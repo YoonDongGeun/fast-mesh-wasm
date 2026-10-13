@@ -1,0 +1,63 @@
+{
+  "name": "fast-mesh-wasm",
+  "version": "0.0.0",
+  "description": "Fast triangle mesh utilities for JavaScript, written in Rust and compiled to WebAssembly",
+  "keywords": [
+    "mesh",
+    "geometry",
+    "normals",
+    "bounding-box",
+    "webassembly",
+    "wasm",
+    "rust",
+    "threejs"
+  ],
+  "homepage": "https://github.com/YoonDongGeun/fast-mesh-wasm#readme",
+  "bugs": "https://github.com/YoonDongGeun/fast-mesh-wasm/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YoonDongGeun/fast-mesh-wasm.git",
+    "directory": "packages/fast-mesh-wasm"
+  },
+  "license": "MIT OR Apache-2.0",
+  "author": "DongGeun Yoon",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
+      },
+      "default": {
+        "types": "./dist/web.d.ts",
+        "default": "./dist/web.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/web.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "check": "publint --strict && attw --pack . --profile esm-only"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^24.19.2",
+    "publint": "^0.3.25",
+    "tsdown": "^0.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

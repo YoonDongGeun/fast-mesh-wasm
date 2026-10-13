@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest a new mesh operation or API improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the use case first. Which mesh operation do you need, and on what kind of data (size, source)?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API
+      description: How would you like to call it from JavaScript/TypeScript?
+      render: ts
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you use today?
+      description: Existing libraries or workarounds, and why they are not enough (speed, size, missing feature).
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd like to implement this myself

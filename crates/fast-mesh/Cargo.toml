@@ -1,0 +1,14 @@
+[package]
+name = "fast-mesh"
+description = "Fast triangle mesh utilities in pure Rust (the core of fast-mesh-wasm)"
+keywords = ["mesh", "geometry", "3d", "normals"]
+categories = ["graphics", "mathematics"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

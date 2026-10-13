@@ -1,0 +1,17 @@
+[package]
+name = "fast-mesh-wasm"
+description = "WebAssembly bindings for fast-mesh (published to npm, not crates.io)"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fast-mesh.workspace = true
+wasm-bindgen.workspace = true

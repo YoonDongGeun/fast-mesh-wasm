@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match the `wasm-bindgen` version pinned in the root Cargo.toml.
+  WASM_BINDGEN_VERSION: 0.2.129
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  package:
+    name: Build and check the npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Test the built package (Node entry)
+        run: pnpm --filter fast-mesh-wasm test
+      - name: Check exports and types (publint, attw)
+        run: pnpm check:pkg
+      - name: Build the Vite example (browser entry)
+        run: pnpm --filter fast-mesh-wasm-example-vite build
+      - run: pnpm --filter fast-mesh-wasm pack --pack-destination "${{ github.workspace }}/pack"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: pack/*.tgz
+
+  install:
+    name: ${{ matrix.pm }} · ${{ matrix.os }} · node ${{ matrix.node }}
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        pm: [npm, pnpm, bun]
+        node: [24]
+        include:
+          - { os: ubuntu-latest, pm: npm, node: 22 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: package
+          path: pack
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - if: matrix.pm == 'pnpm'
+        uses: pnpm/action-setup@v6
+      - if: matrix.pm == 'bun'
+        uses: oven-sh/setup-bun@v2
+      - run: node scripts/smoke.mjs --tarball pack ${{ matrix.pm }}

@@ -1,0 +1,24 @@
+# Rust
+/target/
+
+# Node
+node_modules/
+*.tgz
+.pnpm-store/
+
+# Build output
+packages/fast-mesh-wasm/dist/
+packages/fast-mesh-wasm/src/wasm/
+examples/*/dist/
+
+# Copied into the npm package at build time from the repo root
+packages/fast-mesh-wasm/README.md
+packages/fast-mesh-wasm/LICENSE-*
+
+# Editors / OS / local tooling
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+.omc/

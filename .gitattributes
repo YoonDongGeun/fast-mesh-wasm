@@ -1,0 +1,3 @@
+# Normalize line endings so Windows and Unix contributors produce identical diffs.
+* text=auto eol=lf
+*.wasm binary

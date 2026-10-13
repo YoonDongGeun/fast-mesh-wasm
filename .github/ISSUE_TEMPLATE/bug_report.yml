@@ -1,0 +1,51 @@
+name: Bug report
+description: Something returns a wrong result, throws, or fails to load
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you call, what did you expect, and what did you get instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code (and mesh data, if relevant) that shows the problem. A link to a StackBlitz or repo is great.
+      render: ts
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: fast-mesh-wasm version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      multiple: true
+      options:
+        - Browser (Vite)
+        - Browser (webpack / Next.js)
+        - Browser (other bundler)
+        - Node.js
+        - Bun
+        - Deno
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: runtime-version
+    attributes:
+      label: Runtime / browser version
+      placeholder: "Node 24.13.0, Chrome 141, ..."
+  - type: dropdown
+    id: package-manager
+    attributes:
+      label: Package manager
+      options: [npm, pnpm, bun, yarn, other]

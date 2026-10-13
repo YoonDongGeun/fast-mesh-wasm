@@ -1,0 +1,25 @@
+{
+  "name": "fast-mesh-wasm-monorepo",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.11.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build": "node scripts/build-wasm.mjs && pnpm --filter fast-mesh-wasm build",
+    "test": "cargo test --workspace && pnpm --filter fast-mesh-wasm test",
+    "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "check:pkg": "pnpm --filter fast-mesh-wasm check",
+    "smoke": "node scripts/smoke.mjs",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "pnpm build && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^1.0.1",
+    "@changesets/cli": "^3.0.3",
+    "binaryen": "^132.0.0"
+  }
+}
