@@ -15,15 +15,11 @@ pub struct Transaction<'m> {
     mesh: &'m mut Mesh,
     allocated_vertices: Vec<VertexId>,
     removed_vertices: Vec<VertexId>,
-    moved_vertices: Vec<VertexId>,
     allocated_triangles: Vec<TriangleId>,
     removed_triangles: Vec<TriangleId>,
-    changed_triangles: Vec<TriangleId>,
     /// Slots taken from the free lists, in order, so rollback can return them.
     popped_vertices: Vec<VertexId>,
     popped_triangles: Vec<TriangleId>,
-    /// Per channel (same order as `mesh.channels`): vertices written by `write_channel`.
-    channel_writes: Vec<Vec<VertexId>>,
     live_at_start: (usize, usize),
     poisoned: bool,
     finished: bool,
@@ -41,15 +37,12 @@ impl Mesh {
             c.data.begin();
         }
         Transaction {
-            channel_writes: vec![Vec::new(); self.channels.len()],
             live_at_start: (self.live_vertices, self.live_triangles),
             mesh: self,
             allocated_vertices: Vec::new(),
             removed_vertices: Vec::new(),
-            moved_vertices: Vec::new(),
             allocated_triangles: Vec::new(),
             removed_triangles: Vec::new(),
-            changed_triangles: Vec::new(),
             popped_vertices: Vec::new(),
             popped_triangles: Vec::new(),
             poisoned: false,
@@ -184,6 +177,7 @@ impl Transaction<'_> {
 
     fn alloc_triangle(&mut self, tri: [VertexId; 3]) -> Result<TriangleId> {
         let m = &mut *self.mesh;
+        m.on_topology_changed();
         let id = match m.triangle_free.pop() {
             Some(id) => {
                 self.popped_triangles.push(id);
@@ -256,7 +250,6 @@ impl Transaction<'_> {
             for (&v, &p) in ids.iter().zip(positions) {
                 tx.mesh.positions.set(v as usize, p);
             }
-            tx.moved_vertices.extend_from_slice(ids);
             Ok(())
         })
     }
@@ -298,6 +291,9 @@ impl Transaction<'_> {
             self.check_triangle(t)?;
         }
         self.write(|tx| {
+            if !ids.is_empty() {
+                tx.mesh.on_topology_changed();
+            }
             for &t in ids {
                 let tri = tx.mesh.triangles.get(t as usize);
                 tx.release_corners(tri);
@@ -326,6 +322,9 @@ impl Transaction<'_> {
             }
         }
         self.write(|tx| {
+            if !ids.is_empty() {
+                tx.mesh.on_topology_changed();
+            }
             for (&t, &tri) in ids.iter().zip(triangles) {
                 let old = tx.mesh.triangles.get(t as usize);
                 tx.release_corners(old);
@@ -335,7 +334,6 @@ impl Transaction<'_> {
                 }
                 tx.mesh.triangles.set(t as usize, tri);
             }
-            tx.changed_triangles.extend_from_slice(ids);
             Ok(())
         })
     }
@@ -367,7 +365,6 @@ impl Transaction<'_> {
                     data.set(v as usize * w + k, values[n * w + k]);
                 }
             }
-            tx.channel_writes[ci].extend_from_slice(ids);
             Ok(())
         })
     }
@@ -418,34 +415,37 @@ impl Transaction<'_> {
             &allocated_t,
             &[],
         );
+        // Moved vertices, rewritten triangles and channel writes come from the column
+        // journals, which hold each pre-existing index once however often it was
+        // written. Slot reuse by `alloc_*` and the `[0, 0, 0]` write of a removal also
+        // journal their slot; filtering out created and freed ids removes those.
         let moved = without(
-            sorted(std::mem::take(&mut self.moved_vertices)),
+            sorted(m.positions.journal_ids().to_vec()),
             &allocated_v,
             &freed_v,
         );
         let changed_t = without(
-            sorted(std::mem::take(&mut self.changed_triangles)),
+            sorted(m.triangles.journal_ids().to_vec()),
             &allocated_t,
             &freed_t,
         );
 
         let mut channels = Vec::new();
         let mut channel_data = Vec::new();
-        for ((ci, c), prepared) in m.channels.iter_mut().enumerate().zip(prepared.channels) {
+        for (c, prepared) in m.channels.iter_mut().zip(prepared.channels) {
             let Some(prepared) = prepared else {
                 c.data.end_journal(); // derived: not undoable
                 continue;
             };
+            let w = c.desc.width as u32;
+            let written = c.data.journal_ids().iter().map(|&i| i / w).collect();
+            let written = without(sorted(written), &allocated_v, &freed_v);
+            if !written.is_empty() {
+                channels.push((c.desc.name.clone(), written));
+            }
             let patch = c.data.seal(prepared);
-            {
-                let written = std::mem::take(&mut self.channel_writes[ci]);
-                let written = without(sorted(written), &allocated_v, &freed_v);
-                if !written.is_empty() {
-                    channels.push((c.desc.name.clone(), written));
-                }
-                if !patch.is_empty() {
-                    channel_data.push((c.id, patch));
-                }
+            if !patch.is_empty() {
+                channel_data.push((c.id, patch));
             }
         }
 
@@ -723,6 +723,72 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn repeated_writes_report_each_element_once() {
+        let mut m = quad();
+        m.add_channel(ChannelDesc::source("rgb", 3)).unwrap();
+        // Free slots 1 (triangle) and 3 (vertex), so the transaction reuses them.
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let p = tx.commit().unwrap();
+        // A zero budget evicts the patch at once, which releases its slots.
+        crate::History::new(0).push(&mut m, p).unwrap();
+        assert_eq!(m.free_vertex_slots(), &[3]);
+
+        let mut tx = m.begin_edit();
+        for round in 0..200 {
+            let x = round as f32;
+            tx.set_positions(&[2, 0, 2], &[[x; 3]; 3]).unwrap();
+            tx.write_channel("rgb", &[1, 2], &[x; 6]).unwrap();
+            tx.set_triangles(&[0], &[[0, 1, 2]]).unwrap();
+        }
+        let v = tx.add_vertices(&[[9.; 3]]).unwrap()[0];
+        let t = tx.add_triangles(&[[0, 2, v]]).unwrap()[0];
+        tx.set_positions(&[v], &[[8.; 3]]).unwrap();
+        tx.write_channel("rgb", &[v], &[1.; 3]).unwrap();
+        tx.set_triangles(&[t], &[[0, 1, v]]).unwrap();
+        let patch = tx.commit().unwrap();
+        assert_eq!((v, t), (3, 1), "free slots were reused");
+        let c = patch.changes();
+        assert_eq!(c.vertices_added, vec![3]);
+        assert_eq!(c.vertices_moved, vec![0, 2]);
+        assert_eq!(c.triangles_added, vec![1]);
+        assert_eq!(c.triangles_changed, vec![0]);
+        assert_eq!(c.channels, vec![("rgb".to_string(), vec![1, 2])]);
+        let undo = patch.revert(&mut m).unwrap();
+        assert_eq!(undo.vertices_moved, vec![0, 2]);
+        assert_eq!(undo.vertices_removed, vec![3]);
+    }
+
+    #[test]
+    fn topology_writes_drop_the_adjacency_cache_inside_the_transaction() {
+        type Edit = fn(&mut crate::Transaction<'_>);
+        let edits: [Edit; 3] = [
+            |tx| {
+                tx.add_triangles(&[[1, 2, 3]]).unwrap();
+            },
+            |tx| tx.remove_triangles(&[1]).unwrap(),
+            |tx| tx.set_triangles(&[1], &[[1, 2, 3]]).unwrap(),
+        ];
+        for edit in edits {
+            let mut m = quad();
+            m.ensure_adjacency().unwrap();
+            let mut tx = m.begin_edit();
+            tx.set_positions(&[0], &[[0., 0., 1.]]).unwrap();
+            assert!(tx.mesh().adjacency().is_some(), "moves keep the cache");
+            edit(&mut tx);
+            assert!(tx.mesh().adjacency().is_none());
+            tx.rollback();
+            m.ensure_adjacency().unwrap();
+            assert_eq!(
+                m.adjacency().unwrap().edge_kind(1),
+                crate::EdgeKind::Interior,
+                "rebuilt from the rolled-back mesh"
+            );
         }
     }
 

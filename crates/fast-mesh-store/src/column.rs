@@ -186,6 +186,12 @@ impl<T: Copy + Default> Column<T> {
         }
     }
 
+    /// Indices journaled so far in the current transaction, in first-write order and
+    /// free of duplicates. Only indices that existed at `begin()` are journaled.
+    pub(crate) fn journal_ids(&self) -> &[u32] {
+        self.journal.as_ref().map_or(&[], |j| &j.ids)
+    }
+
     /// Builds every vector of the patch without touching the journal, so a failure
     /// leaves the transaction intact for rollback.
     pub(crate) fn prepare_finish(&self) -> Result<Prepared<T>> {
