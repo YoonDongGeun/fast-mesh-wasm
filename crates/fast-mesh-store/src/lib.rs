@@ -10,13 +10,17 @@
 
 mod channel;
 mod column;
+mod compact;
 mod error;
+mod history;
 mod mesh;
 mod patch;
 mod transaction;
 
 pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
+pub use compact::Remap;
 pub use error::StoreError;
+pub use history::History;
 pub use mesh::Mesh;
 pub use patch::{ChangeSet, Patch};
 pub use transaction::Transaction;
