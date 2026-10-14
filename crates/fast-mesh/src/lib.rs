@@ -53,7 +53,9 @@ pub struct Aabb {
 }
 
 fn vertex_count(positions: &[f32]) -> Result<usize, MeshError> {
-    if positions.len() % 3 != 0 {
+    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs a newer Rust than the MSRV
+    let bad = positions.len() % 3 != 0;
+    if bad {
         return Err(MeshError::PositionsNotMultipleOf3 {
             len: positions.len(),
         });
@@ -62,7 +64,9 @@ fn vertex_count(positions: &[f32]) -> Result<usize, MeshError> {
 }
 
 fn validate_indices(indices: &[u32], vertex_count: usize) -> Result<(), MeshError> {
-    if indices.len() % 3 != 0 {
+    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs a newer Rust than the MSRV
+    let bad = indices.len() % 3 != 0;
+    if bad {
         return Err(MeshError::IndicesNotMultipleOf3 { len: indices.len() });
     }
     match indices.iter().find(|&&i| i as usize >= vertex_count) {
@@ -86,7 +90,7 @@ pub fn compute_vertex_normals(positions: &[f32], indices: &[u32]) -> Result<Vec<
     let mut normals = vec![0.0f32; positions.len()];
     let p = |i: usize| [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]];
 
-    for tri in indices.chunks_exact(3) {
+    for &tri in indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         let (pa, pb, pc) = (p(a), p(b), p(c));
         let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
@@ -104,7 +108,7 @@ pub fn compute_vertex_normals(positions: &[f32], indices: &[u32]) -> Result<Vec<
         }
     }
 
-    for n in normals.chunks_exact_mut(3) {
+    for n in normals.as_chunks_mut::<3>().0 {
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
         if len > 0.0 {
             n.iter_mut().for_each(|x| *x /= len);
@@ -120,7 +124,7 @@ pub fn compute_bounds(positions: &[f32]) -> Result<Aabb, MeshError> {
     }
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for v in positions.chunks_exact(3) {
+    for v in positions.as_chunks::<3>().0 {
         for axis in 0..3 {
             min[axis] = min[axis].min(v[axis]);
             max[axis] = max[axis].max(v[axis]);
@@ -141,8 +145,8 @@ mod tests {
     fn flat_quad_normals_point_up() {
         let normals = compute_vertex_normals(&QUAD_POSITIONS, &QUAD_INDICES).unwrap();
         assert_eq!(normals.len(), QUAD_POSITIONS.len());
-        for n in normals.chunks_exact(3) {
-            assert_eq!(n, [0., 0., 1.]);
+        for n in normals.as_chunks::<3>().0 {
+            assert_eq!(n, &[0., 0., 1.]);
         }
     }
 

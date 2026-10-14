@@ -106,7 +106,7 @@ Users never wire subsystems together themselves. They control timing through upd
 | Attribute channel | per vertex, e.g. `f32` or `[u8; 4]` | ~20 MB each |
 
 - Positions are stored relative to the mesh origin. `f64` input is converted by subtracting the origin.
-- **Adjacency is built lazily**, the first time an algorithm or field needs neighbors, then maintained incrementally. A user who only moves vertices never pays for it.
+- **Adjacency is built lazily**, the first time an algorithm or field needs neighbors, and cached until the next topology change. (Phase 1 rebuilds it after topology changes; incremental maintenance is added with the topology operations that need it inside a transaction.) A user who only moves vertices never pays for it.
 - **Any triangle set is accepted**, including non-manifold input. Adjacency marks non-manifold edges and vertices; topology algorithms treat marked elements as boundaries or refuse to touch them.
 
 ### 4.2 Slots
@@ -119,7 +119,7 @@ Users never wire subsystems together themselves. They control timing through upd
 
 - **Source channels** hold user-provided values (e.g. a painted mask). They are journaled and undoable.
 - **Derived channels** hold computed values (normals, distances, colors). They are not journaled; after undo/redo they are recomputed for the affected vertices. This keeps history small.
-- Each source channel has a **topology value policy** for newly created vertices: `interpolate` (weighted by creation parents), `default`, or `nearest`.
+- Each source channel has a **topology value policy** for newly created vertices: `interpolate` (weighted by creation parents), `default`, or `nearest` (the creation parent with the largest weight; a spatial nearest-vertex lookup arrives with the Scene).
 
 ### 4.4 Transactions and journal
 
@@ -132,7 +132,7 @@ let patch = tx.commit()?;   // or tx.rollback()
 
 - On the first write to a slot within a transaction, the old value is copied into the journal; a per-transaction bitset ensures each slot is copied once.
 - `commit()` produces a `Patch`: for each channel the touched slot ids, old values and new values; created and removed slots; and a `ChangeSet` (dirty vertices, dirty triangles, `topology_changed`).
-- **Snapshot fallback:** if a transaction touches more than a threshold (default 50%) of a channel's slots, the patch stores a full copy of that channel instead of per-slot entries.
+- **Snapshot fallback:** for each column the patch stores either per-slot entries or full copies, whichever is smaller in bytes. Large rewrites (e.g. remeshing) therefore never cost more than two copies of the column.
 - `rollback()` restores from the journal, so a failing algorithm never leaves a half-edited mesh.
 - **Apply and revert are the same operation** with the new or old values. Both emit a `ChangeSet` and flow through the same update path as normal edits.
 - `add_vertices` accepts optional creation parents and weights (e.g. an edge split creates a vertex with parents `(a, b)` and weights `(0.5, 0.5)`). Source channels use them for interpolation; when absent, `nearest` is used.
@@ -141,7 +141,7 @@ let patch = tx.commit()?;   // or tx.rollback()
 
 - A stack of patches with a byte budget. Exceeding the budget evicts the oldest patches (and releases their slots).
 - A new commit after undo discards the redo branch.
-- Per-mesh history or scene-wide history (one undo step can span several meshes).
+- Per-mesh history in the store. Scene-wide history (one undo step can span several meshes) is built on top of it in the Scene phase.
 - Applications with their own undo system can ignore `History` and store `Patch` objects themselves; `patch.apply()` / `patch.revert()` are public.
 
 ## 5. BVH (`fast-mesh-bvh`)

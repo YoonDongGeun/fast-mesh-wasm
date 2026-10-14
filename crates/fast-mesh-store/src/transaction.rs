@@ -352,11 +352,15 @@ impl Transaction<'_> {
         // Slots allocated and removed within this transaction were never visible:
         // they go straight back to the free lists.
         let allocated_v = sorted(std::mem::take(&mut self.allocated_vertices));
-        let (created_v, transient_v): (Vec<_>, Vec<_>) =
-            allocated_v.iter().copied().partition(|&v| m.is_vertex_alive(v));
+        let (created_v, transient_v): (Vec<_>, Vec<_>) = allocated_v
+            .iter()
+            .copied()
+            .partition(|&v| m.is_vertex_alive(v));
         let allocated_t = sorted(std::mem::take(&mut self.allocated_triangles));
-        let (created_t, transient_t): (Vec<_>, Vec<_>) =
-            allocated_t.iter().copied().partition(|&t| m.is_triangle_alive(t));
+        let (created_t, transient_t): (Vec<_>, Vec<_>) = allocated_t
+            .iter()
+            .copied()
+            .partition(|&t| m.is_triangle_alive(t));
         m.vertex_free.extend_from_slice(&transient_v);
         m.triangle_free.extend_from_slice(&transient_t);
 

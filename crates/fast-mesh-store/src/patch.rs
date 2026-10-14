@@ -112,10 +112,14 @@ impl Patch {
         // leaves the mesh logically unchanged.
         mesh.positions
             .grow_to(self.positions.required_len(), [0.0; 3])?;
-        mesh.triangles.grow_to(self.triangles.required_len(), [0; 3])?;
-        mesh.vertex_live.grow_to(self.vertex_live.required_len(), 0)?;
-        mesh.triangle_live.grow_to(self.triangle_live.required_len(), 0)?;
-        mesh.vertex_refs.grow_to(self.vertex_refs.required_len(), 0)?;
+        mesh.triangles
+            .grow_to(self.triangles.required_len(), [0; 3])?;
+        mesh.vertex_live
+            .grow_to(self.vertex_live.required_len(), 0)?;
+        mesh.triangle_live
+            .grow_to(self.triangle_live.required_len(), 0)?;
+        mesh.vertex_refs
+            .grow_to(self.vertex_refs.required_len(), 0)?;
         for (name, p) in &self.channel_data {
             if let Some(i) = mesh.channel_index(name) {
                 mesh.channels[i].data.grow_to(p.required_len(), 0.0)?;
