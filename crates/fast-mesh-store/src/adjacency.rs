@@ -6,7 +6,9 @@
 //! boundary (no neighbor) or non-manifold (more than one neighbor). Orientation is not
 //! assumed to be consistent.
 
-use crate::column::try_vec;
+use std::collections::HashSet;
+
+use crate::column::{try_reserve_exact, try_vec};
 use crate::{Mesh, Result, TriangleId, VertexId};
 
 const NONE: u32 = u32::MAX;
@@ -23,6 +25,12 @@ pub enum EdgeKind {
     NonManifold,
 }
 
+/// Corner table of a [`Mesh`]: for every triangle corner, the corner across the
+/// opposite edge, plus one corner per vertex and a non-manifold flag per vertex.
+///
+/// Built by [`Mesh::ensure_adjacency`] and cached until the next topology change.
+/// See the module docs for the corner numbering.
+#[derive(Debug)]
 pub struct Adjacency {
     opposite: Vec<u32>,
     vertex_corner: Vec<u32>,
@@ -70,15 +78,22 @@ impl Adjacency {
                 if u == w {
                     continue;
                 }
+                // Triangles on edge u-w are incident to both ends: scan the shorter
+                // list, so a high-valence vertex is not scanned once per edge.
+                let (scan, other_end) = if corners_of(u).len() <= corners_of(w).len() {
+                    (u, w)
+                } else {
+                    (w, u)
+                };
                 let (mut count, mut found, mut last) = (0, NONE, NONE);
-                for &d in corners_of(u) {
+                for &d in corners_of(scan) {
                     let s = d / 3;
                     if s as usize == t || s == last {
                         continue;
                     }
                     last = s;
                     let other = tris[s as usize];
-                    if !other.contains(&w) {
+                    if !other.contains(&other_end) {
                         continue;
                     }
                     count += 1;
@@ -96,12 +111,23 @@ impl Adjacency {
 
         let mut vertex_corner = try_vec(vslots, NONE)?;
         let mut non_manifold_vertices = try_vec(vslots.div_ceil(64), 0u64)?;
+        // Scratch buffers for `fan_count`, sized for the highest valence once.
+        let max_valence = (0..vslots)
+            .map(|v| offsets[v + 1] - offsets[v])
+            .max()
+            .unwrap_or(0) as usize;
+        let mut scratch = FanScratch {
+            by_triangle: Vec::new(),
+            parent: Vec::new(),
+        };
+        try_reserve_exact(&mut scratch.by_triangle, max_valence)?;
+        try_reserve_exact(&mut scratch.parent, max_valence)?;
         for v in 0..vslots as u32 {
             let corners = corners_of(v);
             if let Some(&c) = corners.first() {
                 vertex_corner[v as usize] = c;
             }
-            if fan_count(corners, &opposite) != 1 && !corners.is_empty() {
+            if !corners.is_empty() && fan_count(corners, &opposite, &mut scratch) != 1 {
                 non_manifold_vertices[v as usize / 64] |= 1 << (v % 64);
             }
         }
@@ -153,6 +179,7 @@ impl Adjacency {
         };
         let tris = mesh.triangles();
         let mut fan = vec![start / 3];
+        let mut visited = HashSet::from([start / 3]);
         let mut stack = vec![start];
         while let Some(c) = stack.pop() {
             let (t, i) = (c / 3, c % 3);
@@ -161,10 +188,11 @@ impl Adjacency {
                     continue;
                 };
                 let s = o / 3;
-                if fan.contains(&s) {
+                if visited.contains(&s) {
                     continue;
                 }
                 if let Some(j) = tris[s as usize].iter().position(|&x| x == v) {
+                    visited.insert(s);
                     fan.push(s);
                     stack.push(3 * s + j as u32);
                 }
@@ -174,14 +202,31 @@ impl Adjacency {
     }
 }
 
+/// Reusable buffers for [`fan_count`], allocated once per build.
+struct FanScratch {
+    /// `(triangle, local corner index)`, sorted, to find a triangle's corner fast.
+    by_triangle: Vec<(u32, u32)>,
+    /// Union-find parents, one per corner at the vertex.
+    parent: Vec<u32>,
+}
+
 /// Number of fans the corners at one vertex form when joined across interior edges.
 /// A non-manifold edge at the vertex makes the result 0 (never "one fan").
-fn fan_count(corners: &[u32], opposite: &[u32]) -> usize {
-    let mut parent: Vec<usize> = (0..corners.len()).collect();
-    fn root(parent: &mut [usize], mut a: usize) -> usize {
-        while parent[a] != a {
-            parent[a] = parent[parent[a]];
-            a = parent[a];
+/// Runs in O(k log k) for k corners; the scratch buffers hold at least k entries.
+fn fan_count(corners: &[u32], opposite: &[u32], scratch: &mut FanScratch) -> usize {
+    let FanScratch {
+        by_triangle,
+        parent,
+    } = scratch;
+    by_triangle.clear();
+    by_triangle.extend(corners.iter().enumerate().map(|(a, &c)| (c / 3, a as u32)));
+    by_triangle.sort_unstable();
+    parent.clear();
+    parent.extend(0..corners.len() as u32);
+    fn root(parent: &mut [u32], mut a: u32) -> u32 {
+        while parent[a as usize] != a {
+            parent[a as usize] = parent[parent[a as usize] as usize];
+            a = parent[a as usize];
         }
         a
     }
@@ -192,16 +237,21 @@ fn fan_count(corners: &[u32], opposite: &[u32]) -> usize {
                 NON_MANIFOLD => return 0,
                 NONE => {}
                 o => {
-                    if let Some(b) = corners.iter().position(|&x| x / 3 == o / 3) {
-                        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
-                        parent[ra] = rb;
+                    // First corner of the neighboring triangle at this vertex.
+                    let s = o / 3;
+                    let k = by_triangle.partition_point(|&(tri, _)| tri < s);
+                    if let Some(&(tri, b)) = by_triangle.get(k)
+                        && tri == s
+                    {
+                        let (ra, rb) = (root(parent, a as u32), root(parent, b));
+                        parent[ra as usize] = rb;
                     }
                 }
             }
         }
     }
-    (0..corners.len())
-        .filter(|&a| root(&mut parent, a) == a)
+    (0..corners.len() as u32)
+        .filter(|&a| root(parent, a) == a)
         .count()
 }
 
@@ -297,6 +347,36 @@ mod tests {
         .unwrap();
         m.ensure_adjacency().unwrap();
         assert_eq!(m.adjacency().unwrap().opposite(1), Some(4));
+    }
+
+    #[test]
+    fn high_valence_fan_is_built_correctly() {
+        // Open fan around vertex 0: triangles (0, i, i + 1) for rim vertices 1..=N.
+        const N: u32 = 20_000;
+        let positions = vec![0.0f32; 3 * (N as usize + 1)];
+        let indices: Vec<u32> = (1..N).flat_map(|i| [0, i, i + 1]).collect();
+        let mut m = Mesh::from_buffers(&positions, &indices).unwrap();
+        m.ensure_adjacency().unwrap();
+        let a = m.adjacency().unwrap();
+        let tris = N - 1;
+        for t in 0..tris {
+            // Corner 0 (the center) faces the rim edge: boundary.
+            assert_eq!(a.edge_kind(3 * t), EdgeKind::Boundary);
+            // Corner 1 (vertex t + 1) faces edge (t + 2, 0), shared with triangle t + 1,
+            // whose corner there is vertex t + 3 (local 2).
+            let next = (t + 1 < tris).then(|| 3 * (t + 1) + 2);
+            assert_eq!(a.opposite(3 * t + 1), next, "triangle {t}");
+            // Corner 2 (vertex t + 2) faces edge (0, t + 1), shared with triangle t - 1,
+            // whose corner there is vertex t (local 1).
+            let prev = (t > 0).then(|| 3 * (t - 1) + 1);
+            assert_eq!(a.opposite(3 * t + 2), prev, "triangle {t}");
+        }
+        assert!(!a.is_non_manifold_vertex(0));
+        assert!(!a.is_non_manifold_vertex(N / 2));
+        let mut around = a.triangles_around(&m, 0);
+        assert_eq!(around.len(), tris as usize);
+        around.sort_unstable();
+        assert!(around.iter().copied().eq(0..tris));
     }
 
     #[test]

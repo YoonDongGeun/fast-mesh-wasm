@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adjacency::Adjacency;
@@ -62,6 +63,29 @@ pub(crate) fn full_bits(len: usize) -> Result<Vec<u64>> {
         *last = (1u64 << (len % 64)) - 1;
     }
     Ok(words)
+}
+
+/// Shows ids and counts, not the (potentially huge) buffers.
+impl fmt::Debug for Mesh {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mesh")
+            .field("uid", &self.uid)
+            .field("revision", &self.revision)
+            .field("origin", &self.origin)
+            .field("vertices", &self.live_vertices)
+            .field("vertex_slots", &self.vertex_slots())
+            .field("triangles", &self.live_triangles)
+            .field("triangle_slots", &self.triangle_slots())
+            .field(
+                "channels",
+                &self
+                    .channels
+                    .iter()
+                    .map(|c| c.desc.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Mesh {
@@ -445,6 +469,15 @@ mod tests {
         assert_eq!(m.channel("dist").unwrap()[3], 7.0);
         assert_eq!(m.remove_channel("dist").unwrap().name, "dist");
         assert_eq!(m.channel("dist"), None);
+    }
+
+    #[test]
+    fn debug_output_shows_counts() {
+        let mut m = quad();
+        m.ensure_adjacency().unwrap();
+        let s = format!("{m:?}");
+        assert!(s.contains("vertices: 4") && s.contains("triangles: 2"), "{s}");
+        assert!(format!("{:?}", m.adjacency().unwrap()).starts_with("Adjacency"));
     }
 
     #[test]
