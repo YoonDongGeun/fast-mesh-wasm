@@ -1,0 +1,411 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::channel::{Channel, ChannelDesc, ChannelKind};
+use crate::column::{Column, try_vec};
+use crate::{Result, StoreError, TriangleId, VertexId};
+
+static NEXT_MESH_UID: AtomicU64 = AtomicU64::new(1);
+
+/// An editable triangle mesh stored in slots.
+///
+/// Vertices and triangles are addressed by slot ids that stay stable across edits,
+/// undo and redo. Removed slots are dead: `positions()` and `triangles()` still contain
+/// them (removed triangles read `[0, 0, 0]`, which renderers draw as nothing), and
+/// `is_vertex_alive` / `is_triangle_alive` tell them apart. Only [`Mesh::compact`]
+/// renumbers slots.
+pub struct Mesh {
+    pub(crate) uid: u64,
+    pub(crate) epoch: u32,
+    pub(crate) revision: u64,
+    pub(crate) next_revision: u64,
+    pub(crate) origin: [f64; 3],
+    pub(crate) positions: Column<[f32; 3]>,
+    pub(crate) triangles: Column<[u32; 3]>,
+    pub(crate) vertex_live: Column<u64>,
+    pub(crate) triangle_live: Column<u64>,
+    /// Number of triangle corners referencing each vertex.
+    pub(crate) vertex_refs: Column<u32>,
+    pub(crate) channels: Vec<Channel>,
+    pub(crate) vertex_free: Vec<VertexId>,
+    pub(crate) triangle_free: Vec<TriangleId>,
+    pub(crate) live_vertices: usize,
+    pub(crate) live_triangles: usize,
+}
+
+pub(crate) fn bit(bits: &Column<u64>, i: usize) -> bool {
+    let word = i / 64;
+    word < bits.len() && (bits.get(word) >> (i % 64)) & 1 == 1
+}
+
+pub(crate) fn set_bit(bits: &mut Column<u64>, i: usize, on: bool) -> Result<()> {
+    let word = i / 64;
+    bits.grow_to(word + 1, 0)?;
+    let old = bits.get(word);
+    let mask = 1u64 << (i % 64);
+    let new = if on { old | mask } else { old & !mask };
+    if new != old {
+        bits.set(word, new);
+    }
+    Ok(())
+}
+
+pub(crate) fn full_bits(len: usize) -> Result<Vec<u64>> {
+    let mut words = try_vec(len / 64, u64::MAX)?;
+    if !len.is_multiple_of(64) {
+        words.push((1u64 << (len % 64)) - 1);
+    }
+    Ok(words)
+}
+
+impl Default for Mesh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Mesh {
+    /// An empty mesh with its origin at zero.
+    pub fn new() -> Self {
+        Self::from_parts([0.0; 3], Vec::new(), Vec::new(), Vec::new())
+    }
+
+    /// Builds a mesh from flat `[x, y, z, ...]` positions and `[a, b, c, ...]` indices.
+    pub fn from_buffers(positions: &[f32], indices: &[u32]) -> Result<Self> {
+        if !positions.len().is_multiple_of(3) {
+            return Err(StoreError::InvalidArgument(
+                "positions length must be a multiple of 3",
+            ));
+        }
+        let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
+        for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
+            *p = *c;
+        }
+        Self::build([0.0; 3], points, indices)
+    }
+
+    /// Builds a mesh from double-precision positions. The origin is set to the center
+    /// of the bounding box and positions are stored as `f32` offsets from it, which
+    /// keeps precision for coordinates far from zero.
+    pub fn from_buffers_f64(positions: &[f64], indices: &[u32]) -> Result<Self> {
+        if !positions.len().is_multiple_of(3) {
+            return Err(StoreError::InvalidArgument(
+                "positions length must be a multiple of 3",
+            ));
+        }
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for c in positions.as_chunks::<3>().0 {
+            for k in 0..3 {
+                min[k] = min[k].min(c[k]);
+                max[k] = max[k].max(c[k]);
+            }
+        }
+        let origin = if positions.is_empty() {
+            [0.0; 3]
+        } else {
+            [0, 1, 2].map(|k| (min[k] + max[k]) * 0.5)
+        };
+        let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
+        for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
+            *p = [0, 1, 2].map(|k| (c[k] - origin[k]) as f32);
+        }
+        Self::build(origin, points, indices)
+    }
+
+    fn build(origin: [f64; 3], points: Vec<[f32; 3]>, indices: &[u32]) -> Result<Self> {
+        if !indices.len().is_multiple_of(3) {
+            return Err(StoreError::InvalidArgument(
+                "indices length must be a multiple of 3",
+            ));
+        }
+        let vertex_count = points.len();
+        let mut refs = try_vec(vertex_count, 0u32)?;
+        let mut tris = try_vec(indices.len() / 3, [0u32; 3])?;
+        for (t, c) in tris.iter_mut().zip(indices.as_chunks::<3>().0) {
+            for &v in c {
+                if v as usize >= vertex_count {
+                    return Err(StoreError::InvalidVertex(v));
+                }
+                refs[v as usize] += 1;
+            }
+            *t = *c;
+        }
+        Ok(Self::from_parts(origin, points, tris, refs))
+    }
+
+    pub(crate) fn from_parts(
+        origin: [f64; 3],
+        points: Vec<[f32; 3]>,
+        tris: Vec<[u32; 3]>,
+        refs: Vec<u32>,
+    ) -> Self {
+        let (v, t) = (points.len(), tris.len());
+        Self {
+            uid: NEXT_MESH_UID.fetch_add(1, Ordering::Relaxed),
+            epoch: 0,
+            revision: 0,
+            next_revision: 0,
+            origin,
+            positions: Column::from_vec(points),
+            triangles: Column::from_vec(tris),
+            vertex_live: Column::from_vec(full_bits(v).expect("bitset of existing vertices")),
+            triangle_live: Column::from_vec(full_bits(t).expect("bitset of existing triangles")),
+            vertex_refs: Column::from_vec(refs),
+            channels: Vec::new(),
+            vertex_free: Vec::new(),
+            triangle_free: Vec::new(),
+            live_vertices: v,
+            live_triangles: t,
+        }
+    }
+
+    /// Process-unique id of this mesh. Patches only apply to the mesh that created them.
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Changes on every commit, undo and redo. Equal revisions mean equal content.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// World-space origin that positions are relative to.
+    pub fn origin(&self) -> [f64; 3] {
+        self.origin
+    }
+
+    /// Number of vertex slots, alive or dead. Render buffers use this length.
+    pub fn vertex_slots(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Number of triangle slots, alive or dead.
+    pub fn triangle_slots(&self) -> usize {
+        self.triangles.len()
+    }
+
+    /// Number of alive vertices.
+    pub fn vertex_count(&self) -> usize {
+        self.live_vertices
+    }
+
+    /// Number of alive triangles.
+    pub fn triangle_count(&self) -> usize {
+        self.live_triangles
+    }
+
+    pub fn is_vertex_alive(&self, v: VertexId) -> bool {
+        bit(&self.vertex_live, v as usize)
+    }
+
+    pub fn is_triangle_alive(&self, t: TriangleId) -> bool {
+        bit(&self.triangle_live, t as usize)
+    }
+
+    /// Position relative to [`Mesh::origin`], or `None` for a dead or missing vertex.
+    pub fn position(&self, v: VertexId) -> Option<[f32; 3]> {
+        self.is_vertex_alive(v)
+            .then(|| self.positions.get(v as usize))
+    }
+
+    /// Position in world space (origin added in `f64`).
+    pub fn world_position(&self, v: VertexId) -> Option<[f64; 3]> {
+        self.position(v)
+            .map(|p| [0, 1, 2].map(|k| self.origin[k] + p[k] as f64))
+    }
+
+    /// Slot-aligned positions, including dead slots.
+    pub fn positions(&self) -> &[[f32; 3]] {
+        self.positions.as_slice()
+    }
+
+    /// Vertex ids of a triangle, or `None` for a dead or missing triangle.
+    pub fn triangle(&self, t: TriangleId) -> Option<[VertexId; 3]> {
+        self.is_triangle_alive(t)
+            .then(|| self.triangles.get(t as usize))
+    }
+
+    /// Slot-aligned triangles; dead slots read `[0, 0, 0]`.
+    pub fn triangles(&self) -> &[[VertexId; 3]] {
+        self.triangles.as_slice()
+    }
+
+    /// How many triangle corners use vertex `v` (a vertex repeated in one triangle counts twice).
+    pub fn corner_count(&self, v: VertexId) -> u32 {
+        if (v as usize) < self.vertex_refs.len() {
+            self.vertex_refs.get(v as usize)
+        } else {
+            0
+        }
+    }
+
+    /// Dead vertex slots ready for reuse.
+    pub fn free_vertex_slots(&self) -> &[VertexId] {
+        &self.vertex_free
+    }
+
+    /// Dead triangle slots ready for reuse.
+    pub fn free_triangle_slots(&self) -> &[TriangleId] {
+        &self.triangle_free
+    }
+
+    /// Adds a channel filled with its default value. Adding a channel is not undoable.
+    pub fn add_channel(&mut self, desc: ChannelDesc) -> Result<()> {
+        if !(1..=4).contains(&desc.width) {
+            return Err(StoreError::InvalidArgument("channel width must be 1 to 4"));
+        }
+        if self.channel_index(&desc.name).is_some() {
+            return Err(StoreError::ChannelExists(desc.name));
+        }
+        let data = try_vec(self.vertex_slots() * desc.width, desc.default)?;
+        self.channels.push(Channel {
+            desc,
+            data: Column::from_vec(data),
+        });
+        Ok(())
+    }
+
+    /// Removes a channel. Not undoable; patches that recorded it skip it from now on.
+    pub fn remove_channel(&mut self, name: &str) -> Result<ChannelDesc> {
+        let i = self
+            .channel_index(name)
+            .ok_or_else(|| StoreError::UnknownChannel(name.into()))?;
+        Ok(self.channels.remove(i).desc)
+    }
+
+    pub fn channel_desc(&self, name: &str) -> Option<&ChannelDesc> {
+        self.channel_index(name).map(|i| &self.channels[i].desc)
+    }
+
+    /// Slot-aligned values, `width` per vertex.
+    pub fn channel(&self, name: &str) -> Option<&[f32]> {
+        self.channel_index(name)
+            .map(|i| self.channels[i].data.as_slice())
+    }
+
+    /// Writable values of a derived channel. Writes are not recorded for undo.
+    pub fn derived_channel_mut(&mut self, name: &str) -> Result<&mut [f32]> {
+        let i = self
+            .channel_index(name)
+            .ok_or_else(|| StoreError::UnknownChannel(name.into()))?;
+        if self.channels[i].desc.kind != ChannelKind::Derived {
+            return Err(StoreError::NotDerivedChannel(name.into()));
+        }
+        Ok(self.channels[i].data.as_mut_slice())
+    }
+
+    pub(crate) fn channel_index(&self, name: &str) -> Option<usize> {
+        self.channels.iter().position(|c| c.desc.name == name)
+    }
+
+    /// Makes every channel cover every vertex slot.
+    pub(crate) fn grow_channels(&mut self) -> Result<()> {
+        let slots = self.vertex_slots();
+        for c in &mut self.channels {
+            c.data.grow_to(slots * c.desc.width, c.desc.default)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_vertices(&mut self, ids: &[VertexId]) {
+        for &v in ids {
+            debug_assert!(!self.is_vertex_alive(v), "releasing alive vertex {v}");
+            self.vertex_free.push(v);
+        }
+    }
+
+    pub(crate) fn release_triangles(&mut self, ids: &[TriangleId]) {
+        for &t in ids {
+            debug_assert!(!self.is_triangle_alive(t), "releasing alive triangle {t}");
+            self.triangle_free.push(t);
+        }
+    }
+
+    /// Called whenever triangles were added, removed or rewritten.
+    pub(crate) fn on_topology_changed(&mut self) {
+        // The adjacency cache added in Task 7 is invalidated here.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quad() -> Mesh {
+        Mesh::from_buffers(
+            &[0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+            &[0, 1, 2, 0, 2, 3],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn builds_from_flat_buffers() {
+        let m = quad();
+        assert_eq!((m.vertex_count(), m.triangle_count()), (4, 2));
+        assert_eq!(m.position(2), Some([1., 1., 0.]));
+        assert_eq!(m.triangle(1), Some([0, 2, 3]));
+        assert_eq!(m.corner_count(0), 2);
+        assert_eq!(m.corner_count(1), 1);
+    }
+
+    #[test]
+    fn rejects_bad_buffers() {
+        assert!(matches!(
+            Mesh::from_buffers(&[0., 0.], &[]),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            Mesh::from_buffers(&[0., 0., 0.], &[0, 0, 5]).err(),
+            Some(StoreError::InvalidVertex(5))
+        );
+    }
+
+    #[test]
+    fn f64_input_keeps_precision_through_the_origin() {
+        let far = 1.0e7;
+        let m = Mesh::from_buffers_f64(&[far, far, 0.0, far + 0.001, far, 0.0], &[]).unwrap();
+        let o = m.origin();
+        assert!((o[0] - (far + 0.0005)).abs() < 1e-6 && o[1] == far && o[2] == 0.0);
+        let p = m.world_position(1).unwrap();
+        assert!((p[0] - (far + 0.001)).abs() < 1e-6, "got {}", p[0]);
+    }
+
+    #[test]
+    fn out_of_range_ids_read_as_dead() {
+        let m = quad();
+        assert!(!m.is_vertex_alive(99));
+        assert_eq!(m.position(99), None);
+        assert_eq!(m.triangle(99), None);
+    }
+
+    #[test]
+    fn channels_are_slot_aligned_and_unique() {
+        let mut m = quad();
+        m.add_channel(ChannelDesc::source("mask", 1).with_default(0.5))
+            .unwrap();
+        assert_eq!(m.channel("mask"), Some(&[0.5; 4][..]));
+        assert_eq!(
+            m.add_channel(ChannelDesc::source("mask", 1)),
+            Err(StoreError::ChannelExists("mask".into()))
+        );
+        assert!(matches!(
+            m.add_channel(ChannelDesc::source("wide", 5)),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            m.derived_channel_mut("mask").err(),
+            Some(StoreError::NotDerivedChannel("mask".into()))
+        );
+        m.add_channel(ChannelDesc::derived("dist", 1)).unwrap();
+        m.derived_channel_mut("dist").unwrap()[3] = 7.0;
+        assert_eq!(m.channel("dist").unwrap()[3], 7.0);
+        assert_eq!(m.remove_channel("dist").unwrap().name, "dist");
+        assert_eq!(m.channel("dist"), None);
+    }
+
+    #[test]
+    fn every_mesh_gets_a_distinct_uid() {
+        assert_ne!(Mesh::new().uid(), Mesh::new().uid());
+    }
+}

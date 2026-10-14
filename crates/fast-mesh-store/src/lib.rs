@@ -8,10 +8,14 @@
 //! - Every commit, undo and redo reports a [`ChangeSet`] so that dependent data
 //!   (BVHs, fields, render buffers) can update just the affected elements.
 
+mod channel;
 mod column;
 mod error;
+mod mesh;
 
+pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
 pub use error::StoreError;
+pub use mesh::Mesh;
 
 /// Id of a vertex slot.
 pub type VertexId = u32;
