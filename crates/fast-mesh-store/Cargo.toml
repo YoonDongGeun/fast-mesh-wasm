@@ -1,0 +1,17 @@
+[package]
+name = "fast-mesh-store"
+description = "Editable triangle mesh storage with transactional undo/redo (part of fast-mesh-wasm)"
+keywords = ["mesh", "geometry", "undo", "3d"]
+categories = ["graphics", "data-structures"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.12.0"
