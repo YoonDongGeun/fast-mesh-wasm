@@ -101,10 +101,12 @@ impl History {
 
     /// Clears the history and compacts the mesh (see [`Mesh::compact`]).
     pub fn compact(&mut self, mesh: &mut Mesh) -> Result<Remap> {
+        let remap = mesh.compact()?;
+        // Old patches are stale now, so their reserved slots are simply dropped.
         self.undo.clear();
         self.redo.clear();
         self.bytes = 0;
-        mesh.compact()
+        Ok(remap)
     }
 
     /// Changes the budget, evicting old patches if needed.
@@ -264,6 +266,29 @@ mod tests {
         assert!(m.free_vertex_slots().is_empty(), "reserved for redo");
         move_vertex(&mut m, &mut h, 0, 1.0);
         assert_eq!(m.free_vertex_slots(), &[4]);
+    }
+
+    #[test]
+    fn history_compact_empties_history_and_applies_remap() {
+        let mut m = quad();
+        let mut h = History::new(1 << 20);
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[0]).unwrap();
+        tx.remove_vertices(&[1]).unwrap();
+        let p = tx.commit().unwrap();
+        h.push(&mut m, p).unwrap();
+
+        let remap = h.compact(&mut m).unwrap();
+        assert!(!h.can_undo());
+        assert_eq!(h.bytes(), 0);
+        assert_eq!(remap.vertex(1), None);
+        assert_eq!(remap.vertex(2), Some(1));
+        assert_eq!(remap.vertex(3), Some(2));
+        assert_eq!(remap.triangle(0), None);
+        assert_eq!(remap.triangle(1), Some(0));
+        assert_eq!(m.vertex_count(), 3);
+        assert_eq!(m.position(1), Some([1., 1., 0.]));
+        assert_eq!(m.triangle(0), Some([0, 1, 2]));
     }
 
     #[test]
