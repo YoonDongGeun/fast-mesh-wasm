@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::adjacency::Adjacency;
 use crate::channel::{Channel, ChannelDesc, ChannelKind};
 use crate::column::{Column, try_vec};
 use crate::{Result, StoreError, TriangleId, VertexId};
@@ -30,6 +31,8 @@ pub struct Mesh {
     pub(crate) triangle_free: Vec<TriangleId>,
     pub(crate) live_vertices: usize,
     pub(crate) live_triangles: usize,
+    /// Cached corner table; dropped on every topology change.
+    pub(crate) adjacency: Option<Adjacency>,
 }
 
 pub(crate) fn bit(bits: &Column<u64>, i: usize) -> bool {
@@ -156,6 +159,7 @@ impl Mesh {
             triangle_free: Vec::new(),
             live_vertices: v,
             live_triangles: t,
+            adjacency: None,
         }
     }
 
@@ -323,7 +327,7 @@ impl Mesh {
 
     /// Called whenever triangles were added, removed or rewritten.
     pub(crate) fn on_topology_changed(&mut self) {
-        // The adjacency cache added in Task 7 is invalidated here.
+        self.adjacency = None;
     }
 }
 

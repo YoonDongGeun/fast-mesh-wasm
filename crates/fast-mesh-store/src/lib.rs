@@ -8,6 +8,7 @@
 //! - Every commit, undo and redo reports a [`ChangeSet`] so that dependent data
 //!   (BVHs, fields, render buffers) can update just the affected elements.
 
+mod adjacency;
 mod channel;
 mod column;
 mod compact;
@@ -17,6 +18,7 @@ mod mesh;
 mod patch;
 mod transaction;
 
+pub use adjacency::{Adjacency, EdgeKind};
 pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
 pub use compact::Remap;
 pub use error::StoreError;
