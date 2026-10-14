@@ -108,3 +108,49 @@ impl Mesh {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{ChannelDesc, History, Mesh, StoreError};
+
+    #[test]
+    fn compact_renumbers_alive_elements_in_order() {
+        let mut m = Mesh::from_buffers(
+            &[0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+            &[0, 1, 2, 0, 2, 3],
+        )
+        .unwrap();
+        m.add_channel(ChannelDesc::source("mask", 1)).unwrap();
+        let mut tx = m.begin_edit();
+        tx.write_channel("mask", &[0, 1, 2, 3], &[0., 1., 2., 3.])
+            .unwrap();
+        tx.remove_triangles(&[0]).unwrap();
+        tx.remove_vertices(&[1]).unwrap();
+        let patch = tx.commit().unwrap();
+
+        let remap = m.compact().unwrap();
+        assert_eq!(remap.vertices, vec![0, u32::MAX, 1, 2]);
+        assert_eq!(remap.triangle(1), Some(0));
+        assert_eq!(remap.triangle(0), None);
+        assert_eq!((m.vertex_slots(), m.triangle_slots()), (3, 1));
+        assert_eq!(m.triangle(0), Some([0, 1, 2]));
+        assert_eq!(m.position(1), Some([1., 1., 0.]));
+        assert_eq!(m.channel("mask").unwrap(), &[0., 2., 3.]);
+        assert_eq!(m.corner_count(0), 1);
+        assert_eq!(patch.revert(&mut m).err(), Some(StoreError::StalePatch));
+    }
+
+    #[test]
+    fn history_compact_clears_the_stacks() {
+        let mut m = Mesh::from_buffers(&[0., 0., 0.], &[]).unwrap();
+        let mut h = History::new(1 << 20);
+        let mut tx = m.begin_edit();
+        tx.remove_vertices(&[0]).unwrap();
+        let p = tx.commit().unwrap();
+        h.push(&mut m, p).unwrap();
+        h.compact(&mut m).unwrap();
+        assert!(!h.can_undo());
+        assert_eq!(m.vertex_slots(), 0);
+        assert!(m.free_vertex_slots().is_empty());
+    }
+}
