@@ -22,7 +22,9 @@
   "license": "MIT OR Apache-2.0",
   "author": "DongGeun Yoon",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/node.js"
+  ],
   "exports": {
     ".": {
       "node": {

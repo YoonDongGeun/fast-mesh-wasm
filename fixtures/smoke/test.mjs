@@ -8,9 +8,8 @@ const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
 
 assert.deepEqual(Array.from(computeVertexNormals(positions, indices)), [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]);
 
-const bounds = computeBounds(positions);
-assert.deepEqual(Array.from(bounds.max), [1, 1, 0]);
-bounds.free();
+assert.deepEqual(computeBounds(positions).max, [1, 1, 0]);
+assert.deepEqual(computeVertexNormals(Array.from(positions), new Uint16Array(indices)).length, 12);
 
 const runtime = typeof Bun !== "undefined" ? `bun ${Bun.version}` : `node ${process.version}`;
 console.log(`fast-mesh-wasm works on ${runtime}`);

@@ -35,10 +35,11 @@ const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
 const normals = computeVertexNormals(positions, indices);
 // Float32Array [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
 
-using bounds = computeBounds(positions); // freed automatically at the end of the block
-bounds.min; // Float32Array [0, 0, 0]
-bounds.max; // Float32Array [1, 1, 0]
+const bounds = computeBounds(positions);
+// { min: [0, 0, 0], max: [1, 1, 0], center: [0.5, 0.5, 0], size: [1, 1, 0] }
 ```
+
+Inputs can be typed arrays or plain arrays: `Float32Array` positions and `Uint32Array` indices are used without copying, while `Uint16Array`, `Float64Array` and `number[]` are converted once.
 
 ### With three.js
 
@@ -47,10 +48,7 @@ const geometry = new THREE.BufferGeometry();
 geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
 geometry.setIndex(new THREE.BufferAttribute(indices, 1));
 
-const normals = computeVertexNormals(
-  geometry.attributes.position.array as Float32Array,
-  geometry.index!.array as Uint32Array,
-);
+const normals = computeVertexNormals(geometry.attributes.position.array, geometry.index!.array);
 geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 ```
 
@@ -58,33 +56,18 @@ geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 
 | Function | Returns | Description |
 | --- | --- | --- |
-| `init(input?)` | `Promise<void>` | Loads the WebAssembly module. Call once before anything else. Safe to call repeatedly. |
+| `init(input?)` | `Promise<void>` | Loads the WebAssembly module. Required once in browsers; resolves immediately in Node.js and Bun. Safe to call repeatedly. `input` optionally overrides where the `.wasm` file comes from (`InitInput`). |
 | `computeVertexNormals(positions, indices)` | `Float32Array` | Smooth, area-weighted per-vertex normals. Same length as `positions`. |
-| `computeBounds(positions)` | `Bounds` | Axis-aligned bounding box with `min`, `max`, `center` and `size`. |
+| `computeBounds(positions)` | `Bounds` | Plain object `{ min, max, center, size }`, each a `[x, y, z]` array. |
 
-All functions throw an `Error` with a readable message when a buffer length is not a multiple of 3 or an index is out of range.
-
-### Memory
-
-Objects returned as classes (such as `Bounds`) live in WebAssembly memory, which the JavaScript garbage collector does not reclaim right away. Release them with `using` (TypeScript 5.2+, modern runtimes) or by calling `.free()`:
-
-```ts
-const bounds = computeBounds(positions);
-try {
-  console.log(bounds.size);
-} finally {
-  bounds.free();
-}
-```
-
-Typed arrays such as the result of `computeVertexNormals` are ordinary JavaScript copies and need no cleanup.
+All functions throw an `Error` with a readable message when a buffer length is not a multiple of 3 or an index is out of range, and when called before `init()` has finished in the browser.
 
 ## Supported environments
 
 | Environment | Entry | Notes |
 | --- | --- | --- |
 | Browsers via a bundler | `dist/web.js` | Vite, webpack 5, Next.js and others copy the `.wasm` asset automatically |
-| Node.js 22+ | `dist/node.js` | The module is ready on import |
+| Node.js 22+ | `dist/node.js` | The module is ready on import, also inside webpack server bundles (e.g. Next.js) |
 | Bun | `dist/node.js` | Same as Node.js |
 
 The right entry is picked automatically through the `exports` field of `package.json`. The package is ESM only.

@@ -1,0 +1,16 @@
+{
+  "name": "fast-mesh-wasm-example-webpack-node",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "webpack",
+    "start": "node dist/main.cjs"
+  },
+  "dependencies": {
+    "fast-mesh-wasm": "workspace:*"
+  },
+  "devDependencies": {
+    "webpack": "^5.111.1",
+    "webpack-cli": "^7.2.3"
+  }
+}
