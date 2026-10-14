@@ -12,10 +12,14 @@ mod channel;
 mod column;
 mod error;
 mod mesh;
+mod patch;
+mod transaction;
 
 pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
 pub use error::StoreError;
 pub use mesh::Mesh;
+pub use patch::{ChangeSet, Patch};
+pub use transaction::Transaction;
 
 /// Id of a vertex slot.
 pub type VertexId = u32;
