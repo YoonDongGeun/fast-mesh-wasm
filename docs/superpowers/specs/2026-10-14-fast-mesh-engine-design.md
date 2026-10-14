@@ -135,7 +135,7 @@ let patch = tx.commit()?;   // or tx.rollback()
 - **Snapshot fallback:** for each column the patch stores either per-slot entries or full copies, whichever is smaller in bytes. Large rewrites (e.g. remeshing) therefore never cost more than two copies of the column.
 - `rollback()` restores from the journal, so a failing algorithm never leaves a half-edited mesh.
 - **Apply and revert are the same operation** with the new or old values. Both emit a `ChangeSet` and flow through the same update path as normal edits.
-- `add_vertices` accepts optional creation parents and weights (e.g. an edge split creates a vertex with parents `(a, b)` and weights `(0.5, 0.5)`). Source channels use them for interpolation; when absent, `nearest` is used.
+- `add_vertices` accepts optional creation parents and weights (e.g. an edge split creates a vertex with parents `(a, b)` and weights `(0.5, 0.5)`). Source channels use them for interpolation; when absent, source channels use their default value.
 
 ### 4.5 History
 
@@ -447,3 +447,5 @@ Each phase gets its own implementation plan and is released behind changesets. T
 - Current browser support and performance of wasm memory64.
 - Default thresholds (snapshot 50%, rebuild 30%, SAH degradation 1.5×, min-area triangulation size limit) from benchmarks.
 - Actual memory per 10M-triangle mesh versus the estimates in this document.
+- A public, checked way to release slots held by patches stored outside `History` (needed for app-managed undo and scene-wide history).
+- An "all incident triangles of a vertex" query (every fan, not just one) for BVH refit.

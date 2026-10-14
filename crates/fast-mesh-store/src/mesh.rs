@@ -124,12 +124,17 @@ impl Mesh {
 
     /// Builds a mesh from double-precision positions. The origin is set to the center
     /// of the bounding box and positions are stored as `f32` offsets from it, which
-    /// keeps precision for coordinates far from zero.
+    /// keeps precision for coordinates far from zero. Every coordinate, and the
+    /// computed origin, must be finite.
     pub fn from_buffers_f64(positions: &[f64], indices: &[u32]) -> Result<Self> {
         if !positions.len().is_multiple_of(3) {
             return Err(StoreError::InvalidArgument(
                 "positions length must be a multiple of 3",
             ));
+        }
+        let not_finite = StoreError::InvalidArgument("positions must be finite");
+        if !positions.iter().all(|x| x.is_finite()) {
+            return Err(not_finite);
         }
         let mut min = [f64::INFINITY; 3];
         let mut max = [f64::NEG_INFINITY; 3];
@@ -144,6 +149,9 @@ impl Mesh {
         } else {
             [0, 1, 2].map(|k| (min[k] + max[k]) * 0.5)
         };
+        if !origin.iter().all(|x| x.is_finite()) {
+            return Err(not_finite);
+        }
         let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
         for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
             *p = [0, 1, 2].map(|k| (c[k] - origin[k]) as f32);
@@ -439,6 +447,22 @@ mod tests {
     }
 
     #[test]
+    fn f64_input_must_be_finite() {
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                Mesh::from_buffers_f64(&[0., 0., 0., x, 1., 2.], &[]).err(),
+                Some(bad.clone())
+            );
+        }
+        // Finite input whose bounding-box center overflows.
+        assert_eq!(
+            Mesh::from_buffers_f64(&[f64::MAX, 0., 0., f64::MAX, 0., 0.], &[]).err(),
+            Some(bad)
+        );
+    }
+
+    #[test]
     fn out_of_range_ids_read_as_dead() {
         let m = quad();
         assert!(!m.is_vertex_alive(99));
@@ -476,7 +500,10 @@ mod tests {
         let mut m = quad();
         m.ensure_adjacency().unwrap();
         let s = format!("{m:?}");
-        assert!(s.contains("vertices: 4") && s.contains("triangles: 2"), "{s}");
+        assert!(
+            s.contains("vertices: 4") && s.contains("triangles: 2"),
+            "{s}"
+        );
         assert!(format!("{:?}", m.adjacency().unwrap()).starts_with("Adjacency"));
     }
 

@@ -247,6 +247,11 @@ impl<T: Copy + Default> Column<T> {
         Ok(self.seal(prepared))
     }
 
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     /// Test helper: shrinks the column, e.g. to recreate a pre-commit layout.
     #[cfg(test)]
     pub(crate) fn truncate(&mut self, len: usize) {

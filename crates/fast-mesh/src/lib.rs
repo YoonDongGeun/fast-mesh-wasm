@@ -53,9 +53,7 @@ pub struct Aabb {
 }
 
 fn vertex_count(positions: &[f32]) -> Result<usize, MeshError> {
-    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs a newer Rust than the MSRV
-    let bad = positions.len() % 3 != 0;
-    if bad {
+    if !positions.len().is_multiple_of(3) {
         return Err(MeshError::PositionsNotMultipleOf3 {
             len: positions.len(),
         });
@@ -64,9 +62,7 @@ fn vertex_count(positions: &[f32]) -> Result<usize, MeshError> {
 }
 
 fn validate_indices(indices: &[u32], vertex_count: usize) -> Result<(), MeshError> {
-    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs a newer Rust than the MSRV
-    let bad = indices.len() % 3 != 0;
-    if bad {
+    if !indices.len().is_multiple_of(3) {
         return Err(MeshError::IndicesNotMultipleOf3 { len: indices.len() });
     }
     match indices.iter().find(|&&i| i as usize >= vertex_count) {

@@ -1,6 +1,6 @@
-use crate::column::{Column, try_vec};
+use crate::column::{Column, try_reserve, try_reserve_exact, try_vec};
 use crate::mesh::full_bits;
-use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
+use crate::{Mesh, Result, TriangleId, VertexId};
 
 /// Old slot id → new id mapping produced by [`Mesh::compact`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,9 +29,10 @@ impl Remap {
     }
 }
 
-/// Appends with a fallible reservation, so allocation failure is an error, not an abort.
+/// Appends with a fallible reservation, so allocation failure is an error, not an
+/// abort. Callers reserve the final size up front; this then never reallocates.
 fn try_push<T>(v: &mut Vec<T>, x: T) -> Result<()> {
-    v.try_reserve(1).map_err(|_| StoreError::OutOfMemory)?;
+    try_reserve(v, 1)?;
     v.push(x);
     Ok(())
 }
@@ -46,6 +47,7 @@ impl Mesh {
         // Phase 1 (fallible): build every new column as a local. `self` is not written.
         let mut vmap = try_vec(self.vertex_slots(), Remap::REMOVED)?;
         let mut alive_v: Vec<usize> = Vec::new();
+        try_reserve_exact(&mut alive_v, self.live_vertices)?;
         for v in 0..self.vertex_slots() as u32 {
             if self.is_vertex_alive(v) {
                 vmap[v as usize] = alive_v.len() as u32;
@@ -54,6 +56,7 @@ impl Mesh {
         }
         let mut tmap = try_vec(self.triangle_slots(), Remap::REMOVED)?;
         let mut tris: Vec<[u32; 3]> = Vec::new();
+        try_reserve_exact(&mut tris, self.live_triangles)?;
         for t in 0..self.triangle_slots() as u32 {
             if let Some(tri) = self.triangle(t) {
                 tmap[t as usize] = tris.len() as u32;
@@ -63,18 +66,19 @@ impl Mesh {
 
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut refs: Vec<u32> = Vec::new();
+        try_reserve_exact(&mut positions, alive_v.len())?;
+        try_reserve_exact(&mut refs, alive_v.len())?;
         for &v in &alive_v {
             try_push(&mut positions, self.positions.get(v))?;
             try_push(&mut refs, self.vertex_refs.get(v))?;
         }
-        let mut channel_data: Vec<Vec<f32>> = Vec::with_capacity(self.channels.len());
+        let mut channel_data: Vec<Vec<f32>> = Vec::new();
+        try_reserve_exact(&mut channel_data, self.channels.len())?;
         for c in &self.channels {
             let w = c.desc.width;
             let data = c.data.as_slice();
             let mut compacted: Vec<f32> = Vec::new();
-            compacted
-                .try_reserve_exact(alive_v.len() * w)
-                .map_err(|_| StoreError::OutOfMemory)?;
+            try_reserve_exact(&mut compacted, alive_v.len() * w)?;
             for &v in &alive_v {
                 for &x in &data[v * w..(v + 1) * w] {
                     try_push(&mut compacted, x)?;
@@ -138,6 +142,22 @@ mod tests {
         assert_eq!(m.channel("mask").unwrap(), &[0., 2., 3.]);
         assert_eq!(m.corner_count(0), 1);
         assert_eq!(patch.revert(&mut m).err(), Some(StoreError::StalePatch));
+    }
+
+    #[test]
+    fn compacted_columns_have_no_slack() {
+        let positions = vec![0.0f32; 3 * 100];
+        let indices: Vec<u32> = (0..98).flat_map(|i| [i, i + 1, i + 2]).collect();
+        let mut m = Mesh::from_buffers(&positions, &indices).unwrap();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[97]).unwrap();
+        tx.remove_vertices(&[99]).unwrap();
+        tx.commit().unwrap();
+        m.compact().unwrap();
+        assert_eq!((m.vertex_slots(), m.triangle_slots()), (99, 97));
+        assert_eq!(m.positions.capacity(), 99);
+        assert_eq!(m.vertex_refs.capacity(), 99);
+        assert_eq!(m.triangles.capacity(), 97);
     }
 
     #[test]
