@@ -1,3 +1,4 @@
+use crate::channel::Channel;
 use crate::column::ColumnPatch;
 use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 
@@ -109,26 +110,40 @@ impl Patch {
     /// If memory runs out, the mesh is left unchanged.
     pub fn apply(&self, mesh: &mut Mesh) -> Result<ChangeSet> {
         self.check(mesh, self.base_revision)?;
-        // Growing is the only fallible step. It only adds dead slots, so a failure here
-        // leaves the mesh logically unchanged.
+        // Phase A (the only fallible step): reserve capacity on every column. This
+        // never changes a length, so a failure leaves the mesh exactly as it was.
+        let vertex_slots = mesh.positions.len().max(self.positions.required_len());
         mesh.positions
-            .grow_to(self.positions.required_len(), [0.0; 3])?;
+            .try_reserve_to(self.positions.required_len())?;
         mesh.triangles
-            .grow_to(self.triangles.required_len(), [0; 3])?;
+            .try_reserve_to(self.triangles.required_len())?;
         mesh.vertex_live
-            .grow_to(self.vertex_live.required_len(), 0)?;
+            .try_reserve_to(self.vertex_live.required_len())?;
         mesh.triangle_live
-            .grow_to(self.triangle_live.required_len(), 0)?;
+            .try_reserve_to(self.triangle_live.required_len())?;
         mesh.vertex_refs
-            .grow_to(self.vertex_refs.required_len(), 0)?;
-        for (id, p) in &self.channel_data {
-            if let Some(i) = mesh.channel_index_by_id(*id) {
-                mesh.channels[i].data.grow_to(p.required_len(), 0.0)?;
-            }
+            .try_reserve_to(self.vertex_refs.required_len())?;
+        for c in &mut mesh.channels {
+            c.data.try_reserve_to(self.channel_len(c, vertex_slots))?;
         }
-        mesh.grow_channels()?;
 
-        // From here on nothing can fail.
+        // Phase B: grow within the reserved capacity. Only adds dead slots.
+        mesh.positions
+            .resize_reserved(self.positions.required_len(), [0.0; 3]);
+        mesh.triangles
+            .resize_reserved(self.triangles.required_len(), [0; 3]);
+        mesh.vertex_live
+            .resize_reserved(self.vertex_live.required_len(), 0);
+        mesh.triangle_live
+            .resize_reserved(self.triangle_live.required_len(), 0);
+        mesh.vertex_refs
+            .resize_reserved(self.vertex_refs.required_len(), 0);
+        for c in &mut mesh.channels {
+            let len = self.channel_len(c, vertex_slots);
+            c.data.resize_reserved(len, c.desc.default);
+        }
+
+        // Phase C: write. From here on nothing can fail.
         self.positions.apply(&mut mesh.positions);
         self.triangles.apply(&mut mesh.triangles);
         self.vertex_live.apply(&mut mesh.vertex_live);
@@ -174,6 +189,17 @@ impl Patch {
         Ok(self.changes.clone().inverted())
     }
 
+    /// Length channel `c` needs after [`Patch::apply`]: every vertex slot, and
+    /// everything this patch writes to it.
+    fn channel_len(&self, c: &Channel, vertex_slots: usize) -> usize {
+        let own = self
+            .channel_data
+            .iter()
+            .find(|(id, _)| *id == c.id)
+            .map_or(0, |(_, p)| p.required_len());
+        own.max(vertex_slots * c.desc.width)
+    }
+
     fn check(&self, mesh: &Mesh, expected_revision: u64) -> Result<()> {
         if self.mesh_uid != mesh.uid {
             return Err(StoreError::PatchMismatch);
@@ -185,5 +211,79 @@ impl Patch {
             return Err(StoreError::PatchMismatch);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::column::fail_allocations_after;
+    use crate::{ChannelDesc, Mesh, StoreError};
+
+    fn quad() -> Mesh {
+        Mesh::from_buffers(
+            &[0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+            &[0, 1, 2, 0, 2, 3],
+        )
+        .unwrap()
+    }
+
+    /// Lengths of every column that must stay aligned with the slot counts.
+    fn lengths(m: &Mesh) -> Vec<usize> {
+        let mut l = vec![
+            m.positions.len(),
+            m.vertex_refs.len(),
+            m.vertex_live.len(),
+            m.triangles.len(),
+            m.triangle_live.len(),
+        ];
+        l.extend(m.channels.iter().map(|c| c.data.len()));
+        l
+    }
+
+    #[test]
+    fn apply_that_runs_out_of_memory_leaves_every_column_unchanged() {
+        let mut m = quad();
+        m.add_channel(ChannelDesc::source("c", 2)).unwrap();
+        m.add_channel(ChannelDesc::derived("d", 1)).unwrap();
+        let mut tx = m.begin_edit();
+        // 4 + 70 vertices: the liveness bitset grows past one word.
+        let vs = tx.add_vertices(&[[2.; 3]; 70]).unwrap();
+        tx.add_triangles(&[[0, vs[0], vs[1]]]).unwrap();
+        tx.write_channel("c", &[0], &[5., 6.]).unwrap();
+        let patch = tx.commit().unwrap();
+        patch.revert(&mut m).unwrap();
+        // Recreate the exact pre-commit layout (revert keeps appended slots allocated).
+        m.positions.truncate(4);
+        m.vertex_refs.truncate(4);
+        m.vertex_live.truncate(1);
+        m.triangles.truncate(2);
+        m.triangle_live.truncate(1);
+        for c in &mut m.channels {
+            let w = c.desc.width;
+            c.data.truncate(4 * w);
+        }
+        let before = lengths(&m);
+        let revision = m.revision();
+        for k in 0.. {
+            fail_allocations_after(Some(k));
+            let result = patch.apply(&mut m);
+            fail_allocations_after(None);
+            match result {
+                Err(e) => {
+                    assert_eq!(e, StoreError::OutOfMemory);
+                    assert_eq!(lengths(&m), before, "failed after {k} allocations");
+                    assert_eq!(m.revision(), revision);
+                    assert_eq!((m.vertex_count(), m.triangle_count()), (4, 2));
+                }
+                Ok(_) => {
+                    assert!(k > 0, "apply needs to allocate");
+                    assert_eq!((m.vertex_count(), m.triangle_count()), (74, 3));
+                    assert_eq!(lengths(&m), vec![74, 74, 2, 3, 1, 148, 74]);
+                    assert_eq!(&m.channel("c").unwrap()[..2], &[5., 6.]);
+                    assert_eq!(m.triangle(2), Some([0, vs[0], vs[1]]));
+                    break;
+                }
+            }
+        }
     }
 }

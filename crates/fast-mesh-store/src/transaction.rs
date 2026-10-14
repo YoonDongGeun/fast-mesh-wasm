@@ -1,4 +1,5 @@
 use crate::channel::ChannelKind;
+use crate::column::{Prepared, try_reserve_exact};
 use crate::mesh::set_bit;
 use crate::patch::{ChangeSet, Patch};
 use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
@@ -76,6 +77,38 @@ fn check_unique(ids: &[u32], what: &'static str) -> Result<()> {
         return Err(StoreError::InvalidArgument(what));
     }
     Ok(())
+}
+
+/// Patch vectors of every journaled column, built before any journal is consumed.
+struct PreparedColumns {
+    positions: Prepared<[f32; 3]>,
+    triangles: Prepared<[u32; 3]>,
+    vertex_live: Prepared<u64>,
+    triangle_live: Prepared<u64>,
+    vertex_refs: Prepared<u32>,
+    /// Per channel, in `mesh.channels` order: `None` for derived channels.
+    channels: Vec<Option<Prepared<f32>>>,
+}
+
+impl PreparedColumns {
+    fn new(m: &Mesh) -> Result<Self> {
+        let mut channels = Vec::new();
+        try_reserve_exact(&mut channels, m.channels.len())?;
+        for c in &m.channels {
+            channels.push(match c.desc.kind {
+                ChannelKind::Source => Some(c.data.prepare_finish()?),
+                ChannelKind::Derived => None,
+            });
+        }
+        Ok(Self {
+            positions: m.positions.prepare_finish()?,
+            triangles: m.triangles.prepare_finish()?,
+            vertex_live: m.vertex_live.prepare_finish()?,
+            triangle_live: m.triangle_live.prepare_finish()?,
+            vertex_refs: m.vertex_refs.prepare_finish()?,
+            channels,
+        })
+    }
 }
 
 impl Transaction<'_> {
@@ -340,13 +373,24 @@ impl Transaction<'_> {
     }
 
     /// Ends the transaction and returns its patch. An empty transaction returns an
-    /// empty patch and leaves the revision unchanged.
+    /// empty patch and leaves the revision unchanged. If memory for the patch runs
+    /// out, the transaction is rolled back and `OutOfMemory` is returned.
     pub fn commit(mut self) -> Result<Patch> {
         self.finished = true;
         if self.poisoned {
             self.rollback_inner();
             return Err(StoreError::TransactionPoisoned);
         }
+        // Phase 1 (fallible, writes nothing): build every patch vector while all
+        // journals are intact. If memory runs out, roll back as if never committed.
+        let prepared = match PreparedColumns::new(self.mesh) {
+            Ok(p) => p,
+            Err(e) => {
+                self.rollback_inner();
+                return Err(e);
+            }
+        };
+        // Phase 2 (infallible): consume the journals.
         let m = &mut *self.mesh;
 
         // Slots allocated and removed within this transaction were never visible:
@@ -387,9 +431,13 @@ impl Transaction<'_> {
 
         let mut channels = Vec::new();
         let mut channel_data = Vec::new();
-        for (ci, c) in m.channels.iter_mut().enumerate() {
-            let patch = c.data.finish();
-            if c.desc.kind == ChannelKind::Source {
+        for ((ci, c), prepared) in m.channels.iter_mut().enumerate().zip(prepared.channels) {
+            let Some(prepared) = prepared else {
+                c.data.end_journal(); // derived: not undoable
+                continue;
+            };
+            let patch = c.data.seal(prepared);
+            {
                 let written = std::mem::take(&mut self.channel_writes[ci]);
                 let written = without(sorted(written), &allocated_v, &freed_v);
                 if !written.is_empty() {
@@ -420,11 +468,11 @@ impl Transaction<'_> {
             epoch: m.epoch,
             base_revision,
             revision: m.revision,
-            positions: m.positions.finish(),
-            triangles: m.triangles.finish(),
-            vertex_live: m.vertex_live.finish(),
-            triangle_live: m.triangle_live.finish(),
-            vertex_refs: m.vertex_refs.finish(),
+            positions: m.positions.seal(prepared.positions),
+            triangles: m.triangles.seal(prepared.triangles),
+            vertex_live: m.vertex_live.seal(prepared.vertex_live),
+            triangle_live: m.triangle_live.seal(prepared.triangle_live),
+            vertex_refs: m.vertex_refs.seal(prepared.vertex_refs),
             channel_data,
             changes,
         };
@@ -470,6 +518,7 @@ impl Drop for Transaction<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::column::fail_allocations_after;
     use crate::{ChannelDesc, Mesh, StoreError, TopologyPolicy};
 
     fn quad() -> Mesh {
@@ -621,6 +670,59 @@ mod tests {
             assert_eq!(m.channel("c").unwrap(), &untouched[..], "width {new_width}");
             patch.apply(&mut m).unwrap();
             assert_eq!(m.channel("c").unwrap(), &untouched[..], "width {new_width}");
+        }
+    }
+
+    #[test]
+    fn commit_that_runs_out_of_memory_rolls_back_everything() {
+        type State = (Vec<[f32; 3]>, Vec<[u32; 3]>, Vec<f32>, usize, usize, u64);
+        fn state(m: &Mesh) -> State {
+            (
+                m.positions()[..4].to_vec(),
+                m.triangles()[..2].to_vec(),
+                m.channel("c").unwrap()[..4].to_vec(),
+                m.vertex_count(),
+                m.triangle_count(),
+                m.revision(),
+            )
+        }
+        // Sparse patches, and snapshot patches (every position rewritten).
+        for moved in [vec![1], vec![0, 1, 2, 3]] {
+            let mut m = quad();
+            m.add_channel(ChannelDesc::source("c", 1)).unwrap();
+            m.add_channel(ChannelDesc::derived("d", 1)).unwrap();
+            let before = state(&m);
+            for k in 0.. {
+                // A journal left behind by a failed commit would trip `begin()`.
+                let mut tx = m.begin_edit();
+                tx.set_positions(&moved, &vec![[7.; 3]; moved.len()])
+                    .unwrap();
+                let v = tx.add_vertices(&[[1.; 3]]).unwrap()[0];
+                tx.add_triangles(&[[0, 1, v]]).unwrap();
+                tx.remove_triangles(&[1]).unwrap();
+                tx.write_channel("c", &[0], &[3.]).unwrap();
+                fail_allocations_after(Some(k));
+                let result = tx.commit();
+                fail_allocations_after(None);
+                match result {
+                    Err(e) => {
+                        assert_eq!(e, StoreError::OutOfMemory);
+                        assert_eq!(state(&m), before, "failed after {k} allocations");
+                        assert_eq!(m.vertex_slots(), 4, "appended slots truncated");
+                        assert_eq!(m.channel("d").unwrap().len(), 4);
+                    }
+                    Ok(patch) => {
+                        assert!(k > 0, "commit needs to allocate");
+                        assert_eq!(m.position(1), Some([7.; 3]));
+                        assert_eq!(m.triangle(1), None);
+                        assert_eq!(m.channel("c").unwrap()[0], 3.);
+                        // The journals were intact: the patch restores everything.
+                        patch.revert(&mut m).unwrap();
+                        assert_eq!(state(&m), before);
+                        break;
+                    }
+                }
+            }
         }
     }
 

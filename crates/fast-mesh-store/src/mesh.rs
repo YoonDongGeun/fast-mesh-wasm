@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adjacency::Adjacency;
 use crate::channel::{Channel, ChannelDesc, ChannelKind};
-use crate::column::{Column, try_vec};
+use crate::column::{Column, try_reserve, try_vec};
 use crate::{Result, StoreError, TriangleId, VertexId};
 
 static NEXT_MESH_UID: AtomicU64 = AtomicU64::new(1);
@@ -55,9 +55,11 @@ pub(crate) fn set_bit(bits: &mut Column<u64>, i: usize, on: bool) -> Result<()> 
 }
 
 pub(crate) fn full_bits(len: usize) -> Result<Vec<u64>> {
-    let mut words = try_vec(len / 64, u64::MAX)?;
-    if !len.is_multiple_of(64) {
-        words.push((1u64 << (len % 64)) - 1);
+    let mut words = try_vec(len.div_ceil(64), u64::MAX)?;
+    if let Some(last) = words.last_mut()
+        && !len.is_multiple_of(64)
+    {
+        *last = (1u64 << (len % 64)) - 1;
     }
     Ok(words)
 }
@@ -71,7 +73,15 @@ impl Default for Mesh {
 impl Mesh {
     /// An empty mesh with its origin at zero.
     pub fn new() -> Self {
-        Self::from_parts([0.0; 3], Vec::new(), Vec::new(), Vec::new())
+        // Empty liveness bitsets need no allocation, so this cannot fail.
+        Self::assemble(
+            [0.0; 3],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// Builds a mesh from flat `[x, y, z, ...]` positions and `[a, b, c, ...]` indices.
@@ -135,14 +145,35 @@ impl Mesh {
             }
             *t = *c;
         }
-        Ok(Self::from_parts(origin, points, tris, refs))
+        Self::from_parts(origin, points, tris, refs)
     }
 
-    pub(crate) fn from_parts(
+    /// A mesh whose vertices and triangles are all alive.
+    fn from_parts(
         origin: [f64; 3],
         points: Vec<[f32; 3]>,
         tris: Vec<[u32; 3]>,
         refs: Vec<u32>,
+    ) -> Result<Self> {
+        let vertex_live = full_bits(points.len())?;
+        let triangle_live = full_bits(tris.len())?;
+        Ok(Self::assemble(
+            origin,
+            points,
+            tris,
+            refs,
+            vertex_live,
+            triangle_live,
+        ))
+    }
+
+    fn assemble(
+        origin: [f64; 3],
+        points: Vec<[f32; 3]>,
+        tris: Vec<[u32; 3]>,
+        refs: Vec<u32>,
+        vertex_live: Vec<u64>,
+        triangle_live: Vec<u64>,
     ) -> Self {
         let (v, t) = (points.len(), tris.len());
         Self {
@@ -153,8 +184,8 @@ impl Mesh {
             origin,
             positions: Column::from_vec(points),
             triangles: Column::from_vec(tris),
-            vertex_live: Column::from_vec(full_bits(v).expect("bitset of existing vertices")),
-            triangle_live: Column::from_vec(full_bits(t).expect("bitset of existing triangles")),
+            vertex_live: Column::from_vec(vertex_live),
+            triangle_live: Column::from_vec(triangle_live),
             vertex_refs: Column::from_vec(refs),
             channels: Vec::new(),
             next_channel_id: 0,
@@ -265,9 +296,7 @@ impl Mesh {
             return Err(StoreError::ChannelExists(desc.name));
         }
         let data = try_vec(self.vertex_slots() * desc.width, desc.default)?;
-        self.channels
-            .try_reserve(1)
-            .map_err(|_| StoreError::OutOfMemory)?;
+        try_reserve(&mut self.channels, 1)?;
         let id = self.next_channel_id;
         self.next_channel_id += 1;
         self.channels.push(Channel {
@@ -314,15 +343,6 @@ impl Mesh {
     /// Index of the channel with this id, or `None` if it was removed.
     pub(crate) fn channel_index_by_id(&self, id: u64) -> Option<usize> {
         self.channels.iter().position(|c| c.id == id)
-    }
-
-    /// Makes every channel cover every vertex slot.
-    pub(crate) fn grow_channels(&mut self) -> Result<()> {
-        let slots = self.vertex_slots();
-        for c in &mut self.channels {
-            c.data.grow_to(slots * c.desc.width, c.desc.default)?;
-        }
-        Ok(())
     }
 
     /// Puts dead vertex slots on the free list. Ids that are alive or out of range
