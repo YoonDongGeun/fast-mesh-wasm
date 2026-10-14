@@ -6,16 +6,32 @@ import { computeBounds, computeVertexNormals, init } from "fast-mesh-wasm";
 // Unit quad on the XY plane, two counter-clockwise triangles facing +Z.
 const positions = new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]);
 const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
+const up = [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
 
 describe("fast-mesh-wasm (node entry)", () => {
-  it("init resolves", async () => {
+  it("init resolves and accepts the same arguments as in the browser", async () => {
     await expect(init()).resolves.toBeUndefined();
+    await expect(init(new Uint8Array())).resolves.toBeUndefined();
   });
 
   it("computes vertex normals", () => {
     const normals = computeVertexNormals(positions, indices);
     expect(normals).toBeInstanceOf(Float32Array);
-    expect(Array.from(normals)).toEqual([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]);
+    expect(Array.from(normals)).toEqual(up);
+  });
+
+  it("accepts Uint16Array indices, plain arrays and Float64Array positions", () => {
+    expect(Array.from(computeVertexNormals(positions, new Uint16Array(indices)))).toEqual(up);
+    expect(Array.from(computeVertexNormals(Array.from(positions), Array.from(indices)))).toEqual(up);
+    expect(Array.from(computeVertexNormals(new Float64Array(positions), indices))).toEqual(up);
+  });
+
+  it("does not modify its inputs", () => {
+    const pos = Array.from(positions);
+    const idx = new Uint16Array(indices);
+    computeVertexNormals(pos, idx);
+    expect(pos).toEqual(Array.from(positions));
+    expect(Array.from(idx)).toEqual(Array.from(indices));
   });
 
   it("throws a readable error for bad input", () => {
@@ -24,11 +40,15 @@ describe("fast-mesh-wasm (node entry)", () => {
     );
   });
 
-  it("computes bounds and frees memory with `using`", () => {
-    using bounds = computeBounds(positions);
-    expect(Array.from(bounds.min)).toEqual([0, 0, 0]);
-    expect(Array.from(bounds.max)).toEqual([1, 1, 0]);
-    expect(Array.from(bounds.center)).toEqual([0.5, 0.5, 0]);
-    expect(Array.from(bounds.size)).toEqual([1, 1, 0]);
+  it("returns bounds as a plain object", () => {
+    const bounds = computeBounds(positions);
+    expect(bounds).toEqual({
+      min: [0, 0, 0],
+      max: [1, 1, 0],
+      center: [0.5, 0.5, 0],
+      size: [1, 1, 0],
+    });
+    expect(Object.getPrototypeOf(bounds)).toBe(Object.prototype);
+    expect(computeBounds([0, 0, 0, 2, 4, 6]).size).toEqual([2, 4, 6]);
   });
 });

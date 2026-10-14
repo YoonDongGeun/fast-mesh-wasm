@@ -1,7 +1,8 @@
 // Browser and bundler entry (Vite, webpack, Next.js client, Deno, ...).
 // The glue locates the .wasm with `new URL("fast_mesh_wasm_bg.wasm", import.meta.url)`,
 // which bundlers recognize and copy as an asset.
-import wasmInit, { type InitInput } from "./wasm/fast_mesh_wasm.js";
+import { type InitInput, markInitialized } from "./api.js";
+import wasmInit from "./wasm/fast_mesh_wasm.js";
 
 let ready: Promise<void> | undefined;
 
@@ -13,8 +14,18 @@ let ready: Promise<void> | undefined;
  *   Leave empty to load the file shipped with this package.
  */
 export function init(input?: InitInput | Promise<InitInput>): Promise<void> {
-  ready ??= wasmInit(input === undefined ? undefined : { module_or_path: input }).then(() => {});
+  ready ??= wasmInit(input === undefined ? undefined : { module_or_path: input }).then(
+    markInitialized,
+  );
   return ready;
 }
 
-export { Bounds, computeBounds, computeVertexNormals } from "./wasm/fast_mesh_wasm.js";
+export {
+  type Bounds,
+  computeBounds,
+  computeVertexNormals,
+  type Indices,
+  type InitInput,
+  type Positions,
+  type Vec3,
+} from "./api.js";
