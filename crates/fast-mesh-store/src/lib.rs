@@ -8,6 +8,7 @@
 //! - Every commit, undo and redo reports a [`ChangeSet`] so that dependent data
 //!   (BVHs, fields, render buffers) can update just the affected elements.
 
+mod column;
 mod error;
 
 pub use error::StoreError;
