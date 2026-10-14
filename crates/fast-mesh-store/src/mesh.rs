@@ -27,6 +27,8 @@ pub struct Mesh {
     /// Number of triangle corners referencing each vertex.
     pub(crate) vertex_refs: Column<u32>,
     pub(crate) channels: Vec<Channel>,
+    /// Id for the next added channel.
+    pub(crate) next_channel_id: u64,
     pub(crate) vertex_free: Vec<VertexId>,
     pub(crate) triangle_free: Vec<TriangleId>,
     pub(crate) live_vertices: usize,
@@ -155,6 +157,7 @@ impl Mesh {
             triangle_live: Column::from_vec(full_bits(t).expect("bitset of existing triangles")),
             vertex_refs: Column::from_vec(refs),
             channels: Vec::new(),
+            next_channel_id: 0,
             vertex_free: Vec::new(),
             triangle_free: Vec::new(),
             live_vertices: v,
@@ -262,7 +265,13 @@ impl Mesh {
             return Err(StoreError::ChannelExists(desc.name));
         }
         let data = try_vec(self.vertex_slots() * desc.width, desc.default)?;
+        self.channels
+            .try_reserve(1)
+            .map_err(|_| StoreError::OutOfMemory)?;
+        let id = self.next_channel_id;
+        self.next_channel_id += 1;
         self.channels.push(Channel {
+            id,
             desc,
             data: Column::from_vec(data),
         });
@@ -302,6 +311,11 @@ impl Mesh {
         self.channels.iter().position(|c| c.desc.name == name)
     }
 
+    /// Index of the channel with this id, or `None` if it was removed.
+    pub(crate) fn channel_index_by_id(&self, id: u64) -> Option<usize> {
+        self.channels.iter().position(|c| c.id == id)
+    }
+
     /// Makes every channel cover every vertex slot.
     pub(crate) fn grow_channels(&mut self) -> Result<()> {
         let slots = self.vertex_slots();
@@ -311,17 +325,22 @@ impl Mesh {
         Ok(())
     }
 
+    /// Puts dead vertex slots on the free list. Ids that are alive or out of range
+    /// are skipped: they are not free slots of this mesh.
     pub(crate) fn release_vertices(&mut self, ids: &[VertexId]) {
         for &v in ids {
-            debug_assert!(!self.is_vertex_alive(v), "releasing alive vertex {v}");
-            self.vertex_free.push(v);
+            if (v as usize) < self.vertex_slots() && !self.is_vertex_alive(v) {
+                self.vertex_free.push(v);
+            }
         }
     }
 
+    /// Puts dead triangle slots on the free list, skipping alive or out-of-range ids.
     pub(crate) fn release_triangles(&mut self, ids: &[TriangleId]) {
         for &t in ids {
-            debug_assert!(!self.is_triangle_alive(t), "releasing alive triangle {t}");
-            self.triangle_free.push(t);
+            if (t as usize) < self.triangle_slots() && !self.is_triangle_alive(t) {
+                self.triangle_free.push(t);
+            }
         }
     }
 

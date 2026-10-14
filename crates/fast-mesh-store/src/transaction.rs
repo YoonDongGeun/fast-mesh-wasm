@@ -396,7 +396,7 @@ impl Transaction<'_> {
                     channels.push((c.desc.name.clone(), written));
                 }
                 if !patch.is_empty() {
-                    channel_data.push((c.desc.name.clone(), patch));
+                    channel_data.push((c.id, patch));
                 }
             }
         }
@@ -602,6 +602,26 @@ mod tests {
         );
         patch.revert(&mut m).unwrap();
         assert_eq!(&m.channel("mask").unwrap()[..2], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn patches_skip_a_channel_that_was_removed_and_re_added_under_the_same_name() {
+        // Width change (used to panic) and equal width (used to corrupt the new channel).
+        for new_width in [1, 4] {
+            let mut m = quad();
+            m.add_channel(ChannelDesc::source("c", 4)).unwrap();
+            let mut tx = m.begin_edit();
+            tx.write_channel("c", &[0, 1], &[1.0; 8]).unwrap();
+            let patch = tx.commit().unwrap();
+            m.remove_channel("c").unwrap();
+            m.add_channel(ChannelDesc::source("c", new_width).with_default(9.0))
+                .unwrap();
+            let untouched = vec![9.0; 4 * new_width];
+            patch.revert(&mut m).unwrap();
+            assert_eq!(m.channel("c").unwrap(), &untouched[..], "width {new_width}");
+            patch.apply(&mut m).unwrap();
+            assert_eq!(m.channel("c").unwrap(), &untouched[..], "width {new_width}");
+        }
     }
 
     #[test]

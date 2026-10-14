@@ -68,6 +68,9 @@ impl ChannelDesc {
 }
 
 pub(crate) struct Channel {
+    /// Unique within its mesh, never reused. Patches refer to channels by this id, so
+    /// a channel removed and re-added under the same name is a different channel.
+    pub(crate) id: u64,
     pub(crate) desc: ChannelDesc,
     /// `width` values per vertex slot.
     pub(crate) data: Column<f32>,
@@ -109,6 +112,7 @@ mod tests {
 
     fn channel(desc: ChannelDesc, values: &[f32]) -> Channel {
         Channel {
+            id: 0,
             desc,
             data: Column::from_vec(values.to_vec()),
         }

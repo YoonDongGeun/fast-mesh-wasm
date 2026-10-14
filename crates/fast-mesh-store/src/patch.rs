@@ -56,7 +56,8 @@ pub struct Patch {
     pub(crate) vertex_live: ColumnPatch<u64>,
     pub(crate) triangle_live: ColumnPatch<u64>,
     pub(crate) vertex_refs: ColumnPatch<u32>,
-    pub(crate) channel_data: Vec<(String, ColumnPatch<f32>)>,
+    /// Per source channel, keyed by channel id (not name).
+    pub(crate) channel_data: Vec<(u64, ColumnPatch<f32>)>,
     pub(crate) changes: ChangeSet,
 }
 
@@ -99,7 +100,7 @@ impl Patch {
             + self
                 .channel_data
                 .iter()
-                .map(|(n, p)| n.len() + p.byte_size())
+                .map(|(_, p)| 8 + p.byte_size())
                 .sum::<usize>()
             + ids * 4
     }
@@ -120,8 +121,8 @@ impl Patch {
             .grow_to(self.triangle_live.required_len(), 0)?;
         mesh.vertex_refs
             .grow_to(self.vertex_refs.required_len(), 0)?;
-        for (name, p) in &self.channel_data {
-            if let Some(i) = mesh.channel_index(name) {
+        for (id, p) in &self.channel_data {
+            if let Some(i) = mesh.channel_index_by_id(*id) {
                 mesh.channels[i].data.grow_to(p.required_len(), 0.0)?;
             }
         }
@@ -133,8 +134,8 @@ impl Patch {
         self.vertex_live.apply(&mut mesh.vertex_live);
         self.triangle_live.apply(&mut mesh.triangle_live);
         self.vertex_refs.apply(&mut mesh.vertex_refs);
-        for (name, p) in &self.channel_data {
-            if let Some(i) = mesh.channel_index(name) {
+        for (id, p) in &self.channel_data {
+            if let Some(i) = mesh.channel_index_by_id(*id) {
                 p.apply(&mut mesh.channels[i].data);
             }
         }
@@ -157,8 +158,8 @@ impl Patch {
         self.vertex_live.revert(&mut mesh.vertex_live);
         self.triangle_live.revert(&mut mesh.triangle_live);
         self.vertex_refs.revert(&mut mesh.vertex_refs);
-        for (name, p) in &self.channel_data {
-            if let Some(i) = mesh.channel_index(name) {
+        for (id, p) in &self.channel_data {
+            if let Some(i) = mesh.channel_index_by_id(*id) {
                 p.revert(&mut mesh.channels[i].data);
             }
         }
