@@ -105,19 +105,35 @@ impl Patch {
     }
 
     /// Re-applies the patch (redo). The mesh must be at [`Patch::base_revision`].
+    /// If memory runs out, the mesh is left unchanged.
     pub fn apply(&self, mesh: &mut Mesh) -> Result<ChangeSet> {
         self.check(mesh, self.base_revision)?;
-        self.positions.apply(&mut mesh.positions)?;
-        self.triangles.apply(&mut mesh.triangles)?;
-        self.vertex_live.apply(&mut mesh.vertex_live)?;
-        self.triangle_live.apply(&mut mesh.triangle_live)?;
-        self.vertex_refs.apply(&mut mesh.vertex_refs)?;
+        // Growing is the only fallible step. It only adds dead slots, so a failure here
+        // leaves the mesh logically unchanged.
+        mesh.positions
+            .grow_to(self.positions.required_len(), [0.0; 3])?;
+        mesh.triangles.grow_to(self.triangles.required_len(), [0; 3])?;
+        mesh.vertex_live.grow_to(self.vertex_live.required_len(), 0)?;
+        mesh.triangle_live.grow_to(self.triangle_live.required_len(), 0)?;
+        mesh.vertex_refs.grow_to(self.vertex_refs.required_len(), 0)?;
         for (name, p) in &self.channel_data {
             if let Some(i) = mesh.channel_index(name) {
-                p.apply(&mut mesh.channels[i].data)?;
+                mesh.channels[i].data.grow_to(p.required_len(), 0.0)?;
             }
         }
         mesh.grow_channels()?;
+
+        // From here on nothing can fail.
+        self.positions.apply(&mut mesh.positions);
+        self.triangles.apply(&mut mesh.triangles);
+        self.vertex_live.apply(&mut mesh.vertex_live);
+        self.triangle_live.apply(&mut mesh.triangle_live);
+        self.vertex_refs.apply(&mut mesh.vertex_refs);
+        for (name, p) in &self.channel_data {
+            if let Some(i) = mesh.channel_index(name) {
+                p.apply(&mut mesh.channels[i].data);
+            }
+        }
         let c = &self.changes;
         mesh.live_vertices = mesh.live_vertices + c.vertices_added.len() - c.vertices_removed.len();
         mesh.live_triangles =

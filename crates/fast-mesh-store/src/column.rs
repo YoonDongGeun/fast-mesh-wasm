@@ -167,7 +167,20 @@ impl<T: Copy + Default> Column<T> {
 }
 
 impl<T: Copy + Default> ColumnPatch<T> {
-    pub(crate) fn apply(&self, column: &mut Column<T>) -> Result<()> {
+    /// Length the column must have before [`ColumnPatch::apply`].
+    pub(crate) fn required_len(&self) -> usize {
+        match self {
+            Self::Sparse {
+                old_len, appended, ..
+            } => old_len + appended.len(),
+            Self::Snapshot { new, .. } => new.len(),
+        }
+    }
+
+    /// Re-applies the changes. The column must already be `required_len()` long: grow
+    /// it first, which is the only step that can fail.
+    pub(crate) fn apply(&self, column: &mut Column<T>) {
+        debug_assert!(column.len() >= self.required_len());
         match self {
             Self::Sparse {
                 ids,
@@ -176,19 +189,15 @@ impl<T: Copy + Default> ColumnPatch<T> {
                 appended,
                 ..
             } => {
-                let end = old_len + appended.len();
-                column.grow_to(end, T::default())?;
                 for (k, &i) in ids.iter().enumerate() {
                     column.data[i as usize] = new[k];
                 }
-                column.data[*old_len..end].copy_from_slice(appended);
+                column.data[*old_len..old_len + appended.len()].copy_from_slice(appended);
             }
             Self::Snapshot { new, .. } => {
-                column.grow_to(new.len(), T::default())?;
                 column.data[..new.len()].copy_from_slice(new);
             }
         }
-        Ok(())
     }
 
     /// Restores the old values. The column keeps its length: slots appended by the
@@ -274,8 +283,21 @@ mod tests {
         assert_eq!(&c.as_slice()[..3], &[1, 2, 3], "old values restored");
         assert_eq!(c.len(), 4, "appended slot stays allocated");
         assert_eq!(c.get(3), 0, "appended slot is reset to the default");
-        patch.apply(&mut c).unwrap();
+        patch.apply(&mut c);
         assert_eq!(c.as_slice(), &[10, 2, 3, 4]);
+    }
+
+    #[test]
+    fn apply_after_growth_writes_appended_values() {
+        let mut c = column(&[1, 2, 3]);
+        c.begin();
+        c.set(0, 10);
+        c.push(4).unwrap();
+        let patch = c.finish();
+        let mut fresh = column(&[1, 2, 3]);
+        fresh.grow_to(patch.required_len(), 0).unwrap();
+        patch.apply(&mut fresh);
+        assert_eq!(fresh.as_slice(), &[10, 2, 3, 4]);
     }
 
     #[test]
@@ -309,7 +331,7 @@ mod tests {
         assert!(matches!(patch, ColumnPatch::Snapshot { .. }));
         patch.revert(&mut c);
         assert_eq!(c.as_slice(), &[0; 100]);
-        patch.apply(&mut c).unwrap();
+        patch.apply(&mut c);
         assert_eq!(c.as_slice(), &[1; 100]);
     }
 
