@@ -2,8 +2,8 @@
 //! must satisfy every invariant and answer box queries exactly like brute force
 //! and like a freshly built tree.
 
-use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, Quality, UpdatePolicy};
-use fast_mesh_store::{History, Mesh, Transaction};
+use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, Quality, Strategy as UpdateStrategy, UpdatePolicy};
+use fast_mesh_store::{ChangeSet, History, Mesh, Transaction};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,13 @@ enum Step {
     Commit(Vec<Op>),
     Undo,
     Redo,
+    /// Compact the mesh (and history), then update with an empty change set.
+    Compact,
+    /// Apply the last change set a second time.
+    Replay,
+    /// Commit, then `rebuild_region` on the stale tree for these (seeded)
+    /// triangle ids before the update.
+    RegionRebuild(Vec<u32>, Vec<Op>),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -37,6 +44,13 @@ fn step() -> impl Strategy<Value = Step> {
         5 => prop::collection::vec(op(), 1..8).prop_map(Step::Commit),
         1 => Just(Step::Undo),
         1 => Just(Step::Redo),
+        1 => Just(Step::Compact),
+        1 => Just(Step::Replay),
+        2 => (
+            prop::collection::vec(any::<u32>(), 1..4),
+            prop::collection::vec(op(), 1..8)
+        )
+            .prop_map(|(ids, ops)| Step::RegionRebuild(ids, ops)),
     ]
 }
 
@@ -160,10 +174,14 @@ fn brute(mesh: &Mesh, q: &Aabb) -> Vec<u32> {
         .collect()
 }
 
-/// Boxes spread over the grid, from tiny to covering everything.
-fn probe_boxes(n: u32) -> Vec<Aabb> {
+/// Boxes spread over the grid, from tiny to covering everything (`everything`
+/// is the bounds of all triangles, expanded slightly).
+fn probe_boxes(n: u32, everything: Option<Aabb>) -> Vec<Aabb> {
     let n = n as f32;
-    let mut boxes = vec![Aabb::new([-1.0; 3], [n + 1.0, n + 1.0, 5.0])];
+    let mut boxes = Vec::new();
+    if let Some(b) = everything {
+        boxes.push(Aabb::new(b.min.map(|c| c - 1.0), b.max.map(|c| c + 1.0)));
+    }
     for i in 0..6 {
         let c = i as f32 * n / 6.0;
         let r = 0.3 + i as f32 * 0.7;
@@ -177,7 +195,11 @@ fn check(bvh: &Bvh, mesh: &Mesh, options: &BuildOptions, n: u32) -> Result<(), T
     bvh.validate(mesh).map_err(TestCaseError::fail)?;
     prop_assert!(bvh.is_current(mesh));
     let fresh = Bvh::build(mesh, options).unwrap();
-    for q in probe_boxes(n) {
+    let boxes = probe_boxes(n, fresh.root_bounds());
+    if let Some(everything) = boxes.first().filter(|_| mesh.triangle_count() > 0) {
+        prop_assert_eq!(query(bvh, mesh, everything).len(), mesh.triangle_count());
+    }
+    for q in boxes {
         let got = query(bvh, mesh, &q);
         prop_assert_eq!(&got, &brute(mesh, &q));
         prop_assert_eq!(&got, &query(&fresh, mesh, &q));
@@ -198,23 +220,46 @@ proptest! {
         let mut bvh = Bvh::build(&m, &options).unwrap();
         bvh.set_policy(policy).unwrap();
         let mut h = History::new(usize::MAX);
+        let mut last: Option<ChangeSet> = None;
+        let commit = |m: &mut Mesh, h: &mut History, ops: &[Op]| {
+            let mut tx = m.begin_edit();
+            for op in ops {
+                run(&mut tx, op);
+            }
+            let patch = tx.commit().unwrap();
+            let changes = patch.changes().clone();
+            h.push(m, patch).unwrap();
+            Some(changes)
+        };
         for step in &steps {
+            let mut region: &[u32] = &[];
             let changes = match step {
-                Step::Commit(ops) => {
-                    let mut tx = m.begin_edit();
-                    for op in ops {
-                        run(&mut tx, op);
-                    }
-                    let patch = tx.commit().unwrap();
-                    let changes = patch.changes().clone();
-                    h.push(&mut m, patch).unwrap();
-                    Some(changes)
+                Step::Commit(ops) => commit(&mut m, &mut h, ops),
+                Step::RegionRebuild(seeds, ops) => {
+                    region = seeds;
+                    commit(&mut m, &mut h, ops)
                 }
                 Step::Undo => h.undo(&mut m).unwrap(),
                 Step::Redo => h.redo(&mut m).unwrap(),
+                Step::Replay => last.clone(),
+                Step::Compact => {
+                    // Patches and change sets are stale after compaction.
+                    h.compact(&mut m).unwrap();
+                    last = None;
+                    let report = bvh.update(&mut m, &ChangeSet::default()).unwrap();
+                    prop_assert_eq!(report.strategy, UpdateStrategy::Full);
+                    None
+                }
             };
+            if !region.is_empty() {
+                // The tree is stale here; the region may include dead slots.
+                let slots = m.triangle_slots().max(1) as u32;
+                let ids: Vec<u32> = region.iter().map(|&s| s % slots).collect();
+                bvh.rebuild_region(&m, &ids).unwrap();
+            }
             if let Some(changes) = changes {
                 bvh.update(&mut m, &changes).unwrap();
+                last = Some(changes);
             }
             check(&bvh, &m, &options, n)?;
         }
