@@ -10,6 +10,7 @@
 //! Every operation is failure-atomic: on error the BVH is left as it was.
 
 mod aabb;
+mod arena;
 mod error;
 mod options;
 
