@@ -11,6 +11,7 @@
 
 mod aabb;
 mod arena;
+mod build;
 mod error;
 mod options;
 
