@@ -464,9 +464,11 @@ impl Bvh {
             !r
         });
         let extra = found.saturating_sub(1);
+        // The map needs room for all `found` inserts: removing the old root
+        // may leave a tombstone that does not free its room.
         if extra == 0
             || self.treelets.capacity() - self.treelets.len() < extra
-            || self.treelet_of_root.capacity() - self.treelet_of_root.len() < extra
+            || self.treelet_of_root.capacity() - self.treelet_of_root.len() < found
         {
             return;
         }
@@ -930,6 +932,57 @@ mod tests {
         let p = tx.commit().unwrap();
         assert_eq!(bvh.update(&mut m, p.changes()).unwrap().rebuilt_treelets, 1);
         bvh.validate(&m).unwrap();
+    }
+
+    /// Splitting removes the old root and inserts one entry per new treelet.
+    /// The removal can leave a tombstone that does not give its room back, so
+    /// the map needs spare room for every inserted entry, not just the net gain.
+    #[test]
+    fn treelet_split_needs_room_for_every_new_root() {
+        let m = grid(8);
+        // One treelet over the whole mesh: its nodes are the whole arena.
+        let options = BuildOptions {
+            max_leaf_size: 4,
+            treelet_size: 1024,
+            ..Default::default()
+        };
+        let base = Bvh::build(&m, &options).unwrap();
+        assert_eq!(base.treelet_count(), 1);
+        let mut counts = vec![0u32; base.arena.nodes.len()];
+        // Number of treelets a split at size 32 produces.
+        let found = {
+            let mut probe = Bvh::build(&m, &options).unwrap();
+            probe.options.treelet_size = 32;
+            probe.treelets.reserve(64);
+            probe.treelet_of_root.reserve(64);
+            probe.split_treelet(0, &mut counts);
+            probe.validate(&m).unwrap();
+            probe.treelet_count()
+        };
+        assert!(found > 1);
+        for spare in [found - 1, found] {
+            let mut bvh = Bvh::build(&m, &options).unwrap();
+            bvh.options.treelet_size = 32;
+            bvh.treelets.reserve(64);
+            // Fill a fresh map with placeholder keys until exactly `spare`
+            // entries fit without growing.
+            let mut map = std::collections::HashMap::with_capacity(found + 16);
+            map.insert(bvh.root, 0usize);
+            let mut filler = u32::MAX;
+            while map.capacity() - map.len() > spare {
+                map.insert(filler, usize::MAX);
+                filler -= 1;
+            }
+            assert_eq!(map.capacity() - map.len(), spare);
+            let capacity = map.capacity();
+            bvh.treelet_of_root = map;
+            bvh.split_treelet(0, &mut counts);
+            assert_eq!(bvh.treelet_of_root.capacity(), capacity, "spare {spare}");
+            let expected = if spare == found { found } else { 1 };
+            assert_eq!(bvh.treelet_count(), expected, "spare {spare}");
+            bvh.treelet_of_root.retain(|_, &mut i| i != usize::MAX);
+            bvh.validate(&m).unwrap();
+        }
     }
 }
 
