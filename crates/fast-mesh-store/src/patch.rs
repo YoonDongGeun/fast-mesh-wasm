@@ -143,7 +143,15 @@ impl Patch {
             c.data.resize_reserved(len, c.desc.default);
         }
 
-        // Phase C: write. From here on nothing can fail.
+        // Phase C: write. From here on nothing can fail (the incidence index is
+        // dropped instead if it cannot follow).
+        let c = &self.changes;
+        let ids = [
+            &c.triangles_added[..],
+            &c.triangles_removed[..],
+            &c.triangles_changed[..],
+        ];
+        mesh.with_incidence(|inc, m| inc.remove_alive(m, &ids));
         self.positions.apply(&mut mesh.positions);
         self.triangles.apply(&mut mesh.triangles);
         self.vertex_live.apply(&mut mesh.vertex_live);
@@ -154,13 +162,13 @@ impl Patch {
                 p.apply(&mut mesh.channels[i].data);
             }
         }
-        let c = &self.changes;
         mesh.live_vertices = mesh.live_vertices + c.vertices_added.len() - c.vertices_removed.len();
         mesh.live_triangles =
             mesh.live_triangles + c.triangles_added.len() - c.triangles_removed.len();
         mesh.revision = self.revision;
         if c.topology_changed() {
-            mesh.on_topology_changed();
+            mesh.adjacency = None;
+            mesh.with_incidence(|inc, m| inc.insert_alive(m, &ids));
         }
         Ok(self.changes.clone())
     }
@@ -168,6 +176,13 @@ impl Patch {
     /// Undoes the patch. The mesh must be at [`Patch::revision`].
     pub fn revert(&self, mesh: &mut Mesh) -> Result<ChangeSet> {
         self.check(mesh, self.revision)?;
+        let c = &self.changes;
+        let ids = [
+            &c.triangles_added[..],
+            &c.triangles_removed[..],
+            &c.triangles_changed[..],
+        ];
+        mesh.with_incidence(|inc, m| inc.remove_alive(m, &ids));
         self.positions.revert(&mut mesh.positions);
         self.triangles.revert(&mut mesh.triangles);
         self.vertex_live.revert(&mut mesh.vertex_live);
@@ -178,13 +193,13 @@ impl Patch {
                 p.revert(&mut mesh.channels[i].data);
             }
         }
-        let c = &self.changes;
         mesh.live_vertices = mesh.live_vertices + c.vertices_removed.len() - c.vertices_added.len();
         mesh.live_triangles =
             mesh.live_triangles + c.triangles_removed.len() - c.triangles_added.len();
         mesh.revision = self.base_revision;
         if c.topology_changed() {
-            mesh.on_topology_changed();
+            mesh.adjacency = None;
+            mesh.with_incidence(|inc, m| inc.insert_alive(m, &ids));
         }
         Ok(self.changes.clone().inverted())
     }

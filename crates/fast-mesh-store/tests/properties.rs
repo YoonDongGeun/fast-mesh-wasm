@@ -224,10 +224,11 @@ fn check_invariants(m: &Mesh) {
     assert_eq!(m.channel("label").unwrap().len(), m.vertex_slots() * 2);
 }
 
-/// The incidence index must list, per vertex, exactly the alive triangles using it.
-fn check_incidence(m: &mut Mesh) {
-    m.ensure_incidence().unwrap();
-    let inc = m.incidence().unwrap();
+/// The incidence index, built once before the edits, must have followed every
+/// commit, rollback, undo and redo, and list per vertex exactly the alive
+/// triangles using it.
+fn check_incidence(m: &Mesh) {
+    let inc = m.incidence().expect("the index follows edits");
     for v in 0..m.vertex_slots() as u32 {
         let expected: Vec<u32> = alive_triangles(m)
             .into_iter()
@@ -268,6 +269,7 @@ proptest! {
     #[test]
     fn interleaved_steps_match_a_model(steps in prop::collection::vec(step(), 1..30), budget in 200usize..4000) {
         let mut m = grid(8);
+        m.ensure_incidence().unwrap();
         let mut h = History::new(budget);
         // States before each patch on the undo stack, and after each patch on the redo stack.
         let mut undo_states: Vec<State> = Vec::new();
@@ -324,7 +326,7 @@ proptest! {
                 }
             }
             check_invariants(&m);
-            check_incidence(&mut m);
+            check_incidence(&m);
         }
     }
 

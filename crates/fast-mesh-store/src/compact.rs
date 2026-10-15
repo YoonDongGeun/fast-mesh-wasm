@@ -105,7 +105,7 @@ impl Mesh {
         self.epoch += 1;
         self.next_revision += 1;
         self.revision = self.next_revision;
-        self.on_topology_changed();
+        self.on_slots_renumbered();
         Ok(Remap {
             vertices: vmap,
             triangles: tmap,

@@ -19,7 +19,7 @@ In scope:
 
 Out of scope (later phases): winding-number moment data (spec §5.4, moves to Phase 5 Fields); ray, closest-point and mesh-vs-mesh queries (Phase 3); transforms and broadphase (Phase 4); JS bindings (Phase 8); multithreaded builds (later; the code is structured for it).
 
-Follow-ups: incremental maintenance of the incidence index. Today the index is dropped on every topology change and rebuilt in full by the next `update` that has moved vertices, so the first move after a topology edit costs time proportional to the mesh size (see the caveat in `docs/benchmarks.md`).
+Follow-up (done, issue #12): the incidence index follows topology edits instead of being rebuilt after each one (§2).
 
 ## 2. Store addition: incidence index
 
@@ -39,7 +39,9 @@ impl Incidence {
 ```
 
 - Compressed rows: `offsets: Vec<u32>` (vertex slots + 1) and `triangles: Vec<u32>`. A triangle that repeats a vertex (`[a, a, b]`) is listed once for `a`.
-- Built lazily, with fallible allocation. It is cached exactly like `Adjacency`: kept while only positions or channels change, dropped by `on_topology_changed` (commit, apply, revert, compact, and the first topology write inside a transaction).
+- Built lazily, with fallible allocation.
+- *Updated in issue #12:* once built, the index follows commits, rollbacks, undo and redo. The rows of the vertices an edit touches are rewritten into an overlay (`HashMap<VertexId, Vec<TriangleId>>`) that shadows the compressed rows. The old vertices of rewritten or removed triangles come from the triangle column's journal (commit) or from the mesh before writing (apply, revert). Inside a transaction that changed topology, `incidence()` returns `None` until the commit updates the index or the rollback restores the mesh.
+- The index is dropped, and rebuilt compactly by the next `ensure_incidence`, when the overlay holds more than max(4,096, 1/8 of the compressed entries), when memory runs out while updating it, and on `compact`.
 - Memory: about 4 bytes per triangle corner plus 4 per vertex slot, roughly 140 MB at 10M triangles. It exists only while something uses it.
 
 ## 3. Data layout
