@@ -14,7 +14,9 @@ mod arena;
 mod build;
 mod error;
 mod options;
+mod tree;
 
 pub use aabb::Aabb;
 pub use error::{BvhError, Result};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
+pub use tree::Bvh;
