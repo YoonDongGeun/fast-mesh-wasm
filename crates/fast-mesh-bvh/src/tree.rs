@@ -27,6 +27,8 @@ pub struct Bvh {
     pub(crate) garbage_nodes: usize,
     pub(crate) garbage_refs: usize,
     pub(crate) mesh_uid: u64,
+    /// `Mesh::epoch` at the last full build; slot ids are stale once it differs.
+    pub(crate) epoch: u32,
     pub(crate) revision: u64,
     pub(crate) options: BuildOptions,
     pub(crate) policy: UpdatePolicy,
@@ -79,9 +81,18 @@ impl Bvh {
         &self.policy
     }
 
-    /// True when the BVH matches the mesh's current revision.
+    /// The mesh revision this BVH matches (see [`Mesh::revision`]). Manual
+    /// [`Bvh::refit`] and [`Bvh::rebuild_region`] calls do not change it.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// True when the BVH matches the mesh's current revision (and the mesh has
+    /// not been compacted since).
     pub fn is_current(&self, mesh: &Mesh) -> bool {
-        self.mesh_uid == mesh.uid() && self.revision == mesh.revision()
+        self.mesh_uid == mesh.uid()
+            && self.epoch == mesh.epoch()
+            && self.revision == mesh.revision()
     }
 
     /// Builds a complete new tree. Nothing outside the returned value is touched,
@@ -116,6 +127,7 @@ impl Bvh {
             garbage_nodes: 0,
             garbage_refs: 0,
             mesh_uid: mesh.uid(),
+            epoch: mesh.epoch(),
             revision: mesh.revision(),
             options: *options,
             policy: *policy,
@@ -173,15 +185,17 @@ impl Bvh {
         Ok(())
     }
 
-    /// Treelet containing `node` (a node inside or at the root of a treelet).
-    pub(crate) fn treelet_of(&self, mut node: u32) -> usize {
-        loop {
+    /// Treelet containing `node` (a node inside or at the root of a treelet), or
+    /// `None` when the walk up reaches the root without meeting a treelet root
+    /// (which only happens for nodes outside every treelet).
+    pub(crate) fn treelet_of(&self, mut node: u32) -> Option<usize> {
+        while node != NONE {
             if let Some(&t) = self.treelet_of_root.get(&node) {
-                return t;
+                return Some(t);
             }
             node = self.arena.parents[node as usize];
-            debug_assert!(node != NONE, "node is above every treelet");
         }
+        None
     }
 
     /// Appends every alive triangle whose bounding box overlaps the box
@@ -312,6 +326,27 @@ impl Bvh {
         Ok(())
     }
 
+    /// Whether `node` is reachable from the root, by walking parent links and
+    /// checking that each parent really links to the child.
+    fn reachable(&self, mut node: u32) -> bool {
+        let a = &self.arena;
+        for _ in 0..a.nodes.len() {
+            if node == self.root {
+                return true;
+            }
+            let parent = a.parents[node as usize];
+            if parent == NONE {
+                return false;
+            }
+            let p = &a.nodes[parent as usize];
+            if p.is_leaf() || (p.a != node && p.b != node) {
+                return false;
+            }
+            node = parent;
+        }
+        false
+    }
+
     /// Checks every structural invariant against `mesh`. Meant for tests and
     /// debugging; returns a description of the first violation.
     pub fn validate(&self, mesh: &Mesh) -> std::result::Result<(), String> {
@@ -373,6 +408,21 @@ impl Bvh {
         if refs_seen + self.garbage_refs != a.refs.len() {
             return Err("reachable + garbage refs != stored refs".into());
         }
+        // Every triangle → leaf entry must point at a reachable leaf holding it.
+        for (t, &leaf) in a.tri_leaf.iter().enumerate() {
+            if leaf == NONE {
+                continue;
+            }
+            let holds = a
+                .nodes
+                .get(leaf as usize)
+                .is_some_and(|n| n.is_leaf() && a.refs[n.leaf_range()].contains(&(t as u32)));
+            if !holds || !self.reachable(leaf) {
+                return Err(format!(
+                    "tri_leaf of triangle {t} points at node {leaf}, which is not a reachable leaf holding it"
+                ));
+            }
+        }
         for (i, t) in self.treelets.iter().enumerate() {
             if self.treelet_of_root.get(&t.root) != Some(&i) {
                 return Err(format!("treelet {i} is not indexed by its root"));
@@ -408,6 +458,14 @@ impl Bvh {
 
 #[cfg(test)]
 impl Bvh {
+    /// Test-only: number of triangles in each treelet.
+    pub(crate) fn treelet_triangle_counts(&self) -> Vec<usize> {
+        self.treelets
+            .iter()
+            .map(|t| self.arena.subtree_size(t.root).1)
+            .collect()
+    }
+
     /// Test-only: everything that defines the tree, to compare before and after
     /// a failed operation. `tri_leaf` entries are compared as (triangle, leaf)
     /// pairs so growing it with `NONE` does not count as a change.
@@ -424,7 +482,7 @@ impl Bvh {
             self.treelet_of_root.iter().map(|(&r, &i)| (r, i)).collect();
         treelets.sort();
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}",
+            "{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}|{}",
             a.nodes
                 .iter()
                 .map(|n| (n.bounds, n.a, n.b))
@@ -436,6 +494,7 @@ impl Bvh {
             treelets,
             self.garbage_nodes,
             self.garbage_refs,
+            self.epoch,
             self.revision,
         )
     }

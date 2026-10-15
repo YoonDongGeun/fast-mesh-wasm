@@ -8,10 +8,10 @@
 use fast_mesh_store::{ChangeSet, Mesh, TriangleId};
 
 use crate::Aabb;
-use crate::arena::NONE;
+use crate::arena::{NONE, Node};
 use crate::build::{Prims, build_subtree, max_nodes, reserve_headroom};
-use crate::error::{BvhError, Result, try_reserve, try_vec};
-use crate::tree::Bvh;
+use crate::error::{BvhError, Result, try_reserve, try_reserve_map, try_vec};
+use crate::tree::{Bvh, Treelet};
 
 /// How `update` brought the tree up to date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +69,22 @@ impl Bvh {
     /// local topology changes, a full rebuild when more than
     /// `UpdatePolicy::full_rebuild_fraction` of the triangles are dirty. On error the
     /// BVH is unchanged.
+    ///
+    /// When the BVH already matches the mesh's revision, `changes` is ignored and
+    /// the result is [`Strategy::Unchanged`], so applying a change set twice is
+    /// harmless. When the mesh was compacted since the last full build
+    /// ([`Mesh::epoch`] changed), every slot id is stale and the tree is rebuilt
+    /// from scratch ([`Strategy::Full`]) whatever `changes` says.
     pub fn update(&mut self, mesh: &mut Mesh, changes: &ChangeSet) -> Result<UpdateReport> {
         if mesh.uid() != self.mesh_uid {
             return Err(BvhError::MeshMismatch);
+        }
+        if mesh.epoch() != self.epoch {
+            *self = Bvh::assemble(mesh, &self.options, &self.policy)?;
+            return Ok(UpdateReport::new(Strategy::Full));
+        }
+        if mesh.revision() == self.revision {
+            return Ok(UpdateReport::new(Strategy::Unchanged));
         }
         if !changes.vertices_moved.is_empty() {
             mesh.ensure_incidence()?;
@@ -115,30 +128,41 @@ impl Bvh {
         } else {
             Strategy::Partial
         });
+        // Leaves of moved triangles, gathered after the rebuilds (which move
+        // triangles to new leaves); reserved now so the refit cannot fail.
+        let mut leaves = Vec::new();
+        try_reserve(&mut leaves, moved.len())?;
         let mut touched = self.rebuild_treelets(mesh, &removed, &added)?;
         report.rebuilt_treelets = touched.rebuilt;
         report.refit_nodes += touched.refit_nodes;
 
-        // Refit leaves of moved triangles and propagate upwards.
+        // Refit each leaf of a moved triangle once and propagate upwards.
         let (positions, triangles) = (mesh.positions(), mesh.triangles());
         for &t in &moved {
-            let leaf = self.arena.tri_leaf[t as usize];
-            if leaf == NONE {
-                continue;
+            match self.arena.tri_leaf.get(t as usize) {
+                Some(&leaf) if leaf != NONE => leaves.push(leaf),
+                _ => {}
             }
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        for &leaf in &leaves {
             self.arena.refit_leaf(leaf, positions, triangles);
             report.refit_nodes += self.arena.refit_ancestors(leaf);
-            touched.mark(self.treelet_of(leaf));
+            if let Some(i) = self.treelet_of(leaf) {
+                touched.mark(i);
+            }
         }
 
-        // Best effort: rebuild treelets whose quality degraded.
-        for i in 0..self.treelets.len() {
+        // Best effort: rebuild treelets whose quality degraded. Treelets split
+        // off during this update (indices past `touched`) were just built.
+        for i in 0..touched.refit.len() {
             if !touched.refit[i] || touched.rebuilt_now[i] {
                 continue;
             }
             let t = self.treelets[i];
             if self.arena.sah_cost(t.root) > self.policy.degradation_factor * t.build_cost
-                && self.rebuild_one(mesh, i, &[], &[]).is_ok()
+                && self.rebuild_one(mesh, i).is_ok()
             {
                 report.rebuilt_treelets += 1;
                 report.strategy = Strategy::Partial;
@@ -157,9 +181,17 @@ impl Bvh {
     }
 
     /// Recomputes the boxes of the leaves holding `triangles` and their ancestors.
+    ///
+    /// If the mesh was compacted since the last full build ([`Mesh::epoch`]
+    /// changed), slot ids are stale, so this rebuilds the whole tree instead (like
+    /// [`Bvh::rebuild`], which also records the mesh revision). On error the BVH
+    /// is unchanged.
     pub fn refit(&mut self, mesh: &Mesh, triangles: &[TriangleId]) -> Result<()> {
         if mesh.uid() != self.mesh_uid {
             return Err(BvhError::MeshMismatch);
+        }
+        if mesh.epoch() != self.epoch {
+            return self.rebuild(mesh);
         }
         for &t in triangles {
             let leaf = self.arena.tri_leaf.get(t as usize).copied().unwrap_or(NONE);
@@ -172,23 +204,41 @@ impl Bvh {
         Ok(())
     }
 
-    /// Rebuilds the treelets containing `triangles` from their current contents.
+    /// Rebuilds the treelets containing `triangles` from their current contents
+    /// (triangles that died since are dropped).
+    ///
+    /// If the mesh was compacted since the last full build ([`Mesh::epoch`]
+    /// changed), slot ids are stale, so this rebuilds the whole tree instead (like
+    /// [`Bvh::rebuild`], which also records the mesh revision). Memory for every
+    /// affected treelet is reserved before the first one is rebuilt, so on error
+    /// the BVH is unchanged.
     pub fn rebuild_region(&mut self, mesh: &Mesh, triangles: &[TriangleId]) -> Result<()> {
         if mesh.uid() != self.mesh_uid {
             return Err(BvhError::MeshMismatch);
         }
+        if mesh.epoch() != self.epoch {
+            return self.rebuild(mesh);
+        }
         let mut which = Vec::new();
         try_reserve(&mut which, triangles.len())?;
         for &t in triangles {
-            let leaf = self.arena.tri_leaf.get(t as usize).copied().unwrap_or(NONE);
-            if leaf != NONE {
-                which.push(self.treelet_of(leaf));
+            if let Some(i) = self.treelet_of_triangle(t) {
+                which.push(i);
             }
         }
         which.sort_unstable();
         which.dedup();
-        for i in which {
-            self.rebuild_one(mesh, i, &[], &[])?;
+        let mut budget = Budget::default();
+        for &i in &which {
+            budget.add(
+                self.arena.subtree_size(self.treelets[i].root).1,
+                self.options.treelet_size,
+            );
+        }
+        let mut scratch = self.reserve_rebuilds(&budget)?;
+        // Mutation phase: nothing below can fail.
+        for &i in &which {
+            self.replace_treelet(mesh, i, &[], &[], &[], &mut scratch);
         }
         Ok(())
     }
@@ -217,14 +267,16 @@ impl Bvh {
         }
         let positions = mesh.positions();
         let triangles = mesh.triangles();
-        // Which treelet each removal and insertion belongs to.
+        // Which treelet each removal and insertion belongs to. An added triangle
+        // that is already in the tree (a change set applied twice, or merged sets
+        // re-listing an addition) is also treated as removed from where it is, so
+        // it can never be gathered twice.
         let mut queued: Vec<Vec<u32>> = Vec::new();
         try_reserve(&mut queued, self.treelets.len())?;
         queued.resize_with(self.treelets.len(), Vec::new);
-        for &t in removed {
-            let leaf = self.arena.tri_leaf[t as usize];
-            if leaf != NONE {
-                touched.rebuild[self.treelet_of(leaf)] = true;
+        for &t in removed.iter().chain(added) {
+            if let Some(i) = self.treelet_of_triangle(t) {
+                touched.rebuild[i] = true;
             }
         }
         for &t in added {
@@ -237,29 +289,27 @@ impl Bvh {
             queued[i].push(t);
         }
         // Reserve for the largest rebuild and for all appended nodes and refs.
-        let (mut max_n, mut total_nodes, mut total_refs) = (0usize, 0usize, 0usize);
+        let mut budget = Budget::default();
         for (i, q) in queued.iter().enumerate() {
             if touched.rebuild[i] {
                 let (_, refs) = self.arena.subtree_size(self.treelets[i].root);
-                let n = refs + q.len();
-                max_n = max_n.max(n);
-                total_nodes += max_nodes(n);
-                total_refs += n;
+                budget.add(refs + q.len(), self.options.treelet_size);
             }
         }
-        let mut prims = Prims::with_capacity(max_n)?;
-        reserve_headroom(&mut self.arena.nodes, total_nodes)?;
-        reserve_headroom(&mut self.arena.parents, total_nodes)?;
-        reserve_headroom(&mut self.arena.refs, total_refs)?;
+        let mut scratch = self.reserve_rebuilds(&budget)?;
 
-        // Mutation phase: nothing below can fail. Clear removed triangles first so
-        // a rebuilt treelet never overwrites the leaf of a triangle re-added elsewhere.
-        for &t in removed {
-            self.arena.tri_leaf[t as usize] = NONE;
+        // Mutation phase: nothing below can fail. Clear removed and re-added
+        // triangles first so a rebuilt treelet never overwrites the leaf of a
+        // triangle inserted elsewhere.
+        for &t in removed.iter().chain(added) {
+            if let Some(leaf) = self.arena.tri_leaf.get_mut(t as usize) {
+                *leaf = NONE;
+            }
         }
         for (i, q) in queued.iter().enumerate() {
             if touched.rebuild[i] {
-                touched.refit_nodes += self.replace_treelet(mesh, i, removed, q, &mut prims);
+                touched.refit_nodes +=
+                    self.replace_treelet(mesh, i, removed, added, q, &mut scratch);
                 touched.rebuilt += 1;
                 touched.rebuilt_now[i] = true;
             }
@@ -267,49 +317,94 @@ impl Bvh {
         Ok(touched)
     }
 
-    /// Rebuilds one treelet with its own allocation (used for degradation and
-    /// `rebuild_region`). On error the tree is unchanged.
-    fn rebuild_one(&mut self, mesh: &Mesh, i: usize, removed: &[u32], added: &[u32]) -> Result<()> {
-        let (_, refs) = self.arena.subtree_size(self.treelets[i].root);
-        let n = refs + added.len();
-        let mut prims = Prims::with_capacity(n)?;
-        reserve_headroom(&mut self.arena.nodes, max_nodes(n))?;
-        reserve_headroom(&mut self.arena.parents, max_nodes(n))?;
-        reserve_headroom(&mut self.arena.refs, n)?;
-        self.replace_treelet(mesh, i, removed, added, &mut prims);
+    /// Rebuilds one treelet with its own allocation (used for degradation). On
+    /// error the tree is unchanged.
+    fn rebuild_one(&mut self, mesh: &Mesh, i: usize) -> Result<()> {
+        let mut budget = Budget::default();
+        budget.add(
+            self.arena.subtree_size(self.treelets[i].root).1,
+            self.options.treelet_size,
+        );
+        let mut scratch = self.reserve_rebuilds(&budget)?;
+        self.replace_treelet(mesh, i, &[], &[], &[], &mut scratch);
         Ok(())
     }
 
-    /// Builds a new subtree for treelet `i` from its triangles that are still alive
-    /// and not in `removed`, plus `added`, links it in place of the old one and
-    /// refits the ancestors. Capacity must already be reserved, and `tri_leaf` of
-    /// removed triangles already cleared. Returns how many ancestor boxes changed.
+    /// Treelet holding triangle `t`, if the tree holds it.
+    fn treelet_of_triangle(&self, t: TriangleId) -> Option<usize> {
+        match self.arena.tri_leaf.get(t as usize) {
+            Some(&leaf) if leaf != NONE => self.treelet_of(leaf),
+            _ => None,
+        }
+    }
+
+    /// Reserves everything a batch of treelet rebuilds described by `budget`
+    /// needs, so that [`Bvh::replace_treelet`] cannot fail. Only capacity
+    /// changes, so on error the tree is unchanged.
+    fn reserve_rebuilds(&mut self, budget: &Budget) -> Result<Scratch> {
+        let prims = Prims::with_capacity(budget.max_n)?;
+        let counts = if budget.extra_treelets > 0 {
+            try_vec(max_nodes(budget.max_n), 0u32)?
+        } else {
+            Vec::new()
+        };
+        reserve_headroom(&mut self.arena.nodes, budget.nodes)?;
+        reserve_headroom(&mut self.arena.parents, budget.nodes)?;
+        reserve_headroom(&mut self.arena.refs, budget.refs)?;
+        if budget.extra_treelets > 0 {
+            try_reserve(&mut self.treelets, budget.extra_treelets)?;
+        }
+        // Every rebuild inserts its new root; splits insert their extra roots.
+        try_reserve_map(
+            &mut self.treelet_of_root,
+            budget.rebuilds + budget.extra_treelets,
+        )?;
+        Ok(Scratch { prims, counts })
+    }
+
+    /// Builds a new subtree for treelet `i` from its triangles that are still
+    /// alive and in neither `removed` nor `added`, plus `insert`, links it in
+    /// place of the old one and refits the ancestors. A result holding more than
+    /// twice `treelet_size` triangles is split into several treelets. Capacity
+    /// must already be reserved with [`Bvh::reserve_rebuilds`]. Dropped
+    /// triangles whose `tri_leaf` still points into the old treelet get `NONE`.
+    /// Returns how many ancestor boxes changed.
     fn replace_treelet(
         &mut self,
         mesh: &Mesh,
         i: usize,
         removed: &[u32],
         added: &[u32],
-        prims: &mut Prims,
+        insert: &[u32],
+        scratch: &mut Scratch,
     ) -> usize {
         let old_root = self.treelets[i].root;
         let (positions, triangles) = (mesh.positions(), mesh.triangles());
+        let prims = &mut scratch.prims;
         prims.clear();
         let (mut old_nodes, mut old_refs) = (0usize, 0usize);
+        // Taken out (without allocating) so the traversal can clear entries.
+        let mut tri_leaf = std::mem::take(&mut self.arena.tri_leaf);
         let arena = &self.arena;
-        arena.traverse(old_root, |_, n| {
+        arena.traverse(old_root, |node, n| {
             old_nodes += 1;
             if n.is_leaf() {
                 old_refs += n.leaf_range().len();
                 for &t in &arena.refs[n.leaf_range()] {
-                    if mesh.is_triangle_alive(t) && removed.binary_search(&t).is_err() {
+                    if mesh.is_triangle_alive(t)
+                        && removed.binary_search(&t).is_err()
+                        && added.binary_search(&t).is_err()
+                    {
                         prims.push(t, Aabb::of_triangle(positions, triangles[t as usize]));
+                    } else if tri_leaf[t as usize] == node {
+                        tri_leaf[t as usize] = NONE;
                     }
                 }
             }
             true
         });
-        for &t in added {
+        self.arena.tri_leaf = tri_leaf;
+        for &t in insert {
             prims.push(t, Aabb::of_triangle(positions, triangles[t as usize]));
         }
         let parent = self.arena.parents[old_root as usize];
@@ -329,9 +424,74 @@ impl Bvh {
         self.garbage_refs += old_refs;
         self.treelet_of_root.remove(&old_root);
         self.treelet_of_root.insert(new_root, i);
-        self.treelets[i].root = new_root;
-        self.treelets[i].build_cost = self.arena.sah_cost(new_root);
+        self.treelets[i] = Treelet {
+            root: new_root,
+            build_cost: self.arena.sah_cost(new_root),
+        };
+        if prims.len() > 2 * self.options.treelet_size as usize {
+            self.split_treelet(i, &mut scratch.counts);
+        }
         self.arena.refit_ancestors(new_root)
+    }
+
+    /// Splits treelet `i`, which must be the subtree built last (its nodes are
+    /// the tail of the arena, children after parents), by the rule
+    /// `assign_treelets` uses: the topmost subtrees with at most `treelet_size`
+    /// triangles, or single leaves. Best effort and allocation-free: skipped when
+    /// `counts` or the reserved treelet capacity is too small.
+    fn split_treelet(&mut self, i: usize, counts: &mut [u32]) {
+        let root = self.treelets[i].root;
+        let first = root as usize;
+        let nodes = &self.arena.nodes;
+        if nodes.len() - first > counts.len() {
+            return;
+        }
+        for k in (first..nodes.len()).rev() {
+            let n = &nodes[k];
+            counts[k - first] = if n.is_leaf() {
+                n.leaf_range().len() as u32
+            } else {
+                counts[n.a as usize - first] + counts[n.b as usize - first]
+            };
+        }
+        let limit = self.options.treelet_size;
+        let counts = &*counts;
+        let is_root = |k: u32, n: &Node| n.is_leaf() || counts[k as usize - first] <= limit;
+        let mut found = 0usize;
+        self.arena.traverse(root, |k, n| {
+            let r = is_root(k, n);
+            found += usize::from(r);
+            !r
+        });
+        let extra = found.saturating_sub(1);
+        if extra == 0
+            || self.treelets.capacity() - self.treelets.len() < extra
+            || self.treelet_of_root.capacity() - self.treelet_of_root.len() < extra
+        {
+            return;
+        }
+        let arena = &self.arena;
+        let treelets = &mut self.treelets;
+        let map = &mut self.treelet_of_root;
+        map.remove(&root);
+        let mut slot = Some(i);
+        arena.traverse(root, |k, n| {
+            let r = is_root(k, n);
+            if r {
+                let t = Treelet {
+                    root: k,
+                    build_cost: arena.sah_cost(k),
+                };
+                if let Some(i) = slot.take() {
+                    treelets[i] = t;
+                    map.insert(k, i);
+                } else {
+                    map.insert(k, treelets.len());
+                    treelets.push(t);
+                }
+            }
+            !r
+        });
     }
 
     /// Descends the top tree, at each node taking the child whose box grows least,
@@ -372,9 +532,46 @@ impl Touched {
         })
     }
 
+    /// Records a refit in `treelet`. Treelets split off during this update are
+    /// not tracked: they were just built.
     fn mark(&mut self, treelet: usize) {
-        self.refit[treelet] = true;
+        if let Some(r) = self.refit.get_mut(treelet) {
+            *r = true;
+        }
     }
+}
+
+/// Sizes of a batch of treelet rebuilds, accumulated before reserving.
+#[derive(Default)]
+struct Budget {
+    /// Largest rebuild, in triangles.
+    max_n: usize,
+    nodes: usize,
+    refs: usize,
+    rebuilds: usize,
+    /// Upper bound on the treelets added by splitting oversized results.
+    extra_treelets: usize,
+}
+
+impl Budget {
+    /// Adds a rebuild of at most `n` triangles.
+    fn add(&mut self, n: usize, treelet_size: u32) {
+        self.max_n = self.max_n.max(n);
+        self.nodes += max_nodes(n);
+        self.refs += n;
+        self.rebuilds += 1;
+        let size = treelet_size as usize;
+        if n > 2 * size {
+            self.extra_treelets += n.div_ceil(size) * 2 + 1;
+        }
+    }
+}
+
+/// Scratch memory reserved for a batch of treelet rebuilds.
+struct Scratch {
+    prims: Prims,
+    /// Per-node triangle counts of a freshly built subtree, for splitting it.
+    counts: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -602,6 +799,138 @@ mod tests {
         }
         assert!(compacted);
     }
+
+    #[test]
+    fn replaying_a_change_set_does_not_duplicate_triangles() {
+        let mut m = grid(16);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let mut tx = m.begin_edit();
+        let v = tx.add_vertices(&[[0.5, 0.5, 2.0]]).unwrap()[0];
+        tx.add_triangles(&[[0, 1, v]]).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Partial
+        );
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Unchanged
+        );
+        bvh.validate(&m).unwrap();
+        assert_eq!(bvh.revision(), m.revision());
+    }
+
+    #[test]
+    fn re_listed_additions_are_inserted_once() {
+        let mut m = grid(16);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let mut tx = m.begin_edit();
+        let v = tx.add_vertices(&[[0.5, 0.5, 2.0]]).unwrap()[0];
+        tx.add_triangles(&[[0, 1, v]]).unwrap();
+        let first = tx.commit().unwrap().changes().clone();
+        bvh.update(&mut m, &first).unwrap();
+        let mut tx = m.begin_edit();
+        tx.add_triangles(&[[20, 21, v]]).unwrap();
+        let second = tx.commit().unwrap().changes().clone();
+        // A merged set that re-lists the earlier addition.
+        let mut merged = second.clone();
+        merged
+            .triangles_added
+            .extend_from_slice(&first.triangles_added);
+        merged.triangles_added.sort_unstable();
+        merged.triangles_added.dedup();
+        let report = bvh.update(&mut m, &merged).unwrap();
+        assert_eq!(report.strategy, Strategy::Partial);
+        bvh.validate(&m).unwrap();
+        let all = hits(&bvh, &m, [-1.0; 3], [20.0, 20.0, 5.0]);
+        assert_eq!(all.len(), m.triangle_count());
+    }
+
+    #[test]
+    fn compaction_of_the_mesh_forces_a_full_rebuild() {
+        let mut m = grid(8);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[0, 1, 2, 30]).unwrap();
+        let p = tx.commit().unwrap();
+        bvh.update(&mut m, p.changes()).unwrap();
+        m.compact().unwrap();
+        assert!(!bvh.is_current(&m));
+        let report = bvh
+            .update(&mut m, &fast_mesh_store::ChangeSet::default())
+            .unwrap();
+        assert_eq!(report.strategy, Strategy::Full);
+        assert!(bvh.is_current(&m));
+        bvh.validate(&m).unwrap();
+        assert_eq!(
+            hits(&bvh, &m, [-1.0; 3], [9.0, 9.0, 1.0]).len(),
+            m.triangle_count()
+        );
+
+        // Manual refit and region rebuilds also notice the renumbering.
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[5, 6]).unwrap();
+        tx.commit().unwrap();
+        let mut a = Bvh::build(&m, &opts()).unwrap();
+        let mut b = Bvh::build(&m, &opts()).unwrap();
+        m.compact().unwrap();
+        a.refit(&m, &[0]).unwrap();
+        a.validate(&m).unwrap();
+        assert!(a.is_current(&m));
+        b.rebuild_region(&m, &[0]).unwrap();
+        b.validate(&m).unwrap();
+        assert!(b.is_current(&m));
+    }
+
+    #[test]
+    fn region_rebuild_on_a_stale_tree_then_update() {
+        let mut m = grid(8);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[5]).unwrap();
+        let p = tx.commit().unwrap();
+        bvh.rebuild_region(&m, &[4, 5]).unwrap();
+        bvh.validate(&m).unwrap();
+        bvh.update(&mut m, p.changes()).unwrap();
+        bvh.validate(&m).unwrap();
+        assert!(bvh.is_current(&m));
+    }
+
+    #[test]
+    fn treelets_stay_bounded_as_the_mesh_grows() {
+        let mut m = grid(8);
+        let options = BuildOptions {
+            max_leaf_size: 4,
+            treelet_size: 64,
+            ..Default::default()
+        };
+        let mut bvh = Bvh::build(&m, &options).unwrap();
+        for round in 0..14u32 {
+            // Add about 20% more triangles, spread over the mesh.
+            let alive: Vec<u32> = (0..m.triangle_slots() as u32)
+                .filter(|&t| m.is_triangle_alive(t))
+                .collect();
+            let extra: Vec<[u32; 3]> = alive
+                .iter()
+                .step_by(5)
+                .map(|&t| m.triangle(t).unwrap())
+                .collect();
+            let mut tx = m.begin_edit();
+            tx.add_triangles(&extra).unwrap();
+            let p = tx.commit().unwrap();
+            let report = bvh.update(&mut m, p.changes()).unwrap();
+            assert_eq!(report.strategy, Strategy::Partial, "round {round}");
+            bvh.validate(&m).unwrap();
+            let largest = bvh.treelet_triangle_counts().into_iter().max().unwrap();
+            assert!(largest <= 128, "round {round}: treelet of {largest}");
+        }
+        // A one-triangle edit now rebuilds a bounded amount.
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[7]).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(bvh.update(&mut m, p.changes()).unwrap().rebuilt_treelets, 1);
+        bvh.validate(&m).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +997,43 @@ mod oom_tests {
             tx.set_positions(&[30], &[[3.0, 3.0, 4.0]]).unwrap();
             tx.commit().unwrap().changes().clone()
         });
+    }
+
+    #[test]
+    fn failed_region_rebuilds_leave_the_tree_unchanged() {
+        let opts = BuildOptions {
+            max_leaf_size: 2,
+            treelet_size: 8,
+            ..Default::default()
+        };
+        // Triangles far apart, so the region spans several treelets.
+        let region = [0u32, 40, 80, 120];
+        for k in 0.. {
+            let m = wavy(8);
+            let mut bvh = Bvh::build(&m, &opts).unwrap();
+            let mut which: Vec<_> = region
+                .iter()
+                .map(|&t| bvh.treelet_of_triangle(t).unwrap())
+                .collect();
+            which.dedup();
+            assert!(which.len() > 1, "the region must span several treelets");
+            let before = bvh.fingerprint();
+            fail_allocations_after(Some(k));
+            let result = bvh.rebuild_region(&m, &region);
+            fail_allocations_after(None);
+            match result {
+                Err(BvhError::OutOfMemory) => {
+                    assert_eq!(bvh.fingerprint(), before, "allocation {k}")
+                }
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(()) => {
+                    assert!(k > 1, "the rebuild must allocate several times");
+                    assert_ne!(bvh.fingerprint(), before);
+                    bvh.validate(&m).unwrap();
+                    return;
+                }
+            }
+        }
     }
 
     #[test]

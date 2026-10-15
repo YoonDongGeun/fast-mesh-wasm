@@ -7,7 +7,11 @@
 //!   rebuilds the affected treelets, or rebuilds everything, whichever is cheapest.
 //! - [`Bvh::query_aabb`] finds the triangles whose boxes overlap a box.
 //!
-//! Every operation is failure-atomic: on error the BVH is left as it was.
+//! Every fallible operation is failure-atomic: all memory it needs is reserved
+//! before the tree is touched, so on error the BVH is left as it was. The two
+//! optional follow-up steps of [`Bvh::update`] (rebuilding degraded treelets and
+//! compacting storage) never report errors: if memory runs out they are skipped
+//! and the tree stays correct.
 
 mod aabb;
 mod arena;

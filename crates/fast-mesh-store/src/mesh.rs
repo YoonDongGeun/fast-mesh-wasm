@@ -243,6 +243,12 @@ impl Mesh {
         self.revision
     }
 
+    /// Changes whenever [`Mesh::compact`] renumbers slots. Data indexed by slot id
+    /// (such as an acceleration structure) is stale once the epoch differs.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     /// World-space origin that positions are relative to.
     pub fn origin(&self) -> [f64; 3] {
         self.origin

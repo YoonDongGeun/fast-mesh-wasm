@@ -1,8 +1,10 @@
 //! Top-down subtree builders: binned SAH and Morton-code (LBVH).
 //!
 //! Both work on an index permutation (`Prims::order`) so the primitive arrays are
-//! never moved. All memory is reserved up front by the caller, so building never
-//! allocates and cannot fail.
+//! never moved. Full builds start from an estimated node count and grow the
+//! arena on demand, so they can fail with `OutOfMemory`. When the caller has
+//! reserved the worst case up front (`max_nodes(n)` nodes and parents and `n`
+//! refs, as treelet rebuilds do), building never allocates and cannot fail.
 
 use crate::arena::{Arena, LEAF_BIT, NONE, Node};
 use crate::error::{Result, try_reserve, try_reserve_exact};
@@ -95,6 +97,11 @@ impl Prims {
 /// `tri_leaf` must cover every triangle id in `prims`. Nodes are allocated as
 /// needed; when the caller has already reserved `max_nodes(n)` nodes and parents and
 /// `n` refs (as treelet rebuilds do), this cannot fail.
+///
+/// Not atomic: on `Err` the arena may already hold some of the new nodes, refs
+/// and `tri_leaf` entries. Callers either build into a fresh arena they discard
+/// on error (full builds) or reserve the worst case first so no error can occur
+/// (treelet rebuilds).
 pub(crate) fn build_subtree(
     arena: &mut Arena,
     prims: &mut Prims,

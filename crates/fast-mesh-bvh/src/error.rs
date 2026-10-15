@@ -3,7 +3,9 @@ use std::fmt;
 use fast_mesh_store::StoreError;
 
 /// Errors returned by BVH operations. On any error the BVH is left exactly as it
-/// was before the call.
+/// was before the call: every operation reserves the memory it needs before it
+/// changes the tree (best-effort steps that run afterwards are skipped silently
+/// instead of failing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BvhError {
     /// The mesh is not the one this BVH was built from.
