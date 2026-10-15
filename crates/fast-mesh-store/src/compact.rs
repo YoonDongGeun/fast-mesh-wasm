@@ -132,7 +132,9 @@ mod tests {
         tx.remove_vertices(&[1]).unwrap();
         let patch = tx.commit().unwrap();
 
+        let epoch = m.epoch();
         let remap = m.compact().unwrap();
+        assert_ne!(m.epoch(), epoch, "compact must change the epoch");
         assert_eq!(remap.vertices, vec![0, u32::MAX, 1, 2]);
         assert_eq!(remap.triangle(1), Some(0));
         assert_eq!(remap.triangle(0), None);

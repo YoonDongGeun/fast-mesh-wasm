@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::adjacency::Adjacency;
 use crate::channel::{Channel, ChannelDesc, ChannelKind};
 use crate::column::{Column, try_reserve, try_vec};
+use crate::incidence::Incidence;
 use crate::{Result, StoreError, TriangleId, VertexId};
 
 static NEXT_MESH_UID: AtomicU64 = AtomicU64::new(1);
@@ -36,6 +37,8 @@ pub struct Mesh {
     pub(crate) live_triangles: usize,
     /// Cached corner table; dropped on every topology change.
     pub(crate) adjacency: Option<Adjacency>,
+    /// Cached vertex → triangles index; dropped on every topology change.
+    pub(crate) incidence: Option<Incidence>,
 }
 
 pub(crate) fn bit(bits: &Column<u64>, i: usize) -> bool {
@@ -226,6 +229,7 @@ impl Mesh {
             live_vertices: v,
             live_triangles: t,
             adjacency: None,
+            incidence: None,
         }
     }
 
@@ -237,6 +241,12 @@ impl Mesh {
     /// Changes on every commit, undo and redo. Equal revisions mean equal content.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Changes whenever [`Mesh::compact`] renumbers slots. Data indexed by slot id
+    /// (such as an acceleration structure) is stale once the epoch differs.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// World-space origin that positions are relative to.
@@ -399,6 +409,7 @@ impl Mesh {
     /// Called whenever triangles were added, removed or rewritten.
     pub(crate) fn on_topology_changed(&mut self) {
         self.adjacency = None;
+        self.incidence = None;
     }
 }
 

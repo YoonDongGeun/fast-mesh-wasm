@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 58ef387ac01953a3c83cfcd766ca46c2611a09cf9ebe2a8e6db4c078f9ea1d12 # shrinks to (options, policy) = (BuildOptions { quality: Sah, max_leaf_size: 1, sah_bins: 16, treelet_size: 8 }, UpdatePolicy { full_rebuild_fraction: 0.05, degradation_factor: 1.0 }), n = 3, steps = [Compact]
