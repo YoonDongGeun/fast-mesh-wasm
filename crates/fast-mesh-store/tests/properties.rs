@@ -224,6 +224,19 @@ fn check_invariants(m: &Mesh) {
     assert_eq!(m.channel("label").unwrap().len(), m.vertex_slots() * 2);
 }
 
+/// The incidence index must list, per vertex, exactly the alive triangles using it.
+fn check_incidence(m: &mut Mesh) {
+    m.ensure_incidence().unwrap();
+    let inc = m.incidence().unwrap();
+    for v in 0..m.vertex_slots() as u32 {
+        let expected: Vec<u32> = alive_triangles(m)
+            .into_iter()
+            .filter(|&t| m.triangle(t).unwrap().contains(&v))
+            .collect();
+        assert_eq!(inc.triangles(v), &expected[..], "incidence of vertex {v}");
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -311,6 +324,7 @@ proptest! {
                 }
             }
             check_invariants(&m);
+            check_incidence(&mut m);
         }
     }
 
