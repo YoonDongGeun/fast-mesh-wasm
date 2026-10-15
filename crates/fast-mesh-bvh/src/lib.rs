@@ -15,8 +15,10 @@ mod build;
 mod error;
 mod options;
 mod tree;
+mod update;
 
 pub use aabb::Aabb;
 pub use error::{BvhError, Result};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
 pub use tree::Bvh;
+pub use update::{Strategy, UpdateReport};
