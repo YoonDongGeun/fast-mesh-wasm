@@ -35,7 +35,9 @@ Update times are steady state: one mesh and one BVH are edited repeatedly, as in
 
 The default is **4,096**: topology edits cost about a third of the 65,536 setting, while moves and builds are unaffected. Even at 10M triangles the top tree stays small (4,096 treelets).
 
-`full_rebuild_fraction` (0.30) and `degradation_factor` (1.5) are kept. Moving 5% of the vertices of a 1M mesh refits in about 16 ms, against 439 ms for a full SAH build, so falling back to a full rebuild earlier than 30% dirty would be slower.
+`full_rebuild_fraction` (0.30) and `degradation_factor` (1.5) are kept. Moving about 10% of the vertices of a 1M mesh (50,176 of 502,681) refits in about 16 ms, against 439 ms for a full SAH build, so falling back to a full rebuild earlier than 30% dirty would be slower.
+
+**Caveat: moves right after a topology edit.** Refits find the triangles of moved vertices through the mesh's incidence index, which every topology change drops. The first vertex move after a topology edit therefore rebuilds the whole index (about 14–19 ms at 1M triangles, measured during review; proportional to mesh size), so mixed move/topology workloads pay that cost once per topology change. The move benchmarks above are steady state and do not include it. Maintaining the index incrementally is tracked as a follow-up.
 
 ## Reproducing
 
