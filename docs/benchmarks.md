@@ -37,7 +37,15 @@ The default is **4,096**: topology edits cost about a third of the 65,536 settin
 
 `full_rebuild_fraction` (0.30) and `degradation_factor` (1.5) are kept. Moving about 10% of the vertices of a 1M mesh (50,176 of 502,681) refits in about 16 ms, against 439 ms for a full SAH build, so falling back to a full rebuild earlier than 30% dirty would be slower.
 
-**Caveat: moves right after a topology edit.** Refits find the triangles of moved vertices through the mesh's incidence index, which every topology change drops. The first vertex move after a topology edit therefore rebuilds the whole index (about 14–19 ms at 1M triangles, measured during review; proportional to mesh size), so mixed move/topology workloads pay that cost once per topology change. The move benchmarks above are steady state and do not include it. Maintaining the index incrementally is tracked as a follow-up.
+**Moves right after a topology edit.** Refits find the triangles of moved vertices through the mesh's incidence index. Since issue #12 the index follows topology edits (only the touched rows are rewritten) instead of being rebuilt by the next move. Measured on 1M triangles in one run on 2026-10-16, before and after that change:
+
+| | Before (rebuild per edit) | After (index follows edits) |
+| --- | --- | --- |
+| Remove + re-add 200 triangles, then move 484 vertices | 22.3 ms | 6.2 ms |
+| Remove + re-add 200 triangles alone (unchanged) | 4.8 ms | 4.6 ms |
+| Move 484 vertices alone (unchanged) | 0.07 ms | 0.07 ms |
+
+These were measured on a later day than the main table above, so compare them only with each other. The index is still rebuilt in full after `Mesh::compact`, or after edits that leave more than 1/8 of it rewritten.
 
 ## Reproducing
 

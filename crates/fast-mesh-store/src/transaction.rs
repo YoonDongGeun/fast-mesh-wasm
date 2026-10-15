@@ -177,7 +177,7 @@ impl Transaction<'_> {
 
     fn alloc_triangle(&mut self, tri: [VertexId; 3]) -> Result<TriangleId> {
         let m = &mut *self.mesh;
-        m.on_topology_changed();
+        m.on_topology_write();
         let id = match m.triangle_free.pop() {
             Some(id) => {
                 self.popped_triangles.push(id);
@@ -292,7 +292,7 @@ impl Transaction<'_> {
         }
         self.write(|tx| {
             if !ids.is_empty() {
-                tx.mesh.on_topology_changed();
+                tx.mesh.on_topology_write();
             }
             for &t in ids {
                 let tri = tx.mesh.triangles.get(t as usize);
@@ -323,7 +323,7 @@ impl Transaction<'_> {
         }
         self.write(|tx| {
             if !ids.is_empty() {
-                tx.mesh.on_topology_changed();
+                tx.mesh.on_topology_write();
             }
             for (&t, &tri) in ids.iter().zip(triangles) {
                 let old = tx.mesh.triangles.get(t as usize);
@@ -458,6 +458,18 @@ impl Transaction<'_> {
             triangles_changed: changed_t,
             channels,
         };
+        if m.incidence_pending {
+            // The journal still holds every rewritten triangle's old vertices.
+            m.incidence_pending = false;
+            let c = &changes;
+            let ids = [&c.triangles_added[..], &c.triangles_changed[..]];
+            m.with_incidence(|inc, m| {
+                for (t, tri) in m.triangles.journal_entries() {
+                    inc.remove(t, tri)?;
+                }
+                inc.insert_alive(m, &ids)
+            });
+        }
         let base_revision = m.revision;
         if !changes.is_empty() {
             m.next_revision += 1;
@@ -476,9 +488,6 @@ impl Transaction<'_> {
             channel_data,
             changes,
         };
-        if patch.changes.topology_changed() {
-            m.on_topology_changed();
-        }
         Ok(patch)
     }
 
@@ -505,6 +514,8 @@ impl Transaction<'_> {
             m.triangle_free.push(t);
         }
         (m.live_vertices, m.live_triangles) = self.live_at_start;
+        // The columns are as they were, so the index is current again.
+        m.incidence_pending = false;
     }
 }
 

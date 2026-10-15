@@ -37,8 +37,11 @@ pub struct Mesh {
     pub(crate) live_triangles: usize,
     /// Cached corner table; dropped on every topology change.
     pub(crate) adjacency: Option<Adjacency>,
-    /// Cached vertex → triangles index; dropped on every topology change.
+    /// Cached vertex → triangles index; follows edits, dropped by `compact`.
     pub(crate) incidence: Option<Incidence>,
+    /// True inside a transaction that changed topology: `incidence` is stale
+    /// until the commit updates it or the rollback restores the mesh.
+    pub(crate) incidence_pending: bool,
 }
 
 pub(crate) fn bit(bits: &Column<u64>, i: usize) -> bool {
@@ -230,6 +233,7 @@ impl Mesh {
             live_triangles: t,
             adjacency: None,
             incidence: None,
+            incidence_pending: false,
         }
     }
 
@@ -406,10 +410,17 @@ impl Mesh {
         }
     }
 
-    /// Called whenever triangles were added, removed or rewritten.
-    pub(crate) fn on_topology_changed(&mut self) {
+    /// Called by every topology write inside a transaction.
+    pub(crate) fn on_topology_write(&mut self) {
+        self.adjacency = None;
+        self.incidence_pending = true;
+    }
+
+    /// Called when slots are renumbered: every topology cache is dropped.
+    pub(crate) fn on_slots_renumbered(&mut self) {
         self.adjacency = None;
         self.incidence = None;
+        self.incidence_pending = false;
     }
 }
 

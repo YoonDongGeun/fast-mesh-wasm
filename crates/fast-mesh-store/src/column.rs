@@ -84,6 +84,16 @@ pub(crate) fn try_reserve_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<
         .map_err(|_| StoreError::OutOfMemory)
 }
 
+/// `HashMap::try_reserve` reporting `OutOfMemory`.
+pub(crate) fn try_reserve_map<K: Eq + std::hash::Hash, V>(
+    m: &mut std::collections::HashMap<K, V>,
+    additional: usize,
+) -> Result<()> {
+    allocation_allowed()?;
+    m.try_reserve(additional)
+        .map_err(|_| StoreError::OutOfMemory)
+}
+
 pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
     let mut v = Vec::new();
     try_reserve_exact(&mut v, len)?;
@@ -190,6 +200,14 @@ impl<T: Copy + Default> Column<T> {
     /// free of duplicates. Only indices that existed at `begin()` are journaled.
     pub(crate) fn journal_ids(&self) -> &[u32] {
         self.journal.as_ref().map_or(&[], |j| &j.ids)
+    }
+
+    /// `(index, value at begin())` for every journaled index, in first-write order.
+    pub(crate) fn journal_entries(&self) -> impl Iterator<Item = (u32, T)> + '_ {
+        self.journal
+            .as_ref()
+            .into_iter()
+            .flat_map(|j| j.ids.iter().copied().zip(j.old.iter().copied()))
     }
 
     /// Builds every vector of the patch without touching the journal, so a failure

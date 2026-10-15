@@ -126,6 +126,18 @@ fn bench_size(c: &mut Criterion, label: &str, n: u32) {
             first = (first + 997) % (n * n * 2);
         })
     });
+    // Mixed workload: each move follows a topology edit, so the incidence index
+    // must follow the edit rather than be rebuilt.
+    let ids = patch(n, 22);
+    let mut up = true;
+    group.bench_function("remove + add 200 triangles, then move 484 vertices", |b| {
+        b.iter(|| {
+            replace_triangles(&mut m, &mut bvh, first);
+            first = (first + 997) % (n * n * 2);
+            move_patch(&mut m, &mut bvh, &ids, up);
+            up = !up;
+        })
+    });
     group.finish();
     assert!(
         bvh.validate(&m).is_ok(),
