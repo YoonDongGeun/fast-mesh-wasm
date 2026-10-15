@@ -62,6 +62,17 @@ Re-run `pnpm build` after changing Rust code; the JS tests import the built outp
 
 Prefer typed arrays (`&[f32]`, `&[u32]`, `Vec<f32>`) over `JsValue` in signatures, so the generated types stay precise and data is not serialized.
 
+## Supported Node.js versions
+
+The package supports every Node.js LTS line that has not reached end-of-life; currently Node.js 22 and newer. The lowest supported version is kept in sync in four places:
+
+- `engines.node` in `package.json` and `packages/fast-mesh-wasm/package.json`
+- the major version of `@types/node`, so code cannot use APIs that the lowest version lacks
+- the lowest Node.js version in the CI `install` matrix
+- this section
+
+When that version reaches end-of-life, raise all four together in one pull request, with a `minor` changeset (dropping a runtime is a breaking change). Dependabot skips `@types/node` major updates for this reason.
+
 ## Commits and pull requests
 
 - Branch from `main` in your fork, for example `feat/weld-vertices` or `fix/degenerate-normals`.
