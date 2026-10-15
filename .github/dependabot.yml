@@ -18,6 +18,11 @@ updates:
     groups:
       npm-dev:
         dependency-type: development
+    ignore:
+      # @types/node tracks the lowest supported Node.js version (`engines` in package.json).
+      # Raise its major together with that minimum, not on its own.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
