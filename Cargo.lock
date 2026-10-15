@@ -128,6 +128,14 @@ name = "fast-mesh"
 version = "0.1.0"
 
 [[package]]
+name = "fast-mesh-bvh"
+version = "0.1.0"
+dependencies = [
+ "fast-mesh-store",
+ "proptest",
+]
+
+[[package]]
 name = "fast-mesh-store"
 version = "0.1.0"
 dependencies = [
