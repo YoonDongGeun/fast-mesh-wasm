@@ -66,13 +66,13 @@ Rebuilding part of the tree appends new nodes and refs and leaves the old ones u
 - **`Quality::Fast`:** 30-bit Morton codes of centroids within the mesh bounds, sorted with a radix sort, then split top-down at the highest differing bit (falling back to the midpoint when all codes are equal).
 - `max_leaf_size`: 1–16, default 8.
 - Builds are deterministic: the same mesh and options give an identical tree.
-- **Treelets:** after building, the nodes nearest the root whose subtree holds at most `treelet_size` triangles (default 65,536) become treelet roots. The nodes above them form the small top tree. A mesh smaller than `treelet_size` is a single treelet. Treelets are the unit of partial rebuild and of degradation tracking.
+- **Treelets:** after building, the nodes nearest the root whose subtree holds at most `treelet_size` triangles (default 4,096, chosen from benchmarks: see `docs/benchmarks.md`) become treelet roots. The nodes above them form the small top tree. A mesh smaller than `treelet_size` is a single treelet. Treelets are the unit of partial rebuild and of degradation tracking.
 - Subtrees are built independently, so a later multithreaded build can split work at treelet roots without changing the layout.
 
 ## 5. Incremental update
 
 ```rust
-bvh.update(&mesh, &changes) -> Result<UpdateReport, BvhError>
+bvh.update(&mut mesh, &changes) -> Result<UpdateReport, BvhError>   // &mut: may build the mesh's incidence cache
 ```
 
 `changes` is the `ChangeSet` of every commit, undo or redo since the BVH last matched the mesh. Several sets can be merged by the caller (the Scene in Phase 4). The BVH records the mesh uid and the mesh revision it matches. `update` rejects another mesh (`MeshMismatch`) and then records the new revision. `bvh.is_current(&mesh)` compares revisions.
@@ -95,6 +95,8 @@ Manual control, as in the parent spec §5.3: `bvh.refit(&mesh, &triangles)`, `bv
 Failure atomicity: every fallible allocation happens before the tree is modified, or the update falls back to building a complete new tree and swapping it in. On `OutOfMemory` the BVH is left as it was before the call (still matching the old revision).
 
 Defaults (`full_rebuild_fraction`, `degradation_factor`, `treelet_size`, `max_leaf_size`) are confirmed or adjusted from benchmark results before the phase closes, and the chosen values are recorded in `docs/benchmarks.md`.
+
+Manual `refit` and `rebuild_region` do not change the revision the BVH records; `update`, `build` and `rebuild` do. Full builds reserve an estimated node count and grow on demand; treelet rebuilds reserve their worst case (with at least 1/8 headroom) before mutating.
 
 ## 6. Query
 
