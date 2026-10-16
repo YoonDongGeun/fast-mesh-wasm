@@ -205,16 +205,51 @@ fn validate(
     check(mesh_b, bvh_b)
 }
 
-/// The Euclidean distance between boxes `p` and `q` in `f64`, 0 when they
-/// overlap or touch, and infinite when either is empty.
+/// The relative slack on pruning bounds; see [`beyond`].
+const PRUNE_SLACK: f64 = 1.0 / (1u64 << 30) as f64;
+
+/// The largest absolute coordinate of A's root box and of B's root box moved
+/// into A's space: the magnitude that the rounding error of the triangle
+/// distances scales with. 0 when either tree is empty (nothing is visited
+/// then). It is infinite only if a moved box overflows `f32`, and then
+/// [`beyond`] prunes nothing.
+fn magnitude(bvh_a: &Bvh, bvh_b: &Bvh, xf: &Rigid) -> f64 {
+    let (Some(ra), Some(rb)) = (bvh_a.root(), bvh_b.root()) else {
+        return 0.0;
+    };
+    let boxes = [
+        bvh_a.node(ra).bounds,
+        xf.transform_box(&bvh_b.node(rb).bounds),
+    ];
+    boxes
+        .iter()
+        .flat_map(|b| b.min.iter().chain(&b.max))
+        .map(|v| f64::from(v.abs()))
+        .fold(0.0, f64::max)
+}
+
+/// Whether a pair of nodes whose boxes are `box_d` apart ([`box_distance`])
+/// can be dropped under `bound`, for meshes of coordinate magnitude
+/// `magnitude` ([`magnitude`]).
 ///
-/// It is a lower bound on the distance between any point of `p` and any point
-/// of `q`, up to `f64` rounding. B's boxes come from
-/// [`Rigid::transform_box`], which contains every vertex as moved by
-/// [`Rigid::apply`], rounded outward to `f32`; that outward rounding is far
-/// larger than the `f64` rounding of the triangle distances, so in practice
-/// pruning on this bound never drops a pair whose computed distance is within
-/// the bound.
+/// The box gap is a true lower bound on the distance between the boxes'
+/// contents up to `f64` rounding of its own, and with an exact transform
+/// (identity, 90° turns, translations that keep B's vertices on the `f32`
+/// grid) it is essentially exact. The triangle distances, however, carry an
+/// absolute error of a few `f64` ulps of the coordinates. So a pair whose
+/// computed distance is within `bound` can sit in boxes slightly more than
+/// `bound` apart. Pruning only beyond `bound + 2^-30 * (magnitude + bound)`
+/// covers that error with a wide margin, slivers included. The slack only
+/// adds work; which pairs are accepted is still decided by the computed
+/// distance against `bound` itself.
+fn beyond(box_d: f64, bound: f64, magnitude: f64) -> bool {
+    box_d > bound + PRUNE_SLACK * (magnitude + bound)
+}
+
+/// The Euclidean distance between boxes `p` and `q` in `f64`, 0 when they
+/// overlap or touch, and infinite when either is empty. A lower bound on the
+/// distance between any point of `p` and any point of `q`, up to `f64`
+/// rounding; queries prune on it through [`beyond`].
 fn box_distance(p: &Aabb, q: &Aabb) -> f64 {
     if p.is_empty() || q.is_empty() {
         return f64::INFINITY;
@@ -321,9 +356,10 @@ fn mesh_distance_with<const N: usize>(
     max_distance: f32,
 ) -> Option<MeshDistance> {
     // The distance of the best pair so far, or `max_distance` before one is
-    // found. Pairs whose boxes are farther are pruned, in `key` and again in
-    // `visit` (as the bound shrinks after a pair is pushed).
+    // found. Pairs whose boxes are farther (with slack) are pruned, in `key`
+    // and again in `visit`, as the bound shrinks after a pair is pushed.
     let bound = Cell::new(f64::from(max_distance));
+    let m = magnitude(bvh_a, bvh_b, xf);
     let mut best: Option<(TriangleId, TriangleId, TriTriDist)> = None;
     for_each_pair::<N>(
         mesh_a,
@@ -333,9 +369,9 @@ fn mesh_distance_with<const N: usize>(
         xf,
         |p, q| {
             let d = box_distance(p, q);
-            (d <= bound.get()).then_some(d)
+            (!beyond(d, bound.get(), m)).then_some(d)
         },
-        |k| k > bound.get(),
+        |k| beyond(k, bound.get(), m),
         |a, pa, b, pb| {
             let d = tri_tri_distance(pa, pb);
             let dist = d.dist2.sqrt();
@@ -374,6 +410,7 @@ fn triangles_near_with<const N: usize>(
     out_b: &mut Vec<TriangleId>,
 ) -> Result<()> {
     let margin = f64::from(margin);
+    let m = magnitude(bvh_a, bvh_b, xf);
     let mut ap_a = Appender::new(out_a);
     let mut ap_b = Appender::new(out_b);
     let mut failed = None;
@@ -385,7 +422,7 @@ fn triangles_near_with<const N: usize>(
         xf,
         |p, q| {
             let d = box_distance(p, q);
-            (d <= margin).then_some(d)
+            (!beyond(d, margin, m)).then_some(d)
         },
         // `key` already culled every pair beyond the fixed margin.
         |_| false,
@@ -485,30 +522,35 @@ mod tests {
         (0..mesh.triangle_slots() as TriangleId).filter(|&t| mesh.is_triangle_alive(t))
     }
 
-    /// B turned by `rot` after the flip, with its vertex `(2, 3, 2)` (one of
-    /// its highest, so lowest once flipped) right over A's vertex `(3, 2, 2)`
-    /// (one of its highest, near the middle), and raised so B's lowest vertex
-    /// is `gap` above A's highest. For a rotation about z the two vertices
-    /// then meet when `gap` is 0.
+    /// B turned by `rot` after the flip, with its lowest vertex (once turned;
+    /// on ties the one nearest B's middle) right over A's vertex `(3, 2, 2)`,
+    /// one of A's highest, near the middle, and `gap` above it. So B is
+    /// `gap` above A when `gap > 0`, and its lowest vertex touches or dips
+    /// below that peak of A otherwise.
     fn pose(ma: &Mesh, mb: &Mesh, rot: &M3, gap: f64) -> Rigid {
         let rotation = mul(rot, &FLIP_X);
         let mut xf = Rigid {
             rotation,
             translation: [0.0; 3],
         };
-        let moved = xf.apply([2.0, 3.0, 2.0]);
-        xf.translation = [3.0 - moved[0], 2.0 - moved[1], 0.0];
+        let off_middle = |p: &[f32; 3]| (p[0] - 2.5).abs() + (p[1] - 2.5).abs();
+        let low = *mb
+            .positions()
+            .iter()
+            .min_by(|p, q| {
+                let (zp, zq) = (xf.apply(**p)[2], xf.apply(**q)[2]);
+                zp.total_cmp(&zq)
+                    .then(off_middle(p).total_cmp(&off_middle(q)))
+            })
+            .unwrap();
         let top_a = ma
             .positions()
             .iter()
             .map(|p| f64::from(p[2]))
             .fold(f64::NEG_INFINITY, f64::max);
-        let low_b = mb
-            .positions()
-            .iter()
-            .map(|&p| xf.apply(p)[2])
-            .fold(f64::INFINITY, f64::min);
-        xf.translation[2] = top_a + gap - low_b;
+        assert_eq!(top_a, 2.0);
+        let moved = xf.apply(low);
+        xf.translation = [3.0 - moved[0], 2.0 - moved[1], top_a + gap - moved[2]];
         xf
     }
 
@@ -647,7 +689,13 @@ mod tests {
     fn intersecting_pairs_matches_brute_force() {
         let mut total = 0;
         for Posed {
-            ma, ba, mb, bb, xf, ..
+            ma,
+            ba,
+            mb,
+            bb,
+            xf,
+            gap,
+            ..
         } in posed()
         {
             let want: Vec<_> = brute(&ma, &mb, &xf)
@@ -655,6 +703,11 @@ mod tests {
                 .filter(|e| e.2)
                 .map(|e| (e.0, e.1))
                 .collect();
+            // Every overlapping pose meets, the tilted random one included,
+            // so the contact paths run under a general rotation too.
+            if gap < 0.0 {
+                assert!(!want.is_empty(), "gap {gap}");
+            }
             let mut out = vec![(999, 999)];
             let n = intersecting_pairs(&ma, &ba, &mb, &bb, &xf, &mut out).unwrap();
             assert_eq!(n, want.len());
@@ -733,7 +786,13 @@ mod tests {
                 assert!(gap <= 0.0);
                 assert_eq!(got.distance, 0.0);
                 let (pa, pb) = (tri_a(&ma, got.triangle_a), tri_b(&mb, &xf, got.triangle_b));
-                assert!(tri_tri_intersect(pa, pb));
+                // The pair intersects, or its positive distance rounds to 0
+                // (seen here: a vertex of B one f64 ulp below a peak of A,
+                // where both closest points round to the peak).
+                assert!(
+                    tri_tri_intersect(pa, pb) || tri_tri_distance(pa, pb).dist2 == 0.0,
+                    "gap {gap}, {pa:?} {pb:?}"
+                );
                 continue;
             }
             separated += 1;
@@ -838,6 +897,90 @@ mod tests {
                 (vec![], vec![])
             );
         }
+    }
+
+    /// Exact transforms keep the box gap exact while the triangle distances
+    /// carry `f64` rounding at the coordinates' magnitude. A's vertex `p` is
+    /// A's extreme point along x, and B's triangles lie in the plane `gap`
+    /// beyond it, around `p`'s projection. So the true distance equals the box
+    /// gap, and the computed one (a projection onto B's face) can fall just
+    /// below it. B's two triangles sit in separate leaves, so the second leaf
+    /// pair is pruned against the bound set by the first.
+    #[test]
+    fn pruning_keeps_pairs_at_rounding_level() {
+        use fast_mesh_bvh::BuildOptions;
+        let opts = BuildOptions {
+            max_leaf_size: 1,
+            ..Default::default()
+        };
+        let mut rng = Lcg(2024);
+        let ulp = 2f32.powi(-14); // The f32 spacing in [512, 1024).
+        for _ in 0..500 {
+            let mut f = |lo: f32, span: f32| lo + rng.next() * span;
+            let p = [800.0, f(600.0, 300.0), f(600.0, 300.0)];
+            let gap = ulp * (1 + (f(0.0, 4.0) as i32)) as f32;
+            let x = p[0] + gap;
+            let a = [
+                p,
+                [f(700.0, 100.0), f(600.0, 300.0), f(600.0, 300.0)],
+                [f(700.0, 100.0), f(600.0, 300.0), f(600.0, 300.0)],
+            ];
+            // Each triangle surrounds (p.y, p.z): corners below-left,
+            // below-right and above.
+            let mut b = Vec::new();
+            for _ in 0..2 {
+                b.push([x, p[1] - f(1.0, 99.0), p[2] - f(1.0, 99.0)]);
+                b.push([x, p[1] + f(1.0, 99.0), p[2] - f(1.0, 99.0)]);
+                b.push([x, p[1], p[2] + f(1.0, 99.0)]);
+            }
+            let ma = Mesh::from_buffers(a.as_flattened(), &[0, 1, 2]).unwrap();
+            let mb = Mesh::from_buffers(b.as_flattened(), &[0, 1, 2, 3, 4, 5]).unwrap();
+            let ba = Bvh::build(&ma, &opts).unwrap();
+            let bb = Bvh::build(&mb, &opts).unwrap();
+            let xf = Rigid::IDENTITY;
+
+            let all = brute(&ma, &mb, &xf);
+            let (wa, wb, wd) = brute_min(&all).unwrap();
+            let d = wd.dist2.sqrt();
+            let want = MeshDistance {
+                distance: d as f32,
+                point_a: wd.pa.map(|v| v as f32),
+                point_b: wd.pb.map(|v| v as f32),
+                triangle_a: wa,
+                triangle_b: wb,
+            };
+            let got = mesh_distance(&ma, &ba, &mb, &bb, &xf, f32::INFINITY).unwrap();
+            assert_eq!(got, Some(want), "gap {gap}, oracle {d}");
+
+            // The smallest f32 bound that admits the computed distance.
+            let mut bound = d as f32;
+            if f64::from(bound) < d {
+                bound = bound.next_up();
+            }
+            assert!(
+                mesh_distance(&ma, &ba, &mb, &bb, &xf, bound)
+                    .unwrap()
+                    .is_some()
+            );
+            let (na, nb) = near(&ma, &ba, &mb, &bb, &xf, bound);
+            assert!(
+                na.contains(&wa) && nb.contains(&wb),
+                "gap {gap}, oracle {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_slack_covers_rounding() {
+        // A box gap above the bound by less than the slack is kept; one above
+        // it by more is pruned; an infinite bound prunes nothing.
+        let (m, bound) = (1000.0, 1e-4);
+        let slack = PRUNE_SLACK * (m + bound);
+        assert!(slack > 1e-7 && slack < 1e-6);
+        assert!(!beyond(bound + slack / 2.0, bound, m));
+        assert!(beyond(bound + 2.0 * slack, bound, m));
+        assert!(!beyond(1e300, f64::INFINITY, m));
+        assert!(beyond(1e-9, 0.0, 0.0));
     }
 
     #[test]
@@ -963,9 +1106,10 @@ mod tests {
             }
         }
         for bad in [-1.0, f32::NAN, -f32::MIN_POSITIVE] {
-            let mut x = (Vec::new(), Vec::new());
+            let mut x = (vec![7], vec![8]);
             let e = triangles_near(&m, &b, &other, &b, &ok, bad, &mut x.0, &mut x.1);
             assert!(is_invalid(e.unwrap_err()));
+            assert_eq!(x, (vec![7], vec![8]));
             let e = mesh_distance(&m, &b, &other, &b, &ok, bad);
             assert!(is_invalid(e.unwrap_err()));
         }
