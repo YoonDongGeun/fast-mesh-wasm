@@ -449,7 +449,31 @@ fn apply_step(m: &mut Mesh, bvh: &mut Bvh, h: &mut History, step: &Step) {
 /// A random rigid transform that puts B's middle near A's middle: a random unit
 /// quaternion (or one of a few exact rotations) and a translation with jitter,
 /// so that the meshes touch, overlap or sit slightly apart.
-fn random_rigid(rng: &mut Lcg) -> Rigid {
+///
+/// In one case of four the transform is an exact contact instead: the identity
+/// or a flip about x (entries 0 and ±1), with a translation that puts an alive
+/// vertex of B exactly on an alive vertex of A. Both are exact in `f64`, so the
+/// meshes touch exactly there, whatever the edits did.
+fn random_rigid(rng: &mut Lcg, ma: &Mesh, mb: &Mesh) -> Rigid {
+    if rng.next() < 0.25 {
+        let rotation = [
+            Rigid::IDENTITY.rotation,
+            [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
+        ][(rng.next() * 2.0) as usize % 2];
+        let va = pick(&alive(ma, true), (rng.next() * 1e6) as u32);
+        let vb = pick(&alive(mb, true), (rng.next() * 1e6) as u32);
+        if let (Some(va), Some(vb)) = (va, vb) {
+            let pa = ma.position(va).unwrap().map(f64::from);
+            let pb = mb.position(vb).unwrap().map(f64::from);
+            let translation = std::array::from_fn(|i| {
+                pa[i] - (0..3).map(|k| rotation[i][k] * pb[k]).sum::<f64>()
+            });
+            return Rigid {
+                rotation,
+                translation,
+            };
+        }
+    }
     let rotation = if rng.next() < 0.25 {
         // Exact rotations: identity, a flip about x, a quarter turn about z.
         [
@@ -593,10 +617,25 @@ fn check_pair_queries(
             prop_assert!(nb.contains(&g.triangle_b), "{:?}", g);
         } else {
             // Zero means touching or closer than rounding: the pair intersects
-            // or its computed distance is 0.
-            prop_assert!(info.hit || info.dist.distance == 0.0);
+            // or its f64 distance is at most 0 (decided exactly through
+            // `max_distance = 0`).
+            prop_assert!(
+                info.hit
+                    || pair_is_near(
+                        &sa[single(g.triangle_a, &sa)],
+                        &sb[single(g.triangle_b, &sb)],
+                        xf,
+                        0.0
+                    ),
+                "{:?}",
+                g
+            );
             let zero = mesh_distance(ma, ba, mb, bb, xf, 0.0).unwrap();
             prop_assert_eq!(zero.map(|z| z.distance), Some(0.0));
+            // Cross-query consistency: a margin of 0 contains the pair.
+            let (na, nb) = near(ma, ba, mb, bb, xf, 0.0);
+            prop_assert!(na.contains(&g.triangle_a), "{:?}", g);
+            prop_assert!(nb.contains(&g.triangle_b), "{:?}", g);
         }
     } else {
         prop_assert_eq!(mesh_distance(ma, ba, mb, bb, xf, 1.0), Ok(None));
@@ -646,7 +685,7 @@ proptest! {
         let (mut ha, mut hb) = (History::new(usize::MAX), History::new(usize::MAX));
         let mut rng = Lcg(seed);
         for _ in 0..2 {
-            let xf = random_rigid(&mut rng);
+            let xf = random_rigid(&mut rng, &ma, &mb);
             check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
         }
         for i in 0..steps_a.len().max(steps_b.len()) {
@@ -657,7 +696,7 @@ proptest! {
                 apply_step(&mut mb, &mut bb, &mut hb, s);
             }
             for _ in 0..2 {
-                let xf = random_rigid(&mut rng);
+                let xf = random_rigid(&mut rng, &ma, &mb);
                 check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
             }
         }
