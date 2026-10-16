@@ -419,7 +419,7 @@ fn for_each_pair<const N: usize>(
     prune: impl Fn(f64) -> bool,
     mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
 ) {
-    traverse_pairs_with::<N>(bvh_a, bvh_b, xf, key, |va, vb, k| {
+    traverse_pairs_with::<N, f64>(bvh_a, bvh_b, xf, key, |va, vb, k| {
         if prune(k) {
             return Step::Skip;
         }
