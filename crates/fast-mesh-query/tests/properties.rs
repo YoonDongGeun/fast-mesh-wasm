@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, Quality};
 use fast_mesh_query::{
     ClosestOptions, Cull, MeshDistance, Ray, RayOptions, Region, Rigid, closest_point,
-    intersecting_pairs, intersects, mesh_distance, raycast, raycast_all, raycast_any,
-    triangles_in, triangles_near, vertices_in,
+    intersecting_pairs, intersects, mesh_distance, raycast, raycast_all, raycast_any, triangles_in,
+    triangles_near, vertices_in,
 };
 use fast_mesh_store::{History, Mesh, Transaction};
 use proptest::prelude::*;
@@ -542,14 +542,7 @@ fn pair_is_near(sa: &Single, sb: &Single, xf: &Rigid, margin: f32) -> bool {
         .is_some()
 }
 
-fn near(
-    ma: &Mesh,
-    ba: &Bvh,
-    mb: &Mesh,
-    bb: &Bvh,
-    xf: &Rigid,
-    margin: f32,
-) -> (Vec<u32>, Vec<u32>) {
+fn near(ma: &Mesh, ba: &Bvh, mb: &Mesh, bb: &Bvh, xf: &Rigid, margin: f32) -> (Vec<u32>, Vec<u32>) {
     let (mut a, mut b) = (Vec::new(), Vec::new());
     triangles_near(ma, ba, mb, bb, xf, margin, &mut a, &mut b).unwrap();
     (a, b)
@@ -567,11 +560,7 @@ fn check_pair_queries(
     let single = |id: u32, s: &[Single]| s.iter().position(|x| x.id == id).unwrap();
 
     // intersects and intersecting_pairs.
-    let want_pairs: Vec<(u32, u32)> = table
-        .iter()
-        .filter(|p| p.hit)
-        .map(|p| (p.a, p.b))
-        .collect();
+    let want_pairs: Vec<(u32, u32)> = table.iter().filter(|p| p.hit).map(|p| (p.a, p.b)).collect();
     prop_assert_eq!(intersects(ma, ba, mb, bb, xf), Ok(!want_pairs.is_empty()));
     let mut out = vec![(999, 999)];
     let n = intersecting_pairs(ma, ba, mb, bb, xf, &mut out).unwrap();
@@ -583,10 +572,7 @@ fn check_pair_queries(
     // (rounding is monotone), and the pair it names is one of the pairs at that
     // distance, with the same points. Ties inside f32 rounding are not told
     // apart here; the unit tests cover the smallest-pair rule on f64.
-    let min = table
-        .iter()
-        .map(|p| p.dist.distance)
-        .min_by(f32::total_cmp);
+    let min = table.iter().map(|p| p.dist.distance).min_by(f32::total_cmp);
     let got = mesh_distance(ma, ba, mb, bb, xf, f32::INFINITY).unwrap();
     prop_assert_eq!(got.map(|g| g.distance), min);
     if let (Some(g), Some(min)) = (got, min) {
@@ -625,12 +611,7 @@ fn check_pair_queries(
             .filter(|p| {
                 p.hit
                     || (p.dist.distance <= margin
-                        && pair_is_near(
-                            &sa[single(p.a, &sa)],
-                            &sb[single(p.b, &sb)],
-                            xf,
-                            margin,
-                        ))
+                        && pair_is_near(&sa[single(p.a, &sa)], &sb[single(p.b, &sb)], xf, margin))
             })
             .collect();
         let mut want_a: Vec<u32> = near_pairs.iter().map(|p| p.a).collect();
