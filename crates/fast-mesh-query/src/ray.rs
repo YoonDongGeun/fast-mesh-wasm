@@ -107,7 +107,7 @@ fn validate_opts(opts: &RayOptions) -> Result<()> {
     Ok(())
 }
 
-fn points(mesh: &Mesh, id: TriangleId) -> [[f32; 3]; 3] {
+pub(crate) fn points(mesh: &Mesh, id: TriangleId) -> [[f32; 3]; 3] {
     let positions = mesh.positions();
     mesh.triangles()[id as usize].map(|v| positions[v as usize])
 }
@@ -325,6 +325,7 @@ pub fn raycast_many(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{Lcg, build, wavy};
     use crate::tri::{RayPre, ray_triangle};
     use crate::{QueryError, fail_allocations_after};
     use fast_mesh_bvh::{BuildOptions, Bvh, Quality};
@@ -333,41 +334,10 @@ mod tests {
     const T: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     const DOWN: [f32; 3] = [0.0, 0.0, -1.0];
 
-    fn wavy(n: u32) -> Mesh {
-        let mut positions = Vec::new();
-        for y in 0..=n {
-            for x in 0..=n {
-                positions.extend([x as f32, y as f32, ((x + y) % 3) as f32]);
-            }
-        }
-        let mut indices = Vec::new();
-        for y in 0..n {
-            for x in 0..n {
-                let a = y * (n + 1) + x;
-                indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
-            }
-        }
-        Mesh::from_buffers(&positions, &indices).unwrap()
-    }
-
-    fn build(mesh: &Mesh, quality: Quality) -> Bvh {
-        let opts = BuildOptions {
-            quality,
-            max_leaf_size: 2,
-            ..Default::default()
-        };
-        Bvh::build(mesh, &opts).unwrap()
-    }
-
     fn one_triangle(p: &[f32; 9]) -> (Mesh, Bvh) {
         let mesh = Mesh::from_buffers(p, &[0, 1, 2]).unwrap();
         let bvh = build(&mesh, Quality::Sah);
         (mesh, bvh)
-    }
-
-    fn points(mesh: &Mesh, id: TriangleId) -> [[f32; 3]; 3] {
-        let tri = mesh.triangles()[id as usize];
-        tri.map(|v| mesh.positions()[v as usize])
     }
 
     /// Every hit in range, by testing every alive triangle.
@@ -389,19 +359,6 @@ mod tests {
 
     fn brute_closest(mesh: &Mesh, ray: &Ray, opts: &RayOptions) -> Option<(TriangleId, f32)> {
         brute_all(mesh, ray, opts).first().copied()
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        /// Uniform in `[0, 1)`.
-        fn next(&mut self) -> f32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 40) as f32 / (1u64 << 24) as f32
-        }
     }
 
     /// 500 rays from above a `wavy(n)` grid, pointing down with some jitter.

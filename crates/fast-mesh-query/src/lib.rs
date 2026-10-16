@@ -5,22 +5,28 @@
 //! edited after the BVH was last updated. Queries allocate only into the
 //! output vector they are given.
 //!
+//! - Closest point: [`closest_point`] and [`closest_point_many`], with the
+//!   [`Feature`] of the triangle the nearest point lies on.
 //! - Raycasts: [`raycast`] (nearest hit), [`raycast_any`] (occlusion),
 //!   [`raycast_all`] (every hit, sorted) and [`raycast_many`] (a batch). The
 //!   ray-triangle test is watertight: a ray through a shared edge or vertex
 //!   never slips between the triangles meeting there. Ties go to the smallest
 //!   triangle id.
 
+mod closest;
 mod error;
 mod ray;
+#[cfg(test)]
+mod test_util;
 mod tri;
 
 use fast_mesh_bvh::Bvh;
 use fast_mesh_store::Mesh;
 
+pub use closest::*;
 pub use error::{QueryError, Result};
 pub use ray::*;
-pub use tri::Cull;
+pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
 pub(crate) fn check(mesh: &Mesh, bvh: &Bvh) -> Result<()> {

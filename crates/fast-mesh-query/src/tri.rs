@@ -139,6 +139,152 @@ pub(crate) fn ray_triangle(
     Some(TriHit { t, barycentric })
 }
 
+/// The part of a triangle that is closest to a query point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    /// The corner with this index (0, 1 or 2).
+    Vertex(u8),
+    /// The edge joining corners `k` and `(k + 1) % 3`.
+    Edge(u8),
+    /// The interior of the triangle.
+    Face,
+}
+
+/// The point of a triangle closest to a query point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriClosest {
+    pub point: [f32; 3],
+    /// Squared distance from the query to `point`.
+    pub dist2: f32,
+    /// Weights of the triangle's three corners at `point`.
+    pub barycentric: [f32; 3],
+    pub feature: Feature,
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let d = sub(a, b);
+    dot(d, d)
+}
+
+/// The point `a + t * (b - a)`.
+fn lerp_point(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    std::array::from_fn(|k| a[k] + t * (b[k] - a[k]))
+}
+
+/// Closest point of the segment `p[i]..p[j]` to `q`, as an edge or an end vertex.
+fn on_segment(q: [f32; 3], p: [[f32; 3]; 3], i: usize, j: usize, edge: u8) -> TriClosest {
+    let ab = sub(p[j], p[i]);
+    let len2 = dot(ab, ab);
+    let t = if len2 > 0.0 {
+        dot(sub(q, p[i]), ab) / len2
+    } else {
+        0.0
+    };
+    let (t, feature) = if t.is_nan() || t <= 0.0 {
+        (0.0, Feature::Vertex(i as u8))
+    } else if t >= 1.0 {
+        (1.0, Feature::Vertex(j as u8))
+    } else {
+        (t, Feature::Edge(edge))
+    };
+    let mut barycentric = [0.0; 3];
+    barycentric[i] = 1.0 - t;
+    barycentric[j] = t;
+    let point = lerp_point(p[i], p[j], t);
+    TriClosest {
+        point,
+        dist2: dist2(q, point),
+        barycentric,
+        feature,
+    }
+}
+
+/// The point of the triangle `p` closest to `q` (Ericson, Real-Time Collision
+/// Detection, 5.1.5), with the feature it lies on. A triangle whose area
+/// underflows to zero is treated as its three edges.
+pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
+    let [a, b, c] = p;
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(q, a);
+    let bp = sub(q, b);
+    let cp = sub(q, c);
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+    let vc = d1 * d4 - d3 * d2;
+    let vb = d5 * d2 - d1 * d6;
+    let va = d3 * d6 - d5 * d4;
+    let sum = va + vb + vc;
+
+    if sum == 0.0 || !sum.is_finite() {
+        let mut best = on_segment(q, p, 0, 1, 0);
+        for (i, j, edge) in [(1, 2, 1), (2, 0, 2)] {
+            let c = on_segment(q, p, i, j, edge);
+            if c.dist2 < best.dist2 {
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    let vertex = |k: u8| {
+        let mut barycentric = [0.0; 3];
+        barycentric[k as usize] = 1.0;
+        let point = p[k as usize];
+        TriClosest {
+            point,
+            dist2: dist2(q, point),
+            barycentric,
+            feature: Feature::Vertex(k),
+        }
+    };
+    let edge = |i: usize, j: usize, t: f32, k: u8| {
+        let mut barycentric = [0.0; 3];
+        barycentric[i] = 1.0 - t;
+        barycentric[j] = t;
+        let point = lerp_point(p[i], p[j], t);
+        TriClosest {
+            point,
+            dist2: dist2(q, point),
+            barycentric,
+            feature: Feature::Edge(k),
+        }
+    };
+
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return vertex(0);
+    }
+    if d3 >= 0.0 && d4 <= d3 {
+        return vertex(1);
+    }
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return edge(0, 1, d1 / (d1 - d3), 0);
+    }
+    if d6 >= 0.0 && d5 <= d6 {
+        return vertex(2);
+    }
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return edge(2, 0, 1.0 - d2 / (d2 - d6), 2);
+    }
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return edge(1, 2, (d4 - d3) / ((d4 - d3) + (d5 - d6)), 1);
+    }
+    let v = vb / sum;
+    let w = vc / sum;
+    let point = std::array::from_fn(|k| a[k] + ab[k] * v + ac[k] * w);
+    TriClosest {
+        point,
+        dist2: dist2(q, point),
+        barycentric: [1.0 - v - w, v, w],
+        feature: Feature::Face,
+    }
+}
+
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -245,5 +391,79 @@ mod tests {
                 .iter()
                 .any(|p| cast(o, DOWN, *p, Cull::None).is_some())
         );
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6)
+    }
+
+    #[test]
+    fn voronoi_regions() {
+        let cases = [
+            (
+                [-1.0, -1.0, 0.0],
+                Feature::Vertex(0),
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ),
+            (
+                [2.0, -1.0, 0.0],
+                Feature::Vertex(1),
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ),
+            (
+                [-1.0, 2.0, 0.0],
+                Feature::Vertex(2),
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ),
+            (
+                [0.5, -1.0, 0.0],
+                Feature::Edge(0),
+                [0.5, 0.0, 0.0],
+                [0.5, 0.5, 0.0],
+            ),
+            (
+                [1.0, 1.0, 0.0],
+                Feature::Edge(1),
+                [0.5, 0.5, 0.0],
+                [0.0, 0.5, 0.5],
+            ),
+            (
+                [-1.0, 0.5, 0.0],
+                Feature::Edge(2),
+                [0.0, 0.5, 0.0],
+                [0.5, 0.0, 0.5],
+            ),
+            (
+                [0.25, 0.25, 3.0],
+                Feature::Face,
+                [0.25, 0.25, 0.0],
+                [0.5, 0.25, 0.25],
+            ),
+        ];
+        for (q, feature, point, bary) in cases {
+            let c = closest_on_triangle(q, T);
+            assert_eq!(c.feature, feature, "{q:?}");
+            assert!(close(c.point, point), "{q:?}: {:?}", c.point);
+            assert!(close(c.barycentric, bary), "{q:?}: {:?}", c.barycentric);
+        }
+        assert_eq!(closest_on_triangle([0.25, 0.25, 3.0], T).dist2, 9.0);
+    }
+
+    #[test]
+    fn degenerate_triangle_uses_segments() {
+        let line = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]];
+        let c = closest_on_triangle([1.0, 0.0, 0.0], line);
+        assert!(close(c.point, [0.5, 0.5, 0.0]));
+        assert_eq!(c.dist2, 0.5);
+        assert!(matches!(c.feature, Feature::Edge(_)));
+        assert!(c.barycentric.iter().all(|b| b.is_finite()));
+
+        let dot = [[1.0, 1.0, 1.0]; 3];
+        let c = closest_on_triangle([0.0, 0.0, 0.0], dot);
+        assert_eq!(c.feature, Feature::Vertex(0));
+        assert_eq!(c.dist2, 3.0);
     }
 }
