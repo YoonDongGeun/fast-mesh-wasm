@@ -14,8 +14,6 @@ pub enum Cull {
 }
 
 /// Per-ray constants, computed once and reused for every triangle.
-// Used by the queries added in a later task.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RayPre {
     pub origin: [f32; 3],
@@ -30,7 +28,6 @@ pub(crate) struct RayPre {
     sz: f32,
 }
 
-#[allow(dead_code)]
 impl RayPre {
     pub(crate) fn new(origin: [f32; 3], dir: [f32; 3]) -> RayPre {
         let a = [dir[0].abs(), dir[1].abs(), dir[2].abs()];
@@ -61,8 +58,6 @@ impl RayPre {
 }
 
 /// A ray-triangle hit.
-// Used by the queries added in a later task.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriHit {
     /// Distance along the ray, in units of `dir`.
@@ -74,8 +69,13 @@ pub(crate) struct TriHit {
 /// Watertight test of a ray against the triangle `p`, hitting when
 /// `min_t <= t <= max_t`. Rays through a shared edge or vertex hit at least one
 /// of the triangles meeting there.
-// Used by the queries added in a later task.
-#[allow(dead_code)]
+///
+/// A zero-area triangle is never hit. "Zero area" means that `det`, the sum of
+/// the three edge functions, is exactly zero as computed (after the `f64`
+/// fallback). A triangle that is collinear in real numbers but whose `det`
+/// rounds to a nonzero value may still be hit, at a point that is valid for
+/// the rounded geometry. A hit whose `t` or weights are not finite is
+/// rejected.
 pub(crate) fn ray_triangle(
     pre: &RayPre,
     p: [[f32; 3]; 3],
@@ -125,14 +125,18 @@ pub(crate) fn ray_triangle(
     }
     let t_scaled = u * (pre.sz * a[kz]) + v * (pre.sz * b[kz]) + w * (pre.sz * c[kz]);
     let t = t_scaled / det;
-    if !(min_t <= t && t <= max_t) {
+    // `t` overflows to infinity when `t_scaled` does, which an infinite `max_t`
+    // would otherwise accept.
+    if !(t.is_finite() && min_t <= t && t <= max_t) {
         return None;
     }
-    let inv = 1.0 / det;
-    Some(TriHit {
-        t,
-        barycentric: [u * inv, v * inv, w * inv],
-    })
+    // Dividing rather than multiplying by `1 / det` keeps the weights finite
+    // when `det` is subnormal (its reciprocal overflows).
+    let barycentric = [u / det, v / det, w / det];
+    if !barycentric.iter().all(|b| b.is_finite()) {
+        return None;
+    }
+    Some(TriHit { t, barycentric })
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -193,6 +197,33 @@ mod tests {
         assert!(cast([0.25, 0.25, 0.0], [1.0, 0.0, 0.0], T, Cull::None).is_none());
         let d = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]];
         assert!(cast([1.0, 1.0, 1.0], DOWN, d, Cull::None).is_none());
+    }
+
+    #[test]
+    fn subnormal_det_gives_finite_weights() {
+        // Edge functions of about 1e-44 are subnormal in f32, so `1 / det`
+        // overflows. The hit must still have finite weights.
+        let s = 1e-22;
+        let p = [[0.0, 0.0, 0.0], [s, 0.0, 0.0], [0.0, s, 0.0]];
+        let o = [s / 4.0, s / 4.0, 1.0];
+        let h = cast(o, DOWN, p, Cull::None).unwrap();
+        assert_eq!(h.t, 1.0);
+        assert!(h.barycentric.iter().all(|b| b.is_finite()));
+        let sum: f32 = h.barycentric.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn overflowing_t_is_not_a_hit() {
+        // The real t is 3e38, but t_scaled = u*z + v*z + w*z overflows to
+        // infinity, which `max_t = INFINITY` would otherwise accept.
+        let z = -3e38;
+        let p = [[-10.0, -10.0, z], [10.0, -10.0, z], [0.0, 10.0, z]];
+        let o = [0.0, 0.0, 0.0];
+        let pre = RayPre::new(o, DOWN);
+        let a = sub(p[0], o);
+        assert!((pre.sz * a[2]).is_finite());
+        assert_eq!(cast(o, DOWN, p, Cull::None).map(|h| h.t), None);
     }
 
     #[test]

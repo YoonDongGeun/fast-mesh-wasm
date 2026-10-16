@@ -1,17 +1,28 @@
 //! Queries on meshes stored in [`fast_mesh_store`], accelerated by [`fast_mesh_bvh`].
+//!
+//! Every query takes a mesh and a BVH built for it, works in the mesh's local
+//! `f32` coordinates, and fails with [`QueryError::StaleBvh`] when the mesh was
+//! edited after the BVH was last updated. Queries allocate only into the
+//! output vector they are given.
+//!
+//! - Raycasts: [`raycast`] (nearest hit), [`raycast_any`] (occlusion),
+//!   [`raycast_all`] (every hit, sorted) and [`raycast_many`] (a batch). The
+//!   ray-triangle test is watertight: a ray through a shared edge or vertex
+//!   never slips between the triangles meeting there. Ties go to the smallest
+//!   triangle id.
 
 mod error;
+mod ray;
 mod tri;
 
 use fast_mesh_bvh::Bvh;
 use fast_mesh_store::Mesh;
 
 pub use error::{QueryError, Result};
+pub use ray::*;
 pub use tri::Cull;
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
-// Used by the queries added in a later task.
-#[allow(dead_code)]
 pub(crate) fn check(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
     if bvh.mesh_uid() != mesh.uid() {
         Err(QueryError::MeshMismatch)
@@ -49,14 +60,11 @@ fn allocation_allowed() -> Result<()> {
 }
 
 /// Appends to a caller's vector; on failure it restores the vector's original length.
-// Used by the queries added in a later task.
-#[allow(dead_code)]
 pub(crate) struct Appender<'a, T> {
     out: &'a mut Vec<T>,
     start: usize,
 }
 
-#[allow(dead_code)]
 impl<'a, T> Appender<'a, T> {
     pub(crate) fn new(out: &'a mut Vec<T>) -> Self {
         let start = out.len();
