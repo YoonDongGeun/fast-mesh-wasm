@@ -336,14 +336,15 @@ fn for_each_pair<const N: usize>(
     });
 }
 
-fn intersects_with<const N: usize>(
+/// The first intersecting pair `(a, b)` that the traversal finds, if any.
+fn first_intersection<const N: usize>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
     mesh_b: &Mesh,
     bvh_b: &Bvh,
     xf: &Rigid,
-) -> bool {
-    let mut found = false;
+) -> Option<(TriangleId, TriangleId)> {
+    let mut found = None;
     for_each_pair::<N>(
         mesh_a,
         bvh_a,
@@ -352,12 +353,24 @@ fn intersects_with<const N: usize>(
         xf,
         overlap_key,
         |_| false,
-        |_, pa, _, pb| {
-            found = tri_tri_intersect(pa, pb);
-            !found
+        |a, pa, b, pb| {
+            if tri_tri_intersect(pa, pb) {
+                found = Some((a, b));
+            }
+            found.is_none()
         },
     );
     found
+}
+
+fn intersects_with<const N: usize>(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+) -> bool {
+    first_intersection::<N>(mesh_a, bvh_a, mesh_b, bvh_b, xf).is_some()
 }
 
 fn mesh_distance_with<const N: usize>(
@@ -368,6 +381,19 @@ fn mesh_distance_with<const N: usize>(
     xf: &Rigid,
     max_distance: f32,
 ) -> Option<MeshDistance> {
+    // Touching or intersecting meshes have distance 0, and the cheap exact
+    // intersection test finds a pair far faster than the distance search, which
+    // starts with no bound to prune by. Any intersecting pair will do.
+    if let Some((a, b)) = first_intersection::<N>(mesh_a, bvh_a, mesh_b, bvh_b, xf) {
+        let d = tri_tri_distance(tri_a(mesh_a, a), tri_b(mesh_b, xf, b));
+        return Some(MeshDistance {
+            distance: 0.0,
+            point_a: d.pa.map(|v| v as f32),
+            point_b: d.pb.map(|v| v as f32),
+            triangle_a: a,
+            triangle_b: b,
+        });
+    }
     // The distance of the best pair so far, or `max_distance` before one is
     // found. Pairs whose boxes are farther (with slack) are pruned, in `key`
     // and again in `visit`, as the bound shrinks after a pair is pushed.
