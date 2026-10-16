@@ -208,6 +208,35 @@ pub(crate) fn tri_tri_distance(a: [P3; 3], b: [P3; 3]) -> TriTriDist {
     }
 }
 
+/// Whether `tri_tri_distance(a, b).dist2.sqrt() <= bound`, for `bound >= 0`,
+/// decided with the same candidates and arithmetic but without finding the
+/// minimum: it stops at the first candidate within `bound`, and runs the
+/// intersection test only when none is.
+///
+/// The answers agree exactly. `sqrt` is correctly rounded, hence monotone, so
+/// the minimum is within `bound` exactly when some candidate is. A `NaN`
+/// candidate is never the minimum nor within `bound`. An intersecting pair has
+/// `dist2 == 0`, within any `bound >= 0`. And when no candidate is a number,
+/// `dist2` stays infinite, within only an infinite `bound`, checked first.
+pub(crate) fn tri_tri_within(a: [P3; 3], b: [P3; 3], bound: f64) -> bool {
+    if bound == f64::INFINITY {
+        return true;
+    }
+    let near = |pa: P3, pb: P3| {
+        let d = sub3(pa, pb);
+        dot3(d, d).sqrt() <= bound
+    };
+    a.iter().any(|&v| near(v, closest_on_triangle(v, b).point))
+        || b.iter().any(|&v| near(closest_on_triangle(v, a).point, v))
+        || (0..3).any(|i| {
+            (0..3).any(|j| {
+                let (pa, pb) = seg_seg_closest(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3]);
+                near(pa, pb)
+            })
+        })
+        || tri_tri_intersect(a, b)
+}
+
 fn sub3(a: P3, b: P3) -> P3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -1010,6 +1039,42 @@ mod tests {
             assert!(on_triangle(d.pa, a, 1e-9), "{a:?}: {:?}", d.pa);
             assert!(on_triangle(d.pb, b, 1e-9), "{b:?}: {:?}", d.pb);
         }
+    }
+
+    #[test]
+    fn within_matches_distance() {
+        // Random pairs, half of them overlapping (many intersect), half apart,
+        // against bounds at, just around and far from each pair's distance.
+        let mut rng = Lcg(0x3171);
+        let (mut yes, mut hits) = (0, 0);
+        for i in 0..20_000 {
+            let mut r = || f64::from(rng.next());
+            let dx = if i % 2 == 0 { 0.0 } else { 1.0 + r() };
+            let mut a: [P3; 3] = std::array::from_fn(|_| [r(), r(), r()]);
+            let mut b: [P3; 3] = std::array::from_fn(|_| [r() + dx, r(), r()]);
+            if i % 4 == 3 {
+                // Small integers: touching, coplanar and degenerate pairs.
+                let mut g = || std::array::from_fn(|_| (r() * 3.0).floor());
+                (a, b) = (std::array::from_fn(|_| g()), std::array::from_fn(|_| g()));
+            }
+            let d = tri_tri_distance(a, b).dist2.sqrt();
+            hits += usize::from(d == 0.0);
+            for bound in [
+                0.0,
+                d,
+                d.next_up(),
+                d.next_down().max(0.0),
+                0.5 * d,
+                2.0 * d,
+                0.25,
+                f64::INFINITY,
+            ] {
+                let got = tri_tri_within(a, b, bound);
+                assert_eq!(got, d <= bound, "{a:?} {b:?} {bound}");
+                yes += usize::from(got);
+            }
+        }
+        assert!(hits > 1000 && yes > 50_000, "{hits} {yes}");
     }
 
     #[test]

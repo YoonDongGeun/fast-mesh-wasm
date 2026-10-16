@@ -13,7 +13,7 @@ use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::pair::{PAIR_STACK, Step, traverse_pairs_with};
 use crate::ray::points;
-use crate::tritri::{P3, TriTriDist, tri_tri_distance, tri_tri_intersect};
+use crate::tritri::{P3, TriTriDist, tri_tri_distance, tri_tri_intersect, tri_tri_within};
 use crate::{Appender, QueryError, Result, Rigid, check};
 
 /// The closest pair of points between two meshes, found by [`mesh_distance`].
@@ -571,7 +571,10 @@ fn triangles_near_with<const N: usize>(
             if skip_pair(&pa, &pb, margin, m) {
                 return true;
             }
-            if tri_tri_distance(pa, pb).dist2.sqrt() <= margin
+            // Exactly `tri_tri_distance(pa, pb).dist2.sqrt() <= margin`
+            // (0 for pairs that intersect), but stops at the first candidate
+            // within the margin.
+            if tri_tri_within(pa, pb, margin)
                 && let Err(e) = ap_a.push(a).and_then(|()| ap_b.push(b))
             {
                 failed = Some(e);
