@@ -1,7 +1,9 @@
 //! Node storage shared by building, updating and querying.
 //!
-//! Every traversal walks parent links instead of using a stack, so no traversal
-//! allocates and none can fail, however deep or unbalanced the tree is.
+//! No traversal allocates on the heap and none can fail, however deep or
+//! unbalanced the tree is. Most walk parent links instead of using a stack; the
+//! keyed traversal uses a fixed array on the call stack and falls back to a
+//! parent-link walk for any subtree that does not fit.
 
 use crate::Aabb;
 
@@ -116,6 +118,121 @@ impl Arena {
             }
             from = cur;
             cur = next;
+        }
+    }
+
+    /// Visits the subtree at `root` depth-first, the child with the smaller key
+    /// first (left on ties), with a stack of `N` entries on the call stack.
+    /// Children whose key is `None` are skipped; `visit` gets each node's key
+    /// and returns whether to descend (ignored for leaves). `key` runs once per
+    /// node, except inside a subtree that does not fit on the stack: that one is
+    /// finished at once by [`Arena::traverse_by_key_stackless`], in the same
+    /// order, where `key` may run again for the same node.
+    pub(crate) fn traverse_by_key<const N: usize, K: Copy + PartialOrd>(
+        &self,
+        root: u32,
+        mut key: impl FnMut(&Aabb) -> Option<K>,
+        mut visit: impl FnMut(u32, &Node, K) -> bool,
+    ) {
+        if root == NONE {
+            return;
+        }
+        let Some(root_key) = key(&self.nodes[root as usize].bounds) else {
+            return;
+        };
+        if N == 0 {
+            self.traverse_by_key_stackless(root, root_key, key, visit);
+            return;
+        }
+        let mut stack = [(root, root_key); N];
+        let mut len = 1;
+        while len > 0 {
+            len -= 1;
+            let (cur, k) = stack[len];
+            let node = &self.nodes[cur as usize];
+            if !visit(cur, node, k) || node.is_leaf() {
+                continue;
+            }
+            let [(first, kf), (second, ks)] = self.children_by_key(node, &mut key);
+            // The second child goes below the first. It always fits, as an
+            // entry was just popped.
+            if let Some(ks) = ks {
+                stack[len] = (second, ks);
+                len += 1;
+            }
+            if let Some(kf) = kf {
+                if len < N {
+                    stack[len] = (first, kf);
+                    len += 1;
+                } else {
+                    // Finished right away, before the second child is popped:
+                    // the order the stack would have given.
+                    self.traverse_by_key_stackless(first, kf, &mut key, &mut visit);
+                }
+            }
+        }
+    }
+
+    /// [`Arena::traverse_by_key`] without a stack, walking parent links: the
+    /// overflow fallback. `root_key` is `root`'s key. Each inner node's child
+    /// keys are evaluated again on the way back up, to tell which child the walk
+    /// returns from, so `key` must be pure (an impure one can skip subtrees or
+    /// loop forever, though it stays memory-safe).
+    pub(crate) fn traverse_by_key_stackless<K: Copy + PartialOrd>(
+        &self,
+        root: u32,
+        root_key: K,
+        mut key: impl FnMut(&Aabb) -> Option<K>,
+        mut visit: impl FnMut(u32, &Node, K) -> bool,
+    ) {
+        let stop = self.parents[root as usize];
+        let mut cur = root;
+        let mut from = stop;
+        // The key of `cur` whenever the walk arrives at it from above.
+        let mut k = root_key;
+        loop {
+            let node = &self.nodes[cur as usize];
+            let parent = self.parents[cur as usize];
+            let mut next = parent;
+            if from == parent {
+                // First arrival from above.
+                if visit(cur, node, k) && !node.is_leaf() {
+                    let [(first, kf), (second, ks)] = self.children_by_key(node, &mut key);
+                    if let Some(kf) = kf {
+                        (next, k) = (first, kf);
+                    } else if let Some(ks) = ks {
+                        (next, k) = (second, ks);
+                    }
+                }
+            } else {
+                let [(first, _), (second, ks)] = self.children_by_key(node, &mut key);
+                if from == first
+                    && let Some(ks) = ks
+                {
+                    (next, k) = (second, ks);
+                }
+            }
+            if cur == root && next == stop {
+                return;
+            }
+            from = cur;
+            cur = next;
+        }
+    }
+
+    /// The children of an inner node with their keys, in visiting order: the
+    /// smaller key first, the left child on ties or when either key is `None`.
+    pub(crate) fn children_by_key<K: Copy + PartialOrd>(
+        &self,
+        node: &Node,
+        key: &mut impl FnMut(&Aabb) -> Option<K>,
+    ) -> [(u32, Option<K>); 2] {
+        let kl = key(&self.nodes[node.a as usize].bounds);
+        let kr = key(&self.nodes[node.b as usize].bounds);
+        if matches!((kl, kr), (Some(l), Some(r)) if r < l) {
+            [(node.b, kr), (node.a, kl)]
+        } else {
+            [(node.a, kl), (node.b, kr)]
         }
     }
 

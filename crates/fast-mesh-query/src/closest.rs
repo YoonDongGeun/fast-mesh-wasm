@@ -75,12 +75,15 @@ fn closest(mesh: &Mesh, bvh: &Bvh, q: [f32; 3], opts: &ClosestOptions) -> Option
     let max2 = opts.max_distance * opts.max_distance;
     let best: Cell<Option<(TriangleId, TriClosest)>> = Cell::new(None);
     let best_dist2 = || best.get().map_or(max2, |(_, c)| c.dist2);
-    bvh.traverse_ordered(
-        |l, r| box_dist2(q, l) <= box_dist2(q, r),
-        |_, node| {
+    bvh.traverse_by_key(
+        |b| {
+            let d2 = box_dist2(q, b);
+            (d2 <= max2).then_some(d2)
+        },
+        |_, node, d2| {
             // Boxes at exactly the best distance are still visited, so that a
             // tie can go to the smaller id.
-            if box_dist2(q, &node.bounds) > best_dist2() {
+            if d2 > best_dist2() {
                 return false;
             }
             if let NodeKind::Leaf { triangles } = node.kind {

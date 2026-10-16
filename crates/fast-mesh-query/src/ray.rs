@@ -134,7 +134,8 @@ fn make_hit(pre: &RayPre, p: [[f32; 3]; 3], triangle: TriangleId, h: TriHit) -> 
 
 /// Visits, nearest box first, every node whose box the ray meets within
 /// `[opts.min_t, bound()]`, calling `leaf` for each triangle of a visited leaf.
-/// `bound` is read again before each node, so it can shrink as hits are found.
+/// `bound` is read again before each node, so it can shrink as hits are found;
+/// it must stay within `[opts.min_t, opts.max_t]`.
 fn walk(
     bvh: &Bvh,
     pre: &RayPre,
@@ -142,14 +143,15 @@ fn walk(
     bound: impl Fn() -> Option<f32>,
     mut leaf: impl FnMut(TriangleId),
 ) {
-    let entry = |b: &Aabb| ray_box(pre, b, opts.min_t, opts.max_t).unwrap_or(f32::INFINITY);
-    bvh.traverse_ordered(
-        |l, r| entry(l) <= entry(r),
-        |_, node| {
+    bvh.traverse_by_key(
+        |b| ray_box(pre, b, opts.min_t, opts.max_t),
+        |_, node, entry| {
+            // The box meets `[min_t, max_t]` and is entered at `entry >= min_t`,
+            // so it meets `[min_t, bound]` exactly when `entry <= bound`.
             let Some(max_t) = bound() else {
                 return false;
             };
-            if ray_box(pre, &node.bounds, opts.min_t, max_t).is_none() {
+            if entry > max_t {
                 return false;
             }
             if let NodeKind::Leaf { triangles } = node.kind {
