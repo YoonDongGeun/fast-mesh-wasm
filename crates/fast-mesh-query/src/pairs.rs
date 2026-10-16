@@ -129,9 +129,14 @@ pub fn mesh_distance(
 /// A pair of triangles is near when it intersects or touches (decided
 /// exactly), or when its `f64` distance is at most `margin`, compared as
 /// `f64 distance <= f64::from(margin)`. So a `margin` of 0 finds the triangles
-/// that touch the other mesh. Both sides come from the same pair tests, so they
-/// agree pair for pair; a second call with the meshes swapped and
-/// [`Rigid::inverse`] could differ at the rounding level.
+/// that touch, intersect, or are closer than `f64` rounding resolves, as for a
+/// distance of 0 in [`mesh_distance`]: a pair with a positive gap whose
+/// computed distance rounds to 0 counts as near, so a `margin` of 0 can find
+/// pairs for which [`intersects`] (exact) would be `false`.
+///
+/// Both sides come from the same pair tests, so they agree pair for pair; a
+/// second call with the meshes swapped and [`Rigid::inverse`] could differ at
+/// the rounding level.
 ///
 /// Before deduplication, each vector temporarily holds a triangle once per
 /// near pair it belongs to (a triangle near `k` triangles of the other mesh is
