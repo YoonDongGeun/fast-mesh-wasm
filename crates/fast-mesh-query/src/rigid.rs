@@ -51,8 +51,13 @@ impl Rigid {
     }
 
     /// Checks that every value is finite and that the rotation is a proper
-    /// rotation within `1e-6`.
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// rotation (orthonormal with determinant +1) within `1e-6` per entry: the
+    /// check every mesh-vs-mesh query runs first.
+    ///
+    /// # Errors
+    /// [`QueryError::InvalidInput`] for a non-finite value, a rotation that is
+    /// not orthonormal, or a reflection.
+    pub fn validate(&self) -> Result<()> {
         let r = &self.rotation;
         if !r
             .iter()
@@ -84,8 +89,30 @@ impl Rigid {
         Ok(())
     }
 
-    /// Maps a point of B into A's space, in `f64`.
-    pub(crate) fn apply(&self, p: [f32; 3]) -> [f64; 3] {
+    /// Maps a point of B into A's space: `rotation * p + translation`, in
+    /// `f64`.
+    ///
+    /// This is the exact arithmetic (same expression, same order) the queries
+    /// use to move B's vertices, so points transformed with it agree bit for
+    /// bit with what the queries tested. To map a result point such as
+    /// [`MeshDistance::point_b`](crate::MeshDistance::point_b) back into B's
+    /// space, use `apply` on [`Rigid::inverse`].
+    ///
+    /// ```
+    /// use fast_mesh_query::Rigid;
+    ///
+    /// // A quarter turn about z, then a step along x.
+    /// let xf = Rigid {
+    ///     rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+    ///     translation: [1.0, 0.0, 0.0],
+    /// };
+    /// assert_eq!(xf.validate(), Ok(()));
+    /// let in_a = xf.apply([1.0, 0.0, 0.0]);
+    /// assert_eq!(in_a, [1.0, 1.0, 0.0]);
+    /// let back = xf.inverse().apply(in_a.map(|v| v as f32));
+    /// assert_eq!(back, [1.0, 0.0, 0.0]);
+    /// ```
+    pub fn apply(&self, p: [f32; 3]) -> [f64; 3] {
         self.apply_f64(p.map(f64::from))
     }
 

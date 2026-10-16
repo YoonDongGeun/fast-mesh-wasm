@@ -20,7 +20,9 @@ use crate::{Appender, QueryError, Result, Rigid, check};
 ///
 /// Both points are in mesh A's local space: `point_b` is the point of B's
 /// triangle `triangle_b` as placed by the query's [`Rigid`] transform, not a
-/// point in B's own coordinates. Map it back with [`Rigid::inverse`] if needed.
+/// point in B's own coordinates. Map it back into B's space with
+/// [`Rigid::apply`] on [`Rigid::inverse`]; map B's own points into A's space
+/// with [`Rigid::apply`], the arithmetic the queries use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeshDistance {
     /// The distance between the two surfaces. 0 when they touch, intersect,
