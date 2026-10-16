@@ -279,3 +279,7 @@ Accepted deviations from the design above:
 - Closest point uses a sliver band: when sin²θ ≤ 1e-5 or the sum is not finite, the three edge segments are also evaluated and the nearest result is kept.
 - An infinite sphere radius gives `InvalidInput`.
 - A NaN box gives no results.
+- `ray_box` widens the entry distance by `2γ₃` as well as the exit, so rounding never culls a box the ray touches.
+- `box_triangle` first clips the box to the triangle's own bounding box (empty only on a strict gap, since boxes are closed), then runs the separating-axis test. This is exact and keeps infinite or huge boxes from losing precision.
+- A sphere's pruning box is padded outward (radius times `1 + 4 * EPSILON` plus a tiny amount, then one ulp per bound), so it is conservative relative to the `f32` containment tests and results do not depend on tree layout.
+- `fast_mesh_query` re-exports `Aabb` from `fast_mesh_bvh`, so callers can build `Region::Box` without depending on that crate.

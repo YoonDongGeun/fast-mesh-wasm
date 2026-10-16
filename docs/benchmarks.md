@@ -42,7 +42,7 @@ Results for `cargo bench -p fast-mesh-query`, measured on the same `terrain(n)` 
 | `triangles_in`, sphere radius 5 | 6.6 µs (114 triangles) | 6.9 µs (157 triangles) |
 | `vertices_in`, sphere radius 5 | 3.0 µs (44 vertices) | 4.1 µs (63 vertices) |
 
-Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. The table comes from one run that covered both sizes. Runs on this machine differ more than criterion's own intervals suggest: an earlier run of the 1M benchmarks measured 2.95 µs per ray for `raycast`, 2.69 µs for `raycast_any`, 4.56 µs per point for `closest_point` and 10.6 µs for `triangles_in`, up to 60% above the table. Treat differences below that spread as noise, and compare only numbers from the same run.
+Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. The table comes from one run that covered both sizes. Runs on this machine differ more than criterion's own intervals suggest: an earlier run of the 1M benchmarks measured 2.95 µs per ray for `raycast`, 2.69 µs for `raycast_any`, 4.56 µs per point for `closest_point` and 10.6 µs for `triangles_in`, about 60% above the table. Treat differences below that spread as noise, and compare only numbers from the same run.
 
 ## How the defaults were chosen
 
