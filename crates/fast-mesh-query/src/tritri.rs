@@ -12,6 +12,8 @@
 
 use robust::{Coord, Coord3D, orient2d, orient3d};
 
+use crate::tri::closest_on_triangle;
+
 /// A point in `f64`.
 pub(crate) type P3 = [f64; 3];
 
@@ -124,6 +126,156 @@ pub(crate) fn tri_tri_intersect(a: [P3; 3], b: [P3; 3]) -> bool {
         };
     }
     guigue_devillers(a, da, b, db)
+}
+
+/// The distance between two triangles, with a closest pair of points.
+#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriTriDist {
+    /// Squared distance, exactly `0` when the triangles intersect.
+    pub dist2: f64,
+    /// The point on `a`.
+    pub pa: P3,
+    /// The point on `b`.
+    pub pb: P3,
+}
+
+/// The distance between the closed triangles `a` and `b`.
+///
+/// When [`tri_tri_intersect`] says they meet, `dist2` is exactly `0` and
+/// `pa == pb` is a point common to both (up to rounding): the midpoint of the
+/// closest pair found among the candidates below, which also include the points
+/// where an edge of one crosses the plane of the other.
+///
+/// Otherwise it is the minimum over the 6 vertex-triangle distances and the 9
+/// edge-edge distances. Ties go to the first in this order: the vertices of `a`
+/// against `b`, then the vertices of `b` against `a`, then edge pairs
+/// `(i, j)` in `i * 3 + j` order. This is exact up to `f64` rounding of the
+/// closest points.
+#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
+pub(crate) fn tri_tri_distance(a: [P3; 3], b: [P3; 3]) -> TriTriDist {
+    let mut best = TriTriDist {
+        dist2: f64::INFINITY,
+        pa: a[0],
+        pb: b[0],
+    };
+    let mut offer = |pa: P3, pb: P3| {
+        let d = sub3(pa, pb);
+        let dist2 = dot3(d, d);
+        // `NaN` never wins, and a tie keeps the earlier candidate.
+        if dist2 < best.dist2 {
+            best = TriTriDist { dist2, pa, pb };
+        }
+    };
+    for v in a {
+        offer(v, closest_on_triangle(v, b).point);
+    }
+    for v in b {
+        offer(closest_on_triangle(v, a).point, v);
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            let (pa, pb) = seg_seg_closest(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3]);
+            offer(pa, pb);
+        }
+    }
+    if !tri_tri_intersect(a, b) {
+        return best;
+    }
+    // An edge may pierce the other triangle's interior without any vertex or
+    // edge pair being near. Offer where each edge crosses the other's plane.
+    for (edges, other, flip) in [(a, b, false), (b, a, true)] {
+        let n = cross3(sub3(other[1], other[0]), sub3(other[2], other[0]));
+        let height = |p: P3| dot3(n, sub3(p, other[0]));
+        for i in 0..3 {
+            let (p, q) = (edges[i], edges[(i + 1) % 3]);
+            let (hp, hq) = (height(p), height(q));
+            if hp * hq > 0.0 || hp == hq {
+                continue;
+            }
+            let t = hp / (hp - hq);
+            let x: P3 = std::array::from_fn(|k| p[k] + t * (q[k] - p[k]));
+            let y = closest_on_triangle(x, other).point;
+            if flip {
+                offer(y, x);
+            } else {
+                offer(x, y);
+            }
+        }
+    }
+    let mid: P3 = std::array::from_fn(|k| 0.5 * (best.pa[k] + best.pb[k]));
+    TriTriDist {
+        dist2: 0.0,
+        pa: mid,
+        pb: mid,
+    }
+}
+
+fn sub3(a: P3, b: P3) -> P3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: P3, b: P3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: P3, b: P3) -> P3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Closest points of the segments `p1..q1` and `p2..q2` (Ericson, Real-Time
+/// Collision Detection, 5.1.9). Parallel segments, where the closest pair is
+/// not unique, get the pair at `s = 0` on the first segment, reclamped if the
+/// foot on the second falls outside it; either way the distance is right.
+fn seg_seg_closest(p1: P3, q1: P3, p2: P3, q2: P3) -> (P3, P3) {
+    let d1 = sub3(q1, p1);
+    let d2 = sub3(q2, p2);
+    let r = sub3(p1, p2);
+    let a = dot3(d1, d1);
+    let e = dot3(d2, d2);
+    let f = dot3(d2, r);
+    let at = |p: P3, d: P3, t: f64| -> P3 { std::array::from_fn(|k| p[k] + t * d[k]) };
+    // A division that is `0` instead of non-finite, clamped to `[0, 1]`.
+    let unit = |num: f64, den: f64| {
+        let t = num / den;
+        if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let (s, t);
+    if a <= 0.0 && e <= 0.0 {
+        (s, t) = (0.0, 0.0);
+    } else if a <= 0.0 {
+        (s, t) = (0.0, unit(f, e));
+    } else {
+        let c = dot3(d1, r);
+        if e <= 0.0 {
+            (s, t) = (unit(-c, a), 0.0);
+        } else {
+            let b = dot3(d1, d2);
+            let denom = a * e - b * b;
+            let s0 = if denom > 0.0 {
+                unit(b * f - c * e, denom)
+            } else {
+                0.0
+            };
+            let t0 = (b * s0 + f) / e;
+            if t0 < 0.0 {
+                (s, t) = (unit(-c, a), 0.0);
+            } else if t0 > 1.0 {
+                (s, t) = (unit(b - c, a), 1.0);
+            } else {
+                (s, t) = (s0, t0);
+            }
+        }
+    }
+    (at(p1, d1, s), at(p2, d2, t))
 }
 
 fn same_strict_side(d: [i8; 3]) -> bool {
@@ -617,6 +769,196 @@ mod tests {
         assert!(!both(A, b));
         let b = [[0.25, 0.25, -tiny], [0.25, 0.25, 1.0], [0.5, 0.25, 1.0]];
         assert!(both(A, b));
+    }
+
+    fn vsub(a: P3, b: P3) -> P3 {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn vdot(a: P3, b: P3) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn at(a: P3, d: P3, s: f64) -> P3 {
+        [a[0] + s * d[0], a[1] + s * d[1], a[2] + s * d[2]]
+    }
+
+    /// Squared distance from `x` to the segment `a..b`: the minimum of a
+    /// quadratic in one variable over `[0, 1]`.
+    fn oracle_pt_seg(x: P3, a: P3, b: P3) -> f64 {
+        let d = vsub(b, a);
+        let s = if vdot(d, d) > 0.0 {
+            (vdot(vsub(x, a), d) / vdot(d, d)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let r = vsub(x, at(a, d, s));
+        vdot(r, r)
+    }
+
+    /// Squared distance from `x` to the triangle `t`: the minimum of a
+    /// quadratic in `(u, v)` over `u, v >= 0, u + v <= 1`. Solves the normal
+    /// equations, and if the solution is outside, the minimum is on an edge.
+    fn oracle_pt_tri(x: P3, t: [P3; 3]) -> f64 {
+        let (e1, e2) = (vsub(t[1], t[0]), vsub(t[2], t[0]));
+        let w = vsub(x, t[0]);
+        let (a, b, c) = (vdot(e1, e1), vdot(e1, e2), vdot(e2, e2));
+        let det = a * c - b * b;
+        let edges = (0..3)
+            .map(|i| oracle_pt_seg(x, t[i], t[(i + 1) % 3]))
+            .fold(f64::INFINITY, f64::min);
+        if det <= 1e-12 {
+            return edges;
+        }
+        let (r1, r2) = (vdot(w, e1), vdot(w, e2));
+        let u = (c * r1 - b * r2) / det;
+        let v = (a * r2 - b * r1) / det;
+        if u >= 0.0 && v >= 0.0 && u + v <= 1.0 {
+            let p = at(at(t[0], e1, u), e2, v);
+            let r = vsub(x, p);
+            return vdot(r, r).min(edges);
+        }
+        edges
+    }
+
+    /// Squared distance between the segments `p..q` and `r..s`: minimizes
+    /// `|p + a d1 - r - b d2|^2` over `[0, 1]^2` by solving for the stationary
+    /// point, and otherwise on the four sides of the square.
+    fn oracle_seg_seg(p: P3, q: P3, r: P3, s: P3) -> f64 {
+        let (d1, d2) = (vsub(q, p), vsub(s, r));
+        let w = vsub(p, r);
+        let (a, b, c) = (vdot(d1, d1), vdot(d1, d2), vdot(d2, d2));
+        let (e, f) = (vdot(d1, w), vdot(d2, w));
+        let sides = oracle_pt_seg(p, r, s)
+            .min(oracle_pt_seg(q, r, s))
+            .min(oracle_pt_seg(r, p, q))
+            .min(oracle_pt_seg(s, p, q));
+        let det = a * c - b * b;
+        if det <= 1e-12 {
+            return sides;
+        }
+        let u = (b * f - c * e) / det;
+        let v = (a * f - b * e) / det;
+        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+            let g = vsub(at(p, d1, u), at(r, d2, v));
+            return vdot(g, g).min(sides);
+        }
+        sides
+    }
+
+    /// The true squared distance between two disjoint triangles.
+    fn oracle_dist2(a: [P3; 3], b: [P3; 3]) -> f64 {
+        let mut best = f64::INFINITY;
+        for i in 0..3 {
+            best = best.min(oracle_pt_tri(a[i], b)).min(oracle_pt_tri(b[i], a));
+            for j in 0..3 {
+                best = best.min(oracle_seg_seg(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3]));
+            }
+        }
+        best
+    }
+
+    /// Random triangle pairs, with B pushed to `x` in `[1.5, 3]`: always apart.
+    fn separated_pairs(n: usize, seed: u64) -> Vec<([P3; 3], [P3; 3])> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|_| {
+                let mut pt = |dx: f64| -> P3 {
+                    [
+                        f64::from(rng.next()) + dx,
+                        f64::from(rng.next()),
+                        f64::from(rng.next()),
+                    ]
+                };
+                let a: [P3; 3] = std::array::from_fn(|_| pt(0.0));
+                let b: [P3; 3] = std::array::from_fn(|_| pt(1.5));
+                (a, b)
+            })
+            .collect()
+    }
+
+    /// Points of a triangle on a barycentric grid of `n + 1` points per side.
+    fn grid(t: [P3; 3], n: usize) -> Vec<P3> {
+        let mut out = Vec::new();
+        for i in 0..=n {
+            for j in 0..=(n - i) {
+                let (u, v) = (i as f64 / n as f64, j as f64 / n as f64);
+                out.push(std::array::from_fn(|k| {
+                    (1.0 - u - v) * t[0][k] + u * t[1][k] + v * t[2][k]
+                }));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn distance_matches_dense_sampling() {
+        for (a, b) in separated_pairs(500, 0xd157) {
+            let got = tri_tri_distance(a, b).dist2.sqrt();
+            let (ga, gb) = (grid(a, 39), grid(b, 39));
+            let mut dense = f64::INFINITY;
+            for &p in &ga {
+                for &q in &gb {
+                    let d = vsub(p, q);
+                    dense = dense.min(vdot(d, d));
+                }
+            }
+            let truth = oracle_dist2(a, b).sqrt();
+            assert!(got <= dense.sqrt() + 1e-9, "{a:?} {b:?}: {got} > {dense}");
+            assert!(got >= truth - 1e-9, "{a:?} {b:?}: {got} < {truth}");
+        }
+    }
+
+    #[test]
+    fn parallel_edges() {
+        // A's hypotenuse (1,0,0)-(0,1,0) and B's edge, parallel and 0.5 away
+        // in the plane's normal direction; no other feature is closer.
+        let b = [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [1.0, 1.0, 1.5]];
+        let d = tri_tri_distance(A, b);
+        assert!((d.dist2 - 0.25).abs() < 1e-12, "{}", d.dist2);
+        assert!((oracle_dist2(A, b) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn intersecting_is_zero() {
+        let b = [[0.2, 0.2, -1.0], [0.2, 0.2, 1.0], [0.8, 0.1, 0.0]];
+        let d = tri_tri_distance(A, b);
+        assert_eq!(d.dist2, 0.0);
+        assert_eq!(d.pa, d.pb);
+        assert!(on_triangle(d.pa, A, 1e-12), "{:?}", d.pa);
+        assert!(on_triangle(d.pa, b, 1e-12), "{:?}", d.pa);
+        // Touching at one vertex.
+        let c = [[1.0, 0.0, 0.0], [2.0, 0.0, 1.0], [2.0, 1.0, 1.0]];
+        let d = tri_tri_distance(A, c);
+        assert_eq!(d.dist2, 0.0);
+        assert!(on_triangle(d.pa, A, 1e-12) && on_triangle(d.pa, c, 1e-12));
+        assert_eq!(d.pa, d.pb);
+    }
+
+    /// Whether `x` is within `tol` of the plane of `t` and inside it, by
+    /// barycentric coordinates.
+    fn on_triangle(x: P3, t: [P3; 3], tol: f64) -> bool {
+        let (e1, e2) = (vsub(t[1], t[0]), vsub(t[2], t[0]));
+        let w = vsub(x, t[0]);
+        let (a, b, c) = (vdot(e1, e1), vdot(e1, e2), vdot(e2, e2));
+        let det = a * c - b * b;
+        let (r1, r2) = (vdot(w, e1), vdot(w, e2));
+        let u = (c * r1 - b * r2) / det;
+        let v = (a * r2 - b * r1) / det;
+        let p = at(at(t[0], e1, u), e2, v);
+        let off = vsub(x, p);
+        vdot(off, off).sqrt() <= tol && u >= -tol && v >= -tol && u + v <= 1.0 + tol
+    }
+
+    #[test]
+    fn points_are_on_triangles() {
+        for (a, b) in separated_pairs(500, 0x9017) {
+            let d = tri_tri_distance(a, b);
+            let g = vsub(d.pa, d.pb);
+            assert!((vdot(g, g) - d.dist2).abs() < 1e-9);
+            assert!(on_triangle(d.pa, a, 1e-9), "{a:?}: {:?}", d.pa);
+            assert!(on_triangle(d.pb, b, 1e-9), "{b:?}: {:?}", d.pb);
+        }
     }
 
     #[test]

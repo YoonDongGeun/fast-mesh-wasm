@@ -73,7 +73,7 @@ fn validate_opts(opts: &ClosestOptions) -> Result<()> {
 
 fn closest(mesh: &Mesh, bvh: &Bvh, q: [f32; 3], opts: &ClosestOptions) -> Option<ClosestHit> {
     let max2 = opts.max_distance * opts.max_distance;
-    let best: Cell<Option<(TriangleId, TriClosest)>> = Cell::new(None);
+    let best: Cell<Option<(TriangleId, TriClosest<f32>)>> = Cell::new(None);
     let best_dist2 = || best.get().map_or(max2, |(_, c)| c.dist2);
     bvh.traverse_by_key(
         |b| {
