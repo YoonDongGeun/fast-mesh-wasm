@@ -321,12 +321,29 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 /// so touching counts as overlap. An axis that is the zero vector (a
 /// degenerate triangle's normal, or a cross of parallel vectors) is skipped. An
 /// empty box overlaps nothing.
+///
+/// The box is first clipped to the triangle's own bounding box, which is exact
+/// (the box and the triangle meet iff the clipped box and the triangle do) and
+/// makes every coordinate finite and of the triangle's scale, so infinite or
+/// huge boxes lose no precision.
 pub(crate) fn box_triangle(b: &Aabb, p: [[f32; 3]; 3]) -> bool {
     if b.is_empty() {
         return false;
     }
-    let c: [f64; 3] = std::array::from_fn(|k| (f64::from(b.min[k]) + f64::from(b.max[k])) * 0.5);
-    let h: [f64; 3] = std::array::from_fn(|k| (f64::from(b.max[k]) - f64::from(b.min[k])) * 0.5);
+    let mut lo = [0.0f32; 3];
+    let mut hi = [0.0f32; 3];
+    for k in 0..3 {
+        let tmin = p[0][k].min(p[1][k]).min(p[2][k]);
+        let tmax = p[0][k].max(p[1][k]).max(p[2][k]);
+        lo[k] = b.min[k].max(tmin);
+        hi[k] = b.max[k].min(tmax);
+        // Closed boxes: touching is overlap, so only a strict gap is empty.
+        if lo[k] > hi[k] {
+            return false;
+        }
+    }
+    let c: [f64; 3] = std::array::from_fn(|k| (f64::from(lo[k]) + f64::from(hi[k])) * 0.5);
+    let h: [f64; 3] = std::array::from_fn(|k| (f64::from(hi[k]) - f64::from(lo[k])) * 0.5);
     let v: [[f64; 3]; 3] = p.map(|q| std::array::from_fn(|k| f64::from(q[k]) - c[k]));
 
     // Box normals.
@@ -636,6 +653,108 @@ mod tests {
         assert!(box_triangle(&b([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]), T));
         // An empty box overlaps nothing.
         assert!(!box_triangle(&Aabb::EMPTY, T));
+    }
+
+    #[test]
+    fn box_triangle_unbounded_and_huge_boxes() {
+        let b = |min, max| Aabb::new(min, max);
+        let inf = f32::INFINITY;
+        // The triangle lies below x + y = 1, so x >= 0.6, y >= 0.6 misses it.
+        for big in [inf, 1e30, f32::MAX] {
+            assert!(!box_triangle(&b([0.6, 0.6, -big], [big, big, big]), T));
+            assert!(!box_triangle(&b([0.6, 0.6, -1.0], [big, big, 1.0]), T));
+            // The overlapping counterparts.
+            assert!(box_triangle(&b([0.2, 0.2, -big], [big, big, big]), T));
+            assert!(box_triangle(&b([0.2, 0.2, -1.0], [big, big, 1.0]), T));
+            assert!(box_triangle(&b([-big; 3], [big; 3]), T));
+        }
+        // Half-infinite on single axes.
+        assert!(!box_triangle(&b([0.6, 0.6, -inf], [inf, inf, inf]), T));
+        assert!(box_triangle(&b([-inf, -inf, -inf], [0.1, 0.1, inf]), T));
+        assert!(!box_triangle(&b([-inf, -inf, 0.5], [inf, inf, inf]), T));
+        assert!(!box_triangle(&b([-inf, -inf, -inf], [inf, inf, -0.5]), T));
+        assert!(box_triangle(&b([-inf, -inf, 0.0], [inf, inf, 0.0]), T));
+        // Touching the triangle's bounds at a single point counts.
+        assert!(box_triangle(&b([1.0, 0.0, 0.0], [inf, inf, inf]), T));
+        assert!(!box_triangle(&b([1.0001, 0.0, 0.0], [inf, inf, inf]), T));
+    }
+
+    /// Whether the triangle meets the closed box, by clipping the triangle
+    /// against the six half-spaces (Sutherland-Hodgman) in `f64`: they meet iff
+    /// something is left.
+    fn clip_oracle(p: [[f64; 3]; 3], min: [f64; 3], max: [f64; 3]) -> bool {
+        let mut poly: Vec<[f64; 3]> = p.to_vec();
+        for k in 0..3 {
+            for upper in [false, true] {
+                let dist = |v: &[f64; 3]| if upper { max[k] - v[k] } else { v[k] - min[k] };
+                let input = std::mem::take(&mut poly);
+                for i in 0..input.len() {
+                    let (a, b) = (input[i], input[(i + 1) % input.len()]);
+                    let (da, db) = (dist(&a), dist(&b));
+                    if da >= 0.0 {
+                        poly.push(a);
+                    }
+                    if (da >= 0.0) != (db >= 0.0) {
+                        let s = da / (da - db);
+                        poly.push(std::array::from_fn(|j| a[j] + (b[j] - a[j]) * s));
+                    }
+                }
+                if poly.is_empty() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn box_triangle_matches_the_clipping_oracle() {
+        use crate::test_util::Lcg;
+        let mut rng = Lcg(0xb0c5);
+        let (mut yes, mut no, mut skipped) = (0, 0, 0);
+        for _ in 0..4000 {
+            let p: [[f32; 3]; 3] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rng.next() * 2.0 - 1.0));
+            let mut min = [0.0f32; 3];
+            let mut max = [0.0f32; 3];
+            for k in 0..3 {
+                let c = rng.next() * 3.0 - 1.5;
+                let h = 0.05 + rng.next() * 0.8;
+                min[k] = c - h;
+                max[k] = c + h;
+                // Now and then, an unbounded side.
+                match (rng.next() * 12.0) as u32 {
+                    0 => min[k] = f32::NEG_INFINITY,
+                    1 => max[k] = f32::INFINITY,
+                    _ => {}
+                }
+            }
+            let pd = p.map(|v| v.map(f64::from));
+            let widen = |eps: f64| {
+                clip_oracle(
+                    pd,
+                    min.map(|v| f64::from(v) - eps),
+                    max.map(|v| f64::from(v) + eps),
+                )
+            };
+            let (loose, tight) = (widen(1e-9), widen(-1e-9));
+            if loose != tight {
+                skipped += 1;
+                continue;
+            }
+            assert_eq!(
+                box_triangle(&Aabb::new(min, max), p),
+                loose,
+                "triangle {p:?}, box {min:?}..{max:?}"
+            );
+            if loose {
+                yes += 1;
+            } else {
+                no += 1;
+            }
+        }
+        assert!(yes > 500 && no > 500, "yes {yes}, no {no}, skipped {skipped}");
+        assert!(skipped < 100, "skipped {skipped}");
     }
 
     #[test]
