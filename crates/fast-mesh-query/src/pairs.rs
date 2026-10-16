@@ -1351,6 +1351,20 @@ mod tests {
         for t in alive(&m) {
             assert!(pairs.binary_search(&(t, t)).is_ok(), "({t}, {t}) missing");
         }
+        // Neighbours (two triangles sharing an edge) touch along that edge,
+        // so both orders are pairs.
+        let tris: Vec<_> = alive(&m).collect();
+        let shares_edge = |t: TriangleId, u: TriangleId| {
+            let (vt, vu) = (m.triangle(t).unwrap(), m.triangle(u).unwrap());
+            vt.iter().filter(|v| vu.contains(v)).count() == 2
+        };
+        let (t, u) = tris
+            .iter()
+            .flat_map(|&t| tris.iter().map(move |&u| (t, u)))
+            .find(|&(t, u)| shares_edge(t, u))
+            .unwrap();
+        assert!(pairs.binary_search(&(t, u)).is_ok(), "({t}, {u}) missing");
+        assert!(pairs.binary_search(&(u, t)).is_ok(), "({u}, {t}) missing");
         assert_eq!(
             mesh_distance(&m, &b, &m, &b, &xf, 0.0)
                 .unwrap()
