@@ -6,13 +6,17 @@
 //! one-triangle mesh queried through the public API. That reuses the exact
 //! per-triangle arithmetic and leaves the BVH traversal, the pruning and the
 //! tie rules (smallest triangle id wins) as the thing under test.
+//!
+//! The mesh-vs-mesh oracles do the same for every pair of alive triangles: each
+//! pair is two one-triangle meshes queried through the public API.
 
 use std::collections::HashMap;
 
 use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, Quality};
 use fast_mesh_query::{
-    ClosestOptions, Cull, Ray, RayOptions, Region, closest_point, raycast, raycast_all,
-    raycast_any, triangles_in, vertices_in,
+    ClosestOptions, Cull, MeshDistance, Ray, RayOptions, Region, Rigid, closest_point,
+    intersecting_pairs, intersects, mesh_distance, raycast, raycast_all, raycast_any,
+    triangles_in, triangles_near, vertices_in,
 };
 use fast_mesh_store::{History, Mesh, Transaction};
 use proptest::prelude::*;
@@ -415,24 +419,266 @@ proptest! {
         let mut h = History::new(usize::MAX);
         check_queries(&m, &bvh, seed)?;
         for (i, step) in steps.iter().enumerate() {
-            let changes = match step {
-                Step::Commit(ops) => {
-                    let mut tx = m.begin_edit();
-                    for op in ops {
-                        run(&mut tx, op);
-                    }
-                    let patch = tx.commit().unwrap();
-                    let changes = patch.changes().clone();
-                    h.push(&mut m, patch).unwrap();
-                    Some(changes)
-                }
-                Step::Undo => h.undo(&mut m).unwrap(),
-                Step::Redo => h.redo(&mut m).unwrap(),
-            };
-            if let Some(changes) = changes {
-                bvh.update(&mut m, &changes).unwrap();
-            }
+            apply_step(&mut m, &mut bvh, &mut h, step);
             check_queries(&m, &bvh, seed.wrapping_add(i as u64 + 1))?;
+        }
+    }
+}
+
+/// Applies one edit, undo or redo to the mesh, then updates its BVH.
+fn apply_step(m: &mut Mesh, bvh: &mut Bvh, h: &mut History, step: &Step) {
+    let changes = match step {
+        Step::Commit(ops) => {
+            let mut tx = m.begin_edit();
+            for op in ops {
+                run(&mut tx, op);
+            }
+            let patch = tx.commit().unwrap();
+            let changes = patch.changes().clone();
+            h.push(m, patch).unwrap();
+            Some(changes)
+        }
+        Step::Undo => h.undo(m).unwrap(),
+        Step::Redo => h.redo(m).unwrap(),
+    };
+    if let Some(changes) = changes {
+        bvh.update(m, &changes).unwrap();
+    }
+}
+
+/// A random rigid transform that puts B's middle near A's middle: a random unit
+/// quaternion (or one of a few exact rotations) and a translation with jitter,
+/// so that the meshes touch, overlap or sit slightly apart.
+fn random_rigid(rng: &mut Lcg) -> Rigid {
+    let rotation = if rng.next() < 0.25 {
+        // Exact rotations: identity, a flip about x, a quarter turn about z.
+        [
+            Rigid::IDENTITY.rotation,
+            [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        ][(rng.next() * 3.0) as usize % 3]
+    } else {
+        let mut q = [0; 4].map(|_| f64::from(rng.range(-1.0, 1.0)));
+        let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm < 1e-3 {
+            q = [1.0, 0.0, 0.0, 0.0];
+        } else {
+            q = q.map(|v| v / norm);
+        }
+        let [w, x, y, z] = q;
+        [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ]
+    };
+    // The middles of the two grids, before edits.
+    let (ca, cb) = ([3.0, 3.0, 0.6], [2.5, 2.5, 0.6]);
+    let jitter = [
+        f64::from(rng.range(-6.0, 6.0)),
+        f64::from(rng.range(-6.0, 6.0)),
+        f64::from(rng.range(-5.0, 5.0)),
+    ];
+    let translation = std::array::from_fn(|i| {
+        let rotated: f64 = (0..3).map(|k| rotation[i][k] * cb[k]).sum();
+        ca[i] - rotated + jitter[i]
+    });
+    Rigid {
+        rotation,
+        translation,
+    }
+}
+
+/// One pair of alive triangles, one from each mesh, as the brute force sees it.
+struct PairInfo {
+    a: u32,
+    b: u32,
+    /// Whether the triangles intersect or touch.
+    hit: bool,
+    /// The single-pair `mesh_distance`: the f32 distance and the points.
+    dist: MeshDistance,
+}
+
+/// Every pair of alive triangles, in ascending `(a, b)`, tested as two
+/// one-triangle meshes.
+fn pair_table(sa: &[Single], sb: &[Single], xf: &Rigid) -> Vec<PairInfo> {
+    let mut out = Vec::with_capacity(sa.len() * sb.len());
+    for a in sa {
+        for b in sb {
+            let mut pairs = Vec::new();
+            let n = intersecting_pairs(&a.mesh, &a.bvh, &b.mesh, &b.bvh, xf, &mut pairs).unwrap();
+            let dist = mesh_distance(&a.mesh, &a.bvh, &b.mesh, &b.bvh, xf, f32::INFINITY)
+                .unwrap()
+                .unwrap();
+            out.push(PairInfo {
+                a: a.id,
+                b: b.id,
+                hit: n == 1,
+                dist,
+            });
+        }
+    }
+    out
+}
+
+/// Whether a single pair is within `margin`: it touches, or its `f64` distance
+/// is at most `margin` (which `mesh_distance` decides exactly as its
+/// `max_distance`).
+fn pair_is_near(sa: &Single, sb: &Single, xf: &Rigid, margin: f32) -> bool {
+    mesh_distance(&sa.mesh, &sa.bvh, &sb.mesh, &sb.bvh, xf, margin)
+        .unwrap()
+        .is_some()
+}
+
+fn near(
+    ma: &Mesh,
+    ba: &Bvh,
+    mb: &Mesh,
+    bb: &Bvh,
+    xf: &Rigid,
+    margin: f32,
+) -> (Vec<u32>, Vec<u32>) {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    triangles_near(ma, ba, mb, bb, xf, margin, &mut a, &mut b).unwrap();
+    (a, b)
+}
+
+/// All four pair queries against the brute force over every pair of alive
+/// triangles, under `xf`.
+fn check_pair_queries(
+    (ma, ba): (&Mesh, &Bvh),
+    (mb, bb): (&Mesh, &Bvh),
+    xf: &Rigid,
+) -> Result<(), TestCaseError> {
+    let (sa, sb) = (singles(ma), singles(mb));
+    let table = pair_table(&sa, &sb, xf);
+    let single = |id: u32, s: &[Single]| s.iter().position(|x| x.id == id).unwrap();
+
+    // intersects and intersecting_pairs.
+    let want_pairs: Vec<(u32, u32)> = table
+        .iter()
+        .filter(|p| p.hit)
+        .map(|p| (p.a, p.b))
+        .collect();
+    prop_assert_eq!(intersects(ma, ba, mb, bb, xf), Ok(!want_pairs.is_empty()));
+    let mut out = vec![(999, 999)];
+    let n = intersecting_pairs(ma, ba, mb, bb, xf, &mut out).unwrap();
+    prop_assert_eq!(n, want_pairs.len());
+    prop_assert_eq!(out[0], (999, 999));
+    prop_assert_eq!(&out[1..], &want_pairs[..]);
+
+    // mesh_distance: the f32 minimum is the minimum of the f32 pair distances
+    // (rounding is monotone), and the pair it names is one of the pairs at that
+    // distance, with the same points. Ties inside f32 rounding are not told
+    // apart here; the unit tests cover the smallest-pair rule on f64.
+    let min = table
+        .iter()
+        .map(|p| p.dist.distance)
+        .min_by(f32::total_cmp);
+    let got = mesh_distance(ma, ba, mb, bb, xf, f32::INFINITY).unwrap();
+    prop_assert_eq!(got.map(|g| g.distance), min);
+    if let (Some(g), Some(min)) = (got, min) {
+        let info = &table[single(g.triangle_a, &sa) * sb.len() + single(g.triangle_b, &sb)];
+        prop_assert_eq!((info.a, info.b), (g.triangle_a, g.triangle_b));
+        prop_assert_eq!(info.dist.distance, min);
+        if min > 0.0 {
+            // A positive distance comes from the same arithmetic as the pair.
+            prop_assert_eq!(info.dist.point_a, g.point_a);
+            prop_assert_eq!(info.dist.point_b, g.point_b);
+            // max_distance is inclusive.
+            let above = mesh_distance(ma, ba, mb, bb, xf, min.next_up()).unwrap();
+            prop_assert_eq!(above, got);
+            prop_assert_eq!(mesh_distance(ma, ba, mb, bb, xf, min.next_down()), Ok(None));
+            // Cross-query consistency.
+            let (na, nb) = near(ma, ba, mb, bb, xf, min * (1.0 + 1e-6));
+            prop_assert!(na.contains(&g.triangle_a), "{:?}", g);
+            prop_assert!(nb.contains(&g.triangle_b), "{:?}", g);
+        } else {
+            // Zero means touching or closer than rounding: the pair intersects
+            // or its computed distance is 0.
+            prop_assert!(info.hit || info.dist.distance == 0.0);
+            let zero = mesh_distance(ma, ba, mb, bb, xf, 0.0).unwrap();
+            prop_assert_eq!(zero.map(|z| z.distance), Some(0.0));
+        }
+    } else {
+        prop_assert_eq!(mesh_distance(ma, ba, mb, bb, xf, 1.0), Ok(None));
+    }
+
+    // triangles_near. The f32 distance is a monotone rounding of the f64 one, so
+    // a pair farther than the margin in f32 is not near; the rest are decided by
+    // the exact single-pair query.
+    for margin in [0.0, 0.1, 0.6] {
+        let near_pairs: Vec<&PairInfo> = table
+            .iter()
+            .filter(|p| {
+                p.hit
+                    || (p.dist.distance <= margin
+                        && pair_is_near(
+                            &sa[single(p.a, &sa)],
+                            &sb[single(p.b, &sb)],
+                            xf,
+                            margin,
+                        ))
+            })
+            .collect();
+        let mut want_a: Vec<u32> = near_pairs.iter().map(|p| p.a).collect();
+        let mut want_b: Vec<u32> = near_pairs.iter().map(|p| p.b).collect();
+        want_a.sort_unstable();
+        want_a.dedup();
+        want_b.sort_unstable();
+        want_b.dedup();
+        let (mut a, mut b) = (vec![999], vec![998]);
+        triangles_near(ma, ba, mb, bb, xf, margin, &mut a, &mut b).unwrap();
+        prop_assert_eq!((a[0], b[0]), (999, 998));
+        prop_assert_eq!(&a[1..], &want_a[..], "margin {}", margin);
+        prop_assert_eq!(&b[1..], &want_b[..], "margin {}", margin);
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases(64)))]
+
+    #[test]
+    fn pair_queries_match_brute_force_after_edits(
+        options_a in options(),
+        options_b in options(),
+        seed in any::<u64>(),
+        steps_a in prop::collection::vec(step(), 1..6),
+        steps_b in prop::collection::vec(step(), 1..6),
+    ) {
+        let (mut ma, mut mb) = (grid(6), grid(5));
+        let mut ba = Bvh::build(&ma, &options_a).unwrap();
+        let mut bb = Bvh::build(&mb, &options_b).unwrap();
+        let (mut ha, mut hb) = (History::new(usize::MAX), History::new(usize::MAX));
+        let mut rng = Lcg(seed);
+        for _ in 0..2 {
+            let xf = random_rigid(&mut rng);
+            check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
+        }
+        for i in 0..steps_a.len().max(steps_b.len()) {
+            if let Some(s) = steps_a.get(i) {
+                apply_step(&mut ma, &mut ba, &mut ha, s);
+            }
+            if let Some(s) = steps_b.get(i) {
+                apply_step(&mut mb, &mut bb, &mut hb, s);
+            }
+            for _ in 0..2 {
+                let xf = random_rigid(&mut rng);
+                check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
+            }
         }
     }
 }
