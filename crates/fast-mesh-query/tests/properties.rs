@@ -176,6 +176,8 @@ fn run(tx: &mut Transaction<'_>, op: &Op) {
 /// An alive triangle as a mesh of its own, with its BVH.
 struct Single {
     id: u32,
+    /// The corner positions, three coordinates each.
+    flat: Vec<f32>,
     mesh: Mesh,
     bvh: Bvh,
 }
@@ -194,6 +196,7 @@ fn singles(mesh: &Mesh) -> Vec<Single> {
             let bvh = Bvh::build(&single, &BuildOptions::default()).unwrap();
             Single {
                 id,
+                flat,
                 mesh: single,
                 bvh,
             }
@@ -215,31 +218,35 @@ fn brute_rays(singles: &[Single], ray: &Ray, opts: &RayOptions) -> Vec<(u32, f32
     hits
 }
 
-/// The smallest distance and every triangle at exactly that distance.
+/// The nearest triangle and its distance, ties to the smaller id.
 ///
-/// The public API reports `distance`, the square root of the squared distance
-/// the query ranks by. Two squared distances one ulp apart can share a root, so
-/// the triangle that wins on the squared distance is not always the smallest id
-/// among those at the reported distance. The oracle therefore returns the whole
-/// set and the test accepts any member; exact ties of the squared distance are
-/// covered by the unit tests in `closest.rs`.
-fn brute_closest(
-    singles: &[Single],
-    p: [f32; 3],
-    opts: &ClosestOptions,
-) -> Option<(Vec<u32>, f32)> {
-    let mut best: Option<(Vec<u32>, f32)> = None;
+/// The query ranks by the squared distance, which the public API does not
+/// report (the square roots of two different squared distances can be equal).
+/// So the winner is found by a tournament over pairs: the alive triangles are
+/// walked in ascending id, and each candidate plays the current best on a
+/// two-triangle mesh, lower id first, in one leaf. That reproduces the exact
+/// squared-distance comparison and the smaller-id rule.
+fn brute_closest(singles: &[Single], p: [f32; 3], opts: &ClosestOptions) -> Option<(u32, f32)> {
+    let mut best: Option<(&Single, f32)> = None;
     for s in singles {
         let Some(h) = closest_point(&s.mesh, &s.bvh, p, opts).unwrap() else {
             continue;
         };
-        match &mut best {
-            Some((ids, d)) if h.distance == *d => ids.push(s.id),
-            Some((_, d)) if h.distance > *d => {}
-            _ => best = Some((vec![s.id], h.distance)),
+        let Some((b, _)) = best else {
+            best = Some((s, h.distance));
+            continue;
+        };
+        let flat: Vec<f32> = b.flat.iter().chain(&s.flat).copied().collect();
+        let pair = Mesh::from_buffers(&flat, &[0, 1, 2, 3, 4, 5]).unwrap();
+        let bvh = Bvh::build(&pair, &BuildOptions::default()).unwrap();
+        let w = closest_point(&pair, &bvh, p, opts).unwrap().unwrap();
+        if w.triangle == 1 {
+            best = Some((s, w.distance));
+        } else {
+            best = Some((b, w.distance));
         }
     }
-    best
+    best.map(|(s, d)| (s.id, d))
 }
 
 fn brute_triangles(singles: &[Single], region: &Region) -> Vec<u32> {
@@ -374,14 +381,10 @@ fn check_queries(mesh: &Mesh, bvh: &Bvh, seed: u64) -> Result<(), TestCaseError>
         for max_distance in [f32::INFINITY, 1.0] {
             let opts = ClosestOptions { max_distance };
             let got = closest_point(mesh, bvh, p, &opts).unwrap();
-            match (got, brute_closest(&singles, p, &opts)) {
-                (None, None) => {}
-                (Some(h), Some((ids, d))) => {
-                    prop_assert_eq!(h.distance, d);
-                    prop_assert!(ids.contains(&h.triangle), "{} not in {:?}", h.triangle, ids);
-                }
-                (got, want) => prop_assert!(false, "{:?} vs {:?}", got, want),
-            }
+            prop_assert_eq!(
+                got.map(|h| (h.triangle, h.distance)),
+                brute_closest(&singles, p, &opts)
+            );
         }
 
         for sphere in [false, true] {

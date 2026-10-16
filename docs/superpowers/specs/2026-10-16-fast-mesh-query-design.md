@@ -276,6 +276,6 @@ Accepted deviations from the design above:
 - A NaN `max_t` gives `InvalidInput`, like a NaN `min_t`.
 - A hit whose `t` or barycentric weights are not finite is rejected.
 - "Zero-area" means `det == 0` after the f64 fallback of the ray-triangle test.
-- Closest point uses a sliver band: when sin²θ ≤ 1e-5, the three edge segments are also evaluated and the nearest result is kept.
+- Closest point uses a sliver band: when sin²θ ≤ 1e-5 or the sum is not finite, the three edge segments are also evaluated and the nearest result is kept.
 - An infinite sphere radius gives `InvalidInput`.
 - A NaN box gives no results.

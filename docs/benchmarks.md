@@ -30,7 +30,7 @@ Results for `cargo bench -p fast-mesh-query`, measured on the same `terrain(n)` 
 - **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
 - **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
 - **Date:** 2026-10-16
-- **Rays:** origins at `z = 20` over the terrain, directions `(jx, jy, -1)` with jitter in ±0.2, every ray hits
+- **Rays:** origins at `z = 20` over the terrain, directions `(jx, jy, -1)` with jitter in ±0.2 (most rays hit; those near the border may miss)
 - **Points:** random positions over the terrain at heights in `[-5, 5]`, no `max_distance`
 - **Regions:** one sphere of radius 5 at the center of the terrain
 
@@ -42,7 +42,7 @@ Results for `cargo bench -p fast-mesh-query`, measured on the same `terrain(n)` 
 | `triangles_in`, sphere radius 5 | 6.6 µs (114 triangles) | 6.9 µs (157 triangles) |
 | `vertices_in`, sphere radius 5 | 3.0 µs (44 vertices) | 4.1 µs (63 vertices) |
 
-Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. Single runs vary by up to 30% on this machine (a first run of the 1M benchmarks measured 2.95 µs per ray for `raycast`), so treat differences below that as noise.
+Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. The table comes from one run that covered both sizes. Runs on this machine differ more than criterion's own intervals suggest: an earlier run of the 1M benchmarks measured 2.95 µs per ray for `raycast`, 2.69 µs for `raycast_any`, 4.56 µs per point for `closest_point` and 10.6 µs for `triangles_in`, up to 60% above the table. Treat differences below that spread as noise, and compare only numbers from the same run.
 
 ## How the defaults were chosen
 
