@@ -36,13 +36,46 @@ Results for `cargo bench -p fast-mesh-query`, measured on the same `terrain(n)` 
 
 | | 1M triangles | 10M triangles |
 | --- | --- | --- |
-| `raycast`, per ray | 1.99 µs | 2.67 µs |
-| `raycast_any`, per ray | 1.82 µs | 2.45 µs |
-| `closest_point`, per point | 2.80 µs | 3.62 µs |
-| `triangles_in`, sphere radius 5 | 6.6 µs (114 triangles) | 6.9 µs (157 triangles) |
-| `vertices_in`, sphere radius 5 | 3.0 µs (44 vertices) | 4.1 µs (63 vertices) |
+| `raycast`, per ray | 1.07 µs | 1.70 µs |
+| `raycast_any`, per ray | 1.00 µs | 1.60 µs |
+| `closest_point`, per point | 2.52 µs | 3.44 µs |
+| `triangles_in`, sphere radius 5 | 6.8 µs (114 triangles) | 7.7 µs (157 triangles) |
+| `vertices_in`, sphere radius 5 | 2.9 µs (44 vertices) | 6.8 µs (63 vertices) |
 
-Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. The table comes from one run that covered both sizes. Runs on this machine differ more than criterion's own intervals suggest: an earlier run of the 1M benchmarks measured 2.95 µs per ray for `raycast`, 2.69 µs for `raycast_any`, 4.56 µs per point for `closest_point` and 10.6 µs for `triangles_in`, about 60% above the table. Treat differences below that spread as noise, and compare only numbers from the same run.
+These are the numbers after issue #17 (key-ordered traversal with a fixed stack). Before #17, on 2026-10-16: `raycast` 1.99 µs and 2.67 µs, `raycast_any` 1.82 µs and 2.45 µs, `closest_point` 2.80 µs and 3.62 µs, `triangles_in` 6.6 µs and 6.9 µs, `vertices_in` 3.0 µs and 4.1 µs (1M and 10M). Ray queries are about 1.9× faster at 1M and 1.5× at 10M; `closest_point` is about 10% faster; region queries are unchanged within noise.
+
+Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. The 1M column is the fastest of three runs on 2026-10-17 (the others measured `raycast` at 1.28 µs and 1.63 µs, `closest_point` at 3.26 µs and 2.74 µs, `triangles_in` at 10.9 µs and 9.1 µs); the 10M column is from the last run, which also measured the 1M slowly. Runs on this machine differ by up to 50% beyond criterion's own intervals, so treat differences below that spread as noise, and compare only numbers from the same run.
+
+## Mesh-vs-mesh queries (fast-mesh-query)
+
+Results for `cargo bench -p fast-mesh-query`, same machine and toolchain as above, run on 2026-10-17. Each size has two `terrain(n)` meshes with default BVHs. B is flipped 180° about x and placed over A, then turned by `0.1° * i` about z around the middle of the terrain, for `i` in 0..64. Every iteration uses the next of these 64 precomputed `Rigid`s, so each time is a median over the cycle (the pose changes the contact a lot, hence the wide criterion intervals). Each pose is lifted so that the surfaces just touch at their closest place, measured on a grid of samples of A, so the true surfaces cross by a small amount ("touching" below). "Pushed" lowers B 0.5 into A, and "apart" lifts it 0.3 away. The `triangles_near` margin is 1% of the terrain height range (0.080).
+
+Result sizes at poses 0, 31 and 63 (0°, 3.1°, 6.3°):
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| `triangles_near` (triangles of A + of B) | 4,607 + 4,607 / 188 + 188 / 182 + 182 | 48,414 + 48,414 / 359 + 359 / 353 + 353 |
+| `intersecting_pairs`, pushed 0.5 | 18,554 / 3,188 / 928 pairs | 194,919 / 7,766 / 6,344 pairs |
+| `mesh_distance`, touching | 0 at every pose | 0 at every pose |
+| `mesh_distance`, apart 0.3 | 0.299 / 0.287 / 0.279 | 0.299 / 0.267 / 0.298 |
+
+Times (criterion median over the 64-pose cycle):
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| `intersects`, touching | 0.72 ms | 1.20 ms |
+| `intersects`, apart 0.3 | 30 µs | 0.045 µs (rejected almost at once) |
+| `mesh_distance`, touching | 23 ms | 49 ms |
+| `mesh_distance`, apart 0.3 | 5.5 ms | 62 ms |
+| `triangles_near`, margin 0.080 | 11.5 ms | 91 ms |
+| `intersecting_pairs`, pushed 0.5 | 14.8 ms | 199 ms |
+
+The cost of `intersects` grows little with size, and `triangles_near` and `intersecting_pairs` follow the contact size: the 10M poses at 0° have 10× the contact of the 1M ones. 10M results have criterion intervals of 2× to 6× around the median, because the contact varies so much across the cycle; read them as orders of magnitude.
+
+**Against the spec's targets (§1).**
+- `intersects` takes 0.7 ms at 1M vs 1M: within the "few ms" target.
+- `mesh_distance` takes 5.5 ms when the meshes are 0.3 apart, under 2× a "few ms" (about 3 ms) target, but 23 ms when they touch, which misses it by more than 2×. A follow-up issue should look at the touching case; the cause was not investigated here.
+- `triangles_near` costs in proportion to contact: 11.5 ms at 1M for a few hundred to 4,600 triangles per side, and 91 ms at 10M for 350 to 48,000.
 
 ## How the defaults were chosen
 
@@ -73,6 +106,6 @@ These were measured on a later day than the main table above, so compare them on
 ```sh
 cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
-cargo bench -p fast-mesh-query                        # the same for the query benchmarks
+cargo bench -p fast-mesh-query                        # the same for the query benchmarks (single-mesh and mesh-vs-mesh)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
 ```

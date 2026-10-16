@@ -1,6 +1,6 @@
 # fast-mesh queries, part b (Phase 3b) design
 
-- **Status:** Draft for review
+- **Status:** Implemented (Phase 3b)
 - **Date:** 2026-10-16
 - **Parent specs:** `2026-10-14-fast-mesh-engine-design.md` §6, and `2026-10-16-fast-mesh-query-design.md` (Phase 3a, implemented). Where this document disagrees with them, it wins for Phase 3b.
 - **Milestone:** Phase 3: Queries. Also resolves issue #17.
@@ -205,3 +205,13 @@ pub fn intersecting_pairs(.., out: &mut Vec<(TriangleId, TriangleId)>) -> Result
 - Module layout inside `fast-mesh-query`.
 - The f64/f32 boundaries inside the distance code.
 - Bench geometry details.
+
+## 10. Implementation notes
+
+Where the implementation differs from the text above:
+
+- **Distance 0 (§5).** `mesh_distance` reports 0 for pairs that intersect or touch, and also for a positive gap that rounds to 0 in `f64`. The search stops at the first such pair. The oracle accepts a returned pair that intersects (decided exactly) or has a computed distance of 0.
+- **Pruning (§6).** Pairs are pruned when the box gap exceeds the bound plus a relative slack of 2^-30 times the coordinate magnitude, not at the bare bound, because triangle distances carry `f64` rounding that the box gap does not. The slack only adds work. `mesh_distance` prunes in both the traversal's `key` and its `visit`, so the stackless overflow fallback prunes too.
+- **Property test oracle.** `tests/properties.rs` runs each pair of alive triangles as two one-triangle meshes through the public API. It compares `mesh_distance` by its `f32` distance and points, since the public API does not report the `f64` squared distance. So the smallest-pair tie rule on `f64` is covered by the unit tests, not the property test.
+- **Benchmarks (§8).** B is a second `terrain(n)` mesh, flipped and lifted per pose to touch A at its closest place on a sample grid. Besides the four planned benchmarks there are "apart 0.3" variants of `intersects` and `mesh_distance`, the case the use case calls most common.
+- **Speed targets (§1, §8).** `mesh_distance` misses the "few ms" target by more than 2× when the meshes touch (23 ms at 1M vs 1M); see `docs/benchmarks.md`. The other targets are met. A follow-up issue is for the owner to file.
