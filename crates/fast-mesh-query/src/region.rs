@@ -38,11 +38,22 @@ impl Region {
     }
 
     /// A box that contains the whole region.
+    ///
+    /// The `f32` containment test `d <= r * r` can accept points a few ulp
+    /// outside `center +- radius`, so the sphere's box is padded outward: the
+    /// radius grows by a relative `4 * EPSILON` plus a tiny absolute amount,
+    /// and each bound then moves one more ulp out. Pruning is then
+    /// conservative with respect to the containment tests, whatever the tree
+    /// layout.
     fn bounds(&self) -> Aabb {
         match *self {
             Region::Box(b) => b,
             Region::Sphere { center, radius } => {
-                Aabb::new(center.map(|c| c - radius), center.map(|c| c + radius))
+                let r = radius * (1.0 + 4.0 * f32::EPSILON) + f32::MIN_POSITIVE;
+                Aabb::new(
+                    center.map(|c| (c - r).next_down()),
+                    center.map(|c| (c + r).next_up()),
+                )
             }
         }
     }
@@ -131,6 +142,10 @@ pub fn triangles_in(
 /// appended part is sorted.
 ///
 /// A vertex that no triangle uses is not found: the search runs over triangles.
+///
+/// Before deduplication, `out` can temporarily hold each vertex once per
+/// incident candidate triangle, about 6 times the result for a typical mesh,
+/// and `out` keeps that capacity afterwards.
 ///
 /// # Errors
 /// As for [`triangles_in`].
@@ -297,6 +312,47 @@ mod tests {
                 nonempty += usize::from(n > 0);
             }
             assert!(nonempty > 100, "only {nonempty} regions hit");
+        }
+    }
+
+    #[test]
+    fn sphere_pruning_box_covers_f32_containment_at_ulp_scale() {
+        // Rounding in `q - center` and in the squares lets the containment test
+        // accept a point a few ulp beyond `center + radius`. Search seeded
+        // values for such a point, a few ulp outward along +x.
+        let mut rng = Lcg(0x51de);
+        let mut found = None;
+        'search: for _ in 0..20_000 {
+            let center = [rng.next() * 10.0 - 5.0, 0.0, 0.0];
+            let radius = 0.1 + rng.next() * 3.0;
+            let region = Region::Sphere { center, radius };
+            let plain_hi = center[0] + radius;
+            let mut x = plain_hi;
+            for _ in 0..4 {
+                x = x.next_up();
+                if contains(&region, [x, 0.0, 0.0]) {
+                    found = Some((region, x));
+                    break 'search;
+                }
+            }
+        }
+        let (region, x) = found.expect("no point just outside the unpadded box is contained");
+        let Region::Sphere { center, radius } = region else {
+            unreachable!()
+        };
+        assert!(x > center[0] + radius);
+        assert!(contains(&region, [x, 0.0, 0.0]));
+        assert!(region.bounds().max[0] >= x);
+
+        // A triangle whose bounds start at that vertex, so only the padded box
+        // reaches it.
+        let p = [x, 0.0, 0.0, x + 1.0, 5.0, 0.0, x + 1.0, 0.0, 5.0];
+        let mesh = Mesh::from_buffers(&p, &[0, 1, 2]).unwrap();
+        for quality in [Quality::Sah, Quality::Fast] {
+            let bvh = build(&mesh, quality);
+            let mut out = Vec::new();
+            assert_eq!(vertices_in(&mesh, &bvh, &region, &mut out), Ok(1));
+            assert_eq!(out, vec![0]);
         }
     }
 
