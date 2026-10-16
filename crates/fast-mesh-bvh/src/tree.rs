@@ -5,7 +5,7 @@ use fast_mesh_store::{Mesh, TriangleId};
 use crate::arena::{Arena, NONE, Node};
 use crate::build::{Prims, build_subtree, expected_nodes};
 use crate::error::{Result, try_reserve, try_reserve_exact, try_reserve_map, try_vec};
-use crate::{Aabb, BuildOptions, UpdatePolicy};
+use crate::{Aabb, BuildOptions, NodeKind, UpdatePolicy};
 
 /// A subtree that is rebuilt as one unit.
 #[derive(Debug, Clone, Copy)]
@@ -211,7 +211,7 @@ impl Bvh {
             if !node.bounds.overlaps(&query) {
                 return false;
             }
-            if let crate::NodeKind::Leaf { triangles: leaf } = node.kind {
+            if let NodeKind::Leaf { triangles: leaf } = node.kind {
                 for &t in leaf {
                     if Aabb::of_triangle(positions, triangles[t as usize]).overlaps(&query) {
                         out.push(t);

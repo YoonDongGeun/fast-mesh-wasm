@@ -206,6 +206,120 @@ mod tests {
         assert_eq!(got.len(), bvh.node_count());
     }
 
+    /// Pre-order following `first_is_left` on the children's bounds.
+    fn pre_order_by(
+        bvh: &Bvh,
+        id: NodeId,
+        first_is_left: &impl Fn(&Aabb, &Aabb) -> bool,
+        out: &mut Vec<NodeId>,
+    ) {
+        out.push(id);
+        if let NodeKind::Inner { left, right } = bvh.node(id).kind {
+            let (l, r) = (bvh.node(left).bounds, bvh.node(right).bounds);
+            let (first, second) = if first_is_left(&l, &r) {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            pre_order_by(bvh, first, first_is_left, out);
+            pre_order_by(bvh, second, first_is_left, out);
+        }
+    }
+
+    #[test]
+    fn ordered_traversal_with_mixed_choices() {
+        let bvh = build(&grid(6));
+        let pred = |l: &Aabb, r: &Aabb| l.min[0] < r.min[0];
+        // The predicate must pick left at some nodes and right at others.
+        let (mut lefts, mut rights) = (0, 0);
+        bvh.traverse(|_, view| {
+            if let NodeKind::Inner { left, right } = view.kind {
+                if pred(&bvh.node(left).bounds, &bvh.node(right).bounds) {
+                    lefts += 1;
+                } else {
+                    rights += 1;
+                }
+            }
+            true
+        });
+        assert!(lefts > 0 && rights > 0, "lefts {lefts}, rights {rights}");
+
+        let mut expected = Vec::new();
+        pre_order_by(&bvh, bvh.root().unwrap(), &pred, &mut expected);
+        let mut got = Vec::new();
+        bvh.traverse_ordered(pred, |id, _| {
+            got.push(id);
+            true
+        });
+        assert_eq!(got, expected);
+        assert_eq!(got.len(), bvh.node_count());
+    }
+
+    #[test]
+    fn pruning_an_inner_node_skips_only_its_subtree() {
+        let bvh = build(&grid(6));
+        let root = bvh.root().unwrap();
+        let NodeKind::Inner { left, right } = bvh.node(root).kind else {
+            panic!("expected an inner root");
+        };
+        let NodeKind::Inner { .. } = bvh.node(left).kind else {
+            panic!("expected an inner left child");
+        };
+        let mut subtree = Vec::new();
+        pre_order_by(&bvh, left, &|_, _| true, &mut subtree);
+        assert!(subtree.len() > 1);
+
+        let run = |ordered: bool| {
+            let mut got = Vec::new();
+            let visit = |id: NodeId, _: &NodeView| {
+                got.push(id);
+                id != left
+            };
+            if ordered {
+                bvh.traverse_ordered(|_, _| true, visit);
+            } else {
+                bvh.traverse(visit);
+            }
+            got
+        };
+        for got in [run(false), run(true)] {
+            assert_eq!(got.len(), bvh.node_count() - (subtree.len() - 1));
+            assert!(got.contains(&left) && got.contains(&right));
+            for id in &subtree[1..] {
+                assert!(!got.contains(id));
+            }
+            let mut unique = got.clone();
+            unique.sort_by_key(|id| id.0);
+            unique.dedup();
+            assert_eq!(unique.len(), got.len());
+        }
+    }
+
+    #[test]
+    fn single_leaf_tree() {
+        let single = Mesh::from_buffers(&[0., 0., 0., 1., 0., 0., 0., 1., 0.], &[0, 1, 2]).unwrap();
+        let bvh = build(&single);
+        let root = bvh.root().unwrap();
+        assert!(matches!(
+            bvh.node(root).kind,
+            NodeKind::Leaf { triangles } if triangles == [0]
+        ));
+        assert_eq!(bvh.parent(root), None);
+        let mut calls = 0;
+        bvh.traverse(|_, _| {
+            calls += 1;
+            true
+        });
+        bvh.traverse_ordered(
+            |_, _| true,
+            |_, _| {
+                calls += 1;
+                true
+            },
+        );
+        assert_eq!(calls, 2);
+    }
+
     #[test]
     fn ordered_traversal_prunes() {
         let bvh = build(&grid(6));
