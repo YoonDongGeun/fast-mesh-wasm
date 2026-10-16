@@ -12,6 +12,10 @@
 //!   ray-triangle test is watertight: a ray through a shared edge or vertex
 //!   never slips between the triangles meeting there. Ties go to the smallest
 //!   triangle id.
+//! - Region queries: [`triangles_in`] and [`vertices_in`] find the triangles
+//!   that touch, or the vertices inside, a [`Region`] (a box or a sphere). The
+//!   box is an [`Aabb`], re-exported from `fast_mesh_bvh` so that callers need
+//!   not depend on that crate to build a [`Region::Box`].
 
 mod closest;
 mod error;
@@ -26,6 +30,8 @@ use fast_mesh_store::Mesh;
 
 pub use closest::*;
 pub use error::{QueryError, Result};
+/// The axis-aligned box type of [`Region::Box`], re-exported from `fast_mesh_bvh`.
+pub use fast_mesh_bvh::Aabb;
 pub use ray::*;
 pub use region::*;
 pub use tri::{Cull, Feature};

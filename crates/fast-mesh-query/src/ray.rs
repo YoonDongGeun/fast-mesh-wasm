@@ -248,7 +248,12 @@ pub fn raycast_any(mesh: &Mesh, bvh: &Bvh, ray: &Ray, opts: &RayOptions) -> Resu
 
 /// Appends every hit with `opts.min_t <= t <= opts.max_t` to `out`, sorted by
 /// `(t, triangle)`, and returns how many were appended. Elements already in
-/// `out` are kept. A ray crossing an edge shared by two triangles reports both.
+/// `out` are kept.
+///
+/// A ray through an edge shared by several triangles, or through a vertex
+/// shared by a fan, reports one hit per triangle: a vertex shared by 6
+/// triangles gives 6 hits at the same `t`. A caller that counts surface
+/// crossings, for parity or winding, must merge hits with equal `t`.
 ///
 /// # Errors
 /// As for [`raycast`], and [`QueryError::OutOfMemory`] when `out` cannot grow;
@@ -488,6 +493,28 @@ mod tests {
             out.iter().map(|h| (h.triangle, h.t)).collect::<Vec<_>>(),
             [(0, 9.0), (1, 9.0)]
         );
+    }
+
+    #[test]
+    fn ray_through_a_fan_vertex_hits_every_triangle() {
+        // Six triangles around the vertex 0 at the origin.
+        let mut p = vec![0.0, 0.0, 0.0];
+        for i in 0..6 {
+            let a = i as f32 * std::f32::consts::TAU / 6.0;
+            p.extend([a.cos(), a.sin(), 0.0]);
+        }
+        let idx: Vec<u32> = (0..6).flat_map(|i| [0, 1 + i, 1 + (i + 1) % 6]).collect();
+        let mesh = Mesh::from_buffers(&p, &idx).unwrap();
+        let bvh = build(&mesh, Quality::Sah);
+        let ray = Ray {
+            origin: [0.0, 0.0, 2.0],
+            dir: DOWN,
+        };
+        let mut out = Vec::new();
+        assert_eq!(raycast_all(&mesh, &bvh, &ray, &opts(), &mut out), Ok(6));
+        assert!(out.iter().all(|h| h.t == 2.0));
+        let ids: Vec<_> = out.iter().map(|h| h.triangle).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
