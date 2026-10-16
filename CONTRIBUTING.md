@@ -10,6 +10,7 @@ crates/fast-mesh/        Pure Rust algorithms. No WebAssembly code. Most work ha
 crates/fast-mesh-wasm/   #[wasm_bindgen] wrappers that expose the core to JavaScript.
 crates/fast-mesh-store/  Editable mesh storage: slots, channels, transactions, undo/redo history.
 crates/fast-mesh-bvh/    BVH over a store mesh: build, incremental update, box query.
+crates/fast-mesh-query/  Raycast, closest-point and region queries over a store mesh and its BVH.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.
 fixtures/smoke/          Script that CI runs after installing the package with npm, pnpm and bun.
@@ -49,6 +50,7 @@ pnpm test
 | `pnpm check:pkg` | publint and Are The Types Wrong on the package |
 | `pnpm smoke` | Packs the package and installs it with npm, pnpm and bun in temporary projects |
 | `cargo bench -p fast-mesh-bvh` | BVH benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
+| `cargo bench -p fast-mesh-query` | Raycast, closest-point and region benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
 | `pnpm --filter fast-mesh-wasm-example-vite dev` | Runs the browser example |
 
 Re-run `pnpm build` after changing Rust code; the JS tests import the built output.

@@ -1,6 +1,6 @@
 # fast-mesh queries, part a (Phase 3a) design
 
-- **Status:** Approved design, not yet implemented
+- **Status:** Implemented (Phase 3a)
 - **Date:** 2026-10-16
 - **Parent spec:** `2026-10-14-fast-mesh-engine-design.md`, section 6. This document settles what section 6 leaves open for single-mesh queries. Where they disagree, this document wins for Phase 3a.
 - **Milestone:** Phase 3: Queries
@@ -131,7 +131,7 @@ Semantics:
 - **Invalid input:** `InvalidInput` for:
   - a zero or non-finite `dir`;
   - a non-finite `origin`;
-  - `min_t > max_t`, or `min_t` that is NaN;
+  - `min_t > max_t`, or `min_t` or `max_t` that is NaN;
   - in `raycast_many`, slices of different lengths.
 - **Hit range:** a hit counts when `min_t <= t <= max_t`.
 - **`raycast`:** the hit with the smallest `t`. Ties go to the smallest triangle id, so results are deterministic.
@@ -267,3 +267,15 @@ Criterion, `cargo bench -p fast-mesh-query`, on Phase 2's synthetic terrain mesh
 - `triangles_in` and `vertices_in`: a sphere about the size of a sculpting brush.
 
 Results are recorded in a new section of `docs/benchmarks.md`. CI adds `cargo bench -p fast-mesh-query --no-run`. CONTRIBUTING lists the crate in the project layout and the bench command.
+
+## Implementation notes
+
+Accepted deviations from the design above:
+
+- `ray_box` clamps its entry distance to `min_t`, and a negative `min_t` is allowed.
+- A NaN `max_t` gives `InvalidInput`, like a NaN `min_t`.
+- A hit whose `t` or barycentric weights are not finite is rejected.
+- "Zero-area" means `det == 0` after the f64 fallback of the ray-triangle test.
+- Closest point uses a sliver band: when sin²θ ≤ 1e-5, the three edge segments are also evaluated and the nearest result is kept.
+- An infinite sphere radius gives `InvalidInput`.
+- A NaN box gives no results.

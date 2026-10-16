@@ -23,6 +23,27 @@ Reference results for `cargo bench -p fast-mesh-bvh`. Times are criterion median
 
 Update times are steady state: one mesh and one BVH are edited repeatedly, as in an interactive session. Small edits cost about the same at 1M and 10M because they touch only the affected leaves and treelets. The first edit after loading a mesh is slower once: the store's columns and the BVH's arrays grow from their exact initial size, which copies them one time.
 
+## Queries (fast-mesh-query)
+
+Results for `cargo bench -p fast-mesh-query`, measured on the same `terrain(n)` meshes with a BVH built with default options. Ray and point benchmarks run a batch of 100,000 queries on one thread, and the table divides the criterion median by the batch size.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Date:** 2026-10-16
+- **Rays:** origins at `z = 20` over the terrain, directions `(jx, jy, -1)` with jitter in ±0.2, every ray hits
+- **Points:** random positions over the terrain at heights in `[-5, 5]`, no `max_distance`
+- **Regions:** one sphere of radius 5 at the center of the terrain
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| `raycast`, per ray | 1.99 µs | 2.67 µs |
+| `raycast_any`, per ray | 1.82 µs | 2.45 µs |
+| `closest_point`, per point | 2.80 µs | 3.62 µs |
+| `triangles_in`, sphere radius 5 | 6.6 µs (114 triangles) | 6.9 µs (157 triangles) |
+| `vertices_in`, sphere radius 5 | 3.0 µs (44 vertices) | 4.1 µs (63 vertices) |
+
+Ray and point queries cost little more at 10M than at 1M because the tree is only a few levels deeper. Region queries cost about the same at both sizes because they visit only the nodes near the sphere. Single runs vary by up to 30% on this machine (a first run of the 1M benchmarks measured 2.95 µs per ray for `raycast`), so treat differences below that as noise.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -52,4 +73,6 @@ These were measured on a later day than the main table above, so compare them on
 ```sh
 cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
+cargo bench -p fast-mesh-query                        # the same for the query benchmarks
+FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
 ```
