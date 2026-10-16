@@ -430,10 +430,10 @@ Worker data paths:
 
 1. Store, transactions, History
 2. BVH (build, refit, partial rebuild, quality tracking)
-3. Queries (raycast, closest point, distance, intersection, region, plane slicing)
+3. Queries, in two parts: 3a single-mesh (raycast, closest point, region; `2026-10-16-fast-mesh-query-design.md`), 3b mesh-vs-mesh (distance, intersection)
 4. Scene (transforms, broadphase, contacts, dependency graph, policies, events)
 5. Fields and colors (built-ins, signed modes, custom fields)
-6. Sections
+6. Sections (including the plane slicing query, moved here from Phase 3)
 7. Repair operations (phase 1 set)
 8. JS API and three.js adapter
 9. Worker wrapper, sync model, React hooks

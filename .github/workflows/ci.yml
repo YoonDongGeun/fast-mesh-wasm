@@ -29,6 +29,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo bench -p fast-mesh-bvh --no-run
+      - run: cargo bench -p fast-mesh-query --no-run
 
   package:
     name: Build and check the npm package
