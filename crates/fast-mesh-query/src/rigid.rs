@@ -52,7 +52,6 @@ impl Rigid {
 
     /// Checks that every value is finite and that the rotation is a proper
     /// rotation within `1e-6`.
-    #[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
     pub(crate) fn validate(&self) -> Result<()> {
         let r = &self.rotation;
         if !r
@@ -86,7 +85,6 @@ impl Rigid {
     }
 
     /// Maps a point of B into A's space, in `f64`.
-    #[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
     pub(crate) fn apply(&self, p: [f32; 3]) -> [f64; 3] {
         self.apply_f64(p.map(f64::from))
     }
@@ -109,7 +107,6 @@ impl Rigid {
     /// monotone, `apply` of any point in `b` lands inside these bounds as
     /// computed, not just in real arithmetic. The result is the exact image box
     /// `center ± |rotation| * half_extent` up to rounding.
-    #[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
     pub(crate) fn transform_box(&self, b: &Aabb) -> Aabb {
         if b.is_empty() {
             return Aabb::EMPTY;
@@ -146,7 +143,7 @@ fn round_up(x: f64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::Lcg;
+    use crate::test_util::{Lcg, random_rotation};
 
     fn rot_z(deg: f64) -> [[f64; 3]; 3] {
         let (s, c) = deg.to_radians().sin_cos();
@@ -205,35 +202,6 @@ mod tests {
         let back = r.apply(q32);
         for k in 0..3 {
             assert!((back[k] - f64::from(p[k])).abs() <= 1e-6);
-        }
-    }
-
-    /// A random rotation from a random unit quaternion.
-    fn random_rotation(rng: &mut Lcg) -> [[f64; 3]; 3] {
-        loop {
-            let q: [f64; 4] = std::array::from_fn(|_| f64::from(rng.next()) * 2.0 - 1.0);
-            let n = q.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if n < 0.1 {
-                continue;
-            }
-            let [w, x, y, z] = q.map(|v| v / n);
-            return [
-                [
-                    1.0 - 2.0 * (y * y + z * z),
-                    2.0 * (x * y - w * z),
-                    2.0 * (x * z + w * y),
-                ],
-                [
-                    2.0 * (x * y + w * z),
-                    1.0 - 2.0 * (x * x + z * z),
-                    2.0 * (y * z - w * x),
-                ],
-                [
-                    2.0 * (x * z - w * y),
-                    2.0 * (y * z + w * x),
-                    1.0 - 2.0 * (x * x + y * y),
-                ],
-            ];
         }
     }
 

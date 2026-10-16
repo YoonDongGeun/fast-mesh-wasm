@@ -52,6 +52,10 @@ struct Pending {
 ///
 /// Nothing is visited when either tree is empty. Up to [`PAIR_STACK`] pairs
 /// wait on a fixed stack; see [`traverse_pairs_with`] for what happens beyond.
+// Only this module's tests call it: the queries in `pairs` call
+// `traverse_pairs_with::<PAIR_STACK>` so that their tests can force the
+// overflow fallback with a smaller stack.
+#[allow(dead_code)]
 pub(crate) fn traverse_pairs(
     a: &Bvh,
     b: &Bvh,

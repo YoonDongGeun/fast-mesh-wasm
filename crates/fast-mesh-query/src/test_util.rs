@@ -44,3 +44,32 @@ impl Lcg {
         (self.0 >> 40) as f32 / (1u64 << 24) as f32
     }
 }
+
+/// A random rotation matrix (row-major) from a random unit quaternion.
+pub(crate) fn random_rotation(rng: &mut Lcg) -> [[f64; 3]; 3] {
+    loop {
+        let q: [f64; 4] = std::array::from_fn(|_| f64::from(rng.next()) * 2.0 - 1.0);
+        let n = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if n < 0.1 {
+            continue;
+        }
+        let [w, x, y, z] = q.map(|v| v / n);
+        return [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - w * z),
+                2.0 * (x * z + w * y),
+            ],
+            [
+                2.0 * (x * y + w * z),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - w * x),
+            ],
+            [
+                2.0 * (x * z - w * y),
+                2.0 * (y * z + w * x),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ];
+    }
+}

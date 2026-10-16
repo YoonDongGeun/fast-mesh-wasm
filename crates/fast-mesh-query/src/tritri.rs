@@ -102,7 +102,6 @@ fn normal_axis(t: &[P3; 3]) -> Option<usize> {
 /// True when the closed triangles `a` and `b` share at least one point.
 /// Touching at a vertex or along an edge counts. Exact for the given
 /// coordinates.
-#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
 pub(crate) fn tri_tri_intersect(a: [P3; 3], b: [P3; 3]) -> bool {
     // Where a's corners lie relative to b's plane. All zero when b is
     // degenerate.
@@ -129,7 +128,6 @@ pub(crate) fn tri_tri_intersect(a: [P3; 3], b: [P3; 3]) -> bool {
 }
 
 /// The distance between two triangles, with a closest pair of points.
-#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriTriDist {
     /// Squared distance, exactly `0` when the triangles intersect.
@@ -152,7 +150,6 @@ pub(crate) struct TriTriDist {
 /// against `b`, then the vertices of `b` against `a`, then edge pairs
 /// `(i, j)` in `i * 3 + j` order. This is exact up to `f64` rounding of the
 /// closest points.
-#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
 pub(crate) fn tri_tri_distance(a: [P3; 3], b: [P3; 3]) -> TriTriDist {
     let mut best = TriTriDist {
         dist2: f64::INFINITY,
