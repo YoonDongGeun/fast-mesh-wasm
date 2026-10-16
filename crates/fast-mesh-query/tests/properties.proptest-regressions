@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 62be0324c773eb4c407ea401f5d33fe422f772e63a5b6ef0df9b29b6caee9f25 # shrinks to options = BuildOptions { quality: Sah, max_leaf_size: 1, sah_bins: 16, treelet_size: 4096 }, seed = 8987639918567506334, steps = [Commit([AddTriangle([1968, 170420783, 0])]), Commit([AddVertex(0, 0, 0)]), Commit([Move(2827435931, [48, -109, 97]), AddVertex(4049943192, 2776767681, 134), Move(2840829018, [-81, -47, 99])])]

@@ -205,7 +205,7 @@ fn closest(
 ///
 /// # Errors
 /// [`QueryError::InvalidInput`] for a non-finite origin, a zero or non-finite
-/// direction, or `min_t` that is NaN or greater than `max_t`; then
+/// direction, or `min_t` or `max_t` that is NaN, or `min_t` greater than `max_t`; then
 /// [`QueryError::MeshMismatch`] or [`QueryError::StaleBvh`] when `bvh` does not
 /// match the current `mesh`.
 pub fn raycast(mesh: &Mesh, bvh: &Bvh, ray: &Ray, opts: &RayOptions) -> Result<Option<RayHit>> {
@@ -735,6 +735,37 @@ mod tests {
                 &opts(),
                 &mut out
             ),
+            Err(QueryError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn nan_max_t_is_invalid() {
+        let (mesh, bvh) = one_triangle(&T);
+        let ray = Ray {
+            origin: [0.25, 0.25, 1.0],
+            dir: DOWN,
+        };
+        let o = RayOptions {
+            max_t: f32::NAN,
+            ..opts()
+        };
+        assert!(matches!(
+            raycast(&mesh, &bvh, &ray, &o),
+            Err(QueryError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            raycast_any(&mesh, &bvh, &ray, &o),
+            Err(QueryError::InvalidInput(_))
+        ));
+        let mut out = Vec::new();
+        assert!(matches!(
+            raycast_all(&mesh, &bvh, &ray, &o, &mut out),
+            Err(QueryError::InvalidInput(_))
+        ));
+        let mut many = [None];
+        assert!(matches!(
+            raycast_many(&mesh, &bvh, &[ray.origin], &[ray.dir], &o, &mut many),
             Err(QueryError::InvalidInput(_))
         ));
     }
