@@ -13,6 +13,7 @@ authors = ["DongGeun Yoon"]
 [workspace.dependencies]
 fast-mesh = { path = "crates/fast-mesh", version = "0.1.0" }
 fast-mesh-store = { path = "crates/fast-mesh-store", version = "0.1.0" }
+fast-mesh-bvh = { path = "crates/fast-mesh-bvh", version = "0.1.0" }
 # Must match the installed wasm-bindgen-cli exactly. Bump both together.
 wasm-bindgen = "=0.2.129"
 
