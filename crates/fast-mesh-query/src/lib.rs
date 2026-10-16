@@ -16,6 +16,7 @@
 mod closest;
 mod error;
 mod ray;
+mod region;
 #[cfg(test)]
 mod test_util;
 mod tri;
@@ -26,6 +27,7 @@ use fast_mesh_store::Mesh;
 pub use closest::*;
 pub use error::{QueryError, Result};
 pub use ray::*;
+pub use region::*;
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
@@ -93,6 +95,11 @@ impl<'a, T> Appender<'a, T> {
     /// The elements appended through this appender.
     pub(crate) fn appended(&mut self) -> &mut [T] {
         &mut self.out[self.start..]
+    }
+
+    /// Drops all but the first `n` appended elements.
+    pub(crate) fn truncate_appended(&mut self, n: usize) {
+        self.out.truncate(self.start + n);
     }
 
     /// How many elements were appended.

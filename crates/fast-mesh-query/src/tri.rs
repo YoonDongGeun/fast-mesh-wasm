@@ -1,4 +1,7 @@
-//! Watertight ray-triangle intersection (Woop, Benthin and Wald 2013).
+//! Watertight ray-triangle intersection (Woop, Benthin and Wald 2013), closest
+//! point on a triangle, and box and sphere overlap tests.
+
+use fast_mesh_bvh::Aabb;
 
 /// Which triangle faces a ray ignores. A triangle's front is the side its
 /// counter-clockwise winding is seen from.
@@ -310,6 +313,75 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+/// Whether the triangle `p` and the closed box `b` share a point: the
+/// separating-axis test of Akenine-Moller with 13 axes (the three box normals,
+/// the triangle normal and the nine edge-by-box-axis crosses), in `f64`.
+///
+/// An axis separates only when the projected intervals are strictly disjoint,
+/// so touching counts as overlap. An axis that is the zero vector (a
+/// degenerate triangle's normal, or a cross of parallel vectors) is skipped. An
+/// empty box overlaps nothing.
+pub(crate) fn box_triangle(b: &Aabb, p: [[f32; 3]; 3]) -> bool {
+    if b.is_empty() {
+        return false;
+    }
+    let c: [f64; 3] = std::array::from_fn(|k| (f64::from(b.min[k]) + f64::from(b.max[k])) * 0.5);
+    let h: [f64; 3] = std::array::from_fn(|k| (f64::from(b.max[k]) - f64::from(b.min[k])) * 0.5);
+    let v: [[f64; 3]; 3] = p.map(|q| std::array::from_fn(|k| f64::from(q[k]) - c[k]));
+
+    // Box normals.
+    for k in 0..3 {
+        let lo = v[0][k].min(v[1][k]).min(v[2][k]);
+        let hi = v[0][k].max(v[1][k]).max(v[2][k]);
+        if lo > h[k] || hi < -h[k] {
+            return false;
+        }
+    }
+
+    let e: [[f64; 3]; 3] = std::array::from_fn(|i| {
+        let (a, b) = (v[i], v[(i + 1) % 3]);
+        [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+    });
+    let separates = |axis: [f64; 3]| {
+        if axis == [0.0; 3] {
+            return false;
+        }
+        let d = v.map(|q| axis[0] * q[0] + axis[1] * q[1] + axis[2] * q[2]);
+        let r = h[0] * axis[0].abs() + h[1] * axis[1].abs() + h[2] * axis[2].abs();
+        d[0].min(d[1]).min(d[2]) > r || d[0].max(d[1]).max(d[2]) < -r
+    };
+
+    // Triangle normal.
+    if separates(cross64(e[0], e[1])) {
+        return false;
+    }
+    // Edge crosses.
+    for edge in e {
+        for k in 0..3 {
+            let mut unit = [0.0; 3];
+            unit[k] = 1.0;
+            if separates(cross64(edge, unit)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn cross64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Whether the triangle `p` comes within `radius` of `center` (touching
+/// counts).
+pub(crate) fn sphere_triangle(center: [f32; 3], radius: f32, p: [[f32; 3]; 3]) -> bool {
+    closest_on_triangle(center, p).dist2 <= radius * radius
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +618,30 @@ mod tests {
                 assert!((m - got.point[k]).abs() < 1e-4, "{p:?} {q:?}");
             }
         }
+    }
+
+    #[test]
+    fn box_triangle_cases() {
+        let b = |min, max| Aabb::new(min, max);
+        // Overlap.
+        assert!(box_triangle(&b([0.2, 0.2, -1.0], [0.3, 0.3, 1.0]), T));
+        // Separated by a box face axis.
+        assert!(!box_triangle(&b([2.0, 2.0, -1.0], [3.0, 3.0, 1.0]), T));
+        // Separated by the triangle normal.
+        assert!(!box_triangle(&b([0.0, 0.0, 0.1], [1.0, 1.0, 1.0]), T));
+        // Separated only by an edge-cross axis (the hypotenuse): every
+        // coordinate range of the box overlaps the triangle's.
+        assert!(!box_triangle(&b([0.6, 0.6, -1.0], [1.0, 1.0, 1.0]), T));
+        // Touching at the corner (1, 0, 0) counts as overlap.
+        assert!(box_triangle(&b([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]), T));
+        // An empty box overlaps nothing.
+        assert!(!box_triangle(&Aabb::EMPTY, T));
+    }
+
+    #[test]
+    fn sphere_triangle_cases() {
+        assert!(sphere_triangle([0.25, 0.25, 1.0], 1.0, T));
+        assert!(!sphere_triangle([0.25, 0.25, 1.0], 0.999, T));
     }
 
     #[test]
