@@ -6,7 +6,9 @@
 //! size prints the result counts of the region queries once. The mesh-vs-mesh
 //! benchmarks place a flipped copy of the terrain over the terrain and turn it
 //! by a little more about z at every iteration, cycling through 64 poses; they
-//! print their result sizes at three poses.
+//! print their result sizes at three poses. `mesh_distance` on the touching
+//! poses is also measured separately on those that intersect and on the near
+//! misses.
 
 use std::hint::black_box;
 
@@ -219,6 +221,29 @@ fn bench_pairs(c: &mut Criterion, label: &str, n: u32) {
     let apart = poses(side, -0.3);
     let unit = |s: &str| format!("query {label} {s}");
 
+    // The touching poses split by whether the meshes really intersect: the
+    // sample grid misses the closest place by a little, so some poses are
+    // near misses, whose `mesh_distance` falls through to the full search.
+    let (hit, miss): (Vec<Rigid>, Vec<Rigid>) = touching
+        .iter()
+        .partition(|xf| intersects(&ma, &ba, &mb, &bb, xf).unwrap());
+    let gaps: Vec<f32> = miss
+        .iter()
+        .map(|xf| {
+            mesh_distance(&ma, &ba, &mb, &bb, xf, f32::INFINITY)
+                .unwrap()
+                .unwrap()
+                .distance
+        })
+        .collect();
+    eprintln!(
+        "{label}: touching poses: {} intersect, {} are near misses with gaps {:e} to {:e}",
+        hit.len(),
+        miss.len(),
+        gaps.iter().copied().fold(f32::INFINITY, f32::min),
+        gaps.iter().copied().fold(0.0, f32::max),
+    );
+
     // The result sizes, once, at three of the poses.
     for i in [0usize, 31, 63] {
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -264,6 +289,22 @@ fn bench_pairs(c: &mut Criterion, label: &str, n: u32) {
             black_box(mesh_distance(&ma, &ba, &mb, &bb, &touching[i], f32::INFINITY).unwrap());
         })
     });
+    // Each split cycles through its own poses.
+    for (name, set) in [
+        ("mesh_distance touching, intersecting poses", &hit),
+        ("mesh_distance touching, near-miss poses", &miss),
+    ] {
+        if set.is_empty() {
+            continue;
+        }
+        let mut j = 0;
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                j = (j + 1) % set.len();
+                black_box(mesh_distance(&ma, &ba, &mb, &bb, &set[j], f32::INFINITY).unwrap());
+            })
+        });
+    }
     group.bench_function("mesh_distance apart 0.3", |b| {
         b.iter(|| {
             i = (i + 1) % 64;
