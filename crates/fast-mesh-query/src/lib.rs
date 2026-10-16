@@ -24,6 +24,8 @@
 
 mod closest;
 mod error;
+#[allow(dead_code)] // Used by the mesh-vs-mesh queries, added later in Phase 3b.
+mod pair;
 mod ray;
 mod region;
 mod rigid;
