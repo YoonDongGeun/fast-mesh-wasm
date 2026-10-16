@@ -6,6 +6,9 @@
 //! - [`Bvh::update`] takes the store's [`fast_mesh_store::ChangeSet`] and refits,
 //!   rebuilds the affected treelets, or rebuilds everything, whichever is cheapest.
 //! - [`Bvh::query_aabb`] finds the triangles whose boxes overlap a box.
+//! - [`Bvh::root`], [`Bvh::node`], [`Bvh::parent`], [`Bvh::traverse`] and
+//!   [`Bvh::traverse_ordered`] expose the tree read-only, for building other
+//!   queries on top of it.
 //!
 //! Every fallible operation is failure-atomic: all memory it needs is reserved
 //! before the tree is touched, so on error the BVH is left as it was. The two
@@ -17,12 +20,14 @@ mod aabb;
 mod arena;
 mod build;
 mod error;
+mod node;
 mod options;
 mod tree;
 mod update;
 
 pub use aabb::Aabb;
 pub use error::{BvhError, Result};
+pub use node::{NodeId, NodeKind, NodeView};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
 pub use tree::Bvh;
 pub use update::{Strategy, UpdateReport};

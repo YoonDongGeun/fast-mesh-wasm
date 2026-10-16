@@ -200,15 +200,19 @@ impl Bvh {
 
     /// Appends every alive triangle whose bounding box overlaps the box
     /// `[min, max]` (touching counts), in no particular order.
+    ///
+    /// The BVH must be current for `mesh` ([`Bvh::is_current`]); a stale tree
+    /// may return wrong results or panic.
     pub fn query_aabb(&self, mesh: &Mesh, min: [f32; 3], max: [f32; 3], out: &mut Vec<TriangleId>) {
+        debug_assert!(self.is_current(mesh), "query_aabb on a stale BVH");
         let query = Aabb::new(min, max);
         let (positions, triangles) = (mesh.positions(), mesh.triangles());
-        self.arena.traverse(self.root, |_, node| {
+        self.traverse(|_, node| {
             if !node.bounds.overlaps(&query) {
                 return false;
             }
-            if node.is_leaf() {
-                for &t in &self.arena.refs[node.leaf_range()] {
+            if let crate::NodeKind::Leaf { triangles: leaf } = node.kind {
+                for &t in leaf {
                     if Aabb::of_triangle(positions, triangles[t as usize]).overlaps(&query) {
                         out.push(t);
                     }

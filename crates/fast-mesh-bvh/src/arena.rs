@@ -80,6 +80,62 @@ impl Arena {
         }
     }
 
+    /// Like [`Arena::traverse`], but at each inner node `first_is_left` decides
+    /// from the two child boxes (left, right) which child is visited first.
+    /// `first_is_left` must be pure: it is evaluated again on the way back up to
+    /// tell which child the walk is returning from.
+    pub(crate) fn traverse_ordered(
+        &self,
+        root: u32,
+        first_is_left: impl Fn(&Aabb, &Aabb) -> bool,
+        mut visit: impl FnMut(u32, &Node) -> bool,
+    ) {
+        if root == NONE {
+            return;
+        }
+        let stop = self.parents[root as usize];
+        let mut cur = root;
+        let mut from = stop;
+        loop {
+            let node = &self.nodes[cur as usize];
+            let parent = self.parents[cur as usize];
+            let next;
+            if from == parent {
+                // First arrival from above.
+                if visit(cur, node) && !node.is_leaf() {
+                    next = self.first_child(node, &first_is_left).0;
+                } else {
+                    next = parent;
+                }
+            } else {
+                let (first, second) = self.first_child(node, &first_is_left);
+                next = if from == first { second } else { parent };
+            }
+            if cur == root && next == stop {
+                return;
+            }
+            from = cur;
+            cur = next;
+        }
+    }
+
+    /// `(first, second)` children of an inner node under `first_is_left`.
+    fn first_child(
+        &self,
+        node: &Node,
+        first_is_left: &impl Fn(&Aabb, &Aabb) -> bool,
+    ) -> (u32, u32) {
+        let (a, b) = (node.a, node.b);
+        if first_is_left(
+            &self.nodes[a as usize].bounds,
+            &self.nodes[b as usize].bounds,
+        ) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
     /// Recomputes a leaf's box from its triangles.
     pub(crate) fn refit_leaf(&mut self, leaf: u32, positions: &[[f32; 3]], triangles: &[[u32; 3]]) {
         let range = self.nodes[leaf as usize].leaf_range();
