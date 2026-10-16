@@ -50,10 +50,15 @@ pub(crate) fn box_dist2(q: [f32; 3], b: &Aabb) -> f32 {
     d2
 }
 
-fn validate(p: [f32; 3], opts: &ClosestOptions) -> Result<()> {
+fn validate_point(p: [f32; 3]) -> Result<()> {
     if !p.iter().all(|c| c.is_finite()) {
         return Err(QueryError::InvalidInput("query point must be finite"));
     }
+    Ok(())
+}
+
+fn validate(p: [f32; 3], opts: &ClosestOptions) -> Result<()> {
+    validate_point(p)?;
     validate_opts(opts)
 }
 
@@ -139,10 +144,10 @@ pub fn closest_point_many(
             "points and out must have the same length",
         ));
     }
-    for &p in points {
-        validate(p, opts)?;
-    }
     validate_opts(opts)?;
+    for &p in points {
+        validate_point(p)?;
+    }
     check(mesh, bvh)?;
     for (&p, slot) in points.iter().zip(out) {
         *slot = closest(mesh, bvh, p, opts);
