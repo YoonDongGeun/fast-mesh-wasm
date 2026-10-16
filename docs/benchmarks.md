@@ -78,10 +78,33 @@ Times (criterion median over each cycle: the 64 poses, or for the split rows the
 
 The cost of `intersects` grows little with size, and `triangles_near` and `intersecting_pairs` follow the contact size: the 10M poses at 0° have 10× the contact of the 1M ones. 10M results have criterion intervals of 2× to 6× around the median, because the contact varies so much across the cycle; read them as orders of magnitude.
 
+### Near-miss search (issue #22)
+
+Same benchmarks, run on 2026-10-17, "before" from a worktree of `main` (commit `b7fb26b`) and "after" from this change, back to back:
+
+| | 1M, before | 1M, after | 10M, before | 10M, after |
+| --- | --- | --- | --- | --- |
+| `intersects`, touching (unchanged code) | 0.46 ms | 0.46 ms | 0.96 ms, 1.06 ms | 0.98 ms |
+| `mesh_distance`, touching, all 64 poses | 1.96 ms | 0.98 ms | 1.46 ms, 1.49 ms | 1.26 ms |
+| — intersecting poses only | 0.41 ms | 0.39 ms | 0.87 ms, 0.87 ms | 0.95 ms |
+| — near-miss poses only | 4.41 ms | 2.09 ms | 15.7 ms, 15.8 ms (3 poses) | 9.6 ms (3 poses) |
+| `mesh_distance`, apart 0.3 | 1.31 ms | 0.85 ms | 10.2 ms, 10.4 ms | 6.8 ms |
+| `triangles_near`, margin 0.080 | 2.23 ms | 1.55 ms | 15.0 ms, 15.9 ms | 10.6 ms |
+
+The 1M pair is the first of two rounds, in which the unchanged `intersects` measured the same on both sides; in the second round the machine was slower for the "before" run (`intersects` 0.50 ms, near misses 7.2 ms, intersecting poses 0.68 ms) and the "after" numbers repeated within 3% (near misses 2.12 ms, apart 0.85 ms, `triangles_near` 1.44 ms). The 10M "before" column has two runs, one before and one after the "after" run. Intersecting poses run the same code before and after (the exact intersection pre-pass), so their 10M difference is noise.
+
+What changed, with results unchanged:
+- **Per-leaf-pair caching.** The per-pair lower bound used to rebuild both triangles in `f64`, their boxes and their normals for every triangle pair. Now each triangle of a leaf pair is built once, with its box and its slab along its normal, and kept while the traversal stays on the same leaf. The bounds are bit-identical.
+- **Leaf prefilter.** Each triangle's box is first tested against the union box of the other leaf's triangles, and skipped against the whole leaf when that gap is beyond the bound. Its gap is never larger than the per-pair box gap, so it skips only pairs the lower bound would skip.
+- **Tie order.** `mesh_distance` orders pairs by box gap plus `1e-12` times the distance between the box centres, and still prunes on the box gap alone. On a near miss most leaf box pairs touch (gap 0), so the order among them used to be left-child-first. Now the most overlapping pairs come first and the bound falls sooner. Without this, the near misses took 2.9 to 4.6 ms at 1M instead of 2.1 ms.
+- **The pre-pass stays.** The alternative was to drop the exact intersection pre-pass and let the distance search stop at its first pair at distance 0 (the triangle distance already runs the exact test). In two runs, near misses took 1.5 and 2.3 ms that way, against 2.1 ms with the pre-pass. But intersecting poses went from 0.4 ms to 1.5 and 2.2 ms. So the pre-pass is kept.
+
+On the 22 near-miss poses at 1M (single cold runs), the pre-pass costs 0.17 to 0.37 ms on most poses, about 1 to 1.5 ms on four, and 5 ms on one. The whole query visits about 350 to 1,300 leaf pairs on most poses (pre-pass included), about 2,000 on three, and 7,400 on the slowest.
+
 **Against the spec's targets (§1).**
 - `intersects` takes about 0.5 ms at 1M vs 1M (0.45 to 0.84 ms across these runs): within the "few ms" target.
-- `mesh_distance` takes about 0.4 ms at 1M when the meshes intersect, about 1.2 ms when they are 0.3 apart, and about 4 ms on the near misses (7 ms in the slower runs; 22 ms at 10M). Intersecting and apart meet the "few ms" target; near misses, the common case, are at about 1.5× it at 1M and miss it at 10M. The follow-up issue for the owner is the near-miss search.
-- `triangles_near` costs in proportion to contact: about 2.2 ms at 1M for a few hundred to 4,600 triangles per side, and about 24 ms at 10M for 350 to 48,000.
+- `mesh_distance` takes about 0.4 ms at 1M when the meshes intersect, about 0.85 ms when they are 0.3 apart, and about 2.1 ms on the near misses (9.6 ms at 10M). All meet the "few ms" target at 1M. Near misses miss the issue's goal of about 1 ms by about 2×, and 10M near misses miss the "few ms" target.
+- `triangles_near` costs in proportion to contact: about 1.5 ms at 1M for a few hundred to 4,600 triangles per side, and about 11 ms at 10M for 350 to 48,000.
 
 ## How the defaults were chosen
 
