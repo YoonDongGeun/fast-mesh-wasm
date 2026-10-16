@@ -82,7 +82,10 @@ impl Bvh {
 
     /// Like [`Bvh::traverse`], but at each inner node `first_is_left` gets the
     /// left and right child bounds and says whether the left child is visited
-    /// first. It must be pure: it may be called more than once per node.
+    /// first. It must be pure: it may be called more than once per node, and an
+    /// impure predicate (one that gives different answers for the same bounds)
+    /// can make the traversal skip subtrees or loop forever. It is still
+    /// memory-safe.
     pub fn traverse_ordered(
         &self,
         first_is_left: impl Fn(&Aabb, &Aabb) -> bool,
