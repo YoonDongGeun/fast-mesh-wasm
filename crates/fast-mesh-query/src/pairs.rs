@@ -23,7 +23,9 @@ use crate::{Appender, QueryError, Result, Rigid, check};
 /// point in B's own coordinates. Map it back with [`Rigid::inverse`] if needed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeshDistance {
-    /// The distance between the two surfaces, 0 when they intersect or touch.
+    /// The distance between the two surfaces. 0 when they touch, intersect,
+    /// or are closer than `f64` rounding resolves: a positive gap whose
+    /// computed distance rounds to 0 is reported as 0. See [`mesh_distance`].
     pub distance: f32,
     /// The closest point on A's triangle `triangle_a`, in A's local space.
     pub point_a: [f32; 3],
@@ -76,10 +78,13 @@ pub fn intersects(
 /// rounding. Among pairs of triangles at the same minimum distance (equal
 /// squared distance in `f64`), the smallest `(triangle_a, triangle_b)` wins.
 ///
-/// When the meshes intersect or touch, the distance is 0 and the search stops
-/// at the first touching pair it finds: that pair is not necessarily the
-/// smallest one, and the two points are a common point of its triangles, up to
-/// rounding. Use [`intersecting_pairs`] for all of them.
+/// A distance of 0 means the meshes touch, intersect, or are closer than `f64`
+/// rounding resolves: a positive gap whose computed distance rounds to 0 is
+/// reported as 0. The search stops at the first pair of triangles with
+/// distance 0 that it finds. That pair intersects (decided exactly) or has a
+/// computed distance of 0; it is not necessarily the smallest such pair, and
+/// its two points coincide up to rounding. Use [`intersecting_pairs`] for
+/// every intersecting pair.
 ///
 /// Both points are in A's space; see [`MeshDistance`]. Passing the same mesh
 /// twice means two coincident copies, as for [`intersects`].
@@ -290,6 +295,12 @@ fn tri_b(mesh: &Mesh, xf: &Rigid, t: TriangleId) -> [P3; 3] {
     points(mesh, t).map(|p| xf.apply(p))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many leaf pairs [`for_each_pair`] has tested on this thread.
+    static LEAF_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Calls `pair` for every triangle pair of every leaf pair that the traversal
 /// reaches with `key`, B's triangle already in A's space, until `pair` returns
 /// `false`. `prune(k)` drops a popped pair with key `k`.
@@ -311,6 +322,8 @@ fn for_each_pair<const N: usize>(
         let (Some(ta), Some(tb)) = (leaf(va), leaf(vb)) else {
             return Step::Descend;
         };
+        #[cfg(test)]
+        LEAF_VISITS.with(|c| c.set(c.get() + 1));
         for &b in tb {
             let pb = tri_b(mesh_b, xf, b);
             for &a in ta {
@@ -968,6 +981,63 @@ mod tests {
                 "gap {gap}, oracle {d}"
             );
         }
+    }
+
+    /// Pairs whose box gap is above the bound by less than the slack are still
+    /// tested, through each query's `key` and `mesh_distance`'s `visit` check.
+    /// A's far triangle sets the magnitude to 1e6 (slack about 9.3e-4); B's two
+    /// triangles face A's vertex at the origin from 0.5 and 0.5001, in
+    /// separate leaves.
+    #[test]
+    fn pruning_uses_the_slack() {
+        use fast_mesh_bvh::BuildOptions;
+        let opts = BuildOptions {
+            max_leaf_size: 1,
+            ..Default::default()
+        };
+        let a = [
+            [0.0, 0.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [-1.0, 0.0, 1.0],
+            [-1e6, 0.0, 0.0],
+            [-1e6, 1.0, 0.0],
+            [-1e6, 0.0, 1.0],
+        ];
+        let face = |x: f32| [[x, -1.0, -1.0], [x, 1.0, -1.0], [x, 0.0, 1.0]];
+        let b = [face(0.5), face(0.5001)].concat();
+        let ma = Mesh::from_buffers(a.as_flattened(), &[0, 1, 2, 3, 4, 5]).unwrap();
+        let mb = Mesh::from_buffers(b.as_flattened(), &[0, 1, 2, 3, 4, 5]).unwrap();
+        let (ba, bb) = (
+            Bvh::build(&ma, &opts).unwrap(),
+            Bvh::build(&mb, &opts).unwrap(),
+        );
+        let xf = Rigid::IDENTITY;
+        let m = magnitude(&ba, &bb, &xf);
+        assert!(PRUNE_SLACK * m > 5e-4);
+        let visits = |f: &mut dyn FnMut()| {
+            LEAF_VISITS.with(|c| c.set(0));
+            f();
+            LEAF_VISITS.with(|c| c.get())
+        };
+
+        // `mesh_distance`'s `visit` check: the second face is popped after
+        // the bound fell to 0.5, with its key 0.5001 inside the slack.
+        let n = visits(&mut || {
+            let d = mesh_distance(&ma, &ba, &mb, &bb, &xf, f32::INFINITY).unwrap();
+            assert_eq!(d.unwrap().distance, 0.5);
+        });
+        assert_eq!(n, 2);
+
+        // Both `key`s: a bound just under 0.5 culls nothing near the origin.
+        let n = visits(&mut || {
+            let d = mesh_distance(&ma, &ba, &mb, &bb, &xf, 0.4999).unwrap();
+            assert_eq!(d, None);
+        });
+        assert_eq!(n, 2);
+        let n = visits(&mut || {
+            assert_eq!(near(&ma, &ba, &mb, &bb, &xf, 0.4999), (vec![], vec![]));
+        });
+        assert_eq!(n, 2);
     }
 
     #[test]
