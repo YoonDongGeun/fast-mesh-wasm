@@ -153,11 +153,9 @@ pub fn closest_point_many(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ray::points;
     use crate::test_util::{Lcg, build, wavy};
-    use crate::{Cull, Ray, RayOptions, raycast, tri::closest_on_triangle};
+    use crate::{Cull, Ray, RayOptions, raycast};
     use fast_mesh_bvh::{Bvh, Quality};
-    use fast_mesh_store::{Mesh, TriangleId};
 
     const OPEN: ClosestOptions = ClosestOptions {
         max_distance: f32::INFINITY,
