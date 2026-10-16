@@ -977,7 +977,12 @@ mod tests {
             let capacity = map.capacity();
             bvh.treelet_of_root = map;
             bvh.split_treelet(0, &mut counts);
-            assert_eq!(bvh.treelet_of_root.capacity(), capacity, "spare {spare}");
+            // Removing the old root may free its slot, raising `capacity()` by
+            // one without reallocating; a reallocation would at least double it.
+            assert!(
+                bvh.treelet_of_root.capacity() <= capacity + 1,
+                "spare {spare}: the map was reallocated"
+            );
             let expected = if spare == found { found } else { 1 };
             assert_eq!(bvh.treelet_count(), expected, "spare {spare}");
             bvh.treelet_of_root.retain(|_, &mut i| i != usize::MAX);
