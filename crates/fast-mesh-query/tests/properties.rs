@@ -450,28 +450,41 @@ fn apply_step(m: &mut Mesh, bvh: &mut Bvh, h: &mut History, step: &Step) {
 /// quaternion (or one of a few exact rotations) and a translation with jitter,
 /// so that the meshes touch, overlap or sit slightly apart.
 ///
+/// The vertices that some alive triangle uses, ascending.
+fn used_vertices(m: &Mesh) -> Vec<u32> {
+    let mut vs: Vec<u32> = alive(m, false)
+        .into_iter()
+        .flat_map(|t| m.triangle(t).unwrap())
+        .collect();
+    vs.sort_unstable();
+    vs.dedup();
+    vs
+}
+
 /// In one case of four the transform is an exact contact instead: the identity
-/// or a flip about x (entries 0 and ±1), with a translation that puts an alive
-/// vertex of B exactly on an alive vertex of A. Both are exact in `f64`, so the
-/// meshes touch exactly there, whatever the edits did.
-fn random_rigid(rng: &mut Lcg, ma: &Mesh, mb: &Mesh) -> Rigid {
+/// or a flip about x (entries 0 and ±1), with a translation that puts a vertex
+/// of an alive triangle of B exactly on a vertex of an alive triangle of A.
+/// Both are exact in `f64`, so the meshes touch exactly there, whatever the
+/// edits did. The second value says whether the transform is such a contact.
+fn random_rigid(rng: &mut Lcg, ma: &Mesh, mb: &Mesh) -> (Rigid, bool) {
     if rng.next() < 0.25 {
         let rotation = [
             Rigid::IDENTITY.rotation,
             [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]],
         ][(rng.next() * 2.0) as usize % 2];
-        let va = pick(&alive(ma, true), (rng.next() * 1e6) as u32);
-        let vb = pick(&alive(mb, true), (rng.next() * 1e6) as u32);
+        let va = pick(&used_vertices(ma), (rng.next() * 1e6) as u32);
+        let vb = pick(&used_vertices(mb), (rng.next() * 1e6) as u32);
         if let (Some(va), Some(vb)) = (va, vb) {
             let pa = ma.position(va).unwrap().map(f64::from);
             let pb = mb.position(vb).unwrap().map(f64::from);
             let translation = std::array::from_fn(|i| {
                 pa[i] - (0..3).map(|k| rotation[i][k] * pb[k]).sum::<f64>()
             });
-            return Rigid {
+            let xf = Rigid {
                 rotation,
                 translation,
             };
+            return (xf, true);
         }
     }
     let rotation = if rng.next() < 0.25 {
@@ -519,10 +532,25 @@ fn random_rigid(rng: &mut Lcg, ma: &Mesh, mb: &Mesh) -> Rigid {
         let rotated: f64 = (0..3).map(|k| rotation[i][k] * cb[k]).sum();
         ca[i] - rotated + jitter[i]
     });
-    Rigid {
+    let xf = Rigid {
         rotation,
         translation,
+    };
+    (xf, false)
+}
+
+/// Checks the pair queries under a [`random_rigid`] transform, and that an
+/// exact contact intersects.
+fn check_random_pose(
+    rng: &mut Lcg,
+    (ma, ba): (&Mesh, &Bvh),
+    (mb, bb): (&Mesh, &Bvh),
+) -> Result<(), TestCaseError> {
+    let (xf, contact) = random_rigid(rng, ma, mb);
+    if contact {
+        prop_assert_eq!(intersects(ma, ba, mb, bb, &xf), Ok(true), "{:?}", xf);
     }
+    check_pair_queries((ma, ba), (mb, bb), &xf)
 }
 
 /// One pair of alive triangles, one from each mesh, as the brute force sees it.
@@ -685,8 +713,7 @@ proptest! {
         let (mut ha, mut hb) = (History::new(usize::MAX), History::new(usize::MAX));
         let mut rng = Lcg(seed);
         for _ in 0..2 {
-            let xf = random_rigid(&mut rng, &ma, &mb);
-            check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
+            check_random_pose(&mut rng, (&ma, &ba), (&mb, &bb))?;
         }
         for i in 0..steps_a.len().max(steps_b.len()) {
             if let Some(s) = steps_a.get(i) {
@@ -696,8 +723,7 @@ proptest! {
                 apply_step(&mut mb, &mut bb, &mut hb, s);
             }
             for _ in 0..2 {
-                let xf = random_rigid(&mut rng, &ma, &mb);
-                check_pair_queries((&ma, &ba), (&mb, &bb), &xf)?;
+                check_random_pose(&mut rng, (&ma, &ba), (&mb, &bb))?;
             }
         }
     }
