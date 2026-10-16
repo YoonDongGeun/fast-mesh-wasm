@@ -16,14 +16,29 @@
 //!   that touch, or the vertices inside, a [`Region`] (a box or a sphere). The
 //!   box is an [`Aabb`], re-exported from `fast_mesh_bvh` so that callers need
 //!   not depend on that crate to build a [`Region::Box`].
+//! - Relative placement: a [`Rigid`] transform (rotation and translation, no
+//!   scale) maps one mesh's local coordinates into another's, for queries
+//!   between two meshes. Whether two triangles intersect or touch is decided
+//!   exactly, by exact orientation predicates on the transformed `f64`
+//!   coordinates.
+//! - Mesh-vs-mesh queries, with mesh B placed in mesh A's space by a
+//!   [`Rigid`]: [`intersects`], [`mesh_distance`] (a [`MeshDistance`] with
+//!   both points in A's space), [`triangles_near`] (the triangles of each
+//!   mesh within a margin of the other) and [`intersecting_pairs`]. Results
+//!   are in A's space; passing the same mesh twice means two coincident
+//!   copies.
 
 mod closest;
 mod error;
+mod pair;
+mod pairs;
 mod ray;
 mod region;
+mod rigid;
 #[cfg(test)]
 mod test_util;
 mod tri;
+mod tritri;
 
 use fast_mesh_bvh::Bvh;
 use fast_mesh_store::Mesh;
@@ -32,8 +47,10 @@ pub use closest::*;
 pub use error::{QueryError, Result};
 /// The axis-aligned box type of [`Region::Box`], re-exported from `fast_mesh_bvh`.
 pub use fast_mesh_bvh::Aabb;
+pub use pairs::*;
 pub use ray::*;
 pub use region::*;
+pub use rigid::Rigid;
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
@@ -111,6 +128,26 @@ impl<'a, T> Appender<'a, T> {
     /// How many elements were appended.
     pub(crate) fn count(&self) -> usize {
         self.out.len() - self.start
+    }
+
+    /// Sorts the appended elements and removes duplicates among them, in
+    /// place; elements from before stay as they are. Returns how many remain.
+    pub(crate) fn sort_dedup_appended(&mut self) -> usize
+    where
+        T: Ord + Copy,
+    {
+        let found = self.appended();
+        found.sort_unstable();
+        // Compact the sorted run in place, keeping the first of each value.
+        let mut kept = 0;
+        for i in 0..found.len() {
+            if kept == 0 || found[i] != found[kept - 1] {
+                found[kept] = found[i];
+                kept += 1;
+            }
+        }
+        self.truncate_appended(kept);
+        kept
     }
 }
 

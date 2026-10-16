@@ -153,49 +153,85 @@ pub enum Feature {
     Face,
 }
 
+/// The scalar type of [`closest_on_triangle`]: `f32` for the mesh queries and
+/// `f64` for triangle-triangle distance. Only what that function needs.
+pub(crate) trait Real:
+    Copy
+    + PartialOrd
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Div<Output = Self>
+{
+    const ZERO: Self;
+    const ONE: Self;
+    /// The sliver threshold; see [`closest_on_triangle`].
+    const SLIVER: Self;
+    fn is_nan(self) -> bool;
+    fn is_finite(self) -> bool;
+}
+
+macro_rules! impl_real {
+    ($t:ty) => {
+        impl Real for $t {
+            const ZERO: Self = 0.0;
+            const ONE: Self = 1.0;
+            const SLIVER: Self = 1e-5;
+            fn is_nan(self) -> bool {
+                <$t>::is_nan(self)
+            }
+            fn is_finite(self) -> bool {
+                <$t>::is_finite(self)
+            }
+        }
+    };
+}
+impl_real!(f32);
+impl_real!(f64);
+
 /// The point of a triangle closest to a query point.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TriClosest {
-    pub point: [f32; 3],
+pub(crate) struct TriClosest<T = f32> {
+    pub point: [T; 3],
     /// Squared distance from the query to `point`.
-    pub dist2: f32,
+    pub dist2: T,
     /// Weights of the triangle's three corners at `point`.
-    pub barycentric: [f32; 3],
+    pub barycentric: [T; 3],
     pub feature: Feature,
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn dot<T: Real>(a: [T; 3], b: [T; 3]) -> T {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn dist2<T: Real>(a: [T; 3], b: [T; 3]) -> T {
     let d = sub(a, b);
     dot(d, d)
 }
 
 /// The point `a + t * (b - a)`.
-fn lerp_point(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+fn lerp_point<T: Real>(a: [T; 3], b: [T; 3], t: T) -> [T; 3] {
     std::array::from_fn(|k| a[k] + t * (b[k] - a[k]))
 }
 
 /// Closest point of the segment `p[i]..p[j]` to `q`, as an edge or an end vertex.
-fn on_segment(q: [f32; 3], p: [[f32; 3]; 3], i: usize, j: usize, edge: u8) -> TriClosest {
+fn on_segment<T: Real>(q: [T; 3], p: [[T; 3]; 3], i: usize, j: usize, edge: u8) -> TriClosest<T> {
     let ab = sub(p[j], p[i]);
     let len2 = dot(ab, ab);
-    let t = if len2 > 0.0 {
+    let t = if len2 > T::ZERO {
         dot(sub(q, p[i]), ab) / len2
     } else {
-        0.0
+        T::ZERO
     };
-    let (t, feature) = if t.is_nan() || t <= 0.0 {
-        (0.0, Feature::Vertex(i as u8))
-    } else if t >= 1.0 {
-        (1.0, Feature::Vertex(j as u8))
+    let (t, feature) = if t.is_nan() || t <= T::ZERO {
+        (T::ZERO, Feature::Vertex(i as u8))
+    } else if t >= T::ONE {
+        (T::ONE, Feature::Vertex(j as u8))
     } else {
         (t, Feature::Edge(edge))
     };
-    let mut barycentric = [0.0; 3];
-    barycentric[i] = 1.0 - t;
+    let mut barycentric = [T::ZERO; 3];
+    barycentric[i] = T::ONE - t;
     barycentric[j] = t;
     let point = lerp_point(p[i], p[j], t);
     TriClosest {
@@ -206,21 +242,20 @@ fn on_segment(q: [f32; 3], p: [[f32; 3]; 3], i: usize, j: usize, edge: u8) -> Tr
     }
 }
 
-/// Slivers: `sum` below is `|ab x ac|^2`, so `sum <= SLIVER * |ab|^2 * |ac|^2`
-/// means `sin^2(angle at a) <= 1e-5`. There the `f32` region tests of Ericson's
-/// method are dominated by cancellation noise.
-const SLIVER: f32 = 1e-5;
-
 /// The point of the triangle `p` closest to `q` (Ericson, Real-Time Collision
 /// Detection, 5.1.5), with the feature it lies on.
 ///
 /// The result always lies on the triangle. A degenerate or sliver triangle
-/// (`sin^2` of its angle at corner 0 at most [`SLIVER`], or a non-finite area
-/// term) is also tried as its three edges, and the nearest candidate wins, ties
-/// going to the earlier of edge 0, 1, 2 and then to Ericson's result. For such
-/// slivers the feature may be an `Edge` or `Vertex` although the true nearest
-/// point is interior; the error is bounded by the sliver's width.
-pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
+/// (`sin^2` of its angle at corner 0 at most [`Real::SLIVER`], or a non-finite
+/// area term) is also tried as its three edges, and the nearest candidate wins,
+/// ties going to the earlier of edge 0, 1, 2 and then to Ericson's result. For
+/// such slivers the feature may be an `Edge` or `Vertex` although the true
+/// nearest point is interior; the error is bounded by the sliver's width.
+///
+/// Slivers: `sum` below is `|ab x ac|^2`, so `sum <= SLIVER * |ab|^2 * |ac|^2`
+/// means `sin^2(angle at a) <= 1e-5`. There the region tests of Ericson's
+/// method are dominated by cancellation noise.
+pub(crate) fn closest_on_triangle<T: Real>(q: [T; 3], p: [[T; 3]; 3]) -> TriClosest<T> {
     let [a, b, c] = p;
     let ab = sub(b, a);
     let ac = sub(c, a);
@@ -235,10 +270,10 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
     let va = d3 * d6 - d5 * d4;
     let sum = va + vb + vc;
 
-    let ericson = || -> TriClosest {
+    let ericson = || -> TriClosest<T> {
         let vertex = |k: u8| {
-            let mut barycentric = [0.0; 3];
-            barycentric[k as usize] = 1.0;
+            let mut barycentric = [T::ZERO; 3];
+            barycentric[k as usize] = T::ONE;
             let point = p[k as usize];
             TriClosest {
                 point,
@@ -247,9 +282,9 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
                 feature: Feature::Vertex(k),
             }
         };
-        let edge = |i: usize, j: usize, t: f32, k: u8| {
-            let mut barycentric = [0.0; 3];
-            barycentric[i] = 1.0 - t;
+        let edge = |i: usize, j: usize, t: T, k: u8| {
+            let mut barycentric = [T::ZERO; 3];
+            barycentric[i] = T::ONE - t;
             barycentric[j] = t;
             let point = lerp_point(p[i], p[j], t);
             TriClosest {
@@ -260,22 +295,23 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
             }
         };
 
-        if d1 <= 0.0 && d2 <= 0.0 {
+        let z = T::ZERO;
+        if d1 <= z && d2 <= z {
             return vertex(0);
         }
-        if d3 >= 0.0 && d4 <= d3 {
+        if d3 >= z && d4 <= d3 {
             return vertex(1);
         }
-        if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        if vc <= z && d1 >= z && d3 <= z {
             return edge(0, 1, d1 / (d1 - d3), 0);
         }
-        if d6 >= 0.0 && d5 <= d6 {
+        if d6 >= z && d5 <= d6 {
             return vertex(2);
         }
-        if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        if vb <= z && d2 >= z && d6 <= z {
             return edge(0, 2, d2 / (d2 - d6), 2);
         }
-        if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        if va <= z && d4 - d3 >= z && d5 - d6 >= z {
             return edge(1, 2, (d4 - d3) / ((d4 - d3) + (d5 - d6)), 1);
         }
         let v = vb / sum;
@@ -284,12 +320,12 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
         TriClosest {
             point,
             dist2: dist2(q, point),
-            barycentric: [1.0 - v - w, v, w],
+            barycentric: [T::ONE - v - w, v, w],
             feature: Feature::Face,
         }
     };
 
-    let band = !sum.is_finite() || sum <= SLIVER * dot(ab, ab) * dot(ac, ac);
+    let band = !sum.is_finite() || sum <= T::SLIVER * dot(ab, ab) * dot(ac, ac);
     if !band {
         return ericson();
     }
@@ -300,7 +336,7 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
             best = c;
         }
     }
-    if sum > 0.0 && sum.is_finite() {
+    if sum > T::ZERO && sum.is_finite() {
         let e = ericson();
         if e.dist2 < best.dist2 {
             best = e;
@@ -309,7 +345,7 @@ pub(crate) fn closest_on_triangle(q: [f32; 3], p: [[f32; 3]; 3]) -> TriClosest {
     best
 }
 
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn sub<T: Real>(a: [T; 3], b: [T; 3]) -> [T; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
@@ -564,14 +600,14 @@ mod tests {
 
     #[test]
     fn degenerate_triangle_uses_segments() {
-        let line = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]];
+        let line: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 2.0, 0.0]];
         let c = closest_on_triangle([1.0, 0.0, 0.0], line);
         assert!(close(c.point, [0.5, 0.5, 0.0]));
         assert_eq!(c.dist2, 0.5);
         assert!(matches!(c.feature, Feature::Edge(_)));
         assert!(c.barycentric.iter().all(|b| b.is_finite()));
 
-        let dot = [[1.0, 1.0, 1.0]; 3];
+        let dot: [[f32; 3]; 3] = [[1.0, 1.0, 1.0]; 3];
         let c = closest_on_triangle([0.0, 0.0, 0.0], dot);
         assert_eq!(c.feature, Feature::Vertex(0));
         assert_eq!(c.dist2, 3.0);
@@ -767,8 +803,64 @@ mod tests {
     }
 
     #[test]
+    fn f64_matches_f32_on_simple_cases() {
+        let t: [[f64; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let cases = [
+            (
+                [-1.0, -1.0, 0.0],
+                Feature::Vertex(0),
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ),
+            (
+                [2.0, -1.0, 0.0],
+                Feature::Vertex(1),
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ),
+            (
+                [-1.0, 2.0, 0.0],
+                Feature::Vertex(2),
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ),
+            (
+                [0.5, -1.0, 0.0],
+                Feature::Edge(0),
+                [0.5, 0.0, 0.0],
+                [0.5, 0.5, 0.0],
+            ),
+            (
+                [1.0, 1.0, 0.0],
+                Feature::Edge(1),
+                [0.5, 0.5, 0.0],
+                [0.0, 0.5, 0.5],
+            ),
+            (
+                [-1.0, 0.5, 0.0],
+                Feature::Edge(2),
+                [0.0, 0.5, 0.0],
+                [0.5, 0.0, 0.5],
+            ),
+            (
+                [0.25, 0.25, 3.0],
+                Feature::Face,
+                [0.25, 0.25, 0.0],
+                [0.5, 0.25, 0.25],
+            ),
+        ];
+        for (q, feature, point, bary) in cases {
+            let c = closest_on_triangle(q, t);
+            assert_eq!(c.feature, feature, "{q:?}");
+            assert_eq!(c.point, point, "{q:?}");
+            assert_eq!(c.barycentric, bary, "{q:?}");
+        }
+        assert_eq!(closest_on_triangle([0.25, 0.25, 3.0], t).dist2, 9.0);
+    }
+
+    #[test]
     fn ordinary_triangle_keeps_interior_result() {
-        let p = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.0, 3.0, 1.0]];
+        let p: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.0, 3.0, 1.0]];
         let q = [1.5, 1.0, 5.0];
         let c = closest_on_triangle(q, p);
         assert_eq!(c.feature, Feature::Face);

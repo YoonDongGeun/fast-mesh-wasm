@@ -64,7 +64,7 @@ impl Bvh {
 ```
 
 - The 32-byte `Node` layout stays private. Only `NodeView` is public, so the layout can change without breaking callers.
-- Both traversals walk parent links, like the existing private `Arena::traverse`. They use no stack, never allocate and cannot fail, however deep the tree is.
+- Both traversals walk parent links, like the existing private `Arena::traverse`. They use no stack, never allocate and cannot fail, however deep the tree is. *(Superseded in Phase 3b: issue #17 replaced "no stack" with "never allocates on the heap and never fails". The traversals now keep a fixed-size array on the call stack and fall back to the stackless walk only when it is full. See `2026-10-16-fast-mesh-query-pairs-design.md` §3.)*
 - `traverse_ordered` recomputes `first_is_left` for a node when it returns from a child, to know whether the other child is still to be visited. `first_is_left` must therefore be a pure function of the two boxes.
 - The second child is offered to `visit` like the first. A query whose best result improved inside the first child prunes the second there, with no extra mechanism.
 - `query_aabb` is re-implemented on `traverse`. Its signature stays. It documents that the BVH must be current for the mesh, and it checks this with `debug_assert!`. The checked, exact box query is `fast_mesh_query::triangles_in`.

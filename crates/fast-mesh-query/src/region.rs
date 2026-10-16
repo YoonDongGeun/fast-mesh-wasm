@@ -167,18 +167,7 @@ pub fn vertices_in(
         }
         Ok(())
     })?;
-    let found = ap.appended();
-    found.sort_unstable();
-    // Compact the sorted run in place, keeping the first of each value.
-    let mut kept = 0;
-    for i in 0..found.len() {
-        if kept == 0 || found[i] != found[kept - 1] {
-            found[kept] = found[i];
-            kept += 1;
-        }
-    }
-    ap.truncate_appended(kept);
-    Ok(kept)
+    Ok(ap.sort_dedup_appended())
 }
 
 #[cfg(test)]
