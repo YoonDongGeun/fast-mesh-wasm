@@ -143,7 +143,7 @@ pub(crate) struct TriTriDist {
 /// The distance between the closed triangles `a` and `b`.
 ///
 /// When [`tri_tri_intersect`] says they meet, `dist2` is exactly `0` and
-/// `pa == pb` is a point common to both (up to rounding): the midpoint of the
+/// `pa == pb` is a common point, up to rounding: the midpoint of the
 /// closest pair found among the candidates below, which also include the points
 /// where an edge of one crosses the plane of the other.
 ///
@@ -895,7 +895,7 @@ mod tests {
     fn distance_matches_dense_sampling() {
         for (a, b) in separated_pairs(500, 0xd157) {
             let got = tri_tri_distance(a, b).dist2.sqrt();
-            let (ga, gb) = (grid(a, 39), grid(b, 39));
+            let (ga, gb) = (grid(a, 19), grid(b, 19));
             let mut dense = f64::INFINITY;
             for &p in &ga {
                 for &q in &gb {
@@ -906,7 +906,61 @@ mod tests {
             let truth = oracle_dist2(a, b).sqrt();
             assert!(got <= dense.sqrt() + 1e-9, "{a:?} {b:?}: {got} > {dense}");
             assert!(got >= truth - 1e-9, "{a:?} {b:?}: {got} < {truth}");
+            // Two-sided: every candidate is a real pair, so only this bound
+            // catches a non-minimal answer.
+            assert!(got <= truth + 1e-9, "{a:?} {b:?}: {got} > {truth}");
         }
+    }
+
+    #[test]
+    fn piercing_pairs_have_zero_distance() {
+        let mut rng = Lcg(0x91e2c);
+        let mut r = || f64::from(rng.next());
+        for _ in 0..300 {
+            let a: [P3; 3] = std::array::from_fn(|_| std::array::from_fn(|_| r()));
+            let (e1, e2) = (vsub(a[1], a[0]), vsub(a[2], a[0]));
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            // A point well inside A, and B with an edge through it.
+            let (u, v) = (0.1 + 0.3 * r(), 0.1 + 0.3 * r());
+            let x = at(at(a[0], e1, u), e2, v);
+            let (s1, s2) = (0.2 + r(), 0.2 + r());
+            let b = [at(x, n, -s1), at(x, n, s2), std::array::from_fn(|_| r())];
+            let d = tri_tri_distance(a, b);
+            assert_eq!(d.dist2, 0.0, "{a:?} {b:?}");
+            assert_eq!(d.pa, d.pb);
+            assert!(on_triangle(d.pa, a, 1e-9), "{a:?} {b:?}: {:?}", d.pa);
+            assert!(on_triangle(d.pa, b, 1e-9), "{a:?} {b:?}: {:?}", d.pa);
+        }
+    }
+
+    #[test]
+    fn seg_seg_closest_cases() {
+        let z = [0.0; 3];
+        let x = |v: f64, y: f64| [v, y, 0.0];
+        // Parallel and overlapping (any closest pair; this one is fixed).
+        let (pa, pb) = seg_seg_closest(z, x(2.0, 0.0), x(1.0, 1.0), x(3.0, 1.0));
+        assert_eq!((pa, pb), (x(1.0, 0.0), x(1.0, 1.0)));
+        // Parallel and disjoint: end to end.
+        let (pa, pb) = seg_seg_closest(z, x(1.0, 0.0), x(3.0, 1.0), x(4.0, 1.0));
+        assert_eq!((pa, pb), (x(1.0, 0.0), x(3.0, 1.0)));
+        // Antiparallel and disjoint.
+        let (pa, pb) = seg_seg_closest(z, x(1.0, 0.0), x(4.0, 1.0), x(3.0, 1.0));
+        assert_eq!((pa, pb), (x(1.0, 0.0), x(3.0, 1.0)));
+        // A point against a segment, in both roles.
+        let (pa, pb) = seg_seg_closest(x(1.0, 1.0), x(1.0, 1.0), z, x(2.0, 0.0));
+        assert_eq!((pa, pb), (x(1.0, 1.0), x(1.0, 0.0)));
+        let (pa, pb) = seg_seg_closest(z, x(2.0, 0.0), x(1.0, 1.0), x(1.0, 1.0));
+        assert_eq!((pa, pb), (x(1.0, 0.0), x(1.0, 1.0)));
+        // Two points.
+        let (p, q) = ([1.0, 2.0, 3.0], [4.0, 6.0, 3.0]);
+        assert_eq!(seg_seg_closest(p, p, q, q), (p, q));
+        // Skew segments crossing in projection.
+        let (pa, pb) = seg_seg_closest(z, x(2.0, 0.0), [1.0, -1.0, 1.0], [1.0, 1.0, 1.0]);
+        assert_eq!((pa, pb), (x(1.0, 0.0), [1.0, 0.0, 1.0]));
     }
 
     #[test]
