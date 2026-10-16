@@ -753,7 +753,10 @@ mod tests {
                 no += 1;
             }
         }
-        assert!(yes > 500 && no > 500, "yes {yes}, no {no}, skipped {skipped}");
+        assert!(
+            yes > 500 && no > 500,
+            "yes {yes}, no {no}, skipped {skipped}"
+        );
         assert!(skipped < 100, "skipped {skipped}");
     }
 
