@@ -16,14 +16,21 @@
 //!   that touch, or the vertices inside, a [`Region`] (a box or a sphere). The
 //!   box is an [`Aabb`], re-exported from `fast_mesh_bvh` so that callers need
 //!   not depend on that crate to build a [`Region::Box`].
+//! - Relative placement: a [`Rigid`] transform (rotation and translation, no
+//!   scale) maps one mesh's local coordinates into another's, for queries
+//!   between two meshes. Whether two triangles intersect or touch is decided
+//!   exactly, by exact orientation predicates on the transformed `f64`
+//!   coordinates.
 
 mod closest;
 mod error;
 mod ray;
 mod region;
+mod rigid;
 #[cfg(test)]
 mod test_util;
 mod tri;
+mod tritri;
 
 use fast_mesh_bvh::Bvh;
 use fast_mesh_store::Mesh;
@@ -34,6 +41,7 @@ pub use error::{QueryError, Result};
 pub use fast_mesh_bvh::Aabb;
 pub use ray::*;
 pub use region::*;
+pub use rigid::Rigid;
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
