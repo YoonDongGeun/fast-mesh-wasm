@@ -784,7 +784,10 @@ mod tests {
             let a: [P3; 3] = std::array::from_fn(|_| pick());
             let b: [P3; 3] = std::array::from_fn(|_| pick());
             let want = tri_tri_intersect(a, b);
-            for scale in [2f64.powi(-1074), 2f64.powi(-600), 2f64.powi(1000)] {
+            // Built from bits: `powi(-1074)` may compute 1 / 2^1074 = 1 / inf = 0
+            // on some targets.
+            let pow2 = |e: i64| f64::from_bits(((1023 + e) as u64) << 52);
+            for scale in [f64::from_bits(1), pow2(-600), pow2(1000)] {
                 let s = |t: [P3; 3]| t.map(|p| p.map(|v| v * scale));
                 assert_eq!(both(s(a), s(b)), want, "{a:?} {b:?} x {scale:e}");
             }
