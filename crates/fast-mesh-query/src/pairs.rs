@@ -293,89 +293,262 @@ const PLANE_GUARD: f64 = 1e-4;
 
 /// A lower bound on the distance between triangles `a` and `b` (both in A's
 /// space), up to `f64` rounding of a few ulps of the coordinates: the larger
-/// of the gap between their boxes and the gap along each one's normal
-/// ([`plane_gap`]). 0 when nothing separates them.
+/// of the gap between their boxes ([`Tri::box_gap`]) and the gap along each
+/// one's normal ([`Tri::plane_gap`]). 0 when nothing separates them.
 ///
 /// Queries skip a pair whose bound is [`beyond`] their current bound, the rule
 /// they prune boxes by, so a skipped pair could not have been accepted: the
 /// slack covers this bound's rounding and the triangle distance's alike.
 /// Intersecting triangles get 0 up to rounding (both gaps are 0 in exact
-/// arithmetic), well under the slack.
+/// arithmetic), well under the slack. The queries test it with
+/// [`skip_pair`].
+#[cfg(test)]
 fn pair_lower_bound(a: &[P3; 3], b: &[P3; 3]) -> f64 {
-    tri_box_gap(a, b).max(plane_gap(a, b)).max(plane_gap(b, a))
-}
-
-/// The distance between the boxes of triangles `a` and `b`, as [`box_distance`]
-/// does it but on the `f64` corners.
-fn tri_box_gap(a: &[P3; 3], b: &[P3; 3]) -> f64 {
-    let range = |t: &[P3; 3], k: usize| {
-        (
-            t[0][k].min(t[1][k]).min(t[2][k]),
-            t[0][k].max(t[1][k]).max(t[2][k]),
-        )
-    };
-    (0..3)
-        .map(|k| {
-            let ((alo, ahi), (blo, bhi)) = (range(a, k), range(b, k));
-            let gap = (alo - bhi).max(blo - ahi).max(0.0);
-            gap * gap
-        })
-        .sum::<f64>()
-        .sqrt()
-}
-
-/// The gap between triangles `t` and `o` along `t`'s computed normal `n`: how
-/// far `o`'s corners all lie beyond the slab that `t`'s corners span along
-/// `n`, over `|n|`. 0 when they overlap along `n`, or when `t` fails
-/// [`PLANE_GUARD`].
-///
-/// For any direction `n` (exactly as computed, rounding and all), every point of
-/// `t` projects into `t`'s slab and every point of `o` into `o`'s, so the gap
-/// between the slabs is at most the distance between the triangles. With an
-/// exact normal `t`'s slab is just its plane (heights 0) and this is the
-/// distance from the plane to `o`'s nearest corner, when all of `o` lies
-/// strictly on one side. The heights carry `f64` rounding of a few ulps of `|n|`
-/// times the coordinates, so the result is off by a few ulps of the
-/// coordinates.
-fn plane_gap(t: &[P3; 3], o: &[P3; 3]) -> f64 {
-    let sub = |p: P3, q: P3| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-    let dot = |p: P3, q: P3| p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
-    let (u, v) = (sub(t[1], t[0]), sub(t[2], t[0]));
-    let n = [
-        u[1] * v[2] - u[2] * v[1],
-        u[2] * v[0] - u[0] * v[2],
-        u[0] * v[1] - u[1] * v[0],
-    ];
-    let nn = dot(n, n);
-    // Written so that NaN fails too.
-    if !(nn > 0.0 && nn >= PLANE_GUARD * dot(u, u) * dot(v, v)) {
-        return 0.0;
-    }
-    // `t`'s heights: 0 at its first corner, `n·u` and `n·v` (about 0) at the others.
-    let (hu, hv) = (dot(n, u), dot(n, v));
-    let (t_lo, t_hi) = (hu.min(hv).min(0.0), hu.max(hv).max(0.0));
-    let h = o.map(|p| dot(n, sub(p, t[0])));
-    let o_lo = h[0].min(h[1]).min(h[2]);
-    let o_hi = h[0].max(h[1]).max(h[2]);
-    let gap = (o_lo - t_hi).max(t_lo - o_hi);
-    if gap > 0.0 { gap / nn.sqrt() } else { 0.0 }
+    let (a, b) = (Tri::new(*a), Tri::new(*b));
+    a.box_gap(&b.lo, &b.hi)
+        .max(a.plane_gap(&b.p))
+        .max(b.plane_gap(&a.p))
 }
 
 /// Whether a pair of triangles can be skipped under `bound`, for meshes of
-/// magnitude `m`: its [`pair_lower_bound`] is [`beyond`] `bound`.
-fn skip_pair(a: &[P3; 3], b: &[P3; 3], bound: f64, m: f64) -> bool {
-    let skip = beyond(pair_lower_bound(a, b), bound, m);
-    #[cfg(test)]
-    if skip {
-        PAIR_SKIPS.with(|c| c.set(c.get() + 1));
+/// magnitude `m`: whether their `pair_lower_bound` (defined for the tests: the
+/// larger of [`Tri::box_gap`] and each one's [`Tri::plane_gap`]) is
+/// [`beyond`] `bound`.
+///
+/// The three gaps are tested one at a time, cheapest first, and the rest are
+/// not computed once one is beyond. That decides exactly as testing their
+/// maximum would: the maximum exceeds `bound` plus the slack exactly when one
+/// of them does (`f64::max` ignores a NaN, as `beyond` rejects one).
+fn skip_pair(a: &Tri, b: &Tri, bound: f64, m: f64) -> bool {
+    beyond(a.box_gap(&b.lo, &b.hi), bound, m)
+        || beyond(a.plane_gap(&b.p), bound, m)
+        || beyond(b.plane_gap(&a.p), bound, m)
+}
+
+/// A triangle in `f64` (in A's space) with everything [`skip_pair`] needs of
+/// it alone: its box and its slab along its computed normal. The queries compute it once per triangle and leaf pair,
+/// not once per triangle pair. The arithmetic is the same as computing it
+/// afresh for every pair, so the bounds are bit-identical either way.
+#[derive(Debug, Clone, Copy)]
+struct Tri {
+    /// The corners.
+    p: [P3; 3],
+    /// The low corner of the box: per axis the smallest of the corners.
+    lo: P3,
+    /// The high corner of the box: per axis the largest of the corners.
+    hi: P3,
+    /// The slab along the computed normal, or `None` when the triangle fails
+    /// [`PLANE_GUARD`].
+    slab: Option<Slab>,
+}
+
+/// A triangle's computed normal `n = u × v` (for its edge vectors `u`, `v`
+/// from its first corner), `|n|`, and the heights `lo..=hi` that its corners
+/// span along `n`, measured from its first corner: 0, `n·u` and `n·v`, all
+/// about 0.
+#[derive(Debug, Clone, Copy)]
+struct Slab {
+    /// The computed normal.
+    n: P3,
+    /// `|n|`.
+    len: f64,
+    /// The lowest height of the corners along `n`.
+    lo: f64,
+    /// The highest height of the corners along `n`.
+    hi: f64,
+}
+
+/// `p - q`.
+fn sub(p: P3, q: P3) -> P3 {
+    [p[0] - q[0], p[1] - q[1], p[2] - q[2]]
+}
+
+/// `p · q`.
+fn dot(p: P3, q: P3) -> f64 {
+    p[0] * q[0] + p[1] * q[1] + p[2] * q[2]
+}
+
+impl Tri {
+    /// A placeholder for unused slots of a [`Chunk`].
+    const UNUSED: Tri = Tri {
+        p: [[0.0; 3]; 3],
+        lo: [0.0; 3],
+        hi: [0.0; 3],
+        slab: None,
+    };
+
+    /// The triangle with corners `p`.
+    fn new(p: [P3; 3]) -> Tri {
+        let lo = std::array::from_fn(|k| p[0][k].min(p[1][k]).min(p[2][k]));
+        let hi = std::array::from_fn(|k| p[0][k].max(p[1][k]).max(p[2][k]));
+        let (u, v) = (sub(p[1], p[0]), sub(p[2], p[0]));
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let nn = dot(n, n);
+        // Written so that NaN fails too.
+        let slab = (nn > 0.0 && nn >= PLANE_GUARD * dot(u, u) * dot(v, v)).then(|| {
+            let (hu, hv) = (dot(n, u), dot(n, v));
+            Slab {
+                n,
+                len: nn.sqrt(),
+                lo: hu.min(hv).min(0.0),
+                hi: hu.max(hv).max(0.0),
+            }
+        });
+        Tri { p, lo, hi, slab }
     }
-    skip
+
+    /// The distance between this triangle's box and the box `lo..=hi`, as
+    /// [`box_distance`] does it but on `f64` corners.
+    ///
+    /// Every step is monotone under rounding (subtraction, `max`, squaring a
+    /// non-negative value, the sum, `sqrt`), so a box `lo..=hi` that holds
+    /// another one never gets a larger result than it: a gap to a union of
+    /// boxes is at most the gap to each of them, in `f64` as in exact
+    /// arithmetic.
+    fn box_gap(&self, lo: &P3, hi: &P3) -> f64 {
+        (0..3)
+            .map(|k| {
+                let gap = (self.lo[k] - hi[k]).max(lo[k] - self.hi[k]).max(0.0);
+                gap * gap
+            })
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// The gap between this triangle `t` and the triangle with corners `o`
+    /// along `t`'s computed normal `n`: how far `o`'s corners all lie beyond
+    /// the slab that `t`'s corners span along `n`, over `|n|`. 0 when they
+    /// overlap along `n`, or when `t` fails [`PLANE_GUARD`].
+    ///
+    /// For any direction `n` (exactly as computed, rounding and all), every
+    /// point of `t` projects into `t`'s slab and every point of `o` into `o`'s,
+    /// so the gap between the slabs is at most the distance between the
+    /// triangles. With an exact normal `t`'s slab is just its plane (heights 0)
+    /// and this is the distance from the plane to `o`'s nearest corner, when
+    /// all of `o` lies strictly on one side. The heights carry `f64` rounding of
+    /// a few ulps of `|n|` times the coordinates, so the result is off by a few
+    /// ulps of the coordinates.
+    fn plane_gap(&self, o: &[P3; 3]) -> f64 {
+        let Some(s) = &self.slab else {
+            return 0.0;
+        };
+        let h = o.map(|p| dot(s.n, sub(p, self.p[0])));
+        let o_lo = h[0].min(h[1]).min(h[2]);
+        let o_hi = h[0].max(h[1]).max(h[2]);
+        let gap = (o_lo - s.hi).max(s.lo - o_hi);
+        if gap > 0.0 { gap / s.len } else { 0.0 }
+    }
+}
+
+/// The most triangles of one leaf that a [`Chunk`] holds. BVH leaves hold at
+/// most 16 triangles; a larger leaf would be taken in chunks of this size.
+const CHUNK: usize = 16;
+
+/// Up to [`CHUNK`] consecutive triangles of one leaf as [`Tri`]s, with the
+/// union of their boxes.
+///
+/// The traversal often visits several leaf pairs in a row that share a leaf
+/// (it splits one side down to its leaves against a fixed leaf of the other),
+/// so a chunk is only refilled when the triangles change.
+struct Chunk {
+    /// The address and length of the triangle ids it was filled from, which
+    /// identify them within one query (the BVHs are borrowed, so they cannot
+    /// move). `None` before the first fill.
+    from: Option<(*const TriangleId, usize)>,
+    /// The triangles, in the order of the ids; slots past `len` are unused.
+    tris: [Tri; CHUNK],
+    /// How many slots are in use.
+    len: usize,
+    /// The low corner of the union of the triangles' boxes.
+    lo: P3,
+    /// The high corner of the union of the triangles' boxes.
+    hi: P3,
+}
+
+impl Chunk {
+    /// An empty chunk.
+    fn new() -> Chunk {
+        Chunk {
+            from: None,
+            tris: [Tri::UNUSED; CHUNK],
+            len: 0,
+            lo: [f64::INFINITY; 3],
+            hi: [f64::NEG_INFINITY; 3],
+        }
+    }
+
+    /// Fills the chunk with the triangles `ids` (at most [`CHUNK`]), each
+    /// placed in A's space by `place`, unless it already holds them.
+    fn fill(&mut self, ids: &[TriangleId], place: impl Fn(TriangleId) -> [P3; 3]) {
+        let from = Some((ids.as_ptr(), ids.len()));
+        if self.from == from {
+            return;
+        }
+        self.from = from;
+        self.len = ids.len();
+        self.lo = [f64::INFINITY; 3];
+        self.hi = [f64::NEG_INFINITY; 3];
+        for (slot, &t) in self.tris.iter_mut().zip(ids) {
+            *slot = Tri::new(place(t));
+            for k in 0..3 {
+                self.lo[k] = self.lo[k].min(slot.lo[k]);
+                self.hi[k] = self.hi[k].max(slot.hi[k]);
+            }
+        }
+    }
+
+    /// The triangles in use.
+    fn tris(&self) -> &[Tri] {
+        &self.tris[..self.len]
+    }
 }
 
 /// The pair key for the intersection queries: 0 when the boxes overlap (closed),
 /// otherwise cull.
 fn overlap_key(p: &Aabb, q: &Aabb) -> Option<f64> {
     p.overlaps(q).then_some(0.0)
+}
+
+/// The weight of the distance between box centres in [`distance_key`]'s
+/// order.
+const TIE_WEIGHT: f64 = 1e-12;
+
+/// `mesh_distance`'s pair key for A's box `p` and B's moved box `q`:
+/// `(order, gap)`, or `None` to cull the pair when `gap` is [`beyond`]
+/// `bound` (for meshes of magnitude `m`).
+///
+/// `gap` is [`box_distance`], the only value pruning reads, here and through
+/// the key in [`for_each_near_pair`]. `order` is
+/// `gap + TIE_WEIGHT * |centre(p) - centre(q)|`, and the traversal compares
+/// keys as tuples, so it orders by `order` alone unless two are equal. Since
+/// no pruning test reads `order`, the extra term cannot change what is
+/// pruned, and needs no slack of its own; it changes only the visiting order,
+/// which `mesh_distance`'s answer does not depend on (see
+/// `mesh_distance_with`).
+///
+/// The term breaks the ties among the many leaf box pairs of a near miss
+/// that touch (gap 0): the pair whose centres are closest overlaps the most
+/// and tends to hold the closest triangles, so the bound falls sooner. At
+/// `1e-12` per unit of centre distance it reorders only gaps that differ by
+/// less than about `1e-12` times the mesh size.
+fn distance_key(p: &Aabb, q: &Aabb, bound: f64, m: f64) -> Option<(f64, f64)> {
+    let gap = box_distance(p, q);
+    if beyond(gap, bound, m) {
+        return None;
+    }
+    let (cp, cq) = (p.center(), q.center());
+    let centres = (0..3)
+        .map(|k| {
+            let d = f64::from(cp[k]) - f64::from(cq[k]);
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt();
+    Some((gap + TIE_WEIGHT * centres, gap))
 }
 
 /// The triangles of a leaf, or `None` for an inner node.
@@ -399,16 +572,25 @@ fn tri_b(mesh: &Mesh, xf: &Rigid, t: TriangleId) -> [P3; 3] {
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only: how many leaf pairs [`for_each_pair`] has tested on this thread.
+    /// Test-only: how many leaf pairs [`for_each_pair`] and
+    /// [`for_each_near_pair`] have tested on this thread.
     static LEAF_VISITS: Cell<usize> = const { Cell::new(0) };
-    /// Test-only: how many triangle pairs [`skip_pair`] has skipped on this thread.
+    /// Test-only: how many triangle pairs [`for_each_near_pair`] has skipped
+    /// by a lower bound on this thread.
     static PAIR_SKIPS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Test-only: counts `n` triangle pairs skipped by a lower bound.
+fn count_skips(n: usize) {
+    #[cfg(test)]
+    PAIR_SKIPS.with(|c| c.set(c.get() + n));
+    #[cfg(not(test))]
+    let _ = n;
 }
 
 /// Calls `pair` for every triangle pair of every leaf pair that the traversal
 /// reaches with `key`, B's triangle already in A's space, until `pair` returns
-/// `false`. `prune(k)` drops a popped pair with key `k`.
-#[allow(clippy::too_many_arguments)] // The shared five and three callbacks.
+/// `false`. For the intersection queries, which have no distance to bound.
 fn for_each_pair<const N: usize>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
@@ -416,13 +598,9 @@ fn for_each_pair<const N: usize>(
     bvh_b: &Bvh,
     xf: &Rigid,
     key: impl FnMut(&Aabb, &Aabb) -> Option<f64>,
-    prune: impl Fn(f64) -> bool,
     mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
 ) {
-    traverse_pairs_with::<N, f64>(bvh_a, bvh_b, xf, key, |va, vb, k| {
-        if prune(k) {
-            return Step::Skip;
-        }
+    traverse_pairs_with::<N, f64>(bvh_a, bvh_b, xf, key, |va, vb, _| {
         let (Some(ta), Some(tb)) = (leaf(va), leaf(vb)) else {
             return Step::Descend;
         };
@@ -438,6 +616,96 @@ fn for_each_pair<const N: usize>(
         }
         Step::Skip
     });
+}
+
+/// The distance queries' traversal: calls `pair(a, pa, b, pb)` for every
+/// triangle pair of every leaf pair that the traversal reaches with `key`
+/// that [`skip_pair`] does not skip under `bound()` (for meshes of magnitude
+/// `m`), B's triangle already in A's space, until `pair` returns `false`.
+/// `bound()` is read afresh at every test, so it may shrink as `pair` runs.
+///
+/// A popped node pair is dropped when `gap(k)`, the box gap ([`box_distance`])
+/// carried in its key `k`, is [`beyond`] `bound()`.
+///
+/// Leaf pairs are taken a [`Chunk`] of each side at a time. Before any
+/// triangle pair is tested, each triangle's box is tested against the union
+/// box of the other side's chunk, and a triangle beyond it is skipped against
+/// that whole chunk. That gap is at most the box gap to each triangle of the
+/// chunk ([`Tri::box_gap`]: exactly, not just up to rounding), which is the
+/// first gap [`skip_pair`] tests, and `beyond` only grows with the gap. So
+/// every pair this skips, `skip_pair` would have skipped too, under the same
+/// `bound()`: the prefilter changes how much work is done, never which pairs
+/// reach `pair`.
+#[allow(clippy::too_many_arguments)] // The shared five, three callbacks and `m`.
+fn for_each_near_pair<const N: usize, K: Copy + PartialOrd>(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+    key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    gap: impl Fn(K) -> f64,
+    bound: impl Fn() -> f64,
+    m: f64,
+    mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
+) {
+    let (mut ca, mut cb) = (Chunk::new(), Chunk::new());
+    traverse_pairs_with::<N, K>(bvh_a, bvh_b, xf, key, |va, vb, k| {
+        if beyond(gap(k), bound(), m) {
+            return Step::Skip;
+        }
+        let (Some(ta), Some(tb)) = (leaf(va), leaf(vb)) else {
+            return Step::Descend;
+        };
+        #[cfg(test)]
+        LEAF_VISITS.with(|c| c.set(c.get() + 1));
+        for ids_a in ta.chunks(CHUNK) {
+            ca.fill(ids_a, |a| tri_a(mesh_a, a));
+            for ids_b in tb.chunks(CHUNK) {
+                cb.fill(ids_b, |b| tri_b(mesh_b, xf, b));
+                if !chunk_pairs(ids_a, &ca, ids_b, &cb, &bound, m, &mut pair) {
+                    return Step::Stop;
+                }
+            }
+        }
+        Step::Skip
+    });
+}
+
+/// The triangle pairs of two filled chunks for [`for_each_near_pair`], B's
+/// triangles in the outer loop. Returns `false` when `pair` did.
+fn chunk_pairs(
+    ids_a: &[TriangleId],
+    ca: &Chunk,
+    ids_b: &[TriangleId],
+    cb: &Chunk,
+    bound: &impl Fn() -> f64,
+    m: f64,
+    pair: &mut impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
+) -> bool {
+    // Each A triangle's box gap to B's union box, once per chunk pair; the
+    // bound is checked against it afresh for each B triangle.
+    let mut gap_a = [0.0; CHUNK];
+    for (g, t) in gap_a.iter_mut().zip(ca.tris()) {
+        *g = t.box_gap(&cb.lo, &cb.hi);
+    }
+    for (&b, tb) in ids_b.iter().zip(cb.tris()) {
+        if beyond(tb.box_gap(&ca.lo, &ca.hi), bound(), m) {
+            count_skips(ids_a.len());
+            continue;
+        }
+        for ((&a, ta), &g) in ids_a.iter().zip(ca.tris()).zip(&gap_a) {
+            let bound = bound();
+            if beyond(g, bound, m) || skip_pair(ta, tb, bound, m) {
+                count_skips(1);
+                continue;
+            }
+            if !pair(a, ta.p, b, tb.p) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The first intersecting pair `(a, b)` that the traversal finds, if any.
@@ -456,7 +724,6 @@ fn first_intersection<const N: usize>(
         bvh_b,
         xf,
         overlap_key,
-        |_| false,
         |a, pa, b, pb| {
             if tri_tri_intersect(pa, pb) {
                 found = Some((a, b));
@@ -488,6 +755,13 @@ fn mesh_distance_with<const N: usize>(
     // Touching or intersecting meshes have distance 0, and the cheap exact
     // intersection test finds a pair far faster than the distance search, which
     // starts with no bound to prune by. Any intersecting pair will do.
+    //
+    // Measured against folding the test into the distance search (issue #22):
+    // `tri_tri_distance` already runs the exact test and the search stops at
+    // the first pair at distance 0, so the fold would only drop this pass. That
+    // saves the pass's cost on near misses, but took intersecting poses from
+    // 0.4 ms to 1.5 to 2.2 ms at 1M, since the search must first walk the
+    // pairs its order puts before an intersecting one.
     if let Some((a, b)) = first_intersection::<N>(mesh_a, bvh_a, mesh_b, bvh_b, xf) {
         let d = tri_tri_distance(tri_a(mesh_a, a), tri_b(mesh_b, xf, b));
         return Some(MeshDistance {
@@ -501,26 +775,32 @@ fn mesh_distance_with<const N: usize>(
     // The distance of the best pair so far, or `max_distance` before one is
     // found. Pairs whose boxes are farther (with slack) are pruned, in `key`
     // and again in `visit`, as the bound shrinks after a pair is pushed.
+    //
+    // The answer does not depend on the order in which pairs are visited
+    // (except which pair is reported for a distance of 0, which is
+    // unspecified): the bound is always the computed distance of some pair or
+    // `max_distance`, so it never falls below the minimum, and a pair is only
+    // ever skipped under the `beyond` slack rule, so no pair within the bound
+    // is lost. The minimum `dist2`, ties to the smallest `(a, b)`, is then
+    // found whatever the order. The order only decides how soon the bound
+    // falls, hence how much is pruned; that is what `distance_key` tunes.
     let bound = Cell::new(f64::from(max_distance));
     let m = magnitude(bvh_a, bvh_b, xf);
     let mut best: Option<(TriangleId, TriangleId, TriTriDist)> = None;
-    for_each_pair::<N>(
+    for_each_near_pair::<N, (f64, f64)>(
         mesh_a,
         bvh_a,
         mesh_b,
         bvh_b,
         xf,
-        |p, q| {
-            let d = box_distance(p, q);
-            (!beyond(d, bound.get(), m)).then_some(d)
-        },
-        |k| beyond(k, bound.get(), m),
+        |p, q| distance_key(p, q, bound.get(), m),
+        |(_, gap)| gap,
+        || bound.get(),
+        m,
+        // Near misses leave many leaf pairs at key 0 (boxes touch), so most
+        // of their triangle pairs are dropped by the lower bounds in
+        // `for_each_near_pair`, not by the boxes.
         |a, pa, b, pb| {
-            // Near misses leave many leaf pairs at key 0 (boxes touch), so
-            // most of their triangle pairs are dropped here, not by the boxes.
-            if skip_pair(&pa, &pb, bound.get(), m) {
-                return true;
-            }
             let d = tri_tri_distance(pa, pb);
             let dist = d.dist2.sqrt();
             if dist > bound.get() {
@@ -562,7 +842,7 @@ fn triangles_near_with<const N: usize>(
     let mut ap_a = Appender::new(out_a);
     let mut ap_b = Appender::new(out_b);
     let mut failed = None;
-    for_each_pair::<N>(
+    for_each_near_pair::<N, f64>(
         mesh_a,
         bvh_a,
         mesh_b,
@@ -572,12 +852,10 @@ fn triangles_near_with<const N: usize>(
             let d = box_distance(p, q);
             (!beyond(d, margin, m)).then_some(d)
         },
-        // `key` already culled every pair beyond the fixed margin.
-        |_| false,
+        |gap| gap,
+        || margin,
+        m,
         |a, pa, b, pb| {
-            if skip_pair(&pa, &pb, margin, m) {
-                return true;
-            }
             // Exactly `tri_tri_distance(pa, pb).dist2.sqrt() <= margin`
             // (0 for pairs that intersect), but stops at the first candidate
             // within the margin.
@@ -618,7 +896,6 @@ fn intersecting_pairs_with<const N: usize>(
         bvh_b,
         xf,
         overlap_key,
-        |_| false,
         |a, pa, b, pb| {
             if tri_tri_intersect(pa, pb)
                 && let Err(e) = ap.push((a, b))
@@ -1225,6 +1502,157 @@ mod tests {
         assert!(near_skips.iter().all(|&n| n > 0), "{near_skips:?}");
     }
 
+    /// A smooth bumpy `n` x `n` sheet, `z = 0.8 sin(0.7 x) cos(0.5 y)`, so that
+    /// a flipped copy over it meets it at a single place, as the bench terrain
+    /// does.
+    fn bumps(n: u32) -> Mesh {
+        let mut positions = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32, y as f32);
+                positions.extend([fx, fy, 0.8 * (0.7 * fx).sin() * (0.5 * fy).cos()]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+            }
+        }
+        Mesh::from_buffers(&positions, &indices).unwrap()
+    }
+
+    /// The brute-force answer of `mesh_distance` with an infinite bound, for
+    /// meshes that do not meet.
+    fn oracle(all: &[(TriangleId, TriangleId, bool, TriTriDist)]) -> MeshDistance {
+        assert!(!all.iter().any(|e| e.2));
+        let (a, b, d) = brute_min(all).unwrap();
+        MeshDistance {
+            distance: d.dist2.sqrt() as f32,
+            point_a: d.pa.map(|v| v as f32),
+            point_b: d.pb.map(|v| v as f32),
+            triangle_a: a,
+            triangle_b: b,
+        }
+    }
+
+    /// Near misses, the case the leaf-pair caches, the leaf prefilters and the
+    /// tie order speed up: B a tiny gap over A, level or tilted, on the wavy
+    /// meshes and on smooth bumpy sheets, with leaves of 1 to 16 triangles.
+    /// `mesh_distance` gives exactly the oracle's pair, points and distance,
+    /// through the stack and the overflow fallback, and `max_distance` just
+    /// above and below the distance keeps or drops it.
+    #[test]
+    fn near_misses_match_brute_force() {
+        use fast_mesh_bvh::BuildOptions;
+        let check = |ma: &Mesh, mb: &Mesh, xf: &Rigid| {
+            let all = brute(ma, mb, xf);
+            let want = oracle(&all);
+            let d = brute_min(&all).unwrap().2.dist2.sqrt();
+            assert!(d > 0.0 && d < 0.01, "{d}");
+            for (leaf, quality) in [1, 4, 16]
+                .into_iter()
+                .flat_map(|l| [(l, Quality::Sah), (l, Quality::Fast)])
+            {
+                let opts = BuildOptions {
+                    quality,
+                    max_leaf_size: leaf,
+                    ..Default::default()
+                };
+                let (ba, bb) = (
+                    Bvh::build(ma, &opts).unwrap(),
+                    Bvh::build(mb, &opts).unwrap(),
+                );
+                let got = mesh_distance(ma, &ba, mb, &bb, xf, f32::INFINITY);
+                assert_eq!(got, Ok(Some(want)), "leaf {leaf}, {xf:?}");
+                for got in [
+                    mesh_distance_with::<0>(ma, &ba, mb, &bb, xf, f32::INFINITY),
+                    mesh_distance_with::<2>(ma, &ba, mb, &bb, xf, f32::INFINITY),
+                    mesh_distance_with::<5>(ma, &ba, mb, &bb, xf, f32::INFINITY),
+                ] {
+                    assert_eq!(got, Some(want), "leaf {leaf}");
+                }
+                let mut above = want.distance;
+                if f64::from(above) < d {
+                    above = above.next_up();
+                }
+                let got = mesh_distance(ma, &ba, mb, &bb, xf, above);
+                assert_eq!(got, Ok(Some(want)));
+                let below = above.next_down();
+                assert_eq!(mesh_distance(ma, &ba, mb, &bb, xf, below), Ok(None));
+                // `triangles_near` shares the lower bound and the prefilters.
+                for margin in [0.0, above, 2.0 * above, 0.05] {
+                    let got = near(ma, &ba, mb, &bb, xf, margin);
+                    assert_eq!(got, brute_near(&all, margin), "margin {margin}");
+                }
+            }
+        };
+
+        let mut cases = 0;
+        let mut rng = Lcg(0x22);
+        let tilt = |rng: &mut Lcg| -> M3 {
+            // A random turn by up to about 3° about a random axis.
+            let r = random_rotation(rng);
+            let s = 0.05;
+            std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    let id = if i == j { 1.0 } else { 0.0 };
+                    id + s * (r[i][j] - r[j][i])
+                })
+            })
+        };
+        // Wavy meshes: B's lowest vertex `gap` over a peak of A.
+        let (ma, mb) = (wavy(6), wavy(5));
+        for gap in [1e-6, 1e-5, 3e-4, 3e-3] {
+            for rot in [Rigid::IDENTITY.rotation, rot_z(30.0), ROT_Z90] {
+                check(&ma, &mb, &pose(&ma, &mb, &rot, gap));
+                cases += 1;
+            }
+        }
+        // Bumpy sheets: B flipped over A, turned a little, and lowered until
+        // the gap is near `gap`.
+        let (ma, mb) = (bumps(8), bumps(7));
+        for gap in [1e-5, 1e-4, 2e-3] {
+            for deg in [0.0, 2.5, 7.0] {
+                let skew = tilt(&mut rng);
+                // Orthonormalized, so that `Rigid::validate` accepts it.
+                let rot = orthonormal(&mul(&rot_z(deg), &skew));
+                let mut xf = Rigid {
+                    rotation: mul(&rot, &FLIP_X),
+                    translation: [0.3, 7.4, 2.0],
+                };
+                for _ in 0..4 {
+                    let d = brute_min(&brute(&ma, &mb, &xf)).unwrap().2.dist2.sqrt();
+                    xf.translation[2] -= d - gap;
+                }
+                assert_eq!(xf.validate(), Ok(()));
+                check(&ma, &mb, &xf);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 21);
+    }
+
+    /// `m` with its rows made orthonormal (Gram–Schmidt), and the third row
+    /// their cross product, so that it is a proper rotation.
+    fn orthonormal(m: &M3) -> M3 {
+        let dot = |p: &[f64; 3], q: &[f64; 3]| (0..3).map(|k| p[k] * q[k]).sum::<f64>();
+        let unit = |p: [f64; 3]| {
+            let n = dot(&p, &p).sqrt();
+            p.map(|v| v / n)
+        };
+        let r0 = unit(m[0]);
+        let d = dot(&m[1], &r0);
+        let r1 = unit(std::array::from_fn(|k| m[1][k] - d * r0[k]));
+        let r2 = [
+            r0[1] * r1[2] - r0[2] * r1[1],
+            r0[2] * r1[0] - r0[0] * r1[2],
+            r0[0] * r1[1] - r0[1] * r1[0],
+        ];
+        [r0, r1, r2]
+    }
+
     #[test]
     fn pair_lower_bound_is_below_the_distance() {
         // Random pairs, slivers and coplanar ones included: the bound never
@@ -1255,6 +1683,41 @@ mod tests {
             useful += usize::from(lb > 0.5 * d && d > 0.0);
         }
         assert!(useful > 1000, "{useful}");
+    }
+
+    /// The leaf prefilter's premise: a triangle's box gap to the union box of
+    /// a chunk is never above its box gap to any triangle of the chunk, in
+    /// `f64` exactly, so the prefilter skips only pairs `skip_pair` skips.
+    #[test]
+    fn union_box_gap_is_below_each_pair_gap() {
+        let mut rng = Lcg(0x5e1f);
+        let mut r = || f64::from(rng.next());
+        let tri = |r: &mut dyn FnMut() -> f64, at: P3, size: f64| -> [P3; 3] {
+            std::array::from_fn(|_| std::array::from_fn(|k| at[k] + size * r()))
+        };
+        let mut skipped = 0;
+        for _ in 0..2000 {
+            let at: P3 = [10.0 * r(), 10.0 * r(), 10.0 * r()];
+            let ids: Vec<TriangleId> = (0..1 + (r() * 16.0) as TriangleId).collect();
+            let chunk_tris: Vec<[P3; 3]> = ids.iter().map(|_| tri(&mut r, at, 3.0)).collect();
+            let mut chunk = Chunk::new();
+            chunk.fill(&ids, |t| chunk_tris[t as usize]);
+            assert_eq!(chunk.tris().len(), ids.len());
+            let near: P3 = [10.0 * r(), 10.0 * r(), 10.0 * r()];
+            let other = Tri::new(tri(&mut r, near, 3.0));
+            let union_gap = other.box_gap(&chunk.lo, &chunk.hi);
+            let bound = 0.5 * r();
+            for t in chunk.tris() {
+                assert!(union_gap <= other.box_gap(&t.lo, &t.hi));
+                assert!(union_gap <= t.box_gap(&other.lo, &other.hi));
+                if beyond(union_gap, bound, 10.0) {
+                    assert!(skip_pair(t, &other, bound, 10.0));
+                    assert!(skip_pair(&other, t, bound, 10.0));
+                    skipped += 1;
+                }
+            }
+        }
+        assert!(skipped > 1000, "{skipped}");
     }
 
     #[test]
