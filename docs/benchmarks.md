@@ -101,10 +101,23 @@ What changed, with results unchanged:
 
 On the 22 near-miss poses at 1M (single cold runs), the pre-pass costs 0.17 to 0.37 ms on most poses, about 1 to 1.5 ms on four, and 5 ms on one. The whole query visits about 350 to 1,300 leaf pairs on most poses (pre-pass included), about 2,000 on three, and 7,400 on the slowest.
 
+**Box prefilter in the intersection traversal.** A follow-up commit applies the same per-leaf caching to the traversal behind `intersects`, `intersecting_pairs` and the pre-pass. It also skips a pair when the two triangles' boxes are disjoint: first a B triangle against the union box of A's leaf, then pair by pair. The skip is exact. The boxes are the min and max of the same `f64` corners the exact test gets, and the test is strict, so pairs whose boxes only touch are kept. Results are unchanged. 1M, two rounds back to back on 2026-10-18, before (commit `abe83bc`) and after; the second round repeated the first within 2%:
+
+| 1M | before | after |
+| --- | --- | --- |
+| `intersects`, touching | 0.436 ms | 0.291 ms |
+| `mesh_distance`, touching, all 64 poses | 0.94 ms | 0.80 ms |
+| — intersecting poses only | 0.379 ms | 0.251 ms |
+| — near-miss poses only | 2.01 ms | 1.84 ms |
+| `mesh_distance`, apart 0.3 (does not use this path) | 0.82 ms | 0.83 ms |
+| `triangles_near`, margin 0.080 (does not use this path) | 1.37 ms | 1.38 ms |
+| `intersecting_pairs`, pushed 0.5 | 10.4 ms | 4.4 ms |
+
 **Against the spec's targets (§1).**
-- `intersects` takes about 0.5 ms at 1M vs 1M (0.45 to 0.84 ms across these runs): within the "few ms" target.
-- `mesh_distance` takes about 0.4 ms at 1M when the meshes intersect, about 0.85 ms when they are 0.3 apart, and about 2.1 ms on the near misses (9.6 ms at 10M). All meet the "few ms" target at 1M. Near misses miss the issue's goal of about 1 ms by about 2×, and 10M near misses miss the "few ms" target.
-- `triangles_near` costs in proportion to contact: about 1.5 ms at 1M for a few hundred to 4,600 triangles per side, and about 11 ms at 10M for 350 to 48,000.
+- `intersects` takes about 0.3 ms at 1M vs 1M: within the "few ms" target.
+- `mesh_distance` takes about 0.25 ms at 1M when the meshes intersect, about 0.85 ms when they are 0.3 apart, and about 1.8 to 2.1 ms on the near misses (9.6 ms at 10M, measured before the box prefilter). All meet the "few ms" target at 1M. Near misses miss the issue's goal of about 1 ms by about 1.8×, and 10M near misses miss the "few ms" target.
+- `triangles_near` costs in proportion to contact: about 1.4 to 1.5 ms at 1M for a few hundred to 4,600 triangles per side, and about 11 ms at 10M for 350 to 48,000.
+- `intersecting_pairs` with B pushed 0.5 into A takes about 4.4 ms at 1M for 900 to 18,500 pairs.
 
 ## How the defaults were chosen
 
