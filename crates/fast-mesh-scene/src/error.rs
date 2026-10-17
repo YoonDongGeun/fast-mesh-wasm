@@ -12,7 +12,7 @@ use crate::MeshId;
 /// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SceneError {
-    /// The id was never issued by this scene, or its mesh was removed.
+    /// The id is stale: its mesh was removed.
     UnknownMesh,
     /// The mesh's BVH is out of date and its update mode forbids updating it
     /// implicitly.

@@ -115,7 +115,7 @@ impl Scene {
     /// Removes a mesh and returns it. The id never matches again.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`] for a stale or foreign id.
+    /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn remove_mesh(&mut self, id: MeshId) -> Result<Mesh> {
         self.entries
             .remove(id)
@@ -130,7 +130,7 @@ impl Scene {
     /// The mesh behind `id`.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`] for a stale or foreign id.
+    /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn mesh(&self, id: MeshId) -> Result<&Mesh> {
         Ok(&self.entry(id)?.mesh)
     }
@@ -143,7 +143,7 @@ impl Scene {
     /// Where the mesh sits in the world.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`] for a stale or foreign id.
+    /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn placement(&self, id: MeshId) -> Result<Placement> {
         Ok(self.entry(id)?.placement)
     }
@@ -164,7 +164,7 @@ impl Scene {
     /// Whether the mesh's BVH is up to date with the mesh.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`] for a stale or foreign id.
+    /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn is_current(&self, id: MeshId) -> Result<bool> {
         let e = self.entry(id)?;
         Ok(e.bvh.is_current(&e.mesh))

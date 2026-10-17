@@ -44,6 +44,7 @@ impl Placement {
     /// Maps a point of the mesh to the world: `rotation * p + translation`.
     pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
         let (r, t) = (&self.rotation, &self.translation);
+        // Mirrors `Rigid::apply_f64` and must stay bit-identical to it.
         std::array::from_fn(|i| r[i][0] * p[0] + r[i][1] * p[1] + r[i][2] * p[2] + t[i])
     }
 
@@ -197,16 +198,30 @@ mod tests {
 
     #[test]
     fn relative_rotation_of_near_orthonormal_inputs_validates() {
+        // Shears: each input is within tolerance, but the product's columns
+        // are 2e off orthogonal, so only re-orthonormalising makes it valid.
         let e = 0.9e-6;
         let mut a = p(RZ90, [0.0; 3]);
-        a.rotation[0][0] += e;
-        a.rotation[1][1] += e;
-        let mut b = p(RX90, [0.0; 3]);
-        b.rotation[1][1] += e;
-        b.rotation[2][2] += e;
+        a.rotation[0][0] = e;
+        let mut b = p(RZ90, [0.0; 3]);
+        b.rotation[0][0] = e;
         assert!(a.validate().is_ok() && b.validate().is_ok());
+        let (ra, rb) = (&a.rotation, &b.rotation);
+        let raw: [[f64; 3]; 3] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| ra[0][i] * rb[0][j] + ra[1][i] * rb[1][j] + ra[2][i] * rb[2][j])
+        });
+        let raw_rigid = Rigid {
+            rotation: raw,
+            translation: [0.0; 3],
+        };
+        assert!(raw_rigid.validate().is_err(), "raw product must be invalid");
         let rel = relative_rigid(&a, [0.0; 3], &b, [0.0; 3]);
         assert_eq!(rel.validate(), Ok(()));
+        for (row, raw_row) in rel.rotation.iter().zip(&raw) {
+            for (x, y) in row.iter().zip(raw_row) {
+                assert!((x - y).abs() < 2e-6, "{x} vs {y}");
+            }
+        }
     }
 
     #[test]
