@@ -1,0 +1,262 @@
+# fast-mesh Scene (Phase 4) design
+
+- **Status:** Approved for planning (the owner skipped the questions; §15 records the builder-check decisions)
+- **Date:** 2026-10-18
+- **Parent spec:** `2026-10-14-fast-mesh-engine-design.md` §3.3, §4.5 and §7. Where this document disagrees with it, this document wins for Phase 4.
+- **Milestone:** Phase 4: Scene
+
+## 1. Intent
+
+The Scene is the mediator the parent spec describes. It owns meshes and their BVHs, places each mesh in the world, keeps every BVH up to date according to that mesh's update policy, answers queries in world coordinates, and keeps one undo history across all meshes.
+
+The owner's use case is the one from Phase 3b. One dental-arch-like mesh is moved or rotated against another; the per-vertex contact colour itself comes in Phase 5. Undo works on steps, where a step is a group of edits and moves, possibly across several meshes, undone as one ("several things treated as one bundle and undone as a unit", the owner's words).
+
+The owner asked to skip the questions, so the decisions below marked *my call* are mine.
+
+## 2. Goals, non-goals, anti-goals
+
+**Goals:**
+1. Scene registry: add and remove meshes, with stable ids.
+2. World placement as a rigid transform per mesh, in f64. The mesh's f64 origin is handled exactly.
+3. BVH ownership and update policies: eager, lazy and manual, plus `flush`.
+4. Queries in world coordinates, built on Phase 3a/3b:
+   - raycast over all meshes;
+   - closest point, against one mesh or all meshes;
+   - mesh-vs-mesh `intersects`, `mesh_distance` and `triangles_near`.
+5. Broadphase over mesh world boxes, and `find_contacts` across all mesh pairs.
+6. Scene-wide history: steps that group edits and transform changes across meshes, with undo and redo of whole steps under a memory budget.
+7. Change reporting: what changed since the caller last asked, per mesh, so renderers and the later Phase 5 fields can react.
+
+**Non-goals (later phases):**
+- *My call:* the general dependency graph over fields, colours and sections waits for Phase 5/6, when those nodes exist. Phase 4 has exactly one dependency, mesh geometry to its BVH, so a graph engine now would be speculative.
+- *My call:* scale in transforms, which Phase 3b does not support. Scale is added in a later phase together with its distance caveats.
+- Contact normals and contact points beyond the pair queries' outputs. *My call:* add them when a consumer needs them.
+- Sections (Phase 6). JS API and events as callbacks (Phase 8). Worker and sync (Phase 9).
+
+**Anti-goals:**
+- A transform change that touches any vertex, BVH or buffer. It must only store a matrix.
+- A partially applied undo or redo step. A failure leaves every mesh as it was.
+- A query that silently uses a stale BVH.
+
+## 3. Constraints
+
+- **New crate `fast-mesh-scene`.** It depends on `fast-mesh-store`, `fast-mesh-bvh` and `fast-mesh-query`. No new third-party dependencies.
+- **Failure atomicity** as in Phases 1–3: an operation that fails, for example on `OutOfMemory`, leaves the Scene unchanged.
+- **Phase 3 rules for query outputs:** `out` vectors are appended to and rolled back on error, and ties are deterministic.
+- **Docs and checks:** `///` docs on every public item, clippy `-D warnings`, fmt, and the wasm32 build.
+- **Tests:** property tests against a model, criterion benches.
+
+## 4. Ids and registry
+
+```rust
+pub struct MeshId { index: u32, generation: u32 }   // Copy, Eq, Hash, Debug; stale ids are rejected
+pub struct MeshOptions { pub build: BuildOptions, pub bvh_policy: fast_mesh_bvh::UpdatePolicy, pub mode: UpdateMode, pub placement: Placement }
+impl Scene {
+    pub fn new(options: SceneOptions /* history budget */) -> Scene;
+    pub fn add_mesh(&mut self, mesh: Mesh, options: MeshOptions) -> Result<MeshId>;   // builds the BVH
+    pub fn remove_mesh(&mut self, id: MeshId) -> Result<Mesh>;
+    pub fn mesh(&self, id: MeshId) -> Result<&Mesh>;
+    pub fn ids(&self) -> impl Iterator<Item = MeshId>;
+}
+```
+
+- **Generational ids.** A removed id never matches again; using one gives `UnknownMesh`.
+- **Removing a mesh** drops its entries from the history. Steps left empty are dropped. *My call.* Undo of other meshes keeps working.
+
+## 5. Placement (world transforms)
+
+```rust
+/// world = rotation * p + translation, where p is the mesh's world-space point
+/// (origin + local position), all in f64.
+pub struct Placement { pub rotation: [[f64; 3]; 3], pub translation: [f64; 3] }
+impl Scene {
+    pub fn placement(&self, id: MeshId) -> Result<Placement>;
+    pub fn set_placement(&mut self, id: MeshId, p: Placement) -> Result<()>;   // recorded in the current step
+}
+```
+
+- **Validation:** same rule as `Rigid` (orthonormal, det +1 within 1e-6, finite), giving `InvalidInput`.
+- **Cost:** `set_placement` only stores the placement and records the change. Nothing else is touched.
+- **Relative transforms:** for mesh-vs-mesh queries, the Scene computes the relative `Rigid` from B's local space to A's local space in f64, origins included.
+
+  ```text
+  p_world = R_B (o_B + p_B) + t_B
+  p_A     = R_Aᵀ (p_world − t_A) − o_A
+  => R = R_Aᵀ R_B,   t = R_Aᵀ (R_B o_B + t_B − t_A) − o_A
+  ```
+
+  This is the "convert the operand into local space" rule from parent §6.
+- **World to local** for a point or ray uses the same f64 formula, then rounds to f32. World results are reported in f64.
+
+## 6. BVHs and update policies
+
+```rust
+pub enum UpdateMode { Eager, Lazy, Manual }   // see §15.8
+impl Scene {
+    pub fn set_mode(&mut self, id: MeshId, mode: UpdateMode) -> Result<()>;
+    pub fn update(&mut self, id: MeshId) -> Result<()>;   // bring one BVH up to date now
+    pub fn flush(&mut self) -> Result<()>;               // bring every Lazy BVH up to date
+    pub fn is_current(&self, id: MeshId) -> Result<bool>;
+}
+```
+
+- **Eager** (the default) updates the BVH right after every commit, undo and redo of that mesh.
+- **Lazy** accumulates the changes. The BVH is updated before the next query that needs it, or on `flush()`/`update(id)`. This is the policy to use while dragging or brushing.
+- **Manual** updates only on `update(id)`. A query that needs a stale Manual BVH returns `SceneError::StaleBvh(id)` and never updates it implicitly.
+- **Accumulated changes** are kept as one merged `ChangeSet` per mesh, which `Bvh::update` takes. Merging (*my call*: in `fast-mesh-store`, as `ChangeSet::merge(&mut self, later: &ChangeSet)`) keeps the net effect per slot:
+  - added then removed: neither;
+  - removed then added again (slot reuse): counts as changed when the slot was alive before, otherwise as added;
+  - moved and changed are unions, minus the slots that end up removed.
+
+  Undo and redo produce change sets too, and they merge the same way.
+
+## 7. Editing and history
+
+```rust
+impl Scene {
+    /// Runs `f` in a transaction on mesh `id`, commits it, and records the patch.
+    pub fn edit<R>(&mut self, id: MeshId, f: impl FnOnce(&mut Transaction) -> fast_mesh_store::Result<R>) -> Result<R>;
+    pub fn begin_step(&mut self);          // nested calls count; the outermost end closes the step
+    pub fn end_step(&mut self) -> Result<()>;
+    pub fn undo(&mut self) -> Result<bool>; // false: nothing to undo
+    pub fn redo(&mut self) -> Result<bool>;
+    pub fn can_undo(&self) -> bool; pub fn can_redo(&self) -> bool;
+    pub fn clear_history(&mut self) -> Result<()>;
+}
+```
+
+**Steps**
+- A step is the ordered list of entries recorded between `begin_step` and the matching `end_step`. Entries are `Edit(mesh, Patch)` and `Placement(mesh, old, new)`.
+- Outside an explicit step, each `edit` or `set_placement` is its own step.
+- An empty step is not recorded.
+- A new step clears the redo stack.
+- `undo` reverts a step's entries in reverse order; `redo` reapplies them in order.
+- **Atomicity.** If an entry fails partway, for example on OOM, the entries already reverted are reapplied (or vice versa), so the step is all-or-nothing. If that recovery also fails, the Scene reports `SceneError::Corrupted`. *My call:* this is the same rare failure the store already accepts for patches.
+
+**Budget**
+- *My call:* a step's size is the sum of its patches' `byte_size()` plus a constant per placement entry.
+- When the budget is exceeded, the oldest steps are evicted, as in `History`.
+
+**Releasing reserved slots**
+- Evicting or discarding a patch must release the slots it reserves, which `History` does with crate-private code.
+- *My call:* add one public store method so the Scene can do the same:
+
+  ```rust
+  impl Patch {
+      /// Releases the slots this patch reserves. Call it once the patch is dropped from an
+      /// undo history (`Undoable`) or from a redo history (`Redoable`).
+      pub fn release(&self, mesh: &mut Mesh, side: PatchSide);
+  }
+  pub enum PatchSide { Undoable, Redoable }
+  ```
+
+  `History` then uses it internally, with unchanged behaviour.
+
+- **A mesh's own `History` is not used inside the Scene.** The Scene keeps one history across all meshes. A user who edits a mesh outside the Scene (after `remove_mesh`) can use `History` as before.
+
+## 8. Queries in world coordinates
+
+Each query brings the BVHs it needs up to date: Lazy BVHs are updated, and stale Manual ones give `StaleBvh`. Inputs and outputs are world-space f64.
+
+```rust
+pub struct SceneRayHit { pub mesh: MeshId, pub hit: fast_mesh_query::RayHit /* local */, pub point: [f64; 3], pub t: f64 }
+pub fn raycast(&mut self, origin: [f64; 3], dir: [f64; 3], opts: &RayOptions) -> Result<Option<SceneRayHit>>;          // all meshes, nearest
+pub fn closest_point(&mut self, p: [f64; 3], opts: &ClosestOptions) -> Result<Option<SceneClosestHit>>;               // all meshes
+pub fn closest_point_on(&mut self, id: MeshId, p: [f64; 3], opts: &ClosestOptions) -> Result<Option<SceneClosestHit>>;
+pub fn intersects(&mut self, a: MeshId, b: MeshId) -> Result<bool>;
+pub fn mesh_distance(&mut self, a: MeshId, b: MeshId, max_distance: f64) -> Result<Option<SceneMeshDistance>>;      // points in world
+pub fn triangles_near(&mut self, a: MeshId, b: MeshId, margin: f64, out_a: &mut Vec<TriangleId>, out_b: &mut Vec<TriangleId>) -> Result<()>;
+```
+
+- **Mesh-vs-mesh queries** compute the relative `Rigid` (§5) and call Phase 3b. A rigid transform preserves distances, so distances and margins carry over unchanged.
+- **Cross-mesh raycast** works mesh by mesh:
+  - the ray goes into each mesh's local space (exact in f64, then f32);
+  - meshes are culled first by the broadphase (§9);
+  - the nearest world `t` wins, with ties going to the lower `MeshId` index.
+  - *My call:* `dir` is normalised in world space so that `t` is a world distance.
+- **Cross-mesh closest point** works the same way: meshes are visited by broadphase box distance and pruned by the best distance so far.
+- *My call:* queries take `&mut self` because Lazy updates mutate. A read-only `query_current` variant can come later if needed.
+
+## 9. Broadphase and contacts
+
+- **The top level** is a small list of each mesh's world AABB: its BVH root box placed by the rigid transform, conservative in f64. It is rebuilt whenever a placement or BVH changes; it has one entry per mesh.
+- *My call:* a sorted sweep-and-prune or brute-force N² over meshes is enough for "several meshes". Use a BVH over meshes only if benchmarks show it is needed.
+
+```rust
+pub struct Contact { pub a: MeshId, pub b: MeshId, pub intersecting: bool, pub distance: f64, pub triangles_a: Vec<TriangleId>, pub triangles_b: Vec<TriangleId> }
+pub fn find_contacts(&mut self, margin: f64, filter: &ContactFilter, out: &mut Vec<Contact>) -> Result<usize>;
+pub struct ContactFilter { pub pairs: Option<Vec<(MeshId, MeshId)>> /* None = all */, /* groups/masks: my call, later */ }
+```
+
+- **Candidates** are mesh pairs whose world boxes are within `margin`.
+- **Per candidate:**
+  - `intersecting` comes from `intersects`;
+  - `distance` comes from `mesh_distance(max = margin)` and is 0 when intersecting;
+  - `triangles_a`/`_b` come from `triangles_near(margin)`.
+- Pairs beyond `margin` are not reported.
+- The output is sorted by `(a, b)` index.
+- *My call:* group/mask filters from the parent spec are deferred until there is a consumer. An explicit pair list covers the owner's two-mesh case.
+
+## 10. Change reporting (events)
+
+```rust
+pub struct MeshChanges { pub id: MeshId, pub changes: Option<ChangeSet> /* None: everything */, pub placement_changed: bool, pub added: bool, pub removed: bool }
+pub fn take_changes(&mut self) -> Vec<MeshChanges>;   // everything since the last call, then reset
+```
+
+- Every commit, undo, redo, placement change and removal adds to a per-mesh pending report. `take_changes` drains them, in id order.
+- This is the Rust form of the parent spec's `updated` event. Phase 8 turns it into JS events with render dirty ranges.
+- *My call:* render buffers and capacity events are out of scope, because the core has no render buffers yet.
+
+## 11. Errors
+
+```rust
+pub enum SceneError { UnknownMesh, StaleBvh(MeshId), InvalidInput(&'static str), StepNotOpen, Corrupted, Store(StoreError), Bvh(BvhError), Query(QueryError) }
+```
+
+- *My call:* `OutOfMemory` from a lower crate is forwarded wrapped, as `Store(OutOfMemory)` and so on, not flattened.
+
+## 12. Testing
+
+**Model-based property tests**
+- Random sequences over 2–3 meshes: edits, placements, steps (open and close), undo, redo, policy changes, `flush`, `remove_mesh`.
+- A plain model tracks the expected geometry and placements per mesh, and the step stack.
+- After each operation:
+  - every mesh equals the model;
+  - every Eager BVH is current and valid;
+  - Lazy BVHs become current after `flush`;
+  - world queries equal Phase 3 queries called directly with hand-computed local transforms.
+
+**Unit tests**
+- Relative-transform exactness: integer placements give exact relative `Rigid`s.
+- Step atomicity under injected OOM.
+- Release of reserved slots on eviction: a freed slot is reused only after its patch leaves the history.
+- `ChangeSet::merge` against a brute-force replay.
+- Stale ids.
+
+**`find_contacts`** against all-pairs Phase 3b calls.
+
+## 13. Benchmarks
+
+- **Scene overhead** against calling Phase 3 directly, for one raycast, one `mesh_distance` and one `set_placement` plus `mesh_distance` between two 1M meshes. Target: below 5% overhead. *My call*, and not a merge gate.
+- **`find_contacts`** over 2, 8 and 32 meshes.
+
+## 14. Left to the builder
+
+- Internal storage layout.
+- The broadphase algorithm, as long as it is exact and conservative.
+- How `edit` threads the transaction borrow.
+- Module layout.
+
+## 15. Decisions after the builder check (all *my call*)
+
+1. **Eager BVH update failure.** Edits, undo and redo are all-or-nothing for mesh data and history. If the Eager BVH update that follows fails (e.g. `OutOfMemory`), the operation still succeeds; the BVH keeps its merged pending changes and is treated like Lazy until it is updated by the next query, `update(id)` or `flush()` (which then report the error if it fails again). Rationale: making BVH updates part of the atomic unit would need a full copy of every touched BVH. Tests assert "every Eager BVH is current" except right after an injected allocation failure.
+2. **Relative rotations.** Placements are stored exactly as given (validated with the 1e-6 rule). Before a mesh-vs-mesh query the relative rotation `R_Aᵀ R_B` is re-orthonormalised in f64 (Gram–Schmidt on its rows), so Phase 3b's validation always accepts it. The change is within ~1e-6 and is documented.
+3. **Open steps.** `undo`, `redo` and `clear_history` close an open step first (as if `end_step` was called), so Ctrl+Z mid-drag undoes the drag. `cancel_step()` reverts the open step's entries and discards it (Esc). `remove_mesh` is allowed while a step is open and drops that mesh's entries. An `edit` that fails leaves the open step unchanged. `SceneError::StepNotOpen` is returned by `end_step`/`cancel_step` with no open step.
+4. **What queries need.** A query over all meshes needs every mesh current: Lazy BVHs are updated, and any stale Manual BVH makes the query fail with `StaleBvh(id)` (never skipped silently). Queries naming meshes (`closest_point_on`, pair queries, `find_contacts` with a pair filter) only update the named meshes. World boxes come from BVH root boxes after that update.
+5. **Mesh maintenance inside the Scene.** Wrappers: `add_channel(id, desc)`, `remove_channel(id, name)`, `derived_channel_mut(id, name)` (not undoable, as in the store), and `compact(id)`. `compact` releases nothing (its slots no longer exist), drops that mesh's history entries (steps left empty are dropped), rebuilds its BVH and reports the mesh as fully changed.
+6. **Change reports.** `MeshChanges { id, changes: Option<ChangeSet>, placement_changed, added, removed }`. `changes == None` means "treat everything as changed" (after `compact`, `add_mesh`, or when merging the pending report ran out of memory), which keeps `take_changes` infallible. A mesh added and removed between two calls is not reported. `placement_changed` is true if the placement changed at any point since the last call, even if undone.
+7. **`ChangeSet::merge` rules.** Net effect per slot: added then removed → neither; removed then re-added → moved (vertex) or changed (triangle) when the slot was alive before, else added; moved/changed are unions minus slots that end up added or removed; channel lists are unioned per channel name, minus vertices that end up added or removed. Tests check the store invariants (sorted, disjoint, moved ⊂ alive-before) against a brute-force replay; the BVH itself would accept a plain union.
+8. **Names.** The Scene's policy enum is `UpdateMode { Eager, Lazy, Manual }` (`fast_mesh_bvh::UpdatePolicy` keeps its meaning). `MeshOptions` gains `bvh_policy: fast_mesh_bvh::UpdatePolicy`.
+9. **f64 options to f32.** World f64 bounds are converted to Phase 3's f32 options rounding outward (`min_t` down, `max_t`/`max_distance`/`margin` up), and results are filtered again in f64 against the exact bound, so no result outside the bound is returned and none inside is lost.
+10. **`remove_mesh`** releases the slots its dropped entries reserved (`Patch::release`) before returning the mesh.
