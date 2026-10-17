@@ -576,7 +576,8 @@ thread_local! {
     /// [`for_each_near_pair`] have tested on this thread.
     static LEAF_VISITS: Cell<usize> = const { Cell::new(0) };
     /// Test-only: how many triangle pairs [`for_each_near_pair`] has skipped
-    /// by a lower bound on this thread.
+    /// by a lower bound, and [`for_each_pair`] by disjoint boxes, on this
+    /// thread.
     static PAIR_SKIPS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -588,9 +589,29 @@ fn count_skips(n: usize) {
     let _ = n;
 }
 
+/// Whether the closed boxes `lo..=hi` and `lo2..=hi2` are disjoint: on some
+/// axis one lies strictly beyond the other. Boxes that touch are not
+/// disjoint.
+fn boxes_apart(lo: &P3, hi: &P3, lo2: &P3, hi2: &P3) -> bool {
+    (0..3).any(|k| lo[k] > hi2[k] || lo2[k] > hi[k])
+}
+
 /// Calls `pair` for every triangle pair of every leaf pair that the traversal
-/// reaches with `key`, B's triangle already in A's space, until `pair` returns
-/// `false`. For the intersection queries, which have no distance to bound.
+/// reaches with `key` whose triangles may share a point, B's triangle already
+/// in A's space, until `pair` returns `false`. For the intersection queries,
+/// which have no distance to bound.
+///
+/// Leaf pairs are taken a [`Chunk`] of each side at a time, as in
+/// [`for_each_near_pair`]. A pair is skipped only when its triangles' boxes are
+/// disjoint ([`boxes_apart`]), first a B triangle against the union box of
+/// A's chunk, then each A triangle against that B triangle. This is exact,
+/// with no rounding involved: a [`Tri`]'s box is the `min` and `max` of the
+/// very `f64` corners that `tri_tri_intersect` gets, so it holds the whole
+/// closed triangle, and a union box holds each of its boxes. Two triangles in
+/// disjoint closed boxes share no point, so a skipped pair could never have
+/// passed the exact test; a pair that merely touches has touching boxes, so it
+/// is never skipped. The pairs that `pair` accepts are therefore unchanged,
+/// and so are the queries' results.
 fn for_each_pair<const N: usize>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
@@ -600,17 +621,31 @@ fn for_each_pair<const N: usize>(
     key: impl FnMut(&Aabb, &Aabb) -> Option<f64>,
     mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
 ) {
+    let (mut ca, mut cb) = (Chunk::new(), Chunk::new());
     traverse_pairs_with::<N, f64>(bvh_a, bvh_b, xf, key, |va, vb, _| {
         let (Some(ta), Some(tb)) = (leaf(va), leaf(vb)) else {
             return Step::Descend;
         };
         #[cfg(test)]
         LEAF_VISITS.with(|c| c.set(c.get() + 1));
-        for &b in tb {
-            let pb = tri_b(mesh_b, xf, b);
-            for &a in ta {
-                if !pair(a, tri_a(mesh_a, a), b, pb) {
-                    return Step::Stop;
+        for ids_a in ta.chunks(CHUNK) {
+            ca.fill(ids_a, |a| tri_a(mesh_a, a));
+            for ids_b in tb.chunks(CHUNK) {
+                cb.fill(ids_b, |b| tri_b(mesh_b, xf, b));
+                for (&b, tb) in ids_b.iter().zip(cb.tris()) {
+                    if boxes_apart(&tb.lo, &tb.hi, &ca.lo, &ca.hi) {
+                        count_skips(ids_a.len());
+                        continue;
+                    }
+                    for (&a, ta) in ids_a.iter().zip(ca.tris()) {
+                        if boxes_apart(&ta.lo, &ta.hi, &tb.lo, &tb.hi) {
+                            count_skips(1);
+                            continue;
+                        }
+                        if !pair(a, ta.p, b, tb.p) {
+                            return Step::Stop;
+                        }
+                    }
                 }
             }
         }
@@ -1264,6 +1299,121 @@ mod tests {
         let mb = Mesh::from_buffers(b_points.as_flattened(), &[0, 1, 2]).unwrap();
         let (ba, bb) = (build(&ma, Quality::Sah), build(&mb, Quality::Sah));
         (ma, ba, mb, bb)
+    }
+
+    /// The intersection traversal's box prefilter keeps pairs whose boxes only
+    /// touch. A and B share just the corner `(1, 0, 0)`, where their boxes
+    /// meet at that single point too (A's box ends at x = 1 and y = 0 from
+    /// one side, B's starts there from the other); moved by one `f32` ulp
+    /// along x, both the triangles and the boxes come apart.
+    #[test]
+    fn box_prefilter_keeps_touching_pairs() {
+        let a = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let b = [[1.0, 0.0, 0.0], [2.0, -1.0, 0.0], [2.0, 0.0, 1.0]];
+        let (ma, ba, mb, bb) = touching(b);
+        assert_eq!(ma.positions()[..3], a[..]);
+        let (pa, pb) = (
+            Tri::new(tri_a(&ma, 0)),
+            Tri::new(tri_b(&mb, &Rigid::IDENTITY, 0)),
+        );
+        assert!(!boxes_apart(&pa.lo, &pa.hi, &pb.lo, &pb.hi));
+        for n in [0, 2, PAIR_STACK] {
+            let found = match n {
+                0 => intersects_with::<0>(&ma, &ba, &mb, &bb, &Rigid::IDENTITY),
+                2 => intersects_with::<2>(&ma, &ba, &mb, &bb, &Rigid::IDENTITY),
+                _ => intersects(&ma, &ba, &mb, &bb, &Rigid::IDENTITY).unwrap(),
+            };
+            assert!(found, "stack {n}");
+        }
+        let mut pairs = Vec::new();
+        let n = intersecting_pairs(&ma, &ba, &mb, &bb, &Rigid::IDENTITY, &mut pairs);
+        assert_eq!((n, pairs), (Ok(1), vec![(0, 0)]));
+        let d = mesh_distance(&ma, &ba, &mb, &bb, &Rigid::IDENTITY, 1.0);
+        assert_eq!(d.unwrap().unwrap().distance, 0.0);
+
+        let mut apart = Rigid::IDENTITY;
+        apart.translation[0] = f64::from(1f32.next_up() - 1.0);
+        let pb = Tri::new(tri_b(&mb, &apart, 0));
+        assert!(boxes_apart(&pa.lo, &pa.hi, &pb.lo, &pb.hi));
+        assert_eq!(intersects(&ma, &ba, &mb, &bb, &apart), Ok(false));
+        let mut pairs = Vec::new();
+        let n = intersecting_pairs(&ma, &ba, &mb, &bb, &apart, &mut pairs);
+        assert_eq!((n, pairs), (Ok(0), vec![]));
+    }
+
+    /// The intersection queries skip triangle pairs by their boxes, and still
+    /// match the brute force with leaves of 1 to 16 triangles (so that a
+    /// leaf's union box is much larger than its triangles' boxes): on the
+    /// posed wavy meshes, and on bumpy sheets pushed into each other, turned
+    /// and tilted.
+    #[test]
+    fn intersection_queries_skip_pairs_by_boxes() {
+        use fast_mesh_bvh::BuildOptions;
+        let check = |ma: &Mesh, mb: &Mesh, xf: &Rigid| {
+            let want: Vec<_> = brute(ma, mb, xf)
+                .iter()
+                .filter(|e| e.2)
+                .map(|e| (e.0, e.1))
+                .collect();
+            let mut skipped = 0;
+            for leaf in [1, 4, 16] {
+                let opts = BuildOptions {
+                    max_leaf_size: leaf,
+                    ..Default::default()
+                };
+                let (ba, bb) = (
+                    Bvh::build(ma, &opts).unwrap(),
+                    Bvh::build(mb, &opts).unwrap(),
+                );
+                PAIR_SKIPS.with(|c| c.set(0));
+                for got in [
+                    intersecting_pairs_with::<PAIR_STACK>(ma, &ba, mb, &bb, xf, &mut Vec::new()),
+                    intersecting_pairs_with::<0>(ma, &ba, mb, &bb, xf, &mut Vec::new()),
+                ] {
+                    assert_eq!(got, Ok(want.len()), "leaf {leaf}");
+                }
+                let mut out = Vec::new();
+                intersecting_pairs(ma, &ba, mb, &bb, xf, &mut out).unwrap();
+                assert_eq!(out, want, "leaf {leaf}");
+                assert_eq!(intersects(ma, &ba, mb, &bb, xf), Ok(!want.is_empty()));
+                assert_eq!(intersects_with::<1>(ma, &ba, mb, &bb, xf), !want.is_empty());
+                skipped += PAIR_SKIPS.with(|c| c.get());
+            }
+            (want.len(), skipped)
+        };
+        let (mut pairs, mut skipped) = (0, 0);
+        for Posed { ma, mb, xf, .. } in posed() {
+            let (p, s) = check(&ma, &mb, &xf);
+            pairs += p;
+            skipped += s;
+        }
+        let (ma, mb) = (bumps(8), bumps(7));
+        let mut rng = Lcg(0x15);
+        for (deg, lift) in [(0.0, 0.3), (3.0, 0.0), (11.0, -0.3)] {
+            let tilt = orthonormal(&mul(&rot_z(deg), &random_small_turn(&mut rng)));
+            let xf = Rigid {
+                rotation: mul(&tilt, &FLIP_X),
+                translation: [0.3, 7.4, lift],
+            };
+            assert_eq!(xf.validate(), Ok(()));
+            let (p, s) = check(&ma, &mb, &xf);
+            assert!(p > 0, "{deg}");
+            pairs += p;
+            skipped += s;
+        }
+        assert!(pairs > 200 && skipped > 1000, "{pairs} {skipped}");
+    }
+
+    /// A random turn by up to about 3° about a random axis (not exactly
+    /// orthonormal; see [`orthonormal`]).
+    fn random_small_turn(rng: &mut Lcg) -> M3 {
+        let r = random_rotation(rng);
+        std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                let id = if i == j { 1.0 } else { 0.0 };
+                id + 0.05 * (r[i][j] - r[j][i])
+            })
+        })
     }
 
     #[test]
