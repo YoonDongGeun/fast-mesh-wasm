@@ -28,11 +28,11 @@ pub(crate) enum Step {
 /// A pair waiting on the stack: a node of A, a node of B, B's box already
 /// moved into A's space, and the pair's key.
 #[derive(Clone, Copy)]
-struct Pending {
+struct Pending<K> {
     a: NodeId,
     b: NodeId,
     b_box: Aabb,
-    key: f64,
+    key: K,
 }
 
 /// Visits pairs of nodes of `a` and `b` depth-first, smaller key first, with B
@@ -41,6 +41,8 @@ struct Pending {
 /// `key` gets A's box and B's box moved into A's space
 /// ([`Rigid::transform_box`]), and returns `None` to cull the pair with
 /// everything below it. It runs once per created pair, the root pair included.
+/// Keys are compared with [`PartialOrd`], so a key can carry more than the
+/// value it orders by (a tuple orders by its first field, then the next).
 ///
 /// `visit` gets each pair when it is popped, with its key. For a leaf–leaf
 /// pair it does the triangle work and returns [`Step::Skip`] or [`Step::Stop`]
@@ -56,14 +58,14 @@ struct Pending {
 /// Test-only: the queries call `traverse_pairs_with::<PAIR_STACK>` directly,
 /// so that their tests can force the fallback with a smaller stack.
 #[cfg(test)]
-pub(crate) fn traverse_pairs(
+pub(crate) fn traverse_pairs<K: Copy + PartialOrd>(
     a: &Bvh,
     b: &Bvh,
     xf: &Rigid,
-    key: impl FnMut(&Aabb, &Aabb) -> Option<f64>,
-    visit: impl FnMut(&NodeView, &NodeView, f64) -> Step,
+    key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
 ) {
-    traverse_pairs_with::<PAIR_STACK>(a, b, xf, key, visit);
+    traverse_pairs_with::<PAIR_STACK, K>(a, b, xf, key, visit);
 }
 
 /// [`traverse_pairs`] with an `N`-entry stack, so tests can force the
@@ -74,12 +76,12 @@ pub(crate) fn traverse_pairs(
 /// sees only leaf–leaf pairs, in no particular key order, and `Stop` still ends
 /// everything. Queries stay correct regardless, since they check their bounds
 /// again in `visit`.
-pub(crate) fn traverse_pairs_with<const N: usize>(
+pub(crate) fn traverse_pairs_with<const N: usize, K: Copy + PartialOrd>(
     a: &Bvh,
     b: &Bvh,
     xf: &Rigid,
-    mut key: impl FnMut(&Aabb, &Aabb) -> Option<f64>,
-    mut visit: impl FnMut(&NodeView, &NodeView, f64) -> Step,
+    mut key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    mut visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
 ) {
     let (Some(ra), Some(rb)) = (a.root(), b.root()) else {
         return;
@@ -165,13 +167,13 @@ pub(crate) fn traverse_pairs_with<const N: usize>(
 /// its leaves one of B's subtree. Inner pairs are only tested with `key`, not
 /// shown to `visit`. `key` runs once per pair it tests (never for `p` itself,
 /// whose key is known). Returns `false` when `visit` returned [`Step::Stop`].
-fn finish_stackless(
+fn finish_stackless<K: Copy>(
     a: &Bvh,
     b: &Bvh,
     xf: &Rigid,
-    p: Pending,
-    key: &mut impl FnMut(&Aabb, &Aabb) -> Option<f64>,
-    visit: &mut impl FnMut(&NodeView, &NodeView, f64) -> Step,
+    p: Pending<K>,
+    key: &mut impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    visit: &mut impl FnMut(&NodeView, &NodeView, K) -> Step,
 ) -> bool {
     let mut stopped = false;
     a.traverse_from(p.a, |ida, va| {
@@ -321,7 +323,7 @@ mod tests {
         key: impl Fn(&Aabb, &Aabb) -> Option<f64>,
     ) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
-        traverse_pairs_with::<N>(a, b, xf, &key, |va, vb, k| {
+        traverse_pairs_with::<N, f64>(a, b, xf, &key, |va, vb, k| {
             if let (Some(ia), Some(ib)) = (leaf_id(va), leaf_id(vb)) {
                 assert_eq!(Some(k), key(&va.bounds, &xf.transform_box(&vb.bounds)));
                 out.push((ia, ib));
@@ -536,7 +538,7 @@ mod tests {
         stop_at: usize,
     ) -> usize {
         let mut leaf_visits = 0;
-        traverse_pairs_with::<N>(a, b, xf, overlap_key, |va, vb, _| {
+        traverse_pairs_with::<N, f64>(a, b, xf, overlap_key, |va, vb, _| {
             if leaf_id(va).is_some() && leaf_id(vb).is_some() {
                 leaf_visits += 1;
                 if leaf_visits >= stop_at {
@@ -568,7 +570,7 @@ mod tests {
         let xf = rigids()[1];
         let count = |n: &mut usize| {
             *n += 1;
-            Some(0.0)
+            Some(0.0_f64)
         };
 
         // On the stack, every created pair is popped once, as nothing is culled.
@@ -588,7 +590,7 @@ mod tests {
         // Without a stack: the root pair, then each other A node against B's
         // root, then each A leaf against each other B node.
         let mut keys = 0;
-        traverse_pairs_with::<0>(
+        traverse_pairs_with::<0, f64>(
             &ba,
             &bb,
             &xf,
@@ -613,7 +615,7 @@ mod tests {
                 b,
                 &Rigid::IDENTITY,
                 |_, _| panic!("key on an empty tree"),
-                |_, _, _| panic!("visit on an empty tree"),
+                |_, _, _: f64| panic!("visit on an empty tree"),
             );
         }
     }
