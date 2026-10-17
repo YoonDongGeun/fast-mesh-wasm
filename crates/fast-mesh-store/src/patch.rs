@@ -7,7 +7,9 @@ use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 pub struct ChangeSet {
     pub vertices_added: Vec<VertexId>,
     pub vertices_removed: Vec<VertexId>,
-    /// Existing vertices whose position changed.
+    /// Existing vertices whose position changed. In a set produced by
+    /// [`ChangeSet::merge`], such a vertex may also have changed values in any
+    /// channel, so treat it as dirty for all channels.
     pub vertices_moved: Vec<VertexId>,
     pub triangles_added: Vec<TriangleId>,
     pub triangles_removed: Vec<TriangleId>,
@@ -41,12 +43,35 @@ impl ChangeSet {
     ///   (triangle), because the slot was alive before and is alive after;
     /// - moved and changed are unions, minus slots that end up added or removed;
     /// - channel lists are unioned per channel name, minus vertices that end up added
-    ///   or removed. A reused vertex slot is not added to any channel list.
+    ///   or removed. A reused (removed, then added) vertex is added to every channel
+    ///   list named in either input, because its slot got brand-new contents. Names
+    ///   are kept even when their list ends up empty.
     ///
     /// A slot that was written and then restored to its original value stays in the
     /// moved, changed and channel lists; the lists are supersets of the real
     /// differences. All lists stay sorted, duplicate-free and disjoint.
+    ///
+    /// In a merged set, a vertex in `vertices_moved` may have changed values in any
+    /// channel (a reused slot may differ in channels no input named), so consumers
+    /// must treat it as dirty for all channels.
+    ///
+    /// Both sets must satisfy the `ChangeSet` invariants: every list sorted and
+    /// duplicate-free, added, removed and moved/changed disjoint, and channel lists
+    /// free of added and removed vertices. Sets returned by this crate do.
     pub fn merge(&mut self, later: &ChangeSet) {
+        for cs in [&*self, later] {
+            let strictly_sorted = |l: &Vec<u32>| l.windows(2).all(|w| w[0] < w[1]);
+            debug_assert!(
+                strictly_sorted(&cs.vertices_added)
+                    && strictly_sorted(&cs.vertices_removed)
+                    && strictly_sorted(&cs.vertices_moved)
+                    && strictly_sorted(&cs.triangles_added)
+                    && strictly_sorted(&cs.triangles_removed)
+                    && strictly_sorted(&cs.triangles_changed)
+                    && cs.channels.iter().all(|(_, v)| strictly_sorted(v)),
+                "change set lists must be sorted and duplicate-free"
+            );
+        }
         let (vertices_added, vertices_removed, reborn_v) = merge_slots(
             &self.vertices_added,
             &self.vertices_removed,
@@ -81,7 +106,9 @@ impl ChangeSet {
         for (_, ids) in &mut self.channels {
             *ids = difference(ids, &ended);
         }
-        self.channels.retain(|(_, ids)| !ids.is_empty());
+        for (_, ids) in &mut self.channels {
+            *ids = union(ids, &reborn_v);
+        }
 
         self.vertices_added = vertices_added;
         self.vertices_removed = vertices_removed;
@@ -328,6 +355,10 @@ impl Patch {
     /// [`PatchSide::Undoable`], the created slots for [`PatchSide::Redoable`].
     /// Does nothing when the patch is stale (another mesh, or the mesh was compacted),
     /// because its slots no longer exist.
+    ///
+    /// Call it at most once per patch, and only when the patch is discarded from a
+    /// history. Calling it twice, or while a history still holds the patch, corrupts
+    /// slot reuse.
     pub fn release(&self, mesh: &mut Mesh, side: PatchSide) {
         if self.mesh_uid != mesh.uid || self.epoch != mesh.epoch {
             return;
@@ -436,7 +467,10 @@ mod tests {
         assert_eq!(a.triangles_changed, vec![0, 1]);
         assert_eq!(
             a.channels,
-            vec![("c".to_string(), vec![0, 1]), ("d".to_string(), vec![1])]
+            vec![
+                ("c".to_string(), vec![0, 1, 2]),
+                ("d".to_string(), vec![1, 2])
+            ]
         );
     }
 

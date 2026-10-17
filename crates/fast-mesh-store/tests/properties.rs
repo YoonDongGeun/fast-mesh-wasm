@@ -331,13 +331,18 @@ proptest! {
     }
 
     #[test]
-    fn merge_matches_replay(steps in prop::collection::vec(step(), 1..30)) {
+    fn merge_matches_replay(
+        steps in prop::collection::vec(step(), 1..30),
+        // A small budget evicts old patches, which frees removed slots for reuse.
+        budget in prop_oneof![Just(usize::MAX), 200usize..2000],
+    ) {
         let mut m = grid(8);
-        let mut h = History::new(usize::MAX);
+        let mut h = History::new(budget);
         let first = state(&m);
         let mut merged = ChangeSet::default();
-        // Vertex slots that were removed at some point: after reuse, their channel
-        // values come from creation parents, which the merged lists do not cover.
+        // Vertex slots that were removed at some point. If alive again at the end, a
+        // slot may hold brand-new channel values; the documented rule is that it is
+        // then in `vertices_moved` (dirty for all channels).
         let mut reused = std::collections::BTreeSet::new();
         for step in &steps {
             let changes = match step {
@@ -357,7 +362,20 @@ proptest! {
             };
             if let Some(c) = changes {
                 reused.extend(c.vertices_removed.iter().copied());
+                let reborn: Vec<u32> = merged
+                    .vertices_removed
+                    .iter()
+                    .copied()
+                    .filter(|v| c.vertices_added.contains(v))
+                    .collect();
                 merged.merge(&c);
+                // Re-added vertices join every channel list named so far.
+                for v in &reborn {
+                    prop_assert!(merged.vertices_moved.contains(v), "reborn {v} moved");
+                    for (name, ids) in &merged.channels {
+                        prop_assert!(ids.contains(v), "reborn {v} in channel {name}");
+                    }
+                }
             }
         }
         let last = state(&m);
@@ -395,7 +413,7 @@ proptest! {
                     if a.1 != b.1 {
                         differs.push(v);
                     }
-                    if a.2 != b.2 && !reused.contains(&v) {
+                    if a.2 != b.2 {
                         mask_differs.push(v);
                     }
                 }
@@ -416,7 +434,11 @@ proptest! {
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
         for v in &mask_differs {
-            prop_assert!(written.contains(v), "vertex {v} channel written");
+            prop_assert!(
+                written.contains(v)
+                    || (reused.contains(v) && merged.vertices_moved.contains(v)),
+                "vertex {v} channel written"
+            );
         }
         for v in &written {
             prop_assert!(find_v(&first, *v).is_some() && find_v(&last, *v).is_some());
