@@ -11,14 +11,24 @@
 //! - Placements: [`Scene::placement`] and [`Scene::set_placement`]. A
 //!   placement is validated like a [`fast_mesh_query::Rigid`] and stored
 //!   exactly as given.
-//! - BVH state: [`Scene::is_current`] says whether a mesh's BVH is up to date.
+//! - Editing: [`Scene::edit`] runs a store transaction on one mesh and
+//!   records its patch. All-or-nothing: a failed edit changes nothing.
+//! - BVH state: each mesh's [`UpdateMode`] says when its BVH follows the
+//!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
+//!   [`Scene::is_current`].
+//! - Change reports: [`Scene::take_changes`] drains one [`MeshChanges`] per
+//!   affected mesh.
+//! - Maintenance: [`Scene::add_channel`], [`Scene::remove_channel`],
+//!   [`Scene::derived_channel_mut`] and [`Scene::compact`].
 
 mod error;
 mod id;
 mod placement;
+mod report;
 mod scene;
 
 pub use error::{Result, SceneError};
 pub use id::MeshId;
 pub use placement::Placement;
+pub use report::MeshChanges;
 pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};

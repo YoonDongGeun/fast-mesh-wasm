@@ -110,6 +110,22 @@ impl<T> SlotMap<T> {
             })
         })
     }
+
+    /// Live `(id, value)` pairs in index order, mutably.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (MeshId, &mut T)> {
+        self.slots.iter_mut().enumerate().filter_map(|(i, s)| {
+            let generation = s.generation;
+            s.value.as_mut().map(|v| {
+                (
+                    MeshId {
+                        index: i as u32,
+                        generation,
+                    },
+                    v,
+                )
+            })
+        })
+    }
 }
 
 #[cfg(test)]
