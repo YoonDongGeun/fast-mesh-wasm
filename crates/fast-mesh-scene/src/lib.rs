@@ -13,6 +13,11 @@
 //!   exactly as given.
 //! - Editing: [`Scene::edit`] runs a store transaction on one mesh and
 //!   records its patch. All-or-nothing: a failed edit changes nothing.
+//! - History: one undo history across all meshes, in steps.
+//!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
+//!   changes (otherwise each is its own step); [`Scene::undo`],
+//!   [`Scene::redo`] and [`Scene::cancel_step`] are all-or-nothing per step.
+//!   [`SceneOptions::history_budget`] evicts the oldest steps.
 //! - BVH state: each mesh's [`UpdateMode`] says when its BVH follows the
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
@@ -22,6 +27,7 @@
 //!   [`Scene::derived_channel_mut`] and [`Scene::compact`].
 
 mod error;
+mod history;
 mod id;
 mod placement;
 mod report;
