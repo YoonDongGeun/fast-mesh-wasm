@@ -316,6 +316,7 @@ name = "fast-mesh-scene"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "fast-mesh",
  "fast-mesh-bvh",
  "fast-mesh-fields",
  "fast-mesh-ops",
