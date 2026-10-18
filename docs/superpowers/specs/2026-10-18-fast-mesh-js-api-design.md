@@ -321,3 +321,27 @@ Each part gets its own plan.
 - The debug-guard mechanism.
 - The arcball details in the WebGPU example, and its mesh generators.
 - How each part splits into plan tasks. 8a and 8b get separate plans.
+
+## 11. Decisions after the builder check (they override earlier sections)
+
+1. **Geometry edits from JS, executed in Rust** *(owner: "do it in Rust")*. `scene.edit(mesh, ops)` takes an op list and runs it as one Rust transaction through `Scene::edit`, so a single call is one undo step. If any op fails, nothing changes (rollback). Normals, colours, sections and the BVH follow automatically.
+   - Ops:
+     - `{ op: "setPositions", vertices: Uint32Array, positions: Float32Array | Float64Array }`. Positions are in world space and are converted to local with the mesh's placement and origin.
+     - `{ op: "addVertices", positions }`. Returns new vertex ids in the result.
+     - `{ op: "addTriangles", triangles: Uint32Array }`. Returns new triangle ids.
+     - `{ op: "removeTriangles", triangles }`
+     - `{ op: "removeVertices", vertices }`
+   - Ops may refer to vertices added earlier in the same list by index into that op's result, using `{ ref: [opIndex, i] }` *(my call)*.
+   - The ops travel to wasm as one encoded buffer, not one call per op.
+   - `scene.compact(mesh)` is exposed. It renumbers slots, so its change record reports `"all"` and `capacityChanged`.
+   - Undo, redo and drags work as in §5.5.
+2. **The three.js adapter mirrors buffers** *(my call)*. `BufferAttribute` arrays are JS-owned copies. On `commitFrame()` only the dirty ranges are copied from fresh views into them. This avoids detached arrays between `commitFrame()` and `renderer.render()` (three.js uploads lazily). The cost is roughly double JS-side memory per mesh, which is acceptable for the owner's 2–5 meshes. The WebGPU example uploads straight from views with `queue.writeBuffer`, so it makes no extra copy. The §9 benchmark measures the mirror copy plus range bookkeeping.
+3. **`addMesh` coordinates** *(my call)*.
+   - Positions are given in world space, as `Float32Array`, `Float64Array` or an array-like.
+   - Without `origin`, the mesh origin is the bounding-box centre, computed in f64, so local `f32` coordinates stay small and precise.
+   - With `origin`, that point is used.
+   - Positions are stored as `p − origin` in `f32`.
+   - The initial placement is the identity.
+   - `views().positions()` therefore holds local coordinates, and `matrix4 = placement · translate(origin)` puts them back in the world.
+   - The store gains a constructor that takes an explicit origin (with f64 input), next to the existing auto-centring `from_buffers_f64`.
+4. **`DragSession.cancel()`** restores the start placement. It does not cancel the user's outer step. `undo()` during a drag ends the drag first *(my call)*.
