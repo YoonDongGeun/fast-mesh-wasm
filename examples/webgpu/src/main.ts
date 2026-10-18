@@ -70,6 +70,8 @@ function run(renderer: Renderer): void {
 
   let picked: MeshHandle | null = null;
   let gesture: Gesture | null = null;
+  /** The pointer that started `gesture`; other pointers are ignored until it ends. */
+  let gesturePointer = -1;
   /** The latest drag pose, applied once at the start of the next frame. */
   let pendingPose: PlacementInput | null = null;
   let coloring: { mesh: MeshHandle; field: FieldHandle } | null = null;
@@ -149,6 +151,10 @@ function run(renderer: Renderer): void {
   // ---- Pointer: click picks, drag moves, Shift+drag rotates, empty space orbits ----
 
   canvas.addEventListener("pointerdown", (e) => {
+    if (gesture !== null) {
+      return; // a second pointer (touch, pen) while a gesture is open: ignore it
+    }
+    gesturePointer = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
     const ray = camera.ray(e.offsetX, e.offsetY, canvas.clientWidth, canvas.clientHeight);
     const hit = scene.raycast(ray.origin, ray.direction);
@@ -170,7 +176,7 @@ function run(renderer: Renderer): void {
   });
 
   canvas.addEventListener("pointermove", (e) => {
-    if (gesture === null) {
+    if (gesture === null || e.pointerId !== gesturePointer) {
       return;
     }
     if (gesture.kind === "orbit") {
@@ -187,7 +193,10 @@ function run(renderer: Renderer): void {
     pendingPose = gesture.kind === "move" ? movePose(gesture, e) : rotatePose(gesture, e);
   });
 
-  const endGesture = () => {
+  const endGesture = (e: PointerEvent) => {
+    if (e.pointerId !== gesturePointer) {
+      return;
+    }
     if (gesture !== null && gesture.kind !== "orbit" && gesture.session?.active) {
       if (pendingPose !== null) {
         gesture.session.move(pendingPose);
