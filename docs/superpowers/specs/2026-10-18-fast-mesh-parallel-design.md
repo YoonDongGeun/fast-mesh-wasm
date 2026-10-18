@@ -108,3 +108,58 @@ There are two stages:
    - They need not match today's main bit for bit. The sequential build may adopt the same fixed chunked reductions (for example, chunked CG dot products and gather-based transposed products), and any golden values in tests are refreshed.
    - Property tests that compare against from-scratch computation stay as they are.
    - §3's "unaffected" means unaffected in API and behaviour class, not in last-bit float results.
+
+## 8. Implementation notes
+
+What the build decided along the way, where it differs from the sections above, and what it measured. The full benchmark tables are in `docs/benchmarks.md`, section "Parallel".
+
+### Rulings
+1. **Shared helpers live in `fast_mesh_store::par`.** `fast-mesh-store` gets a `parallel` feature after all (§6 expected it would not need one). It is the common base of every engine crate, so the deterministic helpers (`map_chunks`, `map_range`, `join`, `force_sequential`, `parallel_entries`) need no new crate. The cost is a `doc(hidden)` public module in the store's API.
+2. **`force_sequential` is thread-local.** The thread that arms a fault-injection hook is the one that calls the parallel helper, so a thread-local flag covers every site that thread enters, and tests running side by side cannot turn each other's flag off. It is never used in production.
+3. **The helpers take an explicit `oom: impl Fn() -> E`** instead of requiring `E: From<StoreError>`. This keeps the public API unchanged: no new `From` impls on `QueryError` and the other error types. Call sites pass one extra argument.
+4. **The scene's field threshold uses a work estimate,** not the exact candidate count. The near search now runs inside the parallel compute phase, so the candidates are not known when the decision is made. The estimate counts every vertex slot of A when all are recomputed; otherwise it counts the known candidates, plus A's triangle count for the near search when B's root box is within the margin of A's.
+5. **`signed_distances_bit_identical` is smaller than planned:** about 30k points in pseudonormal mode and about 8k in winding mode (still more than 60 chunks), and it returns after the reference run when the feature is off. The planned 300k points cost CI time without strengthening the proof.
+6. **`triangles_near` is parallel too** (a subtree-pair split, as for self pairs). It was not in §2's list, but the one-sided field drag is bound by it.
+7. **The weld neighbour search must keep memory O(n).** The first version stored every close pair, so it could run out of memory with the feature where the build without it succeeds. The ruling was a chunk-local spanning-forest reduction, or dropping the parallel search.
+8. **The weld uses a lock-free union-find instead,** superseding the spanning forest of ruling 7, which is not strictly O(n) when a cluster spans many chunks. One `AtomicU32` parent per vertex slot, no `unsafe`. A union links the larger root under the smaller by compare-exchange and retries if that root moved. A find halves paths, only ever re-pointing a vertex to its grandparent. Every link points from a root to a smaller id, so each group's root is its smallest member however the unions interleave, and the roots match the sequential union-find. The re-reviewer checked the argument, and a stress probe and the bit-identity tests back it.
+
+### Deviations and limits
+- **Normals** are out of stage 1, as §7.1 says.
+- **The BVH build forks at most 24 joins deep** and builds the rest of a chain as one sequential part, which bounds the stack on degenerate SAH chains. Splitting long chains loses their join parallelism.
+- **The feature-off build does not split into parts:** below the threshold, without the feature, or when forced sequential, it builds in one pass into the arena with the same chunked reductions. So where parts are cut cannot change the tree.
+- **The feature-off `Quality::Fast` build was measured about 5% slower than before stage 1** (the chunked reductions). In the "Parallel" runs it took 113 ms, against 115 ms in the BVH table above it, which was measured on another day.
+- **Still sequential:** the Fast build's per-triangle boxes and Morton sort; `analyze`'s edge-map sort (which limits `analyze` to 1.2× without the self-intersection check); the weld's sort; fairing's dot products and vector updates, which are chunked in a fixed order so the sequential build gives the same bits. A parallel sort helper would be follow-up work.
+- **No golden values in the scene and fields bit-identity tests.** CI runs on Linux and the test meshes use `sin` and `atan2`, so the reference is the forced-sequential path, which is the code the feature-off build runs. The BVH test has golden values.
+- **Thread-local test counters undercount** once their site runs on workers (for example `LEAF_VISITS` in the pair queries and `PAIRS` in the weld). Their documentation says so, and the tests that read them stay below the thresholds or force the sequential path.
+- **Nested parallelism:** inside the parallel field compute, `triangles_near` (above its threshold) forks again. Rayon handles the nesting, and the owner-scale check below covers it.
+
+### Thresholds
+Named constants, one per site, each documented with the measurement behind it (i5-13600K):
+
+| Site | Constant | Value |
+| --- | --- | --- |
+| BVH build, parts | `PAR_MIN_SUBTREE` | 8,192 triangles |
+| BVH build, reductions of a part | `PAR_MIN_PRIMS` | 65,536 triangles |
+| `signed_distances` | `PAR_MIN_POINTS` | 512 points |
+| `SignData::build`, per pass | `PAR_MIN_SIGN_ELEMS` | 8,192 elements |
+| `raycast_many`, `closest_point_many` | `PAR_MIN_QUERIES` | 256 queries |
+| `triangles_near`, `intersecting_pairs` | `PAR_MIN_PAIR_TRIS` | 2,048 triangles |
+| `self_intersecting_pairs` | `PAR_MIN_SELF_TRIS` | 1,024 triangles |
+| `analyze` | `PAR_MIN_ANALYZE_TRIS` | 2,048 triangles |
+| Fairing solves | `PAR_MIN_FAIR_SOLVE` | 128 new vertices |
+| Fairing products | `PAR_MIN_FAIR_ROWS` | 1,024 rows |
+| Weld | `PAR_MIN_WELD_VERTS` | 16,384 vertex slots |
+| Scene fields | `PAR_MIN_FIELD_WORK` | 12,288 (work estimate) |
+| Scene sections | `PAR_MIN_SECTION_WORK` | 8,192 triangles |
+
+The final measurement (below) needed no change to any of them.
+
+### Measured (20 threads; feature off → on)
+- **BVH build:** SAH 408 → 65.6 ms at 1M (6.2×) and 4.55 s → 731 ms at 10M (6.2×); Fast 113 → 52.2 ms (2.2×) and 1.51 s → 650 ms (2.3×).
+- **Sign data and distances:** `SignData::build` pseudonormal 132 → 35.6 ms (3.7×); `signed_distances` 15× (pseudonormal) and 12× (winding).
+- **Batch queries:** `raycast_many` 15×, `closest_point_many` 16×. Pair queries 1M vs 1M: `triangles_near` 1.38 → 0.40 ms (3.5×), `intersecting_pairs` 4.46 → 0.68 ms (6.6×).
+- **Repair:** `analyze` 1.2×, with the self-intersection check 2.2×; fill with fairing 4.27 → 1.77 s (2.4×); weld 1.5×.
+- **Sections:** one mesh 1.05×, three meshes 2.0×, the two-sphere plane change with the gap 1.6×.
+- **Field drags (1M):** one side 97.5 → 30.7 ms (3.2×), both sides 194 → 37.7 ms (5.2×).
+- **Many meshes (§7.4):** `many_mesh_drag_1M` 39.2 → 3.60 s (11×).
+- **Owner-scale anti-goal:** `many_mesh_drag_30k` 352 → 57.1 ms, so parallel takes 0.16 times the sequential time. The added `many_mesh_drag_30k_apart` (the same meshes out of reach, so the fields run sequentially even with the feature) measured 319 → 318 µs, 1.00 times. Both are within the 1.05 limit.

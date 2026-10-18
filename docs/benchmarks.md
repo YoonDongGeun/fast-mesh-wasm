@@ -358,6 +358,83 @@ This table comes from a later run on the same machine than the header table of t
 
 The binary grew 37 times because it now carries the BVH, queries, fields, sections and repair, which were not in the package before. The spec's size rule (section 8: call out a release that grows by more than 20%) applies from the next release on. The test build (`pnpm --filter fast-mesh-wasm test`) adds the `__test_panic` export and is not what is published.
 
+## Parallel (the `parallel` feature)
+
+Every benchmark that the `parallel` feature touches, with the feature off and on. Results are bit-identical either way (the tests check it); only the time changes.
+
+- **Machine:** Intel Core i5-13600K (14 cores: 6 performance cores with two threads each, 8 efficiency cores; 20 hardware threads), 32 GB RAM, Windows 11
+- **Threads:** rayon's default global pool, 20 threads (`RAYON_NUM_THREADS` unset). "Off" is the build without the feature and runs on one thread.
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Date:** 2026-10-18 and 2026-10-19
+- **Method:** the bench binaries for both builds were built first, then each crate's benchmarks ran off and then on, back to back, in two full rounds. Before each run the process list was checked for other `cargo`, `rustc` or bench processes. Round 2 was quiet throughout and is the one reported. Round 1 had one other `cargo` process at one point and agrees with round 2 within about 10% on every row except the two noted below.
+- **Inputs:** those of the sections above (`terrain(708)` with 1,002,528 triangles, `terrain(2237)` with 10,008,338 for the BVH, the 998,000-triangle sphere), plus the many-mesh scenes described below. The times are criterion's middle estimate.
+
+| Benchmark | Off | On | Speed-up |
+| --- | --- | --- | --- |
+| BVH build 1M, `Quality::Sah` | 408 ms | 65.6 ms | 6.2× |
+| BVH build 1M, `Quality::Fast` | 113 ms | 52.2 ms | 2.2× |
+| BVH build 10M, `Quality::Sah` | 4.55 s | 731 ms | 6.2× |
+| BVH build 10M, `Quality::Fast` | 1.51 s | 650 ms | 2.3× |
+| `SignData::build`, pseudonormal | 132 ms | 35.6 ms | 3.7× |
+| `SignData::build`, pseudonormal, adjacency not cached | 194 ms | 100 ms | 1.9× |
+| `SignData::build`, winding | 35.5 ms | 21.2 ms | 1.7× |
+| `signed_distances`, 100,000 points, pseudonormal, `max_distance` 1 | 79.0 ms | 5.20 ms | 15× |
+| `signed_distances`, 100,000 points, pseudonormal, `max_distance` ∞ | 137 ms | 8.93 ms | 15× |
+| `signed_distances`, 100,000 points, winding, `max_distance` 1 | 2.39 s | 195 ms | 12× |
+| `signed_distances`, 100,000 points, winding, `max_distance` ∞ | 4.54 s | 382 ms | 12× |
+| `raycast_many`, 100,000 rays | 76.6 ms | 5.26 ms | 15× |
+| `closest_point_many`, 100,000 points | 192 ms | 12.1 ms | 16× |
+| `triangles_near`, 1M vs 1M, margin 0.080 (64-pose cycle) | 1.38 ms | 0.400 ms | 3.5× |
+| `intersecting_pairs`, 1M vs 1M, pushed 0.5 (64-pose cycle) | 4.46 ms | 0.677 ms | 6.6× |
+| `analyze`, no self-intersection check | 489 ms | 405 ms | 1.2× |
+| `analyze`, with self-intersection check | 908 ms | 419 ms | 2.2× |
+| `fill_10_holes_1M`, `fair` off | 353 ms | 350 ms | 1.0× |
+| `fill_10_holes_1M`, `fair` on | 4.27 s | 1.77 s | 2.4× |
+| `weld_1M_10pct_dupes` | 97.3 ms | 66.9 ms | 1.5× |
+| `section_drag_1M`, 64 planes | 15.8 ms | 15.1 ms | 1.05× |
+| `section_drag_3x333k`, 64 planes over three meshes | 23.0 ms | 11.3 ms | 2.0× |
+| `section_fill_1M_sphere`, fill off | 339 µs | 328 µs | 1.0× |
+| `section_fill_1M_sphere`, fill on | 537 µs | 527 µs | 1.0× |
+| `section_gap_two_1M`, `section_gap` alone | 151 µs | 149 µs | 1.0× |
+| `section_gap_two_1M`, plane change (both meshes) + `section_gap` | 840 µs | 513 µs | 1.6× |
+| Field drag 1M, one side, 64 poses | 97.5 ms | 30.7 ms | 3.2× |
+| Field drag 1M, both sides, 64 poses | 194 ms | 37.7 ms | 5.2× |
+| `many_mesh_drag_30k`, 64 poses | 352 ms | 57.1 ms | 6.2× |
+| `many_mesh_drag_30k_apart`, 64 poses | 319 µs | 318 µs | 1.0× |
+| `many_mesh_drag_1M`, 64 poses | 39.2 s | 3.60 s | 11× |
+
+**The many-mesh scenes.** Six `terrain(n)` meshes in a row along x, each overlapping the next by an eighth of its side, so that neighbouring sheets cross along curves. There is a distance field for every ordered pair (30 fields, `max_distance` 0.5, sign `Auto`), and each mesh is coloured by its field to the next. All meshes are Lazy. The middle mesh (the third) is dragged through 64 poses, rising and falling by up to 0.25 and sliding 0.1 along x. Each pose makes ten fields due (five on the moved mesh, five measured to it) and runs `set_placement`, `update_fields`, `colors` of every mesh and `take_changes`. `many_mesh_drag_30k` uses `terrain(122)` (29,768 triangles per mesh, the owner's scale) and recolours about 390 vertices per pose. `many_mesh_drag_30k_apart` puts the same meshes a whole side apart, so no field has anything within reach and no vertex is recoloured. `many_mesh_drag_1M` uses `terrain(708)` and recolours about 46,600 vertices per pose. The 30k benchmarks take 50 samples, the others 10.
+
+**Owner-scale check (spec anti-goal: parallel at most 1.05 times sequential).** Met with the thresholds as they were, so none was changed:
+- `many_mesh_drag_30k`: parallel takes 0.16 times the sequential time (57.1 ms against 352 ms; round 1: 57.8 against 387 ms).
+- `many_mesh_drag_30k_apart`: parallel takes 1.00 times the sequential time (318 µs against 319 µs; round 1: 318 against 612 µs). Nothing is in reach, so every field's work estimate is small, and the fields run one after another on the calling thread as without the feature. An earlier separate run of this benchmark with 10 samples measured 345 and 359 µs off against 349 and 380 µs on: at about 5 µs per pose, the spread between runs is larger than the 5% margin, so the 50-sample round 2 is the one to read.
+
+**Where the gain is small.**
+- **One mesh, one section** (`section_drag_1M`, 1.05×): one slice per plane, and slicing itself is sequential. Several meshes or sections in one update gain (2.0× over three meshes).
+- **`analyze` without the self-intersection check** (1.2×): its passes run side by side, but they all wait for the edge map's sort, which stays sequential.
+- **Fill without fairing** (1.0×): nothing in it is parallel. With fairing on, the three coordinate solves run side by side, with parallel matrix products from 1,024 rows.
+- **The sphere fill and the gap alone** (1.0×): single small computations under every threshold.
+
+**Round-to-round differences.** Round 1 differs from round 2 by more than 10% on two rows, both feature-off: `many_mesh_drag_1M` (51.3 s against 39.2 s) and `many_mesh_drag_30k_apart` (612 µs against 319 µs). The feature-on results of both rounds agree within 2% on both rows.
+
+**Thresholds.** Each parallel site runs sequentially below a named threshold, measured on this machine by the task that added it (the measurements are in each constant's documentation):
+
+| Site | Constant | Value |
+| --- | --- | --- |
+| BVH full build: split into parts built in parallel | `PAR_MIN_SUBTREE` | 8,192 triangles |
+| BVH full build: parallel bound and SAH bin reductions of a part | `PAR_MIN_PRIMS` | 65,536 triangles |
+| `signed_distances` | `PAR_MIN_POINTS` | 512 points |
+| `SignData::build`, per pass | `PAR_MIN_SIGN_ELEMS` | 8,192 elements |
+| `raycast_many`, `closest_point_many` | `PAR_MIN_QUERIES` | 256 queries |
+| `triangles_near`, `intersecting_pairs` | `PAR_MIN_PAIR_TRIS` | 2,048 triangles (A and B together) |
+| `self_intersecting_pairs` | `PAR_MIN_SELF_TRIS` | 1,024 triangles |
+| `analyze` passes side by side | `PAR_MIN_ANALYZE_TRIS` | 2,048 triangles |
+| Fairing: the three solves side by side | `PAR_MIN_FAIR_SOLVE` | 128 new vertices |
+| Fairing: matrix products | `PAR_MIN_FAIR_ROWS` | 1,024 rows |
+| Weld: keys and neighbour search | `PAR_MIN_WELD_VERTS` | 16,384 vertex slots |
+| Scene: fields due in one update | `PAR_MIN_FIELD_WORK` | 12,288 (work estimate, summed) |
+| Scene: section entries due in one update | `PAR_MIN_SECTION_WORK` | 8,192 triangles (summed) |
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -395,4 +472,6 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
+cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k, apart, 6 x 1M)
+cargo bench -p fast-mesh-scene --features parallel          # any of the above with the parallel feature (same for the other crates)
 ```
