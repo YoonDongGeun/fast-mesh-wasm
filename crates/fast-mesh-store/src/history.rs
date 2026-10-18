@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::compact::Remap;
-use crate::{ChangeSet, Mesh, Patch, Result, StoreError};
+use crate::{ChangeSet, Mesh, Patch, PatchSide, Result, StoreError};
 
 /// Undo/redo stacks of [`Patch`]es for one mesh, limited by a memory budget.
 ///
@@ -27,32 +27,6 @@ pub struct History {
     bytes: usize,
     /// Uid of the mesh this history belongs to, set by the first push.
     mesh_uid: Option<u64>,
-}
-
-/// Which reserved slots of a patch to release.
-#[derive(Clone, Copy)]
-enum Reserved {
-    /// Slots the patch removed (it sits on the undo stack).
-    Removed,
-    /// Slots the patch created (it sits on the redo stack, undone).
-    Added,
-}
-
-fn release(mesh: &mut Mesh, p: &Patch, which: Reserved) {
-    if p.mesh_uid != mesh.uid || p.epoch != mesh.epoch {
-        return; // stale: the slots it reserved no longer exist
-    }
-    let c = &p.changes;
-    match which {
-        Reserved::Removed => {
-            mesh.release_vertices(&c.vertices_removed);
-            mesh.release_triangles(&c.triangles_removed);
-        }
-        Reserved::Added => {
-            mesh.release_vertices(&c.vertices_added);
-            mesh.release_triangles(&c.triangles_added);
-        }
-    }
 }
 
 impl History {
@@ -88,7 +62,7 @@ impl History {
         }
         for p in self.redo.drain(..) {
             self.bytes -= p.byte_size();
-            release(mesh, &p, Reserved::Added);
+            p.release(mesh, PatchSide::Redoable);
         }
         self.bytes += patch.byte_size();
         self.undo.push_back(patch);
@@ -136,10 +110,10 @@ impl History {
     pub fn clear(&mut self, mesh: &mut Mesh) -> Result<()> {
         self.check_mesh(mesh)?;
         for p in self.undo.drain(..) {
-            release(mesh, &p, Reserved::Removed);
+            p.release(mesh, PatchSide::Undoable);
         }
         for p in self.redo.drain(..) {
-            release(mesh, &p, Reserved::Added);
+            p.release(mesh, PatchSide::Redoable);
         }
         self.bytes = 0;
         Ok(())
@@ -170,7 +144,7 @@ impl History {
                 break;
             };
             self.bytes -= p.byte_size();
-            release(mesh, &p, Reserved::Removed);
+            p.release(mesh, PatchSide::Undoable);
         }
     }
 

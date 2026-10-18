@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2a2beb6de42d2b8319714fa851efb3cb96b18e43c3b12e8506961966e38e071c # shrinks to count = 2, builds = [BuildOptions { quality: Sah, max_leaf_size: 1, sah_bins: 16, treelet_size: 4096 }, BuildOptions { quality: Sah, max_leaf_size: 1, sah_bins: 16, treelet_size: 4096 }, BuildOptions { quality: Sah, max_leaf_size: 1, sah_bins: 16, treelet_size: 4096 }], modes = [Eager, Lazy, Eager], starts = [(0, [0, 0, 0, 0], [0, 0, 0]), (0, [0, 0, 0, 0], [0, 0, 0]), (0, [0, 0, 0, 0], [0, 0, 0])], seed = 0, actions = [Edit(73, AddVertex(241861, 2932413665, 145)), Undo]

@@ -119,6 +119,58 @@ On the 22 near-miss poses at 1M (single cold runs), the pre-pass costs 0.17 to 0
 - `triangles_near` costs in proportion to contact: about 1.4 to 1.5 ms at 1M for a few hundred to 4,600 triangles per side, and about 11 ms at 10M for 350 to 48,000.
 - `intersecting_pairs` with B pushed 0.5 into A takes about 4.4 ms at 1M for 900 to 18,500 pairs.
 
+## Scene (fast-mesh-scene)
+
+Results for `cargo bench -p fast-mesh-scene`. The first group compares the scene's world queries with calling Phase 3 directly on the same meshes and BVHs; the second times `find_contacts`.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Date:** 2026-10-18
+- **Meshes:** `terrain(708)` (1,002,528 triangles) for the overhead group; `terrain(32)` (2,048 triangles) for `find_contacts`. Default options, Eager mode.
+- **Rays:** as in the query benchmarks (100,000 rays per iteration from `z = 20`, directions `(jx, jy, -1)` with jitter in ±0.2); the table divides the criterion median by the batch size.
+- **Poses:** a flipped copy of the terrain over the terrain, turned by 0.1° more at every step (64 poses) and lifted to just touch, as in the mesh-vs-mesh queries. The direct calls take the pose as a `Rigid`; the scene takes it as B's placement (A sits at the identity), which gives the same relative transform.
+
+### Overhead against direct calls (two 1M meshes)
+
+| | Direct (Phase 3) | Scene | Overhead |
+| --- | --- | --- | --- |
+| `raycast`, per ray (scene of 1 mesh at the identity) | 1.46 µs | 1.76 µs | +0.30 µs (+20%) |
+| `raycast`, per ray (scene of 2 meshes, B flipped above A) | | 1.90 µs | |
+| `mesh_distance`, one fixed pose | 213 µs | 227 µs | +14 µs (+7%) |
+| `mesh_distance`, all 64 poses per iteration (per query) | 83.98 ms (1.312 ms) | | |
+| `set_placement` + `mesh_distance`, all 64 poses per iteration (per query) | | 84.52 ms (1.321 ms) | +0.6% |
+| `set_placement` alone (per call) | | 0.15 µs | |
+
+The two 64-pose benchmarks run all 64 poses in each iteration, so every sample costs the same and the pair is a clean comparison. The raycast rows are from the first run (direct 143 to 153 ms per batch of 100,000, scene of 1 mesh 169 to 182 ms); the pair rows were re-run later on the same day, when the machine was faster: an earlier run of the fixed-pose pair measured 246 µs direct and 249 µs scene, so the one-pose overhead lies between +1% and +7%.
+
+- **`set_placement` meets the target, and `mesh_distance` meets it over the poses.** The spec's target (§13) is below 5% overhead, and it is not a merge gate. A pair query costs the scene one relative transform per call and a placement change touches no BVH. The fixed-pose rows differ by 1% to 7% between runs and the 64-pose pair by 0.6%.
+- **`raycast` does not meet it on a 1 µs query.** The scene adds about 0.3 µs per ray. Its work per ray is fixed (normalising the direction, mapping the ray into each mesh's local space in `f64`, the padded world-box test, a small ordering vector, and mapping the hit back), so it shows on a query this short; it was not profiled further. A second mesh adds about 0.14 µs.
+
+### `find_contacts`
+
+Meshes of 2,048 triangles in a row, each moved 30 units along x, so every mesh overlaps its neighbours and nothing else (side 32). Margin 0.5, no filter.
+
+| Meshes | Pairs tested | Contacts | Triangles listed (A + B) | `find_contacts` |
+| --- | --- | --- | --- | --- |
+| 2 | 1 | 1 | 29 + 29 | 51.9 µs |
+| 8 | 28 | 7 | 203 + 203 | 517 µs |
+| 32 | 496 | 31 | 899 + 899 | 2.27 ms |
+
+The time follows the number of contacts (about 52 to 74 µs each) rather than the number of pairs tested by the broadphase, which grows much faster: 496 pairs at 32 meshes cost no more per contact than 1 pair at 2.
+
+A re-run on the same machine on the same day (when the 1M rows below were added) measured 47.3 µs, 332 µs and 1.50 ms for 2, 8 and 32 meshes, with the same contacts and triangle lists. `find_contacts` did not change between the runs, so the gap is how much the machine varies between runs. Compare rows only within one run.
+
+### `find_contacts` on two touching 1M meshes
+
+This is the owner's per-frame case: the two `terrain(708)` meshes of the overhead group, B flipped above A and lifted to just touch (the 64 poses above), with margin 0.05 and no filter. Measured on 2026-10-18, on a later run than the overhead table.
+
+| | Contacts | Triangles listed (A + B) | Time |
+| --- | --- | --- | --- |
+| `find_contacts`, the fixed pose (31) | 1 | 63 + 63 | 625 µs |
+| `set_placement` + `find_contacts`, all 64 poses per iteration (per pose) | 64 (1 per pose) | 12,201 + 12,201 (about 191 + 191 per pose) | 105.9 ms (1.65 ms) |
+
+Over the poses, a frame's `find_contacts` costs about 1.25 times a `mesh_distance` (1.32 ms per pose in the overhead table). It does more than `mesh_distance`: it finds every triangle pair within the margin, not only the closest one.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -150,4 +202,5 @@ cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
 cargo bench -p fast-mesh-query                        # the same for the query benchmarks (single-mesh and mesh-vs-mesh)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
+cargo bench -p fast-mesh-scene                        # scene overhead and find_contacts on two 1M meshes, and find_contacts over 2-32 small meshes
 ```

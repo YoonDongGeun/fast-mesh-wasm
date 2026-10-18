@@ -7,7 +7,9 @@ use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 pub struct ChangeSet {
     pub vertices_added: Vec<VertexId>,
     pub vertices_removed: Vec<VertexId>,
-    /// Existing vertices whose position changed.
+    /// Existing vertices whose position changed. In a set produced by
+    /// [`ChangeSet::merge`], such a vertex may also have changed values in any
+    /// channel, so treat it as dirty for all channels.
     pub vertices_moved: Vec<VertexId>,
     pub triangles_added: Vec<TriangleId>,
     pub triangles_removed: Vec<TriangleId>,
@@ -33,11 +35,155 @@ impl ChangeSet {
             && self.channels.iter().all(|(_, v)| v.is_empty())
     }
 
+    /// Folds `later`, the change set of an edit (or undo or redo) made after `self`,
+    /// into `self`, so that `self` describes the net effect of both. Per slot:
+    ///
+    /// - added, then removed: reported as neither;
+    /// - removed, then added again (slot reuse): reported as moved (vertex) or changed
+    ///   (triangle), because the slot was alive before and is alive after;
+    /// - moved and changed are unions, minus slots that end up added or removed;
+    /// - channel lists are unioned per channel name, minus vertices that end up added
+    ///   or removed. A reused (removed, then added) vertex is added to every channel
+    ///   list named in either input, because its slot got brand-new contents. Names
+    ///   are kept even when their list ends up empty.
+    ///
+    /// A slot that was written and then restored to its original value stays in the
+    /// moved, changed and channel lists; the lists are supersets of the real
+    /// differences. All lists stay sorted, duplicate-free and disjoint.
+    ///
+    /// In a merged set, a vertex in `vertices_moved` may have changed values in any
+    /// channel (a reused slot may differ in channels no input named), so consumers
+    /// must treat it as dirty for all channels.
+    ///
+    /// Both sets must satisfy the `ChangeSet` invariants: every list sorted and
+    /// duplicate-free, added, removed and moved/changed disjoint, and channel lists
+    /// free of added and removed vertices. Sets returned by this crate do.
+    pub fn merge(&mut self, later: &ChangeSet) {
+        for cs in [&*self, later] {
+            let strictly_sorted = |l: &Vec<u32>| l.windows(2).all(|w| w[0] < w[1]);
+            debug_assert!(
+                strictly_sorted(&cs.vertices_added)
+                    && strictly_sorted(&cs.vertices_removed)
+                    && strictly_sorted(&cs.vertices_moved)
+                    && strictly_sorted(&cs.triangles_added)
+                    && strictly_sorted(&cs.triangles_removed)
+                    && strictly_sorted(&cs.triangles_changed)
+                    && cs.channels.iter().all(|(_, v)| strictly_sorted(v)),
+                "change set lists must be sorted and duplicate-free"
+            );
+        }
+        let (vertices_added, vertices_removed, reborn_v) = merge_slots(
+            &self.vertices_added,
+            &self.vertices_removed,
+            &later.vertices_added,
+            &later.vertices_removed,
+        );
+        let (triangles_added, triangles_removed, reborn_t) = merge_slots(
+            &self.triangles_added,
+            &self.triangles_removed,
+            &later.triangles_added,
+            &later.triangles_removed,
+        );
+        let ended = union(&vertices_added, &vertices_removed);
+        let moved = union(
+            &union(&self.vertices_moved, &later.vertices_moved),
+            &reborn_v,
+        );
+        self.vertices_moved = difference(&moved, &ended);
+        let ended_t = union(&triangles_added, &triangles_removed);
+        let changed = union(
+            &union(&self.triangles_changed, &later.triangles_changed),
+            &reborn_t,
+        );
+        self.triangles_changed = difference(&changed, &ended_t);
+
+        for (name, ids) in &later.channels {
+            match self.channels.iter_mut().find(|(n, _)| n == name) {
+                Some((_, mine)) => *mine = union(mine, ids),
+                None => self.channels.push((name.clone(), ids.clone())),
+            }
+        }
+        for (_, ids) in &mut self.channels {
+            *ids = difference(ids, &ended);
+        }
+        for (_, ids) in &mut self.channels {
+            *ids = union(ids, &reborn_v);
+        }
+
+        self.vertices_added = vertices_added;
+        self.vertices_removed = vertices_removed;
+        self.triangles_added = triangles_added;
+        self.triangles_removed = triangles_removed;
+    }
+
     fn inverted(mut self) -> Self {
         std::mem::swap(&mut self.vertices_added, &mut self.vertices_removed);
         std::mem::swap(&mut self.triangles_added, &mut self.triangles_removed);
         self
     }
+}
+
+/// Sorted union of two sorted, duplicate-free lists.
+fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+/// Elements of `a` that are not in `b` (both sorted, duplicate-free).
+fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut j = 0;
+    a.iter()
+        .copied()
+        .filter(|&x| {
+            while j < b.len() && b[j] < x {
+                j += 1;
+            }
+            !(j < b.len() && b[j] == x)
+        })
+        .collect()
+}
+
+/// Net added and removed slots of two consecutive change sets, plus the slots that
+/// were removed and then added again.
+fn merge_slots(
+    add1: &[u32],
+    rem1: &[u32],
+    add2: &[u32],
+    rem2: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let added = union(&difference(add1, rem2), &difference(add2, rem1));
+    let removed = union(&difference(rem1, add2), &difference(rem2, add1));
+    let reborn = difference(rem1, &difference(rem1, add2));
+    (added, removed, reborn)
+}
+
+/// Which slots of a [`Patch`] to release, see [`Patch::release`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchSide {
+    /// The patch sits on an undo stack: release the slots it removed.
+    Undoable,
+    /// The patch was undone and sits on a redo stack: release the slots it created.
+    Redoable,
 }
 
 /// The recorded effect of one committed transaction. Re-apply it with
@@ -204,6 +350,32 @@ impl Patch {
         Ok(self.changes.clone().inverted())
     }
 
+    /// Returns the slots this patch reserves to the mesh's free lists, for a patch
+    /// that is dropped without being undone or redone again: the removed slots for
+    /// [`PatchSide::Undoable`], the created slots for [`PatchSide::Redoable`].
+    /// Does nothing when the patch is stale (another mesh, or the mesh was compacted),
+    /// because its slots no longer exist.
+    ///
+    /// Call it at most once per patch, and only when the patch is discarded from a
+    /// history. Calling it twice, or while a history still holds the patch, corrupts
+    /// slot reuse.
+    pub fn release(&self, mesh: &mut Mesh, side: PatchSide) {
+        if self.mesh_uid != mesh.uid || self.epoch != mesh.epoch {
+            return;
+        }
+        let c = &self.changes;
+        match side {
+            PatchSide::Undoable => {
+                mesh.release_vertices(&c.vertices_removed);
+                mesh.release_triangles(&c.triangles_removed);
+            }
+            PatchSide::Redoable => {
+                mesh.release_vertices(&c.vertices_added);
+                mesh.release_triangles(&c.triangles_added);
+            }
+        }
+    }
+
     /// Length channel `c` needs after [`Patch::apply`]: every vertex slot, and
     /// everything this patch writes to it.
     fn channel_len(&self, c: &Channel, vertex_slots: usize) -> usize {
@@ -232,7 +404,7 @@ impl Patch {
 #[cfg(test)]
 mod tests {
     use crate::column::fail_allocations_after;
-    use crate::{ChannelDesc, Mesh, StoreError};
+    use crate::{ChangeSet, ChannelDesc, Mesh, PatchSide, StoreError};
 
     fn quad() -> Mesh {
         Mesh::from_buffers(
@@ -240,6 +412,66 @@ mod tests {
             &[0, 1, 2, 0, 2, 3],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn release_matches_history_eviction() {
+        let mut m = quad();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let removal = tx.commit().unwrap();
+        assert!(m.free_vertex_slots().is_empty(), "reserved by the patch");
+        // The wrong side releases nothing.
+        removal.release(&mut m, PatchSide::Redoable);
+        assert!(m.free_vertex_slots().is_empty());
+        removal.release(&mut m, PatchSide::Undoable);
+        assert_eq!(m.free_vertex_slots(), &[3]);
+        assert_eq!(m.free_triangle_slots(), &[1]);
+
+        let mut tx = m.begin_edit();
+        tx.add_vertices(&[[0.; 3]]).unwrap();
+        let creation = tx.commit().unwrap();
+        creation.revert(&mut m).unwrap();
+        assert!(m.free_vertex_slots().is_empty(), "reserved for redo");
+        creation.release(&mut m, PatchSide::Redoable);
+        assert_eq!(m.free_vertex_slots(), &[3]);
+    }
+
+    #[test]
+    fn merge_applies_net_effect_rules() {
+        let mut a = ChangeSet {
+            vertices_added: vec![5],
+            vertices_removed: vec![2],
+            vertices_moved: vec![1, 3],
+            triangles_added: vec![4],
+            triangles_removed: vec![0],
+            triangles_changed: vec![1],
+            channels: vec![("c".into(), vec![1, 3])],
+        };
+        let b = ChangeSet {
+            vertices_added: vec![2],
+            vertices_removed: vec![3, 5],
+            vertices_moved: vec![1],
+            triangles_added: vec![0],
+            triangles_removed: vec![4],
+            triangles_changed: vec![],
+            channels: vec![("c".into(), vec![0]), ("d".into(), vec![1])],
+        };
+        a.merge(&b);
+        assert_eq!(a.vertices_added, Vec::<u32>::new());
+        assert_eq!(a.vertices_removed, vec![3]);
+        assert_eq!(a.vertices_moved, vec![1, 2]);
+        assert_eq!(a.triangles_added, Vec::<u32>::new());
+        assert_eq!(a.triangles_removed, Vec::<u32>::new());
+        assert_eq!(a.triangles_changed, vec![0, 1]);
+        assert_eq!(
+            a.channels,
+            vec![
+                ("c".to_string(), vec![0, 1, 2]),
+                ("d".to_string(), vec![1, 2])
+            ]
+        );
     }
 
     /// Lengths of every column that must stay aligned with the slot counts.

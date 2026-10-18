@@ -1,7 +1,7 @@
 //! Property tests: random edit sequences must keep the store consistent, and
 //! undo/redo/rollback must restore earlier states exactly.
 
-use fast_mesh_store::{ChannelDesc, History, Mesh, TopologyPolicy, Transaction};
+use fast_mesh_store::{ChangeSet, ChannelDesc, History, Mesh, TopologyPolicy, Transaction};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -327,6 +327,141 @@ proptest! {
             }
             check_invariants(&m);
             check_incidence(&m);
+        }
+    }
+
+    #[test]
+    fn merge_matches_replay(
+        steps in prop::collection::vec(step(), 1..30),
+        // A small budget evicts old patches, which frees removed slots for reuse.
+        budget in prop_oneof![Just(usize::MAX), 200usize..2000],
+    ) {
+        let mut m = grid(8);
+        let mut h = History::new(budget);
+        let first = state(&m);
+        let mut merged = ChangeSet::default();
+        // Vertex slots that were removed at some point. If alive again at the end, a
+        // slot may hold brand-new channel values; the documented rule is that it is
+        // then in `vertices_moved` (dirty for all channels).
+        let mut reused = std::collections::BTreeSet::new();
+        for step in &steps {
+            let changes = match step {
+                Step::Commit(ops) => {
+                    let mut tx = m.begin_edit();
+                    for op in ops {
+                        run(&mut tx, op);
+                    }
+                    let patch = tx.commit().unwrap();
+                    let c = patch.changes().clone();
+                    h.push(&mut m, patch).unwrap();
+                    Some(c)
+                }
+                Step::Rollback(_) => None,
+                Step::Undo => h.undo(&mut m).unwrap(),
+                Step::Redo => h.redo(&mut m).unwrap(),
+            };
+            if let Some(c) = changes {
+                reused.extend(c.vertices_removed.iter().copied());
+                let reborn: Vec<u32> = merged
+                    .vertices_removed
+                    .iter()
+                    .copied()
+                    .filter(|v| c.vertices_added.contains(v))
+                    .collect();
+                merged.merge(&c);
+                // Re-added vertices join every channel list named so far.
+                for v in &reborn {
+                    prop_assert!(merged.vertices_moved.contains(v), "reborn {v} moved");
+                    for (name, ids) in &merged.channels {
+                        prop_assert!(ids.contains(v), "reborn {v} in channel {name}");
+                    }
+                }
+            }
+        }
+        let last = state(&m);
+
+        let sorted_unique = |l: &[u32]| l.windows(2).all(|w| w[0] < w[1]);
+        let disjoint = |a: &[u32], b: &[u32]| a.iter().all(|x| !b.contains(x));
+        prop_assert!(sorted_unique(&merged.vertices_added));
+        prop_assert!(sorted_unique(&merged.vertices_removed));
+        prop_assert!(sorted_unique(&merged.vertices_moved));
+        prop_assert!(sorted_unique(&merged.triangles_added));
+        prop_assert!(sorted_unique(&merged.triangles_removed));
+        prop_assert!(sorted_unique(&merged.triangles_changed));
+        prop_assert!(disjoint(&merged.vertices_added, &merged.vertices_removed));
+        prop_assert!(disjoint(&merged.vertices_added, &merged.vertices_moved));
+        prop_assert!(disjoint(&merged.vertices_removed, &merged.vertices_moved));
+        prop_assert!(disjoint(&merged.triangles_added, &merged.triangles_removed));
+        prop_assert!(disjoint(&merged.triangles_added, &merged.triangles_changed));
+        prop_assert!(disjoint(&merged.triangles_removed, &merged.triangles_changed));
+        for (_, ids) in &merged.channels {
+            prop_assert!(sorted_unique(ids));
+            prop_assert!(disjoint(ids, &merged.vertices_added));
+            prop_assert!(disjoint(ids, &merged.vertices_removed));
+        }
+
+        // Brute-force classification of every vertex slot.
+        let slots = m.vertex_slots() as u32;
+        let find_v = |s: &State, v: u32| s.vertices.iter().find(|e| e.0 == v).cloned();
+        let (mut added, mut removed, mut differs, mut mask_differs) =
+            (vec![], vec![], vec![], vec![]);
+        for v in 0..slots {
+            match (find_v(&first, v), find_v(&last, v)) {
+                (None, Some(_)) => added.push(v),
+                (Some(_), None) => removed.push(v),
+                (Some(a), Some(b)) => {
+                    if a.1 != b.1 {
+                        differs.push(v);
+                    }
+                    if a.2 != b.2 {
+                        mask_differs.push(v);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        prop_assert_eq!(&merged.vertices_added, &added);
+        prop_assert_eq!(&merged.vertices_removed, &removed);
+        for v in &differs {
+            prop_assert!(merged.vertices_moved.contains(v), "vertex {v} moved");
+        }
+        for v in &merged.vertices_moved {
+            prop_assert!(find_v(&first, *v).is_some() && find_v(&last, *v).is_some());
+        }
+        let written: Vec<u32> = merged
+            .channels
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        for v in &mask_differs {
+            prop_assert!(
+                written.contains(v)
+                    || (reused.contains(v) && merged.vertices_moved.contains(v)),
+                "vertex {v} channel written"
+            );
+        }
+        for v in &written {
+            prop_assert!(find_v(&first, *v).is_some() && find_v(&last, *v).is_some());
+        }
+
+        // Triangles.
+        let find_t = |s: &State, t: u32| s.triangles.iter().find(|e| e.0 == t).cloned();
+        let (mut added, mut removed, mut differs) = (vec![], vec![], vec![]);
+        for t in 0..m.triangle_slots() as u32 {
+            match (find_t(&first, t), find_t(&last, t)) {
+                (None, Some(_)) => added.push(t),
+                (Some(_), None) => removed.push(t),
+                (Some(a), Some(b)) if a.1 != b.1 => differs.push(t),
+                _ => {}
+            }
+        }
+        prop_assert_eq!(&merged.triangles_added, &added);
+        prop_assert_eq!(&merged.triangles_removed, &removed);
+        for t in &differs {
+            prop_assert!(merged.triangles_changed.contains(t), "triangle {t} changed");
+        }
+        for t in &merged.triangles_changed {
+            prop_assert!(find_t(&first, *t).is_some() && find_t(&last, *t).is_some());
         }
     }
 
