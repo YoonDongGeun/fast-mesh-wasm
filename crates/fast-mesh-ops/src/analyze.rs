@@ -162,10 +162,6 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
 
     let mut degenerate = 0;
     let mut degenerate_list = Vec::new();
-    // Each alive triangle's sorted vertex ids, then its id: sorting brings
-    // each set together, smallest id first.
-    let mut sets: Vec<([VertexId; 3], TriangleId)> = Vec::new();
-    reserve(&mut sets, mesh.triangle_count())?;
     for t in 0..mesh.triangle_slots() as TriangleId {
         let Some(tri) = mesh.triangle(t) else {
             continue;
@@ -176,18 +172,8 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
                 push(&mut degenerate_list, t)?;
             }
         }
-        let mut key = tri;
-        key.sort_unstable();
-        push(&mut sets, (key, t))?;
     }
-    sets.sort_unstable();
-    let mut duplicate_list: Vec<TriangleId> = Vec::new();
-    for w in sets.windows(2) {
-        if w[0].0 == w[1].0 {
-            push(&mut duplicate_list, w[1].1)?;
-        }
-    }
-    duplicate_list.sort_unstable();
+    let mut duplicate_list = duplicate_triangles(mesh)?;
     let duplicate = duplicate_list.len();
     duplicate_list.truncate(max);
 
@@ -216,6 +202,30 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
         orientation_conflicts,
         self_intersects,
     })
+}
+
+/// The alive triangles that repeat the vertex set of a triangle with a smaller
+/// id, ascending.
+pub(crate) fn duplicate_triangles(mesh: &Mesh) -> Result<Vec<TriangleId>> {
+    // Each alive triangle's sorted vertex ids, then its id: sorting brings
+    // each set together, smallest id first.
+    let mut sets: Vec<([VertexId; 3], TriangleId)> = Vec::new();
+    reserve(&mut sets, mesh.triangle_count())?;
+    for t in 0..mesh.triangle_slots() as TriangleId {
+        if let Some(mut key) = mesh.triangle(t) {
+            key.sort_unstable();
+            push(&mut sets, (key, t))?;
+        }
+    }
+    sets.sort_unstable();
+    let mut out = Vec::new();
+    for w in sets.windows(2) {
+        if w[0].0 == w[1].0 {
+            push(&mut out, w[1].1)?;
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// Whether triangle `t` runs along its edge `a`-`b` from `a` to `b`.

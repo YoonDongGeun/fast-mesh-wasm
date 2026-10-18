@@ -4,12 +4,12 @@
 //! order: rewired triangles, removed triangles, removed vertices. A second run
 //! on the result finds nothing to do and writes nothing.
 
-use fast_mesh_store::{Transaction, TriangleId, VertexId};
+use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
-use crate::analyze::{AREA_EPSILON, is_degenerate};
+use crate::analyze::{AREA_EPSILON, duplicate_triangles, is_degenerate};
 use crate::topology::{EdgeMap, components};
 use crate::weld::weld_roots;
-use crate::{OpsError, Result, push, reserve};
+use crate::{OpsError, Result, filled, push, reserve};
 
 /// What [`weld()`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,8 +25,12 @@ pub struct WeldReport {
 /// Vertices are grouped through chains of pairs within the tolerance; each
 /// group keeps its smallest id at its original position. Triangles are
 /// rewritten to the kept ids, those that thereby get a repeated id are
-/// removed, and so are the vertices no triangle uses afterwards. Tolerance 0
-/// merges exact duplicates only. No vertex is created.
+/// removed, and so are all vertices no triangle uses afterwards, including
+/// ones that were unused before. Tolerance 0 merges exact duplicates only. No
+/// vertex is created.
+///
+/// Rewiring can make two triangles share a vertex set, or give an edge a
+/// third triangle; run [`remove_degenerate()`] afterwards to drop duplicates.
 ///
 /// # Errors
 /// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite;
@@ -39,9 +43,6 @@ pub fn weld(tx: &mut Transaction, tolerance: f32) -> Result<WeldReport> {
         if r as usize != v {
             report.merged_vertices += 1;
         }
-    }
-    if report.merged_vertices == 0 {
-        return Ok(report);
     }
     let repeats = |[a, b, c]: [VertexId; 3]| a == b || b == c || a == c;
     let (mut rewired, mut rewired_to, mut collapsed) = (Vec::new(), Vec::new(), Vec::new());
@@ -61,9 +62,10 @@ pub fn weld(tx: &mut Transaction, tolerance: f32) -> Result<WeldReport> {
         }
     }
     report.removed_triangles = collapsed.len();
+    let unused = unused_vertices(mesh, &collapsed, &rewired, &rewired_to)?;
     tx.set_triangles(&rewired, &rewired_to)?;
     tx.remove_triangles(&collapsed)?;
-    remove_unused(tx)?;
+    tx.remove_vertices(&unused)?;
     Ok(report)
 }
 
@@ -114,33 +116,27 @@ pub fn remove_degenerate(
     }
     let mesh = tx.mesh();
     let mut doomed: Vec<TriangleId> = Vec::new();
-    let mut sets: Vec<([VertexId; 3], TriangleId)> = Vec::new();
-    reserve(&mut sets, mesh.triangle_count())?;
     for t in 0..mesh.triangle_slots() as TriangleId {
-        let Some(tri) = mesh.triangle(t) else {
-            continue;
-        };
-        if is_degenerate(mesh, tri, options.area_epsilon) {
+        if mesh
+            .triangle(t)
+            .is_some_and(|tri| is_degenerate(mesh, tri, options.area_epsilon))
+        {
             push(&mut doomed, t)?;
         }
-        let mut key = tri;
-        key.sort_unstable();
-        push(&mut sets, (key, t))?;
     }
-    sets.sort_unstable();
-    for w in sets.windows(2) {
-        if w[0].0 == w[1].0 {
-            push(&mut doomed, w[1].1)?;
-        }
+    for t in duplicate_triangles(mesh)? {
+        push(&mut doomed, t)?;
     }
     doomed.sort_unstable();
     doomed.dedup();
-    tx.remove_triangles(&doomed)?;
-    let removed_vertices = if options.remove_unused_vertices {
-        remove_unused(tx)?
+    let unused = if options.remove_unused_vertices {
+        unused_vertices(mesh, &doomed, &[], &[])?
     } else {
-        0
+        Vec::new()
     };
+    tx.remove_triangles(&doomed)?;
+    tx.remove_vertices(&unused)?;
+    let removed_vertices = unused.len();
     Ok(DegenerateReport {
         removed_triangles: doomed.len(),
         removed_vertices,
@@ -234,8 +230,10 @@ pub fn remove_small_components(
         }
     }
     doomed.sort_unstable();
+    let unused = unused_vertices(mesh, &doomed, &[], &[])?;
     tx.remove_triangles(&doomed)?;
-    let removed_vertices = remove_unused(tx)?;
+    tx.remove_vertices(&unused)?;
+    let removed_vertices = unused.len();
     Ok(RemoveReport {
         removed_components,
         removed_triangles: doomed.len(),
@@ -243,22 +241,42 @@ pub fn remove_small_components(
     })
 }
 
-/// Removes every alive vertex that no triangle uses; returns how many.
-fn remove_unused(tx: &mut Transaction) -> Result<usize> {
-    let mesh = tx.mesh();
-    let mut unused: Vec<VertexId> = Vec::new();
+/// The alive vertices no triangle uses once the planned edits are applied:
+/// triangles `removed` (ascending) are gone, and `rewired[i]` (ascending) has
+/// the corners `rewired_to[i]`. Ascending.
+fn unused_vertices(
+    mesh: &Mesh,
+    removed: &[TriangleId],
+    rewired: &[TriangleId],
+    rewired_to: &[[VertexId; 3]],
+) -> Result<Vec<VertexId>> {
+    let mut used = filled(mesh.vertex_slots(), false)?;
+    for t in 0..mesh.triangle_slots() as TriangleId {
+        let Some(mut tri) = mesh.triangle(t) else {
+            continue;
+        };
+        if removed.binary_search(&t).is_ok() {
+            continue;
+        }
+        if let Ok(i) = rewired.binary_search(&t) {
+            tri = rewired_to[i];
+        }
+        for v in tri {
+            used[v as usize] = true;
+        }
+    }
+    let mut unused = Vec::new();
     for v in 0..mesh.vertex_slots() as VertexId {
-        if mesh.is_vertex_alive(v) && mesh.corner_count(v) == 0 {
+        if mesh.is_vertex_alive(v) && !used[v as usize] {
             push(&mut unused, v)?;
         }
     }
-    tx.remove_vertices(&unused)?;
-    Ok(unused.len())
+    Ok(unused)
 }
 
 #[cfg(test)]
 mod tests {
-    use fast_mesh_store::{History, Mesh};
+    use fast_mesh_store::{History, Mesh, StoreError};
 
     use super::*;
     use crate::analyze::{AnalyzeOptions, analyze};
@@ -506,17 +524,82 @@ mod tests {
     }
 
     #[test]
-    fn out_of_memory_is_reported_and_writes_nothing() {
+    fn weld_into_duplicates_then_remove_degenerate() {
+        // Triangles 0 and 1 differ only in vertex 0 vs its copy 4.
+        let positions = [
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0,
+        ];
+        let mut mesh = Mesh::from_buffers(&positions, &[0, 1, 2, 4, 1, 2]).unwrap();
+        let (r, _) = edit(&mut mesh, |tx| weld(tx, 0.0));
+        assert_eq!(r.merged_vertices, 1);
+        assert_eq!(mesh.triangle_count(), 2);
+        // The stray vertex 3 was unused before and goes too.
+        assert_eq!(mesh.vertex_count(), 3);
+        let (r, _) = edit(&mut mesh, |tx| {
+            remove_degenerate(tx, &DegenerateOptions::default())
+        });
+        assert_eq!(r.removed_triangles, 1);
+        assert!(mesh.is_triangle_alive(0) && !mesh.is_triangle_alive(1));
+    }
+
+    #[test]
+    fn weld_chains_near_points_and_keeps_the_smallest_in_place() {
+        // A, B, C in a row 0.7e-4 apart: |AC| = 1.4e-4 > 1e-4, one group.
+        let positions = [
+            0.0, 0.0, 0.0, 0.7e-4, 0.0, 0.0, 1.4e-4, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+        ];
+        let mut mesh = Mesh::from_buffers(&positions, &[0, 3, 4, 1, 3, 4, 2, 3, 4]).unwrap();
+        let kept = mesh.positions()[0];
+        let (r, _) = edit(&mut mesh, |tx| weld(tx, 1e-4));
+        assert_eq!(r.merged_vertices, 2);
+        assert_eq!(mesh.positions()[0], kept);
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.triangle(2), Some([0, 3, 4]));
+    }
+
+    #[test]
+    fn weld_removes_preexisting_unused_vertices() {
+        let positions = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 9.0, 9.0, 9.0];
+        let mut mesh = Mesh::from_buffers(&positions, &[0, 1, 2]).unwrap();
+        let (r, empty) = edit(&mut mesh, |tx| weld(tx, 0.0));
+        assert_eq!((r, empty), (WeldReport::default(), false));
+        assert_eq!(mesh.vertex_count(), 3);
+        let (_, empty) = edit(&mut mesh, |tx| weld(tx, 0.0));
+        assert!(empty);
+    }
+
+    /// Runs `op` with the `n`-th reservation failing, for every `n` until it
+    /// succeeds; each failure must leave the transaction without a single
+    /// write. Returns how many failure points there were.
+    fn sweep(mut op: impl FnMut(&mut Transaction) -> Result<()>) -> usize {
         let mut mesh = damaged_sphere();
         let before = parts(&mesh);
-        for n in 0..4 {
+        let mut n = 0;
+        loop {
             let mut tx = mesh.begin_edit();
             fail_allocations_after(Some(n));
-            let r = weld(&mut tx, 0.0);
+            let r = op(&mut tx);
             fail_allocations_after(None);
-            assert!(r.is_err());
-            assert!(tx.commit().unwrap().is_empty());
+            let patch = tx.commit().unwrap();
+            if r.is_ok() {
+                assert!(!patch.is_empty());
+                return n;
+            }
+            assert_eq!(r, Err(OpsError::Store(StoreError::OutOfMemory)));
+            assert!(patch.is_empty(), "write before failure point {n}");
+            assert_eq!(parts(&mesh), before);
+            n += 1;
         }
-        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn out_of_memory_is_reported_and_writes_nothing() {
+        let comp = ComponentOptions {
+            min_triangles: Some(10),
+            ..Default::default()
+        };
+        assert!(sweep(|tx| weld(tx, 0.0).map(drop)) > 5);
+        assert!(sweep(|tx| remove_degenerate(tx, &DegenerateOptions::default()).map(drop)) > 5);
+        assert!(sweep(|tx| remove_small_components(tx, &comp).map(drop)) > 5);
     }
 }
