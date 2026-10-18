@@ -1427,6 +1427,49 @@ mod tests {
         assert_valid(&scene, a);
     }
 
+    /// Undo can bring the mesh back to the revision a stale BVH was built
+    /// for: the BVH is current while `pending` is still `Some`. A later edit
+    /// and update must still leave a valid BVH that answers like a fresh one.
+    #[test]
+    fn manual_bvh_current_by_revision_with_pending_changes() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene
+            .add_mesh(grid(4), with_mode(UpdateMode::Manual))
+            .unwrap();
+        lift(&mut scene, m, 6, 1.0);
+        assert_eq!(scene.is_current(m), Ok(false));
+        scene.undo().unwrap();
+        assert_eq!(scene.is_current(m), Ok(true));
+        assert!(scene.entries.get(m).unwrap().pending.is_some());
+
+        lift(&mut scene, m, 7, 2.0);
+        assert_eq!(scene.is_current(m), Ok(false));
+        scene.update(m).unwrap();
+        assert_eq!(scene.is_current(m), Ok(true));
+        assert_valid(&scene, m);
+
+        let points = [[1.0, 1.0, 3.0], [2.5, 1.5, -1.0], [0.0, 4.0, 0.5]];
+        let e = scene.entries.get(m).unwrap();
+        let fresh = Bvh::build(&e.mesh, &BuildOptions::default()).unwrap();
+        let wants = points.map(|p| {
+            fast_mesh_query::closest_point(
+                &e.mesh,
+                &fresh,
+                p,
+                &fast_mesh_query::ClosestOptions::default(),
+            )
+            .unwrap()
+            .map(|h| (h.triangle, h.distance))
+        });
+        for (p, want) in points.into_iter().zip(wants) {
+            let got = scene
+                .closest_point_on(m, p.map(f64::from), &crate::SceneClosestOptions::default())
+                .unwrap()
+                .map(|h| (h.hit.triangle, h.hit.distance));
+            assert_eq!(got, want);
+        }
+    }
+
     #[test]
     fn undo_updates_bvhs_per_mode() {
         let mut scene = Scene::new(SceneOptions::default());

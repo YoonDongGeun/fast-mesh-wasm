@@ -225,36 +225,32 @@ fn bench_overhead(c: &mut Criterion, label: &str, n: u32) {
             black_box(two.mesh_distance(a, b, f64::INFINITY).unwrap());
         })
     });
-    // 64 poses.
-    let mut i = 0;
-    group.bench_function("mesh_distance direct, 64 poses", |bn| {
+    // All 64 poses in every iteration, so each sample costs the same; the
+    // times below are per iteration (64 queries).
+    group.throughput(Throughput::Elements(64));
+    group.bench_function("mesh_distance direct, all 64 poses", |bn| {
         bn.iter(|| {
-            i = (i + 1) % 64;
-            black_box(
-                mesh_distance(
-                    &mesh_a,
-                    &bvh_a,
-                    &mesh_b,
-                    &bvh_b,
-                    &touching[i],
-                    f32::INFINITY,
-                )
-                .unwrap(),
-            );
+            for xf in &touching {
+                black_box(
+                    mesh_distance(&mesh_a, &bvh_a, &mesh_b, &bvh_b, xf, f32::INFINITY).unwrap(),
+                );
+            }
         })
     });
     let placements: Vec<Placement> = touching.iter().map(placement).collect();
-    group.bench_function("set_placement + mesh_distance scene, 64 poses", |bn| {
+    group.bench_function("set_placement + mesh_distance scene, all 64 poses", |bn| {
         bn.iter(|| {
-            i = (i + 1) % 64;
-            two.set_placement(b, placements[i]).unwrap();
-            black_box(two.mesh_distance(a, b, f64::INFINITY).unwrap());
+            for p in &placements {
+                two.set_placement(b, *p).unwrap();
+                black_box(two.mesh_distance(a, b, f64::INFINITY).unwrap());
+            }
         })
     });
-    group.bench_function("set_placement alone", |bn| {
+    group.bench_function("set_placement alone, all 64 poses", |bn| {
         bn.iter(|| {
-            i = (i + 1) % 64;
-            two.set_placement(b, placements[i]).unwrap();
+            for p in &placements {
+                two.set_placement(b, *p).unwrap();
+            }
         })
     });
     group.finish();

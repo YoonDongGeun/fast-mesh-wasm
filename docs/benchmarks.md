@@ -136,27 +136,27 @@ Results for `cargo bench -p fast-mesh-scene`. The first group compares the scene
 | --- | --- | --- | --- |
 | `raycast`, per ray (scene of 1 mesh at the identity) | 1.46 µs | 1.76 µs | +0.30 µs (+20%) |
 | `raycast`, per ray (scene of 2 meshes, B flipped above A) | | 1.90 µs | |
-| `mesh_distance`, one fixed pose | 246 µs | 249 µs | +1% (within noise) |
-| `mesh_distance`, cycling 64 poses | 1.54 ms | | |
-| `set_placement` + `mesh_distance`, cycling 64 poses | | 1.47 ms | within noise |
-| `set_placement` alone | | 0.20 µs | |
+| `mesh_distance`, one fixed pose | 213 µs | 227 µs | +14 µs (+7%) |
+| `mesh_distance`, all 64 poses per iteration (per query) | 83.98 ms (1.312 ms) | | |
+| `set_placement` + `mesh_distance`, all 64 poses per iteration (per query) | | 84.52 ms (1.321 ms) | +0.6% |
+| `set_placement` alone (per call) | | 0.15 µs | |
 
-Criterion's confidence intervals: raycast direct 143 to 153 ms per batch, scene of 1 mesh 169 to 182 ms. The cycling benchmarks vary by about ±10% between runs because the poses differ in cost, so only the fixed-pose row is a clean comparison.
+The two 64-pose benchmarks run all 64 poses in each iteration, so every sample costs the same and the pair is a clean comparison. The raycast rows are from the first run (direct 143 to 153 ms per batch of 100,000, scene of 1 mesh 169 to 182 ms); the pair rows were re-run later on the same day, when the machine was faster: an earlier run of the fixed-pose pair measured 246 µs direct and 249 µs scene, so the one-pose overhead lies between +1% and +7%.
 
-- **`mesh_distance` and `set_placement` meet the target.** The spec's target (§13) is below 5% overhead, and it is not a merge gate. A pair query costs the scene one relative transform per call, and a placement change touches no BVH, so both disappear next to a query that takes hundreds of microseconds.
+- **`set_placement` meets the target, and `mesh_distance` meets it over the poses.** The spec's target (§13) is below 5% overhead, and it is not a merge gate. A pair query costs the scene one relative transform per call and a placement change touches no BVH. The fixed-pose rows differ by 1% to 7% between runs and the 64-pose pair by 0.6%.
 - **`raycast` does not meet it on a 1 µs query.** The scene adds about 0.3 µs per ray. Its work per ray is fixed (normalising the direction, mapping the ray into each mesh's local space in `f64`, the padded world-box test, a small ordering vector, and mapping the hit back), so it shows on a query this short; it was not profiled further. A second mesh adds about 0.14 µs.
 
 ### `find_contacts`
 
 Meshes of 2,048 triangles in a row, each moved 30 units along x, so every mesh overlaps its neighbours and nothing else (side 32). Margin 0.5, no filter.
 
-| Meshes | Pairs in the broadphase | Contacts | Triangles listed (A + B) | `find_contacts` |
+| Meshes | Pairs tested | Contacts | Triangles listed (A + B) | `find_contacts` |
 | --- | --- | --- | --- | --- |
 | 2 | 1 | 1 | 29 + 29 | 51.9 µs |
 | 8 | 28 | 7 | 203 + 203 | 517 µs |
 | 32 | 496 | 31 | 899 + 899 | 2.27 ms |
 
-The time follows the number of contacts (about 52 to 74 µs each) rather than the number of pairs, which grows much faster: 496 pairs at 32 meshes cost no more per contact than 1 pair at 2.
+The time follows the number of contacts (about 52 to 74 µs each) rather than the number of pairs tested by the broadphase, which grows much faster: 496 pairs at 32 meshes cost no more per contact than 1 pair at 2.
 
 ## How the defaults were chosen
 

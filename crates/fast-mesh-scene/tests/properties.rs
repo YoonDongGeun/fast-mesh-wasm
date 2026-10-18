@@ -851,6 +851,63 @@ fn check_queries(scene: &mut Scene, model: &mut Model, seed: u64) -> Result<(), 
     Ok(())
 }
 
+/// After every action: the Eager meshes' BVHs answer like fresh builds.
+/// Only queries that touch Eager meshes alone are used (`closest_point_on`,
+/// and `mesh_distance` between two Eager meshes), so no Lazy BVH is updated
+/// and the staleness the model tracks is left as it is.
+fn check_eager(scene: &mut Scene, model: &Model, seed: u64) -> Result<(), TestCaseError> {
+    let mut rng = Lcg(seed);
+    let eager: Vec<usize> = model
+        .live()
+        .into_iter()
+        .filter(|&i| model.meshes[i].mode == UpdateMode::Eager)
+        .collect();
+    let p = [
+        rng.range(-4.0, 12.0),
+        rng.range(-4.0, 12.0),
+        rng.range(-4.0, 6.0),
+    ];
+    let mut built = Vec::new();
+    for &i in &eager {
+        let id = model.meshes[i].id;
+        let mesh = scene.mesh(id).unwrap();
+        let bvh = Bvh::build(mesh, &BuildOptions::default()).unwrap();
+        let pl = model.meshes[i].placement;
+        let o = mesh.origin();
+        let lp = to_local(&pl, o, p).map(|c| c as f32);
+        let want = closest_point(mesh, &bvh, lp, &ClosestOptions::default())
+            .unwrap()
+            .map(|h| (h.triangle, h.distance, to_world(&pl, o, h.point)));
+        built.push((i, bvh));
+        let got = scene
+            .closest_point_on(id, p, &SceneClosestOptions::default())
+            .unwrap()
+            .map(|h| (h.hit.triangle, h.hit.distance, h.point));
+        prop_assert_eq!(got, want, "closest_point_on mesh {}", i);
+    }
+    for x in 0..built.len() {
+        for y in x + 1..built.len() {
+            let (ia, ib) = (built[x].0, built[y].0);
+            let (ida, idb) = (model.meshes[ia].id, model.meshes[ib].id);
+            let (ma, mb) = (scene.mesh(ida).unwrap(), scene.mesh(idb).unwrap());
+            let xf = relative(
+                (&model.meshes[ia].placement, ma.origin()),
+                (&model.meshes[ib].placement, mb.origin()),
+            );
+            let want = mesh_distance(ma, &built[x].1, mb, &built[y].1, &xf, f32::INFINITY).unwrap();
+            let got = scene.mesh_distance(ida, idb, f64::INFINITY).unwrap();
+            prop_assert_eq!(
+                got.map(|g| g.distance),
+                want.map(|w| f64::from(w.distance)),
+                "mesh_distance {} {}",
+                ia,
+                ib
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The test
 // ---------------------------------------------------------------------------
@@ -1054,8 +1111,8 @@ proptest! {
         actions in prop::collection::vec(action(), 1..25),
     ) {
         let mut scene = Scene::new(SceneOptions::default());
-        // Two meshes without an origin, the third (when present) far away
-        // from zero, so that it has one.
+        // The second mesh is built far from zero, so that it has an origin;
+        // the others have none.
         let specs: [(u32, [f64; 3]); 3] = [
             (3, [0.0; 3]),
             (4, [1000.5, -300.25, 40.0]),
@@ -1103,10 +1160,12 @@ proptest! {
         }
         check_state(&scene, &model)?;
         check_queries(&mut scene, &mut model, seed)?;
-        for a in &actions {
-            // `check_state` also asserts that an Eager BVH is current.
+        for (i, a) in actions.iter().enumerate() {
+            // `check_state` asserts that an Eager BVH is current, and
+            // `check_eager` that it answers like a fresh build.
             apply(&mut scene, &mut model, a)?;
             check_state(&scene, &model)?;
+            check_eager(&mut scene, &model, seed.wrapping_add(i as u64))?;
         }
         scene.flush().unwrap();
         for m in model.meshes.iter_mut().filter(|m| m.live) {
