@@ -68,6 +68,9 @@ jobs:
         with:
           name: package
           path: pack/*.tgz
+      # Needs the release build, so it runs before the test script replaces it.
+      - name: Run the Scene benchmarks (short run, release build)
+        run: pnpm --filter fast-mesh-wasm bench -- --quick
       # Last: the test script rebuilds the package with the `test-panic` feature,
       # which must not reach the packed tarball above.
       - name: Test the package (test build)
