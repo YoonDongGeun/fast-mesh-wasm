@@ -390,8 +390,10 @@ impl SignData {
     /// al. 2018, order 1: a BVH node whose centroid is more than `beta = 8`
     /// times its radius away from `p` contributes its dipole term, and nearer
     /// leaves sum their triangles' exact solid angles (Van Oosterom–Strackee).
-    /// It is within 1e-3 of the exact value on the test meshes at points
-    /// farther than 1% of the bounding-box diagonal from the surface. In
+    /// It is within 1e-3 of the exact value on the closed test meshes at
+    /// points farther than 1% of the bounding-box diagonal from the surface;
+    /// on a flat terrain the error is larger (about 1.2e-3, tested against
+    /// 2e-3), since the errors of a flat sheet add up. In
     /// [`SignMode::Pseudonormal`] no moments are stored and every triangle is
     /// summed exactly, which is slow on large meshes.
     ///

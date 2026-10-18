@@ -536,6 +536,8 @@ impl Scene {
     /// a clean report for every mesh, so it sees only what happens from now
     /// on, and drains its reports with [`Scene::take_changes_for`]. Every
     /// subscriber is told about the same changes, merged the same way.
+    /// A subscriber that never drains keeps accumulating reports (merged
+    /// change sets and removals) until it is drained or unsubscribed.
     pub fn subscribe(&mut self) -> SubscriberId {
         let id = SubscriberId(self.next_subscriber);
         self.next_subscriber += 1;

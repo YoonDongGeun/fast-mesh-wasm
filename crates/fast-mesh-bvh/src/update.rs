@@ -127,7 +127,8 @@ impl Bvh {
             Strategy::Refit
         } else {
             Strategy::Partial
-        }); // Leaves of moved triangles, gathered after the rebuilds (which move
+        });
+        // Leaves of moved triangles, gathered after the rebuilds (which move
         // triangles to new leaves); reserved now so the refit cannot fail.
         let mut leaves = Vec::new();
         try_reserve(&mut leaves, moved.len())?;
@@ -175,7 +176,9 @@ impl Bvh {
         {
             report.compacted = true;
         }
-        // Storage compaction above relies on this bump (a second one is harmless).
+        // The rebuilds and refits above changed the tree, so the generation
+        // moves on. `compact_storage` bumps it too when it ran (it renumbers
+        // the nodes); this second bump is harmless.
         self.generation = next_generation();
         self.revision = mesh.revision();
         Ok(report)
