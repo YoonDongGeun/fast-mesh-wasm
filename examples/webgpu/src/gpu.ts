@@ -57,6 +57,9 @@ export class Renderer {
   readonly #frameBindGroup: GPUBindGroup;
   readonly #meshes = new Map<MeshHandle, GpuMesh>();
   #depth: GPUTexture | undefined;
+  /** Reused every frame for the uniforms, so rendering allocates no arrays. */
+  readonly #frameScratch = new Float32Array(FRAME_BYTES / 4);
+  readonly #objectScratch = new Float32Array(OBJECT_BYTES / 4);
   #lineBuffer: GPUBuffer | undefined;
   #lineVertices = 0;
 
@@ -174,18 +177,19 @@ export class Renderer {
     }
     const views = scene.views(change.mesh);
     const positions = views.positions();
-    old.positions = this.#write(old.positions, VERTEX(), positions, change.positions, 3);
+    old.positions = this.#write(old.positions, VERTEX(), positions, change.positions, 3, positions.byteLength);
     const normals = views.normals();
     if (normals !== null) {
-      old.normals = this.#write(old.normals, VERTEX(), normals, change.normals, 3);
+      // Normals can be short (lazy meshes): the buffer stays as big as the positions.
+      old.normals = this.#write(old.normals, VERTEX(), normals, change.normals, 3, positions.byteLength);
     }
     const colors = views.colors();
     old.hasColors = colors !== null;
     if (colors !== null) {
-      old.colors = this.#write(old.colors, VERTEX(), colors, change.colors, 4);
+      old.colors = this.#write(old.colors, VERTEX(), colors, change.colors, 4, colors.byteLength);
     }
     const indices = views.indices();
-    old.indices = this.#write(old.indices, INDEX(), indices, change.indices, 3);
+    old.indices = this.#write(old.indices, INDEX(), indices, change.indices, 3, indices.byteLength);
     old.indexCount = indices.length;
   }
 
@@ -225,7 +229,8 @@ export class Renderer {
    */
   render(scene: Scene, frame: FrameParams, items: readonly DrawItem[]): void {
     const device = this.#device;
-    const f = new Float32Array(FRAME_BYTES / 4);
+    const f = this.#frameScratch;
+    f.fill(0);
     f.set(frame.viewProj, 0);
     f.set(frame.eye, 16);
     if (frame.clip !== null) {
@@ -242,11 +247,14 @@ export class Renderer {
         continue;
       }
       const matrix = scene.matrix4(item.mesh);
-      const u = new Float32Array(OBJECT_BYTES / 4);
+      const u = this.#objectScratch;
+      u.fill(0);
       u.set(matrix, 0); // f64 → f32
       u.set(item.baseColor, 16);
       u[19] = 1;
-      u.set([item.opacity, gpu.hasColors ? 1 : 0, item.picked ? 1 : 0], 20);
+      u[20] = item.opacity;
+      u[21] = gpu.hasColors ? 1 : 0;
+      u[22] = item.picked ? 1 : 0;
       device.queue.writeBuffer(gpu.uniform, 0, u);
       if (item.opacity >= 1) {
         opaque.push(item);
@@ -347,7 +355,9 @@ export class Renderer {
    * Writes a change's ranges of `view` into `buffer`. `itemSize` is elements
    * per slot (3 floats, 4 colour bytes, 3 indices), so a range `[start, count]`
    * starts at byte `start · itemSize · bytesPerElement`. `"all"` writes the
-   * whole view, recreating the buffer if its size no longer matches.
+   * whole view (at most `size` bytes), recreating the buffer if it is not
+   * `size` bytes. `size` is fixed by the caller, not taken from the view, so a
+   * short view never shrinks the buffer below the vertex count.
    */
   #write(
     buffer: GPUBuffer,
@@ -355,14 +365,16 @@ export class Renderer {
     view: Float32Array | Uint8Array | Uint32Array,
     ranges: Range[] | "all",
     itemSize: number,
+    size: number,
   ): GPUBuffer {
     if (ranges === "all") {
-      if (buffer.size !== Math.max(4, view.byteLength)) {
+      if (buffer.size !== Math.max(4, Math.ceil(size / 4) * 4)) {
         buffer.destroy();
-        return this.#upload(usage, view.byteLength, view);
+        return this.#upload(usage, size, view);
       }
-      if (view.byteLength > 0) {
-        this.#device.queue.writeBuffer(buffer, 0, view.subarray());
+      const bytes = Math.min(view.byteLength, size);
+      if (bytes > 0) {
+        this.#device.queue.writeBuffer(buffer, 0, view.subarray(0, bytes / view.BYTES_PER_ELEMENT));
       }
       return buffer;
     }

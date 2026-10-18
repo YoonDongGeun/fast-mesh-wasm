@@ -55,12 +55,55 @@ geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 
 ### three.js adapter
 
-`fast-mesh-wasm/three` binds `Scene` meshes to `THREE.Mesh` objects that follow the scene on every `scene.commitFrame()` (see `bindMesh`). It needs `three` (an optional peer dependency, `>=0.160`) and, for TypeScript, `@types/three`:
+`fast-mesh-wasm/three` binds `Scene` meshes to `THREE.Mesh` objects that follow the scene on every `scene.commitFrame()`. It needs `three` (an optional peer dependency, `>=0.160`) and, for TypeScript, `@types/three`:
 
 ```sh
 npm install three
 npm install -D @types/three
 ```
+
+```ts
+import * as THREE from "three";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { Scene } from "fast-mesh-wasm";
+import { attachTransformControls, bindMesh, bindSection } from "fast-mesh-wasm/three";
+
+const scene = new Scene();
+const a = scene.addMesh(positionsA, indicesA);
+const b = scene.addMesh(positionsB, indicesB);
+
+const threeScene = new THREE.Scene();
+const renderer = new THREE.WebGLRenderer();
+renderer.localClippingEnabled = true; // needed for bindSection's clipping plane
+
+const boundA = bindMesh(scene, a); // a THREE.Mesh in boundA.object
+const boundB = bindMesh(scene, b, { color: 0x88aaff, opacity: 0.6 });
+threeScene.add(boundA.object, boundB.object);
+
+// Drag B with a TransformControls gizmo: one gesture is one scene drag and one undo step.
+const controls = new TransformControls(camera, renderer.domElement);
+controls.attach(boundB.object);
+threeScene.add(controls.getHelper());
+attachTransformControls(controls, scene, boundB);
+
+// A section: contours and fill, and the bound meshes are clipped at its plane.
+const section = scene.addSection({ meshes: [a, b], plane: { origin: [0, 0, 0], normal: [0, 0, 1] } });
+const boundSection = bindSection(scene, section, [boundA, boundB]);
+threeScene.add(boundSection.group);
+
+function frame() {
+  scene.commitFrame(); // once per animation frame, before rendering: the adapters apply the changes here
+  renderer.render(threeScene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+```
+
+- Colouring (`scene.setColoring`) shows up as a vertex-colour attribute with no code in the app. Undo and redo move the objects through the same change stream.
+- A material you pass to `bindMesh` is used as given and must not be shared between bound meshes (the adapter controls its `color`, `vertexColors`, `opacity`, `transparent` and `depthWrite`).
+- The adapter only reads `scene.onChanges`; it never calls `takeChanges`.
+
+A renderer-neutral version of the same loop, with raw WebGPU and no 3D library, is in [`examples/webgpu`](examples/webgpu).
 
 ## Scene API
 

@@ -262,7 +262,7 @@ function run(renderer: Renderer): void {
     note = "";
     if (ctrl && key === "z") {
       e.preventDefault();
-      // An active drag is ended first, then undone.
+      // The scene ends an active drag itself before it undoes or redoes.
       if (e.shiftKey) {
         scene.redo();
       } else {

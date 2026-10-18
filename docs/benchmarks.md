@@ -334,6 +334,19 @@ Six `terrain(123)` tiles in a 3 by 2 grid, a distance field from every mesh to e
 
 Run 2: 1.01 ms (2.18 ms) and 112 ms (181 ms). In the contact case the whole frame uses about 6% of a 60 fps frame's 16.7 ms at the median. The wide case recomputes nearly every vertex of the moved tile and its neighbours on each move, and is not a frame-rate workload.
 
+### The three.js adapter: the same drag with `bindMesh` on both meshes
+
+`bindMesh` is attached to both 1M meshes (A, coloured, and the dragged B) and the benchmark calls `drag.move(pose)` then `scene.commitFrame()`; the adapters' listeners copy the dirty ranges into the `BufferAttribute` mirrors and set the update ranges inside `commitFrame()`. It runs in Node with `three` and no GL context, so the GPU upload is not measured. Scene, poses and `maxDistance` are those of the table above (`pnpm --filter fast-mesh-wasm bench -- --adapter` runs just this case). 3 cycles of 64 poses after a warm-up cycle, run twice; another branch's work may have shared the CPU.
+
+| Per frame | 1M, contact | 1M, wide |
+| --- | --- | --- |
+| Total, median (p95) | 1.85 ms (4.6 ms) | 417 ms (1,115 ms) |
+| `drag.move` | 1.81 ms | 416 ms |
+| `commitFrame()` with both adapters applying | 0.03 ms (p95 0.10) | 0.10 ms (p95 0.17) |
+| `bindMesh` x2 + first `commitFrame()` (builds both geometries) | 91 ms | 64 ms |
+
+The other run measured 2.01 ms and 420 ms in total, with the same 0.03 and 0.10 ms for `commitFrame()`. The adapter adds about as much as the plain mirror copy of the core table (0.02 to 0.12 ms): the cost of a frame is the engine's work in `drag.move`. The adapter's bounding-box walk runs only when positions or indices change, so it does not appear in a placement-only drag. A GPU upload of the same ranges (three's `writeBuffer` of the update ranges) comes on top and was not measured.
+
 ### Size of the wasm binary
 
 `dist/wasm/fast_mesh_wasm_bg.wasm` after `wasm-opt -O3`, gzip measured with `gzip -9`:

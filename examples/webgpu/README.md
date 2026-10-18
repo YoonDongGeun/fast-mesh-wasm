@@ -10,11 +10,12 @@ the renderer only mirrors its buffers onto the GPU.
 Once per animation frame (see `src/main.ts` and `Renderer.applyChange` in `src/gpu.ts`):
 
 ```ts
+// `ranges(...)` below is pseudocode: iterate [start, count] pairs, or the whole view for "all".
 for (const change of scene.commitFrame()) {
   if (change.removed) { destroyBuffers(change.mesh); continue; }
-  if (change.added || change.capacityChanged) { recreateBuffers(change.mesh); continue; } // every buffer is "all"
-  const v = scene.views(change.mesh);            // 1. read the views, fresh, this frame
-  for (const [start, count] of ranges(change.positions)) // 2. upload only the dirty ranges ("all": the whole view)
+  if (change.added || change.capacityChanged) { recreateBuffers(change.mesh); continue; } // 1. every buffer is "all"
+  const v = scene.views(change.mesh);            // 2. read the views, fresh, this frame
+  for (const [start, count] of ranges(change.positions)) // 3. upload only the dirty ranges ("all": the whole view)
     queue.writeBuffer(posBuf, start * 12, v.positions().subarray(3 * start, 3 * (start + count)));
   // normals: same as positions; colours: 4 bytes per vertex (start * 4); indices: 3 u32 per triangle
 }
@@ -26,7 +27,7 @@ for (const mesh of meshes) {
 
 - Views are only valid until the next scene call: get them inside the frame handler and never keep them.
 - Call `.subarray()` before `writeBuffer` (with `new Scene({ debug: true })` views are Proxies).
-- `"all"` means upload the whole buffer; on `capacityChanged` (3.) the slot counts changed, so recreate the buffers.
+- `"all"` means upload the whole buffer; on `capacityChanged` (1.) the slot counts changed, so recreate the buffers.
 - The index buffer is `Uint32` with removed triangles as `(0, 0, 0)`: draw `indices().length` indices; dead slots are degenerate.
 - `colors()` is `null` while colouring is off. This example always allocates a 4-byte-per-vertex colour buffer
   (so one pipeline fits every mesh) and a uniform flag picks the vertex colour or the object's base colour.
@@ -47,6 +48,7 @@ Needs a browser with WebGPU (recent Chrome, Edge or Safari). Without it the page
 
 - Click: pick a mesh. Drag it: move it in a camera-facing plane. Shift+drag: rotate it (arcball).
 - Drag empty space: orbit. Wheel: zoom.
+- Picking ignores the section clip: a click can hit the clipped-away half.
 - Ctrl+Z: undo. Ctrl+Y or Ctrl+Shift+Z: redo.
 - C: distance colouring of the picked mesh against its nearest other mesh (turbo map, `maxDistance` = 10% of
   the scene diagonal; farther vertices stay grey). C again turns it off.
