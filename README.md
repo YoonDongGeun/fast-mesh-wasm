@@ -83,7 +83,7 @@ threeScene.add(boundA.object, boundB.object);
 // Drag B with a TransformControls gizmo: one gesture is one scene drag and one undo step.
 const controls = new TransformControls(camera, renderer.domElement);
 controls.attach(boundB.object);
-threeScene.add(controls.getHelper());
+threeScene.add(controls.getHelper()); // three >= 0.169; on older three use threeScene.add(controls)
 attachTransformControls(controls, scene, boundB);
 
 // A section: contours and fill, and the bound meshes are clipped at its plane.

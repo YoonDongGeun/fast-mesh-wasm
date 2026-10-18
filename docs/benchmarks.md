@@ -345,7 +345,7 @@ Run 2: 1.01 ms (2.18 ms) and 112 ms (181 ms). In the contact case the whole fram
 | `commitFrame()` with both adapters applying | 0.03 ms (p95 0.10) | 0.10 ms (p95 0.17) |
 | `bindMesh` x2 + first `commitFrame()` (builds both geometries) | 91 ms | 64 ms |
 
-The other run measured 2.01 ms and 420 ms in total, with the same 0.03 and 0.10 ms for `commitFrame()`. The adapter adds about as much as the plain mirror copy of the core table (0.02 to 0.12 ms): the cost of a frame is the engine's work in `drag.move`. The adapter's bounding-box walk runs only when positions or indices change, so it does not appear in a placement-only drag. A GPU upload of the same ranges (three's `writeBuffer` of the update ranges) comes on top and was not measured.
+This table comes from a later run on the same machine than the header table of this section (the adapter case was added after it). The other run measured 2.01 ms and 420 ms in total, with the same 0.03 and 0.10 ms for `commitFrame()`. The adapter adds about as much as the plain mirror copy of the core table (0.02 to 0.12 ms): the cost of a frame is the engine's work in `drag.move`. The adapter's bounding-box walk runs only when positions or indices change, so it does not appear in a placement-only drag. A GPU upload of the same ranges (three's `writeBuffer` of the update ranges) comes on top and was not measured.
 
 ### Size of the wasm binary
 
