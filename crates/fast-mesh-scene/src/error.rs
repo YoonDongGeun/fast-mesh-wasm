@@ -4,6 +4,7 @@ use std::fmt;
 
 use fast_mesh_bvh::BvhError;
 use fast_mesh_fields::FieldsError;
+use fast_mesh_ops::OpsError;
 use fast_mesh_query::QueryError;
 use fast_mesh_store::StoreError;
 
@@ -37,6 +38,9 @@ pub enum SceneError {
     Query(QueryError),
     /// A field kernel reported an error (including `OutOfMemory`).
     Fields(FieldsError),
+    /// A repair operation run through [`Scene::edit`](crate::Scene::edit)
+    /// failed (including `OutOfMemory`).
+    Ops(OpsError),
 }
 
 impl fmt::Display for SceneError {
@@ -53,6 +57,7 @@ impl fmt::Display for SceneError {
             SceneError::Bvh(e) => write!(f, "BVH error: {e}"),
             SceneError::Query(e) => write!(f, "query error: {e}"),
             SceneError::Fields(e) => write!(f, "field error: {e}"),
+            SceneError::Ops(e) => write!(f, "repair operation failed: {e}"),
         }
     }
 }
@@ -64,6 +69,7 @@ impl std::error::Error for SceneError {
             SceneError::Bvh(e) => Some(e),
             SceneError::Query(e) => Some(e),
             SceneError::Fields(e) => Some(e),
+            SceneError::Ops(e) => Some(e),
             _ => None,
         }
     }
@@ -90,6 +96,12 @@ impl From<QueryError> for SceneError {
 impl From<FieldsError> for SceneError {
     fn from(e: FieldsError) -> Self {
         SceneError::Fields(e)
+    }
+}
+
+impl From<OpsError> for SceneError {
+    fn from(e: OpsError) -> Self {
+        SceneError::Ops(e)
     }
 }
 

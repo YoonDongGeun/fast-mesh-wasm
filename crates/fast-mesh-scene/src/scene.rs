@@ -346,22 +346,27 @@ impl Scene {
     /// still succeeds: the BVH keeps its pending changes and is treated like
     /// Lazy until [`Scene::update`], [`Scene::flush`] or a query updates it.
     ///
+    /// `f` may fail with any error that converts into [`SceneError`]: a
+    /// store error, or an [`OpsError`](fast_mesh_ops::OpsError) from a repair
+    /// operation, which becomes [`SceneError::Ops`].
+    ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`] for a stale id, or [`SceneError::Store`]
-    /// when `f` fails, the commit fails or there is no memory to record the
-    /// patch. The transaction is then rolled back and the scene (including
+    /// [`SceneError::UnknownMesh`] for a stale id; `f`'s error, converted
+    /// (for example [`SceneError::Store`] or [`SceneError::Ops`]), when it
+    /// fails; or [`SceneError::Store`] when the commit fails or there is no
+    /// memory to record the patch. The transaction is then rolled back and the scene (including
     /// an open step) is unchanged.
-    pub fn edit<R>(
+    pub fn edit<R, E: Into<SceneError>>(
         &mut self,
         id: MeshId,
-        f: impl FnOnce(&mut Transaction) -> fast_mesh_store::Result<R>,
+        f: impl FnOnce(&mut Transaction) -> std::result::Result<R, E>,
     ) -> Result<R> {
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         // Make room first, so recording cannot fail after the commit.
         self.history.reserve()?;
         let mut tx = entry.mesh.begin_edit();
         // Dropping the transaction on error rolls it back.
-        let r = f(&mut tx)?;
+        let r = f(&mut tx).map_err(Into::into)?;
         let patch = tx.commit()?;
         if patch.is_empty() {
             return Ok(r);
@@ -1090,7 +1095,7 @@ mod tests {
         assert_eq!(scene.is_current(id), Ok(true));
         scene.remove_mesh(id).unwrap();
         assert_eq!(
-            scene.edit(id, |_| Ok(())).err(),
+            scene.edit(id, |_| Ok::<(), StoreError>(())).err(),
             Some(SceneError::UnknownMesh)
         );
     }
@@ -1245,7 +1250,7 @@ mod tests {
 
         // An empty edit is neither recorded nor reported.
         let recorded = scene.history.undo_len();
-        scene.edit(a, |_| Ok(())).unwrap();
+        scene.edit(a, |_| Ok::<(), StoreError>(())).unwrap();
         assert_eq!(scene.history.undo_len(), recorded);
         assert!(scene.take_changes().is_empty());
 
@@ -1382,7 +1387,7 @@ mod tests {
         lift(&mut scene, b, 0, 1.0);
         scene.set_placement(a, moved(1.0)).unwrap();
         // Empty edits, unchanged placements and empty steps record nothing.
-        scene.edit(a, |_| Ok(())).unwrap();
+        scene.edit(a, |_| Ok::<(), StoreError>(())).unwrap();
         scene.set_placement(a, moved(1.0)).unwrap();
         scene.begin_step();
         scene.end_step().unwrap();

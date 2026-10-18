@@ -318,6 +318,7 @@ dependencies = [
  "criterion",
  "fast-mesh-bvh",
  "fast-mesh-fields",
+ "fast-mesh-ops",
  "fast-mesh-query",
  "fast-mesh-store",
  "proptest",

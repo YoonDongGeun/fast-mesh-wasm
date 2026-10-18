@@ -16,6 +16,7 @@ fast-mesh-store.workspace = true
 fast-mesh-bvh.workspace = true
 fast-mesh-query.workspace = true
 fast-mesh-fields.workspace = true
+fast-mesh-ops.workspace = true
 
 [dev-dependencies]
 proptest = "1.12.0"
