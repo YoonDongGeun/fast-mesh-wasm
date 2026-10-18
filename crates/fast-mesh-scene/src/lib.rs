@@ -25,16 +25,33 @@
 //!   affected mesh.
 //! - Maintenance: [`Scene::add_channel`], [`Scene::remove_channel`],
 //!   [`Scene::derived_channel_mut`] and [`Scene::compact`].
+//! - World queries, in world `f64` coordinates: [`Scene::raycast`],
+//!   [`Scene::closest_point`] and [`Scene::closest_point_on`], and between
+//!   two meshes [`Scene::intersects`], [`Scene::mesh_distance`] and
+//!   [`Scene::triangles_near`]. Each maps into mesh-local space, runs the
+//!   Phase 3 query and maps the result back; bounds are rounded outward to
+//!   `f32` and results filtered against the exact bound. Queries over all
+//!   meshes update every Lazy BVH and fail with [`SceneError::StaleBvh`] on
+//!   a stale Manual one; queries naming meshes touch only those.
+//! - Contacts: [`Scene::find_contacts`] finds the mesh pairs within a margin
+//!   (broadphase over world boxes, then Phase 3b per pair), optionally
+//!   restricted by a [`ContactFilter`].
 
+mod contacts;
 mod error;
 mod history;
 mod id;
 mod placement;
+mod query;
 mod report;
 mod scene;
 
+pub use contacts::{Contact, ContactFilter};
 pub use error::{Result, SceneError};
 pub use id::MeshId;
 pub use placement::Placement;
+pub use query::{
+    SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
+};
 pub use report::MeshChanges;
 pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};

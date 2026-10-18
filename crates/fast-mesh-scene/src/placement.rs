@@ -64,8 +64,6 @@ impl Default for Placement {
 }
 
 /// A mesh-local point to the world: `R (o + p) + t`.
-// Used by the world-space queries of later tasks.
-#[allow(dead_code)]
 pub(crate) fn local_to_world(p: &Placement, origin: [f64; 3], local: [f64; 3]) -> [f64; 3] {
     p.apply([
         origin[0] + local[0],
@@ -75,8 +73,6 @@ pub(crate) fn local_to_world(p: &Placement, origin: [f64; 3], local: [f64; 3]) -
 }
 
 /// A world point to mesh-local coordinates: `Rᵀ (q - t) - o`.
-// Used by the world-space queries of later tasks.
-#[allow(dead_code)]
 pub(crate) fn world_to_local(p: &Placement, origin: [f64; 3], q: [f64; 3]) -> [f64; 3] {
     let w = p.inverse_apply(q);
     [w[0] - origin[0], w[1] - origin[1], w[2] - origin[2]]
@@ -113,8 +109,6 @@ fn orthonormalize(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 /// included: `R = R_Aᵀ R_B`, `t = R_Aᵀ (R_B o_B + t_B - t_A) - o_A`, in `f64`.
 /// `R` is re-orthonormalised (within about 1e-6 of the exact product) so that
 /// `Rigid::validate` always accepts it.
-// Used by the mesh-vs-mesh queries of later tasks.
-#[allow(dead_code)]
 pub(crate) fn relative_rigid(
     a: &Placement,
     origin_a: [f64; 3],

@@ -86,9 +86,15 @@ impl Entry {
         self.report.merge(changes);
     }
 
+    /// Whether the BVH is up to date with the mesh: not flagged for a
+    /// rebuild, and current by the BVH's own check.
+    pub(crate) fn is_current(&self) -> bool {
+        !self.rebuild && self.bvh.is_current(&self.mesh)
+    }
+
     /// Brings the BVH up to date with the pending changes. On error the
     /// pending changes are kept, so a later call can retry.
-    fn update_bvh(&mut self) -> Result<()> {
+    pub(crate) fn update_bvh(&mut self) -> Result<()> {
         if self.rebuild {
             #[cfg(test)]
             fault::before_bvh_update()?;
@@ -130,7 +136,7 @@ impl Entry {
 
 /// Several meshes, each with a BVH and a placement in the world.
 pub struct Scene {
-    entries: SlotMap<Entry>,
+    pub(crate) entries: SlotMap<Entry>,
     /// Reports of meshes removed since the last `take_changes`.
     removed: Vec<MeshChanges>,
     /// The shared undo history across all meshes.
@@ -456,7 +462,7 @@ impl Scene {
         Ok(remap)
     }
 
-    fn entry(&self, id: MeshId) -> Result<&Entry> {
+    pub(crate) fn entry(&self, id: MeshId) -> Result<&Entry> {
         self.entries.get(id).ok_or(SceneError::UnknownMesh)
     }
 
@@ -513,8 +519,34 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn is_current(&self, id: MeshId) -> Result<bool> {
-        let e = self.entry(id)?;
-        Ok(!e.rebuild && e.bvh.is_current(&e.mesh))
+        Ok(self.entry(id)?.is_current())
+    }
+
+    /// Makes the BVHs a query needs current (§15.4): those of `only`, or of
+    /// every mesh when `None`. Every non-Manual BVH among them is updated
+    /// (Lazy ones, and Eager ones left stale by a failed update); then a
+    /// stale Manual BVH, including one flagged for a rebuild, fails the
+    /// query with [`SceneError::StaleBvh`] for the lowest such id. Ids in
+    /// `only` must be known.
+    ///
+    /// # Errors
+    /// The first BVH or memory error from an update, then
+    /// [`SceneError::StaleBvh`].
+    pub(crate) fn prepare(&mut self, only: Option<&[MeshId]>) -> Result<()> {
+        let wanted = |id: MeshId| only.is_none_or(|ids| ids.contains(&id));
+        for (id, entry) in self.entries.iter_mut() {
+            if wanted(id) && entry.mode != UpdateMode::Manual {
+                entry.update_bvh()?;
+            }
+        }
+        match self
+            .entries
+            .iter()
+            .find(|(id, e)| wanted(*id) && e.mode == UpdateMode::Manual && !e.is_current())
+        {
+            Some((id, _)) => Err(SceneError::StaleBvh(id)),
+            None => Ok(()),
+        }
     }
 }
 
