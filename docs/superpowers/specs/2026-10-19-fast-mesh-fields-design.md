@@ -241,7 +241,7 @@ impl Scene {
    - What is recomputed after a change:
      - All vertices, when the report is `None` (after `compact`, `add_mesh` or a `Corrupted` step), when `max_distance` is infinite, or when the field is first registered.
      - Otherwise:
-       - the vertices of A's triangles from `triangles_near(A, B, pad(max_distance))`, with `pad(x) = x·(1 + 1e-6) + 1e-6`, so that the f64 pair test never drops a vertex the f32 kernel would keep;
+       - the vertices of A's triangles from `triangles_near(A, B, pad(max_distance))`, with `pad(x) = x·(1 + 1e-6) + 8·f32::EPSILON·M`, where `M` is the largest absolute coordinate of A's root box and of B's root box moved into A's space (the frame of the pair test, as in Phase 3b's pair pruning), so that the pair test never drops a vertex the f32 kernel would keep. *Controller ruling, Task 6 review:* the earlier absolute `1e-6` did not scale with coordinate magnitude;
        - plus the vertices that held finite values before;
        - plus A's added, moved and removed vertices;
        - plus the vertices whose corner count crosses zero in either direction.

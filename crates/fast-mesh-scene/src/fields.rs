@@ -13,7 +13,9 @@
 //! infinite, or on the first update. Otherwise:
 //!
 //! - after a placement change of either mesh or an edit of B: the vertices
-//!   of A's triangles within `pad(max_distance)` of B, plus the vertices that
+//!   of A's triangles within `pad(max_distance)` of B (`max_distance`
+//!   plus a relative `1e-6` and `8·f32::EPSILON` times the coordinate
+//!   magnitude of the pair), plus the vertices that
 //!   held finite values (so they can return to far);
 //! - after an edit of A: its added, moved and removed vertices, plus, when
 //!   its triangles changed, the vertices whose "used by a triangle" state
@@ -71,10 +73,20 @@ pub struct Coloring {
     pub rule: ColorRule,
 }
 
-/// The near-set margin for `max_distance` `x` (§11.6): slightly larger, so
-/// that the `f64` pair test never drops a vertex the `f32` kernel keeps.
-fn pad(x: f64) -> f64 {
-    x * (1.0 + 1e-6) + 1e-6
+/// The near-set margin for `max_distance` `x` (§11.6), for meshes of
+/// coordinate magnitude `m` (see [`Scene::pair_magnitude`]): slightly
+/// larger, so that the pair test in A's space never drops a vertex the
+/// `f32` kernel in B's space keeps.
+fn pad(x: f64, m: f64) -> f64 {
+    x * (1.0 + 1e-6) + 8.0 * f64::from(f32::EPSILON) * m
+}
+
+/// The largest absolute coordinate of a box's corners.
+fn box_magnitude(min: [f32; 3], max: [f32; 3]) -> f64 {
+    min.iter()
+        .chain(&max)
+        .map(|c| f64::from(c.abs()))
+        .fold(0.0, f64::max)
 }
 
 fn oom() -> SceneError {
@@ -159,6 +171,26 @@ impl Entry {
         if let Some(h) = self.hooks.iter_mut().find(|h| h.field == id) {
             *h = FieldHook::new(id);
         }
+    }
+
+    /// Colours vertex slots added since the colours were last sized, from
+    /// the field's channel (NaN for slots the field has not computed), and
+    /// reports them, so that the colours always cover every vertex slot.
+    pub(crate) fn grow_colors(&mut self) {
+        let slots = self.mesh.vertex_slots();
+        let Some(cs) = &mut self.coloring else {
+            return;
+        };
+        let old = cs.colors.len();
+        if slots <= old {
+            return;
+        }
+        let rule = &cs.coloring.rule;
+        let values = self.mesh.channel(&cs.channel).unwrap_or(&[]);
+        cs.colors
+            .extend((old..slots).map(|v| values.get(v).map_or(rule.nan, |&x| color_of(rule, x))));
+        let added: Vec<VertexId> = (old as VertexId..slots as VertexId).collect();
+        self.report_colors(Some(&added));
     }
 
     /// Recolours every vertex from the current field values (after a new
@@ -280,8 +312,12 @@ impl Scene {
     /// [`Scene::flush`]), then read any number of fields and colours.
     ///
     /// # Errors
-    /// The first error, for example [`SceneError::StaleBvh`] when a field's
-    /// mesh is a stale Manual mesh. Every field is still attempted; those
+    /// The first error, for example [`SceneError::StaleBvh`] when a BVH a
+    /// field needs is a stale Manual one: B's always, A's when the field
+    /// must look for A's triangles near B (after a placement change or an
+    /// edit of B). Such a field makes every call (and every
+    /// [`Scene::flush`]) return `StaleBvh` until that BVH is brought up to
+    /// date with [`Scene::update`]. Every field is still attempted; those
     /// that failed stay stale and keep their pending changes.
     pub fn update_fields(&mut self) -> Result<()> {
         self.run_fields(|_| true, None)
@@ -355,9 +391,14 @@ impl Scene {
         Ok(())
     }
 
-    /// The mesh's colours, one RGBA8 per vertex slot as of the last update
-    /// of the colouring's field, or `None` when the mesh has no colouring.
-    /// Never updates.
+    /// The mesh's colours, or `None` when the mesh has no colouring. Never
+    /// updates.
+    ///
+    /// The slice always holds exactly one RGBA8 per vertex slot
+    /// (`colors(mesh).len() == mesh.vertex_slots()`), so it can be indexed
+    /// by vertex id at any time. The colours follow the field's values as of
+    /// its last update; slots added since are coloured from the field's
+    /// channel (NaN, so [`ColorRule::nan`]) until the field is updated.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
@@ -452,6 +493,27 @@ impl Scene {
         }
     }
 
+    /// The largest absolute coordinate of A's root box and of B's root box
+    /// moved into A's space (the frame of the pair test), as in Phase 3b's
+    /// pair pruning: the magnitude the rounding of either side scales with.
+    /// 0 for a mesh without triangles.
+    fn pair_magnitude(&self, on: MeshId, to: MeshId) -> Result<f64> {
+        let xf = self.relative_transform(on, to)?;
+        let root = |m: MeshId| -> Result<Option<_>> {
+            Ok(self.entry(m)?.bvh.root_bounds().filter(|b| !b.is_empty()))
+        };
+        let mut m = root(on)?.map_or(0.0, |b| box_magnitude(b.min, b.max));
+        if let Some(b) = root(to)? {
+            for k in 0..8 {
+                let corner =
+                    std::array::from_fn(|d| if k >> d & 1 == 0 { b.min[d] } else { b.max[d] });
+                let p = xf.apply(corner);
+                m = p.iter().fold(m, |m, c| m.max(c.abs()));
+            }
+        }
+        Ok(m)
+    }
+
     /// Brings field `i` up to date (see the module docs for what is
     /// recomputed). All or nothing: on error nothing is written and the
     /// pending changes stay.
@@ -462,7 +524,6 @@ impl Scene {
             self.fields[i].desc.to,
         );
         let (md, mode) = (self.fields[i].desc.max_distance, self.fields[i].desc.sign);
-        self.prepare(Some(&[on, to]))?;
         let hook_a = self
             .entry(on)?
             .hook(id)
@@ -480,10 +541,15 @@ impl Scene {
         let geometric = hook_a.placement_changed
             || hook_b.placement_changed
             || hook_b.changes.as_ref().is_some_and(|c| !c.is_empty());
+        // B's BVH is always needed; A's only for the near set.
+        let need_near = !full && geometric;
+        let both = [on, to];
+        self.prepare(Some(if need_near { &both } else { &both[1..] }))?;
         let mut near = Vec::new();
-        if !full && geometric {
+        if need_near {
+            let m = self.pair_magnitude(on, to)?;
             let mut near_b = Vec::new();
-            self.triangles_near(on, to, pad(md), &mut near, &mut near_b)?;
+            self.triangles_near(on, to, pad(md, m), &mut near, &mut near_b)?;
         }
         {
             let eb = self.entries.get_mut(to).ok_or(SceneError::UnknownMesh)?;
@@ -645,7 +711,6 @@ pub(crate) mod counter {
 
 #[cfg(test)]
 mod tests {
-    use fast_mesh_bvh::{BuildOptions, Bvh};
     use fast_mesh_fields::{Colormap, OutOfRange, SignData, color_of, signed_distances};
     use fast_mesh_store::{Mesh, VertexId};
 
@@ -737,12 +802,14 @@ mod tests {
         (scene, a, b)
     }
 
-    /// The field's values computed from scratch: every vertex of A, with a
-    /// fresh BVH and fresh sign data for B.
+    /// The field's values computed from scratch: every vertex of A, mapped
+    /// to the world and into B's space with the scene's point accessors (not
+    /// the production transform), with fresh sign data for B. B's own BVH is
+    /// used, which must be current: the fast winding number depends on the
+    /// tree's shape, while the closest distance does not.
     fn reference(scene: &mut Scene, id: FieldId) -> Vec<f32> {
         let f = scene.fields.iter().find(|f| f.id == id).unwrap();
         let (on, to, md, mode) = (f.desc.on, f.desc.to, f.desc.max_distance, f.desc.sign);
-        let xf = scene.relative_transform(on, to).unwrap().inverse();
         let ma = scene.mesh(on).unwrap();
         let slots = ma.vertex_slots();
         let defined: Vec<bool> = (0..slots as VertexId)
@@ -750,14 +817,18 @@ mod tests {
             .collect();
         let points: Vec<[f32; 3]> = (0..slots as VertexId)
             .filter(|&v| defined[v as usize])
-            .map(|v| xf.apply(ma.position(v).unwrap()).map(|c| c as f32))
+            .map(|v| {
+                let p = ma.position(v).unwrap().map(f64::from);
+                let w = scene.local_to_world(on, p).unwrap();
+                scene.world_to_local(to, w).unwrap().map(|c| c as f32)
+            })
             .collect();
         let eb = scene.entries.get_mut(to).unwrap();
-        let bvh = Bvh::build(&eb.mesh, &BuildOptions::default()).unwrap();
-        let sign = SignData::build(&mut eb.mesh, &bvh, mode).unwrap();
+        assert!(eb.is_current(), "the reference needs B's BVH current");
+        let sign = SignData::build(&mut eb.mesh, &eb.bvh, mode).unwrap();
         let mut out = vec![0.0; points.len()];
         let bound = crate::query::round_up(md);
-        signed_distances(&eb.mesh, &bvh, &sign, &points, bound, &mut out).unwrap();
+        signed_distances(&eb.mesh, &eb.bvh, &sign, &points, bound, &mut out).unwrap();
         let mut values = out.into_iter().map(|v| {
             if f64::from(v.abs()) > md {
                 f32::INFINITY
@@ -775,12 +846,39 @@ mod tests {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
+    /// Surface tolerance for the reference, whose points take another
+    /// rounding path (§11.9: relative to the scenes' unit size).
+    const TOL: f32 = 1e-5;
+
+    /// Equal bits; or both finite within `TOL`; or one far and the other
+    /// within `TOL` of `max_distance`.
+    fn close(g: f32, w: f32, md: f64) -> bool {
+        if g.to_bits() == w.to_bits() {
+            return true;
+        }
+        if g.is_nan() || w.is_nan() {
+            return false;
+        }
+        if g.is_finite() && w.is_finite() {
+            return (g - w).abs() <= TOL;
+        }
+        let finite = if g.is_finite() { g } else { w };
+        f64::from(finite.abs()) >= md - f64::from(TOL)
+    }
+
     fn assert_matches(scene: &mut Scene, id: FieldId) {
         let want = reference(scene, id);
+        let md = scene
+            .fields
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .desc
+            .max_distance;
         let got = scene.field_values(id).unwrap().to_vec();
         assert_eq!(got.len(), want.len());
         for (v, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert_eq!(g.to_bits(), w.to_bits(), "vertex {v}: got {g}, want {w}");
+            assert!(close(*g, *w, md), "vertex {v}: got {g}, want {w}");
         }
         assert!(scene.field_status(id).unwrap().current);
     }
@@ -835,106 +933,319 @@ mod tests {
             .map_or(Some(Vec::new()), |c| c.colors_dirty)
     }
 
-    #[test]
-    fn field_matches_from_scratch() {
-        let mut rng = Lcg(42);
-        for round in 0..4 {
-            let modes = [UpdateMode::Eager, UpdateMode::Lazy];
-            let (mut scene, a, b) = sheet_and_cube(modes[round % 2]);
-            let fa = scene
-                .add_distance_field(field("d", a, b, 0.12 + 0.05 * round as f64))
-                .unwrap();
-            let fb = scene.add_distance_field(field("d", b, a, 0.1)).unwrap();
-            let rule = distance_rule(0.2, 0.1);
-            scene
-                .set_coloring(
-                    a,
-                    Some(Coloring {
-                        field: fa,
-                        rule: rule.clone(),
-                    }),
-                )
-                .unwrap();
-            scene.update_fields().unwrap();
-            assert_matches(&mut scene, fa);
-            assert_matches(&mut scene, fb);
-            scene.take_changes();
-            for step in 0..40 {
-                let before = scene.colors(a).unwrap().unwrap().to_vec();
-                match rng.below(8) {
-                    0 => {
-                        let p = turned(
-                            rng.range(-20.0, 20.0),
-                            [
-                                rng.range(-0.1, 0.1),
-                                rng.range(-0.1, 0.1),
-                                rng.range(-0.1, 0.1),
-                            ],
-                        );
-                        scene.set_placement(b, p).unwrap();
-                    }
-                    1 => {
-                        let p = at(rng.range(-0.05, 0.05), 0.0, rng.range(-0.1, 0.1));
-                        scene.set_placement(a, p).unwrap();
-                    }
-                    2 => {
-                        let n = scene.mesh(a).unwrap().vertex_slots();
-                        let v = rng.below(n) as VertexId;
-                        let z = rng.range(-0.2, 0.2) as f32;
-                        let _ = scene.edit(a, |tx| {
+    fn alive_vertex(scene: &Scene, m: MeshId, rng: &mut Lcg) -> Option<VertexId> {
+        let mesh = scene.mesh(m).unwrap();
+        let alive: Vec<VertexId> = (0..mesh.vertex_slots() as VertexId)
+            .filter(|&v| mesh.is_vertex_alive(v))
+            .collect();
+        (!alive.is_empty()).then(|| alive[rng.below(alive.len())])
+    }
+
+    fn alive_triangle(scene: &Scene, m: MeshId, rng: &mut Lcg) -> Option<u32> {
+        let mesh = scene.mesh(m).unwrap();
+        let alive: Vec<u32> = (0..mesh.triangle_slots() as u32)
+            .filter(|&t| mesh.triangle(t).is_some())
+            .collect();
+        (!alive.is_empty()).then(|| alive[rng.below(alive.len())])
+    }
+
+    fn random_mode(rng: &mut Lcg) -> UpdateMode {
+        [UpdateMode::Eager, UpdateMode::Lazy, UpdateMode::Manual][rng.below(3)]
+    }
+
+    fn random_sign(rng: &mut Lcg) -> SignMode {
+        [SignMode::Pseudonormal, SignMode::Winding, SignMode::Auto][rng.below(3)]
+    }
+
+    fn random_max_distance(rng: &mut Lcg) -> f64 {
+        if rng.below(5) == 0 {
+            f64::INFINITY
+        } else {
+            rng.range(0.03, 0.25)
+        }
+    }
+
+    /// One random operation of the walk on meshes `a` (sheet) and `b`
+    /// (cube). Operations that do not apply (nothing to undo, no such
+    /// vertex) are skipped.
+    fn random_op(scene: &mut Scene, a: MeshId, b: MeshId, rng: &mut Lcg) {
+        let m = if rng.below(2) == 0 { a } else { b };
+        match rng.below(16) {
+            0 | 1 => {
+                let p = turned(
+                    rng.range(-25.0, 25.0),
+                    [
+                        rng.range(-0.1, 0.1),
+                        rng.range(-0.1, 0.1),
+                        rng.range(-0.1, 0.1),
+                    ],
+                );
+                scene.set_placement(m, p).unwrap();
+            }
+            2 => {
+                if let Some(v) = alive_vertex(scene, a, rng) {
+                    let z = rng.range(-0.2, 0.2) as f32;
+                    scene
+                        .edit(a, |tx| {
                             let p = tx.mesh().position(v).unwrap();
                             tx.set_positions(&[v], &[[p[0], p[1], z]])
-                        });
-                    }
-                    3 => {
-                        let v = rng.below(8) as VertexId;
-                        let s = rng.range(0.9, 1.1) as f32;
-                        scene
-                            .edit(b, |tx| {
-                                let p = tx.mesh().position(v).unwrap();
-                                tx.set_positions(&[v], &[p.map(|c| c * s)])
-                            })
-                            .unwrap();
-                    }
-                    4 => {
-                        let n = scene.mesh(a).unwrap().triangle_slots();
-                        let t = rng.below(n) as u32;
-                        let _ = scene.edit(a, |tx| tx.remove_triangles(&[t]));
-                    }
-                    5 => {
-                        let x = rng.range(0.2, 0.8) as f32;
-                        scene
-                            .edit(a, |tx| {
-                                let v = tx.add_vertices(&[[x, x, 0.05]])?;
-                                tx.add_triangles(&[[v[0], 0, 1]])
-                            })
-                            .unwrap();
-                    }
-                    6 => {
-                        scene.undo().unwrap();
-                    }
-                    _ => {
-                        scene.redo().unwrap();
-                    }
+                        })
+                        .unwrap();
                 }
-                scene.update_fields().unwrap();
-                assert_matches(&mut scene, fa);
-                assert_matches(&mut scene, fb);
-                assert_colors(&scene, a, &rule, fa);
-                // Every changed colour is reported.
-                let now = scene.colors(a).unwrap().unwrap().to_vec();
-                if let Some(dirty) = colors_dirty(&mut scene, a) {
-                    for (v, c) in now.iter().enumerate() {
-                        if before.get(v) != Some(c) {
-                            assert!(
-                                dirty.binary_search(&(v as VertexId)).is_ok(),
-                                "round {round} step {step}: vertex {v} not reported"
-                            );
-                        }
-                    }
+            }
+            3 => {
+                if let Some(v) = alive_vertex(scene, b, rng) {
+                    let s = rng.range(0.95, 1.05) as f32;
+                    scene
+                        .edit(b, |tx| {
+                            let p = tx.mesh().position(v).unwrap();
+                            tx.set_positions(&[v], &[p.map(|c| c * s)])
+                        })
+                        .unwrap();
+                }
+            }
+            4 => {
+                if let Some(t) = alive_triangle(scene, m, rng) {
+                    scene.edit(m, |tx| tx.remove_triangles(&[t])).unwrap();
+                }
+            }
+            5 => {
+                // A new vertex on a new triangle with two alive vertices.
+                let (Some(p), Some(q)) = (alive_vertex(scene, a, rng), alive_vertex(scene, a, rng))
+                else {
+                    return;
+                };
+                if p == q {
+                    return;
+                }
+                let x = [rng.range(0.0, 1.0) as f32, rng.range(0.0, 1.0) as f32, 0.02];
+                scene
+                    .edit(a, |tx| {
+                        let v = tx.add_vertices(&[x])?;
+                        tx.add_triangles(&[[v[0], p, q]])
+                    })
+                    .unwrap();
+            }
+            6 => {
+                // Removes an alive vertex no triangle uses, if any.
+                let mesh = scene.mesh(m).unwrap();
+                let unused = (0..mesh.vertex_slots() as VertexId)
+                    .find(|&v| mesh.is_vertex_alive(v) && mesh.corner_count(v) == 0);
+                if let Some(v) = unused {
+                    scene.edit(m, |tx| tx.remove_vertices(&[v])).unwrap();
+                }
+            }
+            7 => {
+                // Splits a triangle at its centroid (a topology edit that
+                // keeps a closed mesh closed).
+                if let Some(t) = alive_triangle(scene, m, rng) {
+                    scene
+                        .edit(m, |tx| {
+                            let [i, j, k] = tx.mesh().triangle(t).unwrap();
+                            let ps = [i, j, k].map(|v| tx.mesh().position(v).unwrap());
+                            let c = std::array::from_fn(|d| (ps[0][d] + ps[1][d] + ps[2][d]) / 3.0);
+                            let v = tx.add_vertices(&[c])?[0];
+                            tx.remove_triangles(&[t])?;
+                            tx.add_triangles(&[[i, j, v], [j, k, v], [k, i, v]])
+                        })
+                        .unwrap();
+                }
+            }
+            8 | 9 => {
+                scene.undo().unwrap();
+            }
+            10 => {
+                scene.redo().unwrap();
+            }
+            11 => {
+                // A drag in one step.
+                scene.begin_step();
+                for k in 1..=3 {
+                    let d = 0.01 * k as f64;
+                    scene
+                        .set_placement(m, turned(d * 50.0, [d, -d, d]))
+                        .unwrap();
+                }
+                scene.end_step().unwrap();
+            }
+            12 => {
+                // A drag cancelled half-way.
+                scene.begin_step();
+                scene.set_placement(m, at(0.03, 0.02, -0.04)).unwrap();
+                if let Some(v) = alive_vertex(scene, a, rng) {
+                    scene
+                        .edit(a, |tx| {
+                            let p = tx.mesh().position(v).unwrap();
+                            tx.set_positions(&[v], &[[p[0], p[1], 0.1]])
+                        })
+                        .unwrap();
+                }
+                scene.cancel_step().unwrap();
+            }
+            13 => {
+                scene.compact(m).unwrap();
+            }
+            14 => {
+                scene.set_mode(m, random_mode(rng)).unwrap();
+            }
+            _ => {
+                // Add a vertex, then remove it in the same batch (or let undo
+                // take back an add): exercises slot growth without a net
+                // change.
+                let x = [rng.range(0.0, 1.0) as f32, rng.range(0.0, 1.0) as f32, 0.0];
+                let Some(p) = alive_vertex(scene, a, rng) else {
+                    return;
+                };
+                let Some(q) = alive_vertex(scene, a, rng).filter(|&q| q != p) else {
+                    return;
+                };
+                scene
+                    .edit(a, |tx| {
+                        let v = tx.add_vertices(&[x])?;
+                        tx.add_triangles(&[[v[0], p, q]])
+                    })
+                    .unwrap();
+                scene.undo().unwrap();
+            }
+        }
+    }
+
+    /// `update_fields`, bringing stale Manual BVHs up to date when it asks.
+    fn update_all(scene: &mut Scene) {
+        for _ in 0..8 {
+            match scene.update_fields() {
+                Ok(()) => return,
+                Err(SceneError::StaleBvh(id)) => scene.update(id).unwrap(),
+                Err(e) => panic!("update_fields failed: {e}"),
+            }
+        }
+        panic!("update_fields kept failing");
+    }
+
+    fn check_colors_reported(
+        scene: &Scene,
+        mesh: MeshId,
+        before: &[[u8; 4]],
+        dirty: Option<&Vec<VertexId>>,
+        at: &str,
+    ) {
+        let now = scene.colors(mesh).unwrap().unwrap();
+        assert_eq!(now.len(), scene.mesh(mesh).unwrap().vertex_slots(), "{at}");
+        if let Some(dirty) = dirty {
+            for (v, c) in now.iter().enumerate() {
+                if before.get(v) != Some(c) {
+                    assert!(
+                        dirty.binary_search(&(v as VertexId)).is_ok(),
+                        "{at}: vertex {v} not reported"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn field_matches_from_scratch() {
+        let mut rng = Lcg(42);
+        for round in 0..24 {
+            let mut scene = Scene::new(SceneOptions::default());
+            let a_mode = [UpdateMode::Eager, UpdateMode::Lazy, UpdateMode::Manual][round % 3];
+            let a = scene.add_mesh(sheet(10, 0.1), with_mode(a_mode)).unwrap();
+            let b = scene
+                .add_mesh(
+                    cube([0.3, 0.3, -0.2], 0.4),
+                    with_mode(random_mode(&mut rng)),
+                )
+                .unwrap();
+            scene.update(b).unwrap();
+            let fa = scene
+                .add_distance_field(DistanceField {
+                    sign: random_sign(&mut rng),
+                    ..field("d", a, b, random_max_distance(&mut rng))
+                })
+                .unwrap();
+            let fb = scene
+                .add_distance_field(DistanceField {
+                    sign: random_sign(&mut rng),
+                    ..field("d", b, a, random_max_distance(&mut rng))
+                })
+                .unwrap();
+            let (rule_a, rule_b) = (distance_rule(0.2, 0.1), contact_rule(0.1));
+            for (m, f, rule) in [(a, fa, &rule_a), (b, fb, &rule_b)] {
+                let rule = rule.clone();
+                scene
+                    .set_coloring(m, Some(Coloring { field: f, rule }))
+                    .unwrap();
+            }
+            update_all(&mut scene);
+            scene.take_changes();
+            for step in 0..40 {
+                let at = format!("round {round} step {step}");
+                let before_a = scene.colors(a).unwrap().unwrap().to_vec();
+                let before_b = scene.colors(b).unwrap().unwrap().to_vec();
+                // Eager meshes see one operation at a time; others a batch.
+                let ops = if a_mode == UpdateMode::Eager {
+                    1
+                } else {
+                    1 + rng.below(5)
+                };
+                for _ in 0..ops {
+                    random_op(&mut scene, a, b, &mut rng);
+                    // The colour buffers always cover every vertex slot.
+                    for m in [a, b] {
+                        let n = scene.mesh(m).unwrap().vertex_slots();
+                        assert_eq!(scene.colors(m).unwrap().unwrap().len(), n, "{at}");
+                    }
+                }
+                update_all(&mut scene);
+                for m in [a, b] {
+                    // The reference reads B's BVH, which update_fields made
+                    // current only if a field needed it.
+                    scene.update(m).unwrap();
+                }
+                assert_matches(&mut scene, fa);
+                assert_matches(&mut scene, fb);
+                assert_colors(&scene, a, &rule_a, fa);
+                assert_colors(&scene, b, &rule_b, fb);
+                let ch = scene.take_changes();
+                let dirty = |m: MeshId| {
+                    ch.iter()
+                        .find(|c| c.id == m)
+                        .map_or(Some(Vec::new()), |c| c.colors_dirty.clone())
+                };
+                check_colors_reported(&scene, a, &before_a, dirty(a).as_ref(), &at);
+                check_colors_reported(&scene, b, &before_b, dirty(b).as_ref(), &at);
+            }
+        }
+    }
+
+    /// An add undone before a Lazy field updates leaves nothing for the
+    /// field to do, but the colours must still cover the new slot.
+    #[test]
+    fn colors_cover_slots_after_cancelled_add() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Lazy);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let rule = contact_rule(0.1);
+        let coloring = Coloring {
+            field: f,
+            rule: rule.clone(),
+        };
+        scene.set_coloring(a, Some(coloring)).unwrap();
+        scene.update_fields().unwrap();
+        scene.take_changes();
+        scene
+            .edit(a, |tx| {
+                let v = tx.add_vertices(&[[0.5, 0.5, 0.0]])?;
+                tx.add_triangles(&[[v[0], 0, 1]])
+            })
+            .unwrap();
+        assert_eq!(scene.colors(a).unwrap().unwrap().len(), 122);
+        assert_eq!(scene.colors(a).unwrap().unwrap()[121], rule.nan);
+        scene.undo().unwrap();
+        scene.update_fields().unwrap();
+        assert!(scene.field_status(f).unwrap().current);
+        assert_eq!(scene.colors(a).unwrap().unwrap().len(), 122);
+        assert_colors(&scene, a, &rule, f);
+        assert_eq!(colors_dirty(&mut scene, a), Some(vec![121]));
     }
 
     #[test]

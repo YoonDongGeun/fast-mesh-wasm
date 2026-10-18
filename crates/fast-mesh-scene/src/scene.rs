@@ -142,6 +142,9 @@ impl Entry {
                 c.merge(changes);
             }
         }
+        // Slots only grow through commits, undo, redo and cancel, all of
+        // which pass here.
+        self.grow_colors();
     }
 
     /// Whether the BVH is up to date with the mesh: not flagged for a
@@ -475,13 +478,17 @@ impl Scene {
         Ok(())
     }
 
-    /// Brings the mesh's BVH up to date now, whatever its mode.
+    /// Brings the mesh's BVH up to date now, whatever its mode. Eager fields
+    /// involving the mesh that were left stale (for example by this BVH
+    /// being a stale Manual one) then catch up.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update.
     /// On error the BVH keeps its pending changes.
     pub fn update(&mut self, id: MeshId) -> Result<()> {
-        self.entry_mut(id)?.update_bvh()
+        self.entry_mut(id)?.update_bvh()?;
+        self.run_eager_fields(Some(&[id]));
+        Ok(())
     }
 
     /// Brings every Lazy BVH up to date, and every Eager one left stale by a
@@ -491,9 +498,10 @@ impl Scene {
     ///
     /// # Errors
     /// The first BVH, memory or field error, for example
-    /// [`SceneError::StaleBvh`] for a field measured to a stale Manual mesh.
-    /// Every mesh and field is still attempted; those that failed keep their
-    /// pending changes.
+    /// [`SceneError::StaleBvh`] for a field measured to a stale Manual mesh:
+    /// such a field makes every `flush` return `StaleBvh` until that BVH is
+    /// brought up to date with [`Scene::update`]. Every mesh and field is
+    /// still attempted; those that failed keep their pending changes.
     pub fn flush(&mut self) -> Result<()> {
         let mut first = Ok(());
         for (_, entry) in self.entries.iter_mut() {
