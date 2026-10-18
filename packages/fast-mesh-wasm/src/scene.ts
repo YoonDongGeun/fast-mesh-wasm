@@ -85,7 +85,13 @@ export interface MeshChange {
  * a `cancelStep()` (or an `endStep()` that closes the drag's step) abandons it.
  */
 export interface DragSession {
-  /** Sets the mesh's placement. Throws `INVALID_ARGUMENT` once the drag is over. */
+  /**
+   * Sets the mesh's placement. Throws `INVALID_ARGUMENT` once the drag is over.
+   *
+   * Each move recomputes the eager fields that depend on the mesh, so
+   * coalesce pointer events to one move per animation frame (keep the latest
+   * pose and apply it before {@link Scene.commitFrame}).
+   */
   move(placement: PlacementInput): void;
   /**
    * Finishes the drag, recording it as one undo step (closing any step levels
@@ -1379,6 +1385,8 @@ export class Scene {
   /**
    * Starts dragging a mesh: the moves until {@link DragSession.end} form one
    * undo step (nested in the open step, if there is one). One drag at a time.
+   * Every {@link DragSession.move} recomputes the eager fields, so make at most
+   * one move per animation frame, with the latest pointer pose.
    */
   drag(mesh: MeshHandle): DragSession {
     this.#id(mesh);

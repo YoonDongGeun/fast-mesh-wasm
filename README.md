@@ -58,10 +58,17 @@ geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 For interactive work with several meshes, the `Scene` class keeps the meshes in WebAssembly memory and does the heavy parts in Rust: placements, a BVH per mesh, queries, signed distance fields with colour maps, planar sections, hole repair and undo/redo. Your renderer reads the results through zero-copy typed-array views, and you upload only the ranges that changed.
 
 ```ts
-import { init, Scene, type Quat, type Vec3 } from "fast-mesh-wasm";
+import { init, type MeshHandle, Scene, type Quat, type Vec3 } from "fast-mesh-wasm";
 
 await init();
 const scene = new Scene();
+
+// Provided by your app (not part of this package): mesh data and the
+// renderer's upload functions.
+declare const upperPositions: Float64Array, upperIndices: Uint32Array;
+declare const lowerPositions: Float64Array, lowerIndices: Uint32Array;
+declare function uploadMatrix(mesh: MeshHandle, matrix: Float64Array): void;
+declare function uploadColors(mesh: MeshHandle, startVertex: number, rgba: Uint8Array): void;
 
 // Add meshes. Positions are in world space; the scene stores them relative to
 // the mesh's bounding-box centre so single precision stays accurate.
@@ -74,17 +81,26 @@ const colour = (field: typeof gap) =>
   scene.setColoring(upper, { field, map: "turbo", range: [-0.5, 1] });
 colour(gap);
 
-// Drag the lower mesh. The whole drag is one undo step.
+// Drag the lower mesh. The whole drag is one undo step. Each `move`
+// recomputes the eager fields, so coalesce pointer events to one `move` per
+// animation frame.
 const drag = scene.drag(lower);
+let pending: { rotation: Quat; translation: Vec3 } | undefined;
 function onPointerMove(rotation: Quat, translation: Vec3) {
-  drag.move({ rotation, translation }); // fields and colours follow
+  pending = { rotation, translation }; // keep only the latest pose
 }
 function onPointerUp() {
+  if (pending !== undefined) drag.move(pending);
+  pending = undefined;
   drag.end();
 }
 
 // Once per animation frame: take what changed and upload only that.
 function frame() {
+  if (pending !== undefined) {
+    drag.move(pending); // fields and colours follow
+    pending = undefined;
+  }
   for (const change of scene.commitFrame()) {
     const views = scene.views(change.mesh); // fresh views; do not keep them
     if (change.placementChanged) {

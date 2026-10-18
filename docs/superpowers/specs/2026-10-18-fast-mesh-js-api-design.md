@@ -366,6 +366,6 @@ What the implementation of 8a settled or found. The spec's contracts stand excep
 Full tables, machine and method are in `docs/benchmarks.md` ("JavaScript core"). Node 24 on the i5-13600K, release wasm, another branch's work possibly sharing the CPU:
 
 - **`addMesh`** of 1,002,528 triangles from `Float64Array`: 1.09 s median (second run 1.18 s); 9,999,392 triangles: 12.7 s (13.1 s).
-- **64-pose drag of two touching 1M meshes, colouring on** (`setPlacement` + `commitFrame()` + copying every dirty range into a JS mirror): 1.76 ms per frame at median with a contact-sized `maxDistance` (0.08), of which `commitFrame()` and the copy are 0.02 ms; 448 ms when every vertex is in range. At 10M with the contact `maxDistance`: 38.6 ms (second run 30.5 ms).
-- **The owner's scene** (6 meshes of 30,258 triangles, 30 fields, one dragged): 1.02 ms per frame with a contact-sized `maxDistance`, 105 ms when nearly every vertex is in range.
+- **64-pose drag of two touching 1M meshes, colouring on** (`setPlacement` + `commitFrame()` + copying every dirty range into a JS mirror): 1.76 ms per frame at median with a contact-sized `maxDistance` (0.08), of which `commitFrame()` and the copy are 0.02 ms; 448 ms in the stress case where every vertex is in range (`maxDistance` 8; not an expected workload). At 10M with the contact `maxDistance`: 38.6 ms (second run 30.5 ms).
+- **The owner's scene** (6 meshes of 30,258 triangles, 30 fields, one dragged): 1.02 ms per frame with a contact-sized `maxDistance`, 105 ms in the stress case where nearly every vertex is in range (not an expected workload).
 - **Wasm size:** 19,561 B raw / 9,003 B gzip before 8a, 733,183 B / 292,300 B gzip after.
