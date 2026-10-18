@@ -24,7 +24,7 @@ impl SubscriberId {
 ///
 /// Opaque: field ids are handed out by the scene and only compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FieldId(#[allow(dead_code)] pub(crate) u32);
+pub struct FieldId(pub(crate) u32);
 
 /// What happened to one mesh since the subscriber's last
 /// [`Scene::take_changes_for`](crate::Scene::take_changes_for) (or
@@ -77,11 +77,13 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    /// The report of a mesh that was just added.
+    /// The report of a mesh that was just added: everything is new,
+    /// colours included.
     pub(crate) fn added() -> Report {
         Report {
             changes: None,
             added: true,
+            colors_dirty: None,
             ..Report::clean()
         }
     }
@@ -125,6 +127,31 @@ impl Report {
     pub(crate) fn channel_written(&mut self, name: &str) {
         if !self.channels_written.iter().any(|n| n == name) {
             self.channels_written.push(name.to_owned());
+        }
+    }
+
+    /// Notes a change of field `id`'s values, once per field.
+    pub(crate) fn field_changed(&mut self, id: FieldId) {
+        if !self.fields_changed.contains(&id) {
+            self.fields_changed.push(id);
+        }
+    }
+
+    /// Notes recoloured vertices (`ids` ascending without duplicates), or
+    /// every vertex for `None`.
+    pub(crate) fn colors_changed(&mut self, ids: Option<&[VertexId]>) {
+        match (ids, &mut self.colors_dirty) {
+            (_, None) => {}
+            (None, dirty) => *dirty = None,
+            (Some(ids), Some(dirty)) => {
+                if dirty.is_empty() {
+                    dirty.extend_from_slice(ids);
+                } else if !ids.is_empty() {
+                    dirty.extend_from_slice(ids);
+                    dirty.sort_unstable();
+                    dirty.dedup();
+                }
+            }
         }
     }
 

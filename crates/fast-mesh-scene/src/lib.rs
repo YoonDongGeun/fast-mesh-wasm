@@ -42,9 +42,21 @@
 //! - Contacts: [`Scene::find_contacts`] finds the mesh pairs within a margin
 //!   (broadphase over world boxes, then Phase 3b per pair), optionally
 //!   restricted by a [`ContactFilter`].
+//! - Distance fields: [`Scene::add_distance_field`] registers a signed
+//!   distance field ([`DistanceField`]) from one mesh's vertices to another
+//!   mesh, stored in a derived channel `field:<name>` and kept up to date
+//!   incrementally under the [`UpdateMode`] of the mesh it is on
+//!   ([`Scene::update_fields`], [`Scene::flush`]). Read with
+//!   [`Scene::field_values`] and [`Scene::field_status`]; remove with
+//!   [`Scene::remove_field`] (or with either mesh).
+//! - Colours: [`Scene::set_coloring`] colours a mesh from one of its fields
+//!   with a [`ColorRule`]; [`Scene::colors`] returns one RGBA8 per vertex
+//!   slot, and recoloured vertices are reported in
+//!   [`MeshChanges::colors_dirty`].
 
 mod contacts;
 mod error;
+mod fields;
 mod history;
 mod id;
 mod placement;
@@ -54,6 +66,10 @@ mod scene;
 
 pub use contacts::{Contact, ContactFilter};
 pub use error::{Result, SceneError};
+pub use fast_mesh_fields::{
+    ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
+};
+pub use fields::{Coloring, DistanceField, FieldStatus};
 pub use id::MeshId;
 pub use placement::Placement;
 pub use query::{
