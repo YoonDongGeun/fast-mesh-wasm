@@ -14,4 +14,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 fast-mesh.workspace = true
+fast-mesh-scene.workspace = true
+fast-mesh-store.workspace = true
+fast-mesh-query.workspace = true
+fast-mesh-fields.workspace = true
+fast-mesh-ops.workspace = true
 wasm-bindgen.workspace = true

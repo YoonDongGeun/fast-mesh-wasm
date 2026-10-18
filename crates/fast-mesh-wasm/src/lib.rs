@@ -6,6 +6,10 @@
 
 use wasm_bindgen::prelude::*;
 
+// Not yet called by the bindings; the scene bindings will use it.
+#[allow(dead_code)]
+mod render;
+
 fn to_js_error(err: fast_mesh::MeshError) -> JsError {
     JsError::new(&err.to_string())
 }
