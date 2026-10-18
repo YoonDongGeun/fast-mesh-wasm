@@ -276,20 +276,11 @@ fn unused_vertices(
 
 #[cfg(test)]
 mod tests {
-    use fast_mesh_store::{History, Mesh, StoreError};
+    use fast_mesh_store::{History, Mesh};
 
     use super::*;
     use crate::analyze::{AnalyzeOptions, analyze};
-    use crate::fail_allocations_after;
     use crate::test_util::*;
-
-    /// Runs `f` in a transaction and commits; returns its result and whether
-    /// the patch was empty.
-    fn edit<R>(mesh: &mut Mesh, f: impl FnOnce(&mut Transaction) -> Result<R>) -> (R, bool) {
-        let mut tx = mesh.begin_edit();
-        let r = f(&mut tx).unwrap();
-        (r, tx.commit().unwrap().is_empty())
-    }
 
     #[test]
     fn weld_merges_duplicates_and_drops_collapsed() {
@@ -568,38 +559,25 @@ mod tests {
         assert!(empty);
     }
 
-    /// Runs `op` with the `n`-th reservation failing, for every `n` until it
-    /// succeeds; each failure must leave the transaction without a single
-    /// write. Returns how many failure points there were.
-    fn sweep(mut op: impl FnMut(&mut Transaction) -> Result<()>) -> usize {
-        let mut mesh = damaged_sphere();
-        let before = parts(&mesh);
-        let mut n = 0;
-        loop {
-            let mut tx = mesh.begin_edit();
-            fail_allocations_after(Some(n));
-            let r = op(&mut tx);
-            fail_allocations_after(None);
-            let patch = tx.commit().unwrap();
-            if r.is_ok() {
-                assert!(!patch.is_empty());
-                return n;
-            }
-            assert_eq!(r, Err(OpsError::Store(StoreError::OutOfMemory)));
-            assert!(patch.is_empty(), "write before failure point {n}");
-            assert_eq!(parts(&mesh), before);
-            n += 1;
-        }
-    }
-
     #[test]
     fn out_of_memory_is_reported_and_writes_nothing() {
         let comp = ComponentOptions {
             min_triangles: Some(10),
             ..Default::default()
         };
-        assert!(sweep(|tx| weld(tx, 0.0).map(drop)) > 5);
-        assert!(sweep(|tx| remove_degenerate(tx, &DegenerateOptions::default()).map(drop)) > 5);
-        assert!(sweep(|tx| remove_small_components(tx, &comp).map(drop)) > 5);
+        assert!(sweep(damaged_sphere(), |tx| weld(tx, 0.0).map(drop)) > 5);
+        assert!(
+            sweep(damaged_sphere(), |tx| remove_degenerate(
+                tx,
+                &DegenerateOptions::default()
+            )
+            .map(drop))
+                > 5
+        );
+        assert!(
+            sweep(damaged_sphere(), |tx| remove_small_components(tx, &comp)
+                .map(drop))
+                > 5
+        );
     }
 }

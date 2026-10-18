@@ -21,10 +21,13 @@
 //!   an [`Analysis`]: loops, coincident vertices, degenerate and duplicate
 //!   triangles, non-manifold edges and vertices, pinch vertices, components,
 //!   orientation conflicts and, given a BVH, self-intersection.
+//! - Orientation: [`orient()`] makes the winding consistent patch by patch
+//!   and turns closed components outward.
 
 mod analyze;
 mod cleanup;
 mod error;
+mod orient;
 #[cfg(test)]
 mod test_util;
 mod topology;
@@ -36,6 +39,7 @@ pub use cleanup::{
     remove_degenerate, remove_small_components, weld,
 };
 pub use error::{OpsError, Result};
+pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
 use fast_mesh_store::StoreError;

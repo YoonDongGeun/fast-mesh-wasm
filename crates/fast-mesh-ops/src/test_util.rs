@@ -1,6 +1,40 @@
 //! Fixtures shared by the repair tests.
 
-use fast_mesh_store::{Mesh, TriangleId};
+use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId};
+
+use crate::{OpsError, Result, fail_allocations_after};
+
+/// Runs `f` in a transaction and commits; returns its result and whether
+/// the patch was empty.
+pub(crate) fn edit<R>(mesh: &mut Mesh, f: impl FnOnce(&mut Transaction) -> Result<R>) -> (R, bool) {
+    let mut tx = mesh.begin_edit();
+    let r = f(&mut tx).unwrap();
+    (r, tx.commit().unwrap().is_empty())
+}
+
+/// Runs `op` on `mesh` with the `n`-th reservation failing, for every `n`
+/// until it succeeds; each failure must leave the transaction without a
+/// single write, and the success must write. Returns how many failure points
+/// there were.
+pub(crate) fn sweep(mut mesh: Mesh, mut op: impl FnMut(&mut Transaction) -> Result<()>) -> usize {
+    let before = parts(&mesh);
+    let mut n = 0;
+    loop {
+        let mut tx = mesh.begin_edit();
+        fail_allocations_after(Some(n));
+        let r = op(&mut tx);
+        fail_allocations_after(None);
+        let patch = tx.commit().unwrap();
+        if r.is_ok() {
+            assert!(!patch.is_empty());
+            return n;
+        }
+        assert_eq!(r, Err(OpsError::Store(StoreError::OutOfMemory)));
+        assert!(patch.is_empty(), "write before failure point {n}");
+        assert_eq!(parts(&mesh), before);
+        n += 1;
+    }
+}
 
 /// `positions` (flat `xyz`) and `triangles` as a mesh.
 fn mesh_of(positions: &[f32], triangles: &[[u32; 3]]) -> Mesh {
