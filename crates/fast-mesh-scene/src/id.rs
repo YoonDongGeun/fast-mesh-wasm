@@ -14,6 +14,20 @@ pub struct MeshId {
     generation: u32,
 }
 
+impl MeshId {
+    /// The slot index, for passing the id across an FFI boundary together
+    /// with [`MeshId::generation`]. Turn the pair back into an id with
+    /// [`Scene::mesh_id`](crate::Scene::mesh_id).
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    /// The slot generation; see [`MeshId::index`].
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
@@ -76,6 +90,12 @@ impl<T> SlotMap<T> {
             }
         }
         value
+    }
+
+    /// The id of the live value in slot `index` with this `generation`.
+    pub(crate) fn live_id(&self, index: u32, generation: u32) -> Option<MeshId> {
+        let id = MeshId { index, generation };
+        self.get(id).map(|_| id)
     }
 
     pub(crate) fn get(&self, id: MeshId) -> Option<&T> {

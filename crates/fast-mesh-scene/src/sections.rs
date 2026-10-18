@@ -633,6 +633,12 @@ impl Scene {
         }))
     }
 
+    /// The id of the section with this [`SectionId::raw`] value, or `None`
+    /// when there is none (never added, or removed).
+    pub fn section_id(&self, raw: u32) -> Option<SectionId> {
+        self.sections.iter().map(|s| s.id).find(|id| id.0 == raw)
+    }
+
     fn section_index(&self, id: SectionId) -> Result<usize> {
         self.sections
             .iter()
@@ -1383,7 +1389,10 @@ mod tests {
         assert_eq!(scene.section(id, gone), Err(SceneError::UnknownMesh));
         assert_eq!(scene.section_gap(id, gone, a), Err(SceneError::UnknownMesh));
 
+        assert_eq!(scene.section_id(id.raw()), Some(id));
+        assert_eq!(scene.section_id(id.raw() + 1), None);
         scene.remove_section(id).unwrap();
+        assert_eq!(scene.section_id(id.raw()), None);
         assert!(no_hooks(&scene));
         let u = SceneError::UnknownSection;
         assert_eq!(scene.remove_section(id), Err(u.clone()));

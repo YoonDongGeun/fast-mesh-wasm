@@ -238,8 +238,8 @@ impl Entry {
 impl Scene {
     /// Turns the mesh's vertex normals on or off (off by default). Turning
     /// them on computes them right away, whatever the mesh's
-    /// [`UpdateMode`](crate::UpdateMode); either switch is reported as `normals_dirty: None`.
-    /// Setting the current state again does nothing.
+    /// [`UpdateMode`](crate::UpdateMode); either switch is reported as
+    /// `normals_dirty: None`. Setting the current state again does nothing.
     ///
     /// While on, the normals follow the mesh like its BVH: an Eager mesh's
     /// right after every edit, undo, redo and cancel, a Lazy one's on
@@ -269,9 +269,10 @@ impl Scene {
     }
 
     /// The mesh's vertex normals in mesh-local space, one per vertex slot,
-    /// or `None` when normals are off. A normal is the normalised sum of the area-weighted normals
-    /// of the alive triangles using the vertex; a vertex used by none (or
-    /// only by degenerate ones), dead slots included, reads `[0, 0, 0]`.
+    /// or `None` when normals are off. A normal is the normalised sum of the
+    /// area-weighted normals of the alive triangles using the vertex; a
+    /// vertex used by none (or only by degenerate ones), dead slots
+    /// included, reads `[0, 0, 0]`.
     ///
     /// The normals of a Lazy or Manual mesh are those of its last update
     /// (new vertex slots read zero until then). The slice may differ in

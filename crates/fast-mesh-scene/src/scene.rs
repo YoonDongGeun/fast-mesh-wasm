@@ -568,11 +568,11 @@ impl Scene {
 
     /// Brings every Lazy BVH up to date, and every Eager one left stale by a
     /// failed update, and the same for the normals (see
-    /// [`Scene::set_normals`]); then does the same for the fields, which follow the
-    /// mode of the mesh they are on (see [`Scene::update_fields`]), and for
-    /// the section entries, which follow the mode of their mesh (see
-    /// [`Scene::update_sections`]). Manual BVHs, and fields and section
-    /// entries on Manual meshes, are left alone.
+    /// [`Scene::set_normals`]); then does the same for the fields, which
+    /// follow the mode of the mesh they are on (see
+    /// [`Scene::update_fields`]), and for the section entries, which follow
+    /// the mode of their mesh (see [`Scene::update_sections`]). Manual BVHs,
+    /// and fields and section entries on Manual meshes, are left alone.
     ///
     /// # Errors
     /// The first BVH, memory or field error, for example
@@ -794,6 +794,14 @@ impl Scene {
         self.entries.iter().map(|(id, _)| id)
     }
 
+    /// The id of the live mesh with this [`MeshId::index`] and
+    /// [`MeshId::generation`], or `None` when there is none (never added,
+    /// or removed). For ids passed back across an FFI boundary: a stale or
+    /// made-up pair cannot become a live id.
+    pub fn mesh_id(&self, index: u32, generation: u32) -> Option<MeshId> {
+        self.entries.live_id(index, generation)
+    }
+
     /// Where the mesh sits in the world.
     ///
     /// # Errors
@@ -1001,6 +1009,22 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(scene.mesh(a).err(), Some(SceneError::UnknownMesh));
         assert!(scene.mesh(b).is_ok());
+    }
+
+    #[test]
+    fn mesh_id_from_parts_only_for_live_meshes() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), Some(a));
+        assert_eq!(scene.mesh_id(a.index(), a.generation() + 1), None);
+        assert_eq!(scene.mesh_id(a.index() + 1, 0), None);
+        scene.remove_mesh(a).unwrap();
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), None);
+        // The reused slot answers only for its new generation.
+        let b = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        assert_eq!(b.index(), a.index());
+        assert_eq!(scene.mesh_id(b.index(), b.generation()), Some(b));
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), None);
     }
 
     #[test]

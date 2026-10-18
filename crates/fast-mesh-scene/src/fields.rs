@@ -416,6 +416,12 @@ impl Scene {
             .map(|c| c.colors.as_slice()))
     }
 
+    /// The id of the registered field with this [`FieldId::raw`] value, or
+    /// `None` when there is none (never added, or removed).
+    pub fn field_id(&self, raw: u32) -> Option<FieldId> {
+        self.fields.iter().map(|f| f.id).find(|id| id.0 == raw)
+    }
+
     fn field_index(&self, id: FieldId) -> Result<usize> {
         self.fields
             .iter()
@@ -1631,7 +1637,10 @@ mod tests {
             .add_mesh(cube([0.3, 0.3, -0.2], 0.4), MeshOptions::default())
             .unwrap();
         let g = scene.add_distance_field(field("d", a, c, 0.1)).unwrap();
+        assert_eq!(scene.field_id(g.raw()), Some(g));
+        assert_eq!(scene.field_id(fa.raw()), None);
         scene.remove_field(g).unwrap();
+        assert_eq!(scene.field_id(g.raw()), None);
         assert_eq!(scene.field_values(g), Err(SceneError::UnknownField));
         assert!(scene.mesh(a).unwrap().channel("field:d").is_none());
         scene.add_distance_field(field("d", a, c, 0.1)).unwrap();

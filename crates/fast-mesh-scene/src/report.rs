@@ -26,6 +26,14 @@ impl SubscriberId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(pub(crate) u32);
 
+impl FieldId {
+    /// The raw value, for passing the id across an FFI boundary. Turn it
+    /// back into an id with [`Scene::field_id`](crate::Scene::field_id).
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// A plane section of the scene, from
 /// [`Scene::add_section`](crate::Scene::add_section).
 ///
@@ -33,6 +41,14 @@ pub struct FieldId(pub(crate) u32);
 /// compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SectionId(pub(crate) u32);
+
+impl SectionId {
+    /// The raw value, for passing the id across an FFI boundary. Turn it
+    /// back into an id with [`Scene::section_id`](crate::Scene::section_id).
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
 
 /// What happened to one mesh since the subscriber's last
 /// [`Scene::take_changes_for`](crate::Scene::take_changes_for) (or
