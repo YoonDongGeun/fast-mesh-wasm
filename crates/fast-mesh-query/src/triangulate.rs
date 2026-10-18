@@ -3,12 +3,12 @@
 //! [`triangulate`] is ear clipping in the manner of Mapbox's earcut: the
 //! polygon is a doubly linked ring of vertices, each hole is bridged into the
 //! outer ring by a pair of coincident edges, and ears are clipped until two
-//! vertices remain. Above [`Z_ORDER_MIN`] points the ear test finds the
-//! vertices near a candidate ear through a list sorted by z-order (Morton)
-//! code, as earcut does, instead of walking the whole ring, so that large
-//! rings no longer cost `O(n²)`. It is meant for section fills and hole
-//! filling, where the input is usually simple but may not be, so it never
-//! panics and reports whether it finished instead of failing.
+//! vertices remain. Above 80 points the ear test finds the vertices near a
+//! candidate ear through a list sorted by z-order (Morton) code, as earcut
+//! does, instead of walking the whole ring, so that large rings no longer
+//! cost `O(n²)`. It is meant for section fills and hole filling, where the
+//! input is usually simple but may not be, so it never panics and reports
+//! whether it finished instead of failing.
 
 use std::cmp::Ordering;
 

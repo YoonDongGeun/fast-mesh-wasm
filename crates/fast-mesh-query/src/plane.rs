@@ -6,7 +6,10 @@ use crate::{QueryError, Result};
 /// in it. The frame is right-handed: `normal = u × v`.
 ///
 /// The signed distance of a point `p` is `n·p − n·origin`, in `f64`; points
-/// with a signed distance of zero or more are on the plane's `+` side.
+/// with a signed distance of zero or more are on the plane's `+` side. So a
+/// point exactly in the plane counts as `+`, and flipping the normal is not
+/// always the same cut: a mesh face lying in the plane is cut with one sign
+/// of the normal and not the other (see [`slice`](crate::slice())).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Plane {
     origin: [f64; 3],

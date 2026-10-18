@@ -2,8 +2,12 @@
 //!
 //! Every query takes a mesh and a BVH built for it, works in the mesh's local
 //! `f32` coordinates, and fails with [`QueryError::StaleBvh`] when the mesh was
-//! edited after the BVH was last updated. Queries allocate only into the
-//! output vector they are given.
+//! edited after the BVH was last updated. Point, ray, region and pair queries
+//! allocate only into the output vector they are given. [`slice()`],
+//! [`fill()`], [`contour_gap`] and
+//! [`triangulate`](triangulate::triangulate) also build per-call temporaries,
+//! all reserved fallibly, so that running out of memory is
+//! [`QueryError::OutOfMemory`].
 //!
 //! - Closest point: [`closest_point`] and [`closest_point_many`], with the
 //!   [`Feature`] of the triangle the nearest point lies on.

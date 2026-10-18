@@ -141,7 +141,9 @@ pub struct Slice {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Contour {
     /// The crossing point of each edge in `edges`, in the mesh's local
-    /// coordinates (the plane's frame).
+    /// coordinates (the `f32` positions widened to `f64`, without the mesh
+    /// origin), not in the plane's `(u, v)` frame: see
+    /// [`Plane::to_uv`](crate::Plane::to_uv).
     pub points: Vec<[f64; 3]>,
     /// The crossed edge `(min id, max id)` of each point.
     pub edges: Vec<(VertexId, VertexId)>,
@@ -180,6 +182,13 @@ const SPLIT: usize = usize::MAX - 1;
 /// loops run counter-clockwise in `(u, v)` and holes clockwise. An oriented
 /// open contour runs the same way. A plane through vertices gives
 /// coincident points joined by zero-length segments; they are kept.
+///
+/// A face lying exactly in the plane is cut or not depending on the sign of
+/// the normal, because its vertices are all on the `+` side (`s ≥ 0`): a
+/// cube cut at its top face with the normal `+z` gives the square of that
+/// face (the side faces cross from `−` to `+` there), while with `−z` all of
+/// the cube is on the `+` side and nothing is cut. Offset the plane slightly
+/// to choose.
 ///
 /// A zero-area triangle `[a, a, b]` crossed between `a` and `b` gives a
 /// segment from edge `(a, b)` back to itself. It has no length, so it is
