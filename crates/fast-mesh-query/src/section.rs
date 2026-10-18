@@ -68,7 +68,9 @@ pub fn signed_area(points: &[[f64; 2]]) -> f64 {
 /// Contours are nested into outers and holes:
 /// - When every contour is oriented, counter-clockwise contours are outers,
 ///   and each clockwise contour is a hole of the smallest outer containing
-///   it. A clockwise contour inside no outer is not filled.
+///   it. A clockwise contour inside no outer is not filled. When the summed
+///   signed area is negative (a closed mesh wound inward), the orientation is
+///   taken as reversed throughout: clockwise contours are the outers.
 /// - When any contour is unoriented, winding is ignored: a contour inside an
 ///   even number of others is an outer, and one inside an odd number is a
 ///   hole of the smallest such outer containing it.
@@ -80,7 +82,8 @@ pub fn signed_area(points: &[[f64; 2]]) -> f64 {
 ///
 /// Returns whether the fill is good (`fill_ok`): `false` when triangulation
 /// could not finish, or when the fill's signed area differs from the
-/// contours' summed area (signed when oriented; by nesting depth otherwise)
+/// contours' summed area (signed when oriented, with the sign flipped when
+/// reversed; by nesting depth otherwise)
 /// by more than `1e-6 · max(1, Σ |area|)`. This is best effort: there is no
 /// separate self-intersection test, so a bad fill can go unreported.
 ///
@@ -156,16 +159,25 @@ fn fill_into(contours: &[(&[[f64; 2]], bool)], out: &mut Fill) -> Result<bool> {
     let mut expected = 0.0;
     let mut scale = 0.0;
     if contours.iter().all(|c| c.1) {
+        // A closed mesh wound inward gives clockwise outers and
+        // counter-clockwise holes: a negative total means the orientation is
+        // reversed throughout.
+        let sign = if info.iter().map(|c| c.area).sum::<f64>() < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
         for (i, c) in info.iter().enumerate() {
-            roles.push(if c.area > 0.0 {
+            let area = sign * c.area;
+            roles.push(if area > 0.0 {
                 Role::Outer
-            } else if c.area < 0.0 {
-                container(i, &|j| info[j].area > 0.0).map_or(Role::Skip, Role::Hole)
+            } else if area < 0.0 {
+                container(i, &|j| sign * info[j].area > 0.0).map_or(Role::Skip, Role::Hole)
             } else {
                 Role::Skip
             });
-            expected += c.area;
-            scale += c.area.abs();
+            expected += area;
+            scale += area.abs();
         }
     } else {
         let mut depth = Vec::new();
@@ -765,15 +777,42 @@ mod tests {
     }
 
     #[test]
+    fn fill_inside_out_contours() {
+        // A ring, then the same ring wound inward (clockwise outer,
+        // counter-clockwise hole): the same fill.
+        let outer = square([0.0, 0.0], 3.0, true);
+        let hole = square([0.5, 0.0], 1.0, false);
+        let mut out = Fill::default();
+        assert_eq!(fill(&[(&outer, true), (&hole, true)], &mut out), Ok(true));
+        let area = fill_area(&out);
+        assert!((area - 32.0).abs() < 1e-9, "{area}");
+        let (outer_cw, hole_ccw) = (
+            square([0.0, 0.0], 3.0, false),
+            square([0.5, 0.0], 1.0, true),
+        );
+        assert_eq!(
+            fill(&[(&outer_cw, true), (&hole_ccw, true)], &mut out),
+            Ok(true)
+        );
+        assert_eq!(fill_area(&out), area);
+        // A lone clockwise contour is an inside-out outer.
+        assert_eq!(fill(&[(&outer_cw, true)], &mut out), Ok(true));
+        assert!((fill_area(&out) - 36.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn fill_orphan_hole_and_reused_output() {
-        // A clockwise contour inside no outer is not filled, so the area check fails.
+        // A clockwise contour inside no outer is not filled, so the area check
+        // fails (and only that outer is filled).
+        let outer = square([10.0, 0.0], 3.0, true);
         let hole = square([0.0, 0.0], 1.0, false);
         let mut out = Fill {
             points: vec![[9.0, 9.0]],
             triangles: vec![[0, 0, 0]],
         };
-        assert_eq!(fill(&[(&hole, true)], &mut out), Ok(false));
-        assert_eq!(out, Fill::default());
+        assert_eq!(fill(&[(&outer, true), (&hole, true)], &mut out), Ok(false));
+        assert_eq!(out.points, outer);
+        assert!((fill_area(&out) - 36.0).abs() < 1e-9);
         // Collinear and tiny contours fill nothing and pass.
         let line = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
         assert_eq!(fill(&[(&line, true), (&[], false)], &mut out), Ok(true));
@@ -798,11 +837,8 @@ mod tests {
         for ring in [&bow[..], &twisted[..]] {
             for oriented in [true, false] {
                 let ok = fill(&[(ring, oriented)], &mut out).unwrap();
-                let expected = if oriented {
-                    signed_area(ring)
-                } else {
-                    signed_area(ring).abs()
-                };
+                // One ring is an outer whichever way it turns.
+                let expected = signed_area(ring).abs();
                 if ok {
                     assert!((fill_area(&out) - expected).abs() <= 1e-6);
                 }
