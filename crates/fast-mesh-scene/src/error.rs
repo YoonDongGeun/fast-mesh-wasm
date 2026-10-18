@@ -18,6 +18,8 @@ pub enum SceneError {
     /// The field id is unknown: the field was removed, by hand or with the
     /// mesh it was on or measured to.
     UnknownField,
+    /// The section id is unknown: the section was removed.
+    UnknownSection,
     /// The mesh's BVH is out of date and its update mode forbids updating it
     /// implicitly.
     StaleBvh(MeshId),
@@ -42,6 +44,7 @@ impl fmt::Display for SceneError {
         match self {
             SceneError::UnknownMesh => f.write_str("unknown or removed mesh id"),
             SceneError::UnknownField => f.write_str("unknown or removed field id"),
+            SceneError::UnknownSection => f.write_str("unknown or removed section id"),
             SceneError::StaleBvh(id) => write!(f, "the BVH of mesh {id:?} is out of date"),
             SceneError::InvalidInput(what) => write!(f, "invalid input: {what}"),
             SceneError::StepNotOpen => f.write_str("no history step is open"),

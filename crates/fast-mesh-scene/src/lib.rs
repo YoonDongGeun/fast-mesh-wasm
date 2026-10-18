@@ -53,6 +53,14 @@
 //!   with a [`ColorRule`]; [`Scene::colors`] returns one RGBA8 per vertex
 //!   slot, and recoloured vertices are reported in
 //!   [`MeshChanges::colors_dirty`].
+//! - Sections: [`Scene::add_section`] cuts meshes with a world [`Plane`]
+//!   ([`SectionDesc`]) into contours in world and plane `(u, v)`
+//!   coordinates, with length, signed area and an optional fill
+//!   ([`SectionResult`]), kept up to date under each mesh's [`UpdateMode`]
+//!   ([`Scene::update_sections`], [`Scene::flush`]). Read with
+//!   [`Scene::section`], [`Scene::section_status`] and
+//!   [`Scene::section_gap`]; changes are reported in
+//!   [`MeshChanges::sections_changed`].
 
 mod contacts;
 mod error;
@@ -63,17 +71,21 @@ mod placement;
 mod query;
 mod report;
 mod scene;
+mod sections;
 
 pub use contacts::{Contact, ContactFilter};
 pub use error::{Result, SceneError};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
 };
+pub use fast_mesh_query::Plane;
 pub use fields::{Coloring, DistanceField, FieldStatus};
 pub use id::MeshId;
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
 };
+pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};
+pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};

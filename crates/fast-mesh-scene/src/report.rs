@@ -26,6 +26,14 @@ impl SubscriberId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(pub(crate) u32);
 
+/// A plane section of the scene, from
+/// [`Scene::add_section`](crate::Scene::add_section).
+///
+/// Opaque: section ids are handed out by the scene, never reused, and only
+/// compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SectionId(pub(crate) u32);
+
 /// What happened to one mesh since the subscriber's last
 /// [`Scene::take_changes_for`](crate::Scene::take_changes_for) (or
 /// [`Scene::take_changes`](crate::Scene::take_changes) for the default
@@ -53,6 +61,10 @@ pub struct MeshChanges {
     /// The fields on this mesh whose values changed since the last call,
     /// each once.
     pub fields_changed: Vec<FieldId>,
+    /// The sections whose result for this mesh changed since the last call
+    /// (recomputed to a different result, removed, or no longer selecting
+    /// the mesh), each once, in the order first reported.
+    pub sections_changed: Vec<SectionId>,
     /// The channels written through
     /// [`Scene::derived_channel_mut`](crate::Scene::derived_channel_mut),
     /// added with [`Scene::add_channel`](crate::Scene::add_channel) or
@@ -73,6 +85,7 @@ pub(crate) struct Report {
     /// Recoloured vertices; `None` means "all".
     pub(crate) colors_dirty: Option<Vec<VertexId>>,
     pub(crate) fields_changed: Vec<FieldId>,
+    pub(crate) sections_changed: Vec<SectionId>,
     pub(crate) channels_written: Vec<String>,
 }
 
@@ -96,6 +109,7 @@ impl Report {
             added: false,
             colors_dirty: Some(Vec::new()),
             fields_changed: Vec::new(),
+            sections_changed: Vec::new(),
             channels_written: Vec::new(),
         }
     }
@@ -107,6 +121,7 @@ impl Report {
             && self.changes.as_ref().is_some_and(ChangeSet::is_empty)
             && self.colors_dirty.as_ref().is_some_and(Vec::is_empty)
             && self.fields_changed.is_empty()
+            && self.sections_changed.is_empty()
             && self.channels_written.is_empty()
     }
 
@@ -134,6 +149,14 @@ impl Report {
     pub(crate) fn field_changed(&mut self, id: FieldId) {
         if !self.fields_changed.contains(&id) {
             self.fields_changed.push(id);
+        }
+    }
+
+    /// Notes a change of section `id`'s result for the mesh, once per
+    /// section.
+    pub(crate) fn section_changed(&mut self, id: SectionId) {
+        if !self.sections_changed.contains(&id) {
+            self.sections_changed.push(id);
         }
     }
 
@@ -166,6 +189,7 @@ impl Report {
             removed,
             colors_dirty: r.colors_dirty,
             fields_changed: r.fields_changed,
+            sections_changed: r.sections_changed,
             channels_written: r.channels_written,
         }
     }

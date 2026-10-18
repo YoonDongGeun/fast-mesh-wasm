@@ -1,0 +1,1451 @@
+//! Plane sections of meshes of the scene (spec §6, §11).
+//!
+//! A section cuts the meshes it selects with one world [`Plane`]. For each
+//! selected mesh it keeps a [`SectionResult`]: the contours of the cut in
+//! world and plane `(u, v)` coordinates, their lengths and signed areas, and
+//! optionally the filled cross-section.
+//!
+//! **What an update recomputes.** Each section has a change accumulator on
+//! every mesh it selects (a [`SectionHook`], fed like a subscriber's report).
+//! An entry is stale when the hook holds a non-empty change set, "everything"
+//! or a placement change, or when the section's plane or fill changed, or the
+//! mesh was just selected. A stale entry is recomputed in full: the world
+//! plane is mapped into the mesh's local frame, cut with [`slice()`], and the
+//! points are mapped back.
+//!
+//! Each entry also keeps the sorted vertex ids of its crossed edges and its
+//! crossed triangles, for a finer staleness rule later.
+
+use fast_mesh_query::{Fill, Gap2, Plane, Slice, contour_gap, contour_length, signed_area};
+use fast_mesh_store::{ChangeSet, StoreError, TriangleId, VertexId};
+
+use crate::placement::{local_to_world, world_to_local};
+use crate::scene::Entry;
+use crate::{MeshId, Result, Scene, SceneError, SectionId, UpdateMode};
+
+/// A plane section to register with
+/// [`Scene::add_section`](crate::Scene::add_section).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionDesc {
+    /// The cutting plane, in world coordinates. Its `(u, v)` frame is the
+    /// frame of every result's 2D points.
+    pub plane: Plane,
+    /// The meshes cut, each once.
+    pub meshes: Vec<MeshId>,
+    /// Whether results carry the filled cross-section.
+    pub fill: bool,
+}
+
+/// Whether a section's result for a mesh matches the scene as it is now,
+/// from [`Scene::section_status`](crate::Scene::section_status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionStatus {
+    /// Computed, and nothing it depends on changed since.
+    Current,
+    /// Not computed yet, or something it depends on changed since.
+    Stale,
+}
+
+/// One chain of a section: a closed loop or an open polyline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SectionContour {
+    /// The crossing point of each edge in `edges`, in world coordinates.
+    pub points: Vec<[f64; 3]>,
+    /// The same points in the section plane's `(u, v)` frame.
+    pub uv: Vec<[f64; 2]>,
+    /// The crossed edge `(min id, max id)` of each point.
+    pub edges: Vec<(VertexId, VertexId)>,
+    /// The triangle of each segment: `triangles[i]` joins point `i` to point
+    /// `i + 1`, and the last one of a closed contour joins the last point to
+    /// the first.
+    pub triangles: Vec<TriangleId>,
+    /// Whether the last point joins back to the first.
+    pub closed: bool,
+    /// Whether every segment runs the same way along the contour. On a
+    /// closed, outward-wound mesh outer loops run counter-clockwise in
+    /// `(u, v)` and holes clockwise.
+    pub oriented: bool,
+    /// Whether no end of the contour is a split at a non-manifold edge.
+    pub manifold: bool,
+    /// The length of the polyline (with the closing segment when closed).
+    pub length: f64,
+    /// The signed area in `(u, v)`, positive counter-clockwise; 0 when open.
+    pub area: f64,
+}
+
+/// A section's result for one mesh, from
+/// [`Scene::section`](crate::Scene::section).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionResult {
+    /// The contours, sorted by their first edge key.
+    pub contours: Vec<SectionContour>,
+    /// The summed length of every contour.
+    pub length: f64,
+    /// The summed signed area of the closed, oriented contours.
+    pub area: f64,
+    /// The filled cross-section over the closed contours, when the section
+    /// has fill on and the result was computed. Its points are `(u, v)`;
+    /// [`Plane::from_uv`] of the section plane maps them to the world.
+    pub fill: Option<Fill>,
+    /// Whether the fill looks good (see [`fast_mesh_query::fill`]): best
+    /// effort, a bad fill can go unreported. `true` when `fill` is `None`.
+    pub fill_ok: bool,
+}
+
+impl Default for SectionResult {
+    /// The result before the first computation: no contours, zero length
+    /// and area, no fill.
+    fn default() -> Self {
+        SectionResult {
+            contours: Vec::new(),
+            length: 0.0,
+            area: 0.0,
+            fill: None,
+            fill_ok: true,
+        }
+    }
+}
+
+/// The closest pair between two meshes' contours in a section, from
+/// [`Scene::section_gap`](crate::Scene::section_gap).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gap {
+    /// The distance between `a` and `b` in the plane; 0 when the contours
+    /// cross or touch.
+    pub distance: f64,
+    /// The point on the first mesh's contours, in world coordinates.
+    pub a: [f64; 3],
+    /// The point on the second mesh's contours, in world coordinates.
+    pub b: [f64; 3],
+}
+
+fn oom() -> SceneError {
+    SceneError::Store(StoreError::OutOfMemory)
+}
+
+/// A `Vec` with room for `n` items, or `OutOfMemory`.
+fn try_vec<T>(n: usize) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| oom())?;
+    Ok(v)
+}
+
+/// What happened to one mesh of a section since its entry was last
+/// computed.
+#[derive(Debug, Clone)]
+pub(crate) struct SectionHook {
+    pub(crate) section: SectionId,
+    /// Merged changes; `None` means "everything".
+    pub(crate) changes: Option<ChangeSet>,
+    pub(crate) placement_changed: bool,
+}
+
+impl SectionHook {
+    fn new(section: SectionId) -> SectionHook {
+        SectionHook {
+            section,
+            changes: Some(ChangeSet::default()),
+            placement_changed: false,
+        }
+    }
+
+    fn is_clean(&self) -> bool {
+        !self.placement_changed && self.changes.as_ref().is_some_and(ChangeSet::is_empty)
+    }
+}
+
+/// A section's state for one selected mesh.
+struct SectionEntry {
+    mesh: MeshId,
+    result: SectionResult,
+    /// The plane or fill changed, or the mesh was just selected.
+    stale: bool,
+    computed_once: bool,
+    /// The vertices of the crossed edges, ascending without duplicates.
+    crossed_vertices: Vec<VertexId>,
+    /// The crossed triangles, ascending without duplicates.
+    crossed_triangles: Vec<TriangleId>,
+}
+
+impl SectionEntry {
+    fn new(mesh: MeshId) -> SectionEntry {
+        SectionEntry {
+            mesh,
+            result: SectionResult::default(),
+            stale: true,
+            computed_once: false,
+            crossed_vertices: Vec::new(),
+            crossed_triangles: Vec::new(),
+        }
+    }
+}
+
+/// A registered section.
+pub(crate) struct Section {
+    id: SectionId,
+    desc: SectionDesc,
+    /// One per mesh of `desc.meshes`, in that order.
+    entries: Vec<SectionEntry>,
+}
+
+/// A freshly computed entry.
+struct Computed {
+    result: SectionResult,
+    crossed_vertices: Vec<VertexId>,
+    crossed_triangles: Vec<TriangleId>,
+}
+
+impl Entry {
+    fn section_hook(&self, id: SectionId) -> Option<&SectionHook> {
+        self.section_hooks.iter().find(|h| h.section == id)
+    }
+
+    fn reset_section_hook(&mut self, id: SectionId) {
+        if let Some(h) = self.section_hooks.iter_mut().find(|h| h.section == id) {
+            *h = SectionHook::new(id);
+        }
+    }
+
+    fn remove_section_hook(&mut self, id: SectionId) {
+        self.section_hooks.retain(|h| h.section != id);
+    }
+}
+
+/// `Rᵀ d`: a world direction in the mesh's local frame.
+fn rotate_back(rotation: &[[f64; 3]; 3], d: [f64; 3]) -> [f64; 3] {
+    let r = rotation;
+    std::array::from_fn(|i| r[0][i] * d[0] + r[1][i] * d[1] + r[2][i] * d[2])
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn unit(a: [f64; 3]) -> [f64; 3] {
+    let n = dot(a, a).sqrt();
+    a.map(|c| c / n)
+}
+
+/// The world plane in the mesh's stored local frame (origin excluded), with
+/// axes `Rᵀu` and `Rᵀv`, so that local `(u, v)` equals world `(u, v)`. The
+/// axes are re-orthonormalised: a placement's rotation is only orthonormal
+/// within `1e-6`.
+fn local_plane(entry: &Entry, plane: &Plane) -> Result<Plane> {
+    let p = &entry.placement;
+    let origin = world_to_local(p, entry.mesh.origin(), plane.origin());
+    let u = unit(rotate_back(&p.rotation, plane.u()));
+    let v = rotate_back(&p.rotation, plane.v());
+    let d = dot(v, u);
+    let v = unit(std::array::from_fn(|k| v[k] - d * u[k]));
+    Ok(Plane::with_axes(origin, u, v)?)
+}
+
+/// Cuts the entry's mesh with `desc`'s plane; its BVH must be current.
+fn compute(entry: &Entry, desc: &SectionDesc) -> Result<Computed> {
+    let plane = &desc.plane;
+    let (p, o) = (&entry.placement, entry.mesh.origin());
+    let mut cut = Slice::default();
+    fast_mesh_query::slice(
+        &entry.mesh,
+        &entry.bvh,
+        &local_plane(entry, plane)?,
+        &mut cut,
+    )?;
+
+    let mut contours = try_vec(cut.contours.len())?;
+    let (mut length, mut area) = (0.0, 0.0);
+    let (mut nv, mut nt) = (0, 0);
+    for c in cut.contours {
+        let mut points = try_vec(c.points.len())?;
+        let mut uv = try_vec(c.points.len())?;
+        for &q in &c.points {
+            let w = local_to_world(p, o, q);
+            points.push(w);
+            uv.push(plane.to_uv(w));
+        }
+        let l = contour_length(&uv, c.closed);
+        let a = if c.closed { signed_area(&uv) } else { 0.0 };
+        length += l;
+        if c.closed && c.oriented {
+            area += a;
+        }
+        nv += 2 * c.edges.len();
+        nt += c.triangles.len();
+        contours.push(SectionContour {
+            points,
+            uv,
+            edges: c.edges,
+            triangles: c.triangles,
+            closed: c.closed,
+            oriented: c.oriented,
+            manifold: c.manifold,
+            length: l,
+            area: a,
+        });
+    }
+
+    let mut crossed_vertices = try_vec(nv)?;
+    let mut crossed_triangles = try_vec(nt)?;
+    for c in &contours {
+        crossed_vertices.extend(c.edges.iter().flat_map(|&(a, b)| [a, b]));
+        crossed_triangles.extend_from_slice(&c.triangles);
+    }
+    crossed_vertices.sort_unstable();
+    crossed_vertices.dedup();
+    crossed_triangles.sort_unstable();
+    crossed_triangles.dedup();
+
+    let (fill, fill_ok) = if desc.fill {
+        let mut closed = try_vec(contours.len())?;
+        closed.extend(
+            contours
+                .iter()
+                .filter(|c| c.closed)
+                .map(|c| (c.uv.as_slice(), c.oriented)),
+        );
+        let mut f = Fill::default();
+        let ok = fast_mesh_query::fill(&closed, &mut f)?;
+        (Some(f), ok)
+    } else {
+        (None, true)
+    };
+
+    Ok(Computed {
+        result: SectionResult {
+            contours,
+            length,
+            area,
+            fill,
+            fill_ok,
+        },
+        crossed_vertices,
+        crossed_triangles,
+    })
+}
+
+/// A polyline's `(u, v)` points and whether it is closed.
+type Polyline<'a> = (&'a [[f64; 2]], bool);
+
+/// The polylines of a result's contours, for [`contour_gap`].
+fn polylines(r: &SectionResult) -> Result<Vec<Polyline<'_>>> {
+    let mut out = try_vec(r.contours.len())?;
+    out.extend(r.contours.iter().map(|c| (c.uv.as_slice(), c.closed)));
+    Ok(out)
+}
+
+impl Scene {
+    /// Registers a plane section of the meshes `desc.meshes` and returns its
+    /// id. Sections are not in the history: undo does not move planes.
+    ///
+    /// Each selected mesh gets its own [`SectionResult`], which follows the
+    /// [`UpdateMode`] of that mesh: an Eager mesh's is computed right away
+    /// and after every edit, placement change, undo, redo or cancel of the
+    /// mesh, and after every plane or fill change; a Lazy one's by
+    /// [`Scene::flush`], [`Scene::update`] or [`Scene::update_sections`]; a
+    /// Manual one's by [`Scene::update`] or [`Scene::update_sections`]. A
+    /// failed Eager computation is swallowed and leaves the entry stale.
+    /// Until its first computation an entry reads as an empty result with
+    /// status [`SectionStatus::Stale`].
+    ///
+    /// Results that change are reported in the mesh's
+    /// [`MeshChanges::sections_changed`](crate::MeshChanges::sections_changed).
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale mesh id;
+    /// [`SceneError::InvalidInput`] for a mesh listed twice; a memory error.
+    /// Never [`SceneError::StaleBvh`]. The scene is unchanged on error.
+    pub fn add_section(&mut self, desc: SectionDesc) -> Result<SectionId> {
+        self.check_selection(&desc.meshes)?;
+        let next = self
+            .next_section
+            .checked_add(1)
+            .ok_or(SceneError::InvalidInput("too many sections"))?;
+        let mut entries = try_vec(desc.meshes.len())?;
+        for &m in &desc.meshes {
+            self.entries
+                .get_mut(m)
+                .ok_or(SceneError::UnknownMesh)?
+                .section_hooks
+                .try_reserve(1)
+                .map_err(|_| oom())?;
+            entries.push(SectionEntry::new(m));
+        }
+        self.sections.try_reserve(1).map_err(|_| oom())?;
+        // Nothing can fail from here on.
+        let id = SectionId(self.next_section);
+        self.next_section = next;
+        for &m in &desc.meshes {
+            if let Some(e) = self.entries.get_mut(m) {
+                e.section_hooks.push(SectionHook::new(id));
+            }
+        }
+        self.sections.push(Section { id, desc, entries });
+        self.run_section_eager(self.sections.len() - 1);
+        Ok(id)
+    }
+
+    /// Removes a section. The removal is reported in the
+    /// [`MeshChanges::sections_changed`](crate::MeshChanges::sections_changed)
+    /// of every mesh it selected, and the id is rejected from then on.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`] for an unknown or removed section.
+    pub fn remove_section(&mut self, id: SectionId) -> Result<()> {
+        let i = self.section_index(id)?;
+        let s = self.sections.remove(i);
+        for se in &s.entries {
+            if let Some(e) = self.entries.get_mut(se.mesh) {
+                e.remove_section_hook(id);
+                e.report_section(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves a section's plane. Every entry of the section becomes stale
+    /// (Eager ones are recomputed right away); nothing else is touched.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`] for an unknown or removed section.
+    pub fn set_section_plane(&mut self, id: SectionId, plane: Plane) -> Result<()> {
+        let i = self.section_index(id)?;
+        self.sections[i].desc.plane = plane;
+        self.restale_section(i);
+        Ok(())
+    }
+
+    /// Changes the meshes a section cuts. Meshes it keeps keep their entries;
+    /// added meshes start stale (Eager ones are computed right away); removed
+    /// meshes drop their entries, which is reported in their
+    /// [`MeshChanges::sections_changed`](crate::MeshChanges::sections_changed).
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`]; [`SceneError::UnknownMesh`] for a
+    /// stale mesh id; [`SceneError::InvalidInput`] for a mesh listed twice; a
+    /// memory error. Never [`SceneError::StaleBvh`]. The scene is unchanged
+    /// on error.
+    pub fn set_section_meshes(&mut self, id: SectionId, meshes: Vec<MeshId>) -> Result<()> {
+        let i = self.section_index(id)?;
+        self.check_selection(&meshes)?;
+        let mut entries = try_vec(meshes.len())?;
+        let old = &self.sections[i].entries;
+        for &m in &meshes {
+            if !old.iter().any(|se| se.mesh == m) {
+                self.entries
+                    .get_mut(m)
+                    .ok_or(SceneError::UnknownMesh)?
+                    .section_hooks
+                    .try_reserve(1)
+                    .map_err(|_| oom())?;
+            }
+        }
+        // Nothing can fail from here on.
+        let mut old = std::mem::take(&mut self.sections[i].entries);
+        for &m in &meshes {
+            match old.iter().position(|se| se.mesh == m) {
+                Some(k) => entries.push(old.swap_remove(k)),
+                None => {
+                    if let Some(e) = self.entries.get_mut(m) {
+                        e.section_hooks.push(SectionHook::new(id));
+                    }
+                    entries.push(SectionEntry::new(m));
+                }
+            }
+        }
+        for se in &old {
+            if let Some(e) = self.entries.get_mut(se.mesh) {
+                e.remove_section_hook(id);
+                e.report_section(id);
+            }
+        }
+        let s = &mut self.sections[i];
+        s.entries = entries;
+        s.desc.meshes = meshes;
+        self.run_section_eager(i);
+        Ok(())
+    }
+
+    /// Turns a section's fill on or off. Every entry of the section becomes
+    /// stale (Eager ones are recomputed right away); nothing else is touched.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`] for an unknown or removed section.
+    pub fn set_section_fill(&mut self, id: SectionId, fill: bool) -> Result<()> {
+        let i = self.section_index(id)?;
+        self.sections[i].desc.fill = fill;
+        self.restale_section(i);
+        Ok(())
+    }
+
+    /// Computes every stale section entry, whatever the mode of its mesh,
+    /// bringing the BVHs it needs up to date under the query rules (Lazy
+    /// ones are updated). Renderers call this (or [`Scene::flush`]), then
+    /// read any number of results.
+    ///
+    /// # Errors
+    /// The first error, for example [`SceneError::StaleBvh`] for an entry
+    /// whose mesh has a stale Manual BVH: such an entry stays stale, and
+    /// makes every call return `StaleBvh` until that BVH is brought up to
+    /// date with [`Scene::update`]. Every entry is still attempted.
+    pub fn update_sections(&mut self) -> Result<()> {
+        self.run_sections(|_| true, None)
+    }
+
+    /// The section's result for `mesh` as of its last computation (see
+    /// [`Scene::section_status`]); empty before the first one. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`]; [`SceneError::UnknownMesh`] for a
+    /// stale mesh id; [`SceneError::InvalidInput`] for a live mesh the
+    /// section does not select.
+    pub fn section(&self, id: SectionId, mesh: MeshId) -> Result<&SectionResult> {
+        let (i, k) = self.section_entry(id, mesh)?;
+        Ok(&self.sections[i].entries[k].result)
+    }
+
+    /// Whether the section's result for `mesh` is current. Never updates.
+    ///
+    /// # Errors
+    /// As for [`Scene::section`].
+    pub fn section_status(&self, id: SectionId, mesh: MeshId) -> Result<SectionStatus> {
+        let (i, k) = self.section_entry(id, mesh)?;
+        Ok(if self.entry_current(i, k) {
+            SectionStatus::Current
+        } else {
+            SectionStatus::Stale
+        })
+    }
+
+    /// The closest pair between the contours of meshes `a` and `b` in the
+    /// section, measured in the plane, with its points in the world; `None`
+    /// when either has no contour segments. Never updates: it reads the last
+    /// computed results, so for a stale entry (see [`Scene::section_status`])
+    /// it describes the scene as of that computation, and its points are
+    /// placed with the section's current plane.
+    ///
+    /// # Errors
+    /// As for [`Scene::section`], for either mesh; a memory error.
+    pub fn section_gap(&self, id: SectionId, a: MeshId, b: MeshId) -> Result<Option<Gap>> {
+        let (i, ka) = self.section_entry(id, a)?;
+        let (_, kb) = self.section_entry(id, b)?;
+        let s = &self.sections[i];
+        let pa = polylines(&s.entries[ka].result)?;
+        let pb = polylines(&s.entries[kb].result)?;
+        let plane = &s.desc.plane;
+        Ok(contour_gap(&pa, &pb)?.map(|g: Gap2| Gap {
+            distance: g.distance,
+            a: plane.from_uv(g.a),
+            b: plane.from_uv(g.b),
+        }))
+    }
+
+    fn section_index(&self, id: SectionId) -> Result<usize> {
+        self.sections
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(SceneError::UnknownSection)
+    }
+
+    /// The section's index and the index of `mesh`'s entry in it.
+    fn section_entry(&self, id: SectionId, mesh: MeshId) -> Result<(usize, usize)> {
+        let i = self.section_index(id)?;
+        self.entry(mesh)?;
+        let k = self.sections[i]
+            .entries
+            .iter()
+            .position(|se| se.mesh == mesh)
+            .ok_or(SceneError::InvalidInput(
+                "the section does not select this mesh",
+            ))?;
+        Ok((i, k))
+    }
+
+    /// Every mesh live and listed once.
+    fn check_selection(&self, meshes: &[MeshId]) -> Result<()> {
+        for (j, &m) in meshes.iter().enumerate() {
+            self.entry(m)?;
+            if meshes[..j].contains(&m) {
+                return Err(SceneError::InvalidInput(
+                    "a section lists a mesh more than once",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Computed at least once, and nothing changed since.
+    fn entry_current(&self, i: usize, k: usize) -> bool {
+        let s = &self.sections[i];
+        let se = &s.entries[k];
+        se.computed_once
+            && !se.stale
+            && self
+                .entry(se.mesh)
+                .ok()
+                .and_then(|e| e.section_hook(s.id))
+                .is_some_and(SectionHook::is_clean)
+    }
+
+    /// Stales every entry of section `i`, then computes the Eager ones.
+    fn restale_section(&mut self, i: usize) {
+        for se in &mut self.sections[i].entries {
+            se.stale = true;
+        }
+        self.run_section_eager(i);
+    }
+
+    /// Computes the stale entries of section `i` whose mesh is Eager,
+    /// swallowing failures.
+    fn run_section_eager(&mut self, i: usize) {
+        for k in 0..self.sections[i].entries.len() {
+            let eager = self
+                .entry(self.sections[i].entries[k].mesh)
+                .is_ok_and(|e| e.mode == UpdateMode::Eager);
+            if eager && !self.entry_current(i, k) {
+                let _ = self.compute_entry(i, k);
+            }
+        }
+    }
+
+    /// Computes the stale entries whose mesh's mode passes `want` and (with
+    /// `touched`) is one of those meshes. Returns the first error; every
+    /// entry is attempted.
+    pub(crate) fn run_sections(
+        &mut self,
+        want: impl Fn(UpdateMode) -> bool,
+        touched: Option<&[MeshId]>,
+    ) -> Result<()> {
+        let mut first = Ok(());
+        for i in 0..self.sections.len() {
+            for k in 0..self.sections[i].entries.len() {
+                let mesh = self.sections[i].entries[k].mesh;
+                if touched.is_some_and(|t| !t.contains(&mesh)) {
+                    continue;
+                }
+                let Ok(e) = self.entry(mesh) else { continue };
+                if !want(e.mode) || self.entry_current(i, k) {
+                    continue;
+                }
+                let r = self.compute_entry(i, k);
+                if first.is_ok() {
+                    first = r;
+                }
+            }
+        }
+        first
+    }
+
+    /// Computes the Eager entries of `touched` (all with `None`). Failures
+    /// are swallowed: the entry stays stale (§6.3).
+    pub(crate) fn run_eager_sections(&mut self, touched: Option<&[MeshId]>) {
+        let _ = self.run_sections(|m| m == UpdateMode::Eager, touched);
+    }
+
+    /// Drops `mesh` from every section selecting it, reporting it on the
+    /// mesh (before its removal).
+    pub(crate) fn drop_sections_of(&mut self, mesh: MeshId) {
+        for s in &mut self.sections {
+            if let Some(k) = s.entries.iter().position(|se| se.mesh == mesh) {
+                s.entries.remove(k);
+                s.desc.meshes.retain(|&m| m != mesh);
+                if let Some(e) = self.entries.get_mut(mesh) {
+                    e.remove_section_hook(s.id);
+                    e.report_section(s.id);
+                }
+            }
+        }
+    }
+
+    /// Recomputes entry `k` of section `i` in full, and reports it when the
+    /// result changed or was never computed. All or nothing: on error the
+    /// entry and its pending changes stay as they were.
+    fn compute_entry(&mut self, i: usize, k: usize) -> Result<()> {
+        let mesh = self.sections[i].entries[k].mesh;
+        self.prepare(Some(&[mesh]))?;
+        let c = compute(self.entry(mesh)?, &self.sections[i].desc)?;
+        #[cfg(test)]
+        {
+            self.section_recomputes += 1;
+        }
+        // Commit: nothing below fails.
+        let s = &mut self.sections[i];
+        let id = s.id;
+        let se = &mut s.entries[k];
+        let changed = !se.computed_once || se.result != c.result;
+        se.result = c.result;
+        se.crossed_vertices = c.crossed_vertices;
+        se.crossed_triangles = c.crossed_triangles;
+        se.stale = false;
+        se.computed_once = true;
+        let e = self.entries.get_mut(mesh).ok_or(SceneError::UnknownMesh)?;
+        e.reset_section_hook(id);
+        if changed {
+            e.report_section(id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f64::consts::PI;
+
+    use fast_mesh_store::Mesh;
+
+    use super::*;
+    use crate::{MeshChanges, MeshOptions, Placement, SceneOptions, SubscriberId};
+
+    /// A closed UV sphere of radius `r` around `centre`, outward wound: one
+    /// vertex at each pole and `stacks - 1` rings of `slices` vertices.
+    /// Built from `f64` positions, so its origin is the centre of its box.
+    fn sphere(stacks: u32, slices: u32, r: f64, centre: [f64; 3]) -> Mesh {
+        let mut pos = vec![centre[0], centre[1], centre[2] + r];
+        for i in 1..stacks {
+            let theta = PI * f64::from(i) / f64::from(stacks);
+            for j in 0..slices {
+                let phi = 2.0 * PI * f64::from(j) / f64::from(slices);
+                let (rs, rc) = (r * theta.sin(), r * theta.cos());
+                pos.extend([
+                    centre[0] + rs * phi.cos(),
+                    centre[1] + rs * phi.sin(),
+                    centre[2] + rc,
+                ]);
+            }
+        }
+        pos.extend([centre[0], centre[1], centre[2] - r]);
+        let south = 1 + (stacks - 1) * slices;
+        let ring = |i: u32, j: u32| 1 + (i - 1) * slices + j % slices;
+        let mut idx = Vec::new();
+        for j in 0..slices {
+            idx.extend([0, ring(1, j), ring(1, j + 1)]);
+            for i in 1..stacks - 1 {
+                let (a, b, c, d) = (
+                    ring(i, j),
+                    ring(i + 1, j),
+                    ring(i + 1, j + 1),
+                    ring(i, j + 1),
+                );
+                idx.extend([a, b, c, a, c, d]);
+            }
+            idx.extend([ring(stacks - 1, j), south, ring(stacks - 1, j + 1)]);
+        }
+        Mesh::from_buffers_f64(&pos, &idx).unwrap()
+    }
+
+    fn unit_sphere() -> Mesh {
+        sphere(32, 64, 1.0, [0.0; 3])
+    }
+
+    fn with_mode(mode: UpdateMode) -> MeshOptions {
+        MeshOptions {
+            mode,
+            ..MeshOptions::default()
+        }
+    }
+
+    fn at(x: f64, y: f64, z: f64) -> Placement {
+        Placement {
+            translation: [x, y, z],
+            ..Placement::IDENTITY
+        }
+    }
+
+    fn z_plane(h: f64) -> Plane {
+        Plane::new([0.0, 0.0, h], [0.0, 0.0, 1.0]).unwrap()
+    }
+
+    fn desc(plane: Plane, meshes: &[MeshId], fill: bool) -> SectionDesc {
+        SectionDesc {
+            plane,
+            meshes: meshes.to_vec(),
+            fill,
+        }
+    }
+
+    fn close(value: f64, expected: f64, rel: f64) -> bool {
+        (value - expected).abs() <= rel * expected.abs()
+    }
+
+    /// The circumference of the cut of a unit sphere at height `h`.
+    fn circle(h: f64) -> f64 {
+        2.0 * PI * (1.0 - h * h).sqrt()
+    }
+
+    /// A scene with one unit sphere in `mode`, its add already taken.
+    fn one_sphere(mode: UpdateMode) -> (Scene, MeshId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(unit_sphere(), with_mode(mode)).unwrap();
+        scene.take_changes();
+        (scene, m)
+    }
+
+    /// The sections reported on `mesh` in `ch`.
+    fn of(ch: &[MeshChanges], mesh: MeshId) -> Vec<SectionId> {
+        ch.iter()
+            .find(|c| c.id == mesh)
+            .map_or(Vec::new(), |c| c.sections_changed.clone())
+    }
+
+    /// The section's result for `mesh` is current and equals one computed
+    /// from scratch by a new section with the same plane and fill.
+    fn assert_fresh(scene: &mut Scene, id: SectionId, mesh: MeshId, at: &str) {
+        scene.update_sections().unwrap();
+        assert_eq!(
+            scene.section_status(id, mesh),
+            Ok(SectionStatus::Current),
+            "{at}"
+        );
+        let s = &scene.sections[scene.section_index(id).unwrap()];
+        let d = desc(s.desc.plane, &[mesh], s.desc.fill);
+        let fresh = scene.add_section(d).unwrap();
+        scene.update_sections().unwrap();
+        let want = scene.section(fresh, mesh).unwrap().clone();
+        assert_eq!(scene.section(id, mesh).unwrap(), &want, "{at}");
+        scene.remove_section(fresh).unwrap();
+    }
+
+    fn fill_area(f: &Fill) -> f64 {
+        f.triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| f.points[i as usize]);
+                0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+            })
+            .sum()
+    }
+
+    /// The rotation of the quaternion `q` (normalised first).
+    fn rotation(q: [f64; 4]) -> [[f64; 3]; 3] {
+        let n = q.iter().map(|c| c * c).sum::<f64>().sqrt();
+        let [w, x, y, z] = q.map(|c| c / n);
+        [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - w * z),
+                2.0 * (x * z + w * y),
+            ],
+            [
+                2.0 * (x * y + w * z),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - w * x),
+            ],
+            [
+                2.0 * (x * z - w * y),
+                2.0 * (y * z + w * x),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ]
+    }
+
+    fn remove_triangles_using(scene: &mut Scene, m: MeshId, v: VertexId) -> Vec<TriangleId> {
+        let tris: Vec<TriangleId> = scene
+            .mesh(m)
+            .unwrap()
+            .triangles()
+            .iter()
+            .enumerate()
+            .filter(|(t, tri)| {
+                scene.mesh(m).unwrap().is_triangle_alive(*t as TriangleId) && tri.contains(&v)
+            })
+            .map(|(t, _)| t as TriangleId)
+            .collect();
+        scene.edit(m, |tx| tx.remove_triangles(&tris)).unwrap();
+        tris
+    }
+
+    #[test]
+    fn add_section_eager_computes_immediately() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap().clone();
+        assert_eq!(r.contours.len(), 1);
+        let c = &r.contours[0];
+        assert!(c.closed && c.oriented && c.manifold);
+        assert!(close(r.length, 2.0 * PI * 0.954, 1e-2), "{}", r.length);
+        assert!(close(r.length, circle(0.3), 1e-2));
+        assert_eq!(r.length, c.length);
+        assert!(r.area > 0.0 && r.area == c.area);
+        assert!(close(r.area, PI * (1.0 - 0.09), 1e-2), "{}", r.area);
+        assert!(r.fill.is_none() && r.fill_ok);
+        assert_eq!(c.points.len(), c.uv.len());
+        assert_eq!(c.points.len(), c.edges.len());
+        assert_eq!(c.triangles.len(), c.points.len());
+        assert!(c.points.iter().all(|p| (p[2] - 0.3).abs() < 1e-6));
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].sections_changed, [id]);
+        assert_eq!(scene.section_recomputes, 1);
+        // The crossed sets cover the contour.
+        let se = &scene.sections[0].entries[0];
+        assert_eq!(se.crossed_triangles.len(), c.triangles.len());
+        assert!(se.crossed_vertices.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            c.edges
+                .iter()
+                .all(|&(a, b)| se.crossed_vertices.binary_search(&a).is_ok()
+                    && se.crossed_vertices.binary_search(&b).is_ok())
+        );
+    }
+
+    #[test]
+    fn lazy_waits_for_update_sections() {
+        let (mut scene, m) = one_sphere(UpdateMode::Lazy);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], true)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        assert_eq!(scene.section(id, m), Ok(&SectionResult::default()));
+        assert!(scene.take_changes().is_empty());
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap();
+        assert_eq!(r.contours.len(), 1);
+        assert!(r.fill.is_some() && r.fill_ok);
+        assert_eq!(scene.take_changes()[0].sections_changed, [id]);
+        // Nothing stale: nothing recomputed or reported.
+        scene.update_sections().unwrap();
+        scene.flush().unwrap();
+        assert_eq!(scene.section_recomputes, 1);
+        assert!(scene.take_changes().is_empty());
+        // An edit stales it until a flush.
+        scene
+            .edit(m, |tx| tx.set_positions(&[40], &[[0.0, 0.0, 0.0]]))
+            .unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        scene.flush().unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        assert_fresh(&mut scene, id, m, "after flush");
+    }
+
+    #[test]
+    fn plane_move_restales_and_recomputes_eager() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        scene.set_section_plane(id, z_plane(-0.5)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap();
+        assert!(close(r.length, circle(0.5), 1e-2), "{}", r.length);
+        assert!(
+            r.contours[0]
+                .points
+                .iter()
+                .all(|p| (p[2] + 0.5).abs() < 1e-6)
+        );
+        assert_eq!(scene.section_recomputes, 2);
+        assert_fresh(&mut scene, id, m, "eager");
+
+        // A Lazy mesh keeps the old result, Stale, until updated.
+        let (mut scene, m) = one_sphere(UpdateMode::Lazy);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        scene.update_sections().unwrap();
+        let old = scene.section(id, m).unwrap().clone();
+        scene.set_section_plane(id, z_plane(-0.5)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        assert_eq!(scene.section(id, m), Ok(&old));
+        scene.update_sections().unwrap();
+        let r = scene.section(id, m).unwrap();
+        assert!(close(r.length, circle(0.5), 1e-2));
+        // A fill change stales it too.
+        scene.set_section_fill(id, true).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        assert!(scene.section(id, m).unwrap().fill.is_none());
+        scene.update_sections().unwrap();
+        assert!(scene.section(id, m).unwrap().fill.is_some());
+    }
+
+    #[test]
+    fn world_points_match_local_slice_with_origin() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let centre = [1000.0, -1000.0, 500.0];
+        for _ in 0..8 {
+            let mut scene = Scene::new(SceneOptions::default());
+            let placement = Placement {
+                rotation: rotation([next(), next(), next(), next()]),
+                translation: [next() * 50.0, next() * 50.0, next() * 50.0],
+            };
+            let opts = MeshOptions {
+                placement,
+                ..MeshOptions::default()
+            };
+            let m = scene.add_mesh(sphere(24, 48, 1.0, centre), opts).unwrap();
+            let o = scene.mesh(m).unwrap().origin();
+            assert!((0..3).all(|k| (o[k] - centre[k]).abs() < 1e-9), "{o:?}");
+            // A plane through the sphere, in the world.
+            let c = placement.apply(centre);
+            let n = [next(), next(), next()];
+            let off = next() * 1.2;
+            let len = n.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let origin: [f64; 3] = std::array::from_fn(|k| c[k] + off * n[k] / len);
+            let plane = Plane::new(origin, n).unwrap();
+            let id = scene.add_section(desc(plane, &[m], false)).unwrap();
+            let r = scene.section(id, m).unwrap().clone();
+            assert!(!r.contours.is_empty());
+
+            // The same cut made directly in local space.
+            let r_t = |d: [f64; 3]| -> [f64; 3] {
+                let r = &placement.rotation;
+                std::array::from_fn(|i| r[0][i] * d[0] + r[1][i] * d[1] + r[2][i] * d[2])
+            };
+            let local = Plane::with_axes(
+                scene.world_to_local(m, plane.origin()).unwrap(),
+                r_t(plane.u()),
+                r_t(plane.v()),
+            )
+            .unwrap();
+            let mut cut = Slice::default();
+            fast_mesh_query::slice(
+                scene.mesh(m).unwrap(),
+                scene.bvh(m).unwrap(),
+                &local,
+                &mut cut,
+            )
+            .unwrap();
+            assert_eq!(cut.contours.len(), r.contours.len());
+            let tol = 1e-9 * 1000.0;
+            for (want, got) in cut.contours.iter().zip(&r.contours) {
+                assert_eq!(want.edges, got.edges);
+                assert_eq!(want.triangles, got.triangles);
+                assert_eq!(
+                    (want.closed, want.oriented, want.manifold),
+                    (got.closed, got.oriented, got.manifold)
+                );
+                for ((&l, &w), &uv) in want.points.iter().zip(&got.points).zip(&got.uv) {
+                    let p = scene.local_to_world(m, l).unwrap();
+                    assert!((0..3).all(|k| (p[k] - w[k]).abs() <= tol), "{p:?} {w:?}");
+                    let q = plane.to_uv(w);
+                    assert!((0..2).all(|k| (q[k] - uv[k]).abs() <= tol), "{q:?} {uv:?}");
+                    assert!(plane.signed_distance(w).abs() < 1e-6);
+                }
+            }
+            // Outward winding stays counter-clockwise in the world frame.
+            assert!(r.area > 0.0);
+        }
+    }
+
+    #[test]
+    fn plane_missing_mesh_gives_empty_current_result() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(5.0), &[m], true)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap();
+        assert!(r.contours.is_empty());
+        assert_eq!((r.length, r.area), (0.0, 0.0));
+        assert_eq!(r.fill, Some(Fill::default()));
+        assert!(r.fill_ok);
+        // The first computation is reported, even when empty.
+        assert_eq!(scene.take_changes()[0].sections_changed, [id]);
+        // Still missing: recomputed to the same result, not reported.
+        scene.set_section_plane(id, z_plane(6.0)).unwrap();
+        assert_eq!(scene.section_recomputes, 2);
+        assert!(scene.take_changes().is_empty());
+    }
+
+    #[test]
+    fn edit_undo_redo_keep_result_equal_to_from_scratch() {
+        type Op = Box<dyn Fn(&mut Scene, MeshId)>;
+        // A vertex of the ring just above the plane (ring 16 is the equator).
+        let v: VertexId = 1 + 15 * 64 + 3;
+        let ops: Vec<(&str, Op)> = vec![
+            (
+                "move across",
+                Box::new(move |s, m| {
+                    s.edit(m, |tx| tx.set_positions(&[v], &[[0.9, 0.2, -0.2]]))
+                        .unwrap();
+                }),
+            ),
+            (
+                "remove triangles",
+                Box::new(move |s, m| {
+                    remove_triangles_using(s, m, v + 1);
+                }),
+            ),
+            ("undo", Box::new(|s, _| assert!(s.undo().unwrap()))),
+            ("undo", Box::new(|s, _| assert!(s.undo().unwrap()))),
+            ("redo", Box::new(|s, _| assert!(s.redo().unwrap()))),
+            (
+                "placement",
+                Box::new(|s, m| s.set_placement(m, at(0.1, 0.0, 0.02)).unwrap()),
+            ),
+            (
+                "cancelled drag",
+                Box::new(move |s, m| {
+                    s.begin_step();
+                    s.set_placement(m, at(0.0, 0.0, 0.6)).unwrap();
+                    s.edit(m, |tx| tx.set_positions(&[v], &[[0.0, 0.0, 0.0]]))
+                        .unwrap();
+                    s.cancel_step().unwrap();
+                }),
+            ),
+            (
+                "undo placement",
+                Box::new(|s, _| assert!(s.undo().unwrap())),
+            ),
+            (
+                "redo placement",
+                Box::new(|s, _| assert!(s.redo().unwrap())),
+            ),
+        ];
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy, UpdateMode::Manual] {
+            let (mut scene, m) = one_sphere(mode);
+            let id = scene.add_section(desc(z_plane(0.05), &[m], true)).unwrap();
+            assert_fresh(&mut scene, id, m, "start");
+            for (name, op) in &ops {
+                let before = scene.section(id, m).unwrap().clone();
+                op(&mut scene, m);
+                let expect = if mode == UpdateMode::Eager {
+                    SectionStatus::Current
+                } else {
+                    SectionStatus::Stale
+                };
+                assert_eq!(scene.section_status(id, m), Ok(expect), "{mode:?} {name}");
+                if mode != UpdateMode::Eager {
+                    assert_eq!(scene.section(id, m), Ok(&before), "{mode:?} {name}");
+                }
+                if mode == UpdateMode::Manual {
+                    scene.update(m).unwrap();
+                }
+                assert_fresh(&mut scene, id, m, &format!("{mode:?} {name}"));
+            }
+        }
+    }
+
+    #[test]
+    fn placement_change_recomputes() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        scene.take_changes();
+        scene.set_placement(m, at(0.0, 0.0, 0.2)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap();
+        assert!(close(r.length, circle(0.1), 1e-2), "{}", r.length);
+        assert!(
+            r.contours[0]
+                .points
+                .iter()
+                .all(|p| (p[2] - 0.3).abs() < 1e-6)
+        );
+        let ch = scene.take_changes();
+        assert!(ch[0].placement_changed);
+        assert_eq!(ch[0].sections_changed, [id]);
+        assert_fresh(&mut scene, id, m, "moved");
+    }
+
+    #[test]
+    fn fill_on_gives_area_matching_contours() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], true)).unwrap();
+        let r = scene.section(id, m).unwrap();
+        assert!(r.fill_ok);
+        let f = r.fill.as_ref().unwrap();
+        assert!(!f.triangles.is_empty());
+        let a = fill_area(f);
+        assert!(close(a, r.area, 1e-6), "{a} {}", r.area);
+        assert!(close(r.area, PI * (1.0 - 0.09), 1e-2));
+        // Turning fill off drops it.
+        scene.set_section_fill(id, false).unwrap();
+        let r = scene.section(id, m).unwrap();
+        assert!(r.fill.is_none() && r.fill_ok);
+    }
+
+    #[test]
+    fn gap_between_two_spheres() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let opts = MeshOptions {
+            placement: at(3.0, 0.0, 0.0),
+            ..MeshOptions::default()
+        };
+        let b = scene.add_mesh(unit_sphere(), opts).unwrap();
+        let id = scene
+            .add_section(desc(z_plane(0.0), &[a, b], false))
+            .unwrap();
+        let g = scene.section_gap(id, a, b).unwrap().unwrap();
+        assert!((g.distance - 1.0).abs() < 1e-3, "{}", g.distance);
+        assert!((g.a[0] - 1.0).abs() < 1e-3 && (g.b[0] - 2.0).abs() < 1e-3);
+        for p in [g.a, g.b] {
+            assert!(p[1].abs() < 1e-3 && p[2].abs() < 1e-9, "{p:?}");
+        }
+        let d = (0..3)
+            .map(|k| (g.a[k] - g.b[k]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((d - g.distance).abs() < 1e-9);
+        // Symmetric, and None when one side has no contours.
+        let h = scene.section_gap(id, b, a).unwrap().unwrap();
+        assert!((h.distance - g.distance).abs() < 1e-12);
+        scene.set_placement(b, at(3.0, 0.0, 5.0)).unwrap();
+        assert_eq!(scene.section_gap(id, a, b), Ok(None));
+    }
+
+    #[test]
+    fn error_paths() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let gone = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        scene.remove_mesh(gone).unwrap();
+        let p = z_plane(0.0);
+        let invalid = |r: &Result<SectionId>| matches!(r, Err(SceneError::InvalidInput(_)));
+        assert_eq!(
+            scene.add_section(desc(p, &[a, gone], false)),
+            Err(SceneError::UnknownMesh)
+        );
+        assert!(invalid(&scene.add_section(desc(p, &[a, b, a], false))));
+        assert!(scene.sections.is_empty());
+        let no_hooks = |s: &Scene| {
+            s.ids()
+                .all(|m| s.entry(m).unwrap().section_hooks.is_empty())
+        };
+        assert!(no_hooks(&scene));
+
+        let id = scene.add_section(desc(p, &[a], false)).unwrap();
+        assert_eq!(
+            scene.set_section_meshes(id, vec![a, gone]),
+            Err(SceneError::UnknownMesh)
+        );
+        assert!(matches!(
+            scene.set_section_meshes(id, vec![b, b]),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert_eq!(scene.sections[0].desc.meshes, [a]);
+        assert!(scene.entry(b).unwrap().section_hooks.is_empty());
+        assert!(matches!(
+            scene.section(id, b),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.section_status(id, b),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.section_gap(id, a, b),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert_eq!(scene.section(id, gone), Err(SceneError::UnknownMesh));
+        assert_eq!(scene.section_gap(id, gone, a), Err(SceneError::UnknownMesh));
+
+        scene.remove_section(id).unwrap();
+        assert!(no_hooks(&scene));
+        let u = SceneError::UnknownSection;
+        assert_eq!(scene.remove_section(id), Err(u.clone()));
+        assert_eq!(scene.set_section_plane(id, p), Err(u.clone()));
+        assert_eq!(scene.set_section_meshes(id, vec![a]), Err(u.clone()));
+        assert_eq!(scene.set_section_fill(id, true), Err(u.clone()));
+        assert_eq!(scene.section(id, a), Err(u.clone()));
+        assert_eq!(scene.section_status(id, a), Err(u.clone()));
+        assert_eq!(scene.section_gap(id, a, a), Err(u.clone()));
+        assert_eq!(u.to_string(), "unknown or removed section id");
+        // Ids are not reused.
+        let again = scene.add_section(desc(p, &[a], false)).unwrap();
+        assert_ne!(again, id);
+        assert_eq!(scene.section(id, a), Err(u));
+    }
+
+    #[test]
+    fn remove_section_and_mesh_report_once() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(unit_sphere(), with_mode(UpdateMode::Lazy))
+            .unwrap();
+        let s2 = scene.subscribe();
+        let id = scene
+            .add_section(desc(z_plane(0.2), &[a, b], false))
+            .unwrap();
+        scene.update_sections().unwrap();
+        scene.take_changes();
+        scene.take_changes_for(s2).unwrap();
+        scene.remove_section(id).unwrap();
+        for s in [SubscriberId::DEFAULT, s2] {
+            let ch = scene.take_changes_for(s).unwrap();
+            assert_eq!(ch.len(), 2);
+            for c in &ch {
+                assert_eq!(c.sections_changed, [id], "{:?}", c.id);
+                assert!(c.changes.as_ref().unwrap().is_empty());
+            }
+        }
+
+        let id2 = scene
+            .add_section(desc(z_plane(0.2), &[a, b], false))
+            .unwrap();
+        scene.take_changes();
+        scene.take_changes_for(s2).unwrap();
+        scene.remove_mesh(b).unwrap();
+        assert_eq!(scene.sections[0].desc.meshes, [a]);
+        assert_eq!(scene.section(id2, b), Err(SceneError::UnknownMesh));
+        assert_eq!(scene.section_status(id2, b), Err(SceneError::UnknownMesh));
+        assert_eq!(scene.section_status(id2, a), Ok(SectionStatus::Current));
+        for s in [SubscriberId::DEFAULT, s2] {
+            let ch = scene.take_changes_for(s).unwrap();
+            assert_eq!(ch.len(), 1);
+            assert!(ch[0].removed && ch[0].id == b);
+            assert_eq!(ch[0].sections_changed, [id2]);
+        }
+        scene.update_sections().unwrap();
+        scene.remove_section(id2).unwrap();
+        assert_eq!(of(&scene.take_changes_for(s2).unwrap(), a), [id2]);
+        assert_eq!(scene.section(id2, a), Err(SceneError::UnknownSection));
+        assert_eq!(scene.section_status(id, a), Err(SceneError::UnknownSection));
+    }
+
+    #[test]
+    fn selection_change_keeps_and_drops_entries() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(unit_sphere(), with_mode(UpdateMode::Lazy))
+            .unwrap();
+        let c = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let id = scene
+            .add_section(desc(z_plane(0.2), &[a, b], false))
+            .unwrap();
+        scene.take_changes();
+        let n = scene.section_recomputes;
+        scene.set_section_meshes(id, vec![c, a]).unwrap();
+        // c (Eager) is computed, a is kept as it is, b is dropped.
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_eq!(scene.section_status(id, a), Ok(SectionStatus::Current));
+        assert_eq!(scene.section_status(id, c), Ok(SectionStatus::Current));
+        assert!(matches!(
+            scene.section(id, b),
+            Err(SceneError::InvalidInput(_))
+        ));
+        let ch = scene.take_changes();
+        assert_eq!(of(&ch, a), []);
+        assert_eq!(of(&ch, b), [id]);
+        assert_eq!(of(&ch, c), [id]);
+        assert!(scene.entry(b).unwrap().section_hooks.is_empty());
+        // A selected Lazy mesh is stale until updated.
+        scene.set_section_meshes(id, vec![c, a, b]).unwrap();
+        assert_eq!(scene.section_status(id, b), Ok(SectionStatus::Stale));
+        assert_fresh(&mut scene, id, b, "reselected");
+    }
+
+    #[test]
+    fn compact_recomputes_and_reports() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        // Remove the north pole, so that compaction renumbers every vertex.
+        remove_triangles_using(&mut scene, m, 0);
+        scene.edit(m, |tx| tx.remove_vertices(&[0])).unwrap();
+        assert_fresh(&mut scene, id, m, "holed");
+        scene.take_changes();
+        let before = scene.section(id, m).unwrap().clone();
+        let n = scene.section_recomputes;
+        scene.compact(m).unwrap();
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let after = scene.section(id, m).unwrap();
+        assert_ne!(after.contours[0].edges, before.contours[0].edges);
+        assert!(close(after.length, before.length, 1e-12));
+        let ch = scene.take_changes();
+        assert!(ch[0].changes.is_none());
+        assert_eq!(ch[0].sections_changed, [id]);
+        assert_fresh(&mut scene, id, m, "compacted");
+    }
+
+    #[test]
+    fn manual_stale_bvh_returns_error_and_stays_stale() {
+        let (mut scene, m) = one_sphere(UpdateMode::Manual);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        // Manual waits, even with a current BVH; flush leaves it alone.
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        scene.flush().unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        scene
+            .edit(m, |tx| tx.set_positions(&[40], &[[0.0, 0.0, 0.0]]))
+            .unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        let old = scene.section(id, m).unwrap().clone();
+        assert_eq!(scene.update_sections(), Err(SceneError::StaleBvh(m)));
+        assert_eq!(scene.update_sections(), Err(SceneError::StaleBvh(m)));
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        assert_eq!(scene.section(id, m), Ok(&old));
+        scene.flush().unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        scene.update(m).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        assert_fresh(&mut scene, id, m, "updated");
+        // add_section never fails with StaleBvh.
+        scene
+            .edit(m, |tx| tx.set_positions(&[41], &[[0.0, 0.0, 0.0]]))
+            .unwrap();
+        let other = scene.add_section(desc(z_plane(0.0), &[m], false)).unwrap();
+        assert_eq!(scene.section_status(other, m), Ok(SectionStatus::Stale));
+        assert_eq!(scene.update_sections(), Err(SceneError::StaleBvh(m)));
+    }
+
+    #[test]
+    fn failed_eager_bvh_update_is_retried_by_the_section() {
+        let (mut scene, m) = one_sphere(UpdateMode::Eager);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        // The edit's own BVH update fails; the edit still succeeds, and the
+        // section brings the BVH up to date before cutting.
+        crate::scene::fault::fail_bvh_update_on(1);
+        scene
+            .edit(m, |tx| tx.set_positions(&[40], &[[0.0, 0.0, 0.0]]))
+            .unwrap();
+        assert_eq!(scene.is_current(m), Ok(true));
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        assert_fresh(&mut scene, id, m, "retried");
+    }
+
+    #[test]
+    fn sections_changed_exact() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let c = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let s1 = scene
+            .add_section(desc(z_plane(0.2), &[a, b], false))
+            .unwrap();
+        let s2 = scene
+            .add_section(desc(z_plane(0.4), &[b, c], false))
+            .unwrap();
+        let ch = scene.take_changes();
+        assert_eq!(of(&ch, a), [s1]);
+        assert_eq!(of(&ch, b), [s1, s2]);
+        assert_eq!(of(&ch, c), [s2]);
+        // Two plane moves: s1 once, on its meshes only.
+        scene.set_section_plane(s1, z_plane(0.1)).unwrap();
+        scene.set_section_plane(s1, z_plane(0.0)).unwrap();
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 2);
+        assert_eq!(of(&ch, a), [s1]);
+        assert_eq!(of(&ch, b), [s1]);
+        assert_eq!(of(&ch, c), []);
+        // A placement change of b: both its sections, on b only.
+        scene.set_placement(b, at(0.0, 0.0, 0.05)).unwrap();
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 1);
+        assert_eq!(of(&ch, b), [s1, s2]);
+    }
+}
