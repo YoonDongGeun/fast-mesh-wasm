@@ -338,27 +338,42 @@ pub struct LoopId {
     pub min_vertex: VertexId,
     /// The number of vertices on the loop.
     pub len: u32,
-    /// FNV-1a 64 over the little-endian bytes of the vertex ids, in loop
-    /// order starting at `min_vertex`.
+    /// FNV-1a 64 over the little-endian bytes of the vertex ids in
+    /// [`BoundaryLoop::vertices`] order: for a closed loop, starting at
+    /// `min_vertex`; for an open chain, from its first end.
     pub hash: u64,
 }
 
 /// A chain of boundary edges, closed unless the walk could not close it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryLoop {
+    /// The loop's content fingerprint, which callers pass back to pick this
+    /// loop (for example to fill it). It matches as long as the loop's vertex
+    /// sequence is unchanged, across edits and transactions.
     pub id: LoopId,
-    /// The vertices in loop order, starting at `id.min_vertex`. The loop runs
-    /// along each boundary edge in the direction its one triangle uses it, so
-    /// a hole in an outward-facing surface runs clockwise seen from outside.
-    /// The polygon closes from the last vertex back to the first.
+    /// The vertices in loop order. The loop runs along each boundary edge in
+    /// the direction its one triangle uses it, so a hole in an outward-facing
+    /// surface runs clockwise seen from outside. A closed loop starts at
+    /// `id.min_vertex` and its polygon closes from the last vertex back to the
+    /// first. An open chain runs from one end to the other, unrotated.
     pub vertices: Vec<VertexId>,
-    /// The length of the closed polygon, in local units.
+    /// The length of the polygon closed from the last vertex back to the
+    /// first, in local units (for an open chain, including that closing step).
     pub perimeter: f64,
-    /// The vector area `|sum p_i x p_(i+1)| / 2` of the closed polygon.
+    /// The vector area `|sum p_i x p_(i+1)| / 2` of the same closed polygon.
     pub area: f64,
-    /// `false` when a vertex of the loop touches a non-manifold edge, so the
-    /// edges there were paired by key order rather than by the fan: the loop
-    /// may then be open or join openings that are not one hole.
+    /// `true` when the walk came back to its first edge. `false` for an open
+    /// chain, which ends at a vertex where no boundary edge continues it (for
+    /// example at a non-manifold edge). An open chain is never clean, so it is
+    /// never filled.
+    pub closed: bool,
+    /// `false` when the edges at some vertex of the loop could not be ordered
+    /// by the fan walk: the vertex touches a non-manifold edge, or it is a
+    /// pinch whose fan pieces are wound against each other, so the walk fell
+    /// back to pairing by edge key. The loop may then be open or join openings
+    /// that are not one hole. This fails safe: unclean loops are skipped by
+    /// `fill_holes` unless allowed, and orienting first makes a wound-against
+    /// pinch clean.
     pub clean: bool,
 }
 
@@ -374,8 +389,8 @@ pub(crate) fn fnv1a(ids: &[VertexId]) -> u64 {
     h
 }
 
-/// The boundary loops of `mesh`, sorted by smallest vertex, then by the
-/// vertex after it.
+/// The boundary loops of `mesh`, sorted by smallest vertex, then by vertex
+/// sequence (for a closed loop, the vertex after the smallest).
 ///
 /// Each loop follows the boundary edges (edges of exactly one proper
 /// triangle). At each vertex `b`, entered along `a -> b`, the walk rotates
@@ -388,6 +403,10 @@ pub(crate) fn fnv1a(ids: &[VertexId]) -> u64 {
 /// fan reaches a non-manifold edge, the outgoing boundary edges at that
 /// vertex are paired in key order instead, and loops through a vertex on a
 /// non-manifold edge are marked unclean.
+///
+/// Walks first start at chain heads, vertices with more outgoing than
+/// incoming boundary half-edges, so that an open chain is walked whole from
+/// its first end; the closed loops are walked after.
 pub fn boundary_loops(mesh: &Mesh) -> Result<Vec<BoundaryLoop>> {
     let edges = EdgeMap::build(mesh)?;
     loops_with(mesh, &edges)
@@ -434,14 +453,23 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
         }
     }
     half.sort_unstable_by_key(|s| (s.from, s.to));
+    // Outgoing minus incoming boundary half-edges per vertex: chain heads are
+    // the vertices where it is positive.
+    let mut excess = filled(mesh.vertex_slots(), 0i64)?;
+    for s in &half {
+        excess[s.from as usize] += 1;
+        excess[s.to as usize] -= 1;
+    }
     let mut visited = filled(edges.len(), false)?;
     let mut loops: Vec<BoundaryLoop> = Vec::new();
     let mut verts: Vec<VertexId> = Vec::new();
-    for h in 0..half.len() {
+    let order = (0..2).flat_map(|pass| (0..half.len()).map(move |h| (pass, h)));
+    for (pass, h) in order {
         let start = half[h];
-        if visited[start.edge] {
+        if visited[start.edge] || (pass == 0 && excess[start.from as usize] <= 0) {
             continue;
         }
+        let mut closed = true;
         verts.clear();
         let mut clean = true;
         let mut cur = start;
@@ -481,8 +509,11 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
                 Some(s) if s.edge == start.edge => break,
                 Some(s) => cur = s,
                 None => {
-                    // Nothing leaves `b`: an open chain ending at `b`.
+                    // Nothing leaves `b`: an open chain ending at `b`. Only the
+                    // key-order fallback can get here, so it is already unclean.
                     push(&mut verts, b)?;
+                    closed = false;
+                    clean = false;
                     break;
                 }
             }
@@ -490,9 +521,11 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
         if verts.iter().any(|&v| non_manifold[v as usize]) {
             clean = false;
         }
-        push(&mut loops, make_loop(mesh, &verts, clean)?)?;
+        push(&mut loops, make_loop(mesh, &verts, closed, clean)?)?;
     }
-    loops.sort_unstable_by(|a, b| a.vertices.cmp(&b.vertices));
+    loops.sort_unstable_by(|a, b| {
+        (a.id.min_vertex, &a.vertices).cmp(&(b.id.min_vertex, &b.vertices))
+    });
     Ok(loops)
 }
 
@@ -577,21 +610,25 @@ fn fan_walk(
     None
 }
 
-/// The loop through `verts`, rotated to its canonical start.
-fn make_loop(mesh: &Mesh, verts: &[VertexId], clean: bool) -> Result<BoundaryLoop> {
+/// The loop through `verts`: a closed one rotated to its canonical start, an
+/// open chain kept as walked so that its ends stay first and last.
+fn make_loop(mesh: &Mesh, verts: &[VertexId], closed: bool, clean: bool) -> Result<BoundaryLoop> {
     let n = verts.len();
     let min = *verts.iter().min().expect("a loop has vertices");
     // Among the occurrences of the smallest vertex, start at the one giving
     // the lexicographically smallest rotation, so the start does not depend
     // on where the walk began.
     let rotation = |i: usize| verts[i..].iter().chain(&verts[..i]);
-    let mut best = verts
-        .iter()
-        .position(|&v| v == min)
-        .expect("min is present");
-    for (i, &v) in verts.iter().enumerate().skip(best + 1) {
-        if v == min && rotation(i).cmp(rotation(best)).is_lt() {
-            best = i;
+    let mut best = 0;
+    if closed {
+        best = verts
+            .iter()
+            .position(|&v| v == min)
+            .expect("min is present");
+        for (i, &v) in verts.iter().enumerate().skip(best + 1) {
+            if v == min && rotation(i).cmp(rotation(best)).is_lt() {
+                best = i;
+            }
         }
     }
     let mut vertices = Vec::new();
@@ -614,6 +651,7 @@ fn make_loop(mesh: &Mesh, verts: &[VertexId], clean: bool) -> Result<BoundaryLoo
         vertices,
         perimeter,
         area: 0.5 * norm(vector),
+        closed,
         clean,
     })
 }
@@ -724,7 +762,7 @@ mod tests {
                 &[12, 17, 18, 13][..],
             ]
         );
-        assert!(loops.iter().all(|l| l.clean));
+        assert!(loops.iter().all(|l| l.clean && l.closed));
         assert_eq!(loops[1].id.len, 4);
         assert_eq!(loops[2].id.len, 4);
         assert_eq!(loops[1].id.min_vertex, 6);
@@ -779,10 +817,69 @@ mod tests {
             seqs,
             [&[0, 2, 3, 1][..], &[0, 4, 5, 1][..], &[0, 6, 7, 1][..]]
         );
-        assert!(loops.iter().all(|l| !l.clean));
+        assert!(loops.iter().all(|l| !l.clean && !l.closed));
+        assert_eq!(loops[0].id.hash, fnv1a(&[0, 2, 3, 1]));
         // The non-manifold edge does not make the fin's vertices pinches.
         let map = EdgeMap::build(&mesh).unwrap();
         assert!(pinch_vertices(&mesh, &map).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fin_chains_whole_whatever_the_numbering() {
+        // The fin with the spine relabelled (1, 5): every chain's first edge
+        // no longer sorts first, so walks must start at chain heads to keep
+        // each chain whole, and the chains must keep their ends.
+        let (old, _) = parts(&fin());
+        // New id of each old vertex 0..8; new vertex 0 is unused.
+        let new = [5, 1, 7, 3, 2, 4, 6, 8];
+        let mut positions = vec![0.0f32; 27];
+        for (o, &n) in new.iter().enumerate() {
+            positions[3 * n..3 * n + 3].copy_from_slice(&old[3 * o..3 * o + 3]);
+        }
+        let tris = [
+            [5, 7, 3],
+            [5, 3, 1],
+            [5, 2, 4],
+            [5, 4, 1],
+            [5, 6, 8],
+            [5, 8, 1],
+        ];
+        let indices: Vec<u32> = tris.iter().flatten().copied().collect();
+        let mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+        let loops = boundary_loops(&mesh).unwrap();
+        let seqs: Vec<&[VertexId]> = loops.iter().map(|l| l.vertices.as_slice()).collect();
+        assert_eq!(
+            seqs,
+            [&[5, 2, 4, 1][..], &[5, 6, 8, 1][..], &[5, 7, 3, 1][..]]
+        );
+        assert!(loops.iter().all(|l| !l.clean && !l.closed));
+        assert!(loops.iter().all(|l| l.id.min_vertex == 1 && l.id.len == 4));
+        assert_eq!(loops[0].id.hash, fnv1a(&[5, 2, 4, 1]));
+    }
+
+    #[test]
+    fn three_holes_at_one_vertex_out_of_plane() {
+        // The tri_pinch wedges curved into a bowl, twisted alternately up and
+        // down (a monkey saddle), and folded 39 degrees along the y axis
+        // through vertex 0; all well under 90 degrees.
+        let bowl: fn(f64, f64) -> f64 = |r, _| 0.3 * r * r;
+        let saddle: fn(f64, f64) -> f64 = |r, deg| 0.7 * r * (3.0 * deg.to_radians()).cos();
+        let fold: fn(f64, f64) -> f64 = |r, deg| (0.8 * r * deg.to_radians().cos()).max(0.0);
+        for lift in [bowl, saddle, fold] {
+            let mesh = tri_pinch_lifted(lift);
+            let loops = boundary_loops(&mesh).unwrap();
+            let seqs: Vec<&[VertexId]> = loops.iter().map(|l| l.vertices.as_slice()).collect();
+            assert_eq!(
+                seqs,
+                [
+                    &[0, 1, 6][..],
+                    &[0, 3, 2][..],
+                    &[0, 5, 4][..],
+                    &[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18][..],
+                ]
+            );
+            assert!(loops.iter().all(|l| l.clean && l.closed));
+        }
     }
 
     #[test]

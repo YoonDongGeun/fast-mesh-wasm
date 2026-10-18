@@ -140,12 +140,18 @@ pub(crate) fn bowtie_holes() -> Mesh {
 /// missing. Ring 1 is `r_k = 1 + k` at radius 1 and angle `60k` degrees; ring
 /// 2 is `7 + 2k` at radius 2 and angle `60k`, and `8 + 2k` at angle `60k + 30`.
 pub(crate) fn tri_pinch() -> Mesh {
+    tri_pinch_lifted(|_, _| 0.0)
+}
+
+/// [`tri_pinch`] with each vertex at radius `r` and angle `deg` (degrees)
+/// lifted to `z = lift(r, deg)`.
+pub(crate) fn tri_pinch_lifted(lift: fn(f64, f64) -> f64) -> Mesh {
     let mut positions = vec![0.0f32, 0.0, 0.0];
     let at = |r: f64, deg: f64| {
         [
             (r * deg.to_radians().cos()) as f32,
             (r * deg.to_radians().sin()) as f32,
-            0.0,
+            lift(r, deg) as f32,
         ]
     };
     for k in 0..6 {
