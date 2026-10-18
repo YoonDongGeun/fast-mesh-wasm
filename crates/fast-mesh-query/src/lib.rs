@@ -33,6 +33,8 @@
 //! - Sections: [`slice()`] cuts a mesh with a [`Plane`] into a [`Slice`] of
 //!   [`Contour`]s, chained by crossed edge, with flags for open, unoriented
 //!   and non-manifold pieces.
+//! - Polygon fill: [`triangulate::triangulate`] splits a 2D polygon with
+//!   holes into counter-clockwise triangles by ear clipping.
 
 mod closest;
 mod error;
@@ -46,6 +48,7 @@ mod slice;
 #[cfg(test)]
 mod test_util;
 mod tri;
+pub mod triangulate;
 mod tritri;
 
 use fast_mesh_bvh::Bvh;
