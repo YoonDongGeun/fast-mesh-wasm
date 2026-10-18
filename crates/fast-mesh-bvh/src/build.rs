@@ -5,10 +5,33 @@
 //! arena on demand, so they can fail with `OutOfMemory`. When the caller has
 //! reserved the worst case up front (`max_nodes(n)` nodes and parents and `n`
 //! refs, as treelet rebuilds do), building never allocates and cannot fail.
+//!
+//! Full builds over at least [`PAR_MIN_SUBTREE`] triangles split the top of the
+//! tree into parts that are built separately (in parallel with the `parallel`
+//! feature) and then spliced into one arena. The node layout is the same as a
+//! single sequential build's, so the result does not depend on the feature or
+//! the thread count.
+
+use fast_mesh_store::par;
 
 use crate::arena::{Arena, LEAF_BIT, NONE, Node};
-use crate::error::{Result, try_reserve, try_reserve_exact};
+use crate::error::{BvhError, Result, try_reserve, try_reserve_exact};
 use crate::{Aabb, BuildOptions, Quality};
+
+/// Full builds split subtrees of at least this many triangles into separately
+/// built parts, whose two halves run in parallel with the `parallel` feature.
+/// Smaller subtrees are built in one sequential pass. On the i5-13600K, 1M
+/// triangle SAH builds take the same time (within noise) from 2K to 8K and get
+/// slower above: 70 ms at 16K, 95 ms at 64K.
+pub(crate) const PAR_MIN_SUBTREE: usize = 8 * 1024;
+
+/// The bound and SAH bin reductions of a split part run on the pool from this
+/// many triangles.
+const PAR_MIN_PRIMS: usize = 64 * 1024;
+
+/// Triangles per chunk of those reductions. Fixed, so the combined result does
+/// not depend on the thread count.
+const PAR_CHUNK: usize = 16 * 1024;
 
 /// Triangles to build a subtree from, plus scratch space.
 pub(crate) struct Prims {
@@ -18,6 +41,15 @@ pub(crate) struct Prims {
     keys: Vec<u32>,
     order: Vec<u32>,
     scratch: Vec<u32>,
+}
+
+/// The read-only primitive arrays the builders index through `order`.
+#[derive(Clone, Copy)]
+struct Src<'a> {
+    ids: &'a [u32],
+    boxes: &'a [Aabb],
+    centers: &'a [[f32; 3]],
+    keys: &'a [u32],
 }
 
 /// Most nodes a subtree over `n` triangles can need.
@@ -82,15 +114,51 @@ impl Prims {
         self.ids.len()
     }
 
-    fn range_bounds(&self, start: usize, end: usize) -> (Aabb, Aabb) {
-        let mut bounds = Aabb::EMPTY;
-        let mut centers = Aabb::EMPTY;
-        for &i in &self.order[start..end] {
-            bounds.grow(&self.boxes[i as usize]);
-            centers.grow_point(self.centers[i as usize]);
+    /// Resets `order` to the identity and, for Morton builds, sorts it.
+    fn prepare(&mut self, opts: &BuildOptions) {
+        let n = self.len();
+        self.order.clear();
+        self.order.extend(0..n as u32);
+        if opts.quality == Quality::Fast && n > 1 {
+            morton_sort(self);
         }
-        (bounds, centers)
     }
+
+    /// The primitive arrays and, separately, the mutable order.
+    fn split(&mut self) -> (Src<'_>, &mut [u32]) {
+        let src = Src {
+            ids: &self.ids,
+            boxes: &self.boxes,
+            centers: &self.centers,
+            keys: &self.keys,
+        };
+        (src, &mut self.order)
+    }
+}
+
+/// Box of the triangles in `order` and box of their centers.
+fn range_bounds(src: Src, order: &[u32]) -> (Aabb, Aabb) {
+    let mut bounds = Aabb::EMPTY;
+    let mut centers = Aabb::EMPTY;
+    for &i in order {
+        bounds.grow(&src.boxes[i as usize]);
+        centers.grow_point(src.centers[i as usize]);
+    }
+    (bounds, centers)
+}
+
+/// [`range_bounds`] over fixed chunks, combined in chunk order.
+fn range_bounds_chunked(src: Src, order: &[u32]) -> Result<(Aabb, Aabb)> {
+    let parts = par::map_chunks(order, PAR_CHUNK, PAR_MIN_PRIMS, |_, c| {
+        Ok::<_, BvhError>(range_bounds(src, c))
+    })?;
+    let mut bounds = Aabb::EMPTY;
+    let mut centers = Aabb::EMPTY;
+    for (b, c) in &parts {
+        bounds.grow(b);
+        centers.grow(c);
+    }
+    Ok((bounds, centers))
 }
 
 /// Builds a subtree over all of `prims`, appending to `arena`, and returns its root.
@@ -112,43 +180,254 @@ pub(crate) fn build_subtree(
     if arena.refs.capacity() - arena.refs.len() < n {
         try_reserve(&mut arena.refs, n)?;
     }
-    prims.order.clear();
-    prims.order.extend(0..n as u32);
-    if opts.quality == Quality::Fast && n > 1 {
-        morton_sort(prims);
-    }
+    prims.prepare(opts);
+    let (src, order) = prims.split();
+    let root = push_node(&mut arena.nodes, &mut arena.parents, parent)?;
+    let mut out = Out {
+        nodes: &mut arena.nodes,
+        parents: &mut arena.parents,
+        refs: &mut arena.refs,
+        tri_leaf: Some(&mut arena.tri_leaf),
+    };
+    build_seq(&mut out, src, order, opts, root)?;
+    Ok(root)
+}
 
-    let root = push_node(arena, parent)?;
+/// Builds a whole tree over `prims` (at least one triangle) into the empty
+/// `arena` and returns its root. Allocates as it goes; on `Err` the arena is
+/// garbage.
+pub(crate) fn build_full(arena: &mut Arena, prims: &mut Prims, opts: &BuildOptions) -> Result<u32> {
+    build_full_with(arena, prims, opts, PAR_MIN_SUBTREE)
+}
+
+/// [`build_full`] splitting subtrees of at least `min_part` triangles.
+fn build_full_with(
+    arena: &mut Arena,
+    prims: &mut Prims,
+    opts: &BuildOptions,
+    min_part: usize,
+) -> Result<u32> {
+    let n = prims.len();
+    if n < min_part {
+        let expected = expected_nodes(n, opts.max_leaf_size);
+        try_reserve_exact(&mut arena.nodes, expected)?;
+        try_reserve_exact(&mut arena.parents, expected)?;
+        try_reserve_exact(&mut arena.refs, n)?;
+        return build_subtree(arena, prims, opts, NONE);
+    }
+    prims.prepare(opts);
+    let (src, order) = prims.split();
+    let parts = build_parts(src, order, opts, min_part)?;
+    // Each part adds its nodes but its root, which its parent placed; each
+    // split adds its two children. Plus the root.
+    let nodes = 1 + parts
+        .iter()
+        .map(|p| match p {
+            Part::Seq { nodes, .. } => nodes.len() - 1,
+            Part::Split { .. } => 2,
+        })
+        .sum::<usize>();
+    try_reserve_exact(&mut arena.nodes, nodes)?;
+    try_reserve_exact(&mut arena.parents, nodes)?;
+    try_reserve_exact(&mut arena.refs, n)?;
+    let root = push_node(&mut arena.nodes, &mut arena.parents, NONE)?;
+    let mut parts = parts.into_iter();
+    splice(arena, &mut parts, root, NONE);
+    debug_assert!(parts.next().is_none() && arena.nodes.len() == nodes);
+    Ok(root)
+}
+
+/// A piece of a full build, in a list in the order the pieces are spliced.
+enum Part {
+    /// A subtree built in one sequential pass, numbered from its root at 0;
+    /// leaf ref ranges index `refs`.
+    Seq {
+        nodes: Vec<Node>,
+        parents: Vec<u32>,
+        refs: Vec<u32>,
+    },
+    /// An inner node. The list continues with its smaller child's parts, then
+    /// its larger child's (the left one first when equal), the order in which
+    /// the sequential builder emits their nodes.
+    Split { bounds: Aabb, left_first: bool },
+}
+
+/// The parts of the subtree over `order`: one [`Part::Seq`] below `min_part`
+/// triangles, otherwise a split whose halves are built with [`par::join`].
+fn build_parts(
+    src: Src,
+    order: &mut [u32],
+    opts: &BuildOptions,
+    min_part: usize,
+) -> Result<Vec<Part>> {
+    let m = order.len();
+    let mut list = Vec::new();
+    if m < min_part || m <= opts.max_leaf_size as usize {
+        let expected = expected_nodes(m, opts.max_leaf_size);
+        let (mut nodes, mut parents, mut refs) = (Vec::new(), Vec::new(), Vec::new());
+        try_reserve_exact(&mut nodes, expected)?;
+        try_reserve_exact(&mut parents, expected)?;
+        try_reserve_exact(&mut refs, m)?;
+        let root = push_node(&mut nodes, &mut parents, NONE)?;
+        let mut out = Out {
+            nodes: &mut nodes,
+            parents: &mut parents,
+            refs: &mut refs,
+            tri_leaf: None,
+        };
+        build_seq(&mut out, src, order, opts, root)?;
+        try_reserve_exact(&mut list, 1)?;
+        list.push(Part::Seq {
+            nodes,
+            parents,
+            refs,
+        });
+        return Ok(list);
+    }
+    let (bounds, centers) = range_bounds_chunked(src, order)?;
+    let mid = match opts.quality {
+        Quality::Sah => sah_split(src, order, &centers, opts.sah_bins as usize, true)?,
+        Quality::Fast => morton_split(src, order),
+    };
+    let left_first = mid <= m - mid;
+    let (lo, hi) = order.split_at_mut(mid);
+    let (left, right) = par::join(
+        true,
+        || build_parts(src, lo, opts, min_part),
+        || build_parts(src, hi, opts, min_part),
+    );
+    let (left, right) = (left?, right?);
+    let (first, second) = if left_first {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    try_reserve_exact(&mut list, 1 + first.len() + second.len())?;
+    list.push(Part::Split { bounds, left_first });
+    list.extend(first);
+    list.extend(second);
+    Ok(list)
+}
+
+/// Writes the subtree whose parts come next in `parts` into `arena`, with its
+/// root at the already allocated slot `root`. Capacity is reserved.
+fn splice(arena: &mut Arena, parts: &mut std::vec::IntoIter<Part>, root: u32, parent: u32) {
+    arena.parents[root as usize] = parent;
+    match parts.next().expect("a part for every subtree") {
+        Part::Split { bounds, left_first } => {
+            let left = arena.nodes.len() as u32;
+            let right = left + 1;
+            for _ in 0..2 {
+                arena.nodes.push(Node {
+                    bounds: Aabb::EMPTY,
+                    a: NONE,
+                    b: LEAF_BIT,
+                });
+                arena.parents.push(root);
+            }
+            arena.nodes[root as usize] = Node {
+                bounds,
+                a: left,
+                b: right,
+            };
+            let (first, second) = if left_first {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            splice(arena, parts, first, root);
+            splice(arena, parts, second, root);
+        }
+        Part::Seq {
+            nodes,
+            parents,
+            refs,
+        } => {
+            // Local node 0 goes to `root`, the others after the arena's end.
+            let base = arena.nodes.len() as u32;
+            let at = |k: u32| if k == 0 { root } else { base + k - 1 };
+            let first_ref = arena.refs.len() as u32;
+            for (k, &node) in nodes.iter().enumerate() {
+                let here = at(k as u32);
+                let node = if node.is_leaf() {
+                    for &t in &refs[node.leaf_range()] {
+                        arena.tri_leaf[t as usize] = here;
+                    }
+                    Node {
+                        a: node.a + first_ref,
+                        ..node
+                    }
+                } else {
+                    Node {
+                        a: at(node.a),
+                        b: at(node.b),
+                        ..node
+                    }
+                };
+                if k == 0 {
+                    arena.nodes[root as usize] = node;
+                } else {
+                    arena.nodes.push(node);
+                    arena.parents.push(at(parents[k]));
+                }
+            }
+            arena.refs.extend_from_slice(&refs);
+        }
+    }
+}
+
+/// Where [`build_seq`] writes: an arena's arrays, or a part's (no `tri_leaf`).
+struct Out<'a> {
+    nodes: &'a mut Vec<Node>,
+    parents: &'a mut Vec<u32>,
+    refs: &'a mut Vec<u32>,
+    tri_leaf: Option<&'a mut Vec<u32>>,
+}
+
+/// Builds the subtree over `order` below the already allocated node `root`.
+/// Cannot fail when `max_nodes(order.len()) - 1` more nodes and parents and
+/// `order.len()` refs are reserved.
+fn build_seq(
+    out: &mut Out,
+    src: Src,
+    order: &mut [u32],
+    opts: &BuildOptions,
+    root: u32,
+) -> Result<()> {
     // Continue with the smaller child and push the larger: the stack never holds
     // more than log2(n) entries, so a fixed array is enough.
     let mut stack = [(0u32, 0usize, 0usize); 64];
     let mut depth = 0;
-    let mut task = (root, 0, n);
+    let mut task = (root, 0, order.len());
     loop {
         let (node, start, end) = task;
-        let (bounds, centers) = prims.range_bounds(start, end);
+        let (bounds, centers) = range_bounds(src, &order[start..end]);
         if end - start <= opts.max_leaf_size as usize {
-            let first = arena.refs.len() as u32;
-            for &i in &prims.order[start..end] {
-                let id = prims.ids[i as usize];
-                arena.refs.push(id);
-                arena.tri_leaf[id as usize] = node;
+            let first = out.refs.len() as u32;
+            for &i in &order[start..end] {
+                let id = src.ids[i as usize];
+                out.refs.push(id);
+                if let Some(tri_leaf) = &mut out.tri_leaf {
+                    tri_leaf[id as usize] = node;
+                }
             }
-            arena.nodes[node as usize] = Node::leaf(bounds, first, (end - start) as u32);
+            out.nodes[node as usize] = Node::leaf(bounds, first, (end - start) as u32);
             if depth == 0 {
-                return Ok(root);
+                return Ok(());
             }
             depth -= 1;
             task = stack[depth];
             continue;
         }
-        let mid = match opts.quality {
-            Quality::Sah => sah_split(prims, start, end, &centers, opts.sah_bins as usize),
-            Quality::Fast => morton_split(prims, start, end),
-        };
-        let left = push_node(arena, node)?;
-        let right = push_node(arena, node)?;
-        arena.nodes[node as usize] = Node {
+        let range = &mut order[start..end];
+        let mid = start
+            + match opts.quality {
+                Quality::Sah => sah_split(src, range, &centers, opts.sah_bins as usize, false)?,
+                Quality::Fast => morton_split(src, range),
+            };
+        let left = push_node(out.nodes, out.parents, node)?;
+        let right = push_node(out.nodes, out.parents, node)?;
+        out.nodes[node as usize] = Node {
             bounds,
             a: left,
             b: right,
@@ -164,48 +443,105 @@ pub(crate) fn build_subtree(
     }
 }
 
-fn push_node(arena: &mut Arena, parent: u32) -> Result<u32> {
-    if arena.nodes.len() == arena.nodes.capacity() {
-        let more = arena.nodes.len().max(16);
-        try_reserve(&mut arena.nodes, more)?;
+fn push_node(nodes: &mut Vec<Node>, parents: &mut Vec<u32>, parent: u32) -> Result<u32> {
+    if nodes.len() == nodes.capacity() {
+        let more = nodes.len().max(16);
+        try_reserve(nodes, more)?;
     }
-    if arena.parents.len() == arena.parents.capacity() {
-        let more = arena.parents.len().max(16);
-        try_reserve(&mut arena.parents, more)?;
+    if parents.len() == parents.capacity() {
+        let more = parents.len().max(16);
+        try_reserve(parents, more)?;
     }
-    let index = arena.nodes.len() as u32;
-    arena.nodes.push(Node {
+    let index = nodes.len() as u32;
+    nodes.push(Node {
         bounds: Aabb::EMPTY,
         a: NONE,
         b: LEAF_BIT,
     });
-    arena.parents.push(parent);
+    parents.push(parent);
     Ok(index)
 }
 
-/// Chooses the cheapest binned SAH split and partitions `order[start..end]`.
-/// Falls back to the middle when no split separates the centers.
-fn sah_split(prims: &mut Prims, start: usize, end: usize, centers: &Aabb, bins: usize) -> usize {
-    let mid = start + (end - start) / 2;
+/// Most SAH bins per axis (`BuildOptions::sah_bins` is at most 64).
+const MAX_BINS: usize = 64;
+
+/// Per-axis triangle counts and boxes of the SAH bins.
+#[derive(Clone, Copy)]
+struct Bins {
+    counts: [[u32; MAX_BINS]; 3],
+    boxes: [[Aabb; MAX_BINS]; 3],
+}
+
+impl Bins {
+    const EMPTY: Bins = Bins {
+        counts: [[0; MAX_BINS]; 3],
+        boxes: [[Aabb::EMPTY; MAX_BINS]; 3],
+    };
+
+    fn add(&mut self, other: &Bins) {
+        for axis in 0..3 {
+            for b in 0..MAX_BINS {
+                self.counts[axis][b] += other.counts[axis][b];
+                self.boxes[axis][b].grow(&other.boxes[axis][b]);
+            }
+        }
+    }
+}
+
+/// Bin of center coordinate `c` on an axis starting at `lo` with `extent`.
+fn bin_of(c: f32, lo: f32, extent: f32, bins: usize) -> usize {
+    (((c - lo) / extent) * bins as f32).clamp(0.0, (bins - 1) as f32) as usize
+}
+
+/// Bins the triangles in `order` on every axis where `usable`.
+fn fill_bins(src: Src, order: &[u32], centers: &Aabb, bins: usize, usable: [bool; 3]) -> Bins {
+    let mut out = Bins::EMPTY;
+    for &i in order {
+        let (c, bounds) = (src.centers[i as usize], &src.boxes[i as usize]);
+        for axis in 0..3 {
+            if usable[axis] {
+                let lo = centers.min[axis];
+                let b = bin_of(c[axis], lo, centers.max[axis] - lo, bins);
+                out.counts[axis][b] += 1;
+                out.boxes[axis][b].grow(bounds);
+            }
+        }
+    }
+    out
+}
+
+/// Chooses the cheapest binned SAH split and partitions `order`; returns the
+/// split position within it. Falls back to the middle when no split separates
+/// the centers. `chunked` bins in fixed chunks (on the pool when large), which
+/// allocates; otherwise this never allocates and cannot fail.
+fn sah_split(
+    src: Src,
+    order: &mut [u32],
+    centers: &Aabb,
+    bins: usize,
+    chunked: bool,
+) -> Result<usize> {
+    let mid = order.len() / 2;
+    let usable = [0, 1, 2].map(|axis| {
+        let extent = centers.max[axis] - centers.min[axis];
+        extent.is_finite() && extent > 0.0
+    });
+    let all = if chunked {
+        let parts = par::map_chunks(order, PAR_CHUNK, PAR_MIN_PRIMS, |_, c| {
+            Ok::<_, BvhError>(fill_bins(src, c, centers, bins, usable))
+        })?;
+        let mut all = Bins::EMPTY;
+        parts.iter().for_each(|p| all.add(p));
+        all
+    } else {
+        fill_bins(src, order, centers, bins, usable)
+    };
     let mut best: Option<(f32, usize, usize)> = None; // (cost, axis, last left bin)
-    for axis in 0..3 {
-        let lo = centers.min[axis];
-        let extent = centers.max[axis] - lo;
-        if !extent.is_finite() || extent <= 0.0 {
-            continue;
-        }
-        let bin_of =
-            |c: f32| (((c - lo) / extent) * bins as f32).clamp(0.0, (bins - 1) as f32) as usize;
-        let mut counts = [0u32; 64];
-        let mut boxes = [Aabb::EMPTY; 64];
-        for &i in &prims.order[start..end] {
-            let b = bin_of(prims.centers[i as usize][axis]);
-            counts[b] += 1;
-            boxes[b].grow(&prims.boxes[i as usize]);
-        }
+    for axis in (0..3).filter(|&axis| usable[axis]) {
+        let (counts, boxes) = (&all.counts[axis], &all.boxes[axis]);
         // Sweep from the right to get the right-hand side areas and counts.
-        let mut right_area = [0.0f32; 64];
-        let mut right_count = [0u32; 64];
+        let mut right_area = [0.0f32; MAX_BINS];
+        let mut right_count = [0u32; MAX_BINS];
         let mut acc = Aabb::EMPTY;
         let mut cnt = 0;
         for b in (1..bins).rev() {
@@ -230,36 +566,35 @@ fn sah_split(prims: &mut Prims, start: usize, end: usize, centers: &Aabb, bins: 
         }
     }
     let Some((_, axis, split_bin)) = best else {
-        return mid;
+        return Ok(mid);
     };
     let lo = centers.min[axis];
     let extent = centers.max[axis] - lo;
-    let in_left = |c: f32| {
-        (((c - lo) / extent) * bins as f32).clamp(0.0, (bins - 1) as f32) as usize <= split_bin
-    };
-    let (mut i, mut j) = (start, end);
+    let in_left = |i: u32| bin_of(src.centers[i as usize][axis], lo, extent, bins) <= split_bin;
+    let (mut i, mut j) = (0, order.len());
     while i < j {
-        if in_left(prims.centers[prims.order[i] as usize][axis]) {
+        if in_left(order[i]) {
             i += 1;
         } else {
             j -= 1;
-            prims.order.swap(i, j);
+            order.swap(i, j);
         }
     }
-    if i == start || i == end { mid } else { i }
+    Ok(if i == 0 || i == order.len() { mid } else { i })
 }
 
-/// Splits a Morton-sorted range at the highest bit where its codes differ.
-fn morton_split(prims: &Prims, start: usize, end: usize) -> usize {
-    let key = |i: usize| prims.keys[prims.order[i] as usize];
-    let (first, last) = (key(start), key(end - 1));
+/// Splits a Morton-sorted `order` at the highest bit where its codes differ;
+/// returns the split position within it.
+fn morton_split(src: Src, order: &[u32]) -> usize {
+    let key = |i: usize| src.keys[order[i] as usize];
+    let (first, last) = (key(0), key(order.len() - 1));
     if first == last {
-        return start + (end - start) / 2;
+        return order.len() / 2;
     }
     let bit = 31 - (first ^ last).leading_zeros();
     let mask = 1u32 << bit;
     // Codes are sorted, so those with the bit set form a suffix.
-    let (mut lo, mut hi) = (start, end - 1);
+    let (mut lo, mut hi) = (0, order.len() - 1);
     while lo < hi {
         let m = lo + (hi - lo) / 2;
         if key(m) & mask != 0 {
@@ -346,6 +681,18 @@ mod tests {
         for i in 0..n {
             let x = i as f32 * 2.0;
             p.push(i, Aabb::new([x, 0.0, 0.0], [x + 1.0, 1.0, 0.0]));
+        }
+        p
+    }
+
+    /// `n` triangles scattered by a fixed integer hash, with varied sizes.
+    fn scatter(n: u32) -> Prims {
+        let mut p = Prims::with_capacity(n as usize).unwrap();
+        for i in 0..n {
+            let h = |k: u32| (i.wrapping_mul(2654435761).wrapping_add(k * 40503) >> 8) % 1000;
+            let c = [h(1), h(2), h(3)].map(|v| v as f32 * 0.1);
+            let s = (h(4) % 7) as f32 * 0.05 + 0.01;
+            p.push(i, Aabb::new(c, [c[0] + s, c[1] + s, c[2] + s]));
         }
         p
     }
@@ -455,6 +802,45 @@ mod tests {
             build_subtree(&mut a2, &mut row(50), &opts, NONE).unwrap();
             assert_eq!(shape(&a1), shape(&a2));
             assert_eq!(a1.refs, a2.refs);
+        }
+    }
+
+    /// Splitting into parts and splicing them gives exactly the layout of one
+    /// sequential pass: same nodes in the same slots, refs, parents and leaf map.
+    #[test]
+    fn spliced_parts_match_the_sequential_layout() {
+        let empty = |tris| Arena {
+            nodes: Vec::new(),
+            parents: Vec::new(),
+            refs: Vec::new(),
+            tri_leaf: vec![NONE; tris],
+        };
+        for quality in [Quality::Sah, Quality::Fast] {
+            for (n, leaf, min_part) in [(37, 4, 9), (500, 3, 20), (3000, 8, 64), (3000, 1, 2)] {
+                let opts = BuildOptions {
+                    quality,
+                    max_leaf_size: leaf,
+                    ..Default::default()
+                };
+                for make in [row, scatter] {
+                    let mut seq = arena_for(n as usize, n as usize);
+                    let r1 = build_subtree(&mut seq, &mut make(n), &opts, NONE).unwrap();
+                    let mut parts = empty(n as usize);
+                    let r2 = build_full_with(&mut parts, &mut make(n), &opts, min_part).unwrap();
+                    let tag = format!("{quality:?} n={n} leaf={leaf} part={min_part}");
+                    assert_eq!(r1, r2, "{tag}");
+                    let flat = |a: &Arena| {
+                        a.nodes
+                            .iter()
+                            .map(|n| (n.bounds.min, n.bounds.max, n.a, n.b))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(flat(&seq), flat(&parts), "{tag}");
+                    assert_eq!(seq.parents, parts.parents, "{tag}");
+                    assert_eq!(seq.refs, parts.refs, "{tag}");
+                    assert_eq!(seq.tri_leaf, parts.tri_leaf, "{tag}");
+                }
+            }
         }
     }
 }
