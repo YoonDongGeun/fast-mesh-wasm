@@ -3,9 +3,12 @@
 //! [`triangulate`] is ear clipping in the manner of Mapbox's earcut: the
 //! polygon is a doubly linked ring of vertices, each hole is bridged into the
 //! outer ring by a pair of coincident edges, and ears are clipped until two
-//! vertices remain. It is meant for section fills and hole filling, where the
-//! input is usually simple but may not be, so it never panics and reports
-//! whether it finished instead of failing.
+//! vertices remain. Above [`Z_ORDER_MIN`] points the ear test finds the
+//! vertices near a candidate ear through a list sorted by z-order (Morton)
+//! code, as earcut does, instead of walking the whole ring, so that large
+//! rings no longer cost `O(n²)`. It is meant for section fills and hole
+//! filling, where the input is usually simple but may not be, so it never
+//! panics and reports whether it finished instead of failing.
 
 use std::cmp::Ordering;
 
@@ -45,6 +48,24 @@ pub fn triangulate(
     holes: &[&[[f64; 2]]],
     out: &mut Vec<[u32; 3]>,
 ) -> Result<bool> {
+    let points = holes
+        .iter()
+        .fold(outer.len(), |n, h| n.saturating_add(h.len()));
+    triangulate_with(outer, holes, out, points > Z_ORDER_MIN)
+}
+
+/// The number of points above which ears are tested through the z-order
+/// list (earcut's threshold); below it, walking the ring is as fast.
+const Z_ORDER_MIN: usize = 80;
+
+/// [`triangulate`], with the z-order ear test when `z_order` is set and the
+/// ring's box has a finite, non-zero size. Both tests give the same triangles.
+fn triangulate_with(
+    outer: &[[f64; 2]],
+    holes: &[&[[f64; 2]]],
+    out: &mut Vec<[u32; 3]>,
+    z_order: bool,
+) -> Result<bool> {
     let total = holes
         .iter()
         .try_fold(outer.len(), |n, h| n.checked_add(h.len()))
@@ -68,6 +89,7 @@ pub fn triangulate(
         nodes,
         out,
         ok: true,
+        grid: None,
     };
     let Some(mut start) = e.ring(outer, 0, true) else {
         return Ok(true);
@@ -91,7 +113,11 @@ pub fn triangulate(
     for &h in &queue {
         start = e.eliminate_hole(h, start);
     }
-    let finished = e.clip(e.live(start));
+    let start = e.live(start);
+    if z_order {
+        e.index_curve(start);
+    }
+    let finished = e.clip(start);
     Ok(finished && e.ok)
 }
 
@@ -109,7 +135,12 @@ struct Node {
     y: f64,
     prev: usize,
     next: usize,
-    /// Unlinked from its ring. Its `prev` and `next` still name the
+    /// The z-order code of the point, once the ring is indexed.
+    z: u32,
+    /// The neighbours in the list of the ring's nodes sorted by `z`.
+    prev_z: Option<usize>,
+    next_z: Option<usize>,
+    /// Unlinked from its ring (and from the z-order list). Its `prev` and `next` still name the
     /// neighbours it had when it was removed.
     removed: bool,
 }
@@ -119,6 +150,21 @@ struct Node {
 /// predicates below read as there.
 fn area(p: &Node, q: &Node, r: &Node) -> f64 {
     (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y)
+}
+
+/// The z-order (Morton) code of a point: its coordinates scaled to 15 bits
+/// over the ring's box and interleaved. It never decreases as `x` or `y`
+/// grows, so the points of a box have codes between those of its corners.
+fn z_order(x: f64, y: f64, grid: &ZGrid) -> u32 {
+    // Clamped, so that rounding at the box's edges stays in 0..=32767.
+    let scale = |v: f64, lo: f64| ((v - lo) * grid.inv_size).clamp(0.0, 32767.0) as u32;
+    let spread = |mut v: u32| {
+        v = (v | (v << 8)) & 0x00FF_00FF;
+        v = (v | (v << 4)) & 0x0F0F_0F0F;
+        v = (v | (v << 2)) & 0x3333_3333;
+        (v | (v << 1)) & 0x5555_5555
+    };
+    spread(scale(x, grid.min_x)) | (spread(scale(y, grid.min_y)) << 1)
 }
 
 fn equals(a: &Node, b: &Node) -> bool {
@@ -180,6 +226,16 @@ struct Earcut<'a> {
     out: &'a mut Vec<[u32; 3]>,
     /// False once a hole could not be bridged.
     ok: bool,
+    /// The box z-order codes are taken over, once the ring is indexed.
+    grid: Option<ZGrid>,
+}
+
+/// The lower corner of the ring's box, and `32767` over its larger side.
+#[derive(Debug, Clone, Copy)]
+struct ZGrid {
+    min_x: f64,
+    min_y: f64,
+    inv_size: f64,
 }
 
 impl Earcut<'_> {
@@ -220,6 +276,9 @@ impl Earcut<'_> {
             y,
             prev,
             next,
+            z: 0,
+            prev_z: None,
+            next_z: None,
             removed: false,
         });
         if let Some(l) = last {
@@ -230,9 +289,21 @@ impl Earcut<'_> {
     }
 
     fn remove(&mut self, k: usize) {
-        let Node { prev, next, .. } = self.nodes[k];
+        let Node {
+            prev,
+            next,
+            prev_z,
+            next_z,
+            ..
+        } = self.nodes[k];
         self.nodes[next].prev = prev;
         self.nodes[prev].next = next;
+        if let Some(p) = prev_z {
+            self.nodes[p].next_z = next_z;
+        }
+        if let Some(n) = next_z {
+            self.nodes[n].prev_z = prev_z;
+        }
         self.nodes[k].removed = true;
     }
 
@@ -257,11 +328,14 @@ impl Earcut<'_> {
     /// Returns its last node, or `None` for no points.
     fn ring(&mut self, points: &[[f64; 2]], offset: usize, ccw: bool) -> Option<usize> {
         let n = points.len();
-        // Twice the shoelace area: positive when counter-clockwise.
+        let o = points.first().copied().unwrap_or_default();
+        // Twice the shoelace area, positive when counter-clockwise, taken
+        // about the first point: that keeps the products small when the ring
+        // is far from the origin.
         let twice_area: f64 = (0..n)
             .map(|j| {
                 let (p, q) = (points[j], points[(j + 1) % n]);
-                p[0] * q[1] - q[0] * p[1]
+                (p[0] - o[0]) * (q[1] - o[1]) - (q[0] - o[0]) * (p[1] - o[1])
             })
             .sum();
         let forward = (twice_area > 0.0) == ccw;
@@ -352,19 +426,176 @@ impl Earcut<'_> {
         let mut p = self.next(c);
         while p != a {
             let np = self.n(p);
-            if np.x >= x0
-                && np.x <= x1
-                && np.y >= y0
-                && np.y <= y1
-                && !equals(na, np)
-                && point_in_triangle(na.x, na.y, nb.x, nb.y, nc.x, nc.y, np.x, np.y)
-                && self.turn(self.prev(p), p, self.next(p)) >= 0.0
-            {
+            if np.x >= x0 && np.x <= x1 && np.y >= y0 && np.y <= y1 && self.blocks(p, a, b, c) {
                 return false;
             }
             p = self.next(p);
         }
         true
+    }
+
+    /// Whether `p`, a node in the box of the triangle `abc`, stops it being
+    /// an ear: a reflex (or straight) vertex inside or on it, other than at `a`.
+    fn blocks(&self, p: usize, a: usize, b: usize, c: usize) -> bool {
+        let (na, nb, nc, np) = (self.n(a), self.n(b), self.n(c), self.n(p));
+        !equals(na, np)
+            && point_in_triangle(na.x, na.y, nb.x, nb.y, nc.x, nc.y, np.x, np.y)
+            && self.turn(self.prev(p), p, self.next(p)) >= 0.0
+    }
+
+    /// [`Earcut::is_ear`] through the z-order list. Only nodes whose codes
+    /// lie between those of the triangle box's corners can be in the box, and
+    /// they are found by walking the list both ways from `ear`. It tests the
+    /// same nodes as `is_ear` (plus `ear` itself, which is convex and so
+    /// never blocks), so it gives the same answer.
+    fn is_ear_hashed(&self, ear: usize, grid: &ZGrid) -> bool {
+        let (a, b, c) = (self.prev(ear), ear, self.next(ear));
+        if self.turn(a, b, c) >= 0.0 {
+            return false;
+        }
+        let (na, nb, nc) = (self.n(a), self.n(b), self.n(c));
+        let (x0, x1) = (na.x.min(nb.x).min(nc.x), na.x.max(nb.x).max(nc.x));
+        let (y0, y1) = (na.y.min(nb.y).min(nc.y), na.y.max(nb.y).max(nc.y));
+        let (min_z, max_z) = (z_order(x0, y0, grid), z_order(x1, y1, grid));
+        let stops = |p: usize| {
+            let np = self.n(p);
+            p != a
+                && p != c
+                && np.x >= x0
+                && np.x <= x1
+                && np.y >= y0
+                && np.y <= y1
+                && self.blocks(p, a, b, c)
+        };
+        // The list is finite and acyclic, so both walks end.
+        let mut p = self.nodes[ear].prev_z;
+        while let Some(k) = p.filter(|&k| self.n(k).z >= min_z) {
+            if stops(k) {
+                return false;
+            }
+            p = self.nodes[k].prev_z;
+        }
+        let mut n = self.nodes[ear].next_z;
+        while let Some(k) = n.filter(|&k| self.n(k).z <= max_z) {
+            if stops(k) {
+                return false;
+            }
+            n = self.nodes[k].next_z;
+        }
+        true
+    }
+
+    /// Codes every node of the ring through `start` and links them into a
+    /// list sorted by code, used from then on by the ear test. Does nothing
+    /// when the ring's box has no finite, non-zero size.
+    ///
+    /// Nodes are only removed after this (bridging is done), and removal
+    /// unlinks them from the list too, so the list stays exactly the ring.
+    fn index_curve(&mut self, start: usize) {
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut p = start;
+        loop {
+            let np = self.n(p);
+            (x0, y0) = (x0.min(np.x), y0.min(np.y));
+            (x1, y1) = (x1.max(np.x), y1.max(np.y));
+            p = self.next(p);
+            if p == start {
+                break;
+            }
+        }
+        let size = (x1 - x0).max(y1 - y0);
+        if !(size.is_finite() && size > 0.0) {
+            return;
+        }
+        let grid = ZGrid {
+            min_x: x0,
+            min_y: y0,
+            inv_size: 32767.0 / size,
+        };
+        loop {
+            let (prev, next) = (self.prev(p), self.next(p));
+            let z = z_order(self.n(p).x, self.n(p).y, &grid);
+            let node = &mut self.nodes[p];
+            node.z = z;
+            node.prev_z = (p != start).then_some(prev);
+            node.next_z = (next != start).then_some(next);
+            p = next;
+            if p == start {
+                break;
+            }
+        }
+        self.sort_z(start);
+        self.grid = Some(grid);
+    }
+
+    /// Sorts the z-order list that starts at `head` by code, in place and
+    /// without allocating: Simon Tatham's bottom-up merge sort of a linked
+    /// list, as in earcut.
+    fn sort_z(&mut self, head: usize) {
+        let mut list = Some(head);
+        let mut in_size = 1usize;
+        loop {
+            let mut p = list;
+            list = None;
+            let mut tail: Option<usize> = None;
+            let mut merges = 0;
+            while let Some(run) = p {
+                merges += 1;
+                // Merge the run of up to `in_size` nodes at `p` with the
+                // run of up to `in_size` nodes after it, at `q`.
+                let mut q = Some(run);
+                let mut p_size = 0usize;
+                while let Some(k) = q {
+                    if p_size == in_size {
+                        break;
+                    }
+                    p_size += 1;
+                    q = self.nodes[k].next_z;
+                }
+                let mut q_size = in_size;
+                loop {
+                    let q_open = q_size > 0 && q.is_some();
+                    if p_size == 0 && !q_open {
+                        break;
+                    }
+                    let from_p = p_size > 0
+                        && (!q_open
+                            || match (p, q) {
+                                (Some(pk), Some(qk)) => self.n(pk).z <= self.n(qk).z,
+                                _ => true,
+                            });
+                    let e = if from_p {
+                        p_size -= 1;
+                        p
+                    } else {
+                        q_size -= 1;
+                        q
+                    };
+                    // `p` holds `p_size` more nodes, so this always matches.
+                    let Some(e) = e else { break };
+                    if from_p {
+                        p = self.nodes[e].next_z;
+                    } else {
+                        q = self.nodes[e].next_z;
+                    }
+                    match tail {
+                        Some(t) => self.nodes[t].next_z = Some(e),
+                        None => list = Some(e),
+                    }
+                    self.nodes[e].prev_z = tail;
+                    tail = Some(e);
+                }
+                p = q;
+            }
+            if let Some(t) = tail {
+                self.nodes[t].next_z = None;
+            }
+            if merges <= 1 {
+                return;
+            }
+            in_size = in_size.saturating_mul(2);
+        }
     }
 
     fn emit(&mut self, a: usize, b: usize, c: usize) {
@@ -381,7 +612,11 @@ impl Earcut<'_> {
         let mut stop = ear;
         while self.prev(ear) != self.next(ear) {
             let (prev, next) = (self.prev(ear), self.next(ear));
-            if self.is_ear(ear) {
+            let is_ear = match self.grid {
+                Some(grid) => self.is_ear_hashed(ear, &grid),
+                None => self.is_ear(ear),
+            };
+            if is_ear {
                 self.emit(prev, ear, next);
                 self.remove(ear);
                 ear = self.next(next);
@@ -743,6 +978,46 @@ mod tests {
     }
 
     #[test]
+    fn z_order_and_plain_ear_tests_agree_on_1000_points() {
+        // A wavy ring, concave in many places, with two holes.
+        let outer: Vec<[f64; 2]> = (0..1000)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 1000.0;
+                let r = 10.0 + 2.0 * (17.0 * a).sin() + 0.5 * (61.0 * a).cos();
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        let h1 = square(-3.0, -1.0, 2.0);
+        let h2 = square(2.0, 1.0, 1.5);
+        let holes: [&[[f64; 2]]; 2] = [&h1, &h2];
+        let pts = all_points(&outer, &holes);
+        let expected = shoelace(&outer) - 4.0 - 2.25;
+        let mut areas = Vec::new();
+        for z_order in [false, true] {
+            let mut out = Vec::new();
+            assert_eq!(
+                triangulate_with(&outer, &holes, &mut out, z_order),
+                Ok(true)
+            );
+            let area: f64 = out.iter().map(|&t| signed_area(&pts, t)).sum();
+            assert!(
+                ((area - expected) / expected).abs() < 1e-9,
+                "{area} vs {expected}"
+            );
+            areas.push((area, out));
+        }
+        assert_eq!(areas[0], areas[1]);
+    }
+
+    #[test]
+    fn far_from_origin_orientation() {
+        // Far from the origin, where a shoelace about the origin rounds to
+        // 0 and the ring used to be taken as clockwise.
+        let (_, area) = fill(&square(1e9, 1e9, 1e-3), &[]);
+        assert!((area - 1e-6).abs() < 1e-9, "area {area}");
+    }
+
+    #[test]
     fn degenerate_outer_has_nothing_to_fill() {
         let mut out = vec![[9, 9, 9]];
         assert_eq!(triangulate(&[], &[], &mut out), Ok(true));
@@ -842,9 +1117,47 @@ mod tests {
             let total = outer.len() + holes.iter().map(Vec::len).sum::<usize>();
             let mut out = Vec::new();
             prop_assert!(triangulate(&outer, &hole_refs, &mut out).is_ok());
-            for t in out {
+            for t in &out {
                 prop_assert!(t.iter().all(|&i| (i as usize) < total), "{:?}", t);
             }
+            // Both ear tests, whatever the size, give the same result.
+            let mut plain = Vec::new();
+            let mut hashed = Vec::new();
+            let p = triangulate_with(&outer, &hole_refs, &mut plain, false);
+            let h = triangulate_with(&outer, &hole_refs, &mut hashed, true);
+            prop_assert_eq!(p, h);
+            prop_assert_eq!(plain, hashed);
+        }
+
+        /// A random star-shaped polygon of up to 600 points with a small
+        /// square hole near its centre, filled through the z-order path:
+        /// the triangles' areas sum to the polygon's.
+        #[test]
+        fn large_star_shaped_with_hole_fills_exactly(
+            radii in prop::collection::vec(2.0f64..10.0, 81..600),
+            hole_size in 0.1f64..1.0,
+            centre in (-0.4f64..0.4, -0.4f64..0.4),
+            offset in (-1e3f64..1e3, -1e3f64..1e3),
+        ) {
+            let n = radii.len();
+            let outer: Vec<[f64; 2]> = radii
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let a = i as f64 * std::f64::consts::TAU / n as f64;
+                    [offset.0 + r * a.cos(), offset.1 + r * a.sin()]
+                })
+                .collect();
+            let h = hole_size / 2.0;
+            // Every edge stays more than 1.6 from the centre (see above), and
+            // the hole's corners are within 0.71 + 0.57 of it.
+            let hole = square(offset.0 + centre.0 - h, offset.1 + centre.1 - h, hole_size);
+            let mut out = Vec::new();
+            prop_assert_eq!(triangulate(&outer, &[&hole], &mut out), Ok(true));
+            let pts = all_points(&outer, &[&hole]);
+            let area: f64 = out.iter().map(|&t| signed_area(&pts, t)).sum();
+            let expected = shoelace(&outer) - hole_size * hole_size;
+            prop_assert!(((area - expected) / expected).abs() < 1e-9, "{} vs {}", area, expected);
         }
 
         #[test]
