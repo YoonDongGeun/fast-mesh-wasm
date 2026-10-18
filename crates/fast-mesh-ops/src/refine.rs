@@ -99,11 +99,12 @@ pub(crate) fn refine(
     let mut triangles = Vec::new();
     reserve(&mut triangles, patch.len())?;
     // Every patch corner is a loop vertex.
-    triangles.extend(
-        patch
-            .iter()
-            .map(|t| t.map(|v| old.binary_search(&v).map_or(0, |i| i as u32))),
-    );
+    triangles.extend(patch.iter().map(|t| {
+        t.map(|v| {
+            old.binary_search(&v)
+                .expect("patch corner is a loop vertex") as u32
+        })
+    }));
     let mut refined = RefinedPatch {
         old,
         points,
@@ -232,7 +233,7 @@ struct Relax {
     pairs: Vec<((u32, u32), u32)>,
     /// The triangles changed in this pass; their edges in `pairs` are stale.
     touched: Vec<bool>,
-    /// The edges created in this pass.
+    /// The edges created in this pass, sorted.
     added: Vec<(u32, u32)>,
 }
 
@@ -286,7 +287,7 @@ impl Relax {
         let at = self.pairs.partition_point(|p| p.0 < local);
         let old = patch.old.len() as u32;
         self.pairs.get(at).is_some_and(|p| p.0 == local)
-            || self.added.contains(&local)
+            || self.added.binary_search(&local).is_ok()
             || (local.1 < old
                 && edges
                     .kind(patch.old[local.0 as usize], patch.old[local.1 as usize])
@@ -333,7 +334,10 @@ impl Relax {
         if dot(m1, m2) <= 0.0 || dot(m1, before) <= 0.0 || dot(m2, before) <= 0.0 {
             return Ok(false);
         }
-        push(&mut self.added, key(k, l))?;
+        // `exists` just found `key(k, l)` absent, so it goes in once.
+        let at = self.added.partition_point(|&a| a < key(k, l));
+        reserve(&mut self.added, 1)?;
+        self.added.insert(at, key(k, l));
         patch.triangles[t1] = [i, l, k];
         patch.triangles[t2] = [l, j, k];
         Ok(true)

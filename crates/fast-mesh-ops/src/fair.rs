@@ -148,7 +148,12 @@ impl System {
         ring.dedup();
         let local = |v: VertexId| match old.binary_search(&v) {
             Ok(i) => i as u32,
-            Err(_) => (patch_len + ring.binary_search(&v).unwrap_or(0)) as u32,
+            Err(_) => {
+                let i = ring
+                    .binary_search(&v)
+                    .expect("vertex outside the loop is in the ring");
+                (patch_len + i) as u32
+            }
         };
         let mut points = Vec::new();
         reserve(&mut points, patch_len + ring.len())?;
@@ -495,8 +500,17 @@ impl Cg {
             }
         }
         self.x.copy_from_slice(&self.best);
-        result.residual = best / reference;
-        result.finite = self.x.iter().all(|x| x.is_finite());
+        // The recurrence drifts from the true residual: judge the iterate
+        // kept by `rhs - Bᵀ B x` itself.
+        self.p.copy_from_slice(&self.x);
+        self.apply(b);
+        for ((r, b), ap) in self.r.iter_mut().zip(rhs).zip(&self.ap) {
+            *r = b - ap;
+        }
+        let res = dot_n(&self.r, &self.r).sqrt();
+        result.converged = res <= TOLERANCE * reference;
+        result.residual = res / reference;
+        result.finite = self.x.iter().all(|x| x.is_finite()) && res.is_finite();
         result
     }
 }

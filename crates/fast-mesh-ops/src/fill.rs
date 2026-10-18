@@ -34,6 +34,14 @@ pub struct FillOptions {
     /// Fair the patch so that it continues the surrounding curvature;
     /// otherwise the refined patch keeps its new vertices at the centroids
     /// they were split at.
+    ///
+    /// On by default. Fairing costs about 10-15x an unfaired fill and grows
+    /// with the square of the patch size (conjugate gradient on the
+    /// bi-Laplacian), so a large hole can take seconds; set `fair: false`
+    /// for speed when a closed surface is enough. At a pinch vertex shared
+    /// with another hole filled in the same call, the one-ring used for
+    /// fairing does not include the other hole's patch, which slightly
+    /// distorts the patches near that vertex on a curved surface.
     pub fair: bool,
     /// Loops with more edges than this are triangulated by projection onto
     /// their best-fit plane instead of the `O(n³)` minimum-weight search.
