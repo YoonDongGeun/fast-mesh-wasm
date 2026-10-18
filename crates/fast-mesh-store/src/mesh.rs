@@ -130,8 +130,8 @@ impl Mesh {
 
     /// Builds a mesh from double-precision positions. The origin is set to the center
     /// of the bounding box and positions are stored as `f32` offsets from it, which
-    /// keeps precision for coordinates far from zero. Every coordinate, and the
-    /// computed origin, must be finite.
+    /// keeps precision for coordinates far from zero. Every coordinate, the
+    /// computed origin and every offset (as an `f32`) must be finite.
     pub fn from_buffers_f64(positions: &[f64], indices: &[u32]) -> Result<Self> {
         if !positions.len().is_multiple_of(3) {
             return Err(StoreError::InvalidArgument(
@@ -159,8 +159,8 @@ impl Mesh {
     }
 
     /// Builds a mesh from double-precision positions relative to a given origin:
-    /// positions are stored as `(p - origin)` in `f32`. Every coordinate, and the
-    /// origin, must be finite.
+    /// positions are stored as `(p - origin)` in `f32`. Every coordinate, the
+    /// origin and every offset (as an `f32`) must be finite.
     pub fn from_buffers_f64_with_origin(
         positions: &[f64],
         indices: &[u32],
@@ -178,13 +178,19 @@ impl Mesh {
     }
 
     /// Shared tail of the `f64` constructors; `positions` is already validated.
+    /// Offsets from the origin too large for an `f32` are rejected like
+    /// non-finite input.
     fn with_origin_checked(positions: &[f64], indices: &[u32], origin: [f64; 3]) -> Result<Self> {
+        let not_finite = StoreError::InvalidArgument("positions must be finite");
         if !origin.iter().all(|x| x.is_finite()) {
-            return Err(StoreError::InvalidArgument("positions must be finite"));
+            return Err(not_finite);
         }
         let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
         for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
             *p = [0, 1, 2].map(|k| (c[k] - origin[k]) as f32);
+            if !p.iter().all(|x| x.is_finite()) {
+                return Err(not_finite);
+            }
         }
         Self::build(origin, points, indices)
     }
@@ -537,6 +543,25 @@ mod tests {
             Mesh::from_buffers_f64_with_origin(&[0., 0.], &[], [0.; 3]),
             Err(StoreError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn offsets_overflowing_f32_are_rejected() {
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        // Finite in f64, but 1e39 away from the origin does not fit an f32.
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[1.0e39, 0., 0.], &[], [0.; 3]).err(),
+            Some(bad.clone())
+        );
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[0., 0., 0.], &[], [0., -1.0e39, 0.]).err(),
+            Some(bad.clone())
+        );
+        // The auto-centred constructor shares the check.
+        assert_eq!(
+            Mesh::from_buffers_f64(&[-1.0e300, 0., 0., 1.0e300, 0., 0.], &[]).err(),
+            Some(bad)
+        );
     }
 
     #[test]

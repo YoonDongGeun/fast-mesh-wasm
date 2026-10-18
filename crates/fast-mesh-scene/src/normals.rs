@@ -164,8 +164,8 @@ impl NormalState {
         dirty.sort_unstable();
         dirty.dedup();
         dirty.retain(|&v| (v as usize) < slots);
-        // Ascending triangle order per vertex, as in `compute_all`, so both
-        // give the same bits.
+        // Ascending triangle order per vertex, as in `compute_all`, so the
+        // result matches a full recomputation.
         let p = mesh.positions();
         for &v in &dirty {
             let mut sum = [0.0f32; 3];
@@ -247,6 +247,10 @@ impl Scene {
     /// [`Scene::update`] only. A compaction recomputes them in full right
     /// away. Placement changes leave them alone: they are mesh-local.
     ///
+    /// Memory: besides 12 bytes of normal per vertex slot, a snapshot of the
+    /// triangles (12 bytes per triangle slot) is kept while normals are on,
+    /// so the old vertices of removed and rewritten triangles are known.
+    ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or [`SceneError::Store`] when there is
     /// no memory for them. The scene is unchanged on error.
@@ -264,16 +268,16 @@ impl Scene {
         Ok(())
     }
 
-    /// The mesh's vertex normals in mesh-local space, one per vertex slot
-    /// (`normals(id).len() == mesh.vertex_slots()`), or `None` when normals
-    /// are off. A normal is the normalised sum of the area-weighted normals
+    /// The mesh's vertex normals in mesh-local space, one per vertex slot,
+    /// or `None` when normals are off. A normal is the normalised sum of the area-weighted normals
     /// of the alive triangles using the vertex; a vertex used by none (or
     /// only by degenerate ones), dead slots included, reads `[0, 0, 0]`.
     ///
     /// The normals of a Lazy or Manual mesh are those of its last update
-    /// (new vertex slots read zero until then); if memory ran out while
-    /// following an edit, the slice may be shorter until the next update
-    /// succeeds.
+    /// (new vertex slots read zero until then). The slice may differ in
+    /// length from `mesh.vertex_slots()` until the next successful update:
+    /// shorter if memory ran out while following an edit, or longer if the
+    /// recomputation after a compaction failed.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
