@@ -11,7 +11,7 @@ use crate::Aabb;
 use crate::arena::{NONE, Node};
 use crate::build::{Prims, build_subtree, max_nodes, reserve_headroom};
 use crate::error::{BvhError, Result, try_reserve, try_reserve_map, try_vec};
-use crate::tree::{Bvh, Treelet};
+use crate::tree::{Bvh, Treelet, next_generation};
 
 /// How `update` brought the tree up to date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +175,8 @@ impl Bvh {
         {
             report.compacted = true;
         }
-        self.generation += 1;
+        // Storage compaction above relies on this bump (a second one is harmless).
+        self.generation = next_generation();
         self.revision = mesh.revision();
         Ok(report)
     }
@@ -201,7 +202,7 @@ impl Bvh {
                 self.arena.refit_ancestors(leaf);
             }
         }
-        self.generation += 1;
+        self.generation = next_generation();
         Ok(())
     }
 
@@ -241,7 +242,7 @@ impl Bvh {
         for &i in &which {
             self.replace_treelet(mesh, i, &[], &[], &[], &mut scratch);
         }
-        self.generation += 1;
+        self.generation = next_generation();
         Ok(())
     }
 

@@ -163,8 +163,9 @@ impl Bvh {
 
     /// Counter that changes whenever nodes, boxes, refs or layout change
     /// (build, update, refit, rebuild, compaction), so per-node data keyed by
-    /// [`NodeId::index`] can detect that it went stale. It never repeats a
-    /// value an earlier state of this BVH had.
+    /// [`NodeId::index`] can detect that it went stale. Values are unique
+    /// across all BVHs in this process, so a replacement tree never shares one
+    /// with an earlier tree.
     pub fn generation(&self) -> u64 {
         self.generation
     }
