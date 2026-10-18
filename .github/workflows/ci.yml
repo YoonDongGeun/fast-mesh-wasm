@@ -28,8 +28,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      # fast-mesh-wasm does not depend on the scene crate yet, so `pnpm
-      # build` would not catch a scene change that breaks the wasm target.
+      # The package job builds the scene crate for wasm through fast-mesh-wasm;
+      # these also build the engine crates on their own (own feature sets).
       - run: cargo build --release --target wasm32-unknown-unknown -p fast-mesh-scene
       - run: cargo build --release --target wasm32-unknown-unknown -p fast-mesh-fields
       - run: cargo bench -p fast-mesh-bvh --no-run

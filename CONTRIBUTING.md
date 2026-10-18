@@ -59,7 +59,7 @@ pnpm test
 | `cargo bench -p fast-mesh-ops` | `analyze` (with and without the self-intersection check), `orient`, `fill_holes` (fair on and off), `weld` and `remove_small_components` on 1M triangles; results go in `docs/benchmarks.md` |
 | `pnpm --filter fast-mesh-wasm-example-vite dev` | Runs the browser example |
 
-The package's `test` script (`pnpm --filter fast-mesh-wasm test`) rebuilds the package first as a test build: `scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`) enables the `test-panic` cargo feature, which adds a `__test_panic` export for the poisoning test. Run `pnpm build` afterwards before packing or publishing by hand; `prepublishOnly` refuses a test build, and `pnpm release` always rebuilds.
+The package's `test` script (`pnpm --filter fast-mesh-wasm test`) rebuilds the package first as a test build: `scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`) enables the `test-panic` cargo feature, which adds a `__test_panic` export for the poisoning test. Run `pnpm build` afterwards before packing or publishing by hand; `prepublishOnly` refuses a test build, and `pnpm release` always rebuilds. The root `pnpm test` runs it too, so it also leaves `dist/` as a test build: run `pnpm build` before `pnpm smoke`, which packs `dist/` as it is.
 
 ## Adding or changing an API
 

@@ -1,7 +1,7 @@
 // Public API shared by the browser and Node entries. Wraps the raw wasm-bindgen
 // exports: converts inputs, shapes results into plain values and guards against
 // calls made before the WebAssembly module is ready.
-import { call, setMemory } from "./core.js";
+import { call, ensureInitialized, setMemory } from "./core.js";
 import * as wasm from "./wasm/fast_mesh_wasm.js";
 
 export type { InitInput, InitOutput } from "./wasm/fast_mesh_wasm.js";
@@ -16,10 +16,44 @@ export type Vec3 = [x: number, y: number, z: number];
 export type Positions = Float32Array | ArrayLike<number>;
 
 /**
+ * Flat vertex positions in world space for `Scene.addMesh`, kept in double
+ * precision until the mesh origin is subtracted.
+ * A `Float64Array` is used as is; any other array is converted once.
+ */
+export type Positions64 = Float32Array | Float64Array | ArrayLike<number>;
+
+/**
  * Flat triangle indices `[a0, b0, c0, a1, ...]`.
  * A `Uint32Array` is used as is; `Uint16Array` (common in three.js) and plain arrays are converted once.
  */
 export type Indices = Uint32Array | Uint16Array | ArrayLike<number>;
+
+/** A unit quaternion `[x, y, z, w]`; it is normalised before use. */
+export type Quat = readonly [x: number, y: number, z: number, w: number];
+
+/** A 3×3 rotation matrix as 9 numbers, row-major. */
+export type Mat3 = readonly number[];
+
+/**
+ * When a mesh's derived data (BVH, normals, fields, sections) follows its edits:
+ * right away (`"eager"`), on the next query or `flush()` (`"lazy"`), or only on
+ * `update(mesh)` (`"manual"`).
+ */
+export type UpdateMode = "eager" | "lazy" | "manual";
+
+/** A placement to set: a rotation (row-major matrix or quaternion) and a translation. */
+export interface PlacementInput {
+  /** A proper rotation: 9 numbers row-major, or a quaternion `[x, y, z, w]`. */
+  rotation: Mat3 | Quat;
+  translation: Readonly<Vec3>;
+}
+
+/** A mesh placement: world = rotation · local + translation. */
+export interface Placement {
+  /** 9 numbers, row-major. */
+  rotation: number[];
+  translation: Vec3;
+}
 
 /** Axis-aligned bounding box. */
 export interface Bounds {
@@ -33,21 +67,12 @@ export interface Bounds {
   size: Vec3;
 }
 
-let initialized = false;
-
 /**
  * Called by the entry point once the WebAssembly module is instantiated, with
  * what `initSync` / the default init returned; keeps its memory for views.
  */
 export function markInitialized(output: wasm.InitOutput): void {
   setMemory(output.memory);
-  initialized = true;
-}
-
-function ensureInitialized(fn: string): void {
-  if (!initialized) {
-    throw new Error(`fast-mesh-wasm is not initialized: call \`await init()\` before ${fn}().`);
-  }
 }
 
 function toFloat32(values: Positions): Float32Array {
@@ -67,7 +92,7 @@ function toUint32(values: Indices): Uint32Array {
  * @throws If a length is not a multiple of 3 or an index is out of range.
  */
 export function computeVertexNormals(positions: Positions, indices: Indices): Float32Array {
-  ensureInitialized("computeVertexNormals");
+  ensureInitialized("computeVertexNormals()");
   return call(() => wasm.computeVertexNormals(toFloat32(positions), toUint32(indices)));
 }
 
@@ -78,7 +103,7 @@ export function computeVertexNormals(positions: Positions, indices: Indices): Fl
  * @throws If `positions` is empty or its length is not a multiple of 3.
  */
 export function computeBounds(positions: Positions): Bounds {
-  ensureInitialized("computeBounds");
+  ensureInitialized("computeBounds()");
   const b = call(() => wasm.computeBounds(toFloat32(positions)));
   const min: Vec3 = [b[0], b[1], b[2]];
   const max: Vec3 = [b[3], b[4], b[5]];

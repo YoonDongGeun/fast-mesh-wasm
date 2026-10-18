@@ -25,6 +25,25 @@ export {
   computeVertexNormals,
   type Indices,
   type InitInput,
+  type Mat3,
+  type Placement,
+  type PlacementInput,
   type Positions,
+  type Positions64,
+  type Quat,
+  type UpdateMode,
   type Vec3,
 } from "./api.js";
+export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export {
+  type AddMeshOptions,
+  type DragSession,
+  type FieldHandle,
+  type MeshChange,
+  type MeshHandle,
+  type MeshViews,
+  type Range,
+  Scene,
+  type SceneOptions,
+  type SectionHandle,
+} from "./scene.js";

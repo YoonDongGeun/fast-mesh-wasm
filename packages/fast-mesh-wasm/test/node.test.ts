@@ -1,7 +1,7 @@
 // Imports the package by its own name so the test goes through the published
 // `exports` map and the built dist/ files, exactly like a user install.
 import { describe, expect, it } from "vitest";
-import { computeBounds, computeVertexNormals, init } from "fast-mesh-wasm";
+import { computeBounds, computeVertexNormals, FastMeshError, init, Scene } from "fast-mesh-wasm";
 
 // Unit quad on the XY plane, two counter-clockwise triangles facing +Z.
 const positions = new Float32Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]);
@@ -50,5 +50,12 @@ describe("fast-mesh-wasm (node entry)", () => {
     });
     expect(Object.getPrototypeOf(bounds)).toBe(Object.prototype);
     expect(computeBounds([0, 0, 0, 2, 4, 6]).size).toEqual([2, 4, 6]);
+  });
+
+  it("exports the Scene", () => {
+    using scene = new Scene();
+    const mesh = scene.addMesh(positions, indices);
+    expect(Array.from(scene.views(mesh).indices())).toEqual(Array.from(indices));
+    expect(() => scene.removeMesh({} as never)).toThrow(FastMeshError);
   });
 });

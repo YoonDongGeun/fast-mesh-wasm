@@ -14,8 +14,8 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 # Exports `__test_panic()`, which panics, for the TypeScript poisoning test.
-# Only `FAST_MESH_TEST_BUILD=1 node scripts/build-wasm.mjs` (run by the
-# package's `test` script) enables it; release builds never do.
+# Only `node scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`), run
+# by the package's `test` script, enables it; release builds never do.
 test-panic = []
 
 [dependencies]
