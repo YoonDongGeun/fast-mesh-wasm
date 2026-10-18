@@ -35,6 +35,10 @@
 //!   and non-manifold pieces.
 //! - Polygon fill: [`triangulate::triangulate`] splits a 2D polygon with
 //!   holes into counter-clockwise triangles by ear clipping.
+//! - Section measurements on `(u, v)` polylines: [`contour_length`],
+//!   [`signed_area`], [`fill`] (nesting into outers and holes, then a
+//!   [`Fill`] of triangles) and [`contour_gap`] (the exact in-plane
+//!   [`Gap2`] between two sets of polylines, found through a grid).
 
 mod closest;
 mod error;
@@ -44,6 +48,7 @@ mod plane;
 mod ray;
 mod region;
 mod rigid;
+mod section;
 mod slice;
 #[cfg(test)]
 mod test_util;
@@ -63,6 +68,7 @@ pub use plane::Plane;
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;
+pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};
 pub use slice::{Contour, Slice, slice};
 pub use tri::{Cull, Feature};
 

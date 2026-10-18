@@ -36,7 +36,7 @@ fn side(a: P3, b: P3, c: P3, d: P3) -> i8 {
 }
 
 /// The sign of `det[b - a, c - a]`, the 2D orientation of `a`, `b`, `c`.
-fn side2(a: P2, b: P2, c: P2) -> i8 {
+pub(crate) fn side2(a: P2, b: P2, c: P2) -> i8 {
     if ![a, b, c].iter().flatten().all(|&x| safe(x)) {
         return exact::side2(a, b, c);
     }
@@ -45,7 +45,7 @@ fn side2(a: P2, b: P2, c: P2) -> i8 {
 
 /// `robust::orient2d`: `det[b - a, c - a]` approximately, with the exact sign
 /// when every coordinate is [`safe`].
-fn orient2d_approx(a: P2, b: P2, c: P2) -> f64 {
+pub(crate) fn orient2d_approx(a: P2, b: P2, c: P2) -> f64 {
     let c2 = |p: P2| Coord { x: p[0], y: p[1] };
     orient2d(c2(a), c2(b), c2(c))
 }
