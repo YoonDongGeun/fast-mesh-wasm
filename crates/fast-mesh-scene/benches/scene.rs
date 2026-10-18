@@ -40,8 +40,10 @@
 //! fields, `max_distance` 0.5) and each mesh coloured by its field to the
 //! next. The middle mesh is dragged through 64 poses (ten fields due per
 //! pose), as in the field drag: `many_mesh_drag_30k` (`terrain(122)`, the
-//! owner's scale), `many_mesh_drag_30k_apart` (the same meshes a whole side
-//! apart, so nothing is in reach) and, with `FAST_MESH_BENCH_LARGE=1`,
+//! owner's scale), `many_mesh_drag_30k_touching` (the same meshes
+//! overlapping by one cell, so neighbours barely touch and only a strip of
+//! each is in reach), `many_mesh_drag_30k_apart` (the same meshes a whole
+//! side apart, so nothing is in reach) and, with `FAST_MESH_BENCH_LARGE=1`,
 //! `many_mesh_drag_1M` (`terrain(708)`; about 40 s per iteration without
 //! the `parallel` feature).
 
@@ -881,8 +883,9 @@ fn benches(c: &mut Criterion) {
     bench_fields(c, "1M", 708);
     bench_contacts(c);
     // 122: 29,768 triangles per mesh; 708: 1,002,528. Neighbours overlap by
-    // an eighth of the side, or are a whole side apart.
+    // an eighth of the side, by one cell, or are a whole side apart.
     bench_many_mesh(c, "many_mesh_drag_30k", 122, 122.0 * 7.0 / 8.0);
+    bench_many_mesh(c, "many_mesh_drag_30k_touching", 122, 121.0);
     bench_many_mesh(c, "many_mesh_drag_30k_apart", 122, 244.0);
     if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {
         bench_many_mesh(c, "many_mesh_drag_1M", 708, 708.0 * 7.0 / 8.0);
