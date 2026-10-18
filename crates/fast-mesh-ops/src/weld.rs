@@ -19,7 +19,7 @@ use crate::{OpsError, Result, filled, push, reserve};
 /// outlier does not widen the cells. A coordinate at least `2^60` cells from
 /// zero (every coordinate at tolerance 0) is keyed by its exact value
 /// instead, which keeps cell coordinates from saturating: its `f32` spacing
-/// there is over `2^36` cells, so it can only pair with an equal coordinate.
+/// there is at least `2^36` cells, so it can only pair with an equal coordinate.
 ///
 /// # Errors
 /// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite.
