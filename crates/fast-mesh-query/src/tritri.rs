@@ -99,6 +99,12 @@ fn normal_axis(t: &[P3; 3]) -> Option<usize> {
     best.map(|(k, _)| k)
 }
 
+/// True when the three corners of `t` are collinear (or coincide), decided
+/// exactly.
+pub(crate) fn collinear(t: &[P3; 3]) -> bool {
+    normal_axis(t).is_none()
+}
+
 /// True when the closed triangles `a` and `b` share at least one point.
 /// Touching at a vertex or along an edge counts. Exact for the given
 /// coordinates.
