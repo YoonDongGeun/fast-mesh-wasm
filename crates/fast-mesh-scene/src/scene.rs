@@ -449,8 +449,7 @@ impl Scene {
     /// its edit entries leave the undo and redo stacks and an open step;
     /// steps left empty are dropped. Its placement entries stay valid and
     /// are kept. Nothing is released: the reserved slots no longer exist.
-    /// Its BVH is
-    /// rebuilt whatever its mode, and the next
+    /// Its BVH is rebuilt whatever its mode, and the next
     /// [`Scene::take_changes`] reports it as fully changed (`changes: None`).
     ///
     /// If the rebuild fails, compaction still succeeds and the BVH stays

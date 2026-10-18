@@ -10,8 +10,10 @@ use crate::MeshId;
 pub struct MeshChanges {
     /// The mesh. For a removed mesh this id no longer matches.
     pub id: MeshId,
-    /// The merged changes of every commit since the last call. `None` means
-    /// "treat everything as changed": the mesh was added or compacted.
+    /// The merged changes of every commit, undo and redo since the last
+    /// call. `None` means "treat everything as changed": the mesh was added
+    /// or compacted, or an undo or redo touching it failed with
+    /// [`SceneError::Corrupted`](crate::SceneError::Corrupted).
     pub changes: Option<ChangeSet>,
     /// True if the placement changed at any point since the last call, even
     /// if it was changed back.
@@ -59,9 +61,10 @@ impl Report {
     /// Folds the changes of a later commit into the report. A report that
     /// already says "everything" stays that way.
     ///
-    /// `ChangeSet::merge` cannot fail (its allocations abort on exhaustion
-    /// rather than return an error), so this never needs to fall back to
-    /// `None`; that only happens on `add_mesh` and `compact`.
+    /// `ChangeSet::merge` cannot fail: its allocations abort the process on
+    /// exhaustion rather than return an error, so this never falls back to
+    /// `None`. That only happens on `add_mesh`, `compact` and a `Corrupted`
+    /// undo or redo.
     pub(crate) fn merge(&mut self, later: &ChangeSet) {
         if let Some(c) = &mut self.changes {
             c.merge(later);
