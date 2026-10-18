@@ -85,3 +85,26 @@ There are two stages:
 - How the Scene splits the compute and write phases for fields and sections, provided writes stay sequential and in order.
 - Whether to add `parallel` to `fast-mesh-store`. Probably not needed.
 - Splitting into plan tasks.
+
+## 7. Decisions after the builder check (all *my call*; they override earlier sections)
+
+1. **Normals are out of stage 1.** The incremental Scene normals channel is being added by Phase 8a on another branch. Parallelising it waits for stage 2, after 8a merges, so this branch stays conflict-free. `fast_mesh::compute_vertex_normals` (the `fast-mesh` crate) is not touched either.
+2. **`SignData::build` is in scope.** It rebuilds over the whole target mesh on every edit of that mesh (~150 ms at 1M), so it is the biggest per-edit cost.
+   - Its per-vertex and per-corner loops (pseudonormals, edge normals, winding moments) run in parallel chunks.
+   - It still runs inside the Scene's sequential prepare phase, but is internally parallel.
+   - The `sign_build_*` benches join the §5 list.
+3. **Allocation in parallel paths.**
+   - Workers may allocate, but only fallibly (`try_reserve`). When several workers fail, the error from the lowest work-item index wins, so the error is deterministic.
+   - The parallel SAH build allocates per subtree and splices the results deterministically. It does not pre-reserve the 2n−1 worst case.
+   - The existing out-of-memory fault-injection hooks are thread-local. While a hook is armed (test builds only), every parallel site runs sequentially, so the existing OOM tests keep covering the code they cover today.
+   - A dedicated test covers the lowest-index error rule in parallel.
+4. **Scene benches.**
+   - Six meshes, with a distance field for every ordered pair: 30 fields.
+   - Each mesh is coloured by its field to the next mesh by index.
+   - Dragging one mesh therefore makes 10 fields due per pose (5 on the moved mesh, 5 measured to it).
+   - "Not slower" at owner scale is a recorded measurement in `docs/benchmarks.md`, not a CI gate. Parallel must be within 5% of sequential (criterion noise) or faster, and thresholds are tuned until it is.
+5. **Determinism baseline.**
+   - Results must be bit-identical between `parallel` on and off, for any thread count.
+   - They need not match today's main bit for bit. The sequential build may adopt the same fixed chunked reductions (for example, chunked CG dot products and gather-based transposed products), and any golden values in tests are refreshed.
+   - Property tests that compare against from-scratch computation stay as they are.
+   - §3's "unaffected" means unaffected in API and behaviour class, not in last-bit float results.
