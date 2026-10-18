@@ -23,6 +23,20 @@ const WELD_CHUNK: usize = 8 * 1024;
 /// A vertex's cell: per coordinate `(exact, key)`.
 type Cell = [(bool, i64); 3];
 
+/// Checks a weld tolerance.
+///
+/// # Errors
+/// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite.
+pub(crate) fn check_tolerance(tolerance: f32) -> Result<()> {
+    if tolerance >= 0.0 && tolerance.is_finite() {
+        Ok(())
+    } else {
+        Err(OpsError::InvalidInput(
+            "weld tolerance must be finite and not negative",
+        ))
+    }
+}
+
 /// For every vertex slot, the smallest id of its weld group: the alive
 /// vertices linked through chains of pairs at most `tolerance` apart (in
 /// local units, `f64` distance between the stored `f32` positions). A vertex
@@ -42,11 +56,7 @@ type Cell = [(bool, i64); 3];
 /// # Errors
 /// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite.
 pub(crate) fn weld_roots(mesh: &Mesh, tolerance: f32) -> Result<Vec<VertexId>> {
-    if !(tolerance >= 0.0 && tolerance.is_finite()) {
-        return Err(OpsError::InvalidInput(
-            "weld tolerance must be finite and not negative",
-        ));
-    }
+    check_tolerance(tolerance)?;
     let slots = mesh.vertex_slots();
     let tol = f64::from(tolerance);
     let cell = 2.0 * tol;

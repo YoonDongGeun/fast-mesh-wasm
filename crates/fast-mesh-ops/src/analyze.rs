@@ -10,7 +10,7 @@ use fast_mesh_query::self_intersecting_pairs;
 use crate::topology::{
     BoundaryLoop, Component, EdgeMap, components, loops_with, pinch_vertices, point, triangle_area,
 };
-use crate::weld::weld_roots;
+use crate::weld::{check_tolerance, weld_roots};
 use crate::{Result, filled, push, reserve};
 
 /// Options for [`analyze`].
@@ -132,6 +132,8 @@ pub(crate) const PAR_MIN_ANALYZE_TRIS: usize = 2048;
 /// [`OpsError::Store`]: crate::OpsError::Store
 pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
     let max = options.max_listed;
+    // Checked first, so a bad tolerance fails before any pass runs.
+    check_tolerance(options.weld_tolerance)?;
     // The four passes read the mesh only; on large meshes they run side by
     // side. Their errors are returned in pass order, so the first error is
     // the same however they ran.
@@ -620,15 +622,22 @@ mod tests {
             assert_eq!((a.duplicate, a.degenerate), (1, 1));
             assert!(a.coincident_groups > 0);
         }
-        // The first error in pass order wins, however the passes ran.
+        // A pass's error is the same however the passes ran.
         let other = Bvh::build(&uv_sphere(8, 12, 1.0), &BuildOptions::default()).unwrap();
-        let bad = AnalyzeOptions {
-            weld_tolerance: -1.0,
+        let mut bad = AnalyzeOptions {
             self_intersection: Some(&other),
             ..Default::default()
         };
         let e = assert_parallel_identical("analyze error", || analyze(&mesh, &bad));
-        assert!(matches!(e, Err(OpsError::InvalidInput(_))));
+        assert!(matches!(e, Err(OpsError::Query(_))));
+        // A bad tolerance fails before any pass runs.
+        bad.weld_tolerance = -1.0;
+        let before = par::parallel_entries();
+        assert!(matches!(
+            analyze(&mesh, &bad),
+            Err(OpsError::InvalidInput(_))
+        ));
+        assert_eq!(par::parallel_entries(), before);
     }
 
     #[test]
