@@ -179,6 +179,105 @@ pub(crate) fn traverse_subtree_pairs_with<const N: usize, K: Copy + PartialOrd>(
     }
 }
 
+/// The child pairs of the pair of node `pa` of `a` and node `pb` of `b`,
+/// split as [`traverse_pairs`] splits them, each with `Some` when `key`
+/// keeps it; `None` for a pair of two leaves.
+pub(crate) fn split_pair<K: Copy + PartialOrd>(
+    a: &Bvh,
+    pa: NodeId,
+    b: &Bvh,
+    pb: NodeId,
+    xf: &Rigid,
+    key: &impl Fn(&Aabb, &Aabb) -> Option<K>,
+) -> Option<[Option<(NodeId, NodeId)>; 2]> {
+    let (va, vb) = (a.node(pa), b.node(pb));
+    let b_box = xf.transform_box(&vb.bounds);
+    let (split_a, left, right) = match (va.kind, vb.kind) {
+        (NodeKind::Leaf { .. }, NodeKind::Leaf { .. }) => return None,
+        (NodeKind::Inner { left, right }, NodeKind::Leaf { .. }) => (true, left, right),
+        (NodeKind::Leaf { .. }, NodeKind::Inner { left, right }) => (false, left, right),
+        (
+            NodeKind::Inner { left, right },
+            NodeKind::Inner {
+                left: bl,
+                right: br,
+            },
+        ) => {
+            if va.bounds.surface_area() >= b_box.surface_area() {
+                (true, left, right)
+            } else {
+                (false, bl, br)
+            }
+        }
+    };
+    Some([left, right].map(|c| {
+        let (pair, a_box, b_box) = if split_a {
+            ((c, pb), a.node(c).bounds, b_box)
+        } else {
+            ((pa, c), va.bounds, xf.transform_box(&b.node(c).bounds))
+        };
+        key(&a_box, &b_box).map(|_| pair)
+    }))
+}
+
+/// Cuts the traversal of `a` against `b` ([`traverse_pairs`]) into disjoint
+/// node pairs, for traversals that can run on their own
+/// ([`traverse_subtree_pairs_with`] from each): starting from the root pair
+/// (when `key` keeps it), every pair with an inner node is replaced by the
+/// child pairs `key` keeps ([`split_pair`]), one level of pairs at a time,
+/// until there are `target` pairs or more, or only pairs of leaves are left.
+///
+/// Every pair of leaves the whole traversal reaches lies under exactly one
+/// of the returned pairs, and the pairs culled on the way hold none that it
+/// reaches. The pairs come in a fixed order for given trees.
+///
+/// # Errors
+/// `OutOfMemory` when the list cannot grow.
+pub(crate) fn split_pairs<K: Copy + PartialOrd>(
+    a: &Bvh,
+    b: &Bvh,
+    xf: &Rigid,
+    key: &impl Fn(&Aabb, &Aabb) -> Option<K>,
+    target: usize,
+) -> crate::Result<Vec<(NodeId, NodeId)>> {
+    let mut pairs = Vec::new();
+    let (Some(ra), Some(rb)) = (a.root(), b.root()) else {
+        return Ok(pairs);
+    };
+    if key(&a.node(ra).bounds, &xf.transform_box(&b.node(rb).bounds)).is_none() {
+        return Ok(pairs);
+    }
+    try_push(&mut pairs, (ra, rb))?;
+    while pairs.len() < target {
+        let mut next = Vec::new();
+        let mut split = false;
+        for &(pa, pb) in &pairs {
+            match split_pair(a, pa, b, pb, xf, key) {
+                None => try_push(&mut next, (pa, pb))?,
+                Some(children) => {
+                    split = true;
+                    for c in children.into_iter().flatten() {
+                        try_push(&mut next, c)?;
+                    }
+                }
+            }
+        }
+        pairs = next;
+        if !split {
+            break;
+        }
+    }
+    Ok(pairs)
+}
+
+/// Pushes with a fallible reservation.
+pub(crate) fn try_push<T>(v: &mut Vec<T>, x: T) -> crate::Result<()> {
+    v.try_reserve(1)
+        .map_err(|_| crate::QueryError::OutOfMemory)?;
+    v.push(x);
+    Ok(())
+}
+
 /// Visits every leaf–leaf pair below the pending pair `p` that `key` does not
 /// cull, without a stack: a parent-link walk of A's subtree, and for each of
 /// its leaves one of B's subtree. Inner pairs are only tested with `key`, not

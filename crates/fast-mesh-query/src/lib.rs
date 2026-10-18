@@ -145,6 +145,25 @@ impl<'a, T> Appender<'a, T> {
         Ok(())
     }
 
+    /// Appends all of `items` with one fallible reservation, as [`Self::push`]
+    /// does for one.
+    pub(crate) fn extend(&mut self, items: &[T]) -> Result<()>
+    where
+        T: Copy,
+    {
+        let reserved = allocation_allowed().and_then(|()| {
+            self.out
+                .try_reserve(items.len())
+                .map_err(|_| QueryError::OutOfMemory)
+        });
+        if let Err(e) = reserved {
+            self.out.truncate(self.start);
+            return Err(e);
+        }
+        self.out.extend_from_slice(items);
+        Ok(())
+    }
+
     /// The elements appended through this appender.
     pub(crate) fn appended(&mut self) -> &mut [T] {
         &mut self.out[self.start..]

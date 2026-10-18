@@ -8,10 +8,12 @@
 
 use std::cell::Cell;
 
-use fast_mesh_bvh::{Aabb, Bvh, NodeKind, NodeView};
-use fast_mesh_store::{Mesh, TriangleId};
+use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind, NodeView};
+use fast_mesh_store::{Mesh, TriangleId, par};
 
-use crate::pair::{PAIR_STACK, Step, traverse_pairs_with};
+use crate::pair::{
+    PAIR_STACK, Step, split_pairs, traverse_pairs_with, traverse_subtree_pairs_with, try_push,
+};
 use crate::ray::points;
 use crate::tritri::{P3, TriTriDist, tri_tri_distance, tri_tri_intersect, tri_tri_within};
 use crate::{Appender, QueryError, Result, Rigid, check};
@@ -596,10 +598,27 @@ fn boxes_apart(lo: &P3, hi: &P3, lo2: &P3, hi2: &P3) -> bool {
     (0..3).any(|k| lo[k] > hi2[k] || lo2[k] > hi[k])
 }
 
+/// [`traverse_pairs_with`] from the node pair `from` of A and B, or from
+/// the two roots with `None`.
+fn traverse_from<const N: usize, K: Copy + PartialOrd>(
+    a: &Bvh,
+    b: &Bvh,
+    xf: &Rigid,
+    from: Option<(NodeId, NodeId)>,
+    key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
+) {
+    match from {
+        Some((ra, rb)) => traverse_subtree_pairs_with::<N, K>(a, ra, b, rb, xf, key, visit),
+        None => traverse_pairs_with::<N, K>(a, b, xf, key, visit),
+    }
+}
+
 /// Calls `pair` for every triangle pair of every leaf pair that the traversal
 /// reaches with `key` whose triangles may share a point, B's triangle already
 /// in A's space, until `pair` returns `false`. For the intersection queries,
-/// which have no distance to bound.
+/// which have no distance to bound. The traversal starts from the node pair
+/// `from`, or from the two roots with `None` ([`traverse_from`]).
 ///
 /// Leaf pairs are taken a [`Chunk`] of each side at a time, as in
 /// [`for_each_near_pair`]. A pair is skipped only when its triangles' boxes are
@@ -612,17 +631,19 @@ fn boxes_apart(lo: &P3, hi: &P3, lo2: &P3, hi2: &P3) -> bool {
 /// passed the exact test; a pair that merely touches has touching boxes, so it
 /// is never skipped. The pairs that `pair` accepts are therefore unchanged,
 /// and so are the queries' results.
+#[allow(clippy::too_many_arguments)] // The shared five, the start and two callbacks.
 fn for_each_pair<const N: usize>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
     mesh_b: &Mesh,
     bvh_b: &Bvh,
     xf: &Rigid,
+    from: Option<(NodeId, NodeId)>,
     key: impl FnMut(&Aabb, &Aabb) -> Option<f64>,
     mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
 ) {
     let (mut ca, mut cb) = (Chunk::new(), Chunk::new());
-    traverse_pairs_with::<N, f64>(bvh_a, bvh_b, xf, key, |va, vb, _| {
+    traverse_from::<N, f64>(bvh_a, bvh_b, xf, from, key, |va, vb, _| {
         let (Some(ta), Some(tb)) = (leaf(va), leaf(vb)) else {
             return Step::Descend;
         };
@@ -658,6 +679,7 @@ fn for_each_pair<const N: usize>(
 /// that [`skip_pair`] does not skip under `bound()` (for meshes of magnitude
 /// `m`), B's triangle already in A's space, until `pair` returns `false`.
 /// `bound()` is read afresh at every test, so it may shrink as `pair` runs.
+/// The traversal starts as in [`for_each_pair`].
 ///
 /// A popped node pair is dropped when `gap(k)`, the box gap ([`box_distance`])
 /// carried in its key `k`, is [`beyond`] `bound()`.
@@ -671,13 +693,14 @@ fn for_each_pair<const N: usize>(
 /// every pair this skips, `skip_pair` would have skipped too, under the same
 /// `bound()`: the prefilter changes how much work is done, never which pairs
 /// reach `pair`.
-#[allow(clippy::too_many_arguments)] // The shared five, three callbacks and `m`.
+#[allow(clippy::too_many_arguments)] // The shared five, the start, three callbacks and `m`.
 fn for_each_near_pair<const N: usize, K: Copy + PartialOrd>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
     mesh_b: &Mesh,
     bvh_b: &Bvh,
     xf: &Rigid,
+    from: Option<(NodeId, NodeId)>,
     key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
     gap: impl Fn(K) -> f64,
     bound: impl Fn() -> f64,
@@ -685,7 +708,7 @@ fn for_each_near_pair<const N: usize, K: Copy + PartialOrd>(
     mut pair: impl FnMut(TriangleId, [P3; 3], TriangleId, [P3; 3]) -> bool,
 ) {
     let (mut ca, mut cb) = (Chunk::new(), Chunk::new());
-    traverse_pairs_with::<N, K>(bvh_a, bvh_b, xf, key, |va, vb, k| {
+    traverse_from::<N, K>(bvh_a, bvh_b, xf, from, key, |va, vb, k| {
         if beyond(gap(k), bound(), m) {
             return Step::Skip;
         }
@@ -758,6 +781,7 @@ fn first_intersection<const N: usize>(
         mesh_b,
         bvh_b,
         xf,
+        None,
         overlap_key,
         |a, pa, b, pb| {
             if tri_tri_intersect(pa, pb) {
@@ -828,6 +852,7 @@ fn mesh_distance_with<const N: usize>(
         mesh_b,
         bvh_b,
         xf,
+        None,
         |p, q| distance_key(p, q, bound.get(), m),
         |(_, gap)| gap,
         || bound.get(),
@@ -861,6 +886,29 @@ fn mesh_distance_with<const N: usize>(
     })
 }
 
+/// Triangles of A and B together from which [`triangles_near`] and
+/// [`intersecting_pairs`] split their traversal into parts searched in
+/// parallel ([`split_pairs`]), with the `parallel` feature.
+///
+/// Measured on the i5-13600K with a terrain and a flipped copy whose sheets
+/// cross along curves: at 2 x 648 triangles parallel is 1.1 to 1.25 times
+/// slower, at 2 x 800 even, at 2 x 968 1.7 times faster (`triangles_near`)
+/// and 1.3 times (`intersecting_pairs`), and at 2 x 131k 15 and 14 times.
+const PAR_MIN_PAIR_TRIS: usize = 2048;
+
+/// How many node pairs a parallel pair query splits its traversal into, at
+/// least (unless the trees run out of inner nodes first): enough for the
+/// pool to balance parts of very different cost.
+const PAR_PARTS: usize = 256;
+
+/// Whether a pair query on these meshes splits its traversal: with the
+/// feature, not forced off, and at least [`PAR_MIN_PAIR_TRIS`] triangles.
+fn split_traversal(mesh_a: &Mesh, mesh_b: &Mesh) -> bool {
+    par::enabled()
+        && !par::force_sequential()
+        && mesh_a.triangle_count() + mesh_b.triangle_count() >= PAR_MIN_PAIR_TRIS
+}
+
 #[allow(clippy::too_many_arguments)] // As for `triangles_near`.
 fn triangles_near_with<const N: usize>(
     mesh_a: &Mesh,
@@ -874,36 +922,69 @@ fn triangles_near_with<const N: usize>(
 ) -> Result<()> {
     let margin = f64::from(margin);
     let m = magnitude(bvh_a, bvh_b, xf);
+    let key = |p: &Aabb, q: &Aabb| {
+        let d = box_distance(p, q);
+        (!beyond(d, margin, m)).then_some(d)
+    };
+    // Calls `found(a, b)` for every near pair under `from`, until it fails.
+    let search = |from: Option<(NodeId, NodeId)>,
+                  found: &mut dyn FnMut(TriangleId, TriangleId) -> Result<()>|
+     -> Result<()> {
+        let mut failed = None;
+        for_each_near_pair::<N, f64>(
+            mesh_a,
+            bvh_a,
+            mesh_b,
+            bvh_b,
+            xf,
+            from,
+            key,
+            |gap| gap,
+            || margin,
+            m,
+            |a, pa, b, pb| {
+                // Exactly `tri_tri_distance(pa, pb).dist2.sqrt() <= margin`
+                // (0 for pairs that intersect), but stops at the first
+                // candidate within the margin.
+                if tri_tri_within(pa, pb, margin)
+                    && let Err(e) = found(a, b)
+                {
+                    failed = Some(e);
+                    return false;
+                }
+                true
+            },
+        );
+        failed.map_or(Ok(()), Err)
+    };
     let mut ap_a = Appender::new(out_a);
     let mut ap_b = Appender::new(out_b);
-    let mut failed = None;
-    for_each_near_pair::<N, f64>(
-        mesh_a,
-        bvh_a,
-        mesh_b,
-        bvh_b,
-        xf,
-        |p, q| {
-            let d = box_distance(p, q);
-            (!beyond(d, margin, m)).then_some(d)
-        },
-        |gap| gap,
-        || margin,
-        m,
-        |a, pa, b, pb| {
-            // Exactly `tri_tri_distance(pa, pb).dist2.sqrt() <= margin`
-            // (0 for pairs that intersect), but stops at the first candidate
-            // within the margin.
-            if tri_tri_within(pa, pb, margin)
-                && let Err(e) = ap_a.push(a).and_then(|()| ap_b.push(b))
-            {
-                failed = Some(e);
-                return false;
+    let searched = if split_traversal(mesh_a, mesh_b) {
+        // Each part's triangles, sorted without duplicates, in part order;
+        // appended together they sort to the same result.
+        split_pairs(bvh_a, bvh_b, xf, &key, PAR_PARTS).and_then(|parts| {
+            let found = par::map_chunks(&parts, 1, 0, oom, |_, part| {
+                let (mut near_a, mut near_b) = (Vec::new(), Vec::new());
+                search(Some(part[0]), &mut |a, b| {
+                    try_push(&mut near_a, a)?;
+                    try_push(&mut near_b, b)
+                })?;
+                for v in [&mut near_a, &mut near_b] {
+                    v.sort_unstable();
+                    v.dedup();
+                }
+                Ok((near_a, near_b))
+            })?;
+            for (near_a, near_b) in &found {
+                ap_a.extend(near_a)?;
+                ap_b.extend(near_b)?;
             }
-            true
-        },
-    );
-    if let Some(e) = failed {
+            Ok(())
+        })
+    } else {
+        search(None, &mut |a, b| ap_a.push(a).and_then(|()| ap_b.push(b)))
+    };
+    if let Err(e) = searched {
         // A failed push restored its own vector; restore the other one too.
         ap_a.truncate_appended(0);
         ap_b.truncate_appended(0);
@@ -922,31 +1003,54 @@ fn intersecting_pairs_with<const N: usize>(
     xf: &Rigid,
     out: &mut Vec<(TriangleId, TriangleId)>,
 ) -> Result<usize> {
+    // Calls `found(a, b)` for every intersecting pair under `from`, until it
+    // fails.
+    let search = |from: Option<(NodeId, NodeId)>,
+                  found: &mut dyn FnMut(TriangleId, TriangleId) -> Result<()>|
+     -> Result<()> {
+        let mut failed = None;
+        for_each_pair::<N>(
+            mesh_a,
+            bvh_a,
+            mesh_b,
+            bvh_b,
+            xf,
+            from,
+            overlap_key,
+            |a, pa, b, pb| {
+                if tri_tri_intersect(pa, pb)
+                    && let Err(e) = found(a, b)
+                {
+                    failed = Some(e);
+                    return false;
+                }
+                true
+            },
+        );
+        failed.map_or(Ok(()), Err)
+    };
     let mut ap = Appender::new(out);
-    let mut failed = None;
-    for_each_pair::<N>(
-        mesh_a,
-        bvh_a,
-        mesh_b,
-        bvh_b,
-        xf,
-        overlap_key,
-        |a, pa, b, pb| {
-            if tri_tri_intersect(pa, pb)
-                && let Err(e) = ap.push((a, b))
-            {
-                failed = Some(e);
-                return false;
-            }
-            true
-        },
-    );
-    if let Some(e) = failed {
-        return Err(e);
+    if split_traversal(mesh_a, mesh_b) {
+        // Each part's pairs in part order, sorted below.
+        let parts = split_pairs(bvh_a, bvh_b, xf, &overlap_key, PAR_PARTS)?;
+        let found = par::map_chunks(&parts, 1, 0, oom, |_, part| {
+            let mut pairs = Vec::new();
+            search(Some(part[0]), &mut |a, b| try_push(&mut pairs, (a, b)))?;
+            Ok(pairs)
+        })?;
+        for pairs in &found {
+            ap.extend(pairs)?;
+        }
+    } else {
+        search(None, &mut |a, b| ap.push((a, b)))?;
     }
     // Each triangle is in exactly one leaf, so every pair is found once.
     ap.appended().sort_unstable();
     Ok(ap.count())
+}
+
+fn oom() -> QueryError {
+    QueryError::OutOfMemory
 }
 
 #[cfg(test)]
@@ -2091,5 +2195,33 @@ mod tests {
         fail_allocations_after(None);
         assert_eq!(r, Err(QueryError::OutOfMemory));
         assert_eq!((a, b), (vec![7], vec![8]));
+    }
+
+    #[test]
+    fn pair_queries_bit_identical() {
+        use crate::test_util::{assert_parallel_identical, ripple};
+        let (ma, mb) = (ripple(60, false), ripple(60, true));
+        assert!(ma.triangle_count() + mb.triangle_count() >= PAR_MIN_PAIR_TRIS);
+        for quality in [Quality::Sah, Quality::Fast] {
+            let (ba, bb) = (build(&ma, quality), build(&mb, quality));
+            let turned = Rigid {
+                rotation: rot_z(3.0),
+                translation: [2.5, -2.0, 0.1],
+            };
+            for xf in [Rigid::IDENTITY, turned] {
+                let near = assert_parallel_identical("triangles_near", || {
+                    let (mut a, mut b) = (vec![7], vec![9]);
+                    triangles_near(&ma, &ba, &mb, &bb, &xf, 0.05, &mut a, &mut b).unwrap();
+                    (a, b)
+                });
+                assert!(near.0.len() > 500 && near.1.len() > 500);
+                let crossing = assert_parallel_identical("intersecting_pairs", || {
+                    let mut out = vec![(1, 2)];
+                    let n = intersecting_pairs(&ma, &ba, &mb, &bb, &xf, &mut out).unwrap();
+                    (n, out)
+                });
+                assert!(crossing.0 > 500);
+            }
+        }
     }
 }

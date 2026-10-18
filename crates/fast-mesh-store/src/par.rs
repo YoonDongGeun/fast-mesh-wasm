@@ -137,6 +137,36 @@ pub fn map_chunks<T: Sync, R: Send, E: Send>(
     })
 }
 
+/// Calls `f` on `items` cut into consecutive chunks of `chunk` (the last may
+/// be shorter), with each chunk's index, in parallel when
+/// `items.len() >= threshold` and there is more than one chunk. Allocates
+/// nothing, so it cannot fail; for work that writes each item in place.
+///
+/// # Panics
+/// If `chunk` is 0.
+pub fn for_each_chunk_mut<T: Send>(
+    items: &mut [T],
+    chunk: usize,
+    threshold: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    assert!(chunk > 0, "chunk must be positive");
+    #[cfg(feature = "parallel")]
+    if go_parallel(items.len() >= threshold && items.len() > chunk) {
+        use rayon::prelude::*;
+        items
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(i, c)| f(i, c));
+        return;
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = threshold;
+    for (i, c) in items.chunks_mut(chunk).enumerate() {
+        f(i, c);
+    }
+}
+
 /// Runs `a` and `b`, in parallel when `parallel` is true (and the feature is
 /// on and not forced off), otherwise `a` first. Both always run.
 pub fn join<A: Send, B: Send>(
@@ -252,6 +282,35 @@ mod tests {
         );
         assert_eq!(join(true, || 1, || 2), (1, 2));
         let entered = if enabled() { 2 } else { 0 };
+        assert_eq!(parallel_entries(), before + entered);
+    }
+
+    #[test]
+    fn for_each_chunk_mut_writes_every_chunk() {
+        let expected: Vec<(usize, usize)> = (0..1000).map(|j| (j / 64, j)).collect();
+        for k in POOLS {
+            let mut items = vec![(usize::MAX, usize::MAX); 1000];
+            with_threads(k, || {
+                for_each_chunk_mut(&mut items, 64, 0, |i, c| {
+                    for (j, x) in c.iter_mut().enumerate() {
+                        *x = (i, i * 64 + j);
+                    }
+                })
+            });
+            assert_eq!(items, expected, "{k} threads");
+        }
+        let before = parallel_entries();
+        let mut items = vec![0u8; 4096];
+        for_each_chunk_mut(&mut items, 256, 4097, |_, c| c.fill(1));
+        for_each_chunk_mut(&mut items, 4096, 0, |_, c| c.fill(2));
+        set_force_sequential(true);
+        for_each_chunk_mut(&mut items, 256, 0, |_, c| c.fill(3));
+        set_force_sequential(false);
+        assert_eq!(parallel_entries(), before);
+        assert!(items.iter().all(|&x| x == 3));
+        for_each_chunk_mut(&mut items, 256, 4096, |_, c| c.fill(4));
+        assert!(items.iter().all(|&x| x == 4));
+        let entered = if enabled() { 1 } else { 0 };
         assert_eq!(parallel_entries(), before + entered);
     }
 
