@@ -273,7 +273,7 @@ pub struct Gap { pub distance: f64, pub a: [f64; 3], pub b: [f64; 3] }
 
 ## 12. Implementation notes
 
-What the implementation settled or found. Items 1 to 3 correct wording above; none of them changes a contract elsewhere.
+What the implementation settled or found. Items 1 to 3 correct wording above, and item 10 refines the oriented nesting rule of §5.3 (an oriented set with a negative total area is treated as reversed); no other item changes a contract.
 
 1. **Segment orientation.** The solid's inside, opposite the triangle's winding normal, lies to the left of `from → to` seen from `+n`. Outer contours run counter-clockwise and holes clockwise. The §4.4 wording "the `+` side region on the left" was wrong where `n·N < 0`, and has been fixed there.
 2. **Open contours start at their `from` end.** "Starts at its smallest edge key" holds for closed contours only. An oriented open contour starts at its `from` end; §4.4 is reworded.
@@ -291,4 +291,4 @@ What the implementation settled or found. Items 1 to 3 correct wording above; no
     - Plane drag, 64 poses over a 1M terrain, Eager: 16.8 ms per iteration, 262 µs per pose.
     - Far edit: about 7 µs over the bare edit.
     - Fill of a 2,072-point sphere section: 0.56 ms against 0.34 ms without fill, so the fill costs about 0.22 ms. It first cost about 4.3 ms (4.47 ms against 0.35 ms, run back to back with the fix): the ear test walked the whole ring for every candidate ear, `O(n²)` in the loop's points. `triangulate` now indexes rings above 80 points by z-order code, as earcut does, and tests only the nodes near each candidate ear; the triangles are unchanged.
-    - Gap between two 1M spheres' sections (2,072 points each): 0.153 ms for `section_gap` alone, 0.90 ms with the two-entry recompute. It first cost 2.39 ms and 3.23 ms: the search took the first side's segments in contour order, so its cost depended on where that contour started (2.5 ms from the far side, 0.13 ms from the closest point). The segments are now taken nearest the other side's bounding box first, and the search stops once that box gap reaches the best distance.
+    - Gap between two 1M spheres' sections (2,072 points each): 0.153 ms for `section_gap` alone, 0.90 ms with the two-entry recompute. It first cost 2.39 ms and 3.23 ms: the search took the first side's segments in contour order, so its cost depended on where that contour started (2.5 ms from the far side, 0.13 ms from the closest point, measured during the final review with a separate harness). The segments are now taken nearest the other side's bounding box first, and the search stops once that box gap reaches the best distance.
