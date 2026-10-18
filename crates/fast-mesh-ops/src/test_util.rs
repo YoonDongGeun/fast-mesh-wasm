@@ -406,3 +406,29 @@ pub(crate) fn damaged_sphere() -> Mesh {
     }
     mesh_of(&positions, &triangles)
 }
+
+/// Runs `run` with parallel work forced off (the code a feature-off build
+/// runs), then on pools of 1, 2 and 8 threads and on the global pool,
+/// asserting every run matches the first; with the `parallel` feature, also
+/// that the global run took a parallel path. Returns the first run.
+pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    run: impl Fn() -> R + Sync,
+) -> R {
+    use fast_mesh_store::par;
+    par::set_force_sequential(true);
+    let reference = run();
+    par::set_force_sequential(false);
+    if !par::enabled() {
+        // Every run below would be this one again.
+        return reference;
+    }
+    for k in [1, 2, 8] {
+        let got = par::with_threads(k, &run);
+        assert!(got == reference, "{what}: {k} threads");
+    }
+    let before = par::parallel_entries();
+    assert!(run() == reference, "{what}: global pool");
+    assert!(par::parallel_entries() > before, "{what}: ran sequentially");
+    reference
+}

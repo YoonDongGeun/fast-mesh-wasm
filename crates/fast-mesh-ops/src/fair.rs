@@ -6,7 +6,7 @@
 //! vertices and the ring of mesh vertices just outside the loop fixed, by
 //! conjugate gradient on each coordinate.
 
-use fast_mesh_store::{Mesh, VertexId};
+use fast_mesh_store::{Mesh, VertexId, par};
 
 use crate::fill::{FailReason, FairWeights};
 use crate::refine::RefinedPatch;
@@ -23,6 +23,30 @@ const CLAMP: f64 = 1e-6;
 /// A corner whose triangle's doubled area is at most this times the product
 /// of its two edges adds no cotangent weight.
 const DEGENERATE: f64 = 1e-12;
+
+/// The three coordinate solves run side by side from this many new vertices,
+/// with the `parallel` feature.
+///
+/// Measured on the i5-13600K through `fill_holes` on round terrain holes:
+/// at 23 and 33 new vertices parallel is up to 1.1 times slower, at 94
+/// even, at 173 1.1 times faster, at 678 1.25 and at 3,000 2.2 times.
+const PAR_MIN_FAIR_SOLVE: usize = 128;
+
+/// The products with `B` and `Bᵀ` run in parallel chunks of [`ROW_CHUNK`]
+/// from this many rows (or columns) of output, with the `parallel` feature.
+///
+/// Measured on the i5-13600K as for [`PAR_MIN_FAIR_SOLVE`], against the
+/// side-by-side solves alone: at 678 new vertices between 1.15 times slower
+/// and 1.25 times faster from run to run, at 1,100 1.4 times faster, and at
+/// 12k 2 to 5 times (a busy machine varies most).
+pub(crate) const PAR_MIN_FAIR_ROWS: usize = 1024;
+
+/// Output entries per chunk of a parallel product.
+const ROW_CHUNK: usize = 256;
+
+/// Dot products sum chunks of this many terms, then the chunk sums in
+/// order, in every build: a fixed order that a parallel sum could share.
+const DOT_CHUNK: usize = 256;
 
 /// How fairing went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,28 +334,43 @@ impl System {
             return Ok(None);
         }
 
-        let mut cg = Cg::new(free, np)?;
-        let mut x = filled(free, [0.0f64; 3])?;
-        let mut rhs = filled(free, 0.0f64)?;
-        let mut tmp = filled(np, 0.0f64)?;
+        let mut transposed = Transposed::new(&b, free)?;
+        transposed.build(&b);
+        let bt = transposed.view();
         let cap = 20 * free + 100;
-        let (mut converged, mut iterations, mut residual) = (true, 0, 0.0f64);
-        for d in 0..3 {
+        // One coordinate's solve: its best iterate and how it went. The
+        // three are independent, so large patches solve them side by side.
+        let coordinate = |d: usize| -> Result<(Vec<f64>, CgResult)> {
+            let mut cg = Cg::new(free, np)?;
+            let mut rhs = filled(free, 0.0f64)?;
+            let mut tmp = filled(np, 0.0f64)?;
             for (t, f) in tmp.iter_mut().zip(&fixed) {
                 *t = -f[d];
             }
-            b.transpose_times(&tmp, &mut rhs);
+            bt.times(&tmp, &mut rhs);
             for (i, xi) in cg.x.iter_mut().enumerate() {
                 *xi = patch.points[first + i][d];
             }
-            let r = cg.solve(&b, &jacobi, &rhs, cap);
+            let r = cg.solve(&b, &bt, &jacobi, &rhs, cap);
+            Ok((cg.x, r))
+        };
+        let parallel = free >= PAR_MIN_FAIR_SOLVE;
+        let (rx, (ry, rz)) = par::join(
+            parallel,
+            || coordinate(0),
+            || par::join(parallel, || coordinate(1), || coordinate(2)),
+        );
+        let solved = [rx?, ry?, rz?];
+        let mut x = filled(free, [0.0f64; 3])?;
+        let (mut converged, mut iterations, mut residual) = (true, 0, 0.0f64);
+        for (d, (xd, r)) in solved.iter().enumerate() {
             if !r.finite {
                 return Ok(None);
             }
             converged &= r.converged;
             iterations = iterations.max(r.iterations);
             residual = residual.max(r.residual);
-            for (xi, v) in x.iter_mut().zip(&cg.x) {
+            for (xi, v) in x.iter_mut().zip(xd) {
                 xi[d] = *v;
             }
         }
@@ -366,20 +405,74 @@ impl Sparse<'_> {
             .map(|(&c, &v)| (c as usize, v))
     }
 
-    /// `out = B v`.
+    /// `out = B v`, by rows: each entry is its row's sum in column order.
     fn times(&self, v: &[f64], out: &mut [f64]) {
-        for (k, o) in out.iter_mut().enumerate().take(self.rows()) {
-            *o = self.row(k).map(|(c, x)| x * v[c]).sum();
-        }
+        let rows = self.rows();
+        par::for_each_chunk_mut(
+            &mut out[..rows],
+            ROW_CHUNK,
+            PAR_MIN_FAIR_ROWS,
+            |i, chunk| {
+                for (j, o) in chunk.iter_mut().enumerate() {
+                    *o = self
+                        .row(i * ROW_CHUNK + j)
+                        .fold(0.0, |s, (c, x)| s + x * v[c]);
+                }
+            },
+        );
+    }
+}
+
+/// The transpose of a [`Sparse`] matrix, its rows (the columns of the
+/// original) listing their entries by ascending original row: the product
+/// `Bᵀ v` is then gathered row by row in a fixed order rather than scattered.
+struct Transposed {
+    starts: Vec<u32>,
+    cols: Vec<u32>,
+    vals: Vec<f64>,
+}
+
+impl Transposed {
+    /// Room for the transpose of `b`, which has `columns` columns.
+    fn new(b: &Sparse, columns: usize) -> Result<Transposed> {
+        Ok(Transposed {
+            starts: filled(columns + 1, 0u32)?,
+            cols: filled(b.cols.len(), 0u32)?,
+            vals: filled(b.vals.len(), 0.0f64)?,
+        })
     }
 
-    /// `out = Bᵀ v`.
-    fn transpose_times(&self, v: &[f64], out: &mut [f64]) {
-        out.fill(0.0);
-        for (k, &vk) in v.iter().enumerate().take(self.rows()) {
-            for (c, x) in self.row(k) {
-                out[c] += x * vk;
+    /// Fills in the transpose of `b`: a counting sort of its entries by
+    /// column, visiting rows in order.
+    fn build(&mut self, b: &Sparse) {
+        let columns = self.starts.len() - 1;
+        for &c in b.cols {
+            self.starts[c as usize + 1] += 1;
+        }
+        for c in 0..columns {
+            self.starts[c + 1] += self.starts[c];
+        }
+        // While filling, `starts[c]` is the next free slot of column `c`;
+        // it ends at the start of column `c + 1`, so shift back after.
+        for k in 0..b.rows() {
+            for (c, x) in b.row(k) {
+                let at = self.starts[c] as usize;
+                self.cols[at] = k as u32;
+                self.vals[at] = x;
+                self.starts[c] += 1;
             }
+        }
+        for c in (0..columns).rev() {
+            self.starts[c + 1] = self.starts[c];
+        }
+        self.starts[0] = 0;
+    }
+
+    fn view(&self) -> Sparse<'_> {
+        Sparse {
+            starts: &self.starts,
+            cols: &self.cols,
+            vals: &self.vals,
         }
     }
 }
@@ -406,8 +499,12 @@ struct Cg {
     bp: Vec<f64>,
 }
 
+/// `a · b`, summed in chunks of [`DOT_CHUNK`] whose sums are added in order.
 fn dot_n(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    a.chunks(DOT_CHUNK)
+        .zip(b.chunks(DOT_CHUNK))
+        .map(|(a, b)| a.iter().zip(b).fold(0.0, |s, (x, y)| s + x * y))
+        .fold(0.0, |s, c| s + c)
 }
 
 impl Cg {
@@ -423,10 +520,10 @@ impl Cg {
         })
     }
 
-    /// `ap = Bᵀ B p`.
-    fn apply(&mut self, b: &Sparse) {
+    /// `ap = Bᵀ B p`, with `bt` the transpose of `b`.
+    fn apply(&mut self, b: &Sparse, bt: &Sparse) {
         b.times(&self.p, &mut self.bp);
-        b.transpose_times(&self.bp, &mut self.ap);
+        bt.times(&self.bp, &mut self.ap);
     }
 
     /// `z = r / diag`.
@@ -438,10 +535,17 @@ impl Cg {
 
     /// Solves from the current `x` with the Jacobi preconditioner `diag`
     /// (the diagonal of `Bᵀ B`), at most `cap` iterations; leaves the best
-    /// iterate in `x`.
-    fn solve(&mut self, b: &Sparse, diag: &[f64], rhs: &[f64], cap: usize) -> CgResult {
+    /// iterate in `x`. `bt` is the transpose of `b`.
+    fn solve(
+        &mut self,
+        b: &Sparse,
+        bt: &Sparse,
+        diag: &[f64],
+        rhs: &[f64],
+        cap: usize,
+    ) -> CgResult {
         self.p.copy_from_slice(&self.x);
-        self.apply(b);
+        self.apply(b, bt);
         for ((r, b), ap) in self.r.iter_mut().zip(rhs).zip(&self.ap) {
             *r = b - ap;
         }
@@ -468,7 +572,7 @@ impl Cg {
         self.p.copy_from_slice(&self.z);
         let mut rz = dot_n(&self.r, &self.z);
         for iteration in 1..=cap {
-            self.apply(b);
+            self.apply(b, bt);
             let pap = dot_n(&self.p, &self.ap);
             if !(pap.is_finite() && pap > 0.0) {
                 break;
@@ -503,7 +607,7 @@ impl Cg {
         // The recurrence drifts from the true residual: judge the iterate
         // kept by `rhs - Bᵀ B x` itself.
         self.p.copy_from_slice(&self.x);
-        self.apply(b);
+        self.apply(b, bt);
         for ((r, b), ap) in self.r.iter_mut().zip(rhs).zip(&self.ap) {
             *r = b - ap;
         }
