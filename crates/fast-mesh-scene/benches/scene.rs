@@ -1,6 +1,6 @@
 //! Scene benchmarks.
 //!
-//! `cargo bench -p fast-mesh-scene` runs two groups.
+//! `cargo bench -p fast-mesh-scene` runs the groups below.
 //!
 //! **Overhead against calling Phase 3 directly**, on `terrain(708)` (1M
 //! triangles). A raycast batch of 100,000 rays (criterion throughput is the
@@ -25,13 +25,27 @@
 //! number of recoloured vertices per pose.
 //!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
-//! dragged across a terrain through 64 poses, 100 vertices moved far from the
+//! dragged across a terrain through 64 poses (and across three terrains of
+//! 333k triangles side by side, one section over all three), 100 vertices
+//! moved far from the
 //! plane (and the same edit on a scene without a section, to compare), the
 //! fill of a sphere's cross-section, and the gap between the cross-sections
 //! of two spheres.
 //!
 //! **`find_contacts`** over 2, 8 and 32 small meshes (`terrain(32)`, 2,048
 //! triangles each) in a row, each overlapping its neighbour a little.
+//!
+//! **Many meshes**: six terrains in a row, each overlapping the next by an
+//! eighth of its side, with a distance field for every ordered pair (30
+//! fields, `max_distance` 0.5) and each mesh coloured by its field to the
+//! next. The middle mesh is dragged through 64 poses (ten fields due per
+//! pose), as in the field drag: `many_mesh_drag_30k` (`terrain(122)`, the
+//! owner's scale), `many_mesh_drag_30k_touching` (the same meshes
+//! overlapping by one cell, so neighbours barely touch and only a strip of
+//! each is in reach), `many_mesh_drag_30k_apart` (the same meshes a whole
+//! side apart, so nothing is in reach) and, with `FAST_MESH_BENCH_LARGE=1`,
+//! `many_mesh_drag_1M` (`terrain(708)`; about 40 s per iteration without
+//! the `parallel` feature).
 
 use std::hint::black_box;
 
@@ -562,6 +576,52 @@ fn bench_sections(c: &mut Criterion) {
         },
     );
 
+    // The same drag over three terrains of a third of the size side by side
+    // in y, one section over all three: three entries due per plane, cut in
+    // parallel with the `parallel` feature.
+    let third = 408;
+    let mut scene3 = self::scene();
+    let ids: Vec<MeshId> = (0..3)
+        .map(|k| {
+            let opts = MeshOptions {
+                placement: Placement {
+                    translation: [0.0, f64::from(k * (third + 1)), 0.0],
+                    ..Placement::IDENTITY
+                },
+                ..Default::default()
+            };
+            scene3.add_mesh(terrain(third), opts).unwrap()
+        })
+        .collect();
+    let planes3: Vec<Plane> = (0..64)
+        .map(|i| {
+            let x = (i as f64 + 0.5) / 64.0 * f64::from(third) + 0.37;
+            Plane::new([x, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap()
+        })
+        .collect();
+    let section3 = scene3
+        .add_section(SectionDesc {
+            plane: planes3[0],
+            meshes: ids.clone(),
+            fill: false,
+        })
+        .unwrap();
+    group.bench_function(
+        "section_drag_3x333k: 64 planes, set_section_plane (3 meshes) + read",
+        |b| {
+            b.iter(|| {
+                for p in &planes3 {
+                    scene3.set_section_plane(section3, *p).unwrap();
+                    for &m in &ids {
+                        black_box(scene3.section(section3, m).unwrap().length);
+                    }
+                }
+                black_box(scene3.take_changes());
+            })
+        },
+    );
+    drop(scene3);
+
     // Moving 100 vertices near the x = 0 edge of the terrain, about 354 from
     // a plane at x = side / 2, up and down by 0.5 in z. The baseline is the
     // same edit on a scene with no section: the difference is what the
@@ -700,11 +760,136 @@ fn bench_sections(c: &mut Criterion) {
     group.finish();
 }
 
+/// The `max_distance` of the many-mesh benchmarks.
+const MANY_DISTANCE: f64 = 0.5;
+
+/// The mesh the many-mesh benchmarks drag.
+const MANY_MOVED: usize = 2;
+
+/// Six Lazy `terrain(n)` meshes in a row along x, each moved `step` from the
+/// last, with a distance field for every ordered pair (30 fields) and each
+/// mesh coloured by its field to the next by index (the last by its field to
+/// the first). With `step` below `n` every mesh overlaps its neighbours,
+/// whose sheets cross it along curves; with `step` above `n` they are apart.
+/// Returns the scene, the dragged mesh and its 64 placements: it rises and
+/// falls by up to 0.25 and slides 0.1 along x over the poses.
+fn many_mesh_scene(n: u32, step: f64) -> (Scene, MeshId, Vec<Placement>) {
+    let at = |x: f64, z: f64| Placement {
+        translation: [x, 0.0, z],
+        ..Placement::IDENTITY
+    };
+    let mut scene = scene();
+    let ids: Vec<MeshId> = (0..6)
+        .map(|k| {
+            let opts = MeshOptions {
+                mode: UpdateMode::Lazy,
+                placement: at(k as f64 * step, 0.0),
+                ..Default::default()
+            };
+            scene.add_mesh(terrain(n), opts).unwrap()
+        })
+        .collect();
+    let rule = ColorRule {
+        map: Colormap::Turbo,
+        range: (-0.5, 0.5),
+        below: OutOfRange::Clamp,
+        above: OutOfRange::Base,
+        center: None,
+        base: [200, 200, 200, 255],
+        nan: [255, 0, 255, 255],
+    };
+    for (i, &on) in ids.iter().enumerate() {
+        for (j, &to) in ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let field = scene
+                .add_distance_field(DistanceField {
+                    name: format!("d{i}{j}"),
+                    on,
+                    to,
+                    max_distance: MANY_DISTANCE,
+                    sign: SignMode::Auto,
+                })
+                .unwrap();
+            if j == (i + 1) % ids.len() {
+                let rule = rule.clone();
+                scene
+                    .set_coloring(on, Some(Coloring { field, rule }))
+                    .unwrap();
+            }
+        }
+    }
+    scene.update_fields().unwrap();
+    let x0 = MANY_MOVED as f64 * step;
+    let placements = (0..64)
+        .map(|i| {
+            let t = f64::from(i) / 64.0;
+            at(x0 + 0.1 * t, 0.25 * (std::f64::consts::TAU * t).sin())
+        })
+        .collect();
+    (scene, ids[MANY_MOVED], placements)
+}
+
+/// The many-mesh drag: `set_placement` of the middle mesh, `update_fields`
+/// (ten fields due: five on the moved mesh, five measured to it), `colors`
+/// of every mesh and `take_changes`, through the 64 poses.
+fn bench_many_mesh(c: &mut Criterion, name: &str, n: u32, step: f64) {
+    let (mut scene, moved, placements) = many_mesh_scene(n, step);
+    let ids: Vec<MeshId> = scene.ids().collect();
+    let (mut dirty, mut worst) = (0usize, 0usize);
+    for p in &placements {
+        scene.set_placement(moved, *p).unwrap();
+        scene.update_fields().unwrap();
+        let d: usize = scene
+            .take_changes()
+            .iter()
+            .map(|c| c.colors_dirty.as_ref().map_or(0, Vec::len))
+            .sum();
+        (dirty, worst) = (dirty + d, worst.max(d));
+    }
+    eprintln!(
+        "{name}: 6 x {} triangles, step {step}, 30 fields, max_distance {MANY_DISTANCE}, over 64 \
+         poses: {} vertices recoloured per pose on average (at most {worst})",
+        scene.mesh(moved).unwrap().triangle_count(),
+        dirty / 64
+    );
+    let mut group = c.benchmark_group("scene many meshes");
+    // More samples at the owner's scale, where on and off are compared
+    // within 5%.
+    group.sample_size(if n <= 122 { 50 } else { 10 });
+    group.throughput(Throughput::Elements(64));
+    group.bench_function(
+        format!("{name}: set_placement + update_fields + colors, all 64 poses"),
+        |bn| {
+            bn.iter(|| {
+                for p in &placements {
+                    scene.set_placement(moved, *p).unwrap();
+                    scene.update_fields().unwrap();
+                    for &m in &ids {
+                        black_box(scene.colors(m).unwrap());
+                    }
+                    black_box(scene.take_changes());
+                }
+            })
+        },
+    );
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
     bench_sections(c);
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);
     bench_contacts(c);
+    // 122: 29,768 triangles per mesh; 708: 1,002,528. Neighbours overlap by
+    // an eighth of the side, by one cell, or are a whole side apart.
+    bench_many_mesh(c, "many_mesh_drag_30k", 122, 122.0 * 7.0 / 8.0);
+    bench_many_mesh(c, "many_mesh_drag_30k_touching", 122, 121.0);
+    bench_many_mesh(c, "many_mesh_drag_30k_apart", 122, 244.0);
+    if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {
+        bench_many_mesh(c, "many_mesh_drag_1M", 708, 708.0 * 7.0 / 8.0);
+    }
 }
 
 criterion_group!(group, benches);

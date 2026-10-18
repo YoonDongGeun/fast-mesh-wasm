@@ -23,9 +23,9 @@ use std::f64::consts::PI;
 use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId};
 
-use crate::Result;
 use crate::geom::{add, cross, dot, norm, scale, sub, widen};
-use crate::sign::try_vec;
+use crate::sign::{collect_range, try_vec};
+use crate::{FieldsError, Result};
 
 /// The accuracy parameter: a node is far when its centroid is more than
 /// `BETA` times its radius away from the query point. Chosen so that the
@@ -126,17 +126,38 @@ fn solid_angle([a, b, c]: [[f64; 3]; 3]) -> f64 {
 }
 
 impl Moments {
-    /// Builds the moments of every node of `bvh`, bottom-up: the pre-order
-    /// traversal finishes a left subtree before it enters the right one, so
-    /// when a leaf that is a right child is done, its parent can be combined,
-    /// and so on up while the finished node is a right child.
+    /// Builds the moments of every node of `bvh`, bottom-up. The leaves'
+    /// moments come first (in parallel chunks on large trees, each leaf on
+    /// its own). Then, visiting the leaves in pre-order, which finishes a left
+    /// subtree before it enters the right one: when a leaf that is a right
+    /// child is done, its parent can be combined, and so on up while the
+    /// finished node is a right child.
     pub(crate) fn build(mesh: &Mesh, bvh: &Bvh) -> Result<Moments> {
         let mut nodes = try_vec(bvh.node_slots(), Moment::default())?;
+        let mut leaves = Vec::new();
+        let mut failed = false;
         bvh.traverse(|id, view| {
-            let NodeKind::Leaf { triangles } = view.kind else {
-                return true;
-            };
-            nodes[id.index()] = leaf_moment(mesh, triangles, &view.bounds);
+            if matches!(view.kind, NodeKind::Leaf { .. }) {
+                failed |= leaves.try_reserve(1).is_err();
+                if !failed {
+                    leaves.push(id);
+                }
+            }
+            // After a failure, skip what is left.
+            !failed
+        });
+        if failed {
+            return Err(FieldsError::OutOfMemory);
+        }
+        let moments = collect_range(leaves.len(), |k| {
+            let view = bvh.node(leaves[k]);
+            match view.kind {
+                NodeKind::Leaf { triangles } => leaf_moment(mesh, triangles, &view.bounds),
+                NodeKind::Inner { .. } => unreachable!("collected as a leaf"),
+            }
+        })?;
+        for (&id, moment) in leaves.iter().zip(moments) {
+            nodes[id.index()] = moment;
             let mut child = id;
             while let Some(parent) = bvh.parent(child) {
                 let pv = bvh.node(parent);
@@ -150,9 +171,21 @@ impl Moments {
                     inner_moment(&nodes[left.index()], &nodes[right.index()], &pv.bounds);
                 child = parent;
             }
-            true
-        });
+        }
         Ok(Moments(nodes))
+    }
+
+    /// Every number of every node, as bits, for comparing builds.
+    #[cfg(test)]
+    pub(crate) fn bits(&self) -> impl Iterator<Item = u64> + '_ {
+        self.0.iter().flat_map(|m| {
+            m.normal
+                .into_iter()
+                .chain([m.area])
+                .chain(m.centroid)
+                .chain([m.radius])
+                .map(f64::to_bits)
+        })
     }
 
     /// The winding number of `mesh` at `p`, and how many triangles were

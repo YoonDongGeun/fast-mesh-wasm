@@ -16,6 +16,8 @@ mod error;
 mod history;
 mod incidence;
 mod mesh;
+#[doc(hidden)]
+pub mod par;
 mod patch;
 mod transaction;
 

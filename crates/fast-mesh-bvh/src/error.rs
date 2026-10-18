@@ -49,14 +49,21 @@ thread_local! {
 }
 
 /// Test-only: make every allocation after the next `n` fail with `OutOfMemory`
-/// on this thread (`None` turns it off).
+/// on this thread (`None` turns it off). While armed, parallel work runs on
+/// this thread so the hook sees every allocation.
 #[cfg(test)]
 pub(crate) fn fail_allocations_after(n: Option<usize>) {
-    ALLOCATIONS_LEFT.with(|c| c.set(n));
+    // Only on arming or disarming: the count must see one `true` per arm.
+    let was = ALLOCATIONS_LEFT.with(|c| c.replace(n)).is_some();
+    if was != n.is_some() {
+        fast_mesh_store::par::set_force_sequential(n.is_some());
+    }
 }
 
+/// Checks the test fault hook; counts as one allocation. Always succeeds
+/// outside tests.
 #[cfg(test)]
-fn allocation_allowed() -> Result<()> {
+pub(crate) fn allocation_allowed() -> Result<()> {
     ALLOCATIONS_LEFT.with(|c| match c.get() {
         Some(0) => Err(BvhError::OutOfMemory),
         Some(n) => {
@@ -68,7 +75,7 @@ fn allocation_allowed() -> Result<()> {
 }
 
 #[cfg(not(test))]
-fn allocation_allowed() -> Result<()> {
+pub(crate) fn allocation_allowed() -> Result<()> {
     Ok(())
 }
 

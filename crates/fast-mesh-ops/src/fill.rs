@@ -863,8 +863,12 @@ mod tests {
     /// degrees around [`hole_centres`]: every triangle whose centroid lies
     /// within that angle is removed (as a chord, `2 sin(angle / 2)`).
     fn sphere_with_angular_holes() -> Mesh {
-        let sphere = uv_sphere(64, 128, 1.0);
-        let mut mesh = sphere;
+        sphere_with_holes(64)
+    }
+
+    /// [`sphere_with_angular_holes`] on `uv_sphere(stacks, 2 * stacks, 1)`.
+    fn sphere_with_holes(stacks: u32) -> Mesh {
+        let mut mesh = uv_sphere(stacks, 2 * stacks, 1.0);
         for (c, deg) in hole_centres().iter().zip([10.0f64, 20.0, 30.0]) {
             let chord = 2.0 * (deg.to_radians() / 2.0).sin();
             mesh = punch_holes(&mesh, &[c.map(|x| x as f32)], chord as f32);
@@ -927,6 +931,29 @@ mod tests {
                 assert!((a - deg.to_radians()).abs() < cell, "{deg}: {a}");
             }
         }
+    }
+
+    #[test]
+    fn fill_faired_bit_identical() {
+        // The 30-degree patch has over `PAR_MIN_FAIR_ROWS` vertices.
+        let holed = sphere_with_holes(160);
+        let (positions, triangles) = parts(&holed);
+        let options = FillOptions {
+            max_edges: Some(1000),
+            ..FillOptions::default()
+        };
+        let (mesh, r) = assert_parallel_identical("fill_holes fair", || {
+            let mut mesh = mesh_of(&positions, &triangles);
+            let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+            let (positions, triangles) = parts(&mesh);
+            let bits: Vec<u32> = positions.iter().map(|x| x.to_bits()).collect();
+            ((bits, triangles), r)
+        });
+        assert_eq!(r.filled.len(), 3);
+        assert!(r.filled.iter().all(|f| f.converged && f.weights.is_some()));
+        let largest = r.filled.iter().map(|f| f.vertices_added).max().unwrap();
+        assert!(largest >= crate::fair::PAR_MIN_FAIR_ROWS, "{largest}");
+        assert!(mesh.0.len() > 3 * holed.vertex_slots());
     }
 
     #[test]

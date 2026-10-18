@@ -17,7 +17,12 @@
 //!   [`ColorRule`] ([`Colormap`], range, optional centre, out-of-range rules).
 //!
 //! Everything works in the mesh's local `f32` coordinates. Kernels allocate
-//! only while building [`SignData`], never per point.
+//! only while building [`SignData`], never per point (with the `parallel`
+//! feature, large batches of points also get one buffer per chunk).
+//!
+//! With the `parallel` feature, [`SignData::build`] and large batches of
+//! [`signed_distances`] run on rayon's pool. Every value is the same, bit for
+//! bit, with the feature on or off and for any thread count.
 
 mod color;
 mod distance;

@@ -64,10 +64,15 @@ thread_local! {
 }
 
 /// Makes the `n`-th next fallible reservation on this thread (0-based) and every one
-/// after it fail with `OutOfMemory`. `None` turns failures off.
+/// after it fail with `OutOfMemory`. `None` turns failures off. While armed,
+/// parallel work runs on this thread so the hook sees every reservation.
 #[cfg(test)]
 pub(crate) fn fail_allocations_after(n: Option<usize>) {
-    ALLOCATIONS_LEFT.with(|c| c.set(n));
+    // Only on arming or disarming: the count must see one `true` per arm.
+    let was = ALLOCATIONS_LEFT.with(|c| c.replace(n)).is_some();
+    if was != n.is_some() {
+        fast_mesh_store::par::set_force_sequential(n.is_some());
+    }
 }
 
 /// Fails with `OutOfMemory` when the test fault hook says so; always succeeds
@@ -110,6 +115,7 @@ pub(crate) fn filled<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{damaged_sphere, edit, grid_without};
 
     #[test]
     fn fault_hook_fails_the_nth_reservation() {
@@ -123,5 +129,34 @@ mod tests {
         fail_allocations_after(None);
         assert_eq!(v, vec![1]);
         assert_eq!(filled(3, 7u8), Ok(vec![7, 7, 7]));
+    }
+
+    #[test]
+    /// Small inputs to every parallel site of this crate (analyze, weld,
+    /// fairing) take no parallel path.
+    fn small_inputs_stay_sequential() {
+        use fast_mesh_bvh::{BuildOptions, Bvh};
+        use fast_mesh_store::par;
+        let before = par::parallel_entries();
+        let damaged = damaged_sphere();
+        let bvh = Bvh::build(&damaged, &BuildOptions::default()).unwrap();
+        let options = AnalyzeOptions {
+            weld_tolerance: 0.01,
+            self_intersection: Some(&bvh),
+            ..Default::default()
+        };
+        analyze(&damaged, &options).unwrap();
+        let mut mesh = damaged_sphere();
+        edit(&mut mesh, |tx| weld(tx, 0.01));
+        // A 4 x 4 hole, faired.
+        let cells: Vec<(u32, u32)> = (2..6).flat_map(|y| (2..6).map(move |x| (x, y))).collect();
+        let mut mesh = grid_without(8, &cells);
+        let options = FillOptions {
+            max_edges: Some(20),
+            ..FillOptions::default()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert!(r.filled.len() == 1 && r.filled[0].weights.is_some());
+        assert_eq!(par::parallel_entries(), before);
     }
 }

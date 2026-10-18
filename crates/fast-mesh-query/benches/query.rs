@@ -2,7 +2,9 @@
 //!
 //! `cargo bench -p fast-mesh-query` runs 1M triangles; set `FAST_MESH_BENCH_LARGE=1`
 //! to add 10M. Batch benchmarks run 100,000 queries per iteration with criterion
-//! throughput set to the batch size, so results read per ray or per point. Each
+//! throughput set to the batch size, so results read per ray or per point:
+//! one call per query, and the same batches through `raycast_many` and
+//! `closest_point_many`. Each
 //! size prints the result counts of the region queries once. The mesh-vs-mesh
 //! benchmarks place a flipped copy of the terrain over the terrain and turn it
 //! by a little more about z at every iteration, cycling through 64 poses; they
@@ -18,8 +20,8 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::{
     ClosestOptions, Plane, Ray, RayOptions, Region, Rigid, Slice, closest_point,
-    intersecting_pairs, intersects, mesh_distance, raycast, raycast_any, slice, triangles_in,
-    triangles_near, vertices_in,
+    closest_point_many, intersecting_pairs, intersects, mesh_distance, raycast, raycast_any,
+    raycast_many, slice, triangles_in, triangles_near, vertices_in,
 };
 use fast_mesh_store::Mesh;
 
@@ -157,6 +159,24 @@ fn bench_size(c: &mut Criterion, label: &str, n: u32) {
             for &p in &points {
                 black_box(closest_point(&mesh, &bvh, p, &closest_opts).unwrap());
             }
+        })
+    });
+    // The same batches through the batch calls, parallel with the
+    // `parallel` feature.
+    let origins: Vec<[f32; 3]> = rays.iter().map(|r| r.origin).collect();
+    let dirs: Vec<[f32; 3]> = rays.iter().map(|r| r.dir).collect();
+    let mut hits = vec![None; BATCH];
+    group.bench_function("raycast_many per ray", |b| {
+        b.iter(|| {
+            raycast_many(&mesh, &bvh, &origins, &dirs, &opts, &mut hits).unwrap();
+            black_box(&hits);
+        })
+    });
+    let mut nearest = vec![None; BATCH];
+    group.bench_function("closest_point_many per point", |b| {
+        b.iter(|| {
+            closest_point_many(&mesh, &bvh, &points, &closest_opts, &mut nearest).unwrap();
+            black_box(&nearest);
         })
     });
     group.throughput(Throughput::Elements(1));

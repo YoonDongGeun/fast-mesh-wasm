@@ -26,9 +26,11 @@
 //! product is exactly zero, or the normal is zero) counts as outside, so its
 //! distance is positive. A point on the surface (distance zero) gets zero.
 
+use std::ops::Range;
+
 use fast_mesh_bvh::Bvh;
 use fast_mesh_query::{ClosestHit, Feature, QueryError};
-use fast_mesh_store::{Adjacency, EdgeKind, Incidence, Mesh, TriangleId, VertexId};
+use fast_mesh_store::{Adjacency, EdgeKind, Incidence, Mesh, TriangleId, VertexId, par};
 
 use crate::geom::{
     add, closest_on_triangle, cross, dot, narrow, norm, scale, sub, triangle_normal, unit, widen,
@@ -39,6 +41,18 @@ use crate::{FieldsError, Result};
 /// How many zero-area slivers an edge normal looks through to find the face
 /// on the other side.
 const SLIVER_HOPS: u32 = 4;
+
+/// Elements (vertex slots, triangle slots, corners or BVH leaves) from which
+/// a pass of [`SignData::build`] runs in parallel chunks with the `parallel`
+/// feature. Measured on the i5-13600K with every pass parallel: a
+/// pseudonormal build of a 4k-vertex sheet breaks even (1 ms), of 1k vertices
+/// is slower in parallel, of 8k vertices twice as fast. Each pass decides on
+/// its own length, so a 4k-vertex sheet runs its triangle and corner passes
+/// in parallel and its vertex pass on the calling thread.
+const PAR_MIN_SIGN_ELEMS: usize = 8 * 1024;
+
+/// Elements per parallel chunk of a [`SignData::build`] pass.
+const SIGN_CHUNK: usize = 2048;
 
 /// How the sign of a distance is decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -127,63 +141,106 @@ fn try_push<T>(v: &mut Vec<T>, value: T) -> Result<()> {
     Ok(())
 }
 
+/// `f(i)` for every `i` in `0..len`, in order. With the `parallel` feature,
+/// `len >= PAR_MIN_SIGN_ELEMS` runs in chunks of [`SIGN_CHUNK`] on the pool;
+/// every element is computed alone, so the result is the same either way.
+pub(crate) fn collect_range<T: Send>(len: usize, f: impl Fn(usize) -> T + Sync) -> Result<Vec<T>> {
+    let oom = || FieldsError::OutOfMemory;
+    if len < PAR_MIN_SIGN_ELEMS || !par::enabled() || par::force_sequential() {
+        let mut v = Vec::new();
+        v.try_reserve_exact(len).map_err(|_| oom())?;
+        v.extend((0..len).map(f));
+        return Ok(v);
+    }
+    let parts = par::map_range(len, SIGN_CHUNK, PAR_MIN_SIGN_ELEMS, oom, |r| {
+        let mut v = Vec::new();
+        v.try_reserve_exact(r.len()).map_err(|_| oom())?;
+        v.extend(r.map(&f));
+        Ok(v)
+    })?;
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| oom())?;
+    parts.into_iter().for_each(|p| v.extend(p));
+    Ok(v)
+}
+
+/// `f` over `0..len` cut into chunks of [`SIGN_CHUNK`], results in chunk
+/// order, in parallel under the same rule as [`collect_range`]. For
+/// reductions whose combine does not depend on the order (counts, flags).
+fn reduce_range<R: Send>(len: usize, f: impl Fn(Range<usize>) -> R + Sync) -> Result<Vec<R>> {
+    let oom = || FieldsError::OutOfMemory;
+    par::map_range(len, SIGN_CHUNK, PAR_MIN_SIGN_ELEMS, oom, |r| Ok(f(r)))
+}
+
 fn corners(mesh: &Mesh, tri: [VertexId; 3]) -> [[f32; 3]; 3] {
     tri.map(|v| mesh.positions()[v as usize])
 }
 
 /// Topology facts about a mesh.
-fn topology(mesh: &Mesh, adj: &Adjacency, face: &[[f64; 3]]) -> (bool, bool, usize, usize) {
+fn topology(mesh: &Mesh, adj: &Adjacency, face: &[[f64; 3]]) -> Result<(bool, bool, usize, usize)> {
     let tris = mesh.triangles();
-    let (mut closed, mut consistent, mut degenerate) = (true, true, 0);
-    for (t, tri) in tris.iter().enumerate() {
-        if !mesh.is_triangle_alive(t as TriangleId) {
-            continue;
-        }
-        if face[t] == [0.0; 3] {
-            degenerate += 1;
-        }
-        for i in 0..3 {
-            let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
-            if u == w {
+    let parts = reduce_range(tris.len(), |range| {
+        let (mut closed, mut consistent, mut degenerate) = (true, true, 0);
+        for t in range {
+            let tri = tris[t];
+            if !mesh.is_triangle_alive(t as TriangleId) {
                 continue;
             }
-            let c = (3 * t + i) as u32;
-            match adj.edge_kind(c) {
-                EdgeKind::Boundary | EdgeKind::NonManifold => closed = false,
-                EdgeKind::Interior => {
-                    if let Some(o) = adj.opposite(c) {
-                        let (s, j) = ((o / 3) as usize, (o % 3) as usize);
-                        let other = tris[s];
-                        if (other[(j + 1) % 3], other[(j + 2) % 3]) != (w, u) {
-                            consistent = false;
+            if face[t] == [0.0; 3] {
+                degenerate += 1;
+            }
+            for i in 0..3 {
+                let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
+                if u == w {
+                    continue;
+                }
+                let c = (3 * t + i) as u32;
+                match adj.edge_kind(c) {
+                    EdgeKind::Boundary | EdgeKind::NonManifold => closed = false,
+                    EdgeKind::Interior => {
+                        if let Some(o) = adj.opposite(c) {
+                            let (s, j) = ((o / 3) as usize, (o % 3) as usize);
+                            let other = tris[s];
+                            if (other[(j + 1) % 3], other[(j + 2) % 3]) != (w, u) {
+                                consistent = false;
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    let non_manifold = (0..mesh.vertex_slots() as VertexId)
-        .filter(|&v| mesh.is_vertex_alive(v) && adj.is_non_manifold_vertex(v))
-        .count();
-    (closed, consistent, non_manifold, degenerate)
+        (closed, consistent, degenerate)
+    })?;
+    let (closed, consistent, degenerate) = parts
+        .into_iter()
+        .fold((true, true, 0), |(a, b, n), (c, d, m)| {
+            (a && c, b && d, n + m)
+        });
+    let non_manifold = reduce_range(mesh.vertex_slots(), |range| {
+        range
+            .filter(|&v| {
+                let v = v as VertexId;
+                mesh.is_vertex_alive(v) && adj.is_non_manifold_vertex(v)
+            })
+            .count()
+    })?
+    .into_iter()
+    .sum();
+    Ok((closed, consistent, non_manifold, degenerate))
 }
 
 /// Unit normals of the alive triangles; zero for dead and zero-area ones.
 fn face_normals(mesh: &Mesh) -> Result<Vec<[f64; 3]>> {
-    let mut face = try_vec(mesh.triangle_slots(), [0.0; 3])?;
-    for (t, n) in face.iter_mut().enumerate() {
-        if let Some(tri) = mesh.triangle(t as TriangleId) {
-            *n = unit(triangle_normal(corners(mesh, tri)));
-        }
-    }
-    Ok(face)
+    collect_range(mesh.triangle_slots(), |t| {
+        mesh.triangle(t as TriangleId)
+            .map_or([0.0; 3], |tri| unit(triangle_normal(corners(mesh, tri))))
+    })
 }
 
 /// Angle-weighted pseudonormals of the vertex slots, from the non-degenerate
 /// triangles around each vertex.
 fn vertex_normals(mesh: &Mesh, inc: &Incidence, face: &[[f64; 3]]) -> Result<Vec<[f32; 3]>> {
-    let mut normals = try_vec(mesh.vertex_slots(), [0.0f32; 3])?;
-    for (v, out) in normals.iter_mut().enumerate() {
+    collect_range(mesh.vertex_slots(), |v| {
         let mut sum = [0.0; 3];
         for &t in inc.triangles(v as VertexId) {
             let n = face[t as usize];
@@ -199,9 +256,8 @@ fn vertex_normals(mesh: &Mesh, inc: &Incidence, face: &[[f64; 3]]) -> Result<Vec
             let angle = norm(cross(e1, e2)).atan2(dot(e1, e2));
             sum = add(sum, scale(n, angle));
         }
-        *out = narrow(unit(sum));
-    }
-    Ok(normals)
+        narrow(unit(sum))
+    })
 }
 
 /// The corner of triangle `s` opposite its longest edge (the first on ties).
@@ -259,30 +315,27 @@ fn edge_normals(
     face: &[[f64; 3]],
 ) -> Result<Vec<[f32; 3]>> {
     let tris = mesh.triangles();
-    let mut normals = try_vec(3 * tris.len(), [0.0f32; 3])?;
-    for (t, tri) in tris.iter().enumerate() {
+    collect_range(3 * tris.len(), |c| {
+        let (t, i) = (c / 3, c % 3);
         if !mesh.is_triangle_alive(t as TriangleId) {
-            continue;
+            return [0.0f32; 3];
         }
-        for i in 0..3 {
-            let c = (3 * t + i) as u32;
-            let mut sum = face[t];
-            match adj.edge_kind(c) {
-                EdgeKind::Interior => sum = add(sum, across(mesh, adj, face, c, SLIVER_HOPS)),
-                EdgeKind::Boundary => {}
-                EdgeKind::NonManifold => {
-                    let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
-                    for &s in inc.triangles(u) {
-                        if s as usize != t && tris[s as usize].contains(&w) {
-                            sum = add(sum, face[s as usize]);
-                        }
+        let tri = tris[t];
+        let mut sum = face[t];
+        match adj.edge_kind(c as u32) {
+            EdgeKind::Interior => sum = add(sum, across(mesh, adj, face, c as u32, SLIVER_HOPS)),
+            EdgeKind::Boundary => {}
+            EdgeKind::NonManifold => {
+                let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
+                for &s in inc.triangles(u) {
+                    if s as usize != t && tris[s as usize].contains(&w) {
+                        sum = add(sum, face[s as usize]);
                     }
                 }
             }
-            normals[c as usize] = narrow(sum);
         }
-    }
-    Ok(normals)
+        narrow(sum)
+    })
 }
 
 impl SignData {
@@ -312,7 +365,7 @@ impl SignData {
 
         let face = face_normals(mesh)?;
         let (closed, consistent, non_manifold_vertices, degenerate_triangles) =
-            topology(mesh, adj, &face);
+            topology(mesh, adj, &face)?;
         let resolved = match mode {
             SignMode::Pseudonormal => SignMode::Pseudonormal,
             SignMode::Auto if !(closed && !consistent) => SignMode::Pseudonormal,
@@ -494,6 +547,8 @@ impl SignData {
 
 #[cfg(test)]
 mod tests {
+    use fast_mesh_store::par;
+
     use super::*;
     use crate::test_util::*;
 
@@ -586,6 +641,58 @@ mod tests {
                 ..closed
             })
         );
+    }
+
+    /// The status and every number the sign data holds, as bits.
+    fn fingerprint(s: &SignData) -> (SignStatus, Vec<u64>) {
+        let normals = s.vertex_normals.iter().chain(&s.edge_normals).flatten();
+        let ids = s.degenerate.iter().chain(&s.offsets).chain(&s.candidates);
+        let v = normals
+            .map(|x| u64::from(x.to_bits()))
+            .chain(ids.map(|&i| u64::from(i)))
+            .chain(s.moments.bits())
+            .collect();
+        (s.status, v)
+    }
+
+    #[test]
+    fn sign_build_bit_identical() {
+        // The forced-sequential run is the code a feature-off build runs.
+        let mut mesh = terrain(317);
+        assert!(mesh.triangle_count() >= 200_000);
+        let bvh = build_bvh(&mesh);
+        for mode in [SignMode::Pseudonormal, SignMode::Winding] {
+            let build = |mesh: &mut Mesh| fingerprint(&SignData::build(mesh, &bvh, mode).unwrap());
+            par::set_force_sequential(true);
+            let reference = build(&mut mesh);
+            par::set_force_sequential(false);
+            assert!(reference.1.len() > 200_000, "{mode:?}: nothing built");
+            if !par::enabled() {
+                // Every build below would be this one again.
+                continue;
+            }
+            for k in [1, 2, 8] {
+                let got = par::with_threads(k, || build(&mut mesh));
+                assert!(got == reference, "{mode:?}: {k} threads");
+            }
+            let before = par::parallel_entries();
+            assert!(build(&mut mesh) == reference, "{mode:?}: global pool");
+            assert!(
+                par::parallel_entries() > before,
+                "{mode:?}: ran sequentially"
+            );
+        }
+    }
+
+    #[test]
+    fn small_inputs_stay_sequential() {
+        let before = par::parallel_entries();
+        for mode in [SignMode::Pseudonormal, SignMode::Winding] {
+            for mesh in [cube(), icosphere(), torus(), terrain(16)] {
+                status_of(mesh, mode).unwrap();
+            }
+        }
+        assert_eq!(par::parallel_entries(), before);
     }
 
     #[test]

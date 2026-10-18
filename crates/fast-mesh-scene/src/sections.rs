@@ -31,7 +31,7 @@
 //! change, compaction and "everything" always recompute.
 
 use fast_mesh_query::{Fill, Gap2, Plane, Slice, contour_gap, contour_length, signed_area};
-use fast_mesh_store::{ChangeSet, Mesh, StoreError, TriangleId, VertexId};
+use fast_mesh_store::{ChangeSet, Mesh, StoreError, TriangleId, VertexId, par};
 
 use crate::placement::{Placement, local_to_world, world_to_local};
 use crate::scene::Entry;
@@ -132,6 +132,22 @@ pub struct Gap {
     /// The point on the second mesh's contours, in world coordinates.
     pub b: [f64; 3],
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: batches of entries computed in parallel on this thread.
+    static PARALLEL_SECTION_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Triangles, summed over the meshes of the section entries due in one
+/// update, from which the entries are cut in parallel, one entry per task,
+/// with the `parallel` feature.
+///
+/// Measured on the i5-13600K with one section over three spheres, dragging
+/// its plane (three entries due per plane): at 3 x 960 triangles parallel is
+/// 1.0 to 1.7 times slower, at 3 x 2,208 even to 1.4 times faster, at
+/// 3 x 3,968 1.45 times faster and at 3 x 36k 2.6 times.
+const PAR_MIN_SECTION_WORK: usize = 8 * 1024;
 
 fn oom() -> SceneError {
     SceneError::Store(StoreError::OutOfMemory)
@@ -761,14 +777,19 @@ impl Scene {
     /// Computes the stale entries of section `i` whose mesh is Eager,
     /// swallowing failures.
     fn run_section_eager(&mut self, i: usize) {
+        let mut due = Vec::new();
         for k in 0..self.sections[i].entries.len() {
             let eager = self
                 .entry(self.sections[i].entries[k].mesh)
                 .is_ok_and(|e| e.mode == UpdateMode::Eager);
             if eager && !self.entry_current(i, k) {
-                let _ = self.compute_entry(i, k);
+                if due.try_reserve(1).is_err() {
+                    return;
+                }
+                due.push((i, k));
             }
         }
+        let _ = self.compute_entries(&due);
     }
 
     /// Computes the stale entries whose mesh's mode passes `want` and (with
@@ -780,7 +801,7 @@ impl Scene {
         want: impl Fn(UpdateMode) -> bool,
         touched: Option<&[MeshId]>,
     ) -> Result<()> {
-        let mut first = Ok(());
+        let mut due = Vec::new();
         for i in 0..self.sections.len() {
             for k in 0..self.sections[i].entries.len() {
                 let mesh = self.sections[i].entries[k].mesh;
@@ -794,13 +815,11 @@ impl Scene {
                 if !want(e.mode) {
                     continue;
                 }
-                let r = self.compute_entry(i, k);
-                if first.is_ok() {
-                    first = r;
-                }
+                due.try_reserve(1).map_err(|_| oom())?;
+                due.push((i, k));
             }
         }
-        first
+        self.compute_entries(&due)
     }
 
     /// Computes the Eager entries of `touched` (all with `None`). Failures
@@ -824,12 +843,51 @@ impl Scene {
         }
     }
 
-    /// Recomputes entry `k` of section `i` in full, and reports it when the
-    /// result changed or was never computed. The mesh's BVH is brought up
-    /// to date first under the query rules: a non-Manual one is updated, a
-    /// stale Manual one fails with [`SceneError::StaleBvh`]. All or nothing:
-    /// on error the entry and its pending changes stay as they were.
-    fn compute_entry(&mut self, i: usize, k: usize) -> Result<()> {
+    /// Recomputes the entries `due` (`(section, entry)` index pairs, in
+    /// section order, then entry order) in full, each reported when its
+    /// result changed or was never computed, in three phases: each entry's
+    /// mesh BVH is brought up to date in turn under the query rules (a
+    /// non-Manual one is updated, a stale Manual one fails with
+    /// [`SceneError::StaleBvh`]); then every entry is cut without writing
+    /// (in parallel, one entry per task, when the work is large enough;
+    /// see [`PAR_MIN_SECTION_WORK`]); then each is written and reported in
+    /// order, as if the entries were recomputed one after the other.
+    ///
+    /// All or nothing per entry: on error the entry and its pending changes
+    /// stay as they were. Returns the first error in order; every entry is
+    /// attempted.
+    ///
+    /// Bringing a BVH up to date before the earlier entries are written
+    /// changes nothing: it writes no section state and reports nothing, and
+    /// an entry's cut reads only its mesh, BVH, placement and plane.
+    fn compute_entries(&mut self, due: &[(usize, usize)]) -> Result<()> {
+        let mut outcomes: Vec<Result<()>> = try_vec(due.len())?;
+        let mut jobs: Vec<(usize, usize, usize)> = try_vec(due.len())?;
+        for (n, &(i, k)) in due.iter().enumerate() {
+            let r = self.prepare_entry(i, k);
+            if r.is_ok() {
+                jobs.push((n, i, k));
+            }
+            outcomes.push(r);
+        }
+        match self.cut_entries(&jobs) {
+            Ok(cuts) => {
+                for ((n, i, k), c) in jobs.into_iter().zip(cuts) {
+                    outcomes[n] = c.map(|c| self.apply_entry(i, k, c));
+                }
+            }
+            Err(e) => {
+                for (n, _, _) in jobs {
+                    outcomes[n] = Err(e.clone());
+                }
+            }
+        }
+        outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+    }
+
+    /// Brings the BVH of entry `k` of section `i` up to date under the query
+    /// rules (see [`Scene::compute_entries`]).
+    fn prepare_entry(&mut self, i: usize, k: usize) -> Result<()> {
         let mesh = self.sections[i].entries[k].mesh;
         let e = self.entries.get_mut(mesh).ok_or(SceneError::UnknownMesh)?;
         if e.mode != UpdateMode::Manual {
@@ -837,12 +895,46 @@ impl Scene {
         } else if !e.is_current() {
             return Err(SceneError::StaleBvh(mesh));
         }
-        let c = compute(e, &self.sections[i].desc)?;
+        Ok(())
+    }
+
+    /// Cuts the prepared entries `jobs` (`(_, section, entry)`) without
+    /// writing anything: one result per job, in job order. With the
+    /// `parallel` feature, when their meshes hold [`PAR_MIN_SECTION_WORK`]
+    /// triangles or more in all, the entries are cut in parallel, one job
+    /// per task.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when the per-job results cannot be allocated.
+    fn cut_entries(&self, jobs: &[(usize, usize, usize)]) -> Result<Vec<Result<Computed>>> {
+        let mesh_of = |i: usize, k: usize| self.entry(self.sections[i].entries[k].mesh);
+        let work: usize = jobs
+            .iter()
+            .map(|&(_, i, k)| mesh_of(i, k).map_or(0, |e| e.mesh.triangle_count()))
+            .sum();
+        let parallel = work >= PAR_MIN_SECTION_WORK
+            && jobs.len() > 1
+            && par::enabled()
+            && !par::force_sequential();
+        #[cfg(test)]
+        if parallel {
+            PARALLEL_SECTION_BATCHES.with(|c| c.set(c.get() + 1));
+        }
+        let threshold = if parallel { 0 } else { usize::MAX };
+        // Chunks of one job; an entry's error is its own result.
+        par::map_chunks(jobs, 1, threshold, oom, |_, chunk| {
+            let (_, i, k) = chunk[0];
+            Ok(mesh_of(i, k).and_then(|e| compute(e, &self.sections[i].desc)))
+        })
+    }
+
+    /// Writes the fresh cut `c` into entry `k` of section `i`, and reports
+    /// it when the result changed or was never computed.
+    fn apply_entry(&mut self, i: usize, k: usize, c: Computed) {
         #[cfg(test)]
         {
             self.section_recomputes += 1;
         }
-        // Commit: nothing below fails.
         let s = &mut self.sections[i];
         let id = s.id;
         let se = &mut s.entries[k];
@@ -853,16 +945,18 @@ impl Scene {
         se.plane = Some(s.desc.plane);
         se.stale = false;
         se.computed_once = true;
-        e.reset_section_hook(id);
-        if changed {
-            e.report_section(id);
+        if let Some(e) = self.entries.get_mut(se.mesh) {
+            e.reset_section_hook(id);
+            if changed {
+                e.report_section(id);
+            }
         }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::f64::consts::PI;
 
     use fast_mesh_store::Mesh;
@@ -1850,5 +1944,91 @@ mod tests {
         let ch = scene.take_changes();
         assert_eq!(ch.len(), 1);
         assert_eq!(of(&ch, b), [s1, s2]);
+    }
+
+    /// Four sections over three overlapping spheres of `stacks` x `2 stacks`
+    /// cells in `mode`, the plane of each dragged through four poses; per
+    /// pose, the reports and every result and gap, printed in full (so equal
+    /// strings mean equal bits).
+    fn section_drag(stacks: u32, mode: UpdateMode) -> Vec<String> {
+        let mut scene = Scene::new(SceneOptions::default());
+        let meshes: Vec<MeshId> = (0..3)
+            .map(|k| {
+                let c = [0.6 * k as f64, 0.1 * k as f64, 0.0];
+                let mesh = sphere(stacks, 2 * stacks, 1.0, c);
+                scene.add_mesh(mesh, with_mode(mode)).unwrap()
+            })
+            .collect();
+        let normals = [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.3, 1.0, 0.2],
+            [1.0, 1.0, 1.0],
+        ];
+        let plane = |s: usize, pose: usize| {
+            let t = 0.05 * pose as f64 - 0.1 + 0.02 * s as f64;
+            Plane::new([0.6 + t, t, t], normals[s]).unwrap()
+        };
+        let sections: Vec<SectionId> = (0..4)
+            .map(|s| {
+                let fill = s % 2 == 0;
+                scene.add_section(desc(plane(s, 0), &meshes, fill)).unwrap()
+            })
+            .collect();
+        scene.update_sections().unwrap();
+        scene.take_changes();
+        let mut out = Vec::new();
+        for pose in 1..5 {
+            for (s, &id) in sections.iter().enumerate() {
+                scene.set_section_plane(id, plane(s, pose)).unwrap();
+            }
+            scene.update_sections().unwrap();
+            let mut seen = format!("{:?}", scene.take_changes());
+            for &id in &sections {
+                for &m in &meshes {
+                    let r = scene.section(id, m).unwrap();
+                    assert!(!r.contours.is_empty());
+                    seen += &format!("{r:?}");
+                }
+                seen += &format!("{:?}", scene.section_gap(id, meshes[0], meshes[2]));
+            }
+            out.push(seen);
+        }
+        out
+    }
+
+    #[test]
+    fn sections_bit_identical() {
+        use fast_mesh_store::par;
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy] {
+            // The forced-sequential run is the code a feature-off build runs.
+            par::set_force_sequential(true);
+            let reference = section_drag(40, mode);
+            par::set_force_sequential(false);
+            if !par::enabled() {
+                // Every drag below would be this one again.
+                continue;
+            }
+            for k in [1, 2, 8] {
+                let got = par::with_threads(k, || section_drag(40, mode));
+                assert!(got == reference, "{mode:?}: {k} threads");
+            }
+            let batches = PARALLEL_SECTION_BATCHES.with(Cell::get);
+            assert!(section_drag(40, mode) == reference, "{mode:?}: global pool");
+            let ran = PARALLEL_SECTION_BATCHES.with(Cell::get) > batches;
+            assert!(ran, "{mode:?}: ran sequentially");
+        }
+    }
+
+    #[test]
+    fn small_inputs_stay_sequential() {
+        use fast_mesh_store::par;
+        let before = par::parallel_entries();
+        let batches = PARALLEL_SECTION_BATCHES.with(Cell::get);
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy] {
+            section_drag(8, mode);
+        }
+        assert_eq!(par::parallel_entries(), before);
+        assert_eq!(PARALLEL_SECTION_BATCHES.with(Cell::get), batches);
     }
 }

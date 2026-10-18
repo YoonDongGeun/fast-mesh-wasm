@@ -3,14 +3,14 @@
 use std::fmt;
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_store::{Mesh, TriangleId, VertexId};
+use fast_mesh_store::{Mesh, TriangleId, VertexId, par};
 
 use fast_mesh_query::self_intersecting_pairs;
 
 use crate::topology::{
     BoundaryLoop, Component, EdgeMap, components, loops_with, pinch_vertices, point, triangle_area,
 };
-use crate::weld::weld_roots;
+use crate::weld::{check_tolerance, weld_roots};
 use crate::{Result, filled, push, reserve};
 
 /// Options for [`analyze`].
@@ -87,6 +87,15 @@ pub struct Analysis {
 /// longest edge squared (the default of `remove_degenerate`).
 pub(crate) const AREA_EPSILON: f64 = 1e-12;
 
+/// [`analyze`] runs its passes side by side from this many triangles, with
+/// the `parallel` feature.
+///
+/// Measured on the i5-13600K on terrains (no defects, no BVH): at 512
+/// triangles parallel is 1.1 to 1.2 times slower, at 1,152 1.1 to 1.3 times
+/// faster, and from 4k on steadily 1.25 times (the edge map's sort, which
+/// the other passes wait for, stays sequential).
+pub(crate) const PAR_MIN_ANALYZE_TRIS: usize = 2048;
+
 /// Reports the defects of `mesh` without changing it.
 ///
 /// - Loops, components, edge kinds, pinch vertices and orientation conflicts
@@ -123,12 +132,104 @@ pub(crate) const AREA_EPSILON: f64 = 1e-12;
 /// [`OpsError::Store`]: crate::OpsError::Store
 pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
     let max = options.max_listed;
-    let roots = weld_roots(mesh, options.weld_tolerance)?;
-    let edges = EdgeMap::build(mesh)?;
-    let loops = loops_with(mesh, &edges)?;
-    let components = components(mesh, &edges)?;
-    let pinch_vertices = pinch_vertices(mesh, &edges)?;
+    // Checked first, so a bad tolerance fails before any pass runs.
+    check_tolerance(options.weld_tolerance)?;
+    // The four passes read the mesh only; on large meshes they run side by
+    // side. Their errors are returned in pass order, so the first error is
+    // the same however they ran.
+    let parallel = mesh.triangle_count() >= PAR_MIN_ANALYZE_TRIS;
+    let ((coincident, topology), (scans, self_intersects)) = par::join(
+        parallel,
+        || {
+            par::join(
+                parallel,
+                || groups(&weld_roots(mesh, options.weld_tolerance)?, max),
+                || topology_pass(mesh, max, parallel),
+            )
+        },
+        || {
+            par::join(
+                parallel,
+                || scan_pass(mesh, max),
+                || self_intersection_pass(mesh, options.self_intersection),
+            )
+        },
+    );
+    let (coincident_groups, coincident) = coincident?;
+    let topology = topology?;
+    let (degenerate, degenerate_list, duplicate, duplicate_list) = scans?;
+    let self_intersects = self_intersects?;
 
+    Ok(Analysis {
+        loops: topology.loops,
+        coincident_groups,
+        coincident,
+        degenerate,
+        degenerate_list,
+        duplicate,
+        duplicate_list,
+        non_manifold_edges: topology.non_manifold_edges,
+        non_manifold_edge_list: topology.non_manifold_edge_list,
+        non_manifold_vertices: topology.non_manifold_vertices,
+        pinch_vertices: topology.pinch_vertices,
+        components: topology.components,
+        orientation_conflicts: topology.orientation_conflicts,
+        self_intersects,
+    })
+}
+
+/// What [`analyze`] reads from the edge map.
+struct Topology {
+    loops: Vec<BoundaryLoop>,
+    non_manifold_edges: usize,
+    non_manifold_edge_list: Vec<(VertexId, VertexId)>,
+    non_manifold_vertices: Vec<VertexId>,
+    pinch_vertices: Vec<VertexId>,
+    components: Vec<Component>,
+    orientation_conflicts: usize,
+}
+
+/// The edge map and everything [`analyze`] reads from it: the loops, the
+/// components and the rest side by side when `parallel`, errors in that
+/// order.
+fn topology_pass(mesh: &Mesh, max: usize, parallel: bool) -> Result<Topology> {
+    let edges = EdgeMap::build(mesh)?;
+    let (loops, (components, rest)) = par::join(
+        parallel,
+        || loops_with(mesh, &edges),
+        || {
+            par::join(
+                parallel,
+                || components(mesh, &edges),
+                || edge_kinds(mesh, &edges, max),
+            )
+        },
+    );
+    let (loops, components) = (loops?, components?);
+    let (pinch_vertices, non_manifold, orientation_conflicts) = rest?;
+    let (non_manifold_edges, non_manifold_edge_list, non_manifold_vertices) = non_manifold;
+    Ok(Topology {
+        loops,
+        non_manifold_edges,
+        non_manifold_edge_list,
+        non_manifold_vertices,
+        pinch_vertices,
+        components,
+        orientation_conflicts,
+    })
+}
+
+/// The non-manifold edge count, edge list and vertices.
+type NonManifold = (usize, Vec<(VertexId, VertexId)>, Vec<VertexId>);
+
+/// The pinch vertices, the non-manifold edges and vertices, and the
+/// orientation conflicts.
+fn edge_kinds(
+    mesh: &Mesh,
+    edges: &EdgeMap,
+    max: usize,
+) -> Result<(Vec<VertexId>, NonManifold, usize)> {
+    let pinch_vertices = pinch_vertices(mesh, edges)?;
     let mut non_manifold_edges = 0;
     let mut non_manifold_edge_list = Vec::new();
     let mut on_non_manifold = filled(mesh.vertex_slots(), false)?;
@@ -157,9 +258,19 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
             push(&mut non_manifold_vertices, v as VertexId)?;
         }
     }
+    let non_manifold = (
+        non_manifold_edges,
+        non_manifold_edge_list,
+        non_manifold_vertices,
+    );
+    Ok((pinch_vertices, non_manifold, orientation_conflicts))
+}
 
-    let (coincident_groups, coincident) = groups(&roots, max)?;
+/// The degenerate count and list, then the duplicate count and list.
+type Scans = (usize, Vec<TriangleId>, usize, Vec<TriangleId>);
 
+/// The degenerate and duplicate triangle scans of [`analyze`].
+fn scan_pass(mesh: &Mesh, max: usize) -> Result<Scans> {
     let mut degenerate = 0;
     let mut degenerate_list = Vec::new();
     for t in 0..mesh.triangle_slots() as TriangleId {
@@ -176,32 +287,17 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
     let mut duplicate_list = duplicate_triangles(mesh)?;
     let duplicate = duplicate_list.len();
     duplicate_list.truncate(max);
+    Ok((degenerate, degenerate_list, duplicate, duplicate_list))
+}
 
-    let self_intersects = match options.self_intersection {
-        Some(bvh) => {
-            let mut pairs = Vec::new();
-            self_intersecting_pairs(mesh, bvh, &mut pairs)?;
-            Some(!pairs.is_empty())
-        }
-        None => None,
+/// Whether two triangles of `mesh` intersect, given a BVH.
+fn self_intersection_pass(mesh: &Mesh, bvh: Option<&Bvh>) -> Result<Option<bool>> {
+    let Some(bvh) = bvh else {
+        return Ok(None);
     };
-
-    Ok(Analysis {
-        loops,
-        coincident_groups,
-        coincident,
-        degenerate,
-        degenerate_list,
-        duplicate,
-        duplicate_list,
-        non_manifold_edges,
-        non_manifold_edge_list,
-        non_manifold_vertices,
-        pinch_vertices,
-        components,
-        orientation_conflicts,
-        self_intersects,
-    })
+    let mut pairs = Vec::new();
+    self_intersecting_pairs(mesh, bvh, &mut pairs)?;
+    Ok(Some(!pairs.is_empty()))
 }
 
 /// The alive triangles that repeat the vertex set of a triangle with a smaller
@@ -489,6 +585,59 @@ mod tests {
         };
         let a = analyze(&mesh, &none).unwrap();
         assert_eq!((a.degenerate, a.degenerate_list.len()), (2, 0));
+    }
+
+    /// A damaged mesh of over [`PAR_MIN_ANALYZE_TRIS`] triangles: a sphere
+    /// with holes, flipped triangles, a duplicate, a repeated id and a slit
+    /// (vertex 500 copied, with one triangle moved onto the copy), beside two
+    /// crossed boxes.
+    fn large_damaged() -> Mesh {
+        let sphere = uv_sphere(96, 192, 1.0);
+        let holed = punch_holes(&sphere, &[[1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], 0.2);
+        let every_97th: Vec<TriangleId> = (0..holed.triangle_count() as u32).step_by(97).collect();
+        let (mut positions, mut triangles) =
+            parts(&combine(&[&flip(&holed, &every_97th), &crossed_boxes()]));
+        let copy = (positions.len() / 3) as VertexId;
+        positions.extend_from_within(1500..1503);
+        let t = triangles.iter().position(|t| t.contains(&500)).unwrap();
+        triangles[t] = triangles[t].map(|v| if v == 500 { copy } else { v });
+        triangles.extend([triangles[10], [5, 5, 6]]);
+        mesh_of(&positions, &triangles)
+    }
+
+    #[test]
+    fn analyze_bit_identical() {
+        let mesh = large_damaged();
+        assert!(mesh.triangle_count() >= PAR_MIN_ANALYZE_TRIS);
+        let bvh = Bvh::build(&mesh, &BuildOptions::default()).unwrap();
+        for weld_tolerance in [0.0, 0.02] {
+            let options = AnalyzeOptions {
+                weld_tolerance,
+                self_intersection: Some(&bvh),
+                ..Default::default()
+            };
+            let a = assert_parallel_identical("analyze", || analyze(&mesh, &options).unwrap());
+            assert_eq!(a.self_intersects, Some(true));
+            assert!(a.loops.len() >= 2 && a.orientation_conflicts > 0);
+            assert_eq!((a.duplicate, a.degenerate), (1, 1));
+            assert!(a.coincident_groups > 0);
+        }
+        // A pass's error is the same however the passes ran.
+        let other = Bvh::build(&uv_sphere(8, 12, 1.0), &BuildOptions::default()).unwrap();
+        let mut bad = AnalyzeOptions {
+            self_intersection: Some(&other),
+            ..Default::default()
+        };
+        let e = assert_parallel_identical("analyze error", || analyze(&mesh, &bad));
+        assert!(matches!(e, Err(OpsError::Query(_))));
+        // A bad tolerance fails before any pass runs.
+        bad.weld_tolerance = -1.0;
+        let before = par::parallel_entries();
+        assert!(matches!(
+            analyze(&mesh, &bad),
+            Err(OpsError::InvalidInput(_))
+        ));
+        assert_eq!(par::parallel_entries(), before);
     }
 
     #[test]

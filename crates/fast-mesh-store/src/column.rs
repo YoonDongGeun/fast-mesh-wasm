@@ -50,10 +50,15 @@ thread_local! {
 }
 
 /// Makes the `n`-th next fallible reservation on this thread (0-based) and every one
-/// after it fail with `OutOfMemory`. `None` turns failures off.
+/// after it fail with `OutOfMemory`. `None` turns failures off. While armed,
+/// parallel work runs on this thread so the hook sees every reservation.
 #[cfg(test)]
 pub(crate) fn fail_allocations_after(n: Option<usize>) {
-    ALLOCATIONS_LEFT.with(|c| c.set(n));
+    // Only on arming or disarming: the count must see one `true` per arm.
+    let was = ALLOCATIONS_LEFT.with(|c| c.replace(n)).is_some();
+    if was != n.is_some() {
+        crate::par::set_force_sequential(n.is_some());
+    }
 }
 
 /// Every fallible reservation passes through here, so tests can make it fail.

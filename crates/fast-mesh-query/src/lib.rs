@@ -99,10 +99,15 @@ thread_local! {
 }
 
 /// Makes the `n`-th next fallible reservation on this thread (0-based) and every one
-/// after it fail with `OutOfMemory`. `None` turns failures off.
+/// after it fail with `OutOfMemory`. `None` turns failures off. While armed,
+/// parallel work runs on this thread so the hook sees every reservation.
 #[cfg(test)]
 pub(crate) fn fail_allocations_after(n: Option<usize>) {
-    ALLOCATIONS_LEFT.with(|c| c.set(n));
+    // Only on arming or disarming: the count must see one `true` per arm.
+    let was = ALLOCATIONS_LEFT.with(|c| c.replace(n)).is_some();
+    if was != n.is_some() {
+        fast_mesh_store::par::set_force_sequential(n.is_some());
+    }
 }
 
 fn allocation_allowed() -> Result<()> {
@@ -140,6 +145,25 @@ impl<'a, T> Appender<'a, T> {
             return Err(e);
         }
         self.out.push(v);
+        Ok(())
+    }
+
+    /// Appends all of `items` with one fallible reservation, as [`Self::push`]
+    /// does for one.
+    pub(crate) fn extend(&mut self, items: &[T]) -> Result<()>
+    where
+        T: Copy,
+    {
+        let reserved = allocation_allowed().and_then(|()| {
+            self.out
+                .try_reserve(items.len())
+                .map_err(|_| QueryError::OutOfMemory)
+        });
+        if let Err(e) = reserved {
+            self.out.truncate(self.start);
+            return Err(e);
+        }
+        self.out.extend_from_slice(items);
         Ok(())
     }
 

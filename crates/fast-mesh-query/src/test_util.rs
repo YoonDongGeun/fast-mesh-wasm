@@ -208,3 +208,78 @@ pub(crate) fn signed_volume6(mesh: &Mesh) -> f64 {
         })
         .sum()
 }
+
+/// An `n` x `n` sheet of unit cells over `[0, n]^2`, rippled along x
+/// (`along_y` false) or along y, with amplitude 1.
+pub(crate) fn ripple(n: u32, along_y: bool) -> Mesh {
+    let (positions, indices) = ripple_buffers(n, along_y, 0);
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+/// The two [`ripple`] sheets of size `n` in one mesh, crossing each other
+/// along many curves.
+pub(crate) fn crossed_ripples(n: u32) -> Mesh {
+    let (mut positions, mut indices) = ripple_buffers(n, false, 0);
+    let (p, i) = ripple_buffers(n, true, (positions.len() / 3) as u32);
+    positions.extend(p);
+    indices.extend(i);
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+/// The buffers of a [`ripple`] sheet, its vertex ids starting at `base`.
+fn ripple_buffers(n: u32, along_y: bool, base: u32) -> (Vec<f32>, Vec<u32>) {
+    let mut positions = Vec::new();
+    for y in 0..=n {
+        for x in 0..=n {
+            let t = if along_y { y } else { x } as f32;
+            positions.extend([x as f32, y as f32, (t * 0.7).sin()]);
+        }
+    }
+    let mut indices = Vec::new();
+    for y in 0..n {
+        for x in 0..n {
+            let a = base + y * (n + 1) + x;
+            indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+        }
+    }
+    (positions, indices)
+}
+
+/// Runs `run` with parallel work forced off (the code a feature-off build
+/// runs), then on pools of 1, 2 and 8 threads and on the global pool,
+/// asserting every run matches the first; with the `parallel` feature, also
+/// that the global run took a parallel path. Returns the first run.
+pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    run: impl Fn() -> R + Sync,
+) -> R {
+    assert_runs_identical(what, true, run)
+}
+
+/// [`assert_parallel_identical`], asserting that the global run took a
+/// parallel path only when `splits` (a search whose root boxes are rejected
+/// has nothing to split).
+pub(crate) fn assert_runs_identical<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    splits: bool,
+    run: impl Fn() -> R + Sync,
+) -> R {
+    use fast_mesh_store::par;
+    par::set_force_sequential(true);
+    let reference = run();
+    par::set_force_sequential(false);
+    if !par::enabled() {
+        // Every run below would be this one again.
+        return reference;
+    }
+    for k in [1, 2, 8] {
+        let got = par::with_threads(k, &run);
+        assert!(got == reference, "{what}: {k} threads");
+    }
+    let before = par::parallel_entries();
+    assert!(run() == reference, "{what}: global pool");
+    if splits {
+        assert!(par::parallel_entries() > before, "{what}: ran sequentially");
+    }
+    reference
+}

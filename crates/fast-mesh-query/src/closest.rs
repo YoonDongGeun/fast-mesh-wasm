@@ -3,9 +3,9 @@
 use std::cell::Cell;
 
 use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
-use fast_mesh_store::{Mesh, TriangleId};
+use fast_mesh_store::{Mesh, TriangleId, par};
 
-use crate::ray::points;
+use crate::ray::{PAR_MIN_QUERIES, QUERY_CHUNK, points};
 use crate::tri::{TriClosest, closest_on_triangle};
 use crate::{Feature, QueryError, Result, check};
 
@@ -152,9 +152,12 @@ pub fn closest_point_many(
         validate_point(p)?;
     }
     check(mesh, bvh)?;
-    for (&p, slot) in points.iter().zip(out) {
-        *slot = closest(mesh, bvh, p, opts);
-    }
+    par::for_each_chunk_mut(out, QUERY_CHUNK, PAR_MIN_QUERIES, |i, slots| {
+        let points = &points[i * QUERY_CHUNK..];
+        for (&p, slot) in points.iter().zip(slots) {
+            *slot = closest(mesh, bvh, p, opts);
+        }
+    });
     Ok(())
 }
 
@@ -369,5 +372,81 @@ mod tests {
         assert_eq!(box_dist2([0.5; 3], &b), 0.0);
         assert_eq!(box_dist2([2.0, 0.5, 0.5], &b), 1.0);
         assert_eq!(box_dist2([-1.0, 2.0, 0.5], &b), 2.0);
+    }
+
+    #[test]
+    fn batch_queries_bit_identical() {
+        use crate::raycast_many;
+        use crate::test_util::assert_parallel_identical;
+        let mesh = wavy(150);
+        let bvh = build(&mesh, Quality::Sah);
+        let mut rng = Lcg(0xba7c4);
+        let count = 20_000;
+        let span = 156.0;
+        let mut around = |z: f32| [rng.next() * span - 3.0, rng.next() * span - 3.0, z];
+        let points: Vec<[f32; 3]> = (0..count).map(|k| around((k % 7) as f32 - 1.0)).collect();
+        let origins: Vec<[f32; 3]> = (0..count).map(|_| around(5.0)).collect();
+        let dirs: Vec<[f32; 3]> = (0..count)
+            .map(|k| [(k % 5) as f32 * 0.2 - 0.4, (k % 3) as f32 * 0.3 - 0.3, -1.0])
+            .collect();
+        // Debug prints every float in full, so equal strings mean equal bits.
+        let closest = assert_parallel_identical("closest_point_many", || {
+            let mut out = vec![None; count];
+            closest_point_many(&mesh, &bvh, &points, &OPEN, &mut out).unwrap();
+            format!("{out:?}")
+        });
+        let one: Vec<_> = points
+            .iter()
+            .map(|&p| closest_point(&mesh, &bvh, p, &OPEN).unwrap())
+            .collect();
+        assert_eq!(closest, format!("{one:?}"));
+        let opts = RayOptions::default();
+        let hits = assert_parallel_identical("raycast_many", || {
+            let mut out = vec![None; count];
+            raycast_many(&mesh, &bvh, &origins, &dirs, &opts, &mut out).unwrap();
+            format!("{out:?}")
+        });
+        let one: Vec<_> = origins
+            .iter()
+            .zip(&dirs)
+            .map(|(&origin, &dir)| raycast(&mesh, &bvh, &Ray { origin, dir }, &opts).unwrap())
+            .collect();
+        assert_eq!(hits, format!("{one:?}"));
+        assert!(one.iter().filter(|h| h.is_some()).count() > count / 2);
+    }
+
+    #[test]
+    fn small_inputs_stay_sequential() {
+        use crate::{Rigid, intersecting_pairs, raycast_many, self_intersecting_pairs};
+        use crate::{test_util::crossed_ripples, triangles_near};
+        use fast_mesh_store::par;
+        let before = par::parallel_entries();
+        let mesh = wavy(20);
+        let bvh = build(&mesh, Quality::Sah);
+        let points = &queries(20)[..200];
+        let mut out = vec![None; points.len()];
+        closest_point_many(&mesh, &bvh, points, &OPEN, &mut out).unwrap();
+        let dirs = vec![[0.0, 0.0, -1.0]; points.len()];
+        let mut hits = vec![None; points.len()];
+        raycast_many(
+            &mesh,
+            &bvh,
+            points,
+            &dirs,
+            &RayOptions::default(),
+            &mut hits,
+        )
+        .unwrap();
+        let (mut near_a, mut near_b, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+        let id = Rigid::IDENTITY;
+        triangles_near(&mesh, &bvh, &mesh, &bvh, &id, 0.5, &mut near_a, &mut near_b).unwrap();
+        intersecting_pairs(&mesh, &bvh, &mesh, &bvh, &id, &mut pairs).unwrap();
+        assert!(!near_a.is_empty() && !pairs.is_empty());
+        let crossed = crossed_ripples(10);
+        let crossed_bvh = build(&crossed, Quality::Sah);
+        pairs.clear();
+        self_intersecting_pairs(&crossed, &crossed_bvh, &mut pairs).unwrap();
+        assert!(!pairs.is_empty());
+        assert_eq!(par::parallel_entries(), before);
     }
 }

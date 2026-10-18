@@ -11,7 +11,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Lets the engine run hot loops on rayon's thread pool (see `par`). Results
+# are bit-identical with and without it.
+parallel = ["dep:rayon"]
+# Exposes `par::parallel_entries` to other crates' tests.
+test-counters = []
+
 [dependencies]
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1.12.0"

@@ -1,10 +1,12 @@
 //! Self-intersection: the triangle pairs of one mesh that intersect each
 //! other.
 
-use fast_mesh_bvh::{Bvh, NodeKind};
-use fast_mesh_store::{Mesh, TriangleId};
+use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind};
+use fast_mesh_store::{Mesh, TriangleId, par};
 
-use crate::pair::{PAIR_STACK, Step, traverse_subtree_pairs_with};
+use crate::pair::{
+    PAIR_STACK, PAR_PARTS, Step, oom, split_pair, traverse_subtree_pairs_with, try_push,
+};
 use crate::ray::points;
 use crate::tritri::{P3, collinear, tri_tri_intersect};
 use crate::{Appender, Result, Rigid, check};
@@ -38,24 +40,139 @@ pub fn self_intersecting_pairs(
 ) -> Result<()> {
     check(mesh, bvh)?;
     let mut ap = Appender::new(out);
-    let mut failed = None;
-    // Tests one pair; `false` once a push has failed.
-    let mut test = |a: TriangleId, b: TriangleId| {
-        if let Some(pair) = intersecting(mesh, a, b)
-            && let Err(e) = ap.push(pair)
-        {
-            failed = Some(e);
-            return false;
-        }
-        true
+    let Some(root) = bvh.root() else {
+        return Ok(());
     };
+    if par::enabled() && !par::force_sequential() && mesh.triangle_count() >= PAR_MIN_SELF_TRIS {
+        // Each part's pairs in part order, sorted below.
+        let parts = split(bvh, root)?;
+        let found = par::map_chunks(&parts, 1, 0, oom, |_, part| {
+            let mut pairs = Vec::new();
+            let mut failed = None;
+            part[0].search(bvh, &mut |a, b| {
+                if let Some(pair) = intersecting(mesh, a, b)
+                    && let Err(e) = try_push(&mut pairs, pair)
+                {
+                    failed = Some(e);
+                    return false;
+                }
+                true
+            });
+            failed.map_or(Ok(pairs), Err)
+        })?;
+        for pairs in &found {
+            ap.extend(pairs)?;
+        }
+    } else {
+        let mut failed = None;
+        Part::Within(root).search(bvh, &mut |a, b| {
+            if let Some(pair) = intersecting(mesh, a, b)
+                && let Err(e) = ap.push(pair)
+            {
+                failed = Some(e);
+                return false;
+            }
+            true
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    }
+    ap.appended().sort_unstable();
+    Ok(())
+}
+
+/// Triangles from which [`self_intersecting_pairs`] splits its search into
+/// [`Part`]s searched in parallel, with the `parallel` feature.
+///
+/// Measured on the i5-13600K on terrains (no pair intersects): at 128
+/// triangles parallel is 1.2 to 1.5 times slower, at 512 between 1.3 times
+/// slower and 1.3 times faster from run to run, at 1,058 three times faster
+/// and at 32k nine times. Meshes that do cross themselves gain more.
+const PAR_MIN_SELF_TRIS: usize = 1024;
+
+/// A part of the self-intersection search.
+#[derive(Debug, Clone, Copy)]
+enum Part {
+    /// Every pair of triangles under one node.
+    Within(NodeId),
+    /// Every pair of a triangle under the first node and one under the
+    /// second, two disjoint subtrees whose boxes overlap.
+    Across(NodeId, NodeId),
+}
+
+impl Part {
+    /// Calls `test(a, b)` on every pair of triangles of the part that may
+    /// intersect, once each, until it returns `false`.
+    fn search(self, bvh: &Bvh, test: &mut impl FnMut(TriangleId, TriangleId) -> bool) {
+        match self {
+            Part::Within(root) => within(bvh, root, test),
+            Part::Across(p, q) => {
+                across(bvh, p, q, test);
+            }
+        }
+    }
+}
+
+/// Cuts the search of the tree below `root` into disjoint [`Part`]s, one
+/// level at a time, until there are [`PAR_PARTS`] or more, or none can be
+/// cut further. A node's `Within` becomes its children's two `Within`s and,
+/// when their boxes overlap, their `Across`; an `Across` becomes the
+/// `Across`es of its child pairs whose boxes overlap ([`split_pair`]). Each
+/// pair of triangles the whole search tests is in exactly one part, and in
+/// none of the dropped ones. The parts come in a fixed order for a given
+/// tree.
+fn split(bvh: &Bvh, root: NodeId) -> Result<Vec<Part>> {
+    let overlap = |p: &Aabb, q: &Aabb| p.overlaps(q).then_some(());
+    let mut parts = Vec::new();
+    try_push(&mut parts, Part::Within(root))?;
+    while parts.len() < PAR_PARTS {
+        let mut next = Vec::new();
+        let mut cut = false;
+        for &part in &parts {
+            match part {
+                Part::Within(n) => match bvh.node(n).kind {
+                    NodeKind::Leaf { .. } => try_push(&mut next, part)?,
+                    NodeKind::Inner { left, right } => {
+                        cut = true;
+                        try_push(&mut next, Part::Within(left))?;
+                        try_push(&mut next, Part::Within(right))?;
+                        if bvh.node(left).bounds.overlaps(&bvh.node(right).bounds) {
+                            try_push(&mut next, Part::Across(left, right))?;
+                        }
+                    }
+                },
+                Part::Across(p, q) => {
+                    match split_pair(bvh, p, bvh, q, &Rigid::IDENTITY, &overlap) {
+                        None => try_push(&mut next, part)?,
+                        Some(children) => {
+                            cut = true;
+                            for (p, q) in children.into_iter().flatten() {
+                                try_push(&mut next, Part::Across(p, q))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        parts = next;
+        if !cut {
+            break;
+        }
+    }
+    Ok(parts)
+}
+
+/// Calls `test` on the pairs under `root` that may intersect, until it
+/// returns `false`.
+fn within(bvh: &Bvh, root: NodeId, test: &mut impl FnMut(TriangleId, TriangleId) -> bool) {
     let mut ok = true;
     // Each unordered pair of distinct leaves has one lowest common ancestor,
     // with one leaf under each child; each pair inside one leaf is that
     // leaf's. So walking every node once, pairing its two children's
     // subtrees or a leaf's triangles among themselves, tests every pair of
     // triangles once.
-    bvh.traverse(|_, view| {
+    bvh.traverse_from(root, |_, view| {
         if !ok {
             return false;
         }
@@ -72,42 +189,48 @@ pub fn self_intersecting_pairs(
             }
             NodeKind::Inner { left, right } => {
                 if bvh.node(left).bounds.overlaps(&bvh.node(right).bounds) {
-                    traverse_subtree_pairs_with::<PAIR_STACK, f64>(
-                        bvh,
-                        left,
-                        bvh,
-                        right,
-                        &Rigid::IDENTITY,
-                        |p, q| p.overlaps(q).then_some(0.0),
-                        |va, vb, _| {
-                            let (
-                                NodeKind::Leaf { triangles: ta },
-                                NodeKind::Leaf { triangles: tb },
-                            ) = (va.kind, vb.kind)
-                            else {
-                                return Step::Descend;
-                            };
-                            for &a in ta {
-                                for &b in tb {
-                                    if !test(a, b) {
-                                        ok = false;
-                                        return Step::Stop;
-                                    }
-                                }
-                            }
-                            Step::Skip
-                        },
-                    );
+                    ok = across(bvh, left, right, test);
                 }
             }
         }
         ok
     });
-    if let Some(e) = failed {
-        return Err(e);
-    }
-    ap.appended().sort_unstable();
-    Ok(())
+}
+
+/// Calls `test` on the pairs of a triangle under `p` and one under `q` that
+/// may intersect, until it returns `false`; returns `false` then.
+fn across(
+    bvh: &Bvh,
+    p: NodeId,
+    q: NodeId,
+    test: &mut impl FnMut(TriangleId, TriangleId) -> bool,
+) -> bool {
+    let mut ok = true;
+    traverse_subtree_pairs_with::<PAIR_STACK, f64>(
+        bvh,
+        p,
+        bvh,
+        q,
+        &Rigid::IDENTITY,
+        |p, q| p.overlaps(q).then_some(0.0),
+        |va, vb, _| {
+            let (NodeKind::Leaf { triangles: ta }, NodeKind::Leaf { triangles: tb }) =
+                (va.kind, vb.kind)
+            else {
+                return Step::Descend;
+            };
+            for &a in ta {
+                for &b in tb {
+                    if !test(a, b) {
+                        ok = false;
+                        return Step::Stop;
+                    }
+                }
+            }
+            Step::Skip
+        },
+    );
+    ok
 }
 
 /// `(min, max)` of `a` and `b` when they share no vertex id, neither is
@@ -343,6 +466,18 @@ mod tests {
             fail_allocations_after(None);
             assert_eq!(got, Err(QueryError::OutOfMemory));
             assert_eq!(out, vec![(7, 7)]);
+        }
+    }
+
+    #[test]
+    fn self_pairs_bit_identical() {
+        use crate::test_util::{assert_parallel_identical, crossed_ripples};
+        let mesh = crossed_ripples(60);
+        assert!(mesh.triangle_count() >= PAR_MIN_SELF_TRIS);
+        for quality in [Quality::Sah, Quality::Fast] {
+            let bvh = build(&mesh, quality);
+            let found = assert_parallel_identical("self pairs", || pairs(&mesh, &bvh));
+            assert!(found.len() > 500, "{quality:?}: {} pairs", found.len());
         }
     }
 }

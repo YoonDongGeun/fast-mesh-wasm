@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::arena::{Arena, NONE, Node};
-use crate::build::{Prims, build_subtree, expected_nodes};
+use crate::build::{Prims, build_full, expected_nodes};
 use crate::error::{Result, try_reserve, try_reserve_exact, try_reserve_map, try_vec};
 use crate::{Aabb, BuildOptions, NodeKind, UpdatePolicy};
 
@@ -122,14 +122,13 @@ impl Bvh {
             refs: Vec::new(),
             tri_leaf: try_vec(mesh.triangle_slots(), NONE)?,
         };
-        let expected = expected_nodes(n, options.max_leaf_size);
-        try_reserve_exact(&mut arena.nodes, expected)?;
-        try_reserve_exact(&mut arena.parents, expected)?;
-        try_reserve_exact(&mut arena.refs, n)?;
         let root = if n == 0 {
+            let expected = expected_nodes(n, options.max_leaf_size);
+            try_reserve_exact(&mut arena.nodes, expected)?;
+            try_reserve_exact(&mut arena.parents, expected)?;
             NONE
         } else {
-            build_subtree(&mut arena, &mut prims, options, NONE)?
+            build_full(&mut arena, &mut prims, options)?
         };
         let mut bvh = Bvh {
             arena,
