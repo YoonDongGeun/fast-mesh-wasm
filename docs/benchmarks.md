@@ -198,7 +198,7 @@ Pseudonormal builds slower (it accumulates angle-weighted normals per vertex and
 | `SignData::build`, adjacency cached | 223 ms | 232 ms |
 | `SignData::build`, adjacency not cached | 340 ms | 339 ms |
 
-So a topology edit of B costs about 1.5 times the build alone, on the order of 220 ms at the table's speed. Placement changes and edits of A do not rebuild the sign data. An incremental refit is planned for 5b.
+So a topology edit of B costs about 1.5 times the build alone, an estimated ~220 ms at the table's speed (scaled, not measured). Placement changes and edits of A do not rebuild the sign data. An incremental refit is planned for 5b.
 
 ### The 64-pose drag of two touching 1M terrains
 

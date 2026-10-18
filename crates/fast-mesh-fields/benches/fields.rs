@@ -79,8 +79,7 @@ fn fields(c: &mut Criterion) {
             },
             |(mut fresh, fresh_bvh)| {
                 let sign = SignData::build(&mut fresh, &fresh_bvh, SignMode::Pseudonormal).unwrap();
-                black_box(sign);
-                (fresh, fresh_bvh)
+                (fresh, fresh_bvh, black_box(sign))
             },
             BatchSize::PerIteration,
         )
