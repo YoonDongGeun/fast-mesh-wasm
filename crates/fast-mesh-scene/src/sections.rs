@@ -13,13 +13,27 @@
 //! plane is mapped into the mesh's local frame, cut with [`slice()`], and the
 //! points are mapped back.
 //!
-//! Each entry also keeps the sorted vertex ids of its crossed edges and its
-//! crossed triangles, for a finer staleness rule later.
+//! **Edits that cannot reach the plane** (spec §6.3, §11.5). Each entry
+//! keeps the sorted vertex ids of its crossed edges and its crossed
+//! triangles. An edit, undo or redo leaves the entry current, with nothing
+//! recomputed or reported, unless one of these holds for the changes merged
+//! since the last computation:
+//! 1. a moved or removed vertex is a crossed-edge vertex;
+//! 2. a removed or rewritten triangle is a crossed triangle;
+//! 3. a moved or added vertex that is not a crossed-edge vertex has an alive
+//!    incident triangle with vertices on both sides;
+//! 4. an added or rewritten triangle is alive and has vertices on both sides.
+//!
+//! Sides use the cut's own rule (`s ≥ 0` is `+`, from the stored `f32`
+//! positions) against the same local plane. Before the edit no edge at a
+//! vertex outside the crossed set crossed the plane, so these cover every
+//! segment and crossing point the cut depends on. A placement, plane or fill
+//! change, compaction and "everything" always recompute.
 
 use fast_mesh_query::{Fill, Gap2, Plane, Slice, contour_gap, contour_length, signed_area};
-use fast_mesh_store::{ChangeSet, StoreError, TriangleId, VertexId};
+use fast_mesh_store::{ChangeSet, Mesh, StoreError, TriangleId, VertexId};
 
-use crate::placement::{local_to_world, world_to_local};
+use crate::placement::{Placement, local_to_world, world_to_local};
 use crate::scene::Entry;
 use crate::{MeshId, Result, Scene, SceneError, SectionId, UpdateMode};
 
@@ -165,6 +179,8 @@ struct SectionEntry {
     crossed_vertices: Vec<VertexId>,
     /// The crossed triangles, ascending without duplicates.
     crossed_triangles: Vec<TriangleId>,
+    /// The world plane of the last computation; `None` before the first.
+    plane: Option<Plane>,
 }
 
 impl SectionEntry {
@@ -176,6 +192,7 @@ impl SectionEntry {
             computed_once: false,
             crossed_vertices: Vec::new(),
             crossed_triangles: Vec::new(),
+            plane: None,
         }
     }
 }
@@ -230,9 +247,8 @@ fn unit(a: [f64; 3]) -> [f64; 3] {
 /// axes `Rᵀu` and `Rᵀv`, so that local `(u, v)` equals world `(u, v)`. The
 /// axes are re-orthonormalised: a placement's rotation is only orthonormal
 /// within `1e-6`.
-fn local_plane(entry: &Entry, plane: &Plane) -> Result<Plane> {
-    let p = &entry.placement;
-    let origin = world_to_local(p, entry.mesh.origin(), plane.origin());
+fn local_plane(p: &Placement, mesh_origin: [f64; 3], plane: &Plane) -> Result<Plane> {
+    let origin = world_to_local(p, mesh_origin, plane.origin());
     let u = unit(rotate_back(&p.rotation, plane.u()));
     let v = rotate_back(&p.rotation, plane.v());
     let d = dot(v, u);
@@ -248,7 +264,7 @@ fn compute(entry: &Entry, desc: &SectionDesc) -> Result<Computed> {
     fast_mesh_query::slice(
         &entry.mesh,
         &entry.bvh,
-        &local_plane(entry, plane)?,
+        &local_plane(p, o, plane)?,
         &mut cut,
     )?;
 
@@ -321,6 +337,63 @@ fn compute(entry: &Entry, desc: &SectionDesc) -> Result<Computed> {
         crossed_vertices,
         crossed_triangles,
     })
+}
+
+/// Whether the changes `c`, made since `se` was computed with the local
+/// plane `plane`, can alter its cut (see the module docs). `mesh` is the
+/// current mesh; its incidence index is built if needed, and failing that
+/// the answer is `true`.
+fn reaches_plane(mesh: &mut Mesh, plane: &Plane, c: &ChangeSet, se: &SectionEntry) -> bool {
+    let crossed_vertex = |v: &VertexId| se.crossed_vertices.binary_search(v).is_ok();
+    let crossed_triangle = |t: &TriangleId| se.crossed_triangles.binary_search(t).is_ok();
+    // 1 and 2: something the cut used moved or went.
+    if c.vertices_moved
+        .iter()
+        .chain(&c.vertices_removed)
+        .any(crossed_vertex)
+        || c.triangles_removed
+            .iter()
+            .chain(&c.triangles_changed)
+            .any(crossed_triangle)
+    {
+        return true;
+    }
+    // The side rule of the cut: `+` iff `s ≥ 0`, from the stored position.
+    let straddles = |mesh: &Mesh, t: TriangleId| {
+        mesh.triangle(t).is_some_and(|tri| {
+            let plus = tri.map(|v| {
+                let p = mesh.positions()[v as usize].map(f64::from);
+                plane.signed_distance(p) >= 0.0
+            });
+            plus[0] != plus[1] || plus[1] != plus[2]
+        })
+    };
+    // 4: a new or rewritten triangle crosses.
+    if c.triangles_added
+        .iter()
+        .chain(&c.triangles_changed)
+        .any(|&t| straddles(mesh, t))
+    {
+        return true;
+    }
+    // 3: a triangle around a moved or added vertex off the cut now crosses.
+    let mut off_cut = c
+        .vertices_moved
+        .iter()
+        .chain(&c.vertices_added)
+        .filter(|v| !crossed_vertex(v))
+        .peekable();
+    if off_cut.peek().is_none() {
+        return false;
+    }
+    if mesh.ensure_incidence().is_err() {
+        return true;
+    }
+    let mesh = &*mesh;
+    let Some(incidence) = mesh.incidence() else {
+        return true;
+    };
+    off_cut.any(|&v| incidence.triangles(v).iter().any(|&t| straddles(mesh, t)))
 }
 
 /// A polyline's `(u, v)` points and whether it is closed.
@@ -404,6 +477,8 @@ impl Scene {
 
     /// Moves a section's plane. Every entry of the section becomes stale
     /// (Eager ones are recomputed right away); nothing else is touched.
+    /// Computing an Eager entry needs a current BVH, so an Eager mesh whose
+    /// earlier BVH update failed has that update retried here.
     ///
     /// # Errors
     /// [`SceneError::UnknownSection`] for an unknown or removed section.
@@ -467,6 +542,8 @@ impl Scene {
 
     /// Turns a section's fill on or off. Every entry of the section becomes
     /// stale (Eager ones are recomputed right away); nothing else is touched.
+    /// As with [`Scene::set_section_plane`], an Eager mesh whose earlier BVH
+    /// update failed has that update retried.
     ///
     /// # Errors
     /// [`SceneError::UnknownSection`] for an unknown or removed section.
@@ -521,22 +598,38 @@ impl Scene {
     /// section, measured in the plane, with its points in the world; `None`
     /// when either has no contour segments. Never updates: it reads the last
     /// computed results, so for a stale entry (see [`Scene::section_status`])
-    /// it describes the scene as of that computation, and its points are
-    /// placed with the section's current plane.
+    /// it describes the scene as of that computation. A gap is only defined
+    /// within one plane: when the two results were computed with different
+    /// planes (one was updated after a plane move, the other not yet), it is
+    /// `None`; call [`Scene::update_sections`] first.
     ///
     /// # Errors
-    /// As for [`Scene::section`], for either mesh; a memory error.
+    /// As for [`Scene::section`], for either mesh;
+    /// [`SceneError::InvalidInput`] when `a` and `b` are the same mesh; a
+    /// memory error.
     pub fn section_gap(&self, id: SectionId, a: MeshId, b: MeshId) -> Result<Option<Gap>> {
         let (i, ka) = self.section_entry(id, a)?;
         let (_, kb) = self.section_entry(id, b)?;
+        if a == b {
+            return Err(SceneError::InvalidInput(
+                "a section gap needs two different meshes",
+            ));
+        }
         let s = &self.sections[i];
-        let pa = polylines(&s.entries[ka].result)?;
-        let pb = polylines(&s.entries[kb].result)?;
-        let plane = &s.desc.plane;
+        let (ea, eb) = (&s.entries[ka], &s.entries[kb]);
+        // Each side's points are in the frame of the plane it was cut with.
+        let (Some(plane_a), Some(plane_b)) = (ea.plane, eb.plane) else {
+            return Ok(None);
+        };
+        if plane_a != plane_b {
+            return Ok(None);
+        }
+        let pa = polylines(&ea.result)?;
+        let pb = polylines(&eb.result)?;
         Ok(contour_gap(&pa, &pb)?.map(|g: Gap2| Gap {
             distance: g.distance,
-            a: plane.from_uv(g.a),
-            b: plane.from_uv(g.b),
+            a: plane_a.from_uv(g.a),
+            b: plane_b.from_uv(g.b),
         }))
     }
 
@@ -587,6 +680,47 @@ impl Scene {
                 .is_some_and(SectionHook::is_clean)
     }
 
+    /// Clears the pending changes of entry `k` of section `i` when they
+    /// cannot reach its plane (see the module docs), which leaves the entry
+    /// current with nothing recomputed or reported. Returns whether it did.
+    fn settle_entry(&mut self, i: usize, k: usize) -> bool {
+        let s = &self.sections[i];
+        let se = &s.entries[k];
+        if se.stale || !se.computed_once {
+            return false;
+        }
+        let Some(Entry {
+            mesh,
+            placement,
+            section_hooks,
+            ..
+        }) = self.entries.get_mut(se.mesh)
+        else {
+            return false;
+        };
+        let Some(h) = section_hooks.iter_mut().find(|h| h.section == s.id) else {
+            return false;
+        };
+        if h.placement_changed {
+            return false;
+        }
+        let Some(c) = &h.changes else {
+            return false;
+        };
+        if !c.is_empty() {
+            // The local plane the computation used: the plane, the placement
+            // and the mesh's origin are all unchanged since.
+            let Ok(plane) = local_plane(placement, mesh.origin(), &s.desc.plane) else {
+                return false;
+            };
+            if reaches_plane(mesh, &plane, c, se) {
+                return false;
+            }
+        }
+        *h = SectionHook::new(s.id);
+        true
+    }
+
     /// Stales every entry of section `i`, then computes the Eager ones.
     fn restale_section(&mut self, i: usize) {
         for se in &mut self.sections[i].entries {
@@ -609,8 +743,9 @@ impl Scene {
     }
 
     /// Computes the stale entries whose mesh's mode passes `want` and (with
-    /// `touched`) is one of those meshes. Returns the first error; every
-    /// entry is attempted.
+    /// `touched`) is one of those meshes. Entries of those meshes whose
+    /// changes cannot reach the plane are settled first, whatever the mode.
+    /// Returns the first error; every entry is attempted.
     pub(crate) fn run_sections(
         &mut self,
         want: impl Fn(UpdateMode) -> bool,
@@ -623,8 +758,11 @@ impl Scene {
                 if touched.is_some_and(|t| !t.contains(&mesh)) {
                     continue;
                 }
+                if self.entry_current(i, k) || self.settle_entry(i, k) {
+                    continue;
+                }
                 let Ok(e) = self.entry(mesh) else { continue };
-                if !want(e.mode) || self.entry_current(i, k) {
+                if !want(e.mode) {
                     continue;
                 }
                 let r = self.compute_entry(i, k);
@@ -658,12 +796,19 @@ impl Scene {
     }
 
     /// Recomputes entry `k` of section `i` in full, and reports it when the
-    /// result changed or was never computed. All or nothing: on error the
-    /// entry and its pending changes stay as they were.
+    /// result changed or was never computed. The mesh's BVH is brought up
+    /// to date first under the query rules: a non-Manual one is updated, a
+    /// stale Manual one fails with [`SceneError::StaleBvh`]. All or nothing:
+    /// on error the entry and its pending changes stay as they were.
     fn compute_entry(&mut self, i: usize, k: usize) -> Result<()> {
         let mesh = self.sections[i].entries[k].mesh;
-        self.prepare(Some(&[mesh]))?;
-        let c = compute(self.entry(mesh)?, &self.sections[i].desc)?;
+        let e = self.entries.get_mut(mesh).ok_or(SceneError::UnknownMesh)?;
+        if e.mode != UpdateMode::Manual {
+            e.update_bvh()?;
+        } else if !e.is_current() {
+            return Err(SceneError::StaleBvh(mesh));
+        }
+        let c = compute(e, &self.sections[i].desc)?;
         #[cfg(test)]
         {
             self.section_recomputes += 1;
@@ -676,9 +821,9 @@ impl Scene {
         se.result = c.result;
         se.crossed_vertices = c.crossed_vertices;
         se.crossed_triangles = c.crossed_triangles;
+        se.plane = Some(s.desc.plane);
         se.stale = false;
         se.computed_once = true;
-        let e = self.entries.get_mut(mesh).ok_or(SceneError::UnknownMesh)?;
         e.reset_section_hook(id);
         if changed {
             e.report_section(id);
@@ -1410,6 +1555,194 @@ mod tests {
         assert_eq!(scene.is_current(m), Ok(true));
         assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
         assert_fresh(&mut scene, id, m, "retried");
+    }
+
+    /// The id of vertex `j` of ring `i` of a UV sphere with `slices` slices.
+    fn ring(slices: u32, i: u32, j: u32) -> VertexId {
+        1 + (i - 1) * slices + j % slices
+    }
+
+    /// A 64 x 128 unit sphere in `mode`, cut at z = 0.3, its add and first
+    /// computation taken.
+    fn fine_sphere_cut(mode: UpdateMode) -> (Scene, MeshId, SectionId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene
+            .add_mesh(sphere(64, 128, 1.0, [0.0; 3]), with_mode(mode))
+            .unwrap();
+        let id = scene.add_section(desc(z_plane(0.3), &[m], true)).unwrap();
+        scene.update_sections().unwrap();
+        scene.take_changes();
+        (scene, m, id)
+    }
+
+    fn crossed(scene: &Scene, id: SectionId) -> (Vec<VertexId>, Vec<TriangleId>) {
+        let se = &scene.sections[scene.section_index(id).unwrap()].entries[0];
+        (se.crossed_vertices.clone(), se.crossed_triangles.clone())
+    }
+
+    fn nudge(scene: &mut Scene, m: MeshId, v: VertexId, d: [f32; 3]) {
+        scene
+            .edit(m, |tx| {
+                let p = tx.mesh().position(v).unwrap();
+                tx.set_positions(&[v], &[std::array::from_fn(|k| p[k] + d[k])])
+            })
+            .unwrap();
+    }
+
+    /// The triangle with exactly the vertices `tri`, in that winding.
+    fn find_triangle(scene: &Scene, m: MeshId, tri: [VertexId; 3]) -> TriangleId {
+        let mesh = scene.mesh(m).unwrap();
+        (0..mesh.triangle_slots() as TriangleId)
+            .find(|&t| mesh.triangle(t) == Some(tri))
+            .unwrap()
+    }
+
+    /// Flips the diagonal of the quad of rings `i`, `i + 1` at slice `j`.
+    fn flip_quad(scene: &mut Scene, m: MeshId, slices: u32, i: u32, j: u32) -> [TriangleId; 2] {
+        let (a, b, c, d) = (
+            ring(slices, i, j),
+            ring(slices, i + 1, j),
+            ring(slices, i + 1, j + 1),
+            ring(slices, i, j + 1),
+        );
+        let t = [
+            find_triangle(scene, m, [a, b, c]),
+            find_triangle(scene, m, [a, c, d]),
+        ];
+        scene
+            .edit(m, |tx| tx.set_triangles(&t, &[[a, b, d], [b, c, d]]))
+            .unwrap();
+        t
+    }
+
+    #[test]
+    fn far_edit_does_not_recompute() {
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy, UpdateMode::Manual] {
+            let (mut scene, m, id) = fine_sphere_cut(mode);
+            let before = scene.section(id, m).unwrap().clone();
+            let n = scene.section_recomputes;
+            // Ring 55 sits at z = -0.904.
+            let v = ring(128, 55, 7);
+            assert!(scene.mesh(m).unwrap().position(v).unwrap()[2] < -0.9);
+            nudge(&mut scene, m, v, [0.0, 0.0, 0.01]);
+            // A far edge flip and a far triangle removal.
+            flip_quad(&mut scene, m, 128, 50, 3);
+            let t = find_triangle(&scene, m, [0, ring(128, 1, 9), ring(128, 1, 10)]);
+            scene.edit(m, |tx| tx.remove_triangles(&[t])).unwrap();
+            assert_eq!(
+                scene.section_status(id, m),
+                Ok(SectionStatus::Current),
+                "{mode:?}"
+            );
+            scene.update_sections().unwrap();
+            scene.flush().unwrap();
+            assert_eq!(scene.section_recomputes, n, "{mode:?}");
+            assert_eq!(scene.section(id, m), Ok(&before));
+            let ch = scene.take_changes();
+            assert_eq!(of(&ch, m), [], "{mode:?}");
+            if mode == UpdateMode::Manual {
+                scene.update(m).unwrap();
+            }
+            assert_fresh(&mut scene, id, m, &format!("{mode:?} far"));
+        }
+    }
+
+    #[test]
+    fn edit_touching_plane_recomputes() {
+        let (mut scene, m, id) = fine_sphere_cut(UpdateMode::Eager);
+        let n = scene.section_recomputes;
+        let (cv, _) = crossed(&scene, id);
+        nudge(&mut scene, m, cv[cv.len() / 2], [0.0, 0.0, 0.004]);
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_eq!(of(&scene.take_changes(), m), [id]);
+        assert_fresh(&mut scene, id, m, "touching");
+    }
+
+    #[test]
+    fn vertex_moved_across_plane_recomputes() {
+        let (mut scene, m, id) = fine_sphere_cut(UpdateMode::Eager);
+        let n = scene.section_recomputes;
+        // Ring 27 sits at z = 0.243, below the crossed rings 25 and 26.
+        let v = ring(128, 27, 40);
+        let (cv, _) = crossed(&scene, id);
+        assert!(cv.binary_search(&v).is_err());
+        let p = scene.mesh(m).unwrap().position(v).unwrap();
+        assert!((p[2] - 0.25).abs() < 0.01, "{p:?}");
+        scene
+            .edit(m, |tx| tx.set_positions(&[v], &[[p[0], p[1], 0.35]]))
+            .unwrap();
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_eq!(of(&scene.take_changes(), m), [id]);
+        assert_fresh(&mut scene, id, m, "across");
+    }
+
+    #[test]
+    fn edge_flip_near_plane_recomputes() {
+        let (mut scene, m, id) = fine_sphere_cut(UpdateMode::Lazy);
+        let n = scene.section_recomputes;
+        let before = scene.section(id, m).unwrap().clone();
+        let (_, ct) = crossed(&scene, id);
+        // The quad between the crossed rings 25 and 26.
+        let t = flip_quad(&mut scene, m, 128, 25, 11);
+        assert!(t.iter().all(|t| ct.binary_search(t).is_ok()));
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_ne!(scene.section(id, m), Ok(&before));
+        assert_eq!(of(&scene.take_changes(), m), [id]);
+        assert_fresh(&mut scene, id, m, "flip");
+    }
+
+    #[test]
+    fn far_triangles_added_and_vertices_added_do_not_recompute() {
+        let (mut scene, m, id) = fine_sphere_cut(UpdateMode::Eager);
+        let n = scene.section_recomputes;
+        let (p, q) = (ring(128, 60, 0), ring(128, 60, 1));
+        scene
+            .edit(m, |tx| {
+                let v = tx.add_vertices(&[[0.1, 0.1, -0.95]])?[0];
+                tx.add_triangles(&[[v, p, q]])
+            })
+            .unwrap();
+        assert_eq!(scene.section_recomputes, n);
+        // A new triangle crossing the plane does recompute.
+        scene
+            .edit(m, |tx| {
+                let v = tx.add_vertices(&[[0.0, 0.0, 0.9]])?[0];
+                tx.add_triangles(&[[v, p, q]])
+            })
+            .unwrap();
+        assert_eq!(scene.section_recomputes, n + 1);
+        assert_fresh(&mut scene, id, m, "added");
+    }
+
+    #[test]
+    fn gap_needs_two_meshes_and_one_plane() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let opts = MeshOptions {
+            placement: at(3.0, 0.0, 0.0),
+            mode: UpdateMode::Lazy,
+            ..MeshOptions::default()
+        };
+        let b = scene.add_mesh(unit_sphere(), opts).unwrap();
+        let id = scene
+            .add_section(desc(z_plane(0.0), &[a, b], false))
+            .unwrap();
+        assert!(matches!(
+            scene.section_gap(id, a, a),
+            Err(SceneError::InvalidInput(_))
+        ));
+        scene.update_sections().unwrap();
+        assert!(scene.section_gap(id, a, b).unwrap().is_some());
+        // a (Eager) is cut at the new plane, b (Lazy) still at the old one.
+        scene.set_section_plane(id, z_plane(0.1)).unwrap();
+        assert_eq!(scene.section_gap(id, a, b), Ok(None));
+        scene.update_sections().unwrap();
+        let g = scene.section_gap(id, a, b).unwrap().unwrap();
+        assert!((g.a[2] - 0.1).abs() < 1e-9 && (g.b[2] - 0.1).abs() < 1e-9);
     }
 
     #[test]

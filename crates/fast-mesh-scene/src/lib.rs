@@ -78,7 +78,7 @@ pub use error::{Result, SceneError};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
 };
-pub use fast_mesh_query::Plane;
+pub use fast_mesh_query::{Fill, Plane};
 pub use fields::{Coloring, DistanceField, FieldStatus};
 pub use id::MeshId;
 pub use placement::Placement;
