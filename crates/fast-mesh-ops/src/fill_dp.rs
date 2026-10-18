@@ -11,7 +11,7 @@ use fast_mesh_store::{Mesh, StoreError, VertexId};
 
 use crate::fill::FailReason;
 use crate::topology::{EdgeMap, cross, dot, point, sub};
-use crate::{OpsError, Result, filled, reserve};
+use crate::{OpsError, Result, filled, push, reserve};
 
 const NONE: u32 = u32::MAX;
 
@@ -232,6 +232,10 @@ fn liepa(
         if k - i < 2 {
             continue;
         }
+        // Chosen only when every alternative was forbidden.
+        if normal[i * n + k] == [0.0; 3] {
+            return Ok(Err(FailReason::NoValidTriangulation));
+        }
         let m = apex[i * n + k] as usize;
         out.push([v[k], v[m], v[i]]);
         stack.push((m, k));
@@ -273,6 +277,56 @@ fn smallest_eigenvector(mut a: [[f64; 3]; 3]) -> [f64; 3] {
         .min_by(|&i, &j| a[i][i].total_cmp(&a[j][j]))
         .expect("three eigenvalues");
     [v[0][i], v[1][i], v[2][i]]
+}
+
+/// `tris` (counter-clockwise, numbering the `n` loop points) with the loop
+/// points that no triangle uses put back. Where a triangle `x, y, c` has an
+/// edge `x -> y` over a run of unused points `d1 .. dk` (the loop between `x`
+/// and `y`, forward), those points lie on that edge, and the triangle becomes
+/// the fan `x d1 c`, `d1 d2 c`, ..., `dk y c`, keeping its winding.
+fn restore_dropped(n: usize, tris: &[[u32; 3]]) -> Result<Vec<[u32; 3]>> {
+    let mut used = filled(n, false)?;
+    for t in tris {
+        for &i in t {
+            used[i as usize] = true;
+        }
+    }
+    let mut work = Vec::new();
+    reserve(&mut work, tris.len())?;
+    work.extend_from_slice(tris);
+    let mut out = Vec::new();
+    reserve(&mut out, n.saturating_sub(2).max(tris.len()))?;
+    let next = |i: u32| ((i as usize + 1) % n) as u32;
+    while let Some(t) = work.pop() {
+        let run = (0..3).find(|&e| {
+            let (x, y) = (t[e], t[(e + 1) % 3]);
+            let mut d = next(x);
+            if d == y {
+                return false;
+            }
+            while d != y {
+                if used[d as usize] {
+                    return false;
+                }
+                d = next(d);
+            }
+            true
+        });
+        let Some(e) = run else {
+            push(&mut out, t)?;
+            continue;
+        };
+        let (x, y, c) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
+        let (mut prev, mut d) = (x, next(x));
+        while d != y {
+            push(&mut work, [prev, d, c])?;
+            used[d as usize] = true;
+            prev = d;
+            d = next(d);
+        }
+        push(&mut work, [prev, y, c])?;
+    }
+    Ok(out)
 }
 
 /// Twice the signed area of the 2D triangle `a, b, c`.
@@ -359,20 +413,26 @@ fn projected(
         return Ok(Err(FailReason::ProjectionFolds));
     }
     // A simple polygon is tiled exactly by counter-clockwise triangles.
-    let mut tiled = 0.0;
-    for t in &tris {
-        let [a, b, c] = t.map(|i| flat_loop[i as usize]);
-        let area = orient2d(a, b, c);
-        if area.is_nan() || area <= 0.0 {
-            return Ok(Err(FailReason::ProjectionFolds));
+    let tiles = |tris: &[[u32; 3]]| {
+        let mut tiled = 0.0;
+        for t in tris {
+            let [a, b, c] = t.map(|i| flat_loop[i as usize]);
+            let area = orient2d(a, b, c);
+            if area.is_nan() || area <= 0.0 {
+                return false;
+            }
+            tiled += area;
         }
-        tiled += area;
-    }
-    if tiled.is_nan() || (tiled - polygon_area).abs() > 1e-9 * polygon_area {
+        (tiled - polygon_area).abs() <= 1e-9 * polygon_area
+    };
+    if !tiles(&tris) {
         return Ok(Err(FailReason::ProjectionFolds));
     }
-    // Collinear or coincident points left out of every triangle leave a gap.
-    if tris.len() != n - 2 {
+    // Collinear points left out of every triangle go back in. The result
+    // must still tile the polygon, with `n - 2` triangles; coincident points
+    // give triangles without area and fail here.
+    let tris = restore_dropped(n, &tris)?;
+    if tris.len() != n - 2 || !tiles(&tris) {
         return Ok(Err(FailReason::NoValidTriangulation));
     }
     let mut out = Vec::new();
@@ -400,6 +460,32 @@ fn projected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_collinear_points_are_put_back() {
+        // A square 0, 2, 4, 6 with midpoints 1, 3, 5, 7, clipped as if the
+        // midpoints had been dropped.
+        let p = [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [1.0, 2.0],
+            [0.0, 2.0],
+            [0.0, 1.0],
+        ];
+        let tris = restore_dropped(8, &[[0, 2, 4], [0, 4, 6]]).unwrap();
+        assert_eq!(tris.len(), 6);
+        let mut doubled = 0.0;
+        for t in &tris {
+            let area = orient2d(p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]);
+            assert!(area > 0.0, "{t:?}");
+            doubled += area;
+        }
+        assert_eq!(doubled, 8.0);
+        assert!((0..8).all(|i| tris.iter().any(|t| t.contains(&i))));
+    }
 
     #[test]
     fn jacobi_finds_the_smallest_axis() {

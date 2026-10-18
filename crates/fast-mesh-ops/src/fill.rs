@@ -32,6 +32,7 @@ pub struct FillOptions {
     pub fair: bool,
     /// Loops with more edges than this are triangulated by projection onto
     /// their best-fit plane instead of the `O(n³)` minimum-weight search.
+    /// Below 3, every loop goes to the projection.
     pub dp_limit: usize,
 }
 
@@ -205,9 +206,7 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
             push(&mut report.failed, (l.id, FailReason::NoValidTriangulation))?;
             continue;
         }
-        reserve(&mut chords, new_chords.len())?;
-        chords.extend_from_slice(&new_chords);
-        chords.sort_unstable();
+        merge_sorted(&mut chords, &new_chords)?;
         reserve(&mut patch, tris.len())?;
         patch.extend_from_slice(&tris);
         push(
@@ -224,6 +223,29 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
         tx.add_triangles(&patch)?;
     }
     Ok(report)
+}
+
+/// Merges the sorted `extra` into the sorted `into`, from the back.
+fn merge_sorted(
+    into: &mut Vec<(VertexId, VertexId)>,
+    extra: &[(VertexId, VertexId)],
+) -> Result<()> {
+    reserve(into, extra.len())?;
+    let (mut i, mut j) = (into.len(), extra.len());
+    into.extend_from_slice(extra);
+    for k in (0..into.len()).rev() {
+        if j == 0 {
+            break;
+        }
+        if i > 0 && into[i - 1] > extra[j - 1] {
+            into[k] = into[i - 1];
+            i -= 1;
+        } else {
+            into[k] = extra[j - 1];
+            j -= 1;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `l` meets every bound of `options` that is set.
@@ -587,16 +609,82 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_order() {
+        let mut v = vec![(1, 2), (3, 4), (7, 8)];
+        merge_sorted(&mut v, &[(0, 1), (3, 5), (9, 9)]).unwrap();
+        assert_eq!(v, [(0, 1), (1, 2), (3, 4), (3, 5), (7, 8), (9, 9)]);
+        merge_sorted(&mut v, &[]).unwrap();
+        assert_eq!(v.len(), 6);
+    }
+
+    #[test]
+    fn collinear_hole_filled_by_projection() {
+        // An 8-edge square hole with a collinear midpoint on each side.
+        let mut mesh = grid_without(4, &[(1, 1), (2, 1), (1, 2), (2, 2)]);
+        let options = FillOptions {
+            max_edges: Some(8),
+            dp_limit: 3,
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.failed, vec![]);
+        assert_eq!(r.filled.len(), 1);
+        assert_eq!(r.filled[0].triangles_added, 6);
+        assert_sound(&mesh, 1);
+    }
+
+    #[test]
+    fn large_flat_grid_hole_filled_at_default_limit() {
+        // A square hole of 53 x 53 cells: 212 edges, mostly collinear.
+        let cells: Vec<(u32, u32)> = (4..57).flat_map(|y| (4..57).map(move |x| (x, y))).collect();
+        let mut mesh = grid_without(60, &cells);
+        let options = FillOptions {
+            max_edges: Some(220),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.failed, vec![]);
+        assert_eq!(r.filled.len(), 1);
+        assert_eq!(r.filled[0].triangles_added, 210);
+        assert_sound(&mesh, 1);
+    }
+
+    #[test]
+    fn degenerate_only_triangulation_fails() {
+        // A three-vertex loop a -> c -> b on collinear a, b, c: its only
+        // triangle has no area.
+        let positions = [
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, -1.0, 0.0,
+        ];
+        let mut mesh = mesh_of(&positions, &[[0, 2, 3], [0, 4, 1], [1, 4, 2]]);
+        let loops = boundary_loops(&mesh).unwrap();
+        let sliver = loops.iter().find(|l| l.vertices == [0, 2, 1]).unwrap();
+        let options = FillOptions {
+            loops: Some(vec![sliver.id]),
+            allow_unclean: true,
+            ..unfaired()
+        };
+        let (r, empty) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert!(empty);
+        assert_eq!(
+            r.failed,
+            vec![(sliver.id, FailReason::NoValidTriangulation)]
+        );
+    }
+
+    #[test]
     fn out_of_memory_is_reported_and_writes_nothing() {
         let options = FillOptions {
             max_edges: Some(4),
             ..unfaired()
         };
         assert!(sweep(bowtie_holes(), |tx| fill_holes(tx, &options).map(drop)) > 5);
+        // The projection path.
         let options = FillOptions {
             max_perimeter: Some(7.0),
+            dp_limit: 8,
             ..unfaired()
         };
-        assert!(sweep(wobbly_annulus(400), |tx| fill_holes(tx, &options).map(drop)) > 5);
+        assert!(sweep(wobbly_annulus(64), |tx| fill_holes(tx, &options).map(drop)) > 5);
     }
 }
