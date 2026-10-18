@@ -26,8 +26,8 @@ pub struct WeldReport {
 /// group keeps its smallest id at its original position. Triangles are
 /// rewritten to the kept ids, those that thereby get a repeated id are
 /// removed, and so are all vertices no triangle uses afterwards, including
-/// ones that were unused before. Tolerance 0 merges exact duplicates only. No
-/// vertex is created.
+/// ones that were unused before. Tolerance 0 merges exact duplicates only. A
+/// vertex with a non-finite coordinate is never merged. No vertex is created.
 ///
 /// Rewiring can make two triangles share a vertex set, or give an edge a
 /// third triangle; run [`remove_degenerate()`] afterwards to drop duplicates.
