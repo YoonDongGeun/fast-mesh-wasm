@@ -1,7 +1,9 @@
 // The part of a scene the renderer adapters (`fast-mesh-wasm/three`, ...) depend
 // on. `Scene` implements it; so can any other host that mirrors a scene
 // (for example one running in a Worker). Handles stay opaque: adapters only
-// pass them back to these methods.
+// pass them back to these methods. A host other than `Scene` hands out
+// instances of the same nominal classes (`new MeshHandle()`,
+// `new SectionHandle()`) and keeps its own map from them to its ids.
 import type { Placement } from "./api.js";
 import type { MeshViews } from "./views.js";
 import type {
@@ -19,9 +21,11 @@ import type {
  */
 export interface SceneLike {
   /**
-   * Views of the mesh's render buffers. Slot counts follow from them:
-   * `positions().length / 3` vertex slots and `indices().length / 3`
-   * triangle slots.
+   * Views of the mesh's render buffers. Slot counts follow from them, so
+   * `positions()` must be exactly 3 × vertex slots long and `indices()`
+   * exactly 3 × triangle slots long (normals 3 and colours 4 per vertex slot,
+   * when present): `positions().length / 3` vertex slots and
+   * `indices().length / 3` triangle slots.
    */
   views(mesh: MeshHandle): MeshViews;
   /** The column-major world matrix of the mesh's local render coordinates. */

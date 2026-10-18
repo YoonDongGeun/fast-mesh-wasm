@@ -1,7 +1,14 @@
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
-  entry: { web: "src/web.ts", node: "src/node.ts", three: "src/three/index.ts" },
+  entry: {
+    web: "src/web.ts",
+    node: "src/node.ts",
+    three: "src/three/index.ts",
+    // Internal (not in `exports`): the Worker-side engine, for the browser
+    // Worker script and the Node `worker_threads` test harness.
+    "worker-engine": "src/worker/engine.ts",
+  },
   format: "esm",
   platform: "neutral",
   dts: true,

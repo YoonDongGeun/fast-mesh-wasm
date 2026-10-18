@@ -4,8 +4,8 @@
 // panic poisoning).
 import type { Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
-import type { SceneLike } from "./scene-like.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
+import type { SceneLike } from "./scene-like.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
