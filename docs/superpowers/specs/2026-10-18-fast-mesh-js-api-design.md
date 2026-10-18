@@ -203,7 +203,7 @@ Each part gets its own plan.
   - `added`, `removed`, `placementChanged`, `capacityChanged`: booleans
   - `positions`, `normals`, `colors`, `indices`: `Range[] | "all"`, where `Range = [start, count]` in elements (vertices or triangles)
   - `fieldsChanged: FieldHandle[]` and `sectionsChanged: SectionHandle[]`
-- **`capacityChanged`** is true when `vertexSlots` or `triangleSlots` changed since the last call. Renderers then recreate their GPU buffers and upload everything.
+- **`capacityChanged`** is true when `vertexSlots` or `triangleSlots` changed since the last call. Renderers then recreate their GPU buffers and upload everything: every buffer of that record is reported as `"all"`.
 - **Single consumer:** there is one change consumer per JS scene *(my call: adapters share it through a small fan-out helper, `scene.onChanges(listener)`, which drains on `scene.commitFrame()`)*.
   - `commitFrame()` calls `takeChanges()` once and delivers the result to every listener.
   - Apps call it once per animation frame, and the adapters require it.

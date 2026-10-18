@@ -15,7 +15,8 @@
 //!    - `2` removed
 //!    - `4` placement changed
 //!    - `8` capacity changed (vertex or triangle slot count differs from
-//!      the previous record of the mesh)
+//!      the previous record of the mesh); every buffer is then "all", since
+//!      the GPU buffers must be recreated and filled again
 //!    - `16` positions all
 //!    - `32` normals all
 //!    - `64` colours all
@@ -69,6 +70,7 @@ pub(crate) struct Dirty {
     /// Triangle slots.
     pub indices: Option<Vec<u32>>,
     /// The vertex or triangle slot count changed since the previous report.
+    /// Every list is then `None`.
     pub capacity_changed: bool,
 }
 
@@ -150,7 +152,8 @@ impl RenderState {
     /// for added, removed and rewritten triangles, normals and colours as
     /// the report says. Every set is clamped to its buffer's current length.
     /// A `None` change set makes positions and indices "all"; normals are
-    /// also "all" when their buffer length changed.
+    /// also "all" when their buffer length changed. A slot count change
+    /// makes every buffer "all".
     ///
     /// # Errors
     /// [`StoreError::OutOfMemory`]. The state is then unchanged, apart from
@@ -174,6 +177,14 @@ impl RenderState {
         normals_len: usize,
     ) -> Result<Dirty, StoreError> {
         let (vs, ts) = (mesh.vertex_slots(), mesh.triangle_slots());
+        let capacity_changed = vs != self.vertex_slots || ts != self.triangle_slots;
+        if capacity_changed {
+            // New GPU buffers: the adapter uploads everything anyway.
+            self.vertex_slots = vs;
+            self.triangle_slots = ts;
+            self.normals_len = normals_len;
+            return Ok(Dirty::all());
+        }
         let set = changes.changes.as_ref().filter(|_| !self.stale);
         // Every allocation comes first, so a failure changes nothing.
         let positions = match set {
@@ -204,16 +215,13 @@ impl RenderState {
             Some(c) if !self.stale => Some(slots(&[c], vs)?),
             _ => None,
         };
-        let capacity_changed = vs != self.vertex_slots || ts != self.triangle_slots;
-        self.vertex_slots = vs;
-        self.triangle_slots = ts;
         self.normals_len = normals_len;
         Ok(Dirty {
             positions,
             normals,
             colors,
             indices,
-            capacity_changed,
+            capacity_changed: false,
         })
     }
 }
@@ -246,18 +254,22 @@ pub(crate) fn encode(records: &[Record], out: &mut Vec<u32>) {
     for r in records {
         let d = &r.dirty;
         let flag = |on: bool, bit: u32| if on { bit } else { 0 };
+        // A capacity change makes every buffer "all".
+        let all = |set: &Option<Vec<u32>>| d.capacity_changed || set.is_none();
         let flags = flag(r.added, FLAG_ADDED)
             | flag(r.removed, FLAG_REMOVED)
             | flag(r.placement_changed, FLAG_PLACEMENT)
             | flag(d.capacity_changed, FLAG_CAPACITY)
-            | flag(d.positions.is_none(), FLAG_POSITIONS_ALL)
-            | flag(d.normals.is_none(), FLAG_NORMALS_ALL)
-            | flag(d.colors.is_none(), FLAG_COLORS_ALL)
-            | flag(d.indices.is_none(), FLAG_INDICES_ALL);
+            | flag(all(&d.positions), FLAG_POSITIONS_ALL)
+            | flag(all(&d.normals), FLAG_NORMALS_ALL)
+            | flag(all(&d.colors), FLAG_COLORS_ALL)
+            | flag(all(&d.indices), FLAG_INDICES_ALL);
         out.extend_from_slice(&[r.mesh_index, r.mesh_generation, flags]);
         for set in [&d.positions, &d.normals, &d.colors, &d.indices] {
+            // A capacity change sends no ranges: every buffer is "all".
             let ranges = set
                 .as_deref()
+                .filter(|_| !d.capacity_changed)
                 .map(|s| merge_ranges(s, RANGE_GAP))
                 .unwrap_or_default();
             out.push(ranges.len() as u32);
@@ -379,9 +391,8 @@ mod tests {
             })
             .unwrap();
         let d = step(&mut scene, id, &mut state);
-        assert!(d.capacity_changed);
-        assert_eq!(d.positions, Some(vec![4]));
-        assert_eq!(d.indices, Some(vec![2]));
+        // Growth means new GPU buffers: every buffer is "all".
+        assert_eq!(d, Dirty::all());
         assert_eq!(indices(&scene, id), &[0, 1, 2, 0, 2, 3, 1, 4, 2]);
 
         // Moving and removing keep the slot counts.
@@ -529,13 +540,7 @@ mod tests {
                 added: true,
                 removed: false,
                 placement_changed: true,
-                dirty: Dirty {
-                    positions: None,
-                    normals: None,
-                    colors: Some(vec![]),
-                    indices: None,
-                    capacity_changed: true,
-                },
+                dirty: Dirty::all(),
                 fields: vec![11, 12],
                 sections: vec![],
             },
@@ -574,6 +579,11 @@ mod tests {
         gappy.dirty.positions = Some(vec![1, 5]);
         encode(std::slice::from_ref(&gappy), &mut out);
         assert_eq!(decode(&out)[0].dirty.positions, Some(vec![1, 2, 3, 4, 5]));
+        // A capacity change makes every buffer "all", whatever the lists say.
+        let mut grown = records[1].clone();
+        grown.dirty.capacity_changed = true;
+        encode(std::slice::from_ref(&grown), &mut out);
+        assert_eq!(decode(&out)[0].dirty, Dirty::all());
         encode(&[], &mut out);
         assert_eq!(out, vec![0]);
     }

@@ -232,6 +232,19 @@ describe("edit", () => {
     // The renumbered mesh's edits leave the history.
     expect(s.canUndo()).toBe(false);
   });
+
+  it("growth_reports_every_buffer_all", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    s.takeChanges();
+    s.edit(m, [
+      { op: "addVertices", positions: [4, 0, 0] },
+      { op: "addTriangles", triangles: [1, { ref: [0, 0] }, 2] },
+    ]);
+    const [c] = s.takeChanges();
+    expect(c.capacityChanged).toBe(true);
+    expect([c.positions, c.normals, c.colors, c.indices]).toEqual(["all", "all", "all", "all"]);
+  });
 });
 
 /** Hemisphere with two punched holes (vertex fans removed) and two flipped triangles. */

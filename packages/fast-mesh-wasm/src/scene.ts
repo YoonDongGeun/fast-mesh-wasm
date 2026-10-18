@@ -59,7 +59,10 @@ export interface MeshChange {
   removed: boolean;
   /** Its placement changed: read {@link Scene.matrix4} again. */
   placementChanged: boolean;
-  /** Its vertex or triangle slot count changed: recreate its GPU buffers. */
+  /**
+   * Its vertex or triangle slot count changed: recreate its GPU buffers. Every
+   * buffer is then `"all"`, so upload each one whole.
+   */
   capacityChanged: boolean;
   /** Vertex slots. */
   positions: Range[] | "all";

@@ -1172,19 +1172,17 @@ mod tests {
             vec![1, i, g, 0, 1, 2, 1, 1, 0, 4, 0, 0, 0, 0]
         );
 
-        // Growth reports the capacity change; the normals buffer grew, so
-        // it is "all".
+        // Growth reports the capacity change with every buffer "all".
         s.scene
             .edit(id, |tx| {
                 let v = tx.add_vertices(&[[3., 0., 0.]])?;
                 tx.add_triangles(&[[1, v[0], 2]])
             })
             .unwrap();
-        let msg = s.take_changes();
-        assert_eq!(&msg[..4], &[1, i, g, FLAG_CAPACITY | FLAG_NORMALS_ALL]);
-        // Positions: vertex 4; normals: none listed; colours: none;
-        // indices: triangle 2.
-        assert_eq!(&msg[4..], &[1, 4, 1, 0, 0, 1, 2, 1, 0, 0]);
+        assert_eq!(
+            s.take_changes(),
+            vec![1, i, g, FLAG_CAPACITY | all, 0, 0, 0, 0, 0, 0]
+        );
 
         // A placement change only sets its flag.
         s.set_placement(i, g, &IDENTITY, &[1., 0., 0.]).unwrap();
