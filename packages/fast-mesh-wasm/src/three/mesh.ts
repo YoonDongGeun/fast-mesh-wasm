@@ -39,7 +39,8 @@ export interface BoundMesh {
    * The mesh to add to a THREE.Scene. Its geometry has `position`, `normal`
    * (when the scene mesh keeps normals), `color` (while colouring is on) and
    * an index; its `matrix` is the scene mesh's world matrix
-   * (`matrixAutoUpdate` is off).
+   * (`matrixAutoUpdate` is off). The colour attribute is normalized `Uint16`
+   * RGBA: the engine's sRGB colours converted to three's linear working space.
    */
   readonly object: THREE.Mesh;
   readonly mesh: MeshHandle;
@@ -57,16 +58,45 @@ export interface BoundMesh {
 }
 
 type Material = NonNullable<BindMeshOptions["material"]>;
-type Mirror = Float32Array | Uint8Array | Uint32Array;
+type Mirror = Float32Array | Uint8Array | Uint16Array | Uint32Array;
 
 const DEFAULT_COLOR = 0xcccccc;
 const WHITE = new THREE.Color(0xffffff);
+
+/**
+ * sRGB byte to linear, as a normalized `Uint16` (0 to 65535). The engine's
+ * colour maps are sRGB-encoded bytes; three treats vertex colours as linear
+ * working-space values and encodes its output to sRGB, so bytes passed
+ * through would be encoded twice and look washed out. Sixteen bits keep the
+ * dark tones that eight linear bits would band.
+ */
+export const SRGB_TO_LINEAR16: Uint16Array = (() => {
+  const table = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    const c = i / 255;
+    const linear = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    table[i] = Math.round(linear * 65535);
+  }
+  return table;
+})();
+
+/**
+ * Copies RGBA8 sRGB colours into the `Uint16` mirror at `at`: colour channels
+ * through {@link SRGB_TO_LINEAR16}, alpha (already linear) scaled from 255 to
+ * 65535. `at` is a multiple of 4.
+ */
+const copyColors = (mirror: Uint16Array, src: Uint8Array, at: number) => {
+  for (let i = 0; i < src.length; i++) {
+    const j = at + i;
+    mirror[j] = (j & 3) === 3 ? src[i] * 257 : SRGB_TO_LINEAR16[src[i]];
+  }
+};
 
 /** How each buffer maps to an attribute: components per element and the mirror type. */
 const BUFFERS = {
   positions: { name: "position", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   normals: { name: "normal", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
-  colors: { name: "color", itemSize: 4, normalized: true, make: (n: number) => new Uint8Array(n) },
+  colors: { name: "color", itemSize: 4, normalized: true, make: (n: number) => new Uint16Array(n) },
   indices: { name: "index", itemSize: 3, normalized: false, make: (n: number) => new Uint32Array(n) },
 } as const;
 
@@ -139,20 +169,25 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
    * Copies `view[from, to)` into `mirror`, clamped to both. A lazy mesh's
    * normals can be shorter than its slots until it is updated; the rest of the
    * mirror then keeps its data. `subarray` gives a plain typed array even for
-   * a debug-mode Proxy view.
+   * a debug-mode Proxy view. Colours are converted from sRGB to linear.
    */
-  const copy = (mirror: Mirror, view: Mirror, from: number, to: number) => {
+  const copy = (key: BufferKey, mirror: Mirror, view: Mirror, from: number, to: number) => {
     const end = Math.min(to, view.length, mirror.length);
-    if (end > from) {
-      (mirror as Float32Array).set(view.subarray(from, end) as ArrayLike<number>, from);
+    if (end <= from) {
+      return;
     }
+    if (key === "colors") {
+      copyColors(mirror as Uint16Array, view.subarray(from, end) as Uint8Array, from);
+      return;
+    }
+    (mirror as Float32Array).set(view.subarray(from, end) as ArrayLike<number>, from);
   };
 
   /** A new attribute for `key` holding the whole view, installed in the geometry. */
   const create = (key: BufferKey, view: Mirror) => {
     const spec = BUFFERS[key];
     const mirror = spec.make(lengthOf(key));
-    copy(mirror, view, 0, mirror.length);
+    copy(key, mirror, view, 0, mirror.length);
     if (key === "indices") {
       geometry.setIndex(new THREE.BufferAttribute(mirror, 1));
     } else {
@@ -263,11 +298,11 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
         // Same length: copy in place and mark the whole buffer. A range, not
         // an empty list: three uploads only the listed ranges once any exist,
         // so a later frame's ranges would otherwise drop this full update.
-        copy(mirror, view, 0, mirror.length);
+        copy(key, mirror, view, 0, mirror.length);
         attribute.addUpdateRange(0, mirror.length);
       } else {
         for (const [start, count] of dirty) {
-          copy(mirror, view, start * itemSize, (start + count) * itemSize);
+          copy(key, mirror, view, start * itemSize, (start + count) * itemSize);
           attribute.addUpdateRange(start * itemSize, count * itemSize);
         }
       }

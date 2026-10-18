@@ -100,6 +100,7 @@ requestAnimationFrame(frame);
 ```
 
 - Colouring (`scene.setColoring`) shows up as a vertex-colour attribute with no code in the app. Undo and redo move the objects through the same change stream.
+- The engine's colour maps are sRGB-encoded bytes. The adapter converts them to three's linear working space as it copies them (a normalized `Uint16` colour attribute), so they look the same as in a renderer that passes the bytes through to a non-sRGB canvas.
 - A material you pass to `bindMesh` is used as given and must not be shared between bound meshes (the adapter controls its `color`, `vertexColors`, `opacity`, `transparent` and `depthWrite`).
 - The adapter only reads `scene.onChanges`; it never calls `takeChanges`.
 

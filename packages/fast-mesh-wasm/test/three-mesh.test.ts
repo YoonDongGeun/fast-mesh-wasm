@@ -5,6 +5,7 @@ import * as THREE from "three";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { bindMesh, type BoundMesh } from "../src/three/index.js";
+import { SRGB_TO_LINEAR16 } from "../src/three/mesh.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 const QUARTER_Z = [0, -1, 0, 1, 0, 0, 0, 0, 1];
@@ -88,7 +89,18 @@ function clearRanges(b: BoundMesh) {
   }
 }
 
-/** Every attribute equals the scene's views. */
+/** An sRGB byte as linear normalized Uint16, computed independently of the adapter. */
+function linear16(byte: number): number {
+  const c = byte / 255;
+  return Math.round((c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4) * 65535);
+}
+
+/** RGBA8 sRGB colours as the adapter's Uint16 linear mirror (alpha scaled, not converted). */
+function linearColors(rgba: Uint8Array): number[] {
+  return Array.from(rgba, (byte, i) => (i % 4 === 3 ? byte * 257 : linear16(byte)));
+}
+
+/** Every attribute equals the scene's views (colours converted to linear). */
 function expectMirrorsMatch(s: Scene, m: MeshHandle, b: BoundMesh) {
   const v = s.views(m);
   expect(Array.from(attr(b, "position").array)).toEqual(Array.from(v.positions()));
@@ -102,7 +114,7 @@ function expectMirrorsMatch(s: Scene, m: MeshHandle, b: BoundMesh) {
   if (colors === null) {
     expect(attr(b, "color")).toBeUndefined();
   } else {
-    expect(Array.from(attr(b, "color").array)).toEqual(Array.from(colors));
+    expect(Array.from(attr(b, "color").array)).toEqual(linearColors(colors));
   }
   expect(Array.from(index(b).array)).toEqual(Array.from(v.indices()));
 }
@@ -202,6 +214,31 @@ describe("bindMesh", () => {
     expectMirrorsMatch(s, m, bound);
   });
 
+  it("colors_convert_srgb_to_linear", () => {
+    // The table: 128 is about 0.2158 linear; the ends are exact.
+    expect(SRGB_TO_LINEAR16[0]).toBe(0);
+    expect(SRGB_TO_LINEAR16[255]).toBe(65535);
+    expect(SRGB_TO_LINEAR16[128] / 65535).toBeCloseTo(0.21586, 4);
+    for (let b = 0; b < 256; b++) {
+      expect(SRGB_TO_LINEAR16[b]).toBe(linear16(b));
+    }
+    // A coloured mesh: every channel goes through the table, alpha is scaled.
+    const { s, m, n, bound } = setup();
+    const field = s.addDistanceField({ name: "gap", on: m, to: n, maxDistance: 3 });
+    s.setColoring(m, { field, map: "turbo", range: [0, 3] });
+    s.commitFrame();
+    const rgba = s.views(m).colors()!;
+    const color = attr(bound, "color").array as Uint16Array;
+    for (let i = 0; i < rgba.length; i++) {
+      expect(color[i]).toBe(i % 4 === 3 ? rgba[i] * 257 : SRGB_TO_LINEAR16[rgba[i]]);
+    }
+    expect(color[3]).toBe(rgba[3] * 257);
+    // A range update converts the copied range too.
+    s.setPlacement(n, { rotation: IDENTITY, translation: [0, 0, -0.5] });
+    s.commitFrame();
+    expectMirrorsMatch(s, m, bound);
+  });
+
   it("placement_updates_matrix_only", () => {
     const { s, m, bound } = setup();
     const position = attr(bound, "position");
@@ -294,7 +331,7 @@ describe("bindMesh", () => {
       s.commitFrame();
       const color = attr(bound, "color");
       expect(color).toBeInstanceOf(THREE.BufferAttribute);
-      expect(color.array).toBeInstanceOf(Uint8Array);
+      expect(color.array).toBeInstanceOf(Uint16Array);
       expect(color.itemSize).toBe(4);
       expect(color.normalized).toBe(true);
       expect(material.vertexColors).toBe(true);
