@@ -37,7 +37,7 @@ pub(crate) fn sweep(mut mesh: Mesh, mut op: impl FnMut(&mut Transaction) -> Resu
 }
 
 /// `positions` (flat `xyz`) and `triangles` as a mesh.
-fn mesh_of(positions: &[f32], triangles: &[[u32; 3]]) -> Mesh {
+pub(crate) fn mesh_of(positions: &[f32], triangles: &[[u32; 3]]) -> Mesh {
     let indices: Vec<u32> = triangles.iter().flatten().copied().collect();
     Mesh::from_buffers(positions, &indices).unwrap()
 }
@@ -158,15 +158,56 @@ pub(crate) fn grid(n: u32) -> Mesh {
 /// [`grid`]`(4)` without cells `(1, 1)` and `(2, 2)`: two square holes that
 /// share exactly one corner, vertex 12 at `(2, 2)`. All 25 vertices stay.
 pub(crate) fn bowtie_holes() -> Mesh {
+    grid_without(4, &[(1, 1), (2, 2)])
+}
+
+/// [`grid`]`(n)` without the cells in `missing`. All vertices stay.
+pub(crate) fn grid_without(n: u32, missing: &[(u32, u32)]) -> Mesh {
     let mut triangles = Vec::new();
-    for y in 0..4 {
-        for x in 0..4 {
-            if (x, y) != (1, 1) && (x, y) != (2, 2) {
-                triangles.extend(grid_cell(4, x, y));
+    for y in 0..n {
+        for x in 0..n {
+            if !missing.contains(&(x, y)) {
+                triangles.extend(grid_cell(n, x, y));
             }
         }
     }
-    mesh_of(&grid_positions(4), &triangles)
+    mesh_of(&grid_positions(n), &triangles)
+}
+
+/// A closed band of `2n` triangles between two rings of `n` vertices:
+/// vertex `i` is `inner(t_i)` and vertex `n + i` is `outer(t_i)`, with
+/// `t_i = i / n`. Quad `i` is `[i, n + i, n + i + 1]`, `[i, n + i + 1, i + 1]`
+/// (indices wrapping), counter-clockwise from `+z` for a flat ring with
+/// `inner` inside `outer`; the inner loop then runs clockwise from `+z`.
+pub(crate) fn band(
+    n: u32,
+    inner: impl Fn(f64) -> [f64; 3],
+    outer: impl Fn(f64) -> [f64; 3],
+) -> Mesh {
+    let mut positions = Vec::new();
+    for ring in [&inner as &dyn Fn(f64) -> [f64; 3], &outer] {
+        for i in 0..n {
+            positions.extend(ring(f64::from(i) / f64::from(n)).map(|c| c as f32));
+        }
+    }
+    let mut triangles = Vec::new();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        triangles.extend([[i, n + i, n + j], [i, n + j, j]]);
+    }
+    mesh_of(&positions, &triangles)
+}
+
+/// `mesh` with a closed tetrahedron on its edge `a`-`b` and two new vertices
+/// at `apex`, so that `a`-`b` gains two triangles. The tetrahedron is wound
+/// consistently with itself.
+pub(crate) fn with_tetra(mesh: &Mesh, a: u32, b: u32, apex: [[f32; 3]; 2]) -> Mesh {
+    let (mut positions, mut triangles) = parts(mesh);
+    let c = (positions.len() / 3) as u32;
+    let d = c + 1;
+    positions.extend(apex.iter().flatten());
+    triangles.extend([[a, b, c], [a, c, d], [a, d, b], [b, d, c]]);
+    mesh_of(&positions, &triangles)
 }
 
 /// A flat hexagonal patch around vertex 0 with three triangular holes that

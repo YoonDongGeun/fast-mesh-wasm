@@ -119,7 +119,6 @@ impl EdgeMap {
     }
 
     /// The kind of edge `a`-`b`, or `None` when no proper triangle uses it.
-    #[allow(dead_code, reason = "used by the repair operations of later tasks")]
     pub(crate) fn kind(&self, a: VertexId, b: VertexId) -> Option<EdgeKind> {
         self.index(a, b).map(|i| kind_of(self.at(i).len()))
     }

@@ -23,10 +23,15 @@
 //!   orientation conflicts and, given a BVH, self-intersection.
 //! - Orientation: [`orient()`] makes the winding consistent patch by patch
 //!   and turns closed components outward.
+//! - Hole filling: [`fill_holes`] closes the boundary loops chosen by size
+//!   or by id with triangle patches that agree with their neighbours' winding
+//!   and never make an edge non-manifold.
 
 mod analyze;
 mod cleanup;
 mod error;
+mod fill;
+mod fill_dp;
 mod orient;
 #[cfg(test)]
 mod test_util;
@@ -39,6 +44,7 @@ pub use cleanup::{
     remove_degenerate, remove_small_components, weld,
 };
 pub use error::{OpsError, Result};
+pub use fill::{FailReason, FillOptions, FillReport, FilledLoop, SkipReason, fill_holes};
 pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
