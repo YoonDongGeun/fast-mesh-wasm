@@ -13,8 +13,6 @@
 use std::cell::Cell;
 use std::ops::Range;
 
-use crate::StoreError;
-
 thread_local! {
     /// Set while a test fault hook is armed on this thread.
     static FORCE_SEQUENTIAL: Cell<bool> = const { Cell::new(false) };
@@ -69,32 +67,32 @@ fn go_parallel(large_enough: bool) -> bool {
 ///
 /// When several ranges fail, the error of the first one is returned, however
 /// the work was scheduled. Ranges after a known failure may be skipped. Fails
-/// with `OutOfMemory` (converted into `E`) if the result vector cannot be
-/// allocated.
+/// with `oom()` if the vectors it allocates (one or two, `len / chunk` long)
+/// cannot be allocated. Those allocations do not pass through the crates'
+/// fault-injection hooks; callers that need that coverage check their hook
+/// before calling.
 ///
 /// # Panics
 /// If `chunk` is 0.
-pub fn map_range<R: Send, E: Send + From<StoreError>>(
+pub fn map_range<R: Send, E: Send>(
     len: usize,
     chunk: usize,
     threshold: usize,
+    oom: impl Fn() -> E,
     f: impl Fn(Range<usize>) -> Result<R, E> + Sync,
 ) -> Result<Vec<R>, E> {
     assert!(chunk > 0, "chunk must be positive");
     let count = len.div_ceil(chunk);
     let range = |i: usize| i * chunk..((i + 1) * chunk).min(len);
     let mut out = Vec::new();
-    out.try_reserve_exact(count)
-        .map_err(|_| StoreError::OutOfMemory)?;
+    out.try_reserve_exact(count).map_err(|_| oom())?;
     #[cfg(feature = "parallel")]
     if go_parallel(len >= threshold && count > 1) {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let mut slots: Vec<Option<Result<R, E>>> = Vec::new();
-        slots
-            .try_reserve_exact(count)
-            .map_err(|_| StoreError::OutOfMemory)?;
+        slots.try_reserve_exact(count).map_err(|_| oom())?;
         slots.resize_with(count, || None);
         let first_error = AtomicUsize::new(usize::MAX);
         slots.par_iter_mut().enumerate().for_each(|(i, slot)| {
@@ -127,13 +125,14 @@ pub fn map_range<R: Send, E: Send + From<StoreError>>(
 }
 
 /// [`map_range`] over `items`: `f` gets each chunk's index and its items.
-pub fn map_chunks<T: Sync, R: Send, E: Send + From<StoreError>>(
+pub fn map_chunks<T: Sync, R: Send, E: Send>(
     items: &[T],
     chunk: usize,
     threshold: usize,
+    oom: impl Fn() -> E,
     f: impl Fn(usize, &[T]) -> Result<R, E> + Sync,
 ) -> Result<Vec<R>, E> {
-    map_range(items.len(), chunk, threshold, |r| {
+    map_range(items.len(), chunk, threshold, oom, |r| {
         f(r.start / chunk, &items[r])
     })
 }
@@ -178,9 +177,12 @@ pub fn with_threads<R: Send>(_threads: usize, f: impl FnOnce() -> R + Send) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StoreError;
 
     /// Thread counts every pool-dependent test runs under.
     const POOLS: [usize; 3] = [1, 2, 8];
+
+    const OOM: fn() -> StoreError = || StoreError::OutOfMemory;
 
     #[test]
     fn map_chunks_order_and_results() {
@@ -192,17 +194,17 @@ mod tests {
             .collect();
         for k in POOLS {
             let got = with_threads(k, || {
-                map_chunks(&items, 64, 0, |i, c| {
+                map_chunks(&items, 64, 0, OOM, |i, c| {
                     Ok::<_, StoreError>((i, c.iter().sum::<u64>()))
                 })
             });
             assert_eq!(got.unwrap(), expected, "{k} threads");
-            let ranges = with_threads(k, || map_range(1000, 64, 0, Ok::<_, StoreError>));
+            let ranges = with_threads(k, || map_range(1000, 64, 0, OOM, Ok));
             let want: Vec<Range<usize>> =
                 (0..16).map(|i| i * 64..(i * 64 + 64).min(1000)).collect();
             assert_eq!(ranges.unwrap(), want, "{k} threads");
         }
-        assert!(map_range(0, 8, 0, Ok::<_, StoreError>).unwrap().is_empty());
+        assert!(map_range(0, 8, 0, OOM, Ok).unwrap().is_empty());
     }
 
     #[test]
@@ -210,7 +212,7 @@ mod tests {
         let items = vec![0u8; 20 * 16];
         for k in POOLS {
             let got = with_threads(k, || {
-                map_chunks(&items, 16, 0, |i, _| {
+                map_chunks(&items, 16, 0, OOM, |i, _| {
                     if i == 7 {
                         // Give chunk 12 every chance to fail first.
                         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -231,20 +233,23 @@ mod tests {
         let items = vec![1u32; 4096];
         let sum = |_: usize, c: &[u32]| Ok::<_, StoreError>(c.iter().sum::<u32>());
         let before = parallel_entries();
-        assert_eq!(map_chunks(&items, 256, 4097, sum).unwrap().len(), 16);
-        assert_eq!(map_chunks(&items, 4096, 0, sum).unwrap(), vec![4096]);
+        assert_eq!(map_chunks(&items, 256, 4097, OOM, sum).unwrap().len(), 16);
+        assert_eq!(map_chunks(&items, 4096, 0, OOM, sum).unwrap(), vec![4096]);
         assert_eq!(join(false, || 1, || 2), (1, 2));
         assert_eq!(parallel_entries(), before);
 
         set_force_sequential(true);
         assert!(force_sequential());
-        map_chunks(&items, 256, 0, sum).unwrap();
+        map_chunks(&items, 256, 0, OOM, sum).unwrap();
         join(true, || 1, || 2);
         set_force_sequential(false);
         assert_eq!(parallel_entries(), before);
 
         // At the threshold the parallel path is taken, with the feature only.
-        assert_eq!(map_chunks(&items, 256, 4096, sum).unwrap(), vec![256; 16]);
+        assert_eq!(
+            map_chunks(&items, 256, 4096, OOM, sum).unwrap(),
+            vec![256; 16]
+        );
         assert_eq!(join(true, || 1, || 2), (1, 2));
         let entered = if enabled() { 2 } else { 0 };
         assert_eq!(parallel_entries(), before + entered);

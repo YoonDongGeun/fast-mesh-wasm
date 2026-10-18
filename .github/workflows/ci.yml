@@ -37,11 +37,17 @@ jobs:
         env:
           RAYON_NUM_THREADS: 1
       - name: rayon stays out of the default build
+        shell: bash
         run: |
-          if cargo tree --workspace -e normal,build --prefix none | grep -q '^rayon'; then
-            echo "rayon is a dependency without the parallel feature"
-            exit 1
-          fi
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu wasm32-unknown-unknown; do
+            # Captured first, so a failing `cargo tree` fails the step.
+            deps=$(cargo tree --workspace -e normal,build --prefix none --target "$target")
+            if grep -q '^rayon' <<<"$deps"; then
+              echo "rayon is a dependency without the parallel feature ($target)"
+              exit 1
+            fi
+          done
       # The package job builds the scene crate for wasm through fast-mesh-wasm;
       # these also build the engine crates on their own (own feature sets).
       - run: cargo build --release --target wasm32-unknown-unknown -p fast-mesh-scene

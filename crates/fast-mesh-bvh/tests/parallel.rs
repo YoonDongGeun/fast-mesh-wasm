@@ -78,7 +78,9 @@ fn build_bit_identical() {
     let mesh = wavy(317);
     assert!(mesh.triangle_count() >= 200_000);
     // Golden hashes of the sequential trees: the same with and without the
-    // feature, so a feature-off run checks the feature-on result too.
+    // feature, so a feature-off run checks the feature-on result too. They pin
+    // the exact build algorithm: regenerate them (from a feature-off run)
+    // whenever the builder's splits, reductions or layout change on purpose.
     for (quality, golden) in [
         (Quality::Sah, 10369004575951647529u64),
         (Quality::Fast, 5049794685599701823),

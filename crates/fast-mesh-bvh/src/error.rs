@@ -57,8 +57,10 @@ pub(crate) fn fail_allocations_after(n: Option<usize>) {
     fast_mesh_store::par::set_force_sequential(n.is_some());
 }
 
+/// Checks the test fault hook; counts as one allocation. Always succeeds
+/// outside tests.
 #[cfg(test)]
-fn allocation_allowed() -> Result<()> {
+pub(crate) fn allocation_allowed() -> Result<()> {
     ALLOCATIONS_LEFT.with(|c| match c.get() {
         Some(0) => Err(BvhError::OutOfMemory),
         Some(n) => {
@@ -70,7 +72,7 @@ fn allocation_allowed() -> Result<()> {
 }
 
 #[cfg(not(test))]
-fn allocation_allowed() -> Result<()> {
+pub(crate) fn allocation_allowed() -> Result<()> {
     Ok(())
 }
 
