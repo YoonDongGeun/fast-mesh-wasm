@@ -130,8 +130,8 @@ impl Mesh {
 
     /// Builds a mesh from double-precision positions. The origin is set to the center
     /// of the bounding box and positions are stored as `f32` offsets from it, which
-    /// keeps precision for coordinates far from zero. Every coordinate, and the
-    /// computed origin, must be finite.
+    /// keeps precision for coordinates far from zero. Every coordinate, the
+    /// computed origin and every offset (as an `f32`) must be finite.
     pub fn from_buffers_f64(positions: &[f64], indices: &[u32]) -> Result<Self> {
         if !positions.len().is_multiple_of(3) {
             return Err(StoreError::InvalidArgument(
@@ -155,12 +155,42 @@ impl Mesh {
         } else {
             [0, 1, 2].map(|k| (min[k] + max[k]) * 0.5)
         };
+        Self::with_origin_checked(positions, indices, origin)
+    }
+
+    /// Builds a mesh from double-precision positions relative to a given origin:
+    /// positions are stored as `(p - origin)` in `f32`. Every coordinate, the
+    /// origin and every offset (as an `f32`) must be finite.
+    pub fn from_buffers_f64_with_origin(
+        positions: &[f64],
+        indices: &[u32],
+        origin: [f64; 3],
+    ) -> Result<Self> {
+        if !positions.len().is_multiple_of(3) {
+            return Err(StoreError::InvalidArgument(
+                "positions length must be a multiple of 3",
+            ));
+        }
+        if !positions.iter().all(|x| x.is_finite()) {
+            return Err(StoreError::InvalidArgument("positions must be finite"));
+        }
+        Self::with_origin_checked(positions, indices, origin)
+    }
+
+    /// Shared tail of the `f64` constructors; `positions` is already validated.
+    /// Offsets from the origin too large for an `f32` are rejected like
+    /// non-finite input.
+    fn with_origin_checked(positions: &[f64], indices: &[u32], origin: [f64; 3]) -> Result<Self> {
+        let not_finite = StoreError::InvalidArgument("positions must be finite");
         if !origin.iter().all(|x| x.is_finite()) {
             return Err(not_finite);
         }
         let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
         for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
             *p = [0, 1, 2].map(|k| (c[k] - origin[k]) as f32);
+            if !p.iter().all(|x| x.is_finite()) {
+                return Err(not_finite);
+            }
         }
         Self::build(origin, points, indices)
     }
@@ -480,6 +510,56 @@ mod tests {
         // Finite input whose bounding-box center overflows.
         assert_eq!(
             Mesh::from_buffers_f64(&[f64::MAX, 0., 0., f64::MAX, 0., 0.], &[]).err(),
+            Some(bad)
+        );
+    }
+
+    #[test]
+    fn explicit_origin_stores_offsets() {
+        let o = [1.0e6; 3];
+        let offsets = [[0.25, -0.5, 1.0], [-3.0, 2.125, 0.0], [10.0, 0.0, -7.5]];
+        let flat: Vec<f64> = offsets
+            .iter()
+            .flat_map(|d| [0, 1, 2].map(|k| o[k] + d[k]))
+            .collect();
+        let m = Mesh::from_buffers_f64_with_origin(&flat, &[0, 1, 2], o).unwrap();
+        assert_eq!(m.origin(), o);
+        for (v, d) in offsets.iter().enumerate() {
+            let p = m.position(v as u32).unwrap();
+            for k in 0..3 {
+                assert!((p[k] as f64 - d[k]).abs() < 1e-3, "{v}: {p:?} vs {d:?}");
+            }
+        }
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&flat, &[], [f64::NAN, 0., 0.]).err(),
+            Some(bad.clone())
+        );
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[f64::INFINITY, 0., 0.], &[], [0.; 3]).err(),
+            Some(bad)
+        );
+        assert!(matches!(
+            Mesh::from_buffers_f64_with_origin(&[0., 0.], &[], [0.; 3]),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn offsets_overflowing_f32_are_rejected() {
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        // Finite in f64, but 1e39 away from the origin does not fit an f32.
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[1.0e39, 0., 0.], &[], [0.; 3]).err(),
+            Some(bad.clone())
+        );
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[0., 0., 0.], &[], [0., -1.0e39, 0.]).err(),
+            Some(bad.clone())
+        );
+        // The auto-centred constructor shares the check.
+        assert_eq!(
+            Mesh::from_buffers_f64(&[-1.0e300, 0., 0., 1.0e300, 0., 0.], &[]).err(),
             Some(bad)
         );
     }

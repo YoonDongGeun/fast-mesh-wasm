@@ -26,6 +26,14 @@ impl SubscriberId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(pub(crate) u32);
 
+impl FieldId {
+    /// The raw value, for passing the id across an FFI boundary. Turn it
+    /// back into an id with [`Scene::field_id`](crate::Scene::field_id).
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// A plane section of the scene, from
 /// [`Scene::add_section`](crate::Scene::add_section).
 ///
@@ -33,6 +41,14 @@ pub struct FieldId(pub(crate) u32);
 /// compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SectionId(pub(crate) u32);
+
+impl SectionId {
+    /// The raw value, for passing the id across an FFI boundary. Turn it
+    /// back into an id with [`Scene::section_id`](crate::Scene::section_id).
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
 
 /// What happened to one mesh since the subscriber's last
 /// [`Scene::take_changes_for`](crate::Scene::take_changes_for) (or
@@ -58,6 +74,13 @@ pub struct MeshChanges {
     /// without duplicates. `Some` of an empty list when no colour changed;
     /// `None` means "every colour may have changed" (redraw them all).
     pub colors_dirty: Option<Vec<VertexId>>,
+    /// The vertices whose normals changed since the last call, with the
+    /// same semantics as [`MeshChanges::colors_dirty`]: ascending without
+    /// duplicates, `None` for "every normal may have changed". Only
+    /// reported while normals are on (see
+    /// [`Scene::set_normals`](crate::Scene::set_normals)), apart from the
+    /// `None` of an added or fully changed mesh.
+    pub normals_dirty: Option<Vec<VertexId>>,
     /// The fields on this mesh whose values changed since the last call,
     /// each once.
     pub fields_changed: Vec<FieldId>,
@@ -84,6 +107,8 @@ pub(crate) struct Report {
     pub(crate) added: bool,
     /// Recoloured vertices; `None` means "all".
     pub(crate) colors_dirty: Option<Vec<VertexId>>,
+    /// Vertices with new normals; `None` means "all".
+    pub(crate) normals_dirty: Option<Vec<VertexId>>,
     pub(crate) fields_changed: Vec<FieldId>,
     pub(crate) sections_changed: Vec<SectionId>,
     pub(crate) channels_written: Vec<String>,
@@ -91,12 +116,13 @@ pub(crate) struct Report {
 
 impl Report {
     /// The report of a mesh that was just added: everything is new,
-    /// colours included.
+    /// colours and normals included.
     pub(crate) fn added() -> Report {
         Report {
             changes: None,
             added: true,
             colors_dirty: None,
+            normals_dirty: None,
             ..Report::clean()
         }
     }
@@ -108,6 +134,7 @@ impl Report {
             placement_changed: false,
             added: false,
             colors_dirty: Some(Vec::new()),
+            normals_dirty: Some(Vec::new()),
             fields_changed: Vec::new(),
             sections_changed: Vec::new(),
             channels_written: Vec::new(),
@@ -120,6 +147,7 @@ impl Report {
             && !self.placement_changed
             && self.changes.as_ref().is_some_and(ChangeSet::is_empty)
             && self.colors_dirty.as_ref().is_some_and(Vec::is_empty)
+            && self.normals_dirty.as_ref().is_some_and(Vec::is_empty)
             && self.fields_changed.is_empty()
             && self.sections_changed.is_empty()
             && self.channels_written.is_empty()
@@ -163,19 +191,13 @@ impl Report {
     /// Notes recoloured vertices (`ids` ascending without duplicates), or
     /// every vertex for `None`.
     pub(crate) fn colors_changed(&mut self, ids: Option<&[VertexId]>) {
-        match (ids, &mut self.colors_dirty) {
-            (_, None) => {}
-            (None, dirty) => *dirty = None,
-            (Some(ids), Some(dirty)) => {
-                if dirty.is_empty() {
-                    dirty.extend_from_slice(ids);
-                } else if !ids.is_empty() {
-                    dirty.extend_from_slice(ids);
-                    dirty.sort_unstable();
-                    dirty.dedup();
-                }
-            }
-        }
+        merge_dirty(&mut self.colors_dirty, ids);
+    }
+
+    /// Notes vertices with new normals (`ids` ascending without
+    /// duplicates), or every vertex for `None`.
+    pub(crate) fn normals_changed(&mut self, ids: Option<&[VertexId]>) {
+        merge_dirty(&mut self.normals_dirty, ids);
     }
 
     /// Turns the report into its public form and resets it to clean.
@@ -188,9 +210,29 @@ impl Report {
             added: r.added,
             removed,
             colors_dirty: r.colors_dirty,
+            normals_dirty: r.normals_dirty,
             fields_changed: r.fields_changed,
             sections_changed: r.sections_changed,
             channels_written: r.channels_written,
+        }
+    }
+}
+
+/// Folds dirty vertex ids (ascending without duplicates, `None` for all)
+/// into a dirty list that stays ascending without duplicates. A list that
+/// already says "all" stays that way.
+fn merge_dirty(dirty: &mut Option<Vec<VertexId>>, ids: Option<&[VertexId]>) {
+    match (ids, dirty) {
+        (_, None) => {}
+        (None, dirty) => *dirty = None,
+        (Some(ids), Some(dirty)) => {
+            if dirty.is_empty() {
+                dirty.extend_from_slice(ids);
+            } else if !ids.is_empty() {
+                dirty.extend_from_slice(ids);
+                dirty.sort_unstable();
+                dirty.dedup();
+            }
         }
     }
 }

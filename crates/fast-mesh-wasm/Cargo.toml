@@ -12,6 +12,18 @@ authors.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Exports `__test_panic()`, which panics, for the TypeScript poisoning test.
+# Only `node scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`), run
+# by the package's `test` script, enables it; release builds never do.
+test-panic = []
+
 [dependencies]
 fast-mesh.workspace = true
+fast-mesh-scene.workspace = true
+fast-mesh-bvh.workspace = true
+fast-mesh-store.workspace = true
+fast-mesh-query.workspace = true
+fast-mesh-fields.workspace = true
+fast-mesh-ops.workspace = true
 wasm-bindgen.workspace = true

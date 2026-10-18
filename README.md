@@ -9,6 +9,7 @@ Fast triangle mesh utilities for JavaScript and TypeScript, written in Rust and 
 - Works in browsers (Vite, webpack, Next.js), Node.js and Bun
 - Installs the same way with npm, pnpm and bun. No native build step, no install scripts, zero dependencies
 - Full TypeScript types and inline docs, generated from the Rust source
+- A `Scene` for interactive work: placements, queries, distance-field colouring, sections, repair and undo/redo
 - Uses the flat buffer layout of WebGL and three.js `BufferGeometry`, so data goes in and out without conversion
 
 > **Status:** early development (0.x). The API may change between minor versions.
@@ -52,7 +53,89 @@ const normals = computeVertexNormals(geometry.attributes.position.array, geometr
 geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 ```
 
-## API
+## Scene API
+
+For interactive work with several meshes, the `Scene` class keeps the meshes in WebAssembly memory and does the heavy parts in Rust: placements, a BVH per mesh, queries, signed distance fields with colour maps, planar sections, hole repair and undo/redo. Your renderer reads the results through zero-copy typed-array views, and you upload only the ranges that changed.
+
+```ts
+import { init, type MeshHandle, Scene, type Quat, type Vec3 } from "fast-mesh-wasm";
+
+await init();
+const scene = new Scene();
+
+// Provided by your app (not part of this package): mesh data and the
+// renderer's upload functions.
+declare const upperPositions: Float64Array, upperIndices: Uint32Array;
+declare const lowerPositions: Float64Array, lowerIndices: Uint32Array;
+declare function uploadMatrix(mesh: MeshHandle, matrix: Float64Array): void;
+declare function uploadColors(mesh: MeshHandle, startVertex: number, rgba: Uint8Array): void;
+
+// Add meshes. Positions are in world space; the scene stores them relative to
+// the mesh's bounding-box centre so single precision stays accurate.
+const upper = scene.addMesh(upperPositions, upperIndices);
+const lower = scene.addMesh(lowerPositions, lowerIndices);
+
+// Colour the upper mesh by its signed distance to the lower one.
+const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
+const colour = (field: typeof gap) =>
+  scene.setColoring(upper, { field, map: "turbo", range: [-0.5, 1] });
+colour(gap);
+
+// Drag the lower mesh. The whole drag is one undo step. Each `move`
+// recomputes the eager fields, so coalesce pointer events to one `move` per
+// animation frame.
+const drag = scene.drag(lower);
+let pending: { rotation: Quat; translation: Vec3 } | undefined;
+function onPointerMove(rotation: Quat, translation: Vec3) {
+  pending = { rotation, translation }; // keep only the latest pose
+}
+function onPointerUp() {
+  if (pending !== undefined) drag.move(pending);
+  pending = undefined;
+  drag.end();
+}
+
+// Once per animation frame: take what changed and upload only that.
+function frame() {
+  if (pending !== undefined) {
+    drag.move(pending); // fields and colours follow
+    pending = undefined;
+  }
+  for (const change of scene.commitFrame()) {
+    const views = scene.views(change.mesh); // fresh views; do not keep them
+    if (change.placementChanged) {
+      uploadMatrix(change.mesh, scene.matrix4(change.mesh)); // Float64Array(16)
+    }
+    const colors = views.colors();
+    if (colors !== null && change.colors !== "all") {
+      for (const [start, count] of change.colors) {
+        uploadColors(change.mesh, start, colors.subarray(4 * start, 4 * (start + count)));
+      }
+    } // "all" (a new mesh, or buffers that grew): re-upload the whole buffer
+    // positions, normals and indices work the same way
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Toggle the colouring (display settings are not part of the undo history).
+scene.setColoring(upper, null);
+colour(gap);
+
+// Undo and redo placements and edits.
+if (scene.canUndo()) scene.undo();
+scene.redo();
+
+// Queries are in world space.
+const hit = scene.raycast([0, 0, 50], [0, 0, -1]); // nearest hit over all meshes, or null
+const closest = scene.meshDistance(upper, lower); // { distance, a, b, ... }
+
+scene.free(); // or `using scene = new Scene()`
+```
+
+Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `STALE_BVH`, ...). After a trap inside the WebAssembly module every later call throws `INSTANCE_POISONED`. A view is only valid until the next scene call that may allocate or move buffers: a kept view may read other data or be empty, so re-acquire views after any scene call. `new Scene({ debug: true })` makes views warn when they are read after such a call. Mesh edits (`scene.edit`), `analyze`, `repair`, sections (`addSection`, `section`, `sectionGap`) and `findContacts` are documented in the types.
+
+## Functions
 
 | Function | Returns | Description |
 | --- | --- | --- |

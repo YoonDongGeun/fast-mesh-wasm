@@ -47,7 +47,9 @@
   },
   "scripts": {
     "build": "tsdown",
-    "test": "vitest run",
+    "test": "node ../../scripts/build-wasm.mjs --test && tsdown && vitest run",
+    "prepublishOnly": "node -e \"if (require('fs').readFileSync('dist/wasm/fast_mesh_wasm.d.ts', 'utf8').includes('__test_panic')) { console.error('dist/ is a test build (it exports __test_panic): run pnpm build first'); process.exit(1); }\"",
+    "bench": "node bench/scene.bench.mjs",
     "check": "publint --strict && attw --pack . --profile esm-only"
   },
   "devDependencies": {

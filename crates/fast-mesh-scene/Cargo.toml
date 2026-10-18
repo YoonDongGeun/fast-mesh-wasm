@@ -19,6 +19,7 @@ fast-mesh-fields.workspace = true
 fast-mesh-ops.workspace = true
 
 [dev-dependencies]
+fast-mesh.workspace = true
 proptest = "1.12.0"
 criterion = { version = "0.8.2", default-features = false }
 

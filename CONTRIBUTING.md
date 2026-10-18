@@ -48,7 +48,7 @@ pnpm test
 | Command | What it does |
 | --- | --- |
 | `pnpm build` | Rust → `.wasm` → wasm-bindgen glue and `.d.ts` → wasm-opt → TypeScript bundle in `packages/fast-mesh-wasm/dist` |
-| `pnpm test` | `cargo test` for the core, then Vitest against the built package |
+| `pnpm test` | `cargo test` for the core, then a test build of the package and Vitest against it |
 | `pnpm lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
 | `pnpm check:pkg` | publint and Are The Types Wrong on the package |
 | `pnpm smoke` | Packs the package and installs it with npm, pnpm and bun in temporary projects |
@@ -59,7 +59,7 @@ pnpm test
 | `cargo bench -p fast-mesh-ops` | `analyze` (with and without the self-intersection check), `orient`, `fill_holes` (fair on and off), `weld` and `remove_small_components` on 1M triangles; results go in `docs/benchmarks.md` |
 | `pnpm --filter fast-mesh-wasm-example-vite dev` | Runs the browser example |
 
-Re-run `pnpm build` after changing Rust code; the JS tests import the built output.
+The package's `test` script (`pnpm --filter fast-mesh-wasm test`) rebuilds the package first as a test build: `scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`) enables the `test-panic` cargo feature, which adds a `__test_panic` export for the poisoning test. Run `pnpm build` afterwards before packing or publishing by hand; `prepublishOnly` refuses a test build, and `pnpm release` always rebuilds. The root `pnpm test` runs it too, so it also leaves `dist/` as a test build: run `pnpm build` before `pnpm smoke`, which packs `dist/` as it is.
 
 ## Adding or changing an API
 

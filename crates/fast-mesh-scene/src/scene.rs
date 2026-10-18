@@ -6,6 +6,7 @@ use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transacti
 use crate::fields::{ColorState, Field, FieldHook};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
+use crate::normals::NormalState;
 use crate::report::Report;
 use crate::sections::{Section, SectionHook};
 use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SectionId, SubscriberId};
@@ -73,6 +74,8 @@ pub(crate) struct Entry {
     pub(crate) section_hooks: Vec<SectionHook>,
     /// The mesh's colouring and its colours, if it has one.
     pub(crate) coloring: Option<ColorState>,
+    /// The mesh's vertex normals, if they are on.
+    pub(crate) normals: Option<NormalState>,
 }
 
 impl Entry {
@@ -86,13 +89,18 @@ impl Entry {
         self.report_everything();
     }
 
-    /// Reports the mesh as fully changed to every subscriber, colours
-    /// included (vertex ids may have been renumbered), and to every field
-    /// and section hook.
+    /// Reports the mesh as fully changed to every subscriber, colours and
+    /// normals included (vertex ids may have been renumbered), and to every
+    /// field and section hook; the normals are recomputed in full on their
+    /// next update.
     pub(crate) fn report_everything(&mut self) {
         for r in &mut self.reports {
             r.changes = None;
             r.colors_dirty = None;
+            r.normals_dirty = None;
+        }
+        if let Some(ns) = &mut self.normals {
+            ns.mark_all();
         }
         for h in &mut self.hooks {
             h.changes = None;
@@ -146,8 +154,8 @@ impl Entry {
     }
 
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
-    /// changes, into every subscriber's report and into every field and
-    /// section hook.
+    /// changes, into every subscriber's report, into every field and
+    /// section hook and into the normals' pending changes.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
         match &mut self.pending {
             Some(p) => p.merge(changes),
@@ -165,6 +173,9 @@ impl Entry {
             if let Some(c) = &mut h.changes {
                 c.merge(changes);
             }
+        }
+        if let Some(ns) = &mut self.normals {
+            ns.record(changes, self.mesh.vertex_slots());
         }
         // Slots only grow through commits, undo, redo and cancel, all of
         // which pass here.
@@ -211,12 +222,14 @@ impl Entry {
         Ok(())
     }
 
-    /// After a change: brings an Eager BVH up to date. A failure is not an
-    /// error of the change (§15.1): the pending changes stay and the BVH is
-    /// treated like Lazy until an update succeeds.
+    /// After a change: brings an Eager BVH and Eager normals up to date. A
+    /// failure is not an error of the change (§15.1): the pending changes
+    /// stay and the BVH or normals are treated like Lazy until an update
+    /// succeeds.
     pub(crate) fn after_change(&mut self) {
         if self.mode == UpdateMode::Eager {
             let _ = self.update_bvh();
+            let _ = self.update_normals();
         }
     }
 }
@@ -295,6 +308,7 @@ impl Scene {
             hooks: Vec::new(),
             section_hooks: Vec::new(),
             coloring: None,
+            normals: None,
         })
     }
 
@@ -532,27 +546,33 @@ impl Scene {
         Ok(())
     }
 
-    /// Brings the mesh's BVH up to date now, whatever its mode. Eager fields
-    /// involving the mesh that were left stale (for example by this BVH
-    /// being a stale Manual one) then catch up, and so does every stale
-    /// section entry of the mesh, whatever its mode.
+    /// Brings the mesh's BVH, and its normals if they are on, up to date
+    /// now, whatever its mode. Eager fields involving the mesh that were
+    /// left stale (for example by this BVH being a stale Manual one) then
+    /// catch up, and so does every stale section entry of the mesh, whatever
+    /// its mode.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update.
-    /// On error the BVH keeps its pending changes. Then the first section
-    /// error (for example out of memory); such entries stay stale.
+    /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update
+    /// of the BVH or the normals (both are attempted). On error they keep
+    /// their pending changes. Then the first section error (for example out
+    /// of memory); such entries stay stale.
     pub fn update(&mut self, id: MeshId) -> Result<()> {
-        self.entry_mut(id)?.update_bvh()?;
+        let entry = self.entry_mut(id)?;
+        let bvh = entry.update_bvh();
+        let normals = entry.update_normals();
+        bvh.and(normals)?;
         self.run_eager_fields(Some(&[id]));
         self.run_sections(|_| true, Some(&[id]))
     }
 
     /// Brings every Lazy BVH up to date, and every Eager one left stale by a
-    /// failed update; then does the same for the fields, which follow the
-    /// mode of the mesh they are on (see [`Scene::update_fields`]), and for
-    /// the section entries, which follow the mode of their mesh (see
-    /// [`Scene::update_sections`]). Manual BVHs, and fields and section
-    /// entries on Manual meshes, are left alone.
+    /// failed update, and the same for the normals (see
+    /// [`Scene::set_normals`]); then does the same for the fields, which
+    /// follow the mode of the mesh they are on (see
+    /// [`Scene::update_fields`]), and for the section entries, which follow
+    /// the mode of their mesh (see [`Scene::update_sections`]). Manual BVHs,
+    /// and fields and section entries on Manual meshes, are left alone.
     ///
     /// # Errors
     /// The first BVH, memory or field error, for example
@@ -564,9 +584,10 @@ impl Scene {
         let mut first = Ok(());
         for (_, entry) in self.entries.iter_mut() {
             if entry.mode != UpdateMode::Manual {
-                let r = entry.update_bvh();
+                let bvh = entry.update_bvh();
+                let normals = entry.update_normals();
                 if first.is_ok() {
-                    first = r;
+                    first = bvh.and(normals);
                 }
             }
         }
@@ -726,12 +747,14 @@ impl Scene {
     /// are kept. Nothing is released: the reserved slots no longer exist.
     /// Its BVH is rebuilt whatever its mode, and the next
     /// [`Scene::take_changes`] reports it as fully changed (`changes: None`,
-    /// `colors_dirty: None`). Its field channels and colours are remapped
-    /// with it; the fields involving it are recomputed in full on their
-    /// next update, and so are its section entries.
+    /// `colors_dirty: None`, `normals_dirty: None`). Its field channels and
+    /// colours are remapped with it, and its normals recomputed in full,
+    /// whatever its mode; the fields involving it are recomputed in full on
+    /// their next update, and so are its section entries.
     ///
-    /// If the rebuild fails, compaction still succeeds and the BVH stays
-    /// pending, as after a failed Eager update in [`Scene::edit`].
+    /// If the rebuild (or the normals) fails, compaction still succeeds and
+    /// the BVH (or the normals) stays pending, as after a failed Eager
+    /// update in [`Scene::edit`].
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or a store error from the compaction; the
@@ -746,6 +769,8 @@ impl Scene {
         entry.pending = Some(ChangeSet::default());
         entry.report_everything();
         let _ = entry.update_bvh();
+        // The slot count changed under the normals: recompute them now.
+        let _ = entry.update_normals();
         // The field channels were remapped with the mesh; so are the colours.
         entry.recolor_all();
         self.run_eager(Some(&[id]));
@@ -767,6 +792,14 @@ impl Scene {
     /// The ids of all meshes, in index order.
     pub fn ids(&self) -> impl Iterator<Item = MeshId> {
         self.entries.iter().map(|(id, _)| id)
+    }
+
+    /// The id of the live mesh with this [`MeshId::index`] and
+    /// [`MeshId::generation`], or `None` when there is none (never added,
+    /// or removed). For ids passed back across an FFI boundary: a stale or
+    /// made-up pair cannot become a live id.
+    pub fn mesh_id(&self, index: u32, generation: u32) -> Option<MeshId> {
+        self.entries.live_id(index, generation)
     }
 
     /// Where the mesh sits in the world.
@@ -976,6 +1009,22 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(scene.mesh(a).err(), Some(SceneError::UnknownMesh));
         assert!(scene.mesh(b).is_ok());
+    }
+
+    #[test]
+    fn mesh_id_from_parts_only_for_live_meshes() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), Some(a));
+        assert_eq!(scene.mesh_id(a.index(), a.generation() + 1), None);
+        assert_eq!(scene.mesh_id(a.index() + 1, 0), None);
+        scene.remove_mesh(a).unwrap();
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), None);
+        // The reused slot answers only for its new generation.
+        let b = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        assert_eq!(b.index(), a.index());
+        assert_eq!(scene.mesh_id(b.index(), b.generation()), Some(b));
+        assert_eq!(scene.mesh_id(a.index(), a.generation()), None);
     }
 
     #[test]

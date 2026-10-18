@@ -57,6 +57,10 @@
 //!   with a [`ColorRule`]; [`Scene::colors`] returns one RGBA8 per vertex
 //!   slot, and recoloured vertices are reported in
 //!   [`MeshChanges::colors_dirty`].
+//! - Normals: [`Scene::set_normals`] turns a mesh's smooth vertex normals
+//!   on; [`Scene::normals`] returns one mesh-local normal per vertex slot,
+//!   kept up to date incrementally under the mesh's [`UpdateMode`], and
+//!   recomputed vertices are reported in [`MeshChanges::normals_dirty`].
 //! - Sections: [`Scene::add_section`] cuts meshes with a world [`Plane`]
 //!   ([`SectionDesc`]) into contours in world and plane `(u, v)`
 //!   coordinates, with length, signed area and an optional fill
@@ -71,6 +75,7 @@ mod error;
 mod fields;
 mod history;
 mod id;
+mod normals;
 mod placement;
 mod query;
 mod report;

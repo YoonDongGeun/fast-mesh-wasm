@@ -6,8 +6,9 @@ import { readFileSync } from "node:fs";
 import { type InitInput, markInitialized } from "./api.js";
 import { initSync } from "./wasm/fast_mesh_wasm.js";
 
-initSync({ module: readFileSync(new URL("./wasm/fast_mesh_wasm_bg.wasm", import.meta.url)) });
-markInitialized();
+markInitialized(
+  initSync({ module: readFileSync(new URL("./wasm/fast_mesh_wasm_bg.wasm", import.meta.url)) }),
+);
 
 /**
  * Resolves immediately: in Node.js and Bun the module is ready as soon as it is imported.
@@ -24,6 +25,61 @@ export {
   computeVertexNormals,
   type Indices,
   type InitInput,
+  type Mat3,
+  type Placement,
+  type PlacementInput,
   type Positions,
+  type Positions64,
+  type Quat,
+  type UpdateMode,
   type Vec3,
 } from "./api.js";
+export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export {
+  type AddMeshOptions,
+  type Analysis,
+  type AnalyzeOptions,
+  type BoundaryLoop,
+  type ClosestHit,
+  type ClosestPointOptions,
+  type Colormap,
+  type ColorRule,
+  type Contact,
+  type DegenerateReport,
+  type DistanceFieldDesc,
+  type DragSession,
+  type EditOp,
+  type EditRef,
+  type EditResult,
+  type FieldHandle,
+  type FieldStatus,
+  type FilledLoop,
+  type FillReport,
+  type FindContactsOptions,
+  type LoopId,
+  type MeshChange,
+  type MeshComponent,
+  type MeshDistance,
+  type MeshHandle,
+  type MeshViews,
+  type OrientReport,
+  type OutOfRange,
+  type Range,
+  type RaycastOptions,
+  type RayHit,
+  type RemoveReport,
+  type RepairOp,
+  type RepairReport,
+  type RepairReportOf,
+  type Rgba,
+  Scene,
+  type SceneOptions,
+  type SectionContour,
+  type SectionDesc,
+  type SectionGap,
+  type SectionHandle,
+  type SectionPlane,
+  type SectionResult,
+  type SignMode,
+  type WeldReport,
+} from "./scene.js";
