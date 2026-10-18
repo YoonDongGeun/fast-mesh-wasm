@@ -1,9 +1,10 @@
 // Public API shared by the browser and Node entries. Wraps the raw wasm-bindgen
 // exports: converts inputs, shapes results into plain values and guards against
 // calls made before the WebAssembly module is ready.
+import { call, setMemory } from "./core.js";
 import * as wasm from "./wasm/fast_mesh_wasm.js";
 
-export type { InitInput } from "./wasm/fast_mesh_wasm.js";
+export type { InitInput, InitOutput } from "./wasm/fast_mesh_wasm.js";
 
 /** A 3D vector `[x, y, z]`. */
 export type Vec3 = [x: number, y: number, z: number];
@@ -34,8 +35,12 @@ export interface Bounds {
 
 let initialized = false;
 
-/** Called by the entry point once the WebAssembly module is instantiated. */
-export function markInitialized(): void {
+/**
+ * Called by the entry point once the WebAssembly module is instantiated, with
+ * what `initSync` / the default init returned; keeps its memory for views.
+ */
+export function markInitialized(output: wasm.InitOutput): void {
+  setMemory(output.memory);
   initialized = true;
 }
 
@@ -63,7 +68,7 @@ function toUint32(values: Indices): Uint32Array {
  */
 export function computeVertexNormals(positions: Positions, indices: Indices): Float32Array {
   ensureInitialized("computeVertexNormals");
-  return wasm.computeVertexNormals(toFloat32(positions), toUint32(indices));
+  return call(() => wasm.computeVertexNormals(toFloat32(positions), toUint32(indices)));
 }
 
 /**
@@ -74,7 +79,7 @@ export function computeVertexNormals(positions: Positions, indices: Indices): Fl
  */
 export function computeBounds(positions: Positions): Bounds {
   ensureInitialized("computeBounds");
-  const b = wasm.computeBounds(toFloat32(positions));
+  const b = call(() => wasm.computeBounds(toFloat32(positions)));
   const min: Vec3 = [b[0], b[1], b[2]];
   const max: Vec3 = [b[3], b[4], b[5]];
   return {

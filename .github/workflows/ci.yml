@@ -55,8 +55,6 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - name: Test the built package (Node entry)
-        run: pnpm --filter fast-mesh-wasm test
       - name: Check exports and types (publint, attw)
         run: pnpm check:pkg
       - name: Build the Vite example (browser entry)
@@ -70,6 +68,10 @@ jobs:
         with:
           name: package
           path: pack/*.tgz
+      # Last: the test script rebuilds the package with the `test-panic` feature,
+      # which must not reach the packed tarball above.
+      - name: Test the package (test build)
+        run: pnpm --filter fast-mesh-wasm test
 
   install:
     name: ${{ matrix.pm }} · ${{ matrix.os }} · node ${{ matrix.node }}

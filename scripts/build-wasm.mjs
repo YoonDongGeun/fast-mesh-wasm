@@ -1,5 +1,11 @@
 // Rust -> .wasm -> wasm-bindgen glue + .d.ts -> wasm-opt.
 // Written in Node instead of bash so the same command works on Windows, macOS and Linux.
+//
+// With FAST_MESH_TEST_BUILD=1 (or `--test`) the crate is built with the `test-panic`
+// feature, which adds the `__test_panic` export the poisoning test needs. The output
+// goes to the same place, so a test build must never be published: the package's
+// `test` script makes one, `pnpm build` and `pnpm release` make a release build, and
+// `prepublishOnly` refuses a build that exports `__test_panic`.
 import { execFileSync } from "node:child_process";
 import { copyFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -17,7 +23,9 @@ function run(cmd, args) {
   execFileSync(cmd, args, { cwd: root, stdio: "inherit" });
 }
 
-run("cargo", ["build", "-p", "fast-mesh-wasm", "--target", "wasm32-unknown-unknown", "--release"]);
+const testBuild = process.env.FAST_MESH_TEST_BUILD === "1" || process.argv.includes("--test");
+const cargoArgs = ["build", "-p", "fast-mesh-wasm", "--target", "wasm32-unknown-unknown", "--release"];
+run("cargo", testBuild ? [...cargoArgs, "--features", "test-panic"] : cargoArgs);
 
 rmSync(outDir, { recursive: true, force: true });
 run("wasm-bindgen", [rawWasm, "--out-dir", outDir, "--target", "web"]);

@@ -31,7 +31,7 @@
 //! The TypeScript decoder mirrors this layout.
 
 use fast_mesh_scene::MeshChanges;
-use fast_mesh_store::{Mesh, StoreError, TriangleId};
+use fast_mesh_store::{Mesh, StoreError};
 
 /// Dirty slots that are at most this many slots apart share one range.
 pub(crate) const RANGE_GAP: u32 = 8;
@@ -45,17 +45,17 @@ pub(crate) const FLAG_NORMALS_ALL: u32 = 32;
 pub(crate) const FLAG_COLORS_ALL: u32 = 64;
 pub(crate) const FLAG_INDICES_ALL: u32 = 128;
 
-/// One mesh's slot-aligned render index buffer, kept up to date from change
-/// sets, and the buffer sizes last reported for it.
+/// The buffer sizes last reported for one mesh. The render buffers
+/// themselves live in the scene: positions and triangles in the store
+/// (slot-aligned, dead triangle slots read `0, 0, 0`), normals and colours
+/// in the scene's per-mesh state.
 pub(crate) struct RenderState {
-    /// Three vertex ids per triangle slot; a dead slot reads `0, 0, 0`.
-    indices: Vec<u32>,
     vertex_slots: usize,
     triangle_slots: usize,
     /// Length of the normals buffer at the last report.
     normals_len: usize,
     /// A previous [`RenderState::apply`] failed after its changes were
-    /// taken, so the next one reports and rebuilds everything.
+    /// taken, so the next one reports everything.
     stale: bool,
 }
 
@@ -73,6 +73,18 @@ pub(crate) struct Dirty {
 }
 
 impl Dirty {
+    /// Everything changed, slot counts included: the fallback when the
+    /// dirty sets cannot be built.
+    pub(crate) fn all() -> Dirty {
+        Dirty {
+            positions: None,
+            normals: None,
+            colors: None,
+            indices: None,
+            capacity_changed: true,
+        }
+    }
+
     /// Nothing changed (the dirty sets of a removed mesh).
     pub(crate) fn clean() -> Dirty {
         Dirty {
@@ -116,36 +128,20 @@ fn slots(lists: &[&[u32]], limit: usize) -> Result<Vec<u32>, StoreError> {
     Ok(out)
 }
 
-/// Writes triangle `t`'s vertex ids, or `0, 0, 0` when it is dead.
-fn write_triangle(indices: &mut [u32], mesh: &Mesh, t: TriangleId) {
-    let tri = mesh.triangle(t).unwrap_or([0; 3]);
-    let i = t as usize * 3;
-    indices[i..i + 3].copy_from_slice(&tri);
-}
-
 impl RenderState {
-    /// The render state of `mesh`, with its full index buffer.
-    pub(crate) fn new(mesh: &Mesh) -> Result<RenderState, StoreError> {
-        let mut state = RenderState {
-            indices: Vec::new(),
+    /// The render state of `mesh`, just added: its first report says
+    /// "all" anyway, so only the slot counts matter.
+    pub(crate) fn new(mesh: &Mesh) -> RenderState {
+        RenderState {
             vertex_slots: mesh.vertex_slots(),
             triangle_slots: mesh.triangle_slots(),
             normals_len: 0,
             stale: false,
-        };
-        state.resize(mesh.triangle_slots())?;
-        state.rewrite_all(mesh);
-        Ok(state)
+        }
     }
 
-    /// The index buffer: three `u32` per triangle slot, `0, 0, 0` for a
-    /// dead slot.
-    pub(crate) fn indices(&self) -> &[u32] {
-        &self.indices
-    }
-
-    /// Brings the index buffer up to date with `changes`, the scene's report
-    /// for `mesh`, and returns the dirty slots of every render buffer.
+    /// Turns `changes`, the scene's report for `mesh`, into the dirty slots
+    /// of every render buffer, and remembers the buffer sizes.
     /// `normals_len` is the current length (in vertices) of the mesh's
     /// normals buffer, 0 when normals are off; it may differ from the vertex
     /// slot count after the scene ran out of memory.
@@ -208,16 +204,6 @@ impl RenderState {
             Some(c) if !self.stale => Some(slots(&[c], vs)?),
             _ => None,
         };
-        self.resize(ts)?;
-
-        match &indices {
-            None => self.rewrite_all(mesh),
-            Some(ts) => {
-                for &t in ts {
-                    write_triangle(&mut self.indices, mesh, t);
-                }
-            }
-        }
         let capacity_changed = vs != self.vertex_slots || ts != self.triangle_slots;
         self.vertex_slots = vs;
         self.triangle_slots = ts;
@@ -229,24 +215,6 @@ impl RenderState {
             indices,
             capacity_changed,
         })
-    }
-
-    /// Sizes the index buffer to `triangle_slots`; new slots read `0, 0, 0`
-    /// until written.
-    fn resize(&mut self, triangle_slots: usize) -> Result<(), StoreError> {
-        let len = triangle_slots.checked_mul(3).ok_or_else(oom)?;
-        self.indices
-            .try_reserve(len.saturating_sub(self.indices.len()))
-            .map_err(|_| oom())?;
-        self.indices.resize(len, 0);
-        Ok(())
-    }
-
-    /// Rewrites every triangle slot; the buffer is already sized.
-    fn rewrite_all(&mut self, mesh: &Mesh) {
-        for t in 0..mesh.triangle_slots() {
-            write_triangle(&mut self.indices, mesh, t as TriangleId);
-        }
     }
 }
 
@@ -322,7 +290,7 @@ mod tests {
     fn setup() -> (Scene, MeshId, RenderState) {
         let mut scene = Scene::new(SceneOptions::default());
         let id = scene.add_mesh(quad(), MeshOptions::default()).unwrap();
-        let mut state = RenderState::new(scene.mesh(id).unwrap()).unwrap();
+        let mut state = RenderState::new(scene.mesh(id).unwrap());
         let added = take(&mut scene, id);
         state.apply(scene.mesh(id).unwrap(), &added, 0).unwrap();
         (scene, id, state)
@@ -354,17 +322,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_writes_the_full_index_buffer() {
-        let state = RenderState::new(&quad()).unwrap();
-        assert_eq!(state.indices(), &[0, 1, 2, 0, 2, 3]);
+    /// The render index buffer: the store's slot-aligned triangles.
+    fn indices(scene: &Scene, id: MeshId) -> &[u32] {
+        scene.mesh(id).unwrap().triangles().as_flattened()
     }
 
     #[test]
     fn added_mesh_reports_everything() {
         let mut scene = Scene::new(SceneOptions::default());
         let id = scene.add_mesh(quad(), MeshOptions::default()).unwrap();
-        let mut state = RenderState::new(scene.mesh(id).unwrap()).unwrap();
+        let mut state = RenderState::new(scene.mesh(id).unwrap());
         let ch = take(&mut scene, id);
         let d = state.apply(scene.mesh(id).unwrap(), &ch, 0).unwrap();
         assert_eq!(d.positions, None);
@@ -372,7 +339,7 @@ mod tests {
         assert_eq!(d.normals, None);
         assert_eq!(d.colors, None);
         assert!(!d.capacity_changed);
-        assert_eq!(state.indices(), &[0, 1, 2, 0, 2, 3]);
+        assert_eq!(indices(&scene, id), &[0, 1, 2, 0, 2, 3]);
     }
 
     #[test]
@@ -380,7 +347,7 @@ mod tests {
         let (mut scene, id, mut state) = setup();
         scene.edit(id, |tx| tx.remove_triangles(&[0])).unwrap();
         let d = step(&mut scene, id, &mut state);
-        assert_eq!(state.indices(), &[0, 0, 0, 0, 2, 3]);
+        assert_eq!(indices(&scene, id), &[0, 0, 0, 0, 2, 3]);
         assert_eq!(d.indices, Some(vec![0]));
         assert_eq!(d.positions, Some(vec![]));
         assert!(!d.capacity_changed);
@@ -393,17 +360,17 @@ mod tests {
             .edit(id, |tx| tx.set_triangles(&[1], &[[3, 2, 1]]))
             .unwrap();
         let d = step(&mut scene, id, &mut state);
-        assert_eq!(state.indices(), &[0, 1, 2, 3, 2, 1]);
+        assert_eq!(indices(&scene, id), &[0, 1, 2, 3, 2, 1]);
         assert_eq!(d.indices, Some(vec![1]));
         // Undo puts the old triangle back.
         scene.undo().unwrap();
         let d = step(&mut scene, id, &mut state);
-        assert_eq!(state.indices(), &[0, 1, 2, 0, 2, 3]);
+        assert_eq!(indices(&scene, id), &[0, 1, 2, 0, 2, 3]);
         assert_eq!(d.indices, Some(vec![1]));
     }
 
     #[test]
-    fn capacity_changed_on_growth_only() {
+    fn capacity_changed_on_slot_count_change() {
         let (mut scene, id, mut state) = setup();
         scene
             .edit(id, |tx| {
@@ -415,7 +382,7 @@ mod tests {
         assert!(d.capacity_changed);
         assert_eq!(d.positions, Some(vec![4]));
         assert_eq!(d.indices, Some(vec![2]));
-        assert_eq!(state.indices(), &[0, 1, 2, 0, 2, 3, 1, 4, 2]);
+        assert_eq!(indices(&scene, id), &[0, 1, 2, 0, 2, 3, 1, 4, 2]);
 
         // Moving and removing keep the slot counts.
         scene
@@ -428,7 +395,7 @@ mod tests {
         scene.edit(id, |tx| tx.remove_triangles(&[2])).unwrap();
         let d = step(&mut scene, id, &mut state);
         assert!(!d.capacity_changed);
-        assert_eq!(&state.indices()[6..], &[0, 0, 0]);
+        assert_eq!(&indices(&scene, id)[6..], &[0, 0, 0]);
     }
 
     #[test]
@@ -494,9 +461,7 @@ mod tests {
         assert_eq!(d.positions, None);
         assert_eq!(d.indices, None);
         assert!(d.capacity_changed);
-        let mesh = scene.mesh(id).unwrap();
-        assert_eq!(state.indices().len(), 3 * mesh.triangle_slots());
-        assert_eq!(state.indices(), mesh.triangles().as_flattened());
+        assert_eq!(indices(&scene, id), &[0, 2, 3]);
     }
 
     /// Parses a message back into records, independently of `encode`.

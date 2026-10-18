@@ -6,8 +6,9 @@ import { readFileSync } from "node:fs";
 import { type InitInput, markInitialized } from "./api.js";
 import { initSync } from "./wasm/fast_mesh_wasm.js";
 
-initSync({ module: readFileSync(new URL("./wasm/fast_mesh_wasm_bg.wasm", import.meta.url)) });
-markInitialized();
+markInitialized(
+  initSync({ module: readFileSync(new URL("./wasm/fast_mesh_wasm_bg.wasm", import.meta.url)) }),
+);
 
 /**
  * Resolves immediately: in Node.js and Bun the module is ready as soon as it is imported.

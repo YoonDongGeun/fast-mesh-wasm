@@ -337,6 +337,7 @@ name = "fast-mesh-wasm"
 version = "0.1.0"
 dependencies = [
  "fast-mesh",
+ "fast-mesh-bvh",
  "fast-mesh-fields",
  "fast-mesh-ops",
  "fast-mesh-query",
