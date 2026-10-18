@@ -16,6 +16,14 @@
 //! per-frame case: at the fixed pose, and with `set_placement` through the 64
 //! poses.
 //!
+//! **Fields**, on the same two touching terrains: a distance field from A to B
+//! (`max_distance` 0.08), coloured from contact, with both meshes Lazy so that
+//! the steps show apart. Each iteration runs the 64 poses, and each pose
+//! calls `set_placement`, `update_fields`, reads `colors` and drains
+//! `take_changes`, as a renderer would. The field is on A only, or also on B
+//! (a second field from B to A, both meshes coloured). Setup prints the
+//! number of recoloured vertices per pose.
+//!
 //! **`find_contacts`** over 2, 8 and 32 small meshes (`terrain(32)`, 2,048
 //! triangles each) in a row, each overlapping its neighbour a little.
 
@@ -25,7 +33,8 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::{Ray, RayOptions, Rigid, mesh_distance, raycast};
 use fast_mesh_scene::{
-    Contact, ContactFilter, MeshOptions, Placement, Scene, SceneOptions, SceneRayOptions,
+    ColorRule, Coloring, Colormap, Contact, ContactFilter, DistanceField, MeshId, MeshOptions,
+    OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SignMode, UpdateMode,
 };
 use fast_mesh_store::Mesh;
 
@@ -311,6 +320,100 @@ fn bench_overhead(c: &mut Criterion, label: &str, n: u32) {
     group.finish();
 }
 
+/// The `max_distance` of the field benchmarks.
+const FIELD_DISTANCE: f64 = 0.08;
+
+/// Two Lazy terrains with B at the first pose, a field on A to B, and on B
+/// to A when `both` is true, each field's mesh coloured from contact.
+fn field_scene(n: u32, first: &Placement, both: bool) -> (Scene, MeshId) {
+    let lazy = |placement| MeshOptions {
+        mode: UpdateMode::Lazy,
+        placement,
+        ..Default::default()
+    };
+    let mut scene = scene();
+    let a = scene
+        .add_mesh(terrain(n), lazy(Placement::IDENTITY))
+        .unwrap();
+    let b = scene.add_mesh(terrain(n), lazy(*first)).unwrap();
+    let rule = ColorRule {
+        map: Colormap::Turbo,
+        range: (-0.08, 0.0),
+        below: OutOfRange::Clamp,
+        above: OutOfRange::Base,
+        center: None,
+        base: [200, 200, 200, 255],
+        nan: [255, 0, 255, 255],
+    };
+    let sides = if both {
+        vec![(a, b), (b, a)]
+    } else {
+        vec![(a, b)]
+    };
+    for (on, to) in sides {
+        let field = scene
+            .add_distance_field(DistanceField {
+                name: "d".to_owned(),
+                on,
+                to,
+                max_distance: FIELD_DISTANCE,
+                sign: SignMode::Auto,
+            })
+            .unwrap();
+        let rule = rule.clone();
+        scene
+            .set_coloring(on, Some(Coloring { field, rule }))
+            .unwrap();
+    }
+    scene.update_fields().unwrap();
+    (scene, b)
+}
+
+fn bench_fields(c: &mut Criterion, label: &str, n: u32) {
+    let touching = poses(f64::from(n));
+    let placements: Vec<Placement> = touching.iter().map(placement).collect();
+    let mut group = c.benchmark_group(format!("scene fields {label}"));
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(64));
+    for (name, both) in [("field on A", false), ("fields on A and B", true)] {
+        let (mut scene, b) = field_scene(n, &placements[0], both);
+        let ids: Vec<MeshId> = scene.ids().collect();
+        // Setup: what the 64 poses recolour.
+        let (mut dirty, mut worst) = (0usize, 0usize);
+        for p in &placements {
+            scene.set_placement(b, *p).unwrap();
+            scene.update_fields().unwrap();
+            let d: usize = scene
+                .take_changes()
+                .iter()
+                .map(|c| c.colors_dirty.as_ref().map_or(0, Vec::len))
+                .sum();
+            (dirty, worst) = (dirty + d, worst.max(d));
+        }
+        eprintln!(
+            "{name}, {label}, max_distance {FIELD_DISTANCE}, over 64 poses: {} vertices \
+             recoloured per pose on average (at most {worst})",
+            dirty / 64
+        );
+        group.bench_function(
+            format!("{name}: set_placement + update_fields + colors, all 64 poses"),
+            |bn| {
+                bn.iter(|| {
+                    for p in &placements {
+                        scene.set_placement(b, *p).unwrap();
+                        scene.update_fields().unwrap();
+                        for &m in &ids {
+                            black_box(scene.colors(m).unwrap());
+                        }
+                        black_box(scene.take_changes());
+                    }
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 /// The margin of the two-mesh `find_contacts` benchmarks.
 const CONTACT_MARGIN: f64 = 0.05;
 
@@ -367,6 +470,7 @@ fn bench_contacts(c: &mut Criterion) {
 
 fn benches(c: &mut Criterion) {
     bench_overhead(c, "1M", 708);
+    bench_fields(c, "1M", 708);
     bench_contacts(c);
 }
 

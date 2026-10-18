@@ -1,10 +1,10 @@
-//! Field benchmarks on a synthetic height field (stub; the Scene benchmarks
-//! arrive with the Scene integration).
+//! Field benchmarks on a synthetic height field. The scene's field benchmarks
+//! (the 64-pose drag) are in `fast-mesh-scene`.
 //!
-//! `cargo bench -p fast-mesh-fields` measures `SignData::build` (pseudonormal)
-//! on 1M triangles, and `signed_distances` for a batch of 100,000 points near
-//! the surface, with criterion throughput set to the batch size so results
-//! read per point.
+//! `cargo bench -p fast-mesh-fields` measures `SignData::build` (pseudonormal
+//! and winding) on 1M triangles, and `signed_distances` in both modes for a
+//! batch of 100,000 points near the surface, with criterion throughput set to
+//! the batch size so results read per point.
 
 use std::hint::black_box;
 
@@ -64,17 +64,26 @@ fn fields(c: &mut Criterion) {
         b.iter(|| black_box(SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap()))
     });
 
-    let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+    group.bench_function("sign_build_winding", |b| {
+        b.iter(|| black_box(SignData::build(&mut mesh, &bvh, SignMode::Winding).unwrap()))
+    });
+
     let pts = points(n);
     let mut out = vec![0.0f32; BATCH];
     group.throughput(Throughput::Elements(BATCH as u64));
-    for max_distance in [1.0f32, f32::INFINITY] {
-        group.bench_function(format!("signed_distances/max_{max_distance}"), |b| {
-            b.iter(|| {
-                signed_distances(&mesh, &bvh, &sign, &pts, max_distance, &mut out).unwrap();
-                black_box(&out);
-            })
-        });
+    for (name, mode) in [
+        ("pseudonormal", SignMode::Pseudonormal),
+        ("winding", SignMode::Winding),
+    ] {
+        let sign = SignData::build(&mut mesh, &bvh, mode).unwrap();
+        for max_distance in [1.0f32, f32::INFINITY] {
+            group.bench_function(format!("signed_distances/{name}/max_{max_distance}"), |b| {
+                b.iter(|| {
+                    signed_distances(&mesh, &bvh, &sign, &pts, max_distance, &mut out).unwrap();
+                    black_box(&out);
+                })
+            });
+        }
     }
     group.finish();
 }
