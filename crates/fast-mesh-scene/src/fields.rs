@@ -26,11 +26,18 @@
 //! signs only of finite values, which the near set covers. This relies on
 //! undo reporting revived slots as added (the store's `ChangeSet::merge`
 //! reports a reused slot as moved).
+//!
+//! **Several fields in one update** are prepared one after the other (BVHs,
+//! sign data), then computed without writing, in parallel across fields with
+//! the `parallel` feature when there is enough work, then applied in field
+//! order. Values, colours and reports are the same, bit for bit, as when
+//! each field is updated alone in turn.
 
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignData, SignMode, SignStatus, color_of, signed_distances,
 };
-use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, VertexId};
+use fast_mesh_query::Rigid;
+use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, VertexId, par};
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -91,6 +98,57 @@ fn box_magnitude(min: [f32; 3], max: [f32; 3]) -> f64 {
 
 fn oom() -> SceneError {
     SceneError::Store(StoreError::OutOfMemory)
+}
+
+/// Work, summed over the fields due in one update (see [`FieldJob::work`]),
+/// from which those fields are computed in parallel, one field per task,
+/// with the `parallel` feature. Each field's kernel call is also parallel on
+/// its own above its own threshold.
+///
+/// Measured on the i5-13600K with six terrains in a row, each overlapping
+/// the next, a field for every ordered pair, dragging the middle one (ten
+/// fields due per pose): at 968 triangles per mesh (work about 10k) parallel
+/// is 1.3 times slower, at 1,352 (about 14k) 1.7 times faster, and at 30k
+/// 2.4 times faster.
+const PAR_MIN_FIELD_WORK: usize = 12 * 1024;
+
+/// A due field whose meshes are prepared: what its update recomputes.
+struct FieldJob {
+    /// The field's index.
+    i: usize,
+    /// Every vertex is recomputed.
+    full: bool,
+    /// A placement changed, or B was edited.
+    geometric: bool,
+    /// A's triangles changed since the last update.
+    topology: bool,
+    /// A's merged changes since the last update (`None`: everything).
+    changes: Option<ChangeSet>,
+    /// The margin of the near set, when it is needed.
+    near_margin: Option<f64>,
+    /// From B's local space into A's, as the pair queries take it.
+    b_to_a: Rigid,
+    /// An estimate of the update's cost, in vertices: every vertex slot of
+    /// A when all are recomputed; otherwise the known candidates, plus A's
+    /// triangle count for the near search, which usually costs the most.
+    work: usize,
+}
+
+/// The new state of a field, computed without writing anything.
+struct FieldPlan {
+    /// The vertices recomputed, ascending.
+    candidates: Vec<VertexId>,
+    /// The new value of every candidate, in candidate order.
+    values: Vec<f32>,
+    /// The candidates whose value bits changed, ascending.
+    changed: Vec<VertexId>,
+    /// The new "alive and used by a triangle" flags, when recomputed.
+    referenced: Option<Vec<bool>>,
+    /// The vertices with finite values, ascending.
+    finite: Vec<VertexId>,
+    /// Points the kernel ran on.
+    #[cfg_attr(not(test), allow(dead_code))]
+    recomputed: usize,
 }
 
 /// What happened to one mesh of a field since the field's last update.
@@ -449,7 +507,7 @@ impl Scene {
         want: impl Fn(UpdateMode) -> bool,
         touched: Option<&[MeshId]>,
     ) -> Result<()> {
-        let mut first = Ok(());
+        let mut due = Vec::new();
         for i in 0..self.fields.len() {
             let (on, to) = (self.fields[i].desc.on, self.fields[i].desc.to);
             if touched.is_some_and(|t| !t.contains(&on) && !t.contains(&to)) {
@@ -459,12 +517,10 @@ impl Scene {
             if !want(ea.mode) || self.field_current(i) {
                 continue;
             }
-            let r = self.update_field(i);
-            if first.is_ok() {
-                first = r;
-            }
+            due.try_reserve(1).map_err(|_| oom())?;
+            due.push(i);
         }
-        first
+        self.update_due(&due)
     }
 
     /// Updates the Eager fields involving `touched` (all with `None`).
@@ -532,6 +588,55 @@ impl Scene {
     /// recomputed). All or nothing: on error nothing is written and the
     /// pending changes stay.
     fn update_field(&mut self, i: usize) -> Result<()> {
+        self.update_due(&[i])
+    }
+
+    /// Brings the fields at indices `due` (ascending) up to date, in three
+    /// phases: each is prepared in turn ([`Scene::prepare_field`], which
+    /// needs the meshes mutably), then all are computed without writing
+    /// (in parallel across fields when the work is large enough), then each
+    /// is applied in field order, so that values, colours and reports come
+    /// out as if the fields were updated one after the other. A field that
+    /// fails at any phase is left as it was. Returns the first error in field
+    /// order; every field is attempted.
+    ///
+    /// Preparing a field before the earlier ones are applied changes
+    /// nothing: preparing writes no field state and reports nothing, and a
+    /// field's update reads only its own channel, sign data and hooks.
+    fn update_due(&mut self, due: &[usize]) -> Result<()> {
+        let mut outcomes: Vec<Result<()>> = Vec::new();
+        outcomes.try_reserve_exact(due.len()).map_err(|_| oom())?;
+        let mut jobs: Vec<(usize, FieldJob)> = Vec::new();
+        jobs.try_reserve_exact(due.len()).map_err(|_| oom())?;
+        for (k, &i) in due.iter().enumerate() {
+            match self.prepare_field(i) {
+                Ok(job) => {
+                    jobs.push((k, job));
+                    outcomes.push(Ok(()));
+                }
+                Err(e) => outcomes.push(Err(e)),
+            }
+        }
+        match self.compute_fields(&jobs) {
+            Ok(plans) => {
+                for ((k, job), plan) in jobs.into_iter().zip(plans) {
+                    outcomes[k] = plan.and_then(|plan| self.apply_field(job, plan));
+                }
+            }
+            Err(e) => {
+                for (k, _) in jobs {
+                    outcomes[k] = Err(e.clone());
+                }
+            }
+        }
+        outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+    }
+
+    /// Brings what field `i` reads up to date, the part of an update that
+    /// needs the meshes mutably: its BVHs (B's always, A's when the near set
+    /// is needed) and B's sign data. Then decides what the update recomputes
+    /// (see the module docs). Writes no field state.
+    fn prepare_field(&mut self, i: usize) -> Result<FieldJob> {
         let (id, on, to) = (
             self.fields[i].id,
             self.fields[i].desc.on,
@@ -559,12 +664,11 @@ impl Scene {
         let need_near = !full && geometric;
         let both = [on, to];
         self.prepare(Some(if need_near { &both } else { &both[1..] }))?;
-        let mut near = Vec::new();
-        if need_near {
-            let m = self.pair_magnitude(on, to)?;
-            let mut near_b = Vec::new();
-            self.triangles_near(on, to, pad(md, m), &mut near, &mut near_b)?;
-        }
+        let near_margin = if need_near {
+            Some(pad(md, self.pair_magnitude(on, to)?))
+        } else {
+            None
+        };
         {
             let eb = self.entries.get_mut(to).ok_or(SceneError::UnknownMesh)?;
             let f = &mut self.fields[i];
@@ -572,36 +676,108 @@ impl Scene {
                 f.sign = SignData::build(&mut eb.mesh, &eb.bvh, mode)?;
             }
         }
-        let xf = self.relative_transform(on, to)?.inverse();
-        let (ea, eb) = (self.entry(on)?, self.entry(to)?);
-        let f = &self.fields[i];
+        let b_to_a = self.relative_transform(on, to)?;
+        let ma = &self.entry(on)?.mesh;
+        let changes = hook_a.changes;
+        let topology = changes.as_ref().is_some_and(ChangeSet::topology_changed);
+        let work = if full {
+            ma.vertex_slots()
+        } else {
+            let listed = changes.as_ref().map_or(0, |c| {
+                c.vertices_added.len() + c.vertices_moved.len() + c.vertices_removed.len()
+            });
+            let known = if geometric {
+                self.fields[i].finite.len()
+            } else {
+                0
+            };
+            let near = if need_near { ma.triangle_count() } else { 0 };
+            let flips = if topology { ma.vertex_slots() } else { 0 };
+            listed + known + near + flips
+        };
+        Ok(FieldJob {
+            i,
+            full,
+            geometric,
+            topology,
+            changes,
+            near_margin,
+            b_to_a,
+            work,
+        })
+    }
+
+    /// Computes the prepared fields without writing anything: one result
+    /// per job, in job order. With the `parallel` feature, when the jobs'
+    /// work adds up to [`PAR_MIN_FIELD_WORK`] or more, the fields are
+    /// computed in parallel, one job per task.
+    ///
+    /// # Errors
+    /// `OutOfMemory` when the per-job results cannot be allocated; every
+    /// field then stays as it was.
+    fn compute_fields(&self, jobs: &[(usize, FieldJob)]) -> Result<Vec<Result<FieldPlan>>> {
+        let work: usize = jobs.iter().map(|(_, job)| job.work).sum();
+        let parallel = work >= PAR_MIN_FIELD_WORK
+            && jobs.len() > 1
+            && par::enabled()
+            && !par::force_sequential();
+        #[cfg(test)]
+        if parallel {
+            counter::add_parallel();
+        }
+        let threshold = if parallel { 0 } else { usize::MAX };
+        // Chunks of one job; a field's error is its own result.
+        par::map_chunks(jobs, 1, threshold, oom, |_, chunk| {
+            Ok(self.compute_field(&chunk[0].1))
+        })
+    }
+
+    /// Computes the new values of a prepared field and what changes with
+    /// them, reading the meshes only: the vertices to recompute (searching
+    /// A's triangles near B when needed), their distances, and the field's
+    /// new bookkeeping.
+    fn compute_field(&self, job: &FieldJob) -> Result<FieldPlan> {
+        let f = &self.fields[job.i];
+        let (ea, eb) = (self.entry(f.desc.on)?, self.entry(f.desc.to)?);
         let ma = &ea.mesh;
+        let md = f.desc.max_distance;
         let slots = ma.vertex_slots();
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
-        let topology = hook_a
-            .changes
-            .as_ref()
-            .is_some_and(ChangeSet::topology_changed);
 
         // The vertices to recompute, ascending.
-        let candidates: Vec<VertexId> = if full {
+        let candidates: Vec<VertexId> = if job.full {
             (0..slots as VertexId).collect()
         } else {
             let mut c = Vec::new();
-            for &t in &near {
-                if let Some(tri) = ma.triangle(t) {
-                    c.extend_from_slice(&tri);
+            if let Some(margin) = job.near_margin {
+                // As `Scene::triangles_near`, with the BVHs `prepare_field`
+                // brought up to date.
+                let (mut near, mut near_b) = (Vec::new(), Vec::new());
+                fast_mesh_query::triangles_near(
+                    ma,
+                    &ea.bvh,
+                    &eb.mesh,
+                    &eb.bvh,
+                    &job.b_to_a,
+                    round_up(margin),
+                    &mut near,
+                    &mut near_b,
+                )?;
+                for &t in &near {
+                    if let Some(tri) = ma.triangle(t) {
+                        c.extend_from_slice(&tri);
+                    }
                 }
             }
-            if geometric {
+            if job.geometric {
                 c.extend_from_slice(&f.finite);
             }
-            if let Some(ch) = &hook_a.changes {
+            if let Some(ch) = &job.changes {
                 c.extend_from_slice(&ch.vertices_added);
                 c.extend_from_slice(&ch.vertices_moved);
                 c.extend_from_slice(&ch.vertices_removed);
             }
-            if topology {
+            if job.topology {
                 for v in 0..slots as VertexId {
                     let was = f.referenced.get(v as usize).copied().unwrap_or(false);
                     if was != defined(v) {
@@ -615,6 +791,7 @@ impl Scene {
         };
 
         // A's points in B's local space, in f64 then rounded to f32 (§5.2).
+        let xf = job.b_to_a.inverse();
         let mut ids = Vec::new();
         let mut points = Vec::new();
         for &v in &candidates {
@@ -625,8 +802,6 @@ impl Scene {
         }
         let mut out = vec![0.0f32; points.len()];
         signed_distances(&eb.mesh, &eb.bvh, &f.sign, &points, round_up(md), &mut out)?;
-        #[cfg(test)]
-        counter::add(points.len());
 
         let old = ma.channel(&f.channel).ok_or(SceneError::Corrupted)?;
         let mut values = Vec::with_capacity(candidates.len());
@@ -650,7 +825,7 @@ impl Scene {
             }
             values.push(x);
         }
-        let referenced = (full || topology || f.referenced.len() != slots)
+        let referenced = (job.full || job.topology || f.referenced.len() != slots)
             .then(|| (0..slots as VertexId).map(defined).collect::<Vec<bool>>());
         let finite: Vec<VertexId> = {
             let now = candidates
@@ -658,7 +833,7 @@ impl Scene {
                 .zip(&values)
                 .filter(|(_, x)| x.is_finite())
                 .map(|(&v, _)| v);
-            if full {
+            if job.full {
                 now.collect()
             } else {
                 let mut kept: Vec<VertexId> = f
@@ -672,22 +847,43 @@ impl Scene {
                 kept
             }
         };
+        Ok(FieldPlan {
+            candidates,
+            values,
+            changed,
+            referenced,
+            finite,
+            recomputed: points.len(),
+        })
+    }
 
-        // Commit: nothing below fails.
+    /// Writes a computed field: its values, its colours, its reports and its
+    /// bookkeeping. Fails, writing nothing, only when the field's channel or
+    /// mesh is missing.
+    fn apply_field(&mut self, job: FieldJob, plan: FieldPlan) -> Result<()> {
+        #[cfg(test)]
+        counter::add(plan.recomputed);
+        let i = job.i;
+        let (id, on, to) = (
+            self.fields[i].id,
+            self.fields[i].desc.on,
+            self.fields[i].desc.to,
+        );
         let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
         let channel = ea.mesh.derived_channel_mut(&self.fields[i].channel)?;
-        for (&v, &x) in candidates.iter().zip(&values) {
+        // Commit: nothing below fails.
+        for (&v, &x) in plan.candidates.iter().zip(&plan.values) {
             channel[v as usize] = x;
         }
         ea.reset_hook(id);
-        if !changed.is_empty() {
+        if !plan.changed.is_empty() {
             ea.report_field(id);
         }
         if let Some(cs) = &mut ea.coloring
             && cs.coloring.field == id
         {
             let values = ea.mesh.channel(&cs.channel).unwrap_or(&[]);
-            let dirty = cs.update(values, &changed);
+            let dirty = cs.update(values, &plan.changed);
             ea.report_colors(Some(&dirty));
         }
         if let Some(eb) = self.entries.get_mut(to) {
@@ -695,21 +891,25 @@ impl Scene {
         }
         let f = &mut self.fields[i];
         f.fresh = false;
-        f.finite = finite;
-        if let Some(r) = referenced {
+        f.finite = plan.finite;
+        if let Some(r) = plan.referenced {
             f.referenced = r;
         }
         Ok(())
     }
 }
 
-/// Test-only count of the vertices field updates recompute.
+/// Test-only counts of the vertices field updates recompute, and of the
+/// batches of fields computed in parallel.
 #[cfg(test)]
 pub(crate) mod counter {
     use std::cell::Cell;
 
+    // Both are counted on the thread that runs the update (when fields are
+    // applied), never on the pool's threads.
     thread_local! {
         static RECOMPUTED: Cell<usize> = const { Cell::new(0) };
+        static PARALLEL: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Counts `n` recomputed vertices.
@@ -720,6 +920,17 @@ pub(crate) mod counter {
     /// Vertices recomputed on this thread since the last call.
     pub(crate) fn take() -> usize {
         RECOMPUTED.with(|c| c.replace(0))
+    }
+
+    /// Counts one batch of fields computed in parallel.
+    pub(crate) fn add_parallel() {
+        PARALLEL.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Batches of fields computed in parallel on this thread since the last
+    /// call.
+    pub(crate) fn take_parallel() -> usize {
+        PARALLEL.with(|c| c.replace(0))
     }
 }
 
@@ -1298,6 +1509,115 @@ mod tests {
         assert!(counter::take() >= 3721);
         assert_matches(&mut scene, g);
         assert!(scene.field_values(g).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    /// Six sheets of `n` x `n` cells in `mode`, stacked `gap` apart, with a
+    /// field for every ordered pair (30, all within reach), each mesh
+    /// coloured by its field to the next mesh by index.
+    fn six_sheets(n: u32, gap: f64, mode: UpdateMode) -> (Scene, Vec<MeshId>) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let ids: Vec<MeshId> = (0..6)
+            .map(|k| {
+                let opts = MeshOptions {
+                    mode,
+                    placement: at(0.0, 0.0, k as f64 * gap),
+                    ..MeshOptions::default()
+                };
+                scene.add_mesh(sheet(n, 1.0 / n as f32), opts).unwrap()
+            })
+            .collect();
+        for (i, &a) in ids.iter().enumerate() {
+            for (j, &b) in ids.iter().enumerate() {
+                if i != j {
+                    let id = scene
+                        .add_distance_field(field(&format!("to{j}"), a, b, 8.0 * gap))
+                        .unwrap();
+                    if j == (i + 1) % 6 {
+                        let rule = distance_rule(8.0 * gap as f32, 8.0 * gap as f32);
+                        let coloring = Coloring { field: id, rule };
+                        scene.set_coloring(a, Some(coloring)).unwrap();
+                    }
+                }
+            }
+        }
+        scene.update_fields().unwrap();
+        (scene, ids)
+    }
+
+    /// Per pose of a drag of the first mesh: the reports, every field's
+    /// values and every mesh's colours.
+    type Drag = Vec<(Vec<crate::MeshChanges>, Vec<Vec<u32>>, Vec<Vec<[u8; 4]>>)>;
+
+    fn drag(n: u32, mode: UpdateMode) -> Drag {
+        let gap = 0.01;
+        let (mut scene, ids) = six_sheets(n, gap, mode);
+        scene.take_changes();
+        let poses = [
+            turned(0.5, [0.003, 0.001, 0.002]),
+            turned(-1.0, [0.01, -0.004, 0.025]),
+            turned(2.0, [0.0, 0.002, 0.051]),
+            at(0.0, 0.0, 0.0),
+        ];
+        let mut out = Vec::new();
+        for p in poses {
+            scene.set_placement(ids[0], p).unwrap();
+            scene.update_fields().unwrap();
+            let changes = scene.take_changes();
+            let ids_f: Vec<FieldId> = scene.fields.iter().map(|f| f.id).collect();
+            let values = ids_f
+                .iter()
+                .map(|&f| bits(scene.field_values(f).unwrap()))
+                .collect();
+            let colors = ids
+                .iter()
+                .map(|&m| scene.colors(m).unwrap().unwrap().to_vec())
+                .collect();
+            out.push((changes, values, colors));
+        }
+        out
+    }
+
+    #[test]
+    fn parallel_field_updates_report_in_order() {
+        use fast_mesh_store::par;
+        // The forced-sequential run is the code a feature-off build runs.
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy] {
+            par::set_force_sequential(true);
+            let reference = drag(24, mode);
+            par::set_force_sequential(false);
+            assert!(
+                reference.iter().all(|(c, _, _)| c.len() == 6),
+                "{mode:?}: every mesh reports"
+            );
+            for k in [1, 2, 8] {
+                let got = par::with_threads(k, || drag(24, mode));
+                assert!(got == reference, "{mode:?}: {k} threads");
+            }
+            counter::take_parallel();
+            assert!(drag(24, mode) == reference, "{mode:?}: global pool");
+            if par::enabled() {
+                assert!(counter::take_parallel() > 0, "{mode:?}: ran sequentially");
+            }
+        }
+    }
+
+    #[test]
+    fn small_inputs_stay_sequential() {
+        use fast_mesh_store::par;
+        let before = par::parallel_entries();
+        counter::take_parallel();
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        scene.add_distance_field(field("d", b, a, 0.1)).unwrap();
+        for k in 0..4 {
+            scene
+                .set_placement(b, at(0.01 * k as f64, 0.0, 0.0))
+                .unwrap();
+        }
+        scene.update_fields().unwrap();
+        assert_matches(&mut scene, f);
+        assert_eq!(par::parallel_entries(), before);
+        assert_eq!(counter::take_parallel(), 0);
     }
 
     #[test]
