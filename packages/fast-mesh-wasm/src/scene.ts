@@ -4,7 +4,7 @@
 // panic poisoning).
 import type { Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
-import { call, ensureInitialized, FastMeshError, finalizer, release } from "./core.js";
+import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
@@ -115,6 +115,197 @@ export interface SceneOptions {
   debug?: boolean;
 }
 
+/** A ray hit from {@link Scene.raycast}, in world coordinates. */
+export interface RayHit {
+  mesh: MeshHandle;
+  /** The triangle slot hit. */
+  triangle: number;
+  point: Vec3;
+  /** The world distance from the ray origin. */
+  distance: number;
+  /** Barycentric coordinates of `point` in the triangle. */
+  barycentric: Vec3;
+}
+
+/** Options of {@link Scene.raycast}, in world units. */
+export interface RaycastOptions {
+  /** Smallest distance that counts as a hit (inclusive). Defaults to 0. */
+  minDistance?: number;
+  /** Largest distance that counts as a hit (inclusive). Defaults to `Infinity`. */
+  maxDistance?: number;
+  /** Faces to ignore, by the triangle winding. Defaults to `"none"`. */
+  cull?: "none" | "back" | "front";
+}
+
+/** The nearest surface point from {@link Scene.closestPoint}, in world coordinates. */
+export interface ClosestHit {
+  mesh: MeshHandle;
+  /** The triangle slot the point lies on. */
+  triangle: number;
+  point: Vec3;
+  distance: number;
+}
+
+/** Options of {@link Scene.closestPoint}, in world units. */
+export interface ClosestPointOptions {
+  /** Largest distance that counts as found (inclusive). Defaults to `Infinity`. */
+  maxDistance?: number;
+  /** Search this mesh only. Defaults to every mesh. */
+  mesh?: MeshHandle;
+}
+
+/** The closest pair between two meshes from {@link Scene.meshDistance}, in world coordinates. */
+export interface MeshDistance {
+  /** 0 when the surfaces touch or intersect. */
+  distance: number;
+  /** The point on the first mesh. */
+  a: Vec3;
+  /** The point on the second mesh. */
+  b: Vec3;
+  /** The first mesh's triangle slot that `a` lies on. */
+  triangleA: number;
+  /** The second mesh's triangle slot that `b` lies on. */
+  triangleB: number;
+}
+
+/** Two meshes within the margin of {@link Scene.findContacts}. */
+export interface Contact {
+  /** The mesh with the lower id. */
+  a: MeshHandle;
+  b: MeshHandle;
+  /** Whether the meshes intersect or touch, decided exactly. */
+  intersecting: boolean;
+  /** The distance between the surfaces; 0 when `intersecting`. */
+  distance: number;
+  /** Triangle slots of `a` within the margin of `b`, ascending. */
+  trianglesA: Uint32Array;
+  /** Triangle slots of `b` within the margin of `a`, ascending. */
+  trianglesB: Uint32Array;
+}
+
+/** Options of {@link Scene.findContacts}. */
+export interface FindContactsOptions {
+  /** Report pairs whose surfaces are at most this far apart (world units). Defaults to 0. */
+  margin?: number;
+  /** Only these pairs, either way round. Defaults to every pair of meshes. */
+  pairs?: readonly (readonly [MeshHandle, MeshHandle])[];
+}
+
+/** How a distance field decides which side of the target surface is inside. */
+export type SignMode = "auto" | "pseudonormal" | "winding";
+
+/** A signed distance field to add with {@link Scene.addDistanceField}. */
+export interface DistanceFieldDesc {
+  /** Unique among the fields on `on`. */
+  name: string;
+  /** The mesh whose vertices carry the values. */
+  on: MeshHandle;
+  /** The mesh the distances are measured to. */
+  to: MeshHandle;
+  /** Largest distance computed (inclusive); farther vertices hold `Infinity`. May be `Infinity`. */
+  maxDistance: number;
+  /** Defaults to `"auto"`. */
+  sign?: SignMode;
+}
+
+/** The state of a field, from {@link Scene.fieldStatus}. */
+export interface FieldStatus {
+  /** True when the values match the meshes and placements as they are now. */
+  current: boolean;
+  /** What the latest sign data build found out about the target mesh. */
+  sign: {
+    /** The mode in use (never `"auto"`). */
+    mode: Exclude<SignMode, "auto">;
+    /** No boundary or non-manifold edge. */
+    closed: boolean;
+    consistentOrientation: boolean;
+    nonManifoldVertices: number;
+    degenerateTriangles: number;
+  };
+}
+
+/** An RGBA8 colour, each channel an integer in 0..255. */
+export type Rgba = readonly [r: number, g: number, b: number, a: number];
+
+/**
+ * A colormap: a built-in one, or colour stops `[t, rgba]` (at least two, `t`
+ * in [0, 1] strictly increasing) interpolated linearly.
+ */
+export type Colormap =
+  | "turbo"
+  | "viridis"
+  | "coolwarm"
+  | "grayscale"
+  | { stops: readonly (readonly [t: number, color: Rgba])[] };
+
+/** What to show for a value outside the colour range. */
+export type OutOfRange = "clamp" | "base";
+
+/** How {@link Scene.setColoring} turns a field into vertex colours. */
+export interface ColorRule {
+  /** A field on the coloured mesh. */
+  field: FieldHandle;
+  map: Colormap;
+  /** `[lo, hi]` mapped onto the colormap; finite, `lo < hi`. */
+  range: readonly [lo: number, hi: number];
+  /** Values below `lo`: the colormap's end colour or `base`. Defaults to `"clamp"`. */
+  below?: OutOfRange;
+  /** Values above `hi`, including far (`Infinity`): defaults to `"base"`. */
+  above?: OutOfRange;
+  /** A value within `range` pinned to the middle of the colormap. */
+  center?: number;
+  /** The `"base"` colour. Defaults to light grey `[200, 200, 200, 255]`. */
+  base?: Rgba;
+  /** The colour of NaN (dead or unused vertices). Defaults to `[128, 128, 128, 255]`. */
+  nan?: Rgba;
+}
+
+/** A section plane in world coordinates. */
+export interface SectionPlane {
+  origin: Readonly<Vec3>;
+  /** Points to the plane's `+` side; normalised. */
+  normal: Readonly<Vec3>;
+}
+
+/** A plane section to add with {@link Scene.addSection}. */
+export interface SectionDesc {
+  plane: SectionPlane;
+  /** The meshes cut, each once. */
+  meshes: readonly MeshHandle[];
+  /** Whether results carry the filled cross-section. Defaults to `false`. */
+  fill?: boolean;
+}
+
+/** One chain of a section: a closed loop or an open polyline. */
+export interface SectionContour {
+  /** World xyz, 3 floats per point. A copy. */
+  points: Float32Array;
+  closed: boolean;
+}
+
+/** A section's result for one mesh, from {@link Scene.section}. Copies, in world coordinates. */
+export interface SectionResult {
+  /** `"stale"` when not computed yet or something changed since: call {@link Scene.updateSections}. */
+  status: "current" | "stale";
+  contours: SectionContour[];
+  /** Summed length of every contour. */
+  length: number;
+  /** Summed signed area of the closed, oriented contours (positive counter-clockwise about the normal). */
+  area: number;
+  /** The filled cross-section, when the section has fill on and it was computed. */
+  fill?: { positions: Float32Array; indices: Uint32Array };
+}
+
+/** The closest pair between two meshes' contours, from {@link Scene.sectionGap}. */
+export interface SectionGap {
+  /** Measured in the plane; 0 when the contours cross or touch. */
+  distance: number;
+  /** World point on the first mesh's contours. */
+  a: Vec3;
+  /** World point on the second mesh's contours. */
+  b: Vec3;
+}
+
 /** The scene's view of its active drag. */
 interface ActiveDrag {
   /** The step depth right after the drag's `beginStep`. */
@@ -131,6 +322,64 @@ function modeCode(mode: UpdateMode): number {
     throw invalid('mode must be "eager", "lazy" or "manual"');
   }
   return MODES[mode];
+}
+
+const CULLS = { none: 0, back: 1, front: 2 } as const;
+const SIGNS: Record<SignMode, number> = { auto: 0, pseudonormal: 1, winding: 2 };
+const MAPS = { turbo: 0, viridis: 1, coolwarm: 2, grayscale: 3 } as const;
+const OUT_OF_RANGE: Record<OutOfRange, number> = { clamp: 0, base: 1 };
+const DEFAULT_BASE: Rgba = [200, 200, 200, 255];
+const DEFAULT_NAN: Rgba = [128, 128, 128, 255];
+
+/** The code of a string option in `table`, or `INVALID_ARGUMENT` naming `what`. */
+function codeIn(table: Record<string, number>, value: string, what: string): number {
+  if (!Object.hasOwn(table, value)) {
+    throw invalid(`${what} must be one of ${Object.keys(table).join(", ")}`);
+  }
+  return table[value];
+}
+
+/** Three numbers of a flat result, from `at`. */
+function vec3At(a: Float64Array, at: number): Vec3 {
+  return [a[at], a[at + 1], a[at + 2]];
+}
+
+/** A colour rule as the binding's `(map, rule)`: see `parse_rule` in the Rust crate. */
+function encodeRule(rule: ColorRule): { map: number; values: Float32Array } {
+  if (rule.range?.length !== 2) {
+    throw invalid("range must be [lo, hi]");
+  }
+  // NaN is the binding's "no centre": reject it here rather than drop it.
+  if (rule.center !== undefined && Number.isNaN(rule.center)) {
+    throw invalid("color center must lie within the range");
+  }
+  const values = [
+    rule.range[0],
+    rule.range[1],
+    rule.center ?? Number.NaN,
+    codeIn(OUT_OF_RANGE, rule.below ?? "clamp", "below"),
+    codeIn(OUT_OF_RANGE, rule.above ?? "base", "above"),
+    ...(rule.base ?? DEFAULT_BASE),
+    ...(rule.nan ?? DEFAULT_NAN),
+  ];
+  if (values.length !== 13) {
+    throw invalid("base and nan must have 4 channels");
+  }
+  let map: number;
+  if (typeof rule.map === "string") {
+    map = codeIn(MAPS, rule.map, "map");
+  } else if (typeof rule.map === "object" && rule.map !== null && Array.isArray(rule.map.stops)) {
+    map = 4;
+    for (const [t, color] of rule.map.stops) {
+      if (color.length !== 4) {
+        throw invalid("stop colours must have 4 channels");
+      }
+      values.push(t, ...color);
+    }
+  } else {
+    throw invalid('map must be "turbo", "viridis", "coolwarm", "grayscale" or { stops }');
+  }
+  return { map, values: Float32Array.from(values) };
 }
 
 function invalid(message: string): FastMeshError {
@@ -267,6 +516,50 @@ export class Scene {
       map.set(raw, h);
     }
     return h;
+  }
+
+  /** The raw id of a field or section handle of this scene. */
+  #rawId(handle: FieldHandle | SectionHandle, kind: typeof FieldHandle | typeof SectionHandle): number {
+    this.#scene();
+    const what = kind === FieldHandle ? "field" : "section";
+    const id = handle instanceof kind ? rawIds.get(handle) : undefined;
+    if (id === undefined) {
+      throw invalid(`not a ${what} handle`);
+    }
+    if (id.scene !== this) {
+      throw invalid(`${what} handle belongs to another scene`);
+    }
+    return id.index;
+  }
+
+  #field(field: FieldHandle): number {
+    return this.#rawId(field, FieldHandle);
+  }
+
+  #section(section: SectionHandle): number {
+    return this.#rawId(section, SectionHandle);
+  }
+
+  /** Meshes as the binding's flat `[index, generation, ...]` list. */
+  #flatIds(meshes: readonly MeshHandle[]): Uint32Array {
+    if (!Array.isArray(meshes)) {
+      throw invalid("meshes must be an array of mesh handles");
+    }
+    const out = new Uint32Array(meshes.length * 2);
+    meshes.forEach((m, k) => {
+      const { index, generation } = this.#id(m);
+      out[2 * k] = index;
+      out[2 * k + 1] = generation;
+    });
+    return out;
+  }
+
+  /** `[origin, normal]` as the binding's 6 numbers. */
+  #plane(plane: SectionPlane): Float64Array {
+    if (plane?.origin?.length !== 3 || plane.normal?.length !== 3) {
+      throw invalid("plane needs a 3-number origin and normal");
+    }
+    return Float64Array.from([...plane.origin, ...plane.normal]);
   }
 
   // ---- Meshes ----
@@ -598,5 +891,281 @@ export class Scene {
     };
     this.#drag = session;
     return session;
+  }
+
+  // ---- Queries (world space) ----
+
+  /**
+   * The nearest hit of a world ray over every mesh, or `null`. `direction`
+   * need not be unit length; `distance` is in world units. Lazy meshes are
+   * brought up to date first.
+   *
+   * @throws `INVALID_ARGUMENT` for a non-finite origin or a zero direction; `STALE_BVH` for a stale `"manual"` mesh.
+   */
+  raycast(origin: Readonly<Vec3>, direction: Readonly<Vec3>, options: RaycastOptions = {}): RayHit | null {
+    const s = this.#scene();
+    const o = Float64Array.from(origin);
+    const d = Float64Array.from(direction);
+    const cull = codeIn(CULLS, options.cull ?? "none", "cull");
+    const min = options.minDistance ?? 0;
+    const max = options.maxDistance ?? Number.POSITIVE_INFINITY;
+    const h = call(() => s.raycast(o, d, min, max, cull));
+    if (h.length === 0) {
+      return null;
+    }
+    return {
+      mesh: this.#meshHandle(h[0], h[1]),
+      triangle: h[2],
+      point: vec3At(h, 3),
+      distance: h[6],
+      barycentric: vec3At(h, 7),
+    };
+  }
+
+  /**
+   * The surface point nearest to a world point, over every mesh or one, or
+   * `null` when none is within `maxDistance`.
+   */
+  closestPoint(point: Readonly<Vec3>, options: ClosestPointOptions = {}): ClosestHit | null {
+    const s = this.#scene();
+    const p = Float64Array.from(point);
+    const max = options.maxDistance ?? Number.POSITIVE_INFINITY;
+    let h: Float64Array;
+    if (options.mesh === undefined) {
+      h = call(() => s.closest_point(p, max));
+    } else {
+      const { index, generation } = this.#id(options.mesh);
+      h = call(() => s.closest_point_on(index, generation, p, max));
+    }
+    if (h.length === 0) {
+      return null;
+    }
+    return {
+      mesh: this.#meshHandle(h[0], h[1]),
+      triangle: h[2],
+      point: vec3At(h, 3),
+      distance: h[6],
+    };
+  }
+
+  /**
+   * The distance between two meshes' surfaces as placed, with a closest pair
+   * of points, or `null` when it exceeds `maxDistance` (default `Infinity`)
+   * or a mesh has no triangle.
+   */
+  meshDistance(a: MeshHandle, b: MeshHandle, options: { maxDistance?: number } = {}): MeshDistance | null {
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    const max = options.maxDistance ?? Number.POSITIVE_INFINITY;
+    const d = call(() =>
+      this.#scene().mesh_distance(ia.index, ia.generation, ib.index, ib.generation, max),
+    );
+    if (d.length === 0) {
+      return null;
+    }
+    return { distance: d[0], a: vec3At(d, 1), b: vec3At(d, 4), triangleA: d[7], triangleB: d[8] };
+  }
+
+  /** Whether two meshes intersect or touch as placed. */
+  intersects(a: MeshHandle, b: MeshHandle): boolean {
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    return call(() => this.#scene().intersects(ia.index, ia.generation, ib.index, ib.generation));
+  }
+
+  /** Every mesh pair (or every pair of `pairs`) within `margin`, sorted by mesh id. */
+  findContacts(options: FindContactsOptions = {}): Contact[] {
+    const s = this.#scene();
+    const pairs = options.pairs === undefined ? undefined : this.#flatIds(options.pairs.flat());
+    const msg = call(() => s.find_contacts(options.margin ?? 0, pairs));
+    const out: Contact[] = [];
+    let at = 1;
+    for (let k = 0; k < msg[0]; k++) {
+      const na = msg[at + 6];
+      const nb = msg[at + 7];
+      const start = at + 8;
+      out.push({
+        a: this.#meshHandle(msg[at], msg[at + 1]),
+        b: this.#meshHandle(msg[at + 2], msg[at + 3]),
+        intersecting: msg[at + 4] === 1,
+        distance: msg[at + 5],
+        trianglesA: Uint32Array.from(msg.subarray(start, start + na)),
+        trianglesB: Uint32Array.from(msg.subarray(start + na, start + na + nb)),
+      });
+      at = start + na + nb;
+    }
+    return out;
+  }
+
+  // ---- Fields and colours ----
+
+  /**
+   * Adds a signed distance field: one value per vertex slot of `on`, the
+   * distance to `to` as placed (negative inside), `Infinity` beyond
+   * `maxDistance`, NaN for dead or unused vertices. It follows edits and
+   * placements by the mesh modes, like normals.
+   *
+   * @throws `INVALID_ARGUMENT` when `on` is `to`, `maxDistance` is negative or NaN, or the name is taken.
+   */
+  addDistanceField(desc: DistanceFieldDesc): FieldHandle {
+    const s = this.#scene();
+    const ids = this.#flatIds([desc.on, desc.to]);
+    const sign = codeIn(SIGNS, desc.sign ?? "auto", "sign");
+    if (typeof desc.name !== "string") {
+      throw invalid("name must be a string");
+    }
+    const raw = call(() => s.add_distance_field(desc.name, ids, desc.maxDistance, sign));
+    return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
+  }
+
+  /** Removes a field, and a colouring by it. Its handle then gives `UNKNOWN_FIELD`. */
+  removeField(field: FieldHandle): void {
+    const raw = this.#field(field);
+    call(() => this.#scene().remove_field(raw));
+  }
+
+  /**
+   * A zero-copy view of the field's values as of its last update, one per
+   * vertex slot. Like render views, it is only valid until the next call
+   * that may allocate: get it right before use.
+   */
+  fieldValues(field: FieldHandle): Float32Array {
+    const raw = this.#field(field);
+    const s = this.#scene();
+    const ptr = call(() => s.field_values_ptr(raw));
+    const view = new Float32Array(wasmMemory().buffer, ptr, call(() => s.field_values_len(raw)));
+    return this.#guard === undefined ? view : this.#guard.track(view);
+  }
+
+  /** Whether the field is current, and what its sign data found out about the target mesh. */
+  fieldStatus(field: FieldHandle): FieldStatus {
+    const raw = this.#field(field);
+    const st = call(() => this.#scene().field_status(raw));
+    return {
+      current: st[0] === 1,
+      sign: {
+        mode: st[1] === 2 ? "winding" : "pseudonormal",
+        closed: st[2] === 1,
+        consistentOrientation: st[3] === 1,
+        nonManifoldVertices: st[4],
+        degenerateTriangles: st[5],
+      },
+    };
+  }
+
+  /**
+   * Colours a mesh from one of its fields (`views(mesh).colors()`), or turns
+   * colouring off with `null`, after which `colors()` returns `null`. Every
+   * vertex is recoloured and reported as `"all"`; later field updates (edits,
+   * drags) report only the vertices whose colour may change. A display
+   * setting: never recorded in history.
+   *
+   * @throws `INVALID_ARGUMENT` when the field is not on `mesh` or the rule is invalid; `UNKNOWN_FIELD`.
+   */
+  setColoring(mesh: MeshHandle, rule: ColorRule | null): void {
+    const { index, generation } = this.#id(mesh);
+    if (rule === null) {
+      call(() => this.#scene().clear_coloring(index, generation));
+      return;
+    }
+    const field = this.#field(rule.field);
+    const { map, values } = encodeRule(rule);
+    call(() => this.#scene().set_coloring(index, generation, field, map, values));
+  }
+
+  // ---- Sections ----
+
+  /**
+   * Adds a plane section of `meshes`. Results of `"eager"` meshes are computed
+   * right away; others on {@link Scene.updateSections} or `flush()`.
+   *
+   * @throws `INVALID_ARGUMENT` for a zero normal or a mesh listed twice.
+   */
+  addSection(desc: SectionDesc): SectionHandle {
+    const s = this.#scene();
+    const plane = this.#plane(desc.plane);
+    const meshes = this.#flatIds(desc.meshes);
+    const raw = call(() => s.add_section(plane, meshes, desc.fill ?? false));
+    return this.#rawHandle(this.#sections, () => new SectionHandle(), raw);
+  }
+
+  /** Moves a section's plane. */
+  setSectionPlane(section: SectionHandle, plane: SectionPlane): void {
+    const raw = this.#section(section);
+    const p = this.#plane(plane);
+    call(() => this.#scene().set_section_plane(raw, p));
+  }
+
+  /** Changes the meshes a section cuts. */
+  setSectionMeshes(section: SectionHandle, meshes: readonly MeshHandle[]): void {
+    const raw = this.#section(section);
+    const ids = this.#flatIds(meshes);
+    call(() => this.#scene().set_section_meshes(raw, ids));
+  }
+
+  /** Turns a section's fill on or off. */
+  setSectionFill(section: SectionHandle, fill: boolean): void {
+    const raw = this.#section(section);
+    call(() => this.#scene().set_section_fill(raw, fill));
+  }
+
+  /** Removes a section. Its handle then gives `UNKNOWN_SECTION`. */
+  removeSection(section: SectionHandle): void {
+    const raw = this.#section(section);
+    call(() => this.#scene().remove_section(raw));
+  }
+
+  /** Computes every stale section result, whatever the mesh modes. */
+  updateSections(): void {
+    const s = this.#scene();
+    call(() => s.update_sections());
+  }
+
+  /**
+   * A section's result for one of its meshes as of its last computation
+   * (empty before the first), copied, in world coordinates.
+   *
+   * @throws `INVALID_ARGUMENT` when the section does not cut `mesh`.
+   */
+  section(section: SectionHandle, mesh: MeshHandle): SectionResult {
+    const raw = this.#section(section);
+    const { index, generation } = this.#id(mesh);
+    const r = call(() => this.#scene().section(raw, index, generation));
+    const contours: SectionContour[] = [];
+    let at = 4;
+    for (let k = 0; k < r[3]; k++) {
+      const n = 3 * r[at + 1];
+      contours.push({ closed: r[at] === 1, points: Float32Array.from(r.subarray(at + 2, at + 2 + n)) });
+      at += 2 + n;
+    }
+    const result: SectionResult = {
+      status: r[0] === 0 ? "current" : "stale",
+      contours,
+      length: r[1],
+      area: r[2],
+    };
+    if (r[at] === 1) {
+      const np = 3 * r[at + 1];
+      const positions = Float32Array.from(r.subarray(at + 2, at + 2 + np));
+      at += 2 + np;
+      const indices = Uint32Array.from(r.subarray(at + 1, at + 1 + 3 * r[at]));
+      result.fill = { positions, indices };
+    }
+    return result;
+  }
+
+  /**
+   * The closest pair between two meshes' contours in a section, measured in
+   * the plane, or `null` when either has none or their results were cut with
+   * different planes (call {@link Scene.updateSections} first).
+   */
+  sectionGap(section: SectionHandle, a: MeshHandle, b: MeshHandle): SectionGap | null {
+    const raw = this.#section(section);
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    const g = call(() =>
+      this.#scene().section_gap(raw, ia.index, ia.generation, ib.index, ib.generation),
+    );
+    return g.length === 0 ? null : { distance: g[0], a: vec3At(g, 1), b: vec3At(g, 4) };
   }
 }

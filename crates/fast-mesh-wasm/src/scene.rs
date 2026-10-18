@@ -9,11 +9,20 @@
 //! address in wasm memory and a length in elements of the TypeScript array
 //! type, and the TypeScript layer builds typed-array views from them. A
 //! view is valid until the next call that may allocate.
+//!
+//! Field and section ids cross as their raw `u32` and are checked with
+//! [`Scene::field_id`] and [`Scene::section_id`]. Query and section results
+//! are flat `f64` arrays (ids, counts and flags included, all exact in
+//! `f64`) whose layout each method documents; the TypeScript layer builds
+//! objects from them. A list of meshes is flat `[index, generation, ...]`.
 
 use std::collections::BTreeMap;
 
+use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    MeshId, MeshOptions, Placement, Scene, SceneError, SceneOptions, UpdateMode,
+    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldId, MeshId, MeshOptions,
+    OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError, SceneOptions,
+    SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, UpdateMode,
 };
 use fast_mesh_store::Mesh;
 use wasm_bindgen::prelude::*;
@@ -51,6 +60,109 @@ fn len(n: usize) -> u32 {
     n as u32
 }
 
+/// A count for a flat `f64` result (lossless: far below 2^53).
+fn count(n: usize) -> f64 {
+    n as f64
+}
+
+fn vec3(v: &[f64], what: &str) -> Result<[f64; 3], Error> {
+    v.try_into().map_err(|_| Error::invalid(what))
+}
+
+/// A world plane from `[origin xyz, normal xyz]`, with its default frame.
+fn parse_plane(v: &[f64]) -> Result<Plane, Error> {
+    let [ox, oy, oz, nx, ny, nz]: [f64; 6] = v
+        .try_into()
+        .map_err(|_| Error::invalid("plane must have 6 values (origin, normal)"))?;
+    Plane::new([ox, oy, oz], [nx, ny, nz]).map_err(|e| SceneError::Query(e).into())
+}
+
+/// The sign mode of its binding code: 0 Auto, 1 Pseudonormal, 2 Winding.
+fn parse_sign(sign: u8) -> Result<SignMode, Error> {
+    match sign {
+        0 => Ok(SignMode::Auto),
+        1 => Ok(SignMode::Pseudonormal),
+        2 => Ok(SignMode::Winding),
+        _ => Err(Error::invalid(
+            "sign must be 0 (auto), 1 (pseudonormal) or 2 (winding)",
+        )),
+    }
+}
+
+/// The binding code of a sign mode, as [`parse_sign`] reads it.
+fn sign_code(sign: SignMode) -> u32 {
+    match sign {
+        SignMode::Auto => 0,
+        SignMode::Pseudonormal => 1,
+        SignMode::Winding => 2,
+    }
+}
+
+/// An out-of-range rule from its code: 0 Clamp, 1 Base.
+fn parse_out_of_range(code: f32) -> Result<OutOfRange, Error> {
+    if code == 0.0 {
+        Ok(OutOfRange::Clamp)
+    } else if code == 1.0 {
+        Ok(OutOfRange::Base)
+    } else {
+        Err(Error::invalid(
+            "below and above must be 0 (clamp) or 1 (base)",
+        ))
+    }
+}
+
+/// An RGBA8 colour from 4 values that must be integers in `0..=255`.
+fn parse_rgba(v: &[f32]) -> Result<[u8; 4], Error> {
+    let mut out = [0; 4];
+    for (o, &c) in out.iter_mut().zip(v) {
+        if !(0.0..=255.0).contains(&c) || c.fract() != 0.0 {
+            return Err(Error::invalid(
+                "colour channels must be integers in 0..=255",
+            ));
+        }
+        *o = c as u8;
+    }
+    Ok(out)
+}
+
+/// A colour rule from `map` (0 Turbo, 1 Viridis, 2 Coolwarm, 3 Grayscale,
+/// 4 custom stops) and `rule`: `[lo, hi, center (NaN for none), below,
+/// above, base rgba, nan rgba]`, then for custom stops `(t, r, g, b, a)`
+/// each. The rule's own checks run in [`Scene::set_coloring`].
+fn parse_rule(map: u8, rule: &[f32]) -> Result<ColorRule, Error> {
+    const HEAD: usize = 13;
+    let (stops_flat, rest) = rule.get(HEAD..).unwrap_or_default().as_chunks::<5>();
+    if rule.len() < HEAD || !rest.is_empty() || (map != 4 && !stops_flat.is_empty()) {
+        return Err(Error::invalid("malformed colour rule"));
+    }
+    let map = match map {
+        0 => Colormap::Turbo,
+        1 => Colormap::Viridis,
+        2 => Colormap::Coolwarm,
+        3 => Colormap::Grayscale,
+        4 => {
+            let mut stops = Vec::new();
+            stops
+                .try_reserve(stops_flat.len())
+                .map_err(|_| Error::from(fast_mesh_store::StoreError::OutOfMemory))?;
+            for s in stops_flat {
+                stops.push((s[0], parse_rgba(&s[1..])?));
+            }
+            Colormap::Custom(stops)
+        }
+        _ => return Err(Error::invalid("unknown colormap")),
+    };
+    Ok(ColorRule {
+        map,
+        range: (rule[0], rule[1]),
+        center: (!rule[2].is_nan()).then_some(rule[2]),
+        below: parse_out_of_range(rule[3])?,
+        above: parse_out_of_range(rule[4])?,
+        base: parse_rgba(&rule[5..9])?,
+        nan: parse_rgba(&rule[9..13])?,
+    })
+}
+
 impl Default for WasmScene {
     fn default() -> Self {
         WasmScene::new()
@@ -67,6 +179,33 @@ impl WasmScene {
 
     fn mesh(&self, index: u32, generation: u32) -> Result<&Mesh, Error> {
         Ok(self.scene.mesh(self.id(index, generation)?)?)
+    }
+
+    /// The live mesh ids of a flat `[index, generation, ...]` list.
+    fn ids(&self, flat: &[u32]) -> Result<Vec<MeshId>, Error> {
+        let (pairs, rest) = flat.as_chunks::<2>();
+        if !rest.is_empty() {
+            return Err(Error::invalid("a mesh list needs index, generation pairs"));
+        }
+        let mut out = Vec::new();
+        out.try_reserve(pairs.len())
+            .map_err(|_| Error::from(fast_mesh_store::StoreError::OutOfMemory))?;
+        for &[index, generation] in pairs {
+            out.push(self.id(index, generation)?);
+        }
+        Ok(out)
+    }
+
+    fn field(&self, raw: u32) -> Result<FieldId, Error> {
+        self.scene
+            .field_id(raw)
+            .ok_or_else(|| SceneError::UnknownField.into())
+    }
+
+    fn section_id(&self, raw: u32) -> Result<SectionId, Error> {
+        self.scene
+            .section_id(raw)
+            .ok_or_else(|| SceneError::UnknownSection.into())
     }
 }
 
@@ -350,6 +489,356 @@ impl WasmScene {
     pub fn cancel_step(&mut self) -> Result<(), Error> {
         Ok(self.scene.cancel_step()?)
     }
+
+    // ---- Queries (world space) ----
+
+    /// The nearest hit of a world ray over every mesh with
+    /// `min_distance <= t <= max_distance`; `cull` is 0 (none), 1 (back
+    /// faces) or 2 (front faces). Empty on a miss, else `[index,
+    /// generation, triangle, point xyz, distance, barycentric uvw]`.
+    pub fn raycast(
+        &mut self,
+        origin: &[f64],
+        direction: &[f64],
+        min_distance: f64,
+        max_distance: f64,
+        cull: u8,
+    ) -> Result<Vec<f64>, Error> {
+        let origin = vec3(origin, "origin must have 3 values")?;
+        let dir = vec3(direction, "direction must have 3 values")?;
+        let cull = match cull {
+            0 => Cull::None,
+            1 => Cull::Back,
+            2 => Cull::Front,
+            _ => {
+                return Err(Error::invalid(
+                    "cull must be 0 (none), 1 (back) or 2 (front)",
+                ));
+            }
+        };
+        let opts = SceneRayOptions {
+            min_t: min_distance,
+            max_t: max_distance,
+            cull,
+        };
+        Ok(match self.scene.raycast(origin, dir, &opts)? {
+            None => Vec::new(),
+            Some(h) => {
+                let mut out = vec![
+                    f64::from(h.mesh.index()),
+                    f64::from(h.mesh.generation()),
+                    f64::from(h.hit.triangle),
+                ];
+                out.extend_from_slice(&h.point);
+                out.push(h.t);
+                out.extend(h.hit.barycentric.map(f64::from));
+                out
+            }
+        })
+    }
+
+    /// The point of the scene nearest to world point `p` within
+    /// `max_distance`. Empty when none, else `[index, generation, triangle,
+    /// point xyz, distance]`.
+    pub fn closest_point(&mut self, p: &[f64], max_distance: f64) -> Result<Vec<f64>, Error> {
+        let p = vec3(p, "point must have 3 values")?;
+        let opts = SceneClosestOptions { max_distance };
+        let hit = self.scene.closest_point(p, &opts)?;
+        Ok(hit.map_or_else(Vec::new, closest_record))
+    }
+
+    /// [`WasmScene::closest_point`] on one mesh.
+    pub fn closest_point_on(
+        &mut self,
+        index: u32,
+        generation: u32,
+        p: &[f64],
+        max_distance: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let p = vec3(p, "point must have 3 values")?;
+        let opts = SceneClosestOptions { max_distance };
+        let hit = self.scene.closest_point_on(id, p, &opts)?;
+        Ok(hit.map_or_else(Vec::new, closest_record))
+    }
+
+    /// The distance between two meshes' surfaces as placed. Empty when it
+    /// exceeds `max_distance` or a mesh has no triangle, else `[distance,
+    /// point on a xyz, point on b xyz, triangle of a, triangle of b]`.
+    pub fn mesh_distance(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+        max_distance: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        Ok(match self.scene.mesh_distance(a, b, max_distance)? {
+            None => Vec::new(),
+            Some(d) => {
+                let mut out = vec![d.distance];
+                out.extend_from_slice(&d.point_a);
+                out.extend_from_slice(&d.point_b);
+                out.push(f64::from(d.triangle_a));
+                out.push(f64::from(d.triangle_b));
+                out
+            }
+        })
+    }
+
+    /// Whether two meshes intersect or touch as placed.
+    pub fn intersects(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+    ) -> Result<bool, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        Ok(self.scene.intersects(a, b)?)
+    }
+
+    /// The mesh pairs within `margin` of each other, of `pairs` (flat
+    /// `[a index, a generation, b index, b generation, ...]`) or of the
+    /// whole scene. `[count, contact...]`, each contact `[a index, a
+    /// generation, b index, b generation, intersecting (0/1), distance,
+    /// triangle count of a, of b, triangles of a..., triangles of b...]`.
+    pub fn find_contacts(
+        &mut self,
+        margin: f64,
+        pairs: Option<Vec<u32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let pairs = match pairs {
+            None => None,
+            Some(flat) => {
+                if !flat.len().is_multiple_of(4) {
+                    return Err(Error::invalid("contact pairs need two meshes each"));
+                }
+                let ids = self.ids(&flat)?;
+                Some(
+                    ids.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&[a, b]| (a, b))
+                        .collect(),
+                )
+            }
+        };
+        let mut found = Vec::new();
+        self.scene
+            .find_contacts(margin, &ContactFilter { pairs }, &mut found)?;
+        let mut out = vec![count(found.len())];
+        for c in &found {
+            out.extend([
+                f64::from(c.a.index()),
+                f64::from(c.a.generation()),
+                f64::from(c.b.index()),
+                f64::from(c.b.generation()),
+                f64::from(u8::from(c.intersecting)),
+                c.distance,
+                count(c.triangles_a.len()),
+                count(c.triangles_b.len()),
+            ]);
+            out.extend(c.triangles_a.iter().map(|&t| f64::from(t)));
+            out.extend(c.triangles_b.iter().map(|&t| f64::from(t)));
+        }
+        Ok(out)
+    }
+
+    // ---- Fields and colours ----
+
+    /// Adds a signed distance field on mesh `on` to mesh `to`, given as
+    /// `[on index, on generation, to index, to generation]`, and returns
+    /// its raw id. `sign` is 0 (auto), 1 (pseudonormal) or 2 (winding).
+    pub fn add_distance_field(
+        &mut self,
+        name: String,
+        on_to: &[u32],
+        max_distance: f64,
+        sign: u8,
+    ) -> Result<u32, Error> {
+        let [on, to]: [MeshId; 2] = self
+            .ids(on_to)?
+            .try_into()
+            .map_err(|_| Error::invalid("a field needs two meshes"))?;
+        let desc = DistanceField {
+            name,
+            on,
+            to,
+            max_distance,
+            sign: parse_sign(sign)?,
+        };
+        Ok(self.scene.add_distance_field(desc)?.raw())
+    }
+
+    /// Removes a field (and a colouring by it).
+    pub fn remove_field(&mut self, field: u32) -> Result<(), Error> {
+        Ok(self.scene.remove_field(self.field(field)?)?)
+    }
+
+    /// Address of the field's values (`f32`, one per vertex slot of its
+    /// mesh).
+    pub fn field_values_ptr(&self, field: u32) -> Result<u32, Error> {
+        Ok(addr(self.scene.field_values(self.field(field)?)?))
+    }
+
+    /// Length of the field's values in `f32`s.
+    pub fn field_values_len(&self, field: u32) -> Result<u32, Error> {
+        Ok(len(self.scene.field_values(self.field(field)?)?.len()))
+    }
+
+    /// `[current (0/1), sign mode (1 pseudonormal, 2 winding), closed,
+    /// consistent orientation, non-manifold vertices, degenerate
+    /// triangles]`.
+    pub fn field_status(&self, field: u32) -> Result<Vec<u32>, Error> {
+        let s = self.scene.field_status(self.field(field)?)?;
+        let sign = s.sign;
+        Ok(vec![
+            u32::from(s.current),
+            sign_code(sign.mode),
+            u32::from(sign.closed),
+            u32::from(sign.consistent_orientation),
+            len(sign.non_manifold_vertices),
+            len(sign.degenerate_triangles),
+        ])
+    }
+
+    /// Colours a mesh from one of its fields; see [`parse_rule`] for `map`
+    /// and `rule`. A display setting: not recorded in history.
+    pub fn set_coloring(
+        &mut self,
+        index: u32,
+        generation: u32,
+        field: u32,
+        map: u8,
+        rule: &[f32],
+    ) -> Result<(), Error> {
+        let id = self.id(index, generation)?;
+        let coloring = Coloring {
+            field: self.field(field)?,
+            rule: parse_rule(map, rule)?,
+        };
+        Ok(self.scene.set_coloring(id, Some(coloring))?)
+    }
+
+    /// Stops colouring a mesh. Not recorded in history.
+    pub fn clear_coloring(&mut self, index: u32, generation: u32) -> Result<(), Error> {
+        let id = self.id(index, generation)?;
+        Ok(self.scene.set_coloring(id, None)?)
+    }
+
+    // ---- Sections ----
+
+    /// Adds a section cutting `meshes` (flat pairs) with the world plane
+    /// `[origin xyz, normal xyz]`, and returns its raw id.
+    pub fn add_section(&mut self, plane: &[f64], meshes: &[u32], fill: bool) -> Result<u32, Error> {
+        let desc = SectionDesc {
+            plane: parse_plane(plane)?,
+            meshes: self.ids(meshes)?,
+            fill,
+        };
+        Ok(self.scene.add_section(desc)?.raw())
+    }
+
+    /// Removes a section.
+    pub fn remove_section(&mut self, section: u32) -> Result<(), Error> {
+        Ok(self.scene.remove_section(self.section_id(section)?)?)
+    }
+
+    /// Moves a section's plane, `[origin xyz, normal xyz]`.
+    pub fn set_section_plane(&mut self, section: u32, plane: &[f64]) -> Result<(), Error> {
+        let id = self.section_id(section)?;
+        Ok(self.scene.set_section_plane(id, parse_plane(plane)?)?)
+    }
+
+    /// Changes the meshes a section cuts (flat pairs).
+    pub fn set_section_meshes(&mut self, section: u32, meshes: &[u32]) -> Result<(), Error> {
+        let id = self.section_id(section)?;
+        Ok(self.scene.set_section_meshes(id, self.ids(meshes)?)?)
+    }
+
+    /// Turns a section's fill on or off.
+    pub fn set_section_fill(&mut self, section: u32, fill: bool) -> Result<(), Error> {
+        let id = self.section_id(section)?;
+        Ok(self.scene.set_section_fill(id, fill)?)
+    }
+
+    /// Computes every stale section entry.
+    pub fn update_sections(&mut self) -> Result<(), Error> {
+        Ok(self.scene.update_sections()?)
+    }
+
+    /// A section's result for a mesh, in world coordinates: `[status (0
+    /// current, 1 stale), length, area, contour count, contour..., has fill
+    /// (0/1), fill]`. Each contour is `[closed (0/1), point count, xyz...]`;
+    /// the fill is `[point count, xyz..., triangle count, abc...]`.
+    pub fn section(&self, section: u32, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
+        let id = self.section_id(section)?;
+        let mesh = self.id(index, generation)?;
+        let r = self.scene.section(id, mesh)?;
+        let status = match self.scene.section_status(id, mesh)? {
+            SectionStatus::Current => 0.0,
+            SectionStatus::Stale => 1.0,
+        };
+        let mut out = vec![status, r.length, r.area, count(r.contours.len())];
+        for c in &r.contours {
+            out.push(f64::from(u8::from(c.closed)));
+            out.push(count(c.points.len()));
+            out.extend(c.points.iter().flatten());
+        }
+        // The fill is in the frame of the plane it was computed with.
+        match (&r.fill, self.scene.section_plane(id, mesh)?) {
+            (Some(fill), Some(plane)) => {
+                out.push(1.0);
+                out.push(count(fill.points.len()));
+                out.extend(fill.points.iter().flat_map(|&q| plane.from_uv(q)));
+                out.push(count(fill.triangles.len()));
+                out.extend(fill.triangles.iter().flatten().map(|&i| f64::from(i)));
+            }
+            _ => out.push(0.0),
+        }
+        Ok(out)
+    }
+
+    /// The closest pair between two meshes' contours in a section. Empty
+    /// when there is none, else `[distance, point on a xyz, point on b
+    /// xyz]`.
+    pub fn section_gap(
+        &self,
+        section: u32,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.section_id(section)?;
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        Ok(match self.scene.section_gap(id, a, b)? {
+            None => Vec::new(),
+            Some(g) => {
+                let mut out = vec![g.distance];
+                out.extend_from_slice(&g.a);
+                out.extend_from_slice(&g.b);
+                out
+            }
+        })
+    }
+}
+
+/// `[index, generation, triangle, point xyz, distance]` of a closest hit.
+fn closest_record(h: fast_mesh_scene::SceneClosestHit) -> Vec<f64> {
+    let mut out = vec![
+        f64::from(h.mesh.index()),
+        f64::from(h.mesh.generation()),
+        f64::from(h.hit.triangle),
+    ];
+    out.extend_from_slice(&h.point);
+    out.push(h.distance);
+    out
 }
 
 #[cfg(test)]
@@ -643,5 +1132,236 @@ mod tests {
         s.update(i, g).unwrap();
         assert!(s.scene.is_current(id).unwrap());
         assert_eq!(parse_mode(1).unwrap(), UpdateMode::Lazy);
+    }
+
+    /// An octahedron of "radius" `r` centred at `c`: closed and consistently
+    /// oriented, with its equator square in the plane `z = c.z`.
+    fn octahedron(s: &mut WasmScene, c: [f64; 3], r: f64) -> (u32, u32) {
+        let mut pos = Vec::new();
+        for d in [
+            [r, 0., 0.],
+            [0., r, 0.],
+            [-r, 0., 0.],
+            [0., -r, 0.],
+            [0., 0., r],
+            [0., 0., -r],
+        ] {
+            pos.extend((0..3).map(|k| c[k] + d[k]));
+        }
+        let tris = [
+            0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4, 1, 0, 5, 2, 1, 5, 3, 2, 5, 0, 3, 5,
+        ];
+        let id = s.add_mesh(&pos, &tris, None, 0, true).unwrap();
+        (id[0], id[1])
+    }
+
+    #[test]
+    fn queries_in_world_space() {
+        let mut s = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        let inf = f64::INFINITY;
+        // The ray along +x hits A's vertex at x = -1.
+        let h = s
+            .raycast(&[-5., 0., 0.], &[2., 0., 0.], 0., inf, 0)
+            .unwrap();
+        assert_eq!(&h[..2], &[f64::from(ai), f64::from(ag)]);
+        assert_eq!(h.len(), 10);
+        assert!((h[6] - 4.).abs() < 1e-6 && (h[3] + 1.).abs() < 1e-6);
+        assert!((h[7] + h[8] + h[9] - 1.).abs() < 1e-6);
+        assert_eq!(
+            s.raycast(&[-5., 0., 0.], &[1., 0., 0.], 0., 3., 0).unwrap(),
+            []
+        );
+        // Placements move meshes in the world.
+        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 10.]).unwrap();
+        let h = s
+            .raycast(&[3., 0., 20.], &[0., 0., -1.], 0., inf, 1)
+            .unwrap();
+        assert_eq!(&h[..2], &[f64::from(bi), f64::from(bg)]);
+        assert!((h[5] - 11.).abs() < 1e-6);
+        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 0.]).unwrap();
+
+        let c = s.closest_point(&[1.5, 0., 0.], inf).unwrap();
+        assert_eq!(&c[..2], &[f64::from(ai), f64::from(ag)]);
+        assert!((c[6] - 0.5).abs() < 1e-6);
+        let c = s.closest_point_on(bi, bg, &[1.5, 0., 0.], inf).unwrap();
+        assert_eq!(c[0], f64::from(bi));
+        assert_eq!(s.closest_point(&[1.5, 0., 0.], 0.1).unwrap(), []);
+
+        let d = s.mesh_distance(ai, ag, bi, bg, inf).unwrap();
+        assert_eq!(d.len(), 9);
+        assert!((d[0] - 1.).abs() < 1e-6 && (d[1] - 1.).abs() < 1e-6 && (d[4] - 2.).abs() < 1e-6);
+        assert_eq!(s.mesh_distance(ai, ag, bi, bg, 0.5).unwrap(), []);
+        assert!(!s.intersects(ai, ag, bi, bg).unwrap());
+
+        assert_eq!(s.find_contacts(0.5, None).unwrap(), [0.]);
+        let msg = s.find_contacts(1.5, None).unwrap();
+        assert_eq!(msg[0], 1.);
+        let head = [ai, ag, bi, bg].map(f64::from);
+        assert_eq!(&msg[1..5], &head);
+        assert_eq!(msg[5], 0.);
+        let (na, nb) = (msg[7] as usize, msg[8] as usize);
+        assert!(na > 0 && nb > 0 && msg.len() == 9 + na + nb);
+        let pairs = Some(vec![bi, bg, ai, ag]);
+        assert_eq!(s.find_contacts(1.5, pairs).unwrap(), msg);
+
+        // Malformed input.
+        assert_eq!(
+            code(s.raycast(&[0.; 2], &[1., 0., 0.], 0., inf, 0)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.raycast(&[0.; 3], &[1., 0., 0.], 0., inf, 3)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.find_contacts(1., Some(vec![ai, ag, bi]))),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.find_contacts(1., Some(vec![ai, ag, bi, bg + 1]))),
+            codes::UNKNOWN_MESH
+        );
+    }
+
+    #[test]
+    fn fields_and_coloring_off_history() {
+        let mut s = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        let f = s
+            .add_distance_field("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        assert_eq!(s.field_status(f).unwrap(), vec![1, 1, 1, 1, 0, 0]);
+        assert_eq!(s.field_values_len(f).unwrap(), 6);
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
+        assert_eq!(s.field_values_ptr(f).unwrap(), values.as_ptr() as u32);
+        assert!((values[0] - 1.).abs() < 1e-6);
+
+        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.]).unwrap();
+        s.undo().unwrap();
+        s.take_changes();
+        let rule = |extra: &[f32]| {
+            let mut r = vec![0., 4., f32::NAN, 0., 1., 9., 9., 9., 255., 0., 0., 0., 255.];
+            r.extend_from_slice(extra);
+            r
+        };
+        s.set_coloring(ai, ag, f, 0, &rule(&[])).unwrap();
+        assert_eq!(s.colors_len(ai, ag).unwrap(), 24);
+        assert!(s.take_changes()[3] & FLAG_COLORS_ALL != 0);
+        s.clear_coloring(ai, ag).unwrap();
+        assert_eq!(s.colors_ptr(ai, ag).unwrap(), 0);
+        // Display settings leave history alone: the redo step survives.
+        assert!(s.can_redo());
+        // Custom stops, and every malformed rule.
+        let stops = [0., 255., 0., 0., 255., 1., 0., 0., 255., 255.];
+        s.set_coloring(ai, ag, f, 4, &rule(&stops)).unwrap();
+        let bad = [
+            (0, rule(&stops)),
+            (4, rule(&stops[..7])),
+            (5, rule(&[])),
+            (0, rule(&[])[..12].to_vec()),
+            (0, {
+                let mut r = rule(&[]);
+                r[3] = 2.;
+                r
+            }),
+            (0, {
+                let mut r = rule(&[]);
+                r[5] = 256.;
+                r
+            }),
+            (0, {
+                let mut r = rule(&[]);
+                r[1] = -1.;
+                r
+            }),
+        ];
+        for (map, r) in bad {
+            assert_eq!(
+                code(s.set_coloring(ai, ag, f, map, &r)),
+                codes::INVALID_ARGUMENT,
+                "{map} {r:?}"
+            );
+        }
+        assert_eq!(
+            code(s.add_distance_field("e".into(), &[ai, ag], 1., 0)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_distance_field("e".into(), &[ai, ag, bi, bg], 1., 3)),
+            codes::INVALID_ARGUMENT
+        );
+        s.remove_field(f).unwrap();
+        assert_eq!(s.colors_ptr(ai, ag).unwrap(), 0);
+        assert_eq!(code(s.field_values_ptr(f)), codes::UNKNOWN_FIELD);
+        assert_eq!(code(s.field_status(f)), codes::UNKNOWN_FIELD);
+        assert_eq!(code(s.remove_field(f)), codes::UNKNOWN_FIELD);
+        assert_eq!(
+            code(s.set_coloring(ai, ag, f, 0, &rule(&[]))),
+            codes::UNKNOWN_FIELD
+        );
+    }
+
+    #[test]
+    fn section_results_in_world_space() {
+        let mut s = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        let z0 = [0., 0., 0., 0., 0., 1.];
+        let sec = s.add_section(&z0, &[ai, ag, bi, bg], true).unwrap();
+        let r = s.section(sec, bi, bg).unwrap();
+        // Current; the equator square: length 4·√2, area 2.
+        assert_eq!(r[0], 0.);
+        assert!((r[1] - 4. * 2f64.sqrt()).abs() < 1e-6);
+        assert!((r[2].abs() - 2.).abs() < 1e-6);
+        assert_eq!(&r[3..5], &[1., 1.]);
+        let n = r[5] as usize;
+        assert_eq!(n, 4);
+        let pts = &r[6..6 + 3 * n];
+        assert!(pts.chunks(3).all(|p| p[2] == 0. && (p[0] - 3.).abs() <= 1.));
+        let fill = &r[6 + 3 * n..];
+        assert_eq!(fill[0], 1.);
+        let fp = fill[1] as usize;
+        let ft = fill[2 + 3 * fp] as usize;
+        assert_eq!(fill.len(), 3 + 3 * fp + 3 * ft);
+        // Fill points are mapped to the world: around x = 3, at z = 0.
+        assert!(
+            fill[2..2 + 3 * fp]
+                .chunks(3)
+                .all(|p| p[2] == 0. && p[0] >= 2.)
+        );
+
+        let g = s.section_gap(sec, ai, ag, bi, bg).unwrap();
+        assert!((g[0] - 1.).abs() < 1e-6 && (g[1] - 1.).abs() < 1e-6 && (g[4] - 2.).abs() < 1e-6);
+
+        s.set_section_plane(sec, &[0., 0., 5., 0., 0., 1.]).unwrap();
+        s.set_section_fill(sec, false).unwrap();
+        s.update_sections().unwrap();
+        assert_eq!(s.section(sec, ai, ag).unwrap(), vec![0., 0., 0., 0., 0.]);
+        assert_eq!(s.section_gap(sec, ai, ag, bi, bg).unwrap(), []);
+        s.set_section_meshes(sec, &[ai, ag]).unwrap();
+        assert_eq!(code(s.section(sec, bi, bg)), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.set_section_plane(sec, &[0.; 6])),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_section(&z0[..5], &[ai, ag], false)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_section(&z0, &[ai], false)),
+            codes::INVALID_ARGUMENT
+        );
+        s.remove_section(sec).unwrap();
+        assert_eq!(code(s.section(sec, ai, ag)), codes::UNKNOWN_SECTION);
+        assert_eq!(code(s.set_section_fill(sec, true)), codes::UNKNOWN_SECTION);
+        assert_eq!(code(s.remove_section(sec)), codes::UNKNOWN_SECTION);
+        assert_eq!(
+            code(s.section_gap(sec, ai, ag, bi, bg)),
+            codes::UNKNOWN_SECTION
+        );
     }
 }

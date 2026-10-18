@@ -594,6 +594,18 @@ impl Scene {
         })
     }
 
+    /// The world plane the section's result for `mesh` was computed with,
+    /// whose `(u, v)` frame its 2D points and fill are in; `None` before the
+    /// first computation. It differs from the section's plane while a plane
+    /// move is not yet computed. Never updates.
+    ///
+    /// # Errors
+    /// As for [`Scene::section`].
+    pub fn section_plane(&self, id: SectionId, mesh: MeshId) -> Result<Option<Plane>> {
+        let (i, k) = self.section_entry(id, mesh)?;
+        Ok(self.sections[i].entries[k].plane)
+    }
+
     /// The closest pair between the contours of meshes `a` and `b` in the
     /// section, measured in the plane, with its points in the world; `None`
     /// when either has no contour segments. Never updates: it reads the last
@@ -1752,6 +1764,41 @@ mod tests {
         scene.update_sections().unwrap();
         let g = scene.section_gap(id, a, b).unwrap().unwrap();
         assert!((g.a[2] - 0.1).abs() < 1e-9 && (g.b[2] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn section_plane_is_the_plane_computed_with() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(unit_sphere(), with_mode(UpdateMode::Lazy))
+            .unwrap();
+        let c = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let id = scene
+            .add_section(desc(z_plane(0.0), &[a, b], true))
+            .unwrap();
+        // a (Eager) is computed, b (Lazy) not yet.
+        assert_eq!(scene.section_plane(id, a), Ok(Some(z_plane(0.0))));
+        assert_eq!(scene.section_plane(id, b), Ok(None));
+        scene.set_section_plane(id, z_plane(0.1)).unwrap();
+        scene.update_sections().unwrap();
+        scene.set_section_plane(id, z_plane(0.2)).unwrap();
+        assert_eq!(scene.section_plane(id, a), Ok(Some(z_plane(0.2))));
+        assert_eq!(scene.section_plane(id, b), Ok(Some(z_plane(0.1))));
+        // The fill maps to the world through that plane.
+        let p = scene.section_plane(id, a).unwrap().unwrap();
+        let fill = scene.section(id, a).unwrap().fill.clone().unwrap();
+        assert!(fill.points.iter().all(|&q| p.from_uv(q)[2] == 0.2));
+        assert!(matches!(
+            scene.section_plane(id, c),
+            Err(SceneError::InvalidInput(_))
+        ));
+        scene.remove_section(id).unwrap();
+        assert_eq!(scene.section_plane(id, a), Err(SceneError::UnknownSection));
     }
 
     #[test]
