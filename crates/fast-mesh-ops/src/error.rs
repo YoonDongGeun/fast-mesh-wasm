@@ -29,9 +29,14 @@ impl From<StoreError> for OpsError {
     }
 }
 
+/// A query running out of memory becomes [`OpsError::Store`] with
+/// [`StoreError::OutOfMemory`], like every other allocation failure here.
 impl From<QueryError> for OpsError {
     fn from(e: QueryError) -> Self {
-        OpsError::Query(e)
+        match e {
+            QueryError::OutOfMemory => OpsError::Store(StoreError::OutOfMemory),
+            e => OpsError::Query(e),
+        }
     }
 }
 
@@ -75,6 +80,8 @@ mod tests {
         let q: OpsError = QueryError::StaleBvh.into();
         assert_eq!(q, OpsError::Query(QueryError::StaleBvh));
         assert!(q.source().is_some());
+        let oom: OpsError = QueryError::OutOfMemory.into();
+        assert_eq!(oom, OpsError::Store(StoreError::OutOfMemory));
         assert_eq!(
             OpsError::InvalidInput("no bound").to_string(),
             "invalid input: no bound"

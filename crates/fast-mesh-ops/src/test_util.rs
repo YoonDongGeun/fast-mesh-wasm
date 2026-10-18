@@ -287,3 +287,47 @@ pub(crate) fn box_mesh(lo: [f32; 3], hi: [f32; 3]) -> Mesh {
 pub(crate) fn crossed_boxes() -> Mesh {
     combine(&[&box_mesh([0.0; 3], [2.0; 3]), &box_mesh([1.0; 3], [3.0; 3])])
 }
+
+/// [`uv_sphere`]`(8, 12, 1.0)` (vertex ids `1 + 12 (i - 1) + j` for ring `i`,
+/// column `j`; south pole 85) with known damage, every site sharing no vertex
+/// with another. Quad `(i, j)` lies between rings `i`, `i + 1` and columns
+/// `j`, `j + 1`; its first triangle is `[ring(i, j), ring(i + 1, j),
+/// ring(i + 1, j + 1)]`, the one damaged.
+/// - Holes: quads (1, 0), (3, 3) and (5, 6) lose their triangle, which
+///   leaves three 3-vertex loops.
+/// - Flips: quads (1, 3), (1, 6), (3, 9), (5, 0) and (5, 9) have their
+///   triangle reversed, each against three neighbours.
+/// - Duplicated vertices 86 to 89: copies of ring(i, j) for quads (1, 9),
+///   (3, 0), (3, 6) and (5, 3), in that order, each taking that corner of
+///   the quad's triangle. Each leaves a 4-vertex slit loop.
+/// - A copy of south triangle `[77, 85, 78]`, corners rotated: three
+///   non-manifold edges.
+/// - Two triangles with a repeated vertex id, `[5, 5, 6]` and `[40, 41, 40]`.
+/// - A floating unit square of two triangles on vertices 90 to 93.
+///
+/// The appended triangles end up as 165 (the copy), 166 and 167 (repeated
+/// ids), and 168 and 169 (the square).
+pub(crate) fn damaged_sphere() -> Mesh {
+    let (mut positions, mut triangles) = parts(&uv_sphere(8, 12, 1.0));
+    let quad = |i: usize, j: usize| j * 13 + 1 + 2 * (i - 1);
+    for (i, j) in [(1, 3), (1, 6), (3, 9), (5, 0), (5, 9)] {
+        triangles[quad(i, j)].swap(1, 2);
+    }
+    for (i, j) in [(1, 9), (3, 0), (3, 6), (5, 3)] {
+        let t = &mut triangles[quad(i, j)];
+        let v = 3 * t[0] as usize;
+        t[0] = (positions.len() / 3) as u32;
+        positions.extend_from_within(v..v + 3);
+    }
+    let [a, b, c] = triangles[156 + 4];
+    triangles.push([b, c, a]);
+    triangles.extend([[5, 5, 6], [40, 41, 40]]);
+    let base = (positions.len() / 3) as u32;
+    positions.extend([5.0, 0.0, 0.0, 6.0, 0.0, 0.0, 6.0, 1.0, 0.0, 5.0, 1.0, 0.0]);
+    triangles.extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
+    // Last, from the highest id down, so the other indices above stay valid.
+    for (i, j) in [(5, 6), (3, 3), (1, 0)] {
+        triangles.remove(quad(i, j));
+    }
+    mesh_of(&positions, &triangles)
+}

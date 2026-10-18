@@ -17,12 +17,19 @@
 //!   [`BoundaryLoop`]s by walking each vertex's triangle fan, so that two holes
 //!   touching at one vertex come out as two loops. Each loop has a content
 //!   fingerprint, a [`LoopId`], that callers use to pick loops to fill.
+//! - Analysis: [`analyze`] reports a mesh's defects without changing it, as
+//!   an [`Analysis`]: loops, coincident vertices, degenerate and duplicate
+//!   triangles, non-manifold edges and vertices, pinch vertices, components,
+//!   orientation conflicts and, given a BVH, self-intersection.
 
+mod analyze;
 mod error;
 #[cfg(test)]
 mod test_util;
 mod topology;
+mod weld;
 
+pub use analyze::{Analysis, AnalyzeOptions, analyze};
 pub use error::{OpsError, Result};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 

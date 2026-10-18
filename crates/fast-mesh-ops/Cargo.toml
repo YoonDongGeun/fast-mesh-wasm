@@ -13,6 +13,7 @@ authors.workspace = true
 
 [dependencies]
 fast-mesh-store.workspace = true
+fast-mesh-bvh.workspace = true
 fast-mesh-query.workspace = true
 
 [dev-dependencies]

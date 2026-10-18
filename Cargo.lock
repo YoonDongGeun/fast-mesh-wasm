@@ -294,6 +294,7 @@ name = "fast-mesh-ops"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "fast-mesh-bvh",
  "fast-mesh-query",
  "fast-mesh-store",
  "proptest",

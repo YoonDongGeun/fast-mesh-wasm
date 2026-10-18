@@ -145,14 +145,12 @@ fn kind_of(triangles: usize) -> EdgeKind {
 }
 
 /// For every vertex, the proper triangles using it, in ascending id order.
-#[allow(dead_code, reason = "used by the repair operations of later tasks")]
 pub(crate) struct VertexFans {
     /// Vertex `v`'s fan is `tris[starts[v]..starts[v + 1]]`.
     starts: Vec<u32>,
     tris: Vec<TriangleId>,
 }
 
-#[allow(dead_code, reason = "used by the repair operations of later tasks")]
 impl VertexFans {
     pub(crate) fn build(mesh: &Mesh) -> Result<VertexFans> {
         let slots = mesh.vertex_slots();
@@ -198,24 +196,24 @@ impl VertexFans {
 }
 
 /// A union-find over `0..n` whose roots are always the smallest member.
-struct UnionFind {
+pub(crate) struct UnionFind {
     parent: Vec<u32>,
 }
 
 impl UnionFind {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         UnionFind { parent: Vec::new() }
     }
 
     /// Resets to `n` singletons, reusing the storage.
-    fn reset(&mut self, n: usize) -> Result<()> {
+    pub(crate) fn reset(&mut self, n: usize) -> Result<()> {
         self.parent.clear();
         reserve(&mut self.parent, n)?;
         self.parent.extend(0..n as u32);
         Ok(())
     }
 
-    fn find(&mut self, mut x: u32) -> u32 {
+    pub(crate) fn find(&mut self, mut x: u32) -> u32 {
         while self.parent[x as usize] != x {
             let up = self.parent[self.parent[x as usize] as usize];
             self.parent[x as usize] = up;
@@ -225,7 +223,7 @@ impl UnionFind {
     }
 
     /// Joins the sets of `a` and `b`; `true` when they were separate.
-    fn union(&mut self, a: u32, b: u32) -> bool {
+    pub(crate) fn union(&mut self, a: u32, b: u32) -> bool {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra == rb {
             return false;
@@ -249,7 +247,6 @@ pub struct Component {
 
 /// The connected components of the proper triangles, sorted by their
 /// smallest triangle id.
-#[allow(dead_code, reason = "used by the repair operations of later tasks")]
 pub(crate) fn components(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<Component>> {
     let slots = mesh.triangle_slots();
     let mut uf = UnionFind::new();
@@ -296,7 +293,6 @@ pub(crate) fn components(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<Component>>
 /// piece, ascending. Triangles around a vertex `v` are in one piece when they
 /// are linked through edges at `v`, of any kind; a bowtie corner is a pinch,
 /// a fin's spine is not.
-#[allow(dead_code, reason = "used by the repair operations of later tasks")]
 pub(crate) fn pinch_vertices(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<VertexId>> {
     let fans = VertexFans::build(mesh)?;
     let mut uf = UnionFind::new();
