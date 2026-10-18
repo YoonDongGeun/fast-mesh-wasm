@@ -27,14 +27,19 @@
 //!   mesh within a margin of the other) and [`intersecting_pairs`]. Results
 //!   are in A's space; passing the same mesh twice means two coincident
 //!   copies.
+//! - Cutting planes: a [`Plane`] (origin and unit normal, in `f64` mesh-local
+//!   coordinates) with an orthonormal 2D frame `(u, v)`. A point is on its
+//!   `+` side when its signed distance is zero or more.
 
 mod closest;
 mod error;
 mod pair;
 mod pairs;
+mod plane;
 mod ray;
 mod region;
 mod rigid;
+mod slice;
 #[cfg(test)]
 mod test_util;
 mod tri;
@@ -48,6 +53,7 @@ pub use error::{QueryError, Result};
 /// The axis-aligned box type of [`Region::Box`], re-exported from `fast_mesh_bvh`.
 pub use fast_mesh_bvh::Aabb;
 pub use pairs::*;
+pub use plane::Plane;
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;
