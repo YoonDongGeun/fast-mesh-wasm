@@ -10,8 +10,11 @@
 //! `benches/query.rs` of `fast-mesh-query` does, and turn it by a little more
 //! about z at every iteration, cycling through 64 poses that just touch:
 //! `mesh_distance` at one fixed pose, and `set_placement` plus `mesh_distance`
-//! through the 64 poses. The direct calls get the pose as a `Rigid`. A last
-//! benchmark casts the same rays on a scene of both meshes.
+//! through the 64 poses. The direct calls get the pose as a `Rigid`. Another
+//! benchmark casts the same rays on a scene of both meshes. Two last ones run
+//! `find_contacts` (margin 0.05) on the two touching meshes, the owner's
+//! per-frame case: at the fixed pose, and with `set_placement` through the 64
+//! poses.
 //!
 //! **`find_contacts`** over 2, 8 and 32 small meshes (`terrain(32)`, 2,048
 //! triangles each) in a row, each overlapping its neighbour a little.
@@ -253,8 +256,63 @@ fn bench_overhead(c: &mut Criterion, label: &str, n: u32) {
             }
         })
     });
+
+    // The owner's per-frame case: contacts between two touching 1M meshes.
+    let filter = ContactFilter::default();
+    let mut out: Vec<Contact> = Vec::new();
+    let (mut found, mut ta, mut tb) = (0, 0, 0);
+    for p in &placements {
+        two.set_placement(b, *p).unwrap();
+        out.clear();
+        found += two
+            .find_contacts(CONTACT_MARGIN, &filter, &mut out)
+            .unwrap();
+        for c in &out {
+            (ta, tb) = (ta + c.triangles_a.len(), tb + c.triangles_b.len());
+        }
+    }
+    eprintln!(
+        "find_contacts on two touching {label} meshes, margin {CONTACT_MARGIN}, over 64 poses: \
+         {found} contacts, {ta} + {tb} triangles listed"
+    );
+    two.set_placement(b, placements[fixed]).unwrap();
+    out.clear();
+    two.find_contacts(CONTACT_MARGIN, &filter, &mut out)
+        .unwrap();
+    eprintln!(
+        "  at the fixed pose: {} contacts, {} + {} triangles listed",
+        out.len(),
+        out.iter().map(|c| c.triangles_a.len()).sum::<usize>(),
+        out.iter().map(|c| c.triangles_b.len()).sum::<usize>()
+    );
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("find_contacts scene of 2 touching meshes, one pose", |bn| {
+        bn.iter(|| {
+            out.clear();
+            black_box(
+                two.find_contacts(CONTACT_MARGIN, &filter, &mut out)
+                    .unwrap(),
+            );
+        })
+    });
+    group.throughput(Throughput::Elements(64));
+    group.bench_function("set_placement + find_contacts scene, all 64 poses", |bn| {
+        bn.iter(|| {
+            for p in &placements {
+                two.set_placement(b, *p).unwrap();
+                out.clear();
+                black_box(
+                    two.find_contacts(CONTACT_MARGIN, &filter, &mut out)
+                        .unwrap(),
+                );
+            }
+        })
+    });
     group.finish();
 }
+
+/// The margin of the two-mesh `find_contacts` benchmarks.
+const CONTACT_MARGIN: f64 = 0.05;
 
 fn bench_contacts(c: &mut Criterion) {
     // Small meshes in a row, each moved 30 units along x: with a side of 32,

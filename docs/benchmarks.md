@@ -158,6 +158,19 @@ Meshes of 2,048 triangles in a row, each moved 30 units along x, so every mesh o
 
 The time follows the number of contacts (about 52 to 74 µs each) rather than the number of pairs tested by the broadphase, which grows much faster: 496 pairs at 32 meshes cost no more per contact than 1 pair at 2.
 
+A re-run on the same machine on the same day (when the 1M rows below were added) measured 47.3 µs, 332 µs and 1.50 ms for 2, 8 and 32 meshes, with the same contacts and triangle lists. `find_contacts` did not change between the runs, so the gap is how much the machine varies between runs. Compare rows only within one run.
+
+### `find_contacts` on two touching 1M meshes
+
+This is the owner's per-frame case: the two `terrain(708)` meshes of the overhead group, B flipped above A and lifted to just touch (the 64 poses above), with margin 0.05 and no filter. Measured on 2026-10-18, on a later run than the overhead table.
+
+| | Contacts | Triangles listed (A + B) | Time |
+| --- | --- | --- | --- |
+| `find_contacts`, the fixed pose (31) | 1 | 63 + 63 | 625 µs |
+| `set_placement` + `find_contacts`, all 64 poses per iteration (per pose) | 64 (1 per pose) | 12,201 + 12,201 (about 191 + 191 per pose) | 105.9 ms (1.65 ms) |
+
+Over the poses, a frame's `find_contacts` costs about 1.25 times a `mesh_distance` (1.32 ms per pose in the overhead table). It does more than `mesh_distance`: it finds every triangle pair within the margin, not only the closest one.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -189,5 +202,5 @@ cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
 cargo bench -p fast-mesh-query                        # the same for the query benchmarks (single-mesh and mesh-vs-mesh)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
-cargo bench -p fast-mesh-scene                        # scene overhead on two 1M meshes, and find_contacts
+cargo bench -p fast-mesh-scene                        # scene overhead and find_contacts on two 1M meshes, and find_contacts over 2-32 small meshes
 ```
