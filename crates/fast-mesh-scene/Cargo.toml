@@ -11,6 +11,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Multithreaded hot loops; results are bit-identical with and without it.
+parallel = ["fast-mesh-store/parallel", "fast-mesh-bvh/parallel", "fast-mesh-query/parallel", "fast-mesh-fields/parallel", "fast-mesh-ops/parallel"]
+
 [dependencies]
 fast-mesh-store.workspace = true
 fast-mesh-bvh.workspace = true

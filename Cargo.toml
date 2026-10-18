@@ -18,6 +18,8 @@ fast-mesh-query = { path = "crates/fast-mesh-query", version = "0.1.0" }
 fast-mesh-fields = { path = "crates/fast-mesh-fields", version = "0.1.0" }
 fast-mesh-ops = { path = "crates/fast-mesh-ops", version = "0.1.0" }
 fast-mesh-scene = { path = "crates/fast-mesh-scene", version = "0.1.0" }
+# Only behind the engine crates' `parallel` feature. 1.12 needs Rust 1.80, below our MSRV.
+rayon = "1.12.0"
 # Must match the installed wasm-bindgen-cli exactly. Bump both together.
 wasm-bindgen = "=0.2.129"
 

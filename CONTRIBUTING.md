@@ -62,6 +62,20 @@ pnpm test
 
 The package's `test` script (`pnpm --filter fast-mesh-wasm test`) rebuilds the package first as a test build: `scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`) enables the `test-panic` cargo feature, which adds a `__test_panic` export for the poisoning test. Run `pnpm build` afterwards before packing or publishing by hand; `prepublishOnly` refuses a test build, and `pnpm release` always rebuilds. The root `pnpm test` runs it too, so it also leaves `dist/` as a test build: run `pnpm build` before `pnpm smoke`, which packs `dist/` as it is.
 
+### The `parallel` feature
+
+The engine crates (store, bvh, query, fields, ops, scene) have an optional `parallel` feature, off by default, that runs large hot loops on [rayon](https://crates.io/crates/rayon)'s thread pool. Enabling it on `fast-mesh-scene` or `fast-mesh-ops` turns it on in every engine crate they depend on. Results are bit-identical with the feature on or off, for any thread count, so every test must pass all three ways CI runs them:
+
+```sh
+cargo test --workspace
+cargo test --workspace --features fast-mesh-scene/parallel,fast-mesh-ops/parallel
+RAYON_NUM_THREADS=1 cargo test --workspace --features fast-mesh-scene/parallel,fast-mesh-ops/parallel
+```
+
+Also run clippy with the same `--features`. Benchmarks take it too, for example `cargo bench -p fast-mesh-bvh --features parallel`.
+
+Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread.
+
 ## Adding or changing an API
 
 1. Implement and unit-test the algorithm in `crates/fast-mesh/src`. Keep it free of WebAssembly types.

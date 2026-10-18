@@ -49,10 +49,12 @@ thread_local! {
 }
 
 /// Test-only: make every allocation after the next `n` fail with `OutOfMemory`
-/// on this thread (`None` turns it off).
+/// on this thread (`None` turns it off). While armed, parallel work runs on
+/// this thread so the hook sees every allocation.
 #[cfg(test)]
 pub(crate) fn fail_allocations_after(n: Option<usize>) {
     ALLOCATIONS_LEFT.with(|c| c.set(n));
+    fast_mesh_store::par::set_force_sequential(n.is_some());
 }
 
 #[cfg(test)]
