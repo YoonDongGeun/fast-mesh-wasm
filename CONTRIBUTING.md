@@ -13,6 +13,7 @@ crates/fast-mesh-bvh/    BVH over a store mesh: build, incremental update, box q
 crates/fast-mesh-query/  Raycast, closest-point, region and mesh-vs-mesh queries; plane slices, fill and gap.
 crates/fast-mesh-scene/  Scene: meshes, placements, update modes, world queries, contacts, fields, plane sections, multi-mesh undo.
 crates/fast-mesh-fields/  Per-vertex fields: signed distance (pseudonormal, fast winding), colormaps.
+crates/fast-mesh-ops/     Mesh repair: edge maps, components, boundary loops; analysis, weld, orient, hole filling.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.
 fixtures/smoke/          Script that CI runs after installing the package with npm, pnpm and bun.

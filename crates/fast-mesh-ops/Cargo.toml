@@ -1,0 +1,20 @@
+[package]
+name = "fast-mesh-ops"
+description = "Mesh repair for editable triangle meshes: analysis, welding, orientation and hole filling (part of fast-mesh-wasm)"
+keywords = ["mesh", "repair", "geometry", "hole-filling", "3d"]
+categories = ["graphics", "algorithms"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fast-mesh-store.workspace = true
+fast-mesh-query.workspace = true
+
+[dev-dependencies]
+proptest = "1.12.0"
+criterion = { version = "0.8.2", default-features = false }
