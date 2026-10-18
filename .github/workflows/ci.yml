@@ -30,6 +30,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo bench -p fast-mesh-bvh --no-run
       - run: cargo bench -p fast-mesh-query --no-run
+      - run: cargo bench -p fast-mesh-scene --no-run
 
   package:
     name: Build and check the npm package

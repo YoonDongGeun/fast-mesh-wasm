@@ -1,6 +1,6 @@
 # fast-mesh Scene (Phase 4) design
 
-- **Status:** Approved for planning (the owner skipped the questions; §15 records the builder-check decisions)
+- **Status:** Implemented (Phase 4). The owner skipped the questions; §15 records the builder-check decisions, and "Implementation notes" at the end records where the code differs from the wording above.
 - **Date:** 2026-10-18
 - **Parent spec:** `2026-10-14-fast-mesh-engine-design.md` §3.3, §4.5 and §7. Where this document disagrees with it, this document wins for Phase 4.
 - **Milestone:** Phase 4: Scene
@@ -160,9 +160,11 @@ Each query brings the BVHs it needs up to date: Lazy BVHs are updated, and stale
 
 ```rust
 pub struct SceneRayHit { pub mesh: MeshId, pub hit: fast_mesh_query::RayHit /* local */, pub point: [f64; 3], pub t: f64 }
-pub fn raycast(&mut self, origin: [f64; 3], dir: [f64; 3], opts: &RayOptions) -> Result<Option<SceneRayHit>>;          // all meshes, nearest
-pub fn closest_point(&mut self, p: [f64; 3], opts: &ClosestOptions) -> Result<Option<SceneClosestHit>>;               // all meshes
-pub fn closest_point_on(&mut self, id: MeshId, p: [f64; 3], opts: &ClosestOptions) -> Result<Option<SceneClosestHit>>;
+pub struct SceneRayOptions { pub min_t: f64, pub max_t: f64, pub cull: fast_mesh_query::Cull }   // world units; defaults 0.0, INFINITY, Cull::None
+pub struct SceneClosestOptions { pub max_distance: f64 }                                           // world units; default INFINITY
+pub fn raycast(&mut self, origin: [f64; 3], dir: [f64; 3], opts: &SceneRayOptions) -> Result<Option<SceneRayHit>>;          // all meshes, nearest
+pub fn closest_point(&mut self, p: [f64; 3], opts: &SceneClosestOptions) -> Result<Option<SceneClosestHit>>;               // all meshes
+pub fn closest_point_on(&mut self, id: MeshId, p: [f64; 3], opts: &SceneClosestOptions) -> Result<Option<SceneClosestHit>>;
 pub fn intersects(&mut self, a: MeshId, b: MeshId) -> Result<bool>;
 pub fn mesh_distance(&mut self, a: MeshId, b: MeshId, max_distance: f64) -> Result<Option<SceneMeshDistance>>;      // points in world
 pub fn triangles_near(&mut self, a: MeshId, b: MeshId, margin: f64, out_a: &mut Vec<TriangleId>, out_b: &mut Vec<TriangleId>) -> Result<()>;
@@ -260,3 +262,15 @@ pub enum SceneError { UnknownMesh, StaleBvh(MeshId), InvalidInput(&'static str),
 8. **Names.** The Scene's policy enum is `UpdateMode { Eager, Lazy, Manual }` (`fast_mesh_bvh::UpdatePolicy` keeps its meaning). `MeshOptions` gains `bvh_policy: fast_mesh_bvh::UpdatePolicy`.
 9. **f64 options to f32.** World f64 bounds are converted to Phase 3's f32 options rounding outward (`min_t` down, `max_t`/`max_distance`/`margin` up), and results are filtered again in f64 against the exact bound, so no result outside the bound is returned and none inside is lost.
 10. **`remove_mesh`** releases the slots its dropped entries reserved (`Patch::release`) before returning the mesh.
+
+## 16. Implementation notes
+
+Where the implementation differs from, or makes precise, the wording above:
+
+- **World options are `f64`.** `raycast` takes `SceneRayOptions` and `closest_point` / `closest_point_on` take `SceneClosestOptions` (§8), not Phase 3's `f32` `RayOptions` and `ClosestOptions`. `min_t`, `max_t` and `max_distance` are world distances. Per §15.9 they are rounded outward to `f32` for the Phase 3 call, and hits are filtered again against the exact `f64` bound.
+- **Triangle lists may overshoot a margin that is not an `f32` value.** `triangles_near` and the lists of `find_contacts` round `margin` up to `f32` and cannot be filtered again per triangle, so they may hold triangles up to one `f32` step (relative `6e-8`) beyond it. `distance` and `intersecting` are exact against the `f64` margin.
+- **World boxes are recomputed per query.** §9 says the top level is "rebuilt whenever a placement or BVH changes". The implementation derives each mesh's world box from its BVH root box and placement inside every query that needs it, so nothing has to be kept in step. There is one box per mesh, so the cost is a few operations per mesh.
+- **`compact` keeps placement entries.** Only the mesh's edit entries leave the undo and redo stacks and an open step (§15.5); its placement entries stay valid and stay.
+- **After `Corrupted`, touched meshes are fully changed.** Each mesh the failed step touched is reported with `changes: None` and its BVH is rebuilt from scratch on its next update (right away for Eager). The history may no longer match the meshes, so the caller should consider `clear_history`.
+- **Out of memory is wrapped where it happened.** It surfaces as `Store(OutOfMemory)` when the store, the history or the scene's own bookkeeping ran out, and as `Query(OutOfMemory)` when a Phase 3 query did (for example a result vector in `triangles_near`). See §11.
+- **Placement entries count 192 bytes** against the history budget: the old and the new value, 96 bytes each (§7).

@@ -119,6 +119,45 @@ On the 22 near-miss poses at 1M (single cold runs), the pre-pass costs 0.17 to 0
 - `triangles_near` costs in proportion to contact: about 1.4 to 1.5 ms at 1M for a few hundred to 4,600 triangles per side, and about 11 ms at 10M for 350 to 48,000.
 - `intersecting_pairs` with B pushed 0.5 into A takes about 4.4 ms at 1M for 900 to 18,500 pairs.
 
+## Scene (fast-mesh-scene)
+
+Results for `cargo bench -p fast-mesh-scene`. The first group compares the scene's world queries with calling Phase 3 directly on the same meshes and BVHs; the second times `find_contacts`.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Date:** 2026-10-18
+- **Meshes:** `terrain(708)` (1,002,528 triangles) for the overhead group; `terrain(32)` (2,048 triangles) for `find_contacts`. Default options, Eager mode.
+- **Rays:** as in the query benchmarks (100,000 rays per iteration from `z = 20`, directions `(jx, jy, -1)` with jitter in ±0.2); the table divides the criterion median by the batch size.
+- **Poses:** a flipped copy of the terrain over the terrain, turned by 0.1° more at every step (64 poses) and lifted to just touch, as in the mesh-vs-mesh queries. The direct calls take the pose as a `Rigid`; the scene takes it as B's placement (A sits at the identity), which gives the same relative transform.
+
+### Overhead against direct calls (two 1M meshes)
+
+| | Direct (Phase 3) | Scene | Overhead |
+| --- | --- | --- | --- |
+| `raycast`, per ray (scene of 1 mesh at the identity) | 1.46 µs | 1.76 µs | +0.30 µs (+20%) |
+| `raycast`, per ray (scene of 2 meshes, B flipped above A) | | 1.90 µs | |
+| `mesh_distance`, one fixed pose | 246 µs | 249 µs | +1% (within noise) |
+| `mesh_distance`, cycling 64 poses | 1.54 ms | | |
+| `set_placement` + `mesh_distance`, cycling 64 poses | | 1.47 ms | within noise |
+| `set_placement` alone | | 0.20 µs | |
+
+Criterion's confidence intervals: raycast direct 143 to 153 ms per batch, scene of 1 mesh 169 to 182 ms. The cycling benchmarks vary by about ±10% between runs because the poses differ in cost, so only the fixed-pose row is a clean comparison.
+
+- **`mesh_distance` and `set_placement` meet the target.** The spec's target (§13) is below 5% overhead, and it is not a merge gate. A pair query costs the scene one relative transform per call, and a placement change touches no BVH, so both disappear next to a query that takes hundreds of microseconds.
+- **`raycast` does not meet it on a 1 µs query.** The scene adds about 0.3 µs per ray. Its work per ray is fixed (normalising the direction, mapping the ray into each mesh's local space in `f64`, the padded world-box test, a small ordering vector, and mapping the hit back), so it shows on a query this short; it was not profiled further. A second mesh adds about 0.14 µs.
+
+### `find_contacts`
+
+Meshes of 2,048 triangles in a row, each moved 30 units along x, so every mesh overlaps its neighbours and nothing else (side 32). Margin 0.5, no filter.
+
+| Meshes | Pairs in the broadphase | Contacts | Triangles listed (A + B) | `find_contacts` |
+| --- | --- | --- | --- | --- |
+| 2 | 1 | 1 | 29 + 29 | 51.9 µs |
+| 8 | 28 | 7 | 203 + 203 | 517 µs |
+| 32 | 496 | 31 | 899 + 899 | 2.27 ms |
+
+The time follows the number of contacts (about 52 to 74 µs each) rather than the number of pairs, which grows much faster: 496 pairs at 32 meshes cost no more per contact than 1 pair at 2.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -150,4 +189,5 @@ cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
 cargo bench -p fast-mesh-query                        # the same for the query benchmarks (single-mesh and mesh-vs-mesh)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
+cargo bench -p fast-mesh-scene                        # scene overhead on two 1M meshes, and find_contacts
 ```
