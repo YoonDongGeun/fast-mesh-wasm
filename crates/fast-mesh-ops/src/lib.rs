@@ -25,14 +25,17 @@
 //!   and turns closed components outward.
 //! - Hole filling: [`fill_holes`] closes the boundary loops chosen by size
 //!   or by id with triangle patches that agree with their neighbours' winding
-//!   and never make an edge non-manifold.
+//!   and never make an edge non-manifold, refined to the surrounding density
+//!   and faired to continue the surrounding curvature.
 
 mod analyze;
 mod cleanup;
 mod error;
+mod fair;
 mod fill;
 mod fill_dp;
 mod orient;
+mod refine;
 #[cfg(test)]
 mod test_util;
 mod topology;
@@ -44,7 +47,9 @@ pub use cleanup::{
     remove_degenerate, remove_small_components, weld,
 };
 pub use error::{OpsError, Result};
-pub use fill::{FailReason, FillOptions, FillReport, FilledLoop, SkipReason, fill_holes};
+pub use fill::{
+    FailReason, FairWeights, FillOptions, FillReport, FilledLoop, SkipReason, fill_holes,
+};
 pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
