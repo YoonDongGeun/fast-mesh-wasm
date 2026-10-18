@@ -21,6 +21,7 @@ fast-mesh-bvh.workspace = true
 fast-mesh-query.workspace = true
 
 [dev-dependencies]
+fast-mesh-store = { workspace = true, features = ["test-counters"] }
 criterion = { version = "0.8.2", default-features = false }
 
 [[bench]]
