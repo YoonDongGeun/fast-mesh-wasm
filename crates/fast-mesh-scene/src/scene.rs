@@ -58,10 +58,24 @@ pub(crate) struct Entry {
     /// Changes not yet applied to the BVH, merged into one set. `None` when
     /// none are waiting.
     pub(crate) pending: Option<ChangeSet>,
+    /// The BVH must be rebuilt from scratch: the mesh's content is not
+    /// described by `pending` (after a [`SceneError::Corrupted`] undo).
+    pub(crate) rebuild: bool,
     pub(crate) report: Report,
 }
 
 impl Entry {
+    /// Marks the mesh as changed in unknown ways, after a failed recovery:
+    /// it is reported as fully changed, and the next BVH update rebuilds
+    /// from scratch even if the revision happens to match. An Eager BVH is
+    /// rebuilt right away.
+    pub(crate) fn mark_unknown(&mut self) {
+        self.pending = Some(ChangeSet::default());
+        self.rebuild = true;
+        self.report.changes = None;
+        self.after_change();
+    }
+
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
     /// changes and into the report.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
@@ -75,6 +89,16 @@ impl Entry {
     /// Brings the BVH up to date with the pending changes. On error the
     /// pending changes are kept, so a later call can retry.
     fn update_bvh(&mut self) -> Result<()> {
+        if self.rebuild {
+            #[cfg(test)]
+            fault::before_bvh_update()?;
+            let mut bvh = Bvh::build(&self.mesh, self.bvh.options())?;
+            bvh.set_policy(*self.bvh.policy())?;
+            self.bvh = bvh;
+            self.rebuild = false;
+            self.pending = None;
+            return Ok(());
+        }
         if self.bvh.is_current(&self.mesh) {
             self.pending = None;
             return Ok(());
@@ -142,6 +166,7 @@ impl Scene {
             placement: options.placement,
             mode: options.mode,
             pending: None,
+            rebuild: false,
             report: Report::added(),
         })
     }
@@ -233,7 +258,8 @@ impl Scene {
     /// # Errors
     /// [`SceneError::StepNotOpen`] when no step is open. A store error (for
     /// example out of memory) leaves the meshes and the open step unchanged;
-    /// [`SceneError::Corrupted`] means that even restoring them failed.
+    /// [`SceneError::Corrupted`] means that even restoring them failed, with
+    /// the consequences described for [`Scene::undo`].
     pub fn cancel_step(&mut self) -> Result<()> {
         let done = self.history.cancel(&mut self.entries)?;
         self.absorb(done);
@@ -249,7 +275,11 @@ impl Scene {
     /// # Errors
     /// A store error (for example out of memory): the meshes and both stacks
     /// are then unchanged. [`SceneError::Corrupted`] if restoring them after
-    /// such an error failed too.
+    /// such an error failed too: the step stays on its stack, the meshes it
+    /// edits may be partly changed, each of them is reported as fully
+    /// changed (`changes: None`) and its BVH is rebuilt from scratch on its
+    /// next update (right away for Eager). The history may no longer match
+    /// the meshes, so the caller should consider [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
         let done = self.history.undo(&mut self.entries)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -400,9 +430,10 @@ impl Scene {
 
     /// Removes the mesh's dead slots and renumbers the rest (see
     /// [`Mesh::compact`]). The mesh's recorded patches no longer apply, so
-    /// all its history entries (placement entries included) leave the undo
-    /// and redo stacks and an open step; steps left empty are dropped.
-    /// Nothing is released: the reserved slots no longer exist. Its BVH is
+    /// its edit entries leave the undo and redo stacks and an open step;
+    /// steps left empty are dropped. Its placement entries stay valid and
+    /// are kept. Nothing is released: the reserved slots no longer exist.
+    /// Its BVH is
     /// rebuilt whatever its mode, and the next
     /// [`Scene::take_changes`] reports it as fully changed (`changes: None`).
     ///
@@ -483,7 +514,7 @@ impl Scene {
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn is_current(&self, id: MeshId) -> Result<bool> {
         let e = self.entry(id)?;
-        Ok(e.bvh.is_current(&e.mesh))
+        Ok(!e.rebuild && e.bvh.is_current(&e.mesh))
     }
 }
 
@@ -1194,16 +1225,49 @@ mod tests {
     #[test]
     fn failed_recovery_reports_corrupted() {
         let mut scene = Scene::new(SceneOptions::default());
-        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let a = scene
+            .add_mesh(grid(2), with_mode(UpdateMode::Lazy))
+            .unwrap();
         let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let c = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
         scene.begin_step();
         lift(&mut scene, a, 0, 1.0);
+        scene.set_placement(c, moved(1.0)).unwrap();
         lift(&mut scene, b, 1, 2.0);
         scene.end_step().unwrap();
-        // Call 2 (a's revert) fails, then call 3 (b's recovery apply) too.
+        scene.flush().unwrap();
+        scene.take_changes();
+        let rev_a = scene.mesh(a).unwrap().revision();
+        // Undo order: b, c, a. Call 2 (a's revert) fails, then call 3 (b's
+        // recovery apply) too, so b stays reverted and a unchanged.
         fault::fail_patch_on(2);
         fault::fail_patch_on(3);
         assert_eq!(scene.undo(), Err(SceneError::Corrupted));
+        assert_eq!(scene.mesh(a).unwrap().revision(), rev_a);
+        assert_eq!((z(&scene, a, 0), z(&scene, b, 1)), (1.0, 0.0));
+
+        // Every mesh with an edit in the step is reported fully changed;
+        // the placement-only mesh is not.
+        let ch = scene.take_changes();
+        assert_eq!(ch.iter().map(|c| c.id).collect::<Vec<_>>(), [a, b]);
+        assert!(ch.iter().all(|c| c.changes.is_none()));
+        // b (Eager) was rebuilt right away. a (Lazy) waits for a rebuild,
+        // even though its revision still matches its BVH.
+        assert_eq!(scene.is_current(b), Ok(true));
+        assert_valid(&scene, b);
+        assert_eq!(scene.is_current(a), Ok(false));
+        scene.flush().unwrap();
+        assert_eq!(scene.is_current(a), Ok(true));
+        assert_valid(&scene, a);
+        assert!(!scene.entries.get(a).unwrap().rebuild);
+
+        // The caller recovers with clear_history; editing goes on normally.
+        scene.clear_history().unwrap();
+        assert!(!scene.can_undo() && !scene.can_redo());
+        lift(&mut scene, b, 2, 1.0);
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(z(&scene, b, 2), 0.0);
+        assert_valid(&scene, b);
     }
 
     /// Bytes of each undo step, oldest first.
@@ -1301,18 +1365,23 @@ mod tests {
         assert_eq!(scene.history.undo_len(), 1);
         assert!(!scene.can_redo());
 
-        // c compacts: its entries go too (nothing to release).
+        // c compacts: its edit entries go (nothing to release), and the
+        // step left empty with them; its placement entry stays.
         lift(&mut scene, c, 1, 1.0);
         scene.set_placement(c, moved(1.0)).unwrap();
         assert_eq!(scene.history.undo_len(), 3);
         scene.compact(c).unwrap();
-        assert_eq!(scene.history.undo_len(), 1);
+        assert_eq!(scene.history.undo_len(), 2);
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(c), Ok(Placement::IDENTITY));
         assert_eq!(scene.undo(), Ok(true));
         assert_eq!(z(&scene, a, 0), 0.0);
         assert_eq!((z(&scene, c, 0), z(&scene, c, 1)), (1.0, 1.0));
-        assert_eq!(scene.placement(c), Ok(moved(1.0)));
+        assert_eq!(scene.undo(), Ok(false));
         assert_eq!(scene.redo(), Ok(true));
         assert_eq!(z(&scene, a, 0), 1.0);
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!(scene.placement(c), Ok(moved(1.0)));
 
         // Removing a mesh while a step is open drops its open entries.
         scene.begin_step();

@@ -261,20 +261,28 @@ impl History {
         Ok(done)
     }
 
-    /// Drops every change of mesh `id`; steps left empty are dropped too
-    /// (the open step stays open). With `mesh`, the slots the dropped patches
-    /// reserve on it are released; without, nothing is (after a compaction
-    /// those slots no longer exist).
+    /// Drops changes of mesh `id`; steps left empty are dropped too (the open
+    /// step stays open).
+    ///
+    /// - With `mesh` (removal): every change of the mesh goes, and the slots
+    ///   its patches reserve on `mesh` are released.
+    /// - Without (compaction): only its edit changes go, releasing nothing,
+    ///   since their slots no longer exist; placement changes stay valid and
+    ///   are kept.
     pub(crate) fn forget(&mut self, id: MeshId, mut mesh: Option<&mut Mesh>) {
         let mut drop_from = |step: &mut Step, side: PatchSide| {
             step.changes.retain(|c| {
                 if c.mesh() != id {
                     return true;
                 }
-                if let Some(m) = mesh.as_deref_mut() {
-                    c.release(m, side);
+                match mesh.as_deref_mut() {
+                    Some(m) => {
+                        c.release(m, side);
+                        false
+                    }
+                    // Compaction: only patches go stale with the epoch.
+                    None => matches!(c, Change::Placement { .. }),
                 }
-                false
             });
             step.bytes = step.changes.iter().map(Change::bytes).sum();
         };
@@ -316,7 +324,9 @@ impl History {
 ///
 /// If a change fails, the changes already run are run the other way, in the
 /// opposite order, and the error is returned with every mesh as before. If
-/// that recovery fails too, the result is [`SceneError::Corrupted`].
+/// that recovery fails too, the result is [`SceneError::Corrupted`], and
+/// every mesh with an edit in the step is marked fully changed (see
+/// `Entry::mark_unknown`), since what it holds is no longer known.
 fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Vec<Done>> {
     let mut done: Vec<Done> = Vec::new();
     done.try_reserve_exact(step.changes.len())
@@ -334,6 +344,12 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
             Err(e) => {
                 for j in (0..i).rev() {
                     if run_change(&step.changes[order(j)], entries, !forward).is_err() {
+                        for c in &step.changes {
+                            let Change::Edit(id, _) = c else { continue };
+                            if let Some(e) = entries.get_mut(*id) {
+                                e.mark_unknown();
+                            }
+                        }
                         return Err(SceneError::Corrupted);
                     }
                 }
