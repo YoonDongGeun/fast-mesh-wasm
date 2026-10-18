@@ -25,7 +25,9 @@
 //! number of recoloured vertices per pose.
 //!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
-//! dragged across a terrain through 64 poses, 100 vertices moved far from the
+//! dragged across a terrain through 64 poses (and across three terrains of
+//! 333k triangles side by side, one section over all three), 100 vertices
+//! moved far from the
 //! plane (and the same edit on a scene without a section, to compare), the
 //! fill of a sphere's cross-section, and the gap between the cross-sections
 //! of two spheres.
@@ -561,6 +563,52 @@ fn bench_sections(c: &mut Criterion) {
             })
         },
     );
+
+    // The same drag over three terrains of a third of the size side by side
+    // in y, one section over all three: three entries due per plane, cut in
+    // parallel with the `parallel` feature.
+    let third = 408;
+    let mut scene3 = self::scene();
+    let ids: Vec<MeshId> = (0..3)
+        .map(|k| {
+            let opts = MeshOptions {
+                placement: Placement {
+                    translation: [0.0, f64::from(k * (third + 1)), 0.0],
+                    ..Placement::IDENTITY
+                },
+                ..Default::default()
+            };
+            scene3.add_mesh(terrain(third), opts).unwrap()
+        })
+        .collect();
+    let planes3: Vec<Plane> = (0..64)
+        .map(|i| {
+            let x = (i as f64 + 0.5) / 64.0 * f64::from(third) + 0.37;
+            Plane::new([x, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap()
+        })
+        .collect();
+    let section3 = scene3
+        .add_section(SectionDesc {
+            plane: planes3[0],
+            meshes: ids.clone(),
+            fill: false,
+        })
+        .unwrap();
+    group.bench_function(
+        "section_drag_3x333k: 64 planes, set_section_plane (3 meshes) + read",
+        |b| {
+            b.iter(|| {
+                for p in &planes3 {
+                    scene3.set_section_plane(section3, *p).unwrap();
+                    for &m in &ids {
+                        black_box(scene3.section(section3, m).unwrap().length);
+                    }
+                }
+                black_box(scene3.take_changes());
+            })
+        },
+    );
+    drop(scene3);
 
     // Moving 100 vertices near the x = 0 edge of the terrain, about 354 from
     // a plane at x = side / 2, up and down by 0.5 in z. The baseline is the
