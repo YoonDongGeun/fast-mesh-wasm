@@ -85,12 +85,12 @@ Success means:
 - Cost: proportional to the triangles near the plane (about √n for a typical surface) plus the straddling nodes. Never O(n).
 
 ### 4.4 Orientation and chaining
-- **Segment direction.** Each segment is oriented using its triangle's winding: walking along it, the triangle's `+` side region is on the left, seen from the plane normal. For a consistently oriented closed mesh this makes outer contours counter-clockwise and holes clockwise, in the plane's 2D frame.
+- **Segment direction.** Each segment is oriented using its triangle's winding: the solid's inside (opposite the triangle's winding normal) is on the left of `from → to`, seen from the plane normal. For a consistently oriented closed mesh this makes outer contours counter-clockwise and holes clockwise, in the plane's 2D frame. (The first wording, "the `+` side region on the left", was wrong where the triangle normal `N` has `n·N < 0`; see §12.)
 - **Chaining.** Join segment ends that share an edge key.
   - **Boundary edge** (one incident triangle): the chain ends there, giving an open polyline.
   - **Non-manifold edge** (more than two incident triangles crossing): the chain is split there. Each piece is reported open, with `manifold: false`.
   - **Mismatched orientation:** where two adjacent triangles disagree, the chain still joins (undirected) and the contour reports `oriented: false`.
-- **Determinism.** Output order is deterministic. Contours start at their smallest edge key; closed contours rotate to start there.
+- **Determinism.** Output order is deterministic. Contours are sorted by their first edge key. A closed contour rotates to start at its smallest edge key; an open contour starts at its first end, which for an oriented one is its `from` end (see §12).
 
 ### 4.5 Output
 
@@ -108,7 +108,7 @@ pub fn slice(mesh: &Mesh, bvh: &Bvh, plane: &Plane, out: &mut Slice) -> Result<(
 ```
 
 - Fails with `StaleBvh` or `MeshMismatch` like every other query.
-- Allocation is only into `out`, which is reused across calls.
+- Allocation is only into `out`, which is reused across calls. *(Not so: `slice` allocates per-call temporaries; see §12.)*
 - The plane is given in the mesh's local frame, origin included. The Scene does the world-to-local mapping (§6.2).
 
 ## 5. Derived results
@@ -270,3 +270,25 @@ pub struct Gap { pub distance: f64, pub a: [f64; 3], pub b: [f64; 3] }
    - `add_section` and `set_section_meshes` never fail with `StaleBvh`. For Eager meshes they compute immediately, and a failure is swallowed (§6.3). Lazy and Manual meshes wait for `update_sections`, `update(id)` or `flush`.
 5. **Triangle changes with no vertex moved** (for example an edge flip) count as removed plus added triangles under criterion 3 of §6.3. Each entry keeps enough state, such as its crossed-triangle set, to evaluate a removed triangle's former side.
 6. **`sections_changed`** follows the semantics of `fields_changed`: each section once per call, in the order first reported.
+
+## 12. Implementation notes
+
+What the implementation settled or found. Items 1 to 3 and 12 correct wording above; none of them changes a contract elsewhere.
+
+1. **Segment orientation.** The solid's inside, opposite the triangle's winding normal, lies to the left of `from → to` seen from `+n`. Outer contours run counter-clockwise and holes clockwise. The §4.4 wording "the `+` side region on the left" was wrong where `n·N < 0`, and has been fixed there.
+2. **Open contours start at their `from` end.** "Starts at its smallest edge key" holds for closed contours only. An oriented open contour starts at its `from` end; §4.4 is reworded.
+3. **`slice` allocates per call.** It builds per-call temporaries (the segment list, a sorted list of segment ends, the links between ends and the visited flags), contrary to §4.5's "allocation only into `out`". On the benchmark meshes it takes 114 to 131 µs on a 1M terrain and 220 to 270 µs on a 1M sphere (table in `docs/benchmarks.md`), under the 1 ms target, and the 64-pose drag costs 262 µs per pose all told, including the mapping to world and `(u, v)` and the length. Whether the allocations are a part of that was not measured (there is no allocation-free variant to compare against), so the drag bench does not show that they matter, and does not show that they don't. The BVH traversal itself still allocates nothing (fixed stack).
+4. **Zero-length same-key segments are dropped.** A zero-area triangle `[a, a, b]` crossed between `a` and `b` yields a segment from edge `(a, b)` back to itself. It has no length, and chaining would count it as a third triangle at that edge, so it is dropped before chaining.
+5. **`SectionId` is opaque and never reused.** It is a `u32`, like `FieldId`, not generational like `MeshId` (this overrides §6.1). A removed section's id is rejected with `UnknownSection` for good.
+6. **`flush` does not update the sections of Manual meshes**, consistent with fields and BVHs: a Manual mesh waits for an explicit `update(id)`.
+7. **`section_gap` across planes.** It returns `Ok(None)` when the two entries were cut with different planes (stale, or mixed update modes, so that one entry still has the previous plane), because their `(u, v)` frames then differ. It rejects `a == b` with `InvalidInput`.
+8. **Change settling runs for every mode.** A far edit leaves Lazy and Manual entries Current too, not only Eager ones: the "can this change reach the plane" test (§6.3) is run for every mode when the change is settled, and only a change that reaches the plane stales an entry. A mesh that has a section keeps its incidence index, which criterion 2 reads. Measured on a 1M terrain, moving 100 vertices far from the plane costs 21.1 µs with a section against 14.2 µs without one (BVH refit included in both), so about 7 µs, and the entry stays Current.
+9. **`triangulate` results.** An empty or collinear outer gives `Ok(true)` with no triangles. Non-finite input gives `Ok(false)`. A hole that cannot be bridged to its outer gives `Ok(false)`.
+10. **Nesting is approximate.** `fill` assigns holes by testing one vertex per contour, so a hole touching its outer can be misassigned; `fill_ok` is then `false` (§11.3: best effort).
+11. **Known limits of the gap.** Long segments that span many grid cells make building and searching the grid slow, and coordinates beyond about 1e154 overflow the squared distances.
+12. **Measured numbers** (i5-13600K, 2026-10-18; full tables in `docs/benchmarks.md`).
+    - Slice, 1M triangles: 114 to 131 µs on the terrain, 220 to 270 µs on the sphere. 10M terrain: 0.59 to 0.80 ms. All under the ~1 ms target; nothing was tuned.
+    - Plane drag, 64 poses over a 1M terrain, Eager: 16.8 ms per iteration, 262 µs per pose.
+    - Far edit: about 7 µs over the bare edit.
+    - Fill of a 2,072-point sphere section: 4.6 ms against 0.34 ms without fill, so the fill costs about 4.3 ms. That is the largest cost in the phase; ear clipping on a 2,000-point loop is the likely cause (not profiled).
+    - Gap between two 1M spheres' sections (2,072 points each): 2.55 ms for `section_gap` alone, 3.27 ms with the two-entry recompute.
