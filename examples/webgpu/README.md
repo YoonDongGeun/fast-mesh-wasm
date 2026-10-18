@@ -53,7 +53,8 @@ Needs a browser with WebGPU (recent Chrome, Edge or Safari). Without it the page
 - C: distance colouring of the picked mesh against its nearest other mesh (turbo map, `maxDistance` = 10% of
   the scene diagonal; farther vertices stay grey). C again turns it off.
 - 1–9: picked mesh opacity 0.1–0.9; 0: opaque.
-- S: section plane (normal +z) through the scene centre: yellow contours, and the +z half is clipped away.
+- S: section plane (normal +z) through the scene centre: yellow contours, and the half below it (−z) is clipped
+  away. The side the normal points to stays, as with `bindSection` in three.js.
 - Drop a binary STL file on the page to add it.
 
 ## Manual test checklist
@@ -66,7 +67,7 @@ Needs a browser with WebGPU (recent Chrome, Edge or Safari). Without it the page
    Press C: the sphere is plain again.
 6. Pick the torus, press 5: it is half transparent and the meshes behind show through. Make a second mesh
    transparent too: they blend in a stable order. Press 0: opaque again.
-7. Press S: yellow contours on every mesh and the near half is cut away. Move a mesh: its contour follows.
+7. Press S: yellow contours on every mesh and the half below the plane (−z) is cut away. Move a mesh: its contour follows.
    Press S: the plane and the cut are gone.
 8. Drop a binary STL: it appears, the camera refits, and it can be picked, dragged and coloured.
 9. Open the page in a browser without WebGPU: a message explains it, and the console shows no exception.

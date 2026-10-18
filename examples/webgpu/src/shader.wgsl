@@ -7,7 +7,8 @@ struct Frame {
   viewProj: mat4x4f,
   eye: vec4f,
   // Plane normal in xyz, w = -dot(normal, origin): points with
-  // dot(normal, p) + w > 0 are cut away while flags.x is 1.
+  // dot(normal, p) + w < 0 are cut away while flags.x is 1, so the side the
+  // normal points to stays (as with bindSection in three.js).
   clip: vec4f,
   flags: vec4f,
 };
@@ -49,7 +50,7 @@ fn vs_mesh(in: MeshIn) -> MeshOut {
 
 @fragment
 fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
-  if (frame.flags.x > 0.5 && dot(frame.clip.xyz, in.world) + frame.clip.w > 0.0) {
+  if (frame.flags.x > 0.5 && dot(frame.clip.xyz, in.world) + frame.clip.w < 0.0) {
     discard;
   }
   let toEye = normalize(frame.eye.xyz - in.world);

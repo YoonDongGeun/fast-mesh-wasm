@@ -86,7 +86,8 @@ controls.attach(boundB.object);
 threeScene.add(controls.getHelper()); // three >= 0.169; on older three use threeScene.add(controls)
 attachTransformControls(controls, scene, boundB);
 
-// A section: contours and fill, and the bound meshes are clipped at its plane.
+// A section: contours and fill, and the bound meshes are clipped at its plane
+// (the side the section normal points to stays).
 const section = scene.addSection({ meshes: [a, b], plane: { origin: [0, 0, 0], normal: [0, 0, 1] } });
 const boundSection = bindSection(scene, section, [boundA, boundB]);
 threeScene.add(boundSection.group);
