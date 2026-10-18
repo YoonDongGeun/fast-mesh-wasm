@@ -76,8 +76,8 @@ This is a personal, general-purpose library for any mesh: scans, CAD exports, op
 
 ### 4.2 Boundary loops
 - A boundary half-edge is the directed edge `a→b` of the single triangle using a boundary edge.
-- **Walking at a vertex.** At vertex `b`, the next half-edge is found by rotating around `b`'s triangle fan, starting from the triangle of the incoming half-edge, until the next boundary half-edge leaving `b` is reached. Following the fan this way, not just picking any outgoing boundary edge, is what makes holes that share a vertex come out as separate loops.
-- **When the walk is ambiguous:** a vertex with non-manifold edges, or fans that cannot be ordered. The remaining half-edges at that vertex are paired in a deterministic order (by edge key), and each loop involved is marked `clean: false`. `fill_holes` skips loops that are not clean unless `allow_unclean` is set *(my call)*.
+- **Walking at a vertex.** At vertex `b`, the next half-edge is found by rotating around `b`'s triangle fan, starting from the triangle of the incoming half-edge, until the next boundary half-edge leaving `b` is reached. Following the fan this way, not just picking any outgoing boundary edge, is what makes holes that share a vertex come out as separate loops. *(Implemented differently: rotating around `b`'s own fan reproduces the figure-eight bug at a pinch. See §12 item 1 for the rule that was built.)*
+- **When the walk is ambiguous:** a vertex with non-manifold edges, or fans that cannot be ordered. The remaining half-edges at that vertex are paired in a deterministic order (by edge key), and each loop involved is marked `clean: false`. *(Refined in §12 item 1.)* `fill_holes` skips loops that are not clean unless `allow_unclean` is set *(my call)*.
 - **Each loop records:**
   - its vertices in order;
   - `edges`;
@@ -98,7 +98,7 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 - Options:
   - `weld_tolerance: f32`, used only for counting coincident vertices (default `0.0`, meaning exact duplicates);
   - `self_intersection: Option<&Bvh>`.
-- **Reports** (counts plus id lists, capped at `options.max_listed`, default 1000):
+- **Reports** (counts plus id lists; the lists that have a count beside them are capped at `options.max_listed`, default 1000, and the counts stay exact; §12 item 8):
   - boundary loops (§4.2);
   - coincident vertex groups;
   - degenerate triangles;
@@ -107,11 +107,11 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
   - components (§4.3);
   - orientation conflicts: the number of interior edges whose two triangles use the edge in the same direction;
   - `self_intersects: Option<bool>`.
-- **Self-intersection check.** Look for triangle pairs that intersect and share no vertex, using the BVH and the exact tri-tri test from Phase 3b. Pairs that share a vertex are not tested, and the docs say so *(my call)*.
+- **Self-intersection check.** Look for triangle pairs that intersect and share no vertex, using the BVH and the exact tri-tri test from Phase 3b. Pairs that share a vertex are not tested, and the docs say so *(my call)*. "Degenerate" means different things here and in `analyze`/`remove_degenerate` (§12 item 8).
 
 ### 5.2 `orient(tx, options) -> OrientReport`
 - **Build patches.** Grow patches across interior edges, flipping the neighbour when it uses the shared edge in the same direction. Non-manifold edges are barriers.
-- **Non-orientable patches.** A patch that would need a triangle both flipped and not flipped (a Möbius-like strip) is reported as non-orientable. That component is left unchanged.
+- **Non-orientable patches.** A patch that would need a triangle both flipped and not flipped (a Möbius-like strip) is reported as non-orientable. That patch is left unchanged; the rest of its component is still oriented (§12 item 3).
 - **Per component:** among the orientable patches joined through non-manifold edges, choose the orientation with the larger total area. Ties go to the patch containing the smallest triangle id.
 - **Closed components:** then flip the whole component if its signed volume is negative.
 - **Writing:** flipping a triangle swaps two of its vertices with `set_triangles`.
@@ -126,13 +126,13 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
   - `allow_unclean: bool` (default false);
   - `fair: bool` (default true).
 
-  A loop is filled when it meets every bound that is set. With no bound and no explicit `loops`, the call fails with `InvalidInput`.
+  A loop is filled when it meets every bound that is set. With no bound and no explicit `loops`, the call fails with `InvalidInput`. When both `loops` and bounds are given, both apply, as an intersection (§12 item 4).
 - **Per loop:**
   1. **Triangulate** the loop with minimum-weight dynamic programming over the loop's vertices. The weight is the triangle area plus a penalty on the worst dihedral angle to neighbouring triangles (Liepa 2003). It costs O(n³) time, so it is used up to `dp_limit` edges (default 200 *(my call)*). Longer loops are projected onto their best-fit plane and triangulated with `fast_mesh_query::triangulate`. If the projection folds the loop (the projected polygon self-intersects), the loop is reported as `failed` and left open.
-  2. **Refine** to the surrounding density: give each boundary vertex a target edge length equal to the mean length of its existing edges. Split patch triangles whose edges are longer than √2 × the target (Liepa's density rule), then relax by flipping edges to improve triangle shape. Patch-internal only.
+  2. **Refine** to the surrounding density: give each boundary vertex a target edge length equal to the mean length of its existing edges. Split patch triangles by Liepa's rule: split a triangle when √2 × the distance from its centroid to a corner exceeds the target length at the centroid (§12 item 5), then relax by flipping edges to improve triangle shape. Patch-internal only.
   3. **Fair** (when `fair`): move only the new interior vertices so the patch minimises bending.
      - Solve the bi-Laplacian `Δ²x = 0` with conjugate gradient, holding fixed the loop vertices and the ring of existing vertices just outside it, so the patch continues the surrounding curvature.
-     - Use cotangent weights, clamped to stay positive; the builder may fall back to uniform weights if cotangents prove unstable, recording the choice.
+     - Use cotangent weights, clamped to stay positive; the builder may fall back to uniform weights if cotangents prove unstable, recording the choice (done; §12 item 6).
      - Iteration limit and tolerance are left to the builder. Non-convergence keeps the best iterate and sets `converged: false` in the report.
 - **Writing:** the patch is written only once all three steps have succeeded for that loop, so a failed loop writes nothing.
 - **Report:** filled loops (triangles and vertices added), skipped loops (and why: bounds, unclean), failed loops (and why).
@@ -207,7 +207,7 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 - `orient` on a 1M mesh with 1% flipped triangles.
 - `fill_holes` of 10 holes of 50–500 edges on a 1M mesh.
 - `weld` on 1M triangles with 10% duplicated vertices.
-- Record the results in `docs/benchmarks.md`.
+- Record the results in `docs/benchmarks.md`. Done; numbers in §12 item 12.
 
 ## 10. Left to the builder
 - Data structures: the edge map, union-find and spatial hash.
@@ -220,7 +220,7 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 
 1. **Public API changes are allowed.**
    - `Scene::edit` becomes generic over its error. Its closure returns `Result<R, E>` with `E: From<StoreError>`, and `edit` returns `Result<R, E>`. Scene-side failures are carried through a new `From<SceneError>` bound, or the builder may use an equivalent design that keeps existing callers compiling with at most a type annotation. Record the choice.
-   - `OpsError` implements `From<StoreError>`, so `scene.edit(id, |tx| ops::fill_holes(tx, &opts))` compiles.
+   - `OpsError` implements `From<StoreError>`; what was built is in §12 item 9. So `scene.edit(id, |tx| ops::fill_holes(tx, &opts))` compiles.
    - `fast-mesh-query` gains a public `self_intersecting_pairs(mesh, bvh, out)`. It returns triangle pairs that intersect and share no vertex, using the exact tri-tri test. `analyze` uses it.
 2. **Loop ids are content fingerprints, not revision-bound.**
    - A `LoopId` holds the loop's smallest vertex id, its length, and a hash of its vertex sequence (rotated to start at the smallest vertex).
@@ -235,3 +235,26 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
    - Boundary loops through a pinch vertex are still `clean` when every fan piece at that vertex is edge-manifold, so it can be ordered.
    - A loop is `clean: false` only when the vertex has non-manifold edges.
    - The owner's bowtie case is therefore reported as a pinch, and still filled by default.
+
+## 12. Implementation notes
+
+What the implementation settled or found. Items 1 to 5 and 8 correct wording in earlier sections, which now point here; the rest add detail or record deviations. Measured numbers are in item 12 and in `docs/benchmarks.md`.
+
+1. **The fan walk (§4.2).** The literal rule, "rotate around `b`'s fan to the next boundary half-edge", reproduces the figure-eight bug at a pinch vertex: it can return to the incoming loop's own piece and join two holes into one loop. The implemented rule takes the next boundary edge from another fan piece across the gap. With three or more wedges it chooses the smallest counter-clockwise turn about a local normal, and ties go by edge key order.
+2. **Open chains and unclean pinches (§4.2).** An open chain of boundary edges around a non-manifold edge is walked whole from its head and comes out as a loop with `closed = false` and `clean = false`; `fill_holes` never fills it, even with `allow_unclean`. A pinch whose wedges are wound oppositely also yields unclean pieces.
+3. **`orient` and non-orientable patches (§5.2).** A non-orientable patch leaves only that patch unchanged, not its whole component. The rest of the component is oriented as usual.
+4. **Selection in `fill_holes` (§5.3).** Explicit `loops` and the set bounds (`max_edges`, `max_perimeter`, `max_area`) both apply, as an intersection: a listed loop that exceeds a bound is skipped. Ids that match no loop still return `StaleLoops` before anything is written.
+5. **Refinement rule (§5.3).** It follows Liepa: split a patch triangle when √2 × the distance from its centroid to a corner is greater than σ at the centroid, where σ is the interpolated target length. This replaces the "longer than √2 × the target" wording.
+6. **Fairing.** Cotangent weights are tried first. The solve is retried with uniform weights when the cotangent solve gives a non-finite result, and also when conjugate gradient does not converge. `FilledLoop.weights` (`Option<FairWeights>`) reports which weights were used, and is `None` when fairing did not run. If both fail the loop is reported as failed and left open.
+7. **Triangulation of a loop.** The DP rejects any triangulation that contains a zero-area triangle. The projection path (loops longer than `dp_limit`) runs earcut, which can drop exactly collinear points of the loop; the implementation restores them, so every loop vertex is used. This is a safety net for a fold that projection does not detect.
+8. **`max_listed` and "degenerate".** `max_listed` caps only the lists that have a count beside them; the counts are exact, and the loop and component lists are not capped. "Degenerate" has two meanings. In `analyze` and `remove_degenerate` it is a repeated vertex id or an area ≤ ε·L². In `self_intersecting_pairs` a triangle counts as degenerate only when it is exactly collinear.
+9. **`Scene::edit`.** It is `edit<R, E: Into<SceneError>>(id, f: FnOnce(&mut Transaction) -> Result<R, E>) -> scene::Result<R>`, not `Result<R, E>` as in §11.1. `SceneError` gained an `Ops(OpsError)` variant with a `From<OpsError>` impl, so `scene.edit(id, |tx| ops::fill_holes(tx, &opts))` compiles and returns `SceneError::Ops` on failure. A closure whose body never fails cannot infer `E` (E0283) and needs a type annotation, for example `Ok::<(), StoreError>(())`.
+10. **Poisoned transactions (§6.1).** A write failure inside a store call, after an earlier write in the same operation, poisons the transaction (`commit` returns `TransactionPoisoned`), so `scene.edit` rolls the whole edit back. The operations validate before writing, so this happens only on out-of-memory.
+11. **`fast-mesh-bvh`** is a workspace dependency of `fast-mesh-ops`, for the self-intersection option of `analyze`.
+12. **Measured numbers** (i5-13600K, 2026-10-18; tables and conditions in `docs/benchmarks.md`).
+    - `analyze`, 1M terrain: 478 ms; with the self-intersection check (BVH prebuilt): 893 ms.
+    - `orient`, 1M terrain with 1% flipped: 291 ms (10,026 triangles flipped).
+    - `weld`, 1M triangles with 10% of the vertices duplicated: 86 ms (50,269 merged).
+    - `remove_small_components`, 1M terrain plus 1,000 two-triangle specks: 117 ms.
+    - `fill_holes`, ten holes of 61 to 482 edges in a 1M terrain (83,813 triangles and 40,548 vertices added): 360 ms with `fair` off and 5.16 s with `fair` on. Fairing is about 93% of the time; no budget was set for it and nothing was tuned.
+    - Sphere fairing accuracy (the `unfaired_patch_is_flatter` fixture; largest `| |p| − 1 |` over the new vertices of each hole, on a unit UV sphere of 64 rings and 128 segments with holes of 10°, 20° and 30°): 0.0005, 0.0018 and 0.0082 with fairing, against 0.0103, 0.0507 and 0.1182 without.

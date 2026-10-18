@@ -260,6 +260,29 @@ The first run's fill and gap costs were found and fixed after review; the other 
 - **Fill.** The ear test of `triangulate` walked the whole ring for every candidate ear, so a loop of `n` points cost `O(n²)`: about 0.23 ms at 500 points, 0.92 ms at 1,000, 4.0 ms at 2,072 and 16 ms at 4,144, four times per doubling (measured during the final review with a separate harness, not by the benches above). Above 80 points the ring is now indexed by z-order (Morton) code, and the ear test looks only at the nodes whose codes lie between those of the candidate triangle's box corners, as Mapbox's earcut does. It tests the same nodes, so the triangles are unchanged. The fill now costs about 0.22 ms on the 2,072-point loop, including the nesting and the area check.
 - **Gap.** `contour_gap` took the segments of the first side in contour order, starting from a pair of first segments, so its cost depended on where that contour started: about 2.5 ms when it started on the far side, 0.13 ms when it started at the closest point (measured during the final review with a separate harness). The segments are now taken nearest the other side's bounding box first, and the search stops at the first whose box gap reaches the best distance found. The result is the same pair.
 
+## Repair (fast-mesh-ops)
+
+Results for `cargo bench -p fast-mesh-ops --bench ops`, measured on 2026-10-18.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Meshes:** `terrain(708)` (1,002,528 triangles, 502,681 vertices), with the damage described per row. 10 samples per benchmark.
+- **Timing:** `analyze` reads the mesh. The writing operations run a transaction (`begin_edit`, the operation, `commit`) on a mesh rebuilt from buffers for every iteration; the rebuild is outside the timing and the commit is inside it. Criterion medians.
+
+| Benchmark | Time | Input and result |
+| --- | --- | --- |
+| `analyze`, no self-intersection check | 478 ms | One component, one boundary loop (the rim). |
+| `analyze`, with self-intersection check | 893 ms | The same, with a prebuilt BVH; `self_intersects` is `Some(false)`. The check costs about 415 ms. |
+| `orient_1M_1pct_flipped` | 291 ms | Every 100th triangle flipped (10,026); one patch, all 10,026 flipped back. |
+| `fill_10_holes_1M`, `fair` off | 360 ms | Ten round holes punched in the terrain (loops of 61, 78, 128, 165, 232, 313, 388, 436, 454 and 482 edges); all ten filled, 83,813 triangles and 40,548 vertices added. The 2,832-edge rim is skipped by `max_edges = 1000`. |
+| `fill_10_holes_1M`, `fair` on | 5.16 s | The same fill with fairing: about 4.8 s more than without. |
+| `weld_1M_10pct_dupes` | 86 ms | Every 10th vertex duplicated (50,269 duplicates, 552,950 vertices); each corner on such a vertex takes the duplicate with probability 1/2. Tolerance 0 merges all 50,269; no triangle collapses. |
+| `remove_small_components_1M` | 117 ms | The terrain plus 1,000 separate two-triangle quads, `min_triangles = 10`: 1,000 components, 2,000 triangles and 4,000 vertices removed. |
+
+No target was set for these (the plan asks only that they be recorded), and nothing was tuned.
+
+- **Fairing dominates a fill.** Fairing is about 93% of the 5.16 s, for 40,548 new vertices. Refinement to the surrounding density makes the patches large (on this terrain the edges are about 1 long, so a hole of 482 edges gets thousands of triangles), and each patch needs a conjugate-gradient solve. A fill that needs only a closed surface can set `fair: false` and costs 360 ms for the same ten holes, with a flatter patch (see the accuracy below).
+- **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -295,4 +318,5 @@ cargo bench -p fast-mesh-scene                        # scene overhead and find_
 cargo bench -p fast-mesh-fields                       # SignData::build and signed_distances on 1M triangles
 cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_BENCH_LARGE=1 for the 10M terrain
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
+cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
 ```
