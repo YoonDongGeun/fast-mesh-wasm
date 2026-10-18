@@ -416,11 +416,10 @@ mod tests {
         let mut mesh = terrain(317);
         assert!(mesh.triangle_count() >= 200_000);
         let bvh = build_bvh(&mesh);
-        let points = sample_points(&mesh, &mut Lcg(31), 300_000, 2.0);
-        for (mode, count) in [
-            (SignMode::Pseudonormal, 300_000),
-            (SignMode::Winding, 40_000),
-        ] {
+        // Still dozens of chunks each (`POINT_CHUNK`), at a fraction of the
+        // debug-build time of larger batches.
+        let points = sample_points(&mesh, &mut Lcg(31), 30_000, 2.0);
+        for (mode, count) in [(SignMode::Pseudonormal, 30_000), (SignMode::Winding, 8_000)] {
             let sign = SignData::build(&mut mesh, &bvh, mode).unwrap();
             let points = &points[..count];
             for max_distance in [f32::INFINITY, 0.5] {
@@ -432,15 +431,17 @@ mod tests {
                 par::set_force_sequential(true);
                 let reference = run();
                 par::set_force_sequential(false);
+                if !par::enabled() {
+                    // Every run below would be this one again.
+                    continue;
+                }
                 for k in POOLS {
                     let got = par::with_threads(k, run);
                     assert!(got == reference, "{mode:?}, {max_distance}: {k} threads");
                 }
                 let before = par::parallel_entries();
                 assert!(run() == reference, "{mode:?}, {max_distance}: global pool");
-                if par::enabled() {
-                    assert!(par::parallel_entries() > before, "ran sequentially");
-                }
+                assert!(par::parallel_entries() > before, "ran sequentially");
             }
         }
     }

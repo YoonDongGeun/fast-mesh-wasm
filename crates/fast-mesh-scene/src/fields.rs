@@ -128,9 +128,10 @@ struct FieldJob {
     near_margin: Option<f64>,
     /// From B's local space into A's, as the pair queries take it.
     b_to_a: Rigid,
-    /// An estimate of the update's cost, in vertices: every vertex slot of
+    /// An estimate of the update's cost, in elements: every vertex slot of
     /// A when all are recomputed; otherwise the known candidates, plus A's
-    /// triangle count for the near search, which usually costs the most.
+    /// triangle count for the near search (which usually costs the most)
+    /// when B's root box is within the margin of A's.
     work: usize,
 }
 
@@ -584,6 +585,37 @@ impl Scene {
         Ok(m)
     }
 
+    /// Whether B's root box, moved into A's space by `b_to_a`, comes within
+    /// `margin` of A's root box: when it does not, the near search ends at
+    /// the root pair. False when either mesh has no triangles. Only for the
+    /// work estimate, so the moved box is the bounds of its moved corners.
+    fn roots_within(&self, on: MeshId, to: MeshId, b_to_a: &Rigid, margin: f64) -> Result<bool> {
+        let root = |m: MeshId| -> Result<Option<_>> {
+            Ok(self.entry(m)?.bvh.root_bounds().filter(|b| !b.is_empty()))
+        };
+        let (Some(a), Some(b)) = (root(on)?, root(to)?) else {
+            return Ok(false);
+        };
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for k in 0..8 {
+            let corner = std::array::from_fn(|d| if k >> d & 1 == 0 { b.min[d] } else { b.max[d] });
+            let p = b_to_a.apply(corner);
+            for d in 0..3 {
+                lo[d] = lo[d].min(p[d]);
+                hi[d] = hi[d].max(p[d]);
+            }
+        }
+        let gap2: f64 = (0..3)
+            .map(|d| {
+                let g = (f64::from(a.min[d]) - hi[d])
+                    .max(lo[d] - f64::from(a.max[d]))
+                    .max(0.0);
+                g * g
+            })
+            .sum();
+        Ok(gap2.sqrt() <= margin)
+    }
+
     /// Brings field `i` up to date (see the module docs for what is
     /// recomputed). All or nothing: on error nothing is written and the
     /// pending changes stay.
@@ -691,7 +723,10 @@ impl Scene {
             } else {
                 0
             };
-            let near = if need_near { ma.triangle_count() } else { 0 };
+            let near = match near_margin {
+                Some(margin) if self.roots_within(on, to, &b_to_a, margin)? => ma.triangle_count(),
+                _ => 0,
+            };
             let flips = if topology { ma.vertex_slots() } else { 0 };
             listed + known + near + flips
         };
@@ -1589,15 +1624,17 @@ mod tests {
                 reference.iter().all(|(c, _, _)| c.len() == 6),
                 "{mode:?}: every mesh reports"
             );
+            if !par::enabled() {
+                // Every drag below would be this one again.
+                continue;
+            }
             for k in [1, 2, 8] {
                 let got = par::with_threads(k, || drag(24, mode));
                 assert!(got == reference, "{mode:?}: {k} threads");
             }
             counter::take_parallel();
             assert!(drag(24, mode) == reference, "{mode:?}: global pool");
-            if par::enabled() {
-                assert!(counter::take_parallel() > 0, "{mode:?}: ran sequentially");
-            }
+            assert!(counter::take_parallel() > 0, "{mode:?}: ran sequentially");
         }
     }
 
@@ -1618,6 +1655,23 @@ mod tests {
         assert_matches(&mut scene, f);
         assert_eq!(par::parallel_entries(), before);
         assert_eq!(counter::take_parallel(), 0);
+    }
+
+    #[test]
+    fn near_work_counts_only_meshes_in_reach() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Lazy);
+        scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        scene.update_fields().unwrap();
+        let tris = scene.mesh(a).unwrap().triangle_count();
+        // The sheet has fewer vertices than triangles, so only the near
+        // search can bring the estimate up to its triangle count.
+        assert!(scene.mesh(a).unwrap().vertex_count() < tris);
+        for (x, in_reach) in [(0.01, true), (100.0, false)] {
+            scene.set_placement(b, at(x, 0.0, 0.0)).unwrap();
+            let job = scene.prepare_field(0).unwrap();
+            assert!(job.near_margin.is_some());
+            assert_eq!(job.work >= tris, in_reach, "x = {x}");
+        }
     }
 
     #[test]

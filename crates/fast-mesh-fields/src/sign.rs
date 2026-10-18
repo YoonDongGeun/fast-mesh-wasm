@@ -667,18 +667,20 @@ mod tests {
             let reference = build(&mut mesh);
             par::set_force_sequential(false);
             assert!(reference.1.len() > 200_000, "{mode:?}: nothing built");
+            if !par::enabled() {
+                // Every build below would be this one again.
+                continue;
+            }
             for k in [1, 2, 8] {
                 let got = par::with_threads(k, || build(&mut mesh));
                 assert!(got == reference, "{mode:?}: {k} threads");
             }
             let before = par::parallel_entries();
             assert!(build(&mut mesh) == reference, "{mode:?}: global pool");
-            if par::enabled() {
-                assert!(
-                    par::parallel_entries() > before,
-                    "{mode:?}: ran sequentially"
-                );
-            }
+            assert!(
+                par::parallel_entries() > before,
+                "{mode:?}: ran sequentially"
+            );
         }
     }
 
