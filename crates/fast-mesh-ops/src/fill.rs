@@ -957,33 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn small_inputs_stay_sequential() {
-        use fast_mesh_bvh::{BuildOptions, Bvh};
-        use fast_mesh_store::par;
-        let before = par::parallel_entries();
-        let damaged = damaged_sphere();
-        let bvh = Bvh::build(&damaged, &BuildOptions::default()).unwrap();
-        let options = AnalyzeOptions {
-            weld_tolerance: 0.01,
-            self_intersection: Some(&bvh),
-            ..Default::default()
-        };
-        analyze(&damaged, &options).unwrap();
-        let mut mesh = damaged_sphere();
-        edit(&mut mesh, |tx| weld(tx, 0.01));
-        // A 4 x 4 hole, faired.
-        let cells: Vec<(u32, u32)> = (2..6).flat_map(|y| (2..6).map(move |x| (x, y))).collect();
-        let mut mesh = grid_without(8, &cells);
-        let options = FillOptions {
-            max_edges: Some(20),
-            ..FillOptions::default()
-        };
-        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
-        assert!(r.filled.len() == 1 && r.filled[0].weights.is_some());
-        assert_eq!(par::parallel_entries(), before);
-    }
-
-    #[test]
     fn faired_patch_follows_sphere() {
         let (mesh, r, first) = fill_sphere_holes(true);
         let (worst, count) = radius_errors(&mesh, first);

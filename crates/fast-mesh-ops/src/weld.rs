@@ -1,9 +1,11 @@
 //! Grouping vertices that lie within a tolerance of each other.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use fast_mesh_store::{Mesh, StoreError, VertexId, par};
 
 use crate::topology::{UnionFind, point};
-use crate::{OpsError, Result, filled, push, reserve};
+use crate::{OpsError, Result, filled, reserve};
 
 /// [`weld_roots`] keys the vertices and searches their neighbours in
 /// parallel chunks of [`WELD_CHUNK`] from this many vertex slots, with the
@@ -60,54 +62,127 @@ pub(crate) fn weld_roots(mesh: &Mesh, tolerance: f32) -> Result<Vec<VertexId>> {
             }
         })
     };
-    let oom = || OpsError::Store(StoreError::OutOfMemory);
-    // Each chunk of slots keys its alive vertices with finite coordinates;
-    // the chunks come back in slot order.
-    let keyed = par::map_range(slots, WELD_CHUNK, PAR_MIN_WELD_VERTS, oom, |r| {
-        let mut part: Vec<(Cell, VertexId)> = Vec::new();
-        reserve(&mut part, r.len())?;
-        for v in r.start as VertexId..r.end as VertexId {
-            let p = &mesh.positions()[v as usize];
-            if mesh.is_vertex_alive(v) && p.iter().all(|x| x.is_finite()) {
-                part.push((cell_of(v), v));
+    let parallel = par::enabled() && !par::force_sequential() && slots >= PAR_MIN_WELD_VERTS;
+    let keep = |v: VertexId| {
+        mesh.is_vertex_alive(v) && mesh.positions()[v as usize].iter().all(|x| x.is_finite())
+    };
+    // The alive vertices with finite coordinates, keyed, in slot order.
+    let mut cells: Vec<(Cell, VertexId)> = Vec::new();
+    if parallel {
+        let oom = || OpsError::Store(StoreError::OutOfMemory);
+        let keyed = par::map_range(slots, WELD_CHUNK, 0, oom, |r| {
+            let mut part: Vec<(Cell, VertexId)> = Vec::new();
+            reserve(&mut part, r.len())?;
+            for v in r.start as VertexId..r.end as VertexId {
+                if keep(v) {
+                    part.push((cell_of(v), v));
+                }
+            }
+            Ok(part)
+        })?;
+        reserve(&mut cells, keyed.iter().map(Vec::len).sum())?;
+        for part in &keyed {
+            cells.extend_from_slice(part);
+        }
+    } else {
+        reserve(&mut cells, mesh.vertex_count())?;
+        for v in 0..slots as VertexId {
+            if keep(v) {
+                cells.push((cell_of(v), v));
             }
         }
-        Ok(part)
-    })?;
-    let mut cells: Vec<(Cell, VertexId)> = Vec::new();
-    reserve(&mut cells, keyed.iter().map(Vec::len).sum())?;
-    for part in &keyed {
-        cells.extend_from_slice(part);
     }
-    drop(keyed);
     // The keys are distinct (each holds its vertex), so any sort gives
     // this order.
     cells.sort_unstable();
+    if parallel {
+        // Chunks of the sorted vertices search their neighbours on the
+        // pool and join each close pair at once, in a shared union-find
+        // that always links the larger root under the smaller: its groups,
+        // and so the roots (each group's smallest id), do not depend on the
+        // order of the unions. It takes no memory beyond its parents.
+        let uf = AtomicUnionFind::new(slots)?;
+        let oom = || OpsError::Store(StoreError::OutOfMemory);
+        par::map_range(cells.len(), WELD_CHUNK, 0, oom, |r| {
+            close_pairs(mesh, &cells, tol, r, |v, u| {
+                uf.union(v, u);
+                Ok(())
+            })
+        })?;
+        let mut roots = filled(slots, 0)?;
+        for (v, r) in roots.iter_mut().enumerate() {
+            *r = uf.find(v as u32);
+        }
+        return Ok(roots);
+    }
     let mut uf = UnionFind::new();
     uf.reset(slots)?;
-    // A union-find's groups and roots (each group's smallest id) do not
-    // depend on the order of the unions, so the pairs found in parallel
-    // chunks are joined afterwards, in chunk order.
-    if par::enabled() && !par::force_sequential() && slots >= PAR_MIN_WELD_VERTS {
-        let pairs = par::map_range(cells.len(), WELD_CHUNK, 0, oom, |r| {
-            let mut found = Vec::new();
-            close_pairs(mesh, &cells, tol, r, |v, u| push(&mut found, (v, u)))?;
-            Ok(found)
-        })?;
-        for (v, u) in pairs.into_iter().flatten() {
-            uf.union(v, u);
-        }
-    } else {
-        close_pairs(mesh, &cells, tol, 0..cells.len(), |v, u| {
-            uf.union(v, u);
-            Ok(())
-        })?;
-    }
+    close_pairs(mesh, &cells, tol, 0..cells.len(), |v, u| {
+        uf.union(v, u);
+        Ok(())
+    })?;
     let mut roots = filled(slots, 0)?;
     for (v, r) in roots.iter_mut().enumerate() {
         *r = uf.find(v as u32);
     }
     Ok(roots)
+}
+
+/// A union-find that threads share, for the parallel neighbour search of
+/// [`weld_roots`]. Every link points from a root to a smaller id, so the
+/// links form a forest and each group's root is its smallest member, however
+/// the unions interleave.
+struct AtomicUnionFind {
+    parent: Vec<AtomicU32>,
+}
+
+impl AtomicUnionFind {
+    /// `n` singletons.
+    fn new(n: usize) -> Result<Self> {
+        let mut parent = Vec::new();
+        reserve(&mut parent, n)?;
+        parent.extend((0..n as u32).map(AtomicU32::new));
+        Ok(AtomicUnionFind { parent })
+    }
+
+    /// The root of `x`'s tree, halving the path on the way: each step may
+    /// point a vertex at its grandparent, a smaller id in the same tree.
+    fn find(&self, mut x: u32) -> u32 {
+        loop {
+            let p = self.parent[x as usize].load(Ordering::Acquire);
+            if p == x {
+                return x;
+            }
+            let g = self.parent[p as usize].load(Ordering::Acquire);
+            if g != p {
+                let _ = self.parent[x as usize].compare_exchange(
+                    p,
+                    g,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            x = g;
+        }
+    }
+
+    /// Joins the groups of `a` and `b`: links the larger root under the
+    /// smaller, retrying if another thread linked it first.
+    fn union(&self, a: u32, b: u32) {
+        loop {
+            let (ra, rb) = (self.find(a), self.find(b));
+            if ra == rb {
+                return;
+            }
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            if self.parent[hi as usize]
+                .compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
 }
 
 /// Calls `found(v, u)` for each pair of the vertices `cells[range]` (`v`)
@@ -175,9 +250,37 @@ mod tests {
     }
 
     #[test]
+    fn dense_cluster_bit_identical() {
+        // 2,000 vertices within 0.002 of one point off the grid, all within
+        // the tolerance of each other: about 2 million close pairs, which
+        // the parallel search joins as it finds them instead of storing.
+        let n = 150;
+        let g = (n + 1) * (n + 1);
+        let cluster: Vec<[f32; 3]> = (0..2000)
+            .map(|i| {
+                let d = |k: u32| 0.001 * ((i * k) % 17) as f32 / 17.0;
+                [75.3 + d(3), 75.3 + d(5), 0.5 + d(7)]
+            })
+            .collect();
+        let mesh = grid_and(n, &cluster);
+        assert!(mesh.vertex_count() >= PAR_MIN_WELD_VERTS);
+        let roots =
+            assert_parallel_identical("weld_roots cluster", || weld_roots(&mesh, 0.01).unwrap());
+        let (grid_roots, cluster_roots) = roots.split_at(g as usize);
+        assert!(
+            grid_roots
+                .iter()
+                .enumerate()
+                .all(|(v, &r)| r == v as VertexId)
+        );
+        assert!(cluster_roots.iter().all(|&r| r == g));
+    }
+
+    #[test]
     fn weld_bit_identical() {
         // A grid of spacing 1 with every 7th vertex copied, nudged by up to
-        // 0.01, and a few outliers.
+        // 0.01, and a few outliers; every 5th copy is then removed, leaving a
+        // dead slot (never merged) where it was.
         let n = 300;
         let base = grid(n);
         let extra: Vec<[f32; 3]> = base
@@ -194,7 +297,12 @@ mod tests {
             })
             .chain([[1e30, 0.0, 0.0], [f32::NAN, 0.0, 0.0], [1e30, 0.0, 0.0]])
             .collect();
-        let mesh = grid_and(n, &extra);
+        let mut mesh = grid_and(n, &extra);
+        let g = (n + 1) * (n + 1);
+        let dead: Vec<VertexId> = (g..g + extra.len() as u32).step_by(5).collect();
+        let mut tx = mesh.begin_edit();
+        tx.remove_vertices(&dead).unwrap();
+        tx.commit().unwrap();
         assert!(mesh.vertex_count() >= PAR_MIN_WELD_VERTS);
         for tolerance in [0.0, 0.004, 0.02, 0.6] {
             let roots =
@@ -205,6 +313,13 @@ mod tests {
                 .filter(|&(v, &r)| r != v as VertexId)
                 .count();
             assert!(merged > 0, "{tolerance}");
+            // Dead slots map to themselves and no alive vertex joins them.
+            for (v, &r) in roots.iter().enumerate() {
+                assert_eq!(
+                    dead.binary_search(&r).is_ok(),
+                    dead.binary_search(&(v as VertexId)).is_ok()
+                );
+            }
         }
     }
 
