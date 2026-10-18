@@ -155,8 +155,32 @@ impl Mesh {
         } else {
             [0, 1, 2].map(|k| (min[k] + max[k]) * 0.5)
         };
+        Self::with_origin_checked(positions, indices, origin)
+    }
+
+    /// Builds a mesh from double-precision positions relative to a given origin:
+    /// positions are stored as `(p - origin)` in `f32`. Every coordinate, and the
+    /// origin, must be finite.
+    pub fn from_buffers_f64_with_origin(
+        positions: &[f64],
+        indices: &[u32],
+        origin: [f64; 3],
+    ) -> Result<Self> {
+        if !positions.len().is_multiple_of(3) {
+            return Err(StoreError::InvalidArgument(
+                "positions length must be a multiple of 3",
+            ));
+        }
+        if !positions.iter().all(|x| x.is_finite()) {
+            return Err(StoreError::InvalidArgument("positions must be finite"));
+        }
+        Self::with_origin_checked(positions, indices, origin)
+    }
+
+    /// Shared tail of the `f64` constructors; `positions` is already validated.
+    fn with_origin_checked(positions: &[f64], indices: &[u32], origin: [f64; 3]) -> Result<Self> {
         if !origin.iter().all(|x| x.is_finite()) {
-            return Err(not_finite);
+            return Err(StoreError::InvalidArgument("positions must be finite"));
         }
         let mut points = try_vec(positions.len() / 3, [0.0f32; 3])?;
         for (p, c) in points.iter_mut().zip(positions.as_chunks::<3>().0) {
@@ -482,6 +506,37 @@ mod tests {
             Mesh::from_buffers_f64(&[f64::MAX, 0., 0., f64::MAX, 0., 0.], &[]).err(),
             Some(bad)
         );
+    }
+
+    #[test]
+    fn explicit_origin_stores_offsets() {
+        let o = [1.0e6; 3];
+        let offsets = [[0.25, -0.5, 1.0], [-3.0, 2.125, 0.0], [10.0, 0.0, -7.5]];
+        let flat: Vec<f64> = offsets
+            .iter()
+            .flat_map(|d| [0, 1, 2].map(|k| o[k] + d[k]))
+            .collect();
+        let m = Mesh::from_buffers_f64_with_origin(&flat, &[0, 1, 2], o).unwrap();
+        assert_eq!(m.origin(), o);
+        for (v, d) in offsets.iter().enumerate() {
+            let p = m.position(v as u32).unwrap();
+            for k in 0..3 {
+                assert!((p[k] as f64 - d[k]).abs() < 1e-3, "{v}: {p:?} vs {d:?}");
+            }
+        }
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&flat, &[], [f64::NAN, 0., 0.]).err(),
+            Some(bad.clone())
+        );
+        assert_eq!(
+            Mesh::from_buffers_f64_with_origin(&[f64::INFINITY, 0., 0.], &[], [0.; 3]).err(),
+            Some(bad)
+        );
+        assert!(matches!(
+            Mesh::from_buffers_f64_with_origin(&[0., 0.], &[], [0.; 3]),
+            Err(StoreError::InvalidArgument(_))
+        ));
     }
 
     #[test]
