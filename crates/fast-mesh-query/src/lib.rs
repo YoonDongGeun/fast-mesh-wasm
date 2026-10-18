@@ -31,6 +31,9 @@
 //!   mesh within a margin of the other) and [`intersecting_pairs`]. Results
 //!   are in A's space; passing the same mesh twice means two coincident
 //!   copies.
+//! - Self-intersection: [`self_intersecting_pairs`] finds the triangle pairs
+//!   of one mesh that intersect and share no vertex id, by the same exact
+//!   test.
 //! - Cutting planes: a [`Plane`] (origin and unit normal, in `f64` mesh-local
 //!   coordinates) with an orthonormal 2D frame `(u, v)`. A point is on its
 //!   `+` side when its signed distance is zero or more.
@@ -53,6 +56,7 @@ mod ray;
 mod region;
 mod rigid;
 mod section;
+mod selfpairs;
 mod slice;
 #[cfg(test)]
 mod test_util;
@@ -73,6 +77,7 @@ pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;
 pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};
+pub use selfpairs::self_intersecting_pairs;
 pub use slice::{Contour, Slice, slice};
 pub use tri::{Cull, Feature};
 

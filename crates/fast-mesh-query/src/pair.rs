@@ -80,12 +80,29 @@ pub(crate) fn traverse_pairs_with<const N: usize, K: Copy + PartialOrd>(
     a: &Bvh,
     b: &Bvh,
     xf: &Rigid,
-    mut key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
-    mut visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
+    key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
 ) {
     let (Some(ra), Some(rb)) = (a.root(), b.root()) else {
         return;
     };
+    traverse_subtree_pairs_with::<N, K>(a, ra, b, rb, xf, key, visit);
+}
+
+/// [`traverse_pairs_with`] from the subtree of `a` rooted at `ra` and the
+/// subtree of `b` rooted at `rb`, instead of the two whole trees. With
+/// `a` and `b` the same tree and `ra`, `rb` disjoint subtrees of it, every
+/// pair of a node under `ra` and a node under `rb` is a distinct unordered
+/// pair of that tree.
+pub(crate) fn traverse_subtree_pairs_with<const N: usize, K: Copy + PartialOrd>(
+    a: &Bvh,
+    ra: NodeId,
+    b: &Bvh,
+    rb: NodeId,
+    xf: &Rigid,
+    mut key: impl FnMut(&Aabb, &Aabb) -> Option<K>,
+    mut visit: impl FnMut(&NodeView, &NodeView, K) -> Step,
+) {
     let b_box = xf.transform_box(&b.node(rb).bounds);
     let Some(k) = key(&a.node(ra).bounds, &b_box) else {
         return;

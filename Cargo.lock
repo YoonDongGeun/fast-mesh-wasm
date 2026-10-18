@@ -290,6 +290,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-mesh-ops"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "fast-mesh-bvh",
+ "fast-mesh-query",
+ "fast-mesh-store",
+ "proptest",
+]
+
+[[package]]
 name = "fast-mesh-query"
 version = "0.1.0"
 dependencies = [
@@ -307,6 +318,7 @@ dependencies = [
  "criterion",
  "fast-mesh-bvh",
  "fast-mesh-fields",
+ "fast-mesh-ops",
  "fast-mesh-query",
  "fast-mesh-store",
  "proptest",
