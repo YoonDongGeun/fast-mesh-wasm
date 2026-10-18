@@ -456,6 +456,38 @@ impl WasmScene {
                 sections: c.sections_changed.iter().map(|s| s.raw()).collect(),
             });
         }
+        // Slots added and undone between two takes leave no change behind,
+        // but the buffers grew: report the capacity change anyway.
+        let mut reported: Vec<(u32, u32)> = records
+            .iter()
+            .map(|r| (r.mesh_index, r.mesh_generation))
+            .collect();
+        reported.sort_unstable();
+        for (&id, state) in &mut self.render {
+            if reported
+                .binary_search(&(id.index(), id.generation()))
+                .is_ok()
+            {
+                continue;
+            }
+            let Ok(mesh) = self.scene.mesh(id) else {
+                continue;
+            };
+            let normals = self.scene.normals(id).ok().flatten();
+            let normals_len = normals.map_or(0, <[_]>::len);
+            if let Some(dirty) = state.unreported_growth(mesh, normals_len) {
+                records.push(Record {
+                    mesh_index: id.index(),
+                    mesh_generation: id.generation(),
+                    added: false,
+                    removed: false,
+                    placement_changed: false,
+                    dirty,
+                    fields: Vec::new(),
+                    sections: Vec::new(),
+                });
+            }
+        }
         let mut out = Vec::new();
         encode(&records, &mut out);
         out
@@ -1146,6 +1178,33 @@ mod tests {
             assert_eq!(e.code, expected, "{err:?}");
             assert_eq!(e.message(), format!("{expected}: {err}"));
         }
+    }
+
+    #[test]
+    fn slots_added_and_undone_report_capacity() {
+        let mut s = WasmScene::new();
+        let (i, g) = add(&mut s, false);
+        let (j, h) = add(&mut s, false);
+        s.take_changes();
+        // Added then undone before the next take: the edit cancels out, but
+        // the slots stay, so the buffers must still be recreated.
+        let id = s.id(i, g).unwrap();
+        s.scene
+            .edit(id, |tx| {
+                let v = tx.add_vertices(&[[3., 0., 0.]])?;
+                tx.add_triangles(&[[1, v[0], 2]])
+            })
+            .unwrap();
+        assert!(s.undo().unwrap());
+        assert_eq!(s.vertex_slots(i, g).unwrap(), 5);
+        let all = FLAG_POSITIONS_ALL | FLAG_NORMALS_ALL | FLAG_COLORS_ALL | FLAG_INDICES_ALL;
+        assert_eq!(
+            s.take_changes(),
+            vec![1, i, g, FLAG_CAPACITY | all, 0, 0, 0, 0, 0, 0]
+        );
+        // Reported once; the untouched mesh never is.
+        assert_eq!(s.take_changes(), vec![0]);
+        assert_eq!(s.vertex_slots(j, h).unwrap(), 4);
     }
 
     #[test]

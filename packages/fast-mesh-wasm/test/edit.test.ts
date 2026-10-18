@@ -245,6 +245,23 @@ describe("edit", () => {
     expect(c.capacityChanged).toBe(true);
     expect([c.positions, c.normals, c.colors, c.indices]).toEqual(["all", "all", "all", "all"]);
   });
+
+  it("slots_added_and_undone_report_capacity", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris, { normals: false });
+    s.takeChanges();
+    s.edit(m, [{ op: "addVertices", positions: [4, 0, 0, 5, 0, 0] }]);
+    s.undo();
+    expect(s.vertexSlots(m)).toBe(6);
+    // The edit cancelled out, but the buffers still grew.
+    const [c, ...rest] = s.takeChanges();
+    expect(rest).toEqual([]);
+    expect(c.mesh).toBe(m);
+    expect(c.capacityChanged).toBe(true);
+    expect([c.positions, c.normals, c.colors, c.indices]).toEqual(["all", "all", "all", "all"]);
+    expect(s.views(m).positions().length).toBe(18);
+    expect(s.takeChanges()).toEqual([]);
+  });
 });
 
 /** Hemisphere with two punched holes (vertex fans removed) and two flipped triangles. */

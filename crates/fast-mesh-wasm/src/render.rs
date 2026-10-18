@@ -142,6 +142,22 @@ impl RenderState {
         }
     }
 
+    /// The report of `mesh` when the scene had no change for it but its
+    /// slot counts still differ from the last report (slots added, then
+    /// undone before the changes were taken): every buffer "all", with the
+    /// capacity change. `None` when the counts match.
+    pub(crate) fn unreported_growth(&mut self, mesh: &Mesh, normals_len: usize) -> Option<Dirty> {
+        let (vs, ts) = (mesh.vertex_slots(), mesh.triangle_slots());
+        if vs == self.vertex_slots && ts == self.triangle_slots {
+            return None;
+        }
+        self.vertex_slots = vs;
+        self.triangle_slots = ts;
+        self.normals_len = normals_len;
+        self.stale = false;
+        Some(Dirty::all())
+    }
+
     /// Turns `changes`, the scene's report for `mesh`, into the dirty slots
     /// of every render buffer, and remembers the buffer sizes.
     /// `normals_len` is the current length (in vertices) of the mesh's
