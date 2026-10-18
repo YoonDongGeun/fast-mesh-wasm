@@ -2,8 +2,12 @@
 //!
 //! Every query takes a mesh and a BVH built for it, works in the mesh's local
 //! `f32` coordinates, and fails with [`QueryError::StaleBvh`] when the mesh was
-//! edited after the BVH was last updated. Queries allocate only into the
-//! output vector they are given.
+//! edited after the BVH was last updated. Point, ray, region and pair queries
+//! allocate only into the output vector they are given. [`slice()`],
+//! [`fill()`], [`contour_gap`] and
+//! [`triangulate`](triangulate::triangulate) also build per-call temporaries,
+//! all reserved fallibly, so that running out of memory is
+//! [`QueryError::OutOfMemory`].
 //!
 //! - Closest point: [`closest_point`] and [`closest_point_many`], with the
 //!   [`Feature`] of the triangle the nearest point lies on.
@@ -27,17 +31,33 @@
 //!   mesh within a margin of the other) and [`intersecting_pairs`]. Results
 //!   are in A's space; passing the same mesh twice means two coincident
 //!   copies.
+//! - Cutting planes: a [`Plane`] (origin and unit normal, in `f64` mesh-local
+//!   coordinates) with an orthonormal 2D frame `(u, v)`. A point is on its
+//!   `+` side when its signed distance is zero or more.
+//! - Sections: [`slice()`] cuts a mesh with a [`Plane`] into a [`Slice`] of
+//!   [`Contour`]s, chained by crossed edge, with flags for open, unoriented
+//!   and non-manifold pieces.
+//! - Polygon fill: [`triangulate::triangulate`] splits a 2D polygon with
+//!   holes into counter-clockwise triangles by ear clipping.
+//! - Section measurements on `(u, v)` polylines: [`contour_length`],
+//!   [`signed_area`], [`fill`] (nesting into outers and holes, then a
+//!   [`Fill`] of triangles) and [`contour_gap`] (the exact in-plane
+//!   [`Gap2`] between two sets of polylines, found through a grid).
 
 mod closest;
 mod error;
 mod pair;
 mod pairs;
+mod plane;
 mod ray;
 mod region;
 mod rigid;
+mod section;
+mod slice;
 #[cfg(test)]
 mod test_util;
 mod tri;
+pub mod triangulate;
 mod tritri;
 
 use fast_mesh_bvh::Bvh;
@@ -48,9 +68,12 @@ pub use error::{QueryError, Result};
 /// The axis-aligned box type of [`Region::Box`], re-exported from `fast_mesh_bvh`.
 pub use fast_mesh_bvh::Aabb;
 pub use pairs::*;
+pub use plane::Plane;
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;
+pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};
+pub use slice::{Contour, Slice, slice};
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.

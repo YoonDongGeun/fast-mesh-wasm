@@ -10,8 +10,8 @@ crates/fast-mesh/        Pure Rust algorithms. No WebAssembly code. Most work ha
 crates/fast-mesh-wasm/   #[wasm_bindgen] wrappers that expose the core to JavaScript.
 crates/fast-mesh-store/  Editable mesh storage: slots, channels, transactions, undo/redo history.
 crates/fast-mesh-bvh/    BVH over a store mesh: build, incremental update, box query.
-crates/fast-mesh-query/  Raycast, closest-point, region and mesh-vs-mesh queries.
-crates/fast-mesh-scene/  Scene: meshes, placements, update modes, world queries, contacts, multi-mesh undo.
+crates/fast-mesh-query/  Raycast, closest-point, region and mesh-vs-mesh queries; plane slices, fill and gap.
+crates/fast-mesh-scene/  Scene: meshes, placements, update modes, world queries, contacts, fields, plane sections, multi-mesh undo.
 crates/fast-mesh-fields/  Per-vertex fields: signed distance (pseudonormal, fast winding), colormaps.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.

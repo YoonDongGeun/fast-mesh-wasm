@@ -7,7 +7,8 @@ use crate::fields::{ColorState, Field, FieldHook};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::report::Report;
-use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SubscriberId};
+use crate::sections::{Section, SectionHook};
+use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SectionId, SubscriberId};
 
 /// When a mesh's BVH is brought up to date after the mesh changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +69,8 @@ pub(crate) struct Entry {
     /// One pending change accumulator per field this mesh is part of (as
     /// mesh `on` or `to`): the internal hook field updates read.
     pub(crate) hooks: Vec<FieldHook>,
+    /// One pending change accumulator per section selecting this mesh.
+    pub(crate) section_hooks: Vec<SectionHook>,
     /// The mesh's colouring and its colours, if it has one.
     pub(crate) coloring: Option<ColorState>,
 }
@@ -85,7 +88,7 @@ impl Entry {
 
     /// Reports the mesh as fully changed to every subscriber, colours
     /// included (vertex ids may have been renumbered), and to every field
-    /// hook.
+    /// and section hook.
     pub(crate) fn report_everything(&mut self) {
         for r in &mut self.reports {
             r.changes = None;
@@ -94,14 +97,21 @@ impl Entry {
         for h in &mut self.hooks {
             h.changes = None;
         }
+        for h in &mut self.section_hooks {
+            h.changes = None;
+        }
     }
 
-    /// Reports a placement change to every subscriber and field hook.
+    /// Reports a placement change to every subscriber, field hook and
+    /// section hook.
     pub(crate) fn report_placement(&mut self) {
         for r in &mut self.reports {
             r.placement_changed = true;
         }
         for h in &mut self.hooks {
+            h.placement_changed = true;
+        }
+        for h in &mut self.section_hooks {
             h.placement_changed = true;
         }
     }
@@ -120,6 +130,14 @@ impl Entry {
         }
     }
 
+    /// Reports a change of section `id`'s result for this mesh to every
+    /// subscriber.
+    pub(crate) fn report_section(&mut self, id: SectionId) {
+        for r in &mut self.reports {
+            r.section_changed(id);
+        }
+    }
+
     /// Reports a write to channel `name` to every subscriber.
     fn report_channel(&mut self, name: &str) {
         for r in &mut self.reports {
@@ -128,7 +146,8 @@ impl Entry {
     }
 
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
-    /// changes and into every subscriber's report.
+    /// changes, into every subscriber's report and into every field and
+    /// section hook.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
         match &mut self.pending {
             Some(p) => p.merge(changes),
@@ -138,6 +157,11 @@ impl Entry {
             r.merge(changes);
         }
         for h in &mut self.hooks {
+            if let Some(c) = &mut h.changes {
+                c.merge(changes);
+            }
+        }
+        for h in &mut self.section_hooks {
             if let Some(c) = &mut h.changes {
                 c.merge(changes);
             }
@@ -218,6 +242,13 @@ pub struct Scene {
     pub(crate) fields: Vec<Field>,
     /// The id the next `add_distance_field` hands out.
     pub(crate) next_field: u32,
+    /// The registered sections, in registration order.
+    pub(crate) sections: Vec<Section>,
+    /// The id the next `add_section` hands out.
+    pub(crate) next_section: u32,
+    /// Test-only count of section entry recomputes.
+    #[cfg(test)]
+    pub(crate) section_recomputes: usize,
 }
 
 impl Scene {
@@ -233,6 +264,10 @@ impl Scene {
             history: History::new(options.history_budget),
             fields: Vec::new(),
             next_field: 0,
+            sections: Vec::new(),
+            next_section: 0,
+            #[cfg(test)]
+            section_recomputes: 0,
         }
     }
 
@@ -258,6 +293,7 @@ impl Scene {
             rebuild: false,
             reports: vec![Report::added(); self.subscribers.len()],
             hooks: Vec::new(),
+            section_hooks: Vec::new(),
             coloring: None,
         })
     }
@@ -270,7 +306,9 @@ impl Scene {
     /// subscriber's last call.
     ///
     /// The fields on the mesh and those measured to it are removed with it
-    /// (see [`Scene::remove_field`]), and so are colourings by them.
+    /// (see [`Scene::remove_field`]), and so are colourings by them. The
+    /// mesh leaves every section selecting it, which is reported in its
+    /// final [`MeshChanges::sections_changed`].
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
@@ -283,6 +321,7 @@ impl Scene {
                 .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
         }
         self.drop_fields_of(id);
+        self.drop_sections_of(id);
         let mut entry = self.entries.remove(id).ok_or(SceneError::UnknownMesh)?;
         self.history.forget(id, Some(&mut entry.mesh));
         for (s, r) in self.subscribers.iter_mut().zip(&mut entry.reports) {
@@ -297,9 +336,9 @@ impl Scene {
     /// patch in the history: in the open step, or as a step of its own when
     /// none is open. Recording drops the redo stack. The changes are added to
     /// the mesh's report and to its BVH's pending changes; an Eager BVH is
-    /// then brought up to date, and so are the Eager fields involving the
-    /// mesh (a failed field update leaves the field stale and never fails
-    /// the edit).
+    /// then brought up to date, and so are the Eager fields and section
+    /// entries involving the mesh (a failed update leaves them stale and
+    /// never fails the edit).
     ///
     /// An empty transaction records and reports nothing.
     ///
@@ -333,7 +372,7 @@ impl Scene {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.after_change();
         }
-        self.run_eager_fields(Some(&[id]));
+        self.run_eager(Some(&[id]));
         Ok(r)
     }
 
@@ -371,12 +410,20 @@ impl Scene {
     }
 
     /// Passes a history result through; after [`SceneError::Corrupted`]
-    /// (meshes flagged as fully changed) runs every Eager field first.
+    /// (meshes flagged as fully changed) runs every Eager field and section
+    /// entry first.
     fn after_corrupted<T>(&mut self, r: Result<T>) -> Result<T> {
         if r.as_ref().err() == Some(&SceneError::Corrupted) {
-            self.run_eager_fields(None);
+            self.run_eager(None);
         }
         r
+    }
+
+    /// Updates the Eager fields and section entries involving `touched`
+    /// (all with `None`), swallowing failures (§6.3).
+    fn run_eager(&mut self, touched: Option<&[MeshId]>) {
+        self.run_eager_fields(touched);
+        self.run_eager_sections(touched);
     }
 
     /// Closes an open step, then undoes the latest step: its entries are
@@ -442,8 +489,8 @@ impl Scene {
     }
 
     /// Feeds the outcome of an undo, redo or cancel into the reports and
-    /// pending changes, then runs the Eager updates (BVHs, then fields), as
-    /// after an edit.
+    /// pending changes, then runs the Eager updates (BVHs, then fields and
+    /// sections), as after an edit.
     fn absorb(&mut self, done: Vec<Done>) {
         for (id, changes) in &done {
             if let Some(e) = self.entries.get_mut(*id) {
@@ -460,7 +507,7 @@ impl Scene {
             }
         }
         let touched: Vec<MeshId> = done.iter().map(|(id, _)| *id).collect();
-        self.run_eager_fields(Some(&touched));
+        self.run_eager(Some(&touched));
     }
 
     /// Sets when the mesh's BVH is brought up to date. Switching to
@@ -474,27 +521,31 @@ impl Scene {
         let entry = self.entry_mut(id)?;
         entry.mode = mode;
         entry.after_change();
-        self.run_eager_fields(Some(&[id]));
+        self.run_eager(Some(&[id]));
         Ok(())
     }
 
     /// Brings the mesh's BVH up to date now, whatever its mode. Eager fields
     /// involving the mesh that were left stale (for example by this BVH
-    /// being a stale Manual one) then catch up.
+    /// being a stale Manual one) then catch up, and so does every stale
+    /// section entry of the mesh, whatever its mode.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update.
-    /// On error the BVH keeps its pending changes.
+    /// On error the BVH keeps its pending changes. Then the first section
+    /// error (for example out of memory); such entries stay stale.
     pub fn update(&mut self, id: MeshId) -> Result<()> {
         self.entry_mut(id)?.update_bvh()?;
         self.run_eager_fields(Some(&[id]));
-        Ok(())
+        self.run_sections(|_| true, Some(&[id]))
     }
 
     /// Brings every Lazy BVH up to date, and every Eager one left stale by a
     /// failed update; then does the same for the fields, which follow the
-    /// mode of the mesh they are on (see [`Scene::update_fields`]). Manual
-    /// BVHs and fields on Manual meshes are left alone.
+    /// mode of the mesh they are on (see [`Scene::update_fields`]), and for
+    /// the section entries, which follow the mode of their mesh (see
+    /// [`Scene::update_sections`]). Manual BVHs, and fields and section
+    /// entries on Manual meshes, are left alone.
     ///
     /// # Errors
     /// The first BVH, memory or field error, for example
@@ -513,6 +564,10 @@ impl Scene {
             }
         }
         let r = self.run_fields(|mode| mode != UpdateMode::Manual, None);
+        if first.is_ok() {
+            first = r;
+        }
+        let r = self.run_sections(|mode| mode != UpdateMode::Manual, None);
         if first.is_ok() {
             first = r;
         }
@@ -666,7 +721,7 @@ impl Scene {
     /// [`Scene::take_changes`] reports it as fully changed (`changes: None`,
     /// `colors_dirty: None`). Its field channels and colours are remapped
     /// with it; the fields involving it are recomputed in full on their
-    /// next update.
+    /// next update, and so are its section entries.
     ///
     /// If the rebuild fails, compaction still succeeds and the BVH stays
     /// pending, as after a failed Eager update in [`Scene::edit`].
@@ -686,7 +741,7 @@ impl Scene {
         let _ = entry.update_bvh();
         // The field channels were remapped with the mesh; so are the colours.
         entry.recolor_all();
-        self.run_eager_fields(Some(&[id]));
+        self.run_eager(Some(&[id]));
         Ok(remap)
     }
 
@@ -719,8 +774,8 @@ impl Scene {
     /// `placement_changed` and records the old and new value in the history
     /// (in the open step, or as a step of its own), which drops the redo
     /// stack. Setting the current placement again records and reports
-    /// nothing. No BVH is touched; Eager fields involving the mesh are
-    /// updated (a failure leaves them stale).
+    /// nothing. No BVH is touched; Eager fields and section entries
+    /// involving the mesh are updated (a failure leaves them stale).
     ///
     /// Within an open step, consecutive placement changes of the same mesh
     /// merge into one entry that keeps the first old value and the last new
@@ -744,7 +799,7 @@ impl Scene {
         entry.report_placement();
         self.history
             .record_placement(&mut self.entries, id, old, placement);
-        self.run_eager_fields(Some(&[id]));
+        self.run_eager(Some(&[id]));
         Ok(())
     }
 
