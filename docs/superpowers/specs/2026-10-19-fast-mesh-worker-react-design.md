@@ -189,3 +189,40 @@ interface MeshState {
 - Selector memoisation helpers.
 - Test harness for `worker_threads`.
 - Splitting into plan tasks: 9a and 9b plans.
+
+## 9. Decisions after the builder check (all *my call*; they override earlier sections)
+
+1. **9a ships transfer mode only.** SAB views over Worker memory need one of three things: a frame handshake that freezes mutation, double-buffered render buffers, or accepting torn frames. They also need a shared-memory wasm build. Both belong with multithreading stage 2, which needs the same shared build. So 9a always transfers dirty ranges into main-thread mirrors. §2 goal 5 and §4.4 SAB mode move to stage 2.
+2. **Handles are allocated synchronously on the main thread.**
+   - `addMesh`, `addSection` and the store's field creation return a handle immediately, with a client id.
+   - The Worker keeps a client-id → engine-id map, and messages name client ids.
+   - Coalescing keys use client ids.
+   - Handles survive `restart()`: the map is rebuilt.
+   - Errors from a failed add appear on the handle's status (`error`), and later calls on it give `UNKNOWN_MESH`.
+3. **Adapter data reaches the main thread with every result.**
+   - Each result carries, per changed mesh, its placement and `matrix4`. Per changed section entry it carries the section result (contours and fill), as transferred arrays.
+   - The main-thread proxy keeps these mirrors, so `matrix4`, `placement`, `section` and `sectionPlane` stay synchronous.
+   - `fieldValues` is async in Worker mode (`fetchFieldValues`).
+   - The 8b adapters are retyped from the concrete `Scene` class to a structural `SceneLike` interface (`views`, `matrix4`, `placement`, `section`, `sectionPlane`, `onChanges`, `commitFrame`, `drag`). Both `Scene` and the Worker proxy implement it.
+   - This is type-only, so existing users are unaffected; it is noted in the changeset.
+4. **Drags are optimistic.**
+   - In Worker mode, `drag(mesh).move(p)` updates the main-thread placement mirror and `matrix4` immediately, so the object follows the pointer without lag. It then sends a coalesced move to the Worker.
+   - Colours and sections catch up when results arrive, shown as `status: "computing"` on the dependent state. This visible lag is documented and is not tearing.
+   - `end()` and `cancel()` are synchronous on the main side and enqueue the Worker step.
+   - `cancel()` restores the start placement and records nothing, as in 8a's nested semantics.
+5. **Distance colouring is declarative, and the store owns the fields.**
+   - `setDisplay(mesh, { coloring: { distanceTo: MeshHandle, maxDistance, map, range, below?, above?, center? } | null })`.
+   - The store creates the field on first need, keeps it while colouring is off (engine §12.6: "hiding keeps values"), and reuses it when colouring comes back on with the same target and `maxDistance`. It replaces the field only when those change.
+   - Toggling therefore costs a recolour, not a field build, after the first time.
+   - The low-level `ColorRule` / `addDistanceField` path stays on `Scene` / `WorkerScene` for advanced use.
+6. **`restart()` snapshot.**
+   - Built on the main thread from what it already has: the transfer-mode mirrors (live triangles, local f32 positions), each mesh's origin and placement (kept by the proxy), and the store's declarative state (display, sections, selection).
+   - Rebuilding re-adds each mesh from its live data, compacted (slot ids change, handles do not), then re-applies placements, display (fields are re-created) and sections.
+   - History is not restored.
+   - No extra copy of the inputs is kept.
+7. **API scope.**
+   - **`WorkerScene` / main proxy:** `addMesh`, `removeMesh`, `setPlacement`, `placement`, `matrix4`, `drag`, `edit`, `compact`, `analyze`, `repair`, `undo`, `redo`, `canUndo`/`canRedo` (as state), sections (add, set, remove, `section`, `sectionPlane`), async queries (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`), the low-level fields API, `views`, `onChanges`, `commitFrame`, `restart`, `terminate`.
+   - **Not in 9a:** user-opened steps (`beginStep`/`endStep`/`cancelStep`), Lazy/Manual modes (the Worker scene is always Eager), and `takeChanges` (`onChanges` replaces it).
+   - **`SceneStore` actions:** `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `setDisplay`, `setSection`, `addSection`, `removeSection`, `select`, `restart`.
+8. **Node.** `worker_threads` is a test harness only. `fast-mesh-wasm/worker` targets browsers and has no Node export condition in 9a.
+9. **Package layout.** `<FastMesh>` (R3F) goes in a separate subpath, `fast-mesh-wasm/r3f`, so `./react` does not depend on three or R3F. Optional peers: `react >=18`, `@react-three/fiber >=8`.
