@@ -13,9 +13,13 @@
 //!   positive outside (in front of the surface), negative inside (behind it),
 //!   zero on it, and `+∞` beyond `max_distance`.
 //!
+//! - [`color_of`] turns a field value into an RGBA8 colour under a
+//!   [`ColorRule`] ([`Colormap`], range, optional centre, out-of-range rules).
+//!
 //! Everything works in the mesh's local `f32` coordinates. Kernels allocate
 //! only while building [`SignData`], never per point.
 
+mod color;
 mod distance;
 mod error;
 mod geom;
@@ -24,6 +28,7 @@ mod sign;
 mod test_util;
 mod winding;
 
+pub use color::{ColorRule, Colormap, OutOfRange, color_of};
 pub use distance::signed_distances;
 pub use error::{FieldsError, Result};
 pub use sign::{SignData, SignMode, SignStatus};
