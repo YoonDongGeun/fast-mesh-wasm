@@ -244,6 +244,10 @@ fn bench_fill(c: &mut Criterion) {
             r.skipped.len(),
             r.failed.len()
         );
+        if fair {
+            let fairing: Vec<_> = r.filled.iter().map(|f| (f.weights, f.converged)).collect();
+            eprintln!("fill_10_holes_1M fair on: (weights, converged) per hole: {fairing:?}");
+        }
         group.bench_function(format!("fill_10_holes_1M {name}"), |b| {
             b.iter_batched(
                 || build(&buffers),

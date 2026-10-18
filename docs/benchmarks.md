@@ -267,7 +267,7 @@ Results for `cargo bench -p fast-mesh-ops --bench ops`, measured on 2026-10-18.
 - **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
 - **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
 - **Meshes:** `terrain(708)` (1,002,528 triangles, 502,681 vertices), with the damage described per row. 10 samples per benchmark.
-- **Timing:** `analyze` reads the mesh. The writing operations run a transaction (`begin_edit`, the operation, `commit`) on a mesh rebuilt from buffers for every iteration; the rebuild is outside the timing and the commit is inside it. Criterion medians.
+- **Timing:** `analyze` reads the mesh. The writing operations run a transaction (`begin_edit`, the operation, `commit`) on a mesh rebuilt from buffers for every iteration; the rebuild is outside the timing and the commit is inside it. The times are the middle value of criterion's interval (its headline estimate of the mean time per iteration), not medians.
 
 | Benchmark | Time | Input and result |
 | --- | --- | --- |
@@ -281,8 +281,10 @@ Results for `cargo bench -p fast-mesh-ops --bench ops`, measured on 2026-10-18.
 
 No target was set for these (the plan asks only that they be recorded), and nothing was tuned.
 
-- **Fairing dominates a fill.** Fairing is about 93% of the 5.16 s, for 40,548 new vertices. Refinement to the surrounding density makes the patches large (on this terrain the edges are about 1 long, so a hole of 482 edges gets thousands of triangles), and each patch needs a conjugate-gradient solve. A fill that needs only a closed surface can set `fair: false` and costs 360 ms for the same ten holes, with a flatter patch (see the accuracy below).
+- **Fairing dominates a fill.** Fairing is about 93% of the 5.16 s, for 40,548 new vertices. Refinement to the surrounding density makes the patches large (on this terrain the edges are about 1 long, so a hole of 482 edges gets thousands of triangles), and each patch needs a conjugate-gradient solve. `fair` defaults to true, so a default fill of this input costs about 5 s. A fill that needs only a closed surface can set `fair: false` and costs 360 ms for the same ten holes, with a flatter patch (see the accuracy below).
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
+- **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
