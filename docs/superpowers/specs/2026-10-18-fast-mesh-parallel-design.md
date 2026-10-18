@@ -131,6 +131,9 @@ What the build decided along the way, where it differs from the sections above, 
 - **Still sequential:** the Fast build's per-triangle boxes and Morton sort; `analyze`'s edge-map sort (which limits `analyze` to 1.2× without the self-intersection check); the weld's sort; fairing's dot products and vector updates, which are chunked in a fixed order so the sequential build gives the same bits. A parallel sort helper would be follow-up work.
 - **No golden values in the scene and fields bit-identity tests.** CI runs on Linux and the test meshes use `sin` and `atan2`, so the reference is the forced-sequential path, which is the code the feature-off build runs. The BVH test has golden values.
 - **Thread-local test counters undercount** once their site runs on workers (for example `LEAF_VISITS` in the pair queries and `PAIRS` in the weld). Their documentation says so, and the tests that read them stay below the thresholds or force the sequential path.
+- **Not measured: a barely-touching owner-scale scene.** The owner-scale check covers meshes that cross and meshes far apart. It does not cover meshes that only just touch, where the pair split still runs for little work. That is follow-up work.
+- **BVH `byte_size` is smaller with the feature** for the same tree: 20.2 against 21.6 MB at 1M. `byte_size` sums capacity. The build without the feature reserves the expected node count up front; the parallel build reserves the exact count.
+- **`many_mesh_drag_1M` runs only with `FAST_MESH_BENCH_LARGE=1`.** Without the feature it takes about 10 minutes per run.
 - **Nested parallelism:** inside the parallel field compute, `triangles_near` (above its threshold) forks again. Rayon handles the nesting, and the owner-scale check below covers it.
 
 ### Thresholds

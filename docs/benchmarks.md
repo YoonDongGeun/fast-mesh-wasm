@@ -403,7 +403,7 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 | `many_mesh_drag_30k_apart`, 64 poses | 319 µs | 318 µs | 1.0× |
 | `many_mesh_drag_1M`, 64 poses | 39.2 s | 3.60 s | 11× |
 
-**The many-mesh scenes.** Six `terrain(n)` meshes in a row along x, each overlapping the next by an eighth of its side, so that neighbouring sheets cross along curves. There is a distance field for every ordered pair (30 fields, `max_distance` 0.5, sign `Auto`), and each mesh is coloured by its field to the next. All meshes are Lazy. The middle mesh (the third) is dragged through 64 poses, rising and falling by up to 0.25 and sliding 0.1 along x. Each pose makes ten fields due (five on the moved mesh, five measured to it) and runs `set_placement`, `update_fields`, `colors` of every mesh and `take_changes`. `many_mesh_drag_30k` uses `terrain(122)` (29,768 triangles per mesh, the owner's scale) and recolours about 390 vertices per pose. `many_mesh_drag_30k_apart` puts the same meshes a whole side apart, so no field has anything within reach and no vertex is recoloured. `many_mesh_drag_1M` uses `terrain(708)` and recolours about 46,600 vertices per pose. The 30k benchmarks take 50 samples, the others 10.
+**The many-mesh scenes.** Six `terrain(n)` meshes in a row along x, each overlapping the next by an eighth of its side, so that neighbouring sheets cross along curves. There is a distance field for every ordered pair (30 fields, `max_distance` 0.5, sign `Auto`), and each mesh is coloured by its field to the next. All meshes are Lazy. The middle mesh (the third) is dragged through 64 poses, rising and falling by up to 0.25 and sliding 0.1 along x. Each pose makes ten fields due (five on the moved mesh, five measured to it) and runs `set_placement`, `update_fields`, `colors` of every mesh and `take_changes`. `many_mesh_drag_30k` uses `terrain(122)` (29,768 triangles per mesh, the owner's scale) and recolours about 390 vertices per pose. `many_mesh_drag_30k_apart` puts the same meshes a whole side apart, so no field has anything within reach and no vertex is recoloured. `many_mesh_drag_1M` uses `terrain(708)` and recolours about 46,600 vertices per pose. It runs only with `FAST_MESH_BENCH_LARGE=1`, because a run without the feature takes about 10 minutes. The 30k benchmarks take 50 samples, the others 10.
 
 **Owner-scale check (spec anti-goal: parallel at most 1.05 times sequential).** Met with the thresholds as they were, so none was changed:
 - `many_mesh_drag_30k`: parallel takes 0.16 times the sequential time (57.1 ms against 352 ms; round 1: 57.8 against 387 ms).
@@ -414,6 +414,10 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 - **`analyze` without the self-intersection check** (1.2×): its passes run side by side, but they all wait for the edge map's sort, which stays sequential.
 - **Fill without fairing** (1.0×): nothing in it is parallel. With fairing on, the three coordinate solves run side by side, with parallel matrix products from 1,024 rows.
 - **The sphere fill and the gap alone** (1.0×): single small computations under every threshold.
+
+**Not measured: a barely-touching owner-scale scene.** The 30k check covers meshes that cross and meshes far apart. Meshes that only just touch, where the pair queries split their traversal for little work, were not measured on their own. That is follow-up work.
+
+**BVH memory.** With the feature, the BVH bench prints a smaller `byte_size` for the same nodes and depth: 20.2 MB against 21.6 MB at 1M, and 193.5 MB against 215.3 MB at 10M. The difference is reserved capacity, because `byte_size` sums the arrays' `capacity()`. The build without the feature reserves the expected node count up front, while the parallel build reserves the exact count.
 
 **Round-to-round differences.** Round 1 differs from round 2 by more than 10% on two rows, both feature-off: `many_mesh_drag_1M` (51.3 s against 39.2 s) and `many_mesh_drag_30k_apart` (612 µs against 319 µs). The feature-on results of both rounds agree within 2% on both rows.
 
@@ -472,6 +476,7 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
-cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k, apart, 6 x 1M)
+cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k, and the same apart)
+FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)
 cargo bench -p fast-mesh-scene --features parallel          # any of the above with the parallel feature (same for the other crates)
 ```
