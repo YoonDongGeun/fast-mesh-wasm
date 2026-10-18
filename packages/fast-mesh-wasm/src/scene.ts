@@ -94,6 +94,12 @@ export interface DragSession {
    */
   move(placement: PlacementInput): void;
   /**
+   * False once the drag is over: ended, cancelled, or ended or abandoned by
+   * the scene (`undo()`, `redo()`, `clearHistory()`, `endStep()`,
+   * `cancelStep()`).
+   */
+  readonly active: boolean;
+  /**
    * Finishes the drag, recording it as one undo step (closing any step levels
    * opened inside it too). A no-op once it is over.
    */
@@ -1414,6 +1420,9 @@ export class Scene {
     };
     const session: DragSession & ActiveDrag = {
       depth,
+      get active() {
+        return active;
+      },
       move: (placement) => {
         if (!active) {
           throw invalid("the drag is over");
@@ -1734,6 +1743,17 @@ export class Scene {
     const raw = this.#section(section);
     const p = this.#plane(plane);
     call(() => this.#scene().set_section_plane(raw, p));
+  }
+
+  /**
+   * A section's plane as last set by {@link Scene.addSection} or
+   * {@link Scene.setSectionPlane}, the normal normalised. Results not yet
+   * recomputed (`"stale"`) may still be cut with an earlier plane.
+   */
+  sectionPlane(section: SectionHandle): SectionPlane {
+    const raw = this.#section(section);
+    const p = call(() => this.#peek().section_desc_plane(raw));
+    return { origin: vec3At(p, 0), normal: vec3At(p, 3) };
   }
 
   /** Changes the meshes a section cuts. */

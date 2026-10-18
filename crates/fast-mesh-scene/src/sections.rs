@@ -581,6 +581,17 @@ impl Scene {
         Ok(&self.sections[i].entries[k].result)
     }
 
+    /// The section's description as last set: its plane (the one
+    /// [`Scene::set_section_plane`] gave, which results not yet recomputed
+    /// may lag behind; see [`Scene::section_plane`]), meshes and fill.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownSection`] for an unknown or removed section.
+    pub fn section_desc(&self, id: SectionId) -> Result<&SectionDesc> {
+        let i = self.section_index(id)?;
+        Ok(&self.sections[i].desc)
+    }
+
     /// Whether the section's result for `mesh` is current. Never updates.
     ///
     /// # Errors
@@ -1105,6 +1116,9 @@ mod tests {
         scene.set_section_plane(id, z_plane(-0.5)).unwrap();
         assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Stale));
         assert_eq!(scene.section(id, m), Ok(&old));
+        // The description has the new plane while the result lags.
+        assert_eq!(scene.section_desc(id).unwrap().plane, z_plane(-0.5));
+        assert_eq!(scene.section_plane(id, m), Ok(Some(z_plane(0.3))));
         scene.update_sections().unwrap();
         let r = scene.section(id, m).unwrap();
         assert!(close(r.length, circle(0.5), 1e-2));

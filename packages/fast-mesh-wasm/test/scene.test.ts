@@ -380,11 +380,13 @@ describe("Scene", () => {
     expect(s.canUndo()).toBe(false);
     const drag = s.drag(mesh);
     expect(codeOf(() => s.drag(mesh))).toBe("INVALID_ARGUMENT");
+    expect(drag.active).toBe(true);
     for (let k = 1; k <= 30; k++) {
       drag.move({ rotation: IDENTITY, translation: [k, 0, 0] });
     }
     drag.end();
     drag.end(); // no-op
+    expect(drag.active).toBe(false);
     expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [0, 0, 0] }))).toBe(
       "INVALID_ARGUMENT",
     );
@@ -399,6 +401,7 @@ describe("Scene", () => {
     const c = s.drag(mesh);
     c.move({ rotation: QUARTER_Z, translation: [5, 5, 5] });
     c.cancel();
+    expect(c.active).toBe(false);
     expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0] });
     expect(s.undo()).toBe(true);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
@@ -435,6 +438,7 @@ describe("Scene", () => {
     drag.move({ rotation: IDENTITY, translation: [3, 0, 0] });
     // Undo ends the drag first, then undoes it as a whole.
     expect(s.undo()).toBe(true);
+    expect(drag.active).toBe(false);
     expect(s.placement(mesh).translation).toEqual([1, 0, 0]);
     expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [9, 0, 0] }))).toBe(
       "INVALID_ARGUMENT",
@@ -460,6 +464,7 @@ describe("Scene", () => {
     const d = s.drag(mesh);
     d.move({ rotation: IDENTITY, translation: [1, 0, 0] });
     s.cancelStep();
+    expect(d.active).toBe(false);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
     expect(() => s.undo()).not.toThrow();
     expect(() => d.move({ rotation: IDENTITY, translation: [2, 0, 0] })).toThrow("the drag is over");

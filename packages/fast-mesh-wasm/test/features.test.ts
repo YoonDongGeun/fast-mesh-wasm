@@ -331,8 +331,11 @@ describe("sections", () => {
     expect(gap.a[0]).toBeCloseTo(1, 3);
     expect(gap.b[0]).toBeCloseTo(2, 3);
 
-    // Moving the plane above the spheres: no contours, no gap.
-    s.setSectionPlane(sec, { origin: [0, 0, 5], normal: [0, 0, 1] });
+    // Moving the plane above the spheres: no contours, no gap. The plane
+    // reads back as set, the normal normalised.
+    expect(s.sectionPlane(sec)).toEqual(plane);
+    s.setSectionPlane(sec, { origin: [0, 0, 5], normal: [0, 0, 2] });
+    expect(s.sectionPlane(sec)).toEqual({ origin: [0, 0, 5], normal: [0, 0, 1] });
     s.updateSections();
     expect(s.section(sec, a).contours).toEqual([]);
     expect(s.sectionGap(sec, a, b)).toBeNull();
@@ -388,6 +391,7 @@ describe("sections", () => {
     s.removeSection(sec);
     expect(codeOf(() => s.section(sec, a))).toBe("UNKNOWN_SECTION");
     expect(codeOf(() => s.setSectionFill(sec, true))).toBe("UNKNOWN_SECTION");
+    expect(codeOf(() => s.sectionPlane(sec))).toBe("UNKNOWN_SECTION");
     expect(codeOf(() => s.removeSection(sec))).toBe("UNKNOWN_SECTION");
     // The same handles come back in change records.
     const changes = s.takeChanges();

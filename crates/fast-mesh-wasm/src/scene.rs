@@ -888,6 +888,13 @@ impl WasmScene {
         Ok(self.scene.set_section_plane(id, parse_plane(plane)?)?)
     }
 
+    /// A section's plane as last set, `[origin xyz, normal xyz]`, the normal
+    /// normalised.
+    pub fn section_desc_plane(&self, section: u32) -> Result<Vec<f64>, Error> {
+        let plane = self.scene.section_desc(self.section_id(section)?)?.plane;
+        Ok(plane.origin().into_iter().chain(plane.normal()).collect())
+    }
+
     /// Changes the meshes a section cuts (flat pairs).
     pub fn set_section_meshes(&mut self, section: u32, meshes: &[u32]) -> Result<(), Error> {
         let id = self.section_id(section)?;
@@ -1678,7 +1685,11 @@ mod tests {
         let g = s.section_gap(sec, ai, ag, bi, bg).unwrap();
         assert!((g[0] - 1.).abs() < 1e-6 && (g[1] - 1.).abs() < 1e-6 && (g[4] - 2.).abs() < 1e-6);
 
-        s.set_section_plane(sec, &[0., 0., 5., 0., 0., 1.]).unwrap();
+        s.set_section_plane(sec, &[0., 0., 5., 0., 0., 2.]).unwrap();
+        assert_eq!(
+            s.section_desc_plane(sec).unwrap(),
+            vec![0., 0., 5., 0., 0., 1.]
+        );
         s.set_section_fill(sec, false).unwrap();
         s.update_sections().unwrap();
         assert_eq!(s.section(sec, ai, ag).unwrap(), vec![0., 0., 0., 0., 0.]);
@@ -1701,6 +1712,7 @@ mod tests {
         assert_eq!(code(s.section(sec, ai, ag)), codes::UNKNOWN_SECTION);
         assert_eq!(code(s.set_section_fill(sec, true)), codes::UNKNOWN_SECTION);
         assert_eq!(code(s.remove_section(sec)), codes::UNKNOWN_SECTION);
+        assert_eq!(code(s.section_desc_plane(sec)), codes::UNKNOWN_SECTION);
         assert_eq!(
             code(s.section_gap(sec, ai, ag, bi, bg)),
             codes::UNKNOWN_SECTION
