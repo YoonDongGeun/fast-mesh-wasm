@@ -74,7 +74,9 @@ RAYON_NUM_THREADS=1 cargo test --workspace --features fast-mesh-scene/parallel,f
 
 Also run clippy with the same `--features`. Benchmarks take it too, for example `cargo bench -p fast-mesh-bvh --features parallel`.
 
-Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread.
+Do not enable `parallel` for `wasm32-unknown-unknown`: that target has no threads, so `fast-mesh-wasm` and the npm package build without it (wasm threads are planned for a later stage). CI checks that rayon stays out of the default build for both targets.
+
+Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread. `par::set_force_sequential` is counted: pair every `true` with one `false`.
 
 ## Adding or changing an API
 
