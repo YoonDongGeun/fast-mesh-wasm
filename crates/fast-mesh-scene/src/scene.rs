@@ -348,14 +348,16 @@ impl Scene {
     ///
     /// `f` may fail with any error that converts into [`SceneError`]: a
     /// store error, or an [`OpsError`](fast_mesh_ops::OpsError) from a repair
-    /// operation, which becomes [`SceneError::Ops`].
+    /// operation, which becomes [`SceneError::Ops`]. A closure whose body
+    /// never fails cannot infer its error type (E0283) and must name it, for
+    /// example `scene.edit(id, |_| Ok::<(), StoreError>(()))`.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id; `f`'s error, converted
     /// (for example [`SceneError::Store`] or [`SceneError::Ops`]), when it
     /// fails; or [`SceneError::Store`] when the commit fails or there is no
-    /// memory to record the patch. The transaction is then rolled back and the scene (including
-    /// an open step) is unchanged.
+    /// memory to record the patch. The transaction is then rolled back and
+    /// the scene (including an open step) is unchanged.
     pub fn edit<R, E: Into<SceneError>>(
         &mut self,
         id: MeshId,

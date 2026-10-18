@@ -144,6 +144,10 @@ fn repair_via_edit_is_undoable() {
     let mut scene = Scene::new(SceneOptions::default());
     let id = scene.add_mesh(damaged(), eager()).unwrap();
     let before = alive(&scene, id);
+    let slots = {
+        let m = scene.mesh(id).unwrap();
+        (m.vertex_slots(), m.triangle_slots())
+    };
     let opts = fill_options();
 
     let report = scene
@@ -168,6 +172,10 @@ fn repair_via_edit_is_undoable() {
     // Undo leaves the slots the fill added dead; the alive content is exact.
     assert_eq!(scene.undo(), Ok(true));
     assert_eq!(alive(&scene, id), before);
+    let m = scene.mesh(id).unwrap();
+    assert!(m.vertex_slots() > slots.0 && m.triangle_slots() > slots.1);
+    assert!((slots.0..m.vertex_slots()).all(|v| !m.is_vertex_alive(v as VertexId)));
+    assert!((slots.1..m.triangle_slots()).all(|t| !m.is_triangle_alive(t as TriangleId)));
     assert_eq!(scene.is_current(id), Ok(true));
     assert_eq!(scene.redo(), Ok(true));
     assert_eq!(snapshot(&scene, id), repaired);
@@ -273,8 +281,9 @@ fn repair_updates_fields_and_sections() {
         );
         assert_eq!(got.len(), want.len());
         for (v, (a, b)) in got.iter().zip(want).enumerate() {
-            // Unused vertices hold NaN in both.
-            let same = a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-6;
+            // Bit-exact: the same positions and meshes give the same values
+            // (unused vertices hold NaN in both).
+            let same = a.to_bits() == b.to_bits();
             assert!(same, "vertex {v}: {a} vs {b}");
         }
     }
@@ -314,6 +323,10 @@ fn ops_error_maps_to_scene_error() {
         e.to_string(),
         "repair operation failed: a requested boundary loop no longer matches the mesh"
     );
-    assert!(std::error::Error::source(&e).is_some());
+    let source = std::error::Error::source(&e).unwrap();
+    assert_eq!(
+        source.downcast_ref::<OpsError>(),
+        Some(&OpsError::StaleLoops)
+    );
     assert_eq!(SceneError::from(OpsError::StaleLoops), e);
 }

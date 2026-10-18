@@ -205,13 +205,23 @@ fn largest(a: &Analysis) -> Option<usize> {
     })
 }
 
+/// What the pipeline did, step by step; all zero when it ran out of memory.
+#[derive(Debug, Default)]
+struct Work {
+    merged: usize,
+    degenerate: usize,
+    components: usize,
+    flipped: usize,
+    filled: usize,
+}
+
 /// The value of a repair step; returns from the test case on its error,
 /// passing on `OutOfMemory` (the one allowed failure) and failing otherwise.
 macro_rules! step {
     ($e:expr) => {
         match $e {
             Ok(v) => v,
-            Err(OpsError::Store(StoreError::OutOfMemory)) => return Ok(()),
+            Err(OpsError::Store(StoreError::OutOfMemory)) => return Ok(Work::default()),
             Err(e) => {
                 return Err(TestCaseError::fail(format!(
                     "{} failed: {e}",
@@ -223,11 +233,13 @@ macro_rules! step {
 }
 
 /// Runs the pipeline, checking each step's report against `analyze`.
-fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
+fn pipeline(tx: &mut Transaction) -> Result<Work, TestCaseError> {
+    let mut work = Work::default();
     // weld(0)
     let a = full(tx);
     let merged: usize = a.coincident.iter().map(|g| g.len() - 1).sum();
     let r = step!(weld(tx, 0.0));
+    work.merged = r.merged_vertices;
     prop_assert_eq!(r.merged_vertices, merged);
     let a = full(tx);
     prop_assert_eq!(a.coincident_groups, 0);
@@ -242,6 +254,7 @@ fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
     doomed.sort_unstable();
     doomed.dedup();
     let r = step!(remove_degenerate(tx, &DegenerateOptions::default()));
+    work.degenerate = r.removed_triangles;
     prop_assert_eq!(r.removed_triangles, doomed.len());
     let a = full(tx);
     prop_assert_eq!((a.degenerate, a.duplicate), (0, 0));
@@ -257,6 +270,7 @@ fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
         ..ComponentOptions::default()
     };
     let r = step!(remove_small_components(tx, &options));
+    work.components = r.removed_components;
     prop_assert_eq!(r.removed_components, small.len());
     let removed: usize = small.iter().map(|&i| a.components[i].triangles.len()).sum();
     prop_assert_eq!(r.removed_triangles, removed);
@@ -271,6 +285,7 @@ fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
 
     // orient
     let r = step!(orient(tx));
+    work.flipped = r.flipped_triangles;
     let a = full(tx);
     let orientable = r.non_orientable_patches == 0;
     if orientable {
@@ -283,6 +298,7 @@ fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
         ..FillOptions::default()
     };
     let r = step!(fill_holes(tx, &options));
+    work.filled = r.filled.len();
     let mut reported: Vec<LoopId> = r
         .filled
         .iter()
@@ -315,7 +331,7 @@ fn pipeline(tx: &mut Transaction) -> Result<(), TestCaseError> {
             prop_assert!(left, "loop {:?} was neither filled nor reported", l.id);
         }
     }
-    Ok(())
+    Ok(work)
 }
 
 fn base() -> impl Strategy<Value = Soup> {
@@ -323,6 +339,28 @@ fn base() -> impl Strategy<Value = Soup> {
         (3u32..8, 4u32..12).prop_map(|(st, sl)| sphere(st, sl)),
         (2u32..9).prop_map(grid),
     ]
+}
+
+/// Non-vacuity: a fixed damaged sphere makes every step do work, so the
+/// generators reach each operation's writing path.
+#[test]
+fn fixed_damage_exercises_every_step() {
+    let d = Damage {
+        holes: vec![5, 30],
+        flips: vec![12, 40],
+        splits: vec![(20, 1)],
+        pieces: vec![3],
+        degenerates: vec![(50, 0), (60, 1)],
+    };
+    let mut mesh = damaged(sphere(6, 8), &d);
+    let mut tx = mesh.begin_edit();
+    let work = pipeline(&mut tx).unwrap();
+    tx.commit().unwrap();
+    assert!(work.merged > 0, "{work:?}");
+    assert!(work.degenerate > 0, "{work:?}");
+    assert!(work.components > 0, "{work:?}");
+    assert!(work.flipped > 0, "{work:?}");
+    assert!(work.filled > 0, "{work:?}");
 }
 
 proptest! {
