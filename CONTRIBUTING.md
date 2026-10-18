@@ -12,6 +12,7 @@ crates/fast-mesh-store/  Editable mesh storage: slots, channels, transactions, u
 crates/fast-mesh-bvh/    BVH over a store mesh: build, incremental update, box query.
 crates/fast-mesh-query/  Raycast, closest-point, region and mesh-vs-mesh queries.
 crates/fast-mesh-scene/  Scene: meshes, placements, update modes, world queries, contacts, multi-mesh undo.
+crates/fast-mesh-fields/  Per-vertex fields: signed distance (pseudonormal, fast winding), colormaps.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.
 fixtures/smoke/          Script that CI runs after installing the package with npm, pnpm and bun.
@@ -53,6 +54,7 @@ pnpm test
 | `cargo bench -p fast-mesh-bvh` | BVH benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
 | `cargo bench -p fast-mesh-query` | Raycast, closest-point and region benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
 | `cargo bench -p fast-mesh-scene` | Scene overhead against direct queries on two 1M-triangle meshes, and `find_contacts` over 2, 8 and 32 small meshes; results go in `docs/benchmarks.md` |
+| `cargo bench -p fast-mesh-fields` | `SignData::build` (pseudonormal and winding) and `signed_distances` on 1M triangles; the scene benchmark adds the 64-pose field drag; results go in `docs/benchmarks.md` |
 | `pnpm --filter fast-mesh-wasm-example-vite dev` | Runs the browser example |
 
 Re-run `pnpm build` after changing Rust code; the JS tests import the built output.

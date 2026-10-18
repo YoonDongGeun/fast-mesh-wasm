@@ -1,6 +1,6 @@
 # fast-mesh fields and colors, part a (Phase 5a) design
 
-- **Status:** Approved for planning (decisions after the builder check in §11 override earlier sections)
+- **Status:** Implemented (Phase 5a). Decisions after the builder check in §11 override earlier sections, and §12 records what the implementation settled.
 - **Date:** 2026-10-19
 - **Parent specs:**
   - `2026-10-14-fast-mesh-engine-design.md` §5.4 and §8;
@@ -254,3 +254,18 @@ impl Scene {
 8. **BVH generation.** `fast-mesh-bvh` gains `Bvh::generation() -> u64`, incremented by every structural change: build, update, refit, `rebuild_region` and rebuild. It sits alongside `NodeId::index()` and `Bvh::node_slots()`. `SignData::is_current` checks the mesh uid, epoch and revision, plus the BVH generation.
 9. **Tests.** Surface tolerances are relative to the bounding-box diagonal (1e-5·diag), not absolute.
 10. **Compaction.** It reports `None`, so the field, the colours and the "finite before" set are recomputed in full. No remap is needed.
+
+## 12. Implementation notes
+
+What the implementation settled or found, none of which changes the contracts above.
+
+1. **Fast winding accuracy on flat terrain.**
+   - `beta = 8` (§4 proposed 2; §10 left the tuning to the builder) gives a worst error of 5.8e-4 on the closed test meshes, inside the 1e-3 target. On flat terrain it is about 1.19e-3, a little over the target, so the terrain test uses a bound of 2e-3.
+   - The reason is the order-1 expansion. The dipole term over-estimates a near-flat patch seen face-on by about ¾·(a/d)² relatively, and the order-2 term cannot correct this because it vanishes on a flat patch. Seen from above a sheet, every patch's error has the same sign, so the errors add up over the whole surface and the total falls only like 1/beta².
+   - Raising beta further would lower the error but sum more triangles exactly. Winding is therefore opt-in (`SignMode::Winding`) or the `Auto` fallback for closed meshes with inconsistent orientation, not the default.
+2. **Winding signs near mis-oriented faces.** Winding signs are unreliable within about one face of a mis-oriented face. A mesh with such faces should be checked through `SignData::status` (`consistent_orientation`) before its signs are trusted there.
+3. **Infinities in colours.** `+∞` ("far") follows `ColorRule::above` and `-∞` follows `below`. A distance kernel only produces `+∞`, so a rule with `above: Base` shows far vertices in the base colour.
+4. **`pad` margin.** `pad(x) = x·(1 + 1e-6) + 8·f32::EPSILON·M` (§11.6), with `M` the largest absolute coordinate of the pair, replacing the first absolute `1e-6`, which did not scale with coordinate magnitude.
+5. **Stale Manual target.** `Scene::add_distance_field` fails with `StaleBvh` when the `to` mesh is a Manual mesh with a stale BVH; the scene is unchanged. `Scene::flush` returns `StaleBvh` for such a field until that BVH is brought up to date with `Scene::update`.
+6. **Colour length.** `Scene::colors(mesh)` always has length `vertex_slots`, including for slots added by an edit that was undone before the field updated (they hold the `nan` colour).
+7. **Property test.** `fields_match_from_scratch` (`crates/fast-mesh-scene/tests/fields_properties.rs`) builds its reference from public API only: a shadow mesh of the alive triangles with a fresh BVH and fresh `SignData`. That cannot reuse the scene's own BVH, which the fast winding number depends on (the unit test `field_matches_from_scratch` in `fields.rs` does), so winding signs are accepted when they differ at points where the reference winding number is within 0.02 of 0.5. Pseudonormal and distance values are compared strictly.
