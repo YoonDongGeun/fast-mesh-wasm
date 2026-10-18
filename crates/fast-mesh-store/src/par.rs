@@ -14,8 +14,9 @@ use std::cell::Cell;
 use std::ops::Range;
 
 thread_local! {
-    /// Set while a test fault hook is armed on this thread.
-    static FORCE_SEQUENTIAL: Cell<bool> = const { Cell::new(false) };
+    /// How many [`set_force_sequential`]`(true)` calls on this thread are not
+    /// yet matched by a `false`: one per armed test fault hook.
+    static FORCE_SEQUENTIAL: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "test-counters"))]
@@ -29,18 +30,30 @@ pub fn enabled() -> bool {
     cfg!(feature = "parallel")
 }
 
-/// Makes every helper called from this thread run sequentially (`true`) or
-/// as usual (`false`). The engine crates' out-of-memory fault hooks are
-/// thread-local, so their test helpers set this while a hook is armed: work
-/// handed to other threads would not see the hook. Thread-local for the same
-/// reason, so tests running side by side cannot turn each other's off.
+/// Makes every helper called from this thread run sequentially (`true`), or
+/// undoes one earlier `true` (`false`). The engine crates' out-of-memory
+/// fault hooks are thread-local, so their test helpers set this while a hook
+/// is armed: work handed to other threads would not see the hook.
+///
+/// Counted, not a flag: helpers run sequentially until every `true` has been
+/// matched by a `false`, so one hook (or helper) turning itself off cannot
+/// turn off another that is still armed. A `false` with no `true` left does
+/// nothing. Thread-local for the same reason as the hooks, so tests running
+/// side by side cannot turn each other's off.
 pub fn set_force_sequential(on: bool) {
-    FORCE_SEQUENTIAL.with(|c| c.set(on));
+    FORCE_SEQUENTIAL.with(|c| {
+        c.set(if on {
+            c.get() + 1
+        } else {
+            c.get().saturating_sub(1)
+        })
+    });
 }
 
-/// Whether [`set_force_sequential`] is on for this thread.
+/// Whether some [`set_force_sequential`]`(true)` on this thread is not yet
+/// undone.
 pub fn force_sequential() -> bool {
-    FORCE_SEQUENTIAL.with(Cell::get)
+    FORCE_SEQUENTIAL.with(|c| c.get() > 0)
 }
 
 /// How many helper calls from this thread have taken the parallel path, for
@@ -312,6 +325,27 @@ mod tests {
         assert!(items.iter().all(|&x| x == 4));
         let entered = if enabled() { 1 } else { 0 };
         assert_eq!(parallel_entries(), before + entered);
+    }
+
+    #[test]
+    fn force_sequential_is_counted() {
+        assert!(!force_sequential());
+        // Two hooks armed; the first one turned off leaves the second on.
+        set_force_sequential(true);
+        set_force_sequential(true);
+        set_force_sequential(false);
+        assert!(force_sequential());
+        let before = parallel_entries();
+        assert_eq!(join(true, || 1, || 2), (1, 2));
+        assert_eq!(parallel_entries(), before);
+        set_force_sequential(false);
+        assert!(!force_sequential());
+        // An unmatched `false` does not go below zero.
+        set_force_sequential(false);
+        set_force_sequential(true);
+        assert!(force_sequential());
+        set_force_sequential(false);
+        assert!(!force_sequential());
     }
 
     #[test]
