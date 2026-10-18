@@ -46,9 +46,10 @@ pub(crate) fn narrow(p: [f64; 3]) -> [f32; 3] {
 
 /// The (unnormalized) normal of a triangle, `(b - a) × (c - a)` in `f64`.
 ///
-/// The coordinate differences of `f32` inputs are exact in `f64` and so are
-/// the products, so the result is exactly zero for exactly collinear or
-/// coincident corners: that is the definition of a zero-area triangle here.
+/// For coordinates of similar magnitude, the coordinate differences of `f32`
+/// inputs are exact in `f64` and so are the products, so the result is
+/// exactly zero for exactly collinear or coincident corners: that is the
+/// definition of a zero-area triangle here.
 pub(crate) fn triangle_normal(p: [[f32; 3]; 3]) -> [f64; 3] {
     let [a, b, c] = p.map(widen);
     cross(sub(b, a), sub(c, a))

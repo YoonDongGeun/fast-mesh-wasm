@@ -68,7 +68,7 @@ pub fn signed_distances(
         *value = match closest_point(mesh_b, bvh_b, p, &opts)? {
             None => f32::INFINITY,
             Some(hit) if hit.distance == 0.0 => 0.0,
-            Some(hit) if sign.side(mesh_b, p, &hit) < 0.0 => -hit.distance,
+            Some(hit) if sign.is_inside(mesh_b, bvh_b, p, &hit) => -hit.distance,
             Some(hit) => hit.distance,
         };
     }
@@ -77,78 +77,12 @@ pub fn signed_distances(
 
 #[cfg(test)]
 mod tests {
-    use fast_mesh_query::{ClosestOptions, QueryError, closest_point};
+    use fast_mesh_query::{ClosestOptions, Feature, QueryError, closest_point};
     use fast_mesh_store::Mesh;
 
     use super::*;
     use crate::test_util::*;
     use crate::{FieldsError, SignMode};
-
-    /// A point on a random alive triangle, at random barycentric coordinates.
-    fn surface_point(mesh: &Mesh, rng: &mut Lcg) -> [f32; 3] {
-        let t = loop {
-            let t = (rng.next() * mesh.triangle_slots() as f32) as u32;
-            if mesh.is_triangle_alive(t) {
-                break t;
-            }
-        };
-        let [a, b, c] = mesh
-            .triangle(t)
-            .unwrap()
-            .map(|v| mesh.positions()[v as usize]);
-        let (mut u, mut v) = (rng.next(), rng.next());
-        if u + v > 1.0 {
-            (u, v) = (1.0 - u, 1.0 - v);
-        }
-        std::array::from_fn(|k| a[k] + (b[k] - a[k]) * u + (c[k] - a[k]) * v)
-    }
-
-    /// Random points: half uniform in the mesh's box grown by a quarter of the
-    /// diagonal, half near the surface (offset by up to `near` in a random direction).
-    fn sample_points(mesh: &Mesh, rng: &mut Lcg, count: usize, near: f32) -> Vec<[f32; 3]> {
-        let mut lo = [f32::INFINITY; 3];
-        let mut hi = [f32::NEG_INFINITY; 3];
-        for p in mesh.positions() {
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
-        }
-        let grow = diagonal(mesh) as f32 / 4.0;
-        let (lo, hi) = (lo.map(|c| c - grow), hi.map(|c| c + grow));
-        (0..count)
-            .map(|i| {
-                if i % 2 == 0 {
-                    rng.point(lo, hi)
-                } else {
-                    let s = surface_point(mesh, rng);
-                    let d = rng.point([-near; 3], [near; 3]);
-                    std::array::from_fn(|k| s[k] + d[k])
-                }
-            })
-            .collect()
-    }
-
-    /// Checks magnitudes against brute force and signs against the exact
-    /// winding number, outside `1e-5 · diagonal` of the surface. Returns how
-    /// many signs were checked.
-    fn check_against_exact(mesh: &Mesh, points: &[[f32; 3]], values: &[f32]) -> usize {
-        let tol = 1e-5 * diagonal(mesh);
-        let mut checked = 0;
-        for (&p, &value) in points.iter().zip(values) {
-            let brute = brute_distance(mesh, p);
-            assert!(
-                (f64::from(value.abs()) - brute).abs() <= tol,
-                "magnitude at {p:?}: {value} vs brute force {brute}"
-            );
-            if brute > tol {
-                let inside = exact_winding(mesh, p) >= 0.5;
-                assert_eq!(value < 0.0, inside, "sign at {p:?}: value {value}");
-                checked += 1;
-            }
-        }
-        checked
-    }
 
     fn distances(mesh: &mut Mesh, points: &[[f32; 3]], max_distance: f32) -> (SignData, Vec<f32>) {
         let bvh = build_bvh(mesh);
@@ -186,7 +120,14 @@ mod tests {
         // Points pushed off vertices and edge midpoints, where the closest
         // feature is a vertex or an edge rather than a face.
         let mut rng = Lcg(11);
-        for mut mesh in [cube(), icosphere(), torus(), tetrahedron(), star_prism()] {
+        let meshes = [
+            ("cube", cube()),
+            ("icosphere", icosphere()),
+            ("torus", torus()),
+            ("tetrahedron", tetrahedron()),
+            ("star prism", star_prism()),
+        ];
+        for (name, mut mesh) in meshes {
             let d = diagonal(&mesh) as f32;
             let mut points = Vec::new();
             for t in 0..mesh.triangle_slots() as u32 {
@@ -204,8 +145,45 @@ mod tests {
                 }
             }
             let (_, out) = distances(&mut mesh, &points, f32::INFINITY);
-            check_against_exact(&mesh, &points, &out);
+            let checked = check_against_exact(&mesh, &points, &out);
+            assert!(
+                checked * 10 > points.len() * 9,
+                "{name}: only {checked} of {} signs checked",
+                points.len()
+            );
         }
+    }
+
+    #[test]
+    fn open_sheet_sign_past_the_rim_uses_boundary_edges() {
+        // Points just past the rim y = 0 of a terrain sheet, above and below
+        // it: the closest feature is a boundary edge, whose normal is that of
+        // its single face.
+        let n = 16;
+        let mut mesh = terrain(n);
+        let mut rng = Lcg(13);
+        let mut points = Vec::new();
+        let mut below = Vec::new();
+        for i in 0..1000 {
+            let x = 1.0 + (n - 2) as f32 * rng.next();
+            let y = -(0.02 + 0.3 * rng.next());
+            let h = 0.02 + 0.3 * rng.next();
+            let z = terrain_surface(&mesh, n, f64::from(x), 0.0) as f32;
+            let under = i % 2 == 0;
+            points.push([x, y, if under { z - h } else { z + h }]);
+            below.push(under);
+        }
+        let (_, out) = distances(&mut mesh, &points, f32::INFINITY);
+        let bvh = build_bvh(&mesh);
+        let mut on_edge = 0;
+        for ((&p, &value), &under) in points.iter().zip(&out).zip(&below) {
+            let hit = closest_point(&mesh, &bvh, p, &ClosestOptions::default());
+            if matches!(hit.unwrap().unwrap().feature, Feature::Edge(_)) {
+                on_edge += 1;
+            }
+            assert_eq!(value < 0.0, under, "sign at {p:?}: value {value}");
+        }
+        assert!(on_edge > 900, "only {on_edge} closest points on edges");
     }
 
     #[test]

@@ -33,6 +33,7 @@ use fast_mesh_store::{Adjacency, EdgeKind, Incidence, Mesh, TriangleId, VertexId
 use crate::geom::{
     add, closest_on_triangle, cross, dot, narrow, norm, scale, sub, triangle_normal, unit, widen,
 };
+use crate::winding::Moments;
 use crate::{FieldsError, Result};
 
 /// How many zero-area slivers an edge normal looks through to find the face
@@ -47,9 +48,10 @@ pub enum SignMode {
     /// oriented manifold meshes; on an open mesh "inside" means behind the
     /// surface.
     Pseudonormal,
-    /// The generalized winding number: inside where it is at least one half.
-    /// Robust to self-intersections, but it never reaches one half behind an
-    /// open sheet. Not supported yet: [`SignData::build`] rejects it.
+    /// The generalized winding number (see [`SignData::winding_number`]):
+    /// inside where it is at least one half. Robust to self-intersections and
+    /// inconsistent orientation, but it never reaches one half behind an open
+    /// sheet.
     Winding,
     /// [`SignMode::Pseudonormal`], except for a closed mesh whose orientation
     /// is inconsistent, which needs [`SignMode::Winding`].
@@ -80,10 +82,15 @@ pub struct SignStatus {
 /// Per-mesh data that decides the sign of a distance, built by
 /// [`SignData::build`] for one revision of a mesh and one state of its BVH.
 ///
-/// It holds a unit pseudonormal per vertex slot, an edge normal per triangle
-/// corner (for the edge opposite that corner) and, for every zero-area
-/// triangle, the non-degenerate triangles that share a vertex with it. Face
-/// normals are recomputed from the mesh when needed.
+/// In [`SignMode::Pseudonormal`] it holds a unit pseudonormal per vertex
+/// slot, an edge normal per triangle corner (for the edge opposite that
+/// corner) and, for every zero-area triangle, the non-degenerate triangles
+/// that share a vertex with it. Face normals are recomputed from the mesh when
+/// needed.
+///
+/// In [`SignMode::Winding`] it holds instead the order-1 dipole moments of
+/// every BVH node (area-weighted normal sum, area-weighted centroid and a
+/// bounding radius), for the fast winding number of Barill et al. 2018.
 #[derive(Debug, Clone)]
 pub struct SignData {
     mesh_uid: u64,
@@ -100,10 +107,12 @@ pub struct SignData {
     /// triangles sharing a vertex with `degenerate[i]`, in ascending id order.
     offsets: Vec<u32>,
     candidates: Vec<TriangleId>,
+    /// Winding moments per BVH node; empty unless the mode is `Winding`.
+    pub(crate) moments: Moments,
 }
 
 /// A vector of `len` copies of `value`, or `OutOfMemory`.
-fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
+pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
     let mut v = Vec::new();
     v.try_reserve_exact(len)
         .map_err(|_| FieldsError::OutOfMemory)?;
@@ -278,17 +287,15 @@ fn edge_normals(
 
 impl SignData {
     /// Builds the sign data of `mesh` in `mode`, building the mesh's adjacency
-    /// and incidence first if they are not cached. `Auto` is resolved here;
-    /// [`SignData::status`] reports the outcome.
+    /// and incidence first if they are not cached. `Auto` is resolved here
+    /// (to `Winding` for a closed mesh with inconsistent orientation, to
+    /// `Pseudonormal` otherwise); [`SignData::status`] reports the outcome.
     ///
     /// # Errors
     /// - [`FieldsError::Query`] with `MeshMismatch` or `StaleBvh` when `bvh`
     ///   does not match the current `mesh`.
-    /// - [`FieldsError::InvalidInput`] (`"winding not yet supported"`) for
-    ///   [`SignMode::Winding`], and for `Auto` on a closed mesh with
-    ///   inconsistent orientation.
     /// - [`FieldsError::OutOfMemory`] or [`FieldsError::Store`] when the
-    ///   adjacency, incidence or normals cannot be built.
+    ///   adjacency, incidence, normals or winding moments cannot be built.
     pub fn build(mesh: &mut Mesh, bvh: &Bvh, mode: SignMode) -> Result<SignData> {
         if bvh.mesh_uid() != mesh.uid() {
             return Err(QueryError::MeshMismatch.into());
@@ -309,18 +316,42 @@ impl SignData {
         let resolved = match mode {
             SignMode::Pseudonormal => SignMode::Pseudonormal,
             SignMode::Auto if !(closed && !consistent) => SignMode::Pseudonormal,
-            SignMode::Auto | SignMode::Winding => {
-                return Err(FieldsError::InvalidInput("winding not yet supported"));
-            }
+            SignMode::Auto | SignMode::Winding => SignMode::Winding,
         };
+        let mut data = SignData {
+            mesh_uid: mesh.uid(),
+            epoch: mesh.epoch(),
+            revision: mesh.revision(),
+            bvh_generation: bvh.generation(),
+            status: SignStatus {
+                mode: resolved,
+                closed,
+                consistent_orientation: consistent,
+                non_manifold_vertices,
+                degenerate_triangles,
+            },
+            vertex_normals: Vec::new(),
+            edge_normals: Vec::new(),
+            degenerate: Vec::new(),
+            offsets: Vec::new(),
+            candidates: Vec::new(),
+            moments: Moments::default(),
+        };
+        if resolved == SignMode::Winding {
+            data.moments = Moments::build(mesh, bvh)?;
+            return Ok(data);
+        }
 
-        let vertex_normals = vertex_normals(mesh, inc, &face)?;
-        let edge_normals = edge_normals(mesh, adj, inc, &face)?;
+        data.vertex_normals = vertex_normals(mesh, inc, &face)?;
+        data.edge_normals = edge_normals(mesh, adj, inc, &face)?;
 
-        let mut degenerate = Vec::new();
-        let mut offsets = Vec::new();
-        let mut candidates = Vec::new();
-        try_push(&mut offsets, 0)?;
+        let SignData {
+            degenerate,
+            offsets,
+            candidates,
+            ..
+        } = &mut data;
+        try_push(offsets, 0)?;
         for t in 0..mesh.triangle_slots() {
             let Some(tri) = mesh.triangle(t as TriangleId) else {
                 continue;
@@ -332,7 +363,7 @@ impl SignData {
             for v in tri {
                 for &s in inc.triangles(v) {
                     if face[s as usize] != [0.0; 3] {
-                        try_push(&mut candidates, s)?;
+                        try_push(candidates, s)?;
                     }
                 }
             }
@@ -345,28 +376,42 @@ impl SignData {
                 }
             }
             candidates.truncate(kept);
-            try_push(&mut degenerate, t as TriangleId)?;
-            try_push(&mut offsets, candidates.len() as u32)?;
+            try_push(degenerate, t as TriangleId)?;
+            try_push(offsets, candidates.len() as u32)?;
         }
+        Ok(data)
+    }
 
-        Ok(SignData {
-            mesh_uid: mesh.uid(),
-            epoch: mesh.epoch(),
-            revision: mesh.revision(),
-            bvh_generation: bvh.generation(),
-            status: SignStatus {
-                mode: resolved,
-                closed,
-                consistent_orientation: consistent,
-                non_manifold_vertices,
-                degenerate_triangles,
-            },
-            vertex_normals,
-            edge_normals,
-            degenerate,
-            offsets,
-            candidates,
-        })
+    /// The generalized winding number of `mesh` at `p`: the sum of the solid
+    /// angles of its triangles seen from `p`, over 4π. It is 1 inside a
+    /// closed, outward-facing mesh, 0 outside it, and in between near holes.
+    ///
+    /// In [`SignMode::Winding`] this is the fast approximation of Barill et
+    /// al. 2018, order 1: a BVH node whose centroid is more than `beta = 8`
+    /// times its radius away from `p` contributes its dipole term, and nearer
+    /// leaves sum their triangles' exact solid angles (Van Oosterom–Strackee).
+    /// It is within 1e-3 of the exact value on the test meshes at points
+    /// farther than 1% of the bounding-box diagonal from the surface. In
+    /// [`SignMode::Pseudonormal`] no moments are stored and every triangle is
+    /// summed exactly, which is slow on large meshes.
+    ///
+    /// Returns NaN when this data is not current for `mesh` and `bvh` (see
+    /// [`SignData::is_current`]). Nothing is allocated.
+    pub fn winding_number(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3]) -> f64 {
+        if !self.is_current(mesh, bvh) {
+            return f64::NAN;
+        }
+        self.moments.winding(mesh, bvh, p).0
+    }
+
+    /// Whether `p`, whose closest point on `mesh` is `hit`, counts as inside
+    /// (negative distance). `mesh` and `bvh` must be those this data is
+    /// current for.
+    pub(crate) fn is_inside(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3], hit: &ClosestHit) -> bool {
+        match self.status.mode {
+            SignMode::Winding => self.moments.winding(mesh, bvh, p).0 >= 0.5,
+            _ => self.side(mesh, p, hit) < 0.0,
+        }
     }
 
     /// What the build found out about the mesh, and the resolved mode.
@@ -448,15 +493,12 @@ impl SignData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FieldsError;
     use crate::test_util::*;
 
     fn status_of(mut mesh: Mesh, mode: SignMode) -> Result<SignStatus> {
         let bvh = build_bvh(&mesh);
         SignData::build(&mut mesh, &bvh, mode).map(|s| s.status())
     }
-
-    const NOT_YET: FieldsError = FieldsError::InvalidInput("winding not yet supported");
 
     #[test]
     fn status_reports_topology() {
@@ -512,7 +554,7 @@ mod tests {
         );
 
         // A cube with one triangle flipped: open meshes keep pseudonormals,
-        // closed ones would need winding numbers.
+        // closed ones fall back to winding numbers.
         let (p, mut t) = cube_buffers();
         t[0].swap(1, 2);
         let flipped = SignStatus {
@@ -520,7 +562,13 @@ mod tests {
             ..closed
         };
         assert_eq!(status_of(mesh(&p, &t), SignMode::Pseudonormal), Ok(flipped));
-        assert_eq!(status_of(mesh(&p, &t), SignMode::Auto), Err(NOT_YET));
+        assert_eq!(
+            status_of(mesh(&p, &t), SignMode::Auto),
+            Ok(SignStatus {
+                mode: SignMode::Winding,
+                ..flipped
+            })
+        );
         t.truncate(11);
         assert_eq!(
             status_of(mesh(&p, &t), SignMode::Auto),
@@ -529,7 +577,13 @@ mod tests {
                 ..flipped
             })
         );
-        assert_eq!(status_of(cube(), SignMode::Winding), Err(NOT_YET));
+        assert_eq!(
+            status_of(cube(), SignMode::Winding),
+            Ok(SignStatus {
+                mode: SignMode::Winding,
+                ..closed
+            })
+        );
     }
 
     #[test]

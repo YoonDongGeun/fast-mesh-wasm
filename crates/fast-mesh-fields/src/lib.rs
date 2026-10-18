@@ -7,6 +7,8 @@
 //!   [`SignData::status`] reports the mesh's topology (closed or open,
 //!   consistently oriented or not, non-manifold vertices, zero-area
 //!   triangles) so that an application can warn about doubtful signs.
+//!   [`SignData::winding_number`] gives the generalized winding number, fast
+//!   in [`SignMode::Winding`] (Barill et al. 2018).
 //! - [`signed_distances`] writes, for every point, its distance to the mesh:
 //!   positive outside (in front of the surface), negative inside (behind it),
 //!   zero on it, and `+∞` beyond `max_distance`.
@@ -20,6 +22,7 @@ mod geom;
 mod sign;
 #[cfg(test)]
 mod test_util;
+mod winding;
 
 pub use distance::signed_distances;
 pub use error::{FieldsError, Result};

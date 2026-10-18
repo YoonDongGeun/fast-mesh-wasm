@@ -239,6 +239,51 @@ impl Lcg {
     }
 }
 
+/// A point on a random alive triangle, at random barycentric coordinates.
+pub(crate) fn surface_point(mesh: &Mesh, rng: &mut Lcg) -> [f32; 3] {
+    let t = loop {
+        let t = (rng.next() * mesh.triangle_slots() as f32) as u32;
+        if mesh.is_triangle_alive(t) {
+            break t;
+        }
+    };
+    let [a, b, c] = mesh
+        .triangle(t)
+        .unwrap()
+        .map(|v| mesh.positions()[v as usize]);
+    let (mut u, mut v) = (rng.next(), rng.next());
+    if u + v > 1.0 {
+        (u, v) = (1.0 - u, 1.0 - v);
+    }
+    std::array::from_fn(|k| a[k] + (b[k] - a[k]) * u + (c[k] - a[k]) * v)
+}
+
+/// Random points: half uniform in the mesh's box grown by a quarter of the
+/// diagonal, half near the surface (offset by up to `near` in a random direction).
+pub(crate) fn sample_points(mesh: &Mesh, rng: &mut Lcg, count: usize, near: f32) -> Vec<[f32; 3]> {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for p in mesh.positions() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let grow = diagonal(mesh) as f32 / 4.0;
+    let (lo, hi) = (lo.map(|c| c - grow), hi.map(|c| c + grow));
+    (0..count)
+        .map(|i| {
+            if i % 2 == 0 {
+                rng.point(lo, hi)
+            } else {
+                let s = surface_point(mesh, rng);
+                let d = rng.point([-near; 3], [near; 3]);
+                std::array::from_fn(|k| s[k] + d[k])
+            }
+        })
+        .collect()
+}
+
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -321,6 +366,27 @@ pub(crate) fn brute_distance(mesh: &Mesh, p: [f32; 3]) -> f64 {
     alive_triangles(mesh)
         .map(|t| triangle_distance(p, corners(mesh, t)))
         .fold(f64::INFINITY, f64::min)
+}
+
+/// Checks signed distances: magnitudes against brute force and signs against
+/// the exact winding number, outside `1e-5 · diagonal` of the surface.
+/// Returns how many signs were checked.
+pub(crate) fn check_against_exact(mesh: &Mesh, points: &[[f32; 3]], values: &[f32]) -> usize {
+    let tol = 1e-5 * diagonal(mesh);
+    let mut checked = 0;
+    for (&p, &value) in points.iter().zip(values) {
+        let brute = brute_distance(mesh, p);
+        assert!(
+            (f64::from(value.abs()) - brute).abs() <= tol,
+            "magnitude at {p:?}: {value} vs brute force {brute}"
+        );
+        if brute > tol {
+            let inside = exact_winding(mesh, p) >= 0.5;
+            assert_eq!(value < 0.0, inside, "sign at {p:?}: value {value}");
+            checked += 1;
+        }
+    }
+    checked
 }
 
 /// The length of the bounding-box diagonal of the mesh's vertices.
