@@ -147,19 +147,10 @@ fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::Lcg;
+    use crate::test_util::{Lcg, random_normal};
 
     fn random_vec(rng: &mut Lcg, scale: f64) -> [f64; 3] {
         std::array::from_fn(|_| (f64::from(rng.next()) * 2.0 - 1.0) * scale)
-    }
-
-    fn random_normal(rng: &mut Lcg) -> [f64; 3] {
-        loop {
-            let n = random_vec(rng, 1.0);
-            if dot(n, n) > 0.01 {
-                return n;
-            }
-        }
     }
 
     fn norm(a: [f64; 3]) -> f64 {

@@ -45,6 +45,17 @@ impl Lcg {
     }
 }
 
+/// A random direction for a plane normal: uniform in the cube `[-1, 1)^3`,
+/// rejecting lengths up to 0.1.
+pub(crate) fn random_normal(rng: &mut Lcg) -> [f64; 3] {
+    loop {
+        let n: [f64; 3] = std::array::from_fn(|_| f64::from(rng.next()) * 2.0 - 1.0);
+        if n.iter().map(|c| c * c).sum::<f64>() > 0.01 {
+            return n;
+        }
+    }
+}
+
 /// A random rotation matrix (row-major) from a random unit quaternion.
 pub(crate) fn random_rotation(rng: &mut Lcg) -> [[f64; 3]; 3] {
     loop {

@@ -30,6 +30,9 @@
 //! - Cutting planes: a [`Plane`] (origin and unit normal, in `f64` mesh-local
 //!   coordinates) with an orthonormal 2D frame `(u, v)`. A point is on its
 //!   `+` side when its signed distance is zero or more.
+//! - Sections: [`slice()`] cuts a mesh with a [`Plane`] into a [`Slice`] of
+//!   [`Contour`]s, chained by crossed edge, with flags for open, unoriented
+//!   and non-manifold pieces.
 
 mod closest;
 mod error;
@@ -57,6 +60,7 @@ pub use plane::Plane;
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;
+pub use slice::{Contour, Slice, slice};
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.

@@ -5,16 +5,11 @@
 //! both sides gives exactly one segment, between crossings strictly inside two
 //! of its edges. Crossings are named by their edge key `(min id, max id)`.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the segments are chained by `slice`, added next")
-)]
-
 use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId, VertexId};
 
 use crate::plane::{Plane, dot};
-use crate::{Appender, Result, check};
+use crate::{Appender, QueryError, Result, allocation_allowed, check};
 
 /// The piece of the cut inside one triangle, from the crossing on edge `from`
 /// to the crossing on edge `to`.
@@ -40,14 +35,17 @@ fn position(mesh: &Mesh, v: VertexId) -> [f64; 3] {
 }
 
 /// The point where `plane` crosses the edge `key`, computed from the edge's
-/// endpoints in id order so that it is the same whichever triangle asks. The
-/// endpoints should be on opposite sides.
+/// endpoints in id order so that it is the same whichever triangle asks.
+///
+/// The endpoints must be on opposite sides. For an edge with both endpoints
+/// on the same side the result is meaningless, possibly NaN.
 pub(crate) fn crossing(mesh: &Mesh, plane: &Plane, key: (VertexId, VertexId)) -> [f64; 3] {
     let (a, b) = (
         position(mesh, key.0.min(key.1)),
         position(mesh, key.0.max(key.1)),
     );
     let (sa, sb) = (plane.signed_distance(a), plane.signed_distance(b));
+    debug_assert!((sa >= 0.0) != (sb >= 0.0), "edge {key:?} is not crossed");
     let t = sa / (sa - sb);
     std::array::from_fn(|k| a[k] + t * (b[k] - a[k]))
 }
@@ -132,6 +130,204 @@ pub(crate) fn segments(
     failed.map_or(Ok(()), Err)
 }
 
+/// The cut of a mesh by a plane, as contours.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Slice {
+    /// The contours, sorted by their first edge key.
+    pub contours: Vec<Contour>,
+}
+
+/// One chain of the cut: a closed loop or an open polyline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Contour {
+    /// The crossing point of each edge in `edges`, in the mesh's local
+    /// coordinates (the plane's frame).
+    pub points: Vec<[f64; 3]>,
+    /// The crossed edge `(min id, max id)` of each point.
+    pub edges: Vec<(VertexId, VertexId)>,
+    /// The triangle of each segment: `triangles[i]` joins point `i` to point
+    /// `i + 1`, and the last one of a closed contour joins the last point to
+    /// the first. One fewer than the points when open, as many when closed.
+    pub triangles: Vec<TriangleId>,
+    /// Whether the last point joins back to the first.
+    pub closed: bool,
+    /// Whether every segment runs the same way along the contour, so that
+    /// the triangles agree on their winding.
+    pub oriented: bool,
+    /// Whether no end of the contour is a split at a non-manifold edge.
+    pub manifold: bool,
+}
+
+/// An end of a segment that no other end joins: the edge is a boundary.
+const BOUNDARY: usize = usize::MAX;
+/// An end of a segment at an edge crossed by more than two triangles.
+const SPLIT: usize = usize::MAX - 1;
+
+/// Cuts `mesh` with `plane` and writes the contours to `out`, replacing what
+/// it held and reusing its allocations. The plane and the points are in the
+/// mesh's stored local coordinates (the `f32` positions widened to `f64`,
+/// without the mesh origin).
+///
+/// The triangles' segments are joined at shared crossed edges:
+/// - An edge crossed by one triangle ends an open contour.
+/// - An edge crossed by more than two triangles splits the cut: every piece
+///   ending there is open, with `manifold == false`.
+/// - Where two triangles disagree on their winding the pieces still join,
+///   and the contour has `oriented == false`.
+///
+/// On a closed, outward-wound mesh the contours are closed, oriented loops,
+/// with the solid's inside on their left seen from the plane normal: outer
+/// loops run counter-clockwise in `(u, v)` and holes clockwise. An oriented
+/// open contour runs the same way. A plane through vertices gives
+/// coincident points joined by zero-length segments; they are kept.
+///
+/// A zero-area triangle `[a, a, b]` crossed between `a` and `b` gives a
+/// segment from edge `(a, b)` back to itself. It has no length, so it is
+/// dropped rather than counted as a third triangle at that edge.
+///
+/// The order is deterministic: a closed contour starts at its smallest edge
+/// key, an open one at its first end (its `from` end when oriented), and
+/// the contours are sorted by their first edge key.
+///
+/// # Errors
+/// [`QueryError::MeshMismatch`](crate::QueryError::MeshMismatch) or
+/// [`QueryError::StaleBvh`](crate::QueryError::StaleBvh) when `bvh` does not
+/// match the current `mesh`, and
+/// [`QueryError::OutOfMemory`](crate::QueryError::OutOfMemory) when an
+/// allocation fails. On any error `out` is left empty.
+pub fn slice(mesh: &Mesh, bvh: &Bvh, plane: &Plane, out: &mut Slice) -> Result<()> {
+    let r = chain(mesh, bvh, plane, &mut out.contours);
+    if r.is_err() {
+        out.contours.clear();
+    }
+    r
+}
+
+fn chain(mesh: &Mesh, bvh: &Bvh, plane: &Plane, out: &mut Vec<Contour>) -> Result<()> {
+    let mut segs = Vec::new();
+    segments(mesh, bvh, plane, &mut segs)?;
+    segs.retain(|s| s.from != s.to);
+    // By triangle, so that the result does not depend on the BVH.
+    segs.sort_unstable();
+
+    // The segment ends (see `end_key`). Sorted by edge key, with `from`s
+    // first, the ends at each crossed edge are a run.
+    let ends_len = 2 * segs.len();
+    let key_of = |e| end_key(&segs, e);
+    let mut ends = Vec::new();
+    reserve(&mut ends, ends_len)?;
+    ends.extend(0..ends_len);
+    ends.sort_unstable_by_key(|&e| (key_of(e), e & 1, e));
+
+    // The end each end joins, or why it joins none.
+    let mut link = Vec::new();
+    reserve(&mut link, ends_len)?;
+    link.resize(ends_len, BOUNDARY);
+    for run in ends.chunk_by(|&a, &b| key_of(a) == key_of(b)) {
+        match *run {
+            [_] => {}
+            [a, b] => {
+                link[a] = b;
+                link[b] = a;
+            }
+            _ => run.iter().for_each(|&e| link[e] = SPLIT),
+        }
+    }
+
+    let mut used = Vec::new();
+    reserve(&mut used, segs.len())?;
+    used.resize(segs.len(), false);
+    let mut count = 0;
+    // Open contours first, from their ends in ascending key order, then the
+    // closed loops, each from its smallest key: a loop's segments are all
+    // unused when the scan reaches that key, and its `from` end comes first.
+    for open in [true, false] {
+        for &start in &ends {
+            if used[start / 2] || (open && link[start] < SPLIT) {
+                continue;
+            }
+            if count == out.len() {
+                push(out, Contour::default())?;
+            }
+            let c = &mut out[count];
+            count += 1;
+            c.points.clear();
+            c.edges.clear();
+            c.triangles.clear();
+            walk(&segs, &link, &mut used, start, c)?;
+            reserve(&mut c.points, c.edges.len())?;
+            c.points
+                .extend(c.edges.iter().map(|&e| crossing(mesh, plane, e)));
+        }
+    }
+    out.truncate(count);
+    // A triangle is in one contour only, so the order is total.
+    out.sort_unstable_by_key(|c| (c.edges[0], c.triangles[0]));
+    Ok(())
+}
+
+/// Walks the chain entered at end `start`, filling `c`'s edges, triangles
+/// and flags and marking its segments used.
+fn walk(
+    segs: &[Segment],
+    link: &[usize],
+    used: &mut [bool],
+    start: usize,
+    c: &mut Contour,
+) -> Result<()> {
+    let key_of = |e| end_key(segs, e);
+    c.oriented = true;
+    let mut entry = start;
+    loop {
+        let s = entry / 2;
+        used[s] = true;
+        push(&mut c.edges, key_of(entry))?;
+        push(&mut c.triangles, segs[s].tri)?;
+        // Oriented while every segment is entered by the same kind of end.
+        c.oriented &= entry & 1 == start & 1;
+        let exit = entry ^ 1;
+        match link[exit] {
+            next if next == start => {
+                c.closed = true;
+                c.manifold = true;
+                return Ok(());
+            }
+            next if next >= SPLIT => {
+                push(&mut c.edges, key_of(exit))?;
+                c.closed = false;
+                c.manifold = link[start] != SPLIT && next != SPLIT;
+                if c.oriented && start & 1 == 1 {
+                    // Walked against the segments: turn it to run along them.
+                    c.edges.reverse();
+                    c.triangles.reverse();
+                }
+                return Ok(());
+            }
+            next => entry = next,
+        }
+    }
+}
+
+/// The edge key at end `e`: end `2i` is the `from` of segment `i`, end
+/// `2i + 1` its `to`.
+fn end_key(segs: &[Segment], e: usize) -> (VertexId, VertexId) {
+    let s = &segs[e / 2];
+    if e & 1 == 0 { s.from } else { s.to }
+}
+
+/// Reserves room for `additional` more elements, failing with `OutOfMemory`.
+fn reserve<T>(v: &mut Vec<T>, additional: usize) -> Result<()> {
+    allocation_allowed()?;
+    v.try_reserve(additional)
+        .map_err(|_| QueryError::OutOfMemory)
+}
+
+fn push<T>(v: &mut Vec<T>, value: T) -> Result<()> {
+    reserve(v, 1)?;
+    v.push(value);
+    Ok(())
+}
+
 /// [`segments`] by testing every alive triangle, for the tests.
 #[cfg(test)]
 pub(crate) fn segments_brute(mesh: &Mesh, plane: &Plane, out: &mut Vec<Segment>) {
@@ -147,7 +343,8 @@ mod tests {
     use super::*;
     use crate::plane::{cross, dot};
     use crate::test_util::{
-        Lcg, box_mesh, build, fin, signed_volume6, torus, uv_sphere, wavy, with_degenerates,
+        Lcg, box_mesh, build, fin, random_normal, signed_volume6, torus, uv_sphere, wavy,
+        with_degenerates,
     };
     use crate::{QueryError, fail_allocations_after};
     use fast_mesh_bvh::Quality;
@@ -168,19 +365,6 @@ mod tests {
         let mut out = Vec::new();
         segments(mesh, bvh, plane, &mut out).unwrap();
         sorted(out)
-    }
-
-    fn position(mesh: &Mesh, v: VertexId) -> [f64; 3] {
-        mesh.positions()[v as usize].map(f64::from)
-    }
-
-    fn random_normal(rng: &mut Lcg) -> [f64; 3] {
-        loop {
-            let n: [f64; 3] = std::array::from_fn(|_| f64::from(rng.next()) * 2.0 - 1.0);
-            if dot(n, n) > 0.01 {
-                return n;
-            }
-        }
     }
 
     /// 200 random planes through the mesh's bounding box, 50 through a random
@@ -267,29 +451,38 @@ mod tests {
 
     #[test]
     fn segment_orientation_rule() {
+        // Each segment runs along `n × N` (N the triangle's winding normal),
+        // which puts the solid's inside on the left seen from `n`, whichever
+        // way the triangle faces.
         let mesh = uv_sphere(32, 64, 1.0);
         let bvh = build(&mesh, Quality::Sah);
-        let plane = Plane::new([0.0, 0.0, 0.3], [0.0, 0.0, 1.0]).unwrap();
-        let found = fast(&mesh, &bvh, &plane);
-        assert_eq!(found.len(), 2 * 64);
-        let mut checked = 0;
-        for s in &found {
-            let from = plane.to_uv(crossing(&mesh, &plane, s.from));
-            let to = plane.to_uv(crossing(&mesh, &plane, s.to));
-            let t = mesh.triangles()[s.tri as usize].map(|v| position(&mesh, v));
-            let centroid: [f64; 3] = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
-            let side = plane.signed_distance(centroid);
-            if side.abs() <= 1e-9 {
-                continue;
+        let cases = [
+            ([0.0, 0.0, 0.3], [0.0, 0.0, 1.0]),
+            ([0.0, 0.0, -0.3], [0.3, -0.2, 0.9]),
+            ([0.0, 0.0, -0.3], [-0.3, 0.2, -0.9]),
+        ];
+        let mut facing_away = 0;
+        for (origin, normal) in cases {
+            let plane = Plane::new(origin, normal).unwrap();
+            let found = fast(&mesh, &bvh, &plane);
+            assert!(found.len() > 100);
+            for s in &found {
+                let from = plane.to_uv(crossing(&mesh, &plane, s.from));
+                let to = plane.to_uv(crossing(&mesh, &plane, s.to));
+                let [a, b, c] = mesh.triangles()[s.tri as usize].map(|v| position(&mesh, v));
+                let tn = cross(
+                    std::array::from_fn(|k| b[k] - a[k]),
+                    std::array::from_fn(|k| c[k] - a[k]),
+                );
+                let n = plane.normal();
+                facing_away += usize::from(dot(n, tn) < 0.0);
+                let w = cross(n, tn);
+                let w = [dot(w, plane.u()), dot(w, plane.v())];
+                let d = [to[0] - from[0], to[1] - from[1]];
+                assert!(d[0] * w[0] + d[1] * w[1] > 0.0, "{plane:?} {s:?}");
             }
-            let c = plane.to_uv(centroid);
-            let d = [to[0] - from[0], to[1] - from[1]];
-            let w = [c[0] - from[0], c[1] - from[1]];
-            let turn = d[0] * w[1] - d[1] * w[0];
-            assert!(turn != 0.0 && (turn > 0.0) == (side > 0.0), "{s:?}");
-            checked += 1;
         }
-        assert!(checked > 100);
+        assert!(facing_away > 50, "{facing_away}");
     }
 
     #[test]
@@ -488,5 +681,266 @@ mod tests {
             segments(&mesh, &bvh, &plane, &mut out),
             Err(QueryError::StaleBvh)
         );
+    }
+
+    fn cut(mesh: &Mesh, plane: &Plane) -> Slice {
+        let bvh = build(mesh, Quality::Sah);
+        let mut out = Slice::default();
+        slice(mesh, &bvh, plane, &mut out).unwrap();
+        for c in &out.contours {
+            check_contour(mesh, plane, c);
+        }
+        out
+    }
+
+    /// The arrays are parallel and every point is its edge's crossing.
+    fn check_contour(mesh: &Mesh, plane: &Plane, c: &Contour) {
+        assert_eq!(c.points.len(), c.edges.len());
+        let segments = c.points.len() - usize::from(!c.closed);
+        assert_eq!(c.triangles.len(), segments);
+        assert!(!c.triangles.is_empty());
+        for (p, &e) in c.points.iter().zip(&c.edges) {
+            assert!(e.0 < e.1);
+            assert_eq!(
+                p.map(f64::to_bits),
+                crossing(mesh, plane, e).map(f64::to_bits)
+            );
+        }
+        // Each triangle's segment joins its two points; when oriented, it
+        // runs from the first to the second.
+        let n = c.edges.len();
+        for (i, &t) in c.triangles.iter().enumerate() {
+            let s = segment(mesh, plane, t).unwrap();
+            let (a, b) = (c.edges[i], c.edges[(i + 1) % n]);
+            if c.oriented {
+                assert_eq!((s.from, s.to), (a, b), "{c:?}");
+            } else {
+                assert!((s.from, s.to) == (a, b) || (s.from, s.to) == (b, a));
+            }
+        }
+    }
+
+    /// The signed area of a closed contour in the plane's `(u, v)` frame.
+    fn area(plane: &Plane, c: &Contour) -> f64 {
+        let q: Vec<[f64; 2]> = c.points.iter().map(|&p| plane.to_uv(p)).collect();
+        (0..q.len())
+            .map(|i| {
+                let (a, b) = (q[i], q[(i + 1) % q.len()]);
+                a[0] * b[1] - a[1] * b[0]
+            })
+            .sum::<f64>()
+            / 2.0
+    }
+
+    fn close(value: f64, expected: f64, rel: f64) -> bool {
+        (value - expected).abs() <= rel * expected.abs()
+    }
+
+    #[test]
+    fn sphere_cut_is_one_closed_ccw_loop() {
+        use std::f64::consts::PI;
+        let mesh = uv_sphere(64, 128, 1.0);
+        let plane = Plane::new([0.0, 0.0, 0.3], [0.0, 0.0, 1.0]).unwrap();
+        let out = cut(&mesh, &plane);
+        assert_eq!(out.contours.len(), 1);
+        let c = &out.contours[0];
+        assert!(c.closed && c.oriented && c.manifold);
+        let a = area(&plane, c);
+        assert!(a > 0.0 && close(a, PI * (1.0 - 0.09), 0.01), "{a}");
+    }
+
+    #[test]
+    fn torus_horizontal_cut_is_outer_and_hole() {
+        use std::f64::consts::PI;
+        let mesh = torus(2.0, 0.5, 96, 48);
+        let plane = Plane::new([0.0; 3], [0.0, 0.0, 1.0]).unwrap();
+        let out = cut(&mesh, &plane);
+        assert_eq!(out.contours.len(), 2);
+        let mut areas: Vec<f64> = out
+            .contours
+            .iter()
+            .map(|c| {
+                assert!(c.closed && c.oriented && c.manifold);
+                area(&plane, c)
+            })
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        assert!(close(areas[0], -PI * 1.5 * 1.5, 0.01), "{areas:?}");
+        assert!(close(areas[1], PI * 2.5 * 2.5, 0.01), "{areas:?}");
+    }
+
+    #[test]
+    fn cube_face_flush_plane_is_one_closed_loop() {
+        let mesh = box_mesh([-1.0; 3], [1.0; 3]);
+        for z in [1.0, -1.0] {
+            for n in [1.0, -1.0] {
+                let out = cut(&mesh, &Plane::new([0.0, 0.0, z], [0.0, 0.0, n]).unwrap());
+                assert!(out.contours.len() <= 1, "z = {z}, n = {n}");
+                assert!(out.contours.iter().all(|c| c.closed && c.manifold));
+            }
+        }
+        let out = cut(&mesh, &Plane::new([0.0; 3], [1.0, 0.0, 0.0]).unwrap());
+        assert_eq!(out.contours.len(), 1);
+        let c = &out.contours[0];
+        assert!(c.closed && c.oriented && c.manifold);
+        assert_eq!(c.points.len(), 8);
+    }
+
+    #[test]
+    fn terrain_grid_row_plane_is_open_chains() {
+        let mesh = wavy(20);
+        let mut incident: HashMap<(VertexId, VertexId), usize> = HashMap::new();
+        for t in mesh.triangles() {
+            for i in 0..3 {
+                *incident.entry(key(t[i], t[(i + 1) % 3])).or_default() += 1;
+            }
+        }
+        // Both normals, so that some chain is walked from its `to` end and
+        // turned around.
+        for normal in [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]] {
+            let plane = Plane::new([0.0, 7.0, 0.0], normal).unwrap();
+            let out = cut(&mesh, &plane);
+            assert!(!out.contours.is_empty());
+            for c in &out.contours {
+                assert!(!c.closed && c.oriented && c.manifold);
+                assert_eq!(incident[&c.edges[0]], 1);
+                assert_eq!(incident[c.edges.last().unwrap()], 1);
+            }
+            // Every segment is used exactly once.
+            let mut used: Vec<TriangleId> = out
+                .contours
+                .iter()
+                .flat_map(|c| c.triangles.iter().copied())
+                .collect();
+            used.sort_unstable();
+            let expected: Vec<TriangleId> = brute(&mesh, &plane).iter().map(|s| s.tri).collect();
+            assert_eq!(used, expected);
+        }
+    }
+
+    #[test]
+    fn nonmanifold_fin_splits_chains() {
+        let out = cut(
+            &fin(),
+            &Plane::new([0.0, 0.0, 0.5], [0.0, 0.0, 1.0]).unwrap(),
+        );
+        assert!(out.contours.len() >= 3);
+        for c in &out.contours {
+            assert!(!c.closed && !c.manifold);
+            // Each piece ends at the shared edge.
+            assert!(c.edges[0] == (0, 1) || *c.edges.last().unwrap() == (0, 1));
+        }
+    }
+
+    #[test]
+    fn degenerate_triangles_do_not_break_chains() {
+        let mesh = with_degenerates(uv_sphere(16, 32, 1.0));
+        let mut rng = Lcg(0xde9e);
+        for _ in 0..50 {
+            let plane = Plane::new([0.0; 3], random_normal(&mut rng)).unwrap();
+            let out = cut(&mesh, &plane);
+            assert_eq!(out.contours.len(), 1, "{plane:?}");
+            let c = &out.contours[0];
+            assert!(c.closed && c.oriented && c.manifold, "{plane:?}");
+        }
+    }
+
+    #[test]
+    fn flipped_patch_reports_unoriented() {
+        let sphere = uv_sphere(16, 32, 1.0);
+        let plane = Plane::new([0.0, 0.0, 0.3], [0.0, 0.0, 1.0]).unwrap();
+        let flipped = brute(&sphere, &plane)[3].tri;
+        let positions: Vec<f32> = sphere.positions().iter().flatten().copied().collect();
+        let mut tris = sphere.triangles().to_vec();
+        tris[flipped as usize].swap(1, 2);
+        let indices: Vec<u32> = tris.iter().flatten().copied().collect();
+        let mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+        let out = cut(&mesh, &plane);
+        assert_eq!(out.contours.len(), 1);
+        let c = &out.contours[0];
+        assert!(c.triangles.contains(&flipped));
+        assert!(c.closed && !c.oriented && c.manifold);
+        // Unflipped, the same cut is oriented.
+        assert!(cut(&sphere, &plane).contours[0].oriented);
+    }
+
+    #[test]
+    fn deterministic_order() {
+        let meshes = [torus(2.0, 0.5, 48, 24), wavy(20), fin()];
+        let mut checked = 0;
+        for (i, mesh) in meshes.iter().enumerate() {
+            let sah = build(mesh, Quality::Sah);
+            let quick = build(mesh, Quality::Fast);
+            for plane in planes(mesh, 0x0bde + i as u64).into_iter().step_by(5) {
+                let mut a = Slice::default();
+                let mut b = Slice::default();
+                slice(mesh, &sah, &plane, &mut a).unwrap();
+                slice(mesh, &sah, &plane, &mut b).unwrap();
+                assert_eq!(a, b, "{plane:?}");
+                // Another BVH, and reusing a filled output, give the same value.
+                slice(mesh, &quick, &plane, &mut b).unwrap();
+                assert_eq!(a, b, "{plane:?}");
+                for c in &a.contours {
+                    check_contour(mesh, &plane, c);
+                    if c.closed {
+                        assert_eq!(c.edges[0], *c.edges.iter().min().unwrap());
+                    }
+                }
+                assert!(
+                    a.contours
+                        .windows(2)
+                        .all(|w| w[0].edges[0] <= w[1].edges[0])
+                );
+                checked += usize::from(a.contours.len() > 1);
+            }
+        }
+        assert!(checked > 5, "{checked}");
+    }
+
+    #[test]
+    fn slice_rejects_stale_bvh() {
+        let mut mesh = uv_sphere(8, 16, 1.0);
+        let bvh = build(&mesh, Quality::Sah);
+        let plane = Plane::new([0.0; 3], [0.0, 0.0, 1.0]).unwrap();
+        let mut out = Slice::default();
+        slice(&mesh, &bvh, &plane, &mut out).unwrap();
+        assert!(!out.contours.is_empty());
+        assert_eq!(
+            slice(&uv_sphere(8, 16, 1.0), &bvh, &plane, &mut out),
+            Err(QueryError::MeshMismatch)
+        );
+        let mut tx = mesh.begin_edit();
+        tx.set_positions(&[0], &[[0.0, 0.0, 2.0]]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            slice(&mesh, &bvh, &plane, &mut out),
+            Err(QueryError::StaleBvh)
+        );
+    }
+
+    #[test]
+    fn slice_out_of_memory_clears_output() {
+        let mesh = torus(2.0, 0.5, 24, 12);
+        let bvh = build(&mesh, Quality::Sah);
+        let plane = Plane::new([0.0; 3], [0.0, 0.0, 1.0]).unwrap();
+        let mut expected = Slice::default();
+        slice(&mesh, &bvh, &plane, &mut expected).unwrap();
+        assert_eq!(expected.contours.len(), 2);
+        let mut failures = 0;
+        for n in 0..400 {
+            let mut out = expected.clone();
+            fail_allocations_after(Some(n));
+            let r = slice(&mesh, &bvh, &plane, &mut out);
+            fail_allocations_after(None);
+            match r {
+                Ok(()) => assert_eq!(out, expected),
+                Err(e) => {
+                    assert_eq!(e, QueryError::OutOfMemory);
+                    assert!(out.contours.is_empty());
+                    failures += 1;
+                }
+            }
+        }
+        assert!(failures > 10, "{failures}");
     }
 }
