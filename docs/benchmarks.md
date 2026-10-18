@@ -417,7 +417,6 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 - **Fill without fairing** (1.0×): nothing in it is parallel. With fairing on, the three coordinate solves run side by side, with parallel matrix products from 1,024 rows.
 - **The sphere fill and the gap alone** (1.0×): single small computations under every threshold.
 
-**Not measured: a barely-touching owner-scale scene.** The 30k check covers meshes that cross and meshes far apart. Meshes that only just touch, where the pair queries split their traversal for little work, were not measured on their own. That is follow-up work.
 
 **BVH memory.** With the feature, the BVH bench prints a smaller `byte_size` for the same nodes and depth: 20.2 MB against 21.6 MB at 1M, and 193.5 MB against 215.3 MB at 10M. The difference is reserved capacity, because `byte_size` sums the arrays' `capacity()`. The build without the feature reserves the expected node count up front, while the parallel build reserves the exact count.
 
