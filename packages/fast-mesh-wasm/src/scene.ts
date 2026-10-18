@@ -591,11 +591,15 @@ function encodeRule(rule: ColorRule): { map: number; values: Float32Array } {
     map = codeIn(MAPS, rule.map, "map");
   } else if (typeof rule.map === "object" && rule.map !== null && Array.isArray(rule.map.stops)) {
     map = 4;
-    for (const [t, color] of rule.map.stops) {
-      if (color.length !== 4) {
+    for (const stop of rule.map.stops as unknown[]) {
+      if (!Array.isArray(stop) || stop.length !== 2) {
+        throw invalid("each stop must be [t, rgba]");
+      }
+      const [t, color] = stop as [number, ArrayLike<number> | null];
+      if (typeof color !== "object" || color === null || color.length !== 4) {
         throw invalid("stop colours must have 4 channels");
       }
-      values.push(t, ...color);
+      values.push(t, ...Array.from(color));
     }
   } else {
     throw invalid('map must be "turbo", "viridis", "coolwarm", "grayscale" or { stops }');

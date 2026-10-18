@@ -240,6 +240,11 @@ describe("fields and colouring", () => {
       { base: [1, 2, 3, 4, 5] as unknown as [number, number, number, number], nan: [1, 2, 3] as unknown as [number, number, number, number] },
       { nan: [0, 0, 0, 256] as const },
       { map: { stops: [[0, [0, 0, 0, 255]]] as const } },
+      // Malformed stops: not TypeErrors.
+      { map: { stops: [0, 1] as unknown as [] } },
+      { map: { stops: [[0, [0, 0, 0, 255]], null] as unknown as [] } },
+      { map: { stops: [[0, [0, 0, 0, 255]], [1]] as unknown as [] } },
+      { map: { stops: [[0, [0, 0, 0, 255]], [1, 7]] as unknown as [] } },
     ]) {
       expect(codeOf(() => s.setColoring(a, { field, map: "turbo", range: [0, 2], ...bad }))).toBe(
         "INVALID_ARGUMENT",
