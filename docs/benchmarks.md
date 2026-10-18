@@ -285,6 +285,66 @@ No target was set for these (the plan asks only that they be recorded), and noth
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 - **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
 
+## JavaScript core (fast-mesh-wasm)
+
+Results for `pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m`, a plain Node script (`packages/fast-mesh-wasm/bench/scene.bench.mjs`, `performance.now()`, medians over the iterations shown). It drives the `Scene` class of the built package, so everything crosses the wasm boundary as a user's code would.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, Node 24.13.0, release wasm build (`wasm-opt -O3`), single thread
+- **Date:** 2026-10-18. Two full runs; the tables show run 1, and run 2's numbers are given where they differ. Another branch's parallel-processing work shared the machine and may have been using the CPU in either run, so treat the numbers as upper bounds.
+- **Meshes:** height fields like the Rust benches' (`terrain(n)`, here with a different height function): 1,002,528 triangles (`n = 708`) and 9,999,392 (`n = 2236`), given as `Float64Array` world positions and `Uint32Array` indices.
+- **A frame** is what an adapter does on the JS side without a GPU: `drag.move(placement)`, `scene.commitFrame()`, and copying every dirty range of every changed buffer from fresh views into a JS mirror (the three.js adapter's job, spec section 11 item 2). The mirror is allocated once, from the first frame.
+
+### Adding a mesh
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| `addMesh`, eager (BVH, normals, incidence index, render buffers) | 1.09 s median of 7 runs, p95 1.9 s (run 2: 1.18 s) | 12.7 s median of 3 runs (run 2: 13.1 s) |
+| Two meshes added to a scene | 2.2 s (run 2: 2.4 s) | 26.8 s (run 2: 24.7 s) |
+
+`addMesh` includes the BVH build, which takes 0.44 s at 1M and 5.2 s at 10M on its own (BVH table above); the rest is the store, normals, incidence index and render buffers, and the copy of the input into wasm memory. This was not broken down further.
+
+### The 64-pose drag of two touching 1M and 10M meshes, colouring on
+
+B is flipped over A, lifted until the surfaces touch at pose 0 (measured with `meshDistance`), and turned by 0.1° more at each of 64 poses, as in the Rust drag benchmark above. A distance field on A to B colours A (`range = [-0.08, 0]`, `below = "clamp"`, `above = "base"`). Meshes are in the default eager mode. "Contact" has `maxDistance` 0.08, as the Rust benchmark does. "Wide" has `maxDistance` 8, which puts nearly every vertex of the pair in range and is a stress case, not an expected one. The 64 poses are repeated 3 times after a warm-up cycle (once at 10M).
+
+| Per frame | 1M, contact | 1M, wide | 10M, contact |
+| --- | --- | --- | --- |
+| Total, median (p95) | 1.76 ms (4.0 ms) | 448 ms (753 ms) | 38.6 ms (72.5 ms) |
+| `drag.move` (the engine's eager work happens here) | 1.75 ms | 448 ms | 38.4 ms |
+| `commitFrame()` | 0.01 ms | 0.06 ms | 0.07 ms |
+| Copy of the dirty ranges into the mirror | 0.01 ms | 0.02 ms | 0.05 ms |
+| Colour slots dirty, median | 151 | 6,933 | 3,525 |
+| Setup: `addDistanceField` + `setColoring` | 0.32 s | 0.21 s | 2.3 s |
+| First `commitFrame()` plus full mirror copy | 4.4 ms | 3.7 ms | 44.9 ms |
+
+Run 2 measured the contact frame at 1.95 ms (1M) and 30.5 ms (10M) and the wide frame at 425 ms. The 10M frame time spreads widely because the contact varies a lot over the 64 poses (minimum 1.2 ms, maximum 108 ms in run 1).
+
+- **The binding is not the cost.** `commitFrame()` plus the range copies take 0.02 to 0.12 ms per frame, because only the recoloured vertices are dirty (under 1 KB of colours per frame at contact, about 30 KB wide). The time is the engine's own, in `drag.move`, and the 1M contact frame (1.76 ms) is close to the Rust benchmark's 1.79 ms per pose for a one-sided field, though the terrains are not the same.
+- **The wide case is the field recompute.** With nearly every vertex in range, each pose recomputes distances for much of A; this was not profiled further. An app that wants a whole-surface colour map should expect this cost, and one that wants contact colouring should keep `maxDistance` small.
+
+### The owner's scene: 6 meshes of 30,258 triangles, 30 distance fields
+
+Six `terrain(123)` tiles in a 3 by 2 grid, a distance field from every mesh to every other (30 fields, all kept up to date), each mesh coloured by the field to its next neighbour. One mesh is dragged along a small circle with a slight turn, 400 frames after 20 warm-up frames. Adding the 30 fields and colouring takes 0.13 s.
+
+| Per frame | Contact (tile gap 0.5, `maxDistance` 1) | Wide (tile gap 2, `maxDistance` 10) |
+| --- | --- | --- |
+| Total, median (p95) | 1.02 ms (2.2 ms) | 105 ms (134 ms) |
+| `drag.move` | 1.00 ms | 105 ms |
+| `commitFrame()` + copy | 0.02 ms | 0.07 ms |
+
+Run 2: 1.01 ms (2.18 ms) and 112 ms (181 ms). In the contact case the whole frame uses about 6% of a 60 fps frame's 16.7 ms at the median. The wide case recomputes nearly every vertex of the moved tile and its neighbours on each move, and is not a frame-rate workload.
+
+### Size of the wasm binary
+
+`dist/wasm/fast_mesh_wasm_bg.wasm` after `wasm-opt -O3`, gzip measured with `gzip -9`:
+
+| | Raw | gzip |
+| --- | --- | --- |
+| Before this phase (commit `eff7e80`: `computeVertexNormals` and `computeBounds` only) | 19,561 B (19.1 KiB) | 9,003 B |
+| After this phase (the whole engine behind `WasmScene`) | 733,183 B (716 KiB) | 292,300 B (285 KiB) |
+
+The binary grew 37 times because it now carries the BVH, queries, fields, sections and repair, which were not in the package before. The spec's size rule (section 8: call out a release that grows by more than 20%) applies from the next release on. The test build (`pnpm --filter fast-mesh-wasm test`) adds the `__test_panic` export and is not what is published.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -320,5 +380,6 @@ cargo bench -p fast-mesh-scene                        # scene overhead and find_
 cargo bench -p fast-mesh-fields                       # SignData::build and signed_distances on 1M triangles
 cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_BENCH_LARGE=1 for the 10M terrain
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
+pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
 ```

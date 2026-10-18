@@ -345,3 +345,27 @@ Each part gets its own plan.
    - `views().positions()` therefore holds local coordinates, and `matrix4 = placement · translate(origin)` puts them back in the world.
    - The store gains a constructor that takes an explicit origin (with f64 input), next to the existing auto-centring `from_buffers_f64`.
 4. **`DragSession.cancel()`** restores the start placement. It does not cancel the user's outer step. `undo()` during a drag ends the drag first *(my call)*.
+
+## 12. Implementation notes
+
+What the implementation of 8a settled or found. The spec's contracts stand except where an item says it refines one.
+
+1. **No `unsafe`, no `js-sys`.** `fast-mesh-wasm` depends only on the workspace crates and `wasm-bindgen`. Views are built in TypeScript from `(pointer, length)` pairs over the module's memory, and errors cross as a `JsError` whose message is `"<CODE>: text"`, parsed back into `FastMeshError`. This is stricter than §4.3 requires and behaves the same.
+2. **Manual normals follow the same rule as BVHs and fields.** `flush()` skips a `"manual"` mesh; `update(mesh)` brings its normals up to date.
+3. **Render indices are read straight from the store.** The `indices()` view is the mesh's own triangle array, and the store already writes `0, 0, 0` into removed slots. There is no second index buffer, which saves 12 bytes per triangle slot and a copy per edit.
+4. **The package `test` script builds a test wasm.** It adds the `__test_panic` export that the poisoning test needs, so after `pnpm --filter fast-mesh-wasm test` the `dist/` folder holds a test build. `pnpm build` and `pnpm release` always rebuild a release build, `prepublishOnly` refuses a build that exports `__test_panic`, and CI packs the tarball before it runs the tests. The cost is a slower local test run.
+5. **`DragSession.cancel()` depends on who opened the step.** When the drag opened the outermost step, `cancel()` cancels that step, so edits made during the drag (also in steps opened inside it) are reverted as well. Inside a caller's step it restores the start placement and closes the drag's levels, leaving the caller's step open. A drag whose step is closed or cancelled by the caller (`endStep`, `cancelStep`) is abandoned, and `undo()`, `redo()` and `clearHistory()` end it first.
+6. **The query and colouring API mirrors the Rust options.** The TypeScript shapes follow the engine's options exactly rather than the first sketch in §5.6 and §5.7: for example `raycast` has `minDistance` and `cull` and no mesh filter, `closestPoint` can name a single mesh, and `meshDistance` returns `null` beyond `maxDistance`. `ColorRule` defaults to `above: "base"` and `below: "clamp"`. Picking among all meshes still works with `raycast`.
+7. **`Scene::section_plane` was added to the scene crate.** The binding needs the plane to map a section's fill to world coordinates after the plane moved but the section was not recomputed.
+8. **Repair tolerances are `f32`.** `weldTolerance`, the `weld` tolerance and the area parameters are converted to `f32` at the boundary, so a value below the `f32` range rounds to 0 (an exact-duplicate weld).
+9. **Id lists are checked per element.** A sparse array in an `edit` id list (a hole) is rejected as `INVALID_ARGUMENT`, not read as id 0.
+10. **Handles live as long as the scene** for fields and sections, so that a removal in a change record names the object the app holds. Mesh handles are dropped when the mesh is removed.
+
+### Measured
+
+Full tables, machine and method are in `docs/benchmarks.md` ("JavaScript core"). Node 24 on the i5-13600K, release wasm, another branch's work possibly sharing the CPU:
+
+- **`addMesh`** of 1,002,528 triangles from `Float64Array`: 1.09 s median (second run 1.18 s); 9,999,392 triangles: 12.7 s (13.1 s).
+- **64-pose drag of two touching 1M meshes, colouring on** (`setPlacement` + `commitFrame()` + copying every dirty range into a JS mirror): 1.76 ms per frame at median with a contact-sized `maxDistance` (0.08), of which `commitFrame()` and the copy are 0.02 ms; 448 ms when every vertex is in range. At 10M with the contact `maxDistance`: 38.6 ms (second run 30.5 ms).
+- **The owner's scene** (6 meshes of 30,258 triangles, 30 fields, one dragged): 1.02 ms per frame with a contact-sized `maxDistance`, 105 ms when nearly every vertex is in range.
+- **Wasm size:** 19,561 B raw / 9,003 B gzip before 8a, 733,183 B / 292,300 B gzip after.
