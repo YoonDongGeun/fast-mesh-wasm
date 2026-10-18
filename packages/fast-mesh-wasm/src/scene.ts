@@ -413,7 +413,10 @@ export interface Analysis {
  * rigid, so local and world distances agree.
  */
 export interface AnalyzeOptions {
-  /** Vertices at most this far apart count as coincident. Defaults to 0 (exact duplicates). */
+  /**
+   * Vertices at most this far apart count as coincident. Defaults to 0 (exact
+   * duplicates). Converted to `f32`: a value below the `f32` range rounds to 0.
+   */
   weldTolerance?: number;
   /**
    * Check for self-intersection with the mesh's BVH. A stale `"manual"` mesh
@@ -426,7 +429,8 @@ export interface AnalyzeOptions {
 
 /**
  * One repair operation for {@link Scene.repair}. Distances and areas are in
- * mesh units (equal to world units).
+ * mesh units (equal to world units). They are converted to `f32`, so a
+ * tolerance or area below the `f32` range rounds to 0.
  */
 export type RepairOp =
   | { op: "weld"; tolerance: number }
@@ -614,13 +618,16 @@ function encodeIds(list: unknown, what: string, words: ArrayLike<number>[]): voi
   }
   const ids: number[] = new Array(list.length);
   const refs: number[] = [];
-  list.forEach((x: unknown, slot) => {
+  // An index loop, not forEach: a hole in a sparse array reads as `undefined`
+  // here and is rejected, where forEach would skip it and leave the id unset.
+  for (let slot = 0; slot < list.length; slot++) {
+    const x: unknown = list[slot];
     if (typeof x === "number") {
       if (!Number.isInteger(x) || x < 0 || x >= U32_LIMIT) {
         throw new FastMeshError("INVALID_INDEX", `${what}: ${x} is not an id`);
       }
       ids[slot] = x;
-      return;
+      continue;
     }
     const ref = (x as EditRef | null)?.ref;
     if (!Array.isArray(ref) || ref.length !== 2) {
@@ -633,7 +640,7 @@ function encodeIds(list: unknown, what: string, words: ArrayLike<number>[]): voi
     }
     ids[slot] = 0;
     refs.push(slot, ref[0], ref[1]);
-  });
+  }
   words.push([list.length, refs.length / 3], ids, refs);
 }
 

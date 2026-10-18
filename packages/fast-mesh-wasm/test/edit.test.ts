@@ -89,7 +89,7 @@ describe("edit", () => {
     s.takeChanges();
 
     // A bad ref writes nothing: no vertices, no undo step, no change record.
-    const undoDepthProbe = s.canUndo();
+    const canUndoBefore = s.canUndo();
     const slots = s.vertexSlots(m);
     const bad = [
       // Ref to a later op.
@@ -122,9 +122,13 @@ describe("edit", () => {
       expect(s.vertexSlots(m)).toBe(slots);
       expect(s.triangleCount(m)).toBe(3);
       expect(s.takeChanges()).toEqual([]);
-      expect(s.canUndo()).toBe(undoDepthProbe);
+      expect(s.canUndo()).toBe(canUndoBefore);
     }
     // Malformed lists.
+    // A hole in a sparse id list is not an id.
+    // eslint-disable-next-line no-sparse-arrays
+    expect(codeOf(() => s.edit(m, [{ op: "removeTriangles", triangles: [0, , 2] } as never]))).toBe("INVALID_ARGUMENT");
+    expect(s.triangleCount(m)).toBe(3);
     expect(codeOf(() => s.edit(m, [{ op: "addVertices", positions: [1, 2] }]))).toBe("INVALID_ARGUMENT");
     expect(
       codeOf(() => s.edit(m, [{ op: "setPositions", vertices: [0, 1], positions: [1, 2, 3] }])),
@@ -133,7 +137,7 @@ describe("edit", () => {
     expect(codeOf(() => s.edit(m, [{ op: "addTriangles", triangles: [0, 1] }]))).toBe("INVALID_ARGUMENT");
     // A vertex still in use: the store's own check, rolled back.
     expect(codeOf(() => s.edit(m, [{ op: "removeVertices", vertices: [0] }]))).toBe("INVALID_ARGUMENT");
-    expect(s.canUndo()).toBe(undoDepthProbe);
+    expect(s.canUndo()).toBe(canUndoBefore);
     // An empty list records nothing.
     expect(s.edit(m, []).added).toEqual([]);
     expect(s.takeChanges()).toEqual([]);
