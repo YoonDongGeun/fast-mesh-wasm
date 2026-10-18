@@ -59,6 +59,8 @@ jobs:
         run: pnpm check:pkg
       - name: Build the Vite example (browser entry)
         run: pnpm --filter fast-mesh-wasm-example-vite build
+      - name: Type-check and build the WebGPU example (Scene API, no 3D library)
+        run: pnpm --filter fast-mesh-wasm-example-webgpu build
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build

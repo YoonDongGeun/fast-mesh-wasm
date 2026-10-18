@@ -186,6 +186,22 @@ importers:
         specifier: ^8.3.4
         version: 8.3.4(@types/node@24.19.2)(terser@5.51.2)(yaml@2.9.1)
 
+  examples/webgpu:
+    dependencies:
+      fast-mesh-wasm:
+        specifier: workspace:*
+        version: link:../../packages/fast-mesh-wasm
+    devDependencies:
+      '@webgpu/types':
+        specifier: ^0.1.74
+        version: 0.1.74
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vite:
+        specifier: ^8.3.4
+        version: 8.3.4(@types/node@24.19.2)(terser@5.51.2)(yaml@2.9.1)
+
   examples/webpack-node:
     dependencies:
       fast-mesh-wasm:
@@ -687,6 +703,9 @@ packages:
 
   '@webassemblyjs/wast-printer@1.14.1':
     resolution: {integrity: sha512-kPSSXE6De1XOR820C90RIo2ogvZG+c3KiHzqUoO/F34Y2shGzesfqv7o57xrxovZJH/MetF5UjroJ/R/3isoiw==}
+
+  '@webgpu/types@0.1.74':
+    resolution: {integrity: sha512-lgiI4hbuLcI9unnm2cL/tvCaQU45dp0xcLWJh5uB/9MBGvIA4F8XIk7nSiBeg+K4xWGYwgZKn80LmERI5CxoTA==}
 
   '@xtuc/ieee754@1.2.0':
     resolution: {integrity: sha512-DX8nKgqcGwsc0eJSqYt5lwP4DH5FlHnmuWWBRy7X0NcaGR0ZtuyeESgMwTYVEtxmsNGY+qit4QYT/MIYTOTPeA==}
@@ -2180,6 +2199,8 @@ snapshots:
     dependencies:
       '@webassemblyjs/ast': 1.14.1
       '@xtuc/long': 4.2.2
+
+  '@webgpu/types@0.1.74': {}
 
   '@xtuc/ieee754@1.2.0': {}
 
