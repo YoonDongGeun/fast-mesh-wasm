@@ -4,10 +4,12 @@
 use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId, par};
 
-use crate::pair::{PAIR_STACK, Step, split_pair, traverse_subtree_pairs_with, try_push};
+use crate::pair::{
+    PAIR_STACK, PAR_PARTS, Step, oom, split_pair, traverse_subtree_pairs_with, try_push,
+};
 use crate::ray::points;
 use crate::tritri::{P3, collinear, tri_tri_intersect};
-use crate::{Appender, QueryError, Result, Rigid, check};
+use crate::{Appender, Result, Rigid, check};
 
 /// Appends to `out` every pair `(a, b)` with `a < b` of alive triangles of
 /// `mesh` that intersect or touch and share no vertex id. The appended pairs
@@ -88,15 +90,6 @@ pub fn self_intersecting_pairs(
 /// slower and 1.3 times faster from run to run, at 1,058 three times faster
 /// and at 32k nine times. Meshes that do cross themselves gain more.
 const PAR_MIN_SELF_TRIS: usize = 1024;
-
-/// How many parts a parallel search is split into, at least (unless the tree
-/// runs out of inner nodes first): enough for the pool to balance parts of
-/// very different cost.
-const PAR_PARTS: usize = 256;
-
-fn oom() -> QueryError {
-    QueryError::OutOfMemory
-}
 
 /// A part of the self-intersection search.
 #[derive(Debug, Clone, Copy)]

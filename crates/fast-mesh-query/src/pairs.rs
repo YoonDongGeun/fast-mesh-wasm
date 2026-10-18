@@ -12,7 +12,8 @@ use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind, NodeView};
 use fast_mesh_store::{Mesh, TriangleId, par};
 
 use crate::pair::{
-    PAIR_STACK, Step, split_pairs, traverse_pairs_with, traverse_subtree_pairs_with, try_push,
+    PAIR_STACK, PAR_PARTS, Step, oom, split_pairs, traverse_pairs_with,
+    traverse_subtree_pairs_with, try_push,
 };
 use crate::ray::points;
 use crate::tritri::{P3, TriTriDist, tri_tri_distance, tri_tri_intersect, tri_tri_within};
@@ -575,7 +576,10 @@ fn tri_b(mesh: &Mesh, xf: &Rigid, t: TriangleId) -> [P3; 3] {
 #[cfg(test)]
 thread_local! {
     /// Test-only: how many leaf pairs [`for_each_pair`] and
-    /// [`for_each_near_pair`] have tested on this thread.
+    /// [`for_each_near_pair`] have tested on this thread. Only the calling
+    /// thread counts: work a parallel query hands to the pool is not seen,
+    /// so tests that read this (or [`count_skips`]) stay below the
+    /// parallel thresholds or force sequential.
     static LEAF_VISITS: Cell<usize> = const { Cell::new(0) };
     /// Test-only: how many triangle pairs [`for_each_near_pair`] has skipped
     /// by a lower bound, and [`for_each_pair`] by disjoint boxes, on this
@@ -583,7 +587,8 @@ thread_local! {
     static PAIR_SKIPS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Test-only: counts `n` triangle pairs skipped by a lower bound.
+/// Test-only: counts `n` triangle pairs skipped by a lower bound, on the
+/// calling thread only (see [`LEAF_VISITS`]).
 fn count_skips(n: usize) {
     #[cfg(test)]
     PAIR_SKIPS.with(|c| c.set(c.get() + n));
@@ -896,11 +901,6 @@ fn mesh_distance_with<const N: usize>(
 /// and 1.3 times (`intersecting_pairs`), and at 2 x 131k 15 and 14 times.
 const PAR_MIN_PAIR_TRIS: usize = 2048;
 
-/// How many node pairs a parallel pair query splits its traversal into, at
-/// least (unless the trees run out of inner nodes first): enough for the
-/// pool to balance parts of very different cost.
-const PAR_PARTS: usize = 256;
-
 /// Whether a pair query on these meshes splits its traversal: with the
 /// feature, not forced off, and at least [`PAR_MIN_PAIR_TRIS`] triangles.
 fn split_traversal(mesh_a: &Mesh, mesh_b: &Mesh) -> bool {
@@ -1047,10 +1047,6 @@ fn intersecting_pairs_with<const N: usize>(
     // Each triangle is in exactly one leaf, so every pair is found once.
     ap.appended().sort_unstable();
     Ok(ap.count())
-}
-
-fn oom() -> QueryError {
-    QueryError::OutOfMemory
 }
 
 #[cfg(test)]
@@ -2199,7 +2195,7 @@ mod tests {
 
     #[test]
     fn pair_queries_bit_identical() {
-        use crate::test_util::{assert_parallel_identical, ripple};
+        use crate::test_util::{assert_parallel_identical, assert_runs_identical, ripple};
         let (ma, mb) = (ripple(60, false), ripple(60, true));
         assert!(ma.triangle_count() + mb.triangle_count() >= PAR_MIN_PAIR_TRIS);
         for quality in [Quality::Sah, Quality::Fast] {
@@ -2208,19 +2204,50 @@ mod tests {
                 rotation: rot_z(3.0),
                 translation: [2.5, -2.0, 0.1],
             };
-            for xf in [Rigid::IDENTITY, turned] {
-                let near = assert_parallel_identical("triangles_near", || {
+            // `mb` lifted just over `ma`: the highest peak of `ma` (0.9976,
+            // at x = 56) and the deepest dip of `mb` (-0.9825, at y = 7) are
+            // 0.0499 apart at a lift of 2.03, just under the margin 0.05, and
+            // the next pairs of peak and dip just over it.
+            let touching = Rigid {
+                rotation: rot_z(0.0),
+                translation: [0.0, 0.0, 2.03],
+            };
+            // `mb` stood upright as a wavy curtain `x = 6.73 - sin(0.7 y)`
+            // from `z = -0.5` up, its foot in the trough of `ma` around
+            // `x = 6.73` (where `ma` stays below -0.7): the root boxes
+            // overlap, so both searches split, but no pair is near.
+            let apart = Rigid {
+                rotation: [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+                translation: [6.73, 0.0, -0.5],
+            };
+            // Per pose: the bounds on each near list's length and on the
+            // crossing count, and whether the crossing search splits (the
+            // lifted sheet's box is clear of the other's).
+            let poses = [
+                (Rigid::IDENTITY, 500..usize::MAX, 500..usize::MAX, true),
+                (turned, 500..usize::MAX, 500..usize::MAX, true),
+                (touching, 1..10, 0..1, false),
+                (apart, 0..1, 0..1, true),
+            ];
+            for (i, (xf, near_len, crossings, splits)) in poses.into_iter().enumerate() {
+                let near = assert_parallel_identical(&format!("triangles_near {i}"), || {
                     let (mut a, mut b) = (vec![7], vec![9]);
                     triangles_near(&ma, &ba, &mb, &bb, &xf, 0.05, &mut a, &mut b).unwrap();
                     (a, b)
                 });
-                assert!(near.0.len() > 500 && near.1.len() > 500);
-                let crossing = assert_parallel_identical("intersecting_pairs", || {
+                // Less the sentinel each list started with.
+                let lens = (near.0.len() - 1, near.1.len() - 1);
+                assert!(
+                    near_len.contains(&lens.0) && near_len.contains(&lens.1),
+                    "{i}: {lens:?}"
+                );
+                let what = format!("intersecting_pairs {i}");
+                let crossing = assert_runs_identical(&what, splits, || {
                     let mut out = vec![(1, 2)];
                     let n = intersecting_pairs(&ma, &ba, &mb, &bb, &xf, &mut out).unwrap();
                     (n, out)
                 });
-                assert!(crossing.0 > 500);
+                assert!(crossings.contains(&crossing.0), "{i}: {}", crossing.0);
             }
         }
     }

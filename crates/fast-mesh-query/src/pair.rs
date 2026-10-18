@@ -7,12 +7,22 @@
 
 use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind, NodeView};
 
-use crate::Rigid;
+use crate::{QueryError, Rigid};
 
 /// How many pending node pairs [`traverse_pairs`] keeps in its fixed stack
 /// (40 bytes each). Pending pairs grow by at most one per level of the two
 /// trees combined, so balanced builds never come close.
 pub(crate) const PAIR_STACK: usize = 128;
+
+/// How many node pairs a parallel pair or self-pair search splits its
+/// traversal into, at least (unless the trees run out of inner nodes first):
+/// enough for the pool to balance parts of very different cost.
+pub(crate) const PAR_PARTS: usize = 256;
+
+/// The error of an allocation that failed in a parallel helper.
+pub(crate) fn oom() -> QueryError {
+    QueryError::OutOfMemory
+}
 
 /// What [`traverse_pairs`] does with a pair once `visit` has seen it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

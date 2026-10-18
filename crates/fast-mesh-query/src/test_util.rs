@@ -253,6 +253,17 @@ pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
     what: &str,
     run: impl Fn() -> R + Sync,
 ) -> R {
+    assert_runs_identical(what, true, run)
+}
+
+/// [`assert_parallel_identical`], asserting that the global run took a
+/// parallel path only when `splits` (a search whose root boxes are rejected
+/// has nothing to split).
+pub(crate) fn assert_runs_identical<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    splits: bool,
+    run: impl Fn() -> R + Sync,
+) -> R {
     use fast_mesh_store::par;
     par::set_force_sequential(true);
     let reference = run();
@@ -267,6 +278,8 @@ pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
     }
     let before = par::parallel_entries();
     assert!(run() == reference, "{what}: global pool");
-    assert!(par::parallel_entries() > before, "{what}: ran sequentially");
+    if splits {
+        assert!(par::parallel_entries() > before, "{what}: ran sequentially");
+    }
     reference
 }
