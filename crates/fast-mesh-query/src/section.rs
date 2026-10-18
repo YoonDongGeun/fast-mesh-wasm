@@ -271,8 +271,10 @@ fn in_box(p: P2, lo: P2, hi: P2) -> bool {
 ///
 /// The segments of `b` are binned in a uniform grid with about one cell per
 /// segment, and each segment of `a` searches outward through it ring by ring
-/// until no unvisited cell can be closer. The result is the exact minimum of
-/// the pairwise distances, not an approximation.
+/// until no unvisited cell can be closer. The segments of `a` are taken
+/// nearest `b`'s bounding box first, and the search stops at the first one
+/// whose box is at least the best distance from it. The result is the exact
+/// minimum of the pairwise distances, not an approximation.
 ///
 /// Known limits: a segment of `b` is listed in every cell its bounding box
 /// overlaps, and a segment of `a` starts from every cell its box overlaps, so
@@ -288,16 +290,25 @@ pub fn contour_gap(a: &[(&[[f64; 2]], bool)], b: &[(&[[f64; 2]], bool)]) -> Resu
     collect_segments(a, &mut sa)?;
     let mut sb = Vec::new();
     collect_segments(b, &mut sb)?;
-    let (Some(&first_a), Some(&first_b)) = (sa.first(), sb.first()) else {
+    if sa.is_empty() || sb.is_empty() {
         return Ok(None);
-    };
+    }
     let grid = Grid::build(&sb)?;
+    // The segments of `a` nearest `b`'s box first: the first searches find a
+    // close pair, and the rest stop as soon as their box gap, a lower bound
+    // on their distance to every segment of `b`, reaches it. Without this the
+    // cost depended on where contour `a` happened to start.
+    let to_b = |s: &Seg| {
+        let (l, h) = bounds(s);
+        box_gap(l, h, grid.lo, grid.hi)
+    };
+    sa.sort_unstable_by(|p, q| to_b(p).total_cmp(&to_b(q)));
     let mut seen = Vec::new();
     reserve(&mut seen, sb.len())?;
     seen.resize(sb.len(), 0usize);
-    let mut best = segment_gap(first_a, first_b);
+    let mut best = segment_gap(sa[0], sb[0]);
     for (k, &s) in sa.iter().enumerate() {
-        if best.0 == 0.0 {
+        if best.0 == 0.0 || to_b(&s) >= best.0 {
             break;
         }
         grid.search(s, &sb, &mut seen, k + 1, &mut best);
@@ -876,6 +887,28 @@ mod tests {
             // A few rings per segment, against about `n` each before.
             assert!(rings < 8 * n, "{rings}");
         }
+    }
+
+    #[test]
+    fn gap_cost_does_not_depend_on_where_a_starts() {
+        // Two circles 30 apart; contour a starts at its far side, then at
+        // its point closest to b.
+        let b: Vec<_> = circle(100.0, 2072, true)
+            .into_iter()
+            .map(|p| [p[0] + 230.0, p[1]])
+            .collect();
+        let mut tested = Vec::new();
+        for start in [1036, 0] {
+            let mut a = circle(100.0, 2072, true);
+            a.rotate_left(start);
+            PAIRS_TESTED.with(|c| c.set(0));
+            let g = contour_gap(&[(&a, true)], &[(&b, true)]).unwrap().unwrap();
+            assert!((g.distance - 30.0).abs() < 1e-9, "{g:?}");
+            assert_eq!(g.a, [100.0, 0.0]);
+            tested.push(PAIRS_TESTED.with(|c| c.get()));
+        }
+        // A handful of segments on each side, either way.
+        assert!(tested.iter().all(|&t| t < 64), "{tested:?}");
     }
 
     #[test]
