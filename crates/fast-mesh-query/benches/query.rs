@@ -8,15 +8,18 @@
 //! by a little more about z at every iteration, cycling through 64 poses; they
 //! print their result sizes at three poses. `mesh_distance` on the touching
 //! poses is also measured separately on those that intersect and on the near
-//! misses.
+//! misses. The `slice` groups cut a terrain (at 10M too when large) and a UV
+//! sphere with a plane at three positions each, and print the contour and
+//! segment counts once.
 
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::{
-    ClosestOptions, Ray, RayOptions, Region, Rigid, closest_point, intersecting_pairs, intersects,
-    mesh_distance, raycast, raycast_any, triangles_in, triangles_near, vertices_in,
+    ClosestOptions, Plane, Ray, RayOptions, Region, Rigid, Slice, closest_point,
+    intersecting_pairs, intersects, mesh_distance, raycast, raycast_any, slice, triangles_in,
+    triangles_near, vertices_in,
 };
 use fast_mesh_store::Mesh;
 
@@ -36,6 +39,43 @@ fn terrain(n: u32) -> Mesh {
         for x in 0..n {
             let a = y * (n + 1) + x;
             indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+        }
+    }
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+/// A sphere of radius `r` about the origin, outward wound: `rings` bands of
+/// `segs` quads between two poles (2·segs·(rings − 1) triangles).
+fn uv_sphere(rings: u32, segs: u32, r: f32) -> Mesh {
+    let mut positions = vec![0.0, 0.0, r];
+    for i in 1..rings {
+        let phi = std::f32::consts::PI * i as f32 / rings as f32;
+        for j in 0..segs {
+            let th = std::f32::consts::TAU * j as f32 / segs as f32;
+            positions.extend([
+                r * phi.sin() * th.cos(),
+                r * phi.sin() * th.sin(),
+                r * phi.cos(),
+            ]);
+        }
+    }
+    positions.extend([0.0, 0.0, -r]);
+    let south = 1 + (rings - 1) * segs;
+    let ring = |i: u32, j: u32| 1 + (i - 1) * segs + j % segs;
+    let mut indices = Vec::new();
+    for j in 0..segs {
+        indices.extend([0, ring(1, j), ring(1, j + 1)]);
+        indices.extend([south, ring(rings - 1, j + 1), ring(rings - 1, j)]);
+    }
+    for i in 1..rings - 1 {
+        for j in 0..segs {
+            let (a, b, c, d) = (
+                ring(i, j),
+                ring(i, j + 1),
+                ring(i + 1, j),
+                ring(i + 1, j + 1),
+            );
+            indices.extend([a, c, b, b, c, d]);
         }
     }
     Mesh::from_buffers(&positions, &indices).unwrap()
@@ -342,7 +382,66 @@ fn bench_pairs(c: &mut Criterion, label: &str, n: u32) {
     group.finish();
 }
 
+/// Cuts `mesh` with each plane, after printing what the cut holds.
+fn bench_slice(c: &mut Criterion, name: &str, mesh: &Mesh, planes: &[(String, Plane)]) {
+    let bvh = Bvh::build(mesh, &BuildOptions::default()).unwrap();
+    let mut group = c.benchmark_group(format!("query slice/{name}"));
+    group.sample_size(if name.ends_with("10M") { 10 } else { 100 });
+    group.throughput(Throughput::Elements(1));
+    let mut out = Slice::default();
+    for (label, plane) in planes {
+        slice(mesh, &bvh, plane, &mut out).unwrap();
+        let points: usize = out.contours.iter().map(|c| c.points.len()).sum();
+        eprintln!(
+            "slice/{name} {label}: {} contours, {points} points, {} closed",
+            out.contours.len(),
+            out.contours.iter().filter(|c| c.closed).count()
+        );
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                slice(mesh, &bvh, plane, &mut out).unwrap();
+                black_box(out.contours.len());
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Three planes across a terrain of side `n`, normal along x, between grid
+/// lines.
+fn terrain_planes(n: u32) -> Vec<(String, Plane)> {
+    [0.2, 0.5, 0.8]
+        .map(|f| {
+            let x = (f * f64::from(n)).floor() + 0.37;
+            (
+                format!("x = {x}"),
+                Plane::new([x, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap(),
+            )
+        })
+        .into()
+}
+
+fn bench_slices(c: &mut Criterion) {
+    bench_slice(c, "terrain_1M", &terrain(708), &terrain_planes(708));
+    // 998,000 triangles, radius 100: planes through the cap, the middle and
+    // below it, tilted so that they miss the pole axis.
+    let sphere = uv_sphere(500, 1000, 100.0);
+    let planes: Vec<(String, Plane)> = [-50.5, 0.3, 60.7]
+        .map(|z| {
+            (
+                format!("z = {z}"),
+                Plane::new([0.0, 0.0, z], [0.1, 0.05, 1.0]).unwrap(),
+            )
+        })
+        .into();
+    bench_slice(c, "sphere_1M", &sphere, &planes);
+    if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {
+        bench_slice(c, "terrain_10M", &terrain(2237), &terrain_planes(2237));
+    }
+}
+
 fn benches(c: &mut Criterion) {
+    bench_slices(c);
     bench_size(c, "1M", 708);
     bench_pairs(c, "1M", 708);
     if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {

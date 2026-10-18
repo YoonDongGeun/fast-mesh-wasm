@@ -24,6 +24,12 @@
 //! (a second field from B to A, both meshes coloured). Setup prints the
 //! number of recoloured vertices per pose.
 //!
+//! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
+//! dragged across a terrain through 64 poses, 100 vertices moved far from the
+//! plane (and the same edit on a scene without a section, to compare), the
+//! fill of a sphere's cross-section, and the gap between the cross-sections
+//! of two spheres.
+//!
 //! **`find_contacts`** over 2, 8 and 32 small meshes (`terrain(32)`, 2,048
 //! triangles each) in a row, each overlapping its neighbour a little.
 
@@ -31,10 +37,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
-use fast_mesh_query::{Ray, RayOptions, Rigid, mesh_distance, raycast};
+use fast_mesh_query::{Plane, Ray, RayOptions, Rigid, mesh_distance, raycast};
 use fast_mesh_scene::{
     ColorRule, Coloring, Colormap, Contact, ContactFilter, DistanceField, MeshId, MeshOptions,
-    OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SignMode, UpdateMode,
+    OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SectionDesc, SignMode, UpdateMode,
 };
 use fast_mesh_store::Mesh;
 
@@ -54,6 +60,43 @@ fn terrain(n: u32) -> Mesh {
         for x in 0..n {
             let a = y * (n + 1) + x;
             indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+        }
+    }
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+/// A sphere of radius `r` about the origin, outward wound: `rings` bands of
+/// `segs` quads between two poles (2·segs·(rings − 1) triangles).
+fn uv_sphere(rings: u32, segs: u32, r: f32) -> Mesh {
+    let mut positions = vec![0.0, 0.0, r];
+    for i in 1..rings {
+        let phi = std::f32::consts::PI * i as f32 / rings as f32;
+        for j in 0..segs {
+            let th = std::f32::consts::TAU * j as f32 / segs as f32;
+            positions.extend([
+                r * phi.sin() * th.cos(),
+                r * phi.sin() * th.sin(),
+                r * phi.cos(),
+            ]);
+        }
+    }
+    positions.extend([0.0, 0.0, -r]);
+    let south = 1 + (rings - 1) * segs;
+    let ring = |i: u32, j: u32| 1 + (i - 1) * segs + j % segs;
+    let mut indices = Vec::new();
+    for j in 0..segs {
+        indices.extend([0, ring(1, j), ring(1, j + 1)]);
+        indices.extend([south, ring(rings - 1, j + 1), ring(rings - 1, j)]);
+    }
+    for i in 1..rings - 1 {
+        for j in 0..segs {
+            let (a, b, c, d) = (
+                ring(i, j),
+                ring(i, j + 1),
+                ring(i + 1, j),
+                ring(i + 1, j + 1),
+            );
+            indices.extend([a, c, b, b, c, d]);
         }
     }
     Mesh::from_buffers(&positions, &indices).unwrap()
@@ -468,7 +511,197 @@ fn bench_contacts(c: &mut Criterion) {
     group.finish();
 }
 
+/// A plane across a sphere at height `z`, tilted so it misses the pole axis.
+fn z_plane(z: f64) -> Plane {
+    Plane::new([0.0, 0.0, z], [0.1, 0.05, 1.0]).unwrap()
+}
+
+/// The heights the sphere benchmarks cycle through.
+const SPHERE_ZS: [f64; 3] = [-50.5, 0.3, 60.7];
+
+/// An Eager scene (the default mode) with one mesh.
+fn eager_scene(mesh: Mesh) -> (Scene, MeshId) {
+    let mut scene = scene();
+    let id = scene.add_mesh(mesh, MeshOptions::default()).unwrap();
+    (scene, id)
+}
+
+fn bench_sections(c: &mut Criterion) {
+    let n = 708;
+    let side = f64::from(n);
+    let mut group = c.benchmark_group("scene sections 1M");
+    group.sample_size(10);
+
+    // A plane dragged across the terrain through 64 poses, re-sliced at each
+    // (Eager: `set_section_plane` computes).
+    let (mut scene, id) = eager_scene(terrain(n));
+    let planes: Vec<Plane> = (0..64)
+        .map(|i| {
+            let x = (i as f64 + 0.5) / 64.0 * side + 0.37;
+            Plane::new([x, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap()
+        })
+        .collect();
+    let section = scene
+        .add_section(SectionDesc {
+            plane: planes[0],
+            meshes: vec![id],
+            fill: false,
+        })
+        .unwrap();
+    group.throughput(Throughput::Elements(64));
+    group.bench_function(
+        "section_drag_1M: 64 planes, set_section_plane + read",
+        |b| {
+            b.iter(|| {
+                for p in &planes {
+                    scene.set_section_plane(section, *p).unwrap();
+                    black_box(scene.section(section, id).unwrap().length);
+                }
+                black_box(scene.take_changes());
+            })
+        },
+    );
+
+    // Moving 100 vertices near the x = 0 edge of the terrain, about 354 from
+    // a plane at x = side / 2, up and down by 0.5 in z. The baseline is the
+    // same edit on a scene with no section: the difference is what the
+    // section costs.
+    let moved: Vec<u32> = (0..100).map(|k| (k / 10) * (n + 1) + k % 10).collect();
+    let base: Vec<[f32; 3]> = moved
+        .iter()
+        .map(|&v| {
+            let (x, y) = ((v % (n + 1)) as f32, (v / (n + 1)) as f32);
+            [x, y, (x * 0.05).sin() * (y * 0.07).cos() * 4.0]
+        })
+        .collect();
+    group.throughput(Throughput::Elements(1));
+    for with_section in [false, true] {
+        let (mut scene, id) = eager_scene(terrain(n));
+        let section = with_section.then(|| {
+            scene
+                .add_section(SectionDesc {
+                    plane: Plane::new([side / 2.0 + 0.37, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap(),
+                    meshes: vec![id],
+                    fill: false,
+                })
+                .unwrap()
+        });
+        let mut up = false;
+        let name = if with_section {
+            "section_far_edit_1M: move 100 vertices, section at the middle"
+        } else {
+            "section_far_edit_1M baseline: move 100 vertices, no section"
+        };
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                up = !up;
+                let to: Vec<[f32; 3]> = base
+                    .iter()
+                    .map(|p| [p[0], p[1], p[2] + if up { 0.5 } else { 0.0 }])
+                    .collect();
+                scene.edit(id, |tx| tx.set_positions(&moved, &to)).unwrap();
+                black_box(scene.take_changes());
+            })
+        });
+        if let Some(section) = section {
+            // The far edits must have left the entry Current, or the
+            // benchmark measures recomputes.
+            eprintln!(
+                "section_far_edit_1M: status after the edits {:?}",
+                scene.section_status(section, id).unwrap()
+            );
+        }
+    }
+
+    // Fill: a 998,000-triangle sphere cut at three heights in turn; the
+    // `fill: false` run shows what the contours alone cost.
+    for fill in [false, true] {
+        let (mut scene, id) = eager_scene(uv_sphere(500, 1000, 100.0));
+        let section = scene
+            .add_section(SectionDesc {
+                plane: z_plane(SPHERE_ZS[0]),
+                meshes: vec![id],
+                fill,
+            })
+            .unwrap();
+        let r = scene.section(section, id).unwrap();
+        eprintln!(
+            "sphere_1M fill={fill}: {} contours, {} points, fill triangles {:?}, fill_ok {}, \
+             area {:.1}",
+            r.contours.len(),
+            r.contours.iter().map(|c| c.points.len()).sum::<usize>(),
+            r.fill.as_ref().map(|f| f.triangles.len()),
+            r.fill_ok,
+            r.area
+        );
+        let mut i = 0;
+        let name = if fill {
+            "section_fill_1M_sphere: set_section_plane, fill on"
+        } else {
+            "section_fill_1M_sphere baseline: set_section_plane, fill off"
+        };
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                i = (i + 1) % 3;
+                scene
+                    .set_section_plane(section, z_plane(SPHERE_ZS[i]))
+                    .unwrap();
+                black_box(scene.section(section, id).unwrap().area);
+            })
+        });
+    }
+
+    // Gap: two spheres side by side (centres 230 apart, radius 100, so 30
+    // between them), one section over both. The gap on its own, and a plane
+    // change that recomputes both entries followed by the gap.
+    let mut gap_scene = self::scene();
+    let a = gap_scene
+        .add_mesh(uv_sphere(500, 1000, 100.0), MeshOptions::default())
+        .unwrap();
+    let b = gap_scene
+        .add_mesh(
+            uv_sphere(500, 1000, 100.0),
+            MeshOptions {
+                placement: Placement {
+                    translation: [230.0, 0.0, 0.0],
+                    ..Placement::IDENTITY
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let section = gap_scene
+        .add_section(SectionDesc {
+            plane: z_plane(SPHERE_ZS[1]),
+            meshes: vec![a, b],
+            fill: false,
+        })
+        .unwrap();
+    eprintln!(
+        "section_gap_two_1M: {:?}",
+        gap_scene.section_gap(section, a, b).unwrap()
+    );
+    group.bench_function("section_gap_two_1M: section_gap alone", |bn| {
+        bn.iter(|| black_box(gap_scene.section_gap(section, a, b).unwrap()))
+    });
+    let mut i = 0;
+    group.bench_function(
+        "section_gap_two_1M: set_section_plane (both meshes) + section_gap",
+        |bn| {
+            bn.iter(|| {
+                i = (i + 1) % 3;
+                gap_scene
+                    .set_section_plane(section, z_plane(SPHERE_ZS[i]))
+                    .unwrap();
+                black_box(gap_scene.section_gap(section, a, b).unwrap());
+            })
+        },
+    );
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
+    bench_sections(c);
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);
     bench_contacts(c);
