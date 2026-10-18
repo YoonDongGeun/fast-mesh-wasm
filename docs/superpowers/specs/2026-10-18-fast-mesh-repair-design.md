@@ -77,7 +77,7 @@ This is a personal, general-purpose library for any mesh: scans, CAD exports, op
 ### 4.2 Boundary loops
 - A boundary half-edge is the directed edge `a→b` of the single triangle using a boundary edge.
 - **Walking at a vertex.** At vertex `b`, the next half-edge is found by rotating around `b`'s triangle fan, starting from the triangle of the incoming half-edge, until the next boundary half-edge leaving `b` is reached. Following the fan this way, not just picking any outgoing boundary edge, is what makes holes that share a vertex come out as separate loops. *(Implemented differently: rotating around `b`'s own fan reproduces the figure-eight bug at a pinch. See §12 item 1 for the rule that was built.)*
-- **When the walk is ambiguous:** a vertex with non-manifold edges, or fans that cannot be ordered. The remaining half-edges at that vertex are paired in a deterministic order (by edge key), and each loop involved is marked `clean: false`. *(Refined in §12 items 1–2.)* `fill_holes` skips loops that are not clean unless `allow_unclean` is set *(my call)*.
+- **When the walk is ambiguous:** a vertex with non-manifold edges, or fans that cannot be ordered. The remaining half-edges at that vertex are paired in a deterministic order (by edge key), and each loop involved is marked `clean: false`. *(Refined in §12 items 1–2 and 13.)* `fill_holes` skips loops that are not clean unless `allow_unclean` is set *(my call)*.
 - **Each loop records:**
   - its vertices in order;
   - `edges`;
@@ -144,7 +144,7 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 - Its triangles and the vertices left unused are removed.
 
 ### 5.5 `weld(tx, tolerance) -> WeldReport`
-- Group vertices within `tolerance` using a uniform-grid spatial hash and union-find. Each group keeps its smallest vertex id, at its original position *(my call)*.
+- Group vertices within `tolerance` using a uniform-grid spatial hash and union-find. Each group keeps its smallest vertex id, at its original position *(my call)*. Cell size and non-finite positions: §12 item 14.
 - Triangles are rewritten to the kept ids. Triangles that collapse (a repeated id) are removed. Unused vertices are removed.
 - `tolerance = 0` merges exact duplicates only.
 
@@ -233,12 +233,12 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 4. **Pinch vertices.**
    - `analyze` counts a vertex whose triangle fan splits into several pieces as a non-manifold vertex, in a separate `pinch_vertices` list. This includes the bowtie corner where two holes touch. `non_manifold_vertices` covers vertices on non-manifold edges.
    - Boundary loops through a pinch vertex are still `clean` when every fan piece at that vertex is edge-manifold, so it can be ordered.
-   - A loop is `clean: false` only when the vertex has non-manifold edges. *(Also unclean: open chains and oppositely wound pinches; §12 items 1–2.)*
+   - A loop is `clean: false` only when the vertex has non-manifold edges. *(Also unclean: open chains, oppositely wound pinches and loops across an orientation seam; §12 items 1–2 and 13.)*
    - The owner's bowtie case is therefore reported as a pinch, and still filled by default.
 
 ## 12. Implementation notes
 
-What the implementation settled or found. Items 1 to 6, 8 and 9 correct or qualify wording in earlier sections (§4.2, §5.1 to §5.3, §9, §11.1 and §11.4), which now point here; the rest add detail or record deviations. Measured numbers are in item 12 and in `docs/benchmarks.md`.
+What the implementation settled or found. Items 1 to 6, 8, 9, 13 and 14 correct or qualify wording in earlier sections (§4.2, §5.1 to §5.3, §5.5, §9, §11.1 and §11.4), which now point here; the rest add detail or record deviations. Measured numbers are in item 12 and in `docs/benchmarks.md`.
 
 1. **The fan walk (§4.2).** The literal rule, "rotate around `b`'s fan to the next boundary half-edge", reproduces the figure-eight bug at a pinch vertex: it can return to the incoming loop's own piece and join two holes into one loop. The implemented rule takes the next boundary edge from another fan piece across the gap. With three or more wedges it chooses the smallest counter-clockwise turn about a local normal, and ties go by edge key order.
 2. **Open chains and unclean pinches (§4.2).** An open chain of boundary edges around a non-manifold edge is walked whole from its head and comes out as a loop with `closed = false` and `clean = false`; `fill_holes` never fills it, even with `allow_unclean`. A pinch whose wedges are wound oppositely also yields unclean pieces.
@@ -258,3 +258,5 @@ What the implementation settled or found. Items 1 to 6, 8 and 9 correct or quali
     - `remove_small_components`, 1M terrain plus 1,000 two-triangle specks: 117 ms.
     - `fill_holes`, ten holes of 61 to 482 edges in a 1M terrain (83,813 triangles and 40,548 vertices added): 360 ms with `fair` off and 5.16 s with `fair` on. Fairing is about 93% of the time (`fair` defaults to true); no budget was set for it and nothing was tuned.
     - Sphere fairing accuracy (the `unfaired_patch_is_flatter` fixture; largest `| |p| − 1 |` over the new vertices of each hole, on a unit UV sphere of 64 rings and 128 segments with holes of 10°, 20° and 30°): 0.0005, 0.0018 and 0.0082 with fairing, against 0.0103, 0.0507 and 0.1182 without.
+13. **Loops across an orientation seam (§4.2, item 2).** A flipped triangle on a hole's rim reverses its boundary edge, and the walk then follows the hole backwards; filling that loop would write an inverted patch. A loop is therefore also `clean = false` when it walks a boundary edge against its triangle's direction, or when it is closed and passes a vertex whose outgoing and incoming boundary edges do not balance. `fill_holes` skips such loops unless `allow_unclean` is set; running `orient` first makes them clean. The Möbius boundary, walked across its seam, is unclean too.
+14. **Weld grid (§5.5).** Cells are always `2 × tolerance` wide and do not depend on the mesh extent, so one far outlier cannot widen them and make the grouping quadratic. A coordinate at least 2^60 cells from zero (every coordinate at tolerance 0) is keyed by its exact value instead, so cell coordinates never saturate; at that size its `f32` spacing exceeds 2^36 cells, so it can only pair with an equal coordinate. Vertices with a non-finite coordinate are left out of the grid and never merged, in `weld` and in `analyze`'s coincident-vertex count.
