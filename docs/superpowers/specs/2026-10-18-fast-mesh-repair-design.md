@@ -215,3 +215,23 @@ Each operation is a function in `fast_mesh_ops` that returns a report struct. Th
 - CG details: preconditioner, iteration cap, tolerance, and the cotangent clamp.
 - The refinement and relaxation loop, provided the density rule of §5.3 step 2 holds.
 - Splitting into plan tasks.
+
+## 11. Decisions after the builder check (all *my call*; they override earlier sections)
+
+1. **Public API changes are allowed.**
+   - `Scene::edit` becomes generic over its error. Its closure returns `Result<R, E>` with `E: From<StoreError>`, and `edit` returns `Result<R, E>`. Scene-side failures are carried through a new `From<SceneError>` bound, or the builder may use an equivalent design that keeps existing callers compiling with at most a type annotation. Record the choice.
+   - `OpsError` implements `From<StoreError>`, so `scene.edit(id, |tx| ops::fill_holes(tx, &opts))` compiles.
+   - `fast-mesh-query` gains a public `self_intersecting_pairs(mesh, bvh, out)`. It returns triangle pairs that intersect and share no vertex, using the exact tri-tri test. `analyze` uses it.
+2. **Loop ids are content fingerprints, not revision-bound.**
+   - A `LoopId` holds the loop's smallest vertex id, its length, and a hash of its vertex sequence (rotated to start at the smallest vertex).
+   - `fill_holes` recomputes the loops from `tx.mesh()` and matches the requested ids by content. Any id that does not match returns `OpsError::StaleLoops` before anything is written.
+   - This works inside one transaction after earlier operations have run, so a renumbered or removed loop can never fill the wrong opening.
+3. **`orient` and non-manifold edges.**
+   - Each patch (grown across interior edges only) takes its own majority by area, independently. Patches meeting only at non-manifold edges are not aligned with each other.
+   - "Closed, so face outward" applies only to closed components that have no non-manifold edges, as §4.3 defines. Non-manifold components get per-patch majority only.
+   - Orientation conflicts are counted on interior edges only, so "zero conflicts on orientable input" is well defined.
+4. **Pinch vertices.**
+   - `analyze` counts a vertex whose triangle fan splits into several pieces as a non-manifold vertex, in a separate `pinch_vertices` list. This includes the bowtie corner where two holes touch. `non_manifold_vertices` covers vertices on non-manifold edges.
+   - Boundary loops through a pinch vertex are still `clean` when every fan piece at that vertex is edge-manifold, so it can be ordered.
+   - A loop is `clean: false` only when the vertex has non-manifold edges.
+   - The owner's bowtie case is therefore reported as a pinch, and still filled by default.
