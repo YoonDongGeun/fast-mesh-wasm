@@ -80,7 +80,7 @@ impl Bvh {
             return Err(BvhError::MeshMismatch);
         }
         if mesh.epoch() != self.epoch {
-            *self = Bvh::assemble(mesh, &self.options, &self.policy)?;
+            self.rebuild_from(mesh)?;
             return Ok(UpdateReport::new(Strategy::Full));
         }
         if mesh.revision() == self.revision {
@@ -119,7 +119,7 @@ impl Bvh {
         }
         let alive = mesh.triangle_count().max(1);
         if self.root == NONE || dirty as f32 > self.policy.full_rebuild_fraction * alive as f32 {
-            *self = Bvh::assemble(mesh, &self.options, &self.policy)?;
+            self.rebuild_from(mesh)?;
             return Ok(UpdateReport::new(Strategy::Full));
         }
 
@@ -127,8 +127,7 @@ impl Bvh {
             Strategy::Refit
         } else {
             Strategy::Partial
-        });
-        // Leaves of moved triangles, gathered after the rebuilds (which move
+        }); // Leaves of moved triangles, gathered after the rebuilds (which move
         // triangles to new leaves); reserved now so the refit cannot fail.
         let mut leaves = Vec::new();
         try_reserve(&mut leaves, moved.len())?;
@@ -176,6 +175,7 @@ impl Bvh {
         {
             report.compacted = true;
         }
+        self.generation += 1;
         self.revision = mesh.revision();
         Ok(report)
     }
@@ -201,6 +201,7 @@ impl Bvh {
                 self.arena.refit_ancestors(leaf);
             }
         }
+        self.generation += 1;
         Ok(())
     }
 
@@ -240,6 +241,7 @@ impl Bvh {
         for &i in &which {
             self.replace_treelet(mesh, i, &[], &[], &[], &mut scratch);
         }
+        self.generation += 1;
         Ok(())
     }
 
@@ -248,8 +250,7 @@ impl Bvh {
         if mesh.uid() != self.mesh_uid {
             return Err(BvhError::MeshMismatch);
         }
-        *self = Bvh::assemble(mesh, &self.options, &self.policy)?;
-        Ok(())
+        self.rebuild_from(mesh)
     }
 
     /// Removes `removed` from the tree and inserts `added`, rebuilding each
@@ -766,6 +767,93 @@ mod tests {
         let report = bvh.update(&mut m, p.changes()).unwrap();
         assert!(report.rebuilt_treelets > 0, "{report:?}");
         bvh.validate(&m).unwrap();
+    }
+
+    #[test]
+    fn generation_changes_on_every_structural_change() {
+        let mut m = grid(16);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let mut seen = vec![bvh.generation()];
+        let mut check = |bvh: &Bvh, what: &str| {
+            let g = bvh.generation();
+            assert!(!seen.contains(&g), "{what}: generation {g} repeated");
+            seen.push(g);
+        };
+
+        let mut tx = m.begin_edit();
+        tx.set_positions(&[0], &[[0.0, 0.0, 5.0]]).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Refit
+        );
+        check(&bvh, "update refit");
+
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[0, 1]).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Partial
+        );
+        check(&bvh, "update partial");
+
+        bvh.refit(&m, &[2]).unwrap();
+        check(&bvh, "refit");
+        bvh.rebuild_region(&m, &[2]).unwrap();
+        check(&bvh, "rebuild_region");
+        bvh.compact_storage().unwrap();
+        check(&bvh, "compact_storage");
+        bvh.rebuild(&m).unwrap();
+        check(&bvh, "rebuild");
+
+        // A full rebuild inside `update` replaces the whole value but must
+        // still move the counter on.
+        let all: Vec<u32> = (0..m.vertex_slots() as u32).collect();
+        let lifted: Vec<[f32; 3]> = all
+            .iter()
+            .map(|&v| {
+                let p = m.position(v).unwrap();
+                [p[0], p[1], 1.0]
+            })
+            .collect();
+        let mut tx = m.begin_edit();
+        tx.set_positions(&all, &lifted).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Full
+        );
+        check(&bvh, "update full");
+
+        // So does a rebuild forced by a compacted mesh.
+        m.compact().unwrap();
+        bvh.update(&mut m, &fast_mesh_store::ChangeSet::default())
+            .unwrap();
+        check(&bvh, "update after mesh compaction");
+    }
+
+    #[test]
+    fn generation_unchanged_when_update_is_unchanged() {
+        let mut m = grid(2);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        let g = bvh.generation();
+        // Revision matches: nothing happens.
+        let none = fast_mesh_store::ChangeSet::default();
+        assert_eq!(
+            bvh.update(&mut m, &none).unwrap().strategy,
+            Strategy::Unchanged
+        );
+        assert_eq!(bvh.generation(), g);
+        // Revision moved but no triangle is affected.
+        let mut tx = m.begin_edit();
+        tx.add_vertices(&[[9.0; 3]]).unwrap();
+        let p = tx.commit().unwrap();
+        assert_eq!(
+            bvh.update(&mut m, p.changes()).unwrap().strategy,
+            Strategy::Unchanged
+        );
+        assert_eq!(bvh.generation(), g);
     }
 
     #[test]

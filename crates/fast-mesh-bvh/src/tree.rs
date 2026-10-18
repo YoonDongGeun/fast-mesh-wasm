@@ -30,6 +30,8 @@ pub struct Bvh {
     /// `Mesh::epoch` at the last full build; slot ids are stale once it differs.
     pub(crate) epoch: u32,
     pub(crate) revision: u64,
+    /// Bumped on every structural change; see [`Bvh::generation`].
+    pub(crate) generation: u64,
     pub(crate) options: BuildOptions,
     pub(crate) policy: UpdatePolicy,
 }
@@ -129,6 +131,7 @@ impl Bvh {
             mesh_uid: mesh.uid(),
             epoch: mesh.epoch(),
             revision: mesh.revision(),
+            generation: 0,
             options: *options,
             policy: *policy,
         };
@@ -327,6 +330,16 @@ impl Bvh {
         self.treelet_of_root = roots;
         self.garbage_nodes = 0;
         self.garbage_refs = 0;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Replaces the whole tree with a fresh build, carrying the generation on
+    /// so it never repeats. On error nothing changes.
+    pub(crate) fn rebuild_from(&mut self, mesh: &Mesh) -> Result<()> {
+        let generation = self.generation + 1;
+        *self = Bvh::assemble(mesh, &self.options, &self.policy)?;
+        self.generation = generation;
         Ok(())
     }
 
