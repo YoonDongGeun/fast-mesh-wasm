@@ -124,7 +124,10 @@ pub struct FillReport {
 ///   through an earlier operation in the same transaction, fails the call.
 ///   Loops that are open chains, or not clean unless `allow_unclean`, are
 ///   skipped. An open mesh's intended border (a hemisphere's rim) is kept by
-///   a bound below its size.
+///   a bound below its size. A loop that crosses an orientation seam (a
+///   flipped triangle on its rim) is not clean, so run
+///   [`orient()`](crate::orient()) first on meshes that may contain flipped
+///   triangles.
 /// - Each selected loop is triangulated on its own: up to `dp_limit` edges
 ///   by Liepa's minimum-weight search (the worst dihedral angle to the
 ///   neighbouring triangles first, then area), above it by projection onto
@@ -374,7 +377,7 @@ mod tests {
     use super::*;
     use crate::analyze::{Analysis, AnalyzeOptions, analyze};
     use crate::test_util::*;
-    use crate::{boundary_loops, weld};
+    use crate::{boundary_loops, orient, weld};
 
     fn analysis(mesh: &Mesh) -> Analysis {
         analyze(mesh, &AnalyzeOptions::default()).unwrap()
@@ -687,6 +690,50 @@ mod tests {
         for l in loops.iter().filter(|l| !l.closed) {
             assert!(r.skipped.contains(&(l.id, SkipReason::Unclean)));
         }
+    }
+
+    /// A wavy [`grid_without`]`(20)` with a 16-edge hole (cells 5..9 square)
+    /// and its rim triangle on edge `(5, 6)`-`(5, 7)` reversed.
+    fn hole_with_flipped_rim() -> Mesh {
+        let missing: Vec<(u32, u32)> = (5..9).flat_map(|x| (5..9).map(move |y| (x, y))).collect();
+        let (mut positions, triangles) = parts(&grid_without(20, &missing));
+        for p in positions.as_chunks_mut::<3>().0 {
+            p[2] = 0.2 * (0.3 * p[0]).sin() * (0.2 * p[1]).cos();
+        }
+        let mesh = mesh_of(&positions, &triangles);
+        let (a, b) = (6 * 21 + 5, 7 * 21 + 5);
+        let rim = triangles
+            .iter()
+            .position(|t| t.contains(&a) && t.contains(&b))
+            .unwrap();
+        flip(&mesh, &[rim as u32])
+    }
+
+    #[test]
+    fn hole_across_a_flipped_rim_triangle_is_unclean_until_oriented() {
+        let mut mesh = hole_with_flipped_rim();
+        let loops = boundary_loops(&mesh).unwrap();
+        let hole = loops.iter().find(|l| l.vertices.len() == 16).unwrap();
+        assert!(!hole.clean);
+        let options = FillOptions {
+            max_edges: Some(40),
+            ..FillOptions::default()
+        };
+        let before = parts(&mesh);
+        let (r, empty) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert!(empty && r.filled.is_empty());
+        assert!(r.skipped.contains(&(hole.id, SkipReason::Unclean)));
+        assert_eq!(parts(&mesh), before);
+
+        let (o, _) = edit(&mut mesh, orient);
+        assert_eq!(o.flipped_triangles, 1);
+        let loops = boundary_loops(&mesh).unwrap();
+        let hole = loops.iter().find(|l| l.vertices.len() == 16).unwrap();
+        assert!(hole.closed && hole.clean);
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.filled.len(), 1);
+        assert_eq!(r.filled[0].id, hole.id);
+        assert_sound(&mesh, 1);
     }
 
     #[test]

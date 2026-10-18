@@ -366,9 +366,13 @@ pub struct BoundaryLoop {
     /// by the fan walk: the vertex touches a non-manifold edge, or it is a
     /// pinch whose fan pieces are wound against each other, so the walk fell
     /// back to pairing by edge key. The loop may then be open or join openings
-    /// that are not one hole. This fails safe: unclean loops are skipped by
-    /// `fill_holes` unless allowed, and orienting first makes a wound-against
-    /// pinch clean.
+    /// that are not one hole. Also `false` when the loop crosses an
+    /// orientation seam: it walks some boundary edge against its triangle's
+    /// direction, or it passes a vertex where outgoing and incoming boundary
+    /// edges do not balance (a reversed triangle on the rim), so it may run
+    /// backwards around its hole. This fails safe: unclean loops are skipped
+    /// by `fill_holes` unless allowed, and orienting first makes a
+    /// wound-against pinch or a flipped rim triangle clean.
     pub clean: bool,
 }
 
@@ -397,7 +401,8 @@ pub(crate) fn fnv1a(ids: &[VertexId]) -> u64 {
 /// there are several): two holes sharing one vertex are two loops. Where the
 /// fan reaches a non-manifold edge, the outgoing boundary edges at that
 /// vertex are paired in key order instead, and loops through a vertex on a
-/// non-manifold edge are marked unclean.
+/// non-manifold edge are marked unclean. So are loops that cross an
+/// orientation seam (see [`BoundaryLoop::clean`]).
 ///
 /// Walks first start at chain heads, vertices with more outgoing than
 /// incoming boundary half-edges, so that an open chain is walked whole from
@@ -471,6 +476,11 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
         loop {
             visited[cur.edge] = true;
             push(&mut verts, cur.from)?;
+            // An edge walked against its triangle's direction lies past an
+            // orientation seam: the loop may run backwards around its hole.
+            if !runs_forward(mesh, cur) {
+                clean = false;
+            }
             let b = cur.to;
             let lo = half.partition_point(|s| s.from < b);
             let hi = lo + half[lo..].iter().take_while(|s| s.from == b).count();
@@ -513,7 +523,12 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
                 }
             }
         }
-        if verts.iter().any(|&v| non_manifold[v as usize]) {
+        // A vertex with unbalanced boundary half-edges is where a reversed
+        // edge meets the loop; a closed loop through it crosses a seam.
+        if verts
+            .iter()
+            .any(|&v| non_manifold[v as usize] || (closed && excess[v as usize] != 0))
+        {
             clean = false;
         }
         push(&mut loops, make_loop(mesh, &verts, closed, clean)?)?;
@@ -522,6 +537,12 @@ pub(crate) fn loops_with(mesh: &Mesh, edges: &EdgeMap) -> Result<Vec<BoundaryLoo
         (a.id.min_vertex, &a.vertices).cmp(&(b.id.min_vertex, &b.vertices))
     });
     Ok(loops)
+}
+
+/// Whether `s.tri` uses its edge in the direction `s.from -> s.to`.
+fn runs_forward(mesh: &Mesh, s: Step) -> bool {
+    let [x, y, z] = mesh.triangles()[s.tri as usize];
+    [(x, y), (y, z), (z, x)].contains(&(s.from, s.to))
 }
 
 /// At a pinch vertex `b`, the boundary half-edge that continues the hole
@@ -934,14 +955,14 @@ mod tests {
     #[test]
     fn fixtures_sanity() {
         // Möbius: one component, one boundary curve of 2n edges, walked across
-        // the orientation seam.
+        // the orientation seam, so it is unclean.
         let m = mobius(12);
         let map = EdgeMap::build(&m).unwrap();
         assert_eq!(components(&m, &map).unwrap().len(), 1);
         let loops = boundary_loops(&m).unwrap();
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].vertices.len(), 24);
-        assert!(loops[0].clean);
+        assert!(loops[0].closed && !loops[0].clean);
         // Two punched holes in a sphere give two loops in one component.
         let punched = punch_holes(
             &uv_sphere(16, 16, 1.0),

@@ -26,7 +26,9 @@
 //! - Hole filling: [`fill_holes`] closes the boundary loops chosen by size
 //!   or by id with triangle patches that agree with their neighbours' winding
 //!   and never make an edge non-manifold, refined to the surrounding density
-//!   and faired to continue the surrounding curvature.
+//!   and faired to continue the surrounding curvature. Run [`orient()`]
+//!   first on meshes that may contain flipped triangles: a hole whose rim
+//!   crosses an orientation seam is not clean and is skipped.
 
 mod analyze;
 mod cleanup;
