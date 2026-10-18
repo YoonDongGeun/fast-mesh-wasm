@@ -446,7 +446,7 @@ fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
         };
         match c {
             Change::Edit(..) => e.flag_unknown(),
-            Change::Placement { .. } => e.report.placement_changed = true,
+            Change::Placement { .. } => e.report_placement(),
         }
     }
     for c in &step.changes {

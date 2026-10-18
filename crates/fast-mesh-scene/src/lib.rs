@@ -22,9 +22,15 @@
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
 //! - Change reports: [`Scene::take_changes`] drains one [`MeshChanges`] per
-//!   affected mesh.
+//!   affected mesh. Further consumers each get their own copy of every
+//!   report: [`Scene::subscribe`], [`Scene::take_changes_for`] and
+//!   [`Scene::unsubscribe`].
 //! - Maintenance: [`Scene::add_channel`], [`Scene::remove_channel`],
-//!   [`Scene::derived_channel_mut`] and [`Scene::compact`].
+//!   [`Scene::derived_channel_mut`] (all three reported, and the `field:`
+//!   prefix reserved) and [`Scene::compact`].
+//! - Local space: [`Scene::bvh`] (current BVHs only),
+//!   [`Scene::relative_transform`], [`Scene::world_to_local`] and
+//!   [`Scene::local_to_world`].
 //! - World queries, in world `f64` coordinates: [`Scene::raycast`],
 //!   [`Scene::closest_point`] and [`Scene::closest_point_on`], and between
 //!   two meshes [`Scene::intersects`], [`Scene::mesh_distance`] and
@@ -53,5 +59,5 @@ pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
 };
-pub use report::MeshChanges;
+pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};
