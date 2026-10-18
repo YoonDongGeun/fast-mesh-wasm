@@ -3,7 +3,7 @@
 import * as THREE from "three";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type MeshHandle, Scene, type Vec3 } from "../src/node.js";
+import { FastMeshError, type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import {
   attachTransformControls,
   type BoundMesh,
@@ -43,6 +43,16 @@ class MockControls extends THREE.EventDispatcher<any> implements TransformContro
     this.object!.quaternion.copy(quaternion);
     this.dispatchEvent({ type: "objectChange" });
   }
+}
+
+function codeOf(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (e) {
+    expect(e).toBeInstanceOf(FastMeshError);
+    return (e as FastMeshError).code;
+  }
+  throw new Error("expected a throw");
 }
 
 let scenes: Scene[] = [];
@@ -177,6 +187,9 @@ describe("attachTransformControls", () => {
     // Ctrl+Z while dragging: the drag ends first, then is undone whole.
     expect(s.undo()).toBe(true);
     expect(s.canUndo()).toBe(false);
+    // The next gizmo event already shows the restored placement.
+    controls.moveObject([8, 5, 6]);
+    expectClose(bound.object.matrix.elements, start);
     runFrames(); // the pending pose is dropped
     s.commitFrame();
     // The object follows the restored placement through the change stream.
@@ -255,6 +268,86 @@ describe("attachTransformControls", () => {
     expect(s.canUndo()).toBe(true);
     s.undo();
     expect(s.canUndo()).toBe(false);
+  });
+
+  it("remove_mesh_mid_drag", () => {
+    const { s, m, controls, runFrames, detach } = setup();
+    const g = box([0, 0, 0], [1, 1, 1]);
+    const other = s.addMesh(g.positions, g.indices);
+    controls.setDragging(true);
+    controls.moveObject([4, 5, 6]);
+    runFrames();
+    controls.moveObject([5, 5, 6]);
+    s.removeMesh(m);
+    // The pending pose is dropped without a throw, before and after the frame.
+    expect(() => runFrames()).not.toThrow();
+    s.commitFrame();
+    controls.moveObject([6, 5, 6]);
+    expect(() => runFrames()).not.toThrow();
+    expect(() => controls.setDragging(false)).not.toThrow();
+    // No drag or step is left open: another mesh can be dragged.
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+    const next = s.drag(other);
+    next.move({ rotation: [0, 0, 0, 1], translation: [1, 0, 0] });
+    next.end();
+    // Later gestures are ignored, and detach does not throw.
+    controls.setDragging(true);
+    controls.moveObject([7, 7, 7]);
+    controls.setDragging(false);
+    expect(() => detach()).not.toThrow();
+  });
+
+  it("remove_mesh_mid_drag_before_the_frame_commit", () => {
+    // Removal seen first by a failing move (no commitFrame in between).
+    const { s, m, controls, runFrames, detach } = setup();
+    controls.setDragging(true);
+    controls.moveObject([4, 5, 6]);
+    // Simulate a removal the scene did not report to the drag.
+    vi.spyOn(s, "setPlacement").mockImplementation(() => {
+      throw new FastMeshError("UNKNOWN_MESH", "gone");
+    });
+    expect(() => runFrames()).not.toThrow();
+    vi.restoreAllMocks();
+    expect(() => controls.setDragging(false)).not.toThrow();
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+    expect(() => detach()).not.toThrow();
+    void m;
+  });
+
+  it("gesture_that_cannot_start_a_drag_is_ignored", () => {
+    const { s, m, bound, controls, detach } = setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = box([0, 0, 0], [1, 1, 1]);
+    const other = s.addMesh(g.positions, g.indices);
+    s.clearHistory();
+    const busy = s.drag(other);
+    // Another drag is active: the gesture is ignored, not thrown.
+    expect(() => controls.setDragging(true)).not.toThrow();
+    controls.moveObject([9, 9, 9]);
+    controls.setDragging(false);
+    // The gizmo's pose is put back where the scene has the mesh.
+    expectPoseMatchesScene(s, m, bound);
+    controls.setDragging(true);
+    controls.setDragging(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    busy.end();
+    expect(s.canUndo()).toBe(false);
+    detach();
+  });
+
+  it("detach_removes_listeners_even_when_finish_throws", () => {
+    const { s, controls, detach } = setup();
+    const off = vi.spyOn(controls, "removeEventListener");
+    controls.setDragging(true);
+    controls.moveObject([1, 0, 0]);
+    // Make the final move fail with an unexpected error.
+    vi.spyOn(s, "setPlacement").mockImplementation(() => {
+      throw new Error("boom");
+    });
+    expect(() => detach()).toThrow("boom");
+    expect(off).toHaveBeenCalledTimes(2);
+    // The drag was still ended.
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
   });
 
   it("real_transform_controls_fire_dragging_changed", () => {

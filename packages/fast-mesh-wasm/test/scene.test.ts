@@ -456,6 +456,30 @@ describe("Scene", () => {
     expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
   });
 
+  it("remove_mesh_mid_drag_ends_it", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    const other = s.addMesh(quad, quadTris);
+    s.clearHistory();
+    const drag = s.drag(mesh);
+    drag.move({ rotation: IDENTITY, translation: [2, 0, 0] });
+    // Removing another mesh leaves the drag alone.
+    s.removeMesh(other);
+    expect(drag.active).toBe(true);
+    s.removeMesh(mesh);
+    expect(drag.active).toBe(false);
+    // The mesh's history, the drag's step included, goes with it.
+    expect(s.canUndo()).toBe(false);
+    expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [3, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    drag.end();
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+    // No step is left open, and a new drag can start.
+    const third = s.addMesh(quad, quadTris);
+    s.drag(third).end();
+  });
+
   it("step_calls_during_drag_abandon_it", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);

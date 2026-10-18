@@ -165,6 +165,40 @@ describe("bindSection", () => {
     expect(material.clippingPlanes).toEqual([own]);
   });
 
+  it("material_arrays_are_each_clipped", () => {
+    const { s, ba, sec } = setup();
+    const first = new THREE.MeshStandardMaterial();
+    const second = new THREE.MeshStandardMaterial();
+    ba.object.material = [first, second];
+    const bs = bindSection(s, sec, [ba]);
+    expect(first.clippingPlanes).toEqual([bs.plane]);
+    expect(second.clippingPlanes).toEqual([bs.plane]);
+    bs.dispose();
+    expect(first.clippingPlanes).toBeNull();
+    expect(second.clippingPlanes).toBeNull();
+  });
+
+  it("plane_follows_set_section_plane_for_lazy_meshes", () => {
+    const { s, a, b, ba, bb, sec } = setup();
+    s.setMode(a, "lazy");
+    s.setMode(b, "lazy");
+    s.commitFrame();
+    const bs = bindSection(s, sec, [ba, bb]);
+    const before = positionsOf(linesOf(bs, 0));
+    s.setSectionPlane(sec, { origin: [0, 0, 0.25], normal: [0, 0, 1] });
+    s.commitFrame();
+    // The plane moves on the next frame; the lazy results (and lines) lag.
+    expect(bs.plane.constant).toBeCloseTo(-0.25, 12);
+    expect(s.section(sec, a).status).toBe("stale");
+    expect(positionsOf(linesOf(bs, 0))).toEqual(before);
+    // Once computed, the lines follow.
+    s.updateSections();
+    s.commitFrame();
+    expect(positionsOf(linesOf(bs, 0))).toEqual(expectedLines(s, sec, a));
+    expect(positionsOf(linesOf(bs, 0))).not.toEqual(before);
+    bs.dispose();
+  });
+
   it("uncut_or_removed_meshes_and_sections_draw_nothing", () => {
     const { s, a, b, ba, bb, sec } = setup();
     s.setSectionMeshes(sec, [a]);
@@ -183,7 +217,8 @@ describe("bindSection", () => {
     s.removeSection(sec);
     s.commitFrame();
     expect(positionsOf(linesOf(bs, 1))).toEqual([]);
-    expect((bb.object.material as THREE.Material).clippingPlanes).toEqual([bs.plane]);
+    // Its clipping goes with it.
+    expect((bb.object.material as THREE.Material).clippingPlanes).toBeNull();
     bs.dispose();
     expect((bb.object.material as THREE.Material).clippingPlanes).toBeNull();
     ba.dispose();

@@ -34,7 +34,8 @@ export interface BoundSection {
    */
   readonly plane: THREE.Plane;
   /**
-   * Stops following the scene, removes the plane from the materials and
+   * Stops following the scene, removes the plane from the materials (if the
+   * section's removal has not already) and
    * disposes the geometries and the line and fill materials. Safe to call
    * more than once. The group stays wherever it was added.
    */
@@ -99,8 +100,9 @@ function resultOf(scene: Scene, section: SectionHandle, bound: BoundMesh): Secti
  *
  * The plane is added to each bound mesh's `material.clippingPlanes` (unless
  * `clip` is `false`), which three applies only when the renderer has
- * `renderer.localClippingEnabled = true`. A material shared by several bound
- * meshes gets the plane once.
+ * `renderer.localClippingEnabled = true`. A mesh with an array of materials
+ * has the plane added to each; a material shared by several bound meshes
+ * gets it once.
  *
  * The lines and fill of a bound mesh are rebuilt when a frame's
  * `sectionsChanged` lists the section for it; a mesh the section does not
@@ -108,7 +110,7 @@ function resultOf(scene: Scene, section: SectionHandle, bound: BoundMesh): Secti
  * computed: a `"lazy"` or `"manual"` mesh's lag until the scene computes
  * them. The plane follows {@link Scene.setSectionPlane} on the next frame.
  * When the section is removed, the drawing is emptied and stops following
- * the scene; the clipping stays until {@link BoundSection.dispose}.
+ * the scene, and the plane is taken off the materials.
  *
  * Like `bindMesh`, it only listens through {@link Scene.onChanges}: call
  * `scene.commitFrame()` once per animation frame.
@@ -174,16 +176,26 @@ export function bindSection(
   const clipped: { material: THREE.Material; created: boolean }[] = [];
   if (options.clip ?? true) {
     for (const b of bound) {
-      const material = b.object.material as THREE.Material;
-      if (clipped.some((c) => c.material === material)) {
-        continue;
+      const materials = b.object.material;
+      for (const material of Array.isArray(materials) ? materials : [materials]) {
+        if (clipped.some((c) => c.material === material)) {
+          continue;
+        }
+        const created = material.clippingPlanes === null;
+        material.clippingPlanes = [...(material.clippingPlanes ?? []), plane];
+        material.needsUpdate = true;
+        clipped.push({ material, created });
       }
-      const created = material.clippingPlanes === null;
-      material.clippingPlanes = [...(material.clippingPlanes ?? []), plane];
-      material.needsUpdate = true;
-      clipped.push({ material, created });
     }
   }
+  /** Takes the plane off the materials it was added to. */
+  const unclip = () => {
+    for (const { material, created } of clipped.splice(0)) {
+      const rest = (material.clippingPlanes ?? []).filter((p) => p !== plane);
+      material.clippingPlanes = rest.length === 0 && created ? null : rest;
+      material.needsUpdate = true;
+    }
+  };
 
   let unsubscribe: (() => void) | undefined;
   const detach = () => {
@@ -196,10 +208,11 @@ export function bindSection(
       plane = scene.sectionPlane(section);
     } catch (error) {
       if (error instanceof FastMeshError && error.code === "UNKNOWN_SECTION") {
-        // Removed: nothing left to draw or follow.
+        // Removed: nothing left to draw, clip or follow.
         for (const e of entries) {
           rebuild(e);
         }
+        unclip();
         detach();
         return;
       }
@@ -228,11 +241,7 @@ export function bindSection(
         return;
       }
       disposed = true;
-      for (const { material, created } of clipped) {
-        const rest = (material.clippingPlanes ?? []).filter((p) => p !== plane);
-        material.clippingPlanes = rest.length === 0 && created ? null : rest;
-        material.needsUpdate = true;
-      }
+      unclip();
       for (const e of entries) {
         e.lines.geometry.dispose();
         e.fill.geometry.dispose();

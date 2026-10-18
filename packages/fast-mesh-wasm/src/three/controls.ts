@@ -3,6 +3,7 @@
 // one `move` per animation frame.
 import type * as THREE from "three";
 import type { Quat, Vec3 } from "../api.js";
+import { FastMeshError } from "../core.js";
 import type { DragSession, Scene } from "../scene.js";
 import type { BoundMesh } from "./mesh.js";
 
@@ -23,6 +24,11 @@ export interface AttachTransformControlsOptions {
    * Schedules a callback for the next animation frame. Defaults to
    * `requestAnimationFrame` (or a 16 ms timeout where there is none). Tests
    * can collect the callbacks and run them by hand.
+   *
+   * With the default, the move may run after the app's `commitFrame()` in the
+   * same frame, so the scene (fields, sections) shows it a frame late. To
+   * avoid that lag, pass a scheduler that queues the callback and drain the
+   * queue right before calling `commitFrame()`.
    */
   schedule?: (callback: () => void) => void;
 }
@@ -80,7 +86,9 @@ function rotate(q: Quat, v: Readonly<Vec3>): Vec3 {
  * scene lags by up to a frame); once the drag ends, the final placement is
  * applied. When the drag is ended by the scene instead (`undo()` while
  * dragging, for example), the object follows the scene again and the rest
- * of the gesture is ignored.
+ * of the gesture is ignored. When the mesh is removed, the drag ends
+ * (no step is left open) and the attachment goes idle. A gesture that
+ * cannot start a drag (another drag is active) is ignored with a warning.
  */
 export function attachTransformControls(
   controls: TransformControlsLike,
@@ -98,6 +106,9 @@ export function attachTransformControls(
   let pending: Pose | undefined;
   let scheduled = false;
   let attached = true;
+  /** The mesh was removed: no more scene calls about it. */
+  let gone = false;
+  let warned = false;
 
   /** Puts the object where the scene has it and its pose in step. */
   const syncFromScene = () => {
@@ -106,12 +117,43 @@ export function attachTransformControls(
     object.matrixWorldNeedsUpdate = true;
   };
 
+  /**
+   * Runs a scene call about the mesh; when the mesh turns out to be removed
+   * (`UNKNOWN_MESH`), marks it gone and returns false. Other errors propagate.
+   */
+  const guarded = (run: () => void): boolean => {
+    if (gone) {
+      return false;
+    }
+    try {
+      run();
+      return true;
+    } catch (error) {
+      if (error instanceof FastMeshError && error.code === "UNKNOWN_MESH") {
+        gone = true;
+        return false;
+      }
+      throw error;
+    }
+  };
+
+  /** Lets go of the drag: ends it if the scene has not, drops the pending pose. */
+  const release = () => {
+    const d = drag;
+    drag = undefined;
+    pending = undefined;
+    if (d?.active) {
+      d.end();
+    }
+  };
+
   /** The drag, if it is still ours and live. */
   const live = (): DragSession | undefined => {
     if (drag !== undefined && !drag.active) {
-      // The scene ended it (undo, redo, a step call): stop following the gizmo.
-      drag = undefined;
-      pending = undefined;
+      // The scene ended it (undo, redo, a step call): stop following the
+      // gizmo and show where the scene has the mesh now.
+      release();
+      guarded(syncFromScene);
     }
     return drag;
   };
@@ -124,10 +166,15 @@ export function attachTransformControls(
       return;
     }
     const r = rotate(pose.rotation, origin);
-    d.move({
-      rotation: pose.rotation,
-      translation: [pose.position[0] - r[0], pose.position[1] - r[1], pose.position[2] - r[2]],
-    });
+    const moved = guarded(() =>
+      d.move({
+        rotation: pose.rotation,
+        translation: [pose.position[0] - r[0], pose.position[1] - r[1], pose.position[2] - r[2]],
+      }),
+    );
+    if (!moved) {
+      release();
+    }
   };
 
   const onFrame = () => {
@@ -138,33 +185,47 @@ export function attachTransformControls(
   };
 
   const begin = () => {
-    if (grabbed || controls.object !== object) {
+    if (grabbed || gone || controls.object !== object) {
       return;
     }
-    const p = scene.placement(mesh);
-    const m = scene.matrix4(mesh);
-    const r = p.rotation;
-    const d: Vec3 = [m[12] - p.translation[0], m[13] - p.translation[1], m[14] - p.translation[2]];
-    // Rᵀ d, with R row-major.
-    origin = [
-      r[0] * d[0] + r[3] * d[1] + r[6] * d[2],
-      r[1] * d[0] + r[4] * d[1] + r[7] * d[2],
-      r[2] * d[0] + r[5] * d[1] + r[8] * d[2],
-    ];
-    drag = scene.drag(mesh);
-    grabbed = true;
+    try {
+      const p = scene.placement(mesh);
+      const m = scene.matrix4(mesh);
+      const r = p.rotation;
+      const d: Vec3 = [m[12] - p.translation[0], m[13] - p.translation[1], m[14] - p.translation[2]];
+      // Rᵀ d, with R row-major.
+      origin = [
+        r[0] * d[0] + r[3] * d[1] + r[6] * d[2],
+        r[1] * d[0] + r[4] * d[1] + r[7] * d[2],
+        r[2] * d[0] + r[5] * d[1] + r[8] * d[2],
+      ];
+      drag = scene.drag(mesh);
+      grabbed = true;
+    } catch (error) {
+      // Thrown from TransformControls' pointer handler, this would break the
+      // gizmo: ignore the gesture instead (another drag is active, say).
+      if (!warned) {
+        warned = true;
+        console.warn("fast-mesh-wasm/three: cannot start a drag; the gesture is ignored.", error);
+      }
+    }
   };
 
   const finish = () => {
     if (!grabbed) {
+      // An ignored gesture: put back what the gizmo moved.
+      if (controls.object === object) {
+        guarded(syncFromScene);
+      }
       return;
     }
     grabbed = false;
-    flush();
-    const d = live();
-    drag = undefined;
-    d?.end();
-    syncFromScene();
+    try {
+      flush();
+    } finally {
+      release();
+    }
+    guarded(syncFromScene);
   };
 
   const onDraggingChanged = (event: { value?: unknown }) => {
@@ -197,7 +258,15 @@ export function attachTransformControls(
   // which has just written the matrix from the scene.
   const unsubscribe = scene.onChanges((changes) => {
     for (const c of changes) {
-      if (c.mesh !== mesh || c.removed || !c.placementChanged) {
+      if (c.mesh !== mesh) {
+        continue;
+      }
+      if (c.removed) {
+        gone = true;
+        release();
+        continue;
+      }
+      if (!c.placementChanged) {
         continue;
       }
       if (live() !== undefined) {
@@ -217,11 +286,14 @@ export function attachTransformControls(
     if (!attached) {
       return;
     }
-    finish();
     attached = false;
-    pending = undefined;
-    controls.removeEventListener("dragging-changed", onDraggingChanged);
-    controls.removeEventListener("objectChange", onObjectChange);
-    unsubscribe();
+    try {
+      finish();
+    } finally {
+      pending = undefined;
+      controls.removeEventListener("dragging-changed", onDraggingChanged);
+      controls.removeEventListener("objectChange", onObjectChange);
+      unsubscribe();
+    }
   };
 }
