@@ -68,13 +68,28 @@ export interface MeshChange {
 /**
  * A drag of one mesh: every {@link DragSession.move} until
  * {@link DragSession.end} is one undo step.
+ *
+ * The drag is over once it is ended or cancelled, and also when its step goes
+ * away without it: an `undo()`, `redo()` or `clearHistory()` ends it first, and
+ * a `cancelStep()` (or an `endStep()` that closes the drag's step) abandons it.
  */
 export interface DragSession {
   /** Sets the mesh's placement. Throws `INVALID_ARGUMENT` once the drag is over. */
   move(placement: PlacementInput): void;
-  /** Finishes the drag, recording it as one undo step. A no-op once it is over. */
+  /**
+   * Finishes the drag, recording it as one undo step (closing any step levels
+   * opened inside it too). A no-op once it is over.
+   */
   end(): void;
-  /** Puts the placement back to where the drag started and records nothing. A no-op once it is over. */
+  /**
+   * Puts the placement back to where the drag started and records nothing. A
+   * no-op once it is over.
+   *
+   * When no step was open at `drag()`, this reverts the drag's whole step, so
+   * edits made during the drag (including in steps opened inside it) are
+   * reverted too. Inside a caller's step, it restores the placement and closes
+   * the drag's levels, leaving the caller's step open.
+   */
   cancel(): void;
 }
 
@@ -98,6 +113,15 @@ export interface SceneOptions {
    * that grew the WebAssembly memory (it is then detached). Off by default.
    */
   debug?: boolean;
+}
+
+/** The scene's view of its active drag. */
+interface ActiveDrag {
+  /** The step depth right after the drag's `beginStep`. */
+  depth: number;
+  end(): void;
+  /** Marks the drag over without touching the history (its step is gone). */
+  abandon(): void;
 }
 
 const MODES: Record<UpdateMode, number> = { eager: 0, lazy: 1, manual: 2 };
@@ -174,7 +198,7 @@ export class Scene {
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
   /** History step nesting depth, mirrored from the calls made through this class. */
   #stepDepth = 0;
-  #drag: { end(): void } | undefined;
+  #drag: ActiveDrag | undefined;
 
   constructor(options: SceneOptions = {}) {
     ensureInitialized("new Scene()");
@@ -388,8 +412,14 @@ export class Scene {
         ),
       }),
     );
-    // Every removal is in this message (or was never reported, for a mesh
-    // added and removed in between), so removed handles can go.
+    // A removed mesh's id never matches again: drop its handle, whatever
+    // removed it. Every removal is in this message (or was never reported,
+    // for a mesh added and removed in between), so removed handles can go.
+    for (const c of raw) {
+      if (c.removed) {
+        this.#meshes.delete(`${c.index}:${c.generation}`);
+      }
+    }
     this.#removed.clear();
     return out;
   }
@@ -430,8 +460,10 @@ export class Scene {
   // ---- History ----
 
   /**
-   * Undoes the latest step; an active drag is ended first, so it is what gets
-   * undone. Returns `false` when there is nothing to undo.
+   * Undoes the latest step; an active drag is ended first. Without an open
+   * step around the drag, the drag is what gets undone; inside a caller's
+   * open step, that whole step (drag included) is closed and undone. Returns
+   * `false` when there is nothing to undo.
    */
   undo(): boolean {
     const s = this.#scene();
@@ -486,6 +518,10 @@ export class Scene {
     const s = this.#scene();
     call(() => s.end_step());
     this.#stepDepth--;
+    // The caller closed the drag's step themselves.
+    if (this.#drag !== undefined && this.#stepDepth < this.#drag.depth) {
+      this.#drag.abandon();
+    }
   }
 
   /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
@@ -493,6 +529,8 @@ export class Scene {
     const s = this.#scene();
     call(() => s.cancel_step());
     this.#stepDepth = 0;
+    // The drag's step is gone with it: later moves must not record steps.
+    this.#drag?.abandon();
   }
 
   /**
@@ -507,6 +545,7 @@ export class Scene {
     const start = this.placement(mesh);
     const outermost = this.#stepDepth === 0;
     this.beginStep();
+    const depth = this.#stepDepth;
     let active = true;
     const finish = (): boolean => {
       if (!active) {
@@ -516,7 +555,14 @@ export class Scene {
       this.#drag = undefined;
       return true;
     };
-    const session: DragSession = {
+    // Closes the drag's level and any opened inside it.
+    const close = () => {
+      while (this.#stepDepth >= depth) {
+        this.endStep();
+      }
+    };
+    const session: DragSession & ActiveDrag = {
+      depth,
       move: (placement) => {
         if (!active) {
           throw invalid("the drag is over");
@@ -525,7 +571,7 @@ export class Scene {
       },
       end: () => {
         if (finish()) {
-          this.endStep();
+          close();
         }
       },
       cancel: () => {
@@ -543,8 +589,11 @@ export class Scene {
         try {
           this.setPlacement(mesh, start);
         } finally {
-          this.endStep();
+          close();
         }
+      },
+      abandon: () => {
+        finish();
       },
     };
     this.#drag = session;

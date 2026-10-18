@@ -8,6 +8,7 @@ import {
   type MeshHandle,
   Scene,
 } from "../src/node.js";
+import { decodeChanges } from "../src/changes.js";
 import { wasmMemory } from "../src/core.js";
 
 // Two triangles on the XY plane facing +Z, and a third tilted one.
@@ -399,6 +400,82 @@ describe("Scene", () => {
     next.end();
     expect(s.undo()).toBe(true);
     expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
+  });
+
+  it("step_calls_during_drag_abandon_it", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+
+    // cancelStep takes the drag's step away: the drag is over.
+    const d = s.drag(mesh);
+    d.move({ rotation: IDENTITY, translation: [1, 0, 0] });
+    s.cancelStep();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    expect(() => s.undo()).not.toThrow();
+    expect(() => d.move({ rotation: IDENTITY, translation: [2, 0, 0] })).toThrow("the drag is over");
+    d.end();
+    d.cancel();
+    expect(s.canUndo()).toBe(false);
+
+    // The caller's endStep closing an outermost drag's step: recorded, and over.
+    const e = s.drag(mesh);
+    e.move({ rotation: IDENTITY, translation: [3, 0, 0] });
+    s.endStep();
+    expect(() => e.end()).not.toThrow();
+    expect(() => e.move({ rotation: IDENTITY, translation: [4, 0, 0] })).toThrow("the drag is over");
+    expect(s.undo()).toBe(true);
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+
+    // Nested: closing the drag's level leaves the caller's step to them.
+    s.beginStep();
+    const n = s.drag(mesh);
+    n.move({ rotation: IDENTITY, translation: [5, 0, 0] });
+    s.endStep();
+    n.end();
+    s.endStep();
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+
+    // A step opened inside the drag closes with it.
+    const m = s.drag(mesh);
+    s.beginStep();
+    m.move({ rotation: IDENTITY, translation: [6, 0, 0] });
+    m.end();
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+    expect(s.undo()).toBe(true);
+    expect(s.placement(mesh).translation).toEqual([5, 0, 0]);
+  });
+
+  it("empty_views_do_not_warn", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = scene({ debug: true });
+    const mesh = s.addMesh(quad, []);
+    expect(s.views(mesh).indices().length).toBe(0);
+    const before = wasmMemory().buffer;
+    const big = grid(300);
+    for (let k = 0; k < 50 && wasmMemory().buffer === before; k++) {
+      s.addMesh(big.positions, big.indices);
+    }
+    expect(wasmMemory().buffer).not.toBe(before);
+    s.views(mesh).positions();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("decoder_rejects_malformed_messages", () => {
+    expect(decodeChanges(new Uint32Array([0]))).toEqual([]);
+    expect(() => decodeChanges(new Uint32Array([0, 7]))).toThrow("trailing");
+    expect(() => decodeChanges(new Uint32Array([1, 0, 0]))).toThrow("truncated");
+    const [c] = decodeChanges(new Uint32Array([1, 3, 1, 4 | 32, 1, 2, 3, 0, 0, 1, 0, 1, 2, 5, 6, 1, 9]));
+    expect(c).toMatchObject({
+      index: 3,
+      generation: 1,
+      placementChanged: true,
+      positions: [[2, 3]],
+      normals: "all",
+      colors: [],
+      indices: [[0, 1]],
+      fields: [5, 6],
+      sections: [9],
+    });
   });
 
   it("free_then_use_throws", () => {

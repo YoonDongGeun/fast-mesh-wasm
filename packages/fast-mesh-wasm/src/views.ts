@@ -51,7 +51,10 @@ export class ViewGuard {
       // Bound the list between memory growths: drop collected views.
       this.#views = this.#views.filter((r) => r.deref() !== undefined);
     }
-    this.#views.push(new WeakRef(view));
+    // An empty view reads the same detached or not: nothing to warn about.
+    if (view.byteLength > 0) {
+      this.#views.push(new WeakRef(view));
+    }
     return view;
   }
 }

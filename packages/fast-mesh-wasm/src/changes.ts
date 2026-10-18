@@ -78,5 +78,8 @@ export function decodeChanges(msg: Uint32Array): RawChange[] {
       sections: ids(),
     });
   }
+  if (at !== msg.length) {
+    throw new Error("fast-mesh-wasm: trailing words in change message");
+  }
   return out;
 }

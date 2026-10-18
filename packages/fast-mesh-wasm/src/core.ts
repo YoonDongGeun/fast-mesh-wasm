@@ -82,15 +82,25 @@ function poisonedError(): FastMeshError {
 // Messages from Rust read "<CODE>: <text>".
 const CODED = /^([A-Z_]+): ([\s\S]*)$/;
 
-// Stack exhaustion: V8 and JavaScriptCore throw a RangeError with this text.
+// Stack exhaustion: V8 and JavaScriptCore throw a RangeError with this text;
+// Firefox throws `InternalError: too much recursion` (a non-standard class,
+// matched by name).
 const STACK_EXHAUSTED = /call stack/i;
+
+function stackExhausted(e: unknown): boolean {
+  return (
+    (e instanceof RangeError && STACK_EXHAUSTED.test(e.message)) ||
+    (e instanceof Error && e.name === "InternalError")
+  );
+}
 
 /**
  * Runs a call into WebAssembly. A coded Rust error becomes a
  * {@link FastMeshError}; a trap (a Rust panic) poisons the instance, and from
  * then on every call throws `INSTANCE_POISONED` without entering WebAssembly.
  *
- * Stack exhaustion (a `RangeError` about the call stack) poisons too: it can
+ * Stack exhaustion (a `RangeError` about the call stack, or Firefox's
+ * `InternalError`) poisons too: it can
  * unwind out of WebAssembly mid-call, leaving Rust's state half-updated.
  * Other errors, including messages with a `PREFIX: ` that is not a known
  * code, pass through unchanged, so a foreign error is never relabelled.
@@ -102,10 +112,7 @@ export function call<T>(fn: () => T): T {
   try {
     return fn();
   } catch (e) {
-    if (
-      e instanceof WebAssembly.RuntimeError ||
-      (e instanceof RangeError && STACK_EXHAUSTED.test(e.message))
-    ) {
+    if (e instanceof WebAssembly.RuntimeError || stackExhausted(e)) {
       poisoned = true;
       throw poisonedError();
     }
