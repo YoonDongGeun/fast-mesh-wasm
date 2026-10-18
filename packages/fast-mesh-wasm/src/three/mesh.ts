@@ -5,7 +5,8 @@
 // fresh views into the mirrors.
 import * as THREE from "three";
 import { FastMeshError } from "../core.js";
-import type { MeshChange, MeshHandle, Range, Scene } from "../scene.js";
+import type { MeshChange, MeshHandle, Range } from "../scene.js";
+import type { SceneLike } from "../scene-like.js";
 
 /** Options of {@link bindMesh}. */
 export interface BindMeshOptions {
@@ -111,7 +112,7 @@ type BufferKey = keyof typeof BUFFERS;
 
 /**
  * Binds a scene mesh to a new THREE.Mesh and keeps it in sync on every
- * {@link Scene.commitFrame}: dirty ranges are copied into the attributes'
+ * {@link SceneLike.commitFrame}: dirty ranges are copied into the attributes'
  * mirrors and marked with `addUpdateRange`, attributes are recreated when the
  * mesh's slot counts change, the colour attribute comes and goes with the
  * mesh's colouring, and `object.matrix` follows its placement.
@@ -125,10 +126,10 @@ type BufferKey = keyof typeof BUFFERS;
  * the scene and leaves the object as it was (remove it from your THREE.Scene
  * and call {@link BoundMesh.dispose}).
  *
- * The adapter only listens through {@link Scene.onChanges}: call
+ * The adapter only listens through {@link SceneLike.onChanges}: call
  * `scene.commitFrame()` once per animation frame, before rendering.
  */
-export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOptions = {}): BoundMesh {
+export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOptions = {}): BoundMesh {
   const ownsMaterial = options.material === undefined;
   const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
   // The colour shown without colouring; vertex colours are multiplied by the
@@ -268,8 +269,9 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
    * the geometry. Returns whether positions or indices changed.
    */
   const apply = (change: MeshChange | undefined): boolean => {
-    const vs = scene.vertexSlots(mesh);
-    const ts = scene.triangleSlots(mesh);
+    const v = scene.views(mesh);
+    const vs = v.positions().length / 3;
+    const ts = v.indices().length / 3;
     const resized = vs !== vertexSlots || ts !== triangleSlots;
     vertexSlots = vs;
     triangleSlots = ts;

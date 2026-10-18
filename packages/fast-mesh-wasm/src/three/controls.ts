@@ -4,7 +4,8 @@
 import type * as THREE from "three";
 import type { Quat, Vec3 } from "../api.js";
 import { FastMeshError } from "../core.js";
-import type { DragSession, Scene } from "../scene.js";
+import type { DragSession } from "../scene.js";
+import type { SceneLike } from "../scene-like.js";
 import type { BoundMesh } from "./mesh.js";
 
 /**
@@ -92,7 +93,7 @@ function rotate(q: Quat, v: Readonly<Vec3>): Vec3 {
  */
 export function attachTransformControls(
   controls: TransformControlsLike,
-  scene: Scene,
+  scene: SceneLike,
   bound: BoundMesh,
   options: AttachTransformControlsOptions = {},
 ): () => void {
