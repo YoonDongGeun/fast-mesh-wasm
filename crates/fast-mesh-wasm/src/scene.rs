@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldId, MeshId, MeshOptions,
@@ -27,6 +28,9 @@ use fast_mesh_scene::{
 use fast_mesh_store::Mesh;
 use wasm_bindgen::prelude::*;
 
+use crate::edit::{
+    decode_edit, decode_repair, encode_added, encode_analysis, run_edit, run_repair,
+};
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode};
 
@@ -36,6 +40,9 @@ pub struct WasmScene {
     scene: Scene,
     /// The render state of every live mesh.
     render: BTreeMap<MeshId, RenderState>,
+    /// The update mode of every live mesh, as last set (the scene has no
+    /// getter for it).
+    modes: BTreeMap<MeshId, UpdateMode>,
 }
 
 /// The update mode of its binding code: 0 Eager, 1 Lazy, 2 Manual.
@@ -217,6 +224,7 @@ impl WasmScene {
         WasmScene {
             scene: Scene::new(SceneOptions::default()),
             render: BTreeMap::new(),
+            modes: BTreeMap::new(),
         }
     }
 
@@ -258,6 +266,7 @@ impl WasmScene {
         }
         let state = RenderState::new(self.scene.mesh(id)?);
         self.render.insert(id, state);
+        self.modes.insert(id, mode);
         Ok(vec![id.index(), id.generation()])
     }
 
@@ -266,6 +275,7 @@ impl WasmScene {
         let id = self.id(index, generation)?;
         self.scene.remove_mesh(id)?;
         self.render.remove(&id);
+        self.modes.remove(&id);
         Ok(())
     }
 
@@ -322,7 +332,10 @@ impl WasmScene {
     /// edits: 0 (Eager), 1 (Lazy) or 2 (Manual).
     pub fn set_mode(&mut self, index: u32, generation: u32, mode: u8) -> Result<(), Error> {
         let id = self.id(index, generation)?;
-        Ok(self.scene.set_mode(id, parse_mode(mode)?)?)
+        let mode = parse_mode(mode)?;
+        self.scene.set_mode(id, mode)?;
+        self.modes.insert(id, mode);
+        Ok(())
     }
 
     /// Brings the mesh's BVH, normals, fields and sections up to date now.
@@ -488,6 +501,95 @@ impl WasmScene {
     /// Reverts and discards the open step.
     pub fn cancel_step(&mut self) -> Result<(), Error> {
         Ok(self.scene.cancel_step()?)
+    }
+
+    // ---- Geometry edits and repair ----
+
+    /// Runs an edit op list on a mesh as one transaction: one undo step, and
+    /// nothing changes when an op fails. `ops` and `values` are laid out as
+    /// in [`crate::edit`]: `ops` is a `u32` sequence of op codes (0 set
+    /// positions, 1 add vertices, 2 add triangles, 3 remove triangles, 4
+    /// remove vertices) with their id lists, whose refs name ids added by
+    /// earlier ops of the list; `values` holds the world positions, mapped
+    /// to local with the placement inverse and the origin in `f64`, then
+    /// stored as `f32`. Returns `[n, id × n]` per op: the new vertex or
+    /// triangle ids, none for the other ops. The list is decoded and every
+    /// ref checked before the mesh is touched.
+    pub fn edit(
+        &mut self,
+        index: u32,
+        generation: u32,
+        ops: &[u32],
+        values: &[f64],
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let scene = &self.scene;
+        // The id is live, so the mapping cannot fail.
+        let decoded = decode_edit(ops, values, |q| {
+            scene.world_to_local(id, q).unwrap_or([f64::NAN; 3])
+        })?;
+        let added = self.scene.edit(id, |tx| run_edit(tx, &decoded))?;
+        encode_added(&added)
+    }
+
+    /// Removes the mesh's dead slots and renumbers the rest. Its next change
+    /// record reports every buffer as "all", with the capacity change; its
+    /// edits leave the history (placements stay).
+    pub fn compact(&mut self, index: u32, generation: u32) -> Result<(), Error> {
+        let id = self.id(index, generation)?;
+        self.scene.compact(id)?;
+        Ok(())
+    }
+
+    /// A read-only report of the mesh's defects, laid out as in
+    /// [`crate::edit::encode_analysis`]. `weld_tolerance` (local units,
+    /// equal to world units) groups coincident vertices; lists with a count
+    /// keep their first `max_listed` entries. `self_intersection` checks
+    /// for self-intersection with the mesh's BVH, which is brought up to
+    /// date first unless the mesh is Manual (then `STALE_BVH` when stale).
+    pub fn analyze(
+        &mut self,
+        index: u32,
+        generation: u32,
+        weld_tolerance: f32,
+        self_intersection: bool,
+        max_listed: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let manual = self.modes.get(&id) == Some(&UpdateMode::Manual);
+        if self_intersection && !manual && !self.scene.is_current(id)? {
+            self.scene.update(id)?;
+        }
+        let bvh = if self_intersection {
+            Some(self.scene.bvh(id)?)
+        } else {
+            None
+        };
+        let options = AnalyzeOptions {
+            weld_tolerance,
+            self_intersection: bvh,
+            max_listed: max_listed as usize,
+        };
+        let a = analyze(self.scene.mesh(id)?, &options).map_err(SceneError::Ops)?;
+        Ok(encode_analysis(&a)?)
+    }
+
+    /// Runs repair operations on a mesh, in order, in one transaction: one
+    /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
+    /// and `loops` (`u32`, loop ids for fill holes) are laid out as in
+    /// [`crate::edit`]; returns the reports concatenated in op order.
+    /// Lengths and areas in the options are in local units, equal to world
+    /// units.
+    pub fn repair(
+        &mut self,
+        index: u32,
+        generation: u32,
+        ops: &[f64],
+        loops: &[u32],
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let decoded = decode_repair(ops, loops)?;
+        Ok(self.scene.edit(id, |tx| run_repair(tx, &decoded))?)
     }
 
     // ---- Queries (world space) ----
@@ -1302,6 +1404,189 @@ mod tests {
             code(s.set_coloring(ai, ag, f, 0, &rule(&[]))),
             codes::UNKNOWN_FIELD
         );
+    }
+
+    /// An edit id list without refs.
+    fn ids(list: &[u32]) -> Vec<u32> {
+        let mut v = vec![list.len() as u32, 0];
+        v.extend_from_slice(list);
+        v
+    }
+
+    #[test]
+    fn edit_ops_atomic_with_refs() {
+        let mut s = WasmScene::new();
+        let (i, g) = add(&mut s, true);
+        // Quarter turn about z and a shift; the origin is (1, 1, 0).
+        let rot = [0., -1., 0., 1., 0., 0., 0., 0., 1.];
+        s.set_placement(i, g, &rot, &[10., 20., 30.]).unwrap();
+        s.clear_history().unwrap();
+        s.take_changes();
+        // Add a vertex at world t (local -origin), a triangle on it by ref,
+        // move vertex 2 to world (5, 25, 31), remove triangle 1.
+        let mut ops = vec![1, 1];
+        // Ids [1, _, 2]; slot 1 is id 0 of op 0.
+        ops.extend([2, 3, 1, 1, 0, 2, 1, 0, 0]);
+        ops.push(0);
+        ops.extend(ids(&[2]));
+        ops.push(3);
+        ops.extend(ids(&[1]));
+        let values = [10., 20., 30., 5., 25., 31.];
+        let added = s.edit(i, g, &ops, &values).unwrap();
+        assert_eq!(added, vec![1, 4, 1, 2, 0, 0]);
+        let id = s.id(i, g).unwrap();
+        let mesh = s.scene.mesh(id).unwrap();
+        assert_eq!(mesh.positions()[4], [-1., -1., 0.]);
+        assert_eq!(mesh.positions()[2], [4., 4., 1.]);
+        assert_eq!(mesh.triangle(2), Some([1, 4, 2]));
+        assert_eq!(mesh.triangle(1), None);
+        assert!(s.can_undo());
+        assert!(s.undo().unwrap());
+        assert!(!s.can_undo());
+        assert_eq!(s.vertex_count(i, g).unwrap(), 4);
+        s.take_changes();
+
+        // A failing op after one that wrote: nothing is left, no step.
+        let mut bad = vec![1, 1, 3];
+        bad.extend(ids(&[9]));
+        assert_eq!(
+            code(s.edit(i, g, &bad, &[0., 0., 0.])),
+            codes::INVALID_INDEX
+        );
+        // A bad ref is caught before the scene is touched.
+        let bad_ref = [1, 1, 4, 1, 1, 0, 0, 0, 1];
+        assert_eq!(
+            code(s.edit(i, g, &bad_ref, &[0., 0., 0.])),
+            codes::INVALID_INDEX
+        );
+        assert_eq!(s.vertex_slots(i, g).unwrap(), 5);
+        assert_eq!(s.vertex_count(i, g).unwrap(), 4);
+        // Nothing was recorded: the redo step survives.
+        assert!(!s.can_undo() && s.can_redo());
+        assert_eq!(s.take_changes(), vec![0]);
+        assert_eq!(code(s.edit(i, g + 1, &[], &[])), codes::UNKNOWN_MESH);
+    }
+
+    #[test]
+    fn compact_reports_all_and_capacity() {
+        let mut s = WasmScene::new();
+        let (i, g) = add(&mut s, true);
+        let mut ops = vec![3];
+        ops.extend(ids(&[1]));
+        ops.push(4);
+        ops.extend(ids(&[3]));
+        s.edit(i, g, &ops, &[]).unwrap();
+        s.take_changes();
+        s.compact(i, g).unwrap();
+        let all = FLAG_POSITIONS_ALL | FLAG_NORMALS_ALL | FLAG_COLORS_ALL | FLAG_INDICES_ALL;
+        assert_eq!(
+            s.take_changes(),
+            vec![1, i, g, FLAG_CAPACITY | all, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(s.vertex_slots(i, g).unwrap(), 3);
+        assert!(!s.can_undo());
+        assert_eq!(code(s.compact(i, g + 1)), codes::UNKNOWN_MESH);
+    }
+
+    /// The open upper half of a UV sphere, outward, with the fans of two
+    /// vertices removed (two holes) and two triangles flipped.
+    fn damaged_hemisphere(s: &mut WasmScene, mode: u8) -> (u32, u32) {
+        let (stacks, slices) = (8u32, 32u32);
+        let mut pos = vec![0., 0., 1.];
+        for i in 1..=stacks {
+            let theta = std::f64::consts::FRAC_PI_2 * f64::from(i) / f64::from(stacks);
+            for j in 0..slices {
+                let phi = std::f64::consts::TAU * f64::from(j) / f64::from(slices);
+                pos.extend([
+                    theta.sin() * phi.cos(),
+                    theta.sin() * phi.sin(),
+                    theta.cos(),
+                ]);
+            }
+        }
+        let ring = |i: u32, j: u32| 1 + (i - 1) * slices + j % slices;
+        let mut tris = Vec::new();
+        for j in 0..slices {
+            tris.push([0, ring(1, j), ring(1, j + 1)]);
+            for i in 1..stacks {
+                let (a, b, c, d) = (
+                    ring(i, j),
+                    ring(i + 1, j),
+                    ring(i + 1, j + 1),
+                    ring(i, j + 1),
+                );
+                tris.extend([[a, b, c], [a, c, d]]);
+            }
+        }
+        let holes = [ring(3, 4), ring(5, 20)];
+        tris.retain(|t| !t.iter().any(|v| holes.contains(v)));
+        for k in [40, 200] {
+            tris[k].swap(1, 2);
+        }
+        let id = s
+            .add_mesh(&pos, tris.as_flattened(), None, mode, true)
+            .unwrap();
+        (id[0], id[1])
+    }
+
+    #[test]
+    fn repair_pipeline_one_undo_step() {
+        let mut s = WasmScene::new();
+        let (i, g) = damaged_hemisphere(&mut s, 0);
+        let a = s.analyze(i, g, 0., false, 1000).unwrap();
+        assert_eq!(a[0], 3.);
+        // The last two values: 6 orientation conflicts, not checked.
+        assert_eq!(&a[a.len() - 2..], &[6., -1.]);
+        let triangles = s.triangle_count(i, g).unwrap();
+        let nan = f64::NAN;
+        let ops = [3., 4., nan, 2., nan, nan, 0., 1., nan];
+        let r = s.repair(i, g, &ops, &[]).unwrap();
+        // Orient flipped the two triangles; two loops filled, one skipped.
+        assert_eq!(r[0], 2.);
+        assert_eq!(r[4], 2.);
+        let a = s.analyze(i, g, 0., true, 5).unwrap();
+        assert_eq!(a[0], 1.);
+        assert_eq!(&a[a.len() - 2..], &[0., 0.]);
+        assert!(s.undo().unwrap());
+        assert!(!s.can_undo());
+        assert_eq!(s.triangle_count(i, g).unwrap(), triangles);
+
+        // A failing op rolls the whole list back.
+        let bad = [3., 4., nan, nan, nan, nan, 0., 1., nan];
+        assert_eq!(code(s.repair(i, g, &bad, &[])), codes::INVALID_ARGUMENT);
+        assert!(!s.can_undo());
+        assert_eq!(
+            code(s.analyze(i, g, -1., false, 10)),
+            codes::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn stale_loops_error_code() {
+        let mut s = WasmScene::new();
+        let (i, g) = damaged_hemisphere(&mut s, 2);
+        s.repair(i, g, &[3.], &[]).unwrap();
+        let a = s.analyze(i, g, 0., false, 10).unwrap();
+        // The first loop's id, as the fill op takes it.
+        let id: Vec<u32> = a[1..5].iter().map(|&v| v as u32).collect();
+        let nan = f64::NAN;
+        let fill = [4., nan, nan, nan, 1., 0., 0., nan];
+        s.repair(i, g, &fill, &id).unwrap();
+        s.clear_history().unwrap();
+        assert_eq!(code(s.repair(i, g, &fill, &id)), codes::STALE_LOOPS);
+        assert!(!s.can_undo());
+        // Self-intersection needs the BVH, stale under Manual.
+        assert_eq!(code(s.analyze(i, g, 0., true, 10)), codes::STALE_BVH);
+        s.update(i, g).unwrap();
+        let a = s.analyze(i, g, 0., true, 10).unwrap();
+        assert_eq!(a[a.len() - 1], 0.);
+        // A Lazy mesh is brought up to date first.
+        s.set_mode(i, g, 1).unwrap();
+        let mut ops = vec![0];
+        ops.extend(ids(&[0]));
+        s.edit(i, g, &ops, &[0., 0., 1.01]).unwrap();
+        assert!(!s.scene.is_current(s.id(i, g).unwrap()).unwrap());
+        s.analyze(i, g, 0., true, 10).unwrap();
     }
 
     #[test]

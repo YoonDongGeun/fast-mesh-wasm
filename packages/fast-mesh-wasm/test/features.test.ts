@@ -107,6 +107,25 @@ describe("queries", () => {
     expect(codeOf(() => s.raycast([0, 0, 0], [0, 0, 0]))).toBe("INVALID_ARGUMENT");
   });
 
+  it("rotated_placement_off_centre_origin", () => {
+    const s = scene();
+    // A unit sphere around (3, 0, 0) stored about origin (2, 1, 0), not its centre.
+    const { positions, indices } = sphere([3, 0, 0], 1);
+    const m = s.addMesh(positions, indices, { origin: [2, 1, 0] });
+    // A quarter turn about z then up 1: the centre goes to (0, 3, 1).
+    s.setPlacement(m, { rotation: [0, -1, 0, 1, 0, 0, 0, 0, 1], translation: [0, 0, 1] });
+    const hit = s.raycast([0.01, 10, 1], [0, -1, 0])!;
+    expect(hit.mesh).toBe(m);
+    expect(hit.distance).toBeGreaterThan(5.99);
+    expect(hit.distance).toBeLessThan(6.01);
+    expect(hit.point[1]).toBeCloseTo(10 - hit.distance, 9);
+    // Nothing is left where the unrotated sphere would be.
+    expect(s.raycast([3, -10, 1], [0, 1, 0])).toBeNull();
+    const c = s.closestPoint([0, 3, 3])!;
+    expect(c.distance).toBeCloseTo(1, 2);
+    expect(c.point[2]).toBeCloseTo(2, 2);
+  });
+
   it("closest_point_distance_intersects_contacts", () => {
     const s = scene();
     const a = addSphere(s, [0, 0, 0]);
@@ -217,6 +236,8 @@ describe("fields and colouring", () => {
       { map: "jet" as "turbo" },
       { above: "wrap" as "base" },
       { base: [1, 2, 3] as unknown as [number, number, number, number] },
+      { nan: [1, 2, 3] as unknown as [number, number, number, number] },
+      { base: [1, 2, 3, 4, 5] as unknown as [number, number, number, number], nan: [1, 2, 3] as unknown as [number, number, number, number] },
       { nan: [0, 0, 0, 256] as const },
       { map: { stops: [[0, [0, 0, 0, 255]]] as const } },
     ]) {
@@ -376,9 +397,17 @@ describe("sections", () => {
     expect(codeOf(() => s.fieldValues(otherField))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.meshDistance(a, c))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.fieldValues(a as never))).toBe("INVALID_ARGUMENT");
-    // Removing a mesh drops its fields.
+    // Removing a mesh drops its fields (both of c's are measured to d): they
+    // are reported in the remaining mesh's record, with the handles held.
     const f2 = other.addDistanceField({ name: "e", on: c, to: d, maxDistance: 1 });
+    other.takeChanges();
     other.removeMesh(d);
     expect(codeOf(() => other.fieldValues(f2))).toBe("UNKNOWN_FIELD");
+    const dropped = other.takeChanges();
+    const fieldsChanged = changeOf(dropped, c)!.fieldsChanged;
+    expect(fieldsChanged.length).toBe(2);
+    expect(fieldsChanged).toContain(otherField);
+    expect(fieldsChanged).toContain(f2);
+    expect(changeOf(dropped, d)!.removed).toBe(true);
   });
 });

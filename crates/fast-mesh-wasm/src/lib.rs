@@ -6,6 +6,7 @@
 
 use wasm_bindgen::prelude::*;
 
+mod edit;
 mod error;
 mod render;
 mod scene;

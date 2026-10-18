@@ -29,12 +29,20 @@ export class MeshHandle {
   declare private readonly brand: "MeshHandle";
 }
 
-/** A field in a {@link Scene}. Opaque and deduplicated like {@link MeshHandle}. */
+/**
+ * A field in a {@link Scene}. Opaque and deduplicated like {@link MeshHandle}.
+ * The scene keeps every field handle it gave out for its own lifetime, even
+ * after the field is removed, so a removal in a change record names the same
+ * object you hold.
+ */
 export class FieldHandle {
   declare private readonly brand: "FieldHandle";
 }
 
-/** A section in a {@link Scene}. Opaque and deduplicated like {@link MeshHandle}. */
+/**
+ * A section in a {@link Scene}. Opaque and deduplicated like {@link MeshHandle},
+ * and kept for the scene's lifetime like {@link FieldHandle}.
+ */
 export class SectionHandle {
   declare private readonly brand: "SectionHandle";
 }
@@ -306,6 +314,201 @@ export interface SectionGap {
   b: Vec3;
 }
 
+/**
+ * An id produced by an earlier op of the same {@link Scene.edit} list: id `i`
+ * of the result of op `opIndex` (a vertex of `addVertices`, a triangle of
+ * `addTriangles`).
+ */
+export interface EditRef {
+  ref: readonly [opIndex: number, i: number];
+}
+
+/**
+ * One op of {@link Scene.edit}. Positions are in world space (3 per vertex);
+ * ids are vertex or triangle slots, or {@link EditRef}s to ids added earlier
+ * in the same list.
+ */
+export type EditOp =
+  | { op: "setPositions"; vertices: Uint32Array | readonly number[]; positions: Positions64 }
+  | { op: "addVertices"; positions: Positions64 }
+  | { op: "addTriangles"; triangles: readonly (number | EditRef)[] | Uint32Array }
+  | { op: "removeTriangles"; triangles: Uint32Array | readonly number[] }
+  | { op: "removeVertices"; vertices: Uint32Array | readonly number[] | readonly EditRef[] };
+
+/** What {@link Scene.edit} added. */
+export interface EditResult {
+  /** Per op, in order: the new vertex or triangle ids (empty for ops that add nothing). */
+  added: Uint32Array[];
+}
+
+/**
+ * A boundary loop's content fingerprint, valid while its vertex sequence is
+ * unchanged: pass it back to `fillHoles` to pick that loop.
+ */
+export interface LoopId {
+  /** The smallest vertex id on the loop. */
+  minVertex: number;
+  /** The number of vertices on the loop. */
+  len: number;
+  /** FNV-1a 64 of the loop's vertex ids. */
+  hash: bigint;
+}
+
+/** A chain of boundary edges, from {@link Scene.analyze}. */
+export interface BoundaryLoop {
+  id: LoopId;
+  /** In loop order; a closed loop starts at `id.minVertex`. */
+  vertices: Uint32Array;
+  /** Length of the closed polygon. */
+  perimeter: number;
+  /** Vector area of the closed polygon. */
+  area: number;
+  /** `false` for an open chain (never filled). */
+  closed: boolean;
+  /** `false` when the loop touches a non-manifold edge, an unordered pinch or an orientation seam. */
+  clean: boolean;
+}
+
+/** Triangles connected through shared edges, from {@link Scene.analyze}. */
+export interface MeshComponent {
+  /** Ascending. */
+  triangles: Uint32Array;
+  area: number;
+  /** No boundary and no non-manifold edge. */
+  closed: boolean;
+}
+
+/**
+ * The defects of a mesh, from {@link Scene.analyze}. Lists with a count beside
+ * them keep their first `maxListed` entries; counts are exact.
+ */
+export interface Analysis {
+  loops: BoundaryLoop[];
+  /** Groups of two or more coincident vertices. */
+  coincidentGroups: number;
+  /** The groups, by smallest id, each ascending. */
+  coincident: Uint32Array[];
+  /** Degenerate triangles (repeated vertex or near-zero area). */
+  degenerate: number;
+  degenerateList: Uint32Array;
+  /** Triangles repeating the vertex set of a triangle with a smaller id. */
+  duplicate: number;
+  duplicateList: Uint32Array;
+  /** Edges with three or more triangles. */
+  nonManifoldEdges: number;
+  /** Those edges as `[min, max]`, ascending. */
+  nonManifoldEdgeList: [number, number][];
+  nonManifoldVertices: Uint32Array;
+  /** Vertices whose triangle fan splits into several pieces. */
+  pinchVertices: Uint32Array;
+  components: MeshComponent[];
+  /** Interior edges used in the same direction by both their triangles. */
+  orientationConflicts: number;
+  /** Whether two triangles sharing no vertex intersect; `null` when not checked. */
+  selfIntersects: boolean | null;
+}
+
+/**
+ * Options of {@link Scene.analyze}. Distances are in mesh units: placements are
+ * rigid, so local and world distances agree.
+ */
+export interface AnalyzeOptions {
+  /** Vertices at most this far apart count as coincident. Defaults to 0 (exact duplicates). */
+  weldTolerance?: number;
+  /**
+   * Check for self-intersection with the mesh's BVH. A stale `"manual"` mesh
+   * throws `STALE_BVH`; others are brought up to date first. Defaults to `false`.
+   */
+  selfIntersection?: boolean;
+  /** The most entries kept in each counted list. Defaults to 1000. */
+  maxListed?: number;
+}
+
+/**
+ * One repair operation for {@link Scene.repair}. Distances and areas are in
+ * mesh units (equal to world units).
+ */
+export type RepairOp =
+  | { op: "weld"; tolerance: number }
+  | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
+  | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
+  | { op: "orient" }
+  | {
+      op: "fillHoles";
+      maxEdges?: number;
+      maxPerimeter?: number;
+      maxArea?: number;
+      loops?: readonly LoopId[];
+      allowUnclean?: boolean;
+      fair?: boolean;
+      dpLimit?: number;
+    };
+
+/** What `weld` did. */
+export interface WeldReport {
+  mergedVertices: number;
+  removedTriangles: number;
+}
+
+/** What `removeDegenerate` did. */
+export interface DegenerateReport {
+  removedTriangles: number;
+  removedVertices: number;
+}
+
+/** What `removeSmallComponents` did. */
+export interface RemoveReport {
+  removedComponents: number;
+  removedTriangles: number;
+  removedVertices: number;
+}
+
+/** What `orient` did. */
+export interface OrientReport {
+  flippedTriangles: number;
+  patches: number;
+  nonOrientablePatches: number;
+  flippedOutwardComponents: number;
+}
+
+/** A loop `fillHoles` filled. */
+export interface FilledLoop {
+  /** The loop as it was before the fill. */
+  id: LoopId;
+  trianglesAdded: number;
+  /** Vertices added by refinement. */
+  verticesAdded: number;
+  /** Whether fairing converged; `true` when it did not run. */
+  converged: boolean;
+  /** The Laplacian weights fairing used; `null` when it did not run. */
+  weights: "cotangent" | "uniform" | null;
+}
+
+/** What `fillHoles` did, each list in loop order. */
+export interface FillReport {
+  filled: FilledLoop[];
+  /** Loops left out: beyond a bound, or unclean (or open). */
+  skipped: { id: LoopId; reason: "bounds" | "unclean" }[];
+  /** Selected loops that could not be filled; they stay open. */
+  failed: { id: LoopId; reason: "projectionFolds" | "noValidTriangulation" | "solver" }[];
+}
+
+/** The report of a {@link RepairOp}. */
+export type RepairReport = WeldReport | DegenerateReport | RemoveReport | OrientReport | FillReport;
+
+/** The report type of a repair op. */
+export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
+  ? WeldReport
+  : O extends { op: "removeDegenerate" }
+    ? DegenerateReport
+    : O extends { op: "removeSmallComponents" }
+      ? RemoveReport
+      : O extends { op: "orient" }
+        ? OrientReport
+        : O extends { op: "fillHoles" }
+          ? FillReport
+          : RepairReport;
+
 /** The scene's view of its active drag. */
 interface ActiveDrag {
   /** The step depth right after the drag's `beginStep`. */
@@ -353,18 +556,23 @@ function encodeRule(rule: ColorRule): { map: number; values: Float32Array } {
   if (rule.center !== undefined && Number.isNaN(rule.center)) {
     throw invalid("color center must lie within the range");
   }
+  const base = rule.base ?? DEFAULT_BASE;
+  const nan = rule.nan ?? DEFAULT_NAN;
+  if (base.length !== 4) {
+    throw invalid("base must have 4 channels");
+  }
+  if (nan.length !== 4) {
+    throw invalid("nan must have 4 channels");
+  }
   const values = [
     rule.range[0],
     rule.range[1],
     rule.center ?? Number.NaN,
     codeIn(OUT_OF_RANGE, rule.below ?? "clamp", "below"),
     codeIn(OUT_OF_RANGE, rule.above ?? "base", "above"),
-    ...(rule.base ?? DEFAULT_BASE),
-    ...(rule.nan ?? DEFAULT_NAN),
+    ...base,
+    ...nan,
   ];
-  if (values.length !== 13) {
-    throw invalid("base and nan must have 4 channels");
-  }
   let map: number;
   if (typeof rule.map === "string") {
     map = codeIn(MAPS, rule.map, "map");
@@ -384,6 +592,311 @@ function encodeRule(rule: ColorRule): { map: number; values: Float32Array } {
 
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
+}
+
+const U32_LIMIT = 2 ** 32;
+const EDIT_CODES = {
+  setPositions: 0,
+  addVertices: 1,
+  addTriangles: 2,
+  removeTriangles: 3,
+  removeVertices: 4,
+} as const;
+
+/** An id list as the binding's `n, r, ids..., (slot, op, i)...`; see `crate::edit`. */
+function encodeIds(list: unknown, what: string, words: ArrayLike<number>[]): void {
+  if (list instanceof Uint32Array) {
+    words.push([list.length, 0], list);
+    return;
+  }
+  if (!Array.isArray(list)) {
+    throw invalid(`${what} must be a Uint32Array or an array`);
+  }
+  const ids: number[] = new Array(list.length);
+  const refs: number[] = [];
+  list.forEach((x: unknown, slot) => {
+    if (typeof x === "number") {
+      if (!Number.isInteger(x) || x < 0 || x >= U32_LIMIT) {
+        throw new FastMeshError("INVALID_INDEX", `${what}: ${x} is not an id`);
+      }
+      ids[slot] = x;
+      return;
+    }
+    const ref = (x as EditRef | null)?.ref;
+    if (!Array.isArray(ref) || ref.length !== 2) {
+      throw invalid(`${what} must hold ids or { ref: [opIndex, i] }`);
+    }
+    for (const r of ref) {
+      if (!Number.isInteger(r) || r < 0 || r >= U32_LIMIT) {
+        throw new FastMeshError("INVALID_INDEX", `${what}: ref [${ref.join(", ")}] is out of range`);
+      }
+    }
+    ids[slot] = 0;
+    refs.push(slot, ref[0], ref[1]);
+  });
+  words.push([list.length, refs.length / 3], ids, refs);
+}
+
+/** World positions of an op, checked to be `3 · count` long (any count when `count` is undefined). */
+function opPositions(positions: Positions64, count: number | undefined, what: string): Float64Array {
+  const p = toFloat64(positions ?? []);
+  if (p.length % 3 !== 0 || (count !== undefined && p.length !== 3 * count)) {
+    throw invalid(`${what}: positions need 3 values per vertex`);
+  }
+  return p;
+}
+
+/** An edit op list as the binding's `(ops, values)`; see `crate::edit` in the Rust crate. */
+function encodeEdit(ops: readonly EditOp[]): { words: Uint32Array; values: Float64Array } {
+  if (!Array.isArray(ops)) {
+    throw invalid("ops must be an array");
+  }
+  const words: ArrayLike<number>[] = [];
+  const values: Float64Array[] = [];
+  ops.forEach((o, k) => {
+    const what = `op ${k}`;
+    const code = codeIn(EDIT_CODES, o?.op, `${what}: op`);
+    words.push([code]);
+    switch (o.op) {
+      case "setPositions": {
+        encodeIds(o.vertices, `${what}: vertices`, words);
+        values.push(opPositions(o.positions, o.vertices?.length, what));
+        break;
+      }
+      case "addVertices": {
+        const p = opPositions(o.positions, undefined, what);
+        words.push([p.length / 3]);
+        values.push(p);
+        break;
+      }
+      case "addTriangles":
+        encodeIds(o.triangles, `${what}: triangles`, words);
+        break;
+      case "removeTriangles":
+        encodeIds(o.triangles, `${what}: triangles`, words);
+        break;
+      case "removeVertices":
+        encodeIds(o.vertices, `${what}: vertices`, words);
+        break;
+    }
+  });
+  const out = new Uint32Array(words.reduce((n, w) => n + w.length, 0));
+  let at = 0;
+  for (const w of words) {
+    out.set(w, at);
+    at += w.length;
+  }
+  const flat = new Float64Array(values.reduce((n, v) => n + v.length, 0));
+  at = 0;
+  for (const v of values) {
+    flat.set(v, at);
+    at += v.length;
+  }
+  return { words: out, values: flat };
+}
+
+const REPAIR_CODES = { weld: 0, removeDegenerate: 1, removeSmallComponents: 2, orient: 3, fillHoles: 4 } as const;
+
+/** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
+function optional(v: number | undefined, what: string): number {
+  if (v === undefined) {
+    return Number.NaN;
+  }
+  if (typeof v !== "number" || Number.isNaN(v)) {
+    throw invalid(`${what} must be a number`);
+  }
+  return v;
+}
+
+function flagOf(v: boolean | undefined, fallback: boolean): number {
+  return (v ?? fallback) ? 1 : 0;
+}
+
+/** A loop id as the binding's `minVertex, len, hash low, hash high`. */
+function encodeLoopId(id: LoopId, out: number[]): void {
+  const { minVertex, len, hash } = id ?? ({} as LoopId);
+  if (typeof hash !== "bigint" || hash < 0n || hash >= 1n << 64n) {
+    throw invalid("a loop id's hash must be a bigint in 0..2^64");
+  }
+  for (const v of [minVertex, len]) {
+    if (!Number.isInteger(v) || v < 0 || v >= U32_LIMIT) {
+      throw invalid("a loop id's minVertex and len must be u32 integers");
+    }
+  }
+  out.push(minVertex, len, Number(hash & 0xffffffffn), Number(hash >> 32n));
+}
+
+/** A repair op list as the binding's `(ops, loops)`; see `crate::edit` in the Rust crate. */
+function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: Uint32Array } {
+  const values: number[] = [];
+  const loops: number[] = [];
+  for (const o of ops) {
+    values.push(codeIn(REPAIR_CODES, o?.op, "repair op"));
+    switch (o.op) {
+      case "weld":
+        values.push(optional(o.tolerance, "tolerance"));
+        break;
+      case "removeDegenerate":
+        values.push(optional(o.areaEpsilon, "areaEpsilon"), flagOf(o.removeUnusedVertices, true));
+        break;
+      case "removeSmallComponents":
+        values.push(
+          optional(o.minTriangles, "minTriangles"),
+          optional(o.minArea, "minArea"),
+          flagOf(o.keepLargest, true),
+        );
+        break;
+      case "orient":
+        break;
+      case "fillHoles": {
+        let count = Number.NaN;
+        if (o.loops !== undefined) {
+          if (!Array.isArray(o.loops)) {
+            throw invalid("loops must be an array of loop ids");
+          }
+          count = o.loops.length;
+          for (const id of o.loops) {
+            encodeLoopId(id, loops);
+          }
+        }
+        values.push(
+          optional(o.maxEdges, "maxEdges"),
+          optional(o.maxPerimeter, "maxPerimeter"),
+          optional(o.maxArea, "maxArea"),
+          count,
+          flagOf(o.allowUnclean, false),
+          flagOf(o.fair, true),
+          optional(o.dpLimit, "dpLimit"),
+        );
+        break;
+      }
+    }
+  }
+  return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
+}
+
+/** Reads a flat `f64` result front to back. */
+class Reader {
+  at = 0;
+  constructor(readonly data: Float64Array) {}
+
+  next(): number {
+    return this.data[this.at++];
+  }
+
+  flag(): boolean {
+    return this.next() === 1;
+  }
+
+  /** `n` ids as a copy. */
+  ids(n: number): Uint32Array {
+    const out = Uint32Array.from(this.data.subarray(this.at, this.at + n));
+    this.at += n;
+    return out;
+  }
+
+  /** A count, then that many ids. */
+  list(): Uint32Array {
+    return this.ids(this.next());
+  }
+
+  loopId(): LoopId {
+    const minVertex = this.next();
+    const len = this.next();
+    const lo = BigInt(this.next());
+    const hi = BigInt(this.next());
+    return { minVertex, len, hash: lo | (hi << 32n) };
+  }
+
+  /** A count, then that many items. */
+  many<T>(item: () => T): T[] {
+    const n = this.next();
+    const out: T[] = [];
+    for (let k = 0; k < n; k++) {
+      out.push(item());
+    }
+    return out;
+  }
+}
+
+const SKIP_REASONS = ["bounds", "unclean"] as const;
+const FAIL_REASONS = ["projectionFolds", "noValidTriangulation", "solver"] as const;
+const WEIGHTS = [null, "cotangent", "uniform"] as const;
+
+/** One op's report from a repair result; see `crate::edit` in the Rust crate. */
+function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
+  switch (op) {
+    case "weld":
+      return { mergedVertices: r.next(), removedTriangles: r.next() };
+    case "removeDegenerate":
+      return { removedTriangles: r.next(), removedVertices: r.next() };
+    case "removeSmallComponents":
+      return { removedComponents: r.next(), removedTriangles: r.next(), removedVertices: r.next() };
+    case "orient":
+      return {
+        flippedTriangles: r.next(),
+        patches: r.next(),
+        nonOrientablePatches: r.next(),
+        flippedOutwardComponents: r.next(),
+      };
+    case "fillHoles":
+      return {
+        filled: r.many(() => ({
+          id: r.loopId(),
+          trianglesAdded: r.next(),
+          verticesAdded: r.next(),
+          converged: r.flag(),
+          weights: WEIGHTS[r.next()],
+        })),
+        skipped: r.many(() => ({ id: r.loopId(), reason: SKIP_REASONS[r.next()] })),
+        failed: r.many(() => ({ id: r.loopId(), reason: FAIL_REASONS[r.next()] })),
+      };
+  }
+}
+
+/** An analysis result; see `encode_analysis` in the Rust crate. */
+function decodeAnalysis(r: Reader): Analysis {
+  const loops = r.many(
+    (): BoundaryLoop => ({
+      id: r.loopId(),
+      vertices: r.list(),
+      perimeter: r.next(),
+      area: r.next(),
+      closed: r.flag(),
+      clean: r.flag(),
+    }),
+  );
+  const coincidentGroups = r.next();
+  const coincident = r.many(() => r.list());
+  const degenerate = r.next();
+  const degenerateList = r.list();
+  const duplicate = r.next();
+  const duplicateList = r.list();
+  const nonManifoldEdges = r.next();
+  const nonManifoldEdgeList = r.many((): [number, number] => [r.next(), r.next()]);
+  const nonManifoldVertices = r.list();
+  const pinchVertices = r.list();
+  const components = r.many(
+    (): MeshComponent => ({ triangles: r.list(), area: r.next(), closed: r.flag() }),
+  );
+  const orientationConflicts = r.next();
+  const si = r.next();
+  return {
+    loops,
+    coincidentGroups,
+    coincident,
+    degenerate,
+    degenerateList,
+    duplicate,
+    duplicateList,
+    nonManifoldEdges,
+    nonManifoldEdgeList,
+    nonManifoldVertices,
+    pinchVertices,
+    components,
+    orientationConflicts,
+    selfIntersects: si < 0 ? null : si === 1,
+  };
 }
 
 function toFloat64(values: Positions64): Float64Array {
@@ -442,6 +955,11 @@ export class Scene {
   readonly #meshes = new Map<string, MeshHandle>();
   /** Handles of meshes removed since the last `takeChanges`, for their removal records. */
   readonly #removed = new Map<string, MeshHandle>();
+  /**
+   * Field and section handles by raw id, kept for the scene's lifetime (raw
+   * ids are never reused), so change records reporting a removed field or
+   * section give back the handle the caller holds.
+   */
   readonly #fields = new Map<number, FieldHandle>();
   readonly #sections = new Map<number, SectionHandle>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
@@ -891,6 +1409,87 @@ export class Scene {
     };
     this.#drag = session;
     return session;
+  }
+
+  // ---- Geometry edits and repair ----
+
+  /**
+   * Edits a mesh's geometry with a list of ops, run in Rust as one
+   * transaction: one undo step (or part of the open step), and when any op
+   * fails nothing changes and nothing is recorded. Positions are world
+   * coordinates, mapped to local with the mesh's placement and origin. Ids
+   * may be {@link EditRef}s to ids added by earlier ops of the list; every
+   * ref is checked before anything is written. Normals, colours, fields,
+   * sections and the BVH follow by the mesh's mode.
+   *
+   * @throws `INVALID_INDEX` for a bad ref or an id that is not alive;
+   * `INVALID_ARGUMENT` for a malformed op, positions not 3 per vertex or not
+   * finite in local `f32`, or removing a vertex still in use.
+   */
+  edit(mesh: MeshHandle, ops: readonly EditOp[]): EditResult {
+    const { index, generation } = this.#id(mesh);
+    const { words, values } = encodeEdit(ops);
+    const out = call(() => this.#scene().edit(index, generation, words, values));
+    const added: Uint32Array[] = [];
+    let at = 0;
+    while (at < out.length) {
+      const n = out[at];
+      added.push(out.slice(at + 1, at + 1 + n));
+      at += 1 + n;
+    }
+    return { added };
+  }
+
+  /**
+   * Removes the mesh's dead slots and renumbers the rest. Its next change
+   * record has every buffer `"all"` and `capacityChanged` when the slot counts
+   * shrank. The mesh's earlier edits leave the history (its placement changes
+   * stay undoable).
+   */
+  compact(mesh: MeshHandle): void {
+    const { index, generation } = this.#id(mesh);
+    call(() => this.#scene().compact(index, generation));
+  }
+
+  /**
+   * A read-only report of the mesh's defects: boundary loops (whose ids
+   * `fillHoles` takes), coincident vertices, degenerate and duplicate
+   * triangles, non-manifold edges and vertices, components, orientation
+   * conflicts and, on request, self-intersection.
+   *
+   * @throws `INVALID_ARGUMENT` for a negative or non-finite `weldTolerance`; `STALE_BVH`, see {@link AnalyzeOptions.selfIntersection}.
+   */
+  analyze(mesh: MeshHandle, options: AnalyzeOptions = {}): Analysis {
+    const { index, generation } = this.#id(mesh);
+    const maxListed = options.maxListed ?? 1000;
+    if (!Number.isInteger(maxListed) || maxListed < 0 || maxListed >= U32_LIMIT) {
+      throw invalid("maxListed must be a non-negative integer");
+    }
+    const tolerance = options.weldTolerance ?? 0;
+    const si = options.selfIntersection ?? false;
+    const r = call(() => this.#scene().analyze(index, generation, tolerance, si, maxListed));
+    return decodeAnalysis(new Reader(r));
+  }
+
+  /**
+   * Runs one repair operation and returns its report, or a list of them in
+   * order and returns their reports. A list is one transaction: one undo step,
+   * and when any operation fails nothing changes and nothing is recorded.
+   *
+   * @throws `INVALID_ARGUMENT` for invalid options (`fillHoles` needs a bound or `loops`); `STALE_LOOPS` when a loop id of `fillHoles` no longer matches a loop of the mesh.
+   */
+  repair<const O extends RepairOp>(mesh: MeshHandle, op: O): RepairReportOf<O>;
+  repair<const O extends readonly RepairOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): { -readonly [K in keyof O]: RepairReportOf<O[K]> };
+  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): RepairReport | RepairReport[] {
+    const { index, generation } = this.#id(mesh);
+    const ops: readonly RepairOp[] = Array.isArray(op) ? op : [op as RepairOp];
+    const { values, loops } = encodeRepair(ops);
+    const r = new Reader(call(() => this.#scene().repair(index, generation, values, loops)));
+    const reports = ops.map((o) => decodeReport(o.op, r));
+    return Array.isArray(op) ? reports : reports[0];
   }
 
   // ---- Queries (world space) ----
