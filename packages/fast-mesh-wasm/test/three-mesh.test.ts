@@ -214,6 +214,25 @@ describe("bindMesh", () => {
     expectMirrorsMatch(s, m, bound);
   });
 
+  it("update_ranges_fold_into_one_full_range", () => {
+    // Never uploaded (no render in between): ranges pile up until there are
+    // more than 64, then fold into one full range.
+    const { s, m, bound } = setup();
+    const position = attr(bound, "position");
+    const length = position.array.length;
+    for (let i = 0; i < 64; i++) {
+      s.edit(m, [{ op: "setPositions", vertices: [i % 36], positions: [i, 0, 0.1] }]);
+      s.commitFrame();
+    }
+    expect(position.updateRanges.length).toBe(64);
+    s.edit(m, [{ op: "setPositions", vertices: [5], positions: [5, 0, 0.2] }]);
+    s.commitFrame();
+    expect(position.updateRanges).toEqual([{ start: 0, count: length }]);
+    expect(attr(bound, "normal").updateRanges.length).toBeLessThanOrEqual(64);
+    expect(attr(bound, "position")).toBe(position);
+    expectMirrorsMatch(s, m, bound);
+  });
+
   it("colors_convert_srgb_to_linear", () => {
     // The table: 128 is about 0.2158 linear; the ends are exact.
     expect(SRGB_TO_LINEAR16[0]).toBe(0);

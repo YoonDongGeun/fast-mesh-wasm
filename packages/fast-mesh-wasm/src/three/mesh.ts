@@ -64,6 +64,13 @@ const DEFAULT_COLOR = 0xcccccc;
 const WHITE = new THREE.Color(0xffffff);
 
 /**
+ * Update ranges listed on one attribute before they are folded into a single
+ * full range. Ranges pile up while a bound mesh is not rendered (culled,
+ * hidden, on-demand rendering), and three uploads each one separately.
+ */
+const MAX_UPDATE_RANGES = 64;
+
+/**
  * sRGB byte to linear, as a normalized `Uint16` (0 to 65535). The engine's
  * colour maps are sRGB-encoded bytes; three treats vertex colours as linear
  * working-space values and encodes its output to sRGB, so bytes passed
@@ -305,6 +312,11 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
           copy(key, mirror, view, start * itemSize, (start + count) * itemSize);
           attribute.addUpdateRange(start * itemSize, count * itemSize);
         }
+      }
+      if (attribute.updateRanges.length > MAX_UPDATE_RANGES) {
+        // Not uploaded for a while: one full range instead of a long list.
+        attribute.clearUpdateRanges();
+        attribute.addUpdateRange(0, mirror.length);
       }
       attribute.needsUpdate = true;
     }
