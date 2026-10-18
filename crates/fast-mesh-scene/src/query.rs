@@ -12,7 +12,7 @@
 //! [`query_pad`]): culling never drops a mesh the local query would find
 //! something in.
 
-use fast_mesh_bvh::Aabb;
+use fast_mesh_bvh::{Aabb, Bvh};
 use fast_mesh_query::{ClosestHit, ClosestOptions, Cull, Ray, RayHit, RayOptions, Rigid};
 use fast_mesh_store::{StoreError, TriangleId};
 
@@ -482,6 +482,60 @@ impl Scene {
             eb.mesh.origin(),
         );
         Ok((ea, eb, xf))
+    }
+
+    /// The mesh's BVH, in mesh-local `f32` space, for running Phase 3
+    /// queries directly. Never updates it.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id, or
+    /// [`SceneError::StaleBvh`] when the BVH is not current with the mesh
+    /// (see [`Scene::is_current`]); bring it up to date with
+    /// [`Scene::update`] or [`Scene::flush`] first.
+    pub fn bvh(&self, id: MeshId) -> Result<&Bvh> {
+        let e = self.entry(id)?;
+        if !e.is_current() {
+            return Err(SceneError::StaleBvh(id));
+        }
+        Ok(&e.bvh)
+    }
+
+    /// The transform from mesh `b`'s local space to mesh `a`'s local space,
+    /// origins included: the one the pair queries ([`Scene::intersects`],
+    /// [`Scene::mesh_distance`], [`Scene::triangles_near`]) pass to Phase 3,
+    /// in the convention of [`Rigid`]. Its rotation is re-orthonormalised,
+    /// so it always passes `Rigid::validate`.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn relative_transform(&self, a: MeshId, b: MeshId) -> Result<Rigid> {
+        let (ea, eb) = (self.entry(a)?, self.entry(b)?);
+        Ok(relative_rigid(
+            &ea.placement,
+            ea.mesh.origin(),
+            &eb.placement,
+            eb.mesh.origin(),
+        ))
+    }
+
+    /// A world point in mesh `id`'s local coordinates, origin included:
+    /// `Rᵀ (q - t) - o`, in `f64`.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn world_to_local(&self, id: MeshId, q: [f64; 3]) -> Result<[f64; 3]> {
+        let e = self.entry(id)?;
+        Ok(world_to_local(&e.placement, e.mesh.origin(), q))
+    }
+
+    /// A point in mesh `id`'s local coordinates in the world, origin
+    /// included: `R (o + p) + t`, in `f64`.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn local_to_world(&self, id: MeshId, p: [f64; 3]) -> Result<[f64; 3]> {
+        let e = self.entry(id)?;
+        Ok(local_to_world(&e.placement, e.mesh.origin(), p))
     }
 
     fn check_ids(&self, a: MeshId, b: MeshId) -> Result<()> {
@@ -1332,5 +1386,79 @@ pub(crate) mod tests {
             scene.closest_point(o, &SceneClosestOptions::default()),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn bvh_accessor_rejects_stale() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let manual = MeshOptions {
+            mode: UpdateMode::Manual,
+            ..MeshOptions::default()
+        };
+        let id = scene.add_mesh(cube([0.0; 3], 1.0), manual).unwrap();
+        assert_eq!(scene.bvh(id).unwrap().generation(), {
+            scene.entries.get(id).unwrap().bvh.generation()
+        });
+        scene
+            .edit(id, |tx| tx.set_positions(&[0], &[[-1.0, -1.0, -1.0]]))
+            .unwrap();
+        assert_eq!(scene.bvh(id).err(), Some(SceneError::StaleBvh(id)));
+        scene.update(id).unwrap();
+        let bvh = scene.bvh(id).unwrap();
+        assert!(bvh.is_current(scene.mesh(id).unwrap()));
+        scene.remove_mesh(id).unwrap();
+        assert_eq!(scene.bvh(id).err(), Some(SceneError::UnknownMesh));
+    }
+
+    #[test]
+    fn relative_transform_matches_pair_queries() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(
+                far_cube([1000.5, -20.0, 3.0], 2.0),
+                place(RZ90, [5.0, 1.0, 0.0]),
+            )
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.0; 3], 1.0), place(RX90, [7.5, 0.5, 0.5]))
+            .unwrap();
+        assert_eq!(scene.relative_transform(a, b), Ok(hand_rigid(&scene, a, b)));
+        assert_eq!(scene.relative_transform(b, a), Ok(hand_rigid(&scene, b, a)));
+        // The transform is the one the pair queries run with.
+        let xf = scene.relative_transform(a, b).unwrap();
+        let (ea, eb) = (scene.entries.get(a).unwrap(), scene.entries.get(b).unwrap());
+        let want = fast_mesh_query::mesh_distance(&ea.mesh, &ea.bvh, &eb.mesh, &eb.bvh, &xf, 100.0)
+            .unwrap()
+            .map(|d| f64::from(d.distance));
+        let got = scene
+            .mesh_distance(a, b, 100.0)
+            .unwrap()
+            .map(|d| d.distance);
+        assert_eq!(got, want);
+
+        // Local and world points round-trip through the placement and origin.
+        let pa = scene.placement(a).unwrap();
+        let oa = scene.mesh(a).unwrap().origin();
+        assert_ne!(oa, [0.0; 3]);
+        let q = [3.0, -2.0, 7.0];
+        let l = scene.world_to_local(a, q).unwrap();
+        assert_eq!(l, to_local(&pa, oa, q));
+        let back = scene.local_to_world(a, l).unwrap();
+        for k in 0..3 {
+            assert!((back[k] - q[k]).abs() < 1e-9, "{back:?} {q:?}");
+        }
+        // B-local to A-local agrees with going through the world.
+        let lb = [0.25, 0.5, 0.75];
+        let via_world = scene
+            .world_to_local(a, scene.local_to_world(b, lb).unwrap())
+            .unwrap();
+        let direct = xf.apply(lb.map(|c| c as f32));
+        for k in 0..3 {
+            assert!((via_world[k] - direct[k]).abs() < 1e-9);
+        }
+        scene.remove_mesh(b).unwrap();
+        assert_eq!(scene.relative_transform(a, b), Err(SceneError::UnknownMesh));
+        assert_eq!(scene.world_to_local(b, q), Err(SceneError::UnknownMesh));
+        assert_eq!(scene.local_to_world(b, q), Err(SceneError::UnknownMesh));
     }
 }

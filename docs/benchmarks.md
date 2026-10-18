@@ -171,6 +171,48 @@ This is the owner's per-frame case: the two `terrain(708)` meshes of the overhea
 
 Over the poses, a frame's `find_contacts` costs about 1.25 times a `mesh_distance` (1.32 ms per pose in the overhead table). It does more than `mesh_distance`: it finds every triangle pair within the margin, not only the closest one.
 
+## Fields (fast-mesh-fields, fast-mesh-scene)
+
+Results for `cargo bench -p fast-mesh-fields` and the `scene fields` group of `cargo bench -p fast-mesh-scene`, measured on 2026-10-19.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, single thread
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Meshes:** `terrain(708)`, 1,002,528 triangles, default BVH
+
+### Sign data and signed distances
+
+`signed_distances` runs a batch of 100,000 points over the terrain, at heights within ±2 of it; the table divides the criterion median by the batch size. `max_distance` 1 prunes the closest-point search, and infinity computes every point exactly.
+
+| | Pseudonormal | Winding |
+| --- | --- | --- |
+| `SignData::build`, 1M triangles | 147 ms | 38.0 ms |
+| `signed_distances`, per point, `max_distance` 1 | 1.12 µs | 35.9 µs |
+| `signed_distances`, per point, `max_distance` ∞ | 2.20 µs | 75.9 µs |
+
+Pseudonormal builds slower (it accumulates angle-weighted normals per vertex and edge) but costs only the closest-point query per point. Winding builds faster (it stores node moments) but each point sums dipole terms over many nodes and exact solid angles over the near leaves: on a terrain, which is flat, the order-1 expansion needs `beta = 8` and therefore many near leaves, which is the likely reason it is about 30 times slower per point (not profiled). That is why winding is opt-in, or the `Auto` fallback for closed meshes with inconsistent orientation, and the default is pseudonormal.
+
+**Every edit of the target rebuilds its sign data.** `SignData::is_current` checks the target mesh's revision, so any edit of mesh B (the `to` mesh of a field) rebuilds its sign data over the whole mesh on the next field update: O(n), about 150 ms at 1M triangles in pseudonormal mode (the table above). A topology edit costs more, because it also drops B's cached adjacency (the incidence index is kept up to date), and the build has to rebuild it. The `sign_build_pseudonormal_cold_adjacency` benchmark builds on a fresh mesh whose incidence index is cached but whose adjacency is not. Two runs on 2026-10-18, on a day when the machine was slower than for the table above:
+
+| 1M, pseudonormal | Run 1 | Run 2 |
+| --- | --- | --- |
+| `SignData::build`, adjacency cached | 223 ms | 232 ms |
+| `SignData::build`, adjacency not cached | 340 ms | 339 ms |
+
+So a topology edit of B costs about 1.5 times the build alone, an estimated ~220 ms at the table's speed (scaled, not measured). Placement changes and edits of A do not rebuild the sign data. An incremental refit is planned for 5b.
+
+### The 64-pose drag of two touching 1M terrains
+
+The two `terrain(708)` meshes of the overhead group, B flipped above A and lifted to just touch (the 64 poses above), both meshes Lazy. A distance field from A to B with `max_distance` 0.08 (the `triangles_near` margin above), coloured from contact (`range = (-0.08, 0)`, `below = Clamp`, `above = Base`). Each pose runs `set_placement`, `update_fields`, `colors` for each coloured mesh and `take_changes`, as a renderer would. "Both sides" adds a second field from B to A and colours B too.
+
+| | One side (field on A) | Both sides (fields on A and B) |
+| --- | --- | --- |
+| Candidates recomputed per pose, average (largest) | 219 (2,061) | 438 (4,122) |
+| Vertices recoloured per pose, average (largest) | 116 (1,579) | 232 (3,158) |
+| Time per iteration of 64 poses | 114.7 ms | 231.8 ms |
+| Time per pose | 1.79 ms | 3.62 ms |
+
+The candidate counts come from a counter that is not in the code (the one in the unit tests, made visible for a single run), so the benchmark itself prints only the recoloured counts. The largest counts are at pose 0, where the contact is widest (4,607 triangles of each mesh within 0.080); at the later poses it is a few hundred vertices. The time per pose is within the target of the design (a few ms per pose); the work per pose is not set by the number of vertices recomputed (a few hundred take well under 1 ms at 1 to 2 µs each), so the pair test that finds the candidates is likely the larger part, as `triangles_near` at this margin takes about 1.4 ms per pose (1.37 to 1.38 ms above, measured on another run). That split was not profiled. The two-sided case costs twice the one-sided one, since each side repeats the whole update.
+
 ## How the defaults were chosen
 
 `treelet_size` sets the cost of a topology edit, because every edit rebuilds the treelets it touches. Measured on 1M triangles (first-edit timing, before the steady-state benchmark existed, so absolute numbers are higher than the table above):
@@ -202,5 +244,6 @@ cargo bench -p fast-mesh-bvh                          # 1M triangles
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-bvh  # adds 10M (needs ~2 GB RAM, several minutes)
 cargo bench -p fast-mesh-query                        # the same for the query benchmarks (single-mesh and mesh-vs-mesh)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-query
-cargo bench -p fast-mesh-scene                        # scene overhead and find_contacts on two 1M meshes, and find_contacts over 2-32 small meshes
+cargo bench -p fast-mesh-scene                        # scene overhead and find_contacts on two 1M meshes, find_contacts over 2-32 small meshes, and the field drag
+cargo bench -p fast-mesh-fields                       # SignData::build and signed_distances on 1M triangles
 ```

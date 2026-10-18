@@ -14,6 +14,15 @@ pub const TRAVERSE_STACK: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
 
+impl NodeId {
+    /// Dense index of the node, below [`Bvh::node_slots`], for keying
+    /// per-node data in a plain array. Valid only for the BVH generation
+    /// ([`Bvh::generation`]) it was obtained in.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// What a node holds.
 #[derive(Debug, Clone, Copy)]
 pub enum NodeKind<'a> {
@@ -146,6 +155,21 @@ impl Bvh {
             .traverse(root.0, |i, n| visit(NodeId(i), &self.view(n)));
     }
 
+    /// Number of node slots in storage, garbage included: every
+    /// [`NodeId::index`] is below it.
+    pub fn node_slots(&self) -> usize {
+        self.arena.nodes.len()
+    }
+
+    /// Counter that changes whenever nodes, boxes, refs or layout change
+    /// (build, update, refit, rebuild, compaction), so per-node data keyed by
+    /// [`NodeId::index`] can detect that it went stale. Values are unique
+    /// across all BVHs in this process, so a replacement tree never shares one
+    /// with an earlier tree.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// The uid of the mesh this BVH was built for (see `Mesh::uid`).
     pub fn mesh_uid(&self) -> u64 {
         self.mesh_uid
@@ -182,6 +206,22 @@ mod tests {
             ..Default::default()
         };
         Bvh::build(mesh, &opts).unwrap()
+    }
+
+    #[test]
+    fn node_indices_are_dense_and_unique() {
+        let bvh = build(&grid(6));
+        let mut seen = vec![false; bvh.node_slots()];
+        let mut count = 0;
+        bvh.traverse(|id, _| {
+            assert!(id.index() < bvh.node_slots());
+            assert!(!seen[id.index()], "index {} repeated", id.index());
+            seen[id.index()] = true;
+            count += 1;
+            true
+        });
+        assert_eq!(count, bvh.node_count());
+        assert!(bvh.node_slots() >= bvh.node_count());
     }
 
     #[test]

@@ -22,9 +22,15 @@
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
 //! - Change reports: [`Scene::take_changes`] drains one [`MeshChanges`] per
-//!   affected mesh.
+//!   affected mesh. Further consumers each get their own copy of every
+//!   report: [`Scene::subscribe`], [`Scene::take_changes_for`] and
+//!   [`Scene::unsubscribe`].
 //! - Maintenance: [`Scene::add_channel`], [`Scene::remove_channel`],
-//!   [`Scene::derived_channel_mut`] and [`Scene::compact`].
+//!   [`Scene::derived_channel_mut`] (all three reported, and the `field:`
+//!   prefix reserved) and [`Scene::compact`].
+//! - Local space: [`Scene::bvh`] (current BVHs only),
+//!   [`Scene::relative_transform`], [`Scene::world_to_local`] and
+//!   [`Scene::local_to_world`].
 //! - World queries, in world `f64` coordinates: [`Scene::raycast`],
 //!   [`Scene::closest_point`] and [`Scene::closest_point_on`], and between
 //!   two meshes [`Scene::intersects`], [`Scene::mesh_distance`] and
@@ -36,9 +42,21 @@
 //! - Contacts: [`Scene::find_contacts`] finds the mesh pairs within a margin
 //!   (broadphase over world boxes, then Phase 3b per pair), optionally
 //!   restricted by a [`ContactFilter`].
+//! - Distance fields: [`Scene::add_distance_field`] registers a signed
+//!   distance field ([`DistanceField`]) from one mesh's vertices to another
+//!   mesh, stored in a derived channel `field:<name>` and kept up to date
+//!   incrementally under the [`UpdateMode`] of the mesh it is on
+//!   ([`Scene::update_fields`], [`Scene::flush`]). Read with
+//!   [`Scene::field_values`] and [`Scene::field_status`]; remove with
+//!   [`Scene::remove_field`] (or with either mesh).
+//! - Colours: [`Scene::set_coloring`] colours a mesh from one of its fields
+//!   with a [`ColorRule`]; [`Scene::colors`] returns one RGBA8 per vertex
+//!   slot, and recoloured vertices are reported in
+//!   [`MeshChanges::colors_dirty`].
 
 mod contacts;
 mod error;
+mod fields;
 mod history;
 mod id;
 mod placement;
@@ -48,10 +66,14 @@ mod scene;
 
 pub use contacts::{Contact, ContactFilter};
 pub use error::{Result, SceneError};
+pub use fast_mesh_fields::{
+    ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
+};
+pub use fields::{Coloring, DistanceField, FieldStatus};
 pub use id::MeshId;
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
 };
-pub use report::MeshChanges;
+pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};

@@ -1,12 +1,13 @@
 //! The scene: a registry of meshes with BVHs and placements.
 
 use fast_mesh_bvh::{BuildOptions, Bvh, UpdatePolicy};
-use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction};
+use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
 
+use crate::fields::{ColorState, Field, FieldHook};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::report::Report;
-use crate::{MeshChanges, MeshId, Placement, Result, SceneError};
+use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SubscriberId};
 
 /// When a mesh's BVH is brought up to date after the mesh changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,7 +62,14 @@ pub(crate) struct Entry {
     /// The BVH must be rebuilt from scratch: the mesh's content is not
     /// described by `pending` (after a [`SceneError::Corrupted`] undo).
     pub(crate) rebuild: bool,
-    pub(crate) report: Report,
+    /// One pending report per subscriber, in the order of
+    /// `Scene::subscribers`.
+    pub(crate) reports: Vec<Report>,
+    /// One pending change accumulator per field this mesh is part of (as
+    /// mesh `on` or `to`): the internal hook field updates read.
+    pub(crate) hooks: Vec<FieldHook>,
+    /// The mesh's colouring and its colours, if it has one.
+    pub(crate) coloring: Option<ColorState>,
 }
 
 impl Entry {
@@ -72,17 +80,71 @@ impl Entry {
     pub(crate) fn flag_unknown(&mut self) {
         self.pending = Some(ChangeSet::default());
         self.rebuild = true;
-        self.report.changes = None;
+        self.report_everything();
+    }
+
+    /// Reports the mesh as fully changed to every subscriber, colours
+    /// included (vertex ids may have been renumbered), and to every field
+    /// hook.
+    pub(crate) fn report_everything(&mut self) {
+        for r in &mut self.reports {
+            r.changes = None;
+            r.colors_dirty = None;
+        }
+        for h in &mut self.hooks {
+            h.changes = None;
+        }
+    }
+
+    /// Reports a placement change to every subscriber and field hook.
+    pub(crate) fn report_placement(&mut self) {
+        for r in &mut self.reports {
+            r.placement_changed = true;
+        }
+        for h in &mut self.hooks {
+            h.placement_changed = true;
+        }
+    }
+
+    /// Reports recoloured vertices to every subscriber (`None`: all).
+    pub(crate) fn report_colors(&mut self, ids: Option<&[VertexId]>) {
+        for r in &mut self.reports {
+            r.colors_changed(ids);
+        }
+    }
+
+    /// Reports a change of field `id`'s values to every subscriber.
+    pub(crate) fn report_field(&mut self, id: FieldId) {
+        for r in &mut self.reports {
+            r.field_changed(id);
+        }
+    }
+
+    /// Reports a write to channel `name` to every subscriber.
+    fn report_channel(&mut self, name: &str) {
+        for r in &mut self.reports {
+            r.channel_written(name);
+        }
     }
 
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
-    /// changes and into the report.
+    /// changes and into every subscriber's report.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
         match &mut self.pending {
             Some(p) => p.merge(changes),
             None => self.pending = Some(changes.clone()),
         }
-        self.report.merge(changes);
+        for r in &mut self.reports {
+            r.merge(changes);
+        }
+        for h in &mut self.hooks {
+            if let Some(c) = &mut h.changes {
+                c.merge(changes);
+            }
+        }
+        // Slots only grow through commits, undo, redo and cancel, all of
+        // which pass here.
+        self.grow_colors();
     }
 
     /// Whether the BVH is up to date with the mesh: not flagged for a
@@ -135,13 +197,27 @@ impl Entry {
     }
 }
 
+/// A consumer of change reports.
+struct Subscriber {
+    id: SubscriberId,
+    /// Reports of meshes removed since its last `take_changes_for`.
+    removed: Vec<MeshChanges>,
+}
+
 /// Several meshes, each with a BVH and a placement in the world.
 pub struct Scene {
     pub(crate) entries: SlotMap<Entry>,
-    /// Reports of meshes removed since the last `take_changes`.
-    removed: Vec<MeshChanges>,
+    /// The subscribers in ascending id order; the default one comes first
+    /// and is never removed. Each entry's `reports` follow this order.
+    subscribers: Vec<Subscriber>,
+    /// The id the next `subscribe` hands out.
+    next_subscriber: u64,
     /// The shared undo history across all meshes.
     history: History,
+    /// The registered fields, in registration order.
+    pub(crate) fields: Vec<Field>,
+    /// The id the next `add_distance_field` hands out.
+    pub(crate) next_field: u32,
 }
 
 impl Scene {
@@ -149,8 +225,14 @@ impl Scene {
     pub fn new(options: SceneOptions) -> Scene {
         Scene {
             entries: SlotMap::new(),
-            removed: Vec::new(),
+            subscribers: vec![Subscriber {
+                id: SubscriberId::DEFAULT,
+                removed: Vec::new(),
+            }],
+            next_subscriber: SubscriberId::DEFAULT.0 + 1,
             history: History::new(options.history_budget),
+            fields: Vec::new(),
+            next_field: 0,
         }
     }
 
@@ -174,28 +256,39 @@ impl Scene {
             mode: options.mode,
             pending: None,
             rebuild: false,
-            report: Report::added(),
+            reports: vec![Report::added(); self.subscribers.len()],
+            hooks: Vec::new(),
+            coloring: None,
         })
     }
 
     /// Removes a mesh and returns it. The id never matches again. Its
     /// history entries (undo, redo and in an open step) are dropped, steps
     /// left empty with them, and its patches release the slots they reserve.
-    /// The removal shows up in the next [`Scene::take_changes`], unless the
-    /// mesh was added since the last call.
+    /// The removal shows up in every subscriber's next
+    /// [`Scene::take_changes_for`], unless the mesh was added since that
+    /// subscriber's last call.
+    ///
+    /// The fields on the mesh and those measured to it are removed with it
+    /// (see [`Scene::remove_field`]), and so are colourings by them.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn remove_mesh(&mut self, id: MeshId) -> Result<Mesh> {
         self.entry(id)?;
-        // Reserve first so the report cannot be lost after the removal.
-        self.removed
-            .try_reserve(1)
-            .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+        // Reserve first so no report can be lost after the removal.
+        for s in &mut self.subscribers {
+            s.removed
+                .try_reserve(1)
+                .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+        }
+        self.drop_fields_of(id);
         let mut entry = self.entries.remove(id).ok_or(SceneError::UnknownMesh)?;
         self.history.forget(id, Some(&mut entry.mesh));
-        if !entry.report.added {
-            self.removed.push(entry.report.take(id, true));
+        for (s, r) in self.subscribers.iter_mut().zip(&mut entry.reports) {
+            if !r.added {
+                s.removed.push(r.take(id, true));
+            }
         }
         Ok(entry.mesh)
     }
@@ -204,7 +297,9 @@ impl Scene {
     /// patch in the history: in the open step, or as a step of its own when
     /// none is open. Recording drops the redo stack. The changes are added to
     /// the mesh's report and to its BVH's pending changes; an Eager BVH is
-    /// then brought up to date.
+    /// then brought up to date, and so are the Eager fields involving the
+    /// mesh (a failed field update leaves the field stale and never fails
+    /// the edit).
     ///
     /// An empty transaction records and reports nothing.
     ///
@@ -238,6 +333,7 @@ impl Scene {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.after_change();
         }
+        self.run_eager_fields(Some(&[id]));
         Ok(r)
     }
 
@@ -268,9 +364,19 @@ impl Scene {
     /// [`SceneError::Corrupted`] means that even restoring them failed, with
     /// the consequences described for [`Scene::undo`].
     pub fn cancel_step(&mut self) -> Result<()> {
-        let done = self.history.cancel(&mut self.entries)?;
+        let done = self.history.cancel(&mut self.entries);
+        let done = self.after_corrupted(done)?;
         self.absorb(done);
         Ok(())
+    }
+
+    /// Passes a history result through; after [`SceneError::Corrupted`]
+    /// (meshes flagged as fully changed) runs every Eager field first.
+    fn after_corrupted<T>(&mut self, r: Result<T>) -> Result<T> {
+        if r.as_ref().err() == Some(&SceneError::Corrupted) {
+            self.run_eager_fields(None);
+        }
+        r
     }
 
     /// Closes an open step, then undoes the latest step: its entries are
@@ -297,7 +403,8 @@ impl Scene {
     /// match the meshes, so the caller should consider
     /// [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
-        let done = self.history.undo(&mut self.entries)?;
+        let done = self.history.undo(&mut self.entries);
+        let done = self.after_corrupted(done)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
     }
 
@@ -308,7 +415,8 @@ impl Scene {
     /// # Errors
     /// As for [`Scene::undo`].
     pub fn redo(&mut self) -> Result<bool> {
-        let done = self.history.redo(&mut self.entries)?;
+        let done = self.history.redo(&mut self.entries);
+        let done = self.after_corrupted(done)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
     }
 
@@ -334,13 +442,14 @@ impl Scene {
     }
 
     /// Feeds the outcome of an undo, redo or cancel into the reports and
-    /// pending changes, then runs the Eager updates, as after an edit.
+    /// pending changes, then runs the Eager updates (BVHs, then fields), as
+    /// after an edit.
     fn absorb(&mut self, done: Vec<Done>) {
         for (id, changes) in &done {
             if let Some(e) = self.entries.get_mut(*id) {
                 match changes {
                     Some(c) => e.record_changes(c),
-                    None => e.report.placement_changed = true,
+                    None => e.report_placement(),
                 }
             }
         }
@@ -350,6 +459,8 @@ impl Scene {
                 e.after_change();
             }
         }
+        let touched: Vec<MeshId> = done.iter().map(|(id, _)| *id).collect();
+        self.run_eager_fields(Some(&touched));
     }
 
     /// Sets when the mesh's BVH is brought up to date. Switching to
@@ -363,24 +474,34 @@ impl Scene {
         let entry = self.entry_mut(id)?;
         entry.mode = mode;
         entry.after_change();
+        self.run_eager_fields(Some(&[id]));
         Ok(())
     }
 
-    /// Brings the mesh's BVH up to date now, whatever its mode.
+    /// Brings the mesh's BVH up to date now, whatever its mode. Eager fields
+    /// involving the mesh that were left stale (for example by this BVH
+    /// being a stale Manual one) then catch up.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update.
     /// On error the BVH keeps its pending changes.
     pub fn update(&mut self, id: MeshId) -> Result<()> {
-        self.entry_mut(id)?.update_bvh()
+        self.entry_mut(id)?.update_bvh()?;
+        self.run_eager_fields(Some(&[id]));
+        Ok(())
     }
 
     /// Brings every Lazy BVH up to date, and every Eager one left stale by a
-    /// failed update. Manual BVHs are left alone.
+    /// failed update; then does the same for the fields, which follow the
+    /// mode of the mesh they are on (see [`Scene::update_fields`]). Manual
+    /// BVHs and fields on Manual meshes are left alone.
     ///
     /// # Errors
-    /// The first BVH or memory error. Every mesh is still attempted; those
-    /// that failed keep their pending changes.
+    /// The first BVH, memory or field error, for example
+    /// [`SceneError::StaleBvh`] for a field measured to a stale Manual mesh:
+    /// such a field makes every `flush` return `StaleBvh` until that BVH is
+    /// brought up to date with [`Scene::update`]. Every mesh and field is
+    /// still attempted; those that failed keep their pending changes.
     pub fn flush(&mut self) -> Result<()> {
         let mut first = Ok(());
         for (_, entry) in self.entries.iter_mut() {
@@ -391,22 +512,91 @@ impl Scene {
                 }
             }
         }
+        let r = self.run_fields(|mode| mode != UpdateMode::Manual, None);
+        if first.is_ok() {
+            first = r;
+        }
         first
     }
 
     /// Everything that happened to the meshes since the last call, one entry
-    /// per affected mesh in id order, then resets every report.
+    /// per affected mesh in id order, then resets every report of the
+    /// default subscriber. Other subscribers keep theirs (see
+    /// [`Scene::subscribe`]).
     ///
     /// A mesh added and removed between two calls is not reported, and
     /// neither is a mesh whose changes cancel out (for example vertices added
     /// and removed again).
     pub fn take_changes(&mut self) -> Vec<MeshChanges> {
-        let mut out = std::mem::take(&mut self.removed);
+        // The default subscriber is always first.
+        self.take_at(0)
+    }
+
+    /// Adds a consumer of change reports and returns its id. It starts with
+    /// a clean report for every mesh, so it sees only what happens from now
+    /// on, and drains its reports with [`Scene::take_changes_for`]. Every
+    /// subscriber is told about the same changes, merged the same way.
+    /// A subscriber that never drains keeps accumulating reports (merged
+    /// change sets and removals) until it is drained or unsubscribed.
+    pub fn subscribe(&mut self) -> SubscriberId {
+        let id = SubscriberId(self.next_subscriber);
+        self.next_subscriber += 1;
+        for (_, entry) in self.entries.iter_mut() {
+            entry.reports.push(Report::clean());
+        }
+        self.subscribers.push(Subscriber {
+            id,
+            removed: Vec::new(),
+        });
+        id
+    }
+
+    /// Removes a subscriber and drops its pending reports. Its id is
+    /// rejected from then on.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidInput`] for an unknown or already removed id, or
+    /// for the default subscriber (which backs [`Scene::take_changes`]).
+    pub fn unsubscribe(&mut self, id: SubscriberId) -> Result<()> {
+        if id == SubscriberId::DEFAULT {
+            return Err(SceneError::InvalidInput(
+                "the default subscriber cannot be removed",
+            ));
+        }
+        let i = self.subscriber_index(id)?;
+        self.subscribers.remove(i);
+        for (_, entry) in self.entries.iter_mut() {
+            entry.reports.remove(i);
+        }
+        Ok(())
+    }
+
+    /// [`Scene::take_changes`] for subscriber `id`: everything that happened
+    /// to the meshes since its last call (or since it subscribed), one entry
+    /// per affected mesh in id order, then resets its reports.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidInput`] for an unknown or removed subscriber.
+    pub fn take_changes_for(&mut self, id: SubscriberId) -> Result<Vec<MeshChanges>> {
+        let i = self.subscriber_index(id)?;
+        Ok(self.take_at(i))
+    }
+
+    fn subscriber_index(&self, id: SubscriberId) -> Result<usize> {
+        self.subscribers
+            .binary_search_by_key(&id, |s| s.id)
+            .map_err(|_| SceneError::InvalidInput("unknown or removed subscriber"))
+    }
+
+    /// Drains the reports of the subscriber at index `i`.
+    fn take_at(&mut self, i: usize) -> Vec<MeshChanges> {
+        let mut out = std::mem::take(&mut self.subscribers[i].removed);
         for (id, entry) in self.entries.iter_mut() {
-            if entry.report.is_clean() {
-                entry.report = Report::clean();
+            let r = &mut entry.reports[i];
+            if r.is_clean() {
+                *r = Report::clean();
             } else {
-                out.push(entry.report.take(id, false));
+                out.push(r.take(id, false));
             }
         }
         out.sort_by_key(|c| c.id);
@@ -414,34 +604,57 @@ impl Scene {
     }
 
     /// Adds a channel to the mesh, filled with its default value. Not
-    /// undoable and not reported, as in the store.
+    /// undoable, as in the store; reported in
+    /// [`MeshChanges::channels_written`]. Names starting with `field:` are
+    /// reserved for the scene's fields.
     ///
     /// # Errors
+    /// [`SceneError::InvalidInput`] for a reserved name,
     /// [`SceneError::UnknownMesh`], or the store's error (for example a
     /// duplicate name). The scene is unchanged on error.
     pub fn add_channel(&mut self, id: MeshId, desc: ChannelDesc) -> Result<()> {
-        Ok(self.entry_mut(id)?.mesh.add_channel(desc)?)
+        check_name(&desc.name)?;
+        let entry = self.entry_mut(id)?;
+        let name = desc.name.clone();
+        entry.mesh.add_channel(desc)?;
+        entry.report_channel(&name);
+        Ok(())
     }
 
     /// Removes a channel from the mesh and returns its description. Not
-    /// undoable and not reported, as in the store. Recorded patches skip the
-    /// removed channel from then on, so undo and redo will not restore the
-    /// values of a removed source channel.
+    /// undoable, as in the store; reported in
+    /// [`MeshChanges::channels_written`]. Recorded patches skip the removed
+    /// channel from then on, so undo and redo will not restore the values of
+    /// a removed source channel.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`], or the store's error for an unknown name.
+    /// [`SceneError::InvalidInput`] for a reserved name (starting with
+    /// `field:`), [`SceneError::UnknownMesh`], or the store's error for an
+    /// unknown name.
     pub fn remove_channel(&mut self, id: MeshId, name: &str) -> Result<ChannelDesc> {
-        Ok(self.entry_mut(id)?.mesh.remove_channel(name)?)
+        check_name(name)?;
+        let entry = self.entry_mut(id)?;
+        let desc = entry.mesh.remove_channel(name)?;
+        entry.report_channel(name);
+        Ok(desc)
     }
 
-    /// Writable values of a derived channel. Writes are neither undoable nor
-    /// reported, as in the store.
+    /// Writable values of a derived channel. Writes are not undoable, as in
+    /// the store. The call itself is reported in
+    /// [`MeshChanges::channels_written`], since the slice may be written
+    /// after it returns.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`], or the store's error for an unknown or
-    /// non-derived channel.
+    /// [`SceneError::InvalidInput`] for a reserved name (starting with
+    /// `field:`), [`SceneError::UnknownMesh`], or the store's error for an
+    /// unknown or non-derived channel.
     pub fn derived_channel_mut(&mut self, id: MeshId, name: &str) -> Result<&mut [f32]> {
-        Ok(self.entry_mut(id)?.mesh.derived_channel_mut(name)?)
+        check_name(name)?;
+        let entry = self.entry_mut(id)?;
+        // Look the channel up first, so a failed call reports nothing.
+        entry.mesh.derived_channel_mut(name)?;
+        entry.report_channel(name);
+        Ok(entry.mesh.derived_channel_mut(name)?)
     }
 
     /// Removes the mesh's dead slots and renumbers the rest (see
@@ -450,7 +663,10 @@ impl Scene {
     /// steps left empty are dropped. Its placement entries stay valid and
     /// are kept. Nothing is released: the reserved slots no longer exist.
     /// Its BVH is rebuilt whatever its mode, and the next
-    /// [`Scene::take_changes`] reports it as fully changed (`changes: None`).
+    /// [`Scene::take_changes`] reports it as fully changed (`changes: None`,
+    /// `colors_dirty: None`). Its field channels and colours are remapped
+    /// with it; the fields involving it are recomputed in full on their
+    /// next update.
     ///
     /// If the rebuild fails, compaction still succeeds and the BVH stays
     /// pending, as after a failed Eager update in [`Scene::edit`].
@@ -466,8 +682,11 @@ impl Scene {
         // Every slot id changed; the BVH update rebuilds from scratch because
         // the mesh's epoch changed, whatever the pending changes say.
         entry.pending = Some(ChangeSet::default());
-        entry.report.changes = None;
+        entry.report_everything();
         let _ = entry.update_bvh();
+        // The field channels were remapped with the mesh; so are the colours.
+        entry.recolor_all();
+        self.run_eager_fields(Some(&[id]));
         Ok(remap)
     }
 
@@ -500,7 +719,8 @@ impl Scene {
     /// `placement_changed` and records the old and new value in the history
     /// (in the open step, or as a step of its own), which drops the redo
     /// stack. Setting the current placement again records and reports
-    /// nothing. No BVH is touched.
+    /// nothing. No BVH is touched; Eager fields involving the mesh are
+    /// updated (a failure leaves them stale).
     ///
     /// Within an open step, consecutive placement changes of the same mesh
     /// merge into one entry that keeps the first old value and the last new
@@ -521,9 +741,10 @@ impl Scene {
         }
         self.history.reserve()?;
         entry.placement = placement;
-        entry.report.placement_changed = true;
+        entry.report_placement();
         self.history
             .record_placement(&mut self.entries, id, old, placement);
+        self.run_eager_fields(Some(&[id]));
         Ok(())
     }
 
@@ -561,6 +782,19 @@ impl Scene {
             None => Ok(()),
         }
     }
+}
+
+/// The channel-name prefix reserved for the scene's fields.
+pub(crate) const FIELD_PREFIX: &str = "field:";
+
+/// Rejects a channel name in the reserved `field:` namespace.
+fn check_name(name: &str) -> Result<()> {
+    if name.starts_with(FIELD_PREFIX) {
+        return Err(SceneError::InvalidInput(
+            "channel names starting with `field:` are reserved",
+        ));
+    }
+    Ok(())
 }
 
 /// Test-only fault injection for the Scene's calls into lower crates, whose
@@ -1765,5 +1999,150 @@ mod tests {
         scene.flush().unwrap();
         assert_eq!(scene.is_current(e), Ok(true));
         assert_valid(&scene, e);
+    }
+
+    #[test]
+    fn two_subscribers_each_get_all_changes() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        // A new subscriber does not see the adds made before it.
+        let s = scene.subscribe();
+        assert_eq!(scene.take_changes_for(s), Ok(Vec::new()));
+        assert_eq!(scene.take_changes().len(), 2);
+
+        lift(&mut scene, a, 4, 1.0);
+        scene.set_placement(b, moved(1.0)).unwrap();
+        let mine = scene.take_changes();
+        assert_eq!(mine.len(), 2);
+        // Draining the default subscriber leaves the other one's reports.
+        lift(&mut scene, a, 1, 1.0);
+        let theirs = scene.take_changes_for(s).unwrap();
+        assert_eq!(theirs.len(), 2);
+        assert_eq!(theirs[0].id, a);
+        assert_eq!(theirs[0].changes.as_ref().unwrap().vertices_moved, [1, 4]);
+        assert_eq!(theirs[0].colors_dirty, Some(Vec::new()));
+        assert!(theirs[0].fields_changed.is_empty());
+        assert!(theirs[1].placement_changed && theirs[1].id == b);
+        let mine = scene.take_changes();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].changes.as_ref().unwrap().vertices_moved, [1]);
+
+        // Removals, compaction and new meshes reach every subscriber.
+        let s2 = scene.subscribe();
+        assert_ne!(s, s2);
+        let c = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        scene.compact(b).unwrap();
+        scene.remove_mesh(a).unwrap();
+        for got in [
+            scene.take_changes(),
+            scene.take_changes_for(s).unwrap(),
+            scene.take_changes_for(s2).unwrap(),
+        ] {
+            assert_eq!(got.len(), 3, "{got:?}");
+            assert!(got[0].id == a && got[0].removed);
+            assert!(got[1].id == b && got[1].changes.is_none() && !got[1].added);
+            assert!(got[2].id == c && got[2].added);
+        }
+        assert!(scene.take_changes_for(s2).unwrap().is_empty());
+    }
+
+    /// Whether a removal is reported depends on each subscriber's own report:
+    /// one that saw the add gets `removed`, one that did not gets nothing.
+    #[test]
+    fn add_then_remove_is_per_subscriber() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let s = scene.subscribe();
+        let id = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let added = scene.take_changes_for(s).unwrap();
+        assert!(added[0].added && added[0].colors_dirty.is_none());
+        lift(&mut scene, id, 0, 1.0);
+        scene.remove_mesh(id).unwrap();
+        let got = scene.take_changes_for(s).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].id == id && got[0].removed && !got[0].added);
+        assert_eq!(got[0].changes.as_ref().unwrap().vertices_moved, [0]);
+        assert!(scene.take_changes().is_empty());
+    }
+
+    #[test]
+    fn unsubscribed_id_rejected() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        scene.take_changes();
+        let s = scene.subscribe();
+        let keep = scene.subscribe();
+        scene.unsubscribe(s).unwrap();
+        assert!(matches!(
+            scene.take_changes_for(s),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.unsubscribe(s),
+            Err(SceneError::InvalidInput(_))
+        ));
+        // The others keep working, and a removal still cannot fail.
+        lift(&mut scene, a, 0, 1.0);
+        scene.remove_mesh(a).unwrap();
+        assert_eq!(scene.take_changes_for(keep).unwrap().len(), 1);
+        assert_eq!(scene.take_changes().len(), 1);
+        // Ids are never reused.
+        assert!(scene.subscribe() != s);
+    }
+
+    #[test]
+    fn channel_writes_are_reported() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(grid(1), MeshOptions::default()).unwrap();
+        let s = scene.subscribe();
+        scene.take_changes();
+        scene
+            .add_channel(id, ChannelDesc::derived("curv", 1))
+            .unwrap();
+        scene
+            .add_channel(id, ChannelDesc::derived("other", 1))
+            .unwrap();
+        scene.derived_channel_mut(id, "curv").unwrap()[0] = 1.0;
+        scene.derived_channel_mut(id, "curv").unwrap()[1] = 1.0;
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].channels_written, ["curv", "other"]);
+        assert_eq!(ch[0].changes.as_ref().map(ChangeSet::is_empty), Some(true));
+        assert!(!ch[0].placement_changed && !ch[0].added);
+        scene.remove_channel(id, "other").unwrap();
+        // Failed calls report nothing.
+        assert!(scene.derived_channel_mut(id, "nope").is_err());
+        assert!(scene.remove_channel(id, "nope").is_err());
+        assert_eq!(scene.take_changes()[0].channels_written, ["other"]);
+        assert!(scene.take_changes().is_empty());
+        assert_eq!(
+            scene.take_changes_for(s).unwrap()[0].channels_written,
+            ["curv", "other"]
+        );
+    }
+
+    #[test]
+    fn field_prefix_is_reserved() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(grid(1), MeshOptions::default()).unwrap();
+        scene.take_changes();
+        assert!(matches!(
+            scene.add_channel(id, ChannelDesc::derived("field:d", 1)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(scene.mesh(id).unwrap().channel("field:d").is_none());
+        assert!(matches!(
+            scene.remove_channel(id, "field:d"),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.derived_channel_mut(id, "field:d"),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(scene.take_changes().is_empty());
+        // Only the exact prefix is reserved.
+        scene
+            .add_channel(id, ChannelDesc::derived("fields", 1))
+            .unwrap();
     }
 }
