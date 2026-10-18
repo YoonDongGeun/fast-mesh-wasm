@@ -10,6 +10,23 @@
 //! from before and after the edit, so undoing means putting that data back.
 //! Mesh data is compared by alive slots.
 //!
+//! The history budget is either unlimited or small enough that steps are
+//! evicted within a short sequence. To know which steps go, the model must
+//! know each entry's size, and the size of a patch depends on which slots the
+//! store hands out, which depends on which slots eviction released. So each
+//! model mesh also keeps a shadow `Mesh` that gets the same edits through its
+//! own transactions; the model keeps the shadow's patches, applies, reverts
+//! and releases them as its own history rules say, and so knows each patch's
+//! size. The shadow's free slots must equal the scene mesh's after every
+//! action, which checks slot release on eviction, redo drops and removal.
+//!
+//! After every action `take_changes` is checked against the data the model
+//! had at the previous call: added and removed ids exactly, every slot whose
+//! content changed among the moved or changed ones, `changes: None` only after
+//! a compaction (the test injects no faults, so there is no `Corrupted`), and
+//! `placement_changed` exactly when some placement change ran, including one
+//! that was undone.
+//!
 //! Each edit does one thing to one mesh, so that "the patch is not empty" and
 //! "the model's data changed" are the same thing; steps group several edits.
 
@@ -18,11 +35,14 @@ use fast_mesh_query::{
     ClosestOptions, Cull, Ray, RayOptions, Rigid, closest_point, intersects, mesh_distance, raycast,
 };
 use fast_mesh_scene::{
-    MeshId, MeshOptions, Placement, Scene, SceneClosestOptions, SceneError, SceneOptions,
-    SceneRayOptions, UpdateMode,
+    MeshChanges, MeshId, MeshOptions, Placement, Scene, SceneClosestOptions, SceneError,
+    SceneOptions, SceneRayOptions, UpdateMode,
 };
-use fast_mesh_store::{Mesh, Transaction};
+use fast_mesh_store::{Mesh, Patch, PatchSide, Transaction};
 use proptest::prelude::*;
+
+/// Bytes a placement entry counts against the history budget.
+const PLACEMENT_BYTES: usize = 2 * std::mem::size_of::<Placement>();
 
 /// The case count: `PROPTEST_CASES` when set, else `default`. `with_cases`
 /// alone would ignore the environment variable.
@@ -67,12 +87,19 @@ enum EditOp {
     AddTriangle([u32; 3]),
     RemoveTriangle(u32),
     SetTriangle(u32, [u32; 3]),
+    RemoveVertex(u32),
 }
 
 #[derive(Debug, Clone)]
 enum Action {
     Edit(u8, EditOp),
     SetPlacement(u8, PlacementSeed),
+    /// Several placements of one mesh in a row, as a drag makes them: in an
+    /// open step they merge into one entry.
+    Drag(u8, PlacementSeed, u8),
+    /// Sets a mesh's current placement again: recorded and reported as
+    /// nothing.
+    SetSamePlacement(u8),
     Begin,
     End,
     Cancel,
@@ -83,6 +110,7 @@ enum Action {
     Flush,
     Remove(u8),
     Compact(u8),
+    ClearHistory,
     Query(u64),
 }
 
@@ -97,7 +125,15 @@ fn edit_op() -> impl Strategy<Value = EditOp> {
         2 => any::<[u32; 3]>().prop_map(EditOp::AddTriangle),
         2 => any::<u32>().prop_map(EditOp::RemoveTriangle),
         1 => (any::<u32>(), any::<[u32; 3]>()).prop_map(|(t, v)| EditOp::SetTriangle(t, v)),
+        1 => any::<u32>().prop_map(EditOp::RemoveVertex),
     ]
+}
+
+/// The history budget: unlimited, or small enough that a few edits or
+/// placement entries (a placement entry counts 192 bytes) fill it, so that
+/// short sequences evict steps and open steps outgrow it.
+fn budget() -> impl Strategy<Value = usize> {
+    prop_oneof![Just(usize::MAX), 100usize..800]
 }
 
 fn mode() -> impl Strategy<Value = UpdateMode> {
@@ -116,6 +152,8 @@ fn action() -> impl Strategy<Value = Action> {
     prop_oneof![
         8 => (any::<u8>(), edit_op()).prop_map(|(m, op)| Action::Edit(m, op)),
         3 => (any::<u8>(), placement_seed()).prop_map(|(m, p)| Action::SetPlacement(m, p)),
+        2 => (any::<u8>(), placement_seed(), 2u8..6).prop_map(|(m, p, n)| Action::Drag(m, p, n)),
+        1 => any::<u8>().prop_map(Action::SetSamePlacement),
         2 => Just(Action::Begin),
         2 => Just(Action::End),
         1 => Just(Action::Cancel),
@@ -126,6 +164,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => Just(Action::Flush),
         1 => any::<u8>().prop_map(Action::Remove),
         1 => any::<u8>().prop_map(Action::Compact),
+        1 => Just(Action::ClearHistory),
         2 => any::<u64>().prop_map(Action::Query),
     ]
 }
@@ -306,12 +345,14 @@ fn alive_slots<T>(v: &[Option<T>]) -> Vec<u32> {
 }
 
 /// What one edit did to the data.
+#[derive(Debug, PartialEq)]
 enum Delta {
     Move(u32, [f32; 3]),
     AddVertex(u32, [f32; 3]),
     AddTriangle(u32, [u32; 3]),
     RemoveTriangle(u32),
     SetTriangle(u32, [u32; 3]),
+    RemoveVertex(u32),
 }
 
 impl Delta {
@@ -324,7 +365,60 @@ impl Delta {
                 set_slot(&mut d.triangles, t as usize, Some(tri));
             }
             Delta::RemoveTriangle(t) => set_slot(&mut d.triangles, t as usize, None),
+            Delta::RemoveVertex(v) => set_slot(&mut d.positions, v as usize, None),
         }
+    }
+}
+
+/// How the data at the last `take_changes` (`snap`) differs from `now`, by
+/// slot: ids that became alive, ids that died, and ids alive in both whose
+/// content differs. All sorted.
+#[derive(Debug, Default, PartialEq)]
+struct Diff {
+    vertices_added: Vec<u32>,
+    vertices_removed: Vec<u32>,
+    vertices_moved: Vec<u32>,
+    triangles_added: Vec<u32>,
+    triangles_removed: Vec<u32>,
+    triangles_changed: Vec<u32>,
+}
+
+/// Per slot of two by-slot lists: (became alive, died, alive in both with
+/// different content).
+fn diff_slots<T: Copy + PartialEq>(
+    snap: &[Option<T>],
+    now: &[Option<T>],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut added, mut removed, mut changed) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..snap.len().max(now.len()) {
+        match (slot(snap, i), slot(now, i)) {
+            (None, Some(_)) => added.push(i as u32),
+            (Some(_), None) => removed.push(i as u32),
+            (Some(a), Some(b)) if a != b => changed.push(i as u32),
+            _ => {}
+        }
+    }
+    (added, removed, changed)
+}
+
+impl Diff {
+    fn of(snap: &Data, now: &Data) -> Diff {
+        let (vertices_added, vertices_removed, vertices_moved) =
+            diff_slots(&snap.positions, &now.positions);
+        let (triangles_added, triangles_removed, triangles_changed) =
+            diff_slots(&snap.triangles, &now.triangles);
+        Diff {
+            vertices_added,
+            vertices_removed,
+            vertices_moved,
+            triangles_added,
+            triangles_removed,
+            triangles_changed,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Diff::default()
     }
 }
 
@@ -396,16 +490,28 @@ fn run(
             tx.set_triangles(&[t], &[[a, b, c]])?;
             Some(Delta::SetTriangle(t, [a, b, c]))
         }
+        EditOp::RemoveVertex(s) => {
+            // Only a vertex no alive triangle uses can go.
+            let used: std::collections::HashSet<u32> =
+                data.triangles.iter().flatten().flatten().copied().collect();
+            let unused: Vec<u32> = vs.into_iter().filter(|v| !used.contains(v)).collect();
+            let Some(v) = pick(&unused, s) else {
+                return Ok(None);
+            };
+            tx.remove_vertices(&[v])?;
+            Some(Delta::RemoveVertex(v))
+        }
     })
 }
 
 /// One entry of a model step.
-#[derive(Clone)]
 enum Entry {
     Edit {
         mesh: usize,
         before: (Data, u64),
         after: (Data, u64),
+        /// The same edit's patch on the mesh's shadow.
+        patch: Box<Patch>,
     },
     Place {
         mesh: usize,
@@ -420,14 +526,36 @@ impl Entry {
             Entry::Edit { mesh, .. } | Entry::Place { mesh, .. } => *mesh,
         }
     }
+
+    /// What the entry counts against the history budget.
+    fn bytes(&self) -> usize {
+        match self {
+            Entry::Edit { patch, .. } => patch.byte_size(),
+            Entry::Place { .. } => PLACEMENT_BYTES,
+        }
+    }
 }
+
+type Step = Vec<Entry>;
 
 struct ModelMesh {
     id: MeshId,
     live: bool,
     data: Data,
+    /// A mesh that gets the same edits as the scene's, through its own
+    /// transactions; its patches live in the model's steps.
+    shadow: Mesh,
     placement: Placement,
     mode: UpdateMode,
+    /// The data and placement at the last `take_changes`.
+    snap: Data,
+    snap_placement: Placement,
+    /// A placement change ran since the last `take_changes`.
+    touched: bool,
+    /// Compacted since the last `take_changes`: reported as `None`.
+    everything: bool,
+    /// Removed, and the removal already reported.
+    gone: bool,
     /// The mesh's revision, as the store numbers them: an edit gets a new
     /// one, and undo and redo bring back the revision the patch started or
     /// ended at.
@@ -450,14 +578,18 @@ impl ModelMesh {
     }
 }
 
+/// The expected history: undo steps (oldest first), redo steps (next to redo
+/// last) and the open step, with the Scene's rules for steps, placement runs
+/// and the budget written out plainly.
 struct Model {
     /// The last revision handed out.
     last_rev: u64,
     meshes: Vec<ModelMesh>,
-    undo: Vec<Vec<Entry>>,
-    redo: Vec<Vec<Entry>>,
-    open: Vec<Entry>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    open: Step,
     depth: u32,
+    budget: usize,
 }
 
 impl Model {
@@ -472,13 +604,72 @@ impl Model {
         (!live.is_empty()).then(|| live[sel as usize % live.len()])
     }
 
-    /// Records an entry: drops the redo stack, then closes the step unless
-    /// one is open.
+    /// Bytes of every step held.
+    fn bytes(&self) -> usize {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .chain(std::iter::once(&self.open))
+            .flatten()
+            .map(Entry::bytes)
+            .sum()
+    }
+
+    /// A discarded step gives back the slots its patches reserve.
+    fn release(&mut self, step: &[Entry], side: PatchSide) {
+        for e in step {
+            if let Entry::Edit { mesh, patch, .. } = e
+                && self.meshes[*mesh].live
+            {
+                patch.release(&mut self.meshes[*mesh].shadow, side);
+            }
+        }
+    }
+
+    fn drop_redo(&mut self) {
+        for step in std::mem::take(&mut self.redo) {
+            self.release(&step, PatchSide::Redoable);
+        }
+    }
+
+    /// Drops the oldest undo steps until the budget is met.
+    fn evict(&mut self) {
+        while self.bytes() > self.budget && !self.undo.is_empty() {
+            let step = self.undo.remove(0);
+            self.release(&step, PatchSide::Undoable);
+        }
+    }
+
+    /// Drops the oldest redo steps until the budget is met.
+    fn evict_redo(&mut self) {
+        while self.bytes() > self.budget && !self.redo.is_empty() {
+            let step = self.redo.remove(0);
+            self.release(&step, PatchSide::Redoable);
+        }
+    }
+
+    /// Records an entry: a placement entry right after one of the same mesh
+    /// in the open step merges into it; anything else drops the redo stack,
+    /// then closes the step unless one is open, or else meets the budget.
     fn record(&mut self, e: Entry) {
-        self.redo.clear();
+        if self.depth > 0
+            && let Entry::Place { mesh, new, .. } = &e
+            && let Some(Entry::Place {
+                mesh: last,
+                new: last_new,
+                ..
+            }) = self.open.last_mut()
+            && last == mesh
+        {
+            *last_new = *new;
+            return;
+        }
+        self.drop_redo();
         self.open.push(e);
         if self.depth == 0 {
             self.close();
+        } else {
+            self.evict();
         }
     }
 
@@ -488,7 +679,59 @@ impl Model {
         if !self.open.is_empty() {
             let step = std::mem::take(&mut self.open);
             self.undo.push(step);
+            self.evict();
         }
+    }
+
+    /// Undoes the open step if it has entries, else the latest closed one.
+    /// An undone open step meets the budget only afterwards, on the redo
+    /// stack. False when there is nothing to undo.
+    fn undo(&mut self) -> bool {
+        if !self.open.is_empty() {
+            let step = std::mem::take(&mut self.open);
+            self.depth = 0;
+            self.run_step(&step, true);
+            self.redo.push(step);
+            self.evict();
+            self.evict_redo();
+            return true;
+        }
+        self.depth = 0;
+        let Some(step) = self.undo.pop() else {
+            return false;
+        };
+        self.run_step(&step, true);
+        self.redo.push(step);
+        true
+    }
+
+    /// Redoes the latest undone step, closing the open step first.
+    fn redo(&mut self) -> bool {
+        let Some(step) = self.redo.pop() else {
+            self.close();
+            return false;
+        };
+        self.depth = 0;
+        self.run_step(&step, false);
+        self.undo.push(step);
+        true
+    }
+
+    /// Reverts and discards the open step.
+    fn cancel(&mut self) {
+        let step = std::mem::take(&mut self.open);
+        self.depth = 0;
+        self.run_step(&step, true);
+        self.release(&step, PatchSide::Redoable);
+    }
+
+    /// Closes the open step, then drops every step.
+    fn clear(&mut self) {
+        self.close();
+        for step in std::mem::take(&mut self.undo) {
+            self.release(&step, PatchSide::Undoable);
+        }
+        self.drop_redo();
     }
 
     /// A revision that no mesh has had.
@@ -522,24 +765,58 @@ impl Model {
                     mesh,
                     before,
                     after,
-                } => self.set_data(*mesh, if undo { before } else { after }),
+                    patch,
+                } => {
+                    let shadow = &mut self.meshes[*mesh].shadow;
+                    if undo {
+                        patch.revert(shadow).unwrap();
+                    } else {
+                        patch.apply(shadow).unwrap();
+                    }
+                    self.set_data(*mesh, if undo { before } else { after });
+                }
                 Entry::Place { mesh, old, new } => {
-                    self.meshes[*mesh].placement = if undo { *old } else { *new };
+                    let m = &mut self.meshes[*mesh];
+                    m.placement = if undo { *old } else { *new };
+                    m.touched = true;
                 }
             }
         }
     }
 
     /// Drops the entries of `mesh` (all of them, or only the edits) from every
-    /// step; steps left empty go, except the open one.
+    /// step; steps left empty go, except the open one. Dropping all of them
+    /// (removal) releases what their patches reserve on the shadow, in the
+    /// Scene's order: undo steps, redo steps, then the open step.
     fn forget(&mut self, mesh: usize, edits_only: bool) {
-        let keep = |e: &Entry| e.mesh() != mesh || (edits_only && matches!(e, Entry::Place { .. }));
-        for step in self.undo.iter_mut().chain(&mut self.redo) {
-            step.retain(&keep);
+        let mut undo = std::mem::take(&mut self.undo);
+        let mut redo = std::mem::take(&mut self.redo);
+        let mut open = std::mem::take(&mut self.open);
+        let shadow = &mut self.meshes[mesh].shadow;
+        let mut drop_from = |step: &mut Step, side: PatchSide| {
+            step.retain(|e| {
+                if e.mesh() != mesh {
+                    return true;
+                }
+                if edits_only {
+                    return matches!(e, Entry::Place { .. });
+                }
+                if let Entry::Edit { patch, .. } = e {
+                    patch.release(shadow, side);
+                }
+                false
+            });
+        };
+        for step in &mut undo {
+            drop_from(step, PatchSide::Undoable);
         }
-        self.open.retain(&keep);
-        self.undo.retain(|s| !s.is_empty());
-        self.redo.retain(|s| !s.is_empty());
+        for step in &mut redo {
+            drop_from(step, PatchSide::Redoable);
+        }
+        drop_from(&mut open, PatchSide::Undoable);
+        undo.retain(|s| !s.is_empty());
+        redo.retain(|s| !s.is_empty());
+        (self.undo, self.redo, self.open) = (undo, redo, open);
     }
 }
 
@@ -927,6 +1204,19 @@ fn check_state(scene: &Scene, model: &Model) -> Result<(), TestCaseError> {
         }
         prop_assert_eq!(scene.placement(m.id).unwrap(), m.placement, "mesh {}", i);
         prop_assert_eq!(scene.is_current(m.id).unwrap(), m.current(), "mesh {}", i);
+        // Slots are released exactly when the model's history lets go.
+        prop_assert_eq!(
+            mesh.free_vertex_slots(),
+            m.shadow.free_vertex_slots(),
+            "free vertex slots of mesh {}",
+            i
+        );
+        prop_assert_eq!(
+            mesh.free_triangle_slots(),
+            m.shadow.free_triangle_slots(),
+            "free triangle slots of mesh {}",
+            i
+        );
         if m.mode == UpdateMode::Eager {
             prop_assert!(m.current(), "mesh {} is Eager but the model says stale", i);
         }
@@ -942,6 +1232,101 @@ fn check_state(scene: &Scene, model: &Model) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// One report against the model's data since the last call.
+fn check_report(m: &ModelMesh, i: usize, c: &MeshChanges) -> Result<(), TestCaseError> {
+    prop_assert!(!c.added, "mesh {} reported as added", i);
+    prop_assert_eq!(c.removed, !m.live, "removed flag of mesh {}", i);
+    // Exactly when a placement change ran, even one undone since.
+    prop_assert_eq!(
+        c.placement_changed,
+        m.touched,
+        "placement_changed of mesh {}",
+        i
+    );
+    if m.placement != m.snap_placement {
+        prop_assert!(c.placement_changed, "mesh {} moved unreported", i);
+    }
+    let Some(cs) = &c.changes else {
+        // No faults are injected, so no step ends `Corrupted`, and only
+        // initial adds (checked apart) and compaction report everything.
+        prop_assert!(m.everything, "mesh {} reported `None` uncompacted", i);
+        return Ok(());
+    };
+    prop_assert!(!m.everything, "compacted mesh {} reported with changes", i);
+    let d = Diff::of(&m.snap, &m.data);
+    prop_assert_eq!(&cs.vertices_added, &d.vertices_added, "mesh {}", i);
+    prop_assert_eq!(&cs.vertices_removed, &d.vertices_removed, "mesh {}", i);
+    prop_assert_eq!(&cs.triangles_added, &d.triangles_added, "mesh {}", i);
+    prop_assert_eq!(&cs.triangles_removed, &d.triangles_removed, "mesh {}", i);
+    // Moved and changed may hold slots written and restored again, but every
+    // slot whose content differs is among them. A moved vertex is dirty for
+    // every channel, so the channel lists need not name it.
+    for v in &d.vertices_moved {
+        prop_assert!(cs.vertices_moved.contains(v), "mesh {} vertex {}", i, v);
+    }
+    for t in &d.triangles_changed {
+        prop_assert!(cs.triangles_changed.contains(t), "mesh {} tri {}", i, t);
+    }
+    // And they only hold slots alive at both calls.
+    for &v in &cs.vertices_moved {
+        let alive = slot(&m.snap.positions, v as usize).is_some()
+            && slot(&m.data.positions, v as usize).is_some();
+        prop_assert!(alive, "mesh {} vertex {} moved but not alive", i, v);
+    }
+    for &t in &cs.triangles_changed {
+        let alive = slot(&m.snap.triangles, t as usize).is_some()
+            && slot(&m.data.triangles, t as usize).is_some();
+        prop_assert!(alive, "mesh {} triangle {} changed but not alive", i, t);
+    }
+    Ok(())
+}
+
+/// `take_changes` against the model, then the model's snapshots move on.
+fn check_reports(scene: &mut Scene, model: &mut Model) -> Result<(), TestCaseError> {
+    let got = scene.take_changes();
+    prop_assert!(got.windows(2).all(|w| w[0].id < w[1].id), "{:?}", got);
+    let mut seen = vec![false; model.meshes.len()];
+    for c in &got {
+        let i = model.meshes.iter().position(|m| m.id == c.id);
+        let Some(i) = i.filter(|&i| !model.meshes[i].gone) else {
+            return Err(TestCaseError::fail(format!("unexpected report {c:?}")));
+        };
+        seen[i] = true;
+        check_report(&model.meshes[i], i, c)?;
+    }
+    for (i, m) in model.meshes.iter().enumerate() {
+        if seen[i] || m.gone {
+            continue;
+        }
+        // Left out: nothing to report.
+        prop_assert!(m.live, "removal of mesh {} not reported", i);
+        prop_assert!(!m.touched, "placement change of mesh {} not reported", i);
+        prop_assert!(!m.everything, "compaction of mesh {} not reported", i);
+        let d = Diff::of(&m.snap, &m.data);
+        prop_assert!(d.is_empty(), "mesh {} changed unreported: {:?}", i, d);
+    }
+    for m in &mut model.meshes {
+        m.snap = m.data.clone();
+        m.snap_placement = m.placement;
+        m.touched = false;
+        m.everything = false;
+        m.gone = !m.live;
+    }
+    Ok(())
+}
+
+/// Sets a placement on the scene and the model; an unchanged one records and
+/// reports nothing.
+fn set_placement(scene: &mut Scene, model: &mut Model, i: usize, new: Placement) {
+    let old = model.meshes[i].placement;
+    scene.set_placement(model.meshes[i].id, new).unwrap();
+    if new != old {
+        model.meshes[i].placement = new;
+        model.meshes[i].touched = true;
+        model.record(Entry::Place { mesh: i, old, new });
+    }
+}
+
 fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), TestCaseError> {
     match action {
         Action::Edit(sel, op) => {
@@ -951,6 +1336,11 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
             let id = model.meshes[i].id;
             let before = (model.meshes[i].data.clone(), model.meshes[i].rev);
             let delta = scene.edit(id, |tx| run(tx, &before.0, op)).unwrap();
+            // The same edit on the shadow hands out the same slots.
+            let mut tx = model.meshes[i].shadow.begin_edit();
+            let shadow_delta = run(&mut tx, &before.0, op).unwrap();
+            let patch = tx.commit().unwrap();
+            prop_assert_eq!(&delta, &shadow_delta);
             if let Some(delta) = delta {
                 let mut data = before.0.clone();
                 delta.apply(&mut data);
@@ -960,6 +1350,7 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
                     mesh: i,
                     before,
                     after,
+                    patch: Box::new(patch),
                 });
             }
         }
@@ -967,12 +1358,28 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
             let Some(i) = model.choose(*sel) else {
                 return Ok(());
             };
-            let new = placement(*seed, model.meshes[i].anchor);
-            let old = model.meshes[i].placement;
-            scene.set_placement(model.meshes[i].id, new).unwrap();
-            model.meshes[i].placement = new;
-            if new != old {
-                model.record(Entry::Place { mesh: i, old, new });
+            set_placement(scene, model, i, placement(*seed, model.meshes[i].anchor));
+        }
+        Action::SetSamePlacement(sel) => {
+            let Some(i) = model.choose(*sel) else {
+                return Ok(());
+            };
+            set_placement(scene, model, i, model.meshes[i].placement);
+        }
+        Action::Drag(sel, (kind, q, j), frames) => {
+            let Some(i) = model.choose(*sel) else {
+                return Ok(());
+            };
+            for f in 0..*frames as i8 {
+                // Each frame slides a little further along x; the last frame
+                // of some drags lands back on the first one's placement.
+                let jx = if f + 1 == *frames as i8 && kind % 2 == 0 {
+                    j[0]
+                } else {
+                    j[0].wrapping_add(f.wrapping_mul(3))
+                };
+                let p = placement((*kind, *q, [jx, j[1], j[2]]), model.meshes[i].anchor);
+                set_placement(scene, model, i, p);
             }
         }
         Action::Begin => {
@@ -997,30 +1404,22 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
                 prop_assert!(matches!(r, Err(SceneError::StepNotOpen)), "{r:?}");
             } else {
                 prop_assert!(r.is_ok(), "{r:?}");
-                let step = std::mem::take(&mut model.open);
-                model.run_step(&step, true);
-                model.depth = 0;
+                model.cancel();
             }
         }
         Action::Undo => {
-            model.close();
+            // With eviction on, this is where a wrong step count shows: the
+            // scene undoes when the model has nothing left, or the other way.
             let got = scene.undo().unwrap();
-            let want = model.undo.pop();
-            prop_assert_eq!(got, want.is_some());
-            if let Some(step) = want {
-                model.run_step(&step, true);
-                model.redo.push(step);
-            }
+            prop_assert_eq!(got, model.undo());
         }
         Action::Redo => {
-            model.close();
             let got = scene.redo().unwrap();
-            let want = model.redo.pop();
-            prop_assert_eq!(got, want.is_some());
-            if let Some(step) = want {
-                model.run_step(&step, false);
-                model.undo.push(step);
-            }
+            prop_assert_eq!(got, model.redo());
+        }
+        Action::ClearHistory => {
+            scene.clear_history().unwrap();
+            model.clear();
         }
         Action::SetMode(sel, mode) => {
             let Some(i) = model.choose(*sel) else {
@@ -1061,14 +1460,22 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
             if let Err(e) = model.meshes[i].data.check(&mesh) {
                 return Err(TestCaseError::fail(format!("removed mesh {i}: {e}")));
             }
-            model.meshes[i].live = false;
             model.forget(i, false);
+            model.meshes[i].live = false;
+            // The removed mesh comes back with its history's slots released.
+            let shadow = &model.meshes[i].shadow;
+            prop_assert_eq!(mesh.free_vertex_slots(), shadow.free_vertex_slots());
+            prop_assert_eq!(mesh.free_triangle_slots(), shadow.free_triangle_slots());
         }
         Action::Compact(sel) => {
             let Some(i) = model.choose(*sel) else {
                 return Ok(());
             };
             let remap = scene.compact(model.meshes[i].id).unwrap();
+            let shadow_remap = model.meshes[i].shadow.compact().unwrap();
+            prop_assert_eq!(&remap.vertices, &shadow_remap.vertices);
+            prop_assert_eq!(&remap.triangles, &shadow_remap.triangles);
+            model.meshes[i].everything = true;
             let old = model.meshes[i].data.clone();
             let mut data = Data::default();
             for (v, p) in old.positions.iter().enumerate() {
@@ -1108,9 +1515,10 @@ proptest! {
         modes in prop::collection::vec(mode(), 3),
         starts in prop::collection::vec(placement_seed(), 3),
         seed in any::<u64>(),
-        actions in prop::collection::vec(action(), 1..25),
+        budget in budget(),
+        actions in prop::collection::vec(action(), 1..40),
     ) {
-        let mut scene = Scene::new(SceneOptions::default());
+        let mut scene = Scene::new(SceneOptions { history_budget: budget });
         // The second mesh is built far from zero, so that it has an origin;
         // the others have none.
         let specs: [(u32, [f64; 3]); 3] = [
@@ -1125,6 +1533,7 @@ proptest! {
             redo: Vec::new(),
             open: Vec::new(),
             depth: 0,
+            budget,
         };
         for k in 0..count {
             let (n, offset) = specs[k];
@@ -1150,13 +1559,27 @@ proptest! {
             model.meshes.push(ModelMesh {
                 id,
                 live: true,
+                snap: data.clone(),
                 data,
+                shadow: grid(n, offset),
                 placement: p,
                 mode: modes[k],
+                snap_placement: p,
+                touched: false,
+                everything: false,
+                gone: false,
                 rev: 0,
                 bvh_rev: 0,
                 anchor,
             });
+        }
+        // Freshly added meshes are reported as added and fully changed.
+        let first = scene.take_changes();
+        prop_assert_eq!(first.len(), count);
+        for (c, m) in first.iter().zip(&model.meshes) {
+            prop_assert_eq!(c.id, m.id);
+            prop_assert!(c.added && !c.removed && !c.placement_changed);
+            prop_assert!(c.changes.is_none());
         }
         check_state(&scene, &model)?;
         check_queries(&mut scene, &mut model, seed)?;
@@ -1165,6 +1588,7 @@ proptest! {
             // `check_eager` that it answers like a fresh build.
             apply(&mut scene, &mut model, a)?;
             check_state(&scene, &model)?;
+            check_reports(&mut scene, &mut model)?;
             check_eager(&mut scene, &model, seed.wrapping_add(i as u64))?;
         }
         scene.flush().unwrap();
@@ -1176,5 +1600,6 @@ proptest! {
         check_state(&scene, &model)?;
         check_queries(&mut scene, &mut model, seed ^ 0x5eed)?;
         check_state(&scene, &model)?;
+        check_reports(&mut scene, &mut model)?;
     }
 }
