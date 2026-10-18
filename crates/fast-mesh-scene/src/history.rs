@@ -77,10 +77,12 @@ pub(crate) type Done = (MeshId, Option<ChangeSet>);
 /// Undo and redo stacks of steps, plus the step being recorded.
 ///
 /// `bytes` counts every step held (undo, redo and the open one). Eviction
-/// drops the oldest undo steps only; it runs whenever a change is recorded,
-/// at which point the redo stack is already empty. The open step is never
+/// drops the oldest undo steps; it runs whenever a change is recorded, at
+/// which point the redo stack is already empty. The open step is never
 /// evicted while open; once closed, it is evicted like any other step, so a
-/// step larger than the whole budget is dropped as soon as it closes.
+/// step larger than the whole budget is dropped as soon as it closes. The
+/// one exception is `undo` on a non-empty open step: the step is undone
+/// first and then meets the budget on the redo stack (see `undo`).
 pub(crate) struct History {
     undo: VecDeque<Step>,
     redo: Vec<Step>,
@@ -188,6 +190,19 @@ impl History {
         self.bytes = 0;
     }
 
+    /// Drops the oldest redo steps until the budget is met. Only needed after
+    /// an open step was undone straight onto the redo stack, since an open
+    /// step is not evicted while open and may exceed the budget.
+    fn evict_redo(&mut self, entries: &mut SlotMap<Entry>) {
+        while self.bytes > self.budget && !self.redo.is_empty() {
+            let step = self.redo.remove(0);
+            self.bytes -= step.bytes;
+            for c in &step.changes {
+                release_in(c, entries, PatchSide::Redoable);
+            }
+        }
+    }
+
     /// True if `undo` would undo something (including the open step).
     pub(crate) fn can_undo(&self) -> bool {
         !self.undo.is_empty() || !self.open.changes.is_empty()
@@ -199,19 +214,38 @@ impl History {
     }
 
     /// Closes the open step and undoes the latest step. `None` when there is
-    /// nothing to undo. On error the meshes and both stacks are unchanged
-    /// (except for [`SceneError::Corrupted`]).
+    /// nothing to undo. On error the meshes, both stacks and the open step
+    /// are unchanged (except for [`SceneError::Corrupted`]).
+    ///
+    /// A non-empty open step is undone directly, before any eviction, so
+    /// that it is undone even when it exceeds the budget (§15.3: Ctrl+Z
+    /// mid-drag undoes the drag). It then goes to the redo stack, and the
+    /// budget is met by evicting the oldest undo steps, then, if that is not
+    /// enough, by dropping it from the redo stack again.
     pub(crate) fn undo(&mut self, entries: &mut SlotMap<Entry>) -> Result<Option<Vec<Done>>> {
-        self.close(entries);
-        if self.undo.is_empty() {
+        let has_open = !self.open.changes.is_empty();
+        if !has_open && self.undo.is_empty() {
+            self.depth = 0;
             return Ok(None);
         }
         self.redo
             .try_reserve(1)
             .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+        if has_open {
+            // Recording an entry dropped the redo stack, and nothing can
+            // fill it while the step stays open.
+            debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
+            let done = run_step(&self.open, entries, false)?;
+            self.depth = 0;
+            self.redo.push(std::mem::take(&mut self.open));
+            self.evict(entries);
+            self.evict_redo(entries);
+            return Ok(Some(done));
+        }
         let step = self.undo.pop_back().ok_or(SceneError::Corrupted)?;
         match run_step(&step, entries, false) {
             Ok(done) => {
+                self.depth = 0;
                 self.redo.push(step);
                 Ok(Some(done))
             }
@@ -225,16 +259,25 @@ impl History {
     /// Closes the open step and redoes the latest undone step. `None` when
     /// there is nothing to redo. Errors as for `undo`.
     pub(crate) fn redo(&mut self, entries: &mut SlotMap<Entry>) -> Result<Option<Vec<Done>>> {
-        self.close(entries);
         if self.redo.is_empty() {
+            // Closing may evict the closed step, as `end_step` would; there
+            // is nothing to redo either way.
+            self.close(entries);
             return Ok(None);
         }
+        // A non-empty redo stack means the open step is empty (recording
+        // drops the redo stack), so there is nothing to close but the depth.
+        debug_assert!(
+            self.open.changes.is_empty(),
+            "redo steps beside an open step"
+        );
         self.undo
             .try_reserve(1)
             .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
         let step = self.redo.pop().ok_or(SceneError::Corrupted)?;
         match run_step(&step, entries, true) {
             Ok(done) => {
+                self.depth = 0;
                 self.undo.push_back(step);
                 Ok(Some(done))
             }
@@ -324,9 +367,11 @@ impl History {
 ///
 /// If a change fails, the changes already run are run the other way, in the
 /// opposite order, and the error is returned with every mesh as before. If
-/// that recovery fails too, the result is [`SceneError::Corrupted`], and
-/// every mesh with an edit in the step is marked fully changed (see
-/// `Entry::mark_unknown`), since what it holds is no longer known.
+/// that recovery fails too, the result is [`SceneError::Corrupted`]: every
+/// mesh with an edit in the step is marked fully changed (see
+/// `Entry::flag_unknown`), since what it holds is no longer known, and every
+/// mesh with a placement entry in the step is reported as
+/// `placement_changed`, since its placement may be left at either value.
 fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Vec<Done>> {
     let mut done: Vec<Done> = Vec::new();
     done.try_reserve_exact(step.changes.len())
@@ -344,12 +389,7 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
             Err(e) => {
                 for j in (0..i).rev() {
                     if run_change(&step.changes[order(j)], entries, !forward).is_err() {
-                        for c in &step.changes {
-                            let Change::Edit(id, _) = c else { continue };
-                            if let Some(e) = entries.get_mut(*id) {
-                                e.mark_unknown();
-                            }
-                        }
+                        mark_corrupted(step, entries);
                         return Err(SceneError::Corrupted);
                     }
                 }
@@ -358,6 +398,32 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
         }
     }
     Ok(done)
+}
+
+/// After a failed recovery: flags every mesh the step touched, then brings
+/// the Eager BVHs up to date.
+///
+/// Flagging first and updating after means each mesh is rebuilt once, however
+/// many entries it has in the step: the first `after_change` rebuilds and
+/// clears the flag, the later ones find the BVH current. This needs no
+/// allocation, which matters on a path reached through out-of-memory errors.
+fn mark_corrupted(step: &Step, entries: &mut SlotMap<Entry>) {
+    for c in &step.changes {
+        let Some(e) = entries.get_mut(c.mesh()) else {
+            continue;
+        };
+        match c {
+            Change::Edit(..) => e.flag_unknown(),
+            Change::Placement { .. } => e.report.placement_changed = true,
+        }
+    }
+    for c in &step.changes {
+        if let Change::Edit(id, _) = c
+            && let Some(e) = entries.get_mut(*id)
+        {
+            e.after_change();
+        }
+    }
 }
 
 /// Applies (`forward`) or reverts one change. Returns the mesh's changes, or

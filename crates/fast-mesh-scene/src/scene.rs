@@ -67,13 +67,12 @@ pub(crate) struct Entry {
 impl Entry {
     /// Marks the mesh as changed in unknown ways, after a failed recovery:
     /// it is reported as fully changed, and the next BVH update rebuilds
-    /// from scratch even if the revision happens to match. An Eager BVH is
-    /// rebuilt right away.
-    pub(crate) fn mark_unknown(&mut self) {
+    /// from scratch even if the revision happens to match. The caller then
+    /// calls [`Entry::after_change`], which rebuilds an Eager BVH right away.
+    pub(crate) fn flag_unknown(&mut self) {
         self.pending = Some(ChangeSet::default());
         self.rebuild = true;
         self.report.changes = None;
-        self.after_change();
     }
 
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
@@ -98,6 +97,8 @@ impl Entry {
         if self.rebuild {
             #[cfg(test)]
             fault::before_bvh_update()?;
+            #[cfg(test)]
+            fault::count_rebuild();
             let mut bvh = Bvh::build(&self.mesh, self.bvh.options())?;
             bvh.set_policy(*self.bvh.policy())?;
             self.bvh = bvh;
@@ -278,14 +279,23 @@ impl Scene {
     /// for [`Scene::edit`]; a placement entry gets its old value back and is
     /// reported as `placement_changed`.
     ///
+    /// A non-empty open step is the latest step, and it is undone even when
+    /// it is larger than the whole history budget (Ctrl+Z mid-drag undoes
+    /// the drag). The budget is applied afterwards, which may evict the
+    /// oldest undo steps and, for a step larger than the budget, drop it
+    /// from the redo stack again.
+    ///
     /// # Errors
-    /// A store error (for example out of memory): the meshes and both stacks
-    /// are then unchanged. [`SceneError::Corrupted`] if restoring them after
-    /// such an error failed too: the step stays on its stack, the meshes it
-    /// edits may be partly changed, each of them is reported as fully
-    /// changed (`changes: None`) and its BVH is rebuilt from scratch on its
-    /// next update (right away for Eager). The history may no longer match
-    /// the meshes, so the caller should consider [`Scene::clear_history`].
+    /// A store error (for example out of memory): the meshes, both stacks
+    /// and an open step are then unchanged (the step stays open).
+    /// [`SceneError::Corrupted`] if restoring them after such an error
+    /// failed too: the step stays where it was, the meshes it edits may be
+    /// partly changed, each of them is reported as fully changed
+    /// (`changes: None`) and its BVH is rebuilt from scratch on its next
+    /// update (right away for Eager), and each mesh with a placement entry
+    /// in it is reported as `placement_changed`. The history may no longer
+    /// match the meshes, so the caller should consider
+    /// [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
         let done = self.history.undo(&mut self.entries)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -607,6 +617,21 @@ pub(crate) mod fault {
             PATCH_CALLS.with(|c| c.set(0));
         }
         Err(StoreError::OutOfMemory)
+    }
+
+    thread_local! {
+        /// Rebuilds of a BVH flagged for one (after `Corrupted`).
+        static REBUILDS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Counts one rebuild of a flagged BVH.
+    pub(crate) fn count_rebuild() {
+        REBUILDS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Rebuilds of flagged BVHs on this thread since the last call.
+    pub(crate) fn take_rebuilds() -> u32 {
+        REBUILDS.with(|c| c.replace(0))
     }
 
     /// Checked just before every `Bvh::update` call.
@@ -1278,11 +1303,15 @@ mod tests {
         assert_eq!(scene.mesh(a).unwrap().revision(), rev_a);
         assert_eq!((z(&scene, a, 0), z(&scene, b, 1)), (1.0, 0.0));
 
-        // Every mesh with an edit in the step is reported fully changed;
-        // the placement-only mesh is not.
+        // Every mesh with an edit in the step is reported fully changed; the
+        // placement-only mesh is reported as moved, since its placement may
+        // be left at either value (here recovery put it back).
         let ch = scene.take_changes();
-        assert_eq!(ch.iter().map(|c| c.id).collect::<Vec<_>>(), [a, b]);
-        assert!(ch.iter().all(|c| c.changes.is_none()));
+        assert_eq!(ch.iter().map(|c| c.id).collect::<Vec<_>>(), [a, b, c]);
+        assert!(ch[..2].iter().all(|c| c.changes.is_none()));
+        assert!(ch[2].placement_changed);
+        assert_eq!(ch[2].changes.as_ref().map(ChangeSet::is_empty), Some(true));
+        assert_eq!(scene.placement(c), Ok(moved(1.0)));
         // b (Eager) was rebuilt right away. a (Lazy) waits for a rebuild,
         // even though its revision still matches its BVH.
         assert_eq!(scene.is_current(b), Ok(true));
@@ -1300,6 +1329,131 @@ mod tests {
         assert_eq!(scene.undo(), Ok(true));
         assert_eq!(z(&scene, b, 2), 0.0);
         assert_valid(&scene, b);
+    }
+
+    /// A failed recovery rebuilds each touched Eager BVH once, however many
+    /// entries its mesh has in the step, and reports a placement the
+    /// recovery never got back to.
+    #[test]
+    fn corrupted_step_rebuilds_once_and_reports_placements() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let c = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        scene.begin_step();
+        for k in 0..3 {
+            lift(&mut scene, a, k, 1.0);
+            lift(&mut scene, b, k, 1.0);
+        }
+        scene.set_placement(c, moved(1.0)).unwrap();
+        scene.end_step().unwrap();
+        scene.take_changes();
+        fault::take_rebuilds();
+        // Undo order: c's placement, then b (call 1), then a (call 2, fails).
+        // Recovery re-applies b (call 3, fails), so c stays reverted.
+        fault::fail_patch_on(2);
+        fault::fail_patch_on(3);
+        assert_eq!(scene.undo(), Err(SceneError::Corrupted));
+        assert_eq!(scene.placement(c), Ok(Placement::IDENTITY));
+        // Six edit entries on two Eager meshes: two rebuilds, not six.
+        assert_eq!(fault::take_rebuilds(), 2);
+        for id in [a, b] {
+            assert_eq!(scene.is_current(id), Ok(true));
+            assert_valid(&scene, id);
+        }
+        let ch = scene.take_changes();
+        assert_eq!(ch.iter().map(|c| c.id).collect::<Vec<_>>(), [a, b, c]);
+        assert!(ch[..2].iter().all(|c| c.changes.is_none()));
+        assert!(ch[2].placement_changed);
+        assert_eq!(ch[2].changes.as_ref().map(ChangeSet::is_empty), Some(true));
+    }
+
+    /// Ctrl+Z on an open step larger than the whole budget undoes it; only
+    /// then is it dropped from the redo stack to meet the budget.
+    #[test]
+    fn undo_of_over_budget_open_step_still_undoes() {
+        let mut scene = Scene::new(SceneOptions {
+            history_budget: 1000,
+        });
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        // The reported repro: 20 placements of one mesh in an open step.
+        scene.begin_step();
+        for k in 1..=20 {
+            scene.set_placement(a, moved(f64::from(k))).unwrap();
+        }
+        assert!(scene.can_undo());
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(Placement::IDENTITY));
+        assert_eq!(scene.end_step(), Err(SceneError::StepNotOpen));
+
+        // Entries on alternating meshes: 20 x 192 bytes, far over budget.
+        lift(&mut scene, a, 4, 3.0);
+        scene.begin_step();
+        for k in 1..=10 {
+            scene.set_placement(a, moved(f64::from(k))).unwrap();
+            scene.set_placement(b, moved(f64::from(-k))).unwrap();
+        }
+        assert!(scene.history.bytes() > 1000);
+        assert!(scene.can_undo());
+        scene.take_changes();
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(Placement::IDENTITY));
+        assert_eq!(scene.placement(b), Ok(Placement::IDENTITY));
+        assert_eq!(scene.end_step(), Err(SceneError::StepNotOpen));
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 2);
+        assert!(ch.iter().all(|c| c.placement_changed));
+        // Recording evicted the older edit step; meeting the budget after the
+        // undo dropped the undone step from the redo stack.
+        assert!(!scene.can_undo() && !scene.can_redo());
+        assert_eq!(scene.history.bytes(), 0);
+        assert_eq!(z(&scene, a, 4), 3.0);
+
+        // An open step within budget stays redoable after the undo.
+        scene.begin_step();
+        scene.set_placement(b, moved(2.0)).unwrap();
+        assert_eq!(scene.undo(), Ok(true));
+        assert!(scene.can_redo());
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!(scene.placement(b), Ok(moved(2.0)));
+    }
+
+    /// A failed undo or redo leaves the open step open and unchanged.
+    #[test]
+    fn failed_undo_or_redo_keeps_open_step() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let oom = Err(SceneError::Store(StoreError::OutOfMemory));
+
+        // A non-empty open step: its own undo fails.
+        lift(&mut scene, a, 0, 1.0);
+        scene.begin_step();
+        lift(&mut scene, a, 1, 1.0);
+        fault::fail_patch_on(1);
+        assert_eq!(scene.undo(), oom);
+        assert_eq!((z(&scene, a, 0), z(&scene, a, 1)), (1.0, 1.0));
+        lift(&mut scene, a, 2, 1.0);
+        assert_eq!(scene.end_step(), Ok(()));
+        assert_eq!(scene.history.undo_len(), 2);
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!((z(&scene, a, 1), z(&scene, a, 2)), (0.0, 0.0));
+
+        // An empty open step: the undo of the latest closed step fails.
+        scene.begin_step();
+        fault::fail_patch_on(1);
+        assert_eq!(scene.undo(), oom);
+        assert_eq!(scene.end_step(), Ok(()));
+        assert_eq!(z(&scene, a, 0), 1.0);
+
+        // An empty open step: the redo fails.
+        scene.begin_step();
+        fault::fail_patch_on(1);
+        assert_eq!(scene.redo(), oom);
+        assert_eq!(scene.end_step(), Ok(()));
+        assert_eq!((z(&scene, a, 1), z(&scene, a, 2)), (0.0, 0.0));
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!((z(&scene, a, 1), z(&scene, a, 2)), (1.0, 1.0));
     }
 
     /// Bytes of each undo step, oldest first.
