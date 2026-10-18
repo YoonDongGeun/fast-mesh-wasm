@@ -157,6 +157,38 @@ impl History {
         }
     }
 
+    /// Records a placement change like `record`, except that it merges into
+    /// the open step's last entry when that is a placement entry of the same
+    /// mesh: the merged entry keeps its `old` and takes the new value, so a
+    /// drag records one entry however many frames it lasts. Any other entry
+    /// in between (an edit, or another mesh's placement) breaks the run. A
+    /// merge adds no bytes. `reserve` must have succeeded since the last
+    /// `record`.
+    pub(crate) fn record_placement(
+        &mut self,
+        entries: &mut SlotMap<Entry>,
+        id: MeshId,
+        old: Placement,
+        new: Placement,
+    ) {
+        if self.depth > 0
+            && let Some(Change::Placement {
+                id: last,
+                new: last_new,
+                ..
+            }) = self.open.changes.last_mut()
+            && *last == id
+        {
+            // The run's previous entry recorded `old` as its new value.
+            debug_assert!(*last_new == old, "placement run out of step");
+            *last_new = new;
+            // Recording the previous entry dropped the redo stack already.
+            debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
+            return;
+        }
+        self.record(entries, Change::Placement { id, old, new });
+    }
+
     fn drop_redo(&mut self, entries: &mut SlotMap<Entry>) {
         for step in self.redo.drain(..) {
             self.bytes -= step.bytes;

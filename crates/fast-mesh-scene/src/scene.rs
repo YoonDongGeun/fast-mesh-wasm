@@ -497,10 +497,17 @@ impl Scene {
         Ok(self.entry(id)?.placement)
     }
 
-    /// Moves the mesh. Stores the placement and records the old and new
-    /// value in the history (in the open step, or as a step of its own),
-    /// which drops the redo stack. Setting the current placement again
-    /// records nothing. No BVH is touched.
+    /// Moves the mesh. Stores the placement, reports it as
+    /// `placement_changed` and records the old and new value in the history
+    /// (in the open step, or as a step of its own), which drops the redo
+    /// stack. Setting the current placement again records and reports
+    /// nothing. No BVH is touched.
+    ///
+    /// Within an open step, consecutive placement changes of the same mesh
+    /// merge into one entry that keeps the first old value and the last new
+    /// one, so a drag of any length records one entry and undo still
+    /// restores the placement from before the drag. Any other entry in
+    /// between (an edit, or another mesh's placement) starts a new entry.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], [`SceneError::InvalidInput`] when the
@@ -509,18 +516,15 @@ impl Scene {
     pub fn set_placement(&mut self, id: MeshId, placement: Placement) -> Result<()> {
         placement.validate()?;
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
-        self.history.reserve()?;
         let old = entry.placement;
+        if old == placement {
+            return Ok(());
+        }
+        self.history.reserve()?;
         entry.placement = placement;
         entry.report.placement_changed = true;
-        if old != placement {
-            let change = Change::Placement {
-                id,
-                old,
-                new: placement,
-            };
-            self.history.record(&mut self.entries, change);
-        }
+        self.history
+            .record_placement(&mut self.entries, id, old, placement);
         Ok(())
     }
 
@@ -1417,6 +1421,94 @@ mod tests {
         assert!(scene.can_redo());
         assert_eq!(scene.redo(), Ok(true));
         assert_eq!(scene.placement(b), Ok(moved(2.0)));
+    }
+
+    /// Setting the current placement again is neither recorded nor
+    /// reported.
+    #[test]
+    fn unchanged_placement_is_not_reported() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        scene.take_changes();
+        scene.set_placement(a, Placement::IDENTITY).unwrap();
+        assert!(scene.take_changes().is_empty());
+        assert!(!scene.can_undo());
+        scene.set_placement(a, moved(1.0)).unwrap();
+        scene.take_changes();
+        scene.set_placement(a, moved(1.0)).unwrap();
+        assert!(scene.take_changes().is_empty());
+        assert_eq!(scene.history.undo_len(), 1);
+    }
+
+    /// A drag inside an open step records one placement entry per run.
+    #[test]
+    fn placement_runs_coalesce_in_open_step() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let bytes = crate::history::PLACEMENT_BYTES;
+
+        // 300 frames of a drag: one entry, one entry's bytes.
+        scene.begin_step();
+        for k in 1..=300 {
+            scene.set_placement(a, moved(f64::from(k))).unwrap();
+        }
+        assert_eq!(scene.history.bytes(), bytes);
+        scene.end_step().unwrap();
+        assert_eq!(step_bytes(&scene), [bytes]);
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(Placement::IDENTITY));
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(moved(300.0)));
+
+        // An edit or another mesh's placement between them breaks the run.
+        scene.begin_step();
+        scene.set_placement(a, moved(1.0)).unwrap();
+        scene.set_placement(a, moved(2.0)).unwrap();
+        lift(&mut scene, a, 0, 1.0);
+        scene.set_placement(a, moved(3.0)).unwrap();
+        scene.set_placement(b, moved(4.0)).unwrap();
+        scene.set_placement(a, moved(5.0)).unwrap();
+        scene.set_placement(a, moved(6.0)).unwrap();
+        scene.end_step().unwrap();
+        let last = *step_bytes(&scene).last().unwrap();
+        let edit = last - 4 * bytes;
+        assert!(edit > 0 && edit != bytes, "{last}");
+        // Undo goes back through every run to the placement before the step.
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(moved(300.0)));
+        assert_eq!(scene.placement(b), Ok(Placement::IDENTITY));
+        assert_eq!(z(&scene, a, 0), 0.0);
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!(scene.placement(a), Ok(moved(6.0)));
+        assert_eq!(scene.placement(b), Ok(moved(4.0)));
+
+        // Without an open step every placement is a step of its own.
+        let before = scene.history.undo_len();
+        scene.set_placement(a, moved(7.0)).unwrap();
+        scene.set_placement(a, moved(8.0)).unwrap();
+        assert_eq!(scene.history.undo_len(), before + 2);
+
+        // Cancelling a coalesced drag puts the placement back.
+        scene.begin_step();
+        for k in 0..10 {
+            scene.set_placement(b, moved(f64::from(k) + 0.5)).unwrap();
+        }
+        scene.cancel_step().unwrap();
+        assert_eq!(scene.placement(b), Ok(moved(4.0)));
+
+        // A drag back to where it started still leaves one entry, whose
+        // undo is reported as a placement change.
+        scene.begin_step();
+        scene.set_placement(b, moved(9.0)).unwrap();
+        scene.set_placement(b, moved(4.0)).unwrap();
+        scene.end_step().unwrap();
+        scene.take_changes();
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(b), Ok(moved(4.0)));
+        let ch = scene.take_changes();
+        assert_eq!(ch.len(), 1);
+        assert!(ch[0].placement_changed);
     }
 
     /// A failed undo or redo leaves the open step open and unchanged.
