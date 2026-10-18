@@ -23,6 +23,7 @@
 //!   orientation conflicts and, given a BVH, self-intersection.
 
 mod analyze;
+mod cleanup;
 mod error;
 #[cfg(test)]
 mod test_util;
@@ -30,6 +31,10 @@ mod topology;
 mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, analyze};
+pub use cleanup::{
+    ComponentOptions, DegenerateOptions, DegenerateReport, RemoveReport, WeldReport,
+    remove_degenerate, remove_small_components, weld,
+};
 pub use error::{OpsError, Result};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 

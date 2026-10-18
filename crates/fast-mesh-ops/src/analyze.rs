@@ -85,7 +85,7 @@ pub struct Analysis {
 
 /// A triangle is degenerate by area when its area is at most this times its
 /// longest edge squared (the default of `remove_degenerate`).
-const AREA_EPSILON: f64 = 1e-12;
+pub(crate) const AREA_EPSILON: f64 = 1e-12;
 
 /// Reports the defects of `mesh` without changing it.
 ///
@@ -170,7 +170,7 @@ pub fn analyze(mesh: &Mesh, options: &AnalyzeOptions) -> Result<Analysis> {
         let Some(tri) = mesh.triangle(t) else {
             continue;
         };
-        if is_degenerate(mesh, tri) {
+        if is_degenerate(mesh, tri, AREA_EPSILON) {
             degenerate += 1;
             if degenerate_list.len() < max {
                 push(&mut degenerate_list, t)?;
@@ -224,16 +224,16 @@ fn runs_forward(mesh: &Mesh, t: TriangleId, a: VertexId, b: VertexId) -> bool {
     (x, y) == (a, b) || (y, z) == (a, b) || (z, x) == (a, b)
 }
 
-/// A repeated vertex id, or an area of at most [`AREA_EPSILON`] times the
+/// A repeated vertex id, or an area of at most `area_epsilon` times the
 /// longest edge squared.
-fn is_degenerate(mesh: &Mesh, [a, b, c]: [VertexId; 3]) -> bool {
+pub(crate) fn is_degenerate(mesh: &Mesh, [a, b, c]: [VertexId; 3], area_epsilon: f64) -> bool {
     if a == b || b == c || a == c {
         return true;
     }
     let [p, q, r] = [a, b, c].map(|v| point(mesh, v));
     let d2 = |u: [f64; 3], v: [f64; 3]| (0..3).map(|k| (u[k] - v[k]).powi(2)).sum::<f64>();
     let longest = d2(p, q).max(d2(q, r)).max(d2(r, p));
-    triangle_area(mesh, [a, b, c]) <= AREA_EPSILON * longest
+    triangle_area(mesh, [a, b, c]) <= area_epsilon * longest
 }
 
 /// Marks a vertex whose group is not numbered yet, in [`groups`].

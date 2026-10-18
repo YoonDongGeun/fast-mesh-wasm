@@ -302,7 +302,7 @@ pub(crate) fn crossed_boxes() -> Mesh {
 ///   the quad's triangle. Each leaves a 4-vertex slit loop.
 /// - A copy of south triangle `[77, 85, 78]`, corners rotated: three
 ///   non-manifold edges.
-/// - Two triangles with a repeated vertex id, `[5, 5, 6]` and `[40, 41, 40]`.
+/// - Two triangles with a repeated vertex id, `[5, 5, 6]` and `[42, 45, 42]`.
 /// - A floating unit square of two triangles on vertices 90 to 93.
 ///
 /// The appended triangles end up as 165 (the copy), 166 and 167 (repeated
@@ -321,7 +321,7 @@ pub(crate) fn damaged_sphere() -> Mesh {
     }
     let [a, b, c] = triangles[156 + 4];
     triangles.push([b, c, a]);
-    triangles.extend([[5, 5, 6], [40, 41, 40]]);
+    triangles.extend([[5, 5, 6], [42, 45, 42]]);
     let base = (positions.len() / 3) as u32;
     positions.extend([5.0, 0.0, 0.0, 6.0, 0.0, 0.0, 6.0, 1.0, 0.0, 5.0, 1.0, 0.0]);
     triangles.extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
