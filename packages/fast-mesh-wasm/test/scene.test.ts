@@ -380,11 +380,13 @@ describe("Scene", () => {
     expect(s.canUndo()).toBe(false);
     const drag = s.drag(mesh);
     expect(codeOf(() => s.drag(mesh))).toBe("INVALID_ARGUMENT");
+    expect(drag.active).toBe(true);
     for (let k = 1; k <= 30; k++) {
       drag.move({ rotation: IDENTITY, translation: [k, 0, 0] });
     }
     drag.end();
     drag.end(); // no-op
+    expect(drag.active).toBe(false);
     expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [0, 0, 0] }))).toBe(
       "INVALID_ARGUMENT",
     );
@@ -399,6 +401,7 @@ describe("Scene", () => {
     const c = s.drag(mesh);
     c.move({ rotation: QUARTER_Z, translation: [5, 5, 5] });
     c.cancel();
+    expect(c.active).toBe(false);
     expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0] });
     expect(s.undo()).toBe(true);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
@@ -435,6 +438,7 @@ describe("Scene", () => {
     drag.move({ rotation: IDENTITY, translation: [3, 0, 0] });
     // Undo ends the drag first, then undoes it as a whole.
     expect(s.undo()).toBe(true);
+    expect(drag.active).toBe(false);
     expect(s.placement(mesh).translation).toEqual([1, 0, 0]);
     expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [9, 0, 0] }))).toBe(
       "INVALID_ARGUMENT",
@@ -452,6 +456,30 @@ describe("Scene", () => {
     expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
   });
 
+  it("remove_mesh_mid_drag_ends_it", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    const other = s.addMesh(quad, quadTris);
+    s.clearHistory();
+    const drag = s.drag(mesh);
+    drag.move({ rotation: IDENTITY, translation: [2, 0, 0] });
+    // Removing another mesh leaves the drag alone.
+    s.removeMesh(other);
+    expect(drag.active).toBe(true);
+    s.removeMesh(mesh);
+    expect(drag.active).toBe(false);
+    // The mesh's history, the drag's step included, goes with it.
+    expect(s.canUndo()).toBe(false);
+    expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [3, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    drag.end();
+    expect(codeOf(() => s.endStep())).toBe("STEP_NOT_OPEN");
+    // No step is left open, and a new drag can start.
+    const third = s.addMesh(quad, quadTris);
+    s.drag(third).end();
+  });
+
   it("step_calls_during_drag_abandon_it", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);
@@ -460,6 +488,7 @@ describe("Scene", () => {
     const d = s.drag(mesh);
     d.move({ rotation: IDENTITY, translation: [1, 0, 0] });
     s.cancelStep();
+    expect(d.active).toBe(false);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
     expect(() => s.undo()).not.toThrow();
     expect(() => d.move({ rotation: IDENTITY, translation: [2, 0, 0] })).toThrow("the drag is over");

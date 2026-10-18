@@ -81,8 +81,8 @@ export interface MeshChange {
  * {@link DragSession.end} is one undo step.
  *
  * The drag is over once it is ended or cancelled, and also when its step goes
- * away without it: an `undo()`, `redo()` or `clearHistory()` ends it first, and
- * a `cancelStep()` (or an `endStep()` that closes the drag's step) abandons it.
+ * away without it: an `undo()`, `redo()`, `clearHistory()` or `removeMesh()` of
+ * the dragged mesh ends it first, and a `cancelStep()` (or an `endStep()` that closes the drag's step) abandons it.
  */
 export interface DragSession {
   /**
@@ -93,6 +93,12 @@ export interface DragSession {
    * pose and apply it before {@link Scene.commitFrame}).
    */
   move(placement: PlacementInput): void;
+  /**
+   * False once the drag is over: ended, cancelled, or ended or abandoned by
+   * the scene (`undo()`, `redo()`, `clearHistory()`, `endStep()`,
+   * `cancelStep()`, `removeMesh()` of the dragged mesh).
+   */
+  readonly active: boolean;
   /**
    * Finishes the drag, recording it as one undo step (closing any step levels
    * opened inside it too). A no-op once it is over.
@@ -532,6 +538,8 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
 interface ActiveDrag {
   /** The step depth right after the drag's `beginStep`. */
   depth: number;
+  /** The mesh dragged. */
+  mesh: MeshHandle;
   end(): void;
   /** Marks the drag over without touching the history (its step is gone). */
   abandon(): void;
@@ -1137,9 +1145,17 @@ export class Scene {
     return this.#meshHandle(id[0], id[1]);
   }
 
-  /** Removes a mesh. Its handle then gives `UNKNOWN_MESH`. */
+  /**
+   * Removes a mesh. Its handle then gives `UNKNOWN_MESH`. An active drag of
+   * the mesh is ended first, closing its step; the mesh's history entries
+   * (the drag's included) are then dropped with it.
+   */
   removeMesh(mesh: MeshHandle): void {
     const { index, generation } = this.#id(mesh);
+    // A drag of this mesh ends first, recording its moves as one step.
+    if (this.#drag?.mesh === mesh) {
+      this.#drag.end();
+    }
     call(() => this.#scene().remove_mesh(index, generation));
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
@@ -1414,6 +1430,10 @@ export class Scene {
     };
     const session: DragSession & ActiveDrag = {
       depth,
+      mesh,
+      get active() {
+        return active;
+      },
       move: (placement) => {
         if (!active) {
           throw invalid("the drag is over");
@@ -1734,6 +1754,17 @@ export class Scene {
     const raw = this.#section(section);
     const p = this.#plane(plane);
     call(() => this.#scene().set_section_plane(raw, p));
+  }
+
+  /**
+   * A section's plane as last set by {@link Scene.addSection} or
+   * {@link Scene.setSectionPlane}, the normal normalised. Results not yet
+   * recomputed (`"stale"`) may still be cut with an earlier plane.
+   */
+  sectionPlane(section: SectionHandle): SectionPlane {
+    const raw = this.#section(section);
+    const p = call(() => this.#peek().section_desc_plane(raw));
+    return { origin: vec3At(p, 0), normal: vec3At(p, 3) };
   }
 
   /** Changes the meshes a section cuts. */

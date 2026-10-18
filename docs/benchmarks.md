@@ -334,6 +334,19 @@ Six `terrain(123)` tiles in a 3 by 2 grid, a distance field from every mesh to e
 
 Run 2: 1.01 ms (2.18 ms) and 112 ms (181 ms). In the contact case the whole frame uses about 6% of a 60 fps frame's 16.7 ms at the median. The wide case recomputes nearly every vertex of the moved tile and its neighbours on each move, and is not a frame-rate workload.
 
+### The three.js adapter: the same drag with `bindMesh` on both meshes
+
+`bindMesh` is attached to both 1M meshes (A, coloured, and the dragged B) and the benchmark calls `drag.move(pose)` then `scene.commitFrame()`; the adapters' listeners copy the dirty ranges into the `BufferAttribute` mirrors and set the update ranges inside `commitFrame()`. It runs in Node with `three` and no GL context, so the GPU upload is not measured. Scene, poses and `maxDistance` are those of the table above (`pnpm --filter fast-mesh-wasm bench -- --adapter` runs just this case). 3 cycles of 64 poses after a warm-up cycle, run after the adapter started converting colours from sRGB to linear per element; another test job may have shared the CPU, which mostly affects the engine's `move` time.
+
+| Per frame | 1M, contact | 1M, wide |
+| --- | --- | --- |
+| Total, median (p95) | 2.89 ms (6.25 ms) | 385 ms (948 ms) |
+| `drag.move` | 2.82 ms | 385 ms |
+| `commitFrame()` with both adapters applying | 0.06 ms (p95 0.15) | 0.20 ms (p95 0.42) |
+| `bindMesh` x2 + first `commitFrame()` (builds both geometries) | 141 ms | 146 ms |
+
+This table comes from a later run on the same machine than the header table of this section (the adapter case was added after it). Before the colour conversion, the same case measured 1.85 ms and 417 ms in total, `commitFrame()` 0.03 and 0.10 ms, and setup 91 and 64 ms; the conversion roughly doubles the adapter's share (0.06 and 0.20 ms) and the setup. The adapter still adds little next to the plain mirror copy of the core table (0.02 to 0.12 ms): the cost of a frame is the engine's work in `drag.move`. The adapter's bounding-box walk runs only when positions or indices change, so it does not appear in a placement-only drag. A GPU upload of the same ranges (the renderer uploading each update range: `bufferSubData` in WebGL, `writeBuffer` in WebGPU) comes on top and was not measured.
+
 ### Size of the wasm binary
 
 `dist/wasm/fast_mesh_wasm_bg.wasm` after `wasm-opt -O3`, gzip measured with `gzip -9`:

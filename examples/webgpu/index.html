@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fast-mesh-wasm + WebGPU</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #1c1f24;
+        color: #e6e6e6;
+        font: 13px/1.5 system-ui, sans-serif;
+      }
+      #view {
+        display: block;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+      }
+      .panel {
+        position: absolute;
+        left: 12px;
+        padding: 8px 12px;
+        background: rgba(0, 0, 0, 0.55);
+        border-radius: 6px;
+      }
+      #help {
+        top: 12px;
+      }
+      #status {
+        bottom: 12px;
+      }
+      #message {
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        max-width: 28em;
+        font-size: 15px;
+      }
+      kbd {
+        padding: 0 4px;
+        border: 1px solid #777;
+        border-radius: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="help" class="panel">
+      Click: pick · Drag: move · <kbd>Shift</kbd>+drag: rotate · Drag empty space: orbit · Wheel: zoom<br />
+      <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>
+      redo · <kbd>C</kbd> distance colours · <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd> opacity ·
+      <kbd>S</kbd> section<br />
+      Drop a binary STL to add it.
+    </div>
+    <div id="status" class="panel">Loading…</div>
+    <div id="message" class="panel" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

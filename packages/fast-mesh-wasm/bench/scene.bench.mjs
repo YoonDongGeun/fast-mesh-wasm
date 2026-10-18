@@ -1,6 +1,6 @@
 // Scene benchmarks, run against the built package (a release build, not the test build):
 //
-//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick]
+//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter]
 //
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
@@ -8,10 +8,12 @@
 // JS mirror (the three.js adapter's job, spec section 11 item 2).
 import { readFileSync } from "node:fs";
 import { Scene } from "../dist/node.js";
+import { bindMesh } from "../dist/three.js";
 
 const args = new Set(process.argv.slice(2));
 const quick = args.has("--quick");
 const with10m = args.has("--10m");
+const onlyAdapter = args.has("--adapter"); // run just the three.js adapter case
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -270,16 +272,77 @@ function benchOwner(label, frames, { gap, maxDistance }) {
   scene.free();
 }
 
+// ---- 4. three.js adapter: the 64-pose drag of two touching 1M meshes, bindMesh on both ----
+
+function benchAdapter(label, n, cycles, { maxDistance, range }) {
+  const a = terrain(n);
+  const b = terrain(n, { phase: 1.3 });
+  const scene = new Scene();
+  const meshA = scene.addMesh(a.positions, a.indices);
+  const meshB = scene.addMesh(b.positions, b.indices);
+  const cx = n / 2;
+  const cy = n / 2;
+  let lift = 8;
+  scene.setPlacement(meshB, flippedPose(0, cx, cy, lift));
+  lift -= scene.meshDistance(meshA, meshB)?.distance ?? 0;
+  const pose = (i) => flippedPose(0.1 * i, cx, cy, lift);
+  scene.setPlacement(meshB, pose(0));
+  scene.takeChanges();
+  const field = scene.addDistanceField({ name: "gap", on: meshA, to: meshB, maxDistance });
+  scene.setColoring(meshA, { field, map: "turbo", range, below: "clamp", above: "base" });
+  // Both meshes are bound before the first commitFrame, which builds the geometries (no GPU upload in Node).
+  let t0 = now();
+  const boundA = bindMesh(scene, meshA);
+  const boundB = bindMesh(scene, meshB);
+  scene.commitFrame();
+  console.log(`${label}: bindMesh x2 + first commitFrame (builds both geometries) ${fmt(now() - t0)} ms`);
+
+  const drag = scene.drag(meshB);
+  const total = [];
+  const parts = { move: [], commit: [] };
+  for (let c = 0; c < cycles + 1; c++) {
+    for (let i = 0; i < 64; i++) {
+      const p = pose(i);
+      const f0 = now();
+      drag.move(p);
+      const f1 = now();
+      scene.commitFrame(); // the adapters' listeners apply the ranges inside this call
+      const f2 = now();
+      if (c > 0) {
+        total.push(f2 - f0);
+        parts.move.push(f1 - f0);
+        parts.commit.push(f2 - f1);
+      }
+    }
+  }
+  drag.end();
+  scene.commitFrame();
+  report(`${label} frame (move + commitFrame with bindMesh on both)`, total);
+  console.log(
+    `  parts (median ms): move ${fmt(stats(parts.move).median)}, commitFrame incl. adapter ${fmt(stats(parts.commit).median)} (p95 ${fmt(stats(parts.commit).p95)})`,
+  );
+  boundA.dispose();
+  boundB.dispose();
+  scene.free();
+}
+
 // ---- run ----
 
 console.log(`node ${process.version}, ${process.platform} ${process.arch}${quick ? " (quick)" : ""}`);
 const contact = { maxDistance: 0.08, range: [-0.08, 0] }; // as the Rust drag bench
 const wide = { maxDistance: 8, range: [0, 6] }; // every vertex of the dragged pair is in range
+if (onlyAdapter) {
+  benchAdapter("adapter 1M contact", 708, quick ? 1 : 3, contact);
+  benchAdapter("adapter 1M wide", 708, quick ? 1 : 3, wide);
+  process.exit(0);
+}
 benchAdd("1M", 708, quick ? 3 : 7);
 benchDrag("1M contact", 708, quick ? 1 : 3, contact);
 benchDrag("1M wide", 708, quick ? 1 : 3, wide);
 benchOwner("owner scene, contact", quick ? 100 : 400, { gap: 0.5, maxDistance: 1 });
 benchOwner("owner scene, wide", quick ? 100 : 400, { gap: 2, maxDistance: 10 });
+benchAdapter("adapter 1M contact", 708, quick ? 1 : 3, contact);
+benchAdapter("adapter 1M wide", 708, quick ? 1 : 3, wide);
 if (with10m) {
   benchAdd("10M", 2236, 3);
   benchDrag("10M contact", 2236, 1, contact);

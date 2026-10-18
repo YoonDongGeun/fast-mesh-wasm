@@ -16,6 +16,7 @@ crates/fast-mesh-fields/  Per-vertex fields: signed distance (pseudonormal, fast
 crates/fast-mesh-ops/     Mesh repair: edge maps, components, boundary loops; analysis, weld, orient, hole filling.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.
+examples/webgpu/         Scene API in raw WebGPU (no 3D library): the renderer-neutral pattern.
 fixtures/smoke/          Script that CI runs after installing the package with npm, pnpm and bun.
 scripts/                 Cross-platform build and test scripts (Node.js, no bash needed).
 ```
