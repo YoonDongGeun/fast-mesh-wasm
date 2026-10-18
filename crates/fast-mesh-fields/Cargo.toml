@@ -1,0 +1,24 @@
+[package]
+name = "fast-mesh-fields"
+description = "Signed distance fields between editable triangle meshes (part of fast-mesh-wasm)"
+keywords = ["sdf", "mesh", "geometry", "distance", "3d"]
+categories = ["graphics", "algorithms"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fast-mesh-store.workspace = true
+fast-mesh-bvh.workspace = true
+fast-mesh-query.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "fields"
+harness = false

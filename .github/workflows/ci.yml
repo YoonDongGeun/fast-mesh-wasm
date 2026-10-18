@@ -31,9 +31,11 @@ jobs:
       # fast-mesh-wasm does not depend on the scene crate yet, so `pnpm
       # build` would not catch a scene change that breaks the wasm target.
       - run: cargo build --release --target wasm32-unknown-unknown -p fast-mesh-scene
+      - run: cargo build --release --target wasm32-unknown-unknown -p fast-mesh-fields
       - run: cargo bench -p fast-mesh-bvh --no-run
       - run: cargo bench -p fast-mesh-query --no-run
       - run: cargo bench -p fast-mesh-scene --no-run
+      - run: cargo bench -p fast-mesh-fields --no-run
 
   package:
     name: Build and check the npm package
