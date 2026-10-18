@@ -285,7 +285,12 @@ mod tests {
             }
             let mut out = vec![f32::NAN; points.len()];
             signed_distances(&mesh, &bvh, &sign, &points, f32::INFINITY, &mut out).unwrap();
-            check_against_exact(&mesh, &points, &out);
+            let checked = check_against_exact(&mesh, &points, &out);
+            assert!(
+                checked * 10 > points.len() * 9,
+                "only {checked} of {} signs checked",
+                points.len()
+            );
 
             // The fallback for a reported zero-area triangle really ran.
             let on_sliver = points

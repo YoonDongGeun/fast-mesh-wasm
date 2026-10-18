@@ -222,6 +222,12 @@ impl Scene {
     /// updated) and its sign data built here, so that
     /// [`Scene::field_status`] can report B's topology at once.
     ///
+    /// Every edit of the target mesh `desc.to` rebuilds its sign data over
+    /// the whole mesh (O(n), about 150 ms at 1M triangles in pseudonormal
+    /// mode, more after a topology edit, which drops the cached adjacency);
+    /// an incremental refit is planned for Phase 5b. Placement changes and
+    /// edits of `desc.on` do not rebuild it.
+    ///
     /// # Errors
     /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `on`
     /// equals `to`, `max_distance` is negative or NaN, or `on` already has a
@@ -493,10 +499,11 @@ impl Scene {
         }
     }
 
-    /// The largest absolute coordinate of A's root box and of B's root box
-    /// moved into A's space (the frame of the pair test), as in Phase 3b's
-    /// pair pruning: the magnitude the rounding of either side scales with.
-    /// 0 for a mesh without triangles.
+    /// The largest absolute coordinate of A's root box, of B's root box moved
+    /// into A's space (the frame of the pair test), as in Phase 3b's pair
+    /// pruning, and of B's root box in B's own space (the kernel rounds in
+    /// B's local `f32` frame): the magnitude the rounding of either side
+    /// scales with. 0 for a mesh without triangles.
     fn pair_magnitude(&self, on: MeshId, to: MeshId) -> Result<f64> {
         let xf = self.relative_transform(on, to)?;
         let root = |m: MeshId| -> Result<Option<_>> {
@@ -504,6 +511,7 @@ impl Scene {
         };
         let mut m = root(on)?.map_or(0.0, |b| box_magnitude(b.min, b.max));
         if let Some(b) = root(to)? {
+            m = m.max(box_magnitude(b.min, b.max));
             for k in 0..8 {
                 let corner =
                     std::array::from_fn(|d| if k >> d & 1 == 0 { b.min[d] } else { b.max[d] });
@@ -850,8 +858,9 @@ mod tests {
     /// rounding path (§11.9: relative to the scenes' unit size).
     const TOL: f32 = 1e-5;
 
-    /// Equal bits; or both finite within `TOL`; or one far and the other
-    /// within `TOL` of `max_distance`.
+    /// Equal bits; or both finite within `TOL`; or one far (`+∞`) and the
+    /// other within `TOL` of `max_distance`. Both infinite must be equal, so
+    /// that `+∞` never matches `-∞`.
     fn close(g: f32, w: f32, md: f64) -> bool {
         if g.to_bits() == w.to_bits() {
             return true;
@@ -859,11 +868,14 @@ mod tests {
         if g.is_nan() || w.is_nan() {
             return false;
         }
-        if g.is_finite() && w.is_finite() {
-            return (g - w).abs() <= TOL;
+        match (g.is_finite(), w.is_finite()) {
+            (true, true) => (g - w).abs() <= TOL,
+            (false, false) => g == w,
+            _ => {
+                let (finite, infinite) = if g.is_finite() { (g, w) } else { (w, g) };
+                infinite == f32::INFINITY && f64::from(finite.abs()) >= md - f64::from(TOL)
+            }
         }
-        let finite = if g.is_finite() { g } else { w };
-        f64::from(finite.abs()) >= md - f64::from(TOL)
     }
 
     fn assert_matches(scene: &mut Scene, id: FieldId) {
