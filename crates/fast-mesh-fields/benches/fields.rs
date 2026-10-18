@@ -2,13 +2,14 @@
 //! (the 64-pose drag) are in `fast-mesh-scene`.
 //!
 //! `cargo bench -p fast-mesh-fields` measures `SignData::build` (pseudonormal
-//! and winding) on 1M triangles, and `signed_distances` in both modes for a
+//! and winding) on 1M triangles, the pseudonormal build again with the mesh's
+//! adjacency not cached (as after a topology edit, which drops it), and `signed_distances` in both modes for a
 //! batch of 100,000 points near the surface, with criterion throughput set to
 //! the batch size so results read per point.
 
 use std::hint::black_box;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_fields::{SignData, SignMode, signed_distances};
 use fast_mesh_store::Mesh;
@@ -62,6 +63,27 @@ fn fields(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_function("sign_build_pseudonormal", |b| {
         b.iter(|| black_box(SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap()))
+    });
+
+    // A topology edit drops the cached adjacency (the incidence index is kept
+    // up to date), so the next build pays for it. A fresh mesh has a new uid,
+    // so each iteration builds its own mesh and BVH outside the timing and
+    // warms only the incidence index.
+    group.bench_function("sign_build_pseudonormal_cold_adjacency", |b| {
+        b.iter_batched(
+            || {
+                let mut fresh = terrain(n);
+                let fresh_bvh = Bvh::build(&fresh, &BuildOptions::default()).unwrap();
+                fresh.ensure_incidence().unwrap();
+                (fresh, fresh_bvh)
+            },
+            |(mut fresh, fresh_bvh)| {
+                let sign = SignData::build(&mut fresh, &fresh_bvh, SignMode::Pseudonormal).unwrap();
+                black_box(sign);
+                (fresh, fresh_bvh)
+            },
+            BatchSize::PerIteration,
+        )
     });
 
     group.bench_function("sign_build_winding", |b| {
