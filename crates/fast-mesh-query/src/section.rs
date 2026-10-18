@@ -274,6 +274,12 @@ fn in_box(p: P2, lo: P2, hi: P2) -> bool {
 /// until no unvisited cell can be closer. The result is the exact minimum of
 /// the pairwise distances, not an approximation.
 ///
+/// Known limits: a segment of `b` is listed in every cell its bounding box
+/// overlaps, and a segment of `a` starts from every cell its box overlaps, so
+/// long segments spanning many cells make building and searching the grid
+/// slower (mesh sections have short segments). Coordinates beyond about
+/// `1e154` overflow the squared distances.
+///
 /// # Errors
 /// - [`QueryError::InvalidInput`] when a point is not finite.
 /// - [`QueryError::OutOfMemory`] when working memory could not be reserved.
@@ -371,6 +377,8 @@ fn segment_gap(p: Seg, q: Seg) -> (f64, P2, P2) {
 thread_local! {
     /// Test-only count of [`segment_gap`] calls on this thread.
     static PAIRS_TESTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only count of rings searched by [`Grid::search`] on this thread.
+    static RINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The point of segment `ab` closest to `p`.
@@ -502,9 +510,10 @@ impl Grid {
 
     /// Tests `s` against the grid's segments that could be closer than
     /// `best`, improving it. Cells are visited in rings around the cells of
-    /// `s`'s box; after ring `r` every unvisited cell is at least `r` cell
-    /// sizes away (one cell of slack absorbs rounding in [`Grid::coord`]),
-    /// and the search stops once that bound reaches `best`.
+    /// `s`'s box. After each ring the unvisited cells form up to four strips
+    /// of the grid box beyond the ring's sides, each grown by one cell toward
+    /// `s` (slack for rounding in [`Grid::coord`]); the search stops once the
+    /// nearest strip is at least `best` away.
     fn search(
         &self,
         s: Seg,
@@ -522,14 +531,14 @@ impl Grid {
         let (x0, x1) = (self.coord(lo[0], 0), self.coord(hi[0], 0));
         let (y0, y1) = (self.coord(lo[1], 1), self.coord(hi[1], 1));
         let (nx, ny) = (self.nx as i64, self.ny as i64);
-        let step = self.size[0].min(self.size[1]);
+        // The edge of cell `i` along axis `k`.
+        let cell = |i: i64, k: usize| self.lo[k] + i as f64 * self.size[k];
         let mut visit = |x: i64, y: i64, best: &mut (f64, P2, P2)| {
             if !(0..nx).contains(&x) || !(0..ny).contains(&y) {
                 return;
             }
             // The cell grown by a cell on every side (slack for rounding):
             // its segments lie within it, unless they reach a nearer cell.
-            let cell = |i: i64, k: usize| self.lo[k] + i as f64 * self.size[k];
             let near = box_gap(
                 lo,
                 hi,
@@ -556,6 +565,8 @@ impl Grid {
         };
         let mut r = 0i64;
         loop {
+            #[cfg(test)]
+            RINGS.with(|c| c.set(c.get() + 1));
             let (rx0, rx1, ry0, ry1) = (x0 - r, x1 + r, y0 - r, y1 + r);
             for y in ry0.max(0)..=ry1.min(ny - 1) {
                 if r == 0 || y == ry0 || y == ry1 {
@@ -567,9 +578,21 @@ impl Grid {
                     visit(rx1, y, best);
                 }
             }
-            let covered = rx0 <= 0 && ry0 <= 0 && rx1 >= nx - 1 && ry1 >= ny - 1;
-            let bound = r as f64 * step;
-            if covered || best.0 == 0.0 || (bound * bound).max(to_grid) >= best.0 {
+            // The unvisited strips left, right, below and above the ring,
+            // where the grid extends past it.
+            let (glo, ghi) = (self.lo, self.hi);
+            let strips = [
+                (rx0 > 0).then(|| (glo, [cell(rx0 + 1, 0), ghi[1]])),
+                (rx1 < nx - 1).then(|| ([cell(rx1, 0), glo[1]], ghi)),
+                (ry0 > 0).then(|| (glo, [ghi[0], cell(ry0 + 1, 1)])),
+                (ry1 < ny - 1).then(|| ([glo[0], cell(ry1, 1)], ghi)),
+            ];
+            let nearest = strips
+                .into_iter()
+                .flatten()
+                .map(|(l, h)| box_gap(lo, hi, l, h))
+                .fold(f64::INFINITY, f64::min);
+            if best.0 == 0.0 || nearest.max(to_grid) >= best.0 {
                 return;
             }
             r += 1;
@@ -831,6 +854,28 @@ mod tests {
         assert!((g.distance - 2.0).abs() < 1e-5);
         // About 45 pairs per segment, against 2048 for all pairs.
         assert!(tested < 2048 * 64, "{tested}");
+    }
+
+    #[test]
+    fn gap_near_flat_side_is_not_quadratic() {
+        // Side b is one grid row thinner than its segment spacing (a 1e-6
+        // spike at one end); side a hangs over its other half.
+        let n = 5000;
+        let mut b: Vec<_> = (0..=n).map(|i| [10.0 * i as f64 / n as f64, 0.0]).collect();
+        b[1][1] = 1e-6;
+        for height in [1.0, 0.01] {
+            let a: Vec<_> = (0..=n)
+                .map(|i| [5.0 + 5.0 * i as f64 / n as f64, height])
+                .collect();
+            RINGS.with(|c| c.set(0));
+            let g = contour_gap(&[(&a, false)], &[(&b, false)])
+                .unwrap()
+                .unwrap();
+            let rings = RINGS.with(|c| c.get());
+            assert_eq!(g.distance, height);
+            // A few rings per segment, against about `n` each before.
+            assert!(rings < 8 * n, "{rings}");
+        }
     }
 
     #[test]
