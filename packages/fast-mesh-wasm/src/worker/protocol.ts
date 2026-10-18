@@ -181,7 +181,11 @@ export interface Result {
   changes: MeshChangeWire[];
   /** Placement and `matrix4` (column-major) of every mesh added or moved. */
   placements: { id: ClientId; rotation: number[]; translation: number[]; matrix4: number[] }[];
-  /** Every changed section entry; `result` is `null` once the section or the entry is gone. */
+  /**
+   * Every changed section entry. `result` is `null` once the entry is gone:
+   * the section was removed, no longer cuts the mesh, or the mesh was
+   * removed (one entry per section that cut it).
+   */
   sections: { section: ClientId; mesh: ClientId; result: SectionResultWire | null }[];
   history: { canUndo: boolean; canRedo: boolean };
   /**
@@ -191,9 +195,11 @@ export interface Result {
   status: { key: string; rev: number; status: "ready" | "error"; error?: ErrorWire }[];
   replies: { qid: number; ok: boolean; value?: unknown; error?: ErrorWire }[];
   /**
-   * The WebAssembly instance trapped: every call from now on fails with
-   * `INSTANCE_POISONED`, and the changes of this batch are lost. Recreate the
-   * Worker.
+   * The engine stopped: the WebAssembly instance trapped, or packing the
+   * result failed. The whole batch failed: its changes are lost, and every
+   * status and reply in this result is an `INSTANCE_POISONED` error (the
+   * message names the cause). Later batches fail the same way without
+   * running. Recreate the Worker.
    */
   poisoned?: boolean;
 }
@@ -201,7 +207,9 @@ export interface Result {
 /**
  * The key of a request: its own `key`, or a default naming what it targets
  * (`mesh:<id>` for add and remove, `edit:<id>` for edits, repairs and
- * compaction, `field:<id>`, `section:<id>`, `history`). Queries have none.
+ * compaction, `field:<id>`, `section:<id>` for section add and remove,
+ * `section:<id>:<aspects>` for a section `set`, such as `section:3:plane` or
+ * `section:3:plane+fill`, `history`). Queries have none.
  */
 export function keyOf(req: Request): string | undefined {
   if ("key" in req && req.key !== undefined) {
@@ -221,16 +229,26 @@ export function keyOf(req: Request): string | undefined {
     case "field":
       return `field:${req.field}`;
     case "section":
-      return `section:${req.section}`;
+      return req.op === "set"
+        ? `section:${req.section}:${sectionAspects(req.desc).join("+") || "none"}`
+        : `section:${req.section}`;
     default:
       return undefined;
   }
 }
 
+/** The aspects a section `set` changes, in application order. */
+export function sectionAspects(desc: SectionDescWire | undefined): ("plane" | "meshes" | "fill")[] {
+  return (["plane", "meshes", "fill"] as const).filter((a) => desc?.[a] !== undefined);
+}
+
 /**
  * Whether only the latest of consecutive same-key requests of this kind
- * matters: colouring, section plane/meshes/fill changes and drag moves. Give
- * section changes of different aspects (plane, meshes, fill) different keys.
+ * matters: colouring, section plane/meshes/fill changes and drag moves. The
+ * engine drops such a request only when the next queued request with the
+ * same key is of the same kind, for the same target, and (for a section
+ * `set`) changes every aspect the earlier one changed; so a reused key never
+ * drops another target's or another aspect's change.
  */
 export function isLastWins(req: Request): boolean {
   return (
@@ -238,4 +256,30 @@ export function isLastWins(req: Request): boolean {
     (req.kind === "section" && req.op === "set") ||
     (req.kind === "drag" && req.phase === "move")
   );
+}
+
+/**
+ * Whether `later` makes the last-wins request `earlier` redundant: same kind,
+ * same target (mesh or section) and, for a section `set`, every aspect of
+ * `earlier` changed again. Keys are not compared here.
+ */
+export function supersedes(later: Request, earlier: Request): boolean {
+  if (!isLastWins(earlier) || !isLastWins(later) || later.kind !== earlier.kind) {
+    return false;
+  }
+  switch (earlier.kind) {
+    case "coloring":
+    case "drag":
+      return (later as typeof earlier).id === earlier.id;
+    case "section": {
+      const l = later as typeof earlier;
+      if (l.section !== earlier.section) {
+        return false;
+      }
+      const changed = sectionAspects(l.desc);
+      return sectionAspects(earlier.desc).every((a) => changed.includes(a));
+    }
+    default:
+      return false;
+  }
 }

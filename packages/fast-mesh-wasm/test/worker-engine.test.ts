@@ -51,7 +51,7 @@ class Harness {
   readonly worker: Worker;
   readonly #pending: { resolve: (r: Result) => void; reject: (e: unknown) => void }[] = [];
 
-  constructor(workerData: { testPanic?: boolean } = {}) {
+  constructor(workerData: { testPanic?: boolean; packThrow?: boolean } = {}) {
     this.worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), { workerData });
     this.worker.on("message", (r: Result) => this.#pending.shift()?.resolve(r));
     this.worker.on("error", (e) => {
@@ -77,7 +77,7 @@ class Harness {
 
 const harnesses: Harness[] = [];
 const scenes: Scene[] = [];
-function harness(workerData?: { testPanic?: boolean }): Harness {
+function harness(workerData?: { testPanic?: boolean; packThrow?: boolean }): Harness {
   const h = new Harness(workerData);
   harnesses.push(h);
   return h;
@@ -511,12 +511,95 @@ describe("worker engine", () => {
     const r3 = await h.send([
       { kind: "section", rev: rev(), section: 5, op: "set", desc: { meshes: [1] }, key: "section:5:meshes" },
     ]);
-    expect(entry(r3, 2)?.result ?? null).toBeNull();
+    expect(entry(r3, 2)).toBeDefined();
+    expect(entry(r3, 2)!.result).toBeNull();
     const r4 = await h.send([{ kind: "section", rev: rev(), section: 5, op: "remove" }]);
+    expect(r4.sections.length).toBeGreaterThan(0);
+    expect(entry(r4, 1)).toBeDefined();
     for (const x of r4.sections) {
       expect(x.result).toBeNull();
     }
     expect(statusOf(r4, "section:5")).toMatchObject({ status: "ready" });
+
+    // Removing a mesh nulls its entries in every section that cut it.
+    const r5 = await h.send([
+      { kind: "section", rev: rev(), section: 6, op: "add", desc: { plane, meshes: [1, 2] } },
+      { kind: "section", rev: rev(), section: 7, op: "add", desc: { plane, meshes: [2] } },
+    ]);
+    expect(entry(r5, 2)).toBeUndefined();
+    const r6 = await h.send([{ kind: "removeMesh", rev: rev(), id: 2 }]);
+    const gone = r6.sections.filter((x) => x.mesh === 2);
+    expect(gone.map((x) => [x.section, x.result]).sort()).toEqual([
+      [6, null],
+      [7, null],
+    ]);
+  });
+
+  it("section_set_default_keys_keep_aspects", async () => {
+    const h = harness();
+    const ref = scene();
+    const a = sphere([0, 0, 0]);
+    const plane = (z: number) => ({ origin: [0, 0, z] as Vec3, normal: [0, 0, 1] as Vec3 });
+    const set = (desc: object, key?: string): Request =>
+      ({ kind: "section", rev: rev(), section: 5, op: "set", desc, ...(key === undefined ? {} : { key }) }) as Request;
+    await h.send([
+      addMesh(1, a),
+      { kind: "section", rev: rev(), section: 5, op: "add", desc: { plane: plane(0.1), meshes: [1] } },
+    ]);
+    const ra = ref.addMesh(a.positions, a.indices);
+    const sec = ref.addSection({ plane: plane(0.1), meshes: [ra] });
+
+    // Default keys name the aspects: a plane and a fill change both run.
+    const b1 = [set({ plane: plane(0.3) }), set({ fill: true })];
+    const r1 = await h.send(b1);
+    ref.setSectionPlane(sec, plane(0.3));
+    ref.setSectionFill(sec, true);
+    expect(r1.status).toEqual([
+      { key: "section:5:plane", rev: b1[0].rev, status: "ready" },
+      { key: "section:5:fill", rev: b1[1].rev, status: "ready" },
+    ]);
+    const got = r1.sections.find((x) => x.section === 5 && x.mesh === 1)!.result;
+    expectSection(got, ref.section(sec, ra));
+    expect(got!.fill).toBeDefined();
+
+    // A shared explicit key never drops another aspect's change (plane 0.4
+    // survives the fill change after it, plane+fill survives a plane-only
+    // one); a later set covering every aspect of an earlier one drops it
+    // (fill false by plane+fill, planes 0.6 and 0.7 by the next ones).
+    const b2 = [
+      set({ plane: plane(0.4) }, "k"),
+      set({ fill: false }, "k"),
+      set({ plane: plane(0.5), fill: true }, "k"),
+      set({ plane: plane(0.6) }, "k"),
+      set({ plane: plane(0.7) }, "k"),
+      set({ plane: plane(0.2), fill: true }, "k"),
+    ];
+    const r2 = await h.send(b2);
+    expect(r2.status.map((x) => x.rev)).toEqual([b2[0].rev, b2[2].rev, b2[5].rev]);
+    ref.setSectionPlane(sec, plane(0.2));
+    expectSection(r2.sections.find((x) => x.section === 5 && x.mesh === 1)!.result, ref.section(sec, ra));
+  });
+
+  it("reused_key_never_drops_another_target", async () => {
+    const h = harness();
+    const plane = (z: number) => ({ origin: [0, 0, z] as Vec3, normal: [0, 0, 1] as Vec3 });
+    await h.send([
+      addMesh(1, sphere([0, 0, 0])),
+      addMesh(2, sphere([3, 0, 0])),
+      { kind: "section", rev: rev(), section: 5, op: "add", desc: { plane: plane(0), meshes: [1] } },
+      { kind: "section", rev: rev(), section: 6, op: "add", desc: { plane: plane(0), meshes: [2] } },
+    ]);
+    const batch: Request[] = [
+      { kind: "coloring", rev: rev(), id: 1, rule: null, key: "shared" },
+      { kind: "coloring", rev: rev(), id: 2, rule: null, key: "shared" },
+      { kind: "section", rev: rev(), section: 5, op: "set", desc: { plane: plane(0.2) }, key: "s" },
+      { kind: "section", rev: rev(), section: 6, op: "set", desc: { plane: plane(0.3) }, key: "s" },
+    ];
+    const r = await h.send(batch);
+    expect(r.status.map((x) => x.rev)).toEqual(batch.map((x) => x.rev));
+    const z = (s: number) => r.sections.find((x) => x.section === s)!.result!.contours[0].points[2];
+    expect(z(5)).toBeCloseTo(0.2, 6);
+    expect(z(6)).toBeCloseTo(0.3, 6);
   });
 
   it("errors_cross_boundary_with_codes", async () => {
@@ -547,6 +630,23 @@ describe("worker engine", () => {
     expect(r.placements.find((p) => p.id === 1)!.translation).toEqual([1, 0, 0]);
     // A query result names meshes by client id.
     expect(replyOf(r, 6)).toMatchObject({ ok: true, value: { mesh: 1 } });
+  });
+
+  it("packing_failure_fails_the_batch", async () => {
+    // `can_undo` (read while packing the result) throws a plain error.
+    const h = harness({ packThrow: true });
+    const r1 = await h.send([
+      addMesh(1, sphere([0, 0, 0])),
+      { kind: "query", rev: rev(), qid: 1, name: "intersects", args: { a: 1, b: 1 } },
+    ]);
+    expect(r1.poisoned).toBe(true);
+    expect(r1.changes).toEqual([]);
+    expect(statusOf(r1, "mesh:1")).toMatchObject({ status: "error", error: { code: "INSTANCE_POISONED" } });
+    expect(replyOf(r1, 1)).toMatchObject({ ok: false, error: { code: "INSTANCE_POISONED" } });
+    expect(replyOf(r1, 1)!.error!.message).toContain("boom");
+    const r2 = await h.send([{ kind: "query", rev: rev(), qid: 2, name: "intersects", args: { a: 1, b: 1 } }]);
+    expect(r2.poisoned).toBe(true);
+    expect(replyOf(r2, 2)).toMatchObject({ ok: false, error: { code: "INSTANCE_POISONED" } });
   });
 
   it("trap_posts_poisoned", async () => {

@@ -27,6 +27,7 @@ import {
   type QueryMap,
   type Request,
   type Result,
+  supersedes,
 } from "./protocol.js";
 
 /** The engine's side of the message channel. */
@@ -75,6 +76,15 @@ const POISONED: ErrorWire = {
   code: "INSTANCE_POISONED",
   message: "an earlier fast-mesh call panicked; the WebAssembly instance can no longer be used",
 };
+
+/** The poisoned error after packing a result failed with `e`. */
+function packingFailed(e: unknown): ErrorWire {
+  const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  return {
+    code: "INSTANCE_POISONED",
+    message: `packing the Worker result failed (${cause}); the Worker scene can no longer be used`,
+  };
+}
 
 /** Elements per slot of each buffer. */
 const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
@@ -135,8 +145,19 @@ class Engine {
   readonly #meshIds = new Map<MeshHandle, ClientId>();
   readonly #fieldIds = new Map<FieldHandle, ClientId>();
   readonly #sectionIds = new Map<SectionHandle, ClientId>();
-  /** Handles removed this batch: their ids are dropped once the frame is committed. */
+  /**
+   * Handles removed this batch: their reverse ids are dropped once the frame
+   * (which may still report them) is packed.
+   */
   readonly #removed: MeshHandle[] = [];
+  readonly #removedFields: FieldHandle[] = [];
+  readonly #removedSections: SectionHandle[] = [];
+  /** Each field's meshes, `[on, to]`: removing either drops the field. */
+  readonly #fieldMeshes = new Map<ClientId, [ClientId, ClientId]>();
+  /** Each section's meshes, for the entries a mesh removal ends. */
+  readonly #sectionMeshes = new Map<ClientId, ClientId[]>();
+  /** Section entries ended by mesh removals this batch, reported as `null`. */
+  readonly #goneEntries: { section: ClientId; mesh: ClientId }[] = [];
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]> } | undefined;
 
@@ -160,7 +181,7 @@ class Engine {
     }
     for (const later of this.#queue) {
       if (keyOf(later) === key) {
-        return isLastWins(later) && later.kind === req.kind;
+        return supersedes(later, req);
       }
     }
     return false;
@@ -195,29 +216,41 @@ class Engine {
     try {
       result = this.#result(b);
     } catch (e) {
-      if (isPoison(e)) {
-        this.#poison(undefined, b);
-        return;
-      }
-      throw e;
+      // Packing failed: the frame's changes are taken and lost, so the
+      // mirrors can no longer follow. Stop like a trap.
+      this.#poison(undefined, b, isPoison(e) ? POISONED : packingFailed(e));
+      return;
     }
     this.#port.post(result, b.transfer);
   }
 
-  /** Marks the engine poisoned and posts it, failing `failed` and everything still queued. */
-  #poison(failed: Request | undefined, b: Batch): void {
+  /**
+   * Stops the engine and posts the batch as failed: every status and reply
+   * already collected, `failed` and everything still queued get `error`.
+   */
+  #poison(failed: Request | undefined, b: Batch, error: ErrorWire = POISONED): void {
     this.#poisoned = true;
     const rest = this.#queue.splice(0);
-    this.#postPoisoned(failed === undefined ? rest : [failed, ...rest], b);
+    for (const st of b.status) {
+      st.status = "error";
+      st.error = error;
+    }
+    for (const reply of b.replies) {
+      reply.ok = false;
+      reply.error = error;
+      delete reply.value;
+    }
+    b.transfer.length = 0;
+    this.#postPoisoned(failed === undefined ? rest : [failed, ...rest], b, error);
   }
 
-  #postPoisoned(failed: Request[], b: Batch): void {
+  #postPoisoned(failed: Request[], b: Batch, error: ErrorWire = POISONED): void {
     for (const req of failed) {
       b.rev = Math.max(b.rev, req.rev);
-      b.error(keyOf(req), req.rev, POISONED);
+      b.error(keyOf(req), req.rev, error);
       const qid = (req as { qid?: number }).qid;
       if (qid !== undefined) {
-        b.replies.push({ qid, ok: false, error: POISONED });
+        b.replies.push({ qid, ok: false, error });
       }
     }
     this.#port.post(
@@ -296,6 +329,21 @@ class Engine {
         this.#removed.push(h);
         if (this.#drag?.id === req.id) {
           this.#drag = undefined;
+        }
+        // The scene drops the fields on or to the mesh, and its section entries.
+        for (const [field, [on, to]] of this.#fieldMeshes) {
+          if (on === req.id || to === req.id) {
+            this.#dropField(field);
+          }
+        }
+        for (const [section, meshes] of this.#sectionMeshes) {
+          if (meshes.includes(req.id)) {
+            this.#sectionMeshes.set(
+              section,
+              meshes.filter((m) => m !== req.id),
+            );
+            this.#goneEntries.push({ section, mesh: req.id });
+          }
         }
         return;
       }
@@ -410,10 +458,21 @@ class Engine {
       const h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: this.#mesh(desc.to) });
       this.#fields.set(req.field, h);
       this.#fieldIds.set(h, req.field);
+      this.#fieldMeshes.set(req.field, [desc.on, desc.to]);
       return;
     }
     this.#scene.removeField(this.#field(req.field));
-    this.#fields.delete(req.field);
+    this.#dropField(req.field);
+  }
+
+  /** Forgets a field the scene no longer has; its reverse id goes after packing. */
+  #dropField(field: ClientId): void {
+    const h = this.#fields.get(field);
+    if (h !== undefined) {
+      this.#removedFields.push(h);
+    }
+    this.#fields.delete(field);
+    this.#fieldMeshes.delete(field);
   }
 
   #runSection(req: Extract<Request, { kind: "section" }>): void {
@@ -431,6 +490,7 @@ class Engine {
         });
         this.#sections.set(req.section, h);
         this.#sectionIds.set(h, req.section);
+        this.#sectionMeshes.set(req.section, [...(desc.meshes as ClientId[])]);
         return;
       }
       case "set": {
@@ -440,16 +500,22 @@ class Engine {
         }
         if (desc.meshes !== undefined) {
           s.setSectionMeshes(h, this.#meshList(desc.meshes));
+          this.#sectionMeshes.set(req.section, [...desc.meshes]);
         }
         if (desc.fill !== undefined) {
           s.setSectionFill(h, desc.fill);
         }
         return;
       }
-      case "remove":
-        s.removeSection(this.#section(req.section));
+      case "remove": {
+        const h = this.#section(req.section);
+        s.removeSection(h);
         this.#sections.delete(req.section);
+        this.#sectionMeshes.delete(req.section);
+        // Its reverse id goes after packing (the frame still reports it).
+        this.#removedSections.push(h);
         return;
+      }
     }
   }
 
@@ -540,17 +606,28 @@ class Engine {
         sections.push({ section, mesh: id, result });
       }
     }
+    // A removed mesh's record carries nothing else: report its entries gone.
+    for (const { section, mesh } of this.#goneEntries.splice(0)) {
+      sections.push({ section, mesh, result: null });
+    }
+    const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
     // Every removal is in this frame, or was never reported (added and
     // removed in between): the removed handles' ids can go.
     for (const h of this.#removed.splice(0)) {
       this.#meshIds.delete(h);
+    }
+    for (const h of this.#removedFields.splice(0)) {
+      this.#fieldIds.delete(h);
+    }
+    for (const h of this.#removedSections.splice(0)) {
+      this.#sectionIds.delete(h);
     }
     return {
       rev: b.rev,
       changes,
       placements,
       sections,
-      history: { canUndo: s.canUndo(), canRedo: s.canRedo() },
+      history,
       status: b.status,
       replies: b.replies,
     };
