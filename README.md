@@ -53,6 +53,15 @@ const normals = computeVertexNormals(geometry.attributes.position.array, geometr
 geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 ```
 
+### three.js adapter
+
+`fast-mesh-wasm/three` binds `Scene` meshes to `THREE.Mesh` objects that follow the scene on every `scene.commitFrame()` (see `bindMesh`). It needs `three` (an optional peer dependency, `>=0.160`) and, for TypeScript, `@types/three`:
+
+```sh
+npm install three
+npm install -D @types/three
+```
+
 ## Scene API
 
 For interactive work with several meshes, the `Scene` class keeps the meshes in WebAssembly memory and does the heavy parts in Rust: placements, a BVH per mesh, queries, signed distance fields with colour maps, planar sections, hole repair and undo/redo. Your renderer reads the results through zero-copy typed-array views, and you upload only the ranges that changed.

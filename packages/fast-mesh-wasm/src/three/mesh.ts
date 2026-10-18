@@ -11,18 +11,24 @@ import type { MeshChange, MeshHandle, Range, Scene } from "../scene.js";
 export interface BindMeshOptions {
   /**
    * The material to draw with. Defaults to a new `MeshStandardMaterial`, which
-   * {@link BoundMesh.dispose} then disposes; a material passed here is left to
-   * the caller.
+   * {@link BoundMesh.dispose} then disposes; a material passed here is used as
+   * given and left to the caller to dispose.
+   *
+   * The binding controls the material's `color`, `vertexColors`, `opacity`,
+   * `transparent` and `depthWrite` (colouring and {@link BoundMesh.setOpacity}
+   * change them), so do not share one material between bound meshes: give
+   * each its own (`material.clone()`).
    */
   material?: THREE.MeshStandardMaterial | THREE.MeshPhongMaterial | THREE.MeshLambertMaterial;
   /**
    * The colour shown while the mesh has no colouring. Defaults to the given
-   * material's colour, or light grey for the default material.
+   * material's colour (left untouched), or light grey for the default material.
    */
   color?: THREE.ColorRepresentation;
   /**
-   * Initial opacity in [0, 1], as {@link BoundMesh.setOpacity}. Defaults to 1,
-   * or to the given material's opacity.
+   * Initial opacity in [0, 1], applied with {@link BoundMesh.setOpacity}.
+   * Without it, the default material is opaque and a given material keeps
+   * its `opacity`, `transparent` and `depthWrite`.
    */
   opacity?: number;
 }
@@ -90,9 +96,10 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
   const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
   // The colour shown without colouring; vertex colours are multiplied by the
   // material colour, so it is white while colouring is on.
-  const baseColor =
-    options.color === undefined ? material.color.clone() : new THREE.Color(options.color);
-  material.color.copy(baseColor);
+  if (options.color !== undefined) {
+    material.color.set(options.color);
+  }
+  const baseColor = material.color.clone();
 
   const geometry = new THREE.BufferGeometry();
   const object = new THREE.Mesh(geometry, material);
@@ -193,6 +200,7 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
     }
     const sphere = (geometry.boundingSphere ??= new THREE.Sphere());
     if (box.isEmpty()) {
+      // No live triangle: three's convention for an empty sphere.
       sphere.set(new THREE.Vector3(), -1);
       return;
     }
@@ -252,9 +260,11 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
       const mirror = attribute.array as Mirror;
       const itemSize = BUFFERS[key].itemSize;
       if (dirty === "all") {
-        // Same length: copy in place; no update range means a full upload.
+        // Same length: copy in place and mark the whole buffer. A range, not
+        // an empty list: three uploads only the listed ranges once any exist,
+        // so a later frame's ranges would otherwise drop this full update.
         copy(mirror, view, 0, mirror.length);
-        attribute.clearUpdateRanges();
+        attribute.addUpdateRange(0, mirror.length);
       } else {
         for (const [start, count] of dirty) {
           copy(mirror, view, start * itemSize, (start + count) * itemSize);
@@ -335,6 +345,8 @@ export function bindMesh(scene: Scene, mesh: MeshHandle, options: BindMeshOption
       }
     },
   };
-  bound.setOpacity(options.opacity ?? (ownsMaterial ? 1 : material.opacity));
+  if (options.opacity !== undefined) {
+    bound.setOpacity(options.opacity);
+  }
   return bound;
 }

@@ -182,6 +182,26 @@ describe("bindMesh", () => {
     expect(bound.object.geometry.boundingBox!.max.z).toBeCloseTo(0.5, 5);
   });
 
+  it("full_update_survives_later_ranges", () => {
+    // A mesh without dead slots: compaction reports "all" at the same length.
+    const { s, m, bound } = setup();
+    const position = attr(bound, "position");
+    const length = position.array.length;
+    s.compact(m);
+    const all = s.commitFrame().find((c) => c.mesh === m)!;
+    expect(all.capacityChanged).toBe(false);
+    expect(all.positions).toBe("all");
+    expect(attr(bound, "position")).toBe(position);
+    expect(position.updateRanges).toEqual([{ start: 0, count: length }]);
+    // No upload in between (culled, hidden or on-demand rendering): the
+    // full range is still listed next to the new one.
+    s.edit(m, [{ op: "setPositions", vertices: [7], positions: [1, 1, 0.75] }]);
+    s.commitFrame();
+    expect(position.updateRanges[0]).toEqual({ start: 0, count: length });
+    expect(position.updateRanges.length).toBeGreaterThan(1);
+    expectMirrorsMatch(s, m, bound);
+  });
+
   it("placement_updates_matrix_only", () => {
     const { s, m, bound } = setup();
     const position = attr(bound, "position");
@@ -332,6 +352,31 @@ describe("bindMesh", () => {
     expect(b2.object.material).toBe(phong);
     expect(phong.color.getHex()).toBe(0x00ff00);
     expect([phong.opacity, phong.transparent, phong.depthWrite]).toEqual([0.25, true, false]);
+  });
+
+  it("caller_material_kept_unless_options_given", () => {
+    const s = scene();
+    const g = grid(3);
+    // No options: the caller's colour and transparency flags stay as they are.
+    const glass = new THREE.MeshPhongMaterial({ color: 0x123456, transparent: true, opacity: 1 });
+    glass.depthWrite = false;
+    const version = glass.version;
+    const a = bindMesh(s, s.addMesh(g.positions, g.indices), { material: glass });
+    expect(a.object.material).toBe(glass);
+    expect(glass.color.getHex()).toBe(0x123456);
+    expect([glass.opacity, glass.transparent, glass.depthWrite]).toEqual([1, true, false]);
+    expect(glass.version).toBe(version);
+    // Given options win, and the colour returns after colouring is turned off.
+    const lambert = new THREE.MeshLambertMaterial({ color: 0x123456 });
+    const b = bindMesh(s, s.addMesh(g.positions, g.indices), {
+      material: lambert,
+      color: 0xabcdef,
+      opacity: 0.5,
+    });
+    expect(lambert.color.getHex()).toBe(0xabcdef);
+    expect([lambert.opacity, lambert.transparent, lambert.depthWrite]).toEqual([0.5, true, false]);
+    b.setOpacity(1);
+    expect([lambert.transparent, lambert.depthWrite]).toEqual([false, true]);
   });
 
   it("dispose_and_remove_any_order", () => {
