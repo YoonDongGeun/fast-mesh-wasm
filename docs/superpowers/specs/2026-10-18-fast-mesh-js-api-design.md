@@ -388,10 +388,10 @@ What the implementation of 8b (`fast-mesh-wasm/three` and `examples/webgpu`) set
 
 ### Measured
 
-`docs/benchmarks.md` ("JavaScript core", the three.js adapter table) has the method. Node 24 on the i5-13600K, release wasm, another branch's work possibly sharing the CPU. The case is the 64-pose drag of two touching 1M meshes with colouring on and `bindMesh` on both, in Node with no GL context (no GPU upload):
+`docs/benchmarks.md` ("JavaScript core", the three.js adapter table) has the method. Node 24 on the i5-13600K, release wasm, another test job possibly sharing the CPU (mostly affects `move`). The numbers are from a re-run after the adapter started converting colours sRGB to linear per element. The case is the 64-pose drag of two touching 1M meshes with colouring on and `bindMesh` on both, in Node with no GL context (no GPU upload):
 
-- **Contact (`maxDistance` 0.08):** 1.85 ms per frame at median (p95 4.6 ms; the other run 2.01 ms), of which `drag.move` is 1.81 ms and `commitFrame()` with both adapters applying their ranges is 0.03 ms (p95 0.10 ms).
-- **Wide (`maxDistance` 8, a stress case):** 417 ms (p95 1,115 ms; the other run 420 ms), `commitFrame()` 0.10 ms.
-- **Setup:** `bindMesh` on both meshes plus the first `commitFrame()` (building the geometries) takes 64 to 91 ms.
+- **Contact (`maxDistance` 0.08):** 2.89 ms per frame at median (p95 6.25 ms), of which `drag.move` is 2.82 ms and `commitFrame()` with both adapters applying their ranges is 0.06 ms (p95 0.15 ms).
+- **Wide (`maxDistance` 8, a stress case):** 385 ms (p95 948 ms), of which `drag.move` is 385 ms and `commitFrame()` 0.20 ms (p95 0.42 ms).
+- **Setup:** `bindMesh` on both meshes plus the first `commitFrame()` (building the geometries) takes 141 ms (contact) and 146 ms (wide).
 
-The adapter costs about what the plain mirror copy of §12 does; the frame time is the engine's `drag.move`.
+Before the colour conversion the same case measured 1.85 ms and 417 ms per frame, `commitFrame()` 0.03 and 0.10 ms, setup 64 to 91 ms. The adapter's share is still small next to the plain mirror copy of §12; the frame time is the engine's `drag.move`.
