@@ -120,8 +120,14 @@ export interface AddMeshOptions {
 /** Options of the {@link Scene} constructor. */
 export interface SceneOptions {
   /**
-   * Development checks: warn once when a render view was kept across a call
-   * that grew the WebAssembly memory (it is then detached). Off by default.
+   * Development checks, off by default. Render views ({@link Scene.views},
+   * {@link Scene.fieldValues}) are then `Proxy` objects that warn once per
+   * scene (`console.warn`, no throw) when read after a scene call that may
+   * have moved or freed their buffer. Read-only calls (slot counts,
+   * `placement`, `matrix4`, `canUndo`, ...) keep views valid. Proxies are
+   * slower and are not genuine typed arrays: pass `view.subarray()` (a plain
+   * typed array) to APIs that need one, such as `queue.writeBuffer`. Without
+   * `debug`, views are plain typed arrays with no overhead.
    */
   debug?: boolean;
 }
@@ -956,7 +962,9 @@ function rotationMatrix(rotation: Mat3 | Quat): number[] {
  * garbage collected).
  *
  * Render views ({@link Scene.views}) point into WebAssembly memory and are
- * only valid until the next call that may allocate; see {@link MeshViews}.
+ * only valid until the next scene call that may allocate or move buffers: a
+ * kept view may read other data or be empty. Re-acquire them after every
+ * scene call; see {@link MeshViews}.
  */
 export class Scene {
   #raw: WasmScene | undefined;
@@ -991,6 +999,7 @@ export class Scene {
       return;
     }
     this.#raw = undefined;
+    this.#guard?.bump();
     this.#drag = undefined;
     finalizer.unregister(this);
     release(raw);
@@ -1001,7 +1010,15 @@ export class Scene {
     this.free();
   }
 
+  /** The live raw scene, for a call that may allocate or move buffers. */
   #scene(): WasmScene {
+    const s = this.#peek();
+    this.#guard?.bump();
+    return s;
+  }
+
+  /** The live raw scene, for a read-only call that leaves every view valid. */
+  #peek(): WasmScene {
     if (this.#raw === undefined) {
       throw invalid("scene is freed");
     }
@@ -1010,7 +1027,7 @@ export class Scene {
 
   /** The live mesh id of a handle of this scene. */
   #id(mesh: MeshHandle): HandleId {
-    this.#scene();
+    this.#peek();
     const id = meshIds.get(mesh);
     if (id === undefined) {
       throw invalid("not a mesh handle");
@@ -1048,7 +1065,7 @@ export class Scene {
 
   /** The raw id of a field or section handle of this scene. */
   #rawId(handle: FieldHandle | SectionHandle, kind: typeof FieldHandle | typeof SectionHandle): number {
-    this.#scene();
+    this.#peek();
     const what = kind === FieldHandle ? "field" : "section";
     const id = handle instanceof kind ? rawIds.get(handle) : undefined;
     if (id === undefined) {
@@ -1136,7 +1153,7 @@ export class Scene {
   /** A mesh's placement, with the rotation as a row-major matrix. */
   placement(mesh: MeshHandle): Placement {
     const { index, generation } = this.#id(mesh);
-    const p = call(() => this.#scene().placement(index, generation));
+    const p = call(() => this.#peek().placement(index, generation));
     return { rotation: Array.from(p.subarray(0, 9)), translation: [p[9], p[10], p[11]] };
   }
 
@@ -1147,7 +1164,7 @@ export class Scene {
    */
   matrix4(mesh: MeshHandle): Float64Array {
     const { index, generation } = this.#id(mesh);
-    return call(() => this.#scene().matrix4(index, generation));
+    return call(() => this.#peek().matrix4(index, generation));
   }
 
   /** Sets when the mesh's derived data follows its edits; see {@link UpdateMode}. */
@@ -1172,36 +1189,37 @@ export class Scene {
   /** Vertex slots, alive or dead: the vertex length of the render buffers. */
   vertexSlots(mesh: MeshHandle): number {
     const { index, generation } = this.#id(mesh);
-    return call(() => this.#scene().vertex_slots(index, generation));
+    return call(() => this.#peek().vertex_slots(index, generation));
   }
 
   /** Triangle slots, alive or dead: the triangle length of the index buffer. */
   triangleSlots(mesh: MeshHandle): number {
     const { index, generation } = this.#id(mesh);
-    return call(() => this.#scene().triangle_slots(index, generation));
+    return call(() => this.#peek().triangle_slots(index, generation));
   }
 
   /** Alive vertices. */
   vertexCount(mesh: MeshHandle): number {
     const { index, generation } = this.#id(mesh);
-    return call(() => this.#scene().vertex_count(index, generation));
+    return call(() => this.#peek().vertex_count(index, generation));
   }
 
   /** Alive triangles. */
   triangleCount(mesh: MeshHandle): number {
     const { index, generation } = this.#id(mesh);
-    return call(() => this.#scene().triangle_count(index, generation));
+    return call(() => this.#peek().triangle_count(index, generation));
   }
 
   /**
    * Zero-copy views of the mesh's render buffers. Each getter builds a fresh
-   * view; do not keep one across a call that may allocate (see {@link MeshViews}).
+   * view; re-acquire views after every scene call that may allocate, since a
+   * kept one may read other data or be empty (see {@link MeshViews}).
    */
   views(mesh: MeshHandle): MeshViews {
     const { index, generation } = this.#id(mesh);
     // Fail now, not on the first getter, for a removed mesh.
-    call(() => this.#scene().vertex_slots(index, generation));
-    return meshViews(() => this.#scene(), index, generation, this.#guard);
+    call(() => this.#peek().vertex_slots(index, generation));
+    return meshViews(() => this.#peek(), index, generation, this.#guard);
   }
 
   // ---- Changes ----
@@ -1305,13 +1323,13 @@ export class Scene {
 
   /** True if {@link Scene.undo} would undo something. */
   canUndo(): boolean {
-    const s = this.#scene();
+    const s = this.#peek();
     return call(() => s.can_undo());
   }
 
   /** True if {@link Scene.redo} would redo something. */
   canRedo(): boolean {
-    const s = this.#scene();
+    const s = this.#peek();
     return call(() => s.can_redo());
   }
 
@@ -1636,20 +1654,21 @@ export class Scene {
   /**
    * A zero-copy view of the field's values as of its last update, one per
    * vertex slot. Like render views, it is only valid until the next call
-   * that may allocate: get it right before use.
+   * that may allocate (a kept one may read other data or be empty): get it
+   * right before use.
    */
   fieldValues(field: FieldHandle): Float32Array {
     const raw = this.#field(field);
-    const s = this.#scene();
+    const s = this.#peek();
     const ptr = call(() => s.field_values_ptr(raw));
     const view = new Float32Array(wasmMemory().buffer, ptr, call(() => s.field_values_len(raw)));
-    return this.#guard === undefined ? view : this.#guard.track(view);
+    return this.#guard === undefined ? view : this.#guard.wrap(view);
   }
 
   /** Whether the field is current, and what its sign data found out about the target mesh. */
   fieldStatus(field: FieldHandle): FieldStatus {
     const raw = this.#field(field);
-    const st = call(() => this.#scene().field_status(raw));
+    const st = call(() => this.#peek().field_status(raw));
     return {
       current: st[0] === 1,
       sign: {
@@ -1739,7 +1758,7 @@ export class Scene {
   section(section: SectionHandle, mesh: MeshHandle): SectionResult {
     const raw = this.#section(section);
     const { index, generation } = this.#id(mesh);
-    const r = call(() => this.#scene().section(raw, index, generation));
+    const r = call(() => this.#peek().section(raw, index, generation));
     const contours: SectionContour[] = [];
     let at = 4;
     for (let k = 0; k < r[3]; k++) {

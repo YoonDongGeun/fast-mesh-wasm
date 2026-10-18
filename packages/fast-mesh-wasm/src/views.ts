@@ -1,5 +1,5 @@
 // Typed-array views over a mesh's render buffers in wasm memory, and the debug
-// guard that warns when a caller kept a view the memory growth detached.
+// guard that warns when a caller reads a view kept across a scene call.
 import { call, wasmMemory } from "./core.js";
 import type { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
@@ -7,14 +7,20 @@ import type { WasmScene } from "./wasm/fast_mesh_wasm.js";
  * Zero-copy views of one mesh's render buffers, slot-aligned.
  *
  * Each getter builds a fresh view over the current wasm memory. A view is
- * only valid until the next scene call that may allocate (any edit, add,
- * undo, ...): growing the memory detaches it and it then reads as empty.
- * Get views right before use and do not keep them.
+ * only valid until the next scene call that may allocate or move buffers
+ * (any edit, add, undo, query, ...): the buffer may have moved, so a kept
+ * view may read other data, or be empty once the memory grew. Re-acquire
+ * views after every scene call and do not keep them. With
+ * `new Scene({ debug: true })` reading a kept view warns.
  */
 export interface MeshViews {
   /** Local positions, 3 floats per vertex slot; dead slots hold stale data. */
   positions(): Float32Array;
-  /** Vertex normals, 3 floats per vertex slot, or `null` when normals are off. */
+  /**
+   * Vertex normals, 3 floats per vertex slot, or `null` when normals are off.
+   * For a `"lazy"` or `"manual"` mesh it can be shorter than 3 · vertex slots
+   * after a growth, until the mesh is updated ({@link Scene.update}).
+   */
   normals(): Float32Array | null;
   /** RGBA8 colours, 4 bytes per vertex slot, or `null` without colouring. */
   colors(): Uint8Array | null;
@@ -23,39 +29,51 @@ export interface MeshViews {
 }
 
 /**
- * Debug-mode tracking of the views a scene handed out. When the memory
- * buffer has changed since the last view, every tracked view that is still
- * alive and now detached (`byteLength === 0`) means a caller kept a view
- * across an allocating call; the first one found warns, once per guard.
+ * Debug-mode check of kept views. The scene bumps the epoch on every call
+ * that may allocate or move buffers; a guarded view is a `Proxy` over the
+ * typed array that, on every access, warns (once per guard) when the epoch
+ * moved since the view was made, or the memory growth detached it.
  */
 export class ViewGuard {
-  #buffer: ArrayBuffer | undefined;
-  #views: WeakRef<ArrayBufferView>[] = [];
+  #epoch = 0;
   #warned = false;
 
-  /** Checks the earlier views, then starts tracking `view`. */
-  track<T extends ArrayBufferView>(view: T): T {
-    const buffer = view.buffer as ArrayBuffer;
-    if (buffer !== this.#buffer) {
-      if (!this.#warned && this.#views.some((r) => r.deref()?.byteLength === 0)) {
+  /** A scene call that may allocate or move buffers is about to run. */
+  bump(): void {
+    this.#epoch++;
+  }
+
+  /** `view`, checked on every access. */
+  wrap<T extends ArrayBufferView>(view: T): T {
+    const born = this.#epoch;
+    const attached = view.byteLength > 0;
+    const check = () => {
+      if (!this.#warned && (this.#epoch !== born || (attached && view.byteLength === 0))) {
         this.#warned = true;
         console.warn(
-          "fast-mesh-wasm: a render view was kept across a scene call that grew the " +
-            "WebAssembly memory, so it is detached and reads as empty. Get views right " +
-            "before use (scene.views(mesh).positions() etc.) and do not keep them.",
+          "fast-mesh-wasm: a render view was read after a scene call that may have moved " +
+            "or freed its buffer, so it may read other data or be empty. Views are only " +
+            "valid until the next scene call: re-acquire them right before use " +
+            "(scene.views(mesh).positions() etc.) and do not keep them.",
         );
       }
-      this.#buffer = buffer;
-      this.#views = [];
-    } else if (this.#views.length >= 1024) {
-      // Bound the list between memory growths: drop collected views.
-      this.#views = this.#views.filter((r) => r.deref() !== undefined);
-    }
-    // An empty view reads the same detached or not: nothing to warn about.
-    if (view.byteLength > 0) {
-      this.#views.push(new WeakRef(view));
-    }
-    return view;
+    };
+    return new Proxy(view, {
+      get(target, key) {
+        check();
+        const value: unknown = Reflect.get(target, key, target);
+        // Methods (subarray, slice, iteration, ...) need the real array as `this`.
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+      set(target, key, value) {
+        check();
+        return Reflect.set(target, key, value, target);
+      },
+      has(target, key) {
+        check();
+        return Reflect.has(target, key);
+      },
+    });
   }
 }
 
@@ -81,7 +99,7 @@ export function meshViews(
       return null;
     }
     const view = make(wasmMemory().buffer, p, call(() => len(s)));
-    return guard === undefined ? view : guard.track(view);
+    return guard === undefined ? view : guard.wrap(view);
   };
   const f32 = (b: ArrayBuffer, p: number, n: number) => new Float32Array(b, p, n);
   const u8 = (b: ArrayBuffer, p: number, n: number) => new Uint8Array(b, p, n);

@@ -185,7 +185,7 @@ describe("Scene", () => {
 
   it("views_survive_memory_growth", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const s = scene({ debug: true });
+    const s = scene();
     const mesh = s.addMesh(quad, quadTris);
     const kept = s.views(mesh).positions();
     const expected = Array.from(kept);
@@ -195,28 +195,78 @@ describe("Scene", () => {
       s.addMesh(big.positions, big.indices);
     }
     expect(wasmMemory().buffer).not.toBe(before);
-    // The kept view is detached; a fresh one reads the same data.
+    // The kept view is detached; a fresh one reads the same data. Without
+    // debug there is no check, and views are plain typed arrays.
     expect(kept.byteLength).toBe(0);
-    expect(warn).not.toHaveBeenCalled();
     const fresh = s.views(mesh).positions();
+    expect(fresh).toBeInstanceOf(Float32Array);
+    expect(ArrayBuffer.isView(fresh)).toBe(true);
     expect(Array.from(fresh)).toEqual(expected);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0][0])).toContain("detached");
-    // Once per scene.
-    s.views(mesh).indices();
-    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
+  });
 
-    // Without debug there is no check.
-    const quiet = scene();
-    const q = quiet.addMesh(quad, quadTris);
-    const keptQuiet = quiet.views(q).positions();
-    const now = wasmMemory().buffer;
-    for (let k = 0; k < 50 && wasmMemory().buffer === now; k++) {
-      quiet.addMesh(big.positions, big.indices);
-    }
-    expect(keptQuiet.byteLength).toBe(0);
-    quiet.views(q).positions();
+  it("debug_warns_on_a_view_kept_across_a_reallocation", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = scene({ debug: true });
+    // Headroom first, so the growth below moves the buffer without growing
+    // the memory: the kept view stays attached and reads freed memory.
+    const big = grid(200);
+    s.removeMesh(s.addMesh(big.positions, big.indices, { normals: false }));
+    const mesh = s.addMesh([0, 0, 0, 1, 0, 0, 0, 1, 0], [0, 1, 2]);
+    const kept = s.views(mesh).positions();
+    expect(kept.length).toBe(9);
+    expect(warn).not.toHaveBeenCalled();
+    s.edit(mesh, [{ op: "addVertices", positions: new Float64Array(3 * 64) }]);
+    void kept[0];
     expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("re-acquire");
+    // Once per scene.
+    void kept.length;
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("debug_warns_on_a_view_detached_by_another_scene", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = scene({ debug: true });
+    const mesh = s.addMesh(quad, quadTris);
+    const kept = s.views(mesh).indices();
+    const other = scene();
+    const before = wasmMemory().buffer;
+    const big = grid(300);
+    for (let k = 0; k < 50 && wasmMemory().buffer === before; k++) {
+      other.addMesh(big.positions, big.indices);
+    }
+    expect(warn).not.toHaveBeenCalled();
+    expect(kept.length).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("debug_views_used_correctly_do_not_warn", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = scene({ debug: true });
+    const mesh = s.addMesh(quad, quadTris);
+    // Read from a fresh view and keep nothing (the garbage collector has not
+    // run yet), then grow the memory and read again.
+    const frame = () => s.views(mesh).positions()[0];
+    const first = frame();
+    const before = wasmMemory().buffer;
+    const big = grid(300);
+    for (let k = 0; k < 50 && wasmMemory().buffer === before; k++) {
+      s.addMesh(big.positions, big.indices);
+    }
+    expect(wasmMemory().buffer).not.toBe(before);
+    expect(frame()).toBe(first);
+    // Views of one mesh survive each other and the read-only calls.
+    const views = s.views(mesh);
+    const positions = views.positions();
+    const indices = views.indices();
+    s.vertexSlots(mesh);
+    s.matrix4(mesh);
+    s.canUndo();
+    expect(Array.from(indices)).toEqual(quadTris);
+    expect(positions.subarray(0, 3)).toBeInstanceOf(Float32Array);
+    expect(Array.from(positions.slice(3, 6))).toEqual(Array.from(s.views(mesh).positions().slice(3, 6)));
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("stale_handle_after_slot_reuse", () => {
