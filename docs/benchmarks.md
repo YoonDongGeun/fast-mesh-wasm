@@ -243,12 +243,22 @@ Eager meshes, one section, a world plane. Criterion medians.
 | `section_drag_1M` | 16.8 ms per 64 poses (262 µs per pose) | `set_section_plane` and a read per pose; terrain, no fill. Includes the mapping to world and `(u, v)` and the length. |
 | `section_far_edit_1M` | 21.1 µs | Move 100 vertices about 354 from a plane at the middle; the entry stays Current. |
 | `section_far_edit_1M` baseline | 14.2 µs | The same edit, no section. The section costs about 7 µs. |
-| `section_fill_1M_sphere`, fill on | 4.62 ms | `set_section_plane` plus the recompute; fill of one 2,072-point loop gives 2,070 triangles, `fill_ok` true. |
-| `section_fill_1M_sphere`, fill off | 0.341 ms | The same without the fill: the fill costs about 4.3 ms. |
-| `section_gap_two_1M`, `section_gap` alone | 2.55 ms | Two spheres 230 apart (30 between them), one loop each of 2,072 points. |
-| `section_gap_two_1M`, plane change then `section_gap` | 3.27 ms | Both entries recomputed (about 0.7 ms), then the gap. |
+| `section_fill_1M_sphere`, fill on | 0.560 ms (first run: 4.62 ms) | `set_section_plane` plus the recompute; fill of one 2,072-point loop gives 2,070 triangles, `fill_ok` true. |
+| `section_fill_1M_sphere`, fill off | 0.342 ms (first run: 0.341 ms) | The same without the fill: the fill costs about 0.22 ms (first run: about 4.3 ms). |
+| `section_gap_two_1M`, `section_gap` alone | 0.153 ms (first run: 2.55 ms) | Two spheres 230 apart (30 between them), one loop each of 2,072 points. |
+| `section_gap_two_1M`, plane change then `section_gap` | 0.900 ms (first run: 3.27 ms) | Both entries recomputed (about 0.7 ms), then the gap. |
 
-The fill is the largest cost of the phase: ear clipping on one loop of about 2,000 points takes about 13 times the whole slice and recompute. It was not profiled and not tuned. The gap search takes 2.55 ms for two loops of about 2,000 points; it was not profiled either.
+The first run's fill and gap costs were found and fixed after review; the other rows are from the first run. Before and after, run back to back on 2026-10-18 (`cargo bench -p fast-mesh-scene --bench scene -- "section_fill|section_gap"`, before at commit `79909e7`):
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| `section_fill_1M_sphere`, fill on | 4.47 ms | 0.560 ms |
+| `section_fill_1M_sphere`, fill off | 0.348 ms | 0.342 ms |
+| `section_gap_two_1M`, `section_gap` alone | 2.39 ms | 0.153 ms |
+| `section_gap_two_1M`, plane change then `section_gap` | 3.23 ms | 0.900 ms |
+
+- **Fill.** The ear test of `triangulate` walked the whole ring for every candidate ear, so a loop of `n` points cost `O(n²)`: about 0.23 ms at 500 points, 0.92 ms at 1,000, 4.0 ms at 2,072 and 16 ms at 4,144 (four times per doubling). Above 80 points the ring is now indexed by z-order (Morton) code, and the ear test looks only at the nodes whose codes lie between those of the candidate triangle's box corners, as Mapbox's earcut does. It tests the same nodes, so the triangles are unchanged. The fill now costs about 0.22 ms on the 2,072-point loop, including the nesting and the area check.
+- **Gap.** `contour_gap` took the segments of the first side in contour order, starting from a pair of first segments, so its cost depended on where that contour started: about 2.5 ms when it started on the far side, 0.13 ms when it started at the closest point. The segments are now taken nearest the other side's bounding box first, and the search stops at the first whose box gap reaches the best distance found. The result is the same pair.
 
 ## How the defaults were chosen
 

@@ -273,7 +273,7 @@ pub struct Gap { pub distance: f64, pub a: [f64; 3], pub b: [f64; 3] }
 
 ## 12. Implementation notes
 
-What the implementation settled or found. Items 1 to 3 and 12 correct wording above; none of them changes a contract elsewhere.
+What the implementation settled or found. Items 1 to 3 correct wording above; none of them changes a contract elsewhere.
 
 1. **Segment orientation.** The solid's inside, opposite the triangle's winding normal, lies to the left of `from → to` seen from `+n`. Outer contours run counter-clockwise and holes clockwise. The §4.4 wording "the `+` side region on the left" was wrong where `n·N < 0`, and has been fixed there.
 2. **Open contours start at their `from` end.** "Starts at its smallest edge key" holds for closed contours only. An oriented open contour starts at its `from` end; §4.4 is reworded.
@@ -282,13 +282,13 @@ What the implementation settled or found. Items 1 to 3 and 12 correct wording ab
 5. **`SectionId` is opaque and never reused.** It is a `u32`, like `FieldId`, not generational like `MeshId` (this overrides §6.1). A removed section's id is rejected with `UnknownSection` for good.
 6. **`flush` does not update the sections of Manual meshes**, consistent with fields and BVHs: a Manual mesh waits for an explicit `update(id)`.
 7. **`section_gap` across planes.** It returns `Ok(None)` when the two entries were cut with different planes (stale, or mixed update modes, so that one entry still has the previous plane), because their `(u, v)` frames then differ. It rejects `a == b` with `InvalidInput`.
-8. **Change settling runs for every mode.** A far edit leaves Lazy and Manual entries Current too, not only Eager ones: the "can this change reach the plane" test (§6.3) is run for every mode when the change is settled, and only a change that reaches the plane stales an entry. A mesh that has a section keeps its incidence index, which criterion 2 reads. Measured on a 1M terrain, moving 100 vertices far from the plane costs 21.1 µs with a section against 14.2 µs without one (BVH refit included in both), so about 7 µs, and the entry stays Current.
+8. **Change settling runs for every mode.** A far edit leaves Lazy and Manual entries Current too, not only Eager ones: the "can this change reach the plane" test (§6.3) is run for every mode when the change is settled, and only a change that reaches the plane stales an entry. A mesh that has a section keeps its incidence index, which criterion 3 reads. Measured on a 1M terrain, moving 100 vertices far from the plane costs 21.1 µs with a section against 14.2 µs without one (BVH refit included in both), so about 7 µs, and the entry stays Current.
 9. **`triangulate` results.** An empty or collinear outer gives `Ok(true)` with no triangles. Non-finite input gives `Ok(false)`. A hole that cannot be bridged to its outer gives `Ok(false)`.
-10. **Nesting is approximate.** `fill` assigns holes by testing one vertex per contour, so a hole touching its outer can be misassigned; `fill_ok` is then `false` (§11.3: best effort).
+10. **Nesting is approximate.** `fill` assigns holes by testing one vertex per contour, so a hole touching its outer can be misassigned; `fill_ok` is then `false` (§11.3: best effort). When every contour is oriented and their summed signed area is negative (a closed mesh wound inward), the orientation is taken as reversed: clockwise contours are the outers.
 11. **Known limits of the gap.** Long segments that span many grid cells make building and searching the grid slow, and coordinates beyond about 1e154 overflow the squared distances.
 12. **Measured numbers** (i5-13600K, 2026-10-18; full tables in `docs/benchmarks.md`).
     - Slice, 1M triangles: 114 to 131 µs on the terrain, 220 to 270 µs on the sphere. 10M terrain: 0.59 to 0.80 ms. All under the ~1 ms target; nothing was tuned.
     - Plane drag, 64 poses over a 1M terrain, Eager: 16.8 ms per iteration, 262 µs per pose.
     - Far edit: about 7 µs over the bare edit.
-    - Fill of a 2,072-point sphere section: 4.6 ms against 0.34 ms without fill, so the fill costs about 4.3 ms. That is the largest cost in the phase; ear clipping on a 2,000-point loop is the likely cause (not profiled).
-    - Gap between two 1M spheres' sections (2,072 points each): 2.55 ms for `section_gap` alone, 3.27 ms with the two-entry recompute.
+    - Fill of a 2,072-point sphere section: 0.56 ms against 0.34 ms without fill, so the fill costs about 0.22 ms. It first cost about 4.3 ms (4.47 ms against 0.35 ms, run back to back with the fix): the ear test walked the whole ring for every candidate ear, `O(n²)` in the loop's points. `triangulate` now indexes rings above 80 points by z-order code, as earcut does, and tests only the nodes near each candidate ear; the triangles are unchanged.
+    - Gap between two 1M spheres' sections (2,072 points each): 0.153 ms for `section_gap` alone, 0.90 ms with the two-entry recompute. It first cost 2.39 ms and 3.23 ms: the search took the first side's segments in contour order, so its cost depended on where that contour started (2.5 ms from the far side, 0.13 ms from the closest point). The segments are now taken nearest the other side's bounding box first, and the search stops once that box gap reaches the best distance.
