@@ -194,8 +194,16 @@ Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `
 `fast-mesh-wasm/worker` runs the same engine in a Web Worker, so adding a large mesh, building fields or recolouring never blocks the page. `createWorkerScene()` starts the Worker and resolves to a `WorkerScene` with the `Scene` methods. Your renderer keeps reading synchronous views: every result carries the bytes of its dirty ranges, which are copied into main-thread mirrors.
 
 ```ts
+import * as THREE from "three";
+import type { DragSession, PlacementInput } from "fast-mesh-wasm";
 import { createWorkerScene } from "fast-mesh-wasm/worker";
 import { bindMesh } from "fast-mesh-wasm/three"; // optional: the three.js adapter works on a WorkerScene too
+
+// Provided by your app (not part of this package).
+declare const upperPositions: Float64Array, upperIndices: Uint32Array;
+declare const lowerPositions: Float64Array, lowerIndices: Uint32Array;
+declare const renderer: THREE.WebGLRenderer, threeScene: THREE.Scene, camera: THREE.Camera;
+declare const button: HTMLButtonElement, undoButton: HTMLButtonElement;
 
 const scene = await createWorkerScene(); // no init() needed: the Worker loads the wasm
 
@@ -205,6 +213,23 @@ const lower = scene.addMesh(lowerPositions, lowerIndices);
 const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
 scene.setColoring(upper, { field: gap, map: "turbo", range: [-0.5, 1] });
 const boundUpper = bindMesh(scene, upper);
+threeScene.add(boundUpper.object);
+
+// Drag the lower mesh: one drag per gesture, the latest pose kept until the next frame.
+let drag: DragSession | undefined;
+let pending: PlacementInput | undefined;
+function onPointerDown() {
+  drag = scene.drag(lower); // the whole drag is one undo step
+}
+function onPointerMove(pose: PlacementInput) {
+  pending = pose; // keep only the latest pose
+}
+function onPointerUp() {
+  if (pending !== undefined) drag?.move(pending);
+  pending = undefined;
+  drag?.end(); // returns at once
+  drag = undefined;
+}
 
 // Once per animation frame: send this frame's requests, receive the results so far.
 function frame() {

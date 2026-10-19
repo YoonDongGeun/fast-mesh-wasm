@@ -348,13 +348,18 @@ class BenchWorker {
     this.error = [];
     this.posted = 0; // request batches posted
     this.results = []; // { at, handler } per result, in order
-    this.waiters = [];
-    this.statsWaiter = undefined;
+    this.waiters = []; // { resolve, reject } of drained(), woken by each result
+    this.statsWaiters = []; // the same for stats(), woken by its reply
+    this.failure = undefined; // set once the Worker failed: every wait rejects with it
     this.worker.on("message", (data) => {
       if (data?.kind === "benchStats") {
-        this.statsWaiter?.(data);
-        this.statsWaiter = undefined;
+        this.#wake(this.statsWaiters, data);
         return;
+      }
+      if (data?.kind !== undefined && data.kind !== "ready") {
+        this.#fail(new Error(`the bench Worker sent ${data.kind}: ${JSON.stringify(data.error ?? null)}`));
+      } else if (data?.poisoned) {
+        this.#fail(new Error(`the engine trapped: ${JSON.stringify(data.status?.[0]?.error ?? null)}`));
       }
       const t0 = now();
       for (const cb of this.message) {
@@ -363,16 +368,36 @@ class BenchWorker {
       const t1 = now();
       if (data?.kind === undefined) {
         this.results.push({ at: t1, handler: t1 - t0 });
-        for (const w of this.waiters.splice(0)) {
-          w();
-        }
+        this.#wake(this.waiters);
       }
     });
     this.worker.on("error", (e) => {
+      this.#fail(e);
       for (const cb of this.error) {
         cb(e);
       }
     });
+    this.worker.on("exit", (code) => this.#fail(new Error(`the bench Worker exited (code ${code})`)));
+  }
+
+  #wake(waiters, data) {
+    for (const w of waiters.splice(0)) {
+      w.resolve(data);
+    }
+  }
+
+  #fail(error) {
+    this.failure ??= error;
+    for (const w of [...this.waiters.splice(0), ...this.statsWaiters.splice(0)]) {
+      w.reject(this.failure);
+    }
+  }
+
+  #wait(waiters) {
+    if (this.failure !== undefined) {
+      return Promise.reject(this.failure);
+    }
+    return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
   }
 
   postMessage(msg, transfer) {
@@ -393,17 +418,18 @@ class BenchWorker {
   /** Resolves once every posted batch has its result applied; returns the results since `from`. */
   async drained(from = 0) {
     while (this.results.length < this.posted) {
-      await new Promise((resolve) => this.waiters.push(resolve));
+      await this.#wait(this.waiters);
     }
     return this.results.slice(from);
   }
 
   /** The harness's chunk times and longest Worker block since the last call (call only when drained). */
   stats() {
-    return new Promise((resolve) => {
-      this.statsWaiter = resolve;
+    const reply = this.#wait(this.statsWaiters);
+    if (this.failure === undefined) {
       this.worker.postMessage({ benchStats: true });
-    });
+    }
+    return reply;
   }
 }
 
@@ -489,10 +515,6 @@ async function roundTrip(scene, bw) {
 
 const maxOf = (xs) => xs.reduce((m, x) => Math.max(m, x), 0);
 const chunkMs = (st, kind) => st.chunks.filter((c) => c.kind === kind).map((c) => c.ms);
-
-function workerReport(name, samples, extra = "") {
-  return report(`worker ${name}`, samples, extra);
-}
 
 // 5a. addMesh: main-thread blocks while a big mesh goes to the Worker and comes back.
 async function benchWorkerAdd(label, n, runs) {
@@ -587,8 +609,8 @@ async function benchWorkerToggle(label, n, toggles, opts) {
     ["off", off],
     ["on", on],
   ]) {
-    workerReport(
-      `${label} colouring ${name}, round trip`,
+    report(
+      `worker ${label} colouring ${name}, round trip`,
       s.rt,
       `; handler median ${fmt(stats(s.handler).median)} ms, copy ${fmt(stats(s.copy).median)} ms, worker request ${fmt(stats(s.worker).median)} ms, longest Worker block ${fmt(stats(s.block).median)} ms`,
     );
@@ -598,7 +620,7 @@ async function benchWorkerToggle(label, n, toggles, opts) {
 
 // 5c. The 64-pose drag, one move per frame, in lock step with the results.
 async function benchWorkerDrag(label, n, cycles, opts) {
-  const { scene, bw, meshA, meshB, pose } = await workerPair(n, opts);
+  const { scene, bw, meshB, pose } = await workerPair(n, opts);
   const mirror = new ViewMirror(scene);
   mirror.apply(scene.commitFrame());
   const drag = scene.drag(meshB);
@@ -637,14 +659,13 @@ async function benchWorkerDrag(label, n, cycles, opts) {
   drag.end();
   await roundTrip(scene, bw);
   const med = (k) => fmt(stats(parts[k]).median);
-  workerReport(`${label} main-thread cost per frame (move + commitFrame + copy + result handler)`, main);
+  report(`worker ${label} main-thread cost per frame (move + commitFrame + copy + result handler)`, main);
   console.log(
     `  parts (median ms): move ${med("move")}, commitFrame ${med("commit")}, copy ${med("copy")}, handler ${med("handler")} (p95 ${fmt(stats(parts.handler).p95)}); dirty bytes copied ${fmt(stats(parts.bytes).median / 1e3)} KB`,
   );
   console.log(
     `  round trip move -> result applied: median ${med("rt")} ms (p95 ${fmt(stats(parts.rt).p95)}); worker drag request median ${med("worker")} ms, longest Worker block max ${fmt(maxOf(parts.workerBlock))} ms`,
   );
-  void meshA;
   scene.terminate();
 }
 
@@ -679,8 +700,8 @@ async function benchWorkerLongRequests(label, n, edits) {
       total.push(st.chunks.reduce((s, x) => s + x.ms, 0));
       block.push(st.maxGap);
     }
-    workerReport(
-      `${label} one-vertex edit, ${name}: longest Worker block`,
+    report(
+      `worker ${label} one-vertex edit, ${name}: longest Worker block`,
       block,
       `; worker time for the batch median ${fmt(stats(total).median)} ms, round trip median ${fmt(stats(rt).median)} ms`,
     );
@@ -712,8 +733,8 @@ async function benchWorkerLongRequests(label, n, edits) {
       await roundTrip(scene, bw);
       worker.push(maxOf(chunkMs(await bw.stats(), "section")));
     }
-    workerReport(
-      `${label} section over 3 meshes (fill ${fill ? "on" : "off"}), plane change: worker section request`,
+    report(
+      `worker ${label} section over 3 meshes (fill ${fill ? "on" : "off"}), plane change: worker section request`,
       worker,
       `; addSection ${fmt(add)} ms`,
     );
@@ -734,7 +755,7 @@ async function benchWorkerManySmall(label, calls, rounds) {
   }
   await roundTrip(scene, bw);
   await bw.stats();
-  const parts = { queue: [], send: [], rt: [], handler: [], worker: [], workerBlock: [], chunks: [] };
+  const parts = { queue: [], rt: [], handler: [], worker: [], workerBlock: [], chunks: [] };
   for (let r = 0; r < rounds + 1; r++) {
     const t0 = now();
     for (let k = 0; k < calls; k++) {
@@ -795,7 +816,9 @@ if (onlyWorker) {
   await benchWorkerToggle("1M contact", 708, quick ? 10 : 20, contact);
   await benchWorkerToggle("1M wide", 708, quick ? 10 : 20, wide);
   await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
-  await benchWorkerDrag("1M wide", 708, 1, wide);
+  if (!quick) {
+    await benchWorkerDrag("1M wide", 708, 1, wide); // 64 poses of about 0.4 s each, plus a warm-up cycle
+  }
   await benchWorkerLongRequests("1M", 708, quick ? 4 : 10);
   await benchWorkerManySmall("small requests", 1000, quick ? 5 : 20);
   if (with10m) {

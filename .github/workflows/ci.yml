@@ -95,6 +95,7 @@ jobs:
           path: pack/*.tgz
       # Needs the release build, so it runs before the test script replaces it.
       - name: Run the Scene benchmarks (short run, release build)
+        timeout-minutes: 20
         run: |
           pnpm --filter fast-mesh-wasm bench -- --quick
           pnpm --filter fast-mesh-wasm bench -- --worker --quick
