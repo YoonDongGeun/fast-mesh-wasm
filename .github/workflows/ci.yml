@@ -79,8 +79,11 @@ jobs:
         run: pnpm check:pkg
       - name: Build the Vite example (browser entry)
         run: pnpm --filter fast-mesh-wasm-example-vite build
-      - name: Type-check and build the WebGPU example (Scene API, no 3D library)
-        run: pnpm --filter fast-mesh-wasm-example-webgpu build
+      - name: Type-check and build the WebGPU example (Scene API, no 3D library; ?worker uses the Worker scene)
+        run: |
+          pnpm --filter fast-mesh-wasm-example-webgpu build
+          # Vite must have picked up the package's default Worker URL and emitted the Worker script.
+          ls examples/webgpu/dist/assets/worker-entry-*.js
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build
@@ -92,7 +95,9 @@ jobs:
           path: pack/*.tgz
       # Needs the release build, so it runs before the test script replaces it.
       - name: Run the Scene benchmarks (short run, release build)
-        run: pnpm --filter fast-mesh-wasm bench -- --quick
+        run: |
+          pnpm --filter fast-mesh-wasm bench -- --quick
+          pnpm --filter fast-mesh-wasm bench -- --worker --quick
       # Last: the test script rebuilds the package with the `test-panic` feature,
       # which must not reach the packed tarball above.
       - name: Test the package (test build)
