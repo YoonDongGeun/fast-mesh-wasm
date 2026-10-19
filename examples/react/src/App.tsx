@@ -7,7 +7,7 @@ import type { MeshHandle, SectionHandle } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useHistory, useScene, useSection, useSelection } from "fast-mesh-wasm/react";
 import { meshState, sectionState } from "fast-mesh-wasm/store";
-import { attachTransformControls, type BoundMesh, bindSection } from "fast-mesh-wasm/three";
+import { attachTransformControls, bindSection, type MeshBinding } from "fast-mesh-wasm/three";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -16,18 +16,24 @@ import { type Item, makeItem } from "./items";
 import { fit, type MeshData, parseBinaryStl } from "./meshes";
 import { Panel } from "./Panel";
 
-/** A mesh the user clicked, with the object `<FastMesh>` draws it with: the gizmo's target. */
-interface Picked {
-  mesh: MeshHandle;
-  object: THREE.Mesh;
-}
-
 export function App(props: { initialItems: Item[]; section: SectionHandle }) {
   const { section } = props;
   const store = useScene();
   const [items, setItems] = useState(props.initialItems);
   const [selection, select] = useSelection();
-  const [picked, setPicked] = useState<Picked | null>(null);
+  // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the section and the gizmo.
+  const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
+  const onBind = useCallback((mesh: MeshHandle, bound: MeshBinding | null) => {
+    setBindings((prev) => {
+      const next = new Map(prev);
+      if (bound === null) {
+        next.delete(mesh);
+      } else {
+        next.set(mesh, bound);
+      }
+      return next;
+    });
+  }, []);
   const [gizmoMode, setGizmoMode] = useState<"translate" | "rotate">("translate");
   const [note, setNote] = useState("");
   const { undo, redo } = useHistory();
@@ -35,6 +41,11 @@ export function App(props: { initialItems: Item[]; section: SectionHandle }) {
   // ---- Keyboard: undo/redo, deselect, gizmo mode ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Typing in a field (the opacity slider, say) is not a shortcut.
+      const target = e.target as HTMLElement | null;
+      if (target !== null && (target.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName))) {
+        return;
+      }
       const key = e.key.toLowerCase();
       if ((e.ctrlKey || e.metaKey) && key === "z") {
         e.preventDefault();
@@ -46,6 +57,8 @@ export function App(props: { initialItems: Item[]; section: SectionHandle }) {
       } else if ((e.ctrlKey || e.metaKey) && key === "y") {
         e.preventDefault();
         redo();
+      } else if (e.ctrlKey || e.metaKey || e.altKey) {
+        // Other modified keys (Ctrl+R, say) are the browser's.
       } else if (key === "escape") {
         select(null);
       } else if (key === "t") {
@@ -115,13 +128,7 @@ export function App(props: { initialItems: Item[]; section: SectionHandle }) {
     };
   }, [store, replace]);
 
-  const pick = useCallback(
-    (mesh: MeshHandle, object: THREE.Mesh) => {
-      setPicked((p) => (p?.mesh === mesh && p.object === object ? p : { mesh, object }));
-      select(mesh);
-    },
-    [select],
-  );
+  const selected = selection === null ? null : (bindings.get(selection) ?? null);
 
   return (
     <>
@@ -137,10 +144,10 @@ export function App(props: { initialItems: Item[]; section: SectionHandle }) {
         <directionalLight position={[3, 6, 4]} intensity={2.2} />
         <directionalLight position={[-4, -2, -3]} intensity={0.6} />
         {items.map((item) => (
-          <MeshView key={item.id} item={item} selected={item.mesh === selection} onPick={pick} />
+          <MeshView key={item.id} item={item} selected={item.mesh === selection} onPick={select} onBind={onBind} />
         ))}
-        <SectionView section={section} items={items} />
-        <Controls picked={picked !== null && picked.mesh === selection ? picked : null} mode={gizmoMode} />
+        <SectionView section={section} bindings={bindings} />
+        <Controls bound={selected} mode={gizmoMode} />
       </Canvas>
       <Panel items={items} section={section} note={note} />
     </>
@@ -148,46 +155,46 @@ export function App(props: { initialItems: Item[]; section: SectionHandle }) {
 }
 
 /** A mesh drawn with `<FastMesh>`: click to select it. */
-function MeshView(props: { item: Item; selected: boolean; onPick: (mesh: MeshHandle, object: THREE.Mesh) => void }) {
-  const { item, selected, onPick } = props;
+function MeshView(props: {
+  item: Item;
+  selected: boolean;
+  onPick: (mesh: MeshHandle) => void;
+  onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
+}) {
+  const { item, selected, onPick, onBind } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2600 : 0x000000);
   }, [item.material, selected]);
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
-      onPick(item.mesh, e.eventObject as THREE.Mesh);
+      onPick(item.mesh);
     },
     [item.mesh, onPick],
   );
-  return <FastMesh mesh={item.mesh} material={item.material} onClick={onClick} />;
+  return (
+    <FastMesh mesh={item.mesh} material={item.material} onClick={onClick} onBind={(b) => onBind(item.mesh, b)} />
+  );
 }
 
 /**
  * The section's contours, and the clipping of the meshes it cuts, with
- * `bindSection`. Rebound when the meshes it cuts (as applied) change.
+ * `bindSection` over the `<FastMesh>` bindings. Rebound when the meshes it
+ * cuts (as applied) or their bindings change: `bindSection` clips the
+ * materials it sees when it is called.
  */
-function SectionView(props: { section: SectionHandle; items: Item[] }) {
-  const { section, items } = props;
+function SectionView(props: { section: SectionHandle; bindings: ReadonlyMap<MeshHandle, MeshBinding> }) {
+  const { section, bindings } = props;
   const store = useScene();
   const [state] = useSection(section);
-  const cut = useMemo(() => items.filter((i) => state.meshes.includes(i.mesh)), [items, state.meshes]);
+  const cut = useMemo(() => state.meshes.flatMap((m) => bindings.get(m) ?? []), [bindings, state.meshes]);
   const [group, setGroup] = useState<THREE.Group | null>(null);
 
   useLayoutEffect(() => {
     if (cut.length === 0) {
       return;
     }
-    // `bindSection` reads a bound mesh's handle and its object's material
-    // (to clip it). `<FastMesh>` keeps its binding to itself, so each cut
-    // mesh is described by its handle and the material the app gave it.
-    const bound: BoundMesh[] = cut.map((i) => ({
-      object: new THREE.Mesh(undefined, i.material),
-      mesh: i.mesh,
-      setOpacity() {},
-      dispose() {},
-    }));
-    const b = bindSection(store.scene, section, bound, { lineColor: 0xffd400 });
+    const b = bindSection(store.scene, section, cut, { lineColor: 0xffd400 });
     setGroup(b.group);
     return () => {
       b.dispose();
@@ -198,9 +205,9 @@ function SectionView(props: { section: SectionHandle; items: Item[] }) {
   return group === null ? null : <primitive object={group} dispose={null} />;
 }
 
-/** Orbit camera, plus a TransformControls gizmo on `picked` (dragging through `attachTransformControls`). */
-function Controls(props: { picked: Picked | null; mode: "translate" | "rotate" }) {
-  const { picked, mode } = props;
+/** Orbit camera, plus a TransformControls gizmo on `bound` (dragging through `attachTransformControls`). */
+function Controls(props: { bound: MeshBinding | null; mode: "translate" | "rotate" }) {
+  const { bound, mode } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
@@ -222,21 +229,14 @@ function Controls(props: { picked: Picked | null; mode: "translate" | "rotate" }
   useFrame(() => orbit?.update());
 
   useEffect(() => {
-    if (orbit === null || picked === null) {
+    if (orbit === null || bound === null) {
       return;
     }
     const controls = new TransformControls(camera, gl.domElement);
     const helper = controls.getHelper();
     scene.add(helper);
-    controls.attach(picked.object);
-    // `attachTransformControls` reads a bound mesh's object and handle: the
-    // object `<FastMesh>` draws (from the click) and the mesh it draws.
-    const detach = attachTransformControls(controls, store.scene, {
-      object: picked.object,
-      mesh: picked.mesh,
-      setOpacity() {},
-      dispose() {},
-    });
+    controls.attach(bound.object);
+    const detach = attachTransformControls(controls, store.scene, bound);
     const onDragging = (e: { value: unknown }) => {
       orbit.enabled = e.value !== true;
     };
@@ -251,7 +251,7 @@ function Controls(props: { picked: Picked | null; mode: "translate" | "rotate" }
       orbit.enabled = true;
       setGizmo((g) => (g === controls ? null : g));
     };
-  }, [store, camera, gl, scene, orbit, picked]);
+  }, [store, camera, gl, scene, orbit, bound]);
 
   useEffect(() => {
     gizmo?.setMode(mode);

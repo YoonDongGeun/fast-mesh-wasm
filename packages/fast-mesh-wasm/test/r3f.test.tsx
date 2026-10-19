@@ -7,12 +7,15 @@
 // (all n frames of the first, then all n of the second, ...), so these tests
 // also pin that the driver's dedupe needs no clock or frame stamp.
 import { existsSync, readFileSync } from "node:fs";
+import { type RootState, useThree } from "@react-three/fiber";
 import ReactThreeTestRenderer from "@react-three/test-renderer";
 import * as THREE from "three";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FastMesh, useFrameDriver } from "../src/r3f/index.js";
 import { SceneProvider } from "../src/react/index.js";
-import { createSceneStore, type SceneStore } from "../src/store/index.js";
+import { createSceneStore, type DistanceColoring, meshState, type SceneStore } from "../src/store/index.js";
+import { listenerCount } from "../src/store/store.js";
+import { bindSection, type MeshBinding } from "../src/three/index.js";
 import type { BoundMesh } from "../src/three/mesh.js";
 import { type MeshHandle, Scene } from "../src/node.js";
 
@@ -51,6 +54,7 @@ afterEach(async () => {
   }
   bounds.length = 0;
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 /** A local store with meshes `a`, `b` and `c`, already in frame-loop mode. */
@@ -71,8 +75,8 @@ function setup(): { store: SceneStore; a: MeshHandle; b: MeshHandle; c: MeshHand
 
 type Renderer = Awaited<ReturnType<typeof create>>;
 
-async function mount(el: React.ReactNode): Promise<Renderer> {
-  const r = await create(el);
+async function mount(el: React.ReactNode, options?: Parameters<typeof create>[1]): Promise<Renderer> {
+  const r = await create(el, options);
   let mounted = true;
   disposers.push(async () => {
     if (mounted) {
@@ -241,6 +245,121 @@ describe("FastMesh", () => {
     await r.unmount();
     expect(bound.dispose).toHaveBeenCalledTimes(1);
     expect(bounds).toHaveLength(1);
+  });
+
+  it("fastmesh_demand_invalidates", async () => {
+    const { store, a } = setup();
+    const before = listenerCount(store);
+    let state: RootState | undefined;
+    function Grab() {
+      state = useThree();
+      return null;
+    }
+    // No requestAnimationFrame in Node: R3F's demand loop is never started.
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    const r = await mount(<Grab />, { frameloop: "demand" });
+    const invalidate = vi.spyOn(state!, "invalidate").mockImplementation(() => {});
+    await r.update(
+      <>
+        <Grab />
+        <SceneProvider store={store}>
+          <FastMesh mesh={a} />
+          <FastMesh mesh={a} />
+        </SceneProvider>
+      </>,
+    );
+    await frames(r, 1);
+    invalidate.mockClear();
+
+    await act(async () => {
+      store.setDisplay(a, { opacity: 0.5 });
+    });
+    expect(invalidate).toHaveBeenCalled();
+    const object = r.scene.children[0].instance as THREE.Mesh;
+    expect((object.material as THREE.Material).opacity).toBe(1);
+    await frames(r, 1);
+    expect((object.material as THREE.Material).opacity).toBe(0.5);
+
+    // A frame with no change asks for no other frame.
+    invalidate.mockClear();
+    await frames(r, 1);
+    expect(invalidate).not.toHaveBeenCalled();
+
+    // Unmounted: no subscription left on the store.
+    await r.update(<Grab />);
+    expect(listenerCount(store)).toBe(before);
+  });
+
+  it("fastmesh_unmount_restores_microtask_flush", async () => {
+    const { store, a, b } = setup();
+    const r = await mount(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} />
+      </SceneProvider>,
+    );
+    await frames(r, 1);
+    await r.update(<SceneProvider store={store} />);
+    const rule: DistanceColoring = { distanceTo: b, maxDistance: 5, map: "turbo", range: [0, 2] };
+    store.setDisplay(a, { coloring: rule });
+    expect(meshState(store.getSnapshot(), a).display.coloring).toBeNull();
+    await Promise.resolve();
+    expect(meshState(store.getSnapshot(), a).display.coloring).toEqual(rule);
+  });
+
+  it("fastmesh_display_same_frame", async () => {
+    const { store, a, b } = setup();
+    const r = await mount(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} />
+      </SceneProvider>,
+    );
+    const object = r.scene.children[0].instance as THREE.Mesh;
+    await act(async () => {
+      store.setDisplay(a, {
+        coloring: { distanceTo: b, maxDistance: 5, map: "turbo", range: [0, 2] },
+        opacity: 0.5,
+        visible: false,
+      });
+    });
+    expect(object.geometry.getAttribute("color")).toBeUndefined();
+    await act(async () => {
+      // Checked inside act(), before React re-renders: the frame alone applies both.
+      void r.advanceFrames(1, 1 / 60);
+      expect(object.geometry.getAttribute("color")).toBeDefined();
+      expect((object.material as THREE.Material).opacity).toBe(0.5);
+      expect(object.visible).toBe(false);
+    });
+  });
+
+  it("fastmesh_on_bind_section", async () => {
+    const { store, a } = setup();
+    const section = store.addSection({ plane: { origin: [0, 0, 0.2], normal: [0, 0, 1] }, meshes: [a] });
+    store.commitFrame();
+    const onBind = vi.fn<(b: BoundMesh | null) => void>();
+    const r = await mount(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} onBind={onBind} />
+      </SceneProvider>,
+    );
+    expect(onBind).toHaveBeenCalledTimes(1);
+    const binding: MeshBinding = onBind.mock.calls[0][0]!;
+    expect(binding.object).toBe(r.scene.children[0].instance);
+    const drawn = bindSection(store.scene, section, [binding]);
+    const material = binding.object.material as THREE.Material;
+    expect(material.clippingPlanes).toHaveLength(1);
+    expect(drawn.group.children.length).toBeGreaterThan(0);
+    drawn.dispose();
+
+    // A new inline callback does not rebind.
+    await r.update(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} onBind={(x) => onBind(x)} />
+      </SceneProvider>,
+    );
+    expect(bounds).toHaveLength(1);
+    await r.update(<SceneProvider store={store} />);
+    expect(onBind).toHaveBeenCalledTimes(2);
+    expect(onBind).toHaveBeenLastCalledWith(null);
   });
 
   it("package_r3f_export", () => {

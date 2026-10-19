@@ -66,6 +66,22 @@
       button:disabled {
         opacity: 0.4;
       }
+      /* Requested, not shown yet: the pending window of a colouring or section. */
+      button.computing {
+        border-color: #f0b040;
+        cursor: progress;
+        animation: pending 1s ease-in-out infinite alternate;
+      }
+      @keyframes pending {
+        to {
+          border-color: #556;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        button.computing {
+          animation: none;
+        }
+      }
       .busy {
         color: #f0b040;
       }

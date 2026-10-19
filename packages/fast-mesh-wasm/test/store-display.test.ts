@@ -641,6 +641,33 @@ describe("SceneStore display (worker only, review fixes)", () => {
   });
 });
 
+describe.each([
+  ["local", makeLocal],
+  ["worker", () => makeWorker()],
+] as const)("SceneStore dispose (%s)", (mode, make) => {
+  it("dispose_removes_owned_fields", async () => {
+    const f = await make();
+    const { store, scene } = f;
+    const { a, b } = withTwo(store);
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    await settle(store);
+    expect(f.fieldAdds()).toBe(1);
+    expect(f.fieldRemoves()).toBe(0);
+    store.dispose();
+    if (mode === "worker") {
+      // Queued, and sent with the scene's next frame.
+      scene.commitFrame();
+    }
+    expect(f.fieldRemoves()).toBe(1);
+    if (mode === "local") {
+      // The name is free again, and the colouring went with the field.
+      const local = scene as Scene;
+      const field = local.addDistanceField({ name: "fast-mesh-store:1", on: a, to: b, maxDistance: 5 });
+      expect(local.fieldStatus(field)).toBeDefined();
+    }
+  });
+});
+
 describe("SceneStore display (local only)", () => {
   it("local_restart_rejects", async () => {
     const { store } = await makeLocal();

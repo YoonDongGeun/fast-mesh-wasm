@@ -141,6 +141,8 @@ function colorRule(field: FieldHandle, c: DistanceColoring): ColorRule {
 
 /** Set by `SceneStore`'s static block: the test-only {@link listenerCount}. */
 let listenerCountOf: (store: SceneStore) => number;
+/** Set by `SceneStore`'s static block: the internal {@link setFrameLoop}. */
+let setFrameLoopOf: (store: SceneStore, on: boolean) => void;
 
 /**
  * An observable store over a scene. Read with {@link getSnapshot} and
@@ -540,14 +542,32 @@ export class SceneStore {
   }
 
   /**
-   * Stops listening to the scene. The scene itself is left as it is (it is
-   * the app's). Later actions throw `INVALID_ARGUMENT`; the last snapshot stays readable.
+   * Removes the distance fields the store owns (`fast-mesh-store:<n>`, and
+   * so the colourings by them) and stops listening to the scene. The rest of
+   * the scene is left as it is (it is the app's). On a Worker scene the
+   * removals are queued like any call, and sent with the scene's next
+   * `commitFrame()`; errors from a scene that can no longer take them (a
+   * poisoned Worker scene, for one) are ignored. Later actions throw
+   * `INVALID_ARGUMENT`; the last snapshot stays readable.
    */
   dispose(): void {
     if (this.#disposed) {
       return;
     }
     this.#disposed = true;
+    for (const entry of this.#meshes.values()) {
+      const field = entry.field;
+      if (field === undefined) {
+        continue;
+      }
+      entry.field = undefined;
+      try {
+        this.#host.removeField(field.handle);
+      } catch {
+        // A scene that can no longer take it (a poisoned or terminated
+        // Worker scene, a freed Scene): nothing left to clean up there.
+      }
+    }
     for (const off of this.#unsubscribe.splice(0)) {
       off();
     }
@@ -947,6 +967,12 @@ export class SceneStore {
 
   static {
     listenerCountOf = (store) => store.#listeners.size;
+    setFrameLoopOf = (store, on) => {
+      store.#frameLoop = on;
+      if (!on && !store.#disposed && (store.#pendingDisplay.size > 0 || store.#pendingSections.size > 0)) {
+        store.#schedule();
+      }
+    };
   }
 }
 
@@ -958,4 +984,15 @@ export function createSceneStore(scene: Scene | WorkerScene): SceneStore {
 /** Test-only, not exported from `fast-mesh-wasm/store`: the number of subscribed listeners. */
 export function listenerCount(store: SceneStore): number {
   return listenerCountOf(store);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/store`: switches the store's
+ * flushing. `commitFrame()` switches it on (declarative changes wait for the
+ * next frame); `false` switches it back to flushing on a microtask, and
+ * flushes the changes waiting for a frame. The r3f frame driver calls it
+ * when the store's last driver unmounts.
+ */
+export function setFrameLoop(store: SceneStore, on: boolean): void {
+  setFrameLoopOf(store, on);
 }

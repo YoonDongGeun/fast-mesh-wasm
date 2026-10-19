@@ -15,7 +15,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { FastMeshError } from "../core.js";
-import type { MeshHandle, SectionHandle, SectionPlane } from "../scene.js";
+import type { MeshHandle, SectionHandle } from "../scene.js";
 import {
   type DisplayState,
   EMPTY_SNAPSHOT,
@@ -25,7 +25,7 @@ import {
   type SectionState,
   sectionState,
 } from "../store/snapshot.js";
-import type { SceneStore } from "../store/store.js";
+import type { SceneStore, SectionPatch } from "../store/store.js";
 import { StoreContext } from "./context.js";
 
 /** Provides `store` to the hooks below it. */
@@ -153,7 +153,7 @@ export function useHistory(): HistoryControls {
 }
 
 /** A change to a section: its plane, meshes or fill. */
-export type SectionUpdate = Partial<{ plane: SectionPlane; meshes: readonly MeshHandle[]; fill: boolean }>;
+export type SectionUpdate = SectionPatch;
 
 /**
  * A section's state (the applied plane, meshes and fill, `desired` and

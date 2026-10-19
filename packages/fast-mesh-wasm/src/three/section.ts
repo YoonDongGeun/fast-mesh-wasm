@@ -4,7 +4,7 @@ import * as THREE from "three";
 import { FastMeshError } from "../core.js";
 import type { SectionHandle, SectionPlane, SectionResult } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
-import type { BoundMesh } from "./mesh.js";
+import type { MeshBinding } from "./mesh.js";
 
 /** Options of {@link bindSection}. */
 export interface BindSectionOptions {
@@ -48,7 +48,7 @@ const DEFAULT_FILL = 0x888888;
 
 /** One bound mesh's drawing: its contour lines and fill. */
 interface Entry {
-  bound: BoundMesh;
+  bound: MeshBinding;
   lines: THREE.LineSegments;
   fill: THREE.Mesh;
 }
@@ -82,7 +82,7 @@ function segments(result: SectionResult): Float32Array {
 }
 
 /** The result for a mesh, or `null` when the section or mesh is gone or the section does not cut it. */
-function resultOf(scene: SceneLike, section: SectionHandle, bound: BoundMesh): SectionResult | null {
+function resultOf(scene: SceneLike, section: SectionHandle, bound: MeshBinding): SectionResult | null {
   try {
     return scene.section(section, bound.mesh);
   } catch (error) {
@@ -119,7 +119,7 @@ function resultOf(scene: SceneLike, section: SectionHandle, bound: BoundMesh): S
 export function bindSection(
   scene: SceneLike,
   section: SectionHandle,
-  bound: BoundMesh[],
+  bound: readonly MeshBinding[],
   options: BindSectionOptions = {},
 ): BoundSection {
   const group = new THREE.Group();

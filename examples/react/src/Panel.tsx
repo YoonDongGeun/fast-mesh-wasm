@@ -63,7 +63,13 @@ function MeshBlock(props: { item: Item; other: Item | null }) {
     <section>
       <h2 className={selection === item.mesh ? "selected" : undefined}>{item.name}</h2>
       <div className="row">
-        <button aria-pressed={pressed} aria-busy={busy} disabled={other === null && !pressed} onClick={toggle}>
+        <button
+          className={busy ? "computing" : undefined}
+          aria-pressed={pressed}
+          aria-busy={busy}
+          disabled={other === null && !pressed}
+          onClick={toggle}
+        >
           Colour by distance{other === null ? "" : ` to ${other.name}`}
         </button>
         {busy && (
@@ -112,6 +118,7 @@ function SectionBlock(props: { section: SectionHandle; items: Item[] }) {
       <h2>Section</h2>
       <div className="row">
         <button
+          className={busy ? "computing" : undefined}
           aria-pressed={pressed}
           aria-busy={busy}
           onClick={() => setSection({ meshes: pressed ? [] : items.map((i) => i.mesh) })}

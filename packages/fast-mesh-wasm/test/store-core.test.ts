@@ -4,7 +4,7 @@
 // through the `createWorker` option. Snapshots, structural sharing, history,
 // selection, removed meshes, the flush schedule, subscriptions and the
 // package layout of the subpath.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FastMeshError, Scene } from "../src/node.js";
@@ -465,6 +465,10 @@ describe("fast-mesh-wasm/store package", () => {
     expect(existsSync(new URL("store.d.ts", dist))).toBe(true);
     // Test-only helpers stay out of the public types.
     expect(readFileSync(new URL("store.d.ts", dist), "utf8")).not.toMatch(/listenerCount/);
+    // So do internal ones, in every declaration file.
+    for (const f of readdirSync(dist).filter((f) => f.endsWith(".d.ts"))) {
+      expect(readFileSync(new URL(f, dist), "utf8"), f).not.toMatch(/setFrameLoop|listenerCount/);
+    }
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(pkg.exports["./store"]).toEqual({ types: "./dist/store.d.ts", default: "./dist/store.js" });
 

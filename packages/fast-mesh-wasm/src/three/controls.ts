@@ -6,7 +6,7 @@ import type { Quat, Vec3 } from "../api.js";
 import { FastMeshError } from "../core.js";
 import type { DragSession } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
-import type { BoundMesh } from "./mesh.js";
+import type { MeshBinding } from "./mesh.js";
 
 /**
  * What {@link attachTransformControls} needs of a TransformControls: its
@@ -94,7 +94,7 @@ function rotate(q: Quat, v: Readonly<Vec3>): Vec3 {
 export function attachTransformControls(
   controls: TransformControlsLike,
   scene: SceneLike,
-  bound: BoundMesh,
+  bound: MeshBinding,
   options: AttachTransformControlsOptions = {},
 ): () => void {
   const schedule = options.schedule ?? defaultSchedule;

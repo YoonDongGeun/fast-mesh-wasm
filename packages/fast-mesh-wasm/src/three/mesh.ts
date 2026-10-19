@@ -58,6 +58,13 @@ export interface BoundMesh {
   dispose(): void;
 }
 
+/**
+ * The part of a {@link BoundMesh} that `attachTransformControls` and
+ * `bindSection` use: the scene mesh and its THREE.Mesh. A full `BoundMesh`
+ * is one, and so is the binding `<FastMesh onBind>` delivers.
+ */
+export type MeshBinding = Pick<BoundMesh, "mesh" | "object">;
+
 type Material = NonNullable<BindMeshOptions["material"]>;
 type Mirror = Float32Array | Uint8Array | Uint16Array | Uint32Array;
 
