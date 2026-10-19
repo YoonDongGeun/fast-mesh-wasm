@@ -167,12 +167,12 @@ const POISONED: ErrorWire = {
   message: "an earlier fast-mesh call panicked; the WebAssembly instance can no longer be used",
 };
 
-/** The poisoned error after packing a result failed with `e`. */
+/** The poisoned error after packing or sending a result failed with `e`. */
 function packingFailed(e: unknown): ErrorWire {
   const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
   return {
     code: "INSTANCE_POISONED",
-    message: `packing the Worker result failed (${cause}); the Worker scene can no longer be used`,
+    message: `packing or sending the Worker result failed (${cause}); the Worker scene can no longer be used`,
   };
 }
 
@@ -434,7 +434,15 @@ class Engine {
       this.#poison(b, isPoison(e) ? POISONED : packingFailed(e), undefined, true);
       return false;
     }
-    this.#port.post(result, b.transfer);
+    try {
+      this.#port.post(result, b.transfer);
+    } catch (e) {
+      // Not sent (a value that cannot be cloned, say): the frame's changes
+      // are lost, as when packing fails. Its poisoned result goes instead,
+      // so every batch still gets exactly one result.
+      this.#poison(b, packingFailed(e), undefined, true);
+      return false;
+    }
     return true;
   }
 
@@ -482,19 +490,35 @@ class Engine {
         b.replies.push({ qid, ok: false, error });
       }
     }
-    this.#port.post(
-      {
-        rev: b.rev,
-        changes: [],
-        placements: [],
-        sections: [],
-        history: { canUndo: false, canRedo: false },
-        status: b.status,
-        replies: b.replies,
-        poisoned: true,
-      },
-      b.transfer,
-    );
+    const result: Result = {
+      rev: b.rev,
+      changes: [],
+      placements: [],
+      sections: [],
+      history: { canUndo: false, canRedo: false },
+      status: b.status,
+      replies: b.replies,
+      poisoned: true,
+    };
+    try {
+      this.#port.post(result, b.transfer);
+    } catch {
+      // Something in it cannot be sent: send the bare outcome (keys,
+      // revisions, qids and the error only), so the batch still gets its
+      // one result.
+      try {
+        this.#port.post(
+          {
+            ...result,
+            status: b.status.map((st) => ({ key: st.key, rev: st.rev, status: "error" as const, error })),
+            replies: b.replies.map((r) => ({ qid: r.qid, ok: false, error })),
+          },
+          [],
+        );
+      } catch {
+        // The channel itself is gone: nothing more can be sent.
+      }
+    }
   }
 
   /**

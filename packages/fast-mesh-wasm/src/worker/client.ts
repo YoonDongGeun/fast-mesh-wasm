@@ -10,35 +10,32 @@
 import type { Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode } from "../core.js";
-import {
-  type AddMeshOptions,
-  type Analysis,
-  type AnalyzeOptions,
-  type ClosestHit,
-  type ClosestPointOptions,
-  type ColorRule,
-  type Contact,
-  type DistanceFieldDesc,
-  type DragSession,
-  type EditOp,
-  type EditResult,
-  FieldHandle,
-  type FieldStatus,
-  type FindContactsOptions,
-  type MeshChange,
-  type MeshDistance,
-  MeshHandle,
-  type RaycastOptions,
-  type RayHit,
-  type RepairOp,
-  type RepairReport,
-  type RepairReportOf,
-  rotationMatrix,
-  type SectionDesc,
-  type SectionGap,
-  SectionHandle,
-  type SectionPlane,
-  type SectionResult,
+import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "../handles.js";
+import type {
+  AddMeshOptions,
+  Analysis,
+  AnalyzeOptions,
+  ClosestHit,
+  ClosestPointOptions,
+  ColorRule,
+  Contact,
+  DistanceFieldDesc,
+  DragSession,
+  EditOp,
+  EditResult,
+  FieldStatus,
+  FindContactsOptions,
+  MeshChange,
+  MeshDistance,
+  RaycastOptions,
+  RayHit,
+  RepairOp,
+  RepairReport,
+  RepairReportOf,
+  SectionDesc,
+  SectionGap,
+  SectionPlane,
+  SectionResult,
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import { type MeshViews, ViewGuard } from "../views.js";
@@ -62,7 +59,7 @@ import {
 export interface WorkerLike {
   postMessage(msg: unknown, transfer?: Transferable[]): void;
   /** `"message"` events carry the message in `data`. */
-  addEventListener(type: "message" | "error", cb: (e: any) => void): void;
+  addEventListener(type: "message" | "error" | "messageerror", cb: (e: any) => void): void;
   terminate(): void;
 }
 
@@ -90,7 +87,8 @@ export interface KeyStatus {
   /**
    * `"computing"` while a request with this key is queued or running,
    * `"ready"` or `"error"` once the latest one finished, `"idle"` for a key
-   * never used.
+   * never used, or one of a removed mesh, field or section once its removal
+   * has settled (its state is then forgotten).
    */
   status: "idle" | "computing" | "ready" | "error";
   /** The revision of the request the status is about (0 when idle). */
@@ -109,9 +107,9 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
     ((options.workerUrl === undefined
       ? new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })
       : new Worker(options.workerUrl, { type: "module" })) as unknown as WorkerLike);
-  const scene = new WorkerScene(TOKEN, make, options.debug ?? false);
+  const [scene, started] = createScene(make, options.debug ?? false);
   try {
-    await scene[STARTED];
+    await started;
   } catch (e) {
     scene.terminate();
     throw e;
@@ -125,9 +123,11 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
  */
 export const FALLBACK_FLUSH_MS = 100;
 
-/** Keeps the constructor to {@link createWorkerScene}. */
-const TOKEN = Symbol("WorkerScene");
-const STARTED = Symbol("started");
+/**
+ * Set by `WorkerScene`'s static block: makes a scene (the constructor is
+ * private) and returns it with its first Worker's start.
+ */
+let createScene: (make: () => WorkerLike, debug: boolean) => [WorkerScene, Promise<void>];
 
 /** Elements per slot of each buffer. */
 const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
@@ -402,6 +402,7 @@ interface DragState {
 }
 
 /** Set by `WorkerScene`'s static block: the test-only {@link debugDump}. */
+let debugSizesOf: (scene: WorkerScene) => Record<string, number>;
 let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["debugDump"]["value"]>;
 
 /**
@@ -444,6 +445,14 @@ export class WorkerScene implements SceneLike {
   readonly #byMesh = new Map<MeshHandle, MeshState>();
   /** Handles of removed meshes whose state was pruned: they give `UNKNOWN_MESH`. */
   readonly #tombstones = new WeakSet<MeshHandle>();
+  /** Handles of removed fields and sections whose state was pruned. */
+  readonly #fieldTombstones = new WeakSet<FieldHandle>();
+  readonly #sectionTombstones = new WeakSet<SectionHandle>();
+  /**
+   * Removed fields and sections to forget once the result of their removal
+   * (revision `rev`) is applied, or at a restart.
+   */
+  #prunes: { rev: number; run: () => void }[] = [];
   readonly #fields = new Map<ClientId, FieldState>();
   readonly #byField = new Map<FieldHandle, FieldState>();
   readonly #sections = new Map<ClientId, SectionState>();
@@ -500,18 +509,11 @@ export class WorkerScene implements SceneLike {
   readonly #batchDone = new Map<Request[], Pending>();
   /** The restart under way, until its replay's result is applied. */
   #restarting: Promise<void> | undefined;
-  /** @internal Resolves when the Worker is ready. */
-  readonly [STARTED]: Promise<void>;
-
-  /** @internal Use {@link createWorkerScene}. */
-  constructor(token: typeof TOKEN, make: () => WorkerLike, debug: boolean) {
-    if (token !== TOKEN) {
-      throw new TypeError("use createWorkerScene() to create a WorkerScene");
-    }
+  /** Use {@link createWorkerScene}. */
+  private constructor(make: () => WorkerLike, debug: boolean) {
     this.#make = make;
     this.#guard = debug ? new ViewGuard() : undefined;
     this.#worker = this.#attach(make());
-    this[STARTED] = this.#ready.promise;
   }
 
   /**
@@ -538,6 +540,17 @@ export class WorkerScene implements SceneLike {
       this.#poisonAll({
         code: "INSTANCE_POISONED",
         message: `the Worker failed${e?.message ? ` (${e.message})` : ""}; the Worker scene can no longer be used`,
+      });
+    });
+    // A result that cannot be deserialised is lost, and with it the order of
+    // results: fatal, like a Worker error.
+    worker.addEventListener("messageerror", () => {
+      if (worker !== this.#worker) {
+        return;
+      }
+      this.#poisonAll({
+        code: "INSTANCE_POISONED",
+        message: "a message from the Worker could not be read; the Worker scene can no longer be used",
       });
     });
     return worker;
@@ -745,6 +758,7 @@ export class WorkerScene implements SceneLike {
     }
     const batch = this.#inflight.shift() ?? [];
     this.#apply(msg, batch);
+    this.#runPrunes(msg.rev);
     const done = this.#batchDone.get(batch);
     if (done !== undefined) {
       this.#batchDone.delete(batch);
@@ -998,6 +1012,9 @@ export class WorkerScene implements SceneLike {
     this.#alive();
     const st = field instanceof FieldHandle ? this.#byField.get(field) : undefined;
     if (st === undefined) {
+      if (field instanceof FieldHandle && this.#fieldTombstones.has(field)) {
+        throw new FastMeshError("UNKNOWN_FIELD", "the field was removed");
+      }
       throw invalid("not a field handle of this Worker scene");
     }
     if (st.removed) {
@@ -1009,6 +1026,9 @@ export class WorkerScene implements SceneLike {
   #section(section: SectionHandle): SectionState {
     const st = section instanceof SectionHandle ? this.#bySection.get(section) : undefined;
     if (st === undefined) {
+      if (section instanceof SectionHandle && this.#sectionTombstones.has(section)) {
+        throw new FastMeshError("UNKNOWN_SECTION", "the section was removed");
+      }
       throw invalid("not a section handle of this Worker scene");
     }
     if (st.removed) {
@@ -1100,21 +1120,19 @@ export class WorkerScene implements SceneLike {
       this.#drag.end();
     }
     st.removed = true;
+    const rev = ++this.#rev;
     for (const f of this.#fields.values()) {
-      if (f.desc.on === st.id || f.desc.to === st.id) {
-        f.removed = true;
-        // The engine drops colourings by the field with it.
-        for (const m of this.#meshes.values()) {
-          if (m.coloring?.field === f.handle) {
-            m.coloring = null;
-          }
-        }
+      if (!f.removed && (f.desc.on === st.id || f.desc.to === st.id)) {
+        // The engine drops the field, and colourings by it, with the mesh.
+        this.#fieldRemoved(f, rev);
       }
     }
     for (const s of this.#sections.values()) {
-      s.meshes = s.meshes.filter((m) => m !== st);
+      if (!s.removed) {
+        s.meshes = s.meshes.filter((m) => m !== st);
+      }
     }
-    this.#push({ kind: "removeMesh", rev: ++this.#rev, id: st.id });
+    this.#push({ kind: "removeMesh", rev, id: st.id });
   }
 
   /** Sets a mesh's placement (one undo step); `placement()` follows when the result arrives. */
@@ -1238,7 +1256,7 @@ export class WorkerScene implements SceneLike {
   /** Edits a mesh's geometry (one undo step); resolves with the ids added. */
   edit(mesh: MeshHandle, ops: readonly EditOp[]): Promise<EditResult> {
     return this.#ask(
-      (rev, qid) => ({ kind: "edit", rev, id: this.#live(mesh).id, payload: ops, qid }),
+      (rev, qid) => ({ kind: "edit", rev, id: this.#live(mesh).id, payload: copyInput(ops, "ops"), qid }),
       (v) => v as EditResult,
     );
   }
@@ -1266,7 +1284,7 @@ export class WorkerScene implements SceneLike {
   ): Promise<{ -readonly [K in keyof O]: RepairReportOf<O[K]> }>;
   repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]> {
     return this.#ask(
-      (rev, qid) => ({ kind: "repair", rev, id: this.#live(mesh).id, payload: op, qid }),
+      (rev, qid) => ({ kind: "repair", rev, id: this.#live(mesh).id, payload: copyInput(op, "op"), qid }),
       (v) => v as RepairReport | RepairReport[],
     );
   }
@@ -1341,13 +1359,63 @@ export class WorkerScene implements SceneLike {
   /** Removes a field, and a colouring by it. */
   removeField(field: FieldHandle): void {
     const st = this.#field(field);
+    const rev = ++this.#rev;
+    this.#fieldRemoved(st, rev);
+    this.#push({ kind: "field", rev, field: st.id, op: "remove" });
+  }
+
+  /** A field is removed (by request `rev`): its colourings go, and its state once that is applied. */
+  #fieldRemoved(st: FieldState, rev: number): void {
     st.removed = true;
     for (const m of this.#meshes.values()) {
-      if (m.coloring?.field === field) {
+      if (m.coloring?.field === st.handle) {
         m.coloring = null;
       }
     }
-    this.#push({ kind: "field", rev: ++this.#rev, field: st.id, op: "remove" });
+    this.#prunes.push({
+      rev,
+      run: () => {
+        this.#fields.delete(st.id);
+        this.#byField.delete(st.handle);
+        this.#fieldTombstones.add(st.handle);
+        this.#forgetKeys([`field:${st.id}`], []);
+      },
+    });
+  }
+
+  /**
+   * Runs the prunes whose removal is applied (revision `rev` or older).
+   * Their keys are forgotten: `status()` gives `"idle"` for them.
+   */
+  #runPrunes(rev: number): void {
+    if (this.#prunes.length === 0) {
+      return;
+    }
+    const due = this.#prunes.filter((p) => p.rev <= rev);
+    if (due.length === 0) {
+      return;
+    }
+    this.#prunes = this.#prunes.filter((p) => p.rev > rev);
+    for (const p of due) {
+      p.run();
+    }
+    this.#statusChanged();
+  }
+
+  /** Forgets the statuses of `exact` keys and of keys starting with a `prefixes` entry. */
+  #forgetKeys(exact: string[], prefixes: string[]): void {
+    for (const key of exact) {
+      this.#status.delete(key);
+      this.#latest.delete(key);
+    }
+    if (prefixes.length > 0) {
+      for (const key of [...this.#latest.keys()]) {
+        if (prefixes.some((p) => key.startsWith(p))) {
+          this.#status.delete(key);
+          this.#latest.delete(key);
+        }
+      }
+    }
   }
 
   /**
@@ -1357,8 +1425,10 @@ export class WorkerScene implements SceneLike {
    */
   setColoring(mesh: MeshHandle, rule: ColorRule | null): void {
     const st = this.#live(mesh);
-    const wire: ColorRuleWire | null = rule === null ? null : { ...rule, field: this.#field(rule.field).id };
-    st.coloring = rule;
+    // A copy: later changes to the caller's object do not leak in.
+    const copy = rule === null ? null : copyRule(rule);
+    const wire: ColorRuleWire | null = copy === null ? null : { ...copy, field: this.#field(copy.field).id };
+    st.coloring = copy;
     this.#push({ kind: "coloring", rev: ++this.#rev, id: st.id, rule: wire, key: `display:${st.id}` });
   }
 
@@ -1439,7 +1509,19 @@ export class WorkerScene implements SceneLike {
     this.#alive();
     const st = this.#section(section);
     st.removed = true;
-    this.#push({ kind: "section", rev: ++this.#rev, section: st.id, op: "remove" });
+    // Its results are gone at once (no result may come while poisoned).
+    st.results.clear();
+    const rev = ++this.#rev;
+    this.#prunes.push({
+      rev,
+      run: () => {
+        this.#sections.delete(st.id);
+        this.#bySection.delete(st.handle);
+        this.#sectionTombstones.add(st.handle);
+        this.#forgetKeys([`section:${st.id}`], [`section:${st.id}:`]);
+      },
+    });
+    this.#push({ kind: "section", rev, section: st.id, op: "remove" });
   }
 
   /**
@@ -1603,6 +1685,9 @@ export class WorkerScene implements SceneLike {
           this.#meshes.delete(st.id);
           this.#byMesh.delete(st.handle);
           this.#tombstones.add(st.handle);
+          const id = st.id;
+          this.#forgetKeys([`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`], []);
+          this.#statusChanged();
         }
       }
     }
@@ -1625,9 +1710,13 @@ export class WorkerScene implements SceneLike {
    * `display:<id>`, `field:<id>`, `section:<id>` (add and remove),
    * `section:<id>:plane` / `:meshes` / `:fill`, `history`. A result sets
    * `"ready"` or `"error"` only when no newer request for the key is pending.
+   * A status covers only requests made under its key: a drag or edit does
+   * not mark the `display:` or `section:` keys of the colours and sections
+   * that catch up after it. Returns a copy.
    */
   status(key: string): KeyStatus {
-    return this.#status.get(key) ?? { status: "idle", revision: 0 };
+    const st = this.#status.get(key);
+    return st === undefined ? { status: "idle", revision: 0 } : { ...st };
   }
 
   /**
@@ -1648,6 +1737,12 @@ export class WorkerScene implements SceneLike {
     }
     const st = handle instanceof FieldHandle ? this.#byField.get(handle) : this.#bySection.get(handle);
     if (st === undefined) {
+      if (handle instanceof FieldHandle && this.#fieldTombstones.has(handle)) {
+        throw new FastMeshError("UNKNOWN_FIELD", "the field was removed");
+      }
+      if (handle instanceof SectionHandle && this.#sectionTombstones.has(handle)) {
+        throw new FastMeshError("UNKNOWN_SECTION", "the section was removed");
+      }
       throw invalid("not a handle of this Worker scene");
     }
     return st.id;
@@ -1998,6 +2093,8 @@ export class WorkerScene implements SceneLike {
       this.#latest.set(key, rev);
       this.#status.set(key, { status: "error", revision: rev, error });
     }
+    // Removed fields and sections are not in the new engine: forget them.
+    this.#runPrunes(Number.POSITIVE_INFINITY);
     return { rev, keys };
   }
 
@@ -2033,7 +2130,10 @@ export class WorkerScene implements SceneLike {
       clearTimeout(this.#fallback);
       this.#fallback = undefined;
     }
-    this.#drag = undefined;
+    if (this.#drag !== undefined) {
+      this.#drag.active = false;
+      this.#drag = undefined;
+    }
     this.#worker.terminate();
     const error = invalid("the Worker scene is terminated");
     if (!this.#ready.settled) {
@@ -2050,6 +2150,21 @@ export class WorkerScene implements SceneLike {
   }
 
   static {
+    debugSizesOf = (scene) => ({
+      meshes: scene.#meshes.size,
+      byMesh: scene.#byMesh.size,
+      fields: scene.#fields.size,
+      byField: scene.#byField.size,
+      sections: scene.#sections.size,
+      bySection: scene.#bySection.size,
+      status: scene.#status.size,
+      latest: scene.#latest.size,
+      prunes: scene.#prunes.length,
+    });
+    createScene = (make, debug) => {
+      const scene = new WorkerScene(make, debug);
+      return [scene, scene.#ready.promise];
+    };
     debugDumpOf = (scene, mesh) =>
       scene.#query(
         "debugDump",
@@ -2066,6 +2181,36 @@ export class WorkerScene implements SceneLike {
  */
 export function debugDump(scene: WorkerScene, mesh: MeshHandle): Promise<QueryMap["debugDump"]["value"]> {
   return debugDumpOf(scene, mesh);
+}
+
+/** Test-only, not exported from `fast-mesh-wasm/worker`: the sizes of the scene's internal maps. */
+export function debugSizes(scene: WorkerScene): Record<string, number> {
+  return debugSizesOf(scene);
+}
+
+/**
+ * A deep copy of a caller's request input (edit ops, repair ops), taken at
+ * call time so later changes to it do not leak into the request.
+ */
+function copyInput<T>(value: T, what: string): T {
+  try {
+    return structuredClone(value);
+  } catch (e) {
+    throw invalid(`${what} could not be copied (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
+/** A colour rule with its arrays copied (the field handle kept). */
+function copyRule(rule: ColorRule): ColorRule {
+  const copy = { ...rule } as Record<string, unknown>;
+  for (const [k, v] of Object.entries(copy)) {
+    if (Array.isArray(v)) {
+      copy[k] = [...v];
+    } else if (ArrayBuffer.isView(v)) {
+      copy[k] = (v as unknown as { slice(): unknown }).slice();
+    }
+  }
+  return copy as unknown as ColorRule;
 }
 
 /** Copies an array-like input; anything else is `INVALID_ARGUMENT`, as `Scene` reports bad input. */

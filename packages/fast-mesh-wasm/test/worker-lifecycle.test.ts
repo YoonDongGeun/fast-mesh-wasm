@@ -7,7 +7,7 @@ import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import { type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
-import { debugDump } from "../src/worker/client.js";
+import { debugDump, debugSizes } from "../src/worker/client.js";
 import { runEngine } from "../src/worker/engine.js";
 import type { ClientId, Request, Result } from "../src/worker/protocol.js";
 
@@ -386,6 +386,7 @@ class NodeWorker implements WorkerLike {
   readonly held: unknown[] = [];
   readonly #message: ((e: { data: unknown }) => void)[] = [];
   readonly #error: ((e: unknown) => void)[] = [];
+  readonly #messageError: ((e: unknown) => void)[] = [];
   #arrived: (() => void)[] = [];
 
   constructor(workerData: { testPanic?: boolean } = {}) {
@@ -424,8 +425,15 @@ class NodeWorker implements WorkerLike {
     this.worker.postMessage(msg, transfer as never);
   }
 
-  addEventListener(type: "message" | "error", cb: (e: any) => void): void {
-    (type === "message" ? this.#message : this.#error).push(cb);
+  /** Fires `messageerror`, as a message that cannot be deserialised does. */
+  messageError(): void {
+    for (const cb of this.#messageError) {
+      cb({});
+    }
+  }
+
+  addEventListener(type: "message" | "error" | "messageerror", cb: (e: any) => void): void {
+    (type === "message" ? this.#message : type === "error" ? this.#error : this.#messageError).push(cb);
   }
 
   terminate(): void {
@@ -888,8 +896,9 @@ describe("WorkerScene restart", () => {
     // The removals happened; the plane is replayed as last requested; the
     // placement replays the engine's pose and settles with it (its call was
     // rejected at the time).
-    expect(scene.status(keys.field).status).toBe("ready");
-    expect(scene.status(keys.mesh).status).toBe("ready");
+    // Settled removals are forgotten: their keys read "idle".
+    expect(scene.status(keys.field).status).toBe("idle");
+    expect(scene.status(keys.mesh).status).toBe("idle");
     expect(scene.status(keys.plane).status).toBe("ready");
     expect(scene.status(keys.placement).status).toBe("ready");
     expect(scene.placement(a).translation).toEqual([0, 0, 0]);
@@ -1084,8 +1093,147 @@ describe("WorkerScene restart", () => {
       expect(scene.status(key).status, key).toBe("error");
     }
     await scene.restart();
-    for (const key of keys) {
-      expect(scene.status(key).status, key).toBe("ready");
+    // The removal settled and was forgotten; the plane settled with the replay.
+    expect(scene.status(keys[0]).status).toBe("idle");
+    expect(scene.status(keys[1]).status).toBe("ready");
+  });
+
+  it("removed_state_is_pruned", async () => {
+    const { scene } = await start();
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    await settle(scene);
+    scene.commitFrame();
+    const cycle = async () => {
+      const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+      scene.setColoring(a, { field, map: "turbo", range: [0, 2] });
+      const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a, b] });
+      scene.setSectionPlane(section, { origin: [0, 0, 0.2], normal: [0, 0, 1] });
+      const c = scene.addMesh(sphere([0, 3, 0]).positions, sphere([0, 3, 0]).indices);
+      scene.setPlacement(c, { rotation: IDENTITY, translation: [0, 0, 1] });
+      await settle(scene);
+      scene.removeField(field);
+      scene.removeSection(section);
+      scene.removeMesh(c);
+      await settle(scene);
+      scene.commitFrame();
+      return { field, section, c };
+    };
+    await cycle();
+    const sizes = debugSizes(scene);
+    let last = await cycle();
+    for (let i = 0; i < 20; i++) {
+      last = await cycle();
+    }
+    expect(debugSizes(scene)).toEqual(sizes);
+    expect(sizes.fields).toBe(0);
+    expect(sizes.sections).toBe(0);
+    expect(sizes.meshes).toBe(2);
+    // Removed handles still give the right errors.
+    await expect(scene.fetchFieldValues(last.field)).rejects.toMatchObject({ code: "UNKNOWN_FIELD" });
+    expect(() => scene.sectionPlane(last.section)).toThrow(expect.objectContaining({ code: "UNKNOWN_SECTION" }));
+    expect(() => scene.idOf(last.field)).toThrow(expect.objectContaining({ code: "UNKNOWN_FIELD" }));
+    expect(() => scene.views(last.c)).toThrow(expect.objectContaining({ code: "UNKNOWN_MESH" }));
+    expect(scene.status(`field:${1}`).status).toBe("idle");
+  });
+
+  it("inputs_are_copied_at_call_time", async () => {
+    const { scene, workers } = await start();
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    await settle(scene);
+    const ops = [{ op: "removeTriangles" as const, triangles: [0] }];
+    const edit = scene.edit(a, ops);
+    ops[0].triangles[0] = 5;
+    ops.push({ op: "removeTriangles", triangles: [6] });
+    const repairOp = { op: "removeDegenerate" as const, removeUnusedVertices: true };
+    const repair = scene.repair(a, repairOp);
+    repairOp.removeUnusedVertices = false;
+    const range: [number, number] = [0, 2];
+    scene.setColoring(a, { field, map: "turbo", range });
+    range[1] = 9;
+    scene.commitFrame();
+    await edit;
+    await repair;
+    const sent = workers[0].sent[workers[0].sent.length - 1];
+    expect(sent.find((r) => r.kind === "edit")).toMatchObject({ payload: [{ op: "removeTriangles", triangles: [0] }] });
+    expect(sent.find((r) => r.kind === "repair")).toMatchObject({ payload: { removeUnusedVertices: true } });
+    expect(sent.find((r) => r.kind === "coloring")).toMatchObject({ rule: { range: [0, 2] } });
+    // A restart replays the colouring as it was set.
+    await scene.restart();
+    const replay = workers[1].sent[0];
+    expect(replay.find((r) => r.kind === "coloring")).toMatchObject({ rule: { range: [0, 2] } });
+    // status() returns a copy.
+    const key = `display:${scene.idOf(a)}`;
+    const st = scene.status(key);
+    (st as { status: string }).status = "error";
+    expect(scene.status(key).status).toBe("ready");
+  });
+
+  it("terminate_ends_drag_and_messageerror_poisons", async () => {
+    {
+      const { scene } = await start();
+      const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
+      await settle(scene);
+      const d = scene.drag(a);
+      scene.terminate();
+      expect(d.active).toBe(false);
+    }
+    {
+      const { scene, workers } = await start();
+      const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
+      await settle(scene);
+      workers[0].hold = true;
+      const hit = scene.raycast([0, 0, 5], [0, 0, -1]);
+      scene.commitFrame();
+      await workers[0].waitHeld(1);
+      workers[0].messageError();
+      await expect(hit).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+      await expect(scene.intersects(a, a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+      await scene.restart();
+      expect(await scene.intersects(a, a)).toBe(true);
     }
   });
 });
+
+describe("engine sends", () => {
+  it("unsendable_result_is_replaced_by_a_poisoned_one", async () => {
+    for (const failures of [1, 2]) {
+      const results: Result[] = [];
+      let left = failures;
+      let deliver!: (batch: Request[]) => void;
+      runEngine({
+        post: (msg) => {
+          if (left > 0) {
+            left--;
+            throw new Error("DataCloneError (simulated)");
+          }
+          results.push(msg);
+        },
+        onMessage: (cb) => {
+          deliver = cb;
+        },
+      });
+      deliver([
+        addMeshReq(1, sphere([0, 0, 0])),
+        { kind: "query", rev: rev(), qid: 1, name: "raycast", args: { origin: [0, 0, 5], direction: [0, 0, -1] } },
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Exactly one result for the batch: poisoned, with every outcome an error.
+      expect(results).toHaveLength(1);
+      expect(results[0].poisoned).toBe(true);
+      expect(results[0].replies).toMatchObject([{ qid: 1, ok: false, error: { code: "INSTANCE_POISONED" } }]);
+      expect(results[0].status).toMatchObject([{ key: "mesh:1", status: "error" }]);
+      // Later batches get poisoned results too.
+      deliver([{ kind: "compact", rev: rev(), id: 1 }]);
+      expect(results).toHaveLength(2);
+      expect(results[1].poisoned).toBe(true);
+    }
+  });
+});
+

@@ -321,44 +321,55 @@ function run(renderer: Renderer, scene: Scene | WorkerScene): void {
     }
   });
 
-  /** Distance colouring of the picked mesh against its nearest other mesh. */
+  /**
+   * Distance colouring of the picked mesh against its nearest other mesh.
+   * Never rejects: a mesh removed (or an STL replaced) while it measures is
+   * logged and skipped.
+   */
   async function toggleColoring(): Promise<void> {
     if (toggling) {
       return;
     }
-    if (coloring !== null) {
-      scene.setColoring(coloring.mesh, null);
-      scene.removeField(coloring.field);
-      coloring = null;
-      return;
-    }
-    if (picked === null) {
-      note = "pick a mesh first";
-      return;
-    }
-    const mesh = picked;
-    let nearest: MeshHandle | null = null;
-    let best = Infinity;
     toggling = true;
     try {
-      for (const other of looks.keys()) {
+      if (coloring !== null) {
+        const { mesh, field } = coloring;
+        coloring = null;
+        if (looks.has(mesh)) {
+          scene.setColoring(mesh, null);
+          scene.removeField(field);
+        }
+        return;
+      }
+      if (picked === null) {
+        note = "pick a mesh first";
+        return;
+      }
+      const mesh = picked;
+      let nearest: MeshHandle | null = null;
+      let best = Infinity;
+      for (const other of [...looks.keys()]) {
         const d = other === mesh ? null : await scene.meshDistance(mesh, other); // a promise in Worker mode
         if (d !== null && d.distance < best) {
           best = d.distance;
           nearest = other;
         }
       }
+      // The scene may have changed while measuring.
+      if (nearest === null || !looks.has(mesh) || !looks.has(nearest)) {
+        return;
+      }
+      const maxDistance = 0.1 * diagonal();
+      const field = scene.addDistanceField({ name: "distance", on: mesh, to: nearest, maxDistance });
+      // Farther than maxDistance (Infinity) shows the base grey.
+      scene.setColoring(mesh, { field, map: "turbo", range: [0, maxDistance] });
+      coloring = { mesh, field };
+    } catch (e) {
+      console.warn("fast-mesh example: distance colouring skipped:", e);
+      note = "colouring skipped (the scene changed)";
     } finally {
       toggling = false;
     }
-    if (nearest === null) {
-      return;
-    }
-    const maxDistance = 0.1 * diagonal();
-    const field = scene.addDistanceField({ name: "distance", on: mesh, to: nearest, maxDistance });
-    // Farther than maxDistance (Infinity) shows the base grey.
-    scene.setColoring(mesh, { field, map: "turbo", range: [0, maxDistance] });
-    coloring = { mesh, field };
   }
 
   /** A section plane through the scene centre (normal +z), cutting every mesh. */
