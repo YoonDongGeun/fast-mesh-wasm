@@ -10,6 +10,8 @@ export default defineConfig({
     // must stay a file next to it. Both import the wasm glue in dist/wasm.
     worker: "src/worker/index.ts",
     "worker-entry": "src/worker/entry.ts",
+    // `fast-mesh-wasm/store`: free of React, three.js and the wasm glue.
+    store: "src/store/index.ts",
     // Internal (not in `exports`): the Worker-side engine, for the Node
     // `worker_threads` test harness.
     "worker-engine": "src/worker/engine.ts",
