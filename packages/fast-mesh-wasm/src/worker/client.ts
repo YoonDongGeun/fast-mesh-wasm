@@ -118,6 +118,12 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   return scene;
 }
 
+/**
+ * How long a promise-returning call waits for a `commitFrame()` before it is
+ * sent anyway, once a frame loop runs (queries never hang when frames stop).
+ */
+export const FALLBACK_FLUSH_MS = 100;
+
 /** Keeps the constructor to {@link createWorkerScene}. */
 const TOKEN = Symbol("WorkerScene");
 const STARTED = Symbol("started");
@@ -134,6 +140,9 @@ const MAKE = {
 };
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+/** The most failed requests kept for `restart()`. */
+const FAILED_LOG_LIMIT = 10_000;
 
 /** A placement with its column-major `matrix4`. */
 interface Pose {
@@ -233,6 +242,18 @@ function coalesce(queue: Request[]): Request[] {
   });
 }
 
+/** Reports a listener's error without breaking the caller: `reportError`, else an async rethrow. */
+function reportListenerError(error: unknown): void {
+  const report = (globalThis as { reportError?: (e: unknown) => void }).reportError;
+  if (typeof report === "function") {
+    report(error);
+  } else {
+    setTimeout(() => {
+      throw error;
+    });
+  }
+}
+
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
 }
@@ -258,6 +279,12 @@ interface MeshState {
    */
   local: Pose | undefined;
   localUntil: number;
+  /**
+   * The latest `setPlacement` not yet processed (until the result of
+   * revision `requestedUntil`): a drag starts from it.
+   */
+  requested: Pose | undefined;
+  requestedUntil: number;
   /** `removeMesh` was called: calls on it give `UNKNOWN_MESH`. */
   removed: boolean;
   /** Its removal was delivered: the mirrors are gone too. */
@@ -297,6 +324,9 @@ interface DragState {
   end(): void;
 }
 
+/** Set by `WorkerScene`'s static block: the test-only {@link debugDump}. */
+let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["debugDump"]["value"]>;
+
 /**
  * A scene whose engine runs in a Worker, from {@link createWorkerScene}. It
  * mirrors `Scene` (always `"eager"`) with these differences:
@@ -304,10 +334,13 @@ interface DragState {
  * - Handles are returned synchronously; the Worker catches up in order.
  * - State changes return `void` and are tracked by key through
  *   {@link WorkerScene.status}; calls that return data return promises.
- * - Requests are sent once per frame by {@link WorkerScene.commitFrame}
- *   (calls returning a promise also send on the next microtask), and
- *   "last wins" changes (colouring, section plane/meshes/fill, drag moves)
- *   superseded within the batch are dropped.
+ * - Requests are sent once per frame by {@link WorkerScene.commitFrame},
+ *   in call order, and "last wins" changes (colouring, section
+ *   plane/meshes/fill, drag moves) superseded within the batch are dropped.
+ *   Calls returning a promise wait for the next `commitFrame()` too, or are
+ *   sent on their own after {@link FALLBACK_FLUSH_MS} when no frame comes;
+ *   before the first `commitFrame()` (no frame loop) they are sent on the
+ *   next microtask.
  * - `views`, `placement`, `matrix4`, `section` and `sectionPlane` read
  *   main-thread mirrors, updated as results arrive and reported by the next
  *   `commitFrame()`. Views follow the same fresh-view rule as `Scene`: get
@@ -325,6 +358,8 @@ export class WorkerScene implements SceneLike {
   #nextSection = 0;
   readonly #meshes = new Map<ClientId, MeshState>();
   readonly #byMesh = new Map<MeshHandle, MeshState>();
+  /** Handles of removed meshes whose state was pruned: they give `UNKNOWN_MESH`. */
+  readonly #tombstones = new WeakSet<MeshHandle>();
   readonly #fields = new Map<ClientId, FieldState>();
   readonly #byField = new Map<FieldHandle, FieldState>();
   readonly #sections = new Map<ClientId, SectionState>();
@@ -332,13 +367,23 @@ export class WorkerScene implements SceneLike {
   /** This frame's requests, not sent yet. */
   #queue: Request[] = [];
   #flushScheduled = false;
+  /** `commitFrame()` has been called: promise calls wait for the next frame. */
+  #frameLoop = false;
+  /** Sends queued promise calls when no frame comes. */
+  #fallback: ReturnType<typeof setTimeout> | undefined;
   /** Sent batches awaiting their result (the engine posts one per batch, in order). */
   readonly #inflight: Request[][] = [];
   /**
    * Requests that did not apply because the engine is poisoned (from a
-   * poisoned result, a Worker error, or sent after): for `restart()`.
+   * poisoned result, a Worker error, or failed here without being sent), for
+   * `restart()` to surface or replay. Only never-sent `addMesh` requests are
+   * replayable as they are: a sent one had its buffers transferred (they are
+   * detached here), so its mesh must be rebuilt from the mirrors instead.
+   * Capped at {@link FAILED_LOG_LIMIT} entries, oldest dropped
+   * (`#failedDropped` counts them).
    */
   readonly #failed: Request[] = [];
+  #failedDropped = 0;
   readonly #replies = new Map<number, Pending>();
   /** Change records of results received since the last `commitFrame`, merged per mesh. */
   readonly #changes = new Map<MeshState, MeshChange>();
@@ -414,14 +459,30 @@ export class WorkerScene implements SceneLike {
         reject,
       });
       this.#push(req);
-      if (!this.#flushScheduled) {
-        this.#flushScheduled = true;
-        queueMicrotask(() => {
-          this.#flushScheduled = false;
-          this.#flush();
-        });
-      }
+      this.#scheduleFlush();
     });
+  }
+
+  /**
+   * Makes sure a queued promise call gets sent: with a frame loop, by the
+   * next `commitFrame()` or else the fallback timer, so pointer-rate queries
+   * never send the frame's moves early; without one, on a microtask.
+   */
+  #scheduleFlush(): void {
+    if (this.#frameLoop) {
+      this.#fallback ??= setTimeout(() => {
+        this.#fallback = undefined;
+        this.#flush();
+      }, FALLBACK_FLUSH_MS);
+      return;
+    }
+    if (!this.#flushScheduled) {
+      this.#flushScheduled = true;
+      queueMicrotask(() => {
+        this.#flushScheduled = false;
+        this.#flush();
+      });
+    }
   }
 
   /** A query by name, with its reply mapped. */
@@ -461,7 +522,7 @@ export class WorkerScene implements SceneLike {
   /** Marks requests failed with `error`: their statuses and promises. */
   #fail(batch: Request[], error: FastMeshError): void {
     for (const req of batch) {
-      this.#failed.push(req);
+      this.#logFailed(req);
       const key = keyOf(req);
       if (key !== undefined && this.#latest.get(key) === req.rev) {
         this.#status.set(key, { status: "error", revision: req.rev, error });
@@ -471,6 +532,33 @@ export class WorkerScene implements SceneLike {
         this.#replies.get(qid)?.reject(error);
         this.#replies.delete(qid);
       }
+    }
+  }
+
+  #logFailed(req: Request): void {
+    this.#failed.push(req);
+    if (this.#failed.length > FAILED_LOG_LIMIT) {
+      this.#failed.shift();
+      this.#failedDropped++;
+    }
+  }
+
+  /**
+   * Poisoned: drops the drag hold and pending placements, so the shown poses
+   * are the engine's last known ones (a restart begins clean).
+   */
+  #releaseHolds(): void {
+    if (this.#drag !== undefined) {
+      this.#drag.active = false;
+      this.#drag = undefined;
+    }
+    for (const st of this.#meshes.values()) {
+      if (st.local !== undefined && !samePose(st.local, st.pose)) {
+        this.#optimistic.add(st);
+      }
+      st.local = undefined;
+      st.localUntil = 0;
+      st.requested = undefined;
     }
   }
 
@@ -485,6 +573,7 @@ export class WorkerScene implements SceneLike {
     for (const batch of this.#inflight.splice(0)) {
       this.#fail(batch, e);
     }
+    this.#releaseHolds();
     this.#statusChanged();
   }
 
@@ -511,7 +600,10 @@ export class WorkerScene implements SceneLike {
       // Nothing in the batch applied; every status and reply is an error.
       const first = r.status[0]?.error ?? r.replies[0]?.error;
       this.#poison ??= fromWire(first ?? { code: "INSTANCE_POISONED", message: "the Worker engine stopped" });
-      this.#failed.push(...batch);
+      for (const req of batch) {
+        this.#logFailed(req);
+      }
+      this.#releaseHolds();
       this.#applyStatus(r);
       this.#applyReplies(r);
       // Any promise of the batch still pending fails the same way.
@@ -547,6 +639,9 @@ export class WorkerScene implements SceneLike {
     }
     // Drags whose end or cancel is processed: the engine's pose shows again.
     for (const st of this.#meshes.values()) {
+      if (st.requested !== undefined && r.rev >= st.requestedUntil) {
+        st.requested = undefined;
+      }
       if (st.local !== undefined && r.rev >= st.localUntil) {
         const shown = st.local;
         st.local = undefined;
@@ -690,7 +785,7 @@ export class WorkerScene implements SceneLike {
         }
       }
       if (failure !== undefined) {
-        throw failure.error;
+        reportListenerError(failure.error);
       }
     });
   }
@@ -701,6 +796,9 @@ export class WorkerScene implements SceneLike {
   #state(mesh: MeshHandle): MeshState {
     const st = mesh instanceof MeshHandle ? this.#byMesh.get(mesh) : undefined;
     if (st === undefined) {
+      if (mesh instanceof MeshHandle && this.#tombstones.has(mesh)) {
+        throw new FastMeshError("UNKNOWN_MESH", "the mesh was removed");
+      }
       throw invalid("not a mesh handle of this Worker scene");
     }
     return st;
@@ -775,8 +873,10 @@ export class WorkerScene implements SceneLike {
   ): MeshHandle {
     this.#alive();
     // Copies: the buffers are transferred.
-    const p = positions instanceof Float32Array ? positions.slice() : Float64Array.from(positions);
-    const i = Uint32Array.from(indices);
+    const p = copyArray(positions, "positions", (x) =>
+      x instanceof Float32Array ? x.slice() : Float64Array.from(x as ArrayLike<number>),
+    );
+    const i = copyArray(indices, "indices", (x) => Uint32Array.from(x as ArrayLike<number>));
     const origin: Vec3 | undefined =
       options.origin === undefined ? boxCentre(p) : [options.origin[0], options.origin[1], options.origin[2]];
     const id = ++this.#nextMesh;
@@ -793,6 +893,8 @@ export class WorkerScene implements SceneLike {
       pose: poseOf(IDENTITY, [0, 0, 0], known),
       local: undefined,
       localUntil: 0,
+      requested: undefined,
+      requestedUntil: 0,
       removed: false,
       gone: false,
       coloring: null,
@@ -825,6 +927,12 @@ export class WorkerScene implements SceneLike {
     for (const f of this.#fields.values()) {
       if (f.desc.on === st.id || f.desc.to === st.id) {
         f.removed = true;
+        // The engine drops colourings by the field with it.
+        for (const m of this.#meshes.values()) {
+          if (m.coloring?.field === f.handle) {
+            m.coloring = null;
+          }
+        }
       }
     }
     for (const s of this.#sections.values()) {
@@ -837,12 +945,18 @@ export class WorkerScene implements SceneLike {
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void {
     const st = this.#live(mesh);
     const rotation = rotationMatrix(placement.rotation);
-    this.#push({
+    const t = placement.translation;
+    if (t?.length !== 3) {
+      throw invalid("translation must be 3 numbers");
+    }
+    const translation: Vec3 = [t[0], t[1], t[2]];
+    st.requested = poseOf(rotation, translation, st.origin);
+    st.requestedUntil = this.#push({
       kind: "setPlacement",
       rev: ++this.#rev,
       id: st.id,
       rotation,
-      translation: Array.from(placement.translation),
+      translation,
       key: `placement:${st.id}`,
     });
   }
@@ -885,7 +999,8 @@ export class WorkerScene implements SceneLike {
     if (this.#drag?.active) {
       throw invalid("a drag is already active; end or cancel it first");
     }
-    const start = this.#shown(st);
+    // From where the mesh will be: a queued or in-flight setPlacement counts.
+    const start = st.local ?? st.requested ?? st.pose;
     const key = `placement:${st.id}`;
     this.#push({ kind: "drag", rev: ++this.#rev, id: st.id, phase: "begin", key });
     // Hold the pose from now on: older placement results do not snap it back.
@@ -1245,6 +1360,11 @@ export class WorkerScene implements SceneLike {
    */
   commitFrame(): MeshChange[] {
     this.#alive();
+    this.#frameLoop = true;
+    if (this.#fallback !== undefined) {
+      clearTimeout(this.#fallback);
+      this.#fallback = undefined;
+    }
     this.#flush();
     for (const st of this.#optimistic) {
       const record: MeshChange = {
@@ -1273,8 +1393,16 @@ export class WorkerScene implements SceneLike {
     for (const c of changes) {
       if (c.removed) {
         const st = this.#byMesh.get(c.mesh);
-        if (st !== undefined) {
-          st.gone = true;
+        if (st === undefined) {
+          continue;
+        }
+        st.gone = true;
+        if (st.removed) {
+          // Removed for good (unlike a removal by the engine, which a redo
+          // may revert): keep only a tombstone.
+          this.#meshes.delete(st.id);
+          this.#byMesh.delete(st.handle);
+          this.#tombstones.add(st.handle);
         }
       }
     }
@@ -1357,13 +1485,34 @@ export class WorkerScene implements SceneLike {
     this.#inflight.length = 0;
   }
 
-  /** @internal Test-only: copies of the Worker engine's buffers of a mesh (an engine run with `debug`). */
-  debugDump(mesh: MeshHandle): Promise<QueryMap["debugDump"]["value"]> {
-    return this.#query(
-      "debugDump",
-      () => ({ mesh: this.#state(mesh).id }),
-      (v) => v,
-    );
+  static {
+    debugDumpOf = (scene, mesh) =>
+      scene.#query(
+        "debugDump",
+        () => ({ mesh: scene.#state(mesh).id }),
+        (v) => v,
+      );
+  }
+}
+
+/**
+ * Test-only, not exported from `fast-mesh-wasm/worker`: copies of the Worker
+ * engine's buffers, placement and matrix of a mesh (the engine must run with
+ * `debug`, as the Node harness does).
+ */
+export function debugDump(scene: WorkerScene, mesh: MeshHandle): Promise<QueryMap["debugDump"]["value"]> {
+  return debugDumpOf(scene, mesh);
+}
+
+/** Copies an array-like input; anything else is `INVALID_ARGUMENT`, as `Scene` reports bad input. */
+function copyArray<T>(value: unknown, what: string, copy: (x: unknown) => T): T {
+  if (typeof value !== "object" || value === null || typeof (value as { length?: unknown }).length !== "number") {
+    throw invalid(`${what} must be an array or typed array of numbers`);
+  }
+  try {
+    return copy(value);
+  } catch (e) {
+    throw invalid(`${what} could not be read as numbers (${e instanceof Error ? e.message : String(e)})`);
   }
 }
 
@@ -1393,19 +1542,29 @@ function merge(a: MeshChange, b: MeshChange): MeshChange {
   };
 }
 
+/**
+ * A copy of a valid plane; throws `INVALID_ARGUMENT` (as `Scene` and the
+ * engine do) for a malformed, non-finite or zero-normal plane, so a mirrored
+ * plane is never invalid.
+ */
 function checkPlane(plane: SectionPlane): SectionPlane {
   if (plane?.origin?.length !== 3 || plane.normal?.length !== 3) {
     throw invalid("plane needs a 3-number origin and normal");
   }
-  return { origin: [...plane.origin] as Vec3, normal: [...plane.normal] as Vec3 };
+  const origin: Vec3 = [plane.origin[0], plane.origin[1], plane.origin[2]];
+  const normal: Vec3 = [plane.normal[0], plane.normal[1], plane.normal[2]];
+  if (![...origin, ...normal].every((v) => typeof v === "number" && Number.isFinite(v))) {
+    throw invalid("plane origin and normal must be finite");
+  }
+  if (normal[0] === 0 && normal[1] === 0 && normal[2] === 0) {
+    throw invalid("plane normal must not be zero");
+  }
+  return { origin, normal };
 }
 
-/** The plane with its normal normalised (left as is when zero: the engine reports it). */
+/** A checked plane with its normal normalised. */
 function normalised(plane: SectionPlane): SectionPlane {
   const n = plane.normal;
   const len = Math.hypot(n[0], n[1], n[2]);
-  if (!(len > 0) || !Number.isFinite(len)) {
-    return plane;
-  }
   return { origin: plane.origin, normal: [n[0] / len, n[1] / len, n[2] / len] };
 }

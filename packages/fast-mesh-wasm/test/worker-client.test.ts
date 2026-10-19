@@ -7,10 +7,11 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import * as THREE from "three";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FastMeshError, type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { bindMesh, bindSection } from "../src/three/index.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
+import { debugDump, FALLBACK_FLUSH_MS } from "../src/worker/client.js";
 import type { Request } from "../src/worker/protocol.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -142,8 +143,10 @@ async function start(workerData?: { testPanic?: boolean }): Promise<{ scene: Wor
 
 /** Sends this frame and waits until every result so far is in. */
 async function settle(scene: WorkerScene): Promise<void> {
+  // Queued first, so this frame's batch carries it.
+  const barrier = scene.raycast([0, 0, 1e6], [0, 0, 1]);
   scene.commitFrame();
-  await scene.raycast([0, 0, 1e6], [0, 0, 1]);
+  await barrier;
 }
 
 function bytes(v: ArrayBufferView | null): Buffer | null {
@@ -152,7 +155,10 @@ function bytes(v: ArrayBufferView | null): Buffer | null {
 
 /** The mirrors of `mesh` equal the Worker engine's buffers byte for byte, and its matrix. */
 async function expectMirrored(scene: WorkerScene, mesh: MeshHandle): Promise<void> {
-  const dump = await scene.debugDump(mesh);
+  const pending = debugDump(scene, mesh);
+  // Sent now, not by the fallback timer (this also delivers pending records).
+  scene.commitFrame();
+  const dump = await pending;
   const v = scene.views(mesh);
   for (const name of ["positions", "normals", "colors", "indices"] as const) {
     const want = bytes(dump[name]);
@@ -288,7 +294,7 @@ describe("WorkerScene", () => {
       scene.setColoring(a, i % 2 === 0 ? rule : null);
     }
     await settle(scene);
-    expect(w.sent.at(-2)!.filter((r) => r.kind === "coloring")).toHaveLength(1);
+    expect(w.last().filter((r) => r.kind === "coloring")).toHaveLength(1);
     expect(scene.views(a).colors()).toBeNull();
   });
 
@@ -444,7 +450,7 @@ describe("WorkerScene", () => {
     const drawn = bindSection(scene, section, [bound, boundB]);
 
     const expectInSync = async () => {
-      const dump = await scene.debugDump(a);
+      const dump = await debugDump(scene, a);
       expect(Array.from(geometry.getAttribute("position").array)).toEqual(Array.from(dump.positions));
       expect(Array.from(geometry.getIndex()!.array)).toEqual(Array.from(dump.indices));
       expect(Array.from(geometry.getAttribute("normal").array)).toEqual(Array.from(dump.normals!));
@@ -561,11 +567,17 @@ describe("WorkerScene", () => {
     const a = scene.addMesh(s.positions, s.indices);
     await settle(scene);
     const views = scene.views(a).positions();
+    // A drag held across the trap is let go.
+    const d = scene.drag(a);
+    d.move({ rotation: IDENTITY, translation: [4, 0, 0] });
+    scene.commitFrame();
     scene.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0] });
     const analysis = scene.analyze(a);
+    scene.commitFrame();
     await expect(analysis).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(d.active).toBe(false);
     // Nothing of the batch applied; the status says why.
-    expect(scene.placement(a).translation).toEqual([0, 0, 0]);
+    expect(scene.placement(a).translation).toEqual([4, 0, 0]);
     expect(scene.status(`placement:${scene.idOf(a)}`)).toMatchObject({
       status: "error",
       error: { code: "INSTANCE_POISONED" },
@@ -578,11 +590,155 @@ describe("WorkerScene", () => {
     expect(scene.status(`edit:${scene.idOf(a)}`)).toMatchObject({ status: "error" });
   });
 
+
+  it("frame_queries_wait_for_commit", async () => {
+    const { scene, w } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    const sent = w.sent.length;
+    // One frame of pointer events: a drag move and a hover raycast each.
+    const d = scene.drag(a);
+    const hits: Promise<unknown>[] = [];
+    for (let i = 0; i < 20; i++) {
+      d.move({ rotation: IDENTITY, translation: [i * 0.1, 0, 0] });
+      hits.push(scene.raycast([-5, 0, 0], [1, 0, 0]));
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    // Nothing goes before the frame ends.
+    expect(w.sent.length).toBe(sent);
+    scene.commitFrame();
+    expect(w.sent.length).toBe(sent + 1);
+    const batch = w.last();
+    expect(batch.filter((r) => r.kind === "drag" && r.phase === "move")).toHaveLength(1);
+    expect(batch.filter((r) => r.kind === "query")).toHaveLength(20);
+    // Queries keep their place: after the begin, in call order.
+    expect(batch[0]).toMatchObject({ kind: "drag", phase: "begin" });
+    const results = await Promise.all(hits);
+    expect(results.every((h) => (h as { mesh: unknown }).mesh === a)).toBe(true);
+    d.end();
+    await settle(scene);
+    expect(scene.placement(a).translation).toEqual([1.9000000000000001, 0, 0]);
+  });
+
+  it("fallback_flush_without_frames", async () => {
+    const { scene, w } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    const sent = w.sent.length;
+    // Frames stopped: the query is sent by the fallback timer.
+    const t0 = performance.now();
+    const hit = scene.raycast([-5, 0, 0], [1, 0, 0]);
+    await new Promise((r) => setTimeout(r, FALLBACK_FLUSH_MS / 4));
+    expect(w.sent.length).toBe(sent);
+    expect(((await hit) as { mesh: unknown }).mesh).toBe(a);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(FALLBACK_FLUSH_MS - 5);
+    expect(w.sent.length).toBe(sent + 1);
+    // A frame clears the timer: the query goes with the frame, once.
+    const hit2 = scene.raycast([-5, 0, 0], [1, 0, 0]);
+    scene.commitFrame();
+    await hit2;
+    await new Promise((r) => setTimeout(r, FALLBACK_FLUSH_MS * 1.5));
+    expect(w.sent.length).toBe(sent + 2);
+  });
+
+  it("no_frame_loop_sends_on_microtask", async () => {
+    const { scene, w } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const hit = scene.raycast([-5, 0, 0], [1, 0, 0]);
+    expect(w.sent.length).toBe(0);
+    await Promise.resolve();
+    // The add and the query, in one batch, without any commitFrame.
+    expect(w.sent.length).toBe(1);
+    expect(w.last().map((r) => r.kind)).toEqual(["addMesh", "query"]);
+    expect(((await hit) as { mesh: unknown }).mesh).toBe(a);
+  });
+
+  it("review_fixes_minor", async () => {
+    const { scene } = await start();
+    const s = sphere([0, 0, 0]);
+    const t = sphere([3, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    await settle(scene);
+
+    // A drag started while a setPlacement is queued starts from it.
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [2, 0, 0] });
+    const d = scene.drag(a);
+    expect(scene.placement(a).translation).toEqual([2, 0, 0]);
+    d.move({ rotation: IDENTITY, translation: [3, 0, 0] });
+    d.cancel();
+    expect(scene.placement(a).translation).toEqual([2, 0, 0]);
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.placement(a).translation).toEqual([2, 0, 0]);
+    await expectMirrored(scene, a);
+
+    // Invalid planes throw here, as Scene does; the mirror keeps a valid one.
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a] });
+    const code = (f: () => unknown) => {
+      try {
+        f();
+      } catch (e) {
+        expect(e).toBeInstanceOf(FastMeshError);
+        return (e as FastMeshError).code;
+      }
+      return undefined;
+    };
+    expect(code(() => scene.setSectionPlane(section, { origin: [0, 0, 0], normal: [0, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(code(() => scene.setSectionPlane(section, { origin: [0, NaN, 0], normal: [0, 0, 1] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(
+      code(() => scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, Infinity] }, meshes: [a] })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(scene.sectionPlane(section)).toEqual({ origin: [0, 0, 0], normal: [0, 0, 1] });
+
+    // Garbage input to addMesh is a FastMeshError, not a TypeError.
+    expect(code(() => scene.addMesh(null as never, [0, 1, 2]))).toBe("INVALID_ARGUMENT");
+    expect(code(() => scene.addMesh(42 as never, [0, 1, 2]))).toBe("INVALID_ARGUMENT");
+    expect(code(() => scene.addMesh([0, 0, 0, 1, 0, 0, 0, 1, 0], { length: 3 } as never))).toBeUndefined();
+    expect(code(() => scene.addMesh([0, 0, 0], Symbol() as never))).toBe("INVALID_ARGUMENT");
+
+    // A removed mesh's state is pruned to a tombstone once delivered.
+    scene.removeMesh(b);
+    await settle(scene);
+    scene.commitFrame();
+    expect(code(() => scene.views(b))).toBe("UNKNOWN_MESH");
+    expect(code(() => scene.idOf(b))).toBe("UNKNOWN_MESH");
+    expect(code(() => scene.placement(b))).toBe("UNKNOWN_MESH");
+    expect(code(() => scene.removeMesh(b))).toBe("UNKNOWN_MESH");
+
+    // A throwing status listener does not stop the others; its error is reported.
+    const reported: unknown[] = [];
+    vi.stubGlobal("reportError", (e: unknown) => reported.push(e));
+    let after = 0;
+    const off1 = scene.onStatus(() => {
+      throw new Error("listener boom");
+    });
+    const off2 = scene.onStatus(() => after++);
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0] });
+    await Promise.resolve();
+    expect(after).toBe(1);
+    expect(reported).toHaveLength(1);
+    expect((reported[0] as Error).message).toBe("listener boom");
+    off1();
+    off2();
+    vi.unstubAllGlobals();
+  });
+
   it("package_worker_export_resolves", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("worker.js", dist))).toBe(true);
     expect(existsSync(new URL("worker-entry.js", dist))).toBe(true);
     expect(existsSync(new URL("worker.d.ts", dist))).toBe(true);
+    // The test-only dump stays out of the public types.
+    expect(readFileSync(new URL("worker.d.ts", dist), "utf8")).not.toMatch(/debugDump/);
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(pkg.exports["./worker"]).toEqual({ types: "./dist/worker.d.ts", default: "./dist/worker.js" });
 
