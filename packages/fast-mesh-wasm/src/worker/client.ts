@@ -298,10 +298,11 @@ interface MeshState {
   normalsOn: boolean;
   /**
    * The add request until a result reports the mesh added; a restart can
-   * replay it as long as its buffers were never sent (`addBytes` long).
+   * replay it as long as it was never posted (`sent`: its buffers then went
+   * to the Worker).
    */
   add: AddRequest | undefined;
-  addBytes: number;
+  sent: boolean;
 }
 
 type AddRequest = Extract<Request, { kind: "addMesh" }>;
@@ -328,6 +329,31 @@ interface SectionState {
 interface Pending {
   resolve(value: unknown): void;
   reject(error: unknown): void;
+}
+
+/** Keys a restart settles with its replay's result, each with the keys it depends on. */
+interface Settle {
+  rev: number;
+  keys: Map<string, string[]>;
+}
+
+/**
+ * The keys a declarative request's outcome depends on after a restart: the
+ * mesh or section the replay re-creates for it.
+ */
+function coversOf(req: Request): string[] {
+  switch (req.kind) {
+    case "setPlacement":
+    case "drag":
+    case "coloring":
+      return [`mesh:${req.id}`];
+    case "section":
+      return [`section:${req.section}`];
+    case "field":
+      return req.desc === undefined ? [] : [`mesh:${req.desc.on}`, `mesh:${req.desc.to}`];
+    default:
+      return [];
+  }
 }
 
 /** A Worker's start: settled by its `ready` or `fatal` message, or an error. */
@@ -370,6 +396,8 @@ let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["deb
  *   are synchronous here, and the pose is held until the Worker has the drag.
  * - {@link WorkerScene.restart} replaces the Worker and replays the scene
  *   into it (the way back from `INSTANCE_POISONED`); handles keep working.
+ *   Unlike other promise calls, its replay is sent at once, not with the
+ *   next `commitFrame()`.
  */
 export class WorkerScene implements SceneLike {
   /** Creates a Worker: the first, and one per `restart()`. */
@@ -551,17 +579,22 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Sends the queued requests as one batch, coalesced. */
-  #flush(): void {
+  /**
+   * Sends the queued requests as one batch, coalesced; returns it when it
+   * went to the Worker. A batch that cannot be posted (`postMessage` threw,
+   * say a `DataCloneError`) never reached the Worker: it fails here with
+   * `INVALID_ARGUMENT`, and nothing else changes.
+   */
+  #flush(): Request[] | undefined {
     if (this.#queue.length === 0 || this.#terminated) {
-      return;
+      return undefined;
     }
     const batch = coalesce(this.#queue);
     this.#queue = [];
     if (this.#poison !== undefined) {
       this.#fail(batch, this.#poison);
       this.#statusChanged();
-      return;
+      return undefined;
     }
     const transfer: Transferable[] = [];
     for (const req of batch) {
@@ -569,8 +602,24 @@ export class WorkerScene implements SceneLike {
         transfer.push(req.positions, req.indices);
       }
     }
+    try {
+      this.#worker.postMessage(batch, transfer);
+    } catch (e) {
+      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      this.#fail(batch, invalid(`the requests could not be sent to the Worker (${cause})`), false);
+      this.#statusChanged();
+      return undefined;
+    }
+    for (const req of batch) {
+      if (req.kind === "addMesh") {
+        const st = this.#meshes.get(req.id);
+        if (st?.add === req) {
+          st.sent = true;
+        }
+      }
+    }
     this.#inflight.push(batch);
-    this.#worker.postMessage(batch, transfer);
+    return batch;
   }
 
   /** Marks requests failed with `error`: their statuses and promises (logged for `restart()` when `log`). */
@@ -979,7 +1028,7 @@ export class WorkerScene implements SceneLike {
       live: false,
       normalsOn: options.normals ?? true,
       add: undefined,
-      addBytes: p.byteLength + i.byteLength,
+      sent: false,
     };
     this.#meshes.set(id, st);
     this.#byMesh.set(handle, st);
@@ -1575,15 +1624,23 @@ export class WorkerScene implements SceneLike {
    * - fields, colourings and sections as last requested (removed ones are
    *   not re-created).
    *
-   * History is cleared (`canUndo`/`canRedo` are false). Every replayed key is
-   * `"computing"` until the replay's results arrive. What cannot be replayed
-   * surfaces as errors (`INSTANCE_POISONED`): requests sent to the old
-   * Worker and not answered yet (their promises reject), edits, repairs,
-   * undo/redo, drags and queries not sent yet, and meshes whose add was sent
-   * but never acknowledged (their buffers went to the old Worker: they stay
+   * History is cleared (`canUndo`/`canRedo` are false). The replay is sent
+   * at once, not with the next frame. Every replayed key is `"computing"`
+   * until the replay's results arrive, and so is the key of every pending
+   * declarative request (placement, drag, colouring, field, section): it
+   * settles with the replay, which applies the newest value. After a
+   * poisoning, placements replay the engine's pose, so their failed
+   * requests stay failed. Removals count as done (`"ready"`).
+   *
+   * What cannot be replayed surfaces as errors (`INSTANCE_POISONED`): edits,
+   * repairs, compaction, undo/redo and queries sent and not answered, or not
+   * sent yet (their promises reject), and meshes whose add was sent but
+   * never acknowledged (their buffers went to the old Worker: they stay
    * failed, and calls on them give `UNKNOWN_MESH`). An active drag ends.
-   * Mirrors stay readable throughout. Calling it again before it settles
-   * returns the same promise.
+   * Mirrors, section results included, stay readable throughout. Calling it
+   * again before it settles returns the same promise. When no Worker can be
+   * created, the promise rejects and the scene stays poisoned (a later
+   * `restart()` tries again).
    */
   restart(): Promise<void> {
     if (this.#terminated) {
@@ -1592,13 +1649,39 @@ export class WorkerScene implements SceneLike {
     if (this.#restarting !== undefined) {
       return this.#restarting;
     }
-    this.#restart();
+    const settle = this.#restart();
     // The replay goes now, not with the next frame: nothing else is queued.
-    this.#worker = this.#attach(this.#make());
-    this.#flush();
-    const sent = this.#inflight[this.#inflight.length - 1];
+    let worker: WorkerLike;
+    try {
+      worker = this.#make();
+    } catch (e) {
+      // No Worker: poisoned, the replay fails here (a later restart retries).
+      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      const error = { code: "INSTANCE_POISONED", message: `a new Worker could not be created (${cause})` };
+      this.#poisonAll(error);
+      this.#flush();
+      this.#settle(settle, fromWire(error));
+      return Promise.reject(fromWire(error));
+    }
+    this.#worker = this.#attach(worker);
+    const sent = this.#flush();
+    if (sent === undefined) {
+      // It could not be posted: failed here (see #flush).
+      const error = invalid("the restart's replay could not be sent to the Worker");
+      this.#settle(settle, error);
+      return Promise.reject(error);
+    }
     const done = new Promise<void>((resolve, reject) => {
-      this.#batchDone.set(sent, { resolve: () => resolve(), reject });
+      this.#batchDone.set(sent, {
+        resolve: () => {
+          this.#settle(settle);
+          resolve();
+        },
+        reject: (e) => {
+          this.#settle(settle, e as FastMeshError);
+          reject(e);
+        },
+      });
     });
     this.#restarting = done;
     const clear = () => {
@@ -1610,8 +1693,35 @@ export class WorkerScene implements SceneLike {
     return done;
   }
 
-  /** Retires the old Worker and queues the replay (the only thing queued). */
-  #restart(): void {
+  /**
+   * Ends a restart for the keys it settles without a request of their own:
+   * each is `"ready"`, or `"error"` with `error` (the replay failed) or with
+   * the error of a key it depends on (the mesh or section it targets), unless
+   * a newer request for it was made since.
+   */
+  #settle(settle: Settle, error?: FastMeshError): void {
+    for (const [key, covers] of settle.keys) {
+      if (this.#latest.get(key) !== settle.rev) {
+        continue;
+      }
+      const failed =
+        error ?? covers.map((c) => this.#status.get(c)).find((s) => s?.status === "error")?.error;
+      this.#status.set(
+        key,
+        failed === undefined
+          ? { status: "ready", revision: settle.rev }
+          : { status: "error", revision: settle.rev, error: failed },
+      );
+    }
+    this.#statusChanged();
+  }
+
+  /**
+   * Retires the old Worker and queues the replay (the only thing queued).
+   * Returns the keys of declarative requests the replay covers without a
+   * request under their own key, to settle with the replay's result.
+   */
+  #restart(): Settle {
     const poisoned = this.#poison !== undefined;
     const old = this.#worker;
     // Its late messages are ignored from here on (see #attach).
@@ -1650,24 +1760,50 @@ export class WorkerScene implements SceneLike {
       st.requestedUntil = 0;
     }
 
-    // What was sent or queued and is not replayed from state fails.
+    // What was sent or queued, or failed since a poisoning, by kind:
+    // - adds: replayed below when never sent, else lost;
+    // - removals: done (the new engine never gets what was removed);
+    // - declarative state (placements and drags, colourings, fields,
+    //   sections): settles with the replay, which applies the newest value;
+    //   after a poisoning, placements replay the engine's pose instead, so
+    //   their failed requests stay failed;
+    // - everything else (edits, repairs, compaction, undo/redo, queries)
+    //   is lost: it fails if it had not already.
     const lost = new FastMeshError("INSTANCE_POISONED", "the Worker was restarted before this request ran");
     const pending = [...this.#inflight.splice(0).flat(), ...this.#queue];
     this.#queue = [];
-    for (const req of pending) {
+    const settleKeys = new Map<string, string[]>();
+    const sort = (req: Request, failed: boolean) => {
       if (req.kind === "addMesh") {
-        continue; // Replayed below when its data is still here.
+        return;
       }
-      const removal =
-        req.kind === "removeMesh" ||
-        ((req.kind === "field" || req.kind === "section") && req.op === "remove");
       const key = keyOf(req);
-      if (removal && key !== undefined && this.#latest.get(key) === req.rev) {
-        // Done anyway: the new engine never gets what was removed.
-        this.#status.set(key, { status: "ready", revision: req.rev });
-        continue;
+      const latest = key !== undefined && this.#latest.get(key) === req.rev;
+      const removal =
+        req.kind === "removeMesh" || ((req.kind === "field" || req.kind === "section") && req.op === "remove");
+      if (removal) {
+        if (latest) {
+          this.#status.set(key, { status: "ready", revision: req.rev });
+        }
+        return;
       }
-      this.#fail([req], lost, false);
+      const placement = req.kind === "setPlacement" || req.kind === "drag";
+      const declarative = placement || req.kind === "coloring" || req.kind === "field" || req.kind === "section";
+      if (declarative && !(placement && poisoned)) {
+        if (latest) {
+          settleKeys.set(key, coversOf(req));
+        }
+        return;
+      }
+      if (!failed) {
+        this.#fail([req], lost, false);
+      }
+    };
+    for (const req of this.#failed) {
+      sort(req, true);
+    }
+    for (const req of pending) {
+      sort(req, false);
     }
     for (const p of this.#replies.values()) {
       p.reject(lost);
@@ -1681,6 +1817,7 @@ export class WorkerScene implements SceneLike {
 
     // The replay, in dependency order: meshes, placements, fields,
     // colourings, sections; then the history goes.
+    const first = this.#rev + 1;
     const replayed = new Set<ClientId>();
     for (const st of this.#meshes.values()) {
       if (st.removed) {
@@ -1704,7 +1841,7 @@ export class WorkerScene implements SceneLike {
           indices: indices.buffer as ArrayBuffer,
           options: { origin: st.origin, normals: st.normalsOn },
         });
-      } else if (st.add !== undefined && st.add.positions.byteLength + st.add.indices.byteLength === st.addBytes) {
+      } else if (st.add !== undefined && !st.sent) {
         // Never sent: its buffers are still here.
         st.add = { ...st.add, rev: ++this.#rev };
         this.#push(st.add);
@@ -1766,7 +1903,13 @@ export class WorkerScene implements SceneLike {
       if (s.removed) {
         continue;
       }
-      s.results.clear();
+      // Results stay readable until the replay's replace them; only those of
+      // meshes not replayed go.
+      for (const id of [...s.results.keys()]) {
+        if (!replayed.has(id)) {
+          s.results.delete(id);
+        }
+      }
       const desc: SectionDescWire = {
         plane: s.plane,
         meshes: s.meshes.filter((m) => replayed.has(m.id)).map((m) => m.id),
@@ -1774,7 +1917,18 @@ export class WorkerScene implements SceneLike {
       };
       this.#push({ kind: "section", rev: ++this.#rev, section: s.id, op: "add", desc });
     }
-    this.#push({ kind: "clearHistory", rev: ++this.#rev });
+    const rev = this.#push({ kind: "clearHistory", rev: ++this.#rev });
+    // Declarative keys the replay covers without a request of their own
+    // compute until its result.
+    const keys = new Map<string, string[]>();
+    for (const [key, covers] of settleKeys) {
+      if ((this.#latest.get(key) ?? 0) < first) {
+        keys.set(key, covers);
+        this.#latest.set(key, rev);
+        this.#status.set(key, { status: "computing", revision: rev });
+      }
+    }
+    return { rev, keys };
   }
 
   /** Records a mesh's removal for the next `commitFrame()`, as a result would. */

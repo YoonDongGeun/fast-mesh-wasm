@@ -9,6 +9,7 @@
 // a plain error. `{ serve: true }` runs it as the browser Worker script does
 // (`serveEngine`: a `ready` message first) with the test-only `debugDump`
 // query, for `WorkerScene` through its `createWorker` option.
+// `{ yieldMs }` sets the engine's yield budget (`0`: yield after every chunk).
 import { parentPort, workerData } from "node:worker_threads";
 import "../../dist/node.js";
 import * as raw from "../../dist/wasm/fast_mesh_wasm.js";
@@ -28,7 +29,7 @@ const port = {
   onMessage: (cb) => parentPort.on("message", cb),
 };
 if (workerData?.serve) {
-  serveEngine(port, Promise.resolve(), { debug: true });
+  serveEngine(port, Promise.resolve(), { debug: true, yieldMs: workerData?.yieldMs });
 } else {
-  runEngine(port);
+  runEngine(port, { yieldMs: workerData?.yieldMs });
 }

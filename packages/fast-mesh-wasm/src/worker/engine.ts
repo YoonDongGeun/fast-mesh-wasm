@@ -56,7 +56,23 @@ export interface EngineOptions {
    * (`"repairOp"`).
    */
   onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
+  /**
+   * How long the engine runs chunks before it yields to the message loop,
+   * in milliseconds: {@link YIELD_MS} by default. A yield costs a message
+   * round trip, so thousands of small requests run back to back, while a
+   * long operation lets newer batches in (and be coalesced) after each
+   * chunk past the budget. `0` yields after every chunk (tests).
+   */
+  yieldMs?: number;
 }
+
+/** The default {@link EngineOptions.yieldMs}. */
+export const YIELD_MS = 4;
+
+const now: () => number =
+  typeof performance !== "undefined" && typeof performance.now === "function"
+    ? () => performance.now()
+    : () => Date.now();
 
 /**
  * Runs the engine on `port` until the instance traps. The WebAssembly module
@@ -269,11 +285,27 @@ class Engine {
   readonly #debug: boolean;
   readonly #onChunk: EngineOptions["onChunk"];
   readonly #tick = messageTick();
+  readonly #yieldMs: number;
+  /** When the engine last yielded (or started draining). */
+  #yielded = 0;
 
   constructor(port: Port, options: EngineOptions) {
     this.#port = port;
     this.#debug = options.debug ?? false;
     this.#onChunk = options.onChunk;
+    this.#yieldMs = options.yieldMs ?? YIELD_MS;
+  }
+
+  /**
+   * Yields to the message loop once the time budget since the last yield is
+   * spent; batches sent meanwhile are received there, and the next chunk's
+   * cancellation check sees them.
+   */
+  async #maybeYield(): Promise<void> {
+    if (now() - this.#yielded >= this.#yieldMs) {
+      await this.#tick();
+      this.#yielded = now();
+    }
   }
 
   receive(batch: Request[]): void {
@@ -330,13 +362,15 @@ class Engine {
   /**
    * Runs the queue in arrival order, one chunk (a request, or one operation
    * of a repair list) at a time, yielding to the message loop between
-   * chunks so that newer batches are received meanwhile: superseded "last
+   * chunks once the time budget is spent, so that newer batches are
+   * received meanwhile: superseded "last
    * wins" requests are then dropped before they start, and abandoned field
    * builds are deferred. Each batch's result is posted when its last
    * request is done, so results stay one per batch, in order.
    */
   async #drain(): Promise<void> {
     this.#running = true;
+    this.#yielded = now();
     try {
       while (this.#queue.length > 0) {
         const item = this.#queue.shift() as Item;
@@ -348,7 +382,7 @@ class Engine {
           return;
         }
         if (this.#queue.length > 0 && this.#queue[0] !== END) {
-          await this.#tick();
+          await this.#maybeYield();
         }
       }
     } finally {
@@ -486,7 +520,7 @@ class Engine {
       for (let k = 0; k < ops.length; k++) {
         if (k > 0) {
           // Only receives: nothing else runs before this request is done.
-          await this.#tick();
+          await this.#maybeYield();
         }
         reports.push(s.repair(mesh, ops[k]));
         this.#onChunk?.({ kind: "repairOp", id: req.id });

@@ -210,8 +210,13 @@ function engine(options: { onChunk?: (chunk: { kind: string; id?: ClientId }) =>
 }
 
 describe("yields in a Worker", () => {
-  it("later_batch_arrives_between_chunks", async () => {
-    const worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url));
+  /**
+   * Five field builds for a display and its colouring, with a batch turning
+   * the colouring off sent at once; returns how many of the first batch's
+   * display requests ran.
+   */
+  async function race(yieldMs: number): Promise<number> {
+    const worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), { workerData: { yieldMs } });
     try {
       const results: Result[] = [];
       const two = new Promise<void>((resolve) => {
@@ -244,12 +249,18 @@ describe("yields in a Worker", () => {
       worker.postMessage(batch, buffers);
       worker.postMessage([off]);
       await two;
-      const ran = results[0].status.filter((st) => st.key === display);
-      expect(ran.length).toBeLessThan(6);
       expect(results[1].status).toEqual([{ key: display, rev: off.rev, status: "ready" }]);
+      return results[0].status.filter((st) => st.key === display).length;
     } finally {
       await worker.terminate();
     }
+  }
+
+  it("later_batch_arrives_between_chunks", async () => {
+    // Yielding after every chunk: the second batch cancels the rest.
+    expect(await race(0)).toBeLessThan(6);
+    // Within the time budget the engine does not yield: everything runs.
+    expect(await race(1e9)).toBe(6);
   });
 });
 
@@ -437,10 +448,17 @@ afterEach(() => {
 });
 
 /** A scene whose every Worker (the first and each restart's) is recorded. */
-async function start(workerData?: { testPanic?: boolean }): Promise<{ scene: WorkerScene; workers: NodeWorker[] }> {
+async function start(
+  workerData?: { testPanic?: boolean },
+  failCreate?: (n: number) => boolean,
+): Promise<{ scene: WorkerScene; workers: NodeWorker[] }> {
   const workers: NodeWorker[] = [];
+  let created = 0;
   const scene = await createWorkerScene({
     createWorker: () => {
+      if (failCreate?.(++created)) {
+        throw new Error("no Worker today");
+      }
       const w = new NodeWorker(workerData);
       workers.push(w);
       return w;
@@ -698,6 +716,7 @@ describe("WorkerScene restart", () => {
     expect(scene.canUndo).toBe(false);
     // Until the replay's results arrive, the mirrors stay as they were.
     expect(soup(scene, a)).toEqual(before.a);
+    expect(scene.section(section, a).area).toBe(area);
     await restarted;
     const changes = scene.commitFrame();
     expect(changes.find((c) => c.mesh === a)?.added).toBe(true);
@@ -774,6 +793,175 @@ describe("WorkerScene restart", () => {
     w.release();
     await settle(scene);
     expect(scene.placement(a).translation).toEqual([0, 0, 0]);
+    await expectMirrored(scene, a);
+  });
+
+  it("pending_declarative_requests_settle_on_restart", async () => {
+    const { scene, workers } = await start();
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    scene.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0.5] });
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a, b] });
+    await settle(scene);
+    const id = (h: Parameters<WorkerScene["idOf"]>[0]) => scene.idOf(h);
+
+    // In flight when the restart comes: a section plane, a placement back to
+    // the identity pose, colouring off, and an edit.
+    workers[0].hold = true;
+    scene.setSectionPlane(section, { origin: [0, 0, 0.3], normal: [0, 0, 1] });
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0] });
+    scene.setColoring(a, null);
+    const edit = scene.edit(a, [{ op: "removeTriangles", triangles: [0] }]);
+    scene.commitFrame();
+    await workers[0].waitHeld(1);
+    // Queued, not sent: the section's fill.
+    scene.setSectionFill(section, true);
+
+    const keys = [
+      `section:${id(section)}:plane`,
+      `section:${id(section)}:fill`,
+      `placement:${id(a)}`,
+      `display:${id(a)}`,
+    ];
+    const restarted = scene.restart();
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("computing");
+    }
+    await expect(edit).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(scene.status(`edit:${id(a)}`)).toMatchObject({ status: "error", error: { code: "INSTANCE_POISONED" } });
+    await restarted;
+    scene.commitFrame();
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("ready");
+    }
+    // The replay applied the newest values.
+    expect(scene.placement(a).translation).toEqual([0, 0, 0]);
+    expect(scene.views(a).colors()).toBeNull();
+    const cut = scene.section(section, a);
+    expect(cut.fill).toBeDefined();
+    expect(Math.abs(cut.area)).toBeLessThan(Math.PI * (1 - 0.3 * 0.3));
+    expect(Math.abs(cut.area)).toBeGreaterThan(0);
+    await expectMirrored(scene, a);
+  });
+
+  it("poisoned_restart_settles_removals", async () => {
+    const { scene } = await start({ testPanic: true });
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    const c = scene.addMesh(sphere([0, 4, 0]).positions, sphere([0, 4, 0]).indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a, b] });
+    await settle(scene);
+    await expect(scene.analyze(a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    const keys = {
+      field: `field:${scene.idOf(field)}`,
+      mesh: `mesh:${scene.idOf(c)}`,
+      plane: `section:${scene.idOf(section)}:plane`,
+      placement: `placement:${scene.idOf(a)}`,
+    };
+    // After the poisoning: removals, a section plane and a placement fail.
+    scene.removeField(field);
+    scene.removeMesh(c);
+    scene.setSectionPlane(section, { origin: [0, 0, 0.3], normal: [0, 0, 1] });
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0] });
+    scene.commitFrame();
+    for (const key of Object.values(keys)) {
+      expect(scene.status(key).status, key).toBe("error");
+    }
+    await scene.restart();
+    const changes = scene.commitFrame();
+    // The removals happened; the plane is replayed as last requested; the
+    // placement replays the engine's pose, so its request stays failed.
+    expect(scene.status(keys.field).status).toBe("ready");
+    expect(scene.status(keys.mesh).status).toBe("ready");
+    expect(scene.status(keys.plane).status).toBe("ready");
+    expect(scene.status(keys.placement).status).toBe("error");
+    expect(scene.placement(a).translation).toEqual([0, 0, 0]);
+    expect(changes.find((ch) => ch.mesh === c)?.removed).toBe(true);
+    expect(scene.sectionPlane(section).origin).toEqual([0, 0, 0.3]);
+    await expectMirrored(scene, a);
+  });
+
+  it("empty_mesh_restart", async () => {
+    // Poisoned: an empty add sent in the trapping batch is lost; one added
+    // after the poisoning (never sent) is replayed.
+    {
+      const { scene } = await start({ testPanic: true });
+      const s = sphere([0, 0, 0]);
+      const a = scene.addMesh(s.positions, s.indices);
+      await settle(scene);
+      const sent = scene.addMesh([], []);
+      await expect(scene.analyze(a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+      const later = scene.addMesh([], []);
+      scene.commitFrame();
+      await scene.restart();
+      scene.commitFrame();
+      expect(scene.status(`mesh:${scene.idOf(sent)}`).status).toBe("error");
+      expect(scene.status(`mesh:${scene.idOf(later)}`).status).toBe("ready");
+      await expect(scene.meshDistance(sent, a)).rejects.toMatchObject({ code: "UNKNOWN_MESH" });
+      await scene.meshDistance(later, a);
+      await expectMirrored(scene, later);
+    }
+    // Healthy: an empty add in flight is lost; a queued one is replayed.
+    {
+      const { scene, workers } = await start();
+      workers[0].hold = true;
+      const sent = scene.addMesh([], []);
+      scene.commitFrame();
+      await workers[0].waitHeld(1);
+      const queued = scene.addMesh([], []);
+      await scene.restart();
+      scene.commitFrame();
+      expect(scene.status(`mesh:${scene.idOf(sent)}`)).toMatchObject({
+        status: "error",
+        error: { code: "INSTANCE_POISONED" },
+      });
+      expect(scene.status(`mesh:${scene.idOf(queued)}`).status).toBe("ready");
+      await expectMirrored(scene, queued);
+    }
+  });
+
+  it("restart_survives_a_failing_worker_factory", async () => {
+    const { scene } = await start(undefined, (n) => n === 2);
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    const before = soup(scene, a);
+    let failed: Promise<void> | undefined;
+    expect(() => {
+      failed = scene.restart();
+    }).not.toThrow();
+    await expect(failed).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(scene.status(`mesh:${scene.idOf(a)}`).status).toBe("error");
+    // Poisoned until a restart works; then everything is back.
+    await expect(scene.intersects(a, a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    await scene.restart();
+    scene.commitFrame();
+    expectSameSoup(soup(scene, a), before);
+    expect(scene.status(`mesh:${scene.idOf(a)}`).status).toBe("ready");
+    await expectMirrored(scene, a);
+  });
+
+  it("unsendable_batch_fails_alone", async () => {
+    const { scene } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    // A function cannot be cloned: posting the batch throws.
+    const bad = scene.raycast([0, 0, 5], [0, 0, -1], { bogus: () => 1 } as never);
+    await expect(bad).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    // Later results still match their batches.
+    const hit = await scene.raycast([0, 0, 5], [0, 0, -1]);
+    expect(hit?.mesh).toBe(a);
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0] });
+    await settle(scene);
+    expect(scene.placement(a).translation).toEqual([1, 0, 0]);
     await expectMirrored(scene, a);
   });
 });
