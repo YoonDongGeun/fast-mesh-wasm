@@ -9,7 +9,7 @@
 // optimistic: a move shows at once and holds until the Worker has the drag.
 import type { Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
-import { FastMeshError, type FastMeshErrorCode } from "../core.js";
+import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "../handles.js";
 import type {
   AddMeshOptions,
@@ -241,18 +241,6 @@ function coalesce(queue: Request[]): Request[] {
     }
     return true;
   });
-}
-
-/** Reports a listener's error without breaking the caller: `reportError`, else an async rethrow. */
-function reportListenerError(error: unknown): void {
-  const report = (globalThis as { reportError?: (e: unknown) => void }).reportError;
-  if (typeof report === "function") {
-    report(error);
-  } else {
-    setTimeout(() => {
-      throw error;
-    });
-  }
 }
 
 function invalid(message: string): FastMeshError {

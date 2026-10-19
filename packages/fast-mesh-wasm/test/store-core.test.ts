@@ -33,9 +33,9 @@ class NodeWorker implements WorkerLike {
   readonly #message: ((e: { data: unknown }) => void)[] = [];
   readonly #error: ((e: unknown) => void)[] = [];
 
-  constructor() {
+  constructor(workerData: { undoThrow?: boolean } = {}) {
     this.worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), {
-      workerData: { serve: true },
+      workerData: { serve: true, ...workerData },
     });
     this.worker.on("message", (data: unknown) => {
       for (const cb of this.#message) {
@@ -75,8 +75,8 @@ async function makeLocal(): Promise<Scene> {
   return scene;
 }
 
-async function makeWorker(): Promise<WorkerScene> {
-  const scene = await createWorkerScene({ createWorker: () => new NodeWorker() });
+async function makeWorker(workerData?: { undoThrow?: boolean }): Promise<WorkerScene> {
+  const scene = await createWorkerScene({ createWorker: () => new NodeWorker(workerData) });
   cleanup.push(() => scene.terminate());
   return scene;
 }
@@ -249,11 +249,14 @@ describe.each([
     const store = await start();
     // No frame yet: declarative changes flush on a microtask.
     const { a } = withTwo(store);
+    const commits = vi.spyOn(store.scene, "commitFrame");
     store.setDisplay(a, { visible: false });
     expect(store.getSnapshot().meshes.get(a)!.desired.visible).toBe(false);
     expect(store.getSnapshot().meshes.get(a)!.display.visible).toBe(true);
     await Promise.resolve();
     expect(store.getSnapshot().meshes.get(a)!.display.visible).toBe(false);
+    // The microtask flush applies the store's state only: no scene frame.
+    expect(commits).not.toHaveBeenCalled();
 
     // With a frame loop, they apply at the next commitFrame(), last value wins.
     store.commitFrame();
@@ -380,6 +383,78 @@ describe.each([
     expect(bad).toBeInstanceOf(Promise);
     store.commitFrame();
     await expect(bad).rejects.toBeInstanceOf(FastMeshError);
+  });
+});
+
+describe("SceneStore dependent statuses (worker)", () => {
+  async function startWorker(workerData?: { undoThrow?: boolean }) {
+    const scene = await makeWorker(workerData);
+    const store = createSceneStore(scene);
+    cleanup.unshift(() => store.dispose());
+    return { scene, store };
+  }
+
+  it("failed_edit_leaves_mesh_ready", async () => {
+    const { scene, store } = await startWorker();
+    const { a, b } = withTwo(store);
+    await settle(store);
+    const failed = store.edit(a, [{ op: "nope" } as never]);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("computing");
+    store.commitFrame();
+    await expect(failed).rejects.toBeInstanceOf(FastMeshError);
+    await settle(store);
+    // The edit key holds the error; the mesh's state does not take it.
+    expect(scene.status(`edit:${scene.idOf(a)}`).status).toBe("error");
+    const snap = store.getSnapshot();
+    expect(snap.meshes.get(a)!.status).toBe("ready");
+    expect(snap.meshes.get(a)!.error).toBeUndefined();
+    expect(snap.meshes.get(b)!.status).toBe("ready");
+    expect(snap.status).toBe("idle");
+  });
+
+  it("failed_history_leaves_states_ready", async () => {
+    const { scene, store } = await startWorker({ undoThrow: true });
+    const { a, b } = withTwo(store);
+    const s = store.addSection({ plane: { origin: [0, 0, 0.5], normal: [0, 0, 1] }, meshes: [a, b] });
+    store.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0.1] });
+    await settle(store);
+    expect(store.getSnapshot().history.canUndo).toBe(true);
+    store.undo();
+    // Pending history makes the dependent states catch up.
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("computing");
+    expect(store.getSnapshot().sections.get(s)!.status).toBe("computing");
+    await settle(store);
+    expect(scene.status("history").status).toBe("error");
+    const snap = store.getSnapshot();
+    for (const state of [snap.meshes.get(a)!, snap.meshes.get(b)!, snap.sections.get(s)!]) {
+      expect(state.status).toBe("ready");
+      expect(state.error).toBeUndefined();
+    }
+    // The scene-wide status still reports the failed history request.
+    expect(snap.status).toBe("error");
+    expect(snap.error?.code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("listener_errors_are_reported_not_thrown", async () => {
+    const { store } = await startWorker();
+    const reported: unknown[] = [];
+    const g = globalThis as { reportError?: unknown };
+    const original = g.reportError;
+    g.reportError = (e: unknown) => reported.push(e);
+    try {
+      const after = vi.fn();
+      store.subscribe(() => {
+        throw new Error("listener boom");
+      });
+      store.subscribe(after);
+      const a = store.addMesh(tetra().positions, tetra().indices);
+      // The action took effect and the other listener ran.
+      expect(store.getSnapshot().meshes.has(a)).toBe(true);
+      expect(after).toHaveBeenCalled();
+      expect((reported[0] as Error).message).toBe("listener boom");
+    } finally {
+      g.reportError = original;
+    }
   });
 });
 

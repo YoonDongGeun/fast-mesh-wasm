@@ -45,6 +45,21 @@ export class FastMeshError extends Error {
   }
 }
 
+/**
+ * Internal (not exported from the entries). Reports a listener's error
+ * without breaking the caller: `reportError`, else an async rethrow.
+ */
+export function reportListenerError(error: unknown): void {
+  const report = (globalThis as { reportError?: (e: unknown) => void }).reportError;
+  if (typeof report === "function") {
+    report(error);
+  } else {
+    setTimeout(() => {
+      throw error;
+    });
+  }
+}
+
 let poisoned = false;
 let memory: WebAssembly.Memory | undefined;
 

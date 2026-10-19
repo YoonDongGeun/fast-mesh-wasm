@@ -5,7 +5,7 @@
 // `desired` at once and reaches the scene at the next `commitFrame()` (or on
 // a microtask while no frame loop runs), the last value per frame winning.
 import type { Indices, PlacementInput, Positions64 } from "../api.js";
-import { FastMeshError } from "../core.js";
+import { FastMeshError, reportListenerError } from "../core.js";
 import type {
   DragSession,
   EditOp,
@@ -21,6 +21,7 @@ import type {
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import type { WorkerScene } from "../worker/client.js";
+import { sectionAspects } from "../worker/protocol.js";
 import { type Host, hostOf, type StoreAddMeshOptions } from "./host.js";
 import {
   type Combined,
@@ -60,7 +61,19 @@ interface SectionEntry {
   desired: SectionParts;
 }
 
-const ASPECT_KEYS = ["plane", "meshes", "fill", "plane+meshes", "plane+fill", "meshes+fill", "plane+meshes+fill", "none"];
+/**
+ * The aspect suffixes of a section's `set` keys (`section:<id>:<aspects>`),
+ * made by the client's own `sectionAspects` over every combination of the
+ * three aspects (the empty one gives `none`).
+ */
+const ASPECT_KEYS: readonly string[] = [0, 1, 2, 3, 4, 5, 6, 7].map(
+  (bits) =>
+    sectionAspects({
+      plane: bits & 1 ? { origin: [0, 0, 0], normal: [0, 0, 1] } : undefined,
+      meshes: bits & 2 ? [] : undefined,
+      fill: bits & 4 ? false : undefined,
+    }).join("+") || "none",
+);
 
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
@@ -110,7 +123,13 @@ export class SceneStore {
   /** The current snapshot: frozen, replaced (never mutated) on change. */
   getSnapshot = (): SceneSnapshot => this.#snapshot;
 
-  /** Registers a listener called after each new snapshot; returns the function that removes it. */
+  /**
+   * Registers a listener called after each new snapshot; returns the function
+   * that removes it. A listener that throws does not stop the others nor the
+   * action that changed the state (which has taken effect): its error is
+   * reported with `reportError` (an async rethrow where there is none), as
+   * the Worker scene does with its listeners.
+   */
   subscribe = (listener: () => void): (() => void) => {
     this.#listeners.add(listener);
     return () => {
@@ -438,24 +457,43 @@ export class SceneStore {
     return s.status === "error" ? { status: "error", error: s.error } : { status: s.status };
   }
 
-  /** A mesh's status: its own keys and the history (error > computing > ready > idle). */
-  #meshStatus(entry: MeshEntry): Combined {
-    const id = entry.id;
-    return combine(
-      [`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`, "history"].map((k) => this.#key(k)),
-    );
+  /**
+   * The status of a state from its own keys (all of their status, errors
+   * included) and the keys it depends on, which only add `"computing"`:
+   * their errors belong to the requests that made them (a failed edit
+   * rejects its promise) and are ignored here.
+   */
+  #status(own: readonly string[], dependent: readonly string[]): Combined {
+    const parts = own.map((k) => this.#key(k));
+    if (dependent.some((k) => this.#host.status(k).status === "computing")) {
+      parts.push({ status: "computing" });
+    }
+    return combine(parts);
   }
 
-  /** A section's status: its keys, the placement and edit keys of its meshes, and the history. */
+  /**
+   * A mesh's status: its own `mesh:` and `display:` keys, made `"computing"`
+   * also by its `placement:` and `edit:` keys and the history.
+   */
+  #meshStatus(entry: MeshEntry): Combined {
+    const id = entry.id;
+    return this.#status([`mesh:${id}`, `display:${id}`], [`placement:${id}`, `edit:${id}`, "history"]);
+  }
+
+  /**
+   * A section's status: its own `section:` keys, made `"computing"` also by
+   * the `placement:` and `edit:` keys of its meshes and the history.
+   */
   #sectionStatus(entry: SectionEntry): Combined {
-    const keys = [`section:${entry.id}`, ...ASPECT_KEYS.map((a) => `section:${entry.id}:${a}`), "history"];
+    const own = [`section:${entry.id}`, ...ASPECT_KEYS.map((a) => `section:${entry.id}:${a}`)];
+    const dependent = ["history"];
     for (const m of entry.applied.meshes) {
       const mesh = this.#meshes.get(m);
       if (mesh !== undefined) {
-        keys.push(`placement:${mesh.id}`, `edit:${mesh.id}`);
+        dependent.push(`placement:${mesh.id}`, `edit:${mesh.id}`);
       }
     }
-    return combine(keys.map((k) => this.#key(k)));
+    return this.#status(own, dependent);
   }
 
   /**
@@ -551,17 +589,13 @@ export class SceneStore {
       snap.error = overall.error;
     }
     this.#snapshot = Object.freeze(snap);
-    // Every listener runs even if one throws; the first error is rethrown.
-    let failure: { error: unknown } | undefined;
+    // Every listener runs even if one throws; errors are reported, not thrown.
     for (const listener of [...this.#listeners]) {
       try {
         listener();
       } catch (error) {
-        failure ??= { error };
+        reportListenerError(error);
       }
-    }
-    if (failure !== undefined) {
-      throw failure.error;
     }
   }
 
