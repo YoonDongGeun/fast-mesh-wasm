@@ -2,7 +2,8 @@
 // bound meshes at its plane, following the change stream.
 import * as THREE from "three";
 import { FastMeshError } from "../core.js";
-import type { Scene, SectionHandle, SectionPlane, SectionResult } from "../scene.js";
+import type { SectionHandle, SectionPlane, SectionResult } from "../scene.js";
+import type { SceneLike } from "../scene-like.js";
 import type { BoundMesh } from "./mesh.js";
 
 /** Options of {@link bindSection}. */
@@ -81,7 +82,7 @@ function segments(result: SectionResult): Float32Array {
 }
 
 /** The result for a mesh, or `null` when the section or mesh is gone or the section does not cut it. */
-function resultOf(scene: Scene, section: SectionHandle, bound: BoundMesh): SectionResult | null {
+function resultOf(scene: SceneLike, section: SectionHandle, bound: BoundMesh): SectionResult | null {
   try {
     return scene.section(section, bound.mesh);
   } catch (error) {
@@ -108,15 +109,15 @@ function resultOf(scene: Scene, section: SectionHandle, bound: BoundMesh): Secti
  * `sectionsChanged` lists the section for it; a mesh the section does not
  * cut (or that is removed) draws nothing. Results are shown as last
  * computed: a `"lazy"` or `"manual"` mesh's lag until the scene computes
- * them. The plane follows {@link Scene.setSectionPlane} on the next frame.
+ * them. The plane follows `Scene.setSectionPlane` on the next frame.
  * When the section is removed, the drawing is emptied and stops following
  * the scene, and the plane is taken off the materials.
  *
- * Like `bindMesh`, it only listens through {@link Scene.onChanges}: call
+ * Like `bindMesh`, it only listens through {@link SceneLike.onChanges}: call
  * `scene.commitFrame()` once per animation frame.
  */
 export function bindSection(
-  scene: Scene,
+  scene: SceneLike,
   section: SectionHandle,
   bound: BoundMesh[],
   options: BindSectionOptions = {},

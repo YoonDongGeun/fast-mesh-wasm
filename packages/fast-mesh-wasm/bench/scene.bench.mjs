@@ -1,12 +1,13 @@
 // Scene benchmarks, run against the built package (a release build, not the test build):
 //
-//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter]
+//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker]
 //
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
 // which is setPlacement, commitFrame() and copying every dirty range from the views into a
 // JS mirror (the three.js adapter's job, spec section 11 item 2).
 import { readFileSync } from "node:fs";
+import { Worker } from "node:worker_threads";
 import { Scene } from "../dist/node.js";
 import { bindMesh } from "../dist/three.js";
 
@@ -14,6 +15,7 @@ const args = new Set(process.argv.slice(2));
 const quick = args.has("--quick");
 const with10m = args.has("--10m");
 const onlyAdapter = args.has("--adapter"); // run just the three.js adapter case
+const onlyWorker = args.has("--worker"); // run just the Worker scene cases (with --10m: also 10M)
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -326,11 +328,506 @@ function benchAdapter(label, n, cycles, { maxDistance, range }) {
   scene.free();
 }
 
+// ---- 5. Worker scene (fast-mesh-wasm/worker) in the worker_threads harness ----
+//
+// `WorkerScene` from dist/worker.js drives the engine in a Node Worker
+// (bench/worker-harness.mjs: the engine served as the browser Worker script
+// serves it, default 4 ms yield budget, plus timing probes). Main-thread
+// numbers: the synchronous calls, the time the scene's message handler takes
+// to apply a result to the mirrors ("handler"), the adapter-style copy of the
+// delivered dirty ranges, and the longest event-loop block seen by a
+// setImmediate probe (which also covers the structured-clone of the message).
+// Worker numbers come from the harness: each chunk's time, and the longest
+// block of the Worker's event loop.
+
+/** The bench harness Worker as a `WorkerLike`, timing the scene's message handler. */
+class BenchWorker {
+  constructor() {
+    this.worker = new Worker(new URL("./worker-harness.mjs", import.meta.url));
+    this.message = [];
+    this.error = [];
+    this.posted = 0; // request batches posted
+    this.results = []; // { at, handler } per result, in order
+    this.waiters = []; // { resolve, reject } of drained(), woken by each result
+    this.statsWaiters = []; // the same for stats(), woken by its reply
+    this.failure = undefined; // set once the Worker failed: every wait rejects with it
+    this.worker.on("message", (data) => {
+      if (data?.kind === "benchStats") {
+        this.#wake(this.statsWaiters, data);
+        return;
+      }
+      if (data?.kind !== undefined && data.kind !== "ready") {
+        this.#fail(new Error(`the bench Worker sent ${data.kind}: ${JSON.stringify(data.error ?? null)}`));
+      } else if (data?.poisoned) {
+        this.#fail(new Error(`the engine trapped: ${JSON.stringify(data.status?.[0]?.error ?? null)}`));
+      }
+      const t0 = now();
+      for (const cb of this.message) {
+        cb({ data });
+      }
+      const t1 = now();
+      if (data?.kind === undefined) {
+        this.results.push({ at: t1, handler: t1 - t0 });
+        this.#wake(this.waiters);
+      }
+    });
+    this.worker.on("error", (e) => {
+      this.#fail(e);
+      for (const cb of this.error) {
+        cb(e);
+      }
+    });
+    this.worker.on("exit", (code) => this.#fail(new Error(`the bench Worker exited (code ${code})`)));
+  }
+
+  #wake(waiters, data) {
+    for (const w of waiters.splice(0)) {
+      w.resolve(data);
+    }
+  }
+
+  #fail(error) {
+    this.failure ??= error;
+    for (const w of [...this.waiters.splice(0), ...this.statsWaiters.splice(0)]) {
+      w.reject(this.failure);
+    }
+  }
+
+  #wait(waiters) {
+    if (this.failure !== undefined) {
+      return Promise.reject(this.failure);
+    }
+    return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+  }
+
+  postMessage(msg, transfer) {
+    if (Array.isArray(msg)) {
+      this.posted++;
+    }
+    this.worker.postMessage(msg, transfer);
+  }
+
+  addEventListener(type, cb) {
+    (type === "message" ? this.message : this.error).push(cb);
+  }
+
+  terminate() {
+    void this.worker.terminate();
+  }
+
+  /** Resolves once every posted batch has its result applied; returns the results since `from`. */
+  async drained(from = 0) {
+    while (this.results.length < this.posted) {
+      await this.#wait(this.waiters);
+    }
+    return this.results.slice(from);
+  }
+
+  /** The harness's chunk times and longest Worker block since the last call (call only when drained). */
+  stats() {
+    const reply = this.#wait(this.statsWaiters);
+    if (this.failure === undefined) {
+      this.worker.postMessage({ benchStats: true });
+    }
+    return reply;
+  }
+}
+
+/** The longest main-thread event-loop block, from a setImmediate loop. */
+class Probe {
+  start() {
+    this.max = 0;
+    this.on = true;
+    this.last = now();
+    const tick = () => {
+      if (!this.on) {
+        return;
+      }
+      const t = now();
+      this.max = Math.max(this.max, t - this.last);
+      this.last = t;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+  }
+
+  async stop() {
+    // One more turn, so a block at the very end is seen.
+    await new Promise((resolve) => setImmediate(resolve));
+    this.on = false;
+    return this.max;
+  }
+}
+
+/** `Mirror` for a `SceneLike` without slot counts: sizes come from the views (full slot length). */
+class ViewMirror extends Mirror {
+  apply(changes) {
+    for (const c of changes) {
+      if (c.removed) {
+        this.meshes.delete(c.mesh);
+        continue;
+      }
+      const v = this.scene.views(c.mesh);
+      let m = this.meshes.get(c.mesh);
+      const rebuild = m === undefined || c.capacityChanged;
+      if (rebuild) {
+        const slots = v.positions().length / 3;
+        m = {
+          positions: new Float32Array(slots * 3),
+          normals: new Float32Array(slots * 3),
+          colors: new Uint8Array(slots * 4),
+          indices: new Uint32Array(v.indices().length),
+        };
+        this.meshes.set(c.mesh, m);
+      }
+      this.copy(c.positions, v.positions(), m.positions, 3, rebuild);
+      this.copy(c.normals, v.normals(), m.normals, 3, rebuild);
+      if (v.colors() !== null && m.colors.length !== v.colors().length) {
+        m.colors = new Uint8Array(v.colors().length);
+      }
+      this.copy(c.colors, v.colors(), m.colors, 4, rebuild);
+      this.copy(c.indices, v.indices(), m.indices, 3, rebuild);
+    }
+  }
+}
+
+let createWorkerSceneFn;
+async function openWorkerScene() {
+  createWorkerSceneFn ??= (await import("../dist/worker.js")).createWorkerScene;
+  let bw;
+  const scene = await createWorkerSceneFn({
+    createWorker: () => {
+      bw = new BenchWorker();
+      return bw;
+    },
+  });
+  return { scene, bw };
+}
+
+/** Sends this frame's requests and waits for their results; returns the round trip and handler times. */
+async function roundTrip(scene, bw) {
+  const from = bw.results.length;
+  const t0 = now();
+  scene.commitFrame();
+  const results = await bw.drained(from);
+  return { rt: now() - t0, handler: results.reduce((s, r) => s + r.handler, 0) };
+}
+
+const maxOf = (xs) => xs.reduce((m, x) => Math.max(m, x), 0);
+const chunkMs = (st, kind) => st.chunks.filter((c) => c.kind === kind).map((c) => c.ms);
+
+// 5a. addMesh: main-thread blocks while a big mesh goes to the Worker and comes back.
+async function benchWorkerAdd(label, n, runs) {
+  const g = terrain(n);
+  const { scene, bw } = await openWorkerScene();
+  const probe = new Probe();
+  const parts = { call: [], send: [], handler: [], copy: [], block: [], rt: [], worker: [], workerBlock: [] };
+  for (let r = 0; r < runs; r++) {
+    const mirror = new ViewMirror(scene);
+    probe.start();
+    const t0 = now();
+    const m = scene.addMesh(g.positions, g.indices);
+    const t1 = now();
+    const from = bw.results.length;
+    scene.commitFrame();
+    const t2 = now();
+    const results = await bw.drained(from);
+    const t3 = now();
+    mirror.apply(scene.commitFrame());
+    const t4 = now();
+    parts.block.push(await probe.stop());
+    parts.call.push(t1 - t0);
+    parts.send.push(t2 - t1);
+    parts.rt.push(t3 - t1);
+    parts.handler.push(maxOf(results.map((x) => x.handler)));
+    parts.copy.push(t4 - t3);
+    const st = await bw.stats();
+    parts.worker.push(maxOf(chunkMs(st, "addMesh")));
+    parts.workerBlock.push(st.maxGap);
+    scene.removeMesh(m);
+    await roundTrip(scene, bw);
+    scene.commitFrame();
+    await bw.stats();
+  }
+  const med = (k) => fmt(stats(parts[k]).median);
+  console.log(`worker addMesh ${label} (${g.triangles.toLocaleString("en")} triangles, ${runs} runs, medians):`);
+  console.log(
+    `  main: addMesh() call ${med("call")} ms (max ${fmt(maxOf(parts.call))}), commitFrame() send ${med("send")} ms, result handler ${med("handler")} ms (max ${fmt(maxOf(parts.handler))}), full mirror copy on the next commitFrame ${med("copy")} ms`,
+  );
+  console.log(
+    `  main: longest event-loop block ${med("block")} ms (max ${fmt(maxOf(parts.block))}); round trip to applied ${med("rt")} ms`,
+  );
+  console.log(`  worker: addMesh request ${med("worker")} ms, longest Worker block ${med("workerBlock")} ms`);
+  scene.terminate();
+}
+
+/** Two touching meshes (B flipped over A), a distance field on A to B colouring A. */
+async function workerPair(n, { maxDistance, range }) {
+  const a = terrain(n);
+  const b = terrain(n, { phase: 1.3 });
+  const { scene, bw } = await openWorkerScene();
+  const meshA = scene.addMesh(a.positions, a.indices);
+  const meshB = scene.addMesh(b.positions, b.indices);
+  const cx = n / 2;
+  const cy = n / 2;
+  let lift = 8;
+  scene.setPlacement(meshB, flippedPose(0, cx, cy, lift));
+  const gap = scene.meshDistance(meshA, meshB);
+  await roundTrip(scene, bw);
+  lift -= (await gap)?.distance ?? 0;
+  const pose = (i) => flippedPose(0.1 * i, cx, cy, lift);
+  scene.setPlacement(meshB, pose(0));
+  const field = scene.addDistanceField({ name: "gap", on: meshA, to: meshB, maxDistance });
+  const rule = { field, map: "turbo", range, below: "clamp", above: "base" };
+  scene.setColoring(meshA, rule);
+  await roundTrip(scene, bw);
+  return { scene, bw, meshA, meshB, pose, field, rule };
+}
+
+// 5b. Colouring toggle: round trip from commitFrame() to the result applied.
+async function benchWorkerToggle(label, n, toggles, opts) {
+  const { scene, bw, meshA, rule } = await workerPair(n, opts);
+  const mirror = new ViewMirror(scene);
+  mirror.apply(scene.commitFrame());
+  await bw.stats();
+  const off = { rt: [], handler: [], copy: [], worker: [], block: [] };
+  const on = { rt: [], handler: [], copy: [], worker: [], block: [] };
+  for (let k = 0; k < toggles; k++) {
+    const s = k % 2 === 0 ? off : on;
+    scene.setColoring(meshA, k % 2 === 0 ? null : rule);
+    const { rt, handler } = await roundTrip(scene, bw);
+    const t0 = now();
+    mirror.apply(scene.commitFrame());
+    s.copy.push(now() - t0);
+    s.rt.push(rt);
+    s.handler.push(handler);
+    const st = await bw.stats();
+    s.worker.push(maxOf(chunkMs(st, "coloring")));
+    s.block.push(st.maxGap);
+  }
+  for (const [name, s] of [
+    ["off", off],
+    ["on", on],
+  ]) {
+    report(
+      `worker ${label} colouring ${name}, round trip`,
+      s.rt,
+      `; handler median ${fmt(stats(s.handler).median)} ms, copy ${fmt(stats(s.copy).median)} ms, worker request ${fmt(stats(s.worker).median)} ms, longest Worker block ${fmt(stats(s.block).median)} ms`,
+    );
+  }
+  scene.terminate();
+}
+
+// 5c. The 64-pose drag, one move per frame, in lock step with the results.
+async function benchWorkerDrag(label, n, cycles, opts) {
+  const { scene, bw, meshB, pose } = await workerPair(n, opts);
+  const mirror = new ViewMirror(scene);
+  mirror.apply(scene.commitFrame());
+  const drag = scene.drag(meshB);
+  await roundTrip(scene, bw);
+  await bw.stats();
+  const main = [];
+  const parts = { move: [], commit: [], copy: [], handler: [], rt: [], bytes: [], worker: [], workerBlock: [] };
+  for (let c = 0; c < cycles + 1; c++) {
+    for (let i = 0; i < 64; i++) {
+      const from = bw.results.length;
+      const before = mirror.bytes;
+      const f0 = now();
+      drag.move(pose(i));
+      const f1 = now();
+      const changes = scene.commitFrame(); // sends this move, delivers the previous result
+      const f2 = now();
+      mirror.apply(changes);
+      const f3 = now();
+      const results = await bw.drained(from);
+      const f4 = now();
+      const handler = results.reduce((s, r) => s + r.handler, 0);
+      const st = await bw.stats();
+      if (c > 0) {
+        main.push(f3 - f0 + handler);
+        parts.move.push(f1 - f0);
+        parts.commit.push(f2 - f1);
+        parts.copy.push(f3 - f2);
+        parts.handler.push(handler);
+        parts.rt.push(f4 - f1);
+        parts.bytes.push(mirror.bytes - before);
+        parts.worker.push(maxOf(chunkMs(st, "drag")));
+        parts.workerBlock.push(st.maxGap);
+      }
+    }
+  }
+  drag.end();
+  await roundTrip(scene, bw);
+  const med = (k) => fmt(stats(parts[k]).median);
+  report(`worker ${label} main-thread cost per frame (move + commitFrame + copy + result handler)`, main);
+  console.log(
+    `  parts (median ms): move ${med("move")}, commitFrame ${med("commit")}, copy ${med("copy")}, handler ${med("handler")} (p95 ${fmt(stats(parts.handler).p95)}); dirty bytes copied ${fmt(stats(parts.bytes).median / 1e3)} KB`,
+  );
+  console.log(
+    `  round trip move -> result applied: median ${med("rt")} ms (p95 ${fmt(stats(parts.rt).p95)}); worker drag request median ${med("worker")} ms, longest Worker block max ${fmt(maxOf(parts.workerBlock))} ms`,
+  );
+  scene.terminate();
+}
+
+// 5d. The longest single requests: one edit with several dependent fields, a section over several meshes.
+async function benchWorkerLongRequests(label, n, edits) {
+  const { scene, bw, meshA, meshB } = await workerPair(n, { maxDistance: 0.08, range: [-0.08, 0] });
+  // A third tile C beside the pair, with no field: the edit baseline, and cut by the section.
+  const c = terrain(n, { phase: 2.1, dx: n + 4 });
+  const meshC = scene.addMesh(c.positions, c.indices);
+  await roundTrip(scene, bw);
+  await bw.stats();
+  const w = n + 1;
+  const centre = Math.floor(w / 2) * w + Math.floor(w / 2); // a vertex in the contact area
+  const g = terrain(n);
+  async function editRound(name, mesh, src) {
+    const block = [];
+    const total = [];
+    const rt = [];
+    for (let k = 0; k < edits; k++) {
+      const z = src.positions[3 * centre + 2] + (k % 2 === 0 ? 0.01 : 0);
+      const done = scene.edit(mesh, [
+        {
+          op: "setPositions",
+          vertices: [centre],
+          positions: [src.positions[3 * centre], src.positions[3 * centre + 1], z],
+        },
+      ]);
+      const r = await roundTrip(scene, bw);
+      await done;
+      const st = await bw.stats();
+      rt.push(r.rt);
+      total.push(st.chunks.reduce((s, x) => s + x.ms, 0));
+      block.push(st.maxGap);
+    }
+    report(
+      `worker ${label} one-vertex edit, ${name}: longest Worker block`,
+      block,
+      `; worker time for the batch median ${fmt(stats(total).median)} ms, round trip median ${fmt(stats(rt).median)} ms`,
+    );
+  }
+  await editRound("of C, no field on it", meshC, c);
+  await editRound("of A, 1 field (on A to B)", meshA, g);
+  scene.addDistanceField({ name: "gapBack", on: meshB, to: meshA, maxDistance: 0.08 });
+  await roundTrip(scene, bw);
+  console.log(`  adding the B-to-A contact field: longest Worker block ${fmt((await bw.stats()).maxGap)} ms`);
+  await editRound("of A, 2 contact fields (A to B, B to A)", meshA, g);
+  scene.addDistanceField({ name: "wide", on: meshA, to: meshB, maxDistance: 8 });
+  scene.addDistanceField({ name: "wideBack", on: meshB, to: meshA, maxDistance: 8 });
+  await roundTrip(scene, bw);
+  const st = await bw.stats();
+  console.log(
+    `  adding the 2 wide fields: field builds ${chunkMs(st, "fieldBuild").map(fmt).join(", ")} ms, longest Worker block ${fmt(st.maxGap)} ms`,
+  );
+  await editRound("of A, 4 fields (2 contact, 2 wide with maxDistance 8)", meshA, g);
+
+  // A section over the three meshes.
+  for (const fill of [false, true]) {
+    const plane = (k) => ({ origin: [0, n * (0.3 + 0.01 * k), 0], normal: [0, 1, 0] });
+    const section = scene.addSection({ plane: plane(0), meshes: [meshA, meshB, meshC], fill });
+    await roundTrip(scene, bw);
+    const add = maxOf(chunkMs(await bw.stats(), "section"));
+    const worker = [];
+    for (let k = 1; k <= 16; k++) {
+      scene.setSectionPlane(section, plane(k));
+      await roundTrip(scene, bw);
+      worker.push(maxOf(chunkMs(await bw.stats(), "section")));
+    }
+    report(
+      `worker ${label} section over 3 meshes (fill ${fill ? "on" : "off"}), plane change: worker section request`,
+      worker,
+      `; addSection ${fmt(add)} ms`,
+    );
+    scene.removeSection(section);
+    await roundTrip(scene, bw);
+    await bw.stats();
+  }
+  scene.terminate();
+}
+
+// 5e. Many small requests in one frame: 1000 setPlacement calls over 10 small meshes.
+async function benchWorkerManySmall(label, calls, rounds) {
+  const { scene, bw } = await openWorkerScene();
+  const meshes = [];
+  for (let k = 0; k < 10; k++) {
+    const g = terrain(50, { phase: k, dx: k * 60 });
+    meshes.push(scene.addMesh(g.positions, g.indices));
+  }
+  await roundTrip(scene, bw);
+  await bw.stats();
+  const parts = { queue: [], rt: [], handler: [], worker: [], workerBlock: [], chunks: [] };
+  for (let r = 0; r < rounds + 1; r++) {
+    const t0 = now();
+    for (let k = 0; k < calls; k++) {
+      const x = 0.001 * (k + r);
+      scene.setPlacement(meshes[k % 10], { rotation: [0, 0, 0, 1], translation: [x, 0, 0] });
+    }
+    const t1 = now();
+    const { rt, handler } = await roundTrip(scene, bw);
+    const st = await bw.stats();
+    if (r > 0) {
+      parts.queue.push(t1 - t0);
+      parts.rt.push(rt);
+      parts.handler.push(handler);
+      const run = chunkMs(st, "setPlacement");
+      parts.worker.push(run.reduce((s, x) => s + x, 0));
+      parts.chunks.push(run.length);
+      parts.workerBlock.push(st.maxGap);
+    }
+  }
+  const med = (k) => fmt(stats(parts[k]).median);
+  console.log(`worker ${label}: ${calls} setPlacement calls in one frame over 10 meshes of 5,000 triangles (${rounds} rounds, medians)`);
+  console.log(
+    `  main: queueing the calls ${med("queue")} ms, round trip commitFrame -> result applied ${med("rt")} ms (p95 ${fmt(stats(parts.rt).p95)}), result handler ${med("handler")} ms`,
+  );
+  console.log(
+    `  worker: ${stats(parts.chunks).median} requests run, ${med("worker")} ms summed over them, longest Worker block ${med("workerBlock")} ms (max ${fmt(maxOf(parts.workerBlock))})`,
+  );
+  // The same calls on a synchronous Scene, for comparison.
+  const sync = new Scene();
+  const syncMeshes = [];
+  for (let k = 0; k < 10; k++) {
+    const g = terrain(50, { phase: k, dx: k * 60 });
+    syncMeshes.push(sync.addMesh(g.positions, g.indices));
+  }
+  const times = [];
+  for (let r = 0; r < rounds + 1; r++) {
+    const t0 = now();
+    for (let k = 0; k < calls; k++) {
+      sync.setPlacement(syncMeshes[k % 10], { rotation: [0, 0, 0, 1], translation: [0.001 * (k + r), 0, 0] });
+    }
+    sync.commitFrame();
+    if (r > 0) {
+      times.push(now() - t0);
+    }
+  }
+  report(`  sync Scene, the same ${calls} calls + commitFrame`, times);
+  sync.free();
+  scene.terminate();
+}
+
 // ---- run ----
 
 console.log(`node ${process.version}, ${process.platform} ${process.arch}${quick ? " (quick)" : ""}`);
 const contact = { maxDistance: 0.08, range: [-0.08, 0] }; // as the Rust drag bench
 const wide = { maxDistance: 8, range: [0, 6] }; // every vertex of the dragged pair is in range
+if (onlyWorker) {
+  await benchWorkerAdd("1M", 708, quick ? 3 : 7);
+  await benchWorkerToggle("1M contact", 708, quick ? 10 : 20, contact);
+  await benchWorkerToggle("1M wide", 708, quick ? 10 : 20, wide);
+  await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
+  if (!quick) {
+    await benchWorkerDrag("1M wide", 708, 1, wide); // 64 poses of about 0.4 s each, plus a warm-up cycle
+  }
+  await benchWorkerLongRequests("1M", 708, quick ? 4 : 10);
+  await benchWorkerManySmall("small requests", 1000, quick ? 5 : 20);
+  if (with10m) {
+    await benchWorkerAdd("10M", 2236, 1);
+    await benchWorkerToggle("10M contact", 2236, 6, contact);
+    await benchWorkerDrag("10M contact", 2236, 1, contact);
+  }
+  process.exit(0);
+}
 if (onlyAdapter) {
   benchAdapter("adapter 1M contact", 708, quick ? 1 : 3, contact);
   benchAdapter("adapter 1M wide", 708, quick ? 1 : 3, wide);

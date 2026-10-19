@@ -35,6 +35,7 @@ export {
   type Vec3,
 } from "./api.js";
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export type { SceneLike } from "./scene-like.js";
 export {
   type AddMeshOptions,
   type Analysis,

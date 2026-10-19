@@ -189,6 +189,89 @@ scene.free(); // or `using scene = new Scene()`
 
 Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `STALE_BVH`, ...). After a trap inside the WebAssembly module every later call throws `INSTANCE_POISONED`. A view is only valid until the next scene call that may allocate or move buffers: a kept view may read other data or be empty, so re-acquire views after any scene call. `new Scene({ debug: true })` makes views warn when they are read after such a call. Mesh edits (`scene.edit`), `analyze`, `repair`, sections (`addSection`, `section`, `sectionGap`) and `findContacts` are documented in the types.
 
+## Worker scene
+
+`fast-mesh-wasm/worker` runs the same engine in a Web Worker, so adding a large mesh, building fields or recolouring never blocks the page. `createWorkerScene()` starts the Worker and resolves to a `WorkerScene` with the `Scene` methods. Your renderer keeps reading synchronous views: every result carries the bytes of its dirty ranges, which are copied into main-thread mirrors.
+
+```ts
+import * as THREE from "three";
+import type { DragSession, PlacementInput } from "fast-mesh-wasm";
+import { createWorkerScene } from "fast-mesh-wasm/worker";
+import { bindMesh } from "fast-mesh-wasm/three"; // optional: the three.js adapter works on a WorkerScene too
+
+// Provided by your app (not part of this package).
+declare const upperPositions: Float64Array, upperIndices: Uint32Array;
+declare const lowerPositions: Float64Array, lowerIndices: Uint32Array;
+declare const renderer: THREE.WebGLRenderer, threeScene: THREE.Scene, camera: THREE.Camera;
+declare const button: HTMLButtonElement, undoButton: HTMLButtonElement;
+
+const scene = await createWorkerScene(); // no init() needed: the Worker loads the wasm
+
+// Handles come back at once; the work runs in the Worker.
+const upper = scene.addMesh(upperPositions, upperIndices);
+const lower = scene.addMesh(lowerPositions, lowerIndices);
+const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
+scene.setColoring(upper, { field: gap, map: "turbo", range: [-0.5, 1] });
+const boundUpper = bindMesh(scene, upper);
+threeScene.add(boundUpper.object);
+
+// Drag the lower mesh: one drag per gesture, the latest pose kept until the next frame.
+let drag: DragSession | undefined;
+let pending: PlacementInput | undefined;
+function onPointerDown() {
+  drag = scene.drag(lower); // the whole drag is one undo step
+}
+function onPointerMove(pose: PlacementInput) {
+  pending = pose; // keep only the latest pose
+}
+function onPointerUp() {
+  if (pending !== undefined) drag?.move(pending);
+  pending = undefined;
+  drag?.end(); // returns at once
+  drag = undefined;
+}
+
+// Once per animation frame: send this frame's requests, receive the results so far.
+function frame() {
+  if (pending !== undefined) drag?.move(pending); // at most one move per frame
+  pending = undefined;
+  scene.commitFrame(); // the adapters' listeners apply the changes here, as with Scene
+  renderer.render(threeScene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Status of each piece of state: "idle" | "computing" | "ready" | "error".
+scene.onStatus(() => {
+  const coloring = scene.status(`display:${scene.idOf(upper)}`);
+  button.classList.toggle("busy", coloring.status === "computing");
+  undoButton.disabled = !scene.canUndo; // canUndo / canRedo are getters here
+});
+
+// Queries are async.
+const hit = await scene.raycast([0, 0, 50], [0, 0, -1]);
+const distance = await scene.meshDistance(upper, lower);
+const values = await scene.fetchFieldValues(gap); // `fieldValues` on Scene
+```
+
+- **The frame loop.** `commitFrame()` sends everything queued since the last frame as one batch and returns the change records of the results received meanwhile (already applied to the mirrors, so `views`, `matrix4`, `placement`, `section` and `sectionPlane` read the new state). Results arrive between frames; nothing changes in the mirrors outside a message.
+- **Requests run in order.** A newer colouring, section plane/meshes/fill or drag move drops the older one if it has not started yet, so fast toggling settles on the last state without doing the steps in between. Edits, repairs, `setPlacement`, adds, removals and undo/redo are never dropped. Each `setPlacement` is an undo step: for pointer-rate updates use a drag.
+- **Drags are optimistic.** `scene.drag(mesh).move(pose)` moves the placement mirror at once, so the object follows the pointer; colours and sections catch up when the Worker's result arrives. In 9a a key's status covers only requests made under that key: a drag, `setPlacement` or edit puts its own key (`placement:<id>`, `edit:<id>`) into `"computing"`, not the `display:<id>` or `section:<id>:*` keys of the state that catches up after it. `end()` and `cancel()` return at once; `cancel()` restores the start pose and records nothing.
+- **Queries and anything that returns data** (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`, `analyze`, `edit`, `repair`, `fetchFieldValues`, `fieldStatus`, `sectionGap`) return promises. Once a frame loop runs they go out with the next `commitFrame()` (or after 100 ms if no frame comes); before the first `commitFrame()` they are sent on a microtask. For latency-critical picking, keep a light picking copy in a main-thread `Scene`.
+- **Errors.** A failed state change shows on its key (`status(key).error`, a `FastMeshError` with the same `code` as on `Scene`); a failed promise rejects with it. After a trap inside the Worker every call fails with `INSTANCE_POISONED`. `await scene.restart()` starts a new Worker and replays the scene from the main thread's mirrors: meshes (compacted: slot ids change, handles do not), placements, fields, colourings and sections. History is cleared, and edits or queries that had not finished fail and must be re-issued.
+- **Not in the Worker scene:** user-opened steps (`beginStep`/`endStep`/`cancelStep`), Lazy and Manual modes (it is always eager) and `takeChanges` (use `onChanges` or the return value of `commitFrame()`). `terminate()` stops the Worker.
+- **Large meshes.** `addMesh` copies its inputs on the main thread (they are then transferred to the Worker) and, without an `origin` option, scans the positions for the bounding-box centre. That takes about 9 ms for 1M triangles and about 63 ms for 10M (see [docs/benchmarks.md](docs/benchmarks.md)); passing `origin` skips the scan.
+
+**Bundlers.** The Worker script is a separate file, `worker-entry.js`, loaded with `new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })`. Vite and other bundlers that understand this pattern pick it up and emit it with the `.wasm` it loads: [`examples/webgpu`](examples/webgpu) uses the default with Vite, in both `vite build` and `vite dev` (open it with `?worker`). If your setup does not handle the pattern, serve the package's `dist/` folder (the Worker script loads the files next to it) and pass the script's URL, or create the Worker yourself:
+
+```ts
+const scene = await createWorkerScene({ workerUrl: "/fast-mesh-wasm/worker-entry.js" });
+// or
+const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { type: "module" }) });
+```
+
+`fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
+
 ## Functions
 
 | Function | Returns | Description |

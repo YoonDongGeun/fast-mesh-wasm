@@ -9,3 +9,4 @@ export {
 } from "./controls.js";
 export { type BindMeshOptions, type BoundMesh, bindMesh } from "./mesh.js";
 export { type BindSectionOptions, type BoundSection, bindSection } from "./section.js";
+export type { SceneLike } from "../scene-like.js";
