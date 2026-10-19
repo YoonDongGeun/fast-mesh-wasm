@@ -256,7 +256,7 @@ const values = await scene.fetchFieldValues(gap); // `fieldValues` on Scene
 
 - **The frame loop.** `commitFrame()` sends everything queued since the last frame as one batch and returns the change records of the results received meanwhile (already applied to the mirrors, so `views`, `matrix4`, `placement`, `section` and `sectionPlane` read the new state). Results arrive between frames; nothing changes in the mirrors outside a message.
 - **Requests run in order.** A newer colouring, section plane/meshes/fill or drag move drops the older one if it has not started yet, so fast toggling settles on the last state without doing the steps in between. Edits, repairs, `setPlacement`, adds, removals and undo/redo are never dropped. Each `setPlacement` is an undo step: for pointer-rate updates use a drag.
-- **Drags are optimistic.** `scene.drag(mesh).move(pose)` moves the placement mirror at once, so the object follows the pointer; colours and sections catch up when the Worker's result arrives (their keys show `"computing"` until then). `end()` and `cancel()` return at once; `cancel()` restores the start pose and records nothing.
+- **Drags are optimistic.** `scene.drag(mesh).move(pose)` moves the placement mirror at once, so the object follows the pointer; colours and sections catch up when the Worker's result arrives. In 9a a key's status covers only requests made under that key: a drag, `setPlacement` or edit puts its own key (`placement:<id>`, `edit:<id>`) into `"computing"`, not the `display:<id>` or `section:<id>:*` keys of the state that catches up after it. `end()` and `cancel()` return at once; `cancel()` restores the start pose and records nothing.
 - **Queries and anything that returns data** (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`, `analyze`, `edit`, `repair`, `fetchFieldValues`, `fieldStatus`, `sectionGap`) return promises. Once a frame loop runs they go out with the next `commitFrame()` (or after 100 ms if no frame comes); before the first `commitFrame()` they are sent on a microtask. For latency-critical picking, keep a light picking copy in a main-thread `Scene`.
 - **Errors.** A failed state change shows on its key (`status(key).error`, a `FastMeshError` with the same `code` as on `Scene`); a failed promise rejects with it. After a trap inside the Worker every call fails with `INSTANCE_POISONED`. `await scene.restart()` starts a new Worker and replays the scene from the main thread's mirrors: meshes (compacted: slot ids change, handles do not), placements, fields, colourings and sections. History is cleared, and edits or queries that had not finished fail and must be re-issued.
 - **Not in the Worker scene:** user-opened steps (`beginStep`/`endStep`/`cancelStep`), Lazy and Manual modes (it is always eager) and `takeChanges` (use `onChanges` or the return value of `commitFrame()`). `terminate()` stops the Worker.
@@ -270,7 +270,7 @@ const scene = await createWorkerScene({ workerUrl: "/fast-mesh-wasm/worker-entry
 const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { type: "module" }) });
 ```
 
-`fast-mesh-wasm/worker` is for browsers; it has no Node.js export (Node's `worker_threads` is used only by the tests).
+`fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
 
 ## Functions
 
