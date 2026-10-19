@@ -358,6 +358,98 @@ This table comes from a later run on the same machine than the header table of t
 
 The binary grew 37 times because it now carries the BVH, queries, fields, sections and repair, which were not in the package before. The spec's size rule (section 8: call out a release that grows by more than 20%) applies from the next release on. The test build (`pnpm --filter fast-mesh-wasm test`) adds the `__test_panic` export and is not what is published.
 
+## Worker scene (fast-mesh-wasm/worker)
+
+Results for `pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m`. The `WorkerScene` from the built package (`dist/worker.js`) drives the engine in a Node `worker_threads` Worker (`bench/worker-harness.mjs`), which serves it as the browser Worker script does, with the default 4 ms yield budget. Messages are structured clones with transferred `ArrayBuffer`s, as in a browser, but this is Node's Worker and event loop, not a browser's.
+
+- **Machine:** Intel Core i5-13600K (14 cores, 20 threads), 32 GB RAM, Windows 11, Node 24.13.0
+- **Wasm:** release build (`wasm-opt -O3`) **without** the `parallel` feature: the Worker runs the engine on one thread, as the published npm package does.
+- **Date:** 2026-10-19. Two full runs, back to back, with no other `cargo`, `rustc` or bench process running (CPU load 3% before them). The tables show run 1; run 2 is given in parentheses where it differs by more than about 10% or where only one sample was taken.
+- **Meshes:** the `terrain(n)` height fields of the JavaScript core section: 1,002,528 triangles (`n = 708`) and 9,999,392 (`n = 2236`).
+- **What is timed.** On the main thread: the synchronous calls; the scene's message handler applying a result to the mirrors ("handler", timed around the scene's listener); the adapter-style copy of the delivered dirty ranges into a JS mirror (as in the core section); and the longest event-loop block, from a `setImmediate` probe loop, which also covers the structured-clone of each message. In the Worker: each chunk of work the engine reports (a request, a field build or a repair operation, timed from the end of the previous one), and the longest block of the Worker's event loop, from the same kind of probe. Requests are sent with `commitFrame()` and the bench waits for their result before the next step (lock step), so a round trip is one batch's whole cost.
+
+### Adding a mesh: main-thread blocks
+
+`scene.addMesh(positions, indices)`, then `commitFrame()` sends it, the result comes back with every buffer whole, and the next `commitFrame()` delivers the `added` record, whose whole buffers the bench copies into its mirror (what an adapter does once for a new mesh). 1M: median of 7 runs; 10M: 1 run per run.
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| **Longest main-thread block** (probe), whole add | **9.30 ms** (max 9.83; run 2: max 12.8) | **63.5 ms** (run 2: 63.2) |
+| `addMesh()` call (copies the inputs, scans for the box centre) | 9.25 ms | 63.4 ms (run 2: 62.9) |
+| `commitFrame()` that posts it (buffers transferred) | 0.03 ms | 0.06 ms (run 2: 0.30) |
+| Result handler (whole buffers transferred into the mirrors) | 0.08 ms (max 0.32) | 0.11 ms (run 2: 0.07) |
+| The app's full copy of the new mesh's buffers (next `commitFrame()`) | 4.0 ms | 52.8 ms (run 2: 34.3) |
+| Worker: the `addMesh` request (one Rust call) | 1.13 s | 12.7 s (run 2: 12.2) |
+| Round trip, `addMesh` to result applied | 1.14 s | 12.7 s (run 2: 12.2) |
+
+- **The spec's target (§6: under 16 ms per message) is met at 1M and missed at 10M, but not by a message.** No message handler takes more than 0.32 ms at either size. The longest block is the synchronous `addMesh()` call itself. A separate measurement of its parts with the same operations in plain Node (median of 5) gives, at 1M: `Float64Array.from(positions)` 1.6 ms, `Uint32Array.from(indices)` 2.3 ms, the box-centre scan 4.7 ms; at 10M: 16.8 ms, 16.6 ms and 33.7 ms. Passing `origin` skips the scan (about half of it); the copies are needed because the buffers are transferred.
+- **The Worker is busy for the whole add**: 1.1 s at 1M and 12 s at 10M in one Rust call, which cannot be interrupted. A request sent meanwhile (a toggle, a drag) waits behind it; the page stays responsive.
+- The app's own full copy of a new mesh (4 ms at 1M, 34 to 53 ms at 10M) happens in its `commitFrame()` listener, outside the library; an adapter that uploads a new 10M mesh in one frame pays this whatever the scene runs on.
+
+### Colouring toggle: round trip
+
+Two touching meshes (B flipped over A, as in the 64-pose drag) with a distance field on A to B colouring A. Each toggle calls `setColoring(A, null)` or `setColoring(A, rule)` and `commitFrame()`, then waits for the result. The field is kept, so turning colouring on is a recolour, not a field build (§9.5). 10 toggles each way at 1M, 3 at 10M.
+
+| Round trip, median (p95) | 1M, contact | 1M, wide | 10M, contact |
+| --- | --- | --- | --- |
+| Colouring off | 0.06 ms (0.26) (run 2: 0.13) | 0.06 ms (0.17) | 0.21 ms (0.34) (run 2: 0.15) |
+| Colouring on | 1.00 ms (1.36) | 1.11 ms (1.62) | 9.95 ms (10.9) |
+| Worker: the `coloring` request, on | 0.67 ms | 0.80 ms | 6.58 ms |
+| Main: result handler / copy of the colour ranges, on | 0.01 / 0.12 ms | 0.01 / 0.12 ms | 0.03 / 1.28 ms |
+
+"Contact" and "wide" are the core section's `maxDistance` 0.08 and 8. Turning colouring on recolours every vertex of A and sends the whole colour buffer (2 MB at 1M, 20 MB at 10M; the handler takes 0.01 to 0.03 ms for it); the time is the Worker's recolour plus the message. Turning it off sends no colour bytes.
+
+### The 64-pose drag of two touching meshes, colouring on
+
+The drag of the core section through the Worker scene: per frame `drag.move(pose)` (optimistic: the placement mirror moves at once), `commitFrame()` (sends the move, delivers the previous result), the copy of the delivered dirty ranges, then waiting for the move's result. 1M contact: 3 cycles of 64 poses after a warm-up cycle; 1M wide and 10M contact: 1 cycle.
+
+| Per frame | 1M, contact | 1M, wide | 10M, contact |
+| --- | --- | --- | --- |
+| **Main-thread cost** (move + `commitFrame()` + copy + result handler), median (p95) | **0.03 ms** (0.05) | **0.08 ms** (0.11) | **0.12 ms** (0.21) |
+| of which the result handler (applying the transferred ranges), median (p95) | 0.01 ms (0.03) | 0.04 ms (0.06) | 0.06 ms (0.10) |
+| Dirty bytes per frame, median | 0.6 KB | 27.7 KB | 14.1 KB |
+| Worker: the `drag` move request, median | 1.76 ms | 402 ms (run 2: 391) | 30.9 ms |
+| Round trip, move to result applied, median (p95) | 1.84 ms (4.06) | 402 ms (723) | 31.4 ms (74.1) |
+| Longest Worker block, max | 4.39 ms | 741 ms | 77.1 ms (run 2: 77.8) |
+
+- **The main thread pays almost nothing for a drag**: about 0.1 ms per frame even at 10M, against 1.76 ms (1M) and 38.6 ms (10M) per frame on the main thread with the synchronous `Scene` (core section). The engine's work moved to the Worker unchanged (1.76 ms against 1.75 ms per move at 1M).
+- **Colours lag the drag by the round trip.** The mesh follows the pointer at once; its colours catch up one round trip later: about 2 ms at 1M (within the frame), about 31 ms at 10M (two frames at 60 fps), and 0.4 s in the wide stress case. Moves sent meanwhile coalesce in the Worker, so by design a slow move does not build a backlog (the lock-step bench does not exercise this).
+
+### The longest single requests
+
+The Worker blocks for the whole of one request (ruling 10.1-6: no Rust-side chunking in 9a). The two cases the spec's chunking list names, on 1M meshes: a field recompute after one edit, and a section update over several meshes. A third mesh C (another 1M tile beside the pair) carries no field. Each edit moves one vertex in the contact area (`edit` with `setPositions`), 10 edits per row; the section rows change the plane 16 times.
+
+| | Longest Worker block, median (p95) |
+| --- | --- |
+| One-vertex edit of C (no field depends on it) | 0.13 ms (9.06, the first edit) |
+| One-vertex edit of A, 1 field (on A, to B) | 0.06 ms (7.17, the first edit) |
+| One-vertex edit of A, 2 contact fields (A to B, **B to A**) | **93.6 ms** (105) |
+| One-vertex edit of A, 4 fields (also both directions with `maxDistance` 8) | **348 ms** (375) |
+| Adding the B-to-A contact field (one field build) | 218 ms (run 2: 203) |
+| Adding a wide field (one field build), each of two | 106 and 111 ms |
+| Section over 3 meshes of 1M, plane change, fill off | 0.69 ms (1.22) |
+| Section over 3 meshes of 1M, plane change, fill on | 0.67 ms (0.78) |
+| `addSection` over the 3 meshes, fill off / on | 1.93 / 0.74 ms |
+
+- **One edit can block the Worker for about 0.1 to 0.35 s.** An edit of A is cheap for the field on A (only the moved vertex is recomputed), but every field measured *to* A (here B to A) recomputes after it, and that costs about 94 ms at 1M even for one moved vertex. The size is consistent with rebuilding A's sign data (`SignData::build`, 132 ms in the fields table above); this was not profiled. With both wide fields as well, one edit takes 348 ms. These are single Rust calls (`run_eager_fields`), so a toggle or drag sent meanwhile waits up to that long; the page itself is not blocked. If this matters, the follow-up is Rust-side work: per-field steps for the recompute, or incremental sign data after small edits.
+- **Section updates are not a concern at this size**: under 1.3 ms for three 1M meshes, with or without fill.
+- For comparison, the other long single requests measured above: the 1M wide drag move (median 0.4 s, up to 0.74 s), adding a 1M mesh (1.1 s) and a 10M mesh (12 s).
+
+### Many small requests in one frame
+
+1000 `setPlacement` calls in one frame, spread over 10 meshes of 5,000 triangles, with no fields. Each is its own undo step, so none is coalesced (ruling 10.1-1). 20 rounds after a warm-up round.
+
+| | Median (p95) |
+| --- | --- |
+| Main: queueing the 1000 calls | 0.47 ms |
+| Round trip, `commitFrame()` to result applied | 3.88 ms (6.65) (run 2: p95 5.12) |
+| Main: result handler | 0.07 ms |
+| Worker: the 1000 requests, summed | 2.30 ms |
+| Longest Worker block | 3.16 ms (max 5.02) (run 2: max 3.88) |
+| Synchronous `Scene`, the same 1000 calls + `commitFrame()` | 2.00 ms (8.44) |
+
+The batch runs back to back inside the 4 ms yield budget, so the Worker yields at most once for it; the Worker side costs about the same as the synchronous scene (2.3 ms against 2.0 ms), and the main thread spends about 0.5 ms.
+
 ## Parallel (the `parallel` feature)
 
 Every benchmark that the `parallel` feature touches, with the feature off and on. Results are bit-identical either way (the tests check it); only the time changes.
@@ -476,6 +568,7 @@ cargo bench -p fast-mesh-fields                       # SignData::build and sign
 cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_BENCH_LARGE=1 for the 10M terrain
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
+pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run)
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)

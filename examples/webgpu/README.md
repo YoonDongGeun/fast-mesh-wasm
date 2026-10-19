@@ -44,6 +44,16 @@ pnpm --filter fast-mesh-wasm-example-webgpu dev     # then open the printed URL
 
 Needs a browser with WebGPU (recent Chrome, Edge or Safari). Without it the page shows a message.
 
+### Worker mode
+
+Add `?worker` to the URL (for example `http://localhost:5173/?worker`) to run the scene in a Web Worker
+with `createWorkerScene()` from `fast-mesh-wasm/worker`. The renderer code is the same: it only needs the
+`SceneLike` part of the scene (`views`, `matrix4`, `commitFrame`, ...), which stays synchronous. The
+differences are in `src/main.ts`: picking (`raycast`) and the nearest-mesh search (`meshDistance`) are
+awaited, `canUndo`/`canRedo` are getters, and sections need no `updateSections()`. Vite picks up the
+package's Worker script from its default `new URL("./worker-entry.js", import.meta.url)`, so no Vite
+configuration is needed. The status line ends with "Worker scene" in this mode.
+
 ## Controls
 
 - Click: pick a mesh. Drag it: move it in a camera-facing plane. Shift+drag: rotate it (arcball).
@@ -71,3 +81,5 @@ Needs a browser with WebGPU (recent Chrome, Edge or Safari). Without it the page
    Press S: the plane and the cut are gone.
 8. Drop a binary STL: it appears, the camera refits, and it can be picked, dragged and coloured.
 9. Open the page in a browser without WebGPU: a message explains it, and the console shows no exception.
+10. Open the page with `?worker`: the status line ends with "Worker scene", and steps 2–8 behave the same
+    (colours and contours may follow a moved mesh a frame or more later).

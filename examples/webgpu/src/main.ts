@@ -3,6 +3,12 @@
 // scene (fast-mesh-wasm) owns geometry, placements, history, fields and
 // sections; this file only turns input into scene calls, and once per frame
 // hands `scene.commitFrame()` to the renderer.
+//
+// With `?worker` in the URL the scene runs in a Web Worker
+// (`createWorkerScene` from `fast-mesh-wasm/worker`) instead of on the main
+// thread. The same code drives both: queries are awaited (they return
+// promises in Worker mode), and everything the renderer reads stays
+// synchronous.
 import {
   type DragSession,
   type FieldHandle,
@@ -14,6 +20,7 @@ import {
   type SectionHandle,
   type Vec3,
 } from "fast-mesh-wasm";
+import { createWorkerScene, type WorkerScene } from "fast-mesh-wasm/worker";
 import { add, type CameraBasis, cross, dot, normalize, OrbitCamera, scale, sub } from "./camera";
 import { type DrawItem, Renderer } from "./gpu";
 import { type MeshData, parseBinaryStl, sphere, torus, wavyPlate } from "./meshes";
@@ -21,6 +28,7 @@ import { type MeshData, parseBinaryStl, sphere, torus, wavyPlate } from "./meshe
 const canvas = document.querySelector<HTMLCanvasElement>("#view")!;
 const statusLine = document.querySelector<HTMLElement>("#status")!;
 const message = document.querySelector<HTMLElement>("#message")!;
+const useWorker = new URLSearchParams(location.search).has("worker");
 
 const renderer = await Renderer.create(canvas).catch((error: unknown) => {
   console.error(error);
@@ -33,8 +41,10 @@ if (renderer === null) {
   message.hidden = false;
   statusLine.hidden = true;
 } else {
-  await init();
-  run(renderer);
+  // The default Worker URL (`new URL("./worker-entry.js", import.meta.url)`
+  // inside the package) is picked up by Vite as a Worker entry; see the README.
+  const scene = useWorker ? await createWorkerScene() : await init().then(() => new Scene());
+  run(renderer, scene);
 }
 
 /** Per-mesh display settings: never part of the scene's history. */
@@ -60,8 +70,9 @@ type Gesture =
     };
 type MeshGesture = Exclude<Gesture, { kind: "orbit" }>;
 
-function run(renderer: Renderer): void {
-  const scene = new Scene();
+function run(renderer: Renderer, scene: Scene | WorkerScene): void {
+  const canUndo = () => (scene instanceof Scene ? scene.canUndo() : scene.canUndo);
+  const canRedo = () => (scene instanceof Scene ? scene.canRedo() : scene.canRedo);
   const camera = new OrbitCamera();
   const looks = new Map<MeshHandle, Look>();
   const bounds = { min: [Infinity, Infinity, Infinity] as Vec3, max: [-Infinity, -Infinity, -Infinity] as Vec3 };
@@ -72,6 +83,10 @@ function run(renderer: Renderer): void {
   let gesture: Gesture | null = null;
   /** The pointer that started `gesture`; other pointers are ignored until it ends. */
   let gesturePointer = -1;
+  /** The pointer whose pick (an async raycast in Worker mode) is still running. */
+  let pickingPointer = -1;
+  /** A colouring toggle waiting for its distance queries. */
+  let toggling = false;
   /** The latest drag pose, applied once at the start of the next frame. */
   let pendingPose: PlacementInput | null = null;
   let coloring: { mesh: MeshHandle; field: FieldHandle } | null = null;
@@ -131,7 +146,8 @@ function run(renderer: Renderer): void {
   /** A section's contours as line-list segments (world xyz pairs). */
   function contourSegments(handle: SectionHandle): Float32Array {
     const meshes = [...looks.keys()];
-    if (meshes.some((m) => scene.section(handle, m).status === "stale")) {
+    // A Worker scene keeps its sections up to date itself.
+    if (scene instanceof Scene && meshes.some((m) => scene.section(handle, m).status === "stale")) {
       scene.updateSections();
     }
     const out: number[] = [];
@@ -150,15 +166,21 @@ function run(renderer: Renderer): void {
 
   // ---- Pointer: click picks, drag moves, Shift+drag rotates, empty space orbits ----
 
-  canvas.addEventListener("pointerdown", (e) => {
-    if (gesture !== null) {
+  canvas.addEventListener("pointerdown", async (e) => {
+    if (gesture !== null || pickingPointer !== -1) {
       return; // a second pointer (touch, pen) while a gesture is open: ignore it
     }
-    gesturePointer = e.pointerId;
+    pickingPointer = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
     const ray = camera.ray(e.offsetX, e.offsetY, canvas.clientWidth, canvas.clientHeight);
-    const hit = scene.raycast(ray.origin, ray.direction);
+    const hit = await scene.raycast(ray.origin, ray.direction); // a promise in Worker mode
+    const released = pickingPointer !== e.pointerId;
+    pickingPointer = -1;
     picked = hit?.mesh ?? null;
+    if (released) {
+      return; // the pointer went up before the pick came back: a click, no gesture
+    }
+    gesturePointer = e.pointerId;
     if (hit === null) {
       gesture = { kind: "orbit", x: e.offsetX, y: e.offsetY, yaw: camera.yaw, pitch: camera.pitch };
       return;
@@ -194,6 +216,10 @@ function run(renderer: Renderer): void {
   });
 
   const endGesture = (e: PointerEvent) => {
+    if (e.pointerId === pickingPointer) {
+      pickingPointer = -1; // released before the pick came back: the pick still applies, no gesture
+      return;
+    }
     if (e.pointerId !== gesturePointer) {
       return;
     }
@@ -283,7 +309,7 @@ function run(renderer: Renderer): void {
     } else if (ctrl || e.altKey) {
       return;
     } else if (key === "c") {
-      toggleColoring();
+      void toggleColoring();
     } else if (key === "s") {
       toggleSection();
     } else if (/^[0-9]$/.test(key)) {
@@ -296,7 +322,10 @@ function run(renderer: Renderer): void {
   });
 
   /** Distance colouring of the picked mesh against its nearest other mesh. */
-  function toggleColoring(): void {
+  async function toggleColoring(): Promise<void> {
+    if (toggling) {
+      return;
+    }
     if (coloring !== null) {
       scene.setColoring(coloring.mesh, null);
       scene.removeField(coloring.field);
@@ -307,23 +336,29 @@ function run(renderer: Renderer): void {
       note = "pick a mesh first";
       return;
     }
+    const mesh = picked;
     let nearest: MeshHandle | null = null;
     let best = Infinity;
-    for (const other of looks.keys()) {
-      const d = other === picked ? null : scene.meshDistance(picked, other);
-      if (d !== null && d.distance < best) {
-        best = d.distance;
-        nearest = other;
+    toggling = true;
+    try {
+      for (const other of looks.keys()) {
+        const d = other === mesh ? null : await scene.meshDistance(mesh, other); // a promise in Worker mode
+        if (d !== null && d.distance < best) {
+          best = d.distance;
+          nearest = other;
+        }
       }
+    } finally {
+      toggling = false;
     }
     if (nearest === null) {
       return;
     }
     const maxDistance = 0.1 * diagonal();
-    const field = scene.addDistanceField({ name: "distance", on: picked, to: nearest, maxDistance });
+    const field = scene.addDistanceField({ name: "distance", on: mesh, to: nearest, maxDistance });
     // Farther than maxDistance (Infinity) shows the base grey.
-    scene.setColoring(picked, { field, map: "turbo", range: [0, maxDistance] });
-    coloring = { mesh: picked, field };
+    scene.setColoring(mesh, { field, map: "turbo", range: [0, maxDistance] });
+    coloring = { mesh, field };
   }
 
   /** A section plane through the scene centre (normal +z), cutting every mesh. */
@@ -373,7 +408,8 @@ function run(renderer: Renderer): void {
       look === undefined ? "nothing picked" : `picked: ${look.name} (opacity ${look.opacity})`,
       coloring === null ? "" : "distance colouring on",
       section === null ? "" : "section on",
-      `undo ${scene.canUndo() ? "yes" : "no"} / redo ${scene.canRedo() ? "yes" : "no"}`,
+      `undo ${canUndo() ? "yes" : "no"} / redo ${canRedo() ? "yes" : "no"}`,
+      useWorker ? "Worker scene" : "",
       note,
     ]
       .filter((s) => s !== "")

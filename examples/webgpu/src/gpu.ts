@@ -2,7 +2,7 @@
 // the scene's change records, and drawing. Everything scene-specific goes
 // through `applyChange`: buffers come from `scene.views(mesh)` and only dirty
 // ranges are written with `queue.writeBuffer`.
-import type { MeshChange, MeshHandle, Range, Scene } from "fast-mesh-wasm";
+import type { MeshChange, MeshHandle, Range, SceneLike } from "fast-mesh-wasm";
 import shaderCode from "./shader.wgsl?raw";
 
 /** What one draw needs besides the mesh's buffers. */
@@ -158,7 +158,7 @@ export class Renderer {
    * `scene.commitFrame()`. Views are read fresh here and passed through
    * `.subarray()` (debug-mode views are Proxies, which writeBuffer rejects).
    */
-  applyChange(scene: Scene, change: MeshChange): void {
+  applyChange(scene: SceneLike, change: MeshChange): void {
     const old = this.#meshes.get(change.mesh);
     if (change.removed) {
       if (old !== undefined) {
@@ -227,7 +227,7 @@ export class Renderer {
    * by world centre, then the section lines. Each item's model matrix is
    * `scene.matrix4(mesh)` converted to f32.
    */
-  render(scene: Scene, frame: FrameParams, items: readonly DrawItem[]): void {
+  render(scene: SceneLike, frame: FrameParams, items: readonly DrawItem[]): void {
     const device = this.#device;
     const f = this.#frameScratch;
     f.fill(0);
@@ -314,7 +314,7 @@ export class Renderer {
   }
 
   /** Buffers sized from the views and uploaded whole. */
-  #createMesh(scene: Scene, mesh: MeshHandle): GpuMesh {
+  #createMesh(scene: SceneLike, mesh: MeshHandle): GpuMesh {
     const views = scene.views(mesh);
     const positions = views.positions();
     const slots = positions.length / 3;

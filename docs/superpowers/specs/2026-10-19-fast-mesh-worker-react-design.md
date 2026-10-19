@@ -226,3 +226,44 @@ interface MeshState {
    - **`SceneStore` actions:** `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `setDisplay`, `setSection`, `addSection`, `removeSection`, `select`, `restart`.
 8. **Node.** `worker_threads` is a test harness only. `fast-mesh-wasm/worker` targets browsers and has no Node export condition in 9a.
 9. **Package layout.** `<FastMesh>` (R3F) goes in a separate subpath, `fast-mesh-wasm/r3f`, so `./react` does not depend on three or R3F. Optional peers: `react >=18`, `@react-three/fiber >=8`.
+
+## 10. 9a implementation notes
+
+What 9a shipped, the rulings made while building it, the open points 9b inherits, and the measured costs. Like §9, this section wins over earlier sections where they differ.
+
+### 10.1 Rulings
+1. **`setPlacement` is never coalesced.** Each call is an undo step. Only drag moves coalesce, so pointer-rate updates must use `drag()`. If an app calls `setPlacement` at pointer rate, the work queues (documented).
+2. **Section `set` keys follow the aspects present.** The default key is `section:<id>:plane`, `:meshes` or `:fill` (combined, such as `section:<id>:plane+fill`), so only sets of the same aspects coalesce. Coalescing also checks the target id.
+3. **A poisoned batch applies nothing.** Every request in it reports `INSTANCE_POISONED`, none of its ranges reach the mirrors, and clients do not advance applied revisions from it. After `restart()` its unacknowledged intent is re-sent or surfaced as errors.
+4. **Promise calls follow the frame loop.** Once `commitFrame()` has been seen, promise-returning calls queue for the next `commitFrame()`, with a fallback timer (100 ms, `FALLBACK_FLUSH_MS`) that flushes if no frame comes. Without a frame loop they flush on a microtask. Last-wins requests and queries are never reordered, so a query can gain up to one frame of latency.
+5. **`idOf`, `fieldStatus` and `sectionGap` stay public** (the 9b store needs them). The test-only `debugDump` is not in the public `.d.ts`.
+6. **Chunking stays at request, field-build and repair-operation granularity.** There is no new Rust step in 9a (§4.3). Finer Rust-side chunking is a follow-up if benchmarks show long blocks; §10.3 has the numbers. If one recompute is huge, it blocks the Worker queue (the page stays responsive and the status stays `computing`).
+7. **Restart after poisoning replays engine-acknowledged placements.** Post-poison calls already failed with `INSTANCE_POISONED` and are not replayed. Requests that cannot be replayed fail with `INSTANCE_POISONED`.
+8. **Placements, colourings, fields and sections are declarative state.** A healthy restart replays the newest requested value; a poisoned one replays the engine-acknowledged value. In-flight non-declarative requests (edits, repair, undo/redo) are lost and fail. Pending declarative requests settle with the replay instead of failing.
+9. **After any successful restart, every replayed or settled key reflects the replay**: `ready`, or `error` only if the replay itself failed for that key. Post-poison failures were already reported through their rejected calls, so placement keys of a poisoned restart settle `ready` too.
+
+### 10.2 Open points for 9b
+- **Deferred field-build errors.** A field `add` sent under a display key (`key: "display:<mesh>"`) is abandoned when the colouring it feeds is already superseded, and built when first needed. Its errors (a taken name, an unknown mesh) then surface on the request that first needs the field, not on the add. This is unchanged in 9a; nothing in 9a sends display-keyed field adds, so it only matters once the store does.
+- **The store must send display-keyed field adds.** `WorkerScene.addDistanceField` keeps the `field:<id>` key, which is never cancelled. To get cancellation of superseded field builds, the 9b store, which owns the fields (§9.5), should send its field adds with `key: "display:<mesh>"`. This may need a small internal option on `WorkerScene`.
+- **Undo snap-back (cosmetic).** `undo()` or `redo()` right after a drag drops the poses held for ended drags, so the engine's last acknowledged pose shows until the undo's result arrives. A mesh can briefly jump to that intermediate pose (for a frame or two) before it lands on the undone pose. The store could hold the pre-drag pose instead.
+- **Retry-pose edge case.** When a restart's replay is posted and then fails, the next `restart()` replays the same poses (`#retryPoses`). Those can win over a `setPlacement` sent after the failed replay was posted.
+- Smaller deferred points: the error code of an unpostable replay is mixed (`INVALID_ARGUMENT` for the batch, `INSTANCE_POISONED` for the scene); a removed mesh whose add failed in the Worker leaves a small state entry; non-`FastMeshError` exceptions cross as `INVALID_ARGUMENT` with `"<name>: <message>"`.
+
+### 10.3 Measured costs
+Measured on 2026-10-19 in the Node `worker_threads` harness (`pnpm --filter fast-mesh-wasm bench -- --worker --10m`), i5-13600K, Windows 11, Node 24.13.0, release wasm without the `parallel` feature (single-threaded, as published). Full tables and method: `docs/benchmarks.md`, "Worker scene". Medians of run 1 of two; run 2 agreed within about 10% except where noted there.
+
+| | 1M triangles | 10M triangles |
+| --- | --- | --- |
+| Longest main-thread block during `addMesh` (target §6: < 16 ms per message) | 9.3 ms | 63 ms |
+| of which the synchronous `addMesh()` call (input copies + box-centre scan) | 9.3 ms | 63 ms |
+| Longest message handler during `addMesh` | 0.32 ms | 0.11 ms |
+| Colouring toggle round trip, on / off (contact) | 1.0 / 0.06 ms | 9.9 / 0.2 ms |
+| 64-pose drag with colouring: main-thread cost per frame (contact) | 0.03 ms | 0.12 ms |
+| of which applying the transferred ranges (result handler) | 0.01 ms | 0.06 ms |
+| 64-pose drag: round trip move to colours applied (contact) | 1.8 ms | 31 ms |
+| Worker block of one `addMesh` request | 1.1 s | 12.7 s |
+
+- **§6 target.** No message blocks the main thread for more than 0.32 ms. The 16 ms budget is met at 1M; at 10M the synchronous `addMesh()` call takes 63 ms (copies 33 ms, box-centre scan 34 ms; passing `origin` skips the scan). A transfer-taking `addMesh` variant, or a scan inside the Worker, would be needed to meet it at 10M.
+- **Worst single-request Worker blocks (ruling 6).** On 1M meshes: a one-vertex edit of A takes 94 ms when a field is measured *to* A (B to A), and 348 ms with four fields (two of them `maxDistance` 8); one field build takes 106 to 218 ms; a wide-range drag move takes 0.4 s (up to 0.74 s); a section update over three 1M meshes takes under 1.3 ms. **The edit and wide-move cases exceed ~100 ms**, so finer Rust-side chunking (per-field recompute steps, or incremental sign data after small edits) is worth a follow-up issue; sections need none.
+- **Many small requests.** 1000 `setPlacement` calls in one frame run in 2.3 ms in the Worker (longest block 3.2 ms, within the 4 ms yield budget) and 3.9 ms round trip, against 2.0 ms on the synchronous `Scene`.
+- **Bundling (T3 concern 4).** The default `new URL("./worker-entry.js", import.meta.url)` survives Vite 8: `examples/webgpu` built with `vite build` emits `worker-entry-*.js` and the `.wasm`, and the page with `?worker` ran in headless Chrome (SwiftShader WebGPU) under both `vite preview` and `vite dev`, with picking, colouring, a drag, a section and undo working. In the monorepo the package is a workspace link, so Vite's dependency pre-bundling of an npm-installed copy was not exercised.
