@@ -37,9 +37,9 @@ Files:
 - `src/Panel.tsx`: the panels, with `useMeshDisplay`, `useSection`, `useHistory`, `useSceneStatus` and `useSelection`.
 - `src/items.ts`, `src/meshes.ts`: the app's mesh list, the generators and the STL reader (from the WebGPU example).
 
-`bindSection` and `attachTransformControls` (from `fast-mesh-wasm/three`) take `BoundMesh` objects, and
-`<FastMesh>` keeps its binding to itself. The app passes what they read: the mesh handle with the
-object `<FastMesh>` draws (from the click event) or with the material the app gave `<FastMesh>`.
+`bindSection` and `attachTransformControls` (from `fast-mesh-wasm/three`) take `MeshBinding` objects.
+Each `<FastMesh onBind>` delivers its binding; the app keeps them in a map by mesh and passes them on.
+The section is bound again when a binding changes, since `bindSection` clips the materials it sees then.
 
 ## Run it
 
