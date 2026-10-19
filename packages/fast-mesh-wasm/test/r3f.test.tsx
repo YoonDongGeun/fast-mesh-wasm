@@ -249,7 +249,7 @@ describe("FastMesh", () => {
     expect(existsSync(new URL("r3f.d.ts", dist))).toBe(true);
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     expect(pkg.exports["./r3f"]).toEqual({ types: "./dist/r3f.d.ts", default: "./dist/r3f.js" });
-    expect(pkg.peerDependencies["@react-three/fiber"]).toBe(">=8");
+    expect(pkg.peerDependencies["@react-three/fiber"]).toBe(">=9");
     expect(pkg.peerDependenciesMeta["@react-three/fiber"]).toEqual({ optional: true });
 
     /** Every dist file a file imports, transitively. */
