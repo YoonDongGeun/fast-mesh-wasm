@@ -103,12 +103,13 @@ export interface KeyStatus {
  * Rejects with `INSTANCE_POISONED` when the Worker could not load fast-mesh.
  */
 export async function createWorkerScene(options: WorkerSceneOptions = {}): Promise<WorkerScene> {
-  const worker =
+  // Called again by `restart()`.
+  const make = (): WorkerLike =>
     options.createWorker?.() ??
     ((options.workerUrl === undefined
       ? new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })
       : new Worker(options.workerUrl, { type: "module" })) as unknown as WorkerLike);
-  const scene = new WorkerScene(TOKEN, worker, options.debug ?? false);
+  const scene = new WorkerScene(TOKEN, make, options.debug ?? false);
   try {
     await scene[STARTED];
   } catch (e) {
@@ -291,7 +292,19 @@ interface MeshState {
   gone: boolean;
   /** The colouring last requested (kept for a restart). */
   coloring: ColorRule | null;
+  /** The engine has the mesh, as of the latest result (its mirrors are its data). */
+  live: boolean;
+  /** Normals were asked for at the add. */
+  normalsOn: boolean;
+  /**
+   * The add request until a result reports the mesh added; a restart can
+   * replay it as long as its buffers were never sent (`addBytes` long).
+   */
+  add: AddRequest | undefined;
+  addBytes: number;
 }
+
+type AddRequest = Extract<Request, { kind: "addMesh" }>;
 
 interface FieldState {
   id: ClientId;
@@ -315,6 +328,14 @@ interface SectionState {
 interface Pending {
   resolve(value: unknown): void;
   reject(error: unknown): void;
+}
+
+/** A Worker's start: settled by its `ready` or `fatal` message, or an error. */
+interface Ready {
+  promise: Promise<void>;
+  resolve(): void;
+  reject(e: unknown): void;
+  settled: boolean;
 }
 
 /** An active drag. */
@@ -347,9 +368,14 @@ let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["deb
  *   them right before use. A mesh has 0 slots until its add is processed.
  * - Drags are optimistic: `move` shows the pose at once, `end` and `cancel`
  *   are synchronous here, and the pose is held until the Worker has the drag.
+ * - {@link WorkerScene.restart} replaces the Worker and replays the scene
+ *   into it (the way back from `INSTANCE_POISONED`); handles keep working.
  */
 export class WorkerScene implements SceneLike {
-  readonly #worker: WorkerLike;
+  /** Creates a Worker: the first, and one per `restart()`. */
+  readonly #make: () => WorkerLike;
+  /** The current Worker; only its messages are heard. */
+  #worker: WorkerLike;
   readonly #guard: ViewGuard | undefined;
   #rev = 0;
   #qid = 0;
@@ -375,12 +401,14 @@ export class WorkerScene implements SceneLike {
   readonly #inflight: Request[][] = [];
   /**
    * Requests that did not apply because the engine is poisoned (from a
-   * poisoned result, a Worker error, or failed here without being sent), for
-   * `restart()` to surface or replay. Only never-sent `addMesh` requests are
-   * replayable as they are: a sent one had its buffers transferred (they are
-   * detached here), so its mesh must be rebuilt from the mirrors instead.
-   * Capped at {@link FAILED_LOG_LIMIT} entries, oldest dropped
-   * (`#failedDropped` counts them).
+   * poisoned result, a Worker error, or failed here without being sent),
+   * until `restart()`, which clears it. They have surfaced already (statuses
+   * and rejected promises). Only never-sent `addMesh` requests are replayable
+   * as they are: a sent one had its buffers transferred (they are detached
+   * here). `restart()` finds those through each mesh's `add`, and rebuilds
+   * acknowledged meshes from the mirrors instead. Capped at
+   * {@link FAILED_LOG_LIMIT} entries, oldest dropped (`#failedDropped`
+   * counts them).
    */
   readonly #failed: Request[] = [];
   #failedDropped = 0;
@@ -399,27 +427,53 @@ export class WorkerScene implements SceneLike {
   #drag: DragState | undefined;
   #poison: FastMeshError | undefined;
   #terminated = false;
-  #ready!: { resolve(): void; reject(e: unknown): void; settled: boolean };
+  /** The current Worker's start. */
+  #ready!: Ready;
+  /** Batches whose result settles a promise: a restart's replay. */
+  readonly #batchDone = new Map<Request[], Pending>();
+  /** The restart under way, until its replay's result is applied. */
+  #restarting: Promise<void> | undefined;
   /** @internal Resolves when the Worker is ready. */
   readonly [STARTED]: Promise<void>;
 
   /** @internal Use {@link createWorkerScene}. */
-  constructor(token: typeof TOKEN, worker: WorkerLike, debug: boolean) {
+  constructor(token: typeof TOKEN, make: () => WorkerLike, debug: boolean) {
     if (token !== TOKEN) {
       throw new TypeError("use createWorkerScene() to create a WorkerScene");
     }
-    this.#worker = worker;
+    this.#make = make;
     this.#guard = debug ? new ViewGuard() : undefined;
-    this[STARTED] = new Promise<void>((resolve, reject) => {
-      this.#ready = { resolve, reject, settled: false };
+    this.#worker = this.#attach(make());
+    this[STARTED] = this.#ready.promise;
+  }
+
+  /**
+   * Listens to a new Worker. Only the current Worker is heard: a replaced
+   * one's late messages and errors are ignored.
+   */
+  #attach(worker: WorkerLike): WorkerLike {
+    let ready!: Pick<Ready, "resolve" | "reject">;
+    const promise = new Promise<void>((resolve, reject) => {
+      ready = { resolve, reject };
     });
-    worker.addEventListener("message", (e: { data: WorkerMessage }) => this.#receive(e.data));
+    // A restart's Worker failing to start is reported through its batches.
+    promise.catch(() => {});
+    this.#ready = { ...ready, promise, settled: false };
+    worker.addEventListener("message", (e: { data: WorkerMessage }) => {
+      if (worker === this.#worker) {
+        this.#receive(e.data);
+      }
+    });
     worker.addEventListener("error", (e: { message?: string }) => {
+      if (worker !== this.#worker) {
+        return;
+      }
       this.#poisonAll({
         code: "INSTANCE_POISONED",
         message: `the Worker failed${e?.message ? ` (${e.message})` : ""}; the Worker scene can no longer be used`,
       });
     });
+    return worker;
   }
 
   // ---- Plumbing ----
@@ -519,10 +573,12 @@ export class WorkerScene implements SceneLike {
     this.#worker.postMessage(batch, transfer);
   }
 
-  /** Marks requests failed with `error`: their statuses and promises. */
-  #fail(batch: Request[], error: FastMeshError): void {
+  /** Marks requests failed with `error`: their statuses and promises (logged for `restart()` when `log`). */
+  #fail(batch: Request[], error: FastMeshError, log = true): void {
     for (const req of batch) {
-      this.#logFailed(req);
+      if (log) {
+        this.#logFailed(req);
+      }
       const key = keyOf(req);
       if (key !== undefined && this.#latest.get(key) === req.rev) {
         this.#status.set(key, { status: "error", revision: req.rev, error });
@@ -574,6 +630,8 @@ export class WorkerScene implements SceneLike {
     }
     for (const batch of this.#inflight.splice(0)) {
       this.#fail(batch, e);
+      this.#batchDone.get(batch)?.reject(e);
+      this.#batchDone.delete(batch);
     }
     this.#releaseHolds();
     this.#statusChanged();
@@ -594,6 +652,15 @@ export class WorkerScene implements SceneLike {
     }
     const batch = this.#inflight.shift() ?? [];
     this.#apply(msg, batch);
+    const done = this.#batchDone.get(batch);
+    if (done !== undefined) {
+      this.#batchDone.delete(batch);
+      if (msg.poisoned) {
+        done.reject(this.#poison);
+      } else {
+        done.resolve(undefined);
+      }
+    }
   }
 
   /** Applies one batch's result: mirrors, change records, statuses, replies. */
@@ -699,12 +766,13 @@ export class WorkerScene implements SceneLike {
       return;
     }
     if (c.removed) {
-      st.positions = new Float32Array(0);
-      st.indices = new Uint32Array(0);
-      st.normals = null;
-      st.colors = null;
-      this.#guard?.bump();
+      st.live = false;
+      this.#clearMirrors(st);
     } else {
+      if (c.added) {
+        st.live = true;
+        st.add = undefined;
+      }
       for (const name of BUFFERS) {
         this.#applyBuffer(st, name, c);
       }
@@ -724,6 +792,14 @@ export class WorkerScene implements SceneLike {
     };
     const prev = this.#changes.get(st);
     this.#changes.set(st, prev === undefined ? record : merge(prev, record));
+  }
+
+  #clearMirrors(st: MeshState): void {
+    st.positions = new Float32Array(0);
+    st.indices = new Uint32Array(0);
+    st.normals = null;
+    st.colors = null;
+    this.#guard?.bump();
   }
 
   #applyBuffer(st: MeshState, name: BufferName, c: MeshChangeWire): void {
@@ -900,18 +976,23 @@ export class WorkerScene implements SceneLike {
       removed: false,
       gone: false,
       coloring: null,
+      live: false,
+      normalsOn: options.normals ?? true,
+      add: undefined,
+      addBytes: p.byteLength + i.byteLength,
     };
     this.#meshes.set(id, st);
     this.#byMesh.set(handle, st);
-    this.#push({
+    st.add = {
       kind: "addMesh",
       rev: ++this.#rev,
       id,
       positions: p.buffer as ArrayBuffer,
       f64: !(p instanceof Float32Array),
       indices: i.buffer as ArrayBuffer,
-      options: { origin, normals: options.normals ?? true },
-    });
+      options: { origin, normals: st.normalsOn },
+    };
+    this.#push(st.add);
     return handle;
   }
 
@@ -1116,12 +1197,20 @@ export class WorkerScene implements SceneLike {
   }
 
   /**
-   * An undo or redo is queued: requested placements no longer say where the
-   * meshes will be. The engine's pose is authoritative once it arrives.
+   * An undo or redo is queued: requested placements and the poses held for
+   * ended drags no longer say where the meshes will be. The engine's pose is
+   * shown (and a new drag starts from it) until the results arrive.
    */
   #forgetRequested(): void {
     for (const st of this.#meshes.values()) {
       st.requested = undefined;
+      if (st.local !== undefined && st.localUntil !== Number.POSITIVE_INFINITY) {
+        if (!samePose(st.local, st.pose)) {
+          this.#optimistic.add(st);
+        }
+        st.local = undefined;
+        st.localUntil = 0;
+      }
     }
   }
 
@@ -1472,14 +1561,239 @@ export class WorkerScene implements SceneLike {
   }
 
   /**
-   * Restarts the Worker and replays the scene from the mirrors. Not
-   * available yet: rejects with `INVALID_ARGUMENT`.
+   * Stops the Worker, starts a new one and replays the scene into it; this
+   * is how a scene recovers after `INSTANCE_POISONED`. Resolves once the
+   * replay's results are applied (reported by the next `commitFrame()`).
+   *
+   * The replay is built here, from what the main thread has:
+   * - every mesh the engine had, re-added from its mirrors: live triangles
+   *   only, compacted (slot ids change; handles do not), with its origin;
+   * - meshes whose add was never sent (still queued, or failed here after a
+   *   poisoning), from their own data;
+   * - placements: the engine's, or, when the scene was not poisoned, the
+   *   latest requested one (a `setPlacement` or drag not acknowledged yet);
+   * - fields, colourings and sections as last requested (removed ones are
+   *   not re-created).
+   *
+   * History is cleared (`canUndo`/`canRedo` are false). Every replayed key is
+   * `"computing"` until the replay's results arrive. What cannot be replayed
+   * surfaces as errors (`INSTANCE_POISONED`): requests sent to the old
+   * Worker and not answered yet (their promises reject), edits, repairs,
+   * undo/redo, drags and queries not sent yet, and meshes whose add was sent
+   * but never acknowledged (their buffers went to the old Worker: they stay
+   * failed, and calls on them give `UNKNOWN_MESH`). An active drag ends.
+   * Mirrors stay readable throughout. Calling it again before it settles
+   * returns the same promise.
    */
-  // TODO(Task 4): restart() must clear post-poison holds too: a drag started
-  // after poisoning keeps `local`/`localUntil` (and `requested` may be set)
-  // on its mesh; reset them, and `#drag`, before replaying.
   restart(): Promise<void> {
-    return Promise.reject(invalid("restart() is not implemented yet"));
+    if (this.#terminated) {
+      return Promise.reject(invalid("the Worker scene is terminated"));
+    }
+    if (this.#restarting !== undefined) {
+      return this.#restarting;
+    }
+    this.#restart();
+    // The replay goes now, not with the next frame: nothing else is queued.
+    this.#worker = this.#attach(this.#make());
+    this.#flush();
+    const sent = this.#inflight[this.#inflight.length - 1];
+    const done = new Promise<void>((resolve, reject) => {
+      this.#batchDone.set(sent, { resolve: () => resolve(), reject });
+    });
+    this.#restarting = done;
+    const clear = () => {
+      if (this.#restarting === done) {
+        this.#restarting = undefined;
+      }
+    };
+    done.then(clear, clear);
+    return done;
+  }
+
+  /** Retires the old Worker and queues the replay (the only thing queued). */
+  #restart(): void {
+    const poisoned = this.#poison !== undefined;
+    const old = this.#worker;
+    // Its late messages are ignored from here on (see #attach).
+    this.#worker = { postMessage() {}, addEventListener() {}, terminate() {} };
+    old.terminate();
+    if (this.#fallback !== undefined) {
+      clearTimeout(this.#fallback);
+      this.#fallback = undefined;
+    }
+    if (!this.#ready.settled) {
+      this.#ready.settled = true;
+      this.#ready.reject(invalid("the Worker was restarted"));
+    }
+
+    // Where each mesh will be: with no poisoning, the newest of a held drag
+    // pose and a requested placement; else the engine's. Then the holds go.
+    const poses = new Map<MeshState, Pose>();
+    for (const st of this.#meshes.values()) {
+      const intended =
+        st.requested !== undefined && (st.local === undefined || st.requestedUntil > st.localUntil)
+          ? st.requested
+          : (st.local ?? st.pose);
+      poses.set(st, poisoned ? st.pose : intended);
+    }
+    if (this.#drag !== undefined) {
+      this.#drag.active = false;
+      this.#drag = undefined;
+    }
+    for (const st of this.#meshes.values()) {
+      if (!samePose(this.#shown(st), poses.get(st) as Pose)) {
+        this.#optimistic.add(st);
+      }
+      st.local = undefined;
+      st.localUntil = 0;
+      st.requested = undefined;
+      st.requestedUntil = 0;
+    }
+
+    // What was sent or queued and is not replayed from state fails.
+    const lost = new FastMeshError("INSTANCE_POISONED", "the Worker was restarted before this request ran");
+    const pending = [...this.#inflight.splice(0).flat(), ...this.#queue];
+    this.#queue = [];
+    for (const req of pending) {
+      if (req.kind === "addMesh") {
+        continue; // Replayed below when its data is still here.
+      }
+      const removal =
+        req.kind === "removeMesh" ||
+        ((req.kind === "field" || req.kind === "section") && req.op === "remove");
+      const key = keyOf(req);
+      if (removal && key !== undefined && this.#latest.get(key) === req.rev) {
+        // Done anyway: the new engine never gets what was removed.
+        this.#status.set(key, { status: "ready", revision: req.rev });
+        continue;
+      }
+      this.#fail([req], lost, false);
+    }
+    for (const p of this.#replies.values()) {
+      p.reject(lost);
+    }
+    this.#replies.clear();
+    this.#poison = undefined;
+    this.#failed.length = 0;
+    this.#failedDropped = 0;
+    this.#history = { canUndo: false, canRedo: false };
+    this.#statusChanged();
+
+    // The replay, in dependency order: meshes, placements, fields,
+    // colourings, sections; then the history goes.
+    const replayed = new Set<ClientId>();
+    for (const st of this.#meshes.values()) {
+      if (st.removed) {
+        if (!st.gone) {
+          // Its removal never comes now: report it here (it is then pruned).
+          st.live = false;
+          st.add = undefined;
+          this.#clearMirrors(st);
+          this.#removedHere(st);
+        }
+        continue;
+      }
+      if (st.live) {
+        const { positions, indices } = liveGeometry(st);
+        this.#push({
+          kind: "addMesh",
+          rev: ++this.#rev,
+          id: st.id,
+          positions: positions.buffer as ArrayBuffer,
+          f64: true,
+          indices: indices.buffer as ArrayBuffer,
+          options: { origin: st.origin, normals: st.normalsOn },
+        });
+      } else if (st.add !== undefined && st.add.positions.byteLength + st.add.indices.byteLength === st.addBytes) {
+        // Never sent: its buffers are still here.
+        st.add = { ...st.add, rev: ++this.#rev };
+        this.#push(st.add);
+      } else {
+        const key = `mesh:${st.id}`;
+        if (st.add !== undefined && this.status(key).status !== "error") {
+          this.#status.set(key, { status: "error", revision: this.#latest.get(key) ?? 0, error: lost });
+        }
+        st.add = undefined;
+        continue;
+      }
+      replayed.add(st.id);
+    }
+    for (const st of this.#meshes.values()) {
+      const pose = poses.get(st) as Pose;
+      if (!replayed.has(st.id) || samePose(pose, poseOf(IDENTITY, [0, 0, 0], st.origin))) {
+        continue;
+      }
+      st.requested = pose;
+      st.requestedUntil = ++this.#rev;
+      if (!samePose(pose, st.pose)) {
+        // Held until the replay places it, so it does not flicker back.
+        st.local = pose;
+        st.localUntil = st.requestedUntil;
+      }
+      this.#push({
+        kind: "setPlacement",
+        rev: st.requestedUntil,
+        id: st.id,
+        rotation: pose.rotation,
+        translation: pose.translation,
+        key: `placement:${st.id}`,
+      });
+    }
+    const fields = new Set<ClientId>();
+    for (const f of this.#fields.values()) {
+      if (!f.removed && replayed.has(f.desc.on) && replayed.has(f.desc.to)) {
+        fields.add(f.id);
+        this.#push({ kind: "field", rev: ++this.#rev, field: f.id, op: "add", desc: f.desc });
+      }
+    }
+    for (const st of this.#meshes.values()) {
+      const rule = st.coloring;
+      if (rule === null || !replayed.has(st.id)) {
+        continue;
+      }
+      const f = this.#byField.get(rule.field);
+      if (f !== undefined && fields.has(f.id)) {
+        this.#push({
+          kind: "coloring",
+          rev: ++this.#rev,
+          id: st.id,
+          rule: { ...rule, field: f.id },
+          key: `display:${st.id}`,
+        });
+      }
+    }
+    for (const s of this.#sections.values()) {
+      if (s.removed) {
+        continue;
+      }
+      s.results.clear();
+      const desc: SectionDescWire = {
+        plane: s.plane,
+        meshes: s.meshes.filter((m) => replayed.has(m.id)).map((m) => m.id),
+        fill: s.fill,
+      };
+      this.#push({ kind: "section", rev: ++this.#rev, section: s.id, op: "add", desc });
+    }
+    this.#push({ kind: "clearHistory", rev: ++this.#rev });
+  }
+
+  /** Records a mesh's removal for the next `commitFrame()`, as a result would. */
+  #removedHere(st: MeshState): void {
+    const record: MeshChange = {
+      mesh: st.handle,
+      added: false,
+      removed: true,
+      placementChanged: false,
+      capacityChanged: false,
+      positions: [],
+      normals: [],
+      colors: [],
+      indices: [],
+      fieldsChanged: [],
+      sectionsChanged: [],
+    };
+    const prev = this.#changes.get(st);
+    this.#changes.set(st, prev === undefined ? record : merge(prev, record));
   }
 
   /**
@@ -1502,10 +1816,11 @@ export class WorkerScene implements SceneLike {
       this.#ready.settled = true;
       this.#ready.reject(error);
     }
-    for (const p of this.#replies.values()) {
+    for (const p of [...this.#replies.values(), ...this.#batchDone.values()]) {
       p.reject(error);
     }
     this.#replies.clear();
+    this.#batchDone.clear();
     this.#queue = [];
     this.#inflight.length = 0;
   }
@@ -1539,6 +1854,60 @@ function copyArray<T>(value: unknown, what: string, copy: (x: unknown) => T): T 
   } catch (e) {
     throw invalid(`${what} could not be read as numbers (${e instanceof Error ? e.message : String(e)})`);
   }
+}
+
+/**
+ * A mesh's live geometry from its mirrors, compacted: the live triangles (a
+ * removed one reads `0, 0, 0`) in slot order, over the vertices they use in
+ * slot order, as world positions before placement (local plus origin, in
+ * `f64`, so the engine gets the same `f32` local positions back).
+ */
+function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32Array } {
+  const idx = st.indices;
+  const p = st.positions;
+  const slots = p.length / 3;
+  const index = new Int32Array(slots).fill(-1);
+  let triangles = 0;
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = idx[t];
+    const b = idx[t + 1];
+    const c = idx[t + 2];
+    if ((a === 0 && b === 0 && c === 0) || a >= slots || b >= slots || c >= slots) {
+      continue;
+    }
+    index[a] = index[b] = index[c] = 0;
+    triangles++;
+  }
+  let vertices = 0;
+  for (let v = 0; v < slots; v++) {
+    if (index[v] === 0) {
+      index[v] = vertices++;
+    }
+  }
+  const positions = new Float64Array(3 * vertices);
+  const [ox, oy, oz] = st.origin;
+  for (let v = 0; v < slots; v++) {
+    const k = index[v];
+    if (k >= 0) {
+      positions[3 * k] = p[3 * v] + ox;
+      positions[3 * k + 1] = p[3 * v + 1] + oy;
+      positions[3 * k + 2] = p[3 * v + 2] + oz;
+    }
+  }
+  const indices = new Uint32Array(3 * triangles);
+  let at = 0;
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = idx[t];
+    const b = idx[t + 1];
+    const c = idx[t + 2];
+    if ((a === 0 && b === 0 && c === 0) || a >= slots || b >= slots || c >= slots) {
+      continue;
+    }
+    indices[at++] = index[a];
+    indices[at++] = index[b];
+    indices[at++] = index[c];
+  }
+  return { positions, indices };
 }
 
 /** Merges a later record into an earlier one of the same mesh. */

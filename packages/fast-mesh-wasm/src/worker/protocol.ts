@@ -82,7 +82,16 @@ export type Request =
       key?: string;
     }
   | { kind: "undo" | "redo"; rev: number; key?: string }
+  /** Drops every undo and redo step (the end of a `restart()` replay). */
+  | { kind: "clearHistory"; rev: number; key?: string }
   | { kind: "coloring"; rev: number; id: ClientId; rule: ColorRuleWire | null; key: string }
+  /**
+   * A field `add` may carry the key of the display it is built for (such as
+   * `display:<meshId>`). When the request with that key it feeds (the next
+   * queued last-wins one) is superseded before the build starts, the build is
+   * abandoned: no status is reported, and the field is built when a later
+   * request first needs it (a colouring, `fetchFieldValues`, `fieldStatus`).
+   */
   | { kind: "field"; rev: number; field: ClientId; op: "add" | "remove"; desc?: FieldDescWire; key?: string }
   | {
       kind: "section";
@@ -185,9 +194,12 @@ export interface ErrorWire {
   message: string;
 }
 
-/** What the engine posts after each processed batch. */
+/**
+ * What the engine posts after each processed batch: one per batch received,
+ * in order (a batch whose requests were all dropped still gets one).
+ */
 export interface Result {
-  /** The highest revision processed (or dropped as superseded). */
+  /** The highest revision of the batch processed (or dropped as superseded or abandoned). */
   rev: number;
   /** Change records, ranges applied in order; never drop them. */
   changes: MeshChangeWire[];
@@ -202,7 +214,7 @@ export interface Result {
   history: { canUndo: boolean; canRedo: boolean };
   /**
    * The outcome of every keyed request run in this batch, in order (a
-   * request dropped as superseded has none).
+   * request dropped as superseded, or an abandoned field build, has none).
    */
   status: { key: string; rev: number; status: "ready" | "error"; error?: ErrorWire }[];
   replies: { qid: number; ok: boolean; value?: unknown; error?: ErrorWire }[];
@@ -243,6 +255,7 @@ export function keyOf(req: Request): string | undefined {
       return `edit:${req.id}`;
     case "undo":
     case "redo":
+    case "clearHistory":
       return "history";
     case "field":
       return `field:${req.field}`;

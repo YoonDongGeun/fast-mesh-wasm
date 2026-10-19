@@ -1,9 +1,12 @@
 // The Worker-side engine: a sync `Scene` behind a keyed request queue. It maps
-// client ids to the scene's handles, runs requests in arrival order (dropping
-// superseded "last wins" ones), and after each batch posts one `Result` with
-// the frame's change records, the bytes of their dirty ranges, placements,
-// section results, statuses and replies. Pure: it talks only through `Port`,
-// so it runs in a browser Worker or in Node `worker_threads`.
+// client ids to the scene's handles, runs requests in arrival order in chunks
+// (a request, a field build, an operation of a repair list), yielding to the
+// message loop between chunks so newer batches arrive meanwhile: superseded
+// "last wins" requests are dropped and abandoned field builds deferred before
+// they start. After each batch it posts one `Result` with the frame's change
+// records, the bytes of their dirty ranges, placements, section results,
+// statuses and replies. Pure: it talks only through `Port`, so it runs in a
+// browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
 import {
@@ -21,6 +24,7 @@ import {
   type ClientId,
   type ColorRuleWire,
   type ErrorWire,
+  type FieldDescWire,
   isLastWins,
   keyOf,
   type MeshChangeWire,
@@ -45,6 +49,13 @@ export interface EngineOptions {
    * mesh's render buffers, placement and matrix, for comparing mirrors.
    */
   debug?: boolean;
+  /**
+   * Test-only: called after each chunk of work: every request run (`kind`
+   * is the request's), every field computed (`"fieldBuild"`, `id` is the
+   * field's client id) and every operation of a repair list run in steps
+   * (`"repairOp"`).
+   */
+  onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
 }
 
 /**
@@ -52,7 +63,7 @@ export interface EngineOptions {
  * must already be initialised.
  */
 export function runEngine(port: Port, options: EngineOptions = {}): void {
-  const engine = new Engine(port, options.debug ?? false);
+  const engine = new Engine(port, options);
   port.onMessage((batch) => engine.receive(batch));
 }
 
@@ -196,13 +207,45 @@ class Batch {
   }
 }
 
+/** Marks the end of a received batch in the queue: its result is posted there. */
+const END = Symbol("end of batch");
+type Item = Request | typeof END;
+
+/**
+ * Yields to the message loop, so batches sent meanwhile are received: a
+ * `MessageChannel` tick (nested timers are clamped to 4 ms in browsers),
+ * else `setTimeout(0)`.
+ */
+function messageTick(): () => Promise<void> {
+  if (typeof MessageChannel === "undefined") {
+    return () => new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const channel = new MessageChannel();
+  const waiting: (() => void)[] = [];
+  channel.port1.onmessage = () => waiting.shift()?.();
+  // Node: the port alone must not keep a process alive.
+  (channel.port1 as { unref?: () => void }).unref?.();
+  return () =>
+    new Promise((resolve) => {
+      waiting.push(resolve);
+      channel.port2.postMessage(null);
+    });
+}
+
 class Engine {
   readonly #port: Port;
   readonly #scene = new Scene();
-  readonly #queue: Request[] = [];
+  /** Requests received and not run yet, each batch followed by {@link END}. */
+  readonly #queue: Item[] = [];
+  /** A drain is under way (possibly waiting at a yield). */
+  #running = false;
+  /** What the batch being run collects for its result. */
+  #batch = new Batch();
   #poisoned = false;
   readonly #meshes = new Map<ClientId, MeshHandle>();
   readonly #fields = new Map<ClientId, FieldHandle>();
+  /** Fields whose build was abandoned: built when a request first needs them. */
+  readonly #deferred = new Map<ClientId, FieldDescWire>();
   readonly #sections = new Map<ClientId, SectionHandle>();
   /** Engine handles back to client ids, for change records and query results. */
   readonly #meshIds = new Map<MeshHandle, ClientId>();
@@ -224,10 +267,13 @@ class Engine {
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]> } | undefined;
   readonly #debug: boolean;
+  readonly #onChunk: EngineOptions["onChunk"];
+  readonly #tick = messageTick();
 
-  constructor(port: Port, debug: boolean) {
+  constructor(port: Port, options: EngineOptions) {
     this.#port = port;
-    this.#debug = debug;
+    this.#debug = options.debug ?? false;
+    this.#onChunk = options.onChunk;
   }
 
   receive(batch: Request[]): void {
@@ -235,65 +281,136 @@ class Engine {
       this.#postPoisoned(batch, new Batch());
       return;
     }
-    this.#queue.push(...batch);
-    this.#drain();
+    this.#queue.push(...batch, END);
+    if (!this.#running) {
+      void this.#drain();
+    }
   }
 
-  /** Whether a later queued request with the same key supersedes `req`. */
-  #superseded(req: Request, key: string | undefined): boolean {
+  /**
+   * Whether a later queued request (from index `from` on) with the same key
+   * supersedes the last-wins request `req`.
+   */
+  #superseded(req: Request, key: string | undefined, from = 0): boolean {
     if (key === undefined || !isLastWins(req)) {
       return false;
     }
-    for (const later of this.#queue) {
-      if (keyOf(later) === key) {
+    for (let k = from; k < this.#queue.length; k++) {
+      const later = this.#queue[k];
+      if (later !== END && keyOf(later) === key) {
         return supersedes(later, req);
       }
     }
     return false;
   }
 
-  #drain(): void {
-    const b = new Batch();
-    while (this.#queue.length > 0) {
-      const req = this.#queue.shift() as Request;
-      b.rev = Math.max(b.rev, req.rev);
-      const key = keyOf(req);
-      if (this.#superseded(req, key)) {
-        continue;
-      }
-      try {
-        this.#run(req, b);
-        b.ready(key, req.rev);
-      } catch (e) {
-        if (isPoison(e)) {
-          this.#poison(req, b);
+  /**
+   * Cooperative cancellation of a field build: a field `add` keyed like the
+   * display it is built for is abandoned when the request it feeds (the next
+   * queued last-wins request with that key) is already superseded. The field
+   * is then kept as deferred and built when first needed.
+   */
+  #abandoned(req: Request, key: string | undefined): boolean {
+    if (req.kind !== "field" || req.op !== "add" || key === undefined || req.desc === undefined) {
+      return false;
+    }
+    if (this.#fields.has(req.field) || this.#deferred.has(req.field)) {
+      // Run it: it fails as "already in use".
+      return false;
+    }
+    const at = this.#queue.findIndex((x) => x !== END && keyOf(x) === key && isLastWins(x));
+    if (at < 0 || !this.#superseded(this.#queue[at] as Request, key, at + 1)) {
+      return false;
+    }
+    this.#deferred.set(req.field, req.desc);
+    this.#fieldMeshes.set(req.field, [req.desc.on, req.desc.to]);
+    return true;
+  }
+
+  /**
+   * Runs the queue in arrival order, one chunk (a request, or one operation
+   * of a repair list) at a time, yielding to the message loop between
+   * chunks so that newer batches are received meanwhile: superseded "last
+   * wins" requests are then dropped before they start, and abandoned field
+   * builds are deferred. Each batch's result is posted when its last
+   * request is done, so results stay one per batch, in order.
+   */
+  async #drain(): Promise<void> {
+    this.#running = true;
+    try {
+      while (this.#queue.length > 0) {
+        const item = this.#queue.shift() as Item;
+        if (item === END) {
+          if (!this.#finish()) {
+            return;
+          }
+        } else if (!(await this.#step(item))) {
           return;
         }
-        const error = toWire(e);
-        b.error(key, req.rev, error);
-        const qid = (req as { qid?: number }).qid;
-        if (qid !== undefined) {
-          b.replies.push({ qid, ok: false, error });
+        if (this.#queue.length > 0 && this.#queue[0] !== END) {
+          await this.#tick();
         }
       }
+    } finally {
+      this.#running = false;
     }
+  }
+
+  /** Runs one request; `false` once the engine is poisoned. */
+  async #step(req: Request): Promise<boolean> {
+    const b = this.#batch;
+    b.rev = Math.max(b.rev, req.rev);
+    const key = keyOf(req);
+    if (this.#superseded(req, key) || this.#abandoned(req, key)) {
+      return true;
+    }
+    try {
+      if (req.kind === "repair" && this.#inSteps(req)) {
+        await this.#repairInSteps(req, b);
+      } else {
+        this.#run(req, b);
+      }
+      b.ready(key, req.rev);
+      this.#onChunk?.({ kind: req.kind, id: (req as { id?: ClientId }).id });
+    } catch (e) {
+      if (isPoison(e)) {
+        this.#poison(b, POISONED, req);
+        return false;
+      }
+      const error = toWire(e);
+      b.error(key, req.rev, error);
+      const qid = (req as { qid?: number }).qid;
+      if (qid !== undefined) {
+        b.replies.push({ qid, ok: false, error });
+      }
+    }
+    return true;
+  }
+
+  /** Posts the finished batch's result; `false` when packing failed (poisoned). */
+  #finish(): boolean {
+    const b = this.#batch;
+    this.#batch = new Batch();
     let result: Result;
     try {
       result = this.#result(b);
     } catch (e) {
       // Packing failed: the frame's changes are taken and lost, so the
       // mirrors can no longer follow. Stop like a trap.
-      this.#poison(undefined, b, isPoison(e) ? POISONED : packingFailed(e));
-      return;
+      this.#poison(b, isPoison(e) ? POISONED : packingFailed(e), undefined, true);
+      return false;
     }
     this.#port.post(result, b.transfer);
+    return true;
   }
 
   /**
-   * Stops the engine and posts the batch as failed: every status and reply
-   * already collected, `failed` and everything still queued get `error`.
+   * Stops the engine and posts the batches as failed. In `b`'s result every
+   * status and reply already collected, `failed` and the rest of its batch
+   * (none when `ended`: its end was reached) get `error`; every later batch
+   * already received gets a poisoned result of its own.
    */
-  #poison(failed: Request | undefined, b: Batch, error: ErrorWire = POISONED): void {
+  #poison(b: Batch, error: ErrorWire, failed?: Request, ended = false): void {
     this.#poisoned = true;
     const rest = this.#queue.splice(0);
     for (const st of b.status) {
@@ -306,7 +423,20 @@ class Engine {
       delete reply.value;
     }
     b.transfer.length = 0;
-    this.#postPoisoned(failed === undefined ? rest : [failed, ...rest], b, error);
+    let end = ended ? -1 : rest.indexOf(END);
+    if (end < 0 && !ended) {
+      end = rest.length;
+    }
+    const own = rest.slice(0, Math.max(end, 0)) as Request[];
+    this.#postPoisoned(failed === undefined ? own : [failed, ...own], b, error);
+    for (let start = end + 1; start < rest.length; ) {
+      let next = rest.indexOf(END, start);
+      if (next < 0) {
+        next = rest.length;
+      }
+      this.#postPoisoned(rest.slice(start, next) as Request[], new Batch(), error);
+      start = next + 1;
+    }
   }
 
   #postPoisoned(failed: Request[], b: Batch, error: ErrorWire = POISONED): void {
@@ -333,6 +463,46 @@ class Engine {
     );
   }
 
+  /**
+   * Whether a repair list runs one operation per chunk, inside a history
+   * step: one undo step, reverted when an operation fails, like the list
+   * call. Only where that is the same as the list call: more than one
+   * operation, no drag holding a step open, and no redo steps (the first
+   * recorded operation would drop them even if a later one fails).
+   */
+  #inSteps(req: Extract<Request, { kind: "edit" | "repair" }>): boolean {
+    return (
+      Array.isArray(req.payload) && req.payload.length > 1 && this.#drag === undefined && !this.#scene.canRedo()
+    );
+  }
+
+  async #repairInSteps(req: Extract<Request, { kind: "edit" | "repair" }>, b: Batch): Promise<void> {
+    const s = this.#scene;
+    const mesh = this.#mesh(req.id);
+    const ops = req.payload as RepairOp[];
+    const reports: unknown[] = [];
+    s.beginStep();
+    try {
+      for (let k = 0; k < ops.length; k++) {
+        if (k > 0) {
+          // Only receives: nothing else runs before this request is done.
+          await this.#tick();
+        }
+        reports.push(s.repair(mesh, ops[k]));
+        this.#onChunk?.({ kind: "repairOp", id: req.id });
+      }
+    } catch (e) {
+      if (!isPoison(e)) {
+        s.cancelStep();
+      }
+      throw e;
+    }
+    s.endStep();
+    if (req.qid !== undefined) {
+      b.replies.push({ qid: req.qid, ok: true, value: reports });
+    }
+  }
+
   // ---- Ids ----
 
   #mesh(id: ClientId): MeshHandle {
@@ -343,11 +513,38 @@ class Engine {
     return h;
   }
 
+  /** A field's handle; a deferred field is built first. */
   #field(id: ClientId): FieldHandle {
     const h = this.#fields.get(id);
-    if (h === undefined) {
+    if (h !== undefined) {
+      return h;
+    }
+    const desc = this.#deferred.get(id);
+    if (desc === undefined) {
       throw unknown("UNKNOWN_FIELD", id);
     }
+    return this.#buildField(id, desc);
+  }
+
+  /**
+   * Computes a field (one chunk). Built late, a field has the values it
+   * would have had (eager fields follow every edit and placement); only its
+   * errors (a taken name, say) surface late, on the request that needs it.
+   * A failed build forgets the field.
+   */
+  #buildField(id: ClientId, desc: FieldDescWire): FieldHandle {
+    this.#deferred.delete(id);
+    let h: FieldHandle;
+    try {
+      h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: this.#mesh(desc.to) });
+    } catch (e) {
+      this.#fieldMeshes.delete(id);
+      throw e;
+    }
+    this.#fields.set(id, h);
+    this.#fieldIds.set(h, id);
+    this.#fieldMeshes.set(id, [desc.on, desc.to]);
+    this.#onChunk?.({ kind: "fieldBuild", id });
     return h;
   }
 
@@ -444,6 +641,14 @@ class Engine {
       case "redo":
         s.redo();
         return;
+      case "clearHistory":
+        if (this.#drag !== undefined) {
+          // Closing the history ends the drag's step: end the drag first.
+          this.#drag.session.end();
+          this.#drag = undefined;
+        }
+        s.clearHistory();
+        return;
       case "coloring":
         s.setColoring(this.#mesh(req.id), req.rule === null ? null : this.#rule(req.rule));
         return;
@@ -513,17 +718,19 @@ class Engine {
 
   #runField(req: Extract<Request, { kind: "field" }>): void {
     if (req.op === "add") {
-      if (this.#fields.has(req.field)) {
+      if (this.#fields.has(req.field) || this.#deferred.has(req.field)) {
         throw invalid(`field client id ${req.field} is already in use`);
       }
       const desc = req.desc;
       if (desc === undefined) {
         throw invalid("adding a field needs a desc");
       }
-      const h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: this.#mesh(desc.to) });
-      this.#fields.set(req.field, h);
-      this.#fieldIds.set(h, req.field);
-      this.#fieldMeshes.set(req.field, [desc.on, desc.to]);
+      this.#buildField(req.field, desc);
+      return;
+    }
+    if (this.#deferred.has(req.field)) {
+      // Never built: nothing to remove from the scene.
+      this.#dropField(req.field);
       return;
     }
     this.#scene.removeField(this.#field(req.field));
@@ -537,6 +744,7 @@ class Engine {
       this.#removedFields.push(h);
     }
     this.#fields.delete(field);
+    this.#deferred.delete(field);
     this.#fieldMeshes.delete(field);
   }
 
