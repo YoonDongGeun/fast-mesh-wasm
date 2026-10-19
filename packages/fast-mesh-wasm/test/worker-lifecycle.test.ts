@@ -425,6 +425,13 @@ class NodeWorker implements WorkerLike {
     this.worker.postMessage(msg, transfer as never);
   }
 
+  /** Fires `error`, as a Worker that throws does. */
+  fail(): void {
+    for (const cb of this.#error) {
+      cb({ message: "boom" });
+    }
+  }
+
   /** Fires `messageerror`, as a message that cannot be deserialised does. */
   messageError(): void {
     for (const cb of this.#messageError) {
@@ -1173,6 +1180,43 @@ describe("WorkerScene restart", () => {
     const st = scene.status(key);
     (st as { status: string }).status = "error";
     expect(scene.status(key).status).toBe("ready");
+  });
+
+  it("late_results_after_a_worker_failure_are_ignored", async () => {
+    for (const how of ["messageerror", "error"] as const) {
+      const { scene, workers } = await start();
+      const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
+      await settle(scene);
+      scene.commitFrame();
+      const indices = scene.views(a).indices().slice();
+      // An edit and a placement whose results come after the failure.
+      workers[0].hold = true;
+      const edit = scene.edit(a, [{ op: "removeTriangles", triangles: [0, 1, 2] }]);
+      scene.setPlacement(a, { rotation: IDENTITY, translation: [3, 0, 0] });
+      scene.commitFrame();
+      await workers[0].waitHeld(1);
+      if (how === "messageerror") {
+        workers[0].messageError();
+      } else {
+        workers[0].fail();
+      }
+      expect(workers[0].terminated, how).toBe(true);
+      await expect(edit).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+      const key = `placement:${scene.idOf(a)}`;
+      expect(scene.status(key).status).toBe("error");
+      // The results still arrive: nothing of them applies.
+      workers[0].release();
+      scene.commitFrame();
+      expect(scene.status(key).status, how).toBe("error");
+      expect(scene.status(`edit:${scene.idOf(a)}`).status, how).toBe("error");
+      expect(Buffer.from(scene.views(a).indices().buffer).equals(Buffer.from(indices.buffer)), how).toBe(true);
+      expect(scene.placement(a).translation, how).toEqual([0, 0, 0]);
+      // A restart replays the acknowledged state, not the lost edit.
+      await scene.restart();
+      scene.commitFrame();
+      expect(scene.views(a).indices().length, how).toBe(indices.length);
+      expect(scene.placement(a).translation, how).toEqual([0, 0, 0]);
+    }
   });
 
   it("terminate_ends_drag_and_messageerror_poisons", async () => {

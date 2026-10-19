@@ -386,6 +386,9 @@ function coversOf(req: Request): string[] {
   }
 }
 
+/** A stand-in for a retired Worker: nothing sent to it goes anywhere. */
+const INERT: WorkerLike = { postMessage() {}, addEventListener() {}, terminate() {} };
+
 /** A Worker's start: settled by its `ready` or `fatal` message, or an error. */
 interface Ready {
   promise: Promise<void>;
@@ -537,6 +540,7 @@ export class WorkerScene implements SceneLike {
       if (worker !== this.#worker) {
         return;
       }
+      this.#detach();
       this.#poisonAll({
         code: "INSTANCE_POISONED",
         message: `the Worker failed${e?.message ? ` (${e.message})` : ""}; the Worker scene can no longer be used`,
@@ -548,12 +552,23 @@ export class WorkerScene implements SceneLike {
       if (worker !== this.#worker) {
         return;
       }
+      this.#detach();
       this.#poisonAll({
         code: "INSTANCE_POISONED",
         message: "a message from the Worker could not be read; the Worker scene can no longer be used",
       });
     });
     return worker;
+  }
+
+  /**
+   * Stops hearing the current Worker and terminates it: after an error its
+   * late results (for batches already failed here) must not apply.
+   */
+  #detach(): void {
+    const old = this.#worker;
+    this.#worker = INERT;
+    old.terminate();
   }
 
   // ---- Plumbing ----
@@ -1772,7 +1787,9 @@ export class WorkerScene implements SceneLike {
    * for it), which applies the newest value; after a poisoning, placements
    * replay the engine's pose. A colouring whose field cannot be replayed
    * (its mesh was lost) is dropped, with `UNKNOWN_FIELD` on its display key.
-   * Removals count as done (`"ready"`). When the replay fails as a whole
+   * Removals count as done: field and section removal keys read `"idle"`
+   * at once (their state is forgotten), mesh removal keys after the next
+   * `commitFrame()` delivers the removal. When the replay fails as a whole
    * (no Worker, it could not be posted, a trap), the scene is poisoned and
    * the next `restart()` replays the same intent and settles those keys.
    *
@@ -1880,7 +1897,7 @@ export class WorkerScene implements SceneLike {
     const poisoned = this.#poison !== undefined;
     const old = this.#worker;
     // Its late messages are ignored from here on (see #attach).
-    this.#worker = { postMessage() {}, addEventListener() {}, terminate() {} };
+    this.#worker = INERT;
     old.terminate();
     if (this.#fallback !== undefined) {
       clearTimeout(this.#fallback);
