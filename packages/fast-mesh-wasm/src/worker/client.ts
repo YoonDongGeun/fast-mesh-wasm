@@ -395,6 +395,8 @@ interface DragState {
 /** Set by `WorkerScene`'s static block: the test-only {@link debugDump}. */
 let debugSizesOf: (scene: WorkerScene) => Record<string, number>;
 let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["debugDump"]["value"]>;
+/** Set by `WorkerScene`'s static block: the internal {@link addFieldKeyed}. */
+let addFieldKeyedOf: (scene: WorkerScene, desc: DistanceFieldDesc, key: string) => FieldHandle;
 
 /**
  * A scene whose engine runs in a Worker, from {@link createWorkerScene}. It
@@ -1342,6 +1344,11 @@ export class WorkerScene implements SceneLike {
 
   /** Adds a signed distance field; see `Scene.addDistanceField`. */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
+    return this.#addField(desc, undefined);
+  }
+
+  /** A field add, under `key` when given (see {@link addFieldKeyed}). */
+  #addField(desc: DistanceFieldDesc, key: string | undefined): FieldHandle {
     this.#alive();
     const desc2: FieldDescWire = {
       name: desc.name,
@@ -1355,7 +1362,11 @@ export class WorkerScene implements SceneLike {
     const st: FieldState = { id, handle, desc: desc2, removed: false };
     this.#fields.set(id, st);
     this.#byField.set(handle, st);
-    this.#push({ kind: "field", rev: ++this.#rev, field: id, op: "add", desc: desc2 });
+    this.#push(
+      key === undefined
+        ? { kind: "field", rev: ++this.#rev, field: id, op: "add", desc: desc2 }
+        : { kind: "field", rev: ++this.#rev, field: id, op: "add", desc: desc2, key },
+    );
     return handle;
   }
 
@@ -2170,6 +2181,7 @@ export class WorkerScene implements SceneLike {
       const scene = new WorkerScene(make, debug);
       return [scene, scene.#ready.promise];
     };
+    addFieldKeyedOf = (scene, desc, key) => scene.#addField(desc, key);
     debugDumpOf = (scene, mesh) =>
       scene.#query(
         "debugDump",
@@ -2186,6 +2198,17 @@ export class WorkerScene implements SceneLike {
  */
 export function debugDump(scene: WorkerScene, mesh: MeshHandle): Promise<QueryMap["debugDump"]["value"]> {
   return debugDumpOf(scene, mesh);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: adds a distance field
+ * under `key`, the key of the display it is built for (`display:<meshId>`),
+ * so the engine abandons the build when the colouring it feeds is superseded
+ * before the build starts (the field is then built when first needed). Its
+ * status is reported under `key`. Used by the store (`fast-mesh-wasm/store`).
+ */
+export function addFieldKeyed(scene: WorkerScene, desc: DistanceFieldDesc, key: string): FieldHandle {
+  return addFieldKeyedOf(scene, desc, key);
 }
 
 /** Test-only, not exported from `fast-mesh-wasm/worker`: the sizes of the scene's internal maps. */

@@ -20,7 +20,7 @@ import type {
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import type { Indices, PlacementInput, Positions64 } from "../api.js";
-import type { KeyStatus, WorkerScene } from "../worker/client.js";
+import { addFieldKeyed, type KeyStatus, type WorkerScene } from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
 export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals">;
@@ -44,7 +44,12 @@ export interface Host {
   onStatus(listener: () => void): () => void;
   /** The id of a handle as used in status keys. */
   idOf(handle: MeshHandle | FieldHandle | SectionHandle): number;
-  addField(desc: DistanceFieldDesc): FieldHandle;
+  /**
+   * Adds a distance field. On the Worker host, `key` (the `display:<id>` key
+   * of the colouring it is built for) lets the engine abandon the build when
+   * that colouring is superseded first; the add's status is then under `key`.
+   */
+  addField(desc: DistanceFieldDesc, key?: string): FieldHandle;
   removeField(field: FieldHandle): void;
   setColoring(mesh: MeshHandle, rule: ColorRule | null): void;
   addSection(desc: SectionDesc): SectionHandle;
@@ -53,6 +58,12 @@ export interface Host {
   setSectionFill(section: SectionHandle, fill: boolean): void;
   removeSection(section: SectionHandle): void;
   restart(): Promise<void>;
+  /**
+   * Runs `fn` (a call the store makes for a key, such as a colouring's)
+   * under `key`: an exception sets the key's status to `"error"`, and is
+   * rethrown, until a later call under the key succeeds.
+   */
+  track<T>(key: string, fn: () => T): T;
 }
 
 /** Whether `scene` is a Worker scene (structurally: it reports key statuses). */
@@ -65,22 +76,35 @@ export function hostOf(scene: Scene | WorkerScene): Host {
   return isWorkerScene(scene) ? workerHost(scene) : localHost(scene);
 }
 
-/**
- * The synchronous scene. Calls apply at once, so every key is `"ready"`,
- * except one whose latest call made through {@link LocalHost.track} threw:
- * that key is `"error"` until a call under it succeeds. Nothing is ever
- * pending, so `onStatus` never fires.
- */
-export interface LocalHost extends Host {
-  readonly mode: "local";
-  /** Runs `fn` under `key`: an exception sets the key's status to `"error"` (and is rethrown). */
-  track<T>(key: string, fn: () => T): T;
+/** The errors of calls made under a key that threw at once (see `Host.track`), by key. */
+function tracker() {
+  const errors = new Map<string, FastMeshError>();
+  const track = <T>(key: string, fn: () => T): T => {
+    try {
+      const out = fn();
+      errors.delete(key);
+      return out;
+    } catch (e) {
+      errors.set(
+        key,
+        e instanceof FastMeshError ? e : new FastMeshError("INVALID_ARGUMENT", e instanceof Error ? e.message : String(e)),
+      );
+      throw e;
+    }
+  };
+  return { errors, track };
 }
 
-export function localHost(scene: Scene): LocalHost {
+/**
+ * The synchronous scene. Calls apply at once, so every key is `"ready"`,
+ * except one whose latest call made through `track` threw: that key is
+ * `"error"` until a call under it succeeds. Nothing is ever pending, so
+ * `onStatus` never fires.
+ */
+export function localHost(scene: Scene): Host {
   const ids = new WeakMap<object, number>();
   let next = 0;
-  const errors = new Map<string, FastMeshError>();
+  const { errors, track } = tracker();
   let rev = 0;
   const promised = <T>(fn: () => T): Promise<T> => new Promise<T>((resolve) => resolve(fn()));
   return {
@@ -115,17 +139,7 @@ export function localHost(scene: Scene): LocalHost {
     },
     track: (key, fn) => {
       rev++;
-      try {
-        const out = fn();
-        errors.delete(key);
-        return out;
-      } catch (e) {
-        errors.set(
-          key,
-          e instanceof FastMeshError ? e : new FastMeshError("INVALID_ARGUMENT", e instanceof Error ? e.message : String(e)),
-        );
-        throw e;
-      }
+      return track(key, fn);
     },
     addField: (desc) => scene.addDistanceField(desc),
     removeField: (field) => scene.removeField(field),
@@ -139,8 +153,13 @@ export function localHost(scene: Scene): LocalHost {
   };
 }
 
-/** The Worker scene: statuses, ids and history come from it as they are. */
+/**
+ * The Worker scene: statuses, ids and history come from it as they are,
+ * except a key whose latest call made through `track` threw here, before any
+ * request went out: that key is `"error"` until a call under it succeeds.
+ */
 export function workerHost(scene: WorkerScene): Host {
+  const { errors, track } = tracker();
   return {
     mode: "worker",
     scene,
@@ -154,10 +173,14 @@ export function workerHost(scene: WorkerScene): Host {
     redo: () => scene.redo(),
     canUndo: () => scene.canUndo,
     canRedo: () => scene.canRedo,
-    status: (key) => scene.status(key),
+    status: (key) => {
+      const error = errors.get(key);
+      const s = scene.status(key);
+      return error === undefined ? s : { status: "error", revision: s.revision, error };
+    },
     onStatus: (listener) => scene.onStatus(listener),
     idOf: (handle) => scene.idOf(handle),
-    addField: (desc) => scene.addDistanceField(desc),
+    addField: (desc, key) => (key === undefined ? scene.addDistanceField(desc) : addFieldKeyed(scene, desc, key)),
     removeField: (field) => scene.removeField(field),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
     addSection: (desc) => scene.addSection(desc),
@@ -166,5 +189,6 @@ export function workerHost(scene: WorkerScene): Host {
     setSectionFill: (section, fill) => scene.setSectionFill(section, fill),
     removeSection: (section) => scene.removeSection(section),
     restart: () => scene.restart(),
+    track,
   };
 }

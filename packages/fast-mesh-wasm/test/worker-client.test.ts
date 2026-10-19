@@ -820,9 +820,17 @@ describe("WorkerScene", () => {
     expect(entry).toContain("web.js");
     expect(entry.filter((f) => /three|react/.test(f))).toEqual([]);
     expect([...graph("worker.js")].filter((f) => /three|react|worker-engine/.test(f))).toEqual([]);
-    expect(readFileSync(new URL("worker.js", dist), "utf8")).toContain(
-      'new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })',
-    );
+    // In worker.js or a chunk it imports (the client is shared with
+    // fast-mesh-wasm/store); chunks sit next to worker-entry.js in dist/, so
+    // the relative URL resolves the same.
+    const workerFiles = [...graph("worker.js")].filter((f) => f.endsWith(".js") && !f.includes("/"));
+    expect(
+      workerFiles.some((f) =>
+        readFileSync(new URL(f, dist), "utf8").includes(
+          'new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })',
+        ),
+      ),
+    ).toBe(true);
     // publint and attw.
     execSync("pnpm run check", { cwd: new URL("..", import.meta.url), stdio: "pipe" });
   }, 120_000);
