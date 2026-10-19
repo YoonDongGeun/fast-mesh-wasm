@@ -28,6 +28,7 @@ import {
   type Request,
   type Result,
   supersedes,
+  type WorkerMessage,
 } from "./protocol.js";
 
 /** The engine's side of the message channel. */
@@ -37,13 +38,75 @@ export interface Port {
   onMessage(cb: (batch: Request[]) => void): void;
 }
 
+/** Options of {@link runEngine}. */
+export interface EngineOptions {
+  /**
+   * Test-only: answers the `debugDump` query (`{ mesh }`) with copies of the
+   * mesh's render buffers, placement and matrix, for comparing mirrors.
+   */
+  debug?: boolean;
+}
+
 /**
  * Runs the engine on `port` until the instance traps. The WebAssembly module
  * must already be initialised.
  */
-export function runEngine(port: Port): void {
-  const engine = new Engine(port);
+export function runEngine(port: Port, options: EngineOptions = {}): void {
+  const engine = new Engine(port, options.debug ?? false);
   port.onMessage((batch) => engine.receive(batch));
+}
+
+/** A Worker's side of its channel: raw messages in, messages out. */
+export interface Endpoint {
+  post(msg: WorkerMessage, transfer: Transferable[]): void;
+  /** `cb` gets each message's data, in order. */
+  onMessage(cb: (data: unknown) => void): void;
+}
+
+/**
+ * Serves the engine on a Worker's endpoint once `ready` (the WebAssembly
+ * module's initialisation) resolves. Batches arriving before are kept and
+ * run in order; then `{ kind: "ready" }` is posted first. When `ready`
+ * rejects, `{ kind: "fatal" }` is posted instead and nothing runs.
+ */
+export function serveEngine(endpoint: Endpoint, ready: Promise<unknown>, options: EngineOptions = {}): void {
+  let deliver: ((batch: Request[]) => void) | undefined;
+  const early: Request[][] = [];
+  // Listen right away: messages sent while the module loads are not lost.
+  endpoint.onMessage((data) => {
+    if (deliver === undefined) {
+      early.push(data as Request[]);
+    } else {
+      deliver(data as Request[]);
+    }
+  });
+  ready.then(
+    () => {
+      endpoint.post({ kind: "ready" }, []);
+      runEngine(
+        {
+          post: (msg, transfer) => endpoint.post(msg, transfer),
+          onMessage: (cb) => {
+            deliver = cb;
+            for (const batch of early.splice(0)) {
+              cb(batch);
+            }
+          },
+        },
+        options,
+      );
+    },
+    (e: unknown) => {
+      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      endpoint.post(
+        {
+          kind: "fatal",
+          error: { code: "INSTANCE_POISONED", message: `the Worker could not load fast-mesh (${cause})` },
+        },
+        [],
+      );
+    },
+  );
 }
 
 function unknown(code: "UNKNOWN_MESH" | "UNKNOWN_FIELD" | "UNKNOWN_SECTION", id: ClientId): FastMeshError {
@@ -160,9 +223,11 @@ class Engine {
   readonly #goneEntries: { section: ClientId; mesh: ClientId }[] = [];
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]> } | undefined;
+  readonly #debug: boolean;
 
-  constructor(port: Port) {
+  constructor(port: Port, debug: boolean) {
     this.#port = port;
+    this.#debug = debug;
   }
 
   receive(batch: Request[]): void {
@@ -562,6 +627,21 @@ class Engine {
       case "sectionGap": {
         const a = args as QueryMap["sectionGap"]["args"];
         return s.sectionGap(this.#section(a.section), this.#mesh(a.a), this.#mesh(a.b));
+      }
+      case "debugDump": {
+        if (!this.#debug) {
+          throw invalid(`unknown query ${name}`);
+        }
+        const h = this.#mesh((args as { mesh: ClientId }).mesh);
+        const v = s.views(h);
+        return {
+          positions: v.positions().slice(),
+          normals: v.normals()?.slice() ?? null,
+          colors: v.colors()?.slice() ?? null,
+          indices: v.indices().slice(),
+          placement: s.placement(h),
+          matrix4: Array.from(s.matrix4(h)),
+        };
       }
       default:
         throw invalid(`unknown query ${name}`);

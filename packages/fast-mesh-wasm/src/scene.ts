@@ -965,7 +965,11 @@ function quatToMat3(q: Quat): number[] {
   ];
 }
 
-function rotationMatrix(rotation: Mat3 | Quat): number[] {
+/**
+ * A placement rotation as 9 numbers, row-major (a quaternion converted in
+ * f64). Internal: shared with the Worker client, not part of the public API.
+ */
+export function rotationMatrix(rotation: Mat3 | Quat): number[] {
   if (rotation.length === 4) {
     return quatToMat3(rotation as Quat);
   }

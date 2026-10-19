@@ -127,6 +127,18 @@ export interface QueryMap {
     args: { section: ClientId; a: ClientId; b: ClientId };
     value: { distance: number; a: Vec3; b: Vec3 } | null;
   };
+  /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
+  debugDump: {
+    args: { mesh: ClientId };
+    value: {
+      positions: Float32Array;
+      normals: Float32Array | null;
+      colors: Uint8Array | null;
+      indices: Uint32Array;
+      placement: { rotation: number[]; translation: Vec3 };
+      matrix4: number[];
+    };
+  };
 }
 
 /** `EditOp[]`, the `payload` of an `edit` request. */
@@ -203,6 +215,12 @@ export interface Result {
    */
   poisoned?: boolean;
 }
+
+/**
+ * What a Worker posts: a {@link Result} per batch, after `{ kind: "ready" }`
+ * once the engine runs, or `{ kind: "fatal" }` when it could not start.
+ */
+export type WorkerMessage = Result | { kind: "ready" } | { kind: "fatal"; error: ErrorWire };
 
 /**
  * The key of a request: its own `key`, or a default naming what it targets

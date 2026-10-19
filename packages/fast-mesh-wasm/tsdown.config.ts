@@ -5,8 +5,13 @@ export default defineConfig({
     web: "src/web.ts",
     node: "src/node.ts",
     three: "src/three/index.ts",
-    // Internal (not in `exports`): the Worker-side engine, for the browser
-    // Worker script and the Node `worker_threads` test harness.
+    // `fast-mesh-wasm/worker` (main thread) and the browser Worker script it
+    // loads by URL (`new URL("./worker-entry.js", import.meta.url)`), which
+    // must stay a file next to it. Both import the wasm glue in dist/wasm.
+    worker: "src/worker/index.ts",
+    "worker-entry": "src/worker/entry.ts",
+    // Internal (not in `exports`): the Worker-side engine, for the Node
+    // `worker_threads` test harness.
     "worker-engine": "src/worker/engine.ts",
   },
   format: "esm",

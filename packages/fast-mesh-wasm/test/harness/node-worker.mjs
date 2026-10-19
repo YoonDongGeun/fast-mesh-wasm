@@ -6,11 +6,13 @@
 // workerData `{ testPanic: true }` makes the `analyze` binding trap through
 // `__test_panic` (the test build of the wasm only), to exercise poisoning;
 // `{ packThrow: true }` makes `can_undo` (read while packing a result) throw
-// a plain error.
+// a plain error. `{ serve: true }` runs it as the browser Worker script does
+// (`serveEngine`: a `ready` message first) with the test-only `debugDump`
+// query, for `WorkerScene` through its `createWorker` option.
 import { parentPort, workerData } from "node:worker_threads";
 import "../../dist/node.js";
 import * as raw from "../../dist/wasm/fast_mesh_wasm.js";
-import { runEngine } from "../../dist/worker-engine.js";
+import { runEngine, serveEngine } from "../../dist/worker-engine.js";
 
 if (workerData?.testPanic) {
   raw.WasmScene.prototype.analyze = () => raw.__test_panic();
@@ -21,7 +23,12 @@ if (workerData?.packThrow) {
   };
 }
 
-runEngine({
+const port = {
   post: (msg, transfer) => parentPort.postMessage(msg, transfer),
   onMessage: (cb) => parentPort.on("message", cb),
-});
+};
+if (workerData?.serve) {
+  serveEngine(port, Promise.resolve(), { debug: true });
+} else {
+  runEngine(port);
+}

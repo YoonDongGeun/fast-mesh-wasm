@@ -23,7 +23,8 @@
   "author": "DongGeun Yoon",
   "type": "module",
   "sideEffects": [
-    "./dist/node.js"
+    "./dist/node.js",
+    "./dist/worker-entry.js"
   ],
   "exports": {
     ".": {
@@ -39,6 +40,10 @@
     "./three": {
       "types": "./dist/three.d.ts",
       "default": "./dist/three.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "default": "./dist/worker.js"
     },
     "./package.json": "./package.json"
   },
