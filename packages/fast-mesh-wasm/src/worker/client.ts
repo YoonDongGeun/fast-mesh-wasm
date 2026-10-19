@@ -338,7 +338,7 @@ let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["deb
  *   in call order, and "last wins" changes (colouring, section
  *   plane/meshes/fill, drag moves) superseded within the batch are dropped.
  *   Calls returning a promise wait for the next `commitFrame()` too, or are
- *   sent on their own after {@link FALLBACK_FLUSH_MS} when no frame comes;
+ *   sent on their own after 100 ms when no frame comes;
  *   before the first `commitFrame()` (no frame loop) they are sent on the
  *   next microtask.
  * - `views`, `placement`, `matrix4`, `section` and `sectionPlane` read
@@ -538,8 +538,10 @@ export class WorkerScene implements SceneLike {
   #logFailed(req: Request): void {
     this.#failed.push(req);
     if (this.#failed.length > FAILED_LOG_LIMIT) {
-      this.#failed.shift();
-      this.#failedDropped++;
+      // Drop the oldest half at once: amortised O(1) per request.
+      const drop = this.#failed.length - FAILED_LOG_LIMIT / 2;
+      this.#failed.splice(0, drop);
+      this.#failedDropped += drop;
     }
   }
 
@@ -999,8 +1001,12 @@ export class WorkerScene implements SceneLike {
     if (this.#drag?.active) {
       throw invalid("a drag is already active; end or cancel it first");
     }
-    // From where the mesh will be: a queued or in-flight setPlacement counts.
-    const start = st.local ?? st.requested ?? st.pose;
+    // From where the mesh will be: the newest of a held drag pose and a
+    // queued or in-flight setPlacement, by revision; else the engine's pose.
+    const start =
+      st.requested !== undefined && (st.local === undefined || st.requestedUntil > st.localUntil)
+        ? st.requested
+        : (st.local ?? st.pose);
     const key = `placement:${st.id}`;
     this.#push({ kind: "drag", rev: ++this.#rev, id: st.id, phase: "begin", key });
     // Hold the pose from now on: older placement results do not snap it back.
@@ -1097,6 +1103,7 @@ export class WorkerScene implements SceneLike {
   undo(): void {
     this.#alive();
     this.#drag?.end();
+    this.#forgetRequested();
     this.#push({ kind: "undo", rev: ++this.#rev });
   }
 
@@ -1104,7 +1111,18 @@ export class WorkerScene implements SceneLike {
   redo(): void {
     this.#alive();
     this.#drag?.end();
+    this.#forgetRequested();
     this.#push({ kind: "redo", rev: ++this.#rev });
+  }
+
+  /**
+   * An undo or redo is queued: requested placements no longer say where the
+   * meshes will be. The engine's pose is authoritative once it arrives.
+   */
+  #forgetRequested(): void {
+    for (const st of this.#meshes.values()) {
+      st.requested = undefined;
+    }
   }
 
   /** Whether there is a step to undo, as of the latest result. */
@@ -1457,6 +1475,9 @@ export class WorkerScene implements SceneLike {
    * Restarts the Worker and replays the scene from the mirrors. Not
    * available yet: rejects with `INVALID_ARGUMENT`.
    */
+  // TODO(Task 4): restart() must clear post-poison holds too: a drag started
+  // after poisoning keeps `local`/`localUntil` (and `requested` may be set)
+  // on its mesh; reset them, and `#drag`, before replaying.
   restart(): Promise<void> {
     return Promise.reject(invalid("restart() is not implemented yet"));
   }
@@ -1470,6 +1491,10 @@ export class WorkerScene implements SceneLike {
       return;
     }
     this.#terminated = true;
+    if (this.#fallback !== undefined) {
+      clearTimeout(this.#fallback);
+      this.#fallback = undefined;
+    }
     this.#drag = undefined;
     this.#worker.terminate();
     const error = invalid("the Worker scene is terminated");
@@ -1562,9 +1587,14 @@ function checkPlane(plane: SectionPlane): SectionPlane {
   return { origin, normal };
 }
 
-/** A checked plane with its normal normalised. */
+/**
+ * A checked plane with its normal normalised. Scaled by its largest
+ * component first, so a huge finite normal (whose length overflows) or a
+ * tiny one (whose length underflows) still normalises.
+ */
 function normalised(plane: SectionPlane): SectionPlane {
-  const n = plane.normal;
+  const m = Math.max(Math.abs(plane.normal[0]), Math.abs(plane.normal[1]), Math.abs(plane.normal[2]));
+  const n = [plane.normal[0] / m, plane.normal[1] / m, plane.normal[2] / m];
   const len = Math.hypot(n[0], n[1], n[2]);
   return { origin: plane.origin, normal: [n[0] / len, n[1] / len, n[2] / len] };
 }

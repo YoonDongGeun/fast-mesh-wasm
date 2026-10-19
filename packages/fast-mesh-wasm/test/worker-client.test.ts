@@ -732,6 +732,59 @@ describe("WorkerScene", () => {
     vi.unstubAllGlobals();
   });
 
+  it("drag_start_prefers_newest_pose", async () => {
+    const { scene } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    const at = (x: number) => ({ rotation: IDENTITY, translation: [x, 0, 0] as Vec3 });
+
+    // A drag's held pose, then a newer setPlacement: the next drag starts from it.
+    const d1 = scene.drag(a);
+    d1.move(at(1));
+    d1.end();
+    scene.setPlacement(a, at(7));
+    const d2 = scene.drag(a);
+    expect(scene.placement(a).translation).toEqual([7, 0, 0]);
+    d2.move(at(9));
+    d2.cancel();
+    expect(scene.placement(a).translation).toEqual([7, 0, 0]);
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.placement(a).translation).toEqual([7, 0, 0]);
+    await expectMirrored(scene, a);
+
+    // An undo queued after a setPlacement makes it stale: the drag starts
+    // from the engine's pose, which the undo leaves where it was.
+    scene.setPlacement(b, at(3));
+    await settle(scene);
+    scene.setPlacement(b, at(5));
+    scene.undo();
+    const d3 = scene.drag(b);
+    expect(scene.placement(b).translation).toEqual([3, 0, 0]);
+    d3.move(at(4));
+    d3.cancel();
+    expect(scene.placement(b).translation).toEqual([3, 0, 0]);
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.placement(b).translation).toEqual([3, 0, 0]);
+    await expectMirrored(scene, b);
+
+    // A huge finite normal still normalises.
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1e308] }, meshes: [a] });
+    scene.setSectionPlane(section, { origin: [0, 0, 0], normal: [1e308, 1e308, 0] });
+    const n = scene.sectionPlane(section).normal;
+    expect(n[0]).toBeCloseTo(Math.SQRT1_2, 12);
+    expect(n[1]).toBeCloseTo(Math.SQRT1_2, 12);
+    expect(n[2]).toBe(0);
+
+    // terminate() clears the fallback timer: no flush after it.
+    const pending = scene.raycast([0, 0, 0], [1, 0, 0]);
+    scene.terminate();
+    await expect(pending).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
   it("package_worker_export_resolves", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("worker.js", dist))).toBe(true);
