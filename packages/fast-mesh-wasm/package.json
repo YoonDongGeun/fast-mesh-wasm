@@ -53,6 +53,10 @@
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
     },
+    "./r3f": {
+      "types": "./dist/r3f.d.ts",
+      "default": "./dist/r3f.js"
+    },
     "./package.json": "./package.json"
   },
   "types": "./dist/web.d.ts",
@@ -70,10 +74,14 @@
     "check": "publint --strict && attw --pack . --profile esm-only"
   },
   "peerDependencies": {
+    "@react-three/fiber": ">=8",
     "react": ">=18",
     "three": ">=0.160"
   },
   "peerDependenciesMeta": {
+    "@react-three/fiber": {
+      "optional": true
+    },
     "react": {
       "optional": true
     },
@@ -83,6 +91,8 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
+    "@react-three/fiber": "^9.8.2",
+    "@react-three/test-renderer": "^9.1.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.20.5",
     "@types/react": "^19.3.0",

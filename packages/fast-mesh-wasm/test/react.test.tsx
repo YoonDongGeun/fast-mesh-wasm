@@ -559,7 +559,9 @@ describe("fast-mesh-wasm/react", () => {
     expect(files.filter((f) => f !== "react.js" && f.endsWith(".js") && store.has(f)).length).toBeGreaterThan(0);
     for (const f of files.filter((f) => f.endsWith(".js"))) {
       expect(readFileSync(new NodeURL(f, dist), "utf8"), f).not.toMatch(/\bimport\(/);
-      if (f !== "react.js") {
+      // The hooks may sit in a chunk shared with `./r3f` (one context), but
+      // the store's code never imports React.
+      if (store.has(f)) {
         expect(readFileSync(new NodeURL(f, dist), "utf8"), f).not.toMatch(/from\s*["']react["']/);
       }
     }

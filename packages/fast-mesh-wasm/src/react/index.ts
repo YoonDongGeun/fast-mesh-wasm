@@ -5,7 +5,6 @@
 // (SSR) renders `EMPTY_SNAPSHOT`. Free of three.js and the WebAssembly glue;
 // written without JSX, so the library needs no JSX transform.
 import {
-  createContext,
   createElement,
   type ReactElement,
   type ReactNode,
@@ -27,8 +26,7 @@ import {
   sectionState,
 } from "../store/snapshot.js";
 import type { SceneStore } from "../store/store.js";
-
-const StoreContext = createContext<SceneStore | null>(null);
+import { StoreContext } from "./context.js";
 
 /** Provides `store` to the hooks below it. */
 export function SceneProvider(props: { store: SceneStore; children?: ReactNode }): ReactElement {

@@ -14,6 +14,8 @@ export default defineConfig({
     store: "src/store/index.ts",
     // `fast-mesh-wasm/react`: hooks over the store; React is a peer.
     react: "src/react/index.ts",
+    // `fast-mesh-wasm/r3f`: `<FastMesh>` and the frame driver; R3F is a peer.
+    r3f: "src/r3f/index.ts",
     // Internal (not in `exports`): the Worker-side engine, for the Node
     // `worker_threads` test harness.
     "worker-engine": "src/worker/engine.ts",
@@ -24,8 +26,8 @@ export default defineConfig({
   deps: {
     // Keep the wasm-bindgen glue as a separate file so its `new URL(..., import.meta.url)`
     // keeps pointing at the .wasm next to it. It is copied into dist/wasm below.
-    // `three` and `react` are optional peers: imported, never inlined.
-    neverBundle: [/fast_mesh_wasm\.js$/, /^node:/, /^three($|\/)/, /^react($|\/)/],
+    // `three`, `react` and `@react-three/fiber` are optional peers: imported, never inlined.
+    neverBundle: [/fast_mesh_wasm\.js$/, /^node:/, /^three($|\/)/, /^react($|\/)/, /^@react-three\/fiber($|\/)/],
   },
   copy: [{ from: "src/wasm", to: "dist" }],
 });

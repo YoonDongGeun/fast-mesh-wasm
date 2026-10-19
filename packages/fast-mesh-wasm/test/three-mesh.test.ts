@@ -519,9 +519,24 @@ describe("packaging", () => {
   it("core_entry_does_not_import_three", () => {
     const dist = new URL("../dist/", import.meta.url);
     const imports = /from\s*["']three["']|import\s*["']three["']/;
-    // The core entries and every chunk but the three entry's.
-    const core = readdirSync(dist).filter((f) => f.endsWith(".js") && f !== "three.js");
-    expect(core).toEqual(expect.arrayContaining(["web.js", "node.js"]));
+    // Every entry but the three.js-based ones (`./three`, `./r3f`), and every
+    // chunk they import, transitively.
+    const entries = readdirSync(dist).filter((f) => f.endsWith(".js") && !/-[\w-]{8}\.js$/.test(f));
+    expect(entries).toEqual(expect.arrayContaining(["web.js", "node.js", "three.js", "r3f.js"]));
+    const core = new Set<string>();
+    const visit = (file: string) => {
+      if (core.has(file)) {
+        return;
+      }
+      core.add(file);
+      for (const m of readFileSync(new URL(file, dist), "utf8").matchAll(/from\s*["']\.\/([^"']+)["']/g)) {
+        visit(m[1]);
+      }
+    };
+    for (const entry of entries.filter((f) => f !== "three.js" && f !== "r3f.js")) {
+      visit(entry);
+    }
+    expect([...core]).toEqual(expect.arrayContaining(["web.js", "node.js", "store.js", "react.js"]));
     for (const file of core) {
       expect(readFileSync(new URL(file, dist), "utf8")).not.toMatch(imports);
     }
