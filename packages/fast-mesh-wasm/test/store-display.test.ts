@@ -286,6 +286,37 @@ describe.each([
     expect(st.status).toBe("ready");
   });
 
+  it("pending_change_reads_computing", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b } = withTwo(store);
+    const section = store.addSection({ plane: P1, meshes: [a] });
+    await settle(store);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+    // Store-only changes apply at the flush but never read as pending work.
+    store.setDisplay(a, { opacity: 0.5, visible: false });
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+    // A requested colouring reads "computing" at once, before any flush.
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    let st = store.getSnapshot().meshes.get(a)!;
+    expect(st.desired.coloring).toEqual(ruleTo(b));
+    expect(st.display.coloring).toBe(null);
+    expect(st.status).toBe("computing");
+    expect(store.getSnapshot().status).toBe("computing");
+    // Requesting what was already sent again is not pending.
+    store.setDisplay(a, { coloring: null });
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    store.setSection(section, { plane: P2 });
+    expect(store.getSnapshot().sections.get(section)!.status).toBe("computing");
+    await settle(store);
+    st = store.getSnapshot().meshes.get(a)!;
+    expect(st.display.coloring).toEqual(ruleTo(b));
+    expect(st.status).toBe("ready");
+    expect(store.getSnapshot().sections.get(section)!.plane).toEqual(P2);
+    expect(store.getSnapshot().sections.get(section)!.status).toBe("ready");
+  });
+
   it("toggle_reuses_field", async () => {
     const f = await make();
     const { store } = f;

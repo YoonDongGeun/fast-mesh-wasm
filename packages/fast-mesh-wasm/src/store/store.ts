@@ -790,11 +790,13 @@ export class SceneStore {
    * The status of a state from its own keys (all of their status, errors
    * included) and the keys it depends on, which only add `"computing"`:
    * their errors belong to the requests that made them (a failed edit
-   * rejects its promise) and are ignored here.
+   * rejects its promise) and are ignored here. `pending` (a request
+   * waiting for the next flush that differs from what was sent) also makes
+   * it `"computing"`.
    */
-  #status(own: readonly string[], dependent: readonly string[]): Combined {
+  #status(own: readonly string[], dependent: readonly string[], pending = false): Combined {
     const parts = own.map((k) => this.#key(k));
-    if (dependent.some((k) => this.#host.status(k).status === "computing")) {
+    if (pending || dependent.some((k) => this.#host.status(k).status === "computing")) {
       parts.push({ status: "computing" });
     }
     return combine(parts);
@@ -804,7 +806,8 @@ export class SceneStore {
    * A mesh's status: its own `mesh:` and `display:` keys and the `field:`
    * key of its store field, made `"computing"` also by its `placement:` and
    * `edit:` keys, those of the mesh it is coloured by distance to, and the
-   * history.
+   * history, and while a requested colouring waits for the next flush.
+   * (Opacity and visibility are store-only: they never make it pending.)
    */
   #meshStatus(entry: MeshEntry): Combined {
     const id = entry.id;
@@ -817,12 +820,13 @@ export class SceneStore {
         dependent.push(`placement:${field.toId}`, `edit:${field.toId}`);
       }
     }
-    return this.#status(own, dependent);
+    return this.#status(own, dependent, this.#pendingDisplay.has(entry) && !sameData(entry.desired.coloring, entry.sent));
   }
 
   /**
    * A section's status: its own `section:` keys, made `"computing"` also by
-   * the `placement:` and `edit:` keys of its meshes and the history.
+   * the `placement:` and `edit:` keys of its meshes and the history, and
+   * while a requested aspect waits for the next flush.
    */
   #sectionStatus(entry: SectionEntry): Combined {
     const own = [`section:${entry.id}`, ...ASPECT_KEYS.map((a) => `section:${entry.id}:${a}`)];
@@ -833,7 +837,8 @@ export class SceneStore {
         dependent.push(`placement:${mesh.id}`, `edit:${mesh.id}`);
       }
     }
-    return this.#status(own, dependent);
+    const pending = this.#pendingSections.has(entry) && ASPECTS.some((a) => !sameData(entry.desired[a], entry.sent[a]));
+    return this.#status(own, dependent, pending);
   }
 
   /**

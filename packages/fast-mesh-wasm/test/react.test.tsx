@@ -80,6 +80,7 @@ function Toggle({ mesh, to }: { mesh: MeshHandle; to?: MeshHandle }) {
       aria-pressed={state.desired.coloring !== null}
       aria-busy={state.status === "computing"}
       data-applied={String(state.coloring !== null)}
+      data-opacity={state.opacity}
       data-status={state.status}
       onClick={() => set({ coloring: state.desired.coloring === null && to !== undefined ? ruleTo(to) : null })}
     >
@@ -116,6 +117,8 @@ describe("fast-mesh-wasm/react", () => {
     // Pressed at once (desired), not yet applied: the documented pending state.
     expect(button.getAttribute("aria-pressed")).toBe("true");
     expect(button.dataset.applied).toBe("false");
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(button.dataset.status).toBe("computing");
     act(() => {
       store.commitFrame();
     });
@@ -319,12 +322,14 @@ describe("fast-mesh-wasm/react", () => {
     });
     const button = screen.getByRole("button");
     expect(button.dataset.applied).toBe("true");
+    expect(button.dataset.opacity).toBe("0.5");
     act(() => {
       store.removeMesh(a);
       store.commitFrame();
     });
     expect(button.dataset.status).toBe("idle");
     expect(button.dataset.applied).toBe("false");
+    expect(button.dataset.opacity).toBe("1");
     expect(button.getAttribute("aria-pressed")).toBe("false");
     expect(screen.getByTestId("sel").textContent).toBe("none");
   });
@@ -433,7 +438,8 @@ describe("fast-mesh-wasm/react", () => {
     });
     expect(screen.getByTestId("sec").textContent).toBe("0.2/0.2/1/ready");
     act(() => setter?.({ plane: P2, meshes: [a, b] }));
-    expect(screen.getByTestId("sec").textContent).toBe("0.2/0.3/1/ready");
+    // The documented pending state until the flush.
+    expect(screen.getByTestId("sec").textContent).toBe("0.2/0.3/1/computing");
     act(() => {
       store.commitFrame();
     });
@@ -444,6 +450,69 @@ describe("fast-mesh-wasm/react", () => {
       store.removeSection(section);
     });
     expect(screen.getByTestId("sec").textContent).toBe("0/0/0/idle");
+  });
+
+  it("history_controls_stable", () => {
+    const { store, a } = setup();
+    const seen: ReturnType<typeof useHistory>[] = [];
+    function Spy() {
+      seen.push(useHistory());
+      return null;
+    }
+    render(
+      <SceneProvider store={store}>
+        <Spy />
+      </SceneProvider>,
+    );
+    act(() => {
+      store.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0] });
+      store.commitFrame();
+    });
+    const first = seen[0];
+    const last = seen.at(-1)!;
+    expect(last.canUndo).toBe(true);
+    expect(last).not.toBe(first);
+    // The actions keep their identity across a history change.
+    expect(last.undo).toBe(first.undo);
+    expect(last.redo).toBe(first.redo);
+  });
+
+  it("inline_selector_keeps_identity", () => {
+    const { store, a } = setup();
+    const seen: unknown[] = [];
+    let selections = 0;
+    let rerender: () => void = () => {};
+    function Parent() {
+      const [, setN] = useState(0);
+      rerender = () => setN((n) => n + 1);
+      // Inline selector and equality: new functions on every render.
+      const view = useStoreSelector(
+        (s) => {
+          selections++;
+          return { opacity: s.meshes.get(a)?.display.opacity };
+        },
+        (x, y) => x.opacity === y.opacity,
+      );
+      seen.push(view);
+      return null;
+    }
+    render(
+      <SceneProvider store={store}>
+        <Parent />
+      </SceneProvider>,
+    );
+    act(() => rerender());
+    act(() => rerender());
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    for (const v of seen) {
+      expect(v).toBe(seen[0]);
+    }
+    expect(selections).toBeGreaterThan(0);
+    act(() => {
+      store.setDisplay(a, { opacity: 0.5 });
+      store.commitFrame();
+    });
+    expect(seen.at(-1)).toEqual({ opacity: 0.5 });
   });
 
   it("use_scene_outside_provider_throws", () => {

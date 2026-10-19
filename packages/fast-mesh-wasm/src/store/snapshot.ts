@@ -165,6 +165,29 @@ export function meshState(snap: SceneSnapshot, mesh: MeshHandle): MeshState {
   return snap.meshes.get(mesh) ?? REMOVED_MESH_STATE;
 }
 
+const NO_SECTION_PARTS: SectionParts = Object.freeze({
+  plane: Object.freeze({ origin: Object.freeze([0, 0, 0]), normal: Object.freeze([0, 0, 1]) }) as SectionPlane,
+  meshes: Object.freeze([]),
+  fill: false,
+});
+
+/**
+ * The state of a section not in a snapshot (removed, never added, or on the
+ * server): `"idle"`, no meshes, no fill, a placeholder plane through the
+ * origin facing +z.
+ */
+export const REMOVED_SECTION_STATE: SectionState = Object.freeze({
+  ...NO_SECTION_PARTS,
+  desired: NO_SECTION_PARTS,
+  status: "idle",
+  revision: 0,
+});
+
+/** A section's state in `snap`, or {@link REMOVED_SECTION_STATE} when it is not there. */
+export function sectionState(snap: SceneSnapshot, section: SectionHandle): SectionState {
+  return snap.sections.get(section) ?? REMOVED_SECTION_STATE;
+}
+
 /** A status with its error. */
 export interface Combined {
   status: Status;

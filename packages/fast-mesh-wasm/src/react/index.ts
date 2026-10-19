@@ -12,6 +12,7 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useSyncExternalStore,
 } from "react";
 import { FastMeshError } from "../core.js";
@@ -23,6 +24,7 @@ import {
   meshState,
   type SceneSnapshot,
   type SectionState,
+  sectionState,
 } from "../store/snapshot.js";
 import type { SceneStore } from "../store/store.js";
 
@@ -46,38 +48,54 @@ export function useScene(): SceneStore {
   return store;
 }
 
+/** A memoised selection: the last snapshot and selector seen, and the value kept. */
+interface Memo<T> {
+  snap?: SceneSnapshot;
+  selector?: (s: SceneSnapshot) => unknown;
+  value?: T;
+  has: boolean;
+}
+
 /**
  * Selects a slice of the store's snapshot; the component re-renders only when
  * the slice changes (by `isEqual`, `Object.is` by default). The selection is
- * cached per snapshot, and an equal selection keeps the previous value, so a
- * selector may build new objects. The server renders `EMPTY_SNAPSHOT`.
+ * cached per snapshot and selector, and a new selection equal to the
+ * previous one keeps the previous value, so a selector may build new objects
+ * and may be an inline function. The server renders `EMPTY_SNAPSHOT`.
  */
 export function useStoreSelector<T>(
   selector: (s: SceneSnapshot) => T,
   isEqual: (a: T, b: T) => boolean = Object.is,
 ): T {
   const store = useScene();
+  // The latest selector and equality, read by the stable getters below (as
+  // use-sync-external-store/with-selector does), so an inline selector does
+  // not reset the cache on every render of its parent.
+  const selectorRef = useRef(selector);
+  const isEqualRef = useRef(isEqual);
+  selectorRef.current = selector;
+  isEqualRef.current = isEqual;
   const [get, getServer] = useMemo(() => {
     const memo = (read: () => SceneSnapshot) => {
-      let has = false;
-      let lastSnap: SceneSnapshot | undefined;
-      let last: T;
-      return () => {
+      const m: Memo<T> = { has: false };
+      return (): T => {
         const snap = read();
-        if (has && snap === lastSnap) {
-          return last;
+        const sel = selectorRef.current;
+        if (m.has && snap === m.snap && sel === m.selector) {
+          return m.value as T;
         }
-        const next = selector(snap);
-        lastSnap = snap;
-        if (!has || !isEqual(last, next)) {
-          last = next;
-          has = true;
+        const next = sel(snap);
+        m.snap = snap;
+        m.selector = sel;
+        if (!m.has || !isEqualRef.current(m.value as T, next)) {
+          m.value = next;
+          m.has = true;
         }
-        return last;
+        return m.value as T;
       };
     };
     return [memo(store.getSnapshot), memo(() => EMPTY_SNAPSHOT)] as const;
-  }, [store, selector, isEqual]);
+  }, [store]);
   return useSyncExternalStore(store.subscribe, get, getServer);
 }
 
@@ -124,46 +142,30 @@ export interface HistoryControls {
 
 const selectHistory = (s: SceneSnapshot) => s.history;
 
-/** Undo and redo, with whether each is available. */
+/** Undo and redo, with whether each is available. The object and its actions keep their identity while history is unchanged; the actions are stable per store. */
 export function useHistory(): HistoryControls {
   const store = useScene();
   const history = useStoreSelector(selectHistory);
+  const undo = useCallback(() => store.undo(), [store]);
+  const redo = useCallback(() => store.redo(), [store]);
   return useMemo(
-    () => ({
-      canUndo: history.canUndo,
-      canRedo: history.canRedo,
-      undo: () => store.undo(),
-      redo: () => store.redo(),
-    }),
-    [store, history],
+    () => ({ canUndo: history.canUndo, canRedo: history.canRedo, undo, redo }),
+    [history, undo, redo],
   );
 }
 
 /** A change to a section: its plane, meshes or fill. */
 export type SectionUpdate = Partial<{ plane: SectionPlane; meshes: readonly MeshHandle[]; fill: boolean }>;
 
-const NO_PLANE: SectionPlane = Object.freeze({
-  origin: Object.freeze([0, 0, 0]),
-  normal: Object.freeze([0, 0, 1]),
-}) as SectionPlane;
-const NO_SECTION_PARTS = Object.freeze({ plane: NO_PLANE, meshes: Object.freeze([]), fill: false });
-
-/** The state of a section not in a snapshot (removed, or on the server): `"idle"`, no meshes. */
-const REMOVED_SECTION_STATE: SectionState = Object.freeze({
-  ...NO_SECTION_PARTS,
-  desired: NO_SECTION_PARTS,
-  status: "idle",
-  revision: 0,
-});
-
 /**
  * A section's state (the applied plane, meshes and fill, `desired` and
  * `status`) and its setter (`store.setSection`). A section not in the store
- * reads as `"idle"` with no meshes; the setter throws `UNKNOWN_SECTION` for it.
+ * reads as `REMOVED_SECTION_STATE` (`"idle"`, no meshes); the setter throws
+ * `UNKNOWN_SECTION` for it.
  */
 export function useSection(section: SectionHandle): [SectionState, (patch: SectionUpdate) => void] {
   const store = useScene();
-  const select = useCallback((s: SceneSnapshot) => s.sections.get(section) ?? REMOVED_SECTION_STATE, [section]);
+  const select = useCallback((s: SceneSnapshot) => sectionState(s, section), [section]);
   const state = useStoreSelector(select);
   const set = useCallback((patch: SectionUpdate) => store.setSection(section, patch), [store, section]);
   return [state, set];

@@ -10,9 +10,11 @@ export {
   type MeshState,
   meshState,
   REMOVED_MESH_STATE,
+  REMOVED_SECTION_STATE,
   type SceneSnapshot,
   type SectionParts,
   type SectionState,
+  sectionState,
   type Status,
 } from "./snapshot.js";
 export { createSceneStore, SceneStore, type SectionPatch } from "./store.js";
