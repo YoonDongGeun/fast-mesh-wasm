@@ -272,6 +272,102 @@ const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { 
 
 `fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
 
+## React
+
+Three subpaths connect a scene to UI code:
+
+- `fast-mesh-wasm/store`: `SceneStore`, an observable store over a `Scene` or a `WorkerScene`. It has no dependencies, so it also works without React.
+- `fast-mesh-wasm/react`: hooks over the store. Needs `react` (optional peer, `>=18`; tested with React 19).
+- `fast-mesh-wasm/r3f`: `<FastMesh>` for React Three Fiber. Needs `@react-three/fiber` (optional peer, `>=9`) and `three`.
+
+```tsx
+import { createSceneStore } from "fast-mesh-wasm/store";
+import { createWorkerScene } from "fast-mesh-wasm/worker";
+import { SceneProvider, useHistory, useMeshDisplay } from "fast-mesh-wasm/react";
+import { FastMesh } from "fast-mesh-wasm/r3f";
+import { Canvas } from "@react-three/fiber";
+import type { MeshHandle } from "fast-mesh-wasm";
+
+// Provided by your app (not part of this package).
+declare const upperPositions: Float64Array, upperIndices: Uint32Array;
+declare const lowerPositions: Float64Array, lowerIndices: Uint32Array;
+
+// One store per scene. With the synchronous Scene: `await init(); createSceneStore(new Scene())`.
+const store = createSceneStore(await createWorkerScene());
+const upper = store.addMesh(upperPositions, upperIndices);
+const lower = store.addMesh(lowerPositions, lowerIndices);
+
+function ColourButton({ mesh, to }: { mesh: MeshHandle; to: MeshHandle }) {
+  const [state, setDisplay] = useMeshDisplay(mesh);
+  const pressed = state.desired.coloring !== null; // what was requested
+  const busy = state.status === "computing"; // not shown yet
+  return (
+    <button
+      aria-pressed={pressed}
+      aria-busy={busy}
+      onClick={() =>
+        setDisplay({ coloring: pressed ? null : { distanceTo: to, maxDistance: 2, map: "turbo", range: [0, 2] } })
+      }
+    >
+      Distance colours
+    </button>
+  );
+}
+
+function UndoButton() {
+  const { canUndo, undo } = useHistory();
+  return <button disabled={!canUndo} onClick={undo}>Undo</button>;
+}
+
+export function App() {
+  return (
+    <SceneProvider store={store}>
+      <Canvas>
+        <ambientLight />
+        <FastMesh mesh={upper} />
+        <FastMesh mesh={lower} />
+      </Canvas>
+      <ColourButton mesh={upper} to={lower} />
+      <UndoButton />
+    </SceneProvider>
+  );
+}
+```
+
+**The store.** `store.getSnapshot()` returns a frozen `SceneSnapshot` (meshes, sections, history, selection and an overall status), replaced on every change, with unchanged parts shared between versions. `store.subscribe(listener)` notifies after each new snapshot. Actions mirror the scene: `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `addSection`, `removeSection` and `restart` (Worker only). The declarative ones are new:
+
+- `setDisplay(mesh, { coloring?, opacity?, visible? })`. A `coloring` colours the mesh by its distance to `distanceTo`. The store owns the distance field behind it: one per coloured mesh, named `fast-mesh-store:<n>`, kept while the colouring is off, reused when it comes back with the same `distanceTo`, `maxDistance` and `sign`, and replaced only when one of them changes. `opacity` (in [0, 1], default 1) and `visible` (default true) live only in the store; the engine never sees them. Display changes never enter the undo history.
+- `setSection(section, { plane?, meshes?, fill? })` changes a section.
+- `select(mesh | null)` sets the selection. It is UI state only, and it clears when the selected mesh is removed.
+
+Declarative changes update `desired` at once and reach the scene at the next `store.commitFrame()`, the last value per mesh or section in a frame winning (on both scenes, so rapid toggling never queues work). Without a frame loop they apply on a microtask. Call `store.commitFrame()` once per animation frame instead of `scene.commitFrame()`; `<FastMesh>` does it for you.
+
+**Reading state in components.**
+
+| Hook | Returns |
+| --- | --- |
+| `useScene()` | The store of the nearest `<SceneProvider store>` |
+| `useMeshDisplay(mesh)` | `[state, setDisplay]`: the mesh's applied `coloring`, `opacity` and `visible`, plus `desired`, `status` and `error` |
+| `useSection(section)` | `[state, setSection]`: the applied `plane`, `meshes` and `fill`, plus `desired`, `status` and `error` |
+| `useHistory()` | `{ canUndo, canRedo, undo, redo }` |
+| `useSceneStatus()` | `{ status, error? }` for the whole scene: `"error"` if anything failed, else `"computing"` while anything is pending, else `"idle"` |
+| `useSelection()` | `[mesh \| null, select]` |
+| `useStoreSelector(selector, isEqual?)` | Any slice of the snapshot; re-renders only when it changes |
+
+- **Bind controlled inputs (sliders, toggles, checkboxes) to `state.desired.*`.** That is what the user last asked for, so the input follows them at once. The top-level `state.coloring`, `state.opacity` and `state.visible` (and a section's top-level `plane`, `meshes` and `fill`) are the applied values: what is on screen.
+- **`status === "computing"` covers the pending window**: the time between a request (the button is pressed) and the scene showing it, whether the change is waiting for the next frame or a colouring is being computed in the Worker. Show it as busy; the button never reads "on" while the mesh shows colours off outside this window. A mesh is also `"computing"` while something it depends on is pending: its placement or an edit, those of the mesh it is coloured by distance to, or an undo/redo. A section depends the same way on its meshes. Only a state's own requests can make it `"error"`; a failed edit rejects its own promise instead.
+- **On the synchronous `Scene`** every status is `"ready"` right after the frame that applied it, or `"error"` if the call threw. `store.restart()` rejects with `INVALID_ARGUMENT` there.
+- **A removed mesh or section** reads as `"idle"` with the default display (or no meshes) and its setter throws `UNKNOWN_MESH` or `UNKNOWN_SECTION`, so a component still mounted for it renders without throwing. Removing the mesh another mesh is coloured by distance to leaves that mesh uncoloured, its rule kept in `desired` and its status `"error"` (`UNKNOWN_MESH`) until its colouring changes. A rule the engine rejected is not re-sent until it changes.
+- **SSR.** On the server the hooks render an empty snapshot (`EMPTY_SNAPSHOT`) and never throw for missing data.
+
+**`<FastMesh>`.** `<FastMesh mesh store? material? color? onClick?… />` binds a scene mesh with `bindMesh` on mount, follows the applied opacity and visibility, and disposes the binding on unmount or when the mesh is removed (it then renders nothing). R3F pointer events are passed to the mesh. Adding or removing the `store` prop remounts it (and rebinds the mesh). Give each `<FastMesh>` its own `material`, and dispose it yourself. Every `<FastMesh>` calls `useFrameDriver(store)`, which calls `store.commitFrame()` once per rendered frame however many are mounted: do not call `commitFrame()` yourself as well. Use `useFrameDriver()` on its own when you draw the scene without `<FastMesh>`.
+
+- **One store across two `<Canvas>` roots.** The first mounted driver for a store does the committing. If its canvas stops rendering (`frameloop="demand"` with nothing invalidating it, say) while another canvas keeps running, the store stops committing. Drive such a store from one canvas only, or call `useFrameDriver` in the canvas that always renders.
+- `bindSection` and `attachTransformControls` (`fast-mesh-wasm/three`) read only `mesh` and `object` (and the object's material) of the `BoundMesh` they take. `<FastMesh>` keeps its binding to itself, so pass the mesh handle with the object from a pointer event's `eventObject`, or with the material you gave `<FastMesh>`; [`examples/react`](examples/react) does both.
+- Opacity and visibility apply in the render after the frame that commits them, so they can lag a colouring change by one frame.
+
+[`examples/react`](examples/react) is a complete app on the Worker store (`?local` for the synchronous one): colouring toggles, opacity and visibility, a section, undo/redo, the scene status with Restart, dragging with three's TransformControls and STL drop.
+
 ## Functions
 
 | Function | Returns | Description |
