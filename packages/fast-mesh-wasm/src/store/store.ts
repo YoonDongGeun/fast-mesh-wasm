@@ -249,6 +249,9 @@ export class SceneStore {
     if (entry !== undefined) {
       this.#meshes.delete(mesh);
       this.#pendingDisplay.delete(entry);
+      const display = `display:${entry.id}`;
+      const field = entry.field === undefined ? undefined : `field:${entry.field.id}`;
+      this.#host.forgetErrors((k) => k === display || k === field);
     }
     if (this.#selection === mesh) {
       this.#selection = null;
@@ -258,6 +261,8 @@ export class SceneStore {
         continue;
       }
       // Gone from the scene with the mesh, and so is a colouring by it.
+      const fieldKey = `field:${other.field.id}`;
+      this.#host.forgetErrors((k) => k === fieldKey);
       other.field = undefined;
       other.sent = null;
       other.inflight = undefined;
@@ -482,6 +487,8 @@ export class SceneStore {
     if (entry !== undefined) {
       this.#sections.delete(section);
       this.#pendingSections.delete(entry);
+      const own = `section:${entry.id}`;
+      this.#host.forgetErrors((k) => k === own || k.startsWith(`${own}:`));
     }
     this.#refresh();
   }
@@ -675,12 +682,25 @@ export class SceneStore {
       handle,
       id: this.#host.idOf(handle),
       to: want.distanceTo,
-      toId: this.#meshes.get(want.distanceTo)?.id,
+      toId: this.#idOf(want.distanceTo),
       maxDistance: want.maxDistance,
       sign,
     };
     entry.field = field;
     return field;
+  }
+
+  /**
+   * A mesh's id in status keys, whether or not the store tracks it (a mesh
+   * added straight to the scene); `undefined` for one the scene no longer
+   * knows (removed).
+   */
+  #idOf(mesh: MeshHandle): number | undefined {
+    try {
+      return this.#host.idOf(mesh);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Sends each aspect of a section whose desired value differs from the one sent, under its own key. */

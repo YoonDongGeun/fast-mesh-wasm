@@ -64,6 +64,8 @@ export interface Host {
    * rethrown, until a later call under the key succeeds.
    */
   track<T>(key: string, fn: () => T): T;
+  /** Forgets the `track` errors of the keys `match` accepts (those of a removed mesh or section). */
+  forgetErrors(match: (key: string) => boolean): void;
 }
 
 /** Whether `scene` is a Worker scene (structurally: it reports key statuses). */
@@ -92,7 +94,14 @@ function tracker() {
       throw e;
     }
   };
-  return { errors, track };
+  const forgetErrors = (match: (key: string) => boolean): void => {
+    for (const key of [...errors.keys()]) {
+      if (match(key)) {
+        errors.delete(key);
+      }
+    }
+  };
+  return { errors, track, forgetErrors };
 }
 
 /**
@@ -104,7 +113,7 @@ function tracker() {
 export function localHost(scene: Scene): Host {
   const ids = new WeakMap<object, number>();
   let next = 0;
-  const { errors, track } = tracker();
+  const { errors, track, forgetErrors } = tracker();
   let rev = 0;
   const promised = <T>(fn: () => T): Promise<T> => new Promise<T>((resolve) => resolve(fn()));
   return {
@@ -141,6 +150,7 @@ export function localHost(scene: Scene): Host {
       rev++;
       return track(key, fn);
     },
+    forgetErrors,
     addField: (desc) => scene.addDistanceField(desc),
     removeField: (field) => scene.removeField(field),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
@@ -159,7 +169,7 @@ export function localHost(scene: Scene): Host {
  * request went out: that key is `"error"` until a call under it succeeds.
  */
 export function workerHost(scene: WorkerScene): Host {
-  const { errors, track } = tracker();
+  const { errors, track, forgetErrors } = tracker();
   return {
     mode: "worker",
     scene,
@@ -188,7 +198,19 @@ export function workerHost(scene: WorkerScene): Host {
     setSectionMeshes: (section, meshes) => scene.setSectionMeshes(section, meshes),
     setSectionFill: (section, fill) => scene.setSectionFill(section, fill),
     removeSection: (section) => scene.removeSection(section),
-    restart: () => scene.restart(),
+    restart: () => {
+      // Once the replay is applied, statuses are the replay's (9a): the
+      // errors recorded before the restart go (later ones stay).
+      const before = new Map(errors);
+      return scene.restart().then(() => {
+        for (const [key, error] of before) {
+          if (errors.get(key) === error) {
+            errors.delete(key);
+          }
+        }
+      });
+    },
     track,
+    forgetErrors,
   };
 }

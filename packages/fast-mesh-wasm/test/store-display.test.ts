@@ -531,6 +531,85 @@ describe("SceneStore display (worker only)", () => {
   });
 });
 
+describe("SceneStore display (worker only, review fixes)", () => {
+  it("restart_rearms_unapplied_changes", async () => {
+    const f = await makeWorker({ testPanic: true });
+    const { store } = f;
+    const scene = f.scene as WorkerScene;
+    const { a, b } = withTwo(store);
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    const s = store.addSection({ plane: P1, meshes: [a, b], fill: true });
+    await settle(store);
+    // The trapping query goes first in the batch, so the colouring and the
+    // plane sent with it fail (poisoned) instead of applying.
+    const analysis = scene.analyze(a);
+    store.setDisplay(a, { coloring: null });
+    store.setSection(s, { plane: P2 });
+    store.commitFrame();
+    await expect(analysis).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    for (let k = 0; k < 100 && store.getSnapshot().meshes.get(a)!.status !== "error"; k++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    let snap = store.getSnapshot();
+    expect(snap.meshes.get(a)!.status).toBe("error");
+    expect(snap.meshes.get(a)!.display.coloring).toEqual(ruleTo(b));
+    expect(snap.sections.get(s)!.plane).toEqual(P1);
+
+    await store.restart();
+    await settle(store);
+    snap = store.getSnapshot();
+    const sa = snap.meshes.get(a)!;
+    expect(sa.display.coloring).toBe(null);
+    expect(sa.display.coloring).toEqual(sa.desired.coloring);
+    expect(sa.status).toBe("ready");
+    const ss = snap.sections.get(s)!;
+    expect(ss.plane).toEqual(P2);
+    expect(ss.plane).toEqual(ss.desired.plane);
+    expect(ss.status).toBe("ready");
+    expect(snap.status).toBe("idle");
+  });
+
+  it("restart_clears_sync_errors", async () => {
+    const f = await makeWorker();
+    const { store } = f;
+    const { a, b } = withTwo(store);
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    await settle(store);
+    store.removeMesh(b);
+    await settle(store);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("error");
+    await store.restart();
+    await settle(store);
+    // Statuses are the replay's once it is applied.
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+  });
+
+  it("dependent_status_target_outside_store", async () => {
+    const f = await makeWorker();
+    const { store } = f;
+    const scene = f.scene as WorkerScene;
+    const a = store.addMesh(tetra(0).positions, tetra(0).indices);
+    // The target is added straight to the scene, not through the store.
+    const b = scene.addMesh(tetra(3).positions, tetra(3).indices);
+    await settle(store);
+    store.setDisplay(a, { coloring: ruleTo(b) });
+    await settle(store);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+    const w = f.worker!;
+    w.hold = true;
+    const drag = scene.drag(b);
+    drag.move({ rotation: IDENTITY, translation: [0.5, 0, 0] });
+    store.commitFrame();
+    await w.waitHeld(1);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("computing");
+    w.hold = false;
+    w.release();
+    drag.end();
+    await settle(store);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+  });
+});
+
 describe("SceneStore display (local only)", () => {
   it("local_restart_rejects", async () => {
     const { store } = await makeLocal();
