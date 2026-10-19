@@ -331,6 +331,36 @@ interface Pending {
   reject(error: unknown): void;
 }
 
+/** How a restart treats a request that never applied (see `sortOf`). */
+interface Sorted {
+  kind: "add" | "removal" | "declarative" | "lost";
+  key: string | undefined;
+  rev: number;
+  /** For a declarative request: the keys its outcome depends on. */
+  covers: string[];
+}
+
+function sortOf(req: Request): Sorted {
+  const key = keyOf(req);
+  const base = { key, rev: req.rev, covers: [] as string[] };
+  if (req.kind === "addMesh") {
+    return { ...base, kind: "add" };
+  }
+  if (req.kind === "removeMesh" || ((req.kind === "field" || req.kind === "section") && req.op === "remove")) {
+    return { ...base, kind: "removal" };
+  }
+  if (
+    req.kind === "setPlacement" ||
+    req.kind === "drag" ||
+    req.kind === "coloring" ||
+    req.kind === "field" ||
+    req.kind === "section"
+  ) {
+    return { ...base, kind: "declarative", covers: coversOf(req) };
+  }
+  return { ...base, kind: "lost" };
+}
+
 /** Keys a restart settles with its replay's result, each with the keys it depends on. */
 interface Settle {
   rev: number;
@@ -440,6 +470,15 @@ export class WorkerScene implements SceneLike {
    */
   readonly #failed: Request[] = [];
   #failedDropped = 0;
+  /**
+   * The keys of removals and declarative requests dropped from `#failed`
+   * (latest per key), so a restart still settles them.
+   */
+  readonly #failedKeys = new Map<string, Omit<Sorted, "key">>();
+  /** Keys a failed replay left in error, for the next restart to settle. */
+  readonly #unsettled = new Map<string, Omit<Sorted, "key">>();
+  /** The poses a failed replay had, for its retry. */
+  #retryPoses: Map<MeshState, Pose> | undefined;
   readonly #replies = new Map<number, Pending>();
   /** Change records of results received since the last `commitFrame`, merged per mesh. */
   readonly #changes = new Map<MeshState, MeshChange>();
@@ -645,7 +684,12 @@ export class WorkerScene implements SceneLike {
     if (this.#failed.length > FAILED_LOG_LIMIT) {
       // Drop the oldest half at once: amortised O(1) per request.
       const drop = this.#failed.length - FAILED_LOG_LIMIT / 2;
-      this.#failed.splice(0, drop);
+      for (const req of this.#failed.splice(0, drop)) {
+        const { key, ...rest } = sortOf(req);
+        if (key !== undefined && (rest.kind === "removal" || rest.kind === "declarative")) {
+          this.#failedKeys.set(key, rest);
+        }
+      }
       this.#failedDropped += drop;
     }
   }
@@ -1627,10 +1671,15 @@ export class WorkerScene implements SceneLike {
    * History is cleared (`canUndo`/`canRedo` are false). The replay is sent
    * at once, not with the next frame. Every replayed key is `"computing"`
    * until the replay's results arrive, and so is the key of every pending
-   * declarative request (placement, drag, colouring, field, section): it
-   * settles with the replay, which applies the newest value. After a
-   * poisoning, placements replay the engine's pose, so their failed
-   * requests stay failed. Removals count as done (`"ready"`).
+   * declarative request (placement, drag, colouring, field, section), also
+   * one that failed after a poisoning (its call was rejected then): it
+   * settles with the replay (`"ready"`, or `"error"` when the replay failed
+   * for it), which applies the newest value; after a poisoning, placements
+   * replay the engine's pose. A colouring whose field cannot be replayed
+   * (its mesh was lost) is dropped, with `UNKNOWN_FIELD` on its display key.
+   * Removals count as done (`"ready"`). When the replay fails as a whole
+   * (no Worker, it could not be posted, a trap), the scene is poisoned and
+   * the next `restart()` replays the same intent and settles those keys.
    *
    * What cannot be replayed surfaces as errors (`INSTANCE_POISONED`): edits,
    * repairs, compaction, undo/redo and queries sent and not answered, or not
@@ -1666,14 +1715,21 @@ export class WorkerScene implements SceneLike {
     this.#worker = this.#attach(worker);
     const sent = this.#flush();
     if (sent === undefined) {
-      // It could not be posted: failed here (see #flush).
-      const error = invalid("the restart's replay could not be sent to the Worker");
-      this.#settle(settle, error);
-      return Promise.reject(error);
+      // It could not be posted (failed here, see #flush): the new Worker has
+      // nothing, so the scene is poisoned until a restart works.
+      const error = {
+        code: "INSTANCE_POISONED",
+        message: "the restart's replay could not be sent to the Worker; restart again",
+      };
+      this.#poisonAll(error);
+      this.#settle(settle, fromWire(error));
+      return Promise.reject(fromWire(error));
     }
     const done = new Promise<void>((resolve, reject) => {
       this.#batchDone.set(sent, {
         resolve: () => {
+          // The intent is applied: a later restart starts from the engine.
+          this.#retryPoses = undefined;
           this.#settle(settle);
           resolve();
         },
@@ -1697,12 +1753,16 @@ export class WorkerScene implements SceneLike {
    * Ends a restart for the keys it settles without a request of their own:
    * each is `"ready"`, or `"error"` with `error` (the replay failed) or with
    * the error of a key it depends on (the mesh or section it targets), unless
-   * a newer request for it was made since.
+   * a newer request for it was made since. When the replay failed, the keys
+   * are carried to the next restart, which settles them again.
    */
   #settle(settle: Settle, error?: FastMeshError): void {
     for (const [key, covers] of settle.keys) {
       if (this.#latest.get(key) !== settle.rev) {
         continue;
+      }
+      if (error !== undefined) {
+        this.#unsettled.set(key, { kind: "declarative", rev: settle.rev, covers });
       }
       const failed =
         error ?? covers.map((c) => this.#status.get(c)).find((s) => s?.status === "error")?.error;
@@ -1737,15 +1797,17 @@ export class WorkerScene implements SceneLike {
     }
 
     // Where each mesh will be: with no poisoning, the newest of a held drag
-    // pose and a requested placement; else the engine's. Then the holds go.
+    // pose and a requested placement; else the engine's. A retry after a
+    // failed replay keeps the poses that replay had. Then the holds go.
     const poses = new Map<MeshState, Pose>();
     for (const st of this.#meshes.values()) {
       const intended =
         st.requested !== undefined && (st.local === undefined || st.requestedUntil > st.localUntil)
           ? st.requested
           : (st.local ?? st.pose);
-      poses.set(st, poisoned ? st.pose : intended);
+      poses.set(st, this.#retryPoses?.get(st) ?? (poisoned ? st.pose : intended));
     }
+    this.#retryPoses = poses;
     if (this.#drag !== undefined) {
       this.#drag.active = false;
       this.#drag = undefined;
@@ -1760,50 +1822,46 @@ export class WorkerScene implements SceneLike {
       st.requestedUntil = 0;
     }
 
-    // What was sent or queued, or failed since a poisoning, by kind:
+    // What was sent or queued, or failed since a poisoning, by kind (see
+    // `sortOf`):
     // - adds: replayed below when never sent, else lost;
     // - removals: done (the new engine never gets what was removed);
     // - declarative state (placements and drags, colourings, fields,
-    //   sections): settles with the replay, which applies the newest value;
-    //   after a poisoning, placements replay the engine's pose instead, so
-    //   their failed requests stay failed;
+    //   sections): settles with the replay, which applies the value it
+    //   replays (after a poisoning, the engine's pose for placements);
     // - everything else (edits, repairs, compaction, undo/redo, queries)
     //   is lost: it fails if it had not already.
+    // Keys a failed replay left unsettled, and those of failed requests
+    // dropped from the capped log, are settled again here.
     const lost = new FastMeshError("INSTANCE_POISONED", "the Worker was restarted before this request ran");
     const pending = [...this.#inflight.splice(0).flat(), ...this.#queue];
     this.#queue = [];
     const settleKeys = new Map<string, string[]>();
-    const sort = (req: Request, failed: boolean) => {
-      if (req.kind === "addMesh") {
+    const apply = (sorted: Sorted) => {
+      if (sorted.key === undefined || this.#latest.get(sorted.key) !== sorted.rev) {
         return;
       }
-      const key = keyOf(req);
-      const latest = key !== undefined && this.#latest.get(key) === req.rev;
-      const removal =
-        req.kind === "removeMesh" || ((req.kind === "field" || req.kind === "section") && req.op === "remove");
-      if (removal) {
-        if (latest) {
-          this.#status.set(key, { status: "ready", revision: req.rev });
-        }
-        return;
-      }
-      const placement = req.kind === "setPlacement" || req.kind === "drag";
-      const declarative = placement || req.kind === "coloring" || req.kind === "field" || req.kind === "section";
-      if (declarative && !(placement && poisoned)) {
-        if (latest) {
-          settleKeys.set(key, coversOf(req));
-        }
-        return;
-      }
-      if (!failed) {
-        this.#fail([req], lost, false);
+      if (sorted.kind === "removal") {
+        this.#status.set(sorted.key, { status: "ready", revision: sorted.rev });
+      } else if (sorted.kind === "declarative") {
+        settleKeys.set(sorted.key, sorted.covers);
       }
     };
+    for (const [key, entry] of [...this.#unsettled, ...this.#failedKeys]) {
+      apply({ key, ...entry });
+    }
+    this.#unsettled.clear();
+    this.#failedKeys.clear();
     for (const req of this.#failed) {
-      sort(req, true);
+      apply(sortOf(req));
     }
     for (const req of pending) {
-      sort(req, false);
+      const sorted = sortOf(req);
+      if (sorted.kind === "lost") {
+        this.#fail([req], lost, false);
+      } else {
+        apply(sorted);
+      }
     }
     for (const p of this.#replies.values()) {
       p.reject(lost);
@@ -1883,6 +1941,8 @@ export class WorkerScene implements SceneLike {
         this.#push({ kind: "field", rev: ++this.#rev, field: f.id, op: "add", desc: f.desc });
       }
     }
+    // Colourings whose field cannot be replayed are dropped, as errors.
+    const dropped = new Map<string, FastMeshError>();
     for (const st of this.#meshes.values()) {
       const rule = st.coloring;
       if (rule === null || !replayed.has(st.id)) {
@@ -1897,6 +1957,12 @@ export class WorkerScene implements SceneLike {
           rule: { ...rule, field: f.id },
           key: `display:${st.id}`,
         });
+      } else {
+        st.coloring = null;
+        dropped.set(
+          `display:${st.id}`,
+          new FastMeshError("UNKNOWN_FIELD", "the colouring's field could not be replayed (its mesh was lost)"),
+        );
       }
     }
     for (const s of this.#sections.values()) {
@@ -1922,11 +1988,15 @@ export class WorkerScene implements SceneLike {
     // compute until its result.
     const keys = new Map<string, string[]>();
     for (const [key, covers] of settleKeys) {
-      if ((this.#latest.get(key) ?? 0) < first) {
+      if ((this.#latest.get(key) ?? 0) < first && !dropped.has(key)) {
         keys.set(key, covers);
         this.#latest.set(key, rev);
         this.#status.set(key, { status: "computing", revision: rev });
       }
+    }
+    for (const [key, error] of dropped) {
+      this.#latest.set(key, rev);
+      this.#status.set(key, { status: "error", revision: rev, error });
     }
     return { rev, keys };
   }

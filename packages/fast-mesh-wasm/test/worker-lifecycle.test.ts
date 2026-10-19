@@ -88,8 +88,9 @@ describe("cooperative cancellation", () => {
           }
           builds.push(chunk.id as ClientId);
           if (builds.length === 1 && newer !== undefined) {
-            // The newer colouring arrives during the build (after chunk 1),
-            // as a message would: the engine sees it only if it yields.
+            // The newer colouring arrives during the build, after chunk 1 (on
+            // a microtask, which the async drain lets in between chunks; real
+            // message-loop yields are `later_batch_arrives_between_chunks`).
             const batch = newer;
             newer = undefined;
             queueMicrotask(() => deliver(batch));
@@ -380,6 +381,8 @@ class NodeWorker implements WorkerLike {
   readonly sent: Request[][] = [];
   hold = false;
   terminated = false;
+  /** Every `postMessage` throws, as an uncloneable message would. */
+  failPosts = false;
   readonly held: unknown[] = [];
   readonly #message: ((e: { data: unknown }) => void)[] = [];
   readonly #error: ((e: unknown) => void)[] = [];
@@ -414,6 +417,9 @@ class NodeWorker implements WorkerLike {
   }
 
   postMessage(msg: unknown, transfer?: Transferable[]): void {
+    if (this.failPosts) {
+      throw new Error("DataCloneError (simulated)");
+    }
     this.sent.push(msg as Request[]);
     this.worker.postMessage(msg, transfer as never);
   }
@@ -451,15 +457,18 @@ afterEach(() => {
 async function start(
   workerData?: { testPanic?: boolean },
   failCreate?: (n: number) => boolean,
+  configure?: (w: NodeWorker, n: number) => void,
 ): Promise<{ scene: WorkerScene; workers: NodeWorker[] }> {
   const workers: NodeWorker[] = [];
   let created = 0;
   const scene = await createWorkerScene({
     createWorker: () => {
-      if (failCreate?.(++created)) {
+      created++;
+      if (failCreate?.(created)) {
         throw new Error("no Worker today");
       }
       const w = new NodeWorker(workerData);
+      configure?.(w, created);
       workers.push(w);
       return w;
     },
@@ -877,11 +886,12 @@ describe("WorkerScene restart", () => {
     await scene.restart();
     const changes = scene.commitFrame();
     // The removals happened; the plane is replayed as last requested; the
-    // placement replays the engine's pose, so its request stays failed.
+    // placement replays the engine's pose and settles with it (its call was
+    // rejected at the time).
     expect(scene.status(keys.field).status).toBe("ready");
     expect(scene.status(keys.mesh).status).toBe("ready");
     expect(scene.status(keys.plane).status).toBe("ready");
-    expect(scene.status(keys.placement).status).toBe("error");
+    expect(scene.status(keys.placement).status).toBe("ready");
     expect(scene.placement(a).translation).toEqual([0, 0, 0]);
     expect(changes.find((ch) => ch.mesh === c)?.removed).toBe(true);
     expect(scene.sectionPlane(section).origin).toEqual([0, 0, 0.3]);
@@ -963,5 +973,119 @@ describe("WorkerScene restart", () => {
     await settle(scene);
     expect(scene.placement(a).translation).toEqual([1, 0, 0]);
     await expectMirrored(scene, a);
+  });
+
+  it("failed_replay_keys_settle_on_next_restart", async () => {
+    const { scene, workers } = await start(undefined, (n) => n === 2);
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    scene.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a, b] });
+    await settle(scene);
+    // In flight: a section plane, colouring off and a placement.
+    workers[0].hold = true;
+    scene.setSectionPlane(section, { origin: [0, 0, 0.3], normal: [0, 0, 1] });
+    scene.setColoring(a, null);
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 2] });
+    scene.commitFrame();
+    await workers[0].waitHeld(1);
+    const keys = [
+      `section:${scene.idOf(section)}:plane`,
+      `display:${scene.idOf(a)}`,
+      `placement:${scene.idOf(a)}`,
+    ];
+
+    // No Worker: the replay fails and its keys are errors for now.
+    await expect(scene.restart()).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("error");
+    }
+    // The next restart replays the same intent and settles them.
+    await scene.restart();
+    scene.commitFrame();
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("ready");
+    }
+    expect(scene.placement(a).translation).toEqual([0, 0, 2]);
+    expect(scene.views(a).colors()).toBeNull();
+    expect(scene.sectionPlane(section).origin).toEqual([0, 0, 0.3]);
+    await expectMirrored(scene, a);
+  });
+
+  it("unpostable_replay_poisons_then_retries", async () => {
+    const { scene, workers } = await start(undefined, undefined, (w, n) => {
+      w.failPosts = n === 2;
+    });
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a] });
+    await settle(scene);
+    scene.setSectionPlane(section, { origin: [0, 0, 0.3], normal: [0, 0, 1] });
+    const key = `section:${scene.idOf(section)}:plane`;
+    await expect(scene.restart()).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(workers).toHaveLength(2);
+    // Poisoned, not healthy over an empty engine.
+    await expect(scene.intersects(a, a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(scene.status(key).status).toBe("error");
+    await scene.restart();
+    scene.commitFrame();
+    expect(scene.status(key).status).toBe("ready");
+    expect(scene.status(`mesh:${scene.idOf(a)}`).status).toBe("ready");
+    expect(scene.section(section, a).area).not.toBe(0);
+    await expectMirrored(scene, a);
+  });
+
+  it("dropped_colouring_settles_error", async () => {
+    const { scene, workers } = await start();
+    const s = sphere([0, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    // The colouring's field measures to a mesh whose add is in flight: the
+    // restart loses that mesh, so the field and colouring cannot be replayed.
+    workers[0].hold = true;
+    const c = scene.addMesh(sphere([2.5, 0, 0]).positions, sphere([2.5, 0, 0]).indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: c, maxDistance: 3 });
+    scene.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    scene.commitFrame();
+    await workers[0].waitHeld(1);
+    await scene.restart();
+    scene.commitFrame();
+    expect(scene.status(`mesh:${scene.idOf(c)}`).status).toBe("error");
+    expect(scene.status(`display:${scene.idOf(a)}`)).toMatchObject({
+      status: "error",
+      error: { code: "UNKNOWN_FIELD" },
+    });
+    expect(scene.views(a).colors()).toBeNull();
+    await expectMirrored(scene, a);
+  });
+
+  it("capped_failed_log_still_settles", async () => {
+    const { scene } = await start({ testPanic: true });
+    const s = sphere([0, 0, 0]);
+    const t = sphere([2.5, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    const b = scene.addMesh(t.positions, t.indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    const section = scene.addSection({ plane: { origin: [0, 0, 0], normal: [0, 0, 1] }, meshes: [a, b] });
+    await settle(scene);
+    await expect(scene.analyze(a)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    // A removal and a plane, then more failures than the log keeps.
+    scene.removeField(field);
+    scene.setSectionPlane(section, { origin: [0, 0, 0.3], normal: [0, 0, 1] });
+    for (let i = 0; i < 10_001; i++) {
+      scene.compact(a);
+    }
+    scene.commitFrame();
+    const keys = [`field:${scene.idOf(field)}`, `section:${scene.idOf(section)}:plane`];
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("error");
+    }
+    await scene.restart();
+    for (const key of keys) {
+      expect(scene.status(key).status, key).toBe("ready");
+    }
   });
 });
