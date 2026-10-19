@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fast-mesh-wasm + React</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body,
+      #root {
+        margin: 0;
+        height: 100%;
+        background: #1c1f24;
+        color: #e6e6e6;
+        font: 13px/1.5 system-ui, sans-serif;
+      }
+      #root {
+        position: relative;
+      }
+      .panel {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        width: 260px;
+        max-height: calc(100% - 24px);
+        overflow-y: auto;
+        padding: 8px 12px;
+        background: rgba(0, 0, 0, 0.6);
+        border-radius: 6px;
+        box-sizing: border-box;
+      }
+      .panel section {
+        margin: 6px 0 10px;
+      }
+      .panel h2 {
+        margin: 0 0 4px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .panel h2.selected::after {
+        content: " (selected)";
+        color: #f0b040;
+        font-weight: normal;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 3px 0;
+      }
+      .row input[type="range"] {
+        flex: 1;
+      }
+      button {
+        font: inherit;
+        color: inherit;
+        background: #333a44;
+        border: 1px solid #556;
+        border-radius: 4px;
+        padding: 1px 8px;
+      }
+      button[aria-pressed="true"] {
+        background: #2f6db5;
+      }
+      button:disabled {
+        opacity: 0.4;
+      }
+      .busy {
+        color: #f0b040;
+      }
+      .error {
+        color: #ff7070;
+      }
+      .hint {
+        color: #9aa;
+        font-size: 12px;
+      }
+      kbd {
+        padding: 0 4px;
+        border: 1px solid #777;
+        border-radius: 3px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
