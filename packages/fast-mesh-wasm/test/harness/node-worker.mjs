@@ -6,7 +6,8 @@
 // workerData `{ testPanic: true }` makes the `analyze` binding trap through
 // `__test_panic` (the test build of the wasm only), to exercise poisoning;
 // `{ packThrow: true }` makes `can_undo` (read while packing a result) throw
-// a plain error. `{ serve: true }` runs it as the browser Worker script does
+// a plain error; `{ undoThrow: true }` makes `undo` fail with a coded
+// `INVALID_ARGUMENT` error (a failed history request). `{ serve: true }` runs it as the browser Worker script does
 // (`serveEngine`: a `ready` message first) with the test-only `debugDump`
 // query, for `WorkerScene` through its `createWorker` option.
 // `{ yieldMs }` sets the engine's yield budget (`0`: yield after every chunk).
@@ -21,6 +22,12 @@ if (workerData?.testPanic) {
 if (workerData?.packThrow) {
   raw.WasmScene.prototype.can_undo = () => {
     throw new Error("boom");
+  };
+}
+
+if (workerData?.undoThrow) {
+  raw.WasmScene.prototype.undo = () => {
+    throw new Error("INVALID_ARGUMENT: undo failed (test)");
   };
 }
 

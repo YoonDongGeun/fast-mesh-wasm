@@ -84,6 +84,11 @@ jobs:
           pnpm --filter fast-mesh-wasm-example-webgpu build
           # Vite must have picked up the package's default Worker URL and emitted the Worker script.
           ls examples/webgpu/dist/assets/worker-entry-*.js
+      - name: Type-check and build the React example (store, hooks, <FastMesh>; Worker scene by default)
+        run: |
+          pnpm --filter fast-mesh-wasm-example-react build
+          # The Worker client sits in a chunk shared by ./worker and ./store: Vite must still find the Worker URL.
+          ls examples/react/dist/assets/worker-entry-*.js
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build
