@@ -9,6 +9,7 @@ import { type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
 import { debugDump } from "../src/worker/client.js";
 import { runEngine, serveEngine } from "../src/worker/engine.js";
+import { WasmScene } from "../src/wasm/fast_mesh_wasm.js";
 import type { ClientId, MeshChangeWire, Request, Result } from "../src/worker/protocol.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -56,12 +57,17 @@ function recolors(r: Result, id: ClientId): boolean {
  * A fresh synchronous scene's colours of the coloured mesh at translation
  * `t`, after `edit` (if any) on it.
  */
-function referenceColors(t: Vec3, edit?: (s: Scene, mesh: MeshHandle) => void): Uint8Array {
+function referenceColors(
+  t: Vec3,
+  edit?: (s: Scene, mesh: MeshHandle) => void,
+  target: Vec3 = [0, 0, 0],
+): Uint8Array {
   const s = new Scene();
   try {
     const a = s.addMesh(COLORED.positions, COLORED.indices);
     const b = s.addMesh(TARGET.positions, TARGET.indices);
     s.setPlacement(a, { rotation: IDENTITY, translation: t });
+    s.setPlacement(b, { rotation: IDENTITY, translation: target });
     edit?.(s, a);
     const f = s.addDistanceField({ name: "d", on: a, to: b, maxDistance: MAX_DISTANCE });
     s.setColoring(a, { field: f, map: "turbo", range: [0, MAX_DISTANCE] });
@@ -104,7 +110,7 @@ function moveReq(k: number): Request {
  * The engine in-process with a small step. `chunks` logs every chunk kind;
  * `onStep` runs on each field step (`"fieldStep"` chunk).
  */
-function engine() {
+function engine(stepPoints = STEP_POINTS) {
   const results: Result[] = [];
   const chunks: string[] = [];
   const waiting: (() => void)[] = [];
@@ -140,7 +146,7 @@ function engine() {
     },
     {
       debug: true,
-      stepPoints: STEP_POINTS,
+      stepPoints,
       onChunk: (chunk) => {
         chunks.push(chunk.kind);
         if (chunk.kind === "fieldStep") {
@@ -308,6 +314,177 @@ describe("stepped field updates in the Worker", () => {
       s.edit(mesh, [{ op: "setPositions", vertices: [30], positions: moved }]);
     });
     expect(await dumpColors(h, 1)).toEqual(expected);
+  });
+});
+
+/**
+ * Places the coloured mesh at `pose(3)` (a unit over meshes 1 and 2), sends
+ * `stale` after its first step, and waits for both results. Returns them and
+ * the chunks logged since.
+ */
+async function placeThen(h: ReturnType<typeof engine>, stale: Request[]) {
+  const first = h.results.length;
+  const chunksBefore = h.chunks.length;
+  let once = true;
+  h.onStep = () => {
+    if (once) {
+      once = false;
+      h.later(stale);
+    }
+  };
+  h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: pose(3), key: "placement:1" }]);
+  await h.until(first + 2);
+  h.onStep = undefined;
+  const [placed, after] = h.results.slice(first);
+  return { placed, after, chunks: h.chunks.slice(chunksBefore) };
+}
+
+describe("stale-making requests mid-unit", () => {
+  it("cancel_abandons_unit", async () => {
+    const h = engine();
+    await setup(h);
+    h.send([{ kind: "drag", rev: rev(), id: 1, phase: "begin", key: "placement:1" }]);
+    await h.until(2);
+    const chunksBefore = h.chunks.length;
+    let once = true;
+    h.onStep = () => {
+      if (once) {
+        once = false;
+        h.later([{ kind: "drag", rev: rev(), id: 1, phase: "cancel", key: "placement:1" }]);
+      }
+    };
+    h.send([moveReq(3)]);
+    await h.until(4);
+    h.onStep = undefined;
+    const [moved, cancelled] = h.results.slice(2);
+
+    expect(h.chunks.slice(chunksBefore).filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    expect(recolors(moved, 1)).toBe(false);
+    expect(cancelled.status).toEqual([{ key: "placement:1", rev: revision, status: "ready" }]);
+    // The restored (start) pose.
+    expect(await dumpColors(h, 1)).toEqual(referenceColors([0, 0, 0]));
+  });
+
+  it("queued_moves_do_not_reopen_units", async () => {
+    const h = engine();
+    await setup(h);
+    h.send([{ kind: "drag", rev: rev(), id: 1, phase: "begin", key: "placement:1" }]);
+    await h.until(2);
+    const chunksBefore = h.chunks.length;
+    let once = true;
+    h.onStep = () => {
+      if (once) {
+        once = false;
+        // Three move batches queued at once, mid-unit.
+        const batches = [[moveReq(2)], [moveReq(3)], [moveReq(4)]];
+        queueMicrotask(() => {
+          for (const batch of batches) {
+            h.send(batch);
+          }
+        });
+      }
+    };
+    h.send([moveReq(1)]);
+    await h.until(6);
+    h.onStep = undefined;
+    const moves = h.results.slice(2);
+
+    expect(moves.map((r) => recolors(r, 1))).toEqual([false, false, false, true]);
+    // The first move's unit steps once and is abandoned; the batches in
+    // between (their moves superseded) open no unit; the last pose's unit
+    // runs to completion.
+    const chunks = h.chunks.slice(chunksBefore);
+    const steps = chunks.length - 4;
+    expect(steps).toBeGreaterThan(2);
+    expect(chunks).toEqual(["drag", "fieldStep", "fieldStepAbandon", "drag", ...Array(steps).fill("fieldStep")]);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(4)));
+  });
+
+  it("undo_abandons_unit", async () => {
+    const h = engine();
+    await setup(h);
+    const undo: Request = { kind: "undo", rev: rev() };
+    const { placed, after, chunks } = await placeThen(h, [undo]);
+    expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    expect(recolors(placed, 1)).toBe(false);
+    expect(after.status).toEqual([{ key: "history", rev: undo.rev, status: "ready" }]);
+    // The placement undone.
+    expect(await dumpColors(h, 1)).toEqual(referenceColors([0, 0, 0]));
+  });
+
+  it("remove_mesh_abandons_unit", async () => {
+    const h = engine();
+    await setup(h);
+    const remove: Request = { kind: "removeMesh", rev: rev(), id: 2 };
+    const { placed, after, chunks } = await placeThen(h, [remove]);
+    expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    expect(recolors(placed, 1)).toBe(false);
+    expect(after.status).toEqual([{ key: "mesh:2", rev: remove.rev, status: "ready" }]);
+    // The removal dropped the field and its colouring: nothing is due (one
+    // idle step), and the coloured mesh has no colours left.
+    expect(chunks.at(-1)).toBe("fieldStep");
+    expect(chunks.slice(chunks.indexOf("fieldStepAbandon") + 1)).toEqual(["removeMesh", "fieldStep"]);
+    expect(await dumpColors(h, 1)).toBeNull();
+  });
+
+  it("target_move_abandons_unit", async () => {
+    const h = engine();
+    await setup(h);
+    const target: Vec3 = [0.2, 0.1, -0.15];
+    const { placed, after, chunks } = await placeThen(h, [
+      { kind: "setPlacement", rev: rev(), id: 2, rotation: IDENTITY, translation: target, key: "placement:2" },
+    ]);
+    expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    expect(recolors(placed, 1)).toBe(false);
+    expect(recolors(after, 1)).toBe(true);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(3), undefined, target));
+  });
+
+  it("step_error_ends_unit", async () => {
+    const h = engine();
+    await setup(h);
+    // The third step fails as a field error would: the unit is dropped (its
+    // fields stay due) and the step throws a coded error.
+    const proto = WasmScene.prototype as unknown as {
+      field_step(points: number): number;
+      abandon_field_step(): void;
+    };
+    const original = proto.field_step;
+    let calls = 0;
+    proto.field_step = function (this: typeof proto, points: number) {
+      if (++calls === 3) {
+        this.abandon_field_step();
+        throw new Error("INVALID_ARGUMENT: field step failed (test)");
+      }
+      return original.call(this, points);
+    };
+    let placed: Result;
+    const chunksBefore = h.chunks.length;
+    try {
+      h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: pose(3), key: "placement:1" }]);
+      await h.until(2);
+      placed = h.results[1];
+    } finally {
+      proto.field_step = original;
+    }
+    // Swallowed like a failed eager update: the batch completes once, with
+    // no loop and no colours; its status is ready.
+    expect(h.chunks.slice(chunksBefore)).toEqual(["setPlacement", "fieldStep", "fieldStep", "fieldStep"]);
+    expect(recolors(placed, 1)).toBe(false);
+    expect(placed.status).toEqual([{ key: "placement:1", rev: revision, status: "ready" }]);
+    // The fields stayed due: the next read brings them up to date.
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(3)));
+  });
+
+  it("step_points_clamped", async () => {
+    const h = engine(0);
+    await setup(h);
+    const chunksBefore = h.chunks.length;
+    h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: pose(3), key: "placement:1" }]);
+    await h.until(2);
+    // One vertex a step: many steps, and the unit completes.
+    expect(h.chunks.slice(chunksBefore).filter((c) => c === "fieldStep").length).toBeGreaterThan(STEP_POINTS);
+    expect(recolors(h.results[1], 1)).toBe(true);
   });
 });
 

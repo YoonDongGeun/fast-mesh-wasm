@@ -869,7 +869,6 @@ impl WasmScene {
 
     /// Defers Eager field updates to [`WasmScene::field_step`]; see
     /// [`Scene::set_defer_fields`].
-    #[wasm_bindgen(js_name = setDeferFields)]
     pub fn set_defer_fields(&mut self, on: bool) {
         self.scene.set_defer_fields(on);
     }
@@ -879,7 +878,6 @@ impl WasmScene {
     /// Returns 0 (idle: nothing was due), 1 (pending) or 2 (done: the unit
     /// was applied). An error also ends the unit: the fields that could be
     /// applied were.
-    #[wasm_bindgen(js_name = fieldStep)]
     pub fn field_step(&mut self, points: u32) -> Result<u8, Error> {
         let budget = FieldBudget::Points(points as usize);
         Ok(match self.scene.field_step(budget)? {
@@ -890,14 +888,12 @@ impl WasmScene {
     }
 
     /// Drops the open step unit, if any; see [`Scene::abandon_field_step`].
-    #[wasm_bindgen(js_name = abandonFieldStep)]
     pub fn abandon_field_step(&mut self) {
         self.scene.abandon_field_step();
     }
 
     /// The meshes of the open step unit's fields as flat `[index,
     /// generation, ...]` pairs, each once; empty when no unit is open.
-    #[wasm_bindgen(js_name = fieldStepMeshes)]
     pub fn field_step_meshes(&self) -> Vec<u32> {
         self.scene
             .field_step_meshes()
