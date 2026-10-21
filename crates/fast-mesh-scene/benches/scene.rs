@@ -26,8 +26,11 @@
 //!
 //! **Wide drag**: the same drag with `max_distance` 8 and the colour range 0
 //! to 6, the 9a JS "wide" case, where nearly every vertex is in range and
-//! every pose recomputes almost all of them. At 1M, and at 10M
-//! (`terrain(2237)`) with `FAST_MESH_BENCH_10M=1`.
+//! every pose recomputes almost all of them. It runs 4 of the 64 poses,
+//! spread across the drag (0, 16, 32 and 48), so that a run takes minutes.
+//! At 1M, and at 10M (`terrain(2237)`) with `FAST_MESH_BENCH_10M=1`. The
+//! drag benchmarks build their scenes and run their setup pass only when
+//! criterion runs them, and the setup pass prints the time per pose.
 //!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
 //! dragged across a terrain through 64 poses (and across three terrains of
@@ -449,14 +452,26 @@ fn field_scene(
 
 fn bench_fields(c: &mut Criterion, label: &str, n: u32) {
     let group = format!("scene fields {label}");
-    bench_drag(c, &group, label, n, FIELD_DISTANCE, FIELD_RANGE, |name| {
-        format!("{name}: set_placement + update_fields + colors, all 64 poses")
-    });
+    let all: Vec<usize> = (0..64).collect();
+    bench_drag(
+        c,
+        &group,
+        label,
+        n,
+        &all,
+        FIELD_DISTANCE,
+        FIELD_RANGE,
+        |name| format!("{name}: set_placement + update_fields + colors, all 64 poses"),
+    );
 }
+
+/// The poses of [`poses`] the wide drag runs, spread across the drag. One
+/// wide pose takes seconds, so all 64 would make a criterion run take hours.
+const WIDE_POSES: [usize; 4] = [0, 16, 32, 48];
 
 /// The field drag of [`bench_fields`] with the wide `max_distance` 8 of the
 /// 9a JS "wide" case, where nearly every vertex is in range and every pose
-/// recomputes almost all of them.
+/// recomputes almost all of them, over [`WIDE_POSES`].
 fn bench_wide_drag(c: &mut Criterion, label: &str, n: u32) {
     let group = format!("scene wide drag {label}");
     bench_drag(
@@ -464,55 +479,78 @@ fn bench_wide_drag(c: &mut Criterion, label: &str, n: u32) {
         &group,
         label,
         n,
+        &WIDE_POSES,
         WIDE_DISTANCE,
         WIDE_RANGE,
         str::to_owned,
     );
 }
 
-/// Drags B through the 64 poses of [`poses`] over A, with the field on A
-/// only and on both meshes (see [`field_scene`]), in the criterion group
-/// `group`; `bench_name` names each benchmark from its variant.
+/// Drags B through the poses at `indices` of [`poses`] over A, with the
+/// field on A only and on both meshes (see [`field_scene`]), in the
+/// criterion group `group`; `bench_name` names each benchmark from its
+/// variant. Each iteration runs every pose once.
+///
+/// A variant's scene is built, and its setup pass run, only when criterion
+/// runs that benchmark, so runs filtered to other benchmarks pay nothing.
+/// The setup pass runs each pose once, from the second around to the first
+/// (B starts at the first), and prints what they recolour and how long each
+/// takes.
+#[allow(clippy::too_many_arguments)] // The scene, the poses, the field and the name.
 fn bench_drag(
     c: &mut Criterion,
     group: &str,
     label: &str,
     n: u32,
+    indices: &[usize],
     max_distance: f64,
     range: (f32, f32),
     bench_name: impl Fn(&str) -> String,
 ) {
     let touching = poses(f64::from(n));
-    let placements: Vec<Placement> = touching.iter().map(placement).collect();
+    let placements: Vec<Placement> = indices.iter().map(|&i| placement(&touching[i])).collect();
+    let count = placements.len();
     let mut group = c.benchmark_group(group);
     group.sample_size(10);
-    group.throughput(Throughput::Elements(64));
+    group.throughput(Throughput::Elements(count as u64));
     for (name, both) in [("field on A", false), ("fields on A and B", true)] {
-        let (mut scene, b) = field_scene(n, &placements[0], both, max_distance, range);
-        let ids: Vec<MeshId> = scene.ids().collect();
-        // Setup: what the 64 poses recolour.
-        let (mut dirty, mut worst) = (0usize, 0usize);
-        for p in &placements {
-            scene.set_placement(b, *p).unwrap();
-            scene.update_fields().unwrap();
-            let d: usize = scene
-                .take_changes()
-                .iter()
-                .map(|c| c.colors_dirty.as_ref().map_or(0, Vec::len))
-                .sum();
-            (dirty, worst) = (dirty + d, worst.max(d));
-        }
-        eprintln!(
-            "{name}, {label}, max_distance {max_distance}, over 64 poses: {} vertices \
-             recoloured per pose on average (at most {worst})",
-            dirty / 64
-        );
+        let mut state: Option<(Scene, MeshId, Vec<MeshId>)> = None;
         group.bench_function(bench_name(name), |bn| {
-            bn.iter(|| {
-                for p in &placements {
+            let (scene, b, ids) = state.get_or_insert_with(|| {
+                let (mut scene, b) = field_scene(n, &placements[0], both, max_distance, range);
+                let ids: Vec<MeshId> = scene.ids().collect();
+                // Setup: what the poses recolour, and how long each takes.
+                let (mut dirty, mut worst) = (0usize, 0usize);
+                let mut times = Vec::with_capacity(count);
+                for p in placements.iter().cycle().skip(1).take(count) {
+                    let t = std::time::Instant::now();
                     scene.set_placement(b, *p).unwrap();
                     scene.update_fields().unwrap();
-                    for &m in &ids {
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                    let d: usize = scene
+                        .take_changes()
+                        .iter()
+                        .map(|c| c.colors_dirty.as_ref().map_or(0, Vec::len))
+                        .sum();
+                    (dirty, worst) = (dirty + d, worst.max(d));
+                }
+                let mean = times.iter().sum::<f64>() / count as f64;
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "{name}, {label}, max_distance {max_distance}, over {count} poses: {} \
+                     vertices recoloured per pose on average (at most {worst}); setup pass \
+                     per pose: mean {mean:.1} ms, from {:.1} to {:.1} ms",
+                    dirty / count,
+                    times[0],
+                    times[count - 1]
+                );
+                (scene, b, ids)
+            });
+            bn.iter(|| {
+                for p in &placements {
+                    scene.set_placement(*b, *p).unwrap();
+                    scene.update_fields().unwrap();
+                    for &m in ids.iter() {
                         black_box(scene.colors(m).unwrap());
                     }
                     black_box(scene.take_changes());

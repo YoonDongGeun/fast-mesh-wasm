@@ -7,9 +7,9 @@ Native, single-threaded (`parallel` feature off), i5-13600K, release build,
 
 `cargo bench -p fast-mesh-scene --bench scene -- "wide drag"`, group
 `scene wide drag 1M`: two Lazy `terrain(708)` meshes (1,002,528 triangles,
-502,681 vertices each), B flipped over A through the 64 touching poses of
-`bench_fields`, `max_distance` 8, colour range 0 to 6 (the 9a JS "wide"
-case). `field on A` has one field (A to B); `fields on A and B` adds B to A.
+502,681 vertices each), B flipped over A through 4 of the 64 touching poses
+of `bench_fields` (indices 0, 16, 32 and 48, `WIDE_POSES`), `max_distance`
+8, colour range 0 to 6 (the 9a JS "wide" case). `field on A` has one field (A to B); `fields on A and B` adds B to A.
 Each pose runs `set_placement`, `update_fields`, `colors` and
 `take_changes`. `FAST_MESH_BENCH_10M=1` adds `scene wide drag 10M`
 (`terrain(2237)`, 10,008,338 triangles), which was not run.
@@ -34,22 +34,35 @@ working copy only, and reverted before the commit:
 One timer costs about 52 ns. The per-point timers add about 0.5M of them per
 update (about 26 ms, 0.2% of the total), so the shares are not corrected.
 
-Because one pose takes about 15 s, the profile used the first 8 of the 64
-poses after a 1-pose setup: 7 real updates (pose 0 is the setup pose and
-updates nothing). The numbers below are means per update over those 7.
+Because one pose takes about 15 s, the phase profile used the first 8 of
+the 64 poses after a 1-pose setup: 7 real updates (pose 0 is the setup pose
+and updates nothing). The phase numbers below are means per update over
+poses 1 to 7. They were taken before the bench was cut to `WIDE_POSES`.
 The sign mode was switched through a temporary env var in the bench: `auto`
 (resolves to pseudonormal, the terrain is open) and forced `Winding`.
 
 ## Baseline per pose
 
-Mean over 7 updates (poses 1 to 7), not a criterion median: criterion needs
-at least 10 samples of all 64 poses, about 2.7 h for `field on A` and 5.3 h
-for `fields on A and B`, plus a 64-pose setup pass.
+**The baseline for Tasks 2 and 5** is the committed bench: poses 0, 16, 32
+and 48, auto sign mode, built without the profiling timers. It comes from a
+full criterion run (10 samples, each iteration runs the 4 poses in turn), as
+the criterion median divided by 4. The setup pass of the same run gave
+per-pose means close to it.
+
+| Variant | Criterion median per iteration | **Per pose** | Setup pass, per pose (mean, range) |
+| --- | --- | --- | --- |
+| field on A | 55.559 s [55.462, 55.659] | **13.89 s** | 14.04 s (12.89 to 15.48) |
+| fields on A and B | 111.09 s [110.82, 111.35] | **27.77 s** | 27.66 s (25.71 to 30.74) |
+
+Those 4 poses recolour 221,381 vertices per pose on average for `field on
+A`, and 442,762 for both fields.
+
+From the phase profile (poses 1 to 7, with the timers):
 
 | Variant | Sign mode | Per pose |
 | --- | --- | --- |
-| field on A | auto (pseudonormal) | **14.95 s** |
-| fields on A and B | auto (pseudonormal) | **29.95 s** |
+| field on A | auto (pseudonormal) | 14.95 s |
+| fields on A and B | auto (pseudonormal) | 29.95 s |
 | field on A | winding | 22.11 s |
 | fields on A and B | winding | 44.14 s |
 
@@ -86,8 +99,10 @@ is finite and only B's placement changed, so `prepare_field` asks for A's
 triangles near B. `triangles_near` enumerates every triangle pair within the
 margin (8 plus the rounding pad) and pushes both triangles once per pair
 before sorting and deduplicating. At this range each A triangle has hundreds
-of B triangles within reach, so it tests and records hundreds of millions of
-pairs per pose to find half of A's triangles. The search alone costs about
+of B triangles within reach, so it tests and records an estimated hundreds of
+millions of pairs per pose to find half of A's triangles. That figure is an
+estimate, about 400 B triangles within 8 units of each of 500k near A
+triangles; the pairs were not counted. The search alone costs about
 30 times what recomputing every candidate costs.
 
 The 9a JS figure (~0.4 s per pose) is close to the closest-point plus sign
@@ -106,6 +121,17 @@ for bit. Recomputing more vertices than needed never changes any output.
 1. **Skip the pair enumeration when the near set would be large.**
    Expected: 14.9 s to about 0.5 to 0.9 s per pose for `field on A`
    (roughly 15 to 30 times), pseudonormal.
+   - The estimate includes the extra candidates. Recomputing all 502,681
+     vertices instead of today's 261,621 adds about 241k points. About 15k of
+     the 262k candidates are already out of range today, and the extra ones
+     are out of range too.
+   - Each out-of-range point still costs a bounded closest-point query. If
+     that is as cheap as an in-range one (1.6 µs, an upper bound), the
+     closest-point phase grows from 0.41 s to about 0.8 s.
+   - If the query stops at B's root box, which is likely for most of them,
+     it adds far less, so the phase stays near 0.45 s.
+   - The sign tests (40 ns each) run only for in-range points and do not
+     grow.
    - The simplest exact form is to recompute all of A's vertices, as the full
      path does, when the work estimate (`known` plus the near bound) is a
      large share of A. The 230k vertices beyond reach cost little each,
@@ -128,9 +154,10 @@ for bit. Recomputing more vertices than needed never changes any output.
    - A cached triangle that is dead or moved must not be read: check
      `is_triangle_alive`, or drop the cache on a topology change of B.
    - Covers review focus 1 and 2.
-3. **Winding mode: walk points in spatially coherent batches.** Expected:
-   about 1.3 to 2 times on the winding sign phase (32% of the winding total
-   today, about 90% after item 1).
+3. **Winding mode: walk points in spatially coherent batches.** Expected
+   (unmeasured, a guess from cache behaviour only): about 1.3 to 2 times on
+   the winding sign phase (32% of the winding total today, about 90% after
+   item 1).
    - Points near each other open the same BVH nodes. Visiting a batch of
      neighbouring points per node keeps the moments and the triangles in
      cache.
