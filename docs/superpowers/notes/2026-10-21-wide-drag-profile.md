@@ -173,3 +173,54 @@ for bit. Recomputing more vertices than needed never changes any output.
    entry would skip them. This is a few ns per point, under 1%.
 
 Apply and recolour (4 ms) are not worth touching.
+
+## Task 2 results
+
+Same machine and bench, native, single-threaded, release, at `67503c0`.
+Full criterion run of `cargo bench -p fast-mesh-scene --bench scene --
+"wide drag"` (10 samples, each iteration runs the 4 poses), median
+divided by 4:
+
+| Variant | Criterion median per iteration | **Per pose** | Baseline per pose | Speed-up |
+| --- | --- | --- | --- | --- |
+| field on A | 1.9486 s [1.9433, 1.9540] | **487 ms** | 13.89 s | 28.5× |
+| fields on A and B | 3.9376 s [3.9056, 3.9727] | **984 ms** | 27.77 s | 28.2× |
+
+The values, colours and change records are unchanged (scene property
+tests against the unoptimised paths).
+
+What did it:
+
+1. **Item 1, the near search past a limit** (`bbcb93e`). The near search
+   (`triangles_near_limited`) gives up past one near pair per vertex slot
+   of A, and the update recomputes every vertex. At `max_distance` 8 that
+   costs about 450 ms per field and pose; the abandoned search adds about
+   36 ms (about 70 ns per pair). Measured per pose for `field on A` with
+   the limit at 0, 1, 4 and 16 pairs per slot: 443, 487, 590 and 1,028 ms.
+   One pair per slot keeps the contact and many-mesh drags on the near
+   search; a quarter of a pair per slot already moved
+   `many_mesh_drag_30k` to the recompute (9% slower).
+2. **Item 2, warm start** (`67503c0`). Within noise on this bench. With
+   the limit at 0 and four consecutive poses (0 to 3, not committed),
+   warm and cold ran 453 and 457 ms per pose (criterion medians 1.8135 s
+   and 1.8273 s per 4 poses). The hint is the answer for only about a
+   quarter of the points (B moves several cells per pose at the far
+   edge), and the closest-point query's cost is the descent from the
+   root, which a bound does not shorten. A first version that fell back
+   to the cold query whenever a pruned box came within the rounding
+   window of the answer fell back on 14% of the points and was 10%
+   slower than cold; the committed version visits those boxes instead.
+
+Not done: items 3 (winding batches, not on the bench), 4 (candidate
+bitmap: the recompute path no longer sorts candidates) and 5 (hoisting
+the per-point checks, under 1%).
+
+Contact range, against `f58c958` (criterion `--baseline`, same session):
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| `scene fields 1M`, field on A, 64 poses | 111.05 ms (1.74 ms/pose) | 97.03 ms (1.52 ms/pose) |
+| `scene fields 1M`, fields on A and B | 214.31 ms | 194.29 ms |
+| `many_mesh_drag_30k` | 376.98 ms | 360.78 ms |
+| `many_mesh_drag_30k_touching` | 103.46 ms | 100.10 ms |
+| `many_mesh_drag_30k_apart` | 329.99 µs | 344.16 µs |
