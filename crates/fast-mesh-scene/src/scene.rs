@@ -268,6 +268,10 @@ pub struct Scene {
     pub(crate) section_recomputes: usize,
 }
 
+// Every public `&mut self` method of `Scene`, in this file and the others,
+// starts by dropping an open field step unit with `drop_field_unit` (the
+// step calls aside), and is listed in the test
+// `fields::tests::mutating_calls_abandon_open_unit`. New ones must do both.
 impl Scene {
     /// An empty scene.
     pub fn new(options: SceneOptions) -> Scene {
@@ -565,8 +569,9 @@ impl Scene {
     /// Brings the mesh's BVH, and its normals if they are on, up to date
     /// now, whatever its mode. Eager fields involving the mesh that were
     /// left stale (for example by this BVH being a stale Manual one) then
-    /// catch up, and so does every stale section entry of the mesh, whatever
-    /// its mode.
+    /// catch up, unless Eager field updates are deferred (see
+    /// [`Scene::set_defer_fields`]): they then stay due. Every stale section
+    /// entry of the mesh catches up too, whatever its mode.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or a BVH or memory error from the update
