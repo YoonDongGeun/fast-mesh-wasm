@@ -21,9 +21,10 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldId, MeshId, MeshOptions,
-    OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError, SceneOptions,
-    SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, UpdateMode,
+    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshId,
+    MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
+    SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
+    UpdateMode,
 };
 use fast_mesh_store::Mesh;
 use wasm_bindgen::prelude::*;
@@ -864,6 +865,47 @@ impl WasmScene {
         Ok(self.scene.set_coloring(id, None)?)
     }
 
+    // ---- Stepped field updates ----
+
+    /// Defers Eager field updates to [`WasmScene::field_step`]; see
+    /// [`Scene::set_defer_fields`].
+    #[wasm_bindgen(js_name = setDeferFields)]
+    pub fn set_defer_fields(&mut self, on: bool) {
+        self.scene.set_defer_fields(on);
+    }
+
+    /// Computes up to `points` candidate vertices of the due Eager fields,
+    /// opening a unit first if none is open; see [`Scene::field_step`].
+    /// Returns 0 (idle: nothing was due), 1 (pending) or 2 (done: the unit
+    /// was applied). An error also ends the unit: the fields that could be
+    /// applied were.
+    #[wasm_bindgen(js_name = fieldStep)]
+    pub fn field_step(&mut self, points: u32) -> Result<u8, Error> {
+        let budget = FieldBudget::Points(points as usize);
+        Ok(match self.scene.field_step(budget)? {
+            StepState::Idle => 0,
+            StepState::Pending => 1,
+            StepState::Done => 2,
+        })
+    }
+
+    /// Drops the open step unit, if any; see [`Scene::abandon_field_step`].
+    #[wasm_bindgen(js_name = abandonFieldStep)]
+    pub fn abandon_field_step(&mut self) {
+        self.scene.abandon_field_step();
+    }
+
+    /// The meshes of the open step unit's fields as flat `[index,
+    /// generation, ...]` pairs, each once; empty when no unit is open.
+    #[wasm_bindgen(js_name = fieldStepMeshes)]
+    pub fn field_step_meshes(&self) -> Vec<u32> {
+        self.scene
+            .field_step_meshes()
+            .into_iter()
+            .flat_map(|m| [m.index(), m.generation()])
+            .collect()
+    }
+
     // ---- Sections ----
 
     /// Adds a section cutting `meshes` (flat pairs) with the world plane
@@ -1468,6 +1510,46 @@ mod tests {
             code(s.set_coloring(ai, ag, f, 0, &rule(&[]))),
             codes::UNKNOWN_FIELD
         );
+    }
+
+    #[test]
+    fn field_step_bindings() {
+        let mut s = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        let f = s
+            .add_distance_field("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        let before = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
+        s.set_defer_fields(true);
+        assert_eq!(s.field_step(1).unwrap(), 0);
+        assert!(s.field_step_meshes().is_empty());
+
+        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.]).unwrap();
+        // Deferred: the values wait for the steps.
+        assert_eq!(s.scene.field_values(s.field(f).unwrap()).unwrap(), before);
+        assert_eq!(s.field_step(1).unwrap(), 1);
+        assert_eq!(s.field_step_meshes(), vec![ai, ag, bi, bg]);
+        s.abandon_field_step();
+        assert!(s.field_step_meshes().is_empty());
+        assert_eq!(s.scene.field_values(s.field(f).unwrap()).unwrap(), before);
+
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match s.field_step(1).unwrap() {
+                1 => continue,
+                state => {
+                    assert_eq!(state, 2);
+                    break;
+                }
+            }
+        }
+        // Six vertices, one per step.
+        assert_eq!(steps, 6);
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
+        assert!((values[0] - 2.).abs() < 1e-6, "{values:?}");
+        assert_eq!(s.field_step(u32::MAX).unwrap(), 0);
     }
 
     /// An edit id list without refs.

@@ -3,7 +3,10 @@
 // (a request, a field build, an operation of a repair list), yielding to the
 // message loop between chunks so newer batches arrive meanwhile: superseded
 // "last wins" requests are dropped and abandoned field builds deferred before
-// they start. After each batch it posts one `Result` with the frame's change
+// they start. Field updates are deferred: after a batch's requests, the
+// fields they left due are computed in steps, and a recompute made stale by a
+// queued request is abandoned at a step boundary (§6.1 of the drag-speed
+// design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
 // statuses and replies. Pure: it talks only through `Port`, so it runs in a
 // browser Worker or in Node `worker_threads`.
@@ -52,8 +55,9 @@ export interface EngineOptions {
   /**
    * Test-only: called after each chunk of work: every request run (`kind`
    * is the request's), every field computed (`"fieldBuild"`, `id` is the
-   * field's client id) and every operation of a repair list run in steps
-   * (`"repairOp"`).
+   * field's client id), every operation of a repair list run in steps
+   * (`"repairOp"`), every field step (`"fieldStep"`) and every abandoned
+   * field step unit (`"fieldStepAbandon"`).
    */
   onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
   /**
@@ -64,10 +68,23 @@ export interface EngineOptions {
    * chunk past the budget. `0` yields after every chunk (tests).
    */
   yieldMs?: number;
+  /**
+   * How many vertices of the due fields one field step computes:
+   * {@link STEP_POINTS} by default. Smaller steps notice a stale recompute
+   * sooner, at the cost of more step boundaries (tests use a few, so that a
+   * unit spans many steps).
+   */
+  stepPoints?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
 export const YIELD_MS = 4;
+
+/** The default {@link EngineOptions.stepPoints}. */
+export const STEP_POINTS = 4096;
+
+/** A step budget that computes a whole unit at once. */
+const ALL_POINTS = 0xffff_ffff;
 
 const now: () => number =
   typeof performance !== "undefined" && typeof performance.now === "function"
@@ -288,12 +305,22 @@ class Engine {
   readonly #yieldMs: number;
   /** When the engine last yielded (or started draining). */
   #yielded = 0;
+  readonly #stepPoints: number;
+  /**
+   * The `display:` statuses of batches whose field step unit was abandoned:
+   * they go with the result of the batch whose unit completes next, so the
+   * keys read "computing" until then.
+   */
+  readonly #held: Result["status"] = [];
 
   constructor(port: Port, options: EngineOptions) {
     this.#port = port;
     this.#debug = options.debug ?? false;
     this.#onChunk = options.onChunk;
     this.#yieldMs = options.yieldMs ?? YIELD_MS;
+    this.#stepPoints = options.stepPoints ?? STEP_POINTS;
+    // Field updates wait for the end of the batch, to be stepped there.
+    this.#scene.setDeferFields(true);
   }
 
   /**
@@ -375,7 +402,7 @@ class Engine {
       while (this.#queue.length > 0) {
         const item = this.#queue.shift() as Item;
         if (item === END) {
-          if (!this.#finish()) {
+          if (!(await this.#stepFields()) || !this.#finish()) {
             return;
           }
         } else if (!(await this.#step(item))) {
@@ -419,6 +446,100 @@ class Engine {
       }
     }
     return true;
+  }
+
+  /**
+   * Brings the fields the batch left due up to date in steps of
+   * {@link EngineOptions.stepPoints} vertices, yielding between them once
+   * the time budget is spent. At each step boundary, when a queued request
+   * makes the unit stale ({@link Engine.#makesStale}), the unit is
+   * abandoned: the batch's result then carries none of its values or
+   * colours, and the `display:` statuses of its meshes are held back until a
+   * later unit completes. Other requests wait for the unit. A field error
+   * ends the unit like a failed eager update: swallowed, the failing fields
+   * stay stale. `false` once the engine is poisoned.
+   */
+  async #stepFields(): Promise<boolean> {
+    const s = this.#scene;
+    const b = this.#batch;
+    let meshes: Set<ClientId> | undefined;
+    for (;;) {
+      let state: ReturnType<Scene["fieldStep"]>;
+      try {
+        state = s.fieldStep(this.#stepPoints);
+      } catch (e) {
+        if (isPoison(e)) {
+          b.status.push(...this.#held.splice(0));
+          this.#poison(b, POISONED, undefined, true);
+          return false;
+        }
+        // The unit is over: the fields that could be applied were.
+        state = "done";
+      }
+      this.#onChunk?.({ kind: "fieldStep" });
+      if (state !== "pending") {
+        b.status.push(...this.#held.splice(0));
+        return true;
+      }
+      meshes ??= new Set(s.fieldStepMeshes().map((h) => this.#meshId(h)));
+      await this.#maybeYield();
+      const stale = meshes;
+      if (this.#queue.some((item) => item !== END && this.#makesStale(item, stale))) {
+        s.abandonFieldStep();
+        this.#onChunk?.({ kind: "fieldStepAbandon" });
+        const kept: Result["status"] = [];
+        for (const st of b.status.splice(0)) {
+          const held = st.key.startsWith("display:") && stale.has(Number(st.key.slice("display:".length)));
+          (held ? this.#held : kept).push(st);
+        }
+        b.status.push(...kept);
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Whether the queued `req` makes a field step unit over `meshes` (the
+   * meshes its fields are on and measured to) stale (§6.1): a drag move or
+   * placement, an edit, repair, compaction or removal of one of them, an
+   * undo or redo, or the removal of a field between two of them.
+   */
+  #makesStale(req: Request, meshes: Set<ClientId>): boolean {
+    switch (req.kind) {
+      case "drag":
+        return meshes.has(req.id) && (req.phase === "move" || (req.phase === "end" && req.rotation !== undefined));
+      case "setPlacement":
+      case "edit":
+      case "repair":
+      case "compact":
+      case "removeMesh":
+        return meshes.has(req.id);
+      case "undo":
+      case "redo":
+        return true;
+      case "field": {
+        const on = this.#fieldMeshes.get(req.field);
+        return req.op === "remove" && on !== undefined && meshes.has(on[0]) && meshes.has(on[1]);
+      }
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Brings every due field up to date at once, for a request that reads
+   * fields (their values, status or colours). A field error is swallowed
+   * like a failed eager update's; a trap is rethrown.
+   */
+  #settleFields(): void {
+    try {
+      // One call computes the whole unit.
+      while (this.#scene.fieldStep(ALL_POINTS) === "pending") {}
+    } catch (e) {
+      if (isPoison(e)) {
+        throw e;
+      }
+    }
   }
 
   /** Posts the finished batch's result; `false` when packing failed (poisoned). */
@@ -717,9 +838,13 @@ class Engine {
         this.#runSection(req);
         return;
       case "query":
+        if (req.name === "fieldStatus" || req.name === "debugDump") {
+          this.#settleFields();
+        }
         b.replies.push({ qid: req.qid, ok: true, value: this.#query(req.name, req.args) });
         return;
       case "fetchFieldValues": {
+        this.#settleFields();
         const values = s.fieldValues(this.#field(req.field)).slice();
         b.replies.push({ qid: req.qid, ok: true, value: values });
         b.transfer.push(values.buffer);
