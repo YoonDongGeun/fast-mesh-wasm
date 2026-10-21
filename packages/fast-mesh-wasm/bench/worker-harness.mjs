@@ -12,9 +12,26 @@
 // The bench asks for the numbers with the message `{ benchStats: true }`
 // (never a request batch) and gets `{ kind: "benchStats", chunks, maxGap }`
 // back, after which both probes start again.
+//
+// The engine yields with a `MessageChannel` tick. In a Node Worker a chain of
+// those ticks starves `parentPort`: no batch is received, and no
+// `setImmediate` runs, until the engine stops (measured: 0 of about 90
+// messages sent at 60 Hz arrived during 1.5 s of 4 ms chunks and ticks). A
+// browser Worker interleaves the two. So here the tick is a `setImmediate`
+// turn, which lets messages in as a browser would: `MessageChannel` is
+// replaced, before the engine is created, by a stand-in that delivers through
+// `setImmediate`. The engine uses `MessageChannel` only for that tick.
 import { parentPort } from "node:worker_threads";
-import "../dist/node.js";
-import { serveEngine } from "../dist/worker-engine.js";
+
+globalThis.MessageChannel = class {
+  constructor() {
+    this.port1 = { onmessage: null, unref() {} };
+    this.port2 = { postMessage: (data) => setImmediate(() => this.port1.onmessage?.({ data })) };
+  }
+};
+
+await import("../dist/node.js");
+const { serveEngine } = await import("../dist/worker-engine.js");
 
 const now = () => performance.now();
 let chunks = [];
