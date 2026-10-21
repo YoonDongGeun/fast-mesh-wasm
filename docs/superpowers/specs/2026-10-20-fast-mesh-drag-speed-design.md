@@ -152,3 +152,52 @@ There is one spec and two plans and PRs: A first, then B.
 - **Threads.** Threaded and single-threaded must match bit for bit on the same op sequence.
 - **Fallback.** On a non-isolated page, the scene runs single-threaded and warns once (dev builds only).
 - **Examples.** Both examples build in CI with the headers configured. Their Vite servers send the COOP/COEP headers; check this with a fetch in CI or a test.
+
+## 8. Part A implementation notes
+
+Part A is on `feat/fast-mesh-drag-speed`, from `f64cc25` on (part of #48). The numbers are in `docs/benchmarks.md`, "Wide-range drag"; the profile is `docs/superpowers/notes/2026-10-21-wide-drag-profile.md`.
+
+### Result
+
+- **The 3× target (§6.3) is met, with about 29×.** Native, single-threaded, 1M wide drag (`maxDistance` 8, `scene wide drag 1M`, poses 0, 16, 32 and 48), at `4fbb41d`: 13.89 s to 484 ms per pose for the field on A (28.7×), and 27.77 s to 960 ms for fields on A and B (28.9×). Re-run at `16cf700`: 483 and 997 ms. Contact drag (1M, `maxDistance` 0.08): 1.74 to 1.48 ms per pose.
+- **What did it.** The profile put 96.6% of a pose in the near-triangle search, which listed every triangle pair within the margin. The search now gives up past one near pair per vertex slot of A (`triangles_near_limited`), and the update then recomputes every vertex of A. This is exact: a vertex's value depends only on its position, the target and `maxDistance`, and the plan compares each value bit for bit.
+- **Warm start was tried and dropped** (`67503c0`, reverted in `acfef5d`). It was within noise (453 against 457 ms per pose). The cached triangle was the answer for only about a quarter of the points, and the query's cost is the descent from the root, which a tighter bound does not shorten. Its exactness also rested on a rounding bound that is not proven on the sliver path of `closest_on_triangle`. §6.3 made it optional, so §4 decision 6 and the warm-start items of §5 and §7 do not apply to part A.
+- **Worker (wasm, one thread).**
+  - The 9a wide drag went from 402 ms to 72 ms per move.
+  - On the native terrain a 1M pose takes 662 ms. At 10M a pose takes 0.74 s (9a terrain) and 6.7 s (native terrain).
+  - During a continuous 60 Hz drag no stale pose finishes. The last pose's colours arrive one recompute after the pointer stops (81 ms and 683 ms at 1M), with no backlog.
+  - The longest Worker block is opening a step unit: about 60 ms at 1M and 0.55 to 0.6 s at 10M.
+- **Step API.**
+  - Rust (additive): `Scene::set_defer_fields`, `field_step(FieldBudget)`, `abandon_field_step`, `field_step_pending` and `field_step_meshes`.
+  - Wasm bindings: `set_defer_fields`, `field_step`, `abandon_field_step` and `field_step_meshes`.
+  - TS: an `@internal` `fieldSteps(scene)` in `scene.ts`, for the Worker engine only. The public TS API is unchanged.
+  - Step budget: 4,096 vertices per step (`STEP_POINTS`), with 9a's 4 ms yield budget.
+
+### Rulings
+
+- The 3× target is measured on the native `scene wide drag 1M` bench against Task 1's baseline (14.95 s per pose, field on A), not against the 9a JS figure, which uses a different terrain. Both numbers are reported. The committed 4-pose bench later re-recorded the baseline as 13.89 s.
+- The committed wide bench must finish in reasonable time. It runs 4 of the 64 poses, so a criterion run takes minutes, not hours.
+- Warm start is dropped: `67503c0` is reverted with its tests and docs. §6.3 makes it optional, it gives no measurable gain, and it carries an unproven exactness risk; the closest-point cost is the root descent. A later per-thread profile may want it back.
+- The ~38 ms unit-open cost stays unsplit in part A. The near-search abort is already bounded, and B's threads shorten it.
+- The Worker engine does not call `take_changes` or queries while a unit it keeps is open. Changes are taken only after a unit completes or is abandoned, which abandon-on-mutate enforces.
+- A compute or finish error drops only that field from the unit, mirroring `update_due`'s per-field isolation. The other fields still apply.
+- Open-time BVH refits and sign rebuilds that survive an abandon are the documented exception to "no trace". They equal what any query would do, and results never depend on them, but `field_status().sign` may reflect a newer build than the values.
+- A drag `cancel` of a unit mesh is stale-making, because it restores a different pose, so it abandons. `clearHistory` and colouring changes wait, because they do not change field inputs.
+- The step API stays internal to the Worker engine and is not public on the TS `Scene` (constraint "API stability"). The bindings follow the WasmScene snake_case naming.
+- Field errors at unit completion stay swallowed, as in 9a's eager behaviour. The failing fields stay stale, and the field shows `ready` rather than `error`.
+- Before opening a unit, the engine peeks at the queue. It does not open one while a stale-maker for the last abandoned unit's meshes is queued.
+- After a completed unit, an already-queued stale-maker still costs one unit open (about 38 ms at 1M wide). This is accepted: it is bounded and does not grow a backlog.
+
+### Left for part B (deferred minors that matter there)
+
+- **The unit open is one call that cannot be split.** It takes about 40 ms native and 60 ms in wasm at 1M wide, and 0.55 to 0.6 s in wasm at 10M (up to 1.06 s seen). It is the Worker's longest block during a drag. Threads in the near search and the preparation shorten it.
+- **There is no cross-field parallelism within a step.** The fields of a unit are stepped one after another. With threads, a step should split across fields as well as across points.
+- **Failing fields stay due** and are retried, at the cost of one unit open, at every later batch end.
+- **One unit open per completed unit** is spent when a stale-maker is already queued, because the pre-open peek knows only the last abandoned unit's meshes.
+- **Mid-range fields near one pair per slot** can switch between the near search and the full recompute from pose to pose. That is about a 9% cost jump, exact either way.
+- **During a continuous drag no intermediate pose is shown** when a recompute takes longer than a frame. Part B's speed-up decides how often poses complete while the pointer moves.
+- **The Node harness yield.**
+  - In a Node `worker_threads` Worker, the engine's `MessageChannel` tick starves `parentPort`. No batch arrives while the engine steps, so nothing is ever abandoned there.
+  - The bench harness swaps in a `setImmediate` tick. `test/harness/node-worker.mjs` and the engine itself are unchanged, since the Worker scene targets browsers.
+  - Part B's threaded Worker tests and benches should check the yield in whichever harness they use.
+- `fields.rs` is about 3,000 lines and should be split.
