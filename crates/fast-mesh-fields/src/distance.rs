@@ -1,7 +1,9 @@
 //! Signed distances from points to a mesh.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_query::{ClosestOptions, QueryError, closest_point};
+use fast_mesh_query::{
+    ClosestHit, ClosestOptions, QueryError, closest_point, closest_point_seeded,
+};
 use fast_mesh_store::{Mesh, par};
 
 use crate::{FieldsError, Result, SignData};
@@ -55,35 +57,13 @@ pub fn signed_distances(
             "points and out must have the same length",
         ));
     }
-    if max_distance.is_nan() || max_distance < 0.0 {
-        return Err(FieldsError::InvalidInput(
-            "max_distance must be zero or greater, and not NaN",
-        ));
-    }
-    if !points_in_b.iter().flatten().all(|c| c.is_finite()) {
-        return Err(FieldsError::InvalidInput("points must be finite"));
-    }
-    if bvh_b.mesh_uid() != mesh_b.uid() {
-        return Err(QueryError::MeshMismatch.into());
-    }
-    if !bvh_b.is_current(mesh_b) {
-        return Err(QueryError::StaleBvh.into());
-    }
-    if !sign.is_current(mesh_b, bvh_b) {
-        return Err(FieldsError::InvalidInput(
-            "sign data is not current for this mesh and BVH",
-        ));
-    }
+    validate(mesh_b, bvh_b, sign, points_in_b, max_distance)?;
     let opts = ClosestOptions { max_distance };
     let value = |p: [f32; 3]| -> Result<f32> {
-        Ok(match closest_point(mesh_b, bvh_b, p, &opts)? {
-            None => f32::INFINITY,
-            Some(hit) if hit.distance == 0.0 => 0.0,
-            Some(hit) if sign.is_inside(mesh_b, bvh_b, p, &hit) => -hit.distance,
-            Some(hit) => hit.distance,
-        })
+        let hit = closest_point(mesh_b, bvh_b, p, &opts)?;
+        Ok(signed(mesh_b, bvh_b, sign, p, hit.as_ref()))
     };
-    if points_in_b.len() < PAR_MIN_POINTS || !par::enabled() || par::force_sequential() {
+    if sequential(points_in_b.len()) {
         for (&p, v) in points_in_b.iter().zip(out.iter_mut()) {
             *v = value(p)?;
         }
@@ -103,6 +83,132 @@ pub fn signed_distances(
         chunk.copy_from_slice(&part);
     }
     Ok(())
+}
+
+/// [`signed_distances`] warm-started from `hints`, one per point: the
+/// triangle of B closest to the point at a previous call, or `u32::MAX` for
+/// none. Each point's closest-point query starts bounded by its hint (see
+/// [`fast_mesh_query::closest_point_seeded`]), so hints from nearby points
+/// make it faster; `out` gets the same values, bit for bit, whatever the
+/// hints (dead or out-of-range ids are ignored).
+///
+/// On return, `hints[i]` is the triangle closest to `points_in_b[i]`, or
+/// `u32::MAX` when the point is far (`out[i]` is `+∞`).
+///
+/// # Errors
+/// As for [`signed_distances`], and [`FieldsError::InvalidInput`] when
+/// `hints` and `points_in_b` differ in length. On error neither `out` nor
+/// `hints` is written.
+pub fn signed_distances_seeded(
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    sign: &SignData,
+    points_in_b: &[[f32; 3]],
+    max_distance: f32,
+    hints: &mut [u32],
+    out: &mut [f32],
+) -> Result<()> {
+    if points_in_b.len() != out.len() || points_in_b.len() != hints.len() {
+        return Err(FieldsError::InvalidInput(
+            "points, hints and out must have the same length",
+        ));
+    }
+    validate(mesh_b, bvh_b, sign, points_in_b, max_distance)?;
+    let opts = ClosestOptions { max_distance };
+    let value = |p: [f32; 3], hint: u32| -> Result<(f32, u32)> {
+        let seed = (hint != u32::MAX).then_some(hint);
+        let hit = closest_point_seeded(mesh_b, bvh_b, p, &opts, seed)?;
+        let triangle = hit.as_ref().map_or(u32::MAX, |h| h.triangle);
+        Ok((signed(mesh_b, bvh_b, sign, p, hit.as_ref()), triangle))
+    };
+    if sequential(points_in_b.len()) {
+        // Each point's hint is read before it is replaced, and no write
+        // happens before every point has succeeded.
+        let mut part = Vec::new();
+        part.try_reserve_exact(points_in_b.len())
+            .map_err(|_| FieldsError::OutOfMemory)?;
+        for (&p, &h) in points_in_b.iter().zip(hints.iter()) {
+            part.push(value(p, h)?);
+        }
+        for ((v, h), (x, t)) in out.iter_mut().zip(hints.iter_mut()).zip(part) {
+            (*v, *h) = (x, t);
+        }
+        return Ok(());
+    }
+    // Every point is computed alone, so chunking changes no value.
+    let oom = || FieldsError::OutOfMemory;
+    let old: &[u32] = hints;
+    let parts = par::map_range(points_in_b.len(), POINT_CHUNK, PAR_MIN_POINTS, oom, |r| {
+        let mut part = Vec::new();
+        part.try_reserve_exact(r.len()).map_err(|_| oom())?;
+        for (&p, &h) in points_in_b[r.clone()].iter().zip(&old[r]) {
+            part.push(value(p, h)?);
+        }
+        Ok(part)
+    })?;
+    for ((chunk, hint), part) in out
+        .chunks_mut(POINT_CHUNK)
+        .zip(hints.chunks_mut(POINT_CHUNK))
+        .zip(parts)
+    {
+        for ((v, h), (x, t)) in chunk.iter_mut().zip(hint).zip(part) {
+            (*v, *h) = (x, t);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a batch of `len` points runs sequentially.
+fn sequential(len: usize) -> bool {
+    len < PAR_MIN_POINTS || !par::enabled() || par::force_sequential()
+}
+
+/// The checks of [`signed_distances`] after the lengths, in its order.
+fn validate(
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    sign: &SignData,
+    points_in_b: &[[f32; 3]],
+    max_distance: f32,
+) -> Result<()> {
+    if max_distance.is_nan() || max_distance < 0.0 {
+        return Err(FieldsError::InvalidInput(
+            "max_distance must be zero or greater, and not NaN",
+        ));
+    }
+    if !points_in_b.iter().flatten().all(|c| c.is_finite()) {
+        return Err(FieldsError::InvalidInput("points must be finite"));
+    }
+    if bvh_b.mesh_uid() != mesh_b.uid() {
+        return Err(QueryError::MeshMismatch.into());
+    }
+    if !bvh_b.is_current(mesh_b) {
+        return Err(QueryError::StaleBvh.into());
+    }
+    if !sign.is_current(mesh_b, bvh_b) {
+        return Err(FieldsError::InvalidInput(
+            "sign data is not current for this mesh and BVH",
+        ));
+    }
+    Ok(())
+}
+
+/// The value at `p` from its closest point of B within the bound: `+∞`
+/// without one, `+0.0` on the surface, otherwise the distance signed by
+/// `sign`.
+fn signed(
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    sign: &SignData,
+    p: [f32; 3],
+    hit: Option<&ClosestHit>,
+) -> f32 {
+    match hit {
+        None => f32::INFINITY,
+        Some(hit) if hit.distance == 0.0 => 0.0,
+        Some(hit) if sign.is_inside(mesh_b, bvh_b, p, hit) => -hit.distance,
+        Some(hit) => hit.distance,
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +549,102 @@ mod tests {
                 assert!(run() == reference, "{mode:?}, {max_distance}: global pool");
                 assert!(par::parallel_entries() > before, "ran sequentially");
             }
+        }
+    }
+
+    #[test]
+    fn seeded_signed_matches() {
+        let mut mesh = terrain(40);
+        let bvh = build_bvh(&mesh);
+        let mut rng = Lcg(17);
+        let points = sample_points(&mesh, &mut rng, 3000, 2.0);
+        let slots = mesh.triangle_slots() as u32;
+        for mode in [SignMode::Pseudonormal, SignMode::Winding] {
+            let sign = SignData::build(&mut mesh, &bvh, mode).unwrap();
+            for max_distance in [f32::INFINITY, 0.5] {
+                let mut want = vec![f32::NAN; points.len()];
+                signed_distances(&mesh, &bvh, &sign, &points, max_distance, &mut want).unwrap();
+                // No hints, then the hints of the first run, then hints of
+                // the wrong points, dead and out-of-range ids among them.
+                let mut hints = vec![u32::MAX; points.len()];
+                let mut shuffled: Vec<u32> = (0..points.len() as u32)
+                    .map(|i| {
+                        if i % 7 == 0 {
+                            slots + i
+                        } else {
+                            (i * 31) % slots
+                        }
+                    })
+                    .collect();
+                for hints in [&mut hints, &mut shuffled] {
+                    for round in 0..2 {
+                        let mut out = vec![f32::NAN; points.len()];
+                        signed_distances_seeded(
+                            &mesh,
+                            &bvh,
+                            &sign,
+                            &points,
+                            max_distance,
+                            hints,
+                            &mut out,
+                        )
+                        .unwrap();
+                        assert!(
+                            bits(&out) == bits(&want),
+                            "{mode:?}, {max_distance}, {round}"
+                        );
+                        for ((&p, &v), &h) in points.iter().zip(&out).zip(hints.iter()) {
+                            if v == f32::INFINITY {
+                                assert_eq!(h, u32::MAX);
+                                continue;
+                            }
+                            let tri = mesh
+                                .triangle(h)
+                                .unwrap()
+                                .map(|i| mesh.positions()[i as usize]);
+                            let d = closest_point(&mesh, &bvh, p, &ClosestOptions::default())
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(d.triangle, h);
+                            assert_eq!(d.distance, v.abs());
+                            assert!(tri.iter().all(|c| c.iter().all(|x| x.is_finite())));
+                        }
+                    }
+                }
+            }
+        }
+        // Hints must match the points.
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Auto).unwrap();
+        let mut out = vec![7.0f32; 2];
+        let mut hints = vec![u32::MAX; 3];
+        assert!(matches!(
+            signed_distances_seeded(&mesh, &bvh, &sign, &points[..2], 1.0, &mut hints, &mut out),
+            Err(FieldsError::InvalidInput(_))
+        ));
+        assert_eq!(out, [7.0; 2]);
+    }
+
+    #[test]
+    fn seeded_signed_distances_bit_identical() {
+        let mut mesh = terrain(120);
+        let bvh = build_bvh(&mesh);
+        let points = sample_points(&mesh, &mut Lcg(37), 8_000, 2.0);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+        let mut want = vec![f32::NAN; points.len()];
+        signed_distances(&mesh, &bvh, &sign, &points, 0.5, &mut want).unwrap();
+        let run = || {
+            let mut hints = vec![u32::MAX; points.len()];
+            let mut out = vec![f32::NAN; points.len()];
+            signed_distances_seeded(&mesh, &bvh, &sign, &points, 0.5, &mut hints, &mut out)
+                .unwrap();
+            (bits(&out), hints)
+        };
+        par::set_force_sequential(true);
+        let reference = run();
+        par::set_force_sequential(false);
+        assert!(reference.0 == bits(&want));
+        for k in POOLS {
+            assert!(par::with_threads(k, run) == reference, "{k} threads");
         }
     }
 

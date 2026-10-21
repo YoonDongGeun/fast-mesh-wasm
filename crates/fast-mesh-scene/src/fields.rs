@@ -34,6 +34,17 @@
 //! undo reporting revived slots as added (the store's `ChangeSet::merge`
 //! reports a reused slot as moved).
 //!
+//! **Warm start.** Each field keeps, per vertex slot of A, the triangle of B
+//! that was closest at its last computation (its hint), and seeds the next
+//! closest-point query with it
+//! ([`signed_distances_seeded`]): the values are the same, bit for bit, and
+//! a hint near the answer bounds the search from the start. (On the 1M wide
+//! drag the gain is within noise: the search descends from the root either
+//! way, and there the cost lies.) The hints
+//! are field state, written only when an update is applied; they are
+//! cleared for slots of A that are added (or reused), and all of them when
+//! B's triangles change or either mesh is renumbered.
+//!
 //! **Several fields in one update** are prepared one after the other (BVHs,
 //! sign data), then computed without writing, in parallel across fields with
 //! the `parallel` feature when there is enough work, then applied in field
@@ -41,7 +52,7 @@
 //! each field is updated alone in turn.
 
 use fast_mesh_fields::{
-    ColorRule, FieldsError, SignData, SignMode, SignStatus, color_of, signed_distances,
+    ColorRule, FieldsError, SignData, SignMode, SignStatus, color_of, signed_distances_seeded,
 };
 use fast_mesh_query::Rigid;
 use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, VertexId, par};
@@ -149,6 +160,9 @@ struct FieldJob {
     near_margin: Option<f64>,
     /// From B's local space into A's, as the pair queries take it.
     b_to_a: Rigid,
+    /// Every hint is dropped: B's triangles changed, or either mesh was
+    /// renumbered.
+    clear_hints: bool,
     /// An estimate of the update's cost, in elements: every vertex slot of
     /// A when all are recomputed; otherwise the known candidates, plus A's
     /// triangle count for the near search (which usually costs the most)
@@ -168,6 +182,9 @@ struct FieldPlan {
     referenced: Option<Vec<bool>>,
     /// The vertices with finite values, ascending.
     finite: Vec<VertexId>,
+    /// The vertices the kernel ran on, ascending, and their new hints.
+    hinted: Vec<VertexId>,
+    hints: Vec<u32>,
     /// Points the kernel ran on.
     #[cfg_attr(not(test), allow(dead_code))]
     recomputed: usize,
@@ -240,6 +257,10 @@ pub(crate) struct Field {
     finite: Vec<VertexId>,
     /// Per vertex slot of A at the last update: alive and used by a triangle.
     referenced: Vec<bool>,
+    /// Per vertex slot of A, the triangle of B closest to it when it was last
+    /// computed, or `u32::MAX` (see the module docs). Shorter than A's slots
+    /// when slots were added since.
+    hints: Vec<u32>,
 }
 
 impl Entry {
@@ -372,6 +393,7 @@ impl Scene {
             fresh: true,
             finite: Vec::new(),
             referenced: Vec::new(),
+            hints: Vec::new(),
         });
         if eager {
             let _ = self.update_field(self.fields.len() - 1);
@@ -731,6 +753,11 @@ impl Scene {
         }
         let b_to_a = self.relative_transform(on, to)?;
         let ma = &self.entry(on)?.mesh;
+        let clear_hints = hook_a.changes.is_none()
+            || hook_b
+                .changes
+                .as_ref()
+                .is_none_or(ChangeSet::topology_changed);
         let changes = hook_a.changes;
         let topology = changes.as_ref().is_some_and(ChangeSet::topology_changed);
         let work = if full {
@@ -759,6 +786,7 @@ impl Scene {
             changes,
             near_margin,
             b_to_a,
+            clear_hints,
             work,
         })
     }
@@ -850,18 +878,31 @@ impl Scene {
             c
         };
 
-        // A's points in B's local space, in f64 then rounded to f32 (§5.2).
+        // A's points in B's local space, in f64 then rounded to f32 (§5.2),
+        // with their hints.
         let xf = job.b_to_a.inverse();
+        let added = |v: VertexId| {
+            job.changes
+                .as_ref()
+                .is_some_and(|c| c.vertices_added.binary_search(&v).is_ok())
+        };
+        let warm = !job.clear_hints && warm_start();
         let mut ids = Vec::new();
         let mut points = Vec::new();
+        let mut hints = Vec::new();
         for &v in &candidates {
             if let Some(p) = ma.position(v).filter(|_| defined(v)) {
                 ids.push(v);
                 points.push(xf.apply(p).map(|c| c as f32));
+                let hint = f.hints.get(v as usize).copied().unwrap_or(u32::MAX);
+                hints.push(if warm && !added(v) { hint } else { u32::MAX });
             }
         }
         let mut out = vec![0.0f32; points.len()];
-        signed_distances(&eb.mesh, &eb.bvh, &f.sign, &points, round_up(md), &mut out)?;
+        let bound = round_up(md);
+        signed_distances_seeded(
+            &eb.mesh, &eb.bvh, &f.sign, &points, bound, &mut hints, &mut out,
+        )?;
 
         let old = ma.channel(&f.channel).ok_or(SceneError::Corrupted)?;
         let mut values = Vec::with_capacity(candidates.len());
@@ -914,6 +955,8 @@ impl Scene {
             referenced,
             finite,
             recomputed: points.len(),
+            hinted: ids,
+            hints,
         })
     }
 
@@ -955,6 +998,27 @@ impl Scene {
         if let Some(r) = plan.referenced {
             f.referenced = r;
         }
+        if job.clear_hints {
+            f.hints.clear();
+        }
+        // The slots exist, so this only fails to allocate; hints are only
+        // an accelerator, so they are then dropped.
+        let slots = self.entries.get(on).map_or(0, |e| e.mesh.vertex_slots());
+        if f.hints.len() < slots && f.hints.try_reserve_exact(slots - f.hints.len()).is_err() {
+            f.hints = Vec::new();
+            return Ok(());
+        }
+        f.hints.resize(slots, u32::MAX);
+        if let Some(c) = &job.changes {
+            for &v in &c.vertices_added {
+                if let Some(h) = f.hints.get_mut(v as usize) {
+                    *h = u32::MAX;
+                }
+            }
+        }
+        for (&v, &h) in plan.hinted.iter().zip(&plan.hints) {
+            f.hints[v as usize] = h;
+        }
         Ok(())
     }
 }
@@ -969,6 +1033,15 @@ fn near_pair_limit(slots: usize) -> usize {
     slots.saturating_mul(NEAR_PAIRS_PER_SLOT)
 }
 
+/// Whether the hints seed the closest-point queries (always, outside tests).
+fn warm_start() -> bool {
+    #[cfg(test)]
+    if !counter::warm() {
+        return false;
+    }
+    true
+}
+
 /// Test-only counts of the vertices field updates recompute, and of the
 /// batches of fields computed in parallel.
 #[cfg(test)]
@@ -981,6 +1054,7 @@ pub(crate) mod counter {
         static RECOMPUTED: Cell<usize> = const { Cell::new(0) };
         static PARALLEL: Cell<usize> = const { Cell::new(0) };
         static NEAR_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+        static WARM: Cell<bool> = const { Cell::new(true) };
     }
 
     /// Overrides the near-pair limit of field updates on this thread
@@ -991,6 +1065,15 @@ pub(crate) mod counter {
 
     pub(crate) fn near_limit() -> Option<usize> {
         NEAR_LIMIT.with(Cell::get)
+    }
+
+    /// Turns the warm start of field updates on this thread on or off.
+    pub(crate) fn set_warm(on: bool) {
+        WARM.with(|c| c.set(on));
+    }
+
+    pub(crate) fn warm() -> bool {
+        WARM.with(Cell::get)
     }
 
     /// Counts `n` recomputed vertices.
@@ -2145,7 +2228,18 @@ mod tests {
                 assert!(out[0] == out[1], "round {round} step {step}");
             }
         }
+        counter::set_warm(true);
         counter::set_near_limit(None);
+    }
+
+    #[test]
+    fn warm_drag_matches_cold() {
+        assert_twins_agree(
+            0xa11ce,
+            12,
+            || counter::set_warm(true),
+            || counter::set_warm(false),
+        );
     }
 
     #[test]
@@ -2177,6 +2271,85 @@ mod tests {
         scene.update_fields().unwrap();
         assert_eq!(counter::take(), 3721);
         assert_matches(&mut scene, f);
+    }
+
+    /// The hints of field `id`.
+    fn hints_of(scene: &Scene, id: FieldId) -> Vec<u32> {
+        scene
+            .fields
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .hints
+            .clone()
+    }
+
+    #[test]
+    fn warm_after_target_edit() {
+        let run = |warm: bool| {
+            counter::set_warm(warm);
+            let (mut scene, a, b) = sheet_and_cube(UpdateMode::Lazy);
+            let f = scene.add_distance_field(field("d", a, b, 0.25)).unwrap();
+            let rule = distance_rule(0.2, 0.1);
+            scene
+                .set_coloring(a, Some(Coloring { field: f, rule }))
+                .unwrap();
+            update_all(&mut scene);
+            let mut out = vec![seen(&mut scene, [a, b])];
+            let hinted = |scene: &Scene| {
+                let mut t: Vec<u32> = hints_of(scene, f)
+                    .into_iter()
+                    .filter(|&h| h != u32::MAX)
+                    .collect();
+                t.sort_unstable();
+                t.dedup();
+                t
+            };
+            let first = hinted(&scene);
+            if warm {
+                assert!(first.len() >= 2, "hints {first:?}");
+            }
+            // Move the corners of a hinted triangle: the hint stays and now
+            // names a moved triangle.
+            let t = first[0];
+            let corners = scene.mesh(b).unwrap().triangle(t).unwrap();
+            scene
+                .edit(b, |tx| {
+                    let moved: Vec<[f32; 3]> = corners
+                        .iter()
+                        .map(|&v| tx.mesh().position(v).unwrap().map(|c| c * 1.1 - 0.02))
+                        .collect();
+                    tx.set_positions(&corners, &moved)
+                })
+                .unwrap();
+            update_all(&mut scene);
+            out.push(seen(&mut scene, [a, b]));
+            if warm {
+                assert!(hinted(&scene).contains(&t), "moved triangle {t} not hinted");
+            }
+            // Remove hinted triangles: no hint may name them afterwards.
+            let gone: Vec<u32> = hinted(&scene).into_iter().take(3).collect();
+            scene.edit(b, |tx| tx.remove_triangles(&gone)).unwrap();
+            update_all(&mut scene);
+            out.push(seen(&mut scene, [a, b]));
+            let now = hinted(&scene);
+            assert!(gone.iter().all(|t| !now.contains(t)), "{gone:?} in {now:?}");
+            // And drag on.
+            for k in 1..4 {
+                let d = 0.01 * k as f64;
+                scene
+                    .set_placement(b, turned(d * 40.0, [d, -d, d]))
+                    .unwrap();
+                update_all(&mut scene);
+                out.push(seen(&mut scene, [a, b]));
+            }
+            assert_matches(&mut scene, f);
+            out
+        };
+        let warm = run(true);
+        let cold = run(false);
+        counter::set_warm(true);
+        assert!(warm == cold);
     }
 
     #[test]
