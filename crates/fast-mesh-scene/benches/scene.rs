@@ -24,6 +24,11 @@
 //! (a second field from B to A, both meshes coloured). Setup prints the
 //! number of recoloured vertices per pose.
 //!
+//! **Wide drag**: the same drag with `max_distance` 8 and the colour range 0
+//! to 6, the 9a JS "wide" case, where nearly every vertex is in range and
+//! every pose recomputes almost all of them. At 1M, and at 10M
+//! (`terrain(2237)`) with `FAST_MESH_BENCH_10M=1`.
+//!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
 //! dragged across a terrain through 64 poses (and across three terrains of
 //! 333k triangles side by side, one section over all three), 100 vertices
@@ -380,9 +385,25 @@ fn bench_overhead(c: &mut Criterion, label: &str, n: u32) {
 /// The `max_distance` of the field benchmarks.
 const FIELD_DISTANCE: f64 = 0.08;
 
+/// The colour range of the field benchmarks: from contact.
+const FIELD_RANGE: (f32, f32) = (-0.08, 0.0);
+
+/// The `max_distance` of the wide drag benchmarks, the 9a JS "wide" case.
+const WIDE_DISTANCE: f64 = 8.0;
+
+/// The colour range of the wide drag benchmarks, as the 9a JS "wide" case.
+const WIDE_RANGE: (f32, f32) = (0.0, 6.0);
+
 /// Two Lazy terrains with B at the first pose, a field on A to B, and on B
-/// to A when `both` is true, each field's mesh coloured from contact.
-fn field_scene(n: u32, first: &Placement, both: bool) -> (Scene, MeshId) {
+/// to A when `both` is true, each with `max_distance` and its mesh coloured
+/// over `range`.
+fn field_scene(
+    n: u32,
+    first: &Placement,
+    both: bool,
+    max_distance: f64,
+    range: (f32, f32),
+) -> (Scene, MeshId) {
     let lazy = |placement| MeshOptions {
         mode: UpdateMode::Lazy,
         placement,
@@ -395,7 +416,7 @@ fn field_scene(n: u32, first: &Placement, both: bool) -> (Scene, MeshId) {
     let b = scene.add_mesh(terrain(n), lazy(*first)).unwrap();
     let rule = ColorRule {
         map: Colormap::Turbo,
-        range: (-0.08, 0.0),
+        range,
         below: OutOfRange::Clamp,
         above: OutOfRange::Base,
         center: None,
@@ -413,7 +434,7 @@ fn field_scene(n: u32, first: &Placement, both: bool) -> (Scene, MeshId) {
                 name: "d".to_owned(),
                 on,
                 to,
-                max_distance: FIELD_DISTANCE,
+                max_distance,
                 sign: SignMode::Auto,
             })
             .unwrap();
@@ -427,13 +448,47 @@ fn field_scene(n: u32, first: &Placement, both: bool) -> (Scene, MeshId) {
 }
 
 fn bench_fields(c: &mut Criterion, label: &str, n: u32) {
+    let group = format!("scene fields {label}");
+    bench_drag(c, &group, label, n, FIELD_DISTANCE, FIELD_RANGE, |name| {
+        format!("{name}: set_placement + update_fields + colors, all 64 poses")
+    });
+}
+
+/// The field drag of [`bench_fields`] with the wide `max_distance` 8 of the
+/// 9a JS "wide" case, where nearly every vertex is in range and every pose
+/// recomputes almost all of them.
+fn bench_wide_drag(c: &mut Criterion, label: &str, n: u32) {
+    let group = format!("scene wide drag {label}");
+    bench_drag(
+        c,
+        &group,
+        label,
+        n,
+        WIDE_DISTANCE,
+        WIDE_RANGE,
+        str::to_owned,
+    );
+}
+
+/// Drags B through the 64 poses of [`poses`] over A, with the field on A
+/// only and on both meshes (see [`field_scene`]), in the criterion group
+/// `group`; `bench_name` names each benchmark from its variant.
+fn bench_drag(
+    c: &mut Criterion,
+    group: &str,
+    label: &str,
+    n: u32,
+    max_distance: f64,
+    range: (f32, f32),
+    bench_name: impl Fn(&str) -> String,
+) {
     let touching = poses(f64::from(n));
     let placements: Vec<Placement> = touching.iter().map(placement).collect();
-    let mut group = c.benchmark_group(format!("scene fields {label}"));
+    let mut group = c.benchmark_group(group);
     group.sample_size(10);
     group.throughput(Throughput::Elements(64));
     for (name, both) in [("field on A", false), ("fields on A and B", true)] {
-        let (mut scene, b) = field_scene(n, &placements[0], both);
+        let (mut scene, b) = field_scene(n, &placements[0], both, max_distance, range);
         let ids: Vec<MeshId> = scene.ids().collect();
         // Setup: what the 64 poses recolour.
         let (mut dirty, mut worst) = (0usize, 0usize);
@@ -448,25 +503,22 @@ fn bench_fields(c: &mut Criterion, label: &str, n: u32) {
             (dirty, worst) = (dirty + d, worst.max(d));
         }
         eprintln!(
-            "{name}, {label}, max_distance {FIELD_DISTANCE}, over 64 poses: {} vertices \
+            "{name}, {label}, max_distance {max_distance}, over 64 poses: {} vertices \
              recoloured per pose on average (at most {worst})",
             dirty / 64
         );
-        group.bench_function(
-            format!("{name}: set_placement + update_fields + colors, all 64 poses"),
-            |bn| {
-                bn.iter(|| {
-                    for p in &placements {
-                        scene.set_placement(b, *p).unwrap();
-                        scene.update_fields().unwrap();
-                        for &m in &ids {
-                            black_box(scene.colors(m).unwrap());
-                        }
-                        black_box(scene.take_changes());
+        group.bench_function(bench_name(name), |bn| {
+            bn.iter(|| {
+                for p in &placements {
+                    scene.set_placement(b, *p).unwrap();
+                    scene.update_fields().unwrap();
+                    for &m in &ids {
+                        black_box(scene.colors(m).unwrap());
                     }
-                })
-            },
-        );
+                    black_box(scene.take_changes());
+                }
+            })
+        });
     }
     group.finish();
 }
@@ -881,6 +933,11 @@ fn benches(c: &mut Criterion) {
     bench_sections(c);
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);
+    bench_wide_drag(c, "1M", 708);
+    if std::env::var_os("FAST_MESH_BENCH_10M").is_some() {
+        // 2237: 10,008,338 triangles.
+        bench_wide_drag(c, "10M", 2237);
+    }
     bench_contacts(c);
     // 122: 29,768 triangles per mesh; 708: 1,002,528. Neighbours overlap by
     // an eighth of the side, by one cell, or are a whole side apart.
