@@ -3,7 +3,7 @@
 use fast_mesh_bvh::{BuildOptions, Bvh, UpdatePolicy};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
 
-use crate::fields::{ColorState, Field, FieldHook};
+use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::normals::NormalState;
@@ -259,6 +259,10 @@ pub struct Scene {
     pub(crate) sections: Vec<Section>,
     /// The id the next `add_section` hands out.
     pub(crate) next_section: u32,
+    /// Eager field updates are left due (see [`Scene::set_defer_fields`]).
+    pub(crate) defer_fields: bool,
+    /// The open field step unit (see [`Scene::field_step`]).
+    pub(crate) field_unit: Option<FieldUnit>,
     /// Test-only count of section entry recomputes.
     #[cfg(test)]
     pub(crate) section_recomputes: usize,
@@ -279,6 +283,8 @@ impl Scene {
             next_field: 0,
             sections: Vec::new(),
             next_section: 0,
+            defer_fields: false,
+            field_unit: None,
             #[cfg(test)]
             section_recomputes: 0,
         }
@@ -294,6 +300,7 @@ impl Scene {
     /// [`SceneError::InvalidInput`] for an invalid placement, or a BVH or
     /// memory error from the build. The scene is unchanged on error.
     pub fn add_mesh(&mut self, mesh: Mesh, options: MeshOptions) -> Result<MeshId> {
+        self.drop_field_unit();
         options.placement.validate()?;
         let mut bvh = Bvh::build(&mesh, &options.build)?;
         bvh.set_policy(options.bvh_policy)?;
@@ -327,6 +334,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn remove_mesh(&mut self, id: MeshId) -> Result<Mesh> {
+        self.drop_field_unit();
         self.entry(id)?;
         // Reserve first so no report can be lost after the removal.
         for s in &mut self.subscribers {
@@ -377,6 +385,7 @@ impl Scene {
         id: MeshId,
         f: impl FnOnce(&mut Transaction) -> std::result::Result<R, E>,
     ) -> Result<R> {
+        self.drop_field_unit();
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         // Make room first, so recording cannot fail after the commit.
         self.history.reserve()?;
@@ -401,6 +410,7 @@ impl Scene {
     /// Edits and placement changes until the matching [`Scene::end_step`]
     /// are undone and redone together, across meshes.
     pub fn begin_step(&mut self) {
+        self.drop_field_unit();
         self.history.begin();
     }
 
@@ -411,6 +421,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::StepNotOpen`] when no step is open.
     pub fn end_step(&mut self) -> Result<()> {
+        self.drop_field_unit();
         self.history.end(&mut self.entries)
     }
 
@@ -424,6 +435,7 @@ impl Scene {
     /// [`SceneError::Corrupted`] means that even restoring them failed, with
     /// the consequences described for [`Scene::undo`].
     pub fn cancel_step(&mut self) -> Result<()> {
+        self.drop_field_unit();
         let done = self.history.cancel(&mut self.entries);
         let done = self.after_corrupted(done)?;
         self.absorb(done);
@@ -471,6 +483,7 @@ impl Scene {
     /// match the meshes, so the caller should consider
     /// [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
+        self.drop_field_unit();
         let done = self.history.undo(&mut self.entries);
         let done = self.after_corrupted(done)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -483,6 +496,7 @@ impl Scene {
     /// # Errors
     /// As for [`Scene::undo`].
     pub fn redo(&mut self) -> Result<bool> {
+        self.drop_field_unit();
         let done = self.history.redo(&mut self.entries);
         let done = self.after_corrupted(done)?;
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -505,6 +519,7 @@ impl Scene {
     /// # Errors
     /// None at present; the `Result` leaves room for future checks.
     pub fn clear_history(&mut self) -> Result<()> {
+        self.drop_field_unit();
         self.history.clear(&mut self.entries);
         Ok(())
     }
@@ -539,6 +554,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn set_mode(&mut self, id: MeshId, mode: UpdateMode) -> Result<()> {
+        self.drop_field_unit();
         let entry = self.entry_mut(id)?;
         entry.mode = mode;
         entry.after_change();
@@ -558,6 +574,7 @@ impl Scene {
     /// their pending changes. Then the first section error (for example out
     /// of memory); such entries stay stale.
     pub fn update(&mut self, id: MeshId) -> Result<()> {
+        self.drop_field_unit();
         let entry = self.entry_mut(id)?;
         let bvh = entry.update_bvh();
         let normals = entry.update_normals();
@@ -581,6 +598,7 @@ impl Scene {
     /// brought up to date with [`Scene::update`]. Every mesh and field is
     /// still attempted; those that failed keep their pending changes.
     pub fn flush(&mut self) -> Result<()> {
+        self.drop_field_unit();
         let mut first = Ok(());
         for (_, entry) in self.entries.iter_mut() {
             if entry.mode != UpdateMode::Manual {
@@ -611,6 +629,7 @@ impl Scene {
     /// neither is a mesh whose changes cancel out (for example vertices added
     /// and removed again).
     pub fn take_changes(&mut self) -> Vec<MeshChanges> {
+        self.drop_field_unit();
         // The default subscriber is always first.
         self.take_at(0)
     }
@@ -622,6 +641,7 @@ impl Scene {
     /// A subscriber that never drains keeps accumulating reports (merged
     /// change sets and removals) until it is drained or unsubscribed.
     pub fn subscribe(&mut self) -> SubscriberId {
+        self.drop_field_unit();
         let id = SubscriberId(self.next_subscriber);
         self.next_subscriber += 1;
         for (_, entry) in self.entries.iter_mut() {
@@ -641,6 +661,7 @@ impl Scene {
     /// [`SceneError::InvalidInput`] for an unknown or already removed id, or
     /// for the default subscriber (which backs [`Scene::take_changes`]).
     pub fn unsubscribe(&mut self, id: SubscriberId) -> Result<()> {
+        self.drop_field_unit();
         if id == SubscriberId::DEFAULT {
             return Err(SceneError::InvalidInput(
                 "the default subscriber cannot be removed",
@@ -661,6 +682,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::InvalidInput`] for an unknown or removed subscriber.
     pub fn take_changes_for(&mut self, id: SubscriberId) -> Result<Vec<MeshChanges>> {
+        self.drop_field_unit();
         let i = self.subscriber_index(id)?;
         Ok(self.take_at(i))
     }
@@ -696,6 +718,7 @@ impl Scene {
     /// [`SceneError::UnknownMesh`], or the store's error (for example a
     /// duplicate name). The scene is unchanged on error.
     pub fn add_channel(&mut self, id: MeshId, desc: ChannelDesc) -> Result<()> {
+        self.drop_field_unit();
         check_name(&desc.name)?;
         let entry = self.entry_mut(id)?;
         let name = desc.name.clone();
@@ -715,6 +738,7 @@ impl Scene {
     /// `field:`), [`SceneError::UnknownMesh`], or the store's error for an
     /// unknown name.
     pub fn remove_channel(&mut self, id: MeshId, name: &str) -> Result<ChannelDesc> {
+        self.drop_field_unit();
         check_name(name)?;
         let entry = self.entry_mut(id)?;
         let desc = entry.mesh.remove_channel(name)?;
@@ -732,6 +756,7 @@ impl Scene {
     /// `field:`), [`SceneError::UnknownMesh`], or the store's error for an
     /// unknown or non-derived channel.
     pub fn derived_channel_mut(&mut self, id: MeshId, name: &str) -> Result<&mut [f32]> {
+        self.drop_field_unit();
         check_name(name)?;
         let entry = self.entry_mut(id)?;
         // Look the channel up first, so a failed call reports nothing.
@@ -760,6 +785,7 @@ impl Scene {
     /// [`SceneError::UnknownMesh`], or a store error from the compaction; the
     /// scene is then unchanged.
     pub fn compact(&mut self, id: MeshId) -> Result<Remap> {
+        self.drop_field_unit();
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         let remap = entry.mesh.compact()?;
         // The slots of dropped patches no longer exist: nothing to release.
@@ -828,6 +854,7 @@ impl Scene {
     /// placement is not a proper rotation, or [`SceneError::Store`] when
     /// there is no memory to record it. The scene is unchanged on error.
     pub fn set_placement(&mut self, id: MeshId, placement: Placement) -> Result<()> {
+        self.drop_field_unit();
         placement.validate()?;
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         let old = entry.placement;

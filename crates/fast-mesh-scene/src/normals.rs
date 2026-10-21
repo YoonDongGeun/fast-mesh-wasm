@@ -255,6 +255,7 @@ impl Scene {
     /// [`SceneError::UnknownMesh`], or [`SceneError::Store`] when there is
     /// no memory for them. The scene is unchanged on error.
     pub fn set_normals(&mut self, id: MeshId, on: bool) -> Result<()> {
+        self.drop_field_unit();
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         if on == entry.normals.is_some() {
             return Ok(());

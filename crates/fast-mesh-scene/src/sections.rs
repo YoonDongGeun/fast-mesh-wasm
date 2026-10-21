@@ -444,6 +444,7 @@ impl Scene {
     /// [`SceneError::InvalidInput`] for a mesh listed twice; a memory error.
     /// Never [`SceneError::StaleBvh`]. The scene is unchanged on error.
     pub fn add_section(&mut self, desc: SectionDesc) -> Result<SectionId> {
+        self.drop_field_unit();
         self.check_selection(&desc.meshes)?;
         let next = self
             .next_section
@@ -480,6 +481,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownSection`] for an unknown or removed section.
     pub fn remove_section(&mut self, id: SectionId) -> Result<()> {
+        self.drop_field_unit();
         let i = self.section_index(id)?;
         let s = self.sections.remove(i);
         for se in &s.entries {
@@ -499,6 +501,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownSection`] for an unknown or removed section.
     pub fn set_section_plane(&mut self, id: SectionId, plane: Plane) -> Result<()> {
+        self.drop_field_unit();
         let i = self.section_index(id)?;
         self.sections[i].desc.plane = plane;
         self.restale_section(i);
@@ -516,6 +519,7 @@ impl Scene {
     /// memory error. Never [`SceneError::StaleBvh`]. The scene is unchanged
     /// on error.
     pub fn set_section_meshes(&mut self, id: SectionId, meshes: Vec<MeshId>) -> Result<()> {
+        self.drop_field_unit();
         let i = self.section_index(id)?;
         self.check_selection(&meshes)?;
         let mut entries = try_vec(meshes.len())?;
@@ -564,6 +568,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownSection`] for an unknown or removed section.
     pub fn set_section_fill(&mut self, id: SectionId, fill: bool) -> Result<()> {
+        self.drop_field_unit();
         let i = self.section_index(id)?;
         self.sections[i].desc.fill = fill;
         self.restale_section(i);
@@ -581,6 +586,7 @@ impl Scene {
     /// makes every call return `StaleBvh` until that BVH is brought up to
     /// date with [`Scene::update`]. Every entry is still attempted.
     pub fn update_sections(&mut self) -> Result<()> {
+        self.drop_field_unit();
         self.run_sections(|_| true, None)
     }
 

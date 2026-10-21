@@ -30,7 +30,10 @@
 //! spread across the drag (0, 16, 32 and 48), so that a run takes minutes.
 //! At 1M, and at 10M (`terrain(2237)`) with `FAST_MESH_BENCH_10M=1`. The
 //! drag benchmarks build their scenes and run their setup pass only when
-//! criterion runs them, and the setup pass prints the time per pose.
+//! criterion runs them, and the setup pass prints the time per pose. The
+//! `step` group times the undivided part of a stepped update at the same
+//! poses: `set_placement`, then opening a step unit (the first
+//! `field_step`, of one point), then `abandon_field_step`.
 //!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
 //! dragged across a terrain through 64 poses (and across three terrains of
@@ -61,8 +64,9 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::{Plane, Ray, RayOptions, Rigid, mesh_distance, raycast};
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, Contact, ContactFilter, DistanceField, MeshId, MeshOptions,
-    OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SectionDesc, SignMode, UpdateMode,
+    ColorRule, Coloring, Colormap, Contact, ContactFilter, DistanceField, FieldBudget, MeshId,
+    MeshOptions, OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SectionDesc,
+    SignMode, UpdateMode,
 };
 use fast_mesh_store::Mesh;
 
@@ -484,6 +488,44 @@ fn bench_wide_drag(c: &mut Criterion, label: &str, n: u32) {
         WIDE_RANGE,
         str::to_owned,
     );
+    bench_wide_open(c, &format!("{group} step"), n);
+}
+
+/// Opening a field step unit at the poses of the wide drag, with the field
+/// on A only: `set_placement`, then the first `field_step` (of one point),
+/// which prepares the field and picks its candidates (the near search
+/// included), then `abandon_field_step`. Each pose's unit is abandoned, so
+/// every iteration does the same work. The rest of a unit only computes
+/// values, in steps of any size.
+fn bench_wide_open(c: &mut Criterion, group: &str, n: u32) {
+    let touching = poses(f64::from(n));
+    let placements: Vec<Placement> = WIDE_POSES
+        .iter()
+        .map(|&i| placement(&touching[i]))
+        .collect();
+    let mut group = c.benchmark_group(group);
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(placements.len() as u64));
+    let mut state: Option<(Scene, MeshId)> = None;
+    group.bench_function("field on A: set_placement + open a step unit", |bn| {
+        let (scene, b) = state.get_or_insert_with(|| {
+            let (mut scene, b) = field_scene(n, &placements[0], false, WIDE_DISTANCE, WIDE_RANGE);
+            scene.set_defer_fields(true);
+            let ids: Vec<MeshId> = scene.ids().collect();
+            for m in ids {
+                scene.set_mode(m, UpdateMode::Eager).unwrap();
+            }
+            (scene, b)
+        });
+        bn.iter(|| {
+            for p in &placements {
+                scene.set_placement(*b, *p).unwrap();
+                black_box(scene.field_step(FieldBudget::Points(1)).unwrap());
+                scene.abandon_field_step();
+            }
+        })
+    });
+    group.finish();
 }
 
 /// Drags B through the poses at `indices` of [`poses`] over A, with the
