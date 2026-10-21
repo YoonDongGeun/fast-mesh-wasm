@@ -34,6 +34,6 @@ mod test_util;
 mod winding;
 
 pub use color::{ColorRule, Colormap, OutOfRange, color_of};
-pub use distance::{signed_distances, signed_distances_seeded};
+pub use distance::signed_distances;
 pub use error::{FieldsError, Result};
 pub use sign::{SignData, SignMode, SignStatus};
