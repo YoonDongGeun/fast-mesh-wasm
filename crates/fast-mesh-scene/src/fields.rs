@@ -149,6 +149,9 @@ struct FieldJob {
     near_margin: Option<f64>,
     /// From B's local space into A's, as the pair queries take it.
     b_to_a: Rigid,
+    /// The most near pairs the near search may list (see
+    /// [`NEAR_PAIRS_PER_SLOT`]), decided here on the caller's thread.
+    near_limit: usize,
     /// An estimate of the update's cost, in elements: every vertex slot of
     /// A when all are recomputed; otherwise the known candidates, plus A's
     /// triangle count for the near search (which usually costs the most)
@@ -171,6 +174,9 @@ struct FieldPlan {
     /// Points the kernel ran on.
     #[cfg_attr(not(test), allow(dead_code))]
     recomputed: usize,
+    /// The near search passed its limit, and every vertex was recomputed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    aborted: bool,
 }
 
 /// What happened to one mesh of a field since the field's last update.
@@ -759,6 +765,7 @@ impl Scene {
             changes,
             near_margin,
             b_to_a,
+            near_limit: near_pair_limit(ma.vertex_slots()),
             work,
         })
     }
@@ -805,18 +812,19 @@ impl Scene {
         // pairs: then every vertex is recomputed.
         let mut near = Vec::new();
         let mut all = job.full;
+        let mut aborted = false;
         if let Some(margin) = job.near_margin.filter(|_| !all) {
-            let limit = near_pair_limit(slots);
-            all = !fast_mesh_query::triangles_near_limited(
+            aborted = !fast_mesh_query::triangles_near_limited(
                 ma,
                 &ea.bvh,
                 &eb.mesh,
                 &eb.bvh,
                 &job.b_to_a,
                 round_up(margin),
-                limit,
+                job.near_limit,
                 &mut near,
             )?;
+            all = aborted;
         }
 
         // The vertices to recompute, ascending.
@@ -914,6 +922,7 @@ impl Scene {
             referenced,
             finite,
             recomputed: points.len(),
+            aborted,
         })
     }
 
@@ -922,7 +931,10 @@ impl Scene {
     /// mesh is missing.
     fn apply_field(&mut self, job: FieldJob, plan: FieldPlan) -> Result<()> {
         #[cfg(test)]
-        counter::add(plan.recomputed);
+        {
+            counter::add(plan.recomputed);
+            counter::add_aborted(plan.aborted);
+        }
         let i = job.i;
         let (id, on, to) = (
             self.fields[i].id,
@@ -960,7 +972,8 @@ impl Scene {
 }
 
 /// The most near pairs a field's near search may list for a mesh A of
-/// `slots` vertex slots (see [`NEAR_PAIRS_PER_SLOT`]).
+/// `slots` vertex slots (see [`NEAR_PAIRS_PER_SLOT`]). Called on the thread
+/// that runs the update, as the test override is per thread.
 fn near_pair_limit(slots: usize) -> usize {
     #[cfg(test)]
     if let Some(limit) = counter::near_limit() {
@@ -975,12 +988,23 @@ fn near_pair_limit(slots: usize) -> usize {
 pub(crate) mod counter {
     use std::cell::Cell;
 
-    // Both are counted on the thread that runs the update (when fields are
+    // All are counted on the thread that runs the update (when fields are
     // applied), never on the pool's threads.
     thread_local! {
         static RECOMPUTED: Cell<usize> = const { Cell::new(0) };
         static PARALLEL: Cell<usize> = const { Cell::new(0) };
         static NEAR_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+        static ABORTED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts one near search abandoned past its limit.
+    pub(crate) fn add_aborted(aborted: bool) {
+        ABORTED.with(|c| c.set(c.get() + usize::from(aborted)));
+    }
+
+    /// Near searches abandoned on this thread since the last call.
+    pub(crate) fn take_aborted() -> usize {
+        ABORTED.with(|c| c.replace(0))
     }
 
     /// Overrides the near-pair limit of field updates on this thread
@@ -2117,46 +2141,69 @@ mod tests {
     }
 
     /// Runs the same random walk on two copies of a random scene, the first
-    /// with the switches `on` set, the second with `off` set, and asserts
+    /// with the near-pair limit `on`, the second with `off`, and asserts
     /// after every update that both show the same values, colours and
-    /// reports, bit for bit.
-    fn assert_twins_agree(seed: u64, rounds: usize, on: impl Fn(), off: impl Fn()) {
+    /// reports, bit for bit. Returns, per round, the near searches each copy
+    /// abandoned, and whether the round has a field with a finite
+    /// `max_distance` (only those search).
+    fn assert_twins_agree(
+        seed: u64,
+        rounds: usize,
+        on: usize,
+        off: usize,
+    ) -> Vec<([usize; 2], bool)> {
         let mut rng = Lcg(seed);
+        let mut stats = Vec::new();
         for round in 0..rounds {
             let state = rng.0;
-            let mut twins =
-                [(&on as &dyn Fn(), Lcg(state)), (&off, Lcg(state))].map(|(set, mut r)| {
-                    set();
-                    let (scene, a, b) = twin_scene(&mut r);
-                    (set, r, scene, a, b)
-                });
+            let mut aborted = [0; 2];
+            let mut twins = [(on, Lcg(state)), (off, Lcg(state))].map(|(limit, mut r)| {
+                counter::set_near_limit(Some(limit));
+                let (scene, a, b) = twin_scene(&mut r);
+                (limit, r, scene, a, b)
+            });
             rng.0 = twins[0].1.0;
+            let finite = twins[0]
+                .2
+                .fields
+                .iter()
+                .any(|f| f.desc.max_distance.is_finite());
+            counter::take_aborted();
             for step in 0..30 {
                 let ops = 1 + rng.below(4);
                 let mut out = Vec::new();
-                for (set, r, scene, a, b) in &mut twins {
-                    set();
+                for (k, (limit, r, scene, a, b)) in twins.iter_mut().enumerate() {
+                    counter::set_near_limit(Some(*limit));
                     for _ in 0..ops {
                         random_op(scene, *a, *b, r);
                     }
                     update_all(scene);
                     out.push(seen(scene, [*a, *b]));
+                    aborted[k] += counter::take_aborted();
                 }
-                assert!(out[0] == out[1], "round {round} step {step}");
+                assert_eq!(out[0], out[1], "round {round} step {step}");
             }
+            stats.push((aborted, finite));
         }
         counter::set_near_limit(None);
+        stats
     }
 
     #[test]
     fn near_limit_matches_near_path() {
         // Recomputing every vertex once there is any near pair, against
         // always listing them.
-        assert_twins_agree(
-            0xb0b,
-            12,
-            || counter::set_near_limit(Some(0)),
-            || counter::set_near_limit(Some(usize::MAX)),
+        let stats = assert_twins_agree(0xb0b, 12, 0, usize::MAX);
+        // The recompute path ran in every round that searches, and never
+        // without a limit.
+        let ran: Vec<bool> = stats.iter().map(|&([on, _], _)| on > 0).collect();
+        let searching: Vec<bool> = stats.iter().map(|&(_, finite)| finite).collect();
+        assert_eq!(ran, searching);
+        let off: Vec<usize> = stats.iter().map(|&([_, off], _)| off).collect();
+        assert_eq!(off, vec![0; stats.len()]);
+        assert!(
+            searching.iter().filter(|&&f| f).count() >= 10,
+            "{searching:?}"
         );
     }
 
