@@ -21,6 +21,13 @@
 //!   its triangles changed, the vertices whose "used by a triangle" state
 //!   flipped.
 //!
+//! When the near search would list more than [`NEAR_PAIRS_PER_SLOT`] pairs
+//! of triangles per vertex slot of A, it is abandoned and every vertex is
+//! recomputed instead: at a wide `max_distance` each triangle of A is near
+//! hundreds of B's, and listing the pairs costs far more than the
+//! recompute. Recomputing a vertex outside the near set gives it the value
+//! it already holds, so the values, colours and reports are the same.
+//!
 //! A vertex's value depends only on its own position and on B, so nothing
 //! else can change. Rebuilding B's sign data after an edit of B can flip
 //! signs only of finite values, which the near set covers. This relies on
@@ -111,6 +118,20 @@ fn oom() -> SceneError {
 /// is 1.3 times slower, at 1,352 (about 14k) 1.7 times faster, and at 30k
 /// 2.4 times faster.
 const PAR_MIN_FIELD_WORK: usize = 12 * 1024;
+
+/// Near pairs of triangles per vertex slot of A beyond which a field's near
+/// search is abandoned for recomputing every vertex (see the module docs).
+///
+/// Measured on the i5-13600K with two 1M-triangle terrains, B flipped over
+/// A: a near pair costs about 70 ns to find, and recomputing every vertex
+/// about 450 ms (0.9 µs a slot) at `max_distance` 8, where the search finds
+/// hundreds of pairs per slot and took 14 s. At one pair per slot, an
+/// abandoned search wastes about 8% of the recompute that replaces it. The
+/// contact drag (`max_distance` 0.08) and the many-mesh drags (0.5 between
+/// 30k-triangle terrains) stay under the limit and keep the near search;
+/// a quarter of a pair per slot already sends the latter to the slower
+/// recompute.
+const NEAR_PAIRS_PER_SLOT: usize = 1;
 
 /// A due field whose meshes are prepared: what its update recomputes.
 struct FieldJob {
@@ -779,29 +800,33 @@ impl Scene {
         let slots = ma.vertex_slots();
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
 
+        // A's triangles near B, as `Scene::triangles_near` (with the BVHs
+        // `prepare_field` brought up to date), unless there are too many
+        // pairs: then every vertex is recomputed.
+        let mut near = Vec::new();
+        let mut all = job.full;
+        if let Some(margin) = job.near_margin.filter(|_| !all) {
+            let limit = near_pair_limit(slots);
+            all = !fast_mesh_query::triangles_near_limited(
+                ma,
+                &ea.bvh,
+                &eb.mesh,
+                &eb.bvh,
+                &job.b_to_a,
+                round_up(margin),
+                limit,
+                &mut near,
+            )?;
+        }
+
         // The vertices to recompute, ascending.
-        let candidates: Vec<VertexId> = if job.full {
+        let candidates: Vec<VertexId> = if all {
             (0..slots as VertexId).collect()
         } else {
             let mut c = Vec::new();
-            if let Some(margin) = job.near_margin {
-                // As `Scene::triangles_near`, with the BVHs `prepare_field`
-                // brought up to date.
-                let (mut near, mut near_b) = (Vec::new(), Vec::new());
-                fast_mesh_query::triangles_near(
-                    ma,
-                    &ea.bvh,
-                    &eb.mesh,
-                    &eb.bvh,
-                    &job.b_to_a,
-                    round_up(margin),
-                    &mut near,
-                    &mut near_b,
-                )?;
-                for &t in &near {
-                    if let Some(tri) = ma.triangle(t) {
-                        c.extend_from_slice(&tri);
-                    }
+            for &t in &near {
+                if let Some(tri) = ma.triangle(t) {
+                    c.extend_from_slice(&tri);
                 }
             }
             if job.geometric {
@@ -868,7 +893,7 @@ impl Scene {
                 .zip(&values)
                 .filter(|(_, x)| x.is_finite())
                 .map(|(&v, _)| v);
-            if job.full {
+            if all {
                 now.collect()
             } else {
                 let mut kept: Vec<VertexId> = f
@@ -934,6 +959,16 @@ impl Scene {
     }
 }
 
+/// The most near pairs a field's near search may list for a mesh A of
+/// `slots` vertex slots (see [`NEAR_PAIRS_PER_SLOT`]).
+fn near_pair_limit(slots: usize) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = counter::near_limit() {
+        return limit;
+    }
+    slots.saturating_mul(NEAR_PAIRS_PER_SLOT)
+}
+
 /// Test-only counts of the vertices field updates recompute, and of the
 /// batches of fields computed in parallel.
 #[cfg(test)]
@@ -945,6 +980,17 @@ pub(crate) mod counter {
     thread_local! {
         static RECOMPUTED: Cell<usize> = const { Cell::new(0) };
         static PARALLEL: Cell<usize> = const { Cell::new(0) };
+        static NEAR_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Overrides the near-pair limit of field updates on this thread
+    /// (`None`: the production limit).
+    pub(crate) fn set_near_limit(limit: Option<usize>) {
+        NEAR_LIMIT.with(|c| c.set(limit));
+    }
+
+    pub(crate) fn near_limit() -> Option<usize> {
+        NEAR_LIMIT.with(Cell::get)
     }
 
     /// Counts `n` recomputed vertices.
@@ -2023,6 +2069,114 @@ mod tests {
             .edit(a, |tx| tx.set_positions(&[45], &[[0.5, 0.4, 0.05]]))
             .unwrap();
         scene.update_fields().unwrap();
+    }
+
+    /// Everything a renderer sees of two meshes after an update: every
+    /// field's value bits, both meshes' colours, and the drained reports.
+    type Seen = (
+        Vec<Vec<u32>>,
+        Vec<Option<Vec<[u8; 4]>>>,
+        Vec<crate::MeshChanges>,
+    );
+
+    fn seen(scene: &mut Scene, meshes: [MeshId; 2]) -> Seen {
+        let ids: Vec<FieldId> = scene.fields.iter().map(|f| f.id).collect();
+        let values = ids
+            .iter()
+            .map(|&f| bits(scene.field_values(f).unwrap()))
+            .collect();
+        let colors = meshes
+            .iter()
+            .map(|&m| scene.colors(m).unwrap().map(<[_]>::to_vec))
+            .collect();
+        (values, colors, scene.take_changes())
+    }
+
+    /// A sheet (A) and a cube (B) with a field each way, both coloured,
+    /// with random modes, signs and `max_distance`s (infinite ones too).
+    fn twin_scene(rng: &mut Lcg) -> (Scene, MeshId, MeshId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(sheet(10, 0.1), with_mode(random_mode(rng)))
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.3, 0.3, -0.2], 0.4), with_mode(random_mode(rng)))
+            .unwrap();
+        for (on, to, rule) in [(a, b, distance_rule(0.2, 0.1)), (b, a, contact_rule(0.1))] {
+            let id = scene
+                .add_distance_field(DistanceField {
+                    sign: random_sign(rng),
+                    ..field("d", on, to, random_max_distance(rng))
+                })
+                .unwrap();
+            scene
+                .set_coloring(on, Some(Coloring { field: id, rule }))
+                .unwrap();
+        }
+        (scene, a, b)
+    }
+
+    /// Runs the same random walk on two copies of a random scene, the first
+    /// with the switches `on` set, the second with `off` set, and asserts
+    /// after every update that both show the same values, colours and
+    /// reports, bit for bit.
+    fn assert_twins_agree(seed: u64, rounds: usize, on: impl Fn(), off: impl Fn()) {
+        let mut rng = Lcg(seed);
+        for round in 0..rounds {
+            let state = rng.0;
+            let mut twins =
+                [(&on as &dyn Fn(), Lcg(state)), (&off, Lcg(state))].map(|(set, mut r)| {
+                    set();
+                    let (scene, a, b) = twin_scene(&mut r);
+                    (set, r, scene, a, b)
+                });
+            rng.0 = twins[0].1.0;
+            for step in 0..30 {
+                let ops = 1 + rng.below(4);
+                let mut out = Vec::new();
+                for (set, r, scene, a, b) in &mut twins {
+                    set();
+                    for _ in 0..ops {
+                        random_op(scene, *a, *b, r);
+                    }
+                    update_all(scene);
+                    out.push(seen(scene, [*a, *b]));
+                }
+                assert!(out[0] == out[1], "round {round} step {step}");
+            }
+        }
+        counter::set_near_limit(None);
+    }
+
+    #[test]
+    fn near_limit_matches_near_path() {
+        // Recomputing every vertex once there is any near pair, against
+        // always listing them.
+        assert_twins_agree(
+            0xb0b,
+            12,
+            || counter::set_near_limit(Some(0)),
+            || counter::set_near_limit(Some(usize::MAX)),
+        );
+    }
+
+    #[test]
+    fn wide_reach_recomputes_every_vertex() {
+        let mut scene = Scene::new(SceneOptions::default());
+        // 61 x 61 = 3721 vertices, all within reach of the cube.
+        let a = scene
+            .add_mesh(sheet(60, 1.0 / 60.0), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.4, 0.4, -0.05], 0.1), MeshOptions::default())
+            .unwrap();
+        let f = scene.add_distance_field(field("d", a, b, 2.0)).unwrap();
+        scene.update_fields().unwrap();
+        counter::take();
+        scene.set_placement(b, at(0.002, 0.001, 0.0)).unwrap();
+        scene.update_fields().unwrap();
+        assert_eq!(counter::take(), 3721);
+        assert_matches(&mut scene, f);
     }
 
     #[test]
