@@ -39,8 +39,8 @@ export function bounds(positions: Float64Array): { center: Vec3; radius: number 
 
 /**
  * A triangle soup (3 corners of 3 coordinates per triangle) as an indexed
- * mesh: corners whose positions are bit-identical share a vertex. Nearly
- * equal ones stay apart. An open-addressing hash on the 6 words of each
+ * mesh: corners whose positions are bit-identical share a vertex (after
+ * -0 is made +0, in place). Nearly equal ones stay apart. An open-addressing hash on the 6 words of each
  * corner's f64 coordinates, so a million triangles weld in well under a
  * second.
  */
@@ -57,6 +57,12 @@ export function weldCorners(corners: Float64Array): MeshData {
   const first = new Uint32Array(n);
   const indices = new Uint32Array(n);
   let vertices = 0;
+  // -0 and +0 are the same position with different bits: make every zero +0.
+  for (let i = 0; i < corners.length; i++) {
+    if (corners[i] === 0) {
+      corners[i] = 0;
+    }
+  }
   for (let c = 0; c < n; c++) {
     const w = 6 * c;
     let h = 0x811c9dc5;

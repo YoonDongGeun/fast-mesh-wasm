@@ -97,6 +97,28 @@ endsolid quad
     expect(corners(m)).toEqual(QUAD);
   });
 
+  it("merges -0 and +0 corners (bit patterns differ, positions do not)", () => {
+    const tris = [
+      [
+        [0, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+      ],
+      [
+        [-0, 0, -0],
+        [0, 1, 0],
+        [-1, 0, 0],
+      ],
+    ];
+    const m = parseStl(binaryStl(tris));
+    expect(m.positions.length).toBe(4 * 3);
+    expect(Object.is(m.positions[0], 0)).toBe(true);
+  });
+
+  it("reports a truncated binary STL as a size mismatch", () => {
+    expect(() => parseStl(binaryStl(QUAD).slice(0, 84 + 50 + 20))).toThrow(/2 triangles.*184 bytes.*154/);
+  });
+
   it("rejects what is not STL", () => {
     expect(() => parseStl(text("hello"))).toThrow(/STL/);
     expect(() => parseStl(new ArrayBuffer(90))).toThrow(/STL/);
@@ -136,6 +158,8 @@ f -7 -6 -5
   it("rejects out-of-range indices and files without faces", () => {
     expect(() => parseObj(text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n"))).toThrow(/index/);
     expect(() => parseObj(text("v 0 0 0\n"))).toThrow(/no faces/);
+    expect(() => parseObj(text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n"))).toThrow(/index "0"/);
+    expect(() => parseObj(text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf -1 -2 -4\n"))).toThrow(/before the first vertex/);
   });
 });
 
@@ -229,6 +253,15 @@ describe("parsePly", () => {
   it("rejects big-endian PLY and non-PLY input", () => {
     expect(() => parsePly(binaryPly("binary_big_endian"))).toThrow(/big-endian/);
     expect(() => parsePly(text("solid x\n"))).toThrow(/PLY/);
+  });
+
+  it("rejects a truncated binary PLY", () => {
+    expect(() => parsePly(binaryPly().slice(0, -10))).toThrow(/ends early/);
+  });
+
+  it("ends the header only at an end_header line, not inside a comment", () => {
+    const m = parsePly(text(PLY_ASCII.replace("comment a quad", "comment no end_header here; a quad")));
+    expect(Array.from(m.indices)).toEqual([0, 1, 2, 0, 2, 3]);
   });
 
   it("rejects a face index past the vertices", () => {

@@ -21,6 +21,14 @@ export function parseStl(buffer: ArrayBuffer): MeshData {
   if (/^\s*solid/.test(head)) {
     return checkMesh(parseAscii(new TextDecoder().decode(buffer)), "STL");
   }
+  if (buffer.byteLength >= 84) {
+    const count = new DataView(buffer).getUint32(80, true);
+    if (count > 0) {
+      throw new Error(
+        `binary STL: the header says ${count} triangles (${84 + 50 * count} bytes), but the file has ${buffer.byteLength} bytes`,
+      );
+    }
+  }
   throw new Error("not an STL file (neither binary nor ASCII STL)");
 }
 

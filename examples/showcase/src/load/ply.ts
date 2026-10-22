@@ -118,8 +118,8 @@ function readHeader(bytes: Uint8Array): Header {
   if (!/^ply\s/.test(magic)) {
     throw new Error("not a PLY file");
   }
-  // The header is ASCII and ends with the line "end_header".
-  const end = indexOf(bytes, new TextEncoder().encode("end_header"));
+  // The header is ASCII and ends with the line "end_header" (not the word inside a comment).
+  const end = headerEnd(bytes);
   if (end === -1) {
     throw new Error("PLY: no end_header");
   }
@@ -176,14 +176,22 @@ function readHeader(bytes: Uint8Array): Header {
   return { format, elements, body };
 }
 
-function indexOf(bytes: Uint8Array, needle: Uint8Array): number {
-  outer: for (let i = 0; i + needle.length <= bytes.length; i++) {
+/** Where the line "end_header" starts (after a line end, followed by one or the file's end), or -1. */
+function headerEnd(bytes: Uint8Array): number {
+  const needle = new TextEncoder().encode("end_header");
+  outer: for (let i = 1; i + needle.length <= bytes.length; i++) {
+    if (bytes[i - 1] !== 10) {
+      continue;
+    }
     for (let k = 0; k < needle.length; k++) {
       if (bytes[i + k] !== needle[k]) {
         continue outer;
       }
     }
-    return i;
+    const after = bytes[i + needle.length];
+    if (after === undefined || after === 10 || after === 13 || after === 32 || after === 9) {
+      return i;
+    }
   }
   return -1;
 }
