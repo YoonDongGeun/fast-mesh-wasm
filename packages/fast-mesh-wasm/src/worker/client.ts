@@ -576,8 +576,9 @@ export class WorkerScene implements SceneLike {
 
   /**
    * Listens to a new Worker and sends it the init message. Only the current
-   * Worker is heard (and a handed-off one's batches given back): a replaced
-   * one's late messages and errors are ignored. `keepReady` keeps the start
+   * Worker is heard, and a handed-off one (its batches given back; its
+   * errors poison the scene): a replaced one's late messages and errors are
+   * ignored. `keepReady` keeps the start
    * under way (a Worker replacing one whose thread pool failed).
    */
   #attach(worker: WorkerLike, keepReady = false): WorkerLike {
@@ -600,7 +601,8 @@ export class WorkerScene implements SceneLike {
       }
     });
     worker.addEventListener("error", (e: { message?: string }) => {
-      if (worker !== this.#worker) {
+      // A handed-off Worker too: the batches held for it would wait forever.
+      if (worker !== this.#worker && worker !== this.#handoff?.old) {
         return;
       }
       this.#detach();
@@ -612,7 +614,8 @@ export class WorkerScene implements SceneLike {
     // A result that cannot be deserialised is lost, and with it the order of
     // results: fatal, like a Worker error.
     worker.addEventListener("messageerror", () => {
-      if (worker !== this.#worker) {
+      // A handed-off Worker too: the batches held for it would wait forever.
+      if (worker !== this.#worker && worker !== this.#handoff?.old) {
         return;
       }
       this.#detach();

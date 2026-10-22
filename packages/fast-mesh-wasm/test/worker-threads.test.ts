@@ -190,6 +190,7 @@ class NodeWorker implements WorkerLike {
   holdFallbacks = false;
   readonly fallbacks: { kind: "fallback"; batches: unknown[] }[] = [];
   readonly #message: ((e: { data: unknown }) => void)[] = [];
+  readonly #error: ((e: unknown) => void)[] = [];
 
   constructor(pose: Pose) {
     this.worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), {
@@ -234,6 +235,15 @@ class NodeWorker implements WorkerLike {
   addEventListener(type: "message" | "error" | "messageerror", cb: (e: any) => void): void {
     if (type === "message") {
       this.#message.push(cb);
+    } else if (type === "error") {
+      this.#error.push(cb);
+    }
+  }
+
+  /** Fires `error`, as a Worker that crashes does. */
+  fail(): void {
+    for (const cb of this.#error) {
+      cb({ message: "boom" });
     }
   }
 
@@ -414,6 +424,41 @@ describe("WorkerScene threads", () => {
     expect(workers[2].sent.length).toBe(4);
     expect(scene.threads).toBe(1);
     expect(await scene.intersects(mb, mc)).toBe(false);
+  });
+
+  it("handed_off_worker_error_poisons", async () => {
+    // The restart's Worker fails its pool and crashes while it still owes
+    // batches: the held ones must not wait forever.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { scene, workers } = await start((n) => ({ isolated: true, threaded: n === 1 ? "poolFail" : "fake" }), {
+      threads: 2,
+    });
+    const a = tetra(0);
+    const ma = scene.addMesh(a.positions, a.indices);
+    expect(await scene.intersects(ma, ma)).toBe(true);
+    const restarted = scene.restart();
+    workers[1].holdFallbacks = true;
+    const b = tetra(0.5);
+    const mb = scene.addMesh(b.positions, b.indices);
+    const hit = scene.intersects(ma, mb);
+    await vi.waitFor(() => expect(workers[1].givenBack()).toBe(2));
+    expect(workers[1].fallbacks.map((m) => m.batches.length)).toEqual([0, 1, 1]);
+    // The handoff starts and owes two batches; a query is held behind them.
+    workers[1].release(1);
+    expect(workers).toHaveLength(3);
+    const held = scene.intersects(ma, ma);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    workers[1].fail();
+    await expect(restarted).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    await expect(hit).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    await expect(held).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(workers[1].terminated).toBe(true);
+    expect(workers[2].terminated).toBe(true);
+    // A restart recovers, single-threaded.
+    await scene.restart();
+    expect(workers).toHaveLength(4);
+    expect(workers[3].sent[0]).toMatchObject({ kind: "init", threads: 1 });
+    expect(await scene.intersects(ma, ma)).toBe(true);
   });
 
   it("non_isolated_warns_once_in_dev", async () => {
