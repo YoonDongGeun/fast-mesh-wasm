@@ -6,14 +6,17 @@
 //! that minimum came from.
 //!
 //! Mesh A is an open sheet; B, C and D are cubes around it (closed or with a
-//! face missing), at coordinates around 1000. A has a field to B, C and D
-//! and one to each alone; B has a field to C and A (in that order) and one to
-//! each alone. Every field shares one sign mode and one `max_distance`
-//! (finite or infinite) per case.
+//! face missing), at coordinates around 1000. A has a field to B, C and D,
+//! another to the same meshes in another order (D, B, C), and one to each
+//! alone; B has a field to C and A (in that order) and one to each alone.
+//! Every field shares one sign mode and one `max_distance` (finite or
+//! infinite) per case. The walk also removes target meshes (the reference
+//! is then the single fields of the targets left), and either updates in
+//! one shot or defers the Eager fields and steps them with a random budget.
 
 use fast_mesh_scene::{
-    DistanceField, FieldId, MeshId, MeshOptions, Placement, Scene, SceneError, SceneOptions,
-    SignMode, UpdateMode,
+    DistanceField, FieldBudget, FieldId, MeshId, MeshOptions, Placement, Scene, SceneError,
+    SceneOptions, SignMode, StepState, UpdateMode,
 };
 use fast_mesh_store::{Mesh, VertexId};
 use proptest::prelude::*;
@@ -90,6 +93,8 @@ enum Op {
     Redo,
     Compact(u8),
     SetMode(u8, u8),
+    /// Removes mesh B, C or D (`1 + .0 % 3`).
+    RemoveTarget(u8),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -103,6 +108,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Redo),
         1 => (0u8..4).prop_map(Op::Compact),
         1 => (0u8..4, 0u8..3).prop_map(|(m, k)| Op::SetMode(m, k)),
+        1 => (0u8..3).prop_map(Op::RemoveTarget),
     ]
 }
 
@@ -147,11 +153,26 @@ fn pick<T: Copy>(items: &[T], k: u32) -> Option<T> {
     (!items.is_empty()).then(|| items[k as usize % items.len()])
 }
 
-/// Applies one operation; those that do not apply are skipped, and no mesh
-/// drops below five triangles.
+/// Applies one operation; those that do not apply (to a removed mesh, say)
+/// are skipped, and no mesh drops below five triangles.
 fn apply(scene: &mut Scene, meshes: &[MeshId; 4], op: &Op) {
     let which = |m: &u8| meshes[usize::from(*m) % 4];
+    let gone = |m: MeshId| scene.mesh(m).is_err();
     match op {
+        Op::Place(m, ..)
+        | Op::Move(m, ..)
+        | Op::RemoveTriangle(m, _)
+        | Op::Split(m, _)
+        | Op::Drag(m, _)
+        | Op::Compact(m)
+        | Op::SetMode(m, _)
+            if gone(which(m)) => {}
+        Op::RemoveTarget(k) => {
+            let m = meshes[1 + usize::from(*k) % 3];
+            if !gone(m) {
+                scene.remove_mesh(m).unwrap();
+            }
+        }
         Op::Place(m, deg, t) => {
             let t = t.map(|x| unit(x) * 0.15);
             scene
@@ -231,19 +252,42 @@ fn update_all(scene: &mut Scene) {
     panic!("update_fields kept failing");
 }
 
+/// Steps the deferred Eager fields with `budget` until none is due, then
+/// brings the others along, as `update_all`.
+fn step_all(scene: &mut Scene, budget: usize) {
+    for _ in 0..100_000 {
+        match scene.field_step(FieldBudget::Points(budget)) {
+            Ok(StepState::Idle) => return update_all(scene),
+            Ok(_) => {}
+            Err(SceneError::StaleBvh(id)) => scene.update(id).unwrap(),
+            Err(e) => panic!("field_step failed: {e}"),
+        }
+    }
+    panic!("field_step never went idle");
+}
+
 /// Checks the multi-target field `multi` against the single-target fields
-/// `singles`, one per target in order.
+/// `singles` (each with its target), taken in the field's current target
+/// order. A field whose `on` mesh, or every target, was removed is gone,
+/// and so are its singles: nothing to check. Returns whether a value is
+/// finite.
 fn check(
     scene: &Scene,
     multi: FieldId,
-    singles: &[FieldId],
+    singles: &[(MeshId, FieldId)],
     at: &str,
-) -> Result<(), TestCaseError> {
+) -> Result<bool, TestCaseError> {
+    let Ok(targets) = scene.field_targets(multi) else {
+        return Ok(false);
+    };
     let got = scene.field_values(multi).unwrap();
     let nearest = scene.field_nearest(multi).unwrap();
-    let parts: Vec<&[f32]> = singles
+    let parts: Vec<&[f32]> = targets
         .iter()
-        .map(|&f| scene.field_values(f).unwrap())
+        .map(|t| {
+            let (_, f) = singles.iter().find(|(m, _)| m == t).unwrap();
+            scene.field_values(*f).unwrap()
+        })
         .collect();
     for (v, &g) in got.iter().enumerate() {
         let (mut want, mut from) = (parts[0][v], u32::MAX);
@@ -259,7 +303,7 @@ fn check(
         let n = nearest.get(v).copied().unwrap_or(u32::MAX);
         prop_assert_eq!(n, from, "{} vertex {} nearest", at, v);
     }
-    Ok(())
+    Ok(got.iter().any(|v| v.is_finite()))
 }
 
 proptest! {
@@ -271,6 +315,8 @@ proptest! {
         modes in prop::array::uniform4(0u8..3),
         winding in any::<bool>(),
         infinite in any::<bool>(),
+        stepped in any::<bool>(),
+        budget in 1usize..200,
         batches in prop::collection::vec(prop::collection::vec(op(), 1..4), 1..12),
     ) {
         let mut scene = Scene::new(SceneOptions::default());
@@ -301,25 +347,33 @@ proptest! {
                 })
                 .unwrap()
         };
+        let on_a = vec![(b, add("b", a, vec![b])), (c, add("c", a, vec![c])), (d, add("d", a, vec![d]))];
         let groups = [
-            (add("m", a, vec![b, c, d]), vec![add("b", a, vec![b]), add("c", a, vec![c]), add("d", a, vec![d])]),
-            (add("m", b, vec![c, a]), vec![add("c", b, vec![c]), add("a", b, vec![a])]),
+            (add("m", a, vec![b, c, d]), on_a.clone()),
+            // The same targets in another order: the same values, the indices
+            // permuted.
+            (add("p", a, vec![d, b, c]), on_a),
+            (add("m", b, vec![c, a]), vec![(c, add("c", b, vec![c])), (a, add("a", b, vec![a]))]),
         ];
         update_all(&mut scene);
-        for (multi, singles) in &groups {
-            check(&scene, *multi, singles, "initial")?;
-        }
         let mut finite = false;
+        for (multi, singles) in &groups {
+            finite |= check(&scene, *multi, singles, "initial")?;
+        }
+        prop_assert!(finite);
+        scene.set_defer_fields(stepped);
         for (i, batch) in batches.iter().enumerate() {
             for o in batch {
                 apply(&mut scene, &meshes, o);
             }
-            update_all(&mut scene);
+            if stepped {
+                step_all(&mut scene, budget);
+            } else {
+                update_all(&mut scene);
+            }
             for (multi, singles) in &groups {
                 check(&scene, *multi, singles, &format!("batch {i}"))?;
-                finite |= scene.field_values(*multi).unwrap().iter().any(|v| v.is_finite());
             }
         }
-        prop_assert!(finite);
     }
 }

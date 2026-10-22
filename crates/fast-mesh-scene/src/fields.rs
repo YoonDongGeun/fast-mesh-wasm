@@ -118,9 +118,13 @@ impl DistanceField {
 pub struct FieldStatus {
     /// True when the values match the meshes and placements as they are now.
     pub current: bool,
-    /// What the latest sign data build found out about the first mesh of
-    /// `to` (see [`Scene::field_target_status`](crate::Scene::field_target_status)
-    /// for every target).
+    /// What the latest sign data builds found out about the meshes of `to`,
+    /// together: `closed` and `consistent_orientation` when every target is,
+    /// the counts summed over the targets, and the first target's `mode`
+    /// (every target is built in the requested mode, so they share it unless
+    /// `Auto` resolved differently). See
+    /// [`Scene::field_target_status`](crate::Scene::field_target_status) for
+    /// each target.
     pub sign: SignStatus,
 }
 
@@ -589,6 +593,11 @@ impl Scene {
     /// (slots added since the last update): those slots have none. Never
     /// updates.
     ///
+    /// After a target mesh is removed, and until the field's next update
+    /// (at once for an Eager field, unless deferred), the vertices whose
+    /// value came from it have none here while their value stays finite, and
+    /// the later indices are shifted down to the remaining targets.
+    ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_nearest(&self, id: FieldId) -> Result<&[u32]> {
@@ -614,16 +623,26 @@ impl Scene {
         Ok(f.sign.iter().map(SignData::status).collect())
     }
 
-    /// Whether the field is current, and what the latest sign data build
-    /// found out about its target mesh. Never updates.
+    /// Whether the field is current, and what the latest sign data builds
+    /// found out about its target meshes, together (see
+    /// [`FieldStatus::sign`]). Never updates.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_status(&self, id: FieldId) -> Result<FieldStatus> {
         let i = self.field_index(id)?;
+        let signs = &self.fields[i].sign;
+        let mut sign = signs[0].status();
+        for s in &signs[1..] {
+            let s = s.status();
+            sign.closed &= s.closed;
+            sign.consistent_orientation &= s.consistent_orientation;
+            sign.non_manifold_vertices += s.non_manifold_vertices;
+            sign.degenerate_triangles += s.degenerate_triangles;
+        }
         Ok(FieldStatus {
             current: self.field_current(i),
-            sign: self.fields[i].sign[0].status(),
+            sign,
         })
     }
 
@@ -1494,7 +1513,7 @@ impl Scene {
         {
             counter::add(plan.recomputed);
             counter::add_aborted(plan.aborted);
-            counter::add_applied(id);
+            counter::add_applied(id, plan.recomputed);
         }
         for (&v, &x) in plan.candidates.iter().zip(&plan.values) {
             channel[v as usize] = x;
@@ -1581,17 +1600,23 @@ pub(crate) mod counter {
     }
 
     thread_local! {
-        static APPLIED: std::cell::RefCell<Vec<super::FieldId>> =
+        static APPLIED: std::cell::RefCell<Vec<(super::FieldId, usize)>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// Records that `field` was applied (its update written).
-    pub(crate) fn add_applied(field: super::FieldId) {
-        APPLIED.with(|c| c.borrow_mut().push(field));
+    /// Records that `field` was applied (its update written), having
+    /// recomputed `points` vertices.
+    pub(crate) fn add_applied(field: super::FieldId, points: usize) {
+        APPLIED.with(|c| c.borrow_mut().push((field, points)));
     }
 
     /// The fields applied on this thread since the last call, in order.
     pub(crate) fn take_applied() -> Vec<super::FieldId> {
+        take_applied_counts().into_iter().map(|(f, _)| f).collect()
+    }
+
+    /// As [`take_applied`], with the vertices each recomputed.
+    pub(crate) fn take_applied_counts() -> Vec<(super::FieldId, usize)> {
         APPLIED.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
@@ -3919,5 +3944,140 @@ mod tests {
         let one = DistanceField::new("y", a, b, 0.1, SignMode::Auto);
         assert_eq!(one.to, [b]);
         scene.add_distance_field(one).unwrap();
+    }
+
+    #[test]
+    fn moving_one_target_spares_vertices_another_won() {
+        // B is a sheet with a field to a small cube A through one corner and
+        // a large cube C just under the rest. Moving A recomputes B's
+        // vertices near A, or won by A, never the many that C won.
+        counter::set_near_limit(Some(usize::MAX));
+        let mut scene = Scene::new(SceneOptions::default());
+        let b = scene
+            .add_mesh(sheet(10, 0.1), MeshOptions::default())
+            .unwrap();
+        let a = scene
+            .add_mesh(cube([0.05, 0.05, -0.1], 0.2), MeshOptions::default())
+            .unwrap();
+        let c = scene
+            .add_mesh(cube([0.3, 0.3, -0.74], 0.7), MeshOptions::default())
+            .unwrap();
+        let fb = scene
+            .add_distance_field(DistanceField {
+                to: vec![a, c],
+                ..field("d", b, b, 0.05)
+            })
+            .unwrap();
+        let (_, nearest) = shown(&scene, fb);
+        let by = |k: u32| nearest.iter().filter(|&&n| n == k).count();
+        let (won_by_a, won_by_c) = (by(0), by(1));
+        assert!(won_by_a > 0 && won_by_c > 0);
+        counter::take_applied_counts();
+        scene.set_placement(a, at(0.01, 0.0, 0.0)).unwrap();
+        let counts = counter::take_applied_counts();
+        assert_eq!(counts.len(), 1);
+        let (f, recomputed) = counts[0];
+        assert_eq!(f, fb);
+        let slots = scene.mesh(b).unwrap().vertex_slots();
+        assert!(recomputed > 0, "nothing recomputed");
+        assert!(
+            recomputed + won_by_c <= slots,
+            "{recomputed} + {won_by_c} > {slots}"
+        );
+        // The values C won are untouched and still right.
+        assert_eq!(shown(&scene, fb), min_of_singles(&mut scene, fb));
+        counter::set_near_limit(None);
+    }
+
+    #[test]
+    fn status_aggregates_targets() {
+        let (scene, [a, ..], [_, fb, fc, _]) = group_scene(UpdateMode::Eager);
+        // B's field is to the open sheet A and the closed cube C.
+        let each = scene.field_target_status(fb).unwrap();
+        assert_eq!(each.len(), 2);
+        assert!(!each[0].closed && each[1].closed);
+        let all = scene.field_status(fb).unwrap().sign;
+        assert!(!all.closed);
+        assert_eq!(
+            all.consistent_orientation,
+            each.iter().all(|s| s.consistent_orientation)
+        );
+        assert_eq!(
+            all.non_manifold_vertices,
+            each.iter().map(|s| s.non_manifold_vertices).sum::<usize>()
+        );
+        assert_eq!(
+            all.degenerate_triangles,
+            each.iter().map(|s| s.degenerate_triangles).sum::<usize>()
+        );
+        assert_eq!(all.mode, each[0].mode);
+        // C's field to [A, B]: the same, A first.
+        assert!(!scene.field_status(fc).unwrap().sign.closed);
+        let _ = a;
+    }
+
+    #[test]
+    fn group_walk_with_limits_steps_and_removal() {
+        // The same random walk (placements of every mesh, edits of A, and
+        // C removed half-way) under near limits 0 and none and step budgets
+        // 1, 17 and all, against one-shot updates: the same values, nearest
+        // targets and reports; and the minimum of single fields at the end.
+        for seed in 0..4u64 {
+            let mut runs = Vec::new();
+            for limit in [Some(0), None] {
+                for budget in [Some(1), Some(17), None] {
+                    counter::set_near_limit(limit);
+                    let (mut scene, meshes, fields) = group_scene(UpdateMode::Eager);
+                    scene.set_defer_fields(budget.is_some());
+                    scene.take_changes();
+                    let mut rng = Lcg(seed);
+                    let mut out = Vec::new();
+                    for step in 0..16 {
+                        if step == 8 {
+                            scene.remove_mesh(meshes[2]).unwrap();
+                        }
+                        let k = [0, 1, 3, 0][rng.below(4)];
+                        let t = [
+                            rng.range(-0.04, 0.04),
+                            rng.range(-0.04, 0.04),
+                            rng.range(-0.03, 0.03),
+                        ];
+                        scene
+                            .set_placement(meshes[k], turned(rng.range(-6.0, 6.0), t))
+                            .unwrap();
+                        if rng.below(3) == 0 {
+                            let z = rng.range(-0.1, 0.1) as f32;
+                            scene
+                                .edit(meshes[0], |tx| tx.set_positions(&[23], &[[0.3, 0.2, z]]))
+                                .unwrap();
+                        }
+                        if let Some(budget) = budget {
+                            step_all(&mut scene, budget);
+                        }
+                        let live: Vec<FieldId> = fields
+                            .iter()
+                            .copied()
+                            .filter(|&f| scene.field_targets(f).is_ok())
+                            .collect();
+                        let shownall: Vec<_> = live.iter().map(|&f| shown(&scene, f)).collect();
+                        out.push((live, shownall, scene.take_changes()));
+                    }
+                    counter::set_near_limit(None);
+                    for f in fields {
+                        if scene.field_targets(f).is_ok() {
+                            assert_eq!(
+                                shown(&scene, f),
+                                min_of_singles(&mut scene, f),
+                                "seed {seed}"
+                            );
+                        }
+                    }
+                    runs.push(out);
+                }
+            }
+            for (k, run) in runs.iter().enumerate().skip(1) {
+                assert!(*run == runs[0], "seed {seed}, run {k}");
+            }
+        }
     }
 }

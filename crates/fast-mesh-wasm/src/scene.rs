@@ -811,6 +811,26 @@ impl WasmScene {
         Ok(self.scene.add_distance_field(desc)?.raw())
     }
 
+    /// What the sign data found out about each target, in index order: five
+    /// numbers per target, `[mode, closed, consistent orientation,
+    /// non-manifold vertices, degenerate triangles]` as in
+    /// [`WasmScene::field_status`].
+    pub fn field_target_status(&self, field: u32) -> Result<Vec<u32>, Error> {
+        let all = self.scene.field_target_status(self.field(field)?)?;
+        Ok(all
+            .iter()
+            .flat_map(|s| {
+                [
+                    sign_code(s.mode),
+                    u32::from(s.closed),
+                    u32::from(s.consistent_orientation),
+                    len(s.non_manifold_vertices),
+                    len(s.degenerate_triangles),
+                ]
+            })
+            .collect())
+    }
+
     /// The field's target meshes as flat `[index, generation, ...]` pairs,
     /// in target index order (see [`Scene::field_targets`]).
     pub fn field_targets(&self, field: u32) -> Result<Vec<u32>, Error> {
@@ -854,7 +874,8 @@ impl WasmScene {
 
     /// `[current (0/1), sign mode (1 pseudonormal, 2 winding), closed,
     /// consistent orientation, non-manifold vertices, degenerate
-    /// triangles]`.
+    /// triangles]`, the sign part over every target together (see
+    /// [`fast_mesh_scene::FieldStatus::sign`]).
     pub fn field_status(&self, field: u32) -> Result<Vec<u32>, Error> {
         let s = self.scene.field_status(self.field(field)?)?;
         let sign = s.sign;
@@ -1469,6 +1490,12 @@ mod tests {
             .add_distance_field("d".into(), &[ai, ag, bi, bg, ci, cg], 5., 0)
             .unwrap();
         assert_eq!(s.field_targets(f).unwrap(), vec![bi, bg, ci, cg]);
+        // Two closed, consistent octahedra: one status each, the same overall.
+        assert_eq!(
+            s.field_target_status(f).unwrap(),
+            vec![1, 1, 1, 0, 0, 1, 1, 1, 0, 0]
+        );
+        assert_eq!(s.field_status(f).unwrap(), vec![1, 1, 1, 1, 0, 0]);
         // A's vertex at +x (index 0) is nearest B, the one at -x nearest C.
         let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
         assert!((values[0] - 1.).abs() < 1e-6);

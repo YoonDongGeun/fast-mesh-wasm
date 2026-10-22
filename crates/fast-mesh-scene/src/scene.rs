@@ -811,12 +811,18 @@ impl Scene {
         entry.recolor_all();
         for f in self.fields.iter_mut().filter(|f| f.desc.on == id) {
             let old = std::mem::take(&mut f.nearest);
-            f.nearest = vec![u32::MAX; entry.mesh.vertex_slots()];
-            for (v, n) in old.into_iter().enumerate() {
-                if let Some(w) = remap.vertex(v as VertexId) {
-                    f.nearest[w as usize] = n;
+            let mut nearest = Vec::new();
+            // Without the memory, it stays empty (every slot "none") until
+            // the field's next update, which recomputes every vertex.
+            if nearest.try_reserve_exact(entry.mesh.vertex_slots()).is_ok() {
+                nearest.resize(entry.mesh.vertex_slots(), u32::MAX);
+                for (v, n) in old.into_iter().enumerate() {
+                    if let Some(w) = remap.vertex(v as VertexId) {
+                        nearest[w as usize] = n;
+                    }
                 }
             }
+            f.nearest = nearest;
         }
         self.run_eager(Some(&[id]));
         Ok(remap)
