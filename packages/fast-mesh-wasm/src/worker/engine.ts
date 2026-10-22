@@ -41,6 +41,8 @@ import {
   type WorkerMessage,
 } from "./protocol.js";
 
+import { PoolStartError } from "./load.js";
+
 // The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js).
 export { loadEngine, startEngine } from "./load.js";
 
@@ -144,7 +146,12 @@ export interface Started {
  * Worker script does); with a promise, init messages are ignored. Batches
  * arriving before are kept and run in order; then `{ kind: "ready" }` (with
  * the {@link Started} report, 1 thread by default) is posted first. When the
- * start fails, `{ kind: "fatal" }` is posted instead and nothing runs.
+ * start fails, `{ kind: "fatal" }` is posted instead and nothing runs. When
+ * it fails with a {@link PoolStartError} (the threaded pool did not start),
+ * `{ kind: "fallback" }` is posted instead, giving back every batch received
+ * (and, one message each, every batch received later), their buffers
+ * transferred: the scene replaces this Worker with a single-threaded one and
+ * sends them there.
  */
 export function serveEngine(
   endpoint: Endpoint,
@@ -154,6 +161,22 @@ export function serveEngine(
   let deliver: ((batch: Request[]) => void) | undefined;
   let started = typeof ready !== "function";
   const early: Request[][] = [];
+  /** Set once the start failed with a `PoolStartError`: batches go back. */
+  let giveBack = false;
+  const back = (batches: Request[][], warning?: string) => {
+    const transfer: Transferable[] = [];
+    for (const batch of batches) {
+      for (const req of batch) {
+        if (req.kind === "addMesh") {
+          transfer.push(req.positions, req.indices);
+        }
+      }
+    }
+    endpoint.post(
+      warning === undefined ? { kind: "fallback", batches } : { kind: "fallback", batches, warning },
+      transfer,
+    );
+  };
   const serve = (start: Promise<unknown>) =>
     start.then(
       (info) => {
@@ -173,6 +196,11 @@ export function serveEngine(
         );
       },
       (e: unknown) => {
+        if (e instanceof PoolStartError) {
+          giveBack = true;
+          back(early.splice(0), e.warning);
+          return;
+        }
         const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
         endpoint.post(
           {
@@ -191,6 +219,8 @@ export function serveEngine(
         started = true;
         serve(new Promise<Started>((resolve) => resolve(ready(data))));
       }
+    } else if (giveBack) {
+      back([data as Request[]]);
     } else if (deliver === undefined) {
       early.push(data as Request[]);
     } else {

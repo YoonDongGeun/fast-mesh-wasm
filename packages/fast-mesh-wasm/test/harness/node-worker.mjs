@@ -20,7 +20,8 @@
 // no `crossOriginIsolated`): single-threaded, no warnings. `{ isolated }` poses
 // as a page reporting that `crossOriginIsolated`, and `{ threaded }` replaces
 // the threaded glue: `"fake"` starts (the single-threaded glue, with an
-// `initThreadPool` that posts `{ kind: "pool", threads }`), `"real"` is the
+// `initThreadPool` that posts `{ kind: "pool", threads }`), `"poolFail"` a fake whose
+// pool rejects (the Worker then asks to be replaced), `"real"` is the
 // built dist/wasm-threads glue (it instantiates, but its pool cannot start: no
 // nested `Worker` in Node), `"memFail"` is that glue failing to allocate its
 // shared memory (`new WebAssembly.Memory` throws a RangeError), and
@@ -81,6 +82,14 @@ function threadedLoader(kind) {
         WasmScene: raw.WasmScene,
         initThreadPool: async (threads) => {
           parentPort.postMessage({ kind: "pool", threads });
+        },
+      });
+    case "poolFail":
+      return async () => ({
+        default: raw.default,
+        WasmScene: raw.WasmScene,
+        initThreadPool: async () => {
+          throw new Error("nested Worker failed (test)");
         },
       });
     case "real":

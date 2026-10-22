@@ -8,7 +8,14 @@ import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
-import { defaultThreads, type Glue, loadEngine, type ThreadedGlue } from "../src/worker/load.js";
+import {
+  defaultThreads,
+  type Glue,
+  loadEngine,
+  PoolStartError,
+  startEngine,
+  type ThreadedGlue,
+} from "../src/worker/load.js";
 
 const hasThreaded = existsSync(new URL("../dist/wasm-threads/fast_mesh_wasm.js", import.meta.url));
 
@@ -88,12 +95,11 @@ describe("loadEngine", () => {
   });
 
   it("threaded_start_failure_falls_back", async () => {
+    // Nothing threaded is left behind: the Worker falls back itself.
     const cases = {
       import: { import: new TypeError("Failed to fetch dynamically imported module") },
       // A 4 GiB shared memory can fail to allocate (32-bit or constrained browsers).
       instantiate: { init: new RangeError("WebAssembly.Memory(): could not allocate memory") },
-      pool: { pool: new Error("nested Worker failed") },
-      hang: { hang: true },
     };
     for (const [name, fail] of Object.entries(cases)) {
       const log: string[] = [];
@@ -111,6 +117,37 @@ describe("loadEngine", () => {
       const quiet = loaders([], fail);
       expect((await loadEngine({ threads: 4, isolated: true, ...quiet, poolTimeoutMs: 50 })).threads, name).toBe(1);
     }
+  });
+
+  it("pool_failure_rejects_for_replacement", async () => {
+    // The threaded instance and nested Workers are live: the Worker must go.
+    for (const [name, fail] of Object.entries({ pool: { pool: new Error("nested Worker failed") }, hang: { hang: true } })) {
+      const log: string[] = [];
+      const warn = vi.fn();
+      const got = loadEngine({ threads: 4, isolated: true, ...loaders(log, fail), warn, poolTimeoutMs: 50 });
+      await expect(got, name).rejects.toBeInstanceOf(PoolStartError);
+      await expect(got, name).rejects.toThrow(/Multithreading \(COOP\/COEP\)/);
+      expect(log, name).toEqual(["importThreaded", "threaded.init", "threaded.pool(4)"]);
+      expect(warn, name).not.toHaveBeenCalled();
+    }
+  });
+
+  it("start_engine_warnings", async () => {
+    // The production path: no `debug`, not isolated, so single-threaded and
+    // silent.
+    expect(await startEngine({ kind: "init", threads: 4, debug: false }, loaders([]), false)).toEqual({ threads: 1 });
+    // Development on a page: the reason is reported.
+    const dev = await startEngine({ kind: "init", threads: 4, debug: true }, loaders([]), false);
+    expect(dev.warning).toMatch(/cross-origin isolated/);
+    // Not a page (no `crossOriginIsolated`, as in Node): nothing to fix.
+    expect(await startEngine({ kind: "init", threads: 4, debug: true }, loaders([]), undefined)).toEqual({ threads: 1 });
+    // A pool failure carries its warning in development only.
+    const pool = { pool: new Error("nested Worker failed") };
+    const quiet = await startEngine({ kind: "init", threads: 4, debug: false }, loaders([], pool), true).catch((e) => e);
+    expect(quiet).toBeInstanceOf(PoolStartError);
+    expect(quiet.warning).toBeUndefined();
+    const loud = await startEngine({ kind: "init", threads: 4, debug: true }, loaders([], pool), true).catch((e) => e);
+    expect(loud.warning).toMatch(/single-threaded/);
   });
 
   it("non_isolated_warns_once_in_dev", async () => {
@@ -139,7 +176,7 @@ interface Pose {
   /** `crossOriginIsolated` as a browser page would report it. */
   isolated?: boolean;
   /** The threaded glue: a fake that starts, or a real/failing start-up. */
-  threaded?: "fake" | "real" | "memFail" | "importFail";
+  threaded?: "fake" | "poolFail" | "real" | "memFail" | "importFail";
 }
 
 /** The harness Worker as a `WorkerLike`, keeping its own `pool` reports apart. */
@@ -148,6 +185,9 @@ class NodeWorker implements WorkerLike {
   readonly sent: unknown[] = [];
   readonly pools: number[] = [];
   terminated = false;
+  /** While set, `fallback` messages are kept in `fallbacks` until `release()`. */
+  holdFallbacks = false;
+  readonly fallbacks: { kind: "fallback"; batches: unknown[] }[] = [];
   readonly #message: ((e: { data: unknown }) => void)[] = [];
 
   constructor(pose: Pose) {
@@ -159,10 +199,30 @@ class NodeWorker implements WorkerLike {
         this.pools.push(data.threads as number);
         return;
       }
-      for (const cb of this.#message) {
-        cb({ data });
+      if (data.kind === "fallback" && this.holdFallbacks) {
+        this.fallbacks.push(data as never);
+        return;
       }
+      this.#deliver(data);
     });
+  }
+
+  #deliver(data: unknown): void {
+    for (const cb of this.#message) {
+      cb({ data });
+    }
+  }
+
+  /** Delivers the first `n` held `fallback` messages. */
+  release(n = this.fallbacks.length): void {
+    for (const m of this.fallbacks.splice(0, n)) {
+      this.#deliver(m);
+    }
+  }
+
+  /** Batches given back in held `fallback` messages. */
+  givenBack(): number {
+    return this.fallbacks.reduce((n, m) => n + m.batches.length, 0);
   }
 
   postMessage(msg: unknown, transfer?: Transferable[]): void {
@@ -190,12 +250,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function start(pose: Pose = {}, options: { threads?: number; debug?: boolean } = {}) {
+/** A scene over harness Workers; `pose` may differ per Worker (by index). */
+async function start(pose: Pose | ((n: number) => Pose) = {}, options: { threads?: number; debug?: boolean } = {}) {
   const workers: NodeWorker[] = [];
   const scene = await createWorkerScene({
     ...options,
     createWorker: () => {
-      const w = new NodeWorker(pose);
+      const w = new NodeWorker(typeof pose === "function" ? pose(workers.length) : pose);
       workers.push(w);
       return w;
     },
@@ -234,10 +295,24 @@ describe("WorkerScene threads", () => {
   });
 
   it("threads_option_validated", async () => {
-    for (const threads of [0, -1, 1.5, Number.NaN]) {
+    for (const threads of [1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(createWorkerScene({ threads, createWorker: () => new NodeWorker({}) })).rejects.toMatchObject({
         code: "INVALID_ARGUMENT",
       });
+    }
+  });
+
+  it("threads_option_clamped", async () => {
+    for (const [threads, sent] of [
+      [0, 1],
+      [-3, 1],
+      [64, 64],
+      [1000, 64],
+    ]) {
+      const { scene, workers } = await start({ isolated: true, threaded: "fake" }, { threads });
+      expect(workers[0].sent[0], String(threads)).toMatchObject({ kind: "init", threads: sent });
+      expect(scene.threads, String(threads)).toBe(sent);
+      scene.terminate();
     }
   });
 
@@ -269,6 +344,64 @@ describe("WorkerScene threads", () => {
     expect(await scene.intersects(mesh, mesh)).toBe(true);
   });
 
+  it("pool_failure_replaces_worker", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { scene, workers } = await start({ isolated: true, threaded: "poolFail" }, { threads: 4, debug: true });
+    // The Worker with the half-started pool is gone; a single-threaded one runs.
+    expect(workers).toHaveLength(2);
+    expect(workers[0].terminated).toBe(true);
+    expect(workers[0].sent).toEqual([{ kind: "init", threads: 4, debug: true }]);
+    expect(workers[1].sent[0]).toEqual({ kind: "init", threads: 1, debug: true });
+    expect(scene.threads).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/nested Worker failed/);
+    await works(scene);
+    // Later restarts stay single-threaded: no new wait for a pool.
+    await scene.restart();
+    expect(workers).toHaveLength(3);
+    expect(workers[2].sent[0]).toMatchObject({ kind: "init", threads: 1 });
+    expect(scene.threads).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("pool_failure_on_restart_hands_batches_over", async () => {
+    // The first Worker is threaded; the restart's pool fails, while batches
+    // are sent to it, before and after it gives up.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { scene, workers } = await start((n) => ({ isolated: true, threaded: n === 1 ? "poolFail" : "fake" }), {
+      threads: 2,
+    });
+    expect(scene.threads).toBe(2);
+    const a = tetra(0);
+    const ma = scene.addMesh(a.positions, a.indices);
+    expect(await scene.intersects(ma, ma)).toBe(true);
+    const restarted = scene.restart();
+    workers[1].holdFallbacks = true;
+    // Sent to the second Worker: it gives the replay and these back.
+    const b = tetra(0.5);
+    const mb = scene.addMesh(b.positions, b.indices);
+    const hit = scene.intersects(ma, mb);
+    await vi.waitFor(() => expect(workers[1].givenBack()).toBe(2));
+    // The first give-back arrives: a third Worker starts; batches sent while
+    // the rest is outstanding are held, so the order holds.
+    // (In practice the fake pool fails before the replay arrives: the first give-back is
+    // empty and the two batches follow, so the third batch below is held.)
+    workers[1].release(1);
+    expect(workers).toHaveLength(3);
+    const c = tetra(3);
+    const mc = scene.addMesh(c.positions, c.indices);
+    const apart = scene.intersects(ma, mc);
+    workers[1].release();
+    await restarted;
+    expect(await hit).toBe(true);
+    expect(await apart).toBe(false);
+    expect(workers[1].terminated).toBe(true);
+    expect(workers[2].sent[0]).toEqual({ kind: "init", threads: 1, debug: expect.any(Boolean) });
+    expect(workers[2].sent.length).toBe(4);
+    expect(scene.threads).toBe(1);
+    expect(await scene.intersects(mb, mc)).toBe(false);
+  });
+
   it("non_isolated_warns_once_in_dev", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { scene } = await start({ isolated: false }, { threads: 4, debug: true });
@@ -296,6 +429,10 @@ describe("WorkerScene threads", () => {
       expect(String(warn.mock.calls[0][0]), threaded).toMatch(/single-threaded/);
       expect(String(warn.mock.calls[0][0]), threaded).toMatch(causes[threaded]);
       expect(workers[0].pools, threaded).toEqual([]);
+      // The real glue's pool failed after it instantiated: that Worker was
+      // replaced. The others fell back in their Worker.
+      expect(workers, threaded).toHaveLength(threaded === "real" ? 2 : 1);
+      expect(workers[0].terminated, threaded).toBe(threaded === "real");
       await works(scene);
       scene.terminate();
       warn.mockRestore();

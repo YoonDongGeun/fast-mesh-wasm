@@ -90,7 +90,7 @@ export interface WorkerSceneOptions {
    * single-threaded engine. Threads need a cross-origin isolated page
    * (COOP/COEP headers); elsewhere, or when the threaded engine fails to
    * start, the scene runs single-threaded. {@link WorkerScene.threads} tells
-   * which. A positive integer.
+   * which. An integer, clamped to 1 to {@link MAX_THREADS}.
    */
   threads?: number;
 }
@@ -114,10 +114,10 @@ export interface KeyStatus {
  * Rejects with `INSTANCE_POISONED` when the Worker could not load fast-mesh.
  */
 export async function createWorkerScene(options: WorkerSceneOptions = {}): Promise<WorkerScene> {
-  const { threads } = options;
-  if (threads !== undefined && !(Number.isInteger(threads) && threads >= 1)) {
-    throw invalid(`threads must be a positive integer (got ${threads})`);
+  if (options.threads !== undefined && !Number.isInteger(options.threads)) {
+    throw invalid(`threads must be an integer (got ${options.threads})`);
   }
+  const threads = options.threads === undefined ? undefined : Math.min(Math.max(options.threads, 1), MAX_THREADS);
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
@@ -137,6 +137,9 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   }
   return scene;
 }
+
+/** The most threads {@link WorkerSceneOptions.threads} asks for; more are clamped. */
+export const MAX_THREADS = 64;
 
 /**
  * How long a promise-returning call waits for a `commitFrame()` before it is
@@ -165,6 +168,26 @@ const MAKE = {
 };
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+/** A Worker giving back batches after its thread pool failed (see `WorkerScene`'s handoff). */
+interface Handoff {
+  old: WorkerLike;
+  /** Batches sent to it not given back yet. */
+  remaining: number;
+  /** Batches sent since, held to keep the order. */
+  held: { batch: Request[]; transfer: Transferable[] }[];
+}
+
+/** The buffers a batch transfers: those of its mesh adds. */
+function transferOf(batch: Request[]): Transferable[] {
+  const transfer: Transferable[] = [];
+  for (const req of batch) {
+    if (req.kind === "addMesh") {
+      transfer.push(req.positions, req.indices);
+    }
+  }
+  return transfer;
+}
 
 /** The most failed requests kept for `restart()`. */
 const FAILED_LOG_LIMIT = 10_000;
@@ -526,10 +549,21 @@ export class WorkerScene implements SceneLike {
   readonly #batchDone = new Map<Request[], Pending>();
   /** The restart under way, until its replay's result is applied. */
   #restarting: Promise<void> | undefined;
-  /** The message starting each Worker's engine. */
-  readonly #init: InitMessage;
-  /** The current Worker's thread count, from its ready message. */
+  /**
+   * The message starting each Worker's engine. Its `threads` becomes 1 once a
+   * Worker's thread pool failed to start: later Workers (restarts) never try
+   * again.
+   */
+  #init: InitMessage;
+  /** The current Worker's thread count, from its ready message (1 until then). */
   #threads = 1;
+  /**
+   * A Worker whose thread pool failed to start, while it still gives back
+   * batches sent to it (`remaining` more): batches sent meanwhile are held
+   * (`held`, cloned with their buffers) and go to the current Worker after
+   * those, keeping the order.
+   */
+  #handoff: Handoff | undefined;
   /** Whether the start-up warning was logged (once per scene). */
   #warned = false;
   /** Use {@link createWorkerScene}. */
@@ -541,20 +575,28 @@ export class WorkerScene implements SceneLike {
   }
 
   /**
-   * Listens to a new Worker. Only the current Worker is heard: a replaced
-   * one's late messages and errors are ignored.
+   * Listens to a new Worker and sends it the init message. Only the current
+   * Worker is heard (and a handed-off one's batches given back): a replaced
+   * one's late messages and errors are ignored. `keepReady` keeps the start
+   * under way (a Worker replacing one whose thread pool failed).
    */
-  #attach(worker: WorkerLike): WorkerLike {
-    let ready!: Pick<Ready, "resolve" | "reject">;
-    const promise = new Promise<void>((resolve, reject) => {
-      ready = { resolve, reject };
-    });
-    // A restart's Worker failing to start is reported through its batches.
-    promise.catch(() => {});
-    this.#ready = { ...ready, promise, settled: false };
+  #attach(worker: WorkerLike, keepReady = false): WorkerLike {
+    this.#threads = 1;
+    if (!keepReady) {
+      let ready!: Pick<Ready, "resolve" | "reject">;
+      const promise = new Promise<void>((resolve, reject) => {
+        ready = { resolve, reject };
+      });
+      // A restart's Worker failing to start is reported through its batches.
+      promise.catch(() => {});
+      this.#ready = { ...ready, promise, settled: false };
+    }
     worker.addEventListener("message", (e: { data: WorkerMessage }) => {
-      if (worker === this.#worker) {
-        this.#receive(e.data);
+      const msg = e.data;
+      if ("kind" in msg && msg.kind === "fallback") {
+        this.#onFallback(worker, msg);
+      } else if (worker === this.#worker) {
+        this.#receive(msg);
       }
     });
     worker.addEventListener("error", (e: { message?: string }) => {
@@ -599,6 +641,74 @@ export class WorkerScene implements SceneLike {
     const old = this.#worker;
     this.#worker = INERT;
     old.terminate();
+    this.#dropHandoff();
+  }
+
+  /**
+   * A Worker's thread pool failed to start: it leaves a threaded instance
+   * and nested Workers behind, so it is terminated and replaced by a
+   * single-threaded Worker (this scene's later ones too), which gets the
+   * batches it gives back, in order. The scene's start (or restart) goes on
+   * with the new Worker.
+   */
+  #onFallback(worker: WorkerLike, msg: Extract<WorkerMessage, { kind: "fallback" }>): void {
+    if (this.#terminated) {
+      return;
+    }
+    if (worker === this.#worker) {
+      if (msg.warning !== undefined && !this.#warned) {
+        this.#warned = true;
+        console.warn(msg.warning);
+      }
+      this.#init = { ...this.#init, threads: 1 };
+      let next: WorkerLike;
+      try {
+        next = this.#make();
+      } catch (e) {
+        const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        this.#detach();
+        this.#poisonAll({ code: "INSTANCE_POISONED", message: `a new Worker could not be created (${cause})` });
+        return;
+      }
+      // Every batch in flight went to the old Worker (none is answered before
+      // a start): those not given back yet follow.
+      this.#handoff = { old: worker, remaining: this.#inflight.length, held: [] };
+      this.#worker = this.#attach(next, true);
+    } else if (worker !== this.#handoff?.old) {
+      return;
+    }
+    const handoff = this.#handoff as Handoff;
+    handoff.remaining -= msg.batches.length;
+    for (const batch of msg.batches) {
+      this.#post(batch, transferOf(batch));
+    }
+    if (handoff.remaining <= 0 && this.#handoff === handoff) {
+      this.#handoff = undefined;
+      handoff.old.terminate();
+      for (const { batch, transfer } of handoff.held) {
+        this.#post(batch, transfer);
+      }
+    }
+  }
+
+  /** Posts a batch already counted in flight; one that cannot go poisons the scene. */
+  #post(batch: Request[], transfer: Transferable[]): void {
+    try {
+      this.#worker.postMessage(batch, transfer);
+    } catch (e) {
+      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      this.#detach();
+      this.#poisonAll({
+        code: "INSTANCE_POISONED",
+        message: `requests could not be passed to the single-threaded Worker (${cause})`,
+      });
+    }
+  }
+
+  /** Ends a handoff (restart, error, termination): the old Worker goes. */
+  #dropHandoff(): void {
+    this.#handoff?.old.terminate();
+    this.#handoff = undefined;
   }
 
   // ---- Plumbing ----
@@ -700,7 +810,14 @@ export class WorkerScene implements SceneLike {
       }
     }
     try {
-      this.#worker.postMessage(batch, transfer);
+      if (this.#handoff !== undefined) {
+        // Held until the old Worker gave back everything; cloned now (moving
+        // the buffers), so what cannot be posted still fails here.
+        const held = structuredClone(batch, { transfer });
+        this.#handoff.held.push({ batch: held, transfer: transferOf(held) });
+      } else {
+        this.#worker.postMessage(batch, transfer);
+      }
     } catch (e) {
       const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       this.#fail(batch, invalid(`the requests could not be sent to the Worker (${cause})`), false);
@@ -801,7 +918,7 @@ export class WorkerScene implements SceneLike {
         }
         this.#ready.settled = true;
         this.#ready.resolve();
-      } else {
+      } else if (msg.kind === "fatal") {
         this.#poisonAll(msg.error);
       }
       return;
@@ -1952,6 +2069,7 @@ export class WorkerScene implements SceneLike {
     // Its late messages are ignored from here on (see #attach).
     this.#worker = INERT;
     old.terminate();
+    this.#dropHandoff();
     if (this.#fallback !== undefined) {
       clearTimeout(this.#fallback);
       this.#fallback = undefined;
@@ -2205,6 +2323,7 @@ export class WorkerScene implements SceneLike {
       this.#drag = undefined;
     }
     this.#worker.terminate();
+    this.#dropHandoff();
     const error = invalid("the Worker scene is terminated");
     if (!this.#ready.settled) {
       this.#ready.settled = true;
