@@ -8,6 +8,7 @@ import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
+import type { Request } from "../src/worker/protocol.js";
 import {
   defaultThreads,
   type Glue,
@@ -382,16 +383,29 @@ describe("WorkerScene threads", () => {
     const mb = scene.addMesh(b.positions, b.indices);
     const hit = scene.intersects(ma, mb);
     await vi.waitFor(() => expect(workers[1].givenBack()).toBe(2));
+    // The fake pool fails within the init's microtasks, before the replay's
+    // message is handled: the first give-back is empty, the two batches
+    // follow one message each.
+    expect(workers[1].fallbacks.map((m) => m.batches.length)).toEqual([0, 1, 1]);
     // The first give-back arrives: a third Worker starts; batches sent while
     // the rest is outstanding are held, so the order holds.
-    // (In practice the fake pool fails before the replay arrives: the first give-back is
-    // empty and the two batches follow, so the third batch below is held.)
     workers[1].release(1);
     expect(workers).toHaveLength(3);
     const c = tetra(3);
     const mc = scene.addMesh(c.positions, c.indices);
     const apart = scene.intersects(ma, mc);
+    // Let the batch be flushed (a microtask): it is held, not posted.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Only the init so far (lengths only: posted batches hold detached buffers).
+    expect(workers[2].sent.length).toBe(1);
     workers[1].release();
+    // The given-back batches first (the replay, then `b`'s), the held one last.
+    const adds = (i: number) =>
+      (workers[2].sent[i] as Request[]).flatMap((r) => (r.kind === "addMesh" ? [r.id] : []));
+    expect(workers[2].sent).toHaveLength(4);
+    expect(adds(1)).toEqual([scene.idOf(ma)]);
+    expect(adds(2)).toEqual([scene.idOf(mb)]);
+    expect(adds(3)).toEqual([scene.idOf(mc)]);
     await restarted;
     expect(await hit).toBe(true);
     expect(await apart).toBe(false);
