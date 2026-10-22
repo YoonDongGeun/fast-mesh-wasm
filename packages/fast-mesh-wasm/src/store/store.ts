@@ -233,6 +233,10 @@ export class SceneStore {
   #busy = 0;
   /** The states in the snapshot whose status is `"error"`. */
   #failed = 0;
+  /** The first state in "error" (meshes, then sections), kept until a state enters or leaves "error". */
+  #firstFailed: Combined | undefined;
+  /** A state entered or left "error" (or changed its error) since `#firstFailed` was found. */
+  #failedMoved = false;
   /** A scene event came: the snapshot may be stale until the next refresh. */
   #stale = false;
   /** A refresh on a microtask is queued (for scene events, and snapshots not yet announced). */
@@ -1050,6 +1054,7 @@ export class SceneStore {
       this.#busy += by;
     } else if (state.status === "error") {
       this.#failed += by;
+      this.#failedMoved = true;
     }
   }
 
@@ -1067,7 +1072,10 @@ export class SceneStore {
     this.#updateQueued = true;
     queueMicrotask(() => {
       this.#updateQueued = false;
-      if (!this.#disposed) {
+      // Nothing left to do when a refresh in the meantime took the event (a
+      // store `commitFrame()` takes its own scene's): no scene call then, so
+      // a scene freed in the same task is never touched.
+      if (!this.#disposed && (this.#stale || this.#host.changed.size > 0 || this.#owed)) {
         this.#update();
       }
     });
@@ -1213,8 +1221,13 @@ export class SceneStore {
     const sectionStates = sections ?? prev.sections;
     const historyKey = this.#key("history");
     let overall: Combined = { status: "idle" };
-    if (this.#failed > 0) {
-      overall = firstError(meshStates.values()) ?? firstError(sectionStates.values())!;
+    if (this.#failedMoved) {
+      this.#failedMoved = false;
+      this.#firstFailed =
+        this.#failed > 0 ? (firstError(meshStates.values()) ?? firstError(sectionStates.values())) : undefined;
+    }
+    if (this.#firstFailed !== undefined) {
+      overall = this.#firstFailed;
     } else if (historyKey.status === "error") {
       overall = historyKey;
     } else if (this.#busy > 0 || historyKey.status === "computing") {
