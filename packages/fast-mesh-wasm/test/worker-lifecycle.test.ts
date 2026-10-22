@@ -421,7 +421,10 @@ class NodeWorker implements WorkerLike {
     if (this.failPosts) {
       throw new Error("DataCloneError (simulated)");
     }
-    this.sent.push(msg as Request[]);
+    // Batches only: not the init message.
+    if (Array.isArray(msg)) {
+      this.sent.push(msg as Request[]);
+    }
     this.worker.postMessage(msg, transfer as never);
   }
 

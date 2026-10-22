@@ -44,6 +44,7 @@ import {
   type ColorRuleWire,
   type ErrorWire,
   type FieldDescWire,
+  type InitMessage,
   isLastWins,
   keyOf,
   type MeshChangeWire,
@@ -77,9 +78,21 @@ export interface WorkerSceneOptions {
    * Development checks, off by default: render views are then `Proxy`
    * objects that warn once when read after a mirror they view was replaced
    * (a mesh's slot count changed, a buffer turned on or off, the mesh was
-   * removed). See {@link MeshViews}.
+   * removed). See {@link MeshViews}. Also logs, once per scene, why the
+   * engine runs single-threaded when more threads were asked for (as in
+   * development builds, where `import.meta.env.DEV` is set).
    */
   debug?: boolean;
+  /**
+   * The threads the engine computes with: its WebAssembly runs on a pool of
+   * this many Workers sharing its memory. Defaults to the logical cores
+   * (`navigator.hardwareConcurrency`), at most 8; `1` runs the
+   * single-threaded engine. Threads need a cross-origin isolated page
+   * (COOP/COEP headers); elsewhere, or when the threaded engine fails to
+   * start, the scene runs single-threaded. {@link WorkerScene.threads} tells
+   * which. A positive integer.
+   */
+  threads?: number;
 }
 
 /** The state of a request key, from {@link WorkerScene.status}. */
@@ -101,13 +114,21 @@ export interface KeyStatus {
  * Rejects with `INSTANCE_POISONED` when the Worker could not load fast-mesh.
  */
 export async function createWorkerScene(options: WorkerSceneOptions = {}): Promise<WorkerScene> {
+  const { threads } = options;
+  if (threads !== undefined && !(Number.isInteger(threads) && threads >= 1)) {
+    throw invalid(`threads must be a positive integer (got ${threads})`);
+  }
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
     ((options.workerUrl === undefined
       ? new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })
       : new Worker(options.workerUrl, { type: "module" })) as unknown as WorkerLike);
-  const [scene, started] = createScene(make, options.debug ?? false);
+  const dev = (import.meta as { env?: { DEV?: boolean } }).env?.DEV === true;
+  const [scene, started] = createScene(make, {
+    debug: options.debug ?? false,
+    init: { kind: "init", threads, debug: (options.debug ?? false) || dev },
+  });
   try {
     await started;
   } catch (e) {
@@ -127,7 +148,10 @@ export const FALLBACK_FLUSH_MS = 100;
  * Set by `WorkerScene`'s static block: makes a scene (the constructor is
  * private) and returns it with its first Worker's start.
  */
-let createScene: (make: () => WorkerLike, debug: boolean) => [WorkerScene, Promise<void>];
+let createScene: (
+  make: () => WorkerLike,
+  options: { debug: boolean; init: InitMessage },
+) => [WorkerScene, Promise<void>];
 
 /** Elements per slot of each buffer. */
 const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
@@ -502,10 +526,17 @@ export class WorkerScene implements SceneLike {
   readonly #batchDone = new Map<Request[], Pending>();
   /** The restart under way, until its replay's result is applied. */
   #restarting: Promise<void> | undefined;
+  /** The message starting each Worker's engine. */
+  readonly #init: InitMessage;
+  /** The current Worker's thread count, from its ready message. */
+  #threads = 1;
+  /** Whether the start-up warning was logged (once per scene). */
+  #warned = false;
   /** Use {@link createWorkerScene}. */
-  private constructor(make: () => WorkerLike, debug: boolean) {
+  private constructor(make: () => WorkerLike, options: { debug: boolean; init: InitMessage }) {
     this.#make = make;
-    this.#guard = debug ? new ViewGuard() : undefined;
+    this.#guard = options.debug ? new ViewGuard() : undefined;
+    this.#init = options.init;
     this.#worker = this.#attach(make());
   }
 
@@ -548,6 +579,15 @@ export class WorkerScene implements SceneLike {
         message: "a message from the Worker could not be read; the Worker scene can no longer be used",
       });
     });
+    // The init message goes first: the engine starts on it, and batches wait.
+    try {
+      worker.postMessage(this.#init);
+    } catch (e) {
+      // It never starts; a restart's replay fails to post the same way.
+      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      this.#ready.settled = true;
+      this.#ready.reject(new FastMeshError("INSTANCE_POISONED", `the Worker could not be started (${cause})`));
+    }
     return worker;
   }
 
@@ -754,6 +794,11 @@ export class WorkerScene implements SceneLike {
     }
     if ("kind" in msg) {
       if (msg.kind === "ready") {
+        this.#threads = msg.threads ?? 1;
+        if (msg.warning !== undefined && !this.#warned) {
+          this.#warned = true;
+          console.warn(msg.warning);
+        }
         this.#ready.settled = true;
         this.#ready.resolve();
       } else {
@@ -1328,6 +1373,15 @@ export class WorkerScene implements SceneLike {
         st.localUntil = 0;
       }
     }
+  }
+
+  /**
+   * The threads the engine computes with: more than 1 when the threaded
+   * engine runs (see {@link WorkerSceneOptions.threads}), 1 when
+   * single-threaded. As of the current Worker's start (1 until it is ready).
+   */
+  get threads(): number {
+    return this.#threads;
   }
 
   /** Whether there is a step to undo, as of the latest result. */
@@ -2177,8 +2231,8 @@ export class WorkerScene implements SceneLike {
       latest: scene.#latest.size,
       prunes: scene.#prunes.length,
     });
-    createScene = (make, debug) => {
-      const scene = new WorkerScene(make, debug);
+    createScene = (make, options) => {
+      const scene = new WorkerScene(make, options);
       return [scene, scene.#ready.promise];
     };
     addFieldKeyedOf = (scene, desc, key) => scene.#addField(desc, key);

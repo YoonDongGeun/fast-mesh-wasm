@@ -62,7 +62,10 @@ class NodeWorker implements WorkerLike {
   }
 
   postMessage(msg: unknown, transfer?: Transferable[]): void {
-    this.sent.push(msg as Request[]);
+    // Batches only: not the init message.
+    if (Array.isArray(msg)) {
+      this.sent.push(msg as Request[]);
+    }
     this.worker.postMessage(msg, transfer as never);
   }
 
@@ -125,7 +128,10 @@ class InProcessWorker implements WorkerLike {
   }
 
   postMessage(msg: unknown): void {
-    this.sent.push(msg as Request[]);
+    // Batches only: not the init message.
+    if (Array.isArray(msg)) {
+      this.sent.push(msg as Request[]);
+    }
     const copy = structuredClone(msg);
     if (this.holdIn) {
       this.#heldIn.push(copy);

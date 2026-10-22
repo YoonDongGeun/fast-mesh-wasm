@@ -91,7 +91,10 @@ class NodeWorker implements WorkerLike {
   }
 
   postMessage(msg: unknown, transfer?: Transferable[]): void {
-    this.sent.push(msg as Request[]);
+    // Batches only: not the init message.
+    if (Array.isArray(msg)) {
+      this.sent.push(msg as Request[]);
+    }
     this.worker.postMessage(msg, transfer as never);
   }
 
@@ -817,7 +820,9 @@ describe("WorkerScene", () => {
       expect(files.filter((f) => f.startsWith("worker") || f.startsWith("protocol")), core).toEqual([]);
     }
     const entry = [...graph("worker-entry.js")];
-    expect(entry).toContain("web.js");
+    // The single-threaded glue (the scene imports it; the entry also loads it
+    // by dynamic import, and the threaded one only that way).
+    expect(entry).toContain("wasm/fast_mesh_wasm.js");
     expect(entry.filter((f) => /three|react/.test(f))).toEqual([]);
     expect([...graph("worker.js")].filter((f) => /three|react|worker-engine/.test(f))).toEqual([]);
     // In worker.js or a chunk it imports (the client is shared with

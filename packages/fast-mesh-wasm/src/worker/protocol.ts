@@ -229,10 +229,32 @@ export interface Result {
 }
 
 /**
- * What a Worker posts: a {@link Result} per batch, after `{ kind: "ready" }`
- * once the engine runs, or `{ kind: "fatal" }` when it could not start.
+ * The first message to a Worker, before any batch: how to start the engine.
+ * `threads` is the pool size asked for (`undefined`: the Worker's default,
+ * see `defaultThreads`); `debug` asks for the development warnings.
  */
-export type WorkerMessage = Result | { kind: "ready" } | { kind: "fatal"; error: ErrorWire };
+export interface InitMessage {
+  kind: "init";
+  threads?: number;
+  debug: boolean;
+}
+
+/** Whether a message to a Worker is its {@link InitMessage} (else a batch). */
+export function isInit(data: unknown): data is InitMessage {
+  return !Array.isArray(data) && (data as { kind?: unknown } | null)?.kind === "init";
+}
+
+/**
+ * What a Worker posts: a {@link Result} per batch, after `{ kind: "ready" }`
+ * once the engine runs, or `{ kind: "fatal" }` when it could not start. The
+ * ready message reports the threads the engine computes with (1 when
+ * single-threaded) and, in development, why it is single-threaded when more
+ * were asked for (`warning`, for the main side to log once per scene).
+ */
+export type WorkerMessage =
+  | Result
+  | { kind: "ready"; threads?: number; warning?: string }
+  | { kind: "fatal"; error: ErrorWire };
 
 /**
  * The key of a request: its own `key`, or a default naming what it targets

@@ -29,6 +29,8 @@ import {
   type ColorRuleWire,
   type ErrorWire,
   type FieldDescWire,
+  type InitMessage,
+  isInit,
   isLastWins,
   keyOf,
   type MeshChangeWire,
@@ -38,6 +40,9 @@ import {
   supersedes,
   type WorkerMessage,
 } from "./protocol.js";
+
+// The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js).
+export { loadEngine, startEngine } from "./load.js";
 
 /** The engine's side of the message channel. */
 export interface Port {
@@ -124,50 +129,77 @@ export interface Endpoint {
   onMessage(cb: (data: unknown) => void): void;
 }
 
+/** What a Worker's engine start reports in its ready message. */
+export interface Started {
+  /** The threads the engine computes with: 1 when single-threaded. */
+  threads: number;
+  /** Development only: why it is single-threaded though more threads were asked for. */
+  warning?: string;
+}
+
 /**
- * Serves the engine on a Worker's endpoint once `ready` (the WebAssembly
- * module's initialisation) resolves. Batches arriving before are kept and
- * run in order; then `{ kind: "ready" }` is posted first. When `ready`
- * rejects, `{ kind: "fatal" }` is posted instead and nothing runs.
+ * Serves the engine on a Worker's endpoint once it starts. `ready` is the
+ * start itself (the WebAssembly module's initialisation), or a function
+ * starting it for the Worker's first {@link InitMessage} (as the browser
+ * Worker script does); with a promise, init messages are ignored. Batches
+ * arriving before are kept and run in order; then `{ kind: "ready" }` (with
+ * the {@link Started} report, 1 thread by default) is posted first. When the
+ * start fails, `{ kind: "fatal" }` is posted instead and nothing runs.
  */
-export function serveEngine(endpoint: Endpoint, ready: Promise<unknown>, options: EngineOptions = {}): void {
+export function serveEngine(
+  endpoint: Endpoint,
+  ready: Promise<unknown> | ((init: InitMessage) => Promise<Started>),
+  options: EngineOptions = {},
+): void {
   let deliver: ((batch: Request[]) => void) | undefined;
+  let started = typeof ready !== "function";
   const early: Request[][] = [];
+  const serve = (start: Promise<unknown>) =>
+    start.then(
+      (info) => {
+        const { threads = 1, warning } = (info ?? {}) as Partial<Started>;
+        endpoint.post(warning === undefined ? { kind: "ready", threads } : { kind: "ready", threads, warning }, []);
+        runEngine(
+          {
+            post: (msg, transfer) => endpoint.post(msg, transfer),
+            onMessage: (cb) => {
+              deliver = cb;
+              for (const batch of early.splice(0)) {
+                cb(batch);
+              }
+            },
+          },
+          options,
+        );
+      },
+      (e: unknown) => {
+        const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        endpoint.post(
+          {
+            kind: "fatal",
+            error: { code: "INSTANCE_POISONED", message: `the Worker could not load fast-mesh (${cause})` },
+          },
+          [],
+        );
+      },
+    );
   // Listen right away: messages sent while the module loads are not lost.
   endpoint.onMessage((data) => {
-    if (deliver === undefined) {
+    if (isInit(data)) {
+      // Only the first starts the engine (and its thread pool, once per Worker).
+      if (!started && typeof ready === "function") {
+        started = true;
+        serve(new Promise<Started>((resolve) => resolve(ready(data))));
+      }
+    } else if (deliver === undefined) {
       early.push(data as Request[]);
     } else {
       deliver(data as Request[]);
     }
   });
-  ready.then(
-    () => {
-      endpoint.post({ kind: "ready" }, []);
-      runEngine(
-        {
-          post: (msg, transfer) => endpoint.post(msg, transfer),
-          onMessage: (cb) => {
-            deliver = cb;
-            for (const batch of early.splice(0)) {
-              cb(batch);
-            }
-          },
-        },
-        options,
-      );
-    },
-    (e: unknown) => {
-      const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      endpoint.post(
-        {
-          kind: "fatal",
-          error: { code: "INSTANCE_POISONED", message: `the Worker could not load fast-mesh (${cause})` },
-        },
-        [],
-      );
-    },
-  );
+  if (typeof ready !== "function") {
+    serve(ready);
+  }
 }
 
 function unknown(code: "UNKNOWN_MESH" | "UNKNOWN_FIELD" | "UNKNOWN_SECTION", id: ClientId): FastMeshError {
