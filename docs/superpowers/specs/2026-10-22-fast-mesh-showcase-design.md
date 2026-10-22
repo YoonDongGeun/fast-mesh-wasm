@@ -140,3 +140,26 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
    - **R3F.** `<FastMesh>` passes `shading` and `edgeSoftness` through.
    - **Showcase.** The collision panel gets a "Boundary softness" slider, and fragment shading is on by default.
    - **Exactness.** The per-fragment colour at a vertex equals the vertex-mode colour at that vertex. This is tested.
+
+## 8. Multi-mesh contact groups (owner, 2026-10-23)
+
+The owner's case: meshes A–D, with contact relationships A↔B, B↔C, A↔C and A↔D. Moving A must update everything related to A. B↔C must not be recomputed when A moves. Each mesh shows one colour scale, whichever partner it touches *(owner: the same colours for every partner)*.
+
+1. **Model: a relation graph with three layers** *(my call)*.
+   - **Edges (pairs).** Each ordered pair X→Y is a distance relation: X's vertices measured to Y. The engine already marks only the fields that involve a moved or edited mesh as due. It also skips pairs whose root boxes are farther apart than the margin.
+   - **Nodes (meshes).** A mesh's value is the reduction of its edges: per vertex, the minimum signed distance over all of its partners (the nearest surface, or the deepest penetration). Per vertex, the engine also keeps which partner produced the value (`nearest: u32` partner index; NaN or Infinity → none), so a UI can say "this red area touches C".
+   - **Display.** One colouring per mesh, so the heatmap preset applies unchanged.
+2. **Engine: multi-target distance fields** *(my call)*.
+   - `DistanceField` gains `to: Vec<MeshId>`; the single-target form stays as sugar.
+   - **Per vertex:** the closest point is searched over every target's BVH. The best distance found so far is the upper bound for the next target, so adding partners costs little. The result is exact and bit-identical to taking the min over separate single-target fields, with ties broken by the lowest partner index.
+   - **Recompute:** when any target or the source moves or is edited, the field is due. Candidates come from the union of each target's near set, using the existing near-search limit per target.
+   - **Removing a target** removes it from the set. When the set becomes empty, the field is removed.
+3. **Store API** *(my call)*. `store.setContactGroup(id, { meshes: MeshHandle[], pairs?: [MeshHandle, MeshHandle][] | "all", heatmap: ContactHeatmapOptions } | null)`.
+   - The store derives each member's partner set from `pairs`. `"all"` means every other member, with root-box culling.
+   - For each member it creates one multi-target field, with `distanceTo` as an array, and colours the member with the heatmap.
+   - Moving one member recomputes only the fields of that member and of its partners. Pairs that do not involve the moved mesh (B↔C when A moves) are untouched, because neither B's nor C's field has A… unless A is in their partner set, in which case only those fields recompute. That is the correct dependency.
+   - `fetchColoringValues` works per member.
+4. **Showcase.**
+   - The collision panel gets a "Group" mode: tick the meshes, and choose "all pairs" or edit the pair list in a small matrix.
+   - Readouts are given per pair. They are min gap and max depth through `meshDistance`, throttled.
+   - A tooltip on hover shows the nearest partner, read from the `nearest` buffer through the existing query path. This is optional if it is costly.

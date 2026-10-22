@@ -161,3 +161,26 @@ SceneStore.fetchColoringValues(mesh: MeshHandle): Promise<Float32Array | null>;
 - Showcase check: switching softness changes pixels, through a screenshot diff in headless Chrome.
 
 **Changeset:** minor (`values()` view, `shading`/`edgeSoftness`).
+
+### Task 5: Multi-target distance fields and contact groups (spec §8)
+
+**Files and changes:**
+- **Rust** (`fast-mesh-fields`, `fast-mesh-scene`):
+  - `signed_distances_multi` (closest point across several BVHs, with a shared bound);
+  - `DistanceField.to: Vec<MeshId>` and per-vertex `nearest`;
+  - hooks on every target;
+  - near candidates as the union of per-target near sets;
+  - removing a target updates the field.
+- **Wasm/TS:**
+  - `DistanceFieldDesc.to: MeshHandle | MeshHandle[]` on `Scene` and `WorkerScene`;
+  - `DistanceColoring.distanceTo: MeshHandle | MeshHandle[]` in the store;
+  - `store.setContactGroup`.
+- **Showcase:** a Group mode in the collision panel.
+
+**Tests:**
+- **Rust property test:** a multi-target field is bit-identical to the per-vertex min over separate single-target fields, under random drags and edits of every mesh. The tie rule is the lowest index.
+- **Dependency test:** in a group of four meshes A–D with pairs A↔B, B↔C, A↔C, A↔D, moving A recomputes the fields of A, B, C and D. Moving D recomputes only the fields of A and D (counted).
+- **Store tests:** `setContactGroup` on both hosts. Removing a member updates its partners.
+- **showcase-check:** group mode with three demo meshes.
+
+**Changeset:** minor (multi-target fields, `setContactGroup`).
