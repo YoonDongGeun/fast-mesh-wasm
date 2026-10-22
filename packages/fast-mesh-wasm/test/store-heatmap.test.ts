@@ -90,14 +90,53 @@ describe("contactHeatmap", () => {
     expect(colorAt(c, 0.1003)).toEqual(NEAR);
   });
 
+  it("heatmap_penetration_only", () => {
+    // gap 0: colour penetration only; above the contact band is the base colour.
+    const c = contactHeatmap({ depth: 1, gap: 0 });
+    expect(c.range).toEqual([-1, 0]);
+    expect(c.maxDistance).toBe(1);
+    expect(contactHeatmap({ depth: 1, gap: 0, exactDepth: true }).maxDistance).toBe(Infinity);
+    const stops = (c.map as { stops: readonly (readonly [number, Rgba])[] }).stops;
+    expect(stops.map((s) => s[1])).toEqual([DEEP, SHALLOW, WHITE]);
+    expect(stops[0][0]).toBe(0);
+    expect(stops[stops.length - 1][0]).toBe(1);
+    for (let k = 1; k < stops.length; k++) {
+      expect(Math.fround(stops[k][0])).toBeGreaterThan(Math.fround(stops[k - 1][0]));
+    }
+    expect(colorAt(c, -1)).toEqual(DEEP);
+    expect(colorAt(c, -3)).toEqual(DEEP);
+    expect(colorAt(c, -0.0003)).toEqual(SHALLOW);
+    expect(colorAt(c, 0)).toEqual(WHITE);
+    expect(colorAt(c, 0.001)).toEqual(BASE);
+
+    // With a tolerance the white band reaches +tolerance, and only beyond it is base.
+    const banded = contactHeatmap({ depth: 1, gap: 0, tolerance: 0.1 });
+    expect(banded.range).toEqual([-1, 0.1]);
+    const bandStops = (banded.map as { stops: readonly (readonly [number, Rgba])[] }).stops;
+    expect(bandStops.map((s) => s[1])).toEqual([DEEP, SHALLOW, WHITE, WHITE]);
+    expect(bandStops[bandStops.length - 1][0]).toBe(1);
+    for (let k = 1; k < bandStops.length; k++) {
+      expect(Math.fround(bandStops[k][0])).toBeGreaterThan(Math.fround(bandStops[k - 1][0]));
+    }
+    for (const v of [-0.1, 0, 0.1]) {
+      expect(colorAt(banded, v)).toEqual(WHITE);
+    }
+    expect(colorAt(banded, -0.1003)).toEqual(SHALLOW);
+    expect(colorAt(banded, 0.1001)).toEqual(BASE);
+  });
+
   it("heatmap_validation", () => {
     const bad = [
       { depth: 0, gap: 1 },
       { depth: -1, gap: 1 },
       { depth: Number.NaN, gap: 1 },
       { depth: Infinity, gap: 1 },
-      { depth: 1, gap: 0 },
+      { depth: 0, gap: 0 },
+      { depth: 1, gap: 0, tolerance: 1 },
+      { depth: 1, gap: 0, tolerance: -0.1 },
       { depth: 1, gap: -2 },
+      { depth: 1, gap: -1e-9 },
+      { depth: 1, gap: Number.NaN },
       { depth: 1, gap: Infinity },
       { depth: 1, gap: 1, tolerance: -0.1 },
       { depth: 1, gap: 2, tolerance: 1 },
@@ -112,6 +151,9 @@ describe("contactHeatmap", () => {
       { depth: 1, gap: 1, tolerance: 0.999999999 },
       { depth: 1e-9, gap: 1e9, tolerance: 0 },
       { depth: 1e9, gap: 1e-9, tolerance: 0 },
+      { depth: 1, gap: 0, tolerance: 0.999999999 },
+      { depth: 1e-9, gap: 0, tolerance: 0 },
+      { depth: 1e9, gap: 0, tolerance: 1e-9 },
     ]) {
       const stops = (contactHeatmap(o).map as { stops: readonly (readonly [number, Rgba])[] }).stops;
       expect(stops.length).toBeGreaterThanOrEqual(2);

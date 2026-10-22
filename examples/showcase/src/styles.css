@@ -80,9 +80,6 @@ body,
   text-transform: uppercase;
   color: var(--muted);
 }
-.placeholder {
-  opacity: 0.75;
-}
 .muted {
   color: var(--muted);
   margin: 6px 0;
@@ -254,6 +251,142 @@ input[type="range"] {
   gap: 3px;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* ---- Repair ---- */
+.mesh-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.analysis,
+.readouts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.analysis dt,
+.readouts dt {
+  color: var(--muted);
+}
+.analysis dd,
+.readouts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.analysis.stale {
+  opacity: 0.6;
+}
+.holes {
+  margin: 2px 0 0;
+  padding-left: 14px;
+  color: var(--text);
+}
+.ops {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+}
+.op {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.field input[type="number"] {
+  width: 72px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.report {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.report.error {
+  color: var(--error);
+}
+.busy .progress {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* ---- Collision ---- */
+.slider {
+  display: block;
+  margin: 6px 0;
+}
+.slider-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+}
+.slider output {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.slider input[type="range"] {
+  width: 100%;
+  margin: 2px 0 0;
+}
+.legend {
+  margin: 8px 0;
+}
+.legend-bar {
+  height: 8px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+}
+.legend-labels {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+}
+.legend-zero {
+  position: absolute;
+  transform: translateX(-50%);
+}
+.pair {
+  margin-top: 8px;
+}
+.picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+.picker span {
+  width: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.picker select {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 4px;
 }
 
 /* ---- Viewport overlays ---- */

@@ -1,11 +1,14 @@
 // The app shell: the mesh list on the left, the viewport in the centre, the
-// analysis panels on the right (Repair and Collision come next) and the
+// Repair and Collision panels on the right and the
 // status bar along the bottom. Files dropped anywhere on the page load.
-import type { MeshHandle } from "fast-mesh-wasm";
+import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
+import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useState } from "react";
 import type { Loader } from "./load/loader";
+import { CollisionPanel } from "./panels/CollisionPanel";
 import { MeshList } from "./panels/MeshList";
+import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { type AppState, useApp } from "./scene/app-state";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
@@ -13,6 +16,8 @@ import { type GizmoMode, Viewport } from "./viewport/Viewport";
 /** The engine behind the store, for the status bar. */
 export interface Engine {
   mode: "worker" | "local";
+  /** The store's scene, for the queries the store does not wrap (analyze, distances, contacts). */
+  scene: Scene | WorkerScene;
   /** The engine's threads (as of the Worker's latest start). */
   threads(): number;
   /** Whether the page is cross-origin isolated (needed for threads). */
@@ -150,22 +155,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         {items.length === 0 ? <p className="empty">Drop STL, OBJ or PLY files here</p> : null}
       </main>
       <aside className="sidebar sidebar-right">
-        <section className="panel placeholder" aria-label="Repair">
-          <h2>Repair</h2>
-          <p className="muted">
-            Analyze the selected mesh (holes, orientation, components, non-manifold and degenerate elements) and run
-            undoable repairs.
-          </p>
-          <p className="muted small">Coming soon.</p>
-        </section>
-        <section className="panel placeholder" aria-label="Collision">
-          <h2>Collision</h2>
-          <p className="muted">
-            Pick two meshes to see their contact heatmap: penetration depth in reds, contact in white, the gap in
-            green to blue.
-          </p>
-          <p className="muted small">Coming soon.</p>
-        </section>
+        <RepairPanel app={app} scene={engine.scene} />
+        <CollisionPanel app={app} scene={engine.scene} />
       </aside>
       <StatusBar engine={engine} app={app} />
       {dropping ? <div className="drop-overlay">Drop STL, OBJ or PLY files to load them</div> : null}

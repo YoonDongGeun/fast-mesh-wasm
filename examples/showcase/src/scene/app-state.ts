@@ -1,6 +1,7 @@
 // The app's own state, beside the SceneStore: the meshes it shows (name,
-// material, size) and the loads in progress. A tiny external store, so the
-// loader (outside React) and the components share it; read it with `useApp`.
+// material, size), the loads in progress and the collision pair. A tiny
+// external store, so the loader (outside React) and the components share it;
+// read it with `useApp`.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
@@ -15,6 +16,8 @@ export interface Item {
   name: string;
   /** Owned by the app (one per mesh, as `bindMesh` requires); disposed on removal. */
   material: THREE.MeshStandardMaterial;
+  /** The mesh's colour (`0xrrggbb`), for its swatch: the material turns white while a colouring shows. */
+  color: number;
   /** The triangle count when loaded (repairs change it; see `useTriangleCount`). */
   triangles: number;
   /** The mesh origin: its bounding box centre when loaded. */
@@ -33,15 +36,24 @@ export interface Job {
   message?: string;
 }
 
+/** The meshes the collision panel colours, each against the other; `null` for none picked. */
+export interface CollisionPair {
+  a: MeshHandle | null;
+  b: MeshHandle | null;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
+  collision: CollisionPair;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
 
 export class AppState {
-  #snap: AppSnapshot = { items: [], jobs: [] };
+  #snap: AppSnapshot = { items: [], jobs: [], collision: { a: null, b: null } };
+  /** The pair defaults to the first two meshes added, until it is picked by hand. */
+  #autoPick = true;
   readonly #listeners = new Set<() => void>();
   #nextItem = 0;
   #nextColor = 0;
@@ -72,19 +84,48 @@ export class AppState {
       mesh,
       name: loaded.name,
       material,
+      color,
       triangles,
       center: loaded.center,
       radius: loaded.radius,
     };
-    this.#set({ items: [...this.#snap.items, item] });
+    let collision = this.#snap.collision;
+    if (this.#autoPick) {
+      if (collision.a === null) {
+        collision = { ...collision, a: mesh };
+      } else if (collision.b === null) {
+        collision = { ...collision, b: mesh };
+        this.#autoPick = false;
+      }
+    }
+    this.#set({ items: [...this.#snap.items, item], collision });
     return item;
   }
 
-  /** Removes a mesh from the store and the list, and disposes its material. */
+  /**
+   * Removes a mesh from the store and the list, and disposes its material.
+   * When it is one of the collision pair, its picker resets and the other
+   * mesh's colouring (measured to it) stops first, in the same tick: the
+   * store would otherwise report the colouring's lost target as an error.
+   */
   removeMesh(store: SceneStore, item: Item): void {
+    let collision = this.#snap.collision;
+    if (collision.a === item.mesh || collision.b === item.mesh) {
+      const other = collision.a === item.mesh ? collision.b : collision.a;
+      if (other !== null && other !== item.mesh) {
+        store.setDisplay(other, { coloring: null });
+      }
+      collision = { a: collision.a === item.mesh ? null : collision.a, b: collision.b === item.mesh ? null : collision.b };
+    }
     store.removeMesh(item.mesh);
     item.material.dispose();
-    this.#set({ items: this.#snap.items.filter((i) => i !== item) });
+    this.#set({ items: this.#snap.items.filter((i) => i !== item), collision });
+  }
+
+  /** Picks the collision pair's `side` (by hand: no more defaults). */
+  pick(side: keyof CollisionPair, mesh: MeshHandle | null): void {
+    this.#autoPick = false;
+    this.#set({ collision: { ...this.#snap.collision, [side]: mesh } });
   }
 
   setJob(job: Job): void {

@@ -9,9 +9,15 @@ import type { DistanceColoring } from "./snapshot.js";
 export interface ContactHeatmapOptions {
   /** The penetration depth shown darkest (`deep`); deeper clamps to it. `> 0`. */
   depth: number;
-  /** The gap shown `far`; farther shows the base colour. `> 0`. */
+  /**
+   * The gap shown `far`; farther shows the base colour. `>= 0`: at 0 only
+   * penetration (and the contact band) is coloured.
+   */
   gap: number;
-  /** Distances in `[-tolerance, +tolerance]` are contact (`contact`). In `[0, min(depth, gap))`; defaults to 0. */
+  /**
+   * Distances in `[-tolerance, +tolerance]` are contact (`contact`). In
+   * `[0, min(depth, gap))`, or `[0, depth)` when `gap` is 0; defaults to 0.
+   */
   tolerance?: number;
   /**
    * `true` computes every vertex's distance (`maxDistance: Infinity`), so any
@@ -51,21 +57,26 @@ function invalid(message: string): FastMeshError {
  * colour). From `-depth` the colour runs from `deep` to `shallow` just below
  * the contact band, is `contact` across `[-tolerance, +tolerance]` (a single
  * stop at 0 when the tolerance is 0), then runs from `near` just above the
- * band to `far` at `gap`. A change of `tolerance` or `colors` alone keeps
- * `maxDistance` and `sign`, so the store reuses its field and only recolours.
+ * band to `far` at `gap`. With `gap` 0 there is no gap ramp: the range is
+ * `[-depth, tolerance]` and anything beyond the band shows the base colour.
+ * A change of `tolerance` or `colors` alone keeps `maxDistance` and `sign`,
+ * so the store reuses its field and only recolours.
  *
- * @throws `INVALID_ARGUMENT` unless `depth > 0`, `gap > 0` (both finite) and `0 ≤ tolerance < min(depth, gap)`.
+ * @throws `INVALID_ARGUMENT` unless `depth > 0`, `gap >= 0` (both finite) and
+ * `0 ≤ tolerance < min(depth, gap)` (`< depth` when `gap` is 0).
  */
 export function contactHeatmap(options: ContactHeatmapOptions): Omit<DistanceColoring, "distanceTo"> {
   const { depth, gap, tolerance = 0, exactDepth = false, sign = "auto" } = options;
   if (typeof depth !== "number" || !Number.isFinite(depth) || !(depth > 0)) {
     throw invalid("depth must be a finite number > 0");
   }
-  if (typeof gap !== "number" || !Number.isFinite(gap) || !(gap > 0)) {
-    throw invalid("gap must be a finite number > 0");
+  if (typeof gap !== "number" || !Number.isFinite(gap) || !(gap >= 0)) {
+    throw invalid("gap must be a finite number >= 0");
   }
-  if (typeof tolerance !== "number" || !(tolerance >= 0 && tolerance < Math.min(depth, gap))) {
-    throw invalid("tolerance must be a number in [0, min(depth, gap))");
+  // gap 0 colours penetration only: the band is then bounded by depth alone.
+  const ramp = gap > 0;
+  if (typeof tolerance !== "number" || !(tolerance >= 0 && tolerance < (ramp ? Math.min(depth, gap) : depth))) {
+    throw invalid("tolerance must be a number in [0, min(depth, gap)), or [0, depth) when gap is 0");
   }
   const o = options.colors;
   const c: Record<keyof typeof DEFAULT_COLORS, Rgba> = {
@@ -75,10 +86,14 @@ export function contactHeatmap(options: ContactHeatmapOptions): Omit<DistanceCol
     near: o?.near ?? DEFAULT_COLORS.near,
     far: o?.far ?? DEFAULT_COLORS.far,
   };
-  const t = (v: number): number => (v + depth) / (depth + gap);
+  // The range's top: `gap`, or the band's upper edge without a gap ramp.
+  const top = ramp ? gap : tolerance;
+  const t = (v: number): number => (v + depth) / (depth + top);
   const lo = t(-tolerance);
-  const hi = t(tolerance);
-  // The band's edges are inside (0, 1): tolerance < min(depth, gap).
+  // Without a gap ramp the band ends the range (exactly 1, for the end stop).
+  const hi = ramp ? t(tolerance) : 1;
+  // The band's lower edge is inside (0, 1]: tolerance < depth. With a gap
+  // ramp its upper edge is inside (0, 1) too: tolerance < gap.
   const below = Math.min(EDGE, lo / 2);
   const above = Math.min(EDGE, (1 - hi) / 2);
   const band: [number, Rgba][] = tolerance === 0 ? [[lo, c.contact]] : [[lo, c.contact], [hi, c.contact]];
@@ -86,8 +101,12 @@ export function contactHeatmap(options: ContactHeatmapOptions): Omit<DistanceCol
     [0, c.deep],
     [lo - below, c.shallow],
     ...band,
-    [hi + above, c.near],
-    [1, c.far],
+    ...(ramp
+      ? ([
+          [hi + above, c.near],
+          [1, c.far],
+        ] as [number, Rgba][])
+      : []),
   ];
   // Stops reach the engine as f32 and must stay strictly increasing there:
   // drop a stop that rounds onto the one before it (only with a band edge
@@ -107,7 +126,7 @@ export function contactHeatmap(options: ContactHeatmapOptions): Omit<DistanceCol
     maxDistance: exactDepth ? Infinity : Math.max(depth, gap),
     sign,
     map: { stops: Object.freeze(stops) },
-    range: Object.freeze([-depth, gap] as const),
+    range: Object.freeze([-depth, top] as const),
     below: "clamp",
     above: "base",
   };

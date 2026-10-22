@@ -18,12 +18,29 @@
 // - select: a click on A in the canvas selects it.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
+// - heatmap: the collision pair defaults to A and B, both coloured against
+//   each other (reds where they penetrate, green to blue across the gap);
+//   the readouts show the penetration, intersecting, a gap of 0 and contact
+//   triangles.
+// - colour-from: "Colour from" 0 colours penetration only (no gap colours).
+// - readouts: dragging A away from B refreshes the readouts while the gizmo
+//   drags (about 4 Hz) and once more at the end: no longer intersecting, a
+//   gap. Undo puts A back.
+// - open-target (RF1): picking C (open) as B still colours A and C, and
+//   the panel warns that C is open.
+// - repair (RF5): with C selected and coloured, the repair panel lists its
+//   two holes and two components; Fill holes leaves none, C stays coloured
+//   (over its new vertices too) and the warning goes; Undo brings both back.
+// - remove (RF3): removing B while A and B are coloured resets B's picker,
+//   stops A's colouring and the readouts, with no error.
 // - upload: three fixtures (binary STL, OBJ with quads, ASCII PLY) through
 //   the file input are listed with their triangle counts and drawn; a broken
 //   file shows a failed load.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
+// - local: a short pass with ?local (the synchronous Scene on the main
+//   thread): the demo meshes, the heatmap readouts, Fill holes on C and undo.
 // - console: no console error or uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -231,8 +248,68 @@ async function upload(paths) {
   await browser.send("DOM.setFileInputFiles", { nodeId, files: paths });
 }
 
+/** Sets a range input (`data-control`) to `value`, as a user drag would (React reads `input` events). */
+async function setRange(control, value) {
+  await page(`(() => {
+    const el = document.querySelector('[data-control=${control}]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, ${JSON.stringify(String(value))});
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+}
+
+/** Picks the mesh named `name` in the collision panel's `side` picker. */
+async function pick(side, name) {
+  await page(`(() => {
+    const sel = document.querySelector('[data-pick=${side}]');
+    const opt = [...sel.options].find((o) => o.text === ${JSON.stringify(name)});
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+}
+
+/** Clicks the first element matching `selector`; false when there is none. */
+const clickOn = (selector) =>
+  page(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); el?.click(); return el !== null; })()`);
+
+/**
+ * Drags the gizmo's centre handle on `name` (it must be selected) by
+ * `(dx, dy)` pixels in `steps` moves `ms` apart. The gizmo is hovered until
+ * it reports a handle under the pointer (it picks against its own matrices,
+ * set when it is drawn).
+ */
+async function dragGizmo(name, dx, dy, steps, ms) {
+  const attached = await waitFor(`__showcase.gizmo()?.mesh === ${JSON.stringify(name)}`, 5000);
+  const from = await hook(`screenPoint(${JSON.stringify(name)})`);
+  let axis = null;
+  for (const t = Date.now(); attached && axis === null && Date.now() - t < 5000; ) {
+    await mouse("mouseMoved", from.x, from.y, { button: "none" });
+    axis = await hook("gizmo()?.axis ?? null");
+    if (axis === null) {
+      await sleep(50);
+    }
+  }
+  await mouse("mousePressed", from.x, from.y, { buttons: 1 });
+  const dragging = await waitFor("__showcase.dragging()", 2000);
+  for (let i = 1; i <= steps; i++) {
+    await mouse("mouseMoved", from.x + (dx * i) / steps, from.y + (dy * i) / steps, { buttons: 1 });
+    await sleep(ms);
+  }
+  await mouse("mouseReleased", from.x + dx, from.y + dy, { buttons: 0 });
+  return { attached: attached === true, axis, dragging: dragging === true };
+}
+
+/** `extra` (an expression over `c`, the collision panel's state) in the page: `c` when it holds. */
+const collision = (extra) => `(() => { const c = __showcase.collision(); return (${extra}) && c; })()`;
+/** The vertices `colorCounts` counted. */
+const used = (counts) => (counts === null ? 0 : counts.red + counts.white + counts.gap + counts.other);
+
 const length = (v) => Math.hypot(...v);
 const A = "A · blobby sphere";
+const B = "B · rounded box";
+const C = "C · open shell + piece";
+const q = JSON.stringify;
 
 try {
   const query = threads === undefined ? "" : `?threads=${threads}`;
@@ -273,33 +350,15 @@ try {
   verdict("select", selected === true, `clicked (${fmt(at.x)}, ${fmt(at.y)}); selected ${await hook("selected()")}`);
 
   // ---- drag: the gizmo's centre handle (free move in the view plane) ----
-  // The gizmo is attached to A, then hovered until it reports a handle under
-  // the pointer (it picks against its own matrices, set when it is drawn).
-  const attached = await waitFor(`__showcase.gizmo()?.mesh === ${JSON.stringify(A)}`, 5000);
-  const from = await hook(`screenPoint(${JSON.stringify(A)})`);
-  let axis = null;
-  for (const t = Date.now(); attached && axis === null && Date.now() - t < 5000; ) {
-    await mouse("mouseMoved", from.x, from.y, { button: "none" });
-    axis = await hook("gizmo()?.axis ?? null");
-    if (axis === null) {
-      await sleep(50);
-    }
-  }
-  await mouse("mousePressed", from.x, from.y, { buttons: 1 });
-  const wasDragging = await waitFor("__showcase.dragging()", 2000);
-  for (let i = 1; i <= 12; i++) {
-    await mouse("mouseMoved", from.x + 10 * i, from.y - 3 * i, { buttons: 1 });
-    await sleep(16);
-  }
-  await mouse("mouseReleased", from.x + 120, from.y - 36, { buttons: 0 });
+  const { attached, axis, dragging: wasDragging } = await dragGizmo(A, 120, -36, 12, 16);
   const moved = await waitFor(
     `(() => { const t = __showcase.translation(${JSON.stringify(A)}); const s = __showcase.status(); return !__showcase.dragging() && Math.hypot(...t) > 0.05 && s.canUndo && t; })()`,
     5000,
   );
   verdict(
     "drag",
-    attached === true && axis !== null && wasDragging === true && moved !== undefined,
-    `gizmo on A ${attached === true}, hovered handle ${axis}, dragging ${wasDragging === true}; A moved by ${moved === undefined ? "nothing" : fmt(length(moved))}`,
+    attached && axis !== null && wasDragging && moved !== undefined,
+    `gizmo on A ${attached}, hovered handle ${axis}, dragging ${wasDragging}; A moved by ${moved === undefined ? "nothing" : fmt(length(moved))}`,
   );
 
   // ---- undo / redo ----
@@ -319,6 +378,136 @@ try {
     "undo",
     undone === true && redone === true && undoneAgain === true,
     `Undo button ${undone === true}, Ctrl+Shift+Z ${redone === true}, Ctrl+Z ${undoneAgain === true}`,
+  );
+
+  // ---- heatmap: A and B, each coloured against the other ----
+  await sleep(300); // the undo's change records reach the panel, then its readouts settle
+  const heat = await waitFor(
+    collision(`c.a === ${q(A)} && c.b === ${q(B)}
+      && c.coloring[${q(A)}]?.to === ${q(B)} && c.coloring[${q(A)}].status === "ready"
+      && c.coloring[${q(B)}]?.to === ${q(A)} && c.coloring[${q(B)}].status === "ready"
+      && c.settled && c.readouts?.penetration?.depth > 0`),
+    30_000,
+  );
+  const colorsA = await hook(`colorCounts(${q(A)})`);
+  const r0 = heat?.readouts;
+  verdict(
+    "heatmap",
+    heat !== undefined && r0.intersects && r0.gap === 0 && r0.contacts.a > 0 && r0.contacts.b > 0 && colorsA?.red > 0 && colorsA?.gap > 0,
+    heat === undefined
+      ? `collision ${q(await hook("collision()"))}`
+      : `A and B coloured; penetration ${fmt(r0.penetration.depth)}, intersecting ${r0.intersects}, gap ${r0.gap}, contact triangles ${r0.contacts.a} · ${r0.contacts.b}; A's vertices ${q(colorsA)}`,
+  );
+
+  // ---- colour-from: 0 colours penetration only (the white band ends the range) ----
+  await setRange("gap", 0);
+  const penOnly = await waitFor(
+    collision(`c.coloring[${q(A)}]?.range?.[1] < 0.1 && c.coloring[${q(A)}].status === "ready"`),
+    10_000,
+  );
+  await sleep(100); // the colours of that colouring, committed
+  const colorsPen = await hook(`colorCounts(${q(A)})`);
+  verdict(
+    "colour-from",
+    penOnly !== undefined && colorsPen?.gap === 0 && colorsPen?.red > 0,
+    `range ${q(penOnly?.coloring[A]?.range)}; A's vertices ${q(colorsPen)}`,
+  );
+  await setRange("gap", 1);
+  await waitFor(collision(`c.coloring[${q(A)}]?.range?.[1] === 1 && c.coloring[${q(A)}].status === "ready"`), 10_000);
+
+  // ---- readouts: refreshed while A is dragged away from B, and at the end ----
+  const before = await hook("collision()");
+  const away = await dragGizmo(A, -260, 0, 40, 25);
+  const apart = await waitFor(
+    collision(`!__showcase.dragging() && c.settled && c.readouts !== null && !c.readouts.intersects && c.readouts.gap > 0 && c.readouts.penetration?.depth === 0`),
+    10_000,
+  );
+  const during = (apart?.updatesWhileDragging ?? 0) - before.updatesWhileDragging;
+  verdict(
+    "readouts",
+    away.dragging && apart !== undefined && during >= 2,
+    `${during} refresh(es) while dragging, ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
+  );
+  await clickOn("[data-action=undo]");
+  await waitFor(collision(`Math.hypot(...__showcase.translation(${q(A)})) < 1e-9 && c.readouts?.intersects === true`), 10_000);
+
+  // ---- open-target (RF1): C, open, as B (about 1 from A: colour from 2) ----
+  await setRange("gap", 2);
+  await pick("b", C);
+  const open = await waitFor(
+    collision(`c.b === ${q(C)}
+      && c.coloring[${q(A)}]?.to === ${q(C)} && c.coloring[${q(A)}].status === "ready"
+      && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
+      && c.coloring[${q(B)}]?.to === null
+      && c.readouts?.warnings.some((w) => w.startsWith(${q(`${C} is open`)}))`),
+    20_000,
+  );
+  const colorsOpen = { A: await hook(`colorCounts(${q(A)})`), C: await hook(`colorCounts(${q(C)})`) };
+  verdict(
+    "open-target",
+    open !== undefined && colorsOpen.A?.gap > 0 && colorsOpen.C?.gap > 0,
+    open === undefined
+      ? `collision ${q(await hook("collision()"))}`
+      : `A and C coloured (gap-coloured vertices: A ${colorsOpen.A.gap}, C ${colorsOpen.C.gap}); warning "${open.readouts.warnings.join(" / ")}"`,
+  );
+
+  // ---- repair (RF5): fill C's holes while it is coloured, then undo ----
+  await clickOn(`[data-mesh="${C}"] .mesh-name`);
+  const analysed = await waitFor(`(() => { const r = __showcase.repair(); return r.analysis?.mesh === ${q(C)} && r; })()`, 10_000);
+  const holesBefore = analysed?.analysis.summary.holes.length;
+  const componentsBefore = analysed?.analysis.summary.components.length;
+  const verticesBefore = used(await hook(`colorCounts(${q(C)})`));
+  const analysesBefore = analysed?.analyses ?? 0;
+  await clickOn("[data-repair-op=fillHoles]");
+  const filled = await waitFor(
+    `(() => { const r = __showcase.repair(); const c = __showcase.collision();
+      return r.busy === null && r.analyses > ${analysesBefore} && r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === 0
+        && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
+        && c.readouts !== null && !c.readouts.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
+    30_000,
+  );
+  const verticesFilled = used(await hook(`colorCounts(${q(C)})`));
+  await clickOn("[data-action=undo]");
+  const restored = await waitFor(
+    `(() => { const r = __showcase.repair(); const c = __showcase.collision();
+      return r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === ${holesBefore ?? 2}
+        && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
+        && c.readouts?.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
+    30_000,
+  );
+  const verticesRestored = used(await hook(`colorCounts(${q(C)})`));
+  verdict(
+    "repair",
+    holesBefore === 2 &&
+      componentsBefore === 2 &&
+      filled !== undefined &&
+      verticesFilled > verticesBefore &&
+      restored !== undefined &&
+      verticesRestored === verticesBefore,
+    `C: ${holesBefore} holes, ${componentsBefore} components; ${filled === undefined ? `after Fill holes ${q(await hook("repair()"))}` : `"${filled.r.report}"`}; coloured vertices ${verticesBefore} -> ${verticesFilled} -> ${verticesRestored} after undo; undo ${restored === undefined ? "did not restore the holes, the colouring and the warning" : "restored the holes, the colouring and the warning"}`,
+  );
+
+  // ---- remove (RF3): B removed while A and B are coloured ----
+  await pick("b", B);
+  const pairAB = await waitFor(
+    collision(`c.coloring[${q(B)}]?.to === ${q(A)} && c.coloring[${q(B)}].status === "ready"
+      && c.coloring[${q(C)}]?.to === null && c.readouts?.intersects === true`),
+    20_000,
+  );
+  await clickOn(`[data-mesh="${B}"] button.danger`);
+  const removed = await waitFor(
+    collision(`c.b === null && c.a === ${q(A)} && !(${q(B)} in c.coloring)
+      && c.coloring[${q(A)}]?.to === null && c.readouts === null && __showcase.status().status !== "error"`),
+    10_000,
+  );
+  const settledUpdates = (await hook("collision()")).updates;
+  await sleep(1000);
+  const after = await hook("collision()");
+  const status = await hook("status()");
+  verdict(
+    "remove",
+    pairAB !== undefined && removed !== undefined && after.updates === settledUpdates && after.readouts === null && status.status !== "error",
+    `A and B coloured ${pairAB !== undefined}; B's picker ${after.b === null ? "reset" : "kept"}, A's colouring ${after.coloring[A]?.to === null ? "stopped" : "kept"}, readouts ${after.readouts === null && after.updates === settledUpdates ? "stopped" : "still running"}, scene ${status.status}${status.error === undefined ? "" : ` (${status.error})`}`,
   );
 
   // ---- upload ----
@@ -343,7 +532,7 @@ try {
   verdict(
     "upload",
     loaded !== undefined && broken !== undefined,
-    `${loaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : loaded.slice(3).map((m) => `${m.name} (${m.triangles})`).join(", ")}; broken.stl ${broken === undefined ? "not reported" : `failed: ${broken.message}`}`,
+    `${loaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : loaded.filter((m) => m.name in expected).map((m) => `${m.name} (${m.triangles})`).join(", ")}; broken.stl ${broken === undefined ? "not reported" : `failed: ${broken.message}`}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
@@ -398,6 +587,38 @@ try {
     const { data } = await browser.send("Page.captureScreenshot", { format: "png" });
     writeFileSync(option("--screenshot"), Buffer.from(data, "base64"));
   }
+
+  // ---- local: ?local, the synchronous Scene on the main thread ----
+  await browser.goto(`http://127.0.0.1:${port}/?local`, "window.__showcase !== undefined");
+  const localDemo = await waitFor(
+    `(() => { const i = __showcase.items(); return __showcase.mode === "local" && i.length === 3 && i.every((m) => m.drawn) && i; })()`,
+    60_000,
+  );
+  const localHeat = await waitFor(
+    collision(`c.a === ${q(A)} && c.b === ${q(B)} && c.coloring[${q(A)}]?.status === "ready"
+      && c.readouts?.penetration?.depth > 0 && c.readouts.intersects`),
+    30_000,
+  );
+  await clickOn(`[data-mesh="${C}"] .mesh-name`);
+  const localHoles = await waitFor(
+    `(() => { const r = __showcase.repair(); return r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length; })()`,
+    10_000,
+  );
+  await clickOn("[data-repair-op=fillHoles]");
+  const localFilled = await waitFor(
+    `(() => { const r = __showcase.repair(); return r.busy === null && r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === 0; })()`,
+    30_000,
+  );
+  await clickOn("[data-action=undo]");
+  const localUndone = await waitFor(
+    `(() => { const r = __showcase.repair(); return r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === 2; })()`,
+    30_000,
+  );
+  verdict(
+    "local",
+    localDemo !== undefined && localHeat !== undefined && localHoles === 2 && localFilled === true && localUndone === true,
+    `local scene ${localDemo !== undefined}; heatmap ${localHeat === undefined ? "not ready" : `penetration ${fmt(localHeat.readouts.penetration.depth)}`}; C ${localHoles} holes, filled ${localFilled === true}, undone ${localUndone === true}`,
+  );
 
   // ---- console ----
   const problems = browser.consoleLines.filter((l) => /^(page|worker): (error|assert): |^(page|worker): exception: /.test(l));

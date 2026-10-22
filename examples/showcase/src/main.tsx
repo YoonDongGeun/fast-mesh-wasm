@@ -24,12 +24,16 @@ async function createEngine(): Promise<{ store: SceneStore; engine: Engine }> {
     // Loaded only in this mode, so the Worker mode never fetches the wasm on the main thread.
     const { init, Scene } = await import("fast-mesh-wasm");
     await init();
-    return { store: createSceneStore(new Scene()), engine: { mode: "local", threads: () => 1, isolated } };
+    const scene = new Scene();
+    return { store: createSceneStore(scene), engine: { mode: "local", scene, threads: () => 1, isolated } };
   }
   const worker: WorkerScene = await createWorkerScene(
     threadsParam === null ? {} : { threads: Math.max(1, Math.round(Number(threadsParam)) || 1) },
   );
-  return { store: createSceneStore(worker), engine: { mode: "worker", threads: () => worker.threads, isolated } };
+  return {
+    store: createSceneStore(worker),
+    engine: { mode: "worker", scene: worker, threads: () => worker.threads, isolated },
+  };
 }
 
 const root = createRoot(document.getElementById("root")!);
