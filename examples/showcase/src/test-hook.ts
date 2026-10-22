@@ -73,6 +73,7 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         updates: inspect.collision.updates,
         updatesWhileDragging: inspect.collision.updatesWhileDragging,
         settled: inspect.collision.settled,
+        warnings: inspect.collision.warnings,
       };
     },
     /** The repair panel: the latest analysis (mesh name and summary), the latest report, the op running. */

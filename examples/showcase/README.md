@@ -23,8 +23,9 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   conflicts, components (floating pieces), non-manifold edges and vertices, and degenerate triangles.
   The buttons run the library's repairs through `store.repair`, each one undo step: Weld (within a
   distance), Remove degenerate, Orient, Remove small components (below a triangle count) and Fill
-  holes (up to a size, optionally faired to follow the curvature). Each shows its report while the
-  analysis refreshes; a repair, its undo and its redo all re-analyse.
+  holes (up to 64 edges by default; an empty limit fills any size, an open mesh's outer boundary
+  included; optionally faired to follow the curvature). Each shows its report while the analysis
+  refreshes; a repair, its undo and its redo all re-analyse, and an undo or redo clears the report.
 - **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
   signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
@@ -33,15 +34,18 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   penetration shows the mesh colour. Readouts, refreshed about four times a second while a mesh
   moves and again when it stops:
   - **Max penetration**: the deepest negative value of either colouring
-    (`store.fetchColoringValues`); in fast mode, "≥" when it reaches the bound.
+    (`store.fetchColoringValues`). In fast mode it is measured within the bound (the panel says
+    so), and reads "≥ bound" while the meshes intersect and the deepest value is within 10% of the
+    bound, or no vertex inside the other mesh is within it.
   - **Min gap**: `meshDistance`, 0 when the surfaces touch.
   - **Intersecting**: `intersects`.
   - **In contact**: each mesh's triangles within the tolerance of the other
     (`findContacts({ margin: tolerance })`).
 
-  When a target is open or inconsistently oriented (`fieldStatus`), the panel says so: penetration
-  then follows its surface normals; Orient or Fill holes give a closed result. Removing A or B stops
-  the colouring and resets its picker.
+  When A or B is open (boundary loops, open chains or open components) or inconsistently oriented
+  (orientation conflicts), from `analyze` of it when the pair changes or its triangles change, the
+  panel says so: penetration measured to it then follows its surface normals; Orient or Fill holes
+  give a closed result. Removing A or B stops the colouring and resets its picker.
 - **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
   page is cross-origin isolated, and on an error its message with Restart.
 
@@ -49,7 +53,7 @@ URL options:
 
 | Option | Effect |
 | --- | --- |
-| `?local` | The synchronous `Scene` on the main thread instead of the Worker scene |
+| `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh |
 | `?big` | Demo meshes A and B at about a million triangles each |
 | `?threads=N` | Ask for N engine threads |
 

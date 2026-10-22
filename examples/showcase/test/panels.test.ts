@@ -9,6 +9,7 @@ import {
   formatDistance,
   niceScale,
   toleranceLimit,
+  topologyOf,
 } from "../src/panels/collision-math";
 import { describeReport, summarize } from "../src/panels/repair-summary";
 
@@ -39,19 +40,57 @@ describe("collision math", () => {
   });
 
   it("deepest_penetration", () => {
-    expect(deepestPenetration([null, null], 1)).toBeNull();
+    expect(deepestPenetration([null, null], Infinity, false)).toBeNull();
     // The deepest negative value over both meshes, ignoring far (Infinity) and NaN.
     const a = Float32Array.from([0.5, -0.25, Infinity, Number.NaN]);
     const b = Float32Array.from([-0.125, 2, Infinity]);
-    expect(deepestPenetration([a, b], Infinity)).toEqual({ depth: 0.25, atBound: false });
+    expect(deepestPenetration([a, b], Infinity, true)).toEqual({ depth: 0.25, atLeast: false });
     // No penetration: 0.
-    expect(deepestPenetration([Float32Array.from([0.5, Infinity])], 1)).toEqual({ depth: 0, atBound: false });
-    // A bounded field: a value at the bound means "at least".
-    expect(deepestPenetration([Float32Array.from([Math.fround(-0.3), 1])], 0.3)).toEqual({
-      depth: Math.fround(0.3),
-      atBound: true,
+    expect(deepestPenetration([Float32Array.from([0.5, Infinity])], Infinity, false)).toEqual({
+      depth: 0,
+      atLeast: false,
     });
-    expect(deepestPenetration([Float32Array.from([-0.1])], 0.3)?.atBound).toBe(false);
+  });
+
+  it("deepest_penetration_bounded", () => {
+    // A bounded field (fast mode) stores Infinity beyond its bound, deep
+    // interiors included: a value near the bound may hide a deeper one.
+    const bound = 0.3;
+    // Just short of the bound, as a real field gives (the deepest vertex is
+    // rarely exactly at it): within 10%, while intersecting, is "at least".
+    const near = Float32Array.from([0.2, Math.fround(-0.287), Infinity, Infinity]);
+    expect(deepestPenetration([near], bound, true)).toEqual({ depth: Math.fround(0.287), atLeast: true });
+    // Well inside the bound: measured.
+    expect(deepestPenetration([Float32Array.from([-0.1, Infinity])], bound, true)).toEqual({
+      depth: Math.fround(0.1),
+      atLeast: false,
+    });
+    // Intersecting, but no finite negative value at all (every inside vertex
+    // beyond the bound): at least the bound.
+    expect(deepestPenetration([Float32Array.from([0.25, Infinity, Infinity])], bound, true)).toEqual({
+      depth: 0,
+      atLeast: true,
+    });
+    // Not intersecting: nothing hidden.
+    expect(deepestPenetration([Float32Array.from([0.25, Infinity])], bound, false)).toEqual({
+      depth: 0,
+      atLeast: false,
+    });
+    // An exact field (no bound) never reads "at least".
+    expect(deepestPenetration([near], Infinity, true)?.atLeast).toBe(false);
+  });
+
+  it("topology_of_target", () => {
+    const closed = topologyOf(analysis({}));
+    expect(closed).toEqual({ open: false, inconsistent: false });
+    expect(topologyOf(analysis({ loops: [loop(4, 0.4)] })).open).toBe(true);
+    // An open chain is a loop that does not close: open too.
+    expect(topologyOf(analysis({ loops: [loop(3, 0.1, false)] })).open).toBe(true);
+    // A component that is not closed (non-manifold edges, say) with no loop listed.
+    expect(topologyOf(analysis({ components: [{ triangles: new Uint32Array(3), area: 1, closed: false }] })).open).toBe(
+      true,
+    );
+    expect(topologyOf(analysis({ orientationConflicts: 3 }))).toEqual({ open: false, inconsistent: true });
   });
 
   it("format_distance", () => {

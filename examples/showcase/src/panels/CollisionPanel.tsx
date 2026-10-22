@@ -3,18 +3,27 @@
 // deepest penetration, the gap, whether they intersect and the triangles in
 // contact. The heatmap controls are shared; the pair below them is one mode
 // (a later "Group" mode colours several meshes with the same controls).
-import type { FieldHandle, MeshHandle, Scene } from "fast-mesh-wasm";
+import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useMeshDisplay, useScene } from "fast-mesh-wasm/react";
 import { contactHeatmap, type DistanceColoring, type SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { type AppState, type CollisionPair, type Item, useApp } from "../scene/app-state";
 import { view } from "../viewport/view";
-import { clampTolerance, deepestPenetration, formatDistance, niceScale, toleranceLimit } from "./collision-math";
+import {
+  clampTolerance,
+  deepestPenetration,
+  formatDistance,
+  niceScale,
+  toleranceLimit,
+  topologyOf,
+} from "./collision-math";
 import { inspect, type Readouts } from "./inspect";
 
 /** The readouts refresh at most this often (about 4 Hz), and once more after the last change. */
 const READOUT_PERIOD_MS = 250;
+/** A target is re-analysed this long after its triangles last changed. */
+const TOPOLOGY_DELAY_MS = 250;
 
 type Heatmap = Omit<DistanceColoring, "distanceTo">;
 
@@ -132,7 +141,11 @@ function PairMode(props: {
   }, [store, a, b, heat]);
 
   const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? "the mesh";
-  const readouts = useReadouts(store, scene, ready ? a : null, ready ? b : null, tolerance, heat.maxDistance, nameOf);
+  const readouts = useReadouts(store, scene, ready ? a : null, ready ? b : null, tolerance, heat.maxDistance);
+  const warnings = useTopologyWarnings(scene, ready ? a : null, ready ? b : null, nameOf);
+  useEffect(() => {
+    inspect.collision.warnings = warnings;
+  });
 
   return (
     <div className="pair">
@@ -145,7 +158,12 @@ function PairMode(props: {
       ) : (
         <>
           <PairStatus a={a} b={b} />
-          <ReadoutList readouts={readouts} exact={heat.maxDistance === Infinity} bound={heat.maxDistance} />
+          <ReadoutList readouts={readouts} bound={heat.maxDistance} />
+          {warnings.map((w) => (
+            <p key={w} className="warn small" data-warning>
+              {w}
+            </p>
+          ))}
         </>
       )}
     </div>
@@ -197,15 +215,27 @@ function PairStatus(props: { a: MeshHandle; b: MeshHandle }) {
   return null;
 }
 
-function ReadoutList(props: { readouts: Readouts | null; exact: boolean; bound: number }) {
-  const { readouts: r, exact, bound } = props;
+function ReadoutList(props: { readouts: Readouts | null; bound: number }) {
+  const { readouts: r, bound } = props;
   const dash = "—";
   const pen = r?.penetration ?? null;
+  // A bounded field (fast mode) measures within its bound only; a readout
+  // keeps the bound it was measured with.
+  const within = r === null ? bound : r.bound;
   return (
     <>
       <dl className="readouts" data-readouts={r === null ? "none" : "ready"}>
         <dt>Max penetration</dt>
-        <dd>{pen === null ? dash : pen.atBound ? `≥ ${formatDistance(bound)}` : formatDistance(pen.depth)}</dd>
+        <dd>
+          {pen === null
+            ? dash
+            : pen.atLeast
+              ? `≥ ${formatDistance(Math.max(pen.depth, within))}`
+              : formatDistance(pen.depth)}
+          {pen !== null && Number.isFinite(within) ? (
+            <span className="muted"> (measured within {formatDistance(within)})</span>
+          ) : null}
+        </dd>
         <dt>Min gap</dt>
         <dd>{r === null || r.gap === null ? dash : formatDistance(r.gap)}</dd>
         <dt>Intersecting</dt>
@@ -215,16 +245,11 @@ function ReadoutList(props: { readouts: Readouts | null; exact: boolean; bound: 
           {r === null ? dash : `${r.contacts.a.toLocaleString("en")} · ${r.contacts.b.toLocaleString("en")} triangles`}
         </dd>
       </dl>
-      {exact ? null : (
+      {Number.isFinite(bound) ? (
         <p className="muted small">
-          Fast mode: penetration beyond {formatDistance(bound)} is not measured (mesh colour).
+          Fast mode: distances are measured within {formatDistance(bound)}; deeper penetration shows the mesh colour.
         </p>
-      )}
-      {r?.warnings.map((w) => (
-        <p key={w} className="warn small" data-warning>
-          {w}
-        </p>
-      ))}
+      ) : null}
     </>
   );
 }
@@ -289,8 +314,9 @@ function Slider(props: {
  * The pair's readouts, refreshed when either mesh moves, changes or is
  * recoloured (its change records), at most every READOUT_PERIOD_MS and once
  * more after the last change (so a drag's end is always read). One query
- * at a time; `null` without a pair. A mesh removed mid-query rejects: that
- * refresh is dropped.
+ * at a time; `null` without a pair. A new tolerance or field bound only
+ * asks for a refresh: the previous readouts stay until it lands. A mesh
+ * removed mid-query rejects: that refresh is dropped.
  */
 function useReadouts(
   store: SceneStore,
@@ -299,38 +325,19 @@ function useReadouts(
   b: MeshHandle | null,
   tolerance: number,
   bound: number,
-  nameOf: (m: MeshHandle) => string,
 ): Readouts | null {
   const [readouts, setReadouts] = useState<Readouts | null>(null);
-  const live = useRef({ tolerance, nameOf });
-  live.current = { tolerance, nameOf };
+  const live = useRef({ tolerance, bound });
+  live.current = { tolerance, bound };
   const poke = useRef<() => void>(() => {});
 
-  // The latest field on each mesh, from the change records (the store owns
-  // it; the app adds none): for `fieldStatus`. Kept across pair changes, as
-  // a colouring turned back on reuses its field without recomputing it.
-  const fields = useRef(new Map<MeshHandle, FieldHandle>());
-  useEffect(
-    () =>
-      store.scene.onChanges((changes) => {
-        for (const c of changes) {
-          if (c.removed) {
-            fields.current.delete(c.mesh);
-          } else if (c.fieldsChanged.length > 0) {
-            fields.current.set(c.mesh, c.fieldsChanged[c.fieldsChanged.length - 1]);
-          }
-        }
-      }),
-    [store],
-  );
-
   useEffect(() => {
+    // A new pair: the old pair's readouts no longer apply.
+    setReadouts(null);
+    inspect.collision.readouts = null;
     if (a === null || b === null) {
-      setReadouts(null);
-      inspect.collision.readouts = null;
       return;
     }
-    setReadouts(null);
     let alive = true;
     let dirty = true;
     let running = false;
@@ -338,13 +345,9 @@ function useReadouts(
     let timer: ReturnType<typeof setTimeout> | undefined;
     const s = scene;
 
-    const status = async (on: MeshHandle) => {
-      const f = fields.current.get(on);
-      return f === undefined ? null : await Promise.resolve(s.fieldStatus(f)).catch(() => null);
-    };
     const query = async (): Promise<Readouts> => {
-      const { tolerance: margin, nameOf: name } = live.current;
-      const [va, vb, distance, hit, contacts, onA, onB] = await Promise.all([
+      const { tolerance: margin, bound: maxDistance } = live.current;
+      const [va, vb, distance, hit, contacts] = await Promise.all([
         // After a commit (this runs from change records): the colouring last
         // sent. A colouring replaced meanwhile rejects; read it as none.
         store.fetchColoringValues(a).catch(() => null),
@@ -352,31 +355,11 @@ function useReadouts(
         Promise.resolve(s.meshDistance(a, b)),
         Promise.resolve(s.intersects(a, b)),
         Promise.resolve(s.findContacts({ margin, pairs: [[a, b]] })),
-        status(a),
-        status(b),
       ]);
       const c = contacts[0];
-      const warnings: string[] = [];
-      // The field on A measures to B: its sign data describes B, and the other way round.
-      for (const [st, target] of [
-        [onA, b],
-        [onB, a],
-      ] as const) {
-        if (st === null) {
-          continue;
-        }
-        if (!st.sign.closed) {
-          warnings.push(
-            `${name(target)} is open: penetration side follows its surface normals; repair → orient/fill holes for a closed result`,
-          );
-        } else if (!st.sign.consistentOrientation) {
-          warnings.push(
-            `${name(target)} is inconsistently oriented: penetration side follows its surface normals; repair → orient for a closed result`,
-          );
-        }
-      }
       return {
-        penetration: deepestPenetration([va, vb], bound),
+        penetration: deepestPenetration([va, vb], maxDistance, hit),
+        bound: maxDistance,
         gap: distance === null ? null : distance.distance,
         intersects: hit,
         contacts:
@@ -385,7 +368,6 @@ function useReadouts(
             : c.a === a
               ? { a: c.trianglesA.length, b: c.trianglesB.length }
               : { a: c.trianglesB.length, b: c.trianglesA.length },
-        warnings,
       };
     };
     const kick = () => {
@@ -450,13 +432,95 @@ function useReadouts(
       off();
       clearTimeout(timer);
       poke.current = () => {};
-      inspect.collision.readouts = null;
       inspect.collision.settled = true;
     };
-  }, [store, scene, a, b, bound]);
+  }, [store, scene, a, b]);
 
-  // A new tolerance changes the contact count only (the colours follow through change records).
-  useEffect(() => poke.current(), [tolerance]);
+  // A new tolerance changes the contact count, a new bound how the depth
+  // reads (the colours follow through change records).
+  useEffect(() => poke.current(), [tolerance, bound]);
 
   return a === null || b === null ? null : readouts;
+}
+
+/**
+ * Warnings for a pair mesh that is open or inconsistently oriented: a field
+ * measured to it takes its penetration side from its surface normals. From
+ * `analyze` of each mesh (read-only, counts only), run when the pair changes
+ * and again, coalesced, TOPOLOGY_DELAY_MS after a mesh's triangles change
+ * (a repair, its undo); the latest analysis of each mesh wins.
+ */
+function useTopologyWarnings(
+  scene: Scene | WorkerScene,
+  a: MeshHandle | null,
+  b: MeshHandle | null,
+  nameOf: (m: MeshHandle) => string,
+): string[] {
+  const store = useScene();
+  const [topology, setTopology] = useState<ReadonlyMap<MeshHandle, ReturnType<typeof topologyOf>>>(() => new Map());
+
+  useEffect(() => {
+    setTopology(new Map());
+    if (a === null || b === null) {
+      return;
+    }
+    let alive = true;
+    const seq = new Map<MeshHandle, number>();
+    const timers = new Map<MeshHandle, ReturnType<typeof setTimeout>>();
+    const run = (m: MeshHandle) => {
+      const n = (seq.get(m) ?? 0) + 1;
+      seq.set(m, n);
+      Promise.resolve()
+        .then(() => scene.analyze(m, { maxListed: 1 }))
+        .then(
+          (an) => {
+            if (alive && seq.get(m) === n) {
+              setTopology((t) => new Map(t).set(m, topologyOf(an)));
+            }
+          },
+          () => {
+            // Removed meanwhile: the pair follows.
+          },
+        );
+    };
+    run(a);
+    run(b);
+    const off = store.scene.onChanges((changes) => {
+      for (const c of changes) {
+        if ((c.mesh === a || c.mesh === b) && !c.removed && (c.indices === "all" || c.indices.length > 0)) {
+          const m = c.mesh;
+          clearTimeout(timers.get(m));
+          timers.set(
+            m,
+            setTimeout(() => run(m), TOPOLOGY_DELAY_MS),
+          );
+        }
+      }
+    });
+    return () => {
+      alive = false;
+      off();
+      for (const t of timers.values()) {
+        clearTimeout(t);
+      }
+    };
+  }, [store, scene, a, b]);
+
+  const warnings: string[] = [];
+  for (const m of [b, a]) {
+    const t = m === null ? undefined : topology.get(m);
+    if (m === null || t === undefined) {
+      continue;
+    }
+    if (t.open) {
+      warnings.push(
+        `${nameOf(m)} is open: penetration side follows its surface normals; repair → orient/fill holes for a closed result`,
+      );
+    } else if (t.inconsistent) {
+      warnings.push(
+        `${nameOf(m)} is inconsistently oriented: penetration side follows its surface normals; repair → orient for a closed result`,
+      );
+    }
+  }
+  return warnings;
 }

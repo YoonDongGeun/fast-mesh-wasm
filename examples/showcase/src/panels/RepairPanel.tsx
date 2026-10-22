@@ -14,8 +14,12 @@ import { type AnalysisSummary, describeReport, plural, summarize } from "./repai
 
 /** The most entries the analysis lists (counts stay exact). */
 const MAX_LISTED = 64;
-/** "Any size" for Fill holes: the op needs a bound (or a list of loops). */
+/** "Any size" for Fill holes (an empty field): the op needs a bound (or a list of loops). */
 const ANY_SIZE = 1e9;
+/** The Fill holes size limit to start with: small and medium holes, not an open mesh's outer boundary. */
+const DEFAULT_MAX_EDGES = 64;
+/** How long after an op its own triangle change may still arrive (it has none when nothing changed). */
+const OWN_CHANGE_MS = 1000;
 /** The holes listed by size. */
 const HOLES_SHOWN = 6;
 
@@ -33,9 +37,12 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [report, setReport] = useState<{ mesh: MeshHandle; line: string; failed: boolean } | null>(null);
   const [weldTolerance, setWeldTolerance] = useState(1e-5);
   const [minTriangles, setMinTriangles] = useState(500);
-  const [maxEdges, setMaxEdges] = useState(0);
+  const [maxEdges, setMaxEdges] = useState(DEFAULT_MAX_EDGES);
   const [fair, setFair] = useState(true);
   const seq = useRef(0);
+  // An op's own triangle change keeps its report; any other (undo, redo)
+  // makes the report stale and clears it.
+  const own = useRef<{ pending: boolean; timer?: ReturnType<typeof setTimeout> }>({ pending: false });
   const weldRef = useRef(weldTolerance);
   weldRef.current = weldTolerance;
 
@@ -77,6 +84,12 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const off = store.scene.onChanges((changes) => {
       if (changes.some((c) => c.mesh === mesh && !c.removed && (c.indices === "all" || c.indices.length > 0))) {
+        if (own.current.pending) {
+          own.current.pending = false;
+        } else {
+          setReport(null);
+          inspect.repair.report = null;
+        }
         clearTimeout(timer);
         timer = setTimeout(() => void analyze(mesh), 50);
       }
@@ -93,6 +106,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     }
     setBusy(label);
     inspect.repair.busy = label;
+    clearTimeout(own.current.timer);
+    own.current.pending = true;
     try {
       const r = (await store.repair(mesh, op)) as RepairReport;
       const line = describeReport(op.op, r);
@@ -105,6 +120,9 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     } finally {
       setBusy(null);
       inspect.repair.busy = null;
+      if (own.current.pending) {
+        own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
+      }
     }
   };
 
@@ -209,7 +227,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           >
             Fill holes
           </button>
-          <label className="field" title="Only holes with at most this many edges (empty: any size)">
+          <label
+            className="field"
+            title="Only holes with at most this many edges. Empty: any size, which also fills an open mesh's outer boundary"
+          >
             max
             <input
               type="number"
@@ -226,6 +247,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
             Fair (follow curvature)
           </label>
         </div>
+        <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
       </div>
 
       {busy !== null ? (

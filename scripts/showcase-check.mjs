@@ -22,15 +22,17 @@
 //   each other (reds where they penetrate, green to blue across the gap);
 //   the readouts show the penetration, intersecting, a gap of 0 and contact
 //   triangles.
-// - colour-from: "Colour from" 0 colours penetration only (no gap colours).
+// - colour-from: "Colour from" 0 colours penetration only (no gap colours);
+//   the readouts stay up while the slider moves.
 // - readouts: dragging A away from B refreshes the readouts while the gizmo
-//   drags (about 4 Hz) and once more at the end: no longer intersecting, a
-//   gap. Undo puts A back.
+//   drags (about 4 Hz: at least 2, at most one per 250 ms plus 2) and once
+//   more at the end: no longer intersecting, a gap. Undo puts A back.
 // - open-target (RF1): picking C (open) as B still colours A and C, and
-//   the panel warns that C is open.
+//   the panel warns that C is open (from `analyze` of C).
 // - repair (RF5): with C selected and coloured, the repair panel lists its
-//   two holes and two components; Fill holes leaves none, C stays coloured
-//   (over its new vertices too) and the warning goes; Undo brings both back.
+//   two holes and two components; Fill holes (up to 64 edges, the default)
+//   leaves none, C stays coloured (over its new vertices too) and the
+//   warning goes; Undo brings both back and clears the stale report.
 // - remove (RF3): removing B while A and B are coloured resets B's picker,
 //   stops A's colouring and the readouts, with no error.
 // - upload: three fixtures (binary STL, OBJ with quads, ASCII PLY) through
@@ -400,6 +402,16 @@ try {
   );
 
   // ---- colour-from: 0 colours penetration only (the white band ends the range) ----
+  // The readouts stay up while a slider moves (no flash to none), also in
+  // fast mode, where the depth slider changes the fields' bound.
+  await clickOn("[data-control=fast]");
+  const kept = [];
+  for (const v of [0.8, 0.6, 1]) {
+    await setRange("depth", v);
+    await sleep(40);
+    kept.push(await page("__showcase.collision().readouts !== null"));
+  }
+  await clickOn("[data-control=fast]");
   await setRange("gap", 0);
   const penOnly = await waitFor(
     collision(`c.coloring[${q(A)}]?.range?.[1] < 0.1 && c.coloring[${q(A)}].status === "ready"`),
@@ -409,24 +421,28 @@ try {
   const colorsPen = await hook(`colorCounts(${q(A)})`);
   verdict(
     "colour-from",
-    penOnly !== undefined && colorsPen?.gap === 0 && colorsPen?.red > 0,
-    `range ${q(penOnly?.coloring[A]?.range)}; A's vertices ${q(colorsPen)}`,
+    penOnly !== undefined && colorsPen?.gap === 0 && colorsPen?.red > 0 && kept.every((k) => k),
+    `range ${q(penOnly?.coloring[A]?.range)}; A's vertices ${q(colorsPen)}; readouts kept while the slider moved: ${kept.join(", ")}`,
   );
   await setRange("gap", 1);
   await waitFor(collision(`c.coloring[${q(A)}]?.range?.[1] === 1 && c.coloring[${q(A)}].status === "ready"`), 10_000);
 
   // ---- readouts: refreshed while A is dragged away from B, and at the end ----
   const before = await hook("collision()");
+  const dragStart = Date.now();
   const away = await dragGizmo(A, -260, 0, 40, 25);
+  const dragMs = Date.now() - dragStart;
   const apart = await waitFor(
     collision(`!__showcase.dragging() && c.settled && c.readouts !== null && !c.readouts.intersects && c.readouts.gap > 0 && c.readouts.penetration?.depth === 0`),
     10_000,
   );
   const during = (apart?.updatesWhileDragging ?? 0) - before.updatesWhileDragging;
+  // About 4 Hz: at most one refresh per 250 ms of drag, plus the first and a slack of one.
+  const ceiling = Math.floor(dragMs / 250) + 2;
   verdict(
     "readouts",
-    away.dragging && apart !== undefined && during >= 2,
-    `${during} refresh(es) while dragging, ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
+    away.dragging && apart !== undefined && during >= 2 && during <= ceiling,
+    `${during} refresh(es) in a ${dragMs} ms drag (at most ${ceiling}), ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
   );
   await clickOn("[data-action=undo]");
   await waitFor(collision(`Math.hypot(...__showcase.translation(${q(A)})) < 1e-9 && c.readouts?.intersects === true`), 10_000);
@@ -439,7 +455,7 @@ try {
       && c.coloring[${q(A)}]?.to === ${q(C)} && c.coloring[${q(A)}].status === "ready"
       && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
       && c.coloring[${q(B)}]?.to === null
-      && c.readouts?.warnings.some((w) => w.startsWith(${q(`${C} is open`)}))`),
+      && c.warnings.some((w) => w.startsWith(${q(`${C} is open`)}))`),
     20_000,
   );
   const colorsOpen = { A: await hook(`colorCounts(${q(A)})`), C: await hook(`colorCounts(${q(C)})`) };
@@ -448,7 +464,7 @@ try {
     open !== undefined && colorsOpen.A?.gap > 0 && colorsOpen.C?.gap > 0,
     open === undefined
       ? `collision ${q(await hook("collision()"))}`
-      : `A and C coloured (gap-coloured vertices: A ${colorsOpen.A.gap}, C ${colorsOpen.C.gap}); warning "${open.readouts.warnings.join(" / ")}"`,
+      : `A and C coloured (gap-coloured vertices: A ${colorsOpen.A.gap}, C ${colorsOpen.C.gap}); warning "${open.warnings.join(" / ")}"`,
   );
 
   // ---- repair (RF5): fill C's holes while it is coloured, then undo ----
@@ -461,18 +477,18 @@ try {
   await clickOn("[data-repair-op=fillHoles]");
   const filled = await waitFor(
     `(() => { const r = __showcase.repair(); const c = __showcase.collision();
-      return r.busy === null && r.analyses > ${analysesBefore} && r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === 0
+      return r.busy === null && r.report?.startsWith("Fill holes: filled") && r.analyses > ${analysesBefore} && r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === 0
         && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
-        && c.readouts !== null && !c.readouts.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
+        && c.readouts !== null && !c.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
     30_000,
   );
   const verticesFilled = used(await hook(`colorCounts(${q(C)})`));
   await clickOn("[data-action=undo]");
   const restored = await waitFor(
     `(() => { const r = __showcase.repair(); const c = __showcase.collision();
-      return r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === ${holesBefore ?? 2}
+      return r.report === null && r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length === ${holesBefore ?? 2}
         && c.coloring[${q(C)}]?.to === ${q(A)} && c.coloring[${q(C)}].status === "ready"
-        && c.readouts?.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
+        && c.warnings.some((w) => w.startsWith(${q(`${C} is open`)})) && { r, c }; })()`,
     30_000,
   );
   const verticesRestored = used(await hook(`colorCounts(${q(C)})`));
@@ -484,7 +500,7 @@ try {
       verticesFilled > verticesBefore &&
       restored !== undefined &&
       verticesRestored === verticesBefore,
-    `C: ${holesBefore} holes, ${componentsBefore} components; ${filled === undefined ? `after Fill holes ${q(await hook("repair()"))}` : `"${filled.r.report}"`}; coloured vertices ${verticesBefore} -> ${verticesFilled} -> ${verticesRestored} after undo; undo ${restored === undefined ? "did not restore the holes, the colouring and the warning" : "restored the holes, the colouring and the warning"}`,
+    `C: ${holesBefore} holes, ${componentsBefore} components; ${filled === undefined ? `after Fill holes ${q(await hook("repair()"))}` : `"${filled.r.report}"`}; coloured vertices ${verticesBefore} -> ${verticesFilled} -> ${verticesRestored} after undo; undo ${restored === undefined ? `did not restore the holes, the colouring and the warning, or clear the report (${q(await hook("repair()"))})` : "restored the holes, the colouring and the warning, and cleared the report"}`,
   );
 
   // ---- remove (RF3): B removed while A and B are coloured ----

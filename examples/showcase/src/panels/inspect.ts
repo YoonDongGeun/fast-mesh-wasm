@@ -5,15 +5,19 @@ import type { AnalysisSummary } from "./repair-summary";
 
 /** The collision readouts of the pair as last queried. */
 export interface Readouts {
-  /** The deepest penetration (`-min` of both fields' values), `null` before a field has values. */
-  penetration: { depth: number; atBound: boolean } | null;
+  /**
+   * The deepest penetration (`-min` of both fields' values), `null` before a
+   * field has values; `atLeast` when a bounded field (fast mode) may hide a
+   * deeper one (see `deepestPenetration`).
+   */
+  penetration: { depth: number; atLeast: boolean } | null;
+  /** The fields' bound (`maxDistance`) the depth was measured within; `Infinity` when exact. */
+  bound: number;
   /** The surfaces' distance (`meshDistance`); 0 when they touch or intersect. */
   gap: number | null;
   intersects: boolean;
   /** Triangles within the tolerance of the other mesh (`findContacts({ margin: tolerance })`). */
   contacts: { a: number; b: number };
-  /** Open or inconsistently oriented targets (from `fieldStatus`). */
-  warnings: string[];
 }
 
 export const inspect: {
@@ -24,6 +28,12 @@ export const inspect: {
     updatesWhileDragging: number;
     /** No change waits for a refresh and none runs: the readouts are those of the scene as it is. */
     settled: boolean;
+    /**
+     * Targets that are open (boundary loops, open chains or open components)
+     * or inconsistently oriented (orientation conflicts), from `analyze` of
+     * each mesh of the pair.
+     */
+    warnings: string[];
   };
   repair: {
     /** The mesh analysed (its name) and the summary, `null` before an analysis. */
@@ -35,6 +45,6 @@ export const inspect: {
     busy: string | null;
   };
 } = {
-  collision: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true },
+  collision: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true, warnings: [] },
   repair: { analysis: null, analyses: 0, report: null, busy: null },
 };
