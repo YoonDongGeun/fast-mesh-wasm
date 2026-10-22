@@ -266,24 +266,39 @@ function bytes(a: ArrayBufferView): Uint8Array {
 
 const text = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 
-/** Change records with handles as ids, as text. */
-function record(scene: WorkerScene, changes: MeshChange[]): string {
-  return JSON.stringify(
-    changes.map((c) => ({
-      ...c,
-      mesh: scene.idOf(c.mesh),
-      fieldsChanged: c.fieldsChanged.map((f) => scene.idOf(f)),
-      sectionsChanged: c.sectionsChanged.map((s) => scene.idOf(s)),
-    })),
-  );
+/** Numbers as the bytes of their f64s: exact for -0, NaN payloads and every other value. */
+function f64(values: readonly number[]): Uint8Array {
+  return bytes(Float64Array.from(values));
+}
+
+/** One frame's change records as f64 bytes (handles as ids; `"all"` ranges as -1). */
+function record(scene: WorkerScene, changes: MeshChange[]): Uint8Array {
+  const out: number[] = [changes.length];
+  const ranges = (r: MeshChange["positions"]) => {
+    if (r === "all") {
+      out.push(-1);
+    } else {
+      out.push(r.length, ...r.flat());
+    }
+  };
+  for (const c of changes) {
+    out.push(scene.idOf(c.mesh), +c.added, +c.removed, +c.placementChanged, +c.capacityChanged);
+    ranges(c.positions);
+    ranges(c.normals);
+    ranges(c.colors);
+    ranges(c.indices);
+    out.push(c.fieldsChanged.length, ...c.fieldsChanged.map((f) => scene.idOf(f)));
+    out.push(c.sectionsChanged.length, ...c.sectionsChanged.map((x) => scene.idOf(x)));
+  }
+  return f64(out);
 }
 
 interface Run {
   threads: number;
   startMs: number;
   runMs: number;
-  /** Change records of every `commitFrame()`, in order. */
-  log: string[];
+  /** Change records of every `commitFrame()`, in order (f64 bytes, see `record`). */
+  log: Uint8Array[];
   /** Labelled bytes: mirrors, placements, field values and section results along the way. */
   dump: [string, Uint8Array][];
 }
@@ -293,7 +308,7 @@ async function sequence(threads: number | undefined, n: number): Promise<Run> {
   const t0 = now();
   const scene = await createWorkerScene(threads === undefined ? {} : { threads });
   const startMs = now() - t0;
-  const log: string[] = [];
+  const log: Uint8Array[] = [];
   const dump: [string, Uint8Array][] = [];
   const frame = () => log.push(record(scene, scene.commitFrame()));
   const settle = async <T>(p: Promise<T>): Promise<T> => {
@@ -313,7 +328,8 @@ async function sequence(threads: number | undefined, n: number): Promise<Run> {
       dump.push([`${at} ${name} normals`, normals === null ? text(null) : bytes(normals)]);
       dump.push([`${at} ${name} colors`, colors === null ? text(null) : bytes(colors)]);
       dump.push([`${at} ${name} indices`, bytes(v.indices())]);
-      dump.push([`${at} ${name} placement`, text(scene.placement(m))]);
+      const placement = scene.placement(m);
+      dump.push([`${at} ${name} placement`, f64([...placement.rotation, ...placement.translation])]);
       dump.push([`${at} ${name} matrix4`, bytes(scene.matrix4(m))]);
     }
     for (const [name, f] of fields) {
@@ -323,16 +339,15 @@ async function sequence(threads: number | undefined, n: number): Promise<Run> {
   const sectionDump = (at: string, section: SectionHandle) => {
     for (const [name, m] of meshes) {
       const r = scene.section(section, m);
-      dump.push([
-        `${at} section ${name}`,
-        text({
-          status: r.status,
-          length: r.length,
-          area: r.area,
-          contours: r.contours.map((c) => ({ closed: c.closed, points: Array.from(c.points) })),
-          fill: r.fill === undefined ? null : { positions: Array.from(r.fill.positions), indices: Array.from(r.fill.indices) },
-        }),
-      ]);
+      // Numbers through f64 (or their own f32/u32) bytes, so -0 and NaN compare exactly.
+      dump.push([`${at} section ${name} status`, text(r.status)]);
+      dump.push([`${at} section ${name} measures`, f64([r.length, r.area, r.contours.length])]);
+      r.contours.forEach((c, k) => {
+        dump.push([`${at} section ${name} contour ${k}`, bytes(c.points)]);
+        dump.push([`${at} section ${name} contour ${k} closed`, f64([+c.closed])]);
+      });
+      dump.push([`${at} section ${name} fill positions`, r.fill === undefined ? text(null) : bytes(r.fill.positions)]);
+      dump.push([`${at} section ${name} fill indices`, r.fill === undefined ? text(null) : bytes(r.fill.indices)]);
     }
   };
 
@@ -409,7 +424,8 @@ function differences(x: Run, y: Run, max = 5): string[] {
     out.push(`change records: ${x.log.length} frames against ${y.log.length}`);
   }
   for (let i = 0; i < Math.min(x.log.length, y.log.length) && out.length < max; i++) {
-    if (x.log[i] !== y.log[i]) {
+    const [p, q] = [x.log[i], y.log[i]];
+    if (p.length !== q.length || p.some((v, k) => v !== q[k])) {
       out.push(`change records of frame ${i} differ`);
     }
   }
@@ -436,7 +452,7 @@ function differences(x: Run, y: Run, max = 5): string[] {
 }
 
 async function digest(run: Run): Promise<string> {
-  const parts = [...run.log.map((s) => new TextEncoder().encode(s)), ...run.dump.map(([, b]) => b)];
+  const parts = [...run.log, ...run.dump.map(([, b]) => b)];
   const all = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
   let o = 0;
   for (const p of parts) {

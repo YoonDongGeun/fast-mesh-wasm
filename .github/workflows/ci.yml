@@ -98,10 +98,12 @@ jobs:
           ls examples/react/dist/assets/worker-entry-*.js
       # Headless Chrome (preinstalled on the runner) against `vite preview` of the WebGPU
       # example's check page: threaded and single-threaded bit-identical, shared memory
-      # growth past 512 MB, restart with a new pool, fallback when the pool cannot start.
+      # growth past 512 MB, restart with a new pool, fallback when the pool cannot start;
+      # COOP/COEP on 200, 304 and 404 responses. An explicit pool size, so a runner with
+      # few cores cannot make the comparison single-threaded.
       - name: Check the threaded Worker engine in Chrome
         timeout-minutes: 10
-        run: node scripts/browser-check.mjs
+        run: node scripts/browser-check.mjs --threads 4
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build

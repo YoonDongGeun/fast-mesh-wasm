@@ -112,7 +112,17 @@ function makeApp(name, deps) {
   );
   // npm, as a user would install it; a copy of the tarball keeps the path short.
   copyFileSync(tarball, join(dir, "fast-mesh-wasm.tgz"));
-  sh(`npm install --no-audit --no-fund ./fast-mesh-wasm.tgz ${Object.entries(deps).map(([k, v]) => `${k}@${v}`).join(" ")}`, dir);
+  const install = `npm install --prefer-offline --no-audit --no-fund ./fast-mesh-wasm.tgz ${Object.entries(deps)
+    .map(([k, v]) => `${k}@${v}`)
+    .join(" ")}`;
+  try {
+    sh(install, dir);
+  } catch (e) {
+    // Once more: a registry hiccup should not fail the check.
+    const last = e.stderr?.toString().trim().split("\n")[0];
+    console.log(`  install failed (${last || e}); retrying once`);
+    sh(install, dir);
+  }
   return dir;
 }
 

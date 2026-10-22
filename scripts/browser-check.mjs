@@ -11,6 +11,11 @@
 //   node scripts/browser-check.mjs --bench [--n 708] [--kind 9a|native] [--seconds 10] [--lock-step 8] [--threads 8]
 //
 // Checks (each prints PASS or FAIL; the exit code is 1 on any FAIL):
+// - headers (no browser, Node fetch): the Worker script and the threaded .wasm
+//   come with COOP same-origin and COEP require-corp on a 200 and on the 304
+//   that answers their ETag, and so does a 404. Safari refuses a revalidated
+//   Worker script whose 304 lacks them (Vite's server.headers/preview.headers
+//   do), so the examples set them with a middleware.
 // - page: the page is cross-origin isolated (vite's COOP/COEP headers).
 // - compare: one op sequence (two terrains, wide colouring both ways, drags,
 //   an edit, a filled section, two undos) with `threads: 1`, then threaded;
@@ -28,6 +33,7 @@
 // --bench runs the wide-range drag (bench/scene.bench.mjs 5f) single-threaded
 // and threaded instead, and prints both.
 import { spawn } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { launchChrome, startServer } from "./chrome-cdp.mjs";
@@ -43,7 +49,7 @@ const option = (name, fallback) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const browserName = option("--browser", "chrome");
-const only = option("--only", "page,compare,memory,restart,nested").split(",");
+const only = option("--only", "headers,page,compare,memory,restart,nested").split(",");
 const verbose = flag("--verbose");
 const threadsOpt = option("--threads", undefined);
 const threads = threadsOpt === undefined ? undefined : Number(threadsOpt);
@@ -92,6 +98,67 @@ async function launchPlaywright(name) {
   };
 }
 
+/**
+ * The isolation headers on a 200, on the 304 that answers its ETag, and on a
+ * 404, fetched from the server with no browser. Returns the problems found.
+ */
+async function headerProblems(base, dev) {
+  const pkgDist = join(root, "packages", "fast-mesh-wasm", "dist").replaceAll("\\", "/");
+  let paths;
+  if (dev) {
+    paths = [`/@fs/${pkgDist}/worker-entry.js?worker_file&type=module`, `/@fs/${pkgDist}/wasm-threads/fast_mesh_wasm_bg.wasm`];
+  } else {
+    const assets = join(example, "dist", "assets");
+    const threadedSize = statSync(join(pkgDist, "wasm-threads", "fast_mesh_wasm_bg.wasm")).size;
+    const files = readdirSync(assets);
+    const worker = files.find((f) => /^worker-entry-.*\.js$/.test(f));
+    const wasm = files.find((f) => f.endsWith(".wasm") && statSync(join(assets, f)).size === threadedSize);
+    if (worker === undefined || wasm === undefined) {
+      return [`the example's build has no Worker script or threaded .wasm (worker ${worker}, wasm ${wasm})`];
+    }
+    paths = [`/assets/${worker}`, `/assets/${wasm}`];
+  }
+  const problems = [];
+  const expect = (res, what) => {
+    const coop = res.headers.get("cross-origin-opener-policy");
+    const coep = res.headers.get("cross-origin-embedder-policy");
+    if (coop !== "same-origin" || coep !== "require-corp") {
+      problems.push(`${what}: COOP ${coop}, COEP ${coep}`);
+    }
+  };
+  for (const path of paths) {
+    const url = `${base}${path}`;
+    const first = await fetch(url);
+    await first.arrayBuffer();
+    if (first.status !== 200) {
+      problems.push(`${path}: status ${first.status}`);
+      continue;
+    }
+    expect(first, `${path} 200`);
+    const etag = first.headers.get("etag");
+    if (etag === null) {
+      problems.push(`${path}: no ETag, so no 304 to check`);
+      continue;
+    }
+    const again = await fetch(url, { headers: { "If-None-Match": etag } });
+    await again.arrayBuffer();
+    if (again.status !== 304) {
+      problems.push(`${path}: status ${again.status} for its ETag, not 304`);
+      continue;
+    }
+    expect(again, `${path} 304`);
+  }
+  // Not an HTML request, or Vite's SPA fallback answers it with index.html.
+  const missing = await fetch(`${base}/assets/no-such-file.wasm`, { headers: { Accept: "application/wasm" } });
+  await missing.arrayBuffer();
+  if (missing.status !== 404) {
+    problems.push(`/assets/no-such-file.wasm: status ${missing.status}, not 404`);
+  } else {
+    expect(missing, "/assets/no-such-file.wasm 404");
+  }
+  return problems;
+}
+
 if (flag("--build")) {
   await run(process.execPath, [vite, "build"], example);
 }
@@ -101,6 +168,13 @@ const server = await startServer(
   [vite, flag("--dev") ? "serve" : "preview", "--port", String(port), "--strictPort", "--host", "127.0.0.1"],
   { cwd: example, url: `http://127.0.0.1:${port}/check.html` },
 );
+if (only.includes("headers")) {
+  const problems = await headerProblems(`http://127.0.0.1:${port}`, flag("--dev")).catch((e) => [String(e)]);
+  for (const p of problems) {
+    console.log(`  ${p}`);
+  }
+  verdict("headers", problems.length === 0, "COOP/COEP on a 200, a 304 and a 404 (Worker script, threaded .wasm)");
+}
 const browser = browserName === "chrome" ? await launchChrome({ verbose }) : await launchPlaywright(browserName);
 const call = (fn, arg = {}) => browser.evaluate(`window.fmCheck.${fn}(${JSON.stringify(arg)})`);
 const settleWorkers = async (expected) => {
@@ -169,9 +243,23 @@ try {
       for (const d of r.differences) {
         console.log(`  differs: ${d}`);
       }
+      // With --threads (as in CI) the threaded scene must use exactly that many,
+      // so a runner with few cores cannot make the comparison single-threaded.
+      const threadsOk = threads === undefined ? r.threaded.threads > 1 : r.threaded.threads === threads;
+      if (!threadsOk) {
+        console.log(
+          `  the threaded scene runs ${r.threaded.threads} thread(s), expected ${threads ?? "more than 1"} ` +
+            `(hardwareConcurrency ${info.cores}, crossOriginIsolated ${info.isolated}); ` +
+            (!info.isolated
+              ? "the page is not cross-origin isolated (COOP/COEP headers)"
+              : threads === undefined
+                ? "pass --threads to ask for a pool size"
+                : "its thread pool did not start, so the scene fell back"),
+        );
+      }
       verdict(
         "compare",
-        r.identical && r.single.threads === 1 && r.threaded.threads > 1 && r.colouredEntries > 0,
+        r.identical && r.single.threads === 1 && threadsOk && r.colouredEntries > 0,
         `${r.triangles.toLocaleString("en")} triangles; threads ${r.single.threads} and ${r.threaded.threads}; ${r.identical ? "bit-identical" : "DIFFERENT"}`,
       );
     }
