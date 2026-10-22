@@ -96,6 +96,17 @@ jobs:
           pnpm --filter fast-mesh-wasm-example-react build
           # The Worker client sits in a chunk shared by ./worker and ./store: Vite must still find the Worker URL.
           ls examples/react/dist/assets/worker-entry-*.js
+      - name: Test, type-check and build the showcase (parsers, demo meshes; Worker scene)
+        run: |
+          pnpm --filter fast-mesh-wasm-example-showcase test
+          pnpm --filter fast-mesh-wasm-example-showcase build
+          ls examples/showcase/dist/assets/worker-entry-*.js examples/showcase/dist/assets/parser.worker-*.js
+      # Headless Chrome against `vite preview` of the showcase: demo meshes, click to select,
+      # a gizmo drag, undo/redo, file uploads (STL, OBJ, PLY, a broken file), no console errors;
+      # threaded (an explicit pool size, so a runner with few cores still runs threads > 1).
+      - name: Check the showcase in Chrome
+        timeout-minutes: 10
+        run: node scripts/showcase-check.mjs --threads 4
       # Headless Chrome (preinstalled on the runner) against `vite preview` of the WebGPU
       # example's check page: threaded and single-threaded bit-identical, shared memory
       # growth past 512 MB, restart with a new pool, fallback when the pool cannot start;

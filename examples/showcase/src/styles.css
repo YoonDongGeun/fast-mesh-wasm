@@ -1,0 +1,378 @@
+/* The showcase layout: mesh list | viewport | panels, with the status bar
+   along the bottom. Plain CSS, a dark theme. */
+:root {
+  --bg: #15171b;
+  --panel: #1f2329;
+  --panel-2: #262b32;
+  --line: #333a44;
+  --text: #e4e6ea;
+  --muted: #949ba6;
+  --accent: #4d8fe0;
+  --accent-soft: #2a4a73;
+  --warn: #f0b040;
+  --error: #ff7a7a;
+  --ok: #7cc77f;
+  --radius: 6px;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr) 290px;
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "left view right"
+    "status status status";
+  height: 100%;
+}
+
+.sidebar {
+  overflow-y: auto;
+  padding: 10px;
+  background: var(--panel);
+}
+.sidebar-left {
+  grid-area: left;
+  border-right: 1px solid var(--line);
+}
+.sidebar-right {
+  grid-area: right;
+  border-left: 1px solid var(--line);
+}
+
+.viewport {
+  grid-area: view;
+  position: relative;
+  min-width: 0;
+}
+
+/* ---- Panels ---- */
+.panel + .panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.panel h2 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.placeholder {
+  opacity: 0.75;
+}
+.muted {
+  color: var(--muted);
+  margin: 6px 0;
+}
+.small {
+  font-size: 12px;
+}
+
+/* ---- Controls ---- */
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: #4a5260;
+}
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button.danger:hover:not(:disabled) {
+  border-color: var(--error);
+  color: var(--error);
+}
+button.icon {
+  padding: 0 6px;
+  line-height: 1.3;
+}
+kbd {
+  padding: 0 4px;
+  margin-left: 2px;
+  border: 1px solid #5a6270;
+  border-radius: 3px;
+  font: 11px ui-monospace, monospace;
+  color: var(--muted);
+}
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+/* ---- Loads ---- */
+.jobs,
+.meshes {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.job {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 2px 8px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.job-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-phase {
+  color: var(--muted);
+}
+.job-done .job-phase {
+  color: var(--ok);
+}
+.job-error .job-phase,
+.job-message {
+  color: var(--error);
+}
+.job-message {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+.progress {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--line) 0%, var(--accent) 50%, var(--line) 100%) 0 0 / 200% 100%;
+  animation: progress 1s linear infinite;
+}
+@keyframes progress {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ---- Mesh list ---- */
+.mesh {
+  padding: 7px 8px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.mesh.selected {
+  border-color: var(--warn);
+}
+.mesh-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.mesh-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  padding: 0;
+  background: none;
+  border: none;
+  font-weight: 500;
+}
+.mesh-name[aria-pressed="true"] {
+  background: none;
+  color: var(--warn);
+}
+.count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.mesh-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+}
+.mesh-controls input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+.mesh-controls button {
+  font-size: 12px;
+  padding: 1px 6px;
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---- Viewport overlays ---- */
+.toolbar {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  gap: 10px;
+}
+.toolbar .group {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: rgba(21, 23, 27, 0.8);
+}
+.hint {
+  position: absolute;
+  bottom: 8px;
+  left: 0;
+  right: 0;
+  margin: 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  color: var(--muted);
+  pointer-events: none;
+}
+.drop-overlay {
+  position: fixed;
+  inset: 12px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: rgba(21, 23, 27, 0.75);
+  font-size: 16px;
+  pointer-events: none;
+}
+
+/* ---- Status bar ---- */
+.statusbar {
+  grid-area: status;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 28px;
+  padding: 3px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.statusbar .spacer {
+  flex: 1;
+}
+.statusbar button {
+  font-size: 12px;
+  padding: 0 8px;
+}
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.state-computing .dot {
+  background: var(--warn);
+}
+.state-error .dot {
+  background: var(--error);
+}
+.statusbar .error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--error);
+}
+.busy,
+.warn {
+  color: var(--warn);
+}
+.ok {
+  color: var(--ok);
+}
+
+.fatal {
+  padding: 24px;
+  color: var(--error);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress {
+    animation: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .app {
+    grid-template-columns: 240px minmax(0, 1fr);
+    grid-template-areas:
+      "left view"
+      "right right"
+      "status status";
+    grid-template-rows: minmax(0, 1fr) auto auto;
+  }
+}

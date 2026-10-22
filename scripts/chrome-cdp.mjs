@@ -1,4 +1,4 @@
-// Shared by browser-check.mjs and bundler-check.mjs: a headless Chrome driven
+// Shared by browser-check.mjs, bundler-check.mjs and showcase-check.mjs: a headless Chrome driven
 // over the DevTools protocol (no dependencies: Node's WebSocket), and a static
 // file server that sends the cross-origin isolation headers.
 import { spawn } from "node:child_process";
@@ -88,7 +88,7 @@ class Cdp {
 }
 
 /**
- * Launches headless Chrome and opens a page. Returns `{ goto, evaluate,
+ * Launches headless Chrome and opens a page. Returns `{ goto, evaluate, send,
  * workers, consoleLines, close }`; `workers()` lists the live dedicated
  * Workers of the page, nested ones included (auto-attached).
  */
@@ -191,6 +191,8 @@ export async function launchChrome({ verbose = false, args = [] } = {}) {
       }
     },
     evaluate,
+    /** A DevTools protocol command on the page (`Input.dispatchMouseEvent`, `DOM.setFileInputFiles`, ...). */
+    send: (method, params = {}) => cdp.send(method, params, page),
     workers: () => [...workers.values()],
     consoleLines,
     async close() {
