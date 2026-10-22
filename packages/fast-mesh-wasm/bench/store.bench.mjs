@@ -1,5 +1,5 @@
-// Store benchmarks (`fast-mesh-wasm/store` over the synchronous `Scene`), run against the built
-// package (a release build, not the test build):
+// Store benchmarks (`fast-mesh-wasm/store` over the synchronous `Scene`, then over a `WorkerScene`),
+// run against the built package (a release build, not the test build):
 //
 //   pnpm build && pnpm --filter fast-mesh-wasm bench:store [-- --quick]
 //
@@ -7,8 +7,11 @@
 // shown. The scene holds 1000 small meshes (closed tetrahedra) added through the store, 100 of
 // them coloured by distance to a neighbour, and 10 sections over 100 meshes each, so a refresh
 // has many mesh and section states to derive. The costs are those of the store's actions and
-// events: the scene work under them is tiny (four-vertex meshes).
+// events: the scene work under them is tiny (four-vertex meshes). The Worker case (the engine in a
+// `worker_threads` Worker, bench/worker-harness.mjs) times the store's work on the status changes
+// a placement makes: the refresh that re-derives the states reading the changed keys.
 import { readFileSync } from "node:fs";
+import { Worker } from "node:worker_threads";
 import { Scene } from "../dist/node.js";
 import { createSceneStore } from "../dist/store.js";
 
@@ -42,9 +45,8 @@ const MESHES = 1000;
 const COLOURED = 100;
 const SECTIONS = 10;
 
-/** A store over a fresh scene with `MESHES` meshes; returns the add burst's time (ms) too. */
-function build() {
-  const scene = new Scene();
+/** A store over `scene` (a fresh `Scene` by default) with `MESHES` meshes; returns the add burst's time (ms) too. */
+function build(scene = new Scene()) {
   const store = createSceneStore(scene);
   const meshes = [];
   const t0 = now();
@@ -68,13 +70,13 @@ function build() {
   return { scene, store, meshes, burst };
 }
 
-/** Median and p95 (µs) of `fn` over `n` runs, after `warm` unmeasured ones. */
+/** Median and p95 (µs) of `fn(k)` over `n` runs, after `warm` unmeasured ones; `k` counts all of them. */
 function time(n, warm, fn) {
   for (let k = 0; k < warm; k++) {
     fn(k);
   }
   const samples = [];
-  for (let k = 0; k < n; k++) {
+  for (let k = warm; k < warm + n; k++) {
     const t0 = now();
     fn(k);
     samples.push((now() - t0) * 1000);
@@ -111,7 +113,8 @@ row("`select(mesh)` (store only)", time(iters, 100, (k) => store.select(meshes[k
 row(
   "`setDisplay(opacity)` + `commitFrame()`",
   time(iters, 100, (k) => {
-    store.setDisplay(meshes[k % MESHES], { opacity: k % 2 === 0 ? 0.5 : 1 });
+    // Every call is a change: 0.5 and 0.75 alternate per visit (1 is the default).
+    store.setDisplay(meshes[k % MESHES], { opacity: Math.floor(k / MESHES) % 2 === 0 ? 0.5 : 0.75 });
     store.commitFrame();
   }),
 );
@@ -141,3 +144,75 @@ const t = now() - t0;
 console.log(`\nAdding ${extra} more meshes: ${fmt(t)} ms (${fmt((t * 1000) / extra)} µs per add)`);
 store.dispose();
 scene.free();
+
+// ---- over a Worker scene: the status changes of a placement ----
+
+/** The bench harness Worker as a `WorkerLike`. */
+class HarnessWorker {
+  constructor() {
+    this.worker = new Worker(new URL("./worker-harness.mjs", import.meta.url));
+    this.message = [];
+    this.worker.on("message", (data) => {
+      if (data?.kind === "benchStats") {
+        return;
+      }
+      for (const cb of this.message) {
+        cb({ data });
+      }
+    });
+  }
+  postMessage(msg, transfer) {
+    this.worker.postMessage(msg, transfer);
+  }
+  addEventListener(type, cb) {
+    if (type === "message") {
+      this.message.push(cb);
+    }
+  }
+  terminate() {
+    void this.worker.terminate();
+  }
+}
+
+const { createWorkerScene } = await import("../dist/worker.js");
+const ws = await createWorkerScene({ createWorker: () => new HarnessWorker() });
+// Each status delivery runs the scene's `onStatus` listeners in order: the first one here, the
+// store's, then the last one here, which reads the snapshot. Between the two is the store's work
+// on the delivery, whether it refreshes in its own listener or when the snapshot is read.
+let t0w = 0;
+let armed = false;
+const deliveries = [];
+ws.onStatus(() => {
+  t0w = now();
+});
+const worker = build(ws);
+ws.onStatus(() => {
+  worker.store.getSnapshot();
+  if (armed) {
+    deliveries.push((now() - t0w) * 1000);
+  }
+});
+const idle = async () => {
+  for (let k = 0; k < 20000 && worker.store.getSnapshot().status === "computing"; k++) {
+    worker.store.commitFrame();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+};
+await idle();
+const rounds = quick ? 50 : 300;
+const actions = [];
+armed = true;
+for (let k = 0; k < rounds; k++) {
+  const t = now();
+  worker.store.setPlacement(worker.meshes[1], { rotation: IDENTITY, translation: [0, 0, (k % 2) * 0.01] });
+  actions.push((now() - t) * 1000);
+  await idle();
+}
+armed = false;
+console.log(`\nWorker scene, ${MESHES} meshes as above: \`setPlacement\` of a coloured mesh in a section, ${rounds} round trips\n`);
+console.log("| per event (µs) | median | p95 | n |");
+console.log("| --- | --- | --- | --- |");
+row("`setPlacement` (the action: its key goes computing)", stats(actions));
+row("a status delivery (results arrive)", stats(deliveries));
+worker.store.dispose();
+ws.terminate();
