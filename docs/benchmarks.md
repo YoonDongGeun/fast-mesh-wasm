@@ -450,6 +450,60 @@ The Worker blocks for the whole of one request (ruling 10.1-6: no Rust-side chun
 
 The batch runs back to back inside the 4 ms yield budget, so the Worker yields at most once for it; the Worker side costs about the same as the synchronous scene (2.3 ms against 2.0 ms), and the main thread spends about 0.5 ms.
 
+## Wide-range drag (drag-speed part A)
+
+A drag where most of the coloured mesh is within the field's `maxDistance`: two touching 1M terrains (B flipped over A) with a distance field on A to B, `maxDistance` 8, colour range 0 to 6. Part A made the per-pose recompute faster (exact, single-threaded) and made the Worker step it and drop a stale pose. Part of #48; the profile is in `docs/superpowers/notes/2026-10-21-wide-drag-profile.md`.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, Rust 1.99.0 release profile, Node 24.13.0, wasm release build without the `parallel` feature.
+- **Date:** 2026-10-21 (baseline and the near-search change) and 2026-10-22 (the re-run at the end of part A and the Worker tables).
+
+### Native, single-threaded
+
+`cargo bench -p fast-mesh-scene --bench scene -- "wide drag"`: the terrain and touching poses of the 64-pose field drag above, 4 of its poses (0, 16, 32, 48, so every pose recolours most of A: 221,381 vertices per pose on average for the field on A). Each pose runs `set_placement`, `update_fields`, `colors` and `take_changes`. Criterion median of 10 samples, divided by the 4 poses.
+
+| Per pose | Before (`f58c958`) | Near search past a limit (`4fbb41d`) | End of part A (`16cf700`) | Speed-up |
+| --- | --- | --- | --- | --- |
+| Field on A | 13.89 s | 484 ms | **483 ms** | **28.7×** |
+| Fields on A and B | 27.77 s | 960 ms | 997 ms | 27.9× |
+| Opening a step unit (field on A: `set_placement` and the first one-point `field_step`) | | | 40.1 ms | |
+
+- **The cause** was the near-triangle search: at this range it listed every pair of triangles within 8 units, hundreds of millions per pose, which was 96.6% of the time. The search now gives up past one near pair per vertex slot of A and the update recomputes every vertex instead, with the same values, colours and change records bit for bit.
+- **The spec's target (§6.3, at least 3× per pose) is met** with about 29×.
+- The end-of-part-A run is about 4% slower than `4fbb41d` for both fields (criterion: +3.9%, p < 0.05) and the same for the field on A; the step API added in between does not run on this path, so this is within run-to-run variation on this machine.
+- Opening a step unit costs about 40 ms per pose: the field's preparation and its near search up to the limit, which is one call and cannot be split. The contact drag stays on the near search: 1.74 to 1.48 ms per pose (see the profile note).
+- Warm-starting the closest-point query from each vertex's last closest triangle was tried and dropped: within noise (453 against 457 ms per pose), and its exactness was not proven.
+
+### Worker scene
+
+`pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m` (or `-- --worker --wide [--10m]` for these cases only), in the harness of the Worker scene section. The engine recomputes the due fields at the end of each batch in steps of 4,096 vertices, yielding every 4 ms, and at each step boundary drops the recompute when a newer move of either mesh is queued, unless 200 ms have passed since the last completed recompute (the starvation guard), when it finishes it instead; a queued drag end lifts the guard. A pose's colours are applied all at once. Measured after `eb8b625` with the drag-end rule (starvation guard, `setImmediate` yield in the engine), Node 24.13.0, release build. The continuous drag ends the drag right after its last move (the pointer is released). Two terrains:
+
+- **9a terrain:** the pair of the 64-pose Worker drag (the JavaScript `terrain(n)`). Here few vertices change colour per pose (27.7 KB of dirty bytes per frame at 1M).
+- **Native terrain:** the terrain and touching poses of the native bench above, built in JavaScript (f64 heights), where every pose recolours most of A.
+
+Two ways to drag:
+
+- **Lock step:** one move to poses 16, 32, 48 and 0 in turn, then wait until its colours are applied (8 moves at 1M, 4 at 10M).
+- **Continuous at 60 Hz:** a move every 16.7 ms whatever the Worker is doing, turning B through the 64 poses and back, for 10 s (1M) or 30 s (10M), then the pointer stops.
+
+| | 1M, 9a terrain | 1M, native terrain | 10M, 9a terrain | 10M, native terrain |
+| --- | --- | --- | --- | --- |
+| **Lock step: move to colours applied**, median (p95) | **70.9 ms** (75.6) | **635 ms** (650) | **631 ms** (664) | **6.68 s** (6.95) |
+| Continuous: moves sent / poses recoloured / recomputes dropped | 600 / 41 / 102 | 600 / 12 / 27 | 1800 / 43 / 1 | 1800 / 4 / 1 |
+| **Continuous: update interval during the drag**, median (max) | **252 ms** (304) | **851 ms** (916) | **714 ms** (805) | **7.61 s** (7.61) |
+| **Continuous: last move, then release, to its colours applied** | **133 ms** | **635 ms** | **1.06 s** | **9.89 s** |
+| Continuous: last move to its colours, pointer paused without ending (previous run) | 119 ms | 818 ms | 1.03 s | 12.4 s |
+| Continuous: most batches waiting for a result | 7 | 44 | 48 | 477 |
+| Continuous: longest Worker block | 102 ms | 129 ms | 677 ms | 1.00 s |
+| Main thread per frame, median (longest block) | 0.04 ms (0.51) | 0.04 ms (6.65) | 0.03 ms (0.98) | 0.03 ms (12.5) |
+
+The lock-step Worker blocks of the previous run (the same code without the drag-end rule): longest block per pose 58.4, 62.9, 510 and 644 ms, nearly all of it opening the step unit (the first step).
+
+- **The latest pose wins, with a starvation guard.** During a continuous drag each recompute takes longer than a frame, so a newer move is queued at every step boundary and the recompute is dropped, until 200 ms have passed since the last completed one. The recompute under way then finishes and is shown, and the newest queued move (the older ones are superseded at once) starts the next. So the colours update about every 200 ms plus one recompute (252 ms and 851 ms at 1M), each update the exact colours of one pose. At 10M a recompute alone outlasts the guard, so almost none is dropped (one, by the drag's end) and the colours update once per recompute. When the drag ends, its end drops a recompute kept for an older pose, so the last pose's colours arrive within about one recompute plus the step or unit opening under way: 133 ms and 635 ms at 1M, 1.06 s and 9.89 s at 10M (lock-step recomputes 71 ms, 635 ms, 631 ms and 6.68 s; at 10M on the native terrain that is about 1.5 recomputes, and the extra time is not profiled). A pointer that pauses without ending the drag may wait up to two recomputes, as the kept one finishes first (previous run: 818 ms at 1M and 12.4 s at 10M on the native terrain). The batches waiting for a result are the moves sent during one recompute (up to 477 during a 7 s 10M recompute at 60 Hz); they are answered at once when it ends, and the main thread pays about 0.05 ms per frame.
+- **Before the guard** (Task 5, `01dd3d9`), no pose finished during a continuous drag (1 of 600 recoloured at 1M) and the last arrived one recompute after the pointer stopped (81 ms and 683 ms at 1M, 0.96 s and 6.64 s at 10M).
+- **Before part A** the same 1M 9a-terrain drag took 402 ms per move in the Worker (one Rust call, up to 741 ms); it now takes 72 ms (the 64-pose lock-step drag of the Worker scene section, re-run: median 71.9 ms, p95 80.0, longest Worker block 75.8 ms). The one-vertex edit of A with 4 fields (the longest single requests) went from 348 to 249 ms.
+- **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.5 to 0.65 s at 10M (up to 1.0 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it.
+- **The engine's yield.** The engine yields with `setImmediate` where there is one (Node) and with a `MessageChannel` tick in browsers. In a Node `worker_threads` Worker a chain of `MessageChannel` ticks after chunks of 1 ms or more lets no `parentPort` message in (measured: none of about 60 messages sent at 60 Hz over 1 s of 1 ms or 4 ms chunks, while `setImmediate` let all of them in), so no recompute could be dropped there. The Task 5 table was measured with a `setImmediate` stand-in in the bench harness; the engine now does this itself and the harness no longer patches it. A browser Worker (headless Chrome 155, both examples' Vite builds) admits a message sent a third of the way into a 227 ms recompute: the recompute is dropped and its result posted 83 ms after it started. The Worker scene tables above this section were measured before the change; the Task 5 re-run with a `setImmediate` tick gave the same numbers within about 10% (1M contact drag 1.90 ms, 10M contact drag 30.9 ms, many small requests 3.97 ms).
+
 ## Parallel (the `parallel` feature)
 
 Every benchmark that the `parallel` feature touches, with the feature off and on. Results are bit-identical either way (the tests check it); only the time changes.
@@ -568,7 +622,8 @@ cargo bench -p fast-mesh-fields                       # SignData::build and sign
 cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_BENCH_LARGE=1 for the 10M terrain
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
-pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run)
+pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run, --wide for just the wide-range drag)
+cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)

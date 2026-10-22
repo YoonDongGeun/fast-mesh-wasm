@@ -10,7 +10,10 @@
 // `INVALID_ARGUMENT` error (a failed history request). `{ serve: true }` runs it as the browser Worker script does
 // (`serveEngine`: a `ready` message first) with the test-only `debugDump`
 // query, for `WorkerScene` through its `createWorker` option.
-// `{ yieldMs }` sets the engine's yield budget (`0`: yield after every chunk).
+// `{ yieldMs }` sets the engine's yield budget (`0`: yield after every chunk);
+// `{ stepPoints }` and `{ staleGuardMs }` set the field step options, and
+// `{ reportSteps: true }` posts `{ kind: "chunk", chunk }` for every field step
+// and abandoned unit (`fieldStep`, `fieldStepAbandon`), besides the results.
 import { parentPort, workerData } from "node:worker_threads";
 import "../../dist/node.js";
 import * as raw from "../../dist/wasm/fast_mesh_wasm.js";
@@ -35,8 +38,20 @@ const port = {
   post: (msg, transfer) => parentPort.postMessage(msg, transfer),
   onMessage: (cb) => parentPort.on("message", cb),
 };
+const options = {
+  yieldMs: workerData?.yieldMs,
+  stepPoints: workerData?.stepPoints,
+  staleGuardMs: workerData?.staleGuardMs,
+  onChunk: workerData?.reportSteps
+    ? (chunk) => {
+        if (chunk.kind === "fieldStep" || chunk.kind === "fieldStepAbandon") {
+          parentPort.postMessage({ kind: "chunk", chunk });
+        }
+      }
+    : undefined,
+};
 if (workerData?.serve) {
-  serveEngine(port, Promise.resolve(), { debug: true, yieldMs: workerData?.yieldMs });
+  serveEngine(port, Promise.resolve(), { debug: true, ...options });
 } else {
-  runEngine(port, { yieldMs: workerData?.yieldMs });
+  runEngine(port, options);
 }

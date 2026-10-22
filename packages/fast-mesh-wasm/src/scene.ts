@@ -920,6 +920,38 @@ function toUint32(values: Indices): Uint32Array {
 }
 
 /**
+ * Stepped field updates of a scene (the scene crate's `field_step` API),
+ * for the Worker engine only: not part of the public API, and not exported
+ * from the package entries.
+ *
+ * - `setDefer(on)`: with `on`, the changes that would update the fields of
+ *   `"eager"` meshes leave them due instead (adding a field still computes
+ *   it at once).
+ * - `step(points)`: computes up to `points` vertices of the due fields,
+ *   opening a unit of every due field first (an undivided part). The call
+ *   that computes the last applies the unit and returns `"done"`, exactly as
+ *   a one-shot update at the state it opened at; `"idle"`: nothing was due.
+ *   Any other scene call that may change the scene drops an open unit. A
+ *   field error throws and ends the unit (the failing fields stay due).
+ * - `abandon()`: drops the open unit; its fields stay due.
+ * - `meshes()`: the meshes of the open unit's fields, each once.
+ */
+interface FieldSteps {
+  setDefer(on: boolean): void;
+  step(points: number): "idle" | "pending" | "done";
+  abandon(): void;
+  meshes(): MeshHandle[];
+}
+
+/** Set by `Scene`'s static block. */
+let fieldStepsOf: (scene: Scene) => FieldSteps;
+
+/** @internal The stepped field updates of `scene` (see {@link FieldSteps}); for the Worker engine. */
+export function fieldSteps(scene: Scene): FieldSteps {
+  return fieldStepsOf(scene);
+}
+
+/**
  * A scene of editable meshes. Create it after `await init()`; release it with
  * {@link Scene.free} or a `using` declaration (otherwise it is freed when
  * garbage collected).
@@ -1676,6 +1708,28 @@ export class Scene implements SceneLike {
     const field = this.#field(rule.field);
     const { map, values } = encodeRule(rule);
     call(() => this.#scene().set_coloring(index, generation, field, map, values));
+  }
+
+  // ---- Stepped field updates (internal: see fieldSteps) ----
+
+  static {
+    fieldStepsOf = (scene) => ({
+      setDefer: (on) => call(() => scene.#peek().set_defer_fields(on)),
+      step: (points) => {
+        const s = scene.#scene();
+        const state = call(() => s.field_step(points));
+        return state === 0 ? "idle" : state === 1 ? "pending" : "done";
+      },
+      abandon: () => call(() => scene.#peek().abandon_field_step()),
+      meshes: () => {
+        const flat = call(() => scene.#peek().field_step_meshes());
+        const out: MeshHandle[] = [];
+        for (let k = 0; k < flat.length; k += 2) {
+          out.push(scene.#meshHandle(flat[k], flat[k + 1]));
+        }
+        return out;
+      },
+    });
   }
 
   // ---- Sections ----

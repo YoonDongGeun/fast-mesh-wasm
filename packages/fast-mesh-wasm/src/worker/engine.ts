@@ -3,7 +3,10 @@
 // (a request, a field build, an operation of a repair list), yielding to the
 // message loop between chunks so newer batches arrive meanwhile: superseded
 // "last wins" requests are dropped and abandoned field builds deferred before
-// they start. After each batch it posts one `Result` with the frame's change
+// they start. Field updates are deferred: after a batch's requests, the
+// fields they left due are computed in steps, and a recompute made stale by a
+// queued request is abandoned at a step boundary (§6.1 of the drag-speed
+// design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
 // statuses and replies. Pure: it talks only through `Port`, so it runs in a
 // browser Worker or in Node `worker_threads`.
@@ -12,6 +15,7 @@ import { FastMeshError } from "../core.js";
 import {
   type EditOp,
   type FieldHandle,
+  fieldSteps,
   type MeshChange,
   type MeshHandle,
   type RepairOp,
@@ -52,8 +56,9 @@ export interface EngineOptions {
   /**
    * Test-only: called after each chunk of work: every request run (`kind`
    * is the request's), every field computed (`"fieldBuild"`, `id` is the
-   * field's client id) and every operation of a repair list run in steps
-   * (`"repairOp"`).
+   * field's client id), every operation of a repair list run in steps
+   * (`"repairOp"`), every field step (`"fieldStep"`) and every abandoned
+   * field step unit (`"fieldStepAbandon"`).
    */
   onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
   /**
@@ -64,10 +69,39 @@ export interface EngineOptions {
    * chunk past the budget. `0` yields after every chunk (tests).
    */
   yieldMs?: number;
+  /**
+   * How many vertices of the due fields one field step computes:
+   * {@link STEP_POINTS} by default. Smaller steps notice a stale recompute
+   * sooner, at the cost of more step boundaries (tests use a few, so that a
+   * unit spans many steps). Rounded down and clamped to at least 1.
+   */
+  stepPoints?: number;
+  /**
+   * The starvation guard, in milliseconds: {@link STALE_GUARD_MS} by
+   * default. Once this long has passed since the last field step unit
+   * completed, a queued drag move no longer abandons the unit: it completes
+   * and is published, and the newest pose follows. So a sustained drag whose
+   * recompute outlasts the gaps between moves still updates its colours
+   * about every guard plus one recompute, each update exactly one pose.
+   * Edits, repairs, compactions, removals, placements, undo, redo and drag
+   * cancels always abandon, and so do drag moves once the drag's `end` is
+   * queued (the final pose then follows within one recompute; a pointer
+   * that pauses without ending may wait up to two).
+   */
+  staleGuardMs?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
 export const YIELD_MS = 4;
+
+/** The default {@link EngineOptions.staleGuardMs}. */
+export const STALE_GUARD_MS = 200;
+
+/** The default {@link EngineOptions.stepPoints}. */
+export const STEP_POINTS = 4096;
+
+/** A step budget that computes a whole unit at once. */
+const ALL_POINTS = 0xffff_ffff;
 
 const now: () => number =
   typeof performance !== "undefined" && typeof performance.now === "function"
@@ -228,11 +262,18 @@ const END = Symbol("end of batch");
 type Item = Request | typeof END;
 
 /**
- * Yields to the message loop, so batches sent meanwhile are received: a
- * `MessageChannel` tick (nested timers are clamped to 4 ms in browsers),
- * else `setTimeout(0)`.
+ * Yields to the message loop, so batches sent meanwhile are received:
+ * `setImmediate` where there is one (Node: a chain of `MessageChannel` ticks
+ * after chunks of a millisecond or more lets no `parentPort` message in,
+ * measured), else a `MessageChannel` tick (browsers interleave it with the
+ * Worker's messages, checked in headless Chrome; nested timers are clamped
+ * to 4 ms there), else `setTimeout(0)`.
  */
 function messageTick(): () => Promise<void> {
+  const immediate = (globalThis as { setImmediate?: (cb: () => void) => unknown }).setImmediate;
+  if (typeof immediate === "function") {
+    return () => new Promise((resolve) => immediate(resolve));
+  }
   if (typeof MessageChannel === "undefined") {
     return () => new Promise((resolve) => setTimeout(resolve, 0));
   }
@@ -251,6 +292,8 @@ function messageTick(): () => Promise<void> {
 class Engine {
   readonly #port: Port;
   readonly #scene = new Scene();
+  /** The scene's stepped field updates (internal API). */
+  readonly #steps = fieldSteps(this.#scene);
   /** Requests received and not run yet, each batch followed by {@link END}. */
   readonly #queue: Item[] = [];
   /** A drain is under way (possibly waiting at a yield). */
@@ -288,12 +331,37 @@ class Engine {
   readonly #yieldMs: number;
   /** When the engine last yielded (or started draining). */
   #yielded = 0;
+  readonly #stepPoints: number;
+  /**
+   * The `display:` statuses of batches whose field step unit was abandoned:
+   * they go with the result of the batch whose unit completes next, so the
+   * keys read "computing" until then.
+   */
+  readonly #held: Result["status"] = [];
+  /**
+   * The meshes of the last abandoned unit, until a unit completes: its
+   * fields are still due, so a unit opened while a request queued makes it
+   * stale would be abandoned too.
+   */
+  #lastAbandoned: Set<ClientId> | undefined;
+  readonly #staleGuardMs: number;
+  /**
+   * When the last field step unit completed (the engine's start before
+   * the first): drag moves abandon units only within the guard after it.
+   */
+  #published = now();
 
   constructor(port: Port, options: EngineOptions) {
     this.#port = port;
     this.#debug = options.debug ?? false;
     this.#onChunk = options.onChunk;
     this.#yieldMs = options.yieldMs ?? YIELD_MS;
+    // At least one vertex a step (NaN too); at most what one call takes.
+    const points = Math.floor(options.stepPoints ?? STEP_POINTS);
+    this.#stepPoints = points >= 1 ? Math.min(points, ALL_POINTS) : 1;
+    this.#staleGuardMs = options.staleGuardMs ?? STALE_GUARD_MS;
+    // Field updates wait for the end of the batch, to be stepped there.
+    this.#steps.setDefer(true);
   }
 
   /**
@@ -375,7 +443,7 @@ class Engine {
       while (this.#queue.length > 0) {
         const item = this.#queue.shift() as Item;
         if (item === END) {
-          if (!this.#finish()) {
+          if (!(await this.#stepFields()) || !this.#finish()) {
             return;
           }
         } else if (!(await this.#step(item))) {
@@ -419,6 +487,148 @@ class Engine {
       }
     }
     return true;
+  }
+
+  /**
+   * Brings the fields the batch left due up to date in steps of
+   * {@link EngineOptions.stepPoints} vertices, yielding between them once
+   * the time budget is spent. At each step boundary, when a queued request
+   * makes the unit stale ({@link Engine.#makesStale}), the unit is
+   * abandoned: the batch's result then carries none of its values or
+   * colours, and the `display:` statuses of its meshes are held back until a
+   * later unit completes. No unit is opened while a request queued makes
+   * the last abandoned unit stale (its fields are still due, so the new unit
+   * would be stale too). Past the starvation guard
+   * ({@link EngineOptions.staleGuardMs}) drag moves no longer abandon, so a
+   * sustained drag still publishes. Other requests wait for the unit. A field error
+   * ends the unit like a failed eager update: swallowed, the failing fields
+   * stay stale. `false` once the engine is poisoned.
+   */
+  async #stepFields(): Promise<boolean> {
+    const steps = this.#steps;
+    const b = this.#batch;
+    if (this.#lastAbandoned !== undefined && this.#staleQueued(this.#lastAbandoned)) {
+      this.#hold(b, this.#lastAbandoned);
+      return true;
+    }
+    let meshes: Set<ClientId> | undefined;
+    for (;;) {
+      let state: "idle" | "pending" | "done";
+      try {
+        state = steps.step(this.#stepPoints);
+        if (state === "pending") {
+          meshes ??= new Set(steps.meshes().map((h) => this.#meshId(h)));
+        }
+      } catch (e) {
+        let error = e;
+        if (!isPoison(error)) {
+          // The unit is over (the fields that could be applied were), or
+          // reading its meshes failed: leave none open.
+          try {
+            steps.abandon();
+          } catch (e2) {
+            error = e2;
+          }
+        }
+        if (isPoison(error)) {
+          b.status.push(...this.#held.splice(0));
+          this.#poison(b, POISONED, undefined, true);
+          return false;
+        }
+        state = "done";
+      }
+      this.#onChunk?.({ kind: "fieldStep" });
+      if (state !== "pending") {
+        if (state !== "idle") {
+          this.#published = now();
+        }
+        this.#lastAbandoned = undefined;
+        b.status.push(...this.#held.splice(0));
+        return true;
+      }
+      await this.#maybeYield();
+      if (meshes !== undefined && this.#staleQueued(meshes)) {
+        steps.abandon();
+        this.#onChunk?.({ kind: "fieldStepAbandon" });
+        this.#lastAbandoned = meshes;
+        this.#hold(b, meshes);
+        return true;
+      }
+    }
+  }
+
+  /**
+   * Whether a queued request makes a unit over `meshes` stale. Drag moves
+   * count only within the starvation guard after the last completed unit,
+   * or when the drag's `end` is queued too: on release the newest pose
+   * follows within one recompute, never after a kept older one. (An `end`
+   * with no move queued before it leaves the unit alone: the unit is then
+   * at the final pose.)
+   */
+  #staleQueued(meshes: Set<ClientId>): boolean {
+    const moves =
+      now() - this.#published <= this.#staleGuardMs ||
+      this.#queue.some((item) => item !== END && item.kind === "drag" && item.phase === "end" && meshes.has(item.id));
+    return this.#queue.some((item) => item !== END && this.#makesStale(item, meshes, moves));
+  }
+
+  /** Moves the batch's `display:` statuses of `meshes` to the held ones. */
+  #hold(b: Batch, meshes: Set<ClientId>): void {
+    const kept: Result["status"] = [];
+    for (const st of b.status.splice(0)) {
+      const held = st.key.startsWith("display:") && meshes.has(Number(st.key.slice("display:".length)));
+      (held ? this.#held : kept).push(st);
+    }
+    b.status.push(...kept);
+  }
+
+  /**
+   * Whether the queued `req` makes a field step unit over `meshes` (the
+   * meshes its fields are on and measured to) stale (§6.1): a drag move
+   * (only with `moves`: within the starvation guard), a drag cancel or a
+   * placement, an edit, repair, compaction or removal of one of them, an
+   * undo or redo, or the removal of a field between two of them.
+   */
+  #makesStale(req: Request, meshes: Set<ClientId>, moves: boolean): boolean {
+    switch (req.kind) {
+      case "drag":
+        // A move, an end with a last move, or a cancel (back to the start pose).
+        return (
+          meshes.has(req.id) &&
+          (req.phase === "cancel" || (moves && (req.phase === "move" || (req.phase === "end" && req.rotation !== undefined))))
+        );
+      case "setPlacement":
+      case "edit":
+      case "repair":
+      case "compact":
+      case "removeMesh":
+        return meshes.has(req.id);
+      case "undo":
+      case "redo":
+        return true;
+      case "field": {
+        const on = this.#fieldMeshes.get(req.field);
+        return req.op === "remove" && on !== undefined && meshes.has(on[0]) && meshes.has(on[1]);
+      }
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Brings every due field up to date at once, for a request that reads
+   * fields (their values, status or colours). A field error is swallowed
+   * like a failed eager update's; a trap is rethrown.
+   */
+  #settleFields(): void {
+    try {
+      // One call computes the whole unit.
+      while (this.#steps.step(ALL_POINTS) === "pending") {}
+    } catch (e) {
+      if (isPoison(e)) {
+        throw e;
+      }
+    }
   }
 
   /** Posts the finished batch's result; `false` when packing failed (poisoned). */
@@ -717,9 +927,13 @@ class Engine {
         this.#runSection(req);
         return;
       case "query":
+        if (req.name === "fieldStatus" || req.name === "debugDump") {
+          this.#settleFields();
+        }
         b.replies.push({ qid: req.qid, ok: true, value: this.#query(req.name, req.args) });
         return;
       case "fetchFieldValues": {
+        this.#settleFields();
         const values = s.fieldValues(this.#field(req.field)).slice();
         b.replies.push({ qid: req.qid, ok: true, value: values });
         b.transfer.push(values.buffer);

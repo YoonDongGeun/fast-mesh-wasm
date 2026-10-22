@@ -302,6 +302,7 @@ impl Scene {
         dir: [f64; 3],
         opts: &SceneRayOptions,
     ) -> Result<Option<SceneRayHit>> {
+        self.drop_field_unit();
         check_finite(origin, "ray origin must be finite")?;
         let d = unit_dir(dir)?;
         if opts.min_t.is_nan() || opts.max_t.is_nan() || opts.min_t > opts.max_t {
@@ -400,6 +401,7 @@ impl Scene {
         p: [f64; 3],
         opts: &SceneClosestOptions,
     ) -> Result<Option<SceneClosestHit>> {
+        self.drop_field_unit();
         check_finite(p, "query point must be finite")?;
         check_bound(opts.max_distance, MAX_DISTANCE)?;
         self.prepare(None)?;
@@ -454,6 +456,7 @@ impl Scene {
         p: [f64; 3],
         opts: &SceneClosestOptions,
     ) -> Result<Option<SceneClosestHit>> {
+        self.drop_field_unit();
         self.entry(id)?;
         check_finite(p, "query point must be finite")?;
         check_bound(opts.max_distance, MAX_DISTANCE)?;
@@ -555,6 +558,7 @@ impl Scene {
     /// update, or [`SceneError::StaleBvh`] when either is a stale Manual
     /// mesh (the lower id first).
     pub fn intersects(&mut self, a: MeshId, b: MeshId) -> Result<bool> {
+        self.drop_field_unit();
         self.check_ids(a, b)?;
         let (ea, eb, xf) = self.pair(a, b)?;
         Ok(fast_mesh_query::intersects(
@@ -582,6 +586,7 @@ impl Scene {
         b: MeshId,
         max_distance: f64,
     ) -> Result<Option<SceneMeshDistance>> {
+        self.drop_field_unit();
         self.check_ids(a, b)?;
         check_bound(max_distance, MAX_DISTANCE)?;
         let (ea, eb, xf) = self.pair(a, b)?;
@@ -629,6 +634,7 @@ impl Scene {
         out_a: &mut Vec<TriangleId>,
         out_b: &mut Vec<TriangleId>,
     ) -> Result<()> {
+        self.drop_field_unit();
         self.check_ids(a, b)?;
         check_bound(margin, MARGIN)?;
         let (ea, eb, xf) = self.pair(a, b)?;

@@ -7,6 +7,8 @@
 //! too.
 
 use std::cell::Cell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind, NodeView};
 use fast_mesh_store::{Mesh, TriangleId, par};
@@ -174,6 +176,45 @@ pub fn triangles_near(
         Some((margin, "margin must not be negative or NaN")),
     )?;
     triangles_near_with::<PAIR_STACK>(mesh_a, bvh_a, mesh_b, bvh_b, xf, margin, out_a, out_b)
+}
+
+/// [`triangles_near`] for A's side only, given up once more than `limit`
+/// near pairs are found: for callers that have a cheaper way to go on when
+/// the near set is large (the search visits every near pair, and their
+/// number grows with the margin much faster than the near set).
+///
+/// Returns `Ok(true)` with exactly the triangles [`triangles_near`] appends
+/// to `out_a` when there are at most `limit` near pairs, and `Ok(false)` with
+/// `out_a` unchanged otherwise. With the `parallel` feature, the pairs of
+/// all parts count towards the same limit, so the outcome does not depend
+/// on the threads.
+///
+/// # Errors
+/// As for [`triangles_near`]; on any error `out_a` keeps its original
+/// length.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // As for `triangles_near`, with the limit.
+pub fn triangles_near_limited(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+    margin: f32,
+    limit: usize,
+    out_a: &mut Vec<TriangleId>,
+) -> Result<bool> {
+    validate(
+        mesh_a,
+        bvh_a,
+        mesh_b,
+        bvh_b,
+        xf,
+        Some((margin, "margin must not be negative or NaN")),
+    )?;
+    triangles_near_limited_with::<PAIR_STACK>(
+        mesh_a, bvh_a, mesh_b, bvh_b, xf, margin, limit, out_a, None,
+    )
 }
 
 /// Appends to `out` every pair `(a, b)` of an alive triangle `a` of A and an
@@ -920,17 +961,64 @@ fn triangles_near_with<const N: usize>(
     out_a: &mut Vec<TriangleId>,
     out_b: &mut Vec<TriangleId>,
 ) -> Result<()> {
+    let done = triangles_near_limited_with::<N>(
+        mesh_a,
+        bvh_a,
+        mesh_b,
+        bvh_b,
+        xf,
+        margin,
+        usize::MAX,
+        out_a,
+        Some(out_b),
+    )?;
+    debug_assert!(done, "no limit to pass");
+    Ok(())
+}
+
+/// The search of [`triangles_near`] and [`triangles_near_limited`]: B's side
+/// only with `out_b`, and abandoned (`Ok(false)`, both vectors restored) as
+/// soon as more than `limit` near pairs are found. `usize::MAX` means no
+/// limit, and then the pairs are not counted.
+#[allow(clippy::too_many_arguments)] // As for `triangles_near`, with the limit.
+fn triangles_near_limited_with<const N: usize>(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+    margin: f32,
+    limit: usize,
+    out_a: &mut Vec<TriangleId>,
+    out_b: Option<&mut Vec<TriangleId>>,
+) -> Result<bool> {
     let margin = f64::from(margin);
     let m = magnitude(bvh_a, bvh_b, xf);
     let key = |p: &Aabb, q: &Aabb| {
         let d = box_distance(p, q);
         (!beyond(d, margin, m)).then_some(d)
     };
-    // Calls `found(a, b)` for every near pair under `from`, until it fails.
+    // Near pairs found so far, across all parts, when there is a limit.
+    let found_pairs = AtomicUsize::new(0);
+    let within_limit = || -> std::result::Result<(), Stop> {
+        if limit != usize::MAX && found_pairs.fetch_add(1, Ordering::Relaxed) >= limit {
+            return Err(Stop::Limit);
+        }
+        Ok(())
+    };
+    // The first real failure of any part, which a part stopped by the limit
+    // must not hide.
+    let failure: Mutex<Option<QueryError>> = Mutex::new(None);
+    let record = |e: QueryError| {
+        let mut f = failure.lock().unwrap_or_else(|p| p.into_inner());
+        f.get_or_insert(e);
+    };
+    // Calls `found(a, b)` for every near pair under `from`, until it fails
+    // or passes the limit.
     let search = |from: Option<(NodeId, NodeId)>,
                   found: &mut dyn FnMut(TriangleId, TriangleId) -> Result<()>|
-     -> Result<()> {
-        let mut failed = None;
+     -> std::result::Result<(), Stop> {
+        let mut stopped = None;
         for_each_near_pair::<N, f64>(
             mesh_a,
             bvh_a,
@@ -947,52 +1035,86 @@ fn triangles_near_with<const N: usize>(
                 // (0 for pairs that intersect), but stops at the first
                 // candidate within the margin.
                 if tri_tri_within(pa, pb, margin)
-                    && let Err(e) = found(a, b)
+                    && let Err(e) = within_limit().and_then(|()| found(a, b).map_err(Stop::Failed))
                 {
-                    failed = Some(e);
+                    if let Stop::Failed(e) = &e {
+                        record(*e);
+                    }
+                    stopped = Some(e);
                     return false;
                 }
                 true
             },
         );
-        failed.map_or(Ok(()), Err)
+        stopped.map_or(Ok(()), Err)
     };
+    let want_b = out_b.is_some();
+    let mut spare = Vec::new();
     let mut ap_a = Appender::new(out_a);
-    let mut ap_b = Appender::new(out_b);
-    let searched = if split_traversal(mesh_a, mesh_b) {
+    let mut ap_b = Appender::new(out_b.unwrap_or(&mut spare));
+    let searched: std::result::Result<(), Stop> = if split_traversal(mesh_a, mesh_b) {
         // Each part's triangles, sorted without duplicates, in part order;
         // appended together they sort to the same result.
-        split_pairs(bvh_a, bvh_b, xf, &key, PAR_PARTS).and_then(|parts| {
-            let found = par::map_chunks(&parts, 1, 0, oom, |_, part| {
-                let (mut near_a, mut near_b) = (Vec::new(), Vec::new());
-                search(Some(part[0]), &mut |a, b| {
-                    try_push(&mut near_a, a)?;
-                    try_push(&mut near_b, b)
-                })?;
-                for v in [&mut near_a, &mut near_b] {
-                    v.sort_unstable();
-                    v.dedup();
+        split_pairs(bvh_a, bvh_b, xf, &key, PAR_PARTS)
+            .map_err(Stop::Failed)
+            .and_then(|parts| {
+                let found = par::map_chunks(
+                    &parts,
+                    1,
+                    0,
+                    || Stop::Failed(oom()),
+                    |_, part| {
+                        let (mut near_a, mut near_b) = (Vec::new(), Vec::new());
+                        search(Some(part[0]), &mut |a, b| {
+                            try_push(&mut near_a, a)?;
+                            if want_b {
+                                try_push(&mut near_b, b)?;
+                            }
+                            Ok(())
+                        })?;
+                        for v in [&mut near_a, &mut near_b] {
+                            v.sort_unstable();
+                            v.dedup();
+                        }
+                        Ok((near_a, near_b))
+                    },
+                )?;
+                for (near_a, near_b) in &found {
+                    ap_a.extend(near_a).map_err(Stop::Failed)?;
+                    ap_b.extend(near_b).map_err(Stop::Failed)?;
                 }
-                Ok((near_a, near_b))
-            })?;
-            for (near_a, near_b) in &found {
-                ap_a.extend(near_a)?;
-                ap_b.extend(near_b)?;
+                Ok(())
+            })
+    } else {
+        search(None, &mut |a, b| {
+            ap_a.push(a)?;
+            if want_b {
+                ap_b.push(b)?;
             }
             Ok(())
         })
-    } else {
-        search(None, &mut |a, b| ap_a.push(a).and_then(|()| ap_b.push(b)))
     };
-    if let Err(e) = searched {
+    if let Err(stop) = searched {
         // A failed push restored its own vector; restore the other one too.
         ap_a.truncate_appended(0);
         ap_b.truncate_appended(0);
-        return Err(e);
+        let failed = failure.into_inner().unwrap_or_else(|p| p.into_inner());
+        return match (stop, failed) {
+            // A real failure anywhere wins over the limit.
+            (_, Some(e)) | (Stop::Failed(e), None) => Err(e),
+            (Stop::Limit, None) => Ok(false),
+        };
     }
     ap_a.sort_dedup_appended();
     ap_b.sort_dedup_appended();
-    Ok(())
+    Ok(true)
+}
+
+/// Why [`triangles_near_limited_with`] stopped early: past its limit (on
+/// purpose), or on a real failure.
+enum Stop {
+    Limit,
+    Failed(QueryError),
 }
 
 fn intersecting_pairs_with<const N: usize>(
@@ -1316,6 +1438,102 @@ mod tests {
         }
         assert!(found.iter().all(|&n| n > 50), "{found:?}");
         assert!(found[0] <= found[1] && found[1] < found[2], "{found:?}");
+    }
+
+    #[test]
+    fn triangles_near_limited_stops_past_the_limit() {
+        let mut aborted = 0;
+        for Posed {
+            ma, ba, mb, bb, xf, ..
+        } in posed()
+        {
+            let all = brute(&ma, &mb, &xf);
+            for margin in [0.0, 0.05, 0.5] {
+                let want = brute_near(&all, margin).0;
+                let pairs = all
+                    .iter()
+                    .filter(|(_, _, hit, d)| *hit || d.dist2.sqrt() <= f64::from(margin))
+                    .count();
+                let run = |limit: usize| {
+                    let mut a = vec![999];
+                    let done =
+                        triangles_near_limited(&ma, &ba, &mb, &bb, &xf, margin, limit, &mut a)
+                            .unwrap();
+                    assert_eq!(a[0], 999);
+                    (done, a[1..].to_vec())
+                };
+                // Up to the limit, the same triangles of A as `triangles_near`.
+                assert_eq!(run(usize::MAX), (true, want.clone()));
+                assert_eq!(run(pairs), (true, want.clone()));
+                if pairs > 0 {
+                    // Past it, nothing appended.
+                    assert_eq!(run(pairs - 1), (false, Vec::new()));
+                    assert_eq!(run(0), (false, Vec::new()));
+                    aborted += 1;
+                }
+            }
+        }
+        assert!(aborted > 20, "{aborted}");
+    }
+
+    #[test]
+    fn triangles_near_limited_bit_identical() {
+        use crate::test_util::assert_parallel_identical;
+        // Large enough to split the traversal with the `parallel` feature.
+        let ma = wavy(40);
+        let ba = build(&ma, Quality::Sah);
+        let xf = Rigid {
+            translation: [0.25, 0.5, 0.75],
+            ..Rigid::IDENTITY
+        };
+        let mut want = (Vec::new(), Vec::new());
+        triangles_near(&ma, &ba, &ma, &ba, &xf, 0.5, &mut want.0, &mut want.1).unwrap();
+        let full = assert_parallel_identical("triangles_near_limited", || {
+            let mut a = Vec::new();
+            let done = triangles_near_limited(&ma, &ba, &ma, &ba, &xf, 0.5, usize::MAX, &mut a);
+            (done.unwrap(), a)
+        });
+        assert_eq!(full, (true, want.0));
+        let cut = assert_parallel_identical("triangles_near_limited, cut", || {
+            let mut a = Vec::new();
+            let done = triangles_near_limited(&ma, &ba, &ma, &ba, &xf, 0.5, 100, &mut a);
+            (done.unwrap(), a)
+        });
+        assert_eq!(cut, (false, Vec::new()));
+        // The near pairs in all: the smallest limit the sequential search
+        // completes under.
+        let completes = |limit| {
+            fast_mesh_store::par::set_force_sequential(true);
+            let mut a = Vec::new();
+            let done = triangles_near_limited(&ma, &ba, &ma, &ba, &xf, 0.5, limit, &mut a);
+            fast_mesh_store::par::set_force_sequential(false);
+            done.unwrap()
+        };
+        let (mut lo, mut hi) = (0, 1 << 24);
+        assert!(completes(hi));
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if completes(mid) {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        let total = lo;
+        assert!(total > 1000, "{total}");
+        // Exactly at the total, every part's pairs together just fit; one
+        // fewer is passed, whatever the threads.
+        for (limit, want) in [
+            (total, (true, full.1.clone())),
+            (total - 1, (false, Vec::new())),
+        ] {
+            let got = assert_parallel_identical("triangles_near_limited at the total", || {
+                let mut a = Vec::new();
+                let done = triangles_near_limited(&ma, &ba, &ma, &ba, &xf, 0.5, limit, &mut a);
+                (done.unwrap(), a)
+            });
+            assert_eq!(got, want, "limit {limit}");
+        }
     }
 
     #[test]
@@ -2191,6 +2409,21 @@ mod tests {
         fail_allocations_after(None);
         assert_eq!(r, Err(QueryError::OutOfMemory));
         assert_eq!((a, b), (vec![7], vec![8]));
+
+        // A failed push in the limited search is an error, not a stop at the
+        // limit; reaching the limit first is a stop.
+        for (limit, want) in [
+            (usize::MAX, Err(QueryError::OutOfMemory)),
+            (1000, Err(QueryError::OutOfMemory)),
+            (0, Ok(false)),
+        ] {
+            let mut a = vec![7];
+            fail_allocations_after(Some(0));
+            let r = triangles_near_limited(&ma, &ba, &mb, &bb, &xf, 0.0, limit, &mut a);
+            fail_allocations_after(None);
+            assert_eq!(r, want, "limit {limit}");
+            assert_eq!(a, vec![7]);
+        }
     }
 
     #[test]

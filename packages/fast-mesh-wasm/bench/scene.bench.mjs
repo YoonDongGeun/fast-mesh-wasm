@@ -1,6 +1,6 @@
 // Scene benchmarks, run against the built package (a release build, not the test build):
 //
-//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker]
+//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide]
 //
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
@@ -16,6 +16,7 @@ const quick = args.has("--quick");
 const with10m = args.has("--10m");
 const onlyAdapter = args.has("--adapter"); // run just the three.js adapter case
 const onlyWorker = args.has("--worker"); // run just the Worker scene cases (with --10m: also 10M)
+const onlyWide = args.has("--wide"); // with --worker: run just the Worker wide-range drag cases
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -347,7 +348,8 @@ class BenchWorker {
     this.message = [];
     this.error = [];
     this.posted = 0; // request batches posted
-    this.results = []; // { at, handler } per result, in order
+    this.sentAt = []; // the time each request batch was posted, in order
+    this.results = []; // { at, handler, colored } per result, in order
     this.waiters = []; // { resolve, reject } of drained(), woken by each result
     this.statsWaiters = []; // the same for stats(), woken by its reply
     this.failure = undefined; // set once the Worker failed: every wait rejects with it
@@ -367,7 +369,8 @@ class BenchWorker {
       }
       const t1 = now();
       if (data?.kind === undefined) {
-        this.results.push({ at: t1, handler: t1 - t0 });
+        const colored = (data.changes ?? []).some((c) => c.colors === "all" || c.colors.length > 0);
+        this.results.push({ at: t1, handler: t1 - t0, colored });
         this.#wake(this.waiters);
       }
     });
@@ -403,6 +406,7 @@ class BenchWorker {
   postMessage(msg, transfer) {
     if (Array.isArray(msg)) {
       this.posted++;
+      this.sentAt.push(now());
     }
     this.worker.postMessage(msg, transfer);
   }
@@ -669,6 +673,201 @@ async function benchWorkerDrag(label, n, cycles, opts) {
   scene.terminate();
 }
 
+// 5f. Wide-range drag (maxDistance 8): the field recompute is stepped and a stale pose is
+// dropped at a step boundary when a newer move is queued (drag-speed part A). Two terrains:
+// "9a", the pair of 5c, and "native", the terrain and touching poses of the Rust
+// `scene wide drag` bench (`crates/fast-mesh-scene/benches/scene.rs`), built here in f64.
+
+/** The Rust bench's terrain: z = sin(0.05 x) cos(0.07 y) 4 on the unit grid. */
+function nativeTerrain(n) {
+  const w = n + 1;
+  const positions = new Float64Array(3 * w * w);
+  for (let y = 0; y < w; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = 3 * (y * w + x);
+      positions[o] = x;
+      positions[o + 1] = y;
+      positions[o + 2] = Math.sin(x * 0.05) * Math.cos(y * 0.07) * 4;
+    }
+  }
+  const indices = new Uint32Array(6 * n * n);
+  let t = 0;
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const a = y * w + x;
+      indices.set([a, a + 1, a + w + 1, a, a + w + 1, a + w], t);
+      t += 6;
+    }
+  }
+  return { positions, indices, triangles: 2 * n * n, vertices: w * w };
+}
+
+/** The Rust bench's `contact_lift`: B turned by `deg` just touches A (sampled on a grid). */
+function nativeContactLift(side, deg) {
+  const r = (deg * Math.PI) / 180;
+  const s = Math.sin(r);
+  const c = Math.cos(r);
+  const mid = side / 2;
+  const step = Math.max(1, Math.ceil(side / 500));
+  const height = (x, y) => Math.sin(x * 0.05) * Math.cos(y * 0.07) * 4;
+  let lift = -Infinity;
+  for (let y = 0; y <= side; y += step) {
+    for (let x = 0; x <= side; x += step) {
+      const dx = x - mid;
+      const dy = y - mid;
+      const u = c * dx + s * dy + mid;
+      const v = side - (-s * dx + c * dy + mid);
+      if (u >= 0 && u <= side && v >= 0 && v <= side) {
+        lift = Math.max(lift, height(x, y) + height(u, v));
+      }
+    }
+  }
+  return lift;
+}
+
+/** The Rust bench's `pose`: B flipped about x, moved by (0, side, lift), turned by `deg` about the middle. */
+function nativePose(side, deg) {
+  const lift = nativeContactLift(side, deg);
+  const r = (deg * Math.PI) / 180;
+  const s = Math.sin(r);
+  const c = Math.cos(r);
+  const mid = side / 2;
+  const tx = -mid;
+  const ty = side - mid;
+  return {
+    rotation: [Math.cos(r / 2), Math.sin(r / 2), 0, 0], // Rz(deg) * Rx(pi)
+    translation: [c * tx - s * ty + mid, s * tx + c * ty + mid, lift],
+  };
+}
+
+/** The wide pair on either terrain, coloured and settled at pose 0. */
+async function wideWorkerPair(kind, n) {
+  if (kind === "9a") {
+    return workerPair(n, wide);
+  }
+  const g = nativeTerrain(n);
+  const { scene, bw } = await openWorkerScene();
+  const meshA = scene.addMesh(g.positions, g.indices);
+  const meshB = scene.addMesh(g.positions, g.indices);
+  const cache = new Map();
+  const pose = (i) => {
+    if (!cache.has(i)) {
+      cache.set(i, nativePose(n, 0.1 * i));
+    }
+    return cache.get(i);
+  };
+  scene.setPlacement(meshB, pose(0));
+  const field = scene.addDistanceField({ name: "gap", on: meshA, to: meshB, maxDistance: wide.maxDistance });
+  scene.setColoring(meshA, { field, map: "turbo", range: wide.range, below: "clamp", above: "base" });
+  await roundTrip(scene, bw);
+  return { scene, bw, meshA, meshB, pose };
+}
+
+const sleepUntil = (t) => new Promise((resolve) => setTimeout(resolve, Math.max(0, t - now())));
+
+async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 }) {
+  let t0 = now();
+  const { scene, bw, meshB, pose } = await wideWorkerPair(kind, n);
+  console.log(`worker wide drag ${label}: set up in ${fmt((now() - t0) / 1e3)} s`);
+  const mirror = new ViewMirror(scene);
+  mirror.apply(scene.commitFrame());
+  const drag = scene.drag(meshB);
+  await roundTrip(scene, bw);
+  await bw.stats();
+
+  // Lock step: one move, then wait for its colours, at poses 16, 32, 48, 0 in turn (as the
+  // Rust bench's WIDE_POSES), so every pose recolours most of A.
+  const ls = { rt: [], block: [], open: [], steps: [], colored: 0 };
+  for (let k = 1; k <= lockStep; k++) {
+    const from = bw.results.length;
+    const f0 = now();
+    drag.move(pose((16 * k) % 64));
+    mirror.apply(scene.commitFrame());
+    const results = await bw.drained(from);
+    ls.rt.push(now() - f0);
+    ls.colored += results.filter((r) => r.colored).length;
+    const st = await bw.stats();
+    const steps = chunkMs(st, "fieldStep");
+    ls.block.push(st.maxGap);
+    ls.open.push(steps[0] ?? 0);
+    ls.steps.push(steps.length);
+  }
+  const med = (xs) => fmt(stats(xs).median);
+  report(
+    `worker wide drag ${label}, lock step (one move, wait for its colours): move -> colours applied`,
+    ls.rt,
+    `; ${ls.colored} of ${lockStep} poses recoloured`,
+  );
+  console.log(
+    `  longest Worker block per pose median ${med(ls.block)} ms (max ${fmt(maxOf(ls.block))}); first field step (unit open) median ${med(ls.open)} ms; ${med(ls.steps)} field steps per pose`,
+  );
+
+  // Continuous drag: a move every 1000/hz ms for `seconds`, whatever the Worker is doing,
+  // turning B through the 64 poses and back. Results arrive one per batch, in order; the
+  // results that recolour A are the poses that completed, the rest were dropped as stale.
+  const period = 1000 / hz;
+  const frames = Math.round((seconds * 1000) / period);
+  const first = bw.results.length;
+  const firstSent = bw.sentAt.length;
+  const probe = new Probe();
+  probe.start();
+  const main = [];
+  t0 = now();
+  for (let k = 0; k < frames; k++) {
+    await sleepUntil(t0 + k * period);
+    const f0 = now();
+    const i = k % 128;
+    drag.move(pose(i < 64 ? i : 127 - i));
+    mirror.apply(scene.commitFrame());
+    main.push(now() - f0);
+  }
+  const lastSent = bw.sentAt[bw.sentAt.length - 1];
+  // The pointer is released right after the last move: the drag's end drops a recompute
+  // kept by the starvation guard, so the last pose follows within one recompute.
+  drag.end();
+  mirror.apply(scene.commitFrame());
+  const results = await bw.drained(first);
+  const settled = now();
+  mirror.apply(scene.commitFrame());
+  const mainBlock = await probe.stop();
+  const st = await bw.stats();
+  const sent = bw.sentAt.slice(firstSent);
+  const lag = []; // move sent -> its colours applied, for every pose that completed
+  let backlog = 0; // the most batches posted but not yet answered, seen at a result
+  results.forEach((r, k) => {
+    backlog = Math.max(backlog, sent.filter((s) => s < r.at).length - k - 1);
+    if (r.colored) {
+      lag.push(r.at - sent[k]);
+    }
+  });
+  const steps = chunkMs(st, "fieldStep");
+  console.log(
+    `worker wide drag ${label}, continuous ${hz} Hz drag for ${seconds} s: ${frames} moves, ${lag.length} poses recoloured, ${chunkMs(st, "fieldStepAbandon").length} units abandoned`,
+  );
+  report(`  move -> colours applied, per recoloured pose`, lag);
+  // The update interval while the drag lasts: the time between two results that recolour
+  // A, both before the last move (with the starvation guard, about guard + one recompute).
+  const updates = results.filter((r) => r.colored && r.at <= lastSent).map((r) => r.at);
+  report(
+    `  update interval during the drag (${updates.length} updates before the last move)`,
+    updates.slice(1).map((at, k) => at - updates[k]),
+  );
+  // The last pose's colours are applied with the result of the last move's batch, or of the
+  // end's batch when that one ran the unit; either way the later of the two that recolours.
+  // When the last pose's colours equal the ones shown (the drag path revisits poses), neither
+  // recolours, and the last move's result marks when they were current.
+  const tail = results.slice(-2);
+  const final = tail.findLast((r) => r.colored) ?? tail[0];
+  console.log(
+    `  last move (then release) -> its colours applied ${fmt(final.at - lastSent)} ms (recoloured: ${final.colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
+  );
+  console.log(
+    `  most batches waiting for a result ${backlog}; longest field step ${fmt(maxOf(steps))} ms, longest Worker block ${fmt(st.maxGap)} ms; main thread per frame median ${med(main)} ms, longest main block ${fmt(mainBlock)} ms`,
+  );
+  await roundTrip(scene, bw);
+  scene.terminate();
+}
+
 // 5d. The longest single requests: one edit with several dependent fields, a section over several meshes.
 async function benchWorkerLongRequests(label, n, edits) {
   const { scene, bw, meshA, meshB } = await workerPair(n, { maxDistance: 0.08, range: [-0.08, 0] });
@@ -811,20 +1010,33 @@ async function benchWorkerManySmall(label, calls, rounds) {
 console.log(`node ${process.version}, ${process.platform} ${process.arch}${quick ? " (quick)" : ""}`);
 const contact = { maxDistance: 0.08, range: [-0.08, 0] }; // as the Rust drag bench
 const wide = { maxDistance: 8, range: [0, 6] }; // every vertex of the dragged pair is in range
+if (onlyWorker && onlyWide) {
+  await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
+  await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
+  if (with10m) {
+    await benchWorkerWideDrag("10M, 9a terrain", "9a", 2236, { lockStep: 4, seconds: 30 });
+    await benchWorkerWideDrag("10M, native terrain", "native", 2236, { lockStep: 4, seconds: 30 });
+  }
+  process.exit(0);
+}
 if (onlyWorker) {
   await benchWorkerAdd("1M", 708, quick ? 3 : 7);
   await benchWorkerToggle("1M contact", 708, quick ? 10 : 20, contact);
   await benchWorkerToggle("1M wide", 708, quick ? 10 : 20, wide);
   await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
   if (!quick) {
-    await benchWorkerDrag("1M wide", 708, 1, wide); // 64 poses of about 0.4 s each, plus a warm-up cycle
+    await benchWorkerDrag("1M wide", 708, 1, wide); // 64 poses, plus a warm-up cycle
   }
+  await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
+  await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
   await benchWorkerLongRequests("1M", 708, quick ? 4 : 10);
   await benchWorkerManySmall("small requests", 1000, quick ? 5 : 20);
   if (with10m) {
     await benchWorkerAdd("10M", 2236, 1);
     await benchWorkerToggle("10M contact", 2236, 6, contact);
     await benchWorkerDrag("10M contact", 2236, 1, contact);
+    await benchWorkerWideDrag("10M, 9a terrain", "9a", 2236, { lockStep: 4, seconds: 30 });
+    await benchWorkerWideDrag("10M, native terrain", "native", 2236, { lockStep: 4, seconds: 30 });
   }
   process.exit(0);
 }

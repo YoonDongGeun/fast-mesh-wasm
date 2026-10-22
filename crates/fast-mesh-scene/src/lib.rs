@@ -89,7 +89,7 @@ pub use fast_mesh_fields::{
 };
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
-pub use fields::{Coloring, DistanceField, FieldStatus};
+pub use fields::{Coloring, DistanceField, FieldBudget, FieldStatus, StepState};
 pub use id::MeshId;
 pub use placement::Placement;
 pub use query::{

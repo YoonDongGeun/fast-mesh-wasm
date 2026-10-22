@@ -63,6 +63,7 @@ impl Scene {
         filter: &ContactFilter,
         out: &mut Vec<Contact>,
     ) -> Result<usize> {
+        self.drop_field_unit();
         let start = out.len();
         let found = self.find_contacts_into(margin, filter, out);
         if found.is_err() {

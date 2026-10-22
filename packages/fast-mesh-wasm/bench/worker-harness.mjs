@@ -12,6 +12,10 @@
 // The bench asks for the numbers with the message `{ benchStats: true }`
 // (never a request batch) and gets `{ kind: "benchStats", chunks, maxGap }`
 // back, after which both probes start again.
+//
+// The engine yields with `setImmediate` in Node (a chain of `MessageChannel`
+// ticks lets no `parentPort` message in there), so batches sent during a long
+// recompute arrive between its steps, as in a browser Worker.
 import { parentPort } from "node:worker_threads";
 import "../dist/node.js";
 import { serveEngine } from "../dist/worker-engine.js";

@@ -21,6 +21,13 @@
 //!   its triangles changed, the vertices whose "used by a triangle" state
 //!   flipped.
 //!
+//! When the near search would list more than [`NEAR_PAIRS_PER_SLOT`] pairs
+//! of triangles per vertex slot of A, it is abandoned and every vertex is
+//! recomputed instead: at a wide `max_distance` each triangle of A is near
+//! hundreds of B's, and listing the pairs costs far more than the
+//! recompute. Recomputing a vertex outside the near set gives it the value
+//! it already holds, so the values, colours and reports are the same.
+//!
 //! A vertex's value depends only on its own position and on B, so nothing
 //! else can change. Rebuilding B's sign data after an edit of B can flip
 //! signs only of finite values, which the near set covers. This relies on
@@ -32,6 +39,14 @@
 //! the `parallel` feature when there is enough work, then applied in field
 //! order. Values, colours and reports are the same, bit for bit, as when
 //! each field is updated alone in turn.
+//!
+//! **Stepped updates** ([`Scene::field_step`]) run the same parts: the due
+//! Eager fields are prepared and their candidates picked when the unit
+//! opens, the candidates' values are computed a few at a time over later
+//! calls, and the fields are applied together after the last. No value,
+//! colour, report or hook is written before that, so dropping the unit
+//! leaves none behind (the BVHs and sign data opening it brought up to date
+//! stay so, as after a query).
 
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignData, SignMode, SignStatus, color_of, signed_distances,
@@ -112,6 +127,20 @@ fn oom() -> SceneError {
 /// 2.4 times faster.
 const PAR_MIN_FIELD_WORK: usize = 12 * 1024;
 
+/// Near pairs of triangles per vertex slot of A beyond which a field's near
+/// search is abandoned for recomputing every vertex (see the module docs).
+///
+/// Measured on the i5-13600K with two 1M-triangle terrains, B flipped over
+/// A: a near pair costs about 70 ns to find, and recomputing every vertex
+/// about 450 ms (0.9 µs a slot) at `max_distance` 8, where the search finds
+/// hundreds of pairs per slot and took 14 s. At one pair per slot, an
+/// abandoned search wastes about 8% of the recompute that replaces it. The
+/// contact drag (`max_distance` 0.08) and the many-mesh drags (0.5 between
+/// 30k-triangle terrains) stay under the limit and keep the near search;
+/// a quarter of a pair per slot already sends the latter to the slower
+/// recompute.
+const NEAR_PAIRS_PER_SLOT: usize = 1;
+
 /// A due field whose meshes are prepared: what its update recomputes.
 struct FieldJob {
     /// The field's index.
@@ -128,6 +157,9 @@ struct FieldJob {
     near_margin: Option<f64>,
     /// From B's local space into A's, as the pair queries take it.
     b_to_a: Rigid,
+    /// The most near pairs the near search may list (see
+    /// [`NEAR_PAIRS_PER_SLOT`]), decided here on the caller's thread.
+    near_limit: usize,
     /// An estimate of the update's cost, in elements: every vertex slot of
     /// A when all are recomputed; otherwise the known candidates, plus A's
     /// triangle count for the near search (which usually costs the most)
@@ -150,6 +182,79 @@ struct FieldPlan {
     /// Points the kernel ran on.
     #[cfg_attr(not(test), allow(dead_code))]
     recomputed: usize,
+    /// The near search passed its limit, and every vertex was recomputed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    aborted: bool,
+}
+
+/// The vertices a field's update recomputes, chosen without writing
+/// anything (see the module docs).
+#[derive(Default)]
+struct Pick {
+    /// The vertices to recompute, ascending.
+    candidates: Vec<VertexId>,
+    /// Every vertex is recomputed.
+    all: bool,
+    /// The near search passed its limit.
+    aborted: bool,
+}
+
+/// How much one [`Scene::field_step`](crate::Scene::field_step) computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldBudget {
+    /// Up to this many candidate vertices (at least one), counted across
+    /// the unit's fields in field order.
+    Points(usize),
+}
+
+/// Where the field step unit stands after
+/// [`Scene::field_step`](crate::Scene::field_step).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StepState {
+    /// No Eager field was due, so no unit was opened.
+    Idle,
+    /// A unit is open, with candidates left to compute.
+    Pending,
+    /// This step computed the unit's last candidates and applied it.
+    Done,
+}
+
+/// A field of an open step unit.
+struct UnitField {
+    job: FieldJob,
+    /// Taken by `plan` once every value is computed.
+    pick: Pick,
+    /// The values of the candidates computed so far, in candidate order.
+    values: Vec<f32>,
+    /// Points the kernel ran on so far.
+    recomputed: usize,
+    /// The field's new state, once every value is computed; stays `None`
+    /// for a field whose computation failed, which is then not applied.
+    plan: Option<FieldPlan>,
+}
+
+/// The Eager fields due at one state of the scene, stepped as one unit
+/// (see [`Scene::field_step`](crate::Scene::field_step)). It holds field
+/// indices and computed values only, so any change to the scene must drop
+/// it first.
+pub(crate) struct FieldUnit {
+    fields: Vec<UnitField>,
+    /// The first field with values left to compute.
+    next: usize,
+    /// The error of the first field, in field order, that failed (when the
+    /// unit opened or since), with that field's index.
+    error: Option<(usize, SceneError)>,
+}
+
+impl FieldUnit {
+    /// Records the error of field `i`, keeping the first in field order.
+    fn fail(&mut self, i: usize, e: SceneError) {
+        if self.error.as_ref().is_none_or(|(j, _)| i < *j) {
+            self.error = Some((i, e));
+        }
+    }
 }
 
 /// What happened to one mesh of a field since the field's last update.
@@ -294,6 +399,7 @@ impl Scene {
     /// Manual mesh; a BVH, field or memory error. The scene is unchanged on
     /// error.
     pub fn add_distance_field(&mut self, desc: DistanceField) -> Result<FieldId> {
+        self.drop_field_unit();
         self.entry(desc.on)?;
         self.entry(desc.to)?;
         if desc.on == desc.to {
@@ -366,6 +472,7 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn remove_field(&mut self, id: FieldId) -> Result<()> {
+        self.drop_field_unit();
         let i = self.field_index(id)?;
         self.detach_field(i);
         Ok(())
@@ -385,6 +492,7 @@ impl Scene {
     /// date with [`Scene::update`]. Every field is still attempted; those
     /// that failed stay stale and keep their pending changes.
     pub fn update_fields(&mut self) -> Result<()> {
+        self.drop_field_unit();
         self.run_fields(|_| true, None)
     }
 
@@ -427,6 +535,7 @@ impl Scene {
     /// rule is invalid (see [`ColorRule::validate`]). The scene is unchanged
     /// on error.
     pub fn set_coloring(&mut self, mesh: MeshId, coloring: Option<Coloring>) -> Result<()> {
+        self.drop_field_unit();
         self.entry(mesh)?;
         let state = match coloring {
             None => None,
@@ -508,6 +617,18 @@ impl Scene {
         want: impl Fn(UpdateMode) -> bool,
         touched: Option<&[MeshId]>,
     ) -> Result<()> {
+        let due = self.due_fields(want, touched)?;
+        self.update_due(&due)
+    }
+
+    /// The indices of the fields that are not current, whose mesh's mode
+    /// passes `want`, and (with `touched`) that involve one of those
+    /// meshes, ascending.
+    fn due_fields(
+        &self,
+        want: impl Fn(UpdateMode) -> bool,
+        touched: Option<&[MeshId]>,
+    ) -> Result<Vec<usize>> {
         let mut due = Vec::new();
         for i in 0..self.fields.len() {
             let (on, to) = (self.fields[i].desc.on, self.fields[i].desc.to);
@@ -521,13 +642,236 @@ impl Scene {
             due.try_reserve(1).map_err(|_| oom())?;
             due.push(i);
         }
-        self.update_due(&due)
+        Ok(due)
     }
 
     /// Updates the Eager fields involving `touched` (all with `None`).
-    /// Failures are swallowed: the field stays stale (§11.2).
+    /// Failures are swallowed: the field stays stale (§11.2). With
+    /// [`Scene::set_defer_fields`] on, does nothing: the fields stay due.
     pub(crate) fn run_eager_fields(&mut self, touched: Option<&[MeshId]>) {
+        if self.defer_fields {
+            return;
+        }
         let _ = self.run_fields(|m| m == UpdateMode::Eager, touched);
+    }
+
+    /// Defers Eager field updates: with `on`, the edits, placement changes,
+    /// undos, redos, cancels and [`Scene::update`] calls that would update
+    /// the Eager fields involving a mesh leave them due instead, for
+    /// [`Scene::field_step`] (or [`Scene::update_fields`] or
+    /// [`Scene::flush`]) to bring up to date. Registering a field on an
+    /// Eager mesh still computes it at once. Leaves an open step unit open.
+    ///
+    /// Turning it off does not bring fields that are already due up to
+    /// date: they wait for the next change involving their meshes, or for
+    /// [`Scene::field_step`], [`Scene::update_fields`] or [`Scene::flush`].
+    pub fn set_defer_fields(&mut self, on: bool) {
+        self.defer_fields = on;
+    }
+
+    /// Computes part of the Eager fields that are due, so that a long
+    /// update can be spread over several calls (a Worker yields between
+    /// them).
+    ///
+    /// The first call opens a unit: it takes every due field on an Eager
+    /// mesh (as an Eager update would), brings what each reads up to date
+    /// (BVHs, sign data) and chooses the vertices each recomputes, including
+    /// the near search (see the module docs). That part is not divided.
+    /// Every call, the first included, then computes the values of up to
+    /// `budget` of those vertices, across the unit's fields in field order,
+    /// writing nothing. The call that computes the last ones applies every
+    /// field of the unit together and returns [`StepState::Done`]: values,
+    /// colours and reports are then the same, bit for bit, as from
+    /// [`Scene::update_fields`] at the state the unit opened at.
+    ///
+    /// Any other `&mut self` call on the scene drops an open unit first
+    /// (see [`Scene::abandon_field_step`]), except
+    /// [`Scene::abandon_field_step`] and [`Scene::set_defer_fields`].
+    ///
+    /// Opening a unit is the one part that leaves a trace when the unit is
+    /// then abandoned: the BVHs it brought up to date stay refitted and the
+    /// sign data it rebuilt stays rebuilt, as after any query that needs
+    /// them. No value, colour, report or pending change depends on whether
+    /// that happened.
+    ///
+    /// # Errors
+    /// Errors are isolated per field, as in [`Scene::update_fields`]: a
+    /// field that fails, when the unit opens (for example
+    /// [`SceneError::StaleBvh`] for a stale Manual mesh) or while its values
+    /// are computed, is dropped from the unit and stays stale and due, as
+    /// after a failed Eager update. The other fields go on, and the call
+    /// that applies them returns the first error in field order instead of
+    /// [`StepState::Done`]. When no due field can be opened, the first
+    /// error is returned and no unit is opened.
+    pub fn field_step(&mut self, budget: FieldBudget) -> Result<StepState> {
+        let FieldBudget::Points(points) = budget;
+        let mut unit = match self.field_unit.take() {
+            Some(unit) => unit,
+            None => match self.open_field_unit()? {
+                Some(unit) => unit,
+                None => return Ok(StepState::Idle),
+            },
+        };
+        self.advance_field_unit(&mut unit, points.max(1));
+        if unit.next < unit.fields.len() {
+            self.field_unit = Some(unit);
+            return Ok(StepState::Pending);
+        }
+        for f in unit.fields {
+            // A field that failed has no plan.
+            if let Some(plan) = f.plan {
+                let i = f.job.i;
+                // Fails only when the field's channel or mesh is missing.
+                if let Err(e) = self.apply_field(f.job, plan) {
+                    unit.error = unit.error.filter(|(j, _)| *j < i).or(Some((i, e)));
+                }
+            }
+        }
+        match unit.error {
+            Some((_, e)) => Err(e),
+            None => Ok(StepState::Done),
+        }
+    }
+
+    /// Drops the open step unit, if any: nothing it computed is written or
+    /// reported, and its fields stay due. Does nothing when no unit is
+    /// open. What opening the unit brought up to date (BVHs, sign data)
+    /// stays so; see [`Scene::field_step`].
+    pub fn abandon_field_step(&mut self) {
+        self.drop_field_unit();
+    }
+
+    /// Whether a step unit is open (see [`Scene::field_step`]).
+    pub fn field_step_pending(&self) -> bool {
+        self.field_unit.is_some()
+    }
+
+    /// The meshes the fields of the open step unit are on and measured to,
+    /// each once, in field order; empty when no unit is open. A change to
+    /// any of them makes the unit stale.
+    pub fn field_step_meshes(&self) -> Vec<MeshId> {
+        let mut meshes = Vec::new();
+        for f in self.field_unit.iter().flat_map(|u| &u.fields) {
+            let desc = &self.fields[f.job.i].desc;
+            for m in [desc.on, desc.to] {
+                if !meshes.contains(&m) {
+                    meshes.push(m);
+                }
+            }
+        }
+        meshes
+    }
+
+    /// Drops the open step unit, if any. Every public `&mut self` method of
+    /// the scene but the step calls starts with this, as a unit holds field
+    /// indices and values computed from the scene as it was. A new public
+    /// `&mut self` method must call it first too, and join the list in the
+    /// test `mutating_calls_abandon_open_unit`.
+    pub(crate) fn drop_field_unit(&mut self) {
+        self.field_unit = None;
+    }
+
+    /// The candidates of the open step unit left to compute.
+    #[cfg(test)]
+    pub(crate) fn field_step_left(&self) -> usize {
+        self.field_unit.as_ref().map_or(0, |u| {
+            u.fields[u.next..]
+                .iter()
+                .map(|f| f.pick.candidates.len() - f.values.len())
+                .sum()
+        })
+    }
+
+    /// Opens a step unit over the due Eager fields: prepares each and picks
+    /// its candidates, leaving out (with their errors) those that fail.
+    /// `None` when no field is due; the first error when none opens.
+    fn open_field_unit(&mut self) -> Result<Option<FieldUnit>> {
+        let due = self.due_fields(|m| m == UpdateMode::Eager, None)?;
+        if due.is_empty() {
+            return Ok(None);
+        }
+        let mut unit = FieldUnit {
+            fields: Vec::new(),
+            next: 0,
+            error: None,
+        };
+        let mut jobs = Vec::new();
+        jobs.try_reserve_exact(due.len()).map_err(|_| oom())?;
+        for &i in &due {
+            match self.prepare_field(i) {
+                Ok(job) => jobs.push(job),
+                Err(e) => unit.fail(i, e),
+            }
+        }
+        // Picking is the near search, which can be long: in parallel across
+        // fields as in `compute_fields`. A field's error is its own result.
+        let threshold = field_threshold(jobs.iter());
+        let picks = par::map_chunks(&jobs, 1, threshold, oom, |_, chunk| {
+            Ok(self.pick_candidates(&chunk[0]))
+        })?;
+        unit.fields
+            .try_reserve_exact(jobs.len())
+            .map_err(|_| oom())?;
+        for (job, pick) in jobs.into_iter().zip(picks) {
+            let pick = match pick {
+                Ok(pick) => pick,
+                Err(e) => {
+                    unit.fail(job.i, e);
+                    continue;
+                }
+            };
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(pick.candidates.len())
+                .map_err(|_| oom())?;
+            unit.fields.push(UnitField {
+                job,
+                pick,
+                values,
+                recomputed: 0,
+                plan: None,
+            });
+        }
+        if unit.fields.is_empty() {
+            return Err(unit.error.map_or(SceneError::Corrupted, |(_, e)| e));
+        }
+        Ok(Some(unit))
+    }
+
+    /// Computes the values of up to `left` more candidates of `unit`, in
+    /// field order, and the plan of each field whose values are all
+    /// computed (a field without candidates costs none of `left`). A field
+    /// that fails is dropped from the unit, its error recorded: it gets no
+    /// plan, and its candidates left cost nothing.
+    fn advance_field_unit(&self, unit: &mut FieldUnit, mut left: usize) {
+        while let Some(f) = unit.fields.get_mut(unit.next) {
+            let (done, total) = (f.values.len(), f.pick.candidates.len());
+            let mut computed = Ok(());
+            if done < total {
+                if left == 0 {
+                    break;
+                }
+                let end = done + left.min(total - done);
+                let run = &f.pick.candidates[done..end];
+                computed = self
+                    .compute_values(&f.job, run, &mut f.values)
+                    .map(|n| f.recomputed += n);
+                left -= end - done;
+                if computed.is_ok() && end < total {
+                    break;
+                }
+            }
+            let pick = std::mem::take(&mut f.pick);
+            let values = std::mem::take(&mut f.values);
+            let plan =
+                computed.and_then(|()| self.finish_field(&f.job, pick, values, f.recomputed));
+            let i = f.job.i;
+            match plan {
+                Ok(plan) => f.plan = Some(plan),
+                Err(e) => unit.fail(i, e),
+            }
+            unit.next += 1;
+        }
     }
 
     /// Removes the fields on `mesh` or measured to it.
@@ -738,6 +1082,7 @@ impl Scene {
             changes,
             near_margin,
             b_to_a,
+            near_limit: near_pair_limit(ma.vertex_slots()),
             work,
         })
     }
@@ -751,16 +1096,7 @@ impl Scene {
     /// `OutOfMemory` when the per-job results cannot be allocated; every
     /// field then stays as it was.
     fn compute_fields(&self, jobs: &[(usize, FieldJob)]) -> Result<Vec<Result<FieldPlan>>> {
-        let work: usize = jobs.iter().map(|(_, job)| job.work).sum();
-        let parallel = work >= PAR_MIN_FIELD_WORK
-            && jobs.len() > 1
-            && par::enabled()
-            && !par::force_sequential();
-        #[cfg(test)]
-        if parallel {
-            counter::add_parallel();
-        }
-        let threshold = if parallel { 0 } else { usize::MAX };
+        let threshold = field_threshold(jobs.iter().map(|(_, job)| job));
         // Chunks of one job; a field's error is its own result.
         par::map_chunks(jobs, 1, threshold, oom, |_, chunk| {
             Ok(self.compute_field(&chunk[0].1))
@@ -770,38 +1106,52 @@ impl Scene {
     /// Computes the new values of a prepared field and what changes with
     /// them, reading the meshes only: the vertices to recompute (searching
     /// A's triangles near B when needed), their distances, and the field's
-    /// new bookkeeping.
+    /// new bookkeeping. A step unit runs the same three parts, the middle
+    /// one in pieces.
     fn compute_field(&self, job: &FieldJob) -> Result<FieldPlan> {
+        let pick = self.pick_candidates(job)?;
+        let mut values = Vec::with_capacity(pick.candidates.len());
+        let recomputed = self.compute_values(job, &pick.candidates, &mut values)?;
+        self.finish_field(job, pick, values, recomputed)
+    }
+
+    /// The vertices a prepared field's update recomputes, reading the
+    /// meshes only.
+    fn pick_candidates(&self, job: &FieldJob) -> Result<Pick> {
         let f = &self.fields[job.i];
         let (ea, eb) = (self.entry(f.desc.on)?, self.entry(f.desc.to)?);
         let ma = &ea.mesh;
-        let md = f.desc.max_distance;
         let slots = ma.vertex_slots();
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
 
+        // A's triangles near B, as `Scene::triangles_near` (with the BVHs
+        // `prepare_field` brought up to date), unless there are too many
+        // pairs: then every vertex is recomputed.
+        let mut near = Vec::new();
+        let mut all = job.full;
+        let mut aborted = false;
+        if let Some(margin) = job.near_margin.filter(|_| !all) {
+            aborted = !fast_mesh_query::triangles_near_limited(
+                ma,
+                &ea.bvh,
+                &eb.mesh,
+                &eb.bvh,
+                &job.b_to_a,
+                round_up(margin),
+                job.near_limit,
+                &mut near,
+            )?;
+            all = aborted;
+        }
+
         // The vertices to recompute, ascending.
-        let candidates: Vec<VertexId> = if job.full {
+        let candidates: Vec<VertexId> = if all {
             (0..slots as VertexId).collect()
         } else {
             let mut c = Vec::new();
-            if let Some(margin) = job.near_margin {
-                // As `Scene::triangles_near`, with the BVHs `prepare_field`
-                // brought up to date.
-                let (mut near, mut near_b) = (Vec::new(), Vec::new());
-                fast_mesh_query::triangles_near(
-                    ma,
-                    &ea.bvh,
-                    &eb.mesh,
-                    &eb.bvh,
-                    &job.b_to_a,
-                    round_up(margin),
-                    &mut near,
-                    &mut near_b,
-                )?;
-                for &t in &near {
-                    if let Some(tri) = ma.triangle(t) {
-                        c.extend_from_slice(&tri);
-                    }
+            for &t in &near {
+                if let Some(tri) = ma.triangle(t) {
+                    c.extend_from_slice(&tri);
                 }
             }
             if job.geometric {
@@ -824,12 +1174,39 @@ impl Scene {
             c.dedup();
             c
         };
+        Ok(Pick {
+            candidates,
+            all,
+            aborted,
+        })
+    }
+
+    /// Appends the new values of `candidates`, a run of a prepared field's
+    /// candidates, to `values`, reading the meshes only. Every value
+    /// depends only on its own vertex, so computing the candidates in runs
+    /// gives the same bits as all at once. Returns the points the kernel
+    /// ran on.
+    fn compute_values(
+        &self,
+        job: &FieldJob,
+        candidates: &[VertexId],
+        values: &mut Vec<f32>,
+    ) -> Result<usize> {
+        let f = &self.fields[job.i];
+        let (ea, eb) = (self.entry(f.desc.on)?, self.entry(f.desc.to)?);
+        let ma = &ea.mesh;
+        let md = f.desc.max_distance;
+        let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
+        #[cfg(test)]
+        if counter::fails(f.id) {
+            return Err(oom());
+        }
 
         // A's points in B's local space, in f64 then rounded to f32 (§5.2).
         let xf = job.b_to_a.inverse();
         let mut ids = Vec::new();
         let mut points = Vec::new();
-        for &v in &candidates {
+        for &v in candidates {
             if let Some(p) = ma.position(v).filter(|_| defined(v)) {
                 ids.push(v);
                 points.push(xf.apply(p).map(|c| c as f32));
@@ -838,11 +1215,8 @@ impl Scene {
         let mut out = vec![0.0f32; points.len()];
         signed_distances(&eb.mesh, &eb.bvh, &f.sign, &points, round_up(md), &mut out)?;
 
-        let old = ma.channel(&f.channel).ok_or(SceneError::Corrupted)?;
-        let mut values = Vec::with_capacity(candidates.len());
-        let mut changed = Vec::new();
         let mut k = 0;
-        for &v in &candidates {
+        for &v in candidates {
             let x = if ids.get(k) == Some(&v) {
                 let d = out[k];
                 k += 1;
@@ -855,11 +1229,41 @@ impl Scene {
             } else {
                 f32::NAN
             };
-            if old.get(v as usize).map(|o| o.to_bits()) != Some(x.to_bits()) {
-                changed.push(v);
-            }
             values.push(x);
         }
+        Ok(points.len())
+    }
+
+    /// The new state of a prepared field from its candidates and their new
+    /// `values` (in candidate order): what changed, and the field's new
+    /// bookkeeping. Reads the meshes only.
+    fn finish_field(
+        &self,
+        job: &FieldJob,
+        pick: Pick,
+        values: Vec<f32>,
+        recomputed: usize,
+    ) -> Result<FieldPlan> {
+        let f = &self.fields[job.i];
+        let ma = &self.entry(f.desc.on)?.mesh;
+        let slots = ma.vertex_slots();
+        let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
+        let Pick {
+            candidates,
+            all,
+            aborted,
+        } = pick;
+        if values.len() != candidates.len() {
+            return Err(SceneError::Corrupted);
+        }
+
+        let old = ma.channel(&f.channel).ok_or(SceneError::Corrupted)?;
+        let changed: Vec<VertexId> = candidates
+            .iter()
+            .zip(&values)
+            .filter(|&(&v, x)| old.get(v as usize).map(|o| o.to_bits()) != Some(x.to_bits()))
+            .map(|(&v, _)| v)
+            .collect();
         let referenced = (job.full || job.topology || f.referenced.len() != slots)
             .then(|| (0..slots as VertexId).map(defined).collect::<Vec<bool>>());
         let finite: Vec<VertexId> = {
@@ -868,7 +1272,7 @@ impl Scene {
                 .zip(&values)
                 .filter(|(_, x)| x.is_finite())
                 .map(|(&v, _)| v);
-            if job.full {
+            if all {
                 now.collect()
             } else {
                 let mut kept: Vec<VertexId> = f
@@ -888,7 +1292,8 @@ impl Scene {
             changed,
             referenced,
             finite,
-            recomputed: points.len(),
+            recomputed,
+            aborted,
         })
     }
 
@@ -897,7 +1302,10 @@ impl Scene {
     /// mesh is missing.
     fn apply_field(&mut self, job: FieldJob, plan: FieldPlan) -> Result<()> {
         #[cfg(test)]
-        counter::add(plan.recomputed);
+        {
+            counter::add(plan.recomputed);
+            counter::add_aborted(plan.aborted);
+        }
         let i = job.i;
         let (id, on, to) = (
             self.fields[i].id,
@@ -934,17 +1342,76 @@ impl Scene {
     }
 }
 
+/// The [`par::map_chunks`] threshold for computing `jobs` one field per
+/// task: 0 (in parallel) with the `parallel` feature when there are several
+/// and their work adds up to [`PAR_MIN_FIELD_WORK`] or more, else
+/// `usize::MAX`.
+fn field_threshold<'a>(jobs: impl Iterator<Item = &'a FieldJob>) -> usize {
+    let (n, work) = jobs.fold((0, 0), |(n, w), job| (n + 1, w + job.work));
+    let parallel =
+        work >= PAR_MIN_FIELD_WORK && n > 1 && par::enabled() && !par::force_sequential();
+    #[cfg(test)]
+    if parallel {
+        counter::add_parallel();
+    }
+    if parallel { 0 } else { usize::MAX }
+}
+
+/// The most near pairs a field's near search may list for a mesh A of
+/// `slots` vertex slots (see [`NEAR_PAIRS_PER_SLOT`]). Called on the thread
+/// that runs the update, as the test override is per thread.
+fn near_pair_limit(slots: usize) -> usize {
+    #[cfg(test)]
+    if let Some(limit) = counter::near_limit() {
+        return limit;
+    }
+    slots.saturating_mul(NEAR_PAIRS_PER_SLOT)
+}
+
 /// Test-only counts of the vertices field updates recompute, and of the
 /// batches of fields computed in parallel.
 #[cfg(test)]
 pub(crate) mod counter {
     use std::cell::Cell;
 
-    // Both are counted on the thread that runs the update (when fields are
+    // All are counted on the thread that runs the update (when fields are
     // applied), never on the pool's threads.
     thread_local! {
         static RECOMPUTED: Cell<usize> = const { Cell::new(0) };
         static PARALLEL: Cell<usize> = const { Cell::new(0) };
+        static NEAR_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+        static ABORTED: Cell<usize> = const { Cell::new(0) };
+        static FAILING: Cell<Option<super::FieldId>> = const { Cell::new(None) };
+    }
+
+    /// Makes computing the values of `field` fail (out of memory) on this
+    /// thread; `None`: nothing fails.
+    pub(crate) fn set_failing(field: Option<super::FieldId>) {
+        FAILING.with(|c| c.set(field));
+    }
+
+    pub(crate) fn fails(field: super::FieldId) -> bool {
+        FAILING.with(Cell::get) == Some(field)
+    }
+
+    /// Counts one near search abandoned past its limit.
+    pub(crate) fn add_aborted(aborted: bool) {
+        ABORTED.with(|c| c.set(c.get() + usize::from(aborted)));
+    }
+
+    /// Near searches abandoned on this thread since the last call.
+    pub(crate) fn take_aborted() -> usize {
+        ABORTED.with(|c| c.replace(0))
+    }
+
+    /// Overrides the near-pair limit of field updates on this thread
+    /// (`None`: the production limit).
+    pub(crate) fn set_near_limit(limit: Option<usize>) {
+        NEAR_LIMIT.with(|c| c.set(limit));
+    }
+
+    pub(crate) fn near_limit() -> Option<usize> {
+        NEAR_LIMIT.with(Cell::get)
     }
 
     /// Counts `n` recomputed vertices.
@@ -2025,6 +2492,137 @@ mod tests {
         scene.update_fields().unwrap();
     }
 
+    /// Everything a renderer sees of two meshes after an update: every
+    /// field's value bits, both meshes' colours, and the drained reports.
+    type Seen = (
+        Vec<Vec<u32>>,
+        Vec<Option<Vec<[u8; 4]>>>,
+        Vec<crate::MeshChanges>,
+    );
+
+    fn seen(scene: &mut Scene, meshes: [MeshId; 2]) -> Seen {
+        let ids: Vec<FieldId> = scene.fields.iter().map(|f| f.id).collect();
+        let values = ids
+            .iter()
+            .map(|&f| bits(scene.field_values(f).unwrap()))
+            .collect();
+        let colors = meshes
+            .iter()
+            .map(|&m| scene.colors(m).unwrap().map(<[_]>::to_vec))
+            .collect();
+        (values, colors, scene.take_changes())
+    }
+
+    /// A sheet (A) and a cube (B) with a field each way, both coloured,
+    /// with random modes, signs and `max_distance`s (infinite ones too).
+    fn twin_scene(rng: &mut Lcg) -> (Scene, MeshId, MeshId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(sheet(10, 0.1), with_mode(random_mode(rng)))
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.3, 0.3, -0.2], 0.4), with_mode(random_mode(rng)))
+            .unwrap();
+        for (on, to, rule) in [(a, b, distance_rule(0.2, 0.1)), (b, a, contact_rule(0.1))] {
+            let id = scene
+                .add_distance_field(DistanceField {
+                    sign: random_sign(rng),
+                    ..field("d", on, to, random_max_distance(rng))
+                })
+                .unwrap();
+            scene
+                .set_coloring(on, Some(Coloring { field: id, rule }))
+                .unwrap();
+        }
+        (scene, a, b)
+    }
+
+    /// Runs the same random walk on two copies of a random scene, the first
+    /// with the near-pair limit `on`, the second with `off`, and asserts
+    /// after every update that both show the same values, colours and
+    /// reports, bit for bit. Returns, per round, the near searches each copy
+    /// abandoned, and whether the round has a field with a finite
+    /// `max_distance` (only those search).
+    fn assert_twins_agree(
+        seed: u64,
+        rounds: usize,
+        on: usize,
+        off: usize,
+    ) -> Vec<([usize; 2], bool)> {
+        let mut rng = Lcg(seed);
+        let mut stats = Vec::new();
+        for round in 0..rounds {
+            let state = rng.0;
+            let mut aborted = [0; 2];
+            let mut twins = [(on, Lcg(state)), (off, Lcg(state))].map(|(limit, mut r)| {
+                counter::set_near_limit(Some(limit));
+                let (scene, a, b) = twin_scene(&mut r);
+                (limit, r, scene, a, b)
+            });
+            rng.0 = twins[0].1.0;
+            let finite = twins[0]
+                .2
+                .fields
+                .iter()
+                .any(|f| f.desc.max_distance.is_finite());
+            counter::take_aborted();
+            for step in 0..30 {
+                let ops = 1 + rng.below(4);
+                let mut out = Vec::new();
+                for (k, (limit, r, scene, a, b)) in twins.iter_mut().enumerate() {
+                    counter::set_near_limit(Some(*limit));
+                    for _ in 0..ops {
+                        random_op(scene, *a, *b, r);
+                    }
+                    update_all(scene);
+                    out.push(seen(scene, [*a, *b]));
+                    aborted[k] += counter::take_aborted();
+                }
+                assert_eq!(out[0], out[1], "round {round} step {step}");
+            }
+            stats.push((aborted, finite));
+        }
+        counter::set_near_limit(None);
+        stats
+    }
+
+    #[test]
+    fn near_limit_matches_near_path() {
+        // Recomputing every vertex once there is any near pair, against
+        // always listing them.
+        let stats = assert_twins_agree(0xb0b, 12, 0, usize::MAX);
+        // The recompute path ran in every round that searches, and never
+        // without a limit.
+        let ran: Vec<bool> = stats.iter().map(|&([on, _], _)| on > 0).collect();
+        let searching: Vec<bool> = stats.iter().map(|&(_, finite)| finite).collect();
+        assert_eq!(ran, searching);
+        let off: Vec<usize> = stats.iter().map(|&([_, off], _)| off).collect();
+        assert_eq!(off, vec![0; stats.len()]);
+        assert!(
+            searching.iter().filter(|&&f| f).count() >= 10,
+            "{searching:?}"
+        );
+    }
+
+    #[test]
+    fn wide_reach_recomputes_every_vertex() {
+        let mut scene = Scene::new(SceneOptions::default());
+        // 61 x 61 = 3721 vertices, all within reach of the cube.
+        let a = scene
+            .add_mesh(sheet(60, 1.0 / 60.0), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.4, 0.4, -0.05], 0.1), MeshOptions::default())
+            .unwrap();
+        let f = scene.add_distance_field(field("d", a, b, 2.0)).unwrap();
+        scene.update_fields().unwrap();
+        counter::take();
+        scene.set_placement(b, at(0.002, 0.001, 0.0)).unwrap();
+        scene.update_fields().unwrap();
+        assert_eq!(counter::take(), 3721);
+        assert_matches(&mut scene, f);
+    }
+
     #[test]
     fn invalid_field_descs_rejected() {
         let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
@@ -2054,5 +2652,683 @@ mod tests {
             scene.derived_channel_mut(a, "field:d"),
             Err(SceneError::InvalidInput(_))
         ));
+    }
+
+    /// Steps units with `Points(budget)` until none is left, bringing stale
+    /// Manual BVHs up to date when a step asks, as [`update_all`] does.
+    /// Returns the steps that left a unit pending.
+    fn step_all(scene: &mut Scene, budget: usize) -> usize {
+        let mut pending = 0;
+        for _ in 0..1_000_000 {
+            match scene.field_step(FieldBudget::Points(budget)) {
+                Ok(StepState::Idle) => {
+                    assert!(!scene.field_step_pending());
+                    return pending;
+                }
+                Ok(StepState::Pending) => {
+                    assert!(scene.field_step_pending());
+                    pending += 1;
+                }
+                Ok(StepState::Done) => assert!(!scene.field_step_pending()),
+                Err(SceneError::StaleBvh(id)) => {
+                    assert!(!scene.field_step_pending());
+                    scene.update(id).unwrap();
+                }
+                Err(e) => panic!("field_step failed: {e}"),
+            }
+        }
+        panic!("field_step never went idle");
+    }
+
+    /// Opens a unit and steps it one candidate at a time, up to `points`
+    /// candidates but leaving at least one to compute. Returns the
+    /// candidates computed.
+    fn step_partway(scene: &mut Scene, points: usize) -> usize {
+        let state = scene.field_step(FieldBudget::Points(1)).unwrap();
+        assert_eq!(state, StepState::Pending);
+        let mut done = 1;
+        while done < points && scene.field_step_left() > 1 {
+            let state = scene.field_step(FieldBudget::Points(1)).unwrap();
+            assert_eq!(state, StepState::Pending);
+            done += 1;
+        }
+        assert!(scene.field_step_pending());
+        done
+    }
+
+    #[test]
+    fn stepped_matches_one_shot() {
+        // Four copies of each random scene, all deferring their Eager
+        // fields: three are stepped (then `update_fields` brings the Lazy
+        // and Manual fields along), the last only calls `update_fields`.
+        let budgets = [1, 37, usize::MAX];
+        let mut rng = Lcg(0x57e9);
+        let mut spread = [0usize; 3];
+        for round in 0..10 {
+            let state = rng.0;
+            let mut twins: Vec<_> = (0..4)
+                .map(|_| {
+                    let mut r = Lcg(state);
+                    let (mut scene, a, b) = twin_scene(&mut r);
+                    scene.set_defer_fields(true);
+                    scene.set_mode(a, UpdateMode::Eager).unwrap();
+                    scene.set_mode(b, UpdateMode::Eager).unwrap();
+                    update_all(&mut scene);
+                    scene.take_changes();
+                    (r, scene, a, b)
+                })
+                .collect();
+            rng.0 = twins[0].0.0;
+            for step in 0..30 {
+                let ops = 1 + rng.below(4);
+                let mut out = Vec::new();
+                for (k, (r, scene, a, b)) in twins.iter_mut().enumerate() {
+                    for _ in 0..ops {
+                        random_op(scene, *a, *b, r);
+                    }
+                    if let Some(&budget) = budgets.get(k) {
+                        spread[k] += step_all(scene, budget);
+                    }
+                    update_all(scene);
+                    out.push(seen(scene, [*a, *b]));
+                }
+                for k in 0..3 {
+                    assert_eq!(
+                        out[k], out[3],
+                        "round {round} step {step} budget {}",
+                        budgets[k]
+                    );
+                }
+            }
+        }
+        // Small budgets left units open across steps; the largest never.
+        assert!(spread[0] > spread[1] && spread[1] > 0, "{spread:?}");
+        assert_eq!(spread[2], 0);
+    }
+
+    /// [`step_all`], abandoning the unit at up to two random step
+    /// boundaries (one in five) and stepping on, which opens a new one.
+    /// Returns the units abandoned.
+    fn step_all_abandoning(scene: &mut Scene, budget: usize, rng: &mut Lcg) -> usize {
+        let mut abandoned = 0;
+        for _ in 0..1_000_000 {
+            match scene.field_step(FieldBudget::Points(budget)) {
+                Ok(StepState::Idle) => return abandoned,
+                Ok(StepState::Pending) => {
+                    if abandoned < 2 && rng.below(5) == 0 {
+                        scene.abandon_field_step();
+                        assert!(!scene.field_step_pending());
+                        abandoned += 1;
+                    }
+                }
+                Ok(StepState::Done) => {}
+                Err(SceneError::StaleBvh(id)) => scene.update(id).unwrap(),
+                Err(e) => panic!("field_step failed: {e}"),
+            }
+        }
+        panic!("field_step never went idle");
+    }
+
+    #[test]
+    fn stepped_with_abandons_matches_one_shot() {
+        // As `stepped_matches_one_shot`, with units abandoned at random step
+        // boundaries in the random walk and the stepping carried on.
+        let budgets = [1, 37];
+        let mut rng = Lcg(0xab4d);
+        let mut abandoned = [0usize; 2];
+        for round in 0..8 {
+            let state = rng.0;
+            let mut twins: Vec<_> = (0..3)
+                .map(|k| {
+                    let mut r = Lcg(state);
+                    let (mut scene, a, b) = twin_scene(&mut r);
+                    scene.set_defer_fields(true);
+                    scene.set_mode(a, UpdateMode::Eager).unwrap();
+                    scene.set_mode(b, UpdateMode::Eager).unwrap();
+                    update_all(&mut scene);
+                    scene.take_changes();
+                    // Its own generator for when to abandon, so that the
+                    // random walks stay the same.
+                    (r, Lcg(state ^ (k as u64 + 1)), scene, a, b)
+                })
+                .collect();
+            rng.0 = twins[0].0.0;
+            for step in 0..30 {
+                let ops = 1 + rng.below(4);
+                let mut out = Vec::new();
+                for (k, (r, when, scene, a, b)) in twins.iter_mut().enumerate() {
+                    for _ in 0..ops {
+                        random_op(scene, *a, *b, r);
+                    }
+                    if let Some(&budget) = budgets.get(k) {
+                        abandoned[k] += step_all_abandoning(scene, budget, when);
+                    }
+                    update_all(scene);
+                    out.push(seen(scene, [*a, *b]));
+                }
+                for k in 0..2 {
+                    assert_eq!(
+                        out[k], out[2],
+                        "round {round} step {step} budget {}",
+                        budgets[k]
+                    );
+                }
+            }
+        }
+        assert!(abandoned.iter().all(|&n| n >= 20), "{abandoned:?}");
+    }
+
+    #[test]
+    fn step_error_stays_with_its_field() {
+        let (mut scene, a, b, [fa, fb]) = deferred_pair(0.15);
+        let (mut twin, ..) = deferred_pair(0.15);
+        for s in [&mut scene, &mut twin] {
+            s.set_placement(b, turned(6.0, [0.03, 0.02, 0.01])).unwrap();
+            s.take_changes();
+        }
+        let before = bits(scene.field_values(fa).unwrap());
+        // Computing A's field fails at every step; B's goes on.
+        counter::set_failing(Some(fa));
+        let mut states = Vec::new();
+        let last = loop {
+            match scene.field_step(FieldBudget::Points(7)) {
+                Ok(StepState::Pending) => states.push(StepState::Pending),
+                other => break other,
+            }
+        };
+        counter::set_failing(None);
+        assert!(!states.is_empty());
+        assert_eq!(last, Err(SceneError::Store(StoreError::OutOfMemory)));
+        assert!(!scene.field_step_pending());
+        // A's field is left as it was, stale and due; B's field applied.
+        assert_eq!(bits(scene.field_values(fa).unwrap()), before);
+        assert!(!scene.field_status(fa).unwrap().current);
+        assert!(scene.field_status(fb).unwrap().current);
+        twin.update_fields().unwrap();
+        assert_eq!(
+            bits(scene.field_values(fb).unwrap()),
+            bits(twin.field_values(fb).unwrap())
+        );
+        let ch = scene.take_changes();
+        assert!(ch.iter().all(|c| c.id != a), "A's field reported");
+        // The next unit brings A's field along.
+        assert!(step_all(&mut scene, 7) > 0);
+        twin.take_changes();
+        assert_eq!(seen_values(&scene, [a, b]), seen_values(&twin, [a, b]));
+        // With B's field failing in a unit computed in one call, that call
+        // applies A's field and returns the error.
+        for s in [&mut scene, &mut twin] {
+            s.set_placement(b, turned(-4.0, [0.01, 0.0, 0.02])).unwrap();
+        }
+        counter::set_failing(Some(fb));
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(usize::MAX)),
+            Err(SceneError::Store(StoreError::OutOfMemory))
+        );
+        counter::set_failing(None);
+        assert!(scene.field_status(fa).unwrap().current);
+        assert!(!scene.field_status(fb).unwrap().current);
+        step_all(&mut scene, usize::MAX);
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]).0, seen(&mut twin, [a, b]).0);
+    }
+
+    #[test]
+    fn stepping_runs_parallel_paths() {
+        use fast_mesh_store::par;
+        // Two sheets of 6,561 vertices each, every vertex recomputed (an
+        // infinite max_distance): 13,122 candidates, enough to pick in
+        // parallel across the two fields and for runs of 2,048 to compute
+        // in parallel chunks.
+        let make = || {
+            let mut scene = Scene::new(SceneOptions::default());
+            let a = scene
+                .add_mesh(sheet(80, 1.0 / 80.0), MeshOptions::default())
+                .unwrap();
+            let opts = MeshOptions {
+                placement: at(0.0, 0.0, 0.05),
+                ..MeshOptions::default()
+            };
+            let b = scene.add_mesh(sheet(80, 1.0 / 80.0), opts).unwrap();
+            for (on, to) in [(a, b), (b, a)] {
+                let id = scene
+                    .add_distance_field(field("d", on, to, f64::INFINITY))
+                    .unwrap();
+                let rule = distance_rule(0.1, 0.1);
+                scene
+                    .set_coloring(on, Some(Coloring { field: id, rule }))
+                    .unwrap();
+            }
+            scene.set_defer_fields(true);
+            scene
+                .set_placement(b, turned(3.0, [0.01, 0.0, 0.04]))
+                .unwrap();
+            scene.take_changes();
+            (scene, a, b)
+        };
+        let (mut scene, a, b) = make();
+        let (mut twin, ..) = make();
+        counter::take_parallel();
+        let entries = par::parallel_entries();
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        let picked = counter::take_parallel();
+        let opened = par::parallel_entries();
+        assert_eq!(scene.field_step_left(), 13_121);
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(2048)),
+            Ok(StepState::Pending)
+        );
+        let chunked = par::parallel_entries() - opened;
+        if par::enabled() {
+            assert_eq!(picked, 1, "candidates picked sequentially");
+            assert!(opened > entries);
+            assert!(chunked > 0, "values computed sequentially");
+        } else {
+            assert_eq!((picked, chunked), (0, 0));
+        }
+        assert!(step_all(&mut scene, 2048) > 0);
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+    }
+
+    /// A sheet A and a cube B with a field each way, both coloured, Eager
+    /// meshes deferring their fields, everything current and drained.
+    fn deferred_pair(max_distance: f64) -> (Scene, MeshId, MeshId, [FieldId; 2]) {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let fa = scene
+            .add_distance_field(field("d", a, b, max_distance))
+            .unwrap();
+        let fb = scene
+            .add_distance_field(field("d", b, a, max_distance))
+            .unwrap();
+        for (m, f, rule) in [(a, fa, distance_rule(0.2, 0.1)), (b, fb, contact_rule(0.1))] {
+            scene
+                .set_coloring(m, Some(Coloring { field: f, rule }))
+                .unwrap();
+        }
+        scene.set_defer_fields(true);
+        scene.take_changes();
+        (scene, a, b, [fa, fb])
+    }
+
+    #[test]
+    fn abandon_leaves_no_trace() {
+        // 121 sheet vertices, then 8 cube vertices: partway into the first
+        // field, at its end, and into the second.
+        for md in [0.15, f64::INFINITY] {
+            for points in [1, 60, 121, 125] {
+                let at_ = format!("max_distance {md}, {points} points");
+                let (mut scene, a, b, ids) = deferred_pair(md);
+                let (mut twin, ..) = deferred_pair(md);
+                for s in [&mut scene, &mut twin] {
+                    s.set_placement(b, turned(10.0, [0.05, -0.02, 0.03]))
+                        .unwrap();
+                    s.take_changes();
+                }
+                let before = seen(&mut scene, [a, b]);
+                step_partway(&mut scene, points);
+                assert_eq!(scene.field_step_meshes(), vec![a, b], "{at_}");
+                // Reading does not abandon.
+                assert_eq!(
+                    seen_values(&scene, [a, b]),
+                    (before.0.clone(), before.1.clone())
+                );
+                assert!(scene.field_step_pending(), "{at_}");
+                scene.abandon_field_step();
+                assert!(!scene.field_step_pending(), "{at_}");
+                assert!(scene.field_step_meshes().is_empty(), "{at_}");
+                // Abandoning when idle does nothing.
+                scene.abandon_field_step();
+                assert_eq!(seen(&mut scene, [a, b]), before, "{at_}");
+                for id in ids {
+                    assert!(!scene.field_status(id).unwrap().current, "{at_}");
+                }
+                scene.update_fields().unwrap();
+                twin.update_fields().unwrap();
+                assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]), "{at_}");
+            }
+        }
+    }
+
+    /// The values and colours of [`Seen`].
+    type Shown = (Vec<Vec<u32>>, Vec<Option<Vec<[u8; 4]>>>);
+
+    /// The values and colours of [`seen`], without draining the reports.
+    fn seen_values(scene: &Scene, meshes: [MeshId; 2]) -> Shown {
+        let values = scene
+            .fields
+            .iter()
+            .map(|f| bits(scene.field_values(f.id).unwrap()))
+            .collect();
+        let colors = meshes
+            .iter()
+            .map(|&m| scene.colors(m).unwrap().map(<[_]>::to_vec))
+            .collect();
+        (values, colors)
+    }
+
+    #[test]
+    fn abandon_then_edit_matches_one_shot() {
+        let edits: [fn(&mut Scene, MeshId, MeshId); 3] = [
+            |s, a, _| {
+                s.edit(a, |tx| tx.set_positions(&[45], &[[0.5, 0.4, -0.05]]))
+                    .unwrap();
+            },
+            |s, _, b| {
+                s.edit(b, |tx| tx.set_positions(&[7], &[[0.75, 0.75, 0.25]]))
+                    .unwrap();
+            },
+            |s, a, _| {
+                s.edit(a, |tx| tx.remove_triangles(&[0, 1, 2])).unwrap();
+            },
+        ];
+        for md in [0.15, f64::INFINITY] {
+            for (e, edit) in edits.iter().enumerate() {
+                // Abandoned by hand, or by the edit itself.
+                for by_hand in [true, false] {
+                    let at_ = format!("max_distance {md}, edit {e}, by hand {by_hand}");
+                    let (mut scene, a, b, _) = deferred_pair(md);
+                    let (mut twin, ..) = deferred_pair(md);
+                    let p1 = turned(-8.0, [0.04, 0.03, 0.02]);
+                    scene.set_placement(b, p1).unwrap();
+                    step_partway(&mut scene, 70);
+                    if by_hand {
+                        scene.abandon_field_step();
+                    }
+                    edit(&mut scene, a, b);
+                    assert!(!scene.field_step_pending(), "{at_}");
+                    step_all(&mut scene, 37);
+                    twin.set_placement(b, p1).unwrap();
+                    edit(&mut twin, a, b);
+                    twin.update_fields().unwrap();
+                    assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]), "{at_}");
+                    // Nothing of P1 alone: the values are those of a fresh
+                    // computation at the final state.
+                    for m in [a, b] {
+                        scene.update(m).unwrap();
+                    }
+                    for f in scene.fields.iter().map(|f| f.id).collect::<Vec<_>>() {
+                        assert_matches(&mut scene, f);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_abandons_open_unit() {
+        let (mut scene, a, b, _) = deferred_pair(0.15);
+        let (mut twin, ..) = deferred_pair(0.15);
+        let far = MeshOptions {
+            placement: at(5.0, 0.0, 0.0),
+            ..MeshOptions::default()
+        };
+        let c = scene.add_mesh(sheet(2, 0.5), far).unwrap();
+        twin.add_mesh(sheet(2, 0.5), far).unwrap();
+        // An unrelated placement abandons the unit at P1; the unit stepped
+        // afterwards computes P1 with the new placement.
+        let p1 = turned(5.0, [0.02, 0.01, 0.0]);
+        scene.set_placement(b, p1).unwrap();
+        step_partway(&mut scene, 30);
+        scene.set_placement(c, at(6.0, 0.0, 0.0)).unwrap();
+        assert!(!scene.field_step_pending());
+        step_all(&mut scene, 37);
+        twin.set_placement(b, p1).unwrap();
+        twin.set_placement(c, at(6.0, 0.0, 0.0)).unwrap();
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+        // A newer pose of B abandons the unit at P2; the next steps compute
+        // P3.
+        let (p2, p3) = (at(0.1, 0.0, 0.05), at(-0.05, 0.02, -0.03));
+        scene.set_placement(b, p2).unwrap();
+        step_partway(&mut scene, 100);
+        scene.set_placement(b, p3).unwrap();
+        assert!(!scene.field_step_pending());
+        step_all(&mut scene, 37);
+        twin.set_placement(b, p2).unwrap();
+        twin.set_placement(b, p3).unwrap();
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+    }
+
+    /// What [`mutating_calls_abandon_open_unit`] needs of its scene.
+    struct Ctx {
+        a: MeshId,
+        b: MeshId,
+        c: MeshId,
+        field: FieldId,
+        section: crate::SectionId,
+        subscriber: crate::SubscriberId,
+    }
+
+    /// A scene whose field unit is open: a sheet A and a cube B with a
+    /// field A to B, another sheet C far away with a channel `x` and a
+    /// section, and a subscriber.
+    fn open_unit() -> (Scene, Ctx) {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let field = scene
+            .add_distance_field(field("d", a, b, f64::INFINITY))
+            .unwrap();
+        let opts = MeshOptions {
+            placement: at(5.0, 0.0, 0.0),
+            ..MeshOptions::default()
+        };
+        let c = scene.add_mesh(sheet(2, 0.5), opts).unwrap();
+        scene.add_channel(c, ChannelDesc::derived("x", 1)).unwrap();
+        let plane = crate::Plane::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        let section = scene
+            .add_section(crate::SectionDesc {
+                plane,
+                meshes: vec![c],
+                fill: false,
+            })
+            .unwrap();
+        let subscriber = scene.subscribe();
+        scene.set_defer_fields(true);
+        scene.set_placement(b, at(0.01, 0.0, 0.0)).unwrap();
+        step_partway(&mut scene, 1);
+        let ctx = Ctx {
+            a,
+            b,
+            c,
+            field,
+            section,
+            subscriber,
+        };
+        (scene, ctx)
+    }
+
+    #[test]
+    fn mutating_calls_abandon_open_unit() {
+        use crate::{ContactFilter, Plane, SceneClosestOptions, SceneRayOptions, SectionDesc};
+        type Call = fn(&mut Scene, &Ctx);
+        // Every public `&mut self` method of `Scene` but the three step
+        // calls.
+        let calls: [(&str, Call); 38] = [
+            ("add_mesh", |s, _| {
+                s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
+            }),
+            ("remove_mesh", |s, x| {
+                s.remove_mesh(x.c).unwrap();
+            }),
+            ("edit", |s, x| {
+                s.edit(x.c, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 0.1]]))
+                    .unwrap();
+            }),
+            ("begin_step", |s, _| s.begin_step()),
+            ("end_step", |s, _| {
+                let _ = s.end_step();
+            }),
+            ("cancel_step", |s, _| {
+                let _ = s.cancel_step();
+            }),
+            ("undo", |s, _| {
+                s.undo().unwrap();
+            }),
+            ("redo", |s, _| {
+                s.redo().unwrap();
+            }),
+            ("clear_history", |s, _| s.clear_history().unwrap()),
+            ("set_mode", |s, x| {
+                s.set_mode(x.c, UpdateMode::Lazy).unwrap()
+            }),
+            ("update", |s, x| s.update(x.c).unwrap()),
+            ("flush", |s, _| s.flush().unwrap()),
+            ("take_changes", |s, _| {
+                s.take_changes();
+            }),
+            ("subscribe", |s, _| {
+                s.subscribe();
+            }),
+            ("unsubscribe", |s, x| s.unsubscribe(x.subscriber).unwrap()),
+            ("take_changes_for", |s, x| {
+                s.take_changes_for(x.subscriber).unwrap();
+            }),
+            ("add_channel", |s, x| {
+                s.add_channel(x.c, ChannelDesc::derived("y", 1)).unwrap();
+            }),
+            ("remove_channel", |s, x| {
+                s.remove_channel(x.c, "x").unwrap();
+            }),
+            ("derived_channel_mut", |s, x| {
+                s.derived_channel_mut(x.c, "x").unwrap();
+            }),
+            ("compact", |s, x| {
+                s.compact(x.c).unwrap();
+            }),
+            ("set_placement", |s, x| {
+                s.set_placement(x.c, at(6.0, 0.0, 0.0)).unwrap();
+            }),
+            ("add_distance_field", |s, x| {
+                s.add_distance_field(field("e", x.c, x.b, 0.1)).unwrap();
+            }),
+            ("remove_field", |s, x| s.remove_field(x.field).unwrap()),
+            ("update_fields", |s, _| s.update_fields().unwrap()),
+            ("set_coloring", |s, x| s.set_coloring(x.c, None).unwrap()),
+            ("set_normals", |s, x| s.set_normals(x.c, true).unwrap()),
+            ("raycast", |s, _| {
+                let opts = SceneRayOptions::default();
+                s.raycast([0.5, 0.5, 1.0], [0.0, 0.0, -1.0], &opts).unwrap();
+            }),
+            ("closest_point", |s, _| {
+                let opts = SceneClosestOptions::default();
+                s.closest_point([0.5, 0.5, 1.0], &opts).unwrap();
+            }),
+            ("closest_point_on", |s, x| {
+                let opts = SceneClosestOptions::default();
+                s.closest_point_on(x.c, [0.5, 0.5, 1.0], &opts).unwrap();
+            }),
+            ("intersects", |s, x| {
+                s.intersects(x.c, x.b).unwrap();
+            }),
+            ("mesh_distance", |s, x| {
+                s.mesh_distance(x.c, x.b, 0.1).unwrap();
+            }),
+            ("triangles_near", |s, x| {
+                let (mut ta, mut tb) = (Vec::new(), Vec::new());
+                s.triangles_near(x.c, x.b, 0.1, &mut ta, &mut tb).unwrap();
+            }),
+            ("find_contacts", |s, _| {
+                s.find_contacts(0.1, &ContactFilter::default(), &mut Vec::new())
+                    .unwrap();
+            }),
+            ("add_section", |s, x| {
+                let plane = Plane::new([0.0, 0.0, 0.1], [0.0, 0.0, 1.0]).unwrap();
+                let desc = SectionDesc {
+                    plane,
+                    meshes: vec![x.c],
+                    fill: true,
+                };
+                s.add_section(desc).unwrap();
+            }),
+            ("remove_section", |s, x| {
+                s.remove_section(x.section).unwrap()
+            }),
+            ("set_section_plane", |s, x| {
+                let plane = Plane::new([0.0, 0.0, 0.2], [0.0, 0.0, 1.0]).unwrap();
+                s.set_section_plane(x.section, plane).unwrap();
+            }),
+            ("set_section_meshes", |s, x| {
+                s.set_section_meshes(x.section, vec![x.a, x.c]).unwrap();
+            }),
+            ("set_section_fill", |s, x| {
+                s.set_section_fill(x.section, true).unwrap();
+            }),
+        ];
+        for (name, call) in calls {
+            let (mut scene, ctx) = open_unit();
+            assert!(scene.field_step_pending(), "{name}");
+            call(&mut scene, &ctx);
+            assert!(!scene.field_step_pending(), "{name} left the unit open");
+        }
+        // `update_sections` too (39 in all).
+        let (mut scene, _) = open_unit();
+        scene.update_sections().unwrap();
+        assert!(!scene.field_step_pending(), "update_sections");
+        // Reads and deferral leave the unit open.
+        let (mut scene, x) = open_unit();
+        scene.mesh(x.a).unwrap();
+        scene.placement(x.b).unwrap();
+        scene.is_current(x.a).unwrap();
+        scene.field_values(x.field).unwrap();
+        scene.field_status(x.field).unwrap();
+        scene.colors(x.a).unwrap();
+        assert_eq!(scene.field_step_meshes(), vec![x.a, x.b]);
+        scene.set_defer_fields(false);
+        scene.set_defer_fields(true);
+        assert!(scene.field_step_pending(), "a read or deferral abandoned");
+        assert_eq!(step_all(&mut scene, usize::MAX), 0);
+        assert!(scene.field_status(x.field).unwrap().current);
+    }
+
+    #[test]
+    fn defer_leaves_fields_due() {
+        let (mut scene, a, b, ids) = deferred_pair(0.15);
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Idle)
+        );
+        counter::take();
+        scene.set_placement(b, at(0.02, 0.0, 0.01)).unwrap();
+        scene
+            .edit(a, |tx| tx.set_positions(&[45], &[[0.5, 0.4, 0.05]]))
+            .unwrap();
+        assert_eq!(counter::take(), 0);
+        for id in ids {
+            assert!(!scene.field_status(id).unwrap().current);
+        }
+        assert!(!scene.field_step_pending());
+        // Stepping brings both fields along in one unit, applied together.
+        let before = seen_values(&scene, [a, b]);
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(5)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(seen_values(&scene, [a, b]), before);
+        assert_eq!(counter::take(), 0);
+        assert!(step_all(&mut scene, usize::MAX) == 0);
+        assert!(counter::take() > 0);
+        for id in ids {
+            assert_matches(&mut scene, id);
+        }
+        // Without deferral the fields follow at once.
+        scene.set_defer_fields(false);
+        scene.set_placement(b, at(0.03, 0.0, 0.01)).unwrap();
+        assert!(counter::take() > 0);
+        for id in ids {
+            assert!(scene.field_status(id).unwrap().current);
+        }
+        // Lazy fields are not stepped.
+        scene.set_mode(a, UpdateMode::Lazy).unwrap();
+        scene.set_mode(b, UpdateMode::Lazy).unwrap();
+        scene.set_placement(b, at(0.04, 0.0, 0.01)).unwrap();
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Idle)
+        );
+        assert!(!scene.field_status(ids[0]).unwrap().current);
     }
 }
