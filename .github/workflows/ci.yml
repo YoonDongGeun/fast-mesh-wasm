@@ -64,7 +64,13 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      # The threaded artifact (dist/wasm-threads) needs the pinned nightly with rust-src.
+      - id: nightly
+        uses: ./.github/actions/install-nightly
+      # Keyed on the nightly too: a new pin must not reuse the old rebuilt std.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.toolchain }}
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
@@ -74,6 +80,7 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Builds both artifacts: dist/wasm (stable) and dist/wasm-threads (nightly).
       - run: pnpm build
       - name: Check exports and types (publint, attw)
         run: pnpm check:pkg
@@ -89,11 +96,24 @@ jobs:
           pnpm --filter fast-mesh-wasm-example-react build
           # The Worker client sits in a chunk shared by ./worker and ./store: Vite must still find the Worker URL.
           ls examples/react/dist/assets/worker-entry-*.js
+      # Headless Chrome (preinstalled on the runner) against `vite preview` of the WebGPU
+      # example's check page: threaded and single-threaded bit-identical, shared memory
+      # growth past 512 MB, restart with a new pool, fallback when the pool cannot start;
+      # COOP/COEP on 200, 304 and 404 responses. An explicit pool size, so a runner with
+      # few cores cannot make the comparison single-threaded.
+      - name: Check the threaded Worker engine in Chrome
+        timeout-minutes: 10
+        run: node scripts/browser-check.mjs --threads 4
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build
           node examples/webpack-node/dist/main.cjs
       - run: pnpm --filter fast-mesh-wasm pack --pack-destination "${{ github.workspace }}/pack"
+      # The tarball installed with npm into fresh Vite (build and dev), webpack 5 and
+      # no-bundler apps: threads > 1 in Chrome with only the COOP/COEP headers set.
+      - name: Check bundlers on the packed tarball
+        timeout-minutes: 10
+        run: node scripts/bundler-check.mjs --tarball pack
       - uses: actions/upload-artifact@v7
         with:
           name: package

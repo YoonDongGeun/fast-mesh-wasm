@@ -22,6 +22,9 @@ fast-mesh-scene = { path = "crates/fast-mesh-scene", version = "0.1.0" }
 rayon = "1.12.0"
 # Must match the installed wasm-bindgen-cli exactly. Bump both together.
 wasm-bindgen = "=0.2.129"
+# Only behind fast-mesh-wasm's `threads` feature (the threaded artifact, built
+# on the nightly pinned in scripts/build-wasm.mjs). 1.3 needs wasm-bindgen >= 0.2.99.
+wasm-bindgen-rayon = "1.3.0"
 
 [profile.release]
 opt-level = 3

@@ -257,9 +257,9 @@ const values = await scene.fetchFieldValues(gap); // `fieldValues` on Scene
 - **The frame loop.** `commitFrame()` sends everything queued since the last frame as one batch and returns the change records of the results received meanwhile (already applied to the mirrors, so `views`, `matrix4`, `placement`, `section` and `sectionPlane` read the new state). Results arrive between frames; nothing changes in the mirrors outside a message.
 - **Requests run in order.** A newer colouring, section plane/meshes/fill or drag move drops the older one if it has not started yet, so fast toggling settles on the last state without doing the steps in between. Edits, repairs, `setPlacement`, adds, removals and undo/redo are never dropped. Each `setPlacement` is an undo step: for pointer-rate updates use a drag.
 - **Drags are optimistic.** `scene.drag(mesh).move(pose)` moves the placement mirror at once, so the object follows the pointer; colours and sections catch up when the Worker's result arrives. In 9a a key's status covers only requests made under that key: a drag, `setPlacement` or edit puts its own key (`placement:<id>`, `edit:<id>`) into `"computing"`, not the `display:<id>` or `section:<id>:*` keys of the state that catches up after it. `end()` and `cancel()` return at once; `cancel()` restores the start pose and records nothing.
-- **Wide-range colouring during a drag.** After each batch the Worker recomputes the fields the batch made due in small steps, and drops the recompute when a newer move, `setPlacement`, edit, repair, compact, undo/redo or removal of either mesh is already queued; other requests wait for it. A pose's colours are applied all at once, never partly. So while the pointer keeps moving and one recompute takes longer than a frame, newer moves drop the recompute, until 200 ms have passed since the last colours were applied: then the recompute under way finishes and is shown, and the newest pose follows. During a sustained drag the colours therefore update about every 200 ms plus one recompute, each update exactly one pose, and when the drag ends (`end()`) the last pose's colours arrive within about one recompute (measured: one at 1M, but about 1.5 at 10M when most of the mesh is in range): the end drops a recompute kept for an older pose. A pointer that only pauses, without ending the drag, may wait up to two recomputes. Edits, undo/redo, removals and cancels always drop a stale recompute. `fetchFieldValues()` and `fieldStatus()` first bring every due field up to date in one go, which cannot be dropped, so do not poll them during a drag. On two touching 1M-triangle meshes with `maxDistance` 8, a recompute takes from about 0.07 s to 0.7 s depending on how much of the mesh is in range, and about ten times that at 10M; the longest the Worker is blocked at a time is the start of a recompute, about 60 ms at 1M and 0.6 s at 10M (up to 0.14 s and 1.1 s were seen) (see [docs/benchmarks.md](docs/benchmarks.md)). A contact range (a small `maxDistance`) keeps up with the pointer.
+- **Wide-range colouring during a drag.** After each batch the Worker recomputes the fields the batch made due in small steps, and drops the recompute when a newer move, `setPlacement`, edit, repair, compact, undo/redo or removal of either mesh is already queued; other requests wait for it. A pose's colours are applied all at once, never partly. So while the pointer keeps moving and one recompute takes longer than a frame, newer moves drop the recompute, until 200 ms have passed since the last colours were applied: then the recompute under way finishes and is shown, and the newest pose follows. During a sustained drag the colours therefore update about every 200 ms plus one recompute, each update exactly one pose, and when the drag ends (`end()`) the last pose's colours arrive within about one recompute (measured: one at 1M, but about 1.5 at 10M when most of the mesh is in range): the end drops a recompute kept for an older pose. A pointer that only pauses, without ending the drag, may wait up to two recomputes. Edits, undo/redo, removals and cancels always drop a stale recompute. `fetchFieldValues()` and `fieldStatus()` first bring every due field up to date in one go, which cannot be dropped, so do not poll them during a drag. On two touching 1M-triangle meshes with `maxDistance` 8, a recompute takes from about 0.07 s to 0.7 s depending on how much of the mesh is in range, and about ten times that at 10M; the longest the Worker is blocked at a time is the start of a recompute, about 60 ms at 1M and 0.6 s at 10M (up to 0.14 s and 1.1 s were seen) (see [docs/benchmarks.md](docs/benchmarks.md)). These are single-threaded figures; on a cross-origin isolated page the threaded engine roughly halves the longest block and makes a recompute 1.4 to 4.5 times faster (see [Multithreading (COOP/COEP)](#multithreading-coopcoep)). A contact range (a small `maxDistance`) keeps up with the pointer.
 - **Queries and anything that returns data** (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`, `analyze`, `edit`, `repair`, `fetchFieldValues`, `fieldStatus`, `sectionGap`) return promises. Once a frame loop runs they go out with the next `commitFrame()` (or after 100 ms if no frame comes); before the first `commitFrame()` they are sent on a microtask. For latency-critical picking, keep a light picking copy in a main-thread `Scene`.
-- **Errors.** A failed state change shows on its key (`status(key).error`, a `FastMeshError` with the same `code` as on `Scene`); a failed promise rejects with it. After a trap inside the Worker every call fails with `INSTANCE_POISONED`. `await scene.restart()` starts a new Worker and replays the scene from the main thread's mirrors: meshes (compacted: slot ids change, handles do not), placements, fields, colourings and sections. History is cleared, and edits or queries that had not finished fail and must be re-issued.
+- **Errors.** A failed state change shows on its key (`status(key).error`, a `FastMeshError` with the same `code` as on `Scene`); a failed promise rejects with it. After a trap inside the Worker every call fails with `INSTANCE_POISONED`. With the multithreaded engine, a crash on one of its pool threads (a panic or abort in work split across threads) is not detected: the scene stops answering instead of failing with `INSTANCE_POISONED` (pending promises never settle), while `restart()` and `terminate()` still work; pass `threads: 1` where guaranteed poisoning matters (see [Multithreading (COOP/COEP)](#multithreading-coopcoep)). `await scene.restart()` starts a new Worker and replays the scene from the main thread's mirrors: meshes (compacted: slot ids change, handles do not), placements, fields, colourings and sections. History is cleared, and edits or queries that had not finished fail and must be re-issued.
 - **Not in the Worker scene:** user-opened steps (`beginStep`/`endStep`/`cancelStep`), Lazy and Manual modes (it is always eager) and `takeChanges` (use `onChanges` or the return value of `commitFrame()`). `terminate()` stops the Worker.
 - **Large meshes.** `addMesh` copies its inputs on the main thread (they are then transferred to the Worker) and, without an `origin` option, scans the positions for the bounding-box centre. That takes about 9 ms for 1M triangles and about 63 ms for 10M (see [docs/benchmarks.md](docs/benchmarks.md)); passing `origin` skips the scan.
 
@@ -272,6 +272,103 @@ const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { 
 ```
 
 `fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
+
+## Multithreading (COOP/COEP)
+
+On a cross-origin isolated page the Worker scene runs a multithreaded engine: its WebAssembly runs on a pool of Workers that share its memory, and the work that the Rust crates' `parallel` feature splits (BVH builds, sign data, distance and closest-point queries, near-triangle searches, see "Parallel" in [docs/benchmarks.md](docs/benchmarks.md)) is split across them. Results are bit-identical to the single-threaded engine. On two touching 1M-triangle meshes with a wide distance field, 8 threads made a drag's recompute about 1.6 to 4.5 times faster and halved the longest Worker block (headless Chrome; see "Threaded Worker" in [docs/benchmarks.md](docs/benchmarks.md)). Nothing changes in your code: the same `createWorkerScene()` picks the engine.
+
+A page is cross-origin isolated (`crossOriginIsolated === true`) when its document is served with these two headers:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Send them on **every** response, including 304 (Not Modified) responses: Safari refuses to start a Worker whose script it revalidated with a 304 that lacks them.
+
+**Vite** (dev and preview). Use a small plugin rather than `server.headers`/`preview.headers`, which Vite leaves off its 304 responses ([`examples/webgpu/vite.config.ts`](examples/webgpu/vite.config.ts) does this):
+
+```ts
+import { defineConfig, type Plugin } from "vite";
+
+function crossOriginIsolation(): Plugin {
+  const isolate = (_req: unknown, res: { setHeader(name: string, value: string): void }, next: () => void) => {
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    next();
+  };
+  return {
+    name: "cross-origin-isolation",
+    configureServer: (server) => void server.middlewares.use(isolate),
+    configurePreviewServer: (server) => void server.middlewares.use(isolate),
+  };
+}
+
+export default defineConfig({ plugins: [crossOriginIsolation()] });
+```
+
+**webpack-dev-server** (a middleware ahead of the others, so every response gets the headers):
+
+```js
+// webpack.config.js
+module.exports = {
+  devServer: {
+    setupMiddlewares: (middlewares) => {
+      middlewares.unshift((req, res, next) => {
+        res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+        res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+        next();
+      });
+      return middlewares;
+    },
+  },
+};
+```
+
+**nginx** (`add_header` already covers 200, 304 and the other success and redirect statuses; `always` adds the 4xx and 5xx ones too):
+
+```nginx
+add_header Cross-Origin-Opener-Policy "same-origin" always;
+add_header Cross-Origin-Embedder-Policy "require-corp" always;
+```
+
+A `location` (or other block) with any `add_header` of its own, such as a `Cache-Control` for assets, inherits none of the server-level ones: repeat the two headers in every such block, or keep them in a file you `include` in each.
+
+**Express** (before `express.static`):
+
+```js
+app.use((req, res, next) => {
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  next();
+});
+app.use(express.static("dist"));
+```
+
+**What the headers change for the rest of the page.** With COEP `require-corp`, the page and its Workers may only load cross-origin resources (images and textures, scripts, fonts, models, `fetch` from a CDN or API) that opt in: load them with CORS (`crossorigin` on `<img>`/`<script>`/`<link>`, `img.crossOrigin = "anonymous"` or three.js's `TextureLoader`, whose default is `anonymous`) from a server that sends `Access-Control-Allow-Origin`, or have that server send `Cross-Origin-Resource-Policy: cross-origin` (meant for public assets only: it lets any site embed them). Anything else is blocked, so check third-party embeds before turning isolation on. COOP `same-origin` also cuts the link between your page and cross-origin popups it opens (`window.opener`), which some sign-in flows rely on. Same-origin assets, including this package's files, need nothing. `Cross-Origin-Embedder-Policy: credentialless` also makes a page isolated and loads cross-origin resources without credentials instead of blocking those that do not opt in; Chrome and Firefox support it, Safari does not (the page is then not isolated there, and the scene runs single-threaded).
+
+**The `threads` option.**
+
+```ts
+const scene = await createWorkerScene(); // default: navigator.hardwareConcurrency, at most 8
+const fixed = await createWorkerScene({ threads: 4 }); // clamped to 1..64; a non-integer rejects with INVALID_ARGUMENT
+const single = await createWorkerScene({ threads: 1 }); // the single-threaded engine; the threaded files are never fetched
+console.log(scene.threads); // the threads the engine computes with: 1 when single-threaded (and until the Worker is ready)
+```
+
+**Fallback.** The scene always starts. On a page that is not cross-origin isolated it runs single-threaded and never fetches the threaded files. On an isolated page, if the threaded engine cannot start (its import or instantiation fails, the shared memory cannot be allocated, or the thread pool rejects or has not started within 10 s, for example because its nested Workers cannot load), the scene runs single-threaded. When the failure comes after the threaded engine was instantiated, its Worker is replaced by a fresh single-threaded one, and requests made meanwhile are kept and run there. A scene that fell back this way stays single-threaded across `restart()`, so a restart does not wait 10 s again. `scene.threads` tells which engine runs.
+
+**Crashes on a pool thread.** With the single-threaded engine, a trap in the WebAssembly module poisons the scene (every call fails with `INSTANCE_POISONED`). With the multithreaded engine, a crash on a pool thread (a Rust panic or abort while work is split across threads) ends only that thread: the engine's Worker keeps waiting for it, so the scene stops answering (pending promises never settle, statuses stay `"computing"`) and is not poisoned. `restart()` and `terminate()` still work. Applications that need guaranteed poisoning should pass `threads: 1`.
+
+**The development warning.** In development builds (`import.meta.env.DEV`, as Vite sets it) or with the `debug` option, the scene logs once (per scene, also across restarts) why it runs single-threaded when more threads were asked for: the page is not isolated, or the threaded engine failed to start, with the cause. Production builds are silent.
+
+**Bundlers.** No setting beyond the headers is needed: Vite (dev and build) and webpack 5 work as installed from npm, and so does a page without a bundler that serves the package's `dist/` folder as is (checked by `scripts/bundler-check.mjs`). Bundlers emit the threaded engine into your build output next to the single-threaded one: a chunk, its `.wasm` (about 976 KB, 370 KB gzipped, against 772 KB and 310 KB) and the thread pool's Worker helper. Pages that run single-threaded never download them.
+
+**Without header control** (some static hosts), a service worker such as [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) can make a page cross-origin isolated by adding the headers itself. This package does not ship or test one.
+
+**Browsers.** Current Chrome and Edge, Firefox and Safari support it. Checked: headless Chrome 155, Firefox 157 and Playwright's WebKit 27.2 on Windows (bit-identical results in all three). Known issue: Playwright's Windows WebKit build crashed its web process in 2 of about 20 development-server runs of the check that crashes a threaded Worker on purpose and restarts it; the cause is unknown, and real Safari on macOS has not been checked.
+
+The threaded engine adds memory: its shared memory starts at about 1 MB (18 pages) and may grow to 4 GiB (wasm32's limit), and each pool Worker has its own stack. A 10M-triangle wide-drag scene used about 2.4 GB threaded against 2.1 GB single-threaded.
 
 ## React
 

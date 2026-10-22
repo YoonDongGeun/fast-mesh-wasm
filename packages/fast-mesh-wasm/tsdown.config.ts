@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
@@ -27,7 +28,17 @@ export default defineConfig({
     // Keep the wasm-bindgen glue as a separate file so its `new URL(..., import.meta.url)`
     // keeps pointing at the .wasm next to it. It is copied into dist/wasm below.
     // `three`, `react` and `@react-three/fiber` are optional peers: imported, never inlined.
-    neverBundle: [/fast_mesh_wasm\.js$/, /^node:/, /^three($|\/)/, /^react($|\/)/, /^@react-three\/fiber($|\/)/],
+    // The threaded glue (dist/wasm-threads) is never bundled either: only the
+    // Worker entry may load it, and its rayon worker helpers import it by
+    // relative path.
+    neverBundle: [/fast_mesh_wasm\.js$/, /wasm-threads\//, /^node:/, /^three($|\/)/, /^react($|\/)/, /^@react-three\/fiber($|\/)/],
   },
-  copy: [{ from: "src/wasm", to: "dist" }],
+  // src/wasm-threads is the threaded artifact (`build-wasm.mjs --threads`), with its
+  // rayon worker helpers under snippets/ and the package.json they resolve it by.
+  // Copied only if it exists: a local build without the pinned nightly skips it.
+  // prepublishOnly refuses to publish a dist without it.
+  copy: [
+    { from: "src/wasm", to: "dist" },
+    ...(existsSync("src/wasm-threads") ? [{ from: "src/wasm-threads", to: "dist" }] : []),
+  ],
 });

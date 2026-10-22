@@ -22,6 +22,21 @@ interface HandleId {
   generation: number;
 }
 
+/**
+ * The `WasmScene` class new scenes wrap: the single-threaded glue's, unless
+ * the Worker entry started the threaded glue ({@link useWasmScene}).
+ */
+let RawScene: typeof WasmScene = WasmScene;
+
+/**
+ * Internal (the Worker entry): makes later scenes from `ctor`, the
+ * `WasmScene` of the glue it initialised (the threaded one on cross-origin
+ * isolated pages). Pair it with `setMemory` for that glue's memory.
+ */
+export function useWasmScene(ctor: typeof WasmScene): void {
+  RawScene = ctor;
+}
+
 const meshIds = new WeakMap<MeshHandle, HandleId>();
 const rawIds = new WeakMap<FieldHandle | SectionHandle, HandleId>();
 
@@ -982,7 +997,7 @@ export class Scene implements SceneLike {
 
   constructor(options: SceneOptions = {}) {
     ensureInitialized("new Scene()");
-    this.#raw = call(() => new WasmScene());
+    this.#raw = call(() => new RawScene());
     this.#guard = options.debug ? new ViewGuard() : undefined;
     finalizer.register(this, this.#raw, this);
   }

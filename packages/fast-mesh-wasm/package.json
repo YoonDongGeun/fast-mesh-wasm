@@ -68,8 +68,8 @@
   },
   "scripts": {
     "build": "tsdown",
-    "test": "node ../../scripts/build-wasm.mjs --test && tsdown && vitest run",
-    "prepublishOnly": "node -e \"if (require('fs').readFileSync('dist/wasm/fast_mesh_wasm.d.ts', 'utf8').includes('__test_panic')) { console.error('dist/ is a test build (it exports __test_panic): run pnpm build first'); process.exit(1); }\"",
+    "test": "node ../../scripts/build-wasm.mjs --test && node ../../scripts/build-wasm.mjs --threads && tsdown && vitest run",
+    "prepublishOnly": "node -e \"if (require('fs').readFileSync('dist/wasm/fast_mesh_wasm.d.ts', 'utf8').includes('__test_panic')) { console.error('dist/ is a test build (it exports __test_panic): run pnpm build first'); process.exit(1); } if (!require('fs').existsSync('dist/wasm-threads/fast_mesh_wasm_bg.wasm')) { console.error('dist/ has no threaded artifact (dist/wasm-threads): run pnpm build first'); process.exit(1); } const fs = require('fs'); const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(d + '/' + e.name) : [d + '/' + e.name]); const helpers = walk('dist/wasm-threads/snippets').filter((f) => f.endsWith('/workerHelpers.js')); if (helpers.length !== 1 || helpers.some((f) => /import\\(.\\.\\.\\/\\.\\.\\/\\.\\..\\)/.test(fs.readFileSync(f, 'utf8')))) { console.error('dist/wasm-threads has no rayon worker helper, or it still imports the glue as a directory (../../..): run pnpm build first'); process.exit(1); }\"",
     "bench": "node bench/scene.bench.mjs",
     "check": "publint --strict && attw --pack . --profile esm-only"
   },

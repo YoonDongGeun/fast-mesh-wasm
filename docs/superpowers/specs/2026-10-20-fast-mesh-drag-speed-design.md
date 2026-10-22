@@ -201,3 +201,51 @@ Part A is on `feat/fast-mesh-drag-speed`, from `f64cc25` on (part of #48). The n
 - **During a sustained drag colours update about every guard plus one recompute** (the starvation guard). Part B's speed-up shortens the recompute, and so the interval.
 - **The yield in other browsers.** The `MessageChannel` tick was checked in headless Chrome only; Firefox and Safari are not checked yet. Part B's threaded Worker should re-check the yield wherever it runs.
 - `fields.rs` is about 3,000 lines and should be split.
+
+## 9. Part B implementation notes
+
+Part B is on `feat/fast-mesh-threads`, from `6fe0685` on (part of #48). The numbers are in `docs/benchmarks.md`, "Threaded Worker"; the user-facing guide is the README's "Multithreading (COOP/COEP)".
+
+### Result
+
+- **What shipped.** A second, threaded build of the same Rust engine (`dist/wasm-threads/`), loaded only by the Worker entry on a cross-origin isolated page; `createWorkerScene({ threads })` and `WorkerScene.threads`; a fallback to the single-threaded build whenever the threaded one cannot start. Results are bit-identical to the single-threaded engine: every change record, mirror buffer, placement, field value and section result of a 54-frame op sequence (two 360k-triangle terrains, wide colouring both ways, drags, an edit, a filled section, two undos) compare equal byte for byte, with the same digest in Chrome, Firefox and WebKit.
+- **Speed (headless Chrome 155, i5-13600K, 8 threads against `threads: 1`, wide drag, `maxDistance` 8, median).**
+  - Longest Worker block per pose (the unit open): 47.3 → 23.5 ms (1M, 9a terrain), 50.9 → 21.0 ms (1M, native terrain), 671 → 380 ms (10M, 9a), 825 → 397 ms (10M, native). 1.8 to 2.4×.
+  - Lock step, move to colours: 60.5 → 37.5 ms, 623 → 140 ms, 907 → 637 ms, 10.26 → 2.97 s. 1.4 to 4.5×.
+  - Update interval during a sustained 60 Hz drag: 252 → 222 ms (the 200 ms guard dominates), 792 → 428 ms, 915 → 637 ms, 10.4 → 2.96 s.
+  - Release to the last pose's colours: 69.0 → 34.7 ms, 611 → 298 ms, 912 → 615 ms, 10.05 → 2.71 s.
+- **Against §6.1's "shortens by the core count":** the gain is not 8×. The recompute's per-vertex part scales well (native terrain, 4.5× at 1M), but the unit open (the field's preparation and its near search) scales only about 2×, and on the 9a terrain it is most of a recompute. Splitting the open further is left (below).
+- **Single-threaded browser against Node.** At 1M the browser matches part A's Node `worker_threads` numbers; at 10M it is slower (907 ms against 631 ms and 10.3 s against 6.68 s per lock-step pose, not profiled). Threaded numbers are compared only with single-threaded ones from the same browser run.
+
+### Toolchain, sizes and memory
+
+- **Nightly pin:** `nightly-2026-10-15` (rustc 1.101.0-nightly), in one place: `NIGHTLY` in `scripts/build-wasm.mjs` (`--print-nightly` for CI and the release workflow, which share an install action; the Rust cache is keyed on it). Built with `-Z build-std=panic_abort,std`, `+atomics,+bulk-memory,+mutable-globals`, and the link args `--shared-memory --max-memory=4294967296 --import-memory` plus the TLS exports (this nightly does not add a shared memory on its own).
+- **wasm-bindgen-rayon 1.3.0** works with the `=0.2.129` wasm-bindgen pin: no bump.
+- **Sizes (release):** single-threaded `.wasm` 772,026 bytes (307 KB gzip -9), threaded 975,880 bytes (368 KB); glue 41.5 KB and 45.8 KB; the rayon Worker helper 4.5 KB. Bundlers emit the threaded chunk, `.wasm` and helper into the build output; pages that run single-threaded never fetch them.
+- **Memory:** the threaded build imports a shared memory with 18 pages initial (1.125 MiB) and 65,536 pages maximum (4 GiB). Measured: about 18 MB once the pool has started (thread stacks); it grew to about 560 MB in the browser memory check, and to 2.4 GB in the 10M wide-drag scene (2.1 GB single-threaded).
+
+### Rulings
+
+- Local `pnpm test`/build without the pinned nightly skip the threaded artifact with a loud warning (its tests skip). With `CI` set, and in release/prepublish, a missing nightly or threaded artifact is a hard failure. Cost if wrong: a contributor's local run does not exercise the threaded build.
+- A 10 s `initThreadPool` timeout falls back to single-threaded. It prevents a hung start-up: a nested Worker that fails to load never reports ready, and fires no `error` event on the outer Worker in Chrome, Firefox or WebKit. Cost if wrong: a very slow device runs single-threaded.
+- When threaded start fails after the glue was imported (instantiation succeeded; the pool failed or timed out), the Worker reports it, hands back the batches it received, and the client terminates that Worker and starts a fresh one with `threads: 1`, resending the held batches. Such a scene stays at `threads: 1` for later restarts (no repeated 10 s waits). Cost if wrong: one extra Worker start on the failure path.
+- An explicit `threads` option is clamped to [1, 64]; a non-integer is rejected (`INVALID_ARGUMENT`). Cost if wrong: none.
+- The rayon helper's `import('../../..')` is rewritten to `../../../fast_mesh_wasm.js` at build time, guarded so that an upstream change fails the build. It is needed for pages without a bundler (a browser cannot import a directory). Cost if wrong: a wasm-bindgen-rayon upgrade needs the guard updated.
+- The examples and docs set COOP/COEP with a small Vite middleware plugin, not `server.headers`/`preview.headers`: Vite leaves those off 304 responses, and WebKit then refuses the revalidated Worker script. `scripts/browser-check.mjs` (check `headers`) guards the 304 case. Cost if wrong: none.
+
+### Also decided in the tasks
+
+- The development warning (dev builds or `debug`) is logged at most once per scene, also across restarts.
+- `debugDump` is not used for the browser comparison (it needs a non-public client export); the check compares the public mirrors, `fetchFieldValues`, section results and change records instead.
+- No bundler setting is needed: Vite build and dev, webpack 5 (all from an `npm pack` install) and a page without a bundler start with 8 threads (`scripts/bundler-check.mjs`).
+- Part A's open point, the yield in other browsers, is closed: during a continuous 1M drag, messages arrive mid-unit and units are abandoned in Chrome, Firefox and WebKit, single-threaded and threaded.
+
+### Known issues and left open
+
+- **WebKit.** Playwright's WebKit 27.2 on Windows crashed its web process in 2 of about 20 dev-server runs of the restart check (a threaded Worker crashed on purpose, then `restart()`); 0 of about 11 preview runs. The cause is unknown. Real Safari on macOS is unverified.
+- **The unit open scales only about 2×** with 8 threads and is the longest Worker block (about 21 to 24 ms at 1M, 0.4 s at 10M). Further splitting of the field preparation and near search is not done.
+- **No cross-field parallelism within a step** (part A's deferred item): the fields of a unit still step one after another.
+- **A crash on a pool thread is not detected.** With the threaded engine, a Rust panic or abort on a rayon pool thread (a nested Worker) ends only that thread; the engine Worker stays blocked waiting for it, so the scene stops answering and is never poisoned (the single-threaded engine reports `INSTANCE_POISONED`). `restart()` and `terminate()` still work; `threads: 1` gives guaranteed poisoning. The README says so; detection is a follow-up issue.
+- **The old Worker during the pool-failure handback.** An `error` event from it now poisons the scene (final fix wave), so held batches never wait on a crashed Worker. One that stops without an `error` event would still leave them waiting (the same class as other silent Worker hangs before a reply).
+- The browser check's nested-failure case costs a fixed 10 s (the pool timeout), and the bundler check needs npm registry access in CI.
+- Part A's other deferred items (failing fields stay due, one unit open per completed unit with a stale-maker queued, the mid-range switch, splitting `fields.rs`) are unchanged.

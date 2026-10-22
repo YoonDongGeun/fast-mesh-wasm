@@ -25,7 +25,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      # `pnpm release` builds the threaded artifact too (dist/wasm-threads), which
+      # needs the pinned nightly with rust-src.
+      - id: nightly
+        uses: ./.github/actions/install-nightly
+      # Keyed on the nightly too: a new pin must not reuse the old rebuilt std.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.toolchain }}
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
