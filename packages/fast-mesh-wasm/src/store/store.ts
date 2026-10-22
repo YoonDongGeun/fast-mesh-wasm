@@ -80,6 +80,8 @@ interface MeshEntry {
   /** The colouring sent and not yet applied. */
   inflight?: InFlight<DistanceColoring | null>;
   field?: OwnedField;
+  /** The status keys its state was last derived from (`history` aside), as indexed. */
+  keys?: readonly string[];
 }
 
 /** The aspects of a section the store sets one by one. */
@@ -98,6 +100,8 @@ interface SectionEntry {
   sent: SectionParts;
   /** Aspects sent and not yet applied. */
   inflight: { [A in Aspect]?: InFlight<SectionParts[A]> };
+  /** The status keys its state was last derived from (`history` aside), as indexed. */
+  keys?: readonly string[];
 }
 
 /**
@@ -143,6 +147,45 @@ function colorRule(field: FieldHandle, c: DistanceColoring): ColorRule {
 let listenerCountOf: (store: SceneStore) => number;
 /** Set by `SceneStore`'s static block: the internal {@link setFrameLoop}. */
 let setFrameLoopOf: (store: SceneStore, on: boolean) => void;
+/** Set by `SceneStore`'s static block: the test-only {@link setFullRefresh}. */
+let setFullRefreshOf: (store: SceneStore, on: boolean) => void;
+
+/** Adds `entry` under each of `keys` in `deps`. */
+function addDeps<E>(deps: Map<string, Set<E>>, entry: E, keys: readonly string[]): void {
+  for (const k of keys) {
+    let set = deps.get(k);
+    if (set === undefined) {
+      set = new Set();
+      deps.set(k, set);
+    }
+    set.add(entry);
+  }
+}
+
+/** Removes `entry` from under each of `keys` in `deps`. */
+function dropDeps<E>(deps: Map<string, Set<E>>, entry: E, keys: readonly string[]): void {
+  for (const k of keys) {
+    const set = deps.get(k);
+    if (set !== undefined && set.delete(entry) && set.size === 0) {
+      deps.delete(k);
+    }
+  }
+}
+
+/** The first state in `"error"`, as a status, or `undefined`. */
+function firstError(states: Iterable<MeshState | SectionState>): Combined | undefined {
+  for (const state of states) {
+    if (state.status === "error") {
+      return { status: "error", error: state.error };
+    }
+  }
+  return undefined;
+}
+
+/** Whether two key lists are equal, in order. */
+function sameKeys(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((k, i) => k === b[i]);
+}
 
 /**
  * An observable store over a scene. Read with {@link getSnapshot} and
@@ -163,6 +206,43 @@ export class SceneStore {
   readonly #pendingDisplay = new Set<MeshEntry>();
   /** Sections whose parts changed since the last flush. */
   readonly #pendingSections = new Set<SectionEntry>();
+  // The refresh is incremental: it re-derives only the states marked dirty,
+  // by the actions and flushes that touch them and by the status keys they
+  // read (`#meshDeps`/`#sectionDeps`, from the host's `changed` keys).
+  // Every state reads whether `history` is "computing": when that flips,
+  // all of them are re-derived.
+  /** Meshes (tracked or just removed) whose state must be re-derived. */
+  readonly #dirtyMeshes = new Set<MeshHandle>();
+  /** Sections (tracked or just removed) whose state must be re-derived. */
+  readonly #dirtySections = new Set<SectionHandle>();
+  /** Every state must be re-derived (at the start, and when `history` starts or stops computing). */
+  #allDirty = true;
+  /** Whether `history` was "computing" when the states were last derived. */
+  #historyBusy = false;
+  /** Test-only: every refresh re-derives every state (see {@link setFullRefresh}). */
+  #fullRefresh = false;
+  /** The meshes whose state reads a status key, by key (`history` aside). */
+  readonly #meshDeps = new Map<string, Set<MeshEntry>>();
+  /** The sections whose state reads a status key, by key (`history` aside). */
+  readonly #sectionDeps = new Map<string, Set<SectionEntry>>();
+  /** Meshes that may have a colouring in flight (a superset; settled ones leave at the next refresh). */
+  readonly #inflightMeshes = new Set<MeshEntry>();
+  /** Sections that may have an aspect in flight (a superset, likewise). */
+  readonly #inflightSections = new Set<SectionEntry>();
+  /** The states in the snapshot whose status is `"computing"`. */
+  #busy = 0;
+  /** The states in the snapshot whose status is `"error"`. */
+  #failed = 0;
+  /** The first state in "error" (meshes, then sections), kept until a state enters or leaves "error". */
+  #firstFailed: Combined | undefined;
+  /** A state entered or left "error" (or changed its error) since `#firstFailed` was found. */
+  #failedMoved = false;
+  /** A scene event came: the snapshot may be stale until the next refresh. */
+  #stale = false;
+  /** A refresh on a microtask is queued (for scene events, and snapshots not yet announced). */
+  #updateQueued = false;
+  /** A snapshot was published and its listeners not yet called. */
+  #owed = false;
   /** Fields added so far, for their names (`fast-mesh-store:<n>`). */
   #fieldCount = 0;
   #selection: MeshHandle | null = null;
@@ -175,19 +255,34 @@ export class SceneStore {
     this.#host = hostOf(scene);
     this.scene = this.#host.scene;
     this.mode = this.#host.mode;
-    const refresh = (): void => {
+    // Scene events in one task make one snapshot, on a microtask; reading
+    // the snapshot before then refreshes it (see `getSnapshot`).
+    const event = (): void => {
       if (!this.#disposed) {
-        this.#refresh();
+        this.#stale = true;
+        this.#queueUpdate();
       }
     };
-    this.#unsubscribe = [scene.onChanges(refresh), this.#host.onStatus(refresh)];
-    this.#refresh();
+    this.#unsubscribe = [scene.onChanges(event), this.#host.onStatus(event), () => this.#host.stop()];
+    this.#update();
   }
 
   // ---- Reading ----
 
-  /** The current snapshot: frozen, replaced (never mutated) on change. */
-  getSnapshot = (): SceneSnapshot => this.#snapshot;
+  /**
+   * The current snapshot: frozen, replaced (never mutated) on change. It is
+   * up to date with the scene's statuses when read: a status change not yet
+   * announced refreshes it here, and its listeners are called on a microtask.
+   */
+  getSnapshot = (): SceneSnapshot => {
+    if (!this.#disposed && (this.#stale || this.#host.changed.size > 0)) {
+      this.#refresh();
+      if (this.#owed) {
+        this.#queueUpdate();
+      }
+    }
+    return this.#snapshot;
+  };
 
   /**
    * Registers a listener called after each new snapshot; returns the function
@@ -216,7 +311,7 @@ export class SceneStore {
     this.#frameLoop = true;
     this.#flush();
     const changes = this.#host.scene.commitFrame();
-    this.#refresh();
+    this.#update();
     return changes;
   }
 
@@ -233,7 +328,8 @@ export class SceneStore {
       desired: DEFAULT_DISPLAY,
       sent: null,
     });
-    this.#refresh();
+    this.#dirtyMeshes.add(handle);
+    this.#update();
     return handle;
   }
 
@@ -251,6 +347,9 @@ export class SceneStore {
     if (entry !== undefined) {
       this.#meshes.delete(mesh);
       this.#pendingDisplay.delete(entry);
+      this.#inflightMeshes.delete(entry);
+      this.#unindexMesh(entry);
+      this.#dirtyMeshes.add(mesh);
       const display = `display:${entry.id}`;
       const field = entry.field === undefined ? undefined : `field:${entry.field.id}`;
       this.#host.forgetErrors((k) => k === display || k === field);
@@ -268,6 +367,7 @@ export class SceneStore {
       other.field = undefined;
       other.sent = null;
       other.inflight = undefined;
+      this.#dirtyMeshes.add(other.handle);
       if (other.display.coloring !== null) {
         other.display = Object.freeze({ ...other.display, coloring: null });
       }
@@ -280,15 +380,19 @@ export class SceneStore {
     const without = (meshes: readonly MeshHandle[]): readonly MeshHandle[] =>
       meshes.includes(mesh) ? Object.freeze(meshes.filter((m) => m !== mesh)) : meshes;
     for (const s of this.#sections.values()) {
+      const { applied, sent, desired } = s;
       s.applied = this.#withMeshes(s.applied, without(s.applied.meshes));
       s.sent = this.#withMeshes(s.sent, without(s.sent.meshes));
       s.desired = this.#withMeshes(s.desired, without(s.desired.meshes));
+      if (s.applied !== applied || s.sent !== sent || s.desired !== desired) {
+        this.#dirtySections.add(s.handle);
+      }
       const inflight = s.inflight.meshes;
       if (inflight !== undefined) {
         inflight.value = without(inflight.value);
       }
     }
-    this.#refresh();
+    this.#update();
   }
 
   /** `parts` with `meshes`, the same object when they are. */
@@ -300,7 +404,7 @@ export class SceneStore {
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void {
     this.#alive();
     this.#host.setPlacement(mesh, placement);
-    this.#refresh();
+    this.#update();
   }
 
   /** Starts a drag of a mesh; see the scene's `drag()`. Ending or cancelling it updates the snapshot. */
@@ -309,7 +413,7 @@ export class SceneStore {
     const session = this.#host.scene.drag(mesh);
     const after = (): void => {
       if (!this.#disposed) {
-        this.#refresh();
+        this.#update();
       }
     };
     return {
@@ -342,10 +446,10 @@ export class SceneStore {
 
   /** Refreshes now (a synchronous host has applied the call) and once the promise settles. */
   #settled<T>(p: Promise<T>): Promise<T> {
-    this.#refresh();
+    this.#update();
     const after = (): void => {
       if (!this.#disposed) {
-        this.#refresh();
+        this.#update();
       }
     };
     return p.then(
@@ -366,14 +470,14 @@ export class SceneStore {
   undo(): void {
     this.#alive();
     this.#host.undo();
-    this.#refresh();
+    this.#update();
   }
 
   /** Redoes the latest undone step. */
   redo(): void {
     this.#alive();
     this.#host.redo();
-    this.#refresh();
+    this.#update();
   }
 
   // ---- Display ----
@@ -425,8 +529,9 @@ export class SceneStore {
     }
     entry.desired = Object.freeze(next);
     this.#pendingDisplay.add(entry);
+    this.#dirtyMeshes.add(mesh);
     this.#schedule();
-    this.#refresh();
+    this.#update();
   }
 
   // ---- Sections ----
@@ -444,7 +549,8 @@ export class SceneStore {
       sent: parts,
       inflight: {},
     });
-    this.#refresh();
+    this.#dirtySections.add(handle);
+    this.#update();
     return handle;
   }
 
@@ -477,8 +583,9 @@ export class SceneStore {
     }
     entry.desired = Object.freeze(next);
     this.#pendingSections.add(entry);
+    this.#dirtySections.add(section);
     this.#schedule();
-    this.#refresh();
+    this.#update();
   }
 
   /** Removes a section; it leaves the snapshot at once. */
@@ -489,10 +596,13 @@ export class SceneStore {
     if (entry !== undefined) {
       this.#sections.delete(section);
       this.#pendingSections.delete(entry);
+      this.#inflightSections.delete(entry);
+      this.#unindexSection(entry);
+      this.#dirtySections.add(section);
       const own = `section:${entry.id}`;
       this.#host.forgetErrors((k) => k === own || k.startsWith(`${own}:`));
     }
-    this.#refresh();
+    this.#update();
   }
 
   // ---- Selection ----
@@ -508,7 +618,7 @@ export class SceneStore {
       this.#mesh(mesh);
     }
     this.#selection = mesh;
-    this.#refresh();
+    this.#update();
   }
 
   // ---- Lifecycle ----
@@ -529,6 +639,7 @@ export class SceneStore {
     for (const entry of this.#meshes.values()) {
       if (!sameData(entry.display.coloring, entry.sent)) {
         entry.inflight = { value: entry.sent, rev: this.#host.status(`display:${entry.id}`).revision };
+        this.#inflightMeshes.add(entry);
       }
     }
     for (const entry of this.#sections.values()) {
@@ -611,7 +722,7 @@ export class SceneStore {
         return;
       }
       this.#flush();
-      this.#refresh();
+      this.#update();
     });
   }
 
@@ -622,6 +733,8 @@ export class SceneStore {
    */
   #flush(): void {
     for (const entry of this.#pendingDisplay) {
+      // Its pending state ends here, whatever the flush does.
+      this.#dirtyMeshes.add(entry.handle);
       const d = entry.display;
       const want = entry.desired;
       if (d.opacity !== want.opacity || d.visible !== want.visible) {
@@ -631,6 +744,7 @@ export class SceneStore {
     }
     this.#pendingDisplay.clear();
     for (const entry of this.#pendingSections) {
+      this.#dirtySections.add(entry.handle);
       this.#flushSection(entry);
     }
     this.#pendingSections.clear();
@@ -659,6 +773,7 @@ export class SceneStore {
         }
         entry.sent = want;
         entry.inflight = { value: want, rev: this.#host.status(key).revision };
+        this.#inflightMeshes.add(entry);
       });
     } catch {
       // Reported through the key's status. A colouring the scene no longer
@@ -755,6 +870,7 @@ export class SceneStore {
       value,
       rev: this.#host.status(`section:${entry.id}:${a}`).revision,
     };
+    this.#inflightSections.add(entry);
   }
 
   /**
@@ -769,34 +885,48 @@ export class SceneStore {
     return s.status === "ready" ? "ready" : s.status === "error" ? "error" : undefined;
   }
 
-  /** Applies the colouring and section aspects whose requests are done. */
+  /**
+   * Applies the colouring and section aspects whose requests are done, and
+   * marks the states that change dirty. Only the entries that may have one
+   * in flight are visited (all of them under the test-only full refresh).
+   */
   #applyDone(): void {
-    for (const entry of this.#meshes.values()) {
+    for (const entry of this.#fullRefresh ? [...this.#meshes.values()] : this.#inflightMeshes) {
       const wait = entry.inflight;
       if (wait === undefined) {
+        this.#inflightMeshes.delete(entry);
         continue;
       }
       const done = this.#outcome(`display:${entry.id}`, wait);
       if (done !== undefined) {
         entry.inflight = undefined;
+        this.#inflightMeshes.delete(entry);
         if (done === "ready" && entry.display.coloring !== wait.value) {
           entry.display = Object.freeze({ ...entry.display, coloring: wait.value });
+          this.#dirtyMeshes.add(entry.handle);
         }
       }
     }
-    for (const entry of this.#sections.values()) {
+    for (const entry of this.#fullRefresh ? [...this.#sections.values()] : this.#inflightSections) {
+      let waiting = false;
       for (const a of ASPECTS) {
         const wait = entry.inflight[a];
         if (wait === undefined) {
           continue;
         }
         const done = this.#outcome(`section:${entry.id}:${a}`, wait);
-        if (done !== undefined) {
-          delete entry.inflight[a];
-          if (done === "ready" && entry.applied[a] !== wait.value) {
-            entry.applied = Object.freeze({ ...entry.applied, [a]: wait.value });
-          }
+        if (done === undefined) {
+          waiting = true;
+          continue;
         }
+        delete entry.inflight[a];
+        if (done === "ready" && entry.applied[a] !== wait.value) {
+          entry.applied = Object.freeze({ ...entry.applied, [a]: wait.value });
+          this.#dirtySections.add(entry.handle);
+        }
+      }
+      if (!waiting) {
+        this.#inflightSections.delete(entry);
       }
     }
   }
@@ -810,13 +940,17 @@ export class SceneStore {
    * The status of a state from its own keys (all of their status, errors
    * included) and the keys it depends on, which only add `"computing"`:
    * their errors belong to the requests that made them (a failed edit
-   * rejects its promise) and are ignored here. `pending` (a request
-   * waiting for the next flush that differs from what was sent) also makes
-   * it `"computing"`.
+   * rejects its promise) and are ignored here. `history` is a dependent key
+   * of every state. `pending` (a request waiting for the next flush that
+   * differs from what was sent) also makes it `"computing"`.
    */
-  #status(own: readonly string[], dependent: readonly string[], pending = false): Combined {
+  #status(own: readonly string[], dependent: readonly string[], pending: boolean): Combined {
     const parts = own.map((k) => this.#key(k));
-    if (pending || dependent.some((k) => this.#host.status(k).status === "computing")) {
+    if (
+      pending ||
+      dependent.some((k) => this.#host.status(k).status === "computing") ||
+      this.#host.status("history").status === "computing"
+    ) {
       parts.push({ status: "computing" });
     }
     return combine(parts);
@@ -828,11 +962,12 @@ export class SceneStore {
    * `edit:` keys, those of the mesh it is coloured by distance to, and the
    * history, and while a requested colouring waits for the next flush.
    * (Opacity and visibility are store-only: they never make it pending.)
+   * Indexes the mesh under the keys it read.
    */
   #meshStatus(entry: MeshEntry): Combined {
     const id = entry.id;
     const own = [`mesh:${id}`, `display:${id}`];
-    const dependent = [`placement:${id}`, `edit:${id}`, "history"];
+    const dependent = [`placement:${id}`, `edit:${id}`];
     const field = entry.field;
     if (field !== undefined) {
       own.push(`field:${field.id}`);
@@ -840,41 +975,155 @@ export class SceneStore {
         dependent.push(`placement:${field.toId}`, `edit:${field.toId}`);
       }
     }
+    const keys = [...own, ...dependent];
+    if (entry.keys === undefined || !sameKeys(entry.keys, keys)) {
+      this.#unindexMesh(entry);
+      addDeps(this.#meshDeps, entry, keys);
+      entry.keys = keys;
+    }
     return this.#status(own, dependent, this.#pendingDisplay.has(entry) && !sameData(entry.desired.coloring, entry.sent));
   }
 
   /**
    * A section's status: its own `section:` keys, made `"computing"` also by
    * the `placement:` and `edit:` keys of its meshes and the history, and
-   * while a requested aspect waits for the next flush.
+   * while a requested aspect waits for the next flush. Indexes the section
+   * under the keys it read.
    */
   #sectionStatus(entry: SectionEntry): Combined {
     const own = [`section:${entry.id}`, ...ASPECT_KEYS.map((a) => `section:${entry.id}:${a}`)];
-    const dependent = ["history"];
+    const dependent: string[] = [];
     for (const m of entry.applied.meshes) {
       const mesh = this.#meshes.get(m);
       if (mesh !== undefined) {
         dependent.push(`placement:${mesh.id}`, `edit:${mesh.id}`);
       }
     }
+    const keys = [...own, ...dependent];
+    if (entry.keys === undefined || !sameKeys(entry.keys, keys)) {
+      this.#unindexSection(entry);
+      addDeps(this.#sectionDeps, entry, keys);
+      entry.keys = keys;
+    }
     const pending = this.#pendingSections.has(entry) && ASPECTS.some((a) => !sameData(entry.desired[a], entry.sent[a]));
     return this.#status(own, dependent, pending);
   }
 
+  #unindexMesh(entry: MeshEntry): void {
+    if (entry.keys !== undefined) {
+      dropDeps(this.#meshDeps, entry, entry.keys);
+      entry.keys = undefined;
+    }
+  }
+
+  #unindexSection(entry: SectionEntry): void {
+    if (entry.keys !== undefined) {
+      dropDeps(this.#sectionDeps, entry, entry.keys);
+      entry.keys = undefined;
+    }
+  }
+
   /**
-   * Rebuilds the snapshot from the store and the scene, reusing every
-   * unchanged part of the previous one; publishes (and notifies) only when
-   * something changed.
+   * Marks dirty the states that read a key whose status changed since the
+   * last refresh, and clears the host's set; every state when `history`
+   * starts or stops computing.
+   */
+  #takeChanged(): void {
+    const changed = this.#host.changed;
+    for (const key of changed) {
+      for (const entry of this.#meshDeps.get(key) ?? []) {
+        this.#dirtyMeshes.add(entry.handle);
+      }
+      for (const entry of this.#sectionDeps.get(key) ?? []) {
+        this.#dirtySections.add(entry.handle);
+      }
+    }
+    changed.clear();
+    // Every state reads only whether `history` is "computing": when that
+    // flips (an undo or redo sent, or done), every state is re-derived.
+    const historyBusy = this.#host.status("history").status === "computing";
+    if (historyBusy !== this.#historyBusy) {
+      this.#historyBusy = historyBusy;
+      this.#allDirty = true;
+    }
+  }
+
+  /** Counts `state` (`by` 1) in, or (`-1`) out of, the busy and failed states. */
+  #count(state: { status: string }, by: number): void {
+    if (state.status === "computing") {
+      this.#busy += by;
+    } else if (state.status === "error") {
+      this.#failed += by;
+      this.#failedMoved = true;
+    }
+  }
+
+  /** Refreshes the snapshot, then calls the listeners when it changed. */
+  #update(): void {
+    this.#refresh();
+    this.#notify();
+  }
+
+  /** Queues an {@link #update} on a microtask (once). */
+  #queueUpdate(): void {
+    if (this.#updateQueued) {
+      return;
+    }
+    this.#updateQueued = true;
+    queueMicrotask(() => {
+      this.#updateQueued = false;
+      // Nothing left to do when a refresh in the meantime took the event (a
+      // store `commitFrame()` takes its own scene's): no scene call then, so
+      // a scene freed in the same task is never touched.
+      if (!this.#disposed && (this.#stale || this.#host.changed.size > 0 || this.#owed)) {
+        this.#update();
+      }
+    });
+  }
+
+  /**
+   * Re-derives the dirty states from the store and the scene, sharing every
+   * other part of the previous snapshot; publishes a new snapshot only when
+   * something changed (its listeners are called by {@link #notify}).
    */
   #refresh(): void {
+    this.#stale = false;
     this.#applyDone();
+    this.#takeChanged();
     const prev = this.#snapshot;
     const revision = prev.revision + 1;
     let changed = false;
+    if (this.#allDirty || this.#fullRefresh) {
+      this.#allDirty = false;
+      for (const h of this.#meshes.keys()) {
+        this.#dirtyMeshes.add(h);
+      }
+      for (const h of prev.meshes.keys()) {
+        this.#dirtyMeshes.add(h);
+      }
+      for (const h of this.#sections.keys()) {
+        this.#dirtySections.add(h);
+      }
+      for (const h of prev.sections.keys()) {
+        this.#dirtySections.add(h);
+      }
+    }
 
-    const meshes = new Map<MeshHandle, MeshState>();
-    for (const entry of this.#meshes.values()) {
-      const old = prev.meshes.get(entry.handle);
+    // Copied from the previous snapshot's map on the first change: order
+    // kept, removed states deleted, new ones appended (as in `#meshes`).
+    let meshes: Map<MeshHandle, MeshState> | undefined;
+    let added = 0;
+    for (const handle of this.#dirtyMeshes) {
+      const entry = this.#meshes.get(handle);
+      const old = prev.meshes.get(handle);
+      if (entry === undefined) {
+        if (old !== undefined) {
+          meshes ??= new Map(prev.meshes);
+          meshes.delete(handle);
+          this.#count(old, -1);
+        }
+        continue;
+      }
       const s = this.#meshStatus(entry);
       if (
         old !== undefined &&
@@ -883,23 +1132,44 @@ export class SceneStore {
         old.status === s.status &&
         old.error === s.error
       ) {
-        meshes.set(entry.handle, old);
         continue;
       }
-      changed = true;
       const state: MeshState = { display: entry.display, desired: entry.desired, status: s.status, revision };
       if (s.error !== undefined) {
         state.error = s.error;
       }
-      meshes.set(entry.handle, Object.freeze(state));
+      meshes ??= new Map(prev.meshes);
+      if (old === undefined) {
+        added++;
+      } else {
+        this.#count(old, -1);
+      }
+      meshes.set(handle, Object.freeze(state));
+      this.#count(state, 1);
     }
-    if (meshes.size !== prev.meshes.size) {
+    this.#dirtyMeshes.clear();
+    if (meshes !== undefined) {
       changed = true;
+      if (added > 1) {
+        // Several added at once: put them in the order they were added.
+        const m = meshes;
+        meshes = new Map([...this.#meshes.keys()].map((h) => [h, m.get(h)!]));
+      }
     }
 
-    const sections = new Map<SectionHandle, SectionState>();
-    for (const entry of this.#sections.values()) {
-      const old = prev.sections.get(entry.handle);
+    let sections: Map<SectionHandle, SectionState> | undefined;
+    added = 0;
+    for (const handle of this.#dirtySections) {
+      const entry = this.#sections.get(handle);
+      const old = prev.sections.get(handle);
+      if (entry === undefined) {
+        if (old !== undefined) {
+          sections ??= new Map(prev.sections);
+          sections.delete(handle);
+          this.#count(old, -1);
+        }
+        continue;
+      }
       const s = this.#sectionStatus(entry);
       const a = entry.applied;
       if (
@@ -911,18 +1181,28 @@ export class SceneStore {
         old.status === s.status &&
         old.error === s.error
       ) {
-        sections.set(entry.handle, old);
         continue;
       }
-      changed = true;
       const state: SectionState = { ...a, desired: entry.desired, status: s.status, revision };
       if (s.error !== undefined) {
         state.error = s.error;
       }
-      sections.set(entry.handle, Object.freeze(state));
+      sections ??= new Map(prev.sections);
+      if (old === undefined) {
+        added++;
+      } else {
+        this.#count(old, -1);
+      }
+      sections.set(handle, Object.freeze(state));
+      this.#count(state, 1);
     }
-    if (sections.size !== prev.sections.size) {
+    this.#dirtySections.clear();
+    if (sections !== undefined) {
       changed = true;
+      if (added > 1) {
+        const m = sections;
+        sections = new Map([...this.#sections.keys()].map((h) => [h, m.get(h)!]));
+      }
     }
 
     const canUndo = this.#host.canUndo();
@@ -935,7 +1215,24 @@ export class SceneStore {
     if (prev.selection !== this.#selection) {
       changed = true;
     }
-    const overall = combine([...meshes.values(), ...sections.values(), this.#key("history")]);
+    // As `combine` over every mesh, then every section, then the history:
+    // the first error wins, then any "computing"; "ready" reads "idle".
+    const meshStates = meshes ?? prev.meshes;
+    const sectionStates = sections ?? prev.sections;
+    const historyKey = this.#key("history");
+    let overall: Combined = { status: "idle" };
+    if (this.#failedMoved) {
+      this.#failedMoved = false;
+      this.#firstFailed =
+        this.#failed > 0 ? (firstError(meshStates.values()) ?? firstError(sectionStates.values())) : undefined;
+    }
+    if (this.#firstFailed !== undefined) {
+      overall = this.#firstFailed;
+    } else if (historyKey.status === "error") {
+      overall = historyKey;
+    } else if (this.#busy > 0 || historyKey.status === "computing") {
+      overall = { status: "computing" };
+    }
     const status = overall.status === "ready" ? "idle" : overall.status;
     if (status !== prev.status || overall.error !== prev.error) {
       changed = true;
@@ -945,9 +1242,9 @@ export class SceneStore {
     }
     const snap: SceneSnapshot = {
       revision,
-      meshes: Object.freeze(meshes),
+      meshes: meshes === undefined ? prev.meshes : Object.freeze(meshes),
       history,
-      sections: Object.freeze(sections),
+      sections: sections === undefined ? prev.sections : Object.freeze(sections),
       selection: this.#selection,
       status,
     };
@@ -955,6 +1252,15 @@ export class SceneStore {
       snap.error = overall.error;
     }
     this.#snapshot = Object.freeze(snap);
+    this.#owed = true;
+  }
+
+  /** Calls the listeners once for the snapshots published since they were last called. */
+  #notify(): void {
+    if (!this.#owed) {
+      return;
+    }
+    this.#owed = false;
     // Every listener runs even if one throws; errors are reported, not thrown.
     for (const listener of [...this.#listeners]) {
       try {
@@ -971,6 +1277,12 @@ export class SceneStore {
       store.#frameLoop = on;
       if (!on && !store.#disposed && (store.#pendingDisplay.size > 0 || store.#pendingSections.size > 0)) {
         store.#schedule();
+      }
+    };
+    setFullRefreshOf = (store, on) => {
+      store.#fullRefresh = on;
+      if (on && !store.#disposed) {
+        store.#update();
       }
     };
   }
@@ -995,4 +1307,14 @@ export function listenerCount(store: SceneStore): number {
  */
 export function setFrameLoop(store: SceneStore, on: boolean): void {
   setFrameLoopOf(store, on);
+}
+
+/**
+ * Test-only, not exported from `fast-mesh-wasm/store`: with `true`, every
+ * refresh re-derives every state (the full rebuild the incremental refresh
+ * must match), starting with one at once; `false` goes back to re-deriving
+ * only the dirty states.
+ */
+export function setFullRefresh(store: SceneStore, on: boolean): void {
+  setFullRefreshOf(store, on);
 }

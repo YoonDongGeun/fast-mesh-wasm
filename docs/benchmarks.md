@@ -450,6 +450,43 @@ The Worker blocks for the whole of one request (ruling 10.1-6: no Rust-side chun
 
 The batch runs back to back inside the 4 ms yield budget, so the Worker yields at most once for it; the Worker side costs about the same as the synchronous scene (2.3 ms against 2.0 ms), and the main thread spends about 0.5 ms.
 
+## Store (fast-mesh-wasm/store)
+
+Results for `pnpm build && pnpm --filter fast-mesh-wasm bench:store` (`packages/fast-mesh-wasm/bench/store.bench.mjs`), before and after the incremental snapshot refresh (issue #50).
+
+- **Scene:** a `SceneStore` over the built package holds 1000 small meshes (closed tetrahedra, added through the store). 100 of them are coloured by distance to a neighbour, and there are 10 sections of 100 meshes each. The scene work under each action is tiny, so the numbers are mostly the store's own cost.
+- **Local host:** a synchronous `Scene`, used for the first two tables. It has no pending statuses, so its placements and edits change no status keys.
+- **Worker host:** the engine in a `worker_threads` Worker (`bench/worker-harness.mjs`), used for the third table. A placement there changes status keys, which the store maps to the states that read them (the dependency index).
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, Node 24.13.0, release wasm build.
+- **Date:** 2026-10-23. One run each. Other agents were building and benchmarking on the machine, so treat the numbers as upper bounds, the p95 columns most of all.
+- **Before:** every action and event re-derived every mesh and section, at 5 to 8 status lookups per mesh and 9 or more per section.
+- **After:** only the states that an action touches, or that read a status key that changed, are re-derived. Scene events in one task make one snapshot.
+
+| Local host, per action or event, median (p95), µs | Before | After |
+| --- | --- | --- |
+| `select(mesh)` (store only) | 313 (442) | 0.60 (0.80) |
+| `setDisplay(opacity)` (a change every call) + `store.commitFrame()` | 1033 (1485) | 78.4 (157) |
+| `setPlacement` of a coloured mesh in a section | 342 (549) | 13.9 (25.6) |
+| `store.commitFrame()`, nothing changed | 675 (875) | 19.8 (33.3) |
+| A scene event (`scene.commitFrame()`) + `getSnapshot()` | 354 (617) | 19.3 (26.4) |
+
+| Local host, burst of adds through the store | Before | After |
+| --- | --- | --- |
+| 1000 adds into an empty store (median of 10 runs) | 116 ms | 26.9 ms |
+| 500 more adds onto the 1000 meshes | 203 ms (406 µs per add) | 29.5 ms (59.1 µs per add) |
+
+| Worker host, `setPlacement` of a coloured mesh in a section, 300 round trips, median (p95), µs | Before | After |
+| --- | --- | --- |
+| The action (its `placement:` key goes `"computing"`) | 514 (830) | 140 (205) |
+| A status delivery: the store's work when results arrive (timed across the scene's `onStatus` listeners, up to a snapshot read) | 517 (818) | 55.1 (115) |
+
+**What is left.**
+- **The scene call itself.** A local `commitFrame()` costs about 19 µs with nothing to do. The Worker action also includes the client's own work for the call.
+- **A copy of the snapshot's map.** Every action that changes a mesh's state still copies the snapshot's mesh map, and likewise the section map for a section. This keeps the old snapshot immutable.
+  - The copy is a native `Map` copy, O(meshes), with no status lookups: about 45 µs at 1500 entries, so about 300 µs at 10,000 meshes.
+  - `setDisplay` + `commitFrame()` copies the map twice: once for `desired` and once for the applied display.
+  - An N-add burst is therefore still O(N²), with a small constant.
+
 ## Wide-range drag (drag-speed part A)
 
 A drag where most of the coloured mesh is within the field's `maxDistance`: two touching 1M terrains (B flipped over A) with a distance field on A to B, `maxDistance` 8, colour range 0 to 6. Part A made the per-pose recompute faster (exact, single-threaded) and made the Worker step it and drop a stale pose. Part of #48; the profile is in `docs/superpowers/notes/2026-10-21-wide-drag-profile.md`.
@@ -656,6 +693,7 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run, --wide for just the wide-range drag)
+pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
