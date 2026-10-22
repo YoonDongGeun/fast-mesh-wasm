@@ -106,6 +106,7 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
 3. **Field access** *(my call; additive library API)*. Add `SceneStore.fetchColoringValues(mesh): Promise<Float32Array | null>`. It returns the values of the store-owned field behind the mesh's current colouring, or `null` when there is none. It is the async `fetchFieldValues` on Worker scenes and a copy on local ones.
    - Readouts: maximum penetration = `-min(values)` over finite negative values. In fast mode, if any value sits at the bound, show "≥ depth". Minimum gap comes from `meshDistance`.
    - Readouts throttle to about 4 Hz during drags and refresh on drag end.
+   - *(ruling, 2026-10-23)* Readouts pause while a drag is active and refresh on drag end and when the scene is idle; the 4 Hz throttle applies outside drags only. Reading field values forces due fields current, which would defeat the drag's stale-pose abandonment; the colours stay live during the drag.
 4. **Tolerance** *(my call)*. It is one number, used for two things:
    - the symmetric white band [-tolerance, +tolerance] in the stops;
    - the `findContacts({ margin: tolerance })` readout.

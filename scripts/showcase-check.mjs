@@ -24,9 +24,10 @@
 //   triangles.
 // - colour-from: "Colour from" 0 colours penetration only (no gap colours);
 //   the readouts stay up while the slider moves.
-// - readouts: dragging A away from B refreshes the readouts while the gizmo
-//   drags (about 4 Hz: at least 2, at most one per 250 ms plus 2) and once
-//   more at the end: no longer intersecting, a gap. Undo puts A back.
+// - readouts: dragging A away from B pauses the readouts (none while the
+//   gizmo drags: reading field values would force stale poses current),
+//   then they refresh once at the end: no longer intersecting, a gap. Undo
+//   puts A back.
 // - open-target (RF1): picking C (open) as B still colours A and C, and
 //   the panel warns that C is open (from `analyze` of C).
 // - repair (RF5): with C selected and coloured, the repair panel lists its
@@ -429,20 +430,17 @@ try {
 
   // ---- readouts: refreshed while A is dragged away from B, and at the end ----
   const before = await hook("collision()");
-  const dragStart = Date.now();
   const away = await dragGizmo(A, -260, 0, 40, 25);
-  const dragMs = Date.now() - dragStart;
   const apart = await waitFor(
     collision(`!__showcase.dragging() && c.settled && c.readouts !== null && !c.readouts.intersects && c.readouts.gap > 0 && c.readouts.penetration?.depth === 0`),
     10_000,
   );
   const during = (apart?.updatesWhileDragging ?? 0) - before.updatesWhileDragging;
-  // About 4 Hz: at most one refresh per 250 ms of drag, plus the first and a slack of one.
-  const ceiling = Math.floor(dragMs / 250) + 2;
+  const total = (apart?.updates ?? before.updates) - before.updates;
   verdict(
     "readouts",
-    away.dragging && apart !== undefined && during >= 2 && during <= ceiling,
-    `${during} refresh(es) in a ${dragMs} ms drag (at most ${ceiling}), ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
+    away.dragging && apart !== undefined && during === 0 && total >= 1,
+    `${during} refresh(es) while dragging (paused), ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
   );
   await clickOn("[data-action=undo]");
   await waitFor(collision(`Math.hypot(...__showcase.translation(${q(A)})) < 1e-9 && c.readouts?.intersects === true`), 10_000);

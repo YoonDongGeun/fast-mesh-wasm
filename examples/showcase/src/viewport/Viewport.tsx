@@ -13,7 +13,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { FocusRequest } from "../App";
 import type { Item } from "../scene/app-state";
-import { view } from "./view";
+import { setDragging, view } from "./view";
 
 export type GizmoMode = "translate" | "rotate";
 
@@ -132,7 +132,7 @@ function Controls(props: {
     const detach = attachTransformControls(controls, store.scene, bound);
     const onDragging = (e: { value: unknown }) => {
       orbit.enabled = e.value !== true;
-      view.dragging = e.value === true;
+      setDragging(e.value === true);
     };
     controls.addEventListener("dragging-changed", onDragging);
     view.gizmo = controls;
@@ -144,7 +144,7 @@ function Controls(props: {
       scene.remove(helper);
       controls.dispose();
       orbit.enabled = true;
-      view.dragging = false;
+      setDragging(false);
       if (view.gizmo === controls) {
         view.gizmo = null;
       }

@@ -20,7 +20,12 @@ import {
 } from "./collision-math";
 import { inspect, type Readouts } from "./inspect";
 
-/** The readouts refresh at most this often (about 4 Hz), and once more after the last change. */
+/**
+ * Outside a drag the readouts refresh at most this often (about 4 Hz), and
+ * once more after the last change. During a gizmo drag they pause: reading
+ * the field values forces every due field up to date, which would keep the
+ * Worker from dropping recomputes of stale poses (the colours stay live).
+ */
 const READOUT_PERIOD_MS = 250;
 /** A target is re-analysed this long after its triangles last changed. */
 const TOPOLOGY_DELAY_MS = 250;
@@ -313,8 +318,8 @@ function Slider(props: {
 /**
  * The pair's readouts, refreshed when either mesh moves, changes or is
  * recoloured (its change records), at most every READOUT_PERIOD_MS and once
- * more after the last change (so a drag's end is always read). One query
- * at a time; `null` without a pair. A new tolerance or field bound only
+ * more after the last change. Paused while the gizmo drags, then refreshed
+ * once when the drag ends. One query at a time; `null` without a pair. A new tolerance or field bound only
  * asks for a refresh: the previous readouts stay until it lands. A mesh
  * removed mid-query rejects: that refresh is dropped.
  */
@@ -372,7 +377,8 @@ function useReadouts(
     };
     const kick = () => {
       inspect.collision.settled = !dirty && !running;
-      if (!alive || running || !dirty) {
+      if (!alive || running || !dirty || view.dragging) {
+        // A drag pauses the readouts; its end kicks them again.
         return;
       }
       const wait = last + READOUT_PERIOD_MS - performance.now();
@@ -422,6 +428,12 @@ function useReadouts(
       }
       kick();
     });
+    const onDrag = (dragging: boolean) => {
+      if (!dragging) {
+        kick();
+      }
+    };
+    view.dragListeners.add(onDrag);
     poke.current = () => {
       dirty = true;
       kick();
@@ -430,6 +442,7 @@ function useReadouts(
     return () => {
       alive = false;
       off();
+      view.dragListeners.delete(onDrag);
       clearTimeout(timer);
       poke.current = () => {};
       inspect.collision.settled = true;

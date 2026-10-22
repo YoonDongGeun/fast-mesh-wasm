@@ -31,8 +31,9 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
   from (mm)*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
   *Fast mode (large meshes)* bounds the fields at the larger of depth and colour from, so a deeper
-  penetration shows the mesh colour. Readouts, refreshed about four times a second while a mesh
-  moves and again when it stops:
+  penetration shows the mesh colour. Readouts, refreshed at most about four times a second as the
+  meshes change, paused while the gizmo drags (the colours stay live; reading field values would
+  force stale poses up to date) and refreshed when the drag ends:
   - **Max penetration**: the deepest negative value of either colouring
     (`store.fetchColoringValues`). In fast mode it is measured within the bound (the panel says
     so), and reads "≥ bound" while the meshes intersect and the deepest value is within 10% of the

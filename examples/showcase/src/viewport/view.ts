@@ -14,4 +14,16 @@ export const view: {
   gizmo: TransformControls | null;
   /** True while the gizmo drags. */
   dragging: boolean;
-} = { camera: null, canvas: null, bindings: new Map(), gizmo: null, dragging: false };
+  /** Called with `dragging` whenever it changes. */
+  dragListeners: Set<(dragging: boolean) => void>;
+} = { camera: null, canvas: null, bindings: new Map(), gizmo: null, dragging: false, dragListeners: new Set() };
+
+/** Sets `view.dragging` and tells the listeners when it changes. */
+export function setDragging(dragging: boolean): void {
+  if (view.dragging !== dragging) {
+    view.dragging = dragging;
+    for (const l of view.dragListeners) {
+      l(dragging);
+    }
+  }
+}
