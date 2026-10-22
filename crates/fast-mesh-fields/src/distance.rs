@@ -10,10 +10,10 @@ use crate::{FieldsError, Result, SignData};
 /// `parallel` feature. A point costs about a microsecond (more in winding
 /// mode). Measured on the i5-13600K against a 1M-triangle mesh: 256 points
 /// break even (0.18 ms either way), 512 run 2.3 times faster in parallel.
-const PAR_MIN_POINTS: usize = 512;
+pub(crate) const PAR_MIN_POINTS: usize = 512;
 
 /// Points per parallel chunk of [`signed_distances`].
-const POINT_CHUNK: usize = 128;
+pub(crate) const POINT_CHUNK: usize = 128;
 
 /// Signed distances from `points_in_b` (in mesh B's local coordinates) to
 /// mesh B: `out[i]` gets the value for `points_in_b[i]`.
@@ -74,15 +74,7 @@ pub fn signed_distances(
             "sign data is not current for this mesh and BVH",
         ));
     }
-    let opts = ClosestOptions { max_distance };
-    let value = |p: [f32; 3]| -> Result<f32> {
-        Ok(match closest_point(mesh_b, bvh_b, p, &opts)? {
-            None => f32::INFINITY,
-            Some(hit) if hit.distance == 0.0 => 0.0,
-            Some(hit) if sign.is_inside(mesh_b, bvh_b, p, &hit) => -hit.distance,
-            Some(hit) => hit.distance,
-        })
-    };
+    let value = |p: [f32; 3]| point_value(mesh_b, bvh_b, sign, p, max_distance);
     if points_in_b.len() < PAR_MIN_POINTS || !par::enabled() || par::force_sequential() {
         for (&p, v) in points_in_b.iter().zip(out.iter_mut()) {
             *v = value(p)?;
@@ -103,6 +95,24 @@ pub fn signed_distances(
         chunk.copy_from_slice(&part);
     }
     Ok(())
+}
+
+/// The signed distance of one point, as [`signed_distances`] computes it
+/// (the inputs already checked).
+pub(crate) fn point_value(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    sign: &SignData,
+    p: [f32; 3],
+    max_distance: f32,
+) -> Result<f32> {
+    let opts = ClosestOptions { max_distance };
+    Ok(match closest_point(mesh, bvh, p, &opts)? {
+        None => f32::INFINITY,
+        Some(hit) if hit.distance == 0.0 => 0.0,
+        Some(hit) if sign.is_inside(mesh, bvh, p, &hit) => -hit.distance,
+        Some(hit) => hit.distance,
+    })
 }
 
 #[cfg(test)]
