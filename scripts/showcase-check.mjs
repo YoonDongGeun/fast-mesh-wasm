@@ -7,6 +7,7 @@
 //   node scripts/showcase-check.mjs --build       # build the example first
 //   node scripts/showcase-check.mjs --threads 4   # ?threads=4, and expect exactly 4
 //   node scripts/showcase-check.mjs --big         # also the 1M-triangle upload (RF4)
+//   node scripts/showcase-check.mjs --swiftshader # software WebGL (the default on Linux and under CI)
 //   node scripts/showcase-check.mjs --verbose     # echo the page's console
 //   node scripts/showcase-check.mjs --screenshot out.png   # the page at the end, as a PNG
 //
@@ -181,7 +182,13 @@ const server = await startServer(
   [vite, "preview", "--port", String(port), "--strictPort", "--host", "127.0.0.1"],
   { cwd: example, url: `http://127.0.0.1:${port}/` },
 );
-const browser = await launchChrome({ verbose, args: ["--window-size=1400,900"] });
+// WebGL without a GPU (CI runners): SwiftShader through ANGLE. On by default
+// on Linux and under CI, or with --swiftshader. `args` add to launchChrome's own.
+const swiftshader = flag("--swiftshader") || process.platform === "linux" || process.env.CI !== undefined;
+const browser = await launchChrome({
+  verbose,
+  args: ["--window-size=1400,900", ...(swiftshader ? ["--enable-unsafe-swiftshader", "--use-angle=swiftshader"] : [])],
+});
 const page = (expr) => browser.evaluate(expr);
 const hook = (expr) => page(`window.__showcase.${expr}`);
 
@@ -232,10 +239,19 @@ try {
   await browser.goto(`http://127.0.0.1:${port}/${query}`, "window.__showcase !== undefined");
 
   // ---- page ----
-  const info = await page(
-    "({ isolated: crossOriginIsolated, mode: __showcase.mode, threads: __showcase.threads(), cores: navigator.hardwareConcurrency })",
-  );
-  console.log(`${browser.name} (vite preview); ${info.cores} logical cores`);
+  const info = await page(`({
+    isolated: crossOriginIsolated,
+    mode: __showcase.mode,
+    threads: __showcase.threads(),
+    cores: navigator.hardwareConcurrency,
+    gl: (() => {
+      const gl = document.createElement("canvas").getContext("webgl2");
+      const ext = gl?.getExtension("WEBGL_debug_renderer_info");
+      return gl === null ? "no WebGL2" : ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    })(),
+  })`);
+
+  console.log(`${browser.name} (vite preview); ${info.cores} logical cores; WebGL: ${info.gl}`);
   const threadsOk = threads === undefined ? info.threads > 1 : info.threads === threads;
   verdict("page", info.isolated && info.mode === "worker" && threadsOk, `crossOriginIsolated ${info.isolated}, ${info.mode} scene, threads ${info.threads}`);
 
@@ -257,10 +273,18 @@ try {
   verdict("select", selected === true, `clicked (${fmt(at.x)}, ${fmt(at.y)}); selected ${await hook("selected()")}`);
 
   // ---- drag: the gizmo's centre handle (free move in the view plane) ----
-  await sleep(300); // the gizmo is created and drawn once before it can be hovered
+  // The gizmo is attached to A, then hovered until it reports a handle under
+  // the pointer (it picks against its own matrices, set when it is drawn).
+  const attached = await waitFor(`__showcase.gizmo()?.mesh === ${JSON.stringify(A)}`, 5000);
   const from = await hook(`screenPoint(${JSON.stringify(A)})`);
-  await mouse("mouseMoved", from.x, from.y, { button: "none" });
-  await sleep(50);
+  let axis = null;
+  for (const t = Date.now(); attached && axis === null && Date.now() - t < 5000; ) {
+    await mouse("mouseMoved", from.x, from.y, { button: "none" });
+    axis = await hook("gizmo()?.axis ?? null");
+    if (axis === null) {
+      await sleep(50);
+    }
+  }
   await mouse("mousePressed", from.x, from.y, { buttons: 1 });
   const wasDragging = await waitFor("__showcase.dragging()", 2000);
   for (let i = 1; i <= 12; i++) {
@@ -274,8 +298,8 @@ try {
   );
   verdict(
     "drag",
-    wasDragging === true && moved !== undefined,
-    `gizmo dragging ${wasDragging === true}; A moved by ${moved === undefined ? "nothing" : fmt(length(moved))}`,
+    attached === true && axis !== null && wasDragging === true && moved !== undefined,
+    `gizmo on A ${attached === true}, hovered handle ${axis}, dragging ${wasDragging === true}; A moved by ${moved === undefined ? "nothing" : fmt(length(moved))}`,
   );
 
   // ---- undo / redo ----

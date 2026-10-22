@@ -39,6 +39,18 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
     dragging: () => view.dragging,
+    /**
+     * The gizmo: `null` when there is none, else the mesh it is attached to
+     * and the handle under the pointer (`axis`, `null` until it is hovered).
+     */
+    gizmo: () => {
+      const g = view.gizmo;
+      if (g === null) {
+        return null;
+      }
+      const item = app.getSnapshot().items.find((i) => view.bindings.get(i.mesh)?.object === g.object);
+      return { mesh: item?.name ?? null, axis: g.axis };
+    },
     /** Where the mesh's origin (its centre when loaded, where the gizmo sits) is on the page, in CSS pixels. */
     screenPoint: (name: string) => {
       if (view.camera === null || view.canvas === null) {

@@ -9,7 +9,8 @@ import type { LoaderReply, LoaderRequest } from "./protocol";
 const DONE_LINGER_MS = 2500;
 
 export class Loader {
-  readonly #worker: Worker;
+  /** The loader Worker; `null` after it failed, until the next load starts a new one. */
+  #worker: Worker | null = null;
   readonly #store: SceneStore;
   readonly #app: AppState;
   readonly #waiting = new Map<number, { name: string; resolve: (items: Item[]) => void }>();
@@ -18,16 +19,6 @@ export class Loader {
   constructor(store: SceneStore, app: AppState) {
     this.#store = store;
     this.#app = app;
-    this.#worker = new Worker(new URL("./parser.worker.ts", import.meta.url), { type: "module" });
-    this.#worker.onmessage = (e: MessageEvent<LoaderReply>) => this.#receive(e.data);
-    this.#worker.onerror = (e) => {
-      // The Worker itself failed (its script did not load): fail every job.
-      for (const [id, job] of this.#waiting) {
-        this.#app.setJob({ id, name: job.name, phase: "error", message: e.message || "the loader Worker failed" });
-        job.resolve([]);
-      }
-      this.#waiting.clear();
-    };
   }
 
   /** Loads files; resolves with the meshes added (none for a file that failed: its job shows why). */
@@ -41,12 +32,38 @@ export class Loader {
     return this.#start(big ? "demo meshes (big)" : "demo meshes", { kind: "demo", id: 0, big });
   }
 
+  #workerFor(): Worker {
+    if (this.#worker === null) {
+      const worker = new Worker(new URL("./parser.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (e: MessageEvent<LoaderReply>) => this.#receive(e.data);
+      // The Worker failed (its script did not load, it crashed) or a reply
+      // could not be read: no job in it can finish. Fail them all and drop
+      // the Worker; the next load starts a new one.
+      worker.onerror = (e) => this.#fail(worker, e.message || "the loader Worker failed");
+      worker.onmessageerror = () => this.#fail(worker, "a loader Worker reply could not be read");
+      this.#worker = worker;
+    }
+    return this.#worker;
+  }
+
+  #fail(worker: Worker, message: string): void {
+    if (this.#worker === worker) {
+      this.#worker = null;
+    }
+    worker.terminate();
+    for (const [id, job] of this.#waiting) {
+      this.#app.setJob({ id, name: job.name, phase: "error", message });
+      job.resolve([]);
+    }
+    this.#waiting.clear();
+  }
+
   #start(name: string, request: LoaderRequest): Promise<Item[]> {
     const id = this.#nextJob++;
     this.#app.setJob({ id, name, phase: "reading" });
     return new Promise((resolve) => {
       this.#waiting.set(id, { name, resolve });
-      this.#worker.postMessage({ ...request, id });
+      this.#workerFor().postMessage({ ...request, id });
     });
   }
 
@@ -75,27 +92,65 @@ export class Loader {
       job.resolve([]);
       return;
     }
-    // Adding until the scene reports every mesh added (its mirror arrived from
-    // a Worker scene; the next frame on a local one).
+    this.#awaitAdded(reply.id, name, items, job.resolve);
+  }
+
+  /**
+   * Keeps the job at "adding" until the scene reports every mesh added (its
+   * mirror arrived from a Worker scene; the next frame on a local one). A mesh
+   * removed meanwhile no longer counts. When the scene errors first (one of
+   * these meshes, or the scene turning to "error": a poisoned Worker, which
+   * Restart replays), the job fails instead of waiting. An error the scene
+   * already had is someone else's.
+   */
+  #awaitAdded(id: number, name: string, items: Item[], resolve: (items: Item[]) => void): void {
     const pending = new Set(items.map((i) => i.mesh));
-    const done = () => {
-      off();
-      this.#app.setJob({ id: reply.id, name, phase: "done" });
-      setTimeout(() => this.#app.dropJob(reply.id), DONE_LINGER_MS);
-      job.resolve(items);
+    const erredBefore = this.#store.getSnapshot().status === "error";
+    let settled = false;
+    const settle = (error?: string) => {
+      settled = true;
+      offScene();
+      offStore();
+      if (error === undefined) {
+        this.#app.setJob({ id, name, phase: "done" });
+        setTimeout(() => this.#app.dropJob(id), DONE_LINGER_MS);
+      } else {
+        this.#app.setJob({ id, name, phase: "error", message: error });
+      }
+      resolve(items);
     };
-    const off = this.#store.scene.onChanges((changes) => {
+    const check = () => {
+      if (settled) {
+        return;
+      }
+      const snap = this.#store.getSnapshot();
+      let error: string | undefined;
+      for (const mesh of pending) {
+        const state = snap.meshes.get(mesh);
+        if (state === undefined) {
+          pending.delete(mesh);
+        } else if (state.status === "error") {
+          error = state.error?.message ?? "unknown error";
+        }
+      }
+      if (error === undefined && !erredBefore && snap.status === "error") {
+        error = snap.error?.message ?? "unknown error";
+      }
+      if (error !== undefined) {
+        settle(`the scene failed while adding: ${error}`);
+      } else if (pending.size === 0) {
+        settle();
+      }
+    };
+    const offScene = this.#store.scene.onChanges((changes) => {
       for (const c of changes) {
         if (c.added || c.removed) {
           pending.delete(c.mesh);
         }
       }
-      if (pending.size === 0) {
-        done();
-      }
+      check();
     });
-    if (pending.size === 0) {
-      done();
-    }
+    const offStore = this.#store.subscribe(check);
+    check();
   }
 }

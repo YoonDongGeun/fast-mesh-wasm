@@ -30,10 +30,12 @@ export function Viewport(props: { items: readonly Item[]; mode: GizmoMode; focus
       } else {
         next.set(mesh, bound);
       }
-      view.bindings = next;
       return next;
     });
   }, []);
+  useEffect(() => {
+    view.bindings = bindings;
+  }, [bindings]);
   const selected = selection === null ? null : (bindings.get(selection) ?? null);
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
 
@@ -66,6 +68,10 @@ function MeshView(props: {
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
+      // The end of an orbit drag that started on the mesh is not a click.
+      if (e.delta > 2) {
+        return;
+      }
       onPick(item.mesh);
     },
     [item.mesh, onPick],
@@ -106,6 +112,10 @@ function Controls(props: {
     return () => {
       o.dispose();
       setOrbit((c) => (c === o ? null : c));
+      if (view.camera === camera) {
+        view.camera = null;
+        view.canvas = null;
+      }
     };
   }, [camera, gl]);
 
@@ -125,6 +135,7 @@ function Controls(props: {
       view.dragging = e.value === true;
     };
     controls.addEventListener("dragging-changed", onDragging);
+    view.gizmo = controls;
     setGizmo(controls);
     return () => {
       controls.removeEventListener("dragging-changed", onDragging);
@@ -134,6 +145,9 @@ function Controls(props: {
       controls.dispose();
       orbit.enabled = true;
       view.dragging = false;
+      if (view.gizmo === controls) {
+        view.gizmo = null;
+      }
       setGizmo((g) => (g === controls ? null : g));
     };
   }, [store, camera, gl, scene, orbit, bound]);

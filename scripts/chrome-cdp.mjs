@@ -90,7 +90,8 @@ class Cdp {
 /**
  * Launches headless Chrome and opens a page. Returns `{ goto, evaluate, send,
  * workers, consoleLines, close }`; `workers()` lists the live dedicated
- * Workers of the page, nested ones included (auto-attached).
+ * Workers of the page, nested ones included (auto-attached). `args` are added
+ * to the default flags (software WebGL for GPU-less runners, a window size).
  */
 export async function launchChrome({ verbose = false, args = [] } = {}) {
   const profile = mkdtempSync(join(tmpdir(), "fast-mesh-chrome-"));
