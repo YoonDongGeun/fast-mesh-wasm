@@ -11,6 +11,12 @@ mod error;
 mod render;
 mod scene;
 
+/// `initThreadPool(n)` (threaded artifact only): starts rayon's pool on `n`
+/// Web Workers that share this module and its memory. Await it once, right
+/// after `init()`, before any other call.
+#[cfg(all(feature = "threads", target_arch = "wasm32"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 fn to_js_error(err: fast_mesh::MeshError) -> JsError {
     JsError::new(&err.to_string())
 }

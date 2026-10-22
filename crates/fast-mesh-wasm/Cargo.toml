@@ -17,6 +17,12 @@ crate-type = ["cdylib", "rlib"]
 # Only `node scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`), run
 # by the package's `test` script, enables it; release builds never do.
 test-panic = []
+# Multithreaded engine hot loops (rayon); results are bit-identical without it.
+parallel = ["fast-mesh-scene/parallel", "fast-mesh-ops/parallel"]
+# The threaded artifact (`node scripts/build-wasm.mjs --threads`, pinned
+# nightly, wasm atomics): `parallel` plus `initThreadPool`, which starts
+# rayon's pool on Web Workers sharing this module's memory.
+threads = ["parallel", "dep:wasm-bindgen-rayon"]
 
 [dependencies]
 fast-mesh.workspace = true
@@ -27,3 +33,6 @@ fast-mesh-query.workspace = true
 fast-mesh-fields.workspace = true
 fast-mesh-ops.workspace = true
 wasm-bindgen.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-rayon = { workspace = true, optional = true }

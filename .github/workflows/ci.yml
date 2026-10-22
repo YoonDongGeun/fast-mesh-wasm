@@ -74,6 +74,15 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # The threaded artifact (dist/wasm-threads) needs a nightly with rust-src
+      # (`-Z build-std`). Its date is the NIGHTLY constant in scripts/build-wasm.mjs.
+      - name: Install the pinned nightly for the threaded artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          nightly=$(node scripts/build-wasm.mjs --print-nightly)
+          rustup toolchain install "$nightly" --profile minimal --component rust-src --target wasm32-unknown-unknown
+      # Builds both artifacts: dist/wasm (stable) and dist/wasm-threads (nightly).
       - run: pnpm build
       - name: Check exports and types (publint, attw)
         run: pnpm check:pkg

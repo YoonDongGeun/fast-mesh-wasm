@@ -30,6 +30,10 @@ You need:
   ```sh
   cargo install wasm-bindgen-cli --version =0.2.129 --locked
   ```
+- The nightly that builds the threaded artifact (`dist/wasm-threads`), with `rust-src`. Its date is the `NIGHTLY` constant in `scripts/build-wasm.mjs`:
+  ```sh
+  rustup toolchain install "$(node scripts/build-wasm.mjs --print-nightly)" --profile minimal --component rust-src --target wasm32-unknown-unknown
+  ```
 - [Node.js](https://nodejs.org) 22.11 or newer
 - [pnpm](https://pnpm.io). The repo pins its version in `packageManager`; `npm install -g pnpm` is enough.
 - Optional: [Bun](https://bun.sh), to run the bun smoke test locally.
@@ -48,7 +52,7 @@ pnpm test
 
 | Command | What it does |
 | --- | --- |
-| `pnpm build` | Rust → `.wasm` → wasm-bindgen glue and `.d.ts` → wasm-opt → TypeScript bundle in `packages/fast-mesh-wasm/dist` |
+| `pnpm build` | Rust → `.wasm` → wasm-bindgen glue and `.d.ts` → wasm-opt → TypeScript bundle in `packages/fast-mesh-wasm/dist`; builds both the single-threaded artifact (`dist/wasm`, stable) and the threaded one (`dist/wasm-threads`, `scripts/build-wasm.mjs --threads`, pinned nightly) |
 | `pnpm test` | `cargo test` for the core, then a test build of the package and Vitest against it |
 | `pnpm lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
 | `pnpm check:pkg` | publint and Are The Types Wrong on the package |
@@ -74,7 +78,7 @@ RAYON_NUM_THREADS=1 cargo test --workspace --features fast-mesh-scene/parallel,f
 
 Also run clippy with the same `--features`. Benchmarks take it too, for example `cargo bench -p fast-mesh-bvh --features parallel`.
 
-Do not enable `parallel` for `wasm32-unknown-unknown`: that target has no threads, so `fast-mesh-wasm` and the npm package build without it (wasm threads are planned for a later stage). CI checks that rayon stays out of the default build for both targets.
+Do not enable `parallel` for a plain `wasm32-unknown-unknown` build: that target has no threads, so the single-threaded artifact (`dist/wasm`) builds without it. CI checks that rayon stays out of the default build for both targets. The threaded artifact (`dist/wasm-threads`) enables it through `fast-mesh-wasm`'s `threads` feature, built only by `scripts/build-wasm.mjs --threads` on the pinned nightly with wasm atomics, a rebuilt std and a shared memory (maximum 4 GiB); its `initThreadPool(n)` starts rayon's pool on Web Workers. Only the Worker entry (`worker-entry.js`) may import it.
 
 Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread. `par::set_force_sequential` is counted: pair every `true` with one `false`.
 

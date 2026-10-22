@@ -7,8 +7,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "build:wasm": "node scripts/build-wasm.mjs",
-    "build": "node scripts/build-wasm.mjs && pnpm --filter fast-mesh-wasm build",
+    "build:wasm": "node scripts/build-wasm.mjs && node scripts/build-wasm.mjs --threads",
+    "build": "pnpm build:wasm && pnpm --filter fast-mesh-wasm build",
     "test": "cargo test --workspace && pnpm --filter fast-mesh-wasm test",
     "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings",
     "check:pkg": "pnpm --filter fast-mesh-wasm check",
