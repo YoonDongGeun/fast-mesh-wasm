@@ -63,5 +63,9 @@ pub fn watch_pool_crashes(channel: String) {
     }));
     let channel = CHANNEL.get().map(String::as_str).unwrap_or_default();
     // Every pool thread installs its Worker's listeners (the threads are idle).
+    // No timeout: this blocks until every thread ran it. A pool thread that
+    // died between `initThreadPool` resolving and this broadcast would block
+    // it forever, and the engine never reports ready; that window is not
+    // covered, but nothing runs on the pool in it.
     rayon::broadcast(|_| watch_worker(channel));
 }

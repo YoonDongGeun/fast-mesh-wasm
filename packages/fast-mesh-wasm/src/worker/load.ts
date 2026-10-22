@@ -41,7 +41,10 @@ export interface LoadOptions {
   isolated: boolean;
   importThreaded: () => Promise<ThreadedGlue>;
   importSingle: () => Promise<Glue>;
-  /** Development only: called once when the engine is single-threaded though more threads were asked for. */
+  /**
+   * Development only: called once when the engine is single-threaded though
+   * more threads were asked for, or when its pool cannot be watched for crashes.
+   */
   warn?: (message: string) => void;
   /** How long the pool may take to start: {@link POOL_TIMEOUT_MS} by default. */
   poolTimeoutMs?: number;
@@ -106,9 +109,13 @@ export async function loadEngine(
       if (options.crashChannel !== undefined) {
         try {
           started.wasm.watchPoolCrashes(options.crashChannel);
-        } catch {
+        } catch (e) {
           // The engine works unwatched: a crash on a pool thread then hangs
           // the scene instead of poisoning it, as before the watch existed.
+          const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+          warn?.(
+            `fast-mesh-wasm: crash detection unavailable (${cause}): a crash on a thread of the pool will hang the Worker scene instead of failing its calls with INSTANCE_POISONED. ${SEE}`,
+          );
         }
       }
       return { ...started, threads };

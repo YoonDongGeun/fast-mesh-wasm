@@ -104,16 +104,29 @@ describe("loadEngine", () => {
     const single: string[] = [];
     await loadEngine({ threads: 1, isolated: true, ...loaders(single), crashChannel: "ch" });
     expect(single).toEqual(["importSingle", "single.init"]);
-    // A watch that cannot start leaves a working threaded engine (unwatched).
+    // A watch that cannot start leaves a working threaded engine (unwatched),
+    // with a development warning.
     const failed: string[] = [];
+    const warn = vi.fn();
     const unwatched = await loadEngine({
       threads: 2,
       isolated: true,
       ...loaders(failed, { watch: new Error("no BroadcastChannel") }),
       crashChannel: "ch",
+      warn,
     });
     expect(unwatched.threads).toBe(2);
     expect(failed.at(-1)).toBe("threaded.watch(ch)");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/crash detection unavailable \(Error: no BroadcastChannel\)/);
+    // Not in production (no `warn`): silent.
+    const quiet = await loadEngine({
+      threads: 2,
+      isolated: true,
+      ...loaders([], { watch: new Error("no BroadcastChannel") }),
+      crashChannel: "ch",
+    });
+    expect(quiet.threads).toBe(2);
     // startEngine passes the init message's channel.
     const started: string[] = [];
     await startEngine({ kind: "init", threads: 3, debug: false, crashChannel: "x" }, loaders(started), true);
@@ -425,6 +438,29 @@ describe("WorkerScene threads", () => {
     expect(workers[1].watched).toEqual([next]);
     expect(scene.threads).toBe(4);
     expect(await scene.intersects(mesh, mesh)).toBe(true);
+  });
+
+  it("old_crash_channel_ignored_after_restart", async () => {
+    // A report on the retired Worker's channel (a late one from its pool)
+    // must not poison the scene the restart brought back.
+    vi.stubGlobal("crossOriginIsolated", true);
+    const { scene, workers } = await start({ isolated: true, threaded: "fake" }, { threads: 2 });
+    const old = (workers[0].sent[0] as InitMessage).crashChannel as string;
+    const a = tetra(0);
+    const mesh = scene.addMesh(a.positions, a.indices);
+    await scene.restart();
+    const sender = new BroadcastChannel(old);
+    sender.postMessage({ kind: "poolCrash", detail: "late report (test)" });
+    sender.close();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(workers[1].terminated).toBe(false);
+    expect(await scene.intersects(mesh, mesh)).toBe(true);
+    // The current channel still poisons.
+    const current = new BroadcastChannel((workers[1].sent[0] as InitMessage).crashChannel as string);
+    current.postMessage({ kind: "poolCrash", detail: "current report (test)" });
+    current.close();
+    await vi.waitFor(() => expect(workers[1].terminated).toBe(true));
+    await expect(scene.intersects(mesh, mesh)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
   });
 
   it("pool_failure_watches_nothing", async () => {
