@@ -239,7 +239,12 @@ export interface DistanceFieldDesc {
 export interface FieldStatus {
   /** True when the values match the meshes and placements as they are now. */
   current: boolean;
-  /** What the latest sign data build found out about the (first) target mesh. */
+  /**
+   * What the latest sign data builds found out about the target meshes,
+   * together: `closed` and `consistentOrientation` when every target is, the
+   * counts summed, and the first target's `mode`. See
+   * {@link Scene.fieldTargetStatus} for each target.
+   */
   sign: {
     /** The mode in use (never `"auto"`). */
     mode: Exclude<SignMode, "auto">;
@@ -1717,7 +1722,30 @@ export class Scene implements SceneLike {
     return out;
   }
 
-  /** Whether the field is current, and what its sign data found out about the target mesh. */
+  /**
+   * What the sign data found out about each of the field's targets, in the
+   * order of {@link Scene.fieldTargets}.
+   */
+  fieldTargetStatus(field: FieldHandle): FieldStatus["sign"][] {
+    const raw = this.#field(field);
+    const st = call(() => this.#peek().field_target_status(raw));
+    const out: FieldStatus["sign"][] = [];
+    for (let i = 0; i < st.length; i += 5) {
+      out.push({
+        mode: st[i] === 2 ? "winding" : "pseudonormal",
+        closed: st[i + 1] === 1,
+        consistentOrientation: st[i + 2] === 1,
+        nonManifoldVertices: st[i + 3],
+        degenerateTriangles: st[i + 4],
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Whether the field is current, and what its sign data found out about the
+   * target meshes, together (see {@link FieldStatus.sign}).
+   */
   fieldStatus(field: FieldHandle): FieldStatus {
     const raw = this.#field(field);
     const st = call(() => this.#peek().field_status(raw));

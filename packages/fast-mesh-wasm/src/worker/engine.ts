@@ -997,7 +997,12 @@ class Engine {
         this.#runSection(req);
         return;
       case "query":
-        if (req.name === "fieldStatus" || req.name === "fieldNearest" || req.name === "debugDump") {
+        if (
+          req.name === "fieldStatus" ||
+          req.name === "fieldNearest" ||
+          req.name === "fieldTargetStatus" ||
+          req.name === "debugDump"
+        ) {
           this.#settleFields();
         }
         b.replies.push({ qid: req.qid, ok: true, value: this.#query(req.name, req.args) });
@@ -1169,6 +1174,10 @@ class Engine {
       case "analyze": {
         const a = args as QueryMap["analyze"]["args"];
         return s.analyze(this.#mesh(a.mesh), a.options);
+      }
+      case "fieldTargetStatus": {
+        const a = args as QueryMap["fieldTargetStatus"]["args"];
+        return s.fieldTargetStatus(this.#field(a.field));
       }
       case "fieldNearest": {
         const a = args as QueryMap["fieldNearest"]["args"];

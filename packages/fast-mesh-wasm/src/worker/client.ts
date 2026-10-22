@@ -1717,7 +1717,19 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Whether the field is current, and what its sign data found; see `Scene.fieldStatus`. */
+  /** What the sign data found out about each of the field's targets; see `Scene.fieldTargetStatus`. */
+  fieldTargetStatus(field: FieldHandle): Promise<FieldStatus["sign"][]> {
+    return this.#query(
+      "fieldTargetStatus",
+      () => ({ field: this.#field(field).id }),
+      (v) => v as FieldStatus["sign"][],
+    );
+  }
+
+  /**
+   * Whether the field is current, and what its sign data found out about the
+   * targets together; see `Scene.fieldStatus`.
+   */
   fieldStatus(field: FieldHandle): Promise<FieldStatus> {
     return this.#query(
       "fieldStatus",

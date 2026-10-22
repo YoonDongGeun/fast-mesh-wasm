@@ -362,6 +362,14 @@ describe("sections", () => {
     // A single target, alone or in a list of one, is the same field.
     const listed = s.addDistanceField({ name: "l", on: a, to: [b], maxDistance: 0.5 });
     expect(s.fieldTargets(multi)).toEqual([b, c]);
+    const each = s.fieldTargetStatus(multi);
+    expect(each.length).toBe(2);
+    expect(each.every((st) => st.closed)).toBe(true);
+    expect(s.fieldStatus(multi).sign).toEqual({
+      ...each[0],
+      nonManifoldVertices: each[0].nonManifoldVertices + each[1].nonManifoldVertices,
+      degenerateTriangles: each[0].degenerateTriangles + each[1].degenerateTriangles,
+    });
     const check = () => {
       const got = Array.from(s.fieldValues(multi));
       const nearest = Array.from(s.fieldNearest(multi));

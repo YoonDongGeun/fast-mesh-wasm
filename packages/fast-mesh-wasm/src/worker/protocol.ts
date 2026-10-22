@@ -133,6 +133,7 @@ export interface QueryMap {
   analyze: { args: { mesh: ClientId; options?: AnalyzeOptions }; value: unknown };
   fieldStatus: { args: { field: ClientId }; value: unknown };
   fieldNearest: { args: { field: ClientId }; value: unknown };
+  fieldTargetStatus: { args: { field: ClientId }; value: unknown };
   sectionGap: {
     args: { section: ClientId; a: ClientId; b: ClientId };
     value: { distance: number; a: Vec3; b: Vec3 } | null;

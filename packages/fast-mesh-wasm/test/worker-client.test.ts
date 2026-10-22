@@ -206,6 +206,8 @@ describe("WorkerScene", () => {
     await settle(scene);
     expect(Array.from(await scene.fetchFieldValues(field))).toEqual(Array.from(local.fieldValues(want)));
     const nearest = await scene.fetchFieldNearest(field);
+    expect(await scene.fieldTargetStatus(field)).toEqual(local.fieldTargetStatus(want));
+    expect((await scene.fieldStatus(field)).sign).toEqual(local.fieldStatus(want).sign);
     expect(Array.from(nearest)).toEqual(Array.from(local.fieldNearest(want)));
     expect(Array.from(nearest)).toContain(1);
     // A removed target leaves the field with the others.
