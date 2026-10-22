@@ -232,11 +232,25 @@ export interface Result {
  * The first message to a Worker, before any batch: how to start the engine.
  * `threads` is the pool size asked for (`undefined`: the Worker's default,
  * see `defaultThreads`); `debug` asks for the development warnings.
+ * `crashChannel` (threaded engines only) names the `BroadcastChannel` the
+ * pool's threads report a crash on: the engine Worker is then blocked and
+ * cannot, so the scene listens there itself (see {@link PoolCrash}).
  */
 export interface InitMessage {
   kind: "init";
   threads?: number;
   debug: boolean;
+  crashChannel?: string;
+}
+
+/**
+ * What a pool thread posts on the init message's `crashChannel` when it
+ * panics or traps (`detail`: the panic message, or the error). The thread
+ * is gone and the engine Worker waits on it forever: the scene poisons.
+ */
+export interface PoolCrash {
+  kind: "poolCrash";
+  detail: string;
 }
 
 /** Whether a message to a Worker is its {@link InitMessage} (else a batch). */

@@ -378,6 +378,7 @@ dependencies = [
  "fast-mesh-query",
  "fast-mesh-scene",
  "fast-mesh-store",
+ "rayon",
  "wasm-bindgen",
  "wasm-bindgen-rayon",
 ]

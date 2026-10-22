@@ -16,6 +16,8 @@ describe.skipIf(!existsSync(threadsDir) && !process.env.CI)("threaded artifact (
   it("threaded_artifact_built", async () => {
     const glue = readFileSync(join(threadsDir, "fast_mesh_wasm.js"), "utf8");
     expect(glue).toMatch(/export function initThreadPool\(/);
+    // Pool threads report their crashes (panics, traps) on a BroadcastChannel.
+    expect(glue).toMatch(/export function watchPoolCrashes\(/);
     expect(glue).toMatch(/export \{[^}]*__wbg_init as default[^}]*\}/);
     expect(readFileSync(join(threadsDir, "fast_mesh_wasm.d.ts"), "utf8")).toMatch(
       /export function initThreadPool\(num_threads: number\): Promise<any>;/,

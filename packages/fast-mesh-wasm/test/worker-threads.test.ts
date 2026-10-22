@@ -8,7 +8,7 @@ import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
-import type { Request } from "../src/worker/protocol.js";
+import type { InitMessage, Request } from "../src/worker/protocol.js";
 import {
   defaultThreads,
   type Glue,
@@ -21,7 +21,11 @@ import {
 const hasThreaded = existsSync(new URL("../dist/wasm-threads/fast_mesh_wasm.js", import.meta.url));
 
 /** A fake glue: records what was called, in order. */
-function fakeGlue(log: string[], name: string, fail: { init?: unknown; pool?: unknown; hang?: boolean } = {}) {
+function fakeGlue(
+  log: string[],
+  name: string,
+  fail: { init?: unknown; pool?: unknown; hang?: boolean; watch?: unknown } = {},
+) {
   const memory = new WebAssembly.Memory({ initial: 1 });
   class WasmScene {}
   return {
@@ -42,11 +46,20 @@ function fakeGlue(log: string[], name: string, fail: { init?: unknown; pool?: un
         }
         return fail.pool !== undefined ? Promise.reject(fail.pool) : Promise.resolve();
       },
+      watchPoolCrashes: (channel: string) => {
+        log.push(`${name}.watch(${channel})`);
+        if (fail.watch !== undefined) {
+          throw fail.watch;
+        }
+      },
     } as unknown as ThreadedGlue,
   };
 }
 
-function loaders(log: string[], fail: { import?: unknown; init?: unknown; pool?: unknown; hang?: boolean } = {}) {
+function loaders(
+  log: string[],
+  fail: { import?: unknown; init?: unknown; pool?: unknown; hang?: boolean; watch?: unknown } = {},
+) {
   const threaded = fakeGlue(log, "threaded", fail);
   const single = fakeGlue(log, "single");
   return {
@@ -77,6 +90,34 @@ describe("loadEngine", () => {
     expect(got.memory).toBe(l.threaded.memory);
     expect(log).toEqual(["importThreaded", "threaded.init", "threaded.pool(4)"]);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("threaded_watches_pool_crashes", async () => {
+    // The scene's channel goes to the pool once it runs: its threads report
+    // a crash there (the engine Worker itself is then blocked).
+    const log: string[] = [];
+    const l = loaders(log);
+    const got = await loadEngine({ threads: 4, isolated: true, ...l, crashChannel: "ch" });
+    expect(got.threads).toBe(4);
+    expect(log).toEqual(["importThreaded", "threaded.init", "threaded.pool(4)", "threaded.watch(ch)"]);
+    // Single-threaded, there is no pool to watch.
+    const single: string[] = [];
+    await loadEngine({ threads: 1, isolated: true, ...loaders(single), crashChannel: "ch" });
+    expect(single).toEqual(["importSingle", "single.init"]);
+    // A watch that cannot start leaves a working threaded engine (unwatched).
+    const failed: string[] = [];
+    const unwatched = await loadEngine({
+      threads: 2,
+      isolated: true,
+      ...loaders(failed, { watch: new Error("no BroadcastChannel") }),
+      crashChannel: "ch",
+    });
+    expect(unwatched.threads).toBe(2);
+    expect(failed.at(-1)).toBe("threaded.watch(ch)");
+    // startEngine passes the init message's channel.
+    const started: string[] = [];
+    await startEngine({ kind: "init", threads: 3, debug: false, crashChannel: "x" }, loaders(started), true);
+    expect(started.at(-1)).toBe("threaded.watch(x)");
   });
 
   it("single_thread_never_loads_threaded", async () => {
@@ -178,6 +219,8 @@ interface Pose {
   isolated?: boolean;
   /** The threaded glue: a fake that starts, or a real/failing start-up. */
   threaded?: "fake" | "poolFail" | "real" | "memFail" | "importFail";
+  /** `analyze` posts a pool thread's crash report, then blocks the engine. */
+  poolCrash?: boolean;
 }
 
 /** The harness Worker as a `WorkerLike`, keeping its own `pool` reports apart. */
@@ -185,6 +228,8 @@ class NodeWorker implements WorkerLike {
   readonly worker: Worker;
   readonly sent: unknown[] = [];
   readonly pools: number[] = [];
+  /** Channels the fake threaded glue was asked to watch for pool crashes. */
+  readonly watched: string[] = [];
   terminated = false;
   /** While set, `fallback` messages are kept in `fallbacks` until `release()`. */
   holdFallbacks = false;
@@ -196,9 +241,13 @@ class NodeWorker implements WorkerLike {
     this.worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), {
       workerData: { serve: true, ...pose },
     });
-    this.worker.on("message", (data: { kind?: string; threads?: number }) => {
+    this.worker.on("message", (data: { kind?: string; threads?: number; channel?: string }) => {
       if (data.kind === "pool") {
         this.pools.push(data.threads as number);
+        return;
+      }
+      if (data.kind === "watch") {
+        this.watched.push(data.channel as string);
         return;
       }
       if (data.kind === "fallback" && this.holdFallbacks) {
@@ -259,6 +308,7 @@ afterEach(() => {
     s.terminate();
   }
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 /** A scene over harness Workers; `pose` may differ per Worker (by index). */
@@ -335,9 +385,57 @@ describe("WorkerScene threads", () => {
   });
 
   it("threads_one_forces_single", async () => {
+    vi.stubGlobal("crossOriginIsolated", true);
     const { scene, workers } = await start({ isolated: true, threaded: "fake" }, { threads: 1 });
     expect(scene.threads).toBe(1);
     expect(workers[0].pools).toEqual([]);
+    // No pool, so no crash channel.
+    expect(workers[0].sent[0]).toEqual({ kind: "init", threads: 1, debug: expect.any(Boolean) });
+  });
+
+  it("pool_crash_poisons", async () => {
+    // A pool thread crashes: the engine Worker blocks and never answers; the
+    // crash report on the scene's channel poisons the scene, as a Worker
+    // error does, and a restart recovers with a new pool.
+    vi.stubGlobal("crossOriginIsolated", true);
+    const { scene, workers } = await start({ isolated: true, threaded: "fake", poolCrash: true }, { threads: 4 });
+    expect(scene.threads).toBe(4);
+    const channel = (workers[0].sent[0] as InitMessage).crashChannel;
+    expect(channel).toEqual(expect.any(String));
+    expect(workers[0].watched).toEqual([channel]);
+    const a = tetra(0);
+    const mesh = scene.addMesh(a.positions, a.indices);
+    expect(await scene.intersects(mesh, mesh)).toBe(true);
+    const t0 = performance.now();
+    const crashed = scene.analyze(mesh);
+    const after = scene.intersects(mesh, mesh);
+    await expect(crashed).rejects.toMatchObject({
+      code: "INSTANCE_POISONED",
+      message: expect.stringMatching(/pool.*test pool panic/),
+    });
+    await expect(after).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(workers[0].terminated).toBe(true);
+    await expect(scene.intersects(mesh, mesh)).rejects.toMatchObject({ code: "INSTANCE_POISONED" });
+    await scene.restart();
+    expect(workers).toHaveLength(2);
+    const next = (workers[1].sent[0] as InitMessage).crashChannel;
+    expect(next).toEqual(expect.any(String));
+    expect(next).not.toBe(channel);
+    expect(workers[1].watched).toEqual([next]);
+    expect(scene.threads).toBe(4);
+    expect(await scene.intersects(mesh, mesh)).toBe(true);
+  });
+
+  it("pool_failure_watches_nothing", async () => {
+    // The pool failed and the Worker was replaced by a single-threaded one:
+    // its init has no crash channel, and the scene works.
+    vi.stubGlobal("crossOriginIsolated", true);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { scene, workers } = await start({ isolated: true, threaded: "poolFail" }, { threads: 4 });
+    expect(scene.threads).toBe(1);
+    expect(workers[1].sent[0]).toEqual({ kind: "init", threads: 1, debug: expect.any(Boolean) });
+    await works(scene);
   });
 
   it("restart_reinitialises_pool", async () => {

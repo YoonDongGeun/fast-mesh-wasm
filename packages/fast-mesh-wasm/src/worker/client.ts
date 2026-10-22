@@ -48,6 +48,7 @@ import {
   isLastWins,
   keyOf,
   type MeshChangeWire,
+  type PoolCrash,
   type QueryMap,
   type Request,
   type Result,
@@ -424,6 +425,9 @@ function coversOf(req: Request): string[] {
 /** A stand-in for a retired Worker: nothing sent to it goes anywhere. */
 const INERT: WorkerLike = { postMessage() {}, addEventListener() {}, terminate() {} };
 
+/** Crash channels made so far (part of each name, which must be unique). */
+let crashChannels = 0;
+
 /** A Worker's start: settled by its `ready` or `fatal` message, or an error. */
 interface Ready {
   promise: Promise<void>;
@@ -566,6 +570,8 @@ export class WorkerScene implements SceneLike {
   #handoff: Handoff | undefined;
   /** Whether the start-up warning was logged (once per scene). */
   #warned = false;
+  /** The current Worker's crash channel (see `#watch`), while it may run threaded. */
+  #crashWatch: BroadcastChannel | undefined;
   /** Use {@link createWorkerScene}. */
   private constructor(make: () => WorkerLike, options: { debug: boolean; init: InitMessage }) {
     this.#make = make;
@@ -625,8 +631,9 @@ export class WorkerScene implements SceneLike {
       });
     });
     // The init message goes first: the engine starts on it, and batches wait.
+    this.#unwatch();
     try {
-      worker.postMessage(this.#init);
+      worker.postMessage(this.#watch(worker));
     } catch (e) {
       // It never starts; a restart's replay fails to post the same way.
       const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -637,6 +644,43 @@ export class WorkerScene implements SceneLike {
   }
 
   /**
+   * The init message for `worker`, naming a crash channel when its engine
+   * may run threaded (more than one thread asked for, on a cross-origin
+   * isolated page). A panic or trap on a pool thread kills only that nested
+   * Worker; the engine Worker stays blocked waiting for it and never
+   * answers. So the pool's threads report the crash on this channel, and it
+   * poisons the scene as a Worker error does. Nothing is listened to on
+   * other pages (single-threaded engines report their own traps).
+   */
+  #watch(worker: WorkerLike): InitMessage {
+    const isolated = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+    if (this.#init.threads === 1 || !isolated || typeof BroadcastChannel !== "function") {
+      return this.#init;
+    }
+    const name = `fast-mesh-wasm:pool-crash:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}:${++crashChannels}`;
+    const channel = new BroadcastChannel(name);
+    channel.onmessage = (e: MessageEvent) => {
+      const msg = e.data as PoolCrash | null;
+      if (msg?.kind !== "poolCrash" || worker !== this.#worker) {
+        return;
+      }
+      this.#detach();
+      this.#poisonAll({
+        code: "INSTANCE_POISONED",
+        message: `a thread of the Worker's pool crashed (${String(msg.detail)}); the Worker scene can no longer be used`,
+      });
+    };
+    this.#crashWatch = channel;
+    return { ...this.#init, crashChannel: name };
+  }
+
+  /** Stops listening to the current Worker's crash channel. */
+  #unwatch(): void {
+    this.#crashWatch?.close();
+    this.#crashWatch = undefined;
+  }
+
+  /**
    * Stops hearing the current Worker and terminates it: after an error its
    * late results (for batches already failed here) must not apply.
    */
@@ -644,6 +688,7 @@ export class WorkerScene implements SceneLike {
     const old = this.#worker;
     this.#worker = INERT;
     old.terminate();
+    this.#unwatch();
     this.#dropHandoff();
   }
 
@@ -915,6 +960,10 @@ export class WorkerScene implements SceneLike {
     if ("kind" in msg) {
       if (msg.kind === "ready") {
         this.#threads = msg.threads ?? 1;
+        if (this.#threads === 1) {
+          // It fell back to the single-threaded engine: no pool to hear.
+          this.#unwatch();
+        }
         if (msg.warning !== undefined && !this.#warned) {
           this.#warned = true;
           console.warn(msg.warning);
@@ -2072,6 +2121,7 @@ export class WorkerScene implements SceneLike {
     // Its late messages are ignored from here on (see #attach).
     this.#worker = INERT;
     old.terminate();
+    this.#unwatch();
     this.#dropHandoff();
     if (this.#fallback !== undefined) {
       clearTimeout(this.#fallback);
@@ -2326,6 +2376,7 @@ export class WorkerScene implements SceneLike {
       this.#drag = undefined;
     }
     this.#worker.terminate();
+    this.#unwatch();
     this.#dropHandoff();
     const error = invalid("the Worker scene is terminated");
     if (!this.#ready.settled) {

@@ -20,12 +20,16 @@
 // no `crossOriginIsolated`): single-threaded, no warnings. `{ isolated }` poses
 // as a page reporting that `crossOriginIsolated`, and `{ threaded }` replaces
 // the threaded glue: `"fake"` starts (the single-threaded glue, with an
-// `initThreadPool` that posts `{ kind: "pool", threads }`), `"poolFail"` a fake whose
+// `initThreadPool` that posts `{ kind: "pool", threads }` and a `watchPoolCrashes`
+// that posts `{ kind: "watch", channel }`), `"poolFail"` a fake whose
 // pool rejects (the Worker then asks to be replaced), `"real"` is the
 // built dist/wasm-threads glue (it instantiates, but its pool cannot start: no
 // nested `Worker` in Node), `"memFail"` is that glue failing to allocate its
 // shared memory (`new WebAssembly.Memory` throws a RangeError), and
-// `"importFail"` an import that rejects.
+// `"importFail"` an import that rejects. `{ poolCrash: true }` makes `analyze`
+// stand for a crash on a pool thread: it posts the crash report on the watched
+// channel, as the threaded glue's pool threads do, then blocks this thread (as
+// the engine Worker waits on rayon's latch) for up to 10 s.
 import { readFileSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import "../../dist/node.js";
@@ -44,6 +48,16 @@ if (workerData?.packThrow) {
 if (workerData?.undoThrow) {
   raw.WasmScene.prototype.undo = () => {
     throw new Error("INVALID_ARGUMENT: undo failed (test)");
+  };
+}
+
+/** The channel `watchPoolCrashes` was given (the fake threaded glue). */
+let crashChannel;
+if (workerData?.poolCrash) {
+  raw.WasmScene.prototype.analyze = () => {
+    new BroadcastChannel(crashChannel).postMessage({ kind: "poolCrash", detail: "panicked at test pool panic" });
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10_000);
+    throw new Error("the pool crash was not noticed (test)");
   };
 }
 
@@ -82,6 +96,10 @@ function threadedLoader(kind) {
         WasmScene: raw.WasmScene,
         initThreadPool: async (threads) => {
           parentPort.postMessage({ kind: "pool", threads });
+        },
+        watchPoolCrashes: (channel) => {
+          crashChannel = channel;
+          parentPort.postMessage({ kind: "watch", channel });
         },
       });
     case "poolFail":

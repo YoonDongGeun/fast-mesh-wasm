@@ -29,6 +29,13 @@
 //   and none is left after `terminate()`.
 // - nested: the pool's nested Workers cannot load; the scene starts
 //   single-threaded (after the pool timeout), warns once and works.
+// - poolCrash: a thread of a threaded scene's pool panics, then (a second
+//   scene) traps without a panic; each time the calls left waiting on the
+//   blocked engine reject with INSTANCE_POISONED within 2 s, a mesh add's status
+//   turns from "computing" to "error", and `restart()` starts a new pool
+//   (threads > 1) that works; Chrome only: no Worker is left after
+//   `terminate()`. Needs the threaded test build (`pnpm --filter fast-mesh-wasm
+//   test`, then `--build`): skipped without it, failed when named in --only.
 //
 // --bench runs the wide-range drag (bench/scene.bench.mjs 5f) single-threaded
 // and threaded instead, and prints both.
@@ -49,7 +56,8 @@ const option = (name, fallback) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const browserName = option("--browser", "chrome");
-const only = option("--only", "headers,page,compare,memory,restart,nested").split(",");
+const only = option("--only", "headers,page,compare,memory,restart,nested,poolCrash").split(",");
+const named = (check) => argv.includes("--only") && only.includes(check);
 const verbose = flag("--verbose");
 const threadsOpt = option("--threads", undefined);
 const threads = threadsOpt === undefined ? undefined : Number(threadsOpt);
@@ -315,6 +323,42 @@ try {
           "nested",
           r.threads === 1 && r.works && r.warnings.length === 1 && r.outerErrors.every((e) => e.length === 0),
           `single-threaded after ${fmt(r.readyMs / 1e3)} s, ${r.warnings.length} warning, works ${r.works}`,
+        );
+      }
+    }
+
+    if (only.includes("poolCrash")) {
+      for (const how of ["panic", "trap"]) {
+        const r = await call("poolCrash", { threads, how });
+        const closed = browser.workers ? await settleWorkers(0) : undefined;
+        if (!r.available) {
+          const why = "dist/wasm-threads is not a test build (no __test_panic_pool): run `pnpm --filter fast-mesh-wasm test`, then this with --build";
+          if (named("poolCrash")) {
+            verdict(`poolCrash (${how})`, false, why);
+          } else {
+            console.log(`SKIP poolCrash (${how}): ${why}`);
+          }
+          break;
+        }
+        for (const f of r.failed) {
+          console.log(`  pending call: ${f.code} after ${fmt(f.ms)} ms${f.message ? ` (${f.message})` : ""}`);
+        }
+        console.log(
+          `  threads ${r.threads}; mesh add ${r.addBefore} -> ${r.addAfter}; Worker error events ${JSON.stringify(r.crashErrors)}; restart ${fmt(r.restartMs)} ms, threads ${r.restartThreads}, Workers made ${r.workersMade}` +
+            (browser.workers ? `; live Workers after terminate ${closed}` : ""),
+        );
+        const poisoned = r.failed.every((f) => f.code === "INSTANCE_POISONED" && f.ms < 2000);
+        verdict(
+          `poolCrash (${how})`,
+          r.threads > 1 &&
+            poisoned &&
+            r.addBefore === "computing" &&
+            r.addAfter === "error" &&
+            r.restartThreads > 1 &&
+            r.workersMade === 2 &&
+            r.works &&
+            (closed === undefined || closed === 0),
+          `poisoned within ${fmt(Math.max(...r.failed.map((f) => f.ms)))} ms ${poisoned}, restarted with ${r.restartThreads} threads, works ${r.works}`,
         );
       }
     }
