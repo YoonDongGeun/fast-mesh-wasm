@@ -5,7 +5,7 @@
 import type { Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
-import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "./handles.js";
+import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
 import type { SceneLike } from "./scene-like.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
@@ -222,8 +222,13 @@ export interface DistanceFieldDesc {
   name: string;
   /** The mesh whose vertices carry the values. */
   on: MeshHandle;
-  /** The mesh the distances are measured to. */
-  to: MeshHandle;
+  /**
+   * The mesh the distances are measured to, or several (at least one, all
+   * different, not `on`): a vertex then holds the smallest signed distance
+   * over them (the nearest surface, or the deepest penetration), and
+   * {@link Scene.fieldNearest} tells which one it came from.
+   */
+  to: MeshHandle | readonly MeshHandle[];
   /** Largest distance computed (inclusive); farther vertices hold `Infinity`. May be `Infinity`. */
   maxDistance: number;
   /** Defaults to `"auto"`. */
@@ -234,7 +239,7 @@ export interface DistanceFieldDesc {
 export interface FieldStatus {
   /** True when the values match the meshes and placements as they are now. */
   current: boolean;
-  /** What the latest sign data build found out about the target mesh. */
+  /** What the latest sign data build found out about the (first) target mesh. */
   sign: {
     /** The mode in use (never `"auto"`). */
     mode: Exclude<SignMode, "auto">;
@@ -1653,14 +1658,16 @@ export class Scene implements SceneLike {
   /**
    * Adds a signed distance field: one value per vertex slot of `on`, the
    * distance to `to` as placed (negative inside), `Infinity` beyond
-   * `maxDistance`, NaN for dead or unused vertices. It follows edits and
-   * placements by the mesh modes, like normals.
+   * `maxDistance`, NaN for dead or unused vertices. With several meshes in
+   * `to`, the smallest over them, ties going to the earliest. It follows
+   * edits and placements by the mesh modes, like normals. Removing a mesh of
+   * `to` removes it from the field, or the field with its last target.
    *
-   * @throws `INVALID_ARGUMENT` when `on` is `to`, `maxDistance` is negative or NaN, or the name is taken.
+   * @throws `INVALID_ARGUMENT` when `to` is empty, holds `on` or a mesh twice, `maxDistance` is negative or NaN, or the name is taken.
    */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
     const s = this.#scene();
-    const ids = this.#flatIds([desc.on, desc.to]);
+    const ids = this.#flatIds([desc.on, ...targetsOf(desc.to)]);
     const sign = codeIn(SIGNS, desc.sign ?? "auto", "sign");
     if (typeof desc.name !== "string") {
       throw invalid("name must be a string");
@@ -1687,6 +1694,27 @@ export class Scene implements SceneLike {
     const ptr = call(() => s.field_values_ptr(raw));
     const view = new Float32Array(wasmMemory().buffer, ptr, call(() => s.field_values_len(raw)));
     return this.#guard === undefined ? view : this.#guard.wrap(view);
+  }
+
+  /**
+   * Per vertex slot, the index in {@link Scene.fieldTargets} of the target
+   * the field's value came from, or `0xffffffff` for none (`Infinity` or
+   * NaN). A copy, as of the field's last update.
+   */
+  fieldNearest(field: FieldHandle): Uint32Array {
+    const raw = this.#field(field);
+    return call(() => this.#peek().field_nearest(raw));
+  }
+
+  /** The field's target meshes, in index order (a removed target leaves the list). */
+  fieldTargets(field: FieldHandle): MeshHandle[] {
+    const raw = this.#field(field);
+    const flat = call(() => this.#peek().field_targets(raw));
+    const out: MeshHandle[] = [];
+    for (let i = 0; i < flat.length; i += 2) {
+      out.push(this.#meshHandle(flat[i], flat[i + 1]));
+    }
+    return out;
   }
 
   /** Whether the field is current, and what its sign data found out about the target mesh. */

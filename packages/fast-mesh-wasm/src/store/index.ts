@@ -4,6 +4,7 @@
 // you give it.
 export type { StoreAddMeshOptions } from "./host.js";
 export {
+  type ContactGroup,
   type DisplayState,
   type DistanceColoring,
   EMPTY_SNAPSHOT,

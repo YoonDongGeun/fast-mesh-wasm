@@ -10,7 +10,7 @@
 import type { Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
-import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "../handles.js";
+import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "../handles.js";
 import type {
   AddMeshOptions,
   Analysis,
@@ -416,7 +416,7 @@ function coversOf(req: Request): string[] {
     case "section":
       return [`section:${req.section}`];
     case "field":
-      return req.desc === undefined ? [] : [`mesh:${req.desc.on}`, `mesh:${req.desc.to}`];
+      return req.desc === undefined ? [] : [`mesh:${req.desc.on}`, ...req.desc.to.map((m) => `mesh:${m}`)];
     default:
       return [];
   }
@@ -1362,9 +1362,15 @@ export class WorkerScene implements SceneLike {
     st.removed = true;
     const rev = ++this.#rev;
     for (const f of this.#fields.values()) {
-      if (!f.removed && (f.desc.on === st.id || f.desc.to === st.id)) {
+      if (f.removed) {
+        continue;
+      }
+      if (f.desc.on === st.id || (f.desc.to.length === 1 && f.desc.to[0] === st.id)) {
         // The engine drops the field, and colourings by it, with the mesh.
         this.#fieldRemoved(f, rev);
+      } else if (f.desc.to.includes(st.id)) {
+        // It keeps its other targets (a new object: sent requests keep theirs).
+        f.desc = { ...f.desc, to: f.desc.to.filter((m) => m !== st.id) };
       }
     }
     for (const s of this.#sections.values()) {
@@ -1597,7 +1603,7 @@ export class WorkerScene implements SceneLike {
     const desc2: FieldDescWire = {
       name: desc.name,
       on: this.#live(desc.on).id,
-      to: this.#live(desc.to).id,
+      to: targetsOf(desc.to).map((m) => this.#live(m).id),
       maxDistance: desc.maxDistance,
       sign: desc.sign,
     };
@@ -1695,6 +1701,19 @@ export class WorkerScene implements SceneLike {
     return this.#ask(
       (rev, qid) => ({ kind: "fetchFieldValues", rev, qid, field: this.#field(field).id }),
       (v) => v as Float32Array,
+    );
+  }
+
+  /**
+   * The field's nearest-target indices as of its last update (the index in
+   * its `to`, `0xffffffff` for none); see `Scene.fieldNearest`. A target
+   * removed since shifts the later indices down.
+   */
+  fetchFieldNearest(field: FieldHandle): Promise<Uint32Array> {
+    return this.#query(
+      "fieldNearest",
+      () => ({ field: this.#field(field).id }),
+      (v) => v as Uint32Array,
     );
   }
 
@@ -2293,7 +2312,7 @@ export class WorkerScene implements SceneLike {
     }
     const fields = new Set<ClientId>();
     for (const f of this.#fields.values()) {
-      if (!f.removed && replayed.has(f.desc.on) && replayed.has(f.desc.to)) {
+      if (!f.removed && replayed.has(f.desc.on) && f.desc.to.every((m) => replayed.has(m))) {
         fields.add(f.id);
         this.#push({ kind: "field", rev: ++this.#rev, field: f.id, op: "add", desc: f.desc });
       }

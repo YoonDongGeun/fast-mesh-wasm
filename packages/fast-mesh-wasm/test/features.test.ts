@@ -352,6 +352,48 @@ describe("sections", () => {
     expect(s.section(sec, b).status).toBe("stale");
   });
 
+  it("multi_target_field_is_min_of_singles", () => {
+    const s = scene();
+    const a = addSphere(s, [0, 0, 0]);
+    const b = addSphere(s, [1.5, 0, 0]);
+    const c = addSphere(s, [-1.2, 0.3, 0]);
+    const multi = s.addDistanceField({ name: "m", on: a, to: [b, c], maxDistance: 0.5 });
+    const singles = [b, c].map((to, k) => s.addDistanceField({ name: `s${k}`, on: a, to, maxDistance: 0.5 }));
+    // A single target, alone or in a list of one, is the same field.
+    const listed = s.addDistanceField({ name: "l", on: a, to: [b], maxDistance: 0.5 });
+    expect(s.fieldTargets(multi)).toEqual([b, c]);
+    const check = () => {
+      const got = Array.from(s.fieldValues(multi));
+      const nearest = Array.from(s.fieldNearest(multi));
+      const parts = singles.map((f) => Array.from(s.fieldValues(f)));
+      expect(Array.from(s.fieldValues(listed))).toEqual(parts[0]);
+      got.forEach((v, i) => {
+        const want = Math.min(parts[0][i], parts[1][i]);
+        expect(Object.is(v, want)).toBe(true);
+        const k = Number.isFinite(want) ? (parts[0][i] <= parts[1][i] ? 0 : 1) : 0xffffffff;
+        expect(nearest[i]).toBe(k);
+      });
+      return nearest;
+    };
+    const nearest = check();
+    expect(nearest).toContain(0);
+    expect(nearest).toContain(1);
+    expect(nearest).toContain(0xffffffff);
+    s.setPlacement(c, { rotation: IDENTITY, translation: [0.2, 0, 0] });
+    check();
+    // A target removed: the field keeps the other.
+    s.removeMesh(c);
+    expect(s.fieldTargets(multi)).toEqual([b]);
+    expect(Array.from(s.fieldValues(multi))).toEqual(Array.from(s.fieldValues(singles[0])));
+    expect(codeOf(() => s.addDistanceField({ name: "x", on: a, to: [], maxDistance: 0.5 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.addDistanceField({ name: "x", on: a, to: [b, b], maxDistance: 0.5 }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    // The last target removed: the field goes.
+    s.removeMesh(b);
+    expect(codeOf(() => s.fieldValues(multi))).toBe("UNKNOWN_FIELD");
+  });
+
   it("error_codes_unknown_field_section", () => {
     const s = scene();
     const a = addSphere(s, [0, 0, 0]);

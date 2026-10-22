@@ -674,6 +674,144 @@ describe.each([
   });
 });
 
+/** Four tetrahedra in a row, each overlapping the next. */
+function withFour(store: SceneStore) {
+  const [a, b, c, d] = [0, 0.6, 1.2, -0.6].map((dx) => store.addMesh(tetra(dx).positions, tetra(dx).indices));
+  return { a, b, c, d };
+}
+
+const GROUP_COLORING = { maxDistance: 5, map: "turbo", range: [-1, 1] } as const;
+
+describe.each([
+  ["local", makeLocal],
+  ["worker", () => makeWorker()],
+] as const)("SceneStore contact groups (%s)", (_mode, make) => {
+  /** The `distanceTo` of each mesh's applied colouring (`null` for none). */
+  function partners(store: SceneStore, meshes: readonly MeshHandle[]) {
+    return meshes.map((m) => {
+      const c = store.getSnapshot().meshes.get(m)!.display.coloring;
+      return c === null ? null : c.distanceTo;
+    });
+  }
+
+  it("contact_group_colours_partners", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b, c, d } = withFour(store);
+    await settle(store);
+    store.setContactGroup("g", {
+      meshes: [a, b, c, d],
+      pairs: [
+        [a, b],
+        [b, c],
+        [a, c],
+        [a, d],
+      ],
+      coloring: GROUP_COLORING,
+    });
+    await settle(store);
+    expect(partners(store, [a, b, c, d])).toEqual([[b, c, d], [a, c], [a, b], [a]]);
+    expect(f.fieldAdds()).toBe(4);
+    for (const m of [a, b, c, d]) {
+      const st = store.getSnapshot().meshes.get(m)!;
+      expect(st.status).toBe("ready");
+      expect(st.display.coloring).toMatchObject(GROUP_COLORING);
+      expect(store.scene.views(m).colors()).not.toBe(null);
+    }
+    // Setting the same group again changes nothing; "all" pairs everyone.
+    store.setContactGroup("g", { meshes: [a, b, c, d], pairs: [[a, b], [b, c], [a, c], [a, d]], coloring: GROUP_COLORING });
+    await settle(store);
+    expect(f.fieldAdds()).toBe(4);
+    store.setContactGroup("g", { meshes: [a, b, c, d], pairs: "all", coloring: GROUP_COLORING });
+    await settle(store);
+    expect(partners(store, [a, b, c, d])).toEqual([[b, c, d], [a, c, d], [a, b, d], [a, b, c]]);
+    // A's targets did not change as a set: its field is kept.
+    expect(f.fieldAdds()).toBe(7);
+    // Dropping a member uncolours it; removing the group uncolours the rest.
+    store.setContactGroup("g", { meshes: [a, b], coloring: GROUP_COLORING });
+    await settle(store);
+    expect(partners(store, [a, b, c, d])).toEqual([[b], [a], null, null]);
+    store.setContactGroup("g", null);
+    await settle(store);
+    expect(partners(store, [a, b, c, d])).toEqual([null, null, null, null]);
+    expect(store.getSnapshot().status).toBe("idle");
+  });
+
+  it("contact_group_member_removed", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b, c, d } = withFour(store);
+    store.setContactGroup("g", {
+      meshes: [a, b, c, d],
+      pairs: [
+        [a, b],
+        [b, c],
+        [a, c],
+        [a, d],
+      ],
+      coloring: GROUP_COLORING,
+    });
+    await settle(store);
+    const colorings = f.colorings();
+    // C leaves: the fields measured to it keep their other targets.
+    store.removeMesh(c);
+    await settle(store);
+    expect(partners(store, [a, b, d])).toEqual([[b, d], [a], [a]]);
+    expect(f.fieldAdds()).toBe(4);
+    expect(f.fieldRemoves()).toBe(0);
+    expect(f.colorings()).toBe(colorings);
+    for (const m of [a, b, d]) {
+      expect(store.getSnapshot().meshes.get(m)!.status).toBe("ready");
+    }
+    // A leaves: B and D have no partner left, and no colouring (no error).
+    store.removeMesh(a);
+    await settle(store);
+    expect(partners(store, [b, d])).toEqual([null, null]);
+    expect(store.getSnapshot().meshes.get(b)!.desired.coloring).toBe(null);
+    expect(store.getSnapshot().meshes.get(b)!.status).toBe("ready");
+    expect(store.getSnapshot().meshes.get(d)!.status).toBe("ready");
+    expect(store.getSnapshot().status).toBe("idle");
+  });
+
+  it("distance_to_is_a_set", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b, c } = withFour(store);
+    const rule = (distanceTo: MeshHandle | MeshHandle[]): DistanceColoring => ({ ...GROUP_COLORING, distanceTo });
+    store.setDisplay(a, { coloring: rule([b, c]) });
+    await settle(store);
+    store.setDisplay(a, { coloring: rule([c, b]) });
+    await settle(store);
+    expect(f.fieldAdds()).toBe(1);
+    expect(store.getSnapshot().meshes.get(a)!.display.coloring?.distanceTo).toEqual([c, b]);
+    // Another set is another field; one mesh, as a list or alone, is the same field.
+    store.setDisplay(a, { coloring: rule([b]) });
+    await settle(store);
+    store.setDisplay(a, { coloring: rule(b) });
+    await settle(store);
+    expect(f.fieldAdds()).toBe(2);
+    expect(f.fieldRemoves()).toBe(1);
+    expect(store.getSnapshot().meshes.get(a)!.status).toBe("ready");
+  });
+
+  it("contact_group_rejects_bad_groups", async () => {
+    const { store } = await make();
+    const { a, b, c, d } = withFour(store);
+    const bad = (g: unknown) => () => store.setContactGroup("g", g as never);
+    expect(bad({ meshes: [a, a], coloring: GROUP_COLORING })).toThrow(/twice/);
+    expect(bad({ meshes: [a, b], pairs: [[a, c]], coloring: GROUP_COLORING })).toThrow(/members/);
+    expect(bad({ meshes: [a, b], pairs: [[a, a]], coloring: GROUP_COLORING })).toThrow(/two different/);
+    expect(bad({ meshes: [a, b] })).toThrow(/coloring/);
+    store.setContactGroup("h", { meshes: [c, d], coloring: GROUP_COLORING });
+    expect(bad({ meshes: [a, c], coloring: GROUP_COLORING })).toThrow(/"h"/);
+    const gone = store.addMesh(tetra(5).positions, tetra(5).indices);
+    store.removeMesh(gone);
+    expect(bad({ meshes: [a, gone], coloring: GROUP_COLORING })).toThrow(expect.objectContaining({ code: "UNKNOWN_MESH" }));
+    // Nothing was coloured by the rejected calls.
+    expect(store.getSnapshot().meshes.get(a)!.desired.coloring).toBe(null);
+  });
+});
+
 describe("SceneStore display (local only)", () => {
   it("local_restart_rejects", async () => {
     const { store } = await makeLocal();

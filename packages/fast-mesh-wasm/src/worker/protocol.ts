@@ -22,8 +22,8 @@ export type ClientId = number;
 /** A {@link ColorRule} naming its field by client id. */
 export type ColorRuleWire = Omit<ColorRule, "field"> & { field: ClientId };
 
-/** A {@link DistanceFieldDesc} naming its meshes by client id. */
-export type FieldDescWire = Omit<DistanceFieldDesc, "on" | "to"> & { on: ClientId; to: ClientId };
+/** A {@link DistanceFieldDesc} naming its meshes by client id, its targets as a list. */
+export type FieldDescWire = Omit<DistanceFieldDesc, "on" | "to"> & { on: ClientId; to: ClientId[] };
 
 /**
  * A section description by client ids. For `op: "add"`, `plane` and `meshes`
@@ -132,6 +132,7 @@ export interface QueryMap {
   };
   analyze: { args: { mesh: ClientId; options?: AnalyzeOptions }; value: unknown };
   fieldStatus: { args: { field: ClientId }; value: unknown };
+  fieldNearest: { args: { field: ClientId }; value: unknown };
   sectionGap: {
     args: { section: ClientId; a: ClientId; b: ClientId };
     value: { distance: number; a: Vec3; b: Vec3 } | null;

@@ -118,7 +118,7 @@ describe("cooperative cancellation", () => {
       rev: rev(),
       field,
       op: "add",
-      desc: { name: `f${field}`, on: 1, to: 2, maxDistance: Infinity },
+      desc: { name: `f${field}`, on: 1, to: [2], maxDistance: Infinity },
       key: display,
     }));
     const first: Request = {
@@ -238,7 +238,7 @@ describe("yields in a Worker", () => {
           rev: rev(),
           field,
           op: "add",
-          desc: { name: `f${field}`, on: 1, to: 2, maxDistance: Infinity },
+          desc: { name: `f${field}`, on: 1, to: [2], maxDistance: Infinity },
           key: display,
         });
       }

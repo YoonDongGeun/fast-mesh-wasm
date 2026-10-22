@@ -170,7 +170,7 @@ async function setup(h: ReturnType<typeof engine>, third = false): Promise<void>
   const batch: Request[] = [
     addMeshReq(1, COLORED),
     addMeshReq(2, TARGET),
-    { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: MAX_DISTANCE } },
+    { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: MAX_DISTANCE } },
     { kind: "coloring", rev: rev(), id: 1, rule: { field: 1, map: "turbo", range: [0, MAX_DISTANCE] }, key: "display:1" },
   ];
   if (third) {
@@ -179,7 +179,7 @@ async function setup(h: ReturnType<typeof engine>, third = false): Promise<void>
       rev: rev(),
       field: 2,
       op: "add",
-      desc: { name: "e", on: 3, to: 2, maxDistance: MAX_DISTANCE },
+      desc: { name: "e", on: 3, to: [2], maxDistance: MAX_DISTANCE },
     });
   }
   h.send(batch);
@@ -707,7 +707,7 @@ describe("in a Node Worker", () => {
     worker.postMessage([
       addMeshReq(1, big),
       addMeshReq(2, TARGET),
-      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: MAX_DISTANCE } },
+      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: MAX_DISTANCE } },
       { kind: "coloring", rev: rev(), id: 1, rule: { field: 1, map: "turbo", range: [0, MAX_DISTANCE] }, key: "display:1" },
     ]);
     await until(1);

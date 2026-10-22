@@ -189,6 +189,25 @@ scene.free(); // or `using scene = new Scene()`
 
 Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `STALE_BVH`, ...). After a trap inside the WebAssembly module every later call throws `INSTANCE_POISONED`. A view is only valid until the next scene call that may allocate or move buffers: a kept view may read other data or be empty, so re-acquire views after any scene call. `new Scene({ debug: true })` makes views warn when they are read after such a call. Mesh edits (`scene.edit`), `analyze`, `repair`, sections (`addSection`, `section`, `sectionGap`) and `findContacts` are documented in the types.
 
+### Contact groups: fields to several meshes
+
+A distance field can measure to several meshes at once. Give `to` a list, and each vertex holds the smallest signed distance over them: the nearest surface, or the deepest penetration. So a mesh touching several others shows one colour scale, whichever partner it touches.
+
+```ts
+// a, b, c, d: MeshHandles. Contacts a-b, b-c, a-c and a-d: one field per mesh, to its partners.
+const fa = scene.addDistanceField({ name: "contact", on: a, to: [b, c, d], maxDistance: 1 });
+const fb = scene.addDistanceField({ name: "contact", on: b, to: [a, c], maxDistance: 1 });
+scene.fieldTargets(fa); // [b, c, d]
+scene.fieldNearest(fa); // Uint32Array: per vertex, the index in [b, c, d] it came from (0xffffffff: none)
+```
+
+- **Exact.** The values are bit for bit the minimum of separate single-target fields, ties going to the earliest target, with the `parallel` feature on or off.
+- **Only related fields recompute.** Moving `d` recomputes `a`'s field (`d` is one of its targets) and `d`'s own. Moving `a` recomputes every field that has `a`, and `b`'s field to `[a, c]` is left alone when only `d` moves. Within a field, only the vertices near the moved target, or whose value came from it, are recomputed.
+- **Every target is searched in full.** The best distance so far cannot bound the next target's search: a vertex inside a target is negative however far its surface is. A field to three targets costs about what three single fields cost in the kernel, but it is one field to keep, one colour pass and one value per vertex.
+- **Removing a target mesh** removes it from the field; removing the last one removes the field (and its colouring).
+
+On a `WorkerScene` the same `to: [...]` works; read the indices with `await scene.fetchFieldNearest(field)`. With the store, see `setContactGroup` below.
+
 ## Worker scene
 
 `fast-mesh-wasm/worker` runs the same engine in a Web Worker, so adding a large mesh, building fields or recolouring never blocks the page. `createWorkerScene()` starts the Worker and resolves to a `WorkerScene` with the `Scene` methods. Your renderer keeps reading synchronous views: every result carries the bytes of its dirty ranges, which are copied into main-thread mirrors.
@@ -440,7 +459,17 @@ export function App() {
 
 **The store.** `store.getSnapshot()` returns a frozen `SceneSnapshot` (meshes, sections, history, selection and an overall status), replaced on every change, with unchanged parts shared between versions. `store.subscribe(listener)` notifies after each new snapshot: at once for an action, and once per task for the scene's events (on a microtask; `getSnapshot()` is up to date before then). An update re-derives only the meshes and sections it touches. What still grows with the scene is one copy of the snapshot's mesh map per change: a native `Map` copy, about 45 µs at 1500 meshes. Actions mirror the scene: `addMesh`, `removeMesh`, `setPlacement`, `drag`, `edit`, `repair`, `undo`, `redo`, `addSection`, `removeSection` and `restart` (Worker only). The declarative ones are new:
 
-- `setDisplay(mesh, { coloring?, opacity?, visible? })`. A `coloring` colours the mesh by its distance to `distanceTo`. The store owns the distance field behind it: one per coloured mesh, named `fast-mesh-store:<n>`, kept while the colouring is off, reused when it comes back with the same `distanceTo`, `maxDistance` and `sign`, and replaced only when one of them changes. `opacity` (in [0, 1], default 1) and `visible` (default true) live only in the store; the engine never sees them. Display changes never enter the undo history.
+- `setDisplay(mesh, { coloring?, opacity?, visible? })`. A `coloring` colours the mesh by its distance to `distanceTo`: one mesh, or a list of them (the smallest signed distance over them; see [Contact groups](#contact-groups-fields-to-several-meshes)). The store owns the distance field behind it: one per coloured mesh, named `fast-mesh-store:<n>`, kept while the colouring is off, reused when it comes back with the same `distanceTo` (as a set: the order does not matter), `maxDistance` and `sign`, and replaced only when one of them changes. `opacity` (in [0, 1], default 1) and `visible` (default true) live only in the store; the engine never sees them. Display changes never enter the undo history.
+- `setContactGroup(id, { meshes, pairs?, coloring } | null)` colours a group of meshes by contact. Each member gets `coloring` with its partners as `distanceTo`: the members it is paired with in `pairs` (either way round), or every other member with `pairs: "all"` (the default). `coloring` is a `DistanceColoring` without `distanceTo`, so any preset spreads into it. Moving a member recomputes only its own field and its partners'. Setting the group again updates the members (a member dropped from it is uncoloured); `null` uncolours them all. A removed mesh leaves its groups: the others keep their remaining partners, and a member left with none is uncoloured.
+
+  ```ts
+  store.setContactGroup("parts", {
+    meshes: [a, b, c, d],
+    pairs: [[a, b], [b, c], [a, c], [a, d]],
+    coloring: { maxDistance: 1, map: "coolwarm", range: [-0.5, 0.5], center: 0, above: "base" },
+  });
+  ```
+
 - `setSection(section, { plane?, meshes?, fill? })` changes a section.
 - `select(mesh | null)` sets the selection. It is UI state only, and it clears when the selected mesh is removed.
 
@@ -465,7 +494,7 @@ Meshes must be added through the store (`store.addMesh`). A mesh added straight 
 - **Bind controlled inputs (sliders, toggles, checkboxes) to `state.desired.*`.** That is what the user last asked for, so the input follows them at once. The top-level `state.coloring`, `state.opacity` and `state.visible` (and a section's top-level `plane`, `meshes` and `fill`) are the applied values: what is on screen.
 - **`status === "computing"` covers the pending window of colourings and sections**: the time between a request (the button is pressed) and the scene showing it, whether the change is waiting for the next frame or a colouring is being computed in the Worker. Opacity and visibility never read as pending: they live in the store and apply at the next flush. Show it as busy; the button never reads "on" while the mesh shows colours off outside this window. A mesh is also `"computing"` while something it depends on is pending: its placement or an edit, those of the mesh it is coloured by distance to, or an undo/redo. A section depends the same way on its meshes. Only a state's own requests can make it `"error"`; a failed edit rejects its own promise instead.
 - **On the synchronous `Scene`** every status is `"ready"` right after the frame that applied it, or `"error"` if the call threw. `store.restart()` rejects with `INVALID_ARGUMENT` there.
-- **A removed mesh or section** reads as `"idle"` with the default display (or no meshes) and its setter throws `UNKNOWN_MESH` or `UNKNOWN_SECTION`, so a component still mounted for it renders without throwing. Removing the mesh another mesh is coloured by distance to leaves that mesh uncoloured, its rule kept in `desired` and its status `"error"` (`UNKNOWN_MESH`) until its colouring changes. A rule the engine rejected is not re-sent until it changes.
+- **A removed mesh or section** reads as `"idle"` with the default display (or no meshes) and its setter throws `UNKNOWN_MESH` or `UNKNOWN_SECTION`, so a component still mounted for it renders without throwing. Removing the mesh another mesh is coloured by distance to (alone) leaves that mesh uncoloured, its rule kept in `desired` and its status `"error"` (`UNKNOWN_MESH`) until its colouring changes; a colouring to several meshes keeps the others. A rule the engine rejected is not re-sent until it changes.
 - **SSR.** On the server the hooks render an empty snapshot (`EMPTY_SNAPSHOT`) and never throw for missing data.
 
 **`<FastMesh>`.** `<FastMesh mesh store? material? color? onBind? onClick?… />` binds a scene mesh (added through the store) with `bindMesh` on mount, follows the applied opacity and visibility, and disposes the binding on unmount or when the mesh is removed (it then renders nothing). Opacity and visibility apply inside the frame's `store.commitFrame()`, so they show in the same frame as a colouring flushed with them. R3F pointer events are passed to the mesh. Adding or removing the `store` prop remounts it (and rebinds the mesh). Give each `<FastMesh>` its own `material`, and dispose it yourself. Every `<FastMesh>` calls `useFrameDriver(store)`, which calls `store.commitFrame()` once per rendered frame however many are mounted (do not call `commitFrame()` yourself as well), and invalidates the canvas when the store or the scene changes, so `<Canvas frameloop="demand">` renders every change. Use `useFrameDriver()` on its own when you draw the scene without `<FastMesh>`.

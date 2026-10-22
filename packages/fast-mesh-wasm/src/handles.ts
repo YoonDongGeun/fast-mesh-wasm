@@ -67,3 +67,8 @@ export function rotationMatrix(rotation: Mat3 | Quat): number[] {
   }
   throw new FastMeshError("INVALID_ARGUMENT", "rotation must be a 3×3 matrix (9 numbers) or a quaternion (4 numbers)");
 }
+
+/** A distance field's target or targets (`DistanceFieldDesc.to`), as a list. Internal. */
+export function targetsOf(to: MeshHandle | readonly MeshHandle[]): readonly MeshHandle[] {
+  return Array.isArray(to) ? (to as readonly MeshHandle[]) : [to as MeshHandle];
+}
