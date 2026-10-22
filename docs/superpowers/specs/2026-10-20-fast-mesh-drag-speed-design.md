@@ -165,7 +165,7 @@ Part A is on `feat/fast-mesh-drag-speed`, from `f64cc25` on (part of #48). The n
 - **Worker (wasm, one thread).**
   - The 9a wide drag went from 402 ms to 72 ms per move.
   - On the native terrain a 1M pose takes 662 ms. At 10M a pose takes 0.74 s (9a terrain) and 6.7 s (native terrain).
-  - During a continuous 60 Hz drag no stale pose finishes. The last pose's colours arrive one recompute after the pointer stops (81 ms and 683 ms at 1M), with no backlog.
+  - During a continuous 60 Hz drag, with the starvation guard (200 ms), the colours update every 260 ms (9a terrain) and 851 ms (native terrain) at 1M, median, and every 0.70 s and 7.1 s at 10M, where a recompute outlasts the guard and none is dropped. The last pose's colours arrive 119 ms and 818 ms after the pointer stops at 1M (1.03 s and 12.4 s at 10M): one recompute, or two when the one under way is kept. Before the guard (Task 5), no pose finished during the drag, and the last arrived 81 and 683 ms after it.
   - The longest Worker block is opening a step unit: about 60 ms at 1M and 0.55 to 0.6 s at 10M.
 - **Step API.**
   - Rust (additive): `Scene::set_defer_fields`, `field_step(FieldBudget)`, `abandon_field_step`, `field_step_pending` and `field_step_meshes`.
@@ -187,6 +187,8 @@ Part A is on `feat/fast-mesh-drag-speed`, from `f64cc25` on (part of #48). The n
 - Field errors at unit completion stay swallowed, as in 9a's eager behaviour. The failing fields stay stale, and the field shows `ready` rather than `error`.
 - Before opening a unit, the engine peeks at the queue. It does not open one while a stale-maker for the last abandoned unit's meshes is queued.
 - After a completed unit, an already-queued stale-maker still costs one unit open (about 38 ms at 1M wide). This is accepted: it is bounded and does not grow a backlog.
+- **Starvation guard** (the owner chose "hybrid"). Once more than a guard (default 200 ms, `EngineOptions.staleGuardMs`) has passed since the last completed (published) unit, a queued drag move no longer abandons the unit: it completes and is published, and the newest pose follows. Edits, repairs, compactions, removals, `setPlacement`, undo, redo and drag cancels still always abandon. Colours stay exact for one pose; during a sustained drag they update about every guard plus one recompute.
+- **The engine's yield admits incoming messages in Node `worker_threads` and in browsers.** The engine yields with `setImmediate` where it exists (Node), else with a `MessageChannel` tick (browsers), else `setTimeout(0)`; the bench harness no longer patches it. Checked with a Node test on real `worker_threads` and in headless Chrome.
 
 ### Left for part B (deferred minors that matter there)
 
@@ -195,9 +197,6 @@ Part A is on `feat/fast-mesh-drag-speed`, from `f64cc25` on (part of #48). The n
 - **Failing fields stay due** and are retried, at the cost of one unit open, at every later batch end.
 - **One unit open per completed unit** is spent when a stale-maker is already queued, because the pre-open peek knows only the last abandoned unit's meshes.
 - **Mid-range fields near one pair per slot** can switch between the near search and the full recompute from pose to pose. That is about a 9% cost jump, exact either way.
-- **During a continuous drag no intermediate pose is shown** when a recompute takes longer than a frame. Part B's speed-up decides how often poses complete while the pointer moves.
-- **The Node harness yield.**
-  - In a Node `worker_threads` Worker, the engine's `MessageChannel` tick starves `parentPort`. No batch arrives while the engine steps, so nothing is ever abandoned there.
-  - The bench harness swaps in a `setImmediate` tick. `test/harness/node-worker.mjs` and the engine itself are unchanged, since the Worker scene targets browsers.
-  - Part B's threaded Worker tests and benches should check the yield in whichever harness they use.
+- **During a sustained drag colours update about every guard plus one recompute** (the starvation guard). Part B's speed-up shortens the recompute, and so the interval.
+- **The yield in other browsers.** The `MessageChannel` tick was checked in headless Chrome only; Firefox and Safari are not checked yet. Part B's threaded Worker should re-check the yield wherever it runs.
 - `fields.rs` is about 3,000 lines and should be split.

@@ -475,7 +475,7 @@ A drag where most of the coloured mesh is within the field's `maxDistance`: two 
 
 ### Worker scene
 
-`pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m` (or `-- --worker --wide [--10m]` for these cases only), in the harness of the Worker scene section. The engine recomputes the due fields at the end of each batch in steps of 4,096 vertices, yielding every 4 ms, and at each step boundary drops the recompute when a newer move of either mesh is queued; a pose's colours are applied all at once. Two terrains:
+`pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m` (or `-- --worker --wide [--10m]` for these cases only), in the harness of the Worker scene section. The engine recomputes the due fields at the end of each batch in steps of 4,096 vertices, yielding every 4 ms, and at each step boundary drops the recompute when a newer move of either mesh is queued, unless 200 ms have passed since the last completed recompute (the starvation guard), when it finishes it instead; a pose's colours are applied all at once. Measured in the fix wave after `01dd3d9` (starvation guard and `setImmediate` yield in the engine), Node 24.13.0, release build. Two terrains:
 
 - **9a terrain:** the pair of the 64-pose Worker drag (the JavaScript `terrain(n)`). Here few vertices change colour per pose (27.7 KB of dirty bytes per frame at 1M).
 - **Native terrain:** the terrain and touching poses of the native bench above, built in JavaScript (f64 heights), where every pose recolours most of A.
@@ -487,20 +487,22 @@ Two ways to drag:
 
 | | 1M, 9a terrain | 1M, native terrain | 10M, 9a terrain | 10M, native terrain |
 | --- | --- | --- | --- | --- |
-| **Lock step: move to colours applied**, median (p95) | **72.5 ms** (75.1) | **662 ms** (744) | **735 ms** (781) | **6.71 s** (6.93) |
-| Lock step: longest Worker block per pose, median (max) | 58.0 ms (63.1) | 64.0 ms (79.1) | 545 ms (612) | 590 ms (778) |
-| of which opening the step unit (the first step), median | 57.9 ms | 63.8 ms | 545 ms | 590 ms |
-| Continuous: moves sent / poses recoloured / recomputes dropped | 600 / 1 / 169 | 600 / 1 / 136 | 1800 / 1 / 57 | 1800 / 1 / 43 |
-| **Continuous: last move to its colours applied** | **81.1 ms** | **683 ms** | **961 ms** | **6.64 s** |
-| Continuous: most batches waiting for a result | 5 | 8 | 46 | 64 |
-| Continuous: longest Worker block | 70.5 ms | 135 ms | 776 ms | 1.06 s |
-| Main thread per frame, median (longest block) | 0.04 ms (1.28) | 0.05 ms (5.66) | 0.05 ms (3.33) | 0.05 ms (10.6) |
+| **Lock step: move to colours applied**, median (p95) | **74.1 ms** (82.3) | **646 ms** (655) | **645 ms** (675) | **6.82 s** (7.18) |
+| Lock step: longest Worker block per pose, median (max) | 58.4 ms (68.2) | 62.9 ms (79.8) | 510 ms (523) | 644 ms (794) |
+| of which opening the step unit (the first step), median | 58.3 ms | 62.8 ms | 510 ms | 644 ms |
+| Continuous: moves sent / poses recoloured / recomputes dropped | 600 / 40 / 106 | 600 / 13 / 28 | 1800 / 45 / 0 | 1800 / 6 / 0 |
+| **Continuous: update interval during the drag**, median (max) | **260 ms** (304) | **851 ms** (897) | **701 ms** (763) | **7.15 s** (7.16) |
+| Continuous: move to colours applied, per recoloured pose, median (max) | 88.5 ms (142) | 684 ms (818) | 702 ms (1.03 s) | 7.17 s (12.4 s) |
+| **Continuous: last move to its colours applied** | **119 ms** | **818 ms** | **1.03 s** | **12.4 s** |
+| Continuous: most batches waiting for a result | 8 | 45 | 46 | 430 |
+| Continuous: longest Worker block | 91.8 ms | 119 ms | 621 ms | 802 ms |
+| Main thread per frame, median (longest block) | 0.06 ms (0.72) | 0.06 ms (6.99) | 0.05 ms (0.97) | 0.05 ms (19.3) |
 
-- **The latest pose wins.** During a continuous drag no recompute finishes, because each takes longer than a frame and a newer move is always queued; every one is dropped at its next step boundary. When the pointer stops, the last pose is computed to completion: its colours arrive one recompute after the last move, the same as in lock step. Nothing piles up: the results never fall more than about one unit opening behind (5 to 64 batches, each answered at once once the unit is dropped), and the main thread pays about 0.05 ms per frame.
+- **The latest pose wins, with a starvation guard.** During a continuous drag each recompute takes longer than a frame, so a newer move is queued at every step boundary and the recompute is dropped, until 200 ms have passed since the last completed one. The recompute under way then finishes and is shown, and the newest queued move (the older ones are superseded at once) starts the next. So the colours update about every 200 ms plus one recompute (260 ms and 851 ms at 1M), each update the exact colours of one pose. At 10M a recompute alone outlasts the guard, so none is dropped and the colours update once per recompute. When the pointer stops, the last pose's colours arrive one recompute later, or two when the recompute under way is kept (119 ms and 818 ms at 1M, 1.03 s and 12.4 s at 10M). The batches waiting for a result are the moves sent during one recompute (up to 430 during a 7 s 10M recompute at 60 Hz); they are answered at once when it ends, and the main thread pays about 0.05 ms per frame.
+- **Before the guard** (Task 5, `01dd3d9`), no pose finished during a continuous drag (1 of 600 recoloured at 1M) and the last arrived one recompute after the pointer stopped (81 ms and 683 ms at 1M, 0.96 s and 6.64 s at 10M).
 - **Before part A** the same 1M 9a-terrain drag took 402 ms per move in the Worker (one Rust call, up to 741 ms); it now takes 72 ms (the 64-pose lock-step drag of the Worker scene section, re-run: median 71.9 ms, p95 80.0, longest Worker block 75.8 ms). The one-vertex edit of A with 4 fields (the longest single requests) went from 348 to 249 ms.
-- **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.55 to 0.6 s at 10M (up to 1.06 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it.
-- **Colours lag a continuous drag.** They show the pose where the pointer last paused for one recompute (about 0.07 s and 0.7 s at 1M on the two terrains, 0.7 s and 6.6 s at 10M), and none in between.
-- **The harness's yield.** The engine yields with a `MessageChannel` tick. In a Node `worker_threads` Worker, a chain of those ticks keeps the Worker from receiving `parentPort` messages (measured: none of about 90 messages sent at 60 Hz arrived during 1.5 s of 4 ms chunks and ticks), so no recompute could be dropped there, and the harness's own event-loop probe did not run either. A browser Worker interleaves its incoming messages with the tick. The bench harness therefore replaces `MessageChannel` with a `setImmediate` stand-in (`bench/worker-harness.mjs`). The Worker scene tables above it were measured before this change; the re-run with it gives the same numbers within about 10% (1M contact drag 1.90 ms, 10M contact drag 30.9 ms, many small requests 3.97 ms).
+- **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.5 to 0.65 s at 10M (up to 0.8 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it.
+- **The engine's yield.** The engine yields with `setImmediate` where there is one (Node) and with a `MessageChannel` tick in browsers. In a Node `worker_threads` Worker a chain of `MessageChannel` ticks after chunks of 1 ms or more lets no `parentPort` message in (measured: none of about 60 messages sent at 60 Hz over 1 s of 1 ms or 4 ms chunks, while `setImmediate` let all of them in), so no recompute could be dropped there. The Task 5 table was measured with a `setImmediate` stand-in in the bench harness; the engine now does this itself and the harness no longer patches it. A browser Worker (headless Chrome 155, both examples' Vite builds) admits a message sent a third of the way into a 227 ms recompute: the recompute is dropped and its result posted 83 ms after it started. The Worker scene tables above this section were measured before the change; the Task 5 re-run with a `setImmediate` tick gave the same numbers within about 10% (1M contact drag 1.90 ms, 10M contact drag 30.9 ms, many small requests 3.97 ms).
 
 ## Parallel (the `parallel` feature)
 

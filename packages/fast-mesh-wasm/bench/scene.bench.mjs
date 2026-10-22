@@ -841,6 +841,13 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     `worker wide drag ${label}, continuous ${hz} Hz drag for ${seconds} s: ${frames} moves, ${lag.length} poses recoloured, ${chunkMs(st, "fieldStepAbandon").length} units abandoned`,
   );
   report(`  move -> colours applied, per recoloured pose`, lag);
+  // The update interval while the drag lasts: the time between two results that recolour
+  // A, both before the last move (with the starvation guard, about guard + one recompute).
+  const updates = results.filter((r) => r.colored && r.at <= lastSent).map((r) => r.at);
+  report(
+    `  update interval during the drag (${updates.length} updates before the last move)`,
+    updates.slice(1).map((at, k) => at - updates[k]),
+  );
   console.log(
     `  last move -> its colours applied ${fmt(results[results.length - 1].at - lastSent)} ms (last result recolours: ${results[results.length - 1].colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
   );
