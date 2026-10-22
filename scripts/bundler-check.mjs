@@ -4,15 +4,16 @@
 // builds them, serves them with the headers and checks in headless Chrome
 // that a Worker scene starts with threads > 1 and computes.
 //
-//   node scripts/bundler-check.mjs                    # pack, then vite-build, vite-dev, webpack
+//   node scripts/bundler-check.mjs                    # pack, then vite-build, vite-dev, webpack, nobundler
 //   node scripts/bundler-check.mjs vite-build webpack # only these
 //   node scripts/bundler-check.mjs --tarball pack/    # an existing tarball, or a folder holding one
 //   node scripts/bundler-check.mjs --keep             # keep the scratch apps (printed)
 //
 // Apps:
 // - vite-build: `vite build`, the output served statically with the headers.
-// - vite-dev: the `vite` dev server (`server.headers`), which pre-bundles the
-//   installed package.
+// - vite-dev: the `vite` dev server, the headers set by a middleware plugin
+//   (`server.headers` leaves them off 304s), which pre-bundles the installed
+//   package.
 // - webpack: webpack 5 (`mode: "production"`, no loaders or plugins), the
 //   output served statically with the headers.
 // - nobundler: no bundler: the installed package's dist/ served as is, the
