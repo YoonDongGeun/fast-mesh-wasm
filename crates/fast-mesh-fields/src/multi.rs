@@ -1,11 +1,11 @@
 //! Signed distances from points to the nearest of several meshes.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_query::{QueryError, Rigid};
+use fast_mesh_query::{ClosestOptions, QueryError, Rigid, closest_point};
 use fast_mesh_store::{Mesh, par};
 
-use crate::distance::{PAR_MIN_POINTS, POINT_CHUNK, point_value};
-use crate::{FieldsError, Result, SignData};
+use crate::distance::{PAR_MIN_POINTS, POINT_CHUNK, hit_value, point_value};
+use crate::{FieldsError, Result, SignData, SignMode};
 
 /// One mesh of [`signed_distances_multi`], with what measuring to it reads.
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +18,77 @@ pub struct Target<'a> {
     pub sign: &'a SignData,
     /// From the points' space into the mesh's local space.
     pub to_local: Rigid,
+}
+
+/// Target `t`'s value at `q` (in its local space), searched up to `bound`,
+/// when it may be smaller than `best` (finite); `None` when it cannot be.
+/// A `Some` value is the one the full search gives, bit for bit.
+///
+/// The closest-point search keeps every triangle at most its bound away
+/// (inclusive, on squared `f32` distances), and with the same bound or a
+/// larger one finds the same closest point, ties to the smallest id. So a
+/// search with a smaller bound that finds a hit has found the full search's
+/// hit, and one that finds none says the point is farther than that bound:
+///
+/// - `best < 0`: searched up to `|best|`. A hit at most `|best|` away gives
+///   a value of at least `best`, which cannot win (a tie goes to the lower
+///   index). With no hit, the full search decides.
+/// - `best ≥ 0`, winding signs: searched up to the next `f32` above `best`. A
+///   hit gives the value. With no hit, the distance is above `best`, so only
+///   a negative value can win, and only a point inside does: a winding
+///   number below one half (the same test the sign makes, which needs no
+///   closest point) skips the target.
+/// - Otherwise (pseudonormal signs, whose side comes from the closest point,
+///   with `best ≥ 0`), the full search.
+fn pruned_value(t: &Target<'_>, q: [f32; 3], best: f32, bound: f32) -> Result<Option<f32>> {
+    let search =
+        |max_distance: f32| closest_point(t.mesh, t.bvh, q, &ClosestOptions { max_distance });
+    if best < 0.0 {
+        let b = -best;
+        if b < bound {
+            match search(b)? {
+                Some(hit) if hit.distance <= b => {
+                    #[cfg(test)]
+                    pruned::add();
+                    return Ok(None);
+                }
+                Some(hit) => return Ok(Some(hit_value(t.mesh, t.bvh, t.sign, q, Some(&hit)))),
+                None => {}
+            }
+        }
+    } else if t.sign.mode() == SignMode::Winding {
+        let b = best.next_up();
+        if b < bound {
+            match search(b)? {
+                Some(hit) => return Ok(Some(hit_value(t.mesh, t.bvh, t.sign, q, Some(&hit)))),
+                None if t.sign.winding_number(t.mesh, t.bvh, q) < 0.5 => {
+                    #[cfg(test)]
+                    pruned::add();
+                    return Ok(None);
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(Some(point_value(t.mesh, t.bvh, t.sign, q, bound)?))
+}
+
+/// Test-only count of targets skipped by [`pruned_value`], on this thread.
+#[cfg(test)]
+pub(crate) mod pruned {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PRUNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add() {
+        PRUNED.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn take() -> usize {
+        PRUNED.with(|c| c.replace(0))
+    }
 }
 
 /// The smallest `f32` not below `x` (`x` not NaN).
@@ -41,10 +112,11 @@ fn round_up(x: f64) -> f32 {
 /// `nearest[i]` is that index, or `u32::MAX` when the value is `+∞` (no
 /// target within `max_distance`, or no targets).
 ///
-/// Every target is searched with the full `max_distance`. The best value so
-/// far cannot bound the next target's search: a target the point is inside
-/// gives a negative value however far its surface is, and only the closest
-/// point decides that side.
+/// The best value so far bounds the next target's search where that is
+/// exact (see `pruned_value`): always when it is negative (a penetration),
+/// and in winding mode when it is not. A positive best cannot bound a
+/// pseudonormal target's search: the point may be inside that target however
+/// far its surface is, and only the closest point decides that side.
 ///
 /// With the `parallel` feature, large batches run in chunks on rayon's
 /// pool; the values and indices are the same, bit for bit.
@@ -103,7 +175,14 @@ pub fn signed_distances_multi(
         let (mut best, mut at) = (f32::INFINITY, u32::MAX);
         for (k, t) in targets.iter().enumerate() {
             let q = t.to_local.apply(p).map(|c| c as f32);
-            let mut v = point_value(t.mesh, t.bvh, t.sign, q, bound)?;
+            let found = if best.is_finite() {
+                pruned_value(t, q, best, bound)?
+            } else {
+                Some(point_value(t.mesh, t.bvh, t.sign, q, bound)?)
+            };
+            let Some(mut v) = found else {
+                continue;
+            };
             if f64::from(v.abs()) > max_distance {
                 v = f32::INFINITY;
             }
@@ -291,6 +370,27 @@ mod tests {
                     .all(|(v, &k)| v.is_finite() == (k != u32::MAX))
             );
         }
+    }
+
+    #[test]
+    fn pruning_skips_targets_in_both_modes() {
+        // The skips counted below happen on this thread.
+        par::set_force_sequential(true);
+        let mut s = setup();
+        for mode in [SignMode::Pseudonormal, SignMode::Winding] {
+            let signs = signs(&mut s, mode);
+            let targets = targets(&s, &signs, &[0, 1, 2, 3]);
+            for md in [f64::INFINITY, 0.3] {
+                pruned::take();
+                let (got, at) = run(&targets, &s.points, md);
+                let skipped = pruned::take();
+                let (want, want_at) = reference(&targets, &s.points, md);
+                assert_eq!(bits(&got), bits(&want), "{mode:?} {md}");
+                assert_eq!(at, want_at, "{mode:?} {md}");
+                assert!(skipped > 0, "{mode:?} {md}: nothing pruned");
+            }
+        }
+        par::set_force_sequential(false);
     }
 
     #[test]

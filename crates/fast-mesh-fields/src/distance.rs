@@ -1,7 +1,7 @@
 //! Signed distances from points to a mesh.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_query::{ClosestOptions, QueryError, closest_point};
+use fast_mesh_query::{ClosestHit, ClosestOptions, QueryError, closest_point};
 use fast_mesh_store::{Mesh, par};
 
 use crate::{FieldsError, Result, SignData};
@@ -107,12 +107,24 @@ pub(crate) fn point_value(
     max_distance: f32,
 ) -> Result<f32> {
     let opts = ClosestOptions { max_distance };
-    Ok(match closest_point(mesh, bvh, p, &opts)? {
+    let hit = closest_point(mesh, bvh, p, &opts)?;
+    Ok(hit_value(mesh, bvh, sign, p, hit.as_ref()))
+}
+
+/// The signed distance of `p` given its closest point `hit` (`None`: far).
+pub(crate) fn hit_value(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    sign: &SignData,
+    p: [f32; 3],
+    hit: Option<&ClosestHit>,
+) -> f32 {
+    match hit {
         None => f32::INFINITY,
         Some(hit) if hit.distance == 0.0 => 0.0,
-        Some(hit) if sign.is_inside(mesh, bvh, p, &hit) => -hit.distance,
+        Some(hit) if sign.is_inside(mesh, bvh, p, hit) => -hit.distance,
         Some(hit) => hit.distance,
-    })
+    }
 }
 
 #[cfg(test)]
