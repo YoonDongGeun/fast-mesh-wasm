@@ -484,11 +484,11 @@ store.setDisplay(upper, { coloring: { distanceTo: lower, ...heat } });
 store.setDisplay(lower, { coloring: { distanceTo: upper, ...heat } });
 ```
 
-- The range is `[-depth, gap]`. Penetration runs from `deep` (`#7f0000`) at `-depth` to `shallow` (`#ff6b6b`) at the contact band, which is `contact` (`#ffffff`) across `[-tolerance, +tolerance]` (one stop at 0 when the tolerance is 0, the default). The gap runs from `near` (`#4caf50`) to `far` (`#1e3a8a`) at `gap`. Deeper than `depth` clamps to `deep`; farther than `gap` shows the base colour. `colors` overrides any of the five.
+- The range is `[-depth, gap]`. Penetration runs from `deep` (`#7f0000`) at `-depth` to `shallow` (`#ff6b6b`) at the contact band, which is `contact` (`#ffffff`) across `[-tolerance, +tolerance]` (one stop at 0 when the tolerance is 0, the default). The gap runs from `near` (`#4caf50`) to `far` (`#1e3a8a`) at `gap`. Deeper than `depth` clamps to `deep`; farther than `gap` shows the base colour. `gap: 0` colours penetration only: the range is then `[-depth, tolerance]`, with no gap ramp, and anything beyond the contact band shows the base colour. `colors` overrides any of the five.
 - `exactDepth: false` (the default) bounds the field at `max(depth, gap)`: the fast path for contact, but a vertex deeper than that is beyond the field and shows the base colour. `exactDepth: true` computes every vertex's distance (`maxDistance: Infinity`), so any penetration shows, at the cost of a full recompute on every update.
 - `sign` (default `"auto"`) is passed through. On an open or inconsistently oriented target, the penetration side follows its surface normals (`fieldStatus` tells you which).
 - Changing only `tolerance` or `colors` keeps `maxDistance` and `sign`, so the store reuses its field and only recolours.
-- It throws `INVALID_ARGUMENT` unless `depth > 0`, `gap > 0` (both finite) and `0 <= tolerance < min(depth, gap)`.
+- It throws `INVALID_ARGUMENT` unless `depth > 0`, `gap >= 0` (both finite) and `0 <= tolerance < min(depth, gap)` (`< depth` when `gap` is 0).
 
 `store.fetchColoringValues(mesh)` resolves to a copy of the values of the field behind the mesh's colouring (one per vertex slot), or `null` when the mesh has no colouring: for readouts such as the deepest penetration, `-min(values)`. It uses `fetchFieldValues` on a Worker scene and copies `fieldValues` on a synchronous one. It rejects with `UNKNOWN_MESH` for a mesh not in the store.
 
@@ -522,6 +522,8 @@ Meshes must be added through the store (`store.addMesh`). A mesh added straight 
 - **One store across two `<Canvas>` roots.** The first mounted driver for a store does the committing; every canvas is invalidated on change. If the committing canvas does not render at all (`frameloop="never"`, say) while another one runs, the store stops committing. Drive such a store from one canvas only, or call `useFrameDriver` in the canvas that always renders.
 
 [`examples/react`](examples/react) is a complete app on the Worker store (`?local` for the synchronous one): colouring toggles, opacity and visibility, a section, undo/redo, the scene status with Restart, dragging with three's TransformControls and STL drop.
+
+**Showcase.** [`examples/showcase`](examples/showcase) is a small mesh tool on the same stack: load STL, OBJ and PLY files (parsed in a Worker), move meshes with a gizmo, analyse and repair them (weld, remove degenerate triangles, orient, remove small components, fill holes; each one undo step), and see how two meshes touch as a contact heatmap (`contactHeatmap`) with live readouts of the deepest penetration, the gap and the contacts.
 
 ## Functions
 
