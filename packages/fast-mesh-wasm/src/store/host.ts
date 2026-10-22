@@ -20,7 +20,7 @@ import type {
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import type { Indices, PlacementInput, Positions64 } from "../api.js";
-import { addFieldKeyed, type KeyStatus, type WorkerScene } from "../worker/client.js";
+import { addFieldKeyed, type KeyStatus, watchStatusKeys, type WorkerScene } from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
 export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals">;
@@ -42,6 +42,14 @@ export interface Host {
   status(key: string): KeyStatus;
   /** Registers a listener for status (and undo/redo state) changes; returns its remover. */
   onStatus(listener: () => void): () => void;
+  /**
+   * The keys whose status may have changed since the store last cleared the
+   * set: added at once (before `onStatus` listeners run), by the scene and by
+   * `track` and `forgetErrors`. The store clears it as it reads it.
+   */
+  readonly changed: Set<string>;
+  /** Stops recording `changed` (the store is disposed). */
+  stop(): void;
   /** The id of a handle as used in status keys. */
   idOf(handle: MeshHandle | FieldHandle | SectionHandle): number;
   /**
@@ -78,15 +86,21 @@ export function hostOf(scene: Scene | WorkerScene): Host {
   return isWorkerScene(scene) ? workerHost(scene) : localHost(scene);
 }
 
-/** The errors of calls made under a key that threw at once (see `Host.track`), by key. */
-function tracker() {
+/**
+ * The errors of calls made under a key that threw at once (see `Host.track`),
+ * by key; each key whose error is set or cleared goes into `changed`.
+ */
+function tracker(changed: Set<string>) {
   const errors = new Map<string, FastMeshError>();
   const track = <T>(key: string, fn: () => T): T => {
     try {
       const out = fn();
-      errors.delete(key);
+      if (errors.delete(key)) {
+        changed.add(key);
+      }
       return out;
     } catch (e) {
+      changed.add(key);
       errors.set(
         key,
         e instanceof FastMeshError ? e : new FastMeshError("INVALID_ARGUMENT", e instanceof Error ? e.message : String(e)),
@@ -98,6 +112,7 @@ function tracker() {
     for (const key of [...errors.keys()]) {
       if (match(key)) {
         errors.delete(key);
+        changed.add(key);
       }
     }
   };
@@ -113,7 +128,8 @@ function tracker() {
 export function localHost(scene: Scene): Host {
   const ids = new WeakMap<object, number>();
   let next = 0;
-  const { errors, track, forgetErrors } = tracker();
+  const changed = new Set<string>();
+  const { errors, track, forgetErrors } = tracker(changed);
   let rev = 0;
   const promised = <T>(fn: () => T): Promise<T> => new Promise<T>((resolve) => resolve(fn()));
   return {
@@ -138,6 +154,8 @@ export function localHost(scene: Scene): Host {
       return error === undefined ? { status: "ready", revision: rev } : { status: "error", revision: rev, error };
     },
     onStatus: () => () => {},
+    changed,
+    stop: () => {},
     idOf: (handle) => {
       let id = ids.get(handle);
       if (id === undefined) {
@@ -169,7 +187,9 @@ export function localHost(scene: Scene): Host {
  * request went out: that key is `"error"` until a call under it succeeds.
  */
 export function workerHost(scene: WorkerScene): Host {
-  const { errors, track, forgetErrors } = tracker();
+  const changed = new Set<string>();
+  const { errors, track, forgetErrors } = tracker(changed);
+  const stop = watchStatusKeys(scene, (key) => changed.add(key));
   return {
     mode: "worker",
     scene,
@@ -189,6 +209,8 @@ export function workerHost(scene: WorkerScene): Host {
       return error === undefined ? s : { status: "error", revision: s.revision, error };
     },
     onStatus: (listener) => scene.onStatus(listener),
+    changed,
+    stop,
     idOf: (handle) => scene.idOf(handle),
     addField: (desc, key) => (key === undefined ? scene.addDistanceField(desc) : addFieldKeyed(scene, desc, key)),
     removeField: (field) => scene.removeField(field),
@@ -206,6 +228,7 @@ export function workerHost(scene: WorkerScene): Host {
         for (const [key, error] of before) {
           if (errors.get(key) === error) {
             errors.delete(key);
+            changed.add(key);
           }
         }
       });

@@ -444,6 +444,8 @@ let debugSizesOf: (scene: WorkerScene) => Record<string, number>;
 let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["debugDump"]["value"]>;
 /** Set by `WorkerScene`'s static block: the internal {@link addFieldKeyed}. */
 let addFieldKeyedOf: (scene: WorkerScene, desc: DistanceFieldDesc, key: string) => FieldHandle;
+/** Set by `WorkerScene`'s static block: the internal {@link watchStatusKeys}. */
+let watchStatusKeysOf: (scene: WorkerScene, sink: (key: string) => void) => () => void;
 
 /**
  * A scene whose engine runs in a Worker, from {@link createWorkerScene}. It
@@ -536,6 +538,8 @@ export class WorkerScene implements SceneLike {
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
   readonly #statusListeners = new Set<() => void>();
   readonly #status = new Map<string, KeyStatus>();
+  /** Called with each key whose status is set or forgotten, at once (see {@link watchStatusKeys}). */
+  readonly #statusSinks = new Set<(key: string) => void>();
   /** The latest revision requested per key. */
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
@@ -728,7 +732,7 @@ export class WorkerScene implements SceneLike {
     const key = keyOf(req);
     if (key !== undefined) {
       this.#latest.set(key, req.rev);
-      this.#status.set(key, { status: "computing", revision: req.rev });
+      this.#setStatus(key, { status: "computing", revision: req.rev });
       this.#statusChanged();
     }
     return req.rev;
@@ -847,7 +851,7 @@ export class WorkerScene implements SceneLike {
       }
       const key = keyOf(req);
       if (key !== undefined && this.#latest.get(key) === req.rev) {
-        this.#status.set(key, { status: "error", revision: req.rev, error });
+        this.#setStatus(key, { status: "error", revision: req.rev, error });
       }
       const qid = (req as { qid?: number }).qid;
       if (qid !== undefined) {
@@ -1011,7 +1015,7 @@ export class WorkerScene implements SceneLike {
         // A newer request for the key is still pending.
         continue;
       }
-      this.#status.set(
+      this.#setStatus(
         s.key,
         s.status === "ready"
           ? { status: "ready", revision: s.rev }
@@ -1121,6 +1125,23 @@ export class WorkerScene implements SceneLike {
       const n = count * stride;
       dst.set(src.subarray(at, at + n) as ArrayLike<number>, start * stride);
       at += n;
+    }
+  }
+
+  /** Sets a key's status and tells the sinks. */
+  #setStatus(key: string, status: KeyStatus): void {
+    this.#status.set(key, status);
+    for (const sink of this.#statusSinks) {
+      sink(key);
+    }
+  }
+
+  /** Forgets a key's status and tells the sinks. */
+  #deleteStatus(key: string): void {
+    if (this.#status.delete(key)) {
+      for (const sink of this.#statusSinks) {
+        sink(key);
+      }
     }
   }
 
@@ -1593,13 +1614,13 @@ export class WorkerScene implements SceneLike {
   /** Forgets the statuses of `exact` keys and of keys starting with a `prefixes` entry. */
   #forgetKeys(exact: string[], prefixes: string[]): void {
     for (const key of exact) {
-      this.#status.delete(key);
+      this.#deleteStatus(key);
       this.#latest.delete(key);
     }
     if (prefixes.length > 0) {
       for (const key of [...this.#latest.keys()]) {
         if (prefixes.some((p) => key.startsWith(p))) {
-          this.#status.delete(key);
+          this.#deleteStatus(key);
           this.#latest.delete(key);
         }
       }
@@ -2051,7 +2072,7 @@ export class WorkerScene implements SceneLike {
       }
       const failed =
         error ?? covers.map((c) => this.#status.get(c)).find((s) => s?.status === "error")?.error;
-      this.#status.set(
+      this.#setStatus(
         key,
         failed === undefined
           ? { status: "ready", revision: settle.rev }
@@ -2128,7 +2149,7 @@ export class WorkerScene implements SceneLike {
         return;
       }
       if (sorted.kind === "removal") {
-        this.#status.set(sorted.key, { status: "ready", revision: sorted.rev });
+        this.#setStatus(sorted.key, { status: "ready", revision: sorted.rev });
       } else if (sorted.kind === "declarative") {
         settleKeys.set(sorted.key, sorted.covers);
       }
@@ -2192,7 +2213,7 @@ export class WorkerScene implements SceneLike {
       } else {
         const key = `mesh:${st.id}`;
         if (st.add !== undefined && this.status(key).status !== "error") {
-          this.#status.set(key, { status: "error", revision: this.#latest.get(key) ?? 0, error: lost });
+          this.#setStatus(key, { status: "error", revision: this.#latest.get(key) ?? 0, error: lost });
         }
         st.add = undefined;
         continue;
@@ -2277,12 +2298,12 @@ export class WorkerScene implements SceneLike {
       if ((this.#latest.get(key) ?? 0) < first && !dropped.has(key)) {
         keys.set(key, covers);
         this.#latest.set(key, rev);
-        this.#status.set(key, { status: "computing", revision: rev });
+        this.#setStatus(key, { status: "computing", revision: rev });
       }
     }
     for (const [key, error] of dropped) {
       this.#latest.set(key, rev);
-      this.#status.set(key, { status: "error", revision: rev, error });
+      this.#setStatus(key, { status: "error", revision: rev, error });
     }
     // Removed fields and sections are not in the new engine: forget them.
     this.#runPrunes(Number.POSITIVE_INFINITY);
@@ -2358,6 +2379,12 @@ export class WorkerScene implements SceneLike {
       return [scene, scene.#ready.promise];
     };
     addFieldKeyedOf = (scene, desc, key) => scene.#addField(desc, key);
+    watchStatusKeysOf = (scene, sink) => {
+      scene.#statusSinks.add(sink);
+      return () => {
+        scene.#statusSinks.delete(sink);
+      };
+    };
     debugDumpOf = (scene, mesh) =>
       scene.#query(
         "debugDump",
@@ -2385,6 +2412,16 @@ export function debugDump(scene: WorkerScene, mesh: MeshHandle): Promise<QueryMa
  */
 export function addFieldKeyed(scene: WorkerScene, desc: DistanceFieldDesc, key: string): FieldHandle {
   return addFieldKeyedOf(scene, desc, key);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: calls `sink` at once
+ * with each key whose status is set or forgotten (before the `onStatus`
+ * listeners run, on a microtask), so the store re-derives only the states
+ * that read those keys. Returns the function that stops it.
+ */
+export function watchStatusKeys(scene: WorkerScene, sink: (key: string) => void): () => void {
+  return watchStatusKeysOf(scene, sink);
 }
 
 /** Test-only, not exported from `fast-mesh-wasm/worker`: the sizes of the scene's internal maps. */
