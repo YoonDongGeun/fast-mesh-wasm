@@ -504,6 +504,39 @@ The lock-step Worker blocks of the previous run (the same code without the drag-
 - **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.5 to 0.65 s at 10M (up to 1.0 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it.
 - **The engine's yield.** The engine yields with `setImmediate` where there is one (Node) and with a `MessageChannel` tick in browsers. In a Node `worker_threads` Worker a chain of `MessageChannel` ticks after chunks of 1 ms or more lets no `parentPort` message in (measured: none of about 60 messages sent at 60 Hz over 1 s of 1 ms or 4 ms chunks, while `setImmediate` let all of them in), so no recompute could be dropped there. The Task 5 table was measured with a `setImmediate` stand-in in the bench harness; the engine now does this itself and the harness no longer patches it. A browser Worker (headless Chrome 155, both examples' Vite builds) admits a message sent a third of the way into a 227 ms recompute: the recompute is dropped and its result posted 83 ms after it started. The Worker scene tables above this section were measured before the change; the Task 5 re-run with a `setImmediate` tick gave the same numbers within about 10% (1M contact drag 1.90 ms, 10M contact drag 30.9 ms, many small requests 3.97 ms).
 
+## Threaded Worker (drag-speed part B)
+
+The wide-range drag of the section above, in a Worker scene on a cross-origin isolated page, single-threaded (`threads: 1`) against threaded (the default pool, 8 threads on this machine), in the same headless browser. The threaded engine is the same Rust code built with wasm atomics and the `parallel` feature, its pool on Web Workers (`wasm-bindgen-rayon`); its results are bit-identical (`scripts/browser-check.mjs`, check `compare`).
+
+- **Machine:** Intel Core i5-13600K (20 hardware threads, `hardwareConcurrency` 20), 32 GB RAM, Windows 11.
+- **Browser:** headless Chrome 155.0.8059.85 over the DevTools protocol, against `vite preview` of `examples/webgpu` (its `check.html` page, with the COOP/COEP middleware).
+- **Build:** release `pnpm build` at `9c53ce0` (single-threaded `.wasm` 772 KB, threaded 976 KB; nightly-2026-10-15 for the threaded one).
+- **Date:** 2026-10-22.
+- **Command:** `node scripts/browser-check.mjs --build --bench --n 708 --kind 9a` (and `--kind native`; at 10M `--n 2236 --lock-step 4 --seconds 30`). Each run measures `threads: 1`, then the default.
+- **Same terrains, poses and drags as the Node tables above:** the 9a and native terrains, lock step (one move to poses 16, 32, 48 and 0 in turn, waiting for its colours; 8 moves at 1M, 4 at 10M), and a continuous 60 Hz drag through the 64 poses and back (10 s at 1M, 30 s at 10M) that ends right after its last move. The engine (step size, yield, starvation guard of 200 ms) is unchanged.
+- **Worker block** is the longest time the Worker's event loop did not run (a `MessageChannel` probe in the Worker, as the Node harness's), measured per lock-step pose.
+
+| | 1M, 9a terrain | 1M, native terrain | 10M, 9a terrain | 10M, native terrain |
+| --- | --- | --- | --- | --- |
+| **Longest Worker block per pose**, lock step, median: 1 thread → 8 | 47.3 → **23.5 ms** (2.0×) | 50.9 → **21.0 ms** (2.4×) | 671 → **380 ms** (1.8×) | 825 → **397 ms** (2.1×) |
+| Lock step: move to colours applied, median | 60.5 → 37.5 ms (1.6×) | 623 → 140 ms (4.5×) | 907 → 637 ms (1.4×) | 10.26 → 2.97 s (3.5×) |
+| **Continuous: update interval during the drag**, median | 252 → **222 ms** | 792 → **428 ms** (1.9×) | 915 → **637 ms** (1.4×) | 10.4 s (one interval) → **2.96 s** (3.5×) |
+| **Continuous: last move, then release, to its colours applied** | 69.0 → **34.7 ms** | 611 → **298 ms** | 912 → **615 ms** | 10.05 → **2.71 s** |
+| Continuous: moves sent / poses recoloured / units dropped | 600 / 40 / 152 → 600 / 45 / 362 | 600 / 12 / 41 → 600 / 24 / 108 | 1800 / 34 / 1 → 1800 / 49 / 1 | 1800 / 3 / 1 → 1800 / 11 / 1 |
+| Continuous: longest Worker block | 62.6 → 31.8 ms | 97.1 → 60.3 ms | 727 → 428 ms | 859 → 411 ms |
+| Continuous: most batches waiting for a result | 6 → 3 | 40 → 20 | 61 → 41 | 630 → 193 |
+| Main thread per frame, median (longest) | 0.03 (0.11) → 0.03 ms (0.12) | 0.03 (8.06) → 0.04 ms (11.6) | 0.04 (0.42) → 0.03 ms (0.17) | 0.03 (15.2) → 0.03 ms (17.1) |
+| Set-up (two meshes, the field, first colours) | 3.08 → 0.99 s | 3.50 → 1.05 s | 49.1 → 39.6 s | 56.4 → 39.6 s |
+| WebAssembly memory after set-up | 215 → 258 MB | 215 → 259 MB | 2,122 → 2,390 MB | 2,124 → 2,408 MB |
+
+- **The longest Worker block halves.** It is opening a step unit (the field's preparation and its near search, one call), and 8 threads make it 1.8 to 2.4 times shorter: about 21 to 24 ms at 1M and about 0.4 s at 10M. A request sent during a drag waits at most that long.
+- **A recompute is 1.4 to 4.5 times faster.** The gain is largest where most of the mesh is recomputed (native terrain: 4.5× at 1M, 3.5× at 10M). On the 9a terrain few vertices change per pose, the unit open is most of a recompute, and the gain is that of the open (1.6× and 1.4×).
+- **The update interval** during a sustained drag is about the 200 ms starvation guard plus one recompute, so at 1M on the 9a terrain it barely moves (252 to 222 ms: the guard dominates), while on the native terrain it nearly halves (792 to 428 ms). At 10M a recompute outlasts the guard, and the colours update once per recompute: 637 ms and 2.96 s. Single-threaded, the 10M native drag recoloured 3 poses in 30 s (one interval between two of them inside the drag).
+- **After release** the last pose's colours arrive within about one recompute in every case, threaded and single-threaded.
+- **Browser against Node, single-threaded.** At 1M the browser's single-threaded numbers match the Node `worker_threads` table above (lock step 60.5 against 70.9 ms and 623 against 635 ms; interval 252 and 792 against 252 and 851 ms). At 10M the browser is slower: 907 ms against 631 ms and 10.3 s against 6.68 s per lock-step pose. That gap is not profiled; the threaded numbers are compared only with the single-threaded ones of the same browser run.
+- **Memory.** The threaded engine's shared memory starts at 18 pages (1.1 MiB, about 18 MB once the pool's thread stacks are allocated) and may grow to 65,536 pages (4 GiB). It held about 12 to 20% more after set-up than the single-threaded engine here (the pool's per-thread state and allocation); 10M fits.
+- **Indicative, other browsers** (Task 3's check, the 1M 9a lock step only, longest Worker block per pose, 1 thread → 8): Firefox 157 63.4 → 22.4 ms, Playwright WebKit 27.2 on Windows 49.5 → 21.8 ms. These were not re-run here.
+
 ## Parallel (the `parallel` feature)
 
 Every benchmark that the `parallel` feature touches, with the feature off and on. Results are bit-identical either way (the tests check it); only the time changes.
@@ -623,6 +656,7 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run, --wide for just the wide-range drag)
+pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
 cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
