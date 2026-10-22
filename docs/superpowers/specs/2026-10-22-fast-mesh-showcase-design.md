@@ -125,3 +125,18 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
    `?big` scales A and B to about 1M triangles each for scale checks.
 9. **Selection** *(my call)*. Collision A and B default to the first two meshes. If either is removed, its picker resets and colouring stops. Colouring persists across repairs; the field recomputes. Each mesh has one colouring, so picking a mesh as A or B replaces any colouring it had.
 10. **CI** *(my call)*. CI runs the browser check against `vite preview` with the COOP/COEP plugin and asserts `threads > 1`. It also runs a short `?local` pass. The app uses the workspace package and three's `TransformControls` from `three/addons`, as in `examples/react`, with no new gizmo dependency.
+
+## 7. Owner additions (2026-10-23)
+
+1. **Colouring start distance** *(owner)*. Colouring begins within a chosen distance, for example "from 1 mm", or "from 0 mm", which colours penetration only.
+   - `contactHeatmap` accepts `gap ≥ 0` (with `depth > 0`). When `gap = 0`, everything at or beyond 0 above the tolerance band shows the base colour.
+   - The showcase exposes `gap` as the slider "Colour from (mm)".
+2. **Crisp, adjustable boundary between coloured and uncoloured areas** *(owner)*. Vertex colours interpolate across triangles, so the edge between coloured and base-coloured vertices blurs over a triangle's width. The fix is fragment shading *(my call)*:
+   - **Engine.** It exposes, per mesh, the scalar values of the field behind its colouring as a render buffer, `values()` (f32 per vertex slot). It uses the same dirty ranges as the colours. In Rust this is a view of the colouring field's channel, so no extra copy is made.
+   - **Worker client.** It mirrors that buffer like the other render buffers, with dirty-range transfer.
+   - **`bindMesh` (`fast-mesh-wasm/three`).** It gains `shading?: "vertex" | "fragment"`, default `"vertex"`, which keeps today's behaviour. In `"fragment"` mode the material colours each fragment from the interpolated value through the rule's colormap: a LUT texture, the range, below/above handling, the base colour, and the center.
+     - Far values (Infinity) and NaN are encoded so that they interpolate to base without colouring their neighbours.
+     - `edgeSoftness?: number`, in distance units, sets the width of the blend at the coloured/uncoloured boundary and at the tolerance band. 0 means a hard edge.
+   - **R3F.** `<FastMesh>` passes `shading` and `edgeSoftness` through.
+   - **Showcase.** The collision panel gets a "Boundary softness" slider, and fragment shading is on by default.
+   - **Exactness.** The per-fragment colour at a vertex equals the vertex-mode colour at that vertex. This is tested.
