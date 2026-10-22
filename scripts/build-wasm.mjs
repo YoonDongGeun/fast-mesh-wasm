@@ -13,7 +13,7 @@
 // It is always a release build, also next to a `--test` build of src/wasm. Without the
 // nightly (or its rust-src) it warns and skips, unless CI is set.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,10 +134,24 @@ run(process.execPath, [wasmOpt, bgWasm, "-O3", ...features, "-o", bgWasm]);
 
 if (threads) {
   // wasm-bindgen-rayon's worker helper (snippets/wasm-bindgen-rayon-*/src/workerHelpers.js)
-  // imports the glue as the directory `../../..`, the way wasm-pack lays out a package;
-  // bundlers resolve that through this `main`. Its `sideEffects` (`**`: the helper sits
-  // three levels down, in snippets/<crate>/src/) keeps the helper's top-level message
-  // handler, which runs when it is loaded as a Worker.
+  // imports the glue as the directory `../../..`, the way wasm-pack lays out a package.
+  // Only bundlers resolve a directory (through a package.json `main`); a browser loading
+  // the files as they are fails the import, and the pool never starts. So it is
+  // rewritten to the glue file, which every bundler and browser resolves.
+  const snippets = join(outDir, "snippets");
+  const rayon = readdirSync(snippets).filter((d) => d.startsWith("wasm-bindgen-rayon-"));
+  if (rayon.length !== 1) {
+    throw new Error(`expected one wasm-bindgen-rayon snippet in ${snippets}, found ${rayon.length}`);
+  }
+  const helper = join(snippets, rayon[0], "src", "workerHelpers.js");
+  const source = readFileSync(helper, "utf8");
+  if (source.split("import('../../..')").length !== 2) {
+    throw new Error(`${helper} no longer imports the glue as import('../../..'): update build-wasm.mjs`);
+  }
+  writeFileSync(helper, source.replace("import('../../..')", "import('../../../fast_mesh_wasm.js')"));
+  // `main` names the glue for tools that resolve the directory. `sideEffects` (`**`: the
+  // helper sits three levels down, in snippets/<crate>/src/) keeps the helper's top-level
+  // message handler, which runs when it is loaded as a Worker.
   const nested = { type: "module", main: "fast_mesh_wasm.js", sideEffects: ["./snippets/**"] };
   writeFileSync(join(outDir, "package.json"), `${JSON.stringify(nested, null, 2)}\n`);
 }

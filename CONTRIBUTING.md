@@ -57,6 +57,8 @@ pnpm test
 | `pnpm lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
 | `pnpm check:pkg` | publint and Are The Types Wrong on the package |
 | `pnpm smoke` | Packs the package and installs it with npm, pnpm and bun in temporary projects |
+| `node scripts/browser-check.mjs` | Headless Chrome (`CHROME_PATH` if not found) against `vite preview` of `examples/webgpu/check.html` (build the example first, or pass `--build`): the threaded Worker engine is bit-identical to the single-threaded one, grows its shared memory past 512 MB, restarts with a new pool and falls back when its pool cannot start. `--dev` uses the dev server; `--browser firefox` or `webkit` uses Playwright (`PLAYWRIGHT=<path to its index.mjs>`); `--bench` runs the wide drag single-threaded and threaded instead |
+| `node scripts/bundler-check.mjs` | Packs the package, installs it with npm into fresh Vite (build and dev), webpack 5 and no-bundler apps under the temp folder, and checks in headless Chrome that each starts a Worker scene with threads > 1 |
 | `cargo bench -p fast-mesh-bvh` | BVH benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
 | `cargo bench -p fast-mesh-query` | Raycast, closest-point and region benchmarks on 1M triangles (`FAST_MESH_BENCH_LARGE=1` adds 10M); results go in `docs/benchmarks.md` |
 | `cargo bench -p fast-mesh-scene` | Scene overhead against direct queries on two 1M-triangle meshes, and `find_contacts` over 2, 8 and 32 small meshes; results go in `docs/benchmarks.md` |

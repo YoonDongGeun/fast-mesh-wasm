@@ -96,11 +96,22 @@ jobs:
           pnpm --filter fast-mesh-wasm-example-react build
           # The Worker client sits in a chunk shared by ./worker and ./store: Vite must still find the Worker URL.
           ls examples/react/dist/assets/worker-entry-*.js
+      # Headless Chrome (preinstalled on the runner) against `vite preview` of the WebGPU
+      # example's check page: threaded and single-threaded bit-identical, shared memory
+      # growth past 512 MB, restart with a new pool, fallback when the pool cannot start.
+      - name: Check the threaded Worker engine in Chrome
+        timeout-minutes: 10
+        run: node scripts/browser-check.mjs
       - name: Bundle and run the webpack server example (Node entry, sideEffects)
         run: |
           pnpm --filter fast-mesh-wasm-example-webpack-node build
           node examples/webpack-node/dist/main.cjs
       - run: pnpm --filter fast-mesh-wasm pack --pack-destination "${{ github.workspace }}/pack"
+      # The tarball installed with npm into fresh Vite (build and dev), webpack 5 and
+      # no-bundler apps: threads > 1 in Chrome with only the COOP/COEP headers set.
+      - name: Check bundlers on the packed tarball
+        timeout-minutes: 10
+        run: node scripts/bundler-check.mjs --tarball pack
       - uses: actions/upload-artifact@v7
         with:
           name: package

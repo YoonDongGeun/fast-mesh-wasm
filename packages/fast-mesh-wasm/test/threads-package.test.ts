@@ -38,12 +38,16 @@ describe.skipIf(!existsSync(threadsDir) && !process.env.CI)("threaded artifact (
     // The glue imports the helpers by this relative path.
     const glue = readFileSync(join(threadsDir, "fast_mesh_wasm.js"), "utf8");
     expect(glue).toContain(`./snippets/${rayon[0]}/src/workerHelpers.js`);
-    // The helper spawns itself and imports the glue as the directory `../../..`,
-    // which resolves through dist/wasm-threads/package.json `main`.
+    // The helper spawns itself and imports the glue. Upstream imports the
+    // directory `../../..` (resolved through dist/wasm-threads/package.json
+    // `main`), which only bundlers resolve; the build rewrites it to the glue
+    // file, so a page without a bundler gets threads too.
     expect(source).toContain("new URL('./workerHelpers.js', import.meta.url)");
-    expect(source).toContain("import('../../..')");
+    expect(source).toContain("import('../../../fast_mesh_wasm.js')");
+    expect(source).not.toContain("import('../../..')");
     const pkgRoot = resolve(dirname(helpers), "../../..");
     expect(pkgRoot).toBe(threadsDir);
+    expect(existsSync(resolve(dirname(helpers), "../../../fast_mesh_wasm.js"))).toBe(true);
     const nested = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as {
       main?: string;
       sideEffects?: string[];
