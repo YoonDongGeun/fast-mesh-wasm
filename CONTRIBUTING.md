@@ -30,7 +30,7 @@ You need:
   ```sh
   cargo install wasm-bindgen-cli --version =0.2.129 --locked
   ```
-- The nightly that builds the threaded artifact (`dist/wasm-threads`), with `rust-src`. Its date is the `NIGHTLY` constant in `scripts/build-wasm.mjs`:
+- The nightly that builds the threaded artifact (`dist/wasm-threads`), with `rust-src`. Its date is the `NIGHTLY` constant in `scripts/build-wasm.mjs`. Without it, local builds and tests skip the threaded artifact with a warning, but publishing needs it:
   ```sh
   rustup toolchain install "$(node scripts/build-wasm.mjs --print-nightly)" --profile minimal --component rust-src --target wasm32-unknown-unknown
   ```
@@ -53,7 +53,7 @@ pnpm test
 | Command | What it does |
 | --- | --- |
 | `pnpm build` | Rust → `.wasm` → wasm-bindgen glue and `.d.ts` → wasm-opt → TypeScript bundle in `packages/fast-mesh-wasm/dist`; builds both the single-threaded artifact (`dist/wasm`, stable) and the threaded one (`dist/wasm-threads`, `scripts/build-wasm.mjs --threads`, pinned nightly) |
-| `pnpm test` | `cargo test` for the core, then a test build of the package and Vitest against it |
+| `pnpm test` | `cargo test` for the core, then a test build of the package and Vitest against it. It builds the threaded artifact when the pinned nightly (with `rust-src`) is installed; otherwise it warns, skips that artifact and its tests (`threads-package.test.ts`). Under `CI` a missing nightly is an error |
 | `pnpm lint` | `cargo fmt --check` and `cargo clippy -D warnings` |
 | `pnpm check:pkg` | publint and Are The Types Wrong on the package |
 | `pnpm smoke` | Packs the package and installs it with npm, pnpm and bun in temporary projects |

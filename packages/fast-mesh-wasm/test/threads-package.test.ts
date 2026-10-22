@@ -10,7 +10,9 @@ const pkgDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(pkgDir, "dist");
 const threadsDir = join(dist, "wasm-threads");
 
-describe("threaded artifact (dist/wasm-threads)", () => {
+// Locally, without the pinned nightly, `build-wasm.mjs --threads` skips the artifact
+// (with a warning), so these skip too. Under CI it must exist.
+describe.skipIf(!existsSync(threadsDir) && !process.env.CI)("threaded artifact (dist/wasm-threads)", () => {
   it("threaded_artifact_built", async () => {
     const glue = readFileSync(join(threadsDir, "fast_mesh_wasm.js"), "utf8");
     expect(glue).toMatch(/export function initThreadPool\(/);
@@ -42,8 +44,13 @@ describe("threaded artifact (dist/wasm-threads)", () => {
     expect(source).toContain("import('../../..')");
     const pkgRoot = resolve(dirname(helpers), "../../..");
     expect(pkgRoot).toBe(threadsDir);
-    const nested = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as { main?: string };
+    const nested = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as {
+      main?: string;
+      sideEffects?: string[];
+    };
     expect(nested.main).toBe("fast_mesh_wasm.js");
+    // The helper is three levels down (snippets/<crate>/src/): `*` would not match it.
+    expect(nested.sideEffects).toEqual(["./snippets/**"]);
     expect(existsSync(join(pkgRoot, nested.main!))).toBe(true);
   });
 

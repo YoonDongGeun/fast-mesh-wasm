@@ -1,0 +1,21 @@
+name: Install the pinned nightly
+description: >
+  Installs the nightly that builds the threaded artifact (dist/wasm-threads), with
+  rust-src (for -Z build-std) and wasm32-unknown-unknown. Its date is the NIGHTLY
+  constant in scripts/build-wasm.mjs, read with `--print-nightly`.
+outputs:
+  toolchain:
+    description: The pinned nightly, for example nightly-2026-10-15 (use it in cache keys).
+    value: ${{ steps.resolve.outputs.toolchain }}
+runs:
+  using: composite
+  steps:
+    # The runner's preinstalled Node is enough: the script prints the constant and exits.
+    - id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+        nightly=$(node scripts/build-wasm.mjs --print-nightly)
+        echo "toolchain=$nightly" >> "$GITHUB_OUTPUT"
+    - shell: bash
+      run: rustup toolchain install "${{ steps.resolve.outputs.toolchain }}" --profile minimal --component rust-src --target wasm32-unknown-unknown

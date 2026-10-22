@@ -10,9 +10,10 @@
 // With `--threads` it builds the threaded artifact instead, into src/wasm-threads: the
 // crate's `threads` feature (rayon + wasm-bindgen-rayon's `initThreadPool`) on the
 // nightly pinned below, with wasm atomics, a rebuilt std and a shared, imported memory.
-// It is always a release build, also next to a `--test` build of src/wasm.
+// It is always a release build, also next to a `--test` build of src/wasm. Without the
+// nightly (or its rust-src) it warns and skips, unless CI is set.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +40,49 @@ const bgWasm = join(outDir, "fast_mesh_wasm_bg.wasm");
 function run(cmd, args, env) {
   console.log(`$ ${cmd} ${args.join(" ")}`);
   execFileSync(cmd, args, { cwd: root, stdio: "inherit", env: env ? { ...process.env, ...env } : process.env });
+}
+
+// The nightly and its rust-src (for `-Z build-std`) must be installed. Locally a missing
+// toolchain only skips the threaded artifact, loudly, so contributors without the nightly
+// can still build and test the rest; under CI it is an error. prepublishOnly still refuses
+// a dist without dist/wasm-threads.
+if (threads) {
+  const problem = nightlyProblem();
+  if (problem) {
+    const install = `rustup toolchain install ${NIGHTLY} --profile minimal --component rust-src --target wasm32-unknown-unknown`;
+    const message = [
+      `${problem}, so the threaded artifact (src/wasm-threads) cannot be built.`,
+      `Install it with:`,
+      `  ${install}`,
+    ].join("\n");
+    if (process.env.CI) {
+      console.error(`error: ${message}`);
+      process.exit(1);
+    }
+    // Drop a stale artifact, so dist never ships one that no longer matches the crate.
+    rmSync(outDir, { recursive: true, force: true });
+    const bar = "!".repeat(78);
+    console.warn(`${bar}\nwarning: SKIPPING the threaded artifact. ${message}\n${bar}`);
+    process.exit(0);
+  }
+}
+
+function nightlyProblem() {
+  let sysroot;
+  try {
+    sysroot = execFileSync("rustup", ["run", NIGHTLY, "rustc", "--print", "sysroot"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // Never let rustup install the toolchain as a side effect of this check.
+      env: { ...process.env, RUSTUP_AUTO_INSTALL: "0" },
+    }).trim();
+  } catch {
+    return `The pinned nightly ${NIGHTLY} is not installed`;
+  }
+  if (!existsSync(join(sysroot, "lib", "rustlib", "src"))) {
+    return `The pinned nightly ${NIGHTLY} has no rust-src component`;
+  }
+  return undefined;
 }
 
 const testBuild = !threads && (process.env.FAST_MESH_TEST_BUILD === "1" || process.argv.includes("--test"));
@@ -91,9 +135,10 @@ run(process.execPath, [wasmOpt, bgWasm, "-O3", ...features, "-o", bgWasm]);
 if (threads) {
   // wasm-bindgen-rayon's worker helper (snippets/wasm-bindgen-rayon-*/src/workerHelpers.js)
   // imports the glue as the directory `../../..`, the way wasm-pack lays out a package;
-  // bundlers resolve that through this `main`. Its `sideEffects` keeps the helper's
-  // top-level message handler, which runs when it is loaded as a Worker.
-  const nested = { type: "module", main: "fast_mesh_wasm.js", sideEffects: ["./snippets/*"] };
+  // bundlers resolve that through this `main`. Its `sideEffects` (`**`: the helper sits
+  // three levels down, in snippets/<crate>/src/) keeps the helper's top-level message
+  // handler, which runs when it is loaded as a Worker.
+  const nested = { type: "module", main: "fast_mesh_wasm.js", sideEffects: ["./snippets/**"] };
   writeFileSync(join(outDir, "package.json"), `${JSON.stringify(nested, null, 2)}\n`);
 }
 

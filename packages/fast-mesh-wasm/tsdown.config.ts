@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
@@ -34,8 +35,10 @@ export default defineConfig({
   },
   // src/wasm-threads is the threaded artifact (`build-wasm.mjs --threads`), with its
   // rayon worker helpers under snippets/ and the package.json they resolve it by.
+  // Copied only if it exists: a local build without the pinned nightly skips it.
+  // prepublishOnly refuses to publish a dist without it.
   copy: [
     { from: "src/wasm", to: "dist" },
-    { from: "src/wasm-threads", to: "dist" },
+    ...(existsSync("src/wasm-threads") ? [{ from: "src/wasm-threads", to: "dist" }] : []),
   ],
 });
