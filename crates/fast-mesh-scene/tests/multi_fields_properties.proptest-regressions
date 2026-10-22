@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ab61c38089e119028b0d1a3aa879152c47368acdf25f6882f21b61721148c3ab # shrinks to open = [false, false, false], modes = [0, 0, 0, 0], winding = false, infinite = false, batches = [[Place(0, 1, [0, 0, 0]), Place(1, -1, [0, 0, 0])]]
+cc afd3e75b3043caf7c386c4d004618362abf594931c16173be206e07c00699449 # shrinks to open = [false, false, false], modes = [0, 0, 0, 0], winding = false, infinite = false, batches = [[Place(3, -11, [107, 57, 99])], [Place(1, 0, [0, 0, -1])]]

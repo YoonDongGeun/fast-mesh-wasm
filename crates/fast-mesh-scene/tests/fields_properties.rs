@@ -393,7 +393,7 @@ fn check_values(
     desc: &DistanceField,
     at: &str,
 ) -> Result<(), TestCaseError> {
-    let target = scene.mesh(desc.to).unwrap();
+    let target = scene.mesh(desc.to[0]).unwrap();
     let positions: Vec<f32> = target.positions().iter().flatten().copied().collect();
     let indices: Vec<u32> = (0..target.triangle_slots() as u32)
         .filter(|&t| target.is_triangle_alive(t))
@@ -414,7 +414,10 @@ fn check_values(
         .map(|v| {
             let p = source.position(v).unwrap().map(f64::from);
             let w = scene.local_to_world(desc.on, p).unwrap();
-            scene.world_to_local(desc.to, w).unwrap().map(|c| c as f32)
+            scene
+                .world_to_local(desc.to[0], w)
+                .unwrap()
+                .map(|c| c as f32)
         })
         .collect();
     let mut out = vec![0.0; points.len()];
@@ -558,14 +561,14 @@ proptest! {
             DistanceField {
                 name: "d".to_owned(),
                 on: a,
-                to: b,
+                to: vec![b],
                 max_distance: max_distance(mds[0]),
                 sign: sign_mode(signs[0]),
             },
             DistanceField {
                 name: "d".to_owned(),
                 on: b,
-                to: a,
+                to: vec![a],
                 max_distance: max_distance(mds[1]),
                 sign: sign_mode(signs[1]),
             },

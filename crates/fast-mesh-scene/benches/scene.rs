@@ -440,7 +440,7 @@ fn field_scene(
             .add_distance_field(DistanceField {
                 name: "d".to_owned(),
                 on,
-                to,
+                to: vec![to],
                 max_distance,
                 sign: SignMode::Auto,
             })
@@ -939,7 +939,7 @@ fn many_mesh_scene(n: u32, step: f64) -> (Scene, MeshId, Vec<Placement>) {
                 .add_distance_field(DistanceField {
                     name: format!("d{i}{j}"),
                     on,
-                    to,
+                    to: vec![to],
                     max_distance: MANY_DISTANCE,
                     sign: SignMode::Auto,
                 })

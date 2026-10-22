@@ -193,7 +193,7 @@ fn decorate(
         .add_distance_field(DistanceField {
             name: "to_probe".into(),
             on: hemi,
-            to: probe,
+            to: vec![probe],
             max_distance: f64::INFINITY,
             sign: SignMode::Pseudonormal,
         })
@@ -202,7 +202,7 @@ fn decorate(
         .add_distance_field(DistanceField {
             name: "to_hemi".into(),
             on: probe,
-            to: hemi,
+            to: vec![hemi],
             max_distance: f64::INFINITY,
             sign: SignMode::Pseudonormal,
         })

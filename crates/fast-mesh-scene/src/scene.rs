@@ -330,8 +330,10 @@ impl Scene {
     /// [`Scene::take_changes_for`], unless the mesh was added since that
     /// subscriber's last call.
     ///
-    /// The fields on the mesh and those measured to it are removed with it
-    /// (see [`Scene::remove_field`]), and so are colourings by them. The
+    /// The fields on the mesh and those measured to it alone are removed
+    /// with it (see [`Scene::remove_field`]), and so are colourings by them.
+    /// A field measured to it and to other meshes keeps the others: it is
+    /// recomputed in full, at once when it is Eager. The
     /// mesh leaves every section selecting it, which is reported in its
     /// final [`MeshChanges::sections_changed`].
     ///
@@ -346,7 +348,7 @@ impl Scene {
                 .try_reserve(1)
                 .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
         }
-        self.drop_fields_of(id);
+        let kept_on = self.drop_fields_of(id);
         self.drop_sections_of(id);
         let mut entry = self.entries.remove(id).ok_or(SceneError::UnknownMesh)?;
         self.history.forget(id, Some(&mut entry.mesh));
@@ -355,6 +357,8 @@ impl Scene {
                 s.removed.push(r.take(id, true));
             }
         }
+        // The fields that lost a target are due in full.
+        self.run_eager_fields(Some(&kept_on));
         Ok(entry.mesh)
     }
 
@@ -802,8 +806,18 @@ impl Scene {
         let _ = entry.update_bvh();
         // The slot count changed under the normals: recompute them now.
         let _ = entry.update_normals();
-        // The field channels were remapped with the mesh; so are the colours.
+        // The field channels were remapped with the mesh; so are the colours
+        // and the fields' nearest targets.
         entry.recolor_all();
+        for f in self.fields.iter_mut().filter(|f| f.desc.on == id) {
+            let old = std::mem::take(&mut f.nearest);
+            f.nearest = vec![u32::MAX; entry.mesh.vertex_slots()];
+            for (v, n) in old.into_iter().enumerate() {
+                if let Some(w) = remap.vertex(v as VertexId) {
+                    f.nearest[w as usize] = n;
+                }
+            }
+        }
         self.run_eager(Some(&[id]));
         Ok(remap)
     }

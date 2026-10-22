@@ -131,7 +131,9 @@ pub fn signed_distances_multi(
         }
         Ok(part)
     })?;
-    let chunks = out.chunks_mut(POINT_CHUNK).zip(nearest.chunks_mut(POINT_CHUNK));
+    let chunks = out
+        .chunks_mut(POINT_CHUNK)
+        .zip(nearest.chunks_mut(POINT_CHUNK));
     for ((vs, ns), part) in chunks.zip(parts) {
         for ((v, n), (x, k)) in vs.iter_mut().zip(ns.iter_mut()).zip(part) {
             (*v, *n) = (x, k);

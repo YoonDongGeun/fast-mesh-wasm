@@ -2,37 +2,51 @@
 //! from them (spec §6, §11).
 //!
 //! A field's values live in a derived store channel `field:<name>` on mesh
-//! A (`on`), one `f32` per vertex slot: the signed distance to mesh B
-//! (`to`) as placed in the world, `+∞` beyond `max_distance`, NaN for dead
-//! slots and for alive vertices no alive triangle uses.
+//! A (`on`), one `f32` per vertex slot: the signed distance to the nearest
+//! of its target meshes (`to`) as placed in the world, `+∞` beyond
+//! `max_distance`, NaN for dead slots and for alive vertices no alive
+//! triangle uses. "Nearest" is the smallest signed value: the nearest
+//! surface outside every target, or the deepest penetration. The field also
+//! keeps, per vertex slot, the index in `to` of the target that value came
+//! from (ties to the lowest index; none for `+∞` and NaN). With one target,
+//! the values are the distances to that mesh.
 //!
 //! **What an update recomputes** (§11.6). Each field has a change
-//! accumulator on A and on B (a [`FieldHook`], fed like a subscriber's
-//! report). Everything is recomputed when either says "everything"
+//! accumulator on A and on every target (a [`FieldHook`], fed like a
+//! subscriber's report). Everything is recomputed when any says "everything"
 //! (`add_mesh`, `compact`, a `Corrupted` step), when `max_distance` is
-//! infinite, or on the first update. Otherwise:
+//! infinite, or on the first update. Otherwise a target is *moved* when A's
+//! placement changed, its own placement changed, or it was edited, and:
 //!
-//! - after a placement change of either mesh or an edit of B: the vertices
-//!   of A's triangles within `pad(max_distance)` of B (`max_distance`
-//!   plus a relative `1e-6` and `8·f32::EPSILON` times the coordinate
-//!   magnitude of the pair), plus the vertices that
-//!   held finite values (so they can return to far);
+//! - for each moved target B: the vertices of A's triangles within
+//!   `pad(max_distance)` of B (`max_distance` plus a relative `1e-6` and
+//!   `8·f32::EPSILON` times the coordinate magnitude of the pair), plus the
+//!   vertices whose finite value came from B (so they can return to far, or
+//!   go to another target);
 //! - after an edit of A: its added, moved and removed vertices, plus, when
 //!   its triangles changed, the vertices whose "used by a triangle" state
 //!   flipped.
 //!
-//! When the near search would list more than [`NEAR_PAIRS_PER_SLOT`] pairs
-//! of triangles per vertex slot of A, it is abandoned and every vertex is
-//! recomputed instead: at a wide `max_distance` each triangle of A is near
-//! hundreds of B's, and listing the pairs costs far more than the
-//! recompute. Recomputing a vertex outside the near set gives it the value
-//! it already holds, so the values, colours and reports are the same.
+//! When the near search for a target would list more than
+//! [`NEAR_PAIRS_PER_SLOT`] pairs of triangles per vertex slot of A, it is
+//! abandoned and every vertex is recomputed instead: at a wide
+//! `max_distance` each triangle of A is near hundreds of B's, and listing the
+//! pairs costs far more than the recompute. Recomputing a vertex outside the
+//! near set gives it the value it already holds, so the values, colours and
+//! reports are the same.
 //!
-//! A vertex's value depends only on its own position and on B, so nothing
-//! else can change. Rebuilding B's sign data after an edit of B can flip
-//! signs only of finite values, which the near set covers. This relies on
-//! undo reporting revived slots as added (the store's `ChangeSet::merge`
-//! reports a reused slot as moved).
+//! A vertex's value depends only on its own position and on the targets.
+//! Outside a moved target's new near set, that target's value is `+∞`, which
+//! never wins; so a vertex whose value came from a target that did not move
+//! keeps it (a moved target that tied with it had a higher index, or it would
+//! have won). Rebuilding a target's sign data after an edit can flip signs
+//! only of its finite values, which its near set covers. This relies on undo
+//! reporting revived slots as added (the store's `ChangeSet::merge` reports a
+//! reused slot as moved).
+//!
+//! **Removing a target mesh** removes it from the targets of every field
+//! that has others (such a field is recomputed in full on its next update),
+//! and removes the fields left without targets.
 //!
 //! **Several fields in one update** are prepared one after the other (BVHs,
 //! sign data), then computed without writing, in parallel across fields with
@@ -49,7 +63,8 @@
 //! stay so, as after a query).
 
 use fast_mesh_fields::{
-    ColorRule, FieldsError, SignData, SignMode, SignStatus, color_of, signed_distances,
+    ColorRule, FieldsError, SignData, SignMode, SignStatus, Target, color_of,
+    signed_distances_multi,
 };
 use fast_mesh_query::Rigid;
 use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, VertexId, par};
@@ -66,13 +81,35 @@ pub struct DistanceField {
     pub name: String,
     /// The mesh whose vertices carry the values (mesh A).
     pub on: MeshId,
-    /// The mesh the distances are measured to (mesh B).
-    pub to: MeshId,
+    /// The meshes the distances are measured to: at least one, all
+    /// different, and not `on`. A vertex's value is the smallest over them,
+    /// ties going to the lowest index (see
+    /// [`Scene::field_nearest`](crate::Scene::field_nearest)).
+    pub to: Vec<MeshId>,
     /// The largest distance computed (inclusive); vertices farther away hold
     /// `+∞`. Zero or greater, may be infinite.
     pub max_distance: f64,
-    /// How the sign is decided on mesh `to`.
+    /// How the sign is decided on each mesh of `to`.
     pub sign: SignMode,
+}
+
+impl DistanceField {
+    /// A field on `on` measured to the single mesh `to`.
+    pub fn new(
+        name: impl Into<String>,
+        on: MeshId,
+        to: MeshId,
+        max_distance: f64,
+        sign: SignMode,
+    ) -> DistanceField {
+        DistanceField {
+            name: name.into(),
+            on,
+            to: vec![to],
+            max_distance,
+            sign,
+        }
+    }
 }
 
 /// The state of a field, from
@@ -81,7 +118,9 @@ pub struct DistanceField {
 pub struct FieldStatus {
     /// True when the values match the meshes and placements as they are now.
     pub current: bool,
-    /// What the latest sign data build found out about mesh `to`.
+    /// What the latest sign data build found out about the first mesh of
+    /// `to` (see [`Scene::field_target_status`](crate::Scene::field_target_status)
+    /// for every target).
     pub sign: SignStatus,
 }
 
@@ -147,24 +186,33 @@ struct FieldJob {
     i: usize,
     /// Every vertex is recomputed.
     full: bool,
-    /// A placement changed, or B was edited.
-    geometric: bool,
+    /// Per target: it moved (see the module docs).
+    moved: Vec<bool>,
     /// A's triangles changed since the last update.
     topology: bool,
     /// A's merged changes since the last update (`None`: everything).
     changes: Option<ChangeSet>,
-    /// The margin of the near set, when it is needed.
-    near_margin: Option<f64>,
-    /// From B's local space into A's, as the pair queries take it.
-    b_to_a: Rigid,
+    /// Per target: the margin of its near set, when it is needed.
+    near_margins: Vec<Option<f64>>,
+    /// Per target: from its local space into A's, as the pair queries take
+    /// it.
+    b_to_a: Vec<Rigid>,
     /// The most near pairs the near search may list (see
     /// [`NEAR_PAIRS_PER_SLOT`]), decided here on the caller's thread.
     near_limit: usize,
     /// An estimate of the update's cost, in elements: every vertex slot of
-    /// A when all are recomputed; otherwise the known candidates, plus A's
-    /// triangle count for the near search (which usually costs the most)
-    /// when B's root box is within the margin of A's.
+    /// A times the targets when all are recomputed; otherwise the known
+    /// candidates times the targets, plus A's triangle count for each near
+    /// search (which usually costs the most) whose target's root box is
+    /// within the margin of A's.
     work: usize,
+}
+
+impl FieldJob {
+    /// Some target moved.
+    fn geometric(&self) -> bool {
+        self.moved.contains(&true)
+    }
 }
 
 /// The new state of a field, computed without writing anything.
@@ -173,6 +221,8 @@ struct FieldPlan {
     candidates: Vec<VertexId>,
     /// The new value of every candidate, in candidate order.
     values: Vec<f32>,
+    /// The target each new value came from, in candidate order.
+    nearest: Vec<u32>,
     /// The candidates whose value bits changed, ascending.
     changed: Vec<VertexId>,
     /// The new "alive and used by a triangle" flags, when recomputed.
@@ -228,6 +278,8 @@ struct UnitField {
     pick: Pick,
     /// The values of the candidates computed so far, in candidate order.
     values: Vec<f32>,
+    /// The targets those values came from.
+    nearest: Vec<u32>,
     /// Points the kernel ran on so far.
     recomputed: usize,
     /// The field's new state, once every value is computed; stays `None`
@@ -316,8 +368,12 @@ pub(crate) struct Field {
     pub(crate) desc: DistanceField,
     /// `field:<name>`, the channel on mesh `on`.
     channel: String,
-    /// B's sign data, rebuilt when not current.
-    sign: SignData,
+    /// Each target's sign data, rebuilt when not current.
+    sign: Vec<SignData>,
+    /// Per vertex slot of A as of the last update: the index of the target
+    /// its value came from, `u32::MAX` for none. Shorter than the slots
+    /// when slots were added since; remapped with A by a compaction.
+    pub(crate) nearest: Vec<u32>,
     /// Not computed yet: the next update computes every vertex.
     fresh: bool,
     /// The vertices with finite values, ascending.
@@ -371,40 +427,52 @@ impl Entry {
 }
 
 impl Scene {
-    /// Registers a signed distance field on mesh `desc.on`, measured to mesh
-    /// `desc.to`, and returns its id. Its values go into a derived channel
-    /// `field:<name>` on `desc.on`, readable with [`Scene::field_values`] or
-    /// through [`Scene::mesh`]; they are not undoable.
+    /// Registers a signed distance field on mesh `desc.on`, measured to the
+    /// meshes `desc.to`, and returns its id. Its values go into a derived
+    /// channel `field:<name>` on `desc.on`, readable with
+    /// [`Scene::field_values`] or through [`Scene::mesh`]; they are not
+    /// undoable. With several targets, a vertex's value is the smallest over
+    /// them, and [`Scene::field_nearest`] tells which target it came from.
     ///
     /// The field follows the [`UpdateMode`] of `desc.on`: an Eager field is
     /// computed right away and after every edit, placement change, undo,
-    /// redo or cancel touching either mesh; a Lazy one by [`Scene::flush`]
-    /// or [`Scene::update_fields`]; a Manual one only by
+    /// redo or cancel touching `desc.on` or a target; a Lazy one by
+    /// [`Scene::flush`] or [`Scene::update_fields`]; a Manual one only by
     /// [`Scene::update_fields`]. Until then its values are NaN.
     ///
-    /// B's BVH is brought up to date under the query rules (a Lazy one is
-    /// updated) and its sign data built here, so that
-    /// [`Scene::field_status`] can report B's topology at once.
+    /// The targets' BVHs are brought up to date under the query rules (a
+    /// Lazy one is updated) and their sign data built here, so that
+    /// [`Scene::field_status`] can report their topology at once.
     ///
-    /// Every edit of the target mesh `desc.to` rebuilds its sign data over
-    /// the whole mesh (O(n), about 150 ms at 1M triangles in pseudonormal
-    /// mode, more after a topology edit, which drops the cached adjacency);
-    /// an incremental refit is planned for Phase 5b. Placement changes and
+    /// Every edit of a target mesh rebuilds its sign data over the whole
+    /// mesh (O(n), about 150 ms at 1M triangles in pseudonormal mode, more
+    /// after a topology edit, which drops the cached adjacency); an
+    /// incremental refit is planned for Phase 5b. Placement changes and
     /// edits of `desc.on` do not rebuild it.
     ///
     /// # Errors
-    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `on`
-    /// equals `to`, `max_distance` is negative or NaN, or `on` already has a
-    /// field of that name; [`SceneError::StaleBvh`] when `to` is a stale
-    /// Manual mesh; a BVH, field or memory error. The scene is unchanged on
-    /// error.
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `to` is
+    /// empty, holds `on` or a mesh twice, `max_distance` is negative or NaN,
+    /// or `on` already has a field of that name; [`SceneError::StaleBvh`]
+    /// when a target is a stale Manual mesh; a BVH, field or memory error.
+    /// The scene is unchanged on error.
     pub fn add_distance_field(&mut self, desc: DistanceField) -> Result<FieldId> {
         self.drop_field_unit();
         self.entry(desc.on)?;
-        self.entry(desc.to)?;
-        if desc.on == desc.to {
+        for &to in &desc.to {
+            self.entry(to)?;
+        }
+        if desc.to.is_empty() {
+            return Err(SceneError::InvalidInput("a field needs a target mesh"));
+        }
+        if desc.to.contains(&desc.on) {
             return Err(SceneError::InvalidInput(
                 "a field needs two different meshes",
+            ));
+        }
+        if (1..desc.to.len()).any(|k| desc.to[..k].contains(&desc.to[k])) {
+            return Err(SceneError::InvalidInput(
+                "a field's target meshes must all differ",
             ));
         }
         if desc.max_distance.is_nan() || desc.max_distance < 0.0 {
@@ -425,13 +493,14 @@ impl Scene {
             .next_field
             .checked_add(1)
             .ok_or(SceneError::InvalidInput("too many fields"))?;
-        self.prepare(Some(&[desc.to]))?;
-        let eb = self
-            .entries
-            .get_mut(desc.to)
-            .ok_or(SceneError::UnknownMesh)?;
-        let sign = SignData::build(&mut eb.mesh, &eb.bvh, desc.sign)?;
-        eb.hooks.try_reserve(1).map_err(|_| oom())?;
+        self.prepare(Some(&desc.to))?;
+        let mut sign = Vec::new();
+        sign.try_reserve_exact(desc.to.len()).map_err(|_| oom())?;
+        for &to in &desc.to {
+            let eb = self.entries.get_mut(to).ok_or(SceneError::UnknownMesh)?;
+            sign.push(SignData::build(&mut eb.mesh, &eb.bvh, desc.sign)?);
+            eb.hooks.try_reserve(1).map_err(|_| oom())?;
+        }
         self.fields.try_reserve(1).map_err(|_| oom())?;
         let channel = format!("{FIELD_PREFIX}{}", desc.name);
         let ea = self
@@ -446,14 +515,17 @@ impl Scene {
         self.next_field = next;
         ea.hooks.push(FieldHook::new(id));
         let eager = ea.mode == UpdateMode::Eager;
-        if let Some(eb) = self.entries.get_mut(desc.to) {
-            eb.hooks.push(FieldHook::new(id));
+        for &to in &desc.to {
+            if let Some(eb) = self.entries.get_mut(to) {
+                eb.hooks.push(FieldHook::new(id));
+            }
         }
         self.fields.push(Field {
             id,
             desc,
             channel,
             sign,
+            nearest: Vec::new(),
             fresh: true,
             finite: Vec::new(),
             referenced: Vec::new(),
@@ -510,6 +582,38 @@ impl Scene {
             .ok_or(SceneError::Corrupted)
     }
 
+    /// Per vertex slot of the field's mesh, as of its last update: the index
+    /// in [`Scene::field_targets`] of the target its value came from (the
+    /// lowest on a tie), or `u32::MAX` for none (a `+∞` or NaN value, or a
+    /// slot not computed yet). It can be shorter than the mesh's slots
+    /// (slots added since the last update): those slots have none. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field.
+    pub fn field_nearest(&self, id: FieldId) -> Result<&[u32]> {
+        Ok(&self.fields[self.field_index(id)?].nearest)
+    }
+
+    /// The field's target meshes, in index order. Removing a target mesh
+    /// removes it from here, shifting the later ones down.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field.
+    pub fn field_targets(&self, id: FieldId) -> Result<&[MeshId]> {
+        Ok(&self.fields[self.field_index(id)?].desc.to)
+    }
+
+    /// What the latest sign data build found out about each of the field's
+    /// targets, in index order. Never updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field.
+    pub fn field_target_status(&self, id: FieldId) -> Result<Vec<SignStatus>> {
+        let f = &self.fields[self.field_index(id)?];
+        Ok(f.sign.iter().map(SignData::status).collect())
+    }
+
     /// Whether the field is current, and what the latest sign data build
     /// found out about its target mesh. Never updates.
     ///
@@ -519,7 +623,7 @@ impl Scene {
         let i = self.field_index(id)?;
         Ok(FieldStatus {
             current: self.field_current(i),
-            sign: self.fields[i].sign.status(),
+            sign: self.fields[i].sign[0].status(),
         })
     }
 
@@ -597,7 +701,8 @@ impl Scene {
             .ok_or(SceneError::UnknownField)
     }
 
-    /// Computed at least once, and nothing changed on either mesh since.
+    /// Computed at least once, and nothing changed on its mesh or a target
+    /// since.
     fn field_current(&self, i: usize) -> bool {
         let f = &self.fields[i];
         let clean = |m: MeshId| {
@@ -606,7 +711,7 @@ impl Scene {
                 .and_then(|e| e.hook(f.id))
                 .is_some_and(FieldHook::is_clean)
         };
-        !f.fresh && clean(f.desc.on) && clean(f.desc.to)
+        !f.fresh && clean(f.desc.on) && f.desc.to.iter().all(|&m| clean(m))
     }
 
     /// Updates the fields that are not current, whose mesh's mode passes
@@ -631,8 +736,8 @@ impl Scene {
     ) -> Result<Vec<usize>> {
         let mut due = Vec::new();
         for i in 0..self.fields.len() {
-            let (on, to) = (self.fields[i].desc.on, self.fields[i].desc.to);
-            if touched.is_some_and(|t| !t.contains(&on) && !t.contains(&to)) {
+            let (on, to) = (self.fields[i].desc.on, &self.fields[i].desc.to);
+            if touched.is_some_and(|t| !t.contains(&on) && !to.iter().any(|m| t.contains(m))) {
                 continue;
             }
             let Ok(ea) = self.entry(on) else { continue };
@@ -753,7 +858,7 @@ impl Scene {
         let mut meshes = Vec::new();
         for f in self.field_unit.iter().flat_map(|u| &u.fields) {
             let desc = &self.fields[f.job.i].desc;
-            for m in [desc.on, desc.to] {
+            for &m in std::iter::once(&desc.on).chain(&desc.to) {
                 if !meshes.contains(&m) {
                     meshes.push(m);
                 }
@@ -820,14 +925,18 @@ impl Scene {
                     continue;
                 }
             };
-            let mut values = Vec::new();
+            let (mut values, mut nearest) = (Vec::new(), Vec::new());
             values
+                .try_reserve_exact(pick.candidates.len())
+                .map_err(|_| oom())?;
+            nearest
                 .try_reserve_exact(pick.candidates.len())
                 .map_err(|_| oom())?;
             unit.fields.push(UnitField {
                 job,
                 pick,
                 values,
+                nearest,
                 recomputed: 0,
                 plan: None,
             });
@@ -854,7 +963,7 @@ impl Scene {
                 let end = done + left.min(total - done);
                 let run = &f.pick.candidates[done..end];
                 computed = self
-                    .compute_values(&f.job, run, &mut f.values)
+                    .compute_values(&f.job, run, &mut f.values, &mut f.nearest)
                     .map(|n| f.recomputed += n);
                 left -= end - done;
                 if computed.is_ok() && end < total {
@@ -863,8 +972,9 @@ impl Scene {
             }
             let pick = std::mem::take(&mut f.pick);
             let values = std::mem::take(&mut f.values);
-            let plan =
-                computed.and_then(|()| self.finish_field(&f.job, pick, values, f.recomputed));
+            let nearest = std::mem::take(&mut f.nearest);
+            let plan = computed
+                .and_then(|()| self.finish_field(&f.job, pick, values, nearest, f.recomputed));
             let i = f.job.i;
             match plan {
                 Ok(plan) => f.plan = Some(plan),
@@ -874,22 +984,52 @@ impl Scene {
         }
     }
 
-    /// Removes the fields on `mesh` or measured to it.
-    pub(crate) fn drop_fields_of(&mut self, mesh: MeshId) {
+    /// Removes the fields on `mesh` or measured to it alone, and removes
+    /// `mesh` from the targets of the fields that have others; those are
+    /// recomputed in full on their next update. Returns the meshes those
+    /// fields are on, each once.
+    pub(crate) fn drop_fields_of(&mut self, mesh: MeshId) -> Vec<MeshId> {
+        let mut kept_on = Vec::new();
         let mut i = 0;
         while i < self.fields.len() {
-            if self.fields[i].desc.on == mesh || self.fields[i].desc.to == mesh {
+            let f = &mut self.fields[i];
+            let target = f.desc.to.iter().position(|&m| m == mesh);
+            if f.desc.on == mesh || (target.is_some() && f.desc.to.len() == 1) {
                 self.detach_field(i);
-            } else {
-                i += 1;
+                continue;
             }
+            if let Some(k) = target {
+                f.desc.to.remove(k);
+                f.sign.remove(k);
+                f.fresh = true;
+                // Until then, the indices follow the remaining targets.
+                let k = k as u32;
+                for n in &mut f.nearest {
+                    if *n == k {
+                        *n = u32::MAX;
+                    } else if *n != u32::MAX && *n > k {
+                        *n -= 1;
+                    }
+                }
+                let (id, on) = (f.id, f.desc.on);
+                if let Some(e) = self.entries.get_mut(mesh) {
+                    e.hooks.retain(|h| h.field != id);
+                }
+                if !kept_on.contains(&on) {
+                    kept_on.push(on);
+                }
+            }
+            i += 1;
         }
+        kept_on
     }
 
     fn detach_field(&mut self, i: usize) {
         let f = self.fields.remove(i);
-        if let Some(eb) = self.entries.get_mut(f.desc.to) {
-            eb.hooks.retain(|h| h.field != f.id);
+        for &to in &f.desc.to {
+            if let Some(eb) = self.entries.get_mut(to) {
+                eb.hooks.retain(|h| h.field != f.id);
+            }
         }
         if let Some(ea) = self.entries.get_mut(f.desc.on) {
             ea.hooks.retain(|h| h.field != f.id);
@@ -1009,78 +1149,96 @@ impl Scene {
     }
 
     /// Brings what field `i` reads up to date, the part of an update that
-    /// needs the meshes mutably: its BVHs (B's always, A's when the near set
-    /// is needed) and B's sign data. Then decides what the update recomputes
-    /// (see the module docs). Writes no field state.
+    /// needs the meshes mutably: its BVHs (the targets' always, A's when a
+    /// near set is needed) and the targets' sign data. Then decides what the
+    /// update recomputes (see the module docs). Writes no field state.
     fn prepare_field(&mut self, i: usize) -> Result<FieldJob> {
-        let (id, on, to) = (
-            self.fields[i].id,
-            self.fields[i].desc.on,
-            self.fields[i].desc.to,
-        );
+        let (id, on) = (self.fields[i].id, self.fields[i].desc.on);
+        let mut to = Vec::new();
+        to.try_reserve_exact(self.fields[i].desc.to.len() + 1)
+            .map_err(|_| oom())?;
+        to.extend_from_slice(&self.fields[i].desc.to);
+        let n = to.len();
         let (md, mode) = (self.fields[i].desc.max_distance, self.fields[i].desc.sign);
-        let hook_a = self
-            .entry(on)?
-            .hook(id)
-            .cloned()
-            .ok_or(SceneError::Corrupted)?;
-        let hook_b = self
-            .entry(to)?
-            .hook(id)
-            .cloned()
-            .ok_or(SceneError::Corrupted)?;
-        let full = self.fields[i].fresh
-            || md.is_infinite()
-            || hook_a.changes.is_none()
-            || hook_b.changes.is_none();
-        let geometric = hook_a.placement_changed
-            || hook_b.placement_changed
-            || hook_b.changes.as_ref().is_some_and(|c| !c.is_empty());
-        // B's BVH is always needed; A's only for the near set.
-        let need_near = !full && geometric;
-        let both = [on, to];
-        self.prepare(Some(if need_near { &both } else { &both[1..] }))?;
-        let near_margin = if need_near {
-            Some(pad(md, self.pair_magnitude(on, to)?))
-        } else {
-            None
+        let hook = |m: MeshId| -> Result<FieldHook> {
+            self.entry(m)?
+                .hook(id)
+                .cloned()
+                .ok_or(SceneError::Corrupted)
         };
-        {
-            let eb = self.entries.get_mut(to).ok_or(SceneError::UnknownMesh)?;
+        let hook_a = hook(on)?;
+        let mut full = self.fields[i].fresh || md.is_infinite() || hook_a.changes.is_none();
+        let mut moved = Vec::new();
+        moved.try_reserve_exact(n).map_err(|_| oom())?;
+        for &m in &to {
+            let hook_b = hook(m)?;
+            full |= hook_b.changes.is_none();
+            moved.push(
+                hook_a.placement_changed
+                    || hook_b.placement_changed
+                    || hook_b.changes.as_ref().is_some_and(|c| !c.is_empty()),
+            );
+        }
+        // The targets' BVHs are always needed; A's only for a near set.
+        let need_near = !full && moved.contains(&true);
+        if need_near {
+            to.push(on);
+        }
+        self.prepare(Some(&to))?;
+        to.truncate(n);
+        let mut near_margins = Vec::new();
+        near_margins.try_reserve_exact(n).map_err(|_| oom())?;
+        for (k, &m) in to.iter().enumerate() {
+            near_margins.push(if need_near && moved[k] {
+                Some(pad(md, self.pair_magnitude(on, m)?))
+            } else {
+                None
+            });
+        }
+        for (k, &m) in to.iter().enumerate() {
+            let eb = self.entries.get_mut(m).ok_or(SceneError::UnknownMesh)?;
             let f = &mut self.fields[i];
-            if !f.sign.is_current(&eb.mesh, &eb.bvh) {
-                f.sign = SignData::build(&mut eb.mesh, &eb.bvh, mode)?;
+            if !f.sign[k].is_current(&eb.mesh, &eb.bvh) {
+                f.sign[k] = SignData::build(&mut eb.mesh, &eb.bvh, mode)?;
             }
         }
-        let b_to_a = self.relative_transform(on, to)?;
+        let mut b_to_a = Vec::new();
+        b_to_a.try_reserve_exact(n).map_err(|_| oom())?;
+        for &m in &to {
+            b_to_a.push(self.relative_transform(on, m)?);
+        }
         let ma = &self.entry(on)?.mesh;
         let changes = hook_a.changes;
         let topology = changes.as_ref().is_some_and(ChangeSet::topology_changed);
         let work = if full {
-            ma.vertex_slots()
+            ma.vertex_slots().saturating_mul(n)
         } else {
             let listed = changes.as_ref().map_or(0, |c| {
                 c.vertices_added.len() + c.vertices_moved.len() + c.vertices_removed.len()
             });
-            let known = if geometric {
+            let known = if moved.contains(&true) {
                 self.fields[i].finite.len()
             } else {
                 0
             };
-            let near = match near_margin {
-                Some(margin) if self.roots_within(on, to, &b_to_a, margin)? => ma.triangle_count(),
-                _ => 0,
-            };
+            let mut near = 0;
+            for (k, &m) in to.iter().enumerate() {
+                if let Some(margin) = near_margins[k]
+                    && self.roots_within(on, m, &b_to_a[k], margin)?
+                {
+                    near += ma.triangle_count();
+                }
+            }
             let flips = if topology { ma.vertex_slots() } else { 0 };
-            listed + known + near + flips
+            (listed + known).saturating_mul(n) + near + flips
         };
         Ok(FieldJob {
             i,
             full,
-            geometric,
+            moved,
             topology,
             changes,
-            near_margin,
+            near_margins,
             b_to_a,
             near_limit: near_pair_limit(ma.vertex_slots()),
             work,
@@ -1111,32 +1269,37 @@ impl Scene {
     fn compute_field(&self, job: &FieldJob) -> Result<FieldPlan> {
         let pick = self.pick_candidates(job)?;
         let mut values = Vec::with_capacity(pick.candidates.len());
-        let recomputed = self.compute_values(job, &pick.candidates, &mut values)?;
-        self.finish_field(job, pick, values, recomputed)
+        let mut nearest = Vec::with_capacity(pick.candidates.len());
+        let recomputed = self.compute_values(job, &pick.candidates, &mut values, &mut nearest)?;
+        self.finish_field(job, pick, values, nearest, recomputed)
     }
 
     /// The vertices a prepared field's update recomputes, reading the
     /// meshes only.
     fn pick_candidates(&self, job: &FieldJob) -> Result<Pick> {
         let f = &self.fields[job.i];
-        let (ea, eb) = (self.entry(f.desc.on)?, self.entry(f.desc.to)?);
+        let ea = self.entry(f.desc.on)?;
         let ma = &ea.mesh;
         let slots = ma.vertex_slots();
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
 
-        // A's triangles near B, as `Scene::triangles_near` (with the BVHs
-        // `prepare_field` brought up to date), unless there are too many
-        // pairs: then every vertex is recomputed.
+        // A's triangles near each moved target, as `Scene::triangles_near`
+        // (with the BVHs `prepare_field` brought up to date), unless one
+        // search finds too many pairs: then every vertex is recomputed.
         let mut near = Vec::new();
         let mut all = job.full;
         let mut aborted = false;
-        if let Some(margin) = job.near_margin.filter(|_| !all) {
+        for (k, margin) in job.near_margins.iter().enumerate() {
+            let Some(margin) = margin.filter(|_| !all) else {
+                continue;
+            };
+            let eb = self.entry(f.desc.to[k])?;
             aborted = !fast_mesh_query::triangles_near_limited(
                 ma,
                 &ea.bvh,
                 &eb.mesh,
                 &eb.bvh,
-                &job.b_to_a,
+                &job.b_to_a[k],
                 round_up(margin),
                 job.near_limit,
                 &mut near,
@@ -1154,8 +1317,13 @@ impl Scene {
                     c.extend_from_slice(&tri);
                 }
             }
-            if job.geometric {
-                c.extend_from_slice(&f.finite);
+            if job.geometric() {
+                // The finite values that came from a moved target.
+                let from_moved = |v: VertexId| match f.nearest.get(v as usize) {
+                    Some(&k) => job.moved.get(k as usize).copied().unwrap_or(true),
+                    None => true,
+                };
+                c.extend(f.finite.iter().copied().filter(|&v| from_moved(v)));
             }
             if let Some(ch) = &job.changes {
                 c.extend_from_slice(&ch.vertices_added);
@@ -1182,66 +1350,76 @@ impl Scene {
     }
 
     /// Appends the new values of `candidates`, a run of a prepared field's
-    /// candidates, to `values`, reading the meshes only. Every value
-    /// depends only on its own vertex, so computing the candidates in runs
-    /// gives the same bits as all at once. Returns the points the kernel
-    /// ran on.
+    /// candidates, to `values`, and the targets they came from to
+    /// `nearest`, reading the meshes only. Every value depends only on its
+    /// own vertex, so computing the candidates in runs gives the same bits
+    /// as all at once. Returns the points the kernel ran on.
     fn compute_values(
         &self,
         job: &FieldJob,
         candidates: &[VertexId],
         values: &mut Vec<f32>,
+        nearest: &mut Vec<u32>,
     ) -> Result<usize> {
         let f = &self.fields[job.i];
-        let (ea, eb) = (self.entry(f.desc.on)?, self.entry(f.desc.to)?);
-        let ma = &ea.mesh;
-        let md = f.desc.max_distance;
+        let ma = &self.entry(f.desc.on)?.mesh;
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
         #[cfg(test)]
         if counter::fails(f.id) {
             return Err(oom());
         }
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(f.desc.to.len())
+            .map_err(|_| oom())?;
+        for (k, &m) in f.desc.to.iter().enumerate() {
+            let eb = self.entry(m)?;
+            targets.push(Target {
+                mesh: &eb.mesh,
+                bvh: &eb.bvh,
+                sign: &f.sign[k],
+                // A's points go into each target's local space in f64, then
+                // are rounded to f32 (§5.2).
+                to_local: job.b_to_a[k].inverse(),
+            });
+        }
 
-        // A's points in B's local space, in f64 then rounded to f32 (§5.2).
-        let xf = job.b_to_a.inverse();
         let mut ids = Vec::new();
         let mut points = Vec::new();
         for &v in candidates {
             if let Some(p) = ma.position(v).filter(|_| defined(v)) {
                 ids.push(v);
-                points.push(xf.apply(p).map(|c| c as f32));
+                points.push(p);
             }
         }
         let mut out = vec![0.0f32; points.len()];
-        signed_distances(&eb.mesh, &eb.bvh, &f.sign, &points, round_up(md), &mut out)?;
+        let mut from = vec![0u32; points.len()];
+        let md = f.desc.max_distance;
+        signed_distances_multi(&targets, &points, md, &mut out, &mut from)?;
 
         let mut k = 0;
         for &v in candidates {
-            let x = if ids.get(k) == Some(&v) {
-                let d = out[k];
+            let (x, n) = if ids.get(k) == Some(&v) {
                 k += 1;
-                // The kernel ran with the bound rounded up to f32.
-                if f64::from(d.abs()) > md {
-                    f32::INFINITY
-                } else {
-                    d
-                }
+                (out[k - 1], from[k - 1])
             } else {
-                f32::NAN
+                (f32::NAN, u32::MAX)
             };
             values.push(x);
+            nearest.push(n);
         }
         Ok(points.len())
     }
 
-    /// The new state of a prepared field from its candidates and their new
-    /// `values` (in candidate order): what changed, and the field's new
-    /// bookkeeping. Reads the meshes only.
+    /// The new state of a prepared field from its candidates, their new
+    /// `values` and the targets those came from (in candidate order): what
+    /// changed, and the field's new bookkeeping. Reads the meshes only.
     fn finish_field(
         &self,
         job: &FieldJob,
         pick: Pick,
         values: Vec<f32>,
+        nearest: Vec<u32>,
         recomputed: usize,
     ) -> Result<FieldPlan> {
         let f = &self.fields[job.i];
@@ -1253,7 +1431,7 @@ impl Scene {
             all,
             aborted,
         } = pick;
-        if values.len() != candidates.len() {
+        if values.len() != candidates.len() || nearest.len() != candidates.len() {
             return Err(SceneError::Corrupted);
         }
 
@@ -1289,6 +1467,7 @@ impl Scene {
         Ok(FieldPlan {
             candidates,
             values,
+            nearest,
             changed,
             referenced,
             finite,
@@ -1299,24 +1478,30 @@ impl Scene {
 
     /// Writes a computed field: its values, its colours, its reports and its
     /// bookkeeping. Fails, writing nothing, only when the field's channel or
-    /// mesh is missing.
+    /// mesh is missing, or memory runs out.
     fn apply_field(&mut self, job: FieldJob, plan: FieldPlan) -> Result<()> {
+        let i = job.i;
+        let (id, on) = (self.fields[i].id, self.fields[i].desc.on);
+        let f = &mut self.fields[i];
+        let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
+        let slots = ea.mesh.vertex_slots();
+        f.nearest
+            .try_reserve(slots.saturating_sub(f.nearest.len()))
+            .map_err(|_| oom())?;
+        let channel = ea.mesh.derived_channel_mut(&f.channel)?;
+        // Commit: nothing below fails.
         #[cfg(test)]
         {
             counter::add(plan.recomputed);
             counter::add_aborted(plan.aborted);
+            counter::add_applied(id);
         }
-        let i = job.i;
-        let (id, on, to) = (
-            self.fields[i].id,
-            self.fields[i].desc.on,
-            self.fields[i].desc.to,
-        );
-        let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
-        let channel = ea.mesh.derived_channel_mut(&self.fields[i].channel)?;
-        // Commit: nothing below fails.
         for (&v, &x) in plan.candidates.iter().zip(&plan.values) {
             channel[v as usize] = x;
+        }
+        f.nearest.resize(slots, u32::MAX);
+        for (&v, &n) in plan.candidates.iter().zip(&plan.nearest) {
+            f.nearest[v as usize] = n;
         }
         ea.reset_hook(id);
         if !plan.changed.is_empty() {
@@ -1329,10 +1514,11 @@ impl Scene {
             let dirty = cs.update(values, &plan.changed);
             ea.report_colors(Some(&dirty));
         }
-        if let Some(eb) = self.entries.get_mut(to) {
-            eb.reset_hook(id);
+        for &m in &f.desc.to {
+            if let Some(eb) = self.entries.get_mut(m) {
+                eb.reset_hook(id);
+            }
         }
-        let f = &mut self.fields[i];
         f.fresh = false;
         f.finite = plan.finite;
         if let Some(r) = plan.referenced {
@@ -1392,6 +1578,21 @@ pub(crate) mod counter {
 
     pub(crate) fn fails(field: super::FieldId) -> bool {
         FAILING.with(Cell::get) == Some(field)
+    }
+
+    thread_local! {
+        static APPLIED: std::cell::RefCell<Vec<super::FieldId>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records that `field` was applied (its update written).
+    pub(crate) fn add_applied(field: super::FieldId) {
+        APPLIED.with(|c| c.borrow_mut().push(field));
+    }
+
+    /// The fields applied on this thread since the last call, in order.
+    pub(crate) fn take_applied() -> Vec<super::FieldId> {
+        APPLIED.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     /// Counts one near search abandoned past its limit.
@@ -1513,7 +1714,7 @@ mod tests {
         DistanceField {
             name: name.to_owned(),
             on,
-            to,
+            to: vec![to],
             max_distance,
             sign: SignMode::Auto,
         }
@@ -1536,7 +1737,7 @@ mod tests {
     /// tree's shape, while the closest distance does not.
     fn reference(scene: &mut Scene, id: FieldId) -> Vec<f32> {
         let f = scene.fields.iter().find(|f| f.id == id).unwrap();
-        let (on, to, md, mode) = (f.desc.on, f.desc.to, f.desc.max_distance, f.desc.sign);
+        let (on, to, md, mode) = (f.desc.on, f.desc.to[0], f.desc.max_distance, f.desc.sign);
         let ma = scene.mesh(on).unwrap();
         let slots = ma.vertex_slots();
         let defined: Vec<bool> = (0..slots as VertexId)
@@ -2136,7 +2337,7 @@ mod tests {
         for (x, in_reach) in [(0.01, true), (100.0, false)] {
             scene.set_placement(b, at(x, 0.0, 0.0)).unwrap();
             let job = scene.prepare_field(0).unwrap();
-            assert!(job.near_margin.is_some());
+            assert!(job.near_margins[0].is_some());
             assert_eq!(job.work >= tris, in_reach, "x = {x}");
         }
     }
@@ -3330,5 +3531,393 @@ mod tests {
             Ok(StepState::Idle)
         );
         assert!(!scene.field_status(ids[0]).unwrap().current);
+    }
+
+    /// A contact group (spec §8): a sheet A, cubes B and C cutting it and
+    /// each other, and a cube D cutting A only, with the pairs A-B, B-C,
+    /// A-C and A-D. Each mesh has one field to its partners, registered in
+    /// the order A, B, C, D.
+    fn group_scene(mode: UpdateMode) -> (Scene, [MeshId; 4], [FieldId; 4]) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(sheet(10, 0.1), with_mode(mode)).unwrap();
+        let b = scene
+            .add_mesh(cube([0.1, 0.1, -0.2], 0.3), with_mode(mode))
+            .unwrap();
+        let c = scene
+            .add_mesh(cube([0.3, 0.2, -0.1], 0.3), with_mode(mode))
+            .unwrap();
+        let d = scene
+            .add_mesh(cube([0.75, 0.7, -0.1], 0.2), with_mode(mode))
+            .unwrap();
+        let mut add = |on: MeshId, to: Vec<MeshId>| {
+            scene
+                .add_distance_field(DistanceField {
+                    to,
+                    ..field("g", on, on, 0.12)
+                })
+                .unwrap()
+        };
+        let fields = [
+            add(a, vec![b, c, d]),
+            add(b, vec![a, c]),
+            add(c, vec![a, b]),
+            add(d, vec![a]),
+        ];
+        (scene, [a, b, c, d], fields)
+    }
+
+    /// The fields applied by `f`, in order.
+    fn applied(scene: &mut Scene, f: impl FnOnce(&mut Scene)) -> Vec<FieldId> {
+        counter::take_applied();
+        f(scene);
+        counter::take_applied()
+    }
+
+    #[test]
+    fn group_recomputes_only_related_fields() {
+        // Near searches never abandoned, so that a move recomputes only near
+        // vertices.
+        counter::set_near_limit(Some(usize::MAX));
+        let (mut scene, [a, b, c, d], [fa, fb, fc, fd]) = group_scene(UpdateMode::Eager);
+        // Every field touches something.
+        for f in [fa, fb, fc, fd] {
+            assert!(finite_count(&scene, f) > 0);
+        }
+        let a_slots = scene.mesh(a).unwrap().vertex_slots();
+        counter::take();
+        // D moves: only A's field (measured to D) and D's own.
+        let got = applied(&mut scene, |s| {
+            s.set_placement(d, at(0.01, 0.0, 0.0)).unwrap()
+        });
+        assert_eq!(got, [fa, fd]);
+        // A's vertices near D, and D's: far fewer than A has.
+        let recomputed = counter::take();
+        assert!(recomputed > 0 && recomputed < a_slots, "{recomputed}");
+        // A moves: every field.
+        let got = applied(&mut scene, |s| {
+            s.set_placement(a, at(0.0, 0.01, 0.0)).unwrap()
+        });
+        assert_eq!(got, [fa, fb, fc, fd]);
+        // B moves, or is edited: A's, B's and C's, never D's.
+        let got = applied(&mut scene, |s| {
+            s.set_placement(b, at(0.0, 0.0, 0.01)).unwrap()
+        });
+        assert_eq!(got, [fa, fb, fc]);
+        let got = applied(&mut scene, |s| {
+            s.edit(b, |tx| tx.set_positions(&[0], &[[0.12, 0.1, -0.2]]))
+                .unwrap();
+        });
+        assert_eq!(got, [fa, fb, fc]);
+        // C moves: A's, B's and C's.
+        let got = applied(&mut scene, |s| {
+            s.set_placement(c, at(0.01, 0.0, 0.0)).unwrap()
+        });
+        assert_eq!(got, [fa, fb, fc]);
+        // An edit of D: A's and D's.
+        let got = applied(&mut scene, |s| {
+            s.edit(d, |tx| tx.set_positions(&[0], &[[0.76, 0.7, -0.1]]))
+                .unwrap();
+        });
+        assert_eq!(got, [fa, fd]);
+        // Deferred, the same fields are due, and stepping applies them.
+        scene.set_defer_fields(true);
+        scene.set_placement(d, at(0.02, 0.0, 0.0)).unwrap();
+        let current: Vec<bool> = [fa, fb, fc, fd]
+            .iter()
+            .map(|&f| scene.field_status(f).unwrap().current)
+            .collect();
+        assert_eq!(current, [false, true, true, false]);
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(scene.field_step_meshes(), [a, b, c, d,]);
+        let got = applied(&mut scene, |s| {
+            step_all(s, usize::MAX);
+        });
+        assert_eq!(got, [fa, fd]);
+        counter::set_near_limit(None);
+    }
+
+    /// The values a field's mesh would get from its targets one at a time:
+    /// the minimum of single-target fields, ties to the lowest index.
+    fn min_of_singles(scene: &mut Scene, id: FieldId) -> (Vec<u32>, Vec<u32>) {
+        let desc = scene
+            .fields
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .desc
+            .clone();
+        let singles: Vec<FieldId> = desc
+            .to
+            .iter()
+            .enumerate()
+            .map(|(k, &m)| {
+                scene
+                    .add_distance_field(DistanceField {
+                        name: format!("single{k}"),
+                        to: vec![m],
+                        ..desc.clone()
+                    })
+                    .unwrap()
+            })
+            .collect();
+        update_all(scene);
+        let slots = scene.mesh(desc.on).unwrap().vertex_slots();
+        let (mut values, mut nearest) = (Vec::new(), Vec::new());
+        for v in 0..slots {
+            let parts: Vec<f32> = singles
+                .iter()
+                .map(|&f| scene.field_values(f).unwrap()[v])
+                .collect();
+            let (mut best, mut at) = (parts[0], u32::MAX);
+            if !best.is_nan() {
+                best = f32::INFINITY;
+                for (k, &x) in parts.iter().enumerate() {
+                    if x < best {
+                        (best, at) = (x, k as u32);
+                    }
+                }
+            }
+            values.push(best.to_bits());
+            nearest.push(at);
+        }
+        for f in singles {
+            scene.remove_field(f).unwrap();
+        }
+        (values, nearest)
+    }
+
+    /// The field's value bits and nearest targets (`u32::MAX` past the end
+    /// of the nearest list).
+    fn shown(scene: &Scene, id: FieldId) -> (Vec<u32>, Vec<u32>) {
+        let values = bits(scene.field_values(id).unwrap());
+        let nearest = scene.field_nearest(id).unwrap();
+        let nearest = (0..values.len())
+            .map(|v| nearest.get(v).copied().unwrap_or(u32::MAX))
+            .collect();
+        (values, nearest)
+    }
+
+    #[test]
+    fn group_fields_match_single_targets() {
+        let (mut scene, meshes, fields) = group_scene(UpdateMode::Eager);
+        let mut rng = Lcg(0x6709);
+        for step in 0..30 {
+            let m = meshes[rng.below(4)];
+            let t = [
+                rng.range(-0.05, 0.05),
+                rng.range(-0.05, 0.05),
+                rng.range(-0.05, 0.05),
+            ];
+            scene
+                .set_placement(m, turned(rng.range(-10.0, 10.0), t))
+                .unwrap();
+            for &f in &fields {
+                let got = shown(&scene, f);
+                assert_eq!(got, min_of_singles(&mut scene, f), "step {step}");
+            }
+        }
+        // Every target was nearest somewhere in A's field.
+        let (_, nearest) = shown(&scene, fields[0]);
+        for k in 0..3 {
+            assert!(nearest.contains(&k), "target {k}");
+        }
+    }
+
+    #[test]
+    fn group_near_limit_matches_near_path() {
+        // The same walk with every near search abandoned (limit 0) and with no
+        // limit: the same values, nearest targets and reports.
+        let mut runs = Vec::new();
+        for limit in [Some(0), Some(usize::MAX)] {
+            counter::set_near_limit(limit);
+            counter::take_aborted();
+            let (mut scene, meshes, fields) = group_scene(UpdateMode::Eager);
+            let mut rng = Lcg(0x11);
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                let m = meshes[rng.below(4)];
+                let t = [rng.range(-0.05, 0.05), rng.range(-0.05, 0.05), 0.0];
+                scene
+                    .set_placement(m, turned(rng.range(-5.0, 5.0), t))
+                    .unwrap();
+                out.push((fields.map(|f| shown(&scene, f)), scene.take_changes()));
+            }
+            runs.push((out, counter::take_aborted()));
+        }
+        counter::set_near_limit(None);
+        assert!(runs[0].0 == runs[1].0);
+        assert!(runs[0].1 > 0);
+        assert_eq!(runs[1].1, 0);
+    }
+
+    /// Everything a renderer sees of the group: every field's values and
+    /// nearest targets, and the drained reports.
+    type SeenGroup = (Vec<(Vec<u32>, Vec<u32>)>, Vec<crate::MeshChanges>);
+
+    fn seen_group(scene: &mut Scene, fields: &[FieldId; 4]) -> SeenGroup {
+        let shown = fields.iter().map(|&f| shown(scene, f)).collect();
+        (shown, scene.take_changes())
+    }
+
+    #[test]
+    fn group_stepped_matches_one_shot() {
+        // Four copies of the group: three stepped with different budgets
+        // (one abandoning units at random), the last updated in one shot.
+        let budgets = [1, 23, usize::MAX];
+        let mut twins: Vec<_> = (0..4)
+            .map(|_| {
+                let (mut scene, meshes, fields) = group_scene(UpdateMode::Eager);
+                scene.set_defer_fields(true);
+                scene.take_changes();
+                (scene, meshes, fields)
+            })
+            .collect();
+        let mut rng = Lcg(0x5e9);
+        let mut abandons = Lcg(3);
+        let mut spread = [0usize; 3];
+        for step in 0..25 {
+            let m = rng.below(4);
+            let p = turned(
+                rng.range(-8.0, 8.0),
+                [
+                    rng.range(-0.05, 0.05),
+                    rng.range(-0.05, 0.05),
+                    rng.range(-0.03, 0.03),
+                ],
+            );
+            let edit = rng.below(3) == 0;
+            let z = rng.range(-0.1, 0.1) as f32;
+            let mut out = Vec::new();
+            for (k, (scene, meshes, fields)) in twins.iter_mut().enumerate() {
+                scene.set_placement(meshes[m], p).unwrap();
+                if edit {
+                    scene
+                        .edit(meshes[0], |tx| tx.set_positions(&[12], &[[0.2, 0.1, z]]))
+                        .unwrap();
+                }
+                match k {
+                    0 => spread[0] += step_all(scene, budgets[0]),
+                    1 => spread[1] += step_all_abandoning(scene, budgets[1], &mut abandons),
+                    2 => spread[2] += step_all(scene, budgets[2]),
+                    _ => update_all(scene),
+                }
+                out.push(seen_group(scene, fields));
+            }
+            for k in 0..3 {
+                assert!(out[k] == out[3], "step {step}, twin {k}");
+            }
+        }
+        assert!(spread[0] > 0 && spread[1] > 0, "{spread:?}");
+        assert_eq!(spread[2], 0);
+    }
+
+    #[test]
+    fn removing_a_target_keeps_the_field() {
+        let (mut scene, [a, b, c, d], [fa, fb, fc, fd]) = group_scene(UpdateMode::Eager);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: fa,
+                    rule: contact_rule(0.05),
+                }),
+            )
+            .unwrap();
+        scene.take_changes();
+        scene.remove_mesh(c).unwrap();
+        // C's own field goes; A's and B's lose C and are recomputed at once.
+        assert_eq!(scene.field_values(fc), Err(SceneError::UnknownField));
+        assert_eq!(scene.field_targets(fa), Ok(&[b, d][..]));
+        assert_eq!(scene.field_targets(fb), Ok(&[a][..]));
+        assert_eq!(scene.field_target_status(fa).unwrap().len(), 2);
+        for f in [fa, fb, fd] {
+            assert!(scene.field_status(f).unwrap().current);
+        }
+        let got = shown(&scene, fa);
+        assert_eq!(got, min_of_singles(&mut scene, fa));
+        assert!(got.1.iter().all(|&n| n < 2 || n == u32::MAX));
+        assert!(got.1.contains(&1));
+        assert_colors(&scene, a, &contact_rule(0.05), fa);
+        let ch = scene.take_changes();
+        assert!(
+            ch.iter()
+                .find(|c| c.id == a)
+                .unwrap()
+                .fields_changed
+                .contains(&fa)
+        );
+        // Deferred, the field waits for a step, then recomputes in full.
+        scene.set_defer_fields(true);
+        scene.remove_mesh(d).unwrap();
+        assert_eq!(scene.field_targets(fa), Ok(&[b][..]));
+        assert!(!scene.field_status(fa).unwrap().current);
+        assert!(
+            scene
+                .field_nearest(fa)
+                .unwrap()
+                .iter()
+                .all(|&n| n == 0 || n == u32::MAX)
+        );
+        counter::take();
+        step_all(&mut scene, usize::MAX);
+        assert_eq!(counter::take(), scene.mesh(a).unwrap().vertex_count());
+        assert_eq!(shown(&scene, fa), min_of_singles(&mut scene, fa));
+        // The last target goes: so does the field, and its colouring.
+        scene.remove_mesh(b).unwrap();
+        assert_eq!(scene.field_values(fa), Err(SceneError::UnknownField));
+        assert_eq!(scene.field_values(fb), Err(SceneError::UnknownField));
+        assert_eq!(scene.colors(a), Ok(None));
+        assert!(scene.fields.is_empty());
+    }
+
+    #[test]
+    fn compact_remaps_nearest() {
+        let (mut scene, [a, ..], [fa, ..]) = group_scene(UpdateMode::Eager);
+        // A vertex near the cubes loses its triangles and goes.
+        scene
+            .edit(a, |tx| {
+                let tris: Vec<u32> = (0..tx.mesh().triangle_slots() as u32)
+                    .filter(|&t| tx.mesh().triangle(t).is_some_and(|tri| tri.contains(&0)))
+                    .collect();
+                tx.remove_triangles(&tris)?;
+                tx.remove_vertices(&[0])
+            })
+            .unwrap();
+        let before = scene.field_nearest(fa).unwrap().to_vec();
+        assert!(before.iter().any(|&n| n != u32::MAX));
+        scene.set_defer_fields(true);
+        let remap = scene.compact(a).unwrap();
+        let after = scene.field_nearest(fa).unwrap();
+        assert_eq!(after.len(), scene.mesh(a).unwrap().vertex_slots());
+        for (v, &n) in before.iter().enumerate() {
+            if let Some(w) = remap.vertex(v as VertexId) {
+                assert_eq!(after[w as usize], n, "vertex {v}");
+            }
+        }
+        step_all(&mut scene, usize::MAX);
+        assert_eq!(shown(&scene, fa), min_of_singles(&mut scene, fa));
+    }
+
+    #[test]
+    fn invalid_target_lists_rejected() {
+        let (mut scene, [a, b, c, _], _) = group_scene(UpdateMode::Eager);
+        let bad = |e| matches!(e, Err(SceneError::InvalidInput(_)));
+        let desc = |to: Vec<MeshId>| DistanceField {
+            to,
+            ..field("x", a, b, 0.1)
+        };
+        assert!(bad(scene.add_distance_field(desc(vec![]))));
+        assert!(bad(scene.add_distance_field(desc(vec![b, c, b]))));
+        assert!(bad(scene.add_distance_field(desc(vec![b, a]))));
+        assert_eq!(scene.fields.len(), 4);
+        let id = scene.add_distance_field(desc(vec![c, b])).unwrap();
+        assert_eq!(scene.field_targets(id), Ok(&[c, b][..]));
+        // The single-target constructor is sugar for a list of one.
+        let one = DistanceField::new("y", a, b, 0.1, SignMode::Auto);
+        assert_eq!(one.to, [b]);
+        scene.add_distance_field(one).unwrap();
     }
 }
