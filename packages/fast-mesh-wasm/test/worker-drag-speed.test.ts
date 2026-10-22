@@ -629,6 +629,44 @@ describe("starvation guard", () => {
     expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
     expect(recolors(placed, 1)).toBe(false);
   });
+
+  it("drag_end_bypasses_guard", async () => {
+    // A guard of 0 (always expired): a newer move alone keeps the unit...
+    const h = engine(STEP_POINTS, 0);
+    await setup(h);
+    h.send([{ kind: "drag", rev: rev(), id: 1, phase: "begin", key: "placement:1" }]);
+    await h.until(2);
+    let chunksBefore = h.chunks.length;
+    let stale: Request[][] = [[moveReq(2)]];
+    h.onStep = () => {
+      const batches = stale;
+      stale = [];
+      queueMicrotask(() => {
+        for (const batch of batches) {
+          h.send(batch);
+        }
+      });
+    };
+    h.send([moveReq(1)]);
+    await h.until(4);
+    expect(h.chunks.slice(chunksBefore)).not.toContain("fieldStepAbandon");
+    expect(h.results.slice(2).map((r) => recolors(r, 1))).toEqual([true, true]);
+
+    // ...but with the drag's end queued behind it, the kept unit is dropped
+    // and the final pose follows.
+    chunksBefore = h.chunks.length;
+    stale = [[moveReq(4)], [{ kind: "drag", rev: rev(), id: 1, phase: "end", key: "placement:1" }]];
+    h.send([moveReq(3)]);
+    await h.until(7);
+    h.onStep = undefined;
+    const chunks = h.chunks.slice(chunksBefore);
+    expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    const [moved, last, ended] = h.results.slice(4);
+    expect(recolors(moved, 1)).toBe(false);
+    expect(recolors(last, 1)).toBe(true);
+    expect(recolors(ended, 1)).toBe(false);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(4)));
+  });
 });
 
 // ---- In a Node Worker (real `worker_threads`, built dist/) ----

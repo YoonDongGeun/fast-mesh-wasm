@@ -822,6 +822,10 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     main.push(now() - f0);
   }
   const lastSent = bw.sentAt[bw.sentAt.length - 1];
+  // The pointer is released right after the last move: the drag's end drops a recompute
+  // kept by the starvation guard, so the last pose follows within one recompute.
+  drag.end();
+  mirror.apply(scene.commitFrame());
   const results = await bw.drained(first);
   const settled = now();
   mirror.apply(scene.commitFrame());
@@ -848,13 +852,13 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     `  update interval during the drag (${updates.length} updates before the last move)`,
     updates.slice(1).map((at, k) => at - updates[k]),
   );
+  const lastColored = results.findLast((r) => r.colored);
   console.log(
-    `  last move -> its colours applied ${fmt(results[results.length - 1].at - lastSent)} ms (last result recolours: ${results[results.length - 1].colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
+    `  last move (then release) -> its colours applied ${fmt(lastColored.at - lastSent)} ms (the move's own result recolours: ${results[results.length - 2].colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
   );
   console.log(
     `  most batches waiting for a result ${backlog}; longest field step ${fmt(maxOf(steps))} ms, longest Worker block ${fmt(st.maxGap)} ms; main thread per frame median ${med(main)} ms, longest main block ${fmt(mainBlock)} ms`,
   );
-  drag.end();
   await roundTrip(scene, bw);
   scene.terminate();
 }

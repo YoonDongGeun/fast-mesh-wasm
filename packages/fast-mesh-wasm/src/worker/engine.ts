@@ -84,7 +84,9 @@ export interface EngineOptions {
    * recompute outlasts the gaps between moves still updates its colours
    * about every guard plus one recompute, each update exactly one pose.
    * Edits, repairs, compactions, removals, placements, undo, redo and drag
-   * cancels always abandon.
+   * cancels always abandon, and so do drag moves once the drag's `end` is
+   * queued (the final pose then follows within one recompute; a pointer
+   * that pauses without ending may wait up to two).
    */
   staleGuardMs?: number;
 }
@@ -546,10 +548,16 @@ class Engine {
 
   /**
    * Whether a queued request makes a unit over `meshes` stale. Drag moves
-   * count only within the starvation guard after the last completed unit.
+   * count only within the starvation guard after the last completed unit,
+   * or when the drag's `end` is queued too: on release the newest pose
+   * follows within one recompute, never after a kept older one. (An `end`
+   * with no move queued before it leaves the unit alone: the unit is then
+   * at the final pose.)
    */
   #staleQueued(meshes: Set<ClientId>): boolean {
-    const moves = now() - this.#published <= this.#staleGuardMs;
+    const moves =
+      now() - this.#published <= this.#staleGuardMs ||
+      this.#queue.some((item) => item !== END && item.kind === "drag" && item.phase === "end" && meshes.has(item.id));
     return this.#queue.some((item) => item !== END && this.#makesStale(item, meshes, moves));
   }
 
