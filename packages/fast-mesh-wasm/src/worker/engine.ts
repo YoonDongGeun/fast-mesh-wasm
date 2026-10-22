@@ -76,10 +76,24 @@ export interface EngineOptions {
    * unit spans many steps). Rounded down and clamped to at least 1.
    */
   stepPoints?: number;
+  /**
+   * The starvation guard, in milliseconds: {@link STALE_GUARD_MS} by
+   * default. Once this long has passed since the last field step unit
+   * completed, a queued drag move no longer abandons the unit: it completes
+   * and is published, and the newest pose follows. So a sustained drag whose
+   * recompute outlasts the gaps between moves still updates its colours
+   * about every guard plus one recompute, each update exactly one pose.
+   * Edits, repairs, compactions, removals, placements, undo, redo and drag
+   * cancels always abandon.
+   */
+  staleGuardMs?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
 export const YIELD_MS = 4;
+
+/** The default {@link EngineOptions.staleGuardMs}. */
+export const STALE_GUARD_MS = 200;
 
 /** The default {@link EngineOptions.stepPoints}. */
 export const STEP_POINTS = 4096;
@@ -246,11 +260,18 @@ const END = Symbol("end of batch");
 type Item = Request | typeof END;
 
 /**
- * Yields to the message loop, so batches sent meanwhile are received: a
- * `MessageChannel` tick (nested timers are clamped to 4 ms in browsers),
- * else `setTimeout(0)`.
+ * Yields to the message loop, so batches sent meanwhile are received:
+ * `setImmediate` where there is one (Node: a chain of `MessageChannel` ticks
+ * after chunks of a millisecond or more lets no `parentPort` message in,
+ * measured), else a `MessageChannel` tick (browsers interleave it with the
+ * Worker's messages, checked in headless Chrome; nested timers are clamped
+ * to 4 ms there), else `setTimeout(0)`.
  */
 function messageTick(): () => Promise<void> {
+  const immediate = (globalThis as { setImmediate?: (cb: () => void) => unknown }).setImmediate;
+  if (typeof immediate === "function") {
+    return () => new Promise((resolve) => immediate(resolve));
+  }
   if (typeof MessageChannel === "undefined") {
     return () => new Promise((resolve) => setTimeout(resolve, 0));
   }
@@ -321,6 +342,12 @@ class Engine {
    * stale would be abandoned too.
    */
   #lastAbandoned: Set<ClientId> | undefined;
+  readonly #staleGuardMs: number;
+  /**
+   * When the last field step unit completed (the engine's start before
+   * the first): drag moves abandon units only within the guard after it.
+   */
+  #published = now();
 
   constructor(port: Port, options: EngineOptions) {
     this.#port = port;
@@ -330,6 +357,7 @@ class Engine {
     // At least one vertex a step (NaN too); at most what one call takes.
     const points = Math.floor(options.stepPoints ?? STEP_POINTS);
     this.#stepPoints = points >= 1 ? Math.min(points, ALL_POINTS) : 1;
+    this.#staleGuardMs = options.staleGuardMs ?? STALE_GUARD_MS;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
   }
@@ -468,7 +496,9 @@ class Engine {
    * colours, and the `display:` statuses of its meshes are held back until a
    * later unit completes. No unit is opened while a request queued makes
    * the last abandoned unit stale (its fields are still due, so the new unit
-   * would be stale too). Other requests wait for the unit. A field error
+   * would be stale too). Past the starvation guard
+   * ({@link EngineOptions.staleGuardMs}) drag moves no longer abandon, so a
+   * sustained drag still publishes. Other requests wait for the unit. A field error
    * ends the unit like a failed eager update: swallowed, the failing fields
    * stay stale. `false` once the engine is poisoned.
    */
@@ -495,6 +525,9 @@ class Engine {
       }
       this.#onChunk?.({ kind: "fieldStep" });
       if (state !== "pending") {
+        if (state !== "idle") {
+          this.#published = now();
+        }
         this.#lastAbandoned = undefined;
         b.status.push(...this.#held.splice(0));
         return true;
@@ -511,9 +544,13 @@ class Engine {
     }
   }
 
-  /** Whether a queued request makes a unit over `meshes` stale. */
+  /**
+   * Whether a queued request makes a unit over `meshes` stale. Drag moves
+   * count only within the starvation guard after the last completed unit.
+   */
   #staleQueued(meshes: Set<ClientId>): boolean {
-    return this.#queue.some((item) => item !== END && this.#makesStale(item, meshes));
+    const moves = now() - this.#published <= this.#staleGuardMs;
+    return this.#queue.some((item) => item !== END && this.#makesStale(item, meshes, moves));
   }
 
   /** Moves the batch's `display:` statuses of `meshes` to the held ones. */
@@ -528,17 +565,18 @@ class Engine {
 
   /**
    * Whether the queued `req` makes a field step unit over `meshes` (the
-   * meshes its fields are on and measured to) stale (§6.1): a drag move,
-   * cancel or placement, an edit, repair, compaction or removal of one of them, an
+   * meshes its fields are on and measured to) stale (§6.1): a drag move
+   * (only with `moves`: within the starvation guard), a drag cancel or a
+   * placement, an edit, repair, compaction or removal of one of them, an
    * undo or redo, or the removal of a field between two of them.
    */
-  #makesStale(req: Request, meshes: Set<ClientId>): boolean {
+  #makesStale(req: Request, meshes: Set<ClientId>, moves: boolean): boolean {
     switch (req.kind) {
       case "drag":
         // A move, an end with a last move, or a cancel (back to the start pose).
         return (
           meshes.has(req.id) &&
-          (req.phase === "move" || req.phase === "cancel" || (req.phase === "end" && req.rotation !== undefined))
+          (req.phase === "cancel" || (moves && (req.phase === "move" || (req.phase === "end" && req.rotation !== undefined))))
         );
       case "setPlacement":
       case "edit":

@@ -4,6 +4,7 @@
 // and letting every other request wait. The engine runs in-process (sources,
 // same wasm) with its test-only `onChunk` hook, which delivers newer batches
 // between steps; the status tests drive it through `WorkerScene`.
+import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import { type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
@@ -15,6 +16,11 @@ import type { ClientId, MeshChangeWire, Request, Result } from "../src/worker/pr
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 /** Few vertices a step, so a unit spans many steps. */
 const STEP_POINTS = 16;
+/**
+ * A starvation guard no test reaches: drag moves always abandon (see
+ * `starvation_guard_publishes_during_storm` for the guard).
+ */
+const LONG_GUARD = 60_000;
 /** Wide: every vertex of the coloured terrain is in range. */
 const MAX_DISTANCE = 8;
 
@@ -110,7 +116,7 @@ function moveReq(k: number): Request {
  * The engine in-process with a small step. `chunks` logs every chunk kind;
  * `onStep` runs on each field step (`"fieldStep"` chunk).
  */
-function engine(stepPoints = STEP_POINTS) {
+function engine(stepPoints = STEP_POINTS, staleGuardMs = LONG_GUARD) {
   const results: Result[] = [];
   const chunks: string[] = [];
   const waiting: (() => void)[] = [];
@@ -147,6 +153,7 @@ function engine(stepPoints = STEP_POINTS) {
     {
       debug: true,
       stepPoints,
+      staleGuardMs,
       onChunk: (chunk) => {
         chunks.push(chunk.kind);
         if (chunk.kind === "fieldStep") {
@@ -488,6 +495,209 @@ describe("stale-making requests mid-unit", () => {
   });
 });
 
+/**
+ * Mirrors mesh 1's colours and placement from results, as a client does:
+ * `apply` returns the translation a recolouring result claims (the latest
+ * placement of mesh 1 so far) or `undefined` when it did not recolour.
+ */
+function colorMirror(start: Uint8Array) {
+  const colors = start.slice();
+  let translation: Vec3 = [0, 0, 0];
+  return {
+    colors,
+    apply(r: Result): Vec3 | undefined {
+      const p = r.placements.find((x) => x.id === 1);
+      if (p !== undefined) {
+        translation = p.translation as Vec3;
+      }
+      const c = r.changes.find((x) => x.id === 1);
+      if (c === undefined || !recolors(r, 1)) {
+        return undefined;
+      }
+      const bytes = new Uint8Array(c.bytes.colors as ArrayBuffer);
+      if (c.colors === "all") {
+        colors.set(bytes);
+      } else {
+        let at = 0;
+        for (const [first, count] of c.colors) {
+          colors.set(bytes.subarray(at, at + 4 * count), 4 * first);
+          at += 4 * count;
+        }
+      }
+      return translation;
+    },
+  };
+}
+
+describe("starvation guard", () => {
+  it("starvation_guard_publishes_during_storm", async () => {
+    const GUARD = 15;
+    const h = engine(STEP_POINTS, GUARD);
+    await setup(h);
+    const mirror = colorMirror(await dumpColors(h, 1));
+    h.send([{ kind: "drag", rev: rev(), id: 1, phase: "begin", key: "placement:1" }]);
+    const first = h.results.length + 1;
+    await h.until(first);
+    const chunksBefore = h.chunks.length;
+
+    // A move on every step, in its own batch, for a while: a storm that
+    // never lets a unit finish within the guard.
+    let k = 1;
+    let pending = false;
+    const until = performance.now() + 250;
+    h.onStep = () => {
+      if (!pending && performance.now() < until) {
+        pending = true;
+        const next = moveReq(++k);
+        queueMicrotask(() => {
+          pending = false;
+          h.send([next]);
+        });
+      }
+    };
+    h.send([moveReq(1)]);
+    // The moves stop; the last pose completes.
+    while (performance.now() < until || pending) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    h.onStep = undefined;
+    await h.until(first + k);
+    const results = h.results.slice(first);
+    expect(results).toHaveLength(k);
+    const chunks = h.chunks.slice(chunksBefore);
+
+    // Units were abandoned and others published mid-storm, each exactly
+    // one pose: the colours equal a fresh scene at the pose they claim.
+    const published: Vec3[] = [];
+    for (const r of results) {
+      const t = mirror.apply(r);
+      if (t !== undefined) {
+        published.push(t);
+        expect(mirror.colors).toEqual(referenceColors(t));
+      }
+    }
+    expect(chunks.filter((c) => c === "fieldStepAbandon").length).toBeGreaterThan(0);
+    expect(published.length).toBeGreaterThan(1);
+    // The final pose completes.
+    expect(recolors(results[results.length - 1], 1)).toBe(true);
+    expect(published[published.length - 1]).toEqual(pose(k));
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(k)));
+  });
+
+  it("moves_within_guard_abandon", async () => {
+    // A guard of 10 s, just after a published unit: every move abandons.
+    const h = engine(STEP_POINTS, 10_000);
+    await setup(h);
+    h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: [0.5, 0.4, 0], key: "placement:1" }]);
+    await h.until(2);
+    expect(recolors(h.results[1], 1)).toBe(true);
+    h.send([{ kind: "drag", rev: rev(), id: 1, phase: "begin", key: "placement:1" }]);
+    await h.until(3);
+    const chunksBefore = h.chunks.length;
+    const MOVES = 5;
+    let sent = 1;
+    let fresh = true;
+    h.onStep = () => {
+      if (fresh && sent < MOVES) {
+        fresh = false;
+        const next = moveReq(++sent);
+        queueMicrotask(() => {
+          fresh = true;
+          h.send([next]);
+        });
+      }
+    };
+    h.send([moveReq(1)]);
+    await h.until(3 + MOVES);
+    h.onStep = undefined;
+    expect(h.results.slice(3).map((r) => recolors(r, 1))).toEqual([false, false, false, false, true]);
+    expect(h.chunks.slice(chunksBefore).filter((c) => c === "fieldStepAbandon")).toHaveLength(MOVES - 1);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(MOVES)));
+  });
+
+  it("guard_never_spares_an_edit", async () => {
+    // A guard of 0: drag moves never abandon, edits still do.
+    const h = engine(STEP_POINTS, 0);
+    await setup(h);
+    const edit: Request = {
+      kind: "edit",
+      rev: rev(),
+      id: 1,
+      payload: [{ op: "setPositions", vertices: [30], positions: [0.2, 0.1, 0.9] }],
+    };
+    const { placed, chunks } = await placeThen(h, [edit]);
+    expect(chunks.filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    expect(recolors(placed, 1)).toBe(false);
+  });
+});
+
+// ---- In a Node Worker (real `worker_threads`, built dist/) ----
+
+describe("in a Node Worker", () => {
+  it("message_arrives_mid_unit", async () => {
+    // Steps of a few milliseconds each (in Node, a chain of `MessageChannel`
+    // ticks after chunks of a millisecond or more lets no `parentPort`
+    // message in), a yield after every step: a batch sent while the unit
+    // steps must arrive before it ends.
+    const worker = new Worker(new URL("./harness/node-worker.mjs", import.meta.url), {
+      workerData: { yieldMs: 0, stepPoints: 4096, staleGuardMs: LONG_GUARD, reportSteps: true },
+    });
+    cleanup.push(() => void worker.terminate());
+    const results: Result[] = [];
+    const chunks: string[] = [];
+    let onStep: (() => void) | undefined;
+    const waiting: (() => void)[] = [];
+    worker.on("message", (msg: Result | { kind: "chunk"; chunk: { kind: string } }) => {
+      if ("kind" in msg) {
+        chunks.push(msg.chunk.kind);
+        if (msg.chunk.kind === "fieldStep") {
+          onStep?.();
+        }
+        return;
+      }
+      results.push(msg);
+      for (const f of waiting.splice(0)) {
+        f();
+      }
+    });
+    const until = async (n: number) => {
+      while (results.length < n) {
+        await new Promise<void>((resolve) => waiting.push(resolve));
+      }
+    };
+    const big = terrain(0, 0, 0, 160);
+    worker.postMessage([
+      addMeshReq(1, big),
+      addMeshReq(2, TARGET),
+      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: MAX_DISTANCE } },
+      { kind: "coloring", rev: rev(), id: 1, rule: { field: 1, map: "turbo", range: [0, MAX_DISTANCE] }, key: "display:1" },
+    ]);
+    await until(1);
+    const chunksBefore = chunks.length;
+
+    // The edit is sent from the main thread after the unit's third step: in
+    // Node the first tick after a quiet spell still lets a message in, the
+    // ticks chained after it did not.
+    let steps = 0;
+    onStep = () => {
+      if (++steps === 3) {
+        worker.postMessage([
+          { kind: "edit", rev: rev(), id: 1, payload: [{ op: "setPositions", vertices: [30], positions: [0.2, 0.1, 0.9] }] },
+        ]);
+      }
+    };
+    worker.postMessage([
+      { kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: pose(3), key: "placement:1" },
+    ]);
+    await until(3);
+    onStep = undefined;
+    const [placed, edited] = results.slice(1);
+    expect(chunks.slice(chunksBefore)).toContain("fieldStepAbandon");
+    expect(recolors(placed, 1)).toBe(false);
+    expect(recolors(edited, 1)).toBe(true);
+  });
+});
+
 // ---- Through `WorkerScene` ----
 
 /**
@@ -529,6 +739,7 @@ class InProcessWorker implements WorkerLike {
       {
         debug: true,
         stepPoints: STEP_POINTS,
+        staleGuardMs: LONG_GUARD,
         onChunk: (chunk) => {
           this.chunks.push(chunk.kind);
           if (chunk.kind === "fieldStep") {
