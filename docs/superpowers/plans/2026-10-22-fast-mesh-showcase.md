@@ -141,3 +141,23 @@ SceneStore.fetchColoringValues(mesh: MeshHandle): Promise<Float32Array | null>;
 - [ ] **Step 3: Run `showcase-check`** in Chrome and the `?local` pass. Expected: PASS. Also run Firefox and WebKit once through Playwright, and record the results.
 - [ ] **Step 4: Run the gate.**
 - [ ] **Step 5: Commit** `feat(examples): showcase repair and collision panels`, then `docs(showcase): …`.
+
+### Task 4: Fragment shading for crisp, adjustable colour boundaries (spec §7.2)
+
+**Files:**
+- Rust: `crates/fast-mesh-scene` (per-mesh colouring values view, using the same dirty set as colours).
+- Wasm bindings: `crates/fast-mesh-wasm/src/render.rs`/`scene.rs` (`values_ptr`/`values_len`).
+- TS: `packages/fast-mesh-wasm/src/views.ts` (`values(): Float32Array | null`), `changes.ts`, `worker/{engine,client}.ts` (mirror), `scene-like.ts` (rule access, for example `coloring(mesh): ColorRule | null` if needed).
+- three: `src/three/mesh.ts` (`shading`, `edgeSoftness`; LUT texture plus shader chunk via `onBeforeCompile` on the standard material).
+- R3F pass-through. Showcase slider.
+
+**Tests:**
+- Rust: the values view equals `field_values` of the colouring field, and its dirty set equals the colour dirty set.
+- TS: the Worker mirror stays byte-identical to the engine after drags.
+- three:
+  - In fragment mode, the colour evaluated at the vertex positions equals the vertex-mode colours. Test it with a JS reference of the shader's mapping function, shared with the GLSL generation.
+  - Infinity and NaN map to base.
+  - `edgeSoftness` 0 gives a step.
+- Showcase check: switching softness changes pixels, through a screenshot diff in headless Chrome.
+
+**Changeset:** minor (`values()` view, `shading`/`edgeSoftness`).
