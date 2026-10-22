@@ -128,6 +128,11 @@ jobs:
       # which must not reach the packed tarball above.
       - name: Test the package (test build)
         run: pnpm --filter fast-mesh-wasm test
+      # The test build's threaded artifact can crash a pool thread on purpose
+      # (`__test_panic_pool`, `__test_trap_pool`): the scene must poison, then restart.
+      - name: Check pool-thread crashes in Chrome (test build)
+        timeout-minutes: 5
+        run: node scripts/browser-check.mjs --build --threads 4 --only poolCrash
 
   install:
     name: ${{ matrix.pm }} · ${{ matrix.os }} · node ${{ matrix.node }}

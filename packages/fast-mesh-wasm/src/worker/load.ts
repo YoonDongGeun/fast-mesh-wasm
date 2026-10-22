@@ -6,7 +6,8 @@
 // pool that fails or never starts leaves a live threaded instance and nested
 // Workers behind, so it rejects with a `PoolStartError` instead: the Worker
 // reports it, and the scene replaces the Worker with a single-threaded one
-// (see `serveEngine`). The glue modules come
+// (see `serveEngine`). Once a pool runs, its threads are watched for crashes
+// (`watchPoolCrashes`) when the scene gave a channel. The glue modules come
 // from injected loaders, so this module imports neither: only the Worker
 // entry names them, and single-threaded mode never fetches wasm-threads/.
 import { setMemory } from "../core.js";
@@ -24,6 +25,12 @@ export interface Glue {
 /** The threaded glue: also starts wasm-bindgen-rayon's pool. */
 export interface ThreadedGlue extends Glue {
   initThreadPool(threads: number): Promise<unknown>;
+  /**
+   * Makes the pool's threads report a panic or a trap on the
+   * `BroadcastChannel` named `channel` (a `PoolCrash` message). Call once,
+   * after the pool started.
+   */
+  watchPoolCrashes(channel: string): void;
 }
 
 /** Options of {@link loadEngine}. */
@@ -34,10 +41,15 @@ export interface LoadOptions {
   isolated: boolean;
   importThreaded: () => Promise<ThreadedGlue>;
   importSingle: () => Promise<Glue>;
-  /** Development only: called once when the engine is single-threaded though more threads were asked for. */
+  /**
+   * Development only: called once when the engine is single-threaded though
+   * more threads were asked for, or when its pool cannot be watched for crashes.
+   */
   warn?: (message: string) => void;
   /** How long the pool may take to start: {@link POOL_TIMEOUT_MS} by default. */
   poolTimeoutMs?: number;
+  /** The channel the pool's threads report a crash on (see {@link ThreadedGlue.watchPoolCrashes}). */
+  crashChannel?: string;
 }
 
 /**
@@ -73,7 +85,8 @@ export function defaultThreads(nav: { hardwareConcurrency?: number } | undefined
  * instantiating it fails) the single-threaded one. Returns the glue, its
  * memory and the threads the engine computes with (1 when single-threaded).
  * Rejects with a {@link PoolStartError} when the pool fails or times out
- * after the threaded glue instantiated (`warn` is then not called).
+ * after the threaded glue instantiated (`warn` is then not called). A
+ * started pool is watched for crashes on `crashChannel`, when given.
  */
 export async function loadEngine(
   options: LoadOptions,
@@ -92,6 +105,18 @@ export async function loadEngine(
         await timeout(started.wasm.initThreadPool(threads), options.poolTimeoutMs ?? POOL_TIMEOUT_MS);
       } catch (e) {
         throw new PoolStartError(failed(e));
+      }
+      if (options.crashChannel !== undefined) {
+        try {
+          started.wasm.watchPoolCrashes(options.crashChannel);
+        } catch (e) {
+          // The engine works unwatched: a crash on a pool thread then hangs
+          // the scene instead of poisoning it, as before the watch existed.
+          const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+          warn?.(
+            `fast-mesh-wasm: crash detection unavailable (${cause}): a crash on a thread of the pool will hang the Worker scene instead of failing its calls with INSTANCE_POISONED. ${SEE}`,
+          );
+        }
       }
       return { ...started, threads };
     }
@@ -144,6 +169,7 @@ export async function startEngine(
       // `navigator` is missing in some hosts (older Node `worker_threads`).
       threads: init.threads ?? defaultThreads((globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator),
       isolated: isolated === true,
+      crashChannel: init.crashChannel,
       warn: dev
         ? (message) => {
             warning ??= message;

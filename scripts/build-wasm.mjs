@@ -10,8 +10,9 @@
 // With `--threads` it builds the threaded artifact instead, into src/wasm-threads: the
 // crate's `threads` feature (rayon + wasm-bindgen-rayon's `initThreadPool`) on the
 // nightly pinned below, with wasm atomics, a rebuilt std and a shared, imported memory.
-// It is always a release build, also next to a `--test` build of src/wasm. Without the
-// nightly (or its rust-src) it warns and skips, unless CI is set.
+// `--threads --test` adds `test-panic` there too: `__test_panic_pool` and `__test_trap_pool`,
+// which crash a pool thread, for the browser check (`prepublishOnly` refuses them as well).
+// Without the nightly (or its rust-src) it warns and skips, unless CI is set.
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -85,7 +86,7 @@ function nightlyProblem() {
   return undefined;
 }
 
-const testBuild = !threads && (process.env.FAST_MESH_TEST_BUILD === "1" || process.argv.includes("--test"));
+const testBuild = process.env.FAST_MESH_TEST_BUILD === "1" || process.argv.includes("--test");
 const cargoArgs = ["build", "-p", "fast-mesh-wasm", "--target", "wasm32-unknown-unknown", "--release"];
 if (threads) {
   // wasm-bindgen-rayon's setup (its README and wasm-bindgen's threads guide): atomics
@@ -106,7 +107,18 @@ if (threads) {
   ].join(" ");
   run(
     "rustup",
-    ["run", NIGHTLY, "cargo", ...cargoArgs, "--features", "threads", "--target-dir", targetDir, "-Z", "build-std=panic_abort,std"],
+    [
+      "run",
+      NIGHTLY,
+      "cargo",
+      ...cargoArgs,
+      "--features",
+      testBuild ? "threads,test-panic" : "threads",
+      "--target-dir",
+      targetDir,
+      "-Z",
+      "build-std=panic_abort,std",
+    ],
     { RUSTFLAGS: rustflags },
   );
 } else {

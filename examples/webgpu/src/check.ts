@@ -11,6 +11,9 @@
 // - `restartOpen`, `restartRun`, `close`: a threaded scene whose Worker crashes,
 //   then `restart()`: the new Worker starts a new pool and colours as before.
 // - `nestedFail`: a threaded scene whose nested Workers cannot load.
+// - `poolCrash`: a thread of a threaded scene's pool panics (or traps): the
+//   calls waiting on the blocked engine fail with `INSTANCE_POISONED`, and
+//   `restart()` starts a new pool. Needs the threaded test build.
 // - `bench`: the wide-range drag of the Node bench (`bench/scene.bench.mjs`
 //   5f), lock step and a continuous drag, with the Worker's block times.
 //
@@ -155,6 +158,7 @@ class CheckWorker implements WorkerLike {
   #listeners: Record<string, ((e: unknown) => void)[]> = { message: [], error: [], messageerror: [] };
   #waiters: (() => void)[] = [];
   #stats: ((s: CheckStats) => void)[] = [];
+  #crash: ((available: boolean) => void)[] = [];
 
   constructor(flags: readonly string[]) {
     const url = new URL(checkWorkerUrl, location.href);
@@ -167,6 +171,12 @@ class CheckWorker implements WorkerLike {
       if (data?.kind === "checkStats") {
         for (const w of this.#stats.splice(0)) {
           w(data);
+        }
+        return;
+      }
+      if (data?.kind === "checkPoolCrash") {
+        for (const w of this.#crash.splice(0)) {
+          w(data.available);
         }
         return;
       }
@@ -221,6 +231,13 @@ class CheckWorker implements WorkerLike {
       await new Promise<void>((resolve) => this.#waiters.push(resolve));
     }
     return this.results.slice(from);
+  }
+
+  /** Crashes a pool thread (blocking the engine); false when the build has no hook for it. */
+  crashPool(how: "panic" | "trap"): Promise<boolean> {
+    const reply = new Promise<boolean>((resolve) => this.#crash.push(resolve));
+    this.worker.postMessage({ checkPoolCrash: how });
+    return reply;
   }
 
   /** The probes since the last call (call only when drained). */
@@ -662,6 +679,70 @@ async function nestedFail({ threads }: { threads?: number } = {}) {
   }
 }
 
+// ---- poolCrash: a pool thread panics or traps ----
+
+async function poolCrash({ threads, how = "panic" }: { threads?: number; how?: "panic" | "trap" } = {}) {
+  const { scene, workers } = await openCheckScene([], { threads });
+  try {
+    const n = 100;
+    const a = terrain(n);
+    const b = terrain(n, { phase: 1.3 });
+    const meshA = scene.addMesh(a.positions, a.indices);
+    const meshB = scene.addMesh(b.positions, b.indices);
+    scene.setPlacement(meshB, flippedPose(0, n / 2, n / 2, 4));
+    const field = scene.addDistanceField({ name: "wide", on: meshA, to: meshB, maxDistance: WIDE.maxDistance });
+    scene.setColoring(meshA, { field, map: "turbo", range: WIDE.range });
+    await roundTrip(scene, workers[0]);
+    const before = scene.threads;
+    const t0 = now();
+    if (!(await workers[0].crashPool(how))) {
+      return { available: false, threads: before };
+    }
+    // Sent after the crash: the blocked engine never answers them.
+    const outcome = async (p: Promise<unknown>) => {
+      try {
+        await p;
+        return { code: "resolved", ms: now() - t0 };
+      } catch (e) {
+        return { code: (e as { code?: string }).code ?? String(e), message: String((e as Error).message), ms: now() - t0 };
+      }
+    };
+    const c = terrain(20, { dx: 200 });
+    const meshC = scene.addMesh(c.positions, c.indices);
+    const pending = [outcome(scene.meshDistance(meshA, meshB)), outcome(scene.fieldStatus(field))];
+    scene.commitFrame();
+    const addKey = `mesh:${scene.idOf(meshC)}`;
+    const addBefore = scene.status(addKey).status;
+    // Well past the expected few ms, so a hang still returns.
+    const late = new Promise<{ code: string; ms: number }>((resolve) =>
+      setTimeout(() => resolve({ code: "pending", ms: now() - t0 }), 5000),
+    );
+    const failed = await Promise.all(pending.map((p) => Promise.race([p, late])));
+    const addAfter = scene.status(addKey).status;
+    const r0 = now();
+    await scene.restart();
+    const restartMs = now() - r0;
+    const gap = scene.meshDistance(meshA, meshB);
+    scene.commitFrame();
+    const works = (await gap) !== null && scene.views(meshA).colors() !== null;
+    return {
+      available: true,
+      how,
+      threads: before,
+      failed,
+      addBefore,
+      addAfter,
+      crashErrors: workers[0].errors,
+      restartMs,
+      restartThreads: scene.threads,
+      workersMade: workers.length,
+      works,
+    };
+  } finally {
+    scene.terminate();
+  }
+}
+
 // ---- bench: the wide-range drag (bench/scene.bench.mjs 5f) ----
 
 function stats(samples: number[]) {
@@ -813,6 +894,6 @@ function info() {
   };
 }
 
-const fmCheck = { info, compare, memory, restartOpen, restartRun, close, nestedFail, bench };
+const fmCheck = { info, compare, memory, restartOpen, restartRun, close, nestedFail, poolCrash, bench };
 (window as unknown as { fmCheck: typeof fmCheck }).fmCheck = fmCheck;
 document.querySelector("#out")!.textContent = `ready: ${JSON.stringify(info())}`;

@@ -8,6 +8,8 @@ use wasm_bindgen::prelude::*;
 
 mod edit;
 mod error;
+#[cfg(all(feature = "threads", target_arch = "wasm32"))]
+mod pool;
 mod render;
 mod scene;
 
@@ -16,6 +18,9 @@ mod scene;
 /// after `init()`, before any other call.
 #[cfg(all(feature = "threads", target_arch = "wasm32"))]
 pub use wasm_bindgen_rayon::init_thread_pool;
+
+#[cfg(all(feature = "threads", target_arch = "wasm32"))]
+pub use pool::watch_pool_crashes;
 
 fn to_js_error(err: fast_mesh::MeshError) -> JsError {
     JsError::new(&err.to_string())
@@ -43,4 +48,31 @@ pub fn compute_bounds(positions: &[f32]) -> Result<Vec<f32>, JsError> {
 #[wasm_bindgen(js_name = __test_panic)]
 pub fn test_panic() {
     panic!("test panic");
+}
+
+/// Panics on a thread of rayon's pool, inside a parallel loop, so the browser
+/// check can confirm the Worker scene poisons (`watchPoolCrashes`). Threaded
+/// test builds only (`node scripts/build-wasm.mjs --threads --test`).
+#[cfg(all(feature = "test-panic", feature = "threads", target_arch = "wasm32"))]
+#[wasm_bindgen(js_name = __test_panic_pool)]
+pub fn test_panic_pool() {
+    use rayon::prelude::*;
+    (0..1024u32).into_par_iter().for_each(|i| {
+        if i == 1000 {
+            panic!("test panic on a pool thread");
+        }
+    });
+}
+
+/// Traps on a thread of rayon's pool (`unreachable`, no panic), inside a
+/// parallel loop: a crash the panic hook never sees. Threaded test builds only.
+#[cfg(all(feature = "test-panic", feature = "threads", target_arch = "wasm32"))]
+#[wasm_bindgen(js_name = __test_trap_pool)]
+pub fn test_trap_pool() {
+    use rayon::prelude::*;
+    (0..1024u32).into_par_iter().for_each(|i| {
+        if i == 1000 {
+            core::arch::wasm32::unreachable();
+        }
+    });
 }

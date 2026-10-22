@@ -13,7 +13,9 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Exports `__test_panic()`, which panics, for the TypeScript poisoning test.
+# Exports `__test_panic()`, which panics, for the TypeScript poisoning test,
+# and with `threads` `__test_panic_pool()` / `__test_trap_pool()`, which crash a
+# pool thread, for the browser check.
 # Only `node scripts/build-wasm.mjs --test` (or `FAST_MESH_TEST_BUILD=1`), run
 # by the package's `test` script, enables it; release builds never do.
 test-panic = []
@@ -22,7 +24,8 @@ parallel = ["fast-mesh-scene/parallel", "fast-mesh-ops/parallel"]
 # The threaded artifact (`node scripts/build-wasm.mjs --threads`, pinned
 # nightly, wasm atomics): `parallel` plus `initThreadPool`, which starts
 # rayon's pool on Web Workers sharing this module's memory.
-threads = ["parallel", "dep:wasm-bindgen-rayon"]
+# Its pool threads report a panic or trap to the scene (`watchPoolCrashes`).
+threads = ["parallel", "dep:wasm-bindgen-rayon", "dep:rayon"]
 
 [dependencies]
 fast-mesh.workspace = true
@@ -36,3 +39,4 @@ wasm-bindgen.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-rayon = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }

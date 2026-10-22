@@ -16,9 +16,13 @@
 //
 // Messages besides the scene's: `{ checkStats: true }` is answered with
 // `{ kind: "checkStats", chunks, maxGap, memory }` (chunks and gap since the
-// last call; `memory` is the WebAssembly memory's size in bytes), and
+// last call; `memory` is the WebAssembly memory's size in bytes),
 // `{ checkPoison: true }` throws an uncaught error here, as a crashed Worker
-// would, which poisons the scene.
+// would, which poisons the scene, and `{ checkPoolCrash: "panic" | "trap" }`
+// crashes a thread of the pool (the threaded test build's `__test_panic_pool`
+// or `__test_trap_pool`), which blocks this Worker for good: it is answered
+// first with `{ kind: "checkPoolCrash", available }` (false when the threaded
+// glue is not a test build, or was never loaded).
 import { serveEngine, startEngine } from "../../../packages/fast-mesh-wasm/dist/worker-engine.js";
 
 type ThreadedGlue = Awaited<ReturnType<Parameters<typeof startEngine>[1]["importThreaded"]>>;
@@ -43,6 +47,8 @@ if (query.has("failNested")) {
 }
 
 let memory: WebAssembly.Memory | undefined;
+/** The threaded glue, once imported (its test hooks crash the pool). */
+let threadedGlue: Record<string, unknown> | undefined;
 /** `glue` with its init recording the memory it instantiated with. */
 function recorded<T extends { default(): Promise<{ memory: WebAssembly.Memory }> }>(glue: T): T {
   return {
@@ -84,6 +90,15 @@ serveEngine(
           probeLast = now();
           return;
         }
+        if (data?.checkPoolCrash !== undefined) {
+          const hook = data.checkPoolCrash === "trap" ? "__test_trap_pool" : "__test_panic_pool";
+          const crash = threadedGlue?.[hook];
+          scope.postMessage({ kind: "checkPoolCrash", available: typeof crash === "function" });
+          if (typeof crash === "function") {
+            setTimeout(() => crash());
+          }
+          return;
+        }
         if (data?.checkPoison) {
           setTimeout(() => {
             throw new Error("check: the Worker crashed (on purpose)");
@@ -96,12 +111,11 @@ serveEngine(
   },
   (init) =>
     startEngine(init, {
-      importThreaded: async () =>
-        recorded(
-          (await import(
-            "../../../packages/fast-mesh-wasm/dist/wasm-threads/fast_mesh_wasm.js"
-          )) as unknown as ThreadedGlue,
-        ),
+      importThreaded: async () => {
+        const glue = await import("../../../packages/fast-mesh-wasm/dist/wasm-threads/fast_mesh_wasm.js");
+        threadedGlue = glue as unknown as Record<string, unknown>;
+        return recorded(glue as unknown as ThreadedGlue);
+      },
       importSingle: async () => recorded(await import("../../../packages/fast-mesh-wasm/dist/wasm/fast_mesh_wasm.js")),
     }),
   timed
