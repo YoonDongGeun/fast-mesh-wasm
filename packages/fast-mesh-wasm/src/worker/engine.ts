@@ -516,13 +516,25 @@ class Engine {
       let state: "idle" | "pending" | "done";
       try {
         state = steps.step(this.#stepPoints);
+        if (state === "pending") {
+          meshes ??= new Set(steps.meshes().map((h) => this.#meshId(h)));
+        }
       } catch (e) {
-        if (isPoison(e)) {
+        let error = e;
+        if (!isPoison(error)) {
+          // The unit is over (the fields that could be applied were), or
+          // reading its meshes failed: leave none open.
+          try {
+            steps.abandon();
+          } catch (e2) {
+            error = e2;
+          }
+        }
+        if (isPoison(error)) {
           b.status.push(...this.#held.splice(0));
           this.#poison(b, POISONED, undefined, true);
           return false;
         }
-        // The unit is over: the fields that could be applied were.
         state = "done";
       }
       this.#onChunk?.({ kind: "fieldStep" });
@@ -534,9 +546,8 @@ class Engine {
         b.status.push(...this.#held.splice(0));
         return true;
       }
-      meshes ??= new Set(steps.meshes().map((h) => this.#meshId(h)));
       await this.#maybeYield();
-      if (this.#staleQueued(meshes)) {
+      if (meshes !== undefined && this.#staleQueued(meshes)) {
         steps.abandon();
         this.#onChunk?.({ kind: "fieldStepAbandon" });
         this.#lastAbandoned = meshes;

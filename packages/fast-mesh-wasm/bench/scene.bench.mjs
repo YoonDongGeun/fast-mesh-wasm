@@ -852,9 +852,14 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     `  update interval during the drag (${updates.length} updates before the last move)`,
     updates.slice(1).map((at, k) => at - updates[k]),
   );
-  const lastColored = results.findLast((r) => r.colored);
+  // The last pose's colours are applied with the result of the last move's batch, or of the
+  // end's batch when that one ran the unit; either way the later of the two that recolours.
+  // When the last pose's colours equal the ones shown (the drag path revisits poses), neither
+  // recolours, and the last move's result marks when they were current.
+  const tail = results.slice(-2);
+  const final = tail.findLast((r) => r.colored) ?? tail[0];
   console.log(
-    `  last move (then release) -> its colours applied ${fmt(lastColored.at - lastSent)} ms (the move's own result recolours: ${results[results.length - 2].colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
+    `  last move (then release) -> its colours applied ${fmt(final.at - lastSent)} ms (recoloured: ${final.colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
   );
   console.log(
     `  most batches waiting for a result ${backlog}; longest field step ${fmt(maxOf(steps))} ms, longest Worker block ${fmt(st.maxGap)} ms; main thread per frame median ${med(main)} ms, longest main block ${fmt(mainBlock)} ms`,

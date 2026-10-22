@@ -11,7 +11,7 @@ Native, single-threaded (`parallel` feature off), i5-13600K, release build,
 of `bench_fields` (indices 0, 16, 32 and 48, `WIDE_POSES`), `max_distance`
 8, colour range 0 to 6 (the 9a JS "wide" case). `field on A` has one field (A to B); `fields on A and B` adds B to A.
 Each pose runs `set_placement`, `update_fields`, `colors` and
-`take_changes`. `FAST_MESH_BENCH_10M=1` adds `scene wide drag 10M`
+`take_changes`. `FAST_MESH_BENCH_LARGE=1` adds `scene wide drag 10M`
 (`terrain(2237)`, 10,008,338 triangles), which was not run.
 
 ## Method

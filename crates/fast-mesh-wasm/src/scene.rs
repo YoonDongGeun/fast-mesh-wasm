@@ -884,6 +884,9 @@ impl WasmScene {
             StepState::Idle => 0,
             StepState::Pending => 1,
             StepState::Done => 2,
+            // A state added later: stop stepping (an open unit is dropped
+            // by the next call that changes the scene).
+            _ => 2,
         })
     }
 

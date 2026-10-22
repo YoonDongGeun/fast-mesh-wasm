@@ -201,6 +201,7 @@ struct Pick {
 
 /// How much one [`Scene::field_step`](crate::Scene::field_step) computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldBudget {
     /// Up to this many candidate vertices (at least one), counted across
     /// the unit's fields in field order.
@@ -210,6 +211,7 @@ pub enum FieldBudget {
 /// Where the field step unit stands after
 /// [`Scene::field_step`](crate::Scene::field_step).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StepState {
     /// No Eager field was due, so no unit was opened.
     Idle,

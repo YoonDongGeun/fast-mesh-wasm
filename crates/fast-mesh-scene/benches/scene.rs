@@ -28,7 +28,7 @@
 //! to 6, the 9a JS "wide" case, where nearly every vertex is in range and
 //! every pose recomputes almost all of them. It runs 4 of the 64 poses,
 //! spread across the drag (0, 16, 32 and 48), so that a run takes minutes.
-//! At 1M, and at 10M (`terrain(2237)`) with `FAST_MESH_BENCH_10M=1`. The
+//! At 1M, and at 10M (`terrain(2237)`) with `FAST_MESH_BENCH_LARGE=1`. The
 //! drag benchmarks build their scenes and run their setup pass only when
 //! criterion runs them, and the setup pass prints the time per pose. The
 //! `step` group times the undivided part of a stepped update at the same
@@ -1014,7 +1014,7 @@ fn benches(c: &mut Criterion) {
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);
     bench_wide_drag(c, "1M", 708);
-    if std::env::var_os("FAST_MESH_BENCH_10M").is_some() {
+    if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {
         // 2237: 10,008,338 triangles.
         bench_wide_drag(c, "10M", 2237);
     }

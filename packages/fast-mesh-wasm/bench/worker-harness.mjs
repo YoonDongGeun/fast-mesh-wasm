@@ -17,9 +17,8 @@
 // ticks lets no `parentPort` message in there), so batches sent during a long
 // recompute arrive between its steps, as in a browser Worker.
 import { parentPort } from "node:worker_threads";
-
-await import("../dist/node.js");
-const { serveEngine } = await import("../dist/worker-engine.js");
+import "../dist/node.js";
+import { serveEngine } from "../dist/worker-engine.js";
 
 const now = () => performance.now();
 let chunks = [];
