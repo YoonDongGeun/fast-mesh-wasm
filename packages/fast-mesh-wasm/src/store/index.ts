@@ -2,6 +2,7 @@
 // for UI code (React's `useSyncExternalStore`, or plain subscriptions).
 // Free of React, three.js and the WebAssembly glue: it only uses the scene
 // you give it.
+export { type ContactHeatmapOptions, contactHeatmap } from "./heatmap.js";
 export type { StoreAddMeshOptions } from "./host.js";
 export {
   type ContactGroup,

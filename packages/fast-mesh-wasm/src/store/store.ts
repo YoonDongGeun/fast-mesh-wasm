@@ -780,6 +780,25 @@ export class SceneStore {
     this.#host.removeField(field.handle);
   }
 
+  /**
+   * The values of the store-owned field behind the mesh's colouring (the one
+   * last sent to the scene), one per vertex slot, as of the field's last
+   * update: a copy the caller owns. `null` when the mesh has no colouring.
+   * On a Worker scene the request is ordered after the calls made before
+   * it, so it reads the colouring last flushed. Never a history step.
+   *
+   * Rejects with `UNKNOWN_MESH` for a mesh not in the store, and
+   * `INVALID_ARGUMENT` once the store is disposed.
+   */
+  fetchColoringValues(mesh: MeshHandle): Promise<Float32Array | null> {
+    return new Promise<Float32Array | null>((resolve) => {
+      this.#alive();
+      const entry = this.#mesh(mesh);
+      const field = entry.field;
+      resolve(entry.sent === null || field === undefined ? null : this.#host.fieldValues(field.handle));
+    });
+  }
+
   // ---- Sections ----
 
   /** Adds a plane section and returns its handle at once. */

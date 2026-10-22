@@ -474,6 +474,24 @@ export function App() {
 - `setSection(section, { plane?, meshes?, fill? })` changes a section.
 - `select(mesh | null)` sets the selection. It is UI state only, and it clears when the selected mesh is removed.
 
+**Contact heatmap.** `contactHeatmap({ depth, gap, tolerance?, exactDepth?, sign?, colors? })` builds a colouring (everything but `distanceTo`) that shows how two meshes touch. Spread it into `setDisplay`, colouring each mesh against the other:
+
+```ts
+import { contactHeatmap } from "fast-mesh-wasm/store";
+
+const heat = contactHeatmap({ depth: 0.5, gap: 1, tolerance: 0.05 });
+store.setDisplay(upper, { coloring: { distanceTo: lower, ...heat } });
+store.setDisplay(lower, { coloring: { distanceTo: upper, ...heat } });
+```
+
+- The range is `[-depth, gap]`. Penetration runs from `deep` (`#7f0000`) at `-depth` to `shallow` (`#ff6b6b`) at the contact band, which is `contact` (`#ffffff`) across `[-tolerance, +tolerance]` (one stop at 0 when the tolerance is 0, the default). The gap runs from `near` (`#4caf50`) to `far` (`#1e3a8a`) at `gap`. Deeper than `depth` clamps to `deep`; farther than `gap` shows the base colour. `colors` overrides any of the five.
+- `exactDepth: false` (the default) bounds the field at `max(depth, gap)`: the fast path for contact, but a vertex deeper than that is beyond the field and shows the base colour. `exactDepth: true` computes every vertex's distance (`maxDistance: Infinity`), so any penetration shows, at the cost of a full recompute on every update.
+- `sign` (default `"auto"`) is passed through. On an open or inconsistently oriented target, the penetration side follows its surface normals (`fieldStatus` tells you which).
+- Changing only `tolerance` or `colors` keeps `maxDistance` and `sign`, so the store reuses its field and only recolours.
+- It throws `INVALID_ARGUMENT` unless `depth > 0`, `gap > 0` (both finite) and `0 <= tolerance < min(depth, gap)`.
+
+`store.fetchColoringValues(mesh)` resolves to a copy of the values of the field behind the mesh's colouring (one per vertex slot), or `null` when the mesh has no colouring: for readouts such as the deepest penetration, `-min(values)`. It uses `fetchFieldValues` on a Worker scene and copies `fieldValues` on a synchronous one. It rejects with `UNKNOWN_MESH` for a mesh not in the store.
+
 Declarative changes update `desired` at once and reach the scene at the next `store.commitFrame()`, the last value per mesh or section in a frame winning (on both scenes, so rapid toggling never queues work). Without a frame loop they apply on a microtask. Call `store.commitFrame()` once per animation frame instead of `scene.commitFrame()`; `<FastMesh>` does it for you. The first `store.commitFrame()` switches the store to frame flushing: from then on, declarative changes wait for a frame. When the last `<FastMesh>` (or `useFrameDriver`) of a store unmounts, the store switches back to flushing on a microtask, so changes made with no canvas mounted still apply.
 
 Meshes must be added through the store (`store.addMesh`). A mesh added straight to `store.scene` is not in the store: its hooks read it as removed, and `<FastMesh>` renders nothing for it.
