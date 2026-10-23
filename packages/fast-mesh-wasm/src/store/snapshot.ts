@@ -25,8 +25,12 @@ export type Status = "idle" | "computing" | "ready" | "error";
  * it. The colour fields are those of the scene's `ColorRule`.
  */
 export interface DistanceColoring {
-  /** The mesh the distances are measured to. */
-  distanceTo: MeshHandle;
+  /**
+   * The mesh the distances are measured to, or several: each vertex then
+   * shows the smallest signed distance over them (the nearest surface, or
+   * the deepest penetration). A set: the order does not matter.
+   */
+  distanceTo: MeshHandle | readonly MeshHandle[];
   /** Largest distance computed (inclusive); may be `Infinity`. */
   maxDistance: number;
   /** Defaults to `"auto"`. */
@@ -39,6 +43,23 @@ export interface DistanceColoring {
   center?: number;
   base?: Rgba;
   nan?: Rgba;
+}
+
+/**
+ * A contact group for `SceneStore.setContactGroup`: meshes coloured by their
+ * distance to their partners, each with one colour scale whichever partner
+ * it touches.
+ */
+export interface ContactGroup {
+  /** The members, all in the store, each once. */
+  meshes: readonly MeshHandle[];
+  /**
+   * Which members are measured to each other, either way round: listed
+   * pairs of members, or `"all"` (the default) for every pair.
+   */
+  pairs?: readonly (readonly [MeshHandle, MeshHandle])[] | "all";
+  /** The colouring of every member, its `distanceTo` being the member's partners. */
+  coloring: Omit<DistanceColoring, "distanceTo">;
 }
 
 /** How a mesh is shown. `opacity` and `visible` live only in the store. */

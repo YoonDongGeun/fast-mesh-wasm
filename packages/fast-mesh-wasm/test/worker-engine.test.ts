@@ -269,7 +269,7 @@ describe("worker engine", () => {
     // Colouring by a distance field fills the colour mirror; off clears it.
     const rule = { field: 1, map: "turbo" as const, range: [0, 3] as [number, number] };
     const r3 = await h.send([
-      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: 5 } },
+      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: 5 } },
       { kind: "coloring", rev: rev(), id: 1, rule, key: "display:1" },
     ]);
     const f = ref.addDistanceField({ name: "d", on: ra, to: rb, maxDistance: 5 });
@@ -325,7 +325,7 @@ describe("worker engine", () => {
     const r = await h.send([
       addMesh(1, a),
       addMesh(2, b),
-      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: 5 } },
+      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: 5 } },
       { kind: "coloring", rev: rev(), id: 1, rule: rule(2), key: "display:1" },
       { kind: "edit", rev: rev(), id: 1, payload: move(1.5), qid: 1 },
       { kind: "coloring", rev: rev(), id: 1, rule: rule(3), key: "display:1" },
@@ -410,7 +410,7 @@ describe("worker engine", () => {
     const batch: Request[] = [
       addMesh(1, a),
       addMesh(2, b),
-      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: 2, maxDistance: 5 } },
+      { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: 5 } },
       // An invalid colouring superseded by a valid one: never run.
       { kind: "coloring", rev: rev(), id: 1, rule: { field: 1, map: "turbo", range: [2, 0] }, key: "display:1" },
       { ...lastColoring, rev: rev() } as Request,

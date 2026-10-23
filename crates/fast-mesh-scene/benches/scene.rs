@@ -35,6 +35,16 @@
 //! poses: `set_placement`, then opening a step unit (the first
 //! `field_step`, of one point), then `abandon_field_step`.
 //!
+//! **Multi-target fields**, at 1M (`terrain(708)`): A with three flipped
+//! copies over it, B, C and D, each at the touching pose of a different turn
+//! (0°, 2° and 4°), all Lazy. One field on A measured to B, C and D
+//! (`max_distance` 0.08, coloured from contact) against three single-target
+//! fields on A (one coloured). Each iteration runs 16 steps of one of two
+//! drags: B turned through the first 16 poses of the field drag (one
+//! target moves), or A lifted and lowered by up to 0.03 (every target
+//! moves). Each step calls `set_placement` and `update_fields`, reads the
+//! colours and drains `take_changes`. Setup prints the time per step.
+//!
 //! **Sections**, on `terrain(708)` and on 1M-triangle UV spheres: a plane
 //! dragged across a terrain through 64 poses (and across three terrains of
 //! 333k triangles side by side, one section over all three), 100 vertices
@@ -440,7 +450,7 @@ fn field_scene(
             .add_distance_field(DistanceField {
                 name: "d".to_owned(),
                 on,
-                to,
+                to: vec![to],
                 max_distance,
                 sign: SignMode::Auto,
             })
@@ -599,6 +609,114 @@ fn bench_drag(
                 }
             })
         });
+    }
+    group.finish();
+}
+
+/// The scene of the multi-target benchmarks (see the module docs): A and its
+/// three targets, with one field to all three (`multi`) or one to each. B's
+/// id, A's id and the poses of B's drag.
+fn multi_target_scene(n: u32, multi: bool) -> (Scene, MeshId, MeshId, Vec<Placement>) {
+    let touching = poses(f64::from(n));
+    let lazy = |placement| MeshOptions {
+        mode: UpdateMode::Lazy,
+        placement,
+        ..Default::default()
+    };
+    let mut scene = scene();
+    let a = scene
+        .add_mesh(terrain(n), lazy(Placement::IDENTITY))
+        .unwrap();
+    let targets: Vec<MeshId> = [0, 20, 40]
+        .iter()
+        .map(|&i| {
+            scene
+                .add_mesh(terrain(n), lazy(placement(&touching[i])))
+                .unwrap()
+        })
+        .collect();
+    let rule = ColorRule {
+        map: Colormap::Turbo,
+        range: FIELD_RANGE,
+        below: OutOfRange::Clamp,
+        above: OutOfRange::Base,
+        center: None,
+        base: [200, 200, 200, 255],
+        nan: [255, 0, 255, 255],
+    };
+    let lists: Vec<Vec<MeshId>> = if multi {
+        vec![targets.clone()]
+    } else {
+        targets.iter().map(|&t| vec![t]).collect()
+    };
+    for (k, to) in lists.into_iter().enumerate() {
+        let field = scene
+            .add_distance_field(DistanceField {
+                name: format!("d{k}"),
+                on: a,
+                to,
+                max_distance: FIELD_DISTANCE,
+                sign: SignMode::Auto,
+            })
+            .unwrap();
+        if k == 0 {
+            let rule = rule.clone();
+            scene
+                .set_coloring(a, Some(Coloring { field, rule }))
+                .unwrap();
+        }
+    }
+    scene.update_fields().unwrap();
+    let drag = touching[..16].iter().map(placement).collect();
+    (scene, a, targets[0], drag)
+}
+
+fn bench_multi_target(c: &mut Criterion) {
+    let n = 708;
+    let mut group = c.benchmark_group("scene multi-target fields 1M");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(16));
+    let lifts: Vec<Placement> = (0..16)
+        .map(|k| Placement {
+            translation: [0.0, 0.0, 0.03 * (f64::from(k) * 0.4).sin()],
+            ..Placement::IDENTITY
+        })
+        .collect();
+    for (name, multi) in [
+        ("one field to 3 targets", true),
+        ("3 single-target fields", false),
+    ] {
+        for drag_a in [false, true] {
+            let what = if drag_a { "A lifted" } else { "B turned" };
+            let mut state: Option<(Scene, MeshId, Vec<Placement>)> = None;
+            group.bench_function(format!("{name}, {what}, 16 steps"), |bn| {
+                let (scene, moved, steps) = state.get_or_insert_with(|| {
+                    let (mut scene, a, b, drag) = multi_target_scene(n, multi);
+                    let (moved, steps) = if drag_a {
+                        (a, lifts.clone())
+                    } else {
+                        (b, drag)
+                    };
+                    let t = std::time::Instant::now();
+                    for p in steps.iter().cycle().skip(1).take(steps.len()) {
+                        scene.set_placement(moved, *p).unwrap();
+                        scene.update_fields().unwrap();
+                        black_box(scene.take_changes());
+                    }
+                    let per = t.elapsed().as_secs_f64() * 1e3 / steps.len() as f64;
+                    eprintln!("{name}, {what}: setup pass {per:.1} ms per step");
+                    (scene, moved, steps)
+                });
+                bn.iter(|| {
+                    for p in steps.iter() {
+                        scene.set_placement(*moved, *p).unwrap();
+                        scene.update_fields().unwrap();
+                        black_box(scene.colors(scene.ids().next().unwrap()).unwrap());
+                        black_box(scene.take_changes());
+                    }
+                })
+            });
+        }
     }
     group.finish();
 }
@@ -939,7 +1057,7 @@ fn many_mesh_scene(n: u32, step: f64) -> (Scene, MeshId, Vec<Placement>) {
                 .add_distance_field(DistanceField {
                     name: format!("d{i}{j}"),
                     on,
-                    to,
+                    to: vec![to],
                     max_distance: MANY_DISTANCE,
                     sign: SignMode::Auto,
                 })
@@ -1014,6 +1132,7 @@ fn benches(c: &mut Criterion) {
     bench_overhead(c, "1M", 708);
     bench_fields(c, "1M", 708);
     bench_wide_drag(c, "1M", 708);
+    bench_multi_target(c);
     if std::env::var_os("FAST_MESH_BENCH_LARGE").is_some() {
         // 2237: 10,008,338 triangles.
         bench_wide_drag(c, "10M", 2237);

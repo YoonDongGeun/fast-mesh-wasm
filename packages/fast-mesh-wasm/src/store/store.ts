@@ -24,10 +24,12 @@ import type {
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 import type { WorkerScene } from "../worker/client.js";
+import { targetsOf } from "../handles.js";
 import { sectionAspects } from "../worker/protocol.js";
 import { type Host, hostOf, type StoreAddMeshOptions } from "./host.js";
 import {
   type Combined,
+  type ContactGroup,
   combine,
   DEFAULT_DISPLAY,
   type DisplayState,
@@ -46,18 +48,78 @@ export type SectionPatch = Partial<SectionParts>;
 
 /**
  * The distance field the store owns for a mesh's colouring, keyed by
- * `(to, maxDistance, sign)`: kept while the colouring is off, reused when it
- * comes back with the same key, replaced when the key changes.
+ * `(to, maxDistance, sign)`, `to` taken as a set: kept while the colouring is
+ * off, reused when it comes back with the same key, replaced when the key
+ * changes.
  */
 interface OwnedField {
   handle: FieldHandle;
   /** Its id in status keys (`field:<id>`). */
   id: number;
-  to: MeshHandle;
-  /** The id of `to` in status keys, when the store tracks it. */
-  toId: number | undefined;
+  /** Its targets, by ascending id (the order they were given to the scene). */
+  to: readonly MeshHandle[];
+  /** The ids of `to` in status keys (`undefined` for a mesh the scene no longer knows). */
+  toIds: readonly (number | undefined)[];
   maxDistance: number;
   sign: SignMode;
+}
+
+/**
+ * `c` without `mesh` among its targets when it has others (the scene keeps
+ * such a field without the mesh); otherwise `c` itself.
+ */
+function withoutTarget(c: DistanceColoring | null, mesh: MeshHandle): DistanceColoring | null {
+  if (c === null || !Array.isArray(c.distanceTo) || c.distanceTo.length < 2 || !c.distanceTo.includes(mesh)) {
+    return c;
+  }
+  const to = (c.distanceTo as readonly MeshHandle[]).filter((m) => m !== mesh);
+  return Object.freeze({ ...c, distanceTo: Object.freeze(to) });
+}
+
+/** A contact group with the colouring it gave each member (frozen; `null` for none). */
+interface GroupEntry {
+  group: ContactGroup;
+  given: Map<MeshHandle, DistanceColoring | null>;
+}
+
+/** The members of `g` that `m` is paired with, in member order. */
+function partnersOf(g: ContactGroup, m: MeshHandle): MeshHandle[] {
+  return g.meshes.filter(
+    (p) =>
+      p !== m &&
+      (g.pairs === undefined ||
+        g.pairs === "all" ||
+        g.pairs.some(([a, b]) => (a === m && b === p) || (a === p && b === m))),
+  );
+}
+
+const COLORMAPS = ["turbo", "viridis", "coolwarm", "grayscale"];
+const SIGNS = ["auto", "pseudonormal", "winding"];
+
+/** Checks a contact group's colouring up front (the checks the scene would make at the flush). */
+function checkGroupColoring(c: unknown): void {
+  if (typeof c !== "object" || c === null) {
+    throw invalid("a contact group needs a coloring");
+  }
+  const { maxDistance, range, map, sign } = c as Partial<DistanceColoring>;
+  if (typeof maxDistance !== "number" || !(maxDistance >= 0)) {
+    throw invalid("coloring.maxDistance must be a number, zero or greater (Infinity allowed)");
+  }
+  if (
+    !Array.isArray(range) ||
+    range.length !== 2 ||
+    !range.every((x) => typeof x === "number" && Number.isFinite(x)) ||
+    !(range[0] < range[1])
+  ) {
+    throw invalid("coloring.range must be [lo, hi], finite, with lo < hi");
+  }
+  const stops = typeof map === "object" && map !== null ? (map as { stops?: unknown }).stops : undefined;
+  if (!(typeof map === "string" && COLORMAPS.includes(map)) && !Array.isArray(stops)) {
+    throw invalid("coloring.map must be a built-in colormap or { stops }");
+  }
+  if (sign !== undefined && !SIGNS.includes(sign)) {
+    throw invalid('coloring.sign must be "auto", "pseudonormal" or "winding"');
+  }
 }
 
 /** A request sent to the scene and not yet applied: applied once its key's status reaches `rev`. */
@@ -243,6 +305,10 @@ export class SceneStore {
   #updateQueued = false;
   /** A snapshot was published and its listeners not yet called. */
   #owed = false;
+  /** Contact groups by id. */
+  readonly #groups = new Map<string, GroupEntry>();
+  /** Meshes a contact group uncoloured: the next flush also removes their owned field. */
+  readonly #dropFields = new Set<MeshEntry>();
   /** Fields added so far, for their names (`fast-mesh-store:<n>`). */
   #fieldCount = 0;
   #selection: MeshHandle | null = null;
@@ -335,10 +401,12 @@ export class SceneStore {
 
   /**
    * Removes a mesh; it leaves the snapshot (and the selection) at once. The
-   * scene drops the fields measured to it, and the colourings by them: a
-   * mesh coloured by distance to it shows no colouring, keeps its rule in
-   * `desired`, and is in `"error"` (`UNKNOWN_MESH`) from the next flush
-   * until its colouring changes. Sections stop cutting it.
+   * scene drops the fields measured to it alone, and the colourings by them:
+   * a mesh coloured by distance to it alone shows no colouring, keeps its
+   * rule in `desired`, and is in `"error"` (`UNKNOWN_MESH`) from the next
+   * flush until its colouring changes. A colouring measured to it and other
+   * meshes keeps the others (its `distanceTo` loses the mesh). It leaves its
+   * contact groups, whose members' partners follow. Sections stop cutting it.
    */
   removeMesh(mesh: MeshHandle): void {
     this.#alive();
@@ -347,6 +415,7 @@ export class SceneStore {
     if (entry !== undefined) {
       this.#meshes.delete(mesh);
       this.#pendingDisplay.delete(entry);
+      this.#dropFields.delete(entry);
       this.#inflightMeshes.delete(entry);
       this.#unindexMesh(entry);
       this.#dirtyMeshes.add(mesh);
@@ -358,11 +427,39 @@ export class SceneStore {
       this.#selection = null;
     }
     for (const other of this.#meshes.values()) {
-      if (other.field?.to !== mesh) {
+      // A colouring measured to the mesh and others keeps the others.
+      const prune = (d: DisplayState): DisplayState => {
+        const c = withoutTarget(d.coloring, mesh);
+        return c === d.coloring ? d : Object.freeze({ ...d, coloring: c });
+      };
+      const before = [other.display, other.desired, other.sent];
+      other.display = prune(other.display);
+      other.desired = prune(other.desired);
+      other.sent = withoutTarget(other.sent, mesh);
+      if (other.inflight !== undefined) {
+        other.inflight.value = withoutTarget(other.inflight.value, mesh);
+      }
+      if (other.display !== before[0] || other.desired !== before[1] || other.sent !== before[2]) {
+        this.#dirtyMeshes.add(other.handle);
+      }
+      const owned = other.field;
+      if (owned === undefined || !owned.to.includes(mesh)) {
+        continue;
+      }
+      if (owned.to.length > 1) {
+        // The scene keeps the field without the mesh, and the colouring.
+        const at = owned.to.indexOf(mesh);
+        other.field = {
+          ...owned,
+          to: owned.to.filter((_, k) => k !== at),
+          toIds: owned.toIds.filter((_, k) => k !== at),
+        };
+        // Re-derived, which also re-indexes it under its remaining targets' keys.
+        this.#dirtyMeshes.add(other.handle);
         continue;
       }
       // Gone from the scene with the mesh, and so is a colouring by it.
-      const fieldKey = `field:${other.field.id}`;
+      const fieldKey = `field:${owned.id}`;
       this.#host.forgetErrors((k) => k === fieldKey);
       other.field = undefined;
       other.sent = null;
@@ -390,6 +487,33 @@ export class SceneStore {
       const inflight = s.inflight.meshes;
       if (inflight !== undefined) {
         inflight.value = without(inflight.value);
+      }
+    }
+    for (const ge of this.#groups.values()) {
+      const g = ge.group;
+      if (!g.meshes.includes(mesh)) {
+        continue;
+      }
+      const pairs = g.pairs;
+      ge.group = Object.freeze({
+        ...g,
+        meshes: without(g.meshes),
+        pairs:
+          pairs === undefined || pairs === "all"
+            ? pairs
+            : Object.freeze(pairs.filter(([p, q]) => p !== mesh && q !== mesh)),
+      });
+      ge.given.delete(mesh);
+      for (const [m, given] of ge.given) {
+        // The members with other partners left were pruned above, as their
+        // colourings were; a member left with none stops being coloured,
+        // unless the app has coloured it since.
+        const left = given === null ? null : withoutTarget(given, mesh);
+        ge.given.set(m, left);
+        if (left !== null && partnersOf(ge.group, m).length === 0) {
+          this.#release(m, left);
+          ge.given.set(m, null);
+        }
       }
     }
     this.#update();
@@ -487,10 +611,11 @@ export class SceneStore {
    * at the next `commitFrame()` (or a microtask without a frame loop). A
    * patch equal to the current request changes nothing.
    *
-   * A `coloring` colours the mesh by distance to `distanceTo` through a
-   * field the store owns (one per mesh, named `fast-mesh-store:<n>`, kept
-   * while colouring is off and replaced only when `distanceTo`,
-   * `maxDistance` or `sign` changes). `display.coloring` is the colouring
+   * A `coloring` colours the mesh by distance to `distanceTo` (one mesh or
+   * several) through a field the store owns (one per mesh, named
+   * `fast-mesh-store:<n>`, kept while colouring is off and replaced only
+   * when the set of meshes in `distanceTo`, `maxDistance` or `sign`
+   * changes). `display.coloring` is the colouring
    * last applied: on a Worker scene, once its `display:` request is ready.
    *
    * @throws `UNKNOWN_MESH` for a mesh not in the store, `INVALID_ARGUMENT` for a bad value.
@@ -532,6 +657,127 @@ export class SceneStore {
     this.#dirtyMeshes.add(mesh);
     this.#schedule();
     this.#update();
+  }
+
+  // ---- Contact groups ----
+
+  /**
+   * Sets contact group `id`, or removes it with `null`. Every member is
+   * coloured by `group.coloring` with its partners (the members it is paired
+   * with) as `distanceTo`, through one field per member measured to all of
+   * its partners: each vertex shows the smallest signed distance over them
+   * (the nearest surface, or the deepest penetration). Moving a member then
+   * recomputes only its own field and those of its partners. A member
+   * without partners shows no colouring.
+   *
+   * Members are coloured through {@link setDisplay}, so `desired` and
+   * `display` show the colourings (groups themselves are not in the
+   * snapshot). Setting the group colours every member, overriding a
+   * colouring the app gave it. A member's later `setDisplay` colouring
+   * overrides the group's: the group then leaves that member alone when it
+   * shrinks, is removed, or loses a mesh, until it is set again. Members
+   * dropped from the group, or all of them when it is removed, stop being
+   * coloured, and their store-owned fields are removed (not kept for later,
+   * as `setDisplay` keeps them). A removed mesh leaves its groups (and their
+   * pairs); a member left without partners stops being coloured.
+   *
+   * @throws `UNKNOWN_MESH` for a mesh not in the store; `INVALID_ARGUMENT`
+   *   for a mesh listed twice, a mesh already in another group, a pair that
+   *   is not two different members, or a bad colouring (`maxDistance`,
+   *   `range`, `map` or `sign`; checked here rather than at the flush).
+   */
+  setContactGroup(id: string, group: ContactGroup | null): void {
+    this.#alive();
+    if (typeof id !== "string") {
+      throw invalid("a contact group id must be a string");
+    }
+    const old = this.#groups.get(id);
+    if (group === null) {
+      if (old !== undefined) {
+        this.#groups.delete(id);
+        for (const [m, given] of old.given) {
+          this.#release(m, given);
+        }
+      }
+      return;
+    }
+    if (typeof group !== "object" || !Array.isArray(group.meshes)) {
+      throw invalid("a contact group needs a list of meshes");
+    }
+    const meshes: readonly MeshHandle[] = group.meshes;
+    meshes.forEach((m, k) => {
+      this.#mesh(m);
+      if (meshes.indexOf(m) !== k) {
+        throw invalid("a contact group lists a mesh twice");
+      }
+      for (const [other, g] of this.#groups) {
+        if (other !== id && g.group.meshes.includes(m)) {
+          throw invalid(`a mesh is already in contact group "${other}"`);
+        }
+      }
+    });
+    const pairs = group.pairs;
+    if (pairs !== undefined && pairs !== "all") {
+      if (!Array.isArray(pairs)) {
+        throw invalid('pairs must be a list of mesh pairs or "all"');
+      }
+      for (const pair of pairs) {
+        if (!Array.isArray(pair) || pair.length !== 2 || pair[0] === pair[1]) {
+          throw invalid("a pair needs two different meshes");
+        }
+        if (!meshes.includes(pair[0]) || !meshes.includes(pair[1])) {
+          throw invalid("a pair's meshes must be members of the group");
+        }
+      }
+    }
+    checkGroupColoring(group.coloring);
+    const next: ContactGroup = frozenCopy({ meshes, pairs, coloring: group.coloring });
+    const given = new Map<MeshHandle, DistanceColoring | null>();
+    for (const [m, was] of old?.given ?? []) {
+      if (!next.meshes.includes(m)) {
+        this.#release(m, was);
+      }
+    }
+    this.#groups.set(id, { group: next, given });
+    for (const m of next.meshes) {
+      const partners = partnersOf(next, m);
+      if (partners.length === 0) {
+        this.#release(m, this.#mesh(m).desired.coloring);
+        given.set(m, null);
+      } else {
+        this.setDisplay(m, { coloring: { ...next.coloring, distanceTo: partners } });
+        given.set(m, this.#mesh(m).desired.coloring);
+      }
+    }
+  }
+
+  /**
+   * Uncolours member `m` of a contact group, and has the next flush remove
+   * its owned field, when its requested colouring is still `given` (the
+   * one the group gave it): a colouring the app set since is left alone.
+   */
+  #release(m: MeshHandle, given: DistanceColoring | null): void {
+    const entry = this.#meshes.get(m);
+    if (entry === undefined || !sameData(entry.desired.coloring, given)) {
+      return;
+    }
+    this.#dropFields.add(entry);
+    this.#pendingDisplay.add(entry);
+    this.setDisplay(m, { coloring: null });
+    this.#schedule();
+  }
+
+  /** Removes `entry`'s owned field (and so a colouring by it), if any. */
+  #dropField(entry: MeshEntry): void {
+    const field = entry.field;
+    if (field === undefined) {
+      return;
+    }
+    entry.field = undefined;
+    this.#dirtyMeshes.add(entry.handle);
+    const fieldKey = `field:${field.id}`;
+    this.#host.forgetErrors((k) => k === fieldKey);
+    this.#host.removeField(field.handle);
   }
 
   // ---- Sections ----
@@ -759,14 +1005,23 @@ export class SceneStore {
   #flushColoring(entry: MeshEntry): void {
     const key = `display:${entry.id}`;
     const want = entry.desired.coloring;
+    // A contact group uncoloured it: its field goes too.
+    const drop = this.#dropFields.delete(entry) && want === null;
     try {
       this.#host.track(key, () => {
         if (sameData(want, entry.sent)) {
+          if (drop) {
+            this.#dropField(entry);
+          }
           return;
         }
         if (want === null) {
-          // The field is kept: colouring back on with the same key reuses it.
+          // The field is kept (colouring back on with the same key reuses
+          // it), unless a contact group let the mesh go.
           this.#host.setColoring(entry.handle, null);
+          if (drop) {
+            this.#dropField(entry);
+          }
         } else {
           const field = this.#ownedField(entry, want, key);
           this.#host.setColoring(entry.handle, colorRule(field.handle, want));
@@ -788,10 +1043,14 @@ export class SceneStore {
   /** The field for colouring `entry` by `want`: the owned one when its key matches, else a new one (replacing it). */
   #ownedField(entry: MeshEntry, want: DistanceColoring, key: string): OwnedField {
     const sign: SignMode = want.sign ?? "auto";
+    // The targets as a set: by ascending id (ids unknown to the scene last).
+    const order = (m: MeshHandle): number => this.#idOf(m) ?? Number.POSITIVE_INFINITY;
+    const to = [...targetsOf(want.distanceTo)].sort((a, b) => order(a) - order(b));
     const old = entry.field;
     if (
       old !== undefined &&
-      old.to === want.distanceTo &&
+      old.to.length === to.length &&
+      old.to.every((m, k) => m === to[k]) &&
       Object.is(old.maxDistance, want.maxDistance) &&
       old.sign === sign
     ) {
@@ -807,7 +1066,7 @@ export class SceneStore {
       {
         name: `fast-mesh-store:${++this.#fieldCount}`,
         on: entry.handle,
-        to: want.distanceTo,
+        to,
         maxDistance: want.maxDistance,
         sign,
       },
@@ -816,8 +1075,8 @@ export class SceneStore {
     const field: OwnedField = {
       handle,
       id: this.#host.idOf(handle),
-      to: want.distanceTo,
-      toId: this.#idOf(want.distanceTo),
+      to: Object.freeze(to),
+      toIds: Object.freeze(to.map((m) => this.#idOf(m))),
       maxDistance: want.maxDistance,
       sign,
     };
@@ -959,7 +1218,7 @@ export class SceneStore {
   /**
    * A mesh's status: its own `mesh:` and `display:` keys and the `field:`
    * key of its store field, made `"computing"` also by its `placement:` and
-   * `edit:` keys, those of the mesh it is coloured by distance to, and the
+   * `edit:` keys, those of the meshes it is coloured by distance to, and the
    * history, and while a requested colouring waits for the next flush.
    * (Opacity and visibility are store-only: they never make it pending.)
    * Indexes the mesh under the keys it read.
@@ -971,8 +1230,12 @@ export class SceneStore {
     const field = entry.field;
     if (field !== undefined) {
       own.push(`field:${field.id}`);
-      if (entry.sent !== null && field.toId !== undefined && field.toId !== id) {
-        dependent.push(`placement:${field.toId}`, `edit:${field.toId}`);
+      if (entry.sent !== null) {
+        for (const to of field.toIds) {
+          if (to !== undefined && to !== id) {
+            dependent.push(`placement:${to}`, `edit:${to}`);
+          }
+        }
       }
     }
     const keys = [...own, ...dependent];

@@ -380,7 +380,8 @@ class Engine {
   readonly #removedFields: FieldHandle[] = [];
   readonly #removedSections: SectionHandle[] = [];
   /** Each field's meshes, `[on, to]`: removing either drops the field. */
-  readonly #fieldMeshes = new Map<ClientId, [ClientId, ClientId]>();
+  /** Per field: `[on, ...to]`. */
+  readonly #fieldMeshes = new Map<ClientId, ClientId[]>();
   /** Each section's meshes, for the entries a mesh removal ends. */
   readonly #sectionMeshes = new Map<ClientId, ClientId[]>();
   /** Section entries ended by mesh removals this batch, reported as `null`. */
@@ -485,7 +486,7 @@ class Engine {
       return false;
     }
     this.#deferred.set(req.field, req.desc);
-    this.#fieldMeshes.set(req.field, [req.desc.on, req.desc.to]);
+    this.#fieldMeshes.set(req.field, [req.desc.on, ...req.desc.to]);
     return true;
   }
 
@@ -670,7 +671,7 @@ class Engine {
         return true;
       case "field": {
         const on = this.#fieldMeshes.get(req.field);
-        return req.op === "remove" && on !== undefined && meshes.has(on[0]) && meshes.has(on[1]);
+        return req.op === "remove" && on !== undefined && on.every((m) => meshes.has(m));
       }
       default:
         return false;
@@ -866,14 +867,14 @@ class Engine {
     this.#deferred.delete(id);
     let h: FieldHandle;
     try {
-      h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: this.#mesh(desc.to) });
+      h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
     } catch (e) {
       this.#fieldMeshes.delete(id);
       throw e;
     }
     this.#fields.set(id, h);
     this.#fieldIds.set(h, id);
-    this.#fieldMeshes.set(id, [desc.on, desc.to]);
+    this.#fieldMeshes.set(id, [desc.on, ...desc.to]);
     this.#onChunk?.({ kind: "fieldBuild", id });
     return h;
   }
@@ -923,9 +924,16 @@ class Engine {
           this.#drag = undefined;
         }
         // The scene drops the fields on or to the mesh, and its section entries.
-        for (const [field, [on, to]] of this.#fieldMeshes) {
-          if (on === req.id || to === req.id) {
+        for (const [field, [on, ...to]] of this.#fieldMeshes) {
+          if (on === req.id || (to.length === 1 && to[0] === req.id)) {
             this.#dropField(field);
+          } else if (to.includes(req.id)) {
+            // The field keeps its other targets; so does a deferred build.
+            this.#fieldMeshes.set(field, [on, ...to.filter((m) => m !== req.id)]);
+            const desc = this.#deferred.get(field);
+            if (desc !== undefined) {
+              this.#deferred.set(field, { ...desc, to: desc.to.filter((m) => m !== req.id) });
+            }
           }
         }
         for (const [section, meshes] of this.#sectionMeshes) {
@@ -989,7 +997,12 @@ class Engine {
         this.#runSection(req);
         return;
       case "query":
-        if (req.name === "fieldStatus" || req.name === "debugDump") {
+        if (
+          req.name === "fieldStatus" ||
+          req.name === "fieldNearest" ||
+          req.name === "fieldTargetStatus" ||
+          req.name === "debugDump"
+        ) {
           this.#settleFields();
         }
         b.replies.push({ qid: req.qid, ok: true, value: this.#query(req.name, req.args) });
@@ -1161,6 +1174,14 @@ class Engine {
       case "analyze": {
         const a = args as QueryMap["analyze"]["args"];
         return s.analyze(this.#mesh(a.mesh), a.options);
+      }
+      case "fieldTargetStatus": {
+        const a = args as QueryMap["fieldTargetStatus"]["args"];
+        return s.fieldTargetStatus(this.#field(a.field));
+      }
+      case "fieldNearest": {
+        const a = args as QueryMap["fieldNearest"]["args"];
+        return s.fieldNearest(this.#field(a.field));
       }
       case "fieldStatus": {
         const a = args as QueryMap["fieldStatus"]["args"];

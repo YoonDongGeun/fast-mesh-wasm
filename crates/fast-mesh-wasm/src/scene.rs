@@ -785,9 +785,10 @@ impl WasmScene {
 
     // ---- Fields and colours ----
 
-    /// Adds a signed distance field on mesh `on` to mesh `to`, given as
-    /// `[on index, on generation, to index, to generation]`, and returns
-    /// its raw id. `sign` is 0 (auto), 1 (pseudonormal) or 2 (winding).
+    /// Adds a signed distance field on mesh `on` to one or more target
+    /// meshes, given as flat pairs `[on index, on generation, to index, to
+    /// generation, ...]`, and returns its raw id. `sign` is 0 (auto), 1
+    /// (pseudonormal) or 2 (winding).
     pub fn add_distance_field(
         &mut self,
         name: String,
@@ -795,18 +796,64 @@ impl WasmScene {
         max_distance: f64,
         sign: u8,
     ) -> Result<u32, Error> {
-        let [on, to]: [MeshId; 2] = self
-            .ids(on_to)?
-            .try_into()
-            .map_err(|_| Error::invalid("a field needs two meshes"))?;
+        let mut ids = self.ids(on_to)?;
+        if ids.len() < 2 {
+            return Err(Error::invalid("a field needs two meshes"));
+        }
+        let on = ids.remove(0);
         let desc = DistanceField {
             name,
             on,
-            to,
+            to: ids,
             max_distance,
             sign: parse_sign(sign)?,
         };
         Ok(self.scene.add_distance_field(desc)?.raw())
+    }
+
+    /// What the sign data found out about each target, in index order: five
+    /// numbers per target, `[mode, closed, consistent orientation,
+    /// non-manifold vertices, degenerate triangles]` as in
+    /// [`WasmScene::field_status`].
+    pub fn field_target_status(&self, field: u32) -> Result<Vec<u32>, Error> {
+        let all = self.scene.field_target_status(self.field(field)?)?;
+        Ok(all
+            .iter()
+            .flat_map(|s| {
+                [
+                    sign_code(s.mode),
+                    u32::from(s.closed),
+                    u32::from(s.consistent_orientation),
+                    len(s.non_manifold_vertices),
+                    len(s.degenerate_triangles),
+                ]
+            })
+            .collect())
+    }
+
+    /// The field's target meshes as flat `[index, generation, ...]` pairs,
+    /// in target index order (see [`Scene::field_targets`]).
+    pub fn field_targets(&self, field: u32) -> Result<Vec<u32>, Error> {
+        Ok(self
+            .scene
+            .field_targets(self.field(field)?)?
+            .iter()
+            .flat_map(|m| [m.index(), m.generation()])
+            .collect())
+    }
+
+    /// A copy of the field's nearest-target indices, one per value (see
+    /// [`Scene::field_nearest`]): `u32::MAX` for none, including slots
+    /// added since the field's last update.
+    pub fn field_nearest(&self, field: u32) -> Result<Vec<u32>, Error> {
+        let id = self.field(field)?;
+        let slots = self.scene.field_values(id)?.len();
+        let nearest = self.scene.field_nearest(id)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(slots)
+            .map_err(|_| Error::from(fast_mesh_store::StoreError::OutOfMemory))?;
+        out.extend((0..slots).map(|v| nearest.get(v).copied().unwrap_or(u32::MAX)));
+        Ok(out)
     }
 
     /// Removes a field (and a colouring by it).
@@ -827,7 +874,8 @@ impl WasmScene {
 
     /// `[current (0/1), sign mode (1 pseudonormal, 2 winding), closed,
     /// consistent orientation, non-manifold vertices, degenerate
-    /// triangles]`.
+    /// triangles]`, the sign part over every target together (see
+    /// [`fast_mesh_scene::FieldStatus::sign`]).
     pub fn field_status(&self, field: u32) -> Result<Vec<u32>, Error> {
         let s = self.scene.field_status(self.field(field)?)?;
         let sign = s.sign;
@@ -1429,6 +1477,49 @@ mod tests {
         assert_eq!(
             code(s.find_contacts(1., Some(vec![ai, ag, bi, bg + 1]))),
             codes::UNKNOWN_MESH
+        );
+    }
+
+    #[test]
+    fn multi_target_field_bindings() {
+        let mut s = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        let (ci, cg) = octahedron(&mut s, [-2.5, 0., 0.], 1.);
+        let f = s
+            .add_distance_field("d".into(), &[ai, ag, bi, bg, ci, cg], 5., 0)
+            .unwrap();
+        assert_eq!(s.field_targets(f).unwrap(), vec![bi, bg, ci, cg]);
+        // Two closed, consistent octahedra: one status each, the same overall.
+        assert_eq!(
+            s.field_target_status(f).unwrap(),
+            vec![1, 1, 1, 0, 0, 1, 1, 1, 0, 0]
+        );
+        assert_eq!(s.field_status(f).unwrap(), vec![1, 1, 1, 1, 0, 0]);
+        // A's vertex at +x (index 0) is nearest B, the one at -x nearest C.
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
+        assert!((values[0] - 1.).abs() < 1e-6);
+        assert!((values[2] - 0.5).abs() < 1e-6);
+        let nearest = s.field_nearest(f).unwrap();
+        assert_eq!(nearest.len(), 6);
+        assert_eq!((nearest[0], nearest[2]), (0, 1));
+        // Removing C leaves B.
+        s.remove_mesh(ci, cg).unwrap();
+        assert_eq!(s.field_targets(f).unwrap(), vec![bi, bg]);
+        let nearest = s.field_nearest(f).unwrap();
+        assert_eq!((nearest[0], nearest[2]), (0, 0));
+        // One mesh alone, or an odd list, is rejected.
+        assert_eq!(
+            code(s.add_distance_field("e".into(), &[ai, ag], 1., 0)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_distance_field("e".into(), &[ai, ag, bi], 1., 0)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_distance_field("e".into(), &[ai, ag, bi, bg, bi, bg], 1., 0)),
+            codes::INVALID_ARGUMENT
         );
     }
 

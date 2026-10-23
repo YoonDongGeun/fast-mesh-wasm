@@ -185,8 +185,11 @@ describe.each([
       if (r < 0.25) {
         return null;
       }
-      const to =
+      const one =
         (r < 0.35 ? (pick(outsides) ?? pick(outsideGone)) : r < 0.45 ? pick(gone) : undefined) ?? pick(meshes)!;
+      // Several meshes (a set), sometimes one already removed.
+      const to =
+        random() < 0.3 ? [...new Set([one, pick(meshes)!, ...(random() < 0.2 ? [pick(gone) ?? one] : [])])] : one;
       return {
         distanceTo: to,
         maxDistance: pick([5, 10, Infinity])!,
@@ -219,6 +222,28 @@ describe.each([
           m,
           q < 0.3 ? { opacity: pick([0.25, 0.5, 1])! } : q < 0.45 ? { visible: random() < 0.5 } : { coloring: coloring() },
         );
+      } else if (r < 0.42) {
+        // One contact group, its members and pairs drawn from the store's
+        // meshes; or removed.
+        step = "setContactGroup";
+        const members = meshes.filter(() => random() < 0.6);
+        if (random() < 0.2) {
+          store.setContactGroup("g", null);
+        } else {
+          const pairs: [MeshHandle, MeshHandle][] = [];
+          for (const p of members) {
+            for (const q of members) {
+              if (p !== q && random() < 0.3) {
+                pairs.push([p, q]);
+              }
+            }
+          }
+          store.setContactGroup("g", {
+            meshes: members,
+            pairs: random() < 0.3 ? "all" : pairs,
+            coloring: { maxDistance: pick([5, Infinity])!, map: "turbo", range: [-1, 1] },
+          });
+        }
       } else if (r < 0.45) {
         step = "addSection";
         sections.push(

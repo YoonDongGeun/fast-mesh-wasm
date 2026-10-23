@@ -189,6 +189,36 @@ function rng(seed: number): () => number {
 }
 
 describe("WorkerScene", () => {
+  it("multi_target_field_matches_local_scene", async () => {
+    const { scene } = await start();
+    const local = new Scene();
+    const centres: Vec3[] = [
+      [0, 0, 0],
+      [1.5, 0, 0],
+      [-1.2, 0.3, 0],
+    ];
+    const [a, b, c] = centres.map((p) => scene.addMesh(sphere(p).positions, sphere(p).indices));
+    const [la, lb, lc] = centres.map((p) => local.addMesh(sphere(p).positions, sphere(p).indices));
+    const field = scene.addDistanceField({ name: "m", on: a, to: [b, c], maxDistance: 1 });
+    const want = local.addDistanceField({ name: "m", on: la, to: [lb, lc], maxDistance: 1 });
+    scene.setPlacement(c, { rotation: IDENTITY, translation: [0.2, 0, 0] });
+    local.setPlacement(lc, { rotation: IDENTITY, translation: [0.2, 0, 0] });
+    await settle(scene);
+    expect(Array.from(await scene.fetchFieldValues(field))).toEqual(Array.from(local.fieldValues(want)));
+    const nearest = await scene.fetchFieldNearest(field);
+    expect(await scene.fieldTargetStatus(field)).toEqual(local.fieldTargetStatus(want));
+    expect((await scene.fieldStatus(field)).sign).toEqual(local.fieldStatus(want).sign);
+    expect(Array.from(nearest)).toEqual(Array.from(local.fieldNearest(want)));
+    expect(Array.from(nearest)).toContain(1);
+    // A removed target leaves the field with the others.
+    scene.removeMesh(c);
+    local.removeMesh(lc);
+    await settle(scene);
+    expect(Array.from(await scene.fetchFieldValues(field))).toEqual(Array.from(local.fieldValues(want)));
+    expect(Array.from(await scene.fetchFieldNearest(field))).toEqual(Array.from(local.fieldNearest(want)));
+    local.free();
+  });
+
   it("views_mirror_engine_after_edits", async () => {
     const { scene } = await start();
     const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
