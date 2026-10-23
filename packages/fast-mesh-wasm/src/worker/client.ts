@@ -95,6 +95,20 @@ export interface WorkerSceneOptions {
    * which. An integer, clamped to 1 to {@link MAX_THREADS}.
    */
   threads?: number;
+  /**
+   * Meshes of at least this many triangles are added in the background:
+   * the Worker builds them in steps while the requests sent after them
+   * that do not need them run (toggles, edits, drags, queries of other
+   * meshes), so those do not wait for a large add. A request that names
+   * the new mesh (or a field measured to it), adds or removes a mesh, or
+   * queries every mesh waits for it, so the engine's state is the same as
+   * in arrival order; but a reply to an unrelated request sent after the
+   * add can arrive before the mesh, whose status reads `"computing"` (and
+   * whose views are empty) until it lands. Defaults to 65,536; `Infinity`
+   * turns background adds off, so every add comes back with its own
+   * batch's result. A number, 0 or more.
+   */
+  backgroundAddTriangles?: number;
 }
 
 /** The state of a request key, from {@link WorkerScene.status}. */
@@ -120,6 +134,10 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
     throw invalid(`threads must be an integer (got ${options.threads})`);
   }
   const threads = options.threads === undefined ? undefined : Math.min(Math.max(options.threads, 1), MAX_THREADS);
+  const background = options.backgroundAddTriangles;
+  if (background !== undefined && (typeof background !== "number" || Number.isNaN(background) || background < 0)) {
+    throw invalid(`backgroundAddTriangles must be a number, 0 or more (got ${String(background)})`);
+  }
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
@@ -129,7 +147,12 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   const dev = (import.meta as { env?: { DEV?: boolean } }).env?.DEV === true;
   const [scene, started] = createScene(make, {
     debug: options.debug ?? false,
-    init: { kind: "init", threads, debug: (options.debug ?? false) || dev },
+    init: {
+      kind: "init",
+      threads,
+      debug: (options.debug ?? false) || dev,
+      ...(background === undefined ? {} : { backgroundAddTriangles: background }),
+    },
   });
   try {
     await started;

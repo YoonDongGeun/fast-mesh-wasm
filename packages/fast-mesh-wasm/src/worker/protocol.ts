@@ -265,6 +265,8 @@ export interface InitMessage {
   threads?: number;
   debug: boolean;
   crashChannel?: string;
+  /** `WorkerSceneOptions.backgroundAddTriangles`, when set. */
+  backgroundAddTriangles?: number;
 }
 
 /**

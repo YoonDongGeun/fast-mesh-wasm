@@ -45,6 +45,7 @@ import {
   type WorkerMessage,
 } from "./protocol.js";
 
+import type { WorkerSceneOptions } from "./client.js";
 import { PoolStartError } from "./load.js";
 
 // The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js).
@@ -114,13 +115,17 @@ export interface EngineOptions {
    * Meshes of at least this many triangles are added in the background
    * ({@link BACKGROUND_ADD_TRIANGLES} by default): see
    * {@link Engine.#beginAdd}. `0` adds every mesh so (tests);
-   * `Infinity` none.
+   * `Infinity` none. NaN keeps the default; a negative value counts as 0.
+   * The init message's `backgroundAddTriangles`
+   * ({@link WorkerSceneOptions.backgroundAddTriangles}) overrides it in
+   * {@link serveEngine}.
    */
   backgroundAddTriangles?: number;
   /**
    * The work of one step of a background add's BVH build
    * ({@link ADD_STEP_WORK} by default): a triangle's box, or a triangle
-   * visited per tree level.
+   * visited per tree level. Clamped to 1 to 2^32 − 1; NaN or less than 1
+   * keeps the default.
    */
   addStepWork?: number;
 }
@@ -196,6 +201,8 @@ export function serveEngine(
 ): void {
   let deliver: ((batch: Request[]) => void) | undefined;
   let started = typeof ready !== "function";
+  /** The engine's options, with the scene's from its init message. */
+  let engineOptions = options;
   const early: Request[][] = [];
   /** Set once the start failed with a `PoolStartError`: batches go back. */
   let giveBack = false;
@@ -229,7 +236,7 @@ export function serveEngine(
               }
             },
           },
-          options,
+          engineOptions,
         );
       },
       (e: unknown) => {
@@ -254,6 +261,9 @@ export function serveEngine(
       // Only the first starts the engine (and its thread pool, once per Worker).
       if (!started && typeof ready === "function") {
         started = true;
+        if (data.backgroundAddTriangles !== undefined) {
+          engineOptions = { ...options, backgroundAddTriangles: data.backgroundAddTriangles };
+        }
         serve(new Promise<Started>((resolve) => resolve(ready(data))));
       }
     } else if (giveBack) {
@@ -496,8 +506,12 @@ class Engine {
     const points = Math.floor(options.stepPoints ?? STEP_POINTS);
     this.#stepPoints = points >= 1 ? Math.min(points, ALL_POINTS) : 1;
     this.#staleGuardMs = options.staleGuardMs ?? STALE_GUARD_MS;
-    this.#backgroundAdd = options.backgroundAddTriangles ?? BACKGROUND_ADD_TRIANGLES;
-    this.#addStepWork = Math.max(1, Math.floor(options.addStepWork ?? ADD_STEP_WORK));
+    // NaN keeps the default, a negative threshold counts as 0, Infinity turns it off.
+    const bg = options.backgroundAddTriangles;
+    this.#backgroundAdd = bg === undefined || Number.isNaN(bg) ? BACKGROUND_ADD_TRIANGLES : Math.max(0, bg);
+    // At least one unit a step (NaN or below 1: the default); at most what one call takes.
+    const work = Math.floor(options.addStepWork ?? ADD_STEP_WORK);
+    this.#addStepWork = work >= 1 ? Math.min(work, ALL_POINTS) : ADD_STEP_WORK;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
   }

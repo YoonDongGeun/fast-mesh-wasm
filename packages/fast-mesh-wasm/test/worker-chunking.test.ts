@@ -229,7 +229,7 @@ type Posted = { update: boolean; result: Result };
  * The engine in-process with background adds for meshes of 2000 triangles or more (BIG, not A or B) in
  * small steps, and an update channel.
  */
-function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: number } = {}) {
+function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: number; addStepWork?: number } = {}) {
   const posted: Posted[] = [];
   const chunks: { kind: string; id?: ClientId }[] = [];
   const waiting: (() => void)[] = [];
@@ -274,7 +274,7 @@ function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: numb
     {
       debug: true,
       yieldMs: 0,
-      addStepWork: 64,
+      addStepWork: options.addStepWork ?? 64,
       stepPoints: options.stepPoints,
       backgroundAddTriangles: options.backgroundAddTriangles ?? 2000,
       onChunk: (chunk) => {
@@ -349,6 +349,38 @@ describe("background adds", () => {
     expect(Buffer.from(bytes?.indices as ArrayBuffer).equals(Buffer.from(ref.indices.buffer))).toBe(true);
     expect(Buffer.from(bytes?.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
     expect(u.placements.map((p) => p.id)).toEqual([3]);
+  });
+
+  it("add_step_work_is_clamped", async () => {
+    // Review M1: an unbounded step (Infinity) builds the whole mesh in one
+    // step instead of wrapping to nothing; NaN and values below 1 fall back
+    // to the default (100,000 units: one step for this mesh too); 2 units
+    // take many steps.
+    for (const addStepWork of [Number.POSITIVE_INFINITY, 2 ** 40, Number.NaN, -5, 2]) {
+      const h = addEngine({ addStepWork });
+      h.send([addMeshReq(1, A)]);
+      await h.until(() => h.results().length === 1);
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.chunks.some((c) => c.kind === "addMesh" && c.id === 3));
+      const steps = h.chunks.filter((c) => c.kind === "addMeshStep").length;
+      if (addStepWork === 2) {
+        expect(steps).toBeGreaterThan(100);
+      } else {
+        expect(steps, `${addStepWork}`).toBe(1);
+      }
+    }
+  });
+
+  it("background_add_threshold_is_validated", async () => {
+    // NaN keeps the default; a negative threshold counts as 0 (every add).
+    const h = addEngine({ backgroundAddTriangles: Number.NaN });
+    h.send([addMeshReq(1, BIG)]);
+    await h.until(() => h.results().length === 1);
+    expect(h.chunks.some((c) => c.kind === "addMeshBegin")).toBe(false);
+    const g = addEngine({ backgroundAddTriangles: -1 });
+    g.send([addMeshReq(1, A)]);
+    await g.until(() => g.chunks.some((c) => c.kind === "addMesh"));
+    expect(g.chunks.some((c) => c.kind === "addMeshBegin")).toBe(true);
   });
 
   it("dependent_requests_wait_for_the_add", async () => {
