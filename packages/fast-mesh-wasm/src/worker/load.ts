@@ -1,9 +1,11 @@
 // Which WebAssembly artifact the Worker runs: the threaded one (dist/wasm-threads,
 // with a rayon pool of Workers sharing its memory) on cross-origin isolated
-// pages, else the single-threaded one (dist/wasm). A failure importing or
-// instantiating the threaded glue (say its 4 GiB-maximum shared memory cannot
-// be allocated) falls back to the single-threaded engine in this Worker. A
-// pool that fails or never starts leaves a live threaded instance and nested
+// pages, else the single-threaded one (dist/wasm). A browser that cannot share
+// a growing memory between threads (WebKit 26, see probe.ts) is detected
+// before the threaded glue is imported, and gets the single-threaded engine
+// right away. A failure importing or instantiating the threaded glue (say its
+// 4 GiB-maximum shared memory cannot be allocated) falls back to the
+// single-threaded engine in this Worker too. A pool that fails or never starts leaves a live threaded instance and nested
 // Workers behind, so it rejects with a `PoolStartError` instead: the Worker
 // reports it, and the scene replaces the Worker with a single-threaded one
 // (see `serveEngine`). Once a pool runs, its threads are watched for crashes
@@ -13,6 +15,7 @@
 import { setMemory } from "../core.js";
 import { useWasmScene } from "../scene.js";
 import type { WasmScene } from "../wasm/fast_mesh_wasm.js";
+import { probeSharedGrowth } from "./probe.js";
 import type { InitMessage } from "./protocol.js";
 
 /** What the engine needs of a wasm-bindgen glue module. */
@@ -50,6 +53,13 @@ export interface LoadOptions {
   poolTimeoutMs?: number;
   /** The channel the pool's threads report a crash on (see {@link ThreadedGlue.watchPoolCrashes}). */
   crashChannel?: string;
+  /**
+   * Run before the threaded engine is tried: resolves with why it must not
+   * run in this browser, or `undefined` when it may (see
+   * {@link probeSharedGrowth}, {@link startEngine}'s default). A rejection
+   * counts as `undefined`.
+   */
+  probe?: () => Promise<string | undefined>;
 }
 
 /**
@@ -94,11 +104,19 @@ export async function loadEngine(
   const { threads, warn } = options;
   if (threads !== 1 && options.isolated) {
     let started: { wasm: ThreadedGlue; memory: WebAssembly.Memory } | undefined;
-    try {
-      const glue = await options.importThreaded();
-      started = { wasm: glue, memory: (await glue.default()).memory };
-    } catch (e) {
-      warn?.(failed(e));
+    const broken = await options.probe?.().catch(() => undefined);
+    if (broken !== undefined) {
+      // Nothing threaded loaded yet: this Worker runs single-threaded itself.
+      warn?.(
+        `fast-mesh-wasm: the multithreaded engine cannot run in this browser (${broken}); running single-threaded. ${SEE}`,
+      );
+    } else {
+      try {
+        const glue = await options.importThreaded();
+        started = { wasm: glue, memory: (await glue.default()).memory };
+      } catch (e) {
+        warn?.(failed(e));
+      }
     }
     if (started !== undefined) {
       try {
@@ -148,7 +166,8 @@ function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 /**
  * Starts the Worker's engine for its {@link InitMessage}: loads the glue
- * ({@link loadEngine}) and makes scenes use it. `isolated` defaults to the
+ * ({@link loadEngine}, probing with {@link probeSharedGrowth} unless
+ * `loaders` names a probe) and makes scenes use it. `isolated` defaults to the
  * global `crossOriginIsolated`; development warnings are collected only on a
  * page (where it is a boolean; Node `worker_threads` has none) and when
  * `debug` is set. Resolves with what the ready message reports; rejects
@@ -157,7 +176,7 @@ function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  */
 export async function startEngine(
   init: InitMessage,
-  loaders: Pick<LoadOptions, "importThreaded" | "importSingle" | "poolTimeoutMs">,
+  loaders: Pick<LoadOptions, "importThreaded" | "importSingle" | "poolTimeoutMs" | "probe">,
   isolated: boolean | undefined = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated,
 ): Promise<{ threads: number; warning?: string }> {
   let warning: string | undefined;
@@ -165,6 +184,7 @@ export async function startEngine(
   let loaded: Awaited<ReturnType<typeof loadEngine>>;
   try {
     loaded = await loadEngine({
+      probe: () => probeSharedGrowth(),
       ...loaders,
       // `navigator` is missing in some hosts (older Node `worker_threads`).
       threads: init.threads ?? defaultThreads((globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator),

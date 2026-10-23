@@ -27,6 +27,10 @@
 //   with a new pool (threads > 1, it recolours, a drag back gives the first
 //   colours bit for bit); Chrome only: the old Worker and its pool are gone,
 //   and none is left after `terminate()`.
+// - start: a threaded scene in debug on the package's Worker script. With
+//   threads > 1 it warns nothing; single-threaded (a browser whose shared
+//   memory breaks across threads, as WebKit 26) it is ready within 2 s, warns
+//   once that the engine cannot run in this browser, and works.
 // - nested: the pool's nested Workers cannot load; the scene starts
 //   single-threaded (after the pool timeout), warns once and works.
 // - poolCrash: a thread of a threaded scene's pool panics, then (a second
@@ -56,7 +60,7 @@ const option = (name, fallback) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const browserName = option("--browser", "chrome");
-const only = option("--only", "headers,page,compare,memory,restart,nested,poolCrash").split(",");
+const only = option("--only", "headers,page,compare,memory,restart,start,nested,poolCrash").split(",");
 const named = (check) => argv.includes("--only") && only.includes(check);
 const verbose = flag("--verbose");
 const threadsOpt = option("--threads", undefined);
@@ -305,6 +309,19 @@ try {
         open.threads > 1 && r.threads > 1 && r.poisoned === "INSTANCE_POISONED" && r.workersMade === 2 && r.recoloured && r.backToFirst && counts,
         `recoloured ${r.recoloured}, back to the first colours ${r.backToFirst}${browser.workers ? `, Workers ${opened} -> ${after} -> ${closed}` : ""}`,
       );
+    }
+
+    if (only.includes("start")) {
+      const r = await call("start", { threads });
+      console.log(`  ready after ${fmt(r.readyMs)} ms, threads ${r.threads}, works ${r.works}`);
+      for (const w of r.warnings) {
+        console.log(`  warned: ${w}`);
+      }
+      const ok =
+        r.threads > 1
+          ? r.warnings.length === 0
+          : r.readyMs < 2000 && r.warnings.length === 1 && /cannot run in this browser/.test(r.warnings[0]);
+      verdict("start", ok && r.works, `threads ${r.threads} after ${fmt(r.readyMs)} ms, ${r.warnings.length} warning(s)`);
     }
 
     if (only.includes("nested")) {

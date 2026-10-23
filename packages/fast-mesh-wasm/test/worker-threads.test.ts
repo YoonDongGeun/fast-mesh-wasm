@@ -187,6 +187,59 @@ describe("loadEngine", () => {
     }
   });
 
+  it("broken_shared_growth_skips_threaded", async () => {
+    // The probe saw the browser trap on a memory another thread grew (WebKit
+    // 26): the threaded files are never fetched and nothing threaded is left
+    // behind, so this Worker runs single-threaded itself, without waiting for
+    // a pool that would never start.
+    const log: string[] = [];
+    const l = loaders(log);
+    const warn = vi.fn();
+    const probe = vi.fn(async () => "fill traps after another thread grew the memory");
+    const got = await loadEngine({ threads: 4, isolated: true, ...l, warn, probe });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(got.threads).toBe(1);
+    expect(got.wasm).toBe(l.single.glue);
+    expect(log).toEqual(["importSingle", "single.init"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/fill traps after another thread grew the memory/);
+    expect(warn.mock.calls[0][0]).toMatch(/single-threaded/);
+    expect(warn.mock.calls[0][0]).toMatch(/Multithreading \(COOP\/COEP\)/);
+    // Silent without `warn`.
+    expect((await loadEngine({ threads: 4, isolated: true, ...loaders([]), probe })).threads).toBe(1);
+  });
+
+  it("inconclusive_probe_tries_threaded", async () => {
+    const probes: Record<string, () => Promise<string | undefined>> = {
+      healthy: async () => undefined,
+      failed: async () => {
+        throw new Error("probe crashed");
+      },
+    };
+    for (const [name, probe] of Object.entries(probes)) {
+      const log: string[] = [];
+      const warn = vi.fn();
+      const got = await loadEngine({ threads: 4, isolated: true, ...loaders(log), warn, probe });
+      expect(got.threads, name).toBe(4);
+      expect(log, name).toEqual(["importThreaded", "threaded.init", "threaded.pool(4)"]);
+      expect(warn, name).not.toHaveBeenCalled();
+    }
+  });
+
+  it("probe_only_before_threaded", async () => {
+    // Not run when the threaded engine is not tried at all.
+    const probe = vi.fn(async () => "broken");
+    await loadEngine({ threads: 1, isolated: true, ...loaders([]), probe });
+    await loadEngine({ threads: 4, isolated: false, ...loaders([]), probe });
+    expect(probe).not.toHaveBeenCalled();
+    // startEngine passes an injected probe on.
+    const log: string[] = [];
+    const got = await startEngine({ kind: "init", threads: 4, debug: true }, { ...loaders(log), probe }, true);
+    expect(got.threads).toBe(1);
+    expect(got.warning).toMatch(/broken/);
+    expect(log).toEqual(["importSingle", "single.init"]);
+  });
+
   it("start_engine_warnings", async () => {
     // The production path: no `debug`, not isolated, so single-threaded and
     // silent.
