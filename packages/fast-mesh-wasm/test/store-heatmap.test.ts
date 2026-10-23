@@ -244,7 +244,7 @@ interface Fixture {
   fieldAdds(): number;
   colorings(): number;
   /** The values of a field added straight to the scene (on `a`, to `b`), then removed. */
-  freshValues(a: MeshHandle, b: MeshHandle, maxDistance: number): Promise<Float32Array>;
+  freshValues(a: MeshHandle, b: MeshHandle | MeshHandle[], maxDistance: number): Promise<Float32Array>;
 }
 
 async function makeLocal(): Promise<Fixture> {
@@ -372,6 +372,29 @@ describe.each([
     await expect(store.fetchColoringValues(c)).resolves.toBeNull();
     store.removeMesh(c);
     await expect(store.fetchColoringValues(c)).rejects.toMatchObject({ code: "UNKNOWN_MESH" });
+  });
+
+  it("fetch_coloring_values_of_a_contact_group", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b, c } = nested(store);
+    await settle(store);
+    // Every member measured to both others: the owned field is multi-target.
+    const heat = contactHeatmap({ depth: 0.5, gap: 1, exactDepth: true });
+    store.setContactGroup("g", { meshes: [a, b, c], coloring: heat });
+    await settle(store);
+    const values = await store.fetchColoringValues(a);
+    expect(values).toBeInstanceOf(Float32Array);
+    expect(Array.from(values!)).toEqual(Array.from(await f.freshValues(a, [b, c], Infinity)));
+    expect(values![0]).toBeCloseTo(-1, 5);
+    expect(Array.from((await store.fetchColoringValues(c))!)).toEqual(
+      Array.from(await f.freshValues(c, [a, b], Infinity)),
+    );
+    // The group removed: its fields go, and nothing is coloured.
+    store.setContactGroup("g", null);
+    await settle(store);
+    await expect(store.fetchColoringValues(a)).resolves.toBeNull();
+    await expect(store.fetchColoringValues(c)).resolves.toBeNull();
   });
 
   it("exact_depth_colours_deep_interior", async () => {
