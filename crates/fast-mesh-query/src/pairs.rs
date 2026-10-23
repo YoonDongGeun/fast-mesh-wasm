@@ -1110,14 +1110,11 @@ fn triangles_near_limited_with<const N: usize>(
     Ok(true)
 }
 
-/// Triangles (of both meshes) per part of a [`NearSearch`]: the node-pair
-/// tree is split into about this many triangles per part, but at least
-/// [`PAR_PARTS`] and at most [`NEAR_MAX_PARTS`] parts.
-const NEAR_PART_TRIS: usize = 512;
-
-/// The most parts a [`NearSearch`] splits into: splitting is one pass per
-/// level over the parts so far, done when the search starts.
-const NEAR_MAX_PARTS: usize = 1 << 16;
+/// Triangle pairs per part of a [`NearSearch`], at most (as estimated): a
+/// node pair is split until the product of its two sides' triangle counts
+/// is no larger, so that searching a part takes a bounded time even where
+/// every pair is near (about 5 ms single-threaded on the i5-13600K).
+const NEAR_PART_PAIRS: u64 = 1 << 18;
 
 /// What a triangle pair test counts for in a [`NearSearch::step`] budget,
 /// against one node pair test (a box distance).
@@ -1150,11 +1147,16 @@ impl Stamp {
 /// [`triangles_near_limited`] cut into steps, so that a caller can yield
 /// between them.
 ///
-/// It splits the pairs of the two BVHs' nodes into parts when it starts, as
-/// the parallel search does, and each [`NearSearch::step`] searches whole
-/// parts until it has tested a given number of triangle pairs. The parts
-/// partition the leaf pairs, so every near pair is found in exactly one of
-/// them, and the near pairs are counted against the limit across parts. The
+/// It works through a list of node pairs of the two BVHs, starting with the
+/// roots: each [`NearSearch::step`] splits the large pairs it takes (the
+/// side with more triangles, dropping children beyond the margin as the
+/// traversal does) and searches the parts small enough, whole, until it has
+/// done a given amount of work. A side's triangle count is estimated from
+/// its depth (each level halves it), so the split does not depend on
+/// anything but the trees.
+/// The parts partition the leaf pairs, so every near pair is found in
+/// exactly one of them, and the near pairs are counted against the limit
+/// across parts. The
 /// result ([`NearSearch::finish`]) is therefore the same as from
 /// [`triangles_near_limited`]: whether more than `limit` pairs are near, and
 /// otherwise the same sorted triangles of A. With the `parallel` feature a
@@ -1170,11 +1172,12 @@ pub struct NearSearch {
     margin: f64,
     m: f64,
     limit: usize,
-    parts: Vec<(NodeId, NodeId)>,
-    /// The first part not searched yet.
-    next: usize,
+    /// The node pairs left, with each side's depth; any order.
+    parts: Vec<(NodeId, NodeId, u32, u32)>,
+    /// The two meshes' triangle counts.
+    tris: [u64; 2],
     /// The triangles of A found so far, each part's sorted without
-    /// duplicates, in part order.
+    /// duplicates, in the order the parts were searched.
     near: Vec<TriangleId>,
     /// Near pairs found so far.
     found: usize,
@@ -1185,7 +1188,7 @@ pub struct NearSearch {
 impl NearSearch {
     /// A search for the triangles of A within `margin` of B, with B placed
     /// in A's space by `xf`, giving up past `limit` near pairs, as
-    /// [`triangles_near_limited`]. Splits the node pairs into parts.
+    /// [`triangles_near_limited`].
     ///
     /// # Errors
     /// As for [`triangles_near_limited`].
@@ -1213,9 +1216,12 @@ impl NearSearch {
             let d = box_distance(p, q);
             (!beyond(d, margin, m)).then_some(d)
         };
-        let tris = mesh_a.triangle_count() + mesh_b.triangle_count();
-        let target = PAR_PARTS.max(tris / NEAR_PART_TRIS).min(NEAR_MAX_PARTS);
-        let parts = split_pairs(bvh_a, bvh_b, xf, &key, target)?;
+        let tris = [mesh_a.triangle_count(), mesh_b.triangle_count()].map(|n| n as u64);
+        let mut parts = Vec::new();
+        // The roots, unless already beyond the margin (as `split_pairs`).
+        let roots = split_pairs(bvh_a, bvh_b, xf, &key, 1)?;
+        parts.try_reserve(roots.len()).map_err(|_| oom())?;
+        parts.extend(roots.into_iter().map(|(a, b)| (a, b, 0, 0)));
         Ok(NearSearch {
             stamps: [Stamp::of(mesh_a, bvh_a), Stamp::of(mesh_b, bvh_b)],
             xf: *xf,
@@ -1223,7 +1229,7 @@ impl NearSearch {
             m,
             limit,
             parts,
-            next: 0,
+            tris,
             near: Vec::new(),
             found: 0,
             over: false,
@@ -1232,7 +1238,7 @@ impl NearSearch {
 
     /// Whether every part is searched, or the limit is passed.
     pub fn is_done(&self) -> bool {
-        self.over || self.next == self.parts.len()
+        self.over || self.parts.is_empty()
     }
 
     /// Searches whole parts until about `budget` units of work are done (at
@@ -1270,13 +1276,49 @@ impl NearSearch {
             1
         };
         let mut tested = 0usize;
-        while !self.is_done() && (tested < budget.max(1) || tested == 0) {
-            let end = self.parts.len().min(self.next + batch);
+        let mut ready = Vec::new();
+        ready.try_reserve(batch).map_err(|_| oom())?;
+        while !self.is_done() && tested < budget.max(1) {
+            // Up to `batch` parts small enough to search; larger ones split.
+            ready.clear();
+            while ready.len() < batch
+                && let Some((pa, pb, da, db)) = self.parts.pop()
+            {
+                let est = |n: u64, d: u32| n.checked_shr(d).unwrap_or(0).max(1);
+                let (ea, eb) = (est(self.tris[0], da), est(self.tris[1], db));
+                let inner = |bvh: &Bvh, id: NodeId| match bvh.node(id).kind {
+                    NodeKind::Inner { left, right } => Some([left, right]),
+                    NodeKind::Leaf { .. } => None,
+                };
+                let (ka, kb) = (inner(bvh_a, pa), inner(bvh_b, pb));
+                // The larger side, or the other when it is a leaf.
+                let side = match (ka, kb) {
+                    _ if ea.saturating_mul(eb) <= NEAR_PART_PAIRS => None,
+                    (Some(c), Some(_)) if ea >= eb => Some((true, c)),
+                    (_, Some(c)) => Some((false, c)),
+                    (Some(c), None) => Some((true, c)),
+                    (None, None) => None,
+                };
+                let Some((split_a, children)) = side else {
+                    ready.push((pa, pb));
+                    continue;
+                };
+                tested += 2;
+                self.parts.try_reserve(2).map_err(|_| oom())?;
+                for c in children {
+                    let (na, nb) = if split_a { (c, pb) } else { (pa, c) };
+                    let b_box = xf.transform_box(&bvh_b.node(nb).bounds);
+                    if key(&bvh_a.node(na).bounds, &b_box).is_some() {
+                        let (da, db) = if split_a { (da + 1, db) } else { (da, db + 1) };
+                        self.parts.push((na, nb, da, db));
+                    }
+                }
+            }
             let found_pairs = AtomicUsize::new(self.found);
             let work_done = AtomicUsize::new(0);
             // Each part's triangles of A, sorted without duplicates, or
             // `None` when it stopped at the limit.
-            let parts = par::map_chunks(&self.parts[self.next..end], 1, 0, oom, |_, part| {
+            let parts = par::map_chunks(&ready, 1, 0, oom, |_, part| {
                 let mut near_a = Vec::new();
                 let mut failed = None;
                 let mut limited = false;
@@ -1341,7 +1383,6 @@ impl NearSearch {
                     None => self.over = true,
                 }
             }
-            self.next = end;
             if self.over {
                 self.near = Vec::new();
             }
@@ -2836,16 +2877,21 @@ mod tests {
         for limit in [usize::MAX, total, total - 1, 100] {
             let want = one_call(limit);
             for budget in [1, 500, usize::MAX] {
-                let (got, steps) = assert_parallel_identical("stepped near search", || {
+                let got = assert_parallel_identical("stepped near search", || {
                     let mut a = Vec::new();
-                    let (ok, steps) =
-                        stepped_near(&ma, &ba, &ma, &ba, &xf, 0.5, limit, budget, &mut a);
-                    ((ok, a), steps.min(2))
+                    let (ok, _) = stepped_near(&ma, &ba, &ma, &ba, &xf, 0.5, limit, budget, &mut a);
+                    (ok, a)
                 });
                 assert_eq!(got, want, "limit {limit}, budget {budget}");
                 if budget == 1 && limit == usize::MAX {
-                    assert_eq!(steps, 2, "searched in several steps");
                     assert_eq!(got.1, full);
+                    // One part at a time without the pool: several steps.
+                    fast_mesh_store::par::set_force_sequential(true);
+                    let mut a = Vec::new();
+                    let (_, steps) =
+                        stepped_near(&ma, &ba, &ma, &ba, &xf, 0.5, limit, budget, &mut a);
+                    fast_mesh_store::par::set_force_sequential(false);
+                    assert!(steps > 10, "{steps} steps");
                 }
             }
         }
@@ -2853,9 +2899,10 @@ mod tests {
 
     #[test]
     fn stepped_near_search_refuses_other_meshes() {
-        let ma = wavy(12);
+        // Large enough for several parts per step's batch on the pool.
+        let ma = wavy(120);
         let ba = build(&ma, Quality::Sah);
-        let mut mb = wavy(12);
+        let mut mb = wavy(120);
         let mut bb = build(&mb, Quality::Sah);
         let xf = Rigid::IDENTITY;
         let mut search = NearSearch::new(&ma, &ba, &mb, &bb, &xf, 0.5, usize::MAX).unwrap();
