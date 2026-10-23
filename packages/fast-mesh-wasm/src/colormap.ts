@@ -13,17 +13,22 @@
 // across a triangle the colour follows the value per pixel, and a range
 // edge is an exact iso-line of the interpolated value.
 //
-// Encoding (one `vec2` attribute per vertex: value, NaN flag):
-// - a finite value is passed as is, so the iso-lines between finite
-//   vertices (the range ends, the contact band's edges) are exact;
-// - `+Infinity` (a distance field's "far") becomes `hi + FAR_SPAN · (hi - lo)`
-//   and `-Infinity` becomes `lo - FAR_SPAN · (hi - lo)`: finite values
-//   beyond the range, which colour like the infinity at the vertex (`above`
-//   / `below`) and interpolate towards it, so a far vertex tints nothing
-//   inside the range beyond the iso-line `v = hi`;
-// - NaN sets the flag (and takes the far value): fragments where the
-//   interpolated flag exceeds 1/2 show the rule's NaN colour, so a NaN vertex
-//   colours at most half of its triangles.
+// Encoding: one `vec4` attribute per vertex, `(v · m, m, nan, far)`, where
+// `m` is 1 for a finite value and 0 otherwise, `nan` is 1 for NaN, and `far`
+// is +1 for `+Infinity` and -1 for `-Infinity` (0 otherwise). Interpolated
+// across a triangle, `m` is the weight of its finite vertices, and the
+// fragment renormalises over them:
+// - where that weight is at least 1/2, the fragment shows the colour of
+//   `(v · m) / m`, the value interpolated over the finite vertices alone.
+//   Between finite vertices it is the plain interpolated value, so the
+//   iso-lines there (the range ends, the contact band's edges) are exact,
+//   and at a finite vertex it is that vertex's value;
+// - elsewhere (nearer the non-finite vertices) it shows the NaN colour where
+//   the NaN weight beats the far weight, else the colour of `+Infinity`
+//   (`above`) or `-Infinity` (`below`) by the sign of the far term.
+// A far or NaN vertex so never drags its neighbours' values through other
+// colours (a deep penetration next to a far vertex shows no contact or gap
+// colours): the switch is a hard edge half way between them.
 //
 // Softness: with `edgeSoftness` s > 0 a fragment shows the mean colour of
 // the values in [v - s/2, v + s/2] (a box filter in distance units, on sRGB
@@ -69,8 +74,8 @@ export const LUT_ROWS = 4;
  * through the running integral (row 2); a narrower one sums its entries.
  */
 export const PREFIX_MIN_ENTRIES = 16;
-/** `+Infinity` encodes as `hi + FAR_SPAN · (hi - lo)`, `-Infinity` as `lo - FAR_SPAN · (hi - lo)`. */
-export const FAR_SPAN = 1;
+/** Floats per vertex of the shading attribute: `(v · m, m, nan, far)`. */
+export const ATTRIBUTE_SIZE = 4;
 
 /**
  * The engine's built-in tables (RGB; alpha is 255), base64: Turbo, Viridis
@@ -208,22 +213,16 @@ export function shadingOf(rule: ColorRule): Shading {
 
 /**
  * Writes the attribute of `values[from, to)` (see the notes at the top) into
- * `out` from element `2 · from`: `(value, NaN flag)` per vertex.
+ * `out` from element `4 · from`: `(v · m, m, nan, far)` per vertex.
  */
-export function encodeValues(
-  s: Pick<Shading, "range">,
-  values: ArrayLike<number>,
-  out: Float32Array,
-  from: number,
-  to: number,
-): void {
-  const [lo, hi] = s.range;
-  const span = FAR_SPAN * (hi - lo);
+export function encodeValues(values: ArrayLike<number>, out: Float32Array, from: number, to: number): void {
   for (let i = from; i < to; i++) {
     const v = values[i];
-    const nan = Number.isNaN(v);
-    out[2 * i] = nan || v === Infinity ? hi + span : v === -Infinity ? lo - span : v;
-    out[2 * i + 1] = nan ? 1 : 0;
+    const finite = Number.isFinite(v);
+    out[4 * i] = finite ? v : 0;
+    out[4 * i + 1] = finite ? 1 : 0;
+    out[4 * i + 2] = Number.isNaN(v) ? 1 : 0;
+    out[4 * i + 3] = v === Infinity ? 1 : v === -Infinity ? -1 : 0;
   }
 }
 
@@ -395,25 +394,39 @@ function linear(s: Shading, c: Vec4): Vec4 {
   return out;
 }
 
+/** The colour of `+Infinity` (`sign >= 0`, `above`) or `-Infinity` (`below`), in sRGB bytes. */
+function farBytes(s: Shading, sign: number): Vec4 {
+  const base = sign >= 0 ? s.aboveBase : s.belowBase;
+  const c: Vec4 = base ? [...s.base] : colorAt(s, sign >= 0 ? 1 : 0);
+  return [roundByte(c[0]), roundByte(c[1]), roundByte(c[2]), roundByte(c[3])];
+}
+
 /**
- * The linear RGBA the shader gives the interpolated attribute
- * `(value, nanFlag)` at edge softness `softness`: the reference the GLSL
- * mirrors. With softness 0 at a vertex it is that vertex's colour in vertex
- * shading (`SRGB_TO_LINEAR16[color_of] / 65535`, alpha `/ 255`).
+ * The linear RGBA the shader gives the interpolated attribute `a`
+ * (`(v · m, m, nan, far)`, see the notes at the top) at edge softness
+ * `softness`: the reference the GLSL mirrors. At a vertex with softness 0
+ * it is that vertex's colour in vertex shading
+ * (`SRGB_TO_LINEAR16[color_of] / 65535`, alpha `/ 255`).
  */
-export function shadeReference(s: Shading, value: number, nanFlag: number, softness: number): Vec4 {
-  if (nanFlag > 0.5) {
+export function shadeReference(s: Shading, a: ArrayLike<number>, softness: number): Vec4 {
+  const w = a[1];
+  if (w >= 0.5) {
+    const v = f(a[0] / w);
+    return linear(s, softness > 0 ? softBytes(s, v, softness / 2) : exactBytes(s, v));
+  }
+  const far = 1 - w - a[2];
+  if (a[2] > far) {
     return linear(s, [...s.nan]);
   }
-  return linear(s, softness > 0 ? softBytes(s, value, softness / 2) : exactBytes(s, value));
+  return linear(s, farBytes(s, a[3]));
 }
 
 // ---- The GLSL (GLSL ES 3.0, as three compiles its materials) ----
 
 /** Declarations for the vertex shader: the attribute and its varying. */
 export const SHADING_VERTEX = /* glsl */ `
-attribute vec2 fmValue;
-varying vec2 vFmValue;
+attribute vec4 fmValue;
+varying vec4 vFmValue;
 `;
 
 /**
@@ -422,7 +435,7 @@ varying vec2 vFmValue;
  * function of the same name above (`fmColorAt` = `colorAt`, ...).
  */
 export const SHADING_FRAGMENT = /* glsl */ `
-varying vec2 vFmValue;
+varying vec4 vFmValue;
 uniform highp sampler2D fmLut;
 uniform int fmCount;
 uniform bool fmBuiltin;
@@ -577,10 +590,20 @@ vec4 fmLinear(vec4 c) {
   return o;
 }
 
-vec4 fmShade(vec2 value) {
-  if (value.y > 0.5) {
+vec4 fmFar(float sign) {
+  bool base = sign >= 0.0 ? fmAboveBase : fmBelowBase;
+  return base ? fmBase : fmRound(fmColorAt(sign >= 0.0 ? 1.0 : 0.0));
+}
+
+vec4 fmShade(vec4 a) {
+  float w = a.y;
+  if (w >= 0.5) {
+    float v = a.x / w;
+    return fmLinear(fmSoftness > 0.0 ? fmSoft(v, 0.5 * fmSoftness) : fmExact(v));
+  }
+  if (a.z > 1.0 - w - a.z) {
     return fmLinear(fmNan);
   }
-  return fmLinear(fmSoftness > 0.0 ? fmSoft(value.x, 0.5 * fmSoftness) : fmExact(value.x));
+  return fmLinear(fmFar(a.w));
 }
 `;

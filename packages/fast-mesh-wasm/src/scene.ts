@@ -4,9 +4,9 @@
 // panic poisoning).
 import type { Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
-import { DEFAULT_BASE, DEFAULT_NAN } from "./colormap.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
+import { copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
@@ -560,8 +560,6 @@ function modeCode(mode: UpdateMode): number {
 
 const CULLS = { none: 0, back: 1, front: 2 } as const;
 const SIGNS: Record<SignMode, number> = { auto: 0, pseudonormal: 1, winding: 2 };
-const MAPS = { turbo: 0, viridis: 1, coolwarm: 2, grayscale: 3 } as const;
-const OUT_OF_RANGE: Record<OutOfRange, number> = { clamp: 0, base: 1 };
 
 /** The code of a string option in `table`, or `INVALID_ARGUMENT` naming `what`. */
 function codeIn(table: Record<string, number>, value: string, what: string): number {
@@ -574,56 +572,6 @@ function codeIn(table: Record<string, number>, value: string, what: string): num
 /** Three numbers of a flat result, from `at`. */
 function vec3At(a: Float64Array, at: number): Vec3 {
   return [a[at], a[at + 1], a[at + 2]];
-}
-
-/**
- * A colour rule as the binding's `(map, rule)`: see `parse_rule` in the Rust
- * crate. Internal: exported for the tests, not from the package.
- */
-export function encodeRule(rule: ColorRule): { map: number; values: Float32Array } {
-  if (rule.range?.length !== 2) {
-    throw invalid("range must be [lo, hi]");
-  }
-  // NaN is the binding's "no centre": reject it here rather than drop it.
-  if (rule.center !== undefined && Number.isNaN(rule.center)) {
-    throw invalid("color center must lie within the range");
-  }
-  const base = rule.base ?? DEFAULT_BASE;
-  const nan = rule.nan ?? DEFAULT_NAN;
-  if (base.length !== 4) {
-    throw invalid("base must have 4 channels");
-  }
-  if (nan.length !== 4) {
-    throw invalid("nan must have 4 channels");
-  }
-  const values = [
-    rule.range[0],
-    rule.range[1],
-    rule.center ?? Number.NaN,
-    codeIn(OUT_OF_RANGE, rule.below ?? "clamp", "below"),
-    codeIn(OUT_OF_RANGE, rule.above ?? "base", "above"),
-    ...base,
-    ...nan,
-  ];
-  let map: number;
-  if (typeof rule.map === "string") {
-    map = codeIn(MAPS, rule.map, "map");
-  } else if (typeof rule.map === "object" && rule.map !== null && Array.isArray(rule.map.stops)) {
-    map = 4;
-    for (const stop of rule.map.stops as unknown[]) {
-      if (!Array.isArray(stop) || stop.length !== 2) {
-        throw invalid("each stop must be [t, rgba]");
-      }
-      const [t, color] = stop as [number, ArrayLike<number> | null];
-      if (typeof color !== "object" || color === null || color.length !== 4) {
-        throw invalid("stop colours must have 4 channels");
-      }
-      values.push(t, ...Array.from(color));
-    }
-  } else {
-    throw invalid('map must be "turbo", "viridis", "coolwarm", "grayscale" or { stops }');
-  }
-  return { map, values: Float32Array.from(values) };
 }
 
 function invalid(message: string): FastMeshError {
@@ -1784,11 +1732,12 @@ export class Scene implements SceneLike {
     const field = this.#field(rule.field);
     const { map, values } = encodeRule(rule);
     call(() => this.#scene().set_coloring(index, generation, field, map, values));
-    this.#rules.set(mesh, rule);
+    // A copy: later changes to the caller's object do not leak in.
+    this.#rules.set(mesh, copyRule(rule));
   }
 
   /**
-   * The rule the mesh is coloured by (as given to {@link Scene.setColoring}),
+   * The rule the mesh is coloured by (a copy of the one given to {@link Scene.setColoring}),
    * or `null` without colouring (never set, turned off, or its field removed).
    *
    * @throws `UNKNOWN_MESH`.

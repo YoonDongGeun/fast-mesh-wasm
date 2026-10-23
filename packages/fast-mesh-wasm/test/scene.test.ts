@@ -2,6 +2,7 @@
 // change records, frames, history and drags.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  type ColorRule,
   computeVertexNormals,
   FastMeshError,
   type MeshChange,
@@ -223,6 +224,52 @@ describe("Scene", () => {
     // Once per scene.
     void kept.length;
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("debug_warns_on_a_kept_values_view", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = scene({ debug: true });
+    const a = s.addMesh(quad, quadTris);
+    const b = s.addMesh([0, 0, 1, 1, 0, 1, 0, 1, 1], [0, 1, 2]);
+    const field = s.addDistanceField({ name: "d", on: a, to: b, maxDistance: 2 });
+    expect(s.views(a).values!()).toBeNull();
+    s.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    const kept = s.views(a).values!()!;
+    expect(kept.length).toBe(s.vertexSlots(a));
+    expect(warn).not.toHaveBeenCalled();
+    s.setPlacement(b, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0.5] });
+    void kept[0];
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("re-acquire");
+  });
+
+  it("coloring_returns_a_copy_of_the_rule", () => {
+    const s = scene();
+    const a = s.addMesh(quad, quadTris);
+    const b = s.addMesh([0, 0, 1, 1, 0, 1, 0, 1, 1], [0, 1, 2]);
+    const field = s.addDistanceField({ name: "d", on: a, to: b, maxDistance: 2 });
+    const color: [number, number, number, number] = [255, 0, 0, 255];
+    const rule: ColorRule & { range: [number, number] } = {
+      field,
+      map: {
+        stops: [
+          [0, color],
+          [1, [0, 0, 255, 255]],
+        ],
+      },
+      range: [0, 2],
+    };
+    s.setColoring(a, rule);
+    const shown = s.coloring(a)!;
+    expect(shown).not.toBe(rule);
+    // Later changes to the caller's object, its stops included, do not leak in.
+    color[0] = 1;
+    rule.range[1] = 9;
+    expect(shown.range).toEqual([0, 2]);
+    expect((shown.map as { stops: readonly (readonly [number, readonly number[]])[] }).stops[0][1]).toEqual([255, 0, 0, 255]);
+    expect(shown.field).toBe(field);
+    s.removeField(field);
+    expect(s.coloring(a)).toBeNull();
   });
 
   it("debug_warns_on_a_view_detached_by_another_scene", () => {

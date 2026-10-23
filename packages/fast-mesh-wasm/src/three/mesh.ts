@@ -30,7 +30,7 @@ export interface BindMeshOptions {
    * change them), so do not share one material between bound meshes: give
    * each its own (`material.clone()`).
    */
-  material?: THREE.MeshStandardMaterial | THREE.MeshPhongMaterial | THREE.MeshLambertMaterial;
+  material?: THREE.MeshStandardMaterial | THREE.MeshPhongMaterial | THREE.MeshLambertMaterial | THREE.MeshBasicMaterial;
   /**
    * The colour shown while the mesh has no colouring. Defaults to the given
    * material's colour (left untouched), or light grey for the default material.
@@ -57,7 +57,17 @@ export interface BindMeshOptions {
    *   vertex colour. Far (`Infinity`) and NaN values never tint their
    *   neighbours. Needs a scene with `coloring(mesh)` and
    *   `views(mesh).values` (`Scene` and `WorkerScene` have both); on another
-   *   host the binding falls back to `"vertex"` ({@link BoundMesh.shading}).
+   *   host the binding falls back to `"vertex"` ({@link BoundMesh.shading}),
+   *   and so does a material three's `WebGLRenderer` does not build from its
+   *   own shader chunks (a node material for `WebGPURenderer`, say), with a
+   *   warning.
+   *
+   *   The binding patches the material it draws with, so each fragment-shaded
+   *   binding needs its own material (`material.clone()`): binding a material
+   *   another live fragment-shaded binding uses throws `INVALID_ARGUMENT`.
+   *   Disposing the binding puts the material back as it was (and disposes
+   *   its compiled program, so a later binding recompiles with its own
+   *   uniforms).
    */
   shading?: "vertex" | "fragment";
   /**
@@ -142,8 +152,8 @@ const BUFFERS = {
   positions: { name: "position", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   normals: { name: "normal", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   colors: { name: "color", itemSize: 4, normalized: true, make: (n: number) => new Uint16Array(n) },
-  // Fragment shading: (value, NaN flag) per vertex, encoded by `encodeValues`.
-  values: { name: "fmValue", itemSize: 2, normalized: false, make: (n: number) => new Float32Array(n) },
+  // Fragment shading: (v · m, m, nan, far) per vertex, encoded by `encodeValues`.
+  values: { name: "fmValue", itemSize: 4, normalized: false, make: (n: number) => new Float32Array(n) },
   indices: { name: "index", itemSize: 3, normalized: false, make: (n: number) => new Uint32Array(n) },
 } as const;
 
@@ -177,16 +187,24 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     throw new FastMeshError("INVALID_ARGUMENT", 'shading must be "vertex" or "fragment"');
   }
   checkSoftness(options.edgeSoftness ?? 0);
-  // Fragment shading needs the rule and the values; other hosts get vertex colours.
+  const ownsMaterial = options.material === undefined;
+  const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
+  // Fragment shading needs the rule and the values (other hosts get vertex
+  // colours) and a material built from three's shader chunks.
   const fragment =
     options.shading === "fragment" &&
     typeof scene.coloring === "function" &&
-    typeof scene.views(mesh).values === "function";
+    typeof scene.views(mesh).values === "function" &&
+    patchable(material);
+  if (fragment && patched.has(material)) {
+    throw new FastMeshError(
+      "INVALID_ARGUMENT",
+      "the material is already drawn by another fragment-shaded binding: give each binding its own (material.clone())",
+    );
+  }
   const keys: readonly BufferKey[] = fragment
     ? ["positions", "normals", "values", "indices"]
     : ["positions", "normals", "colors", "indices"];
-  const ownsMaterial = options.material === undefined;
-  const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
   // The colour shown without colouring; vertex colours are multiplied by the
   // material colour, so it is white while colouring is on.
   if (options.color !== undefined) {
@@ -241,13 +259,13 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
    * normals can be shorter than its slots until it is updated; the rest of the
    * mirror then keeps its data. `subarray` gives a plain typed array even for
    * a debug-mode Proxy view. Colours are converted from sRGB to linear, and
-   * values (one per slot, two mirror elements each) encoded.
+   * values (one per slot, four mirror elements each) encoded.
    */
   const copy = (key: BufferKey, mirror: Mirror, view: Mirror, from: number, to: number) => {
     if (key === "values") {
-      const end = Math.min(to / 2, view.length, mirror.length / 2);
-      if (end > from / 2 && shading !== undefined) {
-        encodeValues(shading, view as Float32Array, mirror as Float32Array, from / 2, end);
+      const end = Math.min(to / 4, view.length, mirror.length / 4);
+      if (end > from / 4) {
+        encodeValues(view as Float32Array, mirror as Float32Array, from / 4, end);
       }
       return;
     }
@@ -564,31 +582,96 @@ function setShadingUniforms(u: ShadingUniforms, s: Shading): void {
   u.fmNan.value.fromArray(s.nan);
 }
 
+/** Materials a live fragment-shaded binding has patched. */
+const patched = new WeakSet<object>();
+
+/** The shader chunks fragment shading hooks into, in each stage. */
+const HOOKS = {
+  vertex: ["#include <common>", "#include <begin_vertex>"],
+  fragment: ["#include <common>", "#include <color_fragment>"],
+} as const;
+
+/** `ShaderLib` entries of the materials fragment shading supports, by `material.type`. */
+const SHADER_LIB: Record<string, string> = {
+  MeshStandardMaterial: "standard",
+  MeshPhysicalMaterial: "physical",
+  MeshPhongMaterial: "phong",
+  MeshLambertMaterial: "lambert",
+  MeshBasicMaterial: "basic",
+};
+
+/**
+ * Whether `WebGLRenderer` builds the material from three's chunks with the
+ * hooks fragment shading needs; else warns that the binding uses vertex
+ * colours.
+ */
+function patchable(material: Material): boolean {
+  const lib = (THREE.ShaderLib as Record<string, { vertexShader: string; fragmentShader: string } | undefined>)[
+    SHADER_LIB[material.type] ?? ""
+  ];
+  const ok =
+    (material as { isNodeMaterial?: boolean }).isNodeMaterial !== true &&
+    lib !== undefined &&
+    HOOKS.vertex.every((h) => lib.vertexShader.includes(h)) &&
+    HOOKS.fragment.every((h) => lib.fragmentShader.includes(h));
+  if (!ok) {
+    console.warn(
+      `fast-mesh-wasm: shading "fragment" needs a WebGLRenderer material built from three's shader chunks ` +
+        `(MeshStandardMaterial, MeshPhongMaterial, MeshLambertMaterial or MeshBasicMaterial); ` +
+        `${material.type} is drawn with vertex colours.`,
+    );
+  }
+  return ok;
+}
+
 /**
  * Adds the fragment shading to a material's shaders (`onBeforeCompile`, after
- * any handler it had) under its own program cache key. Returns the function
- * that puts the material's handler and key back.
+ * any handler it had) under its own program cache key, and disposes the
+ * material's compiled program so the next render compiles it with these
+ * uniforms. Returns the function that puts the material's handler and key
+ * back (disposing the program again).
  */
 function patchMaterial(material: Material, uniforms: ShadingUniforms): () => void {
   const before = material.onBeforeCompile;
   const key = material.customProgramCacheKey;
+  let warned = false;
+  const hook = (source: string, chunk: string, add: string): string => {
+    if (!source.includes(chunk)) {
+      if (!warned) {
+        warned = true;
+        console.warn(`fast-mesh-wasm: fragment shading could not find ${chunk} in the material's shader; colours are not shown.`);
+      }
+      return source;
+    }
+    return source.replace(chunk, `${chunk}\n${add}`);
+  };
   material.onBeforeCompile = function (this: Material, shader, renderer) {
     before.call(this, shader, renderer);
     Object.assign(shader.uniforms, uniforms);
-    shader.vertexShader = shader.vertexShader
-      .replace("#include <common>", `#include <common>\n${SHADING_VERTEX}`)
-      .replace("#include <begin_vertex>", "#include <begin_vertex>\n\tvFmValue = fmValue;");
-    shader.fragmentShader = shader.fragmentShader
-      .replace("#include <common>", `#include <common>\n${SHADING_FRAGMENT}`)
-      .replace("#include <color_fragment>", "#include <color_fragment>\n\tif (fmOn) diffuseColor *= fmShade(vFmValue);");
+    shader.vertexShader = hook(
+      hook(shader.vertexShader, HOOKS.vertex[0], SHADING_VERTEX),
+      HOOKS.vertex[1],
+      "\tvFmValue = fmValue;",
+    );
+    shader.fragmentShader = hook(
+      hook(shader.fragmentShader, HOOKS.fragment[0], SHADING_FRAGMENT),
+      HOOKS.fragment[1],
+      "\tif (fmOn) diffuseColor *= fmShade(vFmValue);",
+    );
   };
   material.customProgramCacheKey = function (this: Material) {
     return `${key.call(this)}|fast-mesh-fragment-shading`;
   };
+  patched.add(material);
+  // A program compiled before (by an earlier binding, or none) is dropped:
+  // three runs onBeforeCompile again only for a new program.
+  material.dispose();
   material.needsUpdate = true;
   return () => {
     material.onBeforeCompile = before;
     material.customProgramCacheKey = key;
+    patched.delete(material);
+    material.dispose();
     material.needsUpdate = true;
   };
 }

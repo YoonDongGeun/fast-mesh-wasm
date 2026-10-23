@@ -4,11 +4,10 @@
 // softness, and the binding's attribute, uniforms and material patch. The
 // GLSL itself runs in headless Chrome (scripts/showcase-check.mjs).
 import * as THREE from "three";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   encodeValues,
   exactBytes,
-  FAR_SPAN,
   SHADING_FRAGMENT,
   SRGB_TO_LINEAR16,
   shadeReference,
@@ -16,7 +15,7 @@ import {
   softBytes,
 } from "../src/colormap.js";
 import { type ColorRule, type MeshHandle, Scene, type Vec3 } from "../src/node.js";
-import { encodeRule } from "../src/scene.js";
+import { encodeRule } from "../src/rule.js";
 import type { SceneLike } from "../src/scene-like.js";
 import { contactHeatmap } from "../src/store/index.js";
 import { bindMesh, type BoundMesh } from "../src/three/index.js";
@@ -98,55 +97,75 @@ function samples(rule: ColorRule, random: () => number): Float32Array {
   return Float32Array.from(out);
 }
 
+/** sRGB bytes to linear as the shader gives them (the table is f32 in the texture). */
+function linearOf(bytes: readonly number[]): number[] {
+  return [...bytes.slice(0, 3).map((b) => Math.fround(SRGB_TO_LINEAR16[b] / 65535)), bytes[3] / 255];
+}
+
 describe("fragment shading reference", () => {
-  it("exact_bytes_equal_the_engine_color_of", () => {
+  it("exact_colours_at_vertices_equal_the_engine_color_of", () => {
     const random = rng(5);
     for (const rule of RULES) {
       const s = shadingOf(rule);
       const values = samples(rule, random);
       const want = engineColors(rule, values);
-      const encoded = new Float32Array(2 * values.length);
-      encodeValues(s, values, encoded, 0, values.length);
+      const encoded = new Float32Array(4 * values.length);
+      encodeValues(values, encoded, 0, values.length);
       for (let i = 0; i < values.length; i++) {
         // Through the attribute encoding, as the shader sees the vertex.
-        const got =
-          encoded[2 * i + 1] > 0.5 ? [...(rule.nan ?? [128, 128, 128, 255])] : exactBytes(s, encoded[2 * i]);
+        const got = shadeReference(s, encoded.subarray(4 * i, 4 * i + 4), 0);
         expect(got, `${JSON.stringify(rule.map).slice(0, 30)} at ${values[i]}`).toEqual(
-          Array.from(want.subarray(4 * i, 4 * i + 4)),
+          linearOf(Array.from(want.subarray(4 * i, 4 * i + 4))),
         );
       }
     }
   });
 
-  it("infinity_and_nan_never_tint_their_neighbours", () => {
-    const rule: ColorRule = { field, map: STOPS.map, range: STOPS.range, below: STOPS.below, above: STOPS.above };
+  it("far_and_nan_never_tint_their_neighbours", () => {
+    // The fast contact heatmap: deep penetration sits next to far vertices.
+    const heat = contactHeatmap({ depth: 1, gap: 2, tolerance: 0.25 });
+    const rule: ColorRule = { field, map: heat.map, range: heat.range, below: heat.below, above: heat.above };
     const s = shadingOf(rule);
-    const [lo, hi] = s.range;
-    const enc = new Float32Array(6);
-    encodeValues(s, [Infinity, Number.NaN, -Infinity], enc, 0, 3);
-    expect(Array.from(enc)).toEqual([hi + FAR_SPAN * (hi - lo), 0, hi + FAR_SPAN * (hi - lo), 1, lo - FAR_SPAN * (hi - lo), 0]);
-    const baseLinear = shadeReference(s, enc[0], enc[1], 0);
-    // Far is the base colour (above: "base").
-    // (The table is stored as f32 in the texture, as the GPU reads it.)
-    expect(baseLinear).toEqual([...[200, 200, 200].map((b) => Math.fround(SRGB_TO_LINEAR16[b] / 65535)), 1]);
-    // Between a coloured vertex and a far one, the colour is the value's own
-    // colour up to the iso-line v = hi, and base beyond it: no blend of the two.
-    const v0 = 0.5;
-    for (let k = 1; k < 100; k++) {
-      const lambda = k / 100;
-      const v = Math.fround(v0 + lambda * (enc[0] - v0));
-      const got = shadeReference(s, v, 0, 0);
-      const own = v > hi ? baseLinear : shadeReference(s, v, 0, 0);
-      expect(got).toEqual(own);
-      if (v <= hi) {
-        expect(got).not.toEqual(baseLinear);
+    const [lo] = s.range;
+    const enc = (v: number) => {
+      const out = new Float32Array(4);
+      encodeValues([v], out, 0, 1);
+      return out;
+    };
+    expect(Array.from(enc(Infinity))).toEqual([0, 0, 0, 1]);
+    expect(Array.from(enc(-Infinity))).toEqual([0, 0, 0, -1]);
+    expect(Array.from(enc(Number.NaN))).toEqual([0, 0, 1, 0]);
+    expect(Array.from(enc(0.25))).toEqual([0.25, 1, 0, 0]);
+    const base = linearOf([200, 200, 200, 255]);
+    const nan = linearOf([128, 128, 128, 255]);
+    const mix = (a: Float32Array, b: Float32Array, t: number) => a.map((x, k) => Math.fround((1 - t) * x + t * b[k]));
+    for (const v0 of [Math.fround(lo - 1e-3), lo, Math.fround(lo + 1e-3)]) {
+      const own = shadeReference(s, enc(v0), 0);
+      for (const [other, otherColor] of [
+        [Infinity, base],
+        [Number.NaN, nan],
+      ] as const) {
+        for (let k = 0; k <= 100; k++) {
+          const got = shadeReference(s, mix(enc(v0), enc(other), k / 100), 0);
+          // Only the deep vertex's own colour or the far / NaN colour: no
+          // contact white, no gap colours on the way.
+          expect([own, otherColor], `${v0} to ${other} at ${k / 100}`).toContainEqual(got);
+          expect(got).toEqual(k <= 50 ? own : otherColor);
+        }
       }
     }
-    // A NaN vertex colours only where its flag dominates (half the triangle).
-    const nanLinear = shadeReference(s, 0, 1, 0);
-    expect(nanLinear).toEqual([...[128, 128, 128].map((b) => Math.fround(SRGB_TO_LINEAR16[b] / 65535)), 1]);
-    expect(shadeReference(s, v0, 0.4, 0)).toEqual(shadeReference(s, v0, 0, 0));
-    expect(shadeReference(s, v0, 0.6, 0)).toEqual(nanLinear);
+    // -Infinity follows `below` (clamp: the deepest colour).
+    expect(shadeReference(s, enc(-Infinity), 0)).toEqual(linearOf(exactBytes(s, lo - 1)));
+    // NaN beats far only where its weight is larger.
+    expect(shadeReference(s, [0, 0.2, 0.5, 0.3], 0)).toEqual(nan);
+    expect(shadeReference(s, [0, 0.2, 0.3, 0.5], 0)).toEqual(base);
+    // Between finite vertices the value is the plain interpolation.
+    const a = enc(-0.9);
+    const b = enc(1.5);
+    for (let k = 0; k <= 10; k++) {
+      const m = mix(a, b, k / 10);
+      expect(shadeReference(s, m, 0)).toEqual(linearOf(exactBytes(s, Math.fround(m[0] / m[1]))));
+    }
   });
 
   it("edge_softness_zero_is_a_step_and_wider_a_ramp", () => {
@@ -234,10 +253,10 @@ describe("bindMesh fragment shading", () => {
   }
 
   /** The values attribute equals a fresh encoding of the scene's values. */
-  function expectValuesMirrored(s: Scene, m: MeshHandle, b: BoundMesh, rule: ColorRule) {
+  function expectValuesMirrored(s: Scene, m: MeshHandle, b: BoundMesh) {
     const values = s.views(m).values!()!;
-    const want = new Float32Array(2 * values.length);
-    encodeValues(shadingOf(rule), values, want, 0, values.length);
+    const want = new Float32Array(4 * values.length);
+    encodeValues(values, want, 0, values.length);
     expect(Array.from(b.object.geometry.getAttribute("fmValue").array)).toEqual(Array.from(want));
   }
 
@@ -260,11 +279,11 @@ describe("bindMesh fragment shading", () => {
       expect(fragment.object.geometry.getAttribute("color")).toBeUndefined();
       const sh = shadingOf(s.coloring(m)!);
       let far = 0;
-      for (let v = 0; v < value.length / 2; v++) {
+      for (let v = 0; v < value.length / 4; v++) {
         if (s.views(m).values!()![v] === Infinity) {
           far++;
         }
-        const got = shadeReference(sh, value[2 * v], value[2 * v + 1], 0);
+        const got = shadeReference(sh, value.subarray(4 * v, 4 * v + 4), 0);
         for (let k = 0; k < 3; k++) {
           // The same 16-bit level: the texture holds the table as f32.
           expect(Math.round(got[k] * 65535), `vertex ${v}`).toBe(color[4 * v + k]);
@@ -302,14 +321,14 @@ describe("bindMesh fragment shading", () => {
     expect(material.vertexColors).toBe(false);
     expect(material.color.getHex()).toBe(0xffffff);
     expect((u.fmLut.value as THREE.DataTexture).image.width).toBe(256);
-    expectValuesMirrored(s, m, b, rule);
+    expectValuesMirrored(s, m, b);
     // A drag updates the colours' ranges only, and the values with them.
     const attribute = b.object.geometry.getAttribute("fmValue") as THREE.BufferAttribute;
     attribute.clearUpdateRanges();
     s.setPlacement(n, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0.3, 0, -0.1] });
     s.commitFrame();
     expect(attribute.updateRanges.length).toBeGreaterThan(0);
-    expectValuesMirrored(s, m, b, rule);
+    expectValuesMirrored(s, m, b);
     // A new rule (another range) encodes every value again.
     const wider: ColorRule = { field: f, map: { stops: [[0, [0, 0, 0, 255]], [1, [255, 255, 255, 255]]] }, range: [-1, 2] };
     s.setColoring(m, wider);
@@ -317,7 +336,7 @@ describe("bindMesh fragment shading", () => {
     expect(u.fmBuiltin.value).toBe(false);
     expect(u.fmCount.value).toBe(2);
     expect((u.fmRange.value as THREE.Vector2).toArray()).toEqual([-1, 2]);
-    expectValuesMirrored(s, m, b, wider);
+    expectValuesMirrored(s, m, b);
     // Softness: a uniform, checked.
     b.setEdgeSoftness(0);
     expect(u.fmSoftness.value).toBe(0);
@@ -329,6 +348,68 @@ describe("bindMesh fragment shading", () => {
     expect(b.object.geometry.getAttribute("fmValue")).toBeUndefined();
     expect(u.fmOn.value).toBe(false);
     expect(material.color.getHex()).toBe(0xcccccc);
+  });
+
+  it("a_rebound_material_compiles_with_the_new_bindings_uniforms", () => {
+    const { s, m } = setup();
+    const material = new THREE.MeshStandardMaterial();
+    let disposed = 0;
+    material.addEventListener("dispose", () => disposed++);
+    /** The uniforms the renderer would compile the material with now. */
+    const compiled = () => {
+      const shader = {
+        uniforms: {} as Record<string, { value: unknown }>,
+        vertexShader: THREE.ShaderLib.standard.vertexShader,
+        fragmentShader: THREE.ShaderLib.standard.fragmentShader,
+      };
+      material.onBeforeCompile(shader as never, undefined as never);
+      return shader;
+    };
+    const first = bindMesh(s, m, { material, shading: "fragment", edgeSoftness: 0.1 });
+    // Patching drops any program compiled before, so three recompiles.
+    expect(disposed).toBe(1);
+    expect(compiled().uniforms.fmSoftness.value).toBe(0.1);
+    // One material, one fragment-shaded binding.
+    expect(() => bindMesh(s, m, { material, shading: "fragment" })).toThrow(/material.clone/);
+    first.dispose();
+    expect(disposed).toBe(2);
+    const second = bindMesh(s, m, { material, shading: "fragment", edgeSoftness: 0.3 });
+    expect(disposed).toBe(3);
+    const shader = compiled();
+    expect(shader.uniforms.fmSoftness.value).toBe(0.3);
+    second.setEdgeSoftness(0.4);
+    expect(shader.uniforms.fmSoftness.value).toBe(0.4);
+    second.dispose();
+    // Fragment, then vertex: the material is back as it was, recompiled.
+    const plain = bindMesh(s, m, { material });
+    expect(disposed).toBe(4);
+    expect(compiled().fragmentShader).not.toContain("fmShade");
+    plain.dispose();
+    material.dispose();
+  });
+
+  it("unsupported_materials_fall_back_with_a_warning", () => {
+    const { s, m } = setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const toon = new THREE.MeshToonMaterial() as unknown as THREE.MeshStandardMaterial;
+    expect(bind(s, m, { material: toon, shading: "fragment" }).shading).toBe("vertex");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/MeshToonMaterial is drawn with vertex colours/));
+    const node = new THREE.MeshStandardMaterial();
+    (node as unknown as { isNodeMaterial: boolean }).isNodeMaterial = true;
+    expect(bind(s, m, { material: node, shading: "fragment" }).shading).toBe("vertex");
+    expect(bind(s, m, { material: new THREE.MeshBasicMaterial(), shading: "fragment" }).shading).toBe("fragment");
+    // A chunk another handler removed: warned once, the shader left alone.
+    const odd = new THREE.MeshStandardMaterial();
+    const b = bind(s, m, { material: odd, shading: "fragment" });
+    expect(b.shading).toBe("fragment");
+    const shader = { uniforms: {}, vertexShader: "void main() {}", fragmentShader: "void main() {}" };
+    odd.onBeforeCompile(shader as never, undefined as never);
+    expect(shader.fragmentShader).toBe("void main() {}");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/could not find #include <common>/));
+    warn.mockRestore();
+    toon.dispose();
+    node.dispose();
+    odd.dispose();
   });
 
   it("given_material_is_restored_and_hosts_without_values_fall_back", () => {

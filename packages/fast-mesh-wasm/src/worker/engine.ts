@@ -307,6 +307,7 @@ class Batch {
   rev = 0;
   readonly status: Result["status"] = [];
   readonly replies: Result["replies"] = [];
+  readonly colorings: Result["colorings"] = [];
   readonly transfer: Transferable[] = [];
 
   ready(key: string | undefined, rev: number): void {
@@ -366,6 +367,10 @@ class Engine {
   /** What the batch being run collects for its result. */
   #batch = new Batch();
   #poisoned = false;
+  /** A `values` request turned the values mirror on. */
+  #mirrorValues = false;
+  /** The next result carries every coloured mesh's colours and values whole. */
+  #valuesFull = false;
   readonly #meshes = new Map<ClientId, MeshHandle>();
   readonly #fields = new Map<ClientId, FieldHandle>();
   /** Fields whose build was abandoned: built when a request first needs them. */
@@ -774,6 +779,7 @@ class Engine {
       history: { canUndo: false, canRedo: false },
       status: b.status,
       replies: b.replies,
+      colorings: [],
       poisoned: true,
     };
     try {
@@ -992,6 +998,11 @@ class Engine {
         return;
       case "coloring":
         s.setColoring(this.#mesh(req.id), req.rule === null ? null : this.#rule(req.rule));
+        b.colorings.push({ id: req.id, rev: req.rev });
+        return;
+      case "values":
+        this.#valuesFull ||= !this.#mirrorValues;
+        this.#mirrorValues = true;
         return;
       case "field":
         this.#runField(req);
@@ -1220,7 +1231,11 @@ class Engine {
   /** Commits the frame and packs everything that changed. */
   #result(b: Batch): Result {
     const s = this.#scene;
-    const frame = s.commitFrame();
+    let frame = s.commitFrame();
+    if (this.#valuesFull) {
+      this.#valuesFull = false;
+      frame = this.#withValues(frame);
+    }
     const changes: MeshChangeWire[] = [];
     const placements: Result["placements"] = [];
     const sections: Result["sections"] = [];
@@ -1277,7 +1292,40 @@ class Engine {
       history,
       status: b.status,
       replies: b.replies,
+      colorings: b.colorings,
     };
+  }
+
+  /**
+   * `frame` with every coloured mesh's colours "all" (a record added where it
+   * has none), so the values mirror just turned on starts whole.
+   */
+  #withValues(frame: MeshChange[]): MeshChange[] {
+    const out = [...frame];
+    for (const h of this.#meshes.values()) {
+      if ((this.#scene.views(h).values?.() ?? null) === null) {
+        continue;
+      }
+      const at = out.findIndex((c) => c.mesh === h);
+      if (at === -1) {
+        out.push({
+          mesh: h,
+          added: false,
+          removed: false,
+          placementChanged: false,
+          capacityChanged: false,
+          positions: [],
+          normals: [],
+          colors: "all",
+          indices: [],
+          fieldsChanged: [],
+          sectionsChanged: [],
+        });
+      } else if (!out[at].removed) {
+        out[at] = { ...out[at], colors: "all" };
+      }
+    }
+    return out;
   }
 
   /** The section's result for a mesh, or `null` when the section or the entry is gone. */
@@ -1320,7 +1368,8 @@ class Engine {
     // Fresh views, read with no scene call in between.
     const views: MeshViews = this.#scene.views(c.mesh);
     for (const name of Object.keys(STRIDE) as BufferName[]) {
-      const view = views[name]?.() ?? null;
+      // The values only once the client turned their mirror on.
+      const view = name === "values" && !this.#mirrorValues ? null : (views[name]?.() ?? null);
       if (view !== null) {
         const bytes = copyRanges(view, rangesOf(c, name), STRIDE[name]);
         wire.bytes[name] = bytes;
