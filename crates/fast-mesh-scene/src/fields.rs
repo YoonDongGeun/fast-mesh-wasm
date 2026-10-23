@@ -2354,6 +2354,110 @@ mod tests {
         assert_eq!(scene.colors(a).unwrap().unwrap()[121], rule.nan);
     }
 
+    /// The same for a field measured to several targets: the values behind
+    /// the colours are its channel, a move of either target reports the
+    /// values it changes, and a reused slot's value (NaN) and colour are
+    /// reported, with no nearest target.
+    #[test]
+    fn color_values_view_a_multi_target_field() {
+        let rule = contact_rule(0.1);
+        let colour = |scene: &mut Scene, a: MeshId, f: FieldId| {
+            scene
+                .set_coloring(
+                    a,
+                    Some(Coloring {
+                        field: f,
+                        rule: rule.clone(),
+                    }),
+                )
+                .unwrap();
+        };
+        let view = |s: &Scene, a: MeshId| bits_of(s.color_values(a).unwrap().unwrap());
+
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let c = scene
+            .add_mesh(cube([0.7, 0.7, -0.15], 0.2), MeshOptions::default())
+            .unwrap();
+        let f = scene
+            .add_distance_field(DistanceField {
+                to: vec![b, c],
+                ..field("d", a, b, 0.1)
+            })
+            .unwrap();
+        colour(&mut scene, a, f);
+        assert_eq!(view(&scene, a), bits_of(scene.field_values(f).unwrap()));
+        let nearest = scene.field_nearest(f).unwrap();
+        assert!(
+            nearest.contains(&0) && nearest.contains(&1),
+            "both targets win vertices"
+        );
+        assert_eq!(colors_dirty(&mut scene, a), None);
+        assert_colors(&scene, a, &rule, f);
+        // Moving either target: the values that changed are reported with the colours.
+        for (m, p) in [(b, at(0.0, 0.0, 0.03)), (c, at(-0.02, 0.0, 0.02))] {
+            let before = view(&scene, a);
+            scene.set_placement(m, p).unwrap();
+            assert_eq!(view(&scene, a), bits_of(scene.field_values(f).unwrap()));
+            assert_ne!(view(&scene, a), before);
+            let dirty = colors_dirty(&mut scene, a);
+            check_values_reported(
+                &before,
+                scene.color_values(a).unwrap().unwrap(),
+                dirty.as_ref(),
+                "move",
+            );
+            assert_colors(&scene, a, &rule, f);
+        }
+        assert_eq!(shown(&scene, f), min_of_singles(&mut scene, f));
+
+        // A reused slot, as for one target (see above).
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Lazy);
+        let c = scene
+            .add_mesh(cube([0.7, 0.7, -0.15], 0.2), MeshOptions::default())
+            .unwrap();
+        let f = scene
+            .add_distance_field(DistanceField {
+                to: vec![b, c],
+                ..field("d", a, b, 0.1)
+            })
+            .unwrap();
+        colour(&mut scene, a, f);
+        scene
+            .edit(a, |tx| {
+                let v = tx.add_vertices(&[[0.5, 0.5, 0.0]])?;
+                tx.add_triangles(&[[v[0], 0, 1]])
+            })
+            .unwrap();
+        scene.update_fields().unwrap();
+        scene.undo().unwrap();
+        scene
+            .edit(a, |tx| {
+                let p = tx.mesh().position(0).unwrap();
+                tx.set_positions(&[0], &[p])
+            })
+            .unwrap();
+        scene.take_changes();
+        let before = view(&scene, a);
+        assert!(!f32::from_bits(before[121]).is_nan());
+        scene
+            .edit(a, |tx| tx.add_vertices(&[[5.0, 5.0, 5.0]]))
+            .unwrap();
+        assert!(
+            scene.mesh(a).unwrap().is_vertex_alive(121),
+            "the released slot is reused"
+        );
+        assert_eq!(view(&scene, a), bits_of(scene.field_values(f).unwrap()));
+        let dirty = colors_dirty(&mut scene, a);
+        check_values_reported(
+            &before,
+            scene.color_values(a).unwrap().unwrap(),
+            dirty.as_ref(),
+            "reuse",
+        );
+        assert_eq!(scene.colors(a).unwrap().unwrap()[121], rule.nan);
+        assert_eq!(shown(&scene, f).1[121], u32::MAX);
+    }
+
     #[test]
     fn small_drag_recomputes_only_near_vertices() {
         let mut scene = Scene::new(SceneOptions::default());
