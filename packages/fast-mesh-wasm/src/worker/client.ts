@@ -127,15 +127,21 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
       ? new Worker(new URL("./worker-entry.js", import.meta.url), { type: "module" })
       : new Worker(options.workerUrl, { type: "module" })) as unknown as WorkerLike);
   const dev = (import.meta as { env?: { DEV?: boolean } }).env?.DEV === true;
+  const debug = (options.debug ?? false) || dev;
+  // An earlier scene's Worker found that threads cannot run here: no probe again.
+  const skipped = threadsUnavailable && threads !== 1;
   const [scene, started] = createScene(make, {
     debug: options.debug ?? false,
-    init: { kind: "init", threads, debug: (options.debug ?? false) || dev },
+    init: { kind: "init", threads: skipped ? 1 : threads, debug },
   });
   try {
     await started;
   } catch (e) {
     scene.terminate();
     throw e;
+  }
+  if (skipped && debug) {
+    console.warn(THREADS_UNAVAILABLE);
   }
   return scene;
 }
@@ -439,6 +445,18 @@ const INERT: WorkerLike = { postMessage() {}, addEventListener() {}, terminate()
 /** Crash channels made so far (part of each name, which must be unique). */
 let crashChannels = 0;
 
+/**
+ * Set once a Worker reported that this browser cannot run the threaded
+ * engine (`probeFailed`): the page's later scenes start at one thread, so
+ * the probe never runs again.
+ */
+let threadsUnavailable = false;
+
+/** The development warning of a scene started at one thread because of {@link threadsUnavailable}. */
+const THREADS_UNAVAILABLE =
+  "fast-mesh-wasm: the multithreaded engine cannot run in this browser (found by an earlier Worker scene on this page); " +
+  `running single-threaded. See "Multithreading (COOP/COEP)" in the fast-mesh-wasm README.`;
+
 /** A Worker's start: settled by its `ready` or `fatal` message, or an error. */
 interface Ready {
   promise: Promise<void>;
@@ -572,8 +590,8 @@ export class WorkerScene implements SceneLike {
   #restarting: Promise<void> | undefined;
   /**
    * The message starting each Worker's engine. Its `threads` becomes 1 once a
-   * Worker's thread pool failed to start: later Workers (restarts) never try
-   * again.
+   * Worker's thread pool failed to start, or its probe found that this
+   * browser cannot run threads: later Workers (restarts) never try again.
    */
   #init: InitMessage;
   /** The current Worker's thread count, from its ready message (1 until then). */
@@ -977,6 +995,11 @@ export class WorkerScene implements SceneLike {
     if ("kind" in msg) {
       if (msg.kind === "ready") {
         this.#threads = msg.threads ?? 1;
+        if (msg.probeFailed === true) {
+          // This browser cannot run threads: restarts and later scenes ask for one.
+          this.#init = { ...this.#init, threads: 1 };
+          threadsUnavailable = true;
+        }
         if (this.#threads === 1) {
           // It fell back to the single-threaded engine: no pool to hear.
           this.#unwatch();

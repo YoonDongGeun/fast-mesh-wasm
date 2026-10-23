@@ -189,9 +189,9 @@ describe("loadEngine", () => {
 
   it("broken_shared_growth_skips_threaded", async () => {
     // The probe saw the browser trap on a memory another thread grew (WebKit
-    // 26): the threaded files are never fetched and nothing threaded is left
-    // behind, so this Worker runs single-threaded itself, without waiting for
-    // a pool that would never start.
+    // 26): the threaded glue (imported meanwhile) is never instantiated and
+    // nothing threaded is left behind, so this Worker runs single-threaded
+    // itself, without waiting for a pool that would never start.
     const log: string[] = [];
     const l = loaders(log);
     const warn = vi.fn();
@@ -200,7 +200,8 @@ describe("loadEngine", () => {
     expect(probe).toHaveBeenCalledTimes(1);
     expect(got.threads).toBe(1);
     expect(got.wasm).toBe(l.single.glue);
-    expect(log).toEqual(["importSingle", "single.init"]);
+    expect(got.probeFailed).toBe(true);
+    expect(log).toEqual(["importThreaded", "importSingle", "single.init"]);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toMatch(/fill traps after another thread grew the memory/);
     expect(warn.mock.calls[0][0]).toMatch(/single-threaded/);
@@ -221,6 +222,7 @@ describe("loadEngine", () => {
       const warn = vi.fn();
       const got = await loadEngine({ threads: 4, isolated: true, ...loaders(log), warn, probe });
       expect(got.threads, name).toBe(4);
+      expect(got.probeFailed, name).toBeUndefined();
       expect(log, name).toEqual(["importThreaded", "threaded.init", "threaded.pool(4)"]);
       expect(warn, name).not.toHaveBeenCalled();
     }
@@ -237,7 +239,42 @@ describe("loadEngine", () => {
     const got = await startEngine({ kind: "init", threads: 4, debug: true }, { ...loaders(log), probe }, true);
     expect(got.threads).toBe(1);
     expect(got.warning).toMatch(/broken/);
-    expect(log).toEqual(["importSingle", "single.init"]);
+    expect(got.probeFailed).toBe(true);
+    expect(log).toEqual(["importThreaded", "importSingle", "single.init"]);
+    // Reported in production too (no warning): the scene caches it.
+    const quiet = await startEngine({ kind: "init", threads: 4, debug: false }, { ...loaders([]), probe }, true);
+    expect(quiet).toEqual({ threads: 1, probeFailed: true });
+  });
+
+  it("probe_overlaps_threaded_import", async () => {
+    // The glue is imported while the probe runs; only its instantiation
+    // waits for the probe's answer.
+    const log: string[] = [];
+    let answer!: (why: string | undefined) => void;
+    const probe = () =>
+      new Promise<string | undefined>((resolve) => {
+        log.push("probe");
+        answer = resolve;
+      });
+    const got = loadEngine({ threads: 4, isolated: true, ...loaders(log), probe });
+    await vi.waitFor(() => expect(log).toEqual(["probe", "importThreaded"]));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(log).toEqual(["probe", "importThreaded"]);
+    answer(undefined);
+    expect((await got).threads).toBe(4);
+    expect(log).toEqual(["probe", "importThreaded", "threaded.init", "threaded.pool(4)"]);
+    // A failed import and a broken browser: one warning, the probe's.
+    const warn = vi.fn();
+    const both = await loadEngine({
+      threads: 4,
+      isolated: true,
+      ...loaders([], { import: new TypeError("Failed to fetch (test)") }),
+      warn,
+      probe: async () => "broken",
+    });
+    expect(both.threads).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/broken/);
   });
 
   it("start_engine_warnings", async () => {

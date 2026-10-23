@@ -43,8 +43,10 @@ import {
 
 import { PoolStartError } from "./load.js";
 
-// The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js).
+// The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js),
+// and the probe, for the browser check page.
 export { loadEngine, startEngine } from "./load.js";
+export { probeSharedGrowth } from "./probe.js";
 
 /** The engine's side of the message channel. */
 export interface Port {
@@ -137,6 +139,8 @@ export interface Started {
   threads: number;
   /** Development only: why it is single-threaded though more threads were asked for. */
   warning?: string;
+  /** The browser cannot run the threaded engine (its probe failed): the scene stops asking for threads. */
+  probeFailed?: true;
 }
 
 /**
@@ -180,8 +184,16 @@ export function serveEngine(
   const serve = (start: Promise<unknown>) =>
     start.then(
       (info) => {
-        const { threads = 1, warning } = (info ?? {}) as Partial<Started>;
-        endpoint.post(warning === undefined ? { kind: "ready", threads } : { kind: "ready", threads, warning }, []);
+        const { threads = 1, warning, probeFailed } = (info ?? {}) as Partial<Started>;
+        endpoint.post(
+          {
+            kind: "ready",
+            threads,
+            ...(warning === undefined ? {} : { warning }),
+            ...(probeFailed === true ? { probeFailed } : {}),
+          },
+          [],
+        );
         runEngine(
           {
             post: (msg, transfer) => endpoint.post(msg, transfer),

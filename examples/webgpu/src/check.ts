@@ -10,6 +10,8 @@
 //   a size, then a field and a query on them.
 // - `restartOpen`, `restartRun`, `close`: a threaded scene whose Worker crashes,
 //   then `restart()`: the new Worker starts a new pool and colours as before.
+// - `probe`: the threaded engine's pre-flight probe (see the package's
+//   src/worker/probe.ts), run on the page: why threads cannot run, if so.
 // - `start`: a threaded scene in debug on the package's Worker script: when it
 //   runs single-threaded, how soon it started and what it warned.
 // - `nestedFail`: a threaded scene whose nested Workers cannot load.
@@ -22,6 +24,7 @@
 // The last four use the check Worker (check-worker.ts) for its probes.
 import type { FieldHandle, MeshChange, MeshHandle, PlacementInput, SectionHandle } from "fast-mesh-wasm";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "fast-mesh-wasm/worker";
+import { probeSharedGrowth } from "../../../packages/fast-mesh-wasm/dist/worker-engine.js";
 import checkWorkerUrl from "./check-worker.ts?worker&url";
 
 const now = () => performance.now();
@@ -639,6 +642,15 @@ function close() {
   restartState = undefined;
 }
 
+// ---- probe: whether this browser can run the threaded engine ----
+
+/** The Worker's pre-flight probe, run here: `why` is null when threads may run. */
+async function probe() {
+  const t0 = now();
+  const why = await probeSharedGrowth();
+  return { ms: now() - t0, why: why ?? null };
+}
+
 // ---- start: a threaded scene on the package's Worker script, in debug ----
 
 async function start({ threads }: { threads?: number } = {}) {
@@ -921,6 +933,6 @@ function info() {
   };
 }
 
-const fmCheck = { info, compare, memory, restartOpen, restartRun, close, start, nestedFail, poolCrash, bench };
+const fmCheck = { info, probe, compare, memory, restartOpen, restartRun, close, start, nestedFail, poolCrash, bench };
 (window as unknown as { fmCheck: typeof fmCheck }).fmCheck = fmCheck;
 document.querySelector("#out")!.textContent = `ready: ${JSON.stringify(info())}`;
