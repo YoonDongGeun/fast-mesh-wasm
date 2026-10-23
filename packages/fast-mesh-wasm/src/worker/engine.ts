@@ -1267,7 +1267,12 @@ class Engine {
     const steps = this.#steps;
     const h = steps.addDeferred({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
     const forget = () => {
-      steps.withdraw(h);
+      // Never computed and colouring nothing, so the scene takes it back
+      // without a report; should it ever refuse, remove it the usual way.
+      if (!steps.withdraw(h)) {
+        this.#scene.removeField(h);
+        this.#removedFields.push(h);
+      }
       this.#fields.delete(req.field);
       this.#fieldIds.delete(h);
       this.#fieldMeshes.delete(req.field);
