@@ -1170,6 +1170,26 @@ impl Scene {
     /// test `mutating_calls_abandon_open_unit`.
     pub(crate) fn drop_field_unit(&mut self) {
         self.field_unit = None;
+        self.drop_stale_sign_builds();
+    }
+
+    /// Drops the unfinished sign data builds kept with the fields that are
+    /// no longer for their mesh and BVH as they are (an edit since, say):
+    /// they would only start over, and hold arrays the size of the mesh.
+    fn drop_stale_sign_builds(&mut self) {
+        let entries = &self.entries;
+        for f in &mut self.fields {
+            for (k, slot) in f.sign_builds.iter_mut().enumerate() {
+                let stale = slot.as_ref().is_some_and(|b| {
+                    entries
+                        .get(f.desc.to[k])
+                        .is_none_or(|e| !b.is_for(&e.mesh, &e.bvh))
+                });
+                if stale {
+                    *slot = None;
+                }
+            }
+        }
     }
 
     /// The candidates of the open step unit left to compute, counting only
@@ -1182,6 +1202,16 @@ impl Scene {
                 .map(|f| f.pick.candidates.len() - f.values.len())
                 .sum()
         })
+    }
+
+    /// Unfinished sign data builds kept with the fields.
+    #[cfg(test)]
+    fn kept_sign_builds(&self) -> usize {
+        self.fields
+            .iter()
+            .flat_map(|f| &f.sign_builds)
+            .filter(|b| b.is_some())
+            .count()
     }
 
     /// The stage of the open step unit's first unfinished field.
@@ -1599,8 +1629,9 @@ impl Scene {
                 .is_some_and(|s| s.is_current(&eb.mesh, &eb.bvh))
             {
                 f.sign[k] = Some(SignData::build(&mut eb.mesh, &eb.bvh, mode)?);
-                f.sign_builds[k] = None;
             }
+            // Current now: an unfinished build of it is of no use.
+            f.sign_builds[k] = None;
         }
         Ok(job)
     }
@@ -5146,5 +5177,44 @@ mod tests {
         assert!(scene.field_status(f).unwrap().current);
         let g = twin.field_id(f.raw()).unwrap();
         assert_eq!(scene.field_target_status(f), twin.field_target_status(g));
+    }
+
+    #[test]
+    fn stale_partial_sign_builds_are_dropped() {
+        // Review M3: an unfinished sign build kept with its field goes once
+        // its mesh changes (at the next call that changes the scene), and
+        // when the field is updated in one call or removed.
+        let (mut scene, _, b, [fa, _]) = deferred_pair(0.2);
+        let edit = |s: &mut Scene, z: f32| {
+            s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, 0.29, z]]))
+                .unwrap();
+        };
+        let partial = |s: &mut Scene| {
+            for _ in 0..2 {
+                assert_eq!(s.field_step(FieldBudget::Points(1)), Ok(StepState::Pending));
+            }
+            s.abandon_field_step();
+        };
+        edit(&mut scene, -0.21);
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        // The target changes: stale, dropped by the next scene change.
+        edit(&mut scene, -0.22);
+        scene.set_defer_fields(true);
+        scene.take_changes();
+        scene.abandon_field_step();
+        scene.set_placement(b, at(0.0, 0.0, 0.0)).unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
+        // Updated in one call: dropped.
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        scene.update_fields().unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
+        // Removed with its field.
+        edit(&mut scene, -0.23);
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        scene.remove_field(fa).unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
     }
 }
