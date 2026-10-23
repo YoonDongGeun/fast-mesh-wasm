@@ -1156,7 +1156,10 @@ impl Stamp {
 /// traversal does) and searches the parts small enough, whole, until it has
 /// done a given amount of work. A side's triangle count is estimated from
 /// its depth (each level halves it), so the split does not depend on
-/// anything but the trees.
+/// anything but the trees. On a badly unbalanced BVH (after many
+/// incremental inserts, say) a part can hold far more pairs than the
+/// estimate, and one step can then take long; the result never depends
+/// on it (a known limitation).
 /// The parts partition the leaf pairs, so every near pair is found in
 /// exactly one of them, and the near pairs are counted against the limit
 /// across parts. The

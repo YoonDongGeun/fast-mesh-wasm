@@ -1359,6 +1359,13 @@ export class WorkerScene implements SceneLike {
    * origin defaults to the bounding-box centre, computed here. The mesh has
    * no slots until the Worker has added it; a failed add shows as an error
    * on `status("mesh:<id>")`, and later calls on it fail with `UNKNOWN_MESH`.
+   *
+   * A mesh of {@link WorkerSceneOptions.backgroundAddTriangles} triangles or
+   * more (65,536 by default) is added in the background: requests sent after
+   * it that do not need it run meanwhile, so a reply to one of them can
+   * arrive before the mesh. Until it lands, `status("mesh:<id>")` reads
+   * `"computing"` and its views are empty; its buffers arrive with that
+   * status turning `"ready"`.
    */
   addMesh(
     positions: Positions64,
