@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshId,
-    MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
+    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshBuild,
+    MeshId, MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
     SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
     UpdateMode,
 };
@@ -44,6 +44,26 @@ pub struct WasmScene {
     /// The update mode of every live mesh, as last set (the scene has no
     /// getter for it).
     modes: BTreeMap<MeshId, UpdateMode>,
+    /// Meshes being added in steps, by build id: the build, its update mode
+    /// and whether it gets vertex normals.
+    adds: BTreeMap<u32, (MeshBuild, UpdateMode, bool)>,
+    /// The id the next `begin_add_mesh` hands out.
+    next_add: u32,
+}
+
+/// A mesh from world positions, stored relative to `origin` (or the
+/// bounding-box centre).
+fn mesh_from(positions: &[f64], indices: &[u32], origin: Option<Vec<f64>>) -> Result<Mesh, Error> {
+    Ok(match origin {
+        None => Mesh::from_buffers_f64(positions, indices)?,
+        Some(o) => {
+            let o: [f64; 3] = o
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::invalid("origin must have 3 values"))?;
+            Mesh::from_buffers_f64_with_origin(positions, indices, o)?
+        }
+    })
 }
 
 /// The update mode of its binding code: 0 Eager, 1 Lazy, 2 Manual.
@@ -178,6 +198,21 @@ impl Default for WasmScene {
 }
 
 impl WasmScene {
+    /// After a mesh `id` is added: its vertex normals (with `normals`), its
+    /// render state and its mode; returns `[index, generation]`. When the
+    /// normals cannot be turned on, the mesh is removed again.
+    fn added(&mut self, id: MeshId, mode: UpdateMode, normals: bool) -> Result<Vec<u32>, Error> {
+        if normals && let Err(e) = self.scene.set_normals(id, true) {
+            // Added and removed before any report: the scene reports nothing.
+            let _ = self.scene.remove_mesh(id);
+            return Err(e.into());
+        }
+        let state = RenderState::new(self.scene.mesh(id)?);
+        self.render.insert(id, state);
+        self.modes.insert(id, mode);
+        Ok(vec![id.index(), id.generation()])
+    }
+
     /// The live mesh id behind `(index, generation)`.
     fn id(&self, index: u32, generation: u32) -> Result<MeshId, Error> {
         self.scene
@@ -226,6 +261,8 @@ impl WasmScene {
             scene: Scene::new(SceneOptions::default()),
             render: BTreeMap::new(),
             modes: BTreeMap::new(),
+            adds: BTreeMap::new(),
+            next_add: 0,
         }
     }
 
@@ -245,30 +282,71 @@ impl WasmScene {
         normals: bool,
     ) -> Result<Vec<u32>, Error> {
         let mode = parse_mode(mode)?;
-        let mesh = match origin {
-            None => Mesh::from_buffers_f64(positions, indices)?,
-            Some(o) => {
-                let o: [f64; 3] = o
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::invalid("origin must have 3 values"))?;
-                Mesh::from_buffers_f64_with_origin(positions, indices, o)?
-            }
-        };
+        let mesh = mesh_from(positions, indices, origin)?;
         let options = MeshOptions {
             mode,
             ..MeshOptions::default()
         };
         let id = self.scene.add_mesh(mesh, options)?;
-        if normals && let Err(e) = self.scene.set_normals(id, true) {
-            // Added and removed before any report: the scene reports nothing.
-            let _ = self.scene.remove_mesh(id);
-            return Err(e.into());
+        self.added(id, mode, normals)
+    }
+
+    /// [`WasmScene::add_mesh`] in steps: starts building the mesh and its
+    /// BVH outside the scene ([`MeshBuild`]) and returns the build's id, for
+    /// [`WasmScene::add_mesh_step`] and [`WasmScene::finish_add_mesh`]. The
+    /// scene is unchanged until the mesh is added.
+    pub fn begin_add_mesh(
+        &mut self,
+        positions: &[f64],
+        indices: &[u32],
+        origin: Option<Vec<f64>>,
+        mode: u8,
+        normals: bool,
+    ) -> Result<u32, Error> {
+        let mode = parse_mode(mode)?;
+        let mesh = mesh_from(positions, indices, origin)?;
+        let options = MeshOptions {
+            mode,
+            ..MeshOptions::default()
+        };
+        let build = MeshBuild::new(mesh, options)?;
+        let id = self.next_add;
+        self.next_add = self.next_add.wrapping_add(1);
+        self.adds.insert(id, (build, mode, normals));
+        Ok(id)
+    }
+
+    /// Builds about `budget` more units of a mesh being added (see
+    /// `MeshBuild::step`); `true` once its BVH is built. A failed build is
+    /// dropped.
+    pub fn add_mesh_step(&mut self, build: u32, budget: u32) -> Result<bool, Error> {
+        let (b, ..) = self
+            .adds
+            .get_mut(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+        match b.step(budget as usize) {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                self.adds.remove(&build);
+                Err(e.into())
+            }
         }
-        let state = RenderState::new(self.scene.mesh(id)?);
-        self.render.insert(id, state);
-        self.modes.insert(id, mode);
-        Ok(vec![id.index(), id.generation()])
+    }
+
+    /// Adds a mesh built in steps, finishing what is left of its BVH, and
+    /// returns `[index, generation]`, as [`WasmScene::add_mesh`] would.
+    pub fn finish_add_mesh(&mut self, build: u32) -> Result<Vec<u32>, Error> {
+        let (b, mode, normals) = self
+            .adds
+            .remove(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+        let id = self.scene.add_mesh_built(b)?;
+        self.added(id, mode, normals)
+    }
+
+    /// Drops a mesh being added in steps (nothing was added).
+    pub fn drop_add_mesh(&mut self, build: u32) {
+        self.adds.remove(&build);
     }
 
     /// Removes a mesh; its id never matches again.

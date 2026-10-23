@@ -939,6 +939,35 @@ export function fieldSteps(scene: Scene): FieldSteps {
 }
 
 /**
+ * Meshes added in steps (the scene crate's `MeshBuild`), for the Worker
+ * engine only: not part of the public API.
+ *
+ * - `begin(positions, indices, options)`: starts building a mesh and its
+ *   BVH outside the scene, as `addMesh` would add it; returns the build's
+ *   token. The scene is unchanged until `finish`.
+ * - `step(token, budget)`: builds about `budget` more units of the BVH (a
+ *   triangle's box, or a triangle visited per tree level); `true` once
+ *   built. A failed build throws and is dropped.
+ * - `finish(token)`: adds the mesh (finishing its BVH first), exactly as
+ *   `addMesh` with the same inputs would, and returns its handle.
+ * - `drop(token)`: forgets a build; nothing is added.
+ */
+interface MeshAdds {
+  begin(positions: Positions64, indices: Indices, options?: AddMeshOptions): number;
+  step(token: number, budget: number): boolean;
+  finish(token: number): MeshHandle;
+  drop(token: number): void;
+}
+
+/** Set by `Scene`'s static block. */
+let meshAddsOf: (scene: Scene) => MeshAdds;
+
+/** @internal The stepped mesh adds of `scene` (see {@link MeshAdds}); for the Worker engine. */
+export function meshAdds(scene: Scene): MeshAdds {
+  return meshAddsOf(scene);
+}
+
+/**
  * A scene of editable meshes. Create it after `await init()`; release it with
  * {@link Scene.free} or a `using` declaration (otherwise it is freed when
  * garbage collected).
@@ -1769,6 +1798,27 @@ export class Scene implements SceneLike {
     // Removing the field ends the colouring in the engine.
     const on = call(() => this.#peek().values_ptr(index, generation)) !== 0;
     return on ? (this.#rules.get(mesh) ?? null) : null;
+  }
+
+  // ---- Stepped mesh adds (internal: see meshAdds) ----
+
+  static {
+    meshAddsOf = (scene) => ({
+      begin: (positions, indices, options = {}) => {
+        const s = scene.#scene();
+        const mode = modeCode(options.mode ?? "eager");
+        const origin = options.origin === undefined ? undefined : Float64Array.from(options.origin);
+        const p = toFloat64(positions);
+        const i = toUint32(indices);
+        return call(() => s.begin_add_mesh(p, i, origin, mode, options.normals ?? true));
+      },
+      step: (token, budget) => call(() => scene.#scene().add_mesh_step(token, budget)),
+      finish: (token) => {
+        const id = call(() => scene.#scene().finish_add_mesh(token));
+        return scene.#meshHandle(id[0], id[1]);
+      },
+      drop: (token) => call(() => scene.#peek().drop_add_mesh(token)),
+    });
   }
 
   // ---- Stepped field updates (internal: see fieldSteps) ----

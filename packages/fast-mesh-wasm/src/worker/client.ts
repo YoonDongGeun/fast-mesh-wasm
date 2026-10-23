@@ -989,6 +989,9 @@ export class WorkerScene implements SceneLike {
         this.#ready.resolve();
       } else if (msg.kind === "fatal") {
         this.#poisonAll(msg.error);
+      } else if (msg.kind === "update") {
+        // A background add landed while the Worker was idle: no batch's.
+        this.#apply(msg.result, []);
       }
       return;
     }
@@ -2358,10 +2361,12 @@ export class WorkerScene implements SceneLike {
           f64: true,
           indices: indices.buffer as ArrayBuffer,
           options: { origin: st.origin, normals: st.normalsOn },
+          // The restart resolves with every mesh live.
+          inline: true,
         });
       } else if (st.add !== undefined && !st.sent) {
         // Never sent: its buffers are still here.
-        st.add = { ...st.add, rev: ++this.#rev };
+        st.add = { ...st.add, rev: ++this.#rev, inline: true };
         this.#push(st.add);
       } else {
         const key = `mesh:${st.id}`;

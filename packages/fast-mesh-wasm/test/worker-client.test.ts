@@ -644,6 +644,55 @@ describe("WorkerScene", () => {
     drawn.dispose();
   });
 
+  it("background_add_lands_with_an_update", async () => {
+    // A mesh of 2 x 182^2 = 66,248 triangles is added in the background
+    // (the engine's default threshold is 65,536): its batch's result comes
+    // back without it, and it lands in an update message while the Worker
+    // is idle, with its status and every buffer.
+    const { scene } = await start();
+    const n = 182;
+    const positions = new Float64Array(3 * (n + 1) * (n + 1));
+    for (let j = 0, o = 0; j <= n; j++) {
+      for (let i = 0; i <= n; i++, o += 3) {
+        positions.set([i * 0.01, j * 0.01, 0.05 * Math.sin(i * 0.2) * Math.cos(j * 0.3)], o);
+      }
+    }
+    const indices = new Uint32Array(6 * n * n);
+    for (let j = 0, t = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const a = j * (n + 1) + i;
+        indices.set([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1], t);
+        t += 6;
+      }
+    }
+    const big = scene.addMesh(positions, indices);
+    const key = `mesh:${scene.idOf(big)}`;
+    const ready = new Promise<void>((resolve) => {
+      const off = scene.onStatus(() => {
+        if (scene.status(key).status === "ready") {
+          off();
+          resolve();
+        }
+      });
+    });
+    scene.commitFrame();
+    expect(scene.status(key).status).toBe("computing");
+    await ready;
+    const records = scene.commitFrame();
+    expect(records.find((c) => c.mesh === big)?.added).toBe(true);
+    expect(scene.views(big).positions().length).toBe(3 * (n + 1) * (n + 1));
+    await expectMirrored(scene, big);
+    // The same as a synchronous add.
+    const local = new Scene();
+    try {
+      const m = local.addMesh(positions, indices);
+      expect(bytes(scene.views(big).positions())?.equals(bytes(local.views(m).positions()) as Buffer)).toBe(true);
+      expect(bytes(scene.views(big).normals())?.equals(bytes(local.views(m).normals()) as Buffer)).toBe(true);
+    } finally {
+      local.free();
+    }
+  });
+
   it("status_computing_then_ready", async () => {
     const { scene, w } = await start();
     const s = sphere([0, 0, 0]);

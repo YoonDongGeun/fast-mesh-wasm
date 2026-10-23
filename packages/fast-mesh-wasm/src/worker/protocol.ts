@@ -57,6 +57,12 @@ export type Request =
       indices: ArrayBuffer;
       /** `mode` is ignored: the Worker scene is always `"eager"`. */
       options: AddMeshOptions;
+      /**
+       * Add in place, in the batch's own result (a restart's replay), never
+       * in the background: by default a large mesh is built in the
+       * background and lands with a later result or `update` message.
+       */
+      inline?: boolean;
       key?: string;
     }
   | { kind: "removeMesh" | "compact"; rev: number; id: ClientId; key?: string }
@@ -285,10 +291,14 @@ export function isInit(data: unknown): data is InitMessage {
  * `{ kind: "fallback" }` replaces the ready message when the threaded pool
  * did not start: the Worker gives back the batches it received (later ones
  * follow, one message each) and expects to be replaced by a single-threaded
- * Worker, which gets them.
+ * Worker, which gets them. `{ kind: "update" }` carries a result that
+ * belongs to no batch: a mesh added in the background landed while the
+ * Worker was idle (its frame, and the add's status); its `rev` is that of
+ * the last batch result.
  */
 export type WorkerMessage =
   | Result
+  | { kind: "update"; result: Result }
   | { kind: "ready"; threads?: number; warning?: string }
   | { kind: "fallback"; batches: Request[][]; warning?: string }
   | { kind: "fatal"; error: ErrorWire };

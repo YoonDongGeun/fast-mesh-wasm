@@ -8,14 +8,18 @@
 // they left due are computed in steps, and a recompute made stale by a queued
 // request is abandoned at a step boundary (§6.1 of the drag-speed design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
-// statuses and replies. Pure: it talks only through `Port`, so it runs in a
-// browser Worker or in Node `worker_threads`.
+// statuses and replies. A large mesh is added in the background: its BVH is
+// built in steps outside the scene while later requests that do not depend
+// on it run, and it lands in the frame of the batch under way then (or in an
+// `update` message when the Worker is idle). Pure: it talks only through
+// `Port`, so it runs in a browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
 import {
   type EditOp,
   type FieldHandle,
   fieldSteps,
+  meshAdds,
   type MeshChange,
   type MeshHandle,
   type RepairOp,
@@ -49,6 +53,12 @@ export { loadEngine, startEngine } from "./load.js";
 /** The engine's side of the message channel. */
 export interface Port {
   post(msg: Result, transfer: Transferable[]): void;
+  /**
+   * Posts a result that belongs to no batch (`{ kind: "update" }` on the
+   * wire): a background add landed while the engine was idle. Without it,
+   * meshes are never added in the background.
+   */
+  postUpdate?(msg: Result, transfer: Transferable[]): void;
   /** `cb` gets each batch of requests, in the order they were sent. */
   onMessage(cb: (batch: Request[]) => void): void;
 }
@@ -65,7 +75,9 @@ export interface EngineOptions {
    * is the request's), every field computed (`"fieldBuild"`, `id` is the
    * field's client id), every step of a field add's build
    * (`"fieldBuildStep"`, with the id) and every such build abandoned for a
-   * superseded display (`"fieldBuildAbandon"`), every operation of a repair
+   * superseded display (`"fieldBuildAbandon"`), every background add started
+   * (`"addMeshBegin"`), stepped (`"addMeshStep"`) and landed (`"addMesh"`),
+   * with the mesh's id, every operation of a repair
    * list run in steps (`"repairOp"`), every field step (`"fieldStep"`) and
    * every abandoned field step unit (`"fieldStepAbandon"`).
    */
@@ -98,6 +110,19 @@ export interface EngineOptions {
    * that pauses without ending may wait up to two).
    */
   staleGuardMs?: number;
+  /**
+   * Meshes of at least this many triangles are added in the background
+   * ({@link BACKGROUND_ADD_TRIANGLES} by default): see
+   * {@link Engine.#beginAdd}. `0` adds every mesh so (tests);
+   * `Infinity` none.
+   */
+  backgroundAddTriangles?: number;
+  /**
+   * The work of one step of a background add's BVH build
+   * ({@link ADD_STEP_WORK} by default): a triangle's box, or a triangle
+   * visited per tree level.
+   */
+  addStepWork?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
@@ -108,6 +133,15 @@ export const STALE_GUARD_MS = 200;
 
 /** The default {@link EngineOptions.stepPoints}. */
 export const STEP_POINTS = 4096;
+
+/**
+ * The default {@link EngineOptions.backgroundAddTriangles}: smaller meshes
+ * add in well under a frame, in place.
+ */
+export const BACKGROUND_ADD_TRIANGLES = 65_536;
+
+/** The default {@link EngineOptions.addStepWork}: a few milliseconds of BVH build. */
+export const ADD_STEP_WORK = 100_000;
 
 /** A step budget that computes a whole unit at once. */
 const ALL_POINTS = 0xffff_ffff;
@@ -187,6 +221,7 @@ export function serveEngine(
         runEngine(
           {
             post: (msg, transfer) => endpoint.post(msg, transfer),
+            postUpdate: (result, transfer) => endpoint.post({ kind: "update", result }, transfer),
             onMessage: (cb) => {
               deliver = cb;
               for (const batch of early.splice(0)) {
@@ -329,6 +364,18 @@ class Batch {
 const END = Symbol("end of batch");
 type Item = Request | typeof END;
 
+/** A mesh being added in the background (see {@link Engine.#beginAdd}). */
+interface PendingAdd {
+  id: ClientId;
+  /** The build's token (`meshAdds`). */
+  token: number;
+  /** The add's status key and revision, held until it lands. */
+  key: string | undefined;
+  rev: number;
+  /** Built, waiting to land (not while a field step unit is open). */
+  built: boolean;
+}
+
 /**
  * Yields to the message loop, so batches sent meanwhile are received:
  * `setImmediate` where there is one (Node: a chain of `MessageChannel` ticks
@@ -362,6 +409,16 @@ class Engine {
   readonly #scene = new Scene();
   /** The scene's stepped field updates (internal API). */
   readonly #steps = fieldSteps(this.#scene);
+  /** The scene's stepped mesh adds (internal API). */
+  readonly #meshAdds = meshAdds(this.#scene);
+  /** Meshes being added in the background, in arrival order. */
+  readonly #adds: PendingAdd[] = [];
+  readonly #backgroundAdd: number;
+  readonly #addStepWork: number;
+  /** The revision of the last result posted, for `update` messages. */
+  #lastRev = 0;
+  /** A received batch is being run: its first request started, its result is not posted yet. */
+  #batchOpen = false;
   /** Requests received and not run yet, each batch followed by {@link END}. */
   readonly #queue: Item[] = [];
   /** A drain is under way (possibly waiting at a yield). */
@@ -433,8 +490,23 @@ class Engine {
     const points = Math.floor(options.stepPoints ?? STEP_POINTS);
     this.#stepPoints = points >= 1 ? Math.min(points, ALL_POINTS) : 1;
     this.#staleGuardMs = options.staleGuardMs ?? STALE_GUARD_MS;
+    this.#backgroundAdd = options.backgroundAddTriangles ?? BACKGROUND_ADD_TRIANGLES;
+    this.#addStepWork = Math.max(1, Math.floor(options.addStepWork ?? ADD_STEP_WORK));
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
+  }
+
+  /**
+   * {@link Engine.#maybeYield}, first advancing the oldest background add by
+   * one step when the time budget is spent, so that adds go on while the
+   * engine is busy (about half the time at most). `false` once poisoned.
+   */
+  async #yieldWithAdds(land = true): Promise<boolean> {
+    if (this.#adds.length > 0 && now() - this.#yielded >= this.#yieldMs && !(await this.#advanceAdd(land))) {
+      return false;
+    }
+    await this.#maybeYield();
+    return true;
   }
 
   /**
@@ -521,17 +593,31 @@ class Engine {
     this.#running = true;
     this.#yielded = now();
     try {
-      while (this.#queue.length > 0) {
+      while (this.#queue.length > 0 || this.#adds.length > 0) {
+        if (this.#queue.length === 0) {
+          // Idle but for background adds: one step, then let messages in.
+          if (!(await this.#advanceAdd())) {
+            return;
+          }
+          await this.#tick();
+          this.#yielded = now();
+          continue;
+        }
         const item = this.#queue.shift() as Item;
         if (item === END) {
+          this.#batchOpen = true;
           if (!(await this.#stepFields()) || !this.#finish()) {
             return;
           }
-        } else if (!(await this.#step(item))) {
-          return;
+          this.#batchOpen = false;
+        } else {
+          this.#batchOpen = true;
+          if (!(await this.#step(item))) {
+            return;
+          }
         }
-        if (this.#queue.length > 0 && this.#queue[0] !== END) {
-          await this.#maybeYield();
+        if (this.#queue.length > 0 && this.#queue[0] !== END && !(await this.#yieldWithAdds())) {
+          return;
         }
       }
     } finally {
@@ -547,7 +633,16 @@ class Engine {
     if (this.#superseded(req, key) || this.#abandoned(req, key)) {
       return true;
     }
+    if (this.#adds.length > 0 && this.#dependsOnAdds(req) && !(await this.#finishAdds())) {
+      return false;
+    }
     try {
+      if (req.kind === "addMesh" && this.#inBackground(req)) {
+        this.#beginAdd(req);
+        // Its status is held until it lands.
+        this.#onChunk?.({ kind: "addMeshBegin", id: req.id });
+        return true;
+      }
       if (req.kind === "repair" && this.#inSteps(req)) {
         await this.#repairInSteps(req, b);
       } else if (req.kind === "field" && req.op === "add") {
@@ -573,6 +668,193 @@ class Engine {
       }
     }
     return true;
+  }
+
+  // ---- Background adds ----
+
+  /**
+   * Whether an add runs in the background: the port can post updates, the
+   * mesh is large enough, and the add is not asked to run in place.
+   */
+  #inBackground(req: Extract<Request, { kind: "addMesh" }>): boolean {
+    return (
+      this.#port.postUpdate !== undefined &&
+      req.inline !== true &&
+      req.indices.byteLength / 12 >= this.#backgroundAdd
+    );
+  }
+
+  /**
+   * Starts adding a mesh in the background: the mesh and its BVH are built
+   * outside the scene, a step at a time between other chunks and while the
+   * Worker is idle, and it lands in the scene when built, in arrival order
+   * with the other background adds. Until then its status is held, and a
+   * request that depends on it ({@link Engine.#dependsOnAdds}) first
+   * finishes every background add; other requests run meanwhile.
+   */
+  #beginAdd(req: Extract<Request, { kind: "addMesh" }>): void {
+    if (this.#meshes.has(req.id) || this.#adds.some((a) => a.id === req.id)) {
+      throw invalid(`mesh client id ${req.id} is already in use`);
+    }
+    const positions = req.f64 ? new Float64Array(req.positions) : new Float32Array(req.positions);
+    const token = this.#meshAdds.begin(positions, new Uint32Array(req.indices), { ...req.options, mode: "eager" });
+    this.#adds.push({ id: req.id, token, key: keyOf(req), rev: req.rev, built: false });
+  }
+
+  /** Whether a mesh of `ids` is being added in the background. */
+  #pending(...ids: unknown[]): boolean {
+    return this.#adds.some((a) => ids.includes(a.id));
+  }
+
+  /**
+   * Whether `req` must see the background adds landed first: it names one
+   * of their meshes, adds or removes a mesh (slots are allocated in arrival
+   * order), or queries every mesh (`raycast`, `closestPoint` without a mesh,
+   * `findContacts` without pairs).
+   */
+  #dependsOnAdds(req: Request): boolean {
+    switch (req.kind) {
+      case "addMesh":
+      case "removeMesh":
+        return true;
+      case "compact":
+      case "setPlacement":
+      case "drag":
+      case "edit":
+      case "repair":
+      case "coloring":
+        return this.#pending(req.id);
+      case "field":
+        return req.desc !== undefined && this.#pending(req.desc.on, ...req.desc.to);
+      case "section": {
+        const meshes = req.desc?.meshes;
+        return Array.isArray(meshes) && this.#pending(...meshes);
+      }
+      case "query": {
+        const a = (req.args ?? {}) as {
+          a?: ClientId;
+          b?: ClientId;
+          mesh?: ClientId;
+          options?: { mesh?: ClientId };
+          pairs?: [ClientId, ClientId][];
+        };
+        switch (req.name) {
+          case "raycast":
+            return true;
+          case "closestPoint":
+            return a.options?.mesh === undefined || this.#pending(a.options.mesh);
+          case "findContacts":
+            return a.pairs === undefined || this.#pending(...a.pairs.flat());
+          default:
+            return this.#pending(a.a, a.b, a.mesh);
+        }
+      }
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Advances the oldest background add by one step and, with `land`, lands
+   * it once built (landing changes the scene, which would drop an open
+   * field step unit: the unit's loop steps without landing). A build that
+   * fails is dropped, with an error status for its add. `false` once
+   * poisoned.
+   */
+  async #advanceAdd(land = true): Promise<boolean> {
+    const a = this.#adds[0];
+    if (a === undefined) {
+      return true;
+    }
+    if (!a.built) {
+      try {
+        a.built = this.#meshAdds.step(a.token, this.#addStepWork);
+      } catch (e) {
+        return this.#addFailed(a, e);
+      }
+      this.#onChunk?.({ kind: "addMeshStep", id: a.id });
+    }
+    return a.built && land ? this.#land(a) : true;
+  }
+
+  /** Finishes every background add, in arrival order, yielding (to receive only) between steps. */
+  async #finishAdds(): Promise<boolean> {
+    while (this.#adds.length > 0) {
+      if (!(await this.#advanceAdd())) {
+        return false;
+      }
+      if (this.#adds.length > 0) {
+        await this.#maybeYield();
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Adds a built mesh to the scene. Its status goes with the batch under
+   * way, or, when the Worker is idle (no batch received and not finished),
+   * in an `update` message with the frame it lands in.
+   */
+  #land(a: PendingAdd): boolean {
+    this.#adds.shift();
+    let h: MeshHandle;
+    try {
+      h = this.#meshAdds.finish(a.token);
+    } catch (e) {
+      return this.#addFailed(a, e, true);
+    }
+    this.#meshes.set(a.id, h);
+    this.#meshIds.set(h, a.id);
+    this.#onChunk?.({ kind: "addMesh", id: a.id });
+    this.#settle((b) => b.ready(a.key, a.rev));
+    return true;
+  }
+
+  /** Drops a failed background add; `false` (poisoned) on a trap. */
+  #addFailed(a: PendingAdd, e: unknown, taken = false): boolean {
+    if (!taken) {
+      this.#adds.shift();
+      try {
+        this.#meshAdds.drop(a.token);
+      } catch {
+        // Gone already.
+      }
+    }
+    if (isPoison(e)) {
+      const b = this.#batchOpen ? this.#batch : new Batch();
+      b.error(a.key, a.rev, POISONED);
+      this.#poison(b, POISONED, undefined, !this.#batchOpen);
+      return false;
+    }
+    const error = toWire(e);
+    this.#settle((b) => b.error(a.key, a.rev, error));
+    return true;
+  }
+
+  /**
+   * Records a background add's outcome with `put`: in the batch under way,
+   * or, when the Worker is idle, in an `update` message with the frame.
+   */
+  #settle(put: (b: Batch) => void): void {
+    if (this.#batchOpen) {
+      put(this.#batch);
+      return;
+    }
+    const b = new Batch();
+    b.rev = this.#lastRev;
+    put(b);
+    let result: Result;
+    try {
+      result = this.#result(b);
+    } catch (e) {
+      this.#poison(b, isPoison(e) ? POISONED : packingFailed(e), undefined, true);
+      return;
+    }
+    try {
+      this.#port.postUpdate?.(result, b.transfer);
+    } catch (e) {
+      this.#poison(b, packingFailed(e), undefined, true);
+    }
   }
 
   /**
@@ -632,7 +914,9 @@ class Engine {
         b.status.push(...this.#held.splice(0));
         return true;
       }
-      await this.#maybeYield();
+      if (!(await this.#yieldWithAdds(false))) {
+        return false;
+      }
       if (meshes !== undefined && this.#staleQueued(meshes)) {
         steps.abandon();
         this.#onChunk?.({ kind: "fieldStepAbandon" });
@@ -730,6 +1014,7 @@ class Engine {
       this.#poison(b, isPoison(e) ? POISONED : packingFailed(e), undefined, true);
       return false;
     }
+    this.#lastRev = Math.max(this.#lastRev, result.rev);
     try {
       this.#port.post(result, b.transfer);
     } catch (e) {
@@ -987,7 +1272,7 @@ class Engine {
     const s = this.#scene;
     switch (req.kind) {
       case "addMesh": {
-        if (this.#meshes.has(req.id)) {
+        if (this.#meshes.has(req.id) || this.#adds.some((a) => a.id === req.id)) {
           throw invalid(`mesh client id ${req.id} is already in use`);
         }
         const positions = req.f64 ? new Float64Array(req.positions) : new Float32Array(req.positions);
