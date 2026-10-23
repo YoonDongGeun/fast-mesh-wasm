@@ -229,7 +229,9 @@ type Posted = { update: boolean; result: Result };
  * The engine in-process with background adds for meshes of 2000 triangles or more (BIG, not A or B) in
  * small steps, and an update channel.
  */
-function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: number; addStepWork?: number } = {}) {
+function addEngine(
+  options: { backgroundAddTriangles?: number; stepPoints?: number; addStepWork?: number; threads?: number } = {},
+) {
   const posted: Posted[] = [];
   const chunks: { kind: string; id?: ClientId }[] = [];
   const waiting: (() => void)[] = [];
@@ -275,6 +277,7 @@ function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: numb
       debug: true,
       yieldMs: 0,
       addStepWork: options.addStepWork ?? 64,
+      threads: options.threads,
       stepPoints: options.stepPoints,
       backgroundAddTriangles: options.backgroundAddTriangles ?? 2000,
       onChunk: (chunk) => {
@@ -351,11 +354,36 @@ describe("background adds", () => {
     expect(u.placements.map((p) => p.id)).toEqual([3]);
   });
 
-  it("a_waiting_request_finishes_the_add_in_one_call", async () => {
-    // Review I3: once a request depends on a background add, the rest of
-    // the build runs in one call (the one-call, parallel build), not in
-    // small steps with yields.
+  it("a_waiting_request_steps_the_add_single_threaded", async () => {
+    // Re-review R1: single-threaded, a request waiting on a background add
+    // still lets the add go on in steps with yields (the one-call build
+    // would not be faster), so newer batches arrive and coalesce meanwhile.
     const h = addEngine();
+    h.send([addMeshReq(1, A)]);
+    await h.until(() => h.results().length === 1);
+    let arrived = -1;
+    h.onChunk = (chunk) => {
+      if (chunk.kind === "addMeshStep" && arrived < 0) {
+        arrived = h.chunks.length;
+        h.later([placement(1, 0.25)]);
+      }
+    };
+    h.send([addMeshReq(3, BIG), placement(3, 0.5)]);
+    await h.until(() => h.results().length === 3);
+    const steps = h.chunks.filter((c) => c.kind === "addMeshStep" && c.id === 3).length;
+    expect(steps).toBeGreaterThan(10);
+    // The batch sent during the wait was received before the add landed.
+    const landed = h.chunks.findIndex((c) => c.kind === "addMesh" && c.id === 3);
+    expect(arrived).toBeGreaterThan(0);
+    expect(arrived).toBeLessThan(landed);
+    expect(h.results()[1].status.map((st) => st.key)).toEqual(["mesh:3", "placement:3"]);
+  });
+
+  it("a_waiting_request_finishes_the_add_in_one_call_threaded", async () => {
+    // Review I3: on a threaded engine, once a request depends on a
+    // background add, the rest of the build runs in one call (the
+    // one-call, parallel build), not in small steps with yields.
+    const h = addEngine({ threads: 4 });
     h.send([addMeshReq(1, A)]);
     await h.until(() => h.results().length === 1);
     h.send([addMeshReq(3, BIG), placement(3, 0.5)]);

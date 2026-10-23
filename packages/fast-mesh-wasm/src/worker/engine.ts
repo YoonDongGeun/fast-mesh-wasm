@@ -128,6 +128,14 @@ export interface EngineOptions {
    * keeps the default.
    */
   addStepWork?: number;
+  /**
+   * The threads the engine computes with (1 by default; {@link serveEngine}
+   * passes what the start reports). With more than one, a request waiting
+   * on a background add lands it in one call (the parallel one-call
+   * build, several times faster than steps); with one, it keeps stepping
+   * with yields, which costs the same, so newer batches still arrive.
+   */
+  threads?: number;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
@@ -236,7 +244,7 @@ export function serveEngine(
               }
             },
           },
-          engineOptions,
+          { threads, ...engineOptions },
         );
       },
       (e: unknown) => {
@@ -425,6 +433,8 @@ class Engine {
   readonly #adds: PendingAdd[] = [];
   readonly #backgroundAdd: number;
   readonly #addStepWork: number;
+  /** More than one thread: a waiting request finishes adds in one call. */
+  readonly #threaded: boolean;
   /** The revision of the last result posted, for `update` messages. */
   #lastRev = 0;
   /** A received batch is being run: its first request started, its result is not posted yet. */
@@ -512,6 +522,7 @@ class Engine {
     // At least one unit a step (NaN or below 1: the default); at most what one call takes.
     const work = Math.floor(options.addStepWork ?? ADD_STEP_WORK);
     this.#addStepWork = work >= 1 ? Math.min(work, ALL_POINTS) : ADD_STEP_WORK;
+    this.#threaded = (options.threads ?? 1) > 1;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
   }
@@ -821,15 +832,25 @@ class Engine {
   /**
    * Finishes every background add, in arrival order, for `failed`, the
    * request that waits on them (it is among the failed requests if they
-   * poison the engine). Each lands in one call, which builds what is left
-   * of its BVH at once (the one-call build, parallel in the threaded
-   * engine): the request waits for it anyway, and small steps would only
-   * make that slower.
+   * poison the engine). Threaded, each lands in one call, which builds
+   * what is left of its BVH at once with the parallel one-call build
+   * (several times faster than steps). Single-threaded the two cost the
+   * same, so it keeps stepping, yielding (to receive only) between steps,
+   * so that newer batches still arrive and coalesce.
    */
   async #finishAdds(failed?: Request): Promise<boolean> {
     while (this.#adds.length > 0) {
-      if (!this.#land(this.#adds[0], failed)) {
+      if (this.#threaded) {
+        if (!this.#land(this.#adds[0], failed)) {
+          return false;
+        }
+        continue;
+      }
+      if (!(await this.#advanceAdd(true, failed))) {
         return false;
+      }
+      if (this.#adds.length > 0) {
+        await this.#maybeYield();
       }
     }
     return true;
