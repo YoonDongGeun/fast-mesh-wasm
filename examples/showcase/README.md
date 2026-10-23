@@ -1,0 +1,97 @@
+# fast-mesh-wasm showcase
+
+A small mesh tool built on the library: load meshes, move them, repair them, and see how two meshes
+touch as a contact heatmap. Vite + React + React Three Fiber over a `SceneStore`
+(`fast-mesh-wasm/store`), drawn with `<FastMesh>` (`fast-mesh-wasm/r3f`).
+
+```sh
+pnpm build                                          # the library (once)
+pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
+```
+
+- **Load.** Open or drop STL (binary and ASCII), OBJ and PLY (ASCII and binary little-endian) files.
+  They are read and parsed in a Worker (`src/load/parser.worker.ts`); the page only calls
+  `store.addMesh` with the transferred arrays. Each file shows its progress. STL corners with
+  bit-identical positions share a vertex.
+- **Demo meshes.** A (a blobby sphere), B (a rounded box penetrating A) and C (a shell with two holes
+  and a floating piece) are generated in the same Worker when the app opens.
+- **Mesh list.** Name, triangle count, visibility, opacity; select, focus the camera, remove.
+- **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
+  `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
+  Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
+- **Repair.** For the selected mesh, `analyze` lists its holes (with their sizes), orientation
+  conflicts, components (floating pieces), non-manifold edges and vertices, and degenerate triangles.
+  The buttons run the library's repairs through `store.repair`, each one undo step: Weld (within a
+  distance), Remove degenerate, Orient, Remove small components (below a triangle count) and Fill
+  holes (up to 64 edges by default; an empty limit fills any size, an open mesh's outer boundary
+  included; optionally faired to follow the curvature). Each shows its report while the analysis
+  refreshes; a repair, its undo and its redo all re-analyse, and an undo or redo clears the report.
+- **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
+  signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
+  depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
+  from (mm)*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
+  *Fast mode (large meshes)* bounds the fields at twice the larger of depth and colour from (so the
+  coloured area's outer edge still softens with *Boundary softness*), and a deeper
+  penetration shows the mesh colour. The colourings are drawn with fragment shading
+  (`<FastMesh shading="fragment">`): each pixel is coloured from its interpolated distance, so the
+  edge of the coloured area and the contact band are crisp iso-lines rather than blurred across a
+  triangle. *Boundary softness* widens them into a blend that many distance units wide (0, the
+  default, is a hard edge). Readouts, refreshed at most about four times a second as the
+  meshes change, paused while the gizmo drags (the colours stay live; reading field values would
+  force stale poses up to date) and refreshed when the drag ends:
+  - **Max penetration**: the deepest negative value of either colouring
+    (`store.fetchColoringValues`). In fast mode it is measured within the bound (the panel says
+    so), and reads "≥ bound" while the meshes intersect and the deepest value is within 10% of the
+    bound, or no vertex inside the other mesh is within it.
+  - **Min gap**: `meshDistance`, 0 when the surfaces touch.
+  - **Intersecting**: `intersects`.
+  - **In contact**: each mesh's triangles within the tolerance of the other
+    (`findContacts({ margin: tolerance })`).
+
+  When A or B is open (boundary loops, open chains or open components) or inconsistently oriented
+  (orientation conflicts), from `analyze` of it when the pair changes or its triangles change, the
+  panel says so: penetration measured to it then follows its surface normals; Orient or Fill holes
+  give a closed result. Removing A or B stops the colouring and resets its picker.
+- **Collision: Group mode.** Tick several meshes (the first three by default) into a contact group
+  (`store.setContactGroup`), measured to each other in *All pairs* or in the pairs ticked in a small
+  matrix. Each member gets one field measured to all of its partners and one colour scale, the same
+  heatmap and sliders as the pair: each vertex shows its distance to the nearest partner surface (or
+  the deepest penetration). Moving a member recomputes only its own field and its partners'. A
+  readout per pair, throttled and paused during drags like the pair's: *Min gap* (`meshDistance`),
+  *Hit* (`intersects`) and *Max depth*, the deepest negative value of either member at the vertices
+  the other is nearest to (`store.fetchColoringValues` and the field's `nearest` buffer, whose
+  indices follow `store.coloringTargets`; a vertex inside two partners counts for the deeper one
+  only), read "≥ bound" in fast mode under the same rule as the pair. Hovering a member shows which
+  partner the vertex under the pointer is nearest to and how far: the vertex is found with the
+  engine's BVH `raycast` (one at a time, at most every 50 ms), and the `nearest` buffer is read
+  through `fetchFieldNearest`, or `fieldNearest` with `?local`, when the member is first hovered
+  and after it changes, never during a drag. Open or inconsistently oriented members get the same
+  warning as the pair. Removing a member keeps the others coloured with their remaining partners.
+- **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
+  page is cross-origin isolated, and on an error its message with Restart.
+
+URL options:
+
+| Option | Effect |
+| --- | --- |
+| `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh. The exact depth (the default) recomputes every coloured vertex on the main thread on every drag frame, so dragging large meshes stutters: use *Fast mode* there |
+| `?big` | Demo meshes A and B at about a million triangles each |
+| `?threads=N` | Ask for N engine threads |
+
+The dev and preview servers send the cross-origin isolation headers (COOP/COEP, a middleware in
+`vite.config.ts`), so the Worker scene runs its multithreaded engine.
+
+## Checks
+
+```sh
+pnpm --filter fast-mesh-wasm-example-showcase test   # parsers, demo meshes, panel arithmetic (vitest)
+node scripts/showcase-check.mjs --threads 4          # a scripted session in headless Chrome (on the build; --build builds first)
+node scripts/showcase-check.mjs --big                # plus a 1M-triangle STL upload (main thread < 50 ms)
+```
+
+The scripted session selects and drags A with the gizmo and undoes it; checks the heatmap of A and
+B and its readouts while A is dragged away; picks the open mesh C as B and expects the open-mesh
+warning; fills C's holes while it is coloured and undoes it; colours A, B and C as a contact group
+(colours on all three, the per-pair readouts, the hover tip, the pair matrix) and removes C from it;
+removes B while it is coloured; loads STL, OBJ and PLY files (and a broken one); then repeats a
+short session with `?local` (the group's readouts included). It fails on any console error.

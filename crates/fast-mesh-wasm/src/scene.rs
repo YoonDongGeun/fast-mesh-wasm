@@ -137,7 +137,7 @@ fn parse_rgba(v: &[f32]) -> Result<[u8; 4], Error> {
 /// 4 custom stops) and `rule`: `[lo, hi, center (NaN for none), below,
 /// above, base rgba, nan rgba]`, then for custom stops `(t, r, g, b, a)`
 /// each. The rule's own checks run in [`Scene::set_coloring`].
-fn parse_rule(map: u8, rule: &[f32]) -> Result<ColorRule, Error> {
+pub(crate) fn parse_rule(map: u8, rule: &[f32]) -> Result<ColorRule, Error> {
     const HEAD: usize = 13;
     let (stops_flat, rest) = rule.get(HEAD..).unwrap_or_default().as_chunks::<5>();
     if rule.len() < HEAD || !rest.is_empty() || (map != 4 && !stops_flat.is_empty()) {
@@ -408,6 +408,21 @@ impl WasmScene {
     pub fn colors_len(&self, index: u32, generation: u32) -> Result<u32, Error> {
         let c = self.scene.colors(self.id(index, generation)?)?;
         Ok(c.map_or(0, |c| len(c.len() * 4)))
+    }
+
+    /// Address of the values the colours are made from (`f32`, 1 per vertex
+    /// slot: the colouring field's channel), 0 when the mesh has no
+    /// colouring. They change only at the colours' dirty slots.
+    pub fn values_ptr(&self, index: u32, generation: u32) -> Result<u32, Error> {
+        let v = self.scene.color_values(self.id(index, generation)?)?;
+        Ok(v.map_or(0, addr))
+    }
+
+    /// Length of the colour values in `f32`s, 0 when the mesh has no
+    /// colouring.
+    pub fn values_len(&self, index: u32, generation: u32) -> Result<u32, Error> {
+        let v = self.scene.color_values(self.id(index, generation)?)?;
+        Ok(v.map_or(0, |v| len(v.len())))
     }
 
     /// Address of the index buffer (`u32`, 3 per triangle slot; a removed
@@ -1545,11 +1560,18 @@ mod tests {
             r.extend_from_slice(extra);
             r
         };
+        assert_eq!(s.values_ptr(ai, ag).unwrap(), 0);
+        assert_eq!(s.values_len(ai, ag).unwrap(), 0);
         s.set_coloring(ai, ag, f, 0, &rule(&[])).unwrap();
         assert_eq!(s.colors_len(ai, ag).unwrap(), 24);
+        // The values behind the colours: a view of the field's channel.
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
+        assert_eq!(s.values_ptr(ai, ag).unwrap(), values.as_ptr() as u32);
+        assert_eq!(s.values_len(ai, ag).unwrap(), 6);
         assert!(s.take_changes()[3] & FLAG_COLORS_ALL != 0);
         s.clear_coloring(ai, ag).unwrap();
         assert_eq!(s.colors_ptr(ai, ag).unwrap(), 0);
+        assert_eq!(s.values_ptr(ai, ag).unwrap(), 0);
         // Display settings leave history alone: the redo step survives.
         assert!(s.can_redo());
         // Custom stops, and every malformed rule.

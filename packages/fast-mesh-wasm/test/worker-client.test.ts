@@ -8,11 +8,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import * as THREE from "three";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FastMeshError, type MeshHandle, Scene, type Vec3 } from "../src/node.js";
+import { FastMeshError, type MeshChange, type MeshHandle, Scene, type Vec3 } from "../src/node.js";
 import { bindMesh, bindSection } from "../src/three/index.js";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "../src/worker/index.js";
 import { debugDump, FALLBACK_FLUSH_MS } from "../src/worker/client.js";
-import type { Request } from "../src/worker/protocol.js";
+import type { MeshChangeWire, Request } from "../src/worker/protocol.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 
@@ -158,14 +158,17 @@ function bytes(v: ArrayBufferView | null): Buffer | null {
 
 /** The mirrors of `mesh` equal the Worker engine's buffers byte for byte, and its matrix. */
 async function expectMirrored(scene: WorkerScene, mesh: MeshHandle): Promise<void> {
+  // The values mirror is opt-in: turned on (if it was not) in the same batch.
+  scene.views(mesh).values?.();
   const pending = debugDump(scene, mesh);
   // Sent now, not by the fallback timer (this also delivers pending records).
   scene.commitFrame();
   const dump = await pending;
   const v = scene.views(mesh);
-  for (const name of ["positions", "normals", "colors", "indices"] as const) {
+  for (const name of ["positions", "normals", "colors", "values", "indices"] as const) {
+    expect(dump[name], `${name} dumped`).not.toBeUndefined();
     const want = bytes(dump[name]);
-    const got = bytes(v[name]());
+    const got = bytes(v[name]?.() ?? null);
     if (want === null || got === null) {
       expect(got, name).toBe(want);
     } else {
@@ -219,6 +222,107 @@ describe("WorkerScene", () => {
     local.free();
   });
 
+  it("values_mirror_is_opt_in", async () => {
+    const { scene, w } = await start();
+    const sent: (ArrayBuffer | null)[] = [];
+    w.worker.on("message", (data: { changes?: MeshChangeWire[] }) => {
+      for (const c of data.changes ?? []) {
+        sent.push(c.bytes.values);
+      }
+    });
+    const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
+    const b = scene.addMesh(sphere([2.5, 0, 0]).positions, sphere([2.5, 0, 0]).indices);
+    const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
+    scene.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    await settle(scene);
+    scene.commitFrame();
+    // Vertex shading never reads values(): no value bytes cross.
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sent.every((v) => v === null)).toBe(true);
+    // The first read turns the mirror on; the next result fills it whole.
+    expect(scene.views(a).values!()).toBeNull();
+    const records: MeshChange[] = [];
+    scene.onChanges((c) => records.push(...c));
+    await settle(scene);
+    scene.commitFrame();
+    expect(records.find((r) => r.mesh === a)?.colors).toBe("all");
+    expect(scene.views(a).values!()).not.toBeNull();
+    expect(scene.views(b).values!()).toBeNull();
+    await expectMirrored(scene, a);
+    // Then it follows the colours' ranges.
+    scene.setPlacement(b, { rotation: IDENTITY, translation: [0.3, 0, 0] });
+    await settle(scene);
+    await expectMirrored(scene, a);
+  });
+
+  it("coloring_follows_the_applied_rule", async () => {
+    const { scene, w } = await start();
+    const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
+    const b = scene.addMesh(sphere([2.2, 0, 0]).positions, sphere([2.2, 0, 0]).indices);
+    // Every value finite, or most of them far: the values tell the fields apart.
+    const whole = scene.addDistanceField({ name: "whole", on: a, to: b, maxDistance: Infinity });
+    const near = scene.addDistanceField({ name: "near", on: a, to: b, maxDistance: 0.4 });
+    const first = { field: whole, map: "turbo" as const, range: [0, 2] as const };
+    scene.setColoring(a, first);
+    scene.views(a).values!();
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.coloring(a)?.field).toBe(whole);
+    /** The rule shown matches the mirrored values. */
+    const consistent = () => {
+      const values = scene.views(a).values!();
+      if (values === null) {
+        return scene.coloring(a) === null;
+      }
+      const far = values.some((v) => v === Infinity);
+      return scene.coloring(a)?.field === (far ? near : whole);
+    };
+    const seen: boolean[] = [];
+    scene.onChanges((changes) => {
+      if (changes.some((c) => c.mesh === a)) {
+        seen.push(consistent());
+      }
+    });
+    // A drag result in flight, then a rule on the other field.
+    w.hold = true;
+    const d = scene.drag(a);
+    d.move({ rotation: [0, 0, 0, 1], translation: [0.1, 0, 0] });
+    scene.commitFrame();
+    scene.setColoring(a, { field: near, map: "turbo", range: [0, 0.4] });
+    // Requested, not shown yet.
+    expect(scene.coloring(a)?.field).toBe(whole);
+    scene.commitFrame();
+    await w.waitHeld(2);
+    w.release(1);
+    scene.commitFrame();
+    expect(scene.coloring(a)?.field).toBe(whole);
+    w.release(1);
+    w.hold = false;
+    scene.commitFrame();
+    expect(scene.coloring(a)?.field).toBe(near);
+    d.end();
+    await settle(scene);
+    scene.commitFrame();
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(seen.every((x) => x)).toBe(true);
+
+    // A rejected rule leaves the shown one.
+    const before = scene.coloring(a);
+    expect(Object.isFrozen(before)).toBe(true);
+    expect(Object.isFrozen(before?.range)).toBe(true);
+    scene.setColoring(a, { field: whole, map: "turbo", range: [1, 0] });
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.status(`display:${scene.idOf(a)}`)).toMatchObject({ status: "error" });
+    expect(scene.coloring(a)).toBe(before);
+    // The colouring of a removed field goes when the removal is applied.
+    scene.removeField(near);
+    expect(scene.coloring(a)).toBe(before);
+    await settle(scene);
+    scene.commitFrame();
+    expect(scene.coloring(a)).toBeNull();
+  });
+
   it("views_mirror_engine_after_edits", async () => {
     const { scene } = await start();
     const a = scene.addMesh(sphere([0, 0, 0]).positions, sphere([0, 0, 0]).indices);
@@ -226,6 +330,8 @@ describe("WorkerScene", () => {
     const field = scene.addDistanceField({ name: "d", on: a, to: b, maxDistance: 3 });
     const rule = { field, map: "turbo" as const, range: [0, 2] as const };
     scene.setColoring(a, rule);
+    // The values mirror is opt-in: on from the start here.
+    scene.views(a).values!();
     await settle(scene);
     await expectMirrored(scene, a);
     await expectMirrored(scene, b);

@@ -1,6 +1,7 @@
 // Typed-array views over a mesh's render buffers in wasm memory, and the debug
 // guard that warns when a caller reads a view kept across a scene call.
 import { call, wasmMemory } from "./core.js";
+import type { SceneLike } from "./scene-like.js";
 import type { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
 /**
@@ -24,6 +25,14 @@ export interface MeshViews {
   normals(): Float32Array | null;
   /** RGBA8 colours, 4 bytes per vertex slot, or `null` without colouring. */
   colors(): Uint8Array | null;
+  /**
+   * The values the colours are made from (the colouring field's values), 1
+   * float per vertex slot, or `null` without colouring. They change only at
+   * the colours' dirty slots, so they follow the `colors` change ranges.
+   * Optional for other {@link SceneLike} hosts; `Scene` and `WorkerScene`
+   * provide it.
+   */
+  values?(): Float32Array | null;
   /** 3 vertex indices per triangle slot; a removed triangle reads `0, 0, 0`. */
   indices(): Uint32Array;
 }
@@ -87,7 +96,7 @@ export function meshViews(
   generation: number,
   guard: ViewGuard | undefined,
 ): MeshViews {
-  // `null` for a buffer that is off (pointer 0): normals and colours.
+  // `null` for a buffer that is off (pointer 0): normals, colours and values.
   const build = <T extends ArrayBufferView>(
     make: (buffer: ArrayBuffer, ptr: number, len: number) => T,
     ptr: (s: WasmScene) => number,
@@ -123,6 +132,12 @@ export function meshViews(
         u8,
         (s) => s.colors_ptr(index, generation),
         (s) => s.colors_len(index, generation),
+      ),
+    values: () =>
+      build(
+        f32,
+        (s) => s.values_ptr(index, generation),
+        (s) => s.values_len(index, generation),
       ),
     indices: () =>
       build(

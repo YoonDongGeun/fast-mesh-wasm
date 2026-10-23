@@ -506,13 +506,15 @@ function bytes(v: ArrayBufferView | null): Buffer | null {
 }
 
 async function expectMirrored(scene: WorkerScene, mesh: MeshHandle): Promise<void> {
+  // The values mirror is opt-in: turned on (if it was not) in the same batch.
+  scene.views(mesh).values?.();
   const pending = debugDump(scene, mesh);
   scene.commitFrame();
   const dump = await pending;
   const v = scene.views(mesh);
-  for (const name of ["positions", "normals", "colors", "indices"] as const) {
+  for (const name of ["positions", "normals", "colors", "values", "indices"] as const) {
     const want = bytes(dump[name]);
-    const got = bytes(v[name]());
+    const got = bytes(v[name]?.() ?? null);
     if (want === null || got === null) {
       expect(got, name).toBe(want);
     } else {
@@ -610,6 +612,7 @@ describe("WorkerScene restart", () => {
       history: { canUndo: false, canRedo: false },
       status: [{ key, rev: r1, status: "error", error: { code: "INVALID_ARGUMENT", message: "stale" } }],
       replies: [],
+      colorings: [],
     } satisfies Result);
     expect(scene.status(key)).toEqual({ status: "ready", revision: replay.revision });
     scene.commitFrame();

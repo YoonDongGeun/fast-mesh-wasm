@@ -780,6 +780,43 @@ export class SceneStore {
     this.#host.removeField(field.handle);
   }
 
+  /**
+   * The targets of the store-owned field behind the mesh's colouring (the
+   * one last sent to the scene), in the field's order: the order its
+   * nearest-target indices (`Scene.fieldNearest`,
+   * `WorkerScene.fetchFieldNearest`) refer to. That is ascending scene id,
+   * not the order of `distanceTo` or of a contact group's members. A target
+   * removed since leaves the list, as it leaves the field. Frozen; `null`
+   * when the mesh has no colouring.
+   *
+   * @throws `UNKNOWN_MESH` for a mesh not in the store; `INVALID_ARGUMENT`
+   *   once the store is disposed.
+   */
+  coloringTargets(mesh: MeshHandle): readonly MeshHandle[] | null {
+    this.#alive();
+    const entry = this.#mesh(mesh);
+    return entry.sent === null || entry.field === undefined ? null : entry.field.to;
+  }
+
+  /**
+   * The values of the store-owned field behind the mesh's colouring (the one
+   * last sent to the scene), one per vertex slot, as of the field's last
+   * update: a copy the caller owns. `null` when the mesh has no colouring.
+   * On a Worker scene the request is ordered after the calls made before
+   * it, so it reads the colouring last flushed. Never a history step.
+   *
+   * Rejects with `UNKNOWN_MESH` for a mesh not in the store, and
+   * `INVALID_ARGUMENT` once the store is disposed.
+   */
+  fetchColoringValues(mesh: MeshHandle): Promise<Float32Array | null> {
+    return new Promise<Float32Array | null>((resolve) => {
+      this.#alive();
+      const entry = this.#mesh(mesh);
+      const field = entry.field;
+      resolve(entry.sent === null || field === undefined ? null : this.#host.fieldValues(field.handle));
+    });
+  }
+
   // ---- Sections ----
 
   /** Adds a plane section and returns its handle at once. */

@@ -362,6 +362,48 @@ describe("FastMesh", () => {
     expect(onBind).toHaveBeenLastCalledWith(null);
   });
 
+  it("fastmesh_shading_props", async () => {
+    const { store, a } = setup();
+    const el = (shading: "vertex" | "fragment", edgeSoftness: number) => (
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} shading={shading} edgeSoftness={edgeSoftness} />
+      </SceneProvider>
+    );
+    const r = await mount(el("fragment", 0.2));
+    expect(bounds).toHaveLength(1);
+    expect(bounds[0].shading).toBe("fragment");
+    const soften = vi.spyOn(bounds[0], "setEdgeSoftness");
+    // A new softness is set on the binding, without a rebind.
+    await r.update(el("fragment", 0.5));
+    expect(soften).toHaveBeenLastCalledWith(0.5);
+    expect(bounds).toHaveLength(1);
+    // A new shading rebinds.
+    await r.update(el("vertex", 0.5));
+    expect(bounds).toHaveLength(2);
+    expect(bounds[0].dispose).toHaveBeenCalled();
+    expect(bounds[1].shading).toBe("vertex");
+  });
+
+  it("fastmesh_bad_softness_is_ignored", async () => {
+    const { store, a } = setup();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const el = (edgeSoftness: number) => (
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} shading="fragment" edgeSoftness={edgeSoftness} />
+      </SceneProvider>
+    );
+    // NaN or a negative width binds and draws as 0 (a hard edge), with a warning.
+    const r = await mount(el(Number.NaN));
+    expect(bounds).toHaveLength(1);
+    const soften = vi.spyOn(bounds[0], "setEdgeSoftness");
+    await r.update(el(0.3));
+    expect(soften).toHaveBeenLastCalledWith(0.3);
+    await r.update(el(-1));
+    expect(soften).toHaveBeenLastCalledWith(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("edgeSoftness"))).toBe(true);
+    warn.mockRestore();
+  });
+
   it("package_r3f_export", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("r3f.js", dist))).toBe(true);

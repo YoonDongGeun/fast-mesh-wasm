@@ -37,6 +37,7 @@ import type {
   SectionPlane,
   SectionResult,
 } from "../scene.js";
+import { copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
 import { type MeshViews, ViewGuard } from "../views.js";
 import {
@@ -158,13 +159,14 @@ let createScene: (
 ) => [WorkerScene, Promise<void>];
 
 /** Elements per slot of each buffer. */
-const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
+const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, indices: 3 } as const;
 type BufferName = keyof typeof STRIDE;
 const BUFFERS = Object.keys(STRIDE) as BufferName[];
 const MAKE = {
   positions: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   normals: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   colors: (b: ArrayBuffer | number) => new Uint8Array(b as ArrayBuffer),
+  values: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   indices: (b: ArrayBuffer | number) => new Uint32Array(b as ArrayBuffer),
 };
 
@@ -307,6 +309,8 @@ interface MeshState {
   positions: Float32Array;
   normals: Float32Array | null;
   colors: Uint8Array | null;
+  /** The values behind the colours: mirrored over the colours' ranges. */
+  values: Float32Array | null;
   indices: Uint32Array;
   /** The placement as the engine last reported it. */
   pose: Pose;
@@ -328,6 +332,13 @@ interface MeshState {
   gone: boolean;
   /** The colouring last requested (kept for a restart). */
   coloring: ColorRule | null;
+  /**
+   * The colouring the mirrors show: the requested one once the batch that
+   * applied it is in (`coloring(mesh)` returns it).
+   */
+  shown: ColorRule | null;
+  /** Colouring requests not applied yet, by revision. */
+  pendingRules: Map<number, ColorRule | null>;
   /** The engine has the mesh, as of the latest result (its mirrors are its data). */
   live: boolean;
   /** Normals were asked for at the add. */
@@ -548,6 +559,8 @@ export class WorkerScene implements SceneLike {
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
+  /** The values mirror is on (a `values()` read asked for it). */
+  #values = false;
   #drag: DragState | undefined;
   #poison: FastMeshError | undefined;
   #terminated = false;
@@ -1016,8 +1029,29 @@ export class WorkerScene implements SceneLike {
       this.#statusChanged();
       return;
     }
+    // The rules of the colourings this batch applied, before their records.
+    for (const { id, rev } of r.colorings) {
+      const st = this.#meshes.get(id);
+      if (st === undefined) {
+        continue;
+      }
+      if (st.pendingRules.has(rev)) {
+        st.shown = st.pendingRules.get(rev) ?? null;
+      }
+      for (const k of st.pendingRules.keys()) {
+        if (k <= rev) {
+          st.pendingRules.delete(k);
+        }
+      }
+    }
     for (const c of r.changes) {
       this.#applyChange(c);
+    }
+    // No colours: no colouring (its field removed, or the mesh).
+    for (const st of this.#meshes.values()) {
+      if (st.colors === null) {
+        st.shown = null;
+      }
     }
     for (const p of r.placements) {
       const st = this.#meshes.get(p.id);
@@ -1129,14 +1163,17 @@ export class WorkerScene implements SceneLike {
     st.indices = new Uint32Array(0);
     st.normals = null;
     st.colors = null;
+    st.values = null;
+    st.shown = null;
     this.#guard?.bump();
   }
 
   #applyBuffer(st: MeshState, name: BufferName, c: MeshChangeWire): void {
     const bytes = c.bytes[name];
-    const ranges = c[name];
+    // The values change with the colours.
+    const ranges = c[name === "values" ? "colors" : name];
     if (bytes === null) {
-      if ((name === "normals" || name === "colors") && st[name] !== null) {
+      if ((name === "normals" || name === "colors" || name === "values") && st[name] !== null) {
         st[name] = null;
         this.#guard?.bump();
       }
@@ -1320,6 +1357,9 @@ export class WorkerScene implements SceneLike {
       positions: new Float32Array(0),
       normals: null,
       colors: null,
+      values: null,
+      shown: null,
+      pendingRules: new Map(),
       indices: new Uint32Array(0),
       pose: poseOf(IDENTITY, [0, 0, 0], known),
       local: undefined,
@@ -1425,8 +1465,35 @@ export class WorkerScene implements SceneLike {
       positions: () => wrap(st.positions),
       normals: () => (st.normals === null ? null : wrap(st.normals)),
       colors: () => (st.colors === null ? null : wrap(st.colors)),
+      values: () => {
+        this.#wantValues();
+        return st.values === null ? null : wrap(st.values);
+      },
       indices: () => wrap(st.indices),
     };
+  }
+
+  /**
+   * Turns the values mirror on, at the first `values()` read: until then
+   * results carry no value bytes, so scenes drawn with vertex colours pay
+   * nothing for it. The mirror fills with the next result.
+   */
+  #wantValues(): void {
+    if (!this.#values) {
+      this.#values = true;
+      this.#push({ kind: "values", rev: ++this.#rev });
+    }
+  }
+
+  /**
+   * The rule the mirrored colours and values are made by (a frozen copy of
+   * the one given to `setColoring`, the same object until another rule is
+   * applied), or `null` without colouring. It follows the
+   * results: a new rule shows with the batch that applies it, a rejected one
+   * never, and a removed field's colouring goes when the removal is applied.
+   */
+  coloring(mesh: MeshHandle): ColorRule | null {
+    return this.#mirrored(mesh).shown;
   }
 
   /**
@@ -1693,7 +1760,9 @@ export class WorkerScene implements SceneLike {
     const copy = rule === null ? null : copyRule(rule);
     const wire: ColorRuleWire | null = copy === null ? null : { ...copy, field: this.#field(copy.field).id };
     st.coloring = copy;
-    this.#push({ kind: "coloring", rev: ++this.#rev, id: st.id, rule: wire, key: `display:${st.id}` });
+    const rev = ++this.#rev;
+    st.pendingRules.set(rev, copy);
+    this.#push({ kind: "coloring", rev, id: st.id, rule: wire, key: `display:${st.id}` });
   }
 
   /** A copy of the field's values as of its last update, one per vertex slot. */
@@ -2264,6 +2333,9 @@ export class WorkerScene implements SceneLike {
     // The replay, in dependency order: meshes, placements, fields,
     // colourings, sections; then the history goes.
     const first = this.#rev + 1;
+    if (this.#values) {
+      this.#push({ kind: "values", rev: ++this.#rev });
+    }
     const replayed = new Set<ClientId>();
     for (const st of this.#meshes.values()) {
       if (st.removed) {
@@ -2338,13 +2410,9 @@ export class WorkerScene implements SceneLike {
       }
       const f = this.#byField.get(rule.field);
       if (f !== undefined && fields.has(f.id)) {
-        this.#push({
-          kind: "coloring",
-          rev: ++this.#rev,
-          id: st.id,
-          rule: { ...rule, field: f.id },
-          key: `display:${st.id}`,
-        });
+        const rev = ++this.#rev;
+        st.pendingRules.set(rev, rule);
+        this.#push({ kind: "coloring", rev, id: st.id, rule: { ...rule, field: f.id }, key: `display:${st.id}` });
       } else {
         st.coloring = null;
         dropped.set(
@@ -2521,19 +2589,6 @@ function copyInput<T>(value: T, what: string): T {
   } catch (e) {
     throw invalid(`${what} could not be copied (${e instanceof Error ? e.message : String(e)})`);
   }
-}
-
-/** A colour rule with its arrays copied (the field handle kept). */
-function copyRule(rule: ColorRule): ColorRule {
-  const copy = { ...rule } as Record<string, unknown>;
-  for (const [k, v] of Object.entries(copy)) {
-    if (Array.isArray(v)) {
-      copy[k] = [...v];
-    } else if (ArrayBuffer.isView(v)) {
-      copy[k] = (v as unknown as { slice(): unknown }).slice();
-    }
-  }
-  return copy as unknown as ColorRule;
 }
 
 /** Copies an array-like input; anything else is `INVALID_ARGUMENT`, as `Scene` reports bad input. */

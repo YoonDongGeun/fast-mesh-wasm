@@ -86,6 +86,12 @@ export type Request =
   | { kind: "clearHistory"; rev: number; key?: string }
   | { kind: "coloring"; rev: number; id: ClientId; rule: ColorRuleWire | null; key: string }
   /**
+   * Turns on the mirror of the colours' values (`views(mesh).values()`):
+   * until it, results carry no value bytes. The next result then carries every
+   * coloured mesh's colours and values whole.
+   */
+  | { kind: "values"; rev: number }
+  /**
    * A field `add` may carry the key of the display it is built for (such as
    * `display:<meshId>`). When the request with that key it feeds (the next
    * queued last-wins one) is superseded before the build starts, the build is
@@ -145,6 +151,7 @@ export interface QueryMap {
       positions: Float32Array;
       normals: Float32Array | null;
       colors: Uint8Array | null;
+      values: Float32Array | null;
       indices: Uint32Array;
       placement: { rotation: number[]; translation: Vec3 };
       matrix4: number[];
@@ -163,9 +170,10 @@ export type RepairPayload = RepairOp | RepairOp[];
  *
  * `bytes` holds, per buffer, every dirty range's elements concatenated in
  * range order (positions and normals: 3 `f32` per vertex slot; colours: 4
- * bytes per vertex slot; indices: 3 `u32` per triangle slot), or the whole
- * buffer when the ranges are `"all"`. `null` for a buffer that is off
- * (normals or colours), and for every buffer of a removed mesh.
+ * bytes per vertex slot; values: 1 `f32` per vertex slot, over the colours'
+ * ranges, once a `values` request turned them on; indices: 3 `u32` per triangle slot), or the whole buffer when the
+ * ranges are `"all"`. `null` for a buffer that is off (normals, colours and
+ * values), and for every buffer of a removed mesh.
  */
 export interface MeshChangeWire {
   id: ClientId;
@@ -186,6 +194,7 @@ export interface MeshChangeWire {
     positions: ArrayBuffer | null;
     normals: ArrayBuffer | null;
     colors: ArrayBuffer | null;
+    values: ArrayBuffer | null;
     indices: ArrayBuffer | null;
   };
 }
@@ -220,6 +229,13 @@ export interface Result {
    */
   status: { key: string; rev: number; status: "ready" | "error"; error?: ErrorWire }[];
   replies: { qid: number; ok: boolean; value?: unknown; error?: ErrorWire }[];
+  /**
+   * The colouring requests applied in this batch (mesh, revision), in order:
+   * the colours and values in `changes` are made by these rules. A rejected
+   * or superseded colouring has none. (Their `display:` statuses may come
+   * later, with the batch that completes the fields.)
+   */
+  colorings: { id: ClientId; rev: number }[];
   /**
    * The engine stopped: the WebAssembly instance trapped, or packing the
    * result failed. The whole batch failed: its changes are lost, and every

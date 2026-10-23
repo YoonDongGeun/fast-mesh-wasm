@@ -59,6 +59,8 @@ export interface Host {
    */
   addField(desc: DistanceFieldDesc, key?: string): FieldHandle;
   removeField(field: FieldHandle): void;
+  /** A copy of a field's values as of its last update, one per vertex slot. */
+  fieldValues(field: FieldHandle): Promise<Float32Array>;
   setColoring(mesh: MeshHandle, rule: ColorRule | null): void;
   addSection(desc: SectionDesc): SectionHandle;
   setSectionPlane(section: SectionHandle, plane: SectionPlane): void;
@@ -171,6 +173,8 @@ export function localHost(scene: Scene): Host {
     forgetErrors,
     addField: (desc) => scene.addDistanceField(desc),
     removeField: (field) => scene.removeField(field),
+    // A copy: the zero-copy view is only valid until the next allocation.
+    fieldValues: (field) => promised(() => scene.fieldValues(field).slice()),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
     addSection: (desc) => scene.addSection(desc),
     setSectionPlane: (section, plane) => scene.setSectionPlane(section, plane),
@@ -214,6 +218,7 @@ export function workerHost(scene: WorkerScene): Host {
     idOf: (handle) => scene.idOf(handle),
     addField: (desc, key) => (key === undefined ? scene.addDistanceField(desc) : addFieldKeyed(scene, desc, key)),
     removeField: (field) => scene.removeField(field),
+    fieldValues: (field) => scene.fetchFieldValues(field),
     setColoring: (mesh, rule) => scene.setColoring(mesh, rule),
     addSection: (desc) => scene.addSection(desc),
     setSectionPlane: (section, plane) => scene.setSectionPlane(section, plane),
