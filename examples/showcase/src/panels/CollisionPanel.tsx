@@ -52,6 +52,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   // `null` until a slider moves: the defaults then follow the scale.
   const [params, setParams] = useState<HeatmapParams | null>(null);
   const [fast, setFast] = useState(false);
+  const softness = useApp(app, (s) => s.edgeSoftness);
   const p = params ?? { depth: scale / 2, gap: scale / 2, tolerance: scale / 50 };
   // Clamped to contactHeatmap's limits (spec §6.5, gap ≥ 0 from §7.1).
   const depth = Math.min(Math.max(p.depth, step), scale);
@@ -100,6 +101,16 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         value={tolerance}
         onChange={(v) => set({ tolerance: v })}
         title="Within ± this distance counts as contact (white), and for the contact count"
+      />
+      <Slider
+        label="Boundary softness"
+        name="softness"
+        min={0}
+        max={scale / 10}
+        step={step}
+        value={Math.min(softness, scale / 10)}
+        onChange={(v) => app.setEdgeSoftness(v)}
+        title="The width of the blend where colours meet: the coloured area's edge and the contact band's. 0 is a hard edge"
       />
       <Legend depth={depth} gap={gap} tolerance={tolerance} />
       <label

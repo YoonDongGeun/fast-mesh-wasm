@@ -33,6 +33,7 @@ export interface FocusRequest {
 export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
   const items = useApp(app, (s) => s.items);
+  const edgeSoftness = useApp(app, (s) => s.edgeSoftness);
   const [selection, select] = useSelection();
   const { canUndo, canRedo, undo, redo } = useHistory();
   const [mode, setMode] = useState<GizmoMode>("translate");
@@ -128,7 +129,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <MeshList app={app} onLoad={load} onFocus={focusOn} />
       </aside>
       <main className="viewport">
-        <Viewport items={items} mode={mode} focus={focus} />
+        <Viewport items={items} mode={mode} focus={focus} edgeSoftness={edgeSoftness} />
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">

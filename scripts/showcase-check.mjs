@@ -22,6 +22,10 @@
 //   each other (reds where they penetrate, green to blue across the gap);
 //   the readouts show the penetration, intersecting, a gap of 0 and contact
 //   triangles.
+// - softness: the meshes are drawn with fragment shading, and the
+//   "Boundary softness" slider changes the boundary pixels: two screenshots
+//   of the canvas at softness 0 are identical, one at the slider's maximum
+//   differs (decoded and compared in the page).
 // - colour-from: "Colour from" 0 colours penetration only (no gap colours);
 //   the readouts stay up while the slider moves.
 // - readouts: dragging A away from B pauses the readouts (none while the
@@ -400,6 +404,52 @@ try {
     heat === undefined
       ? `collision ${q(await hook("collision()"))}`
       : `A and B coloured; penetration ${fmt(r0.penetration.depth)}, intersecting ${r0.intersects}, gap ${r0.gap}, contact triangles ${r0.contacts.a} · ${r0.contacts.b}; A's vertices ${q(colorsA)}`,
+  );
+
+  // ---- softness: fragment shading; the slider moves the boundary pixels ----
+  const rect = await page(
+    `(() => { const r = document.querySelector("canvas").getBoundingClientRect(); return { x: r.left, y: r.top, width: r.width, height: r.height }; })()`,
+  );
+  const shot = async () => (await browser.send("Page.captureScreenshot", { format: "png", clip: { ...rect, scale: 1 } })).data;
+  /** Pixels that differ by more than 8 in a channel between two PNG screenshots, decoded in the page. */
+  const pixelDiff = (a, b) =>
+    page(`(async () => {
+      const load = async (data) => {
+        const img = new Image();
+        img.src = "data:image/png;base64," + data;
+        await img.decode();
+        const c = document.createElement("canvas");
+        c.width = img.width;
+        c.height = img.height;
+        const g = c.getContext("2d");
+        g.drawImage(img, 0, 0);
+        return g.getImageData(0, 0, c.width, c.height).data;
+      };
+      const [x, y] = await Promise.all([load(${q(a)}), load(${q(b)})]);
+      let n = 0;
+      for (let i = 0; i < x.length; i += 4) {
+        if (Math.abs(x[i] - y[i]) > 8 || Math.abs(x[i + 1] - y[i + 1]) > 8 || Math.abs(x[i + 2] - y[i + 2]) > 8) n++;
+      }
+      return { n, total: x.length / 4 };
+    })()`);
+  const shadingA = await hook(`shading(${q(A)})`);
+  await setRange("softness", 0);
+  await sleep(300);
+  const hard = await shot();
+  await sleep(200);
+  const hardAgain = await shot();
+  const maxSoftness = await page("Number(document.querySelector('[data-control=softness]').max)");
+  await setRange("softness", maxSoftness);
+  await waitFor(`__showcase.shading(${q(A)}).edgeSoftness > 0`, 2000);
+  await sleep(300);
+  const soft = await shot();
+  const still = await pixelDiff(hard, hardAgain);
+  const softened = await pixelDiff(hard, soft);
+  await setRange("softness", 0);
+  verdict(
+    "softness",
+    shadingA.shading === "fragment" && still.n === 0 && softened.n > 100,
+    `A drawn with ${shadingA.shading} shading; softness 0 twice: ${still.n} pixel(s) differ; softness ${fmt(maxSoftness)}: ${softened.n} of ${softened.total} differ`,
   );
 
   // ---- colour-from: 0 colours penetration only (the white band ends the range) ----

@@ -31,7 +31,11 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
   from (mm)*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
   *Fast mode (large meshes)* bounds the fields at the larger of depth and colour from, so a deeper
-  penetration shows the mesh colour. Readouts, refreshed at most about four times a second as the
+  penetration shows the mesh colour. The colourings are drawn with fragment shading
+  (`<FastMesh shading="fragment">`): each pixel is coloured from its interpolated distance, so the
+  edge of the coloured area and the contact band are crisp iso-lines rather than blurred across a
+  triangle. *Boundary softness* widens them into a blend that many distance units wide (0, the
+  default, is a hard edge). Readouts, refreshed at most about four times a second as the
   meshes change, paused while the gizmo drags (the colours stay live; reading field values would
   force stale poses up to date) and refreshed when the drag ends:
   - **Max penetration**: the deepest negative value of either colouring

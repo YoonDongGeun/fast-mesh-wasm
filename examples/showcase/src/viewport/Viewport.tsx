@@ -1,7 +1,8 @@
 // The canvas: `<FastMesh>` per mesh (click to select), an orbit camera and a
 // TransformControls gizmo on the selected mesh (moves through
 // `attachTransformControls`, one undo step per drag). `<FastMesh>` drives
-// the store's frames.
+// the store's frames. Colourings are drawn with fragment shading, so the
+// heatmap's boundaries are crisp, softened by the collision panel's slider.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
 import type { MeshHandle } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
@@ -17,8 +18,14 @@ import { setDragging, view } from "./view";
 
 export type GizmoMode = "translate" | "rotate";
 
-export function Viewport(props: { items: readonly Item[]; mode: GizmoMode; focus: FocusRequest | null }) {
-  const { items, mode, focus } = props;
+export function Viewport(props: {
+  items: readonly Item[];
+  mode: GizmoMode;
+  focus: FocusRequest | null;
+  /** Fragment shading's edge softness, in distance units. */
+  edgeSoftness: number;
+}) {
+  const { items, mode, focus, edgeSoftness } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -47,7 +54,14 @@ export function Viewport(props: { items: readonly Item[]; mode: GizmoMode; focus
       <directionalLight position={[-4, -2, -3]} intensity={0.5} />
       <gridHelper args={[20, 20, "#3a404a", "#2a2f36"]} position={[0, -0.4, 0]} />
       {items.map((item) => (
-        <MeshView key={item.id} item={item} selected={item.mesh === selection} onPick={select} onBind={onBind} />
+        <MeshView
+          key={item.id}
+          item={item}
+          selected={item.mesh === selection}
+          edgeSoftness={edgeSoftness}
+          onPick={select}
+          onBind={onBind}
+        />
       ))}
       <Controls bound={selected} mode={mode} focus={focus} radiusOf={radiusOf} />
     </Canvas>
@@ -58,10 +72,11 @@ export function Viewport(props: { items: readonly Item[]; mode: GizmoMode; focus
 function MeshView(props: {
   item: Item;
   selected: boolean;
+  edgeSoftness: number;
   onPick: (mesh: MeshHandle) => void;
   onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
 }) {
-  const { item, selected, onPick, onBind } = props;
+  const { item, selected, edgeSoftness, onPick, onBind } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
@@ -77,7 +92,14 @@ function MeshView(props: {
     [item.mesh, onPick],
   );
   return (
-    <FastMesh mesh={item.mesh} material={item.material} onClick={onClick} onBind={(b) => onBind(item.mesh, b)} />
+    <FastMesh
+      mesh={item.mesh}
+      material={item.material}
+      shading="fragment"
+      edgeSoftness={edgeSoftness}
+      onClick={onClick}
+      onBind={(b) => onBind(item.mesh, b)}
+    />
   );
 }
 

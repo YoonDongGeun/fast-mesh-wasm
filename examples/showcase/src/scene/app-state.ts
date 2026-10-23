@@ -46,12 +46,17 @@ export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
   collision: CollisionPair;
+  /**
+   * The width, in distance units, of the blend at the heatmap's colour
+   * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
+   */
+  edgeSoftness: number;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
 
 export class AppState {
-  #snap: AppSnapshot = { items: [], jobs: [], collision: { a: null, b: null } };
+  #snap: AppSnapshot = { items: [], jobs: [], collision: { a: null, b: null }, edgeSoftness: 0 };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
   readonly #listeners = new Set<() => void>();
@@ -126,6 +131,11 @@ export class AppState {
   pick(side: keyof CollisionPair, mesh: MeshHandle | null): void {
     this.#autoPick = false;
     this.#set({ collision: { ...this.#snap.collision, [side]: mesh } });
+  }
+
+  /** Sets the heatmap's boundary softness (a display setting: not undoable). */
+  setEdgeSoftness(width: number): void {
+    this.#set({ edgeSoftness: width });
   }
 
   setJob(job: Job): void {

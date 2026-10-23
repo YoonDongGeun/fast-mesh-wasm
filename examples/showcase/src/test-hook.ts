@@ -37,6 +37,11 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
       const sel = store.getSnapshot().selection;
       return app.getSnapshot().items.find((i) => i.mesh === sel)?.name ?? null;
     },
+    /** How the mesh's colouring is drawn (`<FastMesh shading>` as bound), and the edge softness. */
+    shading: (name: string) => {
+      const b = view.bindings.get(find(name).mesh) as { shading?: string } | undefined;
+      return { shading: b?.shading ?? null, edgeSoftness: app.getSnapshot().edgeSoftness };
+    },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
     dragging: () => view.dragging,
