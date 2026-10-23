@@ -7,6 +7,7 @@
 import type { Placement } from "./api.js";
 import type { MeshViews } from "./views.js";
 import type {
+  ColorRule,
   DragSession,
   MeshChange,
   MeshHandle,
@@ -38,4 +39,10 @@ export interface SceneLike {
   /** Flushes pending changes to the listeners and returns them. */
   commitFrame(): MeshChange[];
   drag(mesh: MeshHandle): DragSession;
+  /**
+   * The rule the mesh is coloured by, or `null` without colouring. Optional:
+   * `bindMesh`'s fragment shading needs it (with `views(mesh).values`) and
+   * falls back to vertex colours on a host without it.
+   */
+  coloring?(mesh: MeshHandle): ColorRule | null;
 }

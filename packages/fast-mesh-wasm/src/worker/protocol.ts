@@ -145,6 +145,7 @@ export interface QueryMap {
       positions: Float32Array;
       normals: Float32Array | null;
       colors: Uint8Array | null;
+      values: Float32Array | null;
       indices: Uint32Array;
       placement: { rotation: number[]; translation: Vec3 };
       matrix4: number[];
@@ -163,9 +164,10 @@ export type RepairPayload = RepairOp | RepairOp[];
  *
  * `bytes` holds, per buffer, every dirty range's elements concatenated in
  * range order (positions and normals: 3 `f32` per vertex slot; colours: 4
- * bytes per vertex slot; indices: 3 `u32` per triangle slot), or the whole
- * buffer when the ranges are `"all"`. `null` for a buffer that is off
- * (normals or colours), and for every buffer of a removed mesh.
+ * bytes per vertex slot; values: 1 `f32` per vertex slot, over the colours'
+ * ranges; indices: 3 `u32` per triangle slot), or the whole buffer when the
+ * ranges are `"all"`. `null` for a buffer that is off (normals, colours and
+ * values), and for every buffer of a removed mesh.
  */
 export interface MeshChangeWire {
   id: ClientId;
@@ -186,6 +188,7 @@ export interface MeshChangeWire {
     positions: ArrayBuffer | null;
     normals: ArrayBuffer | null;
     colors: ArrayBuffer | null;
+    values: ArrayBuffer | null;
     indices: ArrayBuffer | null;
   };
 }

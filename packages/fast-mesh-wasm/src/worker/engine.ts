@@ -273,9 +273,12 @@ function packingFailed(e: unknown): ErrorWire {
 }
 
 /** Elements per slot of each buffer. */
-const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
+const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, indices: 3 } as const;
 
 type BufferName = keyof typeof STRIDE;
+
+/** A buffer's dirty ranges: the values change with the colours. */
+const rangesOf = (c: MeshChange, name: BufferName): Range[] | "all" => c[name === "values" ? "colors" : name];
 
 /** Copies the dirty elements of `view` into a fresh buffer: the whole view for `"all"`. */
 function copyRanges(
@@ -1201,6 +1204,7 @@ class Engine {
           positions: v.positions().slice(),
           normals: v.normals()?.slice() ?? null,
           colors: v.colors()?.slice() ?? null,
+          values: v.values?.()?.slice() ?? null,
           indices: v.indices().slice(),
           placement: s.placement(h),
           matrix4: Array.from(s.matrix4(h)),
@@ -1306,7 +1310,7 @@ class Engine {
       sections: c.sectionsChanged.map((x) => this.#sectionIds.get(x) as ClientId),
       vertexSlots: 0,
       triangleSlots: 0,
-      bytes: { positions: null, normals: null, colors: null, indices: null },
+      bytes: { positions: null, normals: null, colors: null, values: null, indices: null },
     };
     if (c.removed) {
       return wire;
@@ -1316,9 +1320,9 @@ class Engine {
     // Fresh views, read with no scene call in between.
     const views: MeshViews = this.#scene.views(c.mesh);
     for (const name of Object.keys(STRIDE) as BufferName[]) {
-      const view = views[name]();
+      const view = views[name]?.() ?? null;
       if (view !== null) {
-        const bytes = copyRanges(view, c[name], STRIDE[name]);
+        const bytes = copyRanges(view, rangesOf(c, name), STRIDE[name]);
         wire.bytes[name] = bytes;
         b.transfer.push(bytes);
       }

@@ -158,13 +158,14 @@ let createScene: (
 ) => [WorkerScene, Promise<void>];
 
 /** Elements per slot of each buffer. */
-const STRIDE = { positions: 3, normals: 3, colors: 4, indices: 3 } as const;
+const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, indices: 3 } as const;
 type BufferName = keyof typeof STRIDE;
 const BUFFERS = Object.keys(STRIDE) as BufferName[];
 const MAKE = {
   positions: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   normals: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   colors: (b: ArrayBuffer | number) => new Uint8Array(b as ArrayBuffer),
+  values: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   indices: (b: ArrayBuffer | number) => new Uint32Array(b as ArrayBuffer),
 };
 
@@ -307,6 +308,8 @@ interface MeshState {
   positions: Float32Array;
   normals: Float32Array | null;
   colors: Uint8Array | null;
+  /** The values behind the colours: mirrored over the colours' ranges. */
+  values: Float32Array | null;
   indices: Uint32Array;
   /** The placement as the engine last reported it. */
   pose: Pose;
@@ -1129,14 +1132,16 @@ export class WorkerScene implements SceneLike {
     st.indices = new Uint32Array(0);
     st.normals = null;
     st.colors = null;
+    st.values = null;
     this.#guard?.bump();
   }
 
   #applyBuffer(st: MeshState, name: BufferName, c: MeshChangeWire): void {
     const bytes = c.bytes[name];
-    const ranges = c[name];
+    // The values change with the colours.
+    const ranges = c[name === "values" ? "colors" : name];
     if (bytes === null) {
-      if ((name === "normals" || name === "colors") && st[name] !== null) {
+      if ((name === "normals" || name === "colors" || name === "values") && st[name] !== null) {
         st[name] = null;
         this.#guard?.bump();
       }
@@ -1320,6 +1325,7 @@ export class WorkerScene implements SceneLike {
       positions: new Float32Array(0),
       normals: null,
       colors: null,
+      values: null,
       indices: new Uint32Array(0),
       pose: poseOf(IDENTITY, [0, 0, 0], known),
       local: undefined,
@@ -1425,8 +1431,18 @@ export class WorkerScene implements SceneLike {
       positions: () => wrap(st.positions),
       normals: () => (st.normals === null ? null : wrap(st.normals)),
       colors: () => (st.colors === null ? null : wrap(st.colors)),
+      values: () => (st.values === null ? null : wrap(st.values)),
       indices: () => wrap(st.indices),
     };
+  }
+
+  /**
+   * The rule the mesh is coloured by, as last given to `setColoring` (a
+   * copy), or `null` without colouring (never set, turned off, or its field
+   * removed). It can be ahead of the mirrors until the Worker applies it.
+   */
+  coloring(mesh: MeshHandle): ColorRule | null {
+    return this.#mirrored(mesh).coloring;
   }
 
   /**

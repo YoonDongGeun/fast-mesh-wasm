@@ -76,3 +76,20 @@ pub fn test_trap_pool() {
         }
     });
 }
+
+/// The engine's colours of `values` under the colour rule `(map, rule)`
+/// (the encoding of `WasmScene::set_coloring`), RGBA8 each, so the
+/// TypeScript tests can check the fragment shading's mapping against
+/// `color_of`. Test builds only (the `test-panic` feature).
+#[cfg(feature = "test-panic")]
+#[wasm_bindgen(js_name = __test_color_of)]
+pub fn test_color_of(map: u8, rule: &[f32], values: &[f32]) -> Result<Vec<u8>, error::Error> {
+    let rule = scene::parse_rule(map, rule)?;
+    if rule.validate().is_err() {
+        return Err(error::Error::invalid("invalid colour rule"));
+    }
+    Ok(values
+        .iter()
+        .flat_map(|&v| fast_mesh_fields::color_of(&rule, v))
+        .collect())
+}

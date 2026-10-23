@@ -397,24 +397,38 @@ impl Entry {
         }
     }
 
-    /// Colours vertex slots added since the colours were last sized, from
-    /// the field's channel (NaN for slots the field has not computed), and
-    /// reports them, so that the colours always cover every vertex slot.
-    pub(crate) fn grow_colors(&mut self) {
+    /// Colours vertex slots added since the colours were last sized, and the
+    /// reused slots among `added` (the store resets their field values to
+    /// NaN), from the field's channel (NaN for slots the field has not
+    /// computed), and reports them: the colours always cover every vertex
+    /// slot, and the channel never changes at an unreported vertex.
+    pub(crate) fn grow_colors(&mut self, added: &[VertexId]) {
         let slots = self.mesh.vertex_slots();
         let Some(cs) = &mut self.coloring else {
             return;
         };
         let old = cs.colors.len();
-        if slots <= old {
-            return;
-        }
         let rule = &cs.coloring.rule;
         let values = self.mesh.channel(&cs.channel).unwrap_or(&[]);
-        cs.colors
-            .extend((old..slots).map(|v| values.get(v).map_or(rule.nan, |&x| color_of(rule, x))));
-        let added: Vec<VertexId> = (old as VertexId..slots as VertexId).collect();
-        self.report_colors(Some(&added));
+        let color = |v: usize| values.get(v).map_or(rule.nan, |&x| color_of(rule, x));
+        let mut dirty: Vec<VertexId> = added
+            .iter()
+            .copied()
+            .filter(|&v| (v as usize) < old)
+            .collect();
+        for &v in &dirty {
+            cs.colors[v as usize] = color(v as usize);
+        }
+        if slots > old {
+            cs.colors.extend((old..slots).map(color));
+            dirty.extend(old as VertexId..slots as VertexId);
+        }
+        if dirty.is_empty() {
+            return;
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        self.report_colors(Some(&dirty));
     }
 
     /// Recolours every vertex from the current field values (after a new
@@ -705,6 +719,24 @@ impl Scene {
             .coloring
             .as_ref()
             .map(|c| c.colors.as_slice()))
+    }
+
+    /// The values the mesh's colours are made from, or `None` when the mesh
+    /// has no colouring. Never updates.
+    ///
+    /// A view of the colouring field's channel, not a copy: the same slice as
+    /// [`Scene::field_values`] of that field, one `f32` per vertex slot. It
+    /// changes only at vertices reported in `colors_dirty`, so a renderer can
+    /// mirror it with the colours' dirty ranges and map values to colours per
+    /// fragment ([`color_of`] at a vertex gives that vertex's colour).
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn color_values(&self, mesh: MeshId) -> Result<Option<&[f32]>> {
+        let e = self.entry(mesh)?;
+        Ok(e.coloring
+            .as_ref()
+            .map(|c| e.mesh.channel(&c.channel).unwrap_or(&[])))
     }
 
     /// The id of the registered field with this [`FieldId::raw`] value, or
@@ -2139,6 +2171,8 @@ mod tests {
                 let at = format!("round {round} step {step}");
                 let before_a = scene.colors(a).unwrap().unwrap().to_vec();
                 let before_b = scene.colors(b).unwrap().unwrap().to_vec();
+                let values_a = bits_of(scene.color_values(a).unwrap().unwrap());
+                let values_b = bits_of(scene.color_values(b).unwrap().unwrap());
                 // Eager meshes see one operation at a time; others a batch.
                 let ops = if a_mode == UpdateMode::Eager {
                     1
@@ -2171,6 +2205,15 @@ mod tests {
                 };
                 check_colors_reported(&scene, a, &before_a, dirty(a).as_ref(), &at);
                 check_colors_reported(&scene, b, &before_b, dirty(b).as_ref(), &at);
+                for (m, f, before) in [(a, fa, &values_a), (b, fb, &values_b)] {
+                    let now = scene.color_values(m).unwrap().unwrap();
+                    assert_eq!(
+                        bits_of(now),
+                        bits_of(scene.field_values(f).unwrap()),
+                        "{at}"
+                    );
+                    check_values_reported(before, now, dirty(m).as_ref(), &at);
+                }
             }
         }
     }
@@ -2203,6 +2246,112 @@ mod tests {
         assert_eq!(scene.colors(a).unwrap().unwrap().len(), 122);
         assert_colors(&scene, a, &rule, f);
         assert_eq!(colors_dirty(&mut scene, a), Some(vec![121]));
+    }
+
+    fn bits_of(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The vertices whose value bits differ between `before` and `now`
+    /// (slots beyond `before` included) are all in `dirty` (`None`: all).
+    fn check_values_reported(before: &[u32], now: &[f32], dirty: Option<&Vec<VertexId>>, at: &str) {
+        if let Some(dirty) = dirty {
+            for (v, x) in now.iter().enumerate() {
+                if before.get(v) != Some(&x.to_bits()) {
+                    assert!(
+                        dirty.binary_search(&(v as VertexId)).is_ok(),
+                        "{at}: value of vertex {v} not reported"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The values behind the colours are the colouring field's channel, and
+    /// change only where the colours are reported to change.
+    #[test]
+    fn color_values_view_the_coloring_field() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        assert_eq!(scene.color_values(a), Ok(None));
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        let view = |s: &Scene| bits_of(s.color_values(a).unwrap().unwrap());
+        assert_eq!(view(&scene), bits_of(scene.field_values(f).unwrap()));
+        assert_eq!(colors_dirty(&mut scene, a), None);
+        // A drag: the values that changed are reported with the colours.
+        let before = view(&scene);
+        scene.set_placement(b, at(0.0, 0.0, 0.03)).unwrap();
+        assert_eq!(view(&scene), bits_of(scene.field_values(f).unwrap()));
+        assert_ne!(view(&scene), before);
+        let dirty = colors_dirty(&mut scene, a);
+        check_values_reported(
+            &before,
+            scene.color_values(a).unwrap().unwrap(),
+            dirty.as_ref(),
+            "drag",
+        );
+        // Colouring off: no values.
+        scene.set_coloring(a, None).unwrap();
+        assert_eq!(scene.color_values(a), Ok(None));
+
+        // A reused slot: the store resets its value to NaN, and the colours
+        // report it. A Lazy field leaves a value in the slot until it updates.
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Lazy);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        scene
+            .edit(a, |tx| {
+                let v = tx.add_vertices(&[[0.5, 0.5, 0.0]])?;
+                tx.add_triangles(&[[v[0], 0, 1]])
+            })
+            .unwrap();
+        scene.update_fields().unwrap();
+        scene.undo().unwrap();
+        // An edit drops the redo step, which releases the slot.
+        scene
+            .edit(a, |tx| {
+                let p = tx.mesh().position(0).unwrap();
+                tx.set_positions(&[0], &[p])
+            })
+            .unwrap();
+        scene.take_changes();
+        let before = view(&scene);
+        assert!(!f32::from_bits(before[121]).is_nan());
+        scene
+            .edit(a, |tx| tx.add_vertices(&[[5.0, 5.0, 5.0]]))
+            .unwrap();
+        assert!(
+            scene.mesh(a).unwrap().is_vertex_alive(121),
+            "the released slot is reused"
+        );
+        assert_eq!(scene.mesh(a).unwrap().vertex_slots(), 122);
+        assert_eq!(view(&scene), bits_of(scene.field_values(f).unwrap()));
+        let dirty = colors_dirty(&mut scene, a);
+        check_values_reported(
+            &before,
+            scene.color_values(a).unwrap().unwrap(),
+            dirty.as_ref(),
+            "reuse",
+        );
+        // The colour of the reused slot follows its value (NaN) too.
+        assert_eq!(scene.colors(a).unwrap().unwrap()[121], rule.nan);
     }
 
     #[test]

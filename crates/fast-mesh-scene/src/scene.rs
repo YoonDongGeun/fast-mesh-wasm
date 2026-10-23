@@ -179,7 +179,7 @@ impl Entry {
         }
         // Slots only grow through commits, undo, redo and cancel, all of
         // which pass here.
-        self.grow_colors();
+        self.grow_colors(&changes.vertices_added);
     }
 
     /// Whether the BVH is up to date with the mesh: not flagged for a

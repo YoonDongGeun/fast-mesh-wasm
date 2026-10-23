@@ -163,9 +163,10 @@ async function expectMirrored(scene: WorkerScene, mesh: MeshHandle): Promise<voi
   scene.commitFrame();
   const dump = await pending;
   const v = scene.views(mesh);
-  for (const name of ["positions", "normals", "colors", "indices"] as const) {
+  for (const name of ["positions", "normals", "colors", "values", "indices"] as const) {
+    expect(dump[name], `${name} dumped`).not.toBeUndefined();
     const want = bytes(dump[name]);
-    const got = bytes(v[name]());
+    const got = bytes(v[name]?.() ?? null);
     if (want === null || got === null) {
       expect(got, name).toBe(want);
     } else {

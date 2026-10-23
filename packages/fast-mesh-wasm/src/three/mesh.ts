@@ -4,7 +4,17 @@
 // moved memory at render time. Each frame copies only the dirty ranges from
 // fresh views into the mirrors.
 import * as THREE from "three";
+import {
+  encodeValues,
+  LUT_ROWS,
+  SHADING_FRAGMENT,
+  SHADING_VERTEX,
+  SRGB_TO_LINEAR16,
+  type Shading,
+  shadingOf,
+} from "../colormap.js";
 import { FastMeshError } from "../core.js";
+import type { ColorRule } from "../scene.js";
 import type { MeshChange, MeshHandle, Range } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
 
@@ -32,6 +42,31 @@ export interface BindMeshOptions {
    * its `opacity`, `transparent` and `depthWrite`.
    */
   opacity?: number;
+  /**
+   * How a colouring is drawn.
+   *
+   * - `"vertex"` (the default): the engine's colours as a vertex attribute,
+   *   interpolated across each triangle, so the edge between coloured and
+   *   base-coloured vertices blurs over a triangle's width.
+   * - `"fragment"`: every fragment is coloured from the interpolated field
+   *   value through the colouring's rule (a lookup texture and a shader chunk
+   *   added to the material with `onBeforeCompile`, so `WebGLRenderer` only).
+   *   Range edges and colour steps (a contact heatmap's tolerance band) are
+   *   crisp iso-lines of the value, softened with `edgeSoftness`, and
+   *   gradients are smooth per pixel. At a vertex the colour equals its
+   *   vertex colour. Far (`Infinity`) and NaN values never tint their
+   *   neighbours. Needs a scene with `coloring(mesh)` and
+   *   `views(mesh).values` (`Scene` and `WorkerScene` have both); on another
+   *   host the binding falls back to `"vertex"` ({@link BoundMesh.shading}).
+   */
+  shading?: "vertex" | "fragment";
+  /**
+   * Fragment shading: the width, in the field's distance units, of the blend
+   * at each colour step (a range edge to the base colour, the edges of a
+   * contact band). 0 (the default) is a hard edge. Ignored by vertex shading.
+   * See {@link BoundMesh.setEdgeSoftness}.
+   */
+  edgeSoftness?: number;
 }
 
 /** A scene mesh bound to a THREE.Mesh by {@link bindMesh}. */
@@ -45,6 +80,15 @@ export interface BoundMesh {
    */
   readonly object: THREE.Mesh;
   readonly mesh: MeshHandle;
+  /** The shading in use: `"fragment"` only when asked for and the scene supports it. */
+  readonly shading: "vertex" | "fragment";
+  /**
+   * Sets the fragment shading's edge softness (see
+   * {@link BindMeshOptions.edgeSoftness}): a finite number `>= 0`. Takes
+   * effect on the next render, with no recompile. A display setting: never
+   * recorded in history.
+   */
+  setEdgeSoftness(width: number): void;
   /**
    * Sets the opacity in [0, 1]. Below 1 the material is transparent and does
    * not write depth. A display setting: never recorded in history.
@@ -78,22 +122,8 @@ const WHITE = new THREE.Color(0xffffff);
  */
 const MAX_UPDATE_RANGES = 64;
 
-/**
- * sRGB byte to linear, as a normalized `Uint16` (0 to 65535). The engine's
- * colour maps are sRGB-encoded bytes; three treats vertex colours as linear
- * working-space values and encodes its output to sRGB, so bytes passed
- * through would be encoded twice and look washed out. Sixteen bits keep the
- * dark tones that eight linear bits would band.
- */
-export const SRGB_TO_LINEAR16: Uint16Array = (() => {
-  const table = new Uint16Array(256);
-  for (let i = 0; i < 256; i++) {
-    const c = i / 255;
-    const linear = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-    table[i] = Math.round(linear * 65535);
-  }
-  return table;
-})();
+/** sRGB byte to linear, as a normalized `Uint16` (see `colormap.ts`). */
+export { SRGB_TO_LINEAR16 };
 
 /**
  * Copies RGBA8 sRGB colours into the `Uint16` mirror at `at`: colour channels
@@ -112,6 +142,8 @@ const BUFFERS = {
   positions: { name: "position", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   normals: { name: "normal", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   colors: { name: "color", itemSize: 4, normalized: true, make: (n: number) => new Uint16Array(n) },
+  // Fragment shading: (value, NaN flag) per vertex, encoded by `encodeValues`.
+  values: { name: "fmValue", itemSize: 2, normalized: false, make: (n: number) => new Float32Array(n) },
   indices: { name: "index", itemSize: 3, normalized: false, make: (n: number) => new Uint32Array(n) },
 } as const;
 
@@ -129,6 +161,10 @@ type BufferKey = keyof typeof BUFFERS;
  * triangle reads `0, 0, 0` in the index). They are recomputed when positions
  * or indices change, never on placement-only frames.
  *
+ * With `shading: "fragment"` the colour attribute is replaced by the
+ * colouring's values (`fmValue`), coloured per fragment by a shader chunk the
+ * binding adds to the material (see {@link BindMeshOptions.shading}).
+ *
  * When the scene mesh is removed, the binding detaches: it stops following
  * the scene and leaves the object as it was (remove it from your THREE.Scene
  * and call {@link BoundMesh.dispose}).
@@ -137,6 +173,18 @@ type BufferKey = keyof typeof BUFFERS;
  * `scene.commitFrame()` once per animation frame, before rendering.
  */
 export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOptions = {}): BoundMesh {
+  if (options.shading !== undefined && options.shading !== "vertex" && options.shading !== "fragment") {
+    throw new FastMeshError("INVALID_ARGUMENT", 'shading must be "vertex" or "fragment"');
+  }
+  checkSoftness(options.edgeSoftness ?? 0);
+  // Fragment shading needs the rule and the values; other hosts get vertex colours.
+  const fragment =
+    options.shading === "fragment" &&
+    typeof scene.coloring === "function" &&
+    typeof scene.views(mesh).values === "function";
+  const keys: readonly BufferKey[] = fragment
+    ? ["positions", "normals", "values", "indices"]
+    : ["positions", "normals", "colors", "indices"];
   const ownsMaterial = options.material === undefined;
   const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
   // The colour shown without colouring; vertex colours are multiplied by the
@@ -154,6 +202,11 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
   let vertexSlots = -1;
   let triangleSlots = -1;
   let colored = false;
+  // Fragment shading: the rule drawn, its shading data, and the uniforms.
+  let rule: ColorRule | null = null;
+  let shading: Shading | undefined;
+  const uniforms = fragment ? shadingUniforms(options.edgeSoftness ?? 0) : undefined;
+  const restoreMaterial = uniforms === undefined ? undefined : patchMaterial(material, uniforms);
 
   /** The attribute of a buffer, or undefined when it is off. */
   const attributeOf = (key: BufferKey): THREE.BufferAttribute | undefined =>
@@ -171,6 +224,9 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
         return v.normals();
       case "colors":
         return v.colors();
+      case "values":
+        // Off without a rule to draw them by.
+        return shading === undefined ? null : (v.values?.() ?? null);
       case "indices":
         return v.indices();
     }
@@ -184,9 +240,17 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
    * Copies `view[from, to)` into `mirror`, clamped to both. A lazy mesh's
    * normals can be shorter than its slots until it is updated; the rest of the
    * mirror then keeps its data. `subarray` gives a plain typed array even for
-   * a debug-mode Proxy view. Colours are converted from sRGB to linear.
+   * a debug-mode Proxy view. Colours are converted from sRGB to linear, and
+   * values (one per slot, two mirror elements each) encoded.
    */
   const copy = (key: BufferKey, mirror: Mirror, view: Mirror, from: number, to: number) => {
+    if (key === "values") {
+      const end = Math.min(to / 2, view.length, mirror.length / 2);
+      if (end > from / 2 && shading !== undefined) {
+        encodeValues(shading, view as Float32Array, mirror as Float32Array, from / 2, end);
+      }
+      return;
+    }
     const end = Math.min(to, view.length, mirror.length);
     if (end <= from) {
       return;
@@ -223,9 +287,34 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       return;
     }
     colored = on;
-    material.vertexColors = on;
     material.color.copy(on ? WHITE : baseColor);
+    if (uniforms !== undefined) {
+      // The shader multiplies by the fragment's colour only while on: no recompile.
+      uniforms.fmOn.value = on;
+      return;
+    }
+    material.vertexColors = on;
     material.needsUpdate = true;
+  };
+
+  /**
+   * Fragment shading: follows the scene's rule for the mesh. Returns whether
+   * it changed, in which case every value is encoded again.
+   */
+  const followRule = (): boolean => {
+    if (uniforms === undefined) {
+      return false;
+    }
+    const now = scene.coloring?.(mesh) ?? null;
+    if (now === rule) {
+      return false;
+    }
+    rule = now;
+    shading = now === null ? undefined : shadingOf(now);
+    if (shading !== undefined) {
+      setShadingUniforms(uniforms, shading);
+    }
+    return true;
   };
 
   /** Live triangles' vertices only: dead slots keep stale positions. */
@@ -285,8 +374,13 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     let structural = false;
     let geometryChanged = false;
     const pending: (() => void)[] = [];
-    for (const key of Object.keys(BUFFERS) as BufferKey[]) {
-      const dirty: Range[] | "all" = change === undefined ? "all" : change[key];
+    const ruleChanged = followRule();
+    for (const key of keys) {
+      // Values change with the colours (all of them with the rule).
+      const dirty: Range[] | "all" =
+        change === undefined || (key === "values" && ruleChanged)
+          ? "all"
+          : change[key === "values" ? "colors" : key];
       if (dirty !== "all" && dirty.length === 0 && !resized) {
         continue;
       }
@@ -337,11 +431,11 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       for (const run of pending) {
         run();
       }
-      for (const key of Object.keys(BUFFERS) as BufferKey[]) {
+      for (const key of keys) {
         attributeOf(key)?.clearUpdateRanges();
       }
     }
-    setColored(attributeOf("colors") !== undefined);
+    setColored(attributeOf(fragment ? "values" : "colors") !== undefined);
     return geometryChanged;
   };
 
@@ -377,6 +471,13 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
   const bound: BoundMesh = {
     object,
     mesh,
+    shading: fragment ? "fragment" : "vertex",
+    setEdgeSoftness(width: number) {
+      checkSoftness(width);
+      if (uniforms !== undefined) {
+        uniforms.fmSoftness.value = width;
+      }
+    },
     setOpacity(alpha: number) {
       if (typeof alpha !== "number" || !(alpha >= 0 && alpha <= 1)) {
         throw new FastMeshError("INVALID_ARGUMENT", "opacity must be a number in [0, 1]");
@@ -396,8 +497,11 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       }
       disposed = true;
       geometry.dispose();
+      uniforms?.fmLut.value?.dispose();
       if (ownsMaterial) {
         material.dispose();
+      } else {
+        restoreMaterial?.();
       }
     },
   };
@@ -405,4 +509,86 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     bound.setOpacity(options.opacity);
   }
   return bound;
+}
+
+/** `INVALID_ARGUMENT` unless `width` is a finite number `>= 0`. */
+function checkSoftness(width: number): void {
+  if (typeof width !== "number" || !Number.isFinite(width) || width < 0) {
+    throw new FastMeshError("INVALID_ARGUMENT", "edgeSoftness must be a finite number >= 0");
+  }
+}
+
+/** The fragment shading's uniforms (see `SHADING_FRAGMENT`), shared with the material's shader. */
+function shadingUniforms(softness: number) {
+  return {
+    fmLut: { value: null as THREE.DataTexture | null },
+    fmCount: { value: 0 },
+    fmBuiltin: { value: true },
+    fmRange: { value: new THREE.Vector2() },
+    fmCenter: { value: 0 },
+    fmHasCenter: { value: false },
+    fmBelowBase: { value: false },
+    fmAboveBase: { value: true },
+    fmBase: { value: new THREE.Vector4() },
+    fmNan: { value: new THREE.Vector4() },
+    fmSoftness: { value: softness },
+    fmOn: { value: false },
+  };
+}
+
+type ShadingUniforms = ReturnType<typeof shadingUniforms>;
+
+/** Loads a rule's shading data into the uniforms; the texture is reused while its size holds. */
+function setShadingUniforms(u: ShadingUniforms, s: Shading): void {
+  let lut = u.fmLut.value;
+  if (lut === null || lut.image.width !== s.width) {
+    lut?.dispose();
+    lut = new THREE.DataTexture(s.lut, s.width, LUT_ROWS, THREE.RGBAFormat, THREE.FloatType);
+    // Read with texelFetch: no filtering, no mipmaps.
+    lut.minFilter = THREE.NearestFilter;
+    lut.magFilter = THREE.NearestFilter;
+    lut.generateMipmaps = false;
+    u.fmLut.value = lut;
+  } else {
+    (lut.image.data as Float32Array).set(s.lut);
+  }
+  lut.needsUpdate = true;
+  u.fmCount.value = s.count;
+  u.fmBuiltin.value = s.builtin;
+  u.fmRange.value.set(s.range[0], s.range[1]);
+  u.fmHasCenter.value = !Number.isNaN(s.center);
+  u.fmCenter.value = Number.isNaN(s.center) ? 0 : s.center;
+  u.fmBelowBase.value = s.belowBase;
+  u.fmAboveBase.value = s.aboveBase;
+  u.fmBase.value.fromArray(s.base);
+  u.fmNan.value.fromArray(s.nan);
+}
+
+/**
+ * Adds the fragment shading to a material's shaders (`onBeforeCompile`, after
+ * any handler it had) under its own program cache key. Returns the function
+ * that puts the material's handler and key back.
+ */
+function patchMaterial(material: Material, uniforms: ShadingUniforms): () => void {
+  const before = material.onBeforeCompile;
+  const key = material.customProgramCacheKey;
+  material.onBeforeCompile = function (this: Material, shader, renderer) {
+    before.call(this, shader, renderer);
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", `#include <common>\n${SHADING_VERTEX}`)
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\n\tvFmValue = fmValue;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", `#include <common>\n${SHADING_FRAGMENT}`)
+      .replace("#include <color_fragment>", "#include <color_fragment>\n\tif (fmOn) diffuseColor *= fmShade(vFmValue);");
+  };
+  material.customProgramCacheKey = function (this: Material) {
+    return `${key.call(this)}|fast-mesh-fragment-shading`;
+  };
+  material.needsUpdate = true;
+  return () => {
+    material.onBeforeCompile = before;
+    material.customProgramCacheKey = key;
+    material.needsUpdate = true;
+  };
 }

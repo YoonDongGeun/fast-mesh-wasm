@@ -362,6 +362,28 @@ describe("FastMesh", () => {
     expect(onBind).toHaveBeenLastCalledWith(null);
   });
 
+  it("fastmesh_shading_props", async () => {
+    const { store, a } = setup();
+    const el = (shading: "vertex" | "fragment", edgeSoftness: number) => (
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} shading={shading} edgeSoftness={edgeSoftness} />
+      </SceneProvider>
+    );
+    const r = await mount(el("fragment", 0.2));
+    expect(bounds).toHaveLength(1);
+    expect(bounds[0].shading).toBe("fragment");
+    const soften = vi.spyOn(bounds[0], "setEdgeSoftness");
+    // A new softness is set on the binding, without a rebind.
+    await r.update(el("fragment", 0.5));
+    expect(soften).toHaveBeenLastCalledWith(0.5);
+    expect(bounds).toHaveLength(1);
+    // A new shading rebinds.
+    await r.update(el("vertex", 0.5));
+    expect(bounds).toHaveLength(2);
+    expect(bounds[0].dispose).toHaveBeenCalled();
+    expect(bounds[1].shading).toBe("vertex");
+  });
+
   it("package_r3f_export", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("r3f.js", dist))).toBe(true);
