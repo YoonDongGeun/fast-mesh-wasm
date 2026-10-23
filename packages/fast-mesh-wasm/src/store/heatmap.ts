@@ -23,8 +23,14 @@ export interface ContactHeatmapOptions {
    * `true` computes every vertex's distance (`maxDistance: Infinity`), so any
    * penetration deeper than `depth` shows `deep`; every update recomputes the
    * whole field. `false` (the default) bounds the field at
-   * `max(depth, gap)`, the fast contact path: vertices beyond it show the
-   * base colour, deep penetration included.
+   * `2 · max(depth, gap)` (`FAST_BOUND_FACTOR`), the fast contact path:
+   * vertices beyond it are far and show the base colour, deep penetration
+   * included. The bound sits past the range ends, so the values just beyond
+   * the coloured area are still known and its outer edge is a value
+   * boundary (which `bindMesh`'s fragment shading softens with
+   * `edgeSoftness`); only an edge from a coloured vertex to one beyond the
+   * bound (a deep interior, or a triangle longer than the margin) switches
+   * hard, half way along.
    */
   exactDepth?: boolean;
   /** Defaults to `"auto"`. */
@@ -41,6 +47,12 @@ const DEFAULT_COLORS = {
   near: [0x4c, 0xaf, 0x50, 255],
   far: [0x1e, 0x3a, 0x8a, 255],
 } as const satisfies Record<string, Rgba>;
+
+/**
+ * Fast mode bounds the field at this multiple of `max(depth, gap)`: past the
+ * range ends, so the coloured area's outer edge is a value boundary.
+ */
+export const FAST_BOUND_FACTOR = 2;
 
 /** How far (in t) the `shallow` and `near` stops sit from the contact band's edges. */
 const EDGE = 1e-4;
@@ -123,7 +135,7 @@ export function contactHeatmap(options: ContactHeatmapOptions): Omit<DistanceCol
     stops.push(Object.freeze([pos, color] as const));
   }
   return {
-    maxDistance: exactDepth ? Infinity : Math.max(depth, gap),
+    maxDistance: exactDepth ? Infinity : FAST_BOUND_FACTOR * Math.max(depth, gap),
     sign,
     map: { stops: Object.freeze(stops) },
     range: Object.freeze([-depth, top] as const),

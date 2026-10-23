@@ -2,6 +2,7 @@
 // limits, the deepest-penetration readout, and the analysis and repair
 // report summaries.
 import type { Analysis } from "fast-mesh-wasm";
+import { contactHeatmap } from "fast-mesh-wasm/store";
 import { describe, expect, it } from "vitest";
 import {
   clampTolerance,
@@ -50,6 +51,20 @@ describe("collision math", () => {
       depth: 0,
       atLeast: false,
     });
+  });
+
+  it("deepest_penetration_fast_heatmap_bound", () => {
+    // Fast mode bounds the fields at 2 · max(depth, gap); "at least" applies
+    // near that bound, not near the depth slider: a value between depth and
+    // the bound is measured exactly (its colour clamps to the deepest red).
+    const heat = contactHeatmap({ depth: 0.3, gap: 0.3 });
+    expect(heat.maxDistance).toBeCloseTo(0.6, 12);
+    const atDepth = Float32Array.from([Math.fround(-0.29), Infinity]);
+    expect(deepestPenetration([atDepth], heat.maxDistance, true)?.atLeast).toBe(false);
+    const pastDepth = Float32Array.from([Math.fround(-0.45), Infinity]);
+    expect(deepestPenetration([pastDepth], heat.maxDistance, true)).toEqual({ depth: Math.fround(0.45), atLeast: false });
+    const nearBound = Float32Array.from([Math.fround(-0.57), Infinity]);
+    expect(deepestPenetration([nearBound], heat.maxDistance, true)?.atLeast).toBe(true);
   });
 
   it("deepest_penetration_bounded", () => {

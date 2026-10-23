@@ -43,6 +43,11 @@ const NEAR_BOUND = 0.1;
  * deeper than what it holds. `atLeast` says so: when the meshes intersect
  * and the deepest value is within 10% of the bound, or there is no finite
  * negative value at all. An unbounded field (`Infinity`) is exact.
+ *
+ * `bound` is the field's own `maxDistance` (fast mode: `2 · max(depth, gap)`),
+ * not the depth slider: a value between `depth` and the bound is measured
+ * exactly (its colour clamps to the deepest red), so only a value near the
+ * bound can hide a deeper one.
  */
 export function deepestPenetration(
   values: readonly (Float32Array | null)[],

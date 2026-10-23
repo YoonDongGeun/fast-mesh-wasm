@@ -42,13 +42,15 @@ describe("contactHeatmap", () => {
   it("heatmap_defaults", () => {
     const fast = contactHeatmap({ depth: 1, gap: 2 });
     expect(fast.range).toEqual([-1, 2]);
-    expect(fast.maxDistance).toBe(2);
+    // Fast mode bounds the field at 2 · max(depth, gap): values just beyond
+    // the range end stay finite, so the outer boundary is a value boundary.
+    expect(fast.maxDistance).toBe(4);
     expect(fast.below).toBe("clamp");
     expect(fast.above).toBe("base");
     expect(fast.sign).toBe("auto");
-    expect(contactHeatmap({ depth: 3, gap: 2 }).maxDistance).toBe(3);
+    expect(contactHeatmap({ depth: 3, gap: 2 }).maxDistance).toBe(6);
     expect(contactHeatmap({ depth: 1, gap: 2, exactDepth: true }).maxDistance).toBe(Infinity);
-    expect(contactHeatmap({ depth: 1, gap: 2, exactDepth: false }).maxDistance).toBe(2);
+    expect(contactHeatmap({ depth: 1, gap: 2, exactDepth: false }).maxDistance).toBe(4);
     expect(contactHeatmap({ depth: 1, gap: 2, sign: "winding" }).sign).toBe("winding");
 
     // Tolerance 0: the band is one stop at t(0).
@@ -94,7 +96,7 @@ describe("contactHeatmap", () => {
     // gap 0: colour penetration only; above the contact band is the base colour.
     const c = contactHeatmap({ depth: 1, gap: 0 });
     expect(c.range).toEqual([-1, 0]);
-    expect(c.maxDistance).toBe(1);
+    expect(c.maxDistance).toBe(2);
     expect(contactHeatmap({ depth: 1, gap: 0, exactDepth: true }).maxDistance).toBe(Infinity);
     const stops = (c.map as { stops: readonly (readonly [number, Rgba])[] }).stops;
     expect(stops.map((s) => s[1])).toEqual([DEEP, SHALLOW, WHITE]);
@@ -377,13 +379,18 @@ describe.each([
     const { store } = f;
     const { a, b } = nested(store);
     await settle(store);
-    // Vertex 0 of a is 1 deep; the depth slider is 0.25.
-    store.setDisplay(a, { coloring: { distanceTo: b, ...contactHeatmap({ depth: 0.25, gap: 0.5, exactDepth: true }) } });
+    // Vertex 0 of a is 1 deep; the depth slider is 0.2.
+    store.setDisplay(a, { coloring: { distanceTo: b, ...contactHeatmap({ depth: 0.2, gap: 0.4, exactDepth: true }) } });
     await settle(store);
     expect(vertexColor(store, a, 0)).toEqual([...DEEP]);
-    // The fast path bounds the field: the deep vertex is beyond it, base grey.
-    store.setDisplay(a, { coloring: { distanceTo: b, ...contactHeatmap({ depth: 0.25, gap: 0.5 }) } });
+    // The fast path bounds the field at 2 · max(depth, gap) = 0.8: the deep
+    // vertex is beyond it, base grey.
+    store.setDisplay(a, { coloring: { distanceTo: b, ...contactHeatmap({ depth: 0.2, gap: 0.4 }) } });
     await settle(store);
     expect(vertexColor(store, a, 0)).toEqual([...BASE]);
+    // Within the bound (depth 0.3, gap 0.5: bound 1, inclusive) it is known, and clamps to deep.
+    store.setDisplay(a, { coloring: { distanceTo: b, ...contactHeatmap({ depth: 0.3, gap: 0.5 }) } });
+    await settle(store);
+    expect(vertexColor(store, a, 0)).toEqual([...DEEP]);
   });
 });

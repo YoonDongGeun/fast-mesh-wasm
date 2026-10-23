@@ -115,7 +115,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
       <Legend depth={depth} gap={gap} tolerance={tolerance} />
       <label
         className="check"
-        title="Bound the fields at max(depth, colour from): much faster on large meshes, but deeper penetration shows the mesh colour"
+        title="Bound the fields at twice max(depth, colour from): much faster on large meshes, but deeper penetration shows the mesh colour"
       >
         <input type="checkbox" data-control="fast" checked={fast} onChange={(e) => setFast(e.currentTarget.checked)} />
         Fast mode (large meshes)

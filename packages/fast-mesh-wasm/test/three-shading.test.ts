@@ -168,6 +168,62 @@ describe("fragment shading reference", () => {
     }
   });
 
+  it("fast_mode_outer_boundary_blends_under_softness", () => {
+    // Fast mode: the field is bounded at 2 · max(depth, gap), so a vertex just
+    // beyond the gap (the range end) still holds its value: the edge from a
+    // coloured vertex to it crosses `gap` as a value boundary, which softness
+    // blends. Only vertices beyond the bound are far.
+    const heat = contactHeatmap({ depth: 1, gap: 2, tolerance: 0.25 });
+    const rule: ColorRule = { field, map: heat.map, range: heat.range, below: heat.below, above: heat.above };
+    const s = shadingOf(rule);
+    const gap = heat.range[1];
+    const inside = 1.5;
+    const outside = 2.6;
+    // Both within the field's bound: finite values, not far.
+    expect(outside).toBeLessThanOrEqual(heat.maxDistance);
+    const enc = (v: number) => {
+      const out = new Float32Array(4);
+      encodeValues([v], out, 0, 1);
+      return out;
+    };
+    const a = enc(inside);
+    const b = enc(outside);
+    const at = (t: number) => a.map((x, k) => Math.fround((1 - t) * x + t * b[k]));
+    /** Where along the edge the interpolated value is `v`. */
+    const where = (v: number) => (v - inside) / (outside - inside);
+    const base = linearOf([200, 200, 200, 255]);
+    const farColour = shadeReference(s, enc(Math.fround(gap - 1e-4)), 0);
+    // Softness 0: a hard step at the gap.
+    expect(shadeReference(s, at(where(gap) - 1e-3), 0)).not.toEqual(base);
+    expect(shadeReference(s, at(where(gap) + 1e-3), 0)).toEqual(base);
+    // Softness 0.4: a ramp across [gap - 0.2, gap + 0.2], half way at the gap.
+    const softness = 0.4;
+    const mid = shadeReference(s, at(where(gap)), softness);
+    for (let c = 0; c < 3; c++) {
+      const lo = Math.min(farColour[c], base[c]);
+      const hi = Math.max(farColour[c], base[c]);
+      expect(mid[c]).toBeGreaterThan(lo + 0.2 * (hi - lo));
+      expect(mid[c]).toBeLessThan(hi - 0.2 * (hi - lo));
+    }
+    expect(shadeReference(s, at(where(gap + 0.25)), softness)).toEqual(base);
+    // Each step of the ramp moves towards the base colour.
+    let prev = shadeReference(s, at(where(gap - 0.2)), softness);
+    for (let k = 1; k <= 20; k++) {
+      const now = shadeReference(s, at(where(gap - 0.2 + (0.4 * k) / 20)), softness);
+      for (let c = 0; c < 3; c++) {
+        expect(Math.sign(now[c] - prev[c]) * Math.sign(base[c] - farColour[c])).toBeGreaterThanOrEqual(0);
+      }
+      prev = now;
+    }
+    // With the old bound (max(depth, gap) = 2) the outside vertex would be far:
+    // a hard switch half way, whatever the softness.
+    const old = enc(Infinity);
+    const pastHalf = a.map((x, k) => Math.fround(0.51 * old[k] + 0.49 * x));
+    const beforeHalf = a.map((x, k) => Math.fround(0.49 * old[k] + 0.51 * x));
+    expect(shadeReference(s, pastHalf, softness)).toEqual(base);
+    expect(shadeReference(s, beforeHalf, softness)).toEqual(shadeReference(s, [inside, 1, 0, 0], softness));
+  });
+
   it("edge_softness_zero_is_a_step_and_wider_a_ramp", () => {
     const rule: ColorRule = { field, map: STOPS.map, range: STOPS.range, below: STOPS.below, above: STOPS.above };
     const s = shadingOf(rule);
