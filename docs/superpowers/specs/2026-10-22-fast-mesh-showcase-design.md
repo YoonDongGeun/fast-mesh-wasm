@@ -59,7 +59,7 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
 2. **Library: a contact heatmap preset** *(my call: in the library, not only the example)*.
    - The function is `contactHeatmap(options): Omit<DistanceColoring, "distanceTo">`, exported from `fast-mesh-wasm/store`. It is an alias-free helper the app spreads into `setDisplay({ coloring: { distanceTo, ...contactHeatmap(opts) } })`.
    - Options: `{ depth: number, gap: number, tolerance?: number, colors?: { deep?, shallow?, contact?, near?, far? } }`.
-   - It builds the stops and `range = [-depth, gap]`, with `maxDistance = max(depth, gap)`.
+   - It builds the stops and `range = [-depth, gap]`, with `maxDistance = 2 · max(depth, gap)` (past the range ends, so the coloured area's outer edge is a value boundary that fragment shading can soften; see §6.1 and §7.2).
    - The colours run from deep red, through red, to white at 0 (or across [-tolerance, +tolerance]), then from green to blue. Out of range is clamped below and gives the base colour above.
    - Default colours *(my call)*: deep `#7f0000`, shallow `#ff6b6b`, contact `#ffffff`, near `#4caf50`, far `#1e3a8a`.
    - `tolerance` is drawn as a flat white band. Because of that, stops must stay strictly increasing; when the tolerance is 0, the band collapses to one stop.
@@ -99,7 +99,7 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
 
 1. **Penetration beyond the depth slider** *(owner chose option c)*. A field marks vertices beyond its `maxDistance` as far, with no sign. A slider-bounded field would therefore show deep interiors as base grey. So `contactHeatmap` takes `exactDepth?: boolean`:
    - `true` gives `maxDistance: Infinity`. Every vertex then gets its true signed distance, and anything deeper than `depth` clamps to the darkest red. The cost is a full recompute on every update.
-   - `false` gives `maxDistance = max(depth, gap)`, the fast contact path. Deeper vertices show the base colour, and the UI labels them "beyond range".
+   - `false` gives `maxDistance = 2 · max(depth, gap)`, the fast contact path *(changed from `max(depth, gap)` with fragment shading: a field bounded at the range end stores Infinity just past it, so the coloured area's outer edge was a far/finite boundary rather than a value boundary and could not be softened)*. Vertices deeper than the bound show the base colour, and the readouts say the depth was measured within the bound.
    - The showcase defaults to `true`, with a "Fast mode (large meshes)" toggle that switches to `false`. The library default is `false`, because the library is general-purpose and the fast path is the safe default.
 2. **Sign** *(my call)*. `contactHeatmap` passes `sign` through, defaulting to `"auto"`. Auto uses pseudonormals for open meshes, so penetration still has a side.
    - The collision panel reads `fieldStatus` (async) for A and B. When the target is open or inconsistently oriented, it shows a warning: "B is open: penetration side follows its surface normals; repair → orient/fill holes for a closed result".

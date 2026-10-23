@@ -28,7 +28,10 @@ export interface BindMeshOptions {
    * The binding controls the material's `color`, `vertexColors`, `opacity`,
    * `transparent` and `depthWrite` (colouring and {@link BoundMesh.setOpacity}
    * change them), so do not share one material between bound meshes: give
-   * each its own (`material.clone()`).
+   * each its own (`material.clone()`). With `shading: "fragment"` the
+   * binding calls the material's `dispose()` when it binds and again when it
+   * is disposed and puts the material back (dropping its compiled program so
+   * it is rebuilt with, then without, the shading); the material stays usable.
    */
   material?: THREE.MeshStandardMaterial | THREE.MeshPhongMaterial | THREE.MeshLambertMaterial | THREE.MeshBasicMaterial;
   /**
