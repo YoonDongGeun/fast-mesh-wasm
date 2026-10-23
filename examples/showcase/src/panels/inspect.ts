@@ -1,6 +1,7 @@
 // What the repair and collision panels share outside React, for the test hook
 // (scripts/showcase-check.mjs reads it through `window.__showcase`): the
 // latest readouts and analysis, and how often they were refreshed.
+import type { MeshHandle } from "fast-mesh-wasm";
 import type { AnalysisSummary } from "./repair-summary";
 
 /** The collision readouts of the pair as last queried. */
@@ -20,6 +21,37 @@ export interface Readouts {
   contacts: { a: number; b: number };
 }
 
+/** One pair of a contact group, as last queried. */
+export interface PairReadout {
+  a: MeshHandle;
+  b: MeshHandle;
+  /** The surfaces' distance (`meshDistance`); 0 when they touch or intersect. */
+  gap: number | null;
+  intersects: boolean;
+  /**
+   * The deepest penetration between the two: `-min` over either member's
+   * values at the vertices the other is nearest to (see `pairDepths`);
+   * `null` before the fields have values.
+   */
+  depth: number | null;
+}
+
+/** The contact group's readouts as last queried. */
+export interface GroupReadouts {
+  /** The fields' bound (`maxDistance`) the depths were measured within; `Infinity` when exact. */
+  bound: number;
+  pairs: PairReadout[];
+}
+
+/** A live readout: the latest value, how often it was refreshed (and while the gizmo dragged), and whether it is current. */
+export interface LiveProbe<T> {
+  readouts: T | null;
+  updates: number;
+  updatesWhileDragging: number;
+  /** No change waits for a refresh and none runs: the readouts are those of the scene as it is. */
+  settled: boolean;
+}
+
 export const inspect: {
   collision: {
     readouts: Readouts | null;
@@ -35,6 +67,10 @@ export const inspect: {
      */
     warnings: string[];
   };
+  /** The collision panel's Group mode: its readouts and the members' topology warnings. */
+  group: LiveProbe<GroupReadouts> & { warnings: string[] };
+  /** The hover tip: the mesh under the pointer, the partner nearest to the vertex there, and its distance. */
+  hover: { mesh: MeshHandle; partner: MeshHandle | null; distance: number | null } | null;
   repair: {
     /** The mesh analysed (its name) and the summary, `null` before an analysis. */
     analysis: { mesh: string; summary: AnalysisSummary } | null;
@@ -46,5 +82,7 @@ export const inspect: {
   };
 } = {
   collision: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true, warnings: [] },
+  group: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true, warnings: [] },
+  hover: null,
   repair: { analysis: null, analyses: 0, report: null, busy: null },
 };

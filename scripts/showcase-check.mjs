@@ -18,10 +18,11 @@
 // - glsl: bindMesh's fragment shading run on the GPU (a float render target,
 //   read back) for constant quads at a contact heatmap's knots, range ends,
 //   +-tolerance, far, -far, NaN and random values, and for built-in maps with
-//   a centre and both out-of-range modes, at softness 0 and above: every
-//   colour within one 16-bit level of the library's JavaScript reference
-//   (packages/fast-mesh-wasm/src/colormap.ts, loaded with Node's type
-//   stripping).
+//   a centre and both out-of-range modes, at softness 0 and above, against
+//   the library's JavaScript reference (packages/fast-mesh-wasm/src/colormap.ts,
+//   loaded with Node's type stripping): every colour within one 16-bit level
+//   at softness 0 (the exact path), within four with softness (the filter
+//   sums in f32 on the GPU).
 // - select: a click on A in the canvas selects it.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
@@ -45,6 +46,16 @@
 //   two holes and two components; Fill holes (up to 64 edges, the default)
 //   leaves none, C stays coloured (over its new vertices too) and the
 //   warning goes; Undo brings both back and clears the stale report.
+// - group: the Group mode with A, B and C (the default members, all pairs):
+//   each is coloured by its distance to the other two (one field measured
+//   to both), with colours on all three; the readouts list the three pairs
+//   (A and B intersecting, a penetration depth; a gap between A and C)
+//   and the warning that C is open;
+//   hovering A shows the partner nearest to the vertex under the pointer.
+//   Unticking "All pairs" and then the A-C cell of the pair matrix leaves
+//   A and C each coloured against B only (B against both); "All pairs"
+//   again restores them. Removing C keeps A and B coloured, each against the other, with one
+//   pair's readouts and no error. Back to the pair mode.
 // - remove (RF3): removing B while A and B are coloured resets B's picker,
 //   stops A's colouring and the readouts, with no error.
 // - upload: three fixtures (binary STL, OBJ with quads, ASCII PLY) through
@@ -54,7 +65,8 @@
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
 // - local: a short pass with ?local (the synchronous Scene on the main
-//   thread): the demo meshes, the heatmap readouts, Fill holes on C and undo.
+//   thread): the demo meshes, the heatmap readouts, the Group mode's
+//   per-pair readouts (depths from `fieldNearest`), Fill holes on C and undo.
 // - console: no console error or uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -609,11 +621,78 @@ try {
     `C: ${holesBefore} holes, ${componentsBefore} components; ${filled === undefined ? `after Fill holes ${q(await hook("repair()"))}` : `"${filled.r.report}"`}; coloured vertices ${verticesBefore} -> ${verticesFilled} -> ${verticesRestored} after undo; undo ${restored === undefined ? `did not restore the holes, the colouring and the warning, or clear the report (${q(await hook("repair()"))})` : "restored the holes, the colouring and the warning, and cleared the report"}`,
   );
 
+  // ---- group: A, B and C coloured as a contact group, then C removed ----
+  // `to(name, others)`: the mesh is coloured, ready, against exactly `others`.
+  const to = (name, others) =>
+    `(Array.isArray(c.coloring[${q(name)}]?.to) && c.coloring[${q(name)}].status === "ready"
+      && c.coloring[${q(name)}].to.length === ${others.length} && ${q(others)}.every((m) => c.coloring[${q(name)}].to.includes(m)))`;
+  const groupState = (extra) =>
+    `(() => { const c = __showcase.collision(); const g = __showcase.group(); return c.mode === "group" && (${extra}) && { c, g }; })()`;
+  const pairOf = (x, y) => `g.readouts?.pairs.find((p) => p.a === ${q(x)} && p.b === ${q(y)})`;
+  await clickOn("[data-mode=group]");
+  const grouped = await waitFor(
+    groupState(`g.members.length === 3 && g.pairs === "all" && ${to(A, [B, C])} && ${to(B, [A, C])} && ${to(C, [A, B])}
+      && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.intersects && ${pairOf(A, B)}.depth > 0
+      && ${pairOf(A, C)}?.gap > 0 && g.warnings.some((w) => w.startsWith(${q(`${C} is open`)}))`),
+    30_000,
+  );
+  await sleep(100); // the colours of those colourings, committed
+  const colorsGroup = { A: await hook(`colorCounts(${q(A)})`), B: await hook(`colorCounts(${q(B)})`), C: await hook(`colorCounts(${q(C)})`) };
+  // Hover A where it is projected (its front surface): the tip names a partner.
+  const overA = await hook(`screenPoint(${q(A)})`);
+  let hovered;
+  for (const t = Date.now(); hovered === undefined && Date.now() - t < 10_000; ) {
+    await mouse("mouseMoved", overA.x + ((Date.now() / 50) % 3), overA.y, { button: "none" });
+    hovered = await waitFor(
+      `(() => { const h = __showcase.group().hover; return h?.mesh === ${q(A)} && [${q(B)}, ${q(C)}].includes(h.partner) && h; })()`,
+      500,
+    );
+  }
+  await mouse("mouseMoved", 5, 5, { button: "none" });
+  // The pair matrix: every pair ticked when "All pairs" goes off; untick A-C.
+  await clickOn("[data-control=all-pairs]");
+  const matrix = await page(`document.querySelectorAll("[data-pair]:checked").length`);
+  await clickOn(`[data-pair="${A}|${C}"]`);
+  const edited = await waitFor(
+    groupState(`Array.isArray(g.pairs) && g.pairs.length === 2 && ${to(A, [B])} && ${to(C, [B])} && ${to(B, [A, C])}
+      && g.settled && g.readouts?.pairs.length === 2`),
+    20_000,
+  );
+  await clickOn("[data-control=all-pairs]");
+  const restored3 = await waitFor(groupState(`g.pairs === "all" && ${to(A, [B, C])} && ${to(C, [A, B])}`), 20_000);
+  const pairsGroup = grouped?.g.readouts.pairs.map((p) => `${p.a.split(" ")[0]}-${p.b.split(" ")[0]} gap ${fmt(p.gap)} hit ${p.intersects} depth ${p.depth === null ? "-" : fmt(p.depth)}`);
+  await clickOn(`[data-mesh="${C}"] button.danger`);
+  const shrunk = await waitFor(
+    groupState(`!(${q(C)} in c.coloring) && g.members.length === 2 && ${to(A, [B])} && ${to(B, [A])}
+      && g.settled && g.readouts?.pairs.length === 1 && ${pairOf(A, B)}?.intersects && __showcase.status().status !== "error"`),
+    20_000,
+  );
+  await sleep(100);
+  const colorsShrunk = { A: await hook(`colorCounts(${q(A)})`), B: await hook(`colorCounts(${q(B)})`) };
+  const groupStatus = await hook("status()");
+  verdict(
+    "group",
+    grouped !== undefined &&
+      colorsGroup.A?.red > 0 &&
+      colorsGroup.B?.red > 0 &&
+      colorsGroup.C?.gap > 0 &&
+      hovered !== undefined &&
+      matrix === 3 &&
+      edited !== undefined &&
+      restored3 !== undefined &&
+      shrunk !== undefined &&
+      colorsShrunk.A?.red > 0 &&
+      colorsShrunk.B?.red > 0 &&
+      groupStatus.status !== "error",
+    `${grouped === undefined ? `group ${q(await hook("group()"))}; collision ${q((await hook("collision()")).coloring)}` : `A, B and C coloured (red/gap vertices: A ${colorsGroup.A?.red}/${colorsGroup.A?.gap}, B ${colorsGroup.B?.red}/${colorsGroup.B?.gap}, C ${colorsGroup.C?.red}/${colorsGroup.C?.gap}); pairs ${pairsGroup.join(", ")}`}; hover over A ${hovered === undefined ? "showed no partner" : `nearest ${hovered.partner} at ${fmt(hovered.distance)}`}; pair matrix ${matrix} ticked, without A-C ${edited === undefined ? q(await hook("group()")) : "A and C against B only"}, all pairs again ${restored3 !== undefined}; after removing C ${shrunk === undefined ? q(await hook("group()")) : `A and B coloured against each other (red vertices ${colorsShrunk.A?.red}, ${colorsShrunk.B?.red}), one pair`}; scene ${groupStatus.status}`,
+  );
+  await clickOn("[data-mode=pair]");
+
   // ---- remove (RF3): B removed while A and B are coloured ----
   await pick("b", B);
   const pairAB = await waitFor(
-    collision(`c.coloring[${q(B)}]?.to === ${q(A)} && c.coloring[${q(B)}].status === "ready"
-      && c.coloring[${q(C)}]?.to === null && c.readouts?.intersects === true`),
+    collision(`c.mode === "pair" && c.coloring[${q(A)}]?.to === ${q(B)} && c.coloring[${q(B)}]?.to === ${q(A)}
+      && c.coloring[${q(B)}].status === "ready" && c.readouts?.intersects === true`),
     20_000,
   );
   await clickOn(`[data-mesh="${B}"] button.danger`);
@@ -721,6 +800,12 @@ try {
       && c.readouts?.penetration?.depth > 0 && c.readouts.intersects`),
     30_000,
   );
+  await clickOn("[data-mode=group]");
+  const localGroup = await waitFor(
+    groupState(`${to(A, [B, C])} && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.depth > 0`),
+    30_000,
+  );
+  await clickOn("[data-mode=pair]");
   await clickOn(`[data-mesh="${C}"] .mesh-name`);
   const localHoles = await waitFor(
     `(() => { const r = __showcase.repair(); return r.analysis?.mesh === ${q(C)} && r.analysis.summary.holes.length; })()`,
@@ -738,8 +823,8 @@ try {
   );
   verdict(
     "local",
-    localDemo !== undefined && localHeat !== undefined && localHoles === 2 && localFilled === true && localUndone === true,
-    `local scene ${localDemo !== undefined}; heatmap ${localHeat === undefined ? "not ready" : `penetration ${fmt(localHeat.readouts.penetration.depth)}`}; C ${localHoles} holes, filled ${localFilled === true}, undone ${localUndone === true}`,
+    localDemo !== undefined && localHeat !== undefined && localGroup !== undefined && localHoles === 2 && localFilled === true && localUndone === true,
+    `local scene ${localDemo !== undefined}; heatmap ${localHeat === undefined ? "not ready" : `penetration ${fmt(localHeat.readouts.penetration.depth)}`}; group ${localGroup === undefined ? "not ready" : `A-B depth ${fmt(localGroup.g.readouts.pairs[0].depth)}`}; C ${localHoles} holes, filled ${localFilled === true}, undone ${localUndone === true}`,
   );
 
   // ---- console ----

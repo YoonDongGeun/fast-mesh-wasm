@@ -3,6 +3,8 @@
 // `attachTransformControls`, one undo step per drag). `<FastMesh>` drives
 // the store's frames. Colourings are drawn with fragment shading, so the
 // heatmap's boundaries are crisp, softened by the collision panel's slider.
+// With `hoverable` (Group mode) the vertex under the pointer is tracked in
+// `view.hover`, for the hover tip.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
 import type { MeshHandle } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
@@ -14,7 +16,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { FocusRequest } from "../App";
 import type { Item } from "../scene/app-state";
-import { setDragging, view } from "./view";
+import { setDragging, setHover, view } from "./view";
 
 export type GizmoMode = "translate" | "rotate";
 
@@ -24,8 +26,10 @@ export function Viewport(props: {
   focus: FocusRequest | null;
   /** Fragment shading's edge softness, in distance units. */
   edgeSoftness: number;
+  /** Track the vertex under the pointer (`view.hover`). */
+  hoverable: boolean;
 }) {
-  const { items, mode, focus, edgeSoftness } = props;
+  const { items, mode, focus, edgeSoftness, hoverable } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -43,6 +47,11 @@ export function Viewport(props: {
   useEffect(() => {
     view.bindings = bindings;
   }, [bindings]);
+  useEffect(() => {
+    if (!hoverable) {
+      setHover(null);
+    }
+  }, [hoverable]);
   const selected = selection === null ? null : (bindings.get(selection) ?? null);
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
 
@@ -59,6 +68,7 @@ export function Viewport(props: {
           item={item}
           selected={item.mesh === selection}
           edgeSoftness={edgeSoftness}
+          hoverable={hoverable}
           onPick={select}
           onBind={onBind}
         />
@@ -73,10 +83,11 @@ function MeshView(props: {
   item: Item;
   selected: boolean;
   edgeSoftness: number;
+  hoverable: boolean;
   onPick: (mesh: MeshHandle) => void;
   onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind } = props;
+  const { item, selected, edgeSoftness, hoverable, onPick, onBind } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
@@ -91,6 +102,34 @@ function MeshView(props: {
     },
     [item.mesh, onPick],
   );
+  // The hit triangle's corner nearest to the hit point: the vertex hovered.
+  const onPointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (e.face == null) {
+        return;
+      }
+      e.stopPropagation();
+      const position = (e.object as THREE.Mesh).geometry.getAttribute("position");
+      const local = e.object.worldToLocal(e.point.clone());
+      const corner = new THREE.Vector3();
+      let slot = e.face.a;
+      let best = Infinity;
+      for (const v of [e.face.a, e.face.b, e.face.c]) {
+        const d = corner.fromBufferAttribute(position, v).distanceToSquared(local);
+        if (d < best) {
+          best = d;
+          slot = v;
+        }
+      }
+      setHover({ mesh: item.mesh, slot, x: e.nativeEvent.clientX, y: e.nativeEvent.clientY });
+    },
+    [item.mesh],
+  );
+  const onPointerOut = useCallback(() => {
+    if (view.hover?.mesh === item.mesh) {
+      setHover(null);
+    }
+  }, [item.mesh]);
   return (
     <FastMesh
       mesh={item.mesh}
@@ -98,6 +137,8 @@ function MeshView(props: {
       shading="fragment"
       edgeSoftness={edgeSoftness}
       onClick={onClick}
+      onPointerMove={hoverable ? onPointerMove : undefined}
+      onPointerOut={hoverable ? onPointerOut : undefined}
       onBind={(b) => onBind(item.mesh, b)}
     />
   );

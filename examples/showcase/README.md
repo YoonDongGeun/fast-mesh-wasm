@@ -52,6 +52,19 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   (orientation conflicts), from `analyze` of it when the pair changes or its triangles change, the
   panel says so: penetration measured to it then follows its surface normals; Orient or Fill holes
   give a closed result. Removing A or B stops the colouring and resets its picker.
+- **Collision: Group mode.** Tick several meshes (the first three by default) into a contact group
+  (`store.setContactGroup`), measured to each other in *All pairs* or in the pairs ticked in a small
+  matrix. Each member gets one field measured to all of its partners and one colour scale, the same
+  heatmap and sliders as the pair: each vertex shows its distance to the nearest partner surface (or
+  the deepest penetration). Moving a member recomputes only its own field and its partners'. A
+  readout per pair, throttled and paused during drags like the pair's: *Min gap* (`meshDistance`),
+  *Hit* (`intersects`) and *Max depth*, the deepest negative value of either member at the vertices
+  the other is nearest to (`store.fetchColoringValues` and the field's `nearest` buffer; a vertex
+  inside two partners counts for the deeper one only). Hovering a member shows which partner the
+  vertex under the pointer is nearest to and how far (the `nearest` buffer through
+  `fetchFieldNearest`, or `fieldNearest` with `?local`, read when the member is first hovered and
+  after it changes, never during a drag). Open or inconsistently oriented members get the same
+  warning as the pair. Removing a member keeps the others coloured with their remaining partners.
 - **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
   page is cross-origin isolated, and on an error its message with Restart.
 
@@ -76,6 +89,7 @@ node scripts/showcase-check.mjs --big                # plus a 1M-triangle STL up
 
 The scripted session selects and drags A with the gizmo and undoes it; checks the heatmap of A and
 B and its readouts while A is dragged away; picks the open mesh C as B and expects the open-mesh
-warning; fills C's holes while it is coloured and undoes it; removes B while it is coloured; loads
-STL, OBJ and PLY files (and a broken one); then repeats a short session with `?local`. It fails on
-any console error.
+warning; fills C's holes while it is coloured and undoes it; colours A, B and C as a contact group
+(colours on all three, the per-pair readouts, the hover tip, the pair matrix) and removes C from it;
+removes B while it is coloured; loads STL, OBJ and PLY files (and a broken one); then repeats a
+short session with `?local` (the group's readouts included). It fails on any console error.

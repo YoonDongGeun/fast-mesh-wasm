@@ -10,6 +10,7 @@ import type { AppState } from "./scene/app-state";
 import { view } from "./viewport/view";
 
 export function installTestHook(store: SceneStore, engine: Engine, app: AppState): void {
+  const nameOf = (m: unknown) => app.getSnapshot().items.find((i) => i.mesh === m)?.name ?? null;
   const find = (name: string) => {
     const item = app.getSnapshot().items.find((i) => i.name === name);
     if (item === undefined) {
@@ -66,19 +67,21 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
       return { mesh: item?.name ?? null, axis: g.axis };
     },
     /**
-     * The collision panel: the pair (names), each mesh's applied colouring
-     * (its target's name, and the range) and status, and the readouts with
-     * how often they refreshed (and while the gizmo dragged).
+     * The collision panel: the mode, the pair (names), each mesh's applied
+     * colouring (its target's name, or its targets' names in a group, and
+     * the range) and status, and the readouts with how often they refreshed
+     * (and while the gizmo dragged).
      */
     collision: () => {
       const { a, b } = app.getSnapshot().collision;
-      const nameOf = (m: unknown) => app.getSnapshot().items.find((i) => i.mesh === m)?.name ?? null;
       const shown = (m: typeof a) => {
         const st = m === null ? undefined : store.getSnapshot().meshes.get(m);
         const c = st?.display.coloring ?? null;
-        return st === undefined ? null : { status: st.status, to: c === null ? null : nameOf(c.distanceTo), range: c?.range ?? null };
+        const to = c === null ? null : Array.isArray(c.distanceTo) ? c.distanceTo.map(nameOf) : nameOf(c.distanceTo);
+        return st === undefined ? null : { status: st.status, to, range: c?.range ?? null };
       };
       return {
+        mode: app.getSnapshot().collisionMode,
         a: nameOf(a),
         b: nameOf(b),
         coloring: Object.fromEntries(app.getSnapshot().items.map((i) => [i.name, shown(i.mesh)])),
@@ -87,6 +90,27 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         updatesWhileDragging: inspect.collision.updatesWhileDragging,
         settled: inspect.collision.settled,
         warnings: inspect.collision.warnings,
+      };
+    },
+    /**
+     * The Group mode: the members and their pairs (names), the per-pair
+     * readouts (names) with how often they refreshed, the members' warnings,
+     * and the hover tip (mesh, nearest partner, distance).
+     */
+    group: () => {
+      const { members, pairs } = app.getSnapshot().group;
+      const r = inspect.group.readouts;
+      const h = inspect.hover;
+      return {
+        members: members.map(nameOf),
+        pairs: pairs === "all" ? "all" : pairs.map(([x, y]) => [nameOf(x), nameOf(y)]),
+        readouts:
+          r === null ? null : { bound: r.bound, pairs: r.pairs.map((p) => ({ ...p, a: nameOf(p.a), b: nameOf(p.b) })) },
+        updates: inspect.group.updates,
+        updatesWhileDragging: inspect.group.updatesWhileDragging,
+        settled: inspect.group.settled,
+        warnings: inspect.group.warnings,
+        hover: h === null ? null : { mesh: nameOf(h.mesh), partner: h.partner === null ? null : nameOf(h.partner), distance: h.distance },
       };
     },
     /** The repair panel: the latest analysis (mesh name and summary), the latest report, the op running. */

@@ -1,36 +1,21 @@
-// The collision panel: the contact heatmap of two meshes, each coloured by
-// its signed distance to the other (`contactHeatmap`), with readouts of the
-// deepest penetration, the gap, whether they intersect and the triangles in
-// contact. The heatmap controls are shared; the pair below them is one mode
-// (a later "Group" mode colours several meshes with the same controls).
+// The collision panel: the contact heatmap of meshes coloured by their
+// signed distance to each other (`contactHeatmap`). The heatmap controls are
+// shared by two modes: a pair, each mesh coloured against the other, with
+// readouts of the deepest penetration, the gap, whether they intersect and
+// the triangles in contact; and a contact group (`store.setContactGroup`),
+// several meshes each coloured by its nearest partner, with readouts per pair.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useMeshDisplay, useScene } from "fast-mesh-wasm/react";
-import { contactHeatmap, type DistanceColoring, type SceneStore } from "fast-mesh-wasm/store";
+import { contactHeatmap, type DistanceColoring } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { type AppState, type CollisionPair, type Item, useApp } from "../scene/app-state";
-import { view } from "../viewport/view";
-import {
-  clampTolerance,
-  deepestPenetration,
-  formatDistance,
-  niceScale,
-  toleranceLimit,
-  topologyOf,
-} from "./collision-math";
+import { clampTolerance, deepestPenetration, formatDistance, niceScale, toleranceLimit } from "./collision-math";
+import { GroupMode } from "./GroupMode";
 import { inspect, type Readouts } from "./inspect";
+import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 
-/**
- * Outside a drag the readouts refresh at most this often (about 4 Hz), and
- * once more after the last change. During a gizmo drag they pause: reading
- * the field values forces every due field up to date, which would keep the
- * Worker from dropping recomputes of stale poses (the colours stay live).
- */
-const READOUT_PERIOD_MS = 250;
-/** A target is re-analysed this long after its triangles last changed. */
-const TOPOLOGY_DELAY_MS = 250;
-
-type Heatmap = Omit<DistanceColoring, "distanceTo">;
+export type Heatmap = Omit<DistanceColoring, "distanceTo">;
 
 interface HeatmapParams {
   depth: number;
@@ -42,12 +27,13 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   const { app, scene } = props;
   const items = useApp(app, (s) => s.items);
   const pair = useApp(app, (s) => s.collision);
-  const itemA = items.find((i) => i.mesh === pair.a) ?? null;
-  const itemB = items.find((i) => i.mesh === pair.b) ?? null;
+  const mode = useApp(app, (s) => s.collisionMode);
+  const group = useApp(app, (s) => s.group);
+  const shown = mode === "pair" ? [pair.a, pair.b] : group.members;
 
-  // The sliders' scale follows the pair's size: a file in millimetres and
-  // the unit-sized demo meshes both get useful ranges.
-  const scale = niceScale(Math.max(itemA?.radius ?? 0, itemB?.radius ?? 0));
+  // The sliders' scale follows the size of the meshes coloured: a file in
+  // millimetres and the unit-sized demo meshes both get useful ranges.
+  const scale = niceScale(Math.max(0, ...items.filter((i) => shown.includes(i.mesh)).map((i) => i.radius)));
   const step = scale / 1000;
   // `null` until a slider moves: the defaults then follow the scale.
   const [params, setParams] = useState<HeatmapParams | null>(null);
@@ -69,8 +55,24 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   return (
     <section className="panel" aria-label="Collision">
       <h2>Collision</h2>
+      <div className="modes" role="group" aria-label="Collision mode">
+        <button type="button" data-mode="pair" aria-pressed={mode === "pair"} onClick={() => app.setCollisionMode("pair")}>
+          Pair
+        </button>
+        <button
+          type="button"
+          data-mode="group"
+          aria-pressed={mode === "group"}
+          onClick={() => app.setCollisionMode("group")}
+        >
+          Group
+        </button>
+      </div>
       <p className="muted small">
-        Each mesh coloured by its distance to the other: penetration in reds, contact white, the gap green to blue.
+        {mode === "pair"
+          ? "Each mesh coloured by its distance to the other"
+          : "Each mesh coloured by its distance to the nearest of its partners"}
+        : penetration in reds, contact white, the gap green to blue.
       </p>
       <Slider
         label="Penetration depth"
@@ -120,7 +122,11 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         <input type="checkbox" data-control="fast" checked={fast} onChange={(e) => setFast(e.currentTarget.checked)} />
         Fast mode (large meshes)
       </label>
-      <PairMode app={app} scene={scene} items={items} pair={pair} heat={heat} tolerance={tolerance} />
+      {mode === "pair" ? (
+        <PairMode app={app} scene={scene} items={items} pair={pair} heat={heat} tolerance={tolerance} />
+      ) : (
+        <GroupMode app={app} scene={scene} items={items} group={group} heat={heat} />
+      )}
     </section>
   );
 }
@@ -157,8 +163,47 @@ function PairMode(props: {
   }, [store, a, b, heat]);
 
   const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? "the mesh";
-  const readouts = useReadouts(store, scene, ready ? a : null, ready ? b : null, tolerance, heat.maxDistance);
-  const warnings = useTopologyWarnings(scene, ready ? a : null, ready ? b : null, nameOf);
+  // B's warning first: the side A's colours are measured to.
+  const watched = ready ? [b, a] : [];
+  const key = meshesKey(items, watched);
+  const bound = heat.maxDistance;
+  const { readouts, poke } = useLiveReadouts<Readouts>(
+    store,
+    ready ? watched : null,
+    key,
+    async () => {
+      if (!ready) {
+        throw new Error("no pair");
+      }
+      const [va, vb, distance, hit, contacts] = await Promise.all([
+        // After a commit (this runs from change records): the colouring last
+        // sent. A colouring replaced meanwhile rejects; read it as none.
+        store.fetchColoringValues(a).catch(() => null),
+        store.fetchColoringValues(b).catch(() => null),
+        Promise.resolve(scene.meshDistance(a, b)),
+        Promise.resolve(scene.intersects(a, b)),
+        Promise.resolve(scene.findContacts({ margin: tolerance, pairs: [[a, b]] })),
+      ]);
+      const c = contacts[0];
+      return {
+        penetration: deepestPenetration([va, vb], bound, hit),
+        bound,
+        gap: distance === null ? null : distance.distance,
+        intersects: hit,
+        contacts:
+          c === undefined
+            ? { a: 0, b: 0 }
+            : c.a === a
+              ? { a: c.trianglesA.length, b: c.trianglesB.length }
+              : { a: c.trianglesB.length, b: c.trianglesA.length },
+      };
+    },
+    inspect.collision,
+  );
+  // A new tolerance changes the contact count, a new bound how the depth
+  // reads (the colours follow through change records).
+  useEffect(() => poke(), [tolerance, bound]);
+  const warnings = useTopologyWarnings(scene, watched, key, nameOf);
   useEffect(() => {
     inspect.collision.warnings = warnings;
   });
@@ -324,227 +369,4 @@ function Slider(props: {
       />
     </label>
   );
-}
-
-/**
- * The pair's readouts, refreshed when either mesh moves, changes or is
- * recoloured (its change records), at most every READOUT_PERIOD_MS and once
- * more after the last change. Paused while the gizmo drags, then refreshed
- * once when the drag ends. One query at a time; `null` without a pair. A new tolerance or field bound only
- * asks for a refresh: the previous readouts stay until it lands. A mesh
- * removed mid-query rejects: that refresh is dropped.
- */
-function useReadouts(
-  store: SceneStore,
-  scene: Scene | WorkerScene,
-  a: MeshHandle | null,
-  b: MeshHandle | null,
-  tolerance: number,
-  bound: number,
-): Readouts | null {
-  const [readouts, setReadouts] = useState<Readouts | null>(null);
-  const live = useRef({ tolerance, bound });
-  live.current = { tolerance, bound };
-  const poke = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    // A new pair: the old pair's readouts no longer apply.
-    setReadouts(null);
-    inspect.collision.readouts = null;
-    if (a === null || b === null) {
-      return;
-    }
-    let alive = true;
-    let dirty = true;
-    let running = false;
-    let last = -Infinity;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const s = scene;
-
-    const query = async (): Promise<Readouts> => {
-      const { tolerance: margin, bound: maxDistance } = live.current;
-      const [va, vb, distance, hit, contacts] = await Promise.all([
-        // After a commit (this runs from change records): the colouring last
-        // sent. A colouring replaced meanwhile rejects; read it as none.
-        store.fetchColoringValues(a).catch(() => null),
-        store.fetchColoringValues(b).catch(() => null),
-        Promise.resolve(s.meshDistance(a, b)),
-        Promise.resolve(s.intersects(a, b)),
-        Promise.resolve(s.findContacts({ margin, pairs: [[a, b]] })),
-      ]);
-      const c = contacts[0];
-      return {
-        penetration: deepestPenetration([va, vb], maxDistance, hit),
-        bound: maxDistance,
-        gap: distance === null ? null : distance.distance,
-        intersects: hit,
-        contacts:
-          c === undefined
-            ? { a: 0, b: 0 }
-            : c.a === a
-              ? { a: c.trianglesA.length, b: c.trianglesB.length }
-              : { a: c.trianglesB.length, b: c.trianglesA.length },
-      };
-    };
-    const kick = () => {
-      inspect.collision.settled = !dirty && !running;
-      if (!alive || running || !dirty || view.dragging) {
-        // A drag pauses the readouts; its end kicks them again.
-        return;
-      }
-      const wait = last + READOUT_PERIOD_MS - performance.now();
-      if (wait > 0) {
-        timer ??= setTimeout(() => {
-          timer = undefined;
-          kick();
-        }, wait);
-        return;
-      }
-      dirty = false;
-      running = true;
-      inspect.collision.settled = false;
-      last = performance.now();
-      query()
-        .then(
-          (r) => {
-            if (!alive) {
-              return;
-            }
-            setReadouts(r);
-            inspect.collision.readouts = r;
-            inspect.collision.updates++;
-            if (view.dragging) {
-              inspect.collision.updatesWhileDragging++;
-            }
-          },
-          () => {
-            // A mesh removed (or the scene restarted) mid-query: skip this refresh.
-          },
-        )
-        .finally(() => {
-          running = false;
-          kick();
-        });
-    };
-
-    const off = store.scene.onChanges((changes) => {
-      for (const c of changes) {
-        if (c.mesh !== a && c.mesh !== b) {
-          continue;
-        }
-        const changed = (r: readonly unknown[] | "all") => r === "all" || r.length > 0;
-        if (c.placementChanged || changed(c.colors) || changed(c.indices) || c.fieldsChanged.length > 0) {
-          dirty = true;
-        }
-      }
-      kick();
-    });
-    const onDrag = (dragging: boolean) => {
-      if (!dragging) {
-        kick();
-      }
-    };
-    view.dragListeners.add(onDrag);
-    poke.current = () => {
-      dirty = true;
-      kick();
-    };
-    kick();
-    return () => {
-      alive = false;
-      off();
-      view.dragListeners.delete(onDrag);
-      clearTimeout(timer);
-      poke.current = () => {};
-      inspect.collision.settled = true;
-    };
-  }, [store, scene, a, b]);
-
-  // A new tolerance changes the contact count, a new bound how the depth
-  // reads (the colours follow through change records).
-  useEffect(() => poke.current(), [tolerance, bound]);
-
-  return a === null || b === null ? null : readouts;
-}
-
-/**
- * Warnings for a pair mesh that is open or inconsistently oriented: a field
- * measured to it takes its penetration side from its surface normals. From
- * `analyze` of each mesh (read-only, counts only), run when the pair changes
- * and again, coalesced, TOPOLOGY_DELAY_MS after a mesh's triangles change
- * (a repair, its undo); the latest analysis of each mesh wins.
- */
-function useTopologyWarnings(
-  scene: Scene | WorkerScene,
-  a: MeshHandle | null,
-  b: MeshHandle | null,
-  nameOf: (m: MeshHandle) => string,
-): string[] {
-  const store = useScene();
-  const [topology, setTopology] = useState<ReadonlyMap<MeshHandle, ReturnType<typeof topologyOf>>>(() => new Map());
-
-  useEffect(() => {
-    setTopology(new Map());
-    if (a === null || b === null) {
-      return;
-    }
-    let alive = true;
-    const seq = new Map<MeshHandle, number>();
-    const timers = new Map<MeshHandle, ReturnType<typeof setTimeout>>();
-    const run = (m: MeshHandle) => {
-      const n = (seq.get(m) ?? 0) + 1;
-      seq.set(m, n);
-      Promise.resolve()
-        .then(() => scene.analyze(m, { maxListed: 1 }))
-        .then(
-          (an) => {
-            if (alive && seq.get(m) === n) {
-              setTopology((t) => new Map(t).set(m, topologyOf(an)));
-            }
-          },
-          () => {
-            // Removed meanwhile: the pair follows.
-          },
-        );
-    };
-    run(a);
-    run(b);
-    const off = store.scene.onChanges((changes) => {
-      for (const c of changes) {
-        if ((c.mesh === a || c.mesh === b) && !c.removed && (c.indices === "all" || c.indices.length > 0)) {
-          const m = c.mesh;
-          clearTimeout(timers.get(m));
-          timers.set(
-            m,
-            setTimeout(() => run(m), TOPOLOGY_DELAY_MS),
-          );
-        }
-      }
-    });
-    return () => {
-      alive = false;
-      off();
-      for (const t of timers.values()) {
-        clearTimeout(t);
-      }
-    };
-  }, [store, scene, a, b]);
-
-  const warnings: string[] = [];
-  for (const m of [b, a]) {
-    const t = m === null ? undefined : topology.get(m);
-    if (m === null || t === undefined) {
-      continue;
-    }
-    if (t.open) {
-      warnings.push(
-        `${nameOf(m)} is open: penetration side follows its surface normals; repair → orient/fill holes for a closed result`,
-      );
-    } else if (t.inconsistent) {
-      warnings.push(
-        `${nameOf(m)} is inconsistently oriented: penetration side follows its surface normals; repair → orient for a closed result`,
-      );
-    }
-  }
-  return warnings;
 }

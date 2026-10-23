@@ -7,6 +7,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useState } from "react";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { HoverTip } from "./panels/HoverTip";
 import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
@@ -34,6 +35,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
   const items = useApp(app, (s) => s.items);
   const edgeSoftness = useApp(app, (s) => s.edgeSoftness);
+  const grouped = useApp(app, (s) => s.collisionMode === "group");
+  const members = useApp(app, (s) => s.group.members);
   const [selection, select] = useSelection();
   const { canUndo, canRedo, undo, redo } = useHistory();
   const [mode, setMode] = useState<GizmoMode>("translate");
@@ -129,7 +132,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <MeshList app={app} onLoad={load} onFocus={focusOn} />
       </aside>
       <main className="viewport">
-        <Viewport items={items} mode={mode} focus={focus} edgeSoftness={edgeSoftness} />
+        <Viewport items={items} mode={mode} focus={focus} edgeSoftness={edgeSoftness} hoverable={grouped} />
+        {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">

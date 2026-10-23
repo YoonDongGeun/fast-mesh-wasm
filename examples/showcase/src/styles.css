@@ -367,6 +367,59 @@ input[type="range"] {
 .pair {
   margin-top: 8px;
 }
+.modes {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 6px;
+}
+.modes button {
+  flex: 1;
+}
+.members {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+}
+.members .swatch {
+  margin: 0 2px;
+}
+.pair-matrix,
+.pair-readouts {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.pair-matrix th,
+.pair-matrix td {
+  padding: 1px 6px;
+  text-align: center;
+  color: var(--muted);
+  font-weight: 600;
+}
+.pair-readouts {
+  width: 100%;
+}
+.pair-readouts th {
+  color: var(--muted);
+  font-weight: normal;
+  text-align: left;
+}
+.pair-readouts td {
+  font-variant-numeric: tabular-nums;
+  padding: 1px 4px 1px 0;
+}
+.hover-tip {
+  position: fixed;
+  z-index: 5;
+  pointer-events: none;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  white-space: nowrap;
+}
 .picker {
   display: flex;
   align-items: center;
