@@ -4034,9 +4034,13 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 40] = [
+        let calls: [(&str, Call); 41] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
+            }),
+            ("add_mesh_built", |s, _| {
+                let build = crate::MeshBuild::new(sheet(1, 1.0), MeshOptions::default()).unwrap();
+                s.add_mesh_built(build).unwrap();
             }),
             ("remove_mesh", |s, x| {
                 s.remove_mesh(x.c).unwrap();

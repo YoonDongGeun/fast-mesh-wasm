@@ -1,6 +1,6 @@
 //! The scene: a registry of meshes with BVHs and placements.
 
-use fast_mesh_bvh::{BuildOptions, Bvh, UpdatePolicy};
+use fast_mesh_bvh::{BuildOptions, Bvh, BvhBuild, UpdatePolicy};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
 
 use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
@@ -241,6 +241,49 @@ struct Subscriber {
     removed: Vec<MeshChanges>,
 }
 
+/// A mesh being prepared for [`Scene::add_mesh_built`] outside any scene:
+/// its BVH is built in steps ([`MeshBuild::step`]), so that a caller can
+/// yield between them (the Worker engine adds large meshes this way).
+/// Nothing of it is in a scene until it is added.
+#[derive(Debug)]
+pub struct MeshBuild {
+    mesh: Mesh,
+    options: MeshOptions,
+    bvh: BvhBuild,
+}
+
+impl MeshBuild {
+    /// Starts preparing `mesh` for [`Scene::add_mesh`] with `options`.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidInput`] for an invalid placement; a BVH option
+    /// or memory error.
+    pub fn new(mesh: Mesh, options: MeshOptions) -> Result<MeshBuild> {
+        options.placement.validate()?;
+        let bvh = BvhBuild::new(&mesh, &options.build)?;
+        Ok(MeshBuild { mesh, options, bvh })
+    }
+
+    /// Builds about `budget` more units of the BVH (see
+    /// [`BvhBuild::step`]). Returns whether it is built.
+    ///
+    /// # Errors
+    /// A memory error; the build is unusable after it.
+    pub fn step(&mut self, budget: usize) -> Result<bool> {
+        Ok(self.bvh.step(&self.mesh, budget)?)
+    }
+
+    /// Whether the BVH is built.
+    pub fn is_done(&self) -> bool {
+        self.bvh.is_done()
+    }
+
+    /// The mesh being prepared.
+    pub fn mesh(&self) -> &Mesh {
+        &self.mesh
+    }
+}
+
 /// Several meshes, each with a BVH and a placement in the world.
 pub struct Scene {
     pub(crate) entries: SlotMap<Entry>,
@@ -306,7 +349,27 @@ impl Scene {
     pub fn add_mesh(&mut self, mesh: Mesh, options: MeshOptions) -> Result<MeshId> {
         self.drop_field_unit();
         options.placement.validate()?;
-        let mut bvh = Bvh::build(&mesh, &options.build)?;
+        let bvh = Bvh::build(&mesh, &options.build)?;
+        self.insert_mesh(mesh, bvh, options)
+    }
+
+    /// Adds a mesh built in steps by `build` (see [`MeshBuild`]), first
+    /// finishing what is left of its BVH, and returns its id. The mesh, its
+    /// BVH and everything reported are the same as from
+    /// [`Scene::add_mesh`] with the same mesh and options.
+    ///
+    /// # Errors
+    /// As for [`Scene::add_mesh`]. The scene is unchanged on error.
+    pub fn add_mesh_built(&mut self, mut build: MeshBuild) -> Result<MeshId> {
+        self.drop_field_unit();
+        while !build.step(usize::MAX)? {}
+        let MeshBuild { mesh, options, bvh } = build;
+        let bvh = bvh.finish().ok_or(SceneError::Corrupted)?;
+        self.insert_mesh(mesh, bvh, options)
+    }
+
+    /// Inserts a mesh with its freshly built BVH.
+    fn insert_mesh(&mut self, mesh: Mesh, mut bvh: Bvh, options: MeshOptions) -> Result<MeshId> {
         bvh.set_policy(options.bvh_policy)?;
         self.entries.insert(Entry {
             mesh,
@@ -2307,5 +2370,132 @@ mod tests {
         scene
             .add_channel(id, ChannelDesc::derived("fields", 1))
             .unwrap();
+    }
+
+    /// A wavy `n × n` grid sheet.
+    fn sheet(n: u32) -> Mesh {
+        let mut positions = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32 * 0.1, y as f32 * 0.1);
+                positions.extend([fx, fy, (fx * 3.1).sin() * (fy * 1.7).cos() * 0.2]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+            }
+        }
+        Mesh::from_buffers(&positions, &indices).unwrap()
+    }
+
+    #[test]
+    fn mesh_built_in_steps_matches_add_mesh() {
+        // Twins: one adds the sheet at once; the other builds it in steps
+        // while the scene changes (another mesh moved and edited, a removal
+        // freeing a slot before), then adds it.
+        let opts = MeshOptions {
+            placement: Placement {
+                rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                translation: [0.5, 0.1, -0.2],
+            },
+            ..MeshOptions::default()
+        };
+        for budget in [1, 97, 5000, usize::MAX] {
+            let mut twins: Vec<(Scene, MeshId)> = (0..2)
+                .map(|_| {
+                    let mut scene = Scene::new(SceneOptions::default());
+                    let gone = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+                    let other = scene.add_mesh(sheet(6), MeshOptions::default()).unwrap();
+                    scene.remove_mesh(gone).unwrap();
+                    scene.take_changes();
+                    (scene, other)
+                })
+                .collect();
+            let mut build = MeshBuild::new(sheet(30), opts).unwrap();
+            let mut steps = 0;
+            while !build.step(budget).unwrap() {
+                steps += 1;
+                if steps == 3 {
+                    let (scene, other) = &mut twins[1];
+                    scene
+                        .set_placement(
+                            *other,
+                            Placement {
+                                translation: [0.0, 0.0, 0.3],
+                                ..Placement::IDENTITY
+                            },
+                        )
+                        .unwrap();
+                    scene
+                        .edit(*other, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 0.1]]))
+                        .unwrap();
+                }
+            }
+            if steps < 3 {
+                let (scene, other) = &mut twins[1];
+                scene
+                    .set_placement(
+                        *other,
+                        Placement {
+                            translation: [0.0, 0.0, 0.3],
+                            ..Placement::IDENTITY
+                        },
+                    )
+                    .unwrap();
+                scene
+                    .edit(*other, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 0.1]]))
+                    .unwrap();
+            }
+            if budget == 1 {
+                assert!(steps > 100, "{steps}");
+            }
+            let built = twins[1].0.add_mesh_built(build).unwrap();
+            let (scene, other) = &mut twins[0];
+            scene
+                .set_placement(
+                    *other,
+                    Placement {
+                        translation: [0.0, 0.0, 0.3],
+                        ..Placement::IDENTITY
+                    },
+                )
+                .unwrap();
+            scene
+                .edit(*other, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 0.1]]))
+                .unwrap();
+            let added = scene.add_mesh(sheet(30), opts).unwrap();
+            assert_eq!(added, built, "the same slot");
+            let [(a, _), (b, _)] = &mut twins[..] else {
+                unreachable!()
+            };
+            assert_eq!(a.take_changes(), b.take_changes());
+            let (ba, bb) = (a.bvh(added).unwrap(), b.bvh(built).unwrap());
+            assert_eq!((ba.node_count(), ba.depth()), (bb.node_count(), bb.depth()));
+            assert_eq!(ba.root_bounds(), bb.root_bounds());
+            bb.validate(b.mesh(built).unwrap()).unwrap();
+            for k in 0..20 {
+                let p = [0.1 * f64::from(k) - 0.5, 0.15 * f64::from(k), 0.3];
+                let o = crate::SceneClosestOptions::default();
+                assert_eq!(
+                    a.closest_point(p, &o).unwrap(),
+                    b.closest_point(p, &o).unwrap()
+                );
+            }
+        }
+        // An invalid placement is refused before anything is built.
+        let bad = MeshOptions {
+            placement: Placement {
+                rotation: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                translation: [0.0; 3],
+            },
+            ..MeshOptions::default()
+        };
+        assert!(matches!(
+            MeshBuild::new(tri(), bad),
+            Err(SceneError::InvalidInput(_))
+        ));
     }
 }

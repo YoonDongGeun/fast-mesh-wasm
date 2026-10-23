@@ -30,6 +30,18 @@ pub fn enabled() -> bool {
     cfg!(feature = "parallel")
 }
 
+/// The threads the helpers called from this thread would run work on: the
+/// current pool's size with the `parallel` feature (unless forced off), and
+/// one otherwise. For sizing work per step, never for cutting work into
+/// chunks (results must not depend on it).
+pub fn threads() -> usize {
+    #[cfg(feature = "parallel")]
+    if !force_sequential() {
+        return rayon::current_num_threads().max(1);
+    }
+    1
+}
+
 /// Makes every helper called from this thread run sequentially (`true`), or
 /// undoes one earlier `true` (`false`). The engine crates' out-of-memory
 /// fault hooks are thread-local, so their test helpers set this while a hook

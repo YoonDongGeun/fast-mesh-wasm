@@ -97,5 +97,5 @@ pub use query::{
 };
 pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
-pub use scene::{MeshOptions, Scene, SceneOptions, UpdateMode};
+pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};

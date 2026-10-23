@@ -30,5 +30,5 @@ pub use aabb::Aabb;
 pub use error::{BvhError, Result};
 pub use node::{NodeId, NodeKind, NodeView, TRAVERSE_STACK};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
-pub use tree::Bvh;
+pub use tree::{Bvh, BvhBuild};
 pub use update::{Strategy, UpdateReport};
