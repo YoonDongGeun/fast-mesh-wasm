@@ -1,6 +1,6 @@
 // Scene benchmarks, run against the built package (a release build, not the test build):
 //
-//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide]
+//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide] [-- --queued [-- --no-1m]] [-- --contact]
 //
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
@@ -17,6 +17,9 @@ const with10m = args.has("--10m");
 const onlyAdapter = args.has("--adapter"); // run just the three.js adapter case
 const onlyWorker = args.has("--worker"); // run just the Worker scene cases (with --10m: also 10M)
 const onlyWide = args.has("--wide"); // with --worker: run just the Worker wide-range drag cases
+const onlyQueued = args.has("--queued"); // with --worker: run just the toggles queued behind long requests (#48)
+const skip1m = args.has("--no-1m"); // with --worker --queued --10m: only the 10M case
+const onlyContact = args.has("--contact"); // with --worker: run just the 1M contact toggle and drag
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -358,7 +361,7 @@ class BenchWorker {
         this.#wake(this.statsWaiters, data);
         return;
       }
-      if (data?.kind !== undefined && data.kind !== "ready") {
+      if (data?.kind !== undefined && data.kind !== "ready" && data.kind !== "update") {
         this.#fail(new Error(`the bench Worker sent ${data.kind}: ${JSON.stringify(data.error ?? null)}`));
       } else if (data?.poisoned) {
         this.#fail(new Error(`the engine trapped: ${JSON.stringify(data.status?.[0]?.error ?? null)}`));
@@ -944,6 +947,155 @@ async function benchWorkerLongRequests(label, n, edits) {
   scene.terminate();
 }
 
+// 5f. A colouring toggle queued behind a long request (issue #48): a field
+// build, an edit with a field measured to the edited mesh, and an addMesh.
+// The long request's frame is sent, then at once the toggle's frame
+// (`setColoring` of the small pair's mesh, on and off in turn); the Worker
+// receives the toggle while it works on the long request. Timed: the longest
+// Worker block over both, the long request's round trip, and the toggle's
+// round trip (posted to its result applied).
+async function benchWorkerQueued(label, n, runs, { field = true, edit = true, add = true } = {}) {
+  const { scene, bw } = await openWorkerScene();
+  // The pair the long requests work on, and a small pair whose colouring is toggled.
+  const a = terrain(n);
+  const b = terrain(n, { phase: 1.3 });
+  const meshA = scene.addMesh(a.positions, a.indices);
+  const meshB = scene.addMesh(b.positions, b.indices);
+  const lift = 8 - 0.05;
+  scene.setPlacement(meshB, flippedPose(0, n / 2, n / 2, lift));
+  const s = terrain(60, { dx: -100 });
+  const t = terrain(60, { dx: -100, phase: 1.3 });
+  const meshS = scene.addMesh(s.positions, s.indices);
+  const meshT = scene.addMesh(t.positions, t.indices);
+  scene.setPlacement(meshT, flippedPose(0, -70, 30, 8 - 0.05));
+  const small = scene.addDistanceField({ name: "toggle", on: meshS, to: meshT, maxDistance: 0.5 });
+  const rule = { field: small, map: "turbo", range: [-0.5, 0], below: "clamp", above: "base" };
+  scene.setColoring(meshS, rule);
+  const gap = scene.addDistanceField({ name: "gap", on: meshA, to: meshB, maxDistance: 0.08 });
+  scene.setColoring(meshA, { field: gap, map: "turbo", range: [-0.08, 0], below: "clamp", above: "base" });
+  await roundTrip(scene, bw);
+  await bw.stats();
+  let on = true;
+  // Sends `long`'s frame, then the toggle's; returns the three times.
+  async function queued(long, landKey) {
+    let landed;
+    const off =
+      landKey === undefined
+        ? undefined
+        : scene.onStatus(() => {
+            if (landed === undefined && scene.status(landKey()).status === "ready") {
+              landed = now();
+            }
+          });
+    long();
+    const from = bw.results.length;
+    const t0 = now();
+    scene.commitFrame();
+    const longAt = bw.posted - 1;
+    on = !on;
+    scene.setColoring(meshS, on ? rule : null);
+    scene.commitFrame();
+    const toggleAt = bw.posted - 1;
+    await bw.drained(from);
+    if (landKey !== undefined) {
+      while (landed === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      off();
+    }
+    const st = await bw.stats();
+    return {
+      block: st.maxGap,
+      long: bw.results[longAt].at - bw.sentAt[longAt],
+      toggle: bw.results[toggleAt].at - bw.sentAt[toggleAt],
+      landed: landed === undefined ? undefined : landed - t0,
+    };
+  }
+  async function rounds(name, long, after, landKey) {
+    const parts = { block: [], long: [], toggle: [], landed: [] };
+    for (let r = 0; r < runs; r++) {
+      const x = await queued(long, landKey);
+      for (const k of Object.keys(parts)) {
+        if (x[k] !== undefined) {
+          parts[k].push(x[k]);
+        }
+      }
+      await after?.();
+    }
+    const med = (k) => fmt(stats(parts[k]).median);
+    const land = parts.landed.length > 0 ? `, mesh ready (status) after ${med("landed")} ms` : "";
+    const longPart = name === "nothing" ? "" : `, long request round trip ${med("long")} ms${land}`;
+    console.log(
+      `worker ${label} toggle behind ${name} (${runs} runs, medians): longest Worker block ${med("block")} ms (max ${fmt(maxOf(parts.block))})${longPart}, toggle round trip ${med("toggle")} ms (max ${fmt(maxOf(parts.toggle))})`,
+    );
+  }
+  // The toggle alone, for reference.
+  await rounds("nothing", () => {});
+  if (field) {
+    let back;
+    await rounds(
+      "a contact field build (B to A)",
+      () => {
+        back = scene.addDistanceField({ name: "back", on: meshB, to: meshA, maxDistance: 0.08 });
+      },
+      async () => {
+        scene.removeField(back);
+        await roundTrip(scene, bw);
+        await bw.stats();
+      },
+    );
+    let wide;
+    await rounds(
+      "a wide field build (A to B, maxDistance 8)",
+      () => {
+        wide = scene.addDistanceField({ name: "wide", on: meshA, to: meshB, maxDistance: 8 });
+      },
+      async () => {
+        scene.removeField(wide);
+        await roundTrip(scene, bw);
+        await bw.stats();
+      },
+    );
+  }
+  if (edit) {
+    // A field measured to A (B to A): every edit of A rebuilds A's sign data.
+    scene.addDistanceField({ name: "back2", on: meshB, to: meshA, maxDistance: 0.08 });
+    await roundTrip(scene, bw);
+    await bw.stats();
+    const w = n + 1;
+    const centre = Math.floor(w / 2) * w + Math.floor(w / 2);
+    let k = 0;
+    await rounds("a one-vertex edit of A (fields A to B and B to A)", () => {
+      const z = a.positions[3 * centre + 2] + (k++ % 2 === 0 ? 0.01 : 0);
+      void scene.edit(meshA, [
+        { op: "setPositions", vertices: [centre], positions: [a.positions[3 * centre], a.positions[3 * centre + 1], z] },
+      ]);
+    });
+  }
+  if (add) {
+    // The pair goes first, so a 10M add fits in memory.
+    scene.removeMesh(meshA);
+    scene.removeMesh(meshB);
+    await roundTrip(scene, bw);
+    await bw.stats();
+    const c = terrain(n, { phase: 2.1 });
+    let meshC;
+    await rounds(
+      "an addMesh",
+      () => {
+        meshC = scene.addMesh(c.positions, c.indices);
+      },
+      async () => {
+        scene.removeMesh(meshC);
+        await roundTrip(scene, bw);
+        await bw.stats();
+      },
+      () => `mesh:${scene.idOf(meshC)}`,
+    );
+  }
+  scene.terminate();
+}
+
 // 5e. Many small requests in one frame: 1000 setPlacement calls over 10 small meshes.
 async function benchWorkerManySmall(label, calls, rounds) {
   const { scene, bw } = await openWorkerScene();
@@ -1010,6 +1162,20 @@ async function benchWorkerManySmall(label, calls, rounds) {
 console.log(`node ${process.version}, ${process.platform} ${process.arch}${quick ? " (quick)" : ""}`);
 const contact = { maxDistance: 0.08, range: [-0.08, 0] }; // as the Rust drag bench
 const wide = { maxDistance: 8, range: [0, 6] }; // every vertex of the dragged pair is in range
+if (onlyWorker && onlyContact) {
+  await benchWorkerToggle("1M contact", 708, quick ? 10 : 20, contact);
+  await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
+  process.exit(0);
+}
+if (onlyWorker && onlyQueued) {
+  if (!skip1m) {
+    await benchWorkerQueued("1M", 708, quick ? 3 : 5);
+  }
+  if (with10m) {
+    await benchWorkerQueued("10M", 2236, 2);
+  }
+  process.exit(0);
+}
 if (onlyWorker && onlyWide) {
   await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
   await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
@@ -1030,6 +1196,7 @@ if (onlyWorker) {
   await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
   await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
   await benchWorkerLongRequests("1M", 708, quick ? 4 : 10);
+  await benchWorkerQueued("1M", 708, quick ? 3 : 5);
   await benchWorkerManySmall("small requests", 1000, quick ? 5 : 20);
   if (with10m) {
     await benchWorkerAdd("10M", 2236, 1);
