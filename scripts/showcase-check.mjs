@@ -15,6 +15,13 @@
 // - page: cross-origin isolated, and the Worker scene runs threaded
 //   (threads > 1, or exactly --threads).
 // - demo: the demo meshes A, B and C are listed and drawn; the scene is idle.
+// - glsl: bindMesh's fragment shading run on the GPU (a float render target,
+//   read back) for constant quads at a contact heatmap's knots, range ends,
+//   +-tolerance, far, -far, NaN and random values, and for built-in maps with
+//   a centre and both out-of-range modes, at softness 0 and above: every
+//   colour within one 16-bit level of the library's JavaScript reference
+//   (packages/fast-mesh-wasm/src/colormap.ts, loaded with Node's type
+//   stripping).
 // - select: a click on A in the canvas selects it.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
@@ -53,7 +60,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { launchChrome, startServer } from "./chrome-cdp.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -349,6 +356,57 @@ try {
     demo !== undefined && demo.map((m) => m.name[0]).join("") === "ABC",
     demo === undefined ? `items ${JSON.stringify(await hook("items()"))}` : demo.map((m) => `${m.name} (${m.triangles})`).join(", "),
   );
+
+  // ---- glsl: the fragment shading on the GPU against its reference ----
+  {
+    const { shadingOf, shadeReference } = await import(
+      pathToFileURL(join(root, "packages", "fast-mesh-wasm", "src", "colormap.ts")).href
+    );
+    const heatRule = await hook("heatmapRule({ depth: 1, gap: 2, tolerance: 0.25 })");
+    const rules = [
+      heatRule,
+      { map: "turbo", range: [-1, 3], center: 0.5 },
+      { map: "viridis", range: [0, 1], below: "base", above: "clamp" },
+      { map: "coolwarm", range: [-2, 1], center: 0, base: [10, 20, 30, 40], nan: [1, 2, 3, 4] },
+    ];
+    let seed = 11;
+    const random = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+    // Worst difference (and where) at softness 0 (exact path) and above (the filter).
+    const worst = [0, 0];
+    const bad = ["", ""];
+    let count = 0;
+    for (const rule of rules) {
+      const [lo, hi] = rule.range;
+      const knots = typeof rule.map === "string" ? [] : rule.map.stops.map(([t]) => lo + t * (hi - lo));
+      const values = [lo, hi, -0.25, 0.25, 0, ...knots, Math.fround(lo - 1e-3), hi + 1, "Infinity", "-Infinity", "NaN"];
+      for (let k = 0; k < 40; k++) {
+        values.push(Math.fround(lo - 0.1 * (hi - lo) + random() * 1.2 * (hi - lo)));
+      }
+      for (const softness of [0, 0.05 * (hi - lo)]) {
+        const list = `[${values.map((v) => (typeof v === "string" ? v : String(v))).join(",")}]`;
+        const probe = await hook(`shadeProbe(${q(rule)}, ${list}, ${softness})`);
+        const s = shadingOf(rule);
+        probe.rgba.forEach((got, i) => {
+          const want = shadeReference(s, probe.attribute[i], softness);
+          const err = Math.max(...got.map((x, c) => Math.abs(x - want[c])));
+          const path = softness > 0 ? 1 : 0;
+          count++;
+          if (err > worst[path]) {
+            worst[path] = err;
+            bad[path] = ` (value ${values[i]}: GPU ${got.map((x) => x.toFixed(6))} vs ${want.map((x) => x.toFixed(6))})`;
+          }
+        });
+      }
+    }
+    // Exact path: one 16-bit level, plus float slack. The softness filter sums
+    // in f32 on the GPU: within 4 levels (1/64 of an 8-bit level).
+    const levels = (x) => (x * 65535).toFixed(3);
+    verdict(
+      "glsl",
+      worst[0] <= 1.01 / 65535 && worst[1] <= 4 / 65535,
+      `${count} colours; worst difference ${levels(worst[0])} 16-bit levels at softness 0${bad[0]}, ${levels(worst[1])} with softness${bad[1]}`,
+    );
+  }
 
   // ---- select: click A in the canvas ----
   const at = await hook(`screenPoint(${JSON.stringify(A)})`);

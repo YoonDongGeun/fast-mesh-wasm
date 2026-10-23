@@ -1,10 +1,11 @@
 // `window.__showcase`: what scripts/showcase-check.mjs reads in headless
 // Chrome. Read-only views of the app; the check drives it through the UI
 // (the file input, mouse events on the canvas, the toolbar buttons).
-import type { SceneStore } from "fast-mesh-wasm/store";
+import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
 import type { Engine } from "./App";
 import { inspect } from "./panels/inspect";
+import { shadeProbe } from "./shade-probe";
 import type { AppState } from "./scene/app-state";
 import { view } from "./viewport/view";
 
@@ -41,6 +42,13 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     shading: (name: string) => {
       const b = view.bindings.get(find(name).mesh) as { shading?: string } | undefined;
       return { shading: b?.shading ?? null, edgeSoftness: app.getSnapshot().edgeSoftness };
+    },
+    /** Fragment shading on the GPU, read back (see shade-probe.ts). */
+    shadeProbe,
+    /** A contact heatmap's colour rule (without its field), for the probe. */
+    heatmapRule: (options: ContactHeatmapOptions) => {
+      const { maxDistance: _m, sign: _s, ...rule } = contactHeatmap(options);
+      return rule;
     },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
