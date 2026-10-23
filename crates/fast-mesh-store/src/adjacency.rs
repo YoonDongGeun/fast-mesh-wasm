@@ -12,6 +12,10 @@ use crate::column::{try_reserve_exact, try_vec};
 use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 
 const NONE: u32 = u32::MAX;
+
+/// Entries an [`AdjacencyBuild`] or [`IncidenceBuild`](crate::IncidenceBuild)
+/// step zeroes per element of its budget.
+pub(crate) const ZERO_PER_ELEMENT: usize = 16;
 const NON_MANIFOLD: u32 = u32::MAX - 1;
 
 /// Kind of the edge opposite a corner.
@@ -116,6 +120,8 @@ enum Pass {
     Count(usize),
     /// Turning the counts into row offsets, vertex by vertex.
     Prefix(usize),
+    /// Zeroing the corner rows, up to this many entries.
+    Zero(usize),
     /// Listing each vertex's corners, triangle by triangle.
     Fill(usize),
     /// Finding each corner's opposite corner, triangle by triangle.
@@ -229,7 +235,19 @@ impl AdjacencyBuild {
                         self.pass = Pass::Prefix(to);
                         continue;
                     }
-                    self.incident = try_vec(self.offsets[vslots] as usize, 0u32)?;
+                    try_reserve_exact(&mut self.incident, self.offsets[vslots] as usize)?;
+                    self.pass = Pass::Zero(0);
+                }
+                Pass::Zero(from) => {
+                    // Zeroing is cheap: many entries per element of the budget.
+                    let total = self.offsets[vslots] as usize;
+                    let to = total.min(from.saturating_add(left.saturating_mul(ZERO_PER_ELEMENT)));
+                    self.incident.resize(to, 0);
+                    left -= (to - from).div_ceil(ZERO_PER_ELEMENT).min(left);
+                    if to < total {
+                        self.pass = Pass::Zero(to);
+                        continue;
+                    }
                     self.cursor = try_vec(vslots + 1, 0u32)?;
                     self.cursor.copy_from_slice(&self.offsets);
                     self.pass = Pass::Fill(0);
@@ -251,7 +269,8 @@ impl AdjacencyBuild {
                         continue;
                     }
                     self.cursor = Vec::new();
-                    self.opposite = try_vec(3 * tris.len(), NONE)?;
+                    // Filled in corner order by the next pass.
+                    try_reserve_exact(&mut self.opposite, 3 * tris.len())?;
                     self.pass = Pass::Opposite(0);
                 }
                 Pass::Opposite(from) => {
@@ -262,11 +281,13 @@ impl AdjacencyBuild {
                     };
                     for (t, tri) in tris.iter().enumerate().take(to).skip(from) {
                         if !alive(t) {
+                            self.opposite.extend([NONE; 3]);
                             continue;
                         }
                         for i in 0..3 {
                             let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
                             if u == w {
+                                self.opposite.push(NONE);
                                 continue;
                             }
                             // Triangles on edge u-w are incident to both ends: scan the
@@ -293,11 +314,11 @@ impl AdjacencyBuild {
                                     .find(|&j| other[j] != u && other[j] != w)
                                     .map_or(NON_MANIFOLD, |j| 3 * s + j as u32);
                             }
-                            self.opposite[3 * t + i] = match count {
+                            self.opposite.push(match count {
                                 0 => NONE,
                                 1 => found,
                                 _ => NON_MANIFOLD,
-                            };
+                            });
                         }
                     }
                     left -= (to - from).min(left);

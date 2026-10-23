@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 
-use crate::column::{try_reserve, try_reserve_map, try_vec};
+use crate::adjacency::ZERO_PER_ELEMENT;
+use crate::column::{try_reserve, try_reserve_exact, try_reserve_map, try_vec};
 use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 
 /// Overlay size (entries plus rows) always allowed before the index is rebuilt.
@@ -141,6 +142,8 @@ enum Pass {
     Count(usize),
     /// Turning the counts into row offsets, vertex by vertex.
     Prefix(usize),
+    /// Zeroing the rows, up to this many entries.
+    Zero(usize),
     /// Listing each vertex's triangles, triangle by triangle.
     Fill(usize),
     /// Finished: the index is ready to be taken.
@@ -234,7 +237,18 @@ impl IncidenceBuild {
                         self.pass = Pass::Prefix(to);
                         continue;
                     }
-                    self.triangles = try_vec(self.offsets[slots] as usize, 0 as TriangleId)?;
+                    try_reserve_exact(&mut self.triangles, self.offsets[slots] as usize)?;
+                    self.pass = Pass::Zero(0);
+                }
+                Pass::Zero(from) => {
+                    let total = self.offsets[slots] as usize;
+                    let to = total.min(from.saturating_add(left.saturating_mul(ZERO_PER_ELEMENT)));
+                    self.triangles.resize(to, 0 as TriangleId);
+                    left -= (to - from).div_ceil(ZERO_PER_ELEMENT).min(left);
+                    if to < total {
+                        self.pass = Pass::Zero(to);
+                        continue;
+                    }
                     self.cursor = try_vec(slots, 0u32)?;
                     self.cursor.copy_from_slice(&self.offsets[..slots]);
                     self.pass = Pass::Fill(0);

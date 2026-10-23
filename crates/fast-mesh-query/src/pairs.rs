@@ -1110,10 +1110,14 @@ fn triangles_near_limited_with<const N: usize>(
     Ok(true)
 }
 
-/// Node pairs per part of a [`NearSearch`]: the node-pair tree is split until
-/// there are at least this many triangles of both meshes per part, or
-/// [`PAR_PARTS`] parts, whichever is more.
+/// Triangles (of both meshes) per part of a [`NearSearch`]: the node-pair
+/// tree is split into about this many triangles per part, but at least
+/// [`PAR_PARTS`] and at most [`NEAR_MAX_PARTS`] parts.
 const NEAR_PART_TRIS: usize = 512;
+
+/// The most parts a [`NearSearch`] splits into: splitting is one pass per
+/// level over the parts so far, done when the search starts.
+const NEAR_MAX_PARTS: usize = 1 << 16;
 
 /// What a triangle pair test counts for in a [`NearSearch::step`] budget,
 /// against one node pair test (a box distance).
@@ -1210,7 +1214,7 @@ impl NearSearch {
             (!beyond(d, margin, m)).then_some(d)
         };
         let tris = mesh_a.triangle_count() + mesh_b.triangle_count();
-        let target = PAR_PARTS.max(tris / NEAR_PART_TRIS);
+        let target = PAR_PARTS.max(tris / NEAR_PART_TRIS).min(NEAR_MAX_PARTS);
         let parts = split_pairs(bvh_a, bvh_b, xf, &key, target)?;
         Ok(NearSearch {
             stamps: [Stamp::of(mesh_a, bvh_a), Stamp::of(mesh_b, bvh_b)],

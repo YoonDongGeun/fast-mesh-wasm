@@ -169,20 +169,24 @@ pub(crate) fn collect_span<T: Send>(
     f: impl Fn(usize) -> T + Sync,
 ) -> Result<Vec<T>> {
     let mut v = Vec::new();
-    extend_span(&mut v, span, f)?;
+    let total = span.len();
+    extend_span(&mut v, span, total, f)?;
     Ok(v)
 }
 
 /// Appends `f(i)` for every `i` in `span` to `v`, in order, in parallel
-/// under the rule of [`collect_span`].
+/// under the rule of [`collect_span`]. `v` is reserved for `total` elements
+/// in all at once, so that filling it in spans never copies it.
 fn extend_span<T: Send>(
     v: &mut Vec<T>,
     span: Range<usize>,
+    total: usize,
     f: impl Fn(usize) -> T + Sync,
 ) -> Result<()> {
     let oom = || FieldsError::OutOfMemory;
     let (start, len) = (span.start, span.len());
-    v.try_reserve(len).map_err(|_| oom())?;
+    let room = total.max(v.len() + len) - v.len();
+    v.try_reserve_exact(room).map_err(|_| oom())?;
     if len < PAR_MIN_SIGN_ELEMS || !par::enabled() || par::force_sequential() {
         v.extend(span.map(f));
         return Ok(());
@@ -531,7 +535,8 @@ impl SignBuild {
                 Stage::Faces(from) => {
                     let r = span(from, mesh.triangle_slots(), left);
                     let (to, n) = (r.end, r.len());
-                    extend_span(&mut self.face, r, |t| face_normal(mesh, t))?;
+                    let total = mesh.triangle_slots();
+                    extend_span(&mut self.face, r, total, |t| face_normal(mesh, t))?;
                     left -= n.min(left);
                     self.stage = if to == mesh.triangle_slots() {
                         Stage::Topology(0)
@@ -595,7 +600,8 @@ impl SignBuild {
                     let r = span(from, mesh.vertex_slots(), (left / w).max(1));
                     let (to, n) = (r.end, r.len());
                     let face = &self.face;
-                    extend_span(&mut self.data.vertex_normals, r, |v| {
+                    let total = mesh.vertex_slots();
+                    extend_span(&mut self.data.vertex_normals, r, total, |v| {
                         vertex_normal(mesh, inc, face, v)
                     })?;
                     left -= n.saturating_mul(w).min(left);
@@ -610,7 +616,8 @@ impl SignBuild {
                     let r = span(from, 3 * mesh.triangles().len(), (left / w).max(1));
                     let (to, n) = (r.end, r.len());
                     let face = &self.face;
-                    extend_span(&mut self.data.edge_normals, r, |c| {
+                    let total = 3 * mesh.triangles().len();
+                    extend_span(&mut self.data.edge_normals, r, total, |c| {
                         edge_normal(mesh, adj, inc, face, c)
                     })?;
                     left -= n.saturating_mul(w).min(left);

@@ -388,6 +388,9 @@ pub(crate) struct FieldUnit {
     fields: Vec<UnitField>,
     /// The first field not finished yet.
     next: usize,
+    /// Every field is finished and the unit applies on the next step (a
+    /// large unit applies in a step of its own).
+    finished: bool,
     /// The error of the first field, in field order, that failed (when the
     /// unit opened or since), with that field's index.
     error: Option<(usize, SceneError)>,
@@ -1094,10 +1097,25 @@ impl Scene {
                 None => return Ok(StepState::Idle),
             },
         };
-        self.advance_field_unit(&mut unit, points.max(1));
-        if unit.next < unit.fields.len() {
-            self.field_unit = Some(unit);
-            return Ok(StepState::Pending);
+        if !unit.finished {
+            self.advance_field_unit(&mut unit, points.max(1));
+            if unit.next < unit.fields.len() {
+                self.field_unit = Some(unit);
+                return Ok(StepState::Pending);
+            }
+            // Applying writes every candidate's value and colour: when there
+            // are more than a step's worth, in a step of its own.
+            let written: usize = unit
+                .fields
+                .iter()
+                .filter_map(|f| f.plan.as_ref())
+                .map(|p| p.candidates.len())
+                .sum();
+            if points != usize::MAX && written > points {
+                unit.finished = true;
+                self.field_unit = Some(unit);
+                return Ok(StepState::Pending);
+            }
         }
         for f in unit.fields {
             // A field that failed has no plan.
@@ -1196,6 +1214,7 @@ impl Scene {
             only,
             fields: Vec::new(),
             next: 0,
+            finished: false,
             error: None,
         };
         unit.fields
