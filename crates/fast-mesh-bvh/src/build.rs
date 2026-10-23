@@ -461,6 +461,372 @@ fn splice_seq(arena: &mut Arena, nodes: &[Node], parents: &[u32], refs: &[u32], 
     arena.refs.extend_from_slice(refs);
 }
 
+/// A subtree a [`TreeBuild`] step builds as a part: its index in the step,
+/// its range of the order, and the part once built.
+type Job<'a> = (usize, &'a mut [u32], Option<Result<Part>>);
+
+/// Subtrees a [`TreeBuild`] step builds at once on the pool, with the
+/// `parallel` feature.
+const TREE_PAR_BATCH: usize = 64;
+
+/// [`build_full`] cut into steps, so that a caller can yield between them.
+///
+/// It runs [`build_full_seq`]'s loop with its stack kept between steps: a
+/// step takes tasks (a node and its range of triangles) off the stack in
+/// the same order, builds the subtrees that fit the step whole (with
+/// [`build_seq`], or with the `parallel` feature several at once as parts
+/// spliced in stack order, as [`build_full_parts`] does), and splits the
+/// larger ones one level, with the chunked reductions [`build_full_seq`]
+/// uses from [`PAR_MIN_SUBTREE`] triangles. Nodes are allocated in the same
+/// order, so the tree is the same, slot for slot and bit for bit, as from
+/// [`build_full`], with or without the feature.
+pub(crate) struct TreeBuild {
+    pub(crate) arena: Arena,
+    prims: Prims,
+    opts: BuildOptions,
+    /// The tasks left, the next on top.
+    stack: Vec<(u32, usize, usize)>,
+    pub(crate) root: u32,
+    /// The split of the task on top of the stack, when one is under way.
+    split: Option<Split>,
+}
+
+/// A split of a large node under way in a [`TreeBuild`], over its chunks
+/// of [`PAR_CHUNK`] triangles, combined in chunk order as the one-call
+/// reductions do.
+struct Split {
+    /// The node's bounds and its centers' bounds, over the chunks so far.
+    bounds: Aabb,
+    centers: Aabb,
+    pass: Pass,
+}
+
+/// The pass a [`Split`] is in.
+enum Pass {
+    /// The bounds, from this chunk on.
+    Bounds(usize),
+    /// The SAH bins, from this chunk on, with those so far.
+    Bins(usize, Box<Bins>),
+    /// The partition by an axis and last left bin, with its cursors.
+    Partition(usize, usize, usize, usize),
+    /// Done: the split position within the node's range.
+    Done(usize),
+}
+
+/// The work of building a subtree over `m` triangles whole, in triangle
+/// visits: each triangle is visited about once per level.
+fn subtree_work(m: usize, leaf: u32) -> usize {
+    let levels = (m / leaf.max(1) as usize).max(1).ilog2() as usize + 1;
+    m.saturating_mul(levels)
+}
+
+impl TreeBuild {
+    /// A build of a whole tree over `prims` (at least one triangle) into the
+    /// empty `arena`, with nothing built but the root's slot.
+    pub(crate) fn new(mut arena: Arena, mut prims: Prims, opts: &BuildOptions) -> Result<Self> {
+        let n = prims.len();
+        let expected = expected_nodes(n, opts.max_leaf_size);
+        try_reserve_exact(&mut arena.nodes, expected)?;
+        try_reserve_exact(&mut arena.parents, expected)?;
+        try_reserve_exact(&mut arena.refs, n)?;
+        prims.prepare(opts);
+        let root = push_node(&mut arena.nodes, &mut arena.parents, NONE)?;
+        let mut stack = Vec::new();
+        try_reserve(&mut stack, 64)?;
+        stack.push((root, 0, n));
+        Ok(TreeBuild {
+            arena,
+            prims,
+            opts: *opts,
+            stack,
+            root,
+            split: None,
+        })
+    }
+
+    /// Builds about `budget` triangle visits more (at least one task, unless
+    /// done). Returns whether the tree is complete. On `Err` the build is
+    /// garbage.
+    pub(crate) fn step(&mut self, budget: usize) -> Result<bool> {
+        let opts = self.opts;
+        let parallel = par::enabled() && !par::force_sequential();
+        // Work spread over the pool takes about this many times less time:
+        // a third of the threads, as measured (the 1M-triangle build is 5.2
+        // times faster on 20 threads of the i5-13600K).
+        let width = par::threads().div_ceil(3).max(1);
+        let (src, order) = self.prims.split();
+        let mut left = budget.max(1);
+        let mut first = true;
+        while let Some(&(node, start, end)) = self.stack.last() {
+            let m = end - start;
+            let whole = subtree_work(m, opts.max_leaf_size);
+            if !first && left == 0 {
+                break;
+            }
+            // A split under way belongs to the top task: finish it first.
+            if parallel
+                && self.split.is_none()
+                && m >= PAR_MIN_SUBTREE
+                && whole.div_ceil(width.min(2)) <= left
+            {
+                // A large subtree that fits the step on the pool: built in
+                // parts, as `build_full_parts` builds a whole tree, and
+                // spliced at its slot.
+                self.stack.pop();
+                let parts = build_parts(src, &mut order[start..end], &opts, PAR_MIN_SUBTREE, 0)?;
+                let (mut nodes, mut splits) = (0, 0);
+                for p in &parts {
+                    match p {
+                        Part::Seq { nodes: n, .. } => nodes += n.len() - 1,
+                        Part::Split { .. } => (nodes, splits) = (nodes + 2, splits + 1),
+                    }
+                }
+                try_reserve(&mut self.arena.nodes, nodes)?;
+                try_reserve(&mut self.arena.parents, nodes)?;
+                try_reserve(&mut self.arena.refs, m)?;
+                let mut pending = Vec::new();
+                try_reserve_exact(&mut pending, splits + 1)?;
+                pending.push((node, self.arena.parents[node as usize]));
+                splice(&mut self.arena, parts, &mut pending);
+                left = left.saturating_sub(whole.div_ceil(width.min(2)));
+                first = false;
+                continue;
+            }
+            if self.split.is_none() && (whole <= left || m <= opts.max_leaf_size as usize) {
+                // Whole subtrees: this one, and with the pool the next ones
+                // on the stack that fit too.
+                let mut tasks = Vec::new();
+                try_reserve(&mut tasks, if parallel { TREE_PAR_BATCH } else { 1 })?;
+                let mut work = 0usize;
+                while let Some(&(t_node, t_start, t_end)) = self.stack.last() {
+                    let tm = t_end - t_start;
+                    let tw = subtree_work(tm, opts.max_leaf_size);
+                    let fits = tasks.is_empty()
+                        || (parallel
+                            && tasks.len() < TREE_PAR_BATCH
+                            && work.saturating_add(tw) <= left.saturating_mul(width));
+                    if !fits || (tw > left && tm > opts.max_leaf_size as usize) {
+                        break;
+                    }
+                    self.stack.pop();
+                    tasks.push((t_node, t_start, t_end));
+                    work = work.saturating_add(tw);
+                }
+                if tasks.len() == 1 {
+                    let (t_node, t_start, t_end) = tasks[0];
+                    let mut out = Out {
+                        nodes: &mut self.arena.nodes,
+                        parents: &mut self.arena.parents,
+                        refs: &mut self.arena.refs,
+                        tri_leaf: Some(&mut self.arena.tri_leaf),
+                    };
+                    build_seq(
+                        &mut out,
+                        src,
+                        &mut order[t_start..t_end],
+                        &opts,
+                        t_node,
+                        PAR_MIN_SUBTREE,
+                    )?;
+                } else {
+                    // Disjoint ranges of `order`, one per task, in stack order.
+                    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+                    try_reserve(&mut ranges, tasks.len())?;
+                    ranges.extend(tasks.iter().enumerate().map(|(k, &(_, a, b))| (a, b, k)));
+                    ranges.sort_unstable();
+                    let mut jobs: Vec<Job> = Vec::new();
+                    try_reserve(&mut jobs, tasks.len())?;
+                    let mut rest: &mut [u32] = order;
+                    let mut at = 0;
+                    for &(a, b, k) in &ranges {
+                        let (_, tail) = std::mem::take(&mut rest).split_at_mut(a - at);
+                        let (mine, tail) = tail.split_at_mut(b - a);
+                        jobs.push((k, mine, None));
+                        rest = tail;
+                        at = b;
+                    }
+                    par::for_each_chunk_mut(&mut jobs, 1, 2, |_, job| {
+                        let (_, slice, part) = &mut job[0];
+                        *part = Some(seq_part(src, slice, &opts, PAR_MIN_SUBTREE));
+                    });
+                    jobs.sort_unstable_by_key(|j| j.0);
+                    let mut parts = Vec::new();
+                    try_reserve(&mut parts, jobs.len())?;
+                    for (_, _, part) in jobs {
+                        parts.push(part.ok_or(BvhError::OutOfMemory)??);
+                    }
+                    // Room for every part's nodes but its root, and refs.
+                    let (mut nodes, mut refs) = (0, 0);
+                    for p in &parts {
+                        if let Part::Seq {
+                            nodes: n, refs: r, ..
+                        } = p
+                        {
+                            nodes += n.len() - 1;
+                            refs += r.len();
+                        }
+                    }
+                    try_reserve(&mut self.arena.nodes, nodes)?;
+                    try_reserve(&mut self.arena.parents, nodes)?;
+                    try_reserve(&mut self.arena.refs, refs)?;
+                    for (&(t_node, _, _), part) in tasks.iter().zip(parts) {
+                        if let Part::Seq {
+                            nodes,
+                            parents,
+                            refs,
+                        } = part
+                        {
+                            splice_seq(&mut self.arena, &nodes, &parents, &refs, t_node);
+                        }
+                    }
+                }
+                left = left.saturating_sub(work.div_ceil(width));
+                first = false;
+                continue;
+            }
+            // Too large: split it one level, as `build_seq` does; a node
+            // larger than the step's budget over several steps.
+            let chunked = m >= PAR_MIN_SUBTREE;
+            let range = &mut order[start..end];
+            let (bounds, mid) = if chunked && (m > left || self.split.is_some()) {
+                let split = self.split.get_or_insert(Split {
+                    bounds: Aabb::EMPTY,
+                    centers: Aabb::EMPTY,
+                    pass: Pass::Bounds(0),
+                });
+                let spent = step_split(split, src, range, &opts, left, width)?;
+                left = left.saturating_sub(spent);
+                first = false;
+                let Pass::Done(mid) = split.pass else {
+                    continue;
+                };
+                let bounds = split.bounds;
+                self.split = None;
+                (bounds, mid)
+            } else {
+                let (bounds, centers) = if chunked {
+                    range_bounds_chunked(src, range)?
+                } else {
+                    range_bounds(src, range)
+                };
+                let mid = match opts.quality {
+                    Quality::Sah => {
+                        sah_split(src, range, &centers, opts.sah_bins as usize, chunked)?
+                    }
+                    Quality::Fast => morton_split(src, range),
+                };
+                left = left.saturating_sub(m);
+                (bounds, mid)
+            };
+            self.stack.pop();
+            let mid = start + mid;
+            let left_node = push_node(&mut self.arena.nodes, &mut self.arena.parents, node)?;
+            let right_node = push_node(&mut self.arena.nodes, &mut self.arena.parents, node)?;
+            self.arena.nodes[node as usize] = Node {
+                bounds,
+                a: left_node,
+                b: right_node,
+            };
+            let (small, large) = if mid - start <= end - mid {
+                ((left_node, start, mid), (right_node, mid, end))
+            } else {
+                ((right_node, mid, end), (left_node, start, mid))
+            };
+            try_reserve(&mut self.stack, 2)?;
+            self.stack.push(large);
+            self.stack.push(small);
+            first = false;
+        }
+        Ok(self.stack.is_empty())
+    }
+}
+
+/// Advances `split` of the node over `order` by about `budget` triangles:
+/// the bounds over the next chunks, then (SAH) the bins and the partition,
+/// or (Morton) the split by the codes. Returns the budget spent. With the
+/// `parallel` feature the chunks of one step are reduced on the pool, about
+/// `width` times as many for the same budget.
+fn step_split(
+    split: &mut Split,
+    src: Src,
+    order: &mut [u32],
+    opts: &BuildOptions,
+    budget: usize,
+    width: usize,
+) -> Result<usize> {
+    let len = order.len();
+    let chunks = len.div_ceil(PAR_CHUNK);
+    let take = budget.saturating_mul(width).div_ceil(PAR_CHUNK).max(1);
+    let oom = || BvhError::OutOfMemory;
+    let bins = opts.sah_bins as usize;
+    let span_of = |c0: usize| (c0, chunks.min(c0 + take));
+    match &mut split.pass {
+        Pass::Bounds(chunk) => {
+            let (c0, c1) = span_of(*chunk);
+            allocation_allowed()?;
+            let span = &order[c0 * PAR_CHUNK..(c1 * PAR_CHUNK).min(len)];
+            let parts = par::map_chunks(span, PAR_CHUNK, PAR_MIN_PRIMS, oom, |_, c| {
+                Ok(range_bounds(src, c))
+            })?;
+            for (b, c) in &parts {
+                split.bounds.grow(b);
+                split.centers.grow(c);
+            }
+            let spent = span.len().div_ceil(width);
+            split.pass = if c1 < chunks {
+                Pass::Bounds(c1)
+            } else if opts.quality == Quality::Fast {
+                Pass::Done(morton_split(src, order))
+            } else {
+                Pass::Bins(0, Box::new(Bins::EMPTY))
+            };
+            Ok(spent)
+        }
+        Pass::Bins(chunk, all) => {
+            let usable = usable_axes(&split.centers);
+            let (c0, c1) = span_of(*chunk);
+            allocation_allowed()?;
+            let span = &order[c0 * PAR_CHUNK..(c1 * PAR_CHUNK).min(len)];
+            let centers = split.centers;
+            let parts = par::map_chunks(span, PAR_CHUNK, PAR_MIN_PRIMS, oom, |_, c| {
+                Ok(fill_bins(src, c, &centers, bins, usable))
+            })?;
+            parts.iter().for_each(|p| all.add(p));
+            let spent = span.len().div_ceil(width);
+            if c1 < chunks {
+                *chunk = c1;
+            } else {
+                split.pass = match choose_split(all, bins, usable) {
+                    Some((axis, bin)) => Pass::Partition(axis, bin, 0, len),
+                    None => Pass::Done(len / 2),
+                };
+            }
+            Ok(spent)
+        }
+        Pass::Partition(axis, bin, i, j) => {
+            let before = *j - *i;
+            partition(
+                src,
+                order,
+                &split.centers,
+                bins,
+                *axis,
+                *bin,
+                i,
+                j,
+                budget.max(1),
+            );
+            let spent = before - (*j - *i);
+            if *i == *j {
+                let i = *i;
+                split.pass = Pass::Done(if i == 0 || i == len { len / 2 } else { i });
+            }
+            Ok(spent)
+        }
+        Pass::Done(_) => Ok(0),
+    }
+}
+
 /// Where [`build_seq`] writes: an arena's arrays, or a part's (no `tri_leaf`).
 struct Out<'a> {
     nodes: &'a mut Vec<Node>,
@@ -615,10 +981,7 @@ fn sah_split(
     chunked: bool,
 ) -> Result<usize> {
     let mid = order.len() / 2;
-    let usable = [0, 1, 2].map(|axis| {
-        let extent = centers.max[axis] - centers.min[axis];
-        extent.is_finite() && extent > 0.0
-    });
+    let usable = usable_axes(centers);
     let all = if chunked {
         allocation_allowed()?;
         let oom = || BvhError::OutOfMemory;
@@ -631,6 +994,35 @@ fn sah_split(
     } else {
         fill_bins(src, order, centers, bins, usable)
     };
+    let Some((axis, split_bin)) = choose_split(&all, bins, usable) else {
+        return Ok(mid);
+    };
+    let (mut i, mut j) = (0, order.len());
+    partition(
+        src,
+        order,
+        centers,
+        bins,
+        axis,
+        split_bin,
+        &mut i,
+        &mut j,
+        usize::MAX,
+    );
+    Ok(if i == 0 || i == order.len() { mid } else { i })
+}
+
+/// The axes along which the centers spread (finite, positive extent).
+fn usable_axes(centers: &Aabb) -> [bool; 3] {
+    [0, 1, 2].map(|axis| {
+        let extent = centers.max[axis] - centers.min[axis];
+        extent.is_finite() && extent > 0.0
+    })
+}
+
+/// The cheapest binned SAH split of `all`: its axis and last left bin, or
+/// `None` when no split separates the centers.
+fn choose_split(all: &Bins, bins: usize, usable: [bool; 3]) -> Option<(usize, usize)> {
     let mut best: Option<(f32, usize, usize)> = None; // (cost, axis, last left bin)
     for axis in (0..3).filter(|&axis| usable[axis]) {
         let (counts, boxes) = (&all.counts[axis], &all.boxes[axis]);
@@ -660,22 +1052,38 @@ fn sah_split(
             }
         }
     }
-    let Some((_, axis, split_bin)) = best else {
-        return Ok(mid);
-    };
+    best.map(|(_, axis, split_bin)| (axis, split_bin))
+}
+
+/// Partitions `order` so that the triangles in bins up to `split_bin` on
+/// `axis` come first, from the cursors `i` and `j` (start at 0 and
+/// `order.len()`), for up to `budget` more triangles. The partition is done
+/// when `i == j`, which is then the split position.
+#[allow(clippy::too_many_arguments)] // The split, the cursors and the budget.
+fn partition(
+    src: Src,
+    order: &mut [u32],
+    centers: &Aabb,
+    bins: usize,
+    axis: usize,
+    split_bin: usize,
+    i: &mut usize,
+    j: &mut usize,
+    budget: usize,
+) {
     let lo = centers.min[axis];
     let extent = centers.max[axis] - lo;
     let in_left = |i: u32| bin_of(src.centers[i as usize][axis], lo, extent, bins) <= split_bin;
-    let (mut i, mut j) = (0, order.len());
-    while i < j {
-        if in_left(order[i]) {
-            i += 1;
+    let mut left = budget;
+    while *i < *j && left > 0 {
+        if in_left(order[*i]) {
+            *i += 1;
         } else {
-            j -= 1;
-            order.swap(i, j);
+            *j -= 1;
+            order.swap(*i, *j);
         }
+        left -= 1;
     }
-    Ok(if i == 0 || i == order.len() { mid } else { i })
 }
 
 /// Splits a Morton-sorted `order` at the highest bit where its codes differ;

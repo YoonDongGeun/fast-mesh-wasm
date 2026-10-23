@@ -42,4 +42,4 @@ pub use color::{ColorRule, Colormap, OutOfRange, color_of};
 pub use distance::signed_distances;
 pub use error::{FieldsError, Result};
 pub use multi::{Target, signed_distances_multi};
-pub use sign::{SignData, SignMode, SignStatus};
+pub use sign::{SignBuild, SignData, SignMode, SignStatus};

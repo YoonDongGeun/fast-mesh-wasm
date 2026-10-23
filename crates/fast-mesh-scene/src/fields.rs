@@ -54,20 +54,26 @@
 //! order. Values, colours and reports are the same, bit for bit, as when
 //! each field is updated alone in turn.
 //!
-//! **Stepped updates** ([`Scene::field_step`]) run the same parts: the due
-//! Eager fields are prepared and their candidates picked when the unit
-//! opens, the candidates' values are computed a few at a time over later
-//! calls, and the fields are applied together after the last. No value,
-//! colour, report or hook is written before that, so dropping the unit
-//! leaves none behind (the BVHs and sign data opening it brought up to date
-//! stay so, as after a query).
+//! **Stepped updates** ([`Scene::field_step`]) run the same parts in steps:
+//! the due Eager fields' BVHs are prepared when the unit opens; then, one
+//! field after the other, the targets' sign data are built
+//! ([`SignBuild`], a bounded number of elements per step), the near
+//! searches run ([`NearSearch`], whole parts per step), the candidates are
+//! picked and their values computed a few at a time; the fields are
+//! applied together after the last. No value, colour, report or hook is
+//! written before that, so dropping the unit leaves none behind (the BVHs
+//! the unit brought up to date and the sign data it finished stay so, as
+//! after a query; a sign data build it left unfinished is kept with its
+//! field and resumed by a later unit while its mesh and BVH are
+//! unchanged). Each part gives the same bits in steps as in one call, so a
+//! stepped update equals a one-call one.
 
 use fast_mesh_fields::{
-    ColorRule, FieldsError, SignData, SignMode, SignStatus, Target, color_of,
+    ColorRule, FieldsError, SignBuild, SignData, SignMode, SignStatus, Target, color_of,
     signed_distances_multi,
 };
-use fast_mesh_query::Rigid;
-use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, VertexId, par};
+use fast_mesh_query::{NearSearch, Rigid};
+use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, TriangleId, VertexId, par};
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -184,6 +190,24 @@ const PAR_MIN_FIELD_WORK: usize = 12 * 1024;
 /// recompute.
 const NEAR_PAIRS_PER_SLOT: usize = 1;
 
+/// Sign data elements (triangle, vertex or corner slots of a pass of the
+/// targets' adjacency, incidence or sign data) one point of a
+/// [`FieldBudget::Points`] budget stands for, in a step that builds sign
+/// data.
+///
+/// Measured on the i5-13600K, single-threaded, 1M triangles: a pseudonormal
+/// sign data build with its adjacency and incidence is about 7M elements in
+/// 220 ms (about 30 ns each), and a wide value about 1 µs, so 32 elements
+/// take about as long as a point.
+const SIGN_ELEMS_PER_POINT: usize = 32;
+
+/// Triangle pairs a near search tests per point of a
+/// [`FieldBudget::Points`] budget, in a step that searches: a test costs
+/// about 70 ns where most pairs are near (see [`NEAR_PAIRS_PER_SLOT`]), so
+/// 16 take about as long as a point. A step searches whole parts of the
+/// search, so it may test more.
+const NEAR_TESTS_PER_POINT: usize = 16;
+
 /// A due field whose meshes are prepared: what its update recomputes.
 struct FieldJob {
     /// The field's index.
@@ -253,6 +277,39 @@ struct Pick {
     aborted: bool,
 }
 
+/// What is left of one step's budget (see
+/// [`Scene::field_step`](crate::Scene::field_step)).
+struct Step {
+    /// The step's budget, in points.
+    points: usize,
+    /// Values left to compute.
+    left: usize,
+    /// A sign data build, a near search or a walk over every vertex slot
+    /// ran: the step does nothing else.
+    worked: bool,
+}
+
+impl Step {
+    /// Claims the step for one long piece of work: `false` when the step
+    /// already did any work.
+    fn begin_heavy(&mut self) -> bool {
+        if self.unbounded() {
+            return true;
+        }
+        if self.worked || self.left < self.points {
+            return false;
+        }
+        self.worked = true;
+        true
+    }
+
+    /// An unbounded budget (`usize::MAX` points): the step runs the unit to
+    /// the end, long pieces of work included.
+    fn unbounded(&self) -> bool {
+        self.points == usize::MAX
+    }
+}
+
 /// How much one [`Scene::field_step`](crate::Scene::field_step) computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -275,10 +332,38 @@ pub enum StepState {
     Done,
 }
 
+/// Where a field of an open step unit stands. A field goes through every
+/// stage in order; those with nothing to do pass at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Building the sign data of target `k` and the later ones that are not
+    /// current.
+    Sign(usize),
+    /// Searching A's triangles near target `k` and the later moved ones.
+    Near(usize),
+    /// Choosing the candidates from the near triangles.
+    Pick,
+    /// Computing the candidates' values.
+    Values,
+    /// Computing what changes with them (the field's plan).
+    Finish,
+}
+
 /// A field of an open step unit.
 struct UnitField {
     job: FieldJob,
-    /// Taken by `plan` once every value is computed.
+    stage: Stage,
+    /// The near search under way, in [`Stage::Near`].
+    search: Option<NearSearch>,
+    /// A's triangles near the moved targets searched so far.
+    near: Vec<TriangleId>,
+    /// Every vertex is recomputed (a full update, or a near search passed
+    /// its limit).
+    all: bool,
+    /// A near search passed its limit.
+    aborted: bool,
+    /// The candidates, from [`Stage::Pick`] on; taken by `plan` once every
+    /// value is computed.
     pick: Pick,
     /// The values of the candidates computed so far, in candidate order.
     values: Vec<f32>,
@@ -291,14 +376,21 @@ struct UnitField {
     plan: Option<FieldPlan>,
 }
 
-/// The Eager fields due at one state of the scene, stepped as one unit
-/// (see [`Scene::field_step`](crate::Scene::field_step)). It holds field
-/// indices and computed values only, so any change to the scene must drop
-/// it first.
+/// The fields of a step unit (see
+/// [`Scene::field_step`](crate::Scene::field_step)), stepped as one unit:
+/// the Eager fields due at one state of the scene, or one field. It holds
+/// field indices and computed values only, so any change to the scene must
+/// drop it first.
 pub(crate) struct FieldUnit {
+    /// The one field the unit is for, when opened by
+    /// [`Scene::field_step_field`](crate::Scene::field_step_field).
+    only: Option<FieldId>,
     fields: Vec<UnitField>,
-    /// The first field with values left to compute.
+    /// The first field not finished yet.
     next: usize,
+    /// Every field is finished and the unit applies on the next step (a
+    /// large unit applies in a step of its own).
+    finished: bool,
     /// The error of the first field, in field order, that failed (when the
     /// unit opened or since), with that field's index.
     error: Option<(usize, SceneError)>,
@@ -372,8 +464,14 @@ pub(crate) struct Field {
     pub(crate) desc: DistanceField,
     /// `field:<name>`, the channel on mesh `on`.
     channel: String,
-    /// Each target's sign data, rebuilt when not current.
-    sign: Vec<SignData>,
+    /// Each target's sign data, rebuilt when not current; `None` until first
+    /// built (see [`Scene::add_distance_field_deferred`]).
+    sign: Vec<Option<SignData>>,
+    /// Per target: a sign data build a step unit left unfinished, resumed
+    /// while its mesh and BVH are unchanged.
+    sign_builds: Vec<Option<SignBuild>>,
+    /// Applied at least once: [`Scene::withdraw_field`] no longer applies.
+    computed: bool,
     /// Per vertex slot of A as of the last update: the index of the target
     /// its value came from, `u32::MAX` for none. Shorter than the slots
     /// when slots were added since; remapped with A by a compaction.
@@ -384,6 +482,26 @@ pub(crate) struct Field {
     finite: Vec<VertexId>,
     /// Per vertex slot of A at the last update: alive and used by a triangle.
     referenced: Vec<bool>,
+}
+
+impl Field {
+    /// What the latest sign data build of target `k` found out, or the
+    /// placeholder of [`Scene::field_target_status`] before the first.
+    fn sign_status(&self, k: usize) -> SignStatus {
+        self.sign[k].as_ref().map_or(
+            SignStatus {
+                mode: match self.desc.sign {
+                    SignMode::Winding => SignMode::Winding,
+                    SignMode::Pseudonormal | SignMode::Auto => SignMode::Pseudonormal,
+                },
+                closed: false,
+                consistent_orientation: false,
+                non_manifold_vertices: 0,
+                degenerate_triangles: 0,
+            },
+            SignData::status,
+        )
+    }
 }
 
 impl Entry {
@@ -476,6 +594,70 @@ impl Scene {
     /// The scene is unchanged on error.
     pub fn add_distance_field(&mut self, desc: DistanceField) -> Result<FieldId> {
         self.drop_field_unit();
+        let (id, eager) = self.register_field(desc, true)?;
+        if eager {
+            let _ = self.update_field(self.fields.len() - 1);
+        }
+        Ok(id)
+    }
+
+    /// Registers a field as [`Scene::add_distance_field`] does, but computes
+    /// nothing yet: no sign data are built and no BVH is brought up to date,
+    /// whatever the mode of `desc.on`. The field is due until an update
+    /// computes it: [`Scene::field_step`] (an Eager field),
+    /// [`Scene::field_step_field`], [`Scene::update_fields`],
+    /// [`Scene::flush`] (Eager and Lazy) or, unless deferred, the next
+    /// change to one of its meshes (Eager). Until then its values are NaN
+    /// and [`Scene::field_status`] reports placeholder sign data (see
+    /// [`Scene::field_target_status`]). Computed in steps, its values,
+    /// colours and reports are the same, bit for bit, as from
+    /// [`Scene::add_distance_field`].
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] as for
+    /// [`Scene::add_distance_field`]; a memory error. The scene is unchanged
+    /// on error. Errors of the BVHs and sign data come from the update that
+    /// computes the field.
+    pub fn add_distance_field_deferred(&mut self, desc: DistanceField) -> Result<FieldId> {
+        self.drop_field_unit();
+        Ok(self.register_field(desc, false)?.0)
+    }
+
+    /// Removes a field that has never been computed, as if it had never
+    /// been added: unlike [`Scene::remove_field`] nothing is reported.
+    /// Returns `false`, doing nothing, when the field was computed (by any
+    /// update) or colours its mesh; [`Scene::remove_field`] then applies.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field.
+    pub fn withdraw_field(&mut self, id: FieldId) -> Result<bool> {
+        self.drop_field_unit();
+        let i = self.field_index(id)?;
+        let f = &self.fields[i];
+        let colours = self
+            .entry(f.desc.on)
+            .ok()
+            .and_then(|e| e.coloring.as_ref())
+            .is_some_and(|c| c.coloring.field == id);
+        if f.computed || colours {
+            return Ok(false);
+        }
+        let f = self.fields.remove(i);
+        for &m in std::iter::once(&f.desc.on).chain(&f.desc.to) {
+            if let Some(e) = self.entries.get_mut(m) {
+                e.hooks.retain(|h| h.field != id);
+            }
+        }
+        if let Some(ea) = self.entries.get_mut(f.desc.on) {
+            let _ = ea.mesh.remove_channel(&f.channel);
+        }
+        Ok(true)
+    }
+
+    /// Validates `desc` and registers its field (its channel, hooks and,
+    /// with `sign`, its targets' sign data, bringing their BVHs up to date
+    /// first). Returns its id and whether its mesh is Eager. All or nothing.
+    fn register_field(&mut self, desc: DistanceField, sign: bool) -> Result<(FieldId, bool)> {
         self.entry(desc.on)?;
         for &to in &desc.to {
             self.entry(to)?;
@@ -511,12 +693,23 @@ impl Scene {
             .next_field
             .checked_add(1)
             .ok_or(SceneError::InvalidInput("too many fields"))?;
-        self.prepare(Some(&desc.to))?;
-        let mut sign = Vec::new();
-        sign.try_reserve_exact(desc.to.len()).map_err(|_| oom())?;
+        let mut signs = Vec::new();
+        signs.try_reserve_exact(desc.to.len()).map_err(|_| oom())?;
+        let mut sign_builds = Vec::new();
+        sign_builds
+            .try_reserve_exact(desc.to.len())
+            .map_err(|_| oom())?;
+        if sign {
+            self.prepare(Some(&desc.to))?;
+        }
         for &to in &desc.to {
             let eb = self.entries.get_mut(to).ok_or(SceneError::UnknownMesh)?;
-            sign.push(SignData::build(&mut eb.mesh, &eb.bvh, desc.sign)?);
+            signs.push(if sign {
+                Some(SignData::build(&mut eb.mesh, &eb.bvh, desc.sign)?)
+            } else {
+                None
+            });
+            sign_builds.push(None);
             eb.hooks.try_reserve(1).map_err(|_| oom())?;
         }
         self.fields.try_reserve(1).map_err(|_| oom())?;
@@ -542,16 +735,15 @@ impl Scene {
             id,
             desc,
             channel,
-            sign,
+            sign: signs,
+            sign_builds,
+            computed: false,
             nearest: Vec::new(),
             fresh: true,
             finite: Vec::new(),
             referenced: Vec::new(),
         });
-        if eager {
-            let _ = self.update_field(self.fields.len() - 1);
-        }
-        Ok(id)
+        Ok((id, eager))
     }
 
     /// Removes a field: its channel leaves its mesh, a colouring by it is
@@ -632,9 +824,14 @@ impl Scene {
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
+    /// A target whose sign data were never built (a field added with
+    /// [`Scene::add_distance_field_deferred`], not computed yet) reports a
+    /// placeholder: the requested mode (`Auto` as
+    /// [`SignMode::Pseudonormal`]), not closed, not consistently oriented,
+    /// and no counts.
     pub fn field_target_status(&self, id: FieldId) -> Result<Vec<SignStatus>> {
         let f = &self.fields[self.field_index(id)?];
-        Ok(f.sign.iter().map(SignData::status).collect())
+        Ok((0..f.sign.len()).map(|k| f.sign_status(k)).collect())
     }
 
     /// Whether the field is current, and what the latest sign data builds
@@ -645,10 +842,10 @@ impl Scene {
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_status(&self, id: FieldId) -> Result<FieldStatus> {
         let i = self.field_index(id)?;
-        let signs = &self.fields[i].sign;
-        let mut sign = signs[0].status();
-        for s in &signs[1..] {
-            let s = s.status();
+        let f = &self.fields[i];
+        let mut sign = f.sign_status(0);
+        for k in 1..f.sign.len() {
+            let s = f.sign_status(k);
             sign.closed &= s.closed;
             sign.consistent_orientation &= s.consistent_orientation;
             sign.non_manifold_vertices += s.non_manifold_vertices;
@@ -830,48 +1027,95 @@ impl Scene {
     /// them).
     ///
     /// The first call opens a unit: it takes every due field on an Eager
-    /// mesh (as an Eager update would), brings what each reads up to date
-    /// (BVHs, sign data) and chooses the vertices each recomputes, including
-    /// the near search (see the module docs). That part is not divided.
-    /// Every call, the first included, then computes the values of up to
-    /// `budget` of those vertices, across the unit's fields in field order,
-    /// writing nothing. The call that computes the last ones applies every
-    /// field of the unit together and returns [`StepState::Done`]: values,
-    /// colours and reports are then the same, bit for bit, as from
-    /// [`Scene::update_fields`] at the state the unit opened at.
+    /// mesh (as an Eager update would) and brings the BVHs each reads up to
+    /// date. Every call, the first included, then advances the unit's
+    /// fields in field order, writing nothing: for each, the build of its
+    /// targets' sign data when they are not current (about `budget` times
+    /// 32 elements of the build per call), its near search (whole parts,
+    /// about `budget` times 16 triangle pairs per call), the choice of the
+    /// vertices it recomputes (see the module docs), and the values of up
+    /// to `budget` of those vertices per call. A call that builds sign data
+    /// or searches does only that. The call that finishes the last field
+    /// applies every field of the unit together and returns
+    /// [`StepState::Done`]: values, colours and reports are then the same,
+    /// bit for bit, as from [`Scene::update_fields`] at the state the unit
+    /// opened at.
     ///
-    /// Any other `&mut self` call on the scene drops an open unit first
+    /// An open unit, including one opened by [`Scene::field_step_field`],
+    /// is continued. Any other `&mut self` call on the scene drops it first
     /// (see [`Scene::abandon_field_step`]), except
     /// [`Scene::abandon_field_step`] and [`Scene::set_defer_fields`].
     ///
-    /// Opening a unit is the one part that leaves a trace when the unit is
-    /// then abandoned: the BVHs it brought up to date stay refitted and the
-    /// sign data it rebuilt stays rebuilt, as after any query that needs
-    /// them. No value, colour, report or pending change depends on whether
-    /// that happened.
+    /// A unit leaves a trace when it is then abandoned: the BVHs it brought
+    /// up to date stay refitted, and the sign data it finished building
+    /// stay with their fields, as after any query that needs them. A sign
+    /// data build it left unfinished is kept with its field, and a later
+    /// unit resumes it while its mesh and BVH are unchanged. No value,
+    /// colour, report or pending change depends on whether that happened.
     ///
     /// # Errors
     /// Errors are isolated per field, as in [`Scene::update_fields`]: a
     /// field that fails, when the unit opens (for example
-    /// [`SceneError::StaleBvh`] for a stale Manual mesh) or while its values
-    /// are computed, is dropped from the unit and stays stale and due, as
-    /// after a failed Eager update. The other fields go on, and the call
-    /// that applies them returns the first error in field order instead of
+    /// [`SceneError::StaleBvh`] for a stale Manual mesh) or while it is
+    /// advanced, is dropped from the unit and stays stale and due, as after
+    /// a failed Eager update. The other fields go on, and the call that
+    /// applies them returns the first error in field order instead of
     /// [`StepState::Done`]. When no due field can be opened, the first
     /// error is returned and no unit is opened.
     pub fn field_step(&mut self, budget: FieldBudget) -> Result<StepState> {
+        self.step_unit(None, budget)
+    }
+
+    /// [`Scene::field_step`] for field `id` alone, whatever its mesh's
+    /// mode: opens a unit over it when it is not current and no unit for it
+    /// is open (dropping another open unit), or continues its open unit.
+    /// Returns [`StepState::Idle`] when the field is current. The call that
+    /// finishes it applies it, with the same values, colours and reports as
+    /// [`Scene::update_fields`] would give it.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field; then
+    /// as for [`Scene::field_step`].
+    pub fn field_step_field(&mut self, id: FieldId, budget: FieldBudget) -> Result<StepState> {
+        self.field_index(id)?;
+        self.step_unit(Some(id), budget)
+    }
+
+    /// Steps the open unit, or opens one over the due Eager fields
+    /// (`only`: `None`) or over the field `only` (see [`Scene::field_step`]
+    /// and [`Scene::field_step_field`]).
+    fn step_unit(&mut self, only: Option<FieldId>, budget: FieldBudget) -> Result<StepState> {
         let FieldBudget::Points(points) = budget;
-        let mut unit = match self.field_unit.take() {
+        let open = self
+            .field_unit
+            .take()
+            .filter(|u| only.is_none() || u.only == only);
+        let mut unit = match open {
             Some(unit) => unit,
-            None => match self.open_field_unit()? {
+            None => match self.open_field_unit(only)? {
                 Some(unit) => unit,
                 None => return Ok(StepState::Idle),
             },
         };
-        self.advance_field_unit(&mut unit, points.max(1));
-        if unit.next < unit.fields.len() {
-            self.field_unit = Some(unit);
-            return Ok(StepState::Pending);
+        if !unit.finished {
+            self.advance_field_unit(&mut unit, points.max(1));
+            if unit.next < unit.fields.len() {
+                self.field_unit = Some(unit);
+                return Ok(StepState::Pending);
+            }
+            // Applying writes every candidate's value and colour: when there
+            // are more than a step's worth, in a step of its own.
+            let written: usize = unit
+                .fields
+                .iter()
+                .filter_map(|f| f.plan.as_ref())
+                .map(|p| p.candidates.len())
+                .sum();
+            if points != usize::MAX && written > points {
+                unit.finished = true;
+                self.field_unit = Some(unit);
+                return Ok(StepState::Pending);
+            }
         }
         for f in unit.fields {
             // A field that failed has no plan.
@@ -891,8 +1135,9 @@ impl Scene {
 
     /// Drops the open step unit, if any: nothing it computed is written or
     /// reported, and its fields stay due. Does nothing when no unit is
-    /// open. What opening the unit brought up to date (BVHs, sign data)
-    /// stays so; see [`Scene::field_step`].
+    /// open. What the unit brought up to date (BVHs, finished sign data)
+    /// stays so, and an unfinished sign data build is kept; see
+    /// [`Scene::field_step`].
     pub fn abandon_field_step(&mut self) {
         self.drop_field_unit();
     }
@@ -925,9 +1170,30 @@ impl Scene {
     /// test `mutating_calls_abandon_open_unit`.
     pub(crate) fn drop_field_unit(&mut self) {
         self.field_unit = None;
+        self.drop_stale_sign_builds();
     }
 
-    /// The candidates of the open step unit left to compute.
+    /// Drops the unfinished sign data builds kept with the fields that are
+    /// no longer for their mesh and BVH as they are (an edit since, say):
+    /// they would only start over, and hold arrays the size of the mesh.
+    fn drop_stale_sign_builds(&mut self) {
+        let entries = &self.entries;
+        for f in &mut self.fields {
+            for (k, slot) in f.sign_builds.iter_mut().enumerate() {
+                let stale = slot.as_ref().is_some_and(|b| {
+                    entries
+                        .get(f.desc.to[k])
+                        .is_none_or(|e| !b.is_for(&e.mesh, &e.bvh))
+                });
+                if stale {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    /// The candidates of the open step unit left to compute, counting only
+    /// fields whose candidates are chosen.
     #[cfg(test)]
     pub(crate) fn field_step_left(&self) -> usize {
         self.field_unit.as_ref().map_or(0, |u| {
@@ -938,59 +1204,72 @@ impl Scene {
         })
     }
 
-    /// Opens a step unit over the due Eager fields: prepares each and picks
-    /// its candidates, leaving out (with their errors) those that fail.
-    /// `None` when no field is due; the first error when none opens.
-    fn open_field_unit(&mut self) -> Result<Option<FieldUnit>> {
-        let due = self.due_fields(|m| m == UpdateMode::Eager, None)?;
+    /// Unfinished sign data builds kept with the fields.
+    #[cfg(test)]
+    fn kept_sign_builds(&self) -> usize {
+        self.fields
+            .iter()
+            .flat_map(|f| &f.sign_builds)
+            .filter(|b| b.is_some())
+            .count()
+    }
+
+    /// The stage of the open step unit's first unfinished field.
+    #[cfg(test)]
+    fn field_step_stage(&self) -> Option<Stage> {
+        let u = self.field_unit.as_ref()?;
+        u.fields.get(u.next).map(|f| f.stage)
+    }
+
+    /// Opens a step unit over the due Eager fields, or over the field
+    /// `only` when it is not current: prepares each (BVHs, what it
+    /// recomputes), leaving out (with their errors) those that fail. `None`
+    /// when no field is due; the first error when none opens.
+    fn open_field_unit(&mut self, only: Option<FieldId>) -> Result<Option<FieldUnit>> {
+        let due = match only {
+            None => self.due_fields(|m| m == UpdateMode::Eager, None)?,
+            Some(id) => {
+                let i = self.field_index(id)?;
+                if self.field_current(i) {
+                    Vec::new()
+                } else {
+                    vec![i]
+                }
+            }
+        };
         if due.is_empty() {
             return Ok(None);
         }
         let mut unit = FieldUnit {
+            only,
             fields: Vec::new(),
             next: 0,
+            finished: false,
             error: None,
         };
-        let mut jobs = Vec::new();
-        jobs.try_reserve_exact(due.len()).map_err(|_| oom())?;
+        unit.fields
+            .try_reserve_exact(due.len())
+            .map_err(|_| oom())?;
         for &i in &due {
-            match self.prepare_field(i) {
-                Ok(job) => jobs.push(job),
+            match self.prepare_job(i) {
+                Ok(job) => {
+                    let all = job.full;
+                    unit.fields.push(UnitField {
+                        job,
+                        stage: Stage::Sign(0),
+                        search: None,
+                        near: Vec::new(),
+                        all,
+                        aborted: false,
+                        pick: Pick::default(),
+                        values: Vec::new(),
+                        nearest: Vec::new(),
+                        recomputed: 0,
+                        plan: None,
+                    });
+                }
                 Err(e) => unit.fail(i, e),
             }
-        }
-        // Picking is the near search, which can be long: in parallel across
-        // fields as in `compute_fields`. A field's error is its own result.
-        let threshold = field_threshold(jobs.iter());
-        let picks = par::map_chunks(&jobs, 1, threshold, oom, |_, chunk| {
-            Ok(self.pick_candidates(&chunk[0]))
-        })?;
-        unit.fields
-            .try_reserve_exact(jobs.len())
-            .map_err(|_| oom())?;
-        for (job, pick) in jobs.into_iter().zip(picks) {
-            let pick = match pick {
-                Ok(pick) => pick,
-                Err(e) => {
-                    unit.fail(job.i, e);
-                    continue;
-                }
-            };
-            let (mut values, mut nearest) = (Vec::new(), Vec::new());
-            values
-                .try_reserve_exact(pick.candidates.len())
-                .map_err(|_| oom())?;
-            nearest
-                .try_reserve_exact(pick.candidates.len())
-                .map_err(|_| oom())?;
-            unit.fields.push(UnitField {
-                job,
-                pick,
-                values,
-                nearest,
-                recomputed: 0,
-                plan: None,
-            });
         }
         if unit.fields.is_empty() {
             return Err(unit.error.map_or(SceneError::Corrupted, |(_, e)| e));
@@ -998,40 +1277,172 @@ impl Scene {
         Ok(Some(unit))
     }
 
-    /// Computes the values of up to `left` more candidates of `unit`, in
-    /// field order, and the plan of each field whose values are all
-    /// computed (a field without candidates costs none of `left`). A field
-    /// that fails is dropped from the unit, its error recorded: it gets no
-    /// plan, and its candidates left cost nothing.
-    fn advance_field_unit(&self, unit: &mut FieldUnit, mut left: usize) {
+    /// Advances `unit`'s fields in field order with a budget of `points`
+    /// (see [`Scene::field_step`]), giving each field whose values are all
+    /// computed its plan. A field that fails is dropped from the unit, its
+    /// error recorded: it gets no plan, and its work left costs nothing.
+    fn advance_field_unit(&mut self, unit: &mut FieldUnit, points: usize) {
+        let mut step = Step {
+            points,
+            left: points,
+            worked: false,
+        };
         while let Some(f) = unit.fields.get_mut(unit.next) {
-            let (done, total) = (f.values.len(), f.pick.candidates.len());
-            let mut computed = Ok(());
-            if done < total {
-                if left == 0 {
-                    break;
-                }
-                let end = done + left.min(total - done);
-                let run = &f.pick.candidates[done..end];
-                computed = self
-                    .compute_values(&f.job, run, &mut f.values, &mut f.nearest)
-                    .map(|n| f.recomputed += n);
-                left -= end - done;
-                if computed.is_ok() && end < total {
-                    break;
-                }
-            }
-            let pick = std::mem::take(&mut f.pick);
-            let values = std::mem::take(&mut f.values);
-            let nearest = std::mem::take(&mut f.nearest);
-            let plan = computed
-                .and_then(|()| self.finish_field(&f.job, pick, values, nearest, f.recomputed));
             let i = f.job.i;
-            match plan {
-                Ok(plan) => f.plan = Some(plan),
-                Err(e) => unit.fail(i, e),
+            match self.advance_field(f, &mut step) {
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(e) => {
+                    f.search = None;
+                    unit.fail(i, e);
+                }
             }
             unit.next += 1;
+        }
+    }
+
+    /// Advances one field of a unit through its stages within `step`.
+    /// Returns `true` once the field has its plan, `false` when the step is
+    /// spent first.
+    fn advance_field(&mut self, f: &mut UnitField, step: &mut Step) -> Result<bool> {
+        let i = f.job.i;
+        let targets = self.fields[i].desc.to.len();
+        loop {
+            match f.stage {
+                Stage::Sign(k) if k == targets => f.stage = Stage::Near(0),
+                Stage::Sign(k) => {
+                    if self.sign_current(i, k)? {
+                        f.stage = Stage::Sign(k + 1);
+                        continue;
+                    }
+                    if !step.begin_heavy() {
+                        return Ok(false);
+                    }
+                    let elems = step.points.saturating_mul(SIGN_ELEMS_PER_POINT);
+                    if self.step_sign(i, k, elems)? {
+                        f.stage = Stage::Sign(k + 1);
+                    }
+                    if !step.unbounded() {
+                        return Ok(false);
+                    }
+                }
+                Stage::Near(k) if k == targets || f.all => f.stage = Stage::Pick,
+                Stage::Near(k) => {
+                    let Some(margin) = f.job.near_margins[k] else {
+                        f.stage = Stage::Near(k + 1);
+                        continue;
+                    };
+                    if !step.begin_heavy() {
+                        return Ok(false);
+                    }
+                    let (on, to) = (self.fields[i].desc.on, self.fields[i].desc.to[k]);
+                    let (ea, eb) = (self.entry(on)?, self.entry(to)?);
+                    let search = match &mut f.search {
+                        Some(search) => search,
+                        empty => empty.insert(NearSearch::new(
+                            &ea.mesh,
+                            &ea.bvh,
+                            &eb.mesh,
+                            &eb.bvh,
+                            &f.job.b_to_a[k],
+                            round_up(margin),
+                            f.job.near_limit,
+                        )?),
+                    };
+                    let tests = step.points.saturating_mul(NEAR_TESTS_PER_POINT);
+                    if search.step(&ea.mesh, &ea.bvh, &eb.mesh, &eb.bvh, tests)? {
+                        let done = f.search.take().ok_or(SceneError::Corrupted)?;
+                        let within = done.finish(&mut f.near)?.ok_or(SceneError::Corrupted)?;
+                        f.aborted = !within;
+                        f.all = f.aborted;
+                        f.stage = Stage::Near(k + 1);
+                    }
+                    if !step.unbounded() {
+                        return Ok(false);
+                    }
+                }
+                Stage::Pick => {
+                    // Choosing every vertex, or scanning for flipped ones,
+                    // walks every vertex slot: a step of its own.
+                    if (f.all || f.job.topology) && !step.begin_heavy() {
+                        return Ok(false);
+                    }
+                    let near = std::mem::take(&mut f.near);
+                    f.pick = self.assemble_pick(&f.job, &near, f.all, f.aborted)?;
+                    let n = f.pick.candidates.len();
+                    f.values.try_reserve_exact(n).map_err(|_| oom())?;
+                    f.nearest.try_reserve_exact(n).map_err(|_| oom())?;
+                    f.stage = Stage::Values;
+                }
+                Stage::Values => {
+                    let (done, total) = (f.values.len(), f.pick.candidates.len());
+                    if done < total {
+                        if (step.worked && !step.unbounded()) || step.left == 0 {
+                            return Ok(false);
+                        }
+                        let end = done + step.left.min(total - done);
+                        let run = &f.pick.candidates[done..end];
+                        f.recomputed +=
+                            self.compute_values(&f.job, run, &mut f.values, &mut f.nearest)?;
+                        step.left -= end - done;
+                        if end < total {
+                            return Ok(false);
+                        }
+                    }
+                    f.stage = Stage::Finish;
+                }
+                Stage::Finish => {
+                    // A full plan walks every vertex slot: a step of its own.
+                    if f.all && !step.begin_heavy() {
+                        return Ok(false);
+                    }
+                    let pick = std::mem::take(&mut f.pick);
+                    let values = std::mem::take(&mut f.values);
+                    let nearest = std::mem::take(&mut f.nearest);
+                    f.plan =
+                        Some(self.finish_field(&f.job, pick, values, nearest, f.recomputed)?);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    /// Whether field `i`'s sign data of target `k` are current.
+    fn sign_current(&self, i: usize, k: usize) -> Result<bool> {
+        let f = &self.fields[i];
+        let eb = self.entry(f.desc.to[k])?;
+        Ok(f.sign[k]
+            .as_ref()
+            .is_some_and(|s| s.is_current(&eb.mesh, &eb.bvh)))
+    }
+
+    /// Runs the build of field `i`'s sign data of target `k` over up to
+    /// `elems` more elements, resuming the field's unfinished build when it
+    /// is for the mesh and BVH as they are, starting one otherwise. Stores
+    /// the sign data when done, and returns whether it is.
+    fn step_sign(&mut self, i: usize, k: usize, elems: usize) -> Result<bool> {
+        let f = &mut self.fields[i];
+        let eb = self
+            .entries
+            .get_mut(f.desc.to[k])
+            .ok_or(SceneError::UnknownMesh)?;
+        let slot = &mut f.sign_builds[k];
+        let build = match slot {
+            Some(b) if b.is_for(&eb.mesh, &eb.bvh) => b,
+            _ => slot.insert(SignBuild::new(&eb.mesh, &eb.bvh, f.desc.sign)?),
+        };
+        #[cfg(test)]
+        counter::add_sign_step();
+        match build.step(&mut eb.mesh, &eb.bvh, elems) {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                f.sign[k] = slot.take().and_then(SignBuild::finish);
+                Ok(true)
+            }
+            Err(e) => {
+                *slot = None;
+                Err(e.into())
+            }
         }
     }
 
@@ -1052,6 +1463,7 @@ impl Scene {
             if let Some(k) = target {
                 f.desc.to.remove(k);
                 f.sign.remove(k);
+                f.sign_builds.remove(k);
                 f.fresh = true;
                 // Until then, the indices follow the remaining targets.
                 let k = k as u32;
@@ -1204,13 +1616,36 @@ impl Scene {
     /// near set is needed) and the targets' sign data. Then decides what the
     /// update recomputes (see the module docs). Writes no field state.
     fn prepare_field(&mut self, i: usize) -> Result<FieldJob> {
+        let job = self.prepare_job(i)?;
+        let mode = self.fields[i].desc.sign;
+        for k in 0..self.fields[i].desc.to.len() {
+            let f = &mut self.fields[i];
+            let eb = self
+                .entries
+                .get_mut(f.desc.to[k])
+                .ok_or(SceneError::UnknownMesh)?;
+            if !f.sign[k]
+                .as_ref()
+                .is_some_and(|s| s.is_current(&eb.mesh, &eb.bvh))
+            {
+                f.sign[k] = Some(SignData::build(&mut eb.mesh, &eb.bvh, mode)?);
+            }
+            // Current now: an unfinished build of it is of no use.
+            f.sign_builds[k] = None;
+        }
+        Ok(job)
+    }
+
+    /// [`Scene::prepare_field`] but the sign data: the BVHs, then what the
+    /// update recomputes. A step unit builds the sign data in its steps.
+    fn prepare_job(&mut self, i: usize) -> Result<FieldJob> {
         let (id, on) = (self.fields[i].id, self.fields[i].desc.on);
         let mut to = Vec::new();
         to.try_reserve_exact(self.fields[i].desc.to.len() + 1)
             .map_err(|_| oom())?;
         to.extend_from_slice(&self.fields[i].desc.to);
         let n = to.len();
-        let (md, mode) = (self.fields[i].desc.max_distance, self.fields[i].desc.sign);
+        let md = self.fields[i].desc.max_distance;
         let hook = |m: MeshId| -> Result<FieldHook> {
             self.entry(m)?
                 .hook(id)
@@ -1245,13 +1680,6 @@ impl Scene {
             } else {
                 None
             });
-        }
-        for (k, &m) in to.iter().enumerate() {
-            let eb = self.entries.get_mut(m).ok_or(SceneError::UnknownMesh)?;
-            let f = &mut self.fields[i];
-            if !f.sign[k].is_current(&eb.mesh, &eb.bvh) {
-                f.sign[k] = SignData::build(&mut eb.mesh, &eb.bvh, mode)?;
-            }
         }
         let mut b_to_a = Vec::new();
         b_to_a.try_reserve_exact(n).map_err(|_| oom())?;
@@ -1331,8 +1759,6 @@ impl Scene {
         let f = &self.fields[job.i];
         let ea = self.entry(f.desc.on)?;
         let ma = &ea.mesh;
-        let slots = ma.vertex_slots();
-        let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
 
         // A's triangles near each moved target, as `Scene::triangles_near`
         // (with the BVHs `prepare_field` brought up to date), unless one
@@ -1357,13 +1783,30 @@ impl Scene {
             )?;
             all = aborted;
         }
+        self.assemble_pick(job, &near, all, aborted)
+    }
+
+    /// The vertices a prepared field's update recomputes, given A's
+    /// triangles `near` the moved targets, whether `all` are, and whether a
+    /// near search passed its limit. Reads the meshes only.
+    fn assemble_pick(
+        &self,
+        job: &FieldJob,
+        near: &[TriangleId],
+        all: bool,
+        aborted: bool,
+    ) -> Result<Pick> {
+        let f = &self.fields[job.i];
+        let ma = &self.entry(f.desc.on)?.mesh;
+        let slots = ma.vertex_slots();
+        let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
 
         // The vertices to recompute, ascending.
         let candidates: Vec<VertexId> = if all {
             (0..slots as VertexId).collect()
         } else {
             let mut c = Vec::new();
-            for &t in &near {
+            for &t in near {
                 if let Some(tri) = ma.triangle(t) {
                     c.extend_from_slice(&tri);
                 }
@@ -1428,7 +1871,7 @@ impl Scene {
             targets.push(Target {
                 mesh: &eb.mesh,
                 bvh: &eb.bvh,
-                sign: &f.sign[k],
+                sign: f.sign[k].as_ref().ok_or(SceneError::Corrupted)?,
                 // A's points go into each target's local space in f64, then
                 // are rounded to f32 (§5.2).
                 to_local: job.b_to_a[k].inverse(),
@@ -1571,6 +2014,7 @@ impl Scene {
             }
         }
         f.fresh = false;
+        f.computed = true;
         f.finite = plan.finite;
         if let Some(r) = plan.referenced {
             f.referenced = r;
@@ -1619,6 +2063,17 @@ pub(crate) mod counter {
         static NEAR_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
         static ABORTED: Cell<usize> = const { Cell::new(0) };
         static FAILING: Cell<Option<super::FieldId>> = const { Cell::new(None) };
+        static SIGN_STEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts one step of a stepped sign data build.
+    pub(crate) fn add_sign_step() {
+        SIGN_STEPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Steps of stepped sign data builds on this thread since the last call.
+    pub(crate) fn take_sign_steps() -> usize {
+        SIGN_STEPS.with(|c| c.replace(0))
     }
 
     /// Makes computing the values of `field` fail (out of memory) on this
@@ -3356,9 +3811,8 @@ mod tests {
     fn stepping_runs_parallel_paths() {
         use fast_mesh_store::par;
         // Two sheets of 6,561 vertices each, every vertex recomputed (an
-        // infinite max_distance): 13,122 candidates, enough to pick in
-        // parallel across the two fields and for runs of 2,048 to compute
-        // in parallel chunks.
+        // infinite max_distance): enough for runs of 2,048 to compute in
+        // parallel chunks.
         let make = || {
             let mut scene = Scene::new(SceneOptions::default());
             let a = scene
@@ -3393,20 +3847,24 @@ mod tests {
             scene.field_step(FieldBudget::Points(1)),
             Ok(StepState::Pending)
         );
-        let picked = counter::take_parallel();
+        // The first step chooses A's candidates (every vertex slot, a step
+        // of its own); fields are stepped one after the other, never as a
+        // parallel batch.
+        assert_eq!(counter::take_parallel(), 0);
         let opened = par::parallel_entries();
-        assert_eq!(scene.field_step_left(), 13_121);
+        assert_eq!(opened, entries);
+        assert_eq!(scene.field_step_left(), 6561);
+        assert_eq!(scene.field_step_stage(), Some(Stage::Values));
         assert_eq!(
             scene.field_step(FieldBudget::Points(2048)),
             Ok(StepState::Pending)
         );
+        assert_eq!(scene.field_step_left(), 6561 - 2048);
         let chunked = par::parallel_entries() - opened;
         if par::enabled() {
-            assert_eq!(picked, 1, "candidates picked sequentially");
-            assert!(opened > entries);
             assert!(chunked > 0, "values computed sequentially");
         } else {
-            assert_eq!((picked, chunked), (0, 0));
+            assert_eq!(chunked, 0);
         }
         assert!(step_all(&mut scene, 2048) > 0);
         twin.update_fields().unwrap();
@@ -3626,9 +4084,13 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 38] = [
+        let calls: [(&str, Call); 41] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
+            }),
+            ("add_mesh_built", |s, _| {
+                let build = crate::MeshBuild::new(sheet(1, 1.0), MeshOptions::default()).unwrap();
+                s.add_mesh_built(build).unwrap();
             }),
             ("remove_mesh", |s, x| {
                 s.remove_mesh(x.c).unwrap();
@@ -3683,6 +4145,13 @@ mod tests {
             }),
             ("add_distance_field", |s, x| {
                 s.add_distance_field(field("e", x.c, x.b, 0.1)).unwrap();
+            }),
+            ("add_distance_field_deferred", |s, x| {
+                s.add_distance_field_deferred(field("e", x.c, x.b, 0.1))
+                    .unwrap();
+            }),
+            ("withdraw_field", |s, x| {
+                assert!(!s.withdraw_field(x.field).unwrap());
             }),
             ("remove_field", |s, x| s.remove_field(x.field).unwrap()),
             ("update_fields", |s, _| s.update_fields().unwrap()),
@@ -4330,6 +4799,498 @@ mod tests {
             }
             for (k, run) in runs.iter().enumerate().skip(1) {
                 assert!(*run == runs[0], "seed {seed}, run {k}");
+            }
+        }
+    }
+
+    /// A sheet A and a cube B, both Eager and deferring their fields, with
+    /// nothing cached on them (no adjacency, no incidence) and no field.
+    fn bare_pair(rng: &mut Lcg) -> (Scene, MeshId, MeshId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(sheet(10, 0.1), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.3, 0.3, -0.2], 0.4), MeshOptions::default())
+            .unwrap();
+        scene.set_defer_fields(true);
+        let p = turned(rng.range(-20.0, 20.0), [0.0, 0.0, rng.range(-0.1, 0.1)]);
+        scene.set_placement(b, p).unwrap();
+        scene.take_changes();
+        (scene, a, b)
+    }
+
+    /// Steps field `id` alone to the end with `Points(budget)`, abandoning
+    /// at one in `abandon_one_in` step boundaries (0: never), and returns
+    /// the steps that left it pending.
+    fn step_field_all(
+        scene: &mut Scene,
+        id: FieldId,
+        budget: usize,
+        abandon_one_in: usize,
+        rng: &mut Lcg,
+    ) -> usize {
+        let (mut pending, mut abandoned) = (0, 0);
+        for _ in 0..1_000_000 {
+            match scene
+                .field_step_field(id, FieldBudget::Points(budget))
+                .unwrap()
+            {
+                StepState::Idle => return pending,
+                StepState::Pending => {
+                    pending += 1;
+                    // At most three times: an abandoned unit starts over.
+                    if abandon_one_in > 0 && abandoned < 3 && rng.below(abandon_one_in) == 0 {
+                        scene.abandon_field_step();
+                        abandoned += 1;
+                    }
+                }
+                StepState::Done => {}
+            }
+        }
+        panic!("field_step_field never went idle");
+    }
+
+    #[test]
+    fn deferred_add_matches_eager_add() {
+        // The same fields added at once and added deferred, then stepped
+        // alone with small budgets (abandoned at random boundaries too):
+        // the same values, colours and reports, bit for bit.
+        let mut rng = Lcg(0xadd5);
+        let mut spread = 0;
+        for round in 0..12 {
+            let state = rng.0;
+            let md = random_max_distance(&mut rng);
+            let sign = random_sign(&mut rng);
+            let budget = [1, 13, 500, usize::MAX][round % 4];
+            let abandon = if round % 3 == 0 { 4 } else { 0 };
+            let mut out = Vec::new();
+            for deferred in [false, true] {
+                let mut r = Lcg(state);
+                let (mut scene, a, b) = bare_pair(&mut r);
+                let desc = DistanceField {
+                    sign,
+                    ..field("d", a, b, md)
+                };
+                let id = if deferred {
+                    let id = scene.add_distance_field_deferred(desc).unwrap();
+                    assert!(!scene.field_status(id).unwrap().current);
+                    assert!(
+                        scene
+                            .take_changes()
+                            .iter()
+                            .all(|c| c.fields_changed.is_empty())
+                    );
+                    spread += step_field_all(&mut scene, id, budget, abandon, &mut r);
+                    id
+                } else {
+                    scene.add_distance_field(desc).unwrap()
+                };
+                assert!(scene.field_status(id).unwrap().current, "round {round}");
+                scene
+                    .set_coloring(
+                        a,
+                        Some(Coloring {
+                            field: id,
+                            rule: distance_rule(0.2, 0.1),
+                        }),
+                    )
+                    .unwrap();
+                let status = scene.field_target_status(id).unwrap();
+                let nearest = scene.field_nearest(id).unwrap().to_vec();
+                out.push((seen(&mut scene, [a, b]), status, nearest));
+            }
+            assert_eq!(out[0], out[1], "round {round} budget {budget}");
+        }
+        assert!(spread > 100, "{spread}");
+    }
+
+    #[test]
+    fn deferred_add_of_several_targets_matches() {
+        // A field measured to three meshes, added deferred and stepped one
+        // point at a time, against the field added at once.
+        let make = || {
+            let (mut scene, [a, b, c, d], fields) = group_scene(UpdateMode::Eager);
+            for f in fields {
+                scene.remove_field(f).unwrap();
+            }
+            scene.set_defer_fields(true);
+            scene.take_changes();
+            (scene, [a, b, c, d])
+        };
+        let (mut eager, [a, b, c, d]) = make();
+        let (mut stepped, _) = make();
+        let desc = DistanceField {
+            name: "multi".to_owned(),
+            on: a,
+            to: vec![b, c, d],
+            max_distance: 0.3,
+            sign: SignMode::Auto,
+        };
+        let fe = eager.add_distance_field(desc.clone()).unwrap();
+        let fs = stepped.add_distance_field_deferred(desc).unwrap();
+        let before = stepped.field_target_status(fs).unwrap();
+        assert!(
+            before
+                .iter()
+                .all(|s| !s.closed && s.mode == SignMode::Pseudonormal)
+        );
+        assert!(step_field_all(&mut stepped, fs, 1, 0, &mut Lcg(1)) > 50);
+        assert_eq!(
+            bits(eager.field_values(fe).unwrap()),
+            bits(stepped.field_values(fs).unwrap())
+        );
+        assert_eq!(
+            eager.field_nearest(fe).unwrap(),
+            stepped.field_nearest(fs).unwrap()
+        );
+        assert_eq!(
+            eager.field_target_status(fe).unwrap(),
+            stepped.field_target_status(fs).unwrap()
+        );
+        assert_eq!(eager.take_changes(), stepped.take_changes());
+    }
+
+    #[test]
+    fn sign_data_builds_in_steps_and_resumes() {
+        // After an edit of B, the field on A to B rebuilds B's sign data in
+        // the unit's steps; a unit abandoned partway leaves the build to be
+        // resumed, so the steps add up to those of an unbroken build.
+        let (mut scene, a, b, [fa, fb]) = deferred_pair(0.2);
+        let (mut twin, ..) = deferred_pair(0.2);
+        let (mut probe, ..) = deferred_pair(0.2);
+        let edit = |s: &mut Scene| {
+            s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, 0.29, -0.21]]))
+                .unwrap();
+        };
+        edit(&mut scene);
+        edit(&mut twin);
+        edit(&mut probe);
+        counter::take_sign_steps();
+        assert!(step_all(&mut probe, 1) > 0);
+        let unbroken = counter::take_sign_steps();
+        assert!(unbroken >= 4, "{unbroken}");
+        // Partway, then abandoned, then a placement change of A (sign data
+        // of B stay valid), then on to the end.
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(scene.field_step_stage(), Some(Stage::Sign(0)));
+        for _ in 0..unbroken / 2 {
+            assert_eq!(
+                scene.field_step(FieldBudget::Points(1)),
+                Ok(StepState::Pending)
+            );
+        }
+        scene.abandon_field_step();
+        scene.set_placement(a, at(0.0, 0.0, 0.01)).unwrap();
+        twin.set_placement(a, at(0.0, 0.0, 0.01)).unwrap();
+        step_all(&mut scene, 1);
+        let total = counter::take_sign_steps();
+        twin.update_fields().unwrap();
+        assert!(
+            total >= unbroken && total <= unbroken + 2,
+            "{total} against {unbroken}"
+        );
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+        // Partway, then an edit of B: the build starts over, and the result
+        // still matches.
+        edit(&mut scene);
+        edit(&mut twin);
+        for _ in 0..5 {
+            assert_eq!(
+                scene.field_step(FieldBudget::Points(1)),
+                Ok(StepState::Pending)
+            );
+        }
+        let moved = |s: &mut Scene| {
+            s.edit(b, |tx| tx.set_positions(&[1], &[[0.7, 0.31, -0.2]]))
+                .unwrap();
+        };
+        moved(&mut scene);
+        moved(&mut twin);
+        step_all(&mut scene, 3);
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+        assert!(scene.field_status(fa).unwrap().current);
+        assert!(scene.field_status(fb).unwrap().current);
+    }
+
+    #[test]
+    fn near_search_runs_in_steps() {
+        // A contact field on a large sheet: after a move, the near search
+        // spreads over several one-point steps, and the result matches.
+        let make = || {
+            let mut scene = Scene::new(SceneOptions::default());
+            let a = scene
+                .add_mesh(sheet(120, 1.0 / 120.0), MeshOptions::default())
+                .unwrap();
+            let opts = MeshOptions {
+                placement: at(0.0, 0.0, 0.01),
+                ..MeshOptions::default()
+            };
+            let b = scene.add_mesh(sheet(120, 1.0 / 120.0), opts).unwrap();
+            let f = scene.add_distance_field(field("d", a, b, 0.02)).unwrap();
+            scene.set_defer_fields(true);
+            scene
+                .set_placement(b, turned(1.0, [0.0, 0.0, 0.012]))
+                .unwrap();
+            scene.take_changes();
+            (scene, a, b, f)
+        };
+        counter::set_near_limit(Some(usize::MAX));
+        let (mut scene, a, b, _) = make();
+        let (mut twin, ..) = make();
+        let mut near_steps = 0;
+        for _ in 0..1_000_000 {
+            if scene.field_step_stage() == Some(Stage::Near(0)) {
+                near_steps += 1;
+            }
+            if scene.field_step(FieldBudget::Points(1)).unwrap() != StepState::Pending {
+                break;
+            }
+        }
+        twin.update_fields().unwrap();
+        counter::set_near_limit(None);
+        assert!(near_steps > 3, "{near_steps}");
+        assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+    }
+
+    #[test]
+    fn withdraw_field_only_before_it_is_computed() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        scene.take_changes();
+        let f = scene
+            .add_distance_field_deferred(field("d", a, b, 0.1))
+            .unwrap();
+        assert_eq!(scene.withdraw_field(f), Ok(true));
+        assert_eq!(scene.field_values(f), Err(SceneError::UnknownField));
+        assert!(
+            scene.take_changes().is_empty(),
+            "a withdrawn field reported"
+        );
+        assert_eq!(scene.withdraw_field(f), Err(SceneError::UnknownField));
+        // The name is free again; once computed, withdrawing does nothing.
+        let f = scene
+            .add_distance_field_deferred(field("d", a, b, 0.1))
+            .unwrap();
+        scene
+            .field_step_field(f, FieldBudget::Points(usize::MAX))
+            .unwrap();
+        assert_eq!(scene.withdraw_field(f), Ok(false));
+        assert!(scene.field_status(f).unwrap().current);
+        // A colouring by a field keeps it too.
+        let g = scene
+            .add_distance_field_deferred(field("g", a, b, 0.1))
+            .unwrap();
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(a, Some(Coloring { field: g, rule }))
+            .unwrap();
+        assert_eq!(scene.withdraw_field(g), Ok(false));
+        // An Eager add computes at once: nothing to withdraw.
+        let h = scene.add_distance_field(field("h", a, b, 0.1)).unwrap();
+        assert_eq!(scene.withdraw_field(h), Ok(false));
+    }
+
+    #[test]
+    fn field_step_field_steps_one_field() {
+        let (mut scene, a, b, [fa, fb]) = deferred_pair(0.2);
+        scene
+            .set_placement(b, turned(5.0, [0.02, 0.0, 0.0]))
+            .unwrap();
+        scene.take_changes();
+        // A unit over all due fields, then one over B's field alone.
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(
+            scene.field_step_field(fb, FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(scene.field_step_meshes(), vec![b, a]);
+        // `field_step` continues it.
+        assert_eq!(
+            scene.field_step(FieldBudget::Points(1)),
+            Ok(StepState::Pending)
+        );
+        assert_eq!(scene.field_step_meshes(), vec![b, a]);
+        while scene.field_step_field(fb, FieldBudget::Points(7)).unwrap() == StepState::Pending {}
+        assert!(scene.field_status(fb).unwrap().current);
+        assert!(!scene.field_status(fa).unwrap().current);
+        assert_eq!(
+            scene.field_step_field(fb, FieldBudget::Points(7)),
+            Ok(StepState::Idle)
+        );
+        let changed: Vec<MeshId> = scene.take_changes().iter().map(|c| c.id).collect();
+        assert!(!changed.contains(&a) || scene.colors(a).is_ok());
+        assert_eq!(
+            scene.field_step_field(FieldId(999), FieldBudget::Points(1)),
+            Err(SceneError::UnknownField)
+        );
+    }
+
+    #[test]
+    fn sign_build_survives_edit_and_undo_of_a_manual_target() {
+        // A Manual target B: undo brings its revision back, its BVH is not
+        // updated (it reads current again) and its slots stay grown. A
+        // partial sign build of B must start over, not resume.
+        let make = || {
+            let mut scene = Scene::new(SceneOptions::default());
+            let a = scene
+                .add_mesh(sheet(10, 0.1), MeshOptions::default())
+                .unwrap();
+            let b = scene
+                .add_mesh(sheet(30, 1.0 / 30.0), with_mode(UpdateMode::Manual))
+                .unwrap();
+            scene.set_placement(b, at(0.0, 0.0, 0.05)).unwrap();
+            let f = scene
+                .add_distance_field_deferred(field("d", a, b, 0.2))
+                .unwrap();
+            scene.take_changes();
+            (scene, a, b, f)
+        };
+        let (mut scene, a, b, f) = make();
+        let (mut twin, ..) = make();
+        for _ in 0..3 {
+            assert_eq!(
+                scene.field_step_field(f, FieldBudget::Points(1)),
+                Ok(StepState::Pending)
+            );
+        }
+        assert_eq!(scene.field_step_stage(), Some(Stage::Sign(0)));
+        let grow = |s: &mut Scene| {
+            s.edit(b, |tx| {
+                let vs = tx.add_vertices(&[[5.0, 5.0, 0.0], [6.0, 5.0, 0.0], [5.0, 6.0, 0.0]])?;
+                tx.add_triangles(&[[vs[0], vs[1], vs[2]]])
+            })
+            .unwrap();
+            s.undo().unwrap();
+        };
+        grow(&mut scene);
+        grow(&mut twin);
+        while scene.field_step_field(f, FieldBudget::Points(1)).unwrap() != StepState::Idle {}
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]).0, seen(&mut twin, [a, b]).0);
+        assert!(scene.field_status(f).unwrap().current);
+        let g = twin.field_id(f.raw()).unwrap();
+        assert_eq!(scene.field_target_status(f), twin.field_target_status(g));
+    }
+
+    #[test]
+    fn stale_partial_sign_builds_are_dropped() {
+        // Review M3: an unfinished sign build kept with its field goes once
+        // its mesh changes (at the next call that changes the scene), and
+        // when the field is updated in one call or removed.
+        let (mut scene, _, b, [fa, _]) = deferred_pair(0.2);
+        let edit = |s: &mut Scene, z: f32| {
+            s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, 0.29, z]]))
+                .unwrap();
+        };
+        let partial = |s: &mut Scene| {
+            for _ in 0..2 {
+                assert_eq!(s.field_step(FieldBudget::Points(1)), Ok(StepState::Pending));
+            }
+            s.abandon_field_step();
+        };
+        edit(&mut scene, -0.21);
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        // The target changes: stale, dropped by the next scene change.
+        edit(&mut scene, -0.22);
+        scene.set_defer_fields(true);
+        scene.take_changes();
+        scene.abandon_field_step();
+        scene.set_placement(b, at(0.0, 0.0, 0.0)).unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
+        // Updated in one call: dropped.
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        scene.update_fields().unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
+        // Removed with its field.
+        edit(&mut scene, -0.23);
+        partial(&mut scene);
+        assert_eq!(scene.kept_sign_builds(), 1);
+        scene.remove_field(fa).unwrap();
+        assert_eq!(scene.kept_sign_builds(), 0);
+    }
+
+    #[test]
+    fn stepped_unit_bit_identical_across_pools() {
+        // Review M7: the same stepped units (a field build from scratch,
+        // then a recompute after a move and one after an edit of the
+        // target, abandoned once partway) on a one-thread and an
+        // eight-thread pool, against the one-call update: bit for bit.
+        use fast_mesh_store::par;
+        let run = |threads: Option<usize>| {
+            let go = || {
+                let mut scene = Scene::new(SceneOptions::default());
+                let a = scene
+                    .add_mesh(sheet(90, 1.0 / 90.0), MeshOptions::default())
+                    .unwrap();
+                let opts = MeshOptions {
+                    placement: at(0.0, 0.0, 0.04),
+                    ..MeshOptions::default()
+                };
+                let b = scene.add_mesh(sheet(90, 1.0 / 90.0), opts).unwrap();
+                scene.set_defer_fields(true);
+                let f = scene
+                    .add_distance_field_deferred(field("d", a, b, 0.1))
+                    .unwrap();
+                let one_call = threads.is_none();
+                let settle = |s: &mut Scene| {
+                    if one_call {
+                        s.update_fields().unwrap();
+                    } else {
+                        for k in 0.. {
+                            match s.field_step(FieldBudget::Points(97)).unwrap() {
+                                StepState::Pending if k == 3 => s.abandon_field_step(),
+                                StepState::Pending | StepState::Done => {}
+                                _ => break,
+                            }
+                        }
+                    }
+                };
+                if one_call {
+                    scene.update_fields().unwrap();
+                } else {
+                    while scene.field_step_field(f, FieldBudget::Points(97)).unwrap()
+                        != StepState::Idle
+                    {}
+                }
+                let mut out = vec![seen(&mut scene, [a, b])];
+                scene
+                    .set_placement(b, turned(2.0, [0.01, 0.0, 0.035]))
+                    .unwrap();
+                settle(&mut scene);
+                out.push(seen(&mut scene, [a, b]));
+                scene
+                    .edit(b, |tx| tx.set_positions(&[100], &[[0.5, 0.5, -0.01]]))
+                    .unwrap();
+                settle(&mut scene);
+                out.push(seen(&mut scene, [a, b]));
+                out
+            };
+            match threads {
+                Some(k) => par::with_threads(k, go),
+                None => {
+                    par::set_force_sequential(true);
+                    let out = go();
+                    par::set_force_sequential(false);
+                    out
+                }
+            }
+        };
+        let want = run(None);
+        for k in [1, 8] {
+            let got = run(Some(k));
+            // Values and colours; reports may group differently around the
+            // abandon, the values may not.
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!((&g.0, &g.1), (&w.0, &w.1), "{k} threads");
             }
         }
     }

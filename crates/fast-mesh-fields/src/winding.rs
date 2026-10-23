@@ -20,11 +20,11 @@
 
 use std::f64::consts::PI;
 
-use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
+use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::geom::{add, cross, dot, norm, scale, sub, widen};
-use crate::sign::{collect_range, try_vec};
+use crate::sign::{collect_span, try_vec};
 use crate::{FieldsError, Result};
 
 /// The accuracy parameter: a node is far when its centroid is more than
@@ -126,55 +126,6 @@ fn solid_angle([a, b, c]: [[f64; 3]; 3]) -> f64 {
 }
 
 impl Moments {
-    /// Builds the moments of every node of `bvh`, bottom-up. The leaves'
-    /// moments come first (in parallel chunks on large trees, each leaf on
-    /// its own). Then, visiting the leaves in pre-order, which finishes a left
-    /// subtree before it enters the right one: when a leaf that is a right
-    /// child is done, its parent can be combined, and so on up while the
-    /// finished node is a right child.
-    pub(crate) fn build(mesh: &Mesh, bvh: &Bvh) -> Result<Moments> {
-        let mut nodes = try_vec(bvh.node_slots(), Moment::default())?;
-        let mut leaves = Vec::new();
-        let mut failed = false;
-        bvh.traverse(|id, view| {
-            if matches!(view.kind, NodeKind::Leaf { .. }) {
-                failed |= leaves.try_reserve(1).is_err();
-                if !failed {
-                    leaves.push(id);
-                }
-            }
-            // After a failure, skip what is left.
-            !failed
-        });
-        if failed {
-            return Err(FieldsError::OutOfMemory);
-        }
-        let moments = collect_range(leaves.len(), |k| {
-            let view = bvh.node(leaves[k]);
-            match view.kind {
-                NodeKind::Leaf { triangles } => leaf_moment(mesh, triangles, &view.bounds),
-                NodeKind::Inner { .. } => unreachable!("collected as a leaf"),
-            }
-        })?;
-        for (&id, moment) in leaves.iter().zip(moments) {
-            nodes[id.index()] = moment;
-            let mut child = id;
-            while let Some(parent) = bvh.parent(child) {
-                let pv = bvh.node(parent);
-                let NodeKind::Inner { left, right } = pv.kind else {
-                    break;
-                };
-                if right != child {
-                    break;
-                }
-                nodes[parent.index()] =
-                    inner_moment(&nodes[left.index()], &nodes[right.index()], &pv.bounds);
-                child = parent;
-            }
-        }
-        Ok(Moments(nodes))
-    }
-
     /// Every number of every node, as bits, for comparing builds.
     #[cfg(test)]
     pub(crate) fn bits(&self) -> impl Iterator<Item = u64> + '_ {
@@ -212,6 +163,98 @@ impl Moments {
             true
         });
         (total / (4.0 * PI), summed)
+    }
+}
+
+/// A build of the [`Moments`] of every node of a BVH, bottom-up. The leaves'
+/// moments come first (in parallel chunks on large trees, each leaf on
+/// its own). Then, visiting the leaves in pre-order, which finishes a left
+/// subtree before it enters the right one: when a leaf that is a right
+/// child is done, its parent can be combined, and so on up while the
+/// finished node is a right child.
+///
+/// The build runs in steps: the leaves are listed when it starts (one
+/// traversal), then each step computes the moments of the next leaves and
+/// combines every inner node they finish. Each leaf is computed on its own
+/// and the combines run in the same order whatever the steps, so the
+/// moments are the same, bit for bit.
+#[derive(Debug, Clone)]
+pub(crate) struct MomentsBuild {
+    nodes: Vec<Moment>,
+    leaves: Vec<NodeId>,
+    /// The first leaf whose moment is not computed yet.
+    next: usize,
+}
+
+impl MomentsBuild {
+    /// Lists `bvh`'s leaves in pre-order.
+    pub(crate) fn new(bvh: &Bvh) -> Result<MomentsBuild> {
+        let nodes = try_vec(bvh.node_slots(), Moment::default())?;
+        let mut leaves = Vec::new();
+        let mut failed = false;
+        bvh.traverse(|id, view| {
+            if matches!(view.kind, NodeKind::Leaf { .. }) {
+                failed |= leaves.try_reserve(1).is_err();
+                if !failed {
+                    leaves.push(id);
+                }
+            }
+            // After a failure, skip what is left.
+            !failed
+        });
+        if failed {
+            return Err(FieldsError::OutOfMemory);
+        }
+        Ok(MomentsBuild {
+            nodes,
+            leaves,
+            next: 0,
+        })
+    }
+
+    /// Leaves left to compute.
+    pub(crate) fn left(&self) -> usize {
+        self.leaves.len() - self.next
+    }
+
+    /// Computes up to `budget` more leaves (at least one) of `mesh` and
+    /// `bvh`, the BVH it was listed from, and combines the inner nodes they
+    /// finish. Returns whether every leaf is done.
+    pub(crate) fn step(&mut self, mesh: &Mesh, bvh: &Bvh, budget: usize) -> Result<bool> {
+        let from = self.next;
+        let to = self.leaves.len().min(from.saturating_add(budget.max(1)));
+        let leaves = &self.leaves;
+        let moments = collect_span(from..to, |k| {
+            let view = bvh.node(leaves[k]);
+            match view.kind {
+                NodeKind::Leaf { triangles } => leaf_moment(mesh, triangles, &view.bounds),
+                NodeKind::Inner { .. } => unreachable!("collected as a leaf"),
+            }
+        })?;
+        let nodes = &mut self.nodes;
+        for (&id, moment) in leaves[from..to].iter().zip(moments) {
+            nodes[id.index()] = moment;
+            let mut child = id;
+            while let Some(parent) = bvh.parent(child) {
+                let pv = bvh.node(parent);
+                let NodeKind::Inner { left, right } = pv.kind else {
+                    break;
+                };
+                if right != child {
+                    break;
+                }
+                nodes[parent.index()] =
+                    inner_moment(&nodes[left.index()], &nodes[right.index()], &pv.bounds);
+                child = parent;
+            }
+        }
+        self.next = to;
+        Ok(to == self.leaves.len())
+    }
+
+    /// The moments, once every leaf is done.
+    pub(crate) fn finish(self) -> Moments {
+        Moments(self.nodes)
     }
 }
 

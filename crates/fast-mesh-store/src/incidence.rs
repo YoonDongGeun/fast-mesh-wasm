@@ -12,8 +12,9 @@
 
 use std::collections::HashMap;
 
-use crate::column::{try_reserve, try_reserve_map, try_vec};
-use crate::{Mesh, Result, TriangleId, VertexId};
+use crate::adjacency::ZERO_PER_ELEMENT;
+use crate::column::{try_reserve, try_reserve_exact, try_reserve_map, try_vec};
+use crate::{Mesh, Result, StoreError, TriangleId, VertexId};
 
 /// Overlay size (entries plus rows) always allowed before the index is rebuilt.
 const MIN_OVERLAY: usize = 4096;
@@ -46,37 +47,9 @@ fn distinct(tri: [VertexId; 3]) -> impl Iterator<Item = VertexId> {
 
 impl Incidence {
     pub(crate) fn build(mesh: &Mesh) -> Result<Self> {
-        let tris = mesh.triangles();
-        let slots = mesh.vertex_slots();
-        let mut offsets = try_vec(slots + 1, 0u32)?;
-        for (t, &tri) in tris.iter().enumerate() {
-            if mesh.is_triangle_alive(t as TriangleId) {
-                for v in distinct(tri) {
-                    offsets[v as usize + 1] += 1;
-                }
-            }
-        }
-        for v in 0..slots {
-            offsets[v + 1] += offsets[v];
-        }
-        let mut triangles = try_vec(offsets[slots] as usize, 0 as TriangleId)?;
-        let mut cursor = try_vec(slots, 0u32)?;
-        cursor.copy_from_slice(&offsets[..slots]);
-        // Triangles are visited in ascending id order, so every row comes out sorted.
-        for (t, &tri) in tris.iter().enumerate() {
-            if mesh.is_triangle_alive(t as TriangleId) {
-                for v in distinct(tri) {
-                    triangles[cursor[v as usize] as usize] = t as TriangleId;
-                    cursor[v as usize] += 1;
-                }
-            }
-        }
-        Ok(Self {
-            offsets,
-            triangles,
-            overlay: HashMap::new(),
-            overlay_len: 0,
-        })
+        let mut build = IncidenceBuild::new(mesh);
+        build.step(mesh, usize::MAX)?;
+        build.take().ok_or(StoreError::OutOfMemory)
     }
 
     /// Every alive triangle using `v`, each once, in ascending id order. Empty for
@@ -161,6 +134,170 @@ impl Incidence {
     }
 }
 
+/// Where an [`IncidenceBuild`] stands: the pass it is in, with that pass's
+/// cursor (a triangle or vertex slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Counting the triangles of each vertex, triangle by triangle.
+    Count(usize),
+    /// Turning the counts into row offsets, vertex by vertex.
+    Prefix(usize),
+    /// Zeroing the rows, up to this many entries.
+    Zero(usize),
+    /// Listing each vertex's triangles, triangle by triangle.
+    Fill(usize),
+    /// Finished: the index is ready to be taken.
+    Done,
+}
+
+/// A resumable build of a mesh's [`Incidence`]: the build of
+/// [`Mesh::ensure_incidence`] cut into steps of a bounded number of elements
+/// (triangle or vertex slots), so that a caller can yield between them.
+///
+/// Each step runs the same loop bodies as the one-call build, over the next
+/// elements in the same order, so the finished index is the same, entry for
+/// entry. A build is tied to the mesh state it started from (its uid, epoch,
+/// revision and slot counts); [`Mesh::step_incidence`] starts over when the mesh has
+/// changed since, and caches the index when the build is done.
+#[derive(Debug)]
+pub struct IncidenceBuild {
+    uid: u64,
+    epoch: u32,
+    revision: u64,
+    /// The slot counts: an undo brings the revision back but keeps slots
+    /// it added, so the revision alone does not tell the state.
+    slots: (usize, usize),
+    pass: Pass,
+    offsets: Vec<u32>,
+    triangles: Vec<TriangleId>,
+    cursor: Vec<u32>,
+}
+
+impl IncidenceBuild {
+    /// A build of `mesh`'s incidence index as the mesh is now, with nothing
+    /// done.
+    pub fn new(mesh: &Mesh) -> IncidenceBuild {
+        IncidenceBuild {
+            uid: mesh.uid(),
+            epoch: mesh.epoch(),
+            revision: mesh.revision(),
+            slots: (mesh.vertex_slots(), mesh.triangle_slots()),
+            pass: Pass::Count(0),
+            offsets: Vec::new(),
+            triangles: Vec::new(),
+            cursor: Vec::new(),
+        }
+    }
+
+    /// Whether the build started from `mesh` as it is now.
+    pub fn is_for(&self, mesh: &Mesh) -> bool {
+        self.uid == mesh.uid()
+            && self.epoch == mesh.epoch()
+            && self.revision == mesh.revision()
+            && self.slots == (mesh.vertex_slots(), mesh.triangle_slots())
+    }
+
+    /// Whether every pass is done.
+    pub fn is_done(&self) -> bool {
+        self.pass == Pass::Done
+    }
+
+    /// Runs the build over up to `budget` more elements (at least one, unless
+    /// it is done) of `mesh`, which must be the mesh state it started from.
+    /// Returns whether it is done.
+    fn step(&mut self, mesh: &Mesh, budget: usize) -> Result<bool> {
+        debug_assert!(
+            self.is_for(mesh),
+            "an incidence build stepped on another mesh"
+        );
+        let tris = mesh.triangles();
+        let slots = mesh.vertex_slots();
+        let mut left = budget.max(1);
+        while left > 0 {
+            match self.pass {
+                Pass::Count(from) => {
+                    if from == 0 {
+                        self.offsets = try_vec(slots + 1, 0u32)?;
+                    }
+                    let to = tris.len().min(from.saturating_add(left));
+                    for (t, &tri) in tris.iter().enumerate().take(to).skip(from) {
+                        if mesh.is_triangle_alive(t as TriangleId) {
+                            for v in distinct(tri) {
+                                self.offsets[v as usize + 1] += 1;
+                            }
+                        }
+                    }
+                    left -= (to - from).min(left);
+                    self.pass = if to == tris.len() {
+                        Pass::Prefix(0)
+                    } else {
+                        Pass::Count(to)
+                    };
+                }
+                Pass::Prefix(from) => {
+                    let to = slots.min(from.saturating_add(left));
+                    for v in from..to {
+                        self.offsets[v + 1] += self.offsets[v];
+                    }
+                    left -= (to - from).min(left);
+                    if to < slots {
+                        self.pass = Pass::Prefix(to);
+                        continue;
+                    }
+                    try_reserve_exact(&mut self.triangles, self.offsets[slots] as usize)?;
+                    self.pass = Pass::Zero(0);
+                }
+                Pass::Zero(from) => {
+                    let total = self.offsets[slots] as usize;
+                    let to = total.min(from.saturating_add(left.saturating_mul(ZERO_PER_ELEMENT)));
+                    self.triangles.resize(to, 0 as TriangleId);
+                    left -= (to - from).div_ceil(ZERO_PER_ELEMENT).min(left);
+                    if to < total {
+                        self.pass = Pass::Zero(to);
+                        continue;
+                    }
+                    self.cursor = try_vec(slots, 0u32)?;
+                    self.cursor.copy_from_slice(&self.offsets[..slots]);
+                    self.pass = Pass::Fill(0);
+                }
+                Pass::Fill(from) => {
+                    let to = tris.len().min(from.saturating_add(left));
+                    // Triangles are visited in ascending id order, so every row comes
+                    // out sorted.
+                    for (t, &tri) in tris.iter().enumerate().take(to).skip(from) {
+                        if mesh.is_triangle_alive(t as TriangleId) {
+                            for v in distinct(tri) {
+                                let at = &mut self.cursor[v as usize];
+                                self.triangles[*at as usize] = t as TriangleId;
+                                *at += 1;
+                            }
+                        }
+                    }
+                    left -= (to - from).min(left);
+                    if to < tris.len() {
+                        self.pass = Pass::Fill(to);
+                        continue;
+                    }
+                    self.cursor = Vec::new();
+                    self.pass = Pass::Done;
+                }
+                Pass::Done => return Ok(true),
+            }
+        }
+        Ok(self.pass == Pass::Done)
+    }
+
+    /// The finished index, once [`IncidenceBuild::step`] returned `true`.
+    fn take(&mut self) -> Option<Incidence> {
+        (self.pass == Pass::Done).then(|| Incidence {
+            offsets: std::mem::take(&mut self.offsets),
+            triangles: std::mem::take(&mut self.triangles),
+            overlay: HashMap::new(),
+            overlay_len: 0,
+        })
+    }
+}
+
 fn compressed_row<'a>(
     offsets: &[u32],
     triangles: &'a [TriangleId],
@@ -190,6 +327,36 @@ impl Mesh {
     /// transaction that changed topology, until it commits or rolls back.
     pub fn incidence(&self) -> Option<&Incidence> {
         self.incidence.as_ref().filter(|_| !self.incidence_pending)
+    }
+
+    /// [`Mesh::ensure_incidence`] in steps: runs `build` over up to `budget`
+    /// more elements and, once it is done, caches its index. Returns whether
+    /// the index is cached, at once when it already is. When the mesh changed
+    /// since `build` started, `build` starts over first. The index is the
+    /// same as from [`Mesh::ensure_incidence`], entry for entry.
+    ///
+    /// # Errors
+    /// As for [`Mesh::ensure_incidence`]; `build` then starts over.
+    pub fn step_incidence(&mut self, build: &mut IncidenceBuild, budget: usize) -> Result<bool> {
+        debug_assert!(!self.incidence_pending, "called inside a transaction");
+        if self.incidence.is_some() {
+            return Ok(true);
+        }
+        if !build.is_for(self) {
+            *build = IncidenceBuild::new(self);
+        }
+        match build.step(self, budget) {
+            Ok(done) => {
+                if done {
+                    self.incidence = build.take();
+                }
+                Ok(done)
+            }
+            Err(e) => {
+                *build = IncidenceBuild::new(self);
+                Err(e)
+            }
+        }
     }
 
     /// Runs `f` on the cached index. Drops the index if `f` fails (out of
@@ -363,5 +530,50 @@ mod tests {
             }
         }
         assert!(dropped, "some budget must drop the index");
+    }
+
+    #[test]
+    fn stepped_build_matches_one_call() {
+        use crate::IncidenceBuild;
+        let mixed = crate::adjacency::tests::mixed;
+        let mut whole = mixed();
+        whole.ensure_incidence().unwrap();
+        let reference = whole.incidence().unwrap();
+        for budget in [1, 3, 50, usize::MAX] {
+            let mut m = mixed();
+            let mut build = IncidenceBuild::new(&m);
+            while !m.step_incidence(&mut build, budget).unwrap() {
+                assert!(m.incidence().is_none(), "cached before the last step");
+            }
+            assert!(build.is_done());
+            let got = m.incidence().unwrap();
+            assert_eq!(got.offsets, reference.offsets, "budget {budget}");
+            assert_eq!(got.triangles, reference.triangles, "budget {budget}");
+            assert_matches(&m);
+        }
+        // Started over after an edit.
+        let mut m = mixed();
+        let mut build = IncidenceBuild::new(&m);
+        assert!(!m.step_incidence(&mut build, 5).unwrap());
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[7]).unwrap();
+        tx.commit().unwrap();
+        assert!(!build.is_for(&m));
+        while !m.step_incidence(&mut build, 5).unwrap() {}
+        assert_matches(&m);
+    }
+
+    #[test]
+    fn stepped_build_starts_over_after_edit_and_undo() {
+        use crate::IncidenceBuild;
+        let mut m = crate::adjacency::tests::mixed();
+        let mut build = IncidenceBuild::new(&m);
+        for _ in 0..(m.triangle_slots() + 3) {
+            m.step_incidence(&mut build, 1).unwrap();
+        }
+        crate::adjacency::tests::grow_and_undo(&mut m);
+        assert!(!build.is_for(&m));
+        while !m.step_incidence(&mut build, 1000).unwrap() {}
+        assert_matches(&m);
     }
 }

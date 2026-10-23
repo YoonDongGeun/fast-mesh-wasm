@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshId,
-    MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
+    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshBuild,
+    MeshId, MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
     SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
     UpdateMode,
 };
@@ -44,6 +44,26 @@ pub struct WasmScene {
     /// The update mode of every live mesh, as last set (the scene has no
     /// getter for it).
     modes: BTreeMap<MeshId, UpdateMode>,
+    /// Meshes being added in steps, by build id: the build, its update mode
+    /// and whether it gets vertex normals.
+    adds: BTreeMap<u32, (MeshBuild, UpdateMode, bool)>,
+    /// The id the next `begin_add_mesh` hands out.
+    next_add: u32,
+}
+
+/// A mesh from world positions, stored relative to `origin` (or the
+/// bounding-box centre).
+fn mesh_from(positions: &[f64], indices: &[u32], origin: Option<Vec<f64>>) -> Result<Mesh, Error> {
+    Ok(match origin {
+        None => Mesh::from_buffers_f64(positions, indices)?,
+        Some(o) => {
+            let o: [f64; 3] = o
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::invalid("origin must have 3 values"))?;
+            Mesh::from_buffers_f64_with_origin(positions, indices, o)?
+        }
+    })
 }
 
 /// The update mode of its binding code: 0 Eager, 1 Lazy, 2 Manual.
@@ -178,6 +198,21 @@ impl Default for WasmScene {
 }
 
 impl WasmScene {
+    /// After a mesh `id` is added: its vertex normals (with `normals`), its
+    /// render state and its mode; returns `[index, generation]`. When the
+    /// normals cannot be turned on, the mesh is removed again.
+    fn added(&mut self, id: MeshId, mode: UpdateMode, normals: bool) -> Result<Vec<u32>, Error> {
+        if normals && let Err(e) = self.scene.set_normals(id, true) {
+            // Added and removed before any report: the scene reports nothing.
+            let _ = self.scene.remove_mesh(id);
+            return Err(e.into());
+        }
+        let state = RenderState::new(self.scene.mesh(id)?);
+        self.render.insert(id, state);
+        self.modes.insert(id, mode);
+        Ok(vec![id.index(), id.generation()])
+    }
+
     /// The live mesh id behind `(index, generation)`.
     fn id(&self, index: u32, generation: u32) -> Result<MeshId, Error> {
         self.scene
@@ -226,6 +261,8 @@ impl WasmScene {
             scene: Scene::new(SceneOptions::default()),
             render: BTreeMap::new(),
             modes: BTreeMap::new(),
+            adds: BTreeMap::new(),
+            next_add: 0,
         }
     }
 
@@ -245,30 +282,71 @@ impl WasmScene {
         normals: bool,
     ) -> Result<Vec<u32>, Error> {
         let mode = parse_mode(mode)?;
-        let mesh = match origin {
-            None => Mesh::from_buffers_f64(positions, indices)?,
-            Some(o) => {
-                let o: [f64; 3] = o
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::invalid("origin must have 3 values"))?;
-                Mesh::from_buffers_f64_with_origin(positions, indices, o)?
-            }
-        };
+        let mesh = mesh_from(positions, indices, origin)?;
         let options = MeshOptions {
             mode,
             ..MeshOptions::default()
         };
         let id = self.scene.add_mesh(mesh, options)?;
-        if normals && let Err(e) = self.scene.set_normals(id, true) {
-            // Added and removed before any report: the scene reports nothing.
-            let _ = self.scene.remove_mesh(id);
-            return Err(e.into());
+        self.added(id, mode, normals)
+    }
+
+    /// [`WasmScene::add_mesh`] in steps: starts building the mesh and its
+    /// BVH outside the scene ([`MeshBuild`]) and returns the build's id, for
+    /// [`WasmScene::add_mesh_step`] and [`WasmScene::finish_add_mesh`]. The
+    /// scene is unchanged until the mesh is added.
+    pub fn begin_add_mesh(
+        &mut self,
+        positions: &[f64],
+        indices: &[u32],
+        origin: Option<Vec<f64>>,
+        mode: u8,
+        normals: bool,
+    ) -> Result<u32, Error> {
+        let mode = parse_mode(mode)?;
+        let mesh = mesh_from(positions, indices, origin)?;
+        let options = MeshOptions {
+            mode,
+            ..MeshOptions::default()
+        };
+        let build = MeshBuild::new(mesh, options)?;
+        let id = self.next_add;
+        self.next_add = self.next_add.wrapping_add(1);
+        self.adds.insert(id, (build, mode, normals));
+        Ok(id)
+    }
+
+    /// Builds about `budget` more units of a mesh being added (see
+    /// `MeshBuild::step`); `true` once its BVH is built. A failed build is
+    /// dropped.
+    pub fn add_mesh_step(&mut self, build: u32, budget: u32) -> Result<bool, Error> {
+        let (b, ..) = self
+            .adds
+            .get_mut(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+        match b.step(budget as usize) {
+            Ok(done) => Ok(done),
+            Err(e) => {
+                self.adds.remove(&build);
+                Err(e.into())
+            }
         }
-        let state = RenderState::new(self.scene.mesh(id)?);
-        self.render.insert(id, state);
-        self.modes.insert(id, mode);
-        Ok(vec![id.index(), id.generation()])
+    }
+
+    /// Adds a mesh built in steps, finishing what is left of its BVH, and
+    /// returns `[index, generation]`, as [`WasmScene::add_mesh`] would.
+    pub fn finish_add_mesh(&mut self, build: u32) -> Result<Vec<u32>, Error> {
+        let (b, mode, normals) = self
+            .adds
+            .remove(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+        let id = self.scene.add_mesh_built(b)?;
+        self.added(id, mode, normals)
+    }
+
+    /// Drops a mesh being added in steps (nothing was added).
+    pub fn drop_add_mesh(&mut self, build: u32) {
+        self.adds.remove(&build);
     }
 
     /// Removes a mesh; its id never matches again.
@@ -826,6 +904,38 @@ impl WasmScene {
         Ok(self.scene.add_distance_field(desc)?.raw())
     }
 
+    /// [`WasmScene::add_distance_field`] computing nothing yet: the field is
+    /// due until stepped or updated; see
+    /// [`Scene::add_distance_field_deferred`].
+    pub fn add_distance_field_deferred(
+        &mut self,
+        name: String,
+        on_to: &[u32],
+        max_distance: f64,
+        sign: u8,
+    ) -> Result<u32, Error> {
+        let mut ids = self.ids(on_to)?;
+        if ids.len() < 2 {
+            return Err(Error::invalid("a field needs two meshes"));
+        }
+        let on = ids.remove(0);
+        let desc = DistanceField {
+            name,
+            on,
+            to: ids,
+            max_distance,
+            sign: parse_sign(sign)?,
+        };
+        Ok(self.scene.add_distance_field_deferred(desc)?.raw())
+    }
+
+    /// Removes a field never computed, reporting nothing; `false` (nothing
+    /// done) when it was computed or colours its mesh. See
+    /// [`Scene::withdraw_field`].
+    pub fn withdraw_field(&mut self, field: u32) -> Result<bool, Error> {
+        Ok(self.scene.withdraw_field(self.field(field)?)?)
+    }
+
     /// What the sign data found out about each target, in index order: five
     /// numbers per target, `[mode, closed, consistent orientation,
     /// non-manifold vertices, degenerate triangles]` as in
@@ -951,6 +1061,21 @@ impl WasmScene {
             // by the next call that changes the scene).
             _ => 2,
         })
+    }
+
+    /// [`WasmScene::field_step`] for one field alone; see
+    /// [`Scene::field_step_field`]. Returns 0 (idle: the field is current),
+    /// 1 (pending) or 2 (done).
+    pub fn field_step_field(&mut self, field: u32, points: u32) -> Result<u8, Error> {
+        let budget = FieldBudget::Points(points as usize);
+        Ok(
+            match self.scene.field_step_field(self.field(field)?, budget)? {
+                StepState::Idle => 0,
+                StepState::Pending => 1,
+                StepState::Done => 2,
+                _ => 2,
+            },
+        )
     }
 
     /// Drops the open step unit, if any; see [`Scene::abandon_field_step`].
@@ -1657,11 +1782,62 @@ mod tests {
                 }
             }
         }
-        // Six vertices, one per step.
-        assert_eq!(steps, 6);
+        // Six vertices, one per step, after the near search's own step.
+        assert!(steps >= 6, "{steps} steps");
         let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
         assert!((values[0] - 2.).abs() < 1e-6, "{values:?}");
         assert_eq!(s.field_step(u32::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn stepped_field_add_and_mesh_add_bindings() {
+        let mut s = WasmScene::new();
+        let mut t = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        octahedron(&mut t, [0., 0., 0.], 1.);
+        octahedron(&mut t, [3., 0., 0.], 1.);
+        // A field added deferred, stepped alone: the values of an eager add.
+        let f = s
+            .add_distance_field_deferred("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        let g = t
+            .add_distance_field("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        while s.field_step_field(f, 1).unwrap() == 1 {}
+        assert_eq!(s.field_step_field(f, 1).unwrap(), 0);
+        let bits = |w: &WasmScene, id: u32| -> Vec<u32> {
+            let v = w.scene.field_values(w.field(id).unwrap()).unwrap();
+            v.iter().map(|x| x.to_bits()).collect()
+        };
+        assert_eq!(bits(&s, f), bits(&t, g));
+        assert!(!s.withdraw_field(f).unwrap());
+        let h = s
+            .add_distance_field_deferred("e".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        assert!(s.withdraw_field(h).unwrap());
+        assert!(s.field_status(h).is_err());
+        // A mesh added in steps: the same id and buffers as an add.
+        let positions = [0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 1., 0.5];
+        let indices = [0, 1, 2, 1, 3, 2];
+        let build = s
+            .begin_add_mesh(&positions, &indices, None, 0, true)
+            .unwrap();
+        while !s.add_mesh_step(build, 1).unwrap() {}
+        let id = s.finish_add_mesh(build).unwrap();
+        let want = t.add_mesh(&positions, &indices, None, 0, true).unwrap();
+        assert_eq!(id, want);
+        let mesh = |w: &WasmScene| {
+            let m = w.scene.mesh(w.id(id[0], id[1]).unwrap()).unwrap();
+            (m.positions().to_vec(), m.triangles().to_vec())
+        };
+        assert_eq!(mesh(&s), mesh(&t));
+        assert!(s.add_mesh_step(build, 1).is_err());
+        let other = s
+            .begin_add_mesh(&positions, &indices, None, 0, false)
+            .unwrap();
+        s.drop_add_mesh(other);
+        assert!(s.finish_add_mesh(other).is_err());
     }
 
     /// An edit id list without refs.

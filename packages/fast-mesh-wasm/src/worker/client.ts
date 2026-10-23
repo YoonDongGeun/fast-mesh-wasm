@@ -95,6 +95,20 @@ export interface WorkerSceneOptions {
    * which. An integer, clamped to 1 to {@link MAX_THREADS}.
    */
   threads?: number;
+  /**
+   * Meshes of at least this many triangles are added in the background:
+   * the Worker builds them in steps while the requests sent after them
+   * that do not need them run (toggles, edits, drags, queries of other
+   * meshes), so those do not wait for a large add. A request that names
+   * the new mesh (or a field measured to it), adds or removes a mesh, or
+   * queries every mesh waits for it, so the engine's state is the same as
+   * in arrival order; but a reply to an unrelated request sent after the
+   * add can arrive before the mesh, whose status reads `"computing"` (and
+   * whose views are empty) until it lands. Defaults to 65,536; `Infinity`
+   * turns background adds off, so every add comes back with its own
+   * batch's result. A number, 0 or more.
+   */
+  backgroundAddTriangles?: number;
 }
 
 /** The state of a request key, from {@link WorkerScene.status}. */
@@ -120,6 +134,10 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
     throw invalid(`threads must be an integer (got ${options.threads})`);
   }
   const threads = options.threads === undefined ? undefined : Math.min(Math.max(options.threads, 1), MAX_THREADS);
+  const background = options.backgroundAddTriangles;
+  if (background !== undefined && (typeof background !== "number" || Number.isNaN(background) || background < 0)) {
+    throw invalid(`backgroundAddTriangles must be a number, 0 or more (got ${String(background)})`);
+  }
   // Called again by `restart()`.
   const make = (): WorkerLike =>
     options.createWorker?.() ??
@@ -132,7 +150,12 @@ export async function createWorkerScene(options: WorkerSceneOptions = {}): Promi
   const skipped = threadsUnavailable && threads !== 1;
   const [scene, started] = createScene(make, {
     debug: options.debug ?? false,
-    init: { kind: "init", threads: skipped ? 1 : threads, debug },
+    init: {
+      kind: "init",
+      threads: skipped ? 1 : threads,
+      debug,
+      ...(background === undefined ? {} : { backgroundAddTriangles: background }),
+    },
   });
   try {
     await started;
@@ -1012,6 +1035,9 @@ export class WorkerScene implements SceneLike {
         this.#ready.resolve();
       } else if (msg.kind === "fatal") {
         this.#poisonAll(msg.error);
+      } else if (msg.kind === "update") {
+        // A background add landed while the Worker was idle: no batch's.
+        this.#apply(msg.result, []);
       }
       return;
     }
@@ -1356,6 +1382,13 @@ export class WorkerScene implements SceneLike {
    * origin defaults to the bounding-box centre, computed here. The mesh has
    * no slots until the Worker has added it; a failed add shows as an error
    * on `status("mesh:<id>")`, and later calls on it fail with `UNKNOWN_MESH`.
+   *
+   * A mesh of {@link WorkerSceneOptions.backgroundAddTriangles} triangles or
+   * more (65,536 by default) is added in the background: requests sent after
+   * it that do not need it run meanwhile, so a reply to one of them can
+   * arrive before the mesh. Until it lands, `status("mesh:<id>")` reads
+   * `"computing"` and its views are empty; its buffers arrive with that
+   * status turning `"ready"`.
    */
   addMesh(
     positions: Positions64,
@@ -2381,10 +2414,12 @@ export class WorkerScene implements SceneLike {
           f64: true,
           indices: indices.buffer as ArrayBuffer,
           options: { origin: st.origin, normals: st.normalsOn },
+          // The restart resolves with every mesh live.
+          inline: true,
         });
       } else if (st.add !== undefined && !st.sent) {
         // Never sent: its buffers are still here.
-        st.add = { ...st.add, rev: ++this.#rev };
+        st.add = { ...st.add, rev: ++this.#rev, inline: true };
         this.#push(st.add);
       } else {
         const key = `mesh:${st.id}`;

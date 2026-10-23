@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::arena::{Arena, NONE, Node};
-use crate::build::{Prims, build_full, expected_nodes};
+use crate::build::{Prims, TreeBuild, build_full, expected_nodes};
 use crate::error::{Result, try_reserve, try_reserve_exact, try_reserve_map, try_vec};
 use crate::{Aabb, BuildOptions, NodeKind, UpdatePolicy};
 
@@ -67,6 +67,183 @@ pub(crate) fn alive_prims(mesh: &Mesh) -> Result<Prims> {
         }
     }
     Ok(prims)
+}
+
+/// Where a [`BvhBuild`] stands.
+enum BuildStage {
+    /// Collecting the alive triangles' boxes, from this triangle slot on.
+    Prims(Prims, usize),
+    /// Building the tree.
+    Tree(Box<TreeBuild>),
+    /// Done: the BVH is ready to be taken.
+    Done(Box<Bvh>),
+    /// Taken, or failed.
+    Gone,
+}
+
+/// [`Bvh::build`] cut into steps, so that a caller can yield between them:
+/// the triangles' boxes are collected, then the tree is built a bounded
+/// amount of work per step, then its treelets are assigned (one pass).
+///
+/// The tree is the same, slot for slot and bit for bit, as from
+/// [`Bvh::build`], with or without the `parallel` feature (with it, a step
+/// builds several small subtrees at once). The build is tied to the mesh
+/// state it started from ([`BvhBuild::is_for`]).
+pub struct BvhBuild {
+    stage: BuildStage,
+    options: BuildOptions,
+    arena: Option<Arena>,
+    mesh_uid: u64,
+    epoch: u32,
+    revision: u64,
+    /// The mesh's triangle slots: an undo brings the revision back but
+    /// keeps slots it added.
+    triangle_slots: usize,
+}
+
+impl std::fmt::Debug for BvhBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BvhBuild")
+            .field("done", &self.is_done())
+            .finish()
+    }
+}
+
+impl BvhBuild {
+    /// A build of a BVH over the alive triangles of `mesh` as it is now,
+    /// with nothing done yet.
+    ///
+    /// # Errors
+    /// [`BvhError::InvalidOptions`](crate::BvhError::InvalidOptions); out of
+    /// memory.
+    pub fn new(mesh: &Mesh, options: &BuildOptions) -> Result<BvhBuild> {
+        options.validate()?;
+        let prims = Prims::with_capacity(mesh.triangle_count())?;
+        let arena = Arena {
+            nodes: Vec::new(),
+            parents: Vec::new(),
+            refs: Vec::new(),
+            tri_leaf: try_vec(mesh.triangle_slots(), NONE)?,
+        };
+        Ok(BvhBuild {
+            stage: BuildStage::Prims(prims, 0),
+            options: *options,
+            arena: Some(arena),
+            mesh_uid: mesh.uid(),
+            epoch: mesh.epoch(),
+            revision: mesh.revision(),
+            triangle_slots: mesh.triangle_slots(),
+        })
+    }
+
+    /// Whether the build started from `mesh` as it is now.
+    pub fn is_for(&self, mesh: &Mesh) -> bool {
+        self.mesh_uid == mesh.uid()
+            && self.epoch == mesh.epoch()
+            && self.revision == mesh.revision()
+            && self.triangle_slots == mesh.triangle_slots()
+    }
+
+    /// Whether the BVH is built.
+    pub fn is_done(&self) -> bool {
+        matches!(self.stage, BuildStage::Done(_))
+    }
+
+    /// Builds about `budget` more units of work (at least some, unless
+    /// done): a triangle's box collected, or a triangle visited while the
+    /// tree is built (each triangle about once per tree level). Returns
+    /// whether the BVH is built.
+    ///
+    /// # Errors
+    /// [`BvhError::InvalidOptions`](crate::BvhError::InvalidOptions) when
+    /// `mesh` is not the state the build started from; out of memory. The
+    /// build is unusable after an error.
+    pub fn step(&mut self, mesh: &Mesh, budget: usize) -> Result<bool> {
+        if !self.is_for(mesh) {
+            self.stage = BuildStage::Gone;
+            return Err(crate::BvhError::InvalidOptions(
+                "the BVH build started from another mesh state",
+            ));
+        }
+        let mut left = budget.max(1);
+        loop {
+            match std::mem::replace(&mut self.stage, BuildStage::Gone) {
+                BuildStage::Prims(mut prims, from) => {
+                    let (positions, triangles) = (mesh.positions(), mesh.triangles());
+                    let to = triangles.len().min(from.saturating_add(left));
+                    for (t, &tri) in triangles.iter().enumerate().take(to).skip(from) {
+                        if mesh.is_triangle_alive(t as TriangleId) {
+                            prims.push(t as u32, Aabb::of_triangle(positions, tri));
+                        }
+                    }
+                    left = left.saturating_sub(to - from);
+                    if to < triangles.len() {
+                        self.stage = BuildStage::Prims(prims, to);
+                        return Ok(false);
+                    }
+                    let arena = self.arena.take().ok_or(crate::BvhError::OutOfMemory)?;
+                    if prims.len() == 0 {
+                        self.stage =
+                            BuildStage::Done(Box::new(self.finish_tree(mesh, arena, NONE)?));
+                        return Ok(true);
+                    }
+                    self.stage =
+                        BuildStage::Tree(Box::new(TreeBuild::new(arena, prims, &self.options)?));
+                    if left == 0 {
+                        return Ok(false);
+                    }
+                }
+                BuildStage::Tree(mut tree) => {
+                    if !tree.step(left)? {
+                        self.stage = BuildStage::Tree(tree);
+                        return Ok(false);
+                    }
+                    let root = tree.root;
+                    let bvh = self.finish_tree(mesh, tree.arena, root)?;
+                    self.stage = BuildStage::Done(Box::new(bvh));
+                    return Ok(true);
+                }
+                done @ BuildStage::Done(_) => {
+                    self.stage = done;
+                    return Ok(true);
+                }
+                BuildStage::Gone => return Err(crate::BvhError::OutOfMemory),
+            }
+        }
+    }
+
+    /// The BVH, once built; `None` before.
+    pub fn finish(self) -> Option<Bvh> {
+        match self.stage {
+            BuildStage::Done(bvh) => Some(*bvh),
+            _ => None,
+        }
+    }
+
+    /// The BVH around a built tree, as [`Bvh::assemble`] makes it.
+    fn finish_tree(&self, mesh: &Mesh, mut arena: Arena, root: u32) -> Result<Bvh> {
+        if root == NONE {
+            let expected = expected_nodes(0, self.options.max_leaf_size);
+            try_reserve_exact(&mut arena.nodes, expected)?;
+            try_reserve_exact(&mut arena.parents, expected)?;
+        }
+        let mut bvh = Bvh {
+            arena,
+            root,
+            treelets: Vec::new(),
+            treelet_of_root: HashMap::new(),
+            garbage_nodes: 0,
+            garbage_refs: 0,
+            mesh_uid: mesh.uid(),
+            epoch: mesh.epoch(),
+            revision: mesh.revision(),
+            generation: next_generation(),
+            options: self.options,
+            policy: UpdatePolicy::default(),
+        };
+        bvh.assign_treelets()?;
+        Ok(bvh)
+    }
 }
 
 impl Bvh {
@@ -690,5 +867,179 @@ mod tests {
         bvh.compact_storage().unwrap();
         bvh.validate(&mesh).unwrap();
         assert_eq!(bvh.node_count(), before);
+    }
+
+    /// A wavy grid with some triangles removed, so slots and alive
+    /// triangles differ and boxes are not coplanar.
+    fn wavy(n: u32) -> Mesh {
+        let mut positions = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32, y as f32);
+                positions.extend([fx, fy, (fx * 0.31).sin() * (fy * 0.17).cos() * 3.0]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                indices.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+            }
+        }
+        let mut mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+        let mut tx = mesh.begin_edit();
+        let gone: Vec<u32> = [0, 7, 100, 101, 2 * n * n - 1]
+            .into_iter()
+            .filter(|&t| t < 2 * n * n)
+            .collect();
+        tx.remove_triangles(&gone).unwrap();
+        tx.commit().unwrap();
+        mesh
+    }
+
+    /// Node numbers, ids, the root and the treelets of a BVH, as bits.
+    type Fingerprint = (Vec<u64>, Vec<u32>, u32, Vec<(u32, u32)>);
+
+    /// Everything a BVH holds, as bits.
+    fn fingerprint(b: &Bvh) -> Fingerprint {
+        let a = &b.arena;
+        let nodes = a
+            .nodes
+            .iter()
+            .flat_map(|n| {
+                n.bounds
+                    .min
+                    .iter()
+                    .chain(&n.bounds.max)
+                    .map(|c| u64::from(c.to_bits()))
+                    .chain([u64::from(n.a), u64::from(n.b)])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let ids = a
+            .parents
+            .iter()
+            .chain(&a.refs)
+            .chain(&a.tri_leaf)
+            .copied()
+            .collect();
+        let treelets = b
+            .treelets
+            .iter()
+            .map(|t| (t.root, t.build_cost.to_bits()))
+            .collect();
+        (nodes, ids, b.root, treelets)
+    }
+
+    fn stepped(mesh: &Mesh, opts: &BuildOptions, budget: usize) -> (Bvh, usize) {
+        let mut build = BvhBuild::new(mesh, opts).unwrap();
+        let mut steps = 1;
+        while !build.step(mesh, budget).unwrap() {
+            steps += 1;
+        }
+        assert!(build.is_done());
+        (build.finish().unwrap(), steps)
+    }
+
+    #[test]
+    fn stepped_build_matches_one_call() {
+        for quality in [Quality::Sah, Quality::Fast] {
+            for (n, leaf) in [(3, 1), (40, 4), (90, 8)] {
+                let mesh = wavy(n);
+                let opts = BuildOptions {
+                    quality,
+                    max_leaf_size: leaf,
+                    treelet_size: 64,
+                    ..Default::default()
+                };
+                let want = fingerprint(&Bvh::build(&mesh, &opts).unwrap());
+                for budget in [1, 50, 3000, usize::MAX] {
+                    let (got, steps) = stepped(&mesh, &opts, budget);
+                    got.validate(&mesh).unwrap();
+                    assert!(
+                        fingerprint(&got) == want,
+                        "{quality:?} n={n} budget {budget}"
+                    );
+                    if budget == 1 && n == 90 {
+                        assert!(steps > 1000, "{steps}");
+                    }
+                }
+            }
+        }
+        // Empty and single-triangle meshes.
+        for mesh in [Mesh::new(), grid(1)] {
+            let opts = BuildOptions::default();
+            let want = fingerprint(&Bvh::build(&mesh, &opts).unwrap());
+            assert!(fingerprint(&stepped(&mesh, &opts, 1).0) == want);
+        }
+    }
+
+    #[test]
+    fn stepped_build_bit_identical_in_parallel() {
+        use fast_mesh_store::par;
+        // Large enough for chunked reductions and parallel parts.
+        let mesh = wavy(260);
+        for quality in [Quality::Sah, Quality::Fast] {
+            let opts = BuildOptions {
+                quality,
+                ..Default::default()
+            };
+            par::set_force_sequential(true);
+            let want = fingerprint(&Bvh::build(&mesh, &opts).unwrap());
+            par::set_force_sequential(false);
+            assert!(fingerprint(&Bvh::build(&mesh, &opts).unwrap()) == want);
+            for budget in [5_000, 20_000, 300_000, usize::MAX] {
+                for k in [1, 8] {
+                    let got =
+                        par::with_threads(k, || fingerprint(&stepped(&mesh, &opts, budget).0));
+                    assert!(got == want, "{quality:?} budget {budget}, {k} threads");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stepped_build_refuses_another_state() {
+        let mut mesh = wavy(10);
+        let mut build = BvhBuild::new(&mesh, &BuildOptions::default()).unwrap();
+        assert!(!build.step(&mesh, 5).unwrap());
+        let mut tx = mesh.begin_edit();
+        tx.set_positions(&[0], &[[0.0, 0.0, 9.0]]).unwrap();
+        tx.commit().unwrap();
+        assert!(!build.is_for(&mesh));
+        assert!(matches!(
+            build.step(&mesh, 5),
+            Err(BvhError::InvalidOptions(_))
+        ));
+        assert!(build.finish().is_none());
+        let bad = BuildOptions {
+            max_leaf_size: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            BvhBuild::new(&mesh, &bad),
+            Err(BvhError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn stepped_build_refuses_a_grown_mesh_after_undo() {
+        let mut mesh = wavy(10);
+        let mut build = BvhBuild::new(&mesh, &BuildOptions::default()).unwrap();
+        assert!(!build.step(&mesh, 5).unwrap());
+        let revision = mesh.revision();
+        let mut tx = mesh.begin_edit();
+        let vs = tx
+            .add_vertices(&[[20.0, 20.0, 0.0], [21.0, 20.0, 0.0], [20.0, 21.0, 0.0]])
+            .unwrap();
+        tx.add_triangles(&[[vs[0], vs[1], vs[2]]]).unwrap();
+        let patch = tx.commit().unwrap();
+        patch.revert(&mut mesh).unwrap();
+        assert_eq!(mesh.revision(), revision);
+        assert!(!build.is_for(&mesh));
+        assert!(matches!(
+            build.step(&mesh, 5),
+            Err(BvhError::InvalidOptions(_))
+        ));
     }
 }

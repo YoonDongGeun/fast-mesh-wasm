@@ -383,7 +383,7 @@ Results for `pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m`
 | Round trip, `addMesh` to result applied | 1.14 s | 12.7 s (run 2: 12.2) |
 
 - **The spec's target (§6: under 16 ms per message) is met at 1M and missed at 10M, but not by a message.** No message handler takes more than 0.32 ms at either size. The longest block is the synchronous `addMesh()` call itself. A separate measurement of its parts with the same operations in plain Node (median of 5) gives, at 1M: `Float64Array.from(positions)` 1.6 ms, `Uint32Array.from(indices)` 2.3 ms, the box-centre scan 4.7 ms; at 10M: 16.8 ms, 16.6 ms and 33.7 ms. Passing `origin` skips the scan (about half of it); the copies are needed because the buffers are transferred.
-- **The Worker is busy for the whole add**: 1.1 s at 1M and 12 s at 10M in one Rust call, which cannot be interrupted. A request sent meanwhile (a toggle, a drag) waits behind it; the page stays responsive.
+- **The Worker is busy for the whole add**: 1.1 s at 1M and 12 s at 10M in one Rust call, which cannot be interrupted. A request sent meanwhile (a toggle, a drag) waits behind it; the page stays responsive. (Since issue #48 a mesh of 65,536 triangles or more is built in the background, and such a request no longer waits: see "Chunked long calls".)
 - The app's own full copy of a new mesh (4 ms at 1M, 34 to 53 ms at 10M) happens in its `commitFrame()` listener, outside the library; an adapter that uploads a new 10M mesh in one frame pays this whatever the scene runs on.
 
 ### Colouring toggle: round trip
@@ -417,7 +417,7 @@ The drag of the core section through the Worker scene: per frame `drag.move(pose
 
 ### The longest single requests
 
-The Worker blocks for the whole of one request (ruling 10.1-6: no Rust-side chunking in 9a). The two cases the spec's chunking list names, on 1M meshes: a field recompute after one edit, and a section update over several meshes. A third mesh C (another 1M tile beside the pair) carries no field. Each edit moves one vertex in the contact area (`edit` with `setPositions`), 10 edits per row; the section rows change the plane 16 times.
+The Worker blocks for the whole of one request (ruling 10.1-6: no Rust-side chunking in 9a; since issue #48 the field work runs in steps, see "Chunked long calls"). The two cases the spec's chunking list names, on 1M meshes: a field recompute after one edit, and a section update over several meshes. A third mesh C (another 1M tile beside the pair) carries no field. Each edit moves one vertex in the contact area (`edit` with `setPositions`), 10 edits per row; the section rows change the plane 16 times.
 
 | | Longest Worker block, median (p95) |
 | --- | --- |
@@ -538,7 +538,7 @@ The lock-step Worker blocks of the previous run (the same code without the drag-
 - **The latest pose wins, with a starvation guard.** During a continuous drag each recompute takes longer than a frame, so a newer move is queued at every step boundary and the recompute is dropped, until 200 ms have passed since the last completed one. The recompute under way then finishes and is shown, and the newest queued move (the older ones are superseded at once) starts the next. So the colours update about every 200 ms plus one recompute (252 ms and 851 ms at 1M), each update the exact colours of one pose. At 10M a recompute alone outlasts the guard, so almost none is dropped (one, by the drag's end) and the colours update once per recompute. When the drag ends, its end drops a recompute kept for an older pose, so the last pose's colours arrive within about one recompute plus the step or unit opening under way: 133 ms and 635 ms at 1M, 1.06 s and 9.89 s at 10M (lock-step recomputes 71 ms, 635 ms, 631 ms and 6.68 s; at 10M on the native terrain that is about 1.5 recomputes, and the extra time is not profiled). A pointer that pauses without ending the drag may wait up to two recomputes, as the kept one finishes first (previous run: 818 ms at 1M and 12.4 s at 10M on the native terrain). The batches waiting for a result are the moves sent during one recompute (up to 477 during a 7 s 10M recompute at 60 Hz); they are answered at once when it ends, and the main thread pays about 0.05 ms per frame.
 - **Before the guard** (Task 5, `01dd3d9`), no pose finished during a continuous drag (1 of 600 recoloured at 1M) and the last arrived one recompute after the pointer stopped (81 ms and 683 ms at 1M, 0.96 s and 6.64 s at 10M).
 - **Before part A** the same 1M 9a-terrain drag took 402 ms per move in the Worker (one Rust call, up to 741 ms); it now takes 72 ms (the 64-pose lock-step drag of the Worker scene section, re-run: median 71.9 ms, p95 80.0, longest Worker block 75.8 ms). The one-vertex edit of A with 4 fields (the longest single requests) went from 348 to 249 ms.
-- **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.5 to 0.65 s at 10M (up to 1.0 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it.
+- **The longest Worker block is opening a unit**: about 60 ms at 1M and 0.5 to 0.65 s at 10M (up to 1.0 s seen during the continuous 10M drag). A request sent meanwhile waits that long; part B's threads shorten it. (Since issue #48 the open is stepped too: about 4 ms, every step under about 15 ms at 1M; see "Chunked long calls".)
 - **The engine's yield.** The engine yields with `setImmediate` where there is one (Node) and with a `MessageChannel` tick in browsers. In a Node `worker_threads` Worker a chain of `MessageChannel` ticks after chunks of 1 ms or more lets no `parentPort` message in (measured: none of about 60 messages sent at 60 Hz over 1 s of 1 ms or 4 ms chunks, while `setImmediate` let all of them in), so no recompute could be dropped there. The Task 5 table was measured with a `setImmediate` stand-in in the bench harness; the engine now does this itself and the harness no longer patches it. A browser Worker (headless Chrome 155, both examples' Vite builds) admits a message sent a third of the way into a 227 ms recompute: the recompute is dropped and its result posted 83 ms after it started. The Worker scene tables above this section were measured before the change; the Task 5 re-run with a `setImmediate` tick gave the same numbers within about 10% (1M contact drag 1.90 ms, 10M contact drag 30.9 ms, many small requests 3.97 ms).
 
 ## Threaded Worker (drag-speed part B)
@@ -573,6 +573,87 @@ The wide-range drag of the section above, in a Worker scene on a cross-origin is
 - **Browser against Node, single-threaded.** At 1M the browser's single-threaded numbers match the Node `worker_threads` table above (lock step 60.5 against 70.9 ms and 623 against 635 ms; interval 252 and 792 against 252 and 851 ms). At 10M the browser is slower: 907 ms against 631 ms and 10.3 s against 6.68 s per lock-step pose. That gap is not profiled; the threaded numbers are compared only with the single-threaded ones of the same browser run.
 - **Memory.** The threaded engine's shared memory starts at 18 pages (1.1 MiB, about 18 MB once the pool's thread stacks are allocated) and may grow to 65,536 pages (4 GiB). It held about 12 to 20% more after set-up than the single-threaded engine here (the pool's per-thread state and allocation); 10M fits.
 - **Indicative, other browsers** (Task 3's check, the 1M 9a lock step only, longest Worker block per pose, 1 thread → 8): Firefox 157 63.4 → 22.4 ms, Playwright WebKit 27.2 on Windows 49.5 → 21.8 ms. These were not re-run here.
+
+## Chunked long calls (issue #48)
+
+The Worker used to block for the whole of one engine call. Now the field work, the sign data and the near search run in budgeted steps: a field build, the recompute after an edit, and the wide drag's unit open. A large `addMesh` is built in the background. The Worker yields between steps every 4 ms, as before. Results are bit-identical, which the twin tests check.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, Node 24.13.0. Release builds of `main` (`ae40f1d`) and of the branch. The Worker is single-threaded, in the `worker_threads` harness of the Worker scene section.
+- **Date:** 2026-10-24. Each pair of "main" and "now" columns was run back to back in the same session, unless a row says otherwise. Other agents shared the machine during the earlier 10M runs (see the note there).
+- **Commands:**
+  - `pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued`, with `--10m --no-1m` for the 10M case.
+  - `-- --worker --contact` for the contact drag.
+  - `-- --worker --wide` for the wide drag.
+  - For "main", the same bench script runs against main's `dist/`.
+
+### A toggle queued behind a long request
+
+The bench sends a frame with the long request, then at once a frame with a colouring toggle of a small, unrelated pair (60 × 60 terrains). The Worker receives the toggle while it is working on the long request.
+
+- The long requests run on two 1M terrains (B flipped over A): a contact field build (B to A, `maxDistance` 0.08) and a wide one (A to B, `maxDistance` 8).
+- The edit moves one vertex of A, with fields A to B and B to A, so A's sign data are rebuilt.
+- The add is a third 1M terrain.
+- Each row is the median of 5 runs at 1M, and of 2 at 10M.
+
+| 1M triangles | Longest Worker block: main → now | Long request's round trip: main → now | Toggle's round trip: main → now |
+| --- | --- | --- | --- |
+| Contact field build | 118 → **5.6 ms** | 118 → 118 ms | 118 → 118 ms |
+| Wide field build | 115 → **5.9 ms** | 115 → 115 ms | 115 → 115 ms |
+| One-vertex edit, fields both ways | 96.5 → **5.3 ms** | 96.5 → 97.6 ms | 96.5 → 97.6 ms |
+| `addMesh` | 1,177 → **20.5 ms** | 1,178 → 6.6 ms; mesh ready 1,178 → 1,140 ms | 1,178 → **8.2 ms** |
+
+| 10M triangles | Longest Worker block: main → now | Long request's round trip: main → now | Toggle's round trip: main → now |
+| --- | --- | --- | --- |
+| Contact field build | 3,356 → **18.2 ms** | 3,356 → 2,361 ms | 3,356 → 2,361 ms |
+| Wide field build | 2,374 → **17.7 ms** | 2,375 → 1,144 ms | 2,375 → 1,144 ms |
+| One-vertex edit, fields both ways | 1,357 → **14.2 ms** | 1,358 → 1,102 ms | 1,358 → 1,102 ms |
+| `addMesh` | 16,088 → **136 ms** | 16,088 → 69 ms; mesh ready 16,088 → 12,245 ms | 16,088 → **71 ms** |
+
+- **The Worker is never blocked for long now.** At 1M the longest block during a field build or an edit is one step, about 5 to 6 ms, against 0.1 s. At 10M it is 14 to 18 ms, against 1.4 to 3.4 s. Batches sent meanwhile are received at once, and superseded ones are coalesced. A field build for a display that is already superseded is dropped at the next step boundary, as 9a dropped it before it started.
+- **A toggle still waits for a field build or an edit.** Requests run in order, and other requests wait for a field recompute (§6.1 of the drag-speed design). So its round trip is the long request's, about the same as before at 1M. The total work is unchanged within noise at 1M. The 10M rows are faster now, but main's 10M run was earlier in the session, while other agents were busy on the machine, so read them as an upper bound for main.
+- **A toggle no longer waits for an `addMesh`.**
+  - A mesh of 65,536 triangles or more is built in the background: steps of the BVH build run between other requests and while the Worker is idle.
+  - The toggle is answered in 8 ms at 1M (main: 1.18 s) and 71 ms at 10M (main: 16 s). At 10M, 69 ms of that is the add's own batch: the copy of the 10M inputs into wasm and the mesh's store, which come before the build.
+  - The mesh lands about as soon as before (1.14 s at 1M).
+  - The longest block is the landing: the insert, the normals, the render buffers and packing the whole new mesh into its result. That is 20 ms at 1M and 136 ms at 10M, O(n) copies that stay in one piece.
+
+### No regression on the drags
+
+| 1M, median | Main | Now |
+| --- | --- | --- |
+| Contact drag (64 poses, `maxDistance` 0.08), move to colours applied | 1.97 ms (p95 4.19) | 2.02 ms (p95 4.36) |
+| Contact drag, longest Worker block | 5.55 ms | 5.75 ms |
+| Colouring toggle on / off, round trip | 1.05 / 0.12 ms | 1.08 / 0.14 ms |
+| Wide drag, 9a terrain, lock step: move to colours | 78.8 ms | 77.4 ms |
+| Wide drag, 9a terrain: longest Worker block per pose | 58.0 ms | **11.8 ms** |
+| Wide drag, native terrain, lock step: move to colours | 655 ms | 637 ms |
+| Wide drag, native terrain: longest Worker block per pose | 62.5 ms | **12.7 ms** |
+| Continuous 60 Hz wide drag, 9a terrain: update interval / release to colours | 256 / 138 ms | 269 / 91 ms |
+| Continuous 60 Hz wide drag, native terrain: update interval / release to colours | 801 / 653 ms | 824 / 654 ms |
+| Continuous wide drag: longest Worker block (9a / native) | 71.6 / 105 ms | 23.6 / 17.9 ms |
+
+- **The contact path is unchanged within noise.** It stays on the near search, now stepped: 2.02 against 1.97 ms per pose.
+- **The wide drag's unit open is no longer one call.** The first step of a recompute takes about 4 ms (main: 58 to 62 ms, all of it the open), and every later step is under about 15 ms. A recompute takes the same time as before.
+
+### Native steps
+
+Each step was timed with `Points(4096)`, native, single-threaded, on the scene crate's terrain pair (B flipped 7.9 above A). The scratch profile is not committed.
+
+| | 1M: total, longest step | 10M: total, longest step |
+| --- | --- | --- |
+| Contact field build (adjacency, incidence, sign data, near search, values) | 252 ms, 4.6 ms (one call: 230 ms) | 2.6 s, 20 to 24 ms |
+| One-vertex edit, fields both ways (sign data rebuilt) | 152 ms, 4.5 ms (one call: 135 ms) | 1.7 s, 26 ms |
+| Wide field build | 585 ms, 5.8 ms (one call: 590 ms) | 7.0 s, 23 ms |
+| Wide recompute after a move | 470 ms, 6 to 7 ms (one call: 470 ms) | 5.7 s, up to 39 ms (one near-search part) |
+| BVH build (`BvhBuild`, 100,000 units a step) | 408 ms, 4.5 ms (`Bvh::build`: 412 ms) | |
+| BVH build with the `parallel` feature (20 threads) | 315 ms, 10 ms (`Bvh::build`: 80 ms) | |
+
+- **Stepping adds 0 to 12% natively.** The sign data passes cost the same in steps, apart from the per-step overhead.
+- **A stepped BVH build with threads is about four times slower than the one-call parallel build.** It is still faster than single-threaded. A step builds small subtrees in parallel and large ones in parts, but splits the large nodes in between one at a time. The Worker uses it only for background adds, where the total matters less than not blocking.
+- **The longest single pieces at 10M:**
+  - a near-search part where the surfaces intersect over a wide area (each part is bounded to 2^18 triangle pairs);
+  - the transitions between sign data passes;
+  - the finish of a full field, and its apply, which now runs in a step of its own.
 
 ## Parallel (the `parallel` feature)
 
@@ -693,6 +774,7 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run, --wide for just the wide-range drag)
+pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue #48: a toggle queued behind a field build, an edit and an addMesh (1M; --10m adds 10M, --no-1m skips 1M); --contact for just the 1M contact toggle and drag
 pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
