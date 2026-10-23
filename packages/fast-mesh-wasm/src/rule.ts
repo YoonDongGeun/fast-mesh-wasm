@@ -67,24 +67,29 @@ export function encodeRule(rule: ColorRule): { map: number; values: Float32Array
 }
 
 /**
- * A deep copy of a colour rule (the field handle kept): its range and
- * colours, and a custom map's stops with their colours, so later changes to
- * the caller's object do not leak in. Copies what it is given; the engine
- * checks it.
+ * A deep, frozen copy of a colour rule (the field handle kept, not frozen):
+ * its range and colours, and a custom map's stops with their colours, so
+ * later changes to the caller's object do not leak in and callers of
+ * `coloring()` cannot change it. Colours given as typed arrays become plain
+ * arrays (a typed array cannot be frozen). Copies what it is given; the
+ * engine checks it.
  */
 export function copyRule(rule: ColorRule): ColorRule {
+  const frozen = (x: unknown): unknown =>
+    Array.isArray(x) || ArrayBuffer.isView(x) ? Object.freeze(Array.from(x as ArrayLike<unknown>)) : x;
   const copy = { ...rule } as Record<string, unknown>;
   for (const [k, v] of Object.entries(copy)) {
-    if (Array.isArray(v)) {
-      copy[k] = [...v];
-    } else if (ArrayBuffer.isView(v)) {
-      copy[k] = (v as unknown as { slice(): unknown }).slice();
+    if (k !== "field") {
+      copy[k] = frozen(v);
     }
   }
   const stops = (rule.map as { stops?: unknown } | null)?.stops;
   if (Array.isArray(stops)) {
-    const copyColor = (x: unknown) => (Array.isArray(x) || ArrayBuffer.isView(x) ? Array.from(x as ArrayLike<number>) : x);
-    copy.map = { stops: stops.map((stop: unknown) => (Array.isArray(stop) ? stop.map(copyColor) : stop)) };
+    copy.map = Object.freeze({
+      stops: Object.freeze(
+        stops.map((stop: unknown) => (Array.isArray(stop) ? Object.freeze(stop.map(frozen)) : stop)),
+      ),
+    });
   }
-  return copy as unknown as ColorRule;
+  return Object.freeze(copy) as unknown as ColorRule;
 }

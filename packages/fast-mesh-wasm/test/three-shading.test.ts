@@ -421,14 +421,19 @@ describe("bindMesh fragment shading", () => {
       material.onBeforeCompile(shader as never, undefined as never);
       return shader;
     };
+    material.vertexColors = true;
     const first = bindMesh(s, m, { material, shading: "fragment", edgeSoftness: 0.1 });
     // Patching drops any program compiled before, so three recompiles.
     expect(disposed).toBe(1);
+    // The shading colours the fragments: no vertex colours while patched.
+    expect(material.vertexColors).toBe(false);
     expect(compiled().uniforms.fmSoftness.value).toBe(0.1);
     // One material, one fragment-shaded binding.
     expect(() => bindMesh(s, m, { material, shading: "fragment" })).toThrow(/material.clone/);
     first.dispose();
     expect(disposed).toBe(2);
+    expect(material.vertexColors).toBe(true);
+    material.vertexColors = false;
     const second = bindMesh(s, m, { material, shading: "fragment", edgeSoftness: 0.3 });
     expect(disposed).toBe(3);
     const shader = compiled();

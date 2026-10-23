@@ -268,6 +268,12 @@ describe("Scene", () => {
     expect(shown.range).toEqual([0, 2]);
     expect((shown.map as { stops: readonly (readonly [number, readonly number[]])[] }).stops[0][1]).toEqual([255, 0, 0, 255]);
     expect(shown.field).toBe(field);
+    // Frozen, deep (the field handle aside), and the same object on every read.
+    const stops = (shown.map as { stops: readonly (readonly [number, readonly number[]])[] }).stops;
+    for (const part of [shown, shown.range, shown.map, stops, stops[0], stops[0][1]]) {
+      expect(Object.isFrozen(part)).toBe(true);
+    }
+    expect(s.coloring(a)).toBe(shown);
     s.removeField(field);
     expect(s.coloring(a)).toBeNull();
   });

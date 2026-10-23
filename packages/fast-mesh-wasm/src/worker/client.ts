@@ -1486,8 +1486,9 @@ export class WorkerScene implements SceneLike {
   }
 
   /**
-   * The rule the mirrored colours and values are made by (a copy of the one
-   * given to `setColoring`), or `null` without colouring. It follows the
+   * The rule the mirrored colours and values are made by (a frozen copy of
+   * the one given to `setColoring`, the same object until another rule is
+   * applied), or `null` without colouring. It follows the
    * results: a new rule shows with the batch that applies it, a rejected one
    * never, and a removed field's colouring goes when the removal is applied.
    */

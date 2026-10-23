@@ -631,12 +631,17 @@ function patchable(material: Material): boolean {
  * Adds the fragment shading to a material's shaders (`onBeforeCompile`, after
  * any handler it had) under its own program cache key, and disposes the
  * material's compiled program so the next render compiles it with these
- * uniforms. Returns the function that puts the material's handler and key
- * back (disposing the program again).
+ * uniforms; turns its `vertexColors` off meanwhile. Returns the function
+ * that puts the material's handler, key and `vertexColors` back (disposing
+ * the program again).
  */
 function patchMaterial(material: Material, uniforms: ShadingUniforms): () => void {
   const before = material.onBeforeCompile;
   const key = material.customProgramCacheKey;
+  // The shading colours each fragment from its value: vertex colours (an
+  // attribute the binding may not even keep) would multiply in on top.
+  const vertexColors = material.vertexColors;
+  material.vertexColors = false;
   let warned = false;
   const hook = (source: string, chunk: string, add: string): string => {
     if (!source.includes(chunk)) {
@@ -673,6 +678,7 @@ function patchMaterial(material: Material, uniforms: ShadingUniforms): () => voi
   return () => {
     material.onBeforeCompile = before;
     material.customProgramCacheKey = key;
+    material.vertexColors = vertexColors;
     patched.delete(material);
     material.dispose();
     material.needsUpdate = true;

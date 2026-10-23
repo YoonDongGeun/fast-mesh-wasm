@@ -245,6 +245,8 @@ interface Fixture {
   colorings(): number;
   /** The values of a field added straight to the scene (on `a`, to `b`), then removed. */
   freshValues(a: MeshHandle, b: MeshHandle | MeshHandle[], maxDistance: number): Promise<Float32Array>;
+  /** The nearest-target indices of the field behind the mesh's applied colouring. */
+  nearest(mesh: MeshHandle): Promise<Uint32Array>;
 }
 
 async function makeLocal(): Promise<Fixture> {
@@ -266,6 +268,7 @@ async function makeLocal(): Promise<Fixture> {
       scene.removeField(field);
       return values;
     },
+    nearest: async (mesh) => scene.fieldNearest(scene.coloring(mesh)!.field),
   };
 }
 
@@ -295,6 +298,11 @@ async function makeWorker(): Promise<Fixture> {
       scene.removeField(field);
       scene.commitFrame();
       return values;
+    },
+    nearest: async (mesh) => {
+      const p = scene.fetchFieldNearest(scene.coloring(mesh)!.field);
+      scene.commitFrame();
+      return p;
     },
   };
 }
@@ -395,6 +403,38 @@ describe.each([
     await settle(store);
     await expect(store.fetchColoringValues(a)).resolves.toBeNull();
     await expect(store.fetchColoringValues(c)).resolves.toBeNull();
+  });
+
+  it("coloring_targets_give_the_nearest_order", async () => {
+    const f = await make();
+    const { store } = f;
+    const { a, b, c } = nested(store);
+    await settle(store);
+    expect(store.coloringTargets(a)).toBeNull();
+    // Members listed out of id order: a's partners are c and b as listed,
+    // but its field's targets (what `nearest` indexes) are in id order.
+    const heat = contactHeatmap({ depth: 0.5, gap: 1, exactDepth: true });
+    store.setContactGroup("g", { meshes: [c, a, b], coloring: heat });
+    await settle(store);
+    const targets = store.coloringTargets(a);
+    expect(targets).toEqual([b, c]);
+    expect(Object.isFrozen(targets)).toBe(true);
+    // a's vertex 0 is 1 deep inside b; every vertex of c is nearest to b.
+    expect(targets![(await f.nearest(a))[0]]).toBe(b);
+    const ofC = store.coloringTargets(c)!;
+    expect(ofC).toEqual([a, b]);
+    const nearC = await f.nearest(c);
+    expect(Array.from(nearC).every((k) => ofC[k] === b)).toBe(true);
+    // A single target, and none once the colouring is off.
+    store.setContactGroup("g", null);
+    store.setDisplay(a, { coloring: { distanceTo: b, ...heat } });
+    await settle(store);
+    expect(store.coloringTargets(a)).toEqual([b]);
+    store.setDisplay(a, { coloring: null });
+    await settle(store);
+    expect(store.coloringTargets(a)).toBeNull();
+    store.removeMesh(c);
+    expect(() => store.coloringTargets(c)).toThrow(expect.objectContaining({ code: "UNKNOWN_MESH" }));
   });
 
   it("exact_depth_colours_deep_interior", async () => {

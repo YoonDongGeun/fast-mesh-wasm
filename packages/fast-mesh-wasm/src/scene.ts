@@ -1737,8 +1737,9 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * The rule the mesh is coloured by (a copy of the one given to {@link Scene.setColoring}),
-   * or `null` without colouring (never set, turned off, or its field removed).
+   * The rule the mesh is coloured by (a frozen copy of the one given to
+   * {@link Scene.setColoring}, the same object on every read), or `null`
+   * without colouring (never set, turned off, or its field removed).
    *
    * @throws `UNKNOWN_MESH`.
    */

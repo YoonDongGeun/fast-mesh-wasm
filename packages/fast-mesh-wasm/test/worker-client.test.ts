@@ -308,6 +308,8 @@ describe("WorkerScene", () => {
 
     // A rejected rule leaves the shown one.
     const before = scene.coloring(a);
+    expect(Object.isFrozen(before)).toBe(true);
+    expect(Object.isFrozen(before?.range)).toBe(true);
     scene.setColoring(a, { field: whole, map: "turbo", range: [1, 0] });
     await settle(scene);
     scene.commitFrame();

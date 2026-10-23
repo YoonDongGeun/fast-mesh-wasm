@@ -23,7 +23,7 @@ export interface ContactHeatmapOptions {
    * `true` computes every vertex's distance (`maxDistance: Infinity`), so any
    * penetration deeper than `depth` shows `deep`; every update recomputes the
    * whole field. `false` (the default) bounds the field at
-   * `2 · max(depth, gap)` (`FAST_BOUND_FACTOR`), the fast contact path:
+   * `2 · max(depth, gap)`, the fast contact path:
    * vertices beyond it are far and show the base colour, deep penetration
    * included. The bound sits past the range ends, so the values just beyond
    * the coloured area are still known and its outer edge is a value

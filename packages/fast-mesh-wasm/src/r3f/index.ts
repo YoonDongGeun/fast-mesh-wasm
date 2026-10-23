@@ -141,7 +141,8 @@ export interface FastMeshProps extends EventHandlers {
   /**
    * Fragment shading's edge softness in distance units (see
    * `BindMeshOptions.edgeSoftness`); 0 (the default) is a hard edge. Changing
-   * it never rebinds.
+   * it never rebinds. NaN, an infinite or a negative width draws as 0, with a
+   * console warning (`bindMesh` would throw).
    */
   edgeSoftness?: number;
   /**
@@ -166,6 +167,19 @@ export interface FastMeshProps extends EventHandlers {
  *
  * @throws `INVALID_ARGUMENT` without a `store` outside a `SceneProvider`.
  */
+/**
+ * `width` when it is a finite number `>= 0` (what `setEdgeSoftness` takes),
+ * else 0 with a warning: a bad prop (a slider's NaN, say) draws hard edges
+ * rather than throwing inside the canvas.
+ */
+function usableSoftness(width: number): number {
+  if (typeof width === "number" && Number.isFinite(width) && width >= 0) {
+    return width;
+  }
+  console.warn(`fast-mesh-wasm: <FastMesh edgeSoftness={${String(width)}}> is not a finite number >= 0; using 0.`);
+  return 0;
+}
+
 export function FastMesh(props: FastMeshProps): JSX.Element {
   const body = createElement(FastMeshBody, props);
   return props.store === undefined ? body : createElement(SceneProvider, { store: props.store }, body);
@@ -183,8 +197,9 @@ function FastMeshBody(props: FastMeshProps): ReactElement | null {
   const onBindRef = useRef(onBind);
   onBindRef.current = onBind;
   // The latest softness, read when binding: a new one is set, never rebinds.
-  const softnessRef = useRef(edgeSoftness);
-  softnessRef.current = edgeSoftness;
+  const softness = usableSoftness(edgeSoftness);
+  const softnessRef = useRef(softness);
+  softnessRef.current = softness;
 
   useLayoutEffect(() => {
     if (!present) {
@@ -217,8 +232,8 @@ function FastMeshBody(props: FastMeshProps): ReactElement | null {
   }, [store, mesh, present, material, colorKey, shading]);
 
   useLayoutEffect(() => {
-    bound?.setEdgeSoftness(edgeSoftness);
-  }, [bound, edgeSoftness]);
+    bound?.setEdgeSoftness(softness);
+  }, [bound, softness]);
 
   if (bound === null) {
     return null;
