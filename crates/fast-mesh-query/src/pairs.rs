@@ -1131,6 +1131,8 @@ struct Stamp {
     epoch: u32,
     revision: u64,
     generation: u64,
+    /// An undo brings the revision back but keeps slots it added.
+    triangle_slots: usize,
 }
 
 impl Stamp {
@@ -1140,6 +1142,7 @@ impl Stamp {
             epoch: mesh.epoch(),
             revision: mesh.revision(),
             generation: bvh.generation(),
+            triangle_slots: mesh.triangle_slots(),
         }
     }
 }

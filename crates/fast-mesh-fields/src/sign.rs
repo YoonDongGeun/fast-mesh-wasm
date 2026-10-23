@@ -425,6 +425,9 @@ enum Stage {
 #[derive(Debug)]
 pub struct SignBuild {
     data: SignData,
+    /// The mesh's vertex and triangle slots: an undo brings the revision
+    /// back but keeps slots it added.
+    slots: (usize, usize),
     requested: SignMode,
     stage: Stage,
     adjacency: AdjacencyBuild,
@@ -467,6 +470,7 @@ impl SignBuild {
                 candidates: Vec::new(),
                 moments: Moments::default(),
             },
+            slots: (mesh.vertex_slots(), mesh.triangle_slots()),
             requested: mode,
             stage: Stage::Adjacency,
             adjacency: AdjacencyBuild::new(mesh),
@@ -477,9 +481,10 @@ impl SignBuild {
     }
 
     /// Whether the build started from `mesh` and `bvh` as they are now (see
-    /// [`SignData::is_current`]).
+    /// [`SignData::is_current`]), with the same slot counts.
     pub fn is_for(&self, mesh: &Mesh, bvh: &Bvh) -> bool {
         self.data.is_current(mesh, bvh)
+            && self.slots == (mesh.vertex_slots(), mesh.triangle_slots())
     }
 
     /// Whether every pass is done.

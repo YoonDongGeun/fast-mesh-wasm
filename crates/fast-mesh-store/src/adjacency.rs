@@ -138,14 +138,17 @@ enum Pass {
 ///
 /// Each step runs the same loop bodies as the one-call build, over the next
 /// elements in the same order, so the finished table is the same, entry for
-/// entry. A build is tied to the mesh state it started from (its uid, epoch
-/// and revision); [`Mesh::step_adjacency`] starts over when the mesh has
+/// entry. A build is tied to the mesh state it started from (its uid, epoch,
+/// revision and slot counts); [`Mesh::step_adjacency`] starts over when the mesh has
 /// changed since, and caches the table when the build is done.
 #[derive(Debug)]
 pub struct AdjacencyBuild {
     uid: u64,
     epoch: u32,
     revision: u64,
+    /// The slot counts: an undo brings the revision back but keeps slots
+    /// it added, so the revision alone does not tell the state.
+    slots: (usize, usize),
     pass: Pass,
     offsets: Vec<u32>,
     incident: Vec<u32>,
@@ -164,6 +167,7 @@ impl AdjacencyBuild {
             uid: mesh.uid(),
             epoch: mesh.epoch(),
             revision: mesh.revision(),
+            slots: (mesh.vertex_slots(), mesh.triangle_slots()),
             pass: Pass::Count(0),
             offsets: Vec::new(),
             incident: Vec::new(),
@@ -181,7 +185,10 @@ impl AdjacencyBuild {
 
     /// Whether the build started from `mesh` as it is now.
     pub fn is_for(&self, mesh: &Mesh) -> bool {
-        self.uid == mesh.uid() && self.epoch == mesh.epoch() && self.revision == mesh.revision()
+        self.uid == mesh.uid()
+            && self.epoch == mesh.epoch()
+            && self.revision == mesh.revision()
+            && self.slots == (mesh.vertex_slots(), mesh.triangle_slots())
     }
 
     /// Whether every pass is done.
@@ -704,6 +711,38 @@ pub(crate) mod tests {
         assert!(failed, "some pass allocates");
         assert!(m.adjacency().is_none());
         while !m.step_adjacency(&mut build, 64).unwrap() {}
+        let got = table(m.adjacency().unwrap());
+        m.adjacency = None;
+        m.ensure_adjacency().unwrap();
+        assert_eq!(got, table(m.adjacency().unwrap()));
+    }
+
+    /// Edits `m` by adding three vertices and a triangle, then undoes it:
+    /// the revision is back to what it was, but the slots grew.
+    pub(crate) fn grow_and_undo(m: &mut Mesh) {
+        let mut tx = m.begin_edit();
+        let vs = tx
+            .add_vertices(&[[20.0, 20.0, 0.0], [21.0, 20.0, 0.0], [20.0, 21.0, 0.0]])
+            .unwrap();
+        tx.add_triangles(&[[vs[0], vs[1], vs[2]]]).unwrap();
+        let patch = tx.commit().unwrap();
+        patch.revert(m).unwrap();
+    }
+
+    #[test]
+    fn stepped_build_starts_over_after_edit_and_undo() {
+        // Undo brings the revision back while the slots stay grown: the
+        // build must not take the mesh for the one it started from.
+        let mut m = mixed();
+        let mut build = AdjacencyBuild::new(&m);
+        for _ in 0..(m.triangle_slots() + 3) {
+            m.step_adjacency(&mut build, 1).unwrap();
+        }
+        let revision = m.revision();
+        grow_and_undo(&mut m);
+        assert_eq!(m.revision(), revision);
+        assert!(!build.is_for(&m));
+        while !m.step_adjacency(&mut build, 1000).unwrap() {}
         let got = table(m.adjacency().unwrap());
         m.adjacency = None;
         m.ensure_adjacency().unwrap();

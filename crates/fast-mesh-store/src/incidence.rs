@@ -156,14 +156,17 @@ enum Pass {
 ///
 /// Each step runs the same loop bodies as the one-call build, over the next
 /// elements in the same order, so the finished index is the same, entry for
-/// entry. A build is tied to the mesh state it started from (its uid, epoch
-/// and revision); [`Mesh::step_incidence`] starts over when the mesh has
+/// entry. A build is tied to the mesh state it started from (its uid, epoch,
+/// revision and slot counts); [`Mesh::step_incidence`] starts over when the mesh has
 /// changed since, and caches the index when the build is done.
 #[derive(Debug)]
 pub struct IncidenceBuild {
     uid: u64,
     epoch: u32,
     revision: u64,
+    /// The slot counts: an undo brings the revision back but keeps slots
+    /// it added, so the revision alone does not tell the state.
+    slots: (usize, usize),
     pass: Pass,
     offsets: Vec<u32>,
     triangles: Vec<TriangleId>,
@@ -178,6 +181,7 @@ impl IncidenceBuild {
             uid: mesh.uid(),
             epoch: mesh.epoch(),
             revision: mesh.revision(),
+            slots: (mesh.vertex_slots(), mesh.triangle_slots()),
             pass: Pass::Count(0),
             offsets: Vec::new(),
             triangles: Vec::new(),
@@ -187,7 +191,10 @@ impl IncidenceBuild {
 
     /// Whether the build started from `mesh` as it is now.
     pub fn is_for(&self, mesh: &Mesh) -> bool {
-        self.uid == mesh.uid() && self.epoch == mesh.epoch() && self.revision == mesh.revision()
+        self.uid == mesh.uid()
+            && self.epoch == mesh.epoch()
+            && self.revision == mesh.revision()
+            && self.slots == (mesh.vertex_slots(), mesh.triangle_slots())
     }
 
     /// Whether every pass is done.
@@ -553,6 +560,20 @@ mod tests {
         tx.commit().unwrap();
         assert!(!build.is_for(&m));
         while !m.step_incidence(&mut build, 5).unwrap() {}
+        assert_matches(&m);
+    }
+
+    #[test]
+    fn stepped_build_starts_over_after_edit_and_undo() {
+        use crate::IncidenceBuild;
+        let mut m = crate::adjacency::tests::mixed();
+        let mut build = IncidenceBuild::new(&m);
+        for _ in 0..(m.triangle_slots() + 3) {
+            m.step_incidence(&mut build, 1).unwrap();
+        }
+        crate::adjacency::tests::grow_and_undo(&mut m);
+        assert!(!build.is_for(&m));
+        while !m.step_incidence(&mut build, 1000).unwrap() {}
         assert_matches(&m);
     }
 }

@@ -5100,4 +5100,51 @@ mod tests {
             Err(SceneError::UnknownField)
         );
     }
+
+    #[test]
+    fn sign_build_survives_edit_and_undo_of_a_manual_target() {
+        // A Manual target B: undo brings its revision back, its BVH is not
+        // updated (it reads current again) and its slots stay grown. A
+        // partial sign build of B must start over, not resume.
+        let make = || {
+            let mut scene = Scene::new(SceneOptions::default());
+            let a = scene
+                .add_mesh(sheet(10, 0.1), MeshOptions::default())
+                .unwrap();
+            let b = scene
+                .add_mesh(sheet(30, 1.0 / 30.0), with_mode(UpdateMode::Manual))
+                .unwrap();
+            scene.set_placement(b, at(0.0, 0.0, 0.05)).unwrap();
+            let f = scene
+                .add_distance_field_deferred(field("d", a, b, 0.2))
+                .unwrap();
+            scene.take_changes();
+            (scene, a, b, f)
+        };
+        let (mut scene, a, b, f) = make();
+        let (mut twin, ..) = make();
+        for _ in 0..3 {
+            assert_eq!(
+                scene.field_step_field(f, FieldBudget::Points(1)),
+                Ok(StepState::Pending)
+            );
+        }
+        assert_eq!(scene.field_step_stage(), Some(Stage::Sign(0)));
+        let grow = |s: &mut Scene| {
+            s.edit(b, |tx| {
+                let vs = tx.add_vertices(&[[5.0, 5.0, 0.0], [6.0, 5.0, 0.0], [5.0, 6.0, 0.0]])?;
+                tx.add_triangles(&[[vs[0], vs[1], vs[2]]])
+            })
+            .unwrap();
+            s.undo().unwrap();
+        };
+        grow(&mut scene);
+        grow(&mut twin);
+        while scene.field_step_field(f, FieldBudget::Points(1)).unwrap() != StepState::Idle {}
+        twin.update_fields().unwrap();
+        assert_eq!(seen(&mut scene, [a, b]).0, seen(&mut twin, [a, b]).0);
+        assert!(scene.field_status(f).unwrap().current);
+        let g = twin.field_id(f.raw()).unwrap();
+        assert_eq!(scene.field_target_status(f), twin.field_target_status(g));
+    }
 }

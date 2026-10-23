@@ -96,6 +96,9 @@ pub struct BvhBuild {
     mesh_uid: u64,
     epoch: u32,
     revision: u64,
+    /// The mesh's triangle slots: an undo brings the revision back but
+    /// keeps slots it added.
+    triangle_slots: usize,
 }
 
 impl std::fmt::Debug for BvhBuild {
@@ -129,6 +132,7 @@ impl BvhBuild {
             mesh_uid: mesh.uid(),
             epoch: mesh.epoch(),
             revision: mesh.revision(),
+            triangle_slots: mesh.triangle_slots(),
         })
     }
 
@@ -137,6 +141,7 @@ impl BvhBuild {
         self.mesh_uid == mesh.uid()
             && self.epoch == mesh.epoch()
             && self.revision == mesh.revision()
+            && self.triangle_slots == mesh.triangle_slots()
     }
 
     /// Whether the BVH is built.
@@ -1013,6 +1018,27 @@ mod tests {
         };
         assert!(matches!(
             BvhBuild::new(&mesh, &bad),
+            Err(BvhError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn stepped_build_refuses_a_grown_mesh_after_undo() {
+        let mut mesh = wavy(10);
+        let mut build = BvhBuild::new(&mesh, &BuildOptions::default()).unwrap();
+        assert!(!build.step(&mesh, 5).unwrap());
+        let revision = mesh.revision();
+        let mut tx = mesh.begin_edit();
+        let vs = tx
+            .add_vertices(&[[20.0, 20.0, 0.0], [21.0, 20.0, 0.0], [20.0, 21.0, 0.0]])
+            .unwrap();
+        tx.add_triangles(&[[vs[0], vs[1], vs[2]]]).unwrap();
+        let patch = tx.commit().unwrap();
+        patch.revert(&mut mesh).unwrap();
+        assert_eq!(mesh.revision(), revision);
+        assert!(!build.is_for(&mesh));
+        assert!(matches!(
+            build.step(&mesh, 5),
             Err(BvhError::InvalidOptions(_))
         ));
     }
