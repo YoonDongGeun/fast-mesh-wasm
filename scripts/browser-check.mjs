@@ -27,6 +27,13 @@
 //   with a new pool (threads > 1, it recolours, a drag back gives the first
 //   colours bit for bit); Chrome only: the old Worker and its pool are gone,
 //   and none is left after `terminate()`.
+// - probe (no verdict; runs first): the threaded engine's pre-flight probe on
+//   the page. When it finds that threads cannot run in this browser (as in
+//   WebKit 26), compare, memory, restart, nested and poolCrash print SKIP.
+// - start: a threaded scene in debug on the package's Worker script. With
+//   threads > 1 (or `--threads 1`) it warns nothing; when the probe failed it
+//   is single-threaded, ready within 2 s, warns once that the engine cannot
+//   run in this browser, and works.
 // - nested: the pool's nested Workers cannot load; the scene starts
 //   single-threaded (after the pool timeout), warns once and works.
 // - poolCrash: a thread of a threaded scene's pool panics, then (a second
@@ -56,7 +63,7 @@ const option = (name, fallback) => {
   return i === -1 ? fallback : argv[i + 1];
 };
 const browserName = option("--browser", "chrome");
-const only = option("--only", "headers,page,compare,memory,restart,nested,poolCrash").split(",");
+const only = option("--only", "headers,page,compare,memory,restart,start,nested,poolCrash").split(",");
 const named = (check) => argv.includes("--only") && only.includes(check);
 const verbose = flag("--verbose");
 const threadsOpt = option("--threads", undefined);
@@ -236,11 +243,23 @@ try {
       console.log(`  JSON ${JSON.stringify(r)}`);
     }
   } else {
+    // Whether this browser can run threads at all; the threaded checks are skipped when not.
+    const probe = await call("probe");
+    console.log(`  probe: ${probe.why === null ? "threads can run" : probe.why} (${fmt(probe.ms)} ms)`);
+    const unavailable = probe.why !== null;
+    const skipped = (check) => {
+      if (!unavailable) {
+        return false;
+      }
+      console.log(`SKIP ${check}: threads cannot run in this browser`);
+      return true;
+    };
+
     if (only.includes("page")) {
       verdict("page", info.isolated && info.sharedArrayBuffer, `crossOriginIsolated ${info.isolated}`);
     }
 
-    if (only.includes("compare")) {
+    if (only.includes("compare") && !skipped("compare")) {
       const r = await call("compare", { n: Number(option("--n", 300)), threads });
       for (const k of ["single", "threaded"]) {
         const x = r[k];
@@ -272,7 +291,7 @@ try {
       );
     }
 
-    if (only.includes("memory")) {
+    if (only.includes("memory") && !skipped("memory")) {
       const target = Number(option("--memory-mb", 512));
       const r = await call("memory", { targetMb: target, threads });
       console.log(
@@ -285,7 +304,7 @@ try {
       );
     }
 
-    if (only.includes("restart")) {
+    if (only.includes("restart") && !skipped("restart")) {
       const before = browser.workers ? await settleWorkers(0) : undefined;
       const open = await call("restartOpen", { threads });
       const opened = browser.workers ? await settleWorkers(1 + open.threads) : undefined;
@@ -307,7 +326,25 @@ try {
       );
     }
 
-    if (only.includes("nested")) {
+    if (only.includes("start")) {
+      const r = await call("start", { threads });
+      console.log(`  ready after ${fmt(r.readyMs)} ms, threads ${r.threads}, works ${r.works}`);
+      for (const w of r.warnings) {
+        console.log(`  warned: ${w}`);
+      }
+      const ok =
+        threads === 1
+          ? r.threads === 1 && r.warnings.length === 0
+          : unavailable
+            ? r.threads === 1 &&
+              r.readyMs < 2000 &&
+              r.warnings.length === 1 &&
+              /cannot run in this browser/.test(r.warnings[0])
+            : r.threads > 1 && r.warnings.length === 0;
+      verdict("start", ok && r.works, `threads ${r.threads} after ${fmt(r.readyMs)} ms, ${r.warnings.length} warning(s)`);
+    }
+
+    if (only.includes("nested") && !skipped("nested")) {
       const r = await call("nestedFail", { threads });
       if (r.rejected !== undefined) {
         console.log(`  createWorkerScene rejected after ${fmt(r.readyMs)} ms: ${r.rejected}`);
@@ -327,7 +364,7 @@ try {
       }
     }
 
-    if (only.includes("poolCrash")) {
+    if (only.includes("poolCrash") && !skipped("poolCrash")) {
       for (const how of ["panic", "trap"]) {
         const r = await call("poolCrash", { threads, how });
         const closed = browser.workers ? await settleWorkers(0) : undefined;

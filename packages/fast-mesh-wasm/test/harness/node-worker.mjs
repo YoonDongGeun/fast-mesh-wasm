@@ -29,7 +29,8 @@
 // `"importFail"` an import that rejects. `{ poolCrash: true }` makes `analyze`
 // stand for a crash on a pool thread: it posts the crash report on the watched
 // channel, as the threaded glue's pool threads do, then blocks this thread (as
-// the engine Worker waits on rayon's latch) for up to 10 s.
+// the engine Worker waits on rayon's latch) for up to 10 s. `{ probeFails: true }`
+// makes the probe report a browser that cannot run threads (as WebKit 26).
 import { readFileSync } from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import "../../dist/node.js";
@@ -140,6 +141,8 @@ if (workerData?.serve) {
           importThreaded: threadedLoader(workerData.threaded),
           // Already instantiated by dist/node.js: its init returns that instance.
           importSingle: async () => raw,
+          // Node has no nested Web Worker, so the real probe never runs here.
+          probe: async () => (workerData.probeFails ? "memory.fill traps (test probe)" : undefined),
         },
         workerData.isolated,
       ),

@@ -290,6 +290,9 @@ export function isInit(data: unknown): data is InitMessage {
  * ready message reports the threads the engine computes with (1 when
  * single-threaded) and, in development, why it is single-threaded when more
  * were asked for (`warning`, for the main side to log once per scene).
+ * `probeFailed` says this browser cannot run the threaded engine at all: the
+ * scene then asks its later Workers, and the page's later scenes, for one
+ * thread.
  * `{ kind: "fallback" }` replaces the ready message when the threaded pool
  * did not start: the Worker gives back the batches it received (later ones
  * follow, one message each) and expects to be replaced by a single-threaded
@@ -301,7 +304,7 @@ export function isInit(data: unknown): data is InitMessage {
 export type WorkerMessage =
   | Result
   | { kind: "update"; result: Result }
-  | { kind: "ready"; threads?: number; warning?: string }
+  | { kind: "ready"; threads?: number; warning?: string; probeFailed?: true }
   | { kind: "fallback"; batches: Request[][]; warning?: string }
   | { kind: "fatal"; error: ErrorWire };
 

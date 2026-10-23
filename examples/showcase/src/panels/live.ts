@@ -84,12 +84,15 @@ export function useLiveReadouts<T>(
             if (!alive) {
               return;
             }
+            if (view.dragging) {
+              // Started before the drag: it describes the pre-drag pose.
+              // Drop it; the drag's end refreshes.
+              dirty = true;
+              return;
+            }
             setReadouts(r);
             probe.readouts = r;
             probe.updates++;
-            if (view.dragging) {
-              probe.updatesWhileDragging++;
-            }
           },
           () => {
             // A mesh removed (or the scene restarted) mid-query: skip this refresh.
