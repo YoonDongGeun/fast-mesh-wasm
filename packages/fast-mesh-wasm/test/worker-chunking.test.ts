@@ -176,6 +176,34 @@ describe("field builds in steps", () => {
     expect(bytes(await fetchValues(h, 2)).equals(bytes(referenceValues(0.3)))).toBe(true);
   });
 
+  it("a_refused_withdraw_reports_the_removal_with_its_id", async () => {
+    // Re-review R2: should the scene refuse to withdraw an abandoned build
+    // (not reachable today; forced here), the field is removed the usual
+    // way, and its removal record names its client id.
+    await patched(
+      "withdraw_field",
+      () => () => false,
+      async () => {
+        const h = engine();
+        h.send([addMeshReq(1, A), addMeshReq(2, B), addMeshReq(3, C)]);
+        await h.until(1);
+        const display = "display:1";
+        const first: Request = { kind: "coloring", rev: rev(), id: 1, rule: { field: 1, map: "turbo", range: [0, 1] }, key: display };
+        const second: Request = { kind: "coloring", rev: rev(), id: 1, rule: null, key: display };
+        let step = 0;
+        h.onChunk = (chunk) => {
+          if (chunk.kind === "fieldBuildStep" && ++step === 3) {
+            h.later([second]);
+          }
+        };
+        h.send([fieldAdd(1, 1, 2, Number.POSITIVE_INFINITY, display), first]);
+        await h.until(3);
+        expect(h.chunks.map((c) => c.kind)).toContain("fieldBuildAbandon");
+        expect(h.results[1].changes.flatMap((c) => c.fields)).toEqual([1]);
+      },
+    );
+  });
+
   it("superseded_display_build_is_abandoned_mid_build", async () => {
     const h = engine();
     h.send([addMeshReq(1, A), addMeshReq(2, B), addMeshReq(3, C)]);

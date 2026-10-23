@@ -1289,13 +1289,16 @@ class Engine {
     const h = steps.addDeferred({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
     const forget = () => {
       // Never computed and colouring nothing, so the scene takes it back
-      // without a report; should it ever refuse, remove it the usual way.
-      if (!steps.withdraw(h)) {
+      // without a report. Should it ever refuse, remove it the usual way:
+      // that reports the removal, so the handle's client id stays until the
+      // frame is packed (the cleanup after packing drops it).
+      if (steps.withdraw(h)) {
+        this.#fieldIds.delete(h);
+      } else {
         this.#scene.removeField(h);
         this.#removedFields.push(h);
       }
       this.#fields.delete(req.field);
-      this.#fieldIds.delete(h);
       this.#fieldMeshes.delete(req.field);
     };
     this.#fields.set(req.field, h);
