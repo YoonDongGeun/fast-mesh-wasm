@@ -21,12 +21,12 @@ pub mod par;
 mod patch;
 mod transaction;
 
-pub use adjacency::{Adjacency, EdgeKind};
+pub use adjacency::{Adjacency, AdjacencyBuild, EdgeKind};
 pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
 pub use compact::Remap;
 pub use error::StoreError;
 pub use history::History;
-pub use incidence::Incidence;
+pub use incidence::{Incidence, IncidenceBuild};
 pub use mesh::Mesh;
 pub use patch::{ChangeSet, Patch, PatchSide};
 pub use transaction::Transaction;

@@ -1110,6 +1110,263 @@ fn triangles_near_limited_with<const N: usize>(
     Ok(true)
 }
 
+/// Node pairs per part of a [`NearSearch`]: the node-pair tree is split until
+/// there are at least this many triangles of both meshes per part, or
+/// [`PAR_PARTS`] parts, whichever is more.
+const NEAR_PART_TRIS: usize = 512;
+
+/// What a triangle pair test counts for in a [`NearSearch::step`] budget,
+/// against one node pair test (a box distance).
+const NEAR_TEST_WORK: usize = 4;
+
+/// Parts a [`NearSearch`] step searches at once on the pool, with the
+/// `parallel` feature.
+const NEAR_PAR_BATCH: usize = 32;
+
+/// What a mesh and its BVH were when a [`NearSearch`] started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    uid: u64,
+    epoch: u32,
+    revision: u64,
+    generation: u64,
+}
+
+impl Stamp {
+    fn of(mesh: &Mesh, bvh: &Bvh) -> Stamp {
+        Stamp {
+            uid: mesh.uid(),
+            epoch: mesh.epoch(),
+            revision: mesh.revision(),
+            generation: bvh.generation(),
+        }
+    }
+}
+
+/// [`triangles_near_limited`] cut into steps, so that a caller can yield
+/// between them.
+///
+/// It splits the pairs of the two BVHs' nodes into parts when it starts, as
+/// the parallel search does, and each [`NearSearch::step`] searches whole
+/// parts until it has tested a given number of triangle pairs. The parts
+/// partition the leaf pairs, so every near pair is found in exactly one of
+/// them, and the near pairs are counted against the limit across parts. The
+/// result ([`NearSearch::finish`]) is therefore the same as from
+/// [`triangles_near_limited`]: whether more than `limit` pairs are near, and
+/// otherwise the same sorted triangles of A. With the `parallel` feature a
+/// step searches several parts at once.
+///
+/// The search is tied to the meshes and BVHs as they were when it started;
+/// stepping it on others fails.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct NearSearch {
+    stamps: [Stamp; 2],
+    xf: Rigid,
+    margin: f64,
+    m: f64,
+    limit: usize,
+    parts: Vec<(NodeId, NodeId)>,
+    /// The first part not searched yet.
+    next: usize,
+    /// The triangles of A found so far, each part's sorted without
+    /// duplicates, in part order.
+    near: Vec<TriangleId>,
+    /// Near pairs found so far.
+    found: usize,
+    /// More than `limit` pairs are near.
+    over: bool,
+}
+
+impl NearSearch {
+    /// A search for the triangles of A within `margin` of B, with B placed
+    /// in A's space by `xf`, giving up past `limit` near pairs, as
+    /// [`triangles_near_limited`]. Splits the node pairs into parts.
+    ///
+    /// # Errors
+    /// As for [`triangles_near_limited`].
+    #[allow(clippy::too_many_arguments)] // As for `triangles_near_limited`.
+    pub fn new(
+        mesh_a: &Mesh,
+        bvh_a: &Bvh,
+        mesh_b: &Mesh,
+        bvh_b: &Bvh,
+        xf: &Rigid,
+        margin: f32,
+        limit: usize,
+    ) -> Result<NearSearch> {
+        validate(
+            mesh_a,
+            bvh_a,
+            mesh_b,
+            bvh_b,
+            xf,
+            Some((margin, "margin must not be negative or NaN")),
+        )?;
+        let margin = f64::from(margin);
+        let m = magnitude(bvh_a, bvh_b, xf);
+        let key = |p: &Aabb, q: &Aabb| {
+            let d = box_distance(p, q);
+            (!beyond(d, margin, m)).then_some(d)
+        };
+        let tris = mesh_a.triangle_count() + mesh_b.triangle_count();
+        let target = PAR_PARTS.max(tris / NEAR_PART_TRIS);
+        let parts = split_pairs(bvh_a, bvh_b, xf, &key, target)?;
+        Ok(NearSearch {
+            stamps: [Stamp::of(mesh_a, bvh_a), Stamp::of(mesh_b, bvh_b)],
+            xf: *xf,
+            margin,
+            m,
+            limit,
+            parts,
+            next: 0,
+            near: Vec::new(),
+            found: 0,
+            over: false,
+        })
+    }
+
+    /// Whether every part is searched, or the limit is passed.
+    pub fn is_done(&self) -> bool {
+        self.over || self.next == self.parts.len()
+    }
+
+    /// Searches whole parts until about `budget` units of work are done (at
+    /// least one part, unless done), or the limit is passed: a node pair
+    /// tested counts as one, a triangle pair tested as four. Returns whether
+    /// the search is done.
+    ///
+    /// # Errors
+    /// [`QueryError::InvalidInput`] when the meshes or BVHs are not those
+    /// the search started on; [`QueryError::OutOfMemory`]. The search is
+    /// unusable after an error.
+    pub fn step(
+        &mut self,
+        mesh_a: &Mesh,
+        bvh_a: &Bvh,
+        mesh_b: &Mesh,
+        bvh_b: &Bvh,
+        budget: usize,
+    ) -> Result<bool> {
+        if self.stamps != [Stamp::of(mesh_a, bvh_a), Stamp::of(mesh_b, bvh_b)] {
+            return Err(QueryError::InvalidInput(
+                "the near search started on other meshes or BVHs",
+            ));
+        }
+        check(mesh_a, bvh_a)?;
+        check(mesh_b, bvh_b)?;
+        let (margin, m, limit, xf) = (self.margin, self.m, self.limit, self.xf);
+        let key = |p: &Aabb, q: &Aabb| {
+            let d = box_distance(p, q);
+            (!beyond(d, margin, m)).then_some(d)
+        };
+        let batch = if par::enabled() && !par::force_sequential() {
+            NEAR_PAR_BATCH
+        } else {
+            1
+        };
+        let mut tested = 0usize;
+        while !self.is_done() && (tested < budget.max(1) || tested == 0) {
+            let end = self.parts.len().min(self.next + batch);
+            let found_pairs = AtomicUsize::new(self.found);
+            let work_done = AtomicUsize::new(0);
+            // Each part's triangles of A, sorted without duplicates, or
+            // `None` when it stopped at the limit.
+            let parts = par::map_chunks(&self.parts[self.next..end], 1, 0, oom, |_, part| {
+                let mut near_a = Vec::new();
+                let mut failed = None;
+                let mut limited = false;
+                let mut count = 0usize;
+                let boxes = Cell::new(0usize);
+                for_each_near_pair::<PAIR_STACK, f64>(
+                    mesh_a,
+                    bvh_a,
+                    mesh_b,
+                    bvh_b,
+                    &xf,
+                    Some(part[0]),
+                    |p: &Aabb, q: &Aabb| {
+                        boxes.set(boxes.get() + 1);
+                        key(p, q)
+                    },
+                    |gap| gap,
+                    || margin,
+                    m,
+                    |a, pa, _, pb| {
+                        count += 1;
+                        if !tri_tri_within(pa, pb, margin) {
+                            return true;
+                        }
+                        if limit != usize::MAX
+                            && found_pairs.fetch_add(1, Ordering::Relaxed) >= limit
+                        {
+                            limited = true;
+                            return false;
+                        }
+                        if let Err(e) = try_push(&mut near_a, a) {
+                            failed = Some(e);
+                            return false;
+                        }
+                        true
+                    },
+                );
+                let work = count
+                    .saturating_mul(NEAR_TEST_WORK)
+                    .saturating_add(boxes.get());
+                work_done.fetch_add(work, Ordering::Relaxed);
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                if limited {
+                    return Ok(None);
+                }
+                near_a.sort_unstable();
+                near_a.dedup();
+                Ok(Some(near_a))
+            })?;
+            tested = tested.saturating_add(work_done.into_inner());
+            self.found = found_pairs.into_inner();
+            for part in parts {
+                match part {
+                    Some(near_a) => {
+                        self.near
+                            .try_reserve(near_a.len())
+                            .map_err(|_| QueryError::OutOfMemory)?;
+                        self.near.extend_from_slice(&near_a);
+                    }
+                    None => self.over = true,
+                }
+            }
+            self.next = end;
+            if self.over {
+                self.near = Vec::new();
+            }
+        }
+        Ok(self.is_done())
+    }
+
+    /// Once done: whether no more than `limit` pairs are near (as the result
+    /// of [`triangles_near_limited`]), having appended A's near triangles to
+    /// `out_a`, sorted without duplicates, when so. `None`, appending
+    /// nothing, before the search is done.
+    ///
+    /// # Errors
+    /// [`QueryError::OutOfMemory`] when `out_a` cannot grow; it then keeps
+    /// its length.
+    pub fn finish(self, out_a: &mut Vec<TriangleId>) -> Result<Option<bool>> {
+        if !self.is_done() {
+            return Ok(None);
+        }
+        if self.over {
+            return Ok(Some(false));
+        }
+        let mut ap = Appender::new(out_a);
+        ap.extend(&self.near)?;
+        ap.sort_dedup_appended();
+        Ok(Some(true))
+    }
+}
+
 /// Why [`triangles_near_limited_with`] stopped early: past its limit (on
 /// purpose), or on a real failure.
 enum Stop {
@@ -2483,5 +2740,133 @@ mod tests {
                 assert!(crossings.contains(&crossing.0), "{i}: {}", crossing.0);
             }
         }
+    }
+
+    /// Runs a [`NearSearch`] to the end in steps of `budget` tested pairs,
+    /// appending to `out` (as [`triangles_near_limited`] does); returns its
+    /// result and the number of steps.
+    #[allow(clippy::too_many_arguments)] // The search's inputs and the budget.
+    fn stepped_near(
+        ma: &Mesh,
+        ba: &Bvh,
+        mb: &Mesh,
+        bb: &Bvh,
+        xf: &Rigid,
+        margin: f32,
+        limit: usize,
+        budget: usize,
+        out: &mut Vec<TriangleId>,
+    ) -> (bool, usize) {
+        let mut search = NearSearch::new(ma, ba, mb, bb, xf, margin, limit).unwrap();
+        let mut steps = 1;
+        while !search.step(ma, ba, mb, bb, budget).unwrap() {
+            steps += 1;
+        }
+        (search.finish(out).unwrap().unwrap(), steps)
+    }
+
+    #[test]
+    fn stepped_near_search_matches_one_call() {
+        let mut aborted = 0;
+        for Posed {
+            ma, ba, mb, bb, xf, ..
+        } in posed()
+        {
+            let all = brute(&ma, &mb, &xf);
+            for margin in [0.0, 0.05, 0.5] {
+                let pairs = all
+                    .iter()
+                    .filter(|(_, _, hit, d)| *hit || d.dist2.sqrt() <= f64::from(margin))
+                    .count();
+                let mut limits = vec![usize::MAX, pairs, pairs / 2];
+                if pairs > 0 {
+                    limits.extend([pairs - 1, 0]);
+                    aborted += 1;
+                }
+                for limit in limits {
+                    let mut want = vec![999];
+                    let done =
+                        triangles_near_limited(&ma, &ba, &mb, &bb, &xf, margin, limit, &mut want)
+                            .unwrap();
+                    for budget in [1, 10, usize::MAX] {
+                        let mut got = vec![999];
+                        let (ok, _) =
+                            stepped_near(&ma, &ba, &mb, &bb, &xf, margin, limit, budget, &mut got);
+                        assert_eq!((ok, &got), (done, &want), "limit {limit}, budget {budget}");
+                    }
+                }
+            }
+        }
+        assert!(aborted > 20, "{aborted}");
+    }
+
+    #[test]
+    fn stepped_near_search_bit_identical() {
+        use crate::test_util::assert_parallel_identical;
+        let ma = wavy(40);
+        let ba = build(&ma, Quality::Sah);
+        let xf = Rigid {
+            translation: [0.25, 0.5, 0.75],
+            ..Rigid::IDENTITY
+        };
+        let one_call = |limit| {
+            fast_mesh_store::par::set_force_sequential(true);
+            let mut a = Vec::new();
+            let done = triangles_near_limited(&ma, &ba, &ma, &ba, &xf, 0.5, limit, &mut a);
+            fast_mesh_store::par::set_force_sequential(false);
+            (done.unwrap(), a)
+        };
+        let (_, full) = one_call(usize::MAX);
+        // The total number of near pairs, from the one-call search.
+        let (mut lo, mut hi) = (0, 1 << 24);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if one_call(mid).0 {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        let total = lo;
+        assert!(total > 1000, "{total}");
+        for limit in [usize::MAX, total, total - 1, 100] {
+            let want = one_call(limit);
+            for budget in [1, 500, usize::MAX] {
+                let (got, steps) = assert_parallel_identical("stepped near search", || {
+                    let mut a = Vec::new();
+                    let (ok, steps) =
+                        stepped_near(&ma, &ba, &ma, &ba, &xf, 0.5, limit, budget, &mut a);
+                    ((ok, a), steps.min(2))
+                });
+                assert_eq!(got, want, "limit {limit}, budget {budget}");
+                if budget == 1 && limit == usize::MAX {
+                    assert_eq!(steps, 2, "searched in several steps");
+                    assert_eq!(got.1, full);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stepped_near_search_refuses_other_meshes() {
+        let ma = wavy(12);
+        let ba = build(&ma, Quality::Sah);
+        let mut mb = wavy(12);
+        let mut bb = build(&mb, Quality::Sah);
+        let xf = Rigid::IDENTITY;
+        let mut search = NearSearch::new(&ma, &ba, &mb, &bb, &xf, 0.5, usize::MAX).unwrap();
+        assert!(!search.step(&ma, &ba, &mb, &bb, 1).unwrap());
+        let mut tx = mb.begin_edit();
+        tx.set_positions(&[0], &[[0.0, 0.0, 9.0]]).unwrap();
+        let patch = tx.commit().unwrap();
+        bb.update(&mut mb, patch.changes()).unwrap();
+        assert!(matches!(
+            search.step(&ma, &ba, &mb, &bb, 1),
+            Err(QueryError::InvalidInput(_))
+        ));
+        let mut out = Vec::new();
+        let unfinished = NearSearch::new(&ma, &ba, &mb, &bb, &xf, 0.5, usize::MAX).unwrap();
+        assert_eq!(unfinished.finish(&mut out), Ok(None));
+        assert!(out.is_empty());
     }
 }
