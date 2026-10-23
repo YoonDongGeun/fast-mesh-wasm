@@ -819,17 +819,17 @@ class Engine {
   }
 
   /**
-   * Finishes every background add, in arrival order, yielding (to receive
-   * only) between steps, for `failed`, the request that waits on them (it
-   * is among the failed requests if they poison the engine).
+   * Finishes every background add, in arrival order, for `failed`, the
+   * request that waits on them (it is among the failed requests if they
+   * poison the engine). Each lands in one call, which builds what is left
+   * of its BVH at once (the one-call build, parallel in the threaded
+   * engine): the request waits for it anyway, and small steps would only
+   * make that slower.
    */
   async #finishAdds(failed?: Request): Promise<boolean> {
     while (this.#adds.length > 0) {
-      if (!(await this.#advanceAdd(true, failed))) {
+      if (!this.#land(this.#adds[0], failed)) {
         return false;
-      }
-      if (this.#adds.length > 0) {
-        await this.#maybeYield();
       }
     }
     return true;

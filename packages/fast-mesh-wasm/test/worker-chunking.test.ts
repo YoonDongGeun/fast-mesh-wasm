@@ -351,6 +351,22 @@ describe("background adds", () => {
     expect(u.placements.map((p) => p.id)).toEqual([3]);
   });
 
+  it("a_waiting_request_finishes_the_add_in_one_call", async () => {
+    // Review I3: once a request depends on a background add, the rest of
+    // the build runs in one call (the one-call, parallel build), not in
+    // small steps with yields.
+    const h = addEngine();
+    h.send([addMeshReq(1, A)]);
+    await h.until(() => h.results().length === 1);
+    h.send([addMeshReq(3, BIG), placement(3, 0.5)]);
+    await h.until(() => h.results().length === 2);
+    // At most the one step the engine's yield between the two requests
+    // gives a background add; the rest in the call that lands it.
+    const steps = h.chunks.filter((c) => c.kind === "addMeshStep" && c.id === 3).length;
+    expect(steps).toBeLessThanOrEqual(1);
+    expect(h.results()[1].status.map((st) => st.key)).toEqual(["mesh:3", "placement:3"]);
+  });
+
   it("add_step_work_is_clamped", async () => {
     // Review M1: an unbounded step (Infinity) builds the whole mesh in one
     // step instead of wrapping to nothing; NaN and values below 1 fall back
@@ -596,16 +612,10 @@ describe("poisoning with a background add pending", () => {
   });
 
   it("a_trap_while_finishing_adds_errors_the_waiting_request", async () => {
-    let calls = 0;
+    // The waiting request lands the add in one call: that call traps.
     await patched(
-      "add_mesh_step",
-      (orig) =>
-        function (this: unknown, ...args: unknown[]) {
-          if (++calls === 3) {
-            trap();
-          }
-          return orig.apply(this, args);
-        },
+      "finish_add_mesh",
+      () => trap,
       async () => {
         const h = addEngine();
         h.send([addMeshReq(1, A)]);
