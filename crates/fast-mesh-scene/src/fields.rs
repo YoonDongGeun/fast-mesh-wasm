@@ -5217,4 +5217,81 @@ mod tests {
         scene.remove_field(fa).unwrap();
         assert_eq!(scene.kept_sign_builds(), 0);
     }
+
+    #[test]
+    fn stepped_unit_bit_identical_across_pools() {
+        // Review M7: the same stepped units (a field build from scratch,
+        // then a recompute after a move and one after an edit of the
+        // target, abandoned once partway) on a one-thread and an
+        // eight-thread pool, against the one-call update: bit for bit.
+        use fast_mesh_store::par;
+        let run = |threads: Option<usize>| {
+            let go = || {
+                let mut scene = Scene::new(SceneOptions::default());
+                let a = scene
+                    .add_mesh(sheet(90, 1.0 / 90.0), MeshOptions::default())
+                    .unwrap();
+                let opts = MeshOptions {
+                    placement: at(0.0, 0.0, 0.04),
+                    ..MeshOptions::default()
+                };
+                let b = scene.add_mesh(sheet(90, 1.0 / 90.0), opts).unwrap();
+                scene.set_defer_fields(true);
+                let f = scene
+                    .add_distance_field_deferred(field("d", a, b, 0.1))
+                    .unwrap();
+                let one_call = threads.is_none();
+                let settle = |s: &mut Scene| {
+                    if one_call {
+                        s.update_fields().unwrap();
+                    } else {
+                        for k in 0.. {
+                            match s.field_step(FieldBudget::Points(97)).unwrap() {
+                                StepState::Pending if k == 3 => s.abandon_field_step(),
+                                StepState::Pending | StepState::Done => {}
+                                _ => break,
+                            }
+                        }
+                    }
+                };
+                if one_call {
+                    scene.update_fields().unwrap();
+                } else {
+                    while scene.field_step_field(f, FieldBudget::Points(97)).unwrap()
+                        != StepState::Idle
+                    {}
+                }
+                let mut out = vec![seen(&mut scene, [a, b])];
+                scene
+                    .set_placement(b, turned(2.0, [0.01, 0.0, 0.035]))
+                    .unwrap();
+                settle(&mut scene);
+                out.push(seen(&mut scene, [a, b]));
+                scene
+                    .edit(b, |tx| tx.set_positions(&[100], &[[0.5, 0.5, -0.01]]))
+                    .unwrap();
+                settle(&mut scene);
+                out.push(seen(&mut scene, [a, b]));
+                out
+            };
+            match threads {
+                Some(k) => par::with_threads(k, go),
+                None => {
+                    par::set_force_sequential(true);
+                    let out = go();
+                    par::set_force_sequential(false);
+                    out
+                }
+            }
+        };
+        let want = run(None);
+        for k in [1, 8] {
+            let got = run(Some(k));
+            // Values and colours; reports may group differently around the
+            // abandon, the values may not.
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!((&g.0, &g.1), (&w.0, &w.1), "{k} threads");
+            }
+        }
+    }
 }
