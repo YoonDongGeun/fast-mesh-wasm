@@ -1782,11 +1782,62 @@ mod tests {
                 }
             }
         }
-        // Six vertices, one per step.
-        assert_eq!(steps, 6);
+        // Six vertices, one per step, after the near search's own step.
+        assert!(steps >= 6, "{steps} steps");
         let values = s.scene.field_values(s.field(f).unwrap()).unwrap();
         assert!((values[0] - 2.).abs() < 1e-6, "{values:?}");
         assert_eq!(s.field_step(u32::MAX).unwrap(), 0);
+    }
+
+    #[test]
+    fn stepped_field_add_and_mesh_add_bindings() {
+        let mut s = WasmScene::new();
+        let mut t = WasmScene::new();
+        let (ai, ag) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let (bi, bg) = octahedron(&mut s, [3., 0., 0.], 1.);
+        octahedron(&mut t, [0., 0., 0.], 1.);
+        octahedron(&mut t, [3., 0., 0.], 1.);
+        // A field added deferred, stepped alone: the values of an eager add.
+        let f = s
+            .add_distance_field_deferred("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        let g = t
+            .add_distance_field("d".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        while s.field_step_field(f, 1).unwrap() == 1 {}
+        assert_eq!(s.field_step_field(f, 1).unwrap(), 0);
+        let bits = |w: &WasmScene, id: u32| -> Vec<u32> {
+            let v = w.scene.field_values(w.field(id).unwrap()).unwrap();
+            v.iter().map(|x| x.to_bits()).collect()
+        };
+        assert_eq!(bits(&s, f), bits(&t, g));
+        assert!(!s.withdraw_field(f).unwrap());
+        let h = s
+            .add_distance_field_deferred("e".into(), &[ai, ag, bi, bg], 5., 0)
+            .unwrap();
+        assert!(s.withdraw_field(h).unwrap());
+        assert!(s.field_status(h).is_err());
+        // A mesh added in steps: the same id and buffers as an add.
+        let positions = [0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 1., 0.5];
+        let indices = [0, 1, 2, 1, 3, 2];
+        let build = s
+            .begin_add_mesh(&positions, &indices, None, 0, true)
+            .unwrap();
+        while !s.add_mesh_step(build, 1).unwrap() {}
+        let id = s.finish_add_mesh(build).unwrap();
+        let want = t.add_mesh(&positions, &indices, None, 0, true).unwrap();
+        assert_eq!(id, want);
+        let mesh = |w: &WasmScene| {
+            let m = w.scene.mesh(w.id(id[0], id[1]).unwrap()).unwrap();
+            (m.positions().to_vec(), m.triangles().to_vec())
+        };
+        assert_eq!(mesh(&s), mesh(&t));
+        assert!(s.add_mesh_step(build, 1).is_err());
+        let other = s
+            .begin_add_mesh(&positions, &indices, None, 0, false)
+            .unwrap();
+        s.drop_add_mesh(other);
+        assert!(s.finish_add_mesh(other).is_err());
     }
 
     /// An edit id list without refs.
