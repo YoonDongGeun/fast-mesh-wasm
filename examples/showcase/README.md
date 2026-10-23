@@ -59,11 +59,13 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   the deepest penetration). Moving a member recomputes only its own field and its partners'. A
   readout per pair, throttled and paused during drags like the pair's: *Min gap* (`meshDistance`),
   *Hit* (`intersects`) and *Max depth*, the deepest negative value of either member at the vertices
-  the other is nearest to (`store.fetchColoringValues` and the field's `nearest` buffer; a vertex
-  inside two partners counts for the deeper one only). Hovering a member shows which partner the
-  vertex under the pointer is nearest to and how far (the `nearest` buffer through
-  `fetchFieldNearest`, or `fieldNearest` with `?local`, read when the member is first hovered and
-  after it changes, never during a drag). Open or inconsistently oriented members get the same
+  the other is nearest to (`store.fetchColoringValues` and the field's `nearest` buffer, whose
+  indices follow `store.coloringTargets`; a vertex inside two partners counts for the deeper one
+  only), read "≥ bound" in fast mode under the same rule as the pair. Hovering a member shows which
+  partner the vertex under the pointer is nearest to and how far: the vertex is found with the
+  engine's BVH `raycast` (one at a time, at most every 50 ms), and the `nearest` buffer is read
+  through `fetchFieldNearest`, or `fieldNearest` with `?local`, when the member is first hovered
+  and after it changes, never during a drag. Open or inconsistently oriented members get the same
   warning as the pair. Removing a member keeps the others coloured with their remaining partners.
 - **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
   page is cross-origin isolated, and on an error its message with Restart.
@@ -72,7 +74,7 @@ URL options:
 
 | Option | Effect |
 | --- | --- |
-| `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh |
+| `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh. The exact depth (the default) recomputes every coloured vertex on the main thread on every drag frame, so dragging large meshes stutters: use *Fast mode* there |
 | `?big` | Demo meshes A and B at about a million triangles each |
 | `?threads=N` | Ask for N engine threads |
 

@@ -34,6 +34,8 @@ export interface PairReadout {
    * `null` before the fields have values.
    */
   depth: number | null;
+  /** A bounded field (fast mode) may hide a deeper penetration (see `mayBeDeeper`). */
+  atLeast: boolean;
 }
 
 /** The contact group's readouts as last queried. */

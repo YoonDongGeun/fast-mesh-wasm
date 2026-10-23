@@ -4,9 +4,11 @@
 // the store's frames. Colourings are drawn with fragment shading, so the
 // heatmap's boundaries are crisp, softened by the collision panel's slider.
 // With `hoverable` (Group mode) the vertex under the pointer is tracked in
-// `view.hover`, for the hover tip.
+// `view.hover`, for the hover tip: through the engine's BVH raycast
+// (`scene.raycast`, async on the Worker), one at a time and at most every
+// HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle } from "fast-mesh-wasm";
+import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
@@ -14,11 +16,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { FocusRequest } from "../App";
 import type { Item } from "../scene/app-state";
 import { setDragging, setHover, view } from "./view";
 
 export type GizmoMode = "translate" | "rotate";
+
+/** The hover raycast runs at most this often while the pointer moves. */
+const HOVER_PERIOD_MS = 50;
 
 export function Viewport(props: {
   items: readonly Item[];
@@ -28,8 +34,10 @@ export function Viewport(props: {
   edgeSoftness: number;
   /** Track the vertex under the pointer (`view.hover`). */
   hoverable: boolean;
+  /** The engine's scene, for the hover raycast. */
+  scene: Scene | WorkerScene;
 }) {
-  const { items, mode, focus, edgeSoftness, hoverable } = props;
+  const { items, mode, focus, edgeSoftness, hoverable, scene } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -47,11 +55,6 @@ export function Viewport(props: {
   useEffect(() => {
     view.bindings = bindings;
   }, [bindings]);
-  useEffect(() => {
-    if (!hoverable) {
-      setHover(null);
-    }
-  }, [hoverable]);
   const selected = selection === null ? null : (bindings.get(selection) ?? null);
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
 
@@ -68,12 +71,12 @@ export function Viewport(props: {
           item={item}
           selected={item.mesh === selection}
           edgeSoftness={edgeSoftness}
-          hoverable={hoverable}
           onPick={select}
           onBind={onBind}
         />
       ))}
       <Controls bound={selected} mode={mode} focus={focus} radiusOf={radiusOf} />
+      {hoverable ? <HoverRay scene={scene} /> : null}
     </Canvas>
   );
 }
@@ -83,11 +86,10 @@ function MeshView(props: {
   item: Item;
   selected: boolean;
   edgeSoftness: number;
-  hoverable: boolean;
   onPick: (mesh: MeshHandle) => void;
   onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
 }) {
-  const { item, selected, edgeSoftness, hoverable, onPick, onBind } = props;
+  const { item, selected, edgeSoftness, onPick, onBind } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
@@ -102,34 +104,6 @@ function MeshView(props: {
     },
     [item.mesh, onPick],
   );
-  // The hit triangle's corner nearest to the hit point: the vertex hovered.
-  const onPointerMove = useCallback(
-    (e: ThreeEvent<PointerEvent>) => {
-      if (e.face == null) {
-        return;
-      }
-      e.stopPropagation();
-      const position = (e.object as THREE.Mesh).geometry.getAttribute("position");
-      const local = e.object.worldToLocal(e.point.clone());
-      const corner = new THREE.Vector3();
-      let slot = e.face.a;
-      let best = Infinity;
-      for (const v of [e.face.a, e.face.b, e.face.c]) {
-        const d = corner.fromBufferAttribute(position, v).distanceToSquared(local);
-        if (d < best) {
-          best = d;
-          slot = v;
-        }
-      }
-      setHover({ mesh: item.mesh, slot, x: e.nativeEvent.clientX, y: e.nativeEvent.clientY });
-    },
-    [item.mesh],
-  );
-  const onPointerOut = useCallback(() => {
-    if (view.hover?.mesh === item.mesh) {
-      setHover(null);
-    }
-  }, [item.mesh]);
   return (
     <FastMesh
       mesh={item.mesh}
@@ -137,11 +111,100 @@ function MeshView(props: {
       shading="fragment"
       edgeSoftness={edgeSoftness}
       onClick={onClick}
-      onPointerMove={hoverable ? onPointerMove : undefined}
-      onPointerOut={hoverable ? onPointerOut : undefined}
       onBind={(b) => onBind(item.mesh, b)}
     />
   );
+}
+
+/**
+ * The vertex under the pointer, into `view.hover`: the engine's raycast
+ * (its BVH) from the camera through the pointer, the hit triangle's corner
+ * with the largest barycentric weight. One raycast at a time, at most every
+ * HOVER_PERIOD_MS, for the latest pointer position; none while a button is
+ * down (orbiting, or the gizmo dragging). Cleared when the pointer leaves
+ * the canvas and on unmount.
+ */
+function HoverRay(props: { scene: Scene | WorkerScene }) {
+  const { scene } = props;
+  const camera = useThree((s) => s.camera);
+  const gl = useThree((s) => s.gl);
+
+  useEffect(() => {
+    const canvas = gl.domElement;
+    const caster = new THREE.Raycaster();
+    let alive = true;
+    let pending: { x: number; y: number } | null = null;
+    let running = false;
+    let last = -Infinity;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const run = () => {
+      if (!alive || running || pending === null) {
+        return;
+      }
+      const wait = last + HOVER_PERIOD_MS - performance.now();
+      if (wait > 0) {
+        timer ??= setTimeout(() => {
+          timer = undefined;
+          run();
+        }, wait);
+        return;
+      }
+      const at = pending;
+      pending = null;
+      running = true;
+      last = performance.now();
+      const r = canvas.getBoundingClientRect();
+      const ndc = new THREE.Vector2(((at.x - r.left) / r.width) * 2 - 1, 1 - ((at.y - r.top) / r.height) * 2);
+      caster.setFromCamera(ndc, camera);
+      const { origin, direction } = caster.ray;
+      Promise.resolve()
+        .then(() => scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]))
+        .then(
+          (hit) => {
+            if (!alive) {
+              return;
+            }
+            if (hit === null) {
+              setHover(null);
+              return;
+            }
+            const corners = scene.views(hit.mesh).indices().subarray(3 * hit.triangle, 3 * hit.triangle + 3);
+            const [u, v, w] = hit.barycentric;
+            const k = u >= v && u >= w ? 0 : v >= w ? 1 : 2;
+            setHover({ mesh: hit.mesh, slot: corners[k], x: at.x, y: at.y });
+          },
+          () => {
+            // A mesh removed (or the scene restarted) meanwhile: the next move asks again.
+          },
+        )
+        .finally(() => {
+          running = false;
+          run();
+        });
+    };
+    const onMove = (e: PointerEvent) => {
+      if (e.buttons !== 0 || view.dragging) {
+        return;
+      }
+      pending = { x: e.clientX, y: e.clientY };
+      run();
+    };
+    const onLeave = () => {
+      pending = null;
+      setHover(null);
+    };
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerleave", onLeave);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      canvas.removeEventListener("pointermove", onMove);
+      canvas.removeEventListener("pointerleave", onLeave);
+      setHover(null);
+    };
+  }, [scene, camera, gl]);
+
+  return null;
 }
 
 /**

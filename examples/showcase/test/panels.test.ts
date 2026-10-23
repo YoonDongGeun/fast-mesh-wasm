@@ -8,6 +8,7 @@ import {
   clampTolerance,
   deepestPenetration,
   formatDistance,
+  mayBeDeeper,
   niceScale,
   toleranceLimit,
   topologyOf,
@@ -93,6 +94,15 @@ describe("collision math", () => {
     });
     // An exact field (no bound) never reads "at least".
     expect(deepestPenetration([near], Infinity, true)?.atLeast).toBe(false);
+  });
+
+  it("may_be_deeper", () => {
+    // Only a bounded field, meshes that intersect, and a depth near the bound (or none found).
+    expect(mayBeDeeper(0.95, 1, true)).toBe(true);
+    expect(mayBeDeeper(0, 1, true)).toBe(true);
+    expect(mayBeDeeper(0.5, 1, true)).toBe(false);
+    expect(mayBeDeeper(0.95, 1, false)).toBe(false);
+    expect(mayBeDeeper(0.95, Infinity, true)).toBe(false);
   });
 
   it("topology_of_target", () => {

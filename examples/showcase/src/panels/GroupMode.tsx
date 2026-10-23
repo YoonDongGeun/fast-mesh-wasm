@@ -10,7 +10,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useMemo } from "react";
 import type { AppState, GroupSetup, Item } from "../scene/app-state";
 import type { Heatmap } from "./CollisionPanel";
-import { formatDistance } from "./collision-math";
+import { formatDistance, mayBeDeeper } from "./collision-math";
 import { groupPairs, type MemberValues, pairDepths, togglePair } from "./group-math";
 import { type GroupReadouts, inspect } from "./inspect";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
@@ -19,12 +19,12 @@ import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 const GROUP_ID = "showcase";
 
 /**
- * The partners behind a mesh's colouring as applied (its `distanceTo`, as a
- * list): what its field's nearest indices refer to.
+ * The targets of the field behind a mesh's colouring, in the order its
+ * nearest-target indices refer to (`store.coloringTargets`: ascending scene
+ * id, not the member order); empty without a colouring.
  */
-export function partnersOf(store: SceneStore, mesh: MeshHandle): MeshHandle[] {
-  const to = store.getSnapshot().meshes.get(mesh)?.display.coloring?.distanceTo;
-  return to === undefined ? [] : Array.isArray(to) ? [...to] : [to as MeshHandle];
+export function partnersOf(store: SceneStore, mesh: MeshHandle): readonly MeshHandle[] {
+  return store.coloringTargets(mesh) ?? [];
 }
 
 /**
@@ -103,6 +103,7 @@ export function GroupMode(props: {
           gap: each[k][0] === null ? null : each[k][0].distance,
           intersects: each[k][1],
           depth: depths[k],
+          atLeast: depths[k] !== null && mayBeDeeper(depths[k], bound, each[k][1]),
         })),
       };
     },
@@ -240,7 +241,13 @@ function PairReadouts(props: {
                 </td>
                 <td>{p === undefined || p.gap === null ? dash : formatDistance(p.gap)}</td>
                 <td>{p === undefined ? dash : p.intersects ? "yes" : "no"}</td>
-                <td>{p === undefined || p.depth === null ? dash : formatDistance(p.depth)}</td>
+                <td>
+                  {p === undefined || p.depth === null
+                    ? dash
+                    : p.atLeast
+                      ? `≥ ${formatDistance(Math.max(p.depth, within))}`
+                      : formatDistance(p.depth)}
+                </td>
               </tr>
             );
           })}

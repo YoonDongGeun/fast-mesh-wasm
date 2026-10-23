@@ -72,8 +72,17 @@ export function deepestPenetration(
     return null;
   }
   const depth = min < 0 ? -min : 0;
-  const atLeast = Number.isFinite(bound) && intersects && (depth === 0 || depth >= bound * (1 - NEAR_BOUND));
-  return { depth, atLeast };
+  return { depth, atLeast: mayBeDeeper(depth, bound, intersects) };
+}
+
+/**
+ * Whether a penetration `depth` read from fields bounded at `bound` may hide
+ * a deeper one: the bound is finite (fast mode), the meshes intersect, and
+ * the depth is within 10% of the bound, or 0 (no vertex inside the other
+ * within the bound). See `deepestPenetration`.
+ */
+export function mayBeDeeper(depth: number, bound: number, intersects: boolean): boolean {
+  return Number.isFinite(bound) && intersects && (depth === 0 || depth >= bound * (1 - NEAR_BOUND));
 }
 
 /**

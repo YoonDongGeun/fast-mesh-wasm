@@ -104,7 +104,7 @@ The BVH is exact, and its boxes are only an acceleration structure. So a toleran
 2. **Sign** *(my call)*. `contactHeatmap` passes `sign` through, defaulting to `"auto"`. Auto uses pseudonormals for open meshes, so penetration still has a side.
    - The collision panel reads `fieldStatus` (async) for A and B. When the target is open or inconsistently oriented, it shows a warning: "B is open: penetration side follows its surface normals; repair → orient/fill holes for a closed result".
 3. **Field access** *(my call; additive library API)*. Add `SceneStore.fetchColoringValues(mesh): Promise<Float32Array | null>`. It returns the values of the store-owned field behind the mesh's current colouring, or `null` when there is none. It is the async `fetchFieldValues` on Worker scenes and a copy on local ones.
-   - Readouts: maximum penetration = `-min(values)` over finite negative values. In fast mode, if any value sits at the bound, show "≥ depth". Minimum gap comes from `meshDistance`.
+   - Readouts: maximum penetration = `-min(values)` over finite negative values. In fast mode the field's bound (`2 · max(depth, gap)`) can hide a deeper penetration, so the readout shows "≥ bound" when the meshes intersect and either the deepest value is within 10% of the bound or no vertex inside the other mesh is within it at all (the 10% heuristic: a value that close to the bound may be the edge of a deeper region beyond it). Minimum gap comes from `meshDistance`.
    - Readouts throttle to about 4 Hz during drags and refresh on drag end.
    - *(ruling, 2026-10-23)* Readouts pause while a drag is active and refresh on drag end and when the scene is idle; the 4 Hz throttle applies outside drags only. Reading field values forces due fields current, which would defeat the drag's stale-pose abandonment; the colours stay live during the drag.
 4. **Tolerance** *(my call)*. It is one number, used for two things:
@@ -155,12 +155,12 @@ The owner's case: meshes A–D, with contact relationships A↔B, B↔C, A↔C a
    - **Per vertex:** the closest point is searched over every target's BVH. The best distance found so far is the upper bound for the next target, so adding partners costs little. The result is exact and bit-identical to taking the min over separate single-target fields, with ties broken by the lowest partner index.
    - **Recompute:** when any target or the source moves or is edited, the field is due. Candidates come from the union of each target's near set, using the existing near-search limit per target.
    - **Removing a target** removes it from the set. When the set becomes empty, the field is removed.
-3. **Store API** *(my call)*. `store.setContactGroup(id, { meshes: MeshHandle[], pairs?: [MeshHandle, MeshHandle][] | "all", heatmap: ContactHeatmapOptions } | null)`.
+3. **Store API** *(my call)*. `store.setContactGroup(id, { meshes: MeshHandle[], pairs?: [MeshHandle, MeshHandle][] | "all", coloring: Omit<DistanceColoring, "distanceTo"> } | null)`; the showcase passes `coloring: contactHeatmap(options)`.
    - The store derives each member's partner set from `pairs`. `"all"` means every other member, with root-box culling.
    - For each member it creates one multi-target field, with `distanceTo` as an array, and colours the member with the heatmap.
    - Moving one member recomputes only the fields of that member and of its partners. Pairs that do not involve the moved mesh (B↔C when A moves) are untouched, because neither B's nor C's field has A… unless A is in their partner set, in which case only those fields recompute. That is the correct dependency.
    - `fetchColoringValues` works per member.
 4. **Showcase.**
    - The collision panel gets a "Group" mode: tick the meshes, and choose "all pairs" or edit the pair list in a small matrix.
-   - Readouts are given per pair. They are min gap and max depth through `meshDistance`, throttled.
+   - Readouts are given per pair, throttled. Min gap comes from `meshDistance` *(ruling: max depth comes from the fields)*: the deepest negative value of either member at the vertices whose nearest partner is the other member (`fetchColoringValues`, plus the `nearest` buffer read through `store.coloringTargets`). A vertex inside two partners counts for the deeper one only.
    - A tooltip on hover shows the nearest partner, read from the `nearest` buffer through the existing query path. This is optional if it is costly.

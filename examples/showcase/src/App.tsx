@@ -132,7 +132,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <MeshList app={app} onLoad={load} onFocus={focusOn} />
       </aside>
       <main className="viewport">
-        <Viewport items={items} mode={mode} focus={focus} edgeSoftness={edgeSoftness} hoverable={grouped} />
+        <Viewport
+          items={items}
+          mode={mode}
+          focus={focus}
+          edgeSoftness={edgeSoftness}
+          hoverable={grouped}
+          scene={engine.scene}
+        />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
