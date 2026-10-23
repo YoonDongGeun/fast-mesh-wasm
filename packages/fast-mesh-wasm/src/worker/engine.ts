@@ -707,10 +707,20 @@ class Engine {
   }
 
   /**
+   * Whether the field `id` is deferred (not built yet) and measured on or
+   * to a mesh being added in the background: building it needs that mesh.
+   */
+  #fieldPending(id: unknown): boolean {
+    const desc = this.#deferred.get(id as ClientId);
+    return desc !== undefined && this.#pending(desc.on, ...desc.to);
+  }
+
+  /**
    * Whether `req` must see the background adds landed first: it names one
-   * of their meshes, adds or removes a mesh (slots are allocated in arrival
-   * order), or queries every mesh (`raycast`, `closestPoint` without a mesh,
-   * `findContacts` without pairs).
+   * of their meshes, or a deferred field measured on or to one (building
+   * it needs the mesh), adds or removes a mesh (slots are allocated in
+   * arrival order), or queries every mesh (`raycast`, `closestPoint`
+   * without a mesh, `findContacts` without pairs).
    */
   #dependsOnAdds(req: Request): boolean {
     switch (req.kind) {
@@ -722,10 +732,13 @@ class Engine {
       case "drag":
       case "edit":
       case "repair":
-      case "coloring":
         return this.#pending(req.id);
+      case "coloring":
+        return this.#pending(req.id) || (req.rule !== null && this.#fieldPending(req.rule?.field));
+      case "fetchFieldValues":
+        return this.#fieldPending(req.field);
       case "field":
-        return req.desc !== undefined && this.#pending(req.desc.on, ...req.desc.to);
+        return req.desc !== undefined ? this.#pending(req.desc.on, ...req.desc.to) : this.#fieldPending(req.field);
       case "section": {
         const meshes = req.desc?.meshes;
         return Array.isArray(meshes) && this.#pending(...meshes);
@@ -735,12 +748,17 @@ class Engine {
           a?: ClientId;
           b?: ClientId;
           mesh?: ClientId;
+          field?: ClientId;
           options?: { mesh?: ClientId };
           pairs?: [ClientId, ClientId][];
         };
         switch (req.name) {
           case "raycast":
             return true;
+          case "fieldStatus":
+          case "fieldNearest":
+          case "fieldTargetStatus":
+            return this.#fieldPending(a.field);
           case "closestPoint":
             return a.options?.mesh === undefined || this.#pending(a.options.mesh);
           case "findContacts":
@@ -1228,17 +1246,12 @@ class Engine {
    * Computes a field (one chunk). Built late, a field has the values it
    * would have had (eager fields follow every edit and placement); only its
    * errors (a taken name, say) surface late, on the request that needs it.
-   * A failed build forgets the field.
+   * A failed build keeps the field deferred: the next request that needs it
+   * tries again (and reports the error again), and removing it still works.
    */
   #buildField(id: ClientId, desc: FieldDescWire): FieldHandle {
+    const h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
     this.#deferred.delete(id);
-    let h: FieldHandle;
-    try {
-      h = this.#scene.addDistanceField({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
-    } catch (e) {
-      this.#fieldMeshes.delete(id);
-      throw e;
-    }
     this.#fields.set(id, h);
     this.#fieldIds.set(h, id);
     this.#fieldMeshes.set(id, [desc.on, ...desc.to]);

@@ -410,6 +410,99 @@ describe("background adds", () => {
     expect(g.chunks.some((c) => c.kind === "addMeshBegin")).toBe(false);
   });
 
+  it("deferred_field_on_a_pending_mesh_waits_for_it", async () => {
+    // Review C1: a display-keyed field add measured to a mesh still being
+    // added, abandoned by the 9a rule (its colouring is superseded at
+    // once), then needed: it must be built after the mesh lands, as in
+    // arrival order, not fail and be lost.
+    const fieldRef = () => {
+      const s = new Scene();
+      try {
+        const a = s.addMesh(A.positions, A.indices);
+        s.addMesh(B.positions, B.indices);
+        const m = s.addMesh(BIG.positions, BIG.indices);
+        const f = s.addDistanceField({ name: "f10", on: a, to: m, maxDistance: 1 });
+        return { values: s.fieldValues(f).slice(), status: s.fieldStatus(f) };
+      } finally {
+        s.free();
+      }
+    };
+    const ref = fieldRef();
+    const display = "display:1";
+    const add10: Request = {
+      kind: "field",
+      rev: rev(),
+      field: 10,
+      op: "add",
+      desc: { name: "f10", on: 1, to: [3], maxDistance: 1 },
+      key: display,
+    };
+    const colour10: Request = {
+      kind: "coloring",
+      rev: rev(),
+      id: 1,
+      rule: { field: 10, map: "turbo", range: [0, 1] },
+      key: display,
+    };
+    const uncolour: Request = { kind: "coloring", rev: rev(), id: 1, rule: null, key: display };
+    const fetch = (qid: number): Request => ({ kind: "fetchFieldValues", rev: rev(), qid, field: 10 });
+    const status = (qid: number): Request => ({ kind: "query", rev: rev(), qid, name: "fieldStatus", args: { field: 10 } });
+
+    // fetchFieldValues of the deferred field.
+    let h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    h.send([addMeshReq(3, BIG), add10, colour10, uncolour, fetch(5)]);
+    await h.until(() => h.results().length === 2);
+    let reply = h.results()[1].replies[0];
+    expect(reply.ok, JSON.stringify(reply.error)).toBe(true);
+    expect(bytes(reply.value as Float32Array).equals(bytes(ref.values))).toBe(true);
+    expect(h.results()[1].status.find((st) => st.key === "mesh:3")?.status).toBe("ready");
+
+    // A colouring switching back to the deferred field, then its status.
+    h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const back: Request = { ...colour10, rev: rev() } as Request;
+    h.send([addMeshReq(3, BIG), add10, colour10, uncolour, back, status(6)]);
+    await h.until(() => h.results().length === 2);
+    const r = h.results()[1];
+    expect(r.status.find((st) => st.key === display && st.rev === back.rev)?.status).toBe("ready");
+    reply = r.replies[0];
+    expect(reply.ok, JSON.stringify(reply.error)).toBe(true);
+    expect(r.changes.find((c) => c.id === 1)?.colors).not.toEqual([]);
+  });
+
+  it("deferred_field_build_failure_keeps_the_field", async () => {
+    // A deferred field whose build fails (its name is taken by then) keeps
+    // its desc: the error is reported each time it is needed, and the id
+    // stays known.
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const display = "display:1";
+    const add10: Request = {
+      kind: "field",
+      rev: rev(),
+      field: 10,
+      op: "add",
+      desc: { name: "dup", on: 1, to: [2], maxDistance: 1 },
+      key: display,
+    };
+    const colour10: Request = { kind: "coloring", rev: rev(), id: 1, rule: { field: 10, map: "turbo", range: [0, 1] }, key: display };
+    const uncolour: Request = { kind: "coloring", rev: rev(), id: 1, rule: null, key: display };
+    const taken: Request = { kind: "field", rev: rev(), field: 11, op: "add", desc: { name: "dup", on: 1, to: [2], maxDistance: 1 } };
+    const fetch: Request = { kind: "fetchFieldValues", rev: rev(), qid: 9, field: 10 };
+    h.send([add10, colour10, uncolour, taken, fetch]);
+    await h.until(() => h.results().length === 2);
+    expect(h.results()[1].replies[0].error?.code).toBe("INVALID_ARGUMENT");
+    // Still known: removing it works, after which it is unknown.
+    h.send([{ kind: "field", rev: rev(), field: 10, op: "remove" }, { ...fetch, rev: rev(), qid: 10 } as Request]);
+    await h.until(() => h.results().length === 3);
+    expect(h.results()[2].status.find((st) => st.key === "field:10")?.status).toBe("ready");
+    expect(h.results()[2].replies[0].error?.code).toBe("UNKNOWN_FIELD");
+  });
+
   it("failed_background_add_reports_its_error", async () => {
     const h = addEngine();
     // An index out of range fails when the build starts: at once.
