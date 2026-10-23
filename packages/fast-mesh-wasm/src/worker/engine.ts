@@ -1,12 +1,12 @@
 // The Worker-side engine: a sync `Scene` behind a keyed request queue. It maps
 // client ids to the scene's handles, runs requests in arrival order in chunks
-// (a request, a field build, an operation of a repair list), yielding to the
-// message loop between chunks so newer batches arrive meanwhile: superseded
-// "last wins" requests are dropped and abandoned field builds deferred before
-// they start. Field updates are deferred: after a batch's requests, the
-// fields they left due are computed in steps, and a recompute made stale by a
-// queued request is abandoned at a step boundary (§6.1 of the drag-speed
-// design). After each batch it posts one `Result` with the frame's change
+// (a request, a step of a field build, an operation of a repair list),
+// yielding to the message loop between chunks so newer batches arrive
+// meanwhile: superseded "last wins" requests are dropped, and field builds
+// for a superseded display are deferred, before they start or at a step
+// boundary. Field updates are deferred: after a batch's requests, the fields
+// they left due are computed in steps, and a recompute made stale by a queued
+// request is abandoned at a step boundary (§6.1 of the drag-speed design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
 // statuses and replies. Pure: it talks only through `Port`, so it runs in a
 // browser Worker or in Node `worker_threads`.
@@ -63,9 +63,11 @@ export interface EngineOptions {
   /**
    * Test-only: called after each chunk of work: every request run (`kind`
    * is the request's), every field computed (`"fieldBuild"`, `id` is the
-   * field's client id), every operation of a repair list run in steps
-   * (`"repairOp"`), every field step (`"fieldStep"`) and every abandoned
-   * field step unit (`"fieldStepAbandon"`).
+   * field's client id), every step of a field add's build
+   * (`"fieldBuildStep"`, with the id) and every such build abandoned for a
+   * superseded display (`"fieldBuildAbandon"`), every operation of a repair
+   * list run in steps (`"repairOp"`), every field step (`"fieldStep"`) and
+   * every abandoned field step unit (`"fieldStepAbandon"`).
    */
   onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
   /**
@@ -489,13 +491,21 @@ class Engine {
       // Run it: it fails as "already in use".
       return false;
     }
-    const at = this.#queue.findIndex((x) => x !== END && keyOf(x) === key && isLastWins(x));
-    if (at < 0 || !this.#superseded(this.#queue[at] as Request, key, at + 1)) {
+    if (!this.#feedsSuperseded(key)) {
       return false;
     }
     this.#deferred.set(req.field, req.desc);
     this.#fieldMeshes.set(req.field, [req.desc.on, ...req.desc.to]);
     return true;
+  }
+
+  /** Whether the next queued last-wins request keyed `key` is already superseded. */
+  #feedsSuperseded(key: string | undefined): boolean {
+    if (key === undefined) {
+      return false;
+    }
+    const at = this.#queue.findIndex((x) => x !== END && keyOf(x) === key && isLastWins(x));
+    return at >= 0 && this.#superseded(this.#queue[at] as Request, key, at + 1);
   }
 
   /**
@@ -540,6 +550,11 @@ class Engine {
     try {
       if (req.kind === "repair" && this.#inSteps(req)) {
         await this.#repairInSteps(req, b);
+      } else if (req.kind === "field" && req.op === "add") {
+        if (!(await this.#addFieldInSteps(req, key))) {
+          // Abandoned for a superseded display: no status, as before it starts.
+          return true;
+        }
       } else {
         this.#run(req, b);
       }
@@ -843,6 +858,64 @@ class Engine {
     }
   }
 
+  /**
+   * Adds a field and builds it in steps of {@link EngineOptions.stepPoints}
+   * (its sign data, near search and values), yielding between them once the
+   * time budget is spent. At each step boundary the 9a rule applies: when
+   * the display request the add feeds is superseded by a queued one, the
+   * build is abandoned and the field, never computed, is withdrawn without a
+   * report and kept as deferred (built when first needed), as if abandoned
+   * before it started; `false` then. Other requests wait for the build. A
+   * build that fails withdraws the field and throws, so the add fails and
+   * the scene is as before.
+   */
+  async #addFieldInSteps(req: Extract<Request, { kind: "field" }>, key: string | undefined): Promise<boolean> {
+    if (this.#fields.has(req.field) || this.#deferred.has(req.field)) {
+      throw invalid(`field client id ${req.field} is already in use`);
+    }
+    const desc = req.desc;
+    if (desc === undefined) {
+      throw invalid("adding a field needs a desc");
+    }
+    const steps = this.#steps;
+    const h = steps.addDeferred({ ...desc, on: this.#mesh(desc.on), to: desc.to.map((m) => this.#mesh(m)) });
+    const forget = () => {
+      steps.withdraw(h);
+      this.#fields.delete(req.field);
+      this.#fieldIds.delete(h);
+      this.#fieldMeshes.delete(req.field);
+    };
+    this.#fields.set(req.field, h);
+    this.#fieldIds.set(h, req.field);
+    this.#fieldMeshes.set(req.field, [desc.on, ...desc.to]);
+    for (;;) {
+      let state: "idle" | "pending" | "done";
+      try {
+        state = steps.stepField(h, this.#stepPoints);
+      } catch (e) {
+        if (!isPoison(e)) {
+          forget();
+        }
+        throw e;
+      }
+      this.#onChunk?.({ kind: "fieldBuildStep", id: req.field });
+      if (state !== "pending") {
+        break;
+      }
+      await this.#maybeYield();
+      if (this.#feedsSuperseded(key)) {
+        steps.abandon();
+        forget();
+        this.#deferred.set(req.field, desc);
+        this.#fieldMeshes.set(req.field, [desc.on, ...desc.to]);
+        this.#onChunk?.({ kind: "fieldBuildAbandon", id: req.field });
+        return false;
+      }
+    }
+    this.#onChunk?.({ kind: "fieldBuild", id: req.field });
+    return true;
+  }
+
   // ---- Ids ----
 
   #mesh(id: ClientId): MeshHandle {
@@ -1077,18 +1150,8 @@ class Engine {
     return { ...rule, field: this.#field(rule.field) };
   }
 
+  /** A field removal (adds run in steps: {@link Engine.#addFieldInSteps}). */
   #runField(req: Extract<Request, { kind: "field" }>): void {
-    if (req.op === "add") {
-      if (this.#fields.has(req.field) || this.#deferred.has(req.field)) {
-        throw invalid(`field client id ${req.field} is already in use`);
-      }
-      const desc = req.desc;
-      if (desc === undefined) {
-        throw invalid("adding a field needs a desc");
-      }
-      this.#buildField(req.field, desc);
-      return;
-    }
     if (this.#deferred.has(req.field)) {
       // Never built: nothing to remove from the scene.
       this.#dropField(req.field);

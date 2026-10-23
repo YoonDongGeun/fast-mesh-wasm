@@ -826,6 +826,38 @@ impl WasmScene {
         Ok(self.scene.add_distance_field(desc)?.raw())
     }
 
+    /// [`WasmScene::add_distance_field`] computing nothing yet: the field is
+    /// due until stepped or updated; see
+    /// [`Scene::add_distance_field_deferred`].
+    pub fn add_distance_field_deferred(
+        &mut self,
+        name: String,
+        on_to: &[u32],
+        max_distance: f64,
+        sign: u8,
+    ) -> Result<u32, Error> {
+        let mut ids = self.ids(on_to)?;
+        if ids.len() < 2 {
+            return Err(Error::invalid("a field needs two meshes"));
+        }
+        let on = ids.remove(0);
+        let desc = DistanceField {
+            name,
+            on,
+            to: ids,
+            max_distance,
+            sign: parse_sign(sign)?,
+        };
+        Ok(self.scene.add_distance_field_deferred(desc)?.raw())
+    }
+
+    /// Removes a field never computed, reporting nothing; `false` (nothing
+    /// done) when it was computed or colours its mesh. See
+    /// [`Scene::withdraw_field`].
+    pub fn withdraw_field(&mut self, field: u32) -> Result<bool, Error> {
+        Ok(self.scene.withdraw_field(self.field(field)?)?)
+    }
+
     /// What the sign data found out about each target, in index order: five
     /// numbers per target, `[mode, closed, consistent orientation,
     /// non-manifold vertices, degenerate triangles]` as in
@@ -951,6 +983,21 @@ impl WasmScene {
             // by the next call that changes the scene).
             _ => 2,
         })
+    }
+
+    /// [`WasmScene::field_step`] for one field alone; see
+    /// [`Scene::field_step_field`]. Returns 0 (idle: the field is current),
+    /// 1 (pending) or 2 (done).
+    pub fn field_step_field(&mut self, field: u32, points: u32) -> Result<u8, Error> {
+        let budget = FieldBudget::Points(points as usize);
+        Ok(
+            match self.scene.field_step_field(self.field(field)?, budget)? {
+                StepState::Idle => 0,
+                StepState::Pending => 1,
+                StepState::Done => 2,
+                _ => 2,
+            },
+        )
     }
 
     /// Drops the open step unit, if any; see [`Scene::abandon_field_step`].

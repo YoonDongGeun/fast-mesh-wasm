@@ -902,18 +902,30 @@ function toUint32(values: Indices): Uint32Array {
  * - `setDefer(on)`: with `on`, the changes that would update the fields of
  *   `"eager"` meshes leave them due instead (adding a field still computes
  *   it at once).
- * - `step(points)`: computes up to `points` vertices of the due fields,
- *   opening a unit of every due field first (an undivided part). The call
- *   that computes the last applies the unit and returns `"done"`, exactly as
- *   a one-shot update at the state it opened at; `"idle"`: nothing was due.
- *   Any other scene call that may change the scene drops an open unit. A
- *   field error throws and ends the unit (the failing fields stay due).
+ * - `step(points)`: advances the due fields by a budget of `points`
+ *   (values, or about 32 times as many sign data elements, or 16 times as
+ *   many triangle pairs of a near search), opening a unit of every due
+ *   field first, or continuing the open unit. The call that finishes the
+ *   last applies the unit and returns `"done"`, exactly as a one-shot update
+ *   at the state it opened at; `"idle"`: nothing was due. Any other scene
+ *   call that may change the scene drops an open unit. A field error throws
+ *   and ends the unit (the failing fields stay due).
+ * - `addDeferred(desc)`: adds a field like `addDistanceField`, computing
+ *   nothing yet (no sign data either): it is due until stepped.
+ * - `stepField(field, points)`: `step` for one field alone, opening a unit
+ *   over it (dropping another open unit) or continuing its own; `"idle"`:
+ *   the field is current.
+ * - `withdraw(field)`: removes a field that was never computed, reporting
+ *   nothing; `false` (nothing done) when it was computed or colours its mesh.
  * - `abandon()`: drops the open unit; its fields stay due.
  * - `meshes()`: the meshes of the open unit's fields, each once.
  */
 interface FieldSteps {
   setDefer(on: boolean): void;
   step(points: number): "idle" | "pending" | "done";
+  addDeferred(desc: DistanceFieldDesc): FieldHandle;
+  stepField(field: FieldHandle, points: number): "idle" | "pending" | "done";
+  withdraw(field: FieldHandle): boolean;
   abandon(): void;
   meshes(): MeshHandle[];
 }
@@ -1623,13 +1635,22 @@ export class Scene implements SceneLike {
    * @throws `INVALID_ARGUMENT` when `to` is empty, holds `on` or a mesh twice, `maxDistance` is negative or NaN, or the name is taken.
    */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
+    return this.#addField(desc, false);
+  }
+
+  /** `addDistanceField`, or with `deferred` its internal variant that computes nothing yet. */
+  #addField(desc: DistanceFieldDesc, deferred: boolean): FieldHandle {
     const s = this.#scene();
     const ids = this.#flatIds([desc.on, ...targetsOf(desc.to)]);
     const sign = codeIn(SIGNS, desc.sign ?? "auto", "sign");
     if (typeof desc.name !== "string") {
       throw invalid("name must be a string");
     }
-    const raw = call(() => s.add_distance_field(desc.name, ids, desc.maxDistance, sign));
+    const raw = call(() =>
+      deferred
+        ? s.add_distance_field_deferred(desc.name, ids, desc.maxDistance, sign)
+        : s.add_distance_field(desc.name, ids, desc.maxDistance, sign),
+    );
     return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
   }
 
@@ -1759,6 +1780,17 @@ export class Scene implements SceneLike {
         const s = scene.#scene();
         const state = call(() => s.field_step(points));
         return state === 0 ? "idle" : state === 1 ? "pending" : "done";
+      },
+      addDeferred: (desc) => scene.#addField(desc, true),
+      stepField: (field, points) => {
+        const raw = scene.#field(field);
+        const s = scene.#scene();
+        const state = call(() => s.field_step_field(raw, points));
+        return state === 0 ? "idle" : state === 1 ? "pending" : "done";
+      },
+      withdraw: (field) => {
+        const raw = scene.#field(field);
+        return call(() => scene.#scene().withdraw_field(raw));
       },
       abandon: () => call(() => scene.#peek().abandon_field_step()),
       meshes: () => {
