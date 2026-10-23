@@ -419,6 +419,12 @@ class Engine {
   #lastRev = 0;
   /** A received batch is being run: its first request started, its result is not posted yet. */
   #batchOpen = false;
+  /**
+   * The open batch's end marker is consumed (its fields are being stepped
+   * or its result packed): a poisoning then must not take the next
+   * batch's requests for this one's.
+   */
+  #endConsumed = false;
   /** Requests received and not run yet, each batch followed by {@link END}. */
   readonly #queue: Item[] = [];
   /** A drain is under way (possibly waiting at a yield). */
@@ -606,10 +612,12 @@ class Engine {
         const item = this.#queue.shift() as Item;
         if (item === END) {
           this.#batchOpen = true;
+          this.#endConsumed = true;
           if (!(await this.#stepFields()) || !this.#finish()) {
             return;
           }
           this.#batchOpen = false;
+          this.#endConsumed = false;
         } else {
           this.#batchOpen = true;
           if (!(await this.#step(item))) {
@@ -633,7 +641,8 @@ class Engine {
     if (this.#superseded(req, key) || this.#abandoned(req, key)) {
       return true;
     }
-    if (this.#adds.length > 0 && this.#dependsOnAdds(req) && !(await this.#finishAdds())) {
+    // A trap while finishing them poisons with this request among the failed.
+    if (this.#adds.length > 0 && this.#dependsOnAdds(req) && !(await this.#finishAdds(req))) {
       return false;
     }
     try {
@@ -779,7 +788,7 @@ class Engine {
    * fails is dropped, with an error status for its add. `false` once
    * poisoned.
    */
-  async #advanceAdd(land = true): Promise<boolean> {
+  async #advanceAdd(land = true, failed?: Request): Promise<boolean> {
     const a = this.#adds[0];
     if (a === undefined) {
       return true;
@@ -788,17 +797,21 @@ class Engine {
       try {
         a.built = this.#meshAdds.step(a.token, this.#addStepWork);
       } catch (e) {
-        return this.#addFailed(a, e);
+        return this.#addFailed(a, e, false, failed);
       }
       this.#onChunk?.({ kind: "addMeshStep", id: a.id });
     }
-    return a.built && land ? this.#land(a) : true;
+    return a.built && land ? this.#land(a, failed) : true;
   }
 
-  /** Finishes every background add, in arrival order, yielding (to receive only) between steps. */
-  async #finishAdds(): Promise<boolean> {
+  /**
+   * Finishes every background add, in arrival order, yielding (to receive
+   * only) between steps, for `failed`, the request that waits on them (it
+   * is among the failed requests if they poison the engine).
+   */
+  async #finishAdds(failed?: Request): Promise<boolean> {
     while (this.#adds.length > 0) {
-      if (!(await this.#advanceAdd())) {
+      if (!(await this.#advanceAdd(true, failed))) {
         return false;
       }
       if (this.#adds.length > 0) {
@@ -813,13 +826,13 @@ class Engine {
    * way, or, when the Worker is idle (no batch received and not finished),
    * in an `update` message with the frame it lands in.
    */
-  #land(a: PendingAdd): boolean {
+  #land(a: PendingAdd, failed?: Request): boolean {
     this.#adds.shift();
     let h: MeshHandle;
     try {
       h = this.#meshAdds.finish(a.token);
     } catch (e) {
-      return this.#addFailed(a, e, true);
+      return this.#addFailed(a, e, true, failed);
     }
     this.#meshes.set(a.id, h);
     this.#meshIds.set(h, a.id);
@@ -828,8 +841,11 @@ class Engine {
     return true;
   }
 
-  /** Drops a failed background add; `false` (poisoned) on a trap. */
-  #addFailed(a: PendingAdd, e: unknown, taken = false): boolean {
+  /**
+   * Drops a failed background add; `false` (poisoned) on a trap, with
+   * `failed` (the request waiting on it, if any) among the failed requests.
+   */
+  #addFailed(a: PendingAdd, e: unknown, taken = false, failed?: Request): boolean {
     if (!taken) {
       this.#adds.shift();
       try {
@@ -839,9 +855,14 @@ class Engine {
       }
     }
     if (isPoison(e)) {
-      const b = this.#batchOpen ? this.#batch : new Batch();
-      b.error(a.key, a.rev, POISONED);
-      this.#poison(b, POISONED, undefined, !this.#batchOpen);
+      if (this.#batchOpen) {
+        this.#batch.error(a.key, a.rev, POISONED);
+        this.#poison(this.#batch, POISONED, failed, this.#endConsumed);
+      } else {
+        const b = new Batch();
+        b.error(a.key, a.rev, POISONED);
+        this.#poisonIdle(b, POISONED);
+      }
       return false;
     }
     const error = toWire(e);
@@ -865,13 +886,13 @@ class Engine {
     try {
       result = this.#result(b);
     } catch (e) {
-      this.#poison(b, isPoison(e) ? POISONED : packingFailed(e), undefined, true);
+      this.#poisonIdle(b, isPoison(e) ? POISONED : packingFailed(e));
       return;
     }
     try {
       this.#port.postUpdate?.(result, b.transfer);
     } catch (e) {
-      this.#poison(b, packingFailed(e), undefined, true);
+      this.#poisonIdle(b, packingFailed(e));
     }
   }
 
@@ -1053,6 +1074,7 @@ class Engine {
    */
   #poison(b: Batch, error: ErrorWire, failed?: Request, ended = false): void {
     this.#poisoned = true;
+    this.#failAdds(b, error);
     const rest = this.#queue.splice(0);
     for (const st of b.status) {
       st.status = "error";
@@ -1077,6 +1099,54 @@ class Engine {
       }
       this.#postPoisoned(rest.slice(start, next) as Request[], new Batch(), error);
       start = next + 1;
+    }
+  }
+
+  /**
+   * Stops the engine while no batch is open (a background add trapped or
+   * could not be posted while the Worker was idle): `b`'s outcome, every
+   * pending add's key failed with it, goes out as a poisoned `update`,
+   * which belongs to no batch; batches received but not started (none,
+   * normally) get poisoned results of their own, as later ones will.
+   */
+  #poisonIdle(b: Batch, error: ErrorWire): void {
+    this.#poisoned = true;
+    this.#failAdds(b, error);
+    for (const st of b.status) {
+      st.status = "error";
+      st.error = error;
+    }
+    const result: Result = {
+      rev: this.#lastRev,
+      changes: [],
+      placements: [],
+      sections: [],
+      history: { canUndo: false, canRedo: false },
+      status: b.status,
+      replies: [],
+      colorings: [],
+      poisoned: true,
+    };
+    try {
+      this.#port.postUpdate?.(result, []);
+    } catch {
+      // The channel itself is gone: nothing more can be sent.
+    }
+    const rest = this.#queue.splice(0);
+    for (let start = 0; start < rest.length; ) {
+      let next = rest.indexOf(END, start);
+      if (next < 0) {
+        next = rest.length;
+      }
+      this.#postPoisoned(rest.slice(start, next) as Request[], new Batch(), error);
+      start = next + 1;
+    }
+  }
+
+  /** Fails the status of every background add still pending into `b`, and forgets them. */
+  #failAdds(b: Batch, error: ErrorWire): void {
+    for (const a of this.#adds.splice(0)) {
+      b.error(a.key, a.rev, error);
     }
   }
 

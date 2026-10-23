@@ -5,6 +5,7 @@
 // delivers newer batches between chunks.
 import { describe, expect, it } from "vitest";
 import { Scene } from "../src/node.js";
+import { WasmScene } from "../src/wasm/fast_mesh_wasm.js";
 import { runEngine } from "../src/worker/engine.js";
 import type { ClientId, Request, Result } from "../src/worker/protocol.js";
 
@@ -228,7 +229,7 @@ type Posted = { update: boolean; result: Result };
  * The engine in-process with background adds for meshes of 2000 triangles or more (BIG, not A or B) in
  * small steps, and an update channel.
  */
-function addEngine(options: { backgroundAddTriangles?: number } = {}) {
+function addEngine(options: { backgroundAddTriangles?: number; stepPoints?: number } = {}) {
   const posted: Posted[] = [];
   const chunks: { kind: string; id?: ClientId }[] = [];
   const waiting: (() => void)[] = [];
@@ -274,6 +275,7 @@ function addEngine(options: { backgroundAddTriangles?: number } = {}) {
       debug: true,
       yieldMs: 0,
       addStepWork: 64,
+      stepPoints: options.stepPoints,
       backgroundAddTriangles: options.backgroundAddTriangles ?? 2000,
       onChunk: (chunk) => {
         chunks.push(chunk);
@@ -513,5 +515,146 @@ describe("background adds", () => {
     // The id is free again.
     h.send([addMeshReq(1, A)]);
     await h.until(() => h.posted.length >= 2 && h.chunks.some((c) => c.kind === "addMesh"));
+  });
+});
+
+// ---- Poisoning with a background add pending (review I1) ----
+
+type Proto = Record<string, (...args: unknown[]) => unknown>;
+
+/** Replaces a `WasmScene` method for the duration of `run`. */
+async function patched(name: string, make: (orig: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown, run: () => Promise<void>) {
+  const proto = WasmScene.prototype as unknown as Proto;
+  const orig = proto[name];
+  proto[name] = make(orig);
+  try {
+    await run();
+  } finally {
+    proto[name] = orig;
+  }
+}
+
+/**
+ * A trap as the engine sees it (`INSTANCE_POISONED`), without poisoning
+ * this test process's shared instance as a real `RuntimeError` would.
+ */
+const trap = () => {
+  throw new Error("INSTANCE_POISONED: trap (test)");
+};
+
+/** Every status posted for `key`, as `status` strings. */
+const statusesOf = (h: ReturnType<typeof addEngine>, key: string) =>
+  h.posted.flatMap((p) => p.result.status.filter((st) => st.key === key).map((st) => st.status));
+
+describe("poisoning with a background add pending", () => {
+  it("an_unrelated_trap_errors_the_pending_add", async () => {
+    await patched("analyze", () => trap, async () => {
+      const h = addEngine();
+      h.send([addMeshReq(1, A)]);
+      await h.until(() => h.results().length === 1);
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.results().length === 2);
+      h.send([{ kind: "query", rev: rev(), qid: 1, name: "analyze", args: { mesh: 1 } }]);
+      await h.until(() => h.results().length === 3);
+      const r = h.results()[2];
+      expect(r.poisoned).toBe(true);
+      expect(statusesOf(h, "mesh:3")).toEqual(["error"]);
+      expect(r.replies[0].ok).toBe(false);
+    });
+  });
+
+  it("a_trap_while_finishing_adds_errors_the_waiting_request", async () => {
+    let calls = 0;
+    await patched(
+      "add_mesh_step",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          if (++calls === 3) {
+            trap();
+          }
+          return orig.apply(this, args);
+        },
+      async () => {
+        const h = addEngine();
+        h.send([addMeshReq(1, A)]);
+        await h.until(() => h.results().length === 1);
+        const move = placement(3, 1);
+        h.send([addMeshReq(3, BIG), move]);
+        await h.until(() => h.results().length === 2);
+        const r = h.results()[1];
+        expect(r.poisoned).toBe(true);
+        expect(r.status.find((st) => st.key === "placement:3")?.status).toBe("error");
+        expect(r.status.find((st) => st.key === "mesh:3")?.status).toBe("error");
+      },
+    );
+  });
+
+  it("a_trap_while_stepping_fields_keeps_one_result_per_batch", async () => {
+    let calls = 0;
+    let armed = false;
+    await patched(
+      "add_mesh_step",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          if (armed && ++calls === 2) {
+            trap();
+          }
+          return orig.apply(this, args);
+        },
+      async () => {
+        const h = addEngine({ stepPoints: 4 });
+        h.send([
+          addMeshReq(1, A),
+          addMeshReq(2, B),
+          { kind: "field", rev: rev(), field: 1, op: "add", desc: { name: "d", on: 1, to: [2], maxDistance: 8 } },
+        ]);
+        await h.until(() => h.results().length === 1);
+        armed = true;
+        // A background add, then a batch whose field recompute steps (the
+        // add steps between them and traps), and one more batch behind.
+        h.send([addMeshReq(3, BIG)]);
+        h.send([placement(1, 0.2)]);
+        const last = placement(2, 0.1);
+        h.send([last]);
+        await h.until(() => h.results().length === 4);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const results = h.results();
+        expect(results.length).toBe(4);
+        expect(results[3].poisoned).toBe(true);
+        expect(results[3].status).toEqual([expect.objectContaining({ key: "placement:2", status: "error" })]);
+        expect(statusesOf(h, "mesh:3")).toEqual(["error"]);
+        expect(h.posted.filter((p) => p.update)).toEqual([]);
+      },
+    );
+  });
+
+  it("an_idle_trap_is_posted_as_an_update", async () => {
+    let calls = 0;
+    await patched(
+      "add_mesh_step",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          if (++calls === 3) {
+            trap();
+          }
+          return orig.apply(this, args);
+        },
+      async () => {
+        const h = addEngine();
+        h.send([addMeshReq(1, A)]);
+        await h.until(() => h.results().length === 1);
+        h.send([addMeshReq(3, BIG)]);
+        await h.until(() => h.posted.some((p) => p.update));
+        const u = h.posted.find((p) => p.update)?.result as Result;
+        expect(u.poisoned).toBe(true);
+        expect(u.status).toEqual([expect.objectContaining({ key: "mesh:3", status: "error" })]);
+        // One result for each of the two batches, no more.
+        expect(h.results().length).toBe(2);
+        // Later batches are answered as poisoned.
+        h.send([placement(1, 0.3)]);
+        await h.until(() => h.results().length === 3);
+        expect(h.results()[2].poisoned).toBe(true);
+      },
+    );
   });
 });
