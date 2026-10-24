@@ -740,6 +740,126 @@ const trap = () => {
 const statusesOf = (h: ReturnType<typeof addEngine>, key: string) =>
   h.posted.flatMap((p) => p.result.status.filter((st) => st.key === key).map((st) => st.status));
 
+describe("background add landings against a synchronous scene", () => {
+  // Review I2: the landing record of a background add, with each kind of
+  // request that changes the mesh after it lands in the same batch, bit for
+  // bit against a synchronous Scene, on 1 and 4 threads, with normals on and
+  // off. Whatever path the copies take (made and sent, made and dropped, or
+  // not made), the bytes are the frame's.
+  type Mesh = { positions: Float64Array; indices: Uint32Array };
+  const add = (id: ClientId, mesh: Mesh, normals: boolean): Request => ({
+    ...addMeshReq(id, mesh),
+    options: { normals },
+  });
+  const moved: EditOp[] = [{ op: "setPositions", vertices: [41], positions: [1, 6, 1] }];
+  const holes: EditOp[] = [{ op: "removeTriangles", triangles: [0, 1, 2, 50] }];
+  const weld = { op: "weld", tolerance: 0.2 } as const;
+  /** A synchronous scene's buffers of BIG added after A and B, then changed by `change`. */
+  function reference(normals: boolean, change: (s: Scene, m: MeshHandleOf) => void) {
+    const s = new Scene();
+    try {
+      s.addMesh(A.positions, A.indices);
+      s.addMesh(B.positions, B.indices);
+      const m = s.addMesh(BIG.positions, BIG.indices, { normals });
+      change(s, m);
+      const v = s.views(m);
+      return { positions: v.positions().slice(), normals: v.normals()?.slice() ?? null, indices: v.indices().slice() };
+    } finally {
+      s.free();
+    }
+  }
+  type MeshHandleOf = ReturnType<Scene["addMesh"]>;
+  const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+    want === null
+      ? got === null
+      : got != null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+  const cases: [string, (id: ClientId) => Request[], (s: Scene, m: MeshHandleOf) => void][] = [
+    ["weld", (id) => [{ kind: "repair", rev: rev(), id, payload: weld }], (s, m) => void s.repair(m, weld)],
+    [
+      "edit and compact",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: holes },
+        { kind: "compact", rev: rev(), id },
+      ],
+      (s, m) => {
+        s.edit(m, holes);
+        s.compact(m);
+      },
+    ],
+    [
+      "edit and undo",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: moved },
+        { kind: "undo", rev: rev() },
+      ],
+      () => {},
+    ],
+    [
+      "edit, undo and redo",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: moved },
+        { kind: "undo", rev: rev() },
+        { kind: "redo", rev: rev() },
+      ],
+      (s, m) => void s.edit(m, moved),
+    ],
+    ["placement", (id) => [placement(id, 3)], () => {}],
+  ];
+  for (const threads of [1, 4]) {
+    for (const normals of [true, false]) {
+      for (const [name, requests, change] of cases) {
+        it(`${name}, ${threads} thread(s), normals ${normals ? "on" : "off"}`, async () => {
+          const h = addEngine({ threads });
+          h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+          await h.until(() => h.results().length === 1);
+          h.send([add(3, BIG, normals), ...requests(3)]);
+          await h.until(() => h.results().length === 2);
+          const record = h.results()[1].changes.find((c) => c.id === 3);
+          expect(record?.added).toBe(true);
+          const want = reference(normals, change);
+          expect(same(record?.bytes.positions, want.positions)).toBe(true);
+          expect(same(record?.bytes.normals, want.normals)).toBe(true);
+          expect(same(record?.bytes.indices, want.indices)).toBe(true);
+        });
+      }
+      it(`remove and add again, ${threads} thread(s), normals ${normals ? "on" : "off"}`, async () => {
+        const h = addEngine({ threads });
+        h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+        await h.until(() => h.results().length === 1);
+        h.send([add(3, BIG, normals), { kind: "removeMesh", rev: rev(), id: 3 }, add(4, BIG, normals)]);
+        await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 4 && c.added)));
+        const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 4 && c.added)).find(Boolean);
+        const want = reference(normals, () => {});
+        expect(same(record?.bytes.positions, want.positions)).toBe(true);
+        expect(same(record?.bytes.normals, want.normals)).toBe(true);
+        expect(same(record?.bytes.indices, want.indices)).toBe(true);
+      });
+    }
+  }
+
+  it("a_landing_waits_for_an_open_field_unit_and_is_copied_meanwhile", async () => {
+    // The copy changes nothing in the scene, so it runs between the steps
+    // of a field step unit; the landing waits until the unit is over.
+    const h = addEngine({ stepPoints: 4, addStepWork: 400 });
+    h.send([addMeshReq(1, A), addMeshReq(2, B), fieldAdd(9, 1, 2, 0.5)]);
+    await h.until(() => h.results().length === 1);
+    const from = h.chunks.length;
+    h.send([addMeshReq(3, BIG), placement(1, 0.05)]);
+    await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+    const kinds = h.chunks.slice(from).map((c) => c.kind);
+    const firstStep = kinds.indexOf("fieldStep");
+    const lastStep = kinds.lastIndexOf("fieldStep");
+    const packs = kinds.map((k, i) => (k === "addMeshPack" ? i : -1)).filter((i) => i >= 0);
+    expect(packs.some((i) => i > firstStep && i < lastStep), kinds.join(" ")).toBe(true);
+    expect(kinds.indexOf("addMesh")).toBeGreaterThan(lastStep);
+    const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 3 && c.added)).find(Boolean);
+    const want = reference(true, () => {});
+    expect(same(record?.bytes.positions, want.positions)).toBe(true);
+    expect(same(record?.bytes.normals, want.normals)).toBe(true);
+    expect(same(record?.bytes.indices, want.indices)).toBe(true);
+  });
+});
+
 describe("poisoning with a background add pending", () => {
   it("an_unrelated_trap_errors_the_pending_add", async () => {
     await patched("analyze", () => trap, async () => {
