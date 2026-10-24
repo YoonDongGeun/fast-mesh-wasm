@@ -955,6 +955,8 @@ export function fieldSteps(scene: Scene): FieldSteps {
  *   allocate, like any view.
  * - `finish(token)`: adds the mesh (finishing its BVH and normals first),
  *   exactly as `addMesh` with the same inputs would, and returns its handle.
+ * - `stamp(mesh)`: the mesh's content stamp, which goes up whenever its
+ *   positions, triangles or normals change (undo and redo included).
  * - `drop(token)`: forgets a build; nothing is added.
  */
 interface MeshAdds {
@@ -962,6 +964,7 @@ interface MeshAdds {
   step(token: number, budget: number): boolean;
   buffers(token: number): { positions: Float32Array; normals: Float32Array | null; indices: Uint32Array };
   finish(token: number): MeshHandle;
+  stamp(mesh: MeshHandle): number;
   drop(token: number): void;
 }
 
@@ -1831,6 +1834,10 @@ export class Scene implements SceneLike {
       finish: (token) => {
         const id = call(() => scene.#scene().finish_add_mesh(token));
         return scene.#meshHandle(id[0], id[1]);
+      },
+      stamp: (mesh) => {
+        const { index, generation } = scene.#id(mesh);
+        return call(() => scene.#peek().content_stamp(index, generation));
       },
       drop: (token) => call(() => scene.#peek().drop_add_mesh(token)),
     });

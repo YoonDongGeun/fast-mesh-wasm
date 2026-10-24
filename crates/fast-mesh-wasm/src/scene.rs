@@ -370,6 +370,13 @@ impl WasmScene {
         self.added(id, mode, normals)
     }
 
+    /// The mesh's content stamp (`Scene::content_stamp`): it goes up
+    /// whenever the mesh's positions, triangles or normals change.
+    pub fn content_stamp(&self, index: u32, generation: u32) -> Result<f64, Error> {
+        // Exact in `f64` far beyond any count of changes.
+        Ok(self.scene.content_stamp(self.id(index, generation)?)? as f64)
+    }
+
     /// Drops a mesh being added in steps (nothing was added).
     pub fn drop_add_mesh(&mut self, build: u32) {
         self.adds.remove(&build);
@@ -1884,6 +1891,10 @@ mod tests {
         );
         assert_eq!(bufs[3], 12);
         assert!(s.add_mesh_buffers(build).is_err());
+        // The content stamp goes up with a compaction of the mesh.
+        let before = s.content_stamp(i, g).unwrap();
+        s.compact(i, g).unwrap();
+        assert!(s.content_stamp(i, g).unwrap() > before);
         let other = s
             .begin_add_mesh(&positions, &indices, None, 0, false)
             .unwrap();

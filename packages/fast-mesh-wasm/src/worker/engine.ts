@@ -140,6 +140,12 @@ export interface EngineOptions {
    * with yields, which costs the same, so newer batches still arrive.
    */
   threads?: number;
+  /**
+   * Test-only: never drop a landed add's copied-out buffers early (see
+   * {@link Engine.#unpack}), so that only the check at packing time guards
+   * them.
+   */
+  keepCopies?: boolean;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
@@ -424,6 +430,11 @@ interface Packed {
   indices: ArrayBuffer;
   /** Bytes copied so far, over the three in that order. */
   done: number;
+  /**
+   * The landed mesh's content stamp (`meshAdds.stamp`) when it landed: the
+   * copies are sent only while the mesh still has it.
+   */
+  stamp?: number;
 }
 
 /** Whether every byte of a {@link Packed} copy is copied. */
@@ -477,6 +488,7 @@ class Engine {
   readonly #addStepWork: number;
   /** More than one thread: a waiting request finishes adds in one call. */
   readonly #threaded: boolean;
+  readonly #keepCopies: boolean;
   /** The revision of the last result posted, for `update` messages. */
   #lastRev = 0;
   /** A received batch is being run: its first request started, its result is not posted yet. */
@@ -565,6 +577,7 @@ class Engine {
     const work = Math.floor(options.addStepWork ?? ADD_STEP_WORK);
     this.#addStepWork = work >= 1 ? Math.min(work, ALL_POINTS) : ADD_STEP_WORK;
     this.#threaded = (options.threads ?? 1) > 1;
+    this.#keepCopies = options.keepCopies ?? false;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
   }
@@ -924,11 +937,12 @@ class Engine {
 
   /**
    * Forgets the copied-out buffers of a landed mesh that `req` may change
-   * (an edit, repair or compaction of it, an undo or redo), so its record
-   * copies the buffers as they are then.
+   * (an edit, repair or compaction of it, an undo or redo), to free them
+   * early. Correctness does not depend on it: the copies are sent only
+   * while the mesh's content stamp is the one it landed with.
    */
   #unpack(req: Request): void {
-    if (this.#packed.size === 0) {
+    if (this.#packed.size === 0 || this.#keepCopies) {
       return;
     }
     switch (req.kind) {
@@ -994,6 +1008,7 @@ class Engine {
     this.#meshes.set(a.id, h);
     this.#meshIds.set(h, a.id);
     if (packedAll(a.packed)) {
+      a.packed.stamp = this.#meshAdds.stamp(h);
       this.#packed.set(h, a.packed);
     }
     this.#onChunk?.({ kind: "addMesh", id: a.id });
@@ -1966,9 +1981,12 @@ class Engine {
     }
     wire.vertexSlots = this.#scene.vertexSlots(c.mesh);
     wire.triangleSlots = this.#scene.triangleSlots(c.mesh);
-    // A background add's buffers copied out before it landed (the mesh
-    // unchanged since): sent as they are.
-    const packed = c.added ? this.#packed.get(c.mesh) : undefined;
+    // A background add's buffers copied out before it landed, while its
+    // content stamp says the mesh is unchanged since: sent as they are.
+    let packed = c.added ? this.#packed.get(c.mesh) : undefined;
+    if (packed !== undefined && packed.stamp !== this.#meshAdds.stamp(c.mesh)) {
+      packed = undefined;
+    }
     // Fresh views, read with no scene call in between.
     const views: MeshViews = this.#scene.views(c.mesh);
     for (const name of Object.keys(STRIDE) as BufferName[]) {

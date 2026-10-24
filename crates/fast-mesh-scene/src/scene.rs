@@ -76,6 +76,10 @@ pub(crate) struct Entry {
     pub(crate) coloring: Option<ColorState>,
     /// The mesh's vertex normals, if they are on.
     pub(crate) normals: Option<NormalState>,
+    /// Goes up whenever the mesh's positions, triangles or normals change
+    /// (see [`Scene::content_stamp`]): every such change is reported, and
+    /// every report of one bumps it.
+    pub(crate) content: u64,
 }
 
 impl Entry {
@@ -94,6 +98,7 @@ impl Entry {
     /// field and section hook; the normals are recomputed in full on their
     /// next update.
     pub(crate) fn report_everything(&mut self) {
+        self.content += 1;
         for r in &mut self.reports {
             r.changes = None;
             r.colors_dirty = None;
@@ -157,6 +162,7 @@ impl Entry {
     /// changes, into every subscriber's report, into every field and
     /// section hook and into the normals' pending changes.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
+        self.content += 1;
         match &mut self.pending {
             Some(p) => p.merge(changes),
             None => self.pending = Some(changes.clone()),
@@ -434,6 +440,7 @@ impl Scene {
             section_hooks: Vec::new(),
             coloring: None,
             normals: None,
+            content: 0,
         })
     }
 

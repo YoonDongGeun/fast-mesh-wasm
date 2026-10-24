@@ -259,7 +259,13 @@ type Posted = { update: boolean; result: Result };
  * small steps, and an update channel.
  */
 function addEngine(
-  options: { backgroundAddTriangles?: number; stepPoints?: number; addStepWork?: number; threads?: number } = {},
+  options: {
+    backgroundAddTriangles?: number;
+    stepPoints?: number;
+    addStepWork?: number;
+    threads?: number;
+    keepCopies?: boolean;
+  } = {},
 ) {
   const posted: Posted[] = [];
   const chunks: { kind: string; id?: ClientId }[] = [];
@@ -307,6 +313,7 @@ function addEngine(
       yieldMs: 0,
       addStepWork: options.addStepWork ?? 64,
       threads: options.threads,
+      keepCopies: options.keepCopies,
       stepPoints: options.stepPoints,
       backgroundAddTriangles: options.backgroundAddTriangles ?? 2000,
       onChunk: (chunk) => {
@@ -432,6 +439,27 @@ describe("background adds", () => {
     expect(same(added?.bytes.normals, ref.normals)).toBe(true);
     expect(same(added?.bytes.indices, ref.indices)).toBe(true);
     expect(same(added?.bytes.positions, referenceBuffers().positions)).toBe(false);
+  });
+
+  it("the_copies_are_checked_against_the_mesh_when_packed", async () => {
+    // Review I1: with the early drop of the copies turned off, an edit
+    // after the landing (a placement waits on the add, which lands with
+    // its copies, then the edit runs) is still packed as edited: the
+    // copies carry the mesh's content stamp, checked at packing time.
+    const h = addEngine({ keepCopies: true });
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const op: EditOp = { op: "setPositions", vertices: [41], positions: [1.1, 6.2, 0.9] };
+    h.send([addMeshReq(3, BIG), placement(3, 0), { kind: "edit", rev: rev(), id: 3, payload: [op] }]);
+    await h.until(() => h.results().length === 2);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(true);
+    const added = h.results()[1].changes.find((c) => c.id === 3);
+    const ref = referenceBuffers([op]);
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
   });
 
   it("a_waiting_request_steps_the_add_single_threaded", async () => {

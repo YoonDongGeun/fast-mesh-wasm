@@ -325,6 +325,7 @@ impl NormalBuild {
 impl Entry {
     /// Reports vertices with new normals to every subscriber (`None`: all).
     pub(crate) fn report_normals(&mut self, ids: Option<&[VertexId]>) {
+        self.content += 1;
         for r in &mut self.reports {
             r.normals_changed(ids);
         }
@@ -410,6 +411,20 @@ impl Scene {
     /// [`SceneError::UnknownMesh`] for a stale id.
     pub fn normals(&self, id: MeshId) -> Result<Option<&[[f32; 3]]>> {
         Ok(self.entry(id)?.normals.as_ref().map(NormalState::normals))
+    }
+
+    /// A number that goes up (and never down) whenever the mesh's
+    /// positions, triangles or normals change: every commit, undo, redo and
+    /// cancel, compaction, recovery and normals update or switch. Unlike
+    /// [`Mesh::revision`](fast_mesh_store::Mesh::revision), which an undo
+    /// takes back, equal stamps mean nothing in those buffers changed in
+    /// between. Placements and colourings leave it alone.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    #[doc(hidden)]
+    pub fn content_stamp(&self, id: MeshId) -> Result<u64> {
+        Ok(self.entry(id)?.content)
     }
 }
 
@@ -590,6 +605,40 @@ mod tests {
         let mut build = super::NormalBuild::new();
         build.step(mesh, 1).unwrap();
         assert!(build.finish().is_none());
+    }
+
+    #[test]
+    fn content_stamp_moves_on_every_change_of_the_render_buffers() {
+        // It only goes up: on an edit, an undo (which takes the store's
+        // revision back), a redo, a compaction and a normals switch; never
+        // on a placement or a colouring.
+        let (mut scene, id) = scene_with(UpdateMode::Eager);
+        let mut last = scene.content_stamp(id).unwrap();
+        let mut moved = |scene: &Scene, what: &str, want: bool| {
+            let now = scene.content_stamp(id).unwrap();
+            assert!(now >= last, "{what}: went down");
+            assert_eq!(now > last, want, "{what}");
+            last = now;
+        };
+        scene.set_normals(id, true).unwrap();
+        moved(&scene, "normals on", true);
+        move_by(&mut scene, id, 5, [0.0, 0.0, 0.5]);
+        moved(&scene, "edit", true);
+        scene.undo().unwrap();
+        moved(&scene, "undo", true);
+        scene.redo().unwrap();
+        moved(&scene, "redo", true);
+        scene.edit(id, |tx| tx.remove_triangles(&[3])).unwrap();
+        scene.compact(id).unwrap();
+        moved(&scene, "remove and compact", true);
+        let mut p = scene.placement(id).unwrap();
+        p.translation = [2.0, 0.0, 0.0];
+        scene.set_placement(id, p).unwrap();
+        moved(&scene, "placement", false);
+        scene.set_normals(id, false).unwrap();
+        moved(&scene, "normals off", true);
+        scene.remove_mesh(id).unwrap();
+        assert_eq!(scene.content_stamp(id), Err(SceneError::UnknownMesh));
     }
 
     #[test]
