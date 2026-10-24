@@ -973,6 +973,46 @@ describe("poisoning with a background add pending", () => {
     );
   });
 
+  it("a_trap_reading_the_landed_stamp_poisons", async () => {
+    // Re-review R1: the stamp read when an add lands is guarded like the
+    // landing itself: a trap poisons (here while idle: an update).
+    await patched("content_stamp", () => trap, async () => {
+      const h = addEngine();
+      h.send([addMeshReq(1, A)]);
+      await h.until(() => h.results().length === 1);
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.posted.some((p) => p.update));
+      const u = h.posted.find((p) => p.update)?.result as Result;
+      expect(u.poisoned).toBe(true);
+      expect(u.status).toEqual([expect.objectContaining({ key: "mesh:3", status: "error" })]);
+    });
+  });
+
+  it("another_error_reading_the_landed_stamp_keeps_no_copy", async () => {
+    // Any other error: the add lands without keeping its copy, and the
+    // frame copies the buffers.
+    await patched(
+      "content_stamp",
+      () => () => {
+        throw new Error("stamp unavailable (test)");
+      },
+      async () => {
+        const h = addEngine();
+        h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+        await h.until(() => h.results().length === 1);
+        h.send([addMeshReq(3, BIG)]);
+        await h.until(() => h.posted.some((p) => p.update));
+        const u = h.posted.find((p) => p.update)?.result as Result;
+        expect(u.poisoned).toBeFalsy();
+        expect(u.status).toEqual([{ key: "mesh:3", rev: expect.any(Number), status: "ready" }]);
+        const bytes = u.changes.find((c) => c.id === 3)?.bytes;
+        const ref = referenceBuffers();
+        expect(Buffer.from(bytes?.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+        expect(Buffer.from(bytes?.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
+      },
+    );
+  });
+
   it("an_idle_trap_is_posted_as_an_update", async () => {
     let calls = 0;
     await patched(

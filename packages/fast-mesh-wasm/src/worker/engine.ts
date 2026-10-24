@@ -1033,8 +1033,15 @@ class Engine {
     this.#meshes.set(a.id, h);
     this.#meshIds.set(h, a.id);
     if (packedAll(a.packed)) {
-      a.packed.stamp = this.#meshAdds.stamp(h);
-      this.#packed.set(h, a.packed);
+      try {
+        a.packed.stamp = this.#meshAdds.stamp(h);
+        this.#packed.set(h, a.packed);
+      } catch (e) {
+        if (isPoison(e)) {
+          return this.#addFailed(a, e, true, failed);
+        }
+        // Not kept: the frame copies the buffers.
+      }
     }
     this.#onChunk?.({ kind: "addMesh", id: a.id });
     this.#settle((b) => b.ready(a.key, a.rev));
