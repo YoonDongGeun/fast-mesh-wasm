@@ -6,7 +6,7 @@ use fast_mesh_store::{Mesh, TriangleId};
 use crate::arena::{Arena, NONE, Node};
 use crate::build::{Prims, TreeBuild, build_full, expected_nodes};
 use crate::error::{Result, try_reserve, try_reserve_exact, try_reserve_map, try_vec};
-use crate::{Aabb, BuildOptions, NodeKind, UpdatePolicy};
+use crate::{Aabb, BuildOptions, NodeId, NodeKind, UpdatePolicy};
 
 /// Source of [`Bvh::generation`] values, shared by every BVH in the process so
 /// that no two trees (or states of one tree) ever share a value.
@@ -33,6 +33,9 @@ pub struct Bvh {
     pub(crate) treelets: Vec<Treelet>,
     /// Treelet root node → index into `treelets`.
     pub(crate) treelet_of_root: HashMap<u32, usize>,
+    /// The triangles below each node slot (see [`Bvh::subtree_triangles`]);
+    /// meaningless for garbage slots.
+    pub(crate) counts: Vec<u32>,
     /// Nodes and refs no longer reachable from the root.
     pub(crate) garbage_nodes: usize,
     pub(crate) garbage_refs: usize,
@@ -69,12 +72,39 @@ pub(crate) fn alive_prims(mesh: &Mesh) -> Result<Prims> {
     Ok(prims)
 }
 
+/// Subtree counts computed per unit of a [`BvhBuild::step`] budget (see
+/// [`Assign`]).
+const COUNTS_PER_UNIT: usize = 64;
+
+/// Triangles of a treelet whose cost is computed per unit of a
+/// [`BvhBuild::step`] budget (see [`Assign`]).
+const COST_TRIANGLES_PER_UNIT: usize = 32;
+
+/// Where the treelet assignment of a freshly built tree stands
+/// ([`Bvh::assign_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Assign {
+    Start,
+    /// Counting each node's triangles, node slots below this one left
+    /// (children have larger slots than their parents, so a sweep down
+    /// sees children first).
+    Counts(usize),
+    /// Choosing the treelet roots: the topmost subtrees holding at most
+    /// `treelet_size` triangles, or single leaves.
+    Roots,
+    /// Computing each treelet's build cost, from this treelet on.
+    Costs(usize),
+    Done,
+}
+
 /// Where a [`BvhBuild`] stands.
 enum BuildStage {
     /// Collecting the alive triangles' boxes, from this triangle slot on.
     Prims(Prims, usize),
     /// Building the tree.
     Tree(Box<TreeBuild>),
+    /// The tree is built; assigning its treelets.
+    Treelets(Box<Bvh>, Assign),
     /// Done: the BVH is ready to be taken.
     Done(Box<Bvh>),
     /// Taken, or failed.
@@ -83,7 +113,8 @@ enum BuildStage {
 
 /// [`Bvh::build`] cut into steps, so that a caller can yield between them:
 /// the triangles' boxes are collected, then the tree is built a bounded
-/// amount of work per step, then its treelets are assigned (one pass).
+/// amount of work per step, then its treelets are assigned (subtree
+/// counts, roots and costs), also a bounded amount per step.
 ///
 /// The tree is the same, slot for slot and bit for bit, as from
 /// [`Bvh::build`], with or without the `parallel` feature (with it, a step
@@ -150,9 +181,10 @@ impl BvhBuild {
     }
 
     /// Builds about `budget` more units of work (at least some, unless
-    /// done): a triangle's box collected, or a triangle visited while the
-    /// tree is built (each triangle about once per tree level). Returns
-    /// whether the BVH is built.
+    /// done): a triangle's box collected, a triangle visited while the
+    /// tree is built (each triangle about once per tree level), 64 nodes'
+    /// subtree counts, or 32 triangles of a treelet's cost. Returns whether
+    /// the BVH is built.
     ///
     /// # Errors
     /// [`BvhError::InvalidOptions`](crate::BvhError::InvalidOptions) when
@@ -183,8 +215,9 @@ impl BvhBuild {
                     }
                     let arena = self.arena.take().ok_or(crate::BvhError::OutOfMemory)?;
                     if prims.len() == 0 {
-                        self.stage =
-                            BuildStage::Done(Box::new(self.finish_tree(mesh, arena, NONE)?));
+                        let mut bvh = self.finish_tree(mesh, arena, NONE)?;
+                        bvh.assign_treelets()?;
+                        self.stage = BuildStage::Done(Box::new(bvh));
                         return Ok(true);
                     }
                     self.stage =
@@ -200,8 +233,16 @@ impl BvhBuild {
                     }
                     let root = tree.root;
                     let bvh = self.finish_tree(mesh, tree.arena, root)?;
-                    self.stage = BuildStage::Done(Box::new(bvh));
-                    return Ok(true);
+                    self.stage = BuildStage::Treelets(Box::new(bvh), Assign::Start);
+                    return Ok(false);
+                }
+                BuildStage::Treelets(mut bvh, mut at) => {
+                    if bvh.assign_step(&mut at, left)? {
+                        self.stage = BuildStage::Done(bvh);
+                        return Ok(true);
+                    }
+                    self.stage = BuildStage::Treelets(bvh, at);
+                    return Ok(false);
                 }
                 done @ BuildStage::Done(_) => {
                     self.stage = done;
@@ -220,18 +261,20 @@ impl BvhBuild {
         }
     }
 
-    /// The BVH around a built tree, as [`Bvh::assemble`] makes it.
+    /// The BVH around a built tree, as [`Bvh::assemble`] makes it, its
+    /// treelets not assigned yet.
     fn finish_tree(&self, mesh: &Mesh, mut arena: Arena, root: u32) -> Result<Bvh> {
         if root == NONE {
             let expected = expected_nodes(0, self.options.max_leaf_size);
             try_reserve_exact(&mut arena.nodes, expected)?;
             try_reserve_exact(&mut arena.parents, expected)?;
         }
-        let mut bvh = Bvh {
+        Ok(Bvh {
             arena,
             root,
             treelets: Vec::new(),
             treelet_of_root: HashMap::new(),
+            counts: Vec::new(),
             garbage_nodes: 0,
             garbage_refs: 0,
             mesh_uid: mesh.uid(),
@@ -240,9 +283,7 @@ impl BvhBuild {
             generation: next_generation(),
             options: self.options,
             policy: UpdatePolicy::default(),
-        };
-        bvh.assign_treelets()?;
-        Ok(bvh)
+        })
     }
 }
 
@@ -312,6 +353,7 @@ impl Bvh {
             root,
             treelets: Vec::new(),
             treelet_of_root: HashMap::new(),
+            counts: Vec::new(),
             garbage_nodes: 0,
             garbage_refs: 0,
             mesh_uid: mesh.uid(),
@@ -325,53 +367,109 @@ impl Bvh {
         Ok(bvh)
     }
 
-    /// Marks the topmost subtrees holding at most `treelet_size` triangles (or
-    /// single leaves) as treelets. Requires a tree without garbage.
+    /// Counts each node's triangles and marks the topmost subtrees holding at
+    /// most `treelet_size` triangles (or single leaves) as treelets.
+    /// Requires a tree without garbage.
     fn assign_treelets(&mut self) -> Result<()> {
-        self.treelets.clear();
-        self.treelet_of_root.clear();
-        if self.root == NONE {
-            return Ok(());
-        }
-        // Children always have larger indices than their parents, so a reverse
-        // sweep sees children first.
-        let nodes = &self.arena.nodes;
-        let mut counts = try_vec(nodes.len(), 0u32)?;
-        for i in (0..nodes.len()).rev() {
-            let n = &nodes[i];
-            counts[i] = if n.is_leaf() {
-                n.leaf_range().len() as u32
-            } else {
-                counts[n.a as usize] + counts[n.b as usize]
-            };
-        }
-        let limit = self.options.treelet_size;
-        let is_treelet_root = |i: u32, n: &Node| n.is_leaf() || counts[i as usize] <= limit;
-        let mut found = 0;
-        self.arena.traverse(self.root, |i, n| {
-            let root = is_treelet_root(i, n);
-            found += usize::from(root);
-            !root
-        });
-        let mut roots = Vec::new();
-        try_reserve(&mut roots, found)?;
-        try_reserve_map(&mut self.treelet_of_root, found)?;
-        try_reserve(&mut self.treelets, found)?;
-        self.arena.traverse(self.root, |i, n| {
-            let root = is_treelet_root(i, n);
-            if root {
-                roots.push(i);
-            }
-            !root
-        });
-        for root in roots {
-            self.treelet_of_root.insert(root, self.treelets.len());
-            self.treelets.push(Treelet {
-                root,
-                build_cost: self.arena.sah_cost(root),
-            });
-        }
+        let mut at = Assign::Start;
+        while !self.assign_step(&mut at, usize::MAX)? {}
         Ok(())
+    }
+
+    /// [`Bvh::assign_treelets`] in steps of about `budget` units (64 nodes
+    /// counted, or 32 triangles of a treelet whose cost is computed; at least
+    /// one), from `at`. Returns whether it is done. The treelets' costs are
+    /// meaningless until then.
+    pub(crate) fn assign_step(&mut self, at: &mut Assign, budget: usize) -> Result<bool> {
+        let mut left = budget.max(1);
+        loop {
+            match *at {
+                Assign::Start => {
+                    self.treelets.clear();
+                    self.treelet_of_root.clear();
+                    self.counts = Vec::new();
+                    if self.root == NONE {
+                        *at = Assign::Done;
+                        return Ok(true);
+                    }
+                    self.counts = try_vec(self.arena.nodes.len(), 0u32)?;
+                    *at = Assign::Counts(self.arena.nodes.len());
+                }
+                Assign::Counts(end) => {
+                    let start = end.saturating_sub(left.saturating_mul(COUNTS_PER_UNIT));
+                    left = left.saturating_sub((end - start).div_ceil(COUNTS_PER_UNIT));
+                    let (nodes, counts) = (&self.arena.nodes, &mut self.counts);
+                    for i in (start..end).rev() {
+                        let n = &nodes[i];
+                        counts[i] = if n.is_leaf() {
+                            n.leaf_range().len() as u32
+                        } else {
+                            counts[n.a as usize] + counts[n.b as usize]
+                        };
+                    }
+                    *at = if start == 0 {
+                        Assign::Roots
+                    } else {
+                        Assign::Counts(start)
+                    };
+                }
+                Assign::Roots => {
+                    // The tree above the treelets: small, in one go.
+                    let limit = self.options.treelet_size;
+                    let counts = &self.counts;
+                    let is_treelet_root =
+                        |i: u32, n: &Node| n.is_leaf() || counts[i as usize] <= limit;
+                    let mut found = 0;
+                    self.arena.traverse(self.root, |i, n| {
+                        let root = is_treelet_root(i, n);
+                        found += usize::from(root);
+                        !root
+                    });
+                    try_reserve_map(&mut self.treelet_of_root, found)?;
+                    try_reserve(&mut self.treelets, found)?;
+                    let (treelets, map) = (&mut self.treelets, &mut self.treelet_of_root);
+                    self.arena.traverse(self.root, |i, n| {
+                        let root = is_treelet_root(i, n);
+                        if root {
+                            map.insert(i, treelets.len());
+                            treelets.push(Treelet {
+                                root: i,
+                                build_cost: 0.0,
+                            });
+                        }
+                        !root
+                    });
+                    left = left.saturating_sub(found.div_ceil(COUNTS_PER_UNIT));
+                    *at = Assign::Costs(0);
+                }
+                Assign::Costs(from) => {
+                    let mut i = from;
+                    while i < self.treelets.len() && left > 0 {
+                        let t = &mut self.treelets[i];
+                        t.build_cost = self.arena.sah_cost(t.root);
+                        let tris = self.counts[t.root as usize] as usize;
+                        left = left.saturating_sub(tris.div_ceil(COST_TRIANGLES_PER_UNIT).max(1));
+                        i += 1;
+                    }
+                    *at = if i == self.treelets.len() {
+                        Assign::Done
+                    } else {
+                        Assign::Costs(i)
+                    };
+                }
+                Assign::Done => return Ok(true),
+            }
+            if left == 0 {
+                return Ok(*at == Assign::Done);
+            }
+        }
+    }
+
+    /// The triangles in the subtree of `id`: exact, kept up to date by
+    /// builds, updates and compactions (refits change none). Lets a caller
+    /// bound the work of a subtree on any tree, balanced or not.
+    pub fn subtree_triangles(&self, id: NodeId) -> usize {
+        self.counts[id.index()] as usize
     }
 
     /// Treelet containing `node` (a node inside or at the root of a treelet), or
@@ -448,6 +546,7 @@ impl Bvh {
         let a = &self.arena;
         a.nodes.capacity() * size_of::<Node>()
             + (a.parents.capacity() + a.refs.capacity() + a.tri_leaf.capacity()) * 4
+            + self.counts.capacity() * 4
             + self.treelets.capacity() * size_of::<Treelet>()
             + self.treelet_of_root.capacity() * 16
     }
@@ -464,6 +563,8 @@ impl Bvh {
         try_reserve(&mut nodes, live_nodes)?;
         let mut parents = Vec::new();
         try_reserve(&mut parents, live_nodes)?;
+        let mut counts = Vec::new();
+        try_reserve(&mut counts, live_nodes)?;
         let mut refs = Vec::new();
         try_reserve(&mut refs, live_refs)?;
         let mut tri_leaf = try_vec(self.arena.tri_leaf.len(), NONE)?;
@@ -485,6 +586,7 @@ impl Bvh {
             } else {
                 new_index[parent as usize]
             });
+            counts.push(self.counts[old as usize]);
             if n.is_leaf() {
                 let first = refs.len() as u32;
                 for &t in &self.arena.refs[n.leaf_range()] {
@@ -514,6 +616,7 @@ impl Bvh {
             tri_leaf,
         };
         self.treelet_of_root = roots;
+        self.counts = counts;
         self.garbage_nodes = 0;
         self.garbage_refs = 0;
         self.generation = next_generation();
@@ -563,6 +666,16 @@ impl Bvh {
                 return false;
             }
             reachable += 1;
+            let count = if n.is_leaf() {
+                n.leaf_range().len() as u32
+            } else {
+                let c = |k: u32| self.counts.get(k as usize).copied().unwrap_or(u32::MAX);
+                c(n.a).saturating_add(c(n.b))
+            };
+            if self.counts.get(i as usize) != Some(&count) {
+                error = Some(format!("node {i} has the wrong subtree count"));
+                return false;
+            }
             if n.is_leaf() {
                 for &t in &a.refs[n.leaf_range()] {
                     refs_seen += 1;
@@ -683,12 +796,13 @@ impl Bvh {
             self.treelet_of_root.iter().map(|(&r, &i)| (r, i)).collect();
         treelets.sort();
         format!(
-            "{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}|{}",
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}|{}",
             a.nodes
                 .iter()
                 .map(|n| (n.bounds, n.a, n.b))
                 .collect::<Vec<_>>(),
             a.parents,
+            self.counts,
             a.refs,
             leaves,
             self.root,
@@ -921,6 +1035,7 @@ mod tests {
             .iter()
             .chain(&a.refs)
             .chain(&a.tri_leaf)
+            .chain(&b.counts)
             .copied()
             .collect();
         let treelets = b
@@ -972,6 +1087,32 @@ mod tests {
             let want = fingerprint(&Bvh::build(&mesh, &opts).unwrap());
             assert!(fingerprint(&stepped(&mesh, &opts, 1).0) == want);
         }
+    }
+
+    #[test]
+    fn stepped_build_assigns_treelets_in_steps() {
+        // The last stage (subtree counts, treelet roots and their costs) is
+        // stepped too: one pass over every node would be one long step on
+        // a large mesh.
+        let mesh = wavy(90);
+        let opts = BuildOptions {
+            max_leaf_size: 1,
+            treelet_size: 64,
+            ..Default::default()
+        };
+        let want = Bvh::build(&mesh, &opts).unwrap();
+        let mut build = BvhBuild::new(&mesh, &opts).unwrap();
+        while !matches!(build.stage, BuildStage::Treelets(..)) {
+            assert!(!build.step(&mesh, 1).unwrap());
+        }
+        let mut steps = 1;
+        while !build.step(&mesh, 1).unwrap() {
+            steps += 1;
+        }
+        assert!(steps > want.node_count() / 64, "{steps}");
+        let got = build.finish().unwrap();
+        got.validate(&mesh).unwrap();
+        assert!(fingerprint(&got) == fingerprint(&want));
     }
 
     #[test]

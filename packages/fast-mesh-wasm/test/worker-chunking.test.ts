@@ -482,11 +482,12 @@ describe("background adds", () => {
   });
 
   it("add_step_work_is_clamped", async () => {
-    // Review M1: an unbounded step (Infinity) builds the whole BVH in one
-    // step instead of wrapping to nothing, the normals in a second (#64)
-    // and the copy of the buffers in one more; NaN and values below 1 fall
-    // back to the default (100,000 units: the same steps for this mesh);
-    // 2 units take many steps.
+    // Review M1: an unbounded step (Infinity) builds the whole tree in one
+    // step instead of wrapping to nothing; since #64 its treelets are
+    // assigned in a second, the normals computed in a third and the
+    // buffers copied in one more. NaN and values below 1 fall back to the
+    // default (100,000 units: the same steps for this mesh); 2 units take
+    // many steps.
     for (const addStepWork of [Number.POSITIVE_INFINITY, 2 ** 40, Number.NaN, -5, 2]) {
       const h = addEngine({ addStepWork });
       h.send([addMeshReq(1, A)]);
@@ -499,7 +500,7 @@ describe("background adds", () => {
         expect(steps).toBeGreaterThan(100);
         expect(packs).toBeGreaterThan(100);
       } else {
-        expect([steps, packs], `${addStepWork}`).toEqual([2, 1]);
+        expect([steps, packs], `${addStepWork}`).toEqual([3, 1]);
       }
     }
   });
