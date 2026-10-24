@@ -99,32 +99,12 @@ impl NormalState {
         self.pending = None;
     }
 
-    /// Recomputes every normal from scratch: the sum of the face normals of
-    /// the alive triangles, in ascending triangle order, normalised. This
-    /// matches `fast_mesh::compute_vertex_normals` over the alive triangles.
+    /// Recomputes every normal from scratch (see [`NormalBuild`], run to
+    /// the end). On error the state is unchanged.
     fn compute_all(&mut self, mesh: &Mesh) -> Result<()> {
-        let mut normals = Vec::new();
-        try_resize(&mut normals, mesh.vertex_slots(), [0.0f32; 3])?;
-        let mut triangles = Vec::new();
-        triangles
-            .try_reserve_exact(mesh.triangle_slots())
-            .map_err(|_| oom())?;
-        triangles.extend_from_slice(mesh.triangles());
-        let p = mesh.positions();
-        for (t, &tri) in triangles.iter().enumerate() {
-            if mesh.is_triangle_alive(t as TriangleId) {
-                let n = face_normal(p, tri);
-                for v in tri {
-                    add(&mut normals[v as usize], n);
-                }
-            }
-        }
-        for n in &mut normals {
-            *n = normalized(*n);
-        }
-        self.normals = normals;
-        self.triangles = triangles;
-        self.pending = Some(ChangeSet::default());
+        let mut build = NormalBuild::new();
+        while !build.step(mesh, usize::MAX)? {}
+        *self = build.finish().ok_or_else(oom)?;
         Ok(())
     }
 
@@ -194,6 +174,149 @@ impl NormalState {
         }
         self.pending = Some(ChangeSet::default());
         Ok(dirty)
+    }
+}
+
+/// Vertex slots zeroed, or normalised, per unit of a [`NormalBuild::step`]
+/// budget.
+const VERTICES_PER_UNIT: usize = 16;
+
+/// Triangle slots summed per unit of a [`NormalBuild::step`] budget.
+const TRIANGLES_PER_UNIT: usize = 4;
+
+/// Where a [`NormalBuild`] stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalStage {
+    /// Zeroing the normals, then copying the triangles, from this slot on.
+    Zero(usize),
+    /// Summing the face normals, from this triangle slot on.
+    Sum(usize),
+    /// Normalising, from this vertex slot on.
+    Normalize(usize),
+    Done,
+}
+
+/// [`NormalState::new`] cut into steps, so that a caller can yield between
+/// them (a mesh added in the background computes its normals this way,
+/// outside the scene). The normals are the same, bit for bit: the face
+/// normals are summed in ascending triangle order either way. The build is
+/// tied to the mesh it is stepped on, which must not change meanwhile.
+#[derive(Debug)]
+pub(crate) struct NormalBuild {
+    normals: Vec<[f32; 3]>,
+    triangles: Vec<[VertexId; 3]>,
+    stage: NormalStage,
+}
+
+impl NormalBuild {
+    pub(crate) fn new() -> NormalBuild {
+        NormalBuild {
+            normals: Vec::new(),
+            triangles: Vec::new(),
+            stage: NormalStage::Zero(0),
+        }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.stage == NormalStage::Done
+    }
+
+    /// The normals so far (final once done).
+    pub(crate) fn normals(&self) -> &[[f32; 3]] {
+        &self.normals
+    }
+
+    /// Advances by about `budget` units (at least one): the normals are
+    /// zeroed and the triangles copied (16 vertex slots or 4 triangle slots
+    /// a unit), the face normals of the alive triangles summed (4 triangle
+    /// slots a unit), then every normal normalised (16 a unit). Returns
+    /// whether the normals are done.
+    ///
+    /// # Errors
+    /// Out of memory (both arrays are reserved at full size first); the
+    /// build is unusable after it.
+    pub(crate) fn step(&mut self, mesh: &Mesh, budget: usize) -> Result<bool> {
+        let mut left = budget.max(1);
+        let (slots, tri_slots) = (mesh.vertex_slots(), mesh.triangle_slots());
+        // `n` units of work at `per` items each, from `from` to at most `end`.
+        let take = |left: &mut usize, from: usize, end: usize, per: usize| {
+            let to = end.min(from.saturating_add(left.saturating_mul(per)));
+            *left = left.saturating_sub((to - from).div_ceil(per));
+            to
+        };
+        loop {
+            match self.stage {
+                NormalStage::Zero(from) => {
+                    if from == 0 {
+                        self.normals.try_reserve_exact(slots).map_err(|_| oom())?;
+                        self.triangles
+                            .try_reserve_exact(tri_slots)
+                            .map_err(|_| oom())?;
+                    }
+                    // Zero the normals first, then copy the triangles: one
+                    // cursor over both, the triangles past `slots`.
+                    let end = slots + tri_slots;
+                    let to = if from < slots {
+                        take(&mut left, from, slots, VERTICES_PER_UNIT)
+                    } else {
+                        take(&mut left, from, end, TRIANGLES_PER_UNIT)
+                    };
+                    if from < slots {
+                        self.normals.resize(to, [0.0; 3]);
+                    } else {
+                        self.triangles
+                            .extend_from_slice(&mesh.triangles()[from - slots..to - slots]);
+                    }
+                    self.stage = if to == end {
+                        NormalStage::Sum(0)
+                    } else {
+                        NormalStage::Zero(to)
+                    };
+                }
+                NormalStage::Sum(from) => {
+                    let to = take(&mut left, from, tri_slots, TRIANGLES_PER_UNIT);
+                    let p = mesh.positions();
+                    for (t, &tri) in self.triangles.iter().enumerate().take(to).skip(from) {
+                        if mesh.is_triangle_alive(t as TriangleId) {
+                            let n = face_normal(p, tri);
+                            for v in tri {
+                                add(&mut self.normals[v as usize], n);
+                            }
+                        }
+                    }
+                    self.stage = if to == tri_slots {
+                        NormalStage::Normalize(0)
+                    } else {
+                        NormalStage::Sum(to)
+                    };
+                }
+                NormalStage::Normalize(from) => {
+                    let to = take(&mut left, from, slots, VERTICES_PER_UNIT);
+                    for n in &mut self.normals[from..to] {
+                        *n = normalized(*n);
+                    }
+                    self.stage = if to == slots {
+                        NormalStage::Done
+                    } else {
+                        NormalStage::Normalize(to)
+                    };
+                }
+                NormalStage::Done => return Ok(true),
+            }
+            if left == 0 {
+                return Ok(self.is_done());
+            }
+        }
+    }
+
+    /// The normals once done, as [`NormalState::new`] computes them, with
+    /// nothing pending; `None` before.
+    pub(crate) fn finish(self) -> Option<NormalState> {
+        self.is_done().then_some(NormalState {
+            normals: self.normals,
+            triangles: self.triangles,
+            pending: Some(ChangeSet::default()),
+        })
     }
 }
 
@@ -429,6 +552,42 @@ mod tests {
         p.translation = [5.0, 0.0, 0.0];
         scene.set_placement(id, p).unwrap();
         assert_eq!(normals_dirty(&mut scene, id), Some(Vec::new()));
+    }
+
+    #[test]
+    fn normal_build_in_steps_matches_compute_all() {
+        // Dead triangles and a vertex no triangle uses: their slots are
+        // skipped and stay zero, as in one call.
+        let (mut scene, id) = scene_with(UpdateMode::Eager);
+        scene
+            .edit(id, |tx| {
+                tx.remove_triangles(&[0, 1, 7, 30])?;
+                tx.add_vertices(&[[9.0, 9.0, 9.0]])
+            })
+            .unwrap();
+        let mesh = scene.mesh(id).unwrap();
+        let want = super::NormalState::new(mesh).unwrap();
+        let bits =
+            |n: &[[f32; 3]]| -> Vec<u32> { n.iter().flatten().map(|x| x.to_bits()).collect() };
+        for budget in [1, 2, 7, 100, usize::MAX] {
+            let mut build = super::NormalBuild::new();
+            let mut steps = 0;
+            while !build.step(mesh, budget).unwrap() {
+                steps += 1;
+            }
+            if budget == 1 {
+                assert!(steps > mesh.triangle_slots() / 8, "{steps}");
+            }
+            assert!(build.step(mesh, budget).unwrap(), "stays done");
+            let got = build.finish().unwrap();
+            assert_eq!(bits(got.normals()), bits(want.normals()), "budget {budget}");
+            assert_eq!(got.triangles, want.triangles);
+            assert_eq!(got.pending, Some(fast_mesh_store::ChangeSet::default()));
+        }
+        // Unfinished, it gives nothing.
+        let mut build = super::NormalBuild::new();
+        build.step(mesh, 1).unwrap();
+        assert!(build.finish().is_none());
     }
 
     #[test]

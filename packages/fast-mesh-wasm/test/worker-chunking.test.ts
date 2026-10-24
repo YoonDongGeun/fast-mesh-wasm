@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { Scene } from "../src/node.js";
 import { WasmScene } from "../src/wasm/fast_mesh_wasm.js";
 import { runEngine } from "../src/worker/engine.js";
+import type { EditOp } from "../src/node.js";
 import type { ClientId, Request, Result } from "../src/worker/protocol.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -323,13 +324,16 @@ function placement(id: ClientId, x: number): Request {
   return { kind: "setPlacement", rev: rev(), id, rotation: IDENTITY, translation: [x, 0, 0], key: `placement:${id}` };
 }
 
-/** A synchronous scene's buffers of `mesh` added after A and B. */
-function referenceBuffers() {
+/** A synchronous scene's buffers of BIG added after A and B, then edited by `ops`. */
+function referenceBuffers(ops: EditOp[] = []) {
   const s = new Scene();
   try {
     s.addMesh(A.positions, A.indices);
     s.addMesh(B.positions, B.indices);
     const m = s.addMesh(BIG.positions, BIG.indices);
+    if (ops.length > 0) {
+      s.edit(m, ops);
+    }
     const v = s.views(m);
     return {
       positions: v.positions().slice(),
@@ -382,6 +386,54 @@ describe("background adds", () => {
     expect(u.placements.map((p) => p.id)).toEqual([3]);
   });
 
+  it("the_landing_is_copied_out_in_steps_before_it_lands", async () => {
+    // Issue #64: the normals are computed in the build's steps and the
+    // render buffers copied out in steps of their own, after the BVH, so
+    // that landing packs nothing large in one piece. The record is the same,
+    // bit for bit, as a synchronous add's.
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    h.send([addMeshReq(3, BIG)]);
+    await h.until(() => h.chunks.some((c) => c.kind === "addMesh" && c.id === 3) && h.posted.some((p) => p.update));
+    const kinds = h.chunks.map((c) => c.kind);
+    const packs = kinds.filter((k) => k === "addMeshPack").length;
+    expect(packs).toBeGreaterThan(5);
+    expect(kinds.lastIndexOf("addMeshStep")).toBeLessThan(kinds.indexOf("addMeshPack"));
+    expect(kinds.lastIndexOf("addMeshPack")).toBeLessThan(kinds.lastIndexOf("addMesh"));
+    const u = h.posted.find((p) => p.update)?.result as Result;
+    const added = u.changes.find((c) => c.id === 3);
+    const ref = referenceBuffers();
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
+  });
+
+  it("an_edit_in_the_landing_batch_packs_the_edited_mesh", async () => {
+    // The buffers copied out before the landing are those of the mesh as
+    // built: an edit after it lands, in the same frame, is packed instead.
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const op: EditOp = { op: "setPositions", vertices: [41], positions: [1.1, 6.2, 0.9] };
+    h.send([addMeshReq(3, BIG), { kind: "edit", rev: rev(), id: 3, payload: [op] }]);
+    await h.until(() => h.results().length === 2);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(true);
+    const r = h.results()[1];
+    expect(r.status.map((st) => st.key)).toEqual(["mesh:3", "edit:3"]);
+    const added = r.changes.find((c) => c.id === 3);
+    expect(added?.added).toBe(true);
+    const ref = referenceBuffers([op]);
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
+    expect(same(added?.bytes.positions, referenceBuffers().positions)).toBe(false);
+  });
+
   it("a_waiting_request_steps_the_add_single_threaded", async () => {
     // Re-review R1: single-threaded, a request waiting on a background add
     // still lets the add go on in steps with yields (the one-call build
@@ -420,14 +472,21 @@ describe("background adds", () => {
     // gives a background add; the rest in the call that lands it.
     const steps = h.chunks.filter((c) => c.kind === "addMeshStep" && c.id === 3).length;
     expect(steps).toBeLessThanOrEqual(1);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(false);
     expect(h.results()[1].status.map((st) => st.key)).toEqual(["mesh:3", "placement:3"]);
+    // Packed at the frame, as before: the same buffers as a synchronous add.
+    const bytes = h.results()[1].changes.find((c) => c.id === 3)?.bytes;
+    const ref = referenceBuffers();
+    expect(Buffer.from(bytes?.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+    expect(Buffer.from(bytes?.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
   });
 
   it("add_step_work_is_clamped", async () => {
-    // Review M1: an unbounded step (Infinity) builds the whole mesh in one
-    // step instead of wrapping to nothing; NaN and values below 1 fall back
-    // to the default (100,000 units: one step for this mesh too); 2 units
-    // take many steps.
+    // Review M1: an unbounded step (Infinity) builds the whole BVH in one
+    // step instead of wrapping to nothing, the normals in a second (#64)
+    // and the copy of the buffers in one more; NaN and values below 1 fall
+    // back to the default (100,000 units: the same steps for this mesh);
+    // 2 units take many steps.
     for (const addStepWork of [Number.POSITIVE_INFINITY, 2 ** 40, Number.NaN, -5, 2]) {
       const h = addEngine({ addStepWork });
       h.send([addMeshReq(1, A)]);
@@ -435,10 +494,12 @@ describe("background adds", () => {
       h.send([addMeshReq(3, BIG)]);
       await h.until(() => h.chunks.some((c) => c.kind === "addMesh" && c.id === 3));
       const steps = h.chunks.filter((c) => c.kind === "addMeshStep").length;
+      const packs = h.chunks.filter((c) => c.kind === "addMeshPack").length;
       if (addStepWork === 2) {
         expect(steps).toBeGreaterThan(100);
+        expect(packs).toBeGreaterThan(100);
       } else {
-        expect(steps, `${addStepWork}`).toBe(1);
+        expect([steps, packs], `${addStepWork}`).toEqual([2, 1]);
       }
     }
   });

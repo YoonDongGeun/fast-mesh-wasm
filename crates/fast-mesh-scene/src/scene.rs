@@ -6,7 +6,7 @@ use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transacti
 use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
-use crate::normals::NormalState;
+use crate::normals::{NormalBuild, NormalState};
 use crate::report::Report;
 use crate::sections::{Section, SectionHook};
 use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SectionId, SubscriberId};
@@ -242,14 +242,17 @@ struct Subscriber {
 }
 
 /// A mesh being prepared for [`Scene::add_mesh_built`] outside any scene:
-/// its BVH is built in steps ([`MeshBuild::step`]), so that a caller can
-/// yield between them (the Worker engine adds large meshes this way).
-/// Nothing of it is in a scene until it is added.
+/// its BVH, and its vertex normals when asked for
+/// ([`MeshBuild::set_normals`]), are built in steps ([`MeshBuild::step`]),
+/// so that a caller can yield between them (the Worker engine adds large
+/// meshes this way). Nothing of it is in a scene until it is added.
 #[derive(Debug)]
 pub struct MeshBuild {
     mesh: Mesh,
     options: MeshOptions,
     bvh: BvhBuild,
+    /// The normals being computed, when they are on.
+    normals: Option<NormalBuild>,
 }
 
 impl MeshBuild {
@@ -261,21 +264,53 @@ impl MeshBuild {
     pub fn new(mesh: Mesh, options: MeshOptions) -> Result<MeshBuild> {
         options.placement.validate()?;
         let bvh = BvhBuild::new(&mesh, &options.build)?;
-        Ok(MeshBuild { mesh, options, bvh })
+        Ok(MeshBuild {
+            mesh,
+            options,
+            bvh,
+            normals: None,
+        })
+    }
+
+    /// Turns the mesh's vertex normals on or off (off by default), as
+    /// [`Scene::set_normals`] would right after the add: with them on, the
+    /// steps compute them too, once the BVH is built, and the mesh is added
+    /// with them on. Turning them off drops what was computed.
+    pub fn set_normals(&mut self, on: bool) {
+        if !on {
+            self.normals = None;
+        } else if self.normals.is_none() {
+            self.normals = Some(NormalBuild::new());
+        }
     }
 
     /// Builds about `budget` more units of the BVH (see
-    /// [`BvhBuild::step`]). Returns whether it is built.
+    /// [`BvhBuild::step`]), then of the normals when they are on (a unit:
+    /// 4 triangles or 16 vertices). Returns whether everything is built.
     ///
     /// # Errors
     /// A memory error; the build is unusable after it.
     pub fn step(&mut self, budget: usize) -> Result<bool> {
-        Ok(self.bvh.step(&self.mesh, budget)?)
+        if !self.bvh.is_done() {
+            self.bvh.step(&self.mesh, budget)?;
+        } else if let Some(n) = &mut self.normals {
+            n.step(&self.mesh, budget)?;
+        }
+        Ok(self.is_done())
     }
 
-    /// Whether the BVH is built.
+    /// Whether the BVH, and the normals when they are on, are built.
     pub fn is_done(&self) -> bool {
-        self.bvh.is_done()
+        self.bvh.is_done() && self.normals.as_ref().is_none_or(NormalBuild::is_done)
+    }
+
+    /// The vertex normals, once built with them on; `None` before or when
+    /// they are off.
+    pub fn normals(&self) -> Option<&[[f32; 3]]> {
+        self.normals
+            .as_ref()
+            .filter(|n| n.is_done())
+            .map(NormalBuild::normals)
     }
 
     /// The mesh being prepared.
@@ -354,18 +389,34 @@ impl Scene {
     }
 
     /// Adds a mesh built in steps by `build` (see [`MeshBuild`]), first
-    /// finishing what is left of its BVH, and returns its id. The mesh, its
-    /// BVH and everything reported are the same as from
-    /// [`Scene::add_mesh`] with the same mesh and options.
+    /// finishing what is left of its BVH and normals, and returns its id.
+    /// The mesh, its BVH, its normals and everything reported are the same
+    /// as from [`Scene::add_mesh`] with the same mesh and options, followed
+    /// by [`Scene::set_normals`] when the build has normals on.
     ///
     /// # Errors
     /// As for [`Scene::add_mesh`]. The scene is unchanged on error.
     pub fn add_mesh_built(&mut self, mut build: MeshBuild) -> Result<MeshId> {
         self.drop_field_unit();
         while !build.step(usize::MAX)? {}
-        let MeshBuild { mesh, options, bvh } = build;
+        let MeshBuild {
+            mesh,
+            options,
+            bvh,
+            normals,
+        } = build;
         let bvh = bvh.finish().ok_or(SceneError::Corrupted)?;
-        self.insert_mesh(mesh, bvh, options)
+        let normals = match normals {
+            Some(n) => Some(n.finish().ok_or(SceneError::Corrupted)?),
+            None => None,
+        };
+        let id = self.insert_mesh(mesh, bvh, options)?;
+        if let Some(n) = normals {
+            let entry = self.entry_mut(id)?;
+            entry.normals = Some(n);
+            entry.report_normals(None);
+        }
+        Ok(id)
     }
 
     /// Inserts a mesh with its freshly built BVH.
@@ -2497,5 +2548,76 @@ mod tests {
             MeshBuild::new(tri(), bad),
             Err(SceneError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn mesh_built_with_normals_in_steps_matches_add_mesh_and_set_normals() {
+        // Twins: one adds the sheet and turns its normals on; the other
+        // computes the normals in the build's steps, outside the scene, and
+        // adds it with them already on. Same normals bit for bit, same
+        // reports, and turning them on again changes nothing.
+        let bits =
+            |n: &[[f32; 3]]| -> Vec<u32> { n.iter().flatten().map(|x| x.to_bits()).collect() };
+        let opts = MeshOptions::default();
+        let plain_steps = {
+            let mut build = MeshBuild::new(sheet(30), opts).unwrap();
+            let mut steps = 0;
+            while !build.step(97).unwrap() {
+                steps += 1;
+            }
+            steps
+        };
+        // `None`: the build is added without a step (the add finishes it).
+        for budget in [Some(1), Some(97), Some(5000), Some(usize::MAX), None] {
+            let mut a = Scene::new(SceneOptions::default());
+            let mut b = Scene::new(SceneOptions::default());
+            let added = a.add_mesh(sheet(30), opts).unwrap();
+            a.set_normals(added, true).unwrap();
+            let mut build = MeshBuild::new(sheet(30), opts).unwrap();
+            build.set_normals(true);
+            if let Some(budget) = budget {
+                let mut steps = 0;
+                while !build.step(budget).unwrap() {
+                    steps += 1;
+                }
+                assert!(build.is_done());
+                if budget == 97 {
+                    assert!(
+                        steps > plain_steps,
+                        "{steps} vs {plain_steps}: normals take steps"
+                    );
+                }
+            }
+            let built = b.add_mesh_built(build).unwrap();
+            assert_eq!(added, built);
+            assert_eq!(a.take_changes(), b.take_changes(), "{budget:?}");
+            assert_eq!(
+                bits(a.normals(added).unwrap().unwrap()),
+                bits(b.normals(built).unwrap().unwrap()),
+                "{budget:?}"
+            );
+            b.set_normals(built, true).unwrap();
+            assert!(b.take_changes().is_empty(), "already on");
+            // They follow an edit alike (the triangle snapshot is the same).
+            for s in [&mut a, &mut b] {
+                s.edit(added, |tx| {
+                    tx.remove_triangles(&[3])?;
+                    tx.set_positions(&[40], &[[0.5, 0.5, 0.4]])
+                })
+                .unwrap();
+            }
+            assert_eq!(a.take_changes(), b.take_changes());
+            assert_eq!(
+                bits(a.normals(added).unwrap().unwrap()),
+                bits(b.normals(built).unwrap().unwrap())
+            );
+        }
+        // Turned off again before the add: no normals, as from `add_mesh`.
+        let mut b = Scene::new(SceneOptions::default());
+        let mut build = MeshBuild::new(sheet(4), opts).unwrap();
+        build.set_normals(true);
+        build.set_normals(false);
+        let id = b.add_mesh_built(build).unwrap();
+        assert_eq!(b.normals(id).unwrap(), None);
     }
 }

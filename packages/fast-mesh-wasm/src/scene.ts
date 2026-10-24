@@ -946,15 +946,21 @@ export function fieldSteps(scene: Scene): FieldSteps {
  *   BVH outside the scene, as `addMesh` would add it; returns the build's
  *   token. The scene is unchanged until `finish`.
  * - `step(token, budget)`: builds about `budget` more units of the BVH (a
- *   triangle's box, or a triangle visited per tree level); `true` once
- *   built. A failed build throws and is dropped.
- * - `finish(token)`: adds the mesh (finishing its BVH first), exactly as
- *   `addMesh` with the same inputs would, and returns its handle.
+ *   triangle's box, or a triangle visited per tree level), then of the
+ *   vertex normals when they are on (4 triangles or 16 vertices a unit);
+ *   `true` once built. A failed build throws and is dropped.
+ * - `buffers(token)`: views of the build's render buffers (normals `null`
+ *   until built or when off): what `views(mesh)` will show once it is
+ *   added, until the mesh changes. Valid until the next call that may
+ *   allocate, like any view.
+ * - `finish(token)`: adds the mesh (finishing its BVH and normals first),
+ *   exactly as `addMesh` with the same inputs would, and returns its handle.
  * - `drop(token)`: forgets a build; nothing is added.
  */
 interface MeshAdds {
   begin(positions: Positions64, indices: Indices, options?: AddMeshOptions): number;
   step(token: number, budget: number): boolean;
+  buffers(token: number): { positions: Float32Array; normals: Float32Array | null; indices: Uint32Array };
   finish(token: number): MeshHandle;
   drop(token: number): void;
 }
@@ -1813,6 +1819,15 @@ export class Scene implements SceneLike {
         return call(() => s.begin_add_mesh(p, i, origin, mode, options.normals ?? true));
       },
       step: (token, budget) => call(() => scene.#scene().add_mesh_step(token, budget)),
+      buffers: (token) => {
+        const [pp, pl, np, nl, ip, il] = call(() => scene.#peek().add_mesh_buffers(token));
+        const memory = wasmMemory().buffer;
+        return {
+          positions: new Float32Array(memory, pp, pl),
+          normals: np === 0 ? null : new Float32Array(memory, np, nl),
+          indices: new Uint32Array(memory, ip, il),
+        };
+      },
       finish: (token) => {
         const id = call(() => scene.#scene().finish_add_mesh(token));
         return scene.#meshHandle(id[0], id[1]);
