@@ -674,6 +674,32 @@ mod tests {
     }
 
     #[test]
+    fn distant_query_on_small_sliver_stays_accurate() {
+        // The sliver band does not depend on the query distance, so a query
+        // far beyond the triangle's size takes the noisy path; the distance
+        // error stays second order (issue #19).
+        let p = [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 1e-4, 0.0],
+        ];
+        for dist in [10.0f32, 50.0] {
+            let q = [0.5, 0.5, dist];
+            let c = closest_on_triangle(q, p);
+            let got = f64::from(c.dist2).sqrt();
+            assert!((got - segment_distance(q, p)).abs() < 1e-4, "{dist}: {got}");
+            // The point is the barycentric combination of the corners.
+            let w = c.barycentric;
+            assert!(w.iter().all(|x| *x >= -1e-4), "{w:?}");
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+            for k in 0..3 {
+                let m = w[0] * p[0][k] + w[1] * p[1][k] + w[2] * p[2][k];
+                assert!((m - c.point[k]).abs() < 1e-3, "{dist}");
+            }
+        }
+    }
+
+    #[test]
     fn box_triangle_cases() {
         let b = |min, max| Aabb::new(min, max);
         // Overlap.
