@@ -36,9 +36,11 @@
 //   differs (decoded and compared in the page).
 // - colour-from: "Colour from" 0 colours penetration only (no gap colours);
 //   the readouts stay up while the slider moves.
-// - readouts: dragging A away from B pauses the readouts (none while the
-//   gizmo drags: reading field values would force stale poses current),
-//   then they refresh once at the end: no longer intersecting, a gap. Undo
+// - readouts: dragging A away from B pauses the readouts: no query starts
+//   while the gizmo drags (reading field values would force stale poses
+//   current), and a result held across the drag's start (the test hook
+//   holds it) lands mid-drag and is dropped. After the drag they settle on
+//   the final pose: no longer intersecting, a gap, as queried now. Undo
 //   puts A back.
 // - open-target (RF1): picking C (open) as B still colours A and C, and
 //   the panel warns that C is open (from `analyze` of C).
@@ -305,7 +307,7 @@ const clickOn = (selector) =>
  * it reports a handle under the pointer (it picks against its own matrices,
  * set when it is drawn).
  */
-async function dragGizmo(name, dx, dy, steps, ms) {
+async function dragGizmo(name, dx, dy, steps, ms, midway = async () => {}) {
   const attached = await waitFor(`__showcase.gizmo()?.mesh === ${JSON.stringify(name)}`, 5000);
   const from = await hook(`screenPoint(${JSON.stringify(name)})`);
   let axis = null;
@@ -321,6 +323,9 @@ async function dragGizmo(name, dx, dy, steps, ms) {
   for (let i = 1; i <= steps; i++) {
     await mouse("mouseMoved", from.x + (dx * i) / steps, from.y + (dy * i) / steps, { buttons: 1 });
     await sleep(ms);
+    if (i === Math.floor(steps / 2)) {
+      await midway();
+    }
   }
   await mouse("mouseReleased", from.x + dx, from.y + dy, { buttons: 0 });
   return { attached: attached === true, axis, dragging: dragging === true };
@@ -548,20 +553,54 @@ try {
   await setRange("gap", 1);
   await waitFor(collision(`c.coloring[${q(A)}]?.range?.[1] === 1 && c.coloring[${q(A)}].status === "ready"`), 10_000);
 
-  // ---- readouts: refreshed while A is dragged away from B, and at the end ----
+  // ---- readouts: paused while A is dragged away from B, then refreshed ----
+  // A query held across the drag's start (the test hook holds its result)
+  // lands mid-drag however fast or slow the renderer (SwiftShader): it
+  // describes the pre-drag pose, so it is dropped. No query starts while
+  // the gizmo drags; after it the readouts settle on the final pose (the
+  // gap and intersecting as queried now). How many refreshes that takes
+  // varies: the last moves' change records may land after the release.
+  await waitFor(collision("c.settled"), 10_000);
   const before = await hook("collision()");
-  const away = await dragGizmo(A, -260, 0, 40, 25);
+  const tolerance = await page("(() => { const el = document.querySelector('[data-control=tolerance]'); return { value: Number(el.value), max: Number(el.max) }; })()");
+  await hook(`holdReadouts("collision")`);
+  await setRange("tolerance", tolerance.value === 0 ? tolerance.max : 0); // a refresh, held
+  const held = await waitFor(collision(`c.starts > ${before.starts} && !c.settled`), 10_000);
+  let landed;
+  const away = await dragGizmo(A, -260, 0, 40, 25, async () => {
+    await hook(`releaseReadouts("collision")`);
+    landed = await waitFor(collision(`__showcase.dragging() && c.dropped > ${before.dropped}`), 10_000);
+  });
+  await hook(`releaseReadouts("collision")`); // if the drag never got midway
+  // Settled on readouts that match the pose as queried now, with no refresh
+  // landing meanwhile (the pose no longer changes once they match).
   const apart = await waitFor(
-    collision(`!__showcase.dragging() && c.settled && c.readouts !== null && !c.readouts.intersects && c.readouts.gap > 0 && c.readouts.penetration?.depth === 0`),
+    `(async () => {
+      const c = __showcase.collision();
+      const now = await __showcase.pairNow(${q(A)}, ${q(B)});
+      const r = c.readouts;
+      return !__showcase.dragging() && c.settled && __showcase.collision().updates === c.updates && r !== null
+        && !r.intersects && r.gap > 0 && r.penetration?.depth === 0
+        && r.gap === now.gap && r.intersects === now.intersects && { c, now };
+    })()`,
     10_000,
   );
-  const during = (apart?.updatesWhileDragging ?? 0) - before.updatesWhileDragging;
-  const total = (apart?.updates ?? before.updates) - before.updates;
+  const final = apart?.c ?? (await hook("collision()"));
+  const now = apart?.now ?? (await hook(`pairNow(${q(A)}, ${q(B)})`));
+  const startedDuring = final.startsWhileDragging - before.startsWhileDragging;
+  const dropped = final.dropped - before.dropped;
   verdict(
     "readouts",
-    away.dragging && apart !== undefined && during === 0 && total >= 1,
-    `${during} refresh(es) while dragging (paused), ${(apart?.updates ?? before.updates) - before.updates} in all; after the drag ${apart === undefined ? q((await hook("collision()")).readouts) : `gap ${fmt(apart.readouts.gap)}, intersecting ${apart.readouts.intersects}`}`,
+    away.dragging &&
+      held !== undefined &&
+      landed !== undefined &&
+      apart !== undefined &&
+      startedDuring === 0 &&
+      dropped >= 1 &&
+      final.updatesAfterDrag >= 1,
+    `${startedDuring} query(ies) started while dragging (paused); ${dropped} result(s) landed mid-drag and dropped${held === undefined ? " (no query held before the drag)" : ""}; ${final.updatesAfterDrag} refresh(es) after the drag; readouts ${final.readouts === null ? "none" : `gap ${fmt(final.readouts.gap ?? NaN)}, intersecting ${final.readouts.intersects}`}${apart === undefined ? " (not settled on the final pose)" : ""} vs the final pose's gap ${now.gap === null ? "none" : fmt(now.gap)}, intersecting ${now.intersects}`,
   );
+  await setRange("tolerance", tolerance.value);
   await clickOn("[data-action=undo]");
   await waitFor(collision(`Math.hypot(...__showcase.translation(${q(A)})) < 1e-9 && c.readouts?.intersects === true`), 10_000);
 

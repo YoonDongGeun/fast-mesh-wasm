@@ -18,6 +18,7 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     }
     return item;
   };
+  const releases = new Map<"collision" | "group", () => void>();
   (globalThis as { __showcase?: unknown }).__showcase = {
     store,
     mode: engine.mode,
@@ -69,8 +70,9 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     /**
      * The collision panel: the mode, the pair (names), each mesh's applied
      * colouring (its target's name, or its targets' names in a group, and
-     * the range) and status, and the readouts with how often they refreshed
-     * (and while the gizmo dragged).
+     * the range) and status, and the readouts with how often they refreshed,
+     * how their queries met gizmo drags (see `LiveProbe`), and whether they
+     * are current.
      */
     collision: () => {
       const { a, b } = app.getSnapshot().collision;
@@ -87,7 +89,10 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         coloring: Object.fromEntries(app.getSnapshot().items.map((i) => [i.name, shown(i.mesh)])),
         readouts: inspect.collision.readouts,
         updates: inspect.collision.updates,
-        updatesWhileDragging: inspect.collision.updatesWhileDragging,
+        starts: inspect.collision.starts,
+        startsWhileDragging: inspect.collision.startsWhileDragging,
+        dropped: inspect.collision.dropped,
+        updatesAfterDrag: inspect.collision.updatesAfterDrag,
         settled: inspect.collision.settled,
         warnings: inspect.collision.warnings,
       };
@@ -107,11 +112,38 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         readouts:
           r === null ? null : { bound: r.bound, pairs: r.pairs.map((p) => ({ ...p, a: nameOf(p.a), b: nameOf(p.b) })) },
         updates: inspect.group.updates,
-        updatesWhileDragging: inspect.group.updatesWhileDragging,
+        starts: inspect.group.starts,
+        startsWhileDragging: inspect.group.startsWhileDragging,
+        dropped: inspect.group.dropped,
+        updatesAfterDrag: inspect.group.updatesAfterDrag,
         settled: inspect.group.settled,
         warnings: inspect.group.warnings,
         hover: h === null ? null : { mesh: nameOf(h.mesh), partner: h.partner === null ? null : nameOf(h.partner), distance: h.distance },
       };
+    },
+    /**
+     * Holds the `panel`'s readout results: a query's result waits until
+     * `releaseReadouts`, so the check can land one in the middle of a drag.
+     */
+    holdReadouts: (panel: "collision" | "group") => {
+      let release = () => {};
+      const hold = new Promise<void>((r) => {
+        release = r;
+      });
+      inspect[panel].hold = hold;
+      releases.set(panel, release);
+    },
+    /** Lets the held results land. */
+    releaseReadouts: (panel: "collision" | "group") => {
+      inspect[panel].hold = null;
+      releases.get(panel)?.();
+      releases.delete(panel);
+    },
+    /** The two meshes' surface distance and whether they intersect, queried now (the readouts' `gap` and `intersects`). */
+    pairNow: async (a: string, b: string) => {
+      const [ma, mb] = [find(a).mesh, find(b).mesh];
+      const [d, hit] = await Promise.all([engine.scene.meshDistance(ma, mb), engine.scene.intersects(ma, mb)]);
+      return { gap: d === null ? null : d.distance, intersects: hit };
     },
     /** The repair panel: the latest analysis (mesh name and summary), the latest report, the op running. */
     repair: () => ({ ...inspect.repair }),
