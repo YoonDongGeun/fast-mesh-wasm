@@ -239,6 +239,49 @@ mod tests {
     }
 
     #[test]
+    fn boundary_signal_marks_open_rim() {
+        // Points past the rim report a boundary feature; points over the
+        // interior do not.
+        let n = 16;
+        let mut mesh = terrain(n);
+        let bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Auto).unwrap();
+        assert!(!sign.status().closed);
+        let mut rng = Lcg(13);
+        let mut rim_boundary = 0;
+        for _ in 0..200 {
+            let x = 1.0 + (n - 2) as f32 * rng.next();
+            let y = -(0.02 + 0.3 * rng.next());
+            let z = terrain_surface(&mesh, n, f64::from(x), 0.0) as f32;
+            let p = [x, y, z + 0.1];
+            let hit = closest_point(&mesh, &bvh, p, &ClosestOptions::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                SignData::is_boundary_hit(&mesh, &hit),
+                Some(true),
+                "at {p:?}"
+            );
+            rim_boundary += 1;
+        }
+        assert_eq!(rim_boundary, 200);
+        let mut interior_clean = 0;
+        for _ in 0..200 {
+            let (x, y) = (4.0 + 8.0 * rng.next(), 4.0 + 8.0 * rng.next());
+            let z = terrain_surface(&mesh, n, f64::from(x), f64::from(y)) as f32;
+            let p = [x, y, z + 0.1];
+            let hit = closest_point(&mesh, &bvh, p, &ClosestOptions::default())
+                .unwrap()
+                .unwrap();
+            if hit.feature == Feature::Face {
+                assert_eq!(SignData::is_boundary_hit(&mesh, &hit), Some(false));
+                interior_clean += 1;
+            }
+        }
+        assert!(interior_clean > 150, "only {interior_clean} face hits");
+    }
+
+    #[test]
     fn open_sheet_penetration_is_negative() {
         let n = 16;
         let mut mesh = terrain(n);
@@ -353,6 +396,157 @@ mod tests {
                 })
                 .count();
             assert!(on_sliver > 0);
+        }
+    }
+
+    #[test]
+    fn pinch_vertex_signs_match_exact_away_from_pinch() {
+        // Two cubes meeting at one vertex: closed, one non-manifold vertex.
+        // Signs match the exact winding number away from the pinch.
+        let (mut p, mut t) = cube_buffers();
+        let (p2, t2) = cube_buffers();
+        p.extend(p2[1..].iter().map(|q| q.map(|c| c + 2.0)));
+        t.extend(
+            t2.iter()
+                .map(|tri| tri.map(|v| if v == 0 { 7 } else { v + 7 })),
+        );
+        let mut mesh = mesh(&p, &t);
+        let bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Auto).unwrap();
+        let status = sign.status();
+        assert!(status.closed && status.consistent_orientation);
+        assert_eq!(status.non_manifold_vertices, 1);
+        assert_eq!(status.mode, SignMode::Pseudonormal);
+        let pinch = [1.0f32, 1.0, 1.0];
+        let mut rng = Lcg(41);
+        let points = sample_points(&mesh, &mut rng, 2000, 0.2);
+        let mut out = vec![f32::NAN; points.len()];
+        signed_distances(&mesh, &bvh, &sign, &points, f32::INFINITY, &mut out).unwrap();
+        let tol = 1e-5 * diagonal(&mesh);
+        let mut checked = 0;
+        for (&pt, &value) in points.iter().zip(&out) {
+            let to_pinch = ((pt[0] - pinch[0]).powi(2)
+                + (pt[1] - pinch[1]).powi(2)
+                + (pt[2] - pinch[2]).powi(2))
+            .sqrt() as f64;
+            if to_pinch < 0.2 || brute_distance(&mesh, pt) <= tol {
+                continue;
+            }
+            let inside = exact_winding(&mesh, pt) >= 0.5;
+            assert_eq!(value < 0.0, inside, "sign at {pt:?}: value {value}");
+            checked += 1;
+        }
+        assert!(checked > 1500, "only {checked} signs checked");
+    }
+
+    #[test]
+    fn t_junction_vertex_signs_are_consistent() {
+        // A T-junction: the right square's mid-edge vertex lies on the left
+        // square's edge without splitting it. The mesh has a slit (open) but
+        // consistent orientation; signs match the side of the sheet away from
+        // the slit.
+        let pos = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [2.0, 0.5, 0.0],
+        ];
+        let tris = vec![
+            [0, 1, 2],
+            [0, 2, 3],
+            [1, 4, 7],
+            [1, 7, 6],
+            [6, 7, 5],
+            [6, 5, 2],
+        ];
+        let mut mesh = mesh(&pos, &tris);
+        let bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Auto).unwrap();
+        let status = sign.status();
+        assert!(!status.closed);
+        assert!(status.consistent_orientation);
+        assert_eq!(status.mode, SignMode::Pseudonormal);
+        let mut rng = Lcg(43);
+        for _ in 0..500 {
+            let x = rng.next() * 2.0;
+            let y = rng.next();
+            if (x - 1.0).abs() < 0.1 {
+                continue;
+            }
+            let h = 0.05 + rng.next() * 0.2;
+            for under in [false, true] {
+                let p = [x, y, if under { -h } else { h }];
+                let mut out = [f32::NAN; 1];
+                signed_distances(&mesh, &bvh, &sign, &[p], f32::INFINITY, &mut out).unwrap();
+                assert_eq!(out[0] < 0.0, under, "sign at {p:?}: {}", out[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn open_mesh_with_flipped_patch_reports_inconsistent() {
+        // A terrain with one interior triangle flipped: open, inconsistent
+        // orientation, pseudonormal mode, and wrong signs on that patch.
+        let base = terrain(8);
+        let n = 8u32;
+        let flip = (4 * n + 4) * 2;
+        let mut tris: Vec<[u32; 3]> = (0..base.triangle_slots() as u32)
+            .map(|t| base.triangle(t).unwrap())
+            .collect();
+        tris[flip as usize].swap(1, 2);
+        let positions: Vec<[f32; 3]> = base.positions().to_vec();
+        let mut mesh = mesh(&positions, &tris);
+        let bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Auto).unwrap();
+        let status = sign.status();
+        assert!(!status.closed);
+        assert!(!status.consistent_orientation);
+        assert_eq!(status.mode, SignMode::Pseudonormal);
+        let tri = tris[flip as usize].map(|v| positions[v as usize]);
+        let centroid: [f32; 3] = std::array::from_fn(|k| (tri[0][k] + tri[1][k] + tri[2][k]) / 3.0);
+        for h in [0.05, 0.15] {
+            for under in [false, true] {
+                let p = [
+                    centroid[0],
+                    centroid[1],
+                    centroid[2] + if under { -h } else { h },
+                ];
+                let mut out = [f32::NAN; 1];
+                signed_distances(&mesh, &bvh, &sign, &[p], f32::INFINITY, &mut out).unwrap();
+                assert_ne!(out[0] < 0.0, under, "flipped sign at {p:?}: {}", out[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn pseudonormal_signs_on_open_cube() {
+        // The open-cube fixture (top face removed): center reads inside,
+        // far outside reads outside, under pseudonormals.
+        let (p, mut t) = cube_buffers();
+        t.drain(2..4);
+        let mut mesh = mesh(&p, &t);
+        let bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+        let status = sign.status();
+        assert!(!status.closed);
+        assert!(status.consistent_orientation);
+        assert_eq!(status.mode, SignMode::Pseudonormal);
+        let points = [
+            ([0.0, 0.0, 0.0], true),
+            ([0.5, -0.3, 0.2], true),
+            ([3.0, 0.0, 0.0], false),
+            ([0.0, 3.0, 0.0], false),
+            ([0.0, 0.0, -3.0], false),
+        ];
+        let pts: Vec<[f32; 3]> = points.iter().map(|(p, _)| *p).collect();
+        let mut out = vec![f32::NAN; pts.len()];
+        signed_distances(&mesh, &bvh, &sign, &pts, f32::INFINITY, &mut out).unwrap();
+        for ((p, inside), value) in points.iter().zip(out) {
+            assert_eq!(value < 0.0, *inside, "at {p:?}: {value}");
         }
     }
 

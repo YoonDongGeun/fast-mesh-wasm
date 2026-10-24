@@ -93,7 +93,7 @@ pub enum SignMode {
 
 /// What [`SignData::build`] found out about a mesh, so that an application
 /// can warn when signs are doubtful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignStatus {
     /// The mode in use: never [`SignMode::Auto`].
     pub mode: SignMode,
@@ -109,6 +109,12 @@ pub struct SignStatus {
     pub non_manifold_vertices: usize,
     /// Alive triangles with exactly zero area.
     pub degenerate_triangles: usize,
+    /// The signed volume enclosed by the alive triangles (O(n), in `f64`):
+    /// positive for a closed, outward mesh, negative for a consistently
+    /// inverted one (every sign wrong under `Auto`), near zero for an open
+    /// sheet. Apps can warn when a closed, consistently oriented mesh has
+    /// a negative volume.
+    pub signed_volume: f64,
 }
 
 /// Per-mesh data that decides the sign of a distance, built by
@@ -257,6 +263,16 @@ fn topology_span(
         .fold((true, true, 0), |(a, b, n), (c, d, m)| {
             (a && c, b && d, n + m)
         }))
+}
+
+/// The signed volume contribution of triangle slot `t`:
+/// `dot(a, cross(b, c)) / 6` in `f64`, or zero for a dead slot.
+fn tri_volume(mesh: &Mesh, t: usize) -> f64 {
+    let Some(tri) = mesh.triangle(t as TriangleId) else {
+        return 0.0;
+    };
+    let p = corners(mesh, tri).map(widen);
+    dot(p[0], cross(p[1], p[2])) / 6.0
 }
 
 /// The alive non-manifold vertices among the vertex slots in `span`.
@@ -453,6 +469,7 @@ impl SignBuild {
                     consistent_orientation: true,
                     non_manifold_vertices: 0,
                     degenerate_triangles: 0,
+                    signed_volume: 0.0,
                 },
                 vertex_normals: Vec::new(),
                 edge_normals: Vec::new(),
@@ -544,11 +561,16 @@ impl SignBuild {
                 Stage::Topology(from) => {
                     let r = span(from, mesh.triangles().len(), left);
                     let (to, n) = (r.end, r.len());
-                    let (closed, consistent, degenerate) = topology_span(mesh, adj, &self.face, r)?;
+                    let (closed, consistent, degenerate) =
+                        topology_span(mesh, adj, &self.face, r.clone())?;
                     let st = &mut self.data.status;
                     st.closed &= closed;
                     st.consistent_orientation &= consistent;
                     st.degenerate_triangles += degenerate;
+                    // Sequentially in id order, so every budget sums the same bits.
+                    for t in r {
+                        st.signed_volume += tri_volume(mesh, t);
+                    }
                     left -= n.min(left);
                     self.stage = if to == mesh.triangles().len() {
                         Stage::NonManifold(0)
@@ -727,6 +749,46 @@ impl SignData {
         self.moments.winding(mesh, bvh, p).0
     }
 
+    /// Whether the closest feature of `hit` touches a boundary edge of
+    /// `mesh`: a face interior never does, an edge when it is used by one
+    /// triangle only, a vertex when any edge at it is. A point past an open
+    /// rim is signed by the plane of its boundary face, so an antagonist
+    /// vertex just beyond a scan's margin can read as penetration; apps can
+    /// use this to detect that halo. Returns `None` when the mesh's
+    /// adjacency (or, for a vertex, its incidence) is not cached, or `hit`
+    /// is not on an alive triangle.
+    pub fn is_boundary_hit(mesh: &Mesh, hit: &ClosestHit) -> Option<bool> {
+        let adj = mesh.adjacency()?;
+        let t = hit.triangle;
+        if !mesh.is_triangle_alive(t) {
+            return None;
+        }
+        let tri = mesh.triangles()[t as usize];
+        match hit.feature {
+            Feature::Face => Some(false),
+            Feature::Edge(k) => {
+                let c = 3 * t + (u32::from(k) + 2) % 3;
+                Some(adj.edge_kind(c) == EdgeKind::Boundary)
+            }
+            Feature::Vertex(k) => {
+                let inc = mesh.incidence()?;
+                let v = tri[k as usize];
+                for &s in inc.triangles(v) {
+                    let stri = mesh.triangles()[s as usize];
+                    let Some(pos) = stri.iter().position(|&x| x == v) else {
+                        continue;
+                    };
+                    for j in [(pos + 1) % 3, (pos + 2) % 3] {
+                        if adj.edge_kind(3 * s + j as u32) == EdgeKind::Boundary {
+                            return Some(true);
+                        }
+                    }
+                }
+                Some(false)
+            }
+        }
+    }
+
     /// Whether `p`, whose closest point on `mesh` is `hit`, counts as inside
     /// (negative distance). `mesh` and `bvh` must be those this data is
     /// current for.
@@ -825,6 +887,33 @@ mod tests {
         SignData::build(&mut mesh, &bvh, mode).map(|s| s.status())
     }
 
+    /// [`status_of`], with the volume zeroed: for tests of the topology
+    /// flags (the volume is tested separately).
+    fn flags_of(mesh: Mesh, mode: SignMode) -> Result<SignStatus> {
+        status_of(mesh, mode).map(|mut s| {
+            s.signed_volume = 0.0;
+            s
+        })
+    }
+
+    #[test]
+    fn signed_volume_detects_inside_out() {
+        // A closed, outward mesh has positive volume; flipping every
+        // triangle (consistently inverted) negates it, so apps can warn.
+        let closed = status_of(cube(), SignMode::Auto).unwrap();
+        assert!(closed.closed && closed.consistent_orientation);
+        assert!(closed.signed_volume > 0.0);
+        let (p, t) = cube_buffers();
+        let flipped: Vec<[u32; 3]> = t.iter().map(|tri| [tri[0], tri[2], tri[1]]).collect();
+        let inside_out = status_of(mesh(&p, &flipped), SignMode::Auto).unwrap();
+        assert!(inside_out.closed && inside_out.consistent_orientation);
+        assert!(inside_out.signed_volume < 0.0);
+        assert!(
+            (closed.signed_volume + inside_out.signed_volume).abs()
+                < 1e-6 * closed.signed_volume.abs()
+        );
+    }
+
     #[test]
     fn status_reports_topology() {
         let closed = SignStatus {
@@ -833,10 +922,11 @@ mod tests {
             consistent_orientation: true,
             non_manifold_vertices: 0,
             degenerate_triangles: 0,
+            signed_volume: 0.0,
         };
-        assert_eq!(status_of(cube(), SignMode::Auto), Ok(closed));
-        assert_eq!(status_of(cube(), SignMode::Pseudonormal), Ok(closed));
-        assert_eq!(status_of(torus(), SignMode::Auto), Ok(closed));
+        assert_eq!(flags_of(cube(), SignMode::Auto), Ok(closed));
+        assert_eq!(flags_of(cube(), SignMode::Pseudonormal), Ok(closed));
+        assert_eq!(flags_of(torus(), SignMode::Auto), Ok(closed));
 
         // Open: a cube with its top face removed, and a terrain sheet.
         let (p, mut t) = cube_buffers();
@@ -845,8 +935,8 @@ mod tests {
             closed: false,
             ..closed
         };
-        assert_eq!(status_of(mesh(&p, &t), SignMode::Auto), Ok(open));
-        assert_eq!(status_of(terrain(4), SignMode::Auto), Ok(open));
+        assert_eq!(flags_of(mesh(&p, &t), SignMode::Auto), Ok(open));
+        assert_eq!(flags_of(terrain(4), SignMode::Auto), Ok(open));
 
         // Two cubes meeting at one vertex: closed, one non-manifold vertex.
         let (mut p, mut t) = cube_buffers();
@@ -858,7 +948,7 @@ mod tests {
                 .map(|tri| tri.map(|v| if v == 0 { 7 } else { v + 7 })),
         );
         assert_eq!(
-            status_of(mesh(&p, &t), SignMode::Auto),
+            flags_of(mesh(&p, &t), SignMode::Auto),
             Ok(SignStatus {
                 non_manifold_vertices: 1,
                 ..closed
@@ -869,7 +959,7 @@ mod tests {
         let (p, mut t) = cube_buffers();
         t.push([0, 0, 1]);
         assert_eq!(
-            status_of(mesh(&p, &t), SignMode::Auto),
+            flags_of(mesh(&p, &t), SignMode::Auto),
             Ok(SignStatus {
                 closed: false,
                 non_manifold_vertices: 2,
@@ -886,9 +976,9 @@ mod tests {
             consistent_orientation: false,
             ..closed
         };
-        assert_eq!(status_of(mesh(&p, &t), SignMode::Pseudonormal), Ok(flipped));
+        assert_eq!(flags_of(mesh(&p, &t), SignMode::Pseudonormal), Ok(flipped));
         assert_eq!(
-            status_of(mesh(&p, &t), SignMode::Auto),
+            flags_of(mesh(&p, &t), SignMode::Auto),
             Ok(SignStatus {
                 mode: SignMode::Winding,
                 ..flipped
@@ -896,14 +986,14 @@ mod tests {
         );
         t.truncate(11);
         assert_eq!(
-            status_of(mesh(&p, &t), SignMode::Auto),
+            flags_of(mesh(&p, &t), SignMode::Auto),
             Ok(SignStatus {
                 closed: false,
                 ..flipped
             })
         );
         assert_eq!(
-            status_of(cube(), SignMode::Winding),
+            flags_of(cube(), SignMode::Winding),
             Ok(SignStatus {
                 mode: SignMode::Winding,
                 ..closed
@@ -919,6 +1009,7 @@ mod tests {
             .map(|x| u64::from(x.to_bits()))
             .chain(ids.map(|&i| u64::from(i)))
             .chain(s.moments.bits())
+            .chain(std::iter::once(s.status.signed_volume.to_bits()))
             .collect();
         (s.status, v)
     }

@@ -120,15 +120,15 @@ impl DistanceField {
 
 /// The state of a field, from
 /// [`Scene::field_status`](crate::Scene::field_status).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FieldStatus {
     /// True when the values match the meshes and placements as they are now.
     pub current: bool,
     /// What the latest sign data builds found out about the meshes of `to`,
     /// together: `closed` and `consistent_orientation` when every target is,
-    /// the counts summed over the targets, and the first target's `mode`
-    /// (every target is built in the requested mode, so they share it unless
-    /// `Auto` resolved differently). See
+    /// the counts and the signed volume summed over the targets, and the
+    /// first target's `mode` (every target is built in the requested mode,
+    /// so they share it unless `Auto` resolved differently). See
     /// [`Scene::field_target_status`](crate::Scene::field_target_status) for
     /// each target.
     pub sign: SignStatus,
@@ -498,6 +498,7 @@ impl Field {
                 consistent_orientation: false,
                 non_manifold_vertices: 0,
                 degenerate_triangles: 0,
+                signed_volume: 0.0,
             },
             SignData::status,
         )
@@ -850,6 +851,7 @@ impl Scene {
             sign.consistent_orientation &= s.consistent_orientation;
             sign.non_manifold_vertices += s.non_manifold_vertices;
             sign.degenerate_triangles += s.degenerate_triangles;
+            sign.signed_volume += s.signed_volume;
         }
         Ok(FieldStatus {
             current: self.field_current(i),
