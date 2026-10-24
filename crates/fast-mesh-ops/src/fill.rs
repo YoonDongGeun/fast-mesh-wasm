@@ -266,18 +266,17 @@ pub struct FillReport {
 ///
 /// Nothing is written in any of these cases.
 pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillReport> {
-    let bounds = [
-        options.max_perimeter,
-        options.max_area,
-        options.max_dihedral,
-    ];
+    // `max_dihedral` is a quality limit, not a selector: it neither counts
+    // towards the guard below nor skips loops in `within_bounds`.
+    let bounds = [options.max_perimeter, options.max_area];
     if options.max_edges.is_none() && bounds.iter().all(Option::is_none) && options.loops.is_none()
     {
         return Err(OpsError::InvalidInput(
             "fill_holes needs a bound or a list of loops",
         ));
     }
-    if bounds.iter().flatten().any(|b| b.is_nan() || *b < 0.0) {
+    let bad = |b: &f64| b.is_nan() || *b < 0.0;
+    if bounds.iter().flatten().any(bad) || options.max_dihedral.is_some_and(|b| bad(&b)) {
         return Err(OpsError::InvalidInput(
             "fill bounds must not be NaN or negative",
         ));
@@ -791,6 +790,31 @@ mod tests {
             Err(OpsError::InvalidInput(_))
         ));
         assert!(tx.commit().unwrap().is_empty());
+    }
+
+    #[test]
+    fn max_dihedral_alone_selects_no_loop() {
+        // A quality limit, not a selector: on its own it must trip the
+        // accidental-full-fill guard, like `max_refine_vertices` does.
+        for options in [
+            FillOptions {
+                max_dihedral: Some(0.5),
+                ..FillOptions::default()
+            },
+            FillOptions {
+                max_dihedral: Some(0.5),
+                max_refine_vertices: Some(100),
+                ..FillOptions::default()
+            },
+        ] {
+            let mut mesh = bowtie_holes();
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                fill_holes(&mut tx, &options),
+                Err(OpsError::InvalidInput(_))
+            ));
+            assert!(tx.commit().unwrap().is_empty());
+        }
     }
 
     /// [`grid_without`]`(4, (1, 1))` with a closed tetrahedron on edge
