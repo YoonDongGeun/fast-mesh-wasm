@@ -38,6 +38,7 @@ mod fill;
 mod fill_dp;
 mod orient;
 mod refine;
+mod sparse;
 #[cfg(test)]
 mod test_util;
 mod topology;

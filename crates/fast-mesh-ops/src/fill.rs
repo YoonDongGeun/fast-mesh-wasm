@@ -35,13 +35,13 @@ pub struct FillOptions {
     /// otherwise the refined patch keeps its new vertices at the centroids
     /// they were split at.
     ///
-    /// On by default. Fairing costs about 10-15x an unfaired fill and grows
-    /// with the square of the patch size (conjugate gradient on the
-    /// bi-Laplacian), so a large hole can take seconds; set `fair: false`
-    /// for speed when a closed surface is enough. At a pinch vertex shared
-    /// with another hole filled in the same call, the one-ring used for
-    /// fairing does not include the other hole's patch, which slightly
-    /// distorts the patches near that vertex on a curved surface.
+    /// On by default. Fairing is a sparse direct solve of the bi-Laplacian:
+    /// tens of milliseconds for thousands of new vertices, about 0.3 s at
+    /// 19,000; set `fair: false` for speed when a closed surface is enough.
+    /// At a pinch vertex shared with another hole filled in the same call,
+    /// the one-ring used for fairing does not include the other hole's
+    /// patch, which slightly distorts the patches near that vertex on a
+    /// curved surface.
     pub fair: bool,
     /// Loops with more edges than this are triangulated by projection onto
     /// their best-fit plane instead of the `O(n³)` minimum-weight search.
@@ -246,8 +246,8 @@ pub struct FillReport {
 /// - With `fair`, the new vertices are moved to minimise bending, holding
 ///   the loop and the ring of mesh vertices around it fixed: the discrete
 ///   bi-Laplacian, cotangent weights falling back to uniform ones
-///   ([`FilledLoop::weights`]), solved by preconditioned conjugate gradient.
-///   A solve that does not reach its tolerance keeps its best iterate and
+///   ([`FilledLoop::weights`]), factored once as a sparse LDLᵀ and solved
+///   for the three coordinates. A solve that does not reach its tolerance
 ///   reports `converged: false`; one that is not finite fails the loop with
 ///   [`FailReason::Solver`].
 /// - Every selected loop is planned before the first write; the new
@@ -1080,14 +1080,16 @@ mod tests {
 
     #[test]
     fn fill_faired_bit_identical() {
-        // The 30-degree patch has over `PAR_MIN_FAIR_ROWS` vertices.
+        // The 30-degree patch has over a thousand vertices.
         let holed = sphere_with_holes(160);
         let (positions, triangles) = parts(&holed);
         let options = FillOptions {
             max_edges: Some(1000),
             ..FillOptions::default()
         };
-        let (mesh, r) = assert_parallel_identical("fill_holes fair", || {
+        // Fairing is a sequential direct solve, so the runs can only differ
+        // by the thread count: no parallel path is required.
+        let (mesh, r) = assert_identical_across_threads("fill_holes fair", || {
             let mut mesh = mesh_of(&positions, &triangles);
             let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
             let (positions, triangles) = parts(&mesh);
@@ -1097,7 +1099,7 @@ mod tests {
         assert_eq!(r.filled.len(), 3);
         assert!(r.filled.iter().all(|f| f.converged && f.weights.is_some()));
         let largest = r.filled.iter().map(|f| f.vertices_added).max().unwrap();
-        assert!(largest >= crate::fair::PAR_MIN_FAIR_ROWS, "{largest}");
+        assert!(largest >= 1024, "{largest}");
         assert!(mesh.0.len() > 3 * holed.vertex_slots());
     }
 

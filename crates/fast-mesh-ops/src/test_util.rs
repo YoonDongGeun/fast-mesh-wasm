@@ -474,3 +474,28 @@ pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
     assert!(par::parallel_entries() > before, "{what}: ran sequentially");
     reference
 }
+
+/// Runs `run` with parallel work forced off, then on pools of 1, 2 and 8
+/// threads and on the global pool, asserting every run matches the first;
+/// for code with no parallel path of its own, where
+/// [`assert_parallel_identical`] would fail for running sequentially.
+/// Returns the first run.
+pub(crate) fn assert_identical_across_threads<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    run: impl Fn() -> R + Sync,
+) -> R {
+    use fast_mesh_store::par;
+    par::set_force_sequential(true);
+    let reference = run();
+    par::set_force_sequential(false);
+    if !par::enabled() {
+        // Every run below would be this one again.
+        return reference;
+    }
+    for k in [1, 2, 8] {
+        let got = par::with_threads(k, &run);
+        assert!(got == reference, "{what}: {k} threads");
+    }
+    assert!(run() == reference, "{what}: global pool");
+    reference
+}
