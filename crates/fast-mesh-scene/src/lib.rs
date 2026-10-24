@@ -51,12 +51,14 @@
 //!   mesh, stored in a derived channel `field:<name>` and kept up to date
 //!   incrementally under the [`UpdateMode`] of the mesh it is on
 //!   ([`Scene::update_fields`], [`Scene::flush`]). Read with
-//!   [`Scene::field_values`] and [`Scene::field_status`]; remove with
-//!   [`Scene::remove_field`] (or with either mesh).
+//!   [`Scene::field_values`] and [`Scene::field_status`]; list a mesh's with
+//!   [`Scene::fields_on`]; change `max_distance` or the sign mode with
+//!   [`Scene::reconfigure_field`]; remove with [`Scene::remove_field`] (or
+//!   with either mesh).
 //! - Colours: [`Scene::set_coloring`] colours a mesh from one of its fields
-//!   with a [`ColorRule`]; [`Scene::colors`] returns one RGBA8 per vertex
-//!   slot, and recoloured vertices are reported in
-//!   [`MeshChanges::colors_dirty`].
+//!   with a [`ColorRule`]; [`Scene::coloring`] returns the colouring,
+//!   [`Scene::colors`] one RGBA8 per vertex slot, and recoloured vertices
+//!   are reported in [`MeshChanges::colors_dirty`].
 //! - Normals: [`Scene::set_normals`] turns a mesh's smooth vertex normals
 //!   on; [`Scene::normals`] returns one mesh-local normal per vertex slot,
 //!   kept up to date incrementally under the mesh's [`UpdateMode`], and

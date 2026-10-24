@@ -766,7 +766,9 @@ impl Scene {
 
     /// Adds a consumer of change reports and returns its id. It starts with
     /// a clean report for every mesh, so it sees only what happens from now
-    /// on, and drains its reports with [`Scene::take_changes_for`]. Every
+    /// on, except for colours: a mesh that already has a colouring starts
+    /// with `colors_dirty: None`, so the subscriber reads every colour once.
+    /// It drains its reports with [`Scene::take_changes_for`]. Every
     /// subscriber is told about the same changes, merged the same way.
     /// A subscriber that never drains keeps accumulating reports (merged
     /// change sets and removals) until it is drained or unsubscribed.
@@ -775,7 +777,11 @@ impl Scene {
         let id = SubscriberId(self.next_subscriber);
         self.next_subscriber += 1;
         for (_, entry) in self.entries.iter_mut() {
-            entry.reports.push(Report::clean());
+            let mut report = Report::clean();
+            if entry.coloring.is_some() {
+                report.colors_dirty = None;
+            }
+            entry.reports.push(report);
         }
         self.subscribers.push(Subscriber {
             id,

@@ -936,6 +936,81 @@ impl Scene {
             .map(|c| e.mesh.channel(&c.channel).unwrap_or(&[])))
     }
 
+    /// The mesh's colouring, or `None` when the mesh has no colouring. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn coloring(&self, mesh: MeshId) -> Result<Option<&Coloring>> {
+        Ok(self.entry(mesh)?.coloring.as_ref().map(|c| &c.coloring))
+    }
+
+    /// The ids of the fields on `mesh`, in the order they were added. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn fields_on(&self, mesh: MeshId) -> Result<Vec<FieldId>> {
+        self.entry(mesh)?;
+        Ok(self
+            .fields
+            .iter()
+            .filter(|f| f.desc.on == mesh)
+            .map(|f| f.id)
+            .collect())
+    }
+
+    /// Changes a field's `max_distance` and sign mode, keeping its id, its
+    /// name, its meshes and any colouring by it. The field is recomputed in
+    /// full on its next update (at once for an Eager field); until then its
+    /// values are stale and [`Scene::field_status`] reports it as not
+    /// current, with placeholder sign data when the sign mode changed.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field;
+    /// [`SceneError::InvalidInput`] when `max_distance` is negative or NaN.
+    /// The scene is unchanged on error.
+    pub fn reconfigure_field(
+        &mut self,
+        id: FieldId,
+        max_distance: f64,
+        sign: SignMode,
+    ) -> Result<()> {
+        self.drop_field_unit();
+        if max_distance.is_nan() || max_distance < 0.0 {
+            return Err(SceneError::InvalidInput(
+                "max_distance must be zero or greater, and not NaN",
+            ));
+        }
+        let i = self.field_index(id)?;
+        {
+            let f = &mut self.fields[i];
+            if f.desc.max_distance == max_distance && f.desc.sign == sign {
+                return Ok(());
+            }
+            f.desc.max_distance = max_distance;
+            if f.desc.sign != sign {
+                f.desc.sign = sign;
+                for s in f.sign.iter_mut() {
+                    *s = None;
+                }
+                for b in f.sign_builds.iter_mut() {
+                    *b = None;
+                }
+            }
+            f.fresh = true;
+        }
+        let on = self.fields[i].desc.on;
+        let eager = self
+            .entry(on)
+            .map(|e| e.mode == UpdateMode::Eager)
+            .unwrap_or(false);
+        if eager {
+            let _ = self.update_field(i);
+        }
+        Ok(())
+    }
+
     /// The id of the registered field with this [`FieldId::raw`] value, or
     /// `None` when there is none (never added, or removed).
     pub fn field_id(&self, raw: u32) -> Option<FieldId> {
@@ -3295,6 +3370,94 @@ mod tests {
         scene.set_coloring(a, None).unwrap();
         assert_eq!(scene.colors(a), Ok(None));
         assert_eq!(colors_dirty(&mut scene, a), None);
+    }
+
+    #[test]
+    fn late_subscriber_gets_full_colour_report() {
+        // A subscriber added after a colouring exists gets `colors_dirty:
+        // None` for the coloured mesh, so it knows to read every colour.
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        scene.take_changes();
+        let s = scene.subscribe();
+        let changes = scene.take_changes_for(s).unwrap();
+        let mine = changes.iter().find(|c| c.id == a).unwrap();
+        assert_eq!(mine.colors_dirty, None);
+        // An uncoloured mesh still starts clean.
+        assert!(changes.iter().find(|c| c.id == b).is_none());
+    }
+
+    #[test]
+    fn coloring_getter_and_field_list() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        assert_eq!(scene.coloring(a).unwrap(), None);
+        assert_eq!(scene.fields_on(a).unwrap(), vec![]);
+        let f1 = scene.add_distance_field(field("d1", a, b, 0.1)).unwrap();
+        let f2 = scene.add_distance_field(field("d2", a, b, 0.2)).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f1, f2]);
+        assert_eq!(scene.fields_on(b).unwrap(), vec![]);
+        let rule = contact_rule(0.1);
+        let coloring = Coloring {
+            field: f1,
+            rule: rule.clone(),
+        };
+        scene.set_coloring(a, Some(coloring.clone())).unwrap();
+        assert_eq!(scene.coloring(a).unwrap(), Some(&coloring));
+        scene.set_coloring(a, None).unwrap();
+        assert_eq!(scene.coloring(a).unwrap(), None);
+        scene.remove_field(f1).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f2]);
+    }
+
+    #[test]
+    fn reconfigure_field_keeps_id_and_colouring() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        scene.take_changes();
+        let before = scene.field_values(f).unwrap().to_vec();
+        // Widening max_distance keeps the id and the colouring, and brings
+        // more vertices into range.
+        scene.reconfigure_field(f, 0.5, SignMode::Auto).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f]);
+        assert!(scene.coloring(a).unwrap().is_some());
+        // Eager: recomputed at once.
+        assert!(scene.field_status(f).unwrap().current);
+        let after = scene.field_values(f).unwrap().to_vec();
+        assert_ne!(before, after);
+        let finite_before = before.iter().filter(|v| v.is_finite()).count();
+        let finite_after = after.iter().filter(|v| v.is_finite()).count();
+        assert!(finite_after >= finite_before);
+        // Invalid inputs are rejected and change nothing.
+        assert!(matches!(
+            scene.reconfigure_field(f, f64::NAN, SignMode::Auto),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(scene.field_status(f).unwrap().current);
+        // Same values: a no-op.
+        let values = scene.field_values(f).unwrap().to_vec();
+        scene.reconfigure_field(f, 0.5, SignMode::Auto).unwrap();
+        assert!(scene.field_status(f).unwrap().current);
+        assert_eq!(scene.field_values(f).unwrap(), &values[..]);
     }
 
     #[test]
