@@ -13,9 +13,11 @@ use crate::{ChangeSet, Mesh, Patch, PatchSide, Result, StoreError};
 /// The history also decides when removed slots may be reused. A slot freed by a
 /// patch stays reserved while that patch can still be undone, and a slot created by
 /// an undone patch stays reserved while it can be redone. Evicting or discarding the
-/// patch releases the slot. Patches kept outside a `History` never release their
-/// slots; those are reclaimed by [`Mesh::compact`]. Patches made stale by a direct
-/// [`Mesh::compact`] release nothing: their slots no longer exist.
+/// patch releases the slot. Patches kept outside a `History` release their slots
+/// through [`Mesh::release_patch_slots`], at most once and only once no history
+/// still holds the patch; slots never released that way are reclaimed by
+/// [`Mesh::compact`]. Patches made stale by a direct [`Mesh::compact`] release
+/// nothing: their slots no longer exist.
 ///
 /// The budget counts undo and redo patches together, but eviction only drops undo
 /// patches (oldest first). While a large redo stack exists, [`History::bytes`] may
