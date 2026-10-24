@@ -874,6 +874,46 @@ describe("background add landings against a synchronous scene", () => {
     }
   }
 
+  it("the_copies_are_sent_when_nothing_changed_the_mesh", async () => {
+    // Re-review R2: the copies are not only correct but used. The stamp
+    // read when the add lands equals the one read when its record is
+    // packed, so the frame sends them (a spurious bump would disable the
+    // copies with every twin above still green): landing while idle, with
+    // a placement in its batch, and with a field added on the new mesh.
+    const cases: [string, Request[]][] = [
+      ["idle", []],
+      ["placement in the batch", [placement(3, 1)]],
+      [
+        "field on the new mesh",
+        [{ kind: "field", rev: rev(), field: 7, op: "add", desc: { name: "g", on: 3, to: [1], maxDistance: 0.5 } }],
+      ],
+    ];
+    for (const [name, extra] of cases) {
+      const seen: number[] = [];
+      await patched(
+        "content_stamp",
+        (orig) =>
+          function (this: unknown, ...args: unknown[]) {
+            const v = orig.apply(this, args) as number;
+            seen.push(v);
+            return v;
+          },
+        async () => {
+          const h = addEngine();
+          h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+          await h.until(() => h.results().length === 1);
+          h.send([addMeshReq(3, BIG), ...extra.map((e) => ({ ...e, rev: rev() }))]);
+          await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+          await h.until(() => h.results().length === 2);
+          expect(h.chunks.some((c) => c.kind === "addMeshPack"), name).toBe(true);
+          // Read once at the landing, once at the frame: the same.
+          expect(seen, name).toHaveLength(2);
+          expect(seen[1], name).toBe(seen[0]);
+        },
+      );
+    }
+  });
+
   it("a_landing_waits_for_an_open_field_unit_and_is_copied_meanwhile", async () => {
     // The copy changes nothing in the scene, so it runs between the steps
     // of a field step unit; the landing waits until the unit is over.
