@@ -176,9 +176,10 @@ pub fn triangles_in(
 ///
 /// A vertex that no triangle uses is not found: the search runs over triangles.
 ///
-/// Before deduplication, `out` can temporarily hold each vertex once per
-/// incident candidate triangle, about 6 times the result for a typical mesh,
-/// and `out` keeps that capacity afterwards.
+/// During the traversal the appended range is compacted (sorted and
+/// deduplicated in place) whenever it reaches twice its size at the last
+/// compaction, so it never holds much more than twice the final result, and
+/// needs no extra memory; `out` keeps that capacity afterwards.
 ///
 /// # Errors
 /// As for [`triangles_in`].
@@ -192,11 +193,17 @@ pub fn vertices_in(
     check(mesh, bvh)?;
     let mut ap = Appender::new(out);
     let positions = mesh.positions();
+    // Appended elements at which the range is next compacted. Below this
+    // floor compaction costs more than it saves.
+    let mut compact_at = 64;
     candidates(bvh, region, |id| {
         for v in mesh.triangles()[id as usize] {
             if region.contains_point(positions[v as usize]) {
                 ap.push(v)?;
             }
+        }
+        if ap.count() >= compact_at {
+            compact_at = 2 * ap.sort_dedup_appended().max(1);
         }
         Ok(())
     })?;
@@ -450,6 +457,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vertices_in_peak_stays_near_the_result() {
+        // Issue #20: periodic compaction during the traversal bounds the
+        // temporary peak at about twice the result, instead of once per
+        // incident triangle (about 6 times). The capacity pins the peak
+        // within vector doubling of it.
+        let mesh = wavy(64);
+        let bvh = build(&mesh, Quality::Sah);
+        let region = Region::Box(Aabb::new([-1.0; 3], [70.0; 3]));
+        let mut out = Vec::new();
+        let n = vertices_in(&mesh, &bvh, &region, &mut out).unwrap();
+        assert_eq!(n, 65 * 65);
+        assert_eq!(out.len(), n);
+        assert!(
+            out.capacity() <= 5 * n,
+            "capacity {} for {n} vertices",
+            out.capacity()
+        );
     }
 
     #[test]
