@@ -615,7 +615,7 @@ The bench sends a frame with the long request, then at once a frame with a colou
   - A mesh of 65,536 triangles or more is built in the background: steps of the BVH build run between other requests and while the Worker is idle.
   - The toggle is answered in 8 ms at 1M (main: 1.18 s) and 71 ms at 10M (main: 16 s). At 10M, 69 ms of that is the add's own batch: the copy of the 10M inputs into wasm and the mesh's store, which come before the build.
   - The mesh lands about as soon as before (1.14 s at 1M).
-  - The longest block is the landing: the insert, the normals, the render buffers and packing the whole new mesh into its result. That is 20 ms at 1M and 136 ms at 10M, O(n) copies that stay in one piece.
+  - The longest block is the landing: the insert, the normals, the render buffers and packing the whole new mesh into its result. That is 20 ms at 1M and 136 ms at 10M, O(n) copies that stay in one piece. (Since issue #64 these run in steps before the landing: see "Landing a background add" below.)
 
 ### No regression on the drags
 
@@ -634,6 +634,62 @@ The bench sends a frame with the long request, then at once a frame with a colou
 
 - **The contact path is unchanged within noise.** It stays on the near search, now stepped: 2.02 against 1.97 ms per pose.
 - **The wide drag's unit open is no longer one call.** The first step of a recompute takes about 4 ms (main: 58 to 62 ms, all of it the open), and every later step is under about 15 ms. A recompute takes the same time as before.
+
+### Landing a background add, and near-search parts (issue #64)
+
+Landing a background add used to be one call: the insert, the vertex normals, and packing the whole mesh into its frame. Now:
+
+- the normals are computed in the build's steps, after the BVH and still outside the scene (`MeshBuild::set_normals`);
+- the last stage of the BVH build (subtree counts, treelet roots and their costs), which was one pass over the tree, is stepped too;
+- the engine copies the positions, normals and indices out of wasm memory in steps of their own (6.4 MB each by default) before the mesh lands, and the landing frame sends these copies.
+
+The landing itself is then an O(1) insert. Results are bit-identical: twin tests compare `NormalBuild` with one call, `MeshBuild` with normals with `add_mesh` + `set_normals`, and the landing record with a synchronous add's, with and without an edit in the landing batch. A threaded engine that finishes an add for a waiting request still lands it in one call and packs it into the frame, as before.
+
+`pnpm --filter fast-mesh-wasm bench -- --worker --queued --add-only` (with `--10m --no-1m` for 10M): main (`96b48ec`) against this branch, run back to back twice on 2026-10-24. Other agents were using the machine, so the absolute numbers are higher than in the table above. In a quieter run that morning, main's 1M block was 20.2 ms and this branch's 10.7 ms.
+
+| `addMesh`, longest Worker block | Main, run 1 / run 2 | Now, run 1 / run 2 |
+| --- | --- | --- |
+| 1M | 25.2 / 21.6 ms | **14.0 / 16.3 ms** |
+| 10M | 184 / 207 ms | **103 / 108 ms** |
+
+- **At 1M the landing is no longer the longest block.** What remains are the BVH build's own steps (100,000 units: about 8 to 10 ms in wasm, the tree build's last step up to about twice that) and the add's own batch (about 8 to 10 ms, below).
+- **At 10M the longest block is now the add's own batch**, about 100 ms (its round trip equals the block), and no longer the landing (150 to 207 ms).
+- **The pieces, timed in wasm at 10M** through the internal `meshAdds`:
+
+  | Piece | Before | Now |
+  | --- | --- | --- |
+  | Landing (`finish`) | 57 ms (the normals) | 0.04 ms |
+  | Copy of the buffers (240 MB) | 35 ms in one piece | 39 steps of 1.0 to 1.5 ms |
+  | Normals | inside the landing | 57 steps of 0.3 to 4 ms |
+  | Treelet stage of the BVH build | 33 ms in one step | steps of 0.3 to 9 ms |
+
+  At 1M the landing goes from 5.7 to 0.04 ms, and the copy from 3.3 ms in one piece to 4 steps of under 1 ms.
+- **Memory.** The copies are allocated at the first copy step and held until the landing frame is posted: 24 MB at 1M and 240 MB at 10M. That is the same size the frame allocated before, held for longer.
+
+**The add's own batch is not stepped.** It is `begin_add_mesh`: the wasm-bindgen copy of the inputs into wasm memory, `Mesh::from_buffers_f64` (finite check, bounding box, conversion to `f32`, index check) and `MeshBuild::new`.
+
+| | 1M | 10M |
+| --- | --- | --- |
+| `begin_add_mesh` in wasm, without / with `origin` | 9.0 / 7.3 ms | 102 / 71 ms |
+| Native: copy of the inputs (`Vec::clone`) | 4 ms | 42 ms |
+| Native: `Mesh::from_buffers_f64` | 7.5 to 9 ms | 77 to 93 ms |
+| Native: `MeshBuild::new` | 0.8 ms | 7 to 8 ms |
+
+`MeshBuild::new` itself is small. The cost is the store built from the buffers, and the copy into wasm memory in front of it. Stepping that would need a chunked upload into wasm memory and a resumable store construction. That is a new protocol and new store API, not a cheap change, so it is left for a follow-up.
+
+**Near-search parts.** A stepped near search split a node pair until the product of its sides' triangle counts was at most 2^18. It estimated each count from the node's depth, which is exact only on a balanced tree. It now reads the BVH's subtree counts (`Bvh::subtree_triangles`), which the BVH keeps up to date at 4 bytes per node. So a part holds at most 2^18 triangle pairs on any tree. On a split-chain BVH (depth 21 for 640 triangles) the depth estimate left a part of 376,320 pairs. Results are unchanged, and the drags did not regress:
+
+| 1M, median, main → now (back to back, same session) | |
+| --- | --- |
+| Wide drag, 9a terrain, lock step: move to colours | 99.7 → 92.5 ms |
+| Wide drag, 9a terrain: longest Worker block per pose | 14.0 → 13.1 ms |
+| Wide drag, native terrain, lock step: move to colours | 829 → 810 ms |
+| Wide drag, native terrain: longest Worker block per pose | 16.3 → 13.4 ms |
+| Continuous 60 Hz wide drag (9a / native): longest Worker block | 26.8 / 23.8 → 27.1 / 19.9 ms |
+| Contact drag: move to colours applied | 3.20 → 3.28 ms (p95 6.77 → 6.82) |
+| Contact drag: longest Worker block | 7.08 → 7.28 ms |
+
+The 10M near-search part of the native table below (up to 39 ms) was not measured again.
 
 ### Native steps
 
@@ -774,7 +830,7 @@ cargo bench -p fast-mesh-query --bench query -- slice   # slice; add FAST_MESH_B
 cargo bench -p fast-mesh-scene --bench scene -- sections   # section drag, far edit, fill and gap
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m   # the JavaScript core: addMesh, the 64-pose drag (1M and 10M) and the 6-mesh scene; add --quick for a short run (release build needed; 10M needs a few GB of RAM)
 pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --10m   # the Worker scene in a worker_threads Worker (1M, then 10M with --10m; add --quick for a short run, --wide for just the wide-range drag)
-pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue #48: a toggle queued behind a field build, an edit and an addMesh (1M; --10m adds 10M, --no-1m skips 1M); --contact for just the 1M contact toggle and drag
+pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue #48: a toggle queued behind a field build, an edit and an addMesh (1M; --10m adds 10M, --no-1m skips 1M, --add-only runs just the addMesh); --contact for just the 1M contact toggle and drag
 pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit

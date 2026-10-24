@@ -99,8 +99,10 @@ impl NormalState {
         self.pending = None;
     }
 
-    /// Recomputes every normal from scratch (see [`NormalBuild`], run to
-    /// the end). On error the state is unchanged.
+    /// Recomputes every normal from scratch: the sum of the face normals of
+    /// the alive triangles, in ascending triangle order, normalised. This
+    /// matches `fast_mesh::compute_vertex_normals` over the alive triangles.
+    /// It runs [`NormalBuild`] to the end; on error the state is unchanged.
     fn compute_all(&mut self, mesh: &Mesh) -> Result<()> {
         let mut build = NormalBuild::new();
         while !build.step(mesh, usize::MAX)? {}
