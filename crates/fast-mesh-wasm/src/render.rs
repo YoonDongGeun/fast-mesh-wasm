@@ -122,17 +122,25 @@ fn oom() -> StoreError {
 const DENSE_MIN_SLOTS: usize = 8;
 
 /// The ids of `lists` below `limit`, ascending without duplicates, or
-/// `None` for "all" when the input holds past half the slots: a dense
-/// frame uploads everything anyway, and skipping the sort avoids the
-/// `O(n log n)` work. Tiny buffers are exempt (see
-/// [`DENSE_MIN_SLOTS`]).
+/// `None` for "all" when past half the slots are dirty: a dense frame
+/// uploads everything anyway, and skipping the sort avoids the `O(n log n)`
+/// work. Tiny buffers are exempt (see [`DENSE_MIN_SLOTS`]).
+///
+/// Only in-range ids count toward the gate; out-of-range ids are dropped.
+/// The lists are expected unique, as `ChangeSet` lists are, so a
+/// duplicate-heavy input may still report "all" (a safe superset).
 fn slots(lists: &[&[u32]], limit: usize) -> Result<Option<Vec<u32>>, StoreError> {
-    let total: usize = lists.iter().map(|l| l.len()).sum();
-    if limit > DENSE_MIN_SLOTS && total > limit / 2 {
+    let in_range: usize = lists
+        .iter()
+        .flat_map(|l| l.iter())
+        .filter(|s| (**s as usize) < limit)
+        .count();
+    if limit > DENSE_MIN_SLOTS && in_range > limit / 2 {
         return Ok(None);
     }
     let mut out = Vec::new();
-    out.try_reserve_exact(total).map_err(|_| oom())?;
+    let raw: usize = lists.iter().map(|l| l.len()).sum();
+    out.try_reserve_exact(raw).map_err(|_| oom())?;
     for l in lists {
         out.extend(l.iter().copied().filter(|&s| (s as usize) < limit));
     }
@@ -353,6 +361,15 @@ mod tests {
         assert_eq!(slots(&[&[3, 1]], 100), Ok(Some(vec![1, 3])));
         // ...and tiny buffers keep exact ranges even past half.
         assert_eq!(slots(&[&[0, 1, 3, 9]], 2), Ok(Some(vec![0, 1])));
+    }
+
+    #[test]
+    fn dense_gate_ignores_out_of_range_ids() {
+        // Out-of-range ids are dropped, so they must not trip the gate: 10
+        // in-range ids on a 100-slot buffer stay exact however many strays
+        // pad the input.
+        let padded: Vec<u32> = (0..10).chain(1000..1100).collect();
+        assert_eq!(slots(&[&padded], 100), Ok(Some((0..10).collect())));
     }
 
     #[test]
