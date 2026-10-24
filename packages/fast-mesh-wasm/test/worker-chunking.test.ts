@@ -550,9 +550,10 @@ describe("background adds", () => {
     // Review M1: an unbounded step (Infinity) builds the whole tree in one
     // step instead of wrapping to nothing; since #64 its treelets are
     // assigned in a second, the normals computed in a third and the
-    // buffers copied in one more. NaN and values below 1 fall back to the
-    // default (100,000 units: the same steps for this mesh); 2 units take
-    // many steps.
+    // buffers copied in one more. The store build adds one step per pass
+    // (finiteness, bounds, conversion, indices). NaN and values below 1
+    // fall back to the default (100,000 units: the same steps for this
+    // mesh); 2 units take many steps.
     for (const addStepWork of [Number.POSITIVE_INFINITY, 2 ** 40, Number.NaN, -5, 2]) {
       const h = addEngine({ addStepWork });
       h.send([addMeshReq(1, A)]);
@@ -565,7 +566,7 @@ describe("background adds", () => {
         expect(steps).toBeGreaterThan(100);
         expect(packs).toBeGreaterThan(100);
       } else {
-        expect([steps, packs], `${addStepWork}`).toEqual([3, 1]);
+        expect([steps, packs], `${addStepWork}`).toEqual([7, 1]);
       }
     }
   });
@@ -1081,5 +1082,148 @@ describe("poisoning with a background add pending", () => {
         expect(h.results()[2].poisoned).toBe(true);
       },
     );
+  });
+});
+
+describe("chunked background-add uploads (issue #64)", () => {
+  const sameBytes = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+    want === null
+      ? got === null
+      : got != null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+
+  it("upload_runs_in_bounded_pushes_and_lands_bit_identical", async () => {
+    const pushed: { positions: number[]; indices: number[] } = { positions: [], indices: [] };
+    await patched(
+      "add_mesh_push_positions",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          pushed.positions.push((args[1] as Float64Array).length);
+          return orig.apply(this, args);
+        },
+      async () => {
+        await patched(
+          "add_mesh_push_indices",
+          (orig) =>
+            function (this: unknown, ...args: unknown[]) {
+              pushed.indices.push((args[1] as Uint32Array).length);
+              return orig.apply(this, args);
+            },
+          async () => {
+            const h = addEngine({ addStepWork: 64 });
+            h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+            await h.until(() => h.results().length === 1);
+            h.send([addMeshReq(3, BIG)]);
+            await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+            // Bounded pushes (64 units of 64 bytes), more than one each,
+            // covering the buffers exactly.
+            expect(pushed.positions.length).toBeGreaterThan(1);
+            expect(pushed.indices.length).toBeGreaterThan(1);
+            expect(Math.max(...pushed.positions)).toBeLessThanOrEqual((64 * 64) / 8);
+            expect(Math.max(...pushed.indices)).toBeLessThanOrEqual((64 * 64) / 4);
+            expect(pushed.positions.reduce((s, n) => s + n, 0)).toBe(BIG.positions.length);
+            expect(pushed.indices.reduce((s, n) => s + n, 0)).toBe(BIG.indices.length);
+            const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 3 && c.added)).find(Boolean);
+            const ref = referenceBuffers();
+            expect(sameBytes(record?.bytes.positions, ref.positions)).toBe(true);
+            expect(sameBytes(record?.bytes.normals, ref.normals)).toBe(true);
+            expect(sameBytes(record?.bytes.indices, ref.indices)).toBe(true);
+          },
+        );
+      },
+    );
+  });
+
+  it("a_request_sent_during_the_upload_runs_before_the_add_lands", async () => {
+    const h = addEngine({ addStepWork: 64 });
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const toggle = placement(1, 0.5);
+    let sent = false;
+    await patched(
+      "add_mesh_push_positions",
+      (orig) =>
+        function (this: unknown, ...args: unknown[]) {
+          if (!sent) {
+            sent = true;
+            h.later([toggle]);
+          }
+          return orig.apply(this, args);
+        },
+      async () => {
+        h.send([addMeshReq(3, BIG)]);
+        await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+      },
+    );
+    expect(sent).toBe(true);
+    const toggleAt = h.posted.findIndex((p) =>
+      p.result.status.some((st) => st.key === "placement:1" && st.status === "ready"),
+    );
+    const landAt = h.posted.findIndex((p) => p.result.changes.some((c) => c.id === 3 && c.added));
+    expect(toggleAt).toBeGreaterThanOrEqual(0);
+    expect(landAt).toBeGreaterThan(toggleAt);
+  });
+
+  it("a_bad_mesh_fails_while_stepping_with_an_error_status", async () => {
+    const h = addEngine();
+    h.send([addMeshReq(1, A)]);
+    await h.until(() => h.results().length === 1);
+    const bad = { positions: BIG.positions.slice(), indices: BIG.indices.slice() };
+    bad.indices[100] = 999_999;
+    h.send([addMeshReq(3, bad)]);
+    await h.until(() => statusesOf(h, "mesh:3").length === 1);
+    expect(statusesOf(h, "mesh:3")).toEqual(["error"]);
+    const update = h.posted.find((p) => p.result.status.some((st) => st.key === "mesh:3"));
+    expect(update?.result.poisoned).toBeFalsy();
+    // The same code as a synchronous add of the same mesh.
+    const s = new Scene();
+    let code: string | undefined;
+    try {
+      s.addMesh(bad.positions, bad.indices);
+    } catch (e) {
+      code = (e as { code: string }).code;
+    } finally {
+      s.free();
+    }
+    expect(code).toBeDefined();
+    expect(update?.result.status.find((st) => st.key === "mesh:3")?.error?.code).toBe(code);
+    // The engine is fine: a later batch runs.
+    h.send([placement(1, 0.25)]);
+    await h.until(() => h.results().length === 3);
+    expect(h.results()[2].poisoned).toBeFalsy();
+    expect(h.results()[2].status).toContainEqual({ key: "placement:1", rev: expect.any(Number), status: "ready" });
+  });
+
+  it("float32_positions_and_an_explicit_origin_land_like_a_sync_add", async () => {
+    for (const f64 of [true, false]) {
+      const h = addEngine();
+      const positions = f64 ? BIG.positions : Float32Array.from(BIG.positions);
+      const origin: [number, number, number] = [5, 6, 7];
+      h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+      await h.until(() => h.results().length === 1);
+      const req: Request = {
+        kind: "addMesh",
+        rev: rev(),
+        id: 3,
+        positions: positions.slice().buffer,
+        f64,
+        indices: BIG.indices.slice().buffer,
+        options: { origin },
+      };
+      h.send([req]);
+      await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+      const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 3 && c.added)).find(Boolean);
+      const s = new Scene();
+      try {
+        s.addMesh(A.positions, A.indices);
+        s.addMesh(B.positions, B.indices);
+        const m = s.addMesh(positions, BIG.indices, { origin });
+        const v = s.views(m);
+        expect(sameBytes(record?.bytes.positions, v.positions().slice())).toBe(true);
+        expect(sameBytes(record?.bytes.normals, v.normals()?.slice() ?? null)).toBe(true);
+        expect(sameBytes(record?.bytes.indices, v.indices().slice())).toBe(true);
+      } finally {
+        s.free();
+      }
+    }
   });
 });

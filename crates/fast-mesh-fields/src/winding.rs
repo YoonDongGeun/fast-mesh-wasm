@@ -24,7 +24,7 @@ use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::geom::{add, cross, dot, norm, scale, sub, widen};
-use crate::sign::{collect_span, try_vec};
+use crate::sign::collect_span;
 use crate::{FieldsError, Result};
 
 /// The accuracy parameter: a node is far when its centroid is more than
@@ -173,56 +173,103 @@ impl Moments {
 /// child is done, its parent can be combined, and so on up while the
 /// finished node is a right child.
 ///
-/// The build runs in steps: the leaves are listed when it starts (one
-/// traversal), then each step computes the moments of the next leaves and
-/// combines every inner node they finish. Each leaf is computed on its own
-/// and the combines run in the same order whatever the steps, so the
-/// moments are the same, bit for bit.
+/// The build runs in steps: first the node slots are initialised, a slice
+/// at a time; then the leaves are listed from a pre-order frontier and the
+/// next leaves' moments computed, up to the budget per step, combining
+/// every inner node they finish. Each leaf is computed on its own and the
+/// combines run in the same order whatever the steps, so the moments are
+/// the same, bit for bit.
 #[derive(Debug, Clone)]
 pub(crate) struct MomentsBuild {
     nodes: Vec<Moment>,
+    /// Node slots initialised to the default moment; leaves are listed and
+    /// computed only once every slot is.
+    filled: usize,
     leaves: Vec<NodeId>,
+    /// The pre-order frontier: the nodes whose listing is still pending
+    /// (top last), left children on top of their right siblings.
+    stack: Vec<NodeId>,
     /// The first leaf whose moment is not computed yet.
     next: usize,
 }
 
 impl MomentsBuild {
-    /// Lists `bvh`'s leaves in pre-order.
+    /// Reserves the moments of `bvh`'s nodes; the slots are initialised,
+    /// and the leaves listed, by the steps.
     pub(crate) fn new(bvh: &Bvh) -> Result<MomentsBuild> {
-        let nodes = try_vec(bvh.node_slots(), Moment::default())?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(bvh.node_slots())
+            .map_err(|_| FieldsError::OutOfMemory)?;
+        // The leaves are fewer than the node slots, so listing never
+        // reallocates.
         let mut leaves = Vec::new();
-        let mut failed = false;
-        bvh.traverse(|id, view| {
-            if matches!(view.kind, NodeKind::Leaf { .. }) {
-                failed |= leaves.try_reserve(1).is_err();
-                if !failed {
-                    leaves.push(id);
-                }
-            }
-            // After a failure, skip what is left.
-            !failed
-        });
-        if failed {
-            return Err(FieldsError::OutOfMemory);
+        leaves
+            .try_reserve_exact(bvh.node_slots())
+            .map_err(|_| FieldsError::OutOfMemory)?;
+        let mut stack = Vec::new();
+        if let Some(root) = bvh.root() {
+            stack.try_reserve(1).map_err(|_| FieldsError::OutOfMemory)?;
+            stack.push(root);
         }
         Ok(MomentsBuild {
             nodes,
+            filled: 0,
             leaves,
+            stack,
             next: 0,
         })
     }
 
-    /// Leaves left to compute.
-    pub(crate) fn left(&self) -> usize {
-        self.leaves.len() - self.next
+    /// Leaves computed so far.
+    pub(crate) fn computed(&self) -> usize {
+        self.next
     }
 
-    /// Computes up to `budget` more leaves (at least one) of `mesh` and
-    /// `bvh`, the BVH it was listed from, and combines the inner nodes they
-    /// finish. Returns whether every leaf is done.
+    /// Initialised node slots plus computed leaves. Every step advances it
+    /// while the build is not done, so the sign build charges its budget
+    /// against it.
+    pub(crate) fn progress(&self) -> usize {
+        self.filled + self.computed()
+    }
+
+    /// Initialises up to `budget` more node slots (at least one), or, once
+    /// every slot is, lists up to `budget` more leaves and computes up to
+    /// `budget` more leaves (at least one) of `mesh` and `bvh`, the BVH it
+    /// was listed from, combining the inner nodes they finish. Each node is
+    /// visited once across the whole build, so the listing costs no more
+    /// than the moments. Returns whether every leaf is done.
     pub(crate) fn step(&mut self, mesh: &Mesh, bvh: &Bvh, budget: usize) -> Result<bool> {
+        let want = budget.max(1);
+        if self.filled < bvh.node_slots() {
+            let end = self.filled.saturating_add(want).min(bvh.node_slots());
+            // Within the reserved capacity: no allocation.
+            self.nodes.resize(end, Moment::default());
+            self.filled = end;
+            return Ok(false);
+        }
+        while self.leaves.len() - self.next < want {
+            let Some(id) = self.stack.pop() else {
+                break;
+            };
+            match bvh.node(id).kind {
+                NodeKind::Leaf { .. } => {
+                    self.leaves
+                        .try_reserve(1)
+                        .map_err(|_| FieldsError::OutOfMemory)?;
+                    self.leaves.push(id);
+                }
+                NodeKind::Inner { left, right } => {
+                    self.stack
+                        .try_reserve(2)
+                        .map_err(|_| FieldsError::OutOfMemory)?;
+                    self.stack.push(right);
+                    self.stack.push(left);
+                }
+            }
+        }
         let from = self.next;
-        let to = self.leaves.len().min(from.saturating_add(budget.max(1)));
+        let to = self.leaves.len().min(from.saturating_add(want));
         let leaves = &self.leaves;
         let moments = collect_span(from..to, |k| {
             let view = bvh.node(leaves[k]);
@@ -249,7 +296,9 @@ impl MomentsBuild {
             }
         }
         self.next = to;
-        Ok(to == self.leaves.len())
+        // The listing ends when the frontier does; only then is every leaf
+        // listed, and `to == leaves.len()` means every leaf is computed.
+        Ok(self.stack.is_empty() && to == self.leaves.len())
     }
 
     /// The moments, once every leaf is done.
@@ -262,6 +311,7 @@ impl MomentsBuild {
 mod tests {
     use fast_mesh_store::Mesh;
 
+    use super::MomentsBuild;
     use crate::test_util::*;
     use crate::{FieldsError, SignData, SignMode, signed_distances};
 
@@ -269,6 +319,33 @@ mod tests {
         let (p, mut t) = cube_buffers();
         t.drain(2..4);
         mesh(&p, &t)
+    }
+
+    #[test]
+    fn moments_build_lists_leaves_incrementally() {
+        let mesh = terrain(8);
+        let bvh = build_bvh(&mesh);
+        let mut build = MomentsBuild::new(&bvh).unwrap();
+        // `new` only reserves: nothing is listed or computed yet.
+        assert!(build.leaves.is_empty());
+        assert_eq!(build.computed(), 0);
+        // One leaf per step at budget 1, listed just ahead of computed.
+        let mut steps = 0;
+        while !build.step(&mesh, &bvh, 1).unwrap() {
+            assert!(build.leaves.len() - build.computed() <= 1);
+            steps += 1;
+        }
+        assert!(steps > 1);
+        let stepped = build.finish();
+        // The same moments as computing everything at once, bit for bit.
+        let mut whole = MomentsBuild::new(&bvh).unwrap();
+        while !whole.step(&mesh, &bvh, usize::MAX).unwrap() {}
+        assert!(stepped.bits().eq(whole.finish().bits()));
+        // An empty tree is done at once.
+        let empty = Mesh::from_buffers(&[], &[]).unwrap();
+        let empty_bvh = build_bvh(&empty);
+        let mut build = MomentsBuild::new(&empty_bvh).unwrap();
+        assert!(build.step(&empty, &empty_bvh, 1).unwrap());
     }
 
     #[test]

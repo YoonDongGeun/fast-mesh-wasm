@@ -143,15 +143,6 @@ pub struct SignData {
     pub(crate) moments: Moments,
 }
 
-/// A vector of `len` copies of `value`, or `OutOfMemory`.
-pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(len)
-        .map_err(|_| FieldsError::OutOfMemory)?;
-    v.resize(len, value);
-    Ok(v)
-}
-
 /// Pushes with a fallible reservation.
 fn try_push<T>(v: &mut Vec<T>, value: T) -> Result<()> {
     v.try_reserve(1).map_err(|_| FieldsError::OutOfMemory)?;
@@ -494,10 +485,11 @@ impl SignBuild {
 
     /// Runs the build over up to `budget` more elements (at least one,
     /// unless it is done): triangle, vertex or corner slots of a pass, or
-    /// leaves of the winding moments, a vertex pseudonormal counting as 12,
-    /// an edge normal as 2 and a triangle of the adjacency build as 3, for
-    /// what they cost. A step that finishes the mesh's adjacency or
-    /// incidence ends there. Returns whether the build is done.
+    /// leaves of the winding moments and their node slots while those
+    /// initialise, a vertex pseudonormal counting as 12, an edge normal as
+    /// 2 and a triangle of the adjacency build as 3, for what they cost. A
+    /// step that finishes the mesh's adjacency or incidence ends there.
+    /// Returns whether the build is done.
     ///
     /// # Errors
     /// [`FieldsError::InvalidInput`] when `mesh` and `bvh` are not the state
@@ -590,9 +582,9 @@ impl SignBuild {
                 }
                 Stage::Moments => {
                     let moments = self.moments.as_mut().ok_or(FieldsError::OutOfMemory)?;
-                    let n = moments.left().min(left);
+                    let before = moments.progress();
                     let done = moments.step(mesh, bvh, left)?;
-                    left -= n.min(left);
+                    left -= moments.progress().saturating_sub(before).min(left);
                     if done {
                         let moments = self.moments.take().ok_or(FieldsError::OutOfMemory)?;
                         self.data.moments = moments.finish();

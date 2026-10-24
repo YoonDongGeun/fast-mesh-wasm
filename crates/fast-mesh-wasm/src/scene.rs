@@ -26,7 +26,7 @@ use fast_mesh_scene::{
     SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
     UpdateMode,
 };
-use fast_mesh_store::Mesh;
+use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
 
 use crate::edit::{
@@ -44,11 +44,41 @@ pub struct WasmScene {
     /// The update mode of every live mesh, as last set (the scene has no
     /// getter for it).
     modes: BTreeMap<MeshId, UpdateMode>,
-    /// Meshes being added in steps, by build id: the build, its update mode
-    /// and whether it gets vertex normals.
-    adds: BTreeMap<u32, (MeshBuild, UpdateMode, bool)>,
-    /// The id the next `begin_add_mesh` hands out.
+    /// Meshes being added in steps, by build id.
+    adds: BTreeMap<u32, PendingAdd>,
+    /// The id the next `begin_add_mesh_upload` hands out.
     next_add: u32,
+}
+
+/// A mesh being added in steps: its inputs still uploading into wasm
+/// memory ([`MeshBuilder`]) and its store still building, or its store
+/// built and its BVH (and vertex normals) building.
+enum PendingAdd {
+    /// The store uploads and builds in steps; `options` and `normals`
+    /// start the BVH build once it is done.
+    Store {
+        build: Box<MeshBuilder>,
+        options: MeshOptions,
+        normals: bool,
+    },
+    /// The store is built; the BVH builds in steps: the build, its update
+    /// mode and whether it gets vertex normals.
+    Bvh(Box<MeshBuild>, UpdateMode, bool),
+}
+
+/// Starts the BVH build of a built store, with `options` and `normals`,
+/// as [`WasmScene::begin_add_mesh_upload`] promised it.
+fn start_build(
+    build: Box<MeshBuilder>,
+    options: MeshOptions,
+    normals: bool,
+) -> Result<(Box<MeshBuild>, UpdateMode, bool), Error> {
+    let mesh = build.finish().ok_or(SceneError::Corrupted)?;
+    let mode = options.mode;
+    let mut build = MeshBuild::new(mesh, options)?;
+    // Computed in the build's steps; `added` then finds them on.
+    build.set_normals(normals);
+    Ok((Box::new(build), mode, normals))
 }
 
 /// A mesh from world positions, stored relative to `origin` (or the
@@ -291,46 +321,109 @@ impl WasmScene {
         self.added(id, mode, normals)
     }
 
-    /// [`WasmScene::add_mesh`] in steps: starts building the mesh and its
-    /// BVH outside the scene ([`MeshBuild`]) and returns the build's id, for
-    /// [`WasmScene::add_mesh_step`] and [`WasmScene::finish_add_mesh`]. The
-    /// scene is unchanged until the mesh is added.
-    pub fn begin_add_mesh(
+    /// [`WasmScene::add_mesh`] in steps: reserves a mesh of `vertices`
+    /// vertices and `triangles` triangles outside the scene and returns the
+    /// build's id. Its inputs upload in chunks
+    /// ([`WasmScene::add_mesh_push_positions`] and
+    /// [`WasmScene::add_mesh_push_indices`]), then its store, BVH and
+    /// normals build in steps ([`WasmScene::add_mesh_step`]), for
+    /// [`WasmScene::finish_add_mesh`]. The scene is unchanged until the
+    /// mesh is added.
+    pub fn begin_add_mesh_upload(
         &mut self,
-        positions: &[f64],
-        indices: &[u32],
+        vertices: u32,
+        triangles: u32,
         origin: Option<Vec<f64>>,
         mode: u8,
         normals: bool,
     ) -> Result<u32, Error> {
         let mode = parse_mode(mode)?;
-        let mesh = mesh_from(positions, indices, origin)?;
+        let origin: Option<[f64; 3]> = match origin {
+            None => None,
+            Some(o) => Some(
+                o.as_slice()
+                    .try_into()
+                    .map_err(|_| Error::invalid("origin must have 3 values"))?,
+            ),
+        };
+        let build = MeshBuilder::new(vertices as usize, triangles as usize, origin)?;
         let options = MeshOptions {
             mode,
             ..MeshOptions::default()
         };
-        let mut build = MeshBuild::new(mesh, options)?;
-        // Computed in the build's steps; `added` then finds them on.
-        build.set_normals(normals);
         let id = self.next_add;
         self.next_add = self.next_add.wrapping_add(1);
-        self.adds.insert(id, (build, mode, normals));
+        self.adds.insert(
+            id,
+            PendingAdd::Store {
+                build: Box::new(build),
+                options,
+                normals,
+            },
+        );
         Ok(id)
     }
 
-    /// Builds about `budget` more units of a mesh being added (see
-    /// `MeshBuild::step`); `true` once its BVH is built. A failed build is
-    /// dropped.
-    pub fn add_mesh_step(&mut self, build: u32, budget: u32) -> Result<bool, Error> {
-        let (b, ..) = self
+    /// Appends a chunk of flat `[x, y, z, ...]` world positions to a mesh
+    /// being added; the chunks must add up to its declared vertices.
+    pub fn add_mesh_push_positions(&mut self, build: u32, chunk: &[f64]) -> Result<(), Error> {
+        match self
             .adds
             .get_mut(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?
+        {
+            PendingAdd::Store { build, .. } => Ok(build.push_positions(chunk)?),
+            PendingAdd::Bvh(..) => Err(Error::invalid("the mesh upload is finished")),
+        }
+    }
+
+    /// Appends a chunk of flat `[a, b, c, ...]` indices to a mesh being
+    /// added; the chunks must add up to its declared triangles.
+    pub fn add_mesh_push_indices(&mut self, build: u32, chunk: &[u32]) -> Result<(), Error> {
+        match self
+            .adds
+            .get_mut(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?
+        {
+            PendingAdd::Store { build, .. } => Ok(build.push_indices(chunk)?),
+            PendingAdd::Bvh(..) => Err(Error::invalid("the mesh upload is finished")),
+        }
+    }
+
+    /// Builds about `budget` more units of a mesh being added: first its
+    /// store (vertices or triangles a unit), then its BVH (see
+    /// `MeshBuild::step`); `true` once its BVH is built. The upload must be
+    /// complete first. A failed build is dropped.
+    pub fn add_mesh_step(&mut self, build: u32, budget: u32) -> Result<bool, Error> {
+        let entry = self
+            .adds
+            .remove(&build)
             .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
-        match b.step(budget as usize) {
-            Ok(done) => Ok(done),
-            Err(e) => {
-                self.adds.remove(&build);
-                Err(e.into())
+        match entry {
+            PendingAdd::Store {
+                build: mut store,
+                options,
+                normals,
+            } => {
+                if store.step(budget as usize)? {
+                    let (b, mode, normals) = start_build(store, options, normals)?;
+                    self.adds.insert(build, PendingAdd::Bvh(b, mode, normals));
+                } else {
+                    self.adds.insert(
+                        build,
+                        PendingAdd::Store {
+                            build: store,
+                            options,
+                            normals,
+                        },
+                    );
+                }
+                Ok(false)
+            }
+            PendingAdd::Bvh(mut b, mode, normals) => {
+                let done = b.step(budget as usize)?;
+                self.adds.insert(build, PendingAdd::Bvh(b, mode, normals));
+                Ok(done)
             }
         }
     }
@@ -343,10 +436,16 @@ impl WasmScene {
     /// they can be copied out before it lands. Valid until the next call
     /// that may allocate.
     pub fn add_mesh_buffers(&self, build: u32) -> Result<Vec<u32>, Error> {
-        let (b, ..) = self
+        let b = match self
             .adds
             .get(&build)
-            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?
+        {
+            PendingAdd::Store { .. } => {
+                return Err(Error::invalid("the mesh is still being built"));
+            }
+            PendingAdd::Bvh(b, ..) => b,
+        };
         let m = b.mesh();
         let (np, nl) = b.normals().map_or((0, 0), |n| (addr(n), len(n.len() * 3)));
         Ok(vec![
@@ -359,14 +458,26 @@ impl WasmScene {
         ])
     }
 
-    /// Adds a mesh built in steps, finishing what is left of its BVH, and
-    /// returns `[index, generation]`, as [`WasmScene::add_mesh`] would.
+    /// Adds a mesh built in steps, finishing what is left of its store,
+    /// BVH and normals, and returns `[index, generation]`, as
+    /// [`WasmScene::add_mesh`] would.
     pub fn finish_add_mesh(&mut self, build: u32) -> Result<Vec<u32>, Error> {
-        let (b, mode, normals) = self
+        let entry = self
             .adds
             .remove(&build)
             .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
-        let id = self.scene.add_mesh_built(b)?;
+        let (b, mode, normals) = match entry {
+            PendingAdd::Store {
+                build: mut store,
+                options,
+                normals,
+            } => {
+                while !store.step(usize::MAX)? {}
+                start_build(store, options, normals)?
+            }
+            PendingAdd::Bvh(b, mode, normals) => (b, mode, normals),
+        };
+        let id = self.scene.add_mesh_built(*b)?;
         self.added(id, mode, normals)
     }
 
@@ -1853,9 +1964,9 @@ mod tests {
         // A mesh added in steps: the same id and buffers as an add.
         let positions = [0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 1., 0.5];
         let indices = [0, 1, 2, 1, 3, 2];
-        let build = s
-            .begin_add_mesh(&positions, &indices, None, 0, true)
-            .unwrap();
+        let build = s.begin_add_mesh_upload(4, 2, None, 0, true).unwrap();
+        s.add_mesh_push_positions(build, &positions).unwrap();
+        s.add_mesh_push_indices(build, &indices).unwrap();
         while !s.add_mesh_step(build, 1).unwrap() {}
         let id = s.finish_add_mesh(build).unwrap();
         let want = t.add_mesh(&positions, &indices, None, 0, true).unwrap();
@@ -1869,9 +1980,15 @@ mod tests {
         // While built, the build's render buffers are those of the added
         // mesh: the same addresses (the vectors move into the scene) and
         // lengths, normals included once they are built.
-        let build = s
-            .begin_add_mesh(&positions, &indices, None, 0, true)
-            .unwrap();
+        let build = s.begin_add_mesh_upload(4, 2, None, 0, true).unwrap();
+        assert!(s.add_mesh_buffers(build).is_err());
+        s.add_mesh_push_positions(build, &positions).unwrap();
+        s.add_mesh_push_indices(build, &indices).unwrap();
+        // Until the store is built there are no buffers; then the mesh's,
+        // without normals until those build.
+        while s.add_mesh_buffers(build).is_err() {
+            assert!(!s.add_mesh_step(build, 1).unwrap());
+        }
         let before = s.add_mesh_buffers(build).unwrap();
         assert_eq!(before[2..4], [0, 0], "no normals yet");
         while !s.add_mesh_step(build, 1).unwrap() {}
@@ -1895,9 +2012,7 @@ mod tests {
         let before = s.content_stamp(i, g).unwrap();
         s.compact(i, g).unwrap();
         assert!(s.content_stamp(i, g).unwrap() > before);
-        let other = s
-            .begin_add_mesh(&positions, &indices, None, 0, false)
-            .unwrap();
+        let other = s.begin_add_mesh_upload(4, 2, None, 0, false).unwrap();
         s.drop_add_mesh(other);
         assert!(s.finish_add_mesh(other).is_err());
     }

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adjacency::Adjacency;
 use crate::channel::{Channel, ChannelDesc, ChannelKind};
-use crate::column::{Column, try_reserve, try_vec};
+use crate::column::{Column, try_reserve, try_reserve_exact, try_vec};
 use crate::incidence::Incidence;
 use crate::{Patch, PatchSide, PatchState, Result, StoreError, TriangleId, VertexId};
 
@@ -483,10 +483,264 @@ impl Mesh {
     }
 }
 
+/// The pass a [`MeshBuilder`] is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildPhase {
+    /// Scanning the staged positions for finiteness.
+    Finite,
+    /// Scanning the bounding box.
+    Bounds,
+    /// Converting to `f32` offsets from the origin.
+    Convert,
+    /// Checking the indices and copying the triangles.
+    Indices,
+    /// Done: [`MeshBuilder::finish`] gives the mesh.
+    Done,
+}
+
+/// A [`Mesh`] built from flat buffers in steps, for callers that must yield
+/// between chunks of work (the Worker builds large meshes this way).
+///
+/// The inputs arrive first, in chunks of any size
+/// ([`MeshBuilder::push_positions`] and [`MeshBuilder::push_indices`]); then
+/// [`MeshBuilder::step`] runs the same passes as [`Mesh::from_buffers_f64`]
+/// (or [`Mesh::from_buffers_f64_with_origin`] with an explicit origin) a
+/// slice at a time: a finiteness scan, the bounding box (which sets the
+/// origin without one), the conversion to `f32` offsets, and the index check
+/// with the triangle copy. [`MeshBuilder::finish`] gives the mesh: the same
+/// one, bit for bit, as the one-call build, or the same error, however the
+/// chunks and steps split the work.
+#[derive(Debug)]
+pub struct MeshBuilder {
+    vertices: usize,
+    triangles: usize,
+    /// The origin the positions are stored relative to: the given one, or
+    /// the bounding-box centre once the bounds are scanned.
+    origin: [f64; 3],
+    /// Whether `origin` is still to be computed from the bounding box.
+    auto_origin: bool,
+    positions: Vec<f64>,
+    indices: Vec<u32>,
+    phase: BuildPhase,
+    min: [f64; 3],
+    max: [f64; 3],
+    points: Vec<[f32; 3]>,
+    tris: Vec<[u32; 3]>,
+    /// Zeroed alongside the conversion, so the index pass only counts.
+    refs: Vec<u32>,
+    vertex_live: Vec<u64>,
+    triangle_live: Vec<u64>,
+    /// The first vertex (the positions passes) or triangle (the index pass)
+    /// the current pass has not handled yet.
+    cursor: usize,
+}
+
+impl MeshBuilder {
+    /// A build of a mesh of `vertices` vertices and `triangles` triangles,
+    /// stored relative to `origin` (or the bounding-box centre without one),
+    /// with nothing uploaded yet. All the memory is reserved here, so the
+    /// pushes and steps allocate nothing except the small liveness bitsets.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidArgument`] for a non-finite origin (as
+    /// [`Mesh::from_buffers_f64_with_origin`]); [`StoreError::OutOfMemory`].
+    pub fn new(vertices: usize, triangles: usize, origin: Option<[f64; 3]>) -> Result<Self> {
+        let not_finite = StoreError::InvalidArgument("positions must be finite");
+        if let Some(o) = origin
+            && !o.iter().all(|x| x.is_finite())
+        {
+            return Err(not_finite);
+        }
+        // Checked: the steps multiply by 3 without checking.
+        let flat_vertices = vertices.checked_mul(3).ok_or(StoreError::OutOfMemory)?;
+        let flat_triangles = triangles.checked_mul(3).ok_or(StoreError::OutOfMemory)?;
+        let mut positions = Vec::new();
+        try_reserve_exact(&mut positions, flat_vertices)?;
+        let mut indices = Vec::new();
+        try_reserve_exact(&mut indices, flat_triangles)?;
+        let mut points = Vec::new();
+        try_reserve_exact(&mut points, vertices)?;
+        let mut tris = Vec::new();
+        try_reserve_exact(&mut tris, triangles)?;
+        let mut refs = Vec::new();
+        try_reserve_exact(&mut refs, vertices)?;
+        Ok(MeshBuilder {
+            vertices,
+            triangles,
+            origin: origin.unwrap_or([0.0; 3]),
+            auto_origin: origin.is_none(),
+            positions,
+            indices,
+            phase: BuildPhase::Finite,
+            min: [f64::INFINITY; 3],
+            max: [f64::NEG_INFINITY; 3],
+            points,
+            tris,
+            refs,
+            vertex_live: Vec::new(),
+            triangle_live: Vec::new(),
+            cursor: 0,
+        })
+    }
+
+    /// Appends a chunk of flat `[x, y, z, ...]` positions. Chunks may split
+    /// anywhere; they only must add up to the declared vertices.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidArgument`] for more than declared.
+    pub fn push_positions(&mut self, chunk: &[f64]) -> Result<()> {
+        if chunk.len() > 3 * self.vertices - self.positions.len() {
+            return Err(StoreError::InvalidArgument(
+                "positions exceed the declared vertex count",
+            ));
+        }
+        // Within the reserved capacity: no allocation.
+        self.positions.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Appends a chunk of flat `[a, b, c, ...]` indices; like
+    /// [`MeshBuilder::push_positions`], they must add up to the declared
+    /// triangles.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidArgument`] for more than declared.
+    pub fn push_indices(&mut self, chunk: &[u32]) -> Result<()> {
+        if chunk.len() > 3 * self.triangles - self.indices.len() {
+            return Err(StoreError::InvalidArgument(
+                "indices exceed the declared triangle count",
+            ));
+        }
+        self.indices.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Whether the mesh is built.
+    pub fn is_done(&self) -> bool {
+        self.phase == BuildPhase::Done
+    }
+
+    /// Runs up to `budget` more vertices (the positions passes) or triangles
+    /// (the index pass) of the build — at least one while any pass still has
+    /// vertices or triangles — and returns whether the mesh is built. The
+    /// upload must be complete first.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidArgument`] when the upload is incomplete; then
+    /// the same errors as [`Mesh::from_buffers_f64`]: non-finite input,
+    /// offsets that do not fit an `f32`, or [`StoreError::InvalidVertex`]
+    /// for the first out-of-range index; [`StoreError::OutOfMemory`]. The
+    /// build is unusable after an error.
+    pub fn step(&mut self, budget: usize) -> Result<bool> {
+        if self.positions.len() != 3 * self.vertices || self.indices.len() != 3 * self.triangles {
+            return Err(StoreError::InvalidArgument("upload incomplete"));
+        }
+        let not_finite = StoreError::InvalidArgument("positions must be finite");
+        let n = budget.max(1);
+        match self.phase {
+            BuildPhase::Finite => {
+                let end = self.cursor.saturating_add(n).min(self.vertices);
+                if !self.positions[3 * self.cursor..3 * end]
+                    .iter()
+                    .all(|x| x.is_finite())
+                {
+                    return Err(not_finite);
+                }
+                self.cursor = end;
+                if end == self.vertices {
+                    self.phase = BuildPhase::Bounds;
+                    self.cursor = 0;
+                }
+            }
+            BuildPhase::Bounds => {
+                let end = self.cursor.saturating_add(n).min(self.vertices);
+                for c in self.positions[3 * self.cursor..3 * end].as_chunks::<3>().0 {
+                    for (k, &x) in c.iter().enumerate() {
+                        self.min[k] = self.min[k].min(x);
+                        self.max[k] = self.max[k].max(x);
+                    }
+                }
+                self.cursor = end;
+                if end == self.vertices {
+                    if self.auto_origin {
+                        self.origin = if self.vertices == 0 {
+                            [0.0; 3]
+                        } else {
+                            [0, 1, 2].map(|k| (self.min[k] + self.max[k]) * 0.5)
+                        };
+                        self.auto_origin = false;
+                    }
+                    if !self.origin.iter().all(|x| x.is_finite()) {
+                        return Err(not_finite);
+                    }
+                    self.phase = BuildPhase::Convert;
+                    self.cursor = 0;
+                }
+            }
+            BuildPhase::Convert => {
+                let end = self.cursor.saturating_add(n).min(self.vertices);
+                for c in self.positions[3 * self.cursor..3 * end].as_chunks::<3>().0 {
+                    let p = [0, 1, 2].map(|k| (c[k] - self.origin[k]) as f32);
+                    if !p.iter().all(|x| x.is_finite()) {
+                        return Err(not_finite);
+                    }
+                    self.points.push(p);
+                }
+                self.refs.resize(end, 0);
+                self.cursor = end;
+                if end == self.vertices {
+                    self.phase = BuildPhase::Indices;
+                    self.cursor = 0;
+                }
+            }
+            BuildPhase::Indices => {
+                let end = self.cursor.saturating_add(n).min(self.triangles);
+                for c in self.indices[3 * self.cursor..3 * end].as_chunks::<3>().0 {
+                    for &v in c {
+                        if v as usize >= self.vertices {
+                            return Err(StoreError::InvalidVertex(v));
+                        }
+                        self.refs[v as usize] += 1;
+                    }
+                    self.tris.push(*c);
+                }
+                self.cursor = end;
+                if end == self.triangles {
+                    self.vertex_live = full_bits(self.vertices)?;
+                    self.triangle_live = full_bits(self.triangles)?;
+                    self.phase = BuildPhase::Done;
+                }
+            }
+            BuildPhase::Done => return Ok(true),
+        }
+        Ok(self.phase == BuildPhase::Done)
+    }
+
+    /// The mesh, once [`MeshBuilder::step`] returned `true`; `None` before.
+    pub fn finish(self) -> Option<Mesh> {
+        if self.phase != BuildPhase::Done {
+            return None;
+        }
+        Some(Mesh::assemble(
+            self.origin,
+            self.points,
+            self.tris,
+            self.refs,
+            self.vertex_live,
+            self.triangle_live,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::PatchState;
+
+    /// A builder twin-test case: flat positions, flat indices, the origin.
+    type TwinCase = (Vec<f64>, Vec<u32>, Option<[f64; 3]>);
+    /// A builder failure case, with the error both builds return.
+    type FailCase = (Vec<f64>, Vec<u32>, Option<[f64; 3]>, StoreError);
 
     fn quad() -> Mesh {
         Mesh::from_buffers(
@@ -754,5 +1008,181 @@ mod tests {
         assert_eq!(tx.add_vertices(&[[0.; 3]]).unwrap(), vec![4]);
         assert_eq!(tx.add_triangles(&[[0, 1, 2]]).unwrap(), vec![2]);
         tx.rollback();
+    }
+    /// An `n × n` grid over `[0, n)²` with a wavy height, as flat `f64`
+    /// positions and flat indices.
+    fn grid_buffers(n: u32) -> (Vec<f64>, Vec<u32>) {
+        let mut positions = Vec::new();
+        for j in 0..n {
+            for i in 0..n {
+                let (x, y) = (f64::from(i), f64::from(j));
+                positions.extend([x, y, 0.3 * (1.7 * x).sin() * (1.3 * y).cos()]);
+            }
+        }
+        let mut indices = Vec::new();
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = j * n + i;
+                indices.extend([a, a + 1, a + n + 1, a, a + n + 1, a + n]);
+            }
+        }
+        (positions, indices)
+    }
+
+    fn assert_same_mesh(got: &Mesh, want: &Mesh) {
+        assert_eq!(
+            got.origin().map(f64::to_bits),
+            want.origin().map(f64::to_bits)
+        );
+        assert_eq!(got.positions(), want.positions());
+        assert_eq!(got.triangles(), want.triangles());
+        assert_eq!(got.vertex_count(), want.vertex_count());
+        assert_eq!(got.triangle_count(), want.triangle_count());
+        assert_eq!(got.vertex_slots(), want.vertex_slots());
+        assert_eq!(got.triangle_slots(), want.triangle_slots());
+        for v in 0..got.vertex_slots() as VertexId {
+            assert_eq!(got.is_vertex_alive(v), want.is_vertex_alive(v));
+            assert_eq!(got.corner_count(v), want.corner_count(v));
+        }
+        for t in 0..got.triangle_slots() as TriangleId {
+            assert_eq!(got.is_triangle_alive(t), want.is_triangle_alive(t));
+        }
+    }
+
+    fn build_stepped(
+        positions: &[f64],
+        indices: &[u32],
+        origin: Option<[f64; 3]>,
+        budget: usize,
+        chunk: usize,
+    ) -> Result<Mesh> {
+        let mut build = MeshBuilder::new(positions.len() / 3, indices.len() / 3, origin)?;
+        for c in positions.chunks(chunk) {
+            build.push_positions(c)?;
+        }
+        for c in indices.chunks(chunk) {
+            build.push_indices(c)?;
+        }
+        assert!(!build.is_done());
+        while !build.step(budget)? {}
+        assert!(build.is_done());
+        Ok(build.finish().expect("done builds finish"))
+    }
+
+    #[test]
+    fn mesh_builder_matches_from_buffers_f64() {
+        let far = 1.0e7;
+        let (grid_p, grid_t) = grid_buffers(30);
+        let cases: Vec<TwinCase> = vec![
+            (
+                vec![0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+                vec![0, 1, 2, 0, 2, 3],
+                None,
+            ),
+            (
+                vec![0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+                vec![0, 1, 2, 0, 2, 3],
+                Some([0.5, 0.5, 0.0]),
+            ),
+            (vec![], vec![], None),
+            (vec![], vec![], Some([1., 2., 3.])),
+            (vec![1., 2., 3.], vec![], None),
+            (vec![far, far, 0.0, far + 0.001, far, 0.0], vec![], None),
+            (grid_p.clone(), grid_t.clone(), None),
+            (grid_p, grid_t, Some([15.0, 15.0, 0.0])),
+        ];
+        for (positions, indices, origin) in &cases {
+            let reference = match origin {
+                None => Mesh::from_buffers_f64(positions, indices).unwrap(),
+                Some(o) => Mesh::from_buffers_f64_with_origin(positions, indices, *o).unwrap(),
+            };
+            for budget in [1, 2, 7, 100, usize::MAX] {
+                // Chunk sizes deliberately not multiples of 3.
+                for chunk in [1, 5, 100] {
+                    let got = build_stepped(positions, indices, *origin, budget, chunk).unwrap();
+                    assert_same_mesh(&got, &reference);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_builder_fails_like_from_buffers_f64() {
+        let bad = StoreError::InvalidArgument("positions must be finite");
+        let (mut grid_p, mut grid_t) = grid_buffers(10);
+        // A failure past the first step at small budgets: the middle of each buffer.
+        grid_p[3 * 50 + 1] = f64::NAN;
+        grid_t[3 * 60 + 2] = 10_000;
+        let cases: Vec<FailCase> = vec![
+            (grid_p, grid_t.clone(), None, bad.clone()),
+            {
+                let (p, _) = grid_buffers(10);
+                (p, grid_t, None, StoreError::InvalidVertex(10_000))
+            },
+            (
+                vec![f64::MAX, 0., 0., f64::MAX, 0., 0.],
+                vec![],
+                None,
+                bad.clone(),
+            ),
+            (vec![1.0e39, 0., 0.], vec![], Some([0.; 3]), bad.clone()),
+            (
+                vec![0., 0., 0.],
+                vec![],
+                Some([f64::NAN, 0., 0.]),
+                bad.clone(),
+            ),
+            (vec![], vec![7, 8, 9], None, StoreError::InvalidVertex(7)),
+        ];
+        for (positions, indices, origin, expected) in &cases {
+            let reference = match origin {
+                None => Mesh::from_buffers_f64(positions, indices).err(),
+                Some(o) => Mesh::from_buffers_f64_with_origin(positions, indices, *o).err(),
+            };
+            assert_eq!(reference, Some(expected.clone()));
+            for budget in [1, 7, usize::MAX] {
+                let err = build_stepped(positions, indices, *origin, budget, 5).err();
+                assert_eq!(err, Some(expected.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_builder_upload_protocol() {
+        // Pushing past the declared counts fails.
+        let mut build = MeshBuilder::new(1, 1, None).unwrap();
+        build.push_positions(&[0., 0., 0.]).unwrap();
+        assert!(matches!(
+            build.push_positions(&[1.]),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            build.push_indices(&[0, 0, 0, 0]),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        // Stepping before the upload is complete fails.
+        assert!(matches!(
+            build.step(100),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert!(!build.is_done());
+        assert!(MeshBuilder::new(1, 1, None).unwrap().finish().is_none());
+        // Empty pushes are no-ops.
+        build.push_positions(&[]).unwrap();
+        build.push_indices(&[]).unwrap();
+        build.push_indices(&[0, 0, 0]).unwrap();
+        while !build.step(1).unwrap() {}
+        assert!(build.step(1).unwrap());
+        let mesh = build.finish().expect("done builds finish");
+        assert_eq!((mesh.vertex_count(), mesh.triangle_count()), (1, 1));
+        // Absurd counts fail without allocating.
+        assert_eq!(
+            MeshBuilder::new(usize::MAX / 3 + 1, 0, None).err(),
+            Some(StoreError::OutOfMemory)
+        );
+        assert_eq!(
+            MeshBuilder::new(0, usize::MAX / 3 + 1, None).err(),
+            Some(StoreError::OutOfMemory)
+        );
     }
 }

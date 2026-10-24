@@ -8,9 +8,10 @@
 // they left due are computed in steps, and a recompute made stale by a queued
 // request is abandoned at a step boundary (§6.1 of the drag-speed design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
-// statuses and replies. A large mesh is added in the background: its BVH and
-// normals are built in steps outside the scene, and its render buffers
-// copied out in steps, while later requests that do not depend on it run;
+// statuses and replies. A large mesh is added in the background: its inputs
+// upload into wasm memory in chunks, then its store, BVH and normals are
+// built in steps outside the scene, and its render buffers copied out in
+// steps, while later requests that do not depend on it run;
 // it lands in the frame of the batch under way then (or in an `update`
 // message when the Worker is idle). Pure: it talks only through
 // `Port`, so it runs in a browser Worker or in Node `worker_threads`.
@@ -126,10 +127,12 @@ export interface EngineOptions {
   backgroundAddTriangles?: number;
   /**
    * The work of one step of a background add ({@link ADD_STEP_WORK} by
-   * default): a triangle's box, or a triangle visited per tree level, of
-   * its BVH build; 4 triangles or 16 vertices of its normals; 64 bytes of
-   * the copy of its render buffers. Clamped to 1 to 2^32 − 1; NaN or less
-   * than 1 keeps the default.
+   * default): 64 bytes of the upload of its positions and indices into
+   * wasm memory; a vertex or triangle of its store build; a triangle's
+   * box, or a triangle visited per tree level, of its BVH build; 4
+   * triangles or 16 vertices of its normals; 64 bytes of the copy of its
+   * render buffers. Clamped to 1 to 2^32 − 1; NaN or less than 1 keeps
+   * the default.
    */
   addStepWork?: number;
   /**
@@ -171,6 +174,9 @@ const ALL_POINTS = 0xffff_ffff;
 
 /** Bytes of a background add's render buffers copied per unit of {@link EngineOptions.addStepWork}. */
 const PACK_BYTES_PER_UNIT = 64;
+
+/** Bytes of a background add's positions and indices uploaded per unit of {@link EngineOptions.addStepWork}. */
+const UPLOAD_BYTES_PER_UNIT = 64;
 
 const now: () => number =
   typeof performance !== "undefined" && typeof performance.now === "function"
@@ -730,7 +736,7 @@ class Engine {
     this.#unpack(req);
     try {
       if (req.kind === "addMesh" && this.#inBackground(req)) {
-        this.#beginAdd(req);
+        await this.#beginAdd(req);
         // Its status is held until it lands.
         this.#onChunk?.({ kind: "addMeshBegin", id: req.id });
         return true;
@@ -777,19 +783,52 @@ class Engine {
   }
 
   /**
-   * Starts adding a mesh in the background: the mesh and its BVH are built
-   * outside the scene, a step at a time between other chunks and while the
-   * Worker is idle, and it lands in the scene when built, in arrival order
-   * with the other background adds. Until then its status is held, and a
-   * request that depends on it ({@link Engine.#dependsOnAdds}) first
-   * finishes every background add; other requests run meanwhile.
+   * Starts adding a mesh in the background: its inputs upload into wasm
+   * memory in chunks, yielding between them, then the mesh, its BVH and
+   * its normals are built outside the scene, a step at a time between
+   * other chunks and while the Worker is idle, and it lands in the scene
+   * when built, in arrival order with the other background adds. Until
+   * then its status is held, and a request that depends on it
+   * ({@link Engine.#dependsOnAdds}) first finishes every background add;
+   * other requests run meanwhile.
    */
-  #beginAdd(req: Extract<Request, { kind: "addMesh" }>): void {
+  async #beginAdd(req: Extract<Request, { kind: "addMesh" }>): Promise<void> {
     if (this.#meshes.has(req.id) || this.#adds.some((a) => a.id === req.id)) {
       throw invalid(`mesh client id ${req.id} is already in use`);
     }
     const positions = req.f64 ? new Float64Array(req.positions) : new Float32Array(req.positions);
-    const token = this.#meshAdds.begin(positions, new Uint32Array(req.indices), { ...req.options, mode: "eager" });
+    const indices = new Uint32Array(req.indices);
+    if (positions.length % 3 !== 0) {
+      throw invalid("positions length must be a multiple of 3");
+    }
+    if (indices.length % 3 !== 0) {
+      throw invalid("indices length must be a multiple of 3");
+    }
+    const token = this.#meshAdds.beginUpload(positions.length / 3, indices.length / 3, {
+      ...req.options,
+      mode: "eager",
+    });
+    try {
+      const bytes = this.#addStepWork * UPLOAD_BYTES_PER_UNIT;
+      const p = Math.max(1, Math.floor(bytes / positions.BYTES_PER_ELEMENT));
+      const n = Math.max(1, Math.floor(bytes / indices.BYTES_PER_ELEMENT));
+      for (let at = 0; at < positions.length; at += p) {
+        const chunk = positions.subarray(at, at + p);
+        this.#meshAdds.pushPositions(token, chunk instanceof Float64Array ? chunk : Float64Array.from(chunk));
+        await this.#maybeYield();
+      }
+      for (let at = 0; at < indices.length; at += n) {
+        this.#meshAdds.pushIndices(token, indices.subarray(at, at + n));
+        await this.#maybeYield();
+      }
+    } catch (e) {
+      try {
+        this.#meshAdds.drop(token);
+      } catch {
+        // Gone already.
+      }
+      throw e;
+    }
     this.#adds.push({ id: req.id, token, key: keyOf(req), rev: req.rev, built: false });
   }
 
