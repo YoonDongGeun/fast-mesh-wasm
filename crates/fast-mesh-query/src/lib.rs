@@ -4,10 +4,10 @@
 //! `f32` coordinates, and fails with [`QueryError::StaleBvh`] when the mesh was
 //! edited after the BVH was last updated. Point, ray, region and pair queries
 //! allocate only into the output vector they are given. [`slice()`],
-//! [`fill()`], [`contour_gap`] and
-//! [`triangulate`](triangulate::triangulate) also build per-call temporaries,
-//! all reserved fallibly, so that running out of memory is
-//! [`QueryError::OutOfMemory`].
+//! [`fill()`], [`contour_gap`],
+//! [`triangulate`](triangulate::triangulate) and [`intersection_polylines`]
+//! also build per-call temporaries, all reserved fallibly, so that running
+//! out of memory is [`QueryError::OutOfMemory`].
 //!
 //! - Closest point: [`closest_point`] and [`closest_point_many`], with the
 //!   [`Feature`] of the triangle the nearest point lies on.
@@ -28,9 +28,10 @@
 //! - Mesh-vs-mesh queries, with mesh B placed in mesh A's space by a
 //!   [`Rigid`]: [`intersects`], [`mesh_distance`] (a [`MeshDistance`] with
 //!   both points in A's space), [`triangles_near`] (the triangles of each
-//!   mesh within a margin of the other) and [`intersecting_pairs`]. Results
-//!   are in A's space; passing the same mesh twice means two coincident
-//!   copies.
+//!   mesh within a margin of the other), [`intersecting_pairs`] and
+//!   [`intersection_polylines`] (the intersecting pairs clipped and chained
+//!   into [`Polyline`]s). Results are in A's space; passing the same mesh
+//!   twice means two coincident copies.
 //! - Self-intersection: [`self_intersecting_pairs`] finds the triangle pairs
 //!   of one mesh that intersect and share no vertex id, by the same exact
 //!   test.
@@ -52,6 +53,7 @@ mod error;
 mod pair;
 mod pairs;
 mod plane;
+mod polylines;
 mod ray;
 mod region;
 mod rigid;
@@ -73,6 +75,7 @@ pub use error::{QueryError, Result};
 pub use fast_mesh_bvh::Aabb;
 pub use pairs::*;
 pub use plane::Plane;
+pub use polylines::{Polyline, intersection_polylines};
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;

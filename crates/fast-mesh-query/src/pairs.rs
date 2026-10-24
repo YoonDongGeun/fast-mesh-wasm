@@ -243,7 +243,7 @@ pub fn intersecting_pairs(
 
 /// Checks the inputs in the documented order: the transform, then the bound
 /// (with its error message) if any, then each mesh against its BVH.
-fn validate(
+pub(crate) fn validate(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
     mesh_b: &Mesh,
@@ -555,7 +555,7 @@ impl Chunk {
 
 /// The pair key for the intersection queries: 0 when the boxes overlap (closed),
 /// otherwise cull.
-fn overlap_key(p: &Aabb, q: &Aabb) -> Option<f64> {
+pub(crate) fn overlap_key(p: &Aabb, q: &Aabb) -> Option<f64> {
     p.overlaps(q).then_some(0.0)
 }
 
@@ -682,7 +682,7 @@ fn traverse_from<const N: usize, K: Copy + PartialOrd>(
 /// is never skipped. The pairs that `pair` accepts are therefore unchanged,
 /// and so are the queries' results.
 #[allow(clippy::too_many_arguments)] // The shared five, the start and two callbacks.
-fn for_each_pair<const N: usize>(
+pub(crate) fn for_each_pair<const N: usize>(
     mesh_a: &Mesh,
     bvh_a: &Bvh,
     mesh_b: &Mesh,

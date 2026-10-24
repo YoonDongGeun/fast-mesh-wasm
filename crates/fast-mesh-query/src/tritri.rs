@@ -25,7 +25,7 @@ type P2 = [f64; 2];
 /// With `FAST`, every coordinate is already known to be [`safe`]
 /// ([`tri_tri_intersect`] checks the pair's 18 once), so `robust` is called
 /// directly; otherwise out-of-range coordinates fall back to [`exact`].
-fn side<const FAST: bool>(a: P3, b: P3, c: P3, d: P3) -> i8 {
+pub(crate) fn side<const FAST: bool>(a: P3, b: P3, c: P3, d: P3) -> i8 {
     if !FAST && ![a, b, c, d].iter().flatten().all(|&x| safe(x)) {
         return exact::side(a, b, c, d);
     }
@@ -104,7 +104,7 @@ fn drop(p: P3, axis: usize) -> P2 {
 /// three points are collinear (the normal is exactly zero). Dropping this axis
 /// projects `t`'s plane one-to-one onto a coordinate plane. `FAST` skips the
 /// [`safe`] checks, as for [`side`].
-fn normal_axis<const FAST: bool>(t: &[P3; 3]) -> Option<usize> {
+pub(crate) fn normal_axis<const FAST: bool>(t: &[P3; 3]) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for k in 0..3 {
         let [a, b, c] = t.map(|p| drop(p, k));
@@ -476,7 +476,7 @@ fn seg_seg_2d<const FAST: bool>(p: P2, q: P2, r: P2, s: P2) -> bool {
 
 /// True when `x` lies in the closed 2D triangle `t`, which must not be
 /// degenerate. `FAST` skips the [`safe`] checks, as for [`side`].
-fn in_tri_2d<const FAST: bool>(x: P2, t: &[P2; 3]) -> bool {
+pub(crate) fn in_tri_2d<const FAST: bool>(x: P2, t: &[P2; 3]) -> bool {
     let s = [0, 1, 2].map(|i| side2::<FAST>(t[i], t[(i + 1) % 3], x));
     !(s.contains(&1) && s.contains(&-1))
 }
