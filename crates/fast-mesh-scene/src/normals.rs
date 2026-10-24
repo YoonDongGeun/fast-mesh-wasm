@@ -117,10 +117,12 @@ impl NormalState {
     /// Added, removed and moved vertices are included too. Past half the
     /// vertex slots dirty, the collection alone (about 18 ids per moved
     /// vertex) costs more than a full recomputation, so it recomputes
-    /// everything instead and returns `None`.
+    /// everything instead and returns `None`. The same holds past half the
+    /// triangle slots added, removed or rewritten.
     fn compute_changed(&mut self, mesh: &mut Mesh, c: &ChangeSet) -> Result<Option<Vec<VertexId>>> {
-        let total = c.vertices_moved.len() + c.vertices_added.len() + c.vertices_removed.len();
-        if total > mesh.vertex_slots() / 2 {
+        let verts = c.vertices_moved.len() + c.vertices_added.len() + c.vertices_removed.len();
+        let tris = c.triangles_added.len() + c.triangles_removed.len() + c.triangles_changed.len();
+        if verts > mesh.vertex_slots() / 2 || tris > mesh.triangle_slots() / 2 {
             self.compute_all(mesh)?;
             return Ok(None);
         }
@@ -764,6 +766,24 @@ mod tests {
                 tx.set_positions(&all, &spots)
             })
             .unwrap();
+        assert_eq!(normals_dirty(&mut scene, id), None);
+        assert_matches(&scene, id);
+    }
+
+    #[test]
+    fn dense_triangle_removal_reports_all() {
+        let (mut scene, id) = scene_with(UpdateMode::Eager);
+        scene.set_normals(id, true).unwrap();
+        scene.take_changes();
+        // Remove past half the triangles without moving any vertex: only the
+        // triangle threshold can trip the full recompute.
+        let mesh = scene.mesh(id).unwrap();
+        let doomed: Vec<TriangleId> = (0..mesh.triangle_slots() as TriangleId)
+            .filter(|&t| mesh.is_triangle_alive(t))
+            .take(mesh.triangle_slots() / 2 + 1)
+            .collect();
+        assert!(doomed.len() > 1);
+        scene.edit(id, |tx| tx.remove_triangles(&doomed)).unwrap();
         assert_eq!(normals_dirty(&mut scene, id), None);
         assert_matches(&scene, id);
     }
