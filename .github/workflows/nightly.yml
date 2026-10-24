@@ -1,0 +1,24 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROPTEST_RNG_SEED: random
+
+jobs:
+  proptest-random:
+    name: Property tests with random seeds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p fast-mesh-scene --test fields_properties
+      - run: cargo test -p fast-mesh-scene --test fields_properties --features fast-mesh-scene/parallel

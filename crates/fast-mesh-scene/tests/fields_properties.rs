@@ -34,6 +34,7 @@ use fast_mesh_scene::{
 };
 use fast_mesh_store::{Mesh, VertexId};
 use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 
 /// The case count: `PROPTEST_CASES` when set, else `default`. `with_cases`
 /// alone would ignore the environment variable.
@@ -42,6 +43,23 @@ fn cases(default: u32) -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// The proptest config: a fixed seed, so CI is reproducible (a rare sign
+/// flip near the winding tolerance band must not fail CI with no code
+/// change). `PROPTEST_RNG_SEED=random` (the nightly job) or a number
+/// overrides it.
+fn config() -> ProptestConfig {
+    let mut c = ProptestConfig::with_cases(cases(64));
+    c.rng_seed = match std::env::var("PROPTEST_RNG_SEED").as_deref() {
+        Ok("random") => RngSeed::Random,
+        Ok(s) => s
+            .parse()
+            .map(RngSeed::Fixed)
+            .unwrap_or(RngSeed::Fixed(0x5EED_F33D)),
+        Err(_) => RngSeed::Fixed(0x5EED_F33D),
+    };
+    c
 }
 
 /// Surface tolerance for the reference, whose points take another rounding
@@ -534,7 +552,7 @@ fn max_distance(k: u8) -> f64 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases(64)))]
+    #![proptest_config(config())]
 
     /// See the module docs.
     #[test]
@@ -592,15 +610,20 @@ proptest! {
         if !both_sides {
             prop_assert!(scene.colors(b).unwrap().is_none());
         }
+        let mut mode_a = modes[0];
         for (i, batch) in batches.iter().enumerate() {
             let at = format!("batch {i}");
             let before: Vec<Vec<[u8; 4]>> = (0..coloured)
                 .map(|k| scene.colors(meshes[k]).unwrap().unwrap().to_vec())
                 .collect();
-            // An Eager mesh sees one operation at a time.
-            let ops = if modes[0] == 0 { &batch[..1] } else { &batch[..] };
+            // An Eager mesh sees one operation at a time, keyed on its
+            // current mode (a batch may change it).
+            let ops = if mode_a == 0 { &batch[..1] } else { &batch[..] };
             for o in ops {
                 apply(&mut scene, a, b, o);
+                if let Op::SetMode(true, k) = o {
+                    mode_a = k % 3;
+                }
                 for &m in &meshes[..coloured] {
                     let n = scene.mesh(m).unwrap().vertex_slots();
                     prop_assert_eq!(scene.colors(m).unwrap().unwrap().len(), n);
