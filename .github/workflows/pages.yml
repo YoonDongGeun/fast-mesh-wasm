@@ -1,0 +1,70 @@
+name: Pages
+
+# Publishes the showcase (examples/showcase) to GitHub Pages:
+# https://yoondonggeun.github.io/fast-mesh-wasm/. Pages sends no COOP/COEP
+# headers; the showcase's service worker (public/coi-sw.js) adds them, so the
+# engine runs threaded there too. Needs the repository's Pages source set to
+# "GitHub Actions".
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a newer push waits rather than cancelling one mid-deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Must match the `wasm-bindgen` version pinned in the root Cargo.toml.
+  WASM_BINDGEN_VERSION: 0.2.129
+
+jobs:
+  build:
+    if: github.repository == 'YoonDongGeun/fast-mesh-wasm'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      # The threaded artifact (dist/wasm-threads) needs the pinned nightly with rust-src.
+      - id: nightly
+        uses: ./.github/actions/install-nightly
+      # Keyed on the nightly too: a new pin must not reuse the old rebuilt std.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.toolchain }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Builds both artifacts: dist/wasm (stable) and dist/wasm-threads (nightly).
+      - run: pnpm build
+      - name: Build the showcase under /fast-mesh-wasm/
+        run: pnpm --filter fast-mesh-wasm-example-showcase build
+        env:
+          SHOWCASE_BASE: /fast-mesh-wasm/
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: examples/showcase/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # deploy to Pages
+      id-token: write # the deployment's OIDC token
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

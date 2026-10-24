@@ -23,6 +23,11 @@ function crossOriginIsolation(): Plugin {
 }
 
 export default defineConfig({
+  // The public path: `/` by default; the GitHub Pages build sets
+  // SHOWCASE_BASE=/fast-mesh-wasm/. Every asset URL (the Workers, the wasm
+  // files the library finds through `import.meta.url`, public/coi-sw.js) is
+  // resolved against it.
+  base: process.env.SHOWCASE_BASE ?? "/",
   plugins: [react(), crossOriginIsolation()],
   // Top-level await in src/main.tsx needs a modern target, in the page and in
   // the parser Worker. three.js and React Three Fiber make one large chunk;
