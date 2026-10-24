@@ -95,7 +95,11 @@ serveEngine(
           const crash = threadedGlue?.[hook];
           scope.postMessage({ kind: "checkPoolCrash", available: typeof crash === "function" });
           if (typeof crash === "function") {
-            setTimeout(() => crash());
+            // Synchronous on purpose: the reply above is already queued, and
+            // yielding (setTimeout) lets the engine messages the page sends
+            // next get processed first, so the "pending" calls resolve
+            // instead of poisoning (poolCrash flake).
+            crash();
           }
           return;
         }
