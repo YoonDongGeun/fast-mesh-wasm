@@ -4,6 +4,14 @@ A small mesh tool built on the library: load meshes, move them, repair them, and
 touch as a contact heatmap. Vite + React + React Three Fiber over a `SceneStore`
 (`fast-mesh-wasm/store`), drawn with `<FastMesh>` (`fast-mesh-wasm/r3f`).
 
+**[Live demo](https://yoondonggeun.github.io/fast-mesh-wasm/)**, published from `main` by
+`.github/workflows/pages.yml`. GitHub Pages cannot send the COOP/COEP headers that threads need, so
+there a small service worker (`public/coi-sw.js`, registered in `index.html`) adds them and the page
+reloads once on the first visit. Where service workers are unavailable the scene runs
+single-threaded. The dev and preview servers send the headers themselves, so the worker is not
+registered there. `SHOWCASE_BASE=/fast-mesh-wasm/` sets the build's public path (default `/`);
+`node scripts/showcase-pages-check.mjs` checks that build in Chrome (see Checks).
+
 ```sh
 pnpm build                                          # the library (once)
 pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
@@ -87,6 +95,7 @@ The dev and preview servers send the cross-origin isolation headers (COOP/COEP, 
 pnpm --filter fast-mesh-wasm-example-showcase test   # parsers, demo meshes, panel arithmetic (vitest)
 node scripts/showcase-check.mjs --threads 4          # a scripted session in headless Chrome (on the build; --build builds first)
 node scripts/showcase-check.mjs --big                # plus a 1M-triangle STL upload (main thread < 50 ms)
+node scripts/showcase-pages-check.mjs                # the Pages build: no headers, the service worker, the fallback
 ```
 
 The scripted session selects and drags A with the gizmo and undoes it; checks the heatmap of A and

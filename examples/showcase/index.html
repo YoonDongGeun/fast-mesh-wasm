@@ -5,6 +5,48 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>fast-mesh-wasm showcase</title>
     <link rel="icon" href="data:," />
+    <script>
+      // Cross-origin isolation on hosts without COOP/COEP headers (GitHub
+      // Pages): register public/coi-sw.js, which adds them, and reload once
+      // when it takes control. Nothing to do where the server sends them (the
+      // Vite dev and preview servers). Without it (no service workers, a
+      // failed registration) the scene runs single-threaded. The session flag
+      // allows one reload per tab until the page is isolated: no reload loop.
+      (() => {
+        const flag = "fast-mesh-coi-reload";
+        if (window.crossOriginIsolated) {
+          try {
+            sessionStorage.removeItem(flag);
+          } catch {}
+          return;
+        }
+        if (!window.isSecureContext || !("serviceWorker" in navigator)) {
+          return;
+        }
+        const reload = () => {
+          try {
+            if (sessionStorage.getItem(flag) !== null) {
+              console.warn("fast-mesh showcase: still not cross-origin isolated after a reload; running single-threaded");
+              return;
+            }
+            sessionStorage.setItem(flag, "1");
+          } catch {
+            return; // no session storage: no guard, so no reload
+          }
+          location.reload();
+        };
+        navigator.serviceWorker.register("%BASE_URL%coi-sw.js", { scope: "%BASE_URL%" }).then(
+          () => {
+            if (navigator.serviceWorker.controller) {
+              reload(); // controlled, yet not isolated: this page loaded before the worker's headers applied
+            } else {
+              navigator.serviceWorker.addEventListener("controllerchange", reload, { once: true });
+            }
+          },
+          (error) => console.warn("fast-mesh showcase: no cross-origin isolation service worker; running single-threaded", error),
+        );
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

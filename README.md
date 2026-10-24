@@ -6,6 +6,8 @@
 
 Fast triangle mesh utilities for JavaScript and TypeScript, written in Rust and compiled to WebAssembly.
 
+**[Live demo](https://yoondonggeun.github.io/fast-mesh-wasm/)**: the [showcase app](examples/showcase) in your browser.
+
 - Works in browsers (Vite, webpack, Next.js), Node.js and Bun
 - Installs the same way with npm, pnpm and bun. No native build step, no install scripts, zero dependencies
 - Full TypeScript types and inline docs, generated from the Rust source

@@ -107,6 +107,13 @@ jobs:
       - name: Check the showcase in Chrome
         timeout-minutes: 10
         run: node scripts/showcase-check.mjs --threads 4
+      # The GitHub Pages build (pages.yml): rebuilt under /fast-mesh-wasm/ and served
+      # without COOP/COEP; the service worker makes it isolated and threaded after one
+      # reload, and without it the scene still runs single-threaded. Last of the
+      # showcase steps: it leaves examples/showcase/dist built for the subpath.
+      - name: Check the showcase's GitHub Pages build in Chrome
+        timeout-minutes: 10
+        run: node scripts/showcase-pages-check.mjs
       # Headless Chrome (preinstalled on the runner) against `vite preview` of the WebGPU
       # example's check page: threaded and single-threaded bit-identical, shared memory
       # growth past 512 MB, restart with a new pool, fallback when the pool cannot start;
