@@ -468,6 +468,14 @@ impl Bvh {
     /// The triangles in the subtree of `id`: exact, kept up to date by
     /// builds, updates and compactions (refits change none). Lets a caller
     /// bound the work of a subtree on any tree, balanced or not.
+    ///
+    /// As for [`Bvh::node`], `id` must come from this BVH and not predate its
+    /// last modification.
+    ///
+    /// # Panics
+    /// When `id` is past the BVH's nodes (an id from another BVH, or from
+    /// before a compaction); an id that is in range but stale gives an
+    /// unrelated count.
     pub fn subtree_triangles(&self, id: NodeId) -> usize {
         self.counts[id.index()] as usize
     }
