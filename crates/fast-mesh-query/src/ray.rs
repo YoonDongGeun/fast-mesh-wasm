@@ -255,7 +255,12 @@ pub fn raycast_any(mesh: &Mesh, bvh: &Bvh, ray: &Ray, opts: &RayOptions) -> Resu
 /// A ray through an edge shared by several triangles, or through a vertex
 /// shared by a fan, reports one hit per triangle: a vertex shared by 6
 /// triangles gives 6 hits at the same `t`. A caller that counts surface
-/// crossings, for parity or winding, must merge hits with equal `t`.
+/// crossings, for parity or winding, must merge hits with equal `t` itself;
+/// the query keeps every hit so that no crossing is lost, and Phase 5's
+/// inside/outside tests do not count ray crossings at all: they use
+/// angle-weighted pseudonormals, or generalized winding numbers where the
+/// orientation is inconsistent, neither of which needs a parity rule for
+/// duplicate hits.
 ///
 /// # Errors
 /// As for [`raycast`], and [`QueryError::OutOfMemory`] when `out` cannot grow;
@@ -899,6 +904,55 @@ mod tests {
         fail_allocations_after(None);
         assert_eq!(r, Err(QueryError::OutOfMemory));
         assert_eq!(out, vec![sentinel]);
+    }
+
+    /// A flat 6-triangle fan around vertex 0 at the origin.
+    fn fan() -> (Mesh, Bvh) {
+        let mut p = vec![0.0, 0.0, 0.0];
+        for k in 0..6 {
+            let a = std::f64::consts::TAU * f64::from(k) / 6.0;
+            p.extend([a.cos() as f32, a.sin() as f32, 0.0]);
+        }
+        let mut idx = Vec::new();
+        for k in 0..6 {
+            idx.extend([0, 1 + k, 1 + (k + 1) % 6]);
+        }
+        let mesh = Mesh::from_buffers(&p, &idx).unwrap();
+        let bvh = build(&mesh, Quality::Sah);
+        (mesh, bvh)
+    }
+
+    #[test]
+    fn shared_vertex_and_edge_report_one_hit_per_triangle() {
+        // The crossing-count contract of `raycast_all` (issue #18): a ray
+        // through the shared vertex hits every triangle of the fan, at equal
+        // `t`, sorted by triangle id; a ray through a shared edge hits both.
+        let (mesh, bvh) = fan();
+        let mut out = Vec::new();
+        let down = Ray {
+            origin: [0.0, 0.0, 1.0],
+            dir: DOWN,
+        };
+        let n = raycast_all(&mesh, &bvh, &down, &opts(), &mut out).unwrap();
+        assert_eq!(n, 6);
+        assert!(out.iter().all(|h| h.t == 1.0));
+        assert_eq!(
+            out.iter().map(|h| h.triangle).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        // Through the midpoint of the edge 0-1, shared by triangles 0 and 5.
+        let edge = Ray {
+            origin: [0.5, 0.0, 1.0],
+            dir: DOWN,
+        };
+        out.clear();
+        let n = raycast_all(&mesh, &bvh, &edge, &opts(), &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert!(out.iter().all(|h| h.t == 1.0));
+        assert_eq!(
+            out.iter().map(|h| h.triangle).collect::<Vec<_>>(),
+            vec![0, 5]
+        );
     }
 
     #[test]
