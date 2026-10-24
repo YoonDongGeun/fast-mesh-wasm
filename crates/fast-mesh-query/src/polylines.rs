@@ -46,8 +46,8 @@ pub struct Polyline {
 /// endpoints on a shared vertex snap to it exactly, so loops close.
 ///
 /// The order is deterministic: open polylines first, each from its smaller
-/// end, then closed loops, each from its smallest point, and the polylines
-/// sorted by their first point.
+/// end, then closed loops, each from its smallest point; each group is
+/// sorted by first point.
 ///
 /// # Errors
 /// [`QueryError::InvalidInput`] for an invalid `xf` (see [`Rigid`]); then
@@ -197,8 +197,8 @@ const SPLIT: usize = usize::MAX - 1;
 
 /// Chains `segs` into `out` by exact `f32` equality of endpoints: open
 /// polylines from their smaller end first, then closed loops from their
-/// smallest point, and the polylines sorted by their first point. Returns
-/// how many were appended.
+/// smallest point, each group sorted by first point. Returns how many were
+/// appended.
 fn chain(segs: &[Seg32], out: &mut Vec<Polyline>) -> Result<usize> {
     let start = out.len();
     let key_of = |e: usize| {
@@ -289,7 +289,7 @@ fn chain(segs: &[Seg32], out: &mut Vec<Polyline>) -> Result<usize> {
             )?;
         }
     }
-    out[start..].sort_unstable_by_key(|c| c.points[0].map(f32::to_bits));
+    out[start..].sort_unstable_by_key(|c| (c.closed, c.points[0].map(f32::to_bits)));
     Ok(out.len() - start)
 }
 
@@ -1032,6 +1032,29 @@ mod tests {
         let mut got: Vec<_> = segs.iter().map(|s| (bits(s.from), bits(s.to))).collect();
         got.sort_unstable();
         assert_eq!(got, vec![(bits(u), bits(w)), (bits(v), bits(w))]);
+    }
+
+    #[test]
+    fn chain_lists_open_polylines_before_closed_loops() {
+        // A closed loop with the smaller first point still sorts after the
+        // open chain: opens first, then loops, each from its smallest point
+        // and each group sorted by first point.
+        let seg = |from, to| Seg32 { from, to };
+        let segs = vec![
+            seg([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            seg([1.0, 0.0, 0.0], [1.0, 1.0, 0.0]),
+            seg([1.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+            seg([0.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
+            seg([5.0, 0.0, 0.0], [6.0, 0.0, 0.0]),
+            seg([6.0, 0.0, 0.0], [7.0, 0.0, 0.0]),
+        ];
+        let mut out = Vec::new();
+        let n = chain(&segs, &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert!(!out[0].closed, "open chain sorts first, got {out:?}");
+        assert!(out[1].closed);
+        assert_eq!(out[0].points[0], [5.0, 0.0, 0.0]);
+        assert_eq!(out[1].points[0], [0.0, 0.0, 0.0]);
     }
 
     #[test]
