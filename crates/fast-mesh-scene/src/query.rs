@@ -315,11 +315,13 @@ impl Scene {
         // the bounds, nearest entry first.
         let mut order = Vec::new();
         for (id, e) in self.entries.iter() {
-            let lo = local_point(e, origin)?;
+            // Empty meshes hold nothing: skip them before mapping the
+            // point, which may be out of f32 range in their local space.
             let wbox = world_box(e);
             if wbox.is_empty() {
                 continue;
             }
+            let lo = local_point(e, origin)?;
             let dl = rotate_back(&e.placement, d);
             let dl32 = dl.map(|c| c as f32);
             let err_dir = norm(std::array::from_fn(|k| f64::from(dl32[k]) - dl[k]));
@@ -407,11 +409,13 @@ impl Scene {
         self.prepare(None)?;
         let mut order = Vec::new();
         for (id, e) in self.entries.iter() {
-            let lp = local_point(e, p)?;
+            // Empty meshes hold nothing: skip them before mapping the
+            // point, which may be out of f32 range in their local space.
             let wbox = world_box(e);
             if wbox.is_empty() {
                 continue;
             }
+            let lp = local_point(e, p)?;
             let pad = query_pad(e, &wbox, p, lp.p, lp.err, 0.0);
             let lower = (wbox.distance_to(p) - pad).max(0.0);
             if lower <= opts.max_distance {
@@ -1130,6 +1134,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn closest_point_breaks_ties_by_id() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let identity = Placement::IDENTITY.rotation;
+        // Two walls at distance 2 from the origin: `low` (index 0) at x = 2,
+        // `high` (index 1) moved to x = -2, whose larger pad sorts it first.
+        let low = scene
+            .add_mesh(wall(2.0, 1.0), MeshOptions::default())
+            .unwrap();
+        let high = scene
+            .add_mesh(wall(0.0, 1.0), place(identity, [-2.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(low < high);
+        let opts = SceneClosestOptions::default();
+        let o = [0.0, 0.0, 0.0];
+        // Two coincident walls tie exactly too.
+        let twin = scene
+            .add_mesh(wall(2.0, 1.0), MeshOptions::default())
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (low, 2.0));
+        // A nearer mesh wins whatever its id.
+        scene
+            .set_placement(
+                twin,
+                Placement {
+                    rotation: identity,
+                    translation: [-1.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (twin, 1.0));
+        scene
+            .set_placement(
+                low,
+                Placement {
+                    rotation: identity,
+                    translation: [1.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (twin, 1.0));
+    }
+
+    #[test]
     fn queries_update_lazy_and_reject_stale_manual() {
         let mut scene = Scene::new(SceneOptions::default());
         let lazy = scene
@@ -1392,6 +1442,30 @@ pub(crate) mod tests {
             scene.closest_point(o, &SceneClosestOptions::default()),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn queries_skip_empty_meshes_before_mapping_the_point() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let wall_id = scene
+            .add_mesh(wall(5.0, 1.0), MeshOptions::default())
+            .unwrap();
+        // An empty mesh far beyond f32 range: mapping the query point into
+        // its local space would fail, but it holds nothing and must be
+        // skipped first.
+        let far = place(Placement::IDENTITY.rotation, [1e39, 0.0, 0.0]);
+        scene.add_mesh(Mesh::new(), far).unwrap();
+        let o = [0.0, 0.0, 0.0];
+        let hit = scene
+            .raycast(o, [1.0, 0.0, 0.0], &SceneRayOptions::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!((hit.mesh, hit.t), (wall_id, 5.0));
+        let near = scene
+            .closest_point(o, &SceneClosestOptions::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!((near.mesh, near.distance), (wall_id, 5.0));
     }
 
     #[test]

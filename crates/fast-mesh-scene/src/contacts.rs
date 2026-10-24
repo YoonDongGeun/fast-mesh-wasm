@@ -153,6 +153,8 @@ impl Scene {
         if wa.distance_to_box(wb) > margin + pair_pad(ea, wa, eb, wb) {
             return Ok(());
         }
+        #[cfg(test)]
+        crate::scene::fault::before_contact()?;
         let xf = relative_rigid(
             &ea.placement,
             ea.mesh.origin(),
@@ -442,5 +444,35 @@ mod tests {
             Err(SceneError::UnknownMesh)
         );
         assert_eq!(out, keep());
+    }
+
+    #[test]
+    fn find_contacts_truncates_after_a_midway_failure() {
+        let (mut scene, ids) = scene();
+        let keep = || {
+            vec![Contact {
+                a: ids[0],
+                b: ids[1],
+                intersecting: false,
+                distance: 9.0,
+                triangles_a: vec![],
+                triangles_b: vec![],
+            }]
+        };
+        // The second pair to reach the narrow phase fails, after the first
+        // was appended: the error leaves `out` as it was.
+        let mut out = keep();
+        crate::scene::fault::fail_contact_on(2);
+        assert_eq!(
+            scene.find_contacts(0.5, &ContactFilter::default(), &mut out),
+            Err(SceneError::Store(StoreError::OutOfMemory))
+        );
+        assert_eq!(out, keep());
+        // The hook fires once: the search works again afterwards.
+        let n = scene
+            .find_contacts(0.5, &ContactFilter::default(), &mut out)
+            .unwrap();
+        assert!(n >= 2, "{n}");
+        assert_eq!(out.len(), 1 + n);
     }
 }
