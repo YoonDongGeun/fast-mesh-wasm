@@ -417,6 +417,8 @@ interface PendingAdd {
   built: boolean;
   /** Its render buffers being copied out, once built (see {@link Engine.#pack}). */
   packed?: Packed;
+  /** The copy failed (not a trap): it lands without one, the frame copies. */
+  uncopied?: true;
 }
 
 /**
@@ -877,8 +879,8 @@ class Engine {
     if (a === undefined) {
       return true;
     }
-    if (a.built && !copy && land) {
-      // The frame copies the buffers anyway: land as built.
+    if (a.built && (!copy || a.uncopied === true) && land) {
+      // The frame copies the buffers: land as built.
       a.packed = undefined;
       return this.#land(a, failed);
     }
@@ -889,15 +891,20 @@ class Engine {
         return this.#addFailed(a, e, false, failed);
       }
       this.#onChunk?.({ kind: "addMeshStep", id: a.id });
-    } else if (!packedAll(a.packed)) {
+    } else if (!packedAll(a.packed) && a.uncopied !== true) {
       try {
         this.#pack(a);
       } catch (e) {
-        return this.#addFailed(a, e, false, failed);
+        if (isPoison(e)) {
+          return this.#addFailed(a, e, false, failed);
+        }
+        // No memory for the copy (say): the frame copies the buffers.
+        a.packed = undefined;
+        a.uncopied = true;
       }
       this.#onChunk?.({ kind: "addMeshPack", id: a.id });
     }
-    return packedAll(a.packed) && land ? this.#land(a, failed) : true;
+    return (packedAll(a.packed) || a.uncopied === true) && land ? this.#land(a, failed) : true;
   }
 
   /**

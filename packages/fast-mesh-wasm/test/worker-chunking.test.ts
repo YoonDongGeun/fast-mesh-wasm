@@ -465,6 +465,40 @@ describe("background adds", () => {
     expect(same(added?.bytes.indices, ref.indices)).toBe(true);
   });
 
+  it("a_copy_that_cannot_be_allocated_leaves_it_to_the_frame", async () => {
+    // Review M2: when the copy's memory cannot be allocated, the add still
+    // lands, and the frame copies its buffers (bit for bit as before).
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const original = globalThis.ArrayBuffer;
+    const big = BIG.positions.length * 4; // the positions' f32 bytes
+    let refused = 0;
+    globalThis.ArrayBuffer = new Proxy(original, {
+      construct(target, args, newTarget) {
+        if (args[0] === big) {
+          refused++;
+          throw new RangeError("Array buffer allocation failed");
+        }
+        return Reflect.construct(target, args, newTarget);
+      },
+    });
+    try {
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.posted.some((p) => p.update));
+    } finally {
+      globalThis.ArrayBuffer = original;
+    }
+    expect(refused).toBeGreaterThan(0);
+    const u = h.posted.find((p) => p.update)?.result as Result;
+    expect(u.status).toEqual([{ key: "mesh:3", rev: expect.any(Number), status: "ready" }]);
+    const added = u.changes.find((c) => c.id === 3);
+    const ref = referenceBuffers();
+    expect(Buffer.from(added?.bytes.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+    expect(Buffer.from(added?.bytes.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
+    expect(Buffer.from(added?.bytes.indices as ArrayBuffer).equals(Buffer.from(ref.indices.buffer))).toBe(true);
+  });
+
   it("a_waiting_request_steps_the_add_single_threaded", async () => {
     // Re-review R1: single-threaded, a request waiting on a background add
     // still lets the add go on in steps with yields (the one-call build
