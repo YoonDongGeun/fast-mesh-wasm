@@ -31,7 +31,8 @@ use std::ops::Range;
 use fast_mesh_bvh::Bvh;
 use fast_mesh_query::{ClosestHit, Feature, QueryError};
 use fast_mesh_store::{
-    Adjacency, AdjacencyBuild, EdgeKind, Incidence, IncidenceBuild, Mesh, TriangleId, VertexId, par,
+    Adjacency, AdjacencyBuild, ChangeSet, EdgeKind, Incidence, IncidenceBuild, Mesh, TriangleId,
+    VertexId, par,
 };
 
 use crate::geom::{
@@ -393,6 +394,78 @@ fn edge_normal(
     narrow(sum)
 }
 
+/// As [`vertex_normal`], with face normals computed fresh from `mesh`:
+/// for [`SignData::try_refit`], which has no precomputed face array.
+/// Must give the same values (it runs the same arithmetic).
+fn refit_vertex_normal(mesh: &Mesh, inc: &Incidence, v: usize) -> [f32; 3] {
+    let mut sum = [0.0; 3];
+    for &t in inc.triangles(v as VertexId) {
+        let n = face_normal(mesh, t as usize);
+        if n == [0.0; 3] {
+            continue;
+        }
+        let tri = mesh.triangles()[t as usize];
+        let Some(i) = tri.iter().position(|&x| x as usize == v) else {
+            continue;
+        };
+        let p = corners(mesh, tri).map(widen);
+        let (e1, e2) = (sub(p[(i + 1) % 3], p[i]), sub(p[(i + 2) % 3], p[i]));
+        let angle = norm(cross(e1, e2)).atan2(dot(e1, e2));
+        sum = add(sum, scale(n, angle));
+    }
+    narrow(unit(sum))
+}
+
+/// As [`across`], with face normals computed fresh from `mesh`.
+fn refit_across(mesh: &Mesh, adj: &Adjacency, c: u32, hops: u32) -> [f64; 3] {
+    let Some(o) = adj.opposite(c) else {
+        return [0.0; 3];
+    };
+    let s = (o / 3) as usize;
+    let f = face_normal(mesh, s);
+    if f != [0.0; 3] {
+        return f;
+    }
+    if hops == 0 {
+        return [0.0; 3];
+    }
+    let long = longest_edge_corner(mesh, s);
+    let base = 3 * s as u32;
+    if o % 3 != long {
+        refit_across(mesh, adj, base + long, hops - 1)
+    } else {
+        let sum = (0..3)
+            .filter(|&j| j != long)
+            .map(|j| refit_across(mesh, adj, base + j, hops - 1))
+            .fold([0.0; 3], add);
+        unit(sum)
+    }
+}
+
+/// As [`edge_normal`], with face normals computed fresh from `mesh`.
+fn refit_edge_normal(mesh: &Mesh, adj: &Adjacency, inc: &Incidence, c: usize) -> [f32; 3] {
+    let tris = mesh.triangles();
+    let (t, i) = (c / 3, c % 3);
+    if !mesh.is_triangle_alive(t as TriangleId) {
+        return [0.0f32; 3];
+    }
+    let tri = tris[t];
+    let mut sum = face_normal(mesh, t);
+    match adj.edge_kind(c as u32) {
+        EdgeKind::Interior => sum = add(sum, refit_across(mesh, adj, c as u32, SLIVER_HOPS)),
+        EdgeKind::Boundary => {}
+        EdgeKind::NonManifold => {
+            let (u, w) = (tri[(i + 1) % 3], tri[(i + 2) % 3]);
+            for &s in inc.triangles(u) {
+                if s as usize != t && tris[s as usize].contains(&w) {
+                    sum = add(sum, face_normal(mesh, s as usize));
+                }
+            }
+        }
+    }
+    narrow(sum)
+}
+
 /// The pass a [`SignBuild`] is in, with its cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -725,6 +798,130 @@ impl SignData {
         build.finish().ok_or(FieldsError::OutOfMemory)
     }
 
+    /// Refits pseudonormal data in place after a position-only edit,
+    /// recomputing only the vertex and edge normals around
+    /// `changes`' moved vertices (plus the signed volume, in O(n)).
+    /// Returns whether the refit ran: `false` (a full [`SignData::build`]
+    /// is needed) when the mode is not pseudonormal, the topology changed,
+    /// vertices or triangles were added or removed, the slot counts changed,
+    /// the mesh's adjacency or incidence is not cached, the BVH is not
+    /// current, or a dirty triangle changed its degenerate status. On `true`
+    /// the data is current for `mesh` and `bvh` and identical to a rebuild.
+    ///
+    /// # Errors
+    /// [`FieldsError::OutOfMemory`] when the dirty sets cannot be listed.
+    pub fn try_refit(&mut self, mesh: &Mesh, bvh: &Bvh, changes: &ChangeSet) -> Result<bool> {
+        if self.status.mode != SignMode::Pseudonormal {
+            return Ok(false);
+        }
+        if mesh.uid() != self.mesh_uid || mesh.epoch() != self.epoch {
+            return Ok(false);
+        }
+        if bvh.mesh_uid() != self.mesh_uid || !bvh.is_current(mesh) {
+            return Ok(false);
+        }
+        if mesh.vertex_slots() != self.vertex_normals.len()
+            || 3 * mesh.triangle_slots() != self.edge_normals.len()
+        {
+            return Ok(false);
+        }
+        if changes.topology_changed()
+            || !changes.vertices_added.is_empty()
+            || !changes.vertices_removed.is_empty()
+        {
+            return Ok(false);
+        }
+        let (Some(adj), Some(inc)) = (mesh.adjacency(), mesh.incidence()) else {
+            return Ok(false);
+        };
+        // The triangles incident to the moved vertices.
+        let mut dirty: Vec<TriangleId> = Vec::new();
+        for &v in &changes.vertices_moved {
+            let list = inc.triangles(v);
+            dirty
+                .try_reserve(list.len())
+                .map_err(|_| FieldsError::OutOfMemory)?;
+            dirty.extend_from_slice(list);
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        // A dirty triangle that changed its degenerate status needs a rebuild
+        // (new neighbours for the fallback, new counts).
+        for &t in &dirty {
+            let zero = face_normal(mesh, t as usize) == [0.0; 3];
+            if self.degenerate.binary_search(&t).is_ok() != zero {
+                return Ok(false);
+            }
+        }
+        // The vertices of the dirty triangles: exactly those whose normals
+        // can have changed (a vertex normal sums its incident faces).
+        let tris = mesh.triangles();
+        let mut verts: Vec<VertexId> = Vec::new();
+        verts
+            .try_reserve(dirty.len().saturating_mul(3))
+            .map_err(|_| FieldsError::OutOfMemory)?;
+        for &t in &dirty {
+            verts.extend_from_slice(&tris[t as usize]);
+        }
+        verts.sort_unstable();
+        verts.dedup();
+        for &v in &verts {
+            self.vertex_normals[v as usize] = refit_vertex_normal(mesh, inc, v as usize);
+        }
+        // The corners of the dirty triangles, with the corners across their
+        // edges (whose sums include the dirty faces).
+        let mut corners: Vec<u32> = Vec::new();
+        corners
+            .try_reserve(dirty.len().saturating_mul(6))
+            .map_err(|_| FieldsError::OutOfMemory)?;
+        for &t in &dirty {
+            for i in 0..3u32 {
+                let c = 3 * t + i;
+                corners.push(c);
+                match adj.edge_kind(c) {
+                    EdgeKind::Interior => {
+                        if let Some(o) = adj.opposite(c) {
+                            corners.push(o);
+                        }
+                    }
+                    EdgeKind::Boundary => {}
+                    EdgeKind::NonManifold => {
+                        let tri = tris[t as usize];
+                        let (u, w) = (tri[((i + 1) % 3) as usize], tri[((i + 2) % 3) as usize]);
+                        for &s in inc.triangles(u) {
+                            if tris[s as usize].contains(&w) {
+                                let stri = tris[s as usize];
+                                for j in 0..3u32 {
+                                    let (a, b) = (
+                                        stri[((j + 1) % 3) as usize],
+                                        stri[((j + 2) % 3) as usize],
+                                    );
+                                    if (a == u && b == w) || (a == w && b == u) {
+                                        corners.push(3 * s + j);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        corners.sort_unstable();
+        corners.dedup();
+        for &c in &corners {
+            self.edge_normals[c as usize] = refit_edge_normal(mesh, adj, inc, c as usize);
+        }
+        // The volume, over every triangle in id order (as the build sums it).
+        let mut volume = 0.0;
+        for t in 0..mesh.triangle_slots() {
+            volume += tri_volume(mesh, t);
+        }
+        self.status.signed_volume = volume;
+        self.revision = mesh.revision();
+        self.bvh_generation = bvh.generation();
+        Ok(true)
+    }
+
     /// The generalized winding number of `mesh` at `p`: the sum of the solid
     /// angles of its triangles seen from `p`, over 4π. It is 1 inside a
     /// closed, outward-facing mesh, 0 outside it, and in between near holes.
@@ -791,10 +988,11 @@ impl SignData {
 
     /// Whether `p`, whose closest point on `mesh` is `hit`, counts as inside
     /// (negative distance). `mesh` and `bvh` must be those this data is
-    /// current for.
+    /// current for. In winding mode the sign-only beta is used (fewer
+    /// triangles summed than [`SignData::winding_number`).
     pub(crate) fn is_inside(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3], hit: &ClosestHit) -> bool {
         match self.status.mode {
-            SignMode::Winding => self.moments.winding(mesh, bvh, p).0 >= 0.5,
+            SignMode::Winding => self.moments.sign_winding(mesh, bvh, p).0 >= 0.5,
             _ => self.side(mesh, p, hit) < 0.0,
         }
     }
@@ -894,6 +1092,51 @@ mod tests {
             s.signed_volume = 0.0;
             s
         })
+    }
+
+    #[test]
+    fn refit_matches_full_rebuild() {
+        // Position-only edits: refitting around the dirty vertices gives
+        // the same normals, degenerate list and volume as a full rebuild.
+        for (name, mut mesh, moved, positions) in [
+            (
+                "terrain",
+                terrain(16),
+                vec![10, 20, 30],
+                vec![[0.5, 0.5, 1.0], [1.5, 2.5, 0.5], [3.0, 3.0, 2.0]],
+            ),
+            ("cube", cube(), vec![0], vec![[-1.2, -1.0, -0.8]]),
+            (
+                "torus",
+                torus(),
+                vec![5, 100, 200],
+                vec![[1.1, 0.1, 0.2], [0.9, -0.1, 0.3], [1.0, 0.2, -0.1]],
+            ),
+        ] {
+            let mut bvh = build_bvh(&mesh);
+            let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+            let mut tx = mesh.begin_edit();
+            tx.set_positions(&moved, &positions).unwrap();
+            let patch = tx.commit().unwrap();
+            bvh.update(&mut mesh, patch.changes()).unwrap();
+            let mut refitted = sign.clone();
+            assert!(
+                refitted.try_refit(&mesh, &bvh, patch.changes()).unwrap(),
+                "{name}"
+            );
+            let rebuilt = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+            assert_eq!(fingerprint(&refitted), fingerprint(&rebuilt), "{name}");
+        }
+        // A topology edit cannot refit.
+        let mut mesh = cube();
+        let mut bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+        let mut tx = mesh.begin_edit();
+        tx.remove_triangles(&[0]).unwrap();
+        let patch = tx.commit().unwrap();
+        bvh.update(&mut mesh, patch.changes()).unwrap();
+        let mut refitted = sign.clone();
+        assert!(!refitted.try_refit(&mesh, &bvh, patch.changes()).unwrap());
     }
 
     #[test]

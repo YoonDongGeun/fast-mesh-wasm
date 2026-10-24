@@ -32,6 +32,14 @@ use crate::{FieldsError, Result};
 /// error stays below 1e-3 away from the surface (see the module docs).
 const BETA: f64 = 8.0;
 
+/// The accuracy parameter for sign-only queries ([`Moments::sign_winding`],
+/// as used by [`SignData::is_inside`](crate::SignData::is_inside)): a node
+/// is far when its centroid is more than `SIGN_BETA` times its radius away.
+/// Lower than [`BETA`], so fewer triangles are summed exactly; the error
+/// stays well below the 0.5 inside/outside threshold away from the surface
+/// on the closed test meshes.
+const SIGN_BETA: f64 = 4.0;
+
 /// The order-1 moments of one BVH node.
 #[derive(Debug, Clone, Copy, Default)]
 struct Moment {
@@ -143,13 +151,23 @@ impl Moments {
     /// summed exactly. `mesh` and `bvh` must be those the moments were built
     /// for. Nothing is allocated.
     pub(crate) fn winding(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3]) -> (f64, usize) {
+        self.winding_with_beta(mesh, bvh, p, BETA)
+    }
+
+    /// As [`Moments::winding`], with the sign-only [`SIGN_BETA`]: fewer
+    /// triangles summed, same inside/outside away from the surface.
+    pub(crate) fn sign_winding(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3]) -> (f64, usize) {
+        self.winding_with_beta(mesh, bvh, p, SIGN_BETA)
+    }
+
+    fn winding_with_beta(&self, mesh: &Mesh, bvh: &Bvh, p: [f32; 3], beta: f64) -> (f64, usize) {
         let q = widen(p);
         let (mut total, mut summed) = (0.0, 0);
         bvh.traverse(|id, view| {
             if let Some(m) = self.0.get(id.index()) {
                 let d = sub(m.centroid, q);
                 let dist = norm(d);
-                if dist > BETA * m.radius {
+                if dist > beta * m.radius {
                     total += dot(m.normal, d) / (dist * dist * dist);
                     return false;
                 }
@@ -346,6 +364,47 @@ mod tests {
         let empty_bvh = build_bvh(&empty);
         let mut build = MomentsBuild::new(&empty_bvh).unwrap();
         assert!(build.step(&empty, &empty_bvh, 1).unwrap());
+    }
+
+    #[test]
+    fn sign_winding_agrees_and_sums_less() {
+        // The sign-only beta sums fewer triangles than the accurate one,
+        // while giving the same inside/outside on the closed test meshes
+        // away from the surface.
+        let mut rng = Lcg(37);
+        for (name, mut mesh) in [
+            ("cube", cube()),
+            ("icosphere", icosphere()),
+            ("torus", torus()),
+            ("tetrahedron", tetrahedron()),
+            ("star prism", star_prism()),
+        ] {
+            let bvh = build_bvh(&mesh);
+            let sign = SignData::build(&mut mesh, &bvh, SignMode::Winding).unwrap();
+            let diag = diagonal(&mesh);
+            let near = diag as f32 / 10.0;
+            let (mut full_tri, mut sign_tri, mut checked) = (0usize, 0usize, 0usize);
+            for p in sample_points(&mesh, &mut rng, 500, near) {
+                if brute_distance(&mesh, p) <= 0.01 * diag {
+                    continue;
+                }
+                let (w_full, n_full) = sign.moments.winding(&mesh, &bvh, p);
+                let (w_sign, n_sign) = sign.moments.sign_winding(&mesh, &bvh, p);
+                assert_eq!(
+                    w_sign >= 0.5,
+                    w_full >= 0.5,
+                    "{name} at {p:?}: sign {w_sign} vs full {w_full}"
+                );
+                full_tri += n_full;
+                sign_tri += n_sign;
+                checked += 1;
+            }
+            assert!(checked > 400, "{name}: only {checked} checked");
+            assert!(
+                sign_tri <= full_tri,
+                "{name}: sign summed {sign_tri}, full {full_tri}"
+            );
+        }
     }
 
     #[test]

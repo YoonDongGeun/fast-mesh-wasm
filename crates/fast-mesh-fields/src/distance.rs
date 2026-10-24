@@ -1,7 +1,7 @@
 //! Signed distances from points to a mesh.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_query::{ClosestHit, ClosestOptions, QueryError, closest_point};
+use fast_mesh_query::{ClosestHit, ClosestOptions, QueryError, closest_point, closest_point_many};
 use fast_mesh_store::{Mesh, par};
 
 use crate::{FieldsError, Result, SignData};
@@ -74,10 +74,27 @@ pub fn signed_distances(
             "sign data is not current for this mesh and BVH",
         ));
     }
-    let value = |p: [f32; 3]| point_value(mesh_b, bvh_b, sign, p, max_distance);
-    if points_in_b.len() < PAR_MIN_POINTS || !par::enabled() || par::force_sequential() {
-        for (&p, v) in points_in_b.iter().zip(out.iter_mut()) {
-            *v = value(p)?;
+    // The closest points, validated once per batch: `closest_point_many`
+    // checks its inputs a single time, where per-point `closest_point` calls
+    // revalidate the BVH on every point. The hits are identical either way.
+    let opts = ClosestOptions { max_distance };
+    let sequential =
+        points_in_b.len() < PAR_MIN_POINTS || !par::enabled() || par::force_sequential();
+    let mut hits: Vec<Option<ClosestHit>> = Vec::new();
+    hits.try_reserve_exact(points_in_b.len())
+        .map_err(|_| FieldsError::OutOfMemory)?;
+    hits.resize(points_in_b.len(), None);
+    if sequential {
+        par::set_force_sequential(true);
+    }
+    let found = closest_point_many(mesh_b, bvh_b, points_in_b, &opts, &mut hits);
+    if sequential {
+        par::set_force_sequential(false);
+    }
+    found?;
+    if sequential {
+        for ((&p, hit), v) in points_in_b.iter().zip(&hits).zip(out.iter_mut()) {
+            *v = hit_value(mesh_b, bvh_b, sign, p, hit.as_ref());
         }
         return Ok(());
     }
@@ -86,8 +103,14 @@ pub fn signed_distances(
     let parts = par::map_range(points_in_b.len(), POINT_CHUNK, PAR_MIN_POINTS, oom, |r| {
         let mut part = Vec::new();
         part.try_reserve_exact(r.len()).map_err(|_| oom())?;
-        for &p in &points_in_b[r] {
-            part.push(value(p)?);
+        for i in r {
+            part.push(hit_value(
+                mesh_b,
+                bvh_b,
+                sign,
+                points_in_b[i],
+                hits[i].as_ref(),
+            ));
         }
         Ok(part)
     })?;

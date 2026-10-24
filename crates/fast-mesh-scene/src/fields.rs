@@ -234,6 +234,10 @@ struct FieldJob {
     /// search (which usually costs the most) whose target's root box is
     /// within the margin of A's.
     work: usize,
+    /// A's near triangles from a shared pair query with the reciprocal
+    /// field (single-target, same `max_distance`, both needing a near set):
+    /// used instead of running a second query.
+    shared_near: Option<Vec<TriangleId>>,
 }
 
 impl FieldJob {
@@ -581,11 +585,11 @@ impl Scene {
     /// Lazy one is updated) and their sign data built here, so that
     /// [`Scene::field_status`] can report their topology at once.
     ///
-    /// Every edit of a target mesh rebuilds its sign data over the whole
-    /// mesh (O(n), about 150 ms at 1M triangles in pseudonormal mode, more
-    /// after a topology edit, which drops the cached adjacency); an
-    /// incremental refit is planned for Phase 5b. Placement changes and
-    /// edits of `desc.on` do not rebuild it.
+    /// A position-only edit of a target mesh refits its pseudonormal sign
+    /// data around the dirty vertices; any other edit rebuilds it over the
+    /// whole mesh (O(n), about 150 ms at 1M triangles, more after a topology
+    /// edit, which drops the cached adjacency). Placement changes and edits
+    /// of `desc.on` do not rebuild it.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `to` is
@@ -1673,6 +1677,7 @@ impl Scene {
                 Err(e) => outcomes.push(Err(e)),
             }
         }
+        self.share_pair_queries(&mut jobs)?;
         match self.compute_fields(&jobs) {
             Ok(plans) => {
                 for ((k, job), plan) in jobs.into_iter().zip(plans) {
@@ -1688,6 +1693,82 @@ impl Scene {
         outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
     }
 
+    /// Runs one pair query for each reciprocal pair of single-target fields
+    /// among `jobs` that both need a near set and share the same
+    /// `max_distance`, storing each side's near triangles in its job so that
+    /// [`Scene::pick_candidates`] runs no second query. With colouring on
+    /// both sides, A→B and B→A would otherwise each run `triangles_near`
+    /// and throw away the other half; one query roughly halves the
+    /// two-sided drag cost.
+    fn share_pair_queries(&self, jobs: &mut [(usize, FieldJob)]) -> Result<()> {
+        use std::collections::HashMap;
+        let mut groups: HashMap<(MeshId, MeshId), Vec<usize>> = HashMap::new();
+        for (j, (_, job)) in jobs.iter().enumerate() {
+            if job.full || job.shared_near.is_some() {
+                continue;
+            }
+            let f = &self.fields[job.i];
+            if f.desc.to.len() != 1 || job.near_margins.len() != 1 {
+                continue;
+            }
+            if job.near_margins[0].is_none() {
+                continue;
+            }
+            let (a, b) = (f.desc.on, f.desc.to[0]);
+            let key = if a < b { (a, b) } else { (b, a) };
+            groups.entry(key).or_default().push(j);
+        }
+        for js in groups.into_values() {
+            let mut used = vec![false; js.len()];
+            for (x, &jx) in js.iter().enumerate() {
+                if used[x] {
+                    continue;
+                }
+                let fx = &self.fields[jobs[jx].1.i];
+                for (y, &jy) in js.iter().enumerate().skip(x + 1) {
+                    if used[y] {
+                        continue;
+                    }
+                    let fy = &self.fields[jobs[jy].1.i];
+                    if fx.desc.on != fy.desc.to[0] || fx.desc.to[0] != fy.desc.on {
+                        continue;
+                    }
+                    if fx.desc.max_distance != fy.desc.max_distance {
+                        continue;
+                    }
+                    let (Some(m1), Some(m2)) =
+                        (jobs[jx].1.near_margins[0], jobs[jy].1.near_margins[0])
+                    else {
+                        continue;
+                    };
+                    let margin = m1.max(m2);
+                    let ea = self.entry(fx.desc.on)?;
+                    let eb = self.entry(fx.desc.to[0])?;
+                    let mut near_a = Vec::new();
+                    let mut near_b = Vec::new();
+                    fast_mesh_query::triangles_near(
+                        &ea.mesh,
+                        &ea.bvh,
+                        &eb.mesh,
+                        &eb.bvh,
+                        &jobs[jx].1.b_to_a[0],
+                        round_up(margin),
+                        &mut near_a,
+                        &mut near_b,
+                    )?;
+                    jobs[jx].1.shared_near = Some(near_a);
+                    jobs[jy].1.shared_near = Some(near_b);
+                    #[cfg(test)]
+                    counter::add_shared();
+                    used[x] = true;
+                    used[y] = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Brings what field `i` reads up to date, the part of an update that
     /// needs the meshes mutably: its BVHs (the targets' always, A's when a
     /// near set is needed) and the targets' sign data. Then decides what the
@@ -1701,14 +1782,30 @@ impl Scene {
                 .entries
                 .get_mut(f.desc.to[k])
                 .ok_or(SceneError::UnknownMesh)?;
-            if !f.sign[k]
+            if f.sign[k]
                 .as_ref()
                 .is_some_and(|s| s.is_current(&eb.mesh, &eb.bvh))
             {
+                f.sign_builds[k] = None;
+                continue;
+            }
+            // A position-only edit refits around the dirty vertices; anything
+            // else rebuilds over the whole mesh.
+            let id = f.id;
+            let refitted = match (&mut f.sign[k], eb.hook(id).and_then(|h| h.changes.as_ref())) {
+                (Some(s), Some(changes)) => s.try_refit(&eb.mesh, &eb.bvh, changes)?,
+                _ => false,
+            };
+            if !refitted {
+                let f = &mut self.fields[i];
+                let eb = self
+                    .entries
+                    .get_mut(f.desc.to[k])
+                    .ok_or(SceneError::UnknownMesh)?;
                 f.sign[k] = Some(SignData::build(&mut eb.mesh, &eb.bvh, mode)?);
             }
             // Current now: an unfinished build of it is of no use.
-            f.sign_builds[k] = None;
+            self.fields[i].sign_builds[k] = None;
         }
         Ok(job)
     }
@@ -1798,6 +1895,7 @@ impl Scene {
             b_to_a,
             near_limit: near_pair_limit(ma.vertex_slots()),
             work,
+            shared_near: None,
         })
     }
 
@@ -1837,6 +1935,11 @@ impl Scene {
         let ea = self.entry(f.desc.on)?;
         let ma = &ea.mesh;
 
+        // A shared pair query with the reciprocal field already found A's
+        // near triangles: no search here.
+        if let Some(shared) = &job.shared_near {
+            return self.assemble_pick(job, shared, job.full, false);
+        }
         // A's triangles near each moved target, as `Scene::triangles_near`
         // (with the BVHs `prepare_field` brought up to date), unless one
         // search finds too many pairs: then every vertex is recomputed.
@@ -2141,6 +2244,17 @@ pub(crate) mod counter {
         static ABORTED: Cell<usize> = const { Cell::new(0) };
         static FAILING: Cell<Option<super::FieldId>> = const { Cell::new(None) };
         static SIGN_STEPS: Cell<usize> = const { Cell::new(0) };
+        static SHARED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts one shared pair query between reciprocal fields.
+    pub(crate) fn add_shared() {
+        SHARED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Shared pair queries on this thread since the last call.
+    pub(crate) fn take_shared() -> usize {
+        SHARED.with(|c| c.replace(0))
     }
 
     /// Counts one step of a stepped sign data build.
@@ -3022,6 +3136,29 @@ mod tests {
         assert!(counter::take() >= 3721);
         assert_matches(&mut scene, g);
         assert!(scene.field_values(g).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn reciprocal_fields_share_one_pair_query() {
+        // Two-sided colouring with the same max_distance: one shared pair
+        // query per pose, same values as separate queries.
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(sheet(20, 0.05), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.2, 0.2, -0.05], 0.2), MeshOptions::default())
+            .unwrap();
+        let fa = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let fb = scene.add_distance_field(field("d", b, a, 0.1)).unwrap();
+        scene.update_fields().unwrap();
+        scene.take_changes();
+        counter::take_shared();
+        scene.set_placement(b, at(0.01, 0.005, 0.0)).unwrap();
+        scene.update_fields().unwrap();
+        assert_eq!(counter::take_shared(), 1);
+        assert_matches(&mut scene, fa);
+        assert_matches(&mut scene, fb);
     }
 
     /// Six sheets of `n` x `n` cells in `mode`, stacked `gap` apart, with a
