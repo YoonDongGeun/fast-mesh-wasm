@@ -393,6 +393,171 @@ mod tests {
         par::set_force_sequential(false);
     }
 
+    /// Checks `targets` against the reference on `points`, for every order in
+    /// `orders` and every `max_distance` in `mds`, and returns how many
+    /// targets were pruned in all (counted on this thread).
+    fn check_orders(
+        targets: &[Target<'_>],
+        points: &[[f32; 3]],
+        orders: &[&[usize]],
+        mds: &[f64],
+        what: &str,
+    ) -> usize {
+        let mut skipped = 0;
+        for order in orders {
+            let picked: Vec<Target<'_>> = order.iter().map(|&k| targets[k]).collect();
+            for &md in mds {
+                pruned::take();
+                let (got, at) = run(&picked, points, md);
+                skipped += pruned::take();
+                let (want, want_at) = reference(&picked, points, md);
+                assert_eq!(bits(&got), bits(&want), "{what} {order:?} {md}");
+                assert_eq!(at, want_at, "{what} {order:?} {md}");
+            }
+        }
+        skipped
+    }
+
+    /// The measured terrain's vertices, then points on and near it.
+    fn terrain_points(measured: &Mesh) -> Vec<[f32; 3]> {
+        let mut rng = Lcg(17);
+        let mut points = measured.positions().to_vec();
+        for i in 0..2000 {
+            let s = surface_point(measured, &mut rng);
+            let near = if i % 2 == 0 { 0.0 } else { 0.4 };
+            let d = rng.point([-near; 3], [near; 3]);
+            points.push(std::array::from_fn(|k| s[k] + d[k]));
+        }
+        points
+    }
+
+    #[test]
+    fn matches_on_penetrating_terrain() {
+        // The skips counted below happen on this thread.
+        par::set_force_sequential(true);
+        // The measured surface: a terrain over [0, 12]², its vertices and
+        // points around it. The targets cut through it, so their signs at
+        // the points flip from one side of each crossing to the other.
+        let measured = terrain(24);
+        let measured = mesh(
+            &measured
+                .positions()
+                .iter()
+                .map(|p| [p[0] * 0.5, p[1] * 0.5, p[2]])
+                .collect::<Vec<_>>(),
+            measured.triangles(),
+        );
+        let points = terrain_points(&measured);
+        let mut meshes = [terrain(12), terrain(12), cube(), icosphere(), torus()];
+        let places = [
+            // A terrain tilted across the measured one.
+            turned(0, 8.0, [0.0, 0.0, -0.6]),
+            // The same terrain turned a quarter about z: its ridges cross.
+            turned(2, 90.0, [12.0, 0.0, 0.2]),
+            // Closed shapes straddling the measured surface.
+            turned(2, 30.0, [4.0, 4.0, 0.1]),
+            turned(0, 20.0, [8.0, 6.0, -0.2]),
+            // Standing up, so the sheet passes through its hole.
+            turned(0, 90.0, [6.0, 9.5, 0.0]),
+        ];
+        let bvhs: Vec<Bvh> = meshes.iter_mut().map(|m| build_bvh(m)).collect();
+        let orders: [&[usize]; 4] = [
+            &[0, 1, 2, 3, 4],
+            &[2, 0, 3, 1, 4],
+            &[4, 3, 2, 1, 0],
+            &[1, 0],
+        ];
+        for mode in [SignMode::Pseudonormal, SignMode::Winding, SignMode::Auto] {
+            let signs: Vec<SignData> = meshes
+                .iter_mut()
+                .zip(&bvhs)
+                .map(|(m, b)| SignData::build(m, b, mode).unwrap())
+                .collect();
+            let targets: Vec<Target<'_>> = (0..meshes.len())
+                .map(|k| Target {
+                    mesh: &meshes[k],
+                    bvh: &bvhs[k],
+                    sign: &signs[k],
+                    to_local: places[k].inverse(),
+                })
+                .collect();
+            let mds = [f64::INFINITY, 0.4];
+            let skipped = check_orders(&targets, &points, &orders, &mds, &format!("{mode:?}"));
+            assert!(skipped > 0, "{mode:?}: nothing pruned");
+            // Each target is penetrated at some points and not at others.
+            for t in &targets {
+                let (v, _) = run(&[*t], &points, f64::INFINITY);
+                assert!(v.iter().any(|&x| x < 0.0), "{mode:?}: no negative");
+                assert!(v.iter().any(|&x| x > 0.0), "{mode:?}: no positive");
+            }
+        }
+        par::set_force_sequential(false);
+    }
+
+    /// `m` with every `every`-th triangle (from the first) turned over.
+    fn flip_some(m: &Mesh, every: usize) -> Mesh {
+        let mut t = m.triangles().to_vec();
+        for tri in t.iter_mut().step_by(every) {
+            tri.swap(1, 2);
+        }
+        mesh(m.positions(), &t)
+    }
+
+    #[test]
+    fn matches_with_winding_targets() {
+        // The skips counted below happen on this thread.
+        par::set_force_sequential(true);
+        let mut s = setup();
+        // Closed but inconsistently oriented: `Auto` resolves these to
+        // winding signs, while the other targets keep pseudonormals.
+        s.meshes.push(flip_some(&cube(), 12));
+        s.meshes.push(flip_some(&icosphere(), 7));
+        s.meshes.push(flip_some(&torus(), 5));
+        s.places.push(turned(1, 15.0, [-0.2, 0.6, -0.5]));
+        s.places.push(turned(2, -25.0, [0.8, -0.3, 0.6]));
+        s.places.push(turned(0, 60.0, [0.4, 0.5, -0.3]));
+        s.bvhs = s.meshes.iter_mut().map(|m| build_bvh(m)).collect();
+        let signs = signs(&mut s, SignMode::Auto);
+        let modes: Vec<SignMode> = signs.iter().map(SignData::mode).collect();
+        use SignMode::{Pseudonormal as P, Winding as W};
+        assert_eq!(modes, [P, P, P, P, W, W, W]);
+        let all = targets(&s, &signs, &[0, 1, 2, 3, 4, 5, 6]);
+        let orders: [&[usize]; 5] = [
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[4, 5, 6, 0, 1, 2, 3],
+            &[6, 3, 5, 0, 4],
+            &[4, 5, 6],
+            &[1, 5],
+        ];
+        let mds = [f64::INFINITY, 0.3];
+        let skipped = check_orders(&all, &s.points, &orders, &mds, "auto");
+        assert!(skipped > 0, "nothing pruned");
+        // Each winding target is penetrated at some points.
+        for t in &all[4..] {
+            let (v, _) = run(&[*t], &s.points, f64::INFINITY);
+            assert!(v.iter().any(|&x| x < 0.0) && v.iter().any(|&x| x > 0.0));
+        }
+
+        // Where every value is positive only the winding branch can prune
+        // (a pseudonormal target after a positive best is searched in full):
+        // a winding target after a pseudonormal one, at points outside both.
+        for (first, then) in [(1, 5), (0, 4), (2, 6)] {
+            let pair = [all[first], all[then]];
+            let (v, _) = run(&pair, &s.points, f64::INFINITY);
+            let outside: Vec<[f32; 3]> = s
+                .points
+                .iter()
+                .zip(&v)
+                .filter(|(_, x)| **x > 0.0)
+                .map(|(&p, _)| p)
+                .collect();
+            assert!(!outside.is_empty());
+            let skipped = check_orders(&pair, &outside, &[&[0, 1]], &mds, "outside");
+            assert!(skipped > 0, "{first} then {then}: nothing pruned");
+        }
+        par::set_force_sequential(false);
+    }
+
     #[test]
     fn ties_go_to_the_lowest_index() {
         let mut s = setup();
