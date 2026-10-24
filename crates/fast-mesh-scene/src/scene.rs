@@ -7,6 +7,7 @@ use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
+use crate::query::{CachedBox, ClosestCandidate, RayCandidate};
 use crate::report::Report;
 use crate::sections::{Section, SectionHook};
 use crate::{FieldId, MeshChanges, MeshId, Placement, Result, SceneError, SectionId, SubscriberId};
@@ -80,16 +81,21 @@ pub(crate) struct Entry {
     /// (see [`Scene::content_stamp`]): every such change is reported, and
     /// every report of one bumps it.
     pub(crate) content: u64,
+    /// The mesh's world box, cached across queries (see
+    /// [`CachedBox`](crate::query::CachedBox)).
+    pub(crate) wbox: Option<CachedBox>,
 }
 
 impl Entry {
     /// Marks the mesh as changed in unknown ways, after a failed recovery:
-    /// it is reported as fully changed, and the next BVH update rebuilds
-    /// from scratch even if the revision happens to match. The caller then
-    /// calls [`Entry::after_change`], which rebuilds an Eager BVH right away.
+    /// it is reported as fully changed, drops its cached world box, and the
+    /// next BVH update rebuilds from scratch even if the revision happens to
+    /// match. The caller then calls [`Entry::after_change`], which rebuilds
+    /// an Eager BVH right away.
     pub(crate) fn flag_unknown(&mut self) {
         self.pending = Some(ChangeSet::default());
         self.rebuild = true;
+        self.wbox = None;
         self.report_everything();
     }
 
@@ -348,6 +354,11 @@ pub struct Scene {
     pub(crate) defer_fields: bool,
     /// The open field step unit (see [`Scene::field_step`]).
     pub(crate) field_unit: Option<FieldUnit>,
+    /// Reusable broadphase buffers for [`Scene::raycast`] and
+    /// [`Scene::closest_point`]: each call takes its own out and puts it
+    /// back cleared, so queries after the first do not allocate.
+    pub(crate) order_ray: Vec<RayCandidate>,
+    pub(crate) order_closest: Vec<ClosestCandidate>,
     /// Test-only count of section entry recomputes.
     #[cfg(test)]
     pub(crate) section_recomputes: usize,
@@ -374,12 +385,14 @@ impl Scene {
             next_section: 0,
             defer_fields: false,
             field_unit: None,
+            order_ray: Vec::new(),
+            order_closest: Vec::new(),
             #[cfg(test)]
             section_recomputes: 0,
         }
     }
 
-    fn entry_mut(&mut self, id: MeshId) -> Result<&mut Entry> {
+    pub(crate) fn entry_mut(&mut self, id: MeshId) -> Result<&mut Entry> {
         self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)
     }
 
@@ -444,6 +457,7 @@ impl Scene {
             coloring: None,
             normals: None,
             content: 0,
+            wbox: None,
         })
     }
 
@@ -1039,17 +1053,19 @@ impl Scene {
     /// [`SceneError::StaleBvh`].
     pub(crate) fn prepare(&mut self, only: Option<&[MeshId]>) -> Result<()> {
         let wanted = |id: MeshId| only.is_none_or(|ids| ids.contains(&id));
+        let mut stale = None;
         for (id, entry) in self.entries.iter_mut() {
-            if wanted(id) && entry.mode != UpdateMode::Manual {
+            if !wanted(id) {
+                continue;
+            }
+            if entry.mode != UpdateMode::Manual {
                 entry.update_bvh()?;
+            } else if stale.is_none() && !entry.is_current() {
+                stale = Some(id);
             }
         }
-        match self
-            .entries
-            .iter()
-            .find(|(id, e)| wanted(*id) && e.mode == UpdateMode::Manual && !e.is_current())
-        {
-            Some((id, _)) => Err(SceneError::StaleBvh(id)),
+        match stale {
+            Some(id) => Err(SceneError::StaleBvh(id)),
             None => Ok(()),
         }
     }
@@ -1933,6 +1949,17 @@ mod tests {
         assert!(ch[0].changes.is_none());
         assert!(!scene.can_undo() && !scene.can_redo());
         assert_eq!(scene.history.bytes(), 0);
+        // The failed step's meshes dropped their cached world boxes; the
+        // next query repopulates them.
+        assert!(scene.entries.get(a).unwrap().wbox.is_none());
+        scene
+            .raycast(
+                [0.0, 0.0, 5.0],
+                [0.0, 0.0, -1.0],
+                &crate::SceneRayOptions::default(),
+            )
+            .unwrap();
+        assert!(scene.entries.get(a).unwrap().wbox.is_some());
         lift(&mut scene, a, 2, 1.0);
         assert_eq!(scene.undo(), Ok(true));
         assert_eq!(z(&scene, a, 2), 0.0);

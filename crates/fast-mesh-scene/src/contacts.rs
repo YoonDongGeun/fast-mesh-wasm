@@ -3,7 +3,7 @@
 use fast_mesh_store::{StoreError, TriangleId};
 
 use crate::placement::relative_rigid;
-use crate::query::{Aabb64, MARGIN, check_bound, pair_pad, round_up, try_vec, world_box};
+use crate::query::{Aabb64, MARGIN, cached_world_box, check_bound, pair_pad, round_up, try_vec};
 use crate::{MeshId, Result, Scene, SceneError};
 
 /// Two meshes within the margin of [`Scene::find_contacts`].
@@ -114,7 +114,7 @@ impl Scene {
         };
         let mut boxes = try_vec(ids.len())?;
         for &id in &ids {
-            boxes.push(world_box(self.entry(id)?));
+            boxes.push(cached_world_box(self.entry_mut(id)?).0);
         }
         let start = out.len();
         match pairs {
@@ -202,6 +202,7 @@ mod tests {
     use super::*;
     use crate::placement::relative_rigid;
     use crate::query::tests::{RX90, RZ90, cube, place};
+    use crate::query::world_box;
     use crate::{MeshOptions, Placement, SceneOptions, UpdateMode};
 
     /// Every pair `a < b` by calling Phase 3b directly.

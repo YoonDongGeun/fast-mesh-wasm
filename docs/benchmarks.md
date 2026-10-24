@@ -146,6 +146,24 @@ The two 64-pose benchmarks run all 64 poses in each iteration, so every sample c
 - **`set_placement` meets the target, and `mesh_distance` meets it over the poses.** The spec's target (§13) is below 5% overhead, and it is not a merge gate. A pair query costs the scene one relative transform per call and a placement change touches no BVH. The fixed-pose rows differ by 1% to 7% between runs and the 64-pose pair by 0.6%.
 - **`raycast` does not meet it on a 1 µs query.** The scene adds about 0.3 µs per ray. Its work per ray is fixed (normalising the direction, mapping the ray into each mesh's local space in `f64`, the padded world-box test, a small ordering vector, and mapping the hit back), so it shows on a query this short; it was not profiled further. A second mesh adds about 0.14 µs.
 
+### Raycast overhead after #27 (2026-10-24)
+
+Re-measured after the per-ray overhead work (issue #27): the ordering vector is reused across `raycast`/`closest_point` calls instead of allocated per call (and no longer sorted for a single candidate), each mesh's world box and local magnitude are cached across queries (keyed by mesh revision, origin and placement), and `prepare` runs in one pass. The padded-box maths per ray is unchanged, and the property tests still pass. Same machine and toolchain as the table above; other agents were building and benchmarking on the machine during every run, so absolute numbers swing by about ±15% between runs: compare direct against scene only within one run.
+
+Criterion medians per ray (100,000 rays per batch, as above), before and after, two runs each:
+
+| | Direct (Phase 3) | Scene of 1 mesh | Overhead |
+| --- | --- | --- | --- |
+| Before, run 1 | 1.39 µs | 1.62 µs | +0.23 µs (+16%) |
+| Before, run 2 | 1.43 µs | 1.52 µs | +0.09 µs (+6%) |
+| After, run 1 | 1.30 µs | 1.47 µs | +0.16 µs (+13%) |
+| After, run 2 | 1.49 µs | 1.59 µs | +0.10 µs (+7%) |
+
+The run-to-run swing hides the change, so the delta was also measured interleaved: 12 rounds alternating direct and scene batches of the same 100,000 rays, which side first alternating each round. Median deltas: +0.20 µs before, +0.11 µs and +0.09 µs after (two runs).
+
+- **The per-ray overhead roughly halved**, from about +0.20 µs to about +0.10 µs: about +9% on a ~1.1 µs query in the interleaved runs' machine state. The 5% target is still not met, and it is still not a merge gate. What is left per ray is the direction normalisation, the `f64` local mapping and the padded-box maths. A lazy pad (computed only when the unpadded box test is close) was considered and left out: the padded entry distance feeds the candidate order and the early break, so deferring it would need a different break rule, with an unmeasured cost to many-mesh scenes.
+- **A second mesh adds about the same as before** (criterion medians: 1.78 and 1.63 µs before, 1.62 and 1.90 µs after, against the 1-mesh medians above; the last one caught a slow spell).
+
 ### `find_contacts`
 
 Meshes of 2,048 triangles in a row, each moved 30 units along x, so every mesh overlaps its neighbours and nothing else (side 32). Margin 0.5, no filter.
