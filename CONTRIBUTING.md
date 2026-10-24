@@ -25,7 +25,7 @@ scripts/                 Cross-platform build and test scripts (Node.js, no bash
 
 You need:
 
-- [Rust](https://rustup.rs). The exact toolchain and the `wasm32-unknown-unknown` target are installed automatically from `rust-toolchain.toml`.
+- [Rust](https://rustup.rs). The exact toolchain and the `wasm32-unknown-unknown` target are installed automatically from `rust-toolchain.toml`. The workspace supports Rust 1.88 and newer (`rust-version` in the root `Cargo.toml`); CI checks the minimum version with a dedicated MSRV job, so avoid APIs newer than 1.88.
 - `wasm-bindgen-cli`, the same version as the `wasm-bindgen` crate in the root `Cargo.toml`:
   ```sh
   cargo install wasm-bindgen-cli --version =0.2.129 --locked
