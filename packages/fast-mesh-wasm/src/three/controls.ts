@@ -6,7 +6,7 @@ import type { Quat, Vec3 } from "../api.js";
 import { FastMeshError } from "../core.js";
 import type { DragSession } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
-import type { MeshBinding } from "./mesh.js";
+import { checkUntransformedParent, type MeshBinding } from "./mesh.js";
 
 /**
  * What {@link attachTransformControls} needs of a TransformControls: its
@@ -78,7 +78,8 @@ function rotate(q: Quat, v: Readonly<Vec3>): Vec3 {
  *
  * Placements are rigid: TransformControls' scale mode has no effect (the
  * object's scale is kept at 1). The object must be a direct child of an
- * untransformed parent (its matrix is a world matrix), as for `bindMesh`.
+ * untransformed parent (its matrix is a world matrix), as for `bindMesh`;
+ * a transformed ancestor is detected and warned about once.
  *
  * The object's `position`, `quaternion` and `scale` are kept in step with its
  * matrix (TransformControls reads them when a drag starts), so call this
@@ -242,6 +243,8 @@ export function attachTransformControls(
     if (live() === undefined || controls.object !== object) {
       return;
     }
+    // The pose read below is a world pose only under untransformed parents.
+    checkUntransformedParent(object);
     // Rigid placements only: undo scale mode.
     object.scale.set(1, 1, 1);
     // The object shows the gizmo's pose right away (matrixAutoUpdate is off).
@@ -282,6 +285,7 @@ export function attachTransformControls(
   controls.addEventListener("dragging-changed", onDraggingChanged);
   controls.addEventListener("objectChange", onObjectChange);
   syncFromScene();
+  checkUntransformedParent(object);
 
   return () => {
     if (!attached) {

@@ -353,7 +353,10 @@ describe("attachTransformControls", () => {
   it("real_transform_controls_fire_dragging_changed", () => {
     // Three's TransformControls reports `dragging` through the same event.
     const { s, bound } = setup();
-    const tc = new TransformControls(new THREE.PerspectiveCamera());
+    // three@0.160 requires a domElement (it defaults to `document`); a stub
+    // suffices, since the test drives events by hand.
+    const domElement = { style: {}, addEventListener() {}, removeEventListener() {} } as unknown as HTMLElement;
+    const tc = new TransformControls(new THREE.PerspectiveCamera(), domElement);
     tc.attach(bound.object);
     const detach = attachTransformControls(tc, s, bound, { schedule: (f) => f() });
     tc.dragging = true;
@@ -363,5 +366,18 @@ describe("attachTransformControls", () => {
     expectClose(bound.object.position.toArray(), [1, 1, 1]);
     expect(s.canUndo()).toBe(true);
     detach();
+  });
+
+  it("transformed_parent_warns", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { s, bound, controls, detach } = setup();
+    detach();
+    const group = new THREE.Group();
+    group.position.set(1, 2, 3);
+    group.add(bound.object);
+    const off = attachTransformControls(controls, s, bound, { schedule: (f) => f() });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/transformed ancestor/);
+    off();
   });
 });

@@ -182,6 +182,13 @@ type BufferKey = keyof typeof BUFFERS;
  * the scene and leaves the object as it was (remove it from your THREE.Scene
  * and call {@link BoundMesh.dispose}).
  *
+ * The object must sit under an untransformed parent (its `matrix` is a world
+ * matrix); a transformed ancestor is detected and warned about once.
+ *
+ * With a debug scene (`new Scene({ debug: true })`), the views the binding
+ * copies from are checked `Proxy` objects (see `SceneOptions.debug` for
+ * their cost); the mirrors it uploads are always plain typed arrays.
+ *
  * The adapter only listens through {@link SceneLike.onChanges}: call
  * `scene.commitFrame()` once per animation frame, before rendering.
  */
@@ -338,16 +345,35 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     return true;
   };
 
-  /** Live triangles' vertices only: dead slots keep stale positions. */
+  /**
+   * Live triangles' vertices only: dead slots keep stale positions. From the
+   * scene's bounds when the host has them (one engine pass instead of two
+   * walks over every slot), else walked from the mirrors.
+   */
   const computeBounds = () => {
     const position = attributeOf("positions");
     const index = attributeOf("indices");
     if (position === undefined || index === undefined) {
       return;
     }
+    const box = (geometry.boundingBox ??= new THREE.Box3());
+    const sphere = (geometry.boundingSphere ??= new THREE.Sphere());
+    const fromScene = typeof scene.bounds === "function" ? scene.bounds(mesh) : undefined;
+    if (fromScene !== undefined) {
+      if (fromScene === null) {
+        // No live triangle: three's convention for an empty sphere.
+        box.makeEmpty();
+        sphere.set(new THREE.Vector3(), -1);
+        return;
+      }
+      box.min.fromArray(fromScene.min);
+      box.max.fromArray(fromScene.max);
+      box.getCenter(sphere.center);
+      sphere.radius = box.min.distanceTo(box.max) / 2;
+      return;
+    }
     const p = position.array as Float32Array;
     const t = index.array as Uint32Array;
-    const box = (geometry.boundingBox ??= new THREE.Box3());
     box.makeEmpty();
     const point = new THREE.Vector3();
     const live = (k: number) => t[k] !== 0 || t[k + 1] !== 0 || t[k + 2] !== 0;
@@ -358,7 +384,6 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
         }
       }
     }
-    const sphere = (geometry.boundingSphere ??= new THREE.Sphere());
     if (box.isEmpty()) {
       // No live triangle: three's convention for an empty sphere.
       sphere.set(new THREE.Vector3(), -1);
@@ -463,6 +488,7 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
   apply(undefined);
   computeBounds();
   updateMatrix();
+  checkUntransformedParent(object);
 
   let unsubscribe: (() => void) | undefined;
   const detach = () => {
@@ -470,6 +496,8 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     unsubscribe = undefined;
   };
   unsubscribe = scene.onChanges((changes) => {
+    // A parent may have moved with no change to this mesh.
+    checkUntransformedParent(object);
     for (const c of changes) {
       if (c.mesh !== mesh) {
         continue;
@@ -530,6 +558,51 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     bound.setOpacity(options.opacity);
   }
   return bound;
+}
+
+/** Objects already warned about a transformed ancestor. */
+const warnedParents = new WeakSet<object>();
+
+/** Whether the object's own transform is the identity. */
+function isIdentityTransform(o: THREE.Object3D): boolean {
+  if (!o.matrixAutoUpdate) {
+    // Column-major: the diagonal is elements 0, 5, 10, 15.
+    return o.matrix.elements.every((v, i) => v === (i % 5 === 0 ? 1 : 0));
+  }
+  const { position: p, quaternion: q, scale: s } = o;
+  return (
+    p.x === 0 &&
+    p.y === 0 &&
+    p.z === 0 &&
+    q.x === 0 &&
+    q.y === 0 &&
+    q.z === 0 &&
+    q.w === 1 &&
+    s.x === 1 &&
+    s.y === 1 &&
+    s.z === 1
+  );
+}
+
+/**
+ * Warns once per object when it sits under a transformed ancestor: the
+ * adapter drives its matrix as a world matrix, so a transformed parent
+ * offsets it. Internal: shared with the controls and section bindings.
+ */
+export function checkUntransformedParent(object: THREE.Object3D): void {
+  if (warnedParents.has(object)) {
+    return;
+  }
+  for (let p = object.parent; p !== null; p = p.parent) {
+    if (!isIdentityTransform(p)) {
+      warnedParents.add(object);
+      console.warn(
+        "fast-mesh-wasm/three: the bound object has a transformed ancestor; " +
+          "its matrix is driven as a world matrix, so add it under the scene or an untransformed group.",
+      );
+      return;
+    }
+  }
 }
 
 /** `INVALID_ARGUMENT` unless `width` is a finite number `>= 0`. */

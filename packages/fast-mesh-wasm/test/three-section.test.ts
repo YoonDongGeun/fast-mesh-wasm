@@ -1,7 +1,7 @@
 // bindSection in Node: clipping planes on the bound meshes' materials,
 // contour lines and fill following the scene's section results.
 import * as THREE from "three";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type MeshHandle, Scene, type SectionHandle, type Vec3 } from "../src/node.js";
 import { bindMesh, bindSection, type BoundSection } from "../src/three/index.js";
 
@@ -45,6 +45,7 @@ afterEach(() => {
     s.free();
   }
   scenes = [];
+  vi.restoreAllMocks();
 });
 
 function setup() {
@@ -221,6 +222,25 @@ describe("bindSection", () => {
     expect((bb.object.material as THREE.Material).clippingPlanes).toBeNull();
     bs.dispose();
     expect((bb.object.material as THREE.Material).clippingPlanes).toBeNull();
+    ba.dispose();
+    bb.dispose();
+  });
+
+  it("transformed_parent_warns_once", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { s, ba, bb, sec } = setup();
+    const bs = bindSection(s, sec, [ba, bb]);
+    const group = new THREE.Group();
+    group.add(bs.group);
+    s.commitFrame();
+    expect(warn).not.toHaveBeenCalled();
+    group.scale.set(2, 2, 2);
+    s.commitFrame();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/transformed ancestor/);
+    s.commitFrame();
+    expect(warn).toHaveBeenCalledTimes(1);
+    bs.dispose();
     ba.dispose();
     bb.dispose();
   });

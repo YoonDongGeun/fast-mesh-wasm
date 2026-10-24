@@ -234,6 +234,10 @@ function run(renderer: Renderer, scene: Scene | WorkerScene): void {
   };
   canvas.addEventListener("pointerup", endGesture);
   canvas.addEventListener("pointercancel", endGesture);
+  // The capture can be lost without either (the browser takes it, the pointer
+  // leaves the window): end the gesture the same way. It also fires after
+  // every pointerup that releases the capture, when there is nothing to end.
+  canvas.addEventListener("lostpointercapture", endGesture);
   canvas.addEventListener(
     "wheel",
     (e) => {
