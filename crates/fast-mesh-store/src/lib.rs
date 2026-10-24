@@ -28,7 +28,7 @@ pub use error::StoreError;
 pub use history::History;
 pub use incidence::{Incidence, IncidenceBuild};
 pub use mesh::Mesh;
-pub use patch::{ChangeSet, Patch, PatchSide};
+pub use patch::{ChangeSet, Patch, PatchSide, PatchState};
 pub use transaction::Transaction;
 
 /// Id of a vertex slot.

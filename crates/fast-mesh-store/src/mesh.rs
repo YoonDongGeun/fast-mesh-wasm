@@ -5,7 +5,7 @@ use crate::adjacency::Adjacency;
 use crate::channel::{Channel, ChannelDesc, ChannelKind};
 use crate::column::{Column, try_reserve, try_vec};
 use crate::incidence::Incidence;
-use crate::{Result, StoreError, TriangleId, VertexId};
+use crate::{Patch, PatchSide, PatchState, Result, StoreError, TriangleId, VertexId};
 
 static NEXT_MESH_UID: AtomicU64 = AtomicU64::new(1);
 
@@ -440,6 +440,35 @@ impl Mesh {
         }
     }
 
+    /// Returns the slots held by a [`Patch`] kept outside [`crate::History`] —
+    /// for example on an application's own undo stack or a scene-wide history —
+    /// to the free lists, applying the same rules the history uses internally:
+    /// [`PatchState::Applied`] releases the slots the patch removed,
+    /// [`PatchState::Undone`] the slots it created.
+    ///
+    /// Unlike [`Patch::release`], a patch from another mesh or from before a
+    /// [`Mesh::compact`] is an error ([`StoreError::PatchMismatch`] and
+    /// [`StoreError::StalePatch`], respectively), not a silent skip. Slots that
+    /// are alive — reused since the patch was made — are skipped.
+    ///
+    /// Release each patch at most once, and only once no history still holds it:
+    /// releasing twice, or releasing while a history still holds the patch,
+    /// lists a still-dead slot twice and corrupts slot reuse.
+    pub fn release_patch_slots(&mut self, patch: &Patch, state: PatchState) -> Result<()> {
+        if patch.mesh_uid != self.uid {
+            return Err(StoreError::PatchMismatch);
+        }
+        if patch.epoch != self.epoch {
+            return Err(StoreError::StalePatch);
+        }
+        let side = match state {
+            PatchState::Applied => PatchSide::Undoable,
+            PatchState::Undone => PatchSide::Redoable,
+        };
+        patch.release(self, side);
+        Ok(())
+    }
+
     /// Called by every topology write inside a transaction.
     pub(crate) fn on_topology_write(&mut self) {
         self.adjacency = None;
@@ -457,6 +486,7 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PatchState;
 
     fn quad() -> Mesh {
         Mesh::from_buffers(
@@ -612,5 +642,117 @@ mod tests {
     #[test]
     fn every_mesh_gets_a_distinct_uid() {
         assert_ne!(Mesh::new().uid(), Mesh::new().uid());
+    }
+
+    #[test]
+    fn release_patch_slots_follows_history_rules() {
+        let mut m = quad();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let removal = tx.commit().unwrap();
+        assert!(m.free_vertex_slots().is_empty(), "reserved by the patch");
+        // The wrong state releases nothing.
+        m.release_patch_slots(&removal, PatchState::Undone).unwrap();
+        assert!(m.free_vertex_slots().is_empty());
+        m.release_patch_slots(&removal, PatchState::Applied)
+            .unwrap();
+        assert_eq!(m.free_vertex_slots(), &[3]);
+        assert_eq!(m.free_triangle_slots(), &[1]);
+
+        let mut tx = m.begin_edit();
+        tx.add_vertices(&[[0.; 3]]).unwrap();
+        let creation = tx.commit().unwrap();
+        creation.revert(&mut m).unwrap();
+        assert!(m.free_vertex_slots().is_empty(), "reserved for redo");
+        m.release_patch_slots(&creation, PatchState::Applied)
+            .unwrap();
+        assert!(m.free_vertex_slots().is_empty());
+        m.release_patch_slots(&creation, PatchState::Undone)
+            .unwrap();
+        assert_eq!(m.free_vertex_slots(), &[3]);
+    }
+
+    #[test]
+    fn release_patch_slots_rejects_a_foreign_mesh() {
+        let mut m = quad();
+        let mut other = quad();
+        let mut tx = other.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let patch = tx.commit().unwrap();
+        assert_eq!(
+            m.release_patch_slots(&patch, PatchState::Applied).err(),
+            Some(StoreError::PatchMismatch)
+        );
+        assert!(m.free_vertex_slots().is_empty());
+        assert!(m.free_triangle_slots().is_empty());
+    }
+
+    #[test]
+    fn release_patch_slots_rejects_an_earlier_epoch() {
+        let mut m = quad();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let patch = tx.commit().unwrap();
+        m.compact().unwrap();
+        assert_eq!(
+            m.release_patch_slots(&patch, PatchState::Applied).err(),
+            Some(StoreError::StalePatch)
+        );
+        assert!(m.free_vertex_slots().is_empty());
+        assert!(m.free_triangle_slots().is_empty());
+    }
+
+    #[test]
+    fn release_patch_slots_skips_alive_slots() {
+        let mut m = quad();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let patch = tx.commit().unwrap();
+        m.release_patch_slots(&patch, PatchState::Applied).unwrap();
+        assert_eq!(m.free_vertex_slots(), &[3]);
+        // Reuse the slots, then release again: the alive slots are skipped, so
+        // a second release after reuse is a safe no-op.
+        let mut tx = m.begin_edit();
+        assert_eq!(tx.add_vertices(&[[0.; 3]]).unwrap(), vec![3]);
+        assert_eq!(tx.add_triangles(&[[0, 1, 2]]).unwrap(), vec![1]);
+        tx.commit().unwrap();
+        m.release_patch_slots(&patch, PatchState::Applied).unwrap();
+        assert!(m.free_vertex_slots().is_empty());
+        assert!(m.free_triangle_slots().is_empty());
+        let mut tx = m.begin_edit();
+        assert_eq!(tx.add_vertices(&[[0.; 3]]).unwrap(), vec![4]);
+        assert_eq!(tx.add_triangles(&[[0, 1, 2]]).unwrap(), vec![2]);
+        tx.rollback();
+    }
+
+    #[test]
+    fn release_patch_slots_with_history_holding_the_patch() {
+        use crate::History;
+        let mut m = quad();
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[1]).unwrap();
+        tx.remove_vertices(&[3]).unwrap();
+        let patch = tx.commit().unwrap();
+        let mut h = History::new(1 << 20);
+        h.push(&mut m, patch.clone()).unwrap();
+        // An external undo stack drops its copy first; the slots are reused, so
+        // when the history later releases the same patch its slots are alive
+        // and skipped: no duplicate free-list entries.
+        m.release_patch_slots(&patch, PatchState::Applied).unwrap();
+        let mut tx = m.begin_edit();
+        assert_eq!(tx.add_vertices(&[[0.; 3]]).unwrap(), vec![3]);
+        assert_eq!(tx.add_triangles(&[[0, 1, 2]]).unwrap(), vec![1]);
+        tx.commit().unwrap();
+        h.clear(&mut m).unwrap();
+        assert!(m.free_vertex_slots().is_empty());
+        assert!(m.free_triangle_slots().is_empty());
+        let mut tx = m.begin_edit();
+        assert_eq!(tx.add_vertices(&[[0.; 3]]).unwrap(), vec![4]);
+        assert_eq!(tx.add_triangles(&[[0, 1, 2]]).unwrap(), vec![2]);
+        tx.rollback();
     }
 }
