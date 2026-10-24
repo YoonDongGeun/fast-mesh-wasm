@@ -727,4 +727,28 @@ describe("Scene", () => {
     inner.end();
     expect(s.canUndo()).toBe(true);
   });
+
+  it("coalesced_drag_move_validates_pose_values", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    s.commitFrame();
+    const drag = s.drag(mesh, { coalesce: true });
+    // Non-finite values throw at move(), not at the frame...
+    expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [NaN, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(
+      codeOf(() => drag.move({ rotation: [1, 0, 0, 0, 1, 0, 0, 0, Infinity], translation: [0, 0, 0] })),
+    ).toBe("INVALID_ARGUMENT");
+    // ...as does a zero quaternion...
+    expect(codeOf(() => drag.move({ rotation: [0, 0, 0, 0], translation: [0, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(drag.active).toBe(true);
+    // ...while a non-rotation matrix still throws when applied.
+    drag.move({ rotation: [2, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0] });
+    expect(codeOf(() => s.commitFrame())).toBe("INVALID_ARGUMENT");
+    drag.cancel();
+    expect(s.canUndo()).toBe(false);
+  });
 });

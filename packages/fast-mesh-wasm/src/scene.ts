@@ -1532,11 +1532,16 @@ export class Scene implements SceneLike {
           this.setPlacement(mesh, placement);
           return;
         }
-        // Validate now, so a bad pose throws here and not at the frame.
+        // Validate the shape and the values now, so a bad pose throws here
+        // and not at the frame. Whether a matrix is a proper rotation is
+        // still checked when the pose is applied.
         const rotation = rotationMatrix(placement.rotation);
+        if (!rotation.every(Number.isFinite)) {
+          throw invalid("rotation must be finite numbers");
+        }
         const t = placement.translation;
-        if (t?.length !== 3) {
-          throw invalid("translation must be 3 numbers");
+        if (t?.length !== 3 || ![t[0], t[1], t[2]].every(Number.isFinite)) {
+          throw invalid("translation must be 3 finite numbers");
         }
         pending = { rotation, translation: [t[0], t[1], t[2]] };
       },
