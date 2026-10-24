@@ -45,23 +45,28 @@ export interface GroupReadouts {
   pairs: PairReadout[];
 }
 
-/** A live readout: the latest value, how often it was refreshed (and while the gizmo dragged), and whether it is current. */
+/**
+ * A live readout: the latest value, how often it was refreshed, how its
+ * queries met gizmo drags, and whether it is current.
+ */
 export interface LiveProbe<T> {
   readouts: T | null;
   updates: number;
-  updatesWhileDragging: number;
+  /** Readout queries started so far, and those started while the gizmo dragged (paused: none). */
+  starts: number;
+  startsWhileDragging: number;
+  /** Results that landed while the gizmo dragged, dropped (the drag's end refreshes). */
+  dropped: number;
+  /** Refreshes since the last drag ended. */
+  updatesAfterDrag: number;
   /** No change waits for a refresh and none runs: the readouts are those of the scene as it is. */
   settled: boolean;
+  /** Set by the test hook: a query's result waits for it before it lands (to land one mid-drag). */
+  hold: Promise<void> | null;
 }
 
 export const inspect: {
-  collision: {
-    readouts: Readouts | null;
-    /** Readout refreshes so far, and those that landed while the gizmo dragged. */
-    updates: number;
-    updatesWhileDragging: number;
-    /** No change waits for a refresh and none runs: the readouts are those of the scene as it is. */
-    settled: boolean;
+  collision: LiveProbe<Readouts> & {
     /**
      * Targets that are open (boundary loops, open chains or open components)
      * or inconsistently oriented (orientation conflicts), from `analyze` of
@@ -83,8 +88,12 @@ export const inspect: {
     busy: string | null;
   };
 } = {
-  collision: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true, warnings: [] },
-  group: { readouts: null, updates: 0, updatesWhileDragging: 0, settled: true, warnings: [] },
+  collision: { ...liveProbe(), warnings: [] },
+  group: { ...liveProbe(), warnings: [] },
   hover: null,
   repair: { analysis: null, analyses: 0, report: null, busy: null },
 };
+
+function liveProbe(): LiveProbe<never> {
+  return { readouts: null, updates: 0, starts: 0, startsWhileDragging: 0, dropped: 0, updatesAfterDrag: 0, settled: true, hold: null };
+}

@@ -78,7 +78,14 @@ export function useLiveReadouts<T>(
       probe.settled = false;
       last = performance.now();
       Promise.resolve()
-        .then(() => live.current.query())
+        .then(() => {
+          probe.starts++;
+          if (view.dragging) {
+            probe.startsWhileDragging++;
+          }
+          return live.current.query();
+        })
+        .then((r) => (probe.hold === null ? r : probe.hold.then(() => r)))
         .then(
           (r) => {
             if (!alive) {
@@ -88,11 +95,13 @@ export function useLiveReadouts<T>(
               // Started before the drag: it describes the pre-drag pose.
               // Drop it; the drag's end refreshes.
               dirty = true;
+              probe.dropped++;
               return;
             }
             setReadouts(r);
             probe.readouts = r;
             probe.updates++;
+            probe.updatesAfterDrag++;
           },
           () => {
             // A mesh removed (or the scene restarted) mid-query: skip this refresh.
@@ -118,6 +127,7 @@ export function useLiveReadouts<T>(
     });
     const onDrag = (dragging: boolean) => {
       if (!dragging) {
+        probe.updatesAfterDrag = 0;
         kick();
       }
     };
