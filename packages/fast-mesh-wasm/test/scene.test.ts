@@ -698,4 +698,33 @@ describe("Scene", () => {
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
     expect(s.canUndo()).toBe(false);
   });
+
+  it("coalesced_drag_manual_end_step_keeps_pending_pose", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    s.commitFrame();
+    // A coalesced move with no frame yet: the caller's endStep lands it in
+    // the closing step, like a non-coalesced move, instead of dropping it.
+    const drag = s.drag(mesh, { coalesce: true });
+    drag.move({ rotation: IDENTITY, translation: [3, 0, 0] });
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    s.endStep();
+    expect(drag.active).toBe(false);
+    expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
+    expect(s.canUndo()).toBe(true);
+    s.undo();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    expect(s.canUndo()).toBe(false);
+    // Closing a step opened inside the drag keeps the pose pending instead.
+    const inner = s.drag(mesh, { coalesce: true });
+    inner.move({ rotation: IDENTITY, translation: [5, 0, 0] });
+    s.beginStep();
+    s.endStep();
+    expect(inner.active).toBe(true);
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    s.commitFrame();
+    expect(s.placement(mesh).translation).toEqual([5, 0, 0]);
+    inner.end();
+    expect(s.canUndo()).toBe(true);
+  });
 });

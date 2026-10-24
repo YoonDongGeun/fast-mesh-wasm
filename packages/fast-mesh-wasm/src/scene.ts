@@ -77,6 +77,8 @@ export interface MeshChange {
  * The drag is over once it is ended or cancelled, and also when its step goes
  * away without it: an `undo()`, `redo()`, `clearHistory()` or `removeMesh()` of
  * the dragged mesh ends it first, and a `cancelStep()` (or an `endStep()` that closes the drag's step) abandons it.
+ * An `endStep()` lands a pending coalesced pose in the closing step first; a
+ * `cancelStep()` drops it with the step.
  */
 export interface DragSession {
   /**
@@ -1452,6 +1454,12 @@ export class Scene implements SceneLike {
   /** Ends one nesting level of the open step. Throws `STEP_NOT_OPEN` when none is open. */
   endStep(): void {
     const s = this.#scene();
+    const drag = this.#drag;
+    if (drag !== undefined && this.#stepDepth > 0 && this.#stepDepth <= drag.depth) {
+      // The caller is closing the drag's step with a coalesced pose still
+      // pending: land it in the closing step, as a non-coalesced move would.
+      drag.applyPending();
+    }
     call(() => s.end_step());
     this.#stepDepth--;
     // The caller closed the drag's step themselves.
