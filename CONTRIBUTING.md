@@ -86,7 +86,7 @@ Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work 
 
 ### Property tests
 
-The workspace's property suites honor the `PROPTEST_CASES` environment variable, defaulting to a short run. For a longer pass over the store before pushing a storage change:
+Most of the workspace's property suites honor the `PROPTEST_CASES` environment variable, defaulting to a short run (the bvh suite still uses a fixed case count). For a longer pass over the store before pushing a storage change:
 
 ```sh
 PROPTEST_CASES=3000 cargo test -p fast-mesh-store --release --test properties
