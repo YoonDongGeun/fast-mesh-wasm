@@ -114,8 +114,16 @@ impl NormalState {
     /// returns their vertex ids, ascending without duplicates: every vertex
     /// of every triangle added, removed or rewritten (old and new
     /// vertices), and every vertex of every triangle using a moved vertex.
-    /// Added, removed and moved vertices are included too.
-    fn compute_changed(&mut self, mesh: &mut Mesh, c: &ChangeSet) -> Result<Vec<VertexId>> {
+    /// Added, removed and moved vertices are included too. Past half the
+    /// vertex slots dirty, the collection alone (about 18 ids per moved
+    /// vertex) costs more than a full recomputation, so it recomputes
+    /// everything instead and returns `None`.
+    fn compute_changed(&mut self, mesh: &mut Mesh, c: &ChangeSet) -> Result<Option<Vec<VertexId>>> {
+        let total = c.vertices_moved.len() + c.vertices_added.len() + c.vertices_removed.len();
+        if total > mesh.vertex_slots() / 2 {
+            self.compute_all(mesh)?;
+            return Ok(None);
+        }
         // Every allocation comes first, so a failure leaves the state as it was.
         mesh.ensure_incidence()?;
         let (slots, tri_slots) = (mesh.vertex_slots(), mesh.triangle_slots());
@@ -175,7 +183,7 @@ impl NormalState {
             }
         }
         self.pending = Some(ChangeSet::default());
-        Ok(dirty)
+        Ok(Some(dirty))
     }
 }
 
@@ -350,7 +358,7 @@ impl Entry {
                 ns.pending = Some(c);
             }
             Some(c) => match ns.compute_changed(&mut self.mesh, &c) {
-                Ok(dirty) => self.report_normals(Some(&dirty)),
+                Ok(dirty) => self.report_normals(dirty.as_deref()),
                 Err(e) => {
                     ns.pending = Some(c);
                     return Err(e);
@@ -729,6 +737,34 @@ mod tests {
         // Switching to Eager catches up at once.
         move_by(&mut scene, id, 30, [0.2, 0.0, 0.0]);
         scene.set_mode(id, UpdateMode::Eager).unwrap();
+        assert_matches(&scene, id);
+    }
+
+    #[test]
+    fn dense_normals_recompute_all_and_report_all() {
+        let (mut scene, id) = scene_with(UpdateMode::Eager);
+        scene.set_normals(id, true).unwrap();
+        scene.take_changes();
+        // Move every vertex: past half dirty, so the normals are recomputed
+        // in full and reported as all, skipping the dirty sort.
+        let mesh = scene.mesh(id).unwrap();
+        let all: Vec<VertexId> = (0..mesh.vertex_slots() as VertexId)
+            .filter(|&v| mesh.is_vertex_alive(v))
+            .collect();
+        assert!(all.len() > 1);
+        scene
+            .edit(id, |tx| {
+                let spots: Vec<[f32; 3]> = all
+                    .iter()
+                    .map(|&v| {
+                        let p = tx.mesh().position(v).unwrap();
+                        [p[0], p[1], p[2] + 1.0]
+                    })
+                    .collect();
+                tx.set_positions(&all, &spots)
+            })
+            .unwrap();
+        assert_eq!(normals_dirty(&mut scene, id), None);
         assert_matches(&scene, id);
     }
 }

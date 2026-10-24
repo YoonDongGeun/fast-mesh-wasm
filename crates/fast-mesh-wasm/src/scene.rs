@@ -41,9 +41,6 @@ pub struct WasmScene {
     scene: Scene,
     /// The render state of every live mesh.
     render: BTreeMap<MeshId, RenderState>,
-    /// The update mode of every live mesh, as last set (the scene has no
-    /// getter for it).
-    modes: BTreeMap<MeshId, UpdateMode>,
     /// Meshes being added in steps, by build id.
     adds: BTreeMap<u32, PendingAdd>,
     /// The id the next `begin_add_mesh_upload` hands out.
@@ -228,10 +225,10 @@ impl Default for WasmScene {
 }
 
 impl WasmScene {
-    /// After a mesh `id` is added: its vertex normals (with `normals`), its
-    /// render state and its mode; returns `[index, generation]`. When the
+    /// After a mesh `id` is added: its vertex normals (with `normals`)
+    /// and its render state; returns `[index, generation]`. When the
     /// normals cannot be turned on, the mesh is removed again.
-    fn added(&mut self, id: MeshId, mode: UpdateMode, normals: bool) -> Result<Vec<u32>, Error> {
+    fn added(&mut self, id: MeshId, normals: bool) -> Result<Vec<u32>, Error> {
         if normals && let Err(e) = self.scene.set_normals(id, true) {
             // Added and removed before any report: the scene reports nothing.
             let _ = self.scene.remove_mesh(id);
@@ -239,7 +236,6 @@ impl WasmScene {
         }
         let state = RenderState::new(self.scene.mesh(id)?);
         self.render.insert(id, state);
-        self.modes.insert(id, mode);
         Ok(vec![id.index(), id.generation()])
     }
 
@@ -290,7 +286,6 @@ impl WasmScene {
         WasmScene {
             scene: Scene::new(SceneOptions::default()),
             render: BTreeMap::new(),
-            modes: BTreeMap::new(),
             adds: BTreeMap::new(),
             next_add: 0,
         }
@@ -302,7 +297,8 @@ impl WasmScene {
     /// Positions are stored as `p - origin` in `f32`; without `origin` it
     /// is the bounding-box centre. `mode` is 0 (Eager), 1 (Lazy) or 2
     /// (Manual); `normals` turns vertex normals on. The placement starts as
-    /// the identity. Nothing is added on error.
+    /// the identity. A Lazy or Manual mesh builds its BVH on first use
+    /// instead of up front. Nothing is added on error.
     pub fn add_mesh(
         &mut self,
         positions: &[f64],
@@ -315,10 +311,11 @@ impl WasmScene {
         let mesh = mesh_from(positions, indices, origin)?;
         let options = MeshOptions {
             mode,
+            defer_bvh: mode != UpdateMode::Eager,
             ..MeshOptions::default()
         };
         let id = self.scene.add_mesh(mesh, options)?;
-        self.added(id, mode, normals)
+        self.added(id, normals)
     }
 
     /// [`WasmScene::add_mesh`] in steps: reserves a mesh of `vertices`
@@ -466,7 +463,7 @@ impl WasmScene {
             .adds
             .remove(&build)
             .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
-        let (b, mode, normals) = match entry {
+        let (b, _, normals) = match entry {
             PendingAdd::Store {
                 build: mut store,
                 options,
@@ -478,7 +475,7 @@ impl WasmScene {
             PendingAdd::Bvh(b, mode, normals) => (b, mode, normals),
         };
         let id = self.scene.add_mesh_built(*b)?;
-        self.added(id, mode, normals)
+        self.added(id, normals)
     }
 
     /// The mesh's content stamp (`Scene::content_stamp`): it goes up
@@ -498,7 +495,6 @@ impl WasmScene {
         let id = self.id(index, generation)?;
         self.scene.remove_mesh(id)?;
         self.render.remove(&id);
-        self.modes.remove(&id);
         Ok(())
     }
 
@@ -557,8 +553,34 @@ impl WasmScene {
         let id = self.id(index, generation)?;
         let mode = parse_mode(mode)?;
         self.scene.set_mode(id, mode)?;
-        self.modes.insert(id, mode);
         Ok(())
+    }
+
+    /// When the mesh's BVH, normals, fields and sections follow its edits:
+    /// 0 (Eager), 1 (Lazy) or 2 (Manual).
+    pub fn mode(&self, index: u32, generation: u32) -> Result<u8, Error> {
+        Ok(match self.scene.mode(self.id(index, generation)?)? {
+            UpdateMode::Eager => 0,
+            UpdateMode::Lazy => 1,
+            UpdateMode::Manual => 2,
+        })
+    }
+
+    /// The box around the vertices the live triangles use, in the mesh's
+    /// stored local coordinates: `[min xyz, max xyz]`. Empty without live
+    /// triangles.
+    pub fn bounds(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
+        Ok(match self.scene.bounds(self.id(index, generation)?)? {
+            Some(b) => vec![
+                f64::from(b.min[0]),
+                f64::from(b.min[1]),
+                f64::from(b.min[2]),
+                f64::from(b.max[0]),
+                f64::from(b.max[1]),
+                f64::from(b.max[2]),
+            ],
+            None => Vec::new(),
+        })
     }
 
     /// Brings the mesh's BVH, normals, fields and sections up to date now.
@@ -826,7 +848,7 @@ impl WasmScene {
         max_listed: u32,
     ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
-        let manual = self.modes.get(&id) == Some(&UpdateMode::Manual);
+        let manual = self.scene.mode(id)? == UpdateMode::Manual;
         if self_intersection && !manual && !self.scene.is_current(id)? {
             self.scene.update(id)?;
         }
@@ -1654,6 +1676,36 @@ mod tests {
             vec![1, i, g, FLAG_REMOVED, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(code(s.remove_mesh(i, g)), codes::UNKNOWN_MESH);
+    }
+
+    #[test]
+    fn mode_and_bounds_getters() {
+        let mut s = WasmScene::new();
+        let (i, g) = add(&mut s, true);
+        assert_eq!(s.mode(i, g).unwrap(), 0);
+        s.set_mode(i, g, 1).unwrap();
+        assert_eq!(s.mode(i, g).unwrap(), 1);
+        // QUAD spans 0..=2 in x and y; stored relative to its centre.
+        assert_eq!(s.bounds(i, g).unwrap(), vec![-1., -1., 0., 1., 1., 0.]);
+        assert_eq!(code(s.mode(i + 9, g)), codes::UNKNOWN_MESH);
+        assert_eq!(code(s.bounds(i + 9, g)), codes::UNKNOWN_MESH);
+    }
+
+    #[test]
+    fn lazy_and_manual_add_mesh_defer_the_bvh() {
+        let mut s = WasmScene::new();
+        let lazy = s.add_mesh(&QUAD, &QUAD_TRIS, None, 1, true).unwrap();
+        let (li, lg) = (lazy[0], lazy[1]);
+        assert!(!s.scene.is_current(s.id(li, lg).unwrap()).unwrap());
+        // First use builds it: analyzing with self-intersection updates Lazy.
+        s.analyze(li, lg, 0.0, true, 10).unwrap();
+        assert!(s.scene.is_current(s.id(li, lg).unwrap()).unwrap());
+        // Manual waits for `update`: analyze refuses until then.
+        let manual = s.add_mesh(&QUAD, &QUAD_TRIS, None, 2, false).unwrap();
+        let (mi, mg) = (manual[0], manual[1]);
+        assert_eq!(code(s.analyze(mi, mg, 0.0, true, 10)), codes::STALE_BVH);
+        s.update(mi, mg).unwrap();
+        s.analyze(mi, mg, 0.0, true, 10).unwrap();
     }
 
     #[test]

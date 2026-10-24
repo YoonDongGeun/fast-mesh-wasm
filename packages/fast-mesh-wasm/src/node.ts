@@ -48,6 +48,7 @@ export {
   type Contact,
   type DegenerateReport,
   type DistanceFieldDesc,
+  type DragOptions,
   type DragSession,
   type EditOp,
   type EditRef,

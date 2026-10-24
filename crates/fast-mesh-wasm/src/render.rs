@@ -117,17 +117,28 @@ fn oom() -> StoreError {
     StoreError::OutOfMemory
 }
 
-/// The ids of `lists` below `limit`, ascending without duplicates.
-fn slots(lists: &[&[u32]], limit: usize) -> Result<Vec<u32>, StoreError> {
+/// Buffers over this many slots report "all" past half dirty (see
+/// [`slots`]); smaller ones sort cheaply and keep exact ranges.
+const DENSE_MIN_SLOTS: usize = 8;
+
+/// The ids of `lists` below `limit`, ascending without duplicates, or
+/// `None` for "all" when the input holds past half the slots: a dense
+/// frame uploads everything anyway, and skipping the sort avoids the
+/// `O(n log n)` work. Tiny buffers are exempt (see
+/// [`DENSE_MIN_SLOTS`]).
+fn slots(lists: &[&[u32]], limit: usize) -> Result<Option<Vec<u32>>, StoreError> {
+    let total: usize = lists.iter().map(|l| l.len()).sum();
+    if limit > DENSE_MIN_SLOTS && total > limit / 2 {
+        return Ok(None);
+    }
     let mut out = Vec::new();
-    out.try_reserve_exact(lists.iter().map(|l| l.len()).sum())
-        .map_err(|_| oom())?;
+    out.try_reserve_exact(total).map_err(|_| oom())?;
     for l in lists {
         out.extend(l.iter().copied().filter(|&s| (s as usize) < limit));
     }
     out.sort_unstable();
     out.dedup();
-    Ok(out)
+    Ok(Some(out))
 }
 
 impl RenderState {
@@ -205,30 +216,28 @@ impl RenderState {
         // Every allocation comes first, so a failure changes nothing.
         let positions = match set {
             None => None,
-            Some(c) => Some(slots(
+            Some(c) => slots(
                 &[&c.vertices_moved, &c.vertices_added, &c.vertices_removed],
                 vs,
-            )?),
+            )?,
         };
         let indices = match set {
             None => None,
-            Some(c) => Some(slots(
+            Some(c) => slots(
                 &[
                     &c.triangles_added,
                     &c.triangles_removed,
                     &c.triangles_changed,
                 ],
                 ts,
-            )?),
+            )?,
         };
         let normals = match &changes.normals_dirty {
-            Some(n) if !self.stale && normals_len == self.normals_len => {
-                Some(slots(&[n], normals_len)?)
-            }
+            Some(n) if !self.stale && normals_len == self.normals_len => slots(&[n], normals_len)?,
             _ => None,
         };
         let colors = match &changes.colors_dirty {
-            Some(c) if !self.stale => Some(slots(&[c], vs)?),
+            Some(c) if !self.stale => slots(&[c], vs)?,
             _ => None,
         };
         self.normals_len = normals_len;
@@ -333,6 +342,17 @@ mod tests {
     fn step(scene: &mut Scene, id: MeshId, state: &mut RenderState) -> Dirty {
         let ch = take(scene, id);
         state.apply(scene.mesh(id).unwrap(), &ch, 0).unwrap()
+    }
+
+    #[test]
+    fn dense_slots_report_all() {
+        // Past half dirty on a buffer over the gate: "all".
+        let every: Vec<u32> = (0..100).collect();
+        assert_eq!(slots(&[&every], 100), Ok(None));
+        // Sparse stays exact, whatever the buffer size...
+        assert_eq!(slots(&[&[3, 1]], 100), Ok(Some(vec![1, 3])));
+        // ...and tiny buffers keep exact ranges even past half.
+        assert_eq!(slots(&[&[0, 1, 3, 9]], 2), Ok(Some(vec![0, 1])));
     }
 
     #[test]

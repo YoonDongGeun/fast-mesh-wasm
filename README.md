@@ -149,7 +149,7 @@ colour(gap);
 
 // Drag the lower mesh. The whole drag is one undo step. Each `move`
 // recomputes the eager fields, so coalesce pointer events to one `move` per
-// animation frame.
+// animation frame (`scene.drag(mesh, { coalesce: true })` does that for you).
 const drag = scene.drag(lower);
 let pending: { rotation: Quat; translation: Vec3 } | undefined;
 function onPointerMove(rotation: Quat, translation: Vec3) {

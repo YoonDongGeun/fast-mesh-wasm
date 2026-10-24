@@ -2,7 +2,7 @@
 // views, per-frame change records and undo history. Wraps the raw `WasmScene`
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
-import type { Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
+import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
@@ -84,7 +84,8 @@ export interface DragSession {
    *
    * Each move recomputes the eager fields that depend on the mesh, so
    * coalesce pointer events to one move per animation frame (keep the latest
-   * pose and apply it before {@link Scene.commitFrame}).
+   * pose and apply it before {@link Scene.commitFrame}), or start the drag
+   * with {@link DragOptions.coalesce}.
    */
   move(placement: PlacementInput): void;
   /**
@@ -108,6 +109,19 @@ export interface DragSession {
    * the drag's levels, leaving the caller's step open.
    */
   cancel(): void;
+}
+
+/** Options of {@link Scene.drag}. */
+export interface DragOptions {
+  /**
+   * Coalesce moves: each {@link DragSession.move} only remembers its pose,
+   * and the latest one is applied once at the next {@link Scene.commitFrame}
+   * (or {@link DragSession.end}). For pointer events at 120–250 Hz: without
+   * it, every move recomputes the eager fields. Until the frame,
+   * {@link Scene.placement} and {@link Scene.matrix4} show the last applied
+   * pose. `WorkerScene` drags always coalesce. Defaults to `false`.
+   */
+  coalesce?: boolean;
 }
 
 /** Options of {@link Scene.addMesh}. */
@@ -311,7 +325,10 @@ export interface SectionDesc {
 
 /** One chain of a section: a closed loop or an open polyline. */
 export interface SectionContour {
-  /** World xyz, 3 floats per point. A copy. */
+  /**
+   * World xyz, 3 floats per point. A copy. Where the plane passes exactly
+   * through a vertex, the contour repeats that point (a zero-length segment).
+   */
   points: Float32Array;
   closed: boolean;
 }
@@ -553,9 +570,12 @@ interface ActiveDrag {
   end(): void;
   /** Marks the drag over without touching the history (its step is gone). */
   abandon(): void;
+  /** Applies a coalesced drag's pending pose, if it has one. */
+  applyPending(): void;
 }
 
 const MODES: Record<UpdateMode, number> = { eager: 0, lazy: 1, manual: 2 };
+const MODE_NAMES: readonly UpdateMode[] = ["eager", "lazy", "manual"];
 
 function modeCode(mode: UpdateMode): number {
   if (!Object.hasOwn(MODES, mode)) {
@@ -1220,6 +1240,35 @@ export class Scene implements SceneLike {
     call(() => this.#scene().set_mode(index, generation, m));
   }
 
+  /** When the mesh's derived data follows its edits; see {@link UpdateMode}. */
+  mode(mesh: MeshHandle): UpdateMode {
+    const { index, generation } = this.#id(mesh);
+    const code = call(() => this.#peek().mode(index, generation));
+    return MODE_NAMES[code] ?? "eager";
+  }
+
+  /**
+   * The box around the vertices the live triangles use, in the mesh's local
+   * render coordinates ({@link Scene.matrix4} maps them to the world). Dead
+   * slots keep stale positions, so they are excluded. `null` without live
+   * triangles.
+   */
+  bounds(mesh: MeshHandle): Bounds | null {
+    const { index, generation } = this.#id(mesh);
+    const b = call(() => this.#peek().bounds(index, generation));
+    if (b.length === 0) {
+      return null;
+    }
+    const min: Vec3 = [b[0], b[1], b[2]];
+    const max: Vec3 = [b[3], b[4], b[5]];
+    return {
+      min,
+      max,
+      center: [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2],
+      size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]],
+    };
+  }
+
   /** Brings the mesh's derived data up to date now, whatever its mode. */
   update(mesh: MeshHandle): void {
     const { index, generation } = this.#id(mesh);
@@ -1276,6 +1325,8 @@ export class Scene implements SceneLike {
    * {@link Scene.commitFrame} instead.
    */
   takeChanges(): MeshChange[] {
+    // A coalesced drag's latest pose lands first, so the frame reports it.
+    this.#drag?.applyPending();
     const s = this.#scene();
     const raw = decodeChanges(call(() => s.take_changes()));
     const out = raw.map(
@@ -1422,18 +1473,22 @@ export class Scene implements SceneLike {
    * Starts dragging a mesh: the moves until {@link DragSession.end} form one
    * undo step (nested in the open step, if there is one). One drag at a time.
    * Every {@link DragSession.move} recomputes the eager fields, so make at most
-   * one move per animation frame, with the latest pointer pose.
+   * one move per animation frame, with the latest pointer pose, or pass
+   * `{ coalesce: true }` to have the drag do that for you.
    */
-  drag(mesh: MeshHandle): DragSession {
+  drag(mesh: MeshHandle, options: DragOptions = {}): DragSession {
     this.#id(mesh);
     if (this.#drag !== undefined) {
       throw invalid("a drag is already active; end or cancel it first");
     }
+    const coalesce = options.coalesce ?? false;
     const start = this.placement(mesh);
     const outermost = this.#stepDepth === 0;
     this.beginStep();
     const depth = this.#stepDepth;
     let active = true;
+    /** The latest coalesced pose, not yet applied. */
+    let pending: PlacementInput | undefined;
     const finish = (): boolean => {
       if (!active) {
         return false;
@@ -1448,6 +1503,13 @@ export class Scene implements SceneLike {
         this.endStep();
       }
     };
+    const applyPending = () => {
+      if (pending !== undefined) {
+        const pose = pending;
+        pending = undefined;
+        this.setPlacement(mesh, pose);
+      }
+    };
     const session: DragSession & ActiveDrag = {
       depth,
       mesh,
@@ -1458,17 +1520,32 @@ export class Scene implements SceneLike {
         if (!active) {
           throw invalid("the drag is over");
         }
-        this.setPlacement(mesh, placement);
+        if (!coalesce) {
+          this.setPlacement(mesh, placement);
+          return;
+        }
+        // Validate now, so a bad pose throws here and not at the frame.
+        const rotation = rotationMatrix(placement.rotation);
+        const t = placement.translation;
+        if (t?.length !== 3) {
+          throw invalid("translation must be 3 numbers");
+        }
+        pending = { rotation, translation: [t[0], t[1], t[2]] };
       },
       end: () => {
         if (finish()) {
-          close();
+          try {
+            applyPending();
+          } finally {
+            close();
+          }
         }
       },
       cancel: () => {
         if (!finish()) {
           return;
         }
+        pending = undefined;
         if (outermost) {
           // The drag's step is the whole step: reverting it puts the
           // placement back and leaves no entry (a restore-then-end would
@@ -1486,6 +1563,7 @@ export class Scene implements SceneLike {
       abandon: () => {
         finish();
       },
+      applyPending,
     };
     this.#drag = session;
     return session;
