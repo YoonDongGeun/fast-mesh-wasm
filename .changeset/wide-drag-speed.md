@@ -1,5 +1,0 @@
----
-"fast-mesh-wasm": patch
----
-
-Faster wide-range distance colouring while dragging: when most of a mesh is within a field's `maxDistance`, the per-pose update now recomputes every vertex instead of first listing every nearby triangle pair, which makes a 1M-triangle drag with `maxDistance` 8 about 29 times faster per pose. Values and colours are unchanged, bit for bit. In the Worker scene (`fast-mesh-wasm/worker`), the field recompute after a drag move now runs in small steps, and a recompute whose pose is already stale (a newer move, drag cancel, `setPlacement`, edit, repair, compact, undo/redo, removal of either mesh or removal of the field is queued) is dropped, so colours follow the latest pose without a backlog; during a sustained drag a recompute is kept and shown once 200 ms have passed since the last colours, so they still update while the pointer moves. Each pose's colours are still applied all at once. In Node `worker_threads` the engine now yields with `setImmediate`, so requests sent during a long recompute arrive between its steps. No API change.
