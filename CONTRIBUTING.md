@@ -84,6 +84,14 @@ Do not enable `parallel` for a plain `wasm32-unknown-unknown` build: that target
 
 Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread. `par::set_force_sequential` is counted: pair every `true` with one `false`.
 
+### Property tests
+
+The workspace's property suites honor the `PROPTEST_CASES` environment variable, defaulting to a short run. For a longer pass over the store before pushing a storage change:
+
+```sh
+PROPTEST_CASES=3000 cargo test -p fast-mesh-store --release --test properties
+```
+
 ## Adding or changing an API
 
 1. Implement and unit-test the algorithm in `crates/fast-mesh/src`. Keep it free of WebAssembly types.

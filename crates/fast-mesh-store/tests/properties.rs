@@ -4,6 +4,15 @@
 use fast_mesh_store::{ChangeSet, ChannelDesc, History, Mesh, TopologyPolicy, Transaction};
 use proptest::prelude::*;
 
+/// The case count: `PROPTEST_CASES` when set, else `default`. `with_cases`
+/// alone would ignore the environment variable.
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Move(u32, [i8; 3]),
@@ -239,7 +248,7 @@ fn check_incidence(m: &Mesh) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(cases(256)))]
 
     #[test]
     fn undo_all_and_redo_all_restore_exact_states(commits in prop::collection::vec(ops(), 1..12)) {
@@ -493,4 +502,15 @@ proptest! {
             prop_assert_eq!(m.triangle(nt).unwrap(), tri.map(|v| remap.vertex(v).unwrap()));
         }
     }
+}
+
+/// The configured case count is `PROPTEST_CASES` when set, else the 256
+/// default — so a long run needs no file edit.
+#[test]
+fn configured_case_count() {
+    let expected = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(256);
+    assert_eq!(cases(256), expected);
 }
