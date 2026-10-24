@@ -27,7 +27,7 @@ pub use compact::Remap;
 pub use error::StoreError;
 pub use history::History;
 pub use incidence::{Incidence, IncidenceBuild};
-pub use mesh::Mesh;
+pub use mesh::{Mesh, MeshBuilder};
 pub use patch::{ChangeSet, Patch, PatchSide, PatchState};
 pub use transaction::Transaction;
 

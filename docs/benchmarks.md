@@ -612,8 +612,8 @@ The bench sends a frame with the long request, then at once a frame with a colou
 - **The Worker is never blocked for long now.** At 1M the longest block during a field build or an edit is one step, about 5 to 6 ms, against 0.1 s. At 10M it is 14 to 18 ms, against 1.4 to 3.4 s. Batches sent meanwhile are received at once, and superseded ones are coalesced. A field build for a display that is already superseded is dropped at the next step boundary, as 9a dropped it before it started.
 - **A toggle still waits for a field build or an edit.** Requests run in order, and other requests wait for a field recompute (§6.1 of the drag-speed design). So its round trip is the long request's, about the same as before at 1M. The total work is unchanged within noise at 1M. The 10M rows are faster now, but main's 10M run was earlier in the session, while other agents were busy on the machine, so read them as an upper bound for main.
 - **A toggle no longer waits for an `addMesh`.**
-  - A mesh of 65,536 triangles or more is built in the background: steps of the BVH build run between other requests and while the Worker is idle.
-  - The toggle is answered in 8 ms at 1M (main: 1.18 s) and 71 ms at 10M (main: 16 s). At 10M, 69 ms of that is the add's own batch: the copy of the 10M inputs into wasm and the mesh's store, which come before the build.
+  - A mesh of 65,536 triangles or more is built in the background: its inputs upload in chunks, then steps of the store and BVH builds run between other requests and while the Worker is idle. (The upload and the store build used to be one call in the add's own batch; since issue #64 they run in steps too: see "Chunking the add's own batch" below.)
+  - The toggle is answered in 8 ms at 1M (main: 1.18 s) and about 80 ms at 10M (main: 16 s). At 10M, most of that is the add's own batch: the chunked upload of the 10M inputs, spread over yields.
   - The mesh lands about as soon as before (1.14 s at 1M).
   - The longest block is the landing: the insert, the normals, the render buffers and packing the whole new mesh into its result. That is 20 ms at 1M and 136 ms at 10M, O(n) copies that stay in one piece. (Since issue #64 these run in steps before the landing: see "Landing a background add" below.)
 
@@ -652,8 +652,8 @@ The landing itself is then an O(1) insert. Results are bit-identical: twin tests
 | 1M | 25.2 / 21.6 ms | **14.0 / 16.3 ms** |
 | 10M | 184 / 207 ms | **103 / 108 ms** |
 
-- **At 1M the landing is no longer the longest block.** What remains are the BVH build's own steps (100,000 units: about 8 to 10 ms in wasm, the tree build's last step up to about twice that) and the add's own batch (about 8 to 10 ms, below).
-- **At 10M the longest block is now the add's own batch**, about 100 ms (its round trip equals the block), and no longer the landing (150 to 207 ms).
+- **At 1M the landing is no longer the longest block.** What remains are the BVH build's own steps (100,000 units: about 8 to 10 ms in wasm, the tree build's last step up to about twice that) and the add's own batch (about 8 to 10 ms, below; since issue #64 it runs in steps too: see "Chunking the add's own batch" below).
+- **At 10M the longest block is now the add's own batch**, about 100 ms (its round trip equals the block), and no longer the landing (150 to 207 ms). (Since issue #64 the batch runs in steps, and the longest block is a BVH build step again: see below.)
 - **The pieces, timed in wasm at 10M** through the internal `meshAdds`:
 
   | Piece | Before | Now |
@@ -675,7 +675,7 @@ The landing itself is then an O(1) insert. Results are bit-identical: twin tests
 | Native: `Mesh::from_buffers_f64` | 7.5 to 9 ms | 77 to 93 ms |
 | Native: `MeshBuild::new` | 0.8 ms | 7 to 8 ms |
 
-`MeshBuild::new` itself is small. The cost is the store built from the buffers, and the copy into wasm memory in front of it. Stepping that would need a chunked upload into wasm memory and a resumable store construction. That is a new protocol and new store API, not a cheap change, so it is left for a follow-up.
+`MeshBuild::new` itself is small. The cost is the store built from the buffers, and the copy into wasm memory in front of it. Stepping that needs a chunked upload into wasm memory and a resumable store construction: a new protocol and new store API, done as the follow-up below.
 
 **Near-search parts.** A stepped near search split a node pair until the product of its sides' triangle counts was at most 2^18. It estimated each count from the node's depth, which is exact only on a balanced tree. It now reads the BVH's subtree counts (`Bvh::subtree_triangles`), which the BVH keeps up to date at 4 bytes per node. So a part holds at most 2^18 triangle pairs on any tree. On a split-chain BVH (depth 21 for 640 triangles) the depth estimate left a part of 376,320 pairs. Results are unchanged, and the drags did not regress:
 
@@ -690,6 +690,39 @@ The landing itself is then an O(1) insert. Results are bit-identical: twin tests
 | Contact drag: longest Worker block | 7.08 → 7.28 ms |
 
 The 10M near-search part of the native table below (up to 39 ms) was not measured again.
+
+### Chunking the add's own batch (issue #64)
+
+The add's own batch (`begin_add_mesh`: the wasm-bindgen copy of the inputs into wasm memory, `Mesh::from_buffers_f64` and `MeshBuild::new`) now runs in steps too:
+
+- the inputs upload into wasm memory in chunks (6.4 MB each by default), yielding between them;
+- the store builds from the staged inputs in steps (`MeshBuilder`: a finiteness scan, the bounding box, the conversion to `f32`, the index check), bit-identical to the one-call build, or the same error;
+- the steps then build the BVH and normals as before, and the mesh lands as before.
+
+Twin tests compare the stepped store build with the one-call path over budgets and chunk sizes, with and without an explicit origin, and with failures mid-build (non-finite input, an out-of-range index); the engine tests cover the upload (bounded pushes with yields between them, `Float32Array` inputs, an explicit origin) and the landing record, as before.
+
+`pnpm --filter fast-mesh-wasm bench -- --worker --queued --add-only` (with `--10m --no-1m` for 10M), run back to back twice on 2026-10-24. Other agents were using the machine throughout. The 1M main columns are this session's main (`31bc600`); the 10M main columns are #71's same-machine runs (this branch's 10M runs came later in the same session).
+
+| `addMesh`, longest Worker block | Main, run 1 / run 2 | Now, run 1 / run 2 |
+| --- | --- | --- |
+| 1M | 18.3 / 22.6 ms | **15.7 / 17.8 ms** |
+| 10M | 184 / 207 ms | **21.0 / 38.9 ms** |
+
+- **At 1M the longest block is a BVH build step either way** (the tree build's last step runs up to about twice a usual one), about the same as before. The add's own batch answers in 7.6 / 8.2 ms now (main: 15.4 / 12.9 ms), and a toggle sent right after it in 7.7 / 8.4 ms (main: 17.9 / 15.3 ms). The mesh lands as soon as before (1,773 / 1,760 ms against 1,760 / 1,785 ms).
+- **At 10M the longest block is no longer the add's own batch.** The batch's ~100 ms in one call are gone; what remains are the BVH build's own steps. The add's own batch answers in 79 / 110 ms (its pushes and yields, spread out), and a toggle sent right after it in 79 / 112 ms. The mesh lands in 19.3 / 19.1 s; the 1M same-session runs show no change in the total, so the absolute 10M totals reflect the session's load.
+- **The pieces, timed in wasm at 1M and 10M** through the internal `meshAdds` (the scratch profile is not committed):
+
+  | Piece | 1M | 10M |
+  | --- | --- | --- |
+  | Upload (was part of `begin_add_mesh`) | 4 pushes of at most 2.9 ms | 38 pushes of at most 3.5 ms |
+  | Store build (was `Mesh::from_buffers_f64`, 9.0 / 7.3 ms in one call) | 29 steps of at most 1.2 ms | 253 steps of at most 0.9 ms |
+  | Store-to-BVH transition (`MeshBuild::new`) | 1.9 ms in one step | 12.6 ms in one step |
+  | BVH steps | at most 12.0 ms | tens of ms (shared machine) |
+
+  The transition step keeps the one O(n) piece of `BvhBuild::new` (the per-triangle leaf table); stepping that is out of scope here.
+- **Memory.** The staged inputs live from the first push until the store is built: 24 MB at 1M and 240 MB at 10M. That is the same size the one-call copy held, held for longer.
+
+**Winding moments.** `MomentsBuild::new` used to list every leaf in one traversal and zero every node slot in one fill: 15 ms at 1M natively (10 ms the fill, 5 ms the traversal), about 210 ms at 10M. Now `new` only reserves (tens of microseconds), and the steps initialise the slots and list the leaves incrementally, combining in the same order: bit-identical (the stepped and parallel twin tests check it). At 1M the steps run at most 0.4 ms natively; at 10M (5.0M leaves, 10.0M slots) the fill steps run at most about 1 ms and the compute steps a few milliseconds, on the shared machine.
 
 ### Native steps
 

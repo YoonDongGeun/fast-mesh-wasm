@@ -939,28 +939,35 @@ export function fieldSteps(scene: Scene): FieldSteps {
 }
 
 /**
- * Meshes added in steps (the scene crate's `MeshBuild`), for the Worker
- * engine only: not part of the public API.
+ * Meshes added in steps (the store crate's `MeshBuilder`, then the scene
+ * crate's `MeshBuild`), for the Worker engine only: not part of the public
+ * API.
  *
- * - `begin(positions, indices, options)`: starts building a mesh and its
- *   BVH outside the scene, as `addMesh` would add it; returns the build's
- *   token. The scene is unchanged until `finish`.
- * - `step(token, budget)`: builds about `budget` more units of the BVH (a
- *   triangle's box, or a triangle visited per tree level), then of the
- *   vertex normals when they are on (4 triangles or 16 vertices a unit);
- *   `true` once built. A failed build throws and is dropped.
+ * - `beginUpload(vertices, triangles, options)`: reserves a mesh outside
+ *   the scene, as `addMesh` would add it; returns the build's token. The
+ *   scene is unchanged until `finish`.
+ * - `pushPositions(token, chunk)` / `pushIndices(token, chunk)`: append a
+ *   chunk of the inputs; the chunks must add up to the declared counts.
+ * - `step(token, budget)`: builds about `budget` more units: first the
+ *   store (vertices or triangles), then the BVH (a triangle's box, or a
+ *   triangle visited per tree level), then the vertex normals when they
+ *   are on (4 triangles or 16 vertices a unit); `true` once built. The
+ *   upload must be complete first. A failed build throws and is dropped.
  * - `buffers(token)`: views of the build's render buffers (normals `null`
  *   until built or when off): what `views(mesh)` will show once it is
  *   added, until the mesh changes. Valid until the next call that may
- *   allocate, like any view.
- * - `finish(token)`: adds the mesh (finishing its BVH and normals first),
- *   exactly as `addMesh` with the same inputs would, and returns its handle.
+ *   allocate, like any view. Throws until the store is built.
+ * - `finish(token)`: adds the mesh (finishing its store, BVH and normals
+ *   first), exactly as `addMesh` with the same inputs would, and returns
+ *   its handle.
  * - `stamp(mesh)`: the mesh's content stamp, which goes up whenever its
  *   positions, triangles or normals change (undo and redo included).
  * - `drop(token)`: forgets a build; nothing is added.
  */
 interface MeshAdds {
-  begin(positions: Positions64, indices: Indices, options?: AddMeshOptions): number;
+  beginUpload(vertices: number, triangles: number, options?: AddMeshOptions): number;
+  pushPositions(token: number, chunk: Float64Array): void;
+  pushIndices(token: number, chunk: Uint32Array): void;
   step(token: number, budget: number): boolean;
   buffers(token: number): { positions: Float32Array; normals: Float32Array | null; indices: Uint32Array };
   finish(token: number): MeshHandle;
@@ -1813,14 +1820,14 @@ export class Scene implements SceneLike {
 
   static {
     meshAddsOf = (scene) => ({
-      begin: (positions, indices, options = {}) => {
+      beginUpload: (vertices, triangles, options = {}) => {
         const s = scene.#scene();
         const mode = modeCode(options.mode ?? "eager");
         const origin = options.origin === undefined ? undefined : Float64Array.from(options.origin);
-        const p = toFloat64(positions);
-        const i = toUint32(indices);
-        return call(() => s.begin_add_mesh(p, i, origin, mode, options.normals ?? true));
+        return call(() => s.begin_add_mesh_upload(vertices, triangles, origin, mode, options.normals ?? true));
       },
+      pushPositions: (token, chunk) => call(() => scene.#scene().add_mesh_push_positions(token, chunk)),
+      pushIndices: (token, chunk) => call(() => scene.#scene().add_mesh_push_indices(token, chunk)),
       step: (token, budget) => call(() => scene.#scene().add_mesh_step(token, budget)),
       buffers: (token) => {
         const [pp, pl, np, nl, ip, il] = call(() => scene.#peek().add_mesh_buffers(token));
