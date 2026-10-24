@@ -194,6 +194,7 @@ mod tests {
 
     use super::*;
     use crate::analyze::{AnalyzeOptions, analyze};
+    use crate::boundary_loops;
     use crate::test_util::*;
 
     fn conflicts(mesh: &Mesh) -> usize {
@@ -357,6 +358,31 @@ mod tests {
             (4, 2, 1)
         );
         assert_eq!(parts(&mesh), parts(&clean));
+    }
+
+    #[test]
+    fn klein_bottle_skips_outward_pass_unchanged() {
+        // Closed (no boundary, nothing non-manifold) but non-orientable: a
+        // single patch with no outside, left exactly as it was.
+        let mut mesh = klein(16, 12);
+        assert!(boundary_loops(&mesh).unwrap().is_empty());
+        let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
+        assert_eq!(a.non_manifold_edges, 0);
+        assert_eq!(a.components.len(), 1);
+        assert!(a.components[0].closed);
+        let before = parts(&mesh);
+        let (r, empty) = edit(&mut mesh, orient);
+        assert_eq!(
+            r,
+            OrientReport {
+                flipped_triangles: 0,
+                patches: 1,
+                non_orientable_patches: 1,
+                flipped_outward_components: 0,
+            }
+        );
+        assert!(empty);
+        assert_eq!(parts(&mesh), before);
     }
 
     #[test]

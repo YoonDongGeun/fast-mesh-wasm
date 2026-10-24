@@ -729,7 +729,7 @@ impl WasmScene {
             self_intersection: bvh,
             max_listed: max_listed as usize,
         };
-        let a = analyze(self.scene.mesh(id)?, &options).map_err(SceneError::Ops)?;
+        let a = analyze(self.scene.mesh(id)?, &options).map_err(SceneError::from)?;
         Ok(encode_analysis(&a)?)
     }
 
@@ -2035,7 +2035,7 @@ mod tests {
         assert_eq!(&a[a.len() - 2..], &[6., -1.]);
         let triangles = s.triangle_count(i, g).unwrap();
         let nan = f64::NAN;
-        let ops = [3., 4., nan, 2., nan, nan, 0., 1., nan];
+        let ops = [3., 4., nan, 2., nan, nan, 0., 1., nan, nan, nan];
         let r = s.repair(i, g, &ops, &[]).unwrap();
         // Orient flipped the two triangles; two loops filled, one skipped.
         assert_eq!(r[0], 2.);
@@ -2048,7 +2048,7 @@ mod tests {
         assert_eq!(s.triangle_count(i, g).unwrap(), triangles);
 
         // A failing op rolls the whole list back.
-        let bad = [3., 4., nan, nan, nan, nan, 0., 1., nan];
+        let bad = [3., 4., nan, nan, nan, nan, 0., 1., nan, nan, nan];
         assert_eq!(code(s.repair(i, g, &bad, &[])), codes::INVALID_ARGUMENT);
         assert!(!s.can_undo());
         assert_eq!(
@@ -2066,7 +2066,7 @@ mod tests {
         // The first loop's id, as the fill op takes it.
         let id: Vec<u32> = a[1..5].iter().map(|&v| v as u32).collect();
         let nan = f64::NAN;
-        let fill = [4., nan, nan, nan, 1., 0., 0., nan];
+        let fill = [4., nan, nan, nan, 1., 0., 0., nan, nan, nan];
         s.repair(i, g, &fill, &id).unwrap();
         s.clear_history().unwrap();
         assert_eq!(code(s.repair(i, g, &fill, &id)), codes::STALE_LOOPS);

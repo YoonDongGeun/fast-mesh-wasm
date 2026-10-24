@@ -35,8 +35,8 @@
 //! - `2` remove small components: `min_triangles, min_area, keep_largest`.
 //! - `3` orient.
 //! - `4` fill holes: `max_edges, max_perimeter, max_area, loop_count,
-//!   allow_unclean, fair, dp_limit`; `loop_count` (NaN for no id list)
-//!   loop ids are taken from `loops`.
+//!   allow_unclean, fair, dp_limit, max_dihedral, max_refine_vertices`;
+//!   `loop_count` (NaN for no id list) loop ids are taken from `loops`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -48,9 +48,9 @@
 //! - orient: `flipped_triangles, patches, non_orientable_patches,
 //!   flipped_outward_components`.
 //! - fill holes: `filled_n, (loop id, triangles_added, vertices_added,
-//!   converged, weights (0 none, 1 cotangent, 2 uniform)) × filled_n,
-//!   skipped_n, (loop id, reason (0 bounds, 1 unclean)) × skipped_n,
-//!   failed_n, (loop id, reason (0 projection folds, 1 no valid
+//!   converged, weights (0 none, 1 cotangent, 2 uniform), refine_capped)
+//!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean)) ×
+//!   skipped_n, failed_n, (loop id, reason (0 projection folds, 1 no valid
 //!   triangulation, 2 solver)) × failed_n`.
 //!
 //! # Analysis
@@ -410,8 +410,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
         } else if code == 3.0 {
             RepairOp::Orient
         } else if code == 4.0 {
-            let [max_e, max_p, max_a, n, unclean, fair, dp]: [f64; 7] =
-                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [max_e, max_p, max_a, n, unclean, fair, dp, max_dh, max_rv]: [f64; 9] =
+                words.take(9)?.try_into().map_err(|_| malformed(WHAT))?;
             let loops = match count_opt(n, "loop count")? {
                 None => None,
                 Some(n) => {
@@ -428,6 +428,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 loops,
                 allow_unclean: flag(unclean)?,
                 fair: flag(fair)?,
+                max_dihedral: bound(max_dh),
+                max_refine_vertices: count_opt(max_rv, "maxRefineVertices")?,
                 ..FillOptions::default()
             };
             if let Some(dp) = count_opt(dp, "dpLimit")? {
@@ -474,6 +476,7 @@ fn put_fill(out: &mut Vec<f64>, r: &FillReport) -> Result<(), StoreError> {
                 count(f.vertices_added),
                 f64::from(u8::from(f.converged)),
                 weights,
+                f64::from(u8::from(f.refine_capped)),
             ],
         )?;
     }
@@ -703,7 +706,7 @@ mod tests {
             1., nan, 1., //
             2., 10., nan, 0., //
             3., //
-            4., nan, 2., nan, 1., 0., 1., nan,
+            4., nan, 2., nan, 1., 0., 1., nan, 0.5, 100.,
         ];
         let loops = [7, 12, hash as u32, (hash >> 32) as u32];
         let d = decode_repair(&ops, &loops).unwrap();
@@ -733,6 +736,8 @@ mod tests {
         );
         assert!(f.fair && !f.allow_unclean);
         assert_eq!(f.dp_limit, FillOptions::default().dp_limit);
+        assert_eq!(f.max_dihedral, Some(0.5));
+        assert_eq!(f.max_refine_vertices, Some(100));
 
         let code = |ops: &[f64], loops: &[u32]| decode_repair(ops, loops).unwrap_err().code;
         assert_eq!(code(&[5.], &[]), codes::INVALID_ARGUMENT);

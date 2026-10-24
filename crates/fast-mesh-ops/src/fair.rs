@@ -635,10 +635,10 @@ mod tests {
         let l = loops.iter().min_by_key(|l| l.vertices.len()).unwrap();
         let edges = EdgeMap::build(mesh).unwrap();
         let fans = VertexFans::build(mesh).unwrap();
-        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200)
+        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200, None)
             .unwrap()
             .unwrap();
-        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris).unwrap();
+        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
         (fans, patch)
     }
 

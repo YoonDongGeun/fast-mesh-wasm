@@ -1,6 +1,8 @@
 //! Self-intersection: the triangle pairs of one mesh that intersect each
 //! other.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use fast_mesh_bvh::{Aabb, Bvh, NodeId, NodeKind};
 use fast_mesh_store::{Mesh, TriangleId, par};
 
@@ -80,6 +82,61 @@ pub fn self_intersecting_pairs(
     }
     ap.appended().sort_unstable();
     Ok(())
+}
+
+/// Whether any two alive triangles of `mesh` intersect or touch while
+/// sharing no vertex id: the early-exit form of
+/// [`self_intersecting_pairs`], for callers that only need the bool.
+///
+/// The pair test is the same one, so the answer agrees with whether
+/// [`self_intersecting_pairs`] appends anything: neighbours that share a
+/// vertex id are never reported, degenerate triangles are skipped, and
+/// distinct vertices at the same position are distinct vertices. The
+/// search stops at the first intersecting pair it finds; the sequential
+/// search allocates nothing.
+///
+/// # Errors
+/// [`QueryError::MeshMismatch`](crate::QueryError::MeshMismatch) or
+/// [`QueryError::StaleBvh`](crate::QueryError::StaleBvh) when `bvh` does not
+/// match `mesh`, and [`QueryError::OutOfMemory`](crate::QueryError::OutOfMemory)
+/// when the parallel split of the search cannot grow.
+pub fn self_intersects(mesh: &Mesh, bvh: &Bvh) -> Result<bool> {
+    check(mesh, bvh)?;
+    let Some(root) = bvh.root() else {
+        return Ok(false);
+    };
+    if par::enabled() && !par::force_sequential() && mesh.triangle_count() >= PAR_MIN_SELF_TRIS {
+        // Each part stops at its own first hit, or once another part found one.
+        let parts = split(bvh, root)?;
+        let found = AtomicBool::new(false);
+        let hit = par::map_chunks(&parts, 1, 0, oom, |_, part| {
+            let mut yes = false;
+            part[0].search(bvh, &mut |a, b| {
+                if found.load(Ordering::Relaxed) {
+                    return false;
+                }
+                if intersecting(mesh, a, b).is_some() {
+                    found.store(true, Ordering::Relaxed);
+                    yes = true;
+                    return false;
+                }
+                true
+            });
+            Ok(yes)
+        })?;
+        Ok(hit.into_iter().any(|b| b))
+    } else {
+        let mut yes = false;
+        Part::Within(root).search(bvh, &mut |a, b| {
+            if intersecting(mesh, a, b).is_some() {
+                yes = true;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(yes)
+    }
 }
 
 /// Triangles from which [`self_intersecting_pairs`] splits its search into
@@ -479,5 +536,65 @@ mod tests {
             let found = assert_parallel_identical("self pairs", || pairs(&mesh, &bvh));
             assert!(found.len() > 500, "{quality:?}: {} pairs", found.len());
         }
+    }
+
+    #[test]
+    fn self_intersects_matches_pairs_emptiness() {
+        let boxes = crossed_boxes();
+        let sphere = uv_sphere(8, 12);
+        for q in [Quality::Sah, Quality::Fast] {
+            assert_eq!(
+                self_intersects(&boxes, &build(&boxes, q)),
+                Ok(!pairs(&boxes, &build(&boxes, q)).is_empty())
+            );
+            assert_eq!(
+                self_intersects(&sphere, &build(&sphere, q)),
+                Ok(!pairs(&sphere, &build(&sphere, q)).is_empty())
+            );
+        }
+        assert_eq!(
+            self_intersects(&boxes, &build(&boxes, Quality::Sah)),
+            Ok(true)
+        );
+        assert_eq!(
+            self_intersects(&sphere, &build(&sphere, Quality::Sah)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn self_intersects_checks_the_bvh_and_allocates_nothing_sequential() {
+        let boxes = crossed_boxes();
+        let bvh = build(&boxes, Quality::Sah);
+        let other = crossed_boxes();
+        assert_eq!(self_intersects(&other, &bvh), Err(QueryError::MeshMismatch));
+        let mut edited = crossed_boxes();
+        let stale = build(&edited, Quality::Sah);
+        let mut tx = edited.begin_edit();
+        tx.set_positions(&[0], &[[0.5, 0.0, 0.0]]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(self_intersects(&edited, &stale), Err(QueryError::StaleBvh));
+        // The sequential search allocates nothing: the fault hook armed at
+        // the first reservation still lets it answer.
+        fail_allocations_after(Some(0));
+        let got = self_intersects(&boxes, &bvh);
+        fail_allocations_after(None);
+        assert_eq!(got, Ok(true));
+    }
+
+    #[test]
+    fn self_intersects_bit_identical() {
+        use crate::test_util::{assert_parallel_identical, crossed_ripples};
+        let mesh = crossed_ripples(60);
+        assert!(mesh.triangle_count() >= PAR_MIN_SELF_TRIS);
+        for quality in [Quality::Sah, Quality::Fast] {
+            let bvh = build(&mesh, quality);
+            let found =
+                assert_parallel_identical("self intersects", || self_intersects(&mesh, &bvh));
+            assert_eq!(found, Ok(true));
+        }
+        let sphere = uv_sphere(16, 24);
+        let bvh = build(&sphere, Quality::Sah);
+        assert_eq!(self_intersects(&sphere, &bvh), Ok(false));
     }
 }

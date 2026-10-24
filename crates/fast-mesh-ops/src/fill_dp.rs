@@ -79,6 +79,10 @@ impl Weight {
 /// vertex set of a triangle `forbidden` has; [`FailReason::NoValidTriangulation`]
 /// otherwise. `forbidden` is the edge map of `mesh`.
 ///
+/// `max_dihedral` caps the worst dihedral angle of the search's
+/// triangulation, in radians; a best triangulation past it fails the same
+/// way. It applies to the search only, not the projection.
+///
 /// # Errors
 /// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
 pub(crate) fn triangulate_loop(
@@ -86,13 +90,14 @@ pub(crate) fn triangulate_loop(
     loop_vertices: &[VertexId],
     forbidden: &EdgeMap,
     dp_limit: usize,
+    max_dihedral: Option<f64>,
 ) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
     let n = loop_vertices.len();
     if n < 3 {
         return Ok(Err(FailReason::NoValidTriangulation));
     }
     if n <= dp_limit {
-        liepa(mesh, loop_vertices, forbidden)
+        liepa(mesh, loop_vertices, forbidden, max_dihedral)
     } else {
         projected(mesh, loop_vertices, forbidden)
     }
@@ -153,7 +158,11 @@ fn liepa(
     mesh: &Mesh,
     v: &[VertexId],
     edges: &EdgeMap,
+    max_dihedral: Option<f64>,
 ) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+    // `Weight::dihedral` is `1 - cos`, at most 2 (folded flat back); past π
+    // every triangulation passes.
+    let limit = max_dihedral.map(|m| 1.0 - m.min(std::f64::consts::PI).cos());
     let n = v.len();
     let mut p = Vec::new();
     reserve(&mut p, n)?;
@@ -210,6 +219,11 @@ fn liepa(
                     dihedral: worst,
                     area: left.area + right.area + area,
                 };
+                // Partial weights only grow as triangles join, so a partial
+                // past the limit can never come back under it.
+                if limit.is_some_and(|l| w.dihedral > l) {
+                    continue;
+                }
                 if w.better_than(best) {
                     best = w;
                     apex[i * n + k] = m as u32;

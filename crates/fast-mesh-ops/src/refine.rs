@@ -43,6 +43,9 @@ pub(crate) struct RefinedPatch {
     pub(crate) parents: Vec<[(u32, f32); 3]>,
     /// The patch triangles, wound like the triangulation.
     pub(crate) triangles: Vec<[u32; 3]>,
+    /// Whether refinement stopped early: the vertex budget was hit, or the
+    /// rounds ran out while triangles were still coarse.
+    pub(crate) capped: bool,
 }
 
 impl RefinedPatch {
@@ -70,6 +73,10 @@ impl RefinedPatch {
 /// The winding of `patch` is kept. With no usable σ at all, `patch` comes
 /// back unrefined.
 ///
+/// `max_vertices` caps the new vertices: splits stop once it is reached,
+/// and [`RefinedPatch::capped`] reports it, as it reports the rounds
+/// running out while triangles are still coarse.
+///
 /// # Errors
 /// [`OpsError::Store`] when memory runs out.
 pub(crate) fn refine(
@@ -78,6 +85,7 @@ pub(crate) fn refine(
     edges: &EdgeMap,
     loop_vertices: &[VertexId],
     patch: &[[VertexId; 3]],
+    max_vertices: Option<usize>,
 ) -> Result<RefinedPatch> {
     let mut old = Vec::new();
     reserve(&mut old, loop_vertices.len())?;
@@ -110,6 +118,7 @@ pub(crate) fn refine(
         points,
         parents: Vec::new(),
         triangles,
+        capped: false,
     };
     if count == 0 {
         return Ok(refined);
@@ -120,11 +129,14 @@ pub(crate) fn refine(
         }
     }
     let mut relax = Relax::default();
-    for _ in 0..MAX_ROUNDS {
-        let split = split_round(&mut refined, &mut sigma)?;
+    for round in 0..MAX_ROUNDS {
+        let split = split_round(&mut refined, &mut sigma, max_vertices)?;
         relax.run(&mut refined, edges)?;
-        if !split {
+        if refined.capped || !split {
             break;
+        }
+        if round + 1 == MAX_ROUNDS {
+            refined.capped = true;
         }
     }
     Ok(refined)
@@ -172,8 +184,14 @@ fn normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// Splits every triangle that is coarse for the target lengths `sigma` at
-/// its centroid, once; whether any was split.
-fn split_round(patch: &mut RefinedPatch, sigma: &mut Vec<f64>) -> Result<bool> {
+/// its centroid, once, up to `max_vertices` new vertices; whether any was
+/// split. A coarse triangle skipped for the budget marks the patch capped
+/// and ends the round.
+fn split_round(
+    patch: &mut RefinedPatch,
+    sigma: &mut Vec<f64>,
+    max_vertices: Option<usize>,
+) -> Result<bool> {
     let third = 1.0f32 / 3.0;
     let count = patch.triangles.len();
     let mut split = false;
@@ -191,6 +209,10 @@ fn split_round(patch: &mut RefinedPatch, sigma: &mut Vec<f64>) -> Result<bool> {
         });
         if !coarse {
             continue;
+        }
+        if max_vertices.is_some_and(|max| patch.new_vertices() >= max) {
+            patch.capped = true;
+            break;
         }
         let m = u32::try_from(patch.points.len())
             .ok()
@@ -358,10 +380,10 @@ mod tests {
         let l = loops.iter().min_by_key(|l| l.vertices.len()).unwrap();
         let edges = EdgeMap::build(mesh).unwrap();
         let fans = VertexFans::build(mesh).unwrap();
-        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200)
+        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200, None)
             .unwrap()
             .unwrap();
-        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris).unwrap();
+        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
         (l.vertices.clone(), patch)
     }
 
@@ -394,6 +416,36 @@ mod tests {
         assert!(patch.old.iter().all(|&v| mesh.is_vertex_alive(v)));
         let len = patch.points.len() as u32;
         assert!(patch.triangles.iter().flatten().all(|&v| v < len));
+    }
+
+    #[test]
+    fn vertex_budget_caps_refinement_and_reports_it() {
+        let mesh = punch_holes(&uv_sphere(32, 64, 1.0), &[[0.6, 0.0, 0.8]], 0.4);
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        let edges = EdgeMap::build(&mesh).unwrap();
+        let fans = VertexFans::build(&mesh).unwrap();
+        let tris = triangulate_loop(&mesh, &l.vertices, &edges, 200, None)
+            .unwrap()
+            .unwrap();
+        let full = refine(&mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
+        assert!(!full.capped);
+        let n = full.new_vertices();
+        assert!(n > 10, "{n}");
+        let capped = refine(&mesh, &fans, &edges, &l.vertices, &tris, Some(n / 2)).unwrap();
+        assert!(capped.capped);
+        assert!(capped.new_vertices() > 0);
+        assert!(
+            capped.new_vertices() <= n / 2,
+            "{} new vertices",
+            capped.new_vertices()
+        );
+        // A budget the patch fits in changes nothing.
+        let free = refine(&mesh, &fans, &edges, &l.vertices, &tris, Some(n)).unwrap();
+        assert!(!free.capped);
+        assert_eq!(free.new_vertices(), n);
+        assert_eq!(free.triangles.len(), full.triangles.len());
     }
 
     #[test]

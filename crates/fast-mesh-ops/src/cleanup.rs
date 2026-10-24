@@ -89,6 +89,40 @@ impl Default for DegenerateOptions {
     }
 }
 
+impl DegenerateOptions {
+    /// A builder for [`DegenerateOptions`]: every option unset, as
+    /// [`Default`], until set.
+    pub fn builder() -> DegenerateOptionsBuilder {
+        DegenerateOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`DegenerateOptions`], see [`DegenerateOptions::builder`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DegenerateOptionsBuilder {
+    options: DegenerateOptions,
+}
+
+impl DegenerateOptionsBuilder {
+    /// A triangle is degenerate when its area is at most this times its
+    /// longest edge squared.
+    pub fn area_epsilon(mut self, area_epsilon: f64) -> Self {
+        self.options.area_epsilon = area_epsilon;
+        self
+    }
+
+    /// Whether to remove the vertices no triangle uses afterwards.
+    pub fn remove_unused_vertices(mut self, remove_unused_vertices: bool) -> Self {
+        self.options.remove_unused_vertices = remove_unused_vertices;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> DegenerateOptions {
+        self.options
+    }
+}
+
 /// What [`remove_degenerate()`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DegenerateReport {
@@ -163,6 +197,45 @@ impl Default for ComponentOptions {
             min_area: None,
             keep_largest: true,
         }
+    }
+}
+
+impl ComponentOptions {
+    /// A builder for [`ComponentOptions`]: every option unset, as [`Default`],
+    /// until set.
+    pub fn builder() -> ComponentOptionsBuilder {
+        ComponentOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`ComponentOptions`], see [`ComponentOptions::builder`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComponentOptionsBuilder {
+    options: ComponentOptions,
+}
+
+impl ComponentOptionsBuilder {
+    /// Remove components with fewer triangles than this.
+    pub fn min_triangles(mut self, min_triangles: usize) -> Self {
+        self.options.min_triangles = Some(min_triangles);
+        self
+    }
+
+    /// Remove components with less area than this.
+    pub fn min_area(mut self, min_area: f64) -> Self {
+        self.options.min_area = Some(min_area);
+        self
+    }
+
+    /// Keep the largest component even when it is below a bound.
+    pub fn keep_largest(mut self, keep_largest: bool) -> Self {
+        self.options.keep_largest = keep_largest;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> ComponentOptions {
+        self.options
     }
 }
 
@@ -281,6 +354,40 @@ mod tests {
     use super::*;
     use crate::analyze::{AnalyzeOptions, analyze};
     use crate::test_util::*;
+
+    #[test]
+    fn builders_match_literals() {
+        assert_eq!(
+            DegenerateOptions::builder()
+                .area_epsilon(1e-6)
+                .remove_unused_vertices(false)
+                .build(),
+            DegenerateOptions {
+                area_epsilon: 1e-6,
+                remove_unused_vertices: false,
+            }
+        );
+        assert_eq!(
+            DegenerateOptions::builder().build(),
+            DegenerateOptions::default()
+        );
+        assert_eq!(
+            ComponentOptions::builder()
+                .min_triangles(10)
+                .min_area(2.0)
+                .keep_largest(false)
+                .build(),
+            ComponentOptions {
+                min_triangles: Some(10),
+                min_area: Some(2.0),
+                keep_largest: false,
+            }
+        );
+        assert_eq!(
+            ComponentOptions::builder().build(),
+            ComponentOptions::default()
+        );
+    }
 
     #[test]
     fn weld_merges_duplicates_and_drops_collapsed() {

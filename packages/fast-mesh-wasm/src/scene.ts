@@ -471,6 +471,10 @@ export type RepairOp =
       allowUnclean?: boolean;
       fair?: boolean;
       dpLimit?: number;
+      /** Reject a minimum-weight triangulation past this dihedral, in radians. */
+      maxDihedral?: number;
+      /** Stop refining a patch once it has this many new vertices. */
+      maxRefineVertices?: number;
     };
 
 /** What `weld` did. */
@@ -511,6 +515,8 @@ export interface FilledLoop {
   converged: boolean;
   /** The Laplacian weights fairing used; `null` when it did not run. */
   weights: "cotangent" | "uniform" | null;
+  /** Whether refinement stopped early on its vertex budget or rounds. */
+  refineCapped: boolean;
 }
 
 /** What `fillHoles` did, each list in loop order. */
@@ -754,6 +760,8 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           flagOf(o.allowUnclean, false),
           flagOf(o.fair, true),
           optional(o.dpLimit, "dpLimit"),
+          optional(o.maxDihedral, "maxDihedral"),
+          optional(o.maxRefineVertices, "maxRefineVertices"),
         );
         break;
       }
@@ -834,6 +842,7 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
           verticesAdded: r.next(),
           converged: r.flag(),
           weights: WEIGHTS[r.next()],
+          refineCapped: r.flag(),
         })),
         skipped: r.many(() => ({ id: r.loopId(), reason: SKIP_REASONS[r.next()] })),
         failed: r.many(() => ({ id: r.loopId(), reason: FAIL_REASONS[r.next()] })),
