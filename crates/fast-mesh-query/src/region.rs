@@ -423,8 +423,7 @@ mod tests {
                 let bounds = region.bounds();
                 for ax in 0..3 {
                     for _ in 0..1500 {
-                        let span = [1.0f32, 3.0, 10.0, 30.0]
-                            [(rng.next() * 4.0) as usize % 4];
+                        let span = [1.0f32, 3.0, 10.0, 30.0][(rng.next() * 4.0) as usize % 4];
                         let mut p = [[0.0f32; 3]; 3];
                         for v in p.iter_mut() {
                             for k in 0..3 {
@@ -442,8 +441,9 @@ mod tests {
                         if rng.next() < 0.5 {
                             // A sliver: the third corner near the first edge.
                             let s = rng.next();
-                            for k in 0..3 {
-                                p[2][k] = p[0][k] + s * (p[1][k] - p[0][k]);
+                            let (a, b) = (p[0], p[1]);
+                            for (c, (&x, &y)) in p[2].iter_mut().zip(a.iter().zip(b.iter())) {
+                                *c = x + s * (y - x);
                             }
                         }
                         if !p.iter().all(|v| v[ax] > bounds.max[ax]) {

@@ -21,8 +21,12 @@ type P2 = [f64; 2];
 
 /// The sign of `det[b - a, c - a, d - a]`: positive when `d` is on the side of
 /// the plane `abc` that `(b - a) × (c - a)` points to.
-fn side(a: P3, b: P3, c: P3, d: P3) -> i8 {
-    if ![a, b, c, d].iter().flatten().all(|&x| safe(x)) {
+///
+/// With `FAST`, every coordinate is already known to be [`safe`]
+/// ([`tri_tri_intersect`] checks the pair's 18 once), so `robust` is called
+/// directly; otherwise out-of-range coordinates fall back to [`exact`].
+fn side<const FAST: bool>(a: P3, b: P3, c: P3, d: P3) -> i8 {
+    if !FAST && ![a, b, c, d].iter().flatten().all(|&x| safe(x)) {
         return exact::side(a, b, c, d);
     }
     let c3 = |p: P3| Coord3D {
@@ -36,8 +40,9 @@ fn side(a: P3, b: P3, c: P3, d: P3) -> i8 {
 }
 
 /// The sign of `det[b - a, c - a]`, the 2D orientation of `a`, `b`, `c`.
-pub(crate) fn side2(a: P2, b: P2, c: P2) -> i8 {
-    if ![a, b, c].iter().flatten().all(|&x| safe(x)) {
+/// `FAST` skips the [`safe`] checks, as for [`side`].
+pub(crate) fn side2<const FAST: bool>(a: P2, b: P2, c: P2) -> i8 {
+    if !FAST && ![a, b, c].iter().flatten().all(|&x| safe(x)) {
         return exact::side2(a, b, c);
     }
     sign(orient2d_approx(a, b, c))
@@ -55,9 +60,25 @@ pub(crate) fn orient2d_approx(a: P2, b: P2, c: P2) -> f64 {
 ///
 /// `robust` implements Shewchuk's predicates, which are exact only when no
 /// intermediate value underflows or overflows. With every coordinate in this
-/// range, every value they compute stays in the normal `f64` range. Outside
-/// it (a coordinate such as `2^-1074`, for instance), the predicates fall back
-/// to [`exact`].
+/// range, that holds, by the grid the coordinates sit on:
+///
+/// - A safe nonzero coordinate is a normal `f64` of magnitude at least
+///   `2^-200`, so its ulp is at least `2^-252`: every safe coordinate is an
+///   exact multiple of `2^-252`.
+/// - Differences of safe coordinates are multiples of `2^-252` of magnitude
+///   at most `2^201`. Products of two are multiples of `2^-504` below
+///   `2^402`; the triple terms of a 3D determinant are multiples of `2^-756`
+///   below `2^603`. A nonzero exact determinant is therefore at least
+///   `2^-756`, more than 300 bits above the subnormal threshold, and every
+///   magnitude stays thousands of bits below overflow.
+/// - Every rounding inside the predicates meets a normal value: the adaptive
+///   stages only round sums and products of such values, whose nonzero
+///   magnitudes stay in the normal range (sums that cancel below it are
+///   Sterbenz-exact), so their relative error bounds hold; the exact stage
+///   then decides the true sign with exact expansion arithmetic.
+///
+/// Outside the range (a coordinate such as `2^-1074`, for instance), the
+/// predicates fall back to [`exact`].
 fn safe(x: f64) -> bool {
     const MIN: f64 = f64::from_bits((1023 - 200) << 52);
     const MAX: f64 = f64::from_bits((1023 + 200) << 52);
@@ -81,13 +102,14 @@ fn drop(p: P3, axis: usize) -> P2 {
 
 /// The axis of the largest component of `t`'s normal, or `None` when the
 /// three points are collinear (the normal is exactly zero). Dropping this axis
-/// projects `t`'s plane one-to-one onto a coordinate plane.
-fn normal_axis(t: &[P3; 3]) -> Option<usize> {
+/// projects `t`'s plane one-to-one onto a coordinate plane. `FAST` skips the
+/// [`safe`] checks, as for [`side`].
+fn normal_axis<const FAST: bool>(t: &[P3; 3]) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for k in 0..3 {
         let [a, b, c] = t.map(|p| drop(p, k));
         // The normal's component `k` is zero exactly when this sign is.
-        if side2(a, b, c) == 0 {
+        if side2::<FAST>(a, b, c) == 0 {
             continue;
         }
         // Its size, approximately (only used to pick the largest).
@@ -100,37 +122,56 @@ fn normal_axis(t: &[P3; 3]) -> Option<usize> {
 }
 
 /// True when the three corners of `t` are collinear (or coincide), decided
-/// exactly.
-pub(crate) fn collinear(t: &[P3; 3]) -> bool {
-    normal_axis(t).is_none()
+/// exactly. `FAST` skips the [`safe`] checks, as for [`side`].
+pub(crate) fn collinear<const FAST: bool>(t: &[P3; 3]) -> bool {
+    normal_axis::<FAST>(t).is_none()
 }
 
 /// True when the closed triangles `a` and `b` share at least one point.
 /// Touching at a vertex or along an edge counts. Exact for the given
 /// coordinates.
+///
+/// The answer is the same for `(a, b)` and `(b, a)`, because every
+/// branching decision is the exact sign of a predicate: no epsilon ever
+/// breaks a tie differently from the two sides. Keep it that way: any
+/// future tolerance must be symmetric in the two triangles.
 pub(crate) fn tri_tri_intersect(a: [P3; 3], b: [P3; 3]) -> bool {
+    // The 18 coordinates are checked once here, instead of at every
+    // predicate call: every sign below is computed from these same
+    // coordinates (projection only drops axes), so one check covers the
+    // whole pair, and the fast path calls `robust` directly.
+    if a.iter().chain(&b).flatten().all(|&x| safe(x)) {
+        tri_tri_inner::<true>(a, b)
+    } else {
+        tri_tri_inner::<false>(a, b)
+    }
+}
+
+/// [`tri_tri_intersect`] with the range already decided: `FAST` skips the
+/// [`safe`] checks, as for [`side`].
+fn tri_tri_inner<const FAST: bool>(a: [P3; 3], b: [P3; 3]) -> bool {
     // Where a's corners lie relative to b's plane. All zero when b is
     // degenerate.
-    let da = a.map(|p| side(b[0], b[1], b[2], p));
+    let da = a.map(|p| side::<FAST>(b[0], b[1], b[2], p));
     if same_strict_side(da) {
         return false;
     }
-    let db = b.map(|p| side(a[0], a[1], a[2], p));
+    let db = b.map(|p| side::<FAST>(a[0], a[1], a[2], p));
     if same_strict_side(db) {
         return false;
     }
     if da == [0; 3] || db == [0; 3] {
         // Coplanar, or at least one triangle is degenerate.
-        let (na, nb) = (normal_axis(&a), normal_axis(&b));
+        let (na, nb) = (normal_axis::<FAST>(&a), normal_axis::<FAST>(&b));
         return match (na, nb) {
-            (Some(axis), Some(_)) => coplanar(a, b, axis),
+            (Some(axis), Some(_)) => coplanar::<FAST>(a, b, axis),
             _ => {
-                (0..3).any(|i| seg_tri(a[i], a[(i + 1) % 3], &b, nb))
-                    || (0..3).any(|i| seg_tri(b[i], b[(i + 1) % 3], &a, na))
+                (0..3).any(|i| seg_tri::<FAST>(a[i], a[(i + 1) % 3], &b, nb))
+                    || (0..3).any(|i| seg_tri::<FAST>(b[i], b[(i + 1) % 3], &a, na))
             }
         };
     }
-    guigue_devillers(a, da, b, db)
+    guigue_devillers::<FAST>(a, da, b, db)
 }
 
 /// The distance between two triangles, with a closest pair of points.
@@ -336,8 +377,9 @@ fn lone_corner(d: [i8; 3]) -> (usize, bool) {
 
 /// Guigue and Devillers (2003), for two non-degenerate triangles that are not
 /// coplanar and that both straddle or touch the other's plane. `da` and `db`
-/// are the corner signs from [`tri_tri_intersect`].
-fn guigue_devillers(a: [P3; 3], da: [i8; 3], b: [P3; 3], db: [i8; 3]) -> bool {
+/// are the corner signs from [`tri_tri_intersect`]. `FAST` skips the [`safe`]
+/// checks, as for [`side`].
+fn guigue_devillers<const FAST: bool>(a: [P3; 3], da: [i8; 3], b: [P3; 3], db: [i8; 3]) -> bool {
     // Rotate a so its lone corner comes first; if that corner is on the
     // negative side of b, swap b's last two corners (flipping b's normal) so
     // that it is on the positive side.
@@ -356,56 +398,59 @@ fn guigue_devillers(a: [P3; 3], da: [i8; 3], b: [P3; 3], db: [i8; 3]) -> bool {
     }
     // The segments where each triangle crosses the line of the two planes
     // overlap exactly when these two orientations allow it.
-    side(q1, p2, p1, q2) <= 0 && side(p1, p2, r1, r2) <= 0
+    side::<FAST>(q1, p2, p1, q2) <= 0 && side::<FAST>(p1, p2, r1, r2) <= 0
 }
 
 /// Two coplanar non-degenerate triangles, projected by dropping `axis`.
-fn coplanar(a: [P3; 3], b: [P3; 3], axis: usize) -> bool {
+/// `FAST` skips the [`safe`] checks, as for [`side`].
+fn coplanar<const FAST: bool>(a: [P3; 3], b: [P3; 3], axis: usize) -> bool {
     let a = a.map(|p| drop(p, axis));
     let b = b.map(|p| drop(p, axis));
     // If no edges meet, the triangles are either disjoint or one holds the
     // other entirely, so one corner of each settles it.
-    (0..3).any(|i| (0..3).any(|j| seg_seg_2d(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3])))
-        || in_tri_2d(a[0], &b)
-        || in_tri_2d(b[0], &a)
+    (0..3).any(|i| (0..3).any(|j| seg_seg_2d::<FAST>(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3])))
+        || in_tri_2d::<FAST>(a[0], &b)
+        || in_tri_2d::<FAST>(b[0], &a)
 }
 
 /// True when the closed segment `pq` (possibly a single point) meets the closed
-/// triangle `t`. `axis` is `normal_axis(t)`.
-fn seg_tri(p: P3, q: P3, t: &[P3; 3], axis: Option<usize>) -> bool {
+/// triangle `t`. `axis` is `normal_axis(t)`. `FAST` skips the [`safe`] checks,
+/// as for [`side`].
+fn seg_tri<const FAST: bool>(p: P3, q: P3, t: &[P3; 3], axis: Option<usize>) -> bool {
     let Some(axis) = axis else {
         // A degenerate triangle is the union of its edges.
-        return (0..3).any(|i| seg_seg_3d(p, q, t[i], t[(i + 1) % 3]));
+        return (0..3).any(|i| seg_seg_3d::<FAST>(p, q, t[i], t[(i + 1) % 3]));
     };
-    let sp = side(t[0], t[1], t[2], p);
-    let sq = side(t[0], t[1], t[2], q);
+    let sp = side::<FAST>(t[0], t[1], t[2], p);
+    let sq = side::<FAST>(t[0], t[1], t[2], q);
     if sp * sq > 0 {
         return false;
     }
     if sp == 0 && sq == 0 {
         let t2 = t.map(|v| drop(v, axis));
         let (p2, q2) = (drop(p, axis), drop(q, axis));
-        return in_tri_2d(p2, &t2) || (0..3).any(|i| seg_seg_2d(p2, q2, t2[i], t2[(i + 1) % 3]));
+        return in_tri_2d::<FAST>(p2, &t2)
+            || (0..3).any(|i| seg_seg_2d::<FAST>(p2, q2, t2[i], t2[(i + 1) % 3]));
     }
     // pq meets the plane at one point. It lies in t exactly when the line
     // through p and q passes every edge of t on the same side (or through it).
-    let s = [0, 1, 2].map(|i| side(p, q, t[i], t[(i + 1) % 3]));
+    let s = [0, 1, 2].map(|i| side::<FAST>(p, q, t[i], t[(i + 1) % 3]));
     !(s.contains(&1) && s.contains(&-1))
 }
 
 /// True when the closed segments `pq` and `rs` in 3D (either possibly a point)
-/// share a point.
-fn seg_seg_3d(p: P3, q: P3, r: P3, s: P3) -> bool {
-    if side(p, q, r, s) != 0 {
+/// share a point. `FAST` skips the [`safe`] checks, as for [`side`].
+fn seg_seg_3d<const FAST: bool>(p: P3, q: P3, r: P3, s: P3) -> bool {
+    if side::<FAST>(p, q, r, s) != 0 {
         return false;
     }
     // Coplanar: find a plane through three of the points that are not
     // collinear and project along its normal.
     let axis = [[p, q, r], [p, q, s], [r, s, p], [r, s, q]]
         .iter()
-        .find_map(normal_axis);
+        .find_map(normal_axis::<FAST>);
     match axis {
-        Some(k) => seg_seg_2d(drop(p, k), drop(q, k), drop(r, k), drop(s, k)),
+        Some(k) => seg_seg_2d::<FAST>(drop(p, k), drop(q, k), drop(r, k), drop(s, k)),
         // All four points on one line: the segments meet when an endpoint of
         // one lies within the other.
         None => between(p, q, r) || between(p, q, s) || between(r, s, p) || between(r, s, q),
@@ -418,10 +463,10 @@ fn between<const N: usize>(a: [f64; N], b: [f64; N], x: [f64; N]) -> bool {
 }
 
 /// True when the closed 2D segments `pq` and `rs` (either possibly a point)
-/// share a point.
-fn seg_seg_2d(p: P2, q: P2, r: P2, s: P2) -> bool {
-    let (d1, d2) = (side2(p, q, r), side2(p, q, s));
-    let (d3, d4) = (side2(r, s, p), side2(r, s, q));
+/// share a point. `FAST` skips the [`safe`] checks, as for [`side`].
+fn seg_seg_2d<const FAST: bool>(p: P2, q: P2, r: P2, s: P2) -> bool {
+    let (d1, d2) = (side2::<FAST>(p, q, r), side2::<FAST>(p, q, s));
+    let (d3, d4) = (side2::<FAST>(r, s, p), side2::<FAST>(r, s, q));
     (d1 * d2 < 0 && d3 * d4 < 0)
         || (d1 == 0 && between(p, q, r))
         || (d2 == 0 && between(p, q, s))
@@ -430,9 +475,9 @@ fn seg_seg_2d(p: P2, q: P2, r: P2, s: P2) -> bool {
 }
 
 /// True when `x` lies in the closed 2D triangle `t`, which must not be
-/// degenerate.
-fn in_tri_2d(x: P2, t: &[P2; 3]) -> bool {
-    let s = [0, 1, 2].map(|i| side2(t[i], t[(i + 1) % 3], x));
+/// degenerate. `FAST` skips the [`safe`] checks, as for [`side`].
+fn in_tri_2d<const FAST: bool>(x: P2, t: &[P2; 3]) -> bool {
+    let s = [0, 1, 2].map(|i| side2::<FAST>(t[i], t[(i + 1) % 3], x));
     !(s.contains(&1) && s.contains(&-1))
 }
 
@@ -585,12 +630,14 @@ mod tests {
     #[test]
     fn orient_sign_convention() {
         let o = [0.0; 3];
-        assert!(side(o, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]) > 0);
-        assert!(side(o, [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]) < 0);
+        assert!(side::<false>(o, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]) > 0);
+        assert!(side::<false>(o, [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]) < 0);
         assert_eq!(
-            side(o, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [5.0, 7.0, 0.0]),
+            side::<false>(o, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [5.0, 7.0, 0.0]),
             0
         );
+        // The fast path agrees on safe coordinates.
+        assert!(side::<true>(o, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]) > 0);
     }
 
     #[test]
@@ -715,12 +762,86 @@ mod tests {
         assert!(!both(s, [[0.25, 0.25, 1.0]; 3]));
     }
 
-    /// Reference: two closed triangles meet exactly when an edge of one meets
-    /// the other.
-    fn by_edges(a: [P3; 3], b: [P3; 3]) -> bool {
-        let (na, nb) = (normal_axis(&a), normal_axis(&b));
-        (0..3).any(|i| seg_tri(a[i], a[(i + 1) % 3], &b, nb))
-            || (0..3).any(|i| seg_tri(b[i], b[(i + 1) % 3], &a, na))
+    /// Independent reference: two closed triangles meet exactly when an edge
+    /// of one meets the other. Written separately from the production
+    /// `seg_tri`/`seg_seg_3d`, on the signs of the `exact` module alone
+    /// (verified against `robust` by `exact_fallback_matches_robust`), with
+    /// its own projection-axis choice.
+    fn oracle_by_edges(a: [P3; 3], b: [P3; 3]) -> bool {
+        (0..3).any(|i| o_seg_tri(a[i], a[(i + 1) % 3], b))
+            || (0..3).any(|i| o_seg_tri(b[i], b[(i + 1) % 3], a))
+    }
+
+    /// The first axis whose projected triangle has nonzero area, or `None`
+    /// for a collinear triple. Production takes the largest; any nonzero
+    /// one projects one-to-one.
+    fn o_axis(t: [P3; 3]) -> Option<usize> {
+        (0..3).find(|&k| {
+            let [a, b, c] = t.map(|p| drop(p, k));
+            exact::side2(a, b, c) != 0
+        })
+    }
+
+    fn o_seg_tri(p: P3, q: P3, t: [P3; 3]) -> bool {
+        let Some(k) = o_axis(t) else {
+            // A collinear triangle is the union of its edges.
+            return (0..3).any(|i| o_seg_seg(p, q, t[i], t[(i + 1) % 3]));
+        };
+        match (
+            exact::side(t[0], t[1], t[2], p),
+            exact::side(t[0], t[1], t[2], q),
+        ) {
+            // Both ends in the plane: a 2D problem.
+            (0, 0) => {
+                let t2 = t.map(|v| drop(v, k));
+                let (p2, q2) = (drop(p, k), drop(q, k));
+                o_in_tri(p2, t2)
+                    || o_in_tri(q2, t2)
+                    || (0..3).any(|i| o_seg_seg_2d(p2, q2, t2[i], t2[(i + 1) % 3]))
+            }
+            // Both ends strictly on one side.
+            (s, t) if s == t => false,
+            // Straddling, or one end on the plane: the crossing point lies
+            // in `t` exactly when `pq` meets every edge-line on the same
+            // closed side.
+            _ => {
+                let s = [0, 1, 2].map(|i| exact::side(p, q, t[i], t[(i + 1) % 3]));
+                !(s.contains(&1) && s.contains(&-1))
+            }
+        }
+    }
+
+    fn o_seg_seg(p: P3, q: P3, r: P3, s: P3) -> bool {
+        if exact::side(p, q, r, s) != 0 {
+            return false;
+        }
+        // Coplanar: project along the normal of a non-collinear triple.
+        for t in [[p, q, r], [p, q, s], [r, s, p], [r, s, q]] {
+            if let Some(k) = o_axis(t) {
+                return o_seg_seg_2d(drop(p, k), drop(q, k), drop(r, k), drop(s, k));
+            }
+        }
+        // One line: an endpoint of one in the other.
+        o_between(p, q, r) || o_between(p, q, s) || o_between(r, s, p) || o_between(r, s, q)
+    }
+
+    fn o_between<const N: usize>(a: [f64; N], b: [f64; N], x: [f64; N]) -> bool {
+        (0..N).all(|k| a[k].min(b[k]) <= x[k] && x[k] <= a[k].max(b[k]))
+    }
+
+    fn o_seg_seg_2d(p: P2, q: P2, r: P2, s: P2) -> bool {
+        // An endpoint on the other segment, or a proper crossing.
+        let on = |a: P2, b: P2, x: P2| exact::side2(a, b, x) == 0 && o_between(a, b, x);
+        on(p, q, r) || on(p, q, s) || on(r, s, p) || on(r, s, q) || {
+            let c1 = exact::side2(p, q, r) * exact::side2(p, q, s);
+            let c2 = exact::side2(r, s, p) * exact::side2(r, s, q);
+            c1 < 0 && c2 < 0
+        }
+    }
+
+    fn o_in_tri(x: P2, t: [P2; 3]) -> bool {
+        let s = [0, 1, 2].map(|i| exact::side2(t[i], t[(i + 1) % 3], x));
+        !(s.contains(&1) && s.contains(&-1))
     }
 
     #[test]
@@ -734,7 +855,7 @@ mod tests {
             let a: [P3; 3] = std::array::from_fn(|_| pick());
             let b: [P3; 3] = std::array::from_fn(|_| pick());
             let got = both(a, b);
-            assert_eq!(got, by_edges(a, b), "{a:?} {b:?}");
+            assert_eq!(got, oracle_by_edges(a, b), "{a:?} {b:?}");
             hits += usize::from(got);
         }
         assert!(hits > 1000 && hits < 19_000, "{hits}");
@@ -1108,7 +1229,7 @@ mod tests {
                 b[0] = std::array::from_fn(|k| b[0][k] - d * n[k]);
             }
             let got = both(a, b);
-            assert_eq!(got, by_edges(a, b), "{a:?} {b:?}");
+            assert_eq!(got, oracle_by_edges(a, b), "{a:?} {b:?}");
             hits += usize::from(got);
         }
         assert!(hits > 100, "{hits}");

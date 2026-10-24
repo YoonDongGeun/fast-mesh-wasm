@@ -130,8 +130,8 @@ pub fn intersecting_pairs(.., out: &mut Vec<(TriangleId, TriangleId)>) -> Result
 **Simultaneous traversal**
 - It starts from a pair of nodes. At each step it descends into the node with the larger box surface area, or the inner one if the other is a leaf.
 - It prunes a pair when the boxes are disjoint after inflating by the current bound. The bound is `margin` for `triangles_near`, the best distance so far for `mesh_distance`, and 0 for the intersection queries.
-- The pair stack is a fixed array. On overflow, a pair is finished by nested traversals: walk A's subtree stackless, and for each A leaf walk B's subtree stackless. This is correct, just slower.
-- `mesh_distance` visits the nearer child pair first, ordered by box–box distance.
+- The pair stack is a fixed array. On overflow, a pair is finished by nested traversals: walk B's subtree stackless, and for each B leaf walk A's subtree stackless, so each B box is transformed once. This is correct, just slower.
+- `mesh_distance` visits the nearer child pair first, ordered by box–box distance plus a `1e-12` centre-distance tie-break (see §10): among touching leaf boxes the most overlapping come first, and pruning still reads the box gap alone.
 
 **Triangle–triangle intersection**
 - Use the Guigue–Devillers or Möller test with `orient3d` signs from `robust`, so the classification is exact.

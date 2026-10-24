@@ -264,7 +264,10 @@ mod tests {
             .unwrap();
         assert_eq!(h.distance, 0.0);
         assert_eq!(h.point, [1.0, 1.0, 0.0]);
-        assert_eq!(closest_point(&flat, &bvh, [1.0, 1.0, 1e-6], &opts), Ok(None));
+        assert_eq!(
+            closest_point(&flat, &bvh, [1.0, 1.0, 1e-6], &opts),
+            Ok(None)
+        );
         assert_eq!(closest_point(&flat, &bvh, [5.0, 5.0, 0.0], &opts), Ok(None));
     }
 

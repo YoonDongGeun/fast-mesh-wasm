@@ -248,7 +248,7 @@ fn intersecting(mesh: &Mesh, a: TriangleId, b: TriangleId) -> Option<(TriangleId
     });
     // A repeated vertex id makes the corners collinear. Degeneracy only
     // matters for pairs that intersect, so it is decided last.
-    (!apart && tri_tri_intersect(pa, pb) && !collinear(&pa) && !collinear(&pb))
+    (!apart && tri_tri_intersect(pa, pb) && !collinear::<false>(&pa) && !collinear::<false>(&pb))
         .then_some((a.min(b), a.max(b)))
 }
 
@@ -342,7 +342,11 @@ mod tests {
             for b in (a + 1..n).filter(|&t| mesh.is_triangle_alive(t)) {
                 let ((va, pa), (vb, pb)) = (tri(a), tri(b));
                 let shared = va.iter().any(|v| vb.contains(v));
-                if !shared && !collinear(&pa) && !collinear(&pb) && tri_tri_intersect(pa, pb) {
+                if !shared
+                    && !collinear::<false>(&pa)
+                    && !collinear::<false>(&pb)
+                    && tri_tri_intersect(pa, pb)
+                {
                     out.push((a, b));
                 }
             }

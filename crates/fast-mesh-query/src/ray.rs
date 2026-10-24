@@ -987,8 +987,12 @@ mod tests {
                 let corner = |rng: &mut Lcg| -> [f32; 3] {
                     std::array::from_fn(|k| base[k] + (rng.next() * 2.0 - 1.0))
                 };
-                let (e0, e1, a, b) =
-                    (corner(&mut rng), corner(&mut rng), corner(&mut rng), corner(&mut rng));
+                let (e0, e1, a, b) = (
+                    corner(&mut rng),
+                    corner(&mut rng),
+                    corner(&mut rng),
+                    corner(&mut rng),
+                );
                 let mp: [f32; 3] = if rng.next() < 0.5 {
                     // The shared edge midpoint: ties are common.
                     std::array::from_fn(|k| (e0[k] + e1[k]) / 2.0)

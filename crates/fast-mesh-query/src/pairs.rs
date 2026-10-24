@@ -528,6 +528,8 @@ impl Chunk {
     /// Fills the chunk with the triangles `ids` (at most [`CHUNK`]), each
     /// placed in A's space by `place`, unless it already holds them.
     fn fill(&mut self, ids: &[TriangleId], place: impl Fn(TriangleId) -> [P3; 3]) {
+        // Only `CHUNK` slots are filled below, while `len` takes `ids.len()`.
+        debug_assert!(ids.len() <= CHUNK);
         let from = Some((ids.as_ptr(), ids.len()));
         if self.from == from {
             return;
@@ -628,8 +630,10 @@ thread_local! {
     static PAIR_SKIPS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Test-only: counts `n` triangle pairs skipped by a lower bound, on the
-/// calling thread only (see [`LEAF_VISITS`]).
+/// Test-only: counts `n` triangle pairs skipped without the exact test, on
+/// the calling thread only (see [`LEAF_VISITS`]): by a lower bound in
+/// [`for_each_near_pair` ([`chunk_pairs`]), and by disjoint boxes in
+/// [`for_each_pair`].
 fn count_skips(n: usize) {
     #[cfg(test)]
     PAIR_SKIPS.with(|c| c.set(c.get() + n));
@@ -1872,7 +1876,19 @@ mod tests {
                 if wd.dist2 > 0.0 {
                     assert_eq!(other, got);
                 } else {
+                    // The overflow fallback may find another intersecting
+                    // pair than the stacked traversal, but it must be an
+                    // intersecting one, with coincident points.
                     assert_eq!(other.distance, 0.0);
+                    assert_eq!(other.point_a, other.point_b);
+                    let (pa, pb) = (
+                        tri_a(&ma, other.triangle_a),
+                        tri_b(&mb, &xf, other.triangle_b),
+                    );
+                    assert!(
+                        tri_tri_intersect(pa, pb) || tri_tri_distance(pa, pb).dist2 == 0.0,
+                        "gap {gap}, {pa:?} {pb:?}"
+                    );
                 }
             }
             if wd.dist2 == 0.0 {
@@ -2369,17 +2385,6 @@ mod tests {
 
         let mut cases = 0;
         let mut rng = Lcg(0x22);
-        let tilt = |rng: &mut Lcg| -> M3 {
-            // A random turn by up to about 3° about a random axis.
-            let r = random_rotation(rng);
-            let s = 0.05;
-            std::array::from_fn(|i| {
-                std::array::from_fn(|j| {
-                    let id = if i == j { 1.0 } else { 0.0 };
-                    id + s * (r[i][j] - r[j][i])
-                })
-            })
-        };
         // Wavy meshes: B's lowest vertex `gap` over a peak of A.
         let (ma, mb) = (wavy(6), wavy(5));
         for gap in [1e-6, 1e-5, 3e-4, 3e-3] {
@@ -2393,7 +2398,7 @@ mod tests {
         let (ma, mb) = (bumps(8), bumps(7));
         for gap in [1e-5, 1e-4, 2e-3] {
             for deg in [0.0, 2.5, 7.0] {
-                let skew = tilt(&mut rng);
+                let skew = random_small_turn(&mut rng);
                 // Orthonormalized, so that `Rigid::validate` accepts it.
                 let rot = orthonormal(&mul(&rot_z(deg), &skew));
                 let mut xf = Rigid {
