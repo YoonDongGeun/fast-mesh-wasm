@@ -868,13 +868,19 @@ class Engine {
    * ({@link Engine.#pack}); with `land`, lands it once copied (landing
    * changes the scene, which would drop an open field step unit: the
    * unit's loop steps without landing; copying changes nothing). A build
-   * that fails is dropped, with an error status for its add. `false` once
-   * poisoned.
+   * that fails is dropped, with an error status for its add. Without
+   * `copy`, a built add lands at once and the frame copies its buffers.
+   * `false` once poisoned.
    */
-  async #advanceAdd(land = true, failed?: Request): Promise<boolean> {
+  async #advanceAdd(land = true, failed?: Request, copy = true): Promise<boolean> {
     const a = this.#adds[0];
     if (a === undefined) {
       return true;
+    }
+    if (a.built && !copy && land) {
+      // The frame copies the buffers anyway: land as built.
+      a.packed = undefined;
+      return this.#land(a, failed);
     }
     if (!a.built) {
       try {
@@ -892,6 +898,26 @@ class Engine {
       this.#onChunk?.({ kind: "addMeshPack", id: a.id });
     }
     return packedAll(a.packed) && land ? this.#land(a, failed) : true;
+  }
+
+  /**
+   * Whether `req` may change the positions, normals or triangles of the
+   * mesh `id`: an edit, repair, compaction or removal of it, or any undo
+   * or redo.
+   */
+  #changesMesh(req: Request, id: ClientId): boolean {
+    switch (req.kind) {
+      case "edit":
+      case "repair":
+      case "compact":
+      case "removeMesh":
+        return req.id === id;
+      case "undo":
+      case "redo":
+        return true;
+      default:
+        return false;
+    }
   }
 
   /**
@@ -945,23 +971,10 @@ class Engine {
     if (this.#packed.size === 0 || this.#keepCopies) {
       return;
     }
-    switch (req.kind) {
-      case "edit":
-      case "repair":
-      case "compact":
-      case "removeMesh": {
-        const h = this.#meshes.get(req.id);
-        if (h !== undefined) {
-          this.#packed.delete(h);
-        }
-        break;
+    for (const h of [...this.#packed.keys()]) {
+      if (this.#changesMesh(req, this.#meshId(h))) {
+        this.#packed.delete(h);
       }
-      case "undo":
-      case "redo":
-        this.#packed.clear();
-        break;
-      default:
-        break;
     }
   }
 
@@ -972,7 +985,9 @@ class Engine {
    * what is left of its BVH at once with the parallel one-call build
    * (several times faster than steps). Single-threaded the two cost the
    * same, so it keeps stepping, yielding (to receive only) between steps,
-   * so that newer batches still arrive and coalesce.
+   * so that newer batches still arrive and coalesce; it skips the copy of
+   * an add's buffers when `failed` changes that mesh (the frame copies
+   * them anyway).
    */
   async #finishAdds(failed?: Request): Promise<boolean> {
     while (this.#adds.length > 0) {
@@ -982,7 +997,10 @@ class Engine {
         }
         continue;
       }
-      if (!(await this.#advanceAdd(true, failed))) {
+      // No copy of an add's buffers when the waiting request changes it:
+      // the frame would copy them again.
+      const copy = failed === undefined || !this.#changesMesh(failed, this.#adds[0].id);
+      if (!(await this.#advanceAdd(true, failed, copy))) {
         return false;
       }
       if (this.#adds.length > 0) {

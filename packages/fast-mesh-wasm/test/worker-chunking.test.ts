@@ -421,13 +421,16 @@ describe("background adds", () => {
   it("an_edit_in_the_landing_batch_packs_the_edited_mesh", async () => {
     // The buffers copied out before the landing are those of the mesh as
     // built: an edit after it lands, in the same frame, is packed instead.
+    // So when the request waiting on the add is that edit, no copy is made
+    // at all (review M1).
     const h = addEngine();
     h.send([addMeshReq(1, A), addMeshReq(2, B)]);
     await h.until(() => h.results().length === 1);
     const op: EditOp = { op: "setPositions", vertices: [41], positions: [1.1, 6.2, 0.9] };
     h.send([addMeshReq(3, BIG), { kind: "edit", rev: rev(), id: 3, payload: [op] }]);
     await h.until(() => h.results().length === 2);
-    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(true);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(false);
+    expect(h.chunks.filter((c) => c.kind === "addMeshStep").length).toBeGreaterThan(10);
     const r = h.results()[1];
     expect(r.status.map((st) => st.key)).toEqual(["mesh:3", "edit:3"]);
     const added = r.changes.find((c) => c.id === 3);
@@ -748,7 +751,7 @@ describe("background add landings against a synchronous scene", () => {
   // not made), the bytes are the frame's.
   type Mesh = { positions: Float64Array; indices: Uint32Array };
   const add = (id: ClientId, mesh: Mesh, normals: boolean): Request => ({
-    ...addMeshReq(id, mesh),
+    ...(addMeshReq(id, mesh) as Extract<Request, { kind: "addMesh" }>),
     options: { normals },
   });
   const moved: EditOp[] = [{ op: "setPositions", vertices: [41], positions: [1, 6, 1] }];
