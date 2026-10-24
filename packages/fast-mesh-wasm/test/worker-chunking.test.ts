@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { Scene } from "../src/node.js";
 import { WasmScene } from "../src/wasm/fast_mesh_wasm.js";
 import { runEngine } from "../src/worker/engine.js";
+import type { EditOp } from "../src/node.js";
 import type { ClientId, Request, Result } from "../src/worker/protocol.js";
 
 const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -258,7 +259,13 @@ type Posted = { update: boolean; result: Result };
  * small steps, and an update channel.
  */
 function addEngine(
-  options: { backgroundAddTriangles?: number; stepPoints?: number; addStepWork?: number; threads?: number } = {},
+  options: {
+    backgroundAddTriangles?: number;
+    stepPoints?: number;
+    addStepWork?: number;
+    threads?: number;
+    keepCopies?: boolean;
+  } = {},
 ) {
   const posted: Posted[] = [];
   const chunks: { kind: string; id?: ClientId }[] = [];
@@ -306,6 +313,7 @@ function addEngine(
       yieldMs: 0,
       addStepWork: options.addStepWork ?? 64,
       threads: options.threads,
+      keepCopies: options.keepCopies,
       stepPoints: options.stepPoints,
       backgroundAddTriangles: options.backgroundAddTriangles ?? 2000,
       onChunk: (chunk) => {
@@ -323,13 +331,16 @@ function placement(id: ClientId, x: number): Request {
   return { kind: "setPlacement", rev: rev(), id, rotation: IDENTITY, translation: [x, 0, 0], key: `placement:${id}` };
 }
 
-/** A synchronous scene's buffers of `mesh` added after A and B. */
-function referenceBuffers() {
+/** A synchronous scene's buffers of BIG added after A and B, then edited by `ops`. */
+function referenceBuffers(ops: EditOp[] = []) {
   const s = new Scene();
   try {
     s.addMesh(A.positions, A.indices);
     s.addMesh(B.positions, B.indices);
     const m = s.addMesh(BIG.positions, BIG.indices);
+    if (ops.length > 0) {
+      s.edit(m, ops);
+    }
     const v = s.views(m);
     return {
       positions: v.positions().slice(),
@@ -382,6 +393,112 @@ describe("background adds", () => {
     expect(u.placements.map((p) => p.id)).toEqual([3]);
   });
 
+  it("the_landing_is_copied_out_in_steps_before_it_lands", async () => {
+    // Issue #64: the normals are computed in the build's steps and the
+    // render buffers copied out in steps of their own, after the BVH, so
+    // that landing packs nothing large in one piece. The record is the same,
+    // bit for bit, as a synchronous add's.
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    h.send([addMeshReq(3, BIG)]);
+    await h.until(() => h.chunks.some((c) => c.kind === "addMesh" && c.id === 3) && h.posted.some((p) => p.update));
+    const kinds = h.chunks.map((c) => c.kind);
+    const packs = kinds.filter((k) => k === "addMeshPack").length;
+    expect(packs).toBeGreaterThan(5);
+    expect(kinds.lastIndexOf("addMeshStep")).toBeLessThan(kinds.indexOf("addMeshPack"));
+    expect(kinds.lastIndexOf("addMeshPack")).toBeLessThan(kinds.lastIndexOf("addMesh"));
+    const u = h.posted.find((p) => p.update)?.result as Result;
+    const added = u.changes.find((c) => c.id === 3);
+    const ref = referenceBuffers();
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
+  });
+
+  it("an_edit_in_the_landing_batch_packs_the_edited_mesh", async () => {
+    // The buffers copied out before the landing are those of the mesh as
+    // built: an edit after it lands, in the same frame, is packed instead.
+    // So when the request waiting on the add is that edit, no copy is made
+    // at all (review M1).
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const op: EditOp = { op: "setPositions", vertices: [41], positions: [1.1, 6.2, 0.9] };
+    h.send([addMeshReq(3, BIG), { kind: "edit", rev: rev(), id: 3, payload: [op] }]);
+    await h.until(() => h.results().length === 2);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(false);
+    expect(h.chunks.filter((c) => c.kind === "addMeshStep").length).toBeGreaterThan(10);
+    const r = h.results()[1];
+    expect(r.status.map((st) => st.key)).toEqual(["mesh:3", "edit:3"]);
+    const added = r.changes.find((c) => c.id === 3);
+    expect(added?.added).toBe(true);
+    const ref = referenceBuffers([op]);
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
+    expect(same(added?.bytes.positions, referenceBuffers().positions)).toBe(false);
+  });
+
+  it("the_copies_are_checked_against_the_mesh_when_packed", async () => {
+    // Review I1: with the early drop of the copies turned off, an edit
+    // after the landing (a placement waits on the add, which lands with
+    // its copies, then the edit runs) is still packed as edited: the
+    // copies carry the mesh's content stamp, checked at packing time.
+    const h = addEngine({ keepCopies: true });
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const op: EditOp = { op: "setPositions", vertices: [41], positions: [1.1, 6.2, 0.9] };
+    h.send([addMeshReq(3, BIG), placement(3, 0), { kind: "edit", rev: rev(), id: 3, payload: [op] }]);
+    await h.until(() => h.results().length === 2);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(true);
+    const added = h.results()[1].changes.find((c) => c.id === 3);
+    const ref = referenceBuffers([op]);
+    const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+      got != null && want !== null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+    expect(same(added?.bytes.positions, ref.positions)).toBe(true);
+    expect(same(added?.bytes.normals, ref.normals)).toBe(true);
+    expect(same(added?.bytes.indices, ref.indices)).toBe(true);
+  });
+
+  it("a_copy_that_cannot_be_allocated_leaves_it_to_the_frame", async () => {
+    // Review M2: when the copy's memory cannot be allocated, the add still
+    // lands, and the frame copies its buffers (bit for bit as before).
+    const h = addEngine();
+    h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+    await h.until(() => h.results().length === 1);
+    const original = globalThis.ArrayBuffer;
+    const big = BIG.positions.length * 4; // the positions' f32 bytes
+    let refused = 0;
+    globalThis.ArrayBuffer = new Proxy(original, {
+      construct(target, args, newTarget) {
+        if (args[0] === big) {
+          refused++;
+          throw new RangeError("Array buffer allocation failed");
+        }
+        return Reflect.construct(target, args, newTarget);
+      },
+    });
+    try {
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.posted.some((p) => p.update));
+    } finally {
+      globalThis.ArrayBuffer = original;
+    }
+    expect(refused).toBeGreaterThan(0);
+    const u = h.posted.find((p) => p.update)?.result as Result;
+    expect(u.status).toEqual([{ key: "mesh:3", rev: expect.any(Number), status: "ready" }]);
+    const added = u.changes.find((c) => c.id === 3);
+    const ref = referenceBuffers();
+    expect(Buffer.from(added?.bytes.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+    expect(Buffer.from(added?.bytes.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
+    expect(Buffer.from(added?.bytes.indices as ArrayBuffer).equals(Buffer.from(ref.indices.buffer))).toBe(true);
+  });
+
   it("a_waiting_request_steps_the_add_single_threaded", async () => {
     // Re-review R1: single-threaded, a request waiting on a background add
     // still lets the add go on in steps with yields (the one-call build
@@ -420,14 +537,22 @@ describe("background adds", () => {
     // gives a background add; the rest in the call that lands it.
     const steps = h.chunks.filter((c) => c.kind === "addMeshStep" && c.id === 3).length;
     expect(steps).toBeLessThanOrEqual(1);
+    expect(h.chunks.some((c) => c.kind === "addMeshPack")).toBe(false);
     expect(h.results()[1].status.map((st) => st.key)).toEqual(["mesh:3", "placement:3"]);
+    // Packed at the frame, as before: the same buffers as a synchronous add.
+    const bytes = h.results()[1].changes.find((c) => c.id === 3)?.bytes;
+    const ref = referenceBuffers();
+    expect(Buffer.from(bytes?.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+    expect(Buffer.from(bytes?.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
   });
 
   it("add_step_work_is_clamped", async () => {
-    // Review M1: an unbounded step (Infinity) builds the whole mesh in one
-    // step instead of wrapping to nothing; NaN and values below 1 fall back
-    // to the default (100,000 units: one step for this mesh too); 2 units
-    // take many steps.
+    // Review M1: an unbounded step (Infinity) builds the whole tree in one
+    // step instead of wrapping to nothing; since #64 its treelets are
+    // assigned in a second, the normals computed in a third and the
+    // buffers copied in one more. NaN and values below 1 fall back to the
+    // default (100,000 units: the same steps for this mesh); 2 units take
+    // many steps.
     for (const addStepWork of [Number.POSITIVE_INFINITY, 2 ** 40, Number.NaN, -5, 2]) {
       const h = addEngine({ addStepWork });
       h.send([addMeshReq(1, A)]);
@@ -435,10 +560,12 @@ describe("background adds", () => {
       h.send([addMeshReq(3, BIG)]);
       await h.until(() => h.chunks.some((c) => c.kind === "addMesh" && c.id === 3));
       const steps = h.chunks.filter((c) => c.kind === "addMeshStep").length;
+      const packs = h.chunks.filter((c) => c.kind === "addMeshPack").length;
       if (addStepWork === 2) {
         expect(steps).toBeGreaterThan(100);
+        expect(packs).toBeGreaterThan(100);
       } else {
-        expect(steps, `${addStepWork}`).toBe(1);
+        expect([steps, packs], `${addStepWork}`).toEqual([3, 1]);
       }
     }
   });
@@ -650,6 +777,166 @@ const trap = () => {
 const statusesOf = (h: ReturnType<typeof addEngine>, key: string) =>
   h.posted.flatMap((p) => p.result.status.filter((st) => st.key === key).map((st) => st.status));
 
+describe("background add landings against a synchronous scene", () => {
+  // Review I2: the landing record of a background add, with each kind of
+  // request that changes the mesh after it lands in the same batch, bit for
+  // bit against a synchronous Scene, on 1 and 4 threads, with normals on and
+  // off. Whatever path the copies take (made and sent, made and dropped, or
+  // not made), the bytes are the frame's.
+  type Mesh = { positions: Float64Array; indices: Uint32Array };
+  const add = (id: ClientId, mesh: Mesh, normals: boolean): Request => ({
+    ...(addMeshReq(id, mesh) as Extract<Request, { kind: "addMesh" }>),
+    options: { normals },
+  });
+  const moved: EditOp[] = [{ op: "setPositions", vertices: [41], positions: [1, 6, 1] }];
+  const holes: EditOp[] = [{ op: "removeTriangles", triangles: [0, 1, 2, 50] }];
+  const weld = { op: "weld", tolerance: 0.2 } as const;
+  /** A synchronous scene's buffers of BIG added after A and B, then changed by `change`. */
+  function reference(normals: boolean, change: (s: Scene, m: MeshHandleOf) => void) {
+    const s = new Scene();
+    try {
+      s.addMesh(A.positions, A.indices);
+      s.addMesh(B.positions, B.indices);
+      const m = s.addMesh(BIG.positions, BIG.indices, { normals });
+      change(s, m);
+      const v = s.views(m);
+      return { positions: v.positions().slice(), normals: v.normals()?.slice() ?? null, indices: v.indices().slice() };
+    } finally {
+      s.free();
+    }
+  }
+  type MeshHandleOf = ReturnType<Scene["addMesh"]>;
+  const same = (got: ArrayBuffer | null | undefined, want: ArrayBufferView | null) =>
+    want === null
+      ? got === null
+      : got != null && Buffer.from(got).equals(Buffer.from(want.buffer, want.byteOffset, want.byteLength));
+  const cases: [string, (id: ClientId) => Request[], (s: Scene, m: MeshHandleOf) => void][] = [
+    ["weld", (id) => [{ kind: "repair", rev: rev(), id, payload: weld }], (s, m) => void s.repair(m, weld)],
+    [
+      "edit and compact",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: holes },
+        { kind: "compact", rev: rev(), id },
+      ],
+      (s, m) => {
+        s.edit(m, holes);
+        s.compact(m);
+      },
+    ],
+    [
+      "edit and undo",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: moved },
+        { kind: "undo", rev: rev() },
+      ],
+      () => {},
+    ],
+    [
+      "edit, undo and redo",
+      (id) => [
+        { kind: "edit", rev: rev(), id, payload: moved },
+        { kind: "undo", rev: rev() },
+        { kind: "redo", rev: rev() },
+      ],
+      (s, m) => void s.edit(m, moved),
+    ],
+    ["placement", (id) => [placement(id, 3)], () => {}],
+  ];
+  for (const threads of [1, 4]) {
+    for (const normals of [true, false]) {
+      for (const [name, requests, change] of cases) {
+        it(`${name}, ${threads} thread(s), normals ${normals ? "on" : "off"}`, async () => {
+          const h = addEngine({ threads });
+          h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+          await h.until(() => h.results().length === 1);
+          h.send([add(3, BIG, normals), ...requests(3)]);
+          await h.until(() => h.results().length === 2);
+          const record = h.results()[1].changes.find((c) => c.id === 3);
+          expect(record?.added).toBe(true);
+          const want = reference(normals, change);
+          expect(same(record?.bytes.positions, want.positions)).toBe(true);
+          expect(same(record?.bytes.normals, want.normals)).toBe(true);
+          expect(same(record?.bytes.indices, want.indices)).toBe(true);
+        });
+      }
+      it(`remove and add again, ${threads} thread(s), normals ${normals ? "on" : "off"}`, async () => {
+        const h = addEngine({ threads });
+        h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+        await h.until(() => h.results().length === 1);
+        h.send([add(3, BIG, normals), { kind: "removeMesh", rev: rev(), id: 3 }, add(4, BIG, normals)]);
+        await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 4 && c.added)));
+        const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 4 && c.added)).find(Boolean);
+        const want = reference(normals, () => {});
+        expect(same(record?.bytes.positions, want.positions)).toBe(true);
+        expect(same(record?.bytes.normals, want.normals)).toBe(true);
+        expect(same(record?.bytes.indices, want.indices)).toBe(true);
+      });
+    }
+  }
+
+  it("the_copies_are_sent_when_nothing_changed_the_mesh", async () => {
+    // Re-review R2: the copies are not only correct but used. The stamp
+    // read when the add lands equals the one read when its record is
+    // packed, so the frame sends them (a spurious bump would disable the
+    // copies with every twin above still green): landing while idle, with
+    // a placement in its batch, and with a field added on the new mesh.
+    const cases: [string, Request[]][] = [
+      ["idle", []],
+      ["placement in the batch", [placement(3, 1)]],
+      [
+        "field on the new mesh",
+        [{ kind: "field", rev: rev(), field: 7, op: "add", desc: { name: "g", on: 3, to: [1], maxDistance: 0.5 } }],
+      ],
+    ];
+    for (const [name, extra] of cases) {
+      const seen: number[] = [];
+      await patched(
+        "content_stamp",
+        (orig) =>
+          function (this: unknown, ...args: unknown[]) {
+            const v = orig.apply(this, args) as number;
+            seen.push(v);
+            return v;
+          },
+        async () => {
+          const h = addEngine();
+          h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+          await h.until(() => h.results().length === 1);
+          h.send([addMeshReq(3, BIG), ...extra.map((e) => ({ ...e, rev: rev() }))]);
+          await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+          await h.until(() => h.results().length === 2);
+          expect(h.chunks.some((c) => c.kind === "addMeshPack"), name).toBe(true);
+          // Read once at the landing, once at the frame: the same.
+          expect(seen, name).toHaveLength(2);
+          expect(seen[1], name).toBe(seen[0]);
+        },
+      );
+    }
+  });
+
+  it("a_landing_waits_for_an_open_field_unit_and_is_copied_meanwhile", async () => {
+    // The copy changes nothing in the scene, so it runs between the steps
+    // of a field step unit; the landing waits until the unit is over.
+    const h = addEngine({ stepPoints: 4, addStepWork: 400 });
+    h.send([addMeshReq(1, A), addMeshReq(2, B), fieldAdd(9, 1, 2, 0.5)]);
+    await h.until(() => h.results().length === 1);
+    const from = h.chunks.length;
+    h.send([addMeshReq(3, BIG), placement(1, 0.05)]);
+    await h.until(() => h.posted.some((p) => p.result.changes.some((c) => c.id === 3 && c.added)));
+    const kinds = h.chunks.slice(from).map((c) => c.kind);
+    const firstStep = kinds.indexOf("fieldStep");
+    const lastStep = kinds.lastIndexOf("fieldStep");
+    const packs = kinds.map((k, i) => (k === "addMeshPack" ? i : -1)).filter((i) => i >= 0);
+    expect(packs.some((i) => i > firstStep && i < lastStep), kinds.join(" ")).toBe(true);
+    expect(kinds.indexOf("addMesh")).toBeGreaterThan(lastStep);
+    const record = h.posted.map((p) => p.result.changes.find((c) => c.id === 3 && c.added)).find(Boolean);
+    const want = reference(true, () => {});
+    expect(same(record?.bytes.positions, want.positions)).toBe(true);
+    expect(same(record?.bytes.normals, want.normals)).toBe(true);
+    expect(same(record?.bytes.indices, want.indices)).toBe(true);
+  });
+});
+
 describe("poisoning with a background add pending", () => {
   it("an_unrelated_trap_errors_the_pending_add", async () => {
     await patched("analyze", () => trap, async () => {
@@ -722,6 +1009,46 @@ describe("poisoning with a background add pending", () => {
         expect(results[3].status).toEqual([expect.objectContaining({ key: "placement:2", status: "error" })]);
         expect(statusesOf(h, "mesh:3")).toEqual(["error"]);
         expect(h.posted.filter((p) => p.update)).toEqual([]);
+      },
+    );
+  });
+
+  it("a_trap_reading_the_landed_stamp_poisons", async () => {
+    // Re-review R1: the stamp read when an add lands is guarded like the
+    // landing itself: a trap poisons (here while idle: an update).
+    await patched("content_stamp", () => trap, async () => {
+      const h = addEngine();
+      h.send([addMeshReq(1, A)]);
+      await h.until(() => h.results().length === 1);
+      h.send([addMeshReq(3, BIG)]);
+      await h.until(() => h.posted.some((p) => p.update));
+      const u = h.posted.find((p) => p.update)?.result as Result;
+      expect(u.poisoned).toBe(true);
+      expect(u.status).toEqual([expect.objectContaining({ key: "mesh:3", status: "error" })]);
+    });
+  });
+
+  it("another_error_reading_the_landed_stamp_keeps_no_copy", async () => {
+    // Any other error: the add lands without keeping its copy, and the
+    // frame copies the buffers.
+    await patched(
+      "content_stamp",
+      () => () => {
+        throw new Error("stamp unavailable (test)");
+      },
+      async () => {
+        const h = addEngine();
+        h.send([addMeshReq(1, A), addMeshReq(2, B)]);
+        await h.until(() => h.results().length === 1);
+        h.send([addMeshReq(3, BIG)]);
+        await h.until(() => h.posted.some((p) => p.update));
+        const u = h.posted.find((p) => p.update)?.result as Result;
+        expect(u.poisoned).toBeFalsy();
+        expect(u.status).toEqual([{ key: "mesh:3", rev: expect.any(Number), status: "ready" }]);
+        const bytes = u.changes.find((c) => c.id === 3)?.bytes;
+        const ref = referenceBuffers();
+        expect(Buffer.from(bytes?.positions as ArrayBuffer).equals(Buffer.from(ref.positions.buffer))).toBe(true);
+        expect(Buffer.from(bytes?.normals as ArrayBuffer).equals(Buffer.from((ref.normals as Float32Array).buffer))).toBe(true);
       },
     );
   });

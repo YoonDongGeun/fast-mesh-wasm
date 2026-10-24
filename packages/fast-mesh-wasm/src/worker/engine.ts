@@ -8,10 +8,11 @@
 // they left due are computed in steps, and a recompute made stale by a queued
 // request is abandoned at a step boundary (§6.1 of the drag-speed design). After each batch it posts one `Result` with the frame's change
 // records, the bytes of their dirty ranges, placements, section results,
-// statuses and replies. A large mesh is added in the background: its BVH is
-// built in steps outside the scene while later requests that do not depend
-// on it run, and it lands in the frame of the batch under way then (or in an
-// `update` message when the Worker is idle). Pure: it talks only through
+// statuses and replies. A large mesh is added in the background: its BVH and
+// normals are built in steps outside the scene, and its render buffers
+// copied out in steps, while later requests that do not depend on it run;
+// it lands in the frame of the batch under way then (or in an `update`
+// message when the Worker is idle). Pure: it talks only through
 // `Port`, so it runs in a browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
@@ -79,8 +80,8 @@ export interface EngineOptions {
    * field's client id), every step of a field add's build
    * (`"fieldBuildStep"`, with the id) and every such build abandoned for a
    * superseded display (`"fieldBuildAbandon"`), every background add started
-   * (`"addMeshBegin"`), stepped (`"addMeshStep"`) and landed (`"addMesh"`),
-   * with the mesh's id, every operation of a repair
+   * (`"addMeshBegin"`), stepped (`"addMeshStep"`), copied out
+   * (`"addMeshPack"`) and landed (`"addMesh"`), with the mesh's id, every operation of a repair
    * list run in steps (`"repairOp"`), every field step (`"fieldStep"`) and
    * every abandoned field step unit (`"fieldStepAbandon"`).
    */
@@ -124,10 +125,11 @@ export interface EngineOptions {
    */
   backgroundAddTriangles?: number;
   /**
-   * The work of one step of a background add's BVH build
-   * ({@link ADD_STEP_WORK} by default): a triangle's box, or a triangle
-   * visited per tree level. Clamped to 1 to 2^32 − 1; NaN or less than 1
-   * keeps the default.
+   * The work of one step of a background add ({@link ADD_STEP_WORK} by
+   * default): a triangle's box, or a triangle visited per tree level, of
+   * its BVH build; 4 triangles or 16 vertices of its normals; 64 bytes of
+   * the copy of its render buffers. Clamped to 1 to 2^32 − 1; NaN or less
+   * than 1 keeps the default.
    */
   addStepWork?: number;
   /**
@@ -138,6 +140,12 @@ export interface EngineOptions {
    * with yields, which costs the same, so newer batches still arrive.
    */
   threads?: number;
+  /**
+   * Test-only: never drop a landed add's copied-out buffers early (see
+   * {@link Engine.#unpack}), so that only the check at packing time guards
+   * them.
+   */
+  keepCopies?: boolean;
 }
 
 /** The default {@link EngineOptions.yieldMs}. */
@@ -160,6 +168,9 @@ export const ADD_STEP_WORK = 100_000;
 
 /** A step budget that computes a whole unit at once. */
 const ALL_POINTS = 0xffff_ffff;
+
+/** Bytes of a background add's render buffers copied per unit of {@link EngineOptions.addStepWork}. */
+const PACK_BYTES_PER_UNIT = 64;
 
 const now: () => number =
   typeof performance !== "undefined" && typeof performance.now === "function"
@@ -402,9 +413,35 @@ interface PendingAdd {
   /** The add's status key and revision, held until it lands. */
   key: string | undefined;
   rev: number;
-  /** Built, waiting to land (not while a field step unit is open). */
+  /** Built, waiting to be copied out and land (not while a field step unit is open). */
   built: boolean;
+  /** Its render buffers being copied out, once built (see {@link Engine.#pack}). */
+  packed?: Packed;
+  /** The copy failed (not a trap): it lands without one, the frame copies. */
+  uncopied?: true;
 }
+
+/**
+ * Copies of a background add's render buffers, made in steps before it
+ * lands, and sent as its first record's bytes in place of copies made then
+ * (see {@link Engine.#pack}).
+ */
+interface Packed {
+  positions: ArrayBuffer;
+  normals: ArrayBuffer | null;
+  indices: ArrayBuffer;
+  /** Bytes copied so far, over the three in that order. */
+  done: number;
+  /**
+   * The landed mesh's content stamp (`meshAdds.stamp`) when it landed: the
+   * copies are sent only while the mesh still has it.
+   */
+  stamp?: number;
+}
+
+/** Whether every byte of a {@link Packed} copy is copied. */
+const packedAll = (p: Packed | undefined): p is Packed =>
+  p !== undefined && p.done === p.positions.byteLength + (p.normals?.byteLength ?? 0) + p.indices.byteLength;
 
 /**
  * Yields to the message loop, so batches sent meanwhile are received:
@@ -443,10 +480,17 @@ class Engine {
   readonly #meshAdds = meshAdds(this.#scene);
   /** Meshes being added in the background, in arrival order. */
   readonly #adds: PendingAdd[] = [];
+  /**
+   * Landed background adds whose render buffers were copied out before:
+   * their record in the next frame sends these copies, unless a request
+   * changed the mesh since (see {@link Engine.#unpack}).
+   */
+  readonly #packed = new Map<MeshHandle, Packed>();
   readonly #backgroundAdd: number;
   readonly #addStepWork: number;
   /** More than one thread: a waiting request finishes adds in one call. */
   readonly #threaded: boolean;
+  readonly #keepCopies: boolean;
   /** The revision of the last result posted, for `update` messages. */
   #lastRev = 0;
   /** A received batch is being run: its first request started, its result is not posted yet. */
@@ -535,6 +579,7 @@ class Engine {
     const work = Math.floor(options.addStepWork ?? ADD_STEP_WORK);
     this.#addStepWork = work >= 1 ? Math.min(work, ALL_POINTS) : ADD_STEP_WORK;
     this.#threaded = (options.threads ?? 1) > 1;
+    this.#keepCopies = options.keepCopies ?? false;
     // Field updates wait for the end of the batch, to be stepped there.
     this.#steps.setDefer(true);
   }
@@ -682,6 +727,7 @@ class Engine {
     if (this.#adds.length > 0 && this.#dependsOnAdds(req) && !(await this.#finishAdds(req))) {
       return false;
     }
+    this.#unpack(req);
     try {
       if (req.kind === "addMesh" && this.#inBackground(req)) {
         this.#beginAdd(req);
@@ -819,16 +865,24 @@ class Engine {
   }
 
   /**
-   * Advances the oldest background add by one step and, with `land`, lands
-   * it once built (landing changes the scene, which would drop an open
-   * field step unit: the unit's loop steps without landing). A build that
-   * fails is dropped, with an error status for its add. `false` once
-   * poisoned.
+   * Advances the oldest background add by one step: of its build (BVH and
+   * normals), or once built, of the copy of its render buffers
+   * ({@link Engine.#pack}); with `land`, lands it once copied (landing
+   * changes the scene, which would drop an open field step unit: the
+   * unit's loop steps without landing; copying changes nothing). A build
+   * that fails is dropped, with an error status for its add. Without
+   * `copy`, a built add lands at once and the frame copies its buffers.
+   * `false` once poisoned.
    */
-  async #advanceAdd(land = true, failed?: Request): Promise<boolean> {
+  async #advanceAdd(land = true, failed?: Request, copy = true): Promise<boolean> {
     const a = this.#adds[0];
     if (a === undefined) {
       return true;
+    }
+    if (a.built && (!copy || a.uncopied === true) && land) {
+      // The frame copies the buffers: land as built.
+      a.packed = undefined;
+      return this.#land(a, failed);
     }
     if (!a.built) {
       try {
@@ -837,8 +891,98 @@ class Engine {
         return this.#addFailed(a, e, false, failed);
       }
       this.#onChunk?.({ kind: "addMeshStep", id: a.id });
+    } else if (!packedAll(a.packed) && a.uncopied !== true) {
+      try {
+        this.#pack(a);
+      } catch (e) {
+        if (isPoison(e)) {
+          return this.#addFailed(a, e, false, failed);
+        }
+        // No memory for the copy (say): the frame copies the buffers.
+        a.packed = undefined;
+        a.uncopied = true;
+      }
+      this.#onChunk?.({ kind: "addMeshPack", id: a.id });
     }
-    return a.built && land ? this.#land(a, failed) : true;
+    return (packedAll(a.packed) || a.uncopied === true) && land ? this.#land(a, failed) : true;
+  }
+
+  /**
+   * Whether `req` may change the positions, normals or triangles of the
+   * mesh `id`: an edit, repair, compaction or removal of it, or any undo
+   * or redo.
+   */
+  #changesMesh(req: Request, id: ClientId): boolean {
+    switch (req.kind) {
+      case "edit":
+      case "repair":
+      case "compact":
+      case "removeMesh":
+        return req.id === id;
+      case "undo":
+      case "redo":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Copies about {@link EngineOptions.addStepWork} × 64 more bytes of a
+   * built add's render buffers (positions, normals, indices) out of wasm
+   * memory, so that the frame it lands in sends them instead of copying
+   * the whole mesh then. The build's buffers are the added mesh's, moved
+   * into the scene unchanged, so the copies are what the frame would copy,
+   * bit for bit, unless a request changes the mesh first
+   * ({@link Engine.#unpack}).
+   */
+  #pack(a: PendingAdd): void {
+    // Fresh views, read with no scene call in between.
+    const views = this.#meshAdds.buffers(a.token);
+    const p = (a.packed ??= {
+      positions: new ArrayBuffer(views.positions.byteLength),
+      normals: views.normals === null ? null : new ArrayBuffer(views.normals.byteLength),
+      indices: new ArrayBuffer(views.indices.byteLength),
+      done: 0,
+    });
+    const parts: [ArrayBufferView | null, ArrayBuffer | null][] = [
+      [views.positions, p.positions],
+      [views.normals, p.normals],
+      [views.indices, p.indices],
+    ];
+    let budget = this.#addStepWork * PACK_BYTES_PER_UNIT;
+    let start = 0;
+    for (const [view, out] of parts) {
+      if (view === null || out === null) {
+        continue;
+      }
+      const end = start + out.byteLength;
+      if (budget > 0 && p.done < end) {
+        const from = p.done - start;
+        const n = Math.min(out.byteLength - from, budget);
+        new Uint8Array(out, from, n).set(new Uint8Array(view.buffer, view.byteOffset + from, n));
+        p.done += n;
+        budget -= n;
+      }
+      start = end;
+    }
+  }
+
+  /**
+   * Forgets the copied-out buffers of a landed mesh that `req` may change
+   * (an edit, repair or compaction of it, an undo or redo), to free them
+   * early. Correctness does not depend on it: the copies are sent only
+   * while the mesh's content stamp is the one it landed with.
+   */
+  #unpack(req: Request): void {
+    if (this.#packed.size === 0 || this.#keepCopies) {
+      return;
+    }
+    for (const h of [...this.#packed.keys()]) {
+      if (this.#changesMesh(req, this.#meshId(h))) {
+        this.#packed.delete(h);
+      }
+    }
   }
 
   /**
@@ -848,7 +992,9 @@ class Engine {
    * what is left of its BVH at once with the parallel one-call build
    * (several times faster than steps). Single-threaded the two cost the
    * same, so it keeps stepping, yielding (to receive only) between steps,
-   * so that newer batches still arrive and coalesce.
+   * so that newer batches still arrive and coalesce; it skips the copy of
+   * an add's buffers when `failed` changes that mesh (the frame copies
+   * them anyway).
    */
   async #finishAdds(failed?: Request): Promise<boolean> {
     while (this.#adds.length > 0) {
@@ -858,7 +1004,10 @@ class Engine {
         }
         continue;
       }
-      if (!(await this.#advanceAdd(true, failed))) {
+      // No copy of an add's buffers when the waiting request changes it:
+      // the frame would copy them again.
+      const copy = failed === undefined || !this.#changesMesh(failed, this.#adds[0].id);
+      if (!(await this.#advanceAdd(true, failed, copy))) {
         return false;
       }
       if (this.#adds.length > 0) {
@@ -883,6 +1032,17 @@ class Engine {
     }
     this.#meshes.set(a.id, h);
     this.#meshIds.set(h, a.id);
+    if (packedAll(a.packed)) {
+      try {
+        a.packed.stamp = this.#meshAdds.stamp(h);
+        this.#packed.set(h, a.packed);
+      } catch (e) {
+        if (isPoison(e)) {
+          return this.#addFailed(a, e, true, failed);
+        }
+        // Not kept: the frame copies the buffers.
+      }
+    }
     this.#onChunk?.({ kind: "addMesh", id: a.id });
     this.#settle((b) => b.ready(a.key, a.rev));
     return true;
@@ -1759,6 +1919,8 @@ class Engine {
       sections.push({ section, mesh, result: null });
     }
     const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
+    // Every landed add's record is in this frame.
+    this.#packed.clear();
     // Every removal is in this frame, or was never reported (added and
     // removed in between): the removed handles' ids can go.
     for (const h of this.#removed.splice(0)) {
@@ -1851,13 +2013,24 @@ class Engine {
     }
     wire.vertexSlots = this.#scene.vertexSlots(c.mesh);
     wire.triangleSlots = this.#scene.triangleSlots(c.mesh);
+    // A background add's buffers copied out before it landed, while its
+    // content stamp says the mesh is unchanged since: sent as they are.
+    let packed = c.added ? this.#packed.get(c.mesh) : undefined;
+    if (packed !== undefined && packed.stamp !== this.#meshAdds.stamp(c.mesh)) {
+      packed = undefined;
+    }
     // Fresh views, read with no scene call in between.
     const views: MeshViews = this.#scene.views(c.mesh);
     for (const name of Object.keys(STRIDE) as BufferName[]) {
       // The values only once the client turned their mirror on.
       const view = name === "values" && !this.#mirrorValues ? null : (views[name]?.() ?? null);
       if (view !== null) {
-        const bytes = copyRanges(view, rangesOf(c, name), STRIDE[name]);
+        const ranges = rangesOf(c, name);
+        const copy = name === "positions" || name === "normals" || name === "indices" ? packed?.[name] : undefined;
+        const bytes =
+          ranges === "all" && copy != null && copy.byteLength === view.byteLength
+            ? copy
+            : copyRanges(view, ranges, STRIDE[name]);
         wire.bytes[name] = bytes;
         b.transfer.push(bytes);
       }

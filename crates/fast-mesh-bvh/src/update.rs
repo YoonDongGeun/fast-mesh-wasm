@@ -348,13 +348,9 @@ impl Bvh {
     /// changes, so on error the tree is unchanged.
     fn reserve_rebuilds(&mut self, budget: &Budget) -> Result<Scratch> {
         let prims = Prims::with_capacity(budget.max_n)?;
-        let counts = if budget.extra_treelets > 0 {
-            try_vec(max_nodes(budget.max_n), 0u32)?
-        } else {
-            Vec::new()
-        };
         reserve_headroom(&mut self.arena.nodes, budget.nodes)?;
         reserve_headroom(&mut self.arena.parents, budget.nodes)?;
+        reserve_headroom(&mut self.counts, budget.nodes)?;
         reserve_headroom(&mut self.arena.refs, budget.refs)?;
         if budget.extra_treelets > 0 {
             try_reserve(&mut self.treelets, budget.extra_treelets)?;
@@ -364,12 +360,13 @@ impl Bvh {
             &mut self.treelet_of_root,
             budget.rebuilds + budget.extra_treelets,
         )?;
-        Ok(Scratch { prims, counts })
+        Ok(Scratch { prims })
     }
 
     /// Builds a new subtree for treelet `i` from its triangles that are still
     /// alive and in neither `removed` nor `added`, plus `insert`, links it in
-    /// place of the old one and refits the ancestors. A result holding more than
+    /// place of the old one and refits the ancestors, and counts the new
+    /// nodes' triangles (and the ancestors' again). A result holding more than
     /// twice `treelet_size` triangles is split into several treelets. Capacity
     /// must already be reserved with [`Bvh::reserve_rebuilds`]. Dropped
     /// triangles whose `tri_leaf` still points into the old treelet get `NONE`.
@@ -413,8 +410,20 @@ impl Bvh {
             prims.push(t, Aabb::of_triangle(positions, triangles[t as usize]));
         }
         let parent = self.arena.parents[old_root as usize];
+        let first = self.arena.nodes.len();
         let new_root = build_subtree(&mut self.arena, prims, &self.options, parent)
             .expect("capacity for the rebuild was reserved before mutating");
+        // The new nodes are the tail of the arena, children after parents.
+        let nodes = &self.arena.nodes;
+        self.counts.resize(nodes.len(), 0);
+        for k in (first..nodes.len()).rev() {
+            let n = &nodes[k];
+            self.counts[k] = if n.is_leaf() {
+                n.leaf_range().len() as u32
+            } else {
+                self.counts[n.a as usize] + self.counts[n.b as usize]
+            };
+        }
         if parent == NONE {
             self.root = new_root;
         } else {
@@ -434,34 +443,27 @@ impl Bvh {
             build_cost: self.arena.sah_cost(new_root),
         };
         if prims.len() > 2 * self.options.treelet_size as usize {
-            self.split_treelet(i, &mut scratch.counts);
+            self.split_treelet(i);
+        }
+        // The ancestors' counts, from the parent up.
+        let mut up = parent;
+        while up != NONE {
+            let n = &self.arena.nodes[up as usize];
+            self.counts[up as usize] = self.counts[n.a as usize] + self.counts[n.b as usize];
+            up = self.arena.parents[up as usize];
         }
         self.arena.refit_ancestors(new_root)
     }
 
-    /// Splits treelet `i`, which must be the subtree built last (its nodes are
-    /// the tail of the arena, children after parents), by the rule
+    /// Splits treelet `i`, whose nodes' triangles are counted, by the rule
     /// `assign_treelets` uses: the topmost subtrees with at most `treelet_size`
     /// triangles, or single leaves. Best effort and allocation-free: skipped when
-    /// `counts` or the reserved treelet capacity is too small.
-    fn split_treelet(&mut self, i: usize, counts: &mut [u32]) {
+    /// the reserved treelet capacity is too small.
+    fn split_treelet(&mut self, i: usize) {
         let root = self.treelets[i].root;
-        let first = root as usize;
-        let nodes = &self.arena.nodes;
-        if nodes.len() - first > counts.len() {
-            return;
-        }
-        for k in (first..nodes.len()).rev() {
-            let n = &nodes[k];
-            counts[k - first] = if n.is_leaf() {
-                n.leaf_range().len() as u32
-            } else {
-                counts[n.a as usize - first] + counts[n.b as usize - first]
-            };
-        }
         let limit = self.options.treelet_size;
-        let counts = &*counts;
-        let is_root = |k: u32, n: &Node| n.is_leaf() || counts[k as usize - first] <= limit;
+        let counts = &self.counts;
+        let is_root = |k: u32, n: &Node| n.is_leaf() || counts[k as usize] <= limit;
         let mut found = 0usize;
         self.arena.traverse(root, |k, n| {
             let r = is_root(k, n);
@@ -577,8 +579,6 @@ impl Budget {
 /// Scratch memory reserved for a batch of treelet rebuilds.
 struct Scratch {
     prims: Prims,
-    /// Per-node triangle counts of a freshly built subtree, for splitting it.
-    counts: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -876,6 +876,70 @@ mod tests {
         assert!(bvh.is_current(&m));
     }
 
+    /// Every reachable node's [`Bvh::subtree_triangles`] against a count
+    /// of its leaves' triangles.
+    fn assert_counts(bvh: &Bvh, tag: &str) {
+        fn count(bvh: &Bvh, id: crate::NodeId) -> usize {
+            match bvh.node(id).kind {
+                crate::NodeKind::Leaf { triangles } => triangles.len(),
+                crate::NodeKind::Inner { left, right } => count(bvh, left) + count(bvh, right),
+            }
+        }
+        let mut nodes = 0;
+        bvh.traverse(|id, _| {
+            nodes += 1;
+            assert_eq!(
+                bvh.subtree_triangles(id),
+                count(bvh, id),
+                "{tag}: node {id:?}"
+            );
+            true
+        });
+        assert!(nodes > 0 || bvh.root_bounds().is_none(), "{tag}");
+    }
+
+    #[test]
+    fn subtree_triangle_counts_follow_updates() {
+        let mut m = grid(16);
+        let mut bvh = Bvh::build(&m, &opts()).unwrap();
+        assert_counts(&bvh, "build");
+        let mut compacted = false;
+        for round in 0..40u32 {
+            // Removals and additions (treelet rebuilds, some split, garbage
+            // compacted now and then), and moves (refits).
+            let t = (round * 37) % m.triangle_slots() as u32;
+            let old = m.triangle(t);
+            let mut tx = m.begin_edit();
+            if let Some(tri) = old {
+                tx.remove_triangles(&[t]).unwrap();
+                if round % 3 != 0 {
+                    tx.add_triangles(&[tri, tri]).unwrap();
+                }
+            }
+            tx.set_positions(&[round], &[[round as f32, 0.5, 0.3]])
+                .unwrap();
+            let p = tx.commit().unwrap();
+            compacted |= bvh.update(&mut m, p.changes()).unwrap().compacted;
+            assert_counts(&bvh, &format!("round {round}"));
+        }
+        assert!(compacted);
+        // Many triangles in one place: the rebuilt treelet is split.
+        let treelets = bvh.treelet_count();
+        let tri = m.triangle(m.triangle_slots() as u32 - 1).unwrap();
+        let mut tx = m.begin_edit();
+        tx.add_triangles(&[tri; 100]).unwrap();
+        let p = tx.commit().unwrap();
+        bvh.update(&mut m, p.changes()).unwrap();
+        assert!(bvh.treelet_count() > treelets + 1);
+        assert_counts(&bvh, "split");
+        bvh.rebuild_region(&m, &[5, 9, 200]).unwrap();
+        assert_counts(&bvh, "region");
+        bvh.refit(&m, &[1, 2]).unwrap();
+        assert_counts(&bvh, "refit");
+        bvh.rebuild(&m).unwrap();
+        assert_counts(&bvh, "rebuild");
+    }
+
     #[test]
     fn garbage_is_compacted_away() {
         let mut m = grid(16);
@@ -1040,14 +1104,13 @@ mod tests {
         };
         let base = Bvh::build(&m, &options).unwrap();
         assert_eq!(base.treelet_count(), 1);
-        let mut counts = vec![0u32; base.arena.nodes.len()];
         // Number of treelets a split at size 32 produces.
         let found = {
             let mut probe = Bvh::build(&m, &options).unwrap();
             probe.options.treelet_size = 32;
             probe.treelets.reserve(64);
             probe.treelet_of_root.reserve(64);
-            probe.split_treelet(0, &mut counts);
+            probe.split_treelet(0);
             probe.validate(&m).unwrap();
             probe.treelet_count()
         };
@@ -1068,7 +1131,7 @@ mod tests {
             assert_eq!(map.capacity() - map.len(), spare);
             let capacity = map.capacity();
             bvh.treelet_of_root = map;
-            bvh.split_treelet(0, &mut counts);
+            bvh.split_treelet(0);
             // Removing the old root may free its slot, raising `capacity()` by
             // one without reallocating; a reallocation would at least double it.
             assert!(

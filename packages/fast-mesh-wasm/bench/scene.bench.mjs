@@ -1,6 +1,6 @@
 // Scene benchmarks, run against the built package (a release build, not the test build):
 //
-//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide] [-- --queued [-- --no-1m]] [-- --contact]
+//   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide] [-- --queued [-- --no-1m] [-- --add-only]] [-- --contact]
 //
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
@@ -19,6 +19,7 @@ const onlyWorker = args.has("--worker"); // run just the Worker scene cases (wit
 const onlyWide = args.has("--wide"); // with --worker: run just the Worker wide-range drag cases
 const onlyQueued = args.has("--queued"); // with --worker: run just the toggles queued behind long requests (#48)
 const skip1m = args.has("--no-1m"); // with --worker --queued --10m: only the 10M case
+const addOnly = args.has("--add-only"); // with --worker --queued: only the addMesh case
 const onlyContact = args.has("--contact"); // with --worker: run just the 1M contact toggle and drag
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
@@ -1168,11 +1169,12 @@ if (onlyWorker && onlyContact) {
   process.exit(0);
 }
 if (onlyWorker && onlyQueued) {
+  const queuedCases = addOnly ? { field: false, edit: false } : {};
   if (!skip1m) {
-    await benchWorkerQueued("1M", 708, quick ? 3 : 5);
+    await benchWorkerQueued("1M", 708, quick ? 3 : 5, queuedCases);
   }
   if (with10m) {
-    await benchWorkerQueued("10M", 2236, 2);
+    await benchWorkerQueued("10M", 2236, 2, queuedCases);
   }
   process.exit(0);
 }

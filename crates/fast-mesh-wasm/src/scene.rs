@@ -309,7 +309,9 @@ impl WasmScene {
             mode,
             ..MeshOptions::default()
         };
-        let build = MeshBuild::new(mesh, options)?;
+        let mut build = MeshBuild::new(mesh, options)?;
+        // Computed in the build's steps; `added` then finds them on.
+        build.set_normals(normals);
         let id = self.next_add;
         self.next_add = self.next_add.wrapping_add(1);
         self.adds.insert(id, (build, mode, normals));
@@ -333,6 +335,30 @@ impl WasmScene {
         }
     }
 
+    /// The render buffers of a mesh being added in steps, as
+    /// `[positions_ptr, positions_len, normals_ptr, normals_len,
+    /// indices_ptr, indices_len]` (as the `*_ptr` / `*_len` methods give
+    /// them once it is added; normals 0, 0 until built or when off). The
+    /// added mesh keeps these addresses and contents until it changes, so
+    /// they can be copied out before it lands. Valid until the next call
+    /// that may allocate.
+    pub fn add_mesh_buffers(&self, build: u32) -> Result<Vec<u32>, Error> {
+        let (b, ..) = self
+            .adds
+            .get(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
+        let m = b.mesh();
+        let (np, nl) = b.normals().map_or((0, 0), |n| (addr(n), len(n.len() * 3)));
+        Ok(vec![
+            addr(m.positions()),
+            len(m.positions().len() * 3),
+            np,
+            nl,
+            addr(m.triangles()),
+            len(m.triangles().len() * 3),
+        ])
+    }
+
     /// Adds a mesh built in steps, finishing what is left of its BVH, and
     /// returns `[index, generation]`, as [`WasmScene::add_mesh`] would.
     pub fn finish_add_mesh(&mut self, build: u32) -> Result<Vec<u32>, Error> {
@@ -342,6 +368,13 @@ impl WasmScene {
             .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?;
         let id = self.scene.add_mesh_built(b)?;
         self.added(id, mode, normals)
+    }
+
+    /// The mesh's content stamp (`Scene::content_stamp`): it goes up
+    /// whenever the mesh's positions, triangles or normals change.
+    pub fn content_stamp(&self, index: u32, generation: u32) -> Result<f64, Error> {
+        // Exact in `f64` far beyond any count of changes.
+        Ok(self.scene.content_stamp(self.id(index, generation)?)? as f64)
     }
 
     /// Drops a mesh being added in steps (nothing was added).
@@ -1833,6 +1866,35 @@ mod tests {
         };
         assert_eq!(mesh(&s), mesh(&t));
         assert!(s.add_mesh_step(build, 1).is_err());
+        // While built, the build's render buffers are those of the added
+        // mesh: the same addresses (the vectors move into the scene) and
+        // lengths, normals included once they are built.
+        let build = s
+            .begin_add_mesh(&positions, &indices, None, 0, true)
+            .unwrap();
+        let before = s.add_mesh_buffers(build).unwrap();
+        assert_eq!(before[2..4], [0, 0], "no normals yet");
+        while !s.add_mesh_step(build, 1).unwrap() {}
+        let bufs = s.add_mesh_buffers(build).unwrap();
+        let id = s.finish_add_mesh(build).unwrap();
+        let (i, g) = (id[0], id[1]);
+        assert_eq!(
+            bufs,
+            vec![
+                s.positions_ptr(i, g).unwrap(),
+                s.positions_len(i, g).unwrap(),
+                s.normals_ptr(i, g).unwrap(),
+                s.normals_len(i, g).unwrap(),
+                s.indices_ptr(i, g).unwrap(),
+                s.indices_len(i, g).unwrap(),
+            ]
+        );
+        assert_eq!(bufs[3], 12);
+        assert!(s.add_mesh_buffers(build).is_err());
+        // The content stamp goes up with a compaction of the mesh.
+        let before = s.content_stamp(i, g).unwrap();
+        s.compact(i, g).unwrap();
+        assert!(s.content_stamp(i, g).unwrap() > before);
         let other = s
             .begin_add_mesh(&positions, &indices, None, 0, false)
             .unwrap();
