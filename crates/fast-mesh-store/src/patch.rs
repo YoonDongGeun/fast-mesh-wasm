@@ -186,6 +186,16 @@ pub enum PatchSide {
     Redoable,
 }
 
+/// Whether an externally held [`Patch`]'s edit is currently applied to the mesh,
+/// see [`Mesh::release_patch_slots`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchState {
+    /// The patch's edit is applied (as on an undo stack): release the slots it removed.
+    Applied,
+    /// The patch was undone (as on a redo stack): release the slots it created.
+    Undone,
+}
+
 /// The recorded effect of one committed transaction. Re-apply it with
 /// [`Patch::apply`] (redo) or undo it with [`Patch::revert`].
 ///

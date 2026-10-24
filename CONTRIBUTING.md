@@ -25,7 +25,7 @@ scripts/                 Cross-platform build and test scripts (Node.js, no bash
 
 You need:
 
-- [Rust](https://rustup.rs). The exact toolchain and the `wasm32-unknown-unknown` target are installed automatically from `rust-toolchain.toml`.
+- [Rust](https://rustup.rs). The exact toolchain and the `wasm32-unknown-unknown` target are installed automatically from `rust-toolchain.toml`. The workspace supports Rust 1.88 and newer (`rust-version` in the root `Cargo.toml`); CI checks the minimum version with a dedicated MSRV job, so avoid APIs newer than 1.88.
 - `wasm-bindgen-cli`, the same version as the `wasm-bindgen` crate in the root `Cargo.toml`:
   ```sh
   cargo install wasm-bindgen-cli --version =0.2.129 --locked
@@ -83,6 +83,14 @@ Also run clippy with the same `--features`. Benchmarks take it too, for example 
 Do not enable `parallel` for a plain `wasm32-unknown-unknown` build: that target has no threads, so the single-threaded artifact (`dist/wasm`) builds without it. CI checks that rayon stays out of the default build for both targets. The threaded artifact (`dist/wasm-threads`) enables it through `fast-mesh-wasm`'s `threads` feature, built only by `scripts/build-wasm.mjs --threads` on the pinned nightly with wasm atomics, a rebuilt std and a shared memory (maximum 4 GiB); its `initThreadPool(n)` starts rayon's pool on Web Workers. Only the Worker entry (`worker-entry.js`) may import it.
 
 Parallel code goes through the helpers in `fast_mesh_store::par`. They cut work into fixed chunks and return results in chunk order, so combine them in that order and never sum floats in completion order. Each site runs sequentially below a named threshold constant. While a test's out-of-memory hook (`fail_allocations_after`) is armed, every helper runs sequentially on the test's thread. `par::set_force_sequential` is counted: pair every `true` with one `false`.
+
+### Property tests
+
+Most of the workspace's property suites honor the `PROPTEST_CASES` environment variable, defaulting to a short run (the bvh suite still uses a fixed case count). For a longer pass over the store before pushing a storage change:
+
+```sh
+PROPTEST_CASES=3000 cargo test -p fast-mesh-store --release --test properties
+```
 
 ## Adding or changing an API
 

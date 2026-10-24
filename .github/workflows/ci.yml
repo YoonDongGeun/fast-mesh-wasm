@@ -57,6 +57,15 @@ jobs:
       - run: cargo bench -p fast-mesh-scene --no-run
       - run: cargo bench -p fast-mesh-fields --no-run
 
+  msrv:
+    name: Rust MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install 1.88 --profile minimal
+      # `cargo +1.88` overrides rust-toolchain.toml (1.99) for that command.
+      - run: cargo +1.88 check --workspace --all-targets
+
   package:
     name: Build and check the npm package
     runs-on: ubuntu-latest
