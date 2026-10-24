@@ -469,6 +469,50 @@ fn drop_axis(p: P3, axis: usize) -> [f64; 2] {
     [p[(axis + 1) % 3], p[(axis + 2) % 3]]
 }
 
+/// One Sutherland–Hodgman stage: `poly` clipped by the half-plane
+/// through `e0..e1` holding `s_in`, into `next`. Returns the vertex count,
+/// or 0 when the polygon is empty or would exceed `next`'s 6 vertices:
+/// exact signs on rounded crossings can weave a non-convex pattern (a
+/// pentagon with four crossings emits 7) that no convex input produces, so
+/// the stage bails out instead of writing out of bounds.
+fn clip_stage(
+    poly: &[[f64; 2]],
+    e0: [f64; 2],
+    e1: [f64; 2],
+    s_in: i8,
+    next: &mut [[f64; 2]; 6],
+) -> usize {
+    let n = poly.len();
+    let mut m = 0;
+    for i in 0..n {
+        let (p, q) = (poly[i], poly[(i + 1) % n]);
+        let (sp, sq) = (side2::<false>(e0, e1, p), side2::<false>(e0, e1, q));
+        let pin = sp == 0 || sp == s_in;
+        let qin = sq == 0 || sq == s_in;
+        if pin {
+            if m == 6 {
+                return 0;
+            }
+            next[m] = p;
+            m += 1;
+        }
+        if pin != qin {
+            if m == 6 {
+                return 0;
+            }
+            next[m] = if sp == 0 {
+                p
+            } else if sq == 0 {
+                q
+            } else {
+                cross_2d(p, q, e0, e1)
+            };
+            m += 1;
+        }
+    }
+    m
+}
+
 /// The coplanar case of [`clip_pair`]: `pa` clipped by `pb`'s half-planes,
 /// whose boundary is the segments.
 fn clip_coplanar(pa: [P3; 3], pb: [P3; 3], segs: &mut [Seg64; 6]) -> usize {
@@ -483,32 +527,8 @@ fn clip_coplanar(pa: [P3; 3], pb: [P3; 3], segs: &mut [Seg64; 6]) -> usize {
         let s_in = side2::<false>(b[j], b[(j + 1) % 3], b[(j + 2) % 3]);
         debug_assert!(s_in != 0);
         let mut next = [[0.0; 2]; 6];
-        let mut m = 0;
-        for i in 0..n {
-            let (p, q) = (poly[i], poly[(i + 1) % n]);
-            let (sp, sq) = (
-                side2::<false>(b[j], b[(j + 1) % 3], p),
-                side2::<false>(b[j], b[(j + 1) % 3], q),
-            );
-            let pin = sp == 0 || sp == s_in;
-            let qin = sq == 0 || sq == s_in;
-            if pin {
-                next[m] = p;
-                m += 1;
-            }
-            if pin != qin {
-                next[m] = if sp == 0 {
-                    p
-                } else if sq == 0 {
-                    q
-                } else {
-                    cross_2d(p, q, b[j], b[(j + 1) % 3])
-                };
-                m += 1;
-            }
-        }
+        n = clip_stage(&poly[..n], b[j], b[(j + 1) % 3], s_in, &mut next);
         poly = next;
-        n = m;
         if n == 0 {
             return 0;
         }
@@ -862,6 +882,21 @@ mod tests {
             bits([1.0, 1.0, 0.0]),
         );
         assert_eq!(clip_set(A, b), vec![(p, r), (p, q), (r, q)]);
+    }
+
+    #[test]
+    fn clip_stage_bails_out_past_six_vertices() {
+        // A concave pentagon weaving across the clip line four times emits
+        // 3 kept vertices plus 4 crossings: 7 outputs, past the 6-vertex
+        // buffer. Exact signs on rounded crossings can produce such a
+        // pattern from ulp-crafted meshes; the stage bails out with 0
+        // instead of writing out of bounds.
+        let poly = [[0.0, 1.0], [1.0, -1.0], [2.0, 1.0], [3.0, -1.0], [4.0, 1.0]];
+        let mut next = [[0.0; 2]; 6];
+        assert_eq!(
+            clip_stage(&poly, [-10.0, 0.0], [10.0, 0.0], 1, &mut next),
+            0
+        );
     }
 
     #[test]
