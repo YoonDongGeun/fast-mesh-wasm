@@ -9,6 +9,7 @@
 use fast_mesh::compute_vertex_normals;
 use fast_mesh_store::{Transaction, VertexId};
 
+use crate::topology::VertexFans;
 use crate::{OpsError, Result, push, reserve};
 
 /// How a brush's effect fades from its center (`t = 0`) to its rim (`t = 1`).
@@ -213,6 +214,220 @@ pub fn inflate(tx: &mut Transaction, options: &InflateOptions) -> Result<Inflate
     Ok(report)
 }
 
+/// The shrinking Taubin step: each pass moves a vertex `w * λ` of the way
+/// from its position toward its neighbors' centroid.
+pub const TAUBIN_LAMBDA: f32 = 0.33;
+
+/// The inflating Taubin step: each pass moves a vertex `w * μ` of the way
+/// from its position toward its neighbors' centroid, which with the negative
+/// `μ` pushes it back out past where the λ pass left it.
+pub const TAUBIN_MU: f32 = -0.34;
+
+/// Options for [`smooth`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SmoothOptions {
+    /// The brush to apply.
+    pub brush: Brush,
+    /// How many λ/μ cycles to run; 0 moves nothing.
+    pub cycles: u32,
+}
+
+impl SmoothOptions {
+    /// A builder for [`SmoothOptions`]: the default brush until set, 0 cycles.
+    pub fn builder() -> SmoothOptionsBuilder {
+        SmoothOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`SmoothOptions`], see [`SmoothOptions::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct SmoothOptionsBuilder {
+    options: SmoothOptions,
+}
+
+impl SmoothOptionsBuilder {
+    /// Center of the brush in local coordinates.
+    pub fn center(mut self, center: [f32; 3]) -> Self {
+        self.options.brush.center = center;
+        self
+    }
+
+    /// Radius of influence in local units.
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.options.brush.radius = radius;
+        self
+    }
+
+    /// How the effect fades with distance from the center.
+    pub fn falloff(mut self, falloff: Falloff) -> Self {
+        self.options.brush.falloff = falloff;
+        self
+    }
+
+    /// Displacement scale; the per-vertex weight is `strength * falloff`.
+    pub fn strength(mut self, strength: f32) -> Self {
+        self.options.brush.strength = strength;
+        self
+    }
+
+    /// How many λ/μ cycles to run.
+    pub fn cycles(mut self, cycles: u32) -> Self {
+        self.options.cycles = cycles;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> SmoothOptions {
+        self.options
+    }
+}
+
+/// What [`smooth`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SmoothReport {
+    /// How many vertices moved (displacement above 0).
+    pub moved: usize,
+    /// The largest displacement applied, in local units; 0 when nothing
+    /// moved.
+    pub max_displacement: f32,
+}
+
+/// Smooths the vertices under the brush with Taubin λ/μ steps.
+///
+/// - Region: every live vertex closer than `radius` to `center` (brute-force
+///   distance check). Vertices outside it never move but still serve as
+///   neighbor sources.
+/// - Each of the `cycles` runs a λ pass ([`TAUBIN_LAMBDA`]) then a μ pass
+///   ([`TAUBIN_MU`]); every pass moves each region vertex by
+///   `w * k * (centroid - p)`, where `w` is `strength * falloff` at its
+///   normalized distance, `k` the pass constant, and `centroid` the mean of
+///   its neighbor vertices (the deduped vertices of its fan triangles,
+///   excluding itself). Both the moved positions and the neighbor sources
+///   come from a snapshot taken before the pass.
+/// - The move is written once, in a single `set_positions` call over the
+///   vertices whose total displacement is above 0; an empty region writes
+///   nothing. History is untouched.
+///
+/// # Errors
+/// - [`OpsError::InvalidInput`] when the radius is not positive, or any brush
+///   number (center, radius, strength) is not finite.
+/// - [`OpsError::Store`] when memory runs out.
+///
+/// Nothing is written in any of these cases.
+pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothReport> {
+    let brush = &options.brush;
+    if !brush.radius.is_finite() || brush.radius <= 0.0 {
+        return Err(OpsError::InvalidInput(
+            "smooth brush radius must be positive and finite",
+        ));
+    }
+    if brush.center.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("smooth brush center must be finite"));
+    }
+    if !brush.strength.is_finite() {
+        return Err(OpsError::InvalidInput(
+            "smooth brush strength must be finite",
+        ));
+    }
+    let report = SmoothReport::default();
+    if options.cycles == 0 {
+        return Ok(report);
+    }
+    let mesh = tx.mesh();
+    if mesh.vertex_slots() == 0 {
+        return Ok(report);
+    }
+    let fans = VertexFans::build(mesh)?;
+    let positions = mesh.positions();
+    // The region members with their `strength * falloff` weights.
+    let mut members: Vec<(VertexId, f32)> = Vec::new();
+    for (v, p) in positions.iter().enumerate() {
+        let v = v as VertexId;
+        if !mesh.is_vertex_alive(v) {
+            continue;
+        }
+        let dist = brush
+            .center
+            .iter()
+            .zip(p)
+            .map(|(c, p)| (p - c).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let t = dist / brush.radius;
+        if !t.is_finite() || t >= 1.0 {
+            continue;
+        }
+        push(
+            &mut members,
+            (v, brush.strength * falloff_value(brush.falloff, t)),
+        )?;
+    }
+    // Working positions, slot-aligned; only region members ever change.
+    let mut current: Vec<[f32; 3]> = Vec::new();
+    reserve(&mut current, positions.len())?;
+    current.extend_from_slice(positions);
+    let mut before: Vec<[f32; 3]> = Vec::new();
+    let mut adjacent: Vec<VertexId> = Vec::new();
+    for _ in 0..options.cycles {
+        for k in [TAUBIN_LAMBDA, TAUBIN_MU] {
+            before.clear();
+            let missing = current.len().saturating_sub(before.capacity());
+            reserve(&mut before, missing)?;
+            before.extend_from_slice(&current);
+            for &(v, w) in &members {
+                adjacent.clear();
+                for &t in fans.fan(v) {
+                    if let Some(tri) = mesh.triangle(t) {
+                        for u in tri {
+                            if u != v {
+                                push(&mut adjacent, u)?;
+                            }
+                        }
+                    }
+                }
+                if adjacent.is_empty() {
+                    continue;
+                }
+                adjacent.sort_unstable();
+                adjacent.dedup();
+                let mut centroid = [0.0f32; 3];
+                for &u in &adjacent {
+                    for axis in 0..3 {
+                        centroid[axis] += before[u as usize][axis];
+                    }
+                }
+                for c in &mut centroid {
+                    *c /= adjacent.len() as f32;
+                }
+                let p = before[v as usize];
+                for axis in 0..3 {
+                    current[v as usize][axis] = p[axis] + w * k * (centroid[axis] - p[axis]);
+                }
+            }
+        }
+    }
+    let mut report = SmoothReport::default();
+    let mut ids: Vec<VertexId> = Vec::new();
+    let mut moved_to: Vec<[f32; 3]> = Vec::new();
+    for &(v, _) in &members {
+        let length = (0..3)
+            .map(|k| (current[v as usize][k] - positions[v as usize][k]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        push(&mut ids, v)?;
+        push(&mut moved_to, current[v as usize])?;
+        report.max_displacement = report.max_displacement.max(length);
+    }
+    report.moved = ids.len();
+    if !ids.is_empty() {
+        tx.set_positions(&ids, &moved_to)?;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use fast_mesh::compute_vertex_normals;
@@ -367,6 +582,120 @@ mod tests {
             Err(OpsError::InvalidInput(_))
         ));
         assert!(tx.commit().unwrap().is_empty());
+    }
+
+    fn smooth_options(
+        center: [f32; 3],
+        radius: f32,
+        falloff: Falloff,
+        strength: f32,
+        cycles: u32,
+    ) -> SmoothOptions {
+        SmoothOptions::builder()
+            .center(center)
+            .radius(radius)
+            .falloff(falloff)
+            .strength(strength)
+            .cycles(cycles)
+            .build()
+    }
+
+    #[test]
+    fn taubin_pyramid_exact_after_one_cycle() {
+        assert_eq!(TAUBIN_LAMBDA, 0.33);
+        assert_eq!(TAUBIN_MU, -0.34);
+        // Open pyramid: base A(0,0,0) B(1,0,0) C(1,1,0) D(0,1,0), apex
+        // E(0.5,0.5,1); 4 side triangles. `VertexFans::build` only needs
+        // proper triangles, so the open base needs no closing: E's fan is
+        // the 4 side triangles either way.
+        let positions = [
+            0.0, 0.0, 0.0, // A
+            1.0, 0.0, 0.0, // B
+            1.0, 1.0, 0.0, // C
+            0.0, 1.0, 0.0, // D
+            0.5, 0.5, 1.0, // E
+        ];
+        let triangles = [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]];
+        let mut mesh = mesh_of(&positions, &triangles);
+        let options = smooth_options([0.5, 0.5, 1.0], 0.1, Falloff::Linear, 1.0, 1);
+        let (report, empty) = edit(&mut mesh, |tx| smooth(tx, &options));
+        assert!(!empty);
+        assert_eq!(report.moved, 1);
+        let (flat, _) = parts(&mesh);
+        // E's neighbors (A-D) stay fixed outside the region, centroid
+        // (0.5,0.5,0): λ pass z = 1 + 0.33 * (0 - 1) = 0.67, then μ pass
+        // z = 0.67 - 0.34 * (0 - 0.67) = 0.8978.
+        assert!((flat[4 * 3 + 2] - 0.8978).abs() < 1e-4);
+        assert_eq!(flat[4 * 3], 0.5);
+        assert_eq!(flat[4 * 3 + 1], 0.5);
+        for v in 0..4 {
+            assert_eq!(&flat[v * 3..v * 3 + 3], &positions[v * 3..v * 3 + 3]);
+        }
+        assert!((report.max_displacement - (1.0 - 0.8978)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn smooth_zero_cycles_moves_nothing() {
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = smooth_options([0.0; 3], 10.0, Falloff::Linear, 1.0, 0);
+        let mut tx = mesh.begin_edit();
+        let report = smooth(&mut tx, &options).unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn smooth_empty_region_moves_nothing() {
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = smooth_options([100.0, 0.0, 0.0], 1.0, Falloff::Linear, 1.0, 1);
+        let mut tx = mesh.begin_edit();
+        let report = smooth(&mut tx, &options).unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn smooth_invalid_brush_rejected() {
+        let mut mesh = centered_grid();
+        let cases = [
+            smooth_options([0.0; 3], 0.0, Falloff::Linear, 1.0, 1),
+            smooth_options([0.0; 3], -1.0, Falloff::Linear, 1.0, 1),
+            smooth_options([0.0; 3], f32::NAN, Falloff::Linear, 1.0, 1),
+            smooth_options([0.0; 3], 10.0, Falloff::Linear, f32::NAN, 1),
+            smooth_options([f32::INFINITY, 0.0, 0.0], 10.0, Falloff::Linear, 1.0, 1),
+        ];
+        for options in cases {
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                smooth(&mut tx, &options),
+                Err(OpsError::InvalidInput(_))
+            ));
+            assert!(tx.commit().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn smooth_nonmanifold_fan_moves_toward_centroid() {
+        // Two triangles sharing only vertex E(0), with disjoint other
+        // vertices: E's neighbors are all four of them.
+        let positions = [
+            0.0, 0.0, 1.0, // E
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+        ];
+        let triangles = [[0, 1, 2], [0, 3, 4]];
+        let mut mesh = mesh_of(&positions, &triangles);
+        let options = smooth_options([0.0, 0.0, 1.0], 0.1, Falloff::Linear, 1.0, 1);
+        let (report, _) = edit(&mut mesh, |tx| smooth(tx, &options));
+        assert_eq!(report.moved, 1);
+        let (flat, _) = parts(&mesh);
+        let dist = |p: &[f32]| ((p[0] - 0.5).powi(2) + (p[1] - 0.5).powi(2) + p[2].powi(2)).sqrt();
+        assert!(dist(&flat[0..3]) < dist(&positions[0..3]));
     }
 
     #[test]
