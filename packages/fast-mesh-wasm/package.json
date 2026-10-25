@@ -1,6 +1,6 @@
 {
   "name": "fast-mesh-wasm",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Fast triangle mesh utilities for JavaScript, written in Rust and compiled to WebAssembly",
   "keywords": [
     "mesh",
