@@ -61,6 +61,16 @@ export interface GroupSetup {
   pairs: readonly (readonly [MeshHandle, MeshHandle])[] | "all";
 }
 
+/**
+ * A brush-center pick in flight: armed for `mesh` while `point` is `null`,
+ * landed once the viewport writes the local point. The repair panel consumes
+ * it (into its center inputs) and clears it.
+ */
+export interface BrushPick {
+  mesh: MeshHandle;
+  point: Vec3 | null;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -71,6 +81,8 @@ export interface AppSnapshot {
   checks: readonly MeshHandle[];
   /** The named mesh groups. */
   meshGroups: readonly NamedGroup<MeshHandle>[];
+  /** The brush-center pick in flight, if any. */
+  brushPick: BrushPick | null;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -89,6 +101,7 @@ export class AppState {
     group: { members: [], pairs: "all" },
     checks: [],
     meshGroups: [],
+    brushPick: null,
     edgeSoftness: 0,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -232,6 +245,11 @@ export class AppState {
   /** Colours (`on`) or uncolours the named group `id` by its contacts. */
   setGroupColored(id: number, on: boolean): void {
     this.#set({ meshGroups: setColored(this.#snap.meshGroups, id, on) });
+  }
+
+  /** Arms, lands or clears (`null`) the brush-center pick. */
+  setBrushPick(pick: BrushPick | null): void {
+    this.#set({ brushPick: pick });
   }
 
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */

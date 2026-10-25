@@ -46,6 +46,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [cycles, setCycles] = useState(3);
   const [targetLength, setTargetLength] = useState("");
   const [maxRounds, setMaxRounds] = useState("");
+  const brushPick = useApp(app, (s) => s.brushPick);
   // The brush follows the mesh: its bounding center and a quarter of its
   // half-diagonal. Strength and the rest are preferences and persist.
   useEffect(() => {
@@ -54,6 +55,13 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       setBrushRadius(item.radius / 4);
     }
   }, [item]);
+  // A landed pick for this mesh becomes the center (and clears the pick).
+  useEffect(() => {
+    if (brushPick !== null && brushPick.point !== null && brushPick.mesh === mesh) {
+      setCenter(brushPick.point);
+      app.setBrushPick(null);
+    }
+  }, [app, brushPick, mesh]);
   const seq = useRef(0);
   // An op's own triangle change keeps its report; any other (undo, redo)
   // makes the report stale and clears it.
@@ -292,6 +300,22 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
               onChange={(e) => setCenter([center[0], center[1], Number(e.currentTarget.value) || 0])}
             />
           </label>
+          <button
+            type="button"
+            data-action="pick-center"
+            aria-pressed={brushPick !== null && brushPick.point === null && brushPick.mesh === mesh}
+            disabled={disabled}
+            title="Click the mesh to set the brush center"
+            onClick={() =>
+              app.setBrushPick(
+                brushPick !== null && brushPick.point === null && brushPick.mesh === mesh
+                  ? null
+                  : { mesh: item.mesh, point: null },
+              )
+            }
+          >
+            {brushPick !== null && brushPick.point === null && brushPick.mesh === mesh ? "Picking…" : "Pick"}
+          </button>
           <label className="field" title="Brush radius in mesh units">
             radius
             <input
