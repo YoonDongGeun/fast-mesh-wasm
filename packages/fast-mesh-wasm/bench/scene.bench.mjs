@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { Scene } from "../dist/node.js";
 import { bindMesh } from "../dist/three.js";
+import { createReporter } from "./report.mjs";
 
 const args = new Set(process.argv.slice(2));
 const quick = args.has("--quick");
@@ -21,6 +22,8 @@ const onlyQueued = args.has("--queued"); // with --worker: run just the toggles 
 const skip1m = args.has("--no-1m"); // with --worker --queued --10m: only the 10M case
 const addOnly = args.has("--add-only"); // with --worker --queued: only the addMesh case
 const onlyContact = args.has("--contact"); // with --worker: run just the 1M contact toggle and drag
+
+const reporter = createReporter(process.argv.slice(2), { suite: "scene" });
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -135,7 +138,7 @@ class Mirror {
 
 function report(name, samples, extra = "") {
   const s = stats(samples);
-  console.log(`${name}: median ${fmt(s.median)} ms, p95 ${fmt(s.p95)} ms, min ${fmt(s.min)}, max ${fmt(s.max)} (n=${s.n})${extra}`);
+  reporter.report(name, s, "ms", extra);
   return s;
 }
 
@@ -165,7 +168,7 @@ function benchDrag(label, n, cycles, { maxDistance, range }) {
   let t0 = now();
   const meshA = scene.addMesh(a.positions, a.indices);
   const meshB = scene.addMesh(b.positions, b.indices);
-  console.log(`${label}: added 2 meshes of ${a.triangles.toLocaleString("en")} triangles in ${fmt(now() - t0)} ms`);
+  reporter.log(`${label}: added 2 meshes of ${a.triangles.toLocaleString("en")} triangles in ${fmt(now() - t0)} ms`);
   const cx = n / 2;
   const cy = n / 2;
   // Lift B until the surfaces just touch (as the Rust benches do): measure the gap at pose 0.
@@ -178,11 +181,11 @@ function benchDrag(label, n, cycles, { maxDistance, range }) {
   t0 = now();
   const field = scene.addDistanceField({ name: "gap", on: meshA, to: meshB, maxDistance });
   scene.setColoring(meshA, { field, map: "turbo", range, below: "clamp", above: "base" });
-  console.log(`${label}: addDistanceField + setColoring ${fmt(now() - t0)} ms`);
+  reporter.log(`${label}: addDistanceField + setColoring ${fmt(now() - t0)} ms`);
   const mirror = new Mirror(scene);
   t0 = now();
   mirror.apply(scene.commitFrame());
-  console.log(`${label}: first commitFrame + full mirror copy ${fmt(now() - t0)} ms`);
+  reporter.log(`${label}: first commitFrame + full mirror copy ${fmt(now() - t0)} ms`);
 
   const drag = scene.drag(meshB);
   const total = [];
@@ -213,10 +216,10 @@ function benchDrag(label, n, cycles, { maxDistance, range }) {
   }
   drag.end();
   const s = report(`${label} frame (move + commitFrame + copy)`, total);
-  console.log(
+  reporter.log(
     `  parts (median ms): move ${fmt(stats(parts.move).median)}, commitFrame ${fmt(stats(parts.commit).median)}, copy ${fmt(stats(parts.copy).median)}`,
   );
-  console.log(
+  reporter.log(
     `  dirty per frame: median ${fmt(stats(dirtyBytes).median / 1e6)} MB copied, median ${stats(dirtyTriangles).median.toLocaleString("en")} colour slots`,
   );
   scene.free();
@@ -248,7 +251,7 @@ function benchOwner(label, frames, { gap, maxDistance }) {
   });
   const mirror = new Mirror(scene);
   mirror.apply(scene.commitFrame());
-  console.log(`${label}: 6 x ${(2 * n * n).toLocaleString("en")} triangles, ${fields.size} fields, set up in ${fmt(now() - t0)} ms`);
+  reporter.log(`${label}: 6 x ${(2 * n * n).toLocaleString("en")} triangles, ${fields.size} fields, set up in ${fmt(now() - t0)} ms`);
 
   const drag = scene.drag(meshes[0]);
   const total = [];
@@ -273,7 +276,7 @@ function benchOwner(label, frames, { gap, maxDistance }) {
   }
   drag.end();
   report(`${label} frame (move + commitFrame + copy)`, total);
-  console.log(
+  reporter.log(
     `  parts (median ms): move ${fmt(stats(parts.move).median)}, commitFrame ${fmt(stats(parts.commit).median)}, copy ${fmt(stats(parts.copy).median)}`,
   );
   scene.free();
@@ -302,7 +305,7 @@ function benchAdapter(label, n, cycles, { maxDistance, range }) {
   const boundA = bindMesh(scene, meshA);
   const boundB = bindMesh(scene, meshB);
   scene.commitFrame();
-  console.log(`${label}: bindMesh x2 + first commitFrame (builds both geometries) ${fmt(now() - t0)} ms`);
+  reporter.log(`${label}: bindMesh x2 + first commitFrame (builds both geometries) ${fmt(now() - t0)} ms`);
 
   const drag = scene.drag(meshB);
   const total = [];
@@ -325,7 +328,7 @@ function benchAdapter(label, n, cycles, { maxDistance, range }) {
   drag.end();
   scene.commitFrame();
   report(`${label} frame (move + commitFrame with bindMesh on both)`, total);
-  console.log(
+  reporter.log(
     `  parts (median ms): move ${fmt(stats(parts.move).median)}, commitFrame incl. adapter ${fmt(stats(parts.commit).median)} (p95 ${fmt(stats(parts.commit).p95)})`,
   );
   boundA.dispose();
@@ -558,14 +561,14 @@ async function benchWorkerAdd(label, n, runs) {
     await bw.stats();
   }
   const med = (k) => fmt(stats(parts[k]).median);
-  console.log(`worker addMesh ${label} (${g.triangles.toLocaleString("en")} triangles, ${runs} runs, medians):`);
-  console.log(
+  reporter.log(`worker addMesh ${label} (${g.triangles.toLocaleString("en")} triangles, ${runs} runs, medians):`);
+  reporter.log(
     `  main: addMesh() call ${med("call")} ms (max ${fmt(maxOf(parts.call))}), commitFrame() send ${med("send")} ms, result handler ${med("handler")} ms (max ${fmt(maxOf(parts.handler))}), full mirror copy on the next commitFrame ${med("copy")} ms`,
   );
-  console.log(
+  reporter.log(
     `  main: longest event-loop block ${med("block")} ms (max ${fmt(maxOf(parts.block))}); round trip to applied ${med("rt")} ms`,
   );
-  console.log(`  worker: addMesh request ${med("worker")} ms, longest Worker block ${med("workerBlock")} ms`);
+  reporter.log(`  worker: addMesh request ${med("worker")} ms, longest Worker block ${med("workerBlock")} ms`);
   scene.terminate();
 }
 
@@ -668,10 +671,10 @@ async function benchWorkerDrag(label, n, cycles, opts) {
   await roundTrip(scene, bw);
   const med = (k) => fmt(stats(parts[k]).median);
   report(`worker ${label} main-thread cost per frame (move + commitFrame + copy + result handler)`, main);
-  console.log(
+  reporter.log(
     `  parts (median ms): move ${med("move")}, commitFrame ${med("commit")}, copy ${med("copy")}, handler ${med("handler")} (p95 ${fmt(stats(parts.handler).p95)}); dirty bytes copied ${fmt(stats(parts.bytes).median / 1e3)} KB`,
   );
-  console.log(
+  reporter.log(
     `  round trip move -> result applied: median ${med("rt")} ms (p95 ${fmt(stats(parts.rt).p95)}); worker drag request median ${med("worker")} ms, longest Worker block max ${fmt(maxOf(parts.workerBlock))} ms`,
   );
   scene.terminate();
@@ -772,7 +775,7 @@ const sleepUntil = (t) => new Promise((resolve) => setTimeout(resolve, Math.max(
 async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 }) {
   let t0 = now();
   const { scene, bw, meshB, pose } = await wideWorkerPair(kind, n);
-  console.log(`worker wide drag ${label}: set up in ${fmt((now() - t0) / 1e3)} s`);
+  reporter.log(`worker wide drag ${label}: set up in ${fmt((now() - t0) / 1e3)} s`);
   const mirror = new ViewMirror(scene);
   mirror.apply(scene.commitFrame());
   const drag = scene.drag(meshB);
@@ -802,7 +805,7 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     ls.rt,
     `; ${ls.colored} of ${lockStep} poses recoloured`,
   );
-  console.log(
+  reporter.log(
     `  longest Worker block per pose median ${med(ls.block)} ms (max ${fmt(maxOf(ls.block))}); first field step (unit open) median ${med(ls.open)} ms; ${med(ls.steps)} field steps per pose`,
   );
 
@@ -845,7 +848,7 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
     }
   });
   const steps = chunkMs(st, "fieldStep");
-  console.log(
+  reporter.log(
     `worker wide drag ${label}, continuous ${hz} Hz drag for ${seconds} s: ${frames} moves, ${lag.length} poses recoloured, ${chunkMs(st, "fieldStepAbandon").length} units abandoned`,
   );
   report(`  move -> colours applied, per recoloured pose`, lag);
@@ -862,10 +865,10 @@ async function benchWorkerWideDrag(label, kind, n, { lockStep, seconds, hz = 60 
   // recolours, and the last move's result marks when they were current.
   const tail = results.slice(-2);
   const final = tail.findLast((r) => r.colored) ?? tail[0];
-  console.log(
+  reporter.log(
     `  last move (then release) -> its colours applied ${fmt(final.at - lastSent)} ms (recoloured: ${final.colored}); all drained ${fmt(settled - lastSent)} ms after the last move`,
   );
-  console.log(
+  reporter.log(
     `  most batches waiting for a result ${backlog}; longest field step ${fmt(maxOf(steps))} ms, longest Worker block ${fmt(st.maxGap)} ms; main thread per frame median ${med(main)} ms, longest main block ${fmt(mainBlock)} ms`,
   );
   await roundTrip(scene, bw);
@@ -913,13 +916,13 @@ async function benchWorkerLongRequests(label, n, edits) {
   await editRound("of A, 1 field (on A to B)", meshA, g);
   scene.addDistanceField({ name: "gapBack", on: meshB, to: meshA, maxDistance: 0.08 });
   await roundTrip(scene, bw);
-  console.log(`  adding the B-to-A contact field: longest Worker block ${fmt((await bw.stats()).maxGap)} ms`);
+  reporter.log(`  adding the B-to-A contact field: longest Worker block ${fmt((await bw.stats()).maxGap)} ms`);
   await editRound("of A, 2 contact fields (A to B, B to A)", meshA, g);
   scene.addDistanceField({ name: "wide", on: meshA, to: meshB, maxDistance: 8 });
   scene.addDistanceField({ name: "wideBack", on: meshB, to: meshA, maxDistance: 8 });
   await roundTrip(scene, bw);
   const st = await bw.stats();
-  console.log(
+  reporter.log(
     `  adding the 2 wide fields: field builds ${chunkMs(st, "fieldBuild").map(fmt).join(", ")} ms, longest Worker block ${fmt(st.maxGap)} ms`,
   );
   await editRound("of A, 4 fields (2 contact, 2 wide with maxDistance 8)", meshA, g);
@@ -1026,7 +1029,7 @@ async function benchWorkerQueued(label, n, runs, { field = true, edit = true, ad
     const med = (k) => fmt(stats(parts[k]).median);
     const land = parts.landed.length > 0 ? `, mesh ready (status) after ${med("landed")} ms` : "";
     const longPart = name === "nothing" ? "" : `, long request round trip ${med("long")} ms${land}`;
-    console.log(
+    reporter.log(
       `worker ${label} toggle behind ${name} (${runs} runs, medians): longest Worker block ${med("block")} ms (max ${fmt(maxOf(parts.block))})${longPart}, toggle round trip ${med("toggle")} ms (max ${fmt(maxOf(parts.toggle))})`,
     );
   }
@@ -1128,11 +1131,11 @@ async function benchWorkerManySmall(label, calls, rounds) {
     }
   }
   const med = (k) => fmt(stats(parts[k]).median);
-  console.log(`worker ${label}: ${calls} setPlacement calls in one frame over 10 meshes of 5,000 triangles (${rounds} rounds, medians)`);
-  console.log(
+  reporter.log(`worker ${label}: ${calls} setPlacement calls in one frame over 10 meshes of 5,000 triangles (${rounds} rounds, medians)`);
+  reporter.log(
     `  main: queueing the calls ${med("queue")} ms, round trip commitFrame -> result applied ${med("rt")} ms (p95 ${fmt(stats(parts.rt).p95)}), result handler ${med("handler")} ms`,
   );
-  console.log(
+  reporter.log(
     `  worker: ${stats(parts.chunks).median} requests run, ${med("worker")} ms summed over them, longest Worker block ${med("workerBlock")} ms (max ${fmt(maxOf(parts.workerBlock))})`,
   );
   // The same calls on a synchronous Scene, for comparison.
@@ -1166,6 +1169,7 @@ const wide = { maxDistance: 8, range: [0, 6] }; // every vertex of the dragged p
 if (onlyWorker && onlyContact) {
   await benchWorkerToggle("1M contact", 708, quick ? 10 : 20, contact);
   await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
+  reporter.save();
   process.exit(0);
 }
 if (onlyWorker && onlyQueued) {
@@ -1176,6 +1180,7 @@ if (onlyWorker && onlyQueued) {
   if (with10m) {
     await benchWorkerQueued("10M", 2236, 2, queuedCases);
   }
+  reporter.save();
   process.exit(0);
 }
 if (onlyWorker && onlyWide) {
@@ -1185,6 +1190,7 @@ if (onlyWorker && onlyWide) {
     await benchWorkerWideDrag("10M, 9a terrain", "9a", 2236, { lockStep: 4, seconds: 30 });
     await benchWorkerWideDrag("10M, native terrain", "native", 2236, { lockStep: 4, seconds: 30 });
   }
+  reporter.save();
   process.exit(0);
 }
 if (onlyWorker) {
@@ -1207,6 +1213,7 @@ if (onlyWorker) {
     await benchWorkerWideDrag("10M, 9a terrain", "9a", 2236, { lockStep: 4, seconds: 30 });
     await benchWorkerWideDrag("10M, native terrain", "native", 2236, { lockStep: 4, seconds: 30 });
   }
+  reporter.save();
   process.exit(0);
 }
 if (onlyAdapter) {
@@ -1214,6 +1221,7 @@ if (onlyAdapter) {
   if (!quick) {
     benchAdapter("adapter 1M wide", 708, 3, wide);
   }
+  reporter.save();
   process.exit(0);
 }
 benchAdd("1M", 708, quick ? 3 : 7);
@@ -1230,3 +1238,4 @@ if (with10m) {
   benchAdd("10M", 2236, 3);
   benchDrag("10M contact", 2236, 1, contact);
 }
+reporter.save();
