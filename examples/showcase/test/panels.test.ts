@@ -13,7 +13,7 @@ import {
   toleranceLimit,
   topologyOf,
 } from "../src/panels/collision-math";
-import { describeReport, summarize } from "../src/panels/repair-summary";
+import { describeJoin, describeReport, summarize } from "../src/panels/repair-summary";
 
 describe("collision math", () => {
   it("nice_scale", () => {
@@ -245,6 +245,9 @@ describe("repair summaries", () => {
     );
     expect(describeReport("bridgeLoops", { trianglesAdded: 8 })).toBe(
       "Bridge loops: added 8 triangles",
+    );
+    expect(describeJoin({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 })).toBe(
+      "Join: copied 4 vertices and 2 triangles, bridged 8 triangles",
     );
   });
 });

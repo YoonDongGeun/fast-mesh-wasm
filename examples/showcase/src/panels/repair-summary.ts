@@ -1,7 +1,7 @@
 // What the repair panel shows: an `Analysis` reduced to the counts it lists
 // (holes largest first, components largest first), and one line per repair
 // report.
-import type { Analysis, RepairOp, RepairReport } from "fast-mesh-wasm";
+import type { Analysis, JoinReport, RepairOp, RepairReport } from "fast-mesh-wasm";
 
 export interface AnalysisSummary {
   /** Closed boundary loops, largest first. */
@@ -124,4 +124,9 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       return `Bridge loops: added ${plural(r.trianglesAdded, "triangle")}`;
     }
   }
+}
+
+/** One line for a join report. */
+export function describeJoin(report: JoinReport): string {
+  return `Join: copied ${plural(report.verticesAdded, "vertex", "vertices")} and ${plural(report.trianglesAdded, "triangle")}, bridged ${plural(report.bridgeTrianglesAdded, "triangle")}`;
 }
