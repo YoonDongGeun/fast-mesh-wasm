@@ -34,6 +34,7 @@
 //!   smooth normals or toward their neighbours.
 
 mod analyze;
+pub mod bridge;
 mod cleanup;
 pub mod deform;
 mod error;
@@ -50,6 +51,7 @@ mod topology;
 mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
+pub use bridge::{BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops};
 pub use cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
