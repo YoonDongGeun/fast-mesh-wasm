@@ -7,10 +7,10 @@ import type { MeshHandle, RepairOp, RepairReport, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type AppState, useApp } from "../scene/app-state";
+import { type AppState, type Item, useApp } from "../scene/app-state";
 import { formatDistance } from "./collision-math";
 import { inspect } from "./inspect";
-import { type AnalysisSummary, describeReport, plural, summarize } from "./repair-summary";
+import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
 
 /** The most entries the analysis lists (counts stay exact). */
 const MAX_LISTED = 64;
@@ -47,6 +47,13 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [targetLength, setTargetLength] = useState("");
   const [maxRounds, setMaxRounds] = useState("");
   const brushPick = useApp(app, (s) => s.brushPick);
+  const [bridgeA, setBridgeA] = useState("");
+  const [bridgeB, setBridgeB] = useState("");
+  const [loopMax, setLoopMax] = useState(128);
+  const [joinSource, setJoinSource] = useState<number | "">("");
+  const [joinLoopA, setJoinLoopA] = useState("");
+  const [joinLoopB, setJoinLoopB] = useState("");
+  const [sourceSummary, setSourceSummary] = useState<AnalysisSummary | null>(null);
   // The brush follows the mesh: its bounding center and a quarter of its
   // half-diagonal. Strength and the rest are preferences and persist.
   useEffect(() => {
@@ -62,6 +69,51 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       app.setBrushPick(null);
     }
   }, [app, brushPick, mesh]);
+  // Loop picks are loop ids: a fresh analysis (or mesh) invalidates them.
+  useEffect(() => {
+    setBridgeA("");
+    setBridgeB("");
+    setJoinLoopA("");
+    setJoinSource("");
+    setJoinLoopB("");
+    setSourceSummary(null);
+  }, [mesh]);
+  useEffect(() => {
+    setBridgeA("");
+    setBridgeB("");
+    setJoinLoopA("");
+  }, [analysis]);
+  useEffect(() => {
+    setJoinLoopB("");
+  }, [sourceSummary]);
+  // The join source's holes, fetched when the source changes.
+  useEffect(() => {
+    if (joinSource === "") {
+      setSourceSummary(null);
+      return;
+    }
+    const source = items.find((i) => i.id === joinSource) ?? null;
+    if (source === null) {
+      setSourceSummary(null);
+      return;
+    }
+    let alive = true;
+    void Promise.resolve()
+      .then(() => scene.analyze(source.mesh, { maxListed: MAX_LISTED }))
+      .then((a) => {
+        if (alive) {
+          setSourceSummary(summarize(a));
+        }
+      })
+      .catch(() => {
+        if (alive) {
+          setSourceSummary(null);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [scene, joinSource, items]);
   const seq = useRef(0);
   // An op's own triangle change keeps its report; any other (undo, redo)
   // makes the report stale and clears it.
@@ -138,6 +190,48 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       inspect.repair.report = line;
     } catch (e) {
       const line = `${label} failed: ${e instanceof Error ? e.message : String(e)}`;
+      setReport({ mesh, line, failed: true });
+      inspect.repair.report = line;
+    } finally {
+      setBusy(null);
+      inspect.repair.busy = null;
+      if (own.current.pending) {
+        own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
+      }
+    }
+  };
+
+  const runJoin = async (source: Item, loopA: number, loopB: number) => {
+    if (mesh === null || busy !== null) {
+      return;
+    }
+    const target = s?.holes[loopA] ?? null;
+    const from = sourceSummary?.holes[loopB] ?? null;
+    if (target === null || from === null) {
+      return;
+    }
+    const targetName = items.find((i) => i.mesh === mesh)?.name ?? "mesh";
+    setBusy("Join");
+    inspect.repair.busy = "Join";
+    clearTimeout(own.current.timer);
+    own.current.pending = true;
+    try {
+      // Like a removal: release the pair colouring first, in the same tick
+      // the engine drops the source.
+      const snap = app.getSnapshot();
+      if (snap.collisionMode === "pair" && (snap.collision.a === source.mesh || snap.collision.b === source.mesh)) {
+        const other = snap.collision.a === source.mesh ? snap.collision.b : snap.collision.a;
+        if (other !== null && other !== source.mesh) {
+          store.setDisplay(other, { coloring: null });
+        }
+      }
+      const r = await scene.join(mesh, source.mesh, { loopA: target.id, loopB: from.id, maxEdges: loopMax });
+      app.dropItem(store, source);
+      const line = `${describeJoin(r)} — ${source.name} removed (undo restores ${targetName} only)`;
+      setReport({ mesh, line, failed: false });
+      inspect.repair.report = line;
+    } catch (e) {
+      const line = `Join ${source.name} into ${targetName} failed: ${e instanceof Error ? e.message : String(e)}`;
       setReport({ mesh, line, failed: true });
       inspect.repair.report = line;
     } finally {
@@ -416,6 +510,116 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Deform: inflate puffs the brush up (negative dents), smooth relaxes it, remesh retriangulates it.</p>
+      </div>
+
+      <div className="ops">
+        <div className="op">
+          <span className="op-label">Bridge</span>
+          <label className="field" title="First loop (holes of this mesh, largest first)">
+            loop A
+            <select data-bridge-loop="a" value={bridgeA} onChange={(e) => setBridgeA(e.currentTarget.value)}>
+              <option value="">—</option>
+              {(s?.holes ?? []).map((h, n) => (
+                <option key={n} value={n}>
+                  #{n + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" title="Second loop">
+            loop B
+            <select data-bridge-loop="b" value={bridgeB} onChange={(e) => setBridgeB(e.currentTarget.value)}>
+              <option value="">—</option>
+              {(s?.holes ?? []).map((h, n) => (
+                <option key={n} value={n}>
+                  #{n + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            data-repair-op="bridgeLoops"
+            disabled={disabled || bridgeA === "" || bridgeB === "" || bridgeA === bridgeB}
+            title={s === null || s.holes.length < 2 ? "Needs two holes" : "Stitch the two loops with a tube"}
+            onClick={() => {
+              const a = s?.holes[Number(bridgeA)] ?? null;
+              const b = s?.holes[Number(bridgeB)] ?? null;
+              if (a !== null && b !== null) {
+                void run("Bridge loops", { op: "bridgeLoops", loops: [a.id, b.id], maxEdges: loopMax });
+              }
+            }}
+          >
+            Bridge
+          </button>
+          <label className="field" title="Maximum vertices per loop">
+            max
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={loopMax}
+              onChange={(e) => setLoopMax(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+          </label>
+        </div>
+        <div className="op">
+          <span className="op-label">Join</span>
+          <label className="field" title="The mesh copied into this one (and removed)">
+            source
+            <select
+              data-join-source="true"
+              value={joinSource}
+              onChange={(e) => setJoinSource(e.currentTarget.value === "" ? "" : Number(e.currentTarget.value))}
+            >
+              <option value="">—</option>
+              {items
+                .filter((i) => i.mesh !== mesh)
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    {i.name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="field" title="This mesh's loop">
+            loop A
+            <select data-join-loop="a" value={joinLoopA} onChange={(e) => setJoinLoopA(e.currentTarget.value)}>
+              <option value="">—</option>
+              {(s?.holes ?? []).map((h, n) => (
+                <option key={n} value={n}>
+                  #{n + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" title="The source's loop">
+            loop B
+            <select data-join-loop="b" value={joinLoopB} onChange={(e) => setJoinLoopB(e.currentTarget.value)}>
+              <option value="">—</option>
+              {(sourceSummary?.holes ?? []).map((h, n) => (
+                <option key={n} value={n}>
+                  #{n + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            data-action="join"
+            disabled={disabled || joinSource === "" || joinLoopA === "" || joinLoopB === ""}
+            title="Copy the source into this mesh, bridge the loops, remove the source"
+            onClick={() => {
+              const source = items.find((i) => i.id === joinSource) ?? null;
+              if (source !== null) {
+                void runJoin(source, Number(joinLoopA), Number(joinLoopB));
+              }
+            }}
+          >
+            Join
+          </button>
+        </div>
+        <p className="muted small">Bridge stitches two holes of this mesh; Join merges another mesh into it (the source is removed).</p>
       </div>
 
       {busy !== null ? (

@@ -1,11 +1,11 @@
 // What the repair panel shows: an `Analysis` reduced to the counts it lists
 // (holes largest first, components largest first), and one line per repair
 // report.
-import type { Analysis, JoinReport, RepairOp, RepairReport } from "fast-mesh-wasm";
+import type { Analysis, JoinReport, LoopId, RepairOp, RepairReport } from "fast-mesh-wasm";
 
 export interface AnalysisSummary {
-  /** Closed boundary loops, largest first. */
-  holes: { edges: number; perimeter: number }[];
+  /** Closed boundary loops, largest first, with the ids bridging takes. */
+  holes: { id: LoopId; edges: number; perimeter: number }[];
   /** Boundary chains that do not close (never filled). */
   openChains: number;
   /** Interior edges used the same way by both their triangles. */
@@ -24,7 +24,7 @@ export interface AnalysisSummary {
 export function summarize(a: Analysis): AnalysisSummary {
   const holes = a.loops
     .filter((l) => l.closed)
-    .map((l) => ({ edges: l.id.len, perimeter: l.perimeter }))
+    .map((l) => ({ id: l.id, edges: l.id.len, perimeter: l.perimeter }))
     .sort((x, y) => y.edges - x.edges);
   const components = a.components
     .map((c) => ({ triangles: c.triangles.length, closed: c.closed }))

@@ -171,6 +171,28 @@ export class AppState {
    * keep their remaining partners.
    */
   removeMesh(store: SceneStore, item: Item): void {
+    const detached = this.#detach(store, item);
+    store.removeMesh(item.mesh);
+    item.material.dispose();
+    this.#dropLists(item, detached);
+  }
+
+  /**
+   * Drops a mesh the engine already removed (a join's source): the same list
+   * cleanup as {@link removeMesh}, without the store call (which would report
+   * the missing mesh as an error).
+   */
+  dropItem(store: SceneStore, item: Item): void {
+    item.material.dispose();
+    this.#dropLists(item, this.#detach(store, item));
+  }
+
+  /**
+   * Unpicks a removed mesh from the collision pair (releasing the other
+   * mesh's colouring first, in the same tick) and the contact group. The
+   * store takes a removed mesh out of its groups itself.
+   */
+  #detach(store: SceneStore, item: Item): { collision: CollisionPair; group: GroupSetup } {
     let collision = this.#snap.collision;
     if (collision.a === item.mesh || collision.b === item.mesh) {
       const other = collision.a === item.mesh ? collision.b : collision.a;
@@ -180,16 +202,20 @@ export class AppState {
       collision = { a: collision.a === item.mesh ? null : collision.a, b: collision.b === item.mesh ? null : collision.b };
     }
     const { members, pairs } = this.#snap.group;
-    const group: GroupSetup = {
-      members: members.filter((m) => m !== item.mesh),
-      pairs: pairs === "all" ? "all" : pairs.filter(([a, b]) => a !== item.mesh && b !== item.mesh),
+    return {
+      collision,
+      group: {
+        members: members.filter((m) => m !== item.mesh),
+        pairs: pairs === "all" ? "all" : pairs.filter(([a, b]) => a !== item.mesh && b !== item.mesh),
+      },
     };
-    store.removeMesh(item.mesh);
-    item.material.dispose();
+  }
+
+  #dropLists(item: Item, detached: { collision: CollisionPair; group: GroupSetup }): void {
     this.#set({
       items: this.#snap.items.filter((i) => i !== item),
-      collision,
-      group,
+      collision: detached.collision,
+      group: detached.group,
       checks: this.#snap.checks.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
     });
