@@ -29,7 +29,9 @@ test("save writes the document to the --json path", () => {
   assert.equal(doc.schema, 1);
   assert.equal(doc.suite, "scene");
   assert.equal(doc.cases.length, 1);
-  assert.deepEqual(doc.cases[0], { name: "a", unit: "ms", median: 1, p95: 2, min: 0.5, max: 3, n: 7 });
+  assert.ok(typeof doc.cases[0].heapMB === "number" && doc.cases[0].heapMB > 0);
+  const { heapMB: _jsonHeap, ...jsonCase } = doc.cases[0];
+  assert.deepEqual(jsonCase, { name: "a", unit: "ms", median: 1, p95: 2, min: 0.5, max: 3, n: 7 });
 });
 
 test("save without --json is a no-op", () => {
@@ -75,6 +77,13 @@ test("quick flag is recorded and console still prints", () => {
   assert.equal(r.document().quick, true);
 });
 
+test("report samples heapMB after gc when available", () => {
+  const r = createReporter(["--json", "X"], { suite: "scene" });
+  r.report("a", { median: 1, p95: 2, n: 7 }, "ms");
+  const c = r.document().cases[0];
+  assert.ok(typeof c.heapMB === "number" && c.heapMB > 0);
+});
+
 test("record stores a case without printing", () => {
   const lines = [];
   const orig = console.log;
@@ -88,5 +97,7 @@ test("record stores a case without printing", () => {
     console.log = orig;
   }
   assert.deepEqual(lines, []);
-  assert.deepEqual(doc.cases, [{ name: "row", unit: "µs", median: 1.5, p95: 2.5, n: 200 }]);
+  assert.ok(typeof doc.cases[0].heapMB === "number" && doc.cases[0].heapMB > 0);
+  const { heapMB: _recordHeap, ...recordCase } = doc.cases[0];
+  assert.deepEqual([recordCase], [{ name: "row", unit: "µs", median: 1.5, p95: 2.5, n: 200 }]);
 });

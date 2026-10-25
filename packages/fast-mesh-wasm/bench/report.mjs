@@ -33,6 +33,16 @@ export function createReporter(argv, { suite } = {}) {
       if (stats.max !== undefined) {
         entry.max = stats.max;
       }
+      // Heap sample per case: gc first when exposed (CI passes
+      // NODE_OPTIONS=--expose-gc for stable numbers), then heapUsed in MB
+      // rounded to one decimal. Omitted when sampling is impossible —
+      // never zero-filled.
+      try {
+        globalThis.gc?.();
+        entry.heapMB = Math.round((process.memoryUsage().heapUsed / 1048576) * 10) / 10;
+      } catch {
+        // sampling unavailable: leave heapMB unset
+      }
       cases.push(entry);
     },
     log(line) {
