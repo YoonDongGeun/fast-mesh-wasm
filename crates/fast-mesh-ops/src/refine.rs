@@ -43,6 +43,9 @@ pub(crate) struct RefinedPatch {
     pub(crate) parents: Vec<[(u32, f32); 3]>,
     /// The patch triangles, wound like the triangulation.
     pub(crate) triangles: Vec<[u32; 3]>,
+    /// Whether refinement stopped early: the vertex budget was hit, or the
+    /// rounds ran out while triangles were still coarse.
+    pub(crate) capped: bool,
 }
 
 impl RefinedPatch {
@@ -70,6 +73,10 @@ impl RefinedPatch {
 /// The winding of `patch` is kept. With no usable σ at all, `patch` comes
 /// back unrefined.
 ///
+/// `max_vertices` caps the new vertices: splits stop once it is reached,
+/// and [`RefinedPatch::capped`] reports it, as it reports the rounds
+/// running out while triangles are still coarse.
+///
 /// # Errors
 /// [`OpsError::Store`] when memory runs out.
 pub(crate) fn refine(
@@ -78,6 +85,29 @@ pub(crate) fn refine(
     edges: &EdgeMap,
     loop_vertices: &[VertexId],
     patch: &[[VertexId; 3]],
+    max_vertices: Option<usize>,
+) -> Result<RefinedPatch> {
+    refine_inner(
+        mesh,
+        fans,
+        edges,
+        loop_vertices,
+        patch,
+        max_vertices,
+        MAX_ROUNDS,
+    )
+}
+
+/// [`refine`] with an explicit round limit, so tests can reach round
+/// exhaustion without a patch that needs all [`MAX_ROUNDS`] rounds.
+fn refine_inner(
+    mesh: &Mesh,
+    fans: &VertexFans,
+    edges: &EdgeMap,
+    loop_vertices: &[VertexId],
+    patch: &[[VertexId; 3]],
+    max_vertices: Option<usize>,
+    max_rounds: usize,
 ) -> Result<RefinedPatch> {
     let mut old = Vec::new();
     reserve(&mut old, loop_vertices.len())?;
@@ -110,6 +140,7 @@ pub(crate) fn refine(
         points,
         parents: Vec::new(),
         triangles,
+        capped: false,
     };
     if count == 0 {
         return Ok(refined);
@@ -120,11 +151,18 @@ pub(crate) fn refine(
         }
     }
     let mut relax = Relax::default();
-    for _ in 0..MAX_ROUNDS {
-        let split = split_round(&mut refined, &mut sigma)?;
+    for round in 0..max_rounds {
+        let split = split_round(&mut refined, &mut sigma, max_vertices)?;
         relax.run(&mut refined, edges)?;
-        if !split {
+        if refined.capped || !split {
             break;
+        }
+        // The last round may have fixed the last coarse triangle; only
+        // report capped when another round would still split something.
+        if round + 1 == max_rounds
+            && (0..refined.triangles.len()).any(|t| coarse_split(&refined, &sigma, t).is_some())
+        {
+            refined.capped = true;
         }
     }
     Ok(refined)
@@ -171,26 +209,42 @@ fn normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
     (len.is_finite() && len > DEGENERATE * longest * longest).then_some(n)
 }
 
+/// The centroid and new-vertex target length of triangle `t` of `patch`,
+/// when it is coarse for the target lengths `sigma`: not degenerate, and
+/// Liepa's density rule holds at every corner.
+fn coarse_split(patch: &RefinedPatch, sigma: &[f64], t: usize) -> Option<([f64; 3], f64)> {
+    let [a, b, c] = patch.triangles[t];
+    let p = [a, b, c].map(|v| patch.points[v as usize]);
+    normal(p[0], p[1], p[2])?;
+    let centre: [f64; 3] = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
+    let s = (sigma[a as usize] + sigma[b as usize] + sigma[c as usize]) / 3.0;
+    let coarse = [a, b, c].iter().zip(p).all(|(&m, q)| {
+        let d = SQRT_2 * distance(centre, q);
+        d > s && d > sigma[m as usize]
+    });
+    coarse.then_some((centre, s))
+}
+
 /// Splits every triangle that is coarse for the target lengths `sigma` at
-/// its centroid, once; whether any was split.
-fn split_round(patch: &mut RefinedPatch, sigma: &mut Vec<f64>) -> Result<bool> {
+/// its centroid, once, up to `max_vertices` new vertices; whether any was
+/// split. A coarse triangle skipped for the budget marks the patch capped
+/// and ends the round.
+fn split_round(
+    patch: &mut RefinedPatch,
+    sigma: &mut Vec<f64>,
+    max_vertices: Option<usize>,
+) -> Result<bool> {
     let third = 1.0f32 / 3.0;
     let count = patch.triangles.len();
     let mut split = false;
     for t in 0..count {
+        let Some((centre, s)) = coarse_split(patch, sigma, t) else {
+            continue;
+        };
         let [a, b, c] = patch.triangles[t];
-        let p = [a, b, c].map(|v| patch.points[v as usize]);
-        if normal(p[0], p[1], p[2]).is_none() {
-            continue;
-        }
-        let centre: [f64; 3] = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
-        let s = (sigma[a as usize] + sigma[b as usize] + sigma[c as usize]) / 3.0;
-        let coarse = [a, b, c].iter().zip(p).all(|(&m, q)| {
-            let d = SQRT_2 * distance(centre, q);
-            d > s && d > sigma[m as usize]
-        });
-        if !coarse {
-            continue;
+        if max_vertices.is_some_and(|max| patch.new_vertices() >= max) {
+            patch.capped = true;
+            break;
         }
         let m = u32::try_from(patch.points.len())
             .ok()
@@ -358,10 +412,10 @@ mod tests {
         let l = loops.iter().min_by_key(|l| l.vertices.len()).unwrap();
         let edges = EdgeMap::build(mesh).unwrap();
         let fans = VertexFans::build(mesh).unwrap();
-        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200)
+        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200, None)
             .unwrap()
             .unwrap();
-        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris).unwrap();
+        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
         (l.vertices.clone(), patch)
     }
 
@@ -394,6 +448,71 @@ mod tests {
         assert!(patch.old.iter().all(|&v| mesh.is_vertex_alive(v)));
         let len = patch.points.len() as u32;
         assert!(patch.triangles.iter().flatten().all(|&v| v < len));
+    }
+
+    #[test]
+    fn vertex_budget_caps_refinement_and_reports_it() {
+        let mesh = punch_holes(&uv_sphere(32, 64, 1.0), &[[0.6, 0.0, 0.8]], 0.4);
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        let edges = EdgeMap::build(&mesh).unwrap();
+        let fans = VertexFans::build(&mesh).unwrap();
+        let tris = triangulate_loop(&mesh, &l.vertices, &edges, 200, None)
+            .unwrap()
+            .unwrap();
+        let full = refine(&mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
+        assert!(!full.capped);
+        let n = full.new_vertices();
+        assert!(n > 10, "{n}");
+        let capped = refine(&mesh, &fans, &edges, &l.vertices, &tris, Some(n / 2)).unwrap();
+        assert!(capped.capped);
+        assert!(capped.new_vertices() > 0);
+        assert!(
+            capped.new_vertices() <= n / 2,
+            "{} new vertices",
+            capped.new_vertices()
+        );
+        // A budget the patch fits in changes nothing.
+        let free = refine(&mesh, &fans, &edges, &l.vertices, &tris, Some(n)).unwrap();
+        assert!(!free.capped);
+        assert_eq!(free.new_vertices(), n);
+        assert_eq!(free.triangles.len(), full.triangles.len());
+    }
+
+    #[test]
+    fn round_exhaustion_sets_capped_only_while_coarse() {
+        let mesh = punch_holes(&uv_sphere(32, 64, 1.0), &[[0.6, 0.0, 0.8]], 0.4);
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        let edges = EdgeMap::build(&mesh).unwrap();
+        let fans = VertexFans::build(&mesh).unwrap();
+        let tris = triangulate_loop(&mesh, &l.vertices, &edges, 200, None)
+            .unwrap()
+            .unwrap();
+        let full = refine(&mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
+        let n = full.new_vertices();
+        assert!(n > 10, "{n}");
+        // The first round limit that refines fully: its last round fixed
+        // the last coarse triangle, so the patch is not capped.
+        let rounds = (1..=MAX_ROUNDS)
+            .find(|&r| {
+                refine_inner(&mesh, &fans, &edges, &l.vertices, &tris, None, r)
+                    .unwrap()
+                    .new_vertices()
+                    == n
+            })
+            .expect("full refinement fits in MAX_ROUNDS");
+        assert!(rounds >= 2, "{rounds}");
+        for r in 1..rounds {
+            let cut = refine_inner(&mesh, &fans, &edges, &l.vertices, &tris, None, r).unwrap();
+            assert!(cut.capped, "round limit {r} of {rounds}");
+            assert!(cut.new_vertices() < n);
+        }
+        let exact = refine_inner(&mesh, &fans, &edges, &l.vertices, &tris, None, rounds).unwrap();
+        assert!(!exact.capped);
+        assert_eq!(exact.triangles, full.triangles);
     }
 
     #[test]

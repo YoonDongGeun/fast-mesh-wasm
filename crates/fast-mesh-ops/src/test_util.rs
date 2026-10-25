@@ -198,6 +198,48 @@ pub(crate) fn band(
     mesh_of(&positions, &triangles)
 }
 
+/// A Klein bottle: an `n` by `m` grid of quads wrapped into a closed,
+/// non-orientable surface. The `u` sides join straight, while the top of
+/// the `v` range joins the bottom flipped (`(u, 1)` is `(1 - u, 0)`), so
+/// every edge has two triangles but no consistent winding exists. Shaped
+/// by the standard immersion in `f64`.
+pub(crate) fn klein(n: u32, m: u32) -> Mesh {
+    use std::f64::consts::PI;
+    assert!(n >= 3 && m >= 2);
+    let mut positions = Vec::new();
+    for j in 0..m {
+        for i in 0..n {
+            let u = 2.0 * PI * f64::from(i) / f64::from(n);
+            let v = 2.0 * PI * f64::from(j) / f64::from(m);
+            let (su, s2u) = (u.sin(), (2.0 * u).sin());
+            let (cv2, sv2) = ((v / 2.0).cos(), (v / 2.0).sin());
+            let r = 2.0 + cv2 * su - sv2 * s2u;
+            positions.extend([
+                (r * v.cos()) as f32,
+                (r * v.sin()) as f32,
+                (sv2 * su + cv2 * s2u) as f32,
+            ]);
+        }
+    }
+    let at = |i: u32, j: u32| j * n + i;
+    let flip = |i: u32| (n - i) % n;
+    let mut triangles = Vec::new();
+    for j in 0..m {
+        for i in 0..n {
+            let i2 = (i + 1) % n;
+            if j + 1 < m {
+                let (a, b, c, d) = (at(i, j), at(i2, j), at(i2, j + 1), at(i, j + 1));
+                triangles.extend([[a, b, c], [a, c, d]]);
+            } else {
+                let (a, b) = (at(i, j), at(i2, j));
+                let (c, d) = (at(flip(i2), 0), at(flip(i), 0));
+                triangles.extend([[a, b, c], [a, c, d]]);
+            }
+        }
+    }
+    mesh_of(&positions, &triangles)
+}
+
 /// `mesh` with a closed tetrahedron on its edge `a`-`b` and two new vertices
 /// at `apex`, so that `a`-`b` gains two triangles. The tetrahedron is wound
 /// consistently with itself.
@@ -430,5 +472,30 @@ pub(crate) fn assert_parallel_identical<R: PartialEq + std::fmt::Debug + Send>(
     let before = par::parallel_entries();
     assert!(run() == reference, "{what}: global pool");
     assert!(par::parallel_entries() > before, "{what}: ran sequentially");
+    reference
+}
+
+/// Runs `run` with parallel work forced off, then on pools of 1, 2 and 8
+/// threads and on the global pool, asserting every run matches the first;
+/// for code with no parallel path of its own, where
+/// [`assert_parallel_identical`] would fail for running sequentially.
+/// Returns the first run.
+pub(crate) fn assert_identical_across_threads<R: PartialEq + std::fmt::Debug + Send>(
+    what: &str,
+    run: impl Fn() -> R + Sync,
+) -> R {
+    use fast_mesh_store::par;
+    par::set_force_sequential(true);
+    let reference = run();
+    par::set_force_sequential(false);
+    if !par::enabled() {
+        // Every run below would be this one again.
+        return reference;
+    }
+    for k in [1, 2, 8] {
+        let got = par::with_threads(k, &run);
+        assert!(got == reference, "{what}: {k} threads");
+    }
+    assert!(run() == reference, "{what}: global pool");
     reference
 }

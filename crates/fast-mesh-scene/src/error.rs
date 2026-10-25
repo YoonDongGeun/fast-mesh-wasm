@@ -101,9 +101,31 @@ impl From<FieldsError> for SceneError {
 
 impl From<OpsError> for SceneError {
     fn from(e: OpsError) -> Self {
-        SceneError::Ops(e)
+        // Out-of-memory arrives as one variant, however it was raised.
+        match e {
+            OpsError::Store(StoreError::OutOfMemory) => SceneError::Store(StoreError::OutOfMemory),
+            e => SceneError::Ops(e),
+        }
     }
 }
 
 /// `Result` with [`SceneError`] as the error type.
 pub type Result<T> = std::result::Result<T, SceneError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_out_of_memory_maps_to_store() {
+        // Out-of-memory arrives as one variant, however it was raised.
+        assert_eq!(
+            SceneError::from(OpsError::Store(StoreError::OutOfMemory)),
+            SceneError::Store(StoreError::OutOfMemory)
+        );
+        assert_eq!(
+            SceneError::from(OpsError::StaleLoops),
+            SceneError::Ops(OpsError::StaleLoops)
+        );
+    }
+}

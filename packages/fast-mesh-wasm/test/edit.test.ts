@@ -307,6 +307,7 @@ describe("analyze and repair", () => {
     for (const f of fill.filled) {
       expect(f.trianglesAdded).toBeGreaterThanOrEqual(4);
       expect(f.converged).toBe(true);
+      expect(f.refineCapped).toBe(false);
       // Fairing runs only when refinement added vertices.
       if (f.verticesAdded === 0) {
         expect(f.weights).toBeNull();
@@ -342,12 +343,28 @@ describe("analyze and repair", () => {
       mergedVertices: 0,
       removedTriangles: 0,
     });
+    // The new fill options round-trip; a generous budget caps nothing.
+    const options = s.repair(m, {
+      op: "fillHoles",
+      maxPerimeter: 2,
+      maxDihedral: Math.PI,
+      maxRefineVertices: 1000,
+    });
+    expect(options.filled.length).toBe(2);
+    expect(options.filled.every((f) => f.refineCapped === false)).toBe(true);
+    expect(s.undo()).toBe(true);
     // Bad options: nothing changes.
     const undoable = s.canUndo();
     expect(codeOf(() => s.repair(m, [{ op: "orient" }, { op: "fillHoles" }]))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { op: "weld", tolerance: -1 }))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { op: "fillHoles", maxEdges: 1.5 }))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { op: "fillHoles", maxPerimeter: Number.NaN }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(codeOf(() => s.repair(m, { op: "fillHoles", maxDihedral: Number.NaN }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(codeOf(() => s.repair(m, { op: "fillHoles", maxRefineVertices: 1.5 }))).toBe(
       "INVALID_ARGUMENT",
     );
     expect(codeOf(() => s.repair(m, { op: "melt" } as never))).toBe("INVALID_ARGUMENT");

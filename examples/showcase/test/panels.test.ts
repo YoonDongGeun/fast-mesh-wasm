@@ -221,6 +221,7 @@ describe("repair summaries", () => {
             verticesAdded: 0,
             converged: true,
             weights: null,
+            refineCapped: false,
           },
           {
             id: { minVertex: 9, len: 64, hash: 1n },
@@ -228,6 +229,7 @@ describe("repair summaries", () => {
             verticesAdded: 30,
             converged: true,
             weights: "cotangent",
+            refineCapped: false,
           },
         ],
         skipped: [{ id: { minVertex: 5, len: 300, hash: 2n }, reason: "bounds" }],

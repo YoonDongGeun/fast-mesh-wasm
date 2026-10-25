@@ -81,6 +81,7 @@ pub use region::*;
 pub use rigid::Rigid;
 pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};
 pub use selfpairs::self_intersecting_pairs;
+pub use selfpairs::self_intersects;
 pub use slice::{Contour, Slice, slice};
 pub use tri::{Cull, Feature};
 
@@ -95,7 +96,7 @@ pub(crate) fn check(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     /// Test-only fault injection: number of fallible reservations that still succeed.
     static ALLOCATIONS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -104,8 +105,11 @@ thread_local! {
 /// Makes the `n`-th next fallible reservation on this thread (0-based) and every one
 /// after it fail with `OutOfMemory`. `None` turns failures off. While armed,
 /// parallel work runs on this thread so the hook sees every reservation.
-#[cfg(test)]
-pub(crate) fn fail_allocations_after(n: Option<usize>) {
+///
+/// Test-only: compiled for this crate's own tests, and, with the
+/// `fault-injection` feature, as a public helper for dependents' tests.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn fail_allocations_after(n: Option<usize>) {
     // Only on arming or disarming: the count must see one `true` per arm.
     let was = ALLOCATIONS_LEFT.with(|c| c.replace(n)).is_some();
     if was != n.is_some() {
@@ -114,7 +118,7 @@ pub(crate) fn fail_allocations_after(n: Option<usize>) {
 }
 
 fn allocation_allowed() -> Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-injection"))]
     {
         if let Some(n) = ALLOCATIONS_LEFT.with(|c| c.get()) {
             if n == 0 {

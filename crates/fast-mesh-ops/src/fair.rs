@@ -3,18 +3,19 @@
 //! [`fair`] moves the new vertices of a [`RefinedPatch`] so that the patch
 //! minimises bending and continues the curvature around it: it solves the
 //! discrete bi-Laplacian `L(L x) = 0` for the new vertices, with the loop
-//! vertices and the ring of mesh vertices just outside the loop fixed, by
-//! conjugate gradient on each coordinate.
+//! vertices and the ring of mesh vertices just outside the loop fixed, by a
+//! sparse direct solve of the normal equations.
 
-use fast_mesh_store::{Mesh, VertexId, par};
+use fast_mesh_store::{Mesh, VertexId};
 
 use crate::fill::{FailReason, FairWeights};
 use crate::refine::RefinedPatch;
+use crate::sparse;
 use crate::topology::{VertexFans, cross, dot, point, sub};
 use crate::{Result, filled, push, reserve};
 
-/// Conjugate gradient stops once the residual is this small relative to the
-/// right-hand side.
+/// A solve counts as converged once its residual is this small relative to
+/// the right-hand side.
 const TOLERANCE: f64 = 1e-10;
 
 /// Cotangent weights are clamped to at least this times their mean.
@@ -24,36 +25,13 @@ const CLAMP: f64 = 1e-6;
 /// of its two edges adds no cotangent weight.
 const DEGENERATE: f64 = 1e-12;
 
-/// The three coordinate solves run side by side from this many new vertices,
-/// with the `parallel` feature.
-///
-/// Measured on the i5-13600K through `fill_holes` on round terrain holes:
-/// at 23 and 33 new vertices parallel is up to 1.1 times slower, at 94
-/// even, at 173 1.1 times faster, at 678 1.25 and at 3,000 2.2 times.
-const PAR_MIN_FAIR_SOLVE: usize = 128;
-
-/// The products with `B` and `Bᵀ` run in parallel chunks of [`ROW_CHUNK`]
-/// from this many rows (or columns) of output, with the `parallel` feature.
-///
-/// Measured on the i5-13600K as for [`PAR_MIN_FAIR_SOLVE`], against the
-/// side-by-side solves alone: at 678 new vertices between 1.15 times slower
-/// and 1.25 times faster from run to run, at 1,100 1.4 times faster, and at
-/// 12k 2 to 5 times (a busy machine varies most).
-pub(crate) const PAR_MIN_FAIR_ROWS: usize = 1024;
-
-/// Output entries per chunk of a parallel product.
-const ROW_CHUNK: usize = 256;
-
-/// Dot products sum chunks of this many terms, then the chunk sums in
-/// order, in every build: a fixed order that a parallel sum could share.
-const DOT_CHUNK: usize = 256;
-
 /// How fairing went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FairResult {
     /// Whether every coordinate's solve reached the tolerance.
     pub(crate) converged: bool,
-    /// Conjugate gradient iterations, the most of the three coordinates.
+    /// Solver iterations, the most of the three coordinates (0: the direct
+    /// solve takes none).
     pub(crate) iterations: usize,
     /// The weights of the solution kept.
     pub(crate) weights: FairWeights,
@@ -71,10 +49,9 @@ pub(crate) struct FairResult {
 /// - `L` has cotangent weights `(cot α + cot β) / 2`, clamped to at least
 ///   `1e-6` of their mean. When that solve does not converge or is not
 ///   finite, it is retried with uniform weights (and unit areas).
-/// - Each coordinate is solved by conjugate gradient with a Jacobi
-///   preconditioner from the refined positions, to `1e-10` relative to the
-///   right-hand side, at most `20 n + 100` iterations for `n` new vertices.
-///   A solve that stops short keeps its best iterate.
+/// - The normal equations are factored once, as a sparse LDLᵀ, and solved
+///   for the three coordinates; a coordinate counts as converged at `1e-10`
+///   relative to its right-hand side.
 /// - The solution kept is the first converged one; when neither converges,
 ///   the finite one with the smaller relative residual, `converged: false`.
 ///   When neither is finite, the loop fails with [`FailReason::Solver`] and
@@ -143,6 +120,10 @@ struct System {
     edges: Vec<((u32, u32), f64)>,
     /// A third of the area around each patch vertex.
     mass: Vec<f64>,
+    /// The nested-dissection elimination order of the free vertices: entry
+    /// `p` is the free index (local minus `first_free`) eliminated at
+    /// position `p`.
+    order: Vec<u32>,
 }
 
 impl System {
@@ -221,12 +202,54 @@ impl System {
                 _ => push(&mut edges, (k, w))?,
             }
         }
+        // The graph of BᵀB for the nested-dissection order, as free
+        // indices, each edge once: B's row k holds the free neighbours of
+        // patch vertex k (and k itself when free), so every pair of them
+        // shares the row.
+        let first = old.len();
+        let mut free_nbrs: Vec<Vec<u32>> = Vec::new();
+        reserve(&mut free_nbrs, patch_len)?;
+        free_nbrs.resize(patch_len, Vec::new());
+        for &((a, b), _) in &edges {
+            for (k, j) in [(a, b), (b, a)] {
+                if (k as usize) < patch_len && (first..patch_len).contains(&(j as usize)) {
+                    push(&mut free_nbrs[k as usize], (j as usize - first) as u32)?;
+                }
+            }
+        }
+        let mut nd_pairs: Vec<u64> = Vec::new();
+        for (k, nbrs) in free_nbrs.iter().enumerate() {
+            for (i, &u) in nbrs.iter().enumerate() {
+                for &v in &nbrs[i + 1..] {
+                    push(&mut nd_pairs, (u.min(v) as u64) << 32 | u.max(v) as u64)?;
+                }
+            }
+            if k >= first {
+                let this = (k - first) as u32;
+                for &u in nbrs {
+                    if u != this {
+                        push(
+                            &mut nd_pairs,
+                            (u.min(this) as u64) << 32 | u.max(this) as u64,
+                        )?;
+                    }
+                }
+            }
+        }
+        nd_pairs.sort_unstable();
+        nd_pairs.dedup();
+        let mut nd_edges: Vec<(u32, u32)> = Vec::new();
+        reserve(&mut nd_edges, nd_pairs.len())?;
+        nd_edges.extend(nd_pairs.iter().map(|&p| ((p >> 32) as u32, p as u32)));
+        let order =
+            sparse::nested_dissection(patch_len - first, &patch.points[first..], &nd_edges)?;
         Ok(System {
             patch_len,
-            first_free: old.len(),
+            first_free: first,
             points,
             edges,
             mass,
+            order,
         })
     }
 
@@ -321,302 +344,109 @@ impl System {
         {
             return Ok(None);
         }
-        let b = Sparse {
-            starts: &count,
-            cols: &cols,
-            vals: &vals,
-        };
-        let mut jacobi = filled(free, 0.0f64)?;
-        for (c, v) in cols.iter().zip(&vals) {
-            jacobi[*c as usize] += v * v;
+        // The right-hand sides: Bᵀ(-c) per coordinate.
+        let mut rhs = [
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+        ];
+        for k in 0..np {
+            let f = fixed[k];
+            for t in count[k] as usize..count[k + 1] as usize {
+                let (c, v) = (cols[t] as usize, vals[t]);
+                rhs[0][c] -= v * f[0];
+                rhs[1][c] -= v * f[1];
+                rhs[2][c] -= v * f[2];
+            }
         }
-        if jacobi.iter().any(|d| !(d.is_finite() && *d > 0.0)) {
+        // Factored once, solved for the three coordinates.
+        let Some(factor) = sparse::factor_ordered(&count, &cols, &vals, free, &self.order)? else {
             return Ok(None);
-        }
-
-        let mut transposed = Transposed::new(&b, free)?;
-        transposed.build(&b);
-        let bt = transposed.view();
-        let cap = 20 * free + 100;
-        // One coordinate's solve: its best iterate and how it went. The
-        // three are independent, so large patches solve them side by side.
-        let coordinate = |d: usize| -> Result<(Vec<f64>, CgResult)> {
-            let mut cg = Cg::new(free, np)?;
-            let mut rhs = filled(free, 0.0f64)?;
-            let mut tmp = filled(np, 0.0f64)?;
-            for (t, f) in tmp.iter_mut().zip(&fixed) {
-                *t = -f[d];
-            }
-            bt.times(&tmp, &mut rhs);
-            for (i, xi) in cg.x.iter_mut().enumerate() {
-                *xi = patch.points[first + i][d];
-            }
-            let r = cg.solve(&b, &bt, &jacobi, &rhs, cap);
-            Ok((cg.x, r))
         };
-        let parallel = free >= PAR_MIN_FAIR_SOLVE;
-        let (rx, (ry, rz)) = par::join(
-            parallel,
-            || coordinate(0),
-            || par::join(parallel, || coordinate(1), || coordinate(2)),
-        );
-        let solved = [rx?, ry?, rz?];
+        let mut xs = [
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+        ];
+        for d in 0..3 {
+            factor.solve(&rhs[d], &mut xs[d])?;
+        }
+        // Each coordinate judged by its true residual: relative to the
+        // right-hand side, or to the start iterate's residual when that is
+        // zero (a zero right-hand side has the solution 0).
+        let mut bx = filled(np, 0.0f64)?;
+        let mut ax = filled(free, 0.0f64)?;
+        let mut x0 = filled(free, 0.0f64)?;
         let mut x = filled(free, [0.0f64; 3])?;
-        let (mut converged, mut iterations, mut residual) = (true, 0, 0.0f64);
-        for (d, (xd, r)) in solved.iter().enumerate() {
-            if !r.finite {
+        let (mut converged, mut residual) = (true, 0.0f64);
+        for d in 0..3 {
+            let res = true_residual(&count, &cols, &vals, &xs[d], &rhs[d], &mut bx, &mut ax);
+            let rhs_norm = norm(&rhs[d]);
+            let reference = if rhs_norm > 0.0 {
+                rhs_norm
+            } else {
+                for (i, xi) in x0.iter_mut().enumerate() {
+                    *xi = patch.points[first + i][d];
+                }
+                true_residual(&count, &cols, &vals, &x0, &rhs[d], &mut bx, &mut ax)
+            };
+            if !(xs[d].iter().all(|x| x.is_finite()) && res.is_finite()) {
                 return Ok(None);
             }
-            converged &= r.converged;
-            iterations = iterations.max(r.iterations);
-            residual = residual.max(r.residual);
-            for (xi, v) in x.iter_mut().zip(xd) {
+            converged &= res <= TOLERANCE * reference;
+            residual = residual.max(if reference > 0.0 {
+                res / reference
+            } else {
+                0.0
+            });
+            for (xi, v) in x.iter_mut().zip(&xs[d]) {
                 xi[d] = *v;
             }
         }
         Ok(Some(Attempt {
             x,
             converged,
-            iterations,
+            iterations: 0,
             residual,
             weights,
         }))
     }
 }
 
-/// A sparse matrix in compressed rows.
-struct Sparse<'a> {
-    /// Row `k` is `cols[starts[k]..starts[k + 1]]` with `vals` alongside.
-    starts: &'a [u32],
-    cols: &'a [u32],
-    vals: &'a [f64],
+/// `|rhs - Bᵀ B x|`, with `B` in compressed rows; `bx` (one entry per row
+/// of `B`) and `ax` (one per column) are scratch.
+fn true_residual(
+    starts: &[u32],
+    cols: &[u32],
+    vals: &[f64],
+    x: &[f64],
+    rhs: &[f64],
+    bx: &mut [f64],
+    ax: &mut [f64],
+) -> f64 {
+    for (k, o) in bx.iter_mut().enumerate() {
+        let mut s = 0.0;
+        for t in starts[k] as usize..starts[k + 1] as usize {
+            s += vals[t] * x[cols[t] as usize];
+        }
+        *o = s;
+    }
+    ax.fill(0.0);
+    for (k, s) in bx.iter().enumerate() {
+        for t in starts[k] as usize..starts[k + 1] as usize {
+            ax[cols[t] as usize] += vals[t] * s;
+        }
+    }
+    let mut s = 0.0;
+    for (r, a) in rhs.iter().zip(ax.iter()) {
+        s += (r - a) * (r - a);
+    }
+    s.sqrt()
 }
 
-impl Sparse<'_> {
-    fn rows(&self) -> usize {
-        self.starts.len() - 1
-    }
-
-    fn row(&self, k: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
-        let range = self.starts[k] as usize..self.starts[k + 1] as usize;
-        self.cols[range.clone()]
-            .iter()
-            .zip(&self.vals[range])
-            .map(|(&c, &v)| (c as usize, v))
-    }
-
-    /// `out = B v`, by rows: each entry is its row's sum in column order.
-    fn times(&self, v: &[f64], out: &mut [f64]) {
-        let rows = self.rows();
-        par::for_each_chunk_mut(
-            &mut out[..rows],
-            ROW_CHUNK,
-            PAR_MIN_FAIR_ROWS,
-            |i, chunk| {
-                for (j, o) in chunk.iter_mut().enumerate() {
-                    *o = self
-                        .row(i * ROW_CHUNK + j)
-                        .fold(0.0, |s, (c, x)| s + x * v[c]);
-                }
-            },
-        );
-    }
-}
-
-/// The transpose of a [`Sparse`] matrix, its rows (the columns of the
-/// original) listing their entries by ascending original row: the product
-/// `Bᵀ v` is then gathered row by row in a fixed order rather than scattered.
-struct Transposed {
-    starts: Vec<u32>,
-    cols: Vec<u32>,
-    vals: Vec<f64>,
-}
-
-impl Transposed {
-    /// Room for the transpose of `b`, which has `columns` columns.
-    fn new(b: &Sparse, columns: usize) -> Result<Transposed> {
-        Ok(Transposed {
-            starts: filled(columns + 1, 0u32)?,
-            cols: filled(b.cols.len(), 0u32)?,
-            vals: filled(b.vals.len(), 0.0f64)?,
-        })
-    }
-
-    /// Fills in the transpose of `b`: a counting sort of its entries by
-    /// column, visiting rows in order.
-    fn build(&mut self, b: &Sparse) {
-        let columns = self.starts.len() - 1;
-        for &c in b.cols {
-            self.starts[c as usize + 1] += 1;
-        }
-        for c in 0..columns {
-            self.starts[c + 1] += self.starts[c];
-        }
-        // While filling, `starts[c]` is the next free slot of column `c`;
-        // it ends at the start of column `c + 1`, so shift back after.
-        for k in 0..b.rows() {
-            for (c, x) in b.row(k) {
-                let at = self.starts[c] as usize;
-                self.cols[at] = k as u32;
-                self.vals[at] = x;
-                self.starts[c] += 1;
-            }
-        }
-        for c in (0..columns).rev() {
-            self.starts[c + 1] = self.starts[c];
-        }
-        self.starts[0] = 0;
-    }
-
-    fn view(&self) -> Sparse<'_> {
-        Sparse {
-            starts: &self.starts,
-            cols: &self.cols,
-            vals: &self.vals,
-        }
-    }
-}
-
-/// The outcome of one conjugate gradient solve.
-struct CgResult {
-    converged: bool,
-    iterations: usize,
-    /// The best residual relative to the right-hand side.
-    residual: f64,
-    /// Whether the best iterate is finite.
-    finite: bool,
-}
-
-/// Conjugate gradient on `Bᵀ B x = rhs`, with its vectors.
-struct Cg {
-    x: Vec<f64>,
-    best: Vec<f64>,
-    r: Vec<f64>,
-    z: Vec<f64>,
-    p: Vec<f64>,
-    ap: Vec<f64>,
-    /// `B p`, one entry per row of `B`.
-    bp: Vec<f64>,
-}
-
-/// `a · b`, summed in chunks of [`DOT_CHUNK`] whose sums are added in order.
-fn dot_n(a: &[f64], b: &[f64]) -> f64 {
-    a.chunks(DOT_CHUNK)
-        .zip(b.chunks(DOT_CHUNK))
-        .map(|(a, b)| a.iter().zip(b).fold(0.0, |s, (x, y)| s + x * y))
-        .fold(0.0, |s, c| s + c)
-}
-
-impl Cg {
-    fn new(n: usize, rows: usize) -> Result<Cg> {
-        Ok(Cg {
-            x: filled(n, 0.0)?,
-            best: filled(n, 0.0)?,
-            r: filled(n, 0.0)?,
-            z: filled(n, 0.0)?,
-            p: filled(n, 0.0)?,
-            ap: filled(n, 0.0)?,
-            bp: filled(rows, 0.0)?,
-        })
-    }
-
-    /// `ap = Bᵀ B p`, with `bt` the transpose of `b`.
-    fn apply(&mut self, b: &Sparse, bt: &Sparse) {
-        b.times(&self.p, &mut self.bp);
-        bt.times(&self.bp, &mut self.ap);
-    }
-
-    /// `z = r / diag`.
-    fn precondition(&mut self, diag: &[f64]) {
-        for ((z, r), d) in self.z.iter_mut().zip(&self.r).zip(diag) {
-            *z = r / d;
-        }
-    }
-
-    /// Solves from the current `x` with the Jacobi preconditioner `diag`
-    /// (the diagonal of `Bᵀ B`), at most `cap` iterations; leaves the best
-    /// iterate in `x`. `bt` is the transpose of `b`.
-    fn solve(
-        &mut self,
-        b: &Sparse,
-        bt: &Sparse,
-        diag: &[f64],
-        rhs: &[f64],
-        cap: usize,
-    ) -> CgResult {
-        self.p.copy_from_slice(&self.x);
-        self.apply(b, bt);
-        for ((r, b), ap) in self.r.iter_mut().zip(rhs).zip(&self.ap) {
-            *r = b - ap;
-        }
-        let start = dot_n(&self.r, &self.r).sqrt();
-        let norm = dot_n(rhs, rhs).sqrt();
-        // A zero right-hand side has the solution 0: measure from the start.
-        let reference = if norm > 0.0 { norm } else { start };
-        let mut result = CgResult {
-            converged: start <= TOLERANCE * reference,
-            iterations: 0,
-            residual: if reference > 0.0 {
-                start / reference
-            } else {
-                0.0
-            },
-            finite: self.x.iter().all(|x| x.is_finite()) && start.is_finite(),
-        };
-        if result.converged || !result.finite {
-            return result;
-        }
-        self.best.copy_from_slice(&self.x);
-        let mut best = start;
-        self.precondition(diag);
-        self.p.copy_from_slice(&self.z);
-        let mut rz = dot_n(&self.r, &self.z);
-        for iteration in 1..=cap {
-            self.apply(b, bt);
-            let pap = dot_n(&self.p, &self.ap);
-            if !(pap.is_finite() && pap > 0.0) {
-                break;
-            }
-            let alpha = rz / pap;
-            for i in 0..self.x.len() {
-                self.x[i] += alpha * self.p[i];
-                self.r[i] -= alpha * self.ap[i];
-            }
-            let res = dot_n(&self.r, &self.r).sqrt();
-            result.iterations = iteration;
-            if !res.is_finite() {
-                break;
-            }
-            if res < best {
-                best = res;
-                self.best.copy_from_slice(&self.x);
-            }
-            if res <= TOLERANCE * reference {
-                result.converged = true;
-                break;
-            }
-            self.precondition(diag);
-            let next = dot_n(&self.r, &self.z);
-            let beta = next / rz;
-            rz = next;
-            for i in 0..self.p.len() {
-                self.p[i] = self.z[i] + beta * self.p[i];
-            }
-        }
-        self.x.copy_from_slice(&self.best);
-        // The recurrence drifts from the true residual: judge the iterate
-        // kept by `rhs - Bᵀ B x` itself.
-        self.p.copy_from_slice(&self.x);
-        self.apply(b, bt);
-        for ((r, b), ap) in self.r.iter_mut().zip(rhs).zip(&self.ap) {
-            *r = b - ap;
-        }
-        let res = dot_n(&self.r, &self.r).sqrt();
-        result.converged = res <= TOLERANCE * reference;
-        result.residual = res / reference;
-        result.finite = self.x.iter().all(|x| x.is_finite()) && res.is_finite();
-        result
-    }
+/// The Euclidean norm.
+fn norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
 #[cfg(test)]
@@ -635,10 +465,10 @@ mod tests {
         let l = loops.iter().min_by_key(|l| l.vertices.len()).unwrap();
         let edges = EdgeMap::build(mesh).unwrap();
         let fans = VertexFans::build(mesh).unwrap();
-        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200)
+        let tris = triangulate_loop(mesh, &l.vertices, &edges, 200, None)
             .unwrap()
             .unwrap();
-        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris).unwrap();
+        let patch = refine(mesh, &fans, &edges, &l.vertices, &tris, None).unwrap();
         (fans, patch)
     }
 
@@ -673,7 +503,7 @@ mod tests {
         let (fans, mut patch) = refined(&mesh);
         let r = fair(&mesh, &fans, &mut patch).unwrap().unwrap();
         assert_eq!((r.converged, r.weights), (true, FairWeights::Cotangent));
-        assert!(r.iterations > 0 && r.iterations <= 20 * patch.new_vertices() + 100);
+        assert_eq!(r.iterations, 0);
     }
 
     fn attempt(converged: bool, residual: f64, weights: FairWeights) -> Option<Attempt> {
@@ -690,6 +520,16 @@ mod tests {
         choose(c, || Ok(u))
             .unwrap()
             .map(|a| (a.weights, a.converged))
+    }
+
+    #[test]
+    fn direct_solve_takes_no_iterations() {
+        // The direct solve factors once and solves: no iterations, converged.
+        let mesh = tilted_hole();
+        let (fans, mut patch) = refined(&mesh);
+        assert!(patch.new_vertices() > 0);
+        let r = fair(&mesh, &fans, &mut patch).unwrap().unwrap();
+        assert_eq!((r.converged, r.iterations), (true, 0));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::fmt;
 use fast_mesh_bvh::Bvh;
 use fast_mesh_store::{Mesh, TriangleId, VertexId, par};
 
-use fast_mesh_query::self_intersecting_pairs;
+use fast_mesh_query::self_intersects;
 
 use crate::topology::{
     BoundaryLoop, Component, EdgeMap, components, loops_with, pinch_vertices, point, triangle_area,
@@ -44,6 +44,45 @@ impl fmt::Debug for AnalyzeOptions<'_> {
             .field("self_intersection", &self.self_intersection.map(|_| "Bvh"))
             .field("max_listed", &self.max_listed)
             .finish()
+    }
+}
+
+impl<'a> AnalyzeOptions<'a> {
+    /// A builder for [`AnalyzeOptions`]: every option unset, as [`Default`],
+    /// until set.
+    pub fn builder() -> AnalyzeOptionsBuilder<'a> {
+        AnalyzeOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`AnalyzeOptions`], see [`AnalyzeOptions::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzeOptionsBuilder<'a> {
+    options: AnalyzeOptions<'a>,
+}
+
+impl<'a> AnalyzeOptionsBuilder<'a> {
+    /// Vertices at most this far apart count as coincident.
+    pub fn weld_tolerance(mut self, weld_tolerance: f32) -> Self {
+        self.options.weld_tolerance = weld_tolerance;
+        self
+    }
+
+    /// Check for self-intersection with this BVH of the mesh.
+    pub fn self_intersection(mut self, self_intersection: &'a Bvh) -> Self {
+        self.options.self_intersection = Some(self_intersection);
+        self
+    }
+
+    /// The most entries kept in each list that has a count beside it.
+    pub fn max_listed(mut self, max_listed: usize) -> Self {
+        self.options.max_listed = max_listed;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> AnalyzeOptions<'a> {
+        self.options
     }
 }
 
@@ -112,9 +151,9 @@ pub(crate) const PAR_MIN_ANALYZE_TRIS: usize = 2048;
 ///   touch), are listed apart.
 /// - Orientation conflicts: interior edges whose two triangles both run
 ///   along them in the same direction.
-/// - Self-intersection ([`self_intersecting_pairs`]): two alive triangles
-///   that share no vertex id, neither degenerate, intersect or touch. Pairs
-///   sharing a vertex are not tested.
+/// - Self-intersection ([`self_intersects`](fast_mesh_query::self_intersects)):
+///   two alive triangles that share no vertex id, neither degenerate,
+///   intersect or touch. Pairs sharing a vertex are not tested.
 ///
 /// The lists with a count beside them (`coincident`, `degenerate_list`,
 /// `duplicate_list` and `non_manifold_edge_list`) keep their first
@@ -295,9 +334,7 @@ fn self_intersection_pass(mesh: &Mesh, bvh: Option<&Bvh>) -> Result<Option<bool>
     let Some(bvh) = bvh else {
         return Ok(None);
     };
-    let mut pairs = Vec::new();
-    self_intersecting_pairs(mesh, bvh, &mut pairs)?;
-    Ok(Some(!pairs.is_empty()))
+    Ok(Some(self_intersects(mesh, bvh)?))
 }
 
 /// The alive triangles that repeat the vertex set of a triangle with a smaller
@@ -386,6 +423,24 @@ mod tests {
 
     fn run(mesh: &Mesh) -> Analysis {
         analyze(mesh, &AnalyzeOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn builder_matches_literal() {
+        let mesh = uv_sphere(8, 12, 1.0);
+        let bvh = Bvh::build(&mesh, &BuildOptions::default()).unwrap();
+        let got = AnalyzeOptions::builder()
+            .weld_tolerance(0.5)
+            .self_intersection(&bvh)
+            .max_listed(10)
+            .build();
+        assert_eq!(got.weld_tolerance, 0.5);
+        assert!(got.self_intersection.is_some());
+        assert_eq!(got.max_listed, 10);
+        let default = AnalyzeOptions::builder().build();
+        assert_eq!(default.weld_tolerance, 0.0);
+        assert!(default.self_intersection.is_none());
+        assert_eq!(default.max_listed, 1000);
     }
 
     #[test]

@@ -521,7 +521,8 @@ impl Scene {
     ///
     /// `f` may fail with any error that converts into [`SceneError`]: a
     /// store error, or an [`OpsError`](fast_mesh_ops::OpsError) from a repair
-    /// operation, which becomes [`SceneError::Ops`]. A closure whose body
+    /// operation, which becomes [`SceneError::Ops`] (out-of-memory becomes
+    /// [`SceneError::Store`], however it was raised). A closure whose body
     /// never fails cannot infer its error type (E0283) and must name it, for
     /// example `scene.edit(id, |_| Ok::<(), StoreError>(()))`.
     ///

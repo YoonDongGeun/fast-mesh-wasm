@@ -35,18 +35,28 @@ pub struct FillOptions {
     /// otherwise the refined patch keeps its new vertices at the centroids
     /// they were split at.
     ///
-    /// On by default. Fairing costs about 10-15x an unfaired fill and grows
-    /// with the square of the patch size (conjugate gradient on the
-    /// bi-Laplacian), so a large hole can take seconds; set `fair: false`
-    /// for speed when a closed surface is enough. At a pinch vertex shared
-    /// with another hole filled in the same call, the one-ring used for
-    /// fairing does not include the other hole's patch, which slightly
-    /// distorts the patches near that vertex on a curved surface.
+    /// On by default. Fairing is a sparse direct solve of the bi-Laplacian:
+    /// tens of milliseconds for thousands of new vertices, about 0.3 s at
+    /// 19,000; set `fair: false` for speed when a closed surface is enough.
+    /// At a pinch vertex shared with another hole filled in the same call,
+    /// the one-ring used for fairing does not include the other hole's
+    /// patch, which slightly distorts the patches near that vertex on a
+    /// curved surface.
     pub fair: bool,
     /// Loops with more edges than this are triangulated by projection onto
     /// their best-fit plane instead of the `O(n³)` minimum-weight search.
     /// Below 3, every loop goes to the projection.
     pub dp_limit: usize,
+    /// Reject a minimum-weight triangulation whose worst dihedral angle to
+    /// its neighbours exceeds this, in radians: caps that fold nearly back
+    /// on themselves fail with [`FailReason::NoValidTriangulation`]. `None`,
+    /// the default, keeps whatever the search finds. Applies to the search
+    /// only, not the projection past `dp_limit`.
+    pub max_dihedral: Option<f64>,
+    /// Stop refining a patch once it has this many new vertices; the loop
+    /// still fills, and [`FilledLoop::refine_capped`] reports it. `None`,
+    /// the default, refines to the surrounding density without a cap.
+    pub max_refine_vertices: Option<usize>,
 }
 
 impl Default for FillOptions {
@@ -59,7 +69,84 @@ impl Default for FillOptions {
             allow_unclean: false,
             fair: true,
             dp_limit: 200,
+            max_dihedral: None,
+            max_refine_vertices: None,
         }
+    }
+}
+
+impl FillOptions {
+    /// A builder for [`FillOptions`]: every option unset, as [`Default`],
+    /// until set.
+    pub fn builder() -> FillOptionsBuilder {
+        FillOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`FillOptions`], see [`FillOptions::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct FillOptionsBuilder {
+    options: FillOptions,
+}
+
+impl FillOptionsBuilder {
+    /// Fill only loops with at most this many edges.
+    pub fn max_edges(mut self, max_edges: usize) -> Self {
+        self.options.max_edges = Some(max_edges);
+        self
+    }
+
+    /// Fill only loops whose perimeter is at most this, in local units.
+    pub fn max_perimeter(mut self, max_perimeter: f64) -> Self {
+        self.options.max_perimeter = Some(max_perimeter);
+        self
+    }
+
+    /// Fill only loops whose vector area is at most this, in local units squared.
+    pub fn max_area(mut self, max_area: f64) -> Self {
+        self.options.max_area = Some(max_area);
+        self
+    }
+
+    /// Fill only these loops.
+    pub fn loops(mut self, loops: Vec<LoopId>) -> Self {
+        self.options.loops = Some(loops);
+        self
+    }
+
+    /// Also fill loops that are not clean.
+    pub fn allow_unclean(mut self, allow_unclean: bool) -> Self {
+        self.options.allow_unclean = allow_unclean;
+        self
+    }
+
+    /// Fair the patch so that it continues the surrounding curvature.
+    pub fn fair(mut self, fair: bool) -> Self {
+        self.options.fair = fair;
+        self
+    }
+
+    /// Loops with more edges than this are triangulated by projection.
+    pub fn dp_limit(mut self, dp_limit: usize) -> Self {
+        self.options.dp_limit = dp_limit;
+        self
+    }
+
+    /// Reject a minimum-weight triangulation past this dihedral, in radians.
+    pub fn max_dihedral(mut self, max_dihedral: f64) -> Self {
+        self.options.max_dihedral = Some(max_dihedral);
+        self
+    }
+
+    /// Stop refining a patch once it has this many new vertices.
+    pub fn max_refine_vertices(mut self, max_refine_vertices: usize) -> Self {
+        self.options.max_refine_vertices = Some(max_refine_vertices);
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> FillOptions {
+        self.options
     }
 }
 
@@ -100,6 +187,9 @@ pub struct FilledLoop {
     pub converged: bool,
     /// The Laplacian weights fairing used; `None` when it did not run.
     pub weights: Option<FairWeights>,
+    /// Whether refinement stopped early: the `max_refine_vertices` budget
+    /// was hit, or the rounds ran out while triangles were still coarse.
+    pub refine_capped: bool,
 }
 
 /// The edge weights of the Laplacian used to fair a patch.
@@ -140,7 +230,9 @@ pub struct FillReport {
 ///   by Liepa's minimum-weight search (the worst dihedral angle to the
 ///   neighbouring triangles first, then area), above it by projection onto
 ///   the loop's best-fit plane and ear clipping, which fails with
-///   [`FailReason::ProjectionFolds`] when the projection folds. No new edge
+///   [`FailReason::ProjectionFolds`] when the projection folds. With
+///   `max_dihedral`, a search whose best triangulation folds past it fails
+///   with [`FailReason::NoValidTriangulation`]. No new edge
 ///   duplicates one the mesh has, so the patch never makes an edge
 ///   non-manifold, and the patch triangles are wound to agree with their
 ///   neighbours. A loop whose patch would reuse a
@@ -149,13 +241,13 @@ pub struct FillReport {
 /// - The patch is refined to the density of the mesh around the loop
 ///   (Liepa's rule: centroid splits while a triangle is coarse for the mean
 ///   edge length at its corners, with Delaunay edge flips between rounds of
-///   splits). Each new vertex has its triangle's corners as creation parents,
-///   1/3 each.
+///   splits), up to `max_refine_vertices` new vertices when set. Each new
+///   vertex has its triangle's corners as creation parents, 1/3 each.
 /// - With `fair`, the new vertices are moved to minimise bending, holding
 ///   the loop and the ring of mesh vertices around it fixed: the discrete
 ///   bi-Laplacian, cotangent weights falling back to uniform ones
-///   ([`FilledLoop::weights`]), solved by preconditioned conjugate gradient.
-///   A solve that does not reach its tolerance keeps its best iterate and
+///   ([`FilledLoop::weights`]), factored once as a sparse LDLᵀ and solved
+///   for the three coordinates. A solve that does not reach its tolerance
 ///   reports `converged: false`; one that is not finite fails the loop with
 ///   [`FailReason::Solver`].
 /// - Every selected loop is planned before the first write; the new
@@ -167,13 +259,15 @@ pub struct FillReport {
 ///
 /// # Errors
 /// - [`OpsError::InvalidInput`] when no bound and no `loops` are given, or
-///   a bound is NaN or negative.
+///   a bound (or `max_dihedral`) is NaN or negative.
 /// - [`OpsError::StaleLoops`] when an id in `loops` matches no loop of the
 ///   mesh.
 /// - [`OpsError::Store`] when memory runs out.
 ///
 /// Nothing is written in any of these cases.
 pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillReport> {
+    // `max_dihedral` is a quality limit, not a selector: it neither counts
+    // towards the guard below nor skips loops in `within_bounds`.
     let bounds = [options.max_perimeter, options.max_area];
     if options.max_edges.is_none() && bounds.iter().all(Option::is_none) && options.loops.is_none()
     {
@@ -181,7 +275,8 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
             "fill_holes needs a bound or a list of loops",
         ));
     }
-    if bounds.iter().flatten().any(|b| b.is_nan() || *b < 0.0) {
+    let bad = |b: &f64| b.is_nan() || *b < 0.0;
+    if bounds.iter().flatten().any(bad) || options.max_dihedral.is_some_and(|b| bad(&b)) {
         return Err(OpsError::InvalidInput(
             "fill bounds must not be NaN or negative",
         ));
@@ -219,14 +314,27 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
             push(&mut report.skipped, (l.id, SkipReason::Unclean))?;
             continue;
         }
-        let tris = match triangulate_loop(mesh, &l.vertices, &edges, options.dp_limit)? {
+        let tris = match triangulate_loop(
+            mesh,
+            &l.vertices,
+            &edges,
+            options.dp_limit,
+            options.max_dihedral,
+        )? {
             Ok(tris) => tris,
             Err(reason) => {
                 push(&mut report.failed, (l.id, reason))?;
                 continue;
             }
         };
-        let mut patch = refine(mesh, &fans, &edges, &l.vertices, &tris)?;
+        let mut patch = refine(
+            mesh,
+            &fans,
+            &edges,
+            &l.vertices,
+            &tris,
+            options.max_refine_vertices,
+        )?;
         let old = patch.old.len() as u32;
         new_chords.clear();
         for t in &patch.triangles {
@@ -270,6 +378,7 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
                 vertices_added: patch.new_vertices(),
                 converged,
                 weights,
+                refine_capped: patch.capped,
             },
         )?;
     }
@@ -408,6 +517,40 @@ mod tests {
     }
 
     #[test]
+    fn builder_matches_literal() {
+        let id = LoopId {
+            min_vertex: 1,
+            len: 2,
+            hash: 3,
+        };
+        assert_eq!(
+            FillOptions::builder()
+                .max_edges(10)
+                .max_perimeter(2.0)
+                .max_area(3.0)
+                .loops(vec![id])
+                .allow_unclean(true)
+                .fair(false)
+                .dp_limit(50)
+                .max_dihedral(0.5)
+                .max_refine_vertices(100)
+                .build(),
+            FillOptions {
+                max_edges: Some(10),
+                max_perimeter: Some(2.0),
+                max_area: Some(3.0),
+                loops: Some(vec![id]),
+                allow_unclean: true,
+                fair: false,
+                dp_limit: 50,
+                max_dihedral: Some(0.5),
+                max_refine_vertices: Some(100),
+            }
+        );
+        assert_eq!(FillOptions::builder().build(), FillOptions::default());
+    }
+
+    #[test]
     fn sphere_holes_filled_closed_and_consistent() {
         let centres = [[1.0, 0.0, 0.0], [0.0, 0.6, 0.8], [-0.6, -0.48, -0.64]];
         let mut mesh = punch_holes(&uv_sphere(64, 128, 1.0), &centres, 0.2);
@@ -429,6 +572,7 @@ mod tests {
                 vertices_added: f.vertices_added,
                 converged: true,
                 weights: None,
+                refine_capped: false,
             })
             .collect();
         assert_eq!(r.filled, expected);
@@ -546,7 +690,7 @@ mod tests {
         let loops = boundary_loops(&free).unwrap();
         let l = loops.iter().find(|l| l.vertices.len() == 4).unwrap();
         let edges = EdgeMap::build(&free).unwrap();
-        let tris = triangulate_loop(&free, &l.vertices, &edges, 200)
+        let tris = triangulate_loop(&free, &l.vertices, &edges, 200, None)
             .unwrap()
             .unwrap();
         assert!(uses_edge(&tris, 6, 12));
@@ -646,6 +790,31 @@ mod tests {
             Err(OpsError::InvalidInput(_))
         ));
         assert!(tx.commit().unwrap().is_empty());
+    }
+
+    #[test]
+    fn max_dihedral_alone_selects_no_loop() {
+        // A quality limit, not a selector: on its own it must trip the
+        // accidental-full-fill guard, like `max_refine_vertices` does.
+        for options in [
+            FillOptions {
+                max_dihedral: Some(0.5),
+                ..FillOptions::default()
+            },
+            FillOptions {
+                max_dihedral: Some(0.5),
+                max_refine_vertices: Some(100),
+                ..FillOptions::default()
+            },
+        ] {
+            let mut mesh = bowtie_holes();
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                fill_holes(&mut tx, &options),
+                Err(OpsError::InvalidInput(_))
+            ));
+            assert!(tx.commit().unwrap().is_empty());
+        }
     }
 
     /// [`grid_without`]`(4, (1, 1))` with a closed tetrahedron on edge
@@ -935,14 +1104,16 @@ mod tests {
 
     #[test]
     fn fill_faired_bit_identical() {
-        // The 30-degree patch has over `PAR_MIN_FAIR_ROWS` vertices.
+        // The 30-degree patch has over a thousand vertices.
         let holed = sphere_with_holes(160);
         let (positions, triangles) = parts(&holed);
         let options = FillOptions {
             max_edges: Some(1000),
             ..FillOptions::default()
         };
-        let (mesh, r) = assert_parallel_identical("fill_holes fair", || {
+        // Fairing is a sequential direct solve, so the runs can only differ
+        // by the thread count: no parallel path is required.
+        let (mesh, r) = assert_identical_across_threads("fill_holes fair", || {
             let mut mesh = mesh_of(&positions, &triangles);
             let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
             let (positions, triangles) = parts(&mesh);
@@ -952,7 +1123,7 @@ mod tests {
         assert_eq!(r.filled.len(), 3);
         assert!(r.filled.iter().all(|f| f.converged && f.weights.is_some()));
         let largest = r.filled.iter().map(|f| f.vertices_added).max().unwrap();
-        assert!(largest >= crate::fair::PAR_MIN_FAIR_ROWS, "{largest}");
+        assert!(largest >= 1024, "{largest}");
         assert!(mesh.0.len() > 3 * holed.vertex_slots());
     }
 
@@ -1163,6 +1334,124 @@ mod tests {
             p[2] = (0.5 * p[0]).sin() * (0.3 * p[1]).cos();
         }
         mesh_of(&positions, &triangles)
+    }
+
+    #[test]
+    fn refine_budget_is_reported_per_loop() {
+        let mut mesh = sphere_with_angular_holes();
+        let options = FillOptions {
+            max_edges: Some(1000),
+            max_refine_vertices: Some(5),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert!(!r.filled.is_empty());
+        assert!(r.filled.iter().all(|f| f.refine_capped));
+        assert!(r.filled.iter().all(|f| f.vertices_added <= 5));
+        assert_sound(&mesh, 0);
+        // Without the budget nothing is capped.
+        let mut mesh = sphere_with_angular_holes();
+        let options = FillOptions {
+            max_edges: Some(1000),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert!(r.filled.iter().all(|f| !f.refine_capped));
+    }
+
+    #[test]
+    fn max_dihedral_rejects_curved_caps_but_keeps_flat_ones() {
+        // Flat: two 4-edge bowtie holes, coplanar with their neighbours.
+        let mut mesh = bowtie_holes();
+        let options = FillOptions {
+            max_edges: Some(4),
+            max_dihedral: Some(0.1),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.filled.len(), 2);
+        assert!(r.failed.is_empty());
+        // Curved: a 3-edge hole on a coarse sphere tilts steeply against its rim.
+        let loops = boundary_loops(&damaged_sphere()).unwrap();
+        let tri = loops.iter().find(|l| l.vertices.len() == 3).unwrap();
+        let mut mesh = damaged_sphere();
+        let options = FillOptions {
+            loops: Some(vec![tri.id]),
+            max_dihedral: Some(0.1),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.failed, vec![(tri.id, FailReason::NoValidTriangulation)]);
+        // Without the limit the same hole fills.
+        let mut mesh = damaged_sphere();
+        let options = FillOptions {
+            loops: Some(vec![tri.id]),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.filled.len(), 1);
+        // A full half-turn allows everything.
+        let mut mesh = damaged_sphere();
+        let options = FillOptions {
+            loops: Some(vec![tri.id]),
+            max_dihedral: Some(std::f64::consts::PI),
+            ..unfaired()
+        };
+        let (r, _) = edit(&mut mesh, |tx| fill_holes(tx, &options));
+        assert_eq!(r.filled.len(), 1);
+    }
+
+    #[test]
+    fn max_dihedral_bounds_are_validated() {
+        for bad in [f64::NAN, -1.0] {
+            let options = FillOptions {
+                max_edges: Some(4),
+                max_dihedral: Some(bad),
+                ..unfaired()
+            };
+            let mut mesh = bowtie_holes();
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                fill_holes(&mut tx, &options),
+                Err(OpsError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn triangulate_out_of_memory_is_reported_and_writes_nothing() {
+        use fast_mesh_query::fail_allocations_after as fail_query;
+        use fast_mesh_store::StoreError;
+        // The projection path, as in `out_of_memory_is_reported_and_writes_nothing`.
+        let options = FillOptions {
+            max_perimeter: Some(7.0),
+            dp_limit: 8,
+            ..unfaired()
+        };
+        // Fail each query reservation of the fill in turn: every failure is
+        // out-of-memory with nothing written, then the fill succeeds.
+        let mut failures = 0;
+        for n in 0..32 {
+            let mut mesh = wobbly_annulus(64);
+            let before = parts(&mesh);
+            let mut tx = mesh.begin_edit();
+            fail_query(Some(n));
+            let r = fill_holes(&mut tx, &options);
+            fail_query(None);
+            match r {
+                Err(OpsError::Store(StoreError::OutOfMemory)) => {
+                    failures += 1;
+                    assert!(tx.commit().unwrap().is_empty());
+                    assert_eq!(parts(&mesh), before);
+                }
+                Ok(_) => {
+                    assert!(!tx.commit().unwrap().is_empty());
+                    break;
+                }
+                Err(e) => panic!("expected OOM or success, got {e:?}"),
+            }
+        }
+        assert!(failures >= 3, "{failures} query failures");
     }
 
     #[test]

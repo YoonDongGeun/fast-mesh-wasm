@@ -307,13 +307,13 @@ Results for `cargo bench -p fast-mesh-ops --bench ops`, measured on 2026-10-18.
 | `analyze`, with self-intersection check | 893 ms | The same, with a prebuilt BVH; `self_intersects` is `Some(false)`. The check costs about 415 ms. |
 | `orient_1M_1pct_flipped` | 291 ms | Every 100th triangle flipped (10,026); one patch, all 10,026 flipped back. |
 | `fill_10_holes_1M`, `fair` off | 360 ms | Ten round holes punched in the terrain (loops of 61, 78, 128, 165, 232, 313, 388, 436, 454 and 482 edges); all ten filled, 83,813 triangles and 40,548 vertices added. The 2,832-edge rim is skipped by `max_edges = 1000`. |
-| `fill_10_holes_1M`, `fair` on | 5.16 s | The same fill with fairing: about 4.8 s more than without. |
+| `fill_10_holes_1M`, `fair` on | 1.47 s | The same fill with fairing, re-measured 2026-10-24 on the same CPU with other work sharing the machine (upper bound): about 0.8 s more than without on that machine. Before the direct solve below, 10.0 s on the same machine. |
 | `weld_1M_10pct_dupes` | 86 ms | Every 10th vertex duplicated (50,269 duplicates, 552,950 vertices); each corner on such a vertex takes the duplicate with probability 1/2. Tolerance 0 merges all 50,269; no triangle collapses. |
 | `remove_small_components_1M` | 117 ms | The terrain plus 1,000 separate two-triangle quads, `min_triangles = 10`: 1,000 components, 2,000 triangles and 4,000 vertices removed. |
 
 No target was set for these (the plan asks only that they be recorded), and nothing was tuned.
 
-- **Fairing dominates a fill.** Fairing is about 93% of the 5.16 s, for 40,548 new vertices. Refinement to the surrounding density makes the patches large (on this terrain the edges are about 1 long, so a hole of 482 edges gets thousands of triangles), and each patch needs a conjugate-gradient solve. `fair` defaults to true, so a default fill of this input costs about 5 s. A fill that needs only a closed surface can set `fair: false` and costs 360 ms for the same ten holes, with a flatter patch (see the accuracy below). The fairing cost grows with the square of the patch size (conjugate gradient on the bi-Laplacian), so one large hole can take seconds on its own.
+- **Fairing a fill.** Fairing is about half of the 1.47 s, for 40,548 new vertices. Refinement to the surrounding density makes the patches large (on this terrain the edges are about 1 long, so a hole of 482 edges gets thousands of triangles), and each patch needs a sparse direct solve of the bi-Laplacian: a nested-dissection order, an elimination-tree symbolic factorisation and one numeric LDLᵀ for the three coordinates. `fair` defaults to true, so a default fill of this input costs about 1.5 s on the shared machine above (about 5 s before, on a quiet one). A fill that needs only a closed surface can set `fair: false` and costs 360 ms for the same ten holes, with a flatter patch (see the accuracy below). The fairing cost grows much slower than the square of the patch size now: a single round hole of 188, 316, 454 and 680 edges (1,486, 3,986, 9,334 and 19,049 new vertices) on a 200x200 height field fills in 49, 66, 165 and 407 ms with fairing, against 36, 32, 61 and 131 ms without — the fairing itself 13, 33, 104 and 276 ms, where the old conjugate-gradient solve took about 48 ms, 178 ms, 2.0 s and 14.4 s for the same holes (measured back to back with the row above, before at commit `6e7388d`).
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 - **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
 
@@ -806,8 +806,8 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 | `intersecting_pairs`, 1M vs 1M, pushed 0.5 (64-pose cycle) | 4.46 ms | 0.677 ms | 6.6× |
 | `analyze`, no self-intersection check | 489 ms | 405 ms | 1.2× |
 | `analyze`, with self-intersection check | 908 ms | 419 ms | 2.2× |
-| `fill_10_holes_1M`, `fair` off | 353 ms | 350 ms | 1.0× |
-| `fill_10_holes_1M`, `fair` on | 4.27 s | 1.77 s | 2.4× |
+| `fill_10_holes_1M`, `fair` off | 651 ms | 687 ms | 1.0× |
+| `fill_10_holes_1M`, `fair` on | 1.47 s | 1.43 s | 1.0× |
 | `weld_1M_10pct_dupes` | 97.3 ms | 66.9 ms | 1.5× |
 | `section_drag_1M`, 64 planes | 15.8 ms | 15.1 ms | 1.05× |
 | `section_drag_3x333k`, 64 planes over three meshes | 23.0 ms | 11.3 ms | 2.0× |
@@ -832,7 +832,7 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 **Where the gain is small.**
 - **One mesh, one section** (`section_drag_1M`, 1.05×): one slice per plane, and slicing itself is sequential. Several meshes or sections in one update gain (2.0× over three meshes).
 - **`analyze` without the self-intersection check** (1.2×): its passes run side by side, but they all wait for the edge map's sort, which stays sequential.
-- **Fill without fairing** (1.0×): nothing in it is parallel. With fairing on, the three coordinate solves run side by side, with parallel matrix products from 1,024 rows.
+- **Fill with or without fairing** (1.0×): nothing in it is parallel. Fairing used to solve the three coordinates side by side (2.4× on the ten holes); it is now a sequential sparse direct solve, so the feature changes nothing. The two fill rows were re-measured 2026-10-24 with other work sharing the machine (upper bounds).
 - **The sphere fill and the gap alone** (1.0×): single small computations under every threshold.
 
 
@@ -852,8 +852,6 @@ Every benchmark that the `parallel` feature touches, with the feature off and on
 | `triangles_near`, `intersecting_pairs` | `PAR_MIN_PAIR_TRIS` | 2,048 triangles (A and B together) |
 | `self_intersecting_pairs` | `PAR_MIN_SELF_TRIS` | 1,024 triangles |
 | `analyze` passes side by side | `PAR_MIN_ANALYZE_TRIS` | 2,048 triangles |
-| Fairing: the three solves side by side | `PAR_MIN_FAIR_SOLVE` | 128 new vertices |
-| Fairing: matrix products | `PAR_MIN_FAIR_ROWS` | 1,024 rows |
 | Weld: keys and neighbour search | `PAR_MIN_WELD_VERTS` | 16,384 vertex slots |
 | Scene: fields due in one update | `PAR_MIN_FIELD_WORK` | 12,288 (work estimate, summed) |
 | Scene: section entries due in one update | `PAR_MIN_SECTION_WORK` | 8,192 triangles (summed) |

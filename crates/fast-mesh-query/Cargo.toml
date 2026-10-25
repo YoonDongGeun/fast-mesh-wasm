@@ -14,6 +14,9 @@ authors.workspace = true
 [features]
 # Multithreaded hot loops; results are bit-identical with and without it.
 parallel = ["fast-mesh-store/parallel", "fast-mesh-bvh/parallel"]
+# The out-of-memory fault hook as a public test helper, so that crates
+# depending on this one can fail its reservations from their own tests.
+fault-injection = []
 
 [dependencies]
 fast-mesh-store.workspace = true

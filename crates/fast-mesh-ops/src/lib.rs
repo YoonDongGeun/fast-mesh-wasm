@@ -38,19 +38,21 @@ mod fill;
 mod fill_dp;
 mod orient;
 mod refine;
+mod sparse;
 #[cfg(test)]
 mod test_util;
 mod topology;
 mod weld;
 
-pub use analyze::{Analysis, AnalyzeOptions, analyze};
+pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use cleanup::{
-    ComponentOptions, DegenerateOptions, DegenerateReport, RemoveReport, WeldReport,
-    remove_degenerate, remove_small_components, weld,
+    ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
+    DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
 pub use error::{OpsError, Result};
 pub use fill::{
-    FailReason, FairWeights, FillOptions, FillReport, FilledLoop, SkipReason, fill_holes,
+    FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
+    fill_holes,
 };
 pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
