@@ -61,6 +61,8 @@ export {
   type FillReport,
   type FindContactsOptions,
   type InflateReport,
+  type JoinOptions,
+  type JoinReport,
   type LoopId,
   type MeshChange,
   type MeshComponent,

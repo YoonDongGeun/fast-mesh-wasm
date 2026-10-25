@@ -87,6 +87,17 @@ export type Request =
       qid?: number;
       key?: string;
     }
+  | {
+      kind: "join";
+      rev: number;
+      target: ClientId;
+      source: ClientId;
+      /** `JoinOptions`. */
+      payload: unknown;
+      /** When set, the `JoinReport` is replied under it. */
+      qid?: number;
+      key?: string;
+    }
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }
@@ -310,10 +321,11 @@ export type WorkerMessage =
 
 /**
  * The key of a request: its own `key`, or a default naming what it targets
- * (`mesh:<id>` for add and remove, `edit:<id>` for edits, repairs and
- * compaction, `field:<id>`, `section:<id>` for section add and remove,
- * `section:<id>:<aspects>` for a section `set`, such as `section:3:plane` or
- * `section:3:plane+fill`, `history`). Queries have none.
+ * (`mesh:<id>` for add and remove, `edit:<id>` for edits, repairs,
+ * compaction and joins (the join's target), `field:<id>`,
+ * `section:<id>` for section add and remove, `section:<id>:<aspects>` for
+ * a section `set`, such as `section:3:plane` or `section:3:plane+fill`,
+ * `history`). Queries have none.
  */
 export function keyOf(req: Request): string | undefined {
   if ("key" in req && req.key !== undefined) {
@@ -327,6 +339,8 @@ export function keyOf(req: Request): string | undefined {
     case "edit":
     case "repair":
       return `edit:${req.id}`;
+    case "join":
+      return `edit:${req.target}`;
     case "undo":
     case "redo":
     case "clearHistory":

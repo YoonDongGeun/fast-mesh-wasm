@@ -609,6 +609,26 @@ export interface BridgeReport {
   trianglesAdded: number;
 }
 
+/** Options of {@link Scene.join}. */
+export interface JoinOptions {
+  /** The loop on the target, from `analyze(target).loops`. */
+  loopA: LoopId;
+  /** The loop on the source, from `analyze(source).loops`. */
+  loopB: LoopId;
+  /** Maximum vertices per loop; unset means the default (128). */
+  maxEdges?: number;
+}
+
+/** What {@link Scene.join} did. */
+export interface JoinReport {
+  /** Source vertices copied into the target. */
+  verticesAdded: number;
+  /** Source triangles copied into the target. */
+  trianglesAdded: number;
+  /** Bridge triangles between the two loops. */
+  bridgeTrianglesAdded: number;
+}
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -1345,6 +1365,37 @@ export class Scene implements SceneLike {
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+  }
+
+  /**
+   * Joins `source` into `target`: copies the source's geometry into the
+   * target (keeping its world shape), bridges `options.loopA` to the copied
+   * `options.loopB`, and removes the source. The copy and the bridge undo as
+   * one step; the removal is permanent. A drag of the source ends first,
+   * recording its moves as one step, so they survive a failed join.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
+   * mesh twice or loops that cannot bridge; `STALE_LOOPS` for a loop that is
+   * not there. A failed join changes nothing.
+   */
+  join(target: MeshHandle, source: MeshHandle, options: JoinOptions): JoinReport {
+    const ta = this.#id(target);
+    const sb = this.#id(source);
+    const loops: number[] = [];
+    encodeLoopId(options.loopA, loops);
+    encodeLoopId(options.loopB, loops);
+    const maxEdges = optional(options.maxEdges, "maxEdges");
+    // A drag of the source ends first, recording its moves as one step.
+    if (this.#drag?.mesh === source) {
+      this.#drag.end();
+    }
+    const r = call(() =>
+      this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
+    );
+    const key = `${sb.index}:${sb.generation}`;
+    this.#meshes.delete(key);
+    this.#removed.set(key, source);
+    return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
   }
 
   /**

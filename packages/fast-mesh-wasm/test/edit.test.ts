@@ -646,6 +646,49 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
   });
 
+  it("join_merges_source_into_target", () => {
+    const s = scene();
+    const a = s.addMesh(bridgePos.slice(0, 12), bridgeIdx.slice(0, 6));
+    const b = s.addMesh(
+      bridgePos.slice(12),
+      bridgeIdx.slice(6).map((v) => v - 4),
+    );
+    const loopA = s.analyze(a).loops[0].id;
+    const loopB = s.analyze(b).loops[0].id;
+    const r = s.join(a, b, { loopA, loopB });
+    expect(r).toEqual({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 });
+    expect(s.triangleCount(a)).toBe(2 + 2 + 8);
+    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
+    // One undo step restores the target; the source stays removed.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(a)).toBe(2);
+    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
+    expect(s.redo()).toBe(true);
+    expect(s.triangleCount(a)).toBe(2 + 2 + 8);
+  });
+
+  it("join_rejects_bad_selection", () => {
+    const s = scene();
+    const a = s.addMesh(bridgePos.slice(0, 12), bridgeIdx.slice(0, 6));
+    const b = s.addMesh(
+      bridgePos.slice(12),
+      bridgeIdx.slice(6).map((v) => v - 4),
+    );
+    const loopA = s.analyze(a).loops[0].id;
+    const loopB = s.analyze(b).loops[0].id;
+    const good = { loopA, loopB };
+    expect(codeOf(() => s.join(a, a, good))).toBe("INVALID_ARGUMENT");
+    const fake = { ...loopB, hash: loopB.hash ^ 1n };
+    expect(codeOf(() => s.join(a, b, { loopA, loopB: fake }))).toBe("STALE_LOOPS");
+    expect(codeOf(() => s.join(a, b, { loopA: fake, loopB }))).toBe("STALE_LOOPS");
+    expect(codeOf(() => s.join(a, b, { ...good, maxEdges: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.join(a, b, { loopA, loopB: "nope" as never }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(a)).toBe(2);
+    expect(s.triangleCount(b)).toBe(2);
+  });
+
   it("stale_loops_error_code", () => {
     const s = scene();
     const { positions, indices } = damagedHemisphere();
