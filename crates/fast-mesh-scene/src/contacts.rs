@@ -3,7 +3,7 @@
 use fast_mesh_store::{StoreError, TriangleId};
 
 use crate::placement::relative_rigid;
-use crate::query::{Aabb64, MARGIN, check_bound, pair_pad, round_up, try_vec, world_box};
+use crate::query::{Aabb64, MARGIN, cached_world_box, check_bound, pair_pad, round_up, try_vec};
 use crate::{MeshId, Result, Scene, SceneError};
 
 /// Two meshes within the margin of [`Scene::find_contacts`].
@@ -114,7 +114,7 @@ impl Scene {
         };
         let mut boxes = try_vec(ids.len())?;
         for &id in &ids {
-            boxes.push(world_box(self.entry(id)?));
+            boxes.push(cached_world_box(self.entry_mut(id)?).0);
         }
         let start = out.len();
         match pairs {
@@ -153,6 +153,8 @@ impl Scene {
         if wa.distance_to_box(wb) > margin + pair_pad(ea, wa, eb, wb) {
             return Ok(());
         }
+        #[cfg(test)]
+        crate::scene::fault::before_contact()?;
         let xf = relative_rigid(
             &ea.placement,
             ea.mesh.origin(),
@@ -200,6 +202,7 @@ mod tests {
     use super::*;
     use crate::placement::relative_rigid;
     use crate::query::tests::{RX90, RZ90, cube, place};
+    use crate::query::world_box;
     use crate::{MeshOptions, Placement, SceneOptions, UpdateMode};
 
     /// Every pair `a < b` by calling Phase 3b directly.
@@ -442,5 +445,35 @@ mod tests {
             Err(SceneError::UnknownMesh)
         );
         assert_eq!(out, keep());
+    }
+
+    #[test]
+    fn find_contacts_truncates_after_a_midway_failure() {
+        let (mut scene, ids) = scene();
+        let keep = || {
+            vec![Contact {
+                a: ids[0],
+                b: ids[1],
+                intersecting: false,
+                distance: 9.0,
+                triangles_a: vec![],
+                triangles_b: vec![],
+            }]
+        };
+        // The second pair to reach the narrow phase fails, after the first
+        // was appended: the error leaves `out` as it was.
+        let mut out = keep();
+        crate::scene::fault::fail_contact_on(2);
+        assert_eq!(
+            scene.find_contacts(0.5, &ContactFilter::default(), &mut out),
+            Err(SceneError::Store(StoreError::OutOfMemory))
+        );
+        assert_eq!(out, keep());
+        // The hook fires once: the search works again afterwards.
+        let n = scene
+            .find_contacts(0.5, &ContactFilter::default(), &mut out)
+            .unwrap();
+        assert!(n >= 2, "{n}");
+        assert_eq!(out.len(), 1 + n);
     }
 }

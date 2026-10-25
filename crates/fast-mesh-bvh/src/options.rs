@@ -70,7 +70,13 @@ impl Default for UpdatePolicy {
 }
 
 impl UpdatePolicy {
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// Checks the policy, so that it can be refused before a build or an
+    /// update starts. [`Bvh::set_policy`](crate::Bvh::set_policy) checks it
+    /// again.
+    ///
+    /// # Errors
+    /// [`BvhError::InvalidOptions`] when a value is out of range.
+    pub fn validate(&self) -> Result<()> {
         if !(0.0..=1.0).contains(&self.full_rebuild_fraction) {
             return Err(BvhError::InvalidOptions(
                 "full_rebuild_fraction must be 0 to 1",

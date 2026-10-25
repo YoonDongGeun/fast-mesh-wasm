@@ -133,10 +133,11 @@ fn local_point(entry: &Entry, q: [f64; 3]) -> Result<LocalPoint> {
     Ok(LocalPoint { p, err })
 }
 
-/// How much to grow the world box `wbox` of `entry` so that a culling test
-/// with the exact world point `q` keeps every mesh in which the local query
-/// (from the `f32` point `local`, `err` from the exact local point, and for a
-/// ray an `f32` direction `err_dir` from the exact one) can find something.
+/// How much to grow the world box `wbox` of a mesh (placed by `placement`,
+/// with the local magnitude `mesh_mag`) so that a culling test with the
+/// exact world point `q` keeps every mesh in which the local query (from
+/// the `f32` point `local`, `err` from the exact local point, and for a ray
+/// an `f32` direction `err_dir` from the exact one) can find something.
 ///
 /// Anything found lies in the local box, so within `far` of `q`. Mapped back
 /// to the world, the local query's point or ray strays from the exact one by
@@ -144,7 +145,8 @@ fn local_point(entry: &Entry, q: [f64; 3]) -> Result<LocalPoint> {
 /// rotation's distance from orthonormal times `|q - t|` and `t`, plus the
 /// `f32` rounding inside the query.
 fn query_pad(
-    entry: &Entry,
+    placement: &Placement,
+    mesh_mag: f64,
     wbox: &Aabb64,
     q: [f64; 3],
     local: [f32; 3],
@@ -153,8 +155,8 @@ fn query_pad(
 ) -> f64 {
     let (c, h) = wbox.centre_half();
     let far = norm(sub(q, c)) + norm(h);
-    let from_t = norm(sub(q, entry.placement.translation));
-    let mag = max_abs(local) + local_mag(entry) + far;
+    let from_t = norm(sub(q, placement.translation));
+    let mag = max_abs(local) + mesh_mag + far;
     err + 2.0 * (far + err) * err_dir + PLACEMENT_SLACK * (from_t + far) + F32_SLACK * mag
 }
 
@@ -225,6 +227,14 @@ impl Default for SceneClosestOptions {
         }
     }
 }
+
+/// One broadphase candidate of [`Scene::raycast`]: the padded world-box
+/// entry distance, the mesh and the ray in its local space.
+pub(crate) type RayCandidate = (f64, MeshId, Ray);
+
+/// One broadphase candidate of [`Scene::closest_point`]: the padded lower
+/// bound, the mesh and the query point in its local space.
+pub(crate) type ClosestCandidate = (f64, MeshId, [f32; 3]);
 
 /// Where a world ray hit a mesh of the scene.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -311,19 +321,37 @@ impl Scene {
             ));
         }
         self.prepare(None)?;
+        // The order buffer is reused across calls: taken out here and put
+        // back cleared below, so queries after the first do not allocate.
+        let mut order = std::mem::take(&mut self.order_ray);
+        let result = self.raycast_inner(&mut order, origin, d, opts);
+        order.clear();
+        self.order_ray = order;
+        result
+    }
+
+    /// [`Scene::raycast`] past its checks, over the reused `order` buffer.
+    fn raycast_inner(
+        &mut self,
+        order: &mut Vec<RayCandidate>,
+        origin: [f64; 3],
+        d: [f64; 3],
+        opts: &SceneRayOptions,
+    ) -> Result<Option<SceneRayHit>> {
         // Broadphase: the meshes whose padded world box the ray enters within
         // the bounds, nearest entry first.
-        let mut order = Vec::new();
-        for (id, e) in self.entries.iter() {
-            let lo = local_point(e, origin)?;
-            let wbox = world_box(e);
+        for (id, e) in self.entries.iter_mut() {
+            // Empty meshes hold nothing: skip them before mapping the
+            // point, which may be out of f32 range in their local space.
+            let (wbox, mag) = cached_world_box(e);
             if wbox.is_empty() {
                 continue;
             }
+            let lo = local_point(e, origin)?;
             let dl = rotate_back(&e.placement, d);
             let dl32 = dl.map(|c| c as f32);
             let err_dir = norm(std::array::from_fn(|k| f64::from(dl32[k]) - dl[k]));
-            let pad = query_pad(e, &wbox, origin, lo.p, lo.err, err_dir);
+            let pad = query_pad(&e.placement, mag, &wbox, origin, lo.p, lo.err, err_dir);
             if let Some(enter) = wbox.ray_enter(origin, d, pad, opts.min_t, opts.max_t) {
                 order.try_reserve(1).map_err(|_| oom())?;
                 let ray = Ray {
@@ -333,10 +361,12 @@ impl Scene {
                 order.push((enter, id, ray));
             }
         }
-        order.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        if order.len() > 1 {
+            order.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        }
         let (min32, max32) = (round_down(opts.min_t), round_up(opts.max_t));
         let mut best: Option<SceneRayHit> = None;
-        for (enter, id, ray) in order {
+        for &(enter, id, ray) in order.iter() {
             if best.is_some_and(|b| enter > b.t) {
                 break;
             }
@@ -405,24 +435,44 @@ impl Scene {
         check_finite(p, "query point must be finite")?;
         check_bound(opts.max_distance, MAX_DISTANCE)?;
         self.prepare(None)?;
-        let mut order = Vec::new();
-        for (id, e) in self.entries.iter() {
-            let lp = local_point(e, p)?;
-            let wbox = world_box(e);
+        // The order buffer is reused across calls: taken out here and put
+        // back cleared below, so queries after the first do not allocate.
+        let mut order = std::mem::take(&mut self.order_closest);
+        let result = self.closest_inner(&mut order, p, opts);
+        order.clear();
+        self.order_closest = order;
+        result
+    }
+
+    /// [`Scene::closest_point`] past its checks, over the reused `order`
+    /// buffer.
+    fn closest_inner(
+        &mut self,
+        order: &mut Vec<ClosestCandidate>,
+        p: [f64; 3],
+        opts: &SceneClosestOptions,
+    ) -> Result<Option<SceneClosestHit>> {
+        for (id, e) in self.entries.iter_mut() {
+            // Empty meshes hold nothing: skip them before mapping the
+            // point, which may be out of f32 range in their local space.
+            let (wbox, mag) = cached_world_box(e);
             if wbox.is_empty() {
                 continue;
             }
-            let pad = query_pad(e, &wbox, p, lp.p, lp.err, 0.0);
+            let lp = local_point(e, p)?;
+            let pad = query_pad(&e.placement, mag, &wbox, p, lp.p, lp.err, 0.0);
             let lower = (wbox.distance_to(p) - pad).max(0.0);
             if lower <= opts.max_distance {
                 order.try_reserve(1).map_err(|_| oom())?;
                 order.push((lower, id, lp.p));
             }
         }
-        order.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        if order.len() > 1 {
+            order.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        }
         let max32 = round_up(opts.max_distance);
         let mut best: Option<SceneClosestHit> = None;
-        for (lower, id, q) in order {
+        for &(lower, id, q) in order.iter() {
             if best.is_some_and(|b| lower > b.distance) {
                 break;
             }
@@ -715,6 +765,50 @@ impl Aabb64 {
         }
         (lo <= hi).then_some(lo)
     }
+}
+
+/// A world box cached on an [`Entry`](crate::scene::Entry), with the key
+/// that validates it: the mesh revision (equal revisions mean equal
+/// content), the origin and the placement. Valid only while the BVH is
+/// current; queries bring it up to date first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CachedBox {
+    rev: u64,
+    origin: [f64; 3],
+    placement: Placement,
+    bounds: Aabb64,
+    /// The mesh's local magnitude (see [`local_mag`]), from the same root
+    /// box, for [`query_pad`] without another lookup.
+    mag: f64,
+}
+
+/// The entry's world box and local magnitude, cached across queries. A hit
+/// needs only the revision, the origin and the placement to match: equal
+/// revisions mean equal content, and the root box is the bounds of that
+/// content whatever the tree looks like. Queries bring the BVH up to date
+/// first, and [`Entry::flag_unknown`] clears the cache with the rebuild
+/// flag, so a hit never reads a stale tree.
+pub(crate) fn cached_world_box(entry: &mut Entry) -> (Aabb64, f64) {
+    let rev = entry.mesh.revision();
+    let origin = entry.mesh.origin();
+    if !entry.rebuild
+        && let Some(c) = &entry.wbox
+        && c.rev == rev
+        && c.origin == origin
+        && c.placement == entry.placement
+    {
+        return (c.bounds, c.mag);
+    }
+    let bounds = world_box(entry);
+    let mag = local_mag(entry);
+    entry.wbox = Some(CachedBox {
+        rev,
+        origin,
+        placement: entry.placement,
+        bounds,
+        mag,
+    });
+    (bounds, mag)
 }
 
 /// A world box holding every triangle of the mesh: its BVH root box (local
@@ -1130,6 +1224,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn closest_point_breaks_ties_by_id() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let identity = Placement::IDENTITY.rotation;
+        // Two walls at distance 2 from the origin: `low` (index 0) at x = 2,
+        // `high` (index 1) moved to x = -2, whose larger pad sorts it first.
+        let low = scene
+            .add_mesh(wall(2.0, 1.0), MeshOptions::default())
+            .unwrap();
+        let high = scene
+            .add_mesh(wall(0.0, 1.0), place(identity, [-2.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(low < high);
+        let opts = SceneClosestOptions::default();
+        let o = [0.0, 0.0, 0.0];
+        // Two coincident walls tie exactly too.
+        let twin = scene
+            .add_mesh(wall(2.0, 1.0), MeshOptions::default())
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (low, 2.0));
+        // A nearer mesh wins whatever its id.
+        scene
+            .set_placement(
+                twin,
+                Placement {
+                    rotation: identity,
+                    translation: [-1.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (twin, 1.0));
+        scene
+            .set_placement(
+                low,
+                Placement {
+                    rotation: identity,
+                    translation: [1.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+        let hit = scene.closest_point(o, &opts).unwrap().unwrap();
+        assert_eq!((hit.mesh, hit.distance), (twin, 1.0));
+    }
+
+    #[test]
     fn queries_update_lazy_and_reject_stale_manual() {
         let mut scene = Scene::new(SceneOptions::default());
         let lazy = scene
@@ -1392,6 +1532,77 @@ pub(crate) mod tests {
             scene.closest_point(o, &SceneClosestOptions::default()),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn queries_skip_empty_meshes_before_mapping_the_point() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let wall_id = scene
+            .add_mesh(wall(5.0, 1.0), MeshOptions::default())
+            .unwrap();
+        // An empty mesh far beyond f32 range: mapping the query point into
+        // its local space would fail, but it holds nothing and must be
+        // skipped first.
+        let far = place(Placement::IDENTITY.rotation, [1e39, 0.0, 0.0]);
+        scene.add_mesh(Mesh::new(), far).unwrap();
+        let o = [0.0, 0.0, 0.0];
+        let hit = scene
+            .raycast(o, [1.0, 0.0, 0.0], &SceneRayOptions::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!((hit.mesh, hit.t), (wall_id, 5.0));
+        let near = scene
+            .closest_point(o, &SceneClosestOptions::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!((near.mesh, near.distance), (wall_id, 5.0));
+    }
+
+    /// World boxes are cached across queries and recomputed when the mesh
+    /// or its placement changes.
+    #[test]
+    fn world_boxes_are_cached_and_invalidated() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene
+            .add_mesh(wall(5.0, 1.0), MeshOptions::default())
+            .unwrap();
+        let cached = |scene: &Scene| scene.entries.get(id).unwrap().wbox;
+        let fresh = |scene: &Scene| {
+            let e = scene.entries.get(id).unwrap();
+            (world_box(e), local_mag(e))
+        };
+        assert_eq!(cached(&scene), None);
+        let o = [0.0, 0.0, 0.0];
+        scene
+            .raycast(o, [1.0, 0.0, 0.0], &SceneRayOptions::default())
+            .unwrap();
+        let first = cached(&scene).expect("cached by the query");
+        assert_eq!((first.bounds, first.mag), fresh(&scene));
+        // A placement change recomputes the box on the next query.
+        scene
+            .set_placement(
+                id,
+                Placement {
+                    rotation: Placement::IDENTITY.rotation,
+                    translation: [10.0, 0.0, 0.0],
+                },
+            )
+            .unwrap();
+        scene
+            .raycast(o, [1.0, 0.0, 0.0], &SceneRayOptions::default())
+            .unwrap();
+        let moved_box = cached(&scene).expect("cached again");
+        assert_ne!(moved_box.bounds, first.bounds);
+        assert_eq!((moved_box.bounds, moved_box.mag), fresh(&scene));
+        // So does an edit: without triangles the cached box is empty.
+        scene.edit(id, |tx| tx.remove_triangles(&[0, 1])).unwrap();
+        assert_eq!(
+            scene.raycast(o, [1.0, 0.0, 0.0], &SceneRayOptions::default()),
+            Ok(None)
+        );
+        let emptied = cached(&scene).expect("cached again");
+        assert!(emptied.bounds.is_empty());
+        assert_eq!((emptied.bounds, emptied.mag), fresh(&scene));
     }
 
     #[test]

@@ -136,6 +136,8 @@ impl History {
     /// after it) cannot fail. Call before the operation that produces the
     /// change; on error nothing has changed.
     pub(crate) fn reserve(&mut self) -> Result<()> {
+        #[cfg(test)]
+        crate::scene::fault::before_reserve()?;
         let oom = |_| SceneError::Store(StoreError::OutOfMemory);
         self.open.changes.try_reserve(1).map_err(oom)?;
         self.undo.try_reserve(1).map_err(oom)
@@ -247,7 +249,8 @@ impl History {
 
     /// Closes the open step and undoes the latest step. `None` when there is
     /// nothing to undo. On error the meshes, both stacks and the open step
-    /// are unchanged (except for [`SceneError::Corrupted`]).
+    /// are unchanged, except that [`SceneError::Corrupted`] drops the failed
+    /// step (its patches' known states were released in `run_step`).
     ///
     /// A non-empty open step is undone directly, before any eviction, so
     /// that it is undone even when it exceeds the budget (§15.3: Ctrl+Z
@@ -267,7 +270,15 @@ impl History {
             // Recording an entry dropped the redo stack, and nothing can
             // fill it while the step stays open.
             debug_assert!(self.redo.is_empty(), "redo steps beside an open step");
-            let done = run_step(&self.open, entries, false)?;
+            let done = match run_step(&self.open, entries, false) {
+                Ok(done) => done,
+                Err(e) => {
+                    if e == SceneError::Corrupted {
+                        self.drop_open();
+                    }
+                    return Err(e);
+                }
+            };
             self.depth = 0;
             self.redo.push(std::mem::take(&mut self.open));
             self.evict(entries);
@@ -282,7 +293,11 @@ impl History {
                 Ok(Some(done))
             }
             Err(e) => {
-                self.undo.push_back(step);
+                if e == SceneError::Corrupted {
+                    self.bytes -= step.bytes;
+                } else {
+                    self.undo.push_back(step);
+                }
                 Err(e)
             }
         }
@@ -314,19 +329,32 @@ impl History {
                 Ok(Some(done))
             }
             Err(e) => {
-                self.redo.push(step);
+                if e == SceneError::Corrupted {
+                    self.bytes -= step.bytes;
+                } else {
+                    self.redo.push(step);
+                }
                 Err(e)
             }
         }
     }
 
     /// Reverts the open step's changes and discards the step, releasing the
-    /// slots its patches created. On error the step stays open, unchanged.
+    /// slots its patches created. On error the step stays open, unchanged,
+    /// except that [`SceneError::Corrupted`] discards it.
     pub(crate) fn cancel(&mut self, entries: &mut SlotMap<Entry>) -> Result<Vec<Done>> {
         if self.depth == 0 {
             return Err(SceneError::StepNotOpen);
         }
-        let done = run_step(&self.open, entries, false)?;
+        let done = match run_step(&self.open, entries, false) {
+            Ok(done) => done,
+            Err(e) => {
+                if e == SceneError::Corrupted {
+                    self.drop_open();
+                }
+                return Err(e);
+            }
+        };
         let step = std::mem::take(&mut self.open);
         self.depth = 0;
         self.bytes -= step.bytes;
@@ -334,6 +362,14 @@ impl History {
             release_in(c, entries, PatchSide::Redoable);
         }
         Ok(done)
+    }
+
+    /// Discards the open step after [`SceneError::Corrupted`]: its patches'
+    /// known states were released in `run_step`, so only the bytes go.
+    fn drop_open(&mut self) {
+        let step = std::mem::take(&mut self.open);
+        self.depth = 0;
+        self.bytes -= step.bytes;
     }
 
     /// Drops changes of mesh `id`; steps left empty are dropped too (the open
@@ -404,6 +440,9 @@ impl History {
 /// `Entry::flag_unknown`), since what it holds is no longer known, and every
 /// mesh with a placement entry in the step is reported as
 /// `placement_changed`, since its placement may be left at either value.
+/// The caller drops the failed step, so the patches whose end state this run
+/// determines are released for it here; a patch a failed change touched is
+/// left reserved, since its state is unknown.
 fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<Vec<Done>> {
     let mut done: Vec<Done> = Vec::new();
     done.try_reserve_exact(step.changes.len())
@@ -422,14 +461,70 @@ fn run_step(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) -> Result<
                 for j in (0..i).rev() {
                     if run_change(&step.changes[order(j)], entries, !forward).is_err() {
                         mark_corrupted(step, entries);
+                        release_partial(step, entries, forward, i, j);
                         return Err(SceneError::Corrupted);
                     }
+                }
+                if e == SceneError::Corrupted {
+                    // The step names a mesh that is gone (defensive: removal
+                    // drops its changes), but recovery restored everything,
+                    // so every patch is back at a known state.
+                    release_recovered(step, entries, forward);
                 }
                 return Err(e);
             }
         }
     }
     Ok(done)
+}
+
+/// Releases the patches of a step dropped after [`SceneError::Corrupted`]
+/// for the state each is known to be in. Change `i` is the one whose run
+/// failed and `j` the one whose recovery failed; both are left reserved.
+/// Changes run and recovered, or never run, are at the step's far state
+/// (after it for undo, before it for redo); changes run and never recovered
+/// are at the run's end state.
+fn release_partial(step: &Step, entries: &mut SlotMap<Entry>, forward: bool, i: usize, j: usize) {
+    let order = |k: usize| {
+        if forward {
+            k
+        } else {
+            step.changes.len() - 1 - k
+        }
+    };
+    // At the far state: undoable when the step ran backwards, redoable
+    // when it ran forwards.
+    let far = if forward {
+        PatchSide::Redoable
+    } else {
+        PatchSide::Undoable
+    };
+    // At the run's end state: the other side.
+    let end = if forward {
+        PatchSide::Undoable
+    } else {
+        PatchSide::Redoable
+    };
+    for k in (j + 1..i).chain(i + 1..step.changes.len()) {
+        release_in(&step.changes[order(k)], entries, far);
+    }
+    for k in 0..j {
+        release_in(&step.changes[order(k)], entries, end);
+    }
+}
+
+/// Releases every patch of a step dropped after [`SceneError::Corrupted`]
+/// whose recovery still restored everything: all are at the step's far
+/// state.
+fn release_recovered(step: &Step, entries: &mut SlotMap<Entry>, forward: bool) {
+    let far = if forward {
+        PatchSide::Redoable
+    } else {
+        PatchSide::Undoable
+    };
+    for c in &step.changes {
+        release_in(c, entries, far);
+    }
 }
 
 /// After a failed recovery: flags every mesh the step touched, then brings

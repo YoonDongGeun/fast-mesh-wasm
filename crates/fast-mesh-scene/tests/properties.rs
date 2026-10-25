@@ -20,12 +20,13 @@
 //! size. The shadow's free slots must equal the scene mesh's after every
 //! action, which checks slot release on eviction, redo drops and removal.
 //!
-//! After every action `take_changes` is checked against the data the model
+//! After most actions `take_changes` is checked against the data the model
 //! had at the previous call: added and removed ids exactly, every slot whose
 //! content changed among the moved or changed ones, `changes: None` only after
 //! a compaction (the test injects no faults, so there is no `Corrupted`), and
 //! `placement_changed` exactly when some placement change ran, including one
-//! that was undone.
+//! that was undone. The call is skipped on some actions, so that reports
+//! folding across several actions are checked too.
 //!
 //! Each edit does one thing to one mesh, so that "the patch is not empty" and
 //! "the model's data changed" are the same thing; steps group several edits.
@@ -895,6 +896,261 @@ fn relative(a: (&Placement, [f64; 3]), b: (&Placement, [f64; 3])) -> Rigid {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Brute-force world-space oracle, independent of the relative transform
+// ---------------------------------------------------------------------------
+
+/// How far the brute-force world distance may be from the scene's answer:
+/// `f32` rounding and the re-orthonormalised relative rotation move it by
+/// about 1e-5 at most, while a wrong transform misses by whole mesh sizes.
+const BRUTE_TOL: f64 = 1e-3;
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// `R (o + p) + t`: the spec's placement formula, written out plainly. This
+/// is the only transform the brute-force check uses: no relative transform,
+/// no Gram-Schmidt.
+fn world_point(pl: &Placement, origin: [f64; 3], p: [f32; 3]) -> [f64; 3] {
+    let q = [
+        origin[0] + f64::from(p[0]),
+        origin[1] + f64::from(p[1]),
+        origin[2] + f64::from(p[2]),
+    ];
+    std::array::from_fn(|i| {
+        pl.translation[i]
+            + pl.rotation[i]
+                .iter()
+                .zip(&q)
+                .map(|(r, q)| r * q)
+                .sum::<f64>()
+    })
+}
+
+/// Distance from `p` to the segment `ab` (either end when `a == b`).
+fn point_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let ab = sub(b, a);
+    let denom = dot(ab, ab);
+    if denom == 0.0 {
+        return norm(sub(p, a));
+    }
+    let t = (dot(ab, sub(p, a)) / denom).clamp(0.0, 1.0);
+    norm(sub(
+        p,
+        [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]],
+    ))
+}
+
+/// Distance from `p` to the triangle `abc`: the plane distance when the
+/// projection falls inside, else the nearest edge. Degenerate triangles
+/// fall through to their edges.
+fn point_triangle(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let n = cross(ab, ac);
+    let edge = || {
+        point_segment(p, a, b)
+            .min(point_segment(p, b, c))
+            .min(point_segment(p, c, a))
+    };
+    if dot(n, n) == 0.0 {
+        return edge();
+    }
+    // Barycentric coordinates of the projection onto the plane.
+    let ap = sub(p, a);
+    let (d00, d01, d11) = (dot(ab, ab), dot(ab, ac), dot(ac, ac));
+    let (d20, d21) = (dot(ap, ab), dot(ap, ac));
+    let denom = d00 * d11 - d01 * d01;
+    if denom == 0.0 {
+        return edge();
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    if v >= 0.0 && w >= 0.0 && v + w <= 1.0 {
+        dot(ap, n).abs() / norm(n)
+    } else {
+        edge()
+    }
+}
+
+/// Distance between the segments `p1q1` and `p2q2` (Real-Time Collision
+/// Detection 5.1.9, with exact-zero guards instead of an epsilon).
+fn seg_seg(p1: [f64; 3], q1: [f64; 3], p2: [f64; 3], q2: [f64; 3]) -> f64 {
+    let d1 = sub(q1, p1);
+    let d2 = sub(q2, p2);
+    let r = sub(p1, p2);
+    let a = dot(d1, d1);
+    let e = dot(d2, d2);
+    let f = dot(d2, r);
+    if a == 0.0 && e == 0.0 {
+        return norm(r);
+    }
+    let (mut s, mut t);
+    if a == 0.0 {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = dot(d1, r);
+        if e == 0.0 {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = dot(d1, d2);
+            let denom = a * e - b * b;
+            s = if denom == 0.0 {
+                0.0
+            } else {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            };
+            t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+        }
+    }
+    let c1 = [p1[0] + d1[0] * s, p1[1] + d1[1] * s, p1[2] + d1[2] * s];
+    let c2 = [p2[0] + d2[0] * t, p2[1] + d2[1] * t, p2[2] + d2[2] * t];
+    norm(sub(c1, c2))
+}
+
+/// Whether the segment `pq` meets the triangle `abc` (Möller–Trumbore with
+/// a small slop, so near-touching counts as touching).
+fn seg_tri_hit(p: [f64; 3], q: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> bool {
+    const SLOP: f64 = 1e-9;
+    let d = sub(q, p);
+    if d == [0.0; 3] {
+        return false;
+    }
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let h = cross(d, ac);
+    let det = dot(ab, h);
+    if det == 0.0 {
+        return false;
+    }
+    let inv = 1.0 / det;
+    let s = sub(p, a);
+    let u = dot(s, h) * inv;
+    if u < -SLOP || u > 1.0 + SLOP {
+        return false;
+    }
+    let qv = cross(s, ab);
+    let v = dot(d, qv) * inv;
+    if v < -SLOP || u + v > 1.0 + SLOP {
+        return false;
+    }
+    let t = dot(ac, qv) * inv;
+    (-SLOP..=1.0 + SLOP).contains(&t)
+}
+
+/// Brute-force distance between two meshes in world space, from the model's
+/// plain data, or `None` when either mesh has no alive triangle: every
+/// vertex against every triangle of the other mesh, every edge against every
+/// edge, and 0 when an edge pierces a triangle.
+fn brute_distance(
+    pa: &Placement,
+    oa: [f64; 3],
+    da: &Data,
+    pb: &Placement,
+    ob: [f64; 3],
+    db: &Data,
+) -> Option<f64> {
+    let world = |pl: &Placement, o: [f64; 3], d: &Data| {
+        d.positions
+            .iter()
+            .map(|p| p.map(|p| world_point(pl, o, p)))
+            .collect::<Vec<_>>()
+    };
+    let (wa, wb) = (world(pa, oa, da), world(pb, ob, db));
+    let corners = |w: &[Option<[f64; 3]>], t: &[u32; 3]| {
+        [
+            w[t[0] as usize].unwrap(),
+            w[t[1] as usize].unwrap(),
+            w[t[2] as usize].unwrap(),
+        ]
+    };
+    let edges = |c: &[[f64; 3]; 3]| [(c[0], c[1]), (c[1], c[2]), (c[2], c[0])];
+    let (mut any, mut best) = (false, f64::INFINITY);
+    for xa in da.triangles.iter().flatten() {
+        for xb in db.triangles.iter().flatten() {
+            any = true;
+            let (cx, cy) = (corners(&wa, xa), corners(&wb, xb));
+            for &(p, q) in &edges(&cx) {
+                if seg_tri_hit(p, q, cy[0], cy[1], cy[2]) {
+                    return Some(0.0);
+                }
+            }
+            for &(p, q) in &edges(&cy) {
+                if seg_tri_hit(p, q, cx[0], cx[1], cx[2]) {
+                    return Some(0.0);
+                }
+            }
+            for &v in &cx {
+                best = best.min(point_triangle(v, cy[0], cy[1], cy[2]));
+            }
+            for &v in &cy {
+                best = best.min(point_triangle(v, cx[0], cx[1], cx[2]));
+            }
+            for &(p, q) in &edges(&cx) {
+                for &(r, s) in &edges(&cy) {
+                    best = best.min(seg_seg(p, q, r, s));
+                }
+            }
+        }
+    }
+    any.then_some(best)
+}
+
+/// The unbounded `mesh_distance` answer against [`brute_distance`]:
+/// `want_hit` is the exact Phase 3 intersection answer, and `got` the
+/// scene's distance with its world points.
+fn check_brute(
+    a: &ModelMesh,
+    oa: [f64; 3],
+    b: &ModelMesh,
+    ob: [f64; 3],
+    want_hit: bool,
+    got: Option<(f64, [f64; 3], [f64; 3])>,
+) -> Result<(), TestCaseError> {
+    let brute = brute_distance(&a.placement, oa, &a.data, &b.placement, ob, &b.data);
+    match (got, brute) {
+        (None, None) => Ok(()),
+        (Some((d, pta, ptb)), Some(x)) => {
+            if want_hit {
+                prop_assert!(x <= BRUTE_TOL, "intersecting pair, brute {x}");
+            } else {
+                prop_assert!((d - x).abs() <= BRUTE_TOL, "mesh_distance {d} vs brute {x}");
+            }
+            let pair = norm(sub(pta, ptb));
+            prop_assert!(
+                (pair - x).abs() <= BRUTE_TOL,
+                "reported points {pair} apart vs brute {x}"
+            );
+            Ok(())
+        }
+        _ => Err(TestCaseError::fail(format!(
+            "mesh_distance {got:?} vs brute {brute:?}"
+        ))),
+    }
+}
+
 /// A live mesh of the scene with a BVH of its own, built fresh. Phase 3
 /// queries are exact, so they answer the same on any valid BVH.
 struct Fresh {
@@ -1102,6 +1358,16 @@ fn check_queries(scene: &mut Scene, model: &mut Model, seed: u64) -> Result<(), 
             }
             let got = got.unwrap();
             prop_assert_eq!(got.map(|g| g.distance), want.map(|w| f64::from(w.distance)));
+            if bound.is_infinite() {
+                check_brute(
+                    &model.meshes[ia],
+                    oa,
+                    &model.meshes[ib],
+                    ob,
+                    want_hit,
+                    got.as_ref().map(|g| (g.distance, g.point_a, g.point_b)),
+                )?;
+            }
             if let (Some(g), Some(w)) = (got, want) {
                 // Ties between triangle pairs may go either way on different
                 // trees; the pair named must be alive and its own distance.
@@ -1370,15 +1636,23 @@ fn apply(scene: &mut Scene, model: &mut Model, action: &Action) -> Result<(), Te
             let Some(i) = model.choose(*sel) else {
                 return Ok(());
             };
+            // Each frame slides a little further along x; the last frame of
+            // some drags lands back on the first one's placement, and of
+            // others back on the placement from before the drag, which
+            // coalesces into an entry that does nothing.
+            let before = model.meshes[i].placement;
             for f in 0..*frames as i8 {
-                // Each frame slides a little further along x; the last frame
-                // of some drags lands back on the first one's placement.
-                let jx = if f + 1 == *frames as i8 && kind % 2 == 0 {
-                    j[0]
+                let last = f + 1 == *frames as i8;
+                let p = if last && kind % 4 == 2 {
+                    before
                 } else {
-                    j[0].wrapping_add(f.wrapping_mul(3))
+                    let jx = if last && kind % 2 == 0 {
+                        j[0]
+                    } else {
+                        j[0].wrapping_add(f.wrapping_mul(3))
+                    };
+                    placement((*kind, *q, [jx, j[1], j[2]]), model.meshes[i].anchor)
                 };
-                let p = placement((*kind, *q, [jx, j[1], j[2]]), model.meshes[i].anchor);
                 set_placement(scene, model, i, p);
             }
         }
@@ -1588,7 +1862,11 @@ proptest! {
             // `check_eager` that it answers like a fresh build.
             apply(&mut scene, &mut model, a)?;
             check_state(&scene, &model)?;
-            check_reports(&mut scene, &mut model)?;
+            // Skipped on some actions, so that reports folding across
+            // several actions are checked too.
+            if (i + seed as usize) % 3 != 2 {
+                check_reports(&mut scene, &mut model)?;
+            }
             check_eager(&mut scene, &model, seed.wrapping_add(i as u64))?;
         }
         scene.flush().unwrap();
