@@ -1,11 +1,13 @@
 //! Region remeshing: matching a brush region's density to a target edge
 //! length.
 //!
-//! [`remesh`] runs rounds of midpoint splits (Task 1; collapse and flip
-//! passes land in Task 2) over the edges under a [`Region`], until a round
+//! [`remesh`] runs rounds of midpoint splits, midpoint collapses, and
+//! Delaunay-style flips over the edges under a [`Region`], until a round
 //! changes nothing or `max_rounds` runs out, and commits through one
 //! [`Transaction`](fast_mesh_store::Transaction). New vertices sit at edge
 //! midpoints; existing positions are never modified.
+
+use std::cmp::Ordering;
 
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
@@ -13,7 +15,7 @@ use crate::{OpsError, Result, push, reserve};
 
 /// Edges longer than this multiple of the target length are split.
 pub const SPLIT_FACTOR: f64 = 4.0 / 3.0;
-/// Edges shorter than this multiple of the target length collapse (Task 2).
+/// Edges shorter than this multiple of the target length collapse.
 pub const COLLAPSE_FACTOR: f64 = 4.0 / 5.0;
 /// Default cap on remesh rounds.
 pub const REMESH_MAX_ROUNDS: u32 = 10;
@@ -109,9 +111,9 @@ impl RemeshOptionsBuilder {
 pub struct RemeshReport {
     /// Edge splits performed.
     pub splits: usize,
-    /// Edge collapses performed (Task 2).
+    /// Edge collapses performed.
     pub collapses: usize,
-    /// Edge flips performed (Task 2).
+    /// Edge flips performed.
     pub flips: usize,
     /// Rounds that changed the mesh.
     pub rounds: usize,
@@ -131,11 +133,15 @@ impl RemeshReport {
 /// Remeshes the edges inside `options.region` toward the target length.
 ///
 /// Each round splits the edges whose midpoint lies in the region and whose
-/// length exceeds the target by [`SPLIT_FACTOR`]. Splitting an edge inserts
-/// one vertex at its midpoint, shared by the one or two triangles on either
-/// side, so neighbors stay stitched. The whole plan is computed on working
-/// copies first and committed through `tx` at the end, which keeps the call
-/// atomic under sweep: either every round lands or nothing does.
+/// length exceeds the target by [`SPLIT_FACTOR`], collapses interior edges
+/// shorter than the target by [`COLLAPSE_FACTOR`], and flips interior edges
+/// whose quad gains a larger minimum angle. Splitting an edge inserts one
+/// vertex at its midpoint, shared by the triangles on either side, so
+/// neighbors stay stitched; collapsing an edge merges its endpoints into one
+/// midpoint vertex. Boundary edges never collapse, and any pass that would
+/// fold the surface is skipped. The whole plan is computed on working copies
+/// first and committed through `tx` at the end, which keeps the call atomic
+/// under sweep: either every round lands or nothing does.
 pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshReport> {
     let region = &options.region;
     if !region.radius.is_finite() || region.radius <= 0.0 {
@@ -173,26 +179,48 @@ pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshRep
                 WorkTri {
                     id: Some(t),
                     corners,
+                    alive: true,
                 },
             )?;
         }
     }
+    let mut vlive: Vec<bool> = Vec::new();
+    reserve(&mut vlive, slots)?;
+    vlive.extend(std::iter::repeat_n(true, slots));
     let mut added: Vec<NewVert> = Vec::new();
     let mut report = RemeshReport::quiet();
     for _ in 0..options.max_rounds {
-        let splits = split_round(&mut positions, &mut tris, &mut added, region, sigma)?;
-        // Task 2 plugs collapse and flip passes in here; the loop breaks
-        // once a whole round changes nothing.
-        if splits == 0 {
+        let fresh = positions.len();
+        let splits = split_round(
+            &mut positions,
+            &mut vlive,
+            &mut tris,
+            &mut added,
+            region,
+            sigma,
+        )?;
+        let collapses = collapse_round(
+            &mut positions,
+            &mut vlive,
+            &mut tris,
+            &mut added,
+            region,
+            sigma,
+            fresh,
+        )?;
+        let flips = flip_round(&positions, &vlive, &mut tris, region, sigma)?;
+        if splits + collapses + flips == 0 {
             break;
         }
         report.splits += splits;
+        report.collapses += collapses;
+        report.flips += flips;
         report.rounds += 1;
     }
     if report.splits + report.collapses + report.flips == 0 {
         return Ok(report);
     }
-    commit(tx, slots, &tris, &added)?;
+    commit(tx, slots, &vlive, &tris, &added)?;
     Ok(report)
 }
 
@@ -200,6 +228,7 @@ pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshRep
 struct WorkTri {
     id: Option<TriangleId>,
     corners: [u32; 3],
+    alive: bool,
 }
 
 /// A midpoint vertex waiting for commit. `parents` weights the new vertex
@@ -244,7 +273,7 @@ fn global_mean_edge_length(mesh: &Mesh) -> Result<Option<f64>> {
             Some(c) => c,
             None => continue,
         };
-        if corners[0] == corners[1] || corners[1] == corners[2] || corners[2] == corners[0] {
+        if degenerate(&corners) {
             continue;
         }
         for k in 0..3 {
@@ -271,6 +300,7 @@ fn global_mean_edge_length(mesh: &Mesh) -> Result<Option<f64>> {
 /// split made earlier in the same round already consumed it.
 fn split_round(
     positions: &mut Vec<[f32; 3]>,
+    vlive: &mut Vec<bool>,
     tris: &mut Vec<WorkTri>,
     added: &mut Vec<NewVert>,
     region: &Region,
@@ -279,19 +309,7 @@ fn split_round(
     // `positions` and `added` grow in lockstep, one entry per split, so
     // their length gap is the base slot count for the whole round.
     let slots = positions.len() - added.len();
-    let mut pairs: Vec<((u32, u32), usize)> = Vec::new();
-    reserve(&mut pairs, 3 * tris.len())?;
-    for (i, tri) in tris.iter().enumerate() {
-        let c = tri.corners;
-        if c[0] == c[1] || c[1] == c[2] || c[2] == c[0] {
-            continue;
-        }
-        for k in 0..3 {
-            let (a, b) = (c[k], c[(k + 1) % 3]);
-            push(&mut pairs, ((a.min(b), a.max(b)), i))?;
-        }
-    }
-    pairs.sort_unstable();
+    let pairs = snapshot_pairs(tris, vlive)?;
     let mut splits = 0;
     let mut start = 0;
     while start < pairs.len() {
@@ -310,22 +328,17 @@ fn split_round(
             let m = positions.len() as u32;
             let parents = blend_parents(a, b, slots, added)?;
             push(positions, mid)?;
+            push(vlive, true)?;
             push(added, NewVert { pos: mid, parents })?;
             for &(_, i) in &pairs[start..end] {
-                let corners = tris[i].corners;
-                let apex = if corners[0] != a && corners[0] != b {
-                    corners[0]
-                } else if corners[1] != a && corners[1] != b {
-                    corners[1]
-                } else {
-                    corners[2]
-                };
+                let apex = apex_of(&tris[i].corners, a, b);
                 tris[i].corners = [a, m, apex];
                 push(
                     tris,
                     WorkTri {
                         id: None,
                         corners: [m, b, apex],
+                        alive: true,
                     },
                 )?;
             }
@@ -336,8 +349,411 @@ fn split_round(
     Ok(splits)
 }
 
+/// Collapses every short in-region interior edge once, merging its endpoints
+/// into one midpoint vertex. Edges created earlier in the same round are
+/// left alone so the pass cannot undo the split pass behind it. Returns the
+/// collapse count.
+fn collapse_round(
+    positions: &mut Vec<[f32; 3]>,
+    vlive: &mut Vec<bool>,
+    tris: &mut [WorkTri],
+    added: &mut Vec<NewVert>,
+    region: &Region,
+    sigma: f64,
+    fresh: usize,
+) -> Result<usize> {
+    let slots = positions.len() - added.len();
+    let pairs = snapshot_pairs(tris, vlive)?;
+    // Vertices touching the boundary (or a non-manifold edge) are locked:
+    // collapsing past them would reshape the boundary itself.
+    let mut locked: Vec<bool> = Vec::new();
+    reserve(&mut locked, vlive.len())?;
+    locked.extend(std::iter::repeat_n(false, vlive.len()));
+    let mut run = 0;
+    while run < pairs.len() {
+        let mut end = run + 1;
+        while end < pairs.len() && pairs[end].0 == pairs[run].0 {
+            end += 1;
+        }
+        if end - run != 2 {
+            locked[pairs[run].0.0 as usize] = true;
+            locked[pairs[run].0.1 as usize] = true;
+        }
+        run = end;
+    }
+    let mut collapses = 0;
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        while end < pairs.len() && pairs[end].0 == pairs[start].0 {
+            end += 1;
+        }
+        let (a, b) = pairs[start].0;
+        if end - start == 2
+            && (a as usize) < fresh
+            && (b as usize) < fresh
+            && vlive[a as usize]
+            && vlive[b as usize]
+            && !locked[a as usize]
+            && !locked[b as usize]
+        {
+            let mid = midpoint(&positions[a as usize], &positions[b as usize]);
+            let short = matches!(
+                dist(&positions[a as usize], &positions[b as usize])
+                    .partial_cmp(&(sigma * COLLAPSE_FACTOR)),
+                Some(Ordering::Less)
+            );
+            if in_region(&mid, region)
+                && short
+                && let Some(plan) = validate_collapse(positions, vlive, tris, a, b)?
+            {
+                let m = positions.len() as u32;
+                let parents = blend_parents(a, b, slots, added)?;
+                push(positions, plan.mid)?;
+                push(vlive, true)?;
+                push(
+                    added,
+                    NewVert {
+                        pos: plan.mid,
+                        parents,
+                    },
+                )?;
+                tris[plan.owners[0]].alive = false;
+                tris[plan.owners[1]].alive = false;
+                for i in plan.fan {
+                    tris[i].corners = tris[i]
+                        .corners
+                        .map(|v| if v == a || v == b { m } else { v });
+                }
+                vlive[a as usize] = false;
+                vlive[b as usize] = false;
+                collapses += 1;
+            }
+        }
+        start = end;
+    }
+    Ok(collapses)
+}
+
+/// A validated collapse: the two owners to remove and the fan to repoint.
+struct CollapsePlan {
+    owners: [usize; 2],
+    fan: Vec<usize>,
+    mid: [f32; 3],
+}
+
+/// Validates collapsing `(a, b)` against the current working state: exactly
+/// two owners, the link condition (no duplicate triangles after the merge),
+/// and no folded fan triangle.
+fn validate_collapse(
+    positions: &[[f32; 3]],
+    vlive: &[bool],
+    tris: &[WorkTri],
+    a: u32,
+    b: u32,
+) -> Result<Option<CollapsePlan>> {
+    let mut owners: Vec<usize> = Vec::new();
+    let mut fan: Vec<usize> = Vec::new();
+    let mut na: Vec<u32> = Vec::new();
+    let mut nb: Vec<u32> = Vec::new();
+    for (i, tri) in tris.iter().enumerate() {
+        if !tri.alive || degenerate(&tri.corners) {
+            continue;
+        }
+        let c = tri.corners;
+        if !vlive[c[0] as usize] || !vlive[c[1] as usize] || !vlive[c[2] as usize] {
+            continue;
+        }
+        let has_a = c.contains(&a);
+        let has_b = c.contains(&b);
+        if has_a && has_b {
+            push(&mut owners, i)?;
+        } else if has_a || has_b {
+            push(&mut fan, i)?;
+            let side = if has_a { &mut na } else { &mut nb };
+            for &v in &c {
+                if v != a && v != b {
+                    push(side, v)?;
+                }
+            }
+        }
+    }
+    if owners.len() != 2 {
+        return Ok(None);
+    }
+    let c = apex_of(&tris[owners[0]].corners, a, b);
+    let d = apex_of(&tris[owners[1]].corners, a, b);
+    push(&mut na, c)?;
+    push(&mut na, d)?;
+    push(&mut nb, c)?;
+    push(&mut nb, d)?;
+    na.sort_unstable();
+    na.dedup();
+    nb.sort_unstable();
+    nb.dedup();
+    let mut common: Vec<u32> = Vec::new();
+    for &v in &na {
+        if nb.binary_search(&v).is_ok() {
+            push(&mut common, v)?;
+        }
+    }
+    if common.as_slice() != [c.min(d), c.max(d)] {
+        return Ok(None);
+    }
+    let mid = midpoint(&positions[a as usize], &positions[b as usize]);
+    let m = f64v(&mid);
+    for &i in &fan {
+        let old = tris[i].corners;
+        let new = old.map(|v| {
+            if v == a || v == b {
+                m
+            } else {
+                f64v(&positions[v as usize])
+            }
+        });
+        let before = tri_normal(&old, positions);
+        let after = cross3(sub3(new[1], new[0]), sub3(new[2], new[0]));
+        if !matches!(
+            dot3(after, before).partial_cmp(&0.0),
+            Some(Ordering::Greater)
+        ) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(CollapsePlan {
+        owners: [owners[0], owners[1]],
+        fan,
+        mid,
+    }))
+}
+
+/// Flips every interior edge whose quad gains a larger minimum angle,
+/// provided the replacement edge stays within the split band so flips never
+/// re-arm the split pass. Returns the flip count.
+fn flip_round(
+    positions: &[[f32; 3]],
+    vlive: &[bool],
+    tris: &mut [WorkTri],
+    region: &Region,
+    sigma: f64,
+) -> Result<usize> {
+    let pairs = snapshot_pairs(tris, vlive)?;
+    let mut unique: Vec<(u32, u32)> = Vec::new();
+    reserve(&mut unique, pairs.len())?;
+    unique.extend(pairs.iter().map(|&(e, _)| e));
+    unique.dedup();
+    let mut created: Vec<(u32, u32)> = Vec::new();
+    let mut flips = 0;
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        while end < pairs.len() && pairs[end].0 == pairs[start].0 {
+            end += 1;
+        }
+        if end - start == 2 {
+            let (a, b) = pairs[start].0;
+            let mid = midpoint(&positions[a as usize], &positions[b as usize]);
+            let ctx = FlipCtx {
+                positions,
+                tris: &*tris,
+                vlive,
+                unique: &unique,
+                created: &created,
+                sigma,
+            };
+            if in_region(&mid, region)
+                && let Some(plan) = validate_flip(&ctx, a, b, pairs[start].1, pairs[start + 1].1)
+            {
+                tris[plan.owners[0]].corners = plan.new[0];
+                tris[plan.owners[1]].corners = plan.new[1];
+                push(&mut created, plan.created)?;
+                flips += 1;
+            }
+        }
+        start = end;
+    }
+    Ok(flips)
+}
+
+/// Shared inputs for [`validate_flip`].
+struct FlipCtx<'a> {
+    positions: &'a [[f32; 3]],
+    tris: &'a [WorkTri],
+    vlive: &'a [bool],
+    unique: &'a [(u32, u32)],
+    created: &'a [(u32, u32)],
+    sigma: f64,
+}
+
+/// A validated flip: the two owners and their replacement corners.
+struct FlipPlan {
+    owners: [usize; 2],
+    new: [[u32; 3]; 2],
+    created: (u32, u32),
+}
+
+/// Validates flipping `(a, b)` with owners `o1`/`o2` against the current
+/// working state: both owners intact, distinct apexes, no duplicate edge,
+/// a shorter-or-equal replacement, a strictly larger minimum angle, and no
+/// folded triangle.
+fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<FlipPlan> {
+    for &o in &[o1, o2] {
+        let t = &ctx.tris[o];
+        if !t.alive || degenerate(&t.corners) || !carries(&t.corners, a, b) {
+            return None;
+        }
+        if !ctx.vlive[t.corners[0] as usize]
+            || !ctx.vlive[t.corners[1] as usize]
+            || !ctx.vlive[t.corners[2] as usize]
+        {
+            return None;
+        }
+    }
+    let old1 = ctx.tris[o1].corners;
+    let old2 = ctx.tris[o2].corners;
+    let c = apex_of(&old1, a, b);
+    let d = apex_of(&old2, a, b);
+    if c == d {
+        return None;
+    }
+    let e = (c.min(d), c.max(d));
+    if ctx.unique.binary_search(&e).is_ok() || ctx.created.contains(&e) {
+        return None;
+    }
+    let replacement = dist(&ctx.positions[c as usize], &ctx.positions[d as usize]);
+    if !matches!(
+        replacement.partial_cmp(&(ctx.sigma * SPLIT_FACTOR)),
+        Some(Ordering::Less | Ordering::Equal)
+    ) {
+        return None;
+    }
+    let new1 = [c, d, a];
+    let new2 = [c, d, b];
+    let old_max = match (
+        max_cos_angle(&old1, ctx.positions),
+        max_cos_angle(&old2, ctx.positions),
+    ) {
+        (Some(x), Some(y)) => x.max(y),
+        _ => return None,
+    };
+    let new_max = match (
+        max_cos_angle(&new1, ctx.positions),
+        max_cos_angle(&new2, ctx.positions),
+    ) {
+        (Some(x), Some(y)) => x.max(y),
+        _ => return None,
+    };
+    if !matches!(new_max.partial_cmp(&old_max), Some(Ordering::Less)) {
+        return None;
+    }
+    let n1 = orient_like(&new1, &old1, ctx.positions)?;
+    let n2 = orient_like(&new2, &old2, ctx.positions)?;
+    Some(FlipPlan {
+        owners: [o1, o2],
+        new: [n1, n2],
+        created: e,
+    })
+}
+
+/// The `new` corners wound to face the same way as `old`, or `None` when
+/// neither winding faces it (a fold either way).
+fn orient_like(new: &[u32; 3], old: &[u32; 3], positions: &[[f32; 3]]) -> Option<[u32; 3]> {
+    let dot = dot3(tri_normal(new, positions), tri_normal(old, positions));
+    if dot > 0.0 {
+        Some(*new)
+    } else if dot < 0.0 {
+        Some([new[0], new[2], new[1]])
+    } else {
+        None
+    }
+}
+
+/// Every live triangle's edges with their owner index, sorted by edge.
+fn snapshot_pairs(tris: &[WorkTri], vlive: &[bool]) -> Result<Vec<((u32, u32), usize)>> {
+    let mut pairs: Vec<((u32, u32), usize)> = Vec::new();
+    reserve(&mut pairs, 3 * tris.len())?;
+    for (i, tri) in tris.iter().enumerate() {
+        if !tri.alive || degenerate(&tri.corners) {
+            continue;
+        }
+        let c = tri.corners;
+        if !vlive[c[0] as usize] || !vlive[c[1] as usize] || !vlive[c[2] as usize] {
+            continue;
+        }
+        for k in 0..3 {
+            let (a, b) = (c[k], c[(k + 1) % 3]);
+            push(&mut pairs, ((a.min(b), a.max(b)), i))?;
+        }
+    }
+    pairs.sort_unstable();
+    Ok(pairs)
+}
+
+fn degenerate(corners: &[u32; 3]) -> bool {
+    corners[0] == corners[1] || corners[1] == corners[2] || corners[2] == corners[0]
+}
+
 fn carries(corners: &[u32; 3], a: u32, b: u32) -> bool {
     corners.contains(&a) && corners.contains(&b)
+}
+
+/// The corner of a triangle carrying `(a, b)` that is neither endpoint.
+fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
+    if corners[0] != a && corners[0] != b {
+        corners[0]
+    } else if corners[1] != a && corners[1] != b {
+        corners[1]
+    } else {
+        corners[2]
+    }
+}
+
+fn f64v(p: &[f32; 3]) -> [f64; 3] {
+    [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn tri_normal(corners: &[u32; 3], positions: &[[f32; 3]]) -> [f64; 3] {
+    let p0 = f64v(&positions[corners[0] as usize]);
+    let p1 = f64v(&positions[corners[1] as usize]);
+    let p2 = f64v(&positions[corners[2] as usize]);
+    cross3(sub3(p1, p0), sub3(p2, p0))
+}
+
+/// The largest corner cosine of a triangle (its smallest angle, as a
+/// cosine), or `None` when an edge has zero length.
+fn max_cos_angle(corners: &[u32; 3], positions: &[[f32; 3]]) -> Option<f64> {
+    let p = [
+        f64v(&positions[corners[0] as usize]),
+        f64v(&positions[corners[1] as usize]),
+        f64v(&positions[corners[2] as usize]),
+    ];
+    let mut max = f64::NEG_INFINITY;
+    for k in 0..3 {
+        let u = sub3(p[k], p[(k + 1) % 3]);
+        let v = sub3(p[k], p[(k + 2) % 3]);
+        let (nu, nv) = (dot3(u, u).sqrt(), dot3(v, v).sqrt());
+        if nu == 0.0 || nv == 0.0 {
+            return None;
+        }
+        max = max.max(dot3(u, v) / (nu * nv));
+    }
+    Some(max)
 }
 
 /// Weights a midpoint over live base vertices. Endpoints created by earlier
@@ -366,19 +782,28 @@ fn blend_parents(a: u32, b: u32, slots: usize, added: &[NewVert]) -> Result<Vec<
     Ok(parents)
 }
 
-fn commit(tx: &mut Transaction, slots: usize, tris: &[WorkTri], added: &[NewVert]) -> Result<()> {
+fn commit(
+    tx: &mut Transaction,
+    slots: usize,
+    vlive: &[bool],
+    tris: &[WorkTri],
+    added: &[NewVert],
+) -> Result<()> {
     // Everything is reserved before the first write: past this point only
     // infallible pushes into reserved capacity remain, so any allocation
     // failure still leaves an empty patch.
     let mut n_old = 0;
     let mut n_new = 0;
+    let mut n_dead_tri = 0;
     for tri in tris {
-        if tri.id.is_some() {
-            n_old += 1;
-        } else {
-            n_new += 1;
+        match tri.id {
+            Some(_) if !tri.alive => n_dead_tri += 1,
+            Some(_) => n_old += 1,
+            None if tri.alive => n_new += 1,
+            None => {}
         }
     }
+    let n_dead_vert = vlive.iter().take(slots).filter(|&&live| !live).count();
     let mut ids: Vec<VertexId> = Vec::new();
     reserve(&mut ids, added.len())?;
     let mut set_ids: Vec<TriangleId> = Vec::new();
@@ -387,33 +812,56 @@ fn commit(tx: &mut Transaction, slots: usize, tris: &[WorkTri], added: &[NewVert
     reserve(&mut set_tris, n_old)?;
     let mut new_tris: Vec<[VertexId; 3]> = Vec::new();
     reserve(&mut new_tris, n_new)?;
-    for nv in added {
-        ids.push(tx.add_vertex_with_parents(nv.pos, &nv.parents)?);
+    let mut del_tris: Vec<TriangleId> = Vec::new();
+    reserve(&mut del_tris, n_dead_tri)?;
+    let mut del_verts: Vec<VertexId> = Vec::new();
+    reserve(&mut del_verts, n_dead_vert)?;
+    for (k, nv) in added.iter().enumerate() {
+        if vlive[slots + k] {
+            ids.push(tx.add_vertex_with_parents(nv.pos, &nv.parents)?);
+        } else {
+            // Collapsed before commit; no live triangle references it.
+            ids.push(VertexId::MAX);
+        }
     }
     let resolve = |v: u32| -> VertexId {
+        debug_assert!(vlive[v as usize]);
         let i = v as usize;
         if i < slots { v } else { ids[i - slots] }
     };
     let mesh = tx.mesh();
     for tri in tris {
-        let current = [
-            resolve(tri.corners[0]),
-            resolve(tri.corners[1]),
-            resolve(tri.corners[2]),
-        ];
         match tri.id {
+            Some(id) if !tri.alive => del_tris.push(id),
             Some(id) => {
+                let current = [
+                    resolve(tri.corners[0]),
+                    resolve(tri.corners[1]),
+                    resolve(tri.corners[2]),
+                ];
                 let original = mesh.triangle(id).expect("remesh: working id must exist");
                 if current != original {
                     set_ids.push(id);
                     set_tris.push(current);
                 }
             }
-            None => new_tris.push(current),
+            None if tri.alive => new_tris.push([
+                resolve(tri.corners[0]),
+                resolve(tri.corners[1]),
+                resolve(tri.corners[2]),
+            ]),
+            None => {}
+        }
+    }
+    for v in 0..slots as u32 {
+        if !vlive[v as usize] {
+            del_verts.push(v);
         }
     }
     tx.set_triangles(&set_ids, &set_tris)?;
     tx.add_triangles(&new_tris)?;
+    tx.remove_triangles(&del_tris)?;
+    tx.remove_vertices(&del_verts)?;
     Ok(())
 }
 
@@ -535,6 +983,137 @@ mod tests {
     fn split_sweep_keeps_atomicity() {
         let n = sweep(quad_4x1(), |tx: &mut Transaction| {
             remesh(tx, &all_region())?;
+            Ok(())
+        });
+        assert!(n > 0);
+    }
+
+    fn grid_4x4() -> Mesh {
+        let mut pos = Vec::new();
+        for j in 0..4 {
+            for i in 0..4 {
+                pos.extend([i as f32 * 0.1, j as f32 * 0.1, 0.0]);
+            }
+        }
+        let mut tris = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                let a = j * 4 + i;
+                tris.push([a, a + 1, a + 5]);
+                tris.push([a, a + 5, a + 4]);
+            }
+        }
+        mesh_of(&pos, &tris)
+    }
+
+    fn kite() -> Mesh {
+        mesh_of(
+            &[0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.15, 0.0, 1.0, 2.0, 0.0],
+            &[[0, 1, 2], [1, 0, 3]],
+        )
+    }
+
+    #[test]
+    fn collapse_coarsens_dense_interior() {
+        let mut mesh = grid_4x4();
+        let before = parts(&mesh);
+        let options = RemeshOptions::builder()
+            .center([0.15, 0.15, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(report.splits, 0);
+        assert!(report.collapses > 0, "expected collapses, got {report:?}");
+        let (_, tris_after) = parts(&mesh);
+        assert!(tris_after.len() < before.1.len());
+        for t in &tris_after {
+            assert!(
+                t[0] != t[1] && t[1] != t[2] && t[2] != t[0],
+                "degenerate: {t:?}"
+            );
+        }
+        for v in [0, 1, 2, 3, 4, 7, 8, 11, 12, 13, 14, 15] {
+            assert!(mesh.is_vertex_alive(v as VertexId));
+        }
+    }
+
+    #[test]
+    fn collapse_skips_all_boundary() {
+        let mut mesh = mesh_of(&[0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 3.0, 0.0], &[[0, 1, 2]]);
+        let before = parts(&mesh);
+        let options = RemeshOptions::builder()
+            .center([1.0, 1.0, 0.0])
+            .radius(10.0)
+            .target_length(10.0)
+            .build();
+        let (report, empty) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 0, 0)
+        );
+        assert!(empty);
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn flip_improves_skinny_kite() {
+        let mut mesh = kite();
+        let options = RemeshOptions::builder()
+            .center([1.0, 0.5, 0.0])
+            .radius(10.0)
+            .target_length(10.0)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 1, 1)
+        );
+        let (_, tris) = parts(&mesh);
+        assert!(
+            tris.iter().any(|t| t.contains(&2) && t.contains(&3)),
+            "flipped diagonal missing: {tris:?}"
+        );
+    }
+
+    #[test]
+    fn remesh_respects_max_rounds() {
+        let mut mesh = quad_4x1();
+        let before = parts(&mesh);
+        let options = RemeshOptions::builder()
+            .center([2.0, 0.5, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .max_rounds(0)
+            .build();
+        let (report, empty) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 0, 0)
+        );
+        assert!(empty);
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn collapse_and_flip_keep_atomicity() {
+        let grid_options = RemeshOptions::builder()
+            .center([0.15, 0.15, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .build();
+        let n = sweep(grid_4x4(), |tx: &mut Transaction| {
+            remesh(tx, &grid_options)?;
+            Ok(())
+        });
+        assert!(n > 0);
+        let kite_options = RemeshOptions::builder()
+            .center([1.0, 0.5, 0.0])
+            .radius(10.0)
+            .target_length(10.0)
+            .build();
+        let n = sweep(kite(), |tx: &mut Transaction| {
+            remesh(tx, &kite_options)?;
             Ok(())
         });
         assert!(n > 0);
