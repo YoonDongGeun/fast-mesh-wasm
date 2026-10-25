@@ -7,6 +7,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useState } from "react";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { GroupsBar } from "./panels/GroupsBar";
 import { HoverTip } from "./panels/HoverTip";
 import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
@@ -44,6 +45,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [dropping, setDropping] = useState(false);
 
   const focusOn = useCallback((mesh: MeshHandle) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1 })), []);
+  const brushPick = useApp(app, (s) => s.brushPick);
+  const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
+  const onPickPoint = useCallback(
+    (mesh: MeshHandle, point: readonly [number, number, number]) =>
+      app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
+    [app],
+  );
 
   const load = useCallback(
     (files: Iterable<File>) => {
@@ -80,7 +88,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
       } else if (key === "escape") {
-        select(null);
+        // A pick first (it never selects), then the selection.
+        if (app.getSnapshot().brushPick !== null) {
+          app.setBrushPick(null);
+        } else {
+          select(null);
+        }
       } else if (key === "t") {
         setMode("translate");
       } else if (key === "r") {
@@ -91,7 +104,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo, select, selection, focusOn]);
+  }, [undo, redo, select, selection, focusOn, app]);
 
   // ---- Drop files anywhere ----
   useEffect(() => {
@@ -130,6 +143,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     <div className="app">
       <aside className="sidebar sidebar-left">
         <MeshList app={app} onLoad={load} onFocus={focusOn} />
+        <GroupsBar app={app} />
       </aside>
       <main className="viewport">
         <Viewport
@@ -139,6 +153,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           edgeSoftness={edgeSoftness}
           hoverable={grouped}
           scene={engine.scene}
+          picking={picking}
+          onPickPoint={onPickPoint}
         />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
@@ -160,9 +176,11 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           </div>
         </div>
         <p className="hint">
-          {selection === null
-            ? "Click a mesh to select it · drag to orbit · scroll to zoom"
-            : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect"}
+          {picking !== null
+            ? "Click the mesh to set the brush center · Esc cancels"
+            : selection === null
+              ? "Click a mesh to select it · drag to orbit · scroll to zoom"
+              : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ or PLY files here</p> : null}
       </main>

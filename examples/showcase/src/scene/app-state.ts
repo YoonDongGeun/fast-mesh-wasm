@@ -9,6 +9,14 @@ import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
+import {
+  createGroup,
+  dropMember,
+  type NamedGroup,
+  removeGroup,
+  setColored,
+  toggleCheck,
+} from "../panels/groups";
 
 export interface Item {
   /** A React key. */
@@ -53,12 +61,28 @@ export interface GroupSetup {
   pairs: readonly (readonly [MeshHandle, MeshHandle])[] | "all";
 }
 
+/**
+ * A brush-center pick in flight: armed for `mesh` while `point` is `null`,
+ * landed once the viewport writes the local point. The repair panel consumes
+ * it (into its center inputs) and clears it.
+ */
+export interface BrushPick {
+  mesh: MeshHandle;
+  point: Vec3 | null;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
   collision: CollisionPair;
   collisionMode: CollisionMode;
   group: GroupSetup;
+  /** The meshes ticked in the list, in list order: the next named group's members. */
+  checks: readonly MeshHandle[];
+  /** The named mesh groups. */
+  meshGroups: readonly NamedGroup<MeshHandle>[];
+  /** The brush-center pick in flight, if any. */
+  brushPick: BrushPick | null;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -75,6 +99,9 @@ export class AppState {
     collision: { a: null, b: null },
     collisionMode: "pair",
     group: { members: [], pairs: "all" },
+    checks: [],
+    meshGroups: [],
+    brushPick: null,
     edgeSoftness: 0,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -84,6 +111,7 @@ export class AppState {
   readonly #listeners = new Set<() => void>();
   #nextItem = 0;
   #nextColor = 0;
+  #nextGroup = 1;
 
   getSnapshot = (): AppSnapshot => this.#snap;
 
@@ -143,6 +171,28 @@ export class AppState {
    * keep their remaining partners.
    */
   removeMesh(store: SceneStore, item: Item): void {
+    const detached = this.#detach(store, item);
+    store.removeMesh(item.mesh);
+    item.material.dispose();
+    this.#dropLists(item, detached);
+  }
+
+  /**
+   * Drops a mesh the engine already removed (a join's source): the same list
+   * cleanup as {@link removeMesh}, without the store call (which would report
+   * the missing mesh as an error).
+   */
+  dropItem(store: SceneStore, item: Item): void {
+    item.material.dispose();
+    this.#dropLists(item, this.#detach(store, item));
+  }
+
+  /**
+   * Unpicks a removed mesh from the collision pair (releasing the other
+   * mesh's colouring first, in the same tick) and the contact group. The
+   * store takes a removed mesh out of its groups itself.
+   */
+  #detach(store: SceneStore, item: Item): { collision: CollisionPair; group: GroupSetup } {
     let collision = this.#snap.collision;
     if (collision.a === item.mesh || collision.b === item.mesh) {
       const other = collision.a === item.mesh ? collision.b : collision.a;
@@ -152,13 +202,23 @@ export class AppState {
       collision = { a: collision.a === item.mesh ? null : collision.a, b: collision.b === item.mesh ? null : collision.b };
     }
     const { members, pairs } = this.#snap.group;
-    const group: GroupSetup = {
-      members: members.filter((m) => m !== item.mesh),
-      pairs: pairs === "all" ? "all" : pairs.filter(([a, b]) => a !== item.mesh && b !== item.mesh),
+    return {
+      collision,
+      group: {
+        members: members.filter((m) => m !== item.mesh),
+        pairs: pairs === "all" ? "all" : pairs.filter(([a, b]) => a !== item.mesh && b !== item.mesh),
+      },
     };
-    store.removeMesh(item.mesh);
-    item.material.dispose();
-    this.#set({ items: this.#snap.items.filter((i) => i !== item), collision, group });
+  }
+
+  #dropLists(item: Item, detached: { collision: CollisionPair; group: GroupSetup }): void {
+    this.#set({
+      items: this.#snap.items.filter((i) => i !== item),
+      collision: detached.collision,
+      group: detached.group,
+      checks: this.#snap.checks.filter((m) => m !== item.mesh),
+      meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
+    });
   }
 
   /** Picks the collision pair's `side` (by hand: no more defaults). */
@@ -185,6 +245,37 @@ export class AppState {
   /** Sets which group members are measured to each other: `"all"`, or the listed pairs. */
   setGroupPairs(pairs: GroupSetup["pairs"]): void {
     this.#set({ group: { ...this.#snap.group, pairs } });
+  }
+
+  /** Ticks (`on`) or unticks a mesh in the list, kept in list order. */
+  toggleCheck(mesh: MeshHandle, on: boolean): void {
+    const order = this.#snap.items.map((i) => i.mesh);
+    this.#set({ checks: toggleCheck(this.#snap.checks, order, mesh, on) });
+  }
+
+  /** Groups the ticked meshes under `name` (blank for `Group <n>`). Needs at least one tick. */
+  createGroup(name: string): void {
+    const members = this.#snap.checks;
+    if (members.length === 0) {
+      return;
+    }
+    const id = this.#nextGroup++;
+    this.#set({ meshGroups: createGroup(this.#snap.meshGroups, id, name, `Group ${id}`, members) });
+  }
+
+  /** Removes the named group `id` (its meshes stay). */
+  removeGroup(id: number): void {
+    this.#set({ meshGroups: removeGroup(this.#snap.meshGroups, id) });
+  }
+
+  /** Colours (`on`) or uncolours the named group `id` by its contacts. */
+  setGroupColored(id: number, on: boolean): void {
+    this.#set({ meshGroups: setColored(this.#snap.meshGroups, id, on) });
+  }
+
+  /** Arms, lands or clears (`null`) the brush-center pick. */
+  setBrushPick(pick: BrushPick | null): void {
+    this.#set({ brushPick: pick });
   }
 
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */

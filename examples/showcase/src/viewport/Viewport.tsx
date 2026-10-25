@@ -36,8 +36,12 @@ export function Viewport(props: {
   hoverable: boolean;
   /** The engine's scene, for the hover raycast. */
   scene: Scene | WorkerScene;
+  /** The mesh whose brush center is being picked, if the pick is armed. */
+  picking: MeshHandle | null;
+  /** A landed brush-center pick, in the mesh's local coordinates. */
+  onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
 }) {
-  const { items, mode, focus, edgeSoftness, hoverable, scene } = props;
+  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -73,23 +77,42 @@ export function Viewport(props: {
           edgeSoftness={edgeSoftness}
           onPick={select}
           onBind={onBind}
+          picking={picking === item.mesh}
+          onPickPoint={onPickPoint}
+          scene={scene}
         />
       ))}
       <Controls bound={selected} mode={mode} focus={focus} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
+      <PickCursor picking={picking !== null} />
     </Canvas>
   );
 }
 
-/** A mesh drawn with `<FastMesh>`: click to select it. */
+/** A crosshair while a brush-center pick is armed. */
+function PickCursor(props: { picking: boolean }) {
+  const gl = useThree((s) => s.gl);
+  useEffect(() => {
+    gl.domElement.style.cursor = props.picking ? "crosshair" : "";
+    return () => {
+      gl.domElement.style.cursor = "";
+    };
+  }, [gl, props.picking]);
+  return null;
+}
+
+/** A mesh drawn with `<FastMesh>`: click to select it, or to land an armed brush-center pick. */
 function MeshView(props: {
   item: Item;
   selected: boolean;
   edgeSoftness: number;
   onPick: (mesh: MeshHandle) => void;
   onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
+  picking: boolean;
+  onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
+  scene: Scene | WorkerScene;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind } = props;
+  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
@@ -100,9 +123,40 @@ function MeshView(props: {
       if (e.delta > 2) {
         return;
       }
-      onPick(item.mesh);
+      if (!picking) {
+        onPick(item.mesh);
+        return;
+      }
+      // A pick click never selects: raycast and interpolate the hit in the
+      // mesh's local positions, the frame the brush center is in. A hit on
+      // another mesh (or nothing) leaves the pick armed.
+      const { origin, direction } = e.ray;
+      void Promise.resolve()
+        .then(() => scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]))
+        .then((hit) => {
+          if (hit === null || hit.mesh !== item.mesh) {
+            return;
+          }
+          const corners = scene.views(hit.mesh).indices().subarray(3 * hit.triangle, 3 * hit.triangle + 3);
+          const positions = scene.views(hit.mesh).positions();
+          const [u, v, w] = hit.barycentric;
+          const at = (s: number): readonly [number, number, number] => [
+            positions[3 * s],
+            positions[3 * s + 1],
+            positions[3 * s + 2],
+          ];
+          const [a, b, c] = [at(corners[0]), at(corners[1]), at(corners[2])];
+          onPickPoint(item.mesh, [
+            u * a[0] + v * b[0] + w * c[0],
+            u * a[1] + v * b[1] + w * c[1],
+            u * a[2] + v * b[2] + w * c[2],
+          ]);
+        })
+        .catch(() => {
+          // Removed meanwhile: the pick stays armed.
+        });
     },
-    [item.mesh, onPick],
+    [item.mesh, onPick, picking, onPickPoint, scene],
   );
   return (
     <FastMesh

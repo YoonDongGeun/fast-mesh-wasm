@@ -182,8 +182,8 @@ describe("repair summaries", () => {
     expect(s.clean).toBe(false);
     // Holes are the closed loops, largest first; open chains are counted apart.
     expect(s.holes).toEqual([
-      { edges: 64, perimeter: 5 },
-      { edges: 4, perimeter: 0.4 },
+      { id: { minVertex: 0, len: 64, hash: 0n }, edges: 64, perimeter: 5 },
+      { id: { minVertex: 0, len: 4, hash: 0n }, edges: 4, perimeter: 0.4 },
     ]);
     expect(s.openChains).toBe(1);
     // Components largest first.

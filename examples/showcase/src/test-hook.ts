@@ -145,8 +145,25 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
       const [d, hit] = await Promise.all([engine.scene.meshDistance(ma, mb), engine.scene.intersects(ma, mb)]);
       return { gap: d === null ? null : d.distance, intersects: hit };
     },
-    /** The repair panel: the latest analysis (mesh name and summary), the latest report, the op running. */
-    repair: () => ({ ...inspect.repair }),
+    /**
+     * The repair panel: the latest analysis (mesh name and summary), the
+     * latest report, the op running. The holes' loop ids are dropped: their
+     * bigint hashes cannot cross the DevTools protocol.
+     */
+    repair: () => {
+      const r = inspect.repair;
+      const analysis =
+        r.analysis === null
+          ? null
+          : {
+              ...r.analysis,
+              summary: {
+                ...r.analysis.summary,
+                holes: r.analysis.summary.holes.map(({ edges, perimeter }) => ({ edges, perimeter })),
+              },
+            };
+      return { ...r, analysis };
+    },
     /** RGBA8 colours of the mesh's vertices that are drawn: how many are reddish (penetration), white, or blue-green (gap). */
     colorCounts: (name: string) => {
       const v = store.scene.views(find(name).mesh);
