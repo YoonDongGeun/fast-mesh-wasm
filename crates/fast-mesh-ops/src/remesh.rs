@@ -347,9 +347,7 @@ fn split_round(
                 // The children follow the parent's wound order around the
                 // edge; fixed-order children would flip every parent that
                 // winds b -> a.
-                let ab = (corners[0] == a && corners[1] == b)
-                    || (corners[1] == a && corners[2] == b)
-                    || (corners[2] == a && corners[0] == b);
+                let ab = runs_directed(&corners, a, b);
                 let (first, second) = if ab {
                     ([a, m, apex], [m, b, apex])
                 } else {
@@ -645,6 +643,20 @@ fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<
     if c == d {
         return None;
     }
+    // The new triangles follow the owners' wound order around the edge, so
+    // the new diagonal is used in opposite directions by construction: a
+    // normal-based guess (each triangle aligned to its old one) agrees on
+    // flat quads but sprays conflicts on curved ones. An edge the owners
+    // already use the same way cannot be fixed by flipping: leave it.
+    let ab1 = runs_directed(&old1, a, b);
+    if ab1 == runs_directed(&old2, a, b) {
+        return None;
+    }
+    let (new1, new2) = if ab1 {
+        ([c, a, d], [c, d, b])
+    } else {
+        ([c, d, a], [d, c, b])
+    };
     let e = (c.min(d), c.max(d));
     if ctx.unique.binary_search(&e).is_ok() || ctx.created.contains(&e) {
         return None;
@@ -656,8 +668,6 @@ fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<
     ) {
         return None;
     }
-    let new1 = [c, d, a];
-    let new2 = [c, d, b];
     // Area conservation: a valid flip retriangulates the same quad, so the
     // total area only shifts at second order in curvature, while nested or
     // overlapping new triangles inflate it by the double-covered part. 1%
@@ -688,26 +698,30 @@ fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<
     if !matches!(new_max.partial_cmp(&old_max), Some(Ordering::Less)) {
         return None;
     }
-    let n1 = orient_like(&new1, &old1, ctx.positions)?;
-    let n2 = orient_like(&new2, &old2, ctx.positions)?;
+    // The winding is exact by construction; the normals only reject folds.
+    if dot3(
+        tri_normal(&new1, ctx.positions),
+        tri_normal(&old1, ctx.positions),
+    ) <= 0.0
+        || dot3(
+            tri_normal(&new2, ctx.positions),
+            tri_normal(&old2, ctx.positions),
+        ) <= 0.0
+    {
+        return None;
+    }
     Some(FlipPlan {
         owners: [o1, o2],
-        new: [n1, n2],
+        new: [new1, new2],
         created: e,
     })
 }
 
-/// The `new` corners wound to face the same way as `old`, or `None` when
-/// neither winding faces it (a fold either way).
-fn orient_like(new: &[u32; 3], old: &[u32; 3], positions: &[[f32; 3]]) -> Option<[u32; 3]> {
-    let dot = dot3(tri_normal(new, positions), tri_normal(old, positions));
-    if dot > 0.0 {
-        Some(*new)
-    } else if dot < 0.0 {
-        Some([new[0], new[2], new[1]])
-    } else {
-        None
-    }
+/// Whether `corners` winds the edge `a -> b` (as opposed to `b -> a`).
+fn runs_directed(corners: &[u32; 3], a: u32, b: u32) -> bool {
+    (corners[0] == a && corners[1] == b)
+        || (corners[1] == a && corners[2] == b)
+        || (corners[2] == a && corners[0] == b)
 }
 
 /// Every live triangle's edges with their owner index, sorted by edge.
@@ -1248,6 +1262,135 @@ mod tests {
             .build();
         let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
         assert!(report.splits > 0, "expected splits, got {report:?}");
+    }
+
+    fn grid_10x10() -> Mesh {
+        let mut pos = Vec::new();
+        for j in 0..10 {
+            for i in 0..10 {
+                pos.extend([i as f32 * 0.2, j as f32 * 0.2, 0.0]);
+            }
+        }
+        let mut tris = Vec::new();
+        for j in 0..9 {
+            for i in 0..9 {
+                let a = j * 10 + i;
+                tris.push([a, a + 1, a + 11]);
+                tris.push([a, a + 11, a + 10]);
+            }
+        }
+        mesh_of(&pos, &tris)
+    }
+
+    #[test]
+    fn remesh_after_inflate_keeps_orientation() {
+        use crate::analyze::{AnalyzeOptions, analyze};
+        use crate::deform::{Falloff, InflateOptions, inflate};
+
+        let mut mesh = grid_10x10();
+        for _ in 0..4 {
+            edit(&mut mesh, |tx| {
+                inflate(
+                    tx,
+                    &InflateOptions::builder()
+                        .center([0.9, 0.9, 0.0])
+                        .radius(0.8)
+                        .falloff(Falloff::Smooth)
+                        .strength(0.2)
+                        .build(),
+                )
+                .map(drop)
+            });
+        }
+        let options = RemeshOptions::builder()
+            .center([0.9, 0.9, 0.0])
+            .radius(1.2)
+            .max_rounds(4)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(
+            report.splits > 0 && report.flips > 0,
+            "must exercise splits and flips, got {report:?}"
+        );
+        let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
+        assert_eq!(a.orientation_conflicts, 0);
+    }
+
+    #[test]
+    fn remesh_after_inflate_keeps_orientation_on_sphere() {
+        use crate::analyze::{AnalyzeOptions, analyze};
+        use crate::deform::{Falloff, InflateOptions, inflate};
+        use crate::test_util::uv_sphere;
+
+        let mut mesh = uv_sphere(24, 36, 1.0);
+        for _ in 0..6 {
+            edit(&mut mesh, |tx| {
+                inflate(
+                    tx,
+                    &InflateOptions::builder()
+                        .center([0.0, 0.0, 1.0])
+                        .radius(0.5)
+                        .falloff(Falloff::Smooth)
+                        .strength(0.1)
+                        .build(),
+                )
+                .map(drop)
+            });
+        }
+        let options = RemeshOptions::builder()
+            .center([0.0, 0.0, 1.0])
+            .radius(1.0)
+            .max_rounds(4)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(
+            report.splits > 0 && report.flips > 0,
+            "must exercise splits and flips, got {report:?}"
+        );
+        let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
+        assert_eq!(a.orientation_conflicts, 0);
+    }
+
+    #[test]
+    fn remesh_after_inflate_keeps_orientation_on_noisy_sphere() {
+        use crate::analyze::{AnalyzeOptions, analyze};
+        use crate::deform::{Falloff, InflateOptions, inflate};
+        use crate::test_util::{mesh_of, parts, uv_sphere};
+
+        // A blobby stand-in: deterministic high-frequency noise on a sphere.
+        let (pos, tris) = parts(&uv_sphere(24, 36, 1.0));
+        let noisy: Vec<f32> = pos
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| p + 0.02 * ((i as f32 * 12.9898).sin() + (i as f32 * 78.233).sin()))
+            .collect();
+        let mut mesh = mesh_of(&noisy, &tris);
+        for _ in 0..6 {
+            edit(&mut mesh, |tx| {
+                inflate(
+                    tx,
+                    &InflateOptions::builder()
+                        .center([0.0, 0.0, 1.0])
+                        .radius(0.5)
+                        .falloff(Falloff::Smooth)
+                        .strength(0.1)
+                        .build(),
+                )
+                .map(drop)
+            });
+        }
+        let options = RemeshOptions::builder()
+            .center([0.0, 0.0, 1.0])
+            .radius(1.0)
+            .max_rounds(4)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(
+            report.splits > 0 && report.flips > 0,
+            "must exercise splits and flips, got {report:?}"
+        );
+        let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
+        assert_eq!(a.orientation_conflicts, 0);
     }
 
     #[test]

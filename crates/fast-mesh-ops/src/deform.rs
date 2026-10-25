@@ -457,6 +457,160 @@ pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothRep
     Ok(report)
 }
 
+/// Options for [`grab`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GrabOptions {
+    /// The brush to apply.
+    pub brush: Brush,
+    /// The drag vector in local coordinates: each region vertex moves
+    /// `strength * falloff * direction`. Must be finite; a zero vector moves
+    /// nothing.
+    pub direction: [f32; 3],
+}
+
+impl GrabOptions {
+    /// A builder for [`GrabOptions`]: the default brush until set, no drag.
+    pub fn builder() -> GrabOptionsBuilder {
+        GrabOptionsBuilder::default()
+    }
+}
+
+/// A builder for [`GrabOptions`], see [`GrabOptions::builder`].
+#[derive(Debug, Clone, Default)]
+pub struct GrabOptionsBuilder {
+    options: GrabOptions,
+}
+
+impl GrabOptionsBuilder {
+    /// Center of the brush in local coordinates.
+    pub fn center(mut self, center: [f32; 3]) -> Self {
+        self.options.brush.center = center;
+        self
+    }
+
+    /// Radius of influence in local units.
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.options.brush.radius = radius;
+        self
+    }
+
+    /// How the effect fades with distance from the center.
+    pub fn falloff(mut self, falloff: Falloff) -> Self {
+        self.options.brush.falloff = falloff;
+        self
+    }
+
+    /// Displacement scale; the per-vertex offset is `strength * falloff *
+    /// direction`.
+    pub fn strength(mut self, strength: f32) -> Self {
+        self.options.brush.strength = strength;
+        self
+    }
+
+    /// The drag vector in local coordinates.
+    pub fn direction(mut self, direction: [f32; 3]) -> Self {
+        self.options.direction = direction;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> GrabOptions {
+        self.options
+    }
+}
+
+/// What [`grab`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GrabReport {
+    /// How many vertices moved (displacement above 0).
+    pub moved: usize,
+    /// The largest displacement applied, in local units; 0 when nothing
+    /// moved.
+    pub max_displacement: f32,
+}
+
+/// Drags the vertices under the brush along one vector.
+///
+/// - Region: every live vertex closer than `radius` to `center` (brute-force
+///   distance check), each displaced by `strength * falloff * direction`,
+///   where `falloff` is the [`Falloff`] weight of its normalized distance.
+///   Unlike [`inflate`], the direction is the caller's, not the normals'.
+/// - The move is written once, in a single `set_positions` call over the
+///   vertices whose displacement is above 0; an empty region, or a zero
+///   `direction`, writes nothing. History is untouched.
+///
+/// # Errors
+/// - [`OpsError::InvalidInput`] when the radius is not positive, or any brush
+///   number (center, radius, strength) or the direction is not finite.
+/// - [`OpsError::Store`] when memory runs out.
+///
+/// Nothing is written in any of these cases.
+pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
+    let brush = &options.brush;
+    if !brush.radius.is_finite() || brush.radius <= 0.0 {
+        return Err(OpsError::InvalidInput(
+            "grab brush radius must be positive and finite",
+        ));
+    }
+    if brush.center.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("grab brush center must be finite"));
+    }
+    if !brush.strength.is_finite() {
+        return Err(OpsError::InvalidInput("grab brush strength must be finite"));
+    }
+    if options.direction.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("grab direction must be finite"));
+    }
+    let mesh = tx.mesh();
+    let mut report = GrabReport::default();
+    if mesh.vertex_slots() == 0 {
+        return Ok(report);
+    }
+    let positions = mesh.positions();
+    let mut ids: Vec<VertexId> = Vec::new();
+    let mut moved_to: Vec<[f32; 3]> = Vec::new();
+    for (v, p) in positions.iter().enumerate() {
+        let v = v as VertexId;
+        if !mesh.is_vertex_alive(v) {
+            continue;
+        }
+        let dist = brush
+            .center
+            .iter()
+            .zip(p)
+            .map(|(c, p)| (p - c).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let t = dist / brush.radius;
+        if !t.is_finite() || t >= 1.0 {
+            continue;
+        }
+        let w = brush.strength * falloff_value(brush.falloff, t);
+        let displaced = [
+            p[0] + w * options.direction[0],
+            p[1] + w * options.direction[1],
+            p[2] + w * options.direction[2],
+        ];
+        let length = options
+            .direction
+            .iter()
+            .map(|d| (w * d).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        push(&mut ids, v)?;
+        push(&mut moved_to, displaced)?;
+        report.max_displacement = report.max_displacement.max(length);
+    }
+    report.moved = ids.len();
+    if !ids.is_empty() {
+        tx.set_positions(&ids, &moved_to)?;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use fast_mesh::compute_vertex_normals;
@@ -784,5 +938,147 @@ mod tests {
     fn smooth_out_of_memory_is_reported_and_writes_nothing() {
         let options = smooth_options([0.0; 3], 10.0, Falloff::Linear, 1.0, 1);
         assert!(sweep(centered_grid(), |tx| smooth(tx, &options).map(drop)) > 5);
+    }
+
+    fn grab_options(
+        center: [f32; 3],
+        radius: f32,
+        falloff: Falloff,
+        strength: f32,
+        direction: [f32; 3],
+    ) -> GrabOptions {
+        GrabOptions::builder()
+            .center(center)
+            .radius(radius)
+            .falloff(falloff)
+            .strength(strength)
+            .direction(direction)
+            .build()
+    }
+
+    #[test]
+    fn grab_moves_region_along_direction() {
+        let mut mesh = centered_grid();
+        let old = parts(&mesh).0;
+        let options = grab_options([0.0; 3], 10.0, Falloff::Linear, 1.0, [2.0, 0.0, 0.0]);
+        let (report, empty) = edit(&mut mesh, |tx| grab(tx, &options));
+        assert!(!empty);
+        assert_eq!(report.moved, 9);
+        assert!((report.max_displacement - 2.0).abs() < 1e-4);
+        let new = parts(&mesh).0;
+        for k in 0..3 {
+            let want = [2.0, 0.0, 0.0][k];
+            assert!(
+                (new[4 * 3 + k] - (old[4 * 3 + k] + want)).abs() < 1e-4,
+                "center follows strength * direction"
+            );
+        }
+        assert!(displacement(&old, &new, 0) < displacement(&old, &new, 4));
+    }
+
+    #[test]
+    fn grab_strength_scales_the_drag() {
+        let mut mesh = centered_grid();
+        let old = parts(&mesh).0;
+        let options = grab_options([0.0; 3], 10.0, Falloff::Linear, 0.5, [2.0, 0.0, 0.0]);
+        let (report, _) = edit(&mut mesh, |tx| grab(tx, &options));
+        assert_eq!(report.moved, 9);
+        let new = parts(&mesh).0;
+        assert!((new[4 * 3] - (old[4 * 3] + 1.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn grab_zero_direction_moves_nothing() {
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = grab_options([0.0; 3], 10.0, Falloff::Linear, 1.0, [0.0; 3]);
+        let mut tx = mesh.begin_edit();
+        let report = grab(&mut tx, &options).unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn grab_empty_region_moves_nothing() {
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = grab_options(
+            [100.0, 0.0, 0.0],
+            1.0,
+            Falloff::Linear,
+            1.0,
+            [2.0, 0.0, 0.0],
+        );
+        let mut tx = mesh.begin_edit();
+        let report = grab(&mut tx, &options).unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn grab_invalid_brush_rejected() {
+        let mut mesh = centered_grid();
+        let cases = [
+            grab_options([0.0; 3], 0.0, Falloff::Linear, 1.0, [1.0, 0.0, 0.0]),
+            grab_options([0.0; 3], -1.0, Falloff::Linear, 1.0, [1.0, 0.0, 0.0]),
+            grab_options([0.0; 3], f32::NAN, Falloff::Linear, 1.0, [1.0, 0.0, 0.0]),
+            grab_options([0.0; 3], 10.0, Falloff::Linear, f32::NAN, [1.0, 0.0, 0.0]),
+            grab_options(
+                [f32::INFINITY, 0.0, 0.0],
+                10.0,
+                Falloff::Linear,
+                1.0,
+                [1.0, 0.0, 0.0],
+            ),
+            grab_options([0.0; 3], 10.0, Falloff::Linear, 1.0, [f32::NAN, 0.0, 0.0]),
+            grab_options(
+                [0.0; 3],
+                10.0,
+                Falloff::Linear,
+                1.0,
+                [0.0, f32::INFINITY, 0.0],
+            ),
+        ];
+        for options in cases {
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                grab(&mut tx, &options),
+                Err(OpsError::InvalidInput(_))
+            ));
+            assert!(tx.commit().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn grab_empty_region_skips_temporaries() {
+        // No region member: no fallible reservation may run at all.
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = grab_options(
+            [100.0, 0.0, 0.0],
+            1.0,
+            Falloff::Linear,
+            1.0,
+            [2.0, 0.0, 0.0],
+        );
+        let mut tx = mesh.begin_edit();
+        fail_allocations_after(Some(0));
+        let report = grab(&mut tx, &options);
+        fail_allocations_after(None);
+        let report = report.unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn grab_out_of_memory_is_reported_and_writes_nothing() {
+        let options = grab_options([0.0; 3], 10.0, Falloff::Linear, 1.0, [2.0, 0.0, 0.0]);
+        assert!(sweep(centered_grid(), |tx| grab(tx, &options).map(drop)) > 5);
     }
 }

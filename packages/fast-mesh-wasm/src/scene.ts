@@ -531,6 +531,17 @@ export type RepairOp =
       loops: readonly [LoopId, LoopId];
       /** Maximum vertices per loop; unset means the default (128). */
       maxEdges?: number;
+    }
+  | {
+      op: "grab";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; the per-vertex offset is `strength * falloff * direction`. */
+      strength: number;
+      /** The drag vector in local coordinates; zero moves nothing. */
+      direction: Readonly<Vec3>;
     };
 
 /** What `weld` did. */
@@ -609,6 +620,12 @@ export interface BridgeReport {
   trianglesAdded: number;
 }
 
+/** What `grab` did. */
+export interface GrabReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -639,7 +656,8 @@ export type RepairReport =
   | InflateReport
   | SmoothReport
   | RemeshReport
-  | BridgeReport;
+  | BridgeReport
+  | GrabReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -660,7 +678,9 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                 ? RemeshReport
                 : O extends { op: "bridgeLoops" }
                   ? BridgeReport
-                  : RepairReport;
+                  : O extends { op: "grab" }
+                    ? GrabReport
+                    : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -819,6 +839,7 @@ const REPAIR_CODES = {
   smooth: 6,
   remesh: 7,
   bridgeLoops: 8,
+  grab: 9,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -942,6 +963,20 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         }
         break;
       }
+      case "grab": {
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+        );
+        const d = o.direction as readonly number[] | undefined;
+        if (d?.length !== 3 || ![d[0], d[1], d[2]].every(Number.isFinite)) {
+          throw invalid("direction must be 3 finite numbers");
+        }
+        values.push(d[0], d[1], d[2]);
+        break;
+      }
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -1032,6 +1067,8 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };
     case "bridgeLoops":
       return { trianglesAdded: r.next() };
+    case "grab":
+      return { moved: r.next(), maxDisplacement: r.next() };
   }
 }
 
