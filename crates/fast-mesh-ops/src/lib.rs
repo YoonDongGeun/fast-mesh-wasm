@@ -32,6 +32,7 @@
 
 mod analyze;
 mod cleanup;
+pub mod deform;
 mod error;
 mod fair;
 mod fill;
@@ -49,6 +50,7 @@ pub use cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
+pub use deform::{Brush, Falloff, InflateOptions, InflateOptionsBuilder, InflateReport, inflate};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
