@@ -571,7 +571,10 @@ fn bench_drag(
             let (scene, b, ids) = state.get_or_insert_with(|| {
                 let (mut scene, b) = field_scene(n, &placements[0], both, max_distance, range);
                 let ids: Vec<MeshId> = scene.ids().collect();
-                // Setup: what the poses recolour, and how long each takes.
+                // Setup: what the poses recolour, and how long each takes,
+                // from the second pose around to the first (the wrap from
+                // the last pose back to the first included).
+                scene.take_changes();
                 let (mut dirty, mut worst) = (0usize, 0usize);
                 let mut times = Vec::with_capacity(count);
                 for p in placements.iter().cycle().skip(1).take(count) {
@@ -579,10 +582,15 @@ fn bench_drag(
                     scene.set_placement(b, *p).unwrap();
                     scene.update_fields().unwrap();
                     times.push(t.elapsed().as_secs_f64() * 1e3);
-                    let d: usize = scene
-                        .take_changes()
+                    let changes = scene.take_changes();
+                    let d: usize = changes
                         .iter()
-                        .map(|c| c.colors_dirty.as_ref().map_or(0, Vec::len))
+                        .map(|c| {
+                            c.colors_dirty.as_ref().map_or(
+                                scene.mesh(c.id).map(|m| m.vertex_slots()).unwrap_or(0),
+                                Vec::len,
+                            )
+                        })
                         .sum();
                     (dirty, worst) = (dirty + d, worst.max(d));
                 }

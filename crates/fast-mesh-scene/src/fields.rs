@@ -120,15 +120,15 @@ impl DistanceField {
 
 /// The state of a field, from
 /// [`Scene::field_status`](crate::Scene::field_status).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FieldStatus {
     /// True when the values match the meshes and placements as they are now.
     pub current: bool,
     /// What the latest sign data builds found out about the meshes of `to`,
     /// together: `closed` and `consistent_orientation` when every target is,
-    /// the counts summed over the targets, and the first target's `mode`
-    /// (every target is built in the requested mode, so they share it unless
-    /// `Auto` resolved differently). See
+    /// the counts and the signed volume summed over the targets, and the
+    /// first target's `mode` (every target is built in the requested mode,
+    /// so they share it unless `Auto` resolved differently). See
     /// [`Scene::field_target_status`](crate::Scene::field_target_status) for
     /// each target.
     pub sign: SignStatus,
@@ -234,6 +234,10 @@ struct FieldJob {
     /// search (which usually costs the most) whose target's root box is
     /// within the margin of A's.
     work: usize,
+    /// A's near triangles from a shared pair query with the reciprocal
+    /// field (single-target, same `max_distance`, both needing a near set):
+    /// used instead of running a second query.
+    shared_near: Option<Vec<TriangleId>>,
 }
 
 impl FieldJob {
@@ -498,6 +502,7 @@ impl Field {
                 consistent_orientation: false,
                 non_manifold_vertices: 0,
                 degenerate_triangles: 0,
+                signed_volume: 0.0,
             },
             SignData::status,
         )
@@ -580,11 +585,11 @@ impl Scene {
     /// Lazy one is updated) and their sign data built here, so that
     /// [`Scene::field_status`] can report their topology at once.
     ///
-    /// Every edit of a target mesh rebuilds its sign data over the whole
-    /// mesh (O(n), about 150 ms at 1M triangles in pseudonormal mode, more
-    /// after a topology edit, which drops the cached adjacency); an
-    /// incremental refit is planned for Phase 5b. Placement changes and
-    /// edits of `desc.on` do not rebuild it.
+    /// A position-only edit of a target mesh refits its pseudonormal sign
+    /// data around the dirty vertices; any other edit rebuilds it over the
+    /// whole mesh (O(n), about 150 ms at 1M triangles, more after a topology
+    /// edit, which drops the cached adjacency). Placement changes and edits
+    /// of `desc.on` do not rebuild it.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `to` is
@@ -850,6 +855,7 @@ impl Scene {
             sign.consistent_orientation &= s.consistent_orientation;
             sign.non_manifold_vertices += s.non_manifold_vertices;
             sign.degenerate_triangles += s.degenerate_triangles;
+            sign.signed_volume += s.signed_volume;
         }
         Ok(FieldStatus {
             current: self.field_current(i),
@@ -934,6 +940,81 @@ impl Scene {
         Ok(e.coloring
             .as_ref()
             .map(|c| e.mesh.channel(&c.channel).unwrap_or(&[])))
+    }
+
+    /// The mesh's colouring, or `None` when the mesh has no colouring. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn coloring(&self, mesh: MeshId) -> Result<Option<&Coloring>> {
+        Ok(self.entry(mesh)?.coloring.as_ref().map(|c| &c.coloring))
+    }
+
+    /// The ids of the fields on `mesh`, in the order they were added. Never
+    /// updates.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn fields_on(&self, mesh: MeshId) -> Result<Vec<FieldId>> {
+        self.entry(mesh)?;
+        Ok(self
+            .fields
+            .iter()
+            .filter(|f| f.desc.on == mesh)
+            .map(|f| f.id)
+            .collect())
+    }
+
+    /// Changes a field's `max_distance` and sign mode, keeping its id, its
+    /// name, its meshes and any colouring by it. The field is recomputed in
+    /// full on its next update (at once for an Eager field); until then its
+    /// values are stale and [`Scene::field_status`] reports it as not
+    /// current, with placeholder sign data when the sign mode changed.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field;
+    /// [`SceneError::InvalidInput`] when `max_distance` is negative or NaN.
+    /// The scene is unchanged on error.
+    pub fn reconfigure_field(
+        &mut self,
+        id: FieldId,
+        max_distance: f64,
+        sign: SignMode,
+    ) -> Result<()> {
+        self.drop_field_unit();
+        if max_distance.is_nan() || max_distance < 0.0 {
+            return Err(SceneError::InvalidInput(
+                "max_distance must be zero or greater, and not NaN",
+            ));
+        }
+        let i = self.field_index(id)?;
+        {
+            let f = &mut self.fields[i];
+            if f.desc.max_distance == max_distance && f.desc.sign == sign {
+                return Ok(());
+            }
+            f.desc.max_distance = max_distance;
+            if f.desc.sign != sign {
+                f.desc.sign = sign;
+                for s in f.sign.iter_mut() {
+                    *s = None;
+                }
+                for b in f.sign_builds.iter_mut() {
+                    *b = None;
+                }
+            }
+            f.fresh = true;
+        }
+        let on = self.fields[i].desc.on;
+        let eager = self
+            .entry(on)
+            .map(|e| e.mode == UpdateMode::Eager)
+            .unwrap_or(false);
+        if eager {
+            let _ = self.update_field(i);
+        }
+        Ok(())
     }
 
     /// The id of the registered field with this [`FieldId::raw`] value, or
@@ -1596,6 +1677,7 @@ impl Scene {
                 Err(e) => outcomes.push(Err(e)),
             }
         }
+        self.share_pair_queries(&mut jobs)?;
         match self.compute_fields(&jobs) {
             Ok(plans) => {
                 for ((k, job), plan) in jobs.into_iter().zip(plans) {
@@ -1611,6 +1693,82 @@ impl Scene {
         outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
     }
 
+    /// Runs one pair query for each reciprocal pair of single-target fields
+    /// among `jobs` that both need a near set and share the same
+    /// `max_distance`, storing each side's near triangles in its job so that
+    /// [`Scene::pick_candidates`] runs no second query. With colouring on
+    /// both sides, A→B and B→A would otherwise each run `triangles_near`
+    /// and throw away the other half; one query roughly halves the
+    /// two-sided drag cost.
+    fn share_pair_queries(&self, jobs: &mut [(usize, FieldJob)]) -> Result<()> {
+        use std::collections::HashMap;
+        let mut groups: HashMap<(MeshId, MeshId), Vec<usize>> = HashMap::new();
+        for (j, (_, job)) in jobs.iter().enumerate() {
+            if job.full || job.shared_near.is_some() {
+                continue;
+            }
+            let f = &self.fields[job.i];
+            if f.desc.to.len() != 1 || job.near_margins.len() != 1 {
+                continue;
+            }
+            if job.near_margins[0].is_none() {
+                continue;
+            }
+            let (a, b) = (f.desc.on, f.desc.to[0]);
+            let key = if a < b { (a, b) } else { (b, a) };
+            groups.entry(key).or_default().push(j);
+        }
+        for js in groups.into_values() {
+            let mut used = vec![false; js.len()];
+            for (x, &jx) in js.iter().enumerate() {
+                if used[x] {
+                    continue;
+                }
+                let fx = &self.fields[jobs[jx].1.i];
+                for (y, &jy) in js.iter().enumerate().skip(x + 1) {
+                    if used[y] {
+                        continue;
+                    }
+                    let fy = &self.fields[jobs[jy].1.i];
+                    if fx.desc.on != fy.desc.to[0] || fx.desc.to[0] != fy.desc.on {
+                        continue;
+                    }
+                    if fx.desc.max_distance != fy.desc.max_distance {
+                        continue;
+                    }
+                    let (Some(m1), Some(m2)) =
+                        (jobs[jx].1.near_margins[0], jobs[jy].1.near_margins[0])
+                    else {
+                        continue;
+                    };
+                    let margin = m1.max(m2);
+                    let ea = self.entry(fx.desc.on)?;
+                    let eb = self.entry(fx.desc.to[0])?;
+                    let mut near_a = Vec::new();
+                    let mut near_b = Vec::new();
+                    fast_mesh_query::triangles_near(
+                        &ea.mesh,
+                        &ea.bvh,
+                        &eb.mesh,
+                        &eb.bvh,
+                        &jobs[jx].1.b_to_a[0],
+                        round_up(margin),
+                        &mut near_a,
+                        &mut near_b,
+                    )?;
+                    jobs[jx].1.shared_near = Some(near_a);
+                    jobs[jy].1.shared_near = Some(near_b);
+                    #[cfg(test)]
+                    counter::add_shared();
+                    used[x] = true;
+                    used[y] = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Brings what field `i` reads up to date, the part of an update that
     /// needs the meshes mutably: its BVHs (the targets' always, A's when a
     /// near set is needed) and the targets' sign data. Then decides what the
@@ -1624,14 +1782,30 @@ impl Scene {
                 .entries
                 .get_mut(f.desc.to[k])
                 .ok_or(SceneError::UnknownMesh)?;
-            if !f.sign[k]
+            if f.sign[k]
                 .as_ref()
                 .is_some_and(|s| s.is_current(&eb.mesh, &eb.bvh))
             {
+                f.sign_builds[k] = None;
+                continue;
+            }
+            // A position-only edit refits around the dirty vertices; anything
+            // else rebuilds over the whole mesh.
+            let id = f.id;
+            let refitted = match (&mut f.sign[k], eb.hook(id).and_then(|h| h.changes.as_ref())) {
+                (Some(s), Some(changes)) => s.try_refit(&eb.mesh, &eb.bvh, changes)?,
+                _ => false,
+            };
+            if !refitted {
+                let f = &mut self.fields[i];
+                let eb = self
+                    .entries
+                    .get_mut(f.desc.to[k])
+                    .ok_or(SceneError::UnknownMesh)?;
                 f.sign[k] = Some(SignData::build(&mut eb.mesh, &eb.bvh, mode)?);
             }
             // Current now: an unfinished build of it is of no use.
-            f.sign_builds[k] = None;
+            self.fields[i].sign_builds[k] = None;
         }
         Ok(job)
     }
@@ -1721,6 +1895,7 @@ impl Scene {
             b_to_a,
             near_limit: near_pair_limit(ma.vertex_slots()),
             work,
+            shared_near: None,
         })
     }
 
@@ -1760,6 +1935,11 @@ impl Scene {
         let ea = self.entry(f.desc.on)?;
         let ma = &ea.mesh;
 
+        // A shared pair query with the reciprocal field already found A's
+        // near triangles: no search here.
+        if let Some(shared) = &job.shared_near {
+            return self.assemble_pick(job, shared, job.full, false);
+        }
         // A's triangles near each moved target, as `Scene::triangles_near`
         // (with the BVHs `prepare_field` brought up to date), unless one
         // search finds too many pairs: then every vertex is recomputed.
@@ -2064,6 +2244,17 @@ pub(crate) mod counter {
         static ABORTED: Cell<usize> = const { Cell::new(0) };
         static FAILING: Cell<Option<super::FieldId>> = const { Cell::new(None) };
         static SIGN_STEPS: Cell<usize> = const { Cell::new(0) };
+        static SHARED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts one shared pair query between reciprocal fields.
+    pub(crate) fn add_shared() {
+        SHARED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Shared pair queries on this thread since the last call.
+    pub(crate) fn take_shared() -> usize {
+        SHARED.with(|c| c.replace(0))
     }
 
     /// Counts one step of a stepped sign data build.
@@ -2947,6 +3138,29 @@ mod tests {
         assert!(scene.field_values(g).unwrap().iter().all(|v| v.is_finite()));
     }
 
+    #[test]
+    fn reciprocal_fields_share_one_pair_query() {
+        // Two-sided colouring with the same max_distance: one shared pair
+        // query per pose, same values as separate queries.
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(sheet(20, 0.05), MeshOptions::default())
+            .unwrap();
+        let b = scene
+            .add_mesh(cube([0.2, 0.2, -0.05], 0.2), MeshOptions::default())
+            .unwrap();
+        let fa = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let fb = scene.add_distance_field(field("d", b, a, 0.1)).unwrap();
+        scene.update_fields().unwrap();
+        scene.take_changes();
+        counter::take_shared();
+        scene.set_placement(b, at(0.01, 0.005, 0.0)).unwrap();
+        scene.update_fields().unwrap();
+        assert_eq!(counter::take_shared(), 1);
+        assert_matches(&mut scene, fa);
+        assert_matches(&mut scene, fb);
+    }
+
     /// Six sheets of `n` x `n` cells in `mode`, stacked `gap` apart, with a
     /// field for every ordered pair (30, all within reach), each mesh
     /// coloured by its field to the next mesh by index.
@@ -3295,6 +3509,94 @@ mod tests {
         scene.set_coloring(a, None).unwrap();
         assert_eq!(scene.colors(a), Ok(None));
         assert_eq!(colors_dirty(&mut scene, a), None);
+    }
+
+    #[test]
+    fn late_subscriber_gets_full_colour_report() {
+        // A subscriber added after a colouring exists gets `colors_dirty:
+        // None` for the coloured mesh, so it knows to read every colour.
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        scene.take_changes();
+        let s = scene.subscribe();
+        let changes = scene.take_changes_for(s).unwrap();
+        let mine = changes.iter().find(|c| c.id == a).unwrap();
+        assert_eq!(mine.colors_dirty, None);
+        // An uncoloured mesh still starts clean.
+        assert!(changes.iter().find(|c| c.id == b).is_none());
+    }
+
+    #[test]
+    fn coloring_getter_and_field_list() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        assert_eq!(scene.coloring(a).unwrap(), None);
+        assert_eq!(scene.fields_on(a).unwrap(), vec![]);
+        let f1 = scene.add_distance_field(field("d1", a, b, 0.1)).unwrap();
+        let f2 = scene.add_distance_field(field("d2", a, b, 0.2)).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f1, f2]);
+        assert_eq!(scene.fields_on(b).unwrap(), vec![]);
+        let rule = contact_rule(0.1);
+        let coloring = Coloring {
+            field: f1,
+            rule: rule.clone(),
+        };
+        scene.set_coloring(a, Some(coloring.clone())).unwrap();
+        assert_eq!(scene.coloring(a).unwrap(), Some(&coloring));
+        scene.set_coloring(a, None).unwrap();
+        assert_eq!(scene.coloring(a).unwrap(), None);
+        scene.remove_field(f1).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f2]);
+    }
+
+    #[test]
+    fn reconfigure_field_keeps_id_and_colouring() {
+        let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let f = scene.add_distance_field(field("d", a, b, 0.1)).unwrap();
+        let rule = contact_rule(0.1);
+        scene
+            .set_coloring(
+                a,
+                Some(Coloring {
+                    field: f,
+                    rule: rule.clone(),
+                }),
+            )
+            .unwrap();
+        scene.take_changes();
+        let before = scene.field_values(f).unwrap().to_vec();
+        // Widening max_distance keeps the id and the colouring, and brings
+        // more vertices into range.
+        scene.reconfigure_field(f, 0.5, SignMode::Auto).unwrap();
+        assert_eq!(scene.fields_on(a).unwrap(), vec![f]);
+        assert!(scene.coloring(a).unwrap().is_some());
+        // Eager: recomputed at once.
+        assert!(scene.field_status(f).unwrap().current);
+        let after = scene.field_values(f).unwrap().to_vec();
+        assert_ne!(before, after);
+        let finite_before = before.iter().filter(|v| v.is_finite()).count();
+        let finite_after = after.iter().filter(|v| v.is_finite()).count();
+        assert!(finite_after >= finite_before);
+        // Invalid inputs are rejected and change nothing.
+        assert!(matches!(
+            scene.reconfigure_field(f, f64::NAN, SignMode::Auto),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(scene.field_status(f).unwrap().current);
+        // Same values: a no-op.
+        let values = scene.field_values(f).unwrap().to_vec();
+        scene.reconfigure_field(f, 0.5, SignMode::Auto).unwrap();
+        assert!(scene.field_status(f).unwrap().current);
+        assert_eq!(scene.field_values(f).unwrap(), &values[..]);
     }
 
     #[test]
