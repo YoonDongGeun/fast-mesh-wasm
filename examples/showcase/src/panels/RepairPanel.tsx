@@ -39,6 +39,21 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [minTriangles, setMinTriangles] = useState(500);
   const [maxEdges, setMaxEdges] = useState(DEFAULT_MAX_EDGES);
   const [fair, setFair] = useState(true);
+  const [center, setCenter] = useState<readonly [number, number, number]>([0, 0, 0]);
+  const [brushRadius, setBrushRadius] = useState(1);
+  const [strength, setStrength] = useState(1);
+  const [falloff, setFalloff] = useState<"linear" | "smooth">("smooth");
+  const [cycles, setCycles] = useState(3);
+  const [targetLength, setTargetLength] = useState("");
+  const [maxRounds, setMaxRounds] = useState("");
+  // The brush follows the mesh: its bounding center and a quarter of its
+  // half-diagonal. Strength and the rest are preferences and persist.
+  useEffect(() => {
+    if (item !== null) {
+      setCenter(item.center);
+      setBrushRadius(item.radius / 4);
+    }
+  }, [item]);
   const seq = useRef(0);
   // An op's own triangle change keeps its report; any other (undo, redo)
   // makes the report stale and clears it.
@@ -248,6 +263,135 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
+      </div>
+
+      <div className="ops">
+        <div className="op">
+          <span className="op-label">Brush</span>
+          <label className="field" title="Brush center in local mesh coordinates">
+            center
+            <input
+              type="number"
+              step="any"
+              aria-label="Brush center x"
+              value={center[0]}
+              onChange={(e) => setCenter([Number(e.currentTarget.value) || 0, center[1], center[2]])}
+            />
+            <input
+              type="number"
+              step="any"
+              aria-label="Brush center y"
+              value={center[1]}
+              onChange={(e) => setCenter([center[0], Number(e.currentTarget.value) || 0, center[2]])}
+            />
+            <input
+              type="number"
+              step="any"
+              aria-label="Brush center z"
+              value={center[2]}
+              onChange={(e) => setCenter([center[0], center[1], Number(e.currentTarget.value) || 0])}
+            />
+          </label>
+          <label className="field" title="Brush radius in mesh units">
+            radius
+            <input
+              type="number"
+              min={0}
+              step="any"
+              value={brushRadius}
+              onChange={(e) => setBrushRadius(Math.max(0, Number(e.currentTarget.value) || 0))}
+            />
+          </label>
+          <label className="field" title="Displacement scale (negative dents)">
+            strength
+            <input
+              type="number"
+              step="any"
+              value={strength}
+              onChange={(e) => setStrength(Number(e.currentTarget.value) || 0)}
+            />
+          </label>
+          <label className="field" title="How the strength falls off with distance">
+            falloff
+            <select value={falloff} onChange={(e) => setFalloff(e.currentTarget.value as "linear" | "smooth")}>
+              <option value="smooth">smooth</option>
+              <option value="linear">linear</option>
+            </select>
+          </label>
+        </div>
+        <div className="op">
+          <button
+            type="button"
+            data-repair-op="inflate"
+            disabled={disabled}
+            onClick={() =>
+              void run("Inflate", { op: "inflate", center, radius: brushRadius, falloff, strength })
+            }
+          >
+            Inflate
+          </button>
+          <button
+            type="button"
+            data-repair-op="smooth"
+            disabled={disabled}
+            onClick={() =>
+              void run("Smooth", { op: "smooth", center, radius: brushRadius, falloff, strength, cycles })
+            }
+          >
+            Smooth
+          </button>
+          <label className="field" title="Taubin smoothing cycles">
+            cycles
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={cycles}
+              onChange={(e) => setCycles(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+          </label>
+        </div>
+        <div className="op">
+          <button
+            type="button"
+            data-repair-op="remesh"
+            disabled={disabled}
+            onClick={() =>
+              void run("Remesh", {
+                op: "remesh",
+                center,
+                radius: brushRadius,
+                ...(targetLength === "" ? {} : { targetLength: Number(targetLength) }),
+                ...(maxRounds === "" ? {} : { maxRounds: Number(maxRounds) }),
+              })
+            }
+          >
+            Remesh
+          </button>
+          <label className="field" title="Target edge length (empty: the mesh mean)">
+            length
+            <input
+              type="number"
+              min={0}
+              step="any"
+              placeholder="auto"
+              value={targetLength}
+              onChange={(e) => setTargetLength(e.currentTarget.value)}
+            />
+          </label>
+          <label className="field" title="Split/collapse/flip rounds (empty: default)">
+            rounds
+            <input
+              type="number"
+              min={0}
+              step={1}
+              placeholder="auto"
+              value={maxRounds}
+              onChange={(e) => setMaxRounds(e.currentTarget.value)}
+            />
+          </label>
+        </div>
+        <p className="muted small">Deform: inflate puffs the brush up (negative dents), smooth relaxes it, remesh retriangulates it.</p>
       </div>
 
       {busy !== null ? (
