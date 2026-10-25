@@ -81,6 +81,14 @@ jobs:
         run: node --test scripts/bench-compare.test.mjs
       - name: Compare suites
         run: |
+          if [ ! -s bench-json/base-scene.json ] || [ ! -s bench-json/base-store.json ]; then
+            {
+              echo "## Bench deltas vs \`$BASELINE_TAG\`"
+              echo
+              echo "Deltas skipped: baseline \`$BASELINE_TAG\` predates bench JSON output, so no base numbers exist for comparison."
+            } > bench-json/body.md
+            exit 0
+          fi
           node scripts/bench-compare.mjs bench-json/base-scene.json bench-json/head-scene.json --out bench-json/scene.md
           node scripts/bench-compare.mjs bench-json/base-store.json bench-json/head-store.json --out bench-json/store.md
           {
