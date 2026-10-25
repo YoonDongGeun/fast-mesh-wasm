@@ -288,11 +288,10 @@ fn in_box(p: P2, lo: P2, hi: P2) -> bool {
 /// whose box is at least the best distance from it. The result is the exact
 /// minimum of the pairwise distances, not an approximation.
 ///
-/// Known limits: a segment of `b` is listed in every cell its bounding box
-/// overlaps, and a segment of `a` starts from every cell its box overlaps, so
-/// long segments spanning many cells make building and searching the grid
-/// slower (mesh sections have short segments). Coordinates beyond about
-/// `1e154` overflow the squared distances.
+/// Known limits: a segment of `a` starts from every cell its box overlaps,
+/// so a very long one still visits many cells on its first ring (mesh
+/// sections have short segments). Coordinates beyond about `1e154` overflow
+/// the squared distances.
 ///
 /// # Errors
 /// - [`QueryError::InvalidInput`] when a point is not finite.
@@ -421,8 +420,10 @@ fn closest_on(p: P2, a: P2, b: P2) -> P2 {
     }
 }
 
-/// A uniform grid over segments: each segment is listed in every cell its
-/// bounding box overlaps, so that it lies within the union of its cells.
+/// A uniform grid over segments: each segment is listed in the cells it
+/// passes through (see [`Grid::visit_cells`]), so every point of a segment
+/// is in one of its cells or next to one, which the search's one-cell slack
+/// allows for.
 struct Grid {
     lo: P2,
     hi: P2,
@@ -479,15 +480,15 @@ impl Grid {
         let cells = nx * ny;
         reserve(&mut grid.start, cells + 1)?;
         grid.start.resize(cells + 1, 0);
+        let (lo, size) = (grid.lo, grid.size);
         let mut total = 0usize;
         for s in segs {
-            let [x0, x1, y0, y1] = grid.cells_of(s);
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    grid.start[x + y * nx + 1] += 1;
-                }
-            }
-            total = total.saturating_add((x1 - x0 + 1) * (y1 - y0 + 1));
+            let mut count = 0;
+            Grid::visit_cells(lo, size, nx, ny, s, |c| {
+                grid.start[c + 1] += 1;
+                count += 1;
+            });
+            total = total.saturating_add(count);
         }
         for c in 0..cells {
             grid.start[c + 1] += grid.start[c];
@@ -498,15 +499,12 @@ impl Grid {
         let mut end = Vec::new();
         reserve(&mut end, cells)?;
         end.extend_from_slice(&grid.start[1..]);
+        let items = &mut grid.items;
         for (j, s) in segs.iter().enumerate() {
-            let [x0, x1, y0, y1] = grid.cells_of(s);
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    let c = x + y * nx;
-                    end[c] -= 1;
-                    grid.items[end[c]] = j;
-                }
-            }
+            Grid::visit_cells(lo, size, nx, ny, s, |c| {
+                end[c] -= 1;
+                items[end[c]] = j;
+            });
         }
         Ok(grid)
     }
@@ -518,17 +516,52 @@ impl Grid {
         ((x - self.lo[k]) / self.size[k]).floor().clamp(-1.0, n) as i64
     }
 
-    /// The range of grid cells `[x0, x1, y0, y1]` that the box of a segment
-    /// of the grid overlaps.
-    fn cells_of(&self, s: &Seg) -> [usize; 4] {
-        let (lo, hi) = bounds(s);
-        let clamp = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
-        [
-            clamp(self.coord(lo[0], 0), self.nx),
-            clamp(self.coord(hi[0], 0), self.nx),
-            clamp(self.coord(lo[1], 1), self.ny),
-            clamp(self.coord(hi[1], 1), self.ny),
-        ]
+    /// Calls `f` with every cell the segment `s` passes through, from its
+    /// start to its end (Amanatides & Woo's grid traversal), so that a long
+    /// diagonal costs cells along its length rather than its box. Each step
+    /// moves one cell towards the end cell, so every cell comes up once and
+    /// the walk ends after at most `nx + ny` steps, whatever the rounding;
+    /// a step lands at most one cell from the segment, which the search's
+    /// one-cell slack allows for.
+    fn visit_cells(lo: P2, size: P2, nx: usize, ny: usize, s: &Seg, mut f: impl FnMut(usize)) {
+        let coord = |p: f64, k: usize| {
+            let n = [nx, ny][k] as f64;
+            (((p - lo[k]) / size[k]).floor().clamp(-1.0, n) as i64).clamp(0, [nx, ny][k] as i64 - 1)
+        };
+        let g = |p: f64, k: usize| (p - lo[k]) / size[k];
+        let [mut x, mut y] = [coord(s[0][0], 0), coord(s[0][1], 1)];
+        let [ex, ey] = [coord(s[1][0], 0), coord(s[1][1], 1)];
+        let (dx, dy) = (g(s[1][0], 0) - g(s[0][0], 0), g(s[1][1], 1) - g(s[0][1], 1));
+        let (sx, sy) = ((ex - x).signum(), (ey - y).signum());
+        // The fraction of the segment to the first grid line along each
+        // axis, and per cell after that (`inf` past an axis already at the
+        // end, which then never steps).
+        let t_max = |d: f64, c: i64, e: i64, g0: f64| {
+            if e == c {
+                (f64::INFINITY, f64::INFINITY)
+            } else if e > c {
+                ((c as f64 + 1.0 - g0) / d, 1.0 / d)
+            } else {
+                ((g0 - c as f64) / -d, -1.0 / d)
+            }
+        };
+        let (mut t_max_x, t_delta_x) = t_max(dx, x, ex, g(s[0][0], 0));
+        let (mut t_max_y, t_delta_y) = t_max(dy, y, ey, g(s[0][1], 1));
+        loop {
+            f((x + y * nx as i64) as usize);
+            if x == ex && y == ey {
+                break;
+            }
+            // Step the nearer grid line; ties step `x` first, visiting the
+            // corner's neighbour too. An axis at the end never steps.
+            if x != ex && (y == ey || t_max_x <= t_max_y) {
+                x += sx;
+                t_max_x += t_delta_x;
+            } else {
+                y += sy;
+                t_max_y += t_delta_y;
+            }
+        }
     }
 
     /// Tests `s` against the grid's segments that could be closer than
@@ -801,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn fill_hole_touching_outer_contour() {
+        // A hole with an edge on the outer's edge (starting on it), and
+        // one touching at a single apex: both still nest as holes and
+        // fill outer minus hole.
+        let outer = square([0.0, 0.0], 2.0, true);
+        let flush = [[-2.0, 1.0], [-1.0, 1.0], [-1.0, 0.0], [-2.0, 0.0]];
+        let apex = [[-1.0, -1.0], [1.0, -1.0], [0.0, -2.0]];
+        for hole in [&flush[..], &apex[..]] {
+            let mut out = Fill::default();
+            assert_eq!(fill(&[(&outer, true), (hole, true)], &mut out), Ok(true));
+            let area = fill_area(&out);
+            assert!((area - 15.0).abs() < 1e-9, "{area}");
+        }
+    }
+
+    #[test]
     fn fill_orphan_hole_and_reused_output() {
         // A clockwise contour inside no outer is not filled, so the area check
         // fails (and only that outer is filled).
@@ -923,6 +972,41 @@ mod tests {
             // A few rings per segment, against about `n` each before.
             assert!(rings < 8 * n, "{rings}");
         }
+    }
+
+    #[test]
+    fn gap_long_diagonal_lists_cells_along_its_length() {
+        // 4096 short segments on a grid, plus one diagonal across it all:
+        // listing the diagonal in every cell its box overlaps fills the
+        // whole grid, while binning it along its length visits one row of
+        // cells.
+        let mut segs = Vec::new();
+        for i in 0..4096 {
+            let (x, y) = (f64::from(i % 64) + 0.5, f64::from(i / 64) + 0.5);
+            segs.push([[x, y], [x + 0.01, y]]);
+        }
+        segs.push([[0.0, 0.0], [63.0, 63.0]]);
+        let grid = Grid::build(&segs).unwrap();
+        assert!((grid.nx * grid.ny) >= 4096, "{}x{}", grid.nx, grid.ny);
+        let listed = grid.items.iter().filter(|&&j| j == 4096).count();
+        assert!(listed < 512, "{listed}");
+        // And the gap through the grid is still right.
+        let b: Vec<_> = segs.iter().map(|s| (s.to_vec(), false)).collect();
+        let rb: Vec<_> = b.iter().map(|(l, c)| (l.as_slice(), *c)).collect();
+        let far = [[200.0, 200.0], [201.0, 200.0]];
+        let g = contour_gap(&[(&far[..], false)], &rb).unwrap().unwrap();
+        // Nearest: the end (63.51, 63.5) of the corner short segment.
+        assert!(
+            (g.distance - (200.0f64 - 63.51).hypot(200.0 - 63.5)).abs() < 1e-9,
+            "{g:?}"
+        );
+        let brute = brute_gap(&[(&far[..], false)], &rb).unwrap();
+        assert!((g.distance - brute).abs() <= 1e-12);
+        // A long query segment crossing the grid agrees with brute force.
+        let query = [[-50.0, 70.0], [50.0, -10.0]];
+        let g = contour_gap(&[(&query[..], false)], &rb).unwrap().unwrap();
+        let brute = brute_gap(&[(&query[..], false)], &rb).unwrap();
+        assert!((g.distance - brute).abs() <= 1e-12);
     }
 
     #[test]

@@ -216,6 +216,13 @@ fn intersects(p1: &Node, q1: &Node, p2: &Node, q2: &Node) -> bool {
         || (o4 == 0 && on_segment(p2, q1, q2))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of twists removed by
+    /// [`Earcut::cure_local_intersections`] on this thread.
+    static CURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The ring under construction and the triangles found so far.
 ///
 /// Removed nodes stay in `nodes`, unlinked. Every loop below either removes
@@ -656,6 +663,8 @@ impl Earcut<'_> {
                 && self.locally_inside(a, b)
                 && self.locally_inside(b, a)
             {
+                #[cfg(test)]
+                CURES.with(|c| c.set(c.get() + 1));
                 self.emit(a, p, b);
                 self.remove(p);
                 self.remove(pn);
@@ -1097,6 +1106,25 @@ mod tests {
             (-4i32..=4, -4i32..=4).prop_map(|(x, y)| [f64::from(x), f64::from(y)]),
             0..=max,
         )
+    }
+
+    #[test]
+    fn cure_path_repairs_self_touching_ring() {
+        // Two triangles sharing only (0, 0), crossed at (-1, 1/2): no ear
+        // exists until the cure cuts the twist, and then both lobes fill.
+        let ring = [
+            [0.0, 0.0],
+            [-2.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [-2.0, 1.0],
+        ];
+        CURES.with(|c| c.set(0));
+        let (tris, area) = fill(&ring, &[]);
+        assert!(CURES.with(|c| c.get()) > 0);
+        assert!((area - 2.5).abs() < 1e-12, "area {area}");
+        assert_eq!(tris.len(), 2);
     }
 
     proptest! {

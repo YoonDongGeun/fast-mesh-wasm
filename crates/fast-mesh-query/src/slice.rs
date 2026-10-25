@@ -855,6 +855,43 @@ mod tests {
     }
 
     #[test]
+    fn collinear_sliver_with_distinct_ids_crossing_plane() {
+        // A box plus one zero-area triangle: three distinct, collinear
+        // vertices straddling the plane. The sliver's two crossings are
+        // both where its line meets the plane, so it forms its own open
+        // chain of two near-coincident points, leaving the box loop
+        // exactly as cut without it.
+        let flat = box_mesh([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        let n = flat.positions().len() as u32;
+        let positions: Vec<f32> = flat
+            .positions()
+            .iter()
+            .flatten()
+            .copied()
+            .chain([2.0, 0.0, -1.0, 2.0, 0.0, 0.5, 2.0, 0.0, 1.0])
+            .collect();
+        let mut indices: Vec<u32> = flat.triangles().iter().flatten().copied().collect();
+        indices.extend([n, n + 1, n + 2]);
+        let mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+        let plane = Plane::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        let out = cut(&mesh, &plane);
+        assert_eq!(out.contours.len(), 2);
+        let bare = cut(&flat, &plane);
+        assert_eq!(bare.contours.len(), 1);
+        let closed = out.contours.iter().find(|c| c.closed).unwrap();
+        assert_eq!(closed, &bare.contours[0]);
+        let sliver = out.contours.iter().find(|c| !c.closed).unwrap();
+        assert_eq!(sliver.triangles, [flat.triangle_slots() as TriangleId]);
+        assert_eq!(sliver.points.len(), 2);
+        for p in &sliver.points {
+            assert!(
+                (p[0] - 2.0).abs() < 1e-9 && p[1].abs() < 1e-9 && p[2].abs() < 1e-9,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
     fn flipped_patch_reports_unoriented() {
         let sphere = uv_sphere(16, 32, 1.0);
         let plane = Plane::new([0.0, 0.0, 0.3], [0.0, 0.0, 1.0]).unwrap();

@@ -362,6 +362,9 @@ pub struct Scene {
     /// Test-only count of section entry recomputes.
     #[cfg(test)]
     pub(crate) section_recomputes: usize,
+    /// Test-only count of merged-change plane reachability re-checks.
+    #[cfg(test)]
+    pub(crate) section_reach_checks: usize,
 }
 
 // Every public `&mut self` method of `Scene`, in this file and the others,
@@ -389,6 +392,8 @@ impl Scene {
             order_closest: Vec::new(),
             #[cfg(test)]
             section_recomputes: 0,
+            #[cfg(test)]
+            section_reach_checks: 0,
         }
     }
 

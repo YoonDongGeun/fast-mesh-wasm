@@ -168,6 +168,11 @@ pub(crate) struct SectionHook {
     /// Merged changes; `None` means "everything".
     pub(crate) changes: Option<ChangeSet>,
     pub(crate) placement_changed: bool,
+    /// Whether the merged `changes` are already known to reach the plane
+    /// (see [`reaches_plane`]). Later edits skip the re-check, so a long
+    /// sculpt session without update does not cost quadratic time; merging
+    /// more changes keeps it set, and only a reset clears it.
+    pub(crate) reaches: bool,
 }
 
 impl SectionHook {
@@ -176,6 +181,7 @@ impl SectionHook {
             section,
             changes: Some(ChangeSet::default()),
             placement_changed: false,
+            reaches: false,
         }
     }
 
@@ -188,6 +194,9 @@ impl SectionHook {
 struct SectionEntry {
     mesh: MeshId,
     result: SectionResult,
+    /// How many times the result has changed (see
+    /// [`Scene::section_revision`]).
+    revision: u64,
     /// The plane or fill changed, or the mesh was just selected.
     stale: bool,
     computed_once: bool,
@@ -204,6 +213,7 @@ impl SectionEntry {
         SectionEntry {
             mesh,
             result: SectionResult::default(),
+            revision: 0,
             stale: true,
             computed_once: false,
             crossed_vertices: Vec::new(),
@@ -639,6 +649,19 @@ impl Scene {
         Ok(self.sections[i].entries[k].plane)
     }
 
+    /// How many times the section's result for `mesh` has changed: 0 before
+    /// its first computation, then up by one per computation whose result
+    /// differs (a recompute with an identical result leaves it alone).
+    /// Bindings cache per-result data (like GPU buffers) against it instead
+    /// of draining a subscriber. Never updates.
+    ///
+    /// # Errors
+    /// As for [`Scene::section`].
+    pub fn section_revision(&self, id: SectionId, mesh: MeshId) -> Result<u64> {
+        let (i, k) = self.section_entry(id, mesh)?;
+        Ok(self.sections[i].entries[k].revision)
+    }
+
     /// The closest pair between the contours of meshes `a` and `b` in the
     /// section, measured in the plane, with its points in the world; `None`
     /// when either has no contour segments. Never updates: it reads the last
@@ -752,7 +775,7 @@ impl Scene {
         let Some(h) = section_hooks.iter_mut().find(|h| h.section == s.id) else {
             return false;
         };
-        if h.placement_changed {
+        if h.placement_changed || h.reaches {
             return false;
         }
         let Some(c) = &h.changes else {
@@ -764,7 +787,12 @@ impl Scene {
             let Ok(plane) = local_plane(placement, mesh.origin(), &s.desc.plane) else {
                 return false;
             };
+            #[cfg(test)]
+            {
+                self.section_reach_checks += 1;
+            }
             if reaches_plane(mesh, &plane, c, se) {
+                h.reaches = true;
                 return false;
             }
         }
@@ -945,6 +973,9 @@ impl Scene {
         let id = s.id;
         let se = &mut s.entries[k];
         let changed = !se.computed_once || se.result != c.result;
+        if changed {
+            se.revision += 1;
+        }
         se.result = c.result;
         se.crossed_vertices = c.crossed_vertices;
         se.crossed_triangles = c.crossed_triangles;
@@ -1852,6 +1883,43 @@ mod tests {
     }
 
     #[test]
+    fn reaches_flag_skips_repeated_plane_checks() {
+        // A long sculpt session without update: every edit re-checks the
+        // whole merged change set, so the re-checks cost quadratic time.
+        // Moving a different crossed vertex per edit grows the merged set
+        // every time; the first edit finds it reaches the plane and the
+        // rest remember it. Eager entries recompute (and reset) per edit,
+        // so each of their fresh sets is re-checked.
+        for mode in [UpdateMode::Eager, UpdateMode::Lazy, UpdateMode::Manual] {
+            let (mut scene, m, id) = fine_sphere_cut(mode);
+            let (cv, _) = crossed(&scene, id);
+            scene.section_reach_checks = 0;
+            for (k, &v) in cv.iter().take(10).enumerate() {
+                nudge(&mut scene, m, v, [0.0, 0.0, 0.001 * (k as f32 + 1.0)]);
+                let expect = if mode == UpdateMode::Eager {
+                    SectionStatus::Current
+                } else {
+                    SectionStatus::Stale
+                };
+                assert_eq!(scene.section_status(id, m), Ok(expect), "{mode:?}");
+            }
+            let expect = if mode == UpdateMode::Eager { 10 } else { 1 };
+            assert_eq!(scene.section_reach_checks, expect, "{mode:?}");
+            if mode == UpdateMode::Manual {
+                scene.update(m).unwrap();
+            } else {
+                scene.update_sections().unwrap();
+            }
+            assert_eq!(
+                scene.section_status(id, m),
+                Ok(SectionStatus::Current),
+                "{mode:?}"
+            );
+            assert_fresh(&mut scene, id, m, &format!("{mode:?} sculpt"));
+        }
+    }
+
+    #[test]
     fn gap_needs_two_meshes_and_one_plane() {
         let mut scene = Scene::new(SceneOptions::default());
         let a = scene
@@ -1878,6 +1946,41 @@ mod tests {
         scene.update_sections().unwrap();
         let g = scene.section_gap(id, a, b).unwrap().unwrap();
         assert!((g.a[2] - 0.1).abs() < 1e-9 && (g.b[2] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gap_survives_fill_toggle_with_mixed_entries() {
+        // A fill toggle restales every entry but changes no plane: with `a`
+        // (Eager) recomputed and `b` (Lazy) still on its last result, the
+        // computed-with planes are still equal and the gap still defined.
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        let opts = MeshOptions {
+            placement: at(3.0, 0.0, 0.0),
+            mode: UpdateMode::Lazy,
+            ..MeshOptions::default()
+        };
+        let b = scene.add_mesh(unit_sphere(), opts).unwrap();
+        let id = scene
+            .add_section(desc(z_plane(0.0), &[a, b], false))
+            .unwrap();
+        scene.update_sections().unwrap();
+        let before = scene.section_gap(id, a, b).unwrap().unwrap();
+        scene.set_section_fill(id, true).unwrap();
+        assert_eq!(scene.section_status(id, a), Ok(SectionStatus::Current));
+        assert_eq!(scene.section_status(id, b), Ok(SectionStatus::Stale));
+        assert!(scene.section(id, a).unwrap().fill.is_some());
+        assert!(scene.section(id, b).unwrap().fill.is_none());
+        assert_eq!(scene.section_plane(id, a), scene.section_plane(id, b));
+        assert_eq!(scene.section_gap(id, a, b), Ok(Some(before)));
+        scene.update_sections().unwrap();
+        assert!(scene.section(id, b).unwrap().fill.is_some());
+        assert_eq!(
+            scene.section_gap(id, a, b).unwrap().unwrap().distance,
+            before.distance
+        );
     }
 
     #[test]
@@ -1913,6 +2016,53 @@ mod tests {
         ));
         scene.remove_section(id).unwrap();
         assert_eq!(scene.section_plane(id, a), Err(SceneError::UnknownSection));
+    }
+
+    #[test]
+    fn section_revision_counts_result_changes() {
+        let (mut scene, m) = one_sphere(UpdateMode::Lazy);
+        let id = scene.add_section(desc(z_plane(0.3), &[m], false)).unwrap();
+        // Never computed: revision 0.
+        assert_eq!(scene.section_revision(id, m), Ok(0));
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_revision(id, m), Ok(1));
+        // A far edit settles without recompute: unchanged.
+        let n = scene.section_recomputes;
+        nudge(&mut scene, m, 0, [0.0, 0.0, 0.01]);
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_recomputes, n);
+        assert_eq!(scene.section_revision(id, m), Ok(1));
+        // A plane move recomputes with a new result: up by one.
+        scene.set_section_plane(id, z_plane(-0.5)).unwrap();
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_revision(id, m), Ok(2));
+        // A recompute with an identical result: unchanged.
+        scene.set_section_fill(id, false).unwrap();
+        scene.update_sections().unwrap();
+        assert_eq!(scene.section_recomputes, n + 2);
+        assert_eq!(scene.section_revision(id, m), Ok(2));
+        // An Eager entry is at 1 right after the add computes it.
+        let (mut eager, e) = one_sphere(UpdateMode::Eager);
+        let eid = eager.add_section(desc(z_plane(0.3), &[e], false)).unwrap();
+        assert_eq!(eager.section_revision(eid, e), Ok(1));
+        // Errors as for `section`.
+        let other = scene
+            .add_mesh(unit_sphere(), MeshOptions::default())
+            .unwrap();
+        assert!(matches!(
+            scene.section_revision(id, other),
+            Err(SceneError::InvalidInput(_))
+        ));
+        scene.remove_mesh(other).unwrap();
+        assert_eq!(
+            scene.section_revision(id, other),
+            Err(SceneError::UnknownMesh)
+        );
+        scene.remove_section(id).unwrap();
+        assert_eq!(
+            scene.section_revision(id, m),
+            Err(SceneError::UnknownSection)
+        );
     }
 
     #[test]
