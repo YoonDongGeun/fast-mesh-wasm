@@ -14,8 +14,10 @@ import { readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { Scene } from "../dist/node.js";
 import { createSceneStore } from "../dist/store.js";
+import { createReporter } from "./report.mjs";
 
 const quick = process.argv.includes("--quick");
+const reporter = createReporter(process.argv.slice(2), { suite: "store" });
 
 if (readFileSync(new URL("../dist/wasm/fast_mesh_wasm.d.ts", import.meta.url), "utf8").includes("__test_panic")) {
   console.error("dist/ is a test build: run `pnpm build` first (benches need the release build)");
@@ -84,8 +86,10 @@ function time(n, warm, fn) {
   return stats(samples);
 }
 
-const row = (name, s, note = "") =>
-  console.log(`| ${name} | ${fmt(s.median)} | ${fmt(s.p95)} | ${s.n} |${note ? ` ${note}` : ""}`);
+const row = (name, s, unit, note = "") => {
+  reporter.log(`| ${name} | ${fmt(s.median)} | ${fmt(s.p95)} | ${s.n} |${note ? ` ${note}` : ""}`);
+  reporter.record(name, s, unit);
+};
 
 const runs = quick ? 3 : 10;
 const iters = quick ? 200 : 2000;
@@ -100,16 +104,17 @@ for (let r = 0; r < runs; r++) {
   scene.free();
 }
 const b = stats(bursts);
-console.log(`\nStore over Scene: ${MESHES} meshes (${COLOURED} coloured), ${SECTIONS} sections of 100 meshes\n`);
-console.log(`Adding ${MESHES} meshes through the store, one after another: median ${fmt(b.median)} ms, p95 ${fmt(b.p95)} ms (${b.n} runs)`);
-console.log(`  = ${fmt((b.median * 1000) / MESHES)} µs per add\n`);
+reporter.log(`\nStore over Scene: ${MESHES} meshes (${COLOURED} coloured), ${SECTIONS} sections of 100 meshes\n`);
+reporter.log(`Adding ${MESHES} meshes through the store, one after another: median ${fmt(b.median)} ms, p95 ${fmt(b.p95)} ms (${b.n} runs)`);
+reporter.log(`  = ${fmt((b.median * 1000) / MESHES)} µs per add\n`);
+reporter.record(`add ${MESHES} meshes (burst)`, b, "ms");
 
 // ---- per event, on the full scene ----
 
 const { scene, store, meshes } = build();
-console.log("| per event (µs) | median | p95 | n |");
-console.log("| --- | --- | --- | --- |");
-row("`select(mesh)` (store only)", time(iters, 100, (k) => store.select(meshes[k % MESHES])));
+reporter.log("| per event (µs) | median | p95 | n |");
+reporter.log("| --- | --- | --- | --- |");
+row("`select(mesh)` (store only)", time(iters, 100, (k) => store.select(meshes[k % MESHES])), "µs");
 row(
   "`setDisplay(opacity)` + `commitFrame()`",
   time(iters, 100, (k) => {
@@ -117,12 +122,14 @@ row(
     store.setDisplay(meshes[k % MESHES], { opacity: Math.floor(k / MESHES) % 2 === 0 ? 0.5 : 0.75 });
     store.commitFrame();
   }),
+  "µs",
 );
 row(
   "`setPlacement` of a coloured, sectioned mesh",
   time(iters, 100, (k) => store.setPlacement(meshes[1], { rotation: IDENTITY, translation: [0, 0, (k % 2) * 0.01] })),
+  "µs",
 );
-row("`commitFrame()`, nothing changed", time(iters, 100, () => store.commitFrame()));
+row("`commitFrame()`, nothing changed", time(iters, 100, () => store.commitFrame()), "µs");
 // The store may take a scene event on a microtask: reading the snapshot brings it up to date.
 row(
   "scene event (`scene.commitFrame()`) + `getSnapshot()`",
@@ -130,6 +137,7 @@ row(
     scene.commitFrame();
     store.getSnapshot();
   }),
+  "µs",
 );
 
 // ---- a burst of adds on top of the full scene ----
@@ -141,7 +149,8 @@ for (let k = 0; k < extra; k++) {
   store.addMesh(positions, indices);
 }
 const t = now() - t0;
-console.log(`\nAdding ${extra} more meshes: ${fmt(t)} ms (${fmt((t * 1000) / extra)} µs per add)`);
+reporter.log(`\nAdding ${extra} more meshes: ${fmt(t)} ms (${fmt((t * 1000) / extra)} µs per add)`);
+reporter.record(`add ${extra} more meshes`, { median: t, p95: t, n: 1 }, "ms");
 store.dispose();
 scene.free();
 
@@ -209,10 +218,11 @@ for (let k = 0; k < rounds; k++) {
   await idle();
 }
 armed = false;
-console.log(`\nWorker scene, ${MESHES} meshes as above: \`setPlacement\` of a coloured mesh in a section, ${rounds} round trips\n`);
-console.log("| per event (µs) | median | p95 | n |");
-console.log("| --- | --- | --- | --- |");
-row("`setPlacement` (the action: its key goes computing)", stats(actions));
-row("a status delivery (results arrive)", stats(deliveries));
+reporter.log(`\nWorker scene, ${MESHES} meshes as above: \`setPlacement\` of a coloured mesh in a section, ${rounds} round trips\n`);
+reporter.log("| per event (µs) | median | p95 | n |");
+reporter.log("| --- | --- | --- | --- |");
+row("`setPlacement` (the action: its key goes computing)", stats(actions), "µs");
+row("a status delivery (results arrive)", stats(deliveries), "µs");
 worker.store.dispose();
 ws.terminate();
+reporter.save();

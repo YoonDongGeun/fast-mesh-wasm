@@ -61,3 +61,32 @@ test("log passes the line through to the console", () => {
   }
   assert.deepEqual(lines, ["hello"]);
 });
+
+test("mixed units are kept per case", () => {
+  const r = createReporter(["--json", "X"], { suite: "store" });
+  r.report("burst", { median: 10, p95: 11, n: 3 }, "ms");
+  r.report("event", { median: 1.5, p95: 2.5, n: 200 }, "µs");
+  const units = r.document().cases.map((c) => c.unit);
+  assert.deepEqual(units, ["ms", "µs"]);
+});
+
+test("quick flag is recorded and console still prints", () => {
+  const r = createReporter(["--json", "X", "--quick"], { suite: "store" });
+  assert.equal(r.document().quick, true);
+});
+
+test("record stores a case without printing", () => {
+  const lines = [];
+  const orig = console.log;
+  console.log = (line) => lines.push(line);
+  let doc;
+  try {
+    const r = createReporter(["--json", "X"], { suite: "store" });
+    r.record("row", { median: 1.5, p95: 2.5, n: 200 }, "µs");
+    doc = r.document();
+  } finally {
+    console.log = orig;
+  }
+  assert.deepEqual(lines, []);
+  assert.deepEqual(doc.cases, [{ name: "row", unit: "µs", median: 1.5, p95: 2.5, n: 200 }]);
+});
