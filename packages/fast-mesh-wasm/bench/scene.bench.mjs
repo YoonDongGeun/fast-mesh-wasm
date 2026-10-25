@@ -2,6 +2,9 @@
 //
 //   pnpm build && pnpm --filter fast-mesh-wasm bench [-- --10m] [-- --quick] [-- --adapter] [-- --worker] [-- --wide] [-- --queued [-- --no-1m] [-- --add-only]] [-- --contact]
 //
+// Add `--json <path>` to also write every case (median, p95, heap) as JSON;
+// console output is unchanged. The release workflow compares the head JSON
+// against the latest release tag's and posts the delta table on the PR.
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. Nothing here uploads to a GPU: a "frame" is what an adapter does on the JS side,
 // which is setPlacement, commitFrame() and copying every dirty range from the views into a

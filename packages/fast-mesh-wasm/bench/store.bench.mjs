@@ -3,6 +3,9 @@
 //
 //   pnpm build && pnpm --filter fast-mesh-wasm bench:store [-- --quick]
 //
+// Add `--json <path>` to also write every case (median, p95, heap) as JSON;
+// console output is unchanged. The release workflow compares the head JSON
+// against the latest release tag's and posts the delta table on the PR.
 // Plain Node with performance.now(); every number is a median (and p95) over the iterations
 // shown. The scene holds 1000 small meshes (closed tetrahedra) added through the store, 100 of
 // them coloured by distance to a neighbour, and 10 sections over 100 meshes each, so a refresh

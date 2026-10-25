@@ -1,0 +1,111 @@
+name: bench-release
+
+# On every update to the changesets release PR, rebuild the release bench
+# numbers for the PR head and for the latest release tag, and post the
+# delta table as a sticky comment.
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  WASM_BINDGEN_VERSION: 0.2.129
+
+jobs:
+  bench:
+    if: startsWith(github.head_ref, 'changeset-release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+      - name: Resolve baseline release tag
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          tag=$(git describe --tags --abbrev=0 origin/main 2>/dev/null || true)
+          if [ -z "$tag" ]; then
+            echo "no release tag found on origin/main"
+            exit 1
+          fi
+          echo "BASELINE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "baseline: $tag"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASELINE_TAG }}
+          path: baseline
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - id: nightly
+        uses: ./.github/actions/install-nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.toolchain }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies (head)
+        run: pnpm install --frozen-lockfile
+      - name: Install dependencies (baseline)
+        run: pnpm install --frozen-lockfile
+        working-directory: baseline
+      - name: Build release (head)
+        run: pnpm build
+      - name: Build release (baseline)
+        run: pnpm build
+        working-directory: baseline
+      - name: Bench head
+        working-directory: packages/fast-mesh-wasm
+        env:
+          NODE_OPTIONS: --expose-gc
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/bench-json"
+          node bench/scene.bench.mjs --json "$GITHUB_WORKSPACE/bench-json/head-scene.json"
+          node bench/store.bench.mjs --json "$GITHUB_WORKSPACE/bench-json/head-store.json"
+      - name: Bench baseline
+        working-directory: baseline/packages/fast-mesh-wasm
+        env:
+          NODE_OPTIONS: --expose-gc
+        run: |
+          node bench/scene.bench.mjs --json "$GITHUB_WORKSPACE/bench-json/base-scene.json"
+          node bench/store.bench.mjs --json "$GITHUB_WORKSPACE/bench-json/base-store.json"
+      - name: Compare gate
+        run: node --test scripts/bench-compare.test.mjs
+      - name: Compare suites
+        run: |
+          node scripts/bench-compare.mjs bench-json/base-scene.json bench-json/head-scene.json --out bench-json/scene.md
+          node scripts/bench-compare.mjs bench-json/base-store.json bench-json/head-store.json --out bench-json/store.md
+          {
+            echo "## Bench deltas vs \`$BASELINE_TAG\`"
+            echo
+            echo "### scene"
+            echo
+            cat bench-json/scene.md
+            echo "### store"
+            echo
+            cat bench-json/store.md
+          } > bench-json/body.md
+      - name: Sticky PR comment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- bench-delta -->';
+            const body = marker + '\n' + fs.readFileSync('bench-json/body.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
