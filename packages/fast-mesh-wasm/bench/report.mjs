@@ -49,7 +49,14 @@ export function createReporter(argv, { suite } = {}) {
       console.log(line);
     },
     document() {
-      return { schema: 1, suite, quick: argv.includes("--quick"), cases: cases.map((c) => ({ ...c })) };
+      return {
+        schema: 1,
+        suite,
+        node: process.version,
+        platform: `${process.platform}-${process.arch}`,
+        quick: argv.includes("--quick"),
+        cases: cases.map((c) => ({ ...c })),
+      };
     },
     save() {
       if (path === undefined) {

@@ -70,8 +70,18 @@ export function renderMarkdown(result, { baseRef, headRef }) {
     lines.push("| (no common cases) | | | | | | | |");
   }
   lines.push("");
-  lines.push(result.added.length > 0 ? `Added: ${result.added.join(", ")}` : "Added: none");
-  lines.push(result.removed.length > 0 ? `Removed: ${result.removed.join(", ")}` : "Removed: none");
+  if (result.added.length > 0) {
+    lines.push("Added:");
+    for (const name of result.added) lines.push(`- ${name}`);
+  } else {
+    lines.push("Added: none");
+  }
+  if (result.removed.length > 0) {
+    lines.push("Removed:");
+    for (const name of result.removed) lines.push(`- ${name}`);
+  } else {
+    lines.push("Removed: none");
+  }
   lines.push("");
   return lines.join("\n");
 }

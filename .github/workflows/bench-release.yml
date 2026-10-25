@@ -97,10 +97,10 @@ jobs:
             echo
             echo "### scene"
             echo
-            cat bench-json/scene.md
+            tail -n +3 bench-json/scene.md
             echo "### store"
             echo
-            cat bench-json/store.md
+            tail -n +3 bench-json/store.md
           } > bench-json/body.md
       - name: Sticky PR comment
         uses: actions/github-script@v8
