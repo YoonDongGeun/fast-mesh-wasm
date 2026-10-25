@@ -9,6 +9,14 @@ import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
+import {
+  createGroup,
+  dropMember,
+  type NamedGroup,
+  removeGroup,
+  setColored,
+  toggleCheck,
+} from "../panels/groups";
 
 export interface Item {
   /** A React key. */
@@ -59,6 +67,10 @@ export interface AppSnapshot {
   collision: CollisionPair;
   collisionMode: CollisionMode;
   group: GroupSetup;
+  /** The meshes ticked in the list, in list order: the next named group's members. */
+  checks: readonly MeshHandle[];
+  /** The named mesh groups. */
+  meshGroups: readonly NamedGroup<MeshHandle>[];
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -75,6 +87,8 @@ export class AppState {
     collision: { a: null, b: null },
     collisionMode: "pair",
     group: { members: [], pairs: "all" },
+    checks: [],
+    meshGroups: [],
     edgeSoftness: 0,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -84,6 +98,7 @@ export class AppState {
   readonly #listeners = new Set<() => void>();
   #nextItem = 0;
   #nextColor = 0;
+  #nextGroup = 1;
 
   getSnapshot = (): AppSnapshot => this.#snap;
 
@@ -158,7 +173,13 @@ export class AppState {
     };
     store.removeMesh(item.mesh);
     item.material.dispose();
-    this.#set({ items: this.#snap.items.filter((i) => i !== item), collision, group });
+    this.#set({
+      items: this.#snap.items.filter((i) => i !== item),
+      collision,
+      group,
+      checks: this.#snap.checks.filter((m) => m !== item.mesh),
+      meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
+    });
   }
 
   /** Picks the collision pair's `side` (by hand: no more defaults). */
@@ -185,6 +206,32 @@ export class AppState {
   /** Sets which group members are measured to each other: `"all"`, or the listed pairs. */
   setGroupPairs(pairs: GroupSetup["pairs"]): void {
     this.#set({ group: { ...this.#snap.group, pairs } });
+  }
+
+  /** Ticks (`on`) or unticks a mesh in the list, kept in list order. */
+  toggleCheck(mesh: MeshHandle, on: boolean): void {
+    const order = this.#snap.items.map((i) => i.mesh);
+    this.#set({ checks: toggleCheck(this.#snap.checks, order, mesh, on) });
+  }
+
+  /** Groups the ticked meshes under `name` (blank for `Group <n>`). Needs at least one tick. */
+  createGroup(name: string): void {
+    const members = this.#snap.checks;
+    if (members.length === 0) {
+      return;
+    }
+    const id = this.#nextGroup++;
+    this.#set({ meshGroups: createGroup(this.#snap.meshGroups, id, name, `Group ${id}`, members) });
+  }
+
+  /** Removes the named group `id` (its meshes stay). */
+  removeGroup(id: number): void {
+    this.#set({ meshGroups: removeGroup(this.#snap.meshGroups, id) });
+  }
+
+  /** Colours (`on`) or uncolours the named group `id` by its contacts. */
+  setGroupColored(id: number, on: boolean): void {
+    this.#set({ meshGroups: setColored(this.#snap.meshGroups, id, on) });
   }
 
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */

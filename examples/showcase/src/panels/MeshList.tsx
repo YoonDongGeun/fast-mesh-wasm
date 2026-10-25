@@ -89,11 +89,21 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
   const [state, setDisplay] = useMeshDisplay(item.mesh);
   const triangles = useTriangleCount(store, item);
   const selected = selection === item.mesh;
+  const checks = useApp(app, (s) => s.checks);
+  const checked = checks.includes(item.mesh);
   const swatch = `#${item.color.toString(16).padStart(6, "0")}`;
 
   return (
     <li className={selected ? "mesh selected" : "mesh"} data-mesh={item.name}>
       <div className="mesh-head">
+        <label className="check" title={`${item.name}: tick for grouping`}>
+          <input
+            type="checkbox"
+            data-check={item.name}
+            checked={checked}
+            onChange={(e) => app.toggleCheck(item.mesh, e.currentTarget.checked)}
+          />
+        </label>
         <span className="swatch" style={{ background: swatch }} aria-hidden="true" />
         <button
           type="button"

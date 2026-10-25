@@ -7,6 +7,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useState } from "react";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { GroupsBar } from "./panels/GroupsBar";
 import { HoverTip } from "./panels/HoverTip";
 import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
@@ -130,6 +131,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     <div className="app">
       <aside className="sidebar sidebar-left">
         <MeshList app={app} onLoad={load} onFocus={focusOn} />
+        <GroupsBar app={app} />
       </aside>
       <main className="viewport">
         <Viewport
