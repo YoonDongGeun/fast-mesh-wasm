@@ -37,6 +37,9 @@
 //! - `4` fill holes: `max_edges, max_perimeter, max_area, loop_count,
 //!   allow_unclean, fair, dp_limit, max_dihedral, max_refine_vertices`;
 //!   `loop_count` (NaN for no id list) loop ids are taken from `loops`.
+//! - `5` inflate: `cx, cy, cz, radius, falloff (0 linear, 1 smooth),
+//!   strength`.
+//! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -52,11 +55,14 @@
 //!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean)) ×
 //!   skipped_n, failed_n, (loop id, reason (0 projection folds, 1 no valid
 //!   triangulation, 2 solver)) × failed_n`.
+//! - inflate: `moved, max_displacement`.
+//! - smooth: `moved, max_displacement`.
 //!
 //! # Analysis
 //!
 //! One `f64` array, see [`encode_analysis`].
 
+use fast_mesh_ops::deform::{Brush, Falloff, InflateOptions, SmoothOptions};
 use fast_mesh_ops::{
     Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
     FillReport, LoopId, OpsError, SkipReason,
@@ -337,6 +343,8 @@ pub(crate) enum RepairOp {
     Components(ComponentOptions),
     Orient,
     Fill(FillOptions),
+    Inflate(InflateOptions),
+    Smooth(SmoothOptions),
 }
 
 /// A flag: 0 or 1.
@@ -347,6 +355,17 @@ fn flag(v: f64) -> Result<bool, Error> {
         Ok(true)
     } else {
         Err(Error::invalid("flags must be 0 or 1"))
+    }
+}
+
+/// A brush falloff: 0 linear, 1 smooth.
+fn falloff(v: f64) -> Result<Falloff, Error> {
+    if v == 0.0 {
+        Ok(Falloff::Linear)
+    } else if v == 1.0 {
+        Ok(Falloff::Smooth)
+    } else {
+        Err(Error::invalid("falloff must be 0 (linear) or 1 (smooth)"))
     }
 }
 
@@ -436,6 +455,36 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 o.dp_limit = dp;
             }
             RepairOp::Fill(o)
+        } else if code == 5.0 {
+            let [cx, cy, cz, radius, fo, strength]: [f64; 6] =
+                words.take(6)?.try_into().map_err(|_| malformed(WHAT))?;
+            RepairOp::Inflate(InflateOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+            })
+        } else if code == 6.0 {
+            let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
+            // which on wasm32 equals `u32::MAX`, so without this check any
+            // larger value would decode to billions of cycles.
+            if !cycles.is_nan() && cycles > f64::from(u32::MAX) {
+                return Err(Error::invalid("cycles is too large"));
+            }
+            let cycles = count_opt(cycles, "cycles")?.unwrap_or_default();
+            RepairOp::Smooth(SmoothOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                cycles: u32::try_from(cycles).map_err(|_| Error::invalid("cycles is too large"))?,
+            })
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -552,6 +601,14 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::Fill(o) => {
                 let r = fast_mesh_ops::fill_holes(tx, o)?;
                 put_fill(&mut out, &r)?;
+            }
+            RepairOp::Inflate(o) => {
+                let r = fast_mesh_ops::deform::inflate(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Smooth(o) => {
+                let r = fast_mesh_ops::deform::smooth(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
         }
     }
@@ -695,6 +752,27 @@ mod tests {
         // Positions that overflow f32 locally.
         assert_eq!(code(&[1, 1], &[1e300, 0., 0.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[1, 1], &[f64::NAN, 0., 0.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_rejects_cycles_edges() {
+        let smooth = |cycles: f64| decode_repair(&[6., 0., 0., 0., 1., 0., 1., cycles], &[]);
+        let code = |cycles: f64| smooth(cycles).unwrap_err().code;
+        assert_eq!(code(-1.), codes::INVALID_ARGUMENT);
+        assert_eq!(code(2f64.powi(32)), codes::INVALID_ARGUMENT);
+        // The u32 boundary itself still decodes.
+        assert_eq!(
+            smooth(f64::from(u32::MAX)).unwrap(),
+            vec![RepairOp::Smooth(SmoothOptions {
+                brush: Brush {
+                    center: [0.0; 3],
+                    radius: 1.0,
+                    falloff: Falloff::Linear,
+                    strength: 1.0,
+                },
+                cycles: u32::MAX,
+            })]
+        );
     }
 
     #[test]

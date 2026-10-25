@@ -29,9 +29,13 @@
 //!   and faired to continue the surrounding curvature. Run [`orient()`]
 //!   first on meshes that may contain flipped triangles: a hole whose rim
 //!   crosses an orientation seam is not clean and is skipped.
+//! - Brush deformation: [`inflate`](deform::inflate) and
+//!   [`smooth`](deform::smooth) move the vertices under a brush along their
+//!   smooth normals or toward their neighbours.
 
 mod analyze;
 mod cleanup;
+pub mod deform;
 mod error;
 mod fair;
 mod fill;
@@ -49,6 +53,7 @@ pub use cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
+pub use deform::{Brush, Falloff, InflateOptions, InflateOptionsBuilder, InflateReport, inflate};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,

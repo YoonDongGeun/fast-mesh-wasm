@@ -236,5 +236,9 @@ describe("repair summaries", () => {
         failed: [],
       }),
     ).toBe("Fill holes: filled 2 holes (92 triangles, 30 vertices added); skipped 1 (1 beyond the size limit)");
+    expect(describeReport("inflate", { moved: 1234, maxDisplacement: 0.1016 })).toBe(
+      "Inflate: moved 1,234 vertices (max 0.102)",
+    );
+    expect(describeReport("smooth", { moved: 1, maxDisplacement: 2 })).toBe("Smooth: moved 1 vertex (max 2)");
   });
 });
