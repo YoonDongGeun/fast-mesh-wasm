@@ -58,6 +58,11 @@ export function plural(n: number, word: string, words = `${word}s`): string {
   return `${n.toLocaleString("en")} ${n === 1 ? word : words}`;
 }
 
+/** Compact float for one-line summaries (`0.102`, `2`, `1.78`). */
+function fmtNum(x: number): string {
+  return `${Number(x.toPrecision(3))}`;
+}
+
 /** One line for a repair report. */
 export function describeReport(op: RepairOp["op"], report: RepairReport): string {
   switch (op) {
@@ -101,6 +106,14 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
         line += `; ${r.failed.length} could not be filled`;
       }
       return line;
+    }
+    case "inflate": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Inflate: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+    }
+    case "smooth": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Smooth: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
     }
   }
 }
