@@ -59,6 +59,7 @@ export {
   type FilledLoop,
   type FillReport,
   type FindContactsOptions,
+  type InflateReport,
   type LoopId,
   type MeshChange,
   type MeshComponent,
@@ -84,5 +85,6 @@ export {
   type SectionPlane,
   type SectionResult,
   type SignMode,
+  type SmoothReport,
   type WeldReport,
 } from "./scene.js";
