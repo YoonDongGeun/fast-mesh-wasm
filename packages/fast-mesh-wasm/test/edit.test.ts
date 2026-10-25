@@ -546,6 +546,77 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
   });
 
+  it("grab_drags_region_along_direction", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    expect(s.canUndo()).toBe(false);
+    const before = Float32Array.from(s.views(m).positions());
+    // Brush center in local coordinates: the middle vertex (id 4).
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const r = s.repair(m, {
+      op: "grab",
+      center,
+      radius: 0.6,
+      falloff: "linear",
+      strength: 0.5,
+      direction: [2, 0, 0],
+    });
+    expect(r.moved).toBe(1);
+    expect(r.maxDisplacement).toBeCloseTo(1, 4);
+    const after = s.views(m).positions();
+    // Strength times direction, exactly; every other vertex is bit-identical.
+    expect(after[12] - before[12]).toBeCloseTo(1, 4);
+    expect(after[13] - before[13]).toBeCloseTo(0, 6);
+    expect(after[14] - before[14]).toBeCloseTo(0, 6);
+    for (const v of [0, 1, 2, 3, 5, 6, 7, 8]) {
+      expect(Array.from(after.subarray(3 * v, 3 * v + 3))).toEqual(
+        Array.from(before.subarray(3 * v, 3 * v + 3)),
+      );
+    }
+    // One undo entry, restoring bit-identical positions.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+    // A zero direction moves nothing and writes nothing.
+    const r0 = s.repair(m, {
+      op: "grab",
+      center,
+      radius: 0.6,
+      falloff: "linear",
+      strength: 1,
+      direction: [0, 0, 0],
+    });
+    expect(r0).toEqual({ moved: 0, maxDisplacement: 0 });
+    expect(s.canUndo()).toBe(false);
+  });
+
+  it("grab_rejects_invalid_brush", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const good = {
+      op: "grab",
+      center,
+      radius: 0.6,
+      falloff: "linear",
+      strength: 1,
+      direction: [1, 0, 0],
+    } as const;
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { ...good, radius: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, radius: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, strength: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, center: [0, 0] as never }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, falloff: "cubic" as never }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, direction: [0, 0] as never }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, direction: [1, NaN, 0] as never }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
   it("remesh_refines_sparse_region", () => {
     const s = scene();
     const m = s.addMesh(quad, quadTris);

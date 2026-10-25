@@ -60,6 +60,7 @@ export {
   type FilledLoop,
   type FillReport,
   type FindContactsOptions,
+  type GrabReport,
   type InflateReport,
   type JoinOptions,
   type JoinReport,

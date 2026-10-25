@@ -31,7 +31,8 @@
 //!   crosses an orientation seam is not clean and is skipped.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
-//!   smooth normals or toward their neighbours.
+//!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
+//!   drags them along one vector.
 
 mod analyze;
 pub mod append;

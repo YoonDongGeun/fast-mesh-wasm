@@ -164,7 +164,7 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
             };
       return { ...r, analysis };
     },
-    /** The sculpt brush: strokes painted, dabs applied, and whether the ring shows. */
+    /** The sculpt brush: strokes painted, dabs applied, stroke-end remeshes, and whether the ball shows. */
     sculpt: () => ({ ...inspect.sculpt }),
     /** RGBA8 colours of the mesh's vertices that are drawn: how many are reddish (penetration), white, or blue-green (gap). */
     colorCounts: (name: string) => {

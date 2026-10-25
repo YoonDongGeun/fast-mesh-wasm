@@ -84,8 +84,10 @@ export interface AppSnapshot {
   meshGroups: readonly NamedGroup<MeshHandle>[];
   /** The brush-center pick in flight, if any. */
   brushPick: BrushPick | null;
-  /** The sculpt brush armed on a mesh, if any: hover shows its ring, press-and-hold paints. */
+  /** The sculpt brush armed on a mesh, if any: hover shows its ball, press-and-hold paints. */
   sculpt: SculptBrush | null;
+  /** A stroke's end evens its region out with a remesh (in the same undo step on the sync scene). */
+  sculptRemesh: boolean;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -106,6 +108,7 @@ export class AppState {
     meshGroups: [],
     brushPick: null,
     sculpt: null,
+    sculptRemesh: true,
     edgeSoftness: 0,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -286,6 +289,11 @@ export class AppState {
   /** Arms the sculpt brush, updates it while armed, or disarms it (`null`). */
   setSculpt(sculpt: SculptBrush | null): void {
     this.#set({ sculpt });
+  }
+
+  /** Whether a stroke's end remeshes its region. */
+  setSculptRemesh(on: boolean): void {
+    this.#set({ sculptRemesh: on });
   }
 
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */

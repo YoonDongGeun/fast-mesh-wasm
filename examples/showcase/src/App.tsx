@@ -13,6 +13,7 @@ import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { type AppState, useApp } from "./scene/app-state";
+import { SculptToolbox } from "./viewport/Toolbox";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
 /** The engine behind the store, for the status bar. */
@@ -48,6 +49,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const brushPick = useApp(app, (s) => s.brushPick);
   const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
   const sculpt = useApp(app, (s) => s.sculpt);
+  const sculptRemesh = useApp(app, (s) => s.sculptRemesh);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -160,7 +162,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           picking={picking}
           onPickPoint={onPickPoint}
           sculpt={sculpt}
+          sculptRemesh={sculptRemesh}
         />
+        <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
@@ -182,7 +186,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         </div>
         <p className="hint">
           {sculpt !== null
-            ? "Hover shows the brush ring · press-and-hold to sculpt · Esc disarms"
+            ? "Hover shows the brush ball · press-and-hold to sculpt · drag to grab · Esc disarms"
             : picking !== null
               ? "Click the mesh to set the brush center · Esc cancels"
               : selection === null

@@ -44,6 +44,8 @@
 //!   max_rounds (NaN for the default)`.
 //! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
 //!   ids are taken from `loops`.
+//! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
+//!   dx, dy, dz`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -63,13 +65,14 @@
 //! - smooth: `moved, max_displacement`.
 //! - remesh: `splits, collapses, flips, rounds`.
 //! - bridge loops: `triangles_added`.
+//! - grab: `moved, max_displacement`.
 //!
 //! # Analysis
 //!
 //! One `f64` array, see [`encode_analysis`].
 
 use fast_mesh_ops::bridge::BridgeOptions;
-use fast_mesh_ops::deform::{Brush, Falloff, InflateOptions, SmoothOptions};
+use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions, InflateOptions, SmoothOptions};
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::{
     Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
@@ -355,6 +358,7 @@ pub(crate) enum RepairOp {
     Smooth(SmoothOptions),
     Remesh(RemeshOptions),
     Bridge(BridgeOptions),
+    Grab(GrabOptions),
 }
 
 /// A flag: 0 or 1.
@@ -524,6 +528,18 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 loops: (loop_id(pair[0]), loop_id(pair[1])),
                 max_edges: count_opt(max_e, "maxEdges")?,
             })
+        } else if code == 9.0 {
+            let [cx, cy, cz, radius, fo, strength, dx, dy, dz]: [f64; 9] =
+                words.take(9)?.try_into().map_err(|_| malformed(WHAT))?;
+            RepairOp::Grab(GrabOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                direction: [dx as f32, dy as f32, dz as f32],
+            })
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -664,6 +680,10 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::Bridge(o) => {
                 let r = fast_mesh_ops::bridge::bridge_loops(tx, o)?;
                 put(&mut out, &[count(r.triangles_added)])?;
+            }
+            RepairOp::Grab(o) => {
+                let r = fast_mesh_ops::deform::grab(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
         }
     }
@@ -988,5 +1008,34 @@ mod tests {
         assert_eq!(code(&[8., nan], &[0, 4, 11]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[8., -1.], &full), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[8., 1.5], &full), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_grab() {
+        use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions};
+
+        let d = decode_repair(&[9., 1., 2., 3., 4., 1., 0.5, 5., 6., 7.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Grab(GrabOptions {
+                brush: Brush {
+                    center: [1.0, 2.0, 3.0],
+                    radius: 4.0,
+                    falloff: Falloff::Smooth,
+                    strength: 0.5,
+                },
+                direction: [5.0, 6.0, 7.0],
+            })]
+        );
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[9.]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[9., 0., 0., 0., 1., 1., 1., 2.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[9., 0., 0., 0., 1., 2., 1., 0., 0., 0.]),
+            codes::INVALID_ARGUMENT
+        );
     }
 }
