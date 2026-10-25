@@ -514,6 +514,16 @@ export type RepairOp =
       strength: number;
       /** How many Taubin λ/μ cycles to run; 0 moves nothing. */
       cycles: number;
+    }
+  | {
+      op: "remesh";
+      /** Region center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      /** Target edge length; unset means the mesh-wide mean edge length. */
+      targetLength?: number;
+      /** Maximum split/collapse/flip rounds; unset means the default (10). */
+      maxRounds?: number;
     };
 
 /** What `weld` did. */
@@ -579,6 +589,14 @@ export interface SmoothReport {
   maxDisplacement: number;
 }
 
+/** What `remesh` did. */
+export interface RemeshReport {
+  splits: number;
+  collapses: number;
+  flips: number;
+  rounds: number;
+}
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -587,7 +605,8 @@ export type RepairReport =
   | OrientReport
   | FillReport
   | InflateReport
-  | SmoothReport;
+  | SmoothReport
+  | RemeshReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -604,7 +623,9 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
             ? InflateReport
             : O extends { op: "smooth" }
               ? SmoothReport
-              : RepairReport;
+              : O extends { op: "remesh" }
+                ? RemeshReport
+                : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -761,6 +782,7 @@ const REPAIR_CODES = {
   fillHoles: 4,
   inflate: 5,
   smooth: 6,
+  remesh: 7,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -866,6 +888,14 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.cycles, "cycles"),
         );
         break;
+      case "remesh":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          optional(o.targetLength, "targetLength"),
+          optional(o.maxRounds, "maxRounds"),
+        );
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -952,6 +982,8 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { moved: r.next(), maxDisplacement: r.next() };
     case "smooth":
       return { moved: r.next(), maxDisplacement: r.next() };
+    case "remesh":
+      return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };
   }
 }
 

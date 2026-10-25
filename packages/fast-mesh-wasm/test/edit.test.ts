@@ -540,6 +540,52 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
   });
 
+  it("remesh_refines_sparse_region", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    expect(s.canUndo()).toBe(false);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const r = s.repair(m, { op: "remesh", center: [1, 1, 0], radius: 10, targetLength: 0.5 });
+    expect(r.splits).toBeGreaterThan(0);
+    expect(s.views(m).indices().length).toBeGreaterThan(beforeIdx.length);
+    // The original corners are untouched; new vertices append past them.
+    expect(Array.from(s.views(m).positions().subarray(0, 12))).toEqual(Array.from(beforePos));
+    // One undo entry for the call, restoring positions and topology (dead
+    // slots past the original vertices read back as zeros).
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions().subarray(0, beforePos.length))).toEqual(
+      Array.from(beforePos),
+    );
+    expect(Array.from(s.views(m).indices().subarray(0, beforeIdx.length))).toEqual(
+      Array.from(beforeIdx),
+    );
+  });
+
+  it("remesh_rejects_invalid_region", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const good = { op: "remesh", center: [1, 1, 0], radius: 10, targetLength: 0.5 } as const;
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { ...good, radius: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, radius: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, radius: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, center: [0, 0] as never }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(codeOf(() => s.repair(m, { ...good, targetLength: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxRounds: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxRounds: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxRounds: 1.5 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxRounds: 2 ** 32 }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(beforePos));
+    expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
+  });
+
   it("stale_loops_error_code", () => {
     const s = scene();
     const { positions, indices } = damagedHemisphere();

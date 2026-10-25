@@ -70,6 +70,7 @@ export {
   type Range,
   type RaycastOptions,
   type RayHit,
+  type RemeshReport,
   type RemoveReport,
   type RepairOp,
   type RepairReport,
