@@ -87,11 +87,14 @@ export const inspect: {
     /** The op running, if any. */
     busy: string | null;
   };
+  /** The sculpt brush: strokes painted, dabs applied, and whether the ring shows. */
+  sculpt: { strokes: number; dabs: number; hovering: boolean };
 } = {
   collision: { ...liveProbe(), warnings: [] },
   group: { ...liveProbe(), warnings: [] },
   hover: null,
   repair: { analysis: null, analyses: 0, report: null, busy: null },
+  sculpt: { strokes: 0, dabs: 0, hovering: false },
 };
 
 function liveProbe(): LiveProbe<never> {

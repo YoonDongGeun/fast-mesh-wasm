@@ -12,19 +12,31 @@ import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { FocusRequest } from "../App";
+import { inspect } from "../panels/inspect";
 import type { Item } from "../scene/app-state";
+import {
+  type SculptBrush,
+  SculptStroke,
+  type StrokeSteps,
+  faceNormal,
+  interpolateHit,
+} from "./sculpt";
 import { setDragging, setHover, view } from "./view";
 
 export type GizmoMode = "translate" | "rotate";
 
 /** The hover raycast runs at most this often while the pointer moves. */
 const HOVER_PERIOD_MS = 50;
+/** The sculpt raycast runs at most this often while a stroke paints. */
+const STROKE_PERIOD_MS = 30;
+/** Hold-still buildup: a forced dab this often while the button stays down without moving. */
+const BUILDUP_MS = 90;
 
 export function Viewport(props: {
   items: readonly Item[];
@@ -40,8 +52,10 @@ export function Viewport(props: {
   picking: MeshHandle | null;
   /** A landed brush-center pick, in the mesh's local coordinates. */
   onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
+  /** The sculpt brush armed on a mesh, if any. */
+  sculpt: SculptBrush | null;
 }) {
-  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint } = props;
+  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint, sculpt } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -80,11 +94,14 @@ export function Viewport(props: {
           picking={picking === item.mesh}
           onPickPoint={onPickPoint}
           scene={scene}
+          sculpted={sculpt?.mesh === item.mesh}
         />
       ))}
-      <Controls bound={selected} mode={mode} focus={focus} radiusOf={radiusOf} />
+      {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
+      <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
-      <PickCursor picking={picking !== null} />
+      {sculpt !== null ? <SculptLayer scene={scene} sculpt={sculpt} /> : null}
+      <PickCursor picking={picking !== null || sculpt !== null} />
     </Canvas>
   );
 }
@@ -111,8 +128,10 @@ function MeshView(props: {
   picking: boolean;
   onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
   scene: Scene | WorkerScene;
+  /** The sculpt brush is armed on this mesh: clicks paint, they never select or pick. */
+  sculpted: boolean;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene } = props;
+  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
@@ -121,6 +140,10 @@ function MeshView(props: {
       e.stopPropagation();
       // The end of an orbit drag that started on the mesh is not a click.
       if (e.delta > 2) {
+        return;
+      }
+      // A stroke's release on the mesh is not a click either.
+      if (sculpted) {
         return;
       }
       if (!picking) {
@@ -156,7 +179,7 @@ function MeshView(props: {
           // Removed meanwhile: the pick stays armed.
         });
     },
-    [item.mesh, onPick, picking, onPickPoint, scene],
+    [item.mesh, onPick, picking, onPickPoint, scene, sculpted],
   );
   return (
     <FastMesh
@@ -262,6 +285,288 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
 }
 
 /**
+ * The sculpt brush on its mesh: hover shows the brush ring (radius, on the
+ * surface, facing along its normal), press-and-hold paints dabs along the
+ * pointer (and builds up where it holds still). A press on empty space is
+ * the orbit's, as usual; a stroke holds a single undo step on the sync
+ * scene (the Worker has no step nesting: one step per dab there). One
+ * raycast at a time, through the engine's BVH, never three's per-triangle
+ * `Mesh.raycast`.
+ */
+function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush }) {
+  const { scene, sculpt } = props;
+  const store = useScene();
+  const camera = useThree((s) => s.camera);
+  const gl = useThree((s) => s.gl);
+  // The brush inputs drive the armed brush live; the stroke survives them.
+  const brushRef = useRef(sculpt);
+  brushRef.current = sculpt;
+
+  const ring = useMemo(() => {
+    const group = new THREE.Group();
+    const material = new THREE.MeshBasicMaterial({
+      color: 0xffd166,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: true,
+    });
+    group.add(new THREE.Mesh(new THREE.RingGeometry(0.93, 1, 64), material));
+    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.05, 24), material);
+    dot.position.z = 0.001;
+    group.add(dot);
+    group.visible = false;
+    return group;
+  }, []);
+  useEffect(() => {
+    return () => {
+      ring.removeFromParent();
+      for (const child of ring.children) {
+        (child as THREE.Mesh).geometry.dispose();
+      }
+      ((ring.children[0] as THREE.Mesh).material as THREE.Material).dispose();
+    };
+  }, [ring]);
+
+  useEffect(() => {
+    const canvas = gl.domElement;
+    const caster = new THREE.Raycaster();
+    const up = new THREE.Vector3(0, 0, 1);
+    let alive = true;
+    let running = false;
+    let last = -Infinity;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending: { x: number; y: number; period: number } | null = null;
+    let hoverLocal: [number, number, number] | null = null;
+    let stroke: SculptStroke | null = null;
+    let buildup: ReturnType<typeof setInterval> | undefined;
+    /** The stroking pointer, or -1 when no stroke paints. */
+    let active = -1;
+
+    const cast = (x: number, y: number) => {
+      const r = canvas.getBoundingClientRect();
+      caster.setFromCamera(
+        new THREE.Vector2(((x - r.left) / r.width) * 2 - 1, 1 - ((y - r.top) / r.height) * 2),
+        camera,
+      );
+      const { origin, direction } = caster.ray;
+      return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
+    };
+
+    /** The hit over the mesh's local views: its point and face normal. */
+    const localHit = (hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
+      const v = scene.views(brushRef.current.mesh);
+      const indices = v.indices();
+      const positions = v.positions();
+      const corners = [indices[3 * hit.triangle], indices[3 * hit.triangle + 1], indices[3 * hit.triangle + 2]];
+      return {
+        point: interpolateHit(positions, corners, hit.barycentric),
+        normal: faceNormal(positions, corners[0], corners[1], corners[2]),
+      };
+    };
+
+    const hideRing = () => {
+      hoverLocal = null;
+      ring.visible = false;
+      inspect.sculpt.hovering = false;
+    };
+
+    /** The ring onto the surface: a child of the mesh, in its local frame. */
+    const showRing = (point: readonly [number, number, number], normal: readonly [number, number, number]) => {
+      const binding = view.bindings.get(brushRef.current.mesh);
+      if (binding === undefined) {
+        hideRing();
+        return;
+      }
+      if (ring.parent !== binding.object) {
+        binding.object.add(ring);
+      }
+      const radius = brushRef.current.radius;
+      const n = new THREE.Vector3(normal[0], normal[1], normal[2]);
+      ring.visible = true;
+      ring.position.set(point[0], point[1], point[2]).addScaledVector(n, Math.max(radius * 0.02, 1e-4));
+      ring.quaternion.setFromUnitVectors(up, n);
+      ring.scale.setScalar(Math.max(radius, 1e-6));
+    };
+
+    const endStroke = () => {
+      clearInterval(buildup);
+      buildup = undefined;
+      active = -1;
+      if (stroke !== null) {
+        const s = stroke;
+        stroke = null;
+        inspect.sculpt.strokes++;
+        inspect.sculpt.dabs += s.dabs;
+        s.end();
+      }
+      if (view.orbit !== null) {
+        view.orbit.enabled = true;
+      }
+    };
+
+    const run = () => {
+      if (!alive || running || pending === null) {
+        return;
+      }
+      const wait = last + pending.period - performance.now();
+      if (wait > 0) {
+        timer ??= setTimeout(() => {
+          timer = undefined;
+          run();
+        }, wait);
+        return;
+      }
+      const at = pending;
+      pending = null;
+      running = true;
+      last = performance.now();
+      Promise.resolve()
+        .then(() => cast(at.x, at.y))
+        .then(
+          (hit) => {
+            running = false;
+            if (!alive) {
+              return;
+            }
+            if (hit === null || hit.mesh !== brushRef.current.mesh) {
+              hideRing();
+            } else {
+              let point: [number, number, number];
+              let normal: [number, number, number];
+              try {
+                ({ point, normal } = localHit(hit));
+              } catch {
+                // Removed meanwhile: the next move asks again.
+                run();
+                return;
+              }
+              hoverLocal = point;
+              inspect.sculpt.hovering = true;
+              showRing(point, normal);
+              stroke?.dab(point);
+            }
+            run();
+          },
+          () => {
+            running = false;
+            if (alive) {
+              run();
+            }
+          },
+        );
+    };
+
+    const onMove = (e: PointerEvent) => {
+      if (stroke !== null && e.pointerId !== active) {
+        return;
+      }
+      pending = { x: e.clientX, y: e.clientY, period: stroke !== null ? STROKE_PERIOD_MS : HOVER_PERIOD_MS };
+      run();
+    };
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0 || active !== -1 || view.dragging) {
+        return;
+      }
+      // Immediate: the stroke starts where the button lands, not a throttle later.
+      Promise.resolve()
+        .then(() => cast(e.clientX, e.clientY))
+        .then(
+          (hit) => {
+            // The gizmo's own pointerdown runs first (its listeners attached
+            // first): a grab there owns the gesture, not a stroke.
+            if (!alive || active !== -1 || view.dragging) {
+              return;
+            }
+            const brush = brushRef.current;
+            if (hit === null || hit.mesh !== brush.mesh) {
+              return; // empty space (or another mesh): the orbit keeps the gesture.
+            }
+            let point: [number, number, number];
+            let normal: [number, number, number];
+            try {
+              ({ point, normal } = localHit(hit));
+            } catch {
+              return;
+            }
+            hoverLocal = point;
+            inspect.sculpt.hovering = true;
+            showRing(point, normal);
+            // Step nesting is the sync scene's; the Worker steps per dab.
+            const maybe = scene as unknown as {
+              beginStep?: () => void;
+              endStep?: () => void;
+              cancelStep?: () => void;
+            };
+            const steps: StrokeSteps = {
+              beginStep: typeof maybe.beginStep === "function" ? () => maybe.beginStep?.() : undefined,
+              endStep: typeof maybe.endStep === "function" ? () => maybe.endStep?.() : undefined,
+              cancelStep: typeof maybe.cancelStep === "function" ? () => maybe.cancelStep?.() : undefined,
+            };
+            const mesh = brush.mesh;
+            const s = new SculptStroke(() => brushRef.current, steps, (op) =>
+              store.repair(mesh, op).catch((err: unknown) => {
+                // The mesh went away mid-stroke: end it, and let the stroke count the failed dab.
+                endStroke();
+                throw err;
+              }),
+            );
+            active = e.pointerId;
+            stroke = s;
+            if (view.orbit !== null) {
+              view.orbit.enabled = false;
+            }
+            s.dab(point);
+            clearInterval(buildup);
+            buildup = setInterval(() => {
+              const at = hoverLocal;
+              if (at !== null) {
+                stroke?.dab(at, true);
+              }
+            }, BUILDUP_MS);
+          },
+          () => {
+            // Removed meanwhile: the next press asks again.
+          },
+        );
+    };
+    const onUp = (e: PointerEvent) => {
+      if (e.pointerId === active) {
+        endStroke();
+      }
+    };
+    const onLeave = (e: PointerEvent) => {
+      if (stroke !== null) {
+        if (e.pointerId === active) {
+          endStroke();
+        }
+        return;
+      }
+      pending = null;
+      hideRing();
+    };
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("pointerleave", onLeave);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      canvas.removeEventListener("pointermove", onMove);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
+      canvas.removeEventListener("pointerleave", onLeave);
+      endStroke();
+      hideRing();
+    };
+  }, [scene, camera, gl, store, ring]);
+
+  return null;
+}
+
+/**
  * Orbit camera; a TransformControls gizmo on `bound`; and the camera pointed
  * at a mesh on each new `focus` request.
  */
@@ -288,6 +593,7 @@ function Controls(props: {
     const o = new OrbitControls(camera, gl.domElement);
     o.target.set(-0.6, 0.9, 0);
     o.update();
+    view.orbit = o;
     setOrbit(o);
     return () => {
       o.dispose();
@@ -295,6 +601,9 @@ function Controls(props: {
       if (view.camera === camera) {
         view.camera = null;
         view.canvas = null;
+      }
+      if (view.orbit === o) {
+        view.orbit = null;
       }
     };
   }, [camera, gl]);
