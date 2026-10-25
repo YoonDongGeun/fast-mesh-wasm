@@ -1,5 +1,25 @@
 # fast-mesh-wasm
 
+## 0.4.0
+
+### Minor Changes
+
+- [#80](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/80) [`1388bdd`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/1388bdd01c0dc66a9997cdb206b5f2b15f68f8e4) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - JS core follow-ups ([#40](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/40)). `Scene.mode(mesh)` reports when a mesh's derived data follows its edits, and `Scene.bounds(mesh)` the box around the vertices its live triangles use (dead slots keep stale positions, so they are excluded; `null` without live triangles). `Scene.drag(mesh, { coalesce: true })` remembers pointer-rate moves and applies the latest one once at the next `commitFrame()` (or `end()`), so eager fields recompute once per frame.
+  
+  A Lazy or Manual mesh added with `addMesh` now builds its BVH on first use instead of up front (1M triangles: ~1.3 s to ~20 ms; the first query, update or flush builds it). Dense frames report `"all"` past half the slots dirty instead of sorting the dirty sets, in the render records and the normals. Results are unchanged.
+
+- [#79](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/79) [`1cc4e64`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/1cc4e6437cb57fa755dcaf72263fb608e9b5e60c) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `fillHoles` gains two options: `maxDihedral` rejects minimum-weight triangulations that fold past it (in radians), and `maxRefineVertices` caps the vertices refinement adds per patch. Each filled loop now reports `refineCapped` when refinement stopped early on its budget or rounds. The Rust option structs (`FillOptions`, `AnalyzeOptions`, `DegenerateOptions`, `ComponentOptions`) gain builders, `analyze` uses an early-exit self-intersection check with identical results, and repair out-of-memory now arrives as one `SceneError` variant.
+
+### Patch Changes
+
+- [#74](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/74) [`c31f414`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/c31f41420abcdf21de33fb0668bf76eba95c10f7) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - A large mesh added to a Worker scene in the background no longer blocks the Worker while its inputs copy into wasm memory and its store builds: the upload runs in chunks with yields between them, then the store builds in steps, bit-identical to the one-call build, before the BVH build starts as before. In back-to-back runs the longest Worker block for a 1M-triangle add fell from 18.3–22.6 ms to 15.7–17.8 ms (now a BVH build step either way), and at 10M from 184–207 ms to 21.0–38.9 ms; a toggle sent right after the add is answered in about 8 ms at 1M. The winding-moments build lists its leaves incrementally too, instead of one traversal up front. Results are unchanged.
+
+- [#79](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/79) [`1cc4e64`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/1cc4e6437cb57fa755dcaf72263fb608e9b5e60c) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Hole fairing is much faster: the per-coordinate conjugate-gradient solve is now one sparse direct solve of the normal equations (nested-dissection order, elimination-tree symbolic factorisation, numeric LDLᵀ), factored once per patch for all three coordinates. On the ten-hole 1M-triangle fill the faired run fell from 10.0 s to 1.5 s on a shared i5-13600K (6.8x; unfaired unchanged), and a single 19,049-vertex hole from 14.6 s to 0.41 s. Results are unchanged within the fairing tolerance: every hole still converges with cotangent weights, and the sphere accuracy figures are identical.
+
+- [#80](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/80) [`1388bdd`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/1388bdd01c0dc66a9997cdb206b5f2b15f68f8e4) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - three.js adapter follow-ups ([#43](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/43)). `bindMesh` takes its bounding box and sphere from the scene's live-vertex bounds instead of walking every slot twice per edit frame, so sculpt-style drags no longer pay a JS-side walk per frame; on a host without `SceneLike.bounds` (now optional) it walks the mirrors as before. Bound objects and section groups must sit under an untransformed parent (their matrices are driven as world matrices): a transformed ancestor is now detected and warned about once instead of silently offsetting them. CI also runs the adapter tests against `three@0.160`, the peer floor.
+
+- [#75](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/75) [`b0bc65e`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b0bc65e7808f8310c110c8cba6beb1a3b0480193) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Fix Turbo colormap dark end by embedding Google's published 256-entry table.
+
 ## 0.3.1
 
 ### Patch Changes
