@@ -524,6 +524,13 @@ export type RepairOp =
       targetLength?: number;
       /** Maximum split/collapse/flip rounds; unset means the default (10). */
       maxRounds?: number;
+    }
+  | {
+      op: "bridgeLoops";
+      /** The two loops to connect, from `analyze(mesh).loops`. Order is insignificant. */
+      loops: readonly [LoopId, LoopId];
+      /** Maximum vertices per loop; unset means the default (128). */
+      maxEdges?: number;
     };
 
 /** What `weld` did. */
@@ -597,6 +604,11 @@ export interface RemeshReport {
   rounds: number;
 }
 
+/** What `bridgeLoops` did. */
+export interface BridgeReport {
+  trianglesAdded: number;
+}
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -606,7 +618,8 @@ export type RepairReport =
   | FillReport
   | InflateReport
   | SmoothReport
-  | RemeshReport;
+  | RemeshReport
+  | BridgeReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -625,7 +638,9 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
               ? SmoothReport
               : O extends { op: "remesh" }
                 ? RemeshReport
-                : RepairReport;
+                : O extends { op: "bridgeLoops" }
+                  ? BridgeReport
+                  : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -783,6 +798,7 @@ const REPAIR_CODES = {
   inflate: 5,
   smooth: 6,
   remesh: 7,
+  bridgeLoops: 8,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -896,6 +912,16 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.maxRounds, "maxRounds"),
         );
         break;
+      case "bridgeLoops": {
+        if (!Array.isArray(o.loops) || o.loops.length !== 2) {
+          throw invalid("loops must be an array of two loop ids");
+        }
+        values.push(optional(o.maxEdges, "maxEdges"));
+        for (const id of o.loops) {
+          encodeLoopId(id, loops);
+        }
+        break;
+      }
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -984,6 +1010,8 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { moved: r.next(), maxDisplacement: r.next() };
     case "remesh":
       return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };
+    case "bridgeLoops":
+      return { trianglesAdded: r.next() };
   }
 }
 

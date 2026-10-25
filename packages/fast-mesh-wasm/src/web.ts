@@ -42,6 +42,7 @@ export {
   type Analysis,
   type AnalyzeOptions,
   type BoundaryLoop,
+  type BridgeReport,
   type ClosestHit,
   type ClosestPointOptions,
   type Colormap,
