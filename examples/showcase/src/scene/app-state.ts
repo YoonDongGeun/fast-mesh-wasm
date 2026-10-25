@@ -9,6 +9,7 @@ import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
+import type { SculptBrush } from "../viewport/sculpt";
 import {
   createGroup,
   dropMember,
@@ -83,6 +84,8 @@ export interface AppSnapshot {
   meshGroups: readonly NamedGroup<MeshHandle>[];
   /** The brush-center pick in flight, if any. */
   brushPick: BrushPick | null;
+  /** The sculpt brush armed on a mesh, if any: hover shows its ring, press-and-hold paints. */
+  sculpt: SculptBrush | null;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -102,6 +105,7 @@ export class AppState {
     checks: [],
     meshGroups: [],
     brushPick: null,
+    sculpt: null,
     edgeSoftness: 0,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -218,6 +222,7 @@ export class AppState {
       group: detached.group,
       checks: this.#snap.checks.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
+      sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
     });
   }
 
@@ -276,6 +281,11 @@ export class AppState {
   /** Arms, lands or clears (`null`) the brush-center pick. */
   setBrushPick(pick: BrushPick | null): void {
     this.#set({ brushPick: pick });
+  }
+
+  /** Arms the sculpt brush, updates it while armed, or disarms it (`null`). */
+  setSculpt(sculpt: SculptBrush | null): void {
+    this.#set({ sculpt });
   }
 
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */

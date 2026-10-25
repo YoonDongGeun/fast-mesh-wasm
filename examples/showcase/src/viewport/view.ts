@@ -5,6 +5,7 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { MeshBinding } from "fast-mesh-wasm/three";
 import type * as THREE from "three";
+import type { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { TransformControls } from "three/addons/controls/TransformControls.js";
 
 /** The mesh under the pointer: the vertex slot nearest to the hit, and the pointer on the page (CSS pixels). */
@@ -21,6 +22,8 @@ export const view: {
   bindings: ReadonlyMap<MeshHandle, MeshBinding>;
   /** The gizmo on the selected mesh, if any. */
   gizmo: TransformControls | null;
+  /** The orbit camera controls (a sculpt stroke disables them while it paints). */
+  orbit: OrbitControls | null;
   /** True while the gizmo drags. */
   dragging: boolean;
   /** Called with `dragging` whenever it changes. */
@@ -34,6 +37,7 @@ export const view: {
   canvas: null,
   bindings: new Map(),
   gizmo: null,
+  orbit: null,
   dragging: false,
   dragListeners: new Set(),
   hover: null,

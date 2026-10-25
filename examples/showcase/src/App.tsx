@@ -47,6 +47,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const focusOn = useCallback((mesh: MeshHandle) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1 })), []);
   const brushPick = useApp(app, (s) => s.brushPick);
   const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
+  const sculpt = useApp(app, (s) => s.sculpt);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -88,8 +89,11 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
       } else if (key === "escape") {
-        // A pick first (it never selects), then the selection.
-        if (app.getSnapshot().brushPick !== null) {
+        // Sculpt first (it owns the pointer), then a pick (it never selects), then the selection.
+        const snap = app.getSnapshot();
+        if (snap.sculpt !== null) {
+          app.setSculpt(null);
+        } else if (snap.brushPick !== null) {
           app.setBrushPick(null);
         } else {
           select(null);
@@ -155,6 +159,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           scene={engine.scene}
           picking={picking}
           onPickPoint={onPickPoint}
+          sculpt={sculpt}
         />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
@@ -176,11 +181,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           </div>
         </div>
         <p className="hint">
-          {picking !== null
-            ? "Click the mesh to set the brush center · Esc cancels"
-            : selection === null
-              ? "Click a mesh to select it · drag to orbit · scroll to zoom"
-              : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect"}
+          {sculpt !== null
+            ? "Hover shows the brush ring · press-and-hold to sculpt · Esc disarms"
+            : picking !== null
+              ? "Click the mesh to set the brush center · Esc cancels"
+              : selection === null
+                ? "Click a mesh to select it · drag to orbit · scroll to zoom"
+                : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ or PLY files here</p> : null}
       </main>
