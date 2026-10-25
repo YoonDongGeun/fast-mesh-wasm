@@ -222,6 +222,79 @@ describe("WorkerScene", () => {
     local.free();
   });
 
+  it("join_matches_local_scene", async () => {
+    const { scene } = await start();
+    const local = new Scene();
+    // Two quads facing away across the z=0..1 gap.
+    const qa = {
+      positions: Float64Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]),
+      indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    };
+    const qb = {
+      positions: Float64Array.from([0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]),
+      indices: Uint32Array.from([0, 1, 2, 0, 2, 3]),
+    };
+    const a = scene.addMesh(qa.positions, qa.indices);
+    const b = scene.addMesh(qb.positions, qb.indices);
+    const la = local.addMesh(qa.positions, qa.indices);
+    const lb = local.addMesh(qb.positions, qb.indices);
+    await settle(scene);
+    const loopA = (await scene.analyze(a)).loops[0].id;
+    const loopB = (await scene.analyze(b)).loops[0].id;
+    const options = { loopA, loopB };
+    const report = await scene.join(a, b, options);
+    expect(report).toEqual(local.join(la, lb, options));
+    expect(report).toEqual({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 });
+    // The source is gone once the result lands; the target mirrors the join.
+    const code = async (p: Promise<unknown>) => {
+      try {
+        await p;
+      } catch (e) {
+        expect(e).toBeInstanceOf(FastMeshError);
+        return (e as FastMeshError).code;
+      }
+      throw new Error("expected a rejection");
+    };
+    expect(await code(scene.analyze(b))).toBe("UNKNOWN_MESH");
+    await settle(scene);
+    scene.commitFrame();
+    await expectMirrored(scene, a);
+    expect(() => scene.views(b)).toThrow(/removed/);
+    local.free();
+  });
+
+  it("join_failure_keeps_source", async () => {
+    const { scene } = await start();
+    const qa = {
+      positions: Float64Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]),
+      indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    };
+    const qb = {
+      positions: Float64Array.from([0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]),
+      indices: Uint32Array.from([0, 1, 2, 0, 2, 3]),
+    };
+    const a = scene.addMesh(qa.positions, qa.indices);
+    const b = scene.addMesh(qb.positions, qb.indices);
+    await settle(scene);
+    const loopA = (await scene.analyze(a)).loops[0].id;
+    const loopB = (await scene.analyze(b)).loops[0].id;
+    const fake = { ...loopB, hash: loopB.hash ^ 1n };
+    const code = async (p: Promise<unknown>) => {
+      try {
+        await p;
+      } catch (e) {
+        expect(e).toBeInstanceOf(FastMeshError);
+        return (e as FastMeshError).code;
+      }
+      throw new Error("expected a rejection");
+    };
+    expect(await code(scene.join(a, b, { loopA, loopB: fake }))).toBe("STALE_LOOPS");
+    // Nothing changed: the source is still usable, the target untouched.
+    expect((await scene.analyze(b)).loops[0].id).toEqual(loopB);
+    expect((await scene.analyze(a)).loops[0].id).toEqual(loopA);
+    expect(scene.views(b).indices().length).toBe(6);
+  });
+
   it("values_mirror_is_opt_in", async () => {
     const { scene, w } = await start();
     const sent: (ArrayBuffer | null)[] = [];

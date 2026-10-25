@@ -524,6 +524,13 @@ export type RepairOp =
       targetLength?: number;
       /** Maximum split/collapse/flip rounds; unset means the default (10). */
       maxRounds?: number;
+    }
+  | {
+      op: "bridgeLoops";
+      /** The two loops to connect, from `analyze(mesh).loops`. Order is insignificant. */
+      loops: readonly [LoopId, LoopId];
+      /** Maximum vertices per loop; unset means the default (128). */
+      maxEdges?: number;
     };
 
 /** What `weld` did. */
@@ -597,6 +604,31 @@ export interface RemeshReport {
   rounds: number;
 }
 
+/** What `bridgeLoops` did. */
+export interface BridgeReport {
+  trianglesAdded: number;
+}
+
+/** Options of {@link Scene.join}. */
+export interface JoinOptions {
+  /** The loop on the target, from `analyze(target).loops`. */
+  loopA: LoopId;
+  /** The loop on the source, from `analyze(source).loops`. */
+  loopB: LoopId;
+  /** Maximum vertices per loop; unset means the default (128). */
+  maxEdges?: number;
+}
+
+/** What {@link Scene.join} did. */
+export interface JoinReport {
+  /** Source vertices copied into the target. */
+  verticesAdded: number;
+  /** Source triangles copied into the target. */
+  trianglesAdded: number;
+  /** Bridge triangles between the two loops. */
+  bridgeTrianglesAdded: number;
+}
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -606,7 +638,8 @@ export type RepairReport =
   | FillReport
   | InflateReport
   | SmoothReport
-  | RemeshReport;
+  | RemeshReport
+  | BridgeReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -625,7 +658,9 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
               ? SmoothReport
               : O extends { op: "remesh" }
                 ? RemeshReport
-                : RepairReport;
+                : O extends { op: "bridgeLoops" }
+                  ? BridgeReport
+                  : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -783,6 +818,7 @@ const REPAIR_CODES = {
   inflate: 5,
   smooth: 6,
   remesh: 7,
+  bridgeLoops: 8,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -896,6 +932,16 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.maxRounds, "maxRounds"),
         );
         break;
+      case "bridgeLoops": {
+        if (!Array.isArray(o.loops) || o.loops.length !== 2) {
+          throw invalid("loops must be an array of two loop ids");
+        }
+        values.push(optional(o.maxEdges, "maxEdges"));
+        for (const id of o.loops) {
+          encodeLoopId(id, loops);
+        }
+        break;
+      }
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -984,6 +1030,8 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { moved: r.next(), maxDisplacement: r.next() };
     case "remesh":
       return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };
+    case "bridgeLoops":
+      return { trianglesAdded: r.next() };
   }
 }
 
@@ -1317,6 +1365,37 @@ export class Scene implements SceneLike {
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+  }
+
+  /**
+   * Joins `source` into `target`: copies the source's geometry into the
+   * target (keeping its world shape), bridges `options.loopA` to the copied
+   * `options.loopB`, and removes the source. The copy and the bridge undo as
+   * one step; the removal is permanent. A drag of the source ends first,
+   * recording its moves as one step, so they survive a failed join.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
+   * mesh twice or loops that cannot bridge; `STALE_LOOPS` for a loop that is
+   * not there. A failed join changes nothing.
+   */
+  join(target: MeshHandle, source: MeshHandle, options: JoinOptions): JoinReport {
+    const ta = this.#id(target);
+    const sb = this.#id(source);
+    const loops: number[] = [];
+    encodeLoopId(options.loopA, loops);
+    encodeLoopId(options.loopB, loops);
+    const maxEdges = optional(options.maxEdges, "maxEdges");
+    // A drag of the source ends first, recording its moves as one step.
+    if (this.#drag?.mesh === source) {
+      this.#drag.end();
+    }
+    const r = call(() =>
+      this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
+    );
+    const key = `${sb.index}:${sb.generation}`;
+    this.#meshes.delete(key);
+    this.#removed.set(key, source);
+    return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
   }
 
   /**

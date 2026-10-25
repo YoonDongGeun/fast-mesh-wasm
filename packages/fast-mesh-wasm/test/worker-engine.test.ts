@@ -313,6 +313,36 @@ describe("worker engine", () => {
     expectMirror(mirrors.get(1), ref, ra);
   });
 
+  it("join_bridges_and_removes_source", async () => {
+    const h = harness();
+    const ref = scene();
+    // Two quads facing away across the z=0..1 gap.
+    const qa = {
+      positions: Float64Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]),
+      indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    };
+    const qb = {
+      positions: Float64Array.from([0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]),
+      indices: Uint32Array.from([0, 1, 2, 0, 2, 3]),
+    };
+    const ra = ref.addMesh(qa.positions, qa.indices);
+    const rb = ref.addMesh(qb.positions, qb.indices);
+    const loopA = ref.analyze(ra).loops[0].id;
+    const loopB = ref.analyze(rb).loops[0].id;
+    const r0 = await h.send([addMesh(1, qa), addMesh(2, qb)]);
+    const r = await h.send([
+      { kind: "join", rev: rev(), target: 1, source: 2, payload: { loopA, loopB }, qid: 7 },
+    ]);
+    const want = ref.join(ra, rb, { loopA, loopB });
+    expect(replyOf(r, 7)).toEqual({ qid: 7, ok: true, value: want });
+    expect(r.changes.find((c) => c.id === 2)!.removed).toBe(true);
+    const mirrors = new Map<ClientId, MeshMirror>();
+    applyResult(mirrors, r0);
+    applyResult(mirrors, r);
+    expect(mirrors.has(2)).toBe(false);
+    expectMirror(mirrors.get(1), ref, ra);
+  });
+
   it("mixed_batch_keeps_edit_order", async () => {
     const h = harness();
     const ref = scene();

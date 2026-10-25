@@ -13,7 +13,7 @@ import {
   toleranceLimit,
   topologyOf,
 } from "../src/panels/collision-math";
-import { describeReport, summarize } from "../src/panels/repair-summary";
+import { describeJoin, describeReport, summarize } from "../src/panels/repair-summary";
 
 describe("collision math", () => {
   it("nice_scale", () => {
@@ -242,6 +242,12 @@ describe("repair summaries", () => {
     expect(describeReport("smooth", { moved: 1, maxDisplacement: 2 })).toBe("Smooth: moved 1 vertex (max 2)");
     expect(describeReport("remesh", { splits: 12, collapses: 2, flips: 1, rounds: 4 })).toBe(
       "Remesh: 12 splits, 2 collapses, 1 flip in 4 rounds",
+    );
+    expect(describeReport("bridgeLoops", { trianglesAdded: 8 })).toBe(
+      "Bridge loops: added 8 triangles",
+    );
+    expect(describeJoin({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 })).toBe(
+      "Join: copied 4 vertices and 2 triangles, bridged 8 triangles",
     );
   });
 });

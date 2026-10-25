@@ -17,6 +17,8 @@
 //!   [`SceneError`], so repair operations from [`ops`] (the re-exported
 //!   `fast-mesh-ops`) run directly:
 //!   `scene.edit(id, |tx| ops::fill_holes(tx, &options))`.
+//! - Joining: [`Scene::join`] appends one mesh's geometry into another and
+//!   bridges a loop on each, as one undo step, then removes the source mesh.
 //! - History: one undo history across all meshes, in steps.
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
@@ -77,6 +79,7 @@ mod error;
 mod fields;
 mod history;
 mod id;
+mod join;
 mod normals;
 mod placement;
 mod query;
@@ -93,6 +96,7 @@ pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
 pub use fields::{Coloring, DistanceField, FieldBudget, FieldStatus, StepState};
 pub use id::MeshId;
+pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,

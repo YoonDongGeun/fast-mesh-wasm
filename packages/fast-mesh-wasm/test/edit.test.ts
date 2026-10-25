@@ -6,6 +6,12 @@ import { FastMeshError, type LoopId, Scene, type Vec3 } from "../src/node.js";
 // Two triangles on the XY plane facing +Z.
 const quad = [0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0];
 const quadTris = [0, 1, 2, 0, 2, 3];
+// Two quads facing away across the z=0..1 gap (A faces -Z, B faces +Z).
+const bridgePos = [
+  0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+  0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1,
+];
+const bridgeIdx = [0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7];
 // A quarter turn about +z, row-major.
 const QUARTER_Z = [0, -1, 0, 1, 0, 0, 0, 0, 1];
 
@@ -563,6 +569,29 @@ describe("analyze and repair", () => {
     );
   });
 
+  it("bridgeLoops_joins_two_rims", () => {
+    const s = scene();
+    const m = s.addMesh(bridgePos, bridgeIdx);
+    const loops = s.analyze(m).loops;
+    expect(loops.length).toBe(2);
+    const ids: LoopId[] = loops.map((l) => l.id);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const r = s.repair(m, { op: "bridgeLoops", loops: [ids[0], ids[1]] });
+    expect(r.trianglesAdded).toBe(8);
+    expect(s.views(m).indices().length).toBe(beforeIdx.length + 24);
+    // One undo entry for the call, restoring positions and topology (dead
+    // slots past the originals read back as zeros).
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions().subarray(0, beforePos.length))).toEqual(
+      Array.from(beforePos),
+    );
+    expect(Array.from(s.views(m).indices().subarray(0, beforeIdx.length))).toEqual(
+      Array.from(beforeIdx),
+    );
+  });
+
   it("remesh_rejects_invalid_region", () => {
     const s = scene();
     const m = s.addMesh(quad, quadTris);
@@ -584,6 +613,80 @@ describe("analyze and repair", () => {
     expect(s.canUndo()).toBe(undoable);
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(beforePos));
     expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
+  });
+
+  it("bridgeLoops_rejects_bad_selection", () => {
+    const s = scene();
+    const m = s.addMesh(bridgePos, bridgeIdx);
+    const loops = s.analyze(m).loops;
+    expect(loops.length).toBe(2);
+    const ids: LoopId[] = loops.map((l) => l.id);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const good = { op: "bridgeLoops", loops: [ids[0], ids[1]] } as const;
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { op: "bridgeLoops", loops: [ids[0], ids[0]] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    const fake = { ...ids[1], hash: ids[1].hash ^ 1n };
+    expect(codeOf(() => s.repair(m, { op: "bridgeLoops", loops: [ids[0], fake] }))).toBe(
+      "STALE_LOOPS",
+    );
+    expect(codeOf(() => s.repair(m, { op: "bridgeLoops", loops: [ids[0]] as never }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(codeOf(() => s.repair(m, { op: "bridgeLoops", loops: "nope" as never }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(codeOf(() => s.repair(m, { ...good, maxEdges: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxEdges: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, maxEdges: 1.5 }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(beforePos));
+    expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
+  });
+
+  it("join_merges_source_into_target", () => {
+    const s = scene();
+    const a = s.addMesh(bridgePos.slice(0, 12), bridgeIdx.slice(0, 6));
+    const b = s.addMesh(
+      bridgePos.slice(12),
+      bridgeIdx.slice(6).map((v) => v - 4),
+    );
+    const loopA = s.analyze(a).loops[0].id;
+    const loopB = s.analyze(b).loops[0].id;
+    const r = s.join(a, b, { loopA, loopB });
+    expect(r).toEqual({ verticesAdded: 4, trianglesAdded: 2, bridgeTrianglesAdded: 8 });
+    expect(s.triangleCount(a)).toBe(2 + 2 + 8);
+    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
+    // One undo step restores the target; the source stays removed.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(a)).toBe(2);
+    expect(codeOf(() => s.triangleCount(b))).toBe("UNKNOWN_MESH");
+    expect(s.redo()).toBe(true);
+    expect(s.triangleCount(a)).toBe(2 + 2 + 8);
+  });
+
+  it("join_rejects_bad_selection", () => {
+    const s = scene();
+    const a = s.addMesh(bridgePos.slice(0, 12), bridgeIdx.slice(0, 6));
+    const b = s.addMesh(
+      bridgePos.slice(12),
+      bridgeIdx.slice(6).map((v) => v - 4),
+    );
+    const loopA = s.analyze(a).loops[0].id;
+    const loopB = s.analyze(b).loops[0].id;
+    const good = { loopA, loopB };
+    expect(codeOf(() => s.join(a, a, good))).toBe("INVALID_ARGUMENT");
+    const fake = { ...loopB, hash: loopB.hash ^ 1n };
+    expect(codeOf(() => s.join(a, b, { loopA, loopB: fake }))).toBe("STALE_LOOPS");
+    expect(codeOf(() => s.join(a, b, { loopA: fake, loopB }))).toBe("STALE_LOOPS");
+    expect(codeOf(() => s.join(a, b, { ...good, maxEdges: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.join(a, b, { loopA, loopB: "nope" as never }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(a)).toBe(2);
+    expect(s.triangleCount(b)).toBe(2);
   });
 
   it("stale_loops_error_code", () => {

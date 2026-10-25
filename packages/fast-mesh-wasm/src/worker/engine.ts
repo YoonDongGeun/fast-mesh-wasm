@@ -21,6 +21,7 @@ import {
   type EditOp,
   type FieldHandle,
   fieldSteps,
+  type JoinOptions,
   meshAdds,
   type MeshChange,
   type MeshHandle,
@@ -864,6 +865,8 @@ class Engine {
       case "edit":
       case "repair":
         return this.#pending(req.id);
+      case "join":
+        return this.#pending(req.target, req.source);
       case "coloring":
         return this.#pending(req.id) || (req.rule !== null && this.#fieldPending(req.rule?.field));
       case "fetchFieldValues":
@@ -948,8 +951,8 @@ class Engine {
 
   /**
    * Whether `req` may change the positions, normals or triangles of the
-   * mesh `id`: an edit, repair, compaction or removal of it, or any undo
-   * or redo.
+   * mesh `id`: an edit, repair, compaction, join or removal of it, or any
+   * undo or redo.
    */
   #changesMesh(req: Request, id: ClientId): boolean {
     switch (req.kind) {
@@ -958,6 +961,8 @@ class Engine {
       case "compact":
       case "removeMesh":
         return req.id === id;
+      case "join":
+        return req.target === id || req.source === id;
       case "undo":
       case "redo":
         return true;
@@ -1241,8 +1246,8 @@ class Engine {
    * Whether the queued `req` makes a field step unit over `meshes` (the
    * meshes its fields are on and measured to) stale (§6.1): a drag move
    * (only with `moves`: within the starvation guard), a drag cancel or a
-   * placement, an edit, repair, compaction or removal of one of them, an
-   * undo or redo, or the removal of a field between two of them.
+   * placement, an edit, repair, compaction, join or removal of one of them,
+   * an undo or redo, or the removal of a field between two of them.
    */
   #makesStale(req: Request, meshes: Set<ClientId>, moves: boolean): boolean {
     switch (req.kind) {
@@ -1258,6 +1263,8 @@ class Engine {
       case "compact":
       case "removeMesh":
         return meshes.has(req.id);
+      case "join":
+        return meshes.has(req.target) || meshes.has(req.source);
       case "undo":
       case "redo":
         return true;
@@ -1603,6 +1610,34 @@ class Engine {
     return this.#meshIds.get(h) as ClientId;
   }
 
+  /**
+   * Drops engine-side references of a removed mesh: fields on it (or only
+   * to it) and its section entries. The scene did the same with the mesh.
+   */
+  #dropMeshRefs(id: ClientId): void {
+    for (const [field, [on, ...to]] of this.#fieldMeshes) {
+      if (on === id || (to.length === 1 && to[0] === id)) {
+        this.#dropField(field);
+      } else if (to.includes(id)) {
+        // The field keeps its other targets; so does a deferred build.
+        this.#fieldMeshes.set(field, [on, ...to.filter((m) => m !== id)]);
+        const desc = this.#deferred.get(field);
+        if (desc !== undefined) {
+          this.#deferred.set(field, { ...desc, to: desc.to.filter((m) => m !== id) });
+        }
+      }
+    }
+    for (const [section, meshes] of this.#sectionMeshes) {
+      if (meshes.includes(id)) {
+        this.#sectionMeshes.set(
+          section,
+          meshes.filter((m) => m !== id),
+        );
+        this.#goneEntries.push({ section, mesh: id });
+      }
+    }
+  }
+
   // ---- Requests ----
 
   #run(req: Request, b: Batch): void {
@@ -1627,27 +1662,22 @@ class Engine {
         if (this.#drag?.id === req.id) {
           this.#drag = undefined;
         }
-        // The scene drops the fields on or to the mesh, and its section entries.
-        for (const [field, [on, ...to]] of this.#fieldMeshes) {
-          if (on === req.id || (to.length === 1 && to[0] === req.id)) {
-            this.#dropField(field);
-          } else if (to.includes(req.id)) {
-            // The field keeps its other targets; so does a deferred build.
-            this.#fieldMeshes.set(field, [on, ...to.filter((m) => m !== req.id)]);
-            const desc = this.#deferred.get(field);
-            if (desc !== undefined) {
-              this.#deferred.set(field, { ...desc, to: desc.to.filter((m) => m !== req.id) });
-            }
-          }
+        this.#dropMeshRefs(req.id);
+        return;
+      }
+      case "join": {
+        const target = this.#mesh(req.target);
+        const source = this.#mesh(req.source);
+        const value = s.join(target, source, req.payload as JoinOptions);
+        this.#meshes.delete(req.source);
+        // `#meshIds` keeps the handle until its removal record is sent.
+        this.#removed.push(source);
+        if (this.#drag?.id === req.source) {
+          this.#drag = undefined;
         }
-        for (const [section, meshes] of this.#sectionMeshes) {
-          if (meshes.includes(req.id)) {
-            this.#sectionMeshes.set(
-              section,
-              meshes.filter((m) => m !== req.id),
-            );
-            this.#goneEntries.push({ section, mesh: req.id });
-          }
+        this.#dropMeshRefs(req.source);
+        if (req.qid !== undefined) {
+          b.replies.push({ qid: req.qid, ok: true, value });
         }
         return;
       }

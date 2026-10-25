@@ -25,6 +25,8 @@ import type {
   EditResult,
   FieldStatus,
   FindContactsOptions,
+  JoinOptions,
+  JoinReport,
   MeshChange,
   MeshDistance,
   RaycastOptions,
@@ -1455,8 +1457,45 @@ export class WorkerScene implements SceneLike {
     if (this.#drag?.mesh === st) {
       this.#drag.end();
     }
-    st.removed = true;
     const rev = ++this.#rev;
+    this.#noteRemoved(st, rev);
+    this.#push({ kind: "removeMesh", rev, id: st.id });
+  }
+
+  /**
+   * Joins `source` into `target`; see `Scene.join`. The source stays usable
+   * until the join lands: only a successful result removes it (a failed join
+   * changes nothing, engine-side or here).
+   */
+  join(target: MeshHandle, source: MeshHandle, options: JoinOptions): Promise<JoinReport> {
+    const ta = this.#live(target);
+    const st = this.#live(source);
+    if (this.#drag?.mesh === st) {
+      this.#drag.end();
+    }
+    const payload = copyInput(options, "options");
+    // `#ask` runs `make` synchronously, so `rev` is set before `then` runs.
+    let rev = 0;
+    const done = this.#ask(
+      (r, qid) => {
+        rev = r;
+        return { kind: "join", rev: r, target: ta.id, source: st.id, payload, qid };
+      },
+      (v) => v as JoinReport,
+    );
+    return done.then((report) => {
+      this.#noteRemoved(st, rev);
+      return report;
+    });
+  }
+
+  /**
+   * Notes a mesh as removed at `rev`: later calls on it give `UNKNOWN_MESH`,
+   * fields on it (or only to it) are dropped and its section entries go. The
+   * engine does the same when the removal lands.
+   */
+  #noteRemoved(st: MeshState, rev: number): void {
+    st.removed = true;
     for (const f of this.#fields.values()) {
       if (f.removed) {
         continue;
@@ -1474,7 +1513,6 @@ export class WorkerScene implements SceneLike {
         s.meshes = s.meshes.filter((m) => m !== st);
       }
     }
-    this.#push({ kind: "removeMesh", rev, id: st.id });
   }
 
   /** Sets a mesh's placement (one undo step); `placement()` follows when the result arrives. */

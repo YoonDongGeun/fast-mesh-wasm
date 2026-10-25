@@ -42,6 +42,8 @@
 //! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles`.
 //! - `7` remesh: `cx, cy, cz, radius, target_length (NaN for the mesh mean),
 //!   max_rounds (NaN for the default)`.
+//! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
+//!   ids are taken from `loops`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -60,11 +62,13 @@
 //! - inflate: `moved, max_displacement`.
 //! - smooth: `moved, max_displacement`.
 //! - remesh: `splits, collapses, flips, rounds`.
+//! - bridge loops: `triangles_added`.
 //!
 //! # Analysis
 //!
 //! One `f64` array, see [`encode_analysis`].
 
+use fast_mesh_ops::bridge::BridgeOptions;
 use fast_mesh_ops::deform::{Brush, Falloff, InflateOptions, SmoothOptions};
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::{
@@ -350,6 +354,7 @@ pub(crate) enum RepairOp {
     Inflate(InflateOptions),
     Smooth(SmoothOptions),
     Remesh(RemeshOptions),
+    Bridge(BridgeOptions),
 }
 
 /// A flag: 0 or 1.
@@ -375,7 +380,7 @@ fn falloff(v: f64) -> Result<Falloff, Error> {
 }
 
 /// A count, or `None` for NaN.
-fn count_opt(v: f64, what: &str) -> Result<Option<usize>, Error> {
+pub(crate) fn count_opt(v: f64, what: &str) -> Result<Option<usize>, Error> {
     if v.is_nan() {
         return Ok(None);
     }
@@ -393,7 +398,7 @@ fn bound(v: f64) -> Option<f64> {
     (!v.is_nan()).then_some(v)
 }
 
-fn loop_id(w: [u32; 4]) -> LoopId {
+pub(crate) fn loop_id(w: [u32; 4]) -> LoopId {
     LoopId {
         min_vertex: w[0],
         len: w[1],
@@ -510,6 +515,14 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     None => REMESH_MAX_ROUNDS,
                     Some(r) => r?,
                 },
+            })
+        } else if code == 8.0 {
+            let [max_e]: [f64; 1] = words.take(1)?.try_into().map_err(|_| malformed(WHAT))?;
+            let flat = ids.take(8)?;
+            let pair = flat.as_chunks::<4>().0;
+            RepairOp::Bridge(BridgeOptions {
+                loops: (loop_id(pair[0]), loop_id(pair[1])),
+                max_edges: count_opt(max_e, "maxEdges")?,
             })
         } else {
             return Err(Error::invalid("unknown repair op"));
@@ -647,6 +660,10 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                         count(r.rounds),
                     ],
                 )?;
+            }
+            RepairOp::Bridge(o) => {
+                let r = fast_mesh_ops::bridge::bridge_loops(tx, o)?;
+                put(&mut out, &[count(r.triangles_added)])?;
             }
         }
     }
@@ -918,5 +935,58 @@ mod tests {
             code(&[7., 0., 0., 0., 1., nan, 2f64.powi(32)]),
             codes::INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn decode_repair_bridge() {
+        use fast_mesh_ops::LoopId;
+        use fast_mesh_ops::bridge::BridgeOptions;
+
+        let nan = f64::NAN;
+        let ids = |a: [u32; 4], b: [u32; 4]| [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
+        let d = decode_repair(&[8., 64.], &ids([0, 4, 11, 22], [4, 4, 33, 44])).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Bridge(BridgeOptions {
+                loops: (
+                    LoopId {
+                        min_vertex: 0,
+                        len: 4,
+                        hash: 11 | (22 << 32),
+                    },
+                    LoopId {
+                        min_vertex: 4,
+                        len: 4,
+                        hash: 33 | (44 << 32),
+                    },
+                ),
+                max_edges: Some(64),
+            })]
+        );
+        let d = decode_repair(&[8., nan], &ids([0, 4, 11, 22], [4, 4, 33, 44])).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Bridge(BridgeOptions {
+                loops: (
+                    LoopId {
+                        min_vertex: 0,
+                        len: 4,
+                        hash: 11 | (22 << 32),
+                    },
+                    LoopId {
+                        min_vertex: 4,
+                        len: 4,
+                        hash: 33 | (44 << 32),
+                    },
+                ),
+                max_edges: None,
+            })]
+        );
+        let code = |ops: &[f64], ids: &[u32]| decode_repair(ops, ids).unwrap_err().code;
+        let full = ids([0, 4, 11, 22], [4, 4, 33, 44]);
+        assert_eq!(code(&[8.], &full), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[8., nan], &[0, 4, 11]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[8., -1.], &full), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[8., 1.5], &full), codes::INVALID_ARGUMENT);
     }
 }
