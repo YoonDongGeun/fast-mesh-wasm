@@ -21,16 +21,17 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, MeshBuild,
-    MeshId, MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions, SceneError,
-    SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
-    UpdateMode,
+    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, JoinOptions,
+    MeshBuild, MeshId, MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions,
+    SceneError, SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode,
+    StepState, UpdateMode,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
 
 use crate::edit::{
-    decode_edit, decode_repair, encode_added, encode_analysis, run_edit, run_repair,
+    count_opt, decode_edit, decode_repair, encode_added, encode_analysis, loop_id, run_edit,
+    run_repair,
 };
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode};
@@ -882,6 +883,40 @@ impl WasmScene {
         let id = self.id(index, generation)?;
         let decoded = decode_repair(ops, loops)?;
         Ok(self.scene.edit(id, |tx| run_repair(tx, &decoded))?)
+    }
+
+    /// Joins mesh B into mesh A: copies B's geometry into A, bridges the two
+    /// loops and removes B; see [`Scene::join`]. `loops` holds the two loop
+    /// ids (`min_vertex, len, hash low, hash high` each, A's first) and
+    /// `max_edges` is NaN for the default. Returns `[vertices_added,
+    /// triangles_added, bridge_triangles_added]`.
+    pub fn join(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+        loops: &[u32],
+        max_edges: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        let (pair, rest) = loops.as_chunks::<4>();
+        if !rest.is_empty() || pair.len() != 2 {
+            return Err(Error::invalid("join needs two loop ids"));
+        }
+        let options = JoinOptions {
+            loop_a: loop_id(pair[0]),
+            loop_b: loop_id(pair[1]),
+            max_edges: count_opt(max_edges, "maxEdges")?,
+        };
+        let r = self.scene.join(a, b, &options)?;
+        self.render.remove(&b);
+        Ok(vec![
+            r.vertices_added as f64,
+            r.triangles_added as f64,
+            r.bridge_triangles_added as f64,
+        ])
     }
 
     // ---- Queries (world space) ----
@@ -2316,5 +2351,71 @@ mod tests {
             code(s.section_gap(sec, ai, ag, bi, bg)),
             codes::UNKNOWN_SECTION
         );
+    }
+
+    #[test]
+    fn join_merges_source_and_reports_counts() {
+        use fast_mesh_ops::LoopId;
+        use fast_mesh_ops::boundary_loops;
+
+        // Quad A at z=0 facing -z, quad B at z=1 facing +z.
+        let mut s = WasmScene::new();
+        let a = s
+            .add_mesh(
+                &[0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0.],
+                &[0, 2, 1, 0, 3, 2],
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        let b = s
+            .add_mesh(
+                &[0., 0., 1., 1., 0., 1., 1., 1., 1., 0., 1., 1.],
+                &[0, 1, 2, 0, 2, 3],
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        let (ai, ag) = (a[0], a[1]);
+        let (bi, bg) = (b[0], b[1]);
+        let flat = |id: LoopId| {
+            [
+                id.min_vertex,
+                id.len,
+                id.hash as u32,
+                (id.hash >> 32) as u32,
+            ]
+        };
+        let loop_id = |s: &WasmScene, i: u32, g: u32| {
+            boundary_loops(s.scene.mesh(s.id(i, g).unwrap()).unwrap()).unwrap()[0].id
+        };
+        let la = flat(loop_id(&s, ai, ag));
+        let lb = flat(loop_id(&s, bi, bg));
+        let loops = [la[0], la[1], la[2], la[3], lb[0], lb[1], lb[2], lb[3]];
+
+        assert_eq!(
+            code(s.join(ai, ag, bi, bg, &loops[..4], f64::NAN)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.join(ai, ag, bi, bg, &loops, -1.0)),
+            codes::INVALID_ARGUMENT
+        );
+        let fake = [loops[0], loops[1], loops[2], loops[3], 99, 4, 7, 0];
+        assert_eq!(
+            code(s.join(ai, ag, bi, bg, &fake, f64::NAN)),
+            codes::STALE_LOOPS
+        );
+
+        assert_eq!(
+            s.join(ai, ag, bi, bg, &loops, f64::NAN).unwrap(),
+            vec![4.0, 2.0, 8.0]
+        );
+        assert_eq!(s.triangle_count(ai, ag).unwrap(), 2 + 2 + 8);
+        assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
+        assert!(s.undo().unwrap());
+        assert_eq!(s.triangle_count(ai, ag).unwrap(), 2);
     }
 }

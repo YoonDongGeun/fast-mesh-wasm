@@ -380,7 +380,7 @@ fn falloff(v: f64) -> Result<Falloff, Error> {
 }
 
 /// A count, or `None` for NaN.
-fn count_opt(v: f64, what: &str) -> Result<Option<usize>, Error> {
+pub(crate) fn count_opt(v: f64, what: &str) -> Result<Option<usize>, Error> {
     if v.is_nan() {
         return Ok(None);
     }
@@ -398,7 +398,7 @@ fn bound(v: f64) -> Option<f64> {
     (!v.is_nan()).then_some(v)
 }
 
-fn loop_id(w: [u32; 4]) -> LoopId {
+pub(crate) fn loop_id(w: [u32; 4]) -> LoopId {
     LoopId {
         min_vertex: w[0],
         len: w[1],
