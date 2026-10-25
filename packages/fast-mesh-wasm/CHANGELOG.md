@@ -1,5 +1,17 @@
 # fast-mesh-wasm
 
+## 0.5.0
+
+### Minor Changes
+
+- [#86](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/86) [`495393f`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/495393f2482179d6f65fb066533f3f62b2212d04) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Bridge-loops repair op. `scene.repair(mesh, { op: "bridgeLoops", loops: [a, b], maxEdges })` stitches a minimum-area triangle tube between two boundary loops picked from `analyze(mesh).loops`; the loops must wind in opposite directions. Each call is one undo entry; bad selections report `INVALID_ARGUMENT` and unknown ids report `STALE_LOOPS`.
+  
+  Mesh join. `scene.join(target, source, { loopA, loopB, maxEdges })` copies the source mesh's geometry into the target (keeping its world shape), bridges the two loops and removes the source. The copy and the bridge undo as one step; the removal is permanent. Also on `WorkerScene` (async, the source stays usable until the join lands).
+
+- [#83](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/83) [`d844560`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/d8445609bcb4ff273afa6562c5224d90377cac2b) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Brush deformation repair ops. `scene.repair(mesh, { op: "inflate", center, radius, falloff, strength })` displaces vertices along their smooth normals (negative strength deflates), and `{ op: "smooth", center, radius, falloff, strength, cycles }` applies masked Taubin smoothing. Each call is one undo entry; invalid brushes report `INVALID_ARGUMENT`.
+
+- [#85](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/85) [`5986181`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/5986181e5218d46f7b543047abc538a8c6d45d02) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Region remeshing repair op. `scene.repair(mesh, { op: "remesh", center, radius, targetLength, maxRounds })` retriangulates the edges under a spherical region toward a target edge length (unset means the mesh-wide mean) with midpoint splits, midpoint collapses, and angle-improving flips. Boundary edges never collapse; each call is one undo entry; invalid regions report `INVALID_ARGUMENT`.
+
 ## 0.4.0
 
 ### Minor Changes
