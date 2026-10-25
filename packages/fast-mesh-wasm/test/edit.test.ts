@@ -280,6 +280,31 @@ function damagedHemisphere() {
   return { positions, indices: kept.flat() };
 }
 
+/** 3x3 flat grid in z=0, spacing 1, centered at the origin; vertex (x, y) has id y*3+x, wound CCW from +Z. */
+function flatGrid(): { positions: number[]; indices: number[] } {
+  const positions: number[] = [];
+  for (let y = 0; y < 3; y++) {
+    for (let x = 0; x < 3; x++) {
+      positions.push(x - 1, y - 1, 0);
+    }
+  }
+  const indices: number[] = [];
+  for (let y = 0; y < 2; y++) {
+    for (let x = 0; x < 2; x++) {
+      const a = y * 3 + x;
+      indices.push(a, a + 1, a + 4, a, a + 4, a + 3);
+    }
+  }
+  return { positions, indices };
+}
+
+/** Square pyramid with a closed base; apex id 4 at (0.5, 0.5, 1). */
+function pyramid(): { positions: number[]; indices: number[] } {
+  const positions = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0.5, 0.5, 1];
+  const indices = [0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4, 0, 2, 1, 0, 3, 2];
+  return { positions, indices };
+}
+
 describe("analyze and repair", () => {
   it("repair_pipeline_one_undo_step", () => {
     const s = scene();
@@ -370,6 +395,147 @@ describe("analyze and repair", () => {
     expect(codeOf(() => s.repair(m, { op: "melt" } as never))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.analyze(m, { weldTolerance: -1 }))).toBe("INVALID_ARGUMENT");
     expect(s.canUndo()).toBe(undoable);
+  });
+
+  it("inflate_moves_brushed_vertices_along_normal", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    expect(s.canUndo()).toBe(false);
+    const before = Float32Array.from(s.views(m).positions());
+    // Brush center in local coordinates: the middle vertex (id 4).
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const r = s.repair(m, { op: "inflate", center, radius: 0.6, falloff: "linear", strength: 2 });
+    expect(r.moved).toBe(1);
+    expect(r.maxDisplacement).toBeCloseTo(2, 4);
+    const after = s.views(m).positions();
+    // The brushed vertex moved along z only (a flat grid's smooth normal is
+    // ±z); every other vertex is bit-identical.
+    expect(after[12] - before[12]).toBeCloseTo(0, 6);
+    expect(after[13] - before[13]).toBeCloseTo(0, 6);
+    expect(Math.abs(after[14] - before[14])).toBeCloseTo(2, 4);
+    for (const v of [0, 1, 2, 3, 5, 6, 7, 8]) {
+      expect(Array.from(after.subarray(3 * v, 3 * v + 3))).toEqual(
+        Array.from(before.subarray(3 * v, 3 * v + 3)),
+      );
+    }
+    // One undo entry for the call.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+    // The "smooth" falloff wires through too (weight 1 at the center).
+    const r2 = s.repair(m, { op: "inflate", center, radius: 0.6, falloff: "smooth", strength: 2 });
+    expect(r2.moved).toBe(1);
+    expect(r2.maxDisplacement).toBeCloseTo(2, 4);
+  });
+
+  it("inflate_rejects_invalid_brush", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const undoable = s.canUndo();
+    expect(
+      codeOf(() => s.repair(m, { op: "inflate", center, radius: -1, falloff: "linear", strength: 1 })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.repair(m, { op: "inflate", center, radius: 0, falloff: "linear", strength: 1 })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(
+        () => s.repair(m, { op: "inflate", center, radius: 0.6, falloff: "linear", strength: NaN }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(
+        () => s.repair(m, { op: "inflate", center, radius: NaN, falloff: "linear", strength: 1 }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(
+        () =>
+          s.repair(m, { op: "inflate", center, radius: 0.6, falloff: "cubic" as never, strength: 1 }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(
+        () =>
+          s.repair(m, {
+            op: "inflate",
+            center: [0, 0] as never,
+            radius: 0.6,
+            falloff: "linear",
+            strength: 1,
+          }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
+  it("smooth_reduces_spike", () => {
+    const s = scene();
+    const { positions, indices } = pyramid();
+    const m = s.addMesh(positions, indices);
+    expect(s.canUndo()).toBe(false);
+    const before = Float32Array.from(s.views(m).positions());
+    const apex: Vec3 = [before[12], before[13], before[14]];
+    const distBefore = apex[2] - before[2];
+    expect(distBefore).toBeCloseTo(1, 6);
+    const r = s.repair(m, {
+      op: "smooth",
+      center: apex,
+      radius: 0.6,
+      falloff: "smooth",
+      strength: 1,
+      cycles: 1,
+    });
+    expect(r.moved).toBe(1);
+    const after = Float32Array.from(s.views(m).positions());
+    const distAfter = after[14] - after[2];
+    expect(distAfter).toBeLessThan(distBefore);
+    expect(distAfter).toBeCloseTo(0.8978, 3);
+    expect(r.maxDisplacement).toBeCloseTo(distBefore - distAfter, 4);
+    for (const v of [0, 1, 2, 3]) {
+      expect(Array.from(after.subarray(3 * v, 3 * v + 3))).toEqual(
+        Array.from(before.subarray(3 * v, 3 * v + 3)),
+      );
+    }
+    // One undo entry for the call.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+    // Zero cycles move nothing.
+    const r0 = s.repair(m, {
+      op: "smooth",
+      center: apex,
+      radius: 0.6,
+      falloff: "smooth",
+      strength: 1,
+      cycles: 0,
+    });
+    expect(r0).toEqual({ moved: 0, maxDisplacement: 0 });
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
+  it("smooth_rejects_invalid_brush", () => {
+    const s = scene();
+    const { positions, indices } = pyramid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const apex: Vec3 = [before[12], before[13], before[14]];
+    const good = { op: "smooth", center: apex, radius: 0.6, falloff: "smooth", strength: 1, cycles: 1 } as const;
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { ...good, radius: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, strength: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, cycles: 1.5 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, cycles: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, falloff: "cubic" as never }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
   });
 
   it("stale_loops_error_code", () => {

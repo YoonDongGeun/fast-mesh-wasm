@@ -494,6 +494,26 @@ export type RepairOp =
       maxDihedral?: number;
       /** Stop refining a patch once it has this many new vertices. */
       maxRefineVertices?: number;
+    }
+  | {
+      op: "inflate";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; negative pulls instead of pushing. */
+      strength: number;
+    }
+  | {
+      op: "smooth";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; the per-vertex weight is `strength * falloff`. */
+      strength: number;
+      /** How many Taubin λ/μ cycles to run; 0 moves nothing. */
+      cycles: number;
     };
 
 /** What `weld` did. */
@@ -547,8 +567,27 @@ export interface FillReport {
   failed: { id: LoopId; reason: "projectionFolds" | "noValidTriangulation" | "solver" }[];
 }
 
+/** What `inflate` did. */
+export interface InflateReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** What `smooth` did. */
+export interface SmoothReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
 /** The report of a {@link RepairOp}. */
-export type RepairReport = WeldReport | DegenerateReport | RemoveReport | OrientReport | FillReport;
+export type RepairReport =
+  | WeldReport
+  | DegenerateReport
+  | RemoveReport
+  | OrientReport
+  | FillReport
+  | InflateReport
+  | SmoothReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -561,7 +600,11 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
         ? OrientReport
         : O extends { op: "fillHoles" }
           ? FillReport
-          : RepairReport;
+          : O extends { op: "inflate" }
+            ? InflateReport
+            : O extends { op: "smooth" }
+              ? SmoothReport
+              : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -710,7 +753,17 @@ function encodeEdit(ops: readonly EditOp[]): { words: Uint32Array; values: Float
   return { words: out, values: flat };
 }
 
-const REPAIR_CODES = { weld: 0, removeDegenerate: 1, removeSmallComponents: 2, orient: 3, fillHoles: 4 } as const;
+const REPAIR_CODES = {
+  weld: 0,
+  removeDegenerate: 1,
+  removeSmallComponents: 2,
+  orient: 3,
+  fillHoles: 4,
+  inflate: 5,
+  smooth: 6,
+} as const;
+
+const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
 function optional(v: number | undefined, what: string): number {
@@ -725,6 +778,15 @@ function optional(v: number | undefined, what: string): number {
 
 function flagOf(v: boolean | undefined, fallback: boolean): number {
   return (v ?? fallback) ? 1 : 0;
+}
+
+/** A brush center as 3 values; anything else is `INVALID_ARGUMENT`. */
+function centerOf(center: Readonly<Vec3>, values: number[]): void {
+  const c = center as readonly number[] | undefined;
+  if (c?.length !== 3 || ![c[0], c[1], c[2]].every(Number.isFinite)) {
+    throw invalid("center must be 3 finite numbers");
+  }
+  values.push(c[0], c[1], c[2]);
 }
 
 /** A loop id as the binding's `minVertex, len, hash low, hash high`. */
@@ -787,6 +849,23 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         );
         break;
       }
+      case "inflate":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+        );
+        break;
+      case "smooth":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          optional(o.cycles, "cycles"),
+        );
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -869,6 +948,10 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
         skipped: r.many(() => ({ id: r.loopId(), reason: SKIP_REASONS[r.next()] })),
         failed: r.many(() => ({ id: r.loopId(), reason: FAIL_REASONS[r.next()] })),
       };
+    case "inflate":
+      return { moved: r.next(), maxDisplacement: r.next() };
+    case "smooth":
+      return { moved: r.next(), maxDisplacement: r.next() };
   }
 }
 
