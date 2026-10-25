@@ -117,17 +117,36 @@ fn oom() -> StoreError {
     StoreError::OutOfMemory
 }
 
-/// The ids of `lists` below `limit`, ascending without duplicates.
-fn slots(lists: &[&[u32]], limit: usize) -> Result<Vec<u32>, StoreError> {
+/// Buffers over this many slots report "all" past half dirty (see
+/// [`slots`]); smaller ones sort cheaply and keep exact ranges.
+const DENSE_MIN_SLOTS: usize = 8;
+
+/// The ids of `lists` below `limit`, ascending without duplicates, or
+/// `None` for "all" when past half the slots are dirty: a dense frame
+/// uploads everything anyway, and skipping the sort avoids the `O(n log n)`
+/// work. Tiny buffers are exempt (see [`DENSE_MIN_SLOTS`]).
+///
+/// Only in-range ids count toward the gate; out-of-range ids are dropped.
+/// The lists are expected unique, as `ChangeSet` lists are, so a
+/// duplicate-heavy input may still report "all" (a safe superset).
+fn slots(lists: &[&[u32]], limit: usize) -> Result<Option<Vec<u32>>, StoreError> {
+    let in_range: usize = lists
+        .iter()
+        .flat_map(|l| l.iter())
+        .filter(|s| (**s as usize) < limit)
+        .count();
+    if limit > DENSE_MIN_SLOTS && in_range > limit / 2 {
+        return Ok(None);
+    }
     let mut out = Vec::new();
-    out.try_reserve_exact(lists.iter().map(|l| l.len()).sum())
-        .map_err(|_| oom())?;
+    let raw: usize = lists.iter().map(|l| l.len()).sum();
+    out.try_reserve_exact(raw).map_err(|_| oom())?;
     for l in lists {
         out.extend(l.iter().copied().filter(|&s| (s as usize) < limit));
     }
     out.sort_unstable();
     out.dedup();
-    Ok(out)
+    Ok(Some(out))
 }
 
 impl RenderState {
@@ -205,30 +224,28 @@ impl RenderState {
         // Every allocation comes first, so a failure changes nothing.
         let positions = match set {
             None => None,
-            Some(c) => Some(slots(
+            Some(c) => slots(
                 &[&c.vertices_moved, &c.vertices_added, &c.vertices_removed],
                 vs,
-            )?),
+            )?,
         };
         let indices = match set {
             None => None,
-            Some(c) => Some(slots(
+            Some(c) => slots(
                 &[
                     &c.triangles_added,
                     &c.triangles_removed,
                     &c.triangles_changed,
                 ],
                 ts,
-            )?),
+            )?,
         };
         let normals = match &changes.normals_dirty {
-            Some(n) if !self.stale && normals_len == self.normals_len => {
-                Some(slots(&[n], normals_len)?)
-            }
+            Some(n) if !self.stale && normals_len == self.normals_len => slots(&[n], normals_len)?,
             _ => None,
         };
         let colors = match &changes.colors_dirty {
-            Some(c) if !self.stale => Some(slots(&[c], vs)?),
+            Some(c) if !self.stale => slots(&[c], vs)?,
             _ => None,
         };
         self.normals_len = normals_len;
@@ -333,6 +350,26 @@ mod tests {
     fn step(scene: &mut Scene, id: MeshId, state: &mut RenderState) -> Dirty {
         let ch = take(scene, id);
         state.apply(scene.mesh(id).unwrap(), &ch, 0).unwrap()
+    }
+
+    #[test]
+    fn dense_slots_report_all() {
+        // Past half dirty on a buffer over the gate: "all".
+        let every: Vec<u32> = (0..100).collect();
+        assert_eq!(slots(&[&every], 100), Ok(None));
+        // Sparse stays exact, whatever the buffer size...
+        assert_eq!(slots(&[&[3, 1]], 100), Ok(Some(vec![1, 3])));
+        // ...and tiny buffers keep exact ranges even past half.
+        assert_eq!(slots(&[&[0, 1, 3, 9]], 2), Ok(Some(vec![0, 1])));
+    }
+
+    #[test]
+    fn dense_gate_ignores_out_of_range_ids() {
+        // Out-of-range ids are dropped, so they must not trip the gate: 10
+        // in-range ids on a 100-slot buffer stay exact however many strays
+        // pad the input.
+        let padded: Vec<u32> = (0..10).chain(1000..1100).collect();
+        assert_eq!(slots(&[&padded], 100), Ok(Some((0..10).collect())));
     }
 
     #[test]

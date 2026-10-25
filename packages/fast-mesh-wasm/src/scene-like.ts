@@ -4,7 +4,7 @@
 // pass them back to these methods. A host other than `Scene` hands out
 // instances of the same nominal classes (`new MeshHandle()`,
 // `new SectionHandle()`) and keeps its own map from them to its ids.
-import type { Placement } from "./api.js";
+import type { Bounds, Placement } from "./api.js";
 import type { MeshViews } from "./views.js";
 import type {
   ColorRule,
@@ -45,4 +45,11 @@ export interface SceneLike {
    * falls back to vertex colours on a host without it.
    */
   coloring?(mesh: MeshHandle): ColorRule | null;
+  /**
+   * The box around the vertices the mesh's live triangles use, in local
+   * render coordinates, or `null` without live triangles. Optional:
+   * `bindMesh` takes its bounds from it and walks the mirrors on a host
+   * without it.
+   */
+  bounds?(mesh: MeshHandle): Bounds | null;
 }

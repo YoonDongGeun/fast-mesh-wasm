@@ -1,6 +1,6 @@
 //! The scene: a registry of meshes with BVHs and placements.
 
-use fast_mesh_bvh::{BuildOptions, Bvh, BvhBuild, UpdatePolicy};
+use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, BvhBuild, UpdatePolicy};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
 
 use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
@@ -35,6 +35,13 @@ pub struct MeshOptions {
     pub mode: UpdateMode,
     /// Where the mesh starts out in the world.
     pub placement: Placement,
+    /// Build the BVH on first use instead of up front. Only Lazy and
+    /// Manual meshes defer (Eager builds up front regardless); until the
+    /// first build the mesh is not current and [`Scene::bvh`] refuses it
+    /// with [`SceneError::StaleBvh`], like a stale BVH after an edit. Only
+    /// [`Scene::add_mesh`] defers; [`Scene::add_mesh_built`] finishes the
+    /// build it was given.
+    pub defer_bvh: bool,
 }
 
 /// Options for a [`Scene`].
@@ -63,7 +70,8 @@ pub(crate) struct Entry {
     /// none are waiting.
     pub(crate) pending: Option<ChangeSet>,
     /// The BVH must be rebuilt from scratch: the mesh's content is not
-    /// described by `pending` (after a [`SceneError::Corrupted`] undo).
+    /// described by `pending` (after a [`SceneError::Corrupted`] undo, or
+    /// a deferred add whose BVH was never built).
     pub(crate) rebuild: bool,
     /// One pending report per subscriber, in the order of
     /// `Scene::subscribers`.
@@ -401,7 +409,10 @@ impl Scene {
         self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)
     }
 
-    /// Adds a mesh, building its BVH, and returns its id.
+    /// Adds a mesh, building its BVH, and returns its id. With
+    /// [`MeshOptions::defer_bvh`] a Lazy or Manual mesh builds its BVH on
+    /// first use instead (its first update, query or flush), since nothing
+    /// needs it before then.
     ///
     /// # Errors
     /// [`SceneError::InvalidInput`] for an invalid placement, or a BVH or
@@ -411,8 +422,18 @@ impl Scene {
         self.drop_field_unit();
         options.placement.validate()?;
         options.bvh_policy.validate()?;
-        let bvh = Bvh::build(&mesh, &options.build)?;
-        self.insert_mesh(mesh, bvh, options)
+        if !options.defer_bvh || options.mode == UpdateMode::Eager {
+            let bvh = Bvh::build(&mesh, &options.build)?;
+            return self.insert_mesh(mesh, bvh, options);
+        }
+        // Deferred: a placeholder over an empty mesh, replaced by the first
+        // update. Building it validates the build options, as for Eager.
+        let bvh = Bvh::build(&Mesh::new(), &options.build)?;
+        let id = self.insert_mesh(mesh, bvh, options)?;
+        let entry = self.entry_mut(id)?;
+        entry.pending = Some(ChangeSet::default());
+        entry.rebuild = true;
+        Ok(id)
     }
 
     /// Adds a mesh built in steps by `build` (see [`MeshBuild`]), first
@@ -712,6 +733,14 @@ impl Scene {
         entry.after_change();
         self.run_eager(Some(&[id]));
         Ok(())
+    }
+
+    /// When the mesh's BVH is brought up to date (see [`Scene::set_mode`]).
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn mode(&self, id: MeshId) -> Result<UpdateMode> {
+        Ok(self.entry(id)?.mode)
     }
 
     /// Brings the mesh's BVH, and its normals if they are on, up to date
@@ -1053,6 +1082,31 @@ impl Scene {
         Ok(self.entry(id)?.is_current())
     }
 
+    /// The box around the vertices the live triangles use, in the mesh's
+    /// stored local coordinates, or `None` without live triangles. Dead
+    /// slots keep stale positions, and a live vertex no live triangle uses
+    /// is not drawn either, so neither widens it.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn bounds(&self, id: MeshId) -> Result<Option<Aabb>> {
+        let mesh = self.mesh(id)?;
+        let positions = mesh.positions();
+        let mut out = Aabb::EMPTY;
+        for t in 0..mesh.triangle_slots() as u32 {
+            // Dead slots read `0, 0, 0`, which would pull in vertex 0, so
+            // only alive triangles count.
+            if let Some(tri) = mesh.triangle(t) {
+                out.grow(&Aabb::of_triangle(positions, tri));
+            }
+        }
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out))
+        }
+    }
+
     /// Makes the BVHs a query needs current (§15.4): those of `only`, or of
     /// every mesh when `None`. Every non-Manual BVH among them is updated
     /// (Lazy ones, and Eager ones left stale by a failed update); then a
@@ -1327,6 +1381,87 @@ mod tests {
         assert!(scene.set_placement(id, bad).is_err());
         assert_eq!(scene.placement(id), Ok(moved));
         assert_eq!(scene.is_current(id), Ok(true));
+    }
+
+    #[test]
+    fn mode_getter_follows_set_mode() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        assert_eq!(scene.mode(id), Ok(UpdateMode::Eager));
+        scene.set_mode(id, UpdateMode::Lazy).unwrap();
+        assert_eq!(scene.mode(id), Ok(UpdateMode::Lazy));
+        scene.set_mode(id, UpdateMode::Manual).unwrap();
+        assert_eq!(scene.mode(id), Ok(UpdateMode::Manual));
+        scene.remove_mesh(id).unwrap();
+        assert_eq!(scene.mode(id).err(), Some(SceneError::UnknownMesh));
+    }
+
+    #[test]
+    fn bounds_cover_live_triangles_only() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        let b = scene.bounds(id).unwrap().unwrap();
+        assert_eq!(b.min, [0.0, 0.0, 0.0]);
+        assert_eq!(b.max, [1.0, 1.0, 0.0]);
+        // A live vertex no live triangle uses does not widen them.
+        scene
+            .edit(id, |tx| tx.add_vertices(&[[50.0, 50.0, 50.0]]))
+            .unwrap();
+        let b = scene.bounds(id).unwrap().unwrap();
+        assert_eq!((b.min, b.max), ([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        // Without live triangles there are no bounds, whatever the slots hold.
+        scene.edit(id, |tx| tx.remove_triangles(&[0])).unwrap();
+        assert_eq!(scene.bounds(id), Ok(None));
+        scene.remove_mesh(id).unwrap();
+        assert_eq!(scene.bounds(id).err(), Some(SceneError::UnknownMesh));
+    }
+
+    #[test]
+    fn lazy_and_manual_adds_defer_the_bvh_build() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let deferred = |mode| MeshOptions {
+            mode,
+            defer_bvh: true,
+            ..MeshOptions::default()
+        };
+        // Without the flag, and for Eager with it, the BVH builds up front.
+        let eager = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        assert_eq!(scene.is_current(eager), Ok(true));
+        let eager_flagged = scene
+            .add_mesh(grid(2), deferred(UpdateMode::Eager))
+            .unwrap();
+        assert_eq!(scene.is_current(eager_flagged), Ok(true));
+        let lazy = scene.add_mesh(grid(4), deferred(UpdateMode::Lazy)).unwrap();
+        // No BVH was built: not current, and the raw BVH is refused.
+        assert_eq!(scene.mode(lazy), Ok(UpdateMode::Lazy));
+        assert_eq!(scene.is_current(lazy), Ok(false));
+        assert_eq!(scene.bvh(lazy).err(), Some(SceneError::StaleBvh(lazy)));
+        // A query builds the Lazy BVH on demand.
+        let hit = scene
+            .raycast(
+                [2.0, 2.0, 10.0],
+                [0.0, 0.0, -1.0],
+                &crate::SceneRayOptions::default(),
+            )
+            .unwrap();
+        assert!(hit.is_some());
+        assert_eq!(scene.is_current(lazy), Ok(true));
+        assert!(scene.bvh(lazy).is_ok());
+        // Manual waits for an explicit `update`.
+        let manual = scene
+            .add_mesh(grid(4), deferred(UpdateMode::Manual))
+            .unwrap();
+        assert_eq!(scene.is_current(manual), Ok(false));
+        scene.update(manual).unwrap();
+        assert_eq!(scene.is_current(manual), Ok(true));
+        let manual2 = scene
+            .add_mesh(grid(2), deferred(UpdateMode::Manual))
+            .unwrap();
+        scene.set_mode(manual2, UpdateMode::Eager).unwrap();
+        assert_eq!(scene.is_current(manual2), Ok(true));
+        assert_valid(&scene, lazy);
+        assert_valid(&scene, manual);
+        assert_valid(&scene, manual2);
     }
 
     /// A flat `n` x `n` grid of quads, two triangles each.

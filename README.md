@@ -106,6 +106,9 @@ requestAnimationFrame(frame);
 - The engine's colour maps are sRGB-encoded bytes. The adapter converts them to three's linear working space as it copies them (a normalized `Uint16` colour attribute), so they look the same as in a renderer that passes the bytes through to a non-sRGB canvas.
 - A material you pass to `bindMesh` is used as given and must not be shared between bound meshes (the adapter controls its `color`, `vertexColors`, `opacity`, `transparent` and `depthWrite`). With `shading: "fragment"` it also patches the material's shaders and disposes its compiled program on bind and on restore (see [Fragment shading](#fragment-shading)).
 - The adapter only reads `scene.onChanges`; it never calls `takeChanges`.
+- Bound meshes take their bounding box and sphere from the scene's live-vertex bounds (see `Scene.bounds`), recomputed only when positions or indices change; on a host without them the adapter walks the mirrors instead.
+- Bound objects (and section groups) must sit under an untransformed parent: their matrices are driven as world matrices, so a transformed ancestor offsets them and is warned about once.
+- With `new Scene({ debug: true })`, the views the adapter copies from are checked `Proxy` objects (see the Scene API section for their cost); the mirrors it uploads are always plain typed arrays.
 
 #### Fragment shading
 
@@ -149,7 +152,7 @@ colour(gap);
 
 // Drag the lower mesh. The whole drag is one undo step. Each `move`
 // recomputes the eager fields, so coalesce pointer events to one `move` per
-// animation frame.
+// animation frame (`scene.drag(mesh, { coalesce: true })` does that for you).
 const drag = scene.drag(lower);
 let pending: { rotation: Quat; translation: Vec3 } | undefined;
 function onPointerMove(rotation: Quat, translation: Vec3) {

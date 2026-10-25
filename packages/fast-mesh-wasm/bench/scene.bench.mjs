@@ -1194,9 +1194,9 @@ if (onlyWorker) {
   await benchWorkerDrag("1M contact", 708, quick ? 1 : 3, contact);
   if (!quick) {
     await benchWorkerDrag("1M wide", 708, 1, wide); // 64 poses, plus a warm-up cycle
+    await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: 8, seconds: 10 });
+    await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: 8, seconds: 10 });
   }
-  await benchWorkerWideDrag("1M, 9a terrain", "9a", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
-  await benchWorkerWideDrag("1M, native terrain", "native", 708, { lockStep: quick ? 4 : 8, seconds: quick ? 3 : 10 });
   await benchWorkerLongRequests("1M", 708, quick ? 4 : 10);
   await benchWorkerQueued("1M", 708, quick ? 3 : 5);
   await benchWorkerManySmall("small requests", 1000, quick ? 5 : 20);
@@ -1211,16 +1211,21 @@ if (onlyWorker) {
 }
 if (onlyAdapter) {
   benchAdapter("adapter 1M contact", 708, quick ? 1 : 3, contact);
-  benchAdapter("adapter 1M wide", 708, quick ? 1 : 3, wide);
+  if (!quick) {
+    benchAdapter("adapter 1M wide", 708, 3, wide);
+  }
   process.exit(0);
 }
 benchAdd("1M", 708, quick ? 3 : 7);
 benchDrag("1M contact", 708, quick ? 1 : 3, contact);
-benchDrag("1M wide", 708, quick ? 1 : 3, wide);
 benchOwner("owner scene, contact", quick ? 100 : 400, { gap: 0.5, maxDistance: 1 });
-benchOwner("owner scene, wide", quick ? 100 : 400, { gap: 2, maxDistance: 10 });
 benchAdapter("adapter 1M contact", 708, quick ? 1 : 3, contact);
-benchAdapter("adapter 1M wide", 708, quick ? 1 : 3, wide);
+if (!quick) {
+  // The wide stress frames (every vertex in range): minutes, not seconds.
+  benchDrag("1M wide", 708, 3, wide);
+  benchOwner("owner scene, wide", 400, { gap: 2, maxDistance: 10 });
+  benchAdapter("adapter 1M wide", 708, 3, wide);
+}
 if (with10m) {
   benchAdd("10M", 2236, 3);
   benchDrag("10M contact", 2236, 1, contact);

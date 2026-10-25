@@ -4,7 +4,7 @@ import * as THREE from "three";
 import { FastMeshError } from "../core.js";
 import type { SectionHandle, SectionPlane, SectionResult } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
-import type { MeshBinding } from "./mesh.js";
+import { checkUntransformedParent, type MeshBinding } from "./mesh.js";
 
 /** Options of {@link bindSection}. */
 export interface BindSectionOptions {
@@ -23,9 +23,9 @@ export interface BindSectionOptions {
 export interface BoundSection {
   /**
    * Add it to the THREE.Scene, untransformed (results are in world
-   * coordinates). Per bound mesh the section cuts, it holds a `LineSegments`
-   * of the contours and a `Mesh` of the fill (empty while the section has no
-   * fill).
+   * coordinates; a transformed ancestor is detected and warned about once).
+   * Per bound mesh the section cuts, it holds a `LineSegments` of the contours
+   * and a `Mesh` of the fill (empty while the section has no fill).
    */
   readonly group: THREE.Group;
   /**
@@ -203,7 +203,9 @@ export function bindSection(
     unsubscribe?.();
     unsubscribe = undefined;
   };
+  checkUntransformedParent(group);
   unsubscribe = scene.onChanges((changes) => {
+    checkUntransformedParent(group);
     let plane: SectionPlane;
     try {
       plane = scene.sectionPlane(section);

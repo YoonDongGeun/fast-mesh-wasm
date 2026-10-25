@@ -513,6 +513,52 @@ describe("bindMesh", () => {
     expectMatrix(s, m, bound);
     expect(warn).not.toHaveBeenCalled();
   });
+
+  it("bounds_come_from_the_scene", () => {
+    const { s, m, bound } = setup();
+    const spy = vi.spyOn(s, "bounds");
+    // A sculpt-style edit: the bounds follow from the engine, live slots only.
+    s.edit(m, [{ op: "setPositions", vertices: [0], positions: [10, 0, 0] }]);
+    s.commitFrame();
+    expect(spy).toHaveBeenCalledWith(m);
+    expect(bound.object.geometry.boundingBox!.max.x).toBeCloseTo(10 - 2.5, 5);
+  });
+
+  it("bounds_fall_back_without_scene_bounds", () => {
+    const { s, m, bound } = setup();
+    // A host from before Scene.bounds: the adapter walks live triangles.
+    (s as unknown as { bounds?: unknown }).bounds = undefined;
+    s.edit(m, [{ op: "setPositions", vertices: [0], positions: [10, 0, 0] }]);
+    s.commitFrame();
+    expect(bound.object.geometry.boundingBox!.max.x).toBeCloseTo(10 - 2.5, 5);
+    expect(bound.object.geometry.boundingSphere!.radius).toBeGreaterThan(0);
+  });
+
+  it("transformed_parent_warns_once", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { s, n, bound } = setup();
+    const group = new THREE.Group();
+    group.add(bound.object);
+    s.commitFrame();
+    expect(warn).not.toHaveBeenCalled();
+    group.position.set(1, 0, 0);
+    s.commitFrame();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/transformed ancestor/);
+    // Once per object.
+    s.commitFrame();
+    expect(warn).toHaveBeenCalledTimes(1);
+    // A parent with matrixAutoUpdate off is read from its matrix.
+    const other = bindMesh(s, n);
+    const frozen = new THREE.Group();
+    frozen.matrixAutoUpdate = false;
+    frozen.matrix.makeTranslation(2, 0, 0);
+    frozen.add(other.object);
+    s.commitFrame();
+    expect(warn).toHaveBeenCalledTimes(2);
+    other.dispose();
+    bound.dispose();
+  });
 });
 
 describe("packaging", () => {

@@ -161,6 +161,32 @@ jobs:
         timeout-minutes: 5
         run: node scripts/browser-check.mjs --build --threads 4 --only poolCrash
 
+  three-floor:
+    name: three.js adapter on the peer floor (three@0.160)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The peer floor (the `three` peerDependency): the oldest three the
+      # adapter supports. CI-only: this rewrites the devDependency and the
+      # lockfile, which are not committed.
+      - run: pnpm --filter fast-mesh-wasm add -D three@0.160.0
+      - run: node scripts/build-wasm.mjs --test
+      # The packaging test reads dist/; the rest import the sources.
+      - run: pnpm --filter fast-mesh-wasm build
+      - run: pnpm --filter fast-mesh-wasm exec vitest run test/three-mesh.test.ts test/three-controls.test.ts test/three-section.test.ts test/three-shading.test.ts
+
   install:
     name: ${{ matrix.pm }} · ${{ matrix.os }} · node ${{ matrix.node }}
     needs: package

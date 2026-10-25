@@ -632,4 +632,123 @@ describe("Scene", () => {
     }
     expect(codeOf(() => outer?.canUndo())).toBe("INVALID_ARGUMENT");
   });
+
+  it("mode_getter_follows_set_mode", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    expect(s.mode(mesh)).toBe("eager");
+    s.setMode(mesh, "lazy");
+    expect(s.mode(mesh)).toBe("lazy");
+    s.setMode(mesh, "manual");
+    expect(s.mode(mesh)).toBe("manual");
+    s.removeMesh(mesh);
+    expect(codeOf(() => s.mode(mesh))).toBe("UNKNOWN_MESH");
+  });
+
+  it("bounds_cover_live_triangles_only", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    // Local coordinates (origin = box centre (1, 1, 0.5)).
+    const b = s.bounds(mesh)!;
+    expect(b.min).toEqual([-1, -1, -0.5]);
+    expect(b.max).toEqual([1, 1, 0.5]);
+    expect(b.center).toEqual([0, 0, 0]);
+    expect(b.size).toEqual([2, 2, 1]);
+    // Removing every triangle leaves no bounds; the slots still hold positions.
+    s.edit(mesh, [{ op: "removeTriangles", triangles: [0, 1, 2] }]);
+    expect(s.bounds(mesh)).toBeNull();
+    s.removeMesh(mesh);
+    expect(codeOf(() => s.bounds(mesh))).toBe("UNKNOWN_MESH");
+  });
+
+  it("coalesced_drag_applies_once_per_frame", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    s.commitFrame();
+    const drag = s.drag(mesh, { coalesce: true });
+    // Pointer-rate moves: nothing reaches the engine until the frame.
+    drag.move({ rotation: IDENTITY, translation: [1, 0, 0] });
+    drag.move({ rotation: IDENTITY, translation: [2, 0, 0] });
+    drag.move({ rotation: IDENTITY, translation: [3, 0, 0] });
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    const changes = s.commitFrame();
+    // One frame, one placement: the latest pose.
+    expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
+    expect(changes.filter((c) => c.mesh === mesh && c.placementChanged).length).toBe(1);
+    // end() applies a still-pending move, still one undo step in all.
+    drag.move({ rotation: IDENTITY, translation: [4, 0, 0] });
+    drag.end();
+    expect(s.placement(mesh).translation).toEqual([4, 0, 0]);
+    expect(s.canUndo()).toBe(true);
+    s.undo();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    expect(s.canUndo()).toBe(false);
+    // A bad pose still throws at move(), not at the frame.
+    const d2 = s.drag(mesh, { coalesce: true });
+    expect(codeOf(() => d2.move({ rotation: [1, 0, 0], translation: [0, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(d2.active).toBe(true);
+    d2.cancel();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    // Cancelling drops a pending move and records nothing.
+    const d3 = s.drag(mesh, { coalesce: true });
+    d3.move({ rotation: IDENTITY, translation: [9, 0, 0] });
+    d3.cancel();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    expect(s.canUndo()).toBe(false);
+  });
+
+  it("coalesced_drag_manual_end_step_keeps_pending_pose", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    s.commitFrame();
+    // A coalesced move with no frame yet: the caller's endStep lands it in
+    // the closing step, like a non-coalesced move, instead of dropping it.
+    const drag = s.drag(mesh, { coalesce: true });
+    drag.move({ rotation: IDENTITY, translation: [3, 0, 0] });
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    s.endStep();
+    expect(drag.active).toBe(false);
+    expect(s.placement(mesh).translation).toEqual([3, 0, 0]);
+    expect(s.canUndo()).toBe(true);
+    s.undo();
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    expect(s.canUndo()).toBe(false);
+    // Closing a step opened inside the drag keeps the pose pending instead.
+    const inner = s.drag(mesh, { coalesce: true });
+    inner.move({ rotation: IDENTITY, translation: [5, 0, 0] });
+    s.beginStep();
+    s.endStep();
+    expect(inner.active).toBe(true);
+    expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
+    s.commitFrame();
+    expect(s.placement(mesh).translation).toEqual([5, 0, 0]);
+    inner.end();
+    expect(s.canUndo()).toBe(true);
+  });
+
+  it("coalesced_drag_move_validates_pose_values", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    s.commitFrame();
+    const drag = s.drag(mesh, { coalesce: true });
+    // Non-finite values throw at move(), not at the frame...
+    expect(codeOf(() => drag.move({ rotation: IDENTITY, translation: [NaN, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(
+      codeOf(() => drag.move({ rotation: [1, 0, 0, 0, 1, 0, 0, 0, Infinity], translation: [0, 0, 0] })),
+    ).toBe("INVALID_ARGUMENT");
+    // ...as does a zero quaternion...
+    expect(codeOf(() => drag.move({ rotation: [0, 0, 0, 0], translation: [0, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(drag.active).toBe(true);
+    // ...while a non-rotation matrix still throws when applied.
+    drag.move({ rotation: [2, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0] });
+    expect(codeOf(() => s.commitFrame())).toBe("INVALID_ARGUMENT");
+    drag.cancel();
+    expect(s.canUndo()).toBe(false);
+  });
 });
