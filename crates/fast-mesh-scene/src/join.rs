@@ -133,7 +133,9 @@ impl Scene {
     /// [`SceneError::Ops`] with [`OpsError::StaleLoops`] for a loop that is
     /// not there, or [`OpsError::InvalidInput`] when the loops cannot bridge
     /// (unclean, over `max_edges`, winding the same way). A failed join
-    /// changes nothing: both meshes are left as they were.
+    /// changes nothing: both meshes are left as they were. If removing the
+    /// source fails (out of memory), the joined geometry stays recorded and
+    /// the source mesh with it.
     pub fn join(&mut self, a: MeshId, b: MeshId, options: &JoinOptions) -> Result<JoinReport> {
         if a == b {
             return Err(SceneError::InvalidInput("cannot join a mesh to itself"));
