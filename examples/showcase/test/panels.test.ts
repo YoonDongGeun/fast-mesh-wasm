@@ -243,5 +243,8 @@ describe("repair summaries", () => {
     expect(describeReport("remesh", { splits: 12, collapses: 2, flips: 1, rounds: 4 })).toBe(
       "Remesh: 12 splits, 2 collapses, 1 flip in 4 rounds",
     );
+    expect(describeReport("bridgeLoops", { trianglesAdded: 8 })).toBe(
+      "Bridge loops: added 8 triangles",
+    );
   });
 });

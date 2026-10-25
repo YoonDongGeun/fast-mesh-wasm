@@ -119,5 +119,9 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       const r = report as Extract<RepairReport, { splits: number; collapses: number; flips: number; rounds: number }>;
       return `Remesh: ${plural(r.splits, "split")}, ${plural(r.collapses, "collapse")}, ${plural(r.flips, "flip")} in ${plural(r.rounds, "round")}`;
     }
+    case "bridgeLoops": {
+      const r = report as Extract<RepairReport, { trianglesAdded: number }>;
+      return `Bridge loops: added ${plural(r.trianglesAdded, "triangle")}`;
+    }
   }
 }
