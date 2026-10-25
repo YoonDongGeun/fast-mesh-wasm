@@ -7,6 +7,7 @@ use crate::{Aabb, Bvh};
 
 /// How many pending nodes [`Bvh::traverse_by_key`] keeps in its fixed stack.
 /// Deeper pending work falls back to a stackless walk.
+#[doc(hidden)]
 pub const TRAVERSE_STACK: usize = 64;
 
 /// Identifies a node of one [`Bvh`]. Only valid until that BVH is next

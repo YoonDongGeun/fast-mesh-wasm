@@ -252,6 +252,26 @@ mod tests {
     }
 
     #[test]
+    fn max_distance_zero_finds_only_surface_points() {
+        // Issue #19: with `max_distance = 0`, a query point on the surface is
+        // found, anything off it is not.
+        let flat =
+            Mesh::from_buffers(&[0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 4.0, 0.0], &[0, 1, 2]).unwrap();
+        let bvh = build(&flat, Quality::Sah);
+        let opts = ClosestOptions { max_distance: 0.0 };
+        let h = closest_point(&flat, &bvh, [1.0, 1.0, 0.0], &opts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.distance, 0.0);
+        assert_eq!(h.point, [1.0, 1.0, 0.0]);
+        assert_eq!(
+            closest_point(&flat, &bvh, [1.0, 1.0, 1e-6], &opts),
+            Ok(None)
+        );
+        assert_eq!(closest_point(&flat, &bvh, [5.0, 5.0, 0.0], &opts), Ok(None));
+    }
+
+    #[test]
     fn equal_distance_takes_smallest_id() {
         // The point (0.5, 0.5, 0) lies on the diagonal shared by both triangles.
         let p = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0];

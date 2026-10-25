@@ -28,7 +28,9 @@ mod update;
 
 pub use aabb::Aabb;
 pub use error::{BvhError, Result};
-pub use node::{NodeId, NodeKind, NodeView, TRAVERSE_STACK};
+#[doc(hidden)]
+pub use node::TRAVERSE_STACK;
+pub use node::{NodeId, NodeKind, NodeView};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
 pub use tree::{Bvh, BvhBuild};
 pub use update::{Strategy, UpdateReport};

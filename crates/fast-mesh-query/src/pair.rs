@@ -150,6 +150,12 @@ pub(crate) fn traverse_subtree_pairs_with<const N: usize, K: Copy + PartialOrd>(
                     right: br,
                 },
             ) => {
+                // B's box is measured after the rotation into A's space,
+                // which inflates its surface area (much so for thin boxes at
+                // an angle), so ties and near-ties split B more often than A.
+                // That only changes the visiting order, which the queries'
+                // answers do not depend on, and splitting the inflated side
+                // first tends to tighten it sooner.
                 if va.bounds.surface_area() >= p.b_box.surface_area() {
                     (true, left, right)
                 } else {
@@ -213,6 +219,8 @@ pub(crate) fn split_pair<K: Copy + PartialOrd>(
                 right: br,
             },
         ) => {
+            // As in the traversal: B's rotated box reads larger, biasing
+            // ties toward splitting B. Only the order of the parts changes.
             if va.bounds.surface_area() >= b_box.surface_area() {
                 (true, left, right)
             } else {
@@ -289,9 +297,12 @@ pub(crate) fn try_push<T>(v: &mut Vec<T>, x: T) -> crate::Result<()> {
 }
 
 /// Visits every leaf–leaf pair below the pending pair `p` that `key` does not
-/// cull, without a stack: a parent-link walk of A's subtree, and for each of
-/// its leaves one of B's subtree. Inner pairs are only tested with `key`, not
-/// shown to `visit`. `key` runs once per pair it tests (never for `p` itself,
+/// cull, without a stack: a parent-link walk of B's subtree, and for each of
+/// its leaves one of A's subtree. B is outer because only its boxes pay for
+/// [`Rigid::transform_box`]: each B node's box is moved once, for the one
+/// pair the outer walk tests, and each B leaf's moved box is then reused for
+/// the whole inner walk. Inner pairs are only tested with `key`, not shown
+/// to `visit`. `key` runs once per pair it tests (never for `p` itself,
 /// whose key is known). Returns `false` when `visit` returned [`Step::Stop`].
 fn finish_stackless<K: Copy>(
     a: &Bvh,
@@ -302,34 +313,36 @@ fn finish_stackless<K: Copy>(
     visit: &mut impl FnMut(&NodeView, &NodeView, K) -> Step,
 ) -> bool {
     let mut stopped = false;
-    a.traverse_from(p.a, |ida, va| {
+    let a_root = a.node(p.a).bounds;
+    b.traverse_from(p.b, |idb, vb| {
         if stopped {
             return false;
         }
-        // The key of (`ida`, `p.b`).
-        let ka = if ida == p.a {
-            p.key
+        // B's moved box and the key of (`p.a`, `idb`).
+        let (b_box, kb) = if idb == p.b {
+            (p.b_box, p.key)
         } else {
-            match key(&va.bounds, &p.b_box) {
-                Some(k) => k,
+            let b_box = xf.transform_box(&vb.bounds);
+            match key(&a_root, &b_box) {
+                Some(k) => (b_box, k),
                 None => return false,
             }
         };
-        if let NodeKind::Leaf { .. } = va.kind {
-            b.traverse_from(p.b, |idb, vb| {
+        if let NodeKind::Leaf { .. } = vb.kind {
+            a.traverse_from(p.a, |ida, va| {
                 if stopped {
                     return false;
                 }
-                let kb = if idb == p.b {
-                    ka
+                let ka = if ida == p.a {
+                    kb
                 } else {
-                    match key(&va.bounds, &xf.transform_box(&vb.bounds)) {
+                    match key(&va.bounds, &b_box) {
                         Some(k) => k,
                         None => return false,
                     }
                 };
-                if let NodeKind::Leaf { .. } = vb.kind
-                    && visit(va, vb, kb) == Step::Stop
+                if let NodeKind::Leaf { .. } = va.kind
+                    && visit(va, vb, ka) == Step::Stop
                 {
                     stopped = true;
                 }

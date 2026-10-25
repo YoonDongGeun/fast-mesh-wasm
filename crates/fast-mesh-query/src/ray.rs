@@ -13,6 +13,12 @@ pub struct Ray {
     pub origin: [f32; 3],
     /// The direction. It need not be normalized: `t` is measured in units of
     /// `dir`, so it is a distance only when `dir` has unit length.
+    ///
+    /// Subnormal components are valid input. When the largest-magnitude
+    /// component is subnormal, its reciprocal overflows and no computed `t`
+    /// is finite, so the ray never hits anything (the queries return no hit,
+    /// not an error); a subnormal component beside a normal larger one
+    /// behaves like zero.
     pub dir: [f32; 3],
 }
 
@@ -67,6 +73,13 @@ const SHRINK: f32 = 1.0 - 2.0 * GAMMA3;
 /// never culls a box the ray touches. A slab whose `dir` component is zero
 /// and whose face plane contains the origin gives `0 * ∞ = NaN`; `max`/`min`
 /// ignore NaN, so such a slab does not cull.
+///
+/// No absolute slack is needed for large coordinates (issue #19): both this
+/// test and `ray_triangle` subtract the origin from the same corner
+/// coordinates first, so the coordinate-scale rounding is common to the two
+/// and the entry stays at or below the triangle's computed `t`; what rounds
+/// past that subtraction is relative-scale, covered by the widening.
+/// `box_enter_never_exceeds_triangle_t_at_large_coords` pins the invariant.
 pub(crate) fn ray_box(pre: &RayPre, b: &Aabb, min_t: f32, max_t: f32) -> Option<f32> {
     let mut enter = f32::NEG_INFINITY;
     let mut exit = f32::INFINITY;
@@ -255,7 +268,12 @@ pub fn raycast_any(mesh: &Mesh, bvh: &Bvh, ray: &Ray, opts: &RayOptions) -> Resu
 /// A ray through an edge shared by several triangles, or through a vertex
 /// shared by a fan, reports one hit per triangle: a vertex shared by 6
 /// triangles gives 6 hits at the same `t`. A caller that counts surface
-/// crossings, for parity or winding, must merge hits with equal `t`.
+/// crossings, for parity or winding, must merge hits with equal `t` itself;
+/// the query keeps every hit so that no crossing is lost, and Phase 5's
+/// inside/outside tests do not count ray crossings at all: they use
+/// angle-weighted pseudonormals, or generalized winding numbers where the
+/// orientation is inconsistent, neither of which needs a parity rule for
+/// duplicate hits.
 ///
 /// # Errors
 /// As for [`raycast`], and [`QueryError::OutOfMemory`] when `out` cannot grow;
@@ -899,6 +917,147 @@ mod tests {
         fail_allocations_after(None);
         assert_eq!(r, Err(QueryError::OutOfMemory));
         assert_eq!(out, vec![sentinel]);
+    }
+
+    /// A flat 6-triangle fan around vertex 0 at the origin.
+    fn fan() -> (Mesh, Bvh) {
+        let mut p = vec![0.0, 0.0, 0.0];
+        for k in 0..6 {
+            let a = std::f64::consts::TAU * f64::from(k) / 6.0;
+            p.extend([a.cos() as f32, a.sin() as f32, 0.0]);
+        }
+        let mut idx = Vec::new();
+        for k in 0..6 {
+            idx.extend([0, 1 + k, 1 + (k + 1) % 6]);
+        }
+        let mesh = Mesh::from_buffers(&p, &idx).unwrap();
+        let bvh = build(&mesh, Quality::Sah);
+        (mesh, bvh)
+    }
+
+    #[test]
+    fn shared_vertex_and_edge_report_one_hit_per_triangle() {
+        // The crossing-count contract of `raycast_all` (issue #18): a ray
+        // through the shared vertex hits every triangle of the fan, at equal
+        // `t`, sorted by triangle id; a ray through a shared edge hits both.
+        let (mesh, bvh) = fan();
+        let mut out = Vec::new();
+        let down = Ray {
+            origin: [0.0, 0.0, 1.0],
+            dir: DOWN,
+        };
+        let n = raycast_all(&mesh, &bvh, &down, &opts(), &mut out).unwrap();
+        assert_eq!(n, 6);
+        assert!(out.iter().all(|h| h.t == 1.0));
+        assert_eq!(
+            out.iter().map(|h| h.triangle).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        // Through the midpoint of the edge 0-1, shared by triangles 0 and 5.
+        let edge = Ray {
+            origin: [0.5, 0.0, 1.0],
+            dir: DOWN,
+        };
+        out.clear();
+        let n = raycast_all(&mesh, &bvh, &edge, &opts(), &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert!(out.iter().all(|h| h.t == 1.0));
+        assert_eq!(
+            out.iter().map(|h| h.triangle).collect::<Vec<_>>(),
+            vec![0, 5]
+        );
+    }
+
+    #[test]
+    fn box_enter_never_exceeds_triangle_t_at_large_coords() {
+        // Soundness of pruning with the smallest-id tie rule (issue #19): a
+        // box entered above its own triangle's computed `t` could be pruned
+        // while that triangle ties or beats the best. Shared-edge pairs of
+        // unit triangles at large coordinates, where `t` is tiny relative to
+        // them, rays aimed at the edge from outside the boxes.
+        let mut rng = Lcg(0x19e7);
+        let mut hits = 0;
+        for scale in [1e4f32, 1e7, 1e10] {
+            for _ in 0..600 {
+                let base = [
+                    (rng.next() * 2.0 - 1.0) * scale,
+                    (rng.next() * 2.0 - 1.0) * scale,
+                    (rng.next() * 2.0 - 1.0) * scale,
+                ];
+                let corner = |rng: &mut Lcg| -> [f32; 3] {
+                    std::array::from_fn(|k| base[k] + (rng.next() * 2.0 - 1.0))
+                };
+                let (e0, e1, a, b) = (
+                    corner(&mut rng),
+                    corner(&mut rng),
+                    corner(&mut rng),
+                    corner(&mut rng),
+                );
+                let mp: [f32; 3] = if rng.next() < 0.5 {
+                    // The shared edge midpoint: ties are common.
+                    std::array::from_fn(|k| (e0[k] + e1[k]) / 2.0)
+                } else {
+                    // Inside the first triangle: hits are common.
+                    std::array::from_fn(|k| (e0[k] + e1[k] + a[k]) / 3.0)
+                };
+                let dh: [f32; 3] = std::array::from_fn(|_| rng.next() * 2.0 - 1.0);
+                let len = (dh[0] * dh[0] + dh[1] * dh[1] + dh[2] * dh[2]).sqrt();
+                if len == 0.0 {
+                    continue;
+                }
+                let dist = 1.0 + rng.next() * 4.0;
+                let origin = std::array::from_fn(|k| mp[k] - dh[k] / len * dist);
+                let dir = std::array::from_fn(|k| dh[k] / len);
+                let pre = RayPre::new(origin, dir);
+                for p in [[e0, e1, a], [e0, e1, b]] {
+                    let Some(h) = ray_triangle(&pre, p, Cull::None, 0.0, f32::INFINITY) else {
+                        continue;
+                    };
+                    hits += 1;
+                    let (mn, mx) = p.iter().fold(
+                        ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+                        |(mn, mx), q| {
+                            (
+                                std::array::from_fn(|k| mn[k].min(q[k])),
+                                std::array::from_fn(|k| mx[k].max(q[k])),
+                            )
+                        },
+                    );
+                    let b = fast_mesh_bvh::Aabb::new(mn, mx);
+                    let e = ray_box(&pre, &b, 0.0, f32::INFINITY)
+                        .expect("box of a hit triangle is culled");
+                    assert!(e <= h.t, "enter {e} above t {} at scale {scale:e}", h.t);
+                }
+            }
+        }
+        assert!(hits > 1000, "only {hits} hits");
+    }
+
+    #[test]
+    fn subnormal_direction_components() {
+        // Issue #19: subnormal components are valid. A subnormal largest
+        // component overflows the reciprocal, so nothing hits; beside a
+        // normal larger one it behaves like zero and hits as usual.
+        let (mesh, bvh) = one_triangle(&T);
+        let o = [0.25, 0.25, 1.0];
+        let tiny = Ray {
+            origin: o,
+            dir: [1e-40, 0.0, 0.0],
+        };
+        assert_eq!(raycast(&mesh, &bvh, &tiny, &opts()), Ok(None));
+        assert_eq!(raycast_any(&mesh, &bvh, &tiny, &opts()), Ok(None));
+        let mut out = Vec::new();
+        assert_eq!(raycast_all(&mesh, &bvh, &tiny, &opts(), &mut out), Ok(0));
+        let sideways = Ray {
+            origin: o,
+            dir: [1e-40, 0.0, -1.0],
+        };
+        assert_eq!(
+            raycast(&mesh, &bvh, &sideways, &opts())
+                .unwrap()
+                .map(|h| h.t),
+            Some(1.0)
+        );
     }
 
     #[test]

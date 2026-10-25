@@ -543,53 +543,65 @@ mod tests {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6)
     }
 
+    /// One Voronoi-region case: the query, the feature, the closest point
+    /// and the barycentric weights.
+    type VoronoiCase = ([f64; 3], Feature, [f64; 3], [f64; 3]);
+
+    /// Voronoi-region cases shared by the `f32` and `f64` tests. Every value
+    /// is exactly representable in both types.
+    const VORONOI: [VoronoiCase; 7] = [
+        (
+            [-1.0, -1.0, 0.0],
+            Feature::Vertex(0),
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ),
+        (
+            [2.0, -1.0, 0.0],
+            Feature::Vertex(1),
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ),
+        (
+            [-1.0, 2.0, 0.0],
+            Feature::Vertex(2),
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ),
+        (
+            [0.5, -1.0, 0.0],
+            Feature::Edge(0),
+            [0.5, 0.0, 0.0],
+            [0.5, 0.5, 0.0],
+        ),
+        (
+            [1.0, 1.0, 0.0],
+            Feature::Edge(1),
+            [0.5, 0.5, 0.0],
+            [0.0, 0.5, 0.5],
+        ),
+        (
+            [-1.0, 0.5, 0.0],
+            Feature::Edge(2),
+            [0.0, 0.5, 0.0],
+            [0.5, 0.0, 0.5],
+        ),
+        (
+            [0.25, 0.25, 3.0],
+            Feature::Face,
+            [0.25, 0.25, 0.0],
+            [0.5, 0.25, 0.25],
+        ),
+    ];
+
     #[test]
     fn voronoi_regions() {
-        let cases = [
-            (
-                [-1.0, -1.0, 0.0],
-                Feature::Vertex(0),
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-            ),
-            (
-                [2.0, -1.0, 0.0],
-                Feature::Vertex(1),
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ),
-            (
-                [-1.0, 2.0, 0.0],
-                Feature::Vertex(2),
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ),
-            (
-                [0.5, -1.0, 0.0],
-                Feature::Edge(0),
-                [0.5, 0.0, 0.0],
-                [0.5, 0.5, 0.0],
-            ),
-            (
-                [1.0, 1.0, 0.0],
-                Feature::Edge(1),
-                [0.5, 0.5, 0.0],
-                [0.0, 0.5, 0.5],
-            ),
-            (
-                [-1.0, 0.5, 0.0],
-                Feature::Edge(2),
-                [0.0, 0.5, 0.0],
-                [0.5, 0.0, 0.5],
-            ),
-            (
-                [0.25, 0.25, 3.0],
-                Feature::Face,
-                [0.25, 0.25, 0.0],
-                [0.5, 0.25, 0.25],
-            ),
-        ];
-        for (q, feature, point, bary) in cases {
+        for (q, feature, point, bary) in VORONOI {
+            let (q, point, bary) = (
+                q.map(|v| v as f32),
+                point.map(|v| v as f32),
+                bary.map(|v| v as f32),
+            );
             let c = closest_on_triangle(q, T);
             assert_eq!(c.feature, feature, "{q:?}");
             assert!(close(c.point, point), "{q:?}: {:?}", c.point);
@@ -669,6 +681,29 @@ mod tests {
             for k in 0..3 {
                 let m = w[0] * a[k] + w[1] * b[k] + w[2] * c[k];
                 assert!((m - got.point[k]).abs() < 1e-4, "{p:?} {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn distant_query_on_small_sliver_stays_accurate() {
+        // The sliver band does not depend on the query distance, so a query
+        // far beyond the triangle's size takes the noisy path; the distance
+        // error stays second order (issue #19).
+        let p = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1e-4, 0.0]];
+        for dist in [10.0f32, 50.0] {
+            let q = [0.5, 0.5, dist];
+            let c = closest_on_triangle(q, p);
+            let got = f64::from(c.dist2).sqrt();
+            assert!((got - segment_distance(q, p)).abs() < 1e-4, "{dist}: {got}");
+            // The point is the barycentric combination of the corners.
+            let w = c.barycentric;
+            assert!(w.iter().all(|x| *x >= -1e-4), "{w:?}");
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+            let m: [f32; 3] =
+                std::array::from_fn(|k| w[0] * p[0][k] + w[1] * p[1][k] + w[2] * p[2][k]);
+            for (got, want) in m.iter().zip(c.point.iter()) {
+                assert!((got - want).abs() < 1e-3, "{dist}");
             }
         }
     }
@@ -805,51 +840,7 @@ mod tests {
     #[test]
     fn f64_matches_f32_on_simple_cases() {
         let t: [[f64; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        let cases = [
-            (
-                [-1.0, -1.0, 0.0],
-                Feature::Vertex(0),
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-            ),
-            (
-                [2.0, -1.0, 0.0],
-                Feature::Vertex(1),
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ),
-            (
-                [-1.0, 2.0, 0.0],
-                Feature::Vertex(2),
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ),
-            (
-                [0.5, -1.0, 0.0],
-                Feature::Edge(0),
-                [0.5, 0.0, 0.0],
-                [0.5, 0.5, 0.0],
-            ),
-            (
-                [1.0, 1.0, 0.0],
-                Feature::Edge(1),
-                [0.5, 0.5, 0.0],
-                [0.0, 0.5, 0.5],
-            ),
-            (
-                [-1.0, 0.5, 0.0],
-                Feature::Edge(2),
-                [0.0, 0.5, 0.0],
-                [0.5, 0.0, 0.5],
-            ),
-            (
-                [0.25, 0.25, 3.0],
-                Feature::Face,
-                [0.25, 0.25, 0.0],
-                [0.5, 0.25, 0.25],
-            ),
-        ];
-        for (q, feature, point, bary) in cases {
+        for (q, feature, point, bary) in VORONOI {
             let c = closest_on_triangle(q, t);
             assert_eq!(c.feature, feature, "{q:?}");
             assert_eq!(c.point, point, "{q:?}");

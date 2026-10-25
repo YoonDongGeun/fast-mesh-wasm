@@ -446,10 +446,6 @@ fn apply_step(m: &mut Mesh, bvh: &mut Bvh, h: &mut History, step: &Step) {
     }
 }
 
-/// A random rigid transform that puts B's middle near A's middle: a random unit
-/// quaternion (or one of a few exact rotations) and a translation with jitter,
-/// so that the meshes touch, overlap or sit slightly apart.
-///
 /// The vertices that some alive triangle uses, ascending.
 fn used_vertices(m: &Mesh) -> Vec<u32> {
     let mut vs: Vec<u32> = alive(m, false)
@@ -461,6 +457,10 @@ fn used_vertices(m: &Mesh) -> Vec<u32> {
     vs
 }
 
+/// A random rigid transform that puts B's middle near A's middle: a random unit
+/// quaternion (or one of a few exact rotations) and a translation with jitter,
+/// so that the meshes touch, overlap or sit slightly apart.
+///
 /// In one case of four the transform is an exact contact instead: the identity
 /// or a flip about x (entries 0 and ±1), with a translation that puts a vertex
 /// of an alive triangle of B exactly on a vertex of an alive triangle of A.

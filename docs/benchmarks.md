@@ -113,6 +113,20 @@ On the 22 near-miss poses at 1M (single cold runs), the pre-pass costs 0.17 to 0
 | `triangles_near`, margin 0.080 (does not use this path) | 1.37 ms | 1.38 ms |
 | `intersecting_pairs`, pushed 0.5 | 10.4 ms | 4.4 ms |
 
+10M, after only, on 2026-10-24 (this tree, which also dispatches the triangle predicates to a fast path after one range check per pair). The "before" column repeats the 10M "after" column of the per-pair-lower-bound table above (the same code before the box prefilter, another day, so only large moves compare; `intersects` touching is unchanged at 1.5 ms, anchoring the drift). Medians with criterion intervals; the machine was shared, so wide intervals are noise:
+
+| 10M | before | after |
+| --- | --- | --- |
+| `intersects`, touching | 1.51 ms | 1.50 ms (intervals 1.25 to 1.57 ms) |
+| `mesh_distance`, touching, all 64 poses | 2.3 ms | 2.80 ms (intervals 2.31 to 4.39 ms) |
+| — intersecting poses only | 1.32 ms | 1.13 ms (intervals 1.10 to 1.16 ms) |
+| — near-miss poses only | 22 ms (3 poses) | 12.3 ms (3 poses; intervals 12.25 to 13.05 ms) |
+| `mesh_distance`, apart 0.3 (does not use this path) | 12.5 ms | 10.4 ms (intervals 8.63 to 13.29 ms) |
+| `triangles_near`, margin 0.080 (does not use this path) | 23.5 ms | 10.2 ms (intervals 7.7 to 33.3 ms; mean 22.4 ms: noise) |
+| `intersecting_pairs`, pushed 0.5 | 154 ms | 38 ms (intervals 23 to 140 ms: noise) |
+
+The `intersecting_pairs` row supersedes the disputed "29 to 265 ms" interval (issue #23; the fix report said "51-265"): both were pre-prefilter noise bands, and after the prefilter the median is about 4× lower.
+
 **Against the spec's targets (§1).**
 - `intersects` takes about 0.3 ms at 1M vs 1M: within the "few ms" target.
 - `mesh_distance` takes about 0.25 ms at 1M when the meshes intersect, about 0.85 ms when they are 0.3 apart, and about 1.8 to 2.1 ms on the near misses (9.6 ms at 10M, measured before the box prefilter). All meet the "few ms" target at 1M. Near misses miss the issue's goal of about 1 ms by about 1.8×, and 10M near misses miss the "few ms" target.

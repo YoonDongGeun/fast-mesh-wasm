@@ -22,6 +22,23 @@ pub enum Region {
     },
 }
 
+/// Absolute pad on a sphere's pruning radius, on top of the `4 * EPSILON`
+/// relative pad in [`Region::bounds`].
+///
+/// When `r * r` underflows to a subnormal or zero (below about 1e-19), the
+/// containment test `d <= r * r` keeps almost no relative precision: with
+/// `r = 1e-23`, `r * r` is zero and a vertex at `2e-23` is contained. The
+/// relative pad and the one-ulp bound widening are both far below that, so
+/// without an absolute pad such a vertex is pruned.
+///
+/// `1e-22` covers every radius whose square underflows. Then `r * r` is at
+/// most a few ulps of `2^-149`, and `d` carries at most a few more from its
+/// own rounding, so an accepted vertex is within about `2 * r` of the
+/// center for the tiniest radii (below about `4e-23`, where `2 * r` is below
+/// the pad) and within `r + 2^-150 / r` above them (where `2^-150 / r` is
+/// below the pad for every `r` above about `4e-24`).
+const SPHERE_PAD: f32 = 1e-22;
+
 impl Region {
     fn validate(&self) -> Result<()> {
         if let Region::Sphere { center, radius } = self {
@@ -41,15 +58,31 @@ impl Region {
     ///
     /// The `f32` containment test `d <= r * r` can accept points a few ulp
     /// outside `center +- radius`, so the sphere's box is padded outward: the
-    /// radius grows by a relative `4 * EPSILON` plus a tiny absolute amount,
-    /// and each bound then moves one more ulp out. Pruning is then
-    /// conservative with respect to the containment tests, whatever the tree
-    /// layout.
+    /// radius grows by a relative `4 * EPSILON` plus [`SPHERE_PAD`], and each
+    /// bound then moves one more ulp out. Pruning is then conservative with
+    /// respect to the containment tests, whatever the tree layout.
+    ///
+    /// The same box is conservative against `sphere_triangle`'s
+    /// `closest_on_triangle(..).dist2 <= r * r` test as well (issue #19). A
+    /// pruned triangle's corners all lie strictly outside the box on some
+    /// axis, so its true closest point is at least the box gap beyond the
+    /// sphere, and acceptance would need downward rounding to bridge it. A
+    /// vertex closest point carries only relative rounding, covered by the
+    /// `4 * EPSILON` like the vertex test. An interpolated (edge or face)
+    /// one rounds by half an ulp at the corners' scale; corners that can
+    /// flip sit just outside the box, at the box's own scale, so that is
+    /// covered by the full ulp each bound moves out. Corners spread far
+    /// along the separating axis instead push the true foot out of the
+    /// segment (a vertex feature, no interpolation) or the true distance
+    /// far beyond the sphere. The sliver path interpolates along segments
+    /// the same way. `sphere_pruning_box_covers_sphere_triangle_at_ulp_scale`
+    /// sweeps the boundary with margin to spare, and fails if the box is
+    /// shrunk (checked by mutation).
     fn bounds(&self) -> Aabb {
         match *self {
             Region::Box(b) => b,
             Region::Sphere { center, radius } => {
-                let r = radius * (1.0 + 4.0 * f32::EPSILON) + f32::MIN_POSITIVE;
+                let r = radius * (1.0 + 4.0 * f32::EPSILON) + SPHERE_PAD;
                 Aabb::new(
                     center.map(|c| (c - r).next_down()),
                     center.map(|c| (c + r).next_up()),
@@ -143,9 +176,10 @@ pub fn triangles_in(
 ///
 /// A vertex that no triangle uses is not found: the search runs over triangles.
 ///
-/// Before deduplication, `out` can temporarily hold each vertex once per
-/// incident candidate triangle, about 6 times the result for a typical mesh,
-/// and `out` keeps that capacity afterwards.
+/// During the traversal the appended range is compacted (sorted and
+/// deduplicated in place) whenever it reaches twice its size at the last
+/// compaction, so it never holds much more than twice the final result, and
+/// needs no extra memory; `out` keeps that capacity afterwards.
 ///
 /// # Errors
 /// As for [`triangles_in`].
@@ -159,11 +193,17 @@ pub fn vertices_in(
     check(mesh, bvh)?;
     let mut ap = Appender::new(out);
     let positions = mesh.positions();
+    // Appended elements at which the range is next compacted. Below this
+    // floor compaction costs more than it saves.
+    let mut compact_at = 64;
     candidates(bvh, region, |id| {
         for v in mesh.triangles()[id as usize] {
             if region.contains_point(positions[v as usize]) {
                 ap.push(v)?;
             }
+        }
+        if ap.count() >= compact_at {
+            compact_at = 2 * ap.sort_dedup_appended().max(1);
         }
         Ok(())
     })?;
@@ -343,6 +383,100 @@ mod tests {
             assert_eq!(vertices_in(&mesh, &bvh, &region, &mut out), Ok(1));
             assert_eq!(out, vec![0]);
         }
+    }
+
+    #[test]
+    fn sphere_with_underflowing_square_keeps_contained_vertices() {
+        // `r * r` underflows to zero, so every vertex whose squared distance
+        // also underflows to zero is contained; the pruning box must still
+        // reach them (issue #19).
+        let center = [0.0, 0.0, 0.0];
+        let radius = 1e-23f32;
+        assert_eq!(radius * radius, 0.0);
+        let region = Region::Sphere { center, radius };
+        let q = [2e-23f32, 0.0, 0.0];
+        assert!(contains(&region, q));
+        let p = [q[0], q[1], q[2], q[0], 1e-23, 0.0, q[0], 0.0, 1e-23];
+        let mesh = Mesh::from_buffers(&p, &[0, 1, 2]).unwrap();
+        for quality in [Quality::Sah, Quality::Fast] {
+            let bvh = build(&mesh, quality);
+            let mut out = Vec::new();
+            assert_eq!(vertices_in(&mesh, &bvh, &region, &mut out), Ok(3));
+            assert_eq!(out, vec![0, 1, 2]);
+        }
+    }
+
+    #[test]
+    fn sphere_pruning_box_covers_sphere_triangle_at_ulp_scale() {
+        // Pruning must be conservative against `sphere_triangle` too, not
+        // just the vertex test: a triangle all of whose corners lie strictly
+        // outside the padded box (so a node box around them is disjoint from
+        // it) must still be rejected. Corners sit from just outside the box
+        // (a few ulps, where the interpolation rounding bites) to a radius
+        // beyond it, at center scales where that rounding is far above the
+        // relative pad (issue #19).
+        let mut rng = Lcg(0x7a19);
+        for scale in [1.0f32, 10.0, 100.0, 1000.0] {
+            let center = [scale, -0.5 * scale, 0.25 * scale];
+            for radius in [0.5, 1.0, 3.0] {
+                let region = Region::Sphere { center, radius };
+                let bounds = region.bounds();
+                for ax in 0..3 {
+                    for _ in 0..1500 {
+                        let span = [1.0f32, 3.0, 10.0, 30.0][(rng.next() * 4.0) as usize % 4];
+                        let mut p = [[0.0f32; 3]; 3];
+                        for v in p.iter_mut() {
+                            for k in 0..3 {
+                                v[k] = if k == ax {
+                                    // Just outside the box, or up to a radius
+                                    // beyond it (spread corners exercise the
+                                    // interpolation-parameter rounding).
+                                    let t = rng.next();
+                                    bounds.max[ax] + t * t * radius
+                                } else {
+                                    center[k] + (rng.next() * 2.0 - 1.0) * span * radius
+                                };
+                            }
+                        }
+                        if rng.next() < 0.5 {
+                            // A sliver: the third corner near the first edge.
+                            let s = rng.next();
+                            let (a, b) = (p[0], p[1]);
+                            for (c, (&x, &y)) in p[2].iter_mut().zip(a.iter().zip(b.iter())) {
+                                *c = x + s * (y - x);
+                            }
+                        }
+                        if !p.iter().all(|v| v[ax] > bounds.max[ax]) {
+                            continue;
+                        }
+                        assert!(
+                            !sphere_triangle(center, radius, p),
+                            "pruned but accepted: c={center:?} r={radius} ax={ax} p={p:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vertices_in_peak_stays_near_the_result() {
+        // Issue #20: periodic compaction during the traversal bounds the
+        // temporary peak at about twice the result, instead of once per
+        // incident triangle (about 6 times). The capacity pins the peak
+        // within vector doubling of it.
+        let mesh = wavy(64);
+        let bvh = build(&mesh, Quality::Sah);
+        let region = Region::Box(Aabb::new([-1.0; 3], [70.0; 3]));
+        let mut out = Vec::new();
+        let n = vertices_in(&mesh, &bvh, &region, &mut out).unwrap();
+        assert_eq!(n, 65 * 65);
+        assert_eq!(out.len(), n);
+        assert!(
+            out.capacity() <= 5 * n,
+            "capacity {} for {n} vertices",
+            out.capacity()
+        );
     }
 
     #[test]

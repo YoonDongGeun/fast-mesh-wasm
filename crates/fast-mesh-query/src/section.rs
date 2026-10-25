@@ -357,8 +357,8 @@ fn segment_gap(p: Seg, q: Seg) -> (f64, P2, P2) {
     PAIRS_TESTED.with(|c| c.set(c.get() + 1));
     let [a, b] = p;
     let [c, d] = q;
-    let (s1, s2) = (side2(a, b, c), side2(a, b, d));
-    let (s3, s4) = (side2(c, d, a), side2(c, d, b));
+    let (s1, s2) = (side2::<false>(a, b, c), side2::<false>(a, b, d));
+    let (s3, s4) = (side2::<false>(c, d, a), side2::<false>(c, d, b));
     if s1 * s2 < 0 && s3 * s4 < 0 {
         // A proper crossing: where `ab` meets the line through `cd`.
         let (o3, o4) = (orient2d_approx(c, d, a), orient2d_approx(c, d, b));
