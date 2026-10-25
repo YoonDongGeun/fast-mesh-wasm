@@ -10,7 +10,9 @@ import {
   dabSpacing,
   faceNormal,
   farEnough,
+  grabLocalDelta,
   interpolateHit,
+  worldPerPixel,
 } from "../src/viewport/sculpt";
 
 const brush: SculptBrush = {
@@ -20,6 +22,7 @@ const brush: SculptBrush = {
   strength: 0.1,
   falloff: "smooth",
   cycles: 3,
+  direction: [0, 0, 0],
 };
 
 function deferred() {
@@ -38,9 +41,9 @@ function tick(): Promise<void> {
 }
 
 describe("sculpt dabs", () => {
-  it("spaces_dabs_by_a_quarter_radius", () => {
-    expect(dabSpacing(1)).toBe(0.25);
-    expect(dabSpacing(0.4)).toBeCloseTo(0.1, 10);
+  it("spaces_dabs_tightly", () => {
+    expect(dabSpacing(1)).toBe(0.15);
+    expect(dabSpacing(0.4)).toBeCloseTo(0.06, 10);
     expect(dabSpacing(0)).toBeGreaterThan(0);
     expect(dabSpacing(-2)).toBeGreaterThan(0);
   });
@@ -67,6 +70,38 @@ describe("sculpt dabs", () => {
       strength: 0.1,
       cycles: 3,
     });
+    expect(dabOp({ ...brush, op: "grab", direction: [1, 2, 3] }, [1, 2, 3])).toEqual({
+      op: "grab",
+      center: [1, 2, 3],
+      radius: 1,
+      falloff: "smooth",
+      strength: 0.1,
+      direction: [1, 2, 3],
+    });
+  });
+
+  it("world_per_pixel_scales_with_depth", () => {
+    const wpp = worldPerPixel(10, 45, 800);
+    expect(wpp).toBeCloseTo((2 * 10 * Math.tan(Math.PI / 8)) / 800, 12);
+    expect(worldPerPixel(5, 45, 800)).toBeCloseTo(wpp / 2, 12);
+  });
+
+  it("grab_delta_follows_the_screen", () => {
+    // Identity orientation: right is +x, up is +y, screen y grows down.
+    const d = grabLocalDelta(10, -5, 0.1, [1, 0, 0], [0, 1, 0], [0, 0, 0, 1]);
+    expect(d[0]).toBeCloseTo(1, 12);
+    expect(d[1]).toBeCloseTo(0.5, 12);
+    expect(d[2]).toBeCloseTo(0, 12);
+  });
+
+  it("grab_delta_lands_in_the_mesh_frame", () => {
+    // The mesh is turned 90° about z (world +x is its -y): the conjugate
+    // quaternion [0, 0, -√½, √½] carries the world delta back.
+    const q = Math.SQRT1_2;
+    const d = grabLocalDelta(10, 0, 0.1, [1, 0, 0], [0, 1, 0], [0, 0, -q, q]);
+    expect(d[0]).toBeCloseTo(0, 10);
+    expect(d[1]).toBeCloseTo(-1, 10);
+    expect(d[2]).toBeCloseTo(0, 10);
   });
 
   it("face_normal_and_hit_interpolation", () => {
@@ -173,6 +208,63 @@ describe("SculptStroke", () => {
     stroke.end();
     await stroke.done;
     expect(seen).toEqual(["apply", "apply"]);
+  });
+
+  it("creeps_toward_a_distant_pointer", async () => {
+    const centers: (readonly [number, number, number])[] = [];
+    const stroke = new SculptStroke(
+      brush,
+      {},
+      (op) => {
+        centers.push((op as { center: readonly [number, number, number] }).center);
+        return Promise.resolve();
+      },
+    );
+    expect(stroke.dab([0, 0, 0])).toBe("stamped");
+    await tick();
+    // One spacing step toward the pointer, not the whole jump.
+    expect(stroke.dab([0.3, 0, 0])).toBe("stamped");
+    await tick();
+    expect(centers.length).toBe(2);
+    expect(centers[1][0]).toBeCloseTo(0.15, 10);
+    // The next dab lands on the pointer itself.
+    expect(stroke.dab([0.3, 0, 0])).toBe("stamped");
+    await tick();
+    expect(centers[2][0]).toBeCloseTo(0.3, 10);
+    stroke.end();
+    await stroke.done;
+  });
+
+  it("jumps_when_the_pointer_teleports", async () => {
+    const centers: (readonly [number, number, number])[] = [];
+    const stroke = new SculptStroke(
+      brush,
+      {},
+      (op) => {
+        centers.push((op as { center: readonly [number, number, number] }).center);
+        return Promise.resolve();
+      },
+    );
+    expect(stroke.dab([0, 0, 0])).toBe("stamped");
+    await tick();
+    expect(stroke.dab([10, 0, 0])).toBe("stamped");
+    stroke.end();
+    await stroke.done;
+    expect(centers[1]).toEqual([10, 0, 0]);
+  });
+
+  it("tracks_bounds_covering_the_stroke", async () => {
+    const stroke = new SculptStroke(brush, {}, () => Promise.resolve());
+    expect(stroke.bounds()).toBeNull();
+    expect(stroke.dab([0, 0, 0])).toBe("stamped");
+    await tick();
+    expect(stroke.dab([10, 0, 0])).toBe("stamped");
+    const b = stroke.bounds();
+    expect(b?.center).toEqual([5, 0, 0]);
+    // Half the span, plus twice the brush radius (cover + growth margin).
+    expect(b?.radius).toBeCloseTo(7, 10);
+    stroke.end();
+    await stroke.done;
   });
 
   it("reads_a_getter_brush_live", async () => {

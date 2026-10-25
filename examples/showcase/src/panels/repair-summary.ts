@@ -123,6 +123,10 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       const r = report as Extract<RepairReport, { trianglesAdded: number }>;
       return `Bridge loops: added ${plural(r.trianglesAdded, "triangle")}`;
     }
+    case "grab": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Grab: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+    }
   }
 }
 

@@ -5,16 +5,21 @@ import type { MeshHandle, RepairOp } from "fast-mesh-wasm";
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
   mesh: MeshHandle;
-  op: "inflate" | "smooth";
+  op: "inflate" | "smooth" | "grab";
   radius: number;
   strength: number;
   falloff: "linear" | "smooth";
   cycles: number;
+  /** The grab drag vector in local coordinates (the grab tool only). */
+  direction: [number, number, number];
 }
 
-/** Dab spacing: a quarter of the radius (never zero, so dabs terminate). */
+/** Past this many spacings a dab jumps to the pointer instead of creeping (see `SculptStroke.dab`). */
+export const CREEP_SPACINGS = 4;
+
+/** Dab spacing: 15% of the radius (never zero, so dabs terminate). */
 export function dabSpacing(radius: number): number {
-  return Math.max(radius * 0.25, 1e-6);
+  return Math.max(radius * 0.15, 1e-6);
 }
 
 /** Whether `at` is at least `spacing` from the last dab: a new dab. */
@@ -37,7 +42,13 @@ export function dabOp(brush: SculptBrush, center: readonly [number, number, numb
     falloff: brush.falloff,
     strength: brush.strength,
   };
-  return brush.op === "smooth" ? { op: "smooth", ...shared, cycles: brush.cycles } : { op: "inflate", ...shared };
+  if (brush.op === "smooth") {
+    return { op: "smooth", ...shared, cycles: brush.cycles };
+  }
+  if (brush.op === "grab") {
+    return { op: "grab", ...shared, direction: [...brush.direction] as [number, number, number] };
+  }
+  return { op: "inflate", ...shared };
 }
 
 /** The unit face normal of the triangle `(a, b, c)` over flat positions. */
@@ -51,6 +62,52 @@ export function faceNormal(positions: ArrayLike<number>, a: number, b: number, c
   const n: [number, number, number] = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
   const len = Math.hypot(n[0], n[1], n[2]);
   return len === 0 ? [0, 0, 1] : [n[0] / len, n[1] / len, n[2] / len];
+}
+
+/** World units per CSS pixel at `distance` from a perspective camera. */
+export function worldPerPixel(distance: number, fovDegrees: number, canvasCssHeight: number): number {
+  return (2 * distance * Math.tan((fovDegrees * Math.PI) / 360)) / canvasCssHeight;
+}
+
+/** Rotates `v` by the unit quaternion `q` ([x, y, z, w]). */
+function rotateByQuat(
+  v: readonly [number, number, number],
+  q: readonly [number, number, number, number],
+): [number, number, number] {
+  const [qx, qy, qz, qw] = q;
+  // t = 2 * cross(q.xyz, v); v + qw * t + cross(q.xyz, t).
+  const tx = 2 * (qy * v[2] - qz * v[1]);
+  const ty = 2 * (qz * v[0] - qx * v[2]);
+  const tz = 2 * (qx * v[1] - qy * v[0]);
+  return [
+    v[0] + qw * tx + (qy * tz - qz * ty),
+    v[1] + qw * ty + (qz * tx - qx * tz),
+    v[2] + qw * tz + (qx * ty - qy * tx),
+  ];
+}
+
+/**
+ * A grab dab's drag vector in the mesh's local frame: the screen delta
+ * (`pixelDx`, `pixelDy`, y down) at `wpp` world units per pixel, along the
+ * camera's `camRight`/`camUp`, carried by `meshQuatConj` (the conjugate of
+ * the mesh's world quaternion).
+ */
+export function grabLocalDelta(
+  pixelDx: number,
+  pixelDy: number,
+  wpp: number,
+  camRight: readonly [number, number, number],
+  camUp: readonly [number, number, number],
+  meshQuatConj: readonly [number, number, number, number],
+): [number, number, number] {
+  const sx = pixelDx * wpp;
+  const sy = -pixelDy * wpp;
+  const world: [number, number, number] = [
+    camRight[0] * sx + camUp[0] * sy,
+    camRight[1] * sx + camUp[1] * sy,
+    camRight[2] * sx + camUp[2] * sy,
+  ];
+  return rotateByQuat(world, meshQuatConj);
 }
 
 /** Interpolates a raycast hit over flat local positions by its barycentric weights. */
@@ -86,6 +143,8 @@ export class SculptStroke {
   readonly #steps: StrokeSteps;
   readonly #apply: (op: RepairOp) => Promise<unknown>;
   #last: [number, number, number] | null = null;
+  #min: [number, number, number] | null = null;
+  #max: [number, number, number] | null = null;
   #running: Promise<void> | null = null;
   #begun = false;
   #landed = false;
@@ -116,7 +175,9 @@ export class SculptStroke {
   /**
    * Applies a dab at `center` (local coordinates): `skipped` when it is too
    * close to the last (unless `force`, the hold-still buildup), `busy` while
-   * one runs, `ended` once the stroke closed.
+   * one runs, `ended` once the stroke closed. A dab within reach creeps one
+   * spacing toward the pointer (no dotted trails on fast moves); past
+   * `CREEP_SPACINGS` spacings it jumps straight there.
    */
   dab(center: readonly [number, number, number], force = false): "stamped" | "skipped" | "busy" | "ended" {
     if (this.#ended) {
@@ -126,18 +187,39 @@ export class SculptStroke {
       return "busy";
     }
     const brush = this.#brush();
-    if (!force && this.#last !== null && !farEnough(this.#last, center, dabSpacing(brush.radius))) {
-      return "skipped";
+    const spacing = dabSpacing(brush.radius);
+    let at: [number, number, number] = [center[0], center[1], center[2]];
+    if (!force && this.#last !== null) {
+      const dx = center[0] - this.#last[0];
+      const dy = center[1] - this.#last[1];
+      const dz = center[2] - this.#last[2];
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist < spacing) {
+        return "skipped";
+      }
+      if (dist <= CREEP_SPACINGS * spacing) {
+        const k = spacing / dist;
+        at = [this.#last[0] + dx * k, this.#last[1] + dy * k, this.#last[2] + dz * k];
+      }
     }
     if (!this.#begun) {
       this.#begun = true;
       this.#steps.beginStep?.();
     }
     this.#dabs++;
-    this.#last = [center[0], center[1], center[2]];
+    this.#last = at;
+    if (this.#min === null || this.#max === null) {
+      this.#min = [...at];
+      this.#max = [...at];
+    } else {
+      for (let k = 0; k < 3; k++) {
+        this.#min[k] = Math.min(this.#min[k], at[k]);
+        this.#max[k] = Math.max(this.#max[k], at[k]);
+      }
+    }
     let settled: Promise<void>;
     try {
-      settled = Promise.resolve(this.#apply(dabOp(brush, center))).then(
+      settled = Promise.resolve(this.#apply(dabOp(brush, at))).then(
         () => {
           this.#landed = true;
         },
@@ -157,6 +239,28 @@ export class SculptStroke {
       }
     });
     return "stamped";
+  }
+
+  /**
+   * The stamped dabs' bounding sphere, grown by twice the brush radius: the
+   * region a stroke-end remesh should even out. The extra margin covers
+   * hold-buildup growth past the dab centers (a spike outgrows its ball).
+   * `null` before the first dab.
+   */
+  bounds(): { center: [number, number, number]; radius: number } | null {
+    if (this.#min === null || this.#max === null) {
+      return null;
+    }
+    const center: [number, number, number] = [
+      (this.#min[0] + this.#max[0]) / 2,
+      (this.#min[1] + this.#max[1]) / 2,
+      (this.#min[2] + this.#max[2]) / 2,
+    ];
+    const dx = this.#max[0] - this.#min[0];
+    const dy = this.#max[1] - this.#min[1];
+    const dz = this.#max[2] - this.#min[2];
+    const grown = Math.sqrt(dx * dx + dy * dy + dz * dz) / 2 + 2 * this.#brush().radius;
+    return { center, radius: grown };
   }
 
   /** Closes the stroke: its step ends (or cancels, when nothing landed), once the running dab settles. */

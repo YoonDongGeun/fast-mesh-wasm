@@ -24,8 +24,9 @@ import {
   type SculptBrush,
   SculptStroke,
   type StrokeSteps,
-  faceNormal,
+  grabLocalDelta,
   interpolateHit,
+  worldPerPixel,
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
 
@@ -34,7 +35,7 @@ export type GizmoMode = "translate" | "rotate";
 /** The hover raycast runs at most this often while the pointer moves. */
 const HOVER_PERIOD_MS = 50;
 /** The sculpt raycast runs at most this often while a stroke paints. */
-const STROKE_PERIOD_MS = 30;
+const STROKE_PERIOD_MS = 16;
 /** Hold-still buildup: a forced dab this often while the button stays down without moving. */
 const BUILDUP_MS = 90;
 
@@ -54,8 +55,10 @@ export function Viewport(props: {
   onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
   /** The sculpt brush armed on a mesh, if any. */
   sculpt: SculptBrush | null;
+  /** A stroke's end remeshes its region. */
+  sculptRemesh: boolean;
 }) {
-  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint, sculpt } = props;
+  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint, sculpt, sculptRemesh } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -100,7 +103,7 @@ export function Viewport(props: {
       {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
       <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
-      {sculpt !== null ? <SculptLayer scene={scene} sculpt={sculpt} /> : null}
+      {sculpt !== null ? <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} /> : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
     </Canvas>
   );
@@ -285,53 +288,57 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
 }
 
 /**
- * The sculpt brush on its mesh: hover shows the brush ring (radius, on the
- * surface, facing along its normal), press-and-hold paints dabs along the
- * pointer (and builds up where it holds still). A press on empty space is
- * the orbit's, as usual; a stroke holds a single undo step on the sync
- * scene (the Worker has no step nesting: one step per dab there). One
- * raycast at a time, through the engine's BVH, never three's per-triangle
- * `Mesh.raycast`.
+ * The sculpt brush on its mesh: hover shows the brush ball (a translucent
+ * sphere of the brush radius around the surface point), press-and-hold
+ * paints dabs along the pointer (and builds up where it holds still;
+ * grab drags the surface along instead). A press on empty space is the
+ * orbit's, as usual; a stroke holds a single undo step on the sync scene
+ * (the Worker has no step nesting: one step per dab there), and its end
+ * remeshes the stroked region when asked. One raycast at a time, through
+ * the engine's BVH, never three's per-triangle `Mesh.raycast`.
  */
-function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush }) {
-  const { scene, sculpt } = props;
+function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; remesh: boolean }) {
+  const { scene, sculpt, remesh } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
   // The brush inputs drive the armed brush live; the stroke survives them.
   const brushRef = useRef(sculpt);
   brushRef.current = sculpt;
+  const remeshRef = useRef(remesh);
+  remeshRef.current = remesh;
+  // The grab drag vector (local frame), refreshed per raycast while a grab
+  // stroke paints; outside React, so moves never re-render.
+  const dirRef = useRef<[number, number, number]>([0, 0, 0]);
 
-  const ring = useMemo(() => {
+  const ball = useMemo(() => {
     const group = new THREE.Group();
-    const material = new THREE.MeshBasicMaterial({
-      color: 0xffd166,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.9,
-      depthTest: true,
-    });
-    group.add(new THREE.Mesh(new THREE.RingGeometry(0.93, 1, 64), material));
-    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.05, 24), material);
-    dot.position.z = 0.001;
-    group.add(dot);
+    group.add(
+      new THREE.Mesh(
+        new THREE.SphereGeometry(1, 40, 28),
+        new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.18, depthWrite: false }),
+      ),
+    );
+    group.add(
+      new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffd166 })),
+    );
     group.visible = false;
     return group;
   }, []);
   useEffect(() => {
     return () => {
-      ring.removeFromParent();
-      for (const child of ring.children) {
-        (child as THREE.Mesh).geometry.dispose();
+      ball.removeFromParent();
+      for (const child of ball.children) {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
       }
-      ((ring.children[0] as THREE.Mesh).material as THREE.Material).dispose();
     };
-  }, [ring]);
+  }, [ball]);
 
   useEffect(() => {
     const canvas = gl.domElement;
     const caster = new THREE.Raycaster();
-    const up = new THREE.Vector3(0, 0, 1);
     let alive = true;
     let running = false;
     let last = -Infinity;
@@ -339,9 +346,13 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
     let pending: { x: number; y: number; period: number } | null = null;
     let hoverLocal: [number, number, number] | null = null;
     let stroke: SculptStroke | null = null;
+    /** Dabs applied so far (a stroke-end remesh needs at least one). */
+    let landed = 0;
     let buildup: ReturnType<typeof setInterval> | undefined;
     /** The stroking pointer, or -1 when no stroke paints. */
     let active = -1;
+    /** The screen point the last grab delta started from. */
+    let grabFrom: { x: number; y: number } | null = null;
 
     const cast = (x: number, y: number) => {
       const r = canvas.getBoundingClientRect();
@@ -353,56 +364,92 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
       return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
     };
 
-    /** The hit over the mesh's local views: its point and face normal. */
+    /** The hit over the mesh's local views: its point. */
     const localHit = (hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
       const v = scene.views(brushRef.current.mesh);
       const indices = v.indices();
       const positions = v.positions();
       const corners = [indices[3 * hit.triangle], indices[3 * hit.triangle + 1], indices[3 * hit.triangle + 2]];
-      return {
-        point: interpolateHit(positions, corners, hit.barycentric),
-        normal: faceNormal(positions, corners[0], corners[1], corners[2]),
-      };
+      return interpolateHit(positions, corners, hit.barycentric);
     };
 
-    const hideRing = () => {
+    const hideBall = () => {
       hoverLocal = null;
-      ring.visible = false;
+      ball.visible = false;
       inspect.sculpt.hovering = false;
     };
 
-    /** The ring onto the surface: a child of the mesh, in its local frame. */
-    const showRing = (point: readonly [number, number, number], normal: readonly [number, number, number]) => {
+    /** The ball around the surface point: a child of the mesh, in its local frame. */
+    const showBall = (point: readonly [number, number, number]) => {
       const binding = view.bindings.get(brushRef.current.mesh);
       if (binding === undefined) {
-        hideRing();
+        hideBall();
         return;
       }
-      if (ring.parent !== binding.object) {
-        binding.object.add(ring);
+      if (ball.parent !== binding.object) {
+        binding.object.add(ball);
       }
-      const radius = brushRef.current.radius;
-      const n = new THREE.Vector3(normal[0], normal[1], normal[2]);
-      ring.visible = true;
-      ring.position.set(point[0], point[1], point[2]).addScaledVector(n, Math.max(radius * 0.02, 1e-4));
-      ring.quaternion.setFromUnitVectors(up, n);
-      ring.scale.setScalar(Math.max(radius, 1e-6));
+      ball.visible = true;
+      ball.position.set(point[0], point[1], point[2]);
+      ball.scale.setScalar(Math.max(brushRef.current.radius, 1e-6));
     };
 
     const endStroke = () => {
       clearInterval(buildup);
       buildup = undefined;
       active = -1;
+      grabFrom = null;
+      dirRef.current = [0, 0, 0];
       if (stroke !== null) {
         const s = stroke;
         stroke = null;
         inspect.sculpt.strokes++;
         inspect.sculpt.dabs += s.dabs;
+        // The stroke-end remesh lands before the step closes: one undo step
+        // for the stroke and its evening-out (on the sync scene).
+        if (remeshRef.current && landed > 0) {
+          const b = s.bounds();
+          if (b !== null) {
+            inspect.sculpt.remeshes++;
+            void store
+              .repair(brushRef.current.mesh, { op: "remesh", center: b.center, radius: b.radius, maxRounds: 4 })
+              .catch(() => {
+                // A degenerate region (or a mesh removed meanwhile): the
+                // stroke still ends.
+              });
+          }
+        }
         s.end();
       }
       if (view.orbit !== null) {
         view.orbit.enabled = true;
       }
+    };
+
+    /** Refreshes the grab drag vector from the pointer's screen delta since the last dab. */
+    const trackGrab = (x: number, y: number, point: readonly [number, number, number]) => {
+      const from = grabFrom;
+      const binding = view.bindings.get(brushRef.current.mesh);
+      if (from === null || binding === undefined) {
+        return;
+      }
+      const world = binding.object.localToWorld(new THREE.Vector3(point[0], point[1], point[2]));
+      const distance = camera.position.distanceTo(world);
+      const height = canvas.clientHeight;
+      if (!(distance > 0) || !(height > 0)) {
+        return;
+      }
+      const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 45;
+      const e = camera.matrixWorld.elements;
+      const q = binding.object.getWorldQuaternion(new THREE.Quaternion()).invert();
+      dirRef.current = grabLocalDelta(
+        x - from.x,
+        y - from.y,
+        worldPerPixel(distance, fov, height),
+        [e[0], e[1], e[2]],
+        [e[4], e[5], e[6]],
+        [q.x, q.y, q.z, q.w],
+      );
     };
 
     const run = () => {
@@ -430,12 +477,11 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
               return;
             }
             if (hit === null || hit.mesh !== brushRef.current.mesh) {
-              hideRing();
+              hideBall();
             } else {
               let point: [number, number, number];
-              let normal: [number, number, number];
               try {
-                ({ point, normal } = localHit(hit));
+                point = localHit(hit);
               } catch {
                 // Removed meanwhile: the next move asks again.
                 run();
@@ -443,8 +489,22 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
               }
               hoverLocal = point;
               inspect.sculpt.hovering = true;
-              showRing(point, normal);
-              stroke?.dab(point);
+              showBall(point);
+              if (stroke !== null) {
+                if (brushRef.current.op === "grab") {
+                  // Forced: the surface follows the pointer exactly (no
+                  // spacing gate to drop small deltas). Only a stamped dab
+                  // consumes its delta; a busy one retries it whole.
+                  trackGrab(at.x, at.y, point);
+                  if (stroke.dab(point, true) === "stamped") {
+                    const g = dirRef.current;
+                    inspect.sculpt.grabTotal += Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+                    grabFrom = { x: at.x, y: at.y };
+                  }
+                } else {
+                  stroke.dab(point);
+                }
+              }
             }
             run();
           },
@@ -483,15 +543,14 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
               return; // empty space (or another mesh): the orbit keeps the gesture.
             }
             let point: [number, number, number];
-            let normal: [number, number, number];
             try {
-              ({ point, normal } = localHit(hit));
+              point = localHit(hit);
             } catch {
               return;
             }
             hoverLocal = point;
             inspect.sculpt.hovering = true;
-            showRing(point, normal);
+            showBall(point);
             // Step nesting is the sync scene's; the Worker steps per dab.
             const maybe = scene as unknown as {
               beginStep?: () => void;
@@ -504,12 +563,24 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
               cancelStep: typeof maybe.cancelStep === "function" ? () => maybe.cancelStep?.() : undefined,
             };
             const mesh = brush.mesh;
-            const s = new SculptStroke(() => brushRef.current, steps, (op) =>
-              store.repair(mesh, op).catch((err: unknown) => {
-                // The mesh went away mid-stroke: end it, and let the stroke count the failed dab.
-                endStroke();
-                throw err;
-              }),
+            landed = 0;
+            grabFrom = { x: e.clientX, y: e.clientY };
+            dirRef.current = [0, 0, 0];
+            const s = new SculptStroke(
+              () => ({ ...brushRef.current, direction: dirRef.current }),
+              steps,
+              (op) =>
+                store
+                  .repair(mesh, op)
+                  .then((r) => {
+                    landed++;
+                    return r;
+                  })
+                  .catch((err: unknown) => {
+                    // The mesh went away mid-stroke: end it, and let the stroke count the failed dab.
+                    endStroke();
+                    throw err;
+                  }),
             );
             active = e.pointerId;
             stroke = s;
@@ -519,6 +590,10 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
             s.dab(point);
             clearInterval(buildup);
             buildup = setInterval(() => {
+              // Grab is move-driven only: holding still must not drift.
+              if (brushRef.current.op === "grab") {
+                return;
+              }
               const at = hoverLocal;
               if (at !== null) {
                 stroke?.dab(at, true);
@@ -543,7 +618,7 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
         return;
       }
       pending = null;
-      hideRing();
+      hideBall();
     };
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerdown", onDown);
@@ -559,9 +634,9 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush })
       canvas.removeEventListener("pointercancel", onUp);
       canvas.removeEventListener("pointerleave", onLeave);
       endStroke();
-      hideRing();
+      hideBall();
     };
-  }, [scene, camera, gl, store, ring]);
+  }, [scene, camera, gl, store, ball]);
 
   return null;
 }

@@ -47,16 +47,6 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [targetLength, setTargetLength] = useState("");
   const [maxRounds, setMaxRounds] = useState("");
   const brushPick = useApp(app, (s) => s.brushPick);
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const [sculptOp, setSculptOp] = useState<"inflate" | "smooth">("inflate");
-  const sculpting = sculpt !== null && sculpt.mesh === mesh;
-  // While armed, the brush inputs drive the sculpt brush live (radius and
-  // strength are the ring and the dab: adjustable mid-stroke).
-  useEffect(() => {
-    if (sculpting && mesh !== null) {
-      app.setSculpt({ mesh, op: sculptOp, radius: brushRadius, strength, falloff, cycles });
-    }
-  }, [app, sculpting, mesh, sculptOp, brushRadius, strength, falloff, cycles]);
   const [bridgeA, setBridgeA] = useState("");
   const [bridgeB, setBridgeB] = useState("");
   const [loopMax, setLoopMax] = useState(128);
@@ -434,10 +424,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
               onChange={(e) => setBrushRadius(Math.max(0, Number(e.currentTarget.value) || 0))}
             />
           </label>
-          <label
-            className="field"
-            title={sculpting ? "Displacement per sculpt dab (negative dents)" : "Displacement scale (negative dents)"}
-          >
+          <label className="field" title="Displacement scale (negative dents)">
             strength
             <input
               type="number"
@@ -484,40 +471,6 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
               value={cycles}
               onChange={(e) => setCycles(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
             />
-          </label>
-        </div>
-        <div className="op">
-          <button
-            type="button"
-            data-action="sculpt"
-            aria-pressed={sculpting}
-            disabled={disabled}
-            title="Paint the brush on the mesh: hover shows the ring, press-and-hold sculpts (Esc disarms)"
-            onClick={() => {
-              if (sculpting || mesh === null) {
-                app.setSculpt(null);
-                return;
-              }
-              // A click-sized strength would explode per dab: arm with a dab-sized one.
-              const dab = strength > 0.5 ? 0.1 : strength;
-              if (dab !== strength) {
-                setStrength(dab);
-              }
-              app.setSculpt({ mesh, op: sculptOp, radius: brushRadius, strength: dab, falloff, cycles });
-            }}
-          >
-            {sculpting ? "Sculpting…" : "Sculpt"}
-          </button>
-          <label className="field" title="What a sculpt dab applies">
-            paint
-            <select
-              value={sculptOp}
-              disabled={disabled}
-              onChange={(e) => setSculptOp(e.currentTarget.value as "inflate" | "smooth")}
-            >
-              <option value="inflate">inflate</option>
-              <option value="smooth">smooth</option>
-            </select>
           </label>
         </div>
         <div className="op">
