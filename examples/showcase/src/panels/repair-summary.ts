@@ -115,5 +115,9 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
       return `Smooth: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
     }
+    case "remesh": {
+      const r = report as Extract<RepairReport, { splits: number; collapses: number; flips: number; rounds: number }>;
+      return `Remesh: ${plural(r.splits, "split")}, ${plural(r.collapses, "collapse")}, ${plural(r.flips, "flip")} in ${plural(r.rounds, "round")}`;
+    }
   }
 }

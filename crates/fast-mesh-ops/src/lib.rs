@@ -42,6 +42,7 @@ mod fill;
 mod fill_dp;
 mod orient;
 mod refine;
+pub mod remesh;
 mod sparse;
 #[cfg(test)]
 mod test_util;
