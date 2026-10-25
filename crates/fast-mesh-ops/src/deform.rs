@@ -7,7 +7,7 @@
 //! center. A negative strength pulls instead of pushing.
 
 use fast_mesh::compute_vertex_normals;
-use fast_mesh_store::{Transaction, VertexId};
+use fast_mesh_store::{Mesh, Transaction, VertexId};
 
 use crate::topology::VertexFans;
 use crate::{OpsError, Result, push, reserve};
@@ -32,6 +32,25 @@ pub(crate) fn falloff_value(falloff: Falloff, t: f32) -> f32 {
             s * s * (3.0 - 2.0 * s)
         }
     }
+}
+
+/// Whether any live vertex is under the brush: closer than `radius` to
+/// `center`, the same membership test the region loops use.
+fn has_region_member(mesh: &Mesh, brush: &Brush) -> bool {
+    mesh.positions().iter().enumerate().any(|(v, p)| {
+        if !mesh.is_vertex_alive(v as VertexId) {
+            return false;
+        }
+        let dist = brush
+            .center
+            .iter()
+            .zip(p)
+            .map(|(c, p)| (p - c).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let t = dist / brush.radius;
+        t.is_finite() && t < 1.0
+    })
 }
 
 /// A deform brush: a sphere of influence with a falloff and a strength.
@@ -157,6 +176,11 @@ pub fn inflate(tx: &mut Transaction, options: &InflateOptions) -> Result<Inflate
     let mesh = tx.mesh();
     let mut report = InflateReport::default();
     if mesh.vertex_slots() == 0 {
+        return Ok(report);
+    }
+    // Members first: with no live vertex under the brush the call is a
+    // guaranteed no-op, so skip the whole-mesh temporaries below.
+    if !has_region_member(mesh, brush) {
         return Ok(report);
     }
     // Slot-aligned flat positions and the alive triangles, the layout
@@ -337,6 +361,11 @@ pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothRep
     if mesh.vertex_slots() == 0 {
         return Ok(report);
     }
+    // Members first: with no live vertex under the brush the call is a
+    // guaranteed no-op, so skip the whole-mesh temporaries below.
+    if !has_region_member(mesh, brush) {
+        return Ok(report);
+    }
     let fans = VertexFans::build(mesh)?;
     let positions = mesh.positions();
     // The region members with their `strength * falloff` weights.
@@ -435,7 +464,8 @@ mod tests {
 
     use super::*;
     use crate::OpsError;
-    use crate::test_util::{edit, mesh_of, parts};
+    use crate::fail_allocations_after;
+    use crate::test_util::{edit, mesh_of, parts, sweep};
 
     /// A 3x3 flat grid in `z = 0`, spacing 1, centered at the origin; vertex
     /// `(x, y)` has id `y * 3 + x`, wound counter-clockwise from `+z`.
@@ -708,5 +738,51 @@ mod tests {
             Err(OpsError::InvalidInput(_))
         ));
         assert!(tx.commit().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inflate_empty_region_skips_temporaries() {
+        // No region member: no fallible reservation may run at all.
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = options([100.0, 0.0, 0.0], 1.0, Falloff::Linear, 2.0);
+        let mut tx = mesh.begin_edit();
+        fail_allocations_after(Some(0));
+        let report = inflate(&mut tx, &options);
+        fail_allocations_after(None);
+        let report = report.unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn smooth_empty_region_skips_temporaries() {
+        // No region member: no fallible reservation may run at all.
+        let mut mesh = centered_grid();
+        let before = parts(&mesh);
+        let options = smooth_options([100.0, 0.0, 0.0], 1.0, Falloff::Linear, 1.0, 1);
+        let mut tx = mesh.begin_edit();
+        fail_allocations_after(Some(0));
+        let report = smooth(&mut tx, &options);
+        fail_allocations_after(None);
+        let report = report.unwrap();
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.max_displacement, 0.0);
+        assert!(tx.commit().unwrap().is_empty());
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn inflate_out_of_memory_is_reported_and_writes_nothing() {
+        let options = options([0.0; 3], 10.0, Falloff::Linear, 2.0);
+        assert!(sweep(centered_grid(), |tx| inflate(tx, &options).map(drop)) > 5);
+    }
+
+    #[test]
+    fn smooth_out_of_memory_is_reported_and_writes_nothing() {
+        let options = smooth_options([0.0; 3], 10.0, Falloff::Linear, 1.0, 1);
+        assert!(sweep(centered_grid(), |tx| smooth(tx, &options).map(drop)) > 5);
     }
 }

@@ -469,6 +469,12 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
         } else if code == 6.0 {
             let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
                 words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
+            // which on wasm32 equals `u32::MAX`, so without this check any
+            // larger value would decode to billions of cycles.
+            if !cycles.is_nan() && cycles > f64::from(u32::MAX) {
+                return Err(Error::invalid("cycles is too large"));
+            }
             let cycles = count_opt(cycles, "cycles")?.unwrap_or_default();
             RepairOp::Smooth(SmoothOptions {
                 brush: Brush {
@@ -746,6 +752,27 @@ mod tests {
         // Positions that overflow f32 locally.
         assert_eq!(code(&[1, 1], &[1e300, 0., 0.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[1, 1], &[f64::NAN, 0., 0.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_rejects_cycles_edges() {
+        let smooth = |cycles: f64| decode_repair(&[6., 0., 0., 0., 1., 0., 1., cycles], &[]);
+        let code = |cycles: f64| smooth(cycles).unwrap_err().code;
+        assert_eq!(code(-1.), codes::INVALID_ARGUMENT);
+        assert_eq!(code(2f64.powi(32)), codes::INVALID_ARGUMENT);
+        // The u32 boundary itself still decodes.
+        assert_eq!(
+            smooth(f64::from(u32::MAX)).unwrap(),
+            vec![RepairOp::Smooth(SmoothOptions {
+                brush: Brush {
+                    center: [0.0; 3],
+                    radius: 1.0,
+                    falloff: Falloff::Linear,
+                    strength: 1.0,
+                },
+                cycles: u32::MAX,
+            })]
+        );
     }
 
     #[test]

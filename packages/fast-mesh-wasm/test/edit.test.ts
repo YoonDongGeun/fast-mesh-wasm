@@ -531,6 +531,8 @@ describe("analyze and repair", () => {
     expect(codeOf(() => s.repair(m, { ...good, strength: NaN }))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { ...good, cycles: 1.5 }))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { ...good, cycles: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, cycles: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, cycles: 2 ** 32 }))).toBe("INVALID_ARGUMENT");
     expect(codeOf(() => s.repair(m, { ...good, falloff: "cubic" as never }))).toBe(
       "INVALID_ARGUMENT",
     );
