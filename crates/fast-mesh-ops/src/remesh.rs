@@ -107,7 +107,7 @@ impl RemeshOptionsBuilder {
 }
 
 /// Outcome of [`remesh`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RemeshReport {
     /// Edge splits performed.
     pub splits: usize,
@@ -117,17 +117,6 @@ pub struct RemeshReport {
     pub flips: usize,
     /// Rounds that changed the mesh.
     pub rounds: usize,
-}
-
-impl RemeshReport {
-    fn quiet() -> Self {
-        RemeshReport {
-            splits: 0,
-            collapses: 0,
-            flips: 0,
-            rounds: 0,
-        }
-    }
 }
 
 /// Remeshes the edges inside `options.region` toward the target length.
@@ -156,13 +145,13 @@ pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshRep
     }
     let mesh = tx.mesh();
     if !has_member(mesh, region) {
-        return Ok(RemeshReport::quiet());
+        return Ok(RemeshReport::default());
     }
     let sigma = match options.target_length {
         Some(t) if t.is_finite() && t > 0.0 => f64::from(t),
         _ => match global_mean_edge_length(mesh)? {
             Some(mean) => mean,
-            None => return Ok(RemeshReport::quiet()),
+            None => return Ok(RemeshReport::default()),
         },
     };
     let base = mesh.positions();
@@ -188,7 +177,7 @@ pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshRep
     reserve(&mut vlive, slots)?;
     vlive.extend(std::iter::repeat_n(true, slots));
     let mut added: Vec<NewVert> = Vec::new();
-    let mut report = RemeshReport::quiet();
+    let mut report = RemeshReport::default();
     for _ in 0..options.max_rounds {
         let fresh = positions.len();
         let splits = split_round(
@@ -246,8 +235,30 @@ fn in_region(p: &[f32; 3], region: &Region) -> bool {
     t.is_finite() && t < 1.0
 }
 
+/// Whether any live edge midpoint lies in the region. The passes test
+/// midpoints, not vertices, so a vertex scan would wrongly early-out a
+/// region crossed by a long edge but holding no vertices.
 fn has_member(mesh: &Mesh, region: &Region) -> bool {
-    mesh.positions().iter().any(|p| in_region(p, region))
+    let positions = mesh.positions();
+    for t in 0..mesh.triangle_slots() as u32 {
+        let corners = match mesh.triangle(t) {
+            Some(c) => c,
+            None => continue,
+        };
+        if degenerate(&corners) {
+            continue;
+        }
+        for k in 0..3 {
+            let mid = midpoint(
+                &positions[corners[k] as usize],
+                &positions[corners[(k + 1) % 3] as usize],
+            );
+            if in_region(&mid, region) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn dist(a: &[f32; 3], b: &[f32; 3]) -> f64 {
@@ -331,13 +342,25 @@ fn split_round(
             push(vlive, true)?;
             push(added, NewVert { pos: mid, parents })?;
             for &(_, i) in &pairs[start..end] {
-                let apex = apex_of(&tris[i].corners, a, b);
-                tris[i].corners = [a, m, apex];
+                let corners = tris[i].corners;
+                let apex = apex_of(&corners, a, b);
+                // The children follow the parent's wound order around the
+                // edge; fixed-order children would flip every parent that
+                // winds b -> a.
+                let ab = (corners[0] == a && corners[1] == b)
+                    || (corners[1] == a && corners[2] == b)
+                    || (corners[2] == a && corners[0] == b);
+                let (first, second) = if ab {
+                    ([a, m, apex], [m, b, apex])
+                } else {
+                    ([b, m, apex], [m, a, apex])
+                };
+                tris[i].corners = first;
                 push(
                     tris,
                     WorkTri {
                         id: None,
-                        corners: [m, b, apex],
+                        corners: second,
                         alive: true,
                     },
                 )?;
@@ -457,11 +480,17 @@ fn validate_collapse(
     let mut na: Vec<u32> = Vec::new();
     let mut nb: Vec<u32> = Vec::new();
     for (i, tri) in tris.iter().enumerate() {
-        if !tri.alive || degenerate(&tri.corners) {
+        if !tri.alive {
             continue;
         }
         let c = tri.corners;
-        if !vlive[c[0] as usize] || !vlive[c[1] as usize] || !vlive[c[2] as usize] {
+        if degenerate(&c) || !vlive[c[0] as usize] || !vlive[c[1] as usize] || !vlive[c[2] as usize]
+        {
+            // Skipped triangles are never repointed, so the collapse is
+            // only safe when none of them touches either endpoint.
+            if c.contains(&a) || c.contains(&b) {
+                return Ok(None);
+            }
             continue;
         }
         let has_a = c.contains(&a);
@@ -629,6 +658,19 @@ fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<
     }
     let new1 = [c, d, a];
     let new2 = [c, d, b];
+    // Area conservation: a valid flip retriangulates the same quad, so the
+    // total area only shifts at second order in curvature, while nested or
+    // overlapping new triangles inflate it by the double-covered part. 1%
+    // separates the two with wide margins either way; sub-1% grazing
+    // overlaps are the accepted residual (winding stays consistent).
+    let area_old = doubled_area(&old1, ctx.positions) + doubled_area(&old2, ctx.positions);
+    let area_new = doubled_area(&new1, ctx.positions) + doubled_area(&new2, ctx.positions);
+    if !matches!(
+        area_new.partial_cmp(&(area_old * 1.01)),
+        Some(Ordering::Less | Ordering::Equal)
+    ) {
+        return None;
+    }
     let old_max = match (
         max_cos_angle(&old1, ctx.positions),
         max_cos_angle(&old2, ctx.positions),
@@ -733,6 +775,12 @@ fn tri_normal(corners: &[u32; 3], positions: &[[f32; 3]]) -> [f64; 3] {
     let p1 = f64v(&positions[corners[1] as usize]);
     let p2 = f64v(&positions[corners[2] as usize]);
     cross3(sub3(p1, p0), sub3(p2, p0))
+}
+
+/// Twice the area of a triangle (the length of its cross product).
+fn doubled_area(corners: &[u32; 3], positions: &[[f32; 3]]) -> f64 {
+    let n = tri_normal(corners, positions);
+    dot3(n, n).sqrt()
 }
 
 /// The largest corner cosine of a triangle (its smallest angle, as a
@@ -871,7 +919,7 @@ mod tests {
 
     use super::*;
     use crate::OpsError;
-    use crate::test_util::{edit, mesh_of, parts, sweep};
+    use crate::test_util::{edit, mesh_of, parts, sweep, with_triangles};
     use crate::topology::{EdgeMap, point, sub};
 
     fn quad_4x1() -> Mesh {
@@ -900,6 +948,19 @@ mod tests {
             .build()
     }
 
+    /// Every live triangle faces +z with positive area (planar fixtures).
+    fn assert_faces_up(mesh: &Mesh) {
+        let (pos, tris) = parts(mesh);
+        assert!(!tris.is_empty());
+        for t in &tris {
+            let x = |v: u32| f64::from(pos[3 * v as usize]);
+            let y = |v: u32| f64::from(pos[3 * v as usize + 1]);
+            let z = (x(t[1]) - x(t[0])) * (y(t[2]) - y(t[0]))
+                - (y(t[1]) - y(t[0])) * (x(t[2]) - x(t[0]));
+            assert!(z > 0.0, "flipped or degenerate: {t:?} z={z}");
+        }
+    }
+
     #[test]
     fn split_refines_sparse_quad_to_target() {
         let mut mesh = quad_4x1();
@@ -912,6 +973,7 @@ mod tests {
         let (pos_after, tris_after) = parts(&mesh);
         assert_eq!(&pos_after[..12], &before.0[..12]);
         assert!(tris_after.len() > before.1.len());
+        assert_faces_up(&mesh);
     }
 
     #[test]
@@ -934,7 +996,10 @@ mod tests {
             .target_length(100.0)
             .build();
         let (report, _) = edit(&mut mesh, |tx| remesh(tx, &coarse));
-        assert_eq!(report.splits, 0);
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]
@@ -1007,8 +1072,10 @@ mod tests {
     }
 
     fn kite() -> Mesh {
+        // Convex kite, apexes on opposite sides of the shared edge (0, 1):
+        // (0, 1, 2) is skinny, so flipping to (2, 3) improves the angles.
         mesh_of(
-            &[0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.15, 0.0, 1.0, 2.0, 0.0],
+            &[0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.15, 0.0, 1.0, -2.0, 0.0],
             &[[0, 1, 2], [1, 0, 3]],
         )
     }
@@ -1036,6 +1103,7 @@ mod tests {
         for v in [0, 1, 2, 3, 4, 7, 8, 11, 12, 13, 14, 15] {
             assert!(mesh.is_vertex_alive(v as VertexId));
         }
+        assert_faces_up(&mesh);
     }
 
     #[test]
@@ -1074,6 +1142,7 @@ mod tests {
             tris.iter().any(|t| t.contains(&2) && t.contains(&3)),
             "flipped diagonal missing: {tris:?}"
         );
+        assert_faces_up(&mesh);
     }
 
     #[test]
@@ -1117,5 +1186,86 @@ mod tests {
             Ok(())
         });
         assert!(n > 0);
+    }
+
+    #[test]
+    fn collapse_skips_edges_touching_degenerate_triangles() {
+        // Degenerate (5, 5, 9) touches interior vertex 5 but not edge (5, 6):
+        // that collapse is skipped, the rest of the grid still coarsens, and
+        // the degenerate triangle is left untouched.
+        let mut mesh = with_triangles(&grid_4x4(), &[[5, 5, 9]]);
+        let options = RemeshOptions::builder()
+            .center([0.15, 0.15, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(report.collapses > 0, "expected collapses, got {report:?}");
+        let (_, tris) = parts(&mesh);
+        assert!(tris.contains(&[5, 5, 9]));
+        for t in &tris {
+            for &v in t {
+                assert!(mesh.is_vertex_alive(v));
+            }
+        }
+    }
+
+    #[test]
+    fn flip_rejects_reflex_quad() {
+        // Reflex at c=(0, 1): the replacement diagonal (c, d) would leave
+        // the quad, nesting one new triangle inside the other.
+        let mut mesh = mesh_of(
+            &[1.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0],
+            &[[0, 1, 2], [1, 0, 3]],
+        );
+        let before = parts(&mesh);
+        let options = RemeshOptions::builder()
+            .center([1.0, 0.0, 0.0])
+            .radius(10.0)
+            .target_length(10.0)
+            .build();
+        let (report, empty) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 0, 0)
+        );
+        assert!(empty);
+        assert_eq!(parts(&mesh), before);
+    }
+
+    #[test]
+    fn split_finds_edge_crossing_vertex_free_region() {
+        // The region around (5, 0) holds no vertices, but the long base
+        // edge crosses it: its midpoint is in, so it splits.
+        let mut mesh = mesh_of(
+            &[0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.1, 0.0],
+            &[[0, 1, 2]],
+        );
+        let options = RemeshOptions::builder()
+            .center([5.0, 0.0, 0.0])
+            .radius(1.0)
+            .target_length(1.0)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(report.splits > 0, "expected splits, got {report:?}");
+    }
+
+    #[test]
+    fn split_defaults_target_to_mesh_mean() {
+        // Mean edge length is (4 + 4 + 1 + 1 + sqrt(17)) / 5 ~ 2.82; the
+        // two long sides and the diagonal exceed 4/3 of it exactly once.
+        let mut mesh = quad_4x1();
+        let options = RemeshOptions::builder()
+            .center([2.0, 0.5, 0.0])
+            .radius(10.0)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (3, 0, 1, 2)
+        );
+        for len in edge_lengths(&mesh) {
+            assert!(len <= 2.8247 * 4.0 / 3.0 + 1e-4, "long edge left: {len}");
+        }
     }
 }
