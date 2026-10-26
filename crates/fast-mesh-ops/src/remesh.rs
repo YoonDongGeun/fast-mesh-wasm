@@ -50,6 +50,9 @@ pub struct RemeshOptions {
     pub target_length: Option<f32>,
     /// Maximum number of split/collapse/flip rounds.
     pub max_rounds: u32,
+    /// Split long edges only: no collapses, no flips. The triangle count
+    /// only grows, so a live sculpt pass never pops the surface down.
+    pub split_only: bool,
 }
 
 impl Default for RemeshOptions {
@@ -58,6 +61,7 @@ impl Default for RemeshOptions {
             region: Region::default(),
             target_length: None,
             max_rounds: REMESH_MAX_ROUNDS,
+            split_only: false,
         }
     }
 }
@@ -97,6 +101,12 @@ impl RemeshOptionsBuilder {
     /// Maximum number of rounds.
     pub fn max_rounds(mut self, rounds: u32) -> Self {
         self.options.max_rounds = rounds;
+        self
+    }
+
+    /// Split long edges only: no collapses, no flips.
+    pub fn split_only(mut self, split_only: bool) -> Self {
+        self.options.split_only = split_only;
         self
     }
 
@@ -188,16 +198,21 @@ pub fn remesh(tx: &mut Transaction, options: &RemeshOptions) -> Result<RemeshRep
             region,
             sigma,
         )?;
-        let collapses = collapse_round(
-            &mut positions,
-            &mut vlive,
-            &mut tris,
-            &mut added,
-            region,
-            sigma,
-            fresh,
-        )?;
-        let flips = flip_round(&positions, &vlive, &mut tris, region, sigma)?;
+        let (collapses, flips) = if options.split_only {
+            (0, 0)
+        } else {
+            let collapses = collapse_round(
+                &mut positions,
+                &mut vlive,
+                &mut tris,
+                &mut added,
+                region,
+                sigma,
+                fresh,
+            )?;
+            let flips = flip_round(&positions, &vlive, &mut tris, region, sigma)?;
+            (collapses, flips)
+        };
         if splits + collapses + flips == 0 {
             break;
         }
@@ -1157,6 +1172,37 @@ mod tests {
             "flipped diagonal missing: {tris:?}"
         );
         assert_faces_up(&mesh);
+    }
+
+    #[test]
+    fn remesh_split_only_never_collapses_or_flips() {
+        // A dense interior a full pass would coarsen: split-only leaves it alone.
+        let mut mesh = grid_4x4();
+        let before = parts(&mesh);
+        let options = RemeshOptions::builder()
+            .center([0.15, 0.15, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .split_only(true)
+            .build();
+        let (report, empty) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert_eq!(
+            (report.splits, report.collapses, report.flips, report.rounds),
+            (0, 0, 0, 0)
+        );
+        assert!(empty);
+        assert_eq!(parts(&mesh), before);
+        // A sparse quad a full pass would refine: split-only still splits.
+        let mut mesh = quad_4x1();
+        let options = RemeshOptions::builder()
+            .center([2.0, 0.5, 0.0])
+            .radius(10.0)
+            .target_length(1.0)
+            .split_only(true)
+            .build();
+        let (report, _) = edit(&mut mesh, |tx| remesh(tx, &options));
+        assert!(report.splits > 0, "expected splits, got {report:?}");
+        assert_eq!((report.collapses, report.flips), (0, 0));
     }
 
     #[test]

@@ -41,7 +41,7 @@
 //!   strength`.
 //! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles`.
 //! - `7` remesh: `cx, cy, cz, radius, target_length (NaN for the mesh mean),
-//!   max_rounds (NaN for the default)`.
+//!   max_rounds (NaN for the default), split_only (0 or 1)`.
 //! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
 //!   ids are taken from `loops`.
 //! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
@@ -510,8 +510,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 },
             })
         } else if code == 7.0 {
-            let [cx, cy, cz, radius, target, rounds]: [f64; 6] =
-                words.take(6)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [cx, cy, cz, radius, target, rounds, split]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
             // As with smooth's `cycles`: without this check any value past
             // `u32::MAX` would decode to billions of rounds on wasm32.
             if !rounds.is_nan() && rounds > f64::from(u32::MAX) {
@@ -529,6 +529,7 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     None => REMESH_MAX_ROUNDS,
                     Some(r) => r?,
                 },
+                split_only: flag(split)?,
             })
         } else if code == 8.0 {
             let [max_e]: [f64; 1] = words.take(1)?.try_into().map_err(|_| malformed(WHAT))?;
@@ -953,7 +954,7 @@ mod tests {
         use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 
         let nan = f64::NAN;
-        let d = decode_repair(&[7., 1., 2., 3., 4., 0.5, nan], &[]).unwrap();
+        let d = decode_repair(&[7., 1., 2., 3., 4., 0.5, nan, 0.], &[]).unwrap();
         assert_eq!(
             d,
             vec![RepairOp::Remesh(RemeshOptions {
@@ -963,39 +964,46 @@ mod tests {
                 },
                 target_length: Some(0.5),
                 max_rounds: REMESH_MAX_ROUNDS,
+                split_only: false,
             })]
         );
-        let d = decode_repair(&[7., 0., 0., 0., 1., nan, 3.], &[]).unwrap();
+        let d = decode_repair(&[7., 0., 0., 0., 1., nan, 3., 1.], &[]).unwrap();
         assert_eq!(
             d,
             vec![RepairOp::Remesh(RemeshOptions {
                 region: Region::default(),
                 target_length: None,
                 max_rounds: 3,
+                split_only: true,
             })]
         );
         // The u32 boundary itself still decodes.
-        let d = decode_repair(&[7., 0., 0., 0., 1., nan, f64::from(u32::MAX)], &[]).unwrap();
+        let d = decode_repair(&[7., 0., 0., 0., 1., nan, f64::from(u32::MAX), 0.], &[]).unwrap();
         assert_eq!(
             d,
             vec![RepairOp::Remesh(RemeshOptions {
                 region: Region::default(),
                 target_length: None,
                 max_rounds: u32::MAX,
+                split_only: false,
             })]
         );
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
         assert_eq!(code(&[7.]), codes::INVALID_ARGUMENT);
         assert_eq!(
-            code(&[7., 0., 0., 0., 1., nan, -1.]),
+            code(&[7., 0., 0., 0., 1., nan, -1., 0.]),
             codes::INVALID_ARGUMENT
         );
         assert_eq!(
-            code(&[7., 0., 0., 0., 1., nan, 1.5]),
+            code(&[7., 0., 0., 0., 1., nan, 1.5, 0.]),
             codes::INVALID_ARGUMENT
         );
         assert_eq!(
-            code(&[7., 0., 0., 0., 1., nan, 2f64.powi(32)]),
+            code(&[7., 0., 0., 0., 1., nan, 2f64.powi(32), 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[7., 0., 0., 0., 1., nan, 2., 0.5]),
             codes::INVALID_ARGUMENT
         );
     }
