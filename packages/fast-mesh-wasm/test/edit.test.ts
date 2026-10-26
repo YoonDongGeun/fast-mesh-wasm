@@ -692,6 +692,21 @@ describe("analyze and repair", () => {
     );
   });
 
+  it("remesh_split_only_never_collapses", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const r = s.repair(m, { op: "remesh", center: [1, 1, 0], radius: 10, targetLength: 0.5, splitOnly: true });
+    expect(r.splits).toBeGreaterThan(0);
+    expect(r.collapses).toBe(0);
+    expect(r.flips).toBe(0);
+    expect(s.views(m).indices().length).toBeGreaterThan(beforeIdx.length);
+    expect(s.undo()).toBe(true);
+    expect(Array.from(s.views(m).indices().subarray(0, beforeIdx.length))).toEqual(
+      Array.from(beforeIdx),
+    );
+  });
+
   it("bridgeLoops_joins_two_rims", () => {
     const s = scene();
     const m = s.addMesh(bridgePos, bridgeIdx);

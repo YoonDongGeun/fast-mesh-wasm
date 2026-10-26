@@ -524,6 +524,8 @@ export type RepairOp =
       targetLength?: number;
       /** Maximum split/collapse/flip rounds; unset means the default (10). */
       maxRounds?: number;
+      /** Split long edges only (no collapses, no flips); unset means a full pass. */
+      splitOnly?: boolean;
     }
   | {
       op: "bridgeLoops";
@@ -973,6 +975,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.radius, "radius"),
           optional(o.targetLength, "targetLength"),
           optional(o.maxRounds, "maxRounds"),
+          flagOf(o.splitOnly, false),
         );
         break;
       case "bridgeLoops": {
