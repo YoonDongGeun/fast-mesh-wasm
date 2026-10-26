@@ -438,8 +438,10 @@ try {
   await mouse("mouseMoved", atB.x, atB.y, { button: "none", modifiers: 8 });
   await mouse("mousePressed", atB.x, atB.y, { buttons: 1, modifiers: 8 });
   await mouse("mouseReleased", atB.x, atB.y, { buttons: 0, modifiers: 8 });
+  // The queue hint and the seeded source render in the passive effect after
+  // the multi list lands: wait for all three, not just the list.
   const multi = await waitFor(
-    `JSON.stringify(__showcase.multi()) === ${JSON.stringify(JSON.stringify([A, B]))}`,
+    `JSON.stringify(__showcase.multi()) === ${JSON.stringify(JSON.stringify([A, B]))} && (document.querySelector("[data-join-source]")?.value ?? "") !== ""`,
     5000,
   );
   const queued = await page(`document.querySelector("[data-join-queue]")?.textContent ?? null`);
