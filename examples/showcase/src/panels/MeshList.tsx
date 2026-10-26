@@ -6,6 +6,7 @@ import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useRef, useState } from "react";
 import { MESH_EXTENSIONS } from "../load/parse";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
+import { selectMesh } from "../scene/selection";
 
 const PHASE: Record<Job["phase"], string> = {
   reading: "reading…",
@@ -91,10 +92,12 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
   const selected = selection === item.mesh;
   const checks = useApp(app, (s) => s.checks);
   const checked = checks.includes(item.mesh);
+  const multi = useApp(app, (s) => s.multi);
+  const secondary = !selected && multi.includes(item.mesh);
   const swatch = `#${item.color.toString(16).padStart(6, "0")}`;
 
   return (
-    <li className={selected ? "mesh selected" : "mesh"} data-mesh={item.name}>
+    <li className={selected ? "mesh selected" : secondary ? "mesh secondary" : "mesh"} data-mesh={item.name}>
       <div className="mesh-head">
         <label className="check" title={`${item.name}: tick for grouping`}>
           <input
@@ -109,8 +112,12 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
           type="button"
           className="mesh-name"
           aria-pressed={selected}
-          title={`${item.name}: select`}
-          onClick={() => select(selected ? null : item.mesh)}
+          title={`${item.name}: select (shift-click adds)`}
+          onClick={(e) => {
+            // Plain clicks reset (a lone selection toggles off); shift-clicks toggle.
+            const target = e.shiftKey || !selected || multi.length > 1 ? item.mesh : null;
+            selectMesh(app, select, selection, target, e.shiftKey && target !== null);
+          }}
         >
           {item.name}
         </button>

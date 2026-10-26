@@ -41,6 +41,13 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
       const sel = store.getSnapshot().selection;
       return app.getSnapshot().items.find((i) => i.mesh === sel)?.name ?? null;
     },
+    /** The shift-clicked meshes in click order (the primary first), by name. */
+    multi: () => {
+      const items = app.getSnapshot().items;
+      return app
+        .getSnapshot()
+        .multi.map((m) => items.find((i) => i.mesh === m)?.name ?? null);
+    },
     /** How the mesh's colouring is drawn (`<FastMesh shading>` as bound), and the edge softness. */
     shading: (name: string) => {
       const b = view.bindings.get(find(name).mesh) as { shading?: string } | undefined;

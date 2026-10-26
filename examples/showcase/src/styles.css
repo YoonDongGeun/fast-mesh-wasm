@@ -199,6 +199,10 @@ input[type="range"] {
 .mesh.selected {
   border-color: var(--warn);
 }
+.mesh.secondary {
+  border-color: var(--muted);
+  border-style: dashed;
+}
 .mesh-head {
   display: flex;
   align-items: center;

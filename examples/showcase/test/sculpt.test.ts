@@ -13,6 +13,7 @@ import {
   farEnough,
   grabLocalDelta,
   interpolateHit,
+  meanEdgeLength,
   worldPerPixel,
 } from "../src/viewport/sculpt";
 
@@ -103,6 +104,22 @@ describe("sculpt dabs", () => {
     expect(d[0]).toBeCloseTo(0, 10);
     expect(d[1]).toBeCloseTo(-1, 10);
     expect(d[2]).toBeCloseTo(0, 10);
+  });
+
+  it("mean_edge_counts_each_edge_once", () => {
+    // Two triangles sharing the (1, 2) edge: 5 edges (4 of length 1, one √2).
+    const positions = [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0];
+    expect(meanEdgeLength(positions, [0, 1, 2, 1, 3, 2])).toBeCloseTo((4 + Math.SQRT2) / 5, 12);
+    // Direction is insignificant: the shared edge counts once either way.
+    expect(meanEdgeLength(positions, [0, 1, 2, 2, 3, 1])).toBeCloseTo((4 + Math.SQRT2) / 5, 12);
+  });
+
+  it("mean_edge_skips_dead_and_degenerate", () => {
+    // A dead slot (0, 0, 0) and a degenerate triangle add no edges.
+    const positions = [0, 0, 0, 3, 0, 0, 0, 4, 0];
+    expect(meanEdgeLength(positions, [0, 0, 0, 0, 1, 2, 2, 2, 2])).toBeCloseTo((3 + 4 + 5) / 3, 12);
+    expect(meanEdgeLength(positions, [0, 0, 0])).toBeNull();
+    expect(meanEdgeLength([], [])).toBeNull();
   });
 
   it("face_normal_and_hit_interpolation", () => {
