@@ -19,7 +19,8 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { FocusRequest } from "../App";
 import { inspect } from "../panels/inspect";
-import type { Item } from "../scene/app-state";
+import { type AppState, type Item, useApp } from "../scene/app-state";
+import { selectMesh } from "../scene/selection";
 import {
   type SculptBrush,
   SculptStroke,
@@ -27,6 +28,7 @@ import {
   GrabAnchor,
   grabLocalDelta,
   interpolateHit,
+  meanEdgeLength,
   worldPerPixel,
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
@@ -42,6 +44,7 @@ const STROKE_PERIOD_MS = 16;
 const BUILDUP_MS = 90;
 
 export function Viewport(props: {
+  app: AppState;
   items: readonly Item[];
   mode: GizmoMode;
   focus: FocusRequest | null;
@@ -65,6 +68,7 @@ export function Viewport(props: {
   wireframe: boolean;
 }) {
   const {
+    app,
     items,
     mode,
     focus,
@@ -79,6 +83,11 @@ export function Viewport(props: {
     wireframe,
   } = props;
   const [selection, select] = useSelection();
+  const multi = useApp(app, (s) => s.multi);
+  const onPick = useCallback(
+    (mesh: MeshHandle, additive: boolean) => selectMesh(app, select, selection, mesh, additive),
+    [app, select, selection],
+  );
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
   const onBind = useCallback((mesh: MeshHandle, bound: MeshBinding | null) => {
@@ -110,8 +119,9 @@ export function Viewport(props: {
           key={item.id}
           item={item}
           selected={item.mesh === selection}
+          secondary={item.mesh !== selection && multi.includes(item.mesh)}
           edgeSoftness={edgeSoftness}
-          onPick={select}
+          onPick={onPick}
           onBind={onBind}
           picking={picking === item.mesh}
           onPickPoint={onPickPoint}
@@ -148,8 +158,10 @@ function PickCursor(props: { picking: boolean }) {
 function MeshView(props: {
   item: Item;
   selected: boolean;
+  /** Shift-clicked after the primary: dimmer, and a Join source. */
+  secondary: boolean;
   edgeSoftness: number;
-  onPick: (mesh: MeshHandle) => void;
+  onPick: (mesh: MeshHandle, additive: boolean) => void;
   onBind: (mesh: MeshHandle, bound: MeshBinding | null) => void;
   picking: boolean;
   onPickPoint: (mesh: MeshHandle, point: readonly [number, number, number]) => void;
@@ -161,11 +173,11 @@ function MeshView(props: {
   /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
   bound: MeshBinding | null;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
+  const { item, selected, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
     props;
   useLayoutEffect(() => {
-    item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
-  }, [item.material, selected]);
+    item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
+  }, [item.material, selected, secondary]);
   useLayoutEffect(() => {
     if (bound !== null) {
       setWireOverlay(bound.object, wireframe);
@@ -188,7 +200,7 @@ function MeshView(props: {
         return;
       }
       if (!picking) {
-        onPick(item.mesh);
+        onPick(item.mesh, e.nativeEvent.shiftKey);
         return;
       }
       // A pick click never selects: raycast and interpolate the hit in the
@@ -403,6 +415,12 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
     let grabFrom: { x: number; y: number } | null = null;
     /** The grab stroke's locked anchor (the press point), or null outside one. */
     let grabAnchor: GrabAnchor | null = null;
+    /**
+     * The armed mesh's mean edge length, taken once per armed session: the
+     * remesh target every stroke converges back to (the engine's live mean
+     * would ratchet ever finer as splits accumulate).
+     */
+    let densityAnchor: { mesh: MeshHandle; length: number } | null = null;
     /** The last live remesh: when, and how many dabs the stroke had. */
     let liveAt = 0;
     let liveDabs = 0;
@@ -433,13 +451,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       liveAt = now;
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
+      const mesh = brushRef.current.mesh;
       liveRunning = store
-        .repair(brushRef.current.mesh, {
+        .repair(mesh, {
           op: "remesh",
           center: b.center,
           radius: b.radius,
           maxRounds: 2,
           splitOnly: true,
+          targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
         })
         .catch(() => {
           // A degenerate region (or a mesh removed meanwhile): the stroke
@@ -508,8 +528,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
           const b = s.bounds();
           if (b !== null) {
             inspect.sculpt.remeshes++;
+            const mesh = brushRef.current.mesh;
             void store
-              .repair(brushRef.current.mesh, { op: "remesh", center: b.center, radius: b.radius, maxRounds: 4 })
+              .repair(mesh, {
+                op: "remesh",
+                center: b.center,
+                radius: b.radius,
+                maxRounds: 4,
+                targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
+              })
               .catch(() => {
                 // A degenerate region (or a mesh removed meanwhile): the
                 // stroke still ends.
@@ -686,6 +713,18 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             grabFrom = { x: e.clientX, y: e.clientY };
             grabAnchor = brush.op === "grab" ? new GrabAnchor(point) : null;
             dirRef.current = [0, 0, 0];
+            if (densityAnchor === null || densityAnchor.mesh !== mesh) {
+              densityAnchor = null;
+              try {
+                const v = scene.views(mesh);
+                const mean = meanEdgeLength(v.positions(), v.indices());
+                if (mean !== null && mean > 0 && Number.isFinite(mean)) {
+                  densityAnchor = { mesh, length: mean };
+                }
+              } catch {
+                // Removed meanwhile: the remeshes fall back to the engine mean.
+              }
+            }
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,

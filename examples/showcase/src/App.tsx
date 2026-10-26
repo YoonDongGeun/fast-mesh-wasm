@@ -13,6 +13,7 @@ import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { type AppState, useApp } from "./scene/app-state";
+import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
@@ -100,7 +101,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         } else if (snap.brushPick !== null) {
           app.setBrushPick(null);
         } else {
-          select(null);
+          selectMesh(app, select, selection, null, false);
         }
       } else if (key === "t") {
         setMode("translate");
@@ -157,6 +158,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       </aside>
       <main className="viewport">
         <Viewport
+          app={app}
           items={items}
           mode={mode}
           focus={focus}

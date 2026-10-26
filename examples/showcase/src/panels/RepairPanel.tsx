@@ -8,6 +8,7 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../scene/app-state";
+import { nextJoinSource } from "../scene/selection";
 import { formatDistance } from "./collision-math";
 import { inspect } from "./inspect";
 import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
@@ -54,6 +55,23 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [joinLoopA, setJoinLoopA] = useState("");
   const [joinLoopB, setJoinLoopB] = useState("");
   const [sourceSummary, setSourceSummary] = useState<AnalysisSummary | null>(null);
+  // The shift-clicked Join queue: every secondary but the target, in click order.
+  const multi = useApp(app, (s) => s.multi);
+  const queue = multi.filter((m) => m !== mesh).map((m) => items.find((i) => i.mesh === m) ?? null);
+  // A multi-selection seeds the Join source (a manual pick stands while it
+  // is still queued); each join drops its source and the next seeds itself.
+  useEffect(() => {
+    const ids: number[] = [];
+    for (const m of multi) {
+      if (m !== mesh) {
+        const found = items.find((i) => i.mesh === m);
+        if (found !== undefined) {
+          ids.push(found.id);
+        }
+      }
+    }
+    setJoinSource((cur) => nextJoinSource(ids, cur));
+  }, [mesh, multi, items]);
   // The brush follows the mesh: its bounding center and a quarter of its
   // half-diagonal. Strength and the rest are preferences and persist.
   useEffect(() => {
@@ -231,6 +249,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       }
       const r = await scene.join(mesh, source.mesh, { loopA: target.id, loopB: from.id, maxEdges: loopMax });
       app.dropItem(store, source);
+      // The queue advances: the next secondary seeds itself.
+      setJoinSource("");
       const line = `${describeJoin(r)} — ${source.name} removed (undo restores ${targetName} only)`;
       setReport({ mesh, line, failed: false });
       inspect.repair.report = line;
@@ -623,6 +643,16 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
             Join
           </button>
         </div>
+        {queue.some((q) => q !== null) ? (
+          <p className="muted small" data-join-queue>
+            Shift-selected join into {item.name}, in order:{" "}
+            {queue
+              .filter((q) => q !== null)
+              .map((q) => q.name)
+              .join(", then ")}
+            .
+          </p>
+        ) : null}
         <p className="muted small">Bridge stitches two holes of this mesh; Join merges another mesh into it (the source is removed).</p>
       </div>
 

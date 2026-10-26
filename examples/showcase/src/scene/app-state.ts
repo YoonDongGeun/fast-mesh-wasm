@@ -97,6 +97,12 @@ export interface AppSnapshot {
   edgeSoftness: number;
   /** Draw every mesh wireframed (a display setting: not undoable). */
   wireframe: boolean;
+  /**
+   * The shift-clicked meshes in click order: the primary first (it doubles
+   * as the store's single selection, so the gizmo and the panels follow
+   * it), the Join sources after it.
+   */
+  multi: readonly MeshHandle[];
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -116,6 +122,7 @@ export class AppState {
     sculptLiveRemesh: true,
     edgeSoftness: 0,
     wireframe: false,
+    multi: [],
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -230,6 +237,7 @@ export class AppState {
       collision: detached.collision,
       group: detached.group,
       checks: this.#snap.checks.filter((m) => m !== item.mesh),
+      multi: this.#snap.multi.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
       sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
     });
@@ -295,6 +303,11 @@ export class AppState {
   /** Arms the sculpt brush, updates it while armed, or disarms it (`null`). */
   setSculpt(sculpt: SculptBrush | null): void {
     this.#set({ sculpt });
+  }
+
+  /** Sets the shift-clicked meshes, primary first (see `selectMesh`). */
+  setMulti(multi: readonly MeshHandle[]): void {
+    this.#set({ multi });
   }
 
   /** Whether a stroke's end remeshes its region. */

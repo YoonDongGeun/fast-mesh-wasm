@@ -24,6 +24,8 @@
 //   at softness 0 (the exact path), within four with softness (the filter
 //   sums in f32 on the GPU).
 // - select: a click on A in the canvas selects it.
+// - multiselect: shift-clicking B adds it (the primary stays A), and the
+//   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
 // - heatmap: the collision pair defaults to A and B, both coloured against
@@ -430,6 +432,23 @@ try {
   await click(at.x, at.y);
   const selected = await waitFor(`__showcase.selected() === ${JSON.stringify(A)}`, 5000);
   verdict("select", selected === true, `clicked (${fmt(at.x)}, ${fmt(at.y)}); selected ${await hook("selected()")}`);
+
+  // ---- multiselect: shift-click B in the canvas ----
+  const atB = await hook(`screenPoint(${JSON.stringify(B)})`);
+  await mouse("mouseMoved", atB.x, atB.y, { button: "none", modifiers: 8 });
+  await mouse("mousePressed", atB.x, atB.y, { buttons: 1, modifiers: 8 });
+  await mouse("mouseReleased", atB.x, atB.y, { buttons: 0, modifiers: 8 });
+  const multi = await waitFor(
+    `JSON.stringify(__showcase.multi()) === ${JSON.stringify(JSON.stringify([A, B]))}`,
+    5000,
+  );
+  const queued = await page(`document.querySelector("[data-join-queue]")?.textContent ?? null`);
+  const seeded = await page(`document.querySelector("[data-join-source]")?.value ?? ""`);
+  verdict(
+    "multiselect",
+    multi !== undefined && queued !== null && queued.includes(B) && seeded !== "",
+    `multi ${JSON.stringify(await hook("multi()"))}; queue ${JSON.stringify(queued)}; source ${seeded}`,
+  );
 
   // ---- drag: the gizmo's centre handle (free move in the view plane) ----
   const { attached, axis, dragging: wasDragging } = await dragGizmo(A, 120, -36, 12, 16);

@@ -136,6 +136,43 @@ export class GrabAnchor {
   }
 }
 
+/**
+ * The mean live-edge length over flat positions and a triangle index: each
+ * undirected edge once, zero-length (dead-slot) and non-finite edges
+ * skipped. `null` when no edge survives. A sculpt session anchors its
+ * remeshes to this (taken when the brush arms), so repeated strokes converge
+ * back to the armed density instead of ratcheting ever finer.
+ */
+export function meanEdgeLength(positions: ArrayLike<number>, indices: ArrayLike<number>): number | null {
+  const seen = new Set<number>();
+  let sum = 0;
+  let count = 0;
+  const edge = (a: number, b: number) => {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    const key = lo * 4294967296 + hi;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    const dx = positions[3 * a] - positions[3 * b];
+    const dy = positions[3 * a + 1] - positions[3 * b + 1];
+    const dz = positions[3 * a + 2] - positions[3 * b + 2];
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!(len > 0) || !Number.isFinite(len)) {
+      return;
+    }
+    sum += len;
+    count++;
+  };
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    edge(indices[t], indices[t + 1]);
+    edge(indices[t + 1], indices[t + 2]);
+    edge(indices[t + 2], indices[t]);
+  }
+  return count === 0 ? null : sum / count;
+}
+
 /** Interpolates a raycast hit over flat local positions by its barycentric weights. */
 export function interpolateHit(
   positions: ArrayLike<number>,
