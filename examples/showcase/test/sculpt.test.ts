@@ -54,7 +54,7 @@ describe("sculpt dabs", () => {
     expect(farEnough([1, 1, 1], [1, 1, 1], 0.25)).toBe(false);
   });
 
-  it("dab_op_builds_inflate_and_smooth", () => {
+  it("dab_op_builds_inflate_relax_and_grab", () => {
     expect(dabOp(brush, [1, 2, 3])).toEqual({
       op: "inflate",
       center: [1, 2, 3],
@@ -62,8 +62,8 @@ describe("sculpt dabs", () => {
       falloff: "smooth",
       strength: 0.1,
     });
-    expect(dabOp({ ...brush, op: "smooth" }, [1, 2, 3])).toEqual({
-      op: "smooth",
+    expect(dabOp({ ...brush, op: "relax" }, [1, 2, 3])).toEqual({
+      op: "relax",
       center: [1, 2, 3],
       radius: 1,
       falloff: "smooth",

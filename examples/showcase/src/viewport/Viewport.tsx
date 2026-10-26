@@ -57,8 +57,25 @@ export function Viewport(props: {
   sculpt: SculptBrush | null;
   /** A stroke's end remeshes its region. */
   sculptRemesh: boolean;
+  /** A stroke is remeshed live while it paints. */
+  sculptLiveRemesh: boolean;
+  /** Draw every mesh wireframed. */
+  wireframe: boolean;
 }) {
-  const { items, mode, focus, edgeSoftness, hoverable, scene, picking, onPickPoint, sculpt, sculptRemesh } = props;
+  const {
+    items,
+    mode,
+    focus,
+    edgeSoftness,
+    hoverable,
+    scene,
+    picking,
+    onPickPoint,
+    sculpt,
+    sculptRemesh,
+    sculptLiveRemesh,
+    wireframe,
+  } = props;
   const [selection, select] = useSelection();
   // Each mesh's binding, as `<FastMesh onBind>` delivers it: for the gizmo.
   const [bindings, setBindings] = useState<ReadonlyMap<MeshHandle, MeshBinding>>(() => new Map());
@@ -98,12 +115,15 @@ export function Viewport(props: {
           onPickPoint={onPickPoint}
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
+          wireframe={wireframe}
         />
       ))}
       {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
       <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
-      {sculpt !== null ? <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} /> : null}
+      {sculpt !== null ? (
+        <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
+      ) : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
     </Canvas>
   );
@@ -133,11 +153,16 @@ function MeshView(props: {
   scene: Scene | WorkerScene;
   /** The sculpt brush is armed on this mesh: clicks paint, they never select or pick. */
   sculpted: boolean;
+  /** Draw wireframed (the binding never touches `wireframe`, so this is additive). */
+  wireframe: boolean;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted } = props;
+  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe } = props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
+  useLayoutEffect(() => {
+    item.material.wireframe = wireframe;
+  }, [item.material, wireframe]);
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
@@ -297,8 +322,8 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
  * remeshes the stroked region when asked. One raycast at a time, through
  * the engine's BVH, never three's per-triangle `Mesh.raycast`.
  */
-function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; remesh: boolean }) {
-  const { scene, sculpt, remesh } = props;
+function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; remesh: boolean; liveRemesh: boolean }) {
+  const { scene, sculpt, remesh, liveRemesh } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
@@ -307,6 +332,8 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
   brushRef.current = sculpt;
   const remeshRef = useRef(remesh);
   remeshRef.current = remesh;
+  const liveRef = useRef(liveRemesh);
+  liveRef.current = liveRemesh;
   // The grab drag vector (local frame), refreshed per raycast while a grab
   // stroke paints; outside React, so moves never re-render.
   const dirRef = useRef<[number, number, number]>([0, 0, 0]);
@@ -348,11 +375,58 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
     let stroke: SculptStroke | null = null;
     /** Dabs applied so far (a stroke-end remesh needs at least one). */
     let landed = 0;
+    /** Dabs already counted live (the rest settle at the stroke's end). */
+    let counted = 0;
+    const syncDabs = () => {
+      if (stroke !== null) {
+        inspect.sculpt.dabs += stroke.dabs - counted;
+        counted = stroke.dabs;
+      }
+    };
     let buildup: ReturnType<typeof setInterval> | undefined;
     /** The stroking pointer, or -1 when no stroke paints. */
     let active = -1;
     /** The screen point the last grab delta started from. */
     let grabFrom: { x: number; y: number } | null = null;
+    /** The last live remesh: when, and how many dabs the stroke had. */
+    let liveAt = 0;
+    let liveDabs = 0;
+    /** A live remesh in flight, if any (never two at once). */
+    let liveRunning: Promise<unknown> | null = null;
+
+    /**
+     * Remeshes the stroked region live (at most every 600 ms and 4 dabs,
+     * never overlapping): lighter than the stroke-end pass, it only stops
+     * triangles ballooning mid-stroke.
+     */
+    const maybeLiveRemesh = () => {
+      if (!liveRef.current || stroke === null || liveRunning !== null) {
+        return;
+      }
+      if (stroke.dabs - liveDabs < 4) {
+        return;
+      }
+      const now = performance.now();
+      if (now - liveAt < 600) {
+        return;
+      }
+      const b = stroke.bounds();
+      if (b === null) {
+        return;
+      }
+      liveAt = now;
+      liveDabs = stroke.dabs;
+      inspect.sculpt.liveRemeshes++;
+      liveRunning = store
+        .repair(brushRef.current.mesh, { op: "remesh", center: b.center, radius: b.radius, maxRounds: 2 })
+        .catch(() => {
+          // A degenerate region (or a mesh removed meanwhile): the stroke
+          // paints on.
+        })
+        .finally(() => {
+          liveRunning = null;
+        });
+    };
 
     const cast = (x: number, y: number) => {
       const r = canvas.getBoundingClientRect();
@@ -402,9 +476,9 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       dirRef.current = [0, 0, 0];
       if (stroke !== null) {
         const s = stroke;
+        syncDabs();
         stroke = null;
         inspect.sculpt.strokes++;
-        inspect.sculpt.dabs += s.dabs;
         // The stroke-end remesh lands before the step closes: one undo step
         // for the stroke and its evening-out (on the sync scene).
         if (remeshRef.current && landed > 0) {
@@ -504,6 +578,8 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
                 } else {
                   stroke.dab(point);
                 }
+                syncDabs();
+                maybeLiveRemesh();
               }
             }
             run();
@@ -564,6 +640,7 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             };
             const mesh = brush.mesh;
             landed = 0;
+            liveDabs = 0;
             grabFrom = { x: e.clientX, y: e.clientY };
             dirRef.current = [0, 0, 0];
             const s = new SculptStroke(
@@ -584,10 +661,12 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             );
             active = e.pointerId;
             stroke = s;
+            counted = 0;
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
             s.dab(point);
+            syncDabs();
             clearInterval(buildup);
             buildup = setInterval(() => {
               // Grab is move-driven only: holding still must not drift.
@@ -597,6 +676,8 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
               const at = hoverLocal;
               if (at !== null) {
                 stroke?.dab(at, true);
+                syncDabs();
+                maybeLiveRemesh();
               }
             }, BUILDUP_MS);
           },

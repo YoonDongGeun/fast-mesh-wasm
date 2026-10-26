@@ -37,6 +37,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
   const items = useApp(app, (s) => s.items);
   const edgeSoftness = useApp(app, (s) => s.edgeSoftness);
+  const wireframe = useApp(app, (s) => s.wireframe);
   const grouped = useApp(app, (s) => s.collisionMode === "group");
   const members = useApp(app, (s) => s.group.members);
   const [selection, select] = useSelection();
@@ -50,6 +51,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
   const sculpt = useApp(app, (s) => s.sculpt);
   const sculptRemesh = useApp(app, (s) => s.sculptRemesh);
+  const sculptLiveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -106,6 +108,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         setMode("rotate");
       } else if (key === "f" && selection !== null) {
         focusOn(selection);
+      } else if (key === "w") {
+        app.setWireframe(!app.getSnapshot().wireframe);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -163,6 +167,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onPickPoint={onPickPoint}
           sculpt={sculpt}
           sculptRemesh={sculptRemesh}
+          sculptLiveRemesh={sculptLiveRemesh}
+          wireframe={wireframe}
         />
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
@@ -181,6 +187,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             </button>
             <button type="button" data-action="redo" disabled={!canRedo} onClick={redo} title="Redo (Ctrl+Shift+Z)">
               Redo
+            </button>
+          </div>
+          <div className="group">
+            <button
+              type="button"
+              data-action="wire"
+              aria-pressed={wireframe}
+              onClick={() => app.setWireframe(!wireframe)}
+              title="Draw every mesh wireframed (W)"
+            >
+              Wire
             </button>
           </div>
         </div>

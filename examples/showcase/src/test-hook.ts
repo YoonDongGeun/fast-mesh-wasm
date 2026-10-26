@@ -164,8 +164,10 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
             };
       return { ...r, analysis };
     },
-    /** The sculpt brush: strokes painted, dabs applied, stroke-end remeshes, and whether the ball shows. */
+    /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
     sculpt: () => ({ ...inspect.sculpt }),
+    /** Whether every mesh draws wireframed. */
+    wireframe: () => app.getSnapshot().wireframe,
     /** RGBA8 colours of the mesh's vertices that are drawn: how many are reddish (penetration), white, or blue-green (gap). */
     colorCounts: (name: string) => {
       const v = store.scene.views(find(name).mesh);

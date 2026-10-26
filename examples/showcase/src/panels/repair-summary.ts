@@ -127,6 +127,10 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
       return `Grab: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
     }
+    case "relax": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+    }
   }
 }
 

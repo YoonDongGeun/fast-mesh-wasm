@@ -88,11 +88,15 @@ export interface AppSnapshot {
   sculpt: SculptBrush | null;
   /** A stroke's end evens its region out with a remesh (in the same undo step on the sync scene). */
   sculptRemesh: boolean;
+  /** A stroke is remeshed live while it paints, so no triangle balloons mid-stroke. */
+  sculptLiveRemesh: boolean;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
    */
   edgeSoftness: number;
+  /** Draw every mesh wireframed (a display setting: not undoable). */
+  wireframe: boolean;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -109,7 +113,9 @@ export class AppState {
     brushPick: null,
     sculpt: null,
     sculptRemesh: true,
+    sculptLiveRemesh: true,
     edgeSoftness: 0,
+    wireframe: false,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -296,9 +302,19 @@ export class AppState {
     this.#set({ sculptRemesh: on });
   }
 
+  /** Whether a stroke is remeshed live while it paints. */
+  setSculptLiveRemesh(on: boolean): void {
+    this.#set({ sculptLiveRemesh: on });
+  }
+
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */
   setEdgeSoftness(width: number): void {
     this.#set({ edgeSoftness: width });
+  }
+
+  /** Draws every mesh wireframed or solid (a display setting: not undoable). */
+  setWireframe(on: boolean): void {
+    this.#set({ wireframe: on });
   }
 
   setJob(job: Job): void {
