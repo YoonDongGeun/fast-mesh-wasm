@@ -3,6 +3,7 @@
 // so the page only calls `store.addMesh` (which transfers them on to the
 // scene Worker).
 import { demoMeshes } from "../scene/demo";
+import { extractSeries } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
 import { parseMeshFile } from "./parse";
 import type { LoadedMesh, LoaderReply, LoaderRequest } from "./protocol";
@@ -22,6 +23,19 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
   try {
     if (req.kind === "demo") {
       post({ kind: "meshes", id: req.id, meshes: demoMeshes(req.big).map((m) => loaded(m.name, m.data)) });
+      return;
+    }
+    if (req.kind === "dicom") {
+      const parsed: { name: string; buffer: ArrayBuffer }[] = [];
+      for (const file of req.files) {
+        parsed.push({ name: file.name, buffer: await file.arrayBuffer() });
+      }
+      post({ kind: "parsing", id: req.id });
+      post({
+        kind: "meshes",
+        id: req.id,
+        meshes: extractSeries(parsed, req.threshold).map((m) => loaded(m.name, m.data)),
+      });
       return;
     }
     const buffer = await req.file.arrayBuffer();

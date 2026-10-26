@@ -4,6 +4,8 @@ import type { Vec3 } from "./mesh-data";
 export type LoaderRequest =
   /** Parse a file (read in the Worker: the page never touches its bytes). */
   | { kind: "file"; id: number; file: File }
+  /** Stack DICOM files into their series and mesh each isosurface (`threshold` null takes Otsu's). */
+  | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
   /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each. */
   | { kind: "demo"; id: number; big: boolean };
 

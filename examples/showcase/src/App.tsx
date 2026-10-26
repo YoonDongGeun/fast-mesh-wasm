@@ -212,14 +212,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
                 ? "Click a mesh to select it · drag to orbit · scroll to zoom · drop files to load"
                 : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
         </p>
-        {items.length === 0 ? <p className="empty">Drop STL, OBJ or PLY files here</p> : null}
+        {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
       <aside className="sidebar sidebar-right">
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
       </aside>
       <StatusBar engine={engine} app={app} />
-      {dropping ? <div className="drop-overlay">Drop STL, OBJ or PLY files to load them</div> : null}
+      {dropping ? <div className="drop-overlay">Drop STL, OBJ, PLY or DICOM files to load them</div> : null}
     </div>
   );
 }

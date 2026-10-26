@@ -3,10 +3,30 @@
 // The page only adds the parsed arrays to the store.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
+import { isDicom } from "./dicom";
 import type { LoaderReply, LoaderRequest } from "./protocol";
 
 /** How long a finished job stays listed. */
 const DONE_LINGER_MS = 2500;
+
+/**
+ * Whether a dropped file is DICOM: by extension, else by the DICM prefix
+ * (Part-10 files often carry no extension). Reads 132 bytes at most.
+ */
+async function isDicomFile(file: File): Promise<boolean> {
+  const ext = /\.[^./\\]+$/.exec(file.name)?.[0].toLowerCase() ?? "";
+  if (ext === ".dcm" || ext === ".dicom") {
+    return true;
+  }
+  if (ext === ".stl" || ext === ".obj" || ext === ".ply") {
+    return false;
+  }
+  try {
+    return isDicom(await file.slice(0, 132).arrayBuffer());
+  } catch {
+    return false;
+  }
+}
 
 export class Loader {
   /** The loader Worker; `null` after it failed, until the next load starts a new one. */
@@ -21,10 +41,23 @@ export class Loader {
     this.#app = app;
   }
 
-  /** Loads files; resolves with the meshes added (none for a file that failed: its job shows why). */
+  /**
+   * Loads files; resolves with the meshes added (none for a file that
+   * failed: its job shows why). DICOM files go as one job: the Worker
+   * stacks their series and meshes each isosurface.
+   */
   async loadFiles(files: Iterable<File>): Promise<Item[]> {
-    const all = await Promise.all([...files].map((file) => this.#start(file.name, { kind: "file", id: 0, file })));
-    return all.flat();
+    const mesh: File[] = [];
+    const dicom: File[] = [];
+    for (const file of files) {
+      (await isDicomFile(file) ? dicom : mesh).push(file);
+    }
+    const jobs = mesh.map((file) => this.#start(file.name, { kind: "file", id: 0, file }));
+    if (dicom.length > 0) {
+      const name = dicom.length === 1 ? dicom[0].name : `DICOM series (${dicom.length} files)`;
+      jobs.push(this.#start(name, { kind: "dicom", id: 0, files: dicom, threshold: null }));
+    }
+    return (await Promise.all(jobs)).flat();
   }
 
   /** Generates and adds the demo meshes A, B and C. */
