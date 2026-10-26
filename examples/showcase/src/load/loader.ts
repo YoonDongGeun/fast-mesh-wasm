@@ -3,10 +3,31 @@
 // The page only adds the parsed arrays to the store.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
-import type { LoaderReply, LoaderRequest } from "./protocol";
+import { isDicom } from "./dicom";
+import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
+import type { LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 
 /** How long a finished job stays listed. */
 const DONE_LINGER_MS = 2500;
+
+/**
+ * Whether a dropped file is DICOM: by extension, else by the DICM prefix
+ * (Part-10 files often carry no extension). Reads 132 bytes at most.
+ */
+async function isDicomFile(file: File): Promise<boolean> {
+  const ext = /\.[^./\\]+$/.exec(file.name)?.[0].toLowerCase() ?? "";
+  if (ext === ".dcm" || ext === ".dicom") {
+    return true;
+  }
+  if (ext === ".stl" || ext === ".obj" || ext === ".ply") {
+    return false;
+  }
+  try {
+    return isDicom(await file.slice(0, 132).arrayBuffer());
+  } catch {
+    return false;
+  }
+}
 
 export class Loader {
   /** The loader Worker; `null` after it failed, until the next load starts a new one. */
@@ -15,21 +36,80 @@ export class Loader {
   readonly #app: AppState;
   readonly #waiting = new Map<number, { name: string; resolve: (items: Item[]) => void }>();
   #nextJob = 0;
+  /** Fetched source volumes by series id, for the volume view. */
+  readonly #volumes = new Map<string, VolumePayload>();
+  readonly #pendingVolumes = new Map<number, { resolve: (v: VolumePayload) => void; reject: (e: Error) => void }>();
 
   constructor(store: SceneStore, app: AppState) {
     this.#store = store;
     this.#app = app;
+    // Evict volumes whose mesh left (removed): both the page copy and the
+    // Worker's retained one (a CT stack is tens of megabytes).
+    app.subscribe(() => {
+      const live = new Set<string>();
+      for (const item of app.getSnapshot().items) {
+        if (item.volumeId !== null) {
+          live.add(item.volumeId);
+        }
+      }
+      for (const id of this.#volumes.keys()) {
+        if (!live.has(id)) {
+          this.#volumes.delete(id);
+          this.#worker?.postMessage({ kind: "dropVolume", volumeId: id });
+        }
+      }
+    });
   }
 
-  /** Loads files; resolves with the meshes added (none for a file that failed: its job shows why). */
+  /**
+   * Fetches a retained source volume (cached after the first fetch).
+   * `@throws` when the Worker no longer retains it.
+   */
+  fetchVolume(volumeId: string): Promise<VolumePayload> {
+    const cached = this.#volumes.get(volumeId);
+    if (cached !== undefined) {
+      return Promise.resolve(cached);
+    }
+    const id = this.#nextJob++;
+    return new Promise<VolumePayload>((resolve, reject) => {
+      this.#pendingVolumes.set(id, {
+        resolve: (v) => {
+          this.#volumes.set(volumeId, v);
+          resolve(v);
+        },
+        reject,
+      });
+      this.#workerFor().postMessage({ kind: "volume", id, volumeId });
+    });
+  }
+
+  /**
+   * Loads files; resolves with the meshes added (none for a file that
+   * failed: its job shows why). DICOM files go as one job: the Worker
+   * stacks their series and meshes each isosurface.
+   */
   async loadFiles(files: Iterable<File>): Promise<Item[]> {
-    const all = await Promise.all([...files].map((file) => this.#start(file.name, { kind: "file", id: 0, file })));
-    return all.flat();
+    const mesh: File[] = [];
+    const dicom: File[] = [];
+    for (const file of files) {
+      (await isDicomFile(file) ? dicom : mesh).push(file);
+    }
+    const jobs = mesh.map((file) => this.#start(file.name, { kind: "file", id: 0, file }));
+    if (dicom.length > 0) {
+      const name = dicom.length === 1 ? dicom[0].name : `DICOM series (${dicom.length} files)`;
+      jobs.push(this.#start(name, { kind: "dicom", id: 0, files: dicom, threshold: null }));
+    }
+    return (await Promise.all(jobs)).flat();
   }
 
   /** Generates and adds the demo meshes A, B and C. */
   loadDemo(big: boolean): Promise<Item[]> {
     return this.#start(big ? "demo meshes (big)" : "demo meshes", { kind: "demo", id: 0, big });
+  }
+
+  /** Meshes a procedural DICOM phantom through the extraction pipeline. */
+  loadDicomDemo(phantom: PhantomKind): Promise<Item[]> {
+    return this.#start(`${PHANTOM_NAMES[phantom]} (DICOM demo)`, { kind: "phantom", id: 0, phantom });
   }
 
   #workerFor(): Worker {
@@ -56,6 +136,11 @@ export class Loader {
       job.resolve([]);
     }
     this.#waiting.clear();
+    for (const pending of this.#pendingVolumes.values()) {
+      pending.reject(new Error(message));
+    }
+    this.#pendingVolumes.clear();
+    this.#volumes.clear();
   }
 
   #start(name: string, request: LoaderRequest): Promise<Item[]> {
@@ -68,6 +153,22 @@ export class Loader {
   }
 
   #receive(reply: LoaderReply): void {
+    if (reply.kind === "volume") {
+      const pending = this.#pendingVolumes.get(reply.id);
+      if (pending !== undefined) {
+        this.#pendingVolumes.delete(reply.id);
+        pending.resolve(reply.volume);
+      }
+      return;
+    }
+    if (reply.kind === "error") {
+      const pending = this.#pendingVolumes.get(reply.id);
+      if (pending !== undefined) {
+        this.#pendingVolumes.delete(reply.id);
+        pending.reject(new Error(reply.message));
+        return;
+      }
+    }
     const job = this.#waiting.get(reply.id);
     if (job === undefined) {
       return;

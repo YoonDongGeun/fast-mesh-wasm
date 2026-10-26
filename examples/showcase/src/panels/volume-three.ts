@@ -1,0 +1,213 @@
+// Our volume renderer: a three.js raycaster through the 8-bit volume,
+// shaded by the preset LUT. Composite and MIP modes, orbit/zoom via
+// OrbitControls, rendered on demand. No vtk.js.
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import * as THREE from "three";
+
+const STEPS = 256;
+
+const VERT = /* glsl */ `
+varying vec3 vObj;
+uniform vec3 uSize;
+void main() {
+  vObj = position / uSize + 0.5;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const FRAG = /* glsl */ `
+precision highp float;
+precision highp sampler3D;
+varying vec3 vObj;
+uniform sampler3D uVolume;
+uniform sampler2D uLut;
+uniform vec3 uCamObj;
+uniform vec3 uTexel;
+uniform float uMip;
+uniform float uAlphaScale;
+
+vec2 hitBox(vec3 ro, vec3 rd) {
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (vec3(0.0) - ro) * inv;
+  vec3 t1 = (vec3(1.0) - ro) * inv;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+  return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
+}
+
+float sampleAt(vec3 p) {
+  return texture(uVolume, p).r;
+}
+
+// Central differences, scaled back to a unit-per-voxel gradient so the
+// light behaves the same on any grid size.
+vec3 gradientAt(vec3 p) {
+  vec3 g;
+  g.x = sampleAt(p + vec3(uTexel.x, 0.0, 0.0)) - sampleAt(p - vec3(uTexel.x, 0.0, 0.0));
+  g.y = sampleAt(p + vec3(0.0, uTexel.y, 0.0)) - sampleAt(p - vec3(0.0, uTexel.y, 0.0));
+  g.z = sampleAt(p + vec3(0.0, 0.0, uTexel.z)) - sampleAt(p - vec3(0.0, 0.0, uTexel.z));
+  return g / uTexel;
+}
+
+void main() {
+  vec3 rd = normalize(vObj - uCamObj);
+  vec2 hit = hitBox(uCamObj, rd);
+  if (hit.y <= max(hit.x, 0.0)) {
+    discard;
+  }
+  float t0 = max(hit.x, 0.0);
+  float dt = (hit.y - t0) / float(${STEPS});
+  vec3 lightDir = normalize(vec3(-0.45, 0.8, 0.65));
+  if (uMip > 0.5) {
+    float best = 0.0;
+    for (int i = 0; i < ${STEPS}; i++) {
+      float s = texture(uVolume, uCamObj + rd * (t0 + (float(i) + 0.5) * dt)).r;
+      best = max(best, s);
+    }
+    vec4 c = texture(uLut, vec2(best, 0.5));
+    gl_FragColor = vec4(c.rgb, 1.0);
+  } else {
+    vec3 acc = vec3(0.0);
+    float alpha = 0.0;
+    for (int i = 0; i < ${STEPS}; i++) {
+      vec3 p = uCamObj + rd * (t0 + (float(i) + 0.5) * dt);
+      float s = sampleAt(p);
+      vec4 c = texture(uLut, vec2(s, 0.5));
+      float a = 1.0 - pow(1.0 - c.a, uAlphaScale);
+      if (a > 0.003) {
+        vec3 n = -normalize(gradientAt(p) + vec3(1e-6));
+        float shade = 0.35 + 0.75 * max(dot(n, lightDir), 0.0);
+        acc += (1.0 - alpha) * c.rgb * (a * shade);
+        alpha += (1.0 - alpha) * a;
+        if (alpha > 0.99) {
+          break;
+        }
+      }
+    }
+    gl_FragColor = vec4(acc, alpha);
+  }
+}
+`;
+
+export type VolumeGrid = {
+  columns: number;
+  rows: number;
+  slices: number;
+  spacing: [number, number, number];
+};
+
+export class VolumeView3D {
+  private renderer: THREE.WebGLRenderer;
+  private scene = new THREE.Scene();
+  private camera: THREE.PerspectiveCamera;
+  private controls: OrbitControls;
+  private mesh: THREE.Mesh;
+  private material: THREE.ShaderMaterial;
+  private volumeTexture: THREE.Data3DTexture;
+  private lutTexture: THREE.DataTexture;
+  private size: THREE.Vector3;
+  private onChange: () => void;
+
+  constructor(canvas: HTMLCanvasElement, data: Uint8Array, grid: VolumeGrid, lut: Uint8Array) {
+    this.size = new THREE.Vector3(
+      grid.columns * grid.spacing[0],
+      grid.rows * grid.spacing[1],
+      grid.slices * grid.spacing[2],
+    );
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // The shader outputs display-ready colors (the LUT is authored in
+    // sRGB): no output transform, or the clear color and the raycast
+    // disagree about the color space.
+    this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    this.renderer.setClearColor(new THREE.Color(0.05, 0.06, 0.08), 1);
+    this.camera = new THREE.PerspectiveCamera(30, 1, 0.1, 10000);
+    const extent = Math.max(this.size.x, this.size.y, this.size.z);
+    const dist = 1.9 * extent;
+    this.camera.position.set(0, 0, dist);
+    this.camera.near = extent * 0.01;
+    this.camera.far = extent * 20;
+    this.camera.updateProjectionMatrix();
+    this.controls = new OrbitControls(this.camera, canvas);
+    this.controls.target.set(0, 0, 0);
+    this.controls.minDistance = extent * 0.5;
+    this.controls.maxDistance = extent * 8;
+    this.controls.update();
+
+    this.volumeTexture = new THREE.Data3DTexture(data, grid.columns, grid.rows, grid.slices);
+    this.volumeTexture.format = THREE.RedFormat;
+    this.volumeTexture.type = THREE.UnsignedByteType;
+    this.volumeTexture.minFilter = THREE.LinearFilter;
+    this.volumeTexture.magFilter = THREE.LinearFilter;
+    this.volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
+    this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
+    this.volumeTexture.needsUpdate = true;
+
+    this.lutTexture = new THREE.DataTexture(lut, lut.length / 4, 1, THREE.RGBAFormat);
+    this.lutTexture.minFilter = THREE.LinearFilter;
+    this.lutTexture.magFilter = THREE.LinearFilter;
+    this.lutTexture.wrapS = THREE.ClampToEdgeWrapping;
+    this.lutTexture.wrapT = THREE.ClampToEdgeWrapping;
+    this.lutTexture.needsUpdate = true;
+
+    // The presets assume ~0.8 mm samples; correct the opacity for ours.
+    const stepLen = this.size.length() / STEPS / 0.8;
+    this.material = new THREE.ShaderMaterial({
+      vertexShader: VERT,
+      fragmentShader: FRAG,
+      side: THREE.BackSide,
+      transparent: true,
+      depthWrite: false,
+      uniforms: {
+        uVolume: { value: this.volumeTexture },
+        uLut: { value: this.lutTexture },
+        uSize: { value: this.size },
+        uCamObj: { value: new THREE.Vector3() },
+        uTexel: { value: new THREE.Vector3(1 / grid.columns, 1 / grid.rows, 1 / grid.slices) },
+        uMip: { value: 0 },
+        uAlphaScale: { value: stepLen },
+      },
+    });
+    this.mesh = new THREE.Mesh(new THREE.BoxGeometry(this.size.x, this.size.y, this.size.z), this.material);
+    this.mesh.frustumCulled = false;
+    this.scene.add(this.mesh);
+    this.onChange = () => this.render();
+    this.controls.addEventListener("change", this.onChange);
+  }
+
+  setLut(lut: Uint8Array): void {
+    this.lutTexture.image.data = lut;
+    this.lutTexture.needsUpdate = true;
+    this.render();
+  }
+
+  setMip(mip: boolean): void {
+    this.material.uniforms.uMip.value = mip ? 1 : 0;
+    this.render();
+  }
+
+  setSize(width: number, height: number): void {
+    this.renderer.setSize(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)), false);
+    this.camera.aspect = Math.max(1, width) / Math.max(1, height);
+    this.camera.updateProjectionMatrix();
+    this.render();
+  }
+
+  render(): void {
+    const cam = this.camera.position.clone().divide(this.size).addScalar(0.5);
+    (this.material.uniforms.uCamObj.value as THREE.Vector3).copy(cam);
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  dispose(): void {
+    this.controls.removeEventListener("change", this.onChange);
+    this.controls.dispose();
+    this.mesh.geometry.dispose();
+    this.material.dispose();
+    this.volumeTexture.dispose();
+    this.lutTexture.dispose();
+    this.renderer.dispose();
+  }
+}

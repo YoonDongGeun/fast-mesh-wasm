@@ -87,6 +87,10 @@ export const inspect: {
     /** The op running, if any. */
     busy: string | null;
   };
+  /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
+  volume: { id: string | null; preset: string; mip: boolean; ready: boolean };
+  /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */
+  slices: { id: string | null; window: string; axial: number; coronal: number; sagittal: number; ready: boolean };
   /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, whether the ball shows, and the last grab dab's center. */
   sculpt: {
     strokes: number;
@@ -102,6 +106,8 @@ export const inspect: {
   group: { ...liveProbe(), warnings: [] },
   hover: null,
   repair: { analysis: null, analyses: 0, report: null, busy: null },
+  volume: { id: null, preset: "", mip: false, ready: false },
+  slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null },
 };
 

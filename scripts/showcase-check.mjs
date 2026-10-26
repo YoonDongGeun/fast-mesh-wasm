@@ -65,6 +65,18 @@
 // - upload: three fixtures (binary STL, OBJ with quads, ASCII PLY) through
 //   the file input are listed with their triangle counts and drawn; a broken
 //   file shows a failed load.
+// - drop: a synthetic file drop on the canvas (dragover + drop with a PLY)
+//   loads and draws the mesh, like an OS drag-and-drop would.
+// - dicom: a synthetic 8-slice sphere series dropped together stacks and
+//   meshes its isosurface (Otsu's threshold), listed and drawn.
+// - dicom-demo: the Vessel tree phantom button meshes through the same
+//   pipeline, listed and drawn.
+// - volume: selecting the phantom's mesh renders its source volume
+//   (vtk.js), with a canvas and the Bone preset.
+// - volume-preset: the Vessels preset plus MIP switch the rendering.
+// - volume-slices: the Slices tab renders axial/coronal/sagittal views.
+// - volume-slice-move: the axial slider and the window preset move the
+//   slice views.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -180,6 +192,50 @@ end_header
 3 1 2 3
 3 2 0 3
 `;
+
+/** A minimal explicit-VR-LE DICOM slice (8x8 16-bit axial, 1 mm voxels). */
+function dicomSlice({ seriesUid, instanceUid, position, pixels }) {
+  const el = (into, group, element, vr, value) => {
+    into.push(group & 0xff, group >> 8, element & 0xff, element >> 8, vr.charCodeAt(0), vr.charCodeAt(1));
+    if (["OB", "OW", "SQ", "UN"].includes(vr)) {
+      into.push(0, 0, value.length & 0xff, (value.length >> 8) & 0xff, 0, 0);
+    } else {
+      into.push(value.length & 0xff, value.length >> 8);
+    }
+    for (const b of value) into.push(b);
+  };
+  const str = (s, pad = 0x20) => {
+    const raw = [...Buffer.from(s, "latin1")];
+    if (raw.length % 2 !== 0) raw.push(pad);
+    return raw;
+  };
+  const us = (v) => [v & 0xff, v >> 8];
+  const out = new Array(128).fill(0);
+  out.push(0x44, 0x49, 0x43, 0x4d);
+  const meta = [];
+  el(meta, 0x0002, 0x0001, "OB", [0, 1]);
+  el(meta, 0x0002, 0x0002, "UI", str("1.2.840.10008.5.1.4.1.1.2", 0));
+  el(meta, 0x0002, 0x0003, "UI", str(instanceUid, 0));
+  el(meta, 0x0002, 0x0010, "UI", str("1.2.840.10008.1.2.1", 0));
+  out.push(0x02, 0x00, 0x00, 0x00, 0x55, 0x4c, 0x04, 0x00, meta.length & 0xff, (meta.length >> 8) & 0xff, 0, 0, ...meta);
+  const bytes = [];
+  el(bytes, 0x0008, 0x0018, "UI", str(instanceUid, 0));
+  el(bytes, 0x0020, 0x000e, "UI", str(seriesUid, 0));
+  el(bytes, 0x0008, 0x103e, "LO", str("CT Ball"));
+  el(bytes, 0x0028, 0x0002, "US", us(1));
+  el(bytes, 0x0028, 0x0004, "CS", str("MONOCHROME2"));
+  el(bytes, 0x0028, 0x0010, "US", us(8));
+  el(bytes, 0x0028, 0x0011, "US", us(8));
+  el(bytes, 0x0028, 0x0100, "US", us(16));
+  el(bytes, 0x0028, 0x0103, "US", us(0));
+  el(bytes, 0x0028, 0x0030, "DS", str("1\\1"));
+  el(bytes, 0x0020, 0x0032, "DS", str(position.join("\\")));
+  el(bytes, 0x0020, 0x0037, "DS", str("1\\0\\0\\0\\1\\0"));
+  const raw = [];
+  for (const p of pixels) raw.push(p & 0xff, (p >> 8) & 0xff);
+  el(bytes, 0x7fe0, 0x0010, "OW", raw);
+  return new Uint8Array([...out, ...bytes]);
+}
 
 /** A UV sphere as a binary STL: 2 · segments · (rings − 1) triangles (1,000,000 for 1000 x 501). */
 function bigSphereStl(segments, rings) {
@@ -794,6 +850,134 @@ try {
     "upload",
     loaded !== undefined && broken !== undefined,
     `${loaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : loaded.filter((m) => m.name in expected).map((m) => `${m.name} (${m.triangles})`).join(", ")}; broken.stl ${broken === undefined ? "not reported" : `failed: ${broken.message}`}`,
+  );
+
+  // ---- drop: a synthetic file drop on the canvas loads ----
+  const dropName = "dropped.ply";
+  await page(`(() => {
+    const file = new File([${JSON.stringify(TETRA_PLY)}], ${JSON.stringify(dropName)}, { type: "model/ply" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const canvas = document.querySelector("canvas");
+    const r = canvas.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, dataTransfer: dt };
+    canvas.dispatchEvent(new DragEvent("dragover", opts));
+    canvas.dispatchEvent(new DragEvent("drop", opts));
+  })()`);
+  const dropLoaded = await waitFor(
+    `__showcase.items().find((m) => m.name === ${JSON.stringify(dropName)} && m.drawn)`,
+    20_000,
+  );
+  verdict(
+    "drop",
+    dropLoaded !== undefined,
+    dropLoaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${dropName} drawn`,
+  );
+
+  // ---- dicom: a synthetic sphere series dropped together meshes ----
+  const series = [];
+  for (let z = 0; z < 8; z++) {
+    const pixels = [];
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        pixels.push(Math.hypot(x - 3.5, y - 3.5, z - 3.5) <= 2.5 ? 100 : 0);
+      }
+    }
+    series.push({
+      name: `ct${z}.dcm`,
+      bytes: dicomSlice({ seriesUid: "1.9.9", instanceUid: `1.9.9.${z}`, position: [0, 0, z], pixels }),
+    });
+  }
+  await page(`(() => {
+    const dt = new DataTransfer();
+    for (const f of ${JSON.stringify(series.map((s) => ({ name: s.name, bytes: [...s.bytes] })))}) {
+      dt.items.add(new File([new Uint8Array(f.bytes).buffer], f.name));
+    }
+    const canvas = document.querySelector("canvas");
+    const r = canvas.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, dataTransfer: dt };
+    canvas.dispatchEvent(new DragEvent("dragover", opts));
+    canvas.dispatchEvent(new DragEvent("drop", opts));
+  })()`);
+  const iso = await waitFor(`__showcase.items().find((m) => m.name.includes("(iso ") && m.drawn)`, 20_000);
+  verdict(
+    "dicom",
+    iso !== undefined && iso.triangles > 0,
+    iso === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${iso.name} (${iso.triangles})`,
+  );
+
+  // ---- dicom-demo: the Vessel tree phantom meshes ----
+  await clickOn("[data-action=dicom-demo-vessels]");
+  const vessel = await waitFor(
+    `__showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn)`,
+    60_000,
+  );
+  verdict(
+    "dicom-demo",
+    vessel !== undefined && vessel.triangles > 1000,
+    vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
+  );
+
+  // ---- volume: the phantom's source volume renders on selection ----
+  if (vessel !== undefined) {
+    await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
+  }
+  const vol = await waitFor(`__showcase.volume().ready ? __showcase.volume() : null`, 60_000);
+  const volCanvas = await page(`document.querySelector("[data-volume] canvas") !== null`);
+  verdict(
+    "volume",
+    vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true,
+    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas}`,
+  );
+
+  // ---- volume-preset: Vessels + MIP ----
+  await page(`(() => {
+    const sel = document.querySelector('[data-action="volume-preset"]');
+    sel.value = "2";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    document.querySelector('[data-action="volume-mip"]').click();
+    return true;
+  })()`);
+  const volMip = await waitFor(
+    `__showcase.volume().preset === "Vessels" && __showcase.volume().mip ? __showcase.volume() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-preset",
+    volMip !== undefined && volMip.ready === true,
+    volMip === undefined ? JSON.stringify(await hook("volume()")) : `${volMip.preset} mip=${volMip.mip}`,
+  );
+
+  // ---- volume-slices: axial/coronal/sagittal views render ----
+  await clickOn('[data-action="volume-tab-slices"]');
+  const slices = await waitFor(`__showcase.slices().ready ? __showcase.slices() : null`, 60_000);
+  const sliceCanvases = await page(`document.querySelectorAll("[data-slice] canvas").length`);
+  verdict(
+    "volume-slices",
+    slices !== undefined && sliceCanvases === 3,
+    slices === undefined ? "never ready" : `canvases=${sliceCanvases} axial=${slices.axial}`,
+  );
+
+  // ---- volume-slice-move: the slider and window preset steer the views ----
+  await page(`(() => {
+    const el = document.querySelector('[data-action="slice-axial"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, "10");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    const w = document.querySelector('[data-action="volume-window"]');
+    w.value = "3";
+    w.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  const sliceMoved = await waitFor(
+    `__showcase.slices().axial === 10 && __showcase.slices().window === "Full range" ? __showcase.slices() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-slice-move",
+    sliceMoved !== undefined && sliceMoved.ready === true,
+    sliceMoved === undefined
+      ? JSON.stringify(await hook("slices()"))
+      : `axial=${sliceMoved.axial} window=${sliceMoved.window}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
