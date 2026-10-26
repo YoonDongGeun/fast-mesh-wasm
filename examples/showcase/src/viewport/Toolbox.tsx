@@ -131,7 +131,7 @@ export function SculptToolbox(props: { app: AppState }) {
         />
         even out after stroke
       </label>
-      <label className="check" title="Remesh while the stroke paints, so no triangle balloons mid-stroke">
+      <label className="check" title="Split stretched triangles while the stroke paints (never collapses: the count only grows mid-stroke)">
         <input
           type="checkbox"
           data-action="sculpt-live-remesh"

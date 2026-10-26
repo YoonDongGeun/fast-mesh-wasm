@@ -110,6 +110,32 @@ export function grabLocalDelta(
   return rotateByQuat(world, meshQuatConj);
 }
 
+/**
+ * A grab stroke's locked anchor: dabs land here however the pointer's
+ * raycast hits swim (off the lump, onto another mesh), so a drag never
+ * re-grabs elsewhere mid-stroke. It advances by each consumed drag delta,
+ * so the grasped lump stays inside the brush ball.
+ */
+export class GrabAnchor {
+  #center: [number, number, number];
+
+  constructor(start: readonly [number, number, number]) {
+    this.#center = [start[0], start[1], start[2]];
+  }
+
+  /** The next dab's center (a copy). */
+  get center(): [number, number, number] {
+    return [...this.#center];
+  }
+
+  /** Advances the anchor by a consumed drag delta. */
+  advance(delta: readonly [number, number, number]): void {
+    this.#center[0] += delta[0];
+    this.#center[1] += delta[1];
+    this.#center[2] += delta[2];
+  }
+}
+
 /** Interpolates a raycast hit over flat local positions by its barycentric weights. */
 export function interpolateHit(
   positions: ArrayLike<number>,

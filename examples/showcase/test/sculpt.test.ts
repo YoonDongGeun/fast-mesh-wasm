@@ -4,6 +4,7 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import {
+  GrabAnchor,
   SculptStroke,
   type SculptBrush,
   dabOp,
@@ -265,6 +266,24 @@ describe("SculptStroke", () => {
     expect(b?.radius).toBeCloseTo(7, 10);
     stroke.end();
     await stroke.done;
+  });
+
+  it("grab_anchor_holds_the_press_point", () => {
+    const anchor = new GrabAnchor([1, 2, 3]);
+    expect(anchor.center).toEqual([1, 2, 3]);
+    // Later raycast hits never move it: only the consumed drag does.
+    expect(anchor.center).toEqual([1, 2, 3]);
+    // A copy: mutating it leaves the anchor alone.
+    const c = anchor.center;
+    c[0] = 99;
+    expect(anchor.center).toEqual([1, 2, 3]);
+  });
+
+  it("grab_anchor_advances_with_the_drag", () => {
+    const anchor = new GrabAnchor([1, 2, 3]);
+    anchor.advance([0.5, 0, 0]);
+    anchor.advance([0, -1, 2]);
+    expect(anchor.center).toEqual([1.5, 1, 5]);
   });
 
   it("reads_a_getter_brush_live", async () => {

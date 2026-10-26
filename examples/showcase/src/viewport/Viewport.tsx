@@ -24,11 +24,13 @@ import {
   type SculptBrush,
   SculptStroke,
   type StrokeSteps,
+  GrabAnchor,
   grabLocalDelta,
   interpolateHit,
   worldPerPixel,
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
+import { setWireOverlay } from "./wire";
 
 export type GizmoMode = "translate" | "rotate";
 
@@ -59,7 +61,7 @@ export function Viewport(props: {
   sculptRemesh: boolean;
   /** A stroke is remeshed live while it paints. */
   sculptLiveRemesh: boolean;
-  /** Draw every mesh wireframed. */
+  /** Lay the wireframe overlay over every shaded mesh. */
   wireframe: boolean;
 }) {
   const {
@@ -116,6 +118,7 @@ export function Viewport(props: {
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
           wireframe={wireframe}
+          bound={bindings.get(item.mesh) ?? null}
         />
       ))}
       {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
@@ -153,16 +156,26 @@ function MeshView(props: {
   scene: Scene | WorkerScene;
   /** The sculpt brush is armed on this mesh: clicks paint, they never select or pick. */
   sculpted: boolean;
-  /** Draw wireframed (the binding never touches `wireframe`, so this is additive). */
+  /** Lay the wireframe overlay over the shaded solid. */
   wireframe: boolean;
+  /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
+  bound: MeshBinding | null;
 }) {
-  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe } = props;
+  const { item, selected, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
+    props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : 0x000000);
   }, [item.material, selected]);
   useLayoutEffect(() => {
-    item.material.wireframe = wireframe;
-  }, [item.material, wireframe]);
+    if (bound !== null) {
+      setWireOverlay(bound.object, wireframe);
+    }
+    return () => {
+      if (bound !== null) {
+        setWireOverlay(bound.object, false);
+      }
+    };
+  }, [bound, wireframe]);
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
@@ -388,6 +401,8 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
     let active = -1;
     /** The screen point the last grab delta started from. */
     let grabFrom: { x: number; y: number } | null = null;
+    /** The grab stroke's locked anchor (the press point), or null outside one. */
+    let grabAnchor: GrabAnchor | null = null;
     /** The last live remesh: when, and how many dabs the stroke had. */
     let liveAt = 0;
     let liveDabs = 0;
@@ -396,8 +411,9 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
 
     /**
      * Remeshes the stroked region live (at most every 600 ms and 4 dabs,
-     * never overlapping): lighter than the stroke-end pass, it only stops
-     * triangles ballooning mid-stroke.
+     * never overlapping): split-only, so the triangle count only grows and
+     * the surface never pops down mid-stroke. The stroke-end pass evens the
+     * density out fully.
      */
     const maybeLiveRemesh = () => {
       if (!liveRef.current || stroke === null || liveRunning !== null) {
@@ -418,7 +434,13 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
       liveRunning = store
-        .repair(brushRef.current.mesh, { op: "remesh", center: b.center, radius: b.radius, maxRounds: 2 })
+        .repair(brushRef.current.mesh, {
+          op: "remesh",
+          center: b.center,
+          radius: b.radius,
+          maxRounds: 2,
+          splitOnly: true,
+        })
         .catch(() => {
           // A degenerate region (or a mesh removed meanwhile): the stroke
           // paints on.
@@ -473,6 +495,7 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       buildup = undefined;
       active = -1;
       grabFrom = null;
+      grabAnchor = null;
       dirRef.current = [0, 0, 0];
       if (stroke !== null) {
         const s = stroke;
@@ -526,6 +549,32 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       );
     };
 
+    /**
+     * Paints one grab dab at the locked anchor (no raycast: the pointer's
+     * hits may swim off the lump or onto another mesh, but the drag never
+     * re-grabs). Only a stamped dab consumes its delta and advances the
+     * anchor; a busy one retries it whole.
+     */
+    const paintGrab = (x: number, y: number) => {
+      if (stroke === null || grabAnchor === null) {
+        return;
+      }
+      const at = grabAnchor.center;
+      trackGrab(x, y, at);
+      if (stroke.dab(at, true) === "stamped") {
+        const g = dirRef.current;
+        inspect.sculpt.grabTotal += Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        grabAnchor.advance(g);
+        grabFrom = { x, y };
+        // Past the advance (where the ball shows): consecutive centers then
+        // differ by exactly the consumed delta the growth accounts.
+        inspect.sculpt.lastDab = grabAnchor.center;
+        showBall(grabAnchor.center);
+      }
+      syncDabs();
+      maybeLiveRemesh();
+    };
+
     const run = () => {
       if (!alive || running || pending === null) {
         return;
@@ -540,6 +589,11 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       }
       const at = pending;
       pending = null;
+      if (stroke !== null && brushRef.current.op === "grab") {
+        last = performance.now();
+        paintGrab(at.x, at.y);
+        return;
+      }
       running = true;
       last = performance.now();
       Promise.resolve()
@@ -565,19 +619,7 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
               inspect.sculpt.hovering = true;
               showBall(point);
               if (stroke !== null) {
-                if (brushRef.current.op === "grab") {
-                  // Forced: the surface follows the pointer exactly (no
-                  // spacing gate to drop small deltas). Only a stamped dab
-                  // consumes its delta; a busy one retries it whole.
-                  trackGrab(at.x, at.y, point);
-                  if (stroke.dab(point, true) === "stamped") {
-                    const g = dirRef.current;
-                    inspect.sculpt.grabTotal += Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-                    grabFrom = { x: at.x, y: at.y };
-                  }
-                } else {
-                  stroke.dab(point);
-                }
+                stroke.dab(point);
                 syncDabs();
                 maybeLiveRemesh();
               }
@@ -642,6 +684,7 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             landed = 0;
             liveDabs = 0;
             grabFrom = { x: e.clientX, y: e.clientY };
+            grabAnchor = brush.op === "grab" ? new GrabAnchor(point) : null;
             dirRef.current = [0, 0, 0];
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
@@ -665,7 +708,11 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            s.dab(point);
+            // Grab is move-driven only: the press locks the anchor, the first
+            // move paints (a click without a drag leaves no step, no remesh).
+            if (brush.op !== "grab") {
+              s.dab(point);
+            }
             syncDabs();
             clearInterval(buildup);
             buildup = setInterval(() => {

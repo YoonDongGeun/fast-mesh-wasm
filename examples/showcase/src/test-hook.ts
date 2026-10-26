@@ -8,6 +8,7 @@ import { inspect } from "./panels/inspect";
 import { shadeProbe } from "./shade-probe";
 import type { AppState } from "./scene/app-state";
 import { view } from "./viewport/view";
+import { hasWireOverlay } from "./viewport/wire";
 
 export function installTestHook(store: SceneStore, engine: Engine, app: AppState): void {
   const nameOf = (m: unknown) => app.getSnapshot().items.find((i) => i.mesh === m)?.name ?? null;
@@ -168,6 +169,20 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     sculpt: () => ({ ...inspect.sculpt }),
     /** Whether every mesh draws wireframed. */
     wireframe: () => app.getSnapshot().wireframe,
+    /** The wireframe overlays in the scene: meshes bound, overlays shown, and whether every solid stayed shaded. */
+    wireOverlays: () => {
+      let overlays = 0;
+      let solid = true;
+      for (const b of view.bindings.values()) {
+        if (hasWireOverlay(b.object)) {
+          overlays++;
+        }
+        if ((b.object.material as THREE.MeshStandardMaterial).wireframe === true) {
+          solid = false;
+        }
+      }
+      return { meshes: view.bindings.size, overlays, solid };
+    },
     /** RGBA8 colours of the mesh's vertices that are drawn: how many are reddish (penetration), white, or blue-green (gap). */
     colorCounts: (name: string) => {
       const v = store.scene.views(find(name).mesh);
