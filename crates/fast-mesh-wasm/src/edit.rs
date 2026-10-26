@@ -46,6 +46,8 @@
 //!   ids are taken from `loops`.
 //! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
 //!   dx, dy, dz`.
+//! - `10` relax: like `6` smooth, but plain Laplacian passes instead of
+//!   Taubin λ/μ cycles.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -66,13 +68,16 @@
 //! - remesh: `splits, collapses, flips, rounds`.
 //! - bridge loops: `triangles_added`.
 //! - grab: `moved, max_displacement`.
+//! - relax: `moved, max_displacement`.
 //!
 //! # Analysis
 //!
 //! One `f64` array, see [`encode_analysis`].
 
 use fast_mesh_ops::bridge::BridgeOptions;
-use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions, InflateOptions, SmoothOptions};
+use fast_mesh_ops::deform::{
+    Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions,
+};
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::{
     Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
@@ -480,7 +485,7 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     strength: strength as f32,
                 },
             })
-        } else if code == 6.0 {
+        } else if code == 6.0 || code == 10.0 {
             let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
                 words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
             // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
@@ -498,6 +503,11 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     strength: strength as f32,
                 },
                 cycles: u32::try_from(cycles).map_err(|_| Error::invalid("cycles is too large"))?,
+                method: if code == 10.0 {
+                    SmoothMethod::Laplacian
+                } else {
+                    SmoothMethod::Taubin
+                },
             })
         } else if code == 7.0 {
             let [cx, cy, cz, radius, target, rounds]: [f64; 6] =
@@ -846,7 +856,40 @@ mod tests {
                     strength: 1.0,
                 },
                 cycles: u32::MAX,
+                method: SmoothMethod::Taubin,
             })]
+        );
+    }
+
+    #[test]
+    fn decode_repair_relax() {
+        use fast_mesh_ops::deform::{Brush, Falloff, SmoothMethod, SmoothOptions};
+
+        let d = decode_repair(&[10., 1., 2., 3., 4., 1., 0.5, 2.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Smooth(SmoothOptions {
+                brush: Brush {
+                    center: [1.0, 2.0, 3.0],
+                    radius: 4.0,
+                    falloff: Falloff::Smooth,
+                    strength: 0.5,
+                },
+                cycles: 2,
+                method: SmoothMethod::Laplacian,
+            })]
+        );
+        // Code 6 keeps Taubin.
+        let d = decode_repair(&[6., 1., 2., 3., 4., 1., 0.5, 2.], &[]).unwrap();
+        assert!(matches!(
+            d.as_slice(),
+            [RepairOp::Smooth(o)] if o.method == SmoothMethod::Taubin
+        ));
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[10.]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[10., 0., 0., 0., 1., 0., 1.]),
+            codes::INVALID_ARGUMENT
         );
     }
 

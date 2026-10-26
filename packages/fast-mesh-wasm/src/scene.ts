@@ -542,6 +542,17 @@ export type RepairOp =
       strength: number;
       /** The drag vector in local coordinates; zero moves nothing. */
       direction: Readonly<Vec3>;
+    }
+  | {
+      op: "relax";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; the per-vertex weight is `strength * falloff`. */
+      strength: number;
+      /** How many plain Laplacian passes to run; 0 moves nothing. */
+      cycles: number;
     };
 
 /** What `weld` did. */
@@ -626,6 +637,12 @@ export interface GrabReport {
   maxDisplacement: number;
 }
 
+/** What `relax` did. */
+export interface RelaxReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -657,7 +674,8 @@ export type RepairReport =
   | SmoothReport
   | RemeshReport
   | BridgeReport
-  | GrabReport;
+  | GrabReport
+  | RelaxReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -680,7 +698,9 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                   ? BridgeReport
                   : O extends { op: "grab" }
                     ? GrabReport
-                    : RepairReport;
+                    : O extends { op: "relax" }
+                      ? RelaxReport
+                      : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -840,6 +860,7 @@ const REPAIR_CODES = {
   remesh: 7,
   bridgeLoops: 8,
   grab: 9,
+  relax: 10,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -937,6 +958,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         );
         break;
       case "smooth":
+      case "relax":
         centerOf(o.center, values);
         values.push(
           optional(o.radius, "radius"),
@@ -1062,6 +1084,7 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
     case "inflate":
       return { moved: r.next(), maxDisplacement: r.next() };
     case "smooth":
+    case "relax":
       return { moved: r.next(), maxDisplacement: r.next() };
     case "remesh":
       return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };

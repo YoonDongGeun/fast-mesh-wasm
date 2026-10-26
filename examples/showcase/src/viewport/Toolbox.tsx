@@ -9,11 +9,15 @@ import { type AppState, useApp } from "../scene/app-state";
 
 export type SculptTool = "inflate" | "deflate" | "smooth" | "grab";
 
-/** The repair op a tool paints (deflate is inflate with a flipped strength). */
-const TOOL_OP: Record<SculptTool, "inflate" | "smooth" | "grab"> = {
+/**
+ * The repair op a tool paints (deflate is inflate with a flipped strength;
+ * smooth paints plain-Laplacian relax: Taubin λ/μ converges too slowly to
+ * melt under a brush).
+ */
+const TOOL_OP: Record<SculptTool, "inflate" | "relax" | "grab"> = {
   inflate: "inflate",
   deflate: "inflate",
-  smooth: "smooth",
+  smooth: "relax",
   grab: "grab",
 };
 
@@ -30,8 +34,8 @@ const TOOLS: { tool: SculptTool; label: string; title: string }[] = [
  * dab-sized 0.05 already builds a visible bump without folding.
  */
 const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 };
-/** Taubin cycles per smooth dab. */
-const SMOOTH_CYCLES = 1;
+/** Laplacian passes per smooth dab (each melts the full weight toward the centroid). */
+const RELAX_PASSES = 2;
 
 const fmt = (v: number): string => String(Number(v.toPrecision(3)));
 
@@ -41,6 +45,7 @@ export function SculptToolbox(props: { app: AppState }) {
   const items = useApp(app, (s) => s.items);
   const sculpt = useApp(app, (s) => s.sculpt);
   const remesh = useApp(app, (s) => s.sculptRemesh);
+  const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
   const item = items.find((i) => i.mesh === selection) ?? null;
   const [tool, setTool] = useState<SculptTool>("inflate");
   const [radius, setRadius] = useState(0.25);
@@ -126,6 +131,15 @@ export function SculptToolbox(props: { app: AppState }) {
         />
         even out after stroke
       </label>
+      <label className="check" title="Remesh while the stroke paints, so no triangle balloons mid-stroke">
+        <input
+          type="checkbox"
+          data-action="sculpt-live-remesh"
+          checked={liveRemesh}
+          onChange={(e) => app.setSculptLiveRemesh(e.currentTarget.checked)}
+        />
+        even out while painting
+      </label>
     </div>
   );
 }
@@ -145,7 +159,7 @@ function arm(
     radius,
     strength: tool === "deflate" ? -Math.abs(strength) : Math.abs(strength),
     falloff,
-    cycles: SMOOTH_CYCLES,
+    cycles: RELAX_PASSES,
     direction: [0, 0, 0],
   });
 }

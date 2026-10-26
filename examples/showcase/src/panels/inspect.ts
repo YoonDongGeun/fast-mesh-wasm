@@ -87,14 +87,14 @@ export const inspect: {
     /** The op running, if any. */
     busy: string | null;
   };
-  /** The sculpt brush: strokes painted, dabs applied, stroke-end remeshes, grab drag applied, and whether the ball shows. */
-  sculpt: { strokes: number; dabs: number; remeshes: number; grabTotal: number; hovering: boolean };
+  /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, and whether the ball shows. */
+  sculpt: { strokes: number; dabs: number; remeshes: number; liveRemeshes: number; grabTotal: number; hovering: boolean };
 } = {
   collision: { ...liveProbe(), warnings: [] },
   group: { ...liveProbe(), warnings: [] },
   hover: null,
   repair: { analysis: null, analyses: 0, report: null, busy: null },
-  sculpt: { strokes: 0, dabs: 0, remeshes: 0, grabTotal: 0, hovering: false },
+  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false },
 };
 
 function liveProbe(): LiveProbe<never> {

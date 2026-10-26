@@ -5,7 +5,7 @@ import type { MeshHandle, RepairOp } from "fast-mesh-wasm";
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
   mesh: MeshHandle;
-  op: "inflate" | "smooth" | "grab";
+  op: "inflate" | "relax" | "grab";
   radius: number;
   strength: number;
   falloff: "linear" | "smooth";
@@ -42,8 +42,8 @@ export function dabOp(brush: SculptBrush, center: readonly [number, number, numb
     falloff: brush.falloff,
     strength: brush.strength,
   };
-  if (brush.op === "smooth") {
-    return { op: "smooth", ...shared, cycles: brush.cycles };
+  if (brush.op === "relax") {
+    return { op: "relax", ...shared, cycles: brush.cycles };
   }
   if (brush.op === "grab") {
     return { op: "grab", ...shared, direction: [...brush.direction] as [number, number, number] };

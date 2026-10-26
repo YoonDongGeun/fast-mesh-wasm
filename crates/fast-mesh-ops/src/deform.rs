@@ -247,13 +247,28 @@ pub const TAUBIN_LAMBDA: f32 = 0.33;
 /// `μ` pushes it back out past where the λ pass left it.
 pub const TAUBIN_MU: f32 = -0.34;
 
+/// How [`smooth`] relaxes: volume-preserving Taubin λ/μ cycles, or plain
+/// Laplacian passes that melt toward the centroid (sculpt smoothing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SmoothMethod {
+    /// Taubin λ/μ cycles (the default): shrink then inflate back, keeping
+    /// volume while removing noise. Converges slowly on low frequencies.
+    #[default]
+    Taubin,
+    /// Plain Laplacian passes: each pass moves the full weight toward the
+    /// centroid. Melts bumps fast, with some shrinkage.
+    Laplacian,
+}
+
 /// Options for [`smooth`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SmoothOptions {
     /// The brush to apply.
     pub brush: Brush,
-    /// How many λ/μ cycles to run; 0 moves nothing.
+    /// How many cycles to run; 0 moves nothing.
     pub cycles: u32,
+    /// How each cycle relaxes.
+    pub method: SmoothMethod,
 }
 
 impl SmoothOptions {
@@ -294,9 +309,15 @@ impl SmoothOptionsBuilder {
         self
     }
 
-    /// How many λ/μ cycles to run.
+    /// How many cycles to run.
     pub fn cycles(mut self, cycles: u32) -> Self {
         self.options.cycles = cycles;
+        self
+    }
+
+    /// How each cycle relaxes (Taubin λ/μ by default).
+    pub fn method(mut self, method: SmoothMethod) -> Self {
+        self.options.method = method;
         self
     }
 
@@ -316,18 +337,19 @@ pub struct SmoothReport {
     pub max_displacement: f32,
 }
 
-/// Smooths the vertices under the brush with Taubin λ/μ steps.
+/// Smooths the vertices under the brush, Taubin λ/μ or plain Laplacian.
 ///
 /// - Region: every live vertex closer than `radius` to `center` (brute-force
 ///   distance check). Vertices outside it never move but still serve as
 ///   neighbor sources.
-/// - Each of the `cycles` runs a λ pass ([`TAUBIN_LAMBDA`]) then a μ pass
-///   ([`TAUBIN_MU`]); every pass moves each region vertex by
-///   `w * k * (centroid - p)`, where `w` is `strength * falloff` at its
-///   normalized distance, `k` the pass constant, and `centroid` the mean of
-///   its neighbor vertices (the deduped vertices of its fan triangles,
-///   excluding itself). Both the moved positions and the neighbor sources
-///   come from a snapshot taken before the pass.
+/// - Each of the `cycles` runs one pass per method constant (λ then μ for
+///   [`SmoothMethod::Taubin` ([`TAUBIN_LAMBDA`], [`TAUBIN_MU`])), a single
+///   full pass for [`SmoothMethod::Laplacian`]); every pass moves each region
+///   vertex by `w * k * (centroid - p)`, where `w` is `strength * falloff`
+///   at its normalized distance, `k` the pass constant, and `centroid` the
+///   mean of its neighbor vertices (the deduped vertices of its fan
+///   triangles, excluding itself). Both the moved positions and the neighbor
+///   sources come from a snapshot taken before the pass.
 /// - The move is written once, in a single `set_positions` call over the
 ///   vertices whose total displacement is above 0; an empty region writes
 ///   nothing. History is untouched.
@@ -397,8 +419,12 @@ pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothRep
     current.extend_from_slice(positions);
     let mut before: Vec<[f32; 3]> = Vec::new();
     let mut adjacent: Vec<VertexId> = Vec::new();
+    let passes: &[f32] = match options.method {
+        SmoothMethod::Taubin => &[TAUBIN_LAMBDA, TAUBIN_MU],
+        SmoothMethod::Laplacian => &[1.0],
+    };
     for _ in 0..options.cycles {
-        for k in [TAUBIN_LAMBDA, TAUBIN_MU] {
+        for &k in passes {
             before.clear();
             let missing = current.len().saturating_sub(before.capacity());
             reserve(&mut before, missing)?;
@@ -816,6 +842,53 @@ mod tests {
             assert_eq!(&flat[v * 3..v * 3 + 3], &positions[v * 3..v * 3 + 3]);
         }
         assert!((report.max_displacement - (1.0 - 0.8978)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn laplacian_pyramid_melts_to_centroid() {
+        assert_eq!(
+            SmoothOptions::builder().build().method,
+            SmoothMethod::Taubin
+        );
+        // Same open pyramid as the Taubin test: apex E(0.5,0.5,1) over base
+        // centroid (0.5,0.5,0).
+        let positions = [
+            0.0, 0.0, 0.0, // A
+            1.0, 0.0, 0.0, // B
+            1.0, 1.0, 0.0, // C
+            0.0, 1.0, 0.0, // D
+            0.5, 0.5, 1.0, // E
+        ];
+        let triangles = [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]];
+        let mut mesh = mesh_of(&positions, &triangles);
+        let options = SmoothOptions::builder()
+            .center([0.5, 0.5, 1.0])
+            .radius(0.1)
+            .falloff(Falloff::Linear)
+            .strength(1.0)
+            .cycles(1)
+            .method(SmoothMethod::Laplacian)
+            .build();
+        let (report, empty) = edit(&mut mesh, |tx| smooth(tx, &options));
+        assert!(!empty);
+        assert_eq!(report.moved, 1);
+        let (flat, _) = parts(&mesh);
+        // One full pass at weight 1: E lands exactly on its centroid.
+        assert_eq!(&flat[4 * 3..4 * 3 + 3], &[0.5, 0.5, 0.0]);
+        assert!((report.max_displacement - 1.0).abs() < 1e-6);
+        // Half strength, two passes: 1 -> 0.5 -> 0.25.
+        let mut mesh = mesh_of(&positions, &triangles);
+        let options = SmoothOptions::builder()
+            .center([0.5, 0.5, 1.0])
+            .radius(0.1)
+            .falloff(Falloff::Linear)
+            .strength(0.5)
+            .cycles(2)
+            .method(SmoothMethod::Laplacian)
+            .build();
+        edit(&mut mesh, |tx| smooth(tx, &options).map(drop));
+        let (flat, _) = parts(&mesh);
+        assert!((flat[4 * 3 + 2] - 0.25).abs() < 1e-6);
     }
 
     #[test]

@@ -617,6 +617,58 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
   });
 
+  it("relax_melts_a_spike_laplacian", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    // Raise a spike, then relax it back down (re-centering each pass, the
+    // way a brush tracks the surface).
+    s.repair(m, { op: "grab", center, radius: 0.6, falloff: "linear", strength: 1, direction: [0, 0, 2] });
+    const raised = Float32Array.from(s.views(m).positions());
+    expect(raised[14] - before[14]).toBeCloseTo(2, 4);
+    const mid = (): Vec3 => {
+      const p = s.views(m).positions();
+      return [p[12], p[13], p[14]];
+    };
+    const maxZ = (): number => {
+      const p = s.views(m).positions();
+      let max = -Infinity;
+      for (let i = 2; i < p.length; i += 3) {
+        if (p[i] > max) {
+          max = p[i];
+        }
+      }
+      return max;
+    };
+    const r = s.repair(m, { op: "relax", center: mid(), radius: 0.6, falloff: "linear", strength: 0.5, cycles: 1 });
+    expect(r.moved).toBeGreaterThan(0);
+    expect(r.maxDisplacement).toBeGreaterThan(0);
+    const melted = maxZ();
+    expect(melted).toBeLessThan(raised[14]);
+    // And it keeps melting: a second pass drops the peak further still.
+    s.repair(m, { op: "relax", center: mid(), radius: 0.6, falloff: "linear", strength: 0.5, cycles: 1 });
+    expect(maxZ()).toBeLessThan(melted);
+  });
+
+  it("relax_rejects_invalid_brush", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const good = { op: "relax", center, radius: 0.6, falloff: "linear", strength: 1, cycles: 1 } as const;
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { ...good, radius: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, strength: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, center: [0, 0] as never }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, falloff: "cubic" as never }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, cycles: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
   it("remesh_refines_sparse_region", () => {
     const s = scene();
     const m = s.addMesh(quad, quadTris);
