@@ -69,6 +69,8 @@
 //   loads and draws the mesh, like an OS drag-and-drop would.
 // - dicom: a synthetic 8-slice sphere series dropped together stacks and
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
+// - dicom-demo: the Vessel tree phantom button meshes through the same
+//   pipeline, listed and drawn.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -896,6 +898,18 @@ try {
     "dicom",
     iso !== undefined && iso.triangles > 0,
     iso === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${iso.name} (${iso.triangles})`,
+  );
+
+  // ---- dicom-demo: the Vessel tree phantom meshes ----
+  await clickOn("[data-action=dicom-demo-vessels]");
+  const vessel = await waitFor(
+    `__showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn)`,
+    60_000,
+  );
+  verdict(
+    "dicom-demo",
+    vessel !== undefined && vessel.triangles > 1000,
+    vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

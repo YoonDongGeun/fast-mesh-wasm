@@ -3,9 +3,10 @@
 // so the page only calls `store.addMesh` (which transfers them on to the
 // scene Worker).
 import { demoMeshes } from "../scene/demo";
-import { extractSeries } from "./extract";
+import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
 import { parseMeshFile } from "./parse";
+import { phantomSlices } from "./phantom";
 import type { LoadedMesh, LoaderReply, LoaderRequest } from "./protocol";
 
 function post(reply: LoaderReply): void {
@@ -35,6 +36,15 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         kind: "meshes",
         id: req.id,
         meshes: extractSeries(parsed, req.threshold).map((m) => loaded(m.name, m.data)),
+      });
+      return;
+    }
+    if (req.kind === "phantom") {
+      post({ kind: "parsing", id: req.id });
+      post({
+        kind: "meshes",
+        id: req.id,
+        meshes: meshSlices(phantomSlices(req.phantom), 0).map((m) => loaded(m.name, m.data)),
       });
       return;
     }

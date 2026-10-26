@@ -4,6 +4,7 @@
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
 import { isDicom } from "./dicom";
+import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
 import type { LoaderReply, LoaderRequest } from "./protocol";
 
 /** How long a finished job stays listed. */
@@ -63,6 +64,11 @@ export class Loader {
   /** Generates and adds the demo meshes A, B and C. */
   loadDemo(big: boolean): Promise<Item[]> {
     return this.#start(big ? "demo meshes (big)" : "demo meshes", { kind: "demo", id: 0, big });
+  }
+
+  /** Meshes a procedural DICOM phantom through the extraction pipeline. */
+  loadDicomDemo(phantom: PhantomKind): Promise<Item[]> {
+    return this.#start(`${PHANTOM_NAMES[phantom]} (DICOM demo)`, { kind: "phantom", id: 0, phantom });
   }
 
   #workerFor(): Worker {

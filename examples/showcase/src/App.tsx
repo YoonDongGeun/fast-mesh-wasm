@@ -153,7 +153,19 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   return (
     <div className="app">
       <aside className="sidebar sidebar-left">
-        <MeshList app={app} onLoad={load} onFocus={focusOn} />
+        <MeshList
+          app={app}
+          onLoad={load}
+          onLoadPhantom={(phantom) => {
+            void loader.loadDicomDemo(phantom).then((added) => {
+              const last = added.at(-1);
+              if (last !== undefined) {
+                focusOn(last.mesh);
+              }
+            });
+          }}
+          onFocus={focusOn}
+        />
         <GroupsBar app={app} />
       </aside>
       <main className="viewport">

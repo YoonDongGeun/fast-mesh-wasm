@@ -5,6 +5,7 @@ import { useMeshDisplay, useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useRef, useState } from "react";
 import { MESH_EXTENSIONS } from "../load/parse";
+import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 
@@ -19,9 +20,10 @@ const PHASE: Record<Job["phase"], string> = {
 export function MeshList(props: {
   app: AppState;
   onLoad: (files: Iterable<File>) => void;
+  onLoadPhantom: (phantom: PhantomKind) => void;
   onFocus: (mesh: Item["mesh"]) => void;
 }) {
-  const { app, onLoad, onFocus } = props;
+  const { app, onLoad, onLoadPhantom, onFocus } = props;
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
   const input = useRef<HTMLInputElement>(null);
@@ -50,7 +52,22 @@ export function MeshList(props: {
           }}
         />
       </header>
-      <p className="muted small">STL (binary, ASCII), OBJ, PLY (ASCII, binary). Or drop files anywhere.</p>
+      <p className="muted small">STL (binary, ASCII), OBJ, PLY (ASCII, binary), DICOM series. Or drop files anywhere.</p>
+      <p className="muted small">
+        DICOM demos:{" "}
+        {(Object.keys(PHANTOM_NAMES) as PhantomKind[]).map((kind) => (
+          <button
+            key={kind}
+            type="button"
+            className="link"
+            data-action={`dicom-demo-${kind}`}
+            title={`Mesh a procedural ${PHANTOM_NAMES[kind].toLowerCase()} DICOM series`}
+            onClick={() => onLoadPhantom(kind)}
+          >
+            {PHANTOM_NAMES[kind]}
+          </button>
+        ))}
+      </p>
       {jobs.length > 0 ? (
         <ul className="jobs" aria-label="Loads">
           {jobs.map((job) => (

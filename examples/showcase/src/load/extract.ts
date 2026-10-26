@@ -1,7 +1,7 @@
 // The DICOM extraction pipeline: files parsed, series stacked, each
 // isosurface meshed (Otsu's threshold unless one is given) and named for
 // the mesh list. The loader Worker runs it; failures name their file.
-import { parseDicom } from "./dicom";
+import { parseDicom, type DicomSlice } from "./dicom";
 import { isosurface, otsu } from "./isosurface";
 import type { MeshData } from "./mesh-data";
 import { checkMesh } from "./mesh-data";
@@ -27,7 +27,14 @@ export function extractSeries(
   files: readonly { name: string; buffer: ArrayBuffer }[],
   threshold: number | null,
 ): ExtractedSeries[] {
-  const slices = files.map((f) => parseDicom(f.name, f.buffer));
+  return meshSlices(
+    files.map((f) => parseDicom(f.name, f.buffer)),
+    threshold,
+  );
+}
+
+/** Meshes already-parsed slices (phantoms skip the file round-trip). */
+export function meshSlices(slices: readonly DicomSlice[], threshold: number | null): ExtractedSeries[] {
   return stackSeries(slices).map((v) => {
     const thr = threshold ?? otsu(v.values);
     const data = isosurface(v.values, v, thr, v.inverted);
