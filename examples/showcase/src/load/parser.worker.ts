@@ -7,23 +7,45 @@ import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
 import { parseMeshFile } from "./parse";
 import { phantomSlices } from "./phantom";
-import type { LoadedMesh, LoaderReply, LoaderRequest } from "./protocol";
+import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
+import type { DicomVolume } from "./series";
 
 function post(reply: LoaderReply): void {
-  const transfer = reply.kind === "meshes" ? reply.meshes.flatMap((m) => [m.positions.buffer, m.indices.buffer]) : [];
+  const transfer =
+    reply.kind === "meshes"
+      ? reply.meshes.flatMap((m) => [m.positions.buffer, m.indices.buffer])
+      : reply.kind === "volume"
+        ? [reply.volume.values.buffer]
+        : [];
   self.postMessage(reply, { transfer });
 }
 
-function loaded(name: string, data: MeshData): LoadedMesh {
+function loaded(name: string, data: MeshData, volumeId: string | null = null): LoadedMesh {
   const { center, radius } = bounds(data.positions);
-  return { name, positions: data.positions, indices: data.indices, center, radius };
+  return { name, positions: data.positions, indices: data.indices, center, radius, volumeId };
 }
+
+/** Source volumes by series id, served to the volume view on demand. */
+const volumes = new Map<string, { values: Float32Array; pseudoHu: boolean; meta: Omit<VolumePayload, "values" | "pseudoHu"> }>();
 
 self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
   const req = event.data;
+  if (req.kind === "dropVolume") {
+    volumes.delete(req.volumeId);
+    return;
+  }
   try {
     if (req.kind === "demo") {
       post({ kind: "meshes", id: req.id, meshes: demoMeshes(req.big).map((m) => loaded(m.name, m.data)) });
+      return;
+    }
+    if (req.kind === "volume") {
+      const v = volumes.get(req.volumeId);
+      if (v === undefined) {
+        throw new Error(`volume ${req.volumeId} is no longer retained`);
+      }
+      // A copy: transferring would neuter the retained original.
+      post({ kind: "volume", id: req.id, volume: { ...v.meta, values: v.values.slice(), pseudoHu: v.pseudoHu } });
       return;
     }
     if (req.kind === "dicom") {
@@ -35,7 +57,10 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       post({
         kind: "meshes",
         id: req.id,
-        meshes: extractSeries(parsed, req.threshold).map((m) => loaded(m.name, m.data)),
+        meshes: extractSeries(parsed, req.threshold).map((m) => {
+          retain(m.volume, false);
+          return loaded(m.name, m.data, m.seriesUid);
+        }),
       });
       return;
     }
@@ -44,7 +69,10 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       post({
         kind: "meshes",
         id: req.id,
-        meshes: meshSlices(phantomSlices(req.phantom), 0).map((m) => loaded(m.name, m.data)),
+        meshes: meshSlices(phantomSlices(req.phantom), 0).map((m) => {
+          retain(m.volume, true);
+          return loaded(m.name, m.data, m.seriesUid);
+        }),
       });
       return;
     }
@@ -55,3 +83,18 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
     post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });
   }
 };
+
+function retain(volume: DicomVolume, pseudoHu: boolean): void {
+  volumes.set(volume.seriesUid, {
+    values: volume.values,
+    pseudoHu,
+    meta: {
+      volumeId: volume.seriesUid,
+      columns: volume.columns,
+      rows: volume.rows,
+      slices: volume.slices,
+      spacing: volume.spacing,
+      origin: volume.origin,
+    },
+  });
+}

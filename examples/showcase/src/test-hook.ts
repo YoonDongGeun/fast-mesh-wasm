@@ -174,6 +174,10 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     },
     /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
     sculpt: () => ({ ...inspect.sculpt }),
+    /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
+    volume: () => ({ ...inspect.volume }),
+    /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */
+    slices: () => ({ ...inspect.slices }),
     /** Whether every mesh draws wireframed. */
     wireframe: () => app.getSnapshot().wireframe,
     /** The wireframe overlays in the scene: meshes bound, overlays shown, and whether every solid stayed shaded. */

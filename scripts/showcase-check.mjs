@@ -71,6 +71,12 @@
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
 // - dicom-demo: the Vessel tree phantom button meshes through the same
 //   pipeline, listed and drawn.
+// - volume: selecting the phantom's mesh renders its source volume
+//   (vtk.js), with a canvas and the Bone preset.
+// - volume-preset: the Vessels preset plus MIP switch the rendering.
+// - volume-slices: the Slices tab renders axial/coronal/sagittal views.
+// - volume-slice-move: the axial slider and the window preset move the
+//   slice views.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -910,6 +916,68 @@ try {
     "dicom-demo",
     vessel !== undefined && vessel.triangles > 1000,
     vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
+  );
+
+  // ---- volume: the phantom's source volume renders on selection ----
+  if (vessel !== undefined) {
+    await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
+  }
+  const vol = await waitFor(`__showcase.volume().ready ? __showcase.volume() : null`, 60_000);
+  const volCanvas = await page(`document.querySelector("[data-volume] canvas") !== null`);
+  verdict(
+    "volume",
+    vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true,
+    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas}`,
+  );
+
+  // ---- volume-preset: Vessels + MIP ----
+  await page(`(() => {
+    const sel = document.querySelector('[data-action="volume-preset"]');
+    sel.value = "2";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    document.querySelector('[data-action="volume-mip"]').click();
+    return true;
+  })()`);
+  const volMip = await waitFor(
+    `__showcase.volume().preset === "Vessels" && __showcase.volume().mip ? __showcase.volume() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-preset",
+    volMip !== undefined && volMip.ready === true,
+    volMip === undefined ? JSON.stringify(await hook("volume()")) : `${volMip.preset} mip=${volMip.mip}`,
+  );
+
+  // ---- volume-slices: axial/coronal/sagittal views render ----
+  await clickOn('[data-action="volume-tab-slices"]');
+  const slices = await waitFor(`__showcase.slices().ready ? __showcase.slices() : null`, 60_000);
+  const sliceCanvases = await page(`document.querySelectorAll("[data-slice] canvas").length`);
+  verdict(
+    "volume-slices",
+    slices !== undefined && sliceCanvases === 3,
+    slices === undefined ? "never ready" : `canvases=${sliceCanvases} axial=${slices.axial}`,
+  );
+
+  // ---- volume-slice-move: the slider and window preset steer the views ----
+  await page(`(() => {
+    const el = document.querySelector('[data-action="slice-axial"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, "10");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    const w = document.querySelector('[data-action="volume-window"]');
+    w.value = "3";
+    w.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  const sliceMoved = await waitFor(
+    `__showcase.slices().axial === 10 && __showcase.slices().window === "Full range" ? __showcase.slices() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-slice-move",
+    sliceMoved !== undefined && sliceMoved.ready === true,
+    sliceMoved === undefined
+      ? JSON.stringify(await hook("slices()"))
+      : `axial=${sliceMoved.axial} window=${sliceMoved.window}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

@@ -30,8 +30,16 @@ export default defineConfig({
   base: process.env.SHOWCASE_BASE ?? "/",
   plugins: [react(), crossOriginIsolation()],
   // Top-level await in src/main.tsx needs a modern target, in the page and in
-  // the parser Worker. three.js and React Three Fiber make one large chunk;
-  // that is expected here.
-  build: { target: "es2022", chunkSizeWarningLimit: 1600 },
+  // the parser Worker. three.js is one stable vendor chunk (the main view
+  // and the lazy volume panel share it); React Three Fiber stays in index.
+  build: {
+    target: "es2022",
+    chunkSizeWarningLimit: 1600,
+    rollupOptions: {
+      output: {
+        manualChunks: (id) => (id.includes("node_modules/three/") ? "three" : undefined),
+      },
+    },
+  },
   worker: { format: "es" },
 });

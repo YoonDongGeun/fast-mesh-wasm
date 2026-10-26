@@ -34,6 +34,8 @@ export interface Item {
   center: Vec3;
   /** Half the bounding box diagonal, for focusing the camera. */
   radius: number;
+  /** The retained source volume's id (DICOM + phantoms), for the volume view. */
+  volumeId: string | null;
 }
 
 export type JobPhase = "reading" | "parsing" | "adding" | "done" | "error";
@@ -163,6 +165,7 @@ export class AppState {
       triangles,
       center: loaded.center,
       radius: loaded.radius,
+      volumeId: loaded.volumeId,
     };
     let collision = this.#snap.collision;
     if (this.#autoPick) {

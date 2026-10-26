@@ -5,7 +5,7 @@ import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
 import { isDicom } from "./dicom";
 import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
-import type { LoaderReply, LoaderRequest } from "./protocol";
+import type { LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 
 /** How long a finished job stays listed. */
 const DONE_LINGER_MS = 2500;
@@ -36,10 +36,51 @@ export class Loader {
   readonly #app: AppState;
   readonly #waiting = new Map<number, { name: string; resolve: (items: Item[]) => void }>();
   #nextJob = 0;
+  /** Fetched source volumes by series id, for the volume view. */
+  readonly #volumes = new Map<string, VolumePayload>();
+  readonly #pendingVolumes = new Map<number, { resolve: (v: VolumePayload) => void; reject: (e: Error) => void }>();
 
   constructor(store: SceneStore, app: AppState) {
     this.#store = store;
     this.#app = app;
+    // Evict volumes whose mesh left (removed): both the page copy and the
+    // Worker's retained one (a CT stack is tens of megabytes).
+    app.subscribe(() => {
+      const live = new Set<string>();
+      for (const item of app.getSnapshot().items) {
+        if (item.volumeId !== null) {
+          live.add(item.volumeId);
+        }
+      }
+      for (const id of this.#volumes.keys()) {
+        if (!live.has(id)) {
+          this.#volumes.delete(id);
+          this.#worker?.postMessage({ kind: "dropVolume", volumeId: id });
+        }
+      }
+    });
+  }
+
+  /**
+   * Fetches a retained source volume (cached after the first fetch).
+   * `@throws` when the Worker no longer retains it.
+   */
+  fetchVolume(volumeId: string): Promise<VolumePayload> {
+    const cached = this.#volumes.get(volumeId);
+    if (cached !== undefined) {
+      return Promise.resolve(cached);
+    }
+    const id = this.#nextJob++;
+    return new Promise<VolumePayload>((resolve, reject) => {
+      this.#pendingVolumes.set(id, {
+        resolve: (v) => {
+          this.#volumes.set(volumeId, v);
+          resolve(v);
+        },
+        reject,
+      });
+      this.#workerFor().postMessage({ kind: "volume", id, volumeId });
+    });
   }
 
   /**
@@ -95,6 +136,11 @@ export class Loader {
       job.resolve([]);
     }
     this.#waiting.clear();
+    for (const pending of this.#pendingVolumes.values()) {
+      pending.reject(new Error(message));
+    }
+    this.#pendingVolumes.clear();
+    this.#volumes.clear();
   }
 
   #start(name: string, request: LoaderRequest): Promise<Item[]> {
@@ -107,6 +153,22 @@ export class Loader {
   }
 
   #receive(reply: LoaderReply): void {
+    if (reply.kind === "volume") {
+      const pending = this.#pendingVolumes.get(reply.id);
+      if (pending !== undefined) {
+        this.#pendingVolumes.delete(reply.id);
+        pending.resolve(reply.volume);
+      }
+      return;
+    }
+    if (reply.kind === "error") {
+      const pending = this.#pendingVolumes.get(reply.id);
+      if (pending !== undefined) {
+        this.#pendingVolumes.delete(reply.id);
+        pending.reject(new Error(reply.message));
+        return;
+      }
+    }
     const job = this.#waiting.get(reply.id);
     if (job === undefined) {
       return;

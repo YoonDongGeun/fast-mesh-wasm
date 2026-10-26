@@ -5,7 +5,7 @@ import { parseDicom, type DicomSlice } from "./dicom";
 import { isosurface, otsu } from "./isosurface";
 import type { MeshData } from "./mesh-data";
 import { checkMesh } from "./mesh-data";
-import { stackSeries } from "./series";
+import { stackSeries, type DicomVolume } from "./series";
 
 export interface ExtractedSeries {
   name: string;
@@ -15,6 +15,8 @@ export interface ExtractedSeries {
   seriesUid: string;
   /** [columns, rows, slices]. */
   dims: [number, number, number];
+  /** The stacked source volume (retained for the volume view). */
+  volume: DicomVolume;
 }
 
 const fmt = (t: number): string => String(Math.round(t * 100) / 100);
@@ -49,6 +51,7 @@ export function meshSlices(slices: readonly DicomSlice[], threshold: number | nu
       auto: threshold === null,
       seriesUid: v.seriesUid,
       dims: [v.columns, v.rows, v.slices],
+      volume: v,
     };
   });
 }

@@ -9,6 +9,10 @@ export type LoaderRequest =
   | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
   /** Mesh a procedural DICOM phantom through the same extraction pipeline. */
   | { kind: "phantom"; id: number; phantom: PhantomKind }
+  /** Fetch a retained source volume (page cache miss). */
+  | { kind: "volume"; id: number; volumeId: string }
+  /** Drop a retained source volume (fire-and-forget: no reply). */
+  | { kind: "dropVolume"; volumeId: string }
   /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each. */
   | { kind: "demo"; id: number; big: boolean };
 
@@ -20,9 +24,25 @@ export interface LoadedMesh {
   /** Its bounding box centre (the mesh origin, so the gizmo sits on it) and half diagonal. */
   center: Vec3;
   radius: number;
+  /** The retained source volume's id (DICOM + phantoms), for the volume view. */
+  volumeId: string | null;
+}
+
+/** A retained source volume, fetched for the volume view (values transferred). */
+export interface VolumePayload {
+  volumeId: string;
+  columns: number;
+  rows: number;
+  slices: number;
+  spacing: [number, number, number];
+  origin: [number, number, number];
+  values: Float32Array;
+  /** Procedural phantom SDF: map to pseudo-HU for the CT presets. */
+  pseudoHu: boolean;
 }
 
 export type LoaderReply =
   | { kind: "parsing"; id: number }
   | { kind: "meshes"; id: number; meshes: LoadedMesh[] }
+  | { kind: "volume"; id: number; volume: VolumePayload }
   | { kind: "error"; id: number; message: string };

@@ -4,7 +4,7 @@
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useState } from "react";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
 import { GroupsBar } from "./panels/GroupsBar";
@@ -27,6 +27,9 @@ export interface Engine {
   /** Whether the page is cross-origin isolated (needed for threads). */
   isolated: boolean;
 }
+
+/** The volume view loads on demand: vtk.js stays out of the main chunk. */
+const VolumePanel = lazy(() => import("./panels/VolumePanel").then((m) => ({ default: m.VolumePanel })));
 
 /** A request to point the camera at a mesh; `n` makes a repeated request new. */
 export interface FocusRequest {
@@ -229,6 +232,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       <aside className="sidebar sidebar-right">
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
+        <Suspense fallback={null}>
+          <VolumePanel app={app} loader={loader} />
+        </Suspense>
       </aside>
       <StatusBar engine={engine} app={app} />
       {dropping ? <div className="drop-overlay">Drop STL, OBJ, PLY or DICOM files to load them</div> : null}
