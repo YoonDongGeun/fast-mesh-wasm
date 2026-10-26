@@ -65,6 +65,8 @@
 // - upload: three fixtures (binary STL, OBJ with quads, ASCII PLY) through
 //   the file input are listed with their triangle counts and drawn; a broken
 //   file shows a failed load.
+// - drop: a synthetic file drop on the canvas (dragover + drop with a PLY)
+//   loads and draws the mesh, like an OS drag-and-drop would.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -794,6 +796,28 @@ try {
     "upload",
     loaded !== undefined && broken !== undefined,
     `${loaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : loaded.filter((m) => m.name in expected).map((m) => `${m.name} (${m.triangles})`).join(", ")}; broken.stl ${broken === undefined ? "not reported" : `failed: ${broken.message}`}`,
+  );
+
+  // ---- drop: a synthetic file drop on the canvas loads ----
+  const dropName = "dropped.ply";
+  await page(`(() => {
+    const file = new File([${JSON.stringify(TETRA_PLY)}], ${JSON.stringify(dropName)}, { type: "model/ply" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const canvas = document.querySelector("canvas");
+    const r = canvas.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, dataTransfer: dt };
+    canvas.dispatchEvent(new DragEvent("dragover", opts));
+    canvas.dispatchEvent(new DragEvent("drop", opts));
+  })()`);
+  const dropLoaded = await waitFor(
+    `__showcase.items().find((m) => m.name === ${JSON.stringify(dropName)} && m.drawn)`,
+    20_000,
+  );
+  verdict(
+    "drop",
+    dropLoaded !== undefined,
+    dropLoaded === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${dropName} drawn`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

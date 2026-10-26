@@ -209,8 +209,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             : picking !== null
               ? "Click the mesh to set the brush center · Esc cancels"
               : selection === null
-                ? "Click a mesh to select it · drag to orbit · scroll to zoom"
-                : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect"}
+                ? "Click a mesh to select it · drag to orbit · scroll to zoom · drop files to load"
+                : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ or PLY files here</p> : null}
       </main>
