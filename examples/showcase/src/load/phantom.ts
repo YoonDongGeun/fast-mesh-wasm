@@ -1,7 +1,8 @@
-// The DICOM phantoms: vessel tree, brain and heart SDFs sampled into
-// slice stacks. They mesh through the same extraction pipeline as dropped
-// files, so the demos prove the path. All deterministic (seeded), millimetre
-// voxels, signed 16-bit samples of the SDF (isovalue 0).
+// The DICOM phantoms: vessel tree, brain and heart sampled into slice
+// stacks. Vessels and heart are SDFs (isovalue 0); the brain is an HU
+// field (skull, gray/white matter, ventricles, CSF, air). They mesh
+// through the same extraction pipeline as dropped files, so the demos
+// prove the path. All deterministic (seeded), millimetre voxels.
 import type { DicomSlice } from "./dicom";
 
 export type PhantomKind = "vessels" | "brain" | "heart";
@@ -11,6 +12,13 @@ export const PHANTOM_NAMES: Record<PhantomKind, string> = {
   vessels: "Vessel tree",
   brain: "Brain",
   heart: "Heart",
+};
+
+/** The sampled field: signed millimetres, or HU-like intensities. */
+export const PHANTOM_FIELD: Record<PhantomKind, "sdf" | "hu"> = {
+  vessels: "sdf",
+  brain: "hu",
+  heart: "sdf",
 };
 
 type V3 = [number, number, number];
@@ -56,6 +64,12 @@ function makeNoise(seed: number): (x: number, y: number, z: number) => number {
     }
     return acc;
   };
+}
+
+/** Smoothstep from 0 at `a` to 1 at `b` (either order). */
+function sstep(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
 }
 
 /** A millimetre SDF grid accumulated by primitives, each over its own box. */
@@ -178,11 +192,15 @@ function vesselTree(): Segment[] {
   return segs;
 }
 
-const PHANTOMS: Record<PhantomKind, { name: string; uid: string; dims: [number, number, number]; build: (g: Grid) => void }> = {
+const PHANTOMS: Record<
+  PhantomKind,
+  { name: string; uid: string; dims: [number, number, number]; field: "sdf" | "hu"; build: (g: Grid) => void }
+> = {
   vessels: {
     name: "Vessel tree",
     uid: "1.9.9.1",
     dims: [96, 96, 96],
+    field: "sdf",
     build(g) {
       for (const s of vesselTree()) {
         const c = capsule(s.a[0], s.a[1], s.a[2], s.b[0], s.b[1], s.b[2], s.r);
@@ -194,6 +212,7 @@ const PHANTOMS: Record<PhantomKind, { name: string; uid: string; dims: [number, 
     name: "Brain",
     uid: "1.9.9.2",
     dims: [96, 112, 80],
+    field: "hu",
     build(g) {
       // Domain-warped hemispheres: the warp reads as gyri and sulci.
       const n1 = makeNoise(11);
@@ -207,28 +226,81 @@ const PHANTOMS: Record<PhantomKind, { name: string; uid: string; dims: [number, 
           z - 5 * (n3(x * s, y * s, z * s) - 0.5),
         ];
       };
-      // Half-space-clipped ellipsoids: a 2 mm longitudinal fissure.
-      const left = ellipsoid(36, 58, 42, 20, 27, 25);
-      const right = ellipsoid(60, 58, 42, 20, 27, 25);
-      g.add([48, 58, 42], [30, 32, 30], (x, y, z) => {
+      // Half-space-clipped hemispheres: the warp reads as gyri and sulci,
+      // classified into HU tissues under a smooth skull.
+      const left = ellipsoid(37, 58, 44, 18, 27, 25);
+      const right = ellipsoid(59, 58, 44, 18, 27, 25);
+      const cere = ellipsoid(48, 30, 26, 14, 11, 10);
+      const stem = capsule(48, 34, 22, 48, 30, 8, 5);
+      const skull = ellipsoid(48, 55, 42, 33, 37, 35);
+      const ventL = capsule(40, 44, 46, 40, 72, 48, 4);
+      const ventL2 = capsule(40, 44, 46, 37, 36, 41, 3);
+      const ventR = capsule(56, 44, 46, 56, 72, 48, 4);
+      const ventR2 = capsule(56, 44, 46, 59, 36, 41, 3);
+      const vent3 = capsule(48, 52, 45, 48, 64, 45, 2.2);
+      const tex = makeNoise(99);
+      const bone = makeNoise(77);
+      const cortex = (x: number, y: number, z: number): number => {
         const [qx, qy, qz] = warp(x, y, z);
         const dl = Math.max(left.sdf(qx, qy, qz), qx - 47);
         const dr = Math.max(right.sdf(qx, qy, qz), 49 - qx);
-        return Math.min(dl, dr);
-      });
-      const cere = ellipsoid(48, 24, 24, 15, 13, 11);
-      g.add(cere.box, cere.half, (x, y, z) => {
-        const [qx, qy, qz] = warp(x, y, z);
-        return cere.sdf(qx, qy, qz);
-      });
-      const stem = capsule(48, 32, 20, 48, 28, 4, 5);
-      g.add(stem.box, stem.half, stem.sdf);
+        return Math.min(dl, dr, cere.sdf(qx, qy, qz), stem.sdf(x, y, z));
+      };
+      const vent = (x: number, y: number, z: number): number =>
+        Math.min(
+          ventL.sdf(x, y, z),
+          ventL2.sdf(x, y, z),
+          ventR.sdf(x, y, z),
+          ventR2.sdf(x, y, z),
+          vent3.sdf(x, y, z),
+        );
+      g.data.fill(-1000);
+      const x0 = Math.max(0, Math.floor(48 - 33 - 6));
+      const x1 = Math.min(g.nx - 1, Math.ceil(48 + 33 + 6));
+      const y0 = Math.max(0, Math.floor(55 - 37 - 6));
+      const y1 = Math.min(g.ny - 1, Math.ceil(55 + 37 + 6));
+      const z0 = Math.max(0, Math.floor(42 - 35 - 6));
+      const z1 = Math.min(g.nz - 1, Math.ceil(42 + 35 + 6));
+      for (let z = z0; z <= z1; z++) {
+        for (let y = y0; y <= y1; y++) {
+          for (let x = x0; x <= x1; x++) {
+            const dc = cortex(x, y, z);
+            let v: number;
+            if (dc <= 0) {
+              if (dc <= -6 && vent(x, y, z) <= 0) {
+                v = 8;
+              } else if (dc > -3) {
+                v = 42;
+              } else {
+                v = 30;
+              }
+              v += (tex(x * 0.9, y * 0.9, z * 0.9) - 0.5) * 6;
+            } else {
+              const ds = skull.sdf(x, y, z);
+              if (ds <= -3) {
+                v = 8;
+              } else if (ds <= 0) {
+                v = 800 + (bone(x * 0.7, y * 0.7, z * 0.7) - 0.5) * 120;
+              } else if (ds < 2) {
+                // Air into bone: the isosurface rides this ramp, with the
+                // bone noise fading in so it stays smooth.
+                const s = sstep(2, 0, ds);
+                v = -1000 + 1800 * s + (bone(x * 0.7, y * 0.7, z * 0.7) - 0.5) * 120 * s;
+              } else {
+                v = -1000;
+              }
+            }
+            g.data[z * g.ny * g.nx + y * g.nx + x] = v;
+          }
+        }
+      }
     },
   },
   heart: {
     name: "Heart",
     uid: "1.9.9.3",
     dims: [88, 88, 88],
+    field: "sdf",
     build(g) {
       const parts = [
         ellipsoid(38, 38, 44, 13, 17, 15), // LV
@@ -269,11 +341,13 @@ export function phantomSlices(kind: PhantomKind): DicomSlice[] {
   const g = new Grid(nx, ny, nz);
   def.build(g);
   const out: DicomSlice[] = [];
+  const hu = def.field === "hu";
   for (let z = 0; z < nz; z++) {
     const pixels = new Int16Array(nx * ny);
     for (let i = 0; i < nx * ny; i++) {
-      const sdf = g.data[z * ny * nx + i];
-      pixels[i] = Math.min(32767, Math.max(-32768, Math.round((Number.isFinite(sdf) ? sdf : 1000) * 100)));
+      const v = g.data[z * ny * nx + i];
+      const raw = hu ? v : (Number.isFinite(v) ? v : 1000) * 100;
+      pixels[i] = Math.min(32767, Math.max(-32768, Math.round(raw)));
     }
     out.push({
       seriesUid: def.uid,
@@ -283,7 +357,7 @@ export function phantomSlices(kind: PhantomKind): DicomSlice[] {
       columns: nx,
       bitsAllocated: 16,
       pixelRepresentation: 1,
-      rescaleSlope: 0.01,
+      rescaleSlope: hu ? 1 : 0.01,
       rescaleIntercept: 0,
       pixelSpacing: [1, 1],
       position: [0, 0, z],
