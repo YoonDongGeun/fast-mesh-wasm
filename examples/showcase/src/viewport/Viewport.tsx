@@ -1,4 +1,4 @@
-// The canvas: `<FastMesh>` per mesh (click to select), an orbit camera and a
+// The canvas: `<FastMesh>` per mesh (click to select), a trackball camera and a
 // TransformControls gizmo on the selected mesh (moves through
 // `attachTransformControls`, one undo step per drag). `<FastMesh>` drives
 // the store's frames. Colourings are drawn with fragment shading, so the
@@ -14,7 +14,7 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { FocusRequest } from "../App";
@@ -50,6 +50,8 @@ export function Viewport(props: {
   items: readonly Item[];
   mode: GizmoMode;
   focus: FocusRequest | null;
+  /** Bumped to restore the default camera pose. */
+  resetView: number;
   /** Fragment shading's edge softness, in distance units. */
   edgeSoftness: number;
   /** Track the vertex under the pointer (`view.hover`). */
@@ -76,6 +78,7 @@ export function Viewport(props: {
     items,
     mode,
     focus,
+    resetView,
     edgeSoftness,
     hoverable,
     scene,
@@ -137,7 +140,7 @@ export function Viewport(props: {
         />
       ))}
       {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
-      <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} radiusOf={radiusOf} />
+      <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
       {sculpt !== null ? (
         <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
@@ -815,21 +818,23 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
 }
 
 /**
- * Orbit camera; a TransformControls gizmo on `bound`; and the camera pointed
- * at a mesh on each new `focus` request.
+ * Trackball camera (free flipping in every direction, no poles); a
+ * TransformControls gizmo on `bound`; and the camera pointed at a mesh on
+ * each new `focus` request.
  */
 function Controls(props: {
   bound: MeshBinding | null;
   mode: GizmoMode;
   focus: FocusRequest | null;
+  resetView: number;
   radiusOf: (mesh: MeshHandle) => number;
 }) {
-  const { bound, mode, focus, radiusOf } = props;
+  const { bound, mode, focus, resetView, radiusOf } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
-  const [orbit, setOrbit] = useState<OrbitControls | null>(null);
+  const [orbit, setOrbit] = useState<TrackballControls | null>(null);
   const [gizmo, setGizmo] = useState<TransformControls | null>(null);
   // Read when a focus request arrives: a new list of items is not a new request.
   const radiusRef = useRef(radiusOf);
@@ -838,8 +843,10 @@ function Controls(props: {
   useEffect(() => {
     view.camera = camera;
     view.canvas = gl.domElement;
-    const o = new OrbitControls(camera, gl.domElement);
+    const o = new TrackballControls(camera, gl.domElement);
     o.target.set(-0.6, 0.9, 0);
+    // No inertia: the camera stops where the pointer lifts (deterministic).
+    o.staticMoving = true;
     o.update();
     view.orbit = o;
     setOrbit(o);
@@ -893,21 +900,49 @@ function Controls(props: {
     gizmo?.setMode(mode);
   }, [gizmo, mode]);
 
+  // Reset view: the default pose (and an upright camera: the trackball
+  // may have rolled it).
+  useEffect(() => {
+    if (orbit === null || resetView === 0) {
+      return;
+    }
+    camera.position.set(-0.6, 3.4, 8.2);
+    camera.up.set(0, 1, 0);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.near = 0.01;
+      camera.far = 5000;
+      camera.updateProjectionMatrix();
+    }
+    orbit.target.set(-0.6, 0.9, 0);
+    orbit.update();
+  }, [orbit, resetView, camera]);
+
   // Focus: the orbit target to the mesh's centre (its origin, where the
-  // gizmo sits), the camera back along its current direction.
+  // gizmo sits), the camera back along the requested (or current)
+  // direction. A focus box frames that world box instead of the mesh.
   useEffect(() => {
     if (orbit === null || focus === null) {
       return;
     }
-    let m: Float64Array;
-    try {
-      m = store.scene.matrix4(focus.mesh);
-    } catch {
-      return; // removed meanwhile
+    let center: THREE.Vector3;
+    let radius: number;
+    if (focus.box !== undefined) {
+      center = new THREE.Vector3(focus.box.center[0], focus.box.center[1], focus.box.center[2]);
+      radius = Math.max(focus.box.radius, 1e-3);
+    } else {
+      let m: Float64Array;
+      try {
+        m = store.scene.matrix4(focus.mesh);
+      } catch {
+        return; // removed meanwhile
+      }
+      center = new THREE.Vector3(m[12], m[13], m[14]);
+      radius = Math.max(radiusRef.current(focus.mesh), 1e-3);
     }
-    const center = new THREE.Vector3(m[12], m[13], m[14]);
-    const radius = Math.max(radiusRef.current(focus.mesh), 1e-3);
-    const dir = camera.position.clone().sub(orbit.target);
+    const dir =
+      focus.dir === undefined
+        ? camera.position.clone().sub(orbit.target)
+        : new THREE.Vector3(focus.dir[0], focus.dir[1], focus.dir[2]);
     if (dir.lengthSq() === 0) {
       dir.set(0, 0.4, 1);
     }

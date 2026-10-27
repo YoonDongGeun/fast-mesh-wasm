@@ -14,7 +14,10 @@
 // Checks (each prints PASS or FAIL; the exit code is 1 on any FAIL):
 // - page: cross-origin isolated, and the Worker scene runs threaded
 //   (threads > 1, or exactly --threads).
-// - demo: the demo meshes A, B and C are listed and drawn; the scene is idle.
+// - boot: the vessel tree loads, selected, its volume linked into the MPR
+//   state and the scene overlay.
+// - demo: the demo button loads A, B and C, listed and drawn; the scene is
+//   idle. (The boot vessel is removed after, for a pristine A/B/C stage.)
 // - glsl: bindMesh's fragment shading run on the GPU (a float render target,
 //   read back) for constant quads at a contact heatmap's knots, range ends,
 //   +-tolerance, far, -far, NaN and random values, and for built-in maps with
@@ -28,7 +31,7 @@
 //   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
-// - heatmap: the collision pair defaults to A and B, both coloured against
+// - heatmap: the collision pair picks A and B, both coloured against
 //   each other (reds where they penetrate, green to blue across the gap);
 //   the readouts show the penetration, intersecting, a gap of 0 and contact
 //   triangles.
@@ -432,9 +435,24 @@ try {
   const threadsOk = threads === undefined ? info.threads > 1 : info.threads === threads;
   verdict("page", info.isolated && info.mode === "worker" && threadsOk, `crossOriginIsolated ${info.isolated}, ${info.mode} scene, threads ${info.threads}`);
 
-  // ---- demo ----
+  // ---- boot: the vessel tree, selected, its volume linked ----
+  const boot = await waitFor(
+    `(() => { const v = __showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn);
+      return v !== undefined && __showcase.mpr()?.volumeId === v.volumeId && __showcase.sceneSlices().shown === 3 && v; })()`,
+    60_000,
+  );
+  verdict(
+    "boot",
+    boot !== undefined,
+    boot === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${boot.name} (${boot.triangles})`,
+  );
+
+  // ---- demo: the demo button loads A, B and C ----
+  await clickOn("[data-action=demo-meshes]");
   const demo = await waitFor(
-    "(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn) && __showcase.status().status === 'idle' && i; })()",
+    `(() => { const want = [${q(A)}, ${q(B)}, ${q(C)}];
+      const got = want.map((n) => __showcase.items().find((m) => m.name === n)).filter((m) => m !== undefined && m.drawn);
+      return got.length === 3 && __showcase.status().status === "idle" && got; })()`,
     60_000,
   );
   verdict(
@@ -442,6 +460,16 @@ try {
     demo !== undefined && demo.map((m) => m.name[0]).join("") === "ABC",
     demo === undefined ? `items ${JSON.stringify(await hook("items()"))}` : demo.map((m) => `${m.name} (${m.triangles})`).join(", "),
   );
+
+  // Pristine A/B/C stage: select A through the list, remove the boot
+  // vessel, and restore the default camera (boot framed the vessel).
+  await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
+  if (boot !== undefined) {
+    await clickOn(`[data-mesh=${JSON.stringify(boot.name)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(boot.name)})`, 10_000);
+  }
+  await clickOn("[data-action=view-reset]");
+  await sleep(300);
 
   // ---- glsl: the fragment shading on the GPU against its reference ----
   {
@@ -551,6 +579,8 @@ try {
   );
 
   // ---- heatmap: A and B, each coloured against the other ----
+  await pick("a", A);
+  await pick("b", B);
   await sleep(300); // the undo's change records reach the panel, then its readouts settle
   const heat = await waitFor(
     collision(`c.a === ${q(A)} && c.b === ${q(B)}
@@ -757,6 +787,8 @@ try {
     `(() => { const c = __showcase.collision(); const g = __showcase.group(); return c.mode === "group" && (${extra}) && { c, g }; })()`;
   const pairOf = (x, y) => `g.readouts?.pairs.find((p) => p.a === ${q(x)} && p.b === ${q(y)})`;
   await clickOn("[data-mode=group]");
+  // Members are A and B (the boot vessel left): tick C.
+  await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
   const grouped = await waitFor(
     groupState(`g.members.length === 3 && g.pairs === "all" && ${to(A, [B, C])} && ${to(B, [A, C])} && ${to(C, [A, B])}
       && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.intersects && ${pairOf(A, B)}.depth > 0
@@ -1157,16 +1189,29 @@ try {
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
   await browser.goto(`http://127.0.0.1:${port}/?local`, "window.__showcase !== undefined");
+  await waitFor(`document.querySelector("[data-action=demo-meshes]") !== null`, 10_000);
+  await clickOn("[data-action=demo-meshes]");
   const localDemo = await waitFor(
-    `(() => { const i = __showcase.items(); return __showcase.mode === "local" && i.length === 3 && i.every((m) => m.drawn) && i; })()`,
+    `(() => { const want = [${q(A)}, ${q(B)}, ${q(C)}];
+      const got = want.map((n) => __showcase.items().find((m) => m.name === n)).filter((m) => m !== undefined && m.drawn);
+      return __showcase.mode === "local" && got.length === 3 && got; })()`,
     60_000,
   );
+  await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
+  const localVessel = await hook(`items().find((m) => m.name.startsWith("Vessel tree"))?.name ?? null`);
+  if (localVessel !== null) {
+    await clickOn(`[data-mesh=${JSON.stringify(localVessel)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localVessel)})`, 10_000);
+  }
+  await pick("a", A);
+  await pick("b", B);
   const localHeat = await waitFor(
     collision(`c.a === ${q(A)} && c.b === ${q(B)} && c.coloring[${q(A)}]?.status === "ready"
       && c.readouts?.penetration?.depth > 0 && c.readouts.intersects`),
     30_000,
   );
   await clickOn("[data-mode=group]");
+  await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
   const localGroup = await waitFor(
     groupState(`${to(A, [B, C])} && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.depth > 0`),
     30_000,

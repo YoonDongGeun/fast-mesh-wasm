@@ -23,9 +23,10 @@ export function MeshList(props: {
   onLoad: (files: Iterable<File>) => void;
   onLoadPhantom: (phantom: PhantomKind) => void;
   onLoadSample: (sample: SampleKind) => void;
+  onLoadDemo: () => void;
   onFocus: (mesh: Item["mesh"]) => void;
 }) {
-  const { app, onLoad, onLoadPhantom, onLoadSample, onFocus } = props;
+  const { app, onLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus } = props;
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
   const input = useRef<HTMLInputElement>(null);
@@ -84,6 +85,18 @@ export function MeshList(props: {
             {SAMPLE_NAMES[kind]}
           </button>
         ))}
+      </p>
+      <p className="muted small">
+        Demo meshes:{" "}
+        <button
+          type="button"
+          className="link"
+          data-action="demo-meshes"
+          title="Generate the demo meshes A, B and C"
+          onClick={() => onLoadDemo()}
+        >
+          A/B/C
+        </button>
       </p>
       {jobs.length > 0 ? (
         <ul className="jobs" aria-label="Loads">

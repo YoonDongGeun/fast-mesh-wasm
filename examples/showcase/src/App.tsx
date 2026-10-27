@@ -4,7 +4,7 @@
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { Suspense, lazy, useCallback, useEffect, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
 import { GroupsBar } from "./panels/GroupsBar";
@@ -35,6 +35,10 @@ const VolumePanel = lazy(() => import("./panels/VolumePanel").then((m) => ({ def
 export interface FocusRequest {
   mesh: MeshHandle;
   n: number;
+  /** Look from this direction (default: the camera's current one). */
+  dir?: readonly [number, number, number];
+  /** Frame this world box instead of the mesh (the boot landing frames the volume). */
+  box?: { center: readonly [number, number, number]; radius: number };
 }
 
 export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
@@ -48,9 +52,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { canUndo, canRedo, undo, redo } = useHistory();
   const [mode, setMode] = useState<GizmoMode>("translate");
   const [focus, setFocus] = useState<FocusRequest | null>(null);
+  const [resetView, setResetView] = useState(0);
   const [dropping, setDropping] = useState(false);
 
-  const focusOn = useCallback((mesh: MeshHandle) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1 })), []);
+  const focusOn = useCallback(
+    (
+      mesh: MeshHandle,
+      dir?: readonly [number, number, number],
+      box?: { center: readonly [number, number, number]; radius: number },
+    ) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1, dir, box })),
+    [],
+  );
   const brushPick = useApp(app, (s) => s.brushPick);
   const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
   const sculpt = useApp(app, (s) => s.sculpt);
@@ -74,6 +86,52 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     },
     [loader, focusOn],
   );
+
+  // ---- Boot: the vessel tree, selected and framed ----
+  // Once per page (StrictMode runs effects twice in development): the
+  // medical landing view. Everything else loads from its button.
+  const booted = useRef(false);
+  useEffect(() => {
+    if (booted.current) {
+      return;
+    }
+    booted.current = true;
+    void loader.loadDicomDemo("vessels").then((added) => {
+      const last = added.at(-1);
+      if (last === undefined || last.volumeId === null) {
+        return;
+      }
+      selectMesh(app, select, null, last.mesh, false);
+      // A three-quarter view of the volume box (the quads span it, past the
+      // mesh): the cutaway and its slice quads read best at an angle.
+      loader
+        .fetchVolume(last.volumeId)
+        .then((payload) => {
+          const ex = payload.columns * payload.spacing[0];
+          const ey = payload.rows * payload.spacing[1];
+          const ez = payload.slices * payload.spacing[2];
+          const m = engine.scene.matrix4(last.mesh);
+          const lx = payload.origin[0] + ex / 2 - last.center[0];
+          const ly = payload.origin[1] + ey / 2 - last.center[1];
+          const lz = payload.origin[2] + ez / 2 - last.center[2];
+          focusOn(
+            last.mesh,
+            [1, 0.55, 1.15],
+            {
+              center: [
+                m[0] * lx + m[4] * ly + m[8] * lz + m[12],
+                m[1] * lx + m[5] * ly + m[9] * lz + m[13],
+                m[2] * lx + m[6] * ly + m[10] * lz + m[14],
+              ],
+              radius: Math.hypot(ex, ey, ez) / 2,
+            },
+          );
+        })
+        .catch(() => {
+          focusOn(last.mesh);
+        });
+    });
+  }, [app, engine, loader, focusOn, select]);
 
   // ---- Keyboard: undo/redo, gizmo mode, focus, deselect ----
   useEffect(() => {
@@ -175,6 +233,10 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               }
             });
           }}
+          onLoadDemo={() => {
+            // No focus: the meshes join the current view (Reset view restores the overview).
+            void loader.loadDemo(false);
+          }}
           onFocus={focusOn}
         />
         <GroupsBar app={app} />
@@ -185,6 +247,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           items={items}
           mode={mode}
           focus={focus}
+          resetView={resetView}
           edgeSoftness={edgeSoftness}
           hoverable={grouped}
           scene={engine.scene}
@@ -205,6 +268,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             </button>
             <button type="button" aria-pressed={mode === "rotate"} onClick={() => setMode("rotate")} title="Rotate (R)">
               Rotate <kbd>R</kbd>
+            </button>
+            <button type="button" data-action="view-reset" onClick={() => setResetView((n) => n + 1)} title="Reset the camera">
+              Reset view
             </button>
           </div>
           <div className="group">
@@ -233,7 +299,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             : picking !== null
               ? "Click the mesh to set the brush center · Esc cancels"
               : selection === null
-                ? "Click a mesh to select it · drag to orbit · scroll to zoom · drop files to load"
+                ? "Click a mesh to select it · drag to rotate · scroll to zoom · drop files to load"
                 : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}

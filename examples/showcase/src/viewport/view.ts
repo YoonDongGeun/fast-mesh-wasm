@@ -5,7 +5,7 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { MeshBinding } from "fast-mesh-wasm/three";
 import type * as THREE from "three";
-import type { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import type { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import type { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { SceneSliceQuads } from "./SceneSlices";
 
@@ -23,8 +23,8 @@ export const view: {
   bindings: ReadonlyMap<MeshHandle, MeshBinding>;
   /** The gizmo on the selected mesh, if any. */
   gizmo: TransformControls | null;
-  /** The orbit camera controls (a sculpt stroke disables them while it paints). */
-  orbit: OrbitControls | null;
+  /** The trackball camera controls (a sculpt stroke disables them while it paints). */
+  orbit: TrackballControls | null;
   /** True while the gizmo drags. */
   dragging: boolean;
   /** Called with `dragging` whenever it changes. */

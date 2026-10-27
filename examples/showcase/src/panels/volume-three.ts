@@ -1,7 +1,7 @@
 // Our volume renderer: a three.js raycaster through the 8-bit volume,
-// shaded by the preset LUT. Composite and MIP modes, orbit/zoom via
-// OrbitControls, rendered on demand. No vtk.js.
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+// shaded by the preset LUT. Composite and MIP modes, trackball/zoom via
+// TrackballControls, rendered on demand. No vtk.js.
+import { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import * as THREE from "three";
 import { AXIS_COLOR, planeSpec, type SlicePlane, type SlicePlanes } from "./volume-slice";
 
@@ -101,7 +101,7 @@ export class VolumeView3D {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
-  private controls: OrbitControls;
+  private controls: TrackballControls;
   private mesh: THREE.Mesh;
   private material: THREE.ShaderMaterial;
   private volumeTexture: THREE.Data3DTexture;
@@ -131,10 +131,11 @@ export class VolumeView3D {
     this.camera.near = extent * 0.01;
     this.camera.far = extent * 20;
     this.camera.updateProjectionMatrix();
-    this.controls = new OrbitControls(this.camera, canvas);
+    this.controls = new TrackballControls(this.camera, canvas);
     this.controls.target.set(0, 0, 0);
     this.controls.minDistance = extent * 0.5;
     this.controls.maxDistance = extent * 8;
+    this.controls.staticMoving = true;
     this.controls.update();
 
     this.volumeTexture = new THREE.Data3DTexture(data, grid.columns, grid.rows, grid.slices);
