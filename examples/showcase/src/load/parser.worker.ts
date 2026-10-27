@@ -6,9 +6,10 @@ import { demoMeshes } from "../scene/demo";
 import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
 import { parseMeshFile } from "./parse";
-import { phantomSlices } from "./phantom";
+import { PHANTOM_FIELD, phantomSlices } from "./phantom";
 import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 import type { DicomVolume } from "./series";
+import { loadSample } from "./vtkjs";
 
 function post(reply: LoaderReply): void {
   const transfer =
@@ -70,7 +71,20 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         kind: "meshes",
         id: req.id,
         meshes: meshSlices(phantomSlices(req.phantom), 0).map((m) => {
-          retain(m.volume, true);
+          retain(m.volume, PHANTOM_FIELD[req.phantom] === "sdf");
+          return loaded(m.name, m.data, m.seriesUid);
+        }),
+      });
+      return;
+    }
+    if (req.kind === "sample") {
+      post({ kind: "parsing", id: req.id });
+      const { slices, iso } = await loadSample(req.sample, import.meta.env.BASE_URL);
+      post({
+        kind: "meshes",
+        id: req.id,
+        meshes: meshSlices(slices, iso).map((m) => {
+          retain(m.volume, false);
           return loaded(m.name, m.data, m.seriesUid);
         }),
       });

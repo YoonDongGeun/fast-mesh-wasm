@@ -14,7 +14,10 @@
 // Checks (each prints PASS or FAIL; the exit code is 1 on any FAIL):
 // - page: cross-origin isolated, and the Worker scene runs threaded
 //   (threads > 1, or exactly --threads).
-// - demo: the demo meshes A, B and C are listed and drawn; the scene is idle.
+// - boot: the vessel tree loads, selected, its volume linked into the MPR
+//   state and the scene overlay.
+// - demo: the demo button loads A, B and C, listed and drawn; the scene is
+//   idle. (The boot vessel is removed after, for a pristine A/B/C stage.)
 // - glsl: bindMesh's fragment shading run on the GPU (a float render target,
 //   read back) for constant quads at a contact heatmap's knots, range ends,
 //   +-tolerance, far, -far, NaN and random values, and for built-in maps with
@@ -28,7 +31,7 @@
 //   Repair panel seeds its Join source from the queue.
 // - drag: dragging the gizmo's centre handle moves A (one undo step).
 // - undo: the Undo button puts A back; Ctrl+Shift+Z redoes, Ctrl+Z undoes again.
-// - heatmap: the collision pair defaults to A and B, both coloured against
+// - heatmap: the collision pair picks A and B, both coloured against
 //   each other (reds where they penetrate, green to blue across the gap);
 //   the readouts show the penetration, intersecting, a gap of 0 and contact
 //   triangles.
@@ -71,12 +74,23 @@
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
 // - dicom-demo: the Vessel tree phantom button meshes through the same
 //   pipeline, listed and drawn.
-// - volume: selecting the phantom's mesh renders its source volume
-//   (vtk.js), with a canvas and the Bone preset.
+// - sample: the bundled headsq + LIDC2 CT buttons mesh through the same
+//   pipeline, listed and drawn.
+// - volume: selecting the phantom's mesh renders its source volume,
+//   with a canvas, the Bone preset, and the 3 slice planes.
 // - volume-preset: the Vessels preset plus MIP switch the rendering.
+// - volume-planes: the Planes checkbox hides and shows the slice planes.
 // - volume-slices: the Slices tab renders axial/coronal/sagittal views.
 // - volume-slice-move: the axial slider and the window preset move the
 //   slice views.
+// - volume-navigate: clicking the axial view moves the coronal and
+//   sagittal slices there.
+// - volume-scene: the slices float in the main scene as a cutaway; the
+//   Scene checkbox hides and shows them.
+// - scene-drag: dragging an axial corner ball in the scene moves the
+//   slice, and the Slices tab follows.
+// - volume-source: the source picker switches the viewed volume, and the
+//   scene overlay follows.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -421,9 +435,24 @@ try {
   const threadsOk = threads === undefined ? info.threads > 1 : info.threads === threads;
   verdict("page", info.isolated && info.mode === "worker" && threadsOk, `crossOriginIsolated ${info.isolated}, ${info.mode} scene, threads ${info.threads}`);
 
-  // ---- demo ----
+  // ---- boot: the vessel tree, selected, its volume linked ----
+  const boot = await waitFor(
+    `(() => { const v = __showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn);
+      return v !== undefined && __showcase.mpr()?.volumeId === v.volumeId && __showcase.sceneSlices().shown === 3 && v; })()`,
+    60_000,
+  );
+  verdict(
+    "boot",
+    boot !== undefined,
+    boot === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${boot.name} (${boot.triangles})`,
+  );
+
+  // ---- demo: the demo button loads A, B and C ----
+  await clickOn("[data-action=demo-meshes]");
   const demo = await waitFor(
-    "(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn) && __showcase.status().status === 'idle' && i; })()",
+    `(() => { const want = [${q(A)}, ${q(B)}, ${q(C)}];
+      const got = want.map((n) => __showcase.items().find((m) => m.name === n)).filter((m) => m !== undefined && m.drawn);
+      return got.length === 3 && __showcase.status().status === "idle" && got; })()`,
     60_000,
   );
   verdict(
@@ -431,6 +460,16 @@ try {
     demo !== undefined && demo.map((m) => m.name[0]).join("") === "ABC",
     demo === undefined ? `items ${JSON.stringify(await hook("items()"))}` : demo.map((m) => `${m.name} (${m.triangles})`).join(", "),
   );
+
+  // Pristine A/B/C stage: select A through the list, remove the boot
+  // vessel, and restore the default camera (boot framed the vessel).
+  await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
+  if (boot !== undefined) {
+    await clickOn(`[data-mesh=${JSON.stringify(boot.name)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(boot.name)})`, 10_000);
+  }
+  await clickOn("[data-action=view-reset]");
+  await sleep(300);
 
   // ---- glsl: the fragment shading on the GPU against its reference ----
   {
@@ -540,6 +579,8 @@ try {
   );
 
   // ---- heatmap: A and B, each coloured against the other ----
+  await pick("a", A);
+  await pick("b", B);
   await sleep(300); // the undo's change records reach the panel, then its readouts settle
   const heat = await waitFor(
     collision(`c.a === ${q(A)} && c.b === ${q(B)}
@@ -746,6 +787,8 @@ try {
     `(() => { const c = __showcase.collision(); const g = __showcase.group(); return c.mode === "group" && (${extra}) && { c, g }; })()`;
   const pairOf = (x, y) => `g.readouts?.pairs.find((p) => p.a === ${q(x)} && p.b === ${q(y)})`;
   await clickOn("[data-mode=group]");
+  // Members are A and B (the boot vessel left): tick C.
+  await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
   const grouped = await waitFor(
     groupState(`g.members.length === 3 && g.pairs === "all" && ${to(A, [B, C])} && ${to(B, [A, C])} && ${to(C, [A, B])}
       && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.intersects && ${pairOf(A, B)}.depth > 0
@@ -918,16 +961,36 @@ try {
     vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
   );
 
+  // ---- sample: the bundled headsq + LIDC2 CTs mesh ----
+  await clickOn("[data-action=sample-headsq]");
+  const head = await waitFor(
+    `__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`,
+    90_000,
+  );
+  await clickOn("[data-action=sample-lidc2]");
+  const chest = await waitFor(
+    `__showcase.items().find((m) => m.name.includes("LIDC2") && m.drawn)`,
+    90_000,
+  );
+  verdict(
+    "sample",
+    head !== undefined && head.triangles > 100_000 && chest !== undefined && chest.triangles > 100_000,
+    `head ${head === undefined ? "missing" : head.triangles} / chest ${chest === undefined ? "missing" : chest.triangles}`,
+  );
+
   // ---- volume: the phantom's source volume renders on selection ----
   if (vessel !== undefined) {
     await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
   }
-  const vol = await waitFor(`__showcase.volume().ready ? __showcase.volume() : null`, 60_000);
+  const vol = await waitFor(
+    `__showcase.volume().ready && __showcase.volume().planes === 3 ? __showcase.volume() : null`,
+    60_000,
+  );
   const volCanvas = await page(`document.querySelector("[data-volume] canvas") !== null`);
   verdict(
     "volume",
     vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true,
-    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas}`,
+    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas} planes=${vol.planes}`,
   );
 
   // ---- volume-preset: Vessels + MIP ----
@@ -946,6 +1009,17 @@ try {
     "volume-preset",
     volMip !== undefined && volMip.ready === true,
     volMip === undefined ? JSON.stringify(await hook("volume()")) : `${volMip.preset} mip=${volMip.mip}`,
+  );
+
+  // ---- volume-planes: the checkbox hides and shows the slice planes ----
+  await clickOn('[data-action="volume-planes"]');
+  const planesOff = await waitFor(`__showcase.volume().planes === 0 ? __showcase.volume() : null`, 20_000);
+  await clickOn('[data-action="volume-planes"]');
+  const planesOn = await waitFor(`__showcase.volume().planes === 3 ? __showcase.volume() : null`, 20_000);
+  verdict(
+    "volume-planes",
+    planesOff !== undefined && planesOn !== undefined,
+    `off=${planesOff !== undefined} on=${planesOn !== undefined}`,
   );
 
   // ---- volume-slices: axial/coronal/sagittal views render ----
@@ -978,6 +1052,86 @@ try {
     sliceMoved === undefined
       ? JSON.stringify(await hook("slices()"))
       : `axial=${sliceMoved.axial} window=${sliceMoved.window}`,
+  );
+
+  // ---- volume-navigate: clicking the axial view moves the other slices ----
+  // Off-centre (the exact centre sits on a texel boundary): the coronal and
+  // sagittal slices jump there while the axial one stays.
+  await page(`document.querySelector('[data-slice="axial"] canvas').scrollIntoView({ block: "center" })`);
+  const spot = await page(`(() => {
+    const r = document.querySelector('[data-slice="axial"] canvas').getBoundingClientRect();
+    return { x: r.left + r.width * 0.6, y: r.top + r.height * 0.4 };
+  })()`);
+  await click(spot.x, spot.y);
+  const nav = await waitFor(
+    `__showcase.slices().axial === 10 && __showcase.slices().sagittal !== 47 && __showcase.slices().coronal !== 47 ? __showcase.slices() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-navigate",
+    nav !== undefined,
+    nav === undefined
+      ? JSON.stringify(await hook("slices()"))
+      : `axial=${nav.axial} sagittal=${nav.sagittal} coronal=${nav.coronal}`,
+  );
+
+  // ---- volume-scene: the slices float in the main scene as a cutaway ----
+  const inScene = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
+  await clickOn('[data-action="volume-scene"]');
+  const sceneOff = await waitFor(`__showcase.sceneSlices().shown === 0 ? __showcase.sceneSlices() : null`, 20_000);
+  await clickOn('[data-action="volume-scene"]');
+  const sceneOn = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
+  verdict(
+    "volume-scene",
+    inScene !== undefined && sceneOff !== undefined && sceneOn !== undefined,
+    `show=${inScene !== undefined} off=${sceneOff !== undefined} on=${sceneOn !== undefined}`,
+  );
+
+  // ---- scene-drag: an axial corner ball drags the slice through the stack ----
+  const handles = await waitFor(`__showcase.sliceHandles()?.axial ?? null`, 20_000);
+  const axialBefore = await hook(`mpr().slices.axial`);
+  if (handles !== undefined) {
+    const len = Math.hypot(handles.dx, handles.dy) || 1;
+    const ux = handles.dx / len;
+    const uy = handles.dy / len;
+    await mouse("mouseMoved", handles.x, handles.y, { button: "none" });
+    await mouse("mousePressed", handles.x, handles.y, { buttons: 1 });
+    for (let i = 1; i <= 10; i++) {
+      await mouse("mouseMoved", handles.x + (ux * 120 * i) / 10, handles.y + (uy * 120 * i) / 10, { buttons: 1 });
+      await sleep(40);
+    }
+    await mouse("mouseReleased", handles.x + ux * 120, handles.y + uy * 120, { buttons: 0 });
+  }
+  const axialAfter = await hook(`mpr().slices.axial`);
+  const slicesFollow = await waitFor(`__showcase.slices().axial === ${axialAfter} ? true : null`, 20_000);
+  verdict(
+    "scene-drag",
+    handles !== undefined && axialAfter > axialBefore && slicesFollow === true,
+    `axial ${axialBefore} -> ${axialAfter} (slices tab follows: ${slicesFollow === true})`,
+  );
+
+  // ---- volume-source: the source picker switches the viewed volume ----
+  const headItem = await hook(`items().find((m) => m.name.includes("headsq"))`);
+  if (headItem !== undefined) {
+    await page(`(() => {
+      const sel = document.querySelector('[data-action="volume-source"]');
+      sel.value = ${JSON.stringify(headItem.volumeId)};
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+  }
+  const switched =
+    headItem === undefined
+      ? undefined
+      : await waitFor(`__showcase.mpr()?.volumeId === ${JSON.stringify(headItem.volumeId)} ? __showcase.mpr() : null`, 20_000);
+  const overlayFollows =
+    headItem === undefined
+      ? undefined
+      : await waitFor(`__showcase.sceneSlices().id === ${JSON.stringify(headItem.volumeId)}`, 20_000);
+  verdict(
+    "volume-source",
+    switched !== undefined && overlayFollows !== undefined,
+    `mpr=${switched?.volumeId} overlay=${overlayFollows !== undefined}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
@@ -1035,16 +1189,29 @@ try {
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
   await browser.goto(`http://127.0.0.1:${port}/?local`, "window.__showcase !== undefined");
+  await waitFor(`document.querySelector("[data-action=demo-meshes]") !== null`, 10_000);
+  await clickOn("[data-action=demo-meshes]");
   const localDemo = await waitFor(
-    `(() => { const i = __showcase.items(); return __showcase.mode === "local" && i.length === 3 && i.every((m) => m.drawn) && i; })()`,
+    `(() => { const want = [${q(A)}, ${q(B)}, ${q(C)}];
+      const got = want.map((n) => __showcase.items().find((m) => m.name === n)).filter((m) => m !== undefined && m.drawn);
+      return __showcase.mode === "local" && got.length === 3 && got; })()`,
     60_000,
   );
+  await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
+  const localVessel = await hook(`items().find((m) => m.name.startsWith("Vessel tree"))?.name ?? null`);
+  if (localVessel !== null) {
+    await clickOn(`[data-mesh=${JSON.stringify(localVessel)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localVessel)})`, 10_000);
+  }
+  await pick("a", A);
+  await pick("b", B);
   const localHeat = await waitFor(
     collision(`c.a === ${q(A)} && c.b === ${q(B)} && c.coloring[${q(A)}]?.status === "ready"
       && c.readouts?.penetration?.depth > 0 && c.readouts.intersects`),
     30_000,
   );
   await clickOn("[data-mode=group]");
+  await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
   const localGroup = await waitFor(
     groupState(`${to(A, [B, C])} && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.depth > 0`),
     30_000,

@@ -563,6 +563,8 @@ input[type="range"] {
   height: 100%;
   display: block;
   object-fit: contain;
+  cursor: crosshair;
+  touch-action: none;
 }
 .drop-overlay {
   position: fixed;

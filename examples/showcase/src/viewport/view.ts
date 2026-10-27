@@ -5,8 +5,9 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { MeshBinding } from "fast-mesh-wasm/three";
 import type * as THREE from "three";
-import type { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import type { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import type { TransformControls } from "three/addons/controls/TransformControls.js";
+import type { SceneSliceQuads } from "./SceneSlices";
 
 /** The mesh under the pointer: the vertex slot nearest to the hit, and the pointer on the page (CSS pixels). */
 export interface Hover {
@@ -22,8 +23,8 @@ export const view: {
   bindings: ReadonlyMap<MeshHandle, MeshBinding>;
   /** The gizmo on the selected mesh, if any. */
   gizmo: TransformControls | null;
-  /** The orbit camera controls (a sculpt stroke disables them while it paints). */
-  orbit: OrbitControls | null;
+  /** The trackball camera controls (a sculpt stroke disables them while it paints). */
+  orbit: TrackballControls | null;
   /** True while the gizmo drags. */
   dragging: boolean;
   /** Called with `dragging` whenever it changes. */
@@ -32,6 +33,8 @@ export const view: {
   hover: Hover | null;
   /** Called whenever `hover` changes. */
   hoverListeners: Set<() => void>;
+  /** The scene's slice quads, for the test hook to project their handles. */
+  sliceQuads: SceneSliceQuads | null;
 } = {
   camera: null,
   canvas: null,
@@ -42,6 +45,7 @@ export const view: {
   dragListeners: new Set(),
   hover: null,
   hoverListeners: new Set(),
+  sliceQuads: null,
 };
 
 /** Sets `view.dragging` and tells the listeners when it changes. */

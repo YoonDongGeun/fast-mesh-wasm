@@ -1,8 +1,8 @@
 // The fast-mesh-wasm showcase: load meshes (STL, OBJ, PLY), move them, undo.
 // The engine is a `WorkerScene` behind a `SceneStore` (threaded on this
 // cross-origin isolated page); `?local` runs the synchronous `Scene` on the
-// main thread instead. `?big` makes the demo meshes A and B about a million
-// triangles each; `?threads=N` asks for N engine threads.
+// main thread instead. `?threads=N` asks for N engine threads. The app
+// boots onto the vessel tree; the demo meshes load from their button.
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { SceneProvider } from "fast-mesh-wasm/react";
 import { createWorkerScene, type WorkerScene } from "fast-mesh-wasm/worker";
@@ -50,9 +50,6 @@ try {
     </StrictMode>,
   );
   installTestHook(store, engine, app);
-  // Seeded here, outside React: StrictMode runs effects twice in development,
-  // which would add every mesh twice.
-  void loader.loadDemo(params.has("big"));
 } catch (error) {
   console.error(error);
   root.render(<div className="fatal">Could not start the scene: {String(error)}</div>);

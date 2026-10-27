@@ -1,8 +1,9 @@
 // Our volume renderer: a three.js raycaster through the 8-bit volume,
-// shaded by the preset LUT. Composite and MIP modes, orbit/zoom via
-// OrbitControls, rendered on demand. No vtk.js.
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+// shaded by the preset LUT. Composite and MIP modes, trackball/zoom via
+// TrackballControls, rendered on demand. No vtk.js.
+import { TrackballControls } from "three/addons/controls/TrackballControls.js";
 import * as THREE from "three";
+import { AXIS_COLOR, planeSpec, type SlicePlane, type SlicePlanes } from "./volume-slice";
 
 const STEPS = 256;
 
@@ -100,12 +101,13 @@ export class VolumeView3D {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
-  private controls: OrbitControls;
+  private controls: TrackballControls;
   private mesh: THREE.Mesh;
   private material: THREE.ShaderMaterial;
   private volumeTexture: THREE.Data3DTexture;
   private lutTexture: THREE.DataTexture;
   private size: THREE.Vector3;
+  private planes: { mesh: THREE.Mesh; texture: THREE.DataTexture; place: (index: number, count: number) => void }[] = [];
   private onChange: () => void;
 
   constructor(canvas: HTMLCanvasElement, data: Uint8Array, grid: VolumeGrid, lut: Uint8Array) {
@@ -129,10 +131,11 @@ export class VolumeView3D {
     this.camera.near = extent * 0.01;
     this.camera.far = extent * 20;
     this.camera.updateProjectionMatrix();
-    this.controls = new OrbitControls(this.camera, canvas);
+    this.controls = new TrackballControls(this.camera, canvas);
     this.controls.target.set(0, 0, 0);
     this.controls.minDistance = extent * 0.5;
     this.controls.maxDistance = extent * 8;
+    this.controls.staticMoving = true;
     this.controls.update();
 
     this.volumeTexture = new THREE.Data3DTexture(data, grid.columns, grid.rows, grid.slices);
@@ -159,6 +162,9 @@ export class VolumeView3D {
       fragmentShader: FRAG,
       side: THREE.BackSide,
       transparent: true,
+      // The slice planes are opaque and write depth; the box blends over
+      // them so they show through wherever the volume is transparent.
+      depthTest: false,
       depthWrite: false,
       uniforms: {
         uVolume: { value: this.volumeTexture },
@@ -188,6 +194,69 @@ export class VolumeView3D {
     this.render();
   }
 
+  /**
+   * The slice planes (or null to hide them): windowed grayscale quads at
+   * the slice positions, like a medical viewer's 3D overlay. Built once;
+   * later calls move them and refresh their pixels.
+   */
+  setPlanes(planes: SlicePlanes | null): void {
+    if (planes === null) {
+      for (const p of this.planes) {
+        p.mesh.visible = false;
+      }
+      this.render();
+      return;
+    }
+    const list = [planes.axial, planes.coronal, planes.sagittal];
+    list.forEach((plane, i) => {
+      let entry = this.planes[i];
+      if (entry === undefined) {
+        entry = this.buildPlane(i, plane);
+        this.planes[i] = entry;
+      } else {
+        entry.texture.image.data = plane.data;
+        entry.texture.needsUpdate = true;
+      }
+      entry.mesh.visible = true;
+      entry.place(plane.index, plane.count);
+    });
+    this.render();
+  }
+
+  private buildPlane(i: number, plane: SlicePlane): { mesh: THREE.Mesh; texture: THREE.DataTexture; place: (index: number, count: number) => void } {
+    const texture = new THREE.DataTexture(plane.data, plane.width, plane.height);
+    texture.flipY = true;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.wrapS = THREE.ClampToEdgeWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+    texture.needsUpdate = true;
+    const at = (index: number, count: number, extent: number): number => ((index + 0.5) / count - 0.5) * extent;
+    const axis = (["axial", "coronal", "sagittal"] as const)[i];
+    const spec = planeSpec(axis, [this.size.x, this.size.y, this.size.z]);
+    const geometry = new THREE.PlaneGeometry(spec.width, spec.height);
+    if (spec.spinZ) {
+      geometry.rotateZ(Math.PI / 2);
+    }
+    const place =
+      i === 0
+        ? (m: THREE.Mesh, index: number, count: number) => m.position.set(0, 0, at(index, count, this.size.z))
+        : i === 1
+          ? (m: THREE.Mesh, index: number, count: number) => m.position.set(0, at(index, count, this.size.y), 0)
+          : (m: THREE.Mesh, index: number, count: number) => m.position.set(at(index, count, this.size.x), 0, 0);
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide }));
+    mesh.rotation.set(spec.rotation[0], spec.rotation[1], spec.rotation[2]);
+    // The border in the axis color: the plane itself is mostly black air.
+    const border = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geometry),
+      new THREE.LineBasicMaterial({ color: [AXIS_COLOR.axial, AXIS_COLOR.coronal, AXIS_COLOR.sagittal][i] }),
+    );
+    mesh.add(border);
+    mesh.frustumCulled = false;
+    this.scene.add(mesh);
+    return { mesh, texture, place: (index: number, count: number) => place(mesh, index, count) };
+  }
+
   setSize(width: number, height: number): void {
     this.renderer.setSize(Math.max(1, Math.floor(width)), Math.max(1, Math.floor(height)), false);
     this.camera.aspect = Math.max(1, width) / Math.max(1, height);
@@ -208,6 +277,17 @@ export class VolumeView3D {
     this.material.dispose();
     this.volumeTexture.dispose();
     this.lutTexture.dispose();
+    for (const p of this.planes) {
+      p.mesh.geometry.dispose();
+      (p.mesh.material as THREE.Material).dispose();
+      for (const child of p.mesh.children) {
+        const line = child as THREE.LineSegments;
+        line.geometry.dispose();
+        (line.material as THREE.Material).dispose();
+      }
+      p.texture.dispose();
+    }
+    this.planes = [];
     this.renderer.dispose();
   }
 }
