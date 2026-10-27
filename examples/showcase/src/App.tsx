@@ -167,6 +167,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               }
             });
           }}
+          onLoadSample={(sample) => {
+            void loader.loadSample(sample).then((added) => {
+              const last = added.at(-1);
+              if (last !== undefined) {
+                focusOn(last.mesh);
+              }
+            });
+          }}
           onFocus={focusOn}
         />
         <GroupsBar app={app} />

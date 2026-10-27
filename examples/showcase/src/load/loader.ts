@@ -6,6 +6,7 @@ import type { AppState, Item } from "../scene/app-state";
 import { isDicom } from "./dicom";
 import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
 import type { LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
+import { SAMPLE_NAMES, type SampleKind } from "./vtkjs";
 
 /** How long a finished job stays listed. */
 const DONE_LINGER_MS = 2500;
@@ -110,6 +111,11 @@ export class Loader {
   /** Meshes a procedural DICOM phantom through the extraction pipeline. */
   loadDicomDemo(phantom: PhantomKind): Promise<Item[]> {
     return this.#start(`${PHANTOM_NAMES[phantom]} (DICOM demo)`, { kind: "phantom", id: 0, phantom });
+  }
+
+  /** Meshes a bundled sample CT through the extraction pipeline. */
+  loadSample(sample: SampleKind): Promise<Item[]> {
+    return this.#start(`${SAMPLE_NAMES[sample]} (sample CT)`, { kind: "sample", id: 0, sample });
   }
 
   #workerFor(): Worker {

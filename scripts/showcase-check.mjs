@@ -71,6 +71,8 @@
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
 // - dicom-demo: the Vessel tree phantom button meshes through the same
 //   pipeline, listed and drawn.
+// - sample: the bundled headsq + LIDC2 CT buttons mesh through the same
+//   pipeline, listed and drawn.
 // - volume: selecting the phantom's mesh renders its source volume,
 //   with a canvas, the Bone preset, and the 3 slice planes.
 // - volume-preset: the Vessels preset plus MIP switch the rendering.
@@ -921,6 +923,23 @@ try {
     "dicom-demo",
     vessel !== undefined && vessel.triangles > 1000,
     vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
+  );
+
+  // ---- sample: the bundled headsq + LIDC2 CTs mesh ----
+  await clickOn("[data-action=sample-headsq]");
+  const head = await waitFor(
+    `__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`,
+    90_000,
+  );
+  await clickOn("[data-action=sample-lidc2]");
+  const chest = await waitFor(
+    `__showcase.items().find((m) => m.name.includes("LIDC2") && m.drawn)`,
+    90_000,
+  );
+  verdict(
+    "sample",
+    head !== undefined && head.triangles > 100_000 && chest !== undefined && chest.triangles > 100_000,
+    `head ${head === undefined ? "missing" : head.triangles} / chest ${chest === undefined ? "missing" : chest.triangles}`,
   );
 
   // ---- volume: the phantom's source volume renders on selection ----

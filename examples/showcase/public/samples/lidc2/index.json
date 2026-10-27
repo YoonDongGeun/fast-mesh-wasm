@@ -1,0 +1,1 @@
+{"origin":[0,0,0],"spacing":[1.40625,1.40625,2.5],"extent":[0,255,0,255,0,132],"pointData":{"arrays":[{"data":{"name":"ImageFile","dataType":"Uint8Array","size":8716288,"ref":{"basepath":"data","id":"lidc2-scalars.bin"}}}]},"hu":{"slope":8,"intercept":-1000},"seriesUid":"1.2.826.0.1.3680043.2.1125.lidc2","description":"CT chest (VTK LIDC2 sample)","iso":300}

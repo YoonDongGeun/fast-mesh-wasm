@@ -1,6 +1,7 @@
 // Messages between the page and the loader Worker (parser.worker.ts).
 import type { Vec3 } from "./mesh-data";
 import type { PhantomKind } from "./phantom";
+import type { SampleKind } from "./vtkjs";
 
 export type LoaderRequest =
   /** Parse a file (read in the Worker: the page never touches its bytes). */
@@ -9,6 +10,8 @@ export type LoaderRequest =
   | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
   /** Mesh a procedural DICOM phantom through the same extraction pipeline. */
   | { kind: "phantom"; id: number; phantom: PhantomKind }
+  /** Mesh a bundled sample CT through the same extraction pipeline. */
+  | { kind: "sample"; id: number; sample: SampleKind }
   /** Fetch a retained source volume (page cache miss). */
   | { kind: "volume"; id: number; volumeId: string }
   /** Drop a retained source volume (fire-and-forget: no reply). */

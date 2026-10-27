@@ -6,6 +6,7 @@ import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useRef, useState } from "react";
 import { MESH_EXTENSIONS } from "../load/parse";
 import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
+import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 
@@ -21,9 +22,10 @@ export function MeshList(props: {
   app: AppState;
   onLoad: (files: Iterable<File>) => void;
   onLoadPhantom: (phantom: PhantomKind) => void;
+  onLoadSample: (sample: SampleKind) => void;
   onFocus: (mesh: Item["mesh"]) => void;
 }) {
-  const { app, onLoad, onLoadPhantom, onFocus } = props;
+  const { app, onLoad, onLoadPhantom, onLoadSample, onFocus } = props;
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
   const input = useRef<HTMLInputElement>(null);
@@ -65,6 +67,21 @@ export function MeshList(props: {
             onClick={() => onLoadPhantom(kind)}
           >
             {PHANTOM_NAMES[kind]}
+          </button>
+        ))}
+      </p>
+      <p className="muted small">
+        Sample CT:{" "}
+        {(Object.keys(SAMPLE_NAMES) as SampleKind[]).map((kind) => (
+          <button
+            key={kind}
+            type="button"
+            className="link"
+            data-action={`sample-${kind}`}
+            title={`Mesh the bundled ${SAMPLE_NAMES[kind].toLowerCase()} CT series`}
+            onClick={() => onLoadSample(kind)}
+          >
+            {SAMPLE_NAMES[kind]}
           </button>
         ))}
       </p>
