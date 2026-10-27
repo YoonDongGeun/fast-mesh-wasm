@@ -71,12 +71,15 @@
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
 // - dicom-demo: the Vessel tree phantom button meshes through the same
 //   pipeline, listed and drawn.
-// - volume: selecting the phantom's mesh renders its source volume
-//   (vtk.js), with a canvas and the Bone preset.
+// - volume: selecting the phantom's mesh renders its source volume,
+//   with a canvas, the Bone preset, and the 3 slice planes.
 // - volume-preset: the Vessels preset plus MIP switch the rendering.
+// - volume-planes: the Planes checkbox hides and shows the slice planes.
 // - volume-slices: the Slices tab renders axial/coronal/sagittal views.
 // - volume-slice-move: the axial slider and the window preset move the
 //   slice views.
+// - volume-navigate: clicking the axial view moves the coronal and
+//   sagittal slices there.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -922,12 +925,15 @@ try {
   if (vessel !== undefined) {
     await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
   }
-  const vol = await waitFor(`__showcase.volume().ready ? __showcase.volume() : null`, 60_000);
+  const vol = await waitFor(
+    `__showcase.volume().ready && __showcase.volume().planes === 3 ? __showcase.volume() : null`,
+    60_000,
+  );
   const volCanvas = await page(`document.querySelector("[data-volume] canvas") !== null`);
   verdict(
     "volume",
     vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true,
-    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas}`,
+    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas} planes=${vol.planes}`,
   );
 
   // ---- volume-preset: Vessels + MIP ----
@@ -946,6 +952,17 @@ try {
     "volume-preset",
     volMip !== undefined && volMip.ready === true,
     volMip === undefined ? JSON.stringify(await hook("volume()")) : `${volMip.preset} mip=${volMip.mip}`,
+  );
+
+  // ---- volume-planes: the checkbox hides and shows the slice planes ----
+  await clickOn('[data-action="volume-planes"]');
+  const planesOff = await waitFor(`__showcase.volume().planes === 0 ? __showcase.volume() : null`, 20_000);
+  await clickOn('[data-action="volume-planes"]');
+  const planesOn = await waitFor(`__showcase.volume().planes === 3 ? __showcase.volume() : null`, 20_000);
+  verdict(
+    "volume-planes",
+    planesOff !== undefined && planesOn !== undefined,
+    `off=${planesOff !== undefined} on=${planesOn !== undefined}`,
   );
 
   // ---- volume-slices: axial/coronal/sagittal views render ----
@@ -978,6 +995,27 @@ try {
     sliceMoved === undefined
       ? JSON.stringify(await hook("slices()"))
       : `axial=${sliceMoved.axial} window=${sliceMoved.window}`,
+  );
+
+  // ---- volume-navigate: clicking the axial view moves the other slices ----
+  // Off-centre (the exact centre sits on a texel boundary): the coronal and
+  // sagittal slices jump there while the axial one stays.
+  await page(`document.querySelector('[data-slice="axial"] canvas').scrollIntoView({ block: "center" })`);
+  const spot = await page(`(() => {
+    const r = document.querySelector('[data-slice="axial"] canvas').getBoundingClientRect();
+    return { x: r.left + r.width * 0.6, y: r.top + r.height * 0.4 };
+  })()`);
+  await click(spot.x, spot.y);
+  const nav = await waitFor(
+    `__showcase.slices().axial === 10 && __showcase.slices().sagittal !== 47 && __showcase.slices().coronal !== 47 ? __showcase.slices() : null`,
+    20_000,
+  );
+  verdict(
+    "volume-navigate",
+    nav !== undefined,
+    nav === undefined
+      ? JSON.stringify(await hook("slices()"))
+      : `axial=${nav.axial} sagittal=${nav.sagittal} coronal=${nav.coronal}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

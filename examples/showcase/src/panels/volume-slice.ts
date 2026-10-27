@@ -41,6 +41,36 @@ export function extractSlice(
   return { data, width: rows, height: slices };
 }
 
+export type VolumeDims = { columns: number; rows: number; slices: number };
+
+/**
+ * A pointer at (`dx`, `dy`) within the view's box to the slice indices it
+ * picks on the other two axes. The image is `object-fit: contain`, so the
+ * box may letterbox it; out-of-image points clamp to the edge.
+ */
+export function pointerSlice(
+  axis: SliceAxis,
+  dims: VolumeDims,
+  canvas: { width: number; height: number },
+  rect: { width: number; height: number },
+  dx: number,
+  dy: number,
+): Partial<Record<SliceAxis, number>> {
+  const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+  const ox = (rect.width - canvas.width * scale) / 2;
+  const oy = (rect.height - canvas.height * scale) / 2;
+  const pick = (p: number, count: number): number => Math.min(count - 1, Math.max(0, Math.floor(p)));
+  const px = pick((dx - ox) / scale, canvas.width);
+  const top = pick((dy - oy) / scale, canvas.height);
+  if (axis === "axial") {
+    return { sagittal: px, coronal: dims.rows - 1 - top };
+  }
+  if (axis === "coronal") {
+    return { sagittal: px, axial: dims.slices - 1 - top };
+  }
+  return { coronal: px, axial: dims.slices - 1 - top };
+}
+
 /** The values mapped through the window to opaque gray RGBA. */
 export function windowToGray(data: Float32Array, window: number, level: number): Uint8ClampedArray<ArrayBuffer> {
   const out = new Uint8ClampedArray(data.length * 4);
