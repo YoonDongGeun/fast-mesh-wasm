@@ -84,6 +84,10 @@
 //   sagittal slices there.
 // - volume-scene: the slices float in the main scene as a cutaway; the
 //   Scene checkbox hides and shows them.
+// - scene-drag: dragging an axial corner ball in the scene moves the
+//   slice, and the Slices tab follows.
+// - volume-source: the source picker switches the viewed volume, and the
+//   scene overlay follows.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -1049,6 +1053,53 @@ try {
     "volume-scene",
     inScene !== undefined && sceneOff !== undefined && sceneOn !== undefined,
     `show=${inScene !== undefined} off=${sceneOff !== undefined} on=${sceneOn !== undefined}`,
+  );
+
+  // ---- scene-drag: an axial corner ball drags the slice through the stack ----
+  const handles = await waitFor(`__showcase.sliceHandles()?.axial ?? null`, 20_000);
+  const axialBefore = await hook(`mpr().slices.axial`);
+  if (handles !== undefined) {
+    const len = Math.hypot(handles.dx, handles.dy) || 1;
+    const ux = handles.dx / len;
+    const uy = handles.dy / len;
+    await mouse("mouseMoved", handles.x, handles.y, { button: "none" });
+    await mouse("mousePressed", handles.x, handles.y, { buttons: 1 });
+    for (let i = 1; i <= 10; i++) {
+      await mouse("mouseMoved", handles.x + (ux * 120 * i) / 10, handles.y + (uy * 120 * i) / 10, { buttons: 1 });
+      await sleep(40);
+    }
+    await mouse("mouseReleased", handles.x + ux * 120, handles.y + uy * 120, { buttons: 0 });
+  }
+  const axialAfter = await hook(`mpr().slices.axial`);
+  const slicesFollow = await waitFor(`__showcase.slices().axial === ${axialAfter} ? true : null`, 20_000);
+  verdict(
+    "scene-drag",
+    handles !== undefined && axialAfter > axialBefore && slicesFollow === true,
+    `axial ${axialBefore} -> ${axialAfter} (slices tab follows: ${slicesFollow === true})`,
+  );
+
+  // ---- volume-source: the source picker switches the viewed volume ----
+  const headItem = await hook(`items().find((m) => m.name.includes("headsq"))`);
+  if (headItem !== undefined) {
+    await page(`(() => {
+      const sel = document.querySelector('[data-action="volume-source"]');
+      sel.value = ${JSON.stringify(headItem.volumeId)};
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+  }
+  const switched =
+    headItem === undefined
+      ? undefined
+      : await waitFor(`__showcase.mpr()?.volumeId === ${JSON.stringify(headItem.volumeId)} ? __showcase.mpr() : null`, 20_000);
+  const overlayFollows =
+    headItem === undefined
+      ? undefined
+      : await waitFor(`__showcase.sceneSlices().id === ${JSON.stringify(headItem.volumeId)}`, 20_000);
+  verdict(
+    "volume-source",
+    switched !== undefined && overlayFollows !== undefined,
+    `mpr=${switched?.volumeId} overlay=${overlayFollows !== undefined}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

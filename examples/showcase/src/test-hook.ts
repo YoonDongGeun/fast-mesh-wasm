@@ -25,11 +25,12 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     mode: engine.mode,
     threads: () => engine.threads(),
     isolated: engine.isolated,
-    /** The listed meshes: name, triangles as loaded, and whether `<FastMesh>` has drawn geometry for it. */
+    /** The listed meshes: name, triangles as loaded, source volume, and whether `<FastMesh>` has drawn geometry for it. */
     items: () =>
       app.getSnapshot().items.map((i) => ({
         name: i.name,
         triangles: i.triangles,
+        volumeId: i.volumeId,
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
       })),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
@@ -180,6 +181,45 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     slices: () => ({ ...inspect.slices }),
     /** The scene overlay: the series whose slices float in the main scene, and how many show. */
     sceneSlices: () => ({ ...inspect.sceneSlices }),
+    /** The linked MPR state: the series, the slice indices, the window preset, and the scene overlay. */
+    mpr: () => {
+      const m = app.getSnapshot().volumeMpr;
+      return m === null ? null : { volumeId: m.volumeId, slices: { ...m.slices }, window: m.window, inScene: m.inScene };
+    },
+    /**
+     * The scene quads' first corner handles on the page (CSS pixels), each
+     * with the screen direction of higher slices: `null` while the overlay
+     * hides. The check drags a slice by one.
+     */
+    sliceHandles: () => {
+      if (view.camera === null || view.canvas === null || view.sliceQuads === null) {
+        return null;
+      }
+      const quads = view.sliceQuads;
+      if (!quads.group.visible) {
+        return null;
+      }
+      const r = view.canvas.getBoundingClientRect();
+      const toPage = (p: [number, number, number]): { x: number; y: number } => {
+        const v = new THREE.Vector3(p[0], p[1], p[2]).project(view.camera as THREE.Camera);
+        return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
+      };
+      const out: Record<string, { x: number; y: number; dx: number; dy: number } | null> = {};
+      for (const axis of ["axial", "coronal", "sagittal"] as const) {
+        const at = quads.handleWorld(axis, 0);
+        const quad = quads.quadMesh(axis);
+        if (at === null || quad === null) {
+          out[axis] = null;
+          continue;
+        }
+        const normal = quad.getWorldDirection(new THREE.Vector3());
+        const sign = quads.axisSign(axis, normal);
+        const from = toPage(at);
+        const to = toPage([at[0] + sign * normal.x * 10, at[1] + sign * normal.y * 10, at[2] + sign * normal.z * 10]);
+        out[axis] = { ...from, dx: to.x - from.x, dy: to.y - from.y };
+      }
+      return out;
+    },
     /** Whether every mesh draws wireframed. */
     wireframe: () => app.getSnapshot().wireframe,
     /** The wireframe overlays in the scene: meshes bound, overlays shown, and whether every solid stayed shaded. */

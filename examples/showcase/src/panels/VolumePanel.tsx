@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Loader } from "../load/loader";
 import type { VolumePayload } from "../load/protocol";
 import { type AppState, useApp } from "../scene/app-state";
+import { selectMesh } from "../scene/selection";
 import { inspect } from "./inspect";
 import { displayValues } from "./volume-data";
 import { dataRange, normalizeVolume, presetLut } from "./volume-lut";
@@ -98,6 +99,8 @@ function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: st
   const { app, payload, volumeId, name } = props;
   const [tab, setTab] = useState<"volume" | "slices">("volume");
   const mpr = useApp(app, (s) => s.volumeMpr);
+  const [selection, select] = useSelection();
+  const sources = useApp(app, (s) => s.items).filter((i) => i.volumeId !== null);
   useEffect(() => {
     app.setVolumeMpr({
       volumeId,
@@ -155,6 +158,25 @@ function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: st
         <button type="button" role="tab" aria-selected={tab === "slices"} data-action="volume-tab-slices" onClick={() => setTab("slices")}>
           Slices
         </button>
+        <label className="slider" title="Which loaded volume to view">
+          source{" "}
+          <select
+            data-action="volume-source"
+            value={volumeId}
+            onChange={(e) => {
+              const item = sources.find((i) => i.volumeId === e.currentTarget.value);
+              if (item !== undefined) {
+                selectMesh(app, select, selection, item.mesh, false);
+              }
+            }}
+          >
+            {sources.map((i) => (
+              <option key={i.volumeId} value={i.volumeId ?? ""}>
+                {i.name}
+              </option>
+            ))}
+          </select>
+        </label>
         <label className="check" title="Show the slices in the main scene too">
           <input
             type="checkbox"
