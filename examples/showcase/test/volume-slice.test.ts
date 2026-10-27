@@ -1,7 +1,7 @@
 // The MPR slices: plane extraction with a fixed orientation (up is +Y
 // for axial, +Z otherwise) and window/level to gray.
 import { describe, expect, it } from "vitest";
-import { extractSlice, pointerSlice, windowToGray } from "../src/panels/volume-slice";
+import { extractSlice, pointerSlice, slicePlaneImages, windowToGray } from "../src/panels/volume-slice";
 
 // 3 x 2 x 2 voxels, x fastest: value = 100 * k + 10 * j + i.
 const COLUMNS = 3;
@@ -54,6 +54,18 @@ describe("pointerSlice", () => {
     expect(at).toEqual({ sagittal: 0, coronal: 0 });
     const bar = pointerSlice("axial", dims2, { width: 3, height: 2 }, { width: 40, height: 20 }, 2, 10);
     expect(bar).toEqual({ sagittal: 0, coronal: 0 });
+  });
+});
+
+describe("slicePlaneImages", () => {
+  it("windows_all_three_planes_at_the_slices", () => {
+    const dims = { columns: COLUMNS, rows: ROWS, slices: SLICES };
+    const planes = slicePlaneImages(VALUES, dims, { axial: 1, coronal: 1, sagittal: 2 }, 100, 50);
+    expect([planes.axial.width, planes.axial.height, planes.axial.index, planes.axial.count]).toEqual([3, 2, 1, 2]);
+    expect([planes.coronal.width, planes.coronal.height, planes.coronal.index, planes.coronal.count]).toEqual([3, 2, 1, 2]);
+    expect([planes.sagittal.width, planes.sagittal.height, planes.sagittal.index, planes.sagittal.count]).toEqual([2, 2, 2, 3]);
+    // Axial slice 1 starts at voxel 110: above the window, white.
+    expect(Array.from(planes.axial.data.slice(0, 4))).toEqual([255, 255, 255, 255]);
   });
 });
 

@@ -186,6 +186,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           sculptRemesh={sculptRemesh}
           sculptLiveRemesh={sculptLiveRemesh}
           wireframe={wireframe}
+          loader={loader}
         />
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}

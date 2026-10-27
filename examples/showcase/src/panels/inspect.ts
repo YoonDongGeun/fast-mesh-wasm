@@ -91,6 +91,8 @@ export const inspect: {
   volume: { id: string | null; preset: string; mip: boolean; planes: number; ready: boolean };
   /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */
   slices: { id: string | null; window: string; axial: number; coronal: number; sagittal: number; ready: boolean };
+  /** The scene overlay: the series whose slices float in the main scene, and how many show. */
+  sceneSlices: { id: string | null; shown: number };
   /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, whether the ball shows, and the last grab dab's center. */
   sculpt: {
     strokes: number;
@@ -108,6 +110,7 @@ export const inspect: {
   repair: { analysis: null, analyses: 0, report: null, busy: null },
   volume: { id: null, preset: "", mip: false, planes: 0, ready: false },
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
+  sceneSlices: { id: null, shown: 0 },
   sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null },
 };
 

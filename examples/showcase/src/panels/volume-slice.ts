@@ -3,6 +3,45 @@
 // to gray.
 export type SliceAxis = "axial" | "coronal" | "sagittal";
 
+/** The crosshair colors, one per axis, matching the gizmo's RGB. */
+export const AXIS_COLOR: Record<SliceAxis, string> = {
+  sagittal: "#ff5252",
+  coronal: "#69f06e",
+  axial: "#40a0ff",
+};
+
+/** One slice plane's windowed grayscale image and its position. */
+export type SlicePlane = {
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+  index: number;
+  count: number;
+};
+
+export type SlicePlanes = { axial: SlicePlane; coronal: SlicePlane; sagittal: SlicePlane };
+
+export type PlaneFrame = {
+  /** The quad's u/v extents in world units (u follows the first plane axis). */
+  width: number;
+  height: number;
+  /** Spin the quad in-plane first (sagittal: u must follow +Y). */
+  spinZ: boolean;
+  /** The mesh rotation (XYZ Euler). */
+  rotation: [number, number, number];
+};
+
+/** The quad frame for `axis` in a `size` box: u/v follow the plane axes. */
+export function planeSpec(axis: SliceAxis, size: [number, number, number]): PlaneFrame {
+  if (axis === "axial") {
+    return { width: size[0], height: size[1], spinZ: false, rotation: [0, 0, 0] };
+  }
+  if (axis === "coronal") {
+    return { width: size[0], height: size[2], spinZ: false, rotation: [Math.PI / 2, 0, 0] };
+  }
+  return { width: size[1], height: size[2], spinZ: true, rotation: [0, Math.PI / 2, 0] };
+}
+
 export type SliceImage = { data: Float32Array; width: number; height: number };
 
 /** The plane at `index` along `axis`, top row first. */
@@ -69,6 +108,28 @@ export function pointerSlice(
     return { sagittal: px, axial: dims.slices - 1 - top };
   }
   return { coronal: px, axial: dims.slices - 1 - top };
+}
+
+/** The three planes' windowed images at `slices` (for the 3D overlays). */
+export function slicePlaneImages(
+  display: Float32Array,
+  dims: VolumeDims,
+  slices: Record<SliceAxis, number>,
+  colorWindow: number,
+  colorLevel: number,
+): SlicePlanes {
+  const image = (axis: SliceAxis): SlicePlane => {
+    const slice = extractSlice(display, dims.columns, dims.rows, dims.slices, axis, slices[axis]);
+    const count = axis === "axial" ? dims.slices : axis === "coronal" ? dims.rows : dims.columns;
+    return {
+      data: windowToGray(slice.data, colorWindow, colorLevel),
+      width: slice.width,
+      height: slice.height,
+      index: slices[axis],
+      count,
+    };
+  };
+  return { axial: image("axial"), coronal: image("coronal"), sagittal: image("sagittal") };
 }
 
 /** The values mapped through the window to opaque gray RGBA. */

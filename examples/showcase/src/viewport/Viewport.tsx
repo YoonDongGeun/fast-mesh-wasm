@@ -18,9 +18,11 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { FocusRequest } from "../App";
+import type { Loader } from "../load/loader";
 import { inspect } from "../panels/inspect";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { SceneSlices } from "./SceneSlices";
 import {
   type SculptBrush,
   SculptStroke,
@@ -66,6 +68,8 @@ export function Viewport(props: {
   sculptLiveRemesh: boolean;
   /** Lay the wireframe overlay over every shaded mesh. */
   wireframe: boolean;
+  /** The loader, for the scene slice overlay's volume fetch. */
+  loader: Loader;
 }) {
   const {
     app,
@@ -81,6 +85,7 @@ export function Viewport(props: {
     sculptRemesh,
     sculptLiveRemesh,
     wireframe,
+    loader,
   } = props;
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
@@ -138,6 +143,7 @@ export function Viewport(props: {
         <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
       ) : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
+      <SceneSlices app={app} loader={loader} scene={scene} />
     </Canvas>
   );
 }

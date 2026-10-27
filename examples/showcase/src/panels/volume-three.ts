@@ -3,6 +3,7 @@
 // OrbitControls, rendered on demand. No vtk.js.
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import * as THREE from "three";
+import { AXIS_COLOR, planeSpec, type SlicePlane, type SlicePlanes } from "./volume-slice";
 
 const STEPS = 256;
 
@@ -95,38 +96,6 @@ export type VolumeGrid = {
   slices: number;
   spacing: [number, number, number];
 };
-
-/** One slice plane's windowed grayscale image and its position. */
-export type SlicePlane = {
-  data: Uint8ClampedArray;
-  width: number;
-  height: number;
-  index: number;
-  count: number;
-};
-
-export type SlicePlanes = { axial: SlicePlane; coronal: SlicePlane; sagittal: SlicePlane };
-
-export type PlaneFrame = {
-  /** The quad's u/v extents in world units (u follows the first plane axis). */
-  width: number;
-  height: number;
-  /** Spin the quad in-plane first (sagittal: u must follow +Y). */
-  spinZ: boolean;
-  /** The mesh rotation (XYZ Euler). */
-  rotation: [number, number, number];
-};
-
-/** The quad frame for `axis` in a `size` box: u/v follow the plane axes. */
-export function planeSpec(axis: "axial" | "coronal" | "sagittal", size: [number, number, number]): PlaneFrame {
-  if (axis === "axial") {
-    return { width: size[0], height: size[1], spinZ: false, rotation: [0, 0, 0] };
-  }
-  if (axis === "coronal") {
-    return { width: size[0], height: size[2], spinZ: false, rotation: [Math.PI / 2, 0, 0] };
-  }
-  return { width: size[1], height: size[2], spinZ: true, rotation: [0, Math.PI / 2, 0] };
-}
 
 export class VolumeView3D {
   private renderer: THREE.WebGLRenderer;
@@ -279,7 +248,7 @@ export class VolumeView3D {
     // The border in the axis color: the plane itself is mostly black air.
     const border = new THREE.LineSegments(
       new THREE.EdgesGeometry(geometry),
-      new THREE.LineBasicMaterial({ color: [0x40a0ff, 0x69f06e, 0xff5252][i] }),
+      new THREE.LineBasicMaterial({ color: [AXIS_COLOR.axial, AXIS_COLOR.coronal, AXIS_COLOR.sagittal][i] }),
     );
     mesh.add(border);
     mesh.frustumCulled = false;

@@ -80,6 +80,8 @@
 //   slice views.
 // - volume-navigate: clicking the axial view moves the coronal and
 //   sagittal slices there.
+// - volume-scene: the slices float in the main scene as a cutaway; the
+//   Scene checkbox hides and shows them.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -1016,6 +1018,18 @@ try {
     nav === undefined
       ? JSON.stringify(await hook("slices()"))
       : `axial=${nav.axial} sagittal=${nav.sagittal} coronal=${nav.coronal}`,
+  );
+
+  // ---- volume-scene: the slices float in the main scene as a cutaway ----
+  const inScene = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
+  await clickOn('[data-action="volume-scene"]');
+  const sceneOff = await waitFor(`__showcase.sceneSlices().shown === 0 ? __showcase.sceneSlices() : null`, 20_000);
+  await clickOn('[data-action="volume-scene"]');
+  const sceneOn = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
+  verdict(
+    "volume-scene",
+    inScene !== undefined && sceneOff !== undefined && sceneOn !== undefined,
+    `show=${inScene !== undefined} off=${sceneOff !== undefined} on=${sceneOn !== undefined}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

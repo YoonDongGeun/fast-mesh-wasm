@@ -14,7 +14,7 @@ import { inspect } from "./inspect";
 import { displayValues } from "./volume-data";
 import { dataRange, normalizeVolume, presetLut } from "./volume-lut";
 import { VOLUME_PRESETS, WINDOW_PRESETS, type WindowValue } from "./volume-presets";
-import { extractSlice, pointerSlice, windowToGray, type SliceAxis } from "./volume-slice";
+import { AXIS_COLOR, extractSlice, pointerSlice, slicePlaneImages, windowToGray, type SliceAxis } from "./volume-slice";
 import { VolumeView3D } from "./volume-three";
 
 const SLICE_MAX: Record<SliceAxis, (p: VolumePayload) => number> = {
@@ -25,13 +25,6 @@ const SLICE_MAX: Record<SliceAxis, (p: VolumePayload) => number> = {
 
 const SLICE_AXES: SliceAxis[] = ["axial", "coronal", "sagittal"];
 
-/** The crosshair colors, one per axis, matching the gizmo's RGB. */
-const AXIS_COLOR: Record<SliceAxis, string> = {
-  sagittal: "#ff5252",
-  coronal: "#69f06e",
-  axial: "#40a0ff",
-};
-
 export function VolumePanel(props: { app: AppState; loader: Loader }) {
   const { app, loader } = props;
   const [selection] = useSelection();
@@ -40,11 +33,11 @@ export function VolumePanel(props: { app: AppState; loader: Loader }) {
   if (item === null || item.volumeId === null) {
     return null;
   }
-  return <VolumeWork key={item.volumeId} loader={loader} volumeId={item.volumeId} name={item.name} />;
+  return <VolumeWork key={item.volumeId} app={app} loader={loader} volumeId={item.volumeId} name={item.name} />;
 }
 
-function VolumeWork(props: { loader: Loader; volumeId: string; name: string }) {
-  const { loader, volumeId, name } = props;
+function VolumeWork(props: { app: AppState; loader: Loader; volumeId: string; name: string }) {
+  const { app, loader, volumeId, name } = props;
   const [payload, setPayload] = useState<VolumePayload | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -97,26 +90,57 @@ function VolumeWork(props: { loader: Loader; volumeId: string; name: string }) {
       </section>
     );
   }
-  return <VolumeTabs payload={payload} volumeId={volumeId} name={name} />;
+  return <VolumeTabs app={app} payload={payload} volumeId={volumeId} name={name} />;
 }
 
-/** The tabs share the slice positions and the window, so both stay linked. */
-function VolumeTabs(props: { payload: VolumePayload; volumeId: string; name: string }) {
-  const { payload, volumeId, name } = props;
+/** The tabs share the MPR state through the app, so the scene overlay stays linked too. */
+function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: string; name: string }) {
+  const { app, payload, volumeId, name } = props;
   const [tab, setTab] = useState<"volume" | "slices">("volume");
-  const [slices, setSlices] = useState<Record<SliceAxis, number>>(() => ({
-    axial: Math.floor((payload.slices - 1) / 2),
-    coronal: Math.floor((payload.rows - 1) / 2),
-    sagittal: Math.floor((payload.columns - 1) / 2),
-  }));
-  const [window, setWindow] = useState(0);
-  const [planesOn, setPlanesOn] = useState(true);
+  const mpr = useApp(app, (s) => s.volumeMpr);
+  useEffect(() => {
+    app.setVolumeMpr({
+      volumeId,
+      slices: {
+        axial: Math.floor((payload.slices - 1) / 2),
+        coronal: Math.floor((payload.rows - 1) / 2),
+        sagittal: Math.floor((payload.columns - 1) / 2),
+      },
+      window: 0,
+      inScene: true,
+    });
+    return () => {
+      if (app.getSnapshot().volumeMpr?.volumeId === volumeId) {
+        app.setVolumeMpr(null);
+      }
+    };
+  }, [app, payload, volumeId]);
   const display = useMemo(() => displayValues(payload.values, payload.pseudoHu), [payload]);
   const range = useMemo(() => dataRange(display), [display]);
-  const preset = WINDOW_PRESETS[window];
+  const live = mpr !== null && mpr.volumeId === volumeId ? mpr : null;
+  const preset = WINDOW_PRESETS[live?.window ?? 0];
   const resolve = (v: WindowValue, auto: number): number => (v === "auto" ? auto : v);
   const colorWindow = resolve(preset.window, range[1] - range[0]);
   const colorLevel = resolve(preset.level, (range[0] + range[1]) / 2);
+  const setSlices: React.Dispatch<React.SetStateAction<Record<SliceAxis, number>>> = (update) => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur === null || cur.volumeId !== volumeId) {
+      return;
+    }
+    app.setVolumeMpr({ ...cur, slices: typeof update === "function" ? update(cur.slices) : update });
+  };
+  const setWindowIdx = (i: number): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, window: i });
+    }
+  };
+  const setInScene = (on: boolean): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, inScene: on });
+    }
+  };
 
   return (
     <section className="panel" aria-label="Volume">
@@ -131,28 +155,35 @@ function VolumeTabs(props: { payload: VolumePayload; volumeId: string; name: str
         <button type="button" role="tab" aria-selected={tab === "slices"} data-action="volume-tab-slices" onClick={() => setTab("slices")}>
           Slices
         </button>
+        <label className="check" title="Show the slices in the main scene too">
+          <input
+            type="checkbox"
+            data-action="volume-scene"
+            checked={live?.inScene ?? true}
+            onChange={(e) => setInScene(e.currentTarget.checked)}
+          />
+          Scene
+        </label>
       </div>
-      {tab === "volume" ? (
+      {live === null ? null : tab === "volume" ? (
         <VolumeCanvas
           payload={payload}
           volumeId={volumeId}
           display={display}
           range={range}
-          slices={slices}
+          slices={live.slices}
           colorWindow={colorWindow}
           colorLevel={colorLevel}
-          planesOn={planesOn}
-          onPlanesOn={setPlanesOn}
         />
       ) : (
         <SliceWork
           payload={payload}
           volumeId={volumeId}
           display={display}
-          slices={slices}
+          slices={live.slices}
           setSlices={setSlices}
-          windowIdx={window}
-          setWindowIdx={setWindow}
+          windowIdx={live.window}
+          setWindowIdx={setWindowIdx}
           windowName={preset.name}
           colorWindow={colorWindow}
           colorLevel={colorLevel}
@@ -170,15 +201,14 @@ function VolumeCanvas(props: {
   slices: Record<SliceAxis, number>;
   colorWindow: number;
   colorLevel: number;
-  planesOn: boolean;
-  onPlanesOn: (on: boolean) => void;
 }) {
-  const { payload, volumeId, display, range, slices, colorWindow, colorLevel, planesOn, onPlanesOn } = props;
+  const { payload, volumeId, display, range, slices, colorWindow, colorLevel } = props;
   const divRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<VolumeView3D | null>(null);
   const [preset, setPreset] = useState(0);
   const [mip, setMip] = useState(false);
+  const [planesOn, setPlanesOn] = useState(true);
   const [failed, setFailed] = useState(false);
   const prepared = useMemo(() => normalizeVolume(display, range[0], range[1]), [display, range]);
 
@@ -237,12 +267,15 @@ function VolumeCanvas(props: {
       inspect.volume = { id: volumeId, preset: VOLUME_PRESETS[preset].name, mip, planes: 0, ready: true };
       return;
     }
-    const image = (axis: SliceAxis) => {
-      const slice = extractSlice(display, payload.columns, payload.rows, payload.slices, axis, slices[axis]);
-      const count = axis === "axial" ? payload.slices : axis === "coronal" ? payload.rows : payload.columns;
-      return { data: windowToGray(slice.data, colorWindow, colorLevel), width: slice.width, height: slice.height, index: slices[axis], count };
-    };
-    view.setPlanes({ axial: image("axial"), coronal: image("coronal"), sagittal: image("sagittal") });
+    view.setPlanes(
+      slicePlaneImages(
+        display,
+        { columns: payload.columns, rows: payload.rows, slices: payload.slices },
+        slices,
+        colorWindow,
+        colorLevel,
+      ),
+    );
     inspect.volume = { id: volumeId, preset: VOLUME_PRESETS[preset].name, mip, planes: 3, ready: true };
   }, [slices, colorWindow, colorLevel, planesOn, display, payload, preset, mip, volumeId]);
 
@@ -273,7 +306,7 @@ function VolumeCanvas(props: {
             type="checkbox"
             data-action="volume-planes"
             checked={planesOn}
-            onChange={(e) => onPlanesOn(e.currentTarget.checked)}
+            onChange={(e) => setPlanesOn(e.currentTarget.checked)}
           />
           Planes
         </label>

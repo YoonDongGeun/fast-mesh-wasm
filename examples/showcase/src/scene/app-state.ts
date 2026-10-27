@@ -9,6 +9,7 @@ import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
+import type { SliceAxis } from "../panels/volume-slice";
 import type { SculptBrush } from "../viewport/sculpt";
 import {
   createGroup,
@@ -74,6 +75,14 @@ export interface BrushPick {
   point: Vec3 | null;
 }
 
+/** The linked MPR state: slice positions, window preset, scene overlay. */
+export interface VolumeMpr {
+  volumeId: string;
+  slices: Record<SliceAxis, number>;
+  window: number;
+  inScene: boolean;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -105,6 +114,8 @@ export interface AppSnapshot {
    * it), the Join sources after it.
    */
   multi: readonly MeshHandle[];
+  /** The linked MPR state for the selected volume, if any panel shows it. */
+  volumeMpr: VolumeMpr | null;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -125,6 +136,7 @@ export class AppState {
     edgeSoftness: 0,
     wireframe: false,
     multi: [],
+    volumeMpr: null,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -311,6 +323,11 @@ export class AppState {
   /** Sets the shift-clicked meshes, primary first (see `selectMesh`). */
   setMulti(multi: readonly MeshHandle[]): void {
     this.#set({ multi });
+  }
+
+  /** Sets or clears (`null`) the linked MPR state. */
+  setVolumeMpr(mpr: VolumeMpr | null): void {
+    this.#set({ volumeMpr: mpr });
   }
 
   /** Whether a stroke's end remeshes its region. */
