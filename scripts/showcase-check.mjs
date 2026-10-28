@@ -82,7 +82,8 @@
 // - volume-planes: the Planes checkbox hides and shows the slice planes.
 // - volume-slices: the Slices tab renders axial/coronal/sagittal views.
 // - volume-overlay: the floating viewport toolbar steers the same preset,
-//   tab and Scene switch, and hides for a mesh without a volume.
+//   tab and Scene switch (the main scene's volume follows the preset),
+//   and hides for a mesh without a volume.
 // - volume-slice-move: the axial slider and the window preset move the
 //   slice views.
 // - volume-navigate: clicking the axial view moves the coronal and
@@ -1049,6 +1050,7 @@ try {
     return true;
   })()`);
   const overlayBone = await waitFor(`__showcase.volume().preset === "Bone" ? true : null`, 20_000);
+  const overlaySceneBone = await waitFor(`__showcase.sceneVolume().preset === "Bone" ? true : null`, 20_000);
   await page(`(() => {
     const sel = document.querySelector('[data-action="overlay-volume-preset"]');
     sel.value = "2";
@@ -1056,6 +1058,7 @@ try {
     return true;
   })()`);
   const overlayVessels = await waitFor(`__showcase.volume().preset === "Vessels" ? true : null`, 20_000);
+  const overlaySceneVessels = await waitFor(`__showcase.sceneVolume().preset === "Vessels" ? true : null`, 20_000);
   await clickOn('[data-action="overlay-volume-scene"]');
   const overlaySceneOff = await waitFor(`__showcase.sceneSlices().shown === 0 ? true : null`, 20_000);
   await clickOn('[data-action="overlay-volume-scene"]');
@@ -1072,6 +1075,7 @@ try {
     `document.querySelector('[data-action="overlay-volume-tab-slices"]') === null ? true : null`,
     20_000,
   );
+  const overlaySceneHidden = await waitFor(`__showcase.sceneVolume().id === null ? true : null`, 20_000);
   if (vessel !== undefined) {
     await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
   }
@@ -1082,6 +1086,10 @@ try {
           `__showcase.mpr()?.volumeId === ${JSON.stringify(vessel.volumeId)} && document.querySelector('[data-action="overlay-volume-tab-slices"]') !== null ? true : null`,
           20_000,
         );
+  const overlaySceneRestored =
+    vessel === undefined
+      ? undefined
+      : await waitFor(`__showcase.sceneVolume().id === ${JSON.stringify(vessel.volumeId)} ? true : null`, 20_000);
   await clickOn('[data-action="volume-tab-slices"]');
   const slicesAgain = await waitFor(`__showcase.slices().ready ? true : null`, 60_000);
   verdict(
@@ -1091,13 +1099,17 @@ try {
       overlay3d === "true" &&
       overlayBone === true &&
       overlayVessels === true &&
+      overlaySceneBone === true &&
+      overlaySceneVessels === true &&
       overlaySceneOff === true &&
       overlaySceneOn === true &&
       overlayBack === true &&
       overlayHidden === true &&
+      overlaySceneHidden === true &&
       overlayRestored === true &&
+      overlaySceneRestored === true &&
       slicesAgain === true,
-    `shown=${overlayShown} tab3d=${overlay3d} bone=${overlayBone} vessels=${overlayVessels} scene=${overlaySceneOff}/${overlaySceneOn} back=${overlayBack} hidden=${overlayHidden} restored=${overlayRestored} slices=${slicesAgain}`,
+    `shown=${overlayShown} tab3d=${overlay3d} bone=${overlayBone}/${overlaySceneBone} vessels=${overlayVessels}/${overlaySceneVessels} scene=${overlaySceneOff}/${overlaySceneOn} back=${overlayBack} hidden=${overlayHidden}/${overlaySceneHidden} restored=${overlayRestored}/${overlaySceneRestored} slices=${slicesAgain}`,
   );
 
   // ---- volume-slice-move: the slider and window preset steer the views ----
