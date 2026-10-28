@@ -788,7 +788,8 @@ try {
     `(() => { const c = __showcase.collision(); const g = __showcase.group(); return c.mode === "group" && (${extra}) && { c, g }; })()`;
   const pairOf = (x, y) => `g.readouts?.pairs.find((p) => p.a === ${q(x)} && p.b === ${q(y)})`;
   await clickOn("[data-mode=group]");
-  // Members are A and B (the boot vessel left): tick C.
+  // Members are A and B (the boot head left): tick C.
+  await waitFor(`document.querySelector('[data-group-member=${JSON.stringify(C)}]') !== null`, 10_000);
   await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
   const grouped = await waitFor(
     groupState(`g.members.length === 3 && g.pairs === "all" && ${to(A, [B, C])} && ${to(B, [A, C])} && ${to(C, [A, B])}
@@ -1194,11 +1195,6 @@ try {
     60_000,
   );
   await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
-  const localBoot = await hook(`items().find((m) => m.name.includes("headsq"))?.name ?? null`);
-  if (localBoot !== null) {
-    await clickOn(`[data-mesh=${JSON.stringify(localBoot)}] button.danger`);
-    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localBoot)})`, 10_000);
-  }
   await pick("a", A);
   await pick("b", B);
   const localHeat = await waitFor(
@@ -1207,10 +1203,35 @@ try {
     30_000,
   );
   await clickOn("[data-mode=group]");
-  await page(`document.querySelector('[data-group-member=${JSON.stringify(C)}]').click()`);
+  // Members are A and B plus maybe the boot head (it can arrive late):
+  // untick the head and tick C atomically, so a late head finds the
+  // members full and stays out.
+  await waitFor(`document.querySelector('[data-group-member=${JSON.stringify(C)}]') !== null`, 10_000);
+  await page(`(() => {
+    const box = (match) => [...document.querySelectorAll("[data-group-member]")].find((e) =>
+      (e.getAttribute("data-group-member") ?? "").includes(match),
+    );
+    const head = box("headsq");
+    if (head !== undefined && head.checked) {
+      head.click();
+    }
+    const c = box(${q(C)});
+    if (c !== undefined && !c.checked) {
+      c.click();
+    }
+    return true;
+  })()`);
+  // Members locked: drop the boot head if it is here, to lighten software
+  // rendering while the group settles (a later head finds members full).
+  const localBoot = await hook(`items().find((m) => m.name.includes("headsq"))?.name ?? null`);
+  if (localBoot !== null) {
+    await clickOn(`[data-mesh=${JSON.stringify(localBoot)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localBoot)})`, 10_000);
+  }
   const localGroup = await waitFor(
     groupState(`${to(A, [B, C])} && g.settled && g.readouts?.pairs.length === 3 && ${pairOf(A, B)}?.depth > 0`),
-    30_000,
+    // Local mode shares the main thread (and CI draws it in software): settling takes a while.
+    90_000,
   );
   await clickOn("[data-mode=pair]");
   await clickOn(`[data-mesh="${C}"] .mesh-name`);
