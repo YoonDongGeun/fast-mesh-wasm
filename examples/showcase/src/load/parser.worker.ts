@@ -21,9 +21,14 @@ function post(reply: LoaderReply): void {
   self.postMessage(reply, { transfer });
 }
 
-function loaded(name: string, data: MeshData, volumeId: string | null = null): LoadedMesh {
+function loaded(
+  name: string,
+  data: MeshData,
+  volumeId: string | null = null,
+  preset: string | null = null,
+): LoadedMesh {
   const { center, radius } = bounds(data.positions);
-  return { name, positions: data.positions, indices: data.indices, center, radius, volumeId };
+  return { name, positions: data.positions, indices: data.indices, center, radius, volumeId, preset };
 }
 
 /** Source volumes by series id, served to the volume view on demand. */
@@ -79,13 +84,13 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
     }
     if (req.kind === "sample") {
       post({ kind: "parsing", id: req.id });
-      const { slices, iso } = await loadSample(req.sample, import.meta.env.BASE_URL);
+      const { slices, iso, preset } = await loadSample(req.sample, import.meta.env.BASE_URL);
       post({
         kind: "meshes",
         id: req.id,
         meshes: meshSlices(slices, iso).map((m) => {
           retain(m.volume, false);
-          return loaded(m.name, m.data, m.seriesUid);
+          return loaded(m.name, m.data, m.seriesUid, preset);
         }),
       });
       return;

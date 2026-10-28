@@ -87,16 +87,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     [loader, focusOn],
   );
 
-  // ---- Boot: the vessel tree, selected and framed ----
+  // ---- Boot: the CT head, selected and framed ----
   // Once per page (StrictMode runs effects twice in development): the
-  // medical landing view. Everything else loads from its button.
+  // medical landing view (the sample suggests its Vessels preset).
+  // Everything else loads from its button.
   const booted = useRef(false);
   useEffect(() => {
     if (booted.current) {
       return;
     }
     booted.current = true;
-    void loader.loadDicomDemo("vessels").then((added) => {
+    void loader.loadSample("headsq").then((added) => {
       const last = added.at(-1);
       if (last === undefined || last.volumeId === null) {
         return;

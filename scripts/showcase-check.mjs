@@ -14,10 +14,10 @@
 // Checks (each prints PASS or FAIL; the exit code is 1 on any FAIL):
 // - page: cross-origin isolated, and the Worker scene runs threaded
 //   (threads > 1, or exactly --threads).
-// - boot: the vessel tree loads, selected, its volume linked into the MPR
-//   state and the scene overlay.
+// - boot: the CT head loads, selected, its Vessels volume linked into the
+//   MPR state and the scene overlay.
 // - demo: the demo button loads A, B and C, listed and drawn; the scene is
-//   idle. (The boot vessel is removed after, for a pristine A/B/C stage.)
+//   idle. (The boot head is removed after, for a pristine A/B/C stage.)
 // - glsl: bindMesh's fragment shading run on the GPU (a float render target,
 //   read back) for constant quads at a contact heatmap's knots, range ends,
 //   +-tolerance, far, -far, NaN and random values, and for built-in maps with
@@ -74,8 +74,8 @@
 //   meshes its isosurface (Otsu's threshold), listed and drawn.
 // - dicom-demo: the Vessel tree phantom button meshes through the same
 //   pipeline, listed and drawn.
-// - sample: the bundled headsq + LIDC2 CT buttons mesh through the same
-//   pipeline, listed and drawn.
+// - sample: the bundled LIDC2 chest CT button meshes through the same
+//   pipeline, listed and drawn (boot covers the headsq button).
 // - volume: selecting the phantom's mesh renders its source volume,
 //   with a canvas, the Bone preset, and the 3 slice planes.
 // - volume-preset: the Vessels preset plus MIP switch the rendering.
@@ -435,11 +435,12 @@ try {
   const threadsOk = threads === undefined ? info.threads > 1 : info.threads === threads;
   verdict("page", info.isolated && info.mode === "worker" && threadsOk, `crossOriginIsolated ${info.isolated}, ${info.mode} scene, threads ${info.threads}`);
 
-  // ---- boot: the vessel tree, selected, its volume linked ----
+  // ---- boot: the CT head, selected, its Vessels volume linked ----
   const boot = await waitFor(
-    `(() => { const v = __showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn);
-      return v !== undefined && __showcase.mpr()?.volumeId === v.volumeId && __showcase.sceneSlices().shown === 3 && v; })()`,
-    60_000,
+    `(() => { const v = __showcase.items().find((m) => m.name.includes("headsq") && m.drawn);
+      return v !== undefined && __showcase.mpr()?.volumeId === v.volumeId && __showcase.sceneSlices().shown === 3 &&
+        __showcase.volume().preset === "Vessels" && v; })()`,
+    90_000,
   );
   verdict(
     "boot",
@@ -462,7 +463,7 @@ try {
   );
 
   // Pristine A/B/C stage: select A through the list, remove the boot
-  // vessel, and restore the default camera (boot framed the vessel).
+  // head, and restore the default camera (boot framed the head).
   await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
   if (boot !== undefined) {
     await clickOn(`[data-mesh=${JSON.stringify(boot.name)}] button.danger`);
@@ -961,12 +962,7 @@ try {
     vessel === undefined ? `items ${JSON.stringify(await hook("items()"))}` : `${vessel.name} (${vessel.triangles})`,
   );
 
-  // ---- sample: the bundled headsq + LIDC2 CTs mesh ----
-  await clickOn("[data-action=sample-headsq]");
-  const head = await waitFor(
-    `__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`,
-    90_000,
-  );
+  // ---- sample: the bundled LIDC2 chest CT meshes (boot covers headsq) ----
   await clickOn("[data-action=sample-lidc2]");
   const chest = await waitFor(
     `__showcase.items().find((m) => m.name.includes("LIDC2") && m.drawn)`,
@@ -974,8 +970,8 @@ try {
   );
   verdict(
     "sample",
-    head !== undefined && head.triangles > 100_000 && chest !== undefined && chest.triangles > 100_000,
-    `head ${head === undefined ? "missing" : head.triangles} / chest ${chest === undefined ? "missing" : chest.triangles}`,
+    chest !== undefined && chest.triangles > 100_000,
+    `chest ${chest === undefined ? "missing" : chest.triangles}`,
   );
 
   // ---- volume: the phantom's source volume renders on selection ----
@@ -1111,23 +1107,23 @@ try {
   );
 
   // ---- volume-source: the source picker switches the viewed volume ----
-  const headItem = await hook(`items().find((m) => m.name.includes("headsq"))`);
-  if (headItem !== undefined) {
+  const chestItem = await hook(`items().find((m) => m.name.includes("LIDC2"))`);
+  if (chestItem !== undefined) {
     await page(`(() => {
       const sel = document.querySelector('[data-action="volume-source"]');
-      sel.value = ${JSON.stringify(headItem.volumeId)};
+      sel.value = ${JSON.stringify(chestItem.volumeId)};
       sel.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     })()`);
   }
   const switched =
-    headItem === undefined
+    chestItem === undefined
       ? undefined
-      : await waitFor(`__showcase.mpr()?.volumeId === ${JSON.stringify(headItem.volumeId)} ? __showcase.mpr() : null`, 20_000);
+      : await waitFor(`__showcase.mpr()?.volumeId === ${JSON.stringify(chestItem.volumeId)} ? __showcase.mpr() : null`, 20_000);
   const overlayFollows =
-    headItem === undefined
+    chestItem === undefined
       ? undefined
-      : await waitFor(`__showcase.sceneSlices().id === ${JSON.stringify(headItem.volumeId)}`, 20_000);
+      : await waitFor(`__showcase.sceneSlices().id === ${JSON.stringify(chestItem.volumeId)}`, 20_000);
   verdict(
     "volume-source",
     switched !== undefined && overlayFollows !== undefined,
@@ -1198,10 +1194,10 @@ try {
     60_000,
   );
   await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
-  const localVessel = await hook(`items().find((m) => m.name.startsWith("Vessel tree"))?.name ?? null`);
-  if (localVessel !== null) {
-    await clickOn(`[data-mesh=${JSON.stringify(localVessel)}] button.danger`);
-    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localVessel)})`, 10_000);
+  const localBoot = await hook(`items().find((m) => m.name.includes("headsq"))?.name ?? null`);
+  if (localBoot !== null) {
+    await clickOn(`[data-mesh=${JSON.stringify(localBoot)}] button.danger`);
+    await waitFor(`!__showcase.items().some((m) => m.name === ${JSON.stringify(localBoot)})`, 10_000);
   }
   await pick("a", A);
   await pick("b", B);

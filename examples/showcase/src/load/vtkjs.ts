@@ -205,8 +205,9 @@ export function alignVolume(
 }
 
 /**
- * A sample's HU mapping, series identity and mesh isosurface (the
- * descriptor's extras; a null iso takes Otsu's threshold).
+ * A sample's HU mapping, series identity, mesh isosurface and suggested
+ * volume preset (the descriptor's extras; a null iso takes Otsu's
+ * threshold, a missing preset takes Bone).
  */
 export interface SampleMeta {
   slope: number;
@@ -214,9 +215,10 @@ export interface SampleMeta {
   seriesUid: string;
   description: string;
   iso: number | null;
+  preset: string | null;
 }
 
-/** Reads a sample descriptor's HU mapping, series identity and iso. */
+/** Reads a sample descriptor's HU mapping, series identity, iso and preset. */
 export function parseSampleMeta(descriptor: unknown): SampleMeta {
   if (typeof descriptor !== "object" || descriptor === null) fail();
   const d = descriptor as Record<string, unknown>;
@@ -224,12 +226,14 @@ export function parseSampleMeta(descriptor: unknown): SampleMeta {
   if (typeof hu?.slope !== "number" || typeof hu?.intercept !== "number") fail();
   if (typeof d["seriesUid"] !== "string" || typeof d["description"] !== "string") fail();
   if (d["iso"] !== null && typeof d["iso"] !== "number") fail();
+  if (d["preset"] !== undefined && d["preset"] !== null && typeof d["preset"] !== "string") fail();
   return {
     slope: hu!.slope as number,
     intercept: hu!.intercept as number,
     seriesUid: d["seriesUid"] as string,
     description: d["description"] as string,
     iso: d["iso"] as number | null,
+    preset: (d["preset"] as string | null | undefined) ?? null,
   };
 }
 
@@ -243,10 +247,11 @@ async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** A loaded sample: its axial slices and the iso to mesh (null: Otsu's). */
+/** A loaded sample: its axial slices, the iso to mesh (null: Otsu's) and its suggested preset. */
 export interface LoadedSample {
   slices: DicomSlice[];
   iso: number | null;
+  preset: string | null;
 }
 
 /**
@@ -279,6 +284,7 @@ export async function loadSample(
   return {
     slices: volumeToSlices(aligned.values, aligned.dims, aligned.spacing, aligned.origin, meta),
     iso: meta.iso,
+    preset: meta.preset,
   };
 }
 
