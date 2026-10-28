@@ -15,7 +15,7 @@
 // - page: cross-origin isolated, and the Worker scene runs threaded
 //   (threads > 1, or exactly --threads).
 // - boot: the CT head loads, selected, its Vessels volume linked into the
-//   MPR state and the scene overlay.
+//   MPR state and the scene overlay, its surface hidden for the volume.
 // - demo: the demo button loads A, B and C, listed and drawn; the scene is
 //   idle. (The boot head is removed after, for a pristine A/B/C stage.)
 // - glsl: bindMesh's fragment shading run on the GPU (a float render target,
@@ -88,12 +88,14 @@
 //   slice views.
 // - volume-navigate: clicking the axial view moves the coronal and
 //   sagittal slices there.
-// - volume-scene: the slices float in the main scene as a cutaway; the
-//   Scene checkbox hides and shows them.
+// - volume-scene: the volume and its slices float in the main scene (the
+//   mesh surface hides); the Scene checkbox hides and shows them.
 // - scene-drag: dragging an axial corner ball in the scene moves the
 //   slice, and the Slices tab follows.
 // - volume-source: the source picker switches the viewed volume, and the
 //   scene overlay follows.
+// - deselect: a tap on empty canvas clears the selection, and the scene
+//   volume's mesh surface comes back.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -438,11 +440,11 @@ try {
   const threadsOk = threads === undefined ? info.threads > 1 : info.threads === threads;
   verdict("page", info.isolated && info.mode === "worker" && threadsOk, `crossOriginIsolated ${info.isolated}, ${info.mode} scene, threads ${info.threads}`);
 
-  // ---- boot: the CT head, selected, its Vessels volume linked ----
+  // ---- boot: the CT head, selected, its Vessels volume linked, its surface hidden ----
   const boot = await waitFor(
     `(() => { const v = __showcase.items().find((m) => m.name.includes("headsq") && m.drawn);
       return v !== undefined && __showcase.mpr()?.volumeId === v.volumeId && __showcase.sceneSlices().shown === 3 &&
-        __showcase.volume().preset === "Vessels" && v; })()`,
+        __showcase.sceneVolume().preset === "Vessels" && __showcase.volume().preset === "Vessels" && v.visible === false && v; })()`,
     90_000,
   );
   verdict(
@@ -987,10 +989,19 @@ try {
     60_000,
   );
   const volCanvas = await page(`document.querySelector("[data-volume] canvas") !== null`);
+  const volMeshHidden =
+    vessel === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(vessel.name)})?.visible === false ? true : null`,
+          20_000,
+        );
   verdict(
     "volume",
-    vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true,
-    vol === undefined ? "never ready" : `${vol.preset} canvas=${volCanvas} planes=${vol.planes}`,
+    vol !== undefined && vol.preset === "Bone" && vol.mip === false && volCanvas === true && volMeshHidden === true,
+    vol === undefined
+      ? "never ready"
+      : `${vol.preset} canvas=${volCanvas} planes=${vol.planes} meshHidden=${volMeshHidden === true}`,
   );
 
   // ---- volume-preset: Vessels + MIP ----
@@ -1155,16 +1166,34 @@ try {
       : `axial=${nav.axial} sagittal=${nav.sagittal} coronal=${nav.coronal}`,
   );
 
-  // ---- volume-scene: the slices float in the main scene as a cutaway ----
+  // ---- volume-scene: the volume and its slices float in the main scene ----
   const inScene = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
   await clickOn('[data-action="volume-scene"]');
   const sceneOff = await waitFor(`__showcase.sceneSlices().shown === 0 ? __showcase.sceneSlices() : null`, 20_000);
+  const sceneMeshBack =
+    vessel === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(vessel.name)})?.visible === true ? true : null`,
+          20_000,
+        );
   await clickOn('[data-action="volume-scene"]');
   const sceneOn = await waitFor(`__showcase.sceneSlices().shown === 3 ? __showcase.sceneSlices() : null`, 20_000);
+  const sceneMeshHidden =
+    vessel === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(vessel.name)})?.visible === false ? true : null`,
+          20_000,
+        );
   verdict(
     "volume-scene",
-    inScene !== undefined && sceneOff !== undefined && sceneOn !== undefined,
-    `show=${inScene !== undefined} off=${sceneOff !== undefined} on=${sceneOn !== undefined}`,
+    inScene !== undefined &&
+      sceneOff !== undefined &&
+      sceneOn !== undefined &&
+      sceneMeshBack === true &&
+      sceneMeshHidden === true,
+    `show=${inScene !== undefined} off=${sceneOff !== undefined} on=${sceneOn !== undefined} meshBack=${sceneMeshBack === true} meshHidden=${sceneMeshHidden === true}`,
   );
 
   // ---- scene-drag: an axial corner ball drags the slice through the stack ----
@@ -1212,6 +1241,41 @@ try {
     "volume-source",
     switched !== undefined && overlayFollows !== undefined,
     `mpr=${switched?.volumeId} overlay=${overlayFollows !== undefined}`,
+  );
+
+  // ---- deselect: a tap on empty space clears the selection ----
+  // The chest is selected (its surface hides for the scene volume):
+  // tapping where no mesh is brings the surface back. A few canvas
+  // spots, until one misses (a wrong tap just selects a mesh).
+  const viewBox = await page(`(() => {
+    const r = document.querySelector("main canvas").getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  })()`);
+  const taps = [
+    [viewBox.x + viewBox.width - 25, viewBox.y + viewBox.height * 0.55],
+    [viewBox.x + viewBox.width / 2, viewBox.y + viewBox.height - 25],
+    [viewBox.x + viewBox.width / 2, viewBox.y + 70],
+    [viewBox.x + viewBox.width - 25, viewBox.y + viewBox.height - 25],
+  ];
+  let deselected = await hook(`selected() === null`);
+  for (const [tx, ty] of taps) {
+    if (deselected === true) {
+      break;
+    }
+    await click(tx, ty);
+    deselected = await waitFor(`__showcase.selected() === null ? true : null`, 5_000);
+  }
+  const chestBack =
+    chestItem === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(chestItem.name)})?.visible === true ? true : null`,
+          20_000,
+        );
+  verdict(
+    "deselect",
+    deselected === true && chestBack === true,
+    `selected=null:${deselected === true} chest mesh back:${chestBack === true}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
