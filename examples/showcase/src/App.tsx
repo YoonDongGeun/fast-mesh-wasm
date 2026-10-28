@@ -15,6 +15,7 @@ import { StatusBar } from "./panels/StatusBar";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
+import { VolumeOverlay } from "./viewport/VolumeOverlay";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
 /** The engine behind the store, for the status bar. */
@@ -262,6 +263,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         />
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
+        <VolumeOverlay app={app} />
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">

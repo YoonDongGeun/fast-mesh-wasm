@@ -77,12 +77,18 @@ export interface BrushPick {
   point: Vec3 | null;
 }
 
-/** The linked MPR state: slice positions, window preset, scene overlay. */
+/**
+ * The linked volume-view state: slice positions, window preset, scene
+ * overlay, 3D preset, shown tab. The panel and the viewport overlay
+ * steer the same state.
+ */
 export interface VolumeMpr {
   volumeId: string;
   slices: Record<SliceAxis, number>;
   window: number;
   inScene: boolean;
+  preset: number;
+  tab: "volume" | "slices";
 }
 
 export interface AppSnapshot {

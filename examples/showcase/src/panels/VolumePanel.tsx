@@ -115,8 +115,20 @@ function VolumeTabs(props: {
   initialPreset: number;
 }) {
   const { app, payload, volumeId, name, initialPreset } = props;
-  const [tab, setTab] = useState<"volume" | "slices">("volume");
   const mpr = useApp(app, (s) => s.volumeMpr);
+  const tab = mpr !== null && mpr.volumeId === volumeId ? mpr.tab : "volume";
+  const setTab = (t: "volume" | "slices"): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, tab: t });
+    }
+  };
+  const setPresetIdx = (i: number): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, preset: i });
+    }
+  };
   const [selection, select] = useSelection();
   const sources = useApp(app, (s) => s.items).filter((i) => i.volumeId !== null);
   const tabsRef = useRef<HTMLDivElement>(null);
@@ -152,13 +164,15 @@ function VolumeTabs(props: {
       },
       window: 0,
       inScene: true,
+      preset: initialPreset,
+      tab: "volume",
     });
     return () => {
       if (app.getSnapshot().volumeMpr?.volumeId === volumeId) {
         app.setVolumeMpr(null);
       }
     };
-  }, [app, payload, volumeId]);
+  }, [app, payload, volumeId, initialPreset]);
   const display = useMemo(() => displayValues(payload.values, payload.pseudoHu), [payload]);
   const range = useMemo(() => dataRange(display), [display]);
   const live = mpr !== null && mpr.volumeId === volumeId ? mpr : null;
@@ -237,7 +251,8 @@ function VolumeTabs(props: {
           slices={live.slices}
           colorWindow={colorWindow}
           colorLevel={colorLevel}
-          initialPreset={initialPreset}
+          preset={live.preset}
+          setPreset={setPresetIdx}
         />
       ) : (
         <SliceWork
@@ -265,13 +280,13 @@ function VolumeCanvas(props: {
   slices: Record<SliceAxis, number>;
   colorWindow: number;
   colorLevel: number;
-  initialPreset: number;
+  preset: number;
+  setPreset: (i: number) => void;
 }) {
-  const { payload, volumeId, display, range, slices, colorWindow, colorLevel, initialPreset } = props;
+  const { payload, volumeId, display, range, slices, colorWindow, colorLevel, preset, setPreset } = props;
   const divRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<VolumeView3D | null>(null);
-  const [preset, setPreset] = useState(initialPreset);
   const [mip, setMip] = useState(false);
   const [planesOn, setPlanesOn] = useState(true);
   const [failed, setFailed] = useState(false);

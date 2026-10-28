@@ -469,6 +469,21 @@ input[type="range"] {
   border-radius: var(--radius);
   background: rgba(21, 23, 27, 0.8);
 }
+.volume-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  background: rgba(21, 23, 27, 0.8);
+}
+.volume-overlay .group {
+  display: flex;
+  gap: 4px;
+}
 .toolbox {
   position: absolute;
   top: 64px;

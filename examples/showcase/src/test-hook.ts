@@ -181,10 +181,19 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     slices: () => ({ ...inspect.slices }),
     /** The scene overlay: the series whose slices float in the main scene, and how many show. */
     sceneSlices: () => ({ ...inspect.sceneSlices }),
-    /** The linked MPR state: the series, the slice indices, the window preset, and the scene overlay. */
+    /** The linked volume-view state: the series, slices, window, overlay, 3D preset and tab. */
     mpr: () => {
       const m = app.getSnapshot().volumeMpr;
-      return m === null ? null : { volumeId: m.volumeId, slices: { ...m.slices }, window: m.window, inScene: m.inScene };
+      return m === null
+        ? null
+        : {
+            volumeId: m.volumeId,
+            slices: { ...m.slices },
+            window: m.window,
+            inScene: m.inScene,
+            preset: m.preset,
+            tab: m.tab,
+          };
     },
     /**
      * The scene quads' first corner handles on the page (CSS pixels), each
