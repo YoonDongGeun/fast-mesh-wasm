@@ -23,6 +23,7 @@ import { inspect } from "../panels/inspect";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 import { SceneSlices } from "./SceneSlices";
+import { SceneVolume } from "./SceneVolume";
 import {
   type SculptBrush,
   SculptStroke,
@@ -147,6 +148,7 @@ export function Viewport(props: {
       ) : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
       <SceneSlices app={app} loader={loader} scene={scene} />
+      <SceneVolume app={app} loader={loader} scene={scene} />
     </Canvas>
   );
 }

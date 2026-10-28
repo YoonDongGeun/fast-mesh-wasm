@@ -25,6 +25,7 @@ import {
 } from "../panels/volume-slice";
 import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "./slice-drag";
 import { view } from "./view";
+import { matchVolume } from "./volume-box";
 
 const AXES: SliceAxis[] = ["axial", "coronal", "sagittal"];
 
@@ -251,11 +252,11 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
   const gl = useThree((s) => s.gl);
   const quads = useMemo(() => new SceneSliceQuads(), []);
   const [payload, setPayload] = useState<VolumePayload | null>(null);
-  const item: Item | null = items.find((i) => i.mesh === selection) ?? null;
+  const found = matchVolume(items, selection, mpr);
+  const item: Item | null = found?.item ?? null;
   const mesh: MeshHandle | null = item?.mesh ?? null;
-  const active =
-    item !== null && item.volumeId !== null && mpr !== null && mpr.volumeId === item.volumeId && mpr.inScene;
-  const volumeId = active && item !== null ? item.volumeId : null;
+  const active = found !== null && found.mpr.inScene;
+  const volumeId = active && found !== null ? found.volumeId : null;
 
   useEffect(() => {
     gl.localClippingEnabled = true;

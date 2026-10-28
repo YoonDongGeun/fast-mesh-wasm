@@ -4,18 +4,18 @@
 import { useSelection } from "fast-mesh-wasm/react";
 import { VOLUME_PRESETS } from "../panels/volume-presets";
 import { type AppState, useApp } from "../scene/app-state";
+import { matchVolume } from "./volume-box";
 
 export function VolumeOverlay(props: { app: AppState }) {
   const { app } = props;
   const [selection] = useSelection();
   const items = useApp(app, (s) => s.items);
   const mpr = useApp(app, (s) => s.volumeMpr);
-  const item = items.find((i) => i.mesh === selection) ?? null;
-  const live = item !== null && mpr !== null && mpr.volumeId === item.volumeId ? mpr : null;
-  if (item === null || item.volumeId === null || live === null) {
+  const found = matchVolume(items, selection, mpr);
+  if (found === null) {
     return null;
   }
-  const volumeId = item.volumeId;
+  const { volumeId, mpr: live } = found;
   const set = (patch: { preset?: number; tab?: "volume" | "slices"; inScene?: boolean }): void => {
     const cur = app.getSnapshot().volumeMpr;
     if (cur !== null && cur.volumeId === volumeId) {

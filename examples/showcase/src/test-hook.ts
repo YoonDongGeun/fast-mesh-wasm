@@ -181,6 +181,8 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     slices: () => ({ ...inspect.slices }),
     /** The scene overlay: the series whose slices float in the main scene, and how many show. */
     sceneSlices: () => ({ ...inspect.sceneSlices }),
+    /** The scene's volume rendering: the series raymarched in the main scene, and its 3D preset. */
+    sceneVolume: () => ({ ...inspect.sceneVolume }),
     /** The linked volume-view state: the series, slices, window, overlay, 3D preset and tab. */
     mpr: () => {
       const m = app.getSnapshot().volumeMpr;
