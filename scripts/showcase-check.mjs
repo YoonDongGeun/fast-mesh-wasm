@@ -81,6 +81,8 @@
 // - volume-preset: the Vessels preset plus MIP switch the rendering.
 // - volume-planes: the Planes checkbox hides and shows the slice planes.
 // - volume-slices: the Slices tab renders axial/coronal/sagittal views.
+// - volume-overlay: the floating viewport toolbar steers the same preset,
+//   tab and Scene switch, and hides for a mesh without a volume.
 // - volume-slice-move: the axial slider and the window preset move the
 //   slice views.
 // - volume-navigate: clicking the axial view moves the coronal and
@@ -1027,6 +1029,75 @@ try {
     "volume-slices",
     slices !== undefined && sliceCanvases === 3,
     slices === undefined ? "never ready" : `canvases=${sliceCanvases} axial=${slices.axial}`,
+  );
+
+  // ---- volume-overlay: the floating toolbar steers the shared MPR state ----
+  // The vessel stays selected with its slices showing: the overlay offers
+  // the same preset, tab and Scene switch as the panel.
+  const overlayShown = await page(
+    `document.querySelector('[data-action="overlay-volume-tab-slices"]')?.getAttribute("aria-selected") ?? null`,
+  );
+  await clickOn('[data-action="overlay-volume-tab-3d"]');
+  const overlay3d = await waitFor(
+    `__showcase.mpr()?.tab === "volume" ? document.querySelector('[data-action="volume-tab-3d"]').getAttribute("aria-selected") : null`,
+    20_000,
+  );
+  await page(`(() => {
+    const sel = document.querySelector('[data-action="overlay-volume-preset"]');
+    sel.value = "0";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  const overlayBone = await waitFor(`__showcase.volume().preset === "Bone" ? true : null`, 20_000);
+  await page(`(() => {
+    const sel = document.querySelector('[data-action="overlay-volume-preset"]');
+    sel.value = "2";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  })()`);
+  const overlayVessels = await waitFor(`__showcase.volume().preset === "Vessels" ? true : null`, 20_000);
+  await clickOn('[data-action="overlay-volume-scene"]');
+  const overlaySceneOff = await waitFor(`__showcase.sceneSlices().shown === 0 ? true : null`, 20_000);
+  await clickOn('[data-action="overlay-volume-scene"]');
+  const overlaySceneOn = await waitFor(`__showcase.sceneSlices().shown === 3 ? true : null`, 20_000);
+  await clickOn('[data-action="overlay-volume-tab-slices"]');
+  const overlayBack = await waitFor(
+    `__showcase.mpr()?.tab === "slices" && __showcase.slices().ready ? true : null`,
+    60_000,
+  );
+  // The overlay only shows for a volume mesh: mesh A hides it, and
+  // reselecting the vessel brings it back (remounted on the 3D tab).
+  await clickOn(`[data-mesh=${JSON.stringify(A)}] .mesh-name`);
+  const overlayHidden = await waitFor(
+    `document.querySelector('[data-action="overlay-volume-tab-slices"]') === null ? true : null`,
+    20_000,
+  );
+  if (vessel !== undefined) {
+    await clickOn(`[data-mesh="${vessel.name}"] .mesh-name`);
+  }
+  const overlayRestored =
+    vessel === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.mpr()?.volumeId === ${JSON.stringify(vessel.volumeId)} && document.querySelector('[data-action="overlay-volume-tab-slices"]') !== null ? true : null`,
+          20_000,
+        );
+  await clickOn('[data-action="volume-tab-slices"]');
+  const slicesAgain = await waitFor(`__showcase.slices().ready ? true : null`, 60_000);
+  verdict(
+    "volume-overlay",
+    vessel !== undefined &&
+      overlayShown === "true" &&
+      overlay3d === "true" &&
+      overlayBone === true &&
+      overlayVessels === true &&
+      overlaySceneOff === true &&
+      overlaySceneOn === true &&
+      overlayBack === true &&
+      overlayHidden === true &&
+      overlayRestored === true &&
+      slicesAgain === true,
+    `shown=${overlayShown} tab3d=${overlay3d} bone=${overlayBone} vessels=${overlayVessels} scene=${overlaySceneOff}/${overlaySceneOn} back=${overlayBack} hidden=${overlayHidden} restored=${overlayRestored} slices=${slicesAgain}`,
   );
 
   // ---- volume-slice-move: the slider and window preset steer the views ----
