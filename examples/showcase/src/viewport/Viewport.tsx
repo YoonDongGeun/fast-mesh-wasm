@@ -24,6 +24,7 @@ import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
+import { matchVolume } from "./volume-box";
 import {
   type SculptBrush,
   SculptStroke,
@@ -93,6 +94,45 @@ export function Viewport(props: {
   } = props;
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
+  const downAt = useRef<{ x: number; y: number } | null>(null);
+  const lastDragEnd = useRef(0);
+  useEffect(() => {
+    const onDrag = (dragging: boolean) => {
+      if (!dragging) {
+        lastDragEnd.current = Date.now();
+      }
+    };
+    view.dragListeners.add(onDrag);
+    return () => {
+      view.dragListeners.delete(onDrag);
+    };
+  }, []);
+  // A tap on empty space clears the selection; sculpt and picks own the
+  // pointer, and gizmo drags and orbits are not taps.
+  const onMissed = useCallback(
+    (e: MouseEvent) => {
+      if (sculpt !== null || picking !== null || view.dragging || selection === null) {
+        return;
+      }
+      if (view.gizmo !== null && view.gizmo.axis !== null) {
+        return;
+      }
+      if (Date.now() - lastDragEnd.current < 350) {
+        return;
+      }
+      const down = downAt.current;
+      if (down === null || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) {
+        return;
+      }
+      // Through clickMulti: a shift-click on nothing is ignored, like on a mesh.
+      selectMesh(app, select, selection, null, e.shiftKey);
+    },
+    [app, select, selection, sculpt, picking],
+  );
+  const mpr = useApp(app, (s) => s.volumeMpr);
+  // The mesh shown as the scene volume instead of its surface, if any.
+  const volumeFound = matchVolume(items, selection, mpr);
+  const volumeMesh = volumeFound !== null && volumeFound.mpr.inScene ? volumeFound.item.mesh : null;
   const onPick = useCallback(
     (mesh: MeshHandle, additive: boolean) => selectMesh(app, select, selection, mesh, additive),
     [app, select, selection],
@@ -117,7 +157,7 @@ export function Viewport(props: {
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
 
   return (
-    <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }}>
+    <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
       <color attach="background" args={["#1b1e23"]} />
       <hemisphereLight args={["#e8eef8", "#30343c", 1.1]} />
       <directionalLight position={[3, 6, 4]} intensity={2} />
@@ -128,6 +168,7 @@ export function Viewport(props: {
           key={item.id}
           item={item}
           selected={item.mesh === selection}
+          volumeShown={item.mesh === volumeMesh}
           secondary={item.mesh !== selection && multi.includes(item.mesh)}
           edgeSoftness={edgeSoftness}
           onPick={onPick}
@@ -147,10 +188,25 @@ export function Viewport(props: {
         <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
       ) : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
+      <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
       <SceneVolume app={app} loader={loader} scene={scene} />
     </Canvas>
   );
+}
+
+/** Records canvas pointerdowns, so a missed click can tell a drag from a tap. */
+function MissTracker(props: { track: { current: { x: number; y: number } | null } }) {
+  const gl = useThree((s) => s.gl);
+  useEffect(() => {
+    const el = gl.domElement;
+    const onDown = (e: PointerEvent) => {
+      props.track.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
+    };
+    el.addEventListener("pointerdown", onDown);
+    return () => el.removeEventListener("pointerdown", onDown);
+  }, [gl, props.track]);
+  return null;
 }
 
 /** A crosshair while a brush-center pick is armed. */
@@ -169,6 +225,8 @@ function PickCursor(props: { picking: boolean }) {
 function MeshView(props: {
   item: Item;
   selected: boolean;
+  /** Shown as the scene volume instead of its surface (a volume mesh with the overlay on). */
+  volumeShown: boolean;
   /** Shift-clicked after the primary: dimmer, and a Join source. */
   secondary: boolean;
   edgeSoftness: number;
@@ -184,7 +242,7 @@ function MeshView(props: {
   /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
   bound: MeshBinding | null;
 }) {
-  const { item, selected, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
+  const { item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
     props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
@@ -251,6 +309,7 @@ function MeshView(props: {
       material={item.material}
       shading="fragment"
       edgeSoftness={edgeSoftness}
+      visible={!volumeShown}
       onClick={onClick}
       onBind={(b) => onBind(item.mesh, b)}
     />

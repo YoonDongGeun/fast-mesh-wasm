@@ -1,8 +1,5 @@
-// Placing the main scene's volume box: which volume it shows, where the
-// box sits in mesh-local coordinates, and where the cutaway clips it (the
-// same planes that cut the mesh, in box fractions).
-import type { SliceAxis } from "../panels/volume-slice";
-
+// Placing the main scene's volume box: which volume it shows, and where
+// the box sits in mesh-local coordinates.
 export interface VolumeDims {
   columns: number;
   rows: number;
@@ -55,17 +52,3 @@ export function volumeBoxLayout(
   };
 }
 
-/**
- * The cutaway in box fractions (x: sagittal, y: coronal, z: axial): the
- * march keeps the voxels at and below each slice, like the mesh clip.
- */
-export function cutFractions(
-  slices: Record<SliceAxis, number>,
-  dims: VolumeDims,
-): [number, number, number] {
-  return [
-    (slices.sagittal + 0.5) / dims.columns,
-    (slices.coronal + 0.5) / dims.rows,
-    (slices.axial + 0.5) / dims.slices,
-  ];
-}

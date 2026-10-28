@@ -1,8 +1,8 @@
 // The main scene's volume box: which volume it shows (the selected
-// volume mesh's, while the linked MPR state points at it), where the box
-// sits in mesh-local coordinates, and where the cutaway clips it.
+// volume mesh's, while the linked MPR state points at it), and where the
+// box sits in mesh-local coordinates.
 import { describe, expect, it } from "vitest";
-import { cutFractions, matchVolume, volumeBoxLayout } from "../src/viewport/volume-box";
+import { matchVolume, volumeBoxLayout } from "../src/viewport/volume-box";
 
 describe("matchVolume", () => {
   const items = [
@@ -38,12 +38,3 @@ describe("volumeBoxLayout", () => {
   });
 });
 
-describe("cutFractions", () => {
-  it("keeps the voxels at and below each slice, in box fraction", () => {
-    expect(cutFractions({ axial: 9, coronal: 4, sagittal: 1 }, { columns: 4, rows: 10, slices: 20 })).toEqual([
-      (1 + 0.5) / 4,
-      (4 + 0.5) / 10,
-      (9 + 0.5) / 20,
-    ]);
-  });
-});

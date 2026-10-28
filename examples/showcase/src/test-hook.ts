@@ -25,13 +25,14 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     mode: engine.mode,
     threads: () => engine.threads(),
     isolated: engine.isolated,
-    /** The listed meshes: name, triangles as loaded, source volume, and whether `<FastMesh>` has drawn geometry for it. */
+    /** The listed meshes: name, triangles as loaded, source volume, whether `<FastMesh>` has drawn geometry for it, and whether it shows. */
     items: () =>
       app.getSnapshot().items.map((i) => ({
         name: i.name,
         triangles: i.triangles,
         volumeId: i.volumeId,
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
+        visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
     status: () => {

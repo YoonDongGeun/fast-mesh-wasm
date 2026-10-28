@@ -120,6 +120,9 @@ export type VolumeGrid = {
   spacing: [number, number, number];
 };
 
+/** The cutaway uniform for an uncut box: every cut stays open past 1.0. */
+export const OPEN_CUTS: [number, number, number] = [2, 2, 2];
+
 /** The raymarch box's material with its textures, shared by the panel view and the main scene's box. */
 export interface RaymarchMaterial {
   material: THREE.ShaderMaterial;
@@ -172,7 +175,7 @@ export function createRaymarchMaterial(data: Uint8Array, grid: VolumeGrid, lut: 
       uTexel: { value: new THREE.Vector3(1 / grid.columns, 1 / grid.rows, 1 / grid.slices) },
       uMip: { value: 0 },
       uAlphaScale: { value: stepLen },
-      uCut: { value: new THREE.Vector3(2, 2, 2) },
+      uCut: { value: new THREE.Vector3(OPEN_CUTS[0], OPEN_CUTS[1], OPEN_CUTS[2]) },
     },
   });
   return {
