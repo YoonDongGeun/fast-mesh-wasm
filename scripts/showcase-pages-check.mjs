@@ -13,13 +13,13 @@
 // - sw: a fresh profile loads the page, the service worker installs, the page
 //   reloads once and is then cross-origin isolated, with the Worker scene
 //   threaded (threads > 1); two navigations, no more.
-// - scene: the vessel tree boots, the demo button loads A, B and C, and A
+// - scene: the CT head boots, the demo button loads A, B and C, and A
 //   and B are coloured against each other (the contact heatmap, with readouts).
 // - stable: a reload in the same profile stays isolated and threaded with no
 //   extra reload (one navigation).
 // - blocked: with the service worker script unavailable (registration
 //   fails), the page loads once, is not isolated, and the scene runs
-//   single-threaded with the boot vessel, the demo meshes and the heatmap.
+//   single-threaded with the boot head, the demo meshes and the heatmap.
 // - guard: with a service worker that adds no headers (controlled but still
 //   not isolated), the page reloads once and stops there: two navigations,
 //   single-threaded, the scene works.
@@ -146,7 +146,7 @@ async function settle(browser, quiet = 3000) {
   return waitFor(browser, "window.__showcase !== undefined && document.readyState === 'complete'", 30_000);
 }
 
-/** The page's isolation and thread count, then the vessel boot, the demo meshes and the A-B heatmap. */
+/** The page's isolation and thread count, then the head boot, the demo meshes and the A-B heatmap. */
 async function scene(browser) {
   const info = await browser.evaluate(`({
     isolated: crossOriginIsolated,
@@ -156,8 +156,8 @@ async function scene(browser) {
   })`);
   const boot = await waitFor(
     browser,
-    '(() => { const v = __showcase.items().find((m) => m.name.startsWith("Vessel tree") && m.drawn); return v !== undefined && v; })()',
-    60_000,
+    '(() => { const v = __showcase.items().find((m) => m.name.includes("headsq") && m.drawn); return v !== undefined && v; })()',
+    90_000,
   );
   await browser.evaluate(`document.querySelector("[data-action=demo-meshes]").click()`);
   const demo = await waitFor(
@@ -186,7 +186,7 @@ async function scene(browser) {
   );
   const colors = heat === undefined ? null : await browser.evaluate(`__showcase.colorCounts(${q(A)})`);
   const ok = boot !== undefined && demo !== undefined && heat !== undefined && colors?.red > 0 && colors?.gap > 0;
-  const detail = `boot ${boot === undefined ? "missing" : "vessel"}, meshes ${
+  const detail = `boot ${boot === undefined ? "missing" : "head"}, meshes ${
     demo === undefined ? "not drawn" : demo.length
   }, heatmap ${
     heat === undefined ? "not ready" : `penetration ${heat.readouts.penetration.depth.toFixed(3)}, A's vertices ${q(colors)}`
