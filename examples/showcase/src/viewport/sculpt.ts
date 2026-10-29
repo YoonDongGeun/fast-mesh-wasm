@@ -17,6 +17,19 @@ export interface SculptBrush {
 /** Past this many spacings a dab jumps to the pointer instead of creeping (see `SculptStroke.dab`). */
 export const CREEP_SPACINGS = 4;
 
+/**
+ * Past this many triangles sculpt remeshes stand down: the passes run
+ * over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
+ * regions), which would stall the worker and the dabs behind it. Dabs
+ * themselves stay fluid (~20-30 ms), so sculpting keeps working.
+ */
+export const REMESH_TRI_LIMIT = 100_000;
+
+/** Whether `triangles` stands sculpt remeshes (live and stroke-end) down. */
+export function remeshTooBig(triangles: number): boolean {
+  return triangles > REMESH_TRI_LIMIT;
+}
+
 /** Dab spacing: 15% of the radius (never zero, so dabs terminate). */
 export function dabSpacing(radius: number): number {
   return Math.max(radius * 0.15, 1e-6);

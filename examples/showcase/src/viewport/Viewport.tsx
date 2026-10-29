@@ -33,6 +33,7 @@ import {
   grabLocalDelta,
   interpolateHit,
   meanEdgeLength,
+  remeshTooBig,
   worldPerPixel,
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
@@ -502,11 +503,38 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
     /** A live remesh in flight, if any (never two at once). */
     let liveRunning: Promise<unknown> | null = null;
 
+    /** Live triangle slots, or null when the mesh is gone. */
+    const triSlots = (mesh: MeshHandle): number | null => {
+      try {
+        return scene.views(mesh).indices().length / 3;
+      } catch {
+        return null;
+      }
+    };
+
+    /** The remesh density anchor, taken lazily: only remeshes need it. */
+    const ensureDensity = (mesh: MeshHandle): void => {
+      if (densityAnchor !== null && densityAnchor.mesh === mesh) {
+        return;
+      }
+      densityAnchor = null;
+      try {
+        const v = scene.views(mesh);
+        const mean = meanEdgeLength(v.positions(), v.indices());
+        if (mean !== null && mean > 0 && Number.isFinite(mean)) {
+          densityAnchor = { mesh, length: mean };
+        }
+      } catch {
+        // Removed meanwhile: the remeshes fall back to the engine mean.
+      }
+    };
+
     /**
      * Remeshes the stroked region live (at most every 600 ms and 4 dabs,
      * never overlapping): split-only, so the triangle count only grows and
      * the surface never pops down mid-stroke. The stroke-end pass evens the
-     * density out fully.
+     * density out fully. Stands down on huge meshes, where a remesh would
+     * stall the worker behind the dabs.
      */
     const maybeLiveRemesh = () => {
       if (!liveRef.current || stroke === null || liveRunning !== null) {
@@ -523,10 +551,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       if (b === null) {
         return;
       }
+      const mesh = brushRef.current.mesh;
+      const slots = triSlots(mesh);
+      if (slots === null || remeshTooBig(slots)) {
+        return;
+      }
+      ensureDensity(mesh);
       liveAt = now;
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
-      const mesh = brushRef.current.mesh;
       liveRunning = store
         .repair(mesh, {
           op: "remesh",
@@ -598,12 +631,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
         stroke = null;
         inspect.sculpt.strokes++;
         // The stroke-end remesh lands before the step closes: one undo step
-        // for the stroke and its evening-out (on the sync scene).
+        // for the stroke and its evening-out (on the sync scene). Stands
+        // down on huge meshes, where a remesh would stall the worker.
         if (remeshRef.current && landed > 0) {
           const b = s.bounds();
-          if (b !== null) {
+          const mesh = brushRef.current.mesh;
+          const slots = triSlots(mesh);
+          if (b !== null && slots !== null && !remeshTooBig(slots)) {
+            ensureDensity(mesh);
             inspect.sculpt.remeshes++;
-            const mesh = brushRef.current.mesh;
             void store
               .repair(mesh, {
                 op: "remesh",
@@ -788,18 +824,6 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             grabFrom = { x: e.clientX, y: e.clientY };
             grabAnchor = brush.op === "grab" ? new GrabAnchor(point) : null;
             dirRef.current = [0, 0, 0];
-            if (densityAnchor === null || densityAnchor.mesh !== mesh) {
-              densityAnchor = null;
-              try {
-                const v = scene.views(mesh);
-                const mean = meanEdgeLength(v.positions(), v.indices());
-                if (mean !== null && mean > 0 && Number.isFinite(mean)) {
-                  densityAnchor = { mesh, length: mean };
-                }
-              } catch {
-                // Removed meanwhile: the remeshes fall back to the engine mean.
-              }
-            }
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,

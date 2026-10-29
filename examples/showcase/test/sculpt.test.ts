@@ -14,6 +14,7 @@ import {
   grabLocalDelta,
   interpolateHit,
   meanEdgeLength,
+  remeshTooBig,
   worldPerPixel,
 } from "../src/viewport/sculpt";
 
@@ -321,5 +322,14 @@ describe("SculptStroke", () => {
     stroke.end();
     await stroke.done;
     expect(seen).toEqual([1, 2]);
+  });
+});
+
+describe("remesh gate", () => {
+  it("stands remeshes down past the triangle limit", () => {
+    expect(remeshTooBig(27_584)).toBe(false);
+    expect(remeshTooBig(100_000)).toBe(false);
+    expect(remeshTooBig(100_001)).toBe(true);
+    expect(remeshTooBig(302_174)).toBe(true);
   });
 });
