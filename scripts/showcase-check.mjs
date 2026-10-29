@@ -98,6 +98,8 @@
 //   volume's mesh surface comes back.
 // - sculpt-surface: arming a sculpt tool on a volume mesh shows its
 //   surface (quads and volume stand down); disarming restores the volume.
+// - remesh-gate: the remesh checkboxes disable past 100 k triangles (the
+//   chest) and stay enabled below it (the vessel).
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -1322,6 +1324,29 @@ try {
       sculptSurface === true &&
       sculptBack === true,
     `volume=${sculptVol === true} armed=${sculptArmed === true} surface=${sculptSurface === true} back=${sculptBack === true}`,
+  );
+
+  // ---- remesh-gate: remesh options stand down on huge meshes ----
+  // The chest (591 k) disables both remesh checkboxes; the vessel (27 k)
+  // keeps them enabled.
+  const gateOff = await waitFor(
+    `document.querySelector('[data-action="sculpt-remesh"]')?.disabled === true && document.querySelector('[data-action="sculpt-live-remesh"]')?.disabled === true ? true : null`,
+    20_000,
+  );
+  if (vessel !== undefined) {
+    await clickOn(`[data-mesh=${JSON.stringify(vessel.name)}] .mesh-name`);
+  }
+  const gateOn =
+    vessel === undefined
+      ? undefined
+      : await waitFor(
+          `document.querySelector('[data-action="sculpt-remesh"]')?.disabled === false && document.querySelector('[data-action="sculpt-live-remesh"]')?.disabled === false ? true : null`,
+          20_000,
+        );
+  verdict(
+    "remesh-gate",
+    gateOff === true && gateOn === true,
+    `chest disabled=${gateOff === true} vessel enabled=${gateOn === true}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
