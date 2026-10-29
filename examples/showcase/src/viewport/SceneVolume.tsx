@@ -1,10 +1,10 @@
-// The scene's volume rendering: the selected volume raymarched whole with
-// the shared 3D preset (like the panel's 3D tab) and blended over the
-// scene, while its surface mesh hides. Marched on demand into a half-res
-// target (a full march every frame would stall software GL); the
-// composite quad blends the cached target over the scene, like the
-// panel's box blends over its planes — including over anything
-// overlapping the box.
+// The scene's volume rendering: the selected volume raymarched with the
+// shared 3D preset, cut away below the linked slices (the kept side
+// faces the boot camera), and blended over the scene, while its surface
+// mesh hides. Marched on demand into a half-res target (a full march
+// every frame would stall software GL); the composite quad blends the
+// cached target over the scene, like the panel's box blends over its
+// planes — including over anything overlapping the box.
 import type { Scene } from "fast-mesh-wasm";
 import { useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
@@ -17,9 +17,9 @@ import { inspect } from "../panels/inspect";
 import { displayValues } from "../panels/volume-data";
 import { dataRange, normalizeVolume, presetLut } from "../panels/volume-lut";
 import { VOLUME_PRESETS } from "../panels/volume-presets";
-import { createRaymarchMaterial, OPEN_CUTS, type RaymarchMaterial, type VolumeGrid } from "../panels/volume-three";
+import { createRaymarchMaterial, type RaymarchMaterial, type VolumeGrid } from "../panels/volume-three";
 import { type AppState, type Item, useApp } from "../scene/app-state";
-import { matchVolume, volumeBoxLayout } from "./volume-box";
+import { cutFractions, matchVolume, volumeBoxLayout } from "./volume-box";
 
 /** The march target's scale: half res marches 4x faster, upscaled on composite. */
 const RT_SCALE = 0.5;
@@ -202,9 +202,6 @@ export function SceneVolume(props: { app: AppState; loader: Loader; scene: Scene
   const liveItem: Item | null = found?.item ?? null;
   const active = found !== null && found.mpr.inScene;
   const volumeId = active && found !== null ? found.volumeId : null;
-  // The box shows the whole volume (like the panel's 3D tab): slices move
-  // the quads, never this. Only the preset steers it.
-  const mprPreset = mpr?.preset ?? null;
 
   useEffect(() => {
     setPayload(null);
@@ -241,7 +238,7 @@ export function SceneVolume(props: { app: AppState; loader: Loader; scene: Scene
       payload === null ||
       prepared === null ||
       range === null ||
-      mprPreset === null ||
+      mpr === null ||
       liveItem === null ||
       volumeId === null
     ) {
@@ -251,17 +248,17 @@ export function SceneVolume(props: { app: AppState; loader: Loader; scene: Scene
       }
       return;
     }
-    const preset = VOLUME_PRESETS[mprPreset];
+    const preset = VOLUME_PRESETS[mpr.preset];
     box.showVolume(
       volumeId,
       prepared,
       { columns: payload.columns, rows: payload.rows, slices: payload.slices, spacing: payload.spacing },
       presetLut(preset, range[0], range[1]),
       volumeBoxLayout(payload, liveItem.center),
-      OPEN_CUTS,
+      cutFractions(mpr.slices, payload),
     );
     inspect.sceneVolume = { id: volumeId, preset: preset.name };
-  }, [active, payload, prepared, range, mprPreset, liveItem, volumeId, box]);
+  }, [active, payload, prepared, range, mpr, liveItem, volumeId, box]);
 
   useEffect(
     () => () => {

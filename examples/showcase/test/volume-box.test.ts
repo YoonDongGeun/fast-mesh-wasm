@@ -2,7 +2,7 @@
 // volume mesh's, while the linked MPR state points at it), and where the
 // box sits in mesh-local coordinates.
 import { describe, expect, it } from "vitest";
-import { matchVolume, volumeBoxLayout } from "../src/viewport/volume-box";
+import { cutFractions, matchVolume, volumeBoxLayout } from "../src/viewport/volume-box";
 
 describe("matchVolume", () => {
   const items = [
@@ -35,6 +35,16 @@ describe("volumeBoxLayout", () => {
     expect(layout.size).toEqual([8, 12, 16]);
     // The volume centre (14, 26, 38) minus the mesh centre.
     expect(layout.center).toEqual([2, 2, 2]);
+  });
+});
+
+describe("cutFractions", () => {
+  it("keeps the voxels at and above each slice, in box fraction", () => {
+    expect(cutFractions({ axial: 9, coronal: 4, sagittal: 1 }, { columns: 4, rows: 10, slices: 20 })).toEqual([
+      (1 + 0.5) / 4,
+      (4 + 0.5) / 10,
+      (9 + 0.5) / 20,
+    ]);
   });
 });
 

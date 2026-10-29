@@ -1,7 +1,8 @@
 // The scene overlay: the linked MPR slices as quads cutting through the
-// selected mesh in the main scene, with the mesh clipped away above each
-// slice (a cutaway), like a medical viewer. The quads ride the mesh's
-// placement, so gizmo moves carry them along.
+// selected mesh in the main scene, with the mesh clipped away below each
+// slice (a cutaway opening towards the boot camera), like a medical
+// viewer. The quads ride the mesh's placement, so gizmo moves carry them
+// along.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
@@ -53,14 +54,14 @@ export class SceneSliceQuads {
   readonly group = new THREE.Group();
   /** The cutaway planes in world coordinates: assign to the clipped material. */
   readonly clip: [THREE.Plane, THREE.Plane, THREE.Plane] = [
-    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0),
-    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
+    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
   ];
   private local: [THREE.Plane, THREE.Plane, THREE.Plane] = [
-    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0),
-    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
+    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
   ];
   private entries: (QuadEntry | undefined)[] = [];
   private matrix = new THREE.Matrix4();
@@ -121,9 +122,9 @@ export class SceneSliceQuads {
       }
       entry.mesh.position.set(at[i][0], at[i][1], at[i][2]);
     });
-    this.local[0].constant = at[0][2];
-    this.local[1].constant = at[1][1];
-    this.local[2].constant = at[2][0];
+    this.local[0].constant = -at[0][2];
+    this.local[1].constant = -at[1][1];
+    this.local[2].constant = -at[2][0];
     this.group.visible = true;
   }
 

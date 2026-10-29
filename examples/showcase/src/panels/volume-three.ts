@@ -26,7 +26,7 @@ uniform vec3 uCamObj;
 uniform vec3 uTexel;
 uniform float uMip;
 uniform float uAlphaScale;
-// The cutaway: the slice fractions (see cutFractions); past 1.0 a cut stays open.
+// The cutaway: the slice fractions (see cutFractions); below 0.0 a cut stays open.
 uniform vec3 uCut;
 
 vec2 hitBox(vec3 ro, vec3 rd) {
@@ -52,16 +52,16 @@ vec3 gradientAt(vec3 p) {
   return g / uTexel;
 }
 
-// Keeps the samples below the cut on one axis (the mesh clip's twin).
+// Keeps the samples above the cut on one axis (the mesh clip's twin).
 void clipAxis(float ro, float rd, float cut, inout float t0, inout float t1) {
   if (abs(rd) > 1e-9) {
     float tc = (cut - ro) / rd;
     if (rd > 0.0) {
-      t1 = min(t1, tc);
-    } else {
       t0 = max(t0, tc);
+    } else {
+      t1 = min(t1, tc);
     }
-  } else if (ro > cut) {
+  } else if (ro < cut) {
     t1 = t0;
   }
 }
@@ -120,8 +120,8 @@ export type VolumeGrid = {
   spacing: [number, number, number];
 };
 
-/** The cutaway uniform for an uncut box: every cut stays open past 1.0. */
-export const OPEN_CUTS: [number, number, number] = [2, 2, 2];
+/** The cutaway uniform for an uncut box: every cut stays open below 0.0. */
+export const OPEN_CUTS: [number, number, number] = [-1, -1, -1];
 
 /** The raymarch box's material with its textures, shared by the panel view and the main scene's box. */
 export interface RaymarchMaterial {
