@@ -96,6 +96,8 @@
 //   scene overlay follows.
 // - deselect: a tap on empty canvas clears the selection, and the scene
 //   volume's mesh surface comes back.
+// - sculpt-surface: arming a sculpt tool on a volume mesh shows its
+//   surface (quads and volume stand down); disarming restores the volume.
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
@@ -1276,6 +1278,50 @@ try {
     "deselect",
     deselected === true && chestBack === true,
     `selected=null:${deselected === true} chest mesh back:${chestBack === true}`,
+  );
+
+  // ---- sculpt-surface: arming sculpt shows the surface, not the volume ----
+  // Reselect the chest (volume mode hides its surface), arm Inflate (the
+  // surface comes back for the brush, quads and volume stand down), then
+  // disarm (volume mode returns).
+  if (chestItem !== undefined) {
+    await clickOn(`[data-mesh=${JSON.stringify(chestItem.name)}] .mesh-name`);
+  }
+  const sculptVol =
+    chestItem === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(chestItem.name)})?.visible === false && __showcase.sceneVolume().id === ${JSON.stringify(chestItem.volumeId)} ? true : null`,
+          20_000,
+        );
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  const sculptArmed = await waitFor(
+    `document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true" ? true : null`,
+    20_000,
+  );
+  const sculptSurface =
+    chestItem === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(chestItem.name)})?.visible === true && __showcase.sceneVolume().id === null && __showcase.sceneSlices().shown === 0 ? true : null`,
+          20_000,
+        );
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  const sculptBack =
+    chestItem === undefined
+      ? undefined
+      : await waitFor(
+          `__showcase.items().find((m) => m.name === ${JSON.stringify(chestItem.name)})?.visible === false && __showcase.sceneVolume().id === ${JSON.stringify(chestItem.volumeId)} ? true : null`,
+          20_000,
+        );
+  verdict(
+    "sculpt-surface",
+    chestItem !== undefined &&
+      sculptVol === true &&
+      sculptArmed === true &&
+      sculptSurface === true &&
+      sculptBack === true,
+    `volume=${sculptVol === true} armed=${sculptArmed === true} surface=${sculptSurface === true} back=${sculptBack === true}`,
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----
