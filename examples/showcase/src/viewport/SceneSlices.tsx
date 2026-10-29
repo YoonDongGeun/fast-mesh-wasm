@@ -254,9 +254,10 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
   const quads = useMemo(() => new SceneSliceQuads(), []);
   const [payload, setPayload] = useState<VolumePayload | null>(null);
   const found = matchVolume(items, selection, mpr);
+  const sculpt = useApp(app, (s) => s.sculpt);
   const item: Item | null = found?.item ?? null;
   const mesh: MeshHandle | null = item?.mesh ?? null;
-  const active = found !== null && found.mpr.inScene;
+  const active = found !== null && found.mpr.inScene && found.item.mesh !== (sculpt?.mesh ?? null);
   const volumeId = active && found !== null ? found.volumeId : null;
 
   useEffect(() => {

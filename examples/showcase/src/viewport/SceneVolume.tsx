@@ -199,8 +199,9 @@ export function SceneVolume(props: { app: AppState; loader: Loader; scene: Scene
   const box = useMemo(() => new SceneVolumeBox(), []);
   const [payload, setPayload] = useState<VolumePayload | null>(null);
   const found = matchVolume(items, selection, mpr);
+  const sculpt = useApp(app, (s) => s.sculpt);
   const liveItem: Item | null = found?.item ?? null;
-  const active = found !== null && found.mpr.inScene;
+  const active = found !== null && found.mpr.inScene && found.item.mesh !== (sculpt?.mesh ?? null);
   const volumeId = active && found !== null ? found.volumeId : null;
 
   useEffect(() => {

@@ -131,8 +131,13 @@ export function Viewport(props: {
   );
   const mpr = useApp(app, (s) => s.volumeMpr);
   // The mesh shown as the scene volume instead of its surface, if any.
+  // Sculpting shows the surface: the armed mesh drops out of volume mode.
   const volumeFound = matchVolume(items, selection, mpr);
-  const volumeMesh = volumeFound !== null && volumeFound.mpr.inScene ? volumeFound.item.mesh : null;
+  const sculptMesh = sculpt?.mesh ?? null;
+  const volumeMesh =
+    volumeFound !== null && volumeFound.mpr.inScene && volumeFound.item.mesh !== sculptMesh
+      ? volumeFound.item.mesh
+      : null;
   const onPick = useCallback(
     (mesh: MeshHandle, additive: boolean) => selectMesh(app, select, selection, mesh, additive),
     [app, select, selection],
