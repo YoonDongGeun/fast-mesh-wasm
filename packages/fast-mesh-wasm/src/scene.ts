@@ -641,6 +641,28 @@ export type RepairOp =
        * positive and finite.
        */
       thickness: number;
+    }
+  | {
+      op: "simplify";
+      /**
+       * Stop once this many triangles are alive; must be at least 1. A target
+       * at or above the live count leaves the mesh alone.
+       */
+      targetTriangles: number;
+      /** Keep boundary vertices in place; defaults to `true`. */
+      preserveBoundary?: boolean;
+    }
+  | {
+      op: "subdivide";
+      /**
+       * Subdivision scheme; only `"loop"` exists. Defaults to `"loop"`.
+       */
+      method?: "loop";
+      /**
+       * How many times to split every triangle; must be an integer of at
+       * least 1. Each level quadruples the triangle count. Defaults to `1`.
+       */
+      levels?: number;
     };
 
 /** What `weld` did. */
@@ -755,6 +777,24 @@ export interface ShellReport {
   verticesRemoved: number;
 }
 
+/** What `simplify` did. */
+export interface SimplifyReport {
+  /** Edge collapses performed. */
+  collapsed: number;
+  /** Triangles removed (one per boundary collapse, two per interior one). */
+  trianglesRemoved: number;
+  /** Vertices removed (one per collapse). */
+  verticesRemoved: number;
+}
+
+/** What `subdivide` did. */
+export interface SubdivideReport {
+  /** Vertices added, one per subdivided edge per level. */
+  verticesAdded: number;
+  /** Triangles added: three per subdivided triangle per level. */
+  trianglesAdded: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -815,7 +855,9 @@ export type RepairReport =
   | GrabReport
   | RelaxReport
   | OffsetReport
-  | ShellReport;
+  | ShellReport
+  | SimplifyReport
+  | SubdivideReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -844,7 +886,11 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                         ? OffsetReport
                         : O extends { op: "shell" }
                           ? ShellReport
-                          : RepairReport;
+                          : O extends { op: "simplify" }
+                            ? SimplifyReport
+                            : O extends { op: "subdivide" }
+                              ? SubdivideReport
+                              : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -1007,9 +1053,12 @@ const REPAIR_CODES = {
   relax: 10,
   offset: 11,
   shell: 12,
+  simplify: 13,
+  subdivide: 14,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
+const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
 function optional(v: number | undefined, what: string): number {
@@ -1152,6 +1201,18 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
       case "shell":
         values.push(optional(o.thickness, "thickness"));
         break;
+      case "simplify":
+        values.push(
+          optional(o.targetTriangles, "targetTriangles"),
+          flagOf(o.preserveBoundary, true),
+        );
+        break;
+      case "subdivide":
+        values.push(
+          o.method === undefined ? Number.NaN : codeIn(SUBDIVIDE_METHOD_CODES, o.method, "method"),
+          optional(o.levels, "levels"),
+        );
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -1260,6 +1321,10 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
         degenerateRemoved: r.next(),
         verticesRemoved: r.next(),
       };
+    case "simplify":
+      return { collapsed: r.next(), trianglesRemoved: r.next(), verticesRemoved: r.next() };
+    case "subdivide":
+      return { verticesAdded: r.next(), trianglesAdded: r.next() };
   }
 }
 

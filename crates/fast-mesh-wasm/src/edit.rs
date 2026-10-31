@@ -50,6 +50,10 @@
 //!   Taubin λ/μ cycles.
 //! - `11` offset: `distance`.
 //! - `12` shell: `thickness`.
+//! - `13` simplify: `target_triangles, preserve_boundary (0 or 1)`.
+//! - `14` subdivide: `method (0 loop, NaN for the default), levels (NaN
+//!   for 1)`. Each level splits every triangle into four by Loop's scheme;
+//!   see [`fast_mesh_ops::subdivide`].
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -74,6 +78,8 @@
 //! - offset: `moved, max_displacement, degenerate_removed, vertices_removed`.
 //! - shell: `vertices_added, triangles_added, loops_closed, degenerate_removed,
 //!   vertices_removed`.
+//! - simplify: `collapsed, triangles_removed, vertices_removed`.
+//! - subdivide: `vertices_added, triangles_added`.
 //!
 //! # Analysis
 //!
@@ -84,6 +90,8 @@ use fast_mesh_ops::deform::{
     Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions,
 };
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
+use fast_mesh_ops::simplify::SimplifyOptions;
+use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
     Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
     FillReport, LoopId, OffsetOptions, OpsError, ShellOptions, SkipReason,
@@ -371,6 +379,8 @@ pub(crate) enum RepairOp {
     Grab(GrabOptions),
     Offset(f32),
     Shell(f32),
+    Simplify(SimplifyOptions),
+    Subdivide(SubdivideOptions),
 }
 
 /// A flag: 0 or 1.
@@ -562,6 +572,39 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             RepairOp::Offset(words.next()? as f32)
         } else if code == 12.0 {
             RepairOp::Shell(words.next()? as f32)
+        } else if code == 13.0 {
+            let [target, preserve]: [f64; 2] =
+                words.take(2)?.try_into().map_err(|_| malformed(WHAT))?;
+            let target = count_opt(target, "targetTriangles")?
+                .ok_or_else(|| Error::invalid("targetTriangles is required"))?;
+            if target == 0 {
+                return Err(Error::invalid("targetTriangles must be at least 1"));
+            }
+            RepairOp::Simplify(SimplifyOptions {
+                target_triangles: target,
+                preserve_boundary: flag(preserve)?,
+            })
+        } else if code == 14.0 {
+            let [method, levels]: [f64; 2] =
+                words.take(2)?.try_into().map_err(|_| malformed(WHAT))?;
+            let method = if method.is_nan() || method == 0.0 {
+                SubdivideMethod::Loop
+            } else {
+                return Err(Error::invalid("method must be 0 (loop)"));
+            };
+            // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
+            // which on wasm32 equals `u32::MAX`, so without this check any
+            // larger value would decode to billions of levels.
+            if !levels.is_nan() && levels > f64::from(u32::MAX) {
+                return Err(Error::invalid("levels is too large"));
+            }
+            let levels = count_opt(levels, "levels")?.unwrap_or(1);
+            let levels = u32::try_from(levels)
+                .map_err(|_| Error::invalid("levels is too large"))?;
+            if levels == 0 {
+                return Err(Error::invalid("levels must be at least 1"));
+            }
+            RepairOp::Subdivide(SubdivideOptions { method, levels })
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -741,6 +784,21 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                         count(r.vertices_removed),
                     ],
                 )?;
+            }
+            RepairOp::Simplify(o) => {
+                let r = fast_mesh_ops::simplify::simplify(tx, o)?;
+                put(
+                    &mut out,
+                    &[
+                        count(r.collapsed),
+                        count(r.triangles_removed),
+                        count(r.vertices_removed),
+                    ],
+                )?;
+            }
+            RepairOp::Subdivide(o) => {
+                let r = fast_mesh_ops::subdivide::subdivide(tx, o)?;
+                put(&mut out, &[count(r.vertices_added), count(r.triangles_added)])?;
             }
         }
     }
@@ -1149,5 +1207,65 @@ mod tests {
         assert_eq!(code(&[11.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[12.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[11., 0.5, 1.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_simplify() {
+        let d = decode_repair(&[13., 200_000., 1.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Simplify(SimplifyOptions {
+                target_triangles: 200_000,
+                preserve_boundary: true,
+            })]
+        );
+        let d = decode_repair(&[13., 10., 0.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Simplify(SimplifyOptions {
+                target_triangles: 10,
+                preserve_boundary: false,
+            })]
+        );
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[13.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[13., 0., 1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[13., f64::NAN, 1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[13., 1.5, 1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[13., 10., 2.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[13., 10., 1., 0.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_subdivide() {
+        let d = decode_repair(&[14., 0., 2.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Subdivide(SubdivideOptions {
+                method: SubdivideMethod::Loop,
+                levels: 2,
+            })]
+        );
+        // NaN means the defaults: Loop, one level.
+        let d = decode_repair(&[14., f64::NAN, f64::NAN], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Subdivide(SubdivideOptions {
+                method: SubdivideMethod::Loop,
+                levels: 1,
+            })]
+        );
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[14.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[14., 0.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[14., 1., 1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[14., 0., 0.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[14., 0., 1.5]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[14., 0., -1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[14., 0., 2f64.powi(32)]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(code(&[14., 0., 1., 0.]), codes::INVALID_ARGUMENT);
     }
 }

@@ -41,6 +41,12 @@
 //!   crosses an orientation seam is not clean and is skipped.
 //! - Measurement: [`measure`] reports a mesh's surface area (always) and
 //!   enclosed volume (when watertight, with the reason otherwise).
+//! - Simplification: [`simplify`](simplify::simplify) shrinks a mesh toward
+//!   a target triangle count by quadric-error edge collapses, keeping
+//!   boundary vertices in place when asked.
+//! - Subdivision: [`subdivide`](subdivide::subdivide) refines every triangle
+//!   into four per level by Loop's scheme, with boundary vertices relaxing
+//!   along their own curve and other creases holding their midpoints.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -62,6 +68,8 @@ mod offset;
 mod orient;
 mod refine;
 pub mod remesh;
+pub mod simplify;
+pub mod subdivide;
 mod sparse;
 #[cfg(test)]
 mod test_util;

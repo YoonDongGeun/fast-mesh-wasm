@@ -97,6 +97,8 @@ export {
   type SectionResult,
   type ShellReport,
   type SignMode,
+  type SimplifyReport,
   type SmoothReport,
+  type SubdivideReport,
   type WeldReport,
 } from "./scene.js";
