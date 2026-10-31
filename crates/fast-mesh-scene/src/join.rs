@@ -6,7 +6,7 @@ use fast_mesh_ops::bridge::{BridgeOptions, bridge_loops};
 use fast_mesh_ops::{LoopId, OpsError, boundary_loops};
 use fast_mesh_store::{Mesh, StoreError, VertexId};
 
-use crate::placement::relative_rigid;
+use crate::placement::relative_affine;
 use crate::{MeshId, Result, Scene, SceneError};
 
 /// What to join: a loop on the target and a loop on the source.
@@ -56,7 +56,7 @@ fn prepare_source(
     source_placement: &crate::Placement,
     loop_b: LoopId,
 ) -> Result<Source> {
-    let rigid = relative_rigid(
+    let rigid = relative_affine(
         target_placement,
         target.origin(),
         source_placement,
@@ -81,7 +81,7 @@ fn prepare_source(
         let Some(p) = source.position(v as VertexId) else {
             continue;
         };
-        let w = rigid.apply(p);
+        let w = rigid.apply(p.map(f64::from));
         let q = [w[0] as f32, w[1] as f32, w[2] as f32];
         if !q.iter().all(|c| c.is_finite()) {
             return Err(SceneError::InvalidInput("joined positions must be finite"));

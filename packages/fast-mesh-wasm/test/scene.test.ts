@@ -119,10 +119,14 @@ describe("Scene", () => {
   it("quaternion_and_matrix_placement", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);
-    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [0, 0, 0] });
+    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 1, 1] });
 
     s.setPlacement(mesh, { rotation: QUARTER_Z, translation: [10, 20, 30] });
-    expect(s.placement(mesh)).toEqual({ rotation: QUARTER_Z, translation: [10, 20, 30] });
+    expect(s.placement(mesh)).toEqual({
+      rotation: QUARTER_Z,
+      translation: [10, 20, 30],
+      scale: [1, 1, 1],
+    });
 
     // The same quarter turn as a quaternion, unnormalised: normalised first.
     s.setPlacement(mesh, { rotation: [0, 0, 3, 3], translation: [1, 2, 3] });
@@ -156,6 +160,52 @@ describe("Scene", () => {
     );
     // Failed calls leave the placement alone.
     expectClose(s.placement(mesh).rotation, [1, 0, 0, 0, c, -sn, 0, sn, c], 1e-15);
+  });
+
+  it("scaled_placement", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    // The default scale is rigid.
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
+
+    // Uniform and non-uniform scales round-trip; the matrix columns scale.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [10, 20, 30], scale: [2, 2, 2] });
+    expect(s.placement(mesh)).toEqual({
+      rotation: IDENTITY,
+      translation: [10, 20, 30],
+      scale: [2, 2, 2],
+    });
+    // matrix4 = placement · translate(origin); the origin is (1, 1, 0.5),
+    // so the last column is R·(S·o) + t = (2, 2, 1) + (10, 20, 30).
+    expectClose(
+      s.matrix4(mesh),
+      [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 12, 22, 31, 1],
+      1e-15,
+    );
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0], scale: [2, 1, 0.5] });
+    expect(s.placement(mesh).scale).toEqual([2, 1, 0.5]);
+    expectClose(
+      s.matrix4(mesh),
+      [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.5, 0, 2, 1, 0.25, 1],
+      1e-15,
+    );
+
+    // Omitting the scale leaves the mesh rigid.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0] });
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
+
+    // Bad scales are rejected and leave the placement alone.
+    const t: [number, number, number] = [0, 0, 0];
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [0, 1, 1] })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [1, -1, 1] })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [1, 1] as never })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
   });
 
   it("views_match_engine", () => {
@@ -350,6 +400,41 @@ describe("Scene", () => {
     expect(codeOf(() => s.vertexCount({} as MeshHandle))).toBe("INVALID_ARGUMENT");
   });
 
+  it("cut_by_plane_splits_and_caps", () => {
+    const s = scene();
+    // A closed unit cube, outward wound.
+    const box = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const boxTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6,
+      1, 6, 5, 3, 0, 4, 3, 4, 7,
+    ];
+    const mesh = s.addMesh(box, boxTris);
+    s.takeChanges();
+    const r = s.cutByPlane(mesh, { origin: [0.5, 0, 0], normal: [1, 0, 0] });
+    expect(r.kept).toBe(mesh);
+    expect(r.removed).not.toBe(mesh);
+    // Both parts closed: the caps are there.
+    expect(s.analyze(mesh).loops).toEqual([]);
+    expect(s.analyze(r.removed).loops).toEqual([]);
+    expect(r.keptTriangles).toBe(s.triangleCount(mesh));
+    expect(r.removedTriangles).toBe(s.triangleCount(r.removed));
+    expect(r.capTriangles).toBeGreaterThan(0);
+    // The kept side is the + one.
+    const kept = s.views(mesh).positions();
+    for (let v = 0; v < kept.length / 3; v++) {
+      expect(kept[v * 3]).toBeGreaterThanOrEqual(0.5 - 1e-6);
+    }
+    // One undo step restores the cut mesh; the added part stays.
+    expect(s.undo()).toBe(true);
+    expect(s.triangleCount(mesh)).toBe(12);
+    expect(s.triangleCount(r.removed)).toBe(r.removedTriangles);
+    // A plane past the cube misses it.
+    expect(codeOf(() => s.cutByPlane(mesh, { origin: [5, 0, 0], normal: [1, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(s.triangleCount(mesh)).toBe(12);
+  });
+
   it("changes_ranges_after_placement_and_drag", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);
@@ -455,7 +540,7 @@ describe("Scene", () => {
     c.move({ rotation: QUARTER_Z, translation: [5, 5, 5] });
     c.cancel();
     expect(c.active).toBe(false);
-    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0] });
+    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0], scale: [1, 1, 1] });
     expect(s.undo()).toBe(true);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
     expect(s.canUndo()).toBe(false);

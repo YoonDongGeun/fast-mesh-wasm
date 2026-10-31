@@ -23,6 +23,16 @@
 //!   orientation conflicts and, given a BVH, self-intersection.
 //! - Orientation: [`orient()`] makes the winding consistent patch by patch
 //!   and turns closed components outward.
+//! - Booleans: [`boolean_plan`] splits every triangle of mesh A that mesh B
+//!   crosses (and vice versa) so that each piece lies strictly on one side
+//!   of the other mesh, classifies the pieces for [`BooleanOp`] and
+//!   [`apply_boolean`] writes the plan, stitching both rims without any
+//!   winding assumption. Inputs must be closed, manifold and consistently
+//!   wound.
+//! - Offsetting and shells: [`offset`] moves a surface along its smooth
+//!   normals by a signed distance, and [`shell`] solidifies a mesh into a
+//!   printable shell of wall `thickness` by adding a reversed inner copy and
+//!   stitching every rim; both drop pinched triangles and report them.
 //! - Hole filling: [`fill_holes`] closes the boundary loops chosen by size
 //!   or by id with triangle patches that agree with their neighbours' winding
 //!   and never make an edge non-manifold, refined to the surrounding density
@@ -36,13 +46,16 @@
 
 mod analyze;
 pub mod append;
+pub mod boolean;
 pub mod bridge;
 mod cleanup;
+mod cut;
 pub mod deform;
 mod error;
 mod fair;
 mod fill;
 mod fill_dp;
+mod offset;
 mod orient;
 mod refine;
 pub mod remesh;
@@ -54,16 +67,22 @@ mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use append::{AppendReport, AppendSource, append_mesh};
+pub use boolean::{BooleanOp, BooleanPlan, BooleanReport, apply_boolean, boolean_plan};
 pub use bridge::{BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops};
 pub use cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
+pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
 pub use deform::{Brush, Falloff, InflateOptions, InflateOptionsBuilder, InflateReport, inflate};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
+};
+pub use offset::{
+    OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,
+    ShellReport, offset, shell,
 };
 pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};

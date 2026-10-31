@@ -48,6 +48,8 @@
 //!   dx, dy, dz`.
 //! - `10` relax: like `6` smooth, but plain Laplacian passes instead of
 //!   Taubin λ/μ cycles.
+//! - `11` offset: `distance`.
+//! - `12` shell: `thickness`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -69,6 +71,9 @@
 //! - bridge loops: `triangles_added`.
 //! - grab: `moved, max_displacement`.
 //! - relax: `moved, max_displacement`.
+//! - offset: `moved, max_displacement, degenerate_removed, vertices_removed`.
+//! - shell: `vertices_added, triangles_added, loops_closed, degenerate_removed,
+//!   vertices_removed`.
 //!
 //! # Analysis
 //!
@@ -81,7 +86,7 @@ use fast_mesh_ops::deform::{
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::{
     Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
-    FillReport, LoopId, OpsError, SkipReason,
+    FillReport, LoopId, OffsetOptions, OpsError, ShellOptions, SkipReason,
 };
 use fast_mesh_store::{StoreError, Transaction};
 
@@ -364,6 +369,8 @@ pub(crate) enum RepairOp {
     Remesh(RemeshOptions),
     Bridge(BridgeOptions),
     Grab(GrabOptions),
+    Offset(f32),
+    Shell(f32),
 }
 
 /// A flag: 0 or 1.
@@ -551,6 +558,10 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 },
                 direction: [dx as f32, dy as f32, dz as f32],
             })
+        } else if code == 11.0 {
+            RepairOp::Offset(words.next()? as f32)
+        } else if code == 12.0 {
+            RepairOp::Shell(words.next()? as f32)
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -695,6 +706,41 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::Grab(o) => {
                 let r = fast_mesh_ops::deform::grab(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Offset(distance) => {
+                let r = fast_mesh_ops::offset(
+                    tx,
+                    &OffsetOptions {
+                        distance: *distance,
+                    },
+                )?;
+                put(
+                    &mut out,
+                    &[
+                        count(r.moved),
+                        f64::from(r.max_displacement),
+                        count(r.degenerate_removed),
+                        count(r.vertices_removed),
+                    ],
+                )?;
+            }
+            RepairOp::Shell(thickness) => {
+                let r = fast_mesh_ops::shell(
+                    tx,
+                    &ShellOptions {
+                        thickness: *thickness,
+                    },
+                )?;
+                put(
+                    &mut out,
+                    &[
+                        count(r.vertices_added),
+                        count(r.triangles_added),
+                        count(r.loops_closed),
+                        count(r.degenerate_removed),
+                        count(r.vertices_removed),
+                    ],
+                )?;
             }
         }
     }
@@ -1088,5 +1134,20 @@ mod tests {
             code(&[9., 0., 0., 0., 1., 2., 1., 0., 0., 0.]),
             codes::INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn decode_repair_offset_shell() {
+        let d = decode_repair(&[11., 0.5], &[]).unwrap();
+        assert_eq!(d, vec![RepairOp::Offset(0.5)]);
+        let d = decode_repair(&[12., 0.25], &[]).unwrap();
+        assert_eq!(d, vec![RepairOp::Shell(0.25)]);
+        // The values ride through as f32; range checks belong to the ops.
+        let d = decode_repair(&[11., -2.], &[]).unwrap();
+        assert_eq!(d, vec![RepairOp::Offset(-2.0)]);
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[11.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[12.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1.]), codes::INVALID_ARGUMENT);
     }
 }

@@ -260,6 +260,14 @@ fn rotate_back(rotation: &[[f64; 3]; 3], d: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| r[0][i] * d[0] + r[1][i] * d[1] + r[2][i] * d[2])
 }
 
+/// `S (Rᵀ d)`: a world direction in the mesh's scaled local frame, before
+/// normalising. With a non-uniform scale this is not a rotation: axes mapped
+/// this way are re-orthonormalised below.
+fn scale_back(p: &Placement, d: [f64; 3]) -> [f64; 3] {
+    let t = rotate_back(&p.rotation, d);
+    std::array::from_fn(|i| p.scale[i] * t[i])
+}
+
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -269,14 +277,17 @@ fn unit(a: [f64; 3]) -> [f64; 3] {
     a.map(|c| c / n)
 }
 
-/// The world plane in the mesh's stored local frame (origin excluded), with
-/// axes `Rᵀu` and `Rᵀv`, so that local `(u, v)` equals world `(u, v)`. The
-/// axes are re-orthonormalised: a placement's rotation is only orthonormal
-/// within `1e-6`.
+/// The world plane in the mesh's stored local frame (origin excluded). The
+/// axes are the world `(u, v)` mapped through the placement's linear inverse
+/// (`S Rᵀ`, then re-orthonormalised: a placement's rotation is only
+/// orthonormal within `1e-6`, and a non-uniform scale skews the frame), so
+/// that the local plane's zero set is the preimage of the world's, with
+/// matching sides. Cut points map back to the world and their `(u, v)` come
+/// from the world plane, so lengths and areas follow the scale exactly.
 fn local_plane(p: &Placement, mesh_origin: [f64; 3], plane: &Plane) -> Result<Plane> {
     let origin = world_to_local(p, mesh_origin, plane.origin());
-    let u = unit(rotate_back(&p.rotation, plane.u()));
-    let v = rotate_back(&p.rotation, plane.v());
+    let u = unit(scale_back(p, plane.u()));
+    let v = scale_back(p, plane.v());
     let d = dot(v, u);
     let v = unit(std::array::from_fn(|k| v[k] - d * u[k]));
     Ok(Plane::with_axes(origin, u, v)?)
@@ -1060,6 +1071,73 @@ mod tests {
         Plane::new([0.0, 0.0, h], [0.0, 0.0, 1.0]).unwrap()
     }
 
+    #[test]
+    fn scaled_section_follows_the_scale() {
+        // The unit sphere scaled by [2, 1, 1] and moved to [0, 3, 0]: the
+        // world shape is x in [-2, 2], y in [2, 4]. The plane x = 1 cuts a
+        // circle of radius sqrt(1 - 1/4) around [1, 3, 0].
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene
+            .add_mesh(
+                unit_sphere(),
+                MeshOptions {
+                    placement: Placement {
+                        translation: [0.0, 3.0, 0.0],
+                        scale: [2.0, 1.0, 1.0],
+                        ..Placement::IDENTITY
+                    },
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        scene.take_changes();
+        let plane = Plane::new([1.0, 3.0, 0.0], [1.0, 0.0, 0.0]).unwrap();
+        let id = scene.add_section(desc(plane, &[m], false)).unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap().clone();
+        assert_eq!(r.contours.len(), 1);
+        let c = &r.contours[0];
+        assert!(c.closed && c.oriented && c.manifold);
+        assert!(
+            c.points.iter().all(|p| (p[0] - 1.0).abs() < 1e-6),
+            "{:?}",
+            &c.points[..4.min(c.points.len())]
+        );
+        let want_len = 2.0 * PI * (0.75f64).sqrt();
+        assert!(
+            close(r.length, want_len, 2e-2),
+            "{} vs {want_len}",
+            r.length
+        );
+        assert!(
+            close(r.area, PI * 0.75, 2e-2),
+            "{} vs {}",
+            r.area,
+            PI * 0.75
+        );
+        assert_fresh(&mut scene, id, m, "scaled");
+        // Moving the mesh restales the entry until it is recomputed.
+        scene
+            .set_placement(
+                m,
+                Placement {
+                    translation: [0.0, 3.0, 2.0],
+                    scale: [2.0, 1.0, 1.0],
+                    ..Placement::IDENTITY
+                },
+            )
+            .unwrap();
+        assert_eq!(scene.section_status(id, m), Ok(SectionStatus::Current));
+        let r = scene.section(id, m).unwrap();
+        assert!(close(r.length, want_len, 2e-2), "{}", r.length);
+        assert!(
+            r.contours[0]
+                .points
+                .iter()
+                .all(|p| (p[0] - 1.0).abs() < 1e-6)
+        );
+    }
+
     fn desc(plane: Plane, meshes: &[MeshId], fill: bool) -> SectionDesc {
         SectionDesc {
             plane,
@@ -1276,6 +1354,7 @@ mod tests {
             let placement = Placement {
                 rotation: rotation([next(), next(), next(), next()]),
                 translation: [next() * 50.0, next() * 50.0, next() * 50.0],
+                ..Placement::IDENTITY
             };
             let opts = MeshOptions {
                 placement,

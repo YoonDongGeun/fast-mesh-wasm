@@ -21,10 +21,10 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, analyze};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    ColorRule, Coloring, Colormap, ContactFilter, DistanceField, FieldBudget, FieldId, JoinOptions,
-    MeshBuild, MeshId, MeshOptions, OutOfRange, Placement, Plane, Scene, SceneClosestOptions,
-    SceneError, SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode,
-    StepState, UpdateMode,
+    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CutOptions, DistanceField,
+    FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, OutOfRange, Placement,
+    Plane, Scene, SceneClosestOptions, SceneError, SceneOptions, SceneRayOptions, SectionDesc,
+    SectionId, SectionStatus, SignMode, StepState, UpdateMode,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -499,14 +499,16 @@ impl WasmScene {
         Ok(())
     }
 
-    /// Sets the placement from a row-major rotation (9 values) and a
-    /// translation (3 values). The rotation must be a proper rotation.
+    /// Sets the placement from a row-major rotation (9 values), a
+    /// translation (3 values) and a scale (3 values, each positive; `None`
+    /// for `[1, 1, 1]`). The rotation must be a proper rotation.
     pub fn set_placement(
         &mut self,
         index: u32,
         generation: u32,
         rotation: &[f64],
         translation: &[f64],
+        scale: Option<Vec<f64>>,
     ) -> Result<(), Error> {
         let id = self.id(index, generation)?;
         let r: [f64; 9] = rotation
@@ -515,36 +517,59 @@ impl WasmScene {
         let translation: [f64; 3] = translation
             .try_into()
             .map_err(|_| Error::invalid("translation must have 3 values"))?;
+        let scale: [f64; 3] = match scale {
+            None => [1.0; 3],
+            Some(s) => s
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::invalid("scale must have 3 values"))?,
+        };
         let placement = Placement {
             rotation: [[r[0], r[1], r[2]], [r[3], r[4], r[5]], [r[6], r[7], r[8]]],
             translation,
+            scale,
         };
         Ok(self.scene.set_placement(id, placement)?)
     }
 
     /// The placement: the row-major rotation (9 values), then the
-    /// translation (3 values).
+    /// translation (3 values), then the scale (3 values).
     pub fn placement(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
         let p = self.scene.placement(self.id(index, generation)?)?;
         let mut out = p.rotation.as_flattened().to_vec();
         out.extend_from_slice(&p.translation);
+        out.extend_from_slice(&p.scale);
         Ok(out)
     }
 
     /// The world matrix of the local render coordinates,
-    /// `placement · translate(origin)`, column-major (16 values).
+    /// `placement · translate(origin)`, column-major (16 values): the
+    /// rotation columns are scaled, and the last column is
+    /// `rotation · (scale · origin) + translation`.
     pub fn matrix4(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
         let p = self.scene.placement(id)?;
         let o = self.scene.mesh(id)?.origin();
-        let r = p.rotation;
-        // The last column is R·o + t.
+        let (r, s) = (p.rotation, p.scale);
+        // The last column is R·(S·o) + t.
         let w = p.apply(o);
         Ok(vec![
-            r[0][0], r[1][0], r[2][0], 0.0, //
-            r[0][1], r[1][1], r[2][1], 0.0, //
-            r[0][2], r[1][2], r[2][2], 0.0, //
-            w[0], w[1], w[2], 1.0,
+            s[0] * r[0][0],
+            s[0] * r[1][0],
+            s[0] * r[2][0],
+            0.0, //
+            s[1] * r[0][1],
+            s[1] * r[1][1],
+            s[1] * r[2][1],
+            0.0, //
+            s[2] * r[0][2],
+            s[2] * r[1][2],
+            s[2] * r[2][2],
+            0.0, //
+            w[0],
+            w[1],
+            w[2],
+            1.0,
         ])
     }
 
@@ -916,6 +941,75 @@ impl WasmScene {
             r.vertices_added as f64,
             r.triangles_added as f64,
             r.bridge_triangles_added as f64,
+        ])
+    }
+
+    /// Cuts a mesh with a world plane `[origin xyz, normal xyz]`: the `+`
+    /// side stays on the mesh and the `-` side is added as a new mesh with
+    /// the same placement. Returns `[kept index, kept generation, added
+    /// index, added generation, kept triangles, removed triangles, cap
+    /// triangles]`. With `cap` (the usual case) both openings are closed
+    /// with flat, unfaired patches; without it both parts keep the open rim.
+    /// The cut undoes in one step; the added mesh stays, like the removed
+    /// source of [`WasmScene::join`].
+    pub fn cut_by_plane(
+        &mut self,
+        index: u32,
+        generation: u32,
+        plane: &[f64],
+        cap: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let options = CutOptions {
+            plane: parse_plane(plane)?,
+            cap,
+        };
+        let r = self.scene.cut_by_plane(id, &options)?;
+        let added = self.added(r.added, false)?;
+        Ok(vec![
+            index,
+            generation,
+            added[0],
+            added[1],
+            len(r.kept_triangles),
+            len(r.removed_triangles),
+            len(r.cap_triangles),
+        ])
+    }
+
+    /// Combines mesh B into mesh A in the world and returns `[index,
+    /// generation, kept triangles, triangles added]` of A (the result
+    /// replaces A with A's placement; B is unchanged). `op` is 0 (union),
+    /// 1 (subtract) or 2 (intersect). The boolean undoes in one step;
+    /// combining a mesh with itself is a no-op for union and intersect,
+    /// and clears it for subtract. Only positions and triangles cross
+    /// over; the new vertices take channel defaults.
+    pub fn boolean(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+        op: u8,
+    ) -> Result<Vec<u32>, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        let op = match op {
+            0 => BooleanOp::Union,
+            1 => BooleanOp::Subtract,
+            2 => BooleanOp::Intersect,
+            _ => {
+                return Err(Error::invalid(
+                    "op must be 0 (union), 1 (subtract) or 2 (intersect)",
+                ));
+            }
+        };
+        let r = self.scene.boolean(a, b, op)?;
+        Ok(vec![
+            a_index,
+            a_generation,
+            len(r.kept_triangles),
+            len(r.triangles_added),
         ])
     }
 
@@ -1452,16 +1546,29 @@ mod tests {
         // Quarter turn about z, then a translation: R·(p) + t with
         // p = o + local, so the last column is R·o + t.
         let rot = [0., -1., 0., 1., 0., 0., 0., 0., 1.];
-        s.set_placement(i, g, &rot, &[10., 20., 30.]).unwrap();
+        s.set_placement(i, g, &rot, &[10., 20., 30.], None).unwrap();
         let p = s.placement(i, g).unwrap();
         assert_eq!(&p[..9], &rot);
-        assert_eq!(&p[9..], &[10., 20., 30.]);
+        assert_eq!(&p[9..12], &[10., 20., 30.]);
+        assert_eq!(&p[12..], &[1., 1., 1.]);
         let m = s.matrix4(i, g).unwrap();
         // Column-major: column j is m[4j..4j+4].
         assert_eq!(&m[0..4], &[0., 1., 0., 0.]);
         assert_eq!(&m[4..8], &[-1., 0., 0., 0.]);
         assert_eq!(&m[8..12], &[0., 0., 1., 0.]);
         assert_eq!(&m[12..16], &[9., 21., 30., 1.]);
+        // A scale multiplies the rotation columns, and the last column is
+        // R·(S·o) + t: the origin [1, 1, 0] maps to [9, 21, 30] here, since
+        // R·(S·o) = Rz90·(2, 1, 0) = (-1, 2, 0).
+        s.set_placement(i, g, &rot, &[10., 20., 30.], Some(vec![2., 1., 3.]))
+            .unwrap();
+        let p = s.placement(i, g).unwrap();
+        assert_eq!(&p[12..], &[2., 1., 3.]);
+        let m = s.matrix4(i, g).unwrap();
+        assert_eq!(&m[0..4], &[0., 2., 0., 0.]);
+        assert_eq!(&m[4..8], &[-1., 0., 0., 0.]);
+        assert_eq!(&m[8..12], &[0., 0., 3., 0.]);
+        assert_eq!(&m[12..16], &[9., 22., 30., 1.]);
         // An explicit origin is used as given.
         let id = s
             .add_mesh(&QUAD, &QUAD_TRIS, Some(vec![0., 0., 0.]), 1, true)
@@ -1518,6 +1625,43 @@ mod tests {
     }
 
     #[test]
+    fn cut_by_plane_binding() {
+        let mut s = WasmScene::new();
+        // A closed unit cube, outward wound.
+        let positions: [f64; 24] = [
+            0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0., //
+            0., 0., 1., 1., 0., 1., 1., 1., 1., 0., 1., 1.,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, //
+            0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, //
+            1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+        ];
+        let id = s.add_mesh(&positions, &indices, None, 0, false).unwrap();
+        let (i, g) = (id[0], id[1]);
+        let r = s
+            .cut_by_plane(i, g, &[0.5, 0., 0., 1., 0., 0.], true)
+            .unwrap();
+        assert_eq!(r.len(), 7);
+        assert_eq!(&r[..2], &[i, g]);
+        assert_eq!(s.triangle_count(i, g).unwrap(), r[4]);
+        assert_eq!(s.triangle_count(r[2], r[3]).unwrap(), r[5]);
+        assert!(r[6] > 0);
+        // The added mesh renders: it has a render state and the placement.
+        assert_eq!(s.placement(r[2], r[3]).unwrap(), s.placement(i, g).unwrap());
+        assert_eq!(s.bounds(r[2], r[3]).unwrap().len(), 6);
+        // A plane past the cube misses it; nothing changes.
+        assert_eq!(
+            code(s.cut_by_plane(i, g, &[5., 0., 0., 1., 0., 0.], true)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(s.triangle_count(i, g).unwrap(), r[4]);
+        // The cut undoes in one step.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.triangle_count(i, g).unwrap(), 12);
+    }
+
+    #[test]
     fn error_codes_map() {
         let mut s = WasmScene::new();
         let (i, g) = add(&mut s, true);
@@ -1525,11 +1669,20 @@ mod tests {
         assert_eq!(code(s.remove_mesh(i, g + 1)), codes::UNKNOWN_MESH);
         assert_eq!(code(s.matrix4(i + 7, 0)), codes::UNKNOWN_MESH);
         assert_eq!(
-            code(s.set_placement(i, g, &[2.; 9], &[0.; 3])),
+            code(s.set_placement(i, g, &[2.; 9], &[0.; 3], None)),
             codes::INVALID_ARGUMENT
         );
         assert_eq!(
-            code(s.set_placement(i, g, &IDENTITY, &[0.; 2])),
+            code(s.set_placement(i, g, &IDENTITY, &[0.; 2], None)),
+            codes::INVALID_ARGUMENT
+        );
+        // Scales must be 3 finite positive values.
+        assert_eq!(
+            code(s.set_placement(i, g, &IDENTITY, &[0.; 3], Some(vec![1., 0., 1.]))),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.set_placement(i, g, &IDENTITY, &[0.; 3], Some(vec![1., 1.]))),
             codes::INVALID_ARGUMENT
         );
         assert_eq!(code(s.set_mode(i, g, 3)), codes::INVALID_ARGUMENT);
@@ -1681,7 +1834,8 @@ mod tests {
         );
 
         // A placement change only sets its flag.
-        s.set_placement(i, g, &IDENTITY, &[1., 0., 0.]).unwrap();
+        s.set_placement(i, g, &IDENTITY, &[1., 0., 0.], None)
+            .unwrap();
         assert_eq!(
             s.take_changes(),
             vec![1, i, g, FLAG_PLACEMENT, 0, 0, 0, 0, 0, 0]
@@ -1693,8 +1847,10 @@ mod tests {
         assert!(s.can_redo());
         s.take_changes();
         s.begin_step();
-        s.set_placement(i, g, &IDENTITY, &[2., 0., 0.]).unwrap();
-        s.set_placement(i, g, &IDENTITY, &[3., 0., 0.]).unwrap();
+        s.set_placement(i, g, &IDENTITY, &[2., 0., 0.], None)
+            .unwrap();
+        s.set_placement(i, g, &IDENTITY, &[3., 0., 0.], None)
+            .unwrap();
         s.end_step().unwrap();
         assert!(!s.can_redo());
         assert!(s.undo().unwrap());
@@ -1800,13 +1956,15 @@ mod tests {
             []
         );
         // Placements move meshes in the world.
-        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 10.]).unwrap();
+        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 10.], None)
+            .unwrap();
         let h = s
             .raycast(&[3., 0., 20.], &[0., 0., -1.], 0., inf, 1)
             .unwrap();
         assert_eq!(&h[..2], &[f64::from(bi), f64::from(bg)]);
         assert!((h[5] - 11.).abs() < 1e-6);
-        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 0.]).unwrap();
+        s.set_placement(bi, bg, &IDENTITY, &[0., 0., 0.], None)
+            .unwrap();
 
         let c = s.closest_point(&[1.5, 0., 0.], inf).unwrap();
         assert_eq!(&c[..2], &[f64::from(ai), f64::from(ag)]);
@@ -1908,7 +2066,8 @@ mod tests {
         assert_eq!(s.field_values_ptr(f).unwrap(), values.as_ptr() as u32);
         assert!((values[0] - 1.).abs() < 1e-6);
 
-        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.]).unwrap();
+        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.], None)
+            .unwrap();
         s.undo().unwrap();
         s.take_changes();
         let rule = |extra: &[f32]| {
@@ -1993,7 +2152,8 @@ mod tests {
         assert_eq!(s.field_step(1).unwrap(), 0);
         assert!(s.field_step_meshes().is_empty());
 
-        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.]).unwrap();
+        s.set_placement(bi, bg, &IDENTITY, &[1., 0., 0.], None)
+            .unwrap();
         // Deferred: the values wait for the steps.
         assert_eq!(s.scene.field_values(s.field(f).unwrap()).unwrap(), before);
         assert_eq!(s.field_step(1).unwrap(), 1);
@@ -2117,7 +2277,7 @@ mod tests {
         let (i, g) = add(&mut s, true);
         // Quarter turn about z and a shift; the origin is (1, 1, 0).
         let rot = [0., -1., 0., 1., 0., 0., 0., 0., 1.];
-        s.set_placement(i, g, &rot, &[10., 20., 30.]).unwrap();
+        s.set_placement(i, g, &rot, &[10., 20., 30.], None).unwrap();
         s.clear_history().unwrap();
         s.take_changes();
         // Add a vertex at world t (local -origin), a triangle on it by ref,

@@ -453,8 +453,9 @@ export interface Analysis {
 }
 
 /**
- * Options of {@link Scene.analyze}. Distances are in mesh units: placements are
- * rigid, so local and world distances agree.
+ * Options of {@link Scene.analyze}. Distances are in mesh units; with a
+ * rigid placement local and world distances agree, with a scaled one local
+ * distances are in unscaled units.
  */
 export interface AnalyzeOptions {
   /**
@@ -555,6 +556,26 @@ export type RepairOp =
       strength: number;
       /** How many plain Laplacian passes to run; 0 moves nothing. */
       cycles: number;
+    }
+  | {
+      op: "offset";
+      /**
+       * How far to move the surface along its smooth normals, in mesh units
+       * (equal to world units). Positive follows the normals (outward on an
+       * outward-wound closed mesh); negative sinks inward. Must be finite;
+       * 0 moves nothing.
+       */
+      distance: number;
+    }
+  | {
+      op: "shell";
+      /**
+       * Wall thickness in mesh units (equal to world units): the input
+       * surface stays and gains a reversed copy one thickness against its
+       * smooth normals, with every boundary rim stitched shut. Must be
+       * positive and finite.
+       */
+      thickness: number;
     };
 
 /** What `weld` did. */
@@ -645,6 +666,30 @@ export interface RelaxReport {
   maxDisplacement: number;
 }
 
+/** What `offset` did. */
+export interface OffsetReport {
+  moved: number;
+  maxDisplacement: number;
+  /** Degenerate triangles the cleanup pass removed. */
+  degenerateRemoved: number;
+  /** Vertices the cleanup pass removed. */
+  verticesRemoved: number;
+}
+
+/** What `shell` did. */
+export interface ShellReport {
+  /** Copy vertices added. */
+  verticesAdded: number;
+  /** Copy and wall triangles added. */
+  trianglesAdded: number;
+  /** Boundary rims stitched to their copy. A closed mesh has none. */
+  loopsClosed: number;
+  /** Degenerate triangles the cleanup pass removed. */
+  degenerateRemoved: number;
+  /** Vertices the cleanup pass removed. */
+  verticesRemoved: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -665,6 +710,32 @@ export interface JoinReport {
   bridgeTrianglesAdded: number;
 }
 
+/** Options of {@link Scene.cutByPlane}. */
+export interface CutOptions {
+  /**
+   * Close both openings with flat, unfaired patches. Defaults to `true`;
+   * without it both parts keep the open rim the cut leaves.
+   */
+  cap?: boolean;
+}
+
+/** What {@link Scene.cutByPlane} did. */
+export interface CutReport {
+  /** The original handle, now holding the `+` side. */
+  kept: MeshHandle;
+  /** The new handle holding the `-` side. */
+  removed: MeshHandle;
+  /** Alive triangles of {@link CutReport.kept}, cap included. */
+  keptTriangles: number;
+  /** Alive triangles of {@link CutReport.removed}, cap included. */
+  removedTriangles: number;
+  /** Cap triangles added on both sides together. */
+  capTriangles: number;
+}
+
+/** Which boolean for {@link Scene.boolean} to compute. */
+export type BooleanOp = "union" | "subtract" | "intersect";
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -677,7 +748,9 @@ export type RepairReport =
   | RemeshReport
   | BridgeReport
   | GrabReport
-  | RelaxReport;
+  | RelaxReport
+  | OffsetReport
+  | ShellReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -702,7 +775,11 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                     ? GrabReport
                     : O extends { op: "relax" }
                       ? RelaxReport
-                      : RepairReport;
+                      : O extends { op: "offset" }
+                        ? OffsetReport
+                        : O extends { op: "shell" }
+                          ? ShellReport
+                          : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -863,6 +940,8 @@ const REPAIR_CODES = {
   bridgeLoops: 8,
   grab: 9,
   relax: 10,
+  offset: 11,
+  shell: 12,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
@@ -1002,6 +1081,12 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         values.push(d[0], d[1], d[2]);
         break;
       }
+      case "offset":
+        values.push(optional(o.distance, "distance"));
+        break;
+      case "shell":
+        values.push(optional(o.thickness, "thickness"));
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -1095,6 +1180,21 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { trianglesAdded: r.next() };
     case "grab":
       return { moved: r.next(), maxDisplacement: r.next() };
+    case "offset":
+      return {
+        moved: r.next(),
+        maxDisplacement: r.next(),
+        degenerateRemoved: r.next(),
+        verticesRemoved: r.next(),
+      };
+    case "shell":
+      return {
+        verticesAdded: r.next(),
+        trianglesAdded: r.next(),
+        loopsClosed: r.next(),
+        degenerateRemoved: r.next(),
+        verticesRemoved: r.next(),
+      };
   }
 }
 
@@ -1462,30 +1562,88 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * Sets a mesh's placement: world = rotation · local + translation, where
-   * local is relative to the mesh origin. A quaternion is normalised and
-   * converted in double precision.
+   * Cuts `mesh` with a world `plane`: the `+` side
+   * (`signedDistance >= 0`) stays on the mesh and the `-` side is added as
+   * a new mesh with the same placement, so the world shape is kept.
+   * Cutting a closed mesh with `cap` (the default) yields two closed
+   * meshes, capped with flat, unfaired patches.
    *
-   * @throws `INVALID_ARGUMENT` when the rotation is not a proper rotation or a quaternion is zero.
+   * The cut undoes in one step; the added mesh stays, like the removed
+   * source of {@link Scene.join}.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
+   * the plane does not cut the mesh or a rim cannot be capped. A failed cut
+   * changes nothing.
+   */
+  cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): CutReport {
+    const { index, generation } = this.#id(mesh);
+    const p = this.#plane(plane);
+    const r = call(() => this.#scene().cut_by_plane(index, generation, p, options?.cap ?? true));
+    return {
+      kept: this.#meshHandle(r[0], r[1]),
+      removed: this.#meshHandle(r[2], r[3]),
+      keptTriangles: r[4],
+      removedTriangles: r[5],
+      capTriangles: r[6],
+    };
+  }
+
+  /**
+   * Combines `source` into `target` in the world: the union, subtraction
+   * (`target` minus `source`) or intersection. Returns `target`, now
+   * holding the result with its placement; `source` is unchanged.
+   *
+   * Both meshes must be closed and manifold. The boolean undoes in one
+   * step. Combining a mesh with itself is a no-op for `"union"` and
+   * `"intersect"`, and clears it for `"subtract"`.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for an
+   * input that is not closed, manifold and consistently wound. A failed
+   * boolean changes nothing.
+   */
+  boolean(target: MeshHandle, source: MeshHandle, op: BooleanOp): MeshHandle {
+    const ta = this.#id(target);
+    const sb = this.#id(source);
+    const code = codeIn({ union: 0, subtract: 1, intersect: 2 }, op, "op");
+    const r = call(() =>
+      this.#scene().boolean(ta.index, ta.generation, sb.index, sb.generation, code),
+    );
+    return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Sets a mesh's placement: world = rotation · (scale · local) + translation,
+   * where local is relative to the mesh origin. A quaternion is normalised
+   * and converted in double precision. The scale defaults to `[1, 1, 1]`
+   * (rigid) and must be 3 finite positive numbers.
+   *
+   * @throws `INVALID_ARGUMENT` when the rotation is not a proper rotation, the
+   * scale is not 3 finite positive numbers, or a quaternion is zero.
    */
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void {
     const { index, generation } = this.#id(mesh);
     const r = Float64Array.from(rotationMatrix(placement.rotation));
     const t = Float64Array.from(placement.translation);
-    call(() => this.#scene().set_placement(index, generation, r, t));
+    const s = placement.scale === undefined ? undefined : Float64Array.from(placement.scale);
+    call(() => this.#scene().set_placement(index, generation, r, t, s));
   }
 
   /** A mesh's placement, with the rotation as a row-major matrix. */
   placement(mesh: MeshHandle): Placement {
     const { index, generation } = this.#id(mesh);
     const p = call(() => this.#peek().placement(index, generation));
-    return { rotation: Array.from(p.subarray(0, 9)), translation: [p[9], p[10], p[11]] };
+    return {
+      rotation: Array.from(p.subarray(0, 9)),
+      translation: [p[9], p[10], p[11]],
+      scale: [p[12], p[13], p[14]],
+    };
   }
 
   /**
    * The column-major world matrix of the local render coordinates,
    * `placement · translate(origin)`, ready for renderers (convert to `f32`
-   * yourself).
+   * yourself). The rotation columns carry the scale; normals need the
+   * inverse-transpose (three.js' normal matrix does this from the matrix).
    */
   matrix4(mesh: MeshHandle): Float64Array {
     const { index, generation } = this.#id(mesh);
@@ -1790,8 +1948,8 @@ export class Scene implements SceneLike {
           return;
         }
         // Validate the shape and the values now, so a bad pose throws here
-        // and not at the frame. Whether a matrix is a proper rotation is
-        // still checked when the pose is applied.
+        // and not at the frame. Whether a matrix is a proper rotation (and
+        // the scale positive) is still checked when the pose is applied.
         const rotation = rotationMatrix(placement.rotation);
         if (!rotation.every(Number.isFinite)) {
           throw invalid("rotation must be finite numbers");
@@ -1800,7 +1958,15 @@ export class Scene implements SceneLike {
         if (t?.length !== 3 || ![t[0], t[1], t[2]].every(Number.isFinite)) {
           throw invalid("translation must be 3 finite numbers");
         }
-        pending = { rotation, translation: [t[0], t[1], t[2]] };
+        const s = placement.scale;
+        if (s !== undefined && (s.length !== 3 || ![s[0], s[1], s[2]].every(Number.isFinite))) {
+          throw invalid("scale must be 3 finite numbers");
+        }
+        pending = {
+          rotation,
+          translation: [t[0], t[1], t[2]],
+          ...(s === undefined ? {} : { scale: [s[0], s[1], s[2]] as Vec3 }),
+        };
       },
       end: () => {
         if (finish()) {

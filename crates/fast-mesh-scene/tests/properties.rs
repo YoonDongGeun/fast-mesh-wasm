@@ -265,6 +265,7 @@ fn placement(seed: PlacementSeed, anchor: [f64; 3]) -> Placement {
     Placement {
         rotation,
         translation,
+        ..Placement::IDENTITY
     }
 }
 

@@ -1055,8 +1055,9 @@ impl Scene {
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], [`SceneError::InvalidInput`] when the
-    /// placement is not a proper rotation, or [`SceneError::Store`] when
-    /// there is no memory to record it. The scene is unchanged on error.
+    /// rotation is not a proper rotation or the scale is not finite and
+    /// positive, or [`SceneError::Store`] when there is no memory to record
+    /// it. The scene is unchanged on error.
     pub fn set_placement(&mut self, id: MeshId, placement: Placement) -> Result<()> {
         self.drop_field_unit();
         placement.validate()?;
@@ -1381,6 +1382,69 @@ mod tests {
         assert!(scene.set_placement(id, bad).is_err());
         assert_eq!(scene.placement(id), Ok(moved));
         assert_eq!(scene.is_current(id), Ok(true));
+    }
+
+    #[test]
+    fn scaled_placement_undoes_and_rejects_bad_scales() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(tri(), MeshOptions::default()).unwrap();
+        scene.take_changes();
+        let scaled = Placement {
+            translation: [1.0, 2.0, 3.0],
+            scale: [2.0, 0.5, 1.0],
+            ..Placement::IDENTITY
+        };
+        scene.set_placement(id, scaled).unwrap();
+        assert_eq!(scene.placement(id), Ok(scaled));
+        assert!(scene.take_changes()[0].placement_changed);
+        // Undo restores the identity scale; redo brings the scaled one back.
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(id), Ok(Placement::IDENTITY));
+        assert_eq!(scene.redo(), Ok(true));
+        assert_eq!(scene.placement(id), Ok(scaled));
+        // A drag's consecutive scales merge into one history entry.
+        scene.begin_step();
+        scene
+            .set_placement(
+                id,
+                Placement {
+                    scale: [3.0, 0.5, 1.0],
+                    ..scaled
+                },
+            )
+            .unwrap();
+        scene
+            .set_placement(
+                id,
+                Placement {
+                    scale: [4.0, 0.5, 1.0],
+                    ..scaled
+                },
+            )
+            .unwrap();
+        scene.end_step().unwrap();
+        assert_eq!(scene.undo(), Ok(true));
+        assert_eq!(scene.placement(id), Ok(scaled));
+        // Zero, negative and non-finite scales are rejected.
+        for scale in [
+            [0.0, 1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [f64::NAN, 1.0, 1.0],
+            [1.0, f64::INFINITY, 1.0],
+        ] {
+            let bad = Placement {
+                scale,
+                ..Placement::IDENTITY
+            };
+            assert!(
+                matches!(
+                    scene.set_placement(id, bad),
+                    Err(SceneError::InvalidInput(_))
+                ),
+                "scale {scale:?}"
+            );
+            assert_eq!(scene.placement(id), Ok(scaled));
+        }
     }
 
     #[test]
@@ -2857,6 +2921,7 @@ mod tests {
             placement: Placement {
                 rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
                 translation: [0.5, 0.1, -0.2],
+                ..Placement::IDENTITY
             },
             ..MeshOptions::default()
         };
@@ -2947,6 +3012,7 @@ mod tests {
             placement: Placement {
                 rotation: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 translation: [0.0; 3],
+                ..Placement::IDENTITY
             },
             ..MeshOptions::default()
         };

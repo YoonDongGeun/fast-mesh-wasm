@@ -41,18 +41,28 @@ export type Mat3 = readonly number[];
  */
 export type UpdateMode = "eager" | "lazy" | "manual";
 
-/** A placement to set: a rotation (row-major matrix or quaternion) and a translation. */
+/** A placement to set: a rotation (row-major matrix or quaternion), a per-axis scale and a translation. */
 export interface PlacementInput {
   /** A proper rotation: 9 numbers row-major, or a quaternion `[x, y, z, w]`. */
   rotation: Mat3 | Quat;
   translation: Readonly<Vec3>;
+  /**
+   * Per-axis scale: 3 finite positive numbers. Defaults to `[1, 1, 1]`
+   * (rigid). Both uniform and non-uniform scales are supported.
+   */
+  scale?: Readonly<Vec3>;
 }
 
-/** A mesh placement: world = rotation · local + translation. */
+/** A mesh placement: world = rotation · (scale · local) + translation. */
 export interface Placement {
   /** 9 numbers, row-major. */
   rotation: number[];
   translation: Vec3;
+  /**
+   * 3 numbers; `[1, 1, 1]` for a rigid placement. Always present from
+   * {@link Scene}; absent on hosts that do not track scale.
+   */
+  scale?: Vec3;
 }
 
 /** Axis-aligned bounding box. */

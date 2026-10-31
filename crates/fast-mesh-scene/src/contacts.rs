@@ -2,6 +2,8 @@
 
 use fast_mesh_store::{StoreError, TriangleId};
 
+use fast_mesh_query::Rigid;
+
 use crate::placement::relative_rigid;
 use crate::query::{Aabb64, MARGIN, cached_world_box, check_bound, pair_pad, round_up, try_vec};
 use crate::{MeshId, Result, Scene, SceneError};
@@ -155,20 +157,90 @@ impl Scene {
         }
         #[cfg(test)]
         crate::scene::fault::before_contact()?;
-        let xf = relative_rigid(
-            &ea.placement,
-            ea.mesh.origin(),
-            &eb.placement,
-            eb.mesh.origin(),
-        );
+        if crate::placement::is_relative_rigid(&ea.placement, &eb.placement) {
+            let xf = relative_rigid(
+                &ea.placement,
+                ea.mesh.origin(),
+                &eb.placement,
+                eb.mesh.origin(),
+            );
+            return self.contact_rigid(a, b, &xf, margin, out);
+        }
+        self.contact_scaled(a, b, margin, out)
+    }
+
+    /// The narrow phase for one pair with the relative transform `xf`: the
+    /// rigid path of [`Scene::contact`].
+    fn contact_rigid(
+        &self,
+        a: MeshId,
+        b: MeshId,
+        xf: &Rigid,
+        margin: f64,
+        out: &mut Vec<Contact>,
+    ) -> Result<()> {
+        let (ea, eb) = (self.entry(a)?, self.entry(b)?);
         let (ma, ba, mb, bb) = (&ea.mesh, &ea.bvh, &eb.mesh, &eb.bvh);
         let m32 = round_up(margin);
+        let intersecting = fast_mesh_query::intersects(ma, ba, mb, bb, xf)?;
+        let distance = if intersecting {
+            0.0
+        } else {
+            match fast_mesh_query::mesh_distance(ma, ba, mb, bb, xf, m32)? {
+                Some(d) if f64::from(d.distance) <= margin => f64::from(d.distance),
+                _ => return Ok(()),
+            }
+        };
+        let (mut triangles_a, mut triangles_b) = (Vec::new(), Vec::new());
+        fast_mesh_query::triangles_near(
+            ma,
+            ba,
+            mb,
+            bb,
+            xf,
+            m32,
+            &mut triangles_a,
+            &mut triangles_b,
+        )?;
+        out.try_reserve(1)
+            .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+        out.push(Contact {
+            a,
+            b,
+            intersecting,
+            distance,
+            triangles_a,
+            triangles_b,
+        });
+        Ok(())
+    }
+
+    /// The narrow phase for one scaled pair: on a copy of B baked into A's
+    /// local space (or of both into the world when A is non-uniformly
+    /// scaled; see [`Scene::bake_pair_inner`]). Frame distances map to the
+    /// world times the frame's factor.
+    fn contact_scaled(
+        &self,
+        a: MeshId,
+        b: MeshId,
+        margin: f64,
+        out: &mut Vec<Contact>,
+    ) -> Result<()> {
+        let (ta, tb, s) = self.bake_pair_inner(a, b)?;
+        let ea = self.entry(a)?;
+        let (ma, ba) = match &ta {
+            None => (&ea.mesh, &ea.bvh),
+            Some((m, bvh)) => (m, bvh),
+        };
+        let (mb, bb) = (&tb.0, &tb.1);
+        let xf = Rigid::IDENTITY;
+        let m32 = round_up(margin / s);
         let intersecting = fast_mesh_query::intersects(ma, ba, mb, bb, &xf)?;
         let distance = if intersecting {
             0.0
         } else {
             match fast_mesh_query::mesh_distance(ma, ba, mb, bb, &xf, m32)? {
-                Some(d) if f64::from(d.distance) <= margin => f64::from(d.distance),
+                Some(d) if s * f64::from(d.distance) <= margin => s * f64::from(d.distance),
                 _ => return Ok(()),
             }
         };

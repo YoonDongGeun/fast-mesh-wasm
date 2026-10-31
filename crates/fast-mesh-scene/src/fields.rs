@@ -68,12 +68,15 @@
 //! unchanged). Each part gives the same bits in steps as in one call, so a
 //! stepped update equals a one-call one.
 
+use fast_mesh_bvh::Bvh;
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignBuild, SignData, SignMode, SignStatus, Target, color_of,
-    signed_distances_multi,
+    signed_distances, signed_distances_multi,
 };
 use fast_mesh_query::{NearSearch, Rigid};
-use fast_mesh_store::{ChangeSet, ChannelDesc, StoreError, TriangleId, VertexId, par};
+use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, StoreError, TriangleId, VertexId, par};
+
+use crate::baked::baked_mesh;
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -223,7 +226,7 @@ struct FieldJob {
     /// Per target: the margin of its near set, when it is needed.
     near_margins: Vec<Option<f64>>,
     /// Per target: from its local space into A's, as the pair queries take
-    /// it.
+    /// it (unused when `scaled`).
     b_to_a: Vec<Rigid>,
     /// The most near pairs the near search may list (see
     /// [`NEAR_PAIRS_PER_SLOT`]), decided here on the caller's thread.
@@ -238,6 +241,25 @@ struct FieldJob {
     /// field (single-target, same `max_distance`, both needing a near set):
     /// used instead of running a second query.
     shared_near: Option<Vec<TriangleId>>,
+    /// A scaled placement is involved (A's or a target's): candidates are
+    /// all vertices and [`Scene::compute_values_scaled`] measures them
+    /// through the placements (uniform scales by arithmetic, non-uniform
+    /// targets on baked copies in `temp_targets`).
+    scaled: bool,
+    /// Frame distances times this are world distances: A's uniform scale
+    /// when the frame is A's local space, 1 when it is the world.
+    frame_scale: f64,
+    /// Per target: the baked copy in the frame with its BVH and sign data,
+    /// for non-uniformly scaled targets (`None`: the real target is used).
+    temp_targets: Vec<Option<TempTarget>>,
+}
+
+/// A non-uniformly scaled target baked into the update's frame (see
+/// [`FieldJob::temp_targets`]).
+struct TempTarget {
+    mesh: Mesh,
+    bvh: Bvh,
+    sign: SignData,
 }
 
 impl FieldJob {
@@ -1488,8 +1510,13 @@ impl Scene {
         }
     }
 
-    /// Whether field `i`'s sign data of target `k` are current.
+    /// Whether field `i`'s sign data of target `k` are current. A baked
+    /// target (see [`Scene::target_uses_temp`]) needs none: its real sign
+    /// data are unused.
     fn sign_current(&self, i: usize, k: usize) -> Result<bool> {
+        if self.target_uses_temp(i, k) {
+            return Ok(true);
+        }
         let f = &self.fields[i];
         let eb = self.entry(f.desc.to[k])?;
         Ok(f.sign[k]
@@ -1777,6 +1804,11 @@ impl Scene {
         let job = self.prepare_job(i)?;
         let mode = self.fields[i].desc.sign;
         for k in 0..self.fields[i].desc.to.len() {
+            // A non-uniformly scaled target is baked into the frame (see
+            // `FieldJob::temp_targets`): its real sign data are unused.
+            if job.scaled && job.temp_targets[k].is_some() {
+                continue;
+            }
             let f = &mut self.fields[i];
             let eb = self
                 .entries
@@ -1827,6 +1859,16 @@ impl Scene {
                 .ok_or(SceneError::Corrupted)
         };
         let hook_a = hook(on)?;
+        if self.is_scaled_field(on, &to)? {
+            // A scaled placement is involved: the rigid maps below do not
+            // exist, so the update recomputes every vertex through the
+            // placements (see `FieldJob::scaled`). Only the targets' BVHs
+            // are needed (A's takes no part); their real sign data are
+            // built in `prepare_field` (or the step unit) except for the
+            // non-uniform targets baked here.
+            self.prepare(Some(&to))?;
+            return self.prepare_scaled_job(i, on, to, hook_a);
+        }
         let mut full = self.fields[i].fresh || md.is_infinite() || hook_a.changes.is_none();
         let mut moved = Vec::new();
         moved.try_reserve_exact(n).map_err(|_| oom())?;
@@ -1896,6 +1938,101 @@ impl Scene {
             near_limit: near_pair_limit(ma.vertex_slots()),
             work,
             shared_near: None,
+            scaled: false,
+            frame_scale: 1.0,
+            temp_targets: Vec::new(),
+        })
+    }
+
+    /// Whether the field's update runs scaled: A's placement or any target's
+    /// is scaled.
+    fn is_scaled_field(&self, on: MeshId, to: &[MeshId]) -> Result<bool> {
+        if self.entry(on)?.placement.is_scaled() {
+            return Ok(true);
+        }
+        for &m in to {
+            if self.entry(m)?.placement.is_scaled() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the update of field `i` bakes target `k` (a non-uniformly
+    /// scaled target, whose real sign data are unused).
+    fn target_uses_temp(&self, i: usize, k: usize) -> bool {
+        self.entry(self.fields[i].desc.to[k])
+            .is_ok_and(|e| e.placement.is_scaled() && e.placement.uniform_scale().is_none())
+    }
+
+    /// [`Scene::prepare_job`] for a scaled field: every vertex is
+    /// recomputed through the placements, on baked copies of the
+    /// non-uniformly scaled targets. `hook_a` is A's merged changes.
+    fn prepare_scaled_job(
+        &mut self,
+        i: usize,
+        on: MeshId,
+        to: Vec<MeshId>,
+        hook_a: FieldHook,
+    ) -> Result<FieldJob> {
+        let n = to.len();
+        let pa = self.entry(on)?.placement;
+        // The frame the update measures in: A's local space when A is rigid
+        // or uniformly scaled (frame distances times `frame_scale` are world
+        // distances), else the world. Non-uniform targets are baked into it.
+        let in_a_frame = pa.uniform_scale().is_some();
+        let frame_scale = pa.uniform_scale().unwrap_or(1.0);
+        let mut temp_targets: Vec<Option<TempTarget>> = Vec::new();
+        temp_targets.try_reserve_exact(n).map_err(|_| oom())?;
+        for &m in &to {
+            let (pb, ob, options) = {
+                let eb = self.entry(m)?;
+                (eb.placement, eb.mesh.origin(), *eb.bvh.options())
+            };
+            if pb.is_scaled() && pb.uniform_scale().is_none() {
+                let map = |l: [f32; 3]| {
+                    let full = [
+                        ob[0] + f64::from(l[0]),
+                        ob[1] + f64::from(l[1]),
+                        ob[2] + f64::from(l[2]),
+                    ];
+                    if in_a_frame {
+                        pa.inverse_apply(pb.apply(full))
+                    } else {
+                        pb.apply(full)
+                    }
+                };
+                let eb = self.entry(m)?;
+                let (mut mesh, bvh) = baked_mesh(&eb.mesh, map, &options)?;
+                let mode = self.fields[i].desc.sign;
+                let sign = SignData::build(&mut mesh, &bvh, mode)?;
+                temp_targets.push(Some(TempTarget { mesh, bvh, sign }));
+            } else {
+                temp_targets.push(None);
+            }
+        }
+        let ma = &self.entry(on)?.mesh;
+        let changes = hook_a.changes;
+        let topology = changes.as_ref().is_some_and(ChangeSet::topology_changed);
+        let slots = ma.vertex_slots();
+        let mut moved = Vec::new();
+        moved.try_reserve_exact(n).map_err(|_| oom())?;
+        moved.resize(n, true);
+        Ok(FieldJob {
+            i,
+            full: true,
+            moved,
+            topology,
+            changes,
+            near_margins: Vec::new(),
+            b_to_a: Vec::new(),
+            near_limit: near_pair_limit(slots),
+            // Every vertex against every target, plus one baked copy each.
+            work: slots.saturating_mul(n),
+            shared_near: None,
+            scaled: true,
+            frame_scale,
+            temp_targets,
         })
     }
 
@@ -1931,6 +2068,11 @@ impl Scene {
     /// The vertices a prepared field's update recomputes, reading the
     /// meshes only.
     fn pick_candidates(&self, job: &FieldJob) -> Result<Pick> {
+        if job.scaled {
+            // Scaled updates recompute every vertex through the placements
+            // (see `compute_values_scaled`), with no near search.
+            return self.assemble_pick(job, &[], true, false);
+        }
         let f = &self.fields[job.i];
         let ea = self.entry(f.desc.on)?;
         let ma = &ea.mesh;
@@ -2035,6 +2177,9 @@ impl Scene {
         values: &mut Vec<f32>,
         nearest: &mut Vec<u32>,
     ) -> Result<usize> {
+        if job.scaled {
+            return self.compute_values_scaled(job, candidates, values, nearest);
+        }
         let f = &self.fields[job.i];
         let ma = &self.entry(f.desc.on)?.mesh;
         let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
@@ -2083,6 +2228,163 @@ impl Scene {
             nearest.push(n);
         }
         Ok(points.len())
+    }
+
+    /// Appends the new values of `candidates` like [`Scene::compute_values`]
+    /// for a scaled field: every candidate is measured through the
+    /// placements, one target batch at a time.
+    ///
+    /// The frame the candidates are measured in is A's local space when A
+    /// is rigid or uniformly scaled (frame distances times
+    /// [`FieldJob::frame_scale`] are world distances), else the world. Each
+    /// target is measured in its own local space, where the kernel runs:
+    /// - a rigid target: the frame point goes to the world and back into the
+    ///   target's local space; the kernel's bound and values are world ones;
+    /// - a uniformly scaled target: the same, through the target's inverse;
+    ///   the kernel runs with the world bound divided by the scale and its
+    ///   values are multiplied back (a uniform scale multiplies every
+    ///   distance, and signs are preserved by a positive scale);
+    /// - a non-uniformly scaled target: its baked copy in
+    ///   [`FieldJob::temp_targets`] already lives in the frame, so the frame
+    ///   points go in directly and the values are times `frame_scale`.
+    ///
+    /// The per-vertex value is the minimum over the targets, ties going to
+    /// the lowest target index, with magnitudes past `max_distance`
+    /// (compared in `f64`) reading `+∞` and no target — the same bits as
+    /// [`signed_distances_multi`] over the same local points.
+    fn compute_values_scaled(
+        &self,
+        job: &FieldJob,
+        candidates: &[VertexId],
+        values: &mut Vec<f32>,
+        nearest: &mut Vec<u32>,
+    ) -> Result<usize> {
+        let f = &self.fields[job.i];
+        #[cfg(test)]
+        if counter::fails(f.id) {
+            return Err(oom());
+        }
+        if f.desc.to.len() >= u32::MAX as usize {
+            return Err(SceneError::InvalidInput("too many targets"));
+        }
+        let ea = self.entry(f.desc.on)?;
+        let (pa, oa) = (ea.placement, ea.mesh.origin());
+        let in_a_frame = pa.uniform_scale().is_some();
+        let md = f.desc.max_distance;
+        // The candidates' frame points in f64 (`None` for dead or unused
+        // vertices, which read NaN), and the positions of the defined ones.
+        let mut frame: Vec<Option<[f64; 3]>> = Vec::new();
+        frame
+            .try_reserve_exact(candidates.len())
+            .map_err(|_| oom())?;
+        for &v in candidates {
+            frame.push(
+                ea.mesh
+                    .position(v)
+                    .filter(|_| ea.mesh.is_vertex_alive(v) && ea.mesh.corner_count(v) > 0)
+                    .map(|p| {
+                        if in_a_frame {
+                            [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]
+                        } else {
+                            pa.apply([
+                                oa[0] + f64::from(p[0]),
+                                oa[1] + f64::from(p[1]),
+                                oa[2] + f64::from(p[2]),
+                            ])
+                        }
+                    }),
+            );
+        }
+        let mut at: Vec<usize> = Vec::new();
+        at.try_reserve_exact(candidates.len()).map_err(|_| oom())?;
+        let mut fpts: Vec<[f64; 3]> = Vec::new();
+        fpts.try_reserve_exact(candidates.len())
+            .map_err(|_| oom())?;
+        for (ci, q) in frame.iter().enumerate() {
+            if let Some(q) = q {
+                at.push(ci);
+                fpts.push(*q);
+            }
+        }
+        let mut best: Vec<(f32, u32)> = Vec::new();
+        best.try_reserve_exact(candidates.len())
+            .map_err(|_| oom())?;
+        best.resize(candidates.len(), (f32::INFINITY, u32::MAX));
+        for (k, &m) in f.desc.to.iter().enumerate() {
+            // The measuring space, its kernel bound (in its own units) and
+            // what its values are multiplied by to read world distances.
+            let eb = self.entry(m)?;
+            let (mesh, bvh, sign, bound, to_world) = match &job.temp_targets[k] {
+                Some(t) => (
+                    &t.mesh,
+                    &t.bvh,
+                    &t.sign,
+                    round_up(md / job.frame_scale),
+                    job.frame_scale,
+                ),
+                None => {
+                    let s = eb.placement.uniform_scale().unwrap_or(1.0);
+                    (
+                        &eb.mesh,
+                        &eb.bvh,
+                        f.sign[k].as_ref().ok_or(SceneError::Corrupted)?,
+                        round_up(md / s),
+                        s,
+                    )
+                }
+            };
+            let (pb, ob) = (eb.placement, eb.mesh.origin());
+            let temp = job.temp_targets[k].is_some();
+            let mut points: Vec<[f32; 3]> = Vec::new();
+            points.try_reserve_exact(fpts.len()).map_err(|_| oom())?;
+            for &q in &fpts {
+                // Into the target's measuring space: a baked copy lives in
+                // the frame already, so its points go in directly; a real
+                // target's go to the world first (A's placement), then back
+                // into its stored local space (the placement inverse, minus
+                // its origin).
+                let l = if temp {
+                    q
+                } else {
+                    let w = if in_a_frame {
+                        pa.apply([oa[0] + q[0], oa[1] + q[1], oa[2] + q[2]])
+                    } else {
+                        q
+                    };
+                    let m = pb.inverse_apply(w);
+                    [m[0] - ob[0], m[1] - ob[1], m[2] - ob[2]]
+                };
+                points.push([l[0] as f32, l[1] as f32, l[2] as f32]);
+            }
+            let mut out: Vec<f32> = Vec::new();
+            out.try_reserve_exact(points.len()).map_err(|_| oom())?;
+            out.resize(points.len(), 0.0);
+            signed_distances(mesh, bvh, sign, &points, bound, &mut out)?;
+            for (j, &ci) in at.iter().enumerate() {
+                let w = to_world * f64::from(out[j]);
+                let x = if w.abs() > md {
+                    f32::INFINITY
+                } else {
+                    w as f32
+                };
+                // Strictly smaller: a tie stays with the lower index.
+                if x < best[ci].0 {
+                    best[ci] = (x, k as u32);
+                }
+            }
+        }
+        values.try_reserve(candidates.len()).map_err(|_| oom())?;
+        nearest.try_reserve(candidates.len()).map_err(|_| oom())?;
+        for (ci, q) in frame.iter().enumerate() {
+            let (x, n) = if q.is_some() {
+                best[ci]
+            } else {
+                (f32::NAN, u32::MAX)
+            };
+            values.push(x);
+            nearest.push(n);
+        }
+        Ok(fpts.len())
     }
 
     /// The new state of a prepared field from its candidates, their new
@@ -2410,6 +2712,7 @@ mod tests {
         Placement {
             rotation: [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
             translation: t,
+            ..Placement::IDENTITY
         }
     }
 
@@ -5595,5 +5898,203 @@ mod tests {
                 assert_eq!((&g.0, &g.1), (&w.0, &w.1), "{k} threads");
             }
         }
+    }
+
+    /// A box `[min, min + size]`, the triangulation of [`cube`].
+    fn bx(min: [f32; 3], size: [f32; 3]) -> Mesh {
+        let mut pos = Vec::new();
+        for i in 0..8u32 {
+            let b = |bit: u32, s: f32| if i & bit != 0 { s } else { 0.0 };
+            pos.extend_from_slice(&[
+                min[0] + b(1, size[0]),
+                min[1] + b(2, size[1]),
+                min[2] + b(4, size[2]),
+            ]);
+        }
+        let idx = [
+            0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 0, 1, 4, 1, 5, 4, 2, 6, 3, 3, 6, 7, 0, 4, 2, 2, 4,
+            6, 1, 3, 5, 3, 7, 5,
+        ];
+        Mesh::from_buffers(&pos, &idx).unwrap()
+    }
+
+    fn scaled_placement(translation: [f64; 3], scale: [f64; 3]) -> MeshOptions {
+        MeshOptions {
+            placement: Placement {
+                rotation: Placement::IDENTITY.rotation,
+                translation,
+                scale,
+            },
+            ..MeshOptions::default()
+        }
+    }
+
+    /// A scene with A (a unit cube at `[3, 0, 0]`, Eager) and B (a unit
+    /// cube), B placed by `place_b`.
+    fn scaled_pair(place_b: MeshOptions) -> (Scene, MeshId, MeshId) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(cube([3.0, 0.0, 0.0], 1.0), MeshOptions::default())
+            .unwrap();
+        let b = scene.add_mesh(cube([0.0; 3], 1.0), place_b).unwrap();
+        (scene, a, b)
+    }
+
+    fn scaled_values(scene: &mut Scene, on: MeshId, to: &[MeshId]) -> (Vec<f32>, Vec<u32>) {
+        let desc = DistanceField {
+            name: "d".to_owned(),
+            on,
+            to: to.to_vec(),
+            max_distance: f64::INFINITY,
+            sign: SignMode::Auto,
+        };
+        let id = scene.add_distance_field(desc).unwrap();
+        (
+            scene.field_values(id).unwrap().to_vec(),
+            scene.field_nearest(id).unwrap().to_vec(),
+        )
+    }
+
+    #[test]
+    fn scaled_targets_match_rigid_twins() {
+        // B scaled (uniform and non-uniform) measures like the rigid box of
+        // the same world shape: A is the unit cube at x in [3, 4].
+        for scale in [[2.0, 2.0, 2.0], [2.0, 1.0, 0.5], [0.5, 2.0, 1.5]] {
+            let (mut scaled, a, b) = scaled_pair(scaled_placement([0.0; 3], scale));
+            let (mut rigid, ra, rb) = scaled_pair(MeshOptions::default());
+            // The rigid twin of B's world shape: [0, sx] x [0, sy] x [0, sz].
+            let twin = rigid
+                .add_mesh(
+                    bx([0.0; 3], scale.map(|s| s as f32)),
+                    MeshOptions::default(),
+                )
+                .unwrap();
+            rigid.remove_mesh(rb).unwrap();
+            let (got, got_near) = scaled_values(&mut scaled, a, &[b]);
+            let (want, want_near) = scaled_values(&mut rigid, ra, &[twin]);
+            assert_eq!(got.len(), want.len());
+            assert_eq!(got_near, want_near, "scale {scale:?}");
+            for (v, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    close(*g, *w, f64::INFINITY),
+                    "scale {scale:?} vertex {v}: got {g}, want {w}"
+                );
+            }
+            // Every value is finite and positive: A is outside B.
+            assert!(got.iter().all(|&x| x > 0.0), "scale {scale:?}: {got:?}");
+            // Vertices on A's x = 3 face with y, z inside B's read the x gap.
+            let ma = scaled.mesh(a).unwrap();
+            for (v, &x) in got.iter().enumerate() {
+                let p = ma.position(v as VertexId).unwrap();
+                let w = scaled.local_to_world(a, p.map(f64::from)).unwrap();
+                // Inside B's y, z span (with room): the value is the x gap.
+                if (w[0] - 3.0).abs() < 1e-9 && w[2] < scale[2] - 0.25 {
+                    assert!((x - (3.0 - scale[0]) as f32).abs() < 1e-4, "v{v}: {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_a_matches_rigid_twin() {
+        // A scaled, B rigid: A's vertices carry the world distances. A's
+        // world shape is [1.5, 3.5] x [0, 1]^2; the rigid twin has it
+        // directly, with the same triangulation, so slot-wise.
+        let scale = [2.0, 1.0, 1.0];
+        let mut scaled = Scene::new(SceneOptions::default());
+        let a = scaled
+            .add_mesh(
+                cube([0.0; 3], 1.0),
+                scaled_placement([1.5, 0.0, 0.0], scale),
+            )
+            .unwrap();
+        let b = scaled
+            .add_mesh(cube([0.0; 3], 1.0), MeshOptions::default())
+            .unwrap();
+        let mut rigid = Scene::new(SceneOptions::default());
+        let ra = rigid
+            .add_mesh(bx([1.5, 0.0, 0.0], [2.0, 1.0, 1.0]), MeshOptions::default())
+            .unwrap();
+        let rb = rigid
+            .add_mesh(cube([0.0; 3], 1.0), MeshOptions::default())
+            .unwrap();
+        let (got, got_near) = scaled_values(&mut scaled, a, &[b]);
+        let (want, want_near) = scaled_values(&mut rigid, ra, &[rb]);
+        assert_eq!(got_near, want_near);
+        for (v, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                close(*g, *w, f64::INFINITY),
+                "vertex {v}: got {g}, want {w}"
+            );
+        }
+        // The x = 1.5 face reads the 0.5 gap to B.
+        let ma = scaled.mesh(a).unwrap();
+        for (v, &x) in got.iter().enumerate() {
+            let p = ma.position(v as VertexId).unwrap();
+            let w = scaled.local_to_world(a, p.map(f64::from)).unwrap();
+            if (w[0] - 1.5).abs() < 1e-9 {
+                assert!((x - 0.5).abs() < 1e-4, "v{v}: {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_multi_target_and_stepped_updates_match() {
+        // Two targets, one scaled: the minimum (ties to the lowest index)
+        // matches the rigid twins'.
+        let (mut scaled, a, b) = scaled_pair(scaled_placement([0.0; 3], [2.0, 1.0, 1.0]));
+        let c = scaled
+            .add_mesh(cube([3.0, 2.0, 0.0], 1.0), MeshOptions::default())
+            .unwrap();
+        let (mut rigid, ra, _) = scaled_pair(MeshOptions::default());
+        let twin = rigid
+            .add_mesh(bx([0.0; 3], [2.0, 1.0, 1.0]), MeshOptions::default())
+            .unwrap();
+        let rc = rigid
+            .add_mesh(cube([3.0, 2.0, 0.0], 1.0), MeshOptions::default())
+            .unwrap();
+        let (got, got_near) = scaled_values(&mut scaled, a, &[b, c]);
+        let (want, want_near) = scaled_values(&mut rigid, ra, &[twin, rc]);
+        assert_eq!(got_near, want_near);
+        for (v, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                close(*g, *w, f64::INFINITY),
+                "vertex {v}: got {g}, want {w}"
+            );
+        }
+        // Stepped: the field is registered, a placement makes it due while
+        // deferred, then it is stepped to Done with the eager twin's values.
+        let (mut eager, ea, eb) = scaled_pair(scaled_placement([0.0; 3], [2.0, 1.0, 0.5]));
+        let (mut stepped, sa, sb) = scaled_pair(scaled_placement([0.0; 3], [2.0, 1.0, 0.5]));
+        for scene in [&mut eager, &mut stepped] {
+            scene.set_defer_fields(true);
+        }
+        let desc = DistanceField {
+            name: "d".to_owned(),
+            on: sa,
+            to: vec![sb],
+            max_distance: f64::INFINITY,
+            sign: SignMode::Auto,
+        };
+        // Registering computes at once even while deferred; the placement
+        // then leaves the field due for the steps.
+        let id = stepped.add_distance_field(desc).unwrap();
+        assert!(stepped.field_status(id).unwrap().current);
+        let nudge = Placement {
+            translation: [0.01, 0.0, 0.0],
+            ..stepped.placement(sb).unwrap()
+        };
+        stepped.set_placement(sb, nudge).unwrap();
+        assert!(!stepped.field_status(id).unwrap().current);
+        loop {
+            match stepped.field_step(FieldBudget::Points(3)).unwrap() {
+                StepState::Done => break,
+                StepState::Pending => {}
+                StepState::Idle => panic!("a due field idles"),
+            }
+        }
+        eager.set_placement(eb, nudge).unwrap();
+        let want = scaled_values(&mut eager, ea, &[eb]).0;
+        assert_eq!(bits(stepped.field_values(id).unwrap()), bits(&want));
     }
 }
