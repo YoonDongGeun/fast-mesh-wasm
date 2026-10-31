@@ -134,6 +134,12 @@ export interface FastMeshProps extends EventHandlers {
   /** The colour while the mesh has no colouring (see `BindMeshOptions.color`). */
   color?: THREE.ColorRepresentation;
   /**
+   * A visibility override, ANDed with the store display's `visible` (unset
+   * shows). The store still hides the mesh while set; changing it never
+   * rebinds.
+   */
+  visible?: boolean;
+  /**
    * How a colouring is drawn (see `BindMeshOptions.shading`): `"vertex"` (the
    * default) or `"fragment"`. Changing it rebinds the mesh.
    */
@@ -186,7 +192,7 @@ export function FastMesh(props: FastMeshProps): JSX.Element {
 }
 
 function FastMeshBody(props: FastMeshProps): ReactElement | null {
-  const { mesh, store: _store, material, color, shading, edgeSoftness = 0, onBind, ...events } = props;
+  const { mesh, store: _store, material, color, shading, edgeSoftness = 0, onBind, visible, ...events } = props;
   const store = useScene();
   useFrameDriver(store);
   const present = useStoreSelector(useCallback((s: SceneSnapshot) => s.meshes.has(mesh), [mesh]));
@@ -196,6 +202,9 @@ function FastMeshBody(props: FastMeshProps): ReactElement | null {
   // The latest callback, read when binding: a new one never rebinds.
   const onBindRef = useRef(onBind);
   onBindRef.current = onBind;
+  // The latest visibility override, read when the display applies.
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   // The latest softness, read when binding: a new one is set, never rebinds.
   const softness = usableSoftness(edgeSoftness);
   const softnessRef = useRef(softness);
@@ -216,7 +225,7 @@ function FastMeshBody(props: FastMeshProps): ReactElement | null {
       if (d !== last) {
         last = d;
         b.setOpacity(d.opacity);
-        b.object.visible = d.visible;
+        b.object.visible = d.visible && (visibleRef.current ?? true);
       }
     };
     apply();
@@ -234,6 +243,12 @@ function FastMeshBody(props: FastMeshProps): ReactElement | null {
   useLayoutEffect(() => {
     bound?.setEdgeSoftness(softness);
   }, [bound, softness]);
+
+  useLayoutEffect(() => {
+    if (bound !== null) {
+      bound.object.visible = meshState(store.getSnapshot(), mesh).display.visible && (visible ?? true);
+    }
+  }, [store, mesh, bound, visible]);
 
   if (bound === null) {
     return null;

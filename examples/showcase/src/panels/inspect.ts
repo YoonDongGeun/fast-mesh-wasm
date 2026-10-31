@@ -93,6 +93,8 @@ export const inspect: {
   slices: { id: string | null; window: string; axial: number; coronal: number; sagittal: number; ready: boolean };
   /** The scene overlay: the series whose slices float in the main scene, and how many show. */
   sceneSlices: { id: string | null; shown: number };
+  /** The scene's volume rendering: the series raymarched in the main scene, and its 3D preset. */
+  sceneVolume: { id: string | null; preset: string };
   /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, whether the ball shows, and the last grab dab's center. */
   sculpt: {
     strokes: number;
@@ -111,6 +113,7 @@ export const inspect: {
   volume: { id: null, preset: "", mip: false, planes: 0, ready: false },
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sceneSlices: { id: null, shown: 0 },
+  sceneVolume: { id: null, preset: "" },
   sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null },
 };
 

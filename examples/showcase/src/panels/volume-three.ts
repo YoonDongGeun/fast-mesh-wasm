@@ -26,6 +26,8 @@ uniform vec3 uCamObj;
 uniform vec3 uTexel;
 uniform float uMip;
 uniform float uAlphaScale;
+// The cutaway: the slice fractions (see cutFractions); below 0.0 a cut stays open.
+uniform vec3 uCut;
 
 vec2 hitBox(vec3 ro, vec3 rd) {
   vec3 inv = 1.0 / rd;
@@ -50,6 +52,20 @@ vec3 gradientAt(vec3 p) {
   return g / uTexel;
 }
 
+// Keeps the samples above the cut on one axis (the mesh clip's twin).
+void clipAxis(float ro, float rd, float cut, inout float t0, inout float t1) {
+  if (abs(rd) > 1e-9) {
+    float tc = (cut - ro) / rd;
+    if (rd > 0.0) {
+      t0 = max(t0, tc);
+    } else {
+      t1 = min(t1, tc);
+    }
+  } else if (ro < cut) {
+    t1 = t0;
+  }
+}
+
 void main() {
   vec3 rd = normalize(vObj - uCamObj);
   vec2 hit = hitBox(uCamObj, rd);
@@ -57,7 +73,14 @@ void main() {
     discard;
   }
   float t0 = max(hit.x, 0.0);
-  float dt = (hit.y - t0) / float(${STEPS});
+  float t1 = hit.y;
+  clipAxis(uCamObj.x, rd.x, uCut.x, t0, t1);
+  clipAxis(uCamObj.y, rd.y, uCut.y, t0, t1);
+  clipAxis(uCamObj.z, rd.z, uCut.z, t0, t1);
+  if (t1 <= t0) {
+    discard;
+  }
+  float dt = (t1 - t0) / float(${STEPS});
   vec3 lightDir = normalize(vec3(-0.45, 0.8, 0.65));
   if (uMip > 0.5) {
     float best = 0.0;
@@ -97,25 +120,97 @@ export type VolumeGrid = {
   spacing: [number, number, number];
 };
 
+/** The cutaway uniform for an uncut box: every cut stays open below 0.0. */
+export const OPEN_CUTS: [number, number, number] = [-1, -1, -1];
+
+/** The raymarch box's material with its textures, shared by the panel view and the main scene's box. */
+export interface RaymarchMaterial {
+  material: THREE.ShaderMaterial;
+  volumeTexture: THREE.Data3DTexture;
+  lutTexture: THREE.DataTexture;
+  size: THREE.Vector3;
+  setLut(lut: Uint8Array): void;
+  dispose(): void;
+}
+
+export function createRaymarchMaterial(data: Uint8Array, grid: VolumeGrid, lut: Uint8Array): RaymarchMaterial {
+  const size = new THREE.Vector3(
+    grid.columns * grid.spacing[0],
+    grid.rows * grid.spacing[1],
+    grid.slices * grid.spacing[2],
+  );
+  const volumeTexture = new THREE.Data3DTexture(data, grid.columns, grid.rows, grid.slices);
+  volumeTexture.format = THREE.RedFormat;
+  volumeTexture.type = THREE.UnsignedByteType;
+  volumeTexture.minFilter = THREE.LinearFilter;
+  volumeTexture.magFilter = THREE.LinearFilter;
+  volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
+  volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
+  volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
+  volumeTexture.needsUpdate = true;
+
+  const lutTexture = new THREE.DataTexture(lut, lut.length / 4, 1, THREE.RGBAFormat);
+  lutTexture.minFilter = THREE.LinearFilter;
+  lutTexture.magFilter = THREE.LinearFilter;
+  lutTexture.wrapS = THREE.ClampToEdgeWrapping;
+  lutTexture.wrapT = THREE.ClampToEdgeWrapping;
+  lutTexture.needsUpdate = true;
+
+  // The presets assume ~0.8 mm samples; correct the opacity for ours.
+  const stepLen = size.length() / STEPS / 0.8;
+  const material = new THREE.ShaderMaterial({
+    vertexShader: VERT,
+    fragmentShader: FRAG,
+    side: THREE.BackSide,
+    transparent: true,
+    // The slice planes are opaque and write depth; the box blends over
+    // them so they show through wherever the volume is transparent.
+    depthTest: false,
+    depthWrite: false,
+    uniforms: {
+      uVolume: { value: volumeTexture },
+      uLut: { value: lutTexture },
+      uSize: { value: size },
+      uCamObj: { value: new THREE.Vector3() },
+      uTexel: { value: new THREE.Vector3(1 / grid.columns, 1 / grid.rows, 1 / grid.slices) },
+      uMip: { value: 0 },
+      uAlphaScale: { value: stepLen },
+      uCut: { value: new THREE.Vector3(OPEN_CUTS[0], OPEN_CUTS[1], OPEN_CUTS[2]) },
+    },
+  });
+  return {
+    material,
+    volumeTexture,
+    lutTexture,
+    size,
+    setLut(next: Uint8Array): void {
+      lutTexture.image.data = next;
+      lutTexture.needsUpdate = true;
+    },
+    dispose(): void {
+      material.dispose();
+      volumeTexture.dispose();
+      lutTexture.dispose();
+    },
+  };
+}
+
 export class VolumeView3D {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
   private controls: TrackballControls;
   private mesh: THREE.Mesh;
+  private raymarch: RaymarchMaterial;
   private material: THREE.ShaderMaterial;
-  private volumeTexture: THREE.Data3DTexture;
-  private lutTexture: THREE.DataTexture;
   private size: THREE.Vector3;
   private planes: { mesh: THREE.Mesh; texture: THREE.DataTexture; place: (index: number, count: number) => void }[] = [];
   private onChange: () => void;
 
   constructor(canvas: HTMLCanvasElement, data: Uint8Array, grid: VolumeGrid, lut: Uint8Array) {
-    this.size = new THREE.Vector3(
-      grid.columns * grid.spacing[0],
-      grid.rows * grid.spacing[1],
-      grid.slices * grid.spacing[2],
-    );
+    this.raymarch = createRaymarchMaterial(data, grid, lut);
+    this.material = this.raymarch.material;
+    this.size = this.raymarch.size;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     // The shader outputs display-ready colors (the LUT is authored in
@@ -138,44 +233,6 @@ export class VolumeView3D {
     this.controls.staticMoving = true;
     this.controls.update();
 
-    this.volumeTexture = new THREE.Data3DTexture(data, grid.columns, grid.rows, grid.slices);
-    this.volumeTexture.format = THREE.RedFormat;
-    this.volumeTexture.type = THREE.UnsignedByteType;
-    this.volumeTexture.minFilter = THREE.LinearFilter;
-    this.volumeTexture.magFilter = THREE.LinearFilter;
-    this.volumeTexture.wrapS = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
-    this.volumeTexture.needsUpdate = true;
-
-    this.lutTexture = new THREE.DataTexture(lut, lut.length / 4, 1, THREE.RGBAFormat);
-    this.lutTexture.minFilter = THREE.LinearFilter;
-    this.lutTexture.magFilter = THREE.LinearFilter;
-    this.lutTexture.wrapS = THREE.ClampToEdgeWrapping;
-    this.lutTexture.wrapT = THREE.ClampToEdgeWrapping;
-    this.lutTexture.needsUpdate = true;
-
-    // The presets assume ~0.8 mm samples; correct the opacity for ours.
-    const stepLen = this.size.length() / STEPS / 0.8;
-    this.material = new THREE.ShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: FRAG,
-      side: THREE.BackSide,
-      transparent: true,
-      // The slice planes are opaque and write depth; the box blends over
-      // them so they show through wherever the volume is transparent.
-      depthTest: false,
-      depthWrite: false,
-      uniforms: {
-        uVolume: { value: this.volumeTexture },
-        uLut: { value: this.lutTexture },
-        uSize: { value: this.size },
-        uCamObj: { value: new THREE.Vector3() },
-        uTexel: { value: new THREE.Vector3(1 / grid.columns, 1 / grid.rows, 1 / grid.slices) },
-        uMip: { value: 0 },
-        uAlphaScale: { value: stepLen },
-      },
-    });
     this.mesh = new THREE.Mesh(new THREE.BoxGeometry(this.size.x, this.size.y, this.size.z), this.material);
     this.mesh.frustumCulled = false;
     this.scene.add(this.mesh);
@@ -184,8 +241,7 @@ export class VolumeView3D {
   }
 
   setLut(lut: Uint8Array): void {
-    this.lutTexture.image.data = lut;
-    this.lutTexture.needsUpdate = true;
+    this.raymarch.setLut(lut);
     this.render();
   }
 
@@ -274,9 +330,7 @@ export class VolumeView3D {
     this.controls.removeEventListener("change", this.onChange);
     this.controls.dispose();
     this.mesh.geometry.dispose();
-    this.material.dispose();
-    this.volumeTexture.dispose();
-    this.lutTexture.dispose();
+    this.raymarch.dispose();
     for (const p of this.planes) {
       p.mesh.geometry.dispose();
       (p.mesh.material as THREE.Material).dispose();

@@ -15,6 +15,7 @@ import { StatusBar } from "./panels/StatusBar";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
+import { VolumeOverlay } from "./viewport/VolumeOverlay";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
 /** The engine behind the store, for the status bar. */
@@ -87,16 +88,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     [loader, focusOn],
   );
 
-  // ---- Boot: the vessel tree, selected and framed ----
+  // ---- Boot: the CT head, selected and framed ----
   // Once per page (StrictMode runs effects twice in development): the
-  // medical landing view. Everything else loads from its button.
+  // medical landing view (the sample suggests its Vessels preset).
+  // Everything else loads from its button.
   const booted = useRef(false);
   useEffect(() => {
     if (booted.current) {
       return;
     }
     booted.current = true;
-    void loader.loadDicomDemo("vessels").then((added) => {
+    void loader.loadSample("headsq").then((added) => {
       const last = added.at(-1);
       if (last === undefined || last.volumeId === null) {
         return;
@@ -261,6 +263,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         />
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
+        <VolumeOverlay app={app} />
         <div className="toolbar" role="toolbar" aria-label="Viewport tools">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">

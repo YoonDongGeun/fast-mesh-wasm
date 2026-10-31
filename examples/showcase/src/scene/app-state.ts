@@ -37,6 +37,8 @@ export interface Item {
   radius: number;
   /** The retained source volume's id (DICOM + phantoms), for the volume view. */
   volumeId: string | null;
+  /** The suggested volume preset (a sample's descriptor hint), if any. */
+  preset: string | null;
 }
 
 export type JobPhase = "reading" | "parsing" | "adding" | "done" | "error";
@@ -75,12 +77,18 @@ export interface BrushPick {
   point: Vec3 | null;
 }
 
-/** The linked MPR state: slice positions, window preset, scene overlay. */
+/**
+ * The linked volume-view state: slice positions, window preset, scene
+ * overlay, 3D preset, shown tab. The panel and the viewport overlay
+ * steer the same state.
+ */
 export interface VolumeMpr {
   volumeId: string;
   slices: Record<SliceAxis, number>;
   window: number;
   inScene: boolean;
+  preset: number;
+  tab: "volume" | "slices";
 }
 
 export interface AppSnapshot {
@@ -178,6 +186,7 @@ export class AppState {
       center: loaded.center,
       radius: loaded.radius,
       volumeId: loaded.volumeId,
+      preset: loaded.preset,
     };
     let collision = this.#snap.collision;
     if (this.#autoPick) {

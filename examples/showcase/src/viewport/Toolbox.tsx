@@ -6,6 +6,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import { useSelection } from "fast-mesh-wasm/react";
 import { useEffect, useState } from "react";
 import { type AppState, useApp } from "../scene/app-state";
+import { REMESH_TRI_LIMIT, remeshTooBig } from "./sculpt";
 
 export type SculptTool = "inflate" | "deflate" | "smooth" | "grab";
 
@@ -69,6 +70,11 @@ export function SculptToolbox(props: { app: AppState }) {
   if (item === null || selection === null) {
     return null;
   }
+  // Remeshes stand down on huge meshes, where one would stall the worker.
+  const tooBig = remeshTooBig(item.triangles);
+  const remeshTitle = tooBig
+    ? `Stands down past ${REMESH_TRI_LIMIT.toLocaleString("en")} triangles: a remesh would stall the worker`
+    : null;
   const strength = strengths[tool];
   return (
     <div className="toolbox" role="toolbar" aria-label="Sculpt tools">
@@ -122,20 +128,31 @@ export function SculptToolbox(props: { app: AppState }) {
           <option value="linear">linear</option>
         </select>
       </label>
-      <label className="check" title="Even the stroked region out with a remesh when the stroke ends">
+      <label
+        className="check"
+        title={remeshTitle ?? "Even the stroked region out with a remesh when the stroke ends"}
+      >
         <input
           type="checkbox"
           data-action="sculpt-remesh"
           checked={remesh}
+          disabled={tooBig}
           onChange={(e) => app.setSculptRemesh(e.currentTarget.checked)}
         />
         even out after stroke
       </label>
-      <label className="check" title="Split stretched triangles while the stroke paints (never collapses: the count only grows mid-stroke)">
+      <label
+        className="check"
+        title={
+          remeshTitle ??
+          "Split stretched triangles while the stroke paints (never collapses: the count only grows mid-stroke)"
+        }
+      >
         <input
           type="checkbox"
           data-action="sculpt-live-remesh"
           checked={liveRemesh}
+          disabled={tooBig}
           onChange={(e) => app.setSculptLiveRemesh(e.currentTarget.checked)}
         />
         even out while painting

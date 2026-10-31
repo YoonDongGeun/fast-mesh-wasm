@@ -1,7 +1,8 @@
 // The scene overlay: the linked MPR slices as quads cutting through the
-// selected mesh in the main scene, with the mesh clipped away above each
-// slice (a cutaway), like a medical viewer. The quads ride the mesh's
-// placement, so gizmo moves carry them along.
+// selected mesh in the main scene, with the mesh clipped away below each
+// slice (a cutaway opening towards the boot camera), like a medical
+// viewer. The quads ride the mesh's placement, so gizmo moves carry them
+// along.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
@@ -25,6 +26,7 @@ import {
 } from "../panels/volume-slice";
 import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "./slice-drag";
 import { view } from "./view";
+import { matchVolume } from "./volume-box";
 
 const AXES: SliceAxis[] = ["axial", "coronal", "sagittal"];
 
@@ -52,14 +54,14 @@ export class SceneSliceQuads {
   readonly group = new THREE.Group();
   /** The cutaway planes in world coordinates: assign to the clipped material. */
   readonly clip: [THREE.Plane, THREE.Plane, THREE.Plane] = [
-    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0),
-    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
+    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
   ];
   private local: [THREE.Plane, THREE.Plane, THREE.Plane] = [
-    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0),
-    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
+    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
   ];
   private entries: (QuadEntry | undefined)[] = [];
   private matrix = new THREE.Matrix4();
@@ -120,9 +122,9 @@ export class SceneSliceQuads {
       }
       entry.mesh.position.set(at[i][0], at[i][1], at[i][2]);
     });
-    this.local[0].constant = at[0][2];
-    this.local[1].constant = at[1][1];
-    this.local[2].constant = at[2][0];
+    this.local[0].constant = -at[0][2];
+    this.local[1].constant = -at[1][1];
+    this.local[2].constant = -at[2][0];
     this.group.visible = true;
   }
 
@@ -251,11 +253,12 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
   const gl = useThree((s) => s.gl);
   const quads = useMemo(() => new SceneSliceQuads(), []);
   const [payload, setPayload] = useState<VolumePayload | null>(null);
-  const item: Item | null = items.find((i) => i.mesh === selection) ?? null;
+  const found = matchVolume(items, selection, mpr);
+  const sculpt = useApp(app, (s) => s.sculpt);
+  const item: Item | null = found?.item ?? null;
   const mesh: MeshHandle | null = item?.mesh ?? null;
-  const active =
-    item !== null && item.volumeId !== null && mpr !== null && mpr.volumeId === item.volumeId && mpr.inScene;
-  const volumeId = active && item !== null ? item.volumeId : null;
+  const active = found !== null && found.mpr.inScene && found.item.mesh !== (sculpt?.mesh ?? null);
+  const volumeId = active && found !== null ? found.volumeId : null;
 
   useEffect(() => {
     gl.localClippingEnabled = true;

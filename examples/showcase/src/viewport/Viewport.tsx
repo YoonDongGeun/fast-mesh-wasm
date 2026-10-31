@@ -23,6 +23,8 @@ import { inspect } from "../panels/inspect";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 import { SceneSlices } from "./SceneSlices";
+import { SceneVolume } from "./SceneVolume";
+import { matchVolume } from "./volume-box";
 import {
   type SculptBrush,
   SculptStroke,
@@ -31,6 +33,7 @@ import {
   grabLocalDelta,
   interpolateHit,
   meanEdgeLength,
+  remeshTooBig,
   worldPerPixel,
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
@@ -92,6 +95,50 @@ export function Viewport(props: {
   } = props;
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
+  const downAt = useRef<{ x: number; y: number } | null>(null);
+  const lastDragEnd = useRef(0);
+  useEffect(() => {
+    const onDrag = (dragging: boolean) => {
+      if (!dragging) {
+        lastDragEnd.current = Date.now();
+      }
+    };
+    view.dragListeners.add(onDrag);
+    return () => {
+      view.dragListeners.delete(onDrag);
+    };
+  }, []);
+  // A tap on empty space clears the selection; sculpt and picks own the
+  // pointer, and gizmo drags and orbits are not taps.
+  const onMissed = useCallback(
+    (e: MouseEvent) => {
+      if (sculpt !== null || picking !== null || view.dragging || selection === null) {
+        return;
+      }
+      if (view.gizmo !== null && view.gizmo.axis !== null) {
+        return;
+      }
+      if (Date.now() - lastDragEnd.current < 350) {
+        return;
+      }
+      const down = downAt.current;
+      if (down === null || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) {
+        return;
+      }
+      // Through clickMulti: a shift-click on nothing is ignored, like on a mesh.
+      selectMesh(app, select, selection, null, e.shiftKey);
+    },
+    [app, select, selection, sculpt, picking],
+  );
+  const mpr = useApp(app, (s) => s.volumeMpr);
+  // The mesh shown as the scene volume instead of its surface, if any.
+  // Sculpting shows the surface: the armed mesh drops out of volume mode.
+  const volumeFound = matchVolume(items, selection, mpr);
+  const sculptMesh = sculpt?.mesh ?? null;
+  const volumeMesh =
+    volumeFound !== null && volumeFound.mpr.inScene && volumeFound.item.mesh !== sculptMesh
+      ? volumeFound.item.mesh
+      : null;
   const onPick = useCallback(
     (mesh: MeshHandle, additive: boolean) => selectMesh(app, select, selection, mesh, additive),
     [app, select, selection],
@@ -116,7 +163,7 @@ export function Viewport(props: {
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
 
   return (
-    <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }}>
+    <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
       <color attach="background" args={["#1b1e23"]} />
       <hemisphereLight args={["#e8eef8", "#30343c", 1.1]} />
       <directionalLight position={[3, 6, 4]} intensity={2} />
@@ -127,6 +174,7 @@ export function Viewport(props: {
           key={item.id}
           item={item}
           selected={item.mesh === selection}
+          volumeShown={item.mesh === volumeMesh}
           secondary={item.mesh !== selection && multi.includes(item.mesh)}
           edgeSoftness={edgeSoftness}
           onPick={onPick}
@@ -146,9 +194,25 @@ export function Viewport(props: {
         <SculptLayer scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
       ) : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
+      <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
+      <SceneVolume app={app} loader={loader} scene={scene} />
     </Canvas>
   );
+}
+
+/** Records canvas pointerdowns, so a missed click can tell a drag from a tap. */
+function MissTracker(props: { track: { current: { x: number; y: number } | null } }) {
+  const gl = useThree((s) => s.gl);
+  useEffect(() => {
+    const el = gl.domElement;
+    const onDown = (e: PointerEvent) => {
+      props.track.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
+    };
+    el.addEventListener("pointerdown", onDown);
+    return () => el.removeEventListener("pointerdown", onDown);
+  }, [gl, props.track]);
+  return null;
 }
 
 /** A crosshair while a brush-center pick is armed. */
@@ -167,6 +231,8 @@ function PickCursor(props: { picking: boolean }) {
 function MeshView(props: {
   item: Item;
   selected: boolean;
+  /** Shown as the scene volume instead of its surface (a volume mesh with the overlay on). */
+  volumeShown: boolean;
   /** Shift-clicked after the primary: dimmer, and a Join source. */
   secondary: boolean;
   edgeSoftness: number;
@@ -182,7 +248,7 @@ function MeshView(props: {
   /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
   bound: MeshBinding | null;
 }) {
-  const { item, selected, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
+  const { item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
     props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
@@ -249,6 +315,7 @@ function MeshView(props: {
       material={item.material}
       shading="fragment"
       edgeSoftness={edgeSoftness}
+      visible={!volumeShown}
       onClick={onClick}
       onBind={(b) => onBind(item.mesh, b)}
     />
@@ -436,11 +503,38 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
     /** A live remesh in flight, if any (never two at once). */
     let liveRunning: Promise<unknown> | null = null;
 
+    /** Live triangle slots, or null when the mesh is gone. */
+    const triSlots = (mesh: MeshHandle): number | null => {
+      try {
+        return scene.views(mesh).indices().length / 3;
+      } catch {
+        return null;
+      }
+    };
+
+    /** The remesh density anchor, taken lazily: only remeshes need it. */
+    const ensureDensity = (mesh: MeshHandle): void => {
+      if (densityAnchor !== null && densityAnchor.mesh === mesh) {
+        return;
+      }
+      densityAnchor = null;
+      try {
+        const v = scene.views(mesh);
+        const mean = meanEdgeLength(v.positions(), v.indices());
+        if (mean !== null && mean > 0 && Number.isFinite(mean)) {
+          densityAnchor = { mesh, length: mean };
+        }
+      } catch {
+        // Removed meanwhile: the remeshes fall back to the engine mean.
+      }
+    };
+
     /**
      * Remeshes the stroked region live (at most every 600 ms and 4 dabs,
      * never overlapping): split-only, so the triangle count only grows and
      * the surface never pops down mid-stroke. The stroke-end pass evens the
-     * density out fully.
+     * density out fully. Stands down on huge meshes, where a remesh would
+     * stall the worker behind the dabs.
      */
     const maybeLiveRemesh = () => {
       if (!liveRef.current || stroke === null || liveRunning !== null) {
@@ -457,10 +551,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
       if (b === null) {
         return;
       }
+      const mesh = brushRef.current.mesh;
+      const slots = triSlots(mesh);
+      if (slots === null || remeshTooBig(slots)) {
+        return;
+      }
+      ensureDensity(mesh);
       liveAt = now;
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
-      const mesh = brushRef.current.mesh;
       liveRunning = store
         .repair(mesh, {
           op: "remesh",
@@ -532,12 +631,15 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
         stroke = null;
         inspect.sculpt.strokes++;
         // The stroke-end remesh lands before the step closes: one undo step
-        // for the stroke and its evening-out (on the sync scene).
+        // for the stroke and its evening-out (on the sync scene). Stands
+        // down on huge meshes, where a remesh would stall the worker.
         if (remeshRef.current && landed > 0) {
           const b = s.bounds();
-          if (b !== null) {
+          const mesh = brushRef.current.mesh;
+          const slots = triSlots(mesh);
+          if (b !== null && slots !== null && !remeshTooBig(slots)) {
+            ensureDensity(mesh);
             inspect.sculpt.remeshes++;
-            const mesh = brushRef.current.mesh;
             void store
               .repair(mesh, {
                 op: "remesh",
@@ -722,18 +824,6 @@ function SculptLayer(props: { scene: Scene | WorkerScene; sculpt: SculptBrush; r
             grabFrom = { x: e.clientX, y: e.clientY };
             grabAnchor = brush.op === "grab" ? new GrabAnchor(point) : null;
             dirRef.current = [0, 0, 0];
-            if (densityAnchor === null || densityAnchor.mesh !== mesh) {
-              densityAnchor = null;
-              try {
-                const v = scene.views(mesh);
-                const mean = meanEdgeLength(v.positions(), v.indices());
-                if (mean !== null && mean > 0 && Number.isFinite(mean)) {
-                  densityAnchor = { mesh, length: mean };
-                }
-              } catch {
-                // Removed meanwhile: the remeshes fall back to the engine mean.
-              }
-            }
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,

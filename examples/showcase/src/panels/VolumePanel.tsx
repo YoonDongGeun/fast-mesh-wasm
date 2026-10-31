@@ -34,11 +34,23 @@ export function VolumePanel(props: { app: AppState; loader: Loader }) {
   if (item === null || item.volumeId === null) {
     return null;
   }
-  return <VolumeWork key={item.volumeId} app={app} loader={loader} volumeId={item.volumeId} name={item.name} />;
+  // A sample's suggested preset (by name), else Bone.
+  const suggested = item.preset === null ? -1 : VOLUME_PRESETS.findIndex((p) => p.name === item.preset);
+  const initialPreset = suggested < 0 ? 0 : suggested;
+  return (
+    <VolumeWork
+      key={item.volumeId}
+      app={app}
+      loader={loader}
+      volumeId={item.volumeId}
+      name={item.name}
+      initialPreset={initialPreset}
+    />
+  );
 }
 
-function VolumeWork(props: { app: AppState; loader: Loader; volumeId: string; name: string }) {
-  const { app, loader, volumeId, name } = props;
+function VolumeWork(props: { app: AppState; loader: Loader; volumeId: string; name: string; initialPreset: number }) {
+  const { app, loader, volumeId, name, initialPreset } = props;
   const [payload, setPayload] = useState<VolumePayload | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -91,16 +103,57 @@ function VolumeWork(props: { app: AppState; loader: Loader; volumeId: string; na
       </section>
     );
   }
-  return <VolumeTabs app={app} payload={payload} volumeId={volumeId} name={name} />;
+  return <VolumeTabs app={app} payload={payload} volumeId={volumeId} name={name} initialPreset={initialPreset} />;
 }
 
 /** The tabs share the MPR state through the app, so the scene overlay stays linked too. */
-function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: string; name: string }) {
-  const { app, payload, volumeId, name } = props;
-  const [tab, setTab] = useState<"volume" | "slices">("volume");
+function VolumeTabs(props: {
+  app: AppState;
+  payload: VolumePayload;
+  volumeId: string;
+  name: string;
+  initialPreset: number;
+}) {
+  const { app, payload, volumeId, name, initialPreset } = props;
   const mpr = useApp(app, (s) => s.volumeMpr);
+  const tab = mpr !== null && mpr.volumeId === volumeId ? mpr.tab : "volume";
+  const setTab = (t: "volume" | "slices"): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, tab: t });
+    }
+  };
+  const setPresetIdx = (i: number): void => {
+    const cur = app.getSnapshot().volumeMpr;
+    if (cur !== null && cur.volumeId === volumeId) {
+      app.setVolumeMpr({ ...cur, preset: i });
+    }
+  };
   const [selection, select] = useSelection();
   const sources = useApp(app, (s) => s.items).filter((i) => i.volumeId !== null);
+  const tabsRef = useRef<HTMLDivElement>(null);
+  // Selecting a volume mesh brings its tab buttons into view at once,
+  // retried briefly: the panels above can still grow (repair analysis).
+  useEffect(() => {
+    let ticks = 0;
+    const timer = setInterval(() => {
+      ticks += 1;
+      const tabs = tabsRef.current;
+      const pane = tabs?.closest(".sidebar") ?? null;
+      if (tabs === null || pane === null || ticks > 8) {
+        clearInterval(timer);
+        return;
+      }
+      const r = tabs.getBoundingClientRect();
+      const p = pane.getBoundingClientRect();
+      if (r.top < p.top || r.bottom > p.bottom) {
+        tabs.scrollIntoView({ block: "nearest" });
+      } else {
+        clearInterval(timer);
+      }
+    }, 250);
+    return () => clearInterval(timer);
+  }, [volumeId]);
   useEffect(() => {
     app.setVolumeMpr({
       volumeId,
@@ -111,13 +164,15 @@ function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: st
       },
       window: 0,
       inScene: true,
+      preset: initialPreset,
+      tab: "volume",
     });
     return () => {
       if (app.getSnapshot().volumeMpr?.volumeId === volumeId) {
         app.setVolumeMpr(null);
       }
     };
-  }, [app, payload, volumeId]);
+  }, [app, payload, volumeId, initialPreset]);
   const display = useMemo(() => displayValues(payload.values, payload.pseudoHu), [payload]);
   const range = useMemo(() => dataRange(display), [display]);
   const live = mpr !== null && mpr.volumeId === volumeId ? mpr : null;
@@ -151,7 +206,7 @@ function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: st
         <h2>Volume</h2>
         <span className="muted small">{name}</span>
       </header>
-      <div className="row" role="tablist" aria-label="Volume views">
+      <div ref={tabsRef} className="row" role="tablist" aria-label="Volume views">
         <button type="button" role="tab" aria-selected={tab === "volume"} data-action="volume-tab-3d" onClick={() => setTab("volume")}>
           3D
         </button>
@@ -196,6 +251,8 @@ function VolumeTabs(props: { app: AppState; payload: VolumePayload; volumeId: st
           slices={live.slices}
           colorWindow={colorWindow}
           colorLevel={colorLevel}
+          preset={live.preset}
+          setPreset={setPresetIdx}
         />
       ) : (
         <SliceWork
@@ -223,12 +280,13 @@ function VolumeCanvas(props: {
   slices: Record<SliceAxis, number>;
   colorWindow: number;
   colorLevel: number;
+  preset: number;
+  setPreset: (i: number) => void;
 }) {
-  const { payload, volumeId, display, range, slices, colorWindow, colorLevel } = props;
+  const { payload, volumeId, display, range, slices, colorWindow, colorLevel, preset, setPreset } = props;
   const divRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewRef = useRef<VolumeView3D | null>(null);
-  const [preset, setPreset] = useState(0);
   const [mip, setMip] = useState(false);
   const [planesOn, setPlanesOn] = useState(true);
   const [failed, setFailed] = useState(false);

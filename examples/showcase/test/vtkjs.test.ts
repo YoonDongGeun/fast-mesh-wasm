@@ -99,8 +99,9 @@ describe("parseSampleMeta", () => {
         seriesUid: "9.9",
         description: "demo",
         iso: 300,
+        preset: "Vessels",
       }),
-    ).toEqual({ slope: 8, intercept: -1000, seriesUid: "9.9", description: "demo", iso: 300 });
+    ).toEqual({ slope: 8, intercept: -1000, seriesUid: "9.9", description: "demo", iso: 300, preset: "Vessels" });
   });
 
   it("accepts_a_null_iso", () => {
@@ -119,6 +120,18 @@ describe("parseSampleMeta", () => {
     expect(() => parseSampleMeta(DESCRIPTOR)).toThrow();
     expect(() => parseSampleMeta({ ...DESCRIPTOR, hu: { slope: "8", intercept: -1000 } })).toThrow();
   });
+
+  it("defaults_a_missing_preset_to_null", () => {
+    expect(
+      parseSampleMeta({
+        ...DESCRIPTOR,
+        hu: { slope: 8, intercept: -1000 },
+        seriesUid: "9.9",
+        description: "demo",
+        iso: null,
+      }).preset,
+    ).toBe(null);
+  });
 });
 
 describe("loadSample", () => {
@@ -131,6 +144,7 @@ describe("loadSample", () => {
     seriesUid: "9.9",
     description: "tiny",
     iso: 300,
+    preset: "Vessels",
   };
 
   it("fetches_gunzips_and_slices", async () => {
@@ -140,9 +154,10 @@ describe("loadSample", () => {
       if (url.endsWith("index.json")) return new Response(JSON.stringify(TINY));
       return new Response(gzipSync(Buffer.from([0, 125, 200, 255])) as unknown as BodyInit);
     };
-    const { slices, iso } = await loadSample("headsq", "/base/", fetchImpl as typeof fetch);
+    const { slices, iso, preset } = await loadSample("headsq", "/base/", fetchImpl as typeof fetch);
     expect(seen).toEqual(["/base/samples/headsq/index.json", "/base/samples/headsq/data/blob.gz"]);
     expect(iso).toBe(300);
+    expect(preset).toBe("Vessels");
     expect(slices.length).toBe(1);
     expect(slices[0].seriesUid).toBe("9.9");
     expect(Array.from(slices[0].pixels as Int16Array)).toEqual([-1000, 0, 600, 1040]);

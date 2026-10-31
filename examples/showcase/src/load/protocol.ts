@@ -29,6 +29,8 @@ export interface LoadedMesh {
   radius: number;
   /** The retained source volume's id (DICOM + phantoms), for the volume view. */
   volumeId: string | null;
+  /** The suggested volume preset (a sample's descriptor hint), if any. */
+  preset: string | null;
 }
 
 /** A retained source volume, fetched for the volume view (values transferred). */

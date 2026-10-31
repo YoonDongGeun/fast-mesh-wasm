@@ -133,6 +133,43 @@ describe("FastMesh", () => {
     expect(object.visible).toBe(true);
   });
 
+  it("fastmesh_visible_prop_ands_with_display", async () => {
+    const { store, a } = setup();
+    const r = await mount(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} visible={false} />
+      </SceneProvider>,
+    );
+    const object = r.scene.children[0].instance as THREE.Mesh;
+    // Hidden by the prop while the store's display says visible, and a
+    // display round trip must not shake the prop loose.
+    expect(object.visible).toBe(false);
+    await act(async () => {
+      store.setDisplay(a, { visible: false });
+    });
+    await frames(r, 1);
+    await act(async () => {
+      store.setDisplay(a, { visible: true });
+    });
+    await frames(r, 1);
+    expect(object.visible).toBe(false);
+
+    await r.update(
+      <SceneProvider store={store}>
+        <FastMesh mesh={a} />
+      </SceneProvider>,
+    );
+    await frames(r, 1);
+    expect(object.visible).toBe(true);
+
+    // The store still hides it with the prop unset.
+    await act(async () => {
+      store.setDisplay(a, { visible: false });
+    });
+    await frames(r, 1);
+    expect(object.visible).toBe(false);
+  });
+
   it("fastmesh_store_prop_without_provider", async () => {
     const { store, a } = setup();
     const spy = vi.spyOn(store, "commitFrame");
