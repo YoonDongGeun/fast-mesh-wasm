@@ -39,6 +39,8 @@
 //!   and faired to continue the surrounding curvature. Run [`orient()`]
 //!   first on meshes that may contain flipped triangles: a hole whose rim
 //!   crosses an orientation seam is not clean and is skipped.
+//! - Measurement: [`measure`] reports a mesh's surface area (always) and
+//!   enclosed volume (when watertight, with the reason otherwise).
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -55,6 +57,7 @@ mod error;
 mod fair;
 mod fill;
 mod fill_dp;
+mod measure;
 mod offset;
 mod orient;
 mod refine;
@@ -80,6 +83,7 @@ pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
 };
+pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
 pub use offset::{
     OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,
     ShellReport, offset, shell,

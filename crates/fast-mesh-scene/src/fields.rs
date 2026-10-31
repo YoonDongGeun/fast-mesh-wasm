@@ -71,7 +71,7 @@
 use fast_mesh_bvh::Bvh;
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignBuild, SignData, SignMode, SignStatus, Target, color_of,
-    signed_distances, signed_distances_multi,
+    curvatures, signed_distances, signed_distances_multi, thicknesses,
 };
 use fast_mesh_query::{NearSearch, Rigid};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, StoreError, TriangleId, VertexId, par};
@@ -119,6 +119,49 @@ impl DistanceField {
             sign,
         }
     }
+}
+
+/// A per-vertex curvature field to register with
+/// [`Scene::add_curvature_field`].
+///
+/// The value at a vertex is its signed mean curvature (the cotangent Laplace
+/// estimate of [`fast_mesh_fields::curvatures`]): positive on domes (convex
+/// as seen from the normal side, about `1 / r` on a sphere of radius `r`
+/// with outward normals), negative in bowls and dents, zero on flat spots;
+/// a saddle takes the sign of its dominant bend. Units are 1/world-unit:
+/// the placement's scale is applied (a mesh scaled by `s` reads `H / s`),
+/// so scaled meshes read scaled. Dead slots and alive vertices no alive
+/// triangle uses read NaN. Like a thickness field, the values live in a
+/// derived store channel `field:<name>` on `on` and colour through
+/// [`Scene::set_coloring`] unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurvatureField {
+    /// The field's name, unique among the fields on `on`.
+    pub name: String,
+    /// The mesh whose vertices carry the values.
+    pub on: MeshId,
+}
+
+/// A per-vertex wall-thickness field to register with
+/// [`Scene::add_thickness_field`].
+///
+/// The value at a vertex is the distance to the opposite surface along the
+/// vertex's smooth normal (the nearest ray hit in either normal direction),
+/// in world units: the placement's scale is applied, so scaled meshes read
+/// scaled. Hits beyond `max_distance` read `+∞`; vertices whose rays escape
+/// in both directions (open sheets, the rims of open meshes), dead slots and
+/// alive vertices no alive triangle uses read NaN. Like a distance field,
+/// the values live in a derived store channel `field:<name>` on `on` and
+/// colour through [`Scene::set_coloring`] unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThicknessField {
+    /// The field's name, unique among the fields on `on`.
+    pub name: String,
+    /// The mesh whose vertices carry the values.
+    pub on: MeshId,
+    /// The largest thickness kept (inclusive); thicker vertices hold `+∞`.
+    /// Zero or greater, may be infinite.
+    pub max_distance: f64,
 }
 
 /// The state of a field, from
@@ -531,6 +574,42 @@ impl Field {
     }
 }
 
+/// A registered thickness field: its values are recomputed in full on every
+/// update (no targets, no sign data, no near sets), through
+/// [`Scene::update_thick_due`].
+pub(crate) struct ThickField {
+    pub(crate) id: FieldId,
+    pub(crate) desc: ThicknessField,
+    /// `field:<name>`, the channel on mesh `on`.
+    channel: String,
+    /// Applied at least once: [`Scene::withdraw_field`] no longer applies.
+    computed: bool,
+    /// Not computed yet: the next update recomputes every vertex.
+    fresh: bool,
+}
+
+/// A registered curvature field: its values are recomputed in full on every
+/// update (no targets, no sign data, no near sets), through
+/// [`Scene::update_curv_due`].
+pub(crate) struct CurvField {
+    pub(crate) id: FieldId,
+    pub(crate) desc: CurvatureField,
+    /// `field:<name>`, the channel on mesh `on`.
+    channel: String,
+    /// Applied at least once: [`Scene::withdraw_field`] no longer applies.
+    computed: bool,
+    /// Not computed yet: the next update recomputes every vertex.
+    fresh: bool,
+}
+
+/// Which registry a field id lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldRef {
+    Distance(usize),
+    Thickness(usize),
+    Curvature(usize),
+}
+
 impl Entry {
     fn hook(&self, id: FieldId) -> Option<&FieldHook> {
         self.hooks.iter().find(|h| h.field == id)
@@ -659,26 +738,63 @@ impl Scene {
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn withdraw_field(&mut self, id: FieldId) -> Result<bool> {
         self.drop_field_unit();
-        let i = self.field_index(id)?;
-        let f = &self.fields[i];
-        let colours = self
-            .entry(f.desc.on)
-            .ok()
-            .and_then(|e| e.coloring.as_ref())
-            .is_some_and(|c| c.coloring.field == id);
-        if f.computed || colours {
-            return Ok(false);
-        }
-        let f = self.fields.remove(i);
-        for &m in std::iter::once(&f.desc.on).chain(&f.desc.to) {
-            if let Some(e) = self.entries.get_mut(m) {
-                e.hooks.retain(|h| h.field != id);
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => {
+                let f = &self.fields[i];
+                let colours = self
+                    .entry(f.desc.on)
+                    .ok()
+                    .and_then(|e| e.coloring.as_ref())
+                    .is_some_and(|c| c.coloring.field == id);
+                if f.computed || colours {
+                    return Ok(false);
+                }
+                let f = self.fields.remove(i);
+                for &m in std::iter::once(&f.desc.on).chain(&f.desc.to) {
+                    if let Some(e) = self.entries.get_mut(m) {
+                        e.hooks.retain(|h| h.field != id);
+                    }
+                }
+                if let Some(ea) = self.entries.get_mut(f.desc.on) {
+                    let _ = ea.mesh.remove_channel(&f.channel);
+                }
+                Ok(true)
+            }
+            FieldRef::Thickness(t) => {
+                let f = &self.thick[t];
+                let colours = self
+                    .entry(f.desc.on)
+                    .ok()
+                    .and_then(|e| e.coloring.as_ref())
+                    .is_some_and(|c| c.coloring.field == id);
+                if f.computed || colours {
+                    return Ok(false);
+                }
+                let f = self.thick.remove(t);
+                if let Some(ea) = self.entries.get_mut(f.desc.on) {
+                    ea.hooks.retain(|h| h.field != id);
+                    let _ = ea.mesh.remove_channel(&f.channel);
+                }
+                Ok(true)
+            }
+            FieldRef::Curvature(c) => {
+                let f = &self.curv[c];
+                let colours = self
+                    .entry(f.desc.on)
+                    .ok()
+                    .and_then(|e| e.coloring.as_ref())
+                    .is_some_and(|c| c.coloring.field == id);
+                if f.computed || colours {
+                    return Ok(false);
+                }
+                let f = self.curv.remove(c);
+                if let Some(ea) = self.entries.get_mut(f.desc.on) {
+                    ea.hooks.retain(|h| h.field != id);
+                    let _ = ea.mesh.remove_channel(&f.channel);
+                }
+                Ok(true)
             }
         }
-        if let Some(ea) = self.entries.get_mut(f.desc.on) {
-            let _ = ea.mesh.remove_channel(&f.channel);
-        }
-        Ok(true)
     }
 
     /// Validates `desc` and registers its field (its channel, hooks and,
@@ -711,6 +827,14 @@ impl Scene {
             .fields
             .iter()
             .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .thick
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .curv
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
         {
             return Err(SceneError::InvalidInput(
                 "the mesh already has a field of that name",
@@ -773,6 +897,204 @@ impl Scene {
         Ok((id, eager))
     }
 
+    /// Registers a per-vertex wall-thickness field on mesh `desc.on`, and
+    /// returns its id. Its values go into a derived channel `field:<name>` on
+    /// `desc.on`, readable with [`Scene::field_values`] or through
+    /// [`Scene::mesh`]; they are not undoable.
+    ///
+    /// The field follows the [`UpdateMode`] of `desc.on` like a distance
+    /// field: an Eager one is computed right away and after every edit,
+    /// placement change, undo, redo or cancel touching `desc.on`; a Lazy one
+    /// by [`Scene::flush`] or [`Scene::update_fields`]; a Manual one only by
+    /// [`Scene::update_fields`]. Until then its values are NaN. Every update
+    /// recomputes every vertex in full (a thickness has no targets to narrow
+    /// it down to).
+    ///
+    /// A non-uniformly scaled placement is baked into a world-frame copy for
+    /// the update, so the values are world distances; a uniform scale
+    /// multiplies the local values, and a rigid placement changes nothing.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when
+    /// `max_distance` is negative or NaN, or `on` already has a field of that
+    /// name; [`SceneError::StaleBvh`] when the mesh is a stale Manual mesh; a
+    /// BVH, field or memory error. The scene is unchanged on error.
+    pub fn add_thickness_field(&mut self, desc: ThicknessField) -> Result<FieldId> {
+        self.drop_field_unit();
+        let (id, eager) = self.register_thickness(desc)?;
+        if eager {
+            let _ = self.update_thick_field(self.thick.len() - 1);
+        }
+        Ok(id)
+    }
+
+    /// [`Scene::add_thickness_field`] computing nothing yet: the field is due
+    /// until an update computes it ([`Scene::field_step`] (an Eager field),
+    /// [`Scene::field_step_field`], [`Scene::update_fields`] or
+    /// [`Scene::flush`], unless deferred, the next change to its mesh (an
+    /// Eager field)). Until then its values are NaN.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] as for
+    /// [`Scene::add_thickness_field`]; a memory error. The scene is unchanged
+    /// on error. Errors of the BVH come from the update that computes the
+    /// field.
+    pub fn add_thickness_field_deferred(&mut self, desc: ThicknessField) -> Result<FieldId> {
+        self.drop_field_unit();
+        Ok(self.register_thickness(desc)?.0)
+    }
+
+    /// Validates `desc` and registers its thickness field (its channel and
+    /// hook). Returns its id and whether its mesh is Eager. All or nothing.
+    fn register_thickness(&mut self, desc: ThicknessField) -> Result<(FieldId, bool)> {
+        self.entry(desc.on)?;
+        if desc.max_distance.is_nan() || desc.max_distance < 0.0 {
+            return Err(SceneError::InvalidInput(
+                "max_distance must be zero or greater, and not NaN",
+            ));
+        }
+        if self
+            .fields
+            .iter()
+            .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .thick
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .curv
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+        {
+            return Err(SceneError::InvalidInput(
+                "the mesh already has a field of that name",
+            ));
+        }
+        let next = self
+            .next_field
+            .checked_add(1)
+            .ok_or(SceneError::InvalidInput("too many fields"))?;
+        let channel = format!("{FIELD_PREFIX}{}", desc.name);
+        let ea = self
+            .entries
+            .get_mut(desc.on)
+            .ok_or(SceneError::UnknownMesh)?;
+        ea.hooks.try_reserve(1).map_err(|_| oom())?;
+        ea.mesh
+            .add_channel(ChannelDesc::derived(channel.clone(), 1))?;
+        // Nothing can fail from here on.
+        let id = FieldId(self.next_field);
+        self.next_field = next;
+        ea.hooks.push(FieldHook::new(id));
+        let eager = ea.mode == UpdateMode::Eager;
+        self.thick.try_reserve(1).map_err(|_| oom())?;
+        self.thick.push(ThickField {
+            id,
+            desc,
+            channel,
+            computed: false,
+            fresh: true,
+        });
+        Ok((id, eager))
+    }
+
+    /// Registers a per-vertex curvature field on mesh `desc.on`, and returns
+    /// its id. Its values go into a derived channel `field:<name>` on
+    /// `desc.on`, readable with [`Scene::field_values`] or through
+    /// [`Scene::mesh`]; they are not undoable.
+    ///
+    /// The field follows the [`UpdateMode`] of `desc.on` like a distance
+    /// field: an Eager one is computed right away and after every edit,
+    /// placement change, undo, redo or cancel touching `desc.on`; a Lazy one
+    /// by [`Scene::flush`] or [`Scene::update_fields`]; a Manual one only by
+    /// [`Scene::update_fields`]. Until then its values are NaN. Every update
+    /// recomputes every vertex in full (a curvature has no targets to narrow
+    /// it down to).
+    ///
+    /// A non-uniformly scaled placement is baked into a world-frame copy for
+    /// the update, so the values are world curvatures; a uniform scale `s`
+    /// divides the local values by `s`, and a rigid placement changes
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] when `on`
+    /// already has a field of that name; [`SceneError::StaleBvh`] when the
+    /// mesh is a stale Manual mesh; a BVH, field or memory error. The scene
+    /// is unchanged on error.
+    pub fn add_curvature_field(&mut self, desc: CurvatureField) -> Result<FieldId> {
+        self.drop_field_unit();
+        let (id, eager) = self.register_curvature(desc)?;
+        if eager {
+            let _ = self.update_curv_field(self.curv.len() - 1);
+        }
+        Ok(id)
+    }
+
+    /// [`Scene::add_curvature_field`] computing nothing yet: the field is due
+    /// until an update computes it ([`Scene::field_step`] (an Eager field),
+    /// [`Scene::field_step_field`], [`Scene::update_fields`] or
+    /// [`Scene::flush`], unless deferred, the next change to its mesh (an
+    /// Eager field)). Until then its values are NaN.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`]; [`SceneError::InvalidInput`] as for
+    /// [`Scene::add_curvature_field`]; a memory error. The scene is unchanged
+    /// on error. Errors of the BVH come from the update that computes the
+    /// field.
+    pub fn add_curvature_field_deferred(&mut self, desc: CurvatureField) -> Result<FieldId> {
+        self.drop_field_unit();
+        Ok(self.register_curvature(desc)?.0)
+    }
+
+    /// Validates `desc` and registers its curvature field (its channel and
+    /// hook). Returns its id and whether its mesh is Eager. All or nothing.
+    fn register_curvature(&mut self, desc: CurvatureField) -> Result<(FieldId, bool)> {
+        self.entry(desc.on)?;
+        if self
+            .fields
+            .iter()
+            .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .thick
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+            || self
+                .curv
+                .iter()
+                .any(|f| f.desc.on == desc.on && f.desc.name == desc.name)
+        {
+            return Err(SceneError::InvalidInput(
+                "the mesh already has a field of that name",
+            ));
+        }
+        let next = self
+            .next_field
+            .checked_add(1)
+            .ok_or(SceneError::InvalidInput("too many fields"))?;
+        let channel = format!("{FIELD_PREFIX}{}", desc.name);
+        let ea = self
+            .entries
+            .get_mut(desc.on)
+            .ok_or(SceneError::UnknownMesh)?;
+        ea.hooks.try_reserve(1).map_err(|_| oom())?;
+        ea.mesh
+            .add_channel(ChannelDesc::derived(channel.clone(), 1))?;
+        // Nothing can fail from here on.
+        let id = FieldId(self.next_field);
+        self.next_field = next;
+        ea.hooks.push(FieldHook::new(id));
+        let eager = ea.mode == UpdateMode::Eager;
+        self.curv.try_reserve(1).map_err(|_| oom())?;
+        self.curv.push(CurvField {
+            id,
+            desc,
+            channel,
+            computed: false,
+            fresh: true,
+        });
+        Ok((id, eager))
+    }
+
     /// Removes a field: its channel leaves its mesh, a colouring by it is
     /// removed (reported as `colors_dirty: None`), and the removal is
     /// reported in the mesh's [`MeshChanges::fields_changed`](crate::MeshChanges::fields_changed).
@@ -782,8 +1104,11 @@ impl Scene {
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn remove_field(&mut self, id: FieldId) -> Result<()> {
         self.drop_field_unit();
-        let i = self.field_index(id)?;
-        self.detach_field(i);
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => self.detach_field(i),
+            FieldRef::Thickness(t) => self.detach_thick(t),
+            FieldRef::Curvature(c) => self.detach_curv(c),
+        }
         Ok(())
     }
 
@@ -807,15 +1132,31 @@ impl Scene {
 
     /// The field's values, one per vertex slot of its mesh, as of its last
     /// update (see [`Scene::field_status`]): signed distances, `+∞` for far,
-    /// NaN for dead or unused vertices. Never updates.
+    /// NaN for dead or unused vertices. A thickness field holds wall
+    /// thicknesses instead (`+∞` past `max_distance`, NaN where the rays
+    /// escape), and a curvature field signed mean curvatures in 1/world-unit
+    /// (NaN for dead or unused vertices). Never updates.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_values(&self, id: FieldId) -> Result<&[f32]> {
-        let f = &self.fields[self.field_index(id)?];
-        self.entry(f.desc.on)?
+        let (on, channel) = match self.field_ref(id)? {
+            FieldRef::Distance(i) => {
+                let f = &self.fields[i];
+                (f.desc.on, f.channel.as_str())
+            }
+            FieldRef::Thickness(t) => {
+                let f = &self.thick[t];
+                (f.desc.on, f.channel.as_str())
+            }
+            FieldRef::Curvature(c) => {
+                let f = &self.curv[c];
+                (f.desc.on, f.channel.as_str())
+            }
+        };
+        self.entry(on)?
             .mesh
-            .channel(&f.channel)
+            .channel(channel)
             .ok_or(SceneError::Corrupted)
     }
 
@@ -823,8 +1164,9 @@ impl Scene {
     /// in [`Scene::field_targets`] of the target its value came from (the
     /// lowest on a tie), or `u32::MAX` for none (a `+∞` or NaN value, or a
     /// slot not computed yet). It can be shorter than the mesh's slots
-    /// (slots added since the last update): those slots have none. Never
-    /// updates.
+    /// (slots added since the last update): those slots have none.
+    /// Thickness and curvature fields have no targets and report none.
+    /// Never updates.
     ///
     /// After a target mesh is removed, and until the field's next update
     /// (at once for an Eager field, unless deferred), the vertices whose
@@ -834,20 +1176,30 @@ impl Scene {
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_nearest(&self, id: FieldId) -> Result<&[u32]> {
-        Ok(&self.fields[self.field_index(id)?].nearest)
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => Ok(&self.fields[i].nearest),
+            FieldRef::Thickness(_) => Ok(&[]),
+            FieldRef::Curvature(_) => Ok(&[]),
+        }
     }
 
     /// The field's target meshes, in index order. Removing a target mesh
-    /// removes it from here, shifting the later ones down.
+    /// removes it from here, shifting the later ones down. Thickness and
+    /// curvature fields have no targets.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_targets(&self, id: FieldId) -> Result<&[MeshId]> {
-        Ok(&self.fields[self.field_index(id)?].desc.to)
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => Ok(&self.fields[i].desc.to),
+            FieldRef::Thickness(_) => Ok(&[]),
+            FieldRef::Curvature(_) => Ok(&[]),
+        }
     }
 
     /// What the latest sign data build found out about each of the field's
-    /// targets, in index order. Never updates.
+    /// targets, in index order. Thickness and curvature fields have no
+    /// targets. Never updates.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
@@ -857,32 +1209,65 @@ impl Scene {
     /// [`SignMode::Pseudonormal`]), not closed, not consistently oriented,
     /// and no counts.
     pub fn field_target_status(&self, id: FieldId) -> Result<Vec<SignStatus>> {
-        let f = &self.fields[self.field_index(id)?];
-        Ok((0..f.sign.len()).map(|k| f.sign_status(k)).collect())
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => {
+                let f = &self.fields[i];
+                Ok((0..f.sign.len()).map(|k| f.sign_status(k)).collect())
+            }
+            FieldRef::Thickness(_) => Ok(Vec::new()),
+            FieldRef::Curvature(_) => Ok(Vec::new()),
+        }
     }
 
     /// Whether the field is current, and what the latest sign data builds
     /// found out about its target meshes, together (see
-    /// [`FieldStatus::sign`]). Never updates.
+    /// [`FieldStatus::sign`]). Thickness and curvature fields have no sign
+    /// data and report the placeholder (neither closed nor consistently
+    /// oriented). Never updates.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field.
     pub fn field_status(&self, id: FieldId) -> Result<FieldStatus> {
-        let i = self.field_index(id)?;
-        let f = &self.fields[i];
-        let mut sign = f.sign_status(0);
-        for k in 1..f.sign.len() {
-            let s = f.sign_status(k);
-            sign.closed &= s.closed;
-            sign.consistent_orientation &= s.consistent_orientation;
-            sign.non_manifold_vertices += s.non_manifold_vertices;
-            sign.degenerate_triangles += s.degenerate_triangles;
-            sign.signed_volume += s.signed_volume;
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => {
+                let f = &self.fields[i];
+                let mut sign = f.sign_status(0);
+                for k in 1..f.sign.len() {
+                    let s = f.sign_status(k);
+                    sign.closed &= s.closed;
+                    sign.consistent_orientation &= s.consistent_orientation;
+                    sign.non_manifold_vertices += s.non_manifold_vertices;
+                    sign.degenerate_triangles += s.degenerate_triangles;
+                    sign.signed_volume += s.signed_volume;
+                }
+                Ok(FieldStatus {
+                    current: self.field_current(i),
+                    sign,
+                })
+            }
+            FieldRef::Thickness(t) => Ok(FieldStatus {
+                current: self.thick_current(t),
+                sign: SignStatus {
+                    mode: SignMode::Pseudonormal,
+                    closed: false,
+                    consistent_orientation: false,
+                    non_manifold_vertices: 0,
+                    degenerate_triangles: 0,
+                    signed_volume: 0.0,
+                },
+            }),
+            FieldRef::Curvature(c) => Ok(FieldStatus {
+                current: self.curv_current(c),
+                sign: SignStatus {
+                    mode: SignMode::Pseudonormal,
+                    closed: false,
+                    consistent_orientation: false,
+                    non_manifold_vertices: 0,
+                    degenerate_triangles: 0,
+                    signed_volume: 0.0,
+                },
+            }),
         }
-        Ok(FieldStatus {
-            current: self.field_current(i),
-            sign,
-        })
     }
 
     /// Colours `mesh` from one of its fields, or stops colouring it with
@@ -902,8 +1287,21 @@ impl Scene {
         let state = match coloring {
             None => None,
             Some(c) => {
-                let f = &self.fields[self.field_index(c.field)?];
-                if f.desc.on != mesh {
+                let (on, channel) = match self.field_ref(c.field)? {
+                    FieldRef::Distance(i) => {
+                        let f = &self.fields[i];
+                        (f.desc.on, f.channel.clone())
+                    }
+                    FieldRef::Thickness(t) => {
+                        let f = &self.thick[t];
+                        (f.desc.on, f.channel.clone())
+                    }
+                    FieldRef::Curvature(c) => {
+                        let f = &self.curv[c];
+                        (f.desc.on, f.channel.clone())
+                    }
+                };
+                if on != mesh {
                     return Err(SceneError::InvalidInput("the field is not on this mesh"));
                 }
                 c.rule.validate().map_err(|e| match e {
@@ -912,7 +1310,7 @@ impl Scene {
                 })?;
                 Some(ColorState {
                     coloring: c,
-                    channel: f.channel.clone(),
+                    channel,
                     colors: Vec::new(),
                 })
             }
@@ -985,6 +1383,8 @@ impl Scene {
             .iter()
             .filter(|f| f.desc.on == mesh)
             .map(|f| f.id)
+            .chain(self.thick.iter().filter(|f| f.desc.on == mesh).map(|f| f.id))
+            .chain(self.curv.iter().filter(|f| f.desc.on == mesh).map(|f| f.id))
             .collect())
     }
 
@@ -992,7 +1392,10 @@ impl Scene {
     /// name, its meshes and any colouring by it. The field is recomputed in
     /// full on its next update (at once for an Eager field); until then its
     /// values are stale and [`Scene::field_status`] reports it as not
-    /// current, with placeholder sign data when the sign mode changed.
+    /// current, with placeholder sign data when the sign mode changed. A
+    /// thickness field has no sign mode (`sign` is ignored for it), and a
+    /// curvature field has neither (`max_distance` is ignored for it too:
+    /// the call still marks it for recompute).
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field;
@@ -1010,43 +1413,126 @@ impl Scene {
                 "max_distance must be zero or greater, and not NaN",
             ));
         }
-        let i = self.field_index(id)?;
-        {
-            let f = &mut self.fields[i];
-            if f.desc.max_distance == max_distance && f.desc.sign == sign {
-                return Ok(());
-            }
-            f.desc.max_distance = max_distance;
-            if f.desc.sign != sign {
-                f.desc.sign = sign;
-                for s in f.sign.iter_mut() {
-                    *s = None;
+        match self.field_ref(id)? {
+            FieldRef::Distance(i) => {
+                {
+                    let f = &mut self.fields[i];
+                    if f.desc.max_distance == max_distance && f.desc.sign == sign {
+                        return Ok(());
+                    }
+                    f.desc.max_distance = max_distance;
+                    if f.desc.sign != sign {
+                        f.desc.sign = sign;
+                        for s in f.sign.iter_mut() {
+                            *s = None;
+                        }
+                        for b in f.sign_builds.iter_mut() {
+                            *b = None;
+                        }
+                    }
+                    f.fresh = true;
                 }
-                for b in f.sign_builds.iter_mut() {
-                    *b = None;
+                let on = self.fields[i].desc.on;
+                let eager = self
+                    .entry(on)
+                    .map(|e| e.mode == UpdateMode::Eager)
+                    .unwrap_or(false);
+                if eager {
+                    let _ = self.update_field(i);
                 }
+                Ok(())
             }
-            f.fresh = true;
+            FieldRef::Thickness(t) => {
+                {
+                    let f = &mut self.thick[t];
+                    if f.desc.max_distance == max_distance {
+                        return Ok(());
+                    }
+                    f.desc.max_distance = max_distance;
+                    f.fresh = true;
+                }
+                let on = self.thick[t].desc.on;
+                let eager = self
+                    .entry(on)
+                    .map(|e| e.mode == UpdateMode::Eager)
+                    .unwrap_or(false);
+                if eager {
+                    let _ = self.update_thick_field(t);
+                }
+                Ok(())
+            }
+            FieldRef::Curvature(c) => {
+                {
+                    let f = &mut self.curv[c];
+                    f.fresh = true;
+                }
+                let on = self.curv[c].desc.on;
+                let eager = self
+                    .entry(on)
+                    .map(|e| e.mode == UpdateMode::Eager)
+                    .unwrap_or(false);
+                if eager {
+                    let _ = self.update_curv_field(c);
+                }
+                Ok(())
+            }
         }
-        let on = self.fields[i].desc.on;
-        let eager = self
-            .entry(on)
-            .map(|e| e.mode == UpdateMode::Eager)
-            .unwrap_or(false);
-        if eager {
-            let _ = self.update_field(i);
-        }
-        Ok(())
     }
 
     /// The id of the registered field with this [`FieldId::raw`] value, or
     /// `None` when there is none (never added, or removed).
     pub fn field_id(&self, raw: u32) -> Option<FieldId> {
-        self.fields.iter().map(|f| f.id).find(|id| id.0 == raw)
+        self.fields
+            .iter()
+            .map(|f| f.id)
+            .chain(self.thick.iter().map(|f| f.id))
+            .chain(self.curv.iter().map(|f| f.id))
+            .find(|id| id.0 == raw)
     }
 
     fn field_index(&self, id: FieldId) -> Result<usize> {
         self.fields
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or(SceneError::UnknownField)
+    }
+
+    /// Which registry `id` lives in.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field.
+    fn field_ref(&self, id: FieldId) -> Result<FieldRef> {
+        if let Some(i) = self.fields.iter().position(|f| f.id == id) {
+            return Ok(FieldRef::Distance(i));
+        }
+        if let Some(t) = self.thick.iter().position(|f| f.id == id) {
+            return Ok(FieldRef::Thickness(t));
+        }
+        if let Some(c) = self.curv.iter().position(|f| f.id == id) {
+            return Ok(FieldRef::Curvature(c));
+        }
+        Err(SceneError::UnknownField)
+    }
+
+    /// The index of thickness field `id`.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field, or a
+    /// field of another kind.
+    fn thick_index(&self, id: FieldId) -> Result<usize> {
+        self.thick
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or(SceneError::UnknownField)
+    }
+
+    /// The index of curvature field `id`.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownField`] for an unknown or removed field, or a
+    /// field of another kind.
+    fn curv_index(&self, id: FieldId) -> Result<usize> {
+        self.curv
             .iter()
             .position(|f| f.id == id)
             .ok_or(SceneError::UnknownField)
@@ -1065,6 +1551,28 @@ impl Scene {
         !f.fresh && clean(f.desc.on) && f.desc.to.iter().all(|&m| clean(m))
     }
 
+    /// Computed at least once, and nothing changed on its mesh since.
+    fn thick_current(&self, t: usize) -> bool {
+        let f = &self.thick[t];
+        let clean = self
+            .entry(f.desc.on)
+            .ok()
+            .and_then(|e| e.hook(f.id))
+            .is_some_and(FieldHook::is_clean);
+        !f.fresh && clean
+    }
+
+    /// Computed at least once, and nothing changed on its mesh since.
+    fn curv_current(&self, c: usize) -> bool {
+        let f = &self.curv[c];
+        let clean = self
+            .entry(f.desc.on)
+            .ok()
+            .and_then(|e| e.hook(f.id))
+            .is_some_and(FieldHook::is_clean);
+        !f.fresh && clean
+    }
+
     /// Updates the fields that are not current, whose mesh's mode passes
     /// `want`, and (with `touched`) that involve one of those meshes.
     /// Returns the first error; every field is attempted.
@@ -1073,8 +1581,284 @@ impl Scene {
         want: impl Fn(UpdateMode) -> bool,
         touched: Option<&[MeshId]>,
     ) -> Result<()> {
-        let due = self.due_fields(want, touched)?;
-        self.update_due(&due)
+        let due = self.due_fields(&want, touched)?;
+        let r = self.update_due(&due);
+        // Thickness and curvature fields update separately (they hold no
+        // shared unit), but every due field is still attempted.
+        let due_thick = self.due_thick_fields(&want, touched)?;
+        let r2 = self.update_thick_due(&due_thick);
+        let due_curv = self.due_curv_fields(&want, touched)?;
+        let r3 = self.update_curv_due(&due_curv);
+        r.and(r2).and(r3)
+    }
+
+    /// The indices of the thickness fields that are not current, whose
+    /// mesh's mode passes `want`, and (with `touched`) that are on one of
+    /// those meshes, ascending.
+    fn due_thick_fields(
+        &self,
+        want: impl Fn(UpdateMode) -> bool,
+        touched: Option<&[MeshId]>,
+    ) -> Result<Vec<usize>> {
+        let mut due = Vec::new();
+        for t in 0..self.thick.len() {
+            let on = self.thick[t].desc.on;
+            if touched.is_some_and(|touched| !touched.contains(&on)) {
+                continue;
+            }
+            let Ok(ea) = self.entry(on) else { continue };
+            if !want(ea.mode) || self.thick_current(t) {
+                continue;
+            }
+            due.try_reserve(1).map_err(|_| oom())?;
+            due.push(t);
+        }
+        Ok(due)
+    }
+
+    /// The indices of the curvature fields that are not current, whose
+    /// mesh's mode passes `want`, and (with `touched`) that are on one of
+    /// those meshes, ascending.
+    fn due_curv_fields(
+        &self,
+        want: impl Fn(UpdateMode) -> bool,
+        touched: Option<&[MeshId]>,
+    ) -> Result<Vec<usize>> {
+        let mut due = Vec::new();
+        for c in 0..self.curv.len() {
+            let on = self.curv[c].desc.on;
+            if touched.is_some_and(|touched| !touched.contains(&on)) {
+                continue;
+            }
+            let Ok(ea) = self.entry(on) else { continue };
+            if !want(ea.mode) || self.curv_current(c) {
+                continue;
+            }
+            due.try_reserve(1).map_err(|_| oom())?;
+            due.push(c);
+        }
+        Ok(due)
+    }
+
+    /// Brings curvature field `c` up to date: its BVH under the query rules,
+    /// then every vertex recomputed in full. All or nothing: on error
+    /// nothing is written and the pending changes stay.
+    fn update_curv_field(&mut self, c: usize) -> Result<()> {
+        self.update_curv_due(&[c])
+    }
+
+    /// Brings the curvature fields at indices `due` (ascending) up to date,
+    /// one after the other. A field that fails is left as it was. Returns
+    /// the first error; every field is attempted.
+    fn update_curv_due(&mut self, due: &[usize]) -> Result<()> {
+        let mut first: Result<()> = Ok(());
+        for &c in due {
+            if let Err(e) = self.compute_curv_field(c)
+                && first.is_ok()
+            {
+                first = Err(e);
+            }
+        }
+        first
+    }
+
+    /// Prepares curvature field `c`, computes every vertex through the
+    /// placement, and applies the values. Fails, writing nothing, when the
+    /// BVH cannot be brought up to date, the kernel fails, or memory runs
+    /// out.
+    fn compute_curv_field(&mut self, c: usize) -> Result<()> {
+        use fast_mesh_bvh::BuildOptions;
+        use fast_mesh_store::Mesh;
+
+        let (on, channel) = {
+            let f = &self.curv[c];
+            (f.desc.on, f.channel.clone())
+        };
+        // The mesh's own BVH is what the field's staleness tracks; the kernel
+        // reads the mesh itself.
+        self.prepare(Some(&[on]))?;
+        let ea = self.entry(on)?;
+        let (placement, origin) = (ea.placement, ea.mesh.origin());
+        let slots = ea.mesh.vertex_slots();
+        // Where the kernel runs, and what turns its local curvatures into
+        // world ones: a rigid placement changes nothing, a uniform scale `s`
+        // divides (curvature is 1/length), and anything else runs on a baked
+        // world-frame copy.
+        let mut scale = 1.0f32;
+        let mut baked: Option<(Mesh, Bvh)> = None;
+        if placement.is_scaled() {
+            if let Some(s) = placement.uniform_scale() {
+                scale = s as f32;
+            } else {
+                baked = Some(baked_mesh(
+                    &ea.mesh,
+                    |p| {
+                        placement.apply([
+                            origin[0] + f64::from(p[0]),
+                            origin[1] + f64::from(p[1]),
+                            origin[2] + f64::from(p[2]),
+                        ])
+                    },
+                    &BuildOptions::default(),
+                )?);
+            }
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(slots).map_err(|_| oom())?;
+        values.resize(slots, f32::NAN);
+        match &baked {
+            Some((mesh, _)) => {
+                curvatures(mesh, &mut values)?;
+            }
+            None => {
+                let eb = self.entry(on)?;
+                curvatures(&eb.mesh, &mut values)?;
+                if scale != 1.0 {
+                    let s = f64::from(scale);
+                    for v in &mut values {
+                        if v.is_finite() {
+                            *v = (*v as f64 / s) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        drop(baked);
+        // Commit: compare with the channel, then write, recolour and report.
+        let id = self.curv[c].id;
+        let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
+        let old = ea.mesh.channel(&channel).ok_or(SceneError::Corrupted)?;
+        let changed: Vec<VertexId> = (0..slots as VertexId)
+            .filter(|&v| {
+                old.get(v as usize).map(|o| o.to_bits()) != Some(values[v as usize].to_bits())
+            })
+            .collect();
+        ea.mesh.derived_channel_mut(&channel)?[..slots].copy_from_slice(&values);
+        ea.reset_hook(id);
+        if !changed.is_empty() {
+            ea.report_field(id);
+        }
+        if let Some(cs) = &mut ea.coloring
+            && cs.coloring.field == id
+        {
+            let vals = ea.mesh.channel(&cs.channel).unwrap_or(&[]);
+            let dirty = cs.update(vals, &changed);
+            ea.report_colors(Some(&dirty));
+        }
+        let f = &mut self.curv[c];
+        f.fresh = false;
+        f.computed = true;
+        Ok(())
+    }
+
+    /// Brings thickness field `t` up to date: its BVH under the query rules,
+    /// then every vertex recomputed in full. All or nothing: on error
+    /// nothing is written and the pending changes stay.
+    fn update_thick_field(&mut self, t: usize) -> Result<()> {
+        self.update_thick_due(&[t])
+    }
+
+    /// Brings the thickness fields at indices `due` (ascending) up to date,
+    /// one after the other. A field that fails is left as it was. Returns
+    /// the first error; every field is attempted.
+    fn update_thick_due(&mut self, due: &[usize]) -> Result<()> {
+        let mut first: Result<()> = Ok(());
+        for &t in due {
+            if let Err(e) = self.compute_thick_field(t)
+                && first.is_ok()
+            {
+                first = Err(e);
+            }
+        }
+        first
+    }
+
+    /// Prepares thickness field `t` (its BVH), computes every vertex through
+    /// the placement, and applies the values. Fails, writing nothing, when
+    /// the BVH cannot be brought up to date, the kernel fails, or memory
+    /// runs out.
+    fn compute_thick_field(&mut self, t: usize) -> Result<()> {
+        use fast_mesh_bvh::BuildOptions;
+        use fast_mesh_store::Mesh;
+
+        let (on, max_distance, channel) = {
+            let f = &self.thick[t];
+            (f.desc.on, f.desc.max_distance, f.channel.clone())
+        };
+        // The mesh's own BVH is what the kernel reads.
+        self.prepare(Some(&[on]))?;
+        let ea = self.entry(on)?;
+        let (placement, origin) = (ea.placement, ea.mesh.origin());
+        let slots = ea.mesh.vertex_slots();
+        // Where the kernel runs, and what turns its local distances into
+        // world ones: a rigid placement changes nothing, a uniform scale
+        // multiplies, and anything else runs on a baked world-frame copy.
+        let mut scale = 1.0f32;
+        let mut baked: Option<(Mesh, Bvh)> = None;
+        if placement.is_scaled() {
+            if let Some(s) = placement.uniform_scale() {
+                scale = s as f32;
+            } else {
+                baked = Some(baked_mesh(
+                    &ea.mesh,
+                    |p| {
+                        placement.apply([
+                            origin[0] + f64::from(p[0]),
+                            origin[1] + f64::from(p[1]),
+                            origin[2] + f64::from(p[2]),
+                        ])
+                    },
+                    &BuildOptions::default(),
+                )?);
+            }
+        }
+        let mut values = Vec::new();
+        values.try_reserve_exact(slots).map_err(|_| oom())?;
+        values.resize(slots, f32::NAN);
+        match &baked {
+            Some((mesh, bvh)) => {
+                thicknesses(mesh, bvh, max_distance as f32, &mut values)?;
+            }
+            None => {
+                let eb = self.entry(on)?;
+                let bound = (max_distance / f64::from(scale)) as f32;
+                thicknesses(&eb.mesh, &eb.bvh, bound, &mut values)?;
+                if scale != 1.0 {
+                    let s = f64::from(scale);
+                    for v in &mut values {
+                        if v.is_finite() {
+                            *v = (*v as f64 * s) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        drop(baked);
+        // Commit: compare with the channel, then write, recolour and report.
+        let id = self.thick[t].id;
+        let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
+        let old = ea.mesh.channel(&channel).ok_or(SceneError::Corrupted)?;
+        let changed: Vec<VertexId> = (0..slots as VertexId)
+            .filter(|&v| {
+                old.get(v as usize).map(|o| o.to_bits()) != Some(values[v as usize].to_bits())
+            })
+            .collect();
+        ea.mesh.derived_channel_mut(&channel)?[..slots].copy_from_slice(&values);
+        ea.reset_hook(id);
+        if !changed.is_empty() {
+            ea.report_field(id);
+        }
+        if let Some(cs) = &mut ea.coloring
+            && cs.coloring.field == id
+        {
+            let vals = ea.mesh.channel(&cs.channel).unwrap_or(&[]);
+            let dirty = cs.update(vals, &changed);
+            ea.report_colors(Some(&dirty));
+        }
+        let f = &mut self.thick[t];
+        f.fresh = false;
+        f.computed = true;
+        Ok(())
     }
 
     /// The indices of the fields that are not current, whose mesh's mode
@@ -1174,21 +1958,68 @@ impl Scene {
     /// is open (dropping another open unit), or continues its open unit.
     /// Returns [`StepState::Idle`] when the field is current. The call that
     /// finishes it applies it, with the same values, colours and reports as
-    /// [`Scene::update_fields`] would give it.
+    /// [`Scene::update_fields`] would give it. A thickness or curvature field
+    /// holds no incremental state: stepping it computes it in full at once.
     ///
     /// # Errors
     /// [`SceneError::UnknownField`] for an unknown or removed field; then
     /// as for [`Scene::field_step`].
     pub fn field_step_field(&mut self, id: FieldId, budget: FieldBudget) -> Result<StepState> {
-        self.field_index(id)?;
+        self.field_ref(id)?;
         self.step_unit(Some(id), budget)
     }
 
     /// Steps the open unit, or opens one over the due Eager fields
     /// (`only`: `None`) or over the field `only` (see [`Scene::field_step`]
-    /// and [`Scene::field_step_field`]).
+    /// and [`Scene::field_step_field`]). A thickness or curvature field
+    /// stepped alone computes in full at once; with `None`, the due Eager
+    /// thickness and curvature fields compute in full alongside the distance
+    /// unit (their values, colours and reports are the same as from
+    /// [`Scene::update_fields`], applied when the unit applies).
     fn step_unit(&mut self, only: Option<FieldId>, budget: FieldBudget) -> Result<StepState> {
         let FieldBudget::Points(points) = budget;
+        // A thickness or curvature field holds no incremental state: compute
+        // it in full.
+        if let Some(id) = only
+            && let Ok(t) = self.thick_index(id)
+        {
+            self.drop_field_unit();
+            if self.thick_current(t) {
+                return Ok(StepState::Idle);
+            }
+            self.update_thick_field(t)?;
+            return Ok(StepState::Done);
+        }
+        if let Some(id) = only
+            && let Ok(c) = self.curv_index(id)
+        {
+            self.drop_field_unit();
+            if self.curv_current(c) {
+                return Ok(StepState::Idle);
+            }
+            self.update_curv_field(c)?;
+            return Ok(StepState::Done);
+        }
+        // With no single field, due Eager thickness and curvature fields
+        // compute in full first, then the distance unit advances as usual.
+        let mut thick_worked = false;
+        let mut thick_error: Result<()> = Ok(());
+        if only.is_none() {
+            match self.due_thick_fields(|m| m == UpdateMode::Eager, None) {
+                Ok(due) => {
+                    thick_worked = !due.is_empty();
+                    thick_error = self.update_thick_due(&due);
+                }
+                Err(e) => thick_error = Err(e),
+            }
+            match self.due_curv_fields(|m| m == UpdateMode::Eager, None) {
+                Ok(due) => {
+                    thick_worked = thick_worked || !due.is_empty();
+                    thick_error = thick_error.and(self.update_curv_due(&due));
+                }
+                Err(e) => thick_error = thick_error.and(Err(e)),
+            }
+        }
         let open = self
             .field_unit
             .take()
@@ -1197,7 +2028,16 @@ impl Scene {
             Some(unit) => unit,
             None => match self.open_field_unit(only)? {
                 Some(unit) => unit,
-                None => return Ok(StepState::Idle),
+                None => {
+                    // No distance unit: the step did what the thickness and
+                    // curvature fields needed, if anything.
+                    thick_error?;
+                    return Ok(if thick_worked {
+                        StepState::Done
+                    } else {
+                        StepState::Idle
+                    });
+                }
             },
         };
         if !unit.finished {
@@ -1229,6 +2069,11 @@ impl Scene {
                     unit.error = unit.error.filter(|(j, _)| *j < i).or(Some((i, e)));
                 }
             }
+        }
+        // Thickness and curvature values are already applied; their error
+        // joins the unit's.
+        if thick_error.is_err() && unit.error.is_none() {
+            return thick_error.map(|()| StepState::Done);
         }
         match unit.error {
             Some((_, e)) => Err(e),
@@ -1592,6 +2437,24 @@ impl Scene {
             }
             i += 1;
         }
+        // A thickness or curvature field lives on its mesh alone: removing
+        // the mesh removes the field.
+        let mut t = 0;
+        while t < self.thick.len() {
+            if self.thick[t].desc.on == mesh {
+                self.detach_thick(t);
+            } else {
+                t += 1;
+            }
+        }
+        let mut c = 0;
+        while c < self.curv.len() {
+            if self.curv[c].desc.on == mesh {
+                self.detach_curv(c);
+            } else {
+                c += 1;
+            }
+        }
         kept_on
     }
 
@@ -1602,6 +2465,44 @@ impl Scene {
                 eb.hooks.retain(|h| h.field != f.id);
             }
         }
+        if let Some(ea) = self.entries.get_mut(f.desc.on) {
+            ea.hooks.retain(|h| h.field != f.id);
+            let _ = ea.mesh.remove_channel(&f.channel);
+            if ea
+                .coloring
+                .as_ref()
+                .is_some_and(|c| c.coloring.field == f.id)
+            {
+                ea.coloring = None;
+                ea.report_colors(None);
+            }
+            ea.report_field(f.id);
+        }
+    }
+
+    /// Removes thickness field `t`: as [`Scene::detach_field`] without
+    /// targets.
+    fn detach_thick(&mut self, t: usize) {
+        let f = self.thick.remove(t);
+        if let Some(ea) = self.entries.get_mut(f.desc.on) {
+            ea.hooks.retain(|h| h.field != f.id);
+            let _ = ea.mesh.remove_channel(&f.channel);
+            if ea
+                .coloring
+                .as_ref()
+                .is_some_and(|c| c.coloring.field == f.id)
+            {
+                ea.coloring = None;
+                ea.report_colors(None);
+            }
+            ea.report_field(f.id);
+        }
+    }
+
+    /// Removes curvature field `c`: as [`Scene::detach_field`] without
+    /// targets.
+    fn detach_curv(&mut self, c: usize) {
+        let f = self.curv.remove(c);
         if let Some(ea) = self.entries.get_mut(f.desc.on) {
             ea.hooks.retain(|h| h.field != f.id);
             let _ = ea.mesh.remove_channel(&f.channel);
@@ -2723,6 +3624,168 @@ mod tests {
             to: vec![to],
             max_distance,
             sign: SignMode::Auto,
+        }
+    }
+
+    fn thick(name: &str, on: MeshId, max_distance: f64) -> ThicknessField {
+        ThicknessField {
+            name: name.to_owned(),
+            on,
+            max_distance,
+        }
+    }
+
+    fn curv(name: &str, on: MeshId) -> CurvatureField {
+        CurvatureField {
+            name: name.to_owned(),
+            on,
+        }
+    }
+
+    /// A closed plate, 1 x 1 x 0.5 (`n` cells a side), facing out.
+    fn plate(n: u32) -> Mesh {
+        let h = 0.25;
+        let w = n + 1;
+        let mut pos = Vec::new();
+        for z in [h, -h] {
+            for y in 0..=n {
+                for x in 0..=n {
+                    pos.extend_from_slice(&[x as f32 / n as f32, y as f32 / n as f32, z]);
+                }
+            }
+        }
+        let t = |x: u32, y: u32| y * w + x;
+        let b = |x: u32, y: u32| w * w + y * w + x;
+        let mut idx = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                idx.extend_from_slice(&[
+                    t(x, y),
+                    t(x + 1, y),
+                    t(x + 1, y + 1),
+                    t(x, y),
+                    t(x + 1, y + 1),
+                    t(x, y + 1),
+                    b(x, y),
+                    b(x + 1, y + 1),
+                    b(x + 1, y),
+                    b(x, y),
+                    b(x, y + 1),
+                    b(x + 1, y + 1),
+                ]);
+            }
+        }
+        for x in 0..n {
+            idx.extend_from_slice(&[
+                t(x, 0),
+                b(x, 0),
+                b(x + 1, 0),
+                t(x, 0),
+                b(x + 1, 0),
+                t(x + 1, 0),
+                t(x, n),
+                t(x + 1, n),
+                b(x + 1, n),
+                t(x, n),
+                b(x + 1, n),
+                b(x, n),
+                t(0, x),
+                t(0, x + 1),
+                b(0, x + 1),
+                t(0, x),
+                b(0, x + 1),
+                b(0, x),
+                t(n, x),
+                b(n, x),
+                b(n, x + 1),
+                t(n, x),
+                b(n, x + 1),
+                t(n, x + 1),
+            ]);
+        }
+        Mesh::from_buffers(&pos, &idx).unwrap()
+    }
+
+    /// The unit sphere from a twice-subdivided octahedron, facing out: 128
+    /// triangles, every vertex about `1 / 1` of curvature.
+    fn ball() -> Mesh {
+        let mut pos: Vec<[f64; 3]> = vec![
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        let mut tris: Vec<[u32; 3]> = vec![
+            [4, 0, 2],
+            [4, 2, 1],
+            [4, 1, 3],
+            [4, 3, 0],
+            [5, 2, 0],
+            [5, 1, 2],
+            [5, 3, 1],
+            [5, 0, 3],
+        ];
+        for _ in 0..2 {
+            let mut mid = std::collections::HashMap::new();
+            let mut midpoint = |a: u32, b: u32, pos: &mut Vec<[f64; 3]>| {
+                *mid.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                    let (pa, pb) = (pos[a as usize], pos[b as usize]);
+                    pos.push(std::array::from_fn(|k| (pa[k] + pb[k]) / 2.0));
+                    (pos.len() - 1) as u32
+                })
+            };
+            let mut next = Vec::new();
+            for [a, b, c] in tris {
+                let ab = midpoint(a, b, &mut pos);
+                let bc = midpoint(b, c, &mut pos);
+                let ca = midpoint(c, a, &mut pos);
+                next.extend([[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]);
+            }
+            tris = next;
+        }
+        let flat: Vec<f32> = pos
+            .iter()
+            .flat_map(|p| {
+                let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                [p[0] / n, p[1] / n, p[2] / n].map(|c| c as f32)
+            })
+            .collect();
+        let idx: Vec<u32> = tris.iter().flat_map(|t| *t).collect();
+        Mesh::from_buffers(&flat, &idx).unwrap()
+    }
+
+    /// A saddle `z = (2 x^2 - y^2) / s` over `[-1, 1]^2`, `n` cells a side,
+    /// facing up (normals `+z`): mean curvature about `-1 / s` at the middle.
+    fn saddle(n: u32, s: f32) -> Mesh {
+        let mut pos = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32 / n as f32 * 2.0 - 1.0, y as f32 / n as f32 * 2.0 - 1.0);
+                pos.extend_from_slice(&[fx, fy, (2.0 * fx * fx - fy * fy) / s]);
+            }
+        }
+        let mut idx = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                idx.extend_from_slice(&[a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+            }
+        }
+        Mesh::from_buffers(&pos, &idx).unwrap()
+    }
+
+    /// A thickness colour rule over `range`, clamping both ends.
+    fn thick_rule(lo: f32, hi: f32) -> ColorRule {
+        ColorRule {
+            map: Colormap::Turbo,
+            range: (lo, hi),
+            below: OutOfRange::Clamp,
+            above: OutOfRange::Clamp,
+            center: None,
+            base: [200, 200, 200, 255],
+            nan: [128, 128, 128, 255],
         }
     }
 
@@ -4601,6 +5664,402 @@ mod tests {
     }
 
     #[test]
+    fn thickness_plate_reads_depth() {
+        // The interior face vertices of a closed plate read its depth.
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(plate(4), MeshOptions::default()).unwrap();
+        let id = scene
+            .add_thickness_field(thick("t", m, f64::INFINITY))
+            .unwrap();
+        assert!(scene.field_status(id).unwrap().current);
+        let values = scene.field_values(id).unwrap();
+        assert_eq!(values.len(), scene.mesh(m).unwrap().vertex_slots());
+        let w = 5;
+        for y in 1..4 {
+            for x in 1..4 {
+                for &v in &[y * w + x, w * w + y * w + x] {
+                    assert!((values[v as usize] - 0.5).abs() < 1e-3, "{values:?}");
+                }
+            }
+        }
+        // No targets: nearest and target lists are empty, status is the
+        // placeholder, and the field lists on its mesh.
+        assert_eq!(scene.field_nearest(id).unwrap(), &[]);
+        assert_eq!(scene.field_targets(id).unwrap(), &[]);
+        assert!(scene.field_target_status(id).unwrap().is_empty());
+        assert_eq!(scene.fields_on(m).unwrap(), vec![id]);
+        // Colouring by it works like any field.
+        let rule = thick_rule(0.0, 1.0);
+        scene
+            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .unwrap();
+        assert_colors(&scene, m, &rule, id);
+    }
+
+    #[test]
+    fn thickness_open_sheet_reads_nan() {
+        // An open sheet has no opposite surface: every vertex reads NaN.
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(sheet(4, 0.5), MeshOptions::default()).unwrap();
+        let id = scene
+            .add_thickness_field(thick("t", m, f64::INFINITY))
+            .unwrap();
+        let values = scene.field_values(id).unwrap();
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|v| v.is_nan()), "{values:?}");
+        // NaN colours show the rule's nan colour.
+        let rule = thick_rule(0.0, 1.0);
+        scene
+            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .unwrap();
+        assert_colors(&scene, m, &rule, id);
+        for c in scene.colors(m).unwrap().unwrap() {
+            assert_eq!(*c, rule.nan);
+        }
+    }
+
+    #[test]
+    fn thickness_max_distance_reads_far() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(plate(2), MeshOptions::default()).unwrap();
+        let id = scene.add_thickness_field(thick("t", m, 0.1)).unwrap();
+        assert!(scene.field_values(id).unwrap().iter().all(|&v| v == f32::INFINITY));
+        // Reconfiguring widens the bound (the sign is ignored: thickness
+        // has none).
+        scene
+            .reconfigure_field(id, f64::INFINITY, SignMode::Winding)
+            .unwrap();
+        let values = scene.field_values(id).unwrap();
+        assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
+        // And back down again.
+        scene
+            .reconfigure_field(id, 0.1, SignMode::Pseudonormal)
+            .unwrap();
+        assert!(scene.field_values(id).unwrap().iter().all(|&v| v == f32::INFINITY));
+        assert!(scene.field_status(id).unwrap().current);
+    }
+
+    #[test]
+    fn thickness_validation() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(plate(1), MeshOptions::default()).unwrap();
+        scene.add_thickness_field(thick("t", m, 1.0)).unwrap();
+        assert!(matches!(
+            scene.add_thickness_field(thick("t", m, 1.0)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.add_distance_field(field("t", m, m, 1.0)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.add_thickness_field(ThicknessField {
+                name: "u".into(),
+                on: m,
+                max_distance: -1.0,
+            }),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.add_thickness_field(ThicknessField {
+                name: "u".into(),
+                on: m,
+                max_distance: f64::NAN,
+            }),
+            Err(SceneError::InvalidInput(_))
+        ));
+        // Withdrawing a computed field, or one its mesh colours by, refuses.
+        let id = scene.field_id(0).unwrap();
+        let rule = thick_rule(0.0, 1.0);
+        scene
+            .set_coloring(m, Some(Coloring { field: id, rule }))
+            .unwrap();
+        assert!(!scene.withdraw_field(id).unwrap());
+        scene.set_coloring(m, None).unwrap();
+        assert!(!scene.withdraw_field(id).unwrap());
+        scene.remove_field(id).unwrap();
+        assert!(matches!(scene.field_values(id), Err(SceneError::UnknownField)));
+        // A deferred field withdraws before it computes.
+        let late = scene
+            .add_thickness_field_deferred(thick("late", m, 1.0))
+            .unwrap();
+        assert!(scene.withdraw_field(late).unwrap());
+        assert!(matches!(
+            scene.field_values(late),
+            Err(SceneError::UnknownField)
+        ));
+    }
+
+    #[test]
+    fn thickness_follows_edits_and_placements() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(plate(2), MeshOptions::default()).unwrap();
+        let id = scene
+            .add_thickness_field(thick("t", m, f64::INFINITY))
+            .unwrap();
+        // The interior face vertices read the depth, 0.5.
+        let interior = [4, 9 + 4];
+        for &v in &interior {
+            assert!((scene.field_values(id).unwrap()[v as usize] - 0.5).abs() < 1e-3);
+        }
+        // A uniform scale multiplies the world thicknesses.
+        scene
+            .set_placement(
+                m,
+                Placement {
+                    scale: [2.0, 2.0, 2.0],
+                    ..Placement::IDENTITY
+                },
+            )
+            .unwrap();
+        for &v in &interior {
+            assert!((scene.field_values(id).unwrap()[v as usize] - 1.0).abs() < 1e-3);
+        }
+        // A non-uniform scale bakes the mesh: doubling z doubles the depth
+        // under the untilted interior normals.
+        scene
+            .set_placement(
+                m,
+                Placement {
+                    scale: [1.0, 1.0, 2.0],
+                    ..Placement::IDENTITY
+                },
+            )
+            .unwrap();
+        for &v in &interior {
+            assert!((scene.field_values(id).unwrap()[v as usize] - 1.0).abs() < 1e-3);
+        }
+        scene
+            .set_placement(m, Placement::IDENTITY)
+            .unwrap();
+        // Raising a top vertex reshapes the plate and its thicknesses.
+        let before = scene.field_values(id).unwrap().to_vec();
+        scene
+            .edit(m, |tx| tx.set_positions(&[1], &[[1.0 / 2.0, 0.0, 1.0]]))
+            .unwrap();
+        assert!(scene.field_status(id).unwrap().current);
+        let after = scene.field_values(id).unwrap().to_vec();
+        assert_ne!(before, after);
+        assert!(after.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn thickness_steps_in_full() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene
+            .add_mesh(plate(2), MeshOptions::default())
+            .unwrap();
+        let id = scene
+            .add_thickness_field_deferred(thick("t", m, f64::INFINITY))
+            .unwrap();
+        assert!(!scene.field_status(id).unwrap().current);
+        assert_eq!(
+            scene.field_step_field(id, FieldBudget::Points(1)),
+            Ok(StepState::Done)
+        );
+        assert!(scene.field_status(id).unwrap().current);
+        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        // Stepping a current field idles.
+        assert_eq!(
+            scene.field_step_field(id, FieldBudget::Points(1)),
+            Ok(StepState::Idle)
+        );
+        // A Lazy field computes on flush.
+        let mut lazy = Scene::new(SceneOptions::default());
+        let lm = lazy
+            .add_mesh(
+                plate(2),
+                MeshOptions {
+                    mode: UpdateMode::Lazy,
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        let lid = lazy
+            .add_thickness_field(thick("t", lm, f64::INFINITY))
+            .unwrap();
+        assert!(!lazy.field_status(lid).unwrap().current);
+        lazy.flush().unwrap();
+        assert!(lazy.field_status(lid).unwrap().current);
+        assert!(lazy.field_values(lid).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn curvature_sphere_reads_one_over_r() {
+        // Every vertex of the unit ball reads about 1, positive (a dome from
+        // outside).
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let id = scene.add_curvature_field(curv("k", m)).unwrap();
+        assert!(scene.field_status(id).unwrap().current);
+        let values = scene.field_values(id).unwrap();
+        assert_eq!(values.len(), scene.mesh(m).unwrap().vertex_slots());
+        for &v in values.iter() {
+            assert!(v.is_finite(), "{values:?}");
+            assert!(v > 0.0, "{values:?}");
+        }
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        assert!((mean - 1.0).abs() < 0.3, "{mean}");
+        // No targets: nearest and target lists are empty, status is the
+        // placeholder, and the field lists on its mesh.
+        assert_eq!(scene.field_nearest(id).unwrap(), &[]);
+        assert_eq!(scene.field_targets(id).unwrap(), &[]);
+        assert!(scene.field_target_status(id).unwrap().is_empty());
+        assert_eq!(scene.fields_on(m).unwrap(), vec![id]);
+        // Colouring by it works like any field.
+        let rule = thick_rule(-1.0, 2.0);
+        scene
+            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .unwrap();
+        assert_colors(&scene, m, &rule, id);
+    }
+
+    #[test]
+    fn curvature_plane_reads_zero_and_saddle_negative() {
+        let mut scene = Scene::new(SceneOptions::default());
+        // A flat sheet reads 0 everywhere, boundary fan included.
+        let flat = scene.add_mesh(sheet(8, 0.25), MeshOptions::default()).unwrap();
+        let fid = scene.add_curvature_field(curv("k", flat)).unwrap();
+        for &v in scene.field_values(fid).unwrap().iter() {
+            assert!(v.is_finite());
+            assert!(v.abs() < 1e-5, "{v}");
+        }
+        // A saddle reads the sign of its dominant bend: about -1/s at the
+        // middle, finite at the one-sided rim.
+        let m = scene.add_mesh(saddle(32, 4.0), MeshOptions::default()).unwrap();
+        let id = scene.add_curvature_field(curv("k", m)).unwrap();
+        let values = scene.field_values(id).unwrap();
+        assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
+        let c = (16 * 33 + 16) as usize;
+        assert!((values[c] + 0.25).abs() < 0.15, "{:?}", values[c]);
+        assert!(values.iter().any(|&v| v < -0.1), "{values:?}");
+        // NaN colours show the rule's nan colour on dead slots (none here,
+        // but the rule still applies).
+        let rule = thick_rule(-1.0, 1.0);
+        scene
+            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .unwrap();
+        assert_colors(&scene, m, &rule, id);
+    }
+
+    #[test]
+    fn curvature_follows_scales() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let id = scene.add_curvature_field(curv("k", m)).unwrap();
+        let local = scene.field_values(id).unwrap().to_vec();
+        // A uniform scale of 2 halves every curvature (1/world-unit).
+        scene
+            .set_placement(
+                m,
+                Placement {
+                    scale: [2.0, 2.0, 2.0],
+                    ..Placement::IDENTITY
+                },
+            )
+            .unwrap();
+        let scaled = scene.field_values(id).unwrap().to_vec();
+        assert_eq!(scaled.len(), local.len());
+        for (&x, &y) in scaled.iter().zip(&local) {
+            assert!((x - y / 2.0).abs() < 1e-4, "{x} vs {y}");
+        }
+        assert!(scaled.iter().all(|v| v.is_finite()));
+        // A non-uniform scale bakes a world-frame copy: still finite and
+        // current (an ellipsoid is flatter at its equator than a sphere).
+        scene
+            .set_placement(
+                m,
+                Placement {
+                    scale: [1.0, 1.0, 2.0],
+                    ..Placement::IDENTITY
+                },
+            )
+            .unwrap();
+        assert!(scene.field_status(id).unwrap().current);
+        let baked = scene.field_values(id).unwrap().to_vec();
+        assert!(baked.iter().all(|v| v.is_finite()), "{baked:?}");
+        assert_ne!(baked, scaled);
+        // Back to rigid: the local values return.
+        scene.set_placement(m, Placement::IDENTITY).unwrap();
+        assert_eq!(scene.field_values(id).unwrap(), &local);
+    }
+
+    #[test]
+    fn curvature_validation() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        scene.add_thickness_field(thick("t", m, 1.0)).unwrap();
+        scene.add_curvature_field(curv("k", m)).unwrap();
+        // Names clash across all three registries.
+        assert!(matches!(
+            scene.add_curvature_field(curv("t", m)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.add_curvature_field(curv("k", m)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            scene.add_thickness_field(thick("k", m, 1.0)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        // Reconfiguring marks the field for recompute (both settings are
+        // ignored: a curvature has neither).
+        let id = scene.field_id(1).unwrap();
+        scene
+            .reconfigure_field(id, 0.5, SignMode::Winding)
+            .unwrap();
+        assert!(scene.field_status(id).unwrap().current);
+        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        // Removing the mesh removes the field.
+        scene.remove_mesh(m).unwrap();
+        assert!(matches!(scene.field_values(id), Err(SceneError::UnknownField)));
+        // A deferred field withdraws before it computes.
+        let m2 = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let late = scene.add_curvature_field_deferred(curv("late", m2)).unwrap();
+        assert!(scene.withdraw_field(late).unwrap());
+        assert!(matches!(
+            scene.field_values(late),
+            Err(SceneError::UnknownField)
+        ));
+    }
+
+    #[test]
+    fn curvature_steps_in_full() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let m = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let id = scene.add_curvature_field_deferred(curv("k", m)).unwrap();
+        assert!(!scene.field_status(id).unwrap().current);
+        assert_eq!(
+            scene.field_step_field(id, FieldBudget::Points(1)),
+            Ok(StepState::Done)
+        );
+        assert!(scene.field_status(id).unwrap().current);
+        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        // Stepping a current field idles.
+        assert_eq!(
+            scene.field_step_field(id, FieldBudget::Points(1)),
+            Ok(StepState::Idle)
+        );
+        // A Lazy field computes on flush.
+        let mut lazy = Scene::new(SceneOptions::default());
+        let lm = lazy
+            .add_mesh(
+                ball(),
+                MeshOptions {
+                    mode: UpdateMode::Lazy,
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        let lid = lazy.add_curvature_field(curv("k", lm)).unwrap();
+        assert!(!lazy.field_status(lid).unwrap().current);
+        lazy.flush().unwrap();
+        assert!(lazy.field_status(lid).unwrap().current);
+        assert!(lazy.field_values(lid).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn mutation_abandons_open_unit() {
         let (mut scene, a, b, _) = deferred_pair(0.15);
         let (mut twin, ..) = deferred_pair(0.15);
@@ -4689,7 +6148,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 41] = [
+        let calls: [(&str, Call); 43] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -4753,6 +6212,13 @@ mod tests {
             }),
             ("add_distance_field_deferred", |s, x| {
                 s.add_distance_field_deferred(field("e", x.c, x.b, 0.1))
+                    .unwrap();
+            }),
+            ("add_thickness_field", |s, x| {
+                s.add_thickness_field(thick("e", x.c, f64::INFINITY)).unwrap();
+            }),
+            ("add_thickness_field_deferred", |s, x| {
+                s.add_thickness_field_deferred(thick("e", x.c, f64::INFINITY))
                     .unwrap();
             }),
             ("withdraw_field", |s, x| {

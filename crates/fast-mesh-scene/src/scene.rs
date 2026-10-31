@@ -3,7 +3,7 @@
 use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, BvhBuild, UpdatePolicy};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
 
-use crate::fields::{ColorState, Field, FieldHook, FieldUnit};
+use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickField};
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
@@ -352,6 +352,10 @@ pub struct Scene {
     history: History,
     /// The registered fields, in registration order.
     pub(crate) fields: Vec<Field>,
+    /// The registered thickness fields, in registration order.
+    pub(crate) thick: Vec<ThickField>,
+    /// The registered curvature fields, in registration order.
+    pub(crate) curv: Vec<CurvField>,
     /// The id the next `add_distance_field` hands out.
     pub(crate) next_field: u32,
     /// The registered sections, in registration order.
@@ -391,6 +395,8 @@ impl Scene {
             next_subscriber: SubscriberId::DEFAULT.0 + 1,
             history: History::new(options.history_budget),
             fields: Vec::new(),
+            thick: Vec::new(),
+            curv: Vec::new(),
             next_field: 0,
             sections: Vec::new(),
             next_section: 0,

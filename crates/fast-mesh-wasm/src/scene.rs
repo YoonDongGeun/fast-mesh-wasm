@@ -18,13 +18,13 @@
 
 use std::collections::BTreeMap;
 
-use fast_mesh_ops::{AnalyzeOptions, analyze};
+use fast_mesh_ops::{AnalyzeOptions, VolumeReason, analyze, measure_placed};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CutOptions, DistanceField,
-    FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, OutOfRange, Placement,
-    Plane, Scene, SceneClosestOptions, SceneError, SceneOptions, SceneRayOptions, SectionDesc,
-    SectionId, SectionStatus, SignMode, StepState, UpdateMode,
+    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions,
+    DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, OutOfRange,
+    Placement, Plane, Scene, SceneClosestOptions, SceneError, SceneOptions, SceneRayOptions,
+    SectionDesc, SectionId, SectionStatus, SignMode, StepState, ThicknessField, UpdateMode,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -892,6 +892,38 @@ impl WasmScene {
         Ok(encode_analysis(&a)?)
     }
 
+    /// Scalar measurements of a mesh in world coordinates (its placement
+    /// applied, so scaled meshes measure scaled): `[area, volume (NaN when
+    /// the mesh is not watertight), closed (0/1), volume reason (0 closed,
+    /// 1 open, 2 non-manifold), boundary loops, non-manifold edges,
+    /// orientation conflicts]`. Area is always defined; volume is `None`
+    /// with its reason unless the mesh has no boundary and no
+    /// non-manifold edge. The volume is the absolute signed sum, so
+    /// inconsistent winding only flags `orientation conflicts` without
+    /// failing.
+    pub fn measure(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let mesh = self.scene.mesh(id)?;
+        let placement = self.scene.placement(id)?;
+        let origin = mesh.origin();
+        let m =
+            measure_placed(mesh, origin, |p| placement.apply(p)).map_err(SceneError::from)?;
+        let reason = match m.volume_reason {
+            None => 0.0,
+            Some(VolumeReason::Open) => 1.0,
+            Some(VolumeReason::NonManifold) => 2.0,
+        };
+        Ok(vec![
+            m.area,
+            m.volume.unwrap_or(f64::NAN),
+            f64::from(u8::from(m.closed)),
+            reason,
+            count(m.boundary_loops),
+            count(m.non_manifold_edges),
+            count(m.orientation_conflicts),
+        ])
+    }
+
     /// Runs repair operations on a mesh, in order, in one transaction: one
     /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
     /// and `loops` (`u32`, loop ids for fill holes) are laid out as in
@@ -1222,6 +1254,82 @@ impl WasmScene {
             sign: parse_sign(sign)?,
         };
         Ok(self.scene.add_distance_field_deferred(desc)?.raw())
+    }
+
+    /// Adds a per-vertex wall-thickness field on the mesh given as a flat
+    /// pair `[index, generation]`, and returns its raw id: the distance to
+    /// the opposite surface along each vertex's smooth normal, in world
+    /// units. Open sheets and rims read NaN; hits beyond `max_distance`
+    /// read `Infinity`.
+    pub fn add_thickness_field(
+        &mut self,
+        name: String,
+        on: &[u32],
+        max_distance: f64,
+    ) -> Result<u32, Error> {
+        let ids = self.ids(on)?;
+        if ids.len() != 1 {
+            return Err(Error::invalid("a thickness field needs one mesh"));
+        }
+        let desc = ThicknessField {
+            name,
+            on: ids[0],
+            max_distance,
+        };
+        Ok(self.scene.add_thickness_field(desc)?.raw())
+    }
+
+    /// [`WasmScene::add_thickness_field`] computing nothing yet: the field
+    /// is due until stepped or updated; see
+    /// [`Scene::add_thickness_field_deferred`].
+    pub fn add_thickness_field_deferred(
+        &mut self,
+        name: String,
+        on: &[u32],
+        max_distance: f64,
+    ) -> Result<u32, Error> {
+        let ids = self.ids(on)?;
+        if ids.len() != 1 {
+            return Err(Error::invalid("a thickness field needs one mesh"));
+        }
+        let desc = ThicknessField {
+            name,
+            on: ids[0],
+            max_distance,
+        };
+        Ok(self.scene.add_thickness_field_deferred(desc)?.raw())
+    }
+
+    /// Adds a per-vertex curvature field on the mesh given as a flat pair
+    /// `[index, generation]`, and returns its raw id: the signed mean
+    /// curvature at each vertex, in 1/world-units (positive on domes, about
+    /// `1 / r` on a sphere of radius `r`; negative in bowls; zero on flats).
+    /// Dead slots and unused vertices read NaN.
+    pub fn add_curvature_field(&mut self, name: String, on: &[u32]) -> Result<u32, Error> {
+        let ids = self.ids(on)?;
+        if ids.len() != 1 {
+            return Err(Error::invalid("a curvature field needs one mesh"));
+        }
+        let desc = CurvatureField {
+            name,
+            on: ids[0],
+        };
+        Ok(self.scene.add_curvature_field(desc)?.raw())
+    }
+
+    /// [`WasmScene::add_curvature_field`] computing nothing yet: the field
+    /// is due until stepped or updated; see
+    /// [`Scene::add_curvature_field_deferred`].
+    pub fn add_curvature_field_deferred(&mut self, name: String, on: &[u32]) -> Result<u32, Error> {
+        let ids = self.ids(on)?;
+        if ids.len() != 1 {
+            return Err(Error::invalid("a curvature field needs one mesh"));
+        }
+        let desc = CurvatureField {
+            name,
+            on: ids[0],
+        };
+        Ok(self.scene.add_curvature_field_deferred(desc)?.raw())
     }
 
     /// Removes a field never computed, reporting nothing; `false` (nothing
@@ -1662,6 +1770,40 @@ mod tests {
     }
 
     #[test]
+    fn measure_binding_reports_world_space() {
+        let mut s = WasmScene::new();
+        // A closed unit cube, outward wound.
+        let positions: [f64; 24] = [
+            0., 0., 0., 1., 0., 0., 1., 1., 0., 0., 1., 0., //
+            0., 0., 1., 1., 0., 1., 1., 1., 1., 0., 1., 1.,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, //
+            0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, //
+            1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+        ];
+        let id = s.add_mesh(&positions, &indices, None, 0, false).unwrap();
+        let (i, g) = (id[0], id[1]);
+        let m = s.measure(i, g).unwrap();
+        assert!((m[0] - 6.0).abs() < 1e-9, "{m:?}");
+        assert!((m[1] - 1.0).abs() < 1e-9, "{m:?}");
+        assert_eq!(&m[2..], &[1.0, 0.0, 0.0, 0.0, 0.0]);
+        // A uniform scale of 2: area x4, volume x8.
+        s.set_placement(i, g, &IDENTITY, &[1., -2., 3.], Some(vec![2., 2., 2.]))
+            .unwrap();
+        let m = s.measure(i, g).unwrap();
+        assert!((m[0] - 24.0).abs() < 1e-9, "{m:?}");
+        assert!((m[1] - 8.0).abs() < 1e-9, "{m:?}");
+        // An open 2x2 quad: area without volume, reason open.
+        let (j, h) = add(&mut s, false);
+        let m = s.measure(j, h).unwrap();
+        assert!((m[0] - 4.0).abs() < 1e-9, "{m:?}");
+        assert!(m[1].is_nan(), "{m:?}");
+        assert_eq!(&m[2..], &[0.0, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(code(s.measure(i + 9, g)), codes::UNKNOWN_MESH);
+    }
+
+    #[test]
     fn error_codes_map() {
         let mut s = WasmScene::new();
         let (i, g) = add(&mut s, true);
@@ -2005,6 +2147,88 @@ mod tests {
         );
         assert_eq!(
             code(s.find_contacts(1., Some(vec![ai, ag, bi, bg + 1]))),
+            codes::UNKNOWN_MESH
+        );
+    }
+
+    #[test]
+    fn thickness_field_bindings_report_world_space() {
+        let mut s = WasmScene::new();
+        // The unit cube's corners read in [2, 2 sqrt(3)] locally.
+        let (i, g) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let f = s.add_thickness_field("t".into(), &[i, g], f64::INFINITY).unwrap();
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
+        assert_eq!(values.len(), 6);
+        // Every vertex reads the diameter, 2: each normal ray crosses the
+        // octahedron to the opposite vertex.
+        for &v in &values {
+            assert!((v - 2.0).abs() < 1e-3, "{values:?}");
+        }
+        assert_eq!(s.field_targets(f).unwrap(), Vec::<u32>::new());
+        assert_eq!(s.field_target_status(f).unwrap(), Vec::<u32>::new());
+        // A uniform scale of 2 doubles every thickness.
+        s.set_placement(i, g, &IDENTITY, &[0., 0., 0.], Some(vec![2., 2., 2.]))
+            .unwrap();
+        let scaled = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
+        for (&x, &y) in scaled.iter().zip(&values) {
+            assert!((x - 2.0 * y).abs() < 1e-4, "{scaled:?} vs {values:?}");
+        }
+        // An open quad reads NaN everywhere.
+        let (j, h) = add(&mut s, false);
+        let of = s.add_thickness_field("t".into(), &[j, h], f64::INFINITY).unwrap();
+        let open = s.scene.field_values(s.field(of).unwrap()).unwrap().to_vec();
+        assert!(open.iter().all(|v| v.is_nan()), "{open:?}");
+        // Malformed input.
+        assert_eq!(code(s.add_thickness_field("e".into(), &[], 1.)), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.add_thickness_field("e".into(), &[i, g, j], 1.)),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_thickness_field("e".into(), &[i + 9, g], 1.)),
+            codes::UNKNOWN_MESH
+        );
+        assert_eq!(code(s.add_thickness_field("e".into(), &[i, g], -1.)), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn curvature_field_bindings_report_world_space() {
+        let mut s = WasmScene::new();
+        // A closed convex octahedron reads positive everywhere.
+        let (i, g) = octahedron(&mut s, [0., 0., 0.], 1.);
+        let f = s.add_curvature_field("k".into(), &[i, g]).unwrap();
+        let values = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
+        assert_eq!(values.len(), 6);
+        for &v in &values {
+            assert!(v.is_finite(), "{values:?}");
+            assert!(v > 0.0, "{values:?}");
+        }
+        assert_eq!(s.field_targets(f).unwrap(), Vec::<u32>::new());
+        assert_eq!(s.field_target_status(f).unwrap(), Vec::<u32>::new());
+        // A uniform scale of 2 halves every curvature.
+        s.set_placement(i, g, &IDENTITY, &[0., 0., 0.], Some(vec![2., 2., 2.]))
+            .unwrap();
+        let scaled = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
+        for (&x, &y) in scaled.iter().zip(&values) {
+            assert!((x - y / 2.0).abs() < 1e-5, "{scaled:?} vs {values:?}");
+        }
+        // A flat open quad reads zero everywhere (curvature is defined on
+        // open sheets, unlike thickness).
+        let (j, h) = add(&mut s, false);
+        let of = s.add_curvature_field("k".into(), &[j, h]).unwrap();
+        let open = s.scene.field_values(s.field(of).unwrap()).unwrap().to_vec();
+        assert!(!open.is_empty());
+        for &v in &open {
+            assert!(v.abs() < 1e-6, "{open:?}");
+        }
+        // Malformed input.
+        assert_eq!(code(s.add_curvature_field("e".into(), &[])), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.add_curvature_field("e".into(), &[i, g, j])),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(s.add_curvature_field("e".into(), &[i + 9, g])),
             codes::UNKNOWN_MESH
         );
     }

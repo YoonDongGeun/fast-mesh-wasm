@@ -252,6 +252,43 @@ export interface DistanceFieldDesc {
   sign?: SignMode;
 }
 
+/**
+ * A per-vertex wall-thickness field to add with
+ * {@link Scene.addThicknessField}: the distance to the opposite surface
+ * along each vertex's smooth normal, in world units (the placement's scale
+ * applied, so scaled meshes read scaled).
+ *
+ * Vertices whose rays escape in both directions (open sheets, the rims of
+ * open meshes), dead slots and unused vertices hold NaN; hits beyond
+ * `maxDistance` hold `Infinity`. Colour it like any field: NaN takes the
+ * rule's `nan` colour, `Infinity` follows `above`.
+ */
+export interface ThicknessFieldDesc {
+  /** Unique among the fields on `on`. */
+  name: string;
+  /** The mesh whose vertices carry the values. */
+  on: MeshHandle;
+  /** Largest thickness kept (inclusive); thicker vertices hold `Infinity`. May be `Infinity`. */
+  maxDistance: number;
+}
+
+/**
+ * A per-vertex curvature field to add with
+ * {@link Scene.addCurvatureField}: the signed mean curvature at each vertex,
+ * in 1/world-units (positive on domes, about `1 / r` on a sphere of radius
+ * `r` with outward normals; negative in bowls and dents; zero on flat
+ * spots; a saddle takes the sign of its dominant bend).
+ *
+ * Dead slots and vertices no triangle uses hold NaN; colour it like any
+ * field: NaN takes the rule's `nan` colour.
+ */
+export interface CurvatureFieldDesc {
+  /** Unique among the fields on `on`. */
+  name: string;
+  /** The mesh whose vertices carry the values. */
+  on: MeshHandle;
+}
+
 /** The state of a field, from {@link Scene.fieldStatus}. */
 export interface FieldStatus {
   /** True when the values match the meshes and placements as they are now. */
@@ -450,6 +487,34 @@ export interface Analysis {
   orientationConflicts: number;
   /** Whether two triangles sharing no vertex intersect; `null` when not checked. */
   selfIntersects: boolean | null;
+}
+
+/**
+ * Scalar measurements of a mesh, from {@link Scene.measure}. The report is
+ * in world coordinates (the placement applied), so scaled meshes measure
+ * scaled. Thickness (#116) and curvature (#117) build on this.
+ */
+export interface MeasureResult {
+  /** The total triangle area; always defined. */
+  area: number;
+  /**
+   * The enclosed volume, or `null` when the mesh is not watertight (open
+   * or non-manifold), with `volumeReason` saying why. The volume is the
+   * absolute signed sum, so inconsistent winding does not fail the call:
+   * it only shows up in `orientationConflicts`, while partly cancelling
+   * the number. Require `orientationConflicts === 0` for a strict reading.
+   */
+  volume: number | null;
+  /** No boundary loop or open chain and no non-manifold edge. */
+  closed: boolean;
+  /** Why `volume` is `null`; `null` exactly when `closed`. */
+  volumeReason: "open" | "non-manifold" | null;
+  /** The boundary loops and open chains, as `analyze` reports them. */
+  boundaryLoops: number;
+  /** How many edges have three or more triangles. */
+  nonManifoldEdges: number;
+  /** Interior edges used in the same direction by both their triangles. */
+  orientationConflicts: number;
 }
 
 /**
@@ -2066,6 +2131,28 @@ export class Scene implements SceneLike {
   }
 
   /**
+   * Scalar measurements of a mesh in world coordinates: its surface area
+   * (always) and, when watertight, its enclosed volume. An open or
+   * non-manifold mesh still gets its area; only `volume` is `null`, with
+   * `volumeReason` saying why. A read-only call: it leaves every view
+   * valid.
+   */
+  measure(mesh: MeshHandle): MeasureResult {
+    const { index, generation } = this.#id(mesh);
+    const r = call(() => this.#peek().measure(index, generation));
+    const closed = r[2] === 1;
+    return {
+      area: r[0],
+      volume: Number.isNaN(r[1]) ? null : r[1],
+      closed,
+      volumeReason: closed ? null : r[3] === 2 ? "non-manifold" : "open",
+      boundaryLoops: r[4],
+      nonManifoldEdges: r[5],
+      orientationConflicts: r[6],
+    };
+  }
+
+  /**
    * Runs one repair operation and returns its report, or a list of them in
    * order and returns their reports. A list is one transaction: one undo step,
    * and when any operation fails nothing changes and nothing is recorded.
@@ -2204,6 +2291,43 @@ export class Scene implements SceneLike {
    */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
     return this.#addField(desc, false);
+  }
+
+  /**
+   * Adds a per-vertex wall-thickness field: one value per vertex slot of
+   * `on`, the distance to the opposite surface along the vertex's smooth
+   * normal, in world units. Open sheets and rims read NaN, hits beyond
+   * `maxDistance` read `Infinity`. It follows edits and placements by the
+   * mesh modes, like normals, and colours like any field.
+   *
+   * @throws `INVALID_ARGUMENT` when `maxDistance` is negative or NaN, or the name is taken.
+   */
+  addThicknessField(desc: ThicknessFieldDesc): FieldHandle {
+    const s = this.#scene();
+    const ids = this.#flatIds([desc.on]);
+    if (typeof desc.name !== "string") {
+      throw invalid("name must be a string");
+    }
+    const raw = call(() => s.add_thickness_field(desc.name, ids, desc.maxDistance));
+    return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
+  }
+
+  /**
+   * Adds a per-vertex curvature field: one value per vertex slot of `on`,
+   * the signed mean curvature there, in 1/world-units (positive on domes,
+   * negative in bowls, zero on flats). It follows edits and placements by
+   * the mesh modes, like normals, and colours like any field.
+   *
+   * @throws `INVALID_ARGUMENT` when the name is taken.
+   */
+  addCurvatureField(desc: CurvatureFieldDesc): FieldHandle {
+    const s = this.#scene();
+    const ids = this.#flatIds([desc.on]);
+    if (typeof desc.name !== "string") {
+      throw invalid("name must be a string");
+    }
+    const raw = call(() => s.add_curvature_field(desc.name, ids));
+    return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
   }
 
   /** `addDistanceField`, or with `deferred` its internal variant that computes nothing yet. */
