@@ -967,15 +967,18 @@ fn point_triangle(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
             .min(point_segment(p, b, c))
             .min(point_segment(p, c, a))
     };
-    if dot(n, n) == 0.0 {
-        return edge();
-    }
     // Barycentric coordinates of the projection onto the plane.
     let ap = sub(p, a);
     let (d00, d01, d11) = (dot(ab, ab), dot(ab, ac), dot(ac, ac));
     let (d20, d21) = (dot(ap, ab), dot(ap, ac));
+    // `= |ab x ac|^2`: zero for a degenerate triangle. A triangle that is
+    // exactly degenerate in local space is only near-degenerate in the
+    // world (rotation rounding moves it by ~1e-15 relative), so an
+    // exact-zero test misses it and the plane-distance branch below
+    // returns garbage; test degeneracy relative to the edge lengths
+    // instead (valid test triangles have it far above the threshold).
     let denom = d00 * d11 - d01 * d01;
-    if denom == 0.0 {
+    if denom <= 1e-12 * d00 * d11 {
         return edge();
     }
     let v = (d11 * d20 - d01 * d21) / denom;
