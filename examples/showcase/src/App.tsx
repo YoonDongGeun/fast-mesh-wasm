@@ -94,6 +94,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const sculpt = useApp(app, (s) => s.sculpt);
   const sculptRemesh = useApp(app, (s) => s.sculptRemesh);
   const sculptLiveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
+  const maskPaint = useApp(app, (s) => s.maskPaint);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -205,10 +206,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         } else if (tourStep !== null) {
           endTour();
         } else {
-          // Sculpt first (it owns the pointer), then a pick (it never selects), then the selection.
+          // Sculpt first (it owns the pointer), then the mask paint, then a
+          // pick (it never selects), then the selection.
           const snap = app.getSnapshot();
           if (snap.sculpt !== null) {
             app.setSculpt(null);
+          } else if (snap.maskPaint) {
+            app.setMaskPaint(false);
           } else if (snap.brushPick !== null) {
             app.setBrushPick(null);
           } else {
@@ -307,6 +311,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           sculpt={sculpt}
           sculptRemesh={sculptRemesh}
           sculptLiveRemesh={sculptLiveRemesh}
+          maskPaint={maskPaint}
           wireframe={wireframe}
           loader={loader}
         />

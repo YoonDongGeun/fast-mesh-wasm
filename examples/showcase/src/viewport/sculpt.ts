@@ -1,6 +1,6 @@
 // The sculpt stroke: what one dab applies, and one press-and-hold stroke
 // over the meshes (the viewport's ring and pointer loop drive it).
-import type { MeshHandle, RepairOp } from "fast-mesh-wasm";
+import type { FastMeshErrorCode, MeshHandle, RepairOp } from "fast-mesh-wasm";
 
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
@@ -12,6 +12,54 @@ export interface SculptBrush {
   cycles: number;
   /** The grab drag vector in local coordinates (the grab tool only). */
   direction: [number, number, number];
+}
+
+/** The toolbox's brush picker (the viewport paints its strokes). */
+export type SculptTool = "inflate" | "deflate" | "smooth" | "grab";
+
+/**
+ * The repair op a tool paints (deflate is inflate with a flipped strength;
+ * smooth paints plain-Laplacian relax: Taubin λ/μ converges too slowly to
+ * melt under a brush).
+ */
+export function sculptOpForTool(tool: SculptTool): "inflate" | "relax" | "grab" {
+  if (tool === "smooth") {
+    return "relax";
+  }
+  return tool === "grab" ? "grab" : "inflate";
+}
+
+/**
+ * Each tool's starting strength (grab at 1 follows the pointer exactly).
+ * Inflate stays small: dabs overlap heavily along a sweep, so a dab-sized
+ * 0.05 already builds a visible bump without folding.
+ */
+export const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 };
+
+/** Laplacian passes per smooth dab (each melts the full weight toward the centroid). */
+export const RELAX_PASSES = 2;
+
+/**
+ * Arms (or steers) the sculpt brush for `tool` with a dab-sized strength.
+ * The toolbox calls it live, so the radius/strength sliders stay adjustable
+ * mid-stroke (the stroke reads its brush through a getter).
+ */
+export function sculptBrush(
+  tool: SculptTool,
+  mesh: MeshHandle,
+  radius: number,
+  strength: number,
+  falloff: "linear" | "smooth",
+): SculptBrush {
+  return {
+    mesh,
+    op: sculptOpForTool(tool),
+    radius,
+    strength: tool === "deflate" ? -Math.abs(strength) : Math.abs(strength),
+    falloff,
+    cycles: RELAX_PASSES,
+    direction: [0, 0, 0],
+  };
 }
 
 /** Past this many spacings a dab jumps to the pointer instead of creeping (see `SculptStroke.dab`). */
@@ -29,6 +77,44 @@ export const REMESH_TRI_LIMIT = 100_000;
 export function remeshTooBig(triangles: number): boolean {
   return triangles > REMESH_TRI_LIMIT;
 }
+
+/**
+ * Live remesh while sculpting (#129): the per-frame budget.
+ *
+ * At most one live pass per stroke region per `LIVE_REMESH_MIN_MS`, and only
+ * once `LIVE_REMESH_MIN_DABS` dabs landed since the last pass, never two in
+ * flight. The pass itself is split-only (`splitOnly`, `maxRounds: 2` at the
+ * call site), so the triangle count only grows mid-stroke and the surface
+ * never pops down; the stroke-end pass evens the density out fully. Past
+ * `REMESH_TRI_LIMIT` triangles both passes stand down: a whole-mesh remesh
+ * would stall the worker behind the dabs (#64 chunks a repair list one op
+ * per message-loop turn, but a single remesh op is still one long chunk).
+ */
+export const LIVE_REMESH_MIN_DABS = 4;
+/** Minimum milliseconds between two live remesh passes of one stroke. */
+export const LIVE_REMESH_MIN_MS = 600;
+
+/**
+ * Whether a live remesh pass may fire: enough new dabs since the last pass,
+ * enough time since it, and none still in flight.
+ */
+export function liveRemeshDue(dabsSinceLive: number, msSinceLive: number, running: boolean): boolean {
+  return !running && dabsSinceLive >= LIVE_REMESH_MIN_DABS && msSinceLive >= LIVE_REMESH_MIN_MS;
+}
+
+/**
+ * Undo semantics for sculpt remeshes (the #129 open question): SAME step.
+ *
+ * Both the live passes and the stroke-end evening-out land inside the
+ * stroke's open undo step on the sync scene, so one Ctrl+Z takes the whole
+ * gesture (dabs and density fixes) back. A separate remesh step would fight
+ * the stroke: undoing the stroke would leave its splits behind, and undoing
+ * the remesh first would strand the dabs on a density they never painted.
+ * The live pass must therefore never open or close a step itself; it just
+ * repairs while the stroke's step is open. (On the Worker there is no step
+ * nesting — one step per dab — so the passes land as their own steps
+ * there; that divergence is inherent to the Worker scene, not a choice.)
+ */
 
 /** Dab spacing: 15% of the radius (never zero, so dabs terminate). */
 export function dabSpacing(radius: number): number {
@@ -360,4 +446,268 @@ export class SculptStroke {
     }
     this.#close();
   }
+}
+
+// ---- Sculpt mask (#130) ----
+//
+// A painted protected region the deform brushes skip: the mask stores the
+// painted vertex slots, and every dab whose ball touches one is dropped
+// before it reaches the scene.
+//
+// The storage contract answers #130's question against #106's selection
+// contract. A selection snapshot pins the mesh's content stamp, so the
+// engine throws `STALE_SELECTION` after any edit — including the stroke's
+// own position-only dabs, which would kill a mask mid-stroke. The showcase
+// mask therefore pins the vertex ids instead of the stamp: ids are stable
+// across position-only edits (inflate/relax/grab move vertices without
+// touching slots), so the mask survives the strokes it protects. It fails
+// loudly — `checkMask` throws `STALE_SELECTION`, the same code — as soon as
+// the ids stop naming live vertices: a masked slot out of range, or no
+// longer used by a live triangle (a collapse, compact, weld or isolate took
+// it). Surviving cases re-verify cheaply: splits add slots but keep the old
+// vertices alive, so a remeshed stroke's mask carries over (the new vertices
+// land unmasked); undo/redo restores the buffers, and the mask with them
+// when its ids are live again. The documented hole: a merge or compact can
+// remap ids while keeping them live, silently re-pointing the mask —
+// reselect after structural repairs, as with #106 selections.
+
+/**
+ * A painted protected region on one mesh: the masked vertex slots,
+ * ascending, and the vertex slot count when painted (a topology edit that
+ * grows or compacts the slots re-verifies against this).
+ */
+export interface SculptMask {
+  /** The mesh the slots belong to. */
+  mesh: MeshHandle;
+  /** The masked vertex slots, ascending. */
+  vertices: Uint32Array;
+  /** `positions().length / 3` when painted; see the contract above. */
+  slots: number;
+}
+
+/**
+ * Whether `id` names a slot a triangle still uses: in range and on a live
+ * (non-removed) triangle. Removed slots read `0, 0, 0`, so triples of three
+ * zeros are skipped — mirroring the engine's `buildTopology`, where a
+ * genuine all-zero triangle is degenerate (zero area) and losing it is
+ * harmless.
+ */
+function maskIdLive(indices: ArrayLike<number>, id: number, slots: number): boolean {
+  if (!Number.isInteger(id) || id < 0 || id >= slots) {
+    return false;
+  }
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (a === id || b === id || c === id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the mask still names live vertices of `mesh` over its current
+ * buffers: every masked slot in range and used by a live triangle. The
+ * per-dab gate (position moves never change this); the stroke start and
+ * paint/invert paths call `checkMask` to fail loudly instead.
+ */
+export function maskUsable(
+  mask: Pick<SculptMask, "vertices" | "slots">,
+  indices: ArrayLike<number>,
+  slots: number,
+): boolean {
+  // A slots mismatch (splits grew the mesh, a compact shrank it) never
+  // fails on its own: the ids may still name the same vertices (splits only
+  // add), so liveness below decides. An empty mask protects nothing.
+  for (let k = 0; k < mask.vertices.length; k++) {
+    if (!maskIdLive(indices, mask.vertices[k], slots)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * What {@link checkMask} throws: the showcase twin of the engine's
+ * `FastMeshError`, carrying the same machine-readable `code`
+ * (`"INVALID_ARGUMENT"` for the wrong mesh, `"STALE_SELECTION"` once a
+ * topology edit takes a masked vertex). A local class — not the engine's —
+ * so this pure module stays importable without the wasm build (like every
+ * other headless-tested showcase module); catch sites treat both by `code`.
+ */
+export class MaskError extends Error {
+  /** What went wrong; the same codes the engine reports stale selections with. */
+  readonly code: FastMeshErrorCode;
+
+  constructor(code: FastMeshErrorCode, message: string) {
+    super(message);
+    this.name = "MaskError";
+    this.code = code;
+  }
+}
+
+/**
+ * Fails loudly when `mask` is not for `mesh` or no longer usable over its
+ * current buffers: `INVALID_ARGUMENT` for the wrong mesh (like the
+ * engine's `checkSelection`), `STALE_SELECTION` once a topology edit took a
+ * masked vertex (repaint it). Callers clear the stored mask on the throw.
+ */
+export function checkMask(
+  mask: SculptMask,
+  mesh: MeshHandle,
+  indices: ArrayLike<number>,
+  slots: number,
+): void {
+  if (mask === null || typeof mask !== "object" || mask.mesh !== mesh) {
+    throw new MaskError("INVALID_ARGUMENT", "the mask is not for this mesh");
+  }
+  if (!maskUsable(mask, indices, slots)) {
+    throw new MaskError("STALE_SELECTION", "the mask predates the mesh's latest topology edit; repaint it");
+  }
+}
+
+/**
+ * The sphere-brush paint: every live vertex within `radius` of `center`
+ * (squared distances, `<=`, like the engine's `brushPick`), ascending. Dead
+ * slots and out-of-range ids never paint.
+ */
+export function paintMaskIds(
+  positions: ArrayLike<number>,
+  indices: ArrayLike<number>,
+  slots: number,
+  center: readonly [number, number, number],
+  radius: number,
+): Uint32Array {
+  const used = new Uint8Array(slots);
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (a >= 0 && a < slots) {
+      used[a] = 1;
+    }
+    if (b >= 0 && b < slots) {
+      used[b] = 1;
+    }
+    if (c >= 0 && c < slots) {
+      used[c] = 1;
+    }
+  }
+  const r2 = radius * radius;
+  const out: number[] = [];
+  for (let v = 0; v < slots; v++) {
+    if (used[v] === 0) {
+      continue;
+    }
+    const dx = positions[v * 3] - center[0];
+    const dy = positions[v * 3 + 1] - center[1];
+    const dz = positions[v * 3 + 2] - center[2];
+    if (dx * dx + dy * dy + dz * dz <= r2) {
+      out.push(v);
+    }
+  }
+  return Uint32Array.from(out);
+}
+
+/** The sorted union of two ascending id lists (paint accumulates through this). */
+export function unionMaskIds(a: ArrayLike<number>, b: ArrayLike<number>): Uint32Array {
+  const out: number[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const x = a[i];
+    const y = b[j];
+    if (x === y) {
+      out.push(x);
+      i++;
+      j++;
+    } else if (x < y) {
+      out.push(x);
+      i++;
+    } else {
+      out.push(y);
+      j++;
+    }
+  }
+  while (i < a.length) {
+    out.push(a[i++]);
+  }
+  while (j < b.length) {
+    out.push(b[j++]);
+  }
+  return Uint32Array.from(out);
+}
+
+/**
+ * Inverts a mask over the mesh's current buffers: every live vertex outside
+ * it, ascending. The engine's `selectInvert` needs a live selection; this
+ * takes the same universe without one, so invert works freshly painted.
+ */
+export function invertMaskIds(
+  masked: ArrayLike<number>,
+  indices: ArrayLike<number>,
+  slots: number,
+): Uint32Array {
+  const used = new Uint8Array(slots);
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (a >= 0 && a < slots) {
+      used[a] = 1;
+    }
+    if (b >= 0 && b < slots) {
+      used[b] = 1;
+    }
+    if (c >= 0 && c < slots) {
+      used[c] = 1;
+    }
+  }
+  const inSet = new Set<number>();
+  for (let k = 0; k < masked.length; k++) {
+    inSet.add(masked[k]);
+  }
+  const out: number[] = [];
+  for (let v = 0; v < slots; v++) {
+    if (used[v] === 1 && !inSet.has(v)) {
+      out.push(v);
+    }
+  }
+  return Uint32Array.from(out);
+}
+
+/**
+ * Whether a dab at `center` is protected: any masked slot within its ball
+ * (`<= radius`, the paint's own measure). The dab is then dropped before it
+ * reaches the scene — the brushes skip the region instead of scaling it, so
+ * a fully masked lump never drifts under buildup.
+ */
+export function maskBlocksDab(
+  masked: ArrayLike<number>,
+  positions: ArrayLike<number>,
+  center: readonly [number, number, number],
+  radius: number,
+): boolean {
+  const r2 = radius * radius;
+  for (let k = 0; k < masked.length; k++) {
+    const v = masked[k];
+    const dx = positions[v * 3] - center[0];
+    const dy = positions[v * 3 + 1] - center[1];
+    const dz = positions[v * 3 + 2] - center[2];
+    if (dx * dx + dy * dy + dz * dz <= r2) {
+      return true;
+    }
+  }
+  return false;
 }

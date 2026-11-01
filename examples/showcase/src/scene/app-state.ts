@@ -10,7 +10,7 @@ import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
 import type { SliceAxis } from "../panels/volume-slice";
-import type { SculptBrush } from "../viewport/sculpt";
+import type { SculptBrush, SculptMask } from "../viewport/sculpt";
 import {
   createGroup,
   dropMember,
@@ -137,9 +137,27 @@ export interface AppSnapshot {
   brushPick: BrushPick | null;
   /** The sculpt brush armed on a mesh, if any: hover shows its ball, press-and-hold paints. */
   sculpt: SculptBrush | null;
+  /**
+   * The painted protected region on a mesh, if any: deform dabs whose ball
+   * touches a masked vertex are dropped (see `viewport/sculpt.ts`'s mask
+   * contract). `null` when never painted or cleared — loudly, with
+   * `sculptMaskNotice`, when a topology edit takes a masked vertex.
+   */
+  sculptMask: SculptMask | null;
+  /** The mask paint is armed: press-and-hold paints the protected region. */
+  maskPaint: boolean;
+  /** The mask paint radius, in mesh units. */
+  maskRadius: number;
+  /** Why the mask was last cleared against its will (`null` when it stands or was cleared by hand). */
+  sculptMaskNotice: string | null;
   /** A stroke's end evens its region out with a remesh (in the same undo step on the sync scene). */
   sculptRemesh: boolean;
-  /** A stroke is remeshed live while it paints, so no triangle balloons mid-stroke. */
+  /**
+   * A stroke is remeshed live while it paints, so no triangle balloons mid-stroke.
+   * Same undo step as the stroke (see `liveRemeshDue`'s semantics note in
+   * `viewport/sculpt.ts`): the live passes repair inside the stroke's open
+   * step and never open one of their own.
+   */
   sculptLiveRemesh: boolean;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
@@ -189,6 +207,10 @@ export class AppState {
     meshGroups: [],
     brushPick: null,
     sculpt: null,
+    sculptMask: null,
+    maskPaint: false,
+    maskRadius: 0.25,
+    sculptMaskNotice: null,
     sculptRemesh: true,
     sculptLiveRemesh: true,
     edgeSoftness: 0,
@@ -321,6 +343,9 @@ export class AppState {
       multi: this.#snap.multi.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
       sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
+      sculptMask: this.#snap.sculptMask?.mesh === item.mesh ? null : this.#snap.sculptMask,
+      maskPaint: this.#snap.sculptMask?.mesh === item.mesh ? false : this.#snap.maskPaint,
+      sculptMaskNotice: this.#snap.sculptMask?.mesh === item.mesh ? null : this.#snap.sculptMaskNotice,
       repairAnalysis: this.#snap.repairAnalysis?.mesh === item.mesh ? null : this.#snap.repairAnalysis,
       inspectQuery: this.#snap.inspectQuery?.mesh === item.mesh ? null : this.#snap.inspectQuery,
     });
@@ -386,6 +411,30 @@ export class AppState {
   /** Arms the sculpt brush, updates it while armed, or disarms it (`null`). */
   setSculpt(sculpt: SculptBrush | null): void {
     this.#set({ sculpt });
+  }
+
+  /** Stores the painted mask (`null` clears it by hand, and clears its notice). */
+  setSculptMask(mask: SculptMask | null): void {
+    this.#set(mask === null ? { sculptMask: null, sculptMaskNotice: null } : { sculptMask: mask });
+  }
+
+  /** Arms (`true`) or disarms the mask paint. */
+  setMaskPaint(on: boolean): void {
+    this.#set({ maskPaint: on });
+  }
+
+  /** Sets the mask paint radius, in mesh units. */
+  setMaskRadius(radius: number): void {
+    this.#set({ maskRadius: radius });
+  }
+
+  /**
+   * Reports a mask cleared against its will (a topology edit took a masked
+   * vertex): the loud half of the mask contract, shown by the toolbox until
+   * the next paint or hand clear.
+   */
+  setSculptMaskNotice(notice: string | null): void {
+    this.#set({ sculptMaskNotice: notice });
   }
 
   /** Sets the shift-clicked meshes, primary first (see `selectMesh`). */
