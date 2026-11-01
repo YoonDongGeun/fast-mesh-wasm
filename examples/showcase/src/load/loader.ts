@@ -20,7 +20,7 @@ async function isDicomFile(file: File): Promise<boolean> {
   if (ext === ".dcm" || ext === ".dicom") {
     return true;
   }
-  if (ext === ".stl" || ext === ".obj" || ext === ".ply") {
+  if (ext === ".stl" || ext === ".obj" || ext === ".ply" || ext === ".gltf" || ext === ".glb" || ext === ".drc") {
     return false;
   }
   try {

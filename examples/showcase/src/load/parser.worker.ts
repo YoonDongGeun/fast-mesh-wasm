@@ -5,7 +5,7 @@
 import { demoMeshes } from "../scene/demo";
 import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
-import { parseMeshFile } from "./parse";
+import { parseMeshFilesAsync } from "./parse";
 import { PHANTOM_FIELD, phantomSlices } from "./phantom";
 import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 import type { DicomVolume } from "./series";
@@ -97,7 +97,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
     }
     const buffer = await req.file.arrayBuffer();
     post({ kind: "parsing", id: req.id });
-    post({ kind: "meshes", id: req.id, meshes: [loaded(req.file.name, parseMeshFile(req.file.name, buffer))] });
+    post({
+      kind: "meshes",
+      id: req.id,
+      meshes: (await parseMeshFilesAsync(req.file.name, buffer)).map((m) => loaded(m.name, m.data)),
+    });
   } catch (error) {
     post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });
   }

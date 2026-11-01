@@ -10,12 +10,14 @@
   },
   "dependencies": {
     "@react-three/fiber": "^9.8.2",
+    "draco3d": "1.5.9",
     "fast-mesh-wasm": "workspace:*",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "three": "^0.186.1"
   },
   "devDependencies": {
+    "@types/draco3d": "^1.4.10",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/three": "^0.186.0",

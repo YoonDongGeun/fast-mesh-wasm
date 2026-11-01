@@ -30,10 +30,12 @@ export default defineConfig({
     // Keep the wasm-bindgen glue as a separate file so its `new URL(..., import.meta.url)`
     // keeps pointing at the .wasm next to it. It is copied into dist/wasm below.
     // `three`, `react` and `@react-three/fiber` are optional peers: imported, never inlined.
+    // `draco3d` is an optional peer too: `decodeDraco` imports it lazily, only
+    // on the Draco path, so bundles without Draco stay free of it.
     // The threaded glue (dist/wasm-threads) is never bundled either: only the
     // Worker entry may load it, and its rayon worker helpers import it by
     // relative path.
-    neverBundle: [/fast_mesh_wasm\.js$/, /wasm-threads\//, /^node:/, /^three($|\/)/, /^react($|\/)/, /^@react-three\/fiber($|\/)/],
+    neverBundle: [/fast_mesh_wasm\.js$/, /wasm-threads\//, /^node:/, /^three($|\/)/, /^react($|\/)/, /^@react-three\/fiber($|\/)/, /^draco3d($|\/)/],
   },
   // src/wasm-threads is the threaded artifact (`build-wasm.mjs --threads`), with its
   // rayon worker helpers under snippets/ and the package.json they resolve it by.
