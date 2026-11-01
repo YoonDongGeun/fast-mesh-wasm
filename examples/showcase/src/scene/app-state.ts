@@ -3,7 +3,7 @@
 // contact group. A tiny
 // external store, so the loader (outside React) and the components share it;
 // read it with `useApp`.
-import type { MeshHandle } from "fast-mesh-wasm";
+import type { Analysis, MeshHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import * as THREE from "three";
@@ -91,6 +91,22 @@ export interface VolumeMpr {
   tab: "volume" | "slices";
 }
 
+/** One repair-issue kind drawn in 3D (see `viewport/repair-overlays`). */
+export type RepairOverlayKind = "holes" | "nonManifold" | "degenerate" | "components";
+
+export const REPAIR_OVERLAY_KINDS: readonly RepairOverlayKind[] = [
+  "holes",
+  "nonManifold",
+  "degenerate",
+  "components",
+];
+
+/** The repair panel's latest analysis, shared with the 3D overlay. */
+export interface RepairAnalysis {
+  mesh: MeshHandle;
+  analysis: Analysis;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -124,6 +140,10 @@ export interface AppSnapshot {
   multi: readonly MeshHandle[];
   /** The linked MPR state for the selected volume, if any panel shows it. */
   volumeMpr: VolumeMpr | null;
+  /** Which repair-issue kinds draw in 3D (a display setting: not undoable). */
+  repairOverlays: Record<RepairOverlayKind, boolean>;
+  /** The repair panel's latest analysis (the overlay's geometry source). */
+  repairAnalysis: RepairAnalysis | null;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -145,6 +165,8 @@ export class AppState {
     wireframe: false,
     multi: [],
     volumeMpr: null,
+    repairOverlays: { holes: true, nonManifold: true, degenerate: true, components: true },
+    repairAnalysis: null,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -264,6 +286,7 @@ export class AppState {
       multi: this.#snap.multi.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
       sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
+      repairAnalysis: this.#snap.repairAnalysis?.mesh === item.mesh ? null : this.#snap.repairAnalysis,
     });
   }
 
@@ -357,6 +380,19 @@ export class AppState {
   /** Draws every mesh wireframed or solid (a display setting: not undoable). */
   setWireframe(on: boolean): void {
     this.#set({ wireframe: on });
+  }
+
+  /** Draws (`on`) or hides a repair-issue kind in 3D (a display setting: not undoable). */
+  setRepairOverlay(kind: RepairOverlayKind, on: boolean): void {
+    if (this.#snap.repairOverlays[kind] === on) {
+      return;
+    }
+    this.#set({ repairOverlays: { ...this.#snap.repairOverlays, [kind]: on } });
+  }
+
+  /** Shares the repair panel's latest analysis with the 3D overlay (`null` clears it). */
+  setRepairAnalysis(analysis: RepairAnalysis | null): void {
+    this.#set({ repairAnalysis: analysis });
   }
 
   setJob(job: Job): void {

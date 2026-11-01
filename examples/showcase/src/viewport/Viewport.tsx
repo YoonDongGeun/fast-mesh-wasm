@@ -38,6 +38,11 @@ import {
 } from "./sculpt";
 import { setDragging, setHover, view } from "./view";
 import { setWireOverlay } from "./wire";
+import {
+  buildRepairOverlayGroup,
+  countRepairOverlays,
+  disposeRepairOverlayGroup,
+} from "./repair-overlays";
 
 export type GizmoMode = "translate" | "rotate";
 
@@ -172,6 +177,7 @@ export function Viewport(props: {
       {items.map((item) => (
         <MeshView
           key={item.id}
+          app={app}
           item={item}
           selected={item.mesh === selection}
           volumeShown={item.mesh === volumeMesh}
@@ -229,6 +235,7 @@ function PickCursor(props: { picking: boolean }) {
 
 /** A mesh drawn with `<FastMesh>`: click to select it, or to land an armed brush-center pick. */
 function MeshView(props: {
+  app: AppState;
   item: Item;
   selected: boolean;
   /** Shown as the scene volume instead of its surface (a volume mesh with the overlay on). */
@@ -248,7 +255,7 @@ function MeshView(props: {
   /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
   bound: MeshBinding | null;
 }) {
-  const { item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
+  const { app, item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
     props;
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
@@ -310,16 +317,81 @@ function MeshView(props: {
     [item.mesh, onPick, picking, onPickPoint, scene, sculpted],
   );
   return (
-    <FastMesh
-      mesh={item.mesh}
-      material={item.material}
-      shading="fragment"
-      edgeSoftness={edgeSoftness}
-      visible={!volumeShown}
-      onClick={onClick}
-      onBind={(b) => onBind(item.mesh, b)}
-    />
+    <>
+      <FastMesh
+        mesh={item.mesh}
+        material={item.material}
+        shading="fragment"
+        edgeSoftness={edgeSoftness}
+        visible={!volumeShown}
+        onClick={onClick}
+        onBind={(b) => onBind(item.mesh, b)}
+      />
+      <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
+    </>
   );
+}
+
+/**
+ * The repair-issue overlays on their analysed mesh: hole boundaries,
+ * non-manifold edges, degenerate triangles and small components from the
+ * repair panel's latest analysis, as children of the bound mesh's object
+ * (the wire overlay's path). A new analysis object (selection, repair, undo,
+ * redo) rebuilds them, like the panel's numbers; toggles come from the
+ * panel. Reads the local positions/indices once per build: later scene
+ * calls may move the buffers.
+ */
+function RepairOverlays(props: {
+  app: AppState;
+  scene: Scene | WorkerScene;
+  item: Item;
+  /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
+  bound: MeshBinding | null;
+}) {
+  const { app, scene, item, bound } = props;
+  const analysis = useApp(app, (s) => s.repairAnalysis);
+  const kinds = useApp(app, (s) => s.repairOverlays);
+  useLayoutEffect(() => {
+    const object = bound?.object ?? null;
+    if (object === null) {
+      return;
+    }
+    inspect.repair.overlays.kinds = { ...kinds };
+    const none = { holes: 0, nonManifold: 0, degenerate: 0, components: 0 };
+    if (analysis === null || analysis.mesh !== item.mesh) {
+      inspect.repair.overlays.counts = none;
+      return;
+    }
+    let positions: Float32Array;
+    let indices: Uint32Array;
+    try {
+      const views = scene.views(analysis.mesh);
+      positions = views.positions().slice();
+      indices = views.indices().slice();
+    } catch {
+      // Removed meanwhile: nothing to draw.
+      inspect.repair.overlays.counts = none;
+      return;
+    }
+    const group = buildRepairOverlayGroup(analysis.analysis, positions, indices, kinds);
+    const all = countRepairOverlays(analysis.analysis);
+    inspect.repair.overlays.counts = {
+      holes: kinds.holes ? all.holes : 0,
+      nonManifold: kinds.nonManifold ? all.nonManifold : 0,
+      degenerate: kinds.degenerate ? all.degenerate : 0,
+      components: kinds.components ? all.components : 0,
+    };
+    if (group !== null) {
+      object.add(group);
+    }
+    return () => {
+      if (group !== null) {
+        object.remove(group);
+        disposeRepairOverlayGroup(group);
+      }
+    };
+  }, [scene, item.mesh, bound, analysis, kinds]);
+  return null;
 }
 
 /**

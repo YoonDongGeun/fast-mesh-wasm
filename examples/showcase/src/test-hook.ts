@@ -8,6 +8,7 @@ import { inspect } from "./panels/inspect";
 import { shadeProbe } from "./shade-probe";
 import type { AppState } from "./scene/app-state";
 import { view } from "./viewport/view";
+import { hasRepairOverlays } from "./viewport/repair-overlays";
 import { hasWireOverlay } from "./viewport/wire";
 
 export function installTestHook(store: SceneStore, engine: Engine, app: AppState): void {
@@ -247,6 +248,16 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         }
       }
       return { meshes: view.bindings.size, overlays, solid };
+    },
+    /** The repair-issue overlays in the scene: meshes showing any, and the toggles with the primitives drawn. */
+    repairOverlays: () => {
+      let meshes = 0;
+      for (const b of view.bindings.values()) {
+        if (hasRepairOverlays(b.object)) {
+          meshes++;
+        }
+      }
+      return { meshes, kinds: { ...inspect.repair.overlays.kinds }, counts: { ...inspect.repair.overlays.counts } };
     },
     /** RGBA8 colours of the mesh's vertices that are drawn: how many are reddish (penetration), white, or blue-green (gap). */
     colorCounts: (name: string) => {

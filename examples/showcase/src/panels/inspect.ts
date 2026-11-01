@@ -86,6 +86,11 @@ export const inspect: {
     report: string | null;
     /** The op running, if any. */
     busy: string | null;
+    /** The 3D overlay toggles, and how many primitives of each kind it draws. */
+    overlays: {
+      kinds: { holes: boolean; nonManifold: boolean; degenerate: boolean; components: boolean };
+      counts: { holes: number; nonManifold: number; degenerate: number; components: number };
+    };
   };
   /** The volume view: the series shown, its preset, MIP, slice planes, and whether it rendered. */
   volume: { id: string | null; preset: string; mip: boolean; planes: number; ready: boolean };
@@ -109,7 +114,16 @@ export const inspect: {
   collision: { ...liveProbe(), warnings: [] },
   group: { ...liveProbe(), warnings: [] },
   hover: null,
-  repair: { analysis: null, analyses: 0, report: null, busy: null },
+  repair: {
+    analysis: null,
+    analyses: 0,
+    report: null,
+    busy: null,
+    overlays: {
+      kinds: { holes: true, nonManifold: true, degenerate: true, components: true },
+      counts: { holes: 0, nonManifold: 0, degenerate: 0, components: 0 },
+    },
+  },
   volume: { id: null, preset: "", mip: false, planes: 0, ready: false },
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sceneSlices: { id: null, shown: 0 },
