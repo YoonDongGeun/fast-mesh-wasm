@@ -32,7 +32,7 @@ export function MeshList(props: {
   const input = useRef<HTMLInputElement>(null);
 
   return (
-    <section className="panel" aria-label="Meshes">
+    <section className="panel" aria-label="Meshes" data-tour="mesh-list">
       <header className="panel-head">
         <h2>Meshes</h2>
         <button type="button" className="primary" onClick={() => input.current?.click()}>

@@ -8,10 +8,12 @@ import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react"
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
 import { GroupsBar } from "./panels/GroupsBar";
+import { HelpOverlay, TourCard } from "./panels/Help";
 import { HoverTip } from "./panels/HoverTip";
 import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
+import { TOUR_STEPS, markTourSeen, resolveTourStart, tourSeen } from "./panels/tour";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
@@ -55,6 +57,28 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [focus, setFocus] = useState<FocusRequest | null>(null);
   const [resetView, setResetView] = useState(0);
   const [dropping, setDropping] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [tourStep, setTourStep] = useState<number | null>(null);
+
+  // Ending the tour records it, so first-run only runs once.
+  const endTour = useCallback(() => {
+    markTourSeen();
+    setTourStep(null);
+  }, []);
+  const nextTour = useCallback(() => {
+    if (tourStep === null) {
+      return;
+    }
+    if (tourStep + 1 >= TOUR_STEPS.length) {
+      markTourSeen();
+      setTourStep(null);
+    } else {
+      setTourStep(tourStep + 1);
+    }
+  }, [tourStep]);
+  const backTour = useCallback(() => {
+    setTourStep((s) => (s === null || s === 0 ? s : s - 1));
+  }, []);
 
   const focusOn = useCallback(
     (
@@ -135,7 +159,23 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     });
   }, [app, engine, loader, focusOn, select]);
 
-  // ---- Keyboard: undo/redo, gizmo mode, focus, deselect ----
+  // ---- First run: the tour, unless seen, forced off, or headless ----
+  // `?tour=1` forces it on (even headless); `?tour=0` / `?notour` and
+  // headless Chrome (`showcase-check.mjs`) keep it off, so the scripted
+  // session never sees a card over the canvas.
+  const onboarded = useRef(false);
+  useEffect(() => {
+    if (onboarded.current) {
+      return;
+    }
+    onboarded.current = true;
+    const start = resolveTourStart(location.search, navigator.userAgent, navigator.webdriver, tourSeen());
+    if (start !== "off") {
+      setTourStep(0);
+    }
+  }, []);
+
+  // ---- Keyboard: undo/redo, gizmo mode, focus, deselect, help ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Typing in a field (the opacity slider, say) is not a shortcut.
@@ -156,15 +196,23 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         redo();
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
+      } else if (key === "?") {
+        setHelpOpen((v) => !v);
       } else if (key === "escape") {
-        // Sculpt first (it owns the pointer), then a pick (it never selects), then the selection.
-        const snap = app.getSnapshot();
-        if (snap.sculpt !== null) {
-          app.setSculpt(null);
-        } else if (snap.brushPick !== null) {
-          app.setBrushPick(null);
+        if (helpOpen) {
+          setHelpOpen(false);
+        } else if (tourStep !== null) {
+          endTour();
         } else {
-          selectMesh(app, select, selection, null, false);
+          // Sculpt first (it owns the pointer), then a pick (it never selects), then the selection.
+          const snap = app.getSnapshot();
+          if (snap.sculpt !== null) {
+            app.setSculpt(null);
+          } else if (snap.brushPick !== null) {
+            app.setBrushPick(null);
+          } else {
+            selectMesh(app, select, selection, null, false);
+          }
         }
       } else if (key === "t") {
         setMode("translate");
@@ -178,7 +226,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo, select, selection, focusOn, app]);
+  }, [undo, redo, select, selection, focusOn, app, helpOpen, tourStep, endTour]);
 
   // ---- Drop files anywhere ----
   useEffect(() => {
@@ -264,7 +312,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
-        <div className="toolbar" role="toolbar" aria-label="Viewport tools">
+        <div className="toolbar" role="toolbar" aria-label="Viewport tools" data-tour="gizmo">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">
               Move <kbd>T</kbd>
@@ -295,6 +343,11 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               Wire
             </button>
           </div>
+          <div className="group">
+            <button type="button" data-action="help" onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)">
+              Help <kbd>?</kbd>
+            </button>
+          </div>
         </div>
         <p className="hint">
           {sculpt !== null
@@ -315,6 +368,18 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         </Suspense>
       </aside>
       <StatusBar engine={engine} app={app} />
+      {helpOpen ? (
+        <HelpOverlay
+          onClose={() => setHelpOpen(false)}
+          onStartTour={() => {
+            setHelpOpen(false);
+            setTourStep(0);
+          }}
+        />
+      ) : null}
+      {tourStep !== null ? (
+        <TourCard index={tourStep} onNext={nextTour} onBack={backTour} onDone={endTour} />
+      ) : null}
       {dropping ? <div className="drop-overlay">Drop STL, OBJ, PLY or DICOM files to load them</div> : null}
     </div>
   );

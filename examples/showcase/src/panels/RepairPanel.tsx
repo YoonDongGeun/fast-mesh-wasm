@@ -269,7 +269,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
 
   if (item === null) {
     return (
-      <section className="panel" aria-label="Repair">
+      <section className="panel" aria-label="Repair" data-tour="repair">
         <h2>Repair</h2>
         <p className="muted">Select a mesh to analyse and repair it.</p>
       </section>
@@ -279,7 +279,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const s = analysis?.mesh === mesh ? analysis.summary : null;
   const disabled = busy !== null;
   return (
-    <section className="panel" aria-label="Repair" data-repair={item.name}>
+    <section className="panel" aria-label="Repair" data-repair={item.name} data-tour="repair">
       <header className="panel-head">
         <h2>Repair</h2>
         <button type="button" data-repair-op="analyze" onClick={() => void analyze(item.mesh)} disabled={analyzing}>
