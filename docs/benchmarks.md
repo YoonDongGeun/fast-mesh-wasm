@@ -748,10 +748,10 @@ Twin tests compare the stepped store build with the one-call path over budgets a
   | --- | --- | --- |
   | Upload (was part of `begin_add_mesh`) | 4 pushes of at most 2.9 ms | 38 pushes of at most 3.5 ms |
   | Store build (was `Mesh::from_buffers_f64`, 9.0 / 7.3 ms in one call) | 29 steps of at most 1.2 ms | 253 steps of at most 0.9 ms |
-  | Store-to-BVH transition (`MeshBuild::new`) | 1.9 ms in one step | 12.6 ms in one step |
+  | Store-to-BVH transition (`MeshBuild::new`) | O(1): only reserves (was 1.9 ms) | O(1): only reserves (was 12.6 ms) |
   | BVH steps | at most 12.0 ms | tens of ms (shared machine) |
 
-  The transition step keeps the one O(n) piece of `BvhBuild::new` (the per-triangle leaf table); stepping that is out of scope here.
+  The transition step used to keep the one O(n) piece of `BvhBuild::new` (zeroing the per-triangle leaf table, 1.9 ms at 1M and 12.6 ms at 10M in one step). Now `new` only reserves the table and the prim scan zeroes it with the same pass, so the transition is O(1) and the tree is unchanged bit for bit (the stepped-build twins check it, with a `new_only_reserves_the_leaf_table` test).
 - **Memory.** The staged inputs live from the first push until the store is built: 24 MB at 1M and 240 MB at 10M. That is the same size the one-call copy held, held for longer.
 
 **Winding moments.** `MomentsBuild::new` used to list every leaf in one traversal and zero every node slot in one fill: 15 ms at 1M natively (10 ms the fill, 5 ms the traversal), about 210 ms at 10M. Now `new` only reserves (tens of microseconds), and the steps initialise the slots and list the leaves incrementally, combining in the same order: bit-identical (the stepped and parallel twin tests check it). At 1M the steps run at most 0.4 ms natively; at 10M (5.0M leaves, 10.0M slots) the fill steps run at most about 1 ms and the compute steps a few milliseconds, on the shared machine.

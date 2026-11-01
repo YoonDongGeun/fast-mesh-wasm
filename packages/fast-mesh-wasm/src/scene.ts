@@ -8,11 +8,34 @@ import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory 
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
 import { copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
+import {
+  brushPick,
+  buildTopology,
+  checkSelection,
+  checkSpec,
+  componentOf,
+  growIds,
+  invertMatrix4,
+  lassoPick,
+  shrinkIds,
+  transformPoint,
+  type IsolateReport,
+  type SelectSpec,
+  type VertexSelection,
+} from "./selection.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
 export type { Range } from "./changes.js";
 export type { MeshViews } from "./views.js";
+export type {
+  BrushSelect,
+  ComponentSelect,
+  IsolateReport,
+  LassoSelect,
+  SelectSpec,
+  VertexSelection,
+} from "./selection.js";
 // Wasm-free, so the Worker client can use them without the wasm glue.
 export { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "./handles.js";
 
@@ -933,6 +956,21 @@ function vec3At(a: Float64Array, at: number): Vec3 {
 
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
+}
+
+/**
+ * The mean stretch of a column-major 4x4's linear part: the cube root of
+ * its determinant. World-space brush radii divide by it, exact for rigid
+ * placements and a documented approximation under non-uniform scale.
+ */
+function meanStretch(m: Float64Array): number {
+  const det =
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5]);
+  const s = Math.cbrt(Math.abs(det));
+  if (s === 0 || !Number.isFinite(s)) {
+    throw invalid("the mesh placement is not invertible");
+  }
+  return s;
 }
 
 const U32_LIMIT = 2 ** 32;
@@ -2340,6 +2378,160 @@ export class Scene implements SceneLike {
       at = start + na + nb;
     }
     return out;
+  }
+
+  // ---- Selections ----
+
+  /**
+   * Selects vertices of a mesh: a sphere brush, a lasso polygon, or the
+   * connected component holding a seed vertex. The result is a snapshot
+   * (ascending ids plus the mesh's content stamp); any edit, repair, compact,
+   * undo or redo of the mesh invalidates it, and the selection methods then
+   * throw `STALE_SELECTION` instead of silently remapping ids. Placement
+   * changes keep selections valid. Only vertices a live triangle uses can
+   * be selected (dead or never-used slots never are).
+   *
+   * @throws `UNKNOWN_MESH` for a removed mesh; `INVALID_ARGUMENT` for a bad
+   * spec; `INVALID_INDEX` for an out-of-range component seed.
+   */
+  select(mesh: MeshHandle, spec: SelectSpec): VertexSelection {
+    checkSpec(spec);
+    this.#id(mesh);
+    const views = this.views(mesh);
+    const slots = this.vertexSlots(mesh);
+    const positions = views.positions().slice();
+    const indices = views.indices().slice();
+    const topology = buildTopology(indices, slots);
+    let ids: number[];
+    switch (spec.kind) {
+      case "brush": {
+        let center = spec.center;
+        let radius = spec.radius;
+        if (spec.space === "world") {
+          const inv = invertMatrix4(this.matrix4(mesh));
+          center = transformPoint(inv, spec.center);
+          radius = spec.radius / meanStretch(this.matrix4(mesh));
+        }
+        ids = brushPick(positions, topology.used, center, radius);
+        break;
+      }
+      case "lasso":
+        ids = lassoPick(positions, topology.used, spec.polygon, spec.axis ?? "xy");
+        break;
+      case "component":
+        ids = componentOf(topology, spec.seed);
+        break;
+    }
+    return { mesh, vertices: Uint32Array.from(ids), stamp: meshAdds(this).stamp(mesh) };
+  }
+
+  /**
+   * Whether `sel` is still usable: its mesh is alive and no topology edit
+   * landed since it was taken. Never throws.
+   */
+  selectionAlive(sel: VertexSelection): boolean {
+    try {
+      if (sel === null || typeof sel !== "object" || !(sel.vertices instanceof Uint32Array)) {
+        return false;
+      }
+      this.#id(sel.mesh);
+      return Number.isInteger(sel.stamp) && sel.stamp === meshAdds(this).stamp(sel.mesh);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Reads the mesh's topology and checks `sel` against its stamp. */
+  #selectionTopology(sel: VertexSelection): ReturnType<typeof buildTopology> {
+    this.#id(sel.mesh);
+    checkSelection(sel, sel.mesh, meshAdds(this).stamp(sel.mesh));
+    const views = this.views(sel.mesh);
+    return buildTopology(views.indices().slice(), this.vertexSlots(sel.mesh));
+  }
+
+  /**
+   * Grows a selection by `steps` rings of edge neighbours (staying on live
+   * vertices). The result carries the current stamp, so a fresh selection
+   * can be grown right after an edit. `steps` 0 returns an equal copy.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectGrow(sel: VertexSelection, steps = 1): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    return { mesh: sel.mesh, vertices: Uint32Array.from(growIds(topology, sel.vertices, steps)), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Shrinks a selection by `steps` rings, dropping the members with a live
+   * neighbour outside the set. Interior selections (no boundary) survive
+   * unchanged; shrinking past the core gives an empty (still valid)
+   * selection.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectShrink(sel: VertexSelection, steps = 1): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    return { mesh: sel.mesh, vertices: Uint32Array.from(shrinkIds(topology, sel.vertices, steps)), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Inverts a selection: every live vertex outside it. The result carries
+   * the current stamp.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectInvert(sel: VertexSelection): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    const inSet = new Set(sel.vertices);
+    const out: number[] = [];
+    for (let v = 0; v < topology.used.length; v++) {
+      if (topology.used[v] === 1 && !inSet.has(v)) {
+        out.push(v);
+      }
+    }
+    return { mesh: sel.mesh, vertices: Uint32Array.from(out), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Isolates a selection: removes the triangles fully outside it (no
+   * selected vertex), one undo step. Boundary triangles with at least one
+   * selected vertex stay. An empty selection selects nothing to keep and
+   * throws `INVALID_ARGUMENT` rather than clearing the mesh.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  isolate(mesh: MeshHandle, sel: VertexSelection): IsolateReport {
+    this.#id(mesh);
+    checkSelection(sel, mesh, meshAdds(this).stamp(mesh));
+    if (sel.vertices.length === 0) {
+      throw invalid("isolate needs a non-empty selection");
+    }
+    const inSet = new Set(sel.vertices);
+    const views = this.views(mesh);
+    const indices = views.indices().slice();
+    const drop: number[] = [];
+    for (let t = 0; t * 3 + 2 < indices.length; t++) {
+      const a = indices[t * 3];
+      const b = indices[t * 3 + 1];
+      const c = indices[t * 3 + 2];
+      if (a === 0 && b === 0 && c === 0) {
+        continue;
+      }
+      if (!inSet.has(a) && !inSet.has(b) && !inSet.has(c)) {
+        drop.push(t);
+      }
+    }
+    if (drop.length > 0) {
+      this.edit(mesh, [{ op: "removeTriangles", triangles: Uint32Array.from(drop) }]);
+    }
+    return {
+      removedTriangles: drop.length,
+      selection: { mesh, vertices: sel.vertices.slice(), stamp: meshAdds(this).stamp(mesh) },
+    };
   }
 
   // ---- Fields and colours ----

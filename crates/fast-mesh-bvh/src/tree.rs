@@ -99,7 +99,8 @@ pub(crate) enum Assign {
 
 /// Where a [`BvhBuild`] stands.
 enum BuildStage {
-    /// Collecting the alive triangles' boxes, from this triangle slot on.
+    /// Collecting the alive triangles' boxes (and zeroing the leaf
+    /// table with the same scan), from this triangle slot on.
     Prims(Prims, usize),
     /// Building the tree.
     Tree(Box<TreeBuild>),
@@ -142,7 +143,11 @@ impl std::fmt::Debug for BvhBuild {
 
 impl BvhBuild {
     /// A build of a BVH over the alive triangles of `mesh` as it is now,
-    /// with nothing done yet.
+    /// with nothing done yet. Only memory is reserved here: the leaf
+    /// table (`tri_leaf`, one entry per triangle slot) is zeroed by the
+    /// prim scan in [`BvhBuild::step`] instead, so one call of `new`
+    /// stays short even on a large mesh (a background add runs it inside
+    /// a step).
     ///
     /// # Errors
     /// [`BvhError::InvalidOptions`](crate::BvhError::InvalidOptions); out of
@@ -150,11 +155,13 @@ impl BvhBuild {
     pub fn new(mesh: &Mesh, options: &BuildOptions) -> Result<BvhBuild> {
         options.validate()?;
         let prims = Prims::with_capacity(mesh.triangle_count())?;
+        let mut tri_leaf = Vec::new();
+        try_reserve_exact(&mut tri_leaf, mesh.triangle_slots())?;
         let arena = Arena {
             nodes: Vec::new(),
             parents: Vec::new(),
             refs: Vec::new(),
-            tri_leaf: try_vec(mesh.triangle_slots(), NONE)?,
+            tri_leaf,
         };
         Ok(BvhBuild {
             stage: BuildStage::Prims(prims, 0),
@@ -207,6 +214,14 @@ impl BvhBuild {
                         if mesh.is_triangle_alive(t as TriangleId) {
                             prims.push(t as u32, Aabb::of_triangle(positions, tri));
                         }
+                    }
+                    // Zero the leaf table with the scan (same triangle
+                    // slots, in order), so `new` stays O(1): within the
+                    // reserved capacity, so this allocates nothing.
+                    if let Some(arena) = self.arena.as_mut()
+                        && arena.tri_leaf.len() < to
+                    {
+                        arena.tri_leaf.resize(to, NONE);
                     }
                     left = left.saturating_sub(to - from);
                     if to < triangles.len() {
@@ -1095,6 +1110,30 @@ mod tests {
             let want = fingerprint(&Bvh::build(&mesh, &opts).unwrap());
             assert!(fingerprint(&stepped(&mesh, &opts, 1).0) == want);
         }
+    }
+
+    #[test]
+    fn new_only_reserves_the_leaf_table() {
+        // #64: zeroing the leaf table (one entry per triangle slot) was
+        // an O(n) memset inside `new` — the 12.6 ms single step of a 10M
+        // background add's store-to-BVH transition. It now fills with the
+        // prim scan, so `new` stays short; the built tree is unchanged.
+        let mesh = grid(10);
+        let opts = BuildOptions::default();
+        let mut build = BvhBuild::new(&mesh, &opts).unwrap();
+        assert!(build.arena.as_ref().unwrap().tri_leaf.is_empty());
+        let mut last = 0;
+        while !build.step(&mesh, 7).unwrap() {
+            // The arena moves into the tree once the prim scan ends.
+            if matches!(build.stage, BuildStage::Prims(..)) {
+                let len = build.arena.as_ref().unwrap().tri_leaf.len();
+                assert!(len >= last);
+                last = len;
+            }
+        }
+        let got = build.finish().unwrap();
+        got.validate(&mesh).unwrap();
+        assert!(fingerprint(&got) == fingerprint(&Bvh::build(&mesh, &opts).unwrap()));
     }
 
     #[test]

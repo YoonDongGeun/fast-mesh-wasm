@@ -307,7 +307,53 @@ const scene = await createWorkerScene({ workerUrl: "/fast-mesh-wasm/worker-entry
 const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { type: "module" }) });
 ```
 
-`fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
+**Node.js.** `fast-mesh-wasm/worker` has no zero-config Node entry: `createWorkerScene()` with no
+arguments creates a browser `Worker`. In Node use the synchronous `Scene` instead — each call blocks
+until it returns, which is fine for a batch pipeline with no frame budget (repair, distance checks):
+
+```ts
+import { Scene } from "fast-mesh-wasm"; // Node entry: the .wasm loads from disk on import
+
+const scene = new Scene(); // no init() needed, as in browsers
+const upper = scene.addMesh(upperPositions, upperIndices);
+const lower = scene.addMesh(lowerPositions, lowerIndices);
+scene.repair(upper, [{ op: "removeDegenerate" }]);
+const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
+scene.setColoring(upper, { field: gap, map: "turbo", range: [-0.5, 1] });
+const distance = scene.meshDistance(upper, lower)?.distance ?? Infinity;
+const colors = scene.views(upper).colors(); // RGBA8, 4 bytes per vertex slot (null when uncoloured)
+```
+
+`WorkerScene` still runs in Node through the `createWorker` option with a small `node:worker_threads`
+adapter. It is always single-threaded there: Node reports no `crossOriginIsolated`, so `threads` is
+ignored and `scene.threads` reads `1`. The bench and test harnesses do this
+(`packages/fast-mesh-wasm/bench/worker-harness.mjs`, `test/harness/node-worker.mjs`); the shape is:
+
+```ts
+import { Worker } from "node:worker_threads";
+import { createWorkerScene } from "fast-mesh-wasm/worker";
+
+const scene = await createWorkerScene({
+  createWorker: () => {
+    const worker = new Worker(workerUrl, { workerData: { serve: true } });
+    const listeners: ((e: { data: unknown }) => void)[] = [];
+    worker.on("message", (data) => {
+      for (const cb of listeners) cb({ data });
+    });
+    return {
+      postMessage: (msg: unknown, transfer?: Transferable[]) => worker.postMessage(msg, transfer),
+      addEventListener: (type: string, cb: (e: { data: unknown }) => void) => {
+        if (type === "message") listeners.push(cb);
+      },
+      terminate: () => worker.terminate(),
+    };
+  },
+});
+```
+
+where the worker script serves the engine on `parentPort` (see `bench/worker-harness.mjs`). Prefer
+the synchronous `Scene` above unless a headless pipeline needs `WorkerScene` parity (status keys,
+background adds).
 
 ## Multithreading (COOP/COEP)
 
