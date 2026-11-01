@@ -5,13 +5,22 @@ import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fas
 import * as THREE from "three";
 import type { Engine } from "./App";
 import { inspect } from "./panels/inspect";
+import { collectProject, parseProjectDoc, restoreProject } from "./load/project";
+import { type CollisionCsvRow, collisionRowsToCsv, contoursToDxf, contoursToSvg } from "./load/report";
+import { parseBigFileParams } from "./load/big-file";
+import { buildCollisionRows, readSectionContours } from "./panels/ExportPanel";
 import { shadeProbe } from "./shade-probe";
 import type { AppState } from "./scene/app-state";
 import { view } from "./viewport/view";
 import { hasRepairOverlays } from "./viewport/repair-overlays";
 import { hasWireOverlay } from "./viewport/wire";
 
-export function installTestHook(store: SceneStore, engine: Engine, app: AppState): void {
+export function installTestHook(
+  store: SceneStore,
+  engine: Engine,
+  app: AppState,
+  loader?: { cancelJob(id: number): void },
+): void {
   const nameOf = (m: unknown) => app.getSnapshot().items.find((i) => i.mesh === m)?.name ?? null;
   const find = (name: string) => {
     const item = app.getSnapshot().items.find((i) => i.name === name);
@@ -36,6 +45,19 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
+    /** The large-file UX state: the decimate toggle and the URL thresholds. */
+    bigFile: () => {
+      let params = { warnTriangles: 500_000, decimateTriangles: 1_000_000, decimateTarget: 200_000 };
+      try {
+        const p = parseBigFileParams(location.search);
+        params = { warnTriangles: p.warnTriangles, decimateTriangles: p.decimateTriangles, decimateTarget: p.decimateTarget };
+      } catch {
+        // Defaults stand.
+      }
+      return { decimateOnLoad: app.getSnapshot().decimateOnLoad, ...params };
+    },
+    /** Cancels a load by job id (no-op when finished or unknown). */
+    ...(loader === undefined ? {} : { cancelLoad: (id: number) => loader.cancelJob(id) }),
     status: () => {
       const s = store.getSnapshot();
       return { status: s.status, error: s.error?.message, ...s.history };
@@ -297,6 +319,39 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
         }
       }
       return out;
+    },
+    /** The project file JSON of the live session (issue #126). */
+    saveProject: () => JSON.stringify(collectProject(store, app)),
+    /** Replaces the session with the project file JSON. */
+    openProject: (json: string) => restoreProject(store, app, parseProjectDoc(json)),
+    /**
+     * The collision summary as CSV rows (issue #127): the pair row under the
+     * pair as picked now, then the group rows. Empty until a readout lands.
+     */
+    exportRows: (): CollisionCsvRow[] =>
+      buildCollisionRows(app.getSnapshot().items, app.getSnapshot().collision, inspect.collision, inspect.group),
+    /** The collision summary as CSV text. */
+    exportCsv: (): string =>
+      collisionRowsToCsv(
+        buildCollisionRows(app.getSnapshot().items, app.getSnapshot().collision, inspect.collision, inspect.group),
+      ),
+    /**
+     * The inspect section's contours as DXF and SVG text (issue #127), `null`
+     * without a section. Meshes removed meanwhile contribute nothing.
+     */
+    sectionFiles: (): { dxf: string; svg: string } | null => {
+      const section = app.getSnapshot().inspectSection;
+      if (section === null) {
+        return null;
+      }
+      const read = readSectionContours(store, engine.scene, section.handle, section.plane);
+      if (read === null || read.contours.length === 0) {
+        return null;
+      }
+      return {
+        dxf: contoursToDxf(read.contours, read.origin, read.normal),
+        svg: contoursToSvg(read.contours, read.origin, read.normal),
+      };
     },
     /** Where the mesh's origin (its centre when loaded, where the gizmo sits) is on the page, in CSS pixels. */
     screenPoint: (name: string) => {

@@ -190,6 +190,19 @@ input[type="range"] {
   background: linear-gradient(90deg, var(--line) 0%, var(--accent) 50%, var(--line) 100%) 0 0 / 200% 100%;
   animation: progress 1s linear infinite;
 }
+/* A known fraction: a filling bar (the width comes from the job's progress). */
+.progress.determinate {
+  animation: none;
+  background: var(--accent);
+}
+.job-summary {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: var(--muted);
+}
+.big-warning {
+  color: var(--warn, #b7791f);
+}
 @keyframes progress {
   to {
     background-position: -200% 0;

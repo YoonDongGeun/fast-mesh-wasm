@@ -4,14 +4,17 @@
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { parseBigFileParams } from "./load/big-file";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { ExportPanel } from "./panels/ExportPanel";
 import { GroupsBar } from "./panels/GroupsBar";
 import { HelpOverlay, TourCard } from "./panels/Help";
 import { HoverTip } from "./panels/HoverTip";
 import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
+import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { TOUR_STEPS, markTourSeen, resolveTourStart, tourSeen } from "./panels/tour";
@@ -100,6 +103,16 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
     [app],
   );
+
+  // `?big` loads the ~1M-triangle demo variants (see load/big-file.ts).
+  const demoBig = useMemo(() => {
+    try {
+      return parseBigFileParams(location.search).demoBig;
+    } catch {
+      return false;
+    }
+  }, []);
+  const cancelLoad = useCallback((id: number) => loader.cancelJob(id), [loader]);
 
   const load = useCallback(
     (files: Iterable<File>) => {
@@ -272,6 +285,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <MeshList
           app={app}
           onLoad={load}
+          onCancelLoad={cancelLoad}
           onLoadPhantom={(phantom) => {
             void loader.loadDicomDemo(phantom).then((added) => {
               const last = added.at(-1);
@@ -290,11 +304,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           }}
           onLoadDemo={() => {
             // No focus: the meshes join the current view (Reset view restores the overview).
-            void loader.loadDemo(false);
+            void loader.loadDemo(demoBig);
           }}
           onFocus={focusOn}
         />
         <GroupsBar app={app} />
+        <ProjectPanel app={app} />
       </aside>
       <main className="viewport">
         <Viewport
@@ -370,6 +385,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
         <InspectPanel app={app} scene={engine.scene} />
+        <ExportPanel app={app} scene={engine.scene} />
         <Suspense fallback={null}>
           <VolumePanel app={app} loader={loader} />
         </Suspense>

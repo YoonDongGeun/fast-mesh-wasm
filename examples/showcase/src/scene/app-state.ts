@@ -49,6 +49,10 @@ export interface Job {
   name: string;
   phase: JobPhase;
   message?: string;
+  /** Load progress, 0..1, while reading/parsing/adding (unset: indeterminate). */
+  progress?: number;
+  /** Post-load summary (triangles, time, decimation) shown on done jobs. */
+  summary?: string;
 }
 
 /** The meshes the collision panel colours, each against the other; `null` for none picked. */
@@ -192,6 +196,8 @@ export interface AppSnapshot {
   inspectSection: InspectSection | null;
   /** The axis-aligned clip box in world coordinates, if one is armed. */
   clipBox: { min: Vec3; max: Vec3 } | null;
+  /** Heavy loads are decimated on load (#113, via the #118 simplify op). */
+  decimateOnLoad: boolean;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -224,6 +230,7 @@ export class AppState {
     inspectQuery: null,
     inspectSection: null,
     clipBox: null,
+    decimateOnLoad: true,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -503,6 +510,11 @@ export class AppState {
   /** Sets the axis-aligned clip box in world coordinates (`null` clears it). */
   setClipBox(box: { min: Vec3; max: Vec3 } | null): void {
     this.#set({ clipBox: box });
+  }
+
+  /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
+  setDecimateOnLoad(on: boolean): void {
+    this.#set({ decimateOnLoad: on });
   }
 
   setJob(job: Job): void {
