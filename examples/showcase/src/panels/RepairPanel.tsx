@@ -13,12 +13,16 @@ import { nextJoinSource } from "../scene/selection";
 import { REPAIR_OVERLAY_COLORS } from "../viewport/repair-overlays";
 import { formatDistance } from "./collision-math";
 import { inspect } from "./inspect";
+import {
+  AUTO_REPAIR_ANY_SIZE,
+  runAutoRepairPipeline,
+} from "./auto-repair";
 import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
 
 /** The most entries the analysis lists (counts stay exact). */
 const MAX_LISTED = 64;
 /** "Any size" for Fill holes (an empty field): the op needs a bound (or a list of loops). */
-const ANY_SIZE = 1e9;
+const ANY_SIZE = AUTO_REPAIR_ANY_SIZE;
 /** The Fill holes size limit to start with: small and medium holes, not an open mesh's outer boundary. */
 const DEFAULT_MAX_EDGES = 64;
 /** How long after an op its own triangle change may still arrive (it has none when nothing changed). */
@@ -229,6 +233,45 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     }
   };
 
+  // One "Auto repair" click: weld -> remove-degenerate -> orient ->
+  // remove-small-components -> fill holes as ONE repair call (one grouped
+  // undo step, all-or-nothing), using this panel's live settings, with a
+  // per-stage report and a before/after summary. The triangle-change effect
+  // above re-analyses and refreshes the 3D overlays; the explicit analyse
+  // covers a clean mesh (no change, no effect run).
+  const runAuto = async () => {
+    if (mesh === null || busy !== null) {
+      return;
+    }
+    setBusy("Auto repair");
+    inspect.repair.busy = "Auto repair";
+    clearTimeout(own.current.timer);
+    own.current.pending = true;
+    try {
+      const settings = { weldTolerance, minTriangles, maxEdges, fair };
+      const result = await runAutoRepairPipeline(
+        {
+          analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
+          repair: async (ops) => (await store.repair(mesh, ops)) as RepairReport[],
+        },
+        settings,
+      );
+      setReport({ mesh, line: result.line, failed: false });
+      inspect.repair.report = result.line;
+      void analyze(mesh);
+    } catch (e) {
+      const line = `Auto repair failed: ${e instanceof Error ? e.message : String(e)}`;
+      setReport({ mesh, line, failed: true });
+      inspect.repair.report = line;
+    } finally {
+      setBusy(null);
+      inspect.repair.busy = null;
+      if (own.current.pending) {
+        own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
+      }
+    }
+  };
+
   const runJoin = async (source: Item, loopA: number, loopB: number) => {
     if (mesh === null || busy !== null) {
       return;
@@ -398,6 +441,19 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
+      </div>
+
+      <div className="ops">
+        <div className="op">
+          <button type="button" data-repair-op="autoRepair" disabled={disabled} onClick={() => void runAuto()}>
+            Auto repair
+          </button>
+          <p className="muted small">
+            Order: weld → remove degenerate → orient → remove small components → fill holes. Uses the tolerance,
+            “below”, “max edges” and “fair” settings above; one grouped undo step (Ctrl+Z). Reports one line per
+            stage with before → after counts.
+          </p>
+        </div>
       </div>
 
       <div className="ops">

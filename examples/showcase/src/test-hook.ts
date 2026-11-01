@@ -177,6 +177,18 @@ export function installTestHook(store: SceneStore, engine: Engine, app: AppState
     },
     /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
     sculpt: () => ({ ...inspect.sculpt }),
+    /** The inspect tools: the armed tool, the ruler, the query, the section plane and the clip box. */
+    inspectTools: () => ({
+      tool: inspect.tools.tool,
+      ruler: {
+        a: [...inspect.tools.ruler.a] as [number, number, number],
+        b: inspect.tools.ruler.b === null ? null : ([...inspect.tools.ruler.b] as [number, number, number]),
+        distance: inspect.tools.ruler.distance,
+      },
+      query: inspect.tools.query === null ? null : { ...inspect.tools.query },
+      section: inspect.tools.section === null ? null : { ...inspect.tools.section },
+      clip: inspect.tools.clip === null ? null : { ...inspect.tools.clip },
+    }),
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),
     /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */

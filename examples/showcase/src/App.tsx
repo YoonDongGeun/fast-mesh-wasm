@@ -10,6 +10,7 @@ import { CollisionPanel } from "./panels/CollisionPanel";
 import { GroupsBar } from "./panels/GroupsBar";
 import { HelpOverlay, TourCard } from "./panels/Help";
 import { HoverTip } from "./panels/HoverTip";
+import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
@@ -363,6 +364,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       <aside className="sidebar sidebar-right">
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
+        <InspectPanel app={app} scene={engine.scene} />
         <Suspense fallback={null}>
           <VolumePanel app={app} loader={loader} />
         </Suspense>

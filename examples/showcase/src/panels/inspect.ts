@@ -100,6 +100,18 @@ export const inspect: {
   sceneSlices: { id: string | null; shown: number };
   /** The scene's volume rendering: the series raymarched in the main scene, and its 3D preset. */
   sceneVolume: { id: string | null; preset: string };
+  /** The inspect tools (#110): the armed tool, the ruler, the query, the section and the clip box. */
+  tools: {
+    tool: "ruler" | "query" | "section" | "clip" | null;
+    /** The ruler's world endpoints and their distance (`null` until both clicked). */
+    ruler: { a: [number, number, number]; b: [number, number, number] | null; distance: number | null };
+    /** The query hit: mesh name, vertex slot, world point and coloring value. */
+    query: { mesh: string; slot: number; point: [number, number, number]; value: number | null } | null;
+    /** The section plane and how many meshes it cuts. */
+    section: { plane: { origin: [number, number, number]; normal: [number, number, number] }; meshes: number } | null;
+    /** The clip box corners. */
+    clip: { min: [number, number, number]; max: [number, number, number] } | null;
+  };
   /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, whether the ball shows, and the last grab dab's center. */
   sculpt: {
     strokes: number;
@@ -129,6 +141,13 @@ export const inspect: {
   sceneSlices: { id: null, shown: 0 },
   sceneVolume: { id: null, preset: "" },
   sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null },
+  tools: {
+    tool: null,
+    ruler: { a: [0, 0, 0], b: null, distance: null },
+    query: null,
+    section: null,
+    clip: null,
+  },
 };
 
 function liveProbe(): LiveProbe<never> {

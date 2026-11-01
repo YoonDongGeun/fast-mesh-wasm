@@ -22,6 +22,8 @@ import type { Loader } from "../load/loader";
 import { inspect } from "../panels/inspect";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { InspectLayers, pickVertex } from "./InspectLayers";
+import { setSliceClip } from "./clip-planes";
 import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
 import { matchVolume } from "./volume-box";
@@ -114,10 +116,16 @@ export function Viewport(props: {
     };
   }, []);
   // A tap on empty space clears the selection; sculpt and picks own the
-  // pointer, and gizmo drags and orbits are not taps.
+  // pointer, and gizmo drags and orbits are not taps. While an inspect
+  // tool is armed the selection stays put (the ruler and query click
+  // meshes without selecting them).
+  const inspectTool = useApp(app, (s) => s.inspectTool);
   const onMissed = useCallback(
     (e: MouseEvent) => {
       if (sculpt !== null || picking !== null || view.dragging || selection === null) {
+        return;
+      }
+      if (inspectTool !== null) {
         return;
       }
       if (view.gizmo !== null && view.gizmo.axis !== null) {
@@ -133,7 +141,7 @@ export function Viewport(props: {
       // Through clickMulti: a shift-click on nothing is ignored, like on a mesh.
       selectMesh(app, select, selection, null, e.shiftKey);
     },
-    [app, select, selection, sculpt, picking],
+    [app, select, selection, sculpt, picking, inspectTool],
   );
   const mpr = useApp(app, (s) => s.volumeMpr);
   // The mesh shown as the scene volume instead of its surface, if any.
@@ -203,6 +211,7 @@ export function Viewport(props: {
       <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
       <SceneVolume app={app} loader={loader} scene={scene} />
+      <InspectLayers app={app} scene={scene} items={items} />
     </Canvas>
   );
 }
@@ -257,6 +266,8 @@ function MeshView(props: {
 }) {
   const { app, item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
     props;
+  // The armed inspect tool, if any: ruler and query clicks land here instead of selecting.
+  const tool = useApp(app, (s) => s.inspectTool);
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
   }, [item.material, selected, secondary]);
@@ -279,6 +290,36 @@ function MeshView(props: {
       }
       // A stroke's release on the mesh is not a click either.
       if (sculpted) {
+        return;
+      }
+      // The inspect tools own the click while armed, and never select: the
+      // ruler appends a world point (a third click restarts it), the query
+      // records the snapped vertex. A hit on another mesh still lands.
+      if (tool === "ruler" || tool === "query") {
+        const { origin, direction } = e.ray;
+        const at = app.getSnapshot();
+        void Promise.resolve()
+          .then(() =>
+            pickVertex(scene, [origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]),
+          )
+          .then((picked) => {
+            if (picked === null) {
+              return;
+            }
+            if (tool === "ruler") {
+              const ruler = at.ruler;
+              if (ruler === null || ruler.b !== null) {
+                app.setRuler({ a: picked.point, b: null });
+              } else {
+                app.setRuler({ a: ruler.a, b: picked.point });
+              }
+            } else {
+              app.setInspectQuery({ mesh: picked.mesh, slot: picked.slot, point: picked.point });
+            }
+          })
+          .catch(() => {
+            // Removed meanwhile: the click is dropped.
+          });
         return;
       }
       if (!picking) {
@@ -314,7 +355,7 @@ function MeshView(props: {
           // Removed meanwhile: the pick stays armed.
         });
     },
-    [item.mesh, onPick, picking, onPickPoint, scene, sculpted],
+    [item.mesh, onPick, picking, onPickPoint, scene, sculpted, tool, app],
   );
   return (
     <>

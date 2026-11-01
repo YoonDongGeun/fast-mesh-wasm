@@ -3,7 +3,7 @@
 // contact group. A tiny
 // external store, so the loader (outside React) and the components share it;
 // read it with `useApp`.
-import type { Analysis, MeshHandle } from "fast-mesh-wasm";
+import type { Analysis, MeshHandle, SectionHandle, SectionPlane } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import * as THREE from "three";
@@ -107,6 +107,22 @@ export interface RepairAnalysis {
   analysis: Analysis;
 }
 
+/** One inspection tool of the inspect panel: ruler, click-to-query, section plane or clip box. */
+export type InspectTool = "ruler" | "query" | "section" | "clip";
+
+/** The inspect section plane: the store's handle and its plane, for the panel and the gizmo. */
+export interface InspectSection {
+  handle: SectionHandle;
+  plane: SectionPlane;
+}
+
+/** A click-to-query hit: the mesh, the snapped vertex slot, and its world point. */
+export interface InspectQuery {
+  mesh: MeshHandle;
+  slot: number;
+  point: Vec3;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -144,6 +160,20 @@ export interface AppSnapshot {
   repairOverlays: Record<RepairOverlayKind, boolean>;
   /** The repair panel's latest analysis (the overlay's geometry source). */
   repairAnalysis: RepairAnalysis | null;
+  /**
+   * The armed inspection tool, if any: ruler (click two vertices, world
+   * points that survive placement undo), click-to-query (the picked
+   * vertex's coloring value), section plane or clip box.
+   */
+  inspectTool: InspectTool | null;
+  /** The ruler's endpoints in world coordinates (`b` is `null` until the second click). */
+  ruler: { a: Vec3; b: Vec3 | null } | null;
+  /** The click-to-query hit, if one landed. */
+  inspectQuery: InspectQuery | null;
+  /** The section plane cut, if one is armed (its handle lives in the store). */
+  inspectSection: InspectSection | null;
+  /** The axis-aligned clip box in world coordinates, if one is armed. */
+  clipBox: { min: Vec3; max: Vec3 } | null;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -167,6 +197,11 @@ export class AppState {
     volumeMpr: null,
     repairOverlays: { holes: true, nonManifold: true, degenerate: true, components: true },
     repairAnalysis: null,
+    inspectTool: null,
+    ruler: null,
+    inspectQuery: null,
+    inspectSection: null,
+    clipBox: null,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -287,6 +322,7 @@ export class AppState {
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
       sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
       repairAnalysis: this.#snap.repairAnalysis?.mesh === item.mesh ? null : this.#snap.repairAnalysis,
+      inspectQuery: this.#snap.inspectQuery?.mesh === item.mesh ? null : this.#snap.inspectQuery,
     });
   }
 
@@ -393,6 +429,31 @@ export class AppState {
   /** Shares the repair panel's latest analysis with the 3D overlay (`null` clears it). */
   setRepairAnalysis(analysis: RepairAnalysis | null): void {
     this.#set({ repairAnalysis: analysis });
+  }
+
+  /** Arms the inspection tool (`null` disarms it, keeping its results). */
+  setInspectTool(tool: InspectTool | null): void {
+    this.#set({ inspectTool: tool });
+  }
+
+  /** Sets the ruler's endpoints in world coordinates (`null` clears it). */
+  setRuler(ruler: { a: Vec3; b: Vec3 | null } | null): void {
+    this.#set({ ruler });
+  }
+
+  /** Records a click-to-query hit (`null` clears it). */
+  setInspectQuery(query: InspectQuery | null): void {
+    this.#set({ inspectQuery: query });
+  }
+
+  /** Shares the inspect section plane with the 3D gizmo (`null` clears it). */
+  setInspectSection(section: InspectSection | null): void {
+    this.#set({ inspectSection: section });
+  }
+
+  /** Sets the axis-aligned clip box in world coordinates (`null` clears it). */
+  setClipBox(box: { min: Vec3; max: Vec3 } | null): void {
+    this.#set({ clipBox: box });
   }
 
   setJob(job: Job): void {
