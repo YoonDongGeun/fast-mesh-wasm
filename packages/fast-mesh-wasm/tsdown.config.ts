@@ -13,6 +13,8 @@ export default defineConfig({
     "worker-entry": "src/worker/entry.ts",
     // `fast-mesh-wasm/store`: free of React, three.js and the wasm glue.
     store: "src/store/index.ts",
+    // `fast-mesh-wasm/io`: mesh exporters over a SceneLike; wasm-free.
+    io: "src/io/index.ts",
     // `fast-mesh-wasm/react`: hooks over the store; React is a peer.
     react: "src/react/index.ts",
     // `fast-mesh-wasm/r3f`: `<FastMesh>` and the frame driver; R3F is a peer.

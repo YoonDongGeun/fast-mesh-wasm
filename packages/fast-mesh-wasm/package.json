@@ -45,6 +45,10 @@
       "types": "./dist/worker.d.ts",
       "default": "./dist/worker.js"
     },
+    "./io": {
+      "types": "./dist/io.d.ts",
+      "default": "./dist/io.js"
+    },
     "./store": {
       "types": "./dist/store.d.ts",
       "default": "./dist/store.js"
