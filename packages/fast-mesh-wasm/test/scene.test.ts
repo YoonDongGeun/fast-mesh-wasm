@@ -419,11 +419,13 @@ describe("Scene", () => {
     expect(r.keptTriangles).toBe(s.triangleCount(mesh));
     expect(r.removedTriangles).toBe(s.triangleCount(r.removed));
     expect(r.capTriangles).toBeGreaterThan(0);
-    // The kept side is the + one.
-    const kept = s.views(mesh).positions();
-    for (let v = 0; v < kept.length / 3; v++) {
-      expect(kept[v * 3]).toBeGreaterThanOrEqual(0.5 - 1e-6);
-    }
+    // The kept side is the + one: bounds cover the live triangles in
+    // local coordinates, and the identity placement puts the origin at
+    // matrix4[12..14] (dead slots keep stale positions, so the raw
+    // buffer is not checked directly).
+    const keptBounds = s.bounds(mesh)!;
+    const keptOriginX = s.matrix4(mesh)[12];
+    expect(keptBounds.min[0] + keptOriginX).toBeGreaterThanOrEqual(0.5 - 1e-6);
     // One undo step restores the cut mesh; the added part stays.
     expect(s.undo()).toBe(true);
     expect(s.triangleCount(mesh)).toBe(12);
