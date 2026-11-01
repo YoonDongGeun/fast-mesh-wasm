@@ -103,7 +103,7 @@ jobs:
             tail -n +3 bench-json/store.md
           } > bench-json/body.md
       - name: Sticky PR comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
