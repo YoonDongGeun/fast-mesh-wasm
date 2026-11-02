@@ -7,6 +7,7 @@ node_modules/
 .pnpm-store/
 
 # Build output
+packages/fast-mesh-wasm/test/__cookbook__/
 packages/fast-mesh-wasm/dist/
 packages/fast-mesh-wasm/src/wasm/
 packages/fast-mesh-wasm/src/wasm-threads/
