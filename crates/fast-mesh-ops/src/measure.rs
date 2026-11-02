@@ -218,7 +218,11 @@ mod tests {
             &[[0, 2, 1], [0, 3, 2], [0, 1, 3], [1, 2, 3]],
         );
         let m = measure(&mesh).unwrap();
-        assert!((m.area - (1.5 + 3f64.sqrt() / 2.0)).abs() < 1e-12, "area {}", m.area);
+        assert!(
+            (m.area - (1.5 + 3f64.sqrt() / 2.0)).abs() < 1e-12,
+            "area {}",
+            m.area
+        );
         assert!((m.volume.unwrap() - 1.0 / 6.0).abs() < 1e-12, "{m:?}");
         assert!(m.closed && m.volume_reason.is_none());
         assert_eq!(m.orientation_conflicts, 0);
