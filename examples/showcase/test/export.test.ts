@@ -4,7 +4,7 @@
 // touches `fast-mesh-wasm`: CI builds before testing.)
 import { describe, expect, it } from "vitest";
 import type { SceneLike } from "fast-mesh-wasm";
-import { MeshHandle } from "fast-mesh-wasm";
+import type { MeshHandle } from "fast-mesh-wasm";
 import { exportFileName, exportMeshBytes, type MeshExportFormat } from "../src/load/export";
 import type { MeshData } from "../src/load/mesh-data";
 import { parseObj } from "../src/load/obj";
@@ -16,7 +16,7 @@ const QUAD_TRIS = Uint32Array.from([0, 1, 2, 0, 2, 3, 0, 0, 0]);
 
 /** One quad in memory, as the store's scene would serve it. */
 class FakeScene implements SceneLike {
-  readonly mesh = new MeshHandle();
+  readonly mesh = {} as unknown as MeshHandle; // opaque stand-in: FakeScene ignores the handle
   views() {
     return {
       positions: () => QUAD,
