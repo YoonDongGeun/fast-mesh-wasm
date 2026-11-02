@@ -33,6 +33,17 @@ export const TOUR_STEPS: TourStep[] = [
   },
 ];
 
+// The tour card's state machine, pure so tests can drive it: Next from the
+// last step (or Skip/Done anywhere) ends the tour (`null`), Back stays on
+// the first step.
+export function tourNext(index: number): number | null {
+  return index + 1 >= TOUR_STEPS.length ? null : index + 1;
+}
+
+export function tourBack(index: number): number {
+  return index <= 0 ? 0 : index - 1;
+}
+
 export type TourStart = "auto" | "forced" | "off";
 
 export function resolveTourStart(search: string, agent: string, webdriver: boolean, seen: boolean): TourStart {

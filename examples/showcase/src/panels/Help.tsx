@@ -4,7 +4,9 @@
 import { useEffect } from "react";
 import { TOUR_STEPS } from "./tour";
 
-const SHORTCUTS: Array<[string, string]> = [
+// Exported for tests: the overlay must name every binding in App's keyboard
+// handler (T/R, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, F, W, Esc, ?).
+export const SHORTCUTS: Array<[string, string]> = [
   ["T / R", "Move / rotate gizmo"],
   ["Ctrl+Z · Ctrl+Shift+Z (Ctrl+Y)", "Undo / redo"],
   ["F", "Frame the selection"],

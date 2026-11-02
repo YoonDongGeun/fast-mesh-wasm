@@ -17,7 +17,7 @@ import { MeshList } from "./panels/MeshList";
 import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
-import { TOUR_STEPS, markTourSeen, resolveTourStart, tourSeen } from "./panels/tour";
+import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
@@ -73,15 +73,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     if (tourStep === null) {
       return;
     }
-    if (tourStep + 1 >= TOUR_STEPS.length) {
+    const next = tourNext(tourStep);
+    if (next === null) {
       markTourSeen();
-      setTourStep(null);
-    } else {
-      setTourStep(tourStep + 1);
     }
+    setTourStep(next);
   }, [tourStep]);
   const backTour = useCallback(() => {
-    setTourStep((s) => (s === null || s === 0 ? s : s - 1));
+    setTourStep((s) => (s === null ? s : tourBack(s)));
   }, []);
 
   const focusOn = useCallback(
