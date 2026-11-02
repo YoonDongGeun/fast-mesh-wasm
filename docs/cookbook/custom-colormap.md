@@ -4,6 +4,29 @@ Any field (distance, thickness, curvature) can drive vertex colors
 through a custom map, rendered per-pixel so range edges are crisp
 iso-lines instead of triangle-width gradients.
 
+## Setup
+
+A unit box; its wall thickness (about 1 through the faces) drives the map.
+
+```ts
+import { init, Scene } from "fast-mesh-wasm";
+
+await init();
+const scene = new Scene();
+
+const boxPositions = new Float64Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]);
+const boxIndices = new Uint32Array([
+  0, 3, 2, 0, 2, 1, // bottom (z = 0)
+  4, 5, 6, 4, 6, 7, // top (z = 1)
+  0, 1, 5, 0, 5, 4, // front (y = 0)
+  2, 3, 7, 2, 7, 6, // back (y = 1)
+  0, 4, 7, 0, 7, 3, // left (x = 0)
+  1, 2, 6, 1, 6, 5, // right (x = 1)
+]);
+
+const mesh = scene.addMesh(boxPositions, boxIndices);
+```
+
 ## Custom stops
 
 A colormap is a built-in name or stops — `[t, rgba]` pairs, at least
@@ -56,7 +79,10 @@ const bound = bindMesh(scene, mesh, {
 });
 // bound.shading reports "fragment" (falls back to "vertex" with a warning
 // when the scene or material cannot support it).
-// bound.setEdgeSoftness(w); // adjust later, no recompile.
+if (bound.shading !== "fragment") throw new Error("expected fragment shading");
+bound.setEdgeSoftness(0.1); // adjust later, no recompile.
+bound.dispose();
+scene.free();
 ```
 
 Requirements: a scene with `coloring(mesh)` and `views(mesh).values`

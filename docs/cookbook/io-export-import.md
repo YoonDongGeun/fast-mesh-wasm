@@ -7,7 +7,23 @@ Importers return plain arrays ready for `scene.addMesh`.
 ## Export one mesh
 
 ```ts
+import { init, Scene } from "fast-mesh-wasm";
 import { exportGLTF, exportOBJ, exportPLY, exportSTL } from "fast-mesh-wasm/io";
+
+await init();
+const scene = new Scene();
+
+// A unit box: 8 vertices, 12 triangles, outward winding.
+const boxPositions = new Float64Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]);
+const boxIndices = new Uint32Array([
+  0, 3, 2, 0, 2, 1, // bottom (z = 0)
+  4, 5, 6, 4, 6, 7, // top (z = 1)
+  0, 1, 5, 0, 5, 4, // front (y = 0)
+  2, 3, 7, 2, 7, 6, // back (y = 1)
+  0, 4, 7, 0, 7, 3, // left (x = 0)
+  1, 2, 6, 1, 6, 5, // right (x = 1)
+]);
+const mesh = scene.addMesh(boxPositions, boxIndices);
 
 const stl: Uint8Array = exportSTL(scene, mesh); // binary STL by default
 const stlAscii: Uint8Array = exportSTL(scene, mesh, { binary: false, name: "part" });
@@ -15,6 +31,11 @@ const obj: Uint8Array = exportOBJ(scene, mesh, { name: "part" });
 const ply: Uint8Array = exportPLY(scene, mesh); // binary little-endian
 const glb: Uint8Array = exportGLTF(scene, mesh); // binary .glb
 const gltf: Uint8Array = exportGLTF(scene, mesh, { binary: false }); // embedded-base64 .gltf JSON
+if (stl.length === 0 || obj.length === 0 || ply.length === 0 || glb.length === 0 || gltf.length === 0) {
+  throw new Error("expected bytes from every exporter");
+}
+const ascii = new TextDecoder().decode(stlAscii);
+if (!ascii.startsWith("solid part")) throw new Error("expected ASCII STL to name the solid");
 ```
 
 Options shared by every exporter (`ExportOptions`):
@@ -41,9 +62,10 @@ Details worth knowing:
 import { importGLTF, importGLTFAsync } from "fast-mesh-wasm/io";
 
 // Binary .glb, or .gltf JSON with embedded base64 buffers.
-for (const part of importGLTF(bytes)) {
+for (const part of importGLTF(glb)) {
   // { name, positions (world, Float64Array), indices, placement, colors }
-  const mesh = scene.addMesh(part.positions, part.indices);
+  const imported = scene.addMesh(part.positions, part.indices);
+  if (scene.triangleCount(imported) !== 12) throw new Error("expected the box back");
 }
 ```
 
@@ -58,17 +80,22 @@ for (const part of importGLTF(bytes)) {
   optional Draco options:
 
 ```ts
-const parts = await importGLTFAsync(bytes, {
+const parts = await importGLTFAsync(glb, {
   // decoderModule, // a ready draco3d module (reuse across calls), or
   // wasmBinary,    // the decoder .wasm bytes for bundlers/workers
 });
+if (parts.length !== 1 || parts[0].indices.length !== 36) throw new Error("expected the box back");
+scene.free();
 ```
 
 ## Standalone Draco
 
-```ts
+```ts no-run
 import { decodeDraco } from "fast-mesh-wasm/io";
 
+// drcBytes: your own .drc file's bytes (decodeDraco only runs on real
+// Draco bitstreams, so this block is not executed by the snippet test).
+declare const drcBytes: Uint8Array;
 const { positions, indices } = await decodeDraco(drcBytes);
 const mesh = scene.addMesh(positions, indices); // triangle meshes only
 ```

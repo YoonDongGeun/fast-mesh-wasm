@@ -7,10 +7,30 @@ placement (including scale) is applied, so scaled meshes measure scaled.
 ## Ruler: area and volume of one mesh
 
 ```ts
-import { Scene } from "fast-mesh-wasm";
+import { init, Scene } from "fast-mesh-wasm";
 
+await init();
 const scene = new Scene();
-const mesh = scene.addMesh(positions, indices);
+
+// A unit box: 8 vertices, 12 triangles, outward winding.
+const boxPositions = new Float64Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]);
+const boxIndices = new Uint32Array([
+  0, 3, 2, 0, 2, 1, // bottom (z = 0)
+  4, 5, 6, 4, 6, 7, // top (z = 1)
+  0, 1, 5, 0, 5, 4, // front (y = 0)
+  2, 3, 7, 2, 7, 6, // back (y = 1)
+  0, 4, 7, 0, 7, 3, // left (x = 0)
+  1, 2, 6, 1, 6, 5, // right (x = 1)
+]);
+const mesh = scene.addMesh(boxPositions, boxIndices);
+// A second box 2 units away, and a point/ray above the first.
+const b = scene.addMesh(
+  boxPositions.map((v, i) => (i % 3 === 0 ? v + 3 : v)),
+  boxIndices,
+);
+const point: [number, number, number] = [0.5, 0.5, 5];
+const origin: [number, number, number] = [0.5, 0.5, 5];
+const direction: [number, number, number] = [0, 0, -1];
 
 const m = scene.measure(mesh);
 console.log(m.area); // total triangle area, always defined
@@ -24,6 +44,10 @@ if (m.closed) {
   // direction by both triangles.
   console.log(m.volumeReason, m.boundaryLoops, m.nonManifoldEdges);
 }
+if (!m.closed || m.volume === null) throw new Error("expected a watertight mesh");
+if (Math.abs(m.area - 6) > 1e-6 || Math.abs(m.volume - 1) > 1e-6) {
+  throw new Error("expected the unit box back");
+}
 ```
 
 Notes:
@@ -31,16 +55,17 @@ Notes:
 - The volume is the absolute signed sum, so inconsistent winding only
   shows up in `orientationConflicts` while partly cancelling the number.
   For a strict reading, require `orientationConflicts === 0`.
-- Thickness (#116 follow-up: `addThicknessField`) and curvature
-  (`addCurvatureField`) build on the same mesh state; measure first to
-  confirm the mesh is closed before trusting derived fields.
+- Thickness (`addThicknessField`) and curvature (`addCurvatureField`)
+  build on the same mesh state; measure first to confirm the mesh is
+  closed before trusting derived fields.
 
 ## Gap between two meshes
 
 ```ts
 // Closest pair in world coordinates, or null when farther than maxDistance.
-const gap = scene.meshDistance(a, b, { maxDistance: 10 });
+const gap = scene.meshDistance(mesh, b, { maxDistance: 10 });
 // gap = { distance, a, b, triangleA, triangleB } — 0 when they touch.
+if (gap === null || Math.abs(gap.distance - 2) > 1e-6) throw new Error("expected a gap of 2");
 ```
 
 ## Picking and probing
@@ -57,6 +82,9 @@ const ray = scene.raycast(origin, direction, {
   cull: "none", // | "back" | "front" (triangle winding)
 });
 // ray = { mesh, triangle, point, distance, barycentric } | null
+if (hit === null || Math.abs(hit.distance - 4) > 1e-6) throw new Error("expected the box top 4 below");
+if (ray === null || Math.abs(ray.distance - 4) > 1e-6) throw new Error("expected the ray to hit the box top");
+scene.free();
 ```
 
 `direction` need not be unit length; `distance` is in world units.
