@@ -53,8 +53,9 @@ Details worth knowing:
 - Colors ride along where the mesh has them (OBJ `v r g b`, PLY
   `red green blue alpha`, glTF `COLOR_0`); normals follow through the
   inverse-transpose rotation.
-- glTF writes one node / mesh / `TRIANGLES` primitive — Draco
-  compression is not applied.
+- glTF writes one node / mesh / `TRIANGLES` primitive — uncompressed
+  by default, or Draco-compressed (`KHR_draco_mesh_compression`) with
+  `{ draco: true }`, which makes the call async.
 
 ## Import glTF
 
@@ -103,6 +104,26 @@ const mesh = scene.addMesh(positions, indices); // triangle meshes only
 
 Needs the `draco3d` package installed unless you pass a decoder module
 (or its `.wasm`) through the same options as `importGLTFAsync`.
+Encoding mirrors it: `encodeDraco` writes standalone `.drc` bytes and
+`exportGLTF` takes `{ draco: true }`, both sharing the encoder module
+(or its `.wasm`) through `encoderModule` / `wasmBinary`, plus
+quantization, compression level, and face-order options:
+
+```ts
+import { decodeDraco, encodeDraco } from "fast-mesh-wasm/io";
+
+// The same box through Draco: standalone bytes, then compressed glTF.
+const drc: Uint8Array = await encodeDraco(boxPositions, boxIndices);
+if (new TextDecoder().decode(drc.subarray(0, 5)) !== "DRACO") throw new Error("expected Draco bytes");
+const decoded = await decodeDraco(drc);
+if (decoded.indices.length !== 36) throw new Error("expected 36 corners back");
+const dracoScene = new Scene();
+const dracoMesh = dracoScene.addMesh(boxPositions, boxIndices);
+const glbDraco: Uint8Array = await exportGLTF(dracoScene, dracoMesh, { draco: true });
+const fromDraco = await importGLTFAsync(glbDraco);
+if (fromDraco.length !== 1 || fromDraco[0].indices.length !== 36) throw new Error("expected the box back");
+dracoScene.free();
+```
 
 ## External .bin buffers
 
