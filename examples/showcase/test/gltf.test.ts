@@ -4,7 +4,7 @@
 // package `dist` built, like every showcase test that touches
 // `fast-mesh-wasm`: CI builds before testing.)
 import { describe, expect, it } from "vitest";
-import { parseMeshFiles } from "../src/load/parse";
+import { parseMeshFiles, parseMeshFilesAsync } from "../src/load/parse";
 
 function f32(values: number[]): Uint8Array {
   const out = new Uint8Array(4 * values.length);
@@ -119,5 +119,42 @@ describe("parseMeshFiles gltf", () => {
   it("rejects unknown extensions and keeps the single-mesh entry single-mesh", () => {
     expect(() => parseMeshFiles("mesh.xyz", new ArrayBuffer(8))).toThrow(/\.xyz/);
     expect(() => parseMeshFiles("mesh.glb", new ArrayBuffer(0))).toThrow(/glTF/);
+  });
+});
+
+describe("parseMeshFilesAsync external buffers", () => {
+  /** The triangle asset with its buffer external, at `uri`. */
+  function externalDoc(uri: string): ArrayBuffer {
+    const bin = triangleBin();
+    const doc = triangleDoc(bin, [{ mesh: 0 }]) as { buffers: { uri: string }[] };
+    doc.buffers[0].uri = uri;
+    return jsonBytes(doc);
+  }
+
+  it("parses a .gltf with an external .bin from its sibling buffers", async () => {
+    const bin = triangleBin();
+    const [mesh] = await parseMeshFilesAsync("tri.gltf", externalDoc("tri.bin"), {
+      buffers: new Map([["tri.bin", bin.buffer as ArrayBuffer]]),
+    });
+    expect(mesh.name).toBe("tri.gltf");
+    expect(Array.from(mesh.data.positions)).toEqual([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    expect(Array.from(mesh.data.indices)).toEqual([0, 1, 2]);
+  });
+
+  it("matches a subdirectory uri against a dropped sibling by file name", async () => {
+    const bin = triangleBin();
+    const [mesh] = await parseMeshFilesAsync("tri.gltf", externalDoc("buffers/tri.bin"), {
+      buffers: new Map([["tri.bin", bin.buffer as ArrayBuffer]]),
+    });
+    expect(Array.from(mesh.data.indices)).toEqual([0, 1, 2]);
+  });
+
+  it("rejects an external .bin without its sibling", async () => {
+    await expect(parseMeshFilesAsync("tri.gltf", externalDoc("tri.bin"))).rejects.toThrow(/external/);
+    await expect(
+      parseMeshFilesAsync("tri.gltf", externalDoc("tri.bin"), {
+        buffers: new Map([["other.bin", new ArrayBuffer(8)]]),
+      }),
+    ).rejects.toThrow(/unknown external buffer "tri\.bin"/);
   });
 });

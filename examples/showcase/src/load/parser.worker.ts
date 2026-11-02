@@ -170,8 +170,20 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       postCancelled(req.id);
       return;
     }
+    // A `.gltf`/`.glb` job's sibling `.bin` files, for external buffers.
+    let buffers: Map<string, ArrayBuffer> | undefined;
+    if (req.buffers !== undefined && req.buffers.length > 0) {
+      buffers = new Map();
+      for (const sibling of req.buffers) {
+        buffers.set(sibling.name, await sibling.arrayBuffer());
+        if (isCancelled(req.id)) {
+          postCancelled(req.id);
+          return;
+        }
+      }
+    }
     post({ kind: "parsing", id: req.id });
-    const parsed = await parseMeshFilesAsync(req.file.name, buffer);
+    const parsed = await parseMeshFilesAsync(req.file.name, buffer, buffers === undefined ? undefined : { buffers });
     if (isCancelled(req.id)) {
       postCancelled(req.id);
       return;
