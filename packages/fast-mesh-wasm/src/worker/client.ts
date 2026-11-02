@@ -27,6 +27,7 @@ import type {
   FindContactsOptions,
   JoinOptions,
   JoinReport,
+  MeasureResult,
   MeshChange,
   MeshDistance,
   RaycastOptions,
@@ -1681,6 +1682,11 @@ export class WorkerScene implements SceneLike {
       () => ({ mesh: this.#live(mesh).id, options }),
       (v) => v as Analysis,
     );
+  }
+
+  /** Scalar measurements of a mesh; see `Scene.measure`. */
+  measure(mesh: MeshHandle): Promise<MeasureResult> {
+    return this.#query("measure", () => ({ mesh: this.#live(mesh).id }), (v) => v);
   }
 
   /** Runs one repair operation, or a list as one transaction; see `Scene.repair`. */

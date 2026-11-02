@@ -1904,6 +1904,10 @@ class Engine {
         const a = args as QueryMap["analyze"]["args"];
         return s.analyze(this.#mesh(a.mesh), a.options);
       }
+      case "measure": {
+        const a = args as QueryMap["measure"]["args"];
+        return s.measure(this.#mesh(a.mesh));
+      }
       case "fieldTargetStatus": {
         const a = args as QueryMap["fieldTargetStatus"]["args"];
         return s.fieldTargetStatus(this.#field(a.field));

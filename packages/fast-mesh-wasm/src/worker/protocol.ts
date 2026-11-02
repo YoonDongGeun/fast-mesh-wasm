@@ -10,6 +10,7 @@ import type {
   ColorRule,
   DistanceFieldDesc,
   EditOp,
+  MeasureResult,
   RaycastOptions,
   RepairOp,
   SectionPlane,
@@ -154,6 +155,7 @@ export interface QueryMap {
     }[];
   };
   analyze: { args: { mesh: ClientId; options?: AnalyzeOptions }; value: unknown };
+  measure: { args: { mesh: ClientId }; value: MeasureResult };
   fieldStatus: { args: { field: ClientId }; value: unknown };
   fieldNearest: { args: { field: ClientId }; value: unknown };
   fieldTargetStatus: { args: { field: ClientId }; value: unknown };
