@@ -25,8 +25,8 @@ use fast_mesh_bvh::Bvh;
 use fast_mesh_query::{Cull, RayOptions, raycast_many};
 use fast_mesh_store::Mesh;
 
-use crate::Result;
 use crate::FieldsError;
+use crate::Result;
 
 /// A thickness that is this fraction of the mesh's coordinate magnitude, or
 /// less, is skipped as a self-hit: `32 * f32::EPSILON` times the largest
@@ -126,7 +126,9 @@ pub fn thicknesses(mesh: &Mesh, bvh: &Bvh, max_distance: f32, out: &mut [f32]) -
         let defined = mesh.is_vertex_alive(v)
             && mesh.corner_count(v) > 0
             && n != [0.0; 3]
-            && mesh.position(v).is_some_and(|p| p.iter().all(|c| c.is_finite()));
+            && mesh
+                .position(v)
+                .is_some_and(|p| p.iter().all(|c| c.is_finite()));
         if !defined {
             continue;
         }
@@ -154,19 +156,11 @@ pub fn thicknesses(mesh: &Mesh, bvh: &Bvh, max_distance: f32, out: &mut [f32]) -
             (_, None) => {}
             // A hit where none was: the distance, far when past the bound.
             (true, Some(t)) => {
-                out[v as usize] = if t > max_distance {
-                    f32::INFINITY
-                } else {
-                    t
-                };
+                out[v as usize] = if t > max_distance { f32::INFINITY } else { t };
             }
             // The nearer of the pair, far when past the bound.
             (false, Some(t)) => {
-                let got = if t > max_distance {
-                    f32::INFINITY
-                } else {
-                    t
-                };
+                let got = if t > max_distance { f32::INFINITY } else { t };
                 if got < cur {
                     out[v as usize] = got;
                 }
@@ -238,8 +232,14 @@ mod tests {
         let mut tris = Vec::new();
         for y in 0..n {
             for x in 0..n {
-                tris.extend([[t(x, y), t(x + 1, y), t(x + 1, y + 1)], [t(x, y), t(x + 1, y + 1), t(x, y + 1)]]);
-                tris.extend([[b(x, y), b(x + 1, y + 1), b(x + 1, y)], [b(x, y), b(x, y + 1), b(x + 1, y + 1)]]);
+                tris.extend([
+                    [t(x, y), t(x + 1, y), t(x + 1, y + 1)],
+                    [t(x, y), t(x + 1, y + 1), t(x, y + 1)],
+                ]);
+                tris.extend([
+                    [b(x, y), b(x + 1, y + 1), b(x + 1, y)],
+                    [b(x, y), b(x, y + 1), b(x + 1, y + 1)],
+                ]);
             }
         }
         for x in 0..n {

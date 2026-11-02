@@ -1383,7 +1383,12 @@ impl Scene {
             .iter()
             .filter(|f| f.desc.on == mesh)
             .map(|f| f.id)
-            .chain(self.thick.iter().filter(|f| f.desc.on == mesh).map(|f| f.id))
+            .chain(
+                self.thick
+                    .iter()
+                    .filter(|f| f.desc.on == mesh)
+                    .map(|f| f.id),
+            )
             .chain(self.curv.iter().filter(|f| f.desc.on == mesh).map(|f| f.id))
             .collect())
     }
@@ -3762,7 +3767,10 @@ mod tests {
         let mut pos = Vec::new();
         for y in 0..=n {
             for x in 0..=n {
-                let (fx, fy) = (x as f32 / n as f32 * 2.0 - 1.0, y as f32 / n as f32 * 2.0 - 1.0);
+                let (fx, fy) = (
+                    x as f32 / n as f32 * 2.0 - 1.0,
+                    y as f32 / n as f32 * 2.0 - 1.0,
+                );
                 pos.extend_from_slice(&[fx, fy, (2.0 * fx * fx - fy * fy) / s]);
             }
         }
@@ -5691,7 +5699,13 @@ mod tests {
         // Colouring by it works like any field.
         let rule = thick_rule(0.0, 1.0);
         scene
-            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .set_coloring(
+                m,
+                Some(Coloring {
+                    field: id,
+                    rule: rule.clone(),
+                }),
+            )
             .unwrap();
         assert_colors(&scene, m, &rule, id);
     }
@@ -5700,7 +5714,9 @@ mod tests {
     fn thickness_open_sheet_reads_nan() {
         // An open sheet has no opposite surface: every vertex reads NaN.
         let mut scene = Scene::new(SceneOptions::default());
-        let m = scene.add_mesh(sheet(4, 0.5), MeshOptions::default()).unwrap();
+        let m = scene
+            .add_mesh(sheet(4, 0.5), MeshOptions::default())
+            .unwrap();
         let id = scene
             .add_thickness_field(thick("t", m, f64::INFINITY))
             .unwrap();
@@ -5710,7 +5726,13 @@ mod tests {
         // NaN colours show the rule's nan colour.
         let rule = thick_rule(0.0, 1.0);
         scene
-            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .set_coloring(
+                m,
+                Some(Coloring {
+                    field: id,
+                    rule: rule.clone(),
+                }),
+            )
             .unwrap();
         assert_colors(&scene, m, &rule, id);
         for c in scene.colors(m).unwrap().unwrap() {
@@ -5723,7 +5745,13 @@ mod tests {
         let mut scene = Scene::new(SceneOptions::default());
         let m = scene.add_mesh(plate(2), MeshOptions::default()).unwrap();
         let id = scene.add_thickness_field(thick("t", m, 0.1)).unwrap();
-        assert!(scene.field_values(id).unwrap().iter().all(|&v| v == f32::INFINITY));
+        assert!(
+            scene
+                .field_values(id)
+                .unwrap()
+                .iter()
+                .all(|&v| v == f32::INFINITY)
+        );
         // Reconfiguring widens the bound (the sign is ignored: thickness
         // has none).
         scene
@@ -5735,7 +5763,13 @@ mod tests {
         scene
             .reconfigure_field(id, 0.1, SignMode::Pseudonormal)
             .unwrap();
-        assert!(scene.field_values(id).unwrap().iter().all(|&v| v == f32::INFINITY));
+        assert!(
+            scene
+                .field_values(id)
+                .unwrap()
+                .iter()
+                .all(|&v| v == f32::INFINITY)
+        );
         assert!(scene.field_status(id).unwrap().current);
     }
 
@@ -5778,7 +5812,10 @@ mod tests {
         scene.set_coloring(m, None).unwrap();
         assert!(!scene.withdraw_field(id).unwrap());
         scene.remove_field(id).unwrap();
-        assert!(matches!(scene.field_values(id), Err(SceneError::UnknownField)));
+        assert!(matches!(
+            scene.field_values(id),
+            Err(SceneError::UnknownField)
+        ));
         // A deferred field withdraws before it computes.
         let late = scene
             .add_thickness_field_deferred(thick("late", m, 1.0))
@@ -5829,9 +5866,7 @@ mod tests {
         for &v in &interior {
             assert!((scene.field_values(id).unwrap()[v as usize] - 1.0).abs() < 1e-3);
         }
-        scene
-            .set_placement(m, Placement::IDENTITY)
-            .unwrap();
+        scene.set_placement(m, Placement::IDENTITY).unwrap();
         // Raising a top vertex reshapes the plate and its thicknesses.
         let before = scene.field_values(id).unwrap().to_vec();
         scene
@@ -5846,9 +5881,7 @@ mod tests {
     #[test]
     fn thickness_steps_in_full() {
         let mut scene = Scene::new(SceneOptions::default());
-        let m = scene
-            .add_mesh(plate(2), MeshOptions::default())
-            .unwrap();
+        let m = scene.add_mesh(plate(2), MeshOptions::default()).unwrap();
         let id = scene
             .add_thickness_field_deferred(thick("t", m, f64::INFINITY))
             .unwrap();
@@ -5858,7 +5891,13 @@ mod tests {
             Ok(StepState::Done)
         );
         assert!(scene.field_status(id).unwrap().current);
-        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        assert!(
+            scene
+                .field_values(id)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
         // Stepping a current field idles.
         assert_eq!(
             scene.field_step_field(id, FieldBudget::Points(1)),
@@ -5881,7 +5920,12 @@ mod tests {
         assert!(!lazy.field_status(lid).unwrap().current);
         lazy.flush().unwrap();
         assert!(lazy.field_status(lid).unwrap().current);
-        assert!(lazy.field_values(lid).unwrap().iter().all(|v| v.is_finite()));
+        assert!(
+            lazy.field_values(lid)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]
@@ -5909,7 +5953,13 @@ mod tests {
         // Colouring by it works like any field.
         let rule = thick_rule(-1.0, 2.0);
         scene
-            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .set_coloring(
+                m,
+                Some(Coloring {
+                    field: id,
+                    rule: rule.clone(),
+                }),
+            )
             .unwrap();
         assert_colors(&scene, m, &rule, id);
     }
@@ -5918,7 +5968,9 @@ mod tests {
     fn curvature_plane_reads_zero_and_saddle_negative() {
         let mut scene = Scene::new(SceneOptions::default());
         // A flat sheet reads 0 everywhere, boundary fan included.
-        let flat = scene.add_mesh(sheet(8, 0.25), MeshOptions::default()).unwrap();
+        let flat = scene
+            .add_mesh(sheet(8, 0.25), MeshOptions::default())
+            .unwrap();
         let fid = scene.add_curvature_field(curv("k", flat)).unwrap();
         for &v in scene.field_values(fid).unwrap().iter() {
             assert!(v.is_finite());
@@ -5926,7 +5978,9 @@ mod tests {
         }
         // A saddle reads the sign of its dominant bend: about -1/s at the
         // middle, finite at the one-sided rim.
-        let m = scene.add_mesh(saddle(32, 4.0), MeshOptions::default()).unwrap();
+        let m = scene
+            .add_mesh(saddle(32, 4.0), MeshOptions::default())
+            .unwrap();
         let id = scene.add_curvature_field(curv("k", m)).unwrap();
         let values = scene.field_values(id).unwrap();
         assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
@@ -5937,7 +5991,13 @@ mod tests {
         // but the rule still applies).
         let rule = thick_rule(-1.0, 1.0);
         scene
-            .set_coloring(m, Some(Coloring { field: id, rule: rule.clone() }))
+            .set_coloring(
+                m,
+                Some(Coloring {
+                    field: id,
+                    rule: rule.clone(),
+                }),
+            )
             .unwrap();
         assert_colors(&scene, m, &rule, id);
     }
@@ -6006,17 +6066,26 @@ mod tests {
         // Reconfiguring marks the field for recompute (both settings are
         // ignored: a curvature has neither).
         let id = scene.field_id(1).unwrap();
-        scene
-            .reconfigure_field(id, 0.5, SignMode::Winding)
-            .unwrap();
+        scene.reconfigure_field(id, 0.5, SignMode::Winding).unwrap();
         assert!(scene.field_status(id).unwrap().current);
-        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        assert!(
+            scene
+                .field_values(id)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
         // Removing the mesh removes the field.
         scene.remove_mesh(m).unwrap();
-        assert!(matches!(scene.field_values(id), Err(SceneError::UnknownField)));
+        assert!(matches!(
+            scene.field_values(id),
+            Err(SceneError::UnknownField)
+        ));
         // A deferred field withdraws before it computes.
         let m2 = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
-        let late = scene.add_curvature_field_deferred(curv("late", m2)).unwrap();
+        let late = scene
+            .add_curvature_field_deferred(curv("late", m2))
+            .unwrap();
         assert!(scene.withdraw_field(late).unwrap());
         assert!(matches!(
             scene.field_values(late),
@@ -6035,7 +6104,13 @@ mod tests {
             Ok(StepState::Done)
         );
         assert!(scene.field_status(id).unwrap().current);
-        assert!(scene.field_values(id).unwrap().iter().all(|v| v.is_finite()));
+        assert!(
+            scene
+                .field_values(id)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
         // Stepping a current field idles.
         assert_eq!(
             scene.field_step_field(id, FieldBudget::Points(1)),
@@ -6056,7 +6131,12 @@ mod tests {
         assert!(!lazy.field_status(lid).unwrap().current);
         lazy.flush().unwrap();
         assert!(lazy.field_status(lid).unwrap().current);
-        assert!(lazy.field_values(lid).unwrap().iter().all(|v| v.is_finite()));
+        assert!(
+            lazy.field_values(lid)
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]
@@ -6215,7 +6295,8 @@ mod tests {
                     .unwrap();
             }),
             ("add_thickness_field", |s, x| {
-                s.add_thickness_field(thick("e", x.c, f64::INFINITY)).unwrap();
+                s.add_thickness_field(thick("e", x.c, f64::INFINITY))
+                    .unwrap();
             }),
             ("add_thickness_field_deferred", |s, x| {
                 s.add_thickness_field_deferred(thick("e", x.c, f64::INFINITY))

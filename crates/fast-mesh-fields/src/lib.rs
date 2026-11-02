@@ -35,9 +35,9 @@ mod error;
 mod geom;
 mod multi;
 mod sign;
-mod thickness;
 #[cfg(test)]
 mod test_util;
+mod thickness;
 mod winding;
 
 pub use color::{ColorRule, Colormap, OutOfRange, color_of};

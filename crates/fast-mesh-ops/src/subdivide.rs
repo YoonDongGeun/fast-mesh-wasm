@@ -142,9 +142,12 @@ fn step(pos: &mut Vec<[f32; 3]>, vlive: &mut Vec<bool>, tris: &mut Vec<WorkTri>)
     // Edge entries `(edge, triangle, apex)`, sorted by edge so each group is
     // one unique edge with its owners.
     let mut entries: Vec<((u32, u32), u32, u32)> = Vec::new();
-    reserve(&mut entries, clean.checked_mul(3).ok_or(
-        crate::OpsError::Store(fast_mesh_store::StoreError::OutOfMemory),
-    )?)?;
+    reserve(
+        &mut entries,
+        clean.checked_mul(3).ok_or(crate::OpsError::Store(
+            fast_mesh_store::StoreError::OutOfMemory,
+        ))?,
+    )?;
     for (i, tri) in tris.iter().enumerate() {
         if !tri.clean {
             continue;
@@ -297,12 +300,7 @@ fn step(pos: &mut Vec<[f32; 3]>, vlive: &mut Vec<bool>, tris: &mut Vec<WorkTri>)
         }
         let [a, b, c] = tri.corners;
         let (ab, bc, ca) = (edge_id(a, b), edge_id(b, c), edge_id(c, a));
-        let children = [
-            [a, ab, ca],
-            [b, bc, ab],
-            [c, ca, bc],
-            [ab, bc, ca],
-        ];
+        let children = [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]];
         for (j, corners) in children.into_iter().enumerate() {
             push(
                 &mut next,
@@ -337,7 +335,9 @@ fn step(pos: &mut Vec<[f32; 3]>, vlive: &mut Vec<bool>, tris: &mut Vec<WorkTri>)
 /// memory runs out.
 pub fn subdivide(tx: &mut Transaction, options: &SubdivideOptions) -> Result<SubdivideReport> {
     if options.levels == 0 {
-        return Err(OpsError::InvalidInput("subdivide levels must be at least 1"));
+        return Err(OpsError::InvalidInput(
+            "subdivide levels must be at least 1",
+        ));
     }
     let _ = options.method;
     let mesh = tx.mesh();
@@ -585,7 +585,9 @@ mod tests {
             let mut tx = mesh.begin_edit();
             assert_eq!(
                 subdivide(&mut tx, &SubdivideOptions::builder().levels(0).build()),
-                Err(OpsError::InvalidInput("subdivide levels must be at least 1"))
+                Err(OpsError::InvalidInput(
+                    "subdivide levels must be at least 1"
+                ))
             );
         }
         // An empty mesh succeeds without writing.
@@ -594,7 +596,10 @@ mod tests {
         let (report, empty) = edit(&mut empty_mesh, |tx| {
             subdivide(tx, &SubdivideOptions::builder().levels(1).build())
         });
-        assert_eq!((report.vertices_added, report.triangles_added, empty), (0, 0, true));
+        assert_eq!(
+            (report.vertices_added, report.triangles_added, empty),
+            (0, 0, true)
+        );
         assert_eq!(parts(&empty_mesh), before);
         // Degenerate triangles ride through untouched.
         let mut degenerate = mesh_of(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[[0, 0, 1]]);
@@ -602,7 +607,10 @@ mod tests {
         let (report, empty) = edit(&mut degenerate, |tx| {
             subdivide(tx, &SubdivideOptions::builder().levels(1).build())
         });
-        assert_eq!((report.vertices_added, report.triangles_added, empty), (0, 0, true));
+        assert_eq!(
+            (report.vertices_added, report.triangles_added, empty),
+            (0, 0, true)
+        );
         assert_eq!(parts(&degenerate), before);
     }
 

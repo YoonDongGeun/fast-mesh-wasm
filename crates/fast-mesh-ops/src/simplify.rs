@@ -219,7 +219,14 @@ fn optimal_position(q: &Quadric, a: [f64; 3], b: [f64; 3]) -> ([f64; 3], f64) {
         if p.iter().all(|c| c.is_finite()) {
             let cost = quad_error(q, p);
             if cost.is_finite() {
-                return (p, if cost < 0.0 && cost > -1e-9 { 0.0 } else { cost });
+                return (
+                    p,
+                    if cost < 0.0 && cost > -1e-9 {
+                        0.0
+                    } else {
+                        cost
+                    },
+                );
             }
         }
     }
@@ -354,9 +361,11 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
     quadrics.resize(slots, [0.0; 10]);
     for tri in &tris {
         let c = tri.corners;
-        let q = face_quadric(f64v(&positions[c[0] as usize]), f64v(&positions[c[1] as usize]), f64v(
-            &positions[c[2] as usize],
-        ));
+        let q = face_quadric(
+            f64v(&positions[c[0] as usize]),
+            f64v(&positions[c[1] as usize]),
+            f64v(&positions[c[2] as usize]),
+        );
         for &v in &c {
             for k in 0..10 {
                 quadrics[v as usize][k] += q[k];
@@ -411,7 +420,11 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         for k in 0..10 {
             q[k] = quadrics[a as usize][k] + quadrics[b as usize][k];
         }
-        let (_, cost) = optimal_position(&q, f64v(&positions[a as usize]), f64v(&positions[b as usize]));
+        let (_, cost) = optimal_position(
+            &q,
+            f64v(&positions[a as usize]),
+            f64v(&positions[b as usize]),
+        );
         heap.push(HeapEntry { cost, a, b });
     }
 
@@ -443,11 +456,7 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         let pb = f64v(&positions[b as usize]);
         let (pnew, fresh) = optimal_position(&qsum, pa, pb);
         if fresh > top.cost + 1e-9 * (1.0 + top.cost.abs()) {
-            heap.push(HeapEntry {
-                cost: fresh,
-                a,
-                b,
-            });
+            heap.push(HeapEntry { cost: fresh, a, b });
             continue;
         }
         // Link condition: the common neighbours must be exactly the apexes
@@ -502,7 +511,11 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
                 }
             }
         }
-        let keep_pos = [f64::from(pnew32[0]), f64::from(pnew32[1]), f64::from(pnew32[2])];
+        let keep_pos = [
+            f64::from(pnew32[0]),
+            f64::from(pnew32[1]),
+            f64::from(pnew32[2]),
+        ];
         let mut folds = false;
         for &i in &fan {
             let old = tris[i].corners;
@@ -565,7 +578,8 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         }
         scratch.sort_unstable();
         for &w in scratch.iter() {
-            if options.preserve_boundary && (is_boundary[keep as usize] || is_boundary[w as usize]) {
+            if options.preserve_boundary && (is_boundary[keep as usize] || is_boundary[w as usize])
+            {
                 continue;
             }
             let (lo, hi) = key(keep, w);
@@ -573,7 +587,11 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
             for k in 0..10 {
                 q[k] = quadrics[lo as usize][k] + quadrics[hi as usize][k];
             }
-            let (_, cost) = optimal_position(&q, f64v(&positions[lo as usize]), f64v(&positions[hi as usize]));
+            let (_, cost) = optimal_position(
+                &q,
+                f64v(&positions[lo as usize]),
+                f64v(&positions[hi as usize]),
+            );
             heap.push(HeapEntry { cost, a: lo, b: hi });
         }
     }
@@ -605,7 +623,9 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         if !tri.alive {
             n_dead_tri += 1;
         } else {
-            let current = mesh.triangle(tri.id).expect("simplify: working id must exist");
+            let current = mesh
+                .triangle(tri.id)
+                .expect("simplify: working id must exist");
             if current != tri.corners {
                 n_rewired += 1;
             }
@@ -629,7 +649,9 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         if !tri.alive {
             del_t.push(tri.id);
         } else {
-            let current = mesh.triangle(tri.id).expect("simplify: working id must exist");
+            let current = mesh
+                .triangle(tri.id)
+                .expect("simplify: working id must exist");
             if current != tri.corners {
                 set_t.push(tri.id);
                 set_t_to.push(tri.corners);
@@ -699,14 +721,15 @@ mod tests {
         let before = live_count(&mesh);
         assert!(before > 100, "fixture too small: {before}");
         let target = before / 2;
-        let options = SimplifyOptions::builder()
-            .target_triangles(target)
-            .build();
+        let options = SimplifyOptions::builder().target_triangles(target).build();
         let (report, empty) = edit(&mut mesh, |tx| simplify(tx, &options));
         assert!(!empty);
         assert!(report.collapsed > 0, "expected collapses, got {report:?}");
         let now = live_count(&mesh);
-        assert!(now <= target, "expected at most {target} triangles, got {now}");
+        assert!(
+            now <= target,
+            "expected at most {target} triangles, got {now}"
+        );
         assert!(now > 0, "must keep some triangles");
         assert_no_degenerate(&mesh);
     }
@@ -801,7 +824,10 @@ mod tests {
         assert_eq!((report.collapsed, empty), (0, true));
         assert_eq!(parts(&mesh), before);
         let (report, empty) = edit(&mut mesh, |tx| {
-            simplify(tx, &SimplifyOptions::builder().target_triangles(10_000).build())
+            simplify(
+                tx,
+                &SimplifyOptions::builder().target_triangles(10_000).build(),
+            )
         });
         assert_eq!((report.collapsed, empty), (0, true));
         assert_eq!(parts(&mesh), before);
@@ -810,10 +836,7 @@ mod tests {
     #[test]
     fn simplify_sweep_keeps_atomicity() {
         let n = sweep(grid(4), |tx: &mut Transaction| {
-            simplify(
-                tx,
-                &SimplifyOptions::builder().target_triangles(16).build(),
-            )?;
+            simplify(tx, &SimplifyOptions::builder().target_triangles(16).build())?;
             Ok(())
         });
         assert!(n > 0);

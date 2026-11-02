@@ -599,8 +599,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 return Err(Error::invalid("levels is too large"));
             }
             let levels = count_opt(levels, "levels")?.unwrap_or(1);
-            let levels = u32::try_from(levels)
-                .map_err(|_| Error::invalid("levels is too large"))?;
+            let levels =
+                u32::try_from(levels).map_err(|_| Error::invalid("levels is too large"))?;
             if levels == 0 {
                 return Err(Error::invalid("levels must be at least 1"));
             }
@@ -798,7 +798,10 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             }
             RepairOp::Subdivide(o) => {
                 let r = fast_mesh_ops::subdivide::subdivide(tx, o)?;
-                put(&mut out, &[count(r.vertices_added), count(r.triangles_added)])?;
+                put(
+                    &mut out,
+                    &[count(r.vertices_added), count(r.triangles_added)],
+                )?;
             }
         }
     }
@@ -1262,10 +1265,7 @@ mod tests {
         assert_eq!(code(&[14., 0., 0.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[14., 0., 1.5]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[14., 0., -1.]), codes::INVALID_ARGUMENT);
-        assert_eq!(
-            code(&[14., 0., 2f64.powi(32)]),
-            codes::INVALID_ARGUMENT
-        );
+        assert_eq!(code(&[14., 0., 2f64.powi(32)]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[14., 0., 1., 0.]), codes::INVALID_ARGUMENT);
     }
 }

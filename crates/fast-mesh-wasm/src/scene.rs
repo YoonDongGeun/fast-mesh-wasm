@@ -906,8 +906,7 @@ impl WasmScene {
         let mesh = self.scene.mesh(id)?;
         let placement = self.scene.placement(id)?;
         let origin = mesh.origin();
-        let m =
-            measure_placed(mesh, origin, |p| placement.apply(p)).map_err(SceneError::from)?;
+        let m = measure_placed(mesh, origin, |p| placement.apply(p)).map_err(SceneError::from)?;
         let reason = match m.volume_reason {
             None => 0.0,
             Some(VolumeReason::Open) => 1.0,
@@ -1310,10 +1309,7 @@ impl WasmScene {
         if ids.len() != 1 {
             return Err(Error::invalid("a curvature field needs one mesh"));
         }
-        let desc = CurvatureField {
-            name,
-            on: ids[0],
-        };
+        let desc = CurvatureField { name, on: ids[0] };
         Ok(self.scene.add_curvature_field(desc)?.raw())
     }
 
@@ -1325,10 +1321,7 @@ impl WasmScene {
         if ids.len() != 1 {
             return Err(Error::invalid("a curvature field needs one mesh"));
         }
-        let desc = CurvatureField {
-            name,
-            on: ids[0],
-        };
+        let desc = CurvatureField { name, on: ids[0] };
         Ok(self.scene.add_curvature_field_deferred(desc)?.raw())
     }
 
@@ -2156,7 +2149,9 @@ mod tests {
         let mut s = WasmScene::new();
         // The unit cube's corners read in [2, 2 sqrt(3)] locally.
         let (i, g) = octahedron(&mut s, [0., 0., 0.], 1.);
-        let f = s.add_thickness_field("t".into(), &[i, g], f64::INFINITY).unwrap();
+        let f = s
+            .add_thickness_field("t".into(), &[i, g], f64::INFINITY)
+            .unwrap();
         let values = s.scene.field_values(s.field(f).unwrap()).unwrap().to_vec();
         assert_eq!(values.len(), 6);
         // Every vertex reads the diameter, 2: each normal ray crosses the
@@ -2175,11 +2170,16 @@ mod tests {
         }
         // An open quad reads NaN everywhere.
         let (j, h) = add(&mut s, false);
-        let of = s.add_thickness_field("t".into(), &[j, h], f64::INFINITY).unwrap();
+        let of = s
+            .add_thickness_field("t".into(), &[j, h], f64::INFINITY)
+            .unwrap();
         let open = s.scene.field_values(s.field(of).unwrap()).unwrap().to_vec();
         assert!(open.iter().all(|v| v.is_nan()), "{open:?}");
         // Malformed input.
-        assert_eq!(code(s.add_thickness_field("e".into(), &[], 1.)), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.add_thickness_field("e".into(), &[], 1.)),
+            codes::INVALID_ARGUMENT
+        );
         assert_eq!(
             code(s.add_thickness_field("e".into(), &[i, g, j], 1.)),
             codes::INVALID_ARGUMENT
@@ -2188,7 +2188,10 @@ mod tests {
             code(s.add_thickness_field("e".into(), &[i + 9, g], 1.)),
             codes::UNKNOWN_MESH
         );
-        assert_eq!(code(s.add_thickness_field("e".into(), &[i, g], -1.)), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.add_thickness_field("e".into(), &[i, g], -1.)),
+            codes::INVALID_ARGUMENT
+        );
     }
 
     #[test]
@@ -2222,7 +2225,10 @@ mod tests {
             assert!(v.abs() < 1e-6, "{open:?}");
         }
         // Malformed input.
-        assert_eq!(code(s.add_curvature_field("e".into(), &[])), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(s.add_curvature_field("e".into(), &[])),
+            codes::INVALID_ARGUMENT
+        );
         assert_eq!(
             code(s.add_curvature_field("e".into(), &[i, g, j])),
             codes::INVALID_ARGUMENT

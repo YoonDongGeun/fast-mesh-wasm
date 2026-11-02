@@ -69,8 +69,8 @@ mod orient;
 mod refine;
 pub mod remesh;
 pub mod simplify;
-pub mod subdivide;
 mod sparse;
+pub mod subdivide;
 #[cfg(test)]
 mod test_util;
 mod topology;

@@ -30,8 +30,8 @@
 
 use fast_mesh_store::Mesh;
 
-use crate::Result;
 use crate::FieldsError;
+use crate::Result;
 
 /// Per-vertex signed mean curvature of `mesh`: `out[v]` gets the value for
 /// vertex slot `v` (see the module docs), in 1/local-units. `out` must hold
@@ -51,7 +51,9 @@ pub fn curvatures(mesh: &Mesh, out: &mut [f32]) -> Result<()> {
     // neighbour order (deterministic sums); barycentric areas; smooth
     // (area-weighted) normals.
     let mut neighbours: Vec<Vec<(u32, f64)>> = Vec::new();
-    neighbours.try_reserve_exact(slots).map_err(|_| FieldsError::OutOfMemory)?;
+    neighbours
+        .try_reserve_exact(slots)
+        .map_err(|_| FieldsError::OutOfMemory)?;
     neighbours.resize(slots, Vec::new());
     let mut areas = vec![0.0f64; slots];
     let mut normals = vec![[0.0f64; 3]; slots];
@@ -191,7 +193,10 @@ mod tests {
         let mut positions = Vec::new();
         for y in 0..=n {
             for x in 0..=n {
-                let (fx, fy) = (x as f32 / n as f32 * 2.0 - 1.0, y as f32 / n as f32 * 2.0 - 1.0);
+                let (fx, fy) = (
+                    x as f32 / n as f32 * 2.0 - 1.0,
+                    y as f32 / n as f32 * 2.0 - 1.0,
+                );
                 positions.push([fx, fy, (2.0 * fx * fx - fy * fy) / s]);
             }
         }
@@ -218,7 +223,9 @@ mod tests {
         // float rounding of the doubled positions.
         let (p, t) = (m.positions().to_vec(), m.triangles().to_vec());
         let big = mesh(
-            &p.iter().map(|q| [q[0] * 2.0, q[1] * 2.0, q[2] * 2.0]).collect::<Vec<_>>(),
+            &p.iter()
+                .map(|q| [q[0] * 2.0, q[1] * 2.0, q[2] * 2.0])
+                .collect::<Vec<_>>(),
             &t,
         );
         for (&v, &w) in out.iter().zip(run(&big).iter()) {
@@ -262,7 +269,11 @@ mod tests {
     fn flipped_winding_negates() {
         // The sign follows the normals: flipping every triangle negates it.
         let m = icosphere();
-        let t = m.triangles().iter().map(|&[a, b, c]| [a, c, b]).collect::<Vec<_>>();
+        let t = m
+            .triangles()
+            .iter()
+            .map(|&[a, b, c]| [a, c, b])
+            .collect::<Vec<_>>();
         let flipped = mesh(m.positions(), &t);
         let (a, b) = (run(&m), run(&flipped));
         for (&x, &y) in a.iter().zip(&b) {

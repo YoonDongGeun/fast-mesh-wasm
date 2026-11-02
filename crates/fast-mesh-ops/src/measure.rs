@@ -204,7 +204,11 @@ mod tests {
         assert!(m.signed_volume.abs() - 1.0 < 1e-12);
         assert!(m.closed && m.volume_reason.is_none());
         assert_eq!(
-            (m.boundary_loops, m.non_manifold_edges, m.orientation_conflicts),
+            (
+                m.boundary_loops,
+                m.non_manifold_edges,
+                m.orientation_conflicts
+            ),
             (0, 0, 0)
         );
     }
@@ -272,13 +276,11 @@ mod tests {
         assert!((m.area - 24.0).abs() < 1e-9, "area {}", m.area);
         assert!((m.volume.unwrap() - 8.0).abs() < 1e-9, "{m:?}");
         // Non-uniform scales are exact too: 2 x 1 x 1 doubles both.
-        let m =
-            measure_placed(&mesh, [0.0; 3], |p| [2.0 * p[0], p[1], p[2]]).unwrap();
+        let m = measure_placed(&mesh, [0.0; 3], |p| [2.0 * p[0], p[1], p[2]]).unwrap();
         assert!((m.area - 10.0).abs() < 1e-9, "area {}", m.area);
         assert!((m.volume.unwrap() - 2.0).abs() < 1e-9, "{m:?}");
         // A translation alone changes nothing.
-        let m =
-            measure_placed(&mesh, [0.0; 3], |p| [p[0] + 5.0, p[1] - 3.0, p[2] + 1.0]).unwrap();
+        let m = measure_placed(&mesh, [0.0; 3], |p| [p[0] + 5.0, p[1] - 3.0, p[2] + 1.0]).unwrap();
         assert!((m.area - 6.0).abs() < 1e-12);
         assert!((m.volume.unwrap() - 1.0).abs() < 1e-12);
     }

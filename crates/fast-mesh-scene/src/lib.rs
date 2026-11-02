@@ -107,7 +107,9 @@ pub use fast_mesh_fields::{
 };
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
-pub use fields::{Coloring, CurvatureField, DistanceField, FieldBudget, FieldStatus, StepState, ThicknessField};
+pub use fields::{
+    Coloring, CurvatureField, DistanceField, FieldBudget, FieldStatus, StepState, ThicknessField,
+};
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;
