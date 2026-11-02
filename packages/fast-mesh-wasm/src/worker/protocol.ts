@@ -67,7 +67,16 @@ export type Request =
       key?: string;
     }
   | { kind: "removeMesh" | "compact"; rev: number; id: ClientId; key?: string }
-  | { kind: "setPlacement"; rev: number; id: ClientId; rotation: number[]; translation: number[]; key: string }
+  | {
+      kind: "setPlacement";
+      rev: number;
+      id: ClientId;
+      rotation: number[];
+      translation: number[];
+      /** Per-axis scale, 3 numbers; `[1, 1, 1]` when omitted. */
+      scale?: number[];
+      key: string;
+    }
   | {
       kind: "drag";
       rev: number;
@@ -76,6 +85,8 @@ export type Request =
       /** For `move`, and optionally `end` (a last move before ending). */
       rotation?: number[];
       translation?: number[];
+      /** The move's per-axis scale, 3 numbers; `[1, 1, 1]` when omitted. */
+      scale?: number[];
       key: string;
     }
   | {
@@ -172,7 +183,7 @@ export interface QueryMap {
       colors: Uint8Array | null;
       values: Float32Array | null;
       indices: Uint32Array;
-      placement: { rotation: number[]; translation: Vec3 };
+      placement: { rotation: number[]; translation: Vec3; scale: Vec3 };
       matrix4: number[];
     };
   };
@@ -234,7 +245,7 @@ export interface Result {
   /** Change records, ranges applied in order; never drop them. */
   changes: MeshChangeWire[];
   /** Placement and `matrix4` (column-major) of every mesh added or moved. */
-  placements: { id: ClientId; rotation: number[]; translation: number[]; matrix4: number[] }[];
+  placements: { id: ClientId; rotation: number[]; translation: number[]; scale: number[]; matrix4: number[] }[];
   /**
    * Every changed section entry. `result` is `null` once the entry is gone:
    * the section was removed, no longer cuts the mesh, or the mesh was
