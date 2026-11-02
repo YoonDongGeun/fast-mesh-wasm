@@ -217,6 +217,7 @@ fn placement(xf: &Rigid) -> Placement {
     Placement {
         rotation: xf.rotation,
         translation: xf.translation,
+        scale: [1.0; 3],
     }
 }
 
