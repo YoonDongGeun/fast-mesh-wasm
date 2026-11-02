@@ -918,14 +918,14 @@ function checkedEncodeIndices(indices: ArrayLike<number>, vertices: number): Uin
 /** Copies normals to f32 (`null` without), checking length and finiteness. */
 function checkedEncodeNormals(
   normals: ArrayLike<number> | null | undefined,
-  positions: number,
+  positionsLength: number,
 ): Float32Array | null {
   if (normals === null || normals === undefined) {
     return null;
   }
-  if (normals.length !== positions) {
+  if (normals.length !== positionsLength) {
     throw new Error(
-      `Draco: normals need 3 numbers per vertex (got length ${normals.length} for ${positions / 3} vertices)`,
+      `Draco: normals need 3 numbers per vertex (got length ${normals.length} for ${positionsLength / 3} vertices)`,
     );
   }
   const out = Float32Array.from(normals);
