@@ -70,6 +70,27 @@ function docWithUris(uris: (string | null)[]): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(doc));
 }
 
+/** A binary `.glb` of the JSON document and its body chunk. */
+function glb(doc: object, bin: Uint8Array): Uint8Array {
+  const json = new TextEncoder().encode(JSON.stringify(doc));
+  const jsonPadded = (json.length + 3) & ~3;
+  const binPadded = (bin.length + 3) & ~3;
+  const out = new Uint8Array(12 + 8 + jsonPadded + 8 + binPadded);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, 0x46546c67, true);
+  view.setUint32(4, 2, true);
+  view.setUint32(8, out.length, true);
+  view.setUint32(12, jsonPadded, true);
+  view.setUint32(16, 0x4e4f534a, true);
+  out.set(json, 20);
+  out.fill(0x20, 20 + json.length, 20 + jsonPadded);
+  const at = 20 + jsonPadded;
+  view.setUint32(at, binPadded, true);
+  view.setUint32(at + 4, 0x004e4942, true);
+  out.set(bin, at + 8);
+  return out;
+}
+
 describe("io external buffers", () => {
   it("loads_an_external_bin_through_the_resolver", async () => {
     const bin = triangleBin();
@@ -97,6 +118,35 @@ describe("io external buffers", () => {
       },
     });
     expect(seen).toEqual(["positions.bin"]);
+    expect(Array.from(part.positions)).toEqual([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    expect(Array.from(part.indices)).toEqual([0, 1, 2]);
+  });
+
+  it("keeps_the_glb_body_chunk_inline_beside_an_external_buffer", async () => {
+    const bin = triangleBin();
+    const doc = {
+      asset: { version: "2.0" },
+      scenes: [{ nodes: [0] }],
+      nodes: [{ mesh: 0 }],
+      meshes: [{ name: "tri", primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: "VEC3" },
+        { bufferView: 1, componentType: 5123, count: 3, type: "SCALAR" },
+      ],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: 36 },
+        { buffer: 1, byteOffset: 0, byteLength: 6 },
+      ],
+      buffers: [{ byteLength: 36 }, { byteLength: 6, uri: "indices.bin" }],
+    };
+    const seen: string[] = [];
+    const [part] = await importGLTFAsync(glb(doc, bin.subarray(0, 36)), {
+      resolveBuffer: (uri) => {
+        seen.push(uri);
+        return bin.subarray(36);
+      },
+    });
+    expect(seen).toEqual(["indices.bin"]);
     expect(Array.from(part.positions)).toEqual([0, 0, 0, 1, 0, 0, 0, 1, 0]);
     expect(Array.from(part.indices)).toEqual([0, 1, 2]);
   });
