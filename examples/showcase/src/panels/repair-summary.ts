@@ -131,6 +131,26 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
       return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
     }
+    case "offset": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Offset: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+    }
+    case "shell": {
+      const r = report as Extract<RepairReport, { verticesAdded: number; trianglesAdded: number }>;
+      return `Shell: added ${plural(r.verticesAdded, "vertex", "vertices")} and ${plural(r.trianglesAdded, "triangle")}`;
+    }
+    case "simplify": {
+      const r = report as Extract<RepairReport, { collapsed: number; trianglesRemoved: number }>;
+      return `Simplify: ${plural(r.collapsed, "collapse")} (removed ${plural(r.trianglesRemoved, "triangle")})`;
+    }
+    case "subdivide": {
+      const r = report as Extract<RepairReport, { verticesAdded: number; trianglesAdded: number }>;
+      return `Subdivide: added ${plural(r.verticesAdded, "vertex", "vertices")} and ${plural(r.trianglesAdded, "triangle")}`;
+    }
+    default: {
+      const _exhaustive: never = op;
+      throw new Error(`unreachable repair op: ${String(_exhaustive)}`);
+    }
   }
 }
 
