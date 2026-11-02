@@ -18,7 +18,7 @@
 // per-triangle chunks joined once.
 import type { MeshHandle } from "../handles.js";
 import type { SceneLike } from "../scene-like.js";
-import type { Attribute, Decoder, DecoderModule, Mesh } from "draco3d";
+import type { Attribute, Decoder, DecoderModule, EncoderModule, Mesh, MeshBuilder } from "draco3d";
 
 /** Shared by every exporter: whether local render coordinates are mapped to the world. */
 export interface ExportOptions {
@@ -69,6 +69,20 @@ export interface GltfExportOptions extends ExportOptions {
   generator?: string;
   /** The mesh and node names. Defaults to `"mesh"`. */
   name?: string;
+  /**
+   * Compress the primitive with Draco (`KHR_draco_mesh_compression`) instead
+   * of raw buffer views. Defaults to `false`; with `true` the call is async
+   * (a `Promise<Uint8Array>`), encoding through the draco3d encoder (WASM),
+   * which lazy-loads like the decoder. Reads back through
+   * {@link importGLTFAsync}.
+   */
+  draco?: boolean;
+  /**
+   * The Draco encoder settings (quantization, compression level, face-order
+   * preservation, encoder module). Only read when `draco` is `true`; the
+   * attributes themselves always come from the mesh.
+   */
+  dracoOptions?: DracoCompressionOptions;
 }
 
 /** Compacted mesh data: only what live triangles use, placement applied. */
@@ -448,9 +462,46 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
  * the mesh is colored). Binary (default) returns a `.glb`; `binary: false`
  * a `.gltf` JSON with the buffer embedded as a base64 data URI.
  *
- * Draco compression is not applied: it rides on the Draco issue.
+ * Pass `draco: true` for `KHR_draco_mesh_compression` instead: the call
+ * becomes async (a `Promise<Uint8Array>`), encoding through the draco3d
+ * encoder (WASM), which lazy-loads like the decoder.
  */
-export function exportGLTF(scene: SceneLike, mesh: MeshHandle, options?: GltfExportOptions): Uint8Array {
+export function exportGLTF(
+  scene: SceneLike,
+  mesh: MeshHandle,
+  options?: GltfExportOptions & { draco?: false },
+): Uint8Array;
+/**
+ * glTF 2.0 with `draco: true`: the same node, mesh and `TRIANGLES`
+ * primitive, but the positions (plus normals and colors where present) ride
+ * a Draco bitstream in one buffer view instead of raw buffer views. The
+ * primitive's accessors describe the decoded shape (POSITION keeps its
+ * min/max); `extensionsUsed`/`extensionsRequired` name the extension.
+ *
+ * The draco3d encoder (WASM) initializes on first use; its module is shared
+ * across calls. Needs the `draco3d` package installed unless `dracoOptions`
+ * supplies the module or its `.wasm`. Reads back through
+ * {@link importGLTFAsync} (compressed attributes beyond POSITION stay
+ * unmapped there); the sync {@link importGLTF} still throws on it.
+ */
+export function exportGLTF(
+  scene: SceneLike,
+  mesh: MeshHandle,
+  options: GltfExportOptions & { draco: true },
+): Promise<Uint8Array>;
+export function exportGLTF(
+  scene: SceneLike,
+  mesh: MeshHandle,
+  options?: GltfExportOptions,
+): Uint8Array | Promise<Uint8Array>;
+export function exportGLTF(
+  scene: SceneLike,
+  mesh: MeshHandle,
+  options?: GltfExportOptions,
+): Uint8Array | Promise<Uint8Array> {
+  if (options?.draco === true) {
+    return exportGLTFDraco(scene, mesh, options);
+  }
   const snap = snapshot(scene, mesh, options);
   const name = options?.name ?? "mesh";
   const vertices = snap.positions.length / 3;
@@ -486,23 +537,7 @@ export function exportGLTF(scene: SceneLike, mesh: MeshHandle, options?: GltfExp
   bufferViews[bufferViews.length - 1].target = 34963; // ELEMENT_ARRAY_BUFFER
   const binLength = offset;
 
-  let min: [number, number, number] = [0, 0, 0];
-  let max: [number, number, number] = [0, 0, 0];
-  if (vertices > 0) {
-    min = [snap.positions[0], snap.positions[1], snap.positions[2]];
-    max = [min[0], min[1], min[2]];
-    for (let v = 1; v < vertices; v++) {
-      for (let c = 0; c < 3; c++) {
-        const x = snap.positions[3 * v + c];
-        if (x < min[c]) {
-          min[c] = x;
-        }
-        if (x > max[c]) {
-          max[c] = x;
-        }
-      }
-    }
-  }
+  const { min, max } = positionBounds(snap.positions);
 
   let nextView = 1;
   const positionView = 0;
@@ -539,9 +574,49 @@ export function exportGLTF(scene: SceneLike, mesh: MeshHandle, options?: GltfExp
     buffers: [{ byteLength: binLength }],
   };
 
-  if (options?.binary === false) {
+  return packGLTF(json, chunks, options?.binary !== false);
+}
+
+/** The POSITION min/max over compacted vertices (zeros without vertices). */
+function positionBounds(positions: Float32Array): { min: [number, number, number]; max: [number, number, number] } {
+  const min: [number, number, number] = [0, 0, 0];
+  const max: [number, number, number] = [0, 0, 0];
+  const vertices = positions.length / 3;
+  if (vertices > 0) {
+    min[0] = positions[0];
+    min[1] = positions[1];
+    min[2] = positions[2];
+    max[0] = min[0];
+    max[1] = min[1];
+    max[2] = min[2];
+    for (let v = 1; v < vertices; v++) {
+      for (let c = 0; c < 3; c++) {
+        const x = positions[3 * v + c];
+        if (x < min[c]) {
+          min[c] = x;
+        }
+        if (x > max[c]) {
+          max[c] = x;
+        }
+      }
+    }
+  }
+  return { min, max };
+}
+
+/**
+ * Packs the asset JSON plus its buffer chunks into one value: a binary
+ * `.glb`, or `.gltf` JSON with the buffer embedded as a base64 data URI.
+ */
+function packGLTF(
+  json: { buffers: { byteLength: number; uri?: string }[] },
+  chunks: Uint8Array[],
+  binary: boolean,
+): Uint8Array {
+  const binLength = json.buffers[0].byteLength;
+  if (!binary) {
     const bin = concat(chunks, binLength);
-    (json.buffers[0] as { uri?: string }).uri = `data:application/octet-stream;base64,${toBase64(bin)}`;
+    json.buffers[0].uri = `data:application/octet-stream;base64,${toBase64(bin)}`;
     return new TextEncoder().encode(JSON.stringify(json));
   }
   // `.glb`: 12-byte header, a padded JSON chunk, a padded BIN chunk.
@@ -595,6 +670,409 @@ function toBase64(bytes: Uint8Array): string {
     text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   }
   return btoa(text);
+}
+
+/** Per-attribute Draco quantization bits: fewer bits compress smaller, at coarser values. */
+export interface DracoQuantizationBits {
+  /** POSITION bits. Defaults to `14`. */
+  position?: number;
+  /** NORMAL bits. Defaults to `10`. */
+  normal?: number;
+  /** COLOR bits. Defaults to `8` (lossless for byte colors). */
+  color?: number;
+  /**
+   * TEX_COORD bits. Defaults to `12`. Validated but currently unused: UVs
+   * ride issue #137 (there is no UV channel to encode yet).
+   */
+  texCoord?: number;
+}
+
+/** The Draco encoder settings shared by {@link encodeDraco} and the `draco: true` {@link exportGLTF} path. */
+export interface DracoCompressionOptions {
+  /**
+   * A ready draco3d encoder module, as `createEncoderModule` resolves. When
+   * omitted, one is created from the `draco3d` package and shared across
+   * calls. Pass one in to reuse a module (or to supply the `.wasm` in an
+   * environment the default lookup cannot reach, like a bundled Worker).
+   */
+  encoderModule?: unknown;
+  /**
+   * The encoder `.wasm` bytes, forwarded to `createEncoderModule` when the
+   * shared module is created. Bundlers cannot always locate draco3d's own
+   * `.wasm` next to its glue (Vite workers, inlined builds): fetch the
+   * encoder asset (a `?url` import of `draco3d/draco_encoder.wasm`) and pass
+   * its bytes here. Ignored when `encoderModule` is given.
+   */
+  wasmBinary?: Uint8Array | ArrayBuffer;
+  /** Per-attribute quantization bits (each an integer 1..30). */
+  quantizationBits?: DracoQuantizationBits;
+  /**
+   * How hard the encoder squeezes: an integer 0..10, defaulting to `5`.
+   * Higher levels encode slower into fewer bytes (the encode/decode speeds
+   * run at `10 - level`); `0` is the fastest encode.
+   */
+  compressionLevel?: number;
+  /**
+   * Keep the decoded faces (and vertices) in input order via sequential
+   * encoding. Defaults to `false`: the edgebreaker reorders faces while
+   * compressing better. Either way the same triangles decode.
+   */
+  preserveFaceOrder?: boolean;
+}
+
+/** Options of {@link encodeDraco}: the encoder settings plus the extra attributes. */
+export interface DracoEncodeOptions extends DracoCompressionOptions {
+  /**
+   * Per-vertex normals: 3 numbers per vertex, encoded as the NORMAL
+   * attribute. Must match `positions` in length.
+   */
+  normals?: ArrayLike<number>;
+  /**
+   * Per-vertex colors: 4 bytes (RGBA) per vertex, encoded as a normalized
+   * COLOR attribute. Each value must be an integer 0..255.
+   */
+  colors?: ArrayLike<number>;
+}
+
+/**
+ * Encodes a triangle mesh into standalone Draco bytes (a `.drc` file):
+ * positions always, plus the `normals`/`colors` options when given.
+ * Positions encode as 32-bit floats (wider inputs narrow).
+ *
+ * The draco3d encoder (WASM) initializes on first use; its module is shared
+ * across calls. Needs the `draco3d` package installed unless `options`
+ * supplies the module or its `.wasm`.
+ *
+ * Decodes through {@link decodeDraco} (positions and faces only: it maps
+ * POSITION alone, so normals and colors need draco3d's own decoder).
+ */
+export async function encodeDraco(
+  positions: ArrayLike<number>,
+  indices: ArrayLike<number>,
+  options?: DracoEncodeOptions,
+): Promise<Uint8Array> {
+  const checkedPositions = checkedEncodePositions(positions);
+  const checkedIndices = checkedEncodeIndices(indices, checkedPositions.length / 3);
+  const checkedNormals = checkedEncodeNormals(options?.normals, checkedPositions.length);
+  const checkedColors = checkedEncodeColors(options?.colors, checkedPositions.length / 3);
+  const settings = encodeSettings(options);
+  const module = await encoderOf(options);
+  return encodeMeshDraco(module, checkedPositions, checkedIndices, checkedNormals, checkedColors, settings).bytes;
+}
+
+/**
+ * glTF 2.0 with `draco: true`: one node, one mesh, one `TRIANGLES`
+ * primitive whose attributes ride a Draco bitstream in a single buffer view.
+ * The primitive's accessors describe the decoded shape (POSITION keeps its
+ * min/max); the `KHR_draco_mesh_compression` extension maps them to the
+ * bitstream's attribute ids.
+ */
+async function exportGLTFDraco(
+  scene: SceneLike,
+  mesh: MeshHandle,
+  options?: GltfExportOptions,
+): Promise<Uint8Array> {
+  const snap = snapshot(scene, mesh, options);
+  const name = options?.name ?? "mesh";
+  const vertices = snap.positions.length / 3;
+  const settings = encodeSettings(options?.dracoOptions);
+  // The snapshot is already compacted; the checks retype it (f64 views
+  // narrow to f32) and reject the unencodable (Draco needs triangles).
+  const positions = checkedEncodePositions(snap.positions);
+  const indices = checkedEncodeIndices(snap.indices, vertices);
+  const normals = checkedEncodeNormals(snap.normals, positions.length);
+  const colors = checkedEncodeColors(snap.colors, vertices);
+  const module = await encoderOf(options?.dracoOptions);
+  const { bytes, positionId, normalId, colorId } = encodeMeshDraco(
+    module,
+    positions,
+    indices,
+    normals,
+    colors,
+    settings,
+  );
+
+  const { min, max } = positionBounds(snap.positions);
+  const attributes: Record<string, number> = { POSITION: 0 };
+  const accessors: unknown[] = [{ componentType: 5126, count: vertices, type: "VEC3", min, max }];
+  const dracoAttributes: Record<string, number> = { POSITION: positionId };
+  let accessorIndex = 1;
+  if (normals !== null) {
+    attributes["NORMAL"] = accessorIndex++;
+    accessors.push({ componentType: 5126, count: vertices, type: "VEC3" });
+    dracoAttributes["NORMAL"] = normalId as number;
+  }
+  if (colors !== null) {
+    attributes["COLOR_0"] = accessorIndex++;
+    accessors.push({ componentType: 5121, count: vertices, type: "VEC4", normalized: true });
+    dracoAttributes["COLOR_0"] = colorId as number;
+  }
+  accessors.push({ componentType: 5125, count: indices.length, type: "SCALAR" });
+
+  const json = {
+    asset: { version: "2.0", generator: options?.generator ?? "fast-mesh-wasm" },
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0, name }],
+    meshes: [
+      {
+        name,
+        primitives: [
+          {
+            attributes,
+            indices: accessors.length - 1,
+            mode: 4,
+            extensions: { KHR_draco_mesh_compression: { bufferView: 0, attributes: dracoAttributes } },
+          },
+        ],
+      },
+    ],
+    accessors,
+    // The bitstream's buffer view carries no target: it is not a GPU buffer.
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: bytes.length }],
+    buffers: [{ byteLength: bytes.length }],
+    extensionsUsed: ["KHR_draco_mesh_compression"],
+    extensionsRequired: ["KHR_draco_mesh_compression"],
+  };
+  return packGLTF(json, [bytes], options?.binary !== false);
+}
+
+/** The encoder knobs, validated with defaults filled in. */
+interface ResolvedEncodeSettings {
+  positionBits: number;
+  normalBits: number;
+  colorBits: number;
+  level: number;
+  preserveFaceOrder: boolean;
+}
+
+/** Validates the quantization/level/order options before the module loads. */
+function encodeSettings(options?: DracoCompressionOptions): ResolvedEncodeSettings {
+  const bits = options?.quantizationBits;
+  // Validated for #137; nothing encodes UVs yet.
+  checkedQuantizationBits(bits?.texCoord, "texCoord", 12);
+  const level = options?.compressionLevel ?? 5;
+  if (!Number.isInteger(level) || level < 0 || level > 10) {
+    throw new Error(`Draco: the compression level must be an integer from 0 to 10 (got ${options?.compressionLevel})`);
+  }
+  return {
+    positionBits: checkedQuantizationBits(bits?.position, "position", 14),
+    normalBits: checkedQuantizationBits(bits?.normal, "normal", 10),
+    colorBits: checkedQuantizationBits(bits?.color, "color", 8),
+    level,
+    preserveFaceOrder: options?.preserveFaceOrder === true,
+  };
+}
+
+/**
+ * One attribute's quantization bits: the default without an override, else
+ * an integer 1..30. Checked here because the encoder accepts any int.
+ */
+function checkedQuantizationBits(value: number | undefined, name: string, fallback: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (!Number.isInteger(value) || value < 1 || value > 30) {
+    throw new Error(`Draco: ${name} quantization bits must be an integer from 1 to 30 (got ${value})`);
+  }
+  return value;
+}
+
+/** Copies positions to f32, checking length (3 per vertex) and finiteness. */
+function checkedEncodePositions(positions: ArrayLike<number>): Float32Array {
+  if (positions.length === 0) {
+    throw new Error("Draco: cannot encode a mesh with no vertices");
+  }
+  if (positions.length % 3 !== 0) {
+    throw new Error(`Draco: positions need 3 numbers per vertex (got length ${positions.length})`);
+  }
+  const out = Float32Array.from(positions);
+  for (let i = 0; i < out.length; i++) {
+    if (!Number.isFinite(out[i])) {
+      throw new Error(`Draco: position ${Math.floor(i / 3)} is not finite`);
+    }
+  }
+  return out;
+}
+
+/** Copies indices to u32, checking length (3 per triangle) and range. */
+function checkedEncodeIndices(indices: ArrayLike<number>, vertices: number): Uint32Array {
+  if (indices.length === 0) {
+    throw new Error("Draco: cannot encode a mesh with no triangles");
+  }
+  if (indices.length % 3 !== 0) {
+    throw new Error(`Draco: indices need 3 corners per triangle (got length ${indices.length})`);
+  }
+  const out = new Uint32Array(indices.length);
+  for (let t = 0; t < indices.length / 3; t++) {
+    for (let k = 0; k < 3; k++) {
+      const c = indices[3 * t + k];
+      if (!Number.isInteger(c) || c < 0 || c >= vertices) {
+        throw new Error(`Draco: triangle ${t} indexes missing vertex ${c}`);
+      }
+      out[3 * t + k] = c;
+    }
+  }
+  return out;
+}
+
+/** Copies normals to f32 (`null` without), checking length and finiteness. */
+function checkedEncodeNormals(
+  normals: ArrayLike<number> | null | undefined,
+  positions: number,
+): Float32Array | null {
+  if (normals === null || normals === undefined) {
+    return null;
+  }
+  if (normals.length !== positions) {
+    throw new Error(
+      `Draco: normals need 3 numbers per vertex (got length ${normals.length} for ${positions / 3} vertices)`,
+    );
+  }
+  const out = Float32Array.from(normals);
+  for (let i = 0; i < out.length; i++) {
+    if (!Number.isFinite(out[i])) {
+      throw new Error(`Draco: normal ${Math.floor(i / 3)} is not finite`);
+    }
+  }
+  return out;
+}
+
+/** Copies colors to RGBA bytes (`null` without), checking length and byte range. */
+function checkedEncodeColors(
+  colors: ArrayLike<number> | null | undefined,
+  vertices: number,
+): Uint8Array | null {
+  if (colors === null || colors === undefined) {
+    return null;
+  }
+  if (colors.length !== 4 * vertices) {
+    throw new Error(`Draco: colors need 4 bytes per vertex (got length ${colors.length} for ${vertices} vertices)`);
+  }
+  const out = new Uint8Array(4 * vertices);
+  for (let i = 0; i < out.length; i++) {
+    const c = colors[i];
+    if (!Number.isInteger(c) || c < 0 || c > 255) {
+      throw new Error(`Draco: colors[${i}] is not a byte 0..255 (got ${c})`);
+    }
+    out[i] = c;
+  }
+  return out;
+}
+
+/** draco3d@1.5's float-attribute mesh writer: `@types/draco3d@1.4` predates the `*ToMesh` names. */
+interface DracoMeshBuilder {
+  AddFloatAttributeToMesh(mesh: Mesh, attribute: number, count: number, size: number, values: Float32Array): number;
+}
+
+/** Encoded bytes plus the attribute ids the KHR extension maps. */
+interface EncodedDracoMesh {
+  bytes: Uint8Array;
+  positionId: number;
+  normalId: number | null;
+  colorId: number | null;
+}
+
+/**
+ * Builds the mesh (faces, POSITION, NORMAL/COLOR when present) and encodes
+ * it with the resolved settings. Colors ride a normalized uint8 attribute,
+ * like glTF's `COLOR_0`. Throws when the encoder reports failure.
+ */
+function encodeMeshDraco(
+  module: EncoderModule,
+  positions: Float32Array,
+  indices: Uint32Array,
+  normals: Float32Array | null,
+  colors: Uint8Array | null,
+  settings: ResolvedEncodeSettings,
+): EncodedDracoMesh {
+  const mesh = new module.Mesh();
+  const builder = new module.MeshBuilder() as unknown as MeshBuilder & DracoMeshBuilder;
+  try {
+    builder.AddFacesToMesh(mesh, indices.length / 3, indices);
+    const positionId = builder.AddFloatAttributeToMesh(mesh, module.POSITION, positions.length / 3, 3, positions);
+    let normalId: number | null = null;
+    let colorId: number | null = null;
+    if (normals !== null) {
+      normalId = builder.AddFloatAttributeToMesh(mesh, module.NORMAL, normals.length / 3, 3, normals);
+    }
+    if (colors !== null) {
+      colorId = builder.AddUInt8Attribute(mesh, module.COLOR, colors.length / 4, 4, colors);
+      builder.SetNormalizedFlagForAttribute(mesh, colorId, true);
+    }
+    const encoder = new module.Encoder();
+    try {
+      encoder.SetSpeedOptions(10 - settings.level, 10 - settings.level);
+      encoder.SetAttributeQuantization(module.POSITION, settings.positionBits);
+      if (normals !== null) {
+        encoder.SetAttributeQuantization(module.NORMAL, settings.normalBits);
+      }
+      if (colors !== null) {
+        encoder.SetAttributeQuantization(module.COLOR, settings.colorBits);
+      }
+      encoder.SetEncodingMethod(
+        settings.preserveFaceOrder ? module.MESH_SEQUENTIAL_ENCODING : module.MESH_EDGEBREAKER_ENCODING,
+      );
+      const out = new module.DracoInt8Array();
+      try {
+        const length = encoder.EncodeMeshToDracoBuffer(mesh, out);
+        if (!(length > 0)) {
+          throw new Error("Draco: encoding failed (the encoder returned no bytes)");
+        }
+        const bytes = new Uint8Array(length);
+        for (let i = 0; i < length; i++) {
+          bytes[i] = out.GetValue(i);
+        }
+        return { bytes, positionId, normalId, colorId };
+      } finally {
+        module.destroy(out);
+      }
+    } finally {
+      module.destroy(encoder);
+    }
+  } finally {
+    module.destroy(builder);
+    module.destroy(mesh);
+  }
+}
+
+/** The shared draco3d encoder module: `options`'s, or a lazily created one. */
+async function encoderOf(options?: DracoCompressionOptions): Promise<EncoderModule> {
+  if (options?.encoderModule !== undefined) {
+    const module = options.encoderModule as EncoderModule;
+    if (typeof module?.Encoder !== "function" || typeof module?.MeshBuilder !== "function") {
+      throw new Error("Draco: the encoder module is not a draco3d encoder module (from createEncoderModule)");
+    }
+    return module;
+  }
+  if (options?.wasmBinary === undefined && sharedEncoderModule !== null) {
+    return sharedEncoderModule;
+  }
+  const created = await createEncoderModule(options?.wasmBinary);
+  if (options?.wasmBinary === undefined) {
+    sharedEncoderModule = created;
+  }
+  return created;
+}
+
+/** The process-wide encoder module, created on the first default encode. */
+let sharedEncoderModule: EncoderModule | null = null;
+
+/**
+ * Creates a draco3d encoder module, optionally seeded with the `.wasm` bytes.
+ * Imported lazily so bundles that never touch Draco never load the encoder.
+ */
+async function createEncoderModule(wasmBinary?: Uint8Array | ArrayBuffer): Promise<EncoderModule> {
+  let create: (options?: Record<string, unknown>) => Promise<EncoderModule>;
+  try {
+    ({ createEncoderModule: create } = await import("draco3d"));
+  } catch {
+    throw new Error("Draco: encoding needs the draco3d package (npm install draco3d), or pass an encoder module");
+  }
+  const init: Record<string, unknown> = {};
+  if (wasmBinary !== undefined) {
+    init["wasmBinary"] = wasmBinary;
+  }
+  return create(init);
 }
 
 /**
