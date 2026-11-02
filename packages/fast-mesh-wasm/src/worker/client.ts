@@ -231,26 +231,49 @@ const FAILED_LOG_LIMIT = 10_000;
 interface Pose {
   rotation: number[];
   translation: Vec3;
+  scale: Vec3;
   matrix4: Float64Array;
 }
 
-/** `placement · translate(origin)`, column-major, as `Scene.matrix4`. */
-function poseOf(rotation: number[], translation: Vec3, origin: Vec3): Pose {
+/**
+ * `placement · translate(origin)`, column-major, as `Scene.matrix4`: the
+ * rotation columns carry the scale and the last column is
+ * `rotation · (scale · origin) + translation`, in the same operation order
+ * as the engine, so the mirrors stay bit-identical to it.
+ */
+function poseOf(rotation: number[], translation: Vec3, origin: Vec3, scale: Vec3): Pose {
   const r = rotation;
   const o = origin;
+  const s = scale;
   const m = new Float64Array(16);
   for (let row = 0; row < 3; row++) {
     for (let col = 0; col < 3; col++) {
-      m[4 * col + row] = r[3 * row + col];
+      m[4 * col + row] = s[col] * r[3 * row + col];
     }
-    m[12 + row] = r[3 * row] * o[0] + r[3 * row + 1] * o[1] + r[3 * row + 2] * o[2] + translation[row];
+    m[12 + row] =
+      r[3 * row] * (s[0] * o[0]) + r[3 * row + 1] * (s[1] * o[1]) + r[3 * row + 2] * (s[2] * o[2]) + translation[row];
   }
   m[15] = 1;
-  return { rotation, translation, matrix4: m };
+  return { rotation, translation, scale, matrix4: m };
 }
 
 function samePose(a: Pose, b: Pose): boolean {
-  return a.matrix4.every((v, k) => v === b.matrix4[k]) && a.translation.every((v, k) => v === b.translation[k]);
+  return (
+    a.matrix4.every((v, k) => v === b.matrix4[k]) &&
+    a.translation.every((v, k) => v === b.translation[k]) &&
+    a.scale.every((v, k) => v === b.scale[k])
+  );
+}
+
+/** A placement input's scale as a `Vec3`: `[1, 1, 1]` when omitted, as the engine defaults it. */
+function scaleOf(scale: Readonly<Vec3> | undefined): Vec3 {
+  if (scale === undefined) {
+    return [1, 1, 1];
+  }
+  if (scale.length !== 3) {
+    throw invalid("scale must be 3 numbers");
+  }
+  return [scale[0], scale[1], scale[2]];
 }
 
 /**
@@ -1108,7 +1131,12 @@ export class WorkerScene implements SceneLike {
     for (const p of r.placements) {
       const st = this.#meshes.get(p.id);
       if (st !== undefined) {
-        st.pose = { rotation: p.rotation, translation: p.translation as Vec3, matrix4: Float64Array.from(p.matrix4) };
+        st.pose = {
+          rotation: p.rotation,
+          translation: p.translation as Vec3,
+          scale: p.scale as Vec3,
+          matrix4: Float64Array.from(p.matrix4),
+        };
       }
     }
     for (const s of r.sections) {
@@ -1420,7 +1448,7 @@ export class WorkerScene implements SceneLike {
       shown: null,
       pendingRules: new Map(),
       indices: new Uint32Array(0),
-      pose: poseOf(IDENTITY, [0, 0, 0], known),
+      pose: poseOf(IDENTITY, [0, 0, 0], known, [1, 1, 1]),
       local: undefined,
       localUntil: 0,
       requested: undefined,
@@ -1516,7 +1544,10 @@ export class WorkerScene implements SceneLike {
     }
   }
 
-  /** Sets a mesh's placement (one undo step); `placement()` follows when the result arrives. */
+  /**
+   * Sets a mesh's placement (one undo step), scale included (`[1, 1, 1]`
+   * when omitted); `placement()` follows when the result arrives.
+   */
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void {
     const st = this.#live(mesh);
     const rotation = rotationMatrix(placement.rotation);
@@ -1525,21 +1556,23 @@ export class WorkerScene implements SceneLike {
       throw invalid("translation must be 3 numbers");
     }
     const translation: Vec3 = [t[0], t[1], t[2]];
-    st.requested = poseOf(rotation, translation, st.origin);
+    const scale = scaleOf(placement.scale);
+    st.requested = poseOf(rotation, translation, st.origin, scale);
     st.requestedUntil = this.#push({
       kind: "setPlacement",
       rev: ++this.#rev,
       id: st.id,
       rotation,
       translation,
+      scale,
       key: `placement:${st.id}`,
     });
   }
 
-  /** The mesh's placement as mirrored (a drag's pose while it is held). */
+  /** The mesh's placement as mirrored, scale always present (a drag's pose while it is held). */
   placement(mesh: MeshHandle): Placement {
     const p = this.#shown(this.#mirrored(mesh));
-    return { rotation: [...p.rotation], translation: [...p.translation] };
+    return { rotation: [...p.rotation], translation: [...p.translation], scale: [...p.scale] };
   }
 
   /** The column-major world matrix of the mesh's local render coordinates, as mirrored. */
@@ -1647,9 +1680,10 @@ export class WorkerScene implements SceneLike {
           throw invalid("translation must be 3 numbers");
         }
         const translation: Vec3 = [t[0], t[1], t[2]];
-        st.local = poseOf(rotation, translation, st.origin);
+        const scale = scaleOf(placement.scale);
+        st.local = poseOf(rotation, translation, st.origin, scale);
         this.#optimistic.add(st);
-        this.#push({ kind: "drag", rev: ++this.#rev, id: st.id, phase: "move", rotation, translation, key });
+        this.#push({ kind: "drag", rev: ++this.#rev, id: st.id, phase: "move", rotation, translation, scale, key });
       },
       end: d.end,
       cancel: () => {
@@ -2477,7 +2511,7 @@ export class WorkerScene implements SceneLike {
     }
     for (const st of this.#meshes.values()) {
       const pose = poses.get(st) as Pose;
-      if (!replayed.has(st.id) || samePose(pose, poseOf(IDENTITY, [0, 0, 0], st.origin))) {
+      if (!replayed.has(st.id) || samePose(pose, poseOf(IDENTITY, [0, 0, 0], st.origin, [1, 1, 1]))) {
         continue;
       }
       st.requested = pose;
@@ -2493,6 +2527,7 @@ export class WorkerScene implements SceneLike {
         id: st.id,
         rotation: pose.rotation,
         translation: pose.translation,
+        scale: pose.scale,
         key: `placement:${st.id}`,
       });
     }

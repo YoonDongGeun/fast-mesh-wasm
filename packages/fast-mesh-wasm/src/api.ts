@@ -60,7 +60,7 @@ export interface Placement {
   translation: Vec3;
   /**
    * 3 numbers; `[1, 1, 1]` for a rigid placement. Always present from
-   * {@link Scene}; absent on hosts that do not track scale.
+   * {@link Scene} and `WorkerScene`; absent on hosts that do not track scale.
    */
   scale?: Vec3;
 }
