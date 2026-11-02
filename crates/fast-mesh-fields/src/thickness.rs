@@ -388,7 +388,7 @@ mod tests {
         par::set_force_sequential(false);
         if par::enabled() {
             for k in [1usize, 2, 8] {
-                assert_eq!(par::with_threads(k, &run), reference, "{k} threads");
+                assert_eq!(par::with_threads(k, run), reference, "{k} threads");
             }
         }
         // Every vertex of the torus reads a finite wall thickness.
