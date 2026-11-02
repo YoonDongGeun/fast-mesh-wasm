@@ -295,6 +295,50 @@ describe("WorkerScene", () => {
     expect(scene.views(b).indices().length).toBe(6);
   });
 
+  it("measure_matches_local_scene", async () => {
+    const { scene } = await start();
+    const local = new Scene();
+    // A closed unit cube, outward wound.
+    const box = {
+      positions: Float64Array.from([
+        0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1,
+      ]),
+      indices: Uint32Array.from([
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6,
+        1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+      ]),
+    };
+    const a = scene.addMesh(box.positions, box.indices);
+    const la = local.addMesh(box.positions, box.indices);
+    const got = await scene.measure(a);
+    expect(got).toEqual(local.measure(la));
+    expect(got.area).toBeCloseTo(6, 9);
+    expect(got.volume).toBeCloseTo(1, 9);
+    expect(got.closed).toBe(true);
+    // An open quad: area without volume, with the reason.
+    const quad = {
+      positions: Float64Array.from([0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0]),
+      indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    };
+    const b = scene.addMesh(quad.positions, quad.indices);
+    const lb = local.addMesh(quad.positions, quad.indices);
+    const open = await scene.measure(b);
+    expect(open).toEqual(local.measure(lb));
+    expect(open.area).toBeCloseTo(4, 9);
+    expect(open.volume).toBeNull();
+    expect(open.volumeReason).toBe("open");
+    expect(open.closed).toBe(false);
+    // A removed mesh reports UNKNOWN_MESH, like the other queries.
+    scene.removeMesh(b);
+    const e = await scene.measure(b).then(
+      () => undefined,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(FastMeshError);
+    expect((e as FastMeshError).code).toBe("UNKNOWN_MESH");
+    local.free();
+  });
+
   it("values_mirror_is_opt_in", async () => {
     const { scene, w } = await start();
     const sent: (ArrayBuffer | null)[] = [];
