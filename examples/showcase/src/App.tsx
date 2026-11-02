@@ -4,14 +4,20 @@
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { parseBigFileParams } from "./load/big-file";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { ExportPanel } from "./panels/ExportPanel";
 import { GroupsBar } from "./panels/GroupsBar";
+import { HelpOverlay, TourCard } from "./panels/Help";
 import { HoverTip } from "./panels/HoverTip";
+import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
+import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
 import { StatusBar } from "./panels/StatusBar";
+import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
@@ -55,6 +61,27 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [focus, setFocus] = useState<FocusRequest | null>(null);
   const [resetView, setResetView] = useState(0);
   const [dropping, setDropping] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [tourStep, setTourStep] = useState<number | null>(null);
+
+  // Ending the tour records it, so first-run only runs once.
+  const endTour = useCallback(() => {
+    markTourSeen();
+    setTourStep(null);
+  }, []);
+  const nextTour = useCallback(() => {
+    if (tourStep === null) {
+      return;
+    }
+    const next = tourNext(tourStep);
+    if (next === null) {
+      markTourSeen();
+    }
+    setTourStep(next);
+  }, [tourStep]);
+  const backTour = useCallback(() => {
+    setTourStep((s) => (s === null ? s : tourBack(s)));
+  }, []);
 
   const focusOn = useCallback(
     (
@@ -69,11 +96,22 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const sculpt = useApp(app, (s) => s.sculpt);
   const sculptRemesh = useApp(app, (s) => s.sculptRemesh);
   const sculptLiveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
+  const maskPaint = useApp(app, (s) => s.maskPaint);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
     [app],
   );
+
+  // `?big` loads the ~1M-triangle demo variants (see load/big-file.ts).
+  const demoBig = useMemo(() => {
+    try {
+      return parseBigFileParams(location.search).demoBig;
+    } catch {
+      return false;
+    }
+  }, []);
+  const cancelLoad = useCallback((id: number) => loader.cancelJob(id), [loader]);
 
   const load = useCallback(
     (files: Iterable<File>) => {
@@ -135,7 +173,23 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     });
   }, [app, engine, loader, focusOn, select]);
 
-  // ---- Keyboard: undo/redo, gizmo mode, focus, deselect ----
+  // ---- First run: the tour, unless seen, forced off, or headless ----
+  // `?tour=1` forces it on (even headless); `?tour=0` / `?notour` and
+  // headless Chrome (`showcase-check.mjs`) keep it off, so the scripted
+  // session never sees a card over the canvas.
+  const onboarded = useRef(false);
+  useEffect(() => {
+    if (onboarded.current) {
+      return;
+    }
+    onboarded.current = true;
+    const start = resolveTourStart(location.search, navigator.userAgent, navigator.webdriver, tourSeen());
+    if (start !== "off") {
+      setTourStep(0);
+    }
+  }, []);
+
+  // ---- Keyboard: undo/redo, gizmo mode, focus, deselect, help ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Typing in a field (the opacity slider, say) is not a shortcut.
@@ -156,15 +210,26 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         redo();
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
+      } else if (key === "?") {
+        setHelpOpen((v) => !v);
       } else if (key === "escape") {
-        // Sculpt first (it owns the pointer), then a pick (it never selects), then the selection.
-        const snap = app.getSnapshot();
-        if (snap.sculpt !== null) {
-          app.setSculpt(null);
-        } else if (snap.brushPick !== null) {
-          app.setBrushPick(null);
+        if (helpOpen) {
+          setHelpOpen(false);
+        } else if (tourStep !== null) {
+          endTour();
         } else {
-          selectMesh(app, select, selection, null, false);
+          // Sculpt first (it owns the pointer), then the mask paint, then a
+          // pick (it never selects), then the selection.
+          const snap = app.getSnapshot();
+          if (snap.sculpt !== null) {
+            app.setSculpt(null);
+          } else if (snap.maskPaint) {
+            app.setMaskPaint(false);
+          } else if (snap.brushPick !== null) {
+            app.setBrushPick(null);
+          } else {
+            selectMesh(app, select, selection, null, false);
+          }
         }
       } else if (key === "t") {
         setMode("translate");
@@ -178,7 +243,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo, select, selection, focusOn, app]);
+  }, [undo, redo, select, selection, focusOn, app, helpOpen, tourStep, endTour]);
 
   // ---- Drop files anywhere ----
   useEffect(() => {
@@ -219,6 +284,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <MeshList
           app={app}
           onLoad={load}
+          onCancelLoad={cancelLoad}
           onLoadPhantom={(phantom) => {
             void loader.loadDicomDemo(phantom).then((added) => {
               const last = added.at(-1);
@@ -237,11 +303,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           }}
           onLoadDemo={() => {
             // No focus: the meshes join the current view (Reset view restores the overview).
-            void loader.loadDemo(false);
+            void loader.loadDemo(demoBig);
           }}
           onFocus={focusOn}
         />
         <GroupsBar app={app} />
+        <ProjectPanel app={app} />
       </aside>
       <main className="viewport">
         <Viewport
@@ -258,13 +325,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           sculpt={sculpt}
           sculptRemesh={sculptRemesh}
           sculptLiveRemesh={sculptLiveRemesh}
+          maskPaint={maskPaint}
           wireframe={wireframe}
           loader={loader}
         />
         <SculptToolbox app={app} />
         {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
-        <div className="toolbar" role="toolbar" aria-label="Viewport tools">
+        <div className="toolbar" role="toolbar" aria-label="Viewport tools" data-tour="gizmo">
           <div className="group">
             <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">
               Move <kbd>T</kbd>
@@ -295,6 +363,11 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               Wire
             </button>
           </div>
+          <div className="group">
+            <button type="button" data-action="help" onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)">
+              Help <kbd>?</kbd>
+            </button>
+          </div>
         </div>
         <p className="hint">
           {sculpt !== null
@@ -310,11 +383,25 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       <aside className="sidebar sidebar-right">
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
+        <InspectPanel app={app} scene={engine.scene} />
+        <ExportPanel app={app} scene={engine.scene} />
         <Suspense fallback={null}>
           <VolumePanel app={app} loader={loader} />
         </Suspense>
       </aside>
       <StatusBar engine={engine} app={app} />
+      {helpOpen ? (
+        <HelpOverlay
+          onClose={() => setHelpOpen(false)}
+          onStartTour={() => {
+            setHelpOpen(false);
+            setTourStep(0);
+          }}
+        />
+      ) : null}
+      {tourStep !== null ? (
+        <TourCard index={tourStep} onNext={nextTour} onBack={backTour} onDone={endTour} />
+      ) : null}
       {dropping ? <div className="drop-overlay">Drop STL, OBJ, PLY or DICOM files to load them</div> : null}
     </div>
   );

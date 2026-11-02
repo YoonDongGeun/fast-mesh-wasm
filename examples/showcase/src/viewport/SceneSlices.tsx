@@ -25,6 +25,7 @@ import {
   type SlicePlanes,
 } from "../panels/volume-slice";
 import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "./slice-drag";
+import { setSliceClip } from "./clip-planes";
 import { view } from "./view";
 import { matchVolume } from "./volume-box";
 
@@ -300,7 +301,7 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
         center: [0, 0, 0],
       });
       if (item !== null) {
-        item.material.clippingPlanes = null;
+        setSliceClip(item.material, null);
       }
       if (inspect.sceneSlices.id !== null) {
         inspect.sceneSlices = { id: null, shown: 0 };
@@ -327,11 +328,11 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
         center: item.center,
       },
     );
-    item.material.clippingPlanes = quads.clip;
+    setSliceClip(item.material, quads.clip);
     inspect.sceneSlices = { id: mpr.volumeId, shown: 3 };
     return () => {
       // The selection may move on: never leave a cutaway behind.
-      item.material.clippingPlanes = null;
+      setSliceClip(item.material, null);
     };
   }, [active, payload, display, range, mpr, item, quads]);
 

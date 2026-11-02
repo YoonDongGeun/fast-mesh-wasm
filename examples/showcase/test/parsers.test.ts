@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { MeshData } from "../src/load/mesh-data";
 import { parseObj } from "../src/load/obj";
-import { parseMeshFile } from "../src/load/parse";
+import { parseMeshFile, parseMeshFiles } from "../src/load/parse";
 import { parsePly } from "../src/load/ply";
 import { parseStl } from "../src/load/stl";
 
@@ -276,7 +276,10 @@ describe("parseMeshFile", () => {
     expect(parseMeshFile("t.Obj", text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")).indices.length).toBe(3);
   });
 
-  it("rejects unknown extensions", () => {
-    expect(() => parseMeshFile("mesh.glb", new ArrayBuffer(4))).toThrow(/\.glb/);
+  it("rejects unknown extensions, and glTF on the single-mesh entry", () => {
+    expect(() => parseMeshFile("mesh.xyz", new ArrayBuffer(4))).toThrow(/\.xyz/);
+    // A glTF asset can hold several meshes: it needs the plural entry.
+    expect(() => parseMeshFile("mesh.glb", new ArrayBuffer(4))).toThrow(/parseMeshFiles/);
+    expect(() => parseMeshFiles("mesh.xyz", new ArrayBuffer(4))).toThrow(/\.xyz/);
   });
 });

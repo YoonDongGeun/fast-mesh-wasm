@@ -3,14 +3,14 @@
 // contact group. A tiny
 // external store, so the loader (outside React) and the components share it;
 // read it with `useApp`.
-import type { MeshHandle } from "fast-mesh-wasm";
+import type { Analysis, MeshHandle, SectionHandle, SectionPlane } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import * as THREE from "three";
 import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
 import type { SliceAxis } from "../panels/volume-slice";
-import type { SculptBrush } from "../viewport/sculpt";
+import type { SculptBrush, SculptMask } from "../viewport/sculpt";
 import {
   createGroup,
   dropMember,
@@ -49,6 +49,10 @@ export interface Job {
   name: string;
   phase: JobPhase;
   message?: string;
+  /** Load progress, 0..1, while reading/parsing/adding (unset: indeterminate). */
+  progress?: number;
+  /** Post-load summary (triangles, time, decimation) shown on done jobs. */
+  summary?: string;
 }
 
 /** The meshes the collision panel colours, each against the other; `null` for none picked. */
@@ -91,6 +95,38 @@ export interface VolumeMpr {
   tab: "volume" | "slices";
 }
 
+/** One repair-issue kind drawn in 3D (see `viewport/repair-overlays`). */
+export type RepairOverlayKind = "holes" | "nonManifold" | "degenerate" | "components";
+
+export const REPAIR_OVERLAY_KINDS: readonly RepairOverlayKind[] = [
+  "holes",
+  "nonManifold",
+  "degenerate",
+  "components",
+];
+
+/** The repair panel's latest analysis, shared with the 3D overlay. */
+export interface RepairAnalysis {
+  mesh: MeshHandle;
+  analysis: Analysis;
+}
+
+/** One inspection tool of the inspect panel: ruler, click-to-query, section plane or clip box. */
+export type InspectTool = "ruler" | "query" | "section" | "clip";
+
+/** The inspect section plane: the store's handle and its plane, for the panel and the gizmo. */
+export interface InspectSection {
+  handle: SectionHandle;
+  plane: SectionPlane;
+}
+
+/** A click-to-query hit: the mesh, the snapped vertex slot, and its world point. */
+export interface InspectQuery {
+  mesh: MeshHandle;
+  slot: number;
+  point: Vec3;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -105,9 +141,27 @@ export interface AppSnapshot {
   brushPick: BrushPick | null;
   /** The sculpt brush armed on a mesh, if any: hover shows its ball, press-and-hold paints. */
   sculpt: SculptBrush | null;
+  /**
+   * The painted protected region on a mesh, if any: deform dabs whose ball
+   * touches a masked vertex are dropped (see `viewport/sculpt.ts`'s mask
+   * contract). `null` when never painted or cleared — loudly, with
+   * `sculptMaskNotice`, when a topology edit takes a masked vertex.
+   */
+  sculptMask: SculptMask | null;
+  /** The mask paint is armed: press-and-hold paints the protected region. */
+  maskPaint: boolean;
+  /** The mask paint radius, in mesh units. */
+  maskRadius: number;
+  /** Why the mask was last cleared against its will (`null` when it stands or was cleared by hand). */
+  sculptMaskNotice: string | null;
   /** A stroke's end evens its region out with a remesh (in the same undo step on the sync scene). */
   sculptRemesh: boolean;
-  /** A stroke is remeshed live while it paints, so no triangle balloons mid-stroke. */
+  /**
+   * A stroke is remeshed live while it paints, so no triangle balloons mid-stroke.
+   * Same undo step as the stroke (see `liveRemeshDue`'s semantics note in
+   * `viewport/sculpt.ts`): the live passes repair inside the stroke's open
+   * step and never open one of their own.
+   */
   sculptLiveRemesh: boolean;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
@@ -124,6 +178,26 @@ export interface AppSnapshot {
   multi: readonly MeshHandle[];
   /** The linked MPR state for the selected volume, if any panel shows it. */
   volumeMpr: VolumeMpr | null;
+  /** Which repair-issue kinds draw in 3D (a display setting: not undoable). */
+  repairOverlays: Record<RepairOverlayKind, boolean>;
+  /** The repair panel's latest analysis (the overlay's geometry source). */
+  repairAnalysis: RepairAnalysis | null;
+  /**
+   * The armed inspection tool, if any: ruler (click two vertices, world
+   * points that survive placement undo), click-to-query (the picked
+   * vertex's coloring value), section plane or clip box.
+   */
+  inspectTool: InspectTool | null;
+  /** The ruler's endpoints in world coordinates (`b` is `null` until the second click). */
+  ruler: { a: Vec3; b: Vec3 | null } | null;
+  /** The click-to-query hit, if one landed. */
+  inspectQuery: InspectQuery | null;
+  /** The section plane cut, if one is armed (its handle lives in the store). */
+  inspectSection: InspectSection | null;
+  /** The axis-aligned clip box in world coordinates, if one is armed. */
+  clipBox: { min: Vec3; max: Vec3 } | null;
+  /** Heavy loads are decimated on load (#113, via the #118 simplify op). */
+  decimateOnLoad: boolean;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -139,12 +213,24 @@ export class AppState {
     meshGroups: [],
     brushPick: null,
     sculpt: null,
+    sculptMask: null,
+    maskPaint: false,
+    maskRadius: 0.25,
+    sculptMaskNotice: null,
     sculptRemesh: true,
     sculptLiveRemesh: true,
     edgeSoftness: 0,
     wireframe: false,
     multi: [],
     volumeMpr: null,
+    repairOverlays: { holes: true, nonManifold: true, degenerate: true, components: true },
+    repairAnalysis: null,
+    inspectTool: null,
+    ruler: null,
+    inspectQuery: null,
+    inspectSection: null,
+    clipBox: null,
+    decimateOnLoad: true,
   };
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
@@ -264,6 +350,11 @@ export class AppState {
       multi: this.#snap.multi.filter((m) => m !== item.mesh),
       meshGroups: dropMember(this.#snap.meshGroups, item.mesh),
       sculpt: this.#snap.sculpt?.mesh === item.mesh ? null : this.#snap.sculpt,
+      sculptMask: this.#snap.sculptMask?.mesh === item.mesh ? null : this.#snap.sculptMask,
+      maskPaint: this.#snap.sculptMask?.mesh === item.mesh ? false : this.#snap.maskPaint,
+      sculptMaskNotice: this.#snap.sculptMask?.mesh === item.mesh ? null : this.#snap.sculptMaskNotice,
+      repairAnalysis: this.#snap.repairAnalysis?.mesh === item.mesh ? null : this.#snap.repairAnalysis,
+      inspectQuery: this.#snap.inspectQuery?.mesh === item.mesh ? null : this.#snap.inspectQuery,
     });
   }
 
@@ -329,6 +420,30 @@ export class AppState {
     this.#set({ sculpt });
   }
 
+  /** Stores the painted mask (`null` clears it by hand, and clears its notice). */
+  setSculptMask(mask: SculptMask | null): void {
+    this.#set(mask === null ? { sculptMask: null, sculptMaskNotice: null } : { sculptMask: mask });
+  }
+
+  /** Arms (`true`) or disarms the mask paint. */
+  setMaskPaint(on: boolean): void {
+    this.#set({ maskPaint: on });
+  }
+
+  /** Sets the mask paint radius, in mesh units. */
+  setMaskRadius(radius: number): void {
+    this.#set({ maskRadius: radius });
+  }
+
+  /**
+   * Reports a mask cleared against its will (a topology edit took a masked
+   * vertex): the loud half of the mask contract, shown by the toolbox until
+   * the next paint or hand clear.
+   */
+  setSculptMaskNotice(notice: string | null): void {
+    this.#set({ sculptMaskNotice: notice });
+  }
+
   /** Sets the shift-clicked meshes, primary first (see `selectMesh`). */
   setMulti(multi: readonly MeshHandle[]): void {
     this.#set({ multi });
@@ -357,6 +472,49 @@ export class AppState {
   /** Draws every mesh wireframed or solid (a display setting: not undoable). */
   setWireframe(on: boolean): void {
     this.#set({ wireframe: on });
+  }
+
+  /** Draws (`on`) or hides a repair-issue kind in 3D (a display setting: not undoable). */
+  setRepairOverlay(kind: RepairOverlayKind, on: boolean): void {
+    if (this.#snap.repairOverlays[kind] === on) {
+      return;
+    }
+    this.#set({ repairOverlays: { ...this.#snap.repairOverlays, [kind]: on } });
+  }
+
+  /** Shares the repair panel's latest analysis with the 3D overlay (`null` clears it). */
+  setRepairAnalysis(analysis: RepairAnalysis | null): void {
+    this.#set({ repairAnalysis: analysis });
+  }
+
+  /** Arms the inspection tool (`null` disarms it, keeping its results). */
+  setInspectTool(tool: InspectTool | null): void {
+    this.#set({ inspectTool: tool });
+  }
+
+  /** Sets the ruler's endpoints in world coordinates (`null` clears it). */
+  setRuler(ruler: { a: Vec3; b: Vec3 | null } | null): void {
+    this.#set({ ruler });
+  }
+
+  /** Records a click-to-query hit (`null` clears it). */
+  setInspectQuery(query: InspectQuery | null): void {
+    this.#set({ inspectQuery: query });
+  }
+
+  /** Shares the inspect section plane with the 3D gizmo (`null` clears it). */
+  setInspectSection(section: InspectSection | null): void {
+    this.#set({ inspectSection: section });
+  }
+
+  /** Sets the axis-aligned clip box in world coordinates (`null` clears it). */
+  setClipBox(box: { min: Vec3; max: Vec3 } | null): void {
+    this.#set({ clipBox: box });
+  }
+
+  /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
+  setDecimateOnLoad(on: boolean): void {
+    this.#set({ decimateOnLoad: on });
   }
 
   setJob(job: Job): void {

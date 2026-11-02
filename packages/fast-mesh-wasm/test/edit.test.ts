@@ -827,8 +827,7 @@ describe("analyze and repair", () => {
     expect(s.triangleCount(b)).toBe(2);
   });
 
-  it("stale_loops_error_code", () => {
-    const s = scene();
+  it("stale_loops_error_code", () => {    const s = scene();
     const { positions, indices } = damagedHemisphere();
     const m = s.addMesh(positions, indices, { mode: "manual" });
     s.repair(m, { op: "orient" });
@@ -852,5 +851,90 @@ describe("analyze and repair", () => {
     expect(codeOf(() => s.analyze(m, { selfIntersection: true }))).toBe("STALE_BVH");
     s.update(m);
     expect(s.analyze(m, { selfIntersection: true }).selfIntersects).toBe(false);
+  });
+
+  it("offset_moves_along_normals", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    expect(s.canUndo()).toBe(false);
+    const before = Float32Array.from(s.views(m).positions());
+    const r = s.repair(m, { op: "offset", distance: 0.5 });
+    expect(r).toEqual({ moved: 4, maxDisplacement: 0.5, degenerateRemoved: 0, verticesRemoved: 0 });
+    const after = s.views(m).positions();
+    // A flat quad wound from +z: every vertex moves exactly 0.5 up.
+    for (let v = 0; v < 4; v++) {
+      expect(after[3 * v] - before[3 * v]).toBeCloseTo(0, 6);
+      expect(after[3 * v + 1] - before[3 * v + 1]).toBeCloseTo(0, 6);
+      expect(after[3 * v + 2] - before[3 * v + 2]).toBeCloseTo(0.5, 6);
+    }
+    // One undo entry for the call, restoring bit-identical positions.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+    // A negative distance sinks back below the start.
+    const r2 = s.repair(m, { op: "offset", distance: -1 });
+    expect(r2.moved).toBe(4);
+    expect(r2.maxDisplacement).toBeCloseTo(1, 6);
+    expect(s.views(m).positions()[2]).toBeCloseTo(before[2] - 1, 6);
+    expect(s.canUndo()).toBe(true);
+  });
+
+  it("offset_rejects_bad_distance", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    const before = Float32Array.from(s.views(m).positions());
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { op: "offset", distance: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "offset", distance: Infinity }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "offset" } as never))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "offset", distance: "0.5" as never }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
+  it("shell_closes_an_open_mesh", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const r = s.repair(m, { op: "shell", thickness: 0.5 });
+    expect(r).toEqual({
+      verticesAdded: 4,
+      trianglesAdded: 2 + 8,
+      loopsClosed: 1,
+      degenerateRemoved: 0,
+      verticesRemoved: 0,
+    });
+    expect(s.triangleCount(m)).toBe(2 + 2 + 8);
+    expect(s.analyze(m).loops).toEqual([]);
+    // The outer sheet stayed; the copy sits one thickness below it.
+    const after = s.views(m).positions();
+    expect(Array.from(after.subarray(0, beforePos.length))).toEqual(Array.from(beforePos));
+    for (let v = 0; v < 4; v++) {
+      expect(after[(v + 4) * 3 + 2]).toBeCloseTo(-0.5, 6);
+    }
+    // One undo entry for the call; redo closes it again.
+    expect(s.undo()).toBe(true);
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(m)).toBe(2);
+    expect(s.redo()).toBe(true);
+    expect(s.triangleCount(m)).toBe(2 + 2 + 8);
+  });
+
+  it("shell_rejects_bad_thickness", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    const beforePos = Float32Array.from(s.views(m).positions());
+    const beforeIdx = Uint32Array.from(s.views(m).indices());
+    const undoable = s.canUndo();
+    expect(codeOf(() => s.repair(m, { op: "shell", thickness: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "shell", thickness: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "shell", thickness: NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "shell", thickness: Infinity }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "shell" } as never))).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(undoable);
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(beforePos));
+    expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
   });
 });

@@ -1688,6 +1688,7 @@ class Engine {
         s.setPlacement(this.#mesh(req.id), {
           rotation: req.rotation,
           translation: req.translation as [number, number, number],
+          ...(req.scale === undefined ? {} : { scale: req.scale as [number, number, number] }),
         });
         return;
       case "drag":
@@ -1763,7 +1764,11 @@ class Engine {
       if (req.rotation === undefined || req.translation === undefined) {
         throw invalid("a drag move needs a rotation and a translation");
       }
-      return { rotation: req.rotation, translation: req.translation as [number, number, number] };
+      return {
+        rotation: req.rotation,
+        translation: req.translation as [number, number, number],
+        ...(req.scale === undefined ? {} : { scale: req.scale as [number, number, number] }),
+      };
     };
     if (req.phase === "begin") {
       const session = this.#scene.drag(this.#mesh(req.id));
@@ -1904,6 +1909,10 @@ class Engine {
         const a = args as QueryMap["analyze"]["args"];
         return s.analyze(this.#mesh(a.mesh), a.options);
       }
+      case "measure": {
+        const a = args as QueryMap["measure"]["args"];
+        return s.measure(this.#mesh(a.mesh));
+      }
       case "fieldTargetStatus": {
         const a = args as QueryMap["fieldTargetStatus"]["args"];
         return s.fieldTargetStatus(this.#field(a.field));
@@ -1966,6 +1975,7 @@ class Engine {
           id,
           rotation: p.rotation,
           translation: p.translation,
+          scale: p.scale as number[],
           matrix4: Array.from(s.matrix4(c.mesh)),
         });
       }

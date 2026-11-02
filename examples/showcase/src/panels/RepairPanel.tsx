@@ -1,22 +1,28 @@
 // The repair panel for the selected mesh: its analysis (holes and their
 // sizes, orientation, components, non-manifold and degenerate elements),
-// refreshed whenever its triangles change (a repair, its undo), and the
-// library's repair ops, each one undo step through `store.repair`.
+// refreshed whenever its triangles change (a repair, its undo), the 3D
+// overlays drawing those issues on the mesh, and the library's repair ops,
+// each one undo step through `store.repair`.
 // Analysis is read-only: the app calls it on its own scene.
 import type { MeshHandle, RepairOp, RepairReport, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { type AppState, type Item, useApp } from "../scene/app-state";
+import { REPAIR_OVERLAY_KINDS, type AppState, type Item, type RepairOverlayKind, useApp } from "../scene/app-state";
 import { nextJoinSource } from "../scene/selection";
+import { REPAIR_OVERLAY_COLORS } from "../viewport/repair-overlays";
 import { formatDistance } from "./collision-math";
 import { inspect } from "./inspect";
+import {
+  AUTO_REPAIR_ANY_SIZE,
+  runAutoRepairPipeline,
+} from "./auto-repair";
 import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
 
 /** The most entries the analysis lists (counts stay exact). */
 const MAX_LISTED = 64;
 /** "Any size" for Fill holes (an empty field): the op needs a bound (or a list of loops). */
-const ANY_SIZE = 1e9;
+const ANY_SIZE = AUTO_REPAIR_ANY_SIZE;
 /** The Fill holes size limit to start with: small and medium holes, not an open mesh's outer boundary. */
 const DEFAULT_MAX_EDGES = 64;
 /** How long after an op its own triangle change may still arrive (it has none when nothing changed). */
@@ -152,6 +158,9 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         if (n === seq.current) {
           const summary = summarize(a);
           setAnalysis({ mesh: target, summary });
+          // The 3D overlay shares the raw analysis (loop vertices, edge and
+          // triangle lists the summary drops); a new object refreshes it.
+          app.setRepairAnalysis({ mesh: target, analysis: a });
           const name = app.getSnapshot().items.find((i) => i.mesh === target)?.name ?? "";
           inspect.repair.analysis = { mesh: name, summary };
           inspect.repair.analyses++;
@@ -175,6 +184,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       setAnalysis(null);
       setAnalyzing(false);
       inspect.repair.analysis = null;
+      app.setRepairAnalysis(null);
       return;
     }
     void analyze(mesh);
@@ -212,6 +222,45 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       inspect.repair.report = line;
     } catch (e) {
       const line = `${label} failed: ${e instanceof Error ? e.message : String(e)}`;
+      setReport({ mesh, line, failed: true });
+      inspect.repair.report = line;
+    } finally {
+      setBusy(null);
+      inspect.repair.busy = null;
+      if (own.current.pending) {
+        own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
+      }
+    }
+  };
+
+  // One "Auto repair" click: weld -> remove-degenerate -> orient ->
+  // remove-small-components -> fill holes as ONE repair call (one grouped
+  // undo step, all-or-nothing), using this panel's live settings, with a
+  // per-stage report and a before/after summary. The triangle-change effect
+  // above re-analyses and refreshes the 3D overlays; the explicit analyse
+  // covers a clean mesh (no change, no effect run).
+  const runAuto = async () => {
+    if (mesh === null || busy !== null) {
+      return;
+    }
+    setBusy("Auto repair");
+    inspect.repair.busy = "Auto repair";
+    clearTimeout(own.current.timer);
+    own.current.pending = true;
+    try {
+      const settings = { weldTolerance, minTriangles, maxEdges, fair };
+      const result = await runAutoRepairPipeline(
+        {
+          analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
+          repair: async (ops) => (await store.repair(mesh, ops)) as RepairReport[],
+        },
+        settings,
+      );
+      setReport({ mesh, line: result.line, failed: false });
+      inspect.repair.report = result.line;
+      void analyze(mesh);
+    } catch (e) {
+      const line = `Auto repair failed: ${e instanceof Error ? e.message : String(e)}`;
       setReport({ mesh, line, failed: true });
       inspect.repair.report = line;
     } finally {
@@ -269,7 +318,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
 
   if (item === null) {
     return (
-      <section className="panel" aria-label="Repair">
+      <section className="panel" aria-label="Repair" data-tour="repair">
         <h2>Repair</h2>
         <p className="muted">Select a mesh to analyse and repair it.</p>
       </section>
@@ -279,7 +328,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const s = analysis?.mesh === mesh ? analysis.summary : null;
   const disabled = busy !== null;
   return (
-    <section className="panel" aria-label="Repair" data-repair={item.name}>
+    <section className="panel" aria-label="Repair" data-repair={item.name} data-tour="repair">
       <header className="panel-head">
         <h2>Repair</h2>
         <button type="button" data-repair-op="analyze" onClick={() => void analyze(item.mesh)} disabled={analyzing}>
@@ -292,7 +341,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       {s === null ? (
         <p className="muted small">{analyzing ? "Analysing…" : "No analysis."}</p>
       ) : (
-        <AnalysisList summary={s} stale={analyzing} />
+        <>
+          <AnalysisList summary={s} stale={analyzing} />
+          <OverlayToggles app={app} summary={s} />
+        </>
       )}
 
       <div className="ops">
@@ -389,6 +441,19 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
+      </div>
+
+      <div className="ops">
+        <div className="op">
+          <button type="button" data-repair-op="autoRepair" disabled={disabled} onClick={() => void runAuto()}>
+            Auto repair
+          </button>
+          <p className="muted small">
+            Order: weld → remove degenerate → orient → remove small components → fill holes. Uses the tolerance,
+            “below”, “max edges” and “fair” settings above; one grouped undo step (Ctrl+Z). Reports one line per
+            stage with before → after counts.
+          </p>
+        </div>
       </div>
 
       <div className="ops">
@@ -721,5 +786,54 @@ function AnalysisList(props: { summary: AnalysisSummary; stale: boolean }) {
         {s.duplicate > 0 ? `, ${plural(s.duplicate, "duplicate")}` : ""}
       </dd>
     </dl>
+  );
+}
+
+/** The overlay toggles: which analysed issues draw on the mesh in 3D. */
+const OVERLAY_LABELS: Record<RepairOverlayKind, string> = {
+  holes: "Holes",
+  nonManifold: "Non-manifold",
+  degenerate: "Degenerate",
+  components: "Small components",
+};
+
+function OverlayToggles(props: { app: AppState; summary: AnalysisSummary }) {
+  const { app, summary: s } = props;
+  const kinds = useApp(app, (snap) => snap.repairOverlays);
+  const counts: Record<RepairOverlayKind, number> = {
+    holes: s.holes.length,
+    nonManifold: s.nonManifoldEdges,
+    degenerate: s.degenerate + s.duplicate,
+    components: Math.max(0, s.components.length - 1),
+  };
+  return (
+    <fieldset className="overlays" data-overlays>
+      <legend className="muted small">Show in 3D</legend>
+      {REPAIR_OVERLAY_KINDS.map((kind) => (
+        <label
+          key={kind}
+          className="check"
+          title={`${OVERLAY_LABELS[kind]}: ${counts[kind] === 0 ? "none" : plural(counts[kind], "issue")} on the mesh`}
+        >
+          <input
+            type="checkbox"
+            data-overlay={kind}
+            checked={kinds[kind]}
+            onChange={(e) => app.setRepairOverlay(kind, e.currentTarget.checked)}
+          />
+          <span
+            aria-hidden="true"
+            style={{
+              display: "inline-block",
+              width: "0.7em",
+              height: "0.7em",
+              borderRadius: "2px",
+              background: `#${REPAIR_OVERLAY_COLORS[kind].toString(16).padStart(6, "0")}`,
+            }}
+          />{" "}
+          {OVERLAY_LABELS[kind]} ({counts[kind]})
+        </label>
+      ))}
+    </fieldset>
   );
 }

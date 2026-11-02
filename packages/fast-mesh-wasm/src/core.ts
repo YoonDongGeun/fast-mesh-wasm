@@ -17,6 +17,7 @@ export type FastMeshErrorCode =
   | "CORRUPTED"
   | "OUT_OF_MEMORY"
   | "STALE_LOOPS"
+  | "STALE_SELECTION"
   | "INSTANCE_POISONED";
 
 const CODES: ReadonlySet<string> = new Set<FastMeshErrorCode>([
@@ -30,6 +31,7 @@ const CODES: ReadonlySet<string> = new Set<FastMeshErrorCode>([
   "CORRUPTED",
   "OUT_OF_MEMORY",
   "STALE_LOOPS",
+  "STALE_SELECTION",
   "INSTANCE_POISONED",
 ]);
 

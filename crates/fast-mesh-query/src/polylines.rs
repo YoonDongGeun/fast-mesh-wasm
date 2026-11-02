@@ -9,7 +9,7 @@
 //! as `f32`.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_store::Mesh;
+use fast_mesh_store::{Mesh, TriangleId};
 
 use crate::pair::PAIR_STACK;
 use crate::pairs::{for_each_pair, overlap_key, validate};
@@ -31,6 +31,103 @@ pub struct Polyline {
     /// segments meet. Chains always end at junctions; a closed polyline is
     /// manifold.
     pub manifold: bool,
+}
+
+/// One intersection segment between a triangle of A and one of B, in A's
+/// space (B placed by the query's [`Rigid`]).
+///
+/// A pair of triangles that only touch at a point contributes no segment;
+/// coplanar pairs contribute only area overlaps, as their boundary (see
+/// [`intersection_polylines`]): the same segments [`clip_pair`] finds, one
+/// entry per pair, before any welding or duplicate cancellation. Endpoints
+/// are `f32` casts of the `f64` interpolations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PairSegment {
+    /// The triangle of A.
+    pub a: TriangleId,
+    /// The triangle of B.
+    pub b: TriangleId,
+    /// One end of the intersection segment, in A's space.
+    pub from: [f32; 3],
+    /// The other end, in A's space.
+    pub to: [f32; 3],
+}
+
+/// Appends the intersection segment of every intersecting triangle pair of
+/// `mesh_a` and `mesh_b` (B placed in A's space by `xf`), and returns how
+/// many were appended. Elements already in `out` are kept and stay in front.
+///
+/// Unlike [`intersection_polylines`], the segments are not welded, chained
+/// or deduplicated: each pair contributes its own entries, so callers that
+/// split triangles (like boolean operations) see every crossing. Zero-length
+/// segments (endpoints equal after the `f32` cast) are skipped.
+///
+/// # Errors
+/// [`QueryError::InvalidInput`] for an invalid `xf` (see [`Rigid`]); then
+/// [`QueryError::MeshMismatch`] or [`QueryError::StaleBvh`] when a BVH does
+/// not match its current mesh; and [`QueryError::OutOfMemory`] when `out` or
+/// a temporary cannot grow. On any error `out` keeps its original length.
+pub fn intersecting_segments(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+    out: &mut Vec<PairSegment>,
+) -> Result<usize> {
+    validate(mesh_a, bvh_a, mesh_b, bvh_b, xf, None)?;
+    let start = out.len();
+    let r = pair_segments(mesh_a, bvh_a, mesh_b, bvh_b, xf, out);
+    if r.is_err() {
+        out.truncate(start);
+    }
+    r
+}
+
+fn pair_segments(
+    mesh_a: &Mesh,
+    bvh_a: &Bvh,
+    mesh_b: &Mesh,
+    bvh_b: &Bvh,
+    xf: &Rigid,
+    out: &mut Vec<PairSegment>,
+) -> Result<usize> {
+    let start = out.len();
+    let mut buf = [Seg64::EMPTY; 6];
+    let mut failed = false;
+    for_each_pair::<PAIR_STACK>(
+        mesh_a,
+        bvh_a,
+        mesh_b,
+        bvh_b,
+        xf,
+        None,
+        overlap_key,
+        |a, pa, b, pb| {
+            if failed {
+                return false;
+            }
+            if !tri_tri_intersect(pa, pb) {
+                return true;
+            }
+            let n = clip_pair(pa, pb, &mut buf);
+            for s in &buf[..n] {
+                let (from, to) = (s.from.map(|x| x as f32), s.to.map(|x| x as f32));
+                if from == to {
+                    continue;
+                }
+                if push(out, PairSegment { a, b, from, to }).is_err() {
+                    failed = true;
+                    return false;
+                }
+            }
+            true
+        },
+    );
+    if failed {
+        return Err(QueryError::OutOfMemory);
+    }
+    Ok(out.len() - start)
 }
 
 /// Appends to `out` the polylines where `mesh_a` and `mesh_b` (placed in A's
@@ -1220,5 +1317,73 @@ mod tests {
         );
         assert!(out.is_empty());
         fail_allocations_after(None);
+    }
+
+    fn segments_of(ma: &Mesh, ba: &Bvh, mb: &Mesh, bb: &Bvh) -> Vec<PairSegment> {
+        let mut out = Vec::new();
+        let n = intersecting_segments(ma, ba, mb, bb, &Rigid::IDENTITY, &mut out).unwrap();
+        assert_eq!(n, out.len());
+        out
+    }
+
+    #[test]
+    fn pair_segments_cover_overlapping_boxes() {
+        let ma = box_mesh([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        let mb = box_mesh([0.4, -0.5, -0.5], [1.4, 0.5, 0.5]);
+        let (ma_bvh, mb_bvh) = (build(&ma, Quality::Sah), build(&mb, Quality::Sah));
+        let segs = segments_of(&ma, &ma_bvh, &mb, &mb_bvh);
+        assert!(!segs.is_empty());
+        // Every segment is non-degenerate and lies on both meshes.
+        for s in &segs {
+            assert_ne!(s.from, s.to);
+            assert!(ma.triangle(s.a).is_some());
+            assert!(mb.triangle(s.b).is_some());
+        }
+        // Disjoint boxes give nothing.
+        let far = box_mesh([5.0, 5.0, 5.0], [6.0, 6.0, 6.0]);
+        let far_bvh = build(&far, Quality::Sah);
+        assert!(segments_of(&ma, &ma_bvh, &far, &far_bvh).is_empty());
+    }
+
+    #[test]
+    fn pair_segments_include_coplanar_boundaries() {
+        // Two boxes sharing a face plane: the coplanar overlap contributes
+        // its boundary, and point touches contribute nothing.
+        let (ma, ba, mb, bb) = meshes(
+            &[0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0, 2.0, 0.0],
+            &[0, 1, 2, 0, 2, 3],
+            &[1.0, 1.0, 0.0, 3.0, 1.0, 0.0, 3.0, 3.0, 0.0, 1.0, 3.0, 0.0],
+            &[0, 1, 2, 0, 2, 3],
+        );
+        let segs = segments_of(&ma, &ba, &mb, &bb);
+        // The overlap [1,2]^2 chains to its 4 boundary edges; interior edges
+        // of the two quads' triangulation cancel in the polylines but every
+        // pair still contributes its own entries here.
+        assert!(!segs.is_empty());
+        for s in &segs {
+            assert_ne!(s.from, s.to);
+        }
+    }
+
+    #[test]
+    fn pair_segments_leave_out_alone_on_error() {
+        let (ma, ba, mb, bb) = meshes(
+            &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[0, 1, 2],
+            &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[0, 1, 2],
+        );
+        let bad = Rigid {
+            rotation: [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation: [0.0; 3],
+        };
+        let mut out = vec![PairSegment {
+            a: 0,
+            b: 0,
+            from: [0.0; 3],
+            to: [1.0, 0.0, 0.0],
+        }];
+        assert!(intersecting_segments(&ma, &ba, &mb, &bb, &bad, &mut out).is_err());
+        assert_eq!(out.len(), 1);
     }
 }

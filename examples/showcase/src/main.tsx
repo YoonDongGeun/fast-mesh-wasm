@@ -9,6 +9,7 @@ import { createWorkerScene, type WorkerScene } from "fast-mesh-wasm/worker";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App, type Engine } from "./App";
+import { parseBigFileParams } from "./load/big-file";
 import { Loader } from "./load/loader";
 import { AppState } from "./scene/app-state";
 import { installTestHook } from "./test-hook";
@@ -41,6 +42,12 @@ const root = createRoot(document.getElementById("root")!);
 try {
   const { store, engine } = await createEngine();
   const app = new AppState();
+  // `?decimate=0` opts out of decimate-on-load (for testing; see load/big-file.ts).
+  try {
+    app.setDecimateOnLoad(parseBigFileParams(location.search).decimateOnLoad);
+  } catch {
+    // The default stands.
+  }
   const loader = new Loader(store, app);
   root.render(
     <StrictMode>
@@ -49,7 +56,7 @@ try {
       </SceneProvider>
     </StrictMode>,
   );
-  installTestHook(store, engine, app);
+  installTestHook(store, engine, app, loader);
 } catch (error) {
   console.error(error);
   root.render(<div className="fatal">Could not start the scene: {String(error)}</div>);

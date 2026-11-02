@@ -86,6 +86,11 @@ export const inspect: {
     report: string | null;
     /** The op running, if any. */
     busy: string | null;
+    /** The 3D overlay toggles, and how many primitives of each kind it draws. */
+    overlays: {
+      kinds: { holes: boolean; nonManifold: boolean; degenerate: boolean; components: boolean };
+      counts: { holes: number; nonManifold: number; degenerate: number; components: number };
+    };
   };
   /** The volume view: the series shown, its preset, MIP, slice planes, and whether it rendered. */
   volume: { id: string | null; preset: string; mip: boolean; planes: number; ready: boolean };
@@ -95,6 +100,18 @@ export const inspect: {
   sceneSlices: { id: string | null; shown: number };
   /** The scene's volume rendering: the series raymarched in the main scene, and its 3D preset. */
   sceneVolume: { id: string | null; preset: string };
+  /** The inspect tools (#110): the armed tool, the ruler, the query, the section and the clip box. */
+  tools: {
+    tool: "ruler" | "query" | "section" | "clip" | null;
+    /** The ruler's world endpoints and their distance (`null` until both clicked). */
+    ruler: { a: [number, number, number]; b: [number, number, number] | null; distance: number | null };
+    /** The query hit: mesh name, vertex slot, world point and coloring value. */
+    query: { mesh: string; slot: number; point: [number, number, number]; value: number | null } | null;
+    /** The section plane and how many meshes it cuts. */
+    section: { plane: { origin: [number, number, number]; normal: [number, number, number] }; meshes: number } | null;
+    /** The clip box corners. */
+    clip: { min: [number, number, number]; max: [number, number, number] } | null;
+  };
   /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag applied, whether the ball shows, and the last grab dab's center. */
   sculpt: {
     strokes: number;
@@ -104,17 +121,37 @@ export const inspect: {
     grabTotal: number;
     hovering: boolean;
     lastDab: [number, number, number] | null;
+    /** Dabs the mask dropped (the ball touched a masked vertex). */
+    maskedDabs: number;
+    /** Masks cleared against their will (a topology edit took a masked vertex). */
+    maskStale: number;
   };
 } = {
   collision: { ...liveProbe(), warnings: [] },
   group: { ...liveProbe(), warnings: [] },
   hover: null,
-  repair: { analysis: null, analyses: 0, report: null, busy: null },
+  repair: {
+    analysis: null,
+    analyses: 0,
+    report: null,
+    busy: null,
+    overlays: {
+      kinds: { holes: true, nonManifold: true, degenerate: true, components: true },
+      counts: { holes: 0, nonManifold: 0, degenerate: 0, components: 0 },
+    },
+  },
   volume: { id: null, preset: "", mip: false, planes: 0, ready: false },
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sceneSlices: { id: null, shown: 0 },
   sceneVolume: { id: null, preset: "" },
-  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null },
+  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null, maskedDabs: 0, maskStale: 0 },
+  tools: {
+    tool: null,
+    ruler: { a: [0, 0, 0], b: null, distance: null },
+    query: null,
+    section: null,
+    clip: null,
+  },
 };
 
 function liveProbe(): LiveProbe<never> {

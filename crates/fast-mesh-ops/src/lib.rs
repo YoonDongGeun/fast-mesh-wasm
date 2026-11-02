@@ -23,12 +23,30 @@
 //!   orientation conflicts and, given a BVH, self-intersection.
 //! - Orientation: [`orient()`] makes the winding consistent patch by patch
 //!   and turns closed components outward.
+//! - Booleans: [`boolean_plan`] splits every triangle of mesh A that mesh B
+//!   crosses (and vice versa) so that each piece lies strictly on one side
+//!   of the other mesh, classifies the pieces for [`BooleanOp`] and
+//!   [`apply_boolean`] writes the plan, stitching both rims without any
+//!   winding assumption. Inputs must be closed, manifold and consistently
+//!   wound.
+//! - Offsetting and shells: [`offset`] moves a surface along its smooth
+//!   normals by a signed distance, and [`shell`] solidifies a mesh into a
+//!   printable shell of wall `thickness` by adding a reversed inner copy and
+//!   stitching every rim; both drop pinched triangles and report them.
 //! - Hole filling: [`fill_holes`] closes the boundary loops chosen by size
 //!   or by id with triangle patches that agree with their neighbours' winding
 //!   and never make an edge non-manifold, refined to the surrounding density
 //!   and faired to continue the surrounding curvature. Run [`orient()`]
 //!   first on meshes that may contain flipped triangles: a hole whose rim
 //!   crosses an orientation seam is not clean and is skipped.
+//! - Measurement: [`measure`] reports a mesh's surface area (always) and
+//!   enclosed volume (when watertight, with the reason otherwise).
+//! - Simplification: [`simplify`](simplify::simplify) shrinks a mesh toward
+//!   a target triangle count by quadric-error edge collapses, keeping
+//!   boundary vertices in place when asked.
+//! - Subdivision: [`subdivide`](subdivide::subdivide) refines every triangle
+//!   into four per level by Loop's scheme, with boundary vertices relaxing
+//!   along their own curve and other creases holding their midpoints.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -36,17 +54,23 @@
 
 mod analyze;
 pub mod append;
+pub mod boolean;
 pub mod bridge;
 mod cleanup;
+mod cut;
 pub mod deform;
 mod error;
 mod fair;
 mod fill;
 mod fill_dp;
+mod measure;
+mod offset;
 mod orient;
 mod refine;
 pub mod remesh;
+pub mod simplify;
 mod sparse;
+pub mod subdivide;
 #[cfg(test)]
 mod test_util;
 mod topology;
@@ -54,16 +78,23 @@ mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use append::{AppendReport, AppendSource, append_mesh};
+pub use boolean::{BooleanOp, BooleanPlan, BooleanReport, apply_boolean, boolean_plan};
 pub use bridge::{BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops};
 pub use cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
+pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
 pub use deform::{Brush, Falloff, InflateOptions, InflateOptionsBuilder, InflateReport, inflate};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
+};
+pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
+pub use offset::{
+    OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,
+    ShellReport, offset, shell,
 };
 pub use orient::{OrientReport, orient};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};

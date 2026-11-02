@@ -1,12 +1,34 @@
-// The sculpt stroke: dab spacing and ops, and one press-and-hold stroke
+// The sculpt stroke: dab spacing and ops, one press-and-hold stroke
 // through a fake applier (lazy step, busy and spacing guards, one undo
-// step per stroke where the scene nests steps).
+// step per stroke where the scene nests steps), and the brush picker's
+// tool-to-brush mapping (what the toolbox arms).
+//
+// Headless covers the stroke math and the picker mapping here. The rest is
+// manual, through the canvas (the e2e `sculpt-surface` path arms
+// `[data-action="sculpt-tool-inflate"]` and checks the surface returns):
+// the hover ball follows the surface point, press-and-hold paints dabs
+// (holding still builds up, fast moves creep without dotted trails),
+// grab drags the surface along with the pointer, and Esc disarms.
 import type { MeshHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_STRENGTHS,
   GrabAnchor,
+  LIVE_REMESH_MIN_DABS,
+  LIVE_REMESH_MIN_MS,
+  RELAX_PASSES,
   SculptStroke,
+  checkMask,
+  invertMaskIds,
+  liveRemeshDue,
+  maskBlocksDab,
+  maskUsable,
+  MaskError,
+  paintMaskIds,
+  sculptBrush,
   type SculptBrush,
+  type SculptMask,
+  type SculptTool,
   dabOp,
   dabSpacing,
   faceNormal,
@@ -15,6 +37,8 @@ import {
   interpolateHit,
   meanEdgeLength,
   remeshTooBig,
+  sculptOpForTool,
+  unionMaskIds,
   worldPerPixel,
 } from "../src/viewport/sculpt";
 
@@ -331,5 +355,184 @@ describe("remesh gate", () => {
     expect(remeshTooBig(100_000)).toBe(false);
     expect(remeshTooBig(100_001)).toBe(true);
     expect(remeshTooBig(302_174)).toBe(true);
+  });
+});
+
+describe("brush picker", () => {
+  const mesh = 7 as unknown as MeshHandle;
+
+  it("maps_each_tool_to_its_repair_op", () => {
+    const ops: Record<SculptTool, "inflate" | "relax" | "grab"> = {
+      inflate: "inflate",
+      deflate: "inflate",
+      smooth: "relax",
+      grab: "grab",
+    };
+    for (const [tool, op] of Object.entries(ops)) {
+      expect(sculptOpForTool(tool as SculptTool)).toBe(op);
+    }
+  });
+
+  it("starts_each_tool_at_its_own_strength", () => {
+    expect(DEFAULT_STRENGTHS).toEqual({ inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 });
+  });
+
+  it("arms_inflate_up_and_deflate_down", () => {
+    expect(sculptBrush("inflate", mesh, 0.25, 0.05, "smooth").strength).toBeCloseTo(0.05, 12);
+    expect(sculptBrush("deflate", mesh, 0.25, 0.05, "smooth").strength).toBeCloseTo(-0.05, 12);
+    // A stray sign never leaks through: deflate always pushes back in.
+    expect(sculptBrush("deflate", mesh, 0.25, -0.05, "smooth").strength).toBeCloseTo(-0.05, 12);
+    expect(sculptBrush("deflate", mesh, 0.25, 0.05, "smooth").op).toBe("inflate");
+  });
+
+  it("arms_smooth_as_relax_with_passes", () => {
+    const brush = sculptBrush("smooth", mesh, 0.25, 0.5, "smooth");
+    expect(brush.op).toBe("relax");
+    expect(brush.cycles).toBe(RELAX_PASSES);
+    expect(dabOp(brush, [1, 2, 3])).toEqual({
+      op: "relax",
+      center: [1, 2, 3],
+      radius: 0.25,
+      falloff: "smooth",
+      strength: 0.5,
+      cycles: RELAX_PASSES,
+    });
+  });
+
+  it("arms_grab_follow_at_full_strength", () => {
+    const brush = sculptBrush("grab", mesh, 0.25, 1, "smooth");
+    expect(brush.op).toBe("grab");
+    expect(brush.direction).toEqual([0, 0, 0]);
+    expect(dabOp(brush, [1, 2, 3])).toEqual({
+      op: "grab",
+      center: [1, 2, 3],
+      radius: 0.25,
+      falloff: "smooth",
+      strength: 1,
+      direction: [0, 0, 0],
+    });
+  });
+
+  it("carries_radius_and_falloff_through", () => {
+    const brush = sculptBrush("inflate", mesh, 0.4, 0.05, "linear");
+    expect(brush.mesh).toBe(mesh);
+    expect(brush.radius).toBe(0.4);
+    expect(brush.falloff).toBe("linear");
+  });
+});
+
+describe("live remesh gate", () => {
+  it("fires_only_past_both_budgets_and_never_while_running", () => {
+    expect(liveRemeshDue(LIVE_REMESH_MIN_DABS, LIVE_REMESH_MIN_MS, false)).toBe(true);
+    // Not enough new dabs since the last pass.
+    expect(liveRemeshDue(LIVE_REMESH_MIN_DABS - 1, LIVE_REMESH_MIN_MS + 1000, false)).toBe(false);
+    // Too soon after the last pass.
+    expect(liveRemeshDue(LIVE_REMESH_MIN_DABS + 10, LIVE_REMESH_MIN_MS - 1, false)).toBe(false);
+    // A pass still in flight: never two at once.
+    expect(liveRemeshDue(LIVE_REMESH_MIN_DABS + 10, LIVE_REMESH_MIN_MS + 1000, true)).toBe(false);
+  });
+
+  it("keeps_the_per_frame_budget_usable_mid_stroke", () => {
+    // A dab a frame at 60 fps clears the dab budget well inside the time
+    // budget, so long strokes still even out while painting.
+    expect(LIVE_REMESH_MIN_DABS).toBeLessThanOrEqual(8);
+    expect(LIVE_REMESH_MIN_MS).toBeLessThanOrEqual(1000);
+  });
+});
+
+describe("sculpt mask", () => {
+  // A unit quad: 4 slots, two live triangles.
+  const mesh = 7 as unknown as MeshHandle;
+  const other = 9 as unknown as MeshHandle;
+  const positions = [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0];
+  const indices = [0, 1, 2, 1, 3, 2];
+  const mask = (vertices: number[], slots = 4): SculptMask => ({
+    mesh,
+    vertices: Uint32Array.from(vertices),
+    slots,
+  });
+
+  it("paints_a_sphere_brush_over_live_vertices", () => {
+    expect([...paintMaskIds(positions, indices, 4, [0, 0, 0], 0.1)]).toEqual([0]);
+    // Within 1 of the origin: slots 0, 1 and 2 (slot 3 sits at √2).
+    expect([...paintMaskIds(positions, indices, 4, [0, 0, 0], 1)]).toEqual([0, 1, 2]);
+    expect([...paintMaskIds(positions, indices, 4, [0, 0, 0], 2)]).toEqual([0, 1, 2, 3]);
+  });
+
+  it("paint_skips_dead_and_out_of_range_slots", () => {
+    // A removed triple paints nothing, even at its own slots.
+    expect([...paintMaskIds(positions, [0, 0, 0], 4, [0, 0, 0], 2)]).toEqual([]);
+    // An out-of-range id in a live triple never paints.
+    expect([...paintMaskIds(positions, [0, 1, 9], 4, [0, 0, 0], 2)]).toEqual([0, 1]);
+  });
+
+  it("union_accumulates_paint_sorted", () => {
+    expect([...unionMaskIds([0, 2], [1, 2, 3])]).toEqual([0, 1, 2, 3]);
+    expect([...unionMaskIds([], [1])]).toEqual([1]);
+    expect([...unionMaskIds([0, 1], [2, 3])]).toEqual([0, 1, 2, 3]);
+  });
+
+  it("invert_covers_the_live_universe", () => {
+    expect([...invertMaskIds([0], indices, 4)]).toEqual([1, 2, 3]);
+    expect([...invertMaskIds([], indices, 4)]).toEqual([0, 1, 2, 3]);
+    // Dead masked ids drop out instead of reappearing.
+    expect([...invertMaskIds([0, 7], [0, 0, 0], 4)]).toEqual([]);
+  });
+
+  it("blocks_dabs_whose_ball_touches_the_mask", () => {
+    expect(maskBlocksDab([0], positions, [0.05, 0, 0], 0.1)).toBe(true);
+    // The ball's edge counts, like the paint's own measure.
+    expect(maskBlocksDab([1], positions, [0, 0, 0], 1)).toBe(true);
+    expect(maskBlocksDab([3], positions, [0, 0, 0], 1)).toBe(false);
+    expect(maskBlocksDab([], positions, [0, 0, 0], 1)).toBe(false);
+  });
+
+  it("usable_while_every_masked_slot_is_live", () => {
+    expect(maskUsable(mask([0, 3]), indices, 4)).toBe(true);
+    expect(maskUsable(mask([]), indices, 4)).toBe(true);
+    // Out of range, or no live triangle left using it.
+    expect(maskUsable(mask([7]), indices, 4)).toBe(false);
+    expect(maskUsable(mask([3]), [0, 1, 2], 4)).toBe(false);
+    // A removed triple's slots are dead, even at their own corners.
+    expect(maskUsable(mask([0]), [0, 0, 0], 4)).toBe(false);
+  });
+
+  it("survives_position_only_stroke_edits", () => {
+    // A dab moves vertices without touching the slots: the mask stands,
+    // and the gate follows the moved positions.
+    const moved = [0.05, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0];
+    expect(maskUsable(mask([0, 3]), indices, 4)).toBe(true);
+    expect(maskBlocksDab([0], moved, [0.05, 0, 0], 0.1)).toBe(true);
+  });
+
+  it("survives_splits_that_keep_old_vertices_alive", () => {
+    // A remesh split appends a slot and a triangle: the painted ids still
+    // name live vertices, so the mask carries over (the newcomer unmasked).
+    const grown = [...indices, 0, 1, 4];
+    expect(maskUsable(mask([0, 3], 4), grown, 5)).toBe(true);
+  });
+
+  it("fails_loudly_once_a_topology_edit_takes_a_masked_vertex", () => {
+    // A collapse removes every triangle using slot 3: the mask dies.
+    const collapsed = [0, 1, 2];
+    expect(maskUsable(mask([0, 3]), collapsed, 4)).toBe(false);
+    try {
+      checkMask(mask([0, 3]), mesh, collapsed, 4);
+      expect.unreachable();
+    } catch (e) {
+      // The same machine-readable code as the engine's stale selections.
+      expect(e).toBeInstanceOf(MaskError);
+      expect((e as MaskError).code).toBe("STALE_SELECTION");
+    }
+  });
+
+  it("checkMask_rejects_the_wrong_mesh", () => {
+    try {
+      checkMask(mask([0]), other, indices, 4);
+      expect.unreachable();
+    } catch (e) {
+      expect((e as MaskError).code).toBe("INVALID_ARGUMENT");
+    }
+    expect(() => checkMask(mask([0]), mesh, indices, 4)).not.toThrow();
   });
 });

@@ -1,11 +1,17 @@
 // The page side of the loader Worker: one job per file (or for the demo set),
 // tracked in the app state as reading -> parsing -> adding -> done (or error).
 // The page only adds the parsed arrays to the store.
+//
+// Large-file UX (#113): jobs carry progress (the Worker's coarse stage
+// fractions), cancel drops the worker job and the pending add (no orphan
+// meshes), and heavy loads are decimated on load through the #118 simplify
+// op, with a post-load summary on the done job.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
+import { BIG_FILE_DEFAULTS, decimateTargetFor, parseBigFileParams, summarizeLoad } from "./big-file";
 import { isDicom } from "./dicom";
 import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
-import type { LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
+import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 import { SAMPLE_NAMES, type SampleKind } from "./vtkjs";
 
 /** How long a finished job stays listed. */
@@ -20,7 +26,7 @@ async function isDicomFile(file: File): Promise<boolean> {
   if (ext === ".dcm" || ext === ".dicom") {
     return true;
   }
-  if (ext === ".stl" || ext === ".obj" || ext === ".ply") {
+  if (ext === ".stl" || ext === ".obj" || ext === ".ply" || ext === ".gltf" || ext === ".glb" || ext === ".drc") {
     return false;
   }
   try {
@@ -36,6 +42,12 @@ export class Loader {
   readonly #store: SceneStore;
   readonly #app: AppState;
   readonly #waiting = new Map<number, { name: string; resolve: (items: Item[]) => void }>();
+  /** Jobs landing (added, decimating, or awaiting the scene): cancellable. */
+  readonly #landing = new Map<number, { name: string; resolve: (items: Item[]) => void; cancel: () => void }>();
+  /** Jobs the user cancelled: their late worker replies are dropped. */
+  readonly #cancelled = new Set<number>();
+  /** Load start times, for the post-load summary. */
+  readonly #startedAt = new Map<number, number>();
   #nextJob = 0;
   /** Fetched source volumes by series id, for the volume view. */
   readonly #volumes = new Map<string, VolumePayload>();
@@ -142,6 +154,10 @@ export class Loader {
       job.resolve([]);
     }
     this.#waiting.clear();
+    for (const [id, landing] of this.#landing) {
+      landing.cancel();
+      this.#app.setJob({ id, name: landing.name, phase: "error", message });
+    }
     for (const pending of this.#pendingVolumes.values()) {
       pending.reject(new Error(message));
     }
@@ -151,11 +167,44 @@ export class Loader {
 
   #start(name: string, request: LoaderRequest): Promise<Item[]> {
     const id = this.#nextJob++;
-    this.#app.setJob({ id, name, phase: "reading" });
+    this.#startedAt.set(id, Date.now());
+    this.#app.setJob({ id, name, phase: "reading", progress: 0 });
     return new Promise((resolve) => {
       this.#waiting.set(id, { name, resolve });
       this.#workerFor().postMessage({ ...request, id });
     });
+  }
+
+  /**
+   * Cancels a load: the worker drops the job at its next stage boundary,
+   * and a pending add (meshes already in the store, decimating, or awaiting
+   * the scene) is removed again, so no orphan mesh stays behind. Settles the
+   * job as `error: "cancelled"` and resolves its `loadFiles` caller with no
+   * meshes. No-op for unknown or finished jobs.
+   */
+  cancelJob(id: number): void {
+    const waiting = this.#waiting.get(id);
+    const landing = this.#landing.get(id);
+    if (waiting === undefined && landing === undefined) {
+      return;
+    }
+    this.#cancelled.add(id);
+    try {
+      this.#worker?.postMessage({ kind: "cancel", id });
+    } catch {
+      // The worker is gone: settling below is what matters.
+    }
+    if (landing !== undefined) {
+      landing.cancel();
+      return;
+    }
+    if (waiting !== undefined) {
+      this.#waiting.delete(id);
+      this.#cancelled.delete(id);
+      this.#startedAt.delete(id);
+      this.#app.setJob({ id, name: waiting.name, phase: "error", message: "cancelled" });
+      waiting.resolve([]);
+    }
   }
 
   #receive(reply: LoaderReply): void {
@@ -180,26 +229,125 @@ export class Loader {
       return;
     }
     const { name } = job;
+    if (reply.kind === "progress") {
+      if (!this.#cancelled.has(reply.id)) {
+        this.#app.setJob({ id: reply.id, name, phase: reply.phase, progress: clamp01(reply.fraction) });
+      }
+      return;
+    }
     if (reply.kind === "parsing") {
-      this.#app.setJob({ id: reply.id, name, phase: "parsing" });
+      if (!this.#cancelled.has(reply.id)) {
+        const cur = this.#app.getSnapshot().jobs.find((j) => j.id === reply.id);
+        this.#app.setJob({ id: reply.id, name, phase: "parsing", progress: cur?.progress });
+      }
       return;
     }
     this.#waiting.delete(reply.id);
+    if (this.#cancelled.has(reply.id)) {
+      // Cancelled while parsing: nothing was added page-side (no orphans).
+      // (The worker may still post `error: "cancelled"`; it finds no waiter.)
+      this.#cancelled.delete(reply.id);
+      this.#startedAt.delete(reply.id);
+      this.#app.setJob({ id: reply.id, name, phase: "error", message: "cancelled" });
+      job.resolve([]);
+      return;
+    }
     if (reply.kind === "error") {
+      this.#startedAt.delete(reply.id);
       this.#app.setJob({ id: reply.id, name, phase: "error", message: reply.message });
       job.resolve([]);
       return;
     }
-    this.#app.setJob({ id: reply.id, name, phase: "adding" });
+    void this.#land(reply.id, name, reply.meshes, job.resolve);
+  }
+
+  /**
+   * Adds the parsed meshes, decimates heavy loads (#118 simplify), then
+   * awaits the scene. Registers in `#landing` before the first await so
+   * `cancelJob` drops the pending add: no orphan meshes.
+   */
+  async #land(id: number, name: string, meshes: LoadedMesh[], resolve: (items: Item[]) => void): Promise<void> {
+    const t0 = this.#startedAt.get(id) ?? Date.now();
+    this.#app.setJob({ id, name, phase: "adding", progress: 0.8 });
     let items: Item[] = [];
     try {
-      items = reply.meshes.map((m) => this.#app.addMesh(this.#store, m));
+      items = meshes.map((m) => this.#app.addMesh(this.#store, m));
     } catch (error) {
-      this.#app.setJob({ id: reply.id, name, phase: "error", message: String(error) });
-      job.resolve([]);
+      this.#startedAt.delete(id);
+      this.#app.setJob({ id, name, phase: "error", message: String(error) });
+      resolve([]);
       return;
     }
-    this.#awaitAdded(reply.id, name, items, job.resolve);
+    let settled = false;
+    const finish = (landed: Item[]): void => {
+      if (!settled) {
+        settled = true;
+        resolve(landed);
+      }
+    };
+    this.#landing.set(id, {
+      name,
+      resolve: finish,
+      cancel: () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        for (const item of items) {
+          if (this.#app.getSnapshot().items.includes(item)) {
+            try {
+              this.#app.removeMesh(this.#store, item);
+            } catch {
+              // Removed meanwhile: nothing to drop.
+            }
+          }
+        }
+        this.#landing.delete(id);
+        this.#cancelled.delete(id);
+        this.#startedAt.delete(id);
+        this.#app.setJob({ id, name, phase: "error", message: "cancelled" });
+        resolve([]);
+      },
+    });
+    const decimated = await this.#maybeDecimate(id, name, items);
+    if (settled) {
+      return;
+    }
+    this.#awaitAdded(id, name, items, t0, decimated, finish);
+  }
+
+  /**
+   * Decimate-on-load: past the `?decimate-tris=` threshold (and opted in),
+   * simplifies each oversized mesh down to `?decimate-target=` through the
+   * #118 simplify op, one undo step per mesh. Returns what changed, for the
+   * post-load summary (`null` when nothing qualified).
+   */
+  async #maybeDecimate(id: number, name: string, items: Item[]): Promise<{ from: number; to: number } | null> {
+    const { decimateTriangles, decimateTarget } = loadThresholds();
+    if (this.#app.getSnapshot().decimateOnLoad !== true) {
+      return null;
+    }
+    const total = items.reduce((n, i) => n + i.triangles, 0);
+    const big = items.filter((i) => decimateTargetFor(i.triangles, decimateTarget) !== null);
+    if (total < decimateTriangles || big.length === 0) {
+      return null;
+    }
+    this.#app.setJob({ id, name, phase: "adding", progress: 0.9 });
+    let from = 0;
+    let to = 0;
+    for (const item of big) {
+      if (this.#cancelled.has(id)) {
+        return null;
+      }
+      from += item.triangles;
+      try {
+        await this.#store.repair(item.mesh, { op: "simplify", targetTriangles: decimateTarget });
+        to += Math.round(this.#store.scene.views(item.mesh).indices().length / 3);
+      } catch {
+        to += item.triangles;
+      }
+    }
+    return { from, to };
   }
 
   /**
@@ -210,22 +358,40 @@ export class Loader {
    * Restart replays), the job fails instead of waiting. An error the scene
    * already had is someone else's.
    */
-  #awaitAdded(id: number, name: string, items: Item[], resolve: (items: Item[]) => void): void {
+  #awaitAdded(id: number, name: string, items: Item[], t0: number, decimated: { from: number; to: number } | null, resolve: (items: Item[]) => void): void {
     const pending = new Set(items.map((i) => i.mesh));
     const erredBefore = this.#store.getSnapshot().status === "error";
     let settled = false;
+    const entry = this.#landing.get(id);
     const settle = (error?: string) => {
       settled = true;
       offScene();
       offStore();
+      this.#landing.delete(id);
+      this.#startedAt.delete(id);
+      const triangles = items.reduce((n, i) => n + i.triangles, 0);
       if (error === undefined) {
-        this.#app.setJob({ id, name, phase: "done" });
+        const summary = summarizeLoad({ name, triangles, loadMs: Date.now() - t0, decimated });
+        this.#app.setJob({ id, name, phase: "done", progress: 1, summary });
         setTimeout(() => this.#app.dropJob(id), DONE_LINGER_MS);
       } else {
         this.#app.setJob({ id, name, phase: "error", message: error });
       }
       resolve(items);
     };
+    // A cancel during the wait drops the pending add through the same settle.
+    if (entry !== undefined) {
+      const outerCancel = entry.cancel;
+      entry.cancel = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        offScene();
+        offStore();
+        outerCancel();
+      };
+    }
     const check = () => {
       if (settled) {
         return;
@@ -260,4 +426,26 @@ export class Loader {
     const offStore = this.#store.subscribe(check);
     check();
   }
+}
+
+/** Clamps a worker fraction into 0..1 (a corrupt reply never widens the bar). */
+function clamp01(fraction: number): number {
+  return Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : 0;
+}
+
+/** The warn/decimate thresholds, from the URL for testing (`location` is absent in unit tests). */
+function loadThresholds(): { warnTriangles: number; decimateTriangles: number; decimateTarget: number } {
+  try {
+    if (typeof location !== "undefined") {
+      const p = parseBigFileParams(location.search);
+      return { warnTriangles: p.warnTriangles, decimateTriangles: p.decimateTriangles, decimateTarget: p.decimateTarget };
+    }
+  } catch {
+    // Fall through to the defaults.
+  }
+  return {
+    warnTriangles: BIG_FILE_DEFAULTS.warnTriangles,
+    decimateTriangles: BIG_FILE_DEFAULTS.decimateTriangles,
+    decimateTarget: BIG_FILE_DEFAULTS.decimateTarget,
+  };
 }

@@ -75,7 +75,7 @@ pub use error::{QueryError, Result};
 pub use fast_mesh_bvh::Aabb;
 pub use pairs::*;
 pub use plane::Plane;
-pub use polylines::{Polyline, intersection_polylines};
+pub use polylines::{PairSegment, Polyline, intersecting_segments, intersection_polylines};
 pub use ray::*;
 pub use region::*;
 pub use rigid::Rigid;

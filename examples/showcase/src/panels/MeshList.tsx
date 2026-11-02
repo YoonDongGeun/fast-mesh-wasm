@@ -1,9 +1,11 @@
 // The mesh list: open files (or drop them anywhere), see each load's
 // progress, and per mesh its name, triangle count, visibility, opacity,
-// selection, focus and removal.
+// selection, focus and removal. Heavy loads warn past `?warn-tris=` and can
+// be decimated on load (the #118 simplify op) past `?decimate-tris=`.
 import { useMeshDisplay, useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { BIG_FILE_DEFAULTS, estimateMeshBytes, formatMeshBytes, formatTriangles, parseBigFileParams } from "../load/big-file";
 import { MESH_EXTENSIONS } from "../load/parse";
 import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
@@ -18,21 +20,40 @@ const PHASE: Record<Job["phase"], string> = {
   error: "failed",
 };
 
+/** Reads the large-file thresholds from the URL (tolerant; see big-file.ts). */
+function bigFileParams(): { warnTriangles: number; decimateTriangles: number; decimateTarget: number } {
+  try {
+    const p = parseBigFileParams(location.search);
+    return { warnTriangles: p.warnTriangles, decimateTriangles: p.decimateTriangles, decimateTarget: p.decimateTarget };
+  } catch {
+    return {
+      warnTriangles: BIG_FILE_DEFAULTS.warnTriangles,
+      decimateTriangles: BIG_FILE_DEFAULTS.decimateTriangles,
+      decimateTarget: BIG_FILE_DEFAULTS.decimateTarget,
+    };
+  }
+}
+
 export function MeshList(props: {
   app: AppState;
   onLoad: (files: Iterable<File>) => void;
+  onCancelLoad: (id: number) => void;
   onLoadPhantom: (phantom: PhantomKind) => void;
   onLoadSample: (sample: SampleKind) => void;
   onLoadDemo: () => void;
   onFocus: (mesh: Item["mesh"]) => void;
 }) {
-  const { app, onLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus } = props;
+  const { app, onLoad, onCancelLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus } = props;
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
+  const decimateOnLoad = useApp(app, (s) => s.decimateOnLoad);
   const input = useRef<HTMLInputElement>(null);
+  const big = useMemo(bigFileParams, []);
+  const heavy = items.filter((i) => i.triangles >= big.warnTriangles);
+  const heavyBytes = heavy.reduce((n, i) => n + estimateMeshBytes(i.triangles), 0);
 
   return (
-    <section className="panel" aria-label="Meshes">
+    <section className="panel" aria-label="Meshes" data-tour="mesh-list">
       <header className="panel-head">
         <h2>Meshes</h2>
         <button type="button" className="primary" onClick={() => input.current?.click()}>
@@ -98,6 +119,28 @@ export function MeshList(props: {
           A/B/C
         </button>
       </p>
+      <label
+        className="check small"
+        title={`Past ${formatTriangles(big.decimateTriangles)} a load is simplified to ${big.decimateTarget.toLocaleString("en")} triangles (the simplify op)`}
+      >
+        <input
+          type="checkbox"
+          data-action="decimate-on-load"
+          checked={decimateOnLoad}
+          onChange={(e) => app.setDecimateOnLoad(e.currentTarget.checked)}
+        />
+        Decimate big files on load (→ {formatTriangles(big.decimateTarget)})
+      </label>
+      {heavy.length > 0 ? (
+        <p className="warn small" data-big-warning>
+          Heavy {heavy.length === 1 ? "mesh" : "meshes"}:{" "}
+          {heavy.map((i) => `${i.name} (${formatTriangles(i.triangles)})`).join(", ")} {formatMeshBytes(heavyBytes)} in
+          memory.{" "}
+          {decimateOnLoad
+            ? "Future loads decimate past " + formatTriangles(big.decimateTriangles) + "."
+            : "Tick “Decimate big files on load” to simplify future loads."}
+        </p>
+      ) : null}
       {jobs.length > 0 ? (
         <ul className="jobs" aria-label="Loads">
           {jobs.map((job) => (
@@ -105,16 +148,41 @@ export function MeshList(props: {
               <span className="job-name" title={job.name}>
                 {job.name}
               </span>
-              <span className="job-phase">{PHASE[job.phase]}</span>
-              {job.phase === "error" ? (
-                <>
-                  <button type="button" className="icon" aria-label="Dismiss" onClick={() => app.dropJob(job.id)}>
-                    ×
-                  </button>
-                  <span className="job-message">{job.message}</span>
-                </>
-              ) : job.phase !== "done" ? (
+              <span className="job-phase">{job.message === "cancelled" ? "cancelled" : PHASE[job.phase]}</span>
+              {job.phase !== "done" && job.phase !== "error" ? (
+                <button
+                  type="button"
+                  className="icon"
+                  data-action="cancel-load"
+                  data-job={job.id}
+                  title={`Cancel ${job.name}`}
+                  onClick={() => onCancelLoad(job.id)}
+                >
+                  Cancel
+                </button>
+              ) : job.phase === "error" ? (
+                <button type="button" className="icon" aria-label="Dismiss" onClick={() => app.dropJob(job.id)}>
+                  ×
+                </button>
+              ) : null}
+              {typeof job.progress === "number" && job.phase !== "done" ? (
+                <span
+                  className="progress determinate"
+                  role="progressbar"
+                  aria-valuenow={Math.round(job.progress * 100)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`${job.name} progress`}
+                  style={{ width: `${Math.round(job.progress * 100)}%` }}
+                />
+              ) : job.phase !== "done" && job.phase !== "error" ? (
                 <span className="progress" aria-hidden="true" />
+              ) : null}
+              {job.phase === "error" && job.message !== undefined && job.message !== "cancelled" ? (
+                <span className="job-message">{job.message}</span>
+              ) : null}
+              {job.phase === "done" && job.summary !== undefined ? (
+                <span className="job-summary">{job.summary}</span>
               ) : null}
             </li>
           ))}

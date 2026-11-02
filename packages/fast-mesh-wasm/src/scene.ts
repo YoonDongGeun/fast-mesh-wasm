@@ -8,11 +8,34 @@ import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory 
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
 import { copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
+import {
+  brushPick,
+  buildTopology,
+  checkSelection,
+  checkSpec,
+  componentOf,
+  growIds,
+  invertMatrix4,
+  lassoPick,
+  shrinkIds,
+  transformPoint,
+  type IsolateReport,
+  type SelectSpec,
+  type VertexSelection,
+} from "./selection.js";
 import { type MeshViews, meshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
 export type { Range } from "./changes.js";
 export type { MeshViews } from "./views.js";
+export type {
+  BrushSelect,
+  ComponentSelect,
+  IsolateReport,
+  LassoSelect,
+  SelectSpec,
+  VertexSelection,
+} from "./selection.js";
 // Wasm-free, so the Worker client can use them without the wasm glue.
 export { FieldHandle, MeshHandle, rotationMatrix, SectionHandle } from "./handles.js";
 
@@ -252,6 +275,43 @@ export interface DistanceFieldDesc {
   sign?: SignMode;
 }
 
+/**
+ * A per-vertex wall-thickness field to add with
+ * {@link Scene.addThicknessField}: the distance to the opposite surface
+ * along each vertex's smooth normal, in world units (the placement's scale
+ * applied, so scaled meshes read scaled).
+ *
+ * Vertices whose rays escape in both directions (open sheets, the rims of
+ * open meshes), dead slots and unused vertices hold NaN; hits beyond
+ * `maxDistance` hold `Infinity`. Colour it like any field: NaN takes the
+ * rule's `nan` colour, `Infinity` follows `above`.
+ */
+export interface ThicknessFieldDesc {
+  /** Unique among the fields on `on`. */
+  name: string;
+  /** The mesh whose vertices carry the values. */
+  on: MeshHandle;
+  /** Largest thickness kept (inclusive); thicker vertices hold `Infinity`. May be `Infinity`. */
+  maxDistance: number;
+}
+
+/**
+ * A per-vertex curvature field to add with
+ * {@link Scene.addCurvatureField}: the signed mean curvature at each vertex,
+ * in 1/world-units (positive on domes, about `1 / r` on a sphere of radius
+ * `r` with outward normals; negative in bowls and dents; zero on flat
+ * spots; a saddle takes the sign of its dominant bend).
+ *
+ * Dead slots and vertices no triangle uses hold NaN; colour it like any
+ * field: NaN takes the rule's `nan` colour.
+ */
+export interface CurvatureFieldDesc {
+  /** Unique among the fields on `on`. */
+  name: string;
+  /** The mesh whose vertices carry the values. */
+  on: MeshHandle;
+}
+
 /** The state of a field, from {@link Scene.fieldStatus}. */
 export interface FieldStatus {
   /** True when the values match the meshes and placements as they are now. */
@@ -453,8 +513,37 @@ export interface Analysis {
 }
 
 /**
- * Options of {@link Scene.analyze}. Distances are in mesh units: placements are
- * rigid, so local and world distances agree.
+ * Scalar measurements of a mesh, from {@link Scene.measure}. The report is
+ * in world coordinates (the placement applied), so scaled meshes measure
+ * scaled. Thickness (#116) and curvature (#117) build on this.
+ */
+export interface MeasureResult {
+  /** The total triangle area; always defined. */
+  area: number;
+  /**
+   * The enclosed volume, or `null` when the mesh is not watertight (open
+   * or non-manifold), with `volumeReason` saying why. The volume is the
+   * absolute signed sum, so inconsistent winding does not fail the call:
+   * it only shows up in `orientationConflicts`, while partly cancelling
+   * the number. Require `orientationConflicts === 0` for a strict reading.
+   */
+  volume: number | null;
+  /** No boundary loop or open chain and no non-manifold edge. */
+  closed: boolean;
+  /** Why `volume` is `null`; `null` exactly when `closed`. */
+  volumeReason: "open" | "non-manifold" | null;
+  /** The boundary loops and open chains, as `analyze` reports them. */
+  boundaryLoops: number;
+  /** How many edges have three or more triangles. */
+  nonManifoldEdges: number;
+  /** Interior edges used in the same direction by both their triangles. */
+  orientationConflicts: number;
+}
+
+/**
+ * Options of {@link Scene.analyze}. Distances are in mesh units; with a
+ * rigid placement local and world distances agree, with a scaled one local
+ * distances are in unscaled units.
  */
 export interface AnalyzeOptions {
   /**
@@ -555,6 +644,48 @@ export type RepairOp =
       strength: number;
       /** How many plain Laplacian passes to run; 0 moves nothing. */
       cycles: number;
+    }
+  | {
+      op: "offset";
+      /**
+       * How far to move the surface along its smooth normals, in mesh units
+       * (equal to world units). Positive follows the normals (outward on an
+       * outward-wound closed mesh); negative sinks inward. Must be finite;
+       * 0 moves nothing.
+       */
+      distance: number;
+    }
+  | {
+      op: "shell";
+      /**
+       * Wall thickness in mesh units (equal to world units): the input
+       * surface stays and gains a reversed copy one thickness against its
+       * smooth normals, with every boundary rim stitched shut. Must be
+       * positive and finite.
+       */
+      thickness: number;
+    }
+  | {
+      op: "simplify";
+      /**
+       * Stop once this many triangles are alive; must be at least 1. A target
+       * at or above the live count leaves the mesh alone.
+       */
+      targetTriangles: number;
+      /** Keep boundary vertices in place; defaults to `true`. */
+      preserveBoundary?: boolean;
+    }
+  | {
+      op: "subdivide";
+      /**
+       * Subdivision scheme; only `"loop"` exists. Defaults to `"loop"`.
+       */
+      method?: "loop";
+      /**
+       * How many times to split every triangle; must be an integer of at
+       * least 1. Each level quadruples the triangle count. Defaults to `1`.
+       */
+      levels?: number;
     };
 
 /** What `weld` did. */
@@ -645,6 +776,48 @@ export interface RelaxReport {
   maxDisplacement: number;
 }
 
+/** What `offset` did. */
+export interface OffsetReport {
+  moved: number;
+  maxDisplacement: number;
+  /** Degenerate triangles the cleanup pass removed. */
+  degenerateRemoved: number;
+  /** Vertices the cleanup pass removed. */
+  verticesRemoved: number;
+}
+
+/** What `shell` did. */
+export interface ShellReport {
+  /** Copy vertices added. */
+  verticesAdded: number;
+  /** Copy and wall triangles added. */
+  trianglesAdded: number;
+  /** Boundary rims stitched to their copy. A closed mesh has none. */
+  loopsClosed: number;
+  /** Degenerate triangles the cleanup pass removed. */
+  degenerateRemoved: number;
+  /** Vertices the cleanup pass removed. */
+  verticesRemoved: number;
+}
+
+/** What `simplify` did. */
+export interface SimplifyReport {
+  /** Edge collapses performed. */
+  collapsed: number;
+  /** Triangles removed (one per boundary collapse, two per interior one). */
+  trianglesRemoved: number;
+  /** Vertices removed (one per collapse). */
+  verticesRemoved: number;
+}
+
+/** What `subdivide` did. */
+export interface SubdivideReport {
+  /** Vertices added, one per subdivided edge per level. */
+  verticesAdded: number;
+  /** Triangles added: three per subdivided triangle per level. */
+  trianglesAdded: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -665,6 +838,32 @@ export interface JoinReport {
   bridgeTrianglesAdded: number;
 }
 
+/** Options of {@link Scene.cutByPlane}. */
+export interface CutOptions {
+  /**
+   * Close both openings with flat, unfaired patches. Defaults to `true`;
+   * without it both parts keep the open rim the cut leaves.
+   */
+  cap?: boolean;
+}
+
+/** What {@link Scene.cutByPlane} did. */
+export interface CutReport {
+  /** The original handle, now holding the `+` side. */
+  kept: MeshHandle;
+  /** The new handle holding the `-` side. */
+  removed: MeshHandle;
+  /** Alive triangles of {@link CutReport.kept}, cap included. */
+  keptTriangles: number;
+  /** Alive triangles of {@link CutReport.removed}, cap included. */
+  removedTriangles: number;
+  /** Cap triangles added on both sides together. */
+  capTriangles: number;
+}
+
+/** Which boolean for {@link Scene.boolean} to compute. */
+export type BooleanOp = "union" | "subtract" | "intersect";
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -677,7 +876,11 @@ export type RepairReport =
   | RemeshReport
   | BridgeReport
   | GrabReport
-  | RelaxReport;
+  | RelaxReport
+  | OffsetReport
+  | ShellReport
+  | SimplifyReport
+  | SubdivideReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -702,7 +905,15 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                     ? GrabReport
                     : O extends { op: "relax" }
                       ? RelaxReport
-                      : RepairReport;
+                      : O extends { op: "offset" }
+                        ? OffsetReport
+                        : O extends { op: "shell" }
+                          ? ShellReport
+                          : O extends { op: "simplify" }
+                            ? SimplifyReport
+                            : O extends { op: "subdivide" }
+                              ? SubdivideReport
+                              : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -745,6 +956,21 @@ function vec3At(a: Float64Array, at: number): Vec3 {
 
 function invalid(message: string): FastMeshError {
   return new FastMeshError("INVALID_ARGUMENT", message);
+}
+
+/**
+ * The mean stretch of a column-major 4x4's linear part: the cube root of
+ * its determinant. World-space brush radii divide by it, exact for rigid
+ * placements and a documented approximation under non-uniform scale.
+ */
+function meanStretch(m: Float64Array): number {
+  const det =
+    m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5]);
+  const s = Math.cbrt(Math.abs(det));
+  if (s === 0 || !Number.isFinite(s)) {
+    throw invalid("the mesh placement is not invertible");
+  }
+  return s;
 }
 
 const U32_LIMIT = 2 ** 32;
@@ -863,9 +1089,14 @@ const REPAIR_CODES = {
   bridgeLoops: 8,
   grab: 9,
   relax: 10,
+  offset: 11,
+  shell: 12,
+  simplify: 13,
+  subdivide: 14,
 } as const;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
+const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
 function optional(v: number | undefined, what: string): number {
@@ -1002,6 +1233,24 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         values.push(d[0], d[1], d[2]);
         break;
       }
+      case "offset":
+        values.push(optional(o.distance, "distance"));
+        break;
+      case "shell":
+        values.push(optional(o.thickness, "thickness"));
+        break;
+      case "simplify":
+        values.push(
+          optional(o.targetTriangles, "targetTriangles"),
+          flagOf(o.preserveBoundary, true),
+        );
+        break;
+      case "subdivide":
+        values.push(
+          o.method === undefined ? Number.NaN : codeIn(SUBDIVIDE_METHOD_CODES, o.method, "method"),
+          optional(o.levels, "levels"),
+        );
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -1095,6 +1344,25 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { trianglesAdded: r.next() };
     case "grab":
       return { moved: r.next(), maxDisplacement: r.next() };
+    case "offset":
+      return {
+        moved: r.next(),
+        maxDisplacement: r.next(),
+        degenerateRemoved: r.next(),
+        verticesRemoved: r.next(),
+      };
+    case "shell":
+      return {
+        verticesAdded: r.next(),
+        trianglesAdded: r.next(),
+        loopsClosed: r.next(),
+        degenerateRemoved: r.next(),
+        verticesRemoved: r.next(),
+      };
+    case "simplify":
+      return { collapsed: r.next(), trianglesRemoved: r.next(), verticesRemoved: r.next() };
+    case "subdivide":
+      return { verticesAdded: r.next(), trianglesAdded: r.next() };
   }
 }
 
@@ -1462,30 +1730,88 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * Sets a mesh's placement: world = rotation · local + translation, where
-   * local is relative to the mesh origin. A quaternion is normalised and
-   * converted in double precision.
+   * Cuts `mesh` with a world `plane`: the `+` side
+   * (`signedDistance >= 0`) stays on the mesh and the `-` side is added as
+   * a new mesh with the same placement, so the world shape is kept.
+   * Cutting a closed mesh with `cap` (the default) yields two closed
+   * meshes, capped with flat, unfaired patches.
    *
-   * @throws `INVALID_ARGUMENT` when the rotation is not a proper rotation or a quaternion is zero.
+   * The cut undoes in one step; the added mesh stays, like the removed
+   * source of {@link Scene.join}.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
+   * the plane does not cut the mesh or a rim cannot be capped. A failed cut
+   * changes nothing.
+   */
+  cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): CutReport {
+    const { index, generation } = this.#id(mesh);
+    const p = this.#plane(plane);
+    const r = call(() => this.#scene().cut_by_plane(index, generation, p, options?.cap ?? true));
+    return {
+      kept: this.#meshHandle(r[0], r[1]),
+      removed: this.#meshHandle(r[2], r[3]),
+      keptTriangles: r[4],
+      removedTriangles: r[5],
+      capTriangles: r[6],
+    };
+  }
+
+  /**
+   * Combines `source` into `target` in the world: the union, subtraction
+   * (`target` minus `source`) or intersection. Returns `target`, now
+   * holding the result with its placement; `source` is unchanged.
+   *
+   * Both meshes must be closed and manifold. The boolean undoes in one
+   * step. Combining a mesh with itself is a no-op for `"union"` and
+   * `"intersect"`, and clears it for `"subtract"`.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for an
+   * input that is not closed, manifold and consistently wound. A failed
+   * boolean changes nothing.
+   */
+  boolean(target: MeshHandle, source: MeshHandle, op: BooleanOp): MeshHandle {
+    const ta = this.#id(target);
+    const sb = this.#id(source);
+    const code = codeIn({ union: 0, subtract: 1, intersect: 2 }, op, "op");
+    const r = call(() =>
+      this.#scene().boolean(ta.index, ta.generation, sb.index, sb.generation, code),
+    );
+    return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Sets a mesh's placement: world = rotation · (scale · local) + translation,
+   * where local is relative to the mesh origin. A quaternion is normalised
+   * and converted in double precision. The scale defaults to `[1, 1, 1]`
+   * (rigid) and must be 3 finite positive numbers.
+   *
+   * @throws `INVALID_ARGUMENT` when the rotation is not a proper rotation, the
+   * scale is not 3 finite positive numbers, or a quaternion is zero.
    */
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void {
     const { index, generation } = this.#id(mesh);
     const r = Float64Array.from(rotationMatrix(placement.rotation));
     const t = Float64Array.from(placement.translation);
-    call(() => this.#scene().set_placement(index, generation, r, t));
+    const s = placement.scale === undefined ? undefined : Float64Array.from(placement.scale);
+    call(() => this.#scene().set_placement(index, generation, r, t, s));
   }
 
   /** A mesh's placement, with the rotation as a row-major matrix. */
   placement(mesh: MeshHandle): Placement {
     const { index, generation } = this.#id(mesh);
     const p = call(() => this.#peek().placement(index, generation));
-    return { rotation: Array.from(p.subarray(0, 9)), translation: [p[9], p[10], p[11]] };
+    return {
+      rotation: Array.from(p.subarray(0, 9)),
+      translation: [p[9], p[10], p[11]],
+      scale: [p[12], p[13], p[14]],
+    };
   }
 
   /**
    * The column-major world matrix of the local render coordinates,
    * `placement · translate(origin)`, ready for renderers (convert to `f32`
-   * yourself).
+   * yourself). The rotation columns carry the scale; normals need the
+   * inverse-transpose (three.js' normal matrix does this from the matrix).
    */
   matrix4(mesh: MeshHandle): Float64Array {
     const { index, generation } = this.#id(mesh);
@@ -1790,8 +2116,8 @@ export class Scene implements SceneLike {
           return;
         }
         // Validate the shape and the values now, so a bad pose throws here
-        // and not at the frame. Whether a matrix is a proper rotation is
-        // still checked when the pose is applied.
+        // and not at the frame. Whether a matrix is a proper rotation (and
+        // the scale positive) is still checked when the pose is applied.
         const rotation = rotationMatrix(placement.rotation);
         if (!rotation.every(Number.isFinite)) {
           throw invalid("rotation must be finite numbers");
@@ -1800,7 +2126,15 @@ export class Scene implements SceneLike {
         if (t?.length !== 3 || ![t[0], t[1], t[2]].every(Number.isFinite)) {
           throw invalid("translation must be 3 finite numbers");
         }
-        pending = { rotation, translation: [t[0], t[1], t[2]] };
+        const s = placement.scale;
+        if (s !== undefined && (s.length !== 3 || ![s[0], s[1], s[2]].every(Number.isFinite))) {
+          throw invalid("scale must be 3 finite numbers");
+        }
+        pending = {
+          rotation,
+          translation: [t[0], t[1], t[2]],
+          ...(s === undefined ? {} : { scale: [s[0], s[1], s[2]] as Vec3 }),
+        };
       },
       end: () => {
         if (finish()) {
@@ -1897,6 +2231,28 @@ export class Scene implements SceneLike {
     const si = options.selfIntersection ?? false;
     const r = call(() => this.#scene().analyze(index, generation, tolerance, si, maxListed));
     return decodeAnalysis(new Reader(r));
+  }
+
+  /**
+   * Scalar measurements of a mesh in world coordinates: its surface area
+   * (always) and, when watertight, its enclosed volume. An open or
+   * non-manifold mesh still gets its area; only `volume` is `null`, with
+   * `volumeReason` saying why. A read-only call: it leaves every view
+   * valid.
+   */
+  measure(mesh: MeshHandle): MeasureResult {
+    const { index, generation } = this.#id(mesh);
+    const r = call(() => this.#peek().measure(index, generation));
+    const closed = r[2] === 1;
+    return {
+      area: r[0],
+      volume: Number.isNaN(r[1]) ? null : r[1],
+      closed,
+      volumeReason: closed ? null : r[3] === 2 ? "non-manifold" : "open",
+      boundaryLoops: r[4],
+      nonManifoldEdges: r[5],
+      orientationConflicts: r[6],
+    };
   }
 
   /**
@@ -2024,6 +2380,160 @@ export class Scene implements SceneLike {
     return out;
   }
 
+  // ---- Selections ----
+
+  /**
+   * Selects vertices of a mesh: a sphere brush, a lasso polygon, or the
+   * connected component holding a seed vertex. The result is a snapshot
+   * (ascending ids plus the mesh's content stamp); any edit, repair, compact,
+   * undo or redo of the mesh invalidates it, and the selection methods then
+   * throw `STALE_SELECTION` instead of silently remapping ids. Placement
+   * changes keep selections valid. Only vertices a live triangle uses can
+   * be selected (dead or never-used slots never are).
+   *
+   * @throws `UNKNOWN_MESH` for a removed mesh; `INVALID_ARGUMENT` for a bad
+   * spec; `INVALID_INDEX` for an out-of-range component seed.
+   */
+  select(mesh: MeshHandle, spec: SelectSpec): VertexSelection {
+    checkSpec(spec);
+    this.#id(mesh);
+    const views = this.views(mesh);
+    const slots = this.vertexSlots(mesh);
+    const positions = views.positions().slice();
+    const indices = views.indices().slice();
+    const topology = buildTopology(indices, slots);
+    let ids: number[];
+    switch (spec.kind) {
+      case "brush": {
+        let center = spec.center;
+        let radius = spec.radius;
+        if (spec.space === "world") {
+          const inv = invertMatrix4(this.matrix4(mesh));
+          center = transformPoint(inv, spec.center);
+          radius = spec.radius / meanStretch(this.matrix4(mesh));
+        }
+        ids = brushPick(positions, topology.used, center, radius);
+        break;
+      }
+      case "lasso":
+        ids = lassoPick(positions, topology.used, spec.polygon, spec.axis ?? "xy");
+        break;
+      case "component":
+        ids = componentOf(topology, spec.seed);
+        break;
+    }
+    return { mesh, vertices: Uint32Array.from(ids), stamp: meshAdds(this).stamp(mesh) };
+  }
+
+  /**
+   * Whether `sel` is still usable: its mesh is alive and no topology edit
+   * landed since it was taken. Never throws.
+   */
+  selectionAlive(sel: VertexSelection): boolean {
+    try {
+      if (sel === null || typeof sel !== "object" || !(sel.vertices instanceof Uint32Array)) {
+        return false;
+      }
+      this.#id(sel.mesh);
+      return Number.isInteger(sel.stamp) && sel.stamp === meshAdds(this).stamp(sel.mesh);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Reads the mesh's topology and checks `sel` against its stamp. */
+  #selectionTopology(sel: VertexSelection): ReturnType<typeof buildTopology> {
+    this.#id(sel.mesh);
+    checkSelection(sel, sel.mesh, meshAdds(this).stamp(sel.mesh));
+    const views = this.views(sel.mesh);
+    return buildTopology(views.indices().slice(), this.vertexSlots(sel.mesh));
+  }
+
+  /**
+   * Grows a selection by `steps` rings of edge neighbours (staying on live
+   * vertices). The result carries the current stamp, so a fresh selection
+   * can be grown right after an edit. `steps` 0 returns an equal copy.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectGrow(sel: VertexSelection, steps = 1): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    return { mesh: sel.mesh, vertices: Uint32Array.from(growIds(topology, sel.vertices, steps)), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Shrinks a selection by `steps` rings, dropping the members with a live
+   * neighbour outside the set. Interior selections (no boundary) survive
+   * unchanged; shrinking past the core gives an empty (still valid)
+   * selection.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectShrink(sel: VertexSelection, steps = 1): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    return { mesh: sel.mesh, vertices: Uint32Array.from(shrinkIds(topology, sel.vertices, steps)), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Inverts a selection: every live vertex outside it. The result carries
+   * the current stamp.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  selectInvert(sel: VertexSelection): VertexSelection {
+    const topology = this.#selectionTopology(sel);
+    const inSet = new Set(sel.vertices);
+    const out: number[] = [];
+    for (let v = 0; v < topology.used.length; v++) {
+      if (topology.used[v] === 1 && !inSet.has(v)) {
+        out.push(v);
+      }
+    }
+    return { mesh: sel.mesh, vertices: Uint32Array.from(out), stamp: meshAdds(this).stamp(sel.mesh) };
+  }
+
+  /**
+   * Isolates a selection: removes the triangles fully outside it (no
+   * selected vertex), one undo step. Boundary triangles with at least one
+   * selected vertex stay. An empty selection selects nothing to keep and
+   * throws `INVALID_ARGUMENT` rather than clearing the mesh.
+   *
+   * @throws `STALE_SELECTION` when the mesh changed since the selection;
+   * `UNKNOWN_MESH` for a removed mesh.
+   */
+  isolate(mesh: MeshHandle, sel: VertexSelection): IsolateReport {
+    this.#id(mesh);
+    checkSelection(sel, mesh, meshAdds(this).stamp(mesh));
+    if (sel.vertices.length === 0) {
+      throw invalid("isolate needs a non-empty selection");
+    }
+    const inSet = new Set(sel.vertices);
+    const views = this.views(mesh);
+    const indices = views.indices().slice();
+    const drop: number[] = [];
+    for (let t = 0; t * 3 + 2 < indices.length; t++) {
+      const a = indices[t * 3];
+      const b = indices[t * 3 + 1];
+      const c = indices[t * 3 + 2];
+      if (a === 0 && b === 0 && c === 0) {
+        continue;
+      }
+      if (!inSet.has(a) && !inSet.has(b) && !inSet.has(c)) {
+        drop.push(t);
+      }
+    }
+    if (drop.length > 0) {
+      this.edit(mesh, [{ op: "removeTriangles", triangles: Uint32Array.from(drop) }]);
+    }
+    return {
+      removedTriangles: drop.length,
+      selection: { mesh, vertices: sel.vertices.slice(), stamp: meshAdds(this).stamp(mesh) },
+    };
+  }
+
   // ---- Fields and colours ----
 
   /**
@@ -2038,6 +2548,43 @@ export class Scene implements SceneLike {
    */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
     return this.#addField(desc, false);
+  }
+
+  /**
+   * Adds a per-vertex wall-thickness field: one value per vertex slot of
+   * `on`, the distance to the opposite surface along the vertex's smooth
+   * normal, in world units. Open sheets and rims read NaN, hits beyond
+   * `maxDistance` read `Infinity`. It follows edits and placements by the
+   * mesh modes, like normals, and colours like any field.
+   *
+   * @throws `INVALID_ARGUMENT` when `maxDistance` is negative or NaN, or the name is taken.
+   */
+  addThicknessField(desc: ThicknessFieldDesc): FieldHandle {
+    const s = this.#scene();
+    const ids = this.#flatIds([desc.on]);
+    if (typeof desc.name !== "string") {
+      throw invalid("name must be a string");
+    }
+    const raw = call(() => s.add_thickness_field(desc.name, ids, desc.maxDistance));
+    return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
+  }
+
+  /**
+   * Adds a per-vertex curvature field: one value per vertex slot of `on`,
+   * the signed mean curvature there, in 1/world-units (positive on domes,
+   * negative in bowls, zero on flats). It follows edits and placements by
+   * the mesh modes, like normals, and colours like any field.
+   *
+   * @throws `INVALID_ARGUMENT` when the name is taken.
+   */
+  addCurvatureField(desc: CurvatureFieldDesc): FieldHandle {
+    const s = this.#scene();
+    const ids = this.#flatIds([desc.on]);
+    if (typeof desc.name !== "string") {
+      throw invalid("name must be a string");
+    }
+    const raw = call(() => s.add_curvature_field(desc.name, ids));
+    return this.#rawHandle(this.#fields, () => new FieldHandle(), raw);
   }
 
   /** `addDistanceField`, or with `deferred` its internal variant that computes nothing yet. */

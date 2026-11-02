@@ -17,7 +17,9 @@ export type LoaderRequest =
   /** Drop a retained source volume (fire-and-forget: no reply). */
   | { kind: "dropVolume"; volumeId: string }
   /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each. */
-  | { kind: "demo"; id: number; big: boolean };
+  | { kind: "demo"; id: number; big: boolean }
+  /** Drop the worker-side job `id`: its late reply is ignored page-side. */
+  | { kind: "cancel"; id: number };
 
 /** A mesh ready for `store.addMesh`; its arrays are transferred to the page. */
 export interface LoadedMesh {
@@ -48,6 +50,8 @@ export interface VolumePayload {
 
 export type LoaderReply =
   | { kind: "parsing"; id: number }
+  /** Coarse stage progress (the parsers run as single calls; see #64). */
+  | { kind: "progress"; id: number; phase: "reading" | "parsing"; fraction: number }
   | { kind: "meshes"; id: number; meshes: LoadedMesh[] }
   | { kind: "volume"; id: number; volume: VolumePayload }
   | { kind: "error"; id: number; message: string };

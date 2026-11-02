@@ -29,6 +29,7 @@
 //! any thread count.
 
 mod color;
+mod curvature;
 mod distance;
 mod error;
 mod geom;
@@ -36,10 +37,13 @@ mod multi;
 mod sign;
 #[cfg(test)]
 mod test_util;
+mod thickness;
 mod winding;
 
 pub use color::{ColorRule, Colormap, OutOfRange, color_of};
+pub use curvature::curvatures;
 pub use distance::signed_distances;
 pub use error::{FieldsError, Result};
 pub use multi::{Target, signed_distances_multi};
 pub use sign::{SignBuild, SignData, SignMode, SignStatus};
+pub use thickness::thicknesses;

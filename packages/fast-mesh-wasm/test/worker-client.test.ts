@@ -295,6 +295,50 @@ describe("WorkerScene", () => {
     expect(scene.views(b).indices().length).toBe(6);
   });
 
+  it("measure_matches_local_scene", async () => {
+    const { scene } = await start();
+    const local = new Scene();
+    // A closed unit cube, outward wound.
+    const box = {
+      positions: Float64Array.from([
+        0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1,
+      ]),
+      indices: Uint32Array.from([
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6,
+        1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+      ]),
+    };
+    const a = scene.addMesh(box.positions, box.indices);
+    const la = local.addMesh(box.positions, box.indices);
+    const got = await scene.measure(a);
+    expect(got).toEqual(local.measure(la));
+    expect(got.area).toBeCloseTo(6, 9);
+    expect(got.volume).toBeCloseTo(1, 9);
+    expect(got.closed).toBe(true);
+    // An open quad: area without volume, with the reason.
+    const quad = {
+      positions: Float64Array.from([0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0]),
+      indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    };
+    const b = scene.addMesh(quad.positions, quad.indices);
+    const lb = local.addMesh(quad.positions, quad.indices);
+    const open = await scene.measure(b);
+    expect(open).toEqual(local.measure(lb));
+    expect(open.area).toBeCloseTo(4, 9);
+    expect(open.volume).toBeNull();
+    expect(open.volumeReason).toBe("open");
+    expect(open.closed).toBe(false);
+    // A removed mesh reports UNKNOWN_MESH, like the other queries.
+    scene.removeMesh(b);
+    const e = await scene.measure(b).then(
+      () => undefined,
+      (x: unknown) => x,
+    );
+    expect(e).toBeInstanceOf(FastMeshError);
+    expect((e as FastMeshError).code).toBe("UNKNOWN_MESH");
+    local.free();
+  });
+
   it("values_mirror_is_opt_in", async () => {
     const { scene, w } = await start();
     const sent: (ArrayBuffer | null)[] = [];
@@ -1089,6 +1133,52 @@ describe("WorkerScene", () => {
     const pending = scene.raycast([0, 0, 0], [1, 0, 0]);
     scene.terminate();
     await expect(pending).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
+  it("placement_scale_round_trip", async () => {
+    const { scene } = await start();
+    const s = sphere([3, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    expect(scene.placement(a).scale).toEqual([1, 1, 1]);
+
+    // setPlacement carries the scale; the mirror and the matrix follow.
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0], scale: [2, 0.5, 3] });
+    await settle(scene);
+    expect(scene.placement(a)).toEqual({
+      rotation: IDENTITY,
+      translation: [1, 0, 0],
+      scale: [2, 0.5, 3],
+    });
+    const m = scene.matrix4(a);
+    expect([m[0], m[5], m[10]]).toEqual([2, 0.5, 3]);
+    expect(m[12]).toBe(2 * 3 + 1);
+    await expectMirrored(scene, a);
+
+    // A drag move shows its scale at once and settles on it.
+    const d = scene.drag(a);
+    d.move({ rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 2, 1] });
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+    d.end();
+    await settle(scene);
+    await expectMirrored(scene, a);
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+
+    // A restart replays the scale.
+    await scene.restart();
+    scene.commitFrame();
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+    await expectMirrored(scene, a);
+
+    // A malformed scale throws here, as Scene does.
+    let code: string | undefined;
+    try {
+      scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 1] as never });
+    } catch (e) {
+      expect(e).toBeInstanceOf(FastMeshError);
+      code = (e as FastMeshError).code;
+    }
+    expect(code).toBe("INVALID_ARGUMENT");
   });
 
   it("package_worker_export_resolves", () => {

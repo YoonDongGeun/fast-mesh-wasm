@@ -2,15 +2,17 @@
 //! [`fast_mesh_bvh`] and [`fast_mesh_query`].
 //!
 //! A [`Scene`] owns meshes, each with a BVH, an [`UpdateMode`] and a
-//! [`Placement`] (a rigid transform into the world). Meshes are addressed by
-//! generational [`MeshId`]s: once a mesh is removed, its id is rejected with
-//! [`SceneError::UnknownMesh`] for good.
+//! [`Placement`] (a rotation, a per-axis scale and a translation into the
+//! world). Meshes are addressed by generational [`MeshId`]s: once a mesh is
+//! removed, its id is rejected with [`SceneError::UnknownMesh`] for good.
 //!
 //! - Registry: [`Scene::add_mesh`], [`Scene::remove_mesh`], [`Scene::mesh`]
 //!   and [`Scene::ids`] (in index order).
 //! - Placements: [`Scene::placement`] and [`Scene::set_placement`]. A
-//!   placement is validated like a [`fast_mesh_query::Rigid`] and stored
-//!   exactly as given.
+//!   placement is validated (a proper rotation, a finite positive scale)
+//!   and stored exactly as given. World queries, fields and sections all
+//!   follow the scale; pair queries run on copies baked into one mesh's
+//!   local space (or into the world) when a scale is involved.
 //! - Editing: [`Scene::edit`] runs a store transaction on one mesh and
 //!   records its patch. All-or-nothing: a failed edit changes nothing.
 //!   The closure may fail with any error that converts into
@@ -19,6 +21,12 @@
 //!   `scene.edit(id, |tx| ops::fill_holes(tx, &options))`.
 //! - Joining: [`Scene::join`] appends one mesh's geometry into another and
 //!   bridges a loop on each, as one undo step, then removes the source mesh.
+//! - Cutting: [`Scene::cut_by_plane`] splits a mesh with a world plane,
+//!   capping both openings flat by default, and adds the removed side as a
+//!   new mesh with the same placement, as one undo step.
+//! - Booleans: [`Scene::boolean`] unions, subtracts or intersects mesh B
+//!   into mesh A in the world; the result replaces A with A's placement,
+//!   as one undo step.
 //! - History: one undo history across all meshes, in steps.
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
@@ -74,7 +82,10 @@
 //!   [`Scene::section_gap`]; changes are reported in
 //!   [`MeshChanges::sections_changed`].
 
+mod baked;
+mod boolean;
 mod contacts;
+mod cut;
 mod error;
 mod fields;
 mod history;
@@ -87,14 +98,18 @@ mod report;
 mod scene;
 mod sections;
 
+pub use boolean::{BooleanOp, BooleanReport};
 pub use contacts::{Contact, ContactFilter};
+pub use cut::{CutOptions, CutReport};
 pub use error::{Result, SceneError};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
 };
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
-pub use fields::{Coloring, DistanceField, FieldBudget, FieldStatus, StepState};
+pub use fields::{
+    Coloring, CurvatureField, DistanceField, FieldBudget, FieldStatus, StepState, ThicknessField,
+};
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;

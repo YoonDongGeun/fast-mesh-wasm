@@ -132,6 +132,7 @@ fn turned(deg: f64, t: [f64; 3]) -> Placement {
     Placement {
         rotation: r,
         translation,
+        ..Placement::IDENTITY
     }
 }
 

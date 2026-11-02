@@ -119,10 +119,14 @@ describe("Scene", () => {
   it("quaternion_and_matrix_placement", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);
-    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [0, 0, 0] });
+    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 1, 1] });
 
     s.setPlacement(mesh, { rotation: QUARTER_Z, translation: [10, 20, 30] });
-    expect(s.placement(mesh)).toEqual({ rotation: QUARTER_Z, translation: [10, 20, 30] });
+    expect(s.placement(mesh)).toEqual({
+      rotation: QUARTER_Z,
+      translation: [10, 20, 30],
+      scale: [1, 1, 1],
+    });
 
     // The same quarter turn as a quaternion, unnormalised: normalised first.
     s.setPlacement(mesh, { rotation: [0, 0, 3, 3], translation: [1, 2, 3] });
@@ -156,6 +160,52 @@ describe("Scene", () => {
     );
     // Failed calls leave the placement alone.
     expectClose(s.placement(mesh).rotation, [1, 0, 0, 0, c, -sn, 0, sn, c], 1e-15);
+  });
+
+  it("scaled_placement", () => {
+    const s = scene();
+    const mesh = s.addMesh(quad, quadTris);
+    // The default scale is rigid.
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
+
+    // Uniform and non-uniform scales round-trip; the matrix columns scale.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [10, 20, 30], scale: [2, 2, 2] });
+    expect(s.placement(mesh)).toEqual({
+      rotation: IDENTITY,
+      translation: [10, 20, 30],
+      scale: [2, 2, 2],
+    });
+    // matrix4 = placement · translate(origin); the origin is (1, 1, 0.5),
+    // so the last column is R·(S·o) + t = (2, 2, 1) + (10, 20, 30).
+    expectClose(
+      s.matrix4(mesh),
+      [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 12, 22, 31, 1],
+      1e-15,
+    );
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0], scale: [2, 1, 0.5] });
+    expect(s.placement(mesh).scale).toEqual([2, 1, 0.5]);
+    expectClose(
+      s.matrix4(mesh),
+      [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.5, 0, 2, 1, 0.25, 1],
+      1e-15,
+    );
+
+    // Omitting the scale leaves the mesh rigid.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0] });
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
+
+    // Bad scales are rejected and leave the placement alone.
+    const t: [number, number, number] = [0, 0, 0];
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [0, 1, 1] })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [1, -1, 1] })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.setPlacement(mesh, { rotation: IDENTITY, translation: t, scale: [1, 1] as never })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(s.placement(mesh).scale).toEqual([1, 1, 1]);
   });
 
   it("views_match_engine", () => {
@@ -350,6 +400,182 @@ describe("Scene", () => {
     expect(codeOf(() => s.vertexCount({} as MeshHandle))).toBe("INVALID_ARGUMENT");
   });
 
+  it("cut_by_plane_splits_and_caps", () => {
+    const s = scene();
+    // A closed unit cube, outward wound.
+    const box = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const boxTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6,
+      1, 6, 5, 3, 0, 4, 3, 4, 7,
+    ];
+    const mesh = s.addMesh(box, boxTris);
+    s.takeChanges();
+    const r = s.cutByPlane(mesh, { origin: [0.5, 0, 0], normal: [1, 0, 0] });
+    expect(r.kept).toBe(mesh);
+    expect(r.removed).not.toBe(mesh);
+    // Both parts closed: the caps are there.
+    expect(s.analyze(mesh).loops).toEqual([]);
+    expect(s.analyze(r.removed).loops).toEqual([]);
+    expect(r.keptTriangles).toBe(s.triangleCount(mesh));
+    expect(r.removedTriangles).toBe(s.triangleCount(r.removed));
+    expect(r.capTriangles).toBeGreaterThan(0);
+    // The kept side is the + one: bounds cover the live triangles in
+    // local coordinates, and the identity placement puts the origin at
+    // matrix4[12..14] (dead slots keep stale positions, so the raw
+    // buffer is not checked directly).
+    const keptBounds = s.bounds(mesh)!;
+    const keptOriginX = s.matrix4(mesh)[12];
+    expect(keptBounds.min[0] + keptOriginX).toBeGreaterThanOrEqual(0.5 - 1e-6);
+    // One undo step restores the cut mesh; the added part stays.
+    expect(s.undo()).toBe(true);
+    expect(s.triangleCount(mesh)).toBe(12);
+    expect(s.triangleCount(r.removed)).toBe(r.removedTriangles);
+    // A plane past the cube misses it.
+    expect(codeOf(() => s.cutByPlane(mesh, { origin: [5, 0, 0], normal: [1, 0, 0] }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+    expect(s.triangleCount(mesh)).toBe(12);
+  });
+
+  it("measure_reports_area_and_volume", () => {
+    const s = scene();
+    // A closed unit cube, outward wound.
+    const box = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const boxTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6,
+      1, 6, 5, 3, 0, 4, 3, 4, 7,
+    ];
+    const mesh = s.addMesh(box, boxTris);
+    const got = s.measure(mesh);
+    expect(got.area).toBeCloseTo(6, 9);
+    expect(got.volume).toBeCloseTo(1, 9);
+    expect(got.closed).toBe(true);
+    expect(got.volumeReason).toBeNull();
+    expect(got.boundaryLoops).toBe(0);
+    expect(got.nonManifoldEdges).toBe(0);
+    expect(got.orientationConflicts).toBe(0);
+    // A uniform scale of 2: area x4, volume x8.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0], scale: [2, 2, 2] });
+    const scaled = s.measure(mesh);
+    expect(scaled.area).toBeCloseTo(24, 9);
+    expect(scaled.volume).toBeCloseTo(8, 9);
+    expect(scaled.closed).toBe(true);
+    // An open quad: area without volume, with the reason.
+    const open = s.addMesh(quad, quadTris);
+    const m = s.measure(open);
+    expect(m.area).toBeCloseTo(4 + Math.SQRT2, 9);
+    expect(m.volume).toBeNull();
+    expect(m.volumeReason).toBe("open");
+    expect(m.closed).toBe(false);
+    expect(m.boundaryLoops).toBeGreaterThan(0);
+    expect(codeOf(() => s.measure({} as MeshHandle))).toBe("INVALID_ARGUMENT");
+  });
+
+  it("thickness_reads_wall_depth_and_colors", () => {
+    const s = scene();
+    // A closed unit cube, outward wound.
+    const box = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const boxTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6,
+      1, 6, 5, 3, 0, 4, 3, 4, 7,
+    ];
+    const mesh = s.addMesh(box, boxTris);
+    const thick = s.addThicknessField({ name: "t", on: mesh, maxDistance: Number.POSITIVE_INFINITY });
+    const values = Array.from(s.fieldValues(thick));
+    expect(values).toHaveLength(8);
+    for (const v of values) {
+      expect(Number.isFinite(v)).toBe(true);
+      expect(v).toBeGreaterThanOrEqual(1 - 1e-3);
+      expect(v).toBeLessThanOrEqual(2 * Math.sqrt(3) + 1e-3);
+    }
+    // Colours like any field: Infinity would follow `above`, NaN `nan`.
+    s.setColoring(mesh, { field: thick, map: "turbo", range: [0, 5] });
+    expect(s.coloring(mesh)?.field).toBe(thick);
+    expect(s.fieldTargets(thick)).toEqual([]);
+    expect(s.fieldTargetStatus(thick)).toEqual([]);
+    // A uniform scale of 2 doubles every thickness.
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0], scale: [2, 2, 2] });
+    const scaled = Array.from(s.fieldValues(thick));
+    for (let k = 0; k < values.length; k++) {
+      expect(scaled[k]).toBeCloseTo(2 * values[k], 4);
+    }
+    // An open sheet reads NaN everywhere (open boundary → null thickness).
+    const open = s.addMesh(quad.slice(0, 12), [0, 1, 2, 0, 2, 3]);
+    const thin = s.addThicknessField({ name: "t", on: open, maxDistance: Number.POSITIVE_INFINITY });
+    expect(Array.from(s.fieldValues(thin))).toEqual([NaN, NaN, NaN, NaN]);
+    s.setColoring(open, { field: thin, map: "turbo", range: [0, 5] });
+    const colors = s.views(open).colors!()!;
+    expect(colors.length).toBe(4 * 4);
+    for (let k = 0; k < colors.length; k += 4) {
+      expect(Array.from(colors.slice(k, k + 4))).toEqual([128, 128, 128, 255]);
+    }
+    // maxDistance caps: a bound below every thickness reads Infinity.
+    s.removeField(thick);
+    const capped = s.addThicknessField({ name: "c", on: mesh, maxDistance: 0.1 });
+    expect(Array.from(s.fieldValues(capped)).every((v) => v === Number.POSITIVE_INFINITY)).toBe(true);
+    expect(codeOf(() => s.addThicknessField({ name: "c", on: mesh, maxDistance: 1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.addThicknessField({ name: "n", on: mesh, maxDistance: -1 }))).toBe("INVALID_ARGUMENT");
+  });
+
+  it("curvature_reads_signed_mean_curvature_and_colors", () => {
+    const s = scene();
+    // A closed unit cube, outward wound: sharp convex corners read positive.
+    const box = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const boxTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6,
+      1, 6, 5, 3, 0, 4, 3, 4, 7,
+    ];
+    const mesh = s.addMesh(box, boxTris);
+    const curv = s.addCurvatureField({ name: "k", on: mesh });
+    const values = Array.from(s.fieldValues(curv));
+    expect(values).toHaveLength(8);
+    for (const v of values) {
+      expect(Number.isFinite(v)).toBe(true);
+      expect(v).toBeGreaterThan(0);
+    }
+    // Colours like any field: NaN would take the rule's `nan` colour.
+    s.setColoring(mesh, { field: curv, map: "turbo", range: [-1, 2] });
+    expect(s.coloring(mesh)?.field).toBe(curv);
+    expect(s.fieldTargets(curv)).toEqual([]);
+    expect(s.fieldTargetStatus(curv)).toEqual([]);
+    // A uniform scale of 2 halves every curvature (1/world-unit).
+    s.setPlacement(mesh, { rotation: IDENTITY, translation: [0, 0, 0], scale: [2, 2, 2] });
+    const scaled = Array.from(s.fieldValues(curv));
+    for (let k = 0; k < values.length; k++) {
+      expect(scaled[k]).toBeCloseTo(values[k] / 2, 4);
+    }
+    // A flat open quad reads zero everywhere (curvature is defined on
+    // open sheets, unlike thickness).
+    const open = s.addMesh(quad.slice(0, 12), [0, 1, 2, 0, 2, 3]);
+    const flat = s.addCurvatureField({ name: "k", on: open });
+    for (const v of Array.from(s.fieldValues(flat))) {
+      expect(Math.abs(v)).toBeLessThan(1e-6);
+    }
+    // A saddle reads the sign of its dominant bend: negative at the middle.
+    const grid: number[] = [];
+    const n = 8;
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        const fx = (x / n) * 2 - 1;
+        const fy = (y / n) * 2 - 1;
+        grid.push(fx, fy, (2 * fx * fx - fy * fy) / 4);
+      }
+    }
+    const gridTris: number[] = [];
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        gridTris.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    const saddle = s.addMesh(grid, gridTris);
+    const bend = s.addCurvatureField({ name: "k", on: saddle });
+    const bent = Array.from(s.fieldValues(bend));
+    expect(bent.every((v) => Number.isFinite(v))).toBe(true);
+    expect(bent[(4 * (n + 1) + 4) as number]).toBeLessThan(-0.1);
+    expect(codeOf(() => s.addCurvatureField({ name: "k", on: saddle }))).toBe("INVALID_ARGUMENT");
+  });
+
   it("changes_ranges_after_placement_and_drag", () => {
     const s = scene();
     const mesh = s.addMesh(quad, quadTris);
@@ -455,7 +681,7 @@ describe("Scene", () => {
     c.move({ rotation: QUARTER_Z, translation: [5, 5, 5] });
     c.cancel();
     expect(c.active).toBe(false);
-    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0] });
+    expect(s.placement(mesh)).toEqual({ rotation: IDENTITY, translation: [30, 0, 0], scale: [1, 1, 1] });
     expect(s.undo()).toBe(true);
     expect(s.placement(mesh).translation).toEqual([0, 0, 0]);
     expect(s.canUndo()).toBe(false);

@@ -1,26 +1,25 @@
 // The sculpt toolbox: a floating strip over the viewport for the selected
 // mesh. Four tools arm the sculpt brush (inflate, deflate, smooth, grab),
-// with the brush radius and per-tool strength on sliders and the
-// stroke-end remesh toggle; the viewport paints the strokes.
+// with the brush radius and per-tool strength on sliders, the falloff, and
+// the stroke-end and live remeshes toggles; the viewport paints the strokes.
+// The mask group paints the protected region the brushes skip (invert and
+// clear included); mask painting disarms the sculpt brush and vice versa.
 import type { MeshHandle } from "fast-mesh-wasm";
-import { useSelection } from "fast-mesh-wasm/react";
+import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { useEffect, useState } from "react";
 import { type AppState, useApp } from "../scene/app-state";
-import { REMESH_TRI_LIMIT, remeshTooBig } from "./sculpt";
+import { inspect } from "../panels/inspect";
+import {
+  DEFAULT_STRENGTHS,
+  REMESH_TRI_LIMIT,
+  checkMask,
+  invertMaskIds,
+  remeshTooBig,
+  sculptBrush,
+  type SculptTool,
+} from "./sculpt";
 
-export type SculptTool = "inflate" | "deflate" | "smooth" | "grab";
-
-/**
- * The repair op a tool paints (deflate is inflate with a flipped strength;
- * smooth paints plain-Laplacian relax: Taubin λ/μ converges too slowly to
- * melt under a brush).
- */
-const TOOL_OP: Record<SculptTool, "inflate" | "relax" | "grab"> = {
-  inflate: "inflate",
-  deflate: "inflate",
-  smooth: "relax",
-  grab: "grab",
-};
+export type { SculptTool };
 
 const TOOLS: { tool: SculptTool; label: string; title: string }[] = [
   { tool: "inflate", label: "Inflate", title: "Puff the surface up along its normals" },
@@ -28,15 +27,6 @@ const TOOLS: { tool: SculptTool; label: string; title: string }[] = [
   { tool: "smooth", label: "Smooth", title: "Relax the surface toward its neighbours" },
   { tool: "grab", label: "Grab", title: "Drag the surface along with the pointer" },
 ];
-
-/**
- * Each tool remembers its own strength (grab at 1 follows the pointer
- * exactly). Inflate stays small: dabs overlap heavily along a sweep, so a
- * dab-sized 0.05 already builds a visible bump without folding.
- */
-const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 };
-/** Laplacian passes per smooth dab (each melts the full weight toward the centroid). */
-const RELAX_PASSES = 2;
 
 const fmt = (v: number): string => String(Number(v.toPrecision(3)));
 
@@ -92,6 +82,8 @@ export function SculptToolbox(props: { app: AppState }) {
                 return;
               }
               setTool(t.tool);
+              // One pointer owner: sculpting disarms the mask paint.
+              app.setMaskPaint(false);
               arm(app, selection, t.tool, radius, strengths[t.tool], falloff);
             }}
           >
@@ -103,6 +95,7 @@ export function SculptToolbox(props: { app: AppState }) {
         radius <output>{fmt(radius)}</output>
         <input
           type="range"
+          data-action="sculpt-radius"
           min={0.01}
           max={Math.max(item.radius, 0.02)}
           step={0.01}
@@ -114,6 +107,7 @@ export function SculptToolbox(props: { app: AppState }) {
         strength <output>{fmt(strength)}</output>
         <input
           type="range"
+          data-action="sculpt-strength"
           min={0}
           max={1}
           step={0.01}
@@ -123,7 +117,11 @@ export function SculptToolbox(props: { app: AppState }) {
       </label>
       <label className="field" title="How the strength falls off with distance">
         falloff
-        <select value={falloff} onChange={(e) => setFalloff(e.currentTarget.value as "linear" | "smooth")}>
+        <select
+          data-action="sculpt-falloff"
+          value={falloff}
+          onChange={(e) => setFalloff(e.currentTarget.value as "linear" | "smooth")}
+        >
           <option value="smooth">smooth</option>
           <option value="linear">linear</option>
         </select>
@@ -157,11 +155,12 @@ export function SculptToolbox(props: { app: AppState }) {
         />
         even out while painting
       </label>
+      <MaskTools app={app} selection={selection} radius={item.radius} />
     </div>
   );
 }
 
-/** Arms (or steers) the sculpt brush for `tool` with a dab-sized strength. */
+/** Arms (or steers) the sculpt brush for `tool` (see `sculptBrush`). */
 function arm(
   app: AppState,
   mesh: MeshHandle,
@@ -170,13 +169,110 @@ function arm(
   strength: number,
   falloff: "linear" | "smooth",
 ): void {
-  app.setSculpt({
-    mesh,
-    op: TOOL_OP[tool],
-    radius,
-    strength: tool === "deflate" ? -Math.abs(strength) : Math.abs(strength),
-    falloff,
-    cycles: RELAX_PASSES,
-    direction: [0, 0, 0],
-  });
+  app.setSculpt(sculptBrush(tool, mesh, radius, strength, falloff));
+}
+
+/**
+ * The mask group: paint the protected region the deform brushes skip, with
+ * invert and clear. Paint accumulates sphere-brush picks on the selected
+ * mesh (a new mesh replaces the mask); invert and clear work in place over
+ * the mirrored views, failing loudly when a topology edit took a masked
+ * vertex. The counts come from the app; the notice is the loud half of the
+ * mask contract (see `viewport/sculpt.ts`).
+ */
+function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number }) {
+  const { app, selection, radius } = props;
+  const store = useScene();
+  const mask = useApp(app, (s) => s.sculptMask);
+  const painting = useApp(app, (s) => s.maskPaint);
+  const maskRadius = useApp(app, (s) => s.maskRadius);
+  const notice = useApp(app, (s) => s.sculptMaskNotice);
+  // The paint radius follows the mesh, like the sculpt radius.
+  useEffect(() => {
+    app.setMaskRadius(radius / 4);
+  }, [app, radius]);
+  const sameMesh = mask !== null && mask.mesh === selection;
+
+  /** Clears a mask its mesh outlived: loud, with the notice, never silent. */
+  const staleClear = () => {
+    app.setSculptMask(null);
+    app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
+    inspect.sculpt.maskStale++;
+  };
+
+  const onInvert = () => {
+    if (mask === null || !sameMesh) {
+      return;
+    }
+    try {
+      const v = store.scene.views(selection);
+      const slots = v.positions().length / 3;
+      checkMask(mask, selection, v.indices(), slots);
+      app.setSculptMask({ mesh: selection, vertices: invertMaskIds(mask.vertices, v.indices(), slots), slots });
+    } catch {
+      // Removed meanwhile, or stale: a stale mask never silently reinterprets.
+      staleClear();
+    }
+  };
+
+  return (
+    <>
+      <div className="group" aria-label="Mask tools">
+        <button
+          type="button"
+          data-action="sculpt-mask-paint"
+          aria-pressed={painting}
+          title="Paint the protected region the brushes skip (disarms the sculpt brush)"
+          onClick={() => {
+            const on = !painting;
+            if (on) {
+              // One pointer owner: mask painting disarms the sculpt brush.
+              app.setSculpt(null);
+            }
+            app.setMaskPaint(on);
+          }}
+        >
+          Mask
+        </button>
+        <button
+          type="button"
+          data-action="sculpt-mask-invert"
+          title="Protect everything outside the mask instead"
+          disabled={!sameMesh}
+          onClick={onInvert}
+        >
+          Invert
+        </button>
+        <button
+          type="button"
+          data-action="sculpt-mask-clear"
+          title="Drop the protected region"
+          disabled={mask === null}
+          onClick={() => app.setSculptMask(null)}
+        >
+          Clear
+        </button>
+        <span title={sameMesh ? `${mask.vertices.length} protected vertices` : undefined}>
+          {sameMesh ? `${mask.vertices.length} masked` : mask === null ? "no mask" : "masked elsewhere"}
+        </span>
+      </div>
+      <label className="slider" title="Mask paint radius in mesh units">
+        mask radius <output>{fmt(maskRadius)}</output>
+        <input
+          type="range"
+          data-action="sculpt-mask-radius"
+          min={0.01}
+          max={Math.max(radius, 0.02)}
+          step={0.01}
+          value={Math.min(maskRadius, Math.max(radius, 0.02))}
+          onChange={(e) => app.setMaskRadius(Number(e.currentTarget.value))}
+        />
+      </label>
+      {notice !== null ? (
+        <span role="status" title="The mask contract's loud half">
+          {notice}
+        </span>
+      ) : null}
+    </>
+  );
 }

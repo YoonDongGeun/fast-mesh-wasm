@@ -202,7 +202,7 @@ const closest = scene.meshDistance(upper, lower); // { distance, a, b, ... }
 scene.free(); // or `using scene = new Scene()`
 ```
 
-Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `STALE_BVH`, ...). After a trap inside the WebAssembly module every later call throws `INSTANCE_POISONED`. A view is only valid until the next scene call that may allocate or move buffers: a kept view may read other data or be empty, so re-acquire views after any scene call. `new Scene({ debug: true })` makes views warn when they are read after such a call. Mesh edits (`scene.edit`), `analyze`, `repair`, sections (`addSection`, `section`, `sectionGap`) and `findContacts` are documented in the types.
+Errors are `FastMeshError`s with a `code` (`UNKNOWN_MESH`, `INVALID_ARGUMENT`, `STALE_BVH`, ...). After a trap inside the WebAssembly module every later call throws `INSTANCE_POISONED`. A view is only valid until the next scene call that may allocate or move buffers: a kept view may read other data or be empty, so re-acquire views after any scene call. `new Scene({ debug: true })` makes views warn when they are read after such a call. Mesh edits (`scene.edit`), `analyze`, `measure`, `repair`, sections (`addSection`, `section`, `sectionGap`) and `findContacts` are documented in the types.
 
 ### Contact groups: fields to several meshes
 
@@ -293,7 +293,7 @@ const values = await scene.fetchFieldValues(gap); // `fieldValues` on Scene
 - **Requests run in order.** A newer colouring, section plane/meshes/fill or drag move drops the older one if it has not started yet, so fast toggling settles on the last state without doing the steps in between. Edits, repairs, `setPlacement`, adds, removals and undo/redo are never dropped. Each `setPlacement` is an undo step: for pointer-rate updates use a drag. Long work runs in steps: the Worker yields every few milliseconds during a field build, a field update or a large add, so newer batches are received (and coalesced) meanwhile.
 - **Drags are optimistic.** `scene.drag(mesh).move(pose)` moves the placement mirror at once, so the object follows the pointer; colours and sections catch up when the Worker's result arrives. In 9a a key's status covers only requests made under that key: a drag, `setPlacement` or edit puts its own key (`placement:<id>`, `edit:<id>`) into `"computing"`, not the `display:<id>` or `section:<id>:*` keys of the state that catches up after it. `end()` and `cancel()` return at once; `cancel()` restores the start pose and records nothing.
 - **Wide-range colouring during a drag.** After each batch the Worker recomputes the fields the batch made due in small steps, and drops the recompute when a newer move, `setPlacement`, edit, repair, compact, undo/redo or removal of either mesh is already queued; other requests wait for it. A pose's colours are applied all at once, never partly. So while the pointer keeps moving and one recompute takes longer than a frame, newer moves drop the recompute, until 200 ms have passed since the last colours were applied: then the recompute under way finishes and is shown, and the newest pose follows. During a sustained drag the colours therefore update about every 200 ms plus one recompute, each update exactly one pose, and when the drag ends (`end()`) the last pose's colours arrive within about one recompute (measured: one at 1M, but about 1.5 at 10M when most of the mesh is in range): the end drops a recompute kept for an older pose. A pointer that only pauses, without ending the drag, may wait up to two recomputes. Edits, undo/redo, removals and cancels always drop a stale recompute. `fetchFieldValues()` and `fieldStatus()` first bring every due field up to date in one go, which cannot be dropped, so do not poll them during a drag. On two touching 1M-triangle meshes with `maxDistance` 8, a recompute takes from about 0.07 s to 0.7 s depending on how much of the mesh is in range, and about ten times that at 10M; the Worker is never blocked for long, since a recompute runs in steps: about 12 ms at a time at 1M, and 14 to 18 ms for field builds and edits at 10M (see [docs/benchmarks.md](docs/benchmarks.md)). These are single-threaded figures; on a cross-origin isolated page the threaded engine makes a recompute 1.4 to 4.5 times faster (see [Multithreading (COOP/COEP)](#multithreading-coopcoep)). A contact range (a small `maxDistance`) keeps up with the pointer.
-- **Queries and anything that returns data** (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`, `analyze`, `edit`, `repair`, `fetchFieldValues`, `fieldStatus`, `sectionGap`) return promises. Once a frame loop runs they go out with the next `commitFrame()` (or after 100 ms if no frame comes); before the first `commitFrame()` they are sent on a microtask. For latency-critical picking, keep a light picking copy in a main-thread `Scene`.
+- **Queries and anything that returns data** (`raycast`, `closestPoint`, `meshDistance`, `intersects`, `findContacts`, `analyze`, `measure`, `edit`, `repair`, `fetchFieldValues`, `fieldStatus`, `sectionGap`) return promises. Once a frame loop runs they go out with the next `commitFrame()` (or after 100 ms if no frame comes); before the first `commitFrame()` they are sent on a microtask. For latency-critical picking, keep a light picking copy in a main-thread `Scene`.
 - **Errors.** A failed state change shows on its key (`status(key).error`, a `FastMeshError` with the same `code` as on `Scene`); a failed promise rejects with it. After a trap inside the Worker every call fails with `INSTANCE_POISONED`, also when it happens on one of the multithreaded engine's pool threads (a panic or a trap in work split across threads); a few kinds of pool-thread failure still cannot be detected (see [Multithreading (COOP/COEP)](#multithreading-coopcoep)). `await scene.restart()` starts a new Worker and replays the scene from the main thread's mirrors: meshes (compacted: slot ids change, handles do not), placements, fields, colourings and sections. History is cleared, and edits or queries that had not finished fail and must be re-issued.
 - **Not in the Worker scene:** user-opened steps (`beginStep`/`endStep`/`cancelStep`), Lazy and Manual modes (it is always eager) and `takeChanges` (use `onChanges` or the return value of `commitFrame()`). `terminate()` stops the Worker.
 - **Large meshes.** `addMesh` copies its inputs on the main thread (they are then transferred to the Worker) and, without an `origin` option, scans the positions for the bounding-box centre. That takes about 9 ms for 1M triangles and about 63 ms for 10M (see [docs/benchmarks.md](docs/benchmarks.md)); passing `origin` skips the scan.
@@ -307,7 +307,53 @@ const scene = await createWorkerScene({ workerUrl: "/fast-mesh-wasm/worker-entry
 const scene = await createWorkerScene({ createWorker: () => new Worker(myUrl, { type: "module" }) });
 ```
 
-`fast-mesh-wasm/worker` is for browsers and is not supported in Node.js (its tests run it on Node's `worker_threads` as a harness only).
+**Node.js.** `fast-mesh-wasm/worker` has no zero-config Node entry: `createWorkerScene()` with no
+arguments creates a browser `Worker`. In Node use the synchronous `Scene` instead — each call blocks
+until it returns, which is fine for a batch pipeline with no frame budget (repair, distance checks):
+
+```ts
+import { Scene } from "fast-mesh-wasm"; // Node entry: the .wasm loads from disk on import
+
+const scene = new Scene(); // no init() needed, as in browsers
+const upper = scene.addMesh(upperPositions, upperIndices);
+const lower = scene.addMesh(lowerPositions, lowerIndices);
+scene.repair(upper, [{ op: "removeDegenerate" }]);
+const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
+scene.setColoring(upper, { field: gap, map: "turbo", range: [-0.5, 1] });
+const distance = scene.meshDistance(upper, lower)?.distance ?? Infinity;
+const colors = scene.views(upper).colors(); // RGBA8, 4 bytes per vertex slot (null when uncoloured)
+```
+
+`WorkerScene` still runs in Node through the `createWorker` option with a small `node:worker_threads`
+adapter. It is always single-threaded there: Node reports no `crossOriginIsolated`, so `threads` is
+ignored and `scene.threads` reads `1`. The bench and test harnesses do this
+(`packages/fast-mesh-wasm/bench/worker-harness.mjs`, `test/harness/node-worker.mjs`); the shape is:
+
+```ts
+import { Worker } from "node:worker_threads";
+import { createWorkerScene } from "fast-mesh-wasm/worker";
+
+const scene = await createWorkerScene({
+  createWorker: () => {
+    const worker = new Worker(workerUrl, { workerData: { serve: true } });
+    const listeners: ((e: { data: unknown }) => void)[] = [];
+    worker.on("message", (data) => {
+      for (const cb of listeners) cb({ data });
+    });
+    return {
+      postMessage: (msg: unknown, transfer?: Transferable[]) => worker.postMessage(msg, transfer),
+      addEventListener: (type: string, cb: (e: { data: unknown }) => void) => {
+        if (type === "message") listeners.push(cb);
+      },
+      terminate: () => worker.terminate(),
+    };
+  },
+});
+```
+
+where the worker script serves the engine on `parentPort` (see `bench/worker-harness.mjs`). Prefer
+the synchronous `Scene` above unless a headless pipeline needs `WorkerScene` parity (status keys,
+background adds).
 
 ## Multithreading (COOP/COEP)
 

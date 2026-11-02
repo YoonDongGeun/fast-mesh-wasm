@@ -53,7 +53,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   );
 
   return (
-    <section className="panel" aria-label="Collision">
+    <section className="panel" aria-label="Collision" data-tour="collision">
       <h2>Collision</h2>
       <div className="modes" role="group" aria-label="Collision mode">
         <button type="button" data-mode="pair" aria-pressed={mode === "pair"} onClick={() => app.setCollisionMode("pair")}>
