@@ -1135,6 +1135,52 @@ describe("WorkerScene", () => {
     await expect(pending).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
   });
 
+  it("placement_scale_round_trip", async () => {
+    const { scene } = await start();
+    const s = sphere([3, 0, 0]);
+    const a = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    expect(scene.placement(a).scale).toEqual([1, 1, 1]);
+
+    // setPlacement carries the scale; the mirror and the matrix follow.
+    scene.setPlacement(a, { rotation: IDENTITY, translation: [1, 0, 0], scale: [2, 0.5, 3] });
+    await settle(scene);
+    expect(scene.placement(a)).toEqual({
+      rotation: IDENTITY,
+      translation: [1, 0, 0],
+      scale: [2, 0.5, 3],
+    });
+    const m = scene.matrix4(a);
+    expect([m[0], m[5], m[10]]).toEqual([2, 0.5, 3]);
+    expect(m[12]).toBe(2 * 3 + 1);
+    await expectMirrored(scene, a);
+
+    // A drag move shows its scale at once and settles on it.
+    const d = scene.drag(a);
+    d.move({ rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 2, 1] });
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+    d.end();
+    await settle(scene);
+    await expectMirrored(scene, a);
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+
+    // A restart replays the scale.
+    await scene.restart();
+    scene.commitFrame();
+    expect(scene.placement(a).scale).toEqual([1, 2, 1]);
+    await expectMirrored(scene, a);
+
+    // A malformed scale throws here, as Scene does.
+    let code: string | undefined;
+    try {
+      scene.setPlacement(a, { rotation: IDENTITY, translation: [0, 0, 0], scale: [1, 1] as never });
+    } catch (e) {
+      expect(e).toBeInstanceOf(FastMeshError);
+      code = (e as FastMeshError).code;
+    }
+    expect(code).toBe("INVALID_ARGUMENT");
+  });
+
   it("package_worker_export_resolves", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("worker.js", dist))).toBe(true);
