@@ -36,6 +36,22 @@ async function isDicomFile(file: File): Promise<boolean> {
   }
 }
 
+/**
+ * A drop batch's `.bin` files, when a `.gltf`/`.glb` dropped with them can
+ * resolve them as external buffers; otherwise none (a lone `.bin` stays a
+ * regular file, whose job reports it as unreadable, as before).
+ */
+export function siblingBinFiles(files: readonly File[]): File[] {
+  if (!files.some((f) => isGltfName(f.name))) {
+    return [];
+  }
+  return files.filter((f) => /\.bin$/i.test(f.name));
+}
+
+function isGltfName(name: string): boolean {
+  return /\.gl(?:tf|b)$/i.test(name);
+}
+
 export class Loader {
   /** The loader Worker; `null` after it failed, until the next load starts a new one. */
   #worker: Worker | null = null;
@@ -99,15 +115,25 @@ export class Loader {
   /**
    * Loads files; resolves with the meshes added (none for a file that
    * failed: its job shows why). DICOM files go as one job: the Worker
-   * stacks their series and meshes each isosurface.
+   * stacks their series and meshes each isosurface. `.bin` files dropped
+   * with a `.gltf`/`.glb` ride on its job as sibling buffers.
    */
   async loadFiles(files: Iterable<File>): Promise<Item[]> {
+    const list = [...files];
+    const siblings = siblingBinFiles(list);
     const mesh: File[] = [];
     const dicom: File[] = [];
-    for (const file of files) {
+    for (const file of list) {
+      if (siblings.includes(file)) {
+        continue;
+      }
       (await isDicomFile(file) ? dicom : mesh).push(file);
     }
-    const jobs = mesh.map((file) => this.#start(file.name, { kind: "file", id: 0, file }));
+    const jobs = mesh.map((file) =>
+      isGltfName(file.name) && siblings.length > 0
+        ? this.#start(file.name, { kind: "file", id: 0, file, buffers: siblings })
+        : this.#start(file.name, { kind: "file", id: 0, file }),
+    );
     if (dicom.length > 0) {
       const name = dicom.length === 1 ? dicom[0].name : `DICOM series (${dicom.length} files)`;
       jobs.push(this.#start(name, { kind: "dicom", id: 0, files: dicom, threshold: null }));

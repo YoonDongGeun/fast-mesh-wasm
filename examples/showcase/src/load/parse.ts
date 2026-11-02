@@ -3,7 +3,7 @@
 import { decodeDraco } from "fast-mesh-wasm/io";
 import { decoderModule } from "./draco";
 import type { MeshData } from "./mesh-data";
-import { parseGltf, parseGltfAsync, type NamedMeshData } from "./gltf";
+import { parseGltf, parseGltfAsync, type GltfParseOptions, type NamedMeshData } from "./gltf";
 import { parseObj } from "./obj";
 import { parsePly } from "./ply";
 import { parseStl } from "./stl";
@@ -57,18 +57,23 @@ export function parseMeshFiles(name: string, buffer: ArrayBuffer): NamedMeshData
 /**
  * Parses a mesh file like {@link parseMeshFiles}, and additionally decodes
  * `.drc` files and Draco-compressed (`KHR_draco_mesh_compression`) glTF
- * assets through the draco3d decoder. Formats without Draco parse on the
- * sync path.
+ * assets through the draco3d decoder, and resolves a `.gltf`/`.glb` asset's
+ * external `.bin` buffers from `options.buffers`. Formats without Draco or
+ * external buffers parse on the sync path.
  *
  * @throws for an unknown extension or a file its parser rejects.
  */
-export async function parseMeshFilesAsync(name: string, buffer: ArrayBuffer): Promise<NamedMeshData[]> {
+export async function parseMeshFilesAsync(
+  name: string,
+  buffer: ArrayBuffer,
+  options?: GltfParseOptions,
+): Promise<NamedMeshData[]> {
   const ext = /\.[^./\\]+$/.exec(name)?.[0].toLowerCase() ?? "";
   if (ext === ".drc") {
     return [{ name, data: await parseDrc(buffer) }];
   }
   if (ext === ".gltf" || ext === ".glb") {
-    return parseGltfAsync(name, buffer);
+    return parseGltfAsync(name, buffer, options);
   }
   return [{ name, data: parseMeshFile(name, buffer) }];
 }

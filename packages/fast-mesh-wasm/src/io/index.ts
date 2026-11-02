@@ -604,9 +604,10 @@ function toBase64(bytes: Uint8Array): string {
  * as `placement` (column-major, like `scene.matrix4`).
  *
  * Only uncompressed buffers are read. `KHR_draco_mesh_compression`
- * primitives throw (decode them with {@link importGLTFAsync}), as do external
- * (non-embedded) `.bin` buffers and sparse accessors. Animations, skins and
- * materials beyond per-vertex colors are skipped: the documented subset.
+ * primitives throw (decode them with {@link importGLTFAsync}), as do sparse
+ * accessors. External (non-embedded) `.bin` buffers load through
+ * {@link importGLTFAsync}'s `resolveBuffer`. Animations, skins and materials
+ * beyond per-vertex colors are skipped: the documented subset.
  */
 export interface ImportedMesh {
   /** The node name, else the mesh name, else `"mesh"` (deduplicated). */
@@ -628,9 +629,10 @@ export interface ImportedMesh {
  * down the hierarchy, so placements are preserved); other primitive modes
  * throw, except `TRIANGLE_STRIP` and `TRIANGLE_FAN`, which are expanded.
  *
- * @throws When the container is malformed, a buffer is external, a
- * primitive is Draco-compressed (decode it with {@link importGLTFAsync}) or
- * not a triangle mesh, or the file holds no triangle meshes.
+ * @throws When the container is malformed, a buffer is external (load it
+ * with {@link importGLTFAsync} and a `resolveBuffer` callback), a primitive
+ * is Draco-compressed (decode it with {@link importGLTFAsync}) or not a
+ * triangle mesh, or the file holds no triangle meshes.
  */
 export function importGLTF(bytes: Uint8Array | ArrayBuffer): ImportedMesh[] {
   const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -717,6 +719,21 @@ export interface DecodedDracoMesh {
   indices: Uint32Array;
 }
 
+/**
+ * Supplies an external glTF buffer's bytes, by its `uri` as declared
+ * (`"model.bin"`, a relative path, an absolute URL: passed through
+ * verbatim). Called at most once per external buffer, in buffer order.
+ *
+ * The importer never fetches: this callback is the only way external bytes
+ * enter (fetch / FileReader / fs on the caller's side). Cap sizes here —
+ * reject URIs outside the asset's directory and buffers past a byte budget
+ * before returning them; oversized or hostile buffers otherwise land in
+ * memory unchecked.
+ */
+export type GltfBufferResolver = (
+  uri: string,
+) => Uint8Array | ArrayBuffer | Promise<Uint8Array | ArrayBuffer>;
+
 /** Options of {@link decodeDraco} and {@link importGLTFAsync}. */
 export interface DracoDecodeOptions {
   /**
@@ -734,6 +751,16 @@ export interface DracoDecodeOptions {
    * its bytes here. Ignored when `decoderModule` is given.
    */
   wasmBinary?: Uint8Array | ArrayBuffer;
+}
+
+/** Options of {@link importGLTFAsync}: Draco decoding plus external buffers. */
+export interface GltfImportOptions extends DracoDecodeOptions {
+  /**
+   * Loads external (non-embedded) `.bin` buffers, by URI. Without one, an
+   * external buffer throws. Embedded data URIs and the GLB body chunk never
+   * consult it.
+   */
+  resolveBuffer?: GltfBufferResolver;
 }
 
 /**
@@ -756,28 +783,30 @@ export async function decodeDraco(
 }
 
 /**
- * Reads a glTF 2.0 asset like {@link importGLTF}, and additionally decodes
- * `KHR_draco_mesh_compression` primitives through the draco3d decoder (WASM).
- * A Draco primitive's positions and faces come from its compressed buffer
- * view (attribute ids from the extension); its node placement still bakes
- * into world positions, while colors read as `null` (compressed attributes
- * beyond POSITION are not mapped).
+ * Reads a glTF 2.0 asset like {@link importGLTF}: `KHR_draco_mesh_compression`
+ * primitives decode through the draco3d decoder (WASM), and external
+ * (non-embedded) `.bin` buffers load through `options.resolveBuffer`. A Draco
+ * primitive's positions and faces come from its compressed buffer view
+ * (attribute ids from the extension); its node placement still bakes into
+ * world positions, while colors read as `null` (compressed attributes beyond
+ * POSITION are not mapped).
  *
  * Primitives without the extension decode synchronously in place, so assets
  * without Draco never initialize the decoder.
  *
- * @throws When the container is malformed, a buffer is external, a Draco
- * primitive fails to decode, a primitive is not a triangle mesh, or the file
- * holds no triangle meshes.
+ * @throws When the container is malformed, a buffer is external without a
+ * `resolveBuffer` (or its bytes cannot be resolved), a Draco primitive fails
+ * to decode, a primitive is not a triangle mesh, or the file holds no
+ * triangle meshes.
  */
 export async function importGLTFAsync(
   bytes: Uint8Array | ArrayBuffer,
-  options?: DracoDecodeOptions,
+  options?: GltfImportOptions,
 ): Promise<ImportedMesh[]> {
   const raw = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const { json, bin } = splitContainer(raw);
   const doc = checkedDocument(json);
-  const buffers = resolveBuffers(doc, bin);
+  const buffers = await resolveBuffersAsync(doc, bin, options?.resolveBuffer);
   const specs = collectPrimitiveSpecs(doc);
   const usedNames = new Map<string, number>();
   let shared: DecoderModule | null = null;
@@ -1119,7 +1148,7 @@ function resolveBuffers(doc: GltfDocument, bin: Uint8Array | null): Uint8Array[]
         return bin.subarray(0, Math.min(b.byteLength, bin.length));
       }
       if (b.uri === undefined) {
-        throw new Error(`glTF: buffer ${i} has no URI and is not the GLB body (external buffers are not supported)`);
+        throw new Error(`glTF: buffer ${i} has no URI and is not the GLB body (only the first GLB buffer may omit its URI)`);
       }
       return decodeDataUri(b.uri, i);
     });
@@ -1132,17 +1161,91 @@ function resolveBuffers(doc: GltfDocument, bin: Uint8Array | null): Uint8Array[]
   }
   return declared.map((b, i) => {
     if (b.uri === undefined) {
-      throw new Error(`glTF: buffer ${i} is external (only embedded base64 buffers are supported)`);
+      throw new Error(
+        `glTF: buffer ${i} is external (only embedded base64 buffers are supported; load it with importGLTFAsync and a resolveBuffer callback)`,
+      );
     }
     return decodeDataUri(b.uri, i);
   });
+}
+
+/**
+ * Resolves every declared buffer to bytes like {@link resolveBuffers}, and
+ * additionally loads external (non-embedded) `.bin` buffers through
+ * `resolveBuffer`. Embedded data URIs and the GLB body chunk decode inline,
+ * exactly as the sync path does; the importer itself never fetches.
+ */
+async function resolveBuffersAsync(
+  doc: GltfDocument,
+  bin: Uint8Array | null,
+  resolveBuffer?: GltfBufferResolver,
+): Promise<Uint8Array[]> {
+  const declared = doc.buffers ?? [];
+  if (bin !== null && declared.length === 0) {
+    return [bin];
+  }
+  if (bin === null && declared.length === 0) {
+    // No buffers declared: files without accessors (no meshes, or scenes
+    // alone) report "no triangle meshes" below; anything referencing buffer
+    // 0 fails at the accessor with a missing-buffer error.
+    return [];
+  }
+  const out: Uint8Array[] = [];
+  for (const [i, b] of declared.entries()) {
+    if (bin !== null && i === 0 && b.uri === undefined) {
+      out.push(bin.subarray(0, Math.min(b.byteLength, bin.length)));
+    } else if (b.uri === undefined) {
+      throw new Error(`glTF: buffer ${i} has no URI and is not the GLB body (only the first GLB buffer may omit its URI)`);
+    } else if (b.uri.startsWith("data:")) {
+      out.push(decodeDataUri(b.uri, i));
+    } else {
+      out.push(await resolveExternal(b.uri, i, resolveBuffer));
+    }
+  }
+  return out;
+}
+
+/**
+ * Loads one external buffer through the caller's resolver. Throws without a
+ * resolver, wraps a resolver failure with the buffer's index and URI, and
+ * rejects anything but bytes.
+ */
+async function resolveExternal(
+  uri: string,
+  index: number,
+  resolveBuffer?: GltfBufferResolver,
+): Promise<Uint8Array> {
+  const what = `glTF: buffer ${index} ("${shortUri(uri)}")`;
+  if (resolveBuffer === undefined) {
+    throw new Error(`${what} is external; pass a resolveBuffer callback to load it`);
+  }
+  let bytes: Uint8Array | ArrayBuffer;
+  try {
+    bytes = await resolveBuffer(uri);
+  } catch (error) {
+    throw new Error(`${what} could not be resolved (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (bytes instanceof Uint8Array) {
+    return bytes;
+  }
+  if (bytes instanceof ArrayBuffer) {
+    return new Uint8Array(bytes);
+  }
+  throw new Error(`${what} resolved to no bytes (the resolveBuffer callback must return a Uint8Array or ArrayBuffer)`);
+}
+
+/** A URI shortened for error messages: hostile files can declare megabytes of URI. */
+function shortUri(uri: string): string {
+  return uri.length > 120 ? `${uri.slice(0, 117)}...` : uri;
 }
 
 function decodeDataUri(uri: string, buffer: number): Uint8Array {
   const marker = ";base64,";
   const at = uri.indexOf(marker);
   if (!uri.startsWith("data:") || at === -1) {
-    throw new Error(`glTF: buffer ${buffer} is external (only embedded base64 buffers are supported)`);
+    throw new Error(
+      `glTF: buffer ${buffer} is external (only embedded base64 buffers are supported; load it with importGLTFAsync and a resolveBuffer callback)`,
+    );
   }
   return decodeBase64(uri.slice(at + marker.length), buffer);
 }

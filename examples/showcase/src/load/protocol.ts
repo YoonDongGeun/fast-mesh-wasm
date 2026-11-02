@@ -4,8 +4,12 @@ import type { PhantomKind } from "./phantom";
 import type { SampleKind } from "./vtkjs";
 
 export type LoaderRequest =
-  /** Parse a file (read in the Worker: the page never touches its bytes). */
-  | { kind: "file"; id: number; file: File }
+  /**
+   * Parse a file (read in the Worker: the page never touches its bytes).
+   * `buffers` carries a `.gltf`/`.glb` asset's sibling `.bin` files from the
+   * same drop batch, for its external buffers.
+   */
+  | { kind: "file"; id: number; file: File; buffers?: File[] }
   /** Stack DICOM files into their series and mesh each isosurface (`threshold` null takes Otsu's). */
   | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
   /** Mesh a procedural DICOM phantom through the same extraction pipeline. */

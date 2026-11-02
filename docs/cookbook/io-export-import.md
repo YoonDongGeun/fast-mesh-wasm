@@ -72,9 +72,9 @@ for (const part of importGLTF(glb)) {
 - One scene mesh per glTF (node, primitive); node transforms are baked
   into `positions`, and also returned as `placement` (column-major).
   `TRIANGLE_STRIP` / `TRIANGLE_FAN` are expanded; anything else throws.
-- External (non-embedded) `.bin` buffers and sparse accessors are not
-  supported; animations, skins, and materials beyond per-vertex colors
-  are skipped.
+- External (non-embedded) `.bin` buffers load through `importGLTFAsync`'s
+  `resolveBuffer` (see below); sparse accessors are not supported.
+  Animations, skins, and materials beyond per-vertex colors are skipped.
 - `KHR_draco_mesh_compression` primitives throw under `importGLTF` —
   decode them with `importGLTFAsync`, which takes the same bytes plus
   optional Draco options:
@@ -83,6 +83,7 @@ for (const part of importGLTF(glb)) {
 const parts = await importGLTFAsync(glb, {
   // decoderModule, // a ready draco3d module (reuse across calls), or
   // wasmBinary,    // the decoder .wasm bytes for bundlers/workers
+  // resolveBuffer, // external .bin bytes by URI (see below)
 });
 if (parts.length !== 1 || parts[0].indices.length !== 36) throw new Error("expected the box back");
 scene.free();
@@ -102,3 +103,37 @@ const mesh = scene.addMesh(positions, indices); // triangle meshes only
 
 Needs the `draco3d` package installed unless you pass a decoder module
 (or its `.wasm`) through the same options as `importGLTFAsync`.
+
+## External .bin buffers
+
+A `.gltf` that references sibling files (`"uri": "model.bin"`) loads through
+`importGLTFAsync` with a `resolveBuffer` callback. The importer never fetches:
+the callback is the only way external bytes enter, so it is also where size
+caps belong — reject URIs outside the asset's directory and buffers past a
+byte budget before returning them.
+
+```ts
+// The sibling file's bytes stand in for a fetch / FileReader / fs read.
+const extPositions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+const extBin = new Uint8Array(extPositions.buffer);
+const extDoc = new TextEncoder().encode(
+  JSON.stringify({
+    asset: { version: "2.0" },
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3" }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: extBin.length }],
+    buffers: [{ byteLength: extBin.length, uri: "tri.bin" }],
+  }),
+);
+const extParts = await importGLTFAsync(extDoc, {
+  resolveBuffer: (uri) => {
+    if (uri !== "tri.bin") throw new Error(`unexpected buffer ${uri}`);
+    return extBin;
+  },
+});
+if (extParts.length !== 1 || extParts[0].indices.length !== 3) {
+  throw new Error("expected the triangle back");
+}
+```
