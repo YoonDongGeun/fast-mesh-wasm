@@ -1,0 +1,41 @@
+[package]
+name = "fast-mesh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the workspace (see the root Cargo.toml): the fuzz harness
+# builds only under the nightly cargo-fuzz needs, never in the MSRV job.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+fast-mesh-store = { path = "../crates/fast-mesh-store" }
+fast-mesh-bvh = { path = "../crates/fast-mesh-bvh" }
+fast-mesh-query = { path = "../crates/fast-mesh-query" }
+fast-mesh-ops = { path = "../crates/fast-mesh-ops" }
+
+[[bin]]
+name = "fill"
+path = "fuzz_targets/fill.rs"
+
+[[bin]]
+name = "weld"
+path = "fuzz_targets/weld.rs"
+
+[[bin]]
+name = "triangulate"
+path = "fuzz_targets/triangulate.rs"
+
+[[bin]]
+name = "bvh"
+path = "fuzz_targets/bvh.rs"
+
+[[bin]]
+name = "boolean"
+path = "fuzz_targets/boolean.rs"
