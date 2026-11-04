@@ -1,0 +1,66 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    # Path filters do not apply to scheduled runs: this always fuzzes.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGETS: 'fill weld triangulate bvh boolean'
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ github.event_name == 'schedule' && 'nightly' || 'short' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned wasm nightly doubles as the fuzz toolchain (cargo-fuzz needs
+      # nightly, with rust-src); no second toolchain to install.
+      - id: nightly
+        uses: ./.github/actions/install-nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.toolchain }}
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo +${{ steps.nightly.outputs.toolchain }} fuzz build
+      - name: Run fuzz targets
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          seconds=${{ github.event_name == 'schedule' && 420 || 20 }}
+          for t in $TARGETS; do
+            cargo +${{ steps.nightly.outputs.toolchain }} fuzz run "$t" -- \
+              -max_total_time="$seconds" -max_len=4096 -rss_limit_mb=2048
+          done
+      # Crash repros, not issues: one flaky crash must not spam the tracker.
+      # See fuzz/README.md for the triage steps.
+      - name: Upload crash repros
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
