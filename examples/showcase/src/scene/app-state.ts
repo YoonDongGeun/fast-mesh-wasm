@@ -19,6 +19,13 @@ import {
   setColored,
   toggleCheck,
 } from "../panels/groups";
+import {
+  clampSidebarWidth,
+  DEFAULT_SIDEBAR_WIDTH,
+  defaultSettings,
+  type ShowcaseSettings,
+  type ShowcaseTheme,
+} from "../panels/settings";
 
 export interface Item {
   /** A React key. */
@@ -69,6 +76,13 @@ export interface GroupSetup {
   members: readonly MeshHandle[];
   /** Every pair of members, or the listed ones (either way round). */
   pairs: readonly (readonly [MeshHandle, MeshHandle])[] | "all";
+}
+
+/** The collision heatmap's slider values, in mesh units (persisted: last-used). */
+export interface HeatmapParams {
+  depth: number;
+  gap: number;
+  tolerance: number;
 }
 
 /**
@@ -198,6 +212,21 @@ export interface AppSnapshot {
   clipBox: { min: Vec3; max: Vec3 } | null;
   /** Heavy loads are decimated on load (#113, via the #118 simplify op). */
   decimateOnLoad: boolean;
+  /** The app theme (a display setting: persisted, not undoable). */
+  theme: ShowcaseTheme;
+  /** Whether the sidebars show (a display setting: persisted, not undoable). */
+  leftVisible: boolean;
+  rightVisible: boolean;
+  /** The sidebar widths, in pixels (a display setting: persisted, not undoable). */
+  leftWidth: number;
+  rightWidth: number;
+  /**
+   * The collision heatmap's slider values (`null` until a slider moves:
+   * the defaults then follow the meshes' scale). Persisted: last-used.
+   */
+  heatmapParams: HeatmapParams | null;
+  /** Fast heatmap mode (bounded fields; persisted: last-used, not undoable). */
+  heatmapFast: boolean;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -231,7 +260,36 @@ export class AppState {
     inspectSection: null,
     clipBox: null,
     decimateOnLoad: true,
+    theme: "dark",
+    leftVisible: true,
+    rightVisible: true,
+    leftWidth: DEFAULT_SIDEBAR_WIDTH,
+    rightWidth: DEFAULT_SIDEBAR_WIDTH,
+    heatmapParams: null,
+    heatmapFast: false,
   };
+
+  /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
+  constructor(initial: ShowcaseSettings = defaultSettings()) {
+    this.#snap = {
+      ...this.#snap,
+      theme: initial.theme,
+      leftVisible: initial.leftVisible,
+      rightVisible: initial.rightVisible,
+      leftWidth: initial.leftWidth,
+      rightWidth: initial.rightWidth,
+      wireframe: initial.wireframe,
+      edgeSoftness: initial.edgeSoftness,
+      repairOverlays: { ...initial.repairOverlays },
+      collisionMode: initial.collisionMode,
+      heatmapParams: initial.heatmap === null ? null : { ...initial.heatmap },
+      heatmapFast: initial.heatmapFast,
+      decimateOnLoad: initial.decimateOnLoad,
+      sculptRemesh: initial.sculptRemesh,
+      sculptLiveRemesh: initial.sculptLiveRemesh,
+      maskRadius: initial.maskRadius,
+    };
+  }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
   #autoPick = true;
   /** The group defaults to the first three meshes added (the demo set), until it is ticked by hand. */
@@ -515,6 +573,66 @@ export class AppState {
   /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
   setDecimateOnLoad(on: boolean): void {
     this.#set({ decimateOnLoad: on });
+  }
+
+  /** Sets the app theme (a display setting: persisted, not undoable). */
+  setTheme(theme: ShowcaseTheme): void {
+    this.#set({ theme });
+  }
+
+  /** Shows or hides the left sidebar (a display setting: persisted, not undoable). */
+  setLeftVisible(visible: boolean): void {
+    this.#set({ leftVisible: visible });
+  }
+
+  /** Shows or hides the right sidebar (a display setting: persisted, not undoable). */
+  setRightVisible(visible: boolean): void {
+    this.#set({ rightVisible: visible });
+  }
+
+  /** Sets the left sidebar's width in pixels, clamped (a display setting: persisted, not undoable). */
+  setLeftWidth(width: number): void {
+    this.#set({ leftWidth: clampSidebarWidth(width) });
+  }
+
+  /** Sets the right sidebar's width in pixels, clamped (a display setting: persisted, not undoable). */
+  setRightWidth(width: number): void {
+    this.#set({ rightWidth: clampSidebarWidth(width) });
+  }
+
+  /** Sets the heatmap sliders (`null`: follow the meshes' scale). Persisted: last-used. */
+  setHeatmapParams(params: HeatmapParams | null): void {
+    this.#set({ heatmapParams: params });
+  }
+
+  /** Sets fast heatmap mode (bounded fields). Persisted: last-used, not undoable. */
+  setHeatmapFast(fast: boolean): void {
+    this.#set({ heatmapFast: fast });
+  }
+
+  /**
+   * Restores every persisted display setting to its default (the status
+   * bar's "reset to defaults" button). Meshes, selection and history stay.
+   */
+  resetDisplaySettings(): void {
+    const d = defaultSettings();
+    this.#set({
+      theme: d.theme,
+      leftVisible: d.leftVisible,
+      rightVisible: d.rightVisible,
+      leftWidth: d.leftWidth,
+      rightWidth: d.rightWidth,
+      wireframe: d.wireframe,
+      edgeSoftness: d.edgeSoftness,
+      repairOverlays: { ...d.repairOverlays },
+      collisionMode: d.collisionMode,
+      heatmapParams: d.heatmap,
+      heatmapFast: d.heatmapFast,
+      decimateOnLoad: d.decimateOnLoad,
+      sculptRemesh: d.sculptRemesh,
+      sculptLiveRemesh: d.sculptLiveRemesh,
+      maskRadius: d.maskRadius,
+    });
   }
 
   setJob(job: Job): void {

@@ -77,6 +77,10 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   warning as the pair. Removing a member keeps the others coloured with their remaining partners.
 - **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
   page is cross-origin isolated, and on an error its message with Restart.
+- **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
+  repair overlays, collision mode, the last-used heatmap sliders) persist in localStorage across
+  reloads under versioned `fm.showcase.*` keys; Reset settings in the status bar restores the
+  defaults. Meshes and projects stay file-based.
 
 URL options:
 

@@ -9,8 +9,8 @@ import { createWorkerScene, type WorkerScene } from "fast-mesh-wasm/worker";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App, type Engine } from "./App";
-import { parseBigFileParams } from "./load/big-file";
 import { Loader } from "./load/loader";
+import { loadSettings, saveSettings, settingsFromSnapshot } from "./panels/settings";
 import { AppState } from "./scene/app-state";
 import { installTestHook } from "./test-hook";
 import "./styles.css";
@@ -41,13 +41,21 @@ const root = createRoot(document.getElementById("root")!);
 
 try {
   const { store, engine } = await createEngine();
-  const app = new AppState();
+  const app = new AppState(loadSettings());
   // `?decimate=0` opts out of decimate-on-load (for testing; see load/big-file.ts).
+  // An explicit param wins over the stored prefs; otherwise they stand.
   try {
-    app.setDecimateOnLoad(parseBigFileParams(location.search).decimateOnLoad);
+    const decimate = new URLSearchParams(location.search).get("decimate");
+    if (decimate !== null) {
+      app.setDecimateOnLoad(decimate !== "0");
+    }
   } catch {
-    // The default stands.
+    // The stored prefs stand.
   }
+  // Every display change persists (prefs only: meshes stay file-based).
+  app.subscribe(() => {
+    saveSettings(settingsFromSnapshot(app.getSnapshot()));
+  });
   const loader = new Loader(store, app);
   root.render(
     <StrictMode>
