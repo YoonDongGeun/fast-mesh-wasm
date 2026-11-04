@@ -1,5 +1,21 @@
 # fast-mesh-wasm
 
+## 0.5.1
+
+### Patch Changes
+
+- [#148](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/148) [`b2b1928`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b2b1928b165507fed855a20f5ad4476048f2213a) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Starting a background add's BVH build no longer zeroes its per-triangle leaf table in one call: `BvhBuild::new` only reserves the table and the prim scan fills it with the same pass, so the store-to-BVH transition stays short even on a large mesh (it was 1.9 ms at 1M and 12.6 ms at 10M in one step) and the built tree is unchanged bit for bit. A toggle queued behind a field build or an edit's recompute still waits for it, by arrival order; letting unrelated requests run during an open field unit stays a spec-first design change.
+
+- [#154](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/154) [`838162e`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/838162eb3de3b34a4cc773e30e8ee2aed65004ce) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Export the `Scene.cutByPlane` types (`CutOptions`, `CutReport`) from the main entry and `MAX_THREADS` from `fast-mesh-wasm/worker`, so the documented signatures name importable types.
+
+- [#151](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/151) [`aaaae82`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/aaaae82e636e598f0f5093ca68f4d8bc687a09a0) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `fast-mesh-wasm/io` gains Draco encoding: `encodeDraco(positions, indices)` writes standalone `.drc` bytes and `exportGLTF` takes `{ draco: true }` (async) for `KHR_draco_mesh_compression`, both through draco3d's lazily loaded encoder with quantization-bits, compression-level, and face-order-preservation options.
+
+- [#152](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/152) [`b1c36af`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b1c36afd767b021623ee6339279f9ac3641da945) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `importGLTFAsync` loads `.gltf` assets with external `.bin` buffers through a new `resolveBuffer` option: a callback returning each buffer's bytes by URI (fetch / FileReader / fs on the caller's side; the importer itself never fetches). The sync `importGLTF` still throws on external buffers, now pointing at the async form.
+
+- [#148](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/148) [`b2b1928`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b2b1928b165507fed855a20f5ad4476048f2213a) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `WorkerScene` gains `measure(mesh)`, the worker-side twin of `Scene.measure`: scalar area and watertight-volume measurements of a mesh, resolving with the same `MeasureResult` (volume `null` with `volumeReason` on open or non-manifold meshes).
+
+- [#148](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/148) [`b2b1928`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b2b1928b165507fed855a20f5ad4476048f2213a) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `WorkerScene` placements now carry scale end to end: `setPlacement` and drag moves accept `scale`, `placement()` always returns it, and restarts replay it, so the worker mirror matches `Scene` (whose `placement()` already included it).
+
 ## 0.5.0
 
 ### Minor Changes
