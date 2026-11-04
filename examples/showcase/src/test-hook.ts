@@ -5,6 +5,7 @@ import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fas
 import * as THREE from "three";
 import type { Engine } from "./App";
 import { inspect } from "./panels/inspect";
+import { settingsFromSnapshot } from "./panels/settings";
 import { collectProject, parseProjectDoc, restoreProject } from "./load/project";
 import { type CollisionCsvRow, collisionRowsToCsv, contoursToDxf, contoursToSvg } from "./load/report";
 import { parseBigFileParams } from "./load/big-file";
@@ -269,6 +270,10 @@ export function installTestHook(
     },
     /** Whether every mesh draws wireframed. */
     wireframe: () => app.getSnapshot().wireframe,
+    /** The persisted display settings, as stored (issue #144). */
+    settings: () => settingsFromSnapshot(app.getSnapshot()),
+    /** Restores the display defaults (the status bar's reset). */
+    resetSettings: () => app.resetDisplaySettings(),
     /** The wireframe overlays in the scene: meshes bound, overlays shown, and whether every solid stayed shaded. */
     wireOverlays: () => {
       let overlays = 0;

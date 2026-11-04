@@ -8,20 +8,14 @@ import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useMeshDisplay, useScene } from "fast-mesh-wasm/react";
 import { contactHeatmap, type DistanceColoring } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useMemo, useState } from "react";
-import { type AppState, type CollisionPair, type Item, useApp } from "../scene/app-state";
+import { useEffect, useMemo } from "react";
+import { type AppState, type CollisionPair, type HeatmapParams, type Item, useApp } from "../scene/app-state";
 import { clampTolerance, deepestPenetration, formatDistance, niceScale, toleranceLimit } from "./collision-math";
 import { GroupMode } from "./GroupMode";
 import { inspect, type Readouts } from "./inspect";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 
 export type Heatmap = Omit<DistanceColoring, "distanceTo">;
-
-interface HeatmapParams {
-  depth: number;
-  gap: number;
-  tolerance: number;
-}
 
 export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScene }) {
   const { app, scene } = props;
@@ -36,8 +30,10 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   const scale = niceScale(Math.max(0, ...items.filter((i) => shown.includes(i.mesh)).map((i) => i.radius)));
   const step = scale / 1000;
   // `null` until a slider moves: the defaults then follow the scale.
-  const [params, setParams] = useState<HeatmapParams | null>(null);
-  const [fast, setFast] = useState(false);
+  // In the app state (persisted: last-used), not local: the status bar's
+  // reset restores them with the rest of the display settings.
+  const params = useApp(app, (s) => s.heatmapParams);
+  const fast = useApp(app, (s) => s.heatmapFast);
   const softness = useApp(app, (s) => s.edgeSoftness);
   const p = params ?? { depth: scale / 2, gap: scale / 2, tolerance: scale / 50 };
   // Clamped to contactHeatmap's limits (spec §6.5, gap ≥ 0 from §7.1).
@@ -45,7 +41,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   const gap = Math.min(Math.max(p.gap, 0), scale);
   const tolerance = clampTolerance(p.tolerance, depth, gap, step);
   const tolMax = Math.max(0, toleranceLimit(depth, gap) - step);
-  const set = (patch: Partial<HeatmapParams>) => setParams({ depth, gap, tolerance, ...patch });
+  const set = (patch: Partial<HeatmapParams>) => app.setHeatmapParams({ depth, gap, tolerance, ...patch });
 
   const heat = useMemo(
     () => contactHeatmap({ depth, gap, tolerance, exactDepth: !fast }),
@@ -119,7 +115,12 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         className="check"
         title="Bound the fields at twice max(depth, colour from): much faster on large meshes, but deeper penetration shows the mesh colour"
       >
-        <input type="checkbox" data-control="fast" checked={fast} onChange={(e) => setFast(e.currentTarget.checked)} />
+        <input
+          type="checkbox"
+          data-control="fast"
+          checked={fast}
+          onChange={(e) => app.setHeatmapFast(e.currentTarget.checked)}
+        />
         Fast mode (large meshes)
       </label>
       {mode === "pair" ? (

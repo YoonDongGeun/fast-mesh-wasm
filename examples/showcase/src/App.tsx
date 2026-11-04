@@ -4,7 +4,17 @@
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useHistory, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 import { parseBigFileParams } from "./load/big-file";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
@@ -16,6 +26,7 @@ import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
 import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
+import { DEFAULT_SIDEBAR_WIDTH } from "./panels/settings";
 import { StatusBar } from "./panels/StatusBar";
 import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
 import { type AppState, useApp } from "./scene/app-state";
@@ -63,6 +74,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [dropping, setDropping] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [tourStep, setTourStep] = useState<number | null>(null);
+  // The persisted display settings: the theme (as `data-theme` on the
+  // root, for the light overrides) and the sidebars (shown, widths).
+  const theme = useApp(app, (s) => s.theme);
+  const leftVisible = useApp(app, (s) => s.leftVisible);
+  const rightVisible = useApp(app, (s) => s.rightVisible);
+  const leftWidth = useApp(app, (s) => s.leftWidth);
+  const rightWidth = useApp(app, (s) => s.rightWidth);
+  const shellRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   // Ending the tour records it, so first-run only runs once.
   const endTour = useCallback(() => {
@@ -278,9 +300,16 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     };
   }, [load]);
 
+  // A hidden sidebar keeps its panels mounted (their effects, like the
+  // volume view's linked MPR state, stay alive): it just takes no room.
+  const shellStyle = {
+    "--left-w": leftVisible ? `${leftWidth}px` : "0px",
+    "--right-w": rightVisible ? `${rightWidth}px` : "0px",
+  } as CSSProperties;
   return (
-    <div className="app">
-      <aside className="sidebar sidebar-left">
+    <div ref={shellRef} className="app" style={shellStyle}>
+      <aside className="sidebar sidebar-left" style={leftVisible ? undefined : { display: "none" }}>
+        <SidebarHandle side="left" shell={shellRef} app={app} />
         <MeshList
           app={app}
           onLoad={load}
@@ -380,7 +409,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
-      <aside className="sidebar sidebar-right">
+      <aside className="sidebar sidebar-right" style={rightVisible ? undefined : { display: "none" }}>
+        <SidebarHandle side="right" shell={shellRef} app={app} />
         <RepairPanel app={app} scene={engine.scene} />
         <CollisionPanel app={app} scene={engine.scene} />
         <InspectPanel app={app} scene={engine.scene} />
@@ -404,5 +434,32 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       ) : null}
       {dropping ? <div className="drop-overlay">Drop STL, OBJ, PLY or DICOM files to load them</div> : null}
     </div>
+  );
+}
+
+/** A sidebar's edge: drag to resize it (persisted), double-click for the default width. */
+function SidebarHandle(props: { side: "left" | "right"; shell: RefObject<HTMLDivElement | null>; app: AppState }) {
+  const { side, shell, app } = props;
+  const setWidth = side === "left" ? (w: number) => app.setLeftWidth(w) : (w: number) => app.setRightWidth(w);
+  return (
+    <div
+      className={`resize-handle resize-${side}`}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={side === "left" ? "Resize the left panel" : "Resize the right panel"}
+      title="Drag to resize · double-click to reset"
+      onDoubleClick={() => setWidth(DEFAULT_SIDEBAR_WIDTH)}
+      onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
+      onPointerMove={(e) => {
+        if (e.buttons !== 1) {
+          return;
+        }
+        const rect = shell.current?.getBoundingClientRect();
+        if (rect === undefined) {
+          return;
+        }
+        setWidth(side === "left" ? e.clientX - rect.left : rect.right - e.clientX);
+      }}
+    />
   );
 }

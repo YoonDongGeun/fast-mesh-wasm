@@ -16,6 +16,10 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
   const [restarting, setRestarting] = useState(false);
   // Re-rendered after a restart: the new Worker's thread count.
   const [, setRestarts] = useState(0);
+  // The persisted display settings, and the reset that restores them.
+  const theme = useApp(app, (s) => s.theme);
+  const leftVisible = useApp(app, (s) => s.leftVisible);
+  const rightVisible = useApp(app, (s) => s.rightVisible);
 
   const restart = () => {
     setRestarting(true);
@@ -65,6 +69,43 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
         title="Threads need a cross-origin isolated page (COOP/COEP headers)"
       >
         {engine.isolated ? "cross-origin isolated" : "not cross-origin isolated"}
+      </span>
+      <span className="settings" role="group" aria-label="Display settings">
+        <button
+          type="button"
+          data-action="theme"
+          aria-pressed={theme === "light"}
+          onClick={() => app.setTheme(theme === "dark" ? "light" : "dark")}
+          title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
+        >
+          {theme === "dark" ? "Dark" : "Light"}
+        </button>
+        <button
+          type="button"
+          data-action="toggle-left"
+          aria-pressed={leftVisible}
+          onClick={() => app.setLeftVisible(!leftVisible)}
+          title={leftVisible ? "Hide the left panel" : "Show the left panel"}
+        >
+          Left
+        </button>
+        <button
+          type="button"
+          data-action="toggle-right"
+          aria-pressed={rightVisible}
+          onClick={() => app.setRightVisible(!rightVisible)}
+          title={rightVisible ? "Hide the right panel" : "Show the right panel"}
+        >
+          Right
+        </button>
+        <button
+          type="button"
+          data-action="reset-settings"
+          onClick={() => app.resetDisplaySettings()}
+          title="Reset the display settings to their defaults (meshes stay)"
+        >
+          Reset settings
+        </button>
       </span>
     </footer>
   );

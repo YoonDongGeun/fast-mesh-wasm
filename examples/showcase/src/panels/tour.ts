@@ -3,6 +3,8 @@
 // in headless runs (showcase-check.mjs drives `--headless=new` Chrome, whose
 // user agent carries "HeadlessChrome") unless `?tour=1` forces it on.
 // `?tour=0` (or `?notour`) forces it off.
+import { readStorage, removeStorage, writeStorage } from "./settings";
+
 export interface TourStep {
   /** The `[data-tour]` anchor this step points at. */
   target: string;
@@ -60,20 +62,23 @@ export function resolveTourStart(search: string, agent: string, webdriver: boole
   return seen ? "off" : "auto";
 }
 
-const SEEN_KEY = "fast-mesh-showcase.seen-tour";
+const SEEN_KEY = "fm.showcase.seen-tour";
+/** The pre-#144 key: adopted once, then forgotten. */
+const LEGACY_SEEN_KEY = "fast-mesh-showcase.seen-tour";
 
 export function tourSeen(): boolean {
-  try {
-    return localStorage.getItem(SEEN_KEY) === "1";
-  } catch {
-    return false;
+  if (readStorage(SEEN_KEY) === "1") {
+    return true;
   }
+  if (readStorage(LEGACY_SEEN_KEY) === "1") {
+    writeStorage(SEEN_KEY, "1");
+    removeStorage(LEGACY_SEEN_KEY);
+    return true;
+  }
+  return false;
 }
 
 export function markTourSeen(): void {
-  try {
-    localStorage.setItem(SEEN_KEY, "1");
-  } catch {
-    // Private mode, say: the tour just shows again next visit.
-  }
+  writeStorage(SEEN_KEY, "1");
+  removeStorage(LEGACY_SEEN_KEY);
 }
