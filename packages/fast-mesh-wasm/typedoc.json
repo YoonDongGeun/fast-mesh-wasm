@@ -1,0 +1,22 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "fast-mesh-wasm",
+  "entryPoints": [
+    "src/web.ts",
+    "src/node.ts",
+    "src/three/index.ts",
+    "src/worker/index.ts",
+    "src/store/index.ts",
+    "src/io/index.ts",
+    "src/react/index.ts",
+    "src/r3f/index.ts"
+  ],
+  "out": "docs",
+  "readme": "none",
+  "tsconfig": "tsconfig.docs.json",
+  "exclude": ["src/wasm/**", "src/wasm-threads/**", "src/worker/engine.ts", "src/worker/entry.ts"],
+  "navigationLinks": {
+    "Showcase": "../../",
+    "Rust API": "../rust/"
+  }
+}

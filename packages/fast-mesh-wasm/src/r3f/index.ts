@@ -162,18 +162,6 @@ export interface FastMeshProps extends EventHandlers {
 }
 
 /**
- * Draws a scene mesh: binds it with `bindMesh` on mount and disposes the
- * binding on unmount (or when the mesh is removed, after which it renders
- * nothing). The mesh's applied `opacity` and `visible` follow the store in
- * the frame that applies them; colouring follows the scene. Drives the
- * store's frames with {@link useFrameDriver}. Use it inside a `<Canvas>`.
- *
- * The mesh must be added through the store (`store.addMesh`): a mesh added
- * straight to `store.scene` is not in the store, and renders nothing.
- *
- * @throws `INVALID_ARGUMENT` without a `store` outside a `SceneProvider`.
- */
-/**
  * `width` when it is a finite number `>= 0` (what `setEdgeSoftness` takes),
  * else 0 with a warning: a bad prop (a slider's NaN, say) draws hard edges
  * rather than throwing inside the canvas.
@@ -186,6 +174,18 @@ function usableSoftness(width: number): number {
   return 0;
 }
 
+/**
+ * Draws a scene mesh: binds it with `bindMesh` on mount and disposes the
+ * binding on unmount (or when the mesh is removed, after which it renders
+ * nothing). The mesh's applied `opacity` and `visible` follow the store in
+ * the frame that applies them; colouring follows the scene. Drives the
+ * store's frames with {@link useFrameDriver}. Use it inside a `<Canvas>`.
+ *
+ * The mesh must be added through the store (`store.addMesh`): a mesh added
+ * straight to `store.scene` is not in the store, and renders nothing.
+ *
+ * @throws `INVALID_ARGUMENT` without a `store` outside a `SceneProvider`.
+ */
 export function FastMesh(props: FastMeshProps): JSX.Element {
   const body = createElement(FastMeshBody, props);
   return props.store === undefined ? body : createElement(SceneProvider, { store: props.store }, body);

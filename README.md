@@ -8,6 +8,8 @@ Fast triangle mesh utilities for JavaScript and TypeScript, written in Rust and 
 
 **[Live demo](https://yoondonggeun.github.io/fast-mesh-wasm/)**: the [showcase app](examples/showcase) in your browser.
 
+**[API reference](https://yoondonggeun.github.io/fast-mesh-wasm/api/)**: the [TypeScript API](https://yoondonggeun.github.io/fast-mesh-wasm/api/js/) of the `fast-mesh-wasm` package and the [Rust API](https://yoondonggeun.github.io/fast-mesh-wasm/api/rust/) of the workspace crates, rebuilt from `main` on every push. Task-oriented recipes live in the [cookbook](docs/cookbook).
+
 - Works in browsers (Vite, webpack, Next.js), Node.js and Bun
 - Installs the same way with npm, pnpm and bun. No native build step, no install scripts, zero dependencies
 - Full TypeScript types and inline docs, generated from the Rust source

@@ -2,6 +2,10 @@
 
 Task-oriented recipes for `fast-mesh-wasm`. Each recipe is runnable
 against the built package and shows the minimal calls for one job.
+For every function, type and option the recipes use, see the
+[hosted API reference](https://yoondonggeun.github.io/fast-mesh-wasm/api/)
+([TypeScript](https://yoondonggeun.github.io/fast-mesh-wasm/api/js/),
+[Rust](https://yoondonggeun.github.io/fast-mesh-wasm/api/rust/)).
 
 | Recipe | What it does |
 | --- | --- |

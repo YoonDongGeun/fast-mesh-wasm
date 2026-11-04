@@ -1,10 +1,17 @@
 name: Pages
 
-# Publishes the showcase (examples/showcase) to GitHub Pages:
-# https://yoondonggeun.github.io/fast-mesh-wasm/. Pages sends no COOP/COEP
-# headers; the showcase's service worker (public/coi-sw.js) adds them, so the
-# engine runs threaded there too. Needs the repository's Pages source set to
-# "GitHub Actions".
+# Publishes the showcase (examples/showcase) plus the API reference to GitHub
+# Pages: https://yoondonggeun.github.io/fast-mesh-wasm/. Pages sends no
+# COOP/COEP headers; the showcase's service worker (public/coi-sw.js) adds
+# them, so the engine runs threaded there too. Needs the repository's Pages
+# source set to "GitHub Actions".
+#
+# The API reference lives next to the showcase: TypeDoc for the npm package
+# at /api/js/ and rustdoc for the workspace crates at /api/rust/, with a
+# chooser at /api/. Every push rebuilds them: a Pages deployment replaces the
+# whole site, so skipping the doc steps on any push would unpublish /api/.
+# They reuse this job's checkout, toolchains and caches, so the extra cost is
+# just the two doc builds.
 on:
   push:
     branches: [main]
@@ -52,9 +59,57 @@ jobs:
         run: pnpm --filter fast-mesh-wasm-example-showcase build
         env:
           SHOWCASE_BASE: /fast-mesh-wasm/
+      # API reference next to the showcase. TypeDoc needs the wasm glue, so it
+      # runs after `pnpm build`; rustdoc reuses the cached target dir.
+      - name: Build the TypeScript API reference
+        run: pnpm docs:js
+      - name: Build the Rust API reference
+        run: pnpm docs:rust
+      - name: Assemble the Pages site
+        run: |
+          rm -rf site
+          mkdir -p site
+          cp -r examples/showcase/dist/. site/
+          mkdir -p site/api/js site/api/rust
+          cp -r packages/fast-mesh-wasm/docs/. site/api/js/
+          cp -r target/doc/. site/api/rust/
+          rm -f site/api/rust/.lock
+          cat > site/api/index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>fast-mesh-wasm API reference</title>
+          <h1>fast-mesh-wasm API reference</h1>
+          <ul>
+            <li><a href="js/">TypeScript API</a> (<code>fast-mesh-wasm</code> npm package)</li>
+            <li><a href="rust/">Rust API</a> (workspace crates)</li>
+          </ul>
+          <p><a href="../">Back to the showcase</a></p>
+          </html>
+          EOF
+          # rustdoc writes no workspace index for a virtual manifest: list the crates.
+          {
+            echo '<!doctype html>'
+            echo '<html lang="en">'
+            echo '<meta charset="utf-8">'
+            echo '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            echo '<title>fast-mesh-wasm Rust API</title>'
+            echo '<h1>fast-mesh-wasm Rust API</h1>'
+            echo '<ul>'
+            for d in site/api/rust/*/; do
+              crate=$(basename "$d")
+              if [ -f "$d/index.html" ]; then
+                echo "<li><a href=\"$crate/\"><code>${crate//_/-}</code></a></li>"
+              fi
+            done
+            echo '</ul>'
+            echo '<p><a href="../">Back to the API reference</a></p>'
+            echo '</html>'
+          } > site/api/rust/index.html
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: examples/showcase/dist
+          path: site
 
   deploy:
     needs: build

@@ -1,0 +1,7 @@
+{
+  // TypeDoc's program: the library sources only. The main tsconfig also
+  // includes test/, whose self-imports (`fast-mesh-wasm`, `../dist/...`)
+  // only resolve after a full package build with aliases.
+  "extends": "./tsconfig.json",
+  "include": ["src"]
+}
