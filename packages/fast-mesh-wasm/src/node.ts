@@ -51,6 +51,8 @@ export {
   type ComponentSelect,
   type Contact,
   type CurvatureFieldDesc,
+  type CutOptions,
+  type CutReport,
   type DegenerateReport,
   type DistanceFieldDesc,
   type ThicknessFieldDesc,

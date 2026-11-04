@@ -4,6 +4,7 @@
 export {
   createWorkerScene,
   type KeyStatus,
+  MAX_THREADS,
   type WorkerLike,
   WorkerScene,
   type WorkerSceneOptions,

@@ -11,6 +11,7 @@ packages/fast-mesh-wasm/test/__cookbook__/
 packages/fast-mesh-wasm/dist/
 packages/fast-mesh-wasm/src/wasm/
 packages/fast-mesh-wasm/src/wasm-threads/
+packages/fast-mesh-wasm/docs/
 examples/*/dist/
 
 # Copied into the npm package at build time from the repo root
