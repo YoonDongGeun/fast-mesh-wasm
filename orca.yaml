@@ -1,0 +1,7 @@
+scripts:
+  # pnpm hard-links packages from its store, so this takes seconds and adds
+  # almost nothing on disk. Do not link node_modules between worktrees: on
+  # Windows, `git worktree remove --force` deletes through junctions and
+  # empties the linked checkout's node_modules.
+  setup: |
+    pnpm install --frozen-lockfile --prefer-offline
