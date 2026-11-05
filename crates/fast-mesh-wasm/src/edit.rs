@@ -54,6 +54,10 @@
 //! - `14` subdivide: `method (0 loop, NaN for the default), levels (NaN
 //!   for 1)`. Each level splits every triangle into four by Loop's scheme;
 //!   see [`fast_mesh_ops::subdivide`].
+//! - `15` auto repair: `weld_tolerance, min_triangles, max_edges (Infinity
+//!   for any size), fair`, NaN meaning the default of
+//!   [`AutoRepairOptions`]. Its report is, for each stage in the order it
+//!   ran, the code of the op that stage is, then that op's report.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -93,8 +97,9 @@ use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::simplify::SimplifyOptions;
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
-    Analysis, ComponentOptions, DegenerateOptions, FailReason, FairWeights, FillOptions,
-    FillReport, LoopId, OffsetOptions, OpsError, ShellOptions, SkipReason,
+    Analysis, AutoRepairOptions, AutoRepairStage, ComponentOptions, DegenerateOptions, FailReason,
+    FairWeights, FillOptions, FillReport, LoopId, OffsetOptions, OpsError, ShellOptions,
+    SkipReason,
 };
 use fast_mesh_store::{StoreError, Transaction};
 
@@ -381,6 +386,7 @@ pub(crate) enum RepairOp {
     Shell(f32),
     Simplify(SimplifyOptions),
     Subdivide(SubdivideOptions),
+    Auto(AutoRepairOptions),
 }
 
 /// A flag: 0 or 1.
@@ -605,6 +611,25 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 return Err(Error::invalid("levels must be at least 1"));
             }
             RepairOp::Subdivide(SubdivideOptions { method, levels })
+        } else if code == 15.0 {
+            let [weld, min_t, max_e, fair]: [f64; 4] =
+                words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
+            let mut o = AutoRepairOptions::default();
+            if let Some(weld) = bound(weld) {
+                o.weld_tolerance = weld as f32;
+            }
+            if let Some(min_t) = count_opt(min_t, "minTriangles")? {
+                o.min_triangles = min_t;
+            }
+            if max_e == f64::INFINITY {
+                o.max_edges = None;
+            } else if let Some(max_e) = count_opt(max_e, "maxEdges")? {
+                o.max_edges = Some(max_e);
+            }
+            if !fair.is_nan() {
+                o.fair = flag(fair)?;
+            }
+            RepairOp::Auto(o)
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -671,6 +696,38 @@ fn put_fill(out: &mut Vec<f64>, r: &FillReport) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Appends the report of one of the ops an auto repair is made of (see the
+/// module docs).
+fn put_stage(out: &mut Vec<f64>, stage: AutoRepairStage) -> Result<(), StoreError> {
+    match stage {
+        AutoRepairStage::Weld(r) => {
+            put(out, &[count(r.merged_vertices), count(r.removed_triangles)])
+        }
+        AutoRepairStage::Degenerate(r) => put(
+            out,
+            &[count(r.removed_triangles), count(r.removed_vertices)],
+        ),
+        AutoRepairStage::Components(r) => put(
+            out,
+            &[
+                count(r.removed_components),
+                count(r.removed_triangles),
+                count(r.removed_vertices),
+            ],
+        ),
+        AutoRepairStage::Orient(r) => put(
+            out,
+            &[
+                count(r.flipped_triangles),
+                count(r.patches),
+                count(r.non_orientable_patches),
+                count(r.flipped_outward_components),
+            ],
+        ),
+        AutoRepairStage::Fill(r) => put_fill(out, r),
+    }
+}
+
 /// Runs decoded repair ops in `tx`, in order, and returns their reports
 /// (see the module docs).
 ///
@@ -683,44 +740,37 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
         match op {
             RepairOp::Weld(tolerance) => {
                 let r = fast_mesh_ops::weld(tx, *tolerance)?;
-                put(
-                    &mut out,
-                    &[count(r.merged_vertices), count(r.removed_triangles)],
-                )?;
+                put_stage(&mut out, AutoRepairStage::Weld(&r))?;
             }
             RepairOp::Degenerate(o) => {
                 let r = fast_mesh_ops::remove_degenerate(tx, o)?;
-                put(
-                    &mut out,
-                    &[count(r.removed_triangles), count(r.removed_vertices)],
-                )?;
+                put_stage(&mut out, AutoRepairStage::Degenerate(&r))?;
             }
             RepairOp::Components(o) => {
                 let r = fast_mesh_ops::remove_small_components(tx, o)?;
-                put(
-                    &mut out,
-                    &[
-                        count(r.removed_components),
-                        count(r.removed_triangles),
-                        count(r.removed_vertices),
-                    ],
-                )?;
+                put_stage(&mut out, AutoRepairStage::Components(&r))?;
             }
             RepairOp::Orient => {
                 let r = fast_mesh_ops::orient(tx)?;
-                put(
-                    &mut out,
-                    &[
-                        count(r.flipped_triangles),
-                        count(r.patches),
-                        count(r.non_orientable_patches),
-                        count(r.flipped_outward_components),
-                    ],
-                )?;
+                put_stage(&mut out, AutoRepairStage::Orient(&r))?;
             }
             RepairOp::Fill(o) => {
                 let r = fast_mesh_ops::fill_holes(tx, o)?;
-                put_fill(&mut out, &r)?;
+                put_stage(&mut out, AutoRepairStage::Fill(&r))?;
+            }
+            RepairOp::Auto(o) => {
+                let r = fast_mesh_ops::auto_repair(tx, o)?;
+                for stage in r.stages() {
+                    let code = match stage {
+                        AutoRepairStage::Weld(_) => 0.0,
+                        AutoRepairStage::Degenerate(_) => 1.0,
+                        AutoRepairStage::Components(_) => 2.0,
+                        AutoRepairStage::Orient(_) => 3.0,
+                        AutoRepairStage::Fill(_) => 4.0,
+                    };
+                    put(&mut out, &[code])?;
+                    put_stage(&mut out, stage)?;
+                }
             }
             RepairOp::Inflate(o) => {
                 let r = fast_mesh_ops::deform::inflate(tx, o)?;
@@ -1237,6 +1287,37 @@ mod tests {
         assert_eq!(code(&[13., 1.5, 1.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[13., 10., 2.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[13., 10., 1., 0.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_auto() {
+        let nan = f64::NAN;
+        let d = decode_repair(&[15., nan, nan, nan, nan], &[]).unwrap();
+        assert_eq!(d, vec![RepairOp::Auto(AutoRepairOptions::default())]);
+        let d = decode_repair(&[15., 0.5, 3., f64::INFINITY, 0.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Auto(AutoRepairOptions {
+                weld_tolerance: 0.5,
+                min_triangles: 3,
+                max_edges: None,
+                fair: false,
+            })]
+        );
+        let d = decode_repair(&[15., nan, nan, 8., 1.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Auto(AutoRepairOptions {
+                max_edges: Some(8),
+                ..AutoRepairOptions::default()
+            })]
+        );
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[15., nan, nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[15., nan, 1.5, nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[15., nan, nan, -1., nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[15., nan, nan, 1.5, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[15., nan, nan, nan, 2.]), codes::INVALID_ARGUMENT);
     }
 
     #[test]
