@@ -467,6 +467,46 @@ describe("WorkerScene", () => {
     expect(scene.views(b).indices().length).toBe(6);
   });
 
+  it("register_matches_local_scene_applies_and_undoes", async () => {
+    const { scene } = await start();
+    const local = new Scene();
+    // A sphere stretched per axis and displaced in z by a wave: no symmetries.
+    const base = sphere([0, 0, 0], 1, 24, 48);
+    const positions = base.positions.map((v, i) => {
+      const k = i % 3;
+      const wave = 1 + 0.2 * Math.sin(3 * base.positions[i - k] + 1) * Math.cos(2 * base.positions[i - k + 1]);
+      return v * [1.3, 0.9, 0.6][k] * wave;
+    });
+    const fixed = scene.addMesh(positions, base.indices);
+    const moving = scene.addMesh(positions, base.indices);
+    const lf = local.addMesh(positions, base.indices);
+    const lm = local.addMesh(positions, base.indices);
+    const start_ = { rotation: IDENTITY, translation: [0.05, -0.04, 0.03] as Vec3 };
+    scene.setPlacement(moving, start_);
+    local.setPlacement(lm, start_);
+    const r = await scene.register(moving, fixed, { maxIterations: 40 });
+    expect(r).toEqual(local.register(lm, lf, { maxIterations: 40 }));
+    expect(r.converged).toBe(true);
+    expect(r.applied).toBe(true);
+    expect(r.rmse).toBeLessThan(1e-5);
+    r.placement.translation.forEach((v) => expect(Math.abs(v)).toBeLessThan(1e-5));
+    await settle(scene);
+    expect(scene.placement(moving)).toEqual(r.placement);
+    // One undo step, and it reaches the mirror too.
+    scene.undo();
+    await settle(scene);
+    expect(scene.placement(moving).translation).toEqual(start_.translation);
+    // Returned only: the mirror stays where it is.
+    const only = await scene.register(moving, fixed, { apply: false });
+    expect(only.converged).toBe(true);
+    expect(only.applied).toBe(false);
+    await settle(scene);
+    expect(scene.placement(moving).translation).toEqual(start_.translation);
+    // Errors reject, and a stale handle is refused here.
+    await expect(scene.register(moving, fixed, { overlap: 2 })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(scene.register(moving, moving)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
   it("measure_matches_local_scene", async () => {
     const { scene } = await start();
     const local = new Scene();

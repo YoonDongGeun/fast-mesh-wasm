@@ -863,6 +863,92 @@ export interface JoinReport {
   bridgeTrianglesAdded: number;
 }
 
+/** Options of {@link Scene.register}. */
+export interface RegisterOptions {
+  /** The most solver steps. 0 only measures the current placement. Default 50. */
+  maxIterations?: number;
+  /**
+   * Stops when one step moves every point by at most this fraction of the
+   * moving mesh's extent (the largest distance of its points from their
+   * centroid). Default `1e-6`.
+   */
+  tolerance?: number;
+  /**
+   * The fraction of the moving mesh expected to lie over the fixed one, in
+   * `(0, 1]`: each iteration uses that many of its points, closest first, so
+   * the rest (the part beyond the overlap, and outliers) do not pull the
+   * result. Set it a little below the true overlap for partial scans.
+   * Default 1: every point counts, and nothing is rejected.
+   */
+  overlap?: number;
+  /** Points farther than this from the fixed mesh (world units) are not used. Default: no limit. */
+  maxDistance?: number;
+  /**
+   * The most points of the moving mesh to use, evenly spaced over its
+   * triangles' centroids and its vertices. `rmse` is measured on these.
+   * Default 100,000.
+   */
+  maxSamples?: number;
+  /**
+   * Whether a converged result becomes the moving mesh's placement, as one
+   * undo step. A result that did not converge is never applied, whatever
+   * this says. Default `true`.
+   */
+  apply?: boolean;
+}
+
+/**
+ * Why {@link Scene.register} stopped:
+ * - `"converged"`: a step fell below the tolerance with all six rigid motions
+ *   constrained.
+ * - `"maxIterations"`: the steps ran out first.
+ * - `"underconstrained"`: a step fell below the tolerance, but the surface
+ *   does not determine some motion (a plane sliding in its plane, a tube along
+ *   its axis), which stayed where the current placement put it.
+ * - `"tooFewCorrespondences"`: fewer than six points have a usable closest
+ *   point.
+ * - `"diverged"`: a step took points out of the range the query can represent.
+ */
+export type RegisterStatus = "converged" | "maxIterations" | "underconstrained" | "tooFewCorrespondences" | "diverged";
+
+/** What {@link Scene.register} found. */
+export interface RegisterResult {
+  /**
+   * The moving mesh's aligned placement, with its scale unchanged: the
+   * converged result, or the best estimate when it did not converge.
+   */
+  placement: Placement;
+  /**
+   * The root mean square distance (world units) from the used points to the
+   * fixed mesh at `placement`; `Infinity` when no point has a closest point.
+   */
+  rmse: number;
+  /** Solver steps taken. */
+  iterations: number;
+  /**
+   * `status === "converged"`. ICP is local, so this says the iteration settled
+   * and the surface determined the result, not that it found the right
+   * alignment: judge that from `rmse`.
+   */
+  converged: boolean;
+  /** Why iteration stopped. */
+  status: RegisterStatus;
+  /** Whether `placement` was set on the moving mesh. */
+  applied: boolean;
+  /** Points of the moving mesh sampled. */
+  samples: number;
+  /** Sampled points used at `placement`: the rest were trimmed or out of range. */
+  inliers: number;
+  /**
+   * How well the worst-constrained motion is determined, in `[0, 1]`: the
+   * smallest eigenvalue of the solver's normal equations over the largest at
+   * the last step. Below `1e-6` it counts as undetermined. A sphere's spin is
+   * determined only by its facets, so this falls as it is tessellated finer.
+   * 0 when no step ran.
+   */
+  conditioning: number;
+}
+
 /** Options of {@link Scene.cutByPlane}. */
 export interface CutOptions {
   /**
@@ -1166,6 +1252,15 @@ const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
 const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
+/** The `status` codes of `WasmScene.register`, in order. */
+const REGISTER_STATUSES: readonly RegisterStatus[] = [
+  "converged",
+  "maxIterations",
+  "underconstrained",
+  "tooFewCorrespondences",
+  "diverged",
+];
+
 function optional(v: number | undefined, what: string): number {
   if (v === undefined) {
     return Number.NaN;
@@ -1868,6 +1963,74 @@ export class Scene implements SceneLike {
       this.#scene().boolean(ta.index, ta.generation, sb.index, sb.generation, code),
     );
     return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Rigidly aligns the mesh `moving` to the mesh `fixed` by point-to-plane ICP,
+   * with the closest points found through `fixed`'s BVH and trimmed by
+   * `options.overlap`. A drag of either mesh ends first, recording its moves
+   * as one step.
+   *
+   * **The initial guess is the current placements.** ICP finds the nearest
+   * fit, so put the meshes roughly in place first with `setPlacement`.
+   *
+   * **Applying.** By default a converged result becomes `moving`'s placement
+   * as one undo step (`applied` in the result); `apply: false` only returns
+   * it. A result that did not converge is never applied, so a failed alignment
+   * does not move anything; `placement` still holds the best estimate, for
+   * `setPlacement` if it will do.
+   *
+   * **Scales.** Only rotation and translation are solved. `moving`'s scale is
+   * applied to its points and kept. `fixed`'s scale, uniform or not, is
+   * followed exactly on a copy baked through it, so each such call costs a BVH
+   * build. All distances are in world units.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
+   * mesh twice, a mesh without triangles or an invalid option; `STALE_BVH` for
+   * a stale Manual `fixed`. Nothing changes on a throw.
+   */
+  register(moving: MeshHandle, fixed: MeshHandle, options: RegisterOptions = {}): RegisterResult {
+    const m = this.#id(moving);
+    const f = this.#id(fixed);
+    const maxIterations = optional(options.maxIterations, "maxIterations");
+    const tolerance = optional(options.tolerance, "tolerance");
+    const overlap = optional(options.overlap, "overlap");
+    const maxDistance = optional(options.maxDistance, "maxDistance");
+    const maxSamples = optional(options.maxSamples, "maxSamples");
+    const apply = options.apply ?? true;
+    if (this.#drag?.mesh === moving || this.#drag?.mesh === fixed) {
+      this.#drag.end();
+    }
+    const r = call(() =>
+      this.#scene().register(
+        m.index,
+        m.generation,
+        f.index,
+        f.generation,
+        maxIterations,
+        tolerance,
+        overlap,
+        maxDistance,
+        maxSamples,
+        apply,
+      ),
+    );
+    const status = REGISTER_STATUSES[r[17]];
+    return {
+      placement: {
+        rotation: Array.from(r.subarray(0, 9)),
+        translation: [r[9], r[10], r[11]],
+        scale: [r[12], r[13], r[14]],
+      },
+      rmse: r[15],
+      iterations: r[16],
+      converged: status === "converged",
+      status,
+      applied: r[18] === 1,
+      samples: r[19],
+      inliers: r[20],
+      conditioning: r[21],
+    };
   }
 
   /**

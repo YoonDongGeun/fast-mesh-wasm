@@ -28,6 +28,8 @@ import type {
   JoinOptions,
   JoinReport,
   MeasureResult,
+  RegisterOptions,
+  RegisterResult,
   MeshChange,
   MeshDistance,
   RaycastOptions,
@@ -1558,6 +1560,26 @@ export class WorkerScene implements SceneLike {
         s.meshes = s.meshes.filter((m) => m !== st);
       }
     }
+  }
+
+  /**
+   * Rigidly aligns `moving` to `fixed` by ICP from their placements as the
+   * Worker has them when the request runs; see `Scene.register`. An applied
+   * result reaches `placement()` with its batch, like a `setPlacement`.
+   * Not replayed by a restart: an unanswered one rejects with
+   * `INSTANCE_POISONED`, like an edit.
+   */
+  register(moving: MeshHandle, fixed: MeshHandle, options: RegisterOptions = {}): Promise<RegisterResult> {
+    const m = this.#live(moving);
+    const f = this.#live(fixed);
+    if (this.#drag?.mesh === m || this.#drag?.mesh === f) {
+      this.#drag.end();
+    }
+    const payload = copyInput(options, "options");
+    return this.#ask(
+      (rev, qid) => ({ kind: "register", rev, moving: m.id, fixed: f.id, payload, qid }),
+      (v) => v as RegisterResult,
+    );
   }
 
   /**

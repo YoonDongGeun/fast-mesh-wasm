@@ -113,6 +113,17 @@ export type Request =
       qid?: number;
       key?: string;
     }
+  | {
+      kind: "register";
+      rev: number;
+      moving: ClientId;
+      fixed: ClientId;
+      /** `RegisterOptions`. */
+      payload: unknown;
+      /** The `RegisterResult` is replied under it. */
+      qid: number;
+      key?: string;
+    }
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }

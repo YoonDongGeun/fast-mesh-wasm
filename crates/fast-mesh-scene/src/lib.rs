@@ -27,6 +27,9 @@
 //! - Booleans: [`Scene::boolean`] unions, subtracts or intersects mesh B
 //!   into mesh A in the world; the result replaces A with A's placement,
 //!   as one undo step.
+//! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
+//!   trimmed point-to-plane ICP from their current placements, and sets the
+//!   moving mesh's placement as one undo step when it converges.
 //! - History: one undo history across all meshes, in steps.
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
@@ -98,6 +101,7 @@ mod join;
 mod normals;
 mod placement;
 mod query;
+mod register;
 mod report;
 mod scene;
 mod sections;
@@ -122,6 +126,7 @@ pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
 };
+pub use register::{RegisterOptions, RegisterReport};
 pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};

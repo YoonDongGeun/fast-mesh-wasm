@@ -11,6 +11,7 @@ For every function, type and option the recipes use, see the
 | --- | --- |
 | [Load → repair → color → export](load-repair-color-export.md) | The whole session end to end: glTF in, repair, paint, STL out |
 | [Measure → ruler / query](measure-ruler.md) | `measure`, `meshDistance`, `closestPoint`, `raycast` |
+| [Align two scans](align-two-scans.md) | `register`: rigid ICP from the current placements, partial overlap, undo |
 | [Headless Node pipeline](headless-node.md) | Sync `Scene` in Node, plus the `createWorker` adapter for `WorkerScene` |
 | [IO: export / import](io-export-import.md) | `exportSTL` / `OBJ` / `PLY` / `glTF`, `importGLTF`, Draco |
 | [Selection + mask](selection-mask.md) | Brush / lasso / component picks, grow / shrink / invert, `isolate` |

@@ -50,6 +50,8 @@
 //! - Subdivision: [`subdivide`](subdivide::subdivide) refines every triangle
 //!   into four per level by Loop's scheme, with boundary vertices relaxing
 //!   along their own curve and other creases holding their midpoints.
+//! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
+//!   ICP with trimmed outlier rejection, and reports how far it got.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -70,6 +72,7 @@ mod error;
 mod fair;
 mod fill;
 mod fill_dp;
+pub mod icp;
 mod measure;
 mod offset;
 mod orient;
@@ -103,6 +106,7 @@ pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
 };
+pub use icp::{IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
 pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
 pub use offset::{
     OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,
