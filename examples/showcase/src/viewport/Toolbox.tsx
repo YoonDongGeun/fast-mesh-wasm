@@ -9,6 +9,7 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { useEffect, useState } from "react";
 import { type AppState, useApp } from "../scene/app-state";
 import { inspect } from "../panels/inspect";
+import { formatLength } from "../panels/units";
 import {
   DEFAULT_STRENGTHS,
   REMESH_TRI_LIMIT,
@@ -37,6 +38,7 @@ export function SculptToolbox(props: { app: AppState }) {
   const sculpt = useApp(app, (s) => s.sculpt);
   const remesh = useApp(app, (s) => s.sculptRemesh);
   const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
+  const units = useApp(app, (s) => s.units);
   const item = items.find((i) => i.mesh === selection) ?? null;
   const [tool, setTool] = useState<SculptTool>("inflate");
   const [radius, setRadius] = useState(0.25);
@@ -91,8 +93,8 @@ export function SculptToolbox(props: { app: AppState }) {
           </button>
         ))}
       </div>
-      <label className="slider" title="Brush radius in mesh units">
-        radius <output>{fmt(radius)}</output>
+      <label className="slider" title="Brush radius">
+        radius <output>{formatLength(radius, units)}</output>
         <input
           type="range"
           data-action="sculpt-radius"
@@ -187,6 +189,7 @@ function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number
   const painting = useApp(app, (s) => s.maskPaint);
   const maskRadius = useApp(app, (s) => s.maskRadius);
   const notice = useApp(app, (s) => s.sculptMaskNotice);
+  const units = useApp(app, (s) => s.units);
   // The paint radius follows the mesh, like the sculpt radius.
   useEffect(() => {
     app.setMaskRadius(radius / 4);
@@ -256,8 +259,8 @@ function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number
           {sameMesh ? `${mask.vertices.length} masked` : mask === null ? "no mask" : "masked elsewhere"}
         </span>
       </div>
-      <label className="slider" title="Mask paint radius in mesh units">
-        mask radius <output>{fmt(maskRadius)}</output>
+      <label className="slider" title="Mask paint radius">
+        mask radius <output>{formatLength(maskRadius, units)}</output>
         <input
           type="range"
           data-action="sculpt-mask-radius"

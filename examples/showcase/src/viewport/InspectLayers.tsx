@@ -11,7 +11,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import type { AppState, Item } from "../scene/app-state";
 import { type AppSnapshot, useApp } from "../scene/app-state";
-import { formatDistance } from "../panels/collision-math";
+import { formatLength } from "../panels/units";
 import { boxFaces, localVertex, normalTravel, rulerDistance, snapSlot, worldFromMatrix } from "./inspect-tools";
 import { setBoxClip, setSectionClip } from "./clip-planes";
 import { dragPlaneNormal, planeHit } from "./slice-drag";
@@ -72,6 +72,7 @@ function dotSize(items: readonly Item[]): number {
 function RulerLayer(props: { app: AppState; items: readonly Item[] }) {
   const { app, items } = props;
   const ruler = useAppOf(app, (s) => s.ruler);
+  const units = useAppOf(app, (s) => s.units);
   const group = useMemo(() => new THREE.Group(), []);
   const line = useMemo(() => {
     const g = new THREE.BufferGeometry();
@@ -126,7 +127,7 @@ function RulerLayer(props: { app: AppState; items: readonly Item[] }) {
     if (ruler.b !== null) {
       const d = rulerDistance(ruler.a, ruler.b);
       label.set(
-        formatDistance(d),
+        formatLength(d, units),
         [(ruler.a[0] + b[0]) / 2, (ruler.a[1] + b[1]) / 2, (ruler.a[2] + b[2]) / 2],
         Math.max(d * 0.12, size * 4),
       );
@@ -134,7 +135,7 @@ function RulerLayer(props: { app: AppState; items: readonly Item[] }) {
     } else {
       label.sprite.visible = false;
     }
-  }, [group, line, balls, label, ruler, items]);
+  }, [group, line, balls, label, ruler, items, units]);
 
   return <primitive object={group} />;
 }

@@ -7,6 +7,7 @@ import {
   localVertex,
   normalTravel,
   pointInBox,
+  readMeasure,
   rulerDistance,
   snapSlot,
   worldFromMatrix,
@@ -105,5 +106,32 @@ describe("formatCoord", () => {
   it("shortens_coordinates", () => {
     expect(formatCoord(1.23456789)).toBe("1.235");
     expect(formatCoord(0)).toBe("0");
+  });
+});
+
+describe("readMeasure", () => {
+  const reading = { area: 6, volume: 1, closed: true };
+
+  it("takes a local Scene's answer", async () => {
+    expect(await readMeasure({ measure: () => reading }, 1)).toEqual({ area: 6, volume: 1 });
+  });
+
+  it("takes a WorkerScene's promise", async () => {
+    expect(await readMeasure({ measure: () => Promise.resolve(reading) }, 1)).toEqual({ area: 6, volume: 1 });
+  });
+
+  it("has no reading without measure, or when it fails", async () => {
+    expect(await readMeasure({}, 1)).toBeNull();
+    expect(await readMeasure({ measure: () => Promise.reject(new Error("gone")) }, 1)).toBeNull();
+    expect(
+      await readMeasure(
+        {
+          measure: () => {
+            throw new Error("gone");
+          },
+        },
+        1,
+      ),
+    ).toBeNull();
   });
 });

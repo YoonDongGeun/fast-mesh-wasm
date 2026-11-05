@@ -359,7 +359,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           loader={loader}
         />
         <SculptToolbox app={app} />
-        {grouped ? <HoverTip scene={engine.scene} items={items} members={members} /> : null}
+        {grouped ? <HoverTip app={app} scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
         <div className="toolbar" role="toolbar" aria-label="Viewport tools" data-tour="gizmo">
           <div className="group">

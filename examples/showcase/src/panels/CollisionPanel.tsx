@@ -10,9 +10,10 @@ import { contactHeatmap, type DistanceColoring } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useMemo } from "react";
 import { type AppState, type CollisionPair, type HeatmapParams, type Item, useApp } from "../scene/app-state";
-import { clampTolerance, deepestPenetration, formatDistance, niceScale, toleranceLimit } from "./collision-math";
+import { clampTolerance, deepestPenetration, niceScale, toleranceLimit } from "./collision-math";
 import { GroupMode } from "./GroupMode";
 import { inspect, type Readouts } from "./inspect";
+import { formatLength, formatLengthValue, fromDisplayLength, type LengthUnit, rangeToDisplay } from "./units";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 
 export type Heatmap = Omit<DistanceColoring, "distanceTo">;
@@ -24,9 +25,12 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   const mode = useApp(app, (s) => s.collisionMode);
   const group = useApp(app, (s) => s.group);
   const shown = mode === "pair" ? [pair.a, pair.b] : group.members;
+  const units = useApp(app, (s) => s.units);
 
   // The sliders' scale follows the size of the meshes coloured: a file in
   // millimetres and the unit-sized demo meshes both get useful ranges.
+  // In mm, whatever the display unit: changing that moves no value, so no
+  // colouring. Only the Slider converts, both ways.
   const scale = niceScale(Math.max(0, ...items.filter((i) => shown.includes(i.mesh)).map((i) => i.radius)));
   const step = scale / 1000;
   // `null` until a slider moves: the defaults then follow the scale.
@@ -71,7 +75,8 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         : penetration in reds, contact white, the gap green to blue.
       </p>
       <Slider
-        label="Penetration depth"
+        label={`Penetration depth (${units})`}
+        unit={units}
         name="depth"
         min={step}
         max={scale}
@@ -81,7 +86,8 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         title="The penetration shown darkest; deeper clamps to it"
       />
       <Slider
-        label="Colour from (mm)"
+        label={`Colour from (${units})`}
+        unit={units}
         name="gap"
         min={0}
         max={scale}
@@ -91,7 +97,8 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         title="The gap shown blue; farther shows the mesh colour. 0 colours penetration only"
       />
       <Slider
-        label="Contact tolerance"
+        label={`Contact tolerance (${units})`}
+        unit={units}
         name="tolerance"
         min={0}
         max={tolMax}
@@ -101,7 +108,8 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         title="Within ± this distance counts as contact (white), and for the contact count"
       />
       <Slider
-        label="Boundary softness"
+        label={`Boundary softness (${units})`}
+        unit={units}
         name="softness"
         min={0}
         max={scale / 10}
@@ -110,7 +118,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         onChange={(v) => app.setEdgeSoftness(v)}
         title="The width of the blend where colours meet: the coloured area's edge and the contact band's. 0 is a hard edge"
       />
-      <Legend depth={depth} gap={gap} tolerance={tolerance} />
+      <Legend depth={depth} gap={gap} tolerance={tolerance} unit={units} />
       <label
         className="check"
         title="Bound the fields at twice max(depth, colour from): much faster on large meshes, but deeper penetration shows the mesh colour"
@@ -124,7 +132,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
         Fast mode (large meshes)
       </label>
       {mode === "pair" ? (
-        <PairMode app={app} scene={scene} items={items} pair={pair} heat={heat} tolerance={tolerance} />
+        <PairMode app={app} scene={scene} items={items} pair={pair} heat={heat} tolerance={tolerance} unit={units} />
       ) : (
         <GroupMode app={app} scene={scene} items={items} group={group} heat={heat} />
       )}
@@ -140,8 +148,9 @@ function PairMode(props: {
   pair: CollisionPair;
   heat: Heatmap;
   tolerance: number;
+  unit: LengthUnit;
 }) {
-  const { app, scene, items, pair, heat, tolerance } = props;
+  const { app, scene, items, pair, heat, tolerance, unit } = props;
   const store = useScene();
   const { a, b } = pair;
   const ready = a !== null && b !== null && a !== b;
@@ -220,7 +229,7 @@ function PairMode(props: {
       ) : (
         <>
           <PairStatus a={a} b={b} />
-          <ReadoutList readouts={readouts} bound={heat.maxDistance} />
+          <ReadoutList readouts={readouts} bound={heat.maxDistance} unit={unit} />
           {warnings.map((w) => (
             <p key={w} className="warn small" data-warning>
               {w}
@@ -277,8 +286,8 @@ function PairStatus(props: { a: MeshHandle; b: MeshHandle }) {
   return null;
 }
 
-function ReadoutList(props: { readouts: Readouts | null; bound: number }) {
-  const { readouts: r, bound } = props;
+function ReadoutList(props: { readouts: Readouts | null; bound: number; unit: LengthUnit }) {
+  const { readouts: r, bound, unit } = props;
   const dash = "—";
   const pen = r?.penetration ?? null;
   // A bounded field (fast mode) measures within its bound only; a readout
@@ -292,14 +301,14 @@ function ReadoutList(props: { readouts: Readouts | null; bound: number }) {
           {pen === null
             ? dash
             : pen.atLeast
-              ? `≥ ${formatDistance(Math.max(pen.depth, within))}`
-              : formatDistance(pen.depth)}
+              ? `≥ ${formatLength(Math.max(pen.depth, within), unit)}`
+              : formatLength(pen.depth, unit)}
           {pen !== null && Number.isFinite(within) ? (
-            <span className="muted"> (measured within {formatDistance(within)})</span>
+            <span className="muted"> (measured within {formatLength(within, unit)})</span>
           ) : null}
         </dd>
         <dt>Min gap</dt>
-        <dd>{r === null || r.gap === null ? dash : formatDistance(r.gap)}</dd>
+        <dd>{r === null || r.gap === null ? dash : formatLength(r.gap, unit)}</dd>
         <dt>Intersecting</dt>
         <dd>{r === null ? dash : r.intersects ? "yes" : "no"}</dd>
         <dt title="Triangles of each mesh within the contact tolerance of the other">In contact</dt>
@@ -309,7 +318,7 @@ function ReadoutList(props: { readouts: Readouts | null; bound: number }) {
       </dl>
       {Number.isFinite(bound) ? (
         <p className="muted small">
-          Fast mode: distances are measured within {formatDistance(bound)}; deeper penetration shows the mesh colour.
+          Fast mode: distances are measured within {formatLength(bound, unit)}; deeper penetration shows the mesh colour.
         </p>
       ) : null}
     </>
@@ -317,8 +326,8 @@ function ReadoutList(props: { readouts: Readouts | null; bound: number }) {
 }
 
 /** The heatmap's colours from −depth to the gap, as `contactHeatmap` maps them by default. */
-function Legend(props: { depth: number; gap: number; tolerance: number }) {
-  const { depth, gap, tolerance } = props;
+function Legend(props: { depth: number; gap: number; tolerance: number; unit: LengthUnit }) {
+  const { depth, gap, tolerance, unit } = props;
   const top = gap > 0 ? gap : tolerance;
   const at = (v: number) => `${(((v + depth) / (depth + top)) * 100).toFixed(2)}%`;
   const stops =
@@ -329,20 +338,22 @@ function Legend(props: { depth: number; gap: number; tolerance: number }) {
     <div className="legend" aria-hidden="true">
       <div className="legend-bar" style={{ background: `linear-gradient(to right, ${stops})` }} />
       <div className="legend-labels">
-        <span>−{formatDistance(depth)}</span>
+        <span>−{formatLength(depth, unit)}</span>
         {gap > 0 ? (
           <span className="legend-zero" style={{ left: at(0) }}>
             0
           </span>
         ) : null}
-        <span>{gap > 0 ? formatDistance(gap) : `${formatDistance(tolerance)}, then the mesh colour`}</span>
+        <span>{gap > 0 ? formatLength(gap, unit) : `${formatLength(tolerance, unit)}, then the mesh colour`}</span>
       </div>
     </div>
   );
 }
 
+/** A length slider: holds mm, and its input runs in the display unit, converting both ways. */
 function Slider(props: {
   label: string;
+  unit: LengthUnit;
   name: string;
   min: number;
   max: number;
@@ -351,22 +362,23 @@ function Slider(props: {
   title: string;
   onChange: (v: number) => void;
 }) {
-  const { label, name, min, max, step, value, title, onChange } = props;
+  const { label, unit, name, min, max, step, value, title, onChange } = props;
+  const shown = rangeToDisplay({ min, max, step, value }, unit);
   return (
     <label className="slider" title={title}>
       <span className="slider-head">
         <span>{label}</span>
-        <output>{formatDistance(value)}</output>
+        <output>{formatLengthValue(value, unit)}</output>
       </span>
       <input
         type="range"
         data-control={name}
-        min={min}
-        max={max}
-        step={step}
-        value={value}
+        min={shown.min}
+        max={shown.max}
+        step={shown.step}
+        value={shown.value}
         disabled={max <= min}
-        onChange={(e) => onChange(Number(e.currentTarget.value))}
+        onChange={(e) => onChange(fromDisplayLength(Number(e.currentTarget.value), unit))}
       />
     </label>
   );

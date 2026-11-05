@@ -42,9 +42,13 @@ export function installTestHook(
         name: i.name,
         triangles: i.triangles,
         volumeId: i.volumeId,
+        importScale: i.importScale,
+        radius: i.radius,
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
         visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
+    /** A mesh's stored positions, as the engine holds them. */
+    positions: (name: string) => Array.from(store.scene.views(find(name).mesh).positions()),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
     /** The large-file UX state: the decimate toggle and the URL thresholds. */
     bigFile: () => {
@@ -272,6 +276,11 @@ export function installTestHook(
     wireframe: () => app.getSnapshot().wireframe,
     /** The persisted display settings, as stored (issue #144). */
     settings: () => settingsFromSnapshot(app.getSnapshot()),
+    /** The display unit, its global default, and what loads are assumed to be in. */
+    units: () => {
+      const { units, defaultUnits, importScale } = app.getSnapshot();
+      return { units, defaultUnits, importScale };
+    },
     /** Restores the display defaults (the status bar's reset). */
     resetSettings: () => app.resetDisplaySettings(),
     /** The wireframe overlays in the scene: meshes bound, overlays shown, and whether every solid stayed shaded. */
@@ -339,6 +348,7 @@ export function installTestHook(
     exportCsv: (): string =>
       collisionRowsToCsv(
         buildCollisionRows(app.getSnapshot().items, app.getSnapshot().collision, inspect.collision, inspect.group),
+        app.getSnapshot().units,
       ),
     /**
      * The inspect section's contours as DXF and SVG text (issue #127), `null`

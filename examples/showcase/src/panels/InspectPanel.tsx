@@ -9,9 +9,9 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useState } from "react";
 import { type AppState, type InspectTool, type Item, useApp } from "../scene/app-state";
-import { formatCoord, rulerDistance } from "../viewport/inspect-tools";
-import { formatDistance } from "./collision-math";
+import { formatCoord, readMeasure, rulerDistance } from "../viewport/inspect-tools";
 import { inspect } from "./inspect";
+import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "./units";
 
 const TOOLS: { tool: InspectTool; label: string; title: string }[] = [
   { tool: "ruler", label: "Ruler", title: "Click two vertices to measure their distance (snaps to vertices)" },
@@ -38,6 +38,7 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
   const query = useApp(app, (s) => s.inspectQuery);
   const section = useApp(app, (s) => s.inspectSection);
   const clip = useApp(app, (s) => s.clipBox);
+  const units = useApp(app, (s) => s.units);
   const item = items.find((i) => i.mesh === selection) ?? null;
 
   const distance = ruler !== null && ruler.b !== null ? rulerDistance(ruler.a, ruler.b) : null;
@@ -65,21 +66,11 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
           setQueryValue(null);
         }
       });
-    try {
-      const maybe = scene as unknown as { measure?: (m: MeshHandle) => { area: number; volume: number | null } };
-      if (typeof maybe.measure === "function") {
-        const m = maybe.measure(query.mesh);
-        if (alive) {
-          setQueryMeasure({ area: m.area, volume: m.volume });
-        }
-      } else if (alive) {
-        setQueryMeasure(null);
-      }
-    } catch {
+    void readMeasure(scene, query.mesh).then((m) => {
       if (alive) {
-        setQueryMeasure(null);
+        setQueryMeasure(m);
       }
-    }
+    });
     return () => {
       alive = false;
     };
@@ -135,10 +126,10 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
       {tool === "query" ? (
         <p className="muted small">Click a vertex in the viewport to read its coloring value.</p>
       ) : null}
-      <RulerReadout app={app} ruler={ruler} distance={distance} />
-      <QueryReadout query={query} items={items} value={queryValue} measure={queryMeasure} />
-      <SectionControls app={app} scene={scene} store={store} items={items} item={item} section={section} active={tool === "section"} />
-      {tool === "clip" || clip !== null ? <ClipControls app={app} scene={scene} items={items} item={item} clip={clip} /> : null}
+      <RulerReadout app={app} ruler={ruler} distance={distance} unit={units} />
+      <QueryReadout query={query} items={items} value={queryValue} measure={queryMeasure} unit={units} />
+      <SectionControls app={app} scene={scene} store={store} items={items} item={item} section={section} active={tool === "section"} unit={units} />
+      {tool === "clip" || clip !== null ? <ClipControls app={app} scene={scene} items={items} item={item} clip={clip} unit={units} /> : null}
     </section>
   );
 }
@@ -147,17 +138,18 @@ function RulerReadout(props: {
   app: AppState;
   ruler: { a: [number, number, number]; b: [number, number, number] | null } | null;
   distance: number | null;
+  unit: LengthUnit;
 }) {
-  const { app, ruler, distance } = props;
+  const { app, ruler, distance, unit } = props;
   if (ruler === null) {
     return null;
   }
-  const pt = (p: readonly [number, number, number]) => p.map(formatCoord).join(", ");
   return (
     <p className="readout" data-readout="ruler">
-      A ({pt(ruler.a)}){ruler.b === null ? " · click a second vertex" : ` → B (${pt(ruler.b)})`}{" "}
+      A {formatPoint(ruler.a, unit)}
+      {ruler.b === null ? " · click a second vertex" : ` → B ${formatPoint(ruler.b, unit)}`}{" "}
       {distance === null ? null : (
-        <strong>= {formatDistance(distance)}</strong>
+        <strong>= {formatLength(distance, unit)}</strong>
       )}{" "}
       <button type="button" data-action="ruler-clear" onClick={() => app.setRuler(null)} title="Clear the ruler">
         Clear
@@ -171,8 +163,9 @@ function QueryReadout(props: {
   items: readonly Item[];
   value: number | null;
   measure: { area: number; volume: number | null } | null;
+  unit: LengthUnit;
 }) {
-  const { query, items, value, measure } = props;
+  const { query, items, value, measure, unit } = props;
   if (query === null) {
     return null;
   }
@@ -180,14 +173,14 @@ function QueryReadout(props: {
   return (
     <div className="readout" data-readout="query">
       <p>
-        {name} vertex {query.slot} at ({query.point.map(formatCoord).join(", ")})
+        {name} vertex {query.slot} at {formatPoint(query.point, unit)}
       </p>
       <p>
-        coloring value: {value === null ? "no coloring" : formatCoord(value)}
+        coloring value: {value === null ? "no coloring" : formatCoordLength(value, unit)}
         {measure === null ? null : (
           <>
-            {" · "}area {formatDistance(measure.area)}
-            {measure.volume === null ? " · open mesh (no volume)" : ` · volume ${formatDistance(measure.volume)}`}
+            {" · "}area {formatArea(measure.area, unit)}
+            {measure.volume === null ? " · open mesh (no volume)" : ` · volume ${formatVolume(measure.volume, unit)}`}
           </>
         )}
       </p>
@@ -203,8 +196,9 @@ function SectionControls(props: {
   item: Item | null;
   section: { handle: unknown; plane: { origin: readonly [number, number, number]; normal: readonly [number, number, number] } } | null;
   active: boolean;
+  unit: LengthUnit;
 }) {
-  const { app, scene, store, items, item, section, active } = props;
+  const { app, scene, store, items, item, section, active, unit } = props;
   if (!active && section === null) {
     return null;
   }
@@ -252,7 +246,7 @@ function SectionControls(props: {
       ) : (
         <>
           <p className="muted small">
-            origin ({section.plane.origin.map(formatCoord).join(", ")}) · normal (
+            origin {formatPoint(section.plane.origin, unit)} · normal (
             {section.plane.normal.map(formatCoord).join(", ")}) · drag the handle in the viewport
           </p>
           <div className="modes" role="group" aria-label="Section axis">
@@ -287,7 +281,7 @@ function SectionControls(props: {
             </button>
           </div>
           <label className="slider">
-            offset <output>{formatCoord(offset)}</output>
+            offset <output>{formatCoordLength(offset, unit)}</output>
             <input
               type="range"
               min={-range}
@@ -361,8 +355,9 @@ function ClipControls(props: {
   items: readonly Item[];
   item: Item | null;
   clip: { min: [number, number, number]; max: [number, number, number] } | null;
+  unit: LengthUnit;
 }) {
-  const { app, scene, items, item, clip } = props;
+  const { app, scene, items, item, clip, unit } = props;
   if (clip === null) {
     return (
       <p>
@@ -406,7 +401,7 @@ function ClipControls(props: {
       {AXES.map((a, i) => (
         <div key={a}>
           <label className="slider">
-            {a} min <output>{formatCoord(clip.min[i])}</output>
+            {a} min <output>{formatCoordLength(clip.min[i], unit)}</output>
             <input
               type="range"
               min={lo[i]}
@@ -417,7 +412,7 @@ function ClipControls(props: {
             />
           </label>
           <label className="slider">
-            {a} max <output>{formatCoord(clip.max[i])}</output>
+            {a} max <output>{formatCoordLength(clip.max[i], unit)}</output>
             <input
               type="range"
               min={lo[i]}

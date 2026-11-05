@@ -2,6 +2,7 @@
 // (holes largest first, components largest first), and one line per repair
 // report.
 import type { Analysis, JoinReport, LoopId, RepairOp, RepairReport } from "fast-mesh-wasm";
+import { type LengthUnit, toDisplayLength } from "./units";
 
 export interface AnalysisSummary {
   /** Closed boundary loops, largest first, with the ids bridging takes. */
@@ -63,8 +64,13 @@ function fmtNum(x: number): string {
   return `${Number(x.toPrecision(3))}`;
 }
 
-/** One line for a repair report. */
-export function describeReport(op: RepairOp["op"], report: RepairReport): string {
+/**
+ * One line for a repair report. Lengths come as bare numbers without a
+ * `unit`, in it with one (the report holds mm).
+ */
+export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: LengthUnit): string {
+  const fmtLength = (x: number): string =>
+    unit === undefined ? fmtNum(x) : `${fmtNum(toDisplayLength(x, unit))} ${unit}`;
   switch (op) {
     case "weld": {
       const r = report as Extract<RepairReport, { mergedVertices: number }>;
@@ -109,11 +115,11 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
     }
     case "inflate": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
-      return `Inflate: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+      return `Inflate: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "smooth": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
-      return `Smooth: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+      return `Smooth: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "remesh": {
       const r = report as Extract<RepairReport, { splits: number; collapses: number; flips: number; rounds: number }>;
@@ -125,15 +131,15 @@ export function describeReport(op: RepairOp["op"], report: RepairReport): string
     }
     case "grab": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
-      return `Grab: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+      return `Grab: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "relax": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
-      return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+      return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "offset": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
-      return `Offset: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtNum(r.maxDisplacement)})`;
+      return `Offset: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "shell": {
       const r = report as Extract<RepairReport, { verticesAdded: number; trianglesAdded: number }>;

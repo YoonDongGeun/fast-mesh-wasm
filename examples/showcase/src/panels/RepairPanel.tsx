@@ -11,13 +11,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { REPAIR_OVERLAY_KINDS, type AppState, type Item, type RepairOverlayKind, useApp } from "../scene/app-state";
 import { nextJoinSource } from "../scene/selection";
 import { REPAIR_OVERLAY_COLORS } from "../viewport/repair-overlays";
-import { formatDistance } from "./collision-math";
 import { inspect } from "./inspect";
 import {
   AUTO_REPAIR_ANY_SIZE,
   runAutoRepairPipeline,
 } from "./auto-repair";
 import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
+import { formatLength, fromDisplayLength, lengthInputValue, type LengthUnit } from "./units";
+import { LengthInput } from "./LengthInput";
 
 /** The most entries the analysis lists (counts stay exact). */
 const MAX_LISTED = 64;
@@ -37,6 +38,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const items = useApp(app, (s) => s.items);
   const item = items.find((i) => i.mesh === selection) ?? null;
   const mesh = item?.mesh ?? null;
+  const units = useApp(app, (s) => s.units);
 
   const [analysis, setAnalysis] = useState<{ mesh: MeshHandle; summary: AnalysisSummary } | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -217,7 +219,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     own.current.pending = true;
     try {
       const r = (await store.repair(mesh, op)) as RepairReport;
-      const line = describeReport(op.op, r);
+      const line = describeReport(op.op, r, units);
       setReport({ mesh, line, failed: false });
       inspect.repair.report = line;
     } catch (e) {
@@ -342,7 +344,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         <p className="muted small">{analyzing ? "Analysing…" : "No analysis."}</p>
       ) : (
         <>
-          <AnalysisList summary={s} stale={analyzing} />
+          <AnalysisList summary={s} stale={analyzing} unit={units} />
           <OverlayToggles app={app} summary={s} />
         </>
       )}
@@ -357,15 +359,9 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           >
             Weld
           </button>
-          <label className="field" title="Vertices at most this far apart are merged (mesh units)">
-            within
-            <input
-              type="number"
-              min={0}
-              step="any"
-              value={weldTolerance}
-              onChange={(e) => setWeldTolerance(Math.max(0, Number(e.currentTarget.value) || 0))}
-            />
+          <label className="field" title="Vertices at most this far apart are merged">
+            within ({units})
+            <LengthInput min={0} mm={weldTolerance} unit={units} onMm={(mm) => setWeldTolerance(Math.max(0, mm))} />
           </label>
         </div>
         <div className="op">
@@ -460,28 +456,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         <div className="op">
           <span className="op-label">Brush</span>
           <label className="field" title="Brush center in local mesh coordinates">
-            center
-            <input
-              type="number"
-              step="any"
-              aria-label="Brush center x"
-              value={center[0]}
-              onChange={(e) => setCenter([Number(e.currentTarget.value) || 0, center[1], center[2]])}
-            />
-            <input
-              type="number"
-              step="any"
-              aria-label="Brush center y"
-              value={center[1]}
-              onChange={(e) => setCenter([center[0], Number(e.currentTarget.value) || 0, center[2]])}
-            />
-            <input
-              type="number"
-              step="any"
-              aria-label="Brush center z"
-              value={center[2]}
-              onChange={(e) => setCenter([center[0], center[1], Number(e.currentTarget.value) || 0])}
-            />
+            center ({units})
+            <LengthInput aria-label="Brush center x" mm={center[0]} unit={units} onMm={(mm) => setCenter([mm, center[1], center[2]])} />
+            <LengthInput aria-label="Brush center y" mm={center[1]} unit={units} onMm={(mm) => setCenter([center[0], mm, center[2]])} />
+            <LengthInput aria-label="Brush center z" mm={center[2]} unit={units} onMm={(mm) => setCenter([center[0], center[1], mm])} />
           </label>
           <button
             type="button"
@@ -499,17 +477,11 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           >
             {brushPick !== null && brushPick.point === null && brushPick.mesh === mesh ? "Picking…" : "Pick"}
           </button>
-          <label className="field" title="Brush radius in mesh units">
-            radius
-            <input
-              type="number"
-              min={0}
-              step="any"
-              value={brushRadius}
-              onChange={(e) => setBrushRadius(Math.max(0, Number(e.currentTarget.value) || 0))}
-            />
+          <label className="field" title="Brush radius">
+            radius ({units})
+            <LengthInput min={0} mm={brushRadius} unit={units} onMm={(mm) => setBrushRadius(Math.max(0, mm))} />
           </label>
-          <label className="field" title="Displacement scale (negative dents)">
+          <label className="field" title="Displacement scale (negative dents): always in mm for Inflate, a weight for Smooth">
             strength
             <input
               type="number"
@@ -576,14 +548,17 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
             Remesh
           </button>
           <label className="field" title="Target edge length (empty: the mesh mean)">
-            length
+            length ({units})
             <input
               type="number"
               min={0}
               step="any"
               placeholder="auto"
-              value={targetLength}
-              onChange={(e) => setTargetLength(e.currentTarget.value)}
+              value={targetLength === "" ? "" : lengthInputValue(Number(targetLength), units)}
+              onChange={(e) => {
+                const typed = e.currentTarget.value;
+                setTargetLength(typed === "" ? "" : String(fromDisplayLength(Number(typed), units)));
+              }}
             />
           </label>
           <label className="field" title="Split/collapse/flip rounds (empty: default)">
@@ -734,8 +709,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   );
 }
 
-function AnalysisList(props: { summary: AnalysisSummary; stale: boolean }) {
-  const { summary: s, stale } = props;
+function AnalysisList(props: { summary: AnalysisSummary; stale: boolean; unit: LengthUnit }) {
+  const { summary: s, stale, unit } = props;
   const bad = (n: number) => (n > 0 ? "warn" : undefined);
   return (
     <dl
@@ -750,7 +725,7 @@ function AnalysisList(props: { summary: AnalysisSummary; stale: boolean }) {
           <ul className="holes">
             {s.holes.slice(0, HOLES_SHOWN).map((h, k) => (
               <li key={k}>
-                {plural(h.edges, "edge")} · perimeter {formatDistance(h.perimeter)}
+                {plural(h.edges, "edge")} · perimeter {formatLength(h.perimeter, unit)}
               </li>
             ))}
             {s.holes.length > HOLES_SHOWN ? <li className="muted">and {s.holes.length - HOLES_SHOWN} more</li> : null}

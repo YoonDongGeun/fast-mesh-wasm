@@ -96,6 +96,7 @@ export function ExportPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const items = useApp(app, (s) => s.items);
   const section = useApp(app, (s) => s.inspectSection);
   const pair = useApp(app, (s) => s.collision);
+  const units = useApp(app, (s) => s.units);
   const [selection] = useSelection();
   const [format, setFormat] = useState<MeshExportFormat>("stl");
   const [meshId, setMeshId] = useState<string | null>(null);
@@ -142,7 +143,7 @@ export function ExportPanel(props: { app: AppState; scene: Scene | WorkerScene }
         setMessage("There is no collision summary yet: pick a pair or tick a group first.");
         return;
       }
-      downloadReportText(collisionRowsToCsv(rows), reportFileName("collision-summary", "csv"), "text/csv");
+      downloadReportText(collisionRowsToCsv(rows, units), reportFileName("collision-summary", "csv"), "text/csv");
       setMessage(null);
     } catch (error) {
       setMessage(`Could not export the report: ${error instanceof Error ? error.message : String(error)}`);

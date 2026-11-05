@@ -87,7 +87,7 @@ describe("collision CSV", () => {
       { a: "B", b: "C", gap: 0, intersects: true, depth: 1.25 },
     ]);
     expect(csv.split("\n")).toEqual([
-      "mesh_a,mesh_b,min_gap,intersects,max_depth",
+      "mesh_a,mesh_b,min_gap_mm,intersects,max_depth_mm",
       "A,B,0.5,no,",
       "B,C,0,yes,1.25",
       "",
@@ -100,7 +100,18 @@ describe("collision CSV", () => {
   });
 
   it("is header-only with no rows", () => {
-    expect(collisionRowsToCsv([])).toBe("mesh_a,mesh_b,min_gap,intersects,max_depth\n");
+    expect(collisionRowsToCsv([])).toBe("mesh_a,mesh_b,min_gap_mm,intersects,max_depth_mm\n");
+  });
+
+  it("converts the lengths to the display unit, and says so in the header", () => {
+    const csv = collisionRowsToCsv(
+      [
+        { a: "A", b: "B", gap: 25.4, intersects: false, depth: null },
+        { a: "B", b: "C", gap: null, intersects: true, depth: 127 },
+      ],
+      "in",
+    );
+    expect(csv.split("\n")).toEqual(["mesh_a,mesh_b,min_gap_in,intersects,max_depth_in", "A,B,1,no,", "B,C,,yes,5", ""]);
   });
 
   it("sanitizes download names", () => {

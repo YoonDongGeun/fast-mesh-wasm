@@ -240,6 +240,9 @@ describe("repair summaries", () => {
       "Inflate: moved 1,234 vertices (max 0.102)",
     );
     expect(describeReport("smooth", { moved: 1, maxDisplacement: 2 })).toBe("Smooth: moved 1 vertex (max 2)");
+    // With the display unit: the displacement is a length.
+    expect(describeReport("inflate", { moved: 1, maxDisplacement: 2 }, "mm")).toBe("Inflate: moved 1 vertex (max 2 mm)");
+    expect(describeReport("inflate", { moved: 1, maxDisplacement: 25.4 }, "in")).toBe("Inflate: moved 1 vertex (max 1 in)");
     expect(describeReport("remesh", { splits: 12, collapses: 2, flips: 1, rounds: 4 })).toBe(
       "Remesh: 12 splits, 2 collapses, 1 flip in 4 rounds",
     );
