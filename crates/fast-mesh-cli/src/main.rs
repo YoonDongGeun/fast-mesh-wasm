@@ -17,7 +17,8 @@ use args::{Command, Input, Output, OutputFormat};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_cli::io::{self, MeshData};
 use fast_mesh_ops::{
-    AutoRepairReport, BooleanOp, VolumeReason, apply_boolean, auto_repair, boolean_plan, measure,
+    AutoRepairReport, BooleanOp, MeasureReport, VolumeReason, apply_boolean, auto_repair,
+    boolean_plan, measure,
 };
 use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
@@ -357,18 +358,83 @@ fn run_boolean(a: &Input, b: &Input, op: BooleanOp, output: &Output) -> Result<V
     // On `Err` the transaction drops uncommitted: nothing is kept.
     let applied = apply_boolean(&mut tx, &plan).map_err(runtime)?;
     tx.commit().map_err(runtime)?;
-    write(&from_mesh(&mesh_a)?, output)?;
-    let closed = measure(&mesh_a).map_err(runtime)?.closed;
-    if !closed {
-        eprintln!("fast-mesh: warning: the boolean's result is not closed");
+    // Before writing: a refused result must not replace an existing output.
+    let result = measure(&mesh_a).map_err(runtime)?;
+    if let Some(message) = invalid_boolean_result(&result) {
+        return Err(Failure::Runtime(message));
     }
+    write(&from_mesh(&mesh_a)?, output)?;
     Ok(Value::Object(vec![
         ("command", Value::Text("boolean".into())),
         ("a", path_text(&a.path)),
         ("b", path_text(&b.path)),
         ("output", path_text(&output.path)),
-        ("closed", Value::Bool(closed)),
+        ("closed", Value::Bool(result.closed)),
         ("kept_triangles", Value::Count(applied.kept_triangles)),
         ("triangles_added", Value::Count(applied.triangles_added)),
     ]))
+}
+
+/// Why a boolean's result cannot be trusted, if so. Closed alone is not enough:
+/// the engine can return a closed mesh with flipped patches and a wrong volume.
+/// This is a structural check: it cannot tell a sound mesh of the wrong shape.
+fn invalid_boolean_result(result: &MeasureReport) -> Option<String> {
+    (!result.closed || result.orientation_conflicts > 0).then(|| {
+        format!(
+            "the engine produced an invalid result ({} boundary loop(s), {} non-manifold edge(s), {} orientation conflict(s)), so nothing was written; see fast-mesh-wasm issue #165",
+            result.boundary_loops, result.non_manifold_edges, result.orientation_conflicts
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sound() -> MeasureReport {
+        MeasureReport {
+            area: 6.0,
+            signed_volume: 1.0,
+            volume: Some(1.0),
+            closed: true,
+            volume_reason: None,
+            boundary_loops: 0,
+            non_manifold_edges: 0,
+            orientation_conflicts: 0,
+        }
+    }
+
+    #[test]
+    fn a_sound_result_is_valid() {
+        assert_eq!(invalid_boolean_result(&sound()), None);
+    }
+
+    /// Each defect alone is enough.
+    #[test]
+    fn each_defect_is_invalid() {
+        let open = MeasureReport {
+            closed: false,
+            boundary_loops: 2,
+            ..sound()
+        };
+        let non_manifold = MeasureReport {
+            closed: false,
+            non_manifold_edges: 3,
+            ..sound()
+        };
+        let conflicted = MeasureReport {
+            orientation_conflicts: 4,
+            ..sound()
+        };
+        for (report, count) in [
+            (open, "2 boundary loop"),
+            (non_manifold, "3 non-manifold edge"),
+            (conflicted, "4 orientation conflict"),
+        ] {
+            let message = invalid_boolean_result(&report).unwrap();
+            for word in ["invalid result", "#165", count] {
+                assert!(message.contains(word), "{word}: {message}");
+            }
+        }
+    }
 }
