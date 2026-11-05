@@ -116,7 +116,12 @@ export function HoverTip(props: { app: AppState; scene: Scene | WorkerScene; ite
   }
   const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? "a mesh";
   return (
-    <div className="hover-tip" data-hover-tip style={{ left: hover.x + 14, top: hover.y + 14 }}>
+    <div
+      className="hover-tip"
+      data-hover-tip
+      // A tap lands anywhere on a phone: the tip stays on screen (its max-width in styles.css).
+      style={{ left: view.pointerType === "touch" ? `min(${hover.x + 14}px, calc(100vw - 236px))` : hover.x + 14, top: hover.y + 14 }}
+    >
       <strong>{nameOf(member)}</strong>
       <br />
       {data === null

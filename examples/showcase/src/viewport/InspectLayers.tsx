@@ -15,6 +15,7 @@ import { formatLength } from "../panels/units";
 import { boxFaces, localVertex, normalTravel, rulerDistance, snapSlot, worldFromMatrix } from "./inspect-tools";
 import { setBoxClip, setSectionClip } from "./clip-planes";
 import { dragPlaneNormal, planeHit } from "./slice-drag";
+import { isExtraFinger } from "./touch";
 import { setDragging, view } from "./view";
 
 /** The engine hit's snapped vertex in world coordinates. */
@@ -236,6 +237,13 @@ function SectionLayer(props: { app: AppState; scene: Scene | WorkerScene; items:
     );
   }, [gizmo, section, items, selection]);
 
+  useEffect(() => {
+    view.sectionHandle = gizmo.handle;
+    return () => {
+      view.sectionHandle = null;
+    };
+  }, [gizmo]);
+
   // Dragging the handle ball moves the plane along its normal.
   useEffect(() => {
     void scene;
@@ -273,7 +281,7 @@ function SectionLayer(props: { app: AppState; scene: Scene | WorkerScene; items:
     const onDown = (e: PointerEvent) => {
       const snap = app.getSnapshot();
       const cur = snap.inspectSection;
-      if (e.button !== 0 || drag.current !== null || view.dragging || cur === null) {
+      if (e.button !== 0 || isExtraFinger(e) || drag.current !== null || view.dragging || cur === null) {
         return;
       }
       if (snap.sculpt !== null || snap.brushPick !== null) {

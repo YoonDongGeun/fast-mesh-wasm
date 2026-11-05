@@ -116,6 +116,11 @@ jobs:
       - name: Check the showcase in Chrome
         timeout-minutes: 10
         run: node scripts/showcase-check.mjs --threads 4
+      # Phone metrics with touch emulation and real multi-touch input (Input.dispatchTouchEvent):
+      # the camera moves under one and two fingers, a second finger fires no tool, panels reachable.
+      - name: Check the showcase on touch in Chrome
+        timeout-minutes: 5
+        run: node scripts/showcase-touch-check.mjs
       # The GitHub Pages build (pages.yml): rebuilt under /fast-mesh-wasm/ and served
       # without COOP/COEP; the service worker makes it isolated and threaded after one
       # reload, and without it the scene still runs single-threaded. Last of the

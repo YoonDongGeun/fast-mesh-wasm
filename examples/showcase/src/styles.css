@@ -810,6 +810,160 @@ input[type="range"] {
       "left view"
       "right right"
       "status status";
-    grid-template-rows: minmax(0, 1fr) auto auto;
+    /* The right panel scrolls in its share: at auto it would squeeze the canvas to nothing. */
+    grid-template-rows: minmax(0, 1fr) minmax(0, 40%) auto;
+  }
+}
+
+/* ---- Touch ---- */
+/* The trackball and gizmo set touch-action on the canvas inline, and a gizmo's
+   dispose clears it, which would hand the next drag to the browser. On the
+   whole viewport: a pinch starting on an overlay would zoom the page. */
+.viewport {
+  touch-action: none;
+}
+.viewport canvas {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+@media (pointer: coarse) {
+  button,
+  button.link,
+  button.icon,
+  .statusbar button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 6px 10px;
+  }
+  select,
+  input[type="number"],
+  input[type="text"] {
+    min-height: 44px;
+    font-size: 16px; /* iOS zooms the page into anything smaller on focus */
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: 22px;
+    height: 22px;
+  }
+  input[type="range"] {
+    min-height: 36px;
+  }
+  .resize-handle {
+    width: 14px;
+  }
+  .toolbar {
+    right: 10px;
+    flex-wrap: wrap;
+    gap: 4px;
+    pointer-events: none; /* the gaps belong to the canvas */
+  }
+  .toolbar .group {
+    pointer-events: auto;
+  }
+  .toolbar kbd {
+    display: none;
+  }
+  /* Sculpting and mask paint are mouse tools for now: the brush panel would
+     cover the canvas, and an armed brush takes the one-finger orbit. */
+  .toolbox {
+    display: none;
+  }
+  .hover-tip {
+    max-width: 228px;
+    white-space: normal;
+  }
+}
+
+/* A phone held upright: the canvas stays pinned on top and the panels scroll
+   under it, so a slider's effect stays in view. Touching the canvas never
+   scrolls (touch-action), so the panels must be what scrolls the page. */
+@media (max-width: 600px) {
+  html,
+  body,
+  #root {
+    height: auto;
+    min-height: 100%;
+  }
+  html {
+    scroll-padding-top: 56vh; /* what scrolls into view lands below the canvas */
+  }
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+  }
+  .viewport {
+    order: -1;
+    flex: none;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    height: 55vh;
+    height: 55svh; /* svh: the collapsing address bar must not resize the canvas mid-scroll */
+    background: var(--bg);
+  }
+  .sidebar {
+    overflow: visible;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .resize-handle {
+    display: none;
+  }
+  .statusbar {
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    white-space: normal;
+  }
+  .volume-overlay {
+    /* Under the toolbar's two rows it would hide the view: along the bottom instead. */
+    top: auto;
+    bottom: 30px;
+    left: 10px;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+}
+
+/* A phone held sideways: the same, with the panels beside the canvas. */
+@media (pointer: coarse) and (max-height: 500px) and (min-width: 601px) {
+  html,
+  body,
+  #root {
+    height: auto;
+    min-height: 100%;
+  }
+  .app {
+    height: auto;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+    grid-template-areas:
+      "view left"
+      "view right"
+      "view status"
+      "view .";
+  }
+  .viewport {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    height: 100svh;
+  }
+  .sidebar {
+    overflow: visible;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .resize-handle {
+    display: none;
+  }
+  .statusbar {
+    flex-wrap: wrap;
+    white-space: normal;
   }
 }
