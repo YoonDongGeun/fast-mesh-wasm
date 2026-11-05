@@ -317,6 +317,32 @@ No target was set for these (the plan asks only that they be recorded), and noth
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 - **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
 
+## Command line (fast-mesh-cli)
+
+End-to-end runs of the `fast-mesh` binary, process start to exit, reading and writing files, measured on 2026-11-05.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, with other builds sharing the machine (upper bounds)
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`); the `parallel` column is `--features parallel` with the default pool
+- **Meshes:** `gen_torus` (`cargo run --release -p fast-mesh-cli --example gen_torus -- 1000000 a.stl`): 999,696 triangles, 499,848 vertices, binary STL of 50 MB. `holed.stl` is the same with 10 separated triangles removed.
+- **Timing:** the median of 3 runs
+
+| Command | Single thread | `parallel` | Notes |
+| --- | --- | --- | --- |
+| `measure a.stl --format json` | 1.14 s | 1.04 s | Area and volume within 3e-3 % of the smooth torus's 118.44 and 59.22; closed. |
+| `repair holed.stl -o r.stl --auto` | 2.69 s | 2.87 s | All 10 holes filled and faired; the result measures closed. |
+| `repair holed.stl -o r.stl --auto --no-fair` | 3.09 s | 3.25 s | These holes are single triangles, with next to nothing to fair: the difference is the machine's load. |
+| `convert a.stl -o a2.stl` | 0.31 s | 0.52 s | Parse, weld corners, write. |
+| `convert a.stl -o a.ply` / `a.ply` to `.stl` | 0.22 / 0.21 s | 0.29 / 0.24 s | Binary PLY, 19 MB. |
+| `convert a.stl -o a.glb` / `a.glb` to `.stl` | 0.28 / 0.20 s | 0.26 / 0.14 s | GLB, 18 MB. |
+| `convert a.stl -o a.obj` / `a.obj` to `.stl` | 0.52 / 0.33 s | 0.42 / 0.35 s | OBJ, 52 MB. |
+| `convert a.stl -o a.ply --ascii` / back | 0.45 / 0.38 s | 0.43 / 0.38 s | ASCII PLY, 51 MB. |
+| `convert a.stl -o a.stl --ascii` / back | 1.61 / 1.16 s | 1.49 / 1.06 s | ASCII STL, 311 MB. |
+| `boolean a.stl b.stl --op union` | 5.91 s | 3.24 s | Disjoint inputs only: `b.stl` is 699,744 triangles moved out of reach. Overlapping curved inputs stop with "too complex" (below). |
+
+The parsers and writers do not depend on the engine's `parallel` feature, so the conversion differences are noise. Loading is linear in the file: `convert` from binary STL to binary STL takes 29 ms, 202 ms and 868 ms at 100k, 1M and 4M triangles (OBJ to binary STL 43, 217 and 929 ms; single thread, median of 3).
+
+**The boolean at this size.** No overlapping 1M pair in these runs completed, so there is no time for a real one. `boolean_plan` returned "boolean intersection too complex" for all 48 random-offset overlaps of two different tori (2k to 100k triangles), and for two different UV spheres from 168 to 998,000 triangles, after about 5.6 s at the largest. Two identical spheres one radius apart along x succeed at 3k and 49k triangles (the lens volume comes out within 1 % of 5π/12) but report `closed: false`, and fail at 998,000. Calling `boolean_plan` directly on the 2k torus pair, with separate origins and with a shared one, gives the same refusal, so this is the engine and not the CLI. Axis-aligned cubes succeed and are what the end-to-end tests check.
+
 ## JavaScript core (fast-mesh-wasm)
 
 Results for `pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m`, a plain Node script (`packages/fast-mesh-wasm/bench/scene.bench.mjs`, `performance.now()`, medians over the iterations shown). It drives the `Scene` class of the built package, so everything crosses the wasm boundary as a user's code would.

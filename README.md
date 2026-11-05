@@ -613,6 +613,35 @@ Meshes must be added through the store (`store.addMesh`). A mesh added straight 
 
 All functions throw an `Error` with a readable message when a buffer length is not a multiple of 3 or an index is out of range, and when called before `init()` has finished in the browser.
 
+## Command line
+
+`fast-mesh` is a native binary for batch jobs and CI steps. It calls the Rust engine crates directly, with no WebAssembly or Node.js, and is not part of the npm package:
+
+```sh
+cargo install --path crates/fast-mesh-cli           # add --features parallel for multithreading
+
+fast-mesh repair in.stl -o out.stl --auto           # weld, remove degenerate, orient, remove small components, fill holes
+fast-mesh measure in.stl --format json              # counts, area, volume when watertight, defects
+fast-mesh boolean a.stl b.stl --op union -o out.stl # union, intersection or difference (a minus b)
+fast-mesh convert in.ply -o out.glb
+```
+
+Files are `.stl` (binary or ASCII), `.obj`, `.ply` (ASCII or binary little-endian) and `.glb`, chosen by extension. `--ascii` writes the text form of `.stl` and `.ply`. `repair` takes `--weld-tolerance <d>`, `--min-triangles <n>`, `--max-edges <n|any>` and `--no-fair`, with the defaults of `AutoRepairOptions`. `fast-mesh <command> --help` lists a command's options.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | The operation or a file failed: malformed or truncated input, I/O, inputs a boolean refuses, an empty result. |
+| `2` | Usage error: bad arguments, an unsupported extension, or an output that names an input without `--force`. |
+
+Reports go to stdout and diagnostics to stderr. With `--format json`, stdout holds one JSON object on success and nothing on failure, so a script can check the exit code and then parse. A hole `repair` leaves open is not a failure: it exits `0`, counts the hole in the report (`skipped`, `failed`) and warns on stderr.
+
+The output appears whole or not at all: it is written beside the target and renamed over it when complete, so a failed run leaves any existing file untouched.
+
+`boolean` refuses what the engine cannot resolve with `invalid input: boolean intersection too complex` (exit `1`); at present that includes many overlaps of curved surfaces, so check it on your data. Its report says whether the result is `closed`, and it warns on stderr when not.
+
+Limits: a `.glb` becomes one mesh, with its node placements baked and its primitives merged. Draco and meshopt compression, GPU instancing, sparse accessors and buffers outside the GLB body are refused with an error. JSON `.gltf`, big-endian PLY and UVs are not supported. Other attributes (normals, colors, materials) are not carried across a conversion.
+
 ## Supported environments
 
 | Environment | Entry | Notes |

@@ -52,11 +52,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-mesh-cli"
+version = "0.1.0"
+dependencies = [
+ "fast-mesh-bvh",
+ "fast-mesh-ops",
+ "fast-mesh-query",
+ "fast-mesh-store",
+]
+
+[[package]]
 name = "fast-mesh-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "fast-mesh-bvh",
+ "fast-mesh-cli",
  "fast-mesh-ops",
  "fast-mesh-query",
  "fast-mesh-store",

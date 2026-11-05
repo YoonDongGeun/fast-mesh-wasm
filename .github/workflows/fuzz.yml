@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGETS: 'fill weld triangulate bvh boolean'
+  TARGETS: 'fill weld triangulate bvh boolean parsers'
 
 jobs:
   fuzz:
