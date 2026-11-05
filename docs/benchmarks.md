@@ -343,6 +343,22 @@ The parsers and writers do not depend on the engine's `parallel` feature, so the
 
 **The boolean at this size.** No overlapping 1M pair in these runs completed, so there is no time for a real one. `boolean_plan` returned "boolean intersection too complex" for all 48 random-offset overlaps of two different tori (2k to 100k triangles), and for two different UV spheres from 168 to 998,000 triangles, after about 5.6 s at the largest. Two identical spheres one radius apart along x succeed at 3k and 49k triangles (the lens volume comes out within 1 % of 5π/12) but report `closed: false`, and fail at 998,000. Calling `boolean_plan` directly on the 2k torus pair, with separate origins and with a shared one, gives the same refusal, so this is the engine and not the CLI. Axis-aligned cubes succeed and are what the end-to-end tests check.
 
+## Registration (fast-mesh-ops)
+
+Results for `cargo bench -p fast-mesh-ops --bench ops -- icp` (and with `--features parallel`), measured on 2026-11-05.
+
+- **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, shared with other builds and tests during the run, so the single-thread times are an upper bound and the intervals are wide. Compare only within this table.
+- **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
+- **Input:** `terrain(708)` (1,002,528 triangles) as the fixed mesh with a prebuilt BVH. The points are the same terrain's triangle centroids and vertices (`sample_surface`), displaced by the inverse of a known motion: 0.1 degrees about z (1.2 cells at the far corner) and about a third of a cell along each axis. Default options otherwise. 10 samples per benchmark; the times are the middle of criterion's interval. The BVH build is outside the timing.
+
+| Benchmark | Points used | Steps | Final rmse | One thread | `parallel`, default pool |
+| --- | --- | --- | --- | --- | --- |
+| `icp/100k_samples` (the `Scene::register` default cap) | 100,000 | 3 | 9.5e-6 | 737 ms | 65 ms |
+| `icp/100k_samples_overlap_0.8` | 80,000 of 100,000 | 3 | 9.2e-7 | 600 ms | 58 ms |
+| `icp/all_samples` | 1,505,209 | 3 | 9.5e-6 | 5.95 s | 553 ms |
+
+All three report `Converged` with conditioning about 4.8e-3, and the same steps and rmse with the feature on or off. Three steps here means four correspondence passes: the last one measures the final pose. The cost is almost all closest-point queries, at roughly 1 to 2 µs per point per pass on one thread, so a call costs about passes x points x that. The rmse floor is the rounding of `f32` coordinates near 700 in the correspondence search; the solver's own residuals are computed in `f64`. The default cap of 100,000 points makes the cost of a call independent of the moving mesh's size, apart from one pass over its triangles to pick the samples. This input is an easy case (identical surfaces, a small displacement): a poor initial guess or a partial overlap takes more steps, up to `max_iterations`.
+
 ## JavaScript core (fast-mesh-wasm)
 
 Results for `pnpm build && pnpm --filter fast-mesh-wasm bench -- --10m`, a plain Node script (`packages/fast-mesh-wasm/bench/scene.bench.mjs`, `performance.now()`, medians over the iterations shown). It drives the `Scene` class of the built package, so everything crosses the wasm boundary as a user's code would.
@@ -923,7 +939,7 @@ pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue 
 pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
-cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld and remove_small_components on 1M triangles
+cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld, remove_small_components and icp on 1M triangles
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)
 cargo bench -p fast-mesh-scene --features parallel          # any of the above with the parallel feature (same for the other crates)
