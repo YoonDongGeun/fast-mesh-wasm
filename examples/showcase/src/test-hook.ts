@@ -358,6 +358,23 @@ export function installTestHook(
         svg: contoursToSvg(read.contours, read.origin, read.normal),
       };
     },
+    /** The camera and its orbit target, for scripts/showcase-touch-check.mjs. */
+    cameraPose: () => {
+      if (view.camera === null || view.orbit === null) {
+        return null;
+      }
+      return { position: view.camera.position.toArray(), target: view.orbit.target.toArray() };
+    },
+    /** Where the section gizmo's handle ball is on the page, in CSS pixels; `null` without a section. */
+    sectionHandle: () => {
+      const handle = view.sectionHandle;
+      if (view.camera === null || view.canvas === null || handle === null || !handle.parent?.visible) {
+        return null;
+      }
+      const p = handle.getWorldPosition(new THREE.Vector3()).project(view.camera);
+      const r = view.canvas.getBoundingClientRect();
+      return { x: r.left + ((p.x + 1) / 2) * r.width, y: r.top + ((1 - p.y) / 2) * r.height };
+    },
     /** Where the mesh's origin (its centre when loaded, where the gizmo sits) is on the page, in CSS pixels. */
     screenPoint: (name: string) => {
       if (view.camera === null || view.canvas === null) {

@@ -100,6 +100,7 @@ pnpm --filter fast-mesh-wasm-example-showcase test   # parsers, demo meshes, pan
 node scripts/showcase-check.mjs --threads 4          # a scripted session in headless Chrome (on the build; --build builds first)
 node scripts/showcase-check.mjs --big                # plus a 1M-triangle STL upload (main thread < 50 ms)
 node scripts/showcase-pages-check.mjs                # the Pages build: no headers, the service worker, the fallback
+node scripts/showcase-touch-check.mjs                # phone metrics, real multi-touch input (--shots <dir> saves screenshots)
 ```
 
 The scripted session selects and drags A with the gizmo and undoes it; checks the heatmap of A and
@@ -108,3 +109,9 @@ warning; fills C's holes while it is coloured and undoes it; colours A, B and C 
 (colours on all three, the per-pair readouts, the hover tip, the pair matrix) and removes C from it;
 removes B while it is coloured; loads STL, OBJ and PLY files (and a broken one); then repeats a
 short session with `?local` (the group's readouts included). It fails on any console error.
+
+The touch session runs with phone metrics and multi-touch input through `Input.dispatchTouchEvent`,
+and asserts on the camera: one finger orbits, two pinch and pan, a second finger never starts a tool
+(gizmo, slice and section handles), a tap selects and shows the hover tip in Group mode, panels stay
+reachable in portrait, landscape and on a tablet, and a mouse still behaves as before. Sculpting and
+mask paint are mouse tools for now: their panel is hidden on a coarse pointer.
