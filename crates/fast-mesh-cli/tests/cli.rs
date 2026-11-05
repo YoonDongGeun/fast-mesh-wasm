@@ -725,3 +725,165 @@ fn compressed_glb_fails_clearly() {
     assert!(stderr(&o).contains("Draco"), "{}", stderr(&o));
     assert!(!out.exists());
 }
+
+/// A unit cube moved by `at`, as OBJ. Each bit of `mask` picks the diagonal of
+/// one face: the input is the same solid whatever the mask (volume 1, closed,
+/// consistently wound), but the engine's result depends on it (issue #165).
+fn masked_cube_obj(mask: u32, at: [f64; 3]) -> Vec<u8> {
+    let mut s = String::new();
+    for x in [0.0, 1.0] {
+        for y in [0.0, 1.0] {
+            for z in [0.0, 1.0] {
+                s.push_str(&format!("v {} {} {}\n", x + at[0], y + at[1], z + at[2]));
+            }
+        }
+    }
+    const QUADS: [[usize; 4]; 6] = [
+        [0, 1, 3, 2],
+        [4, 6, 7, 5],
+        [0, 4, 5, 1],
+        [2, 3, 7, 6],
+        [0, 2, 6, 4],
+        [1, 5, 7, 3],
+    ];
+    for (i, [a, b, c, d]) in QUADS.into_iter().enumerate() {
+        let triangles = if mask & (1 << i) != 0 {
+            [[a, b, c], [a, c, d]]
+        } else {
+            [[b, c, d], [b, d, a]]
+        };
+        for t in triangles {
+            s.push_str(&format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1));
+        }
+    }
+    s.into_bytes()
+}
+
+/// A failure that says the result was invalid, on stderr only, and how.
+fn assert_invalid_result_refusal(o: &Output, defect: &str) {
+    assert_eq!(code(o), 1, "{}", stderr(o));
+    assert_eq!(stdout(o), "", "stdout holds nothing on failure");
+    let message = stderr(o);
+    for word in ["invalid result", "#165", defect] {
+        assert!(message.contains(word), "no {word:?} in: {message}");
+    }
+}
+
+/// Unit cubes moved by (dx, dy, dz) overlap in a box of volume
+/// o = (1 - dx)(1 - dy)(1 - dz): the expected volumes are 2 - o, o and 1 - o.
+///
+/// The engine gets these wrong today (#165), which must be refused. Once it is
+/// fixed they succeed; either way a wrong volume must never exit 0.
+#[test]
+fn boolean_never_reports_a_wrong_result_as_success() {
+    let dir = Dir::new("boolean-wrong");
+    let (dx, dy, dz) = (0.5, 0.25, 0.125);
+    let overlap = (1.0 - dx) * (1.0 - dy) * (1.0 - dz);
+    let a0 = dir.file("a0.obj", &masked_cube_obj(0, [0.0; 3]));
+    let a36 = dir.file("a36.obj", &masked_cube_obj(36, [0.0; 3]));
+    let b = dir.file("b.obj", &masked_cube_obj(0, [dx, dy, dz]));
+    let names = ["a0.obj", "a36.obj", "b.obj"];
+    for (a, op, volume, defect) in [
+        // Closed, with orientation conflicts.
+        (&a0, "union", 2.0 - overlap, "orientation conflict"),
+        (&a0, "intersection", overlap, "orientation conflict"),
+        (&a0, "difference", 1.0 - overlap, "orientation conflict"),
+        // Open.
+        (&a36, "intersection", overlap, "boundary loop"),
+        (&a36, "difference", 1.0 - overlap, "boundary loop"),
+    ] {
+        let output = dir.path("out.obj");
+        let o = run(&args![
+            "boolean", a, &b, "--op", op, "-o", &output, "--format", "json"
+        ]);
+        if code(&o) == 0 {
+            let json = measure_json(&output);
+            assert_eq!(field(&json, "closed"), "true", "{op}: {json}");
+            assert_eq!(number(&json, "orientation_conflicts"), 0.0, "{op}: {json}");
+            assert!(
+                (number(&json, "volume") - volume).abs() < 1e-4,
+                "{op}: expected {volume}: {json}"
+            );
+            fs::remove_file(&output).unwrap();
+        } else {
+            assert_invalid_result_refusal(&o, defect);
+            assert_eq!(dir.names(), names, "{op}");
+        }
+    }
+}
+
+/// Two cubes sharing only an edge: their union really is non-manifold, so this
+/// stays a refusal whatever happens to the engine.
+fn edge_touching_cubes(dir: &Dir) -> (PathBuf, PathBuf) {
+    (
+        dir.file("a.obj", &masked_cube_obj(0, [0.0; 3])),
+        dir.file("b.obj", &masked_cube_obj(0, [1.0, 1.0, 0.0])),
+    )
+}
+
+#[test]
+fn boolean_refuses_a_non_manifold_result_without_output() {
+    let dir = Dir::new("boolean-non-manifold");
+    let (a, b) = edge_touching_cubes(&dir);
+    let output = dir.path("out.obj");
+    for format in ["text", "json"] {
+        let o = run(&args![
+            "boolean", &a, &b, "--op", "union", "-o", &output, "--format", format
+        ]);
+        assert_invalid_result_refusal(&o, "1 non-manifold edge");
+        assert_eq!(dir.names(), ["a.obj", "b.obj"], "{format}");
+    }
+}
+
+#[test]
+fn an_invalid_boolean_result_leaves_an_existing_output_alone() {
+    let dir = Dir::new("boolean-keeps-output");
+    let (a, b) = edge_touching_cubes(&dir);
+    let out = dir.file("out.obj", b"previous contents");
+    let before = fs::read(&a).unwrap();
+    for extra in [None, Some("--force")] {
+        let mut args = args!["boolean", &a, &b, "--op", "union", "-o", &out].to_vec();
+        args.extend(extra.map(OsString::from));
+        assert_invalid_result_refusal(&run(&args), "non-manifold");
+        assert_eq!(fs::read(&out).unwrap(), b"previous contents");
+    }
+    // Not even when `--force` lets the output name an input.
+    let o = run(&args![
+        "boolean", &a, &b, "--op", "union", "-o", &a, "--force"
+    ]);
+    assert_invalid_result_refusal(&o, "non-manifold");
+    assert_eq!(fs::read(&a).unwrap(), before);
+    assert_eq!(dir.names(), ["a.obj", "b.obj", "out.obj"]);
+}
+
+/// A valid result still succeeds, replacing an existing output under `--force`
+/// and matching a volume worked out by hand: the overlap of cubes moved by
+/// (1/2, 1/4, 1/8) is 1/2 x 3/4 x 7/8 = 21/64.
+#[test]
+fn boolean_keeps_a_valid_result() {
+    let dir = Dir::new("boolean-valid");
+    let a = dir.file("a.obj", &masked_cube_obj(0, [0.0; 3]));
+    let b = dir.file("b.obj", &masked_cube_obj(22, [0.5, 0.25, 0.125]));
+    let output = dir.file("out.obj", b"previous contents");
+    let o = run(&args![
+        "boolean",
+        &a,
+        &b,
+        "--op",
+        "intersection",
+        "-o",
+        &output,
+        "--force",
+        "--format",
+        "json"
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(field(&stdout(&o), "closed"), "true");
+    let json = measure_json(&output);
+    assert_eq!(field(&json, "closed"), "true", "{json}");
+    assert_eq!(number(&json, "orientation_conflicts"), 0.0, "{json}");
+    assert!(
+        (number(&json, "volume") - 21.0 / 64.0).abs() < 1e-9,
+        "{json}"
+    );
+}
