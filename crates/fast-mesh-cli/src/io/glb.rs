@@ -26,6 +26,17 @@ const UNSIGNED_INT: u64 = 5125;
 /// otherwise claim any total. A file holding more itself is still read whole.
 const MIN_EXPANSION_LIMIT: u64 = 1 << 28;
 
+/// How many (node, primitive) pairs a file may hold, at least: each costs a
+/// fresh read of its accessors, even with no vertices, so reuse in a small file
+/// could otherwise cost nodes x primitives. See [`visit_limit`].
+const MIN_VISIT_LIMIT: u64 = 1 << 20;
+
+/// The most (node, primitive) pairs for a file of `len` bytes. A pair without
+/// reuse takes well over 16 bytes of JSON, so such a file never reaches this.
+fn visit_limit(len: usize) -> u64 {
+    MIN_VISIT_LIMIT.max(len as u64 / 16)
+}
+
 fn bad(what: impl std::fmt::Display) -> Error {
     Error::new(format!("glTF: {what}"))
 }
@@ -41,6 +52,9 @@ pub(super) fn parse(bytes: &[u8]) -> Result<MeshData> {
         return Err(bad("the asset is not a JSON object"));
     }
     let reader = Document { doc: &doc, bin };
+
+    // Before reading any accessor, so that this costs only the nodes.
+    check_visits(&doc, visit_limit(bytes.len()))?;
 
     // A dry walk first, so that reuse is refused before anything is expanded.
     let limit = MIN_EXPANSION_LIMIT.max(bytes.len() as u64);
@@ -76,6 +90,20 @@ pub(super) fn parse(bytes: &[u8]) -> Result<MeshData> {
         return Err(bad("the file has no triangle meshes"));
     }
     check_mesh(out, "glTF")
+}
+
+/// Refuses a file whose nodes visit more than `limit` primitives in total.
+fn check_visits(doc: &Value, limit: u64) -> Result<()> {
+    let mut visits = 0u64;
+    walk_nodes(doc, &mut |node, _| {
+        visits = visits.saturating_add(node_primitives(doc, node)?.len() as u64);
+        if visits > limit {
+            return Err(bad(format!(
+                "too many node-primitive visits once nodes reuse their meshes (limit {limit})"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// The primitives of the mesh a node holds, if any.
@@ -675,4 +703,26 @@ pub(super) fn write<W: Write>(data: &MeshData, out: &mut W) -> Result<()> {
         out.write_all(&index.to_le_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visits_are_capped_exactly() {
+        let json = r#"{"nodes":[{"mesh":0},{"mesh":0},{"mesh":0},{}],
+            "meshes":[{"primitives":[{},{}]}]}"#;
+        let doc = json::parse(json.as_bytes()).unwrap();
+        check_visits(&doc, 6).unwrap();
+        let message = check_visits(&doc, 5).unwrap_err().to_string();
+        assert!(message.contains("node-primitive visits"), "{message}");
+    }
+
+    #[test]
+    fn the_visit_limit_grows_with_the_file_only_past_its_floor() {
+        assert_eq!(visit_limit(0), MIN_VISIT_LIMIT);
+        assert_eq!(visit_limit(16 << 20), MIN_VISIT_LIMIT);
+        assert_eq!(visit_limit(32 << 20), 2 << 20);
+    }
 }

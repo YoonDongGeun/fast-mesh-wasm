@@ -165,17 +165,18 @@ fn glb_chunk_length() {
     refused_cheaply(Format::Glb, &b);
 }
 
-/// Nothing is wrong with any one count here: two thousand nodes reuse a mesh of
-/// a thousand primitives over the same vertices, 2 billion once expanded.
+/// Nothing is wrong with any one count here: three hundred nodes reuse a mesh of
+/// three hundred primitives over the same vertices, 90 million once expanded:
+/// within the cap on visits, past the cap on expansion.
 #[test]
 fn glb_instancing_bomb() {
     let mut nodes = String::from("[");
-    for _ in 0..2_000 {
+    for _ in 0..299 {
         nodes.push_str(r#"{"mesh":0},"#);
     }
     nodes.push_str(r#"{"mesh":0}]"#);
     let mut primitives = String::from("[");
-    for _ in 0..1000 {
+    for _ in 0..299 {
         primitives.push_str(r#"{"attributes":{"POSITION":0}},"#);
     }
     primitives.push_str(r#"{"attributes":{"POSITION":0}}]"#);
@@ -198,5 +199,41 @@ fn glb_instancing_bomb() {
     bytes.extend_from_slice(&11988u32.to_le_bytes());
     bytes.extend_from_slice(b"BIN\0");
     bytes.extend_from_slice(&[0u8; 11988]);
-    assert!(refused_cheaply(Format::Glb, &bytes).contains("too many"));
+    assert!(refused_cheaply(Format::Glb, &bytes).contains("vertices and corners"));
+}
+
+/// A GLB whose `nodes` nodes all reuse one mesh of `primitives` primitives over
+/// an accessor of `count` vertices.
+fn reused_primitives(nodes: usize, primitives: usize, count: usize) -> Vec<u8> {
+    let nodes = vec![r#"{"mesh":0}"#; nodes].join(",");
+    let primitives = vec![r#"{"attributes":{"POSITION":0}}"#; primitives].join(",");
+    glb(&format!(
+        r#"{{"nodes":[{nodes}],"meshes":[{{"primitives":[{primitives}]}}],
+        "accessors":[{{"bufferView":0,"componentType":5126,"count":{count},"type":"VEC3"}}],
+        "bufferViews":[{{"buffer":0,"byteLength":36}}],"buffers":[{{"byteLength":36}}]}}"#
+    ))
+}
+
+/// Zero-count primitives add almost nothing to the expanded size, so only a cap
+/// on visits stops this small file costing nodes x primitives (100 million
+/// here). The error is the evidence: without the cap the walk runs to the end
+/// and reports that the file has no triangles instead.
+#[test]
+fn glb_zero_count_primitives_cannot_multiply_visits() {
+    let bytes = reused_primitives(10_000, 10_000, 0);
+    assert!(bytes.len() < 500_000, "{}", bytes.len());
+    // Serial: the other tests here watch every allocation in the process.
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let message = parse(Format::Glb, &bytes).err().unwrap().to_string();
+    assert!(message.contains("node-primitive"), "{message}");
+}
+
+/// Reuse well under the cap is ordinary instancing, and still reads.
+#[test]
+fn glb_modest_primitive_reuse_still_parses() {
+    let bytes = reused_primitives(100, 10, 3);
+    // Serial: the other tests here watch every allocation in the process.
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mesh = parse(Format::Glb, &bytes).unwrap();
+    assert_eq!(mesh.indices.len(), 3 * 100 * 10);
 }
