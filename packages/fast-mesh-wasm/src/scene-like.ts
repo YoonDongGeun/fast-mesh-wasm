@@ -24,8 +24,8 @@ export interface SceneLike {
   /**
    * Views of the mesh's render buffers. Slot counts follow from them, so
    * `positions()` must be exactly 3 × vertex slots long and `indices()`
-   * exactly 3 × triangle slots long (normals 3 and colours 4 per vertex slot,
-   * when present): `positions().length / 3` vertex slots and
+   * exactly 3 × triangle slots long (normals 3, colours 4 and UVs 2 per vertex
+   * slot, when present): `positions().length / 3` vertex slots and
    * `indices().length / 3` triangle slots.
    */
   views(mesh: MeshHandle): MeshViews;

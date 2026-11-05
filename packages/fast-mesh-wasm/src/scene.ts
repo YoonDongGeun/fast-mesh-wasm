@@ -23,11 +23,11 @@ import {
   type SelectSpec,
   type VertexSelection,
 } from "./selection.js";
-import { type MeshViews, meshViews, ViewGuard } from "./views.js";
+import { meshViews, type SceneMeshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
 
 export type { Range } from "./changes.js";
-export type { MeshViews } from "./views.js";
+export type { MeshViews, SceneMeshViews } from "./views.js";
 export type {
   BrushSelect,
   ComponentSelect,
@@ -89,6 +89,12 @@ export interface MeshChange {
   colors: Range[] | "all";
   /** Triangle slots. */
   indices: Range[] | "all";
+  /**
+   * Vertex slots. Only on a record of a mesh that has UVs or just lost them:
+   * `"all"` with `views(mesh).uvs()` reading `null` means an operation dropped
+   * them, and `"all"` after `undo` that they came back.
+   */
+  uvs?: Range[] | "all";
   fieldsChanged: FieldHandle[];
   sectionsChanged: SectionHandle[];
 }
@@ -160,6 +166,13 @@ export interface AddMeshOptions {
   mode?: UpdateMode;
   /** Keep vertex normals up to date. Defaults to `true`. */
   normals?: boolean;
+  /**
+   * Texture coordinates: 2 finite values per vertex, stored as `f32` and read
+   * back with `views(mesh).uvs()`. Without them the mesh has no UV channel and
+   * pays nothing. Every operation keeps them aligned or drops them, undoably;
+   * see `docs/uv-channel.md`. Weld keeps seams apart.
+   */
+  uvs?: Float32Array | readonly number[];
 }
 
 /** Options of the {@link Scene} constructor. */
@@ -437,7 +450,19 @@ export type EditOp =
   | { op: "addVertices"; positions: Positions64 }
   | { op: "addTriangles"; triangles: readonly (number | EditRef)[] | Uint32Array }
   | { op: "removeTriangles"; triangles: Uint32Array | readonly number[] }
-  | { op: "removeVertices"; vertices: Uint32Array | readonly number[] | readonly EditRef[] };
+  | { op: "removeVertices"; vertices: Uint32Array | readonly number[] | readonly EditRef[] }
+  /**
+   * Sets the UVs of vertices (2 values each; undoable like the rest of the
+   * edit), `addVertices` ones included. `addVertices` alone gives a mesh with
+   * UVs the UV `(0, 0)`, and `setPositions` leaves them as they were.
+   *
+   * @throws `INVALID_ARGUMENT` on a mesh without UVs.
+   */
+  | {
+      op: "setUvs";
+      vertices: Uint32Array | readonly (number | EditRef)[];
+      uvs: Float32Array | readonly number[];
+    };
 
 /** What {@link Scene.edit} added. */
 export interface EditResult {
@@ -734,7 +759,7 @@ export interface FilledLoop {
 export interface FillReport {
   filled: FilledLoop[];
   /** Loops left out: beyond a bound, or unclean (or open). */
-  skipped: { id: LoopId; reason: "bounds" | "unclean" }[];
+  skipped: { id: LoopId; reason: "bounds" | "unclean" | "uvSeam" }[];
   /** Selected loops that could not be filled; they stay open. */
   failed: { id: LoopId; reason: "projectionFolds" | "noValidTriangulation" | "solver" }[];
 }
@@ -1009,6 +1034,7 @@ const EDIT_CODES = {
   addTriangles: 2,
   removeTriangles: 3,
   removeVertices: 4,
+  setUvs: 5,
 } as const;
 
 /** An id list as the binding's `n, r, ids..., (slot, op, i)...`; see `crate::edit`. */
@@ -1089,6 +1115,15 @@ function encodeEdit(ops: readonly EditOp[]): { words: Uint32Array; values: Float
       case "removeVertices":
         encodeIds(o.vertices, `${what}: vertices`, words);
         break;
+      case "setUvs": {
+        encodeIds(o.vertices, `${what}: vertices`, words);
+        const uvs = Float64Array.from(o.uvs ?? []);
+        if (uvs.length !== 2 * o.vertices.length) {
+          throw invalid(`${what}: uvs need 2 values per vertex`);
+        }
+        values.push(uvs);
+        break;
+      }
     }
   });
   const out = new Uint32Array(words.reduce((n, w) => n + w.length, 0));
@@ -1336,7 +1371,7 @@ class Reader {
   }
 }
 
-const SKIP_REASONS = ["bounds", "unclean"] as const;
+const SKIP_REASONS = ["bounds", "unclean", "uvSeam"] as const;
 const FAIL_REASONS = ["projectionFolds", "noValidTriangulation", "solver"] as const;
 const WEIGHTS = [null, "cotangent", "uniform"] as const;
 
@@ -1518,8 +1553,9 @@ export function fieldSteps(scene: Scene): FieldSteps {
  * - `beginUpload(vertices, triangles, options)`: reserves a mesh outside
  *   the scene, as `addMesh` would add it; returns the build's token. The
  *   scene is unchanged until `finish`.
- * - `pushPositions(token, chunk)` / `pushIndices(token, chunk)`: append a
- *   chunk of the inputs; the chunks must add up to the declared counts.
+ * - `pushPositions(token, chunk)` / `pushIndices(token, chunk)` /
+ *   `pushUvs(token, chunk)`: append a chunk of the inputs; the chunks must
+ *   add up to the declared counts (UVs are optional: none, or 2 per vertex).
  * - `step(token, budget)`: builds about `budget` more units: first the
  *   store (vertices or triangles), then the BVH (a triangle's box, or a
  *   triangle visited per tree level), then the vertex normals when they
@@ -1540,6 +1576,7 @@ interface MeshAdds {
   beginUpload(vertices: number, triangles: number, options?: AddMeshOptions): number;
   pushPositions(token: number, chunk: Float64Array): void;
   pushIndices(token: number, chunk: Uint32Array): void;
+  pushUvs(token: number, chunk: Float32Array): void;
   step(token: number, budget: number): boolean;
   buffers(token: number): { positions: Float32Array; normals: Float32Array | null; indices: Uint32Array };
   finish(token: number): MeshHandle;
@@ -1716,7 +1753,8 @@ export class Scene implements SceneLike {
    * identity, so {@link Scene.matrix4} maps the local coordinates back to
    * where they were given.
    *
-   * @throws `INVALID_ARGUMENT` for bad lengths or options, `INVALID_INDEX` for an index out of range.
+   * @throws `INVALID_ARGUMENT` for bad lengths or options (`uvs` not 2 finite
+   * values per vertex included), `INVALID_INDEX` for an index out of range.
    */
   addMesh(positions: Positions64, indices: Indices, options: AddMeshOptions = {}): MeshHandle {
     const s = this.#scene();
@@ -1724,7 +1762,13 @@ export class Scene implements SceneLike {
     const origin = options.origin === undefined ? undefined : Float64Array.from(options.origin);
     const p = toFloat64(positions);
     const i = toUint32(indices);
-    const id = call(() => s.add_mesh(p, i, origin, mode, options.normals ?? true));
+    const normals = options.normals ?? true;
+    if (options.uvs === undefined) {
+      const id = call(() => s.add_mesh(p, i, origin, mode, normals));
+      return this.#meshHandle(id[0], id[1]);
+    }
+    const uvs = options.uvs instanceof Float32Array ? options.uvs : Float32Array.from(options.uvs);
+    const id = call(() => s.add_mesh_with_uvs(p, i, uvs, origin, mode, normals));
     return this.#meshHandle(id[0], id[1]);
   }
 
@@ -1942,7 +1986,7 @@ export class Scene implements SceneLike {
    * view; re-acquire views after every scene call that may allocate, since a
    * kept one may read other data or be empty (see {@link MeshViews}).
    */
-  views(mesh: MeshHandle): MeshViews {
+  views(mesh: MeshHandle): SceneMeshViews {
     const { index, generation } = this.#id(mesh);
     // Fail now, not on the first getter, for a removed mesh.
     call(() => this.#peek().vertex_slots(index, generation));
@@ -1972,6 +2016,7 @@ export class Scene implements SceneLike {
         normals: c.normals,
         colors: c.colors,
         indices: c.indices,
+        ...(c.uvs === undefined ? {} : { uvs: c.uvs }),
         fieldsChanged: c.fields.map((f) =>
           this.#rawHandle(this.#fields, () => new FieldHandle(), f),
         ),
@@ -2796,6 +2841,7 @@ export class Scene implements SceneLike {
       },
       pushPositions: (token, chunk) => call(() => scene.#scene().add_mesh_push_positions(token, chunk)),
       pushIndices: (token, chunk) => call(() => scene.#scene().add_mesh_push_indices(token, chunk)),
+      pushUvs: (token, chunk) => call(() => scene.#scene().add_mesh_push_uvs(token, chunk)),
       step: (token, budget) => call(() => scene.#scene().add_mesh_step(token, budget)),
       buffers: (token) => {
         const [pp, pl, np, nl, ip, il] = call(() => scene.#peek().add_mesh_buffers(token));

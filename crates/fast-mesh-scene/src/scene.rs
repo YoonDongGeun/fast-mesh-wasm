@@ -184,6 +184,9 @@ impl Entry {
         for r in &mut self.reports {
             r.merge(changes);
         }
+        for name in &changes.channels_toggled {
+            self.report_channel(name);
+        }
         for h in &mut self.hooks {
             if let Some(c) = &mut h.changes {
                 c.merge(changes);

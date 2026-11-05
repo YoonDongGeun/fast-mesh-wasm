@@ -6,8 +6,11 @@
 //! triangles cross over: source channels take defaults, derived channels
 //! (like normals) are recomputed by the scene. Triangle indices are bounds
 //! checked; anything else about the soup is the caller's responsibility.
+//!
+//! UVs are the exception: a default would misalign them, so a target with UVs
+//! gets the source's from [`append_mesh_with_uvs`], or loses its own.
 
-use fast_mesh_store::{Transaction, VertexId};
+use fast_mesh_store::{Transaction, UV_CHANNEL, VertexId};
 
 use crate::{OpsError, Result, reserve};
 
@@ -29,6 +32,8 @@ pub struct AppendReport {
     pub vertices_added: usize,
     /// Triangles added.
     pub triangles_added: usize,
+    /// Only one side had UVs, so the result has none (undo restores a target's).
+    pub uvs_dropped: bool,
 }
 
 /// Copies `source` into `tx`, returning the new vertex ids in source order.
@@ -36,6 +41,26 @@ pub struct AppendReport {
 /// Triangle indices past the positions are rejected before anything is
 /// written. Either every vertex and triangle lands or nothing does.
 pub fn append_mesh(tx: &mut Transaction, source: &AppendSource) -> Result<AppendReport> {
+    append_mesh_with_uvs(tx, source, None)
+}
+
+/// [`append_mesh`] with the source's UVs: 2 values per source position, or
+/// `None` for a source without them. When both sides have UVs the result does
+/// too; otherwise it has none and [`AppendReport::uvs_dropped`] is set.
+///
+/// # Errors
+/// [`OpsError::InvalidInput`] for bad triangle indices or a wrong `uvs`
+/// length, before anything is written.
+pub fn append_mesh_with_uvs(
+    tx: &mut Transaction,
+    source: &AppendSource,
+    uvs: Option<&[f32]>,
+) -> Result<AppendReport> {
+    if uvs.is_some_and(|u| u.len() != 2 * source.positions.len()) {
+        return Err(OpsError::InvalidInput(
+            "append uvs need 2 values per position",
+        ));
+    }
     for t in &source.triangles {
         if t.iter().any(|&v| (v as usize) >= source.positions.len()) {
             return Err(OpsError::InvalidInput(
@@ -53,10 +78,17 @@ pub fn append_mesh(tx: &mut Transaction, source: &AppendSource) -> Result<Append
         mapped.push([ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]]);
     }
     tx.add_triangles(&mapped)?;
+    let target_has_uvs = tx.mesh().uvs().is_some();
+    match uvs {
+        Some(u) if target_has_uvs => tx.write_channel(UV_CHANNEL, &ids, u)?,
+        None if target_has_uvs => tx.drop_channel(UV_CHANNEL)?,
+        _ => {}
+    }
     Ok(AppendReport {
         vertices_added: ids.len(),
         triangles_added: mapped.len(),
         vertex_map: ids,
+        uvs_dropped: target_has_uvs != uvs.is_some(),
     })
 }
 

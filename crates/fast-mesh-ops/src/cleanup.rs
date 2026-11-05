@@ -7,8 +7,8 @@
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
 use crate::analyze::{AREA_EPSILON, duplicate_triangles, is_degenerate};
-use crate::topology::{EdgeMap, components};
-use crate::weld::weld_roots;
+use crate::topology::{Component, EdgeMap, UnionFind, components};
+use crate::weld::{weld_roots, weld_roots_keeping_seams};
 use crate::{OpsError, Result, filled, push, reserve};
 
 /// What [`weld()`] did.
@@ -29,6 +29,10 @@ pub struct WeldReport {
 /// ones that were unused before. Tolerance 0 merges exact duplicates only. A
 /// vertex with a non-finite coordinate is never merged. No vertex is created.
 ///
+/// On a mesh with UVs ([`Mesh::uvs`]), a pair also needs equal UVs (within
+/// `1e-6` per component) to merge, so the two sides of a UV seam stay apart
+/// and every kept vertex keeps its own UV. Without UVs nothing changes.
+///
 /// Rewiring can make two triangles share a vertex set, or give an edge a
 /// third triangle; run [`remove_degenerate()`] afterwards to drop duplicates.
 ///
@@ -37,7 +41,7 @@ pub struct WeldReport {
 /// [`OpsError::Store`] when memory runs out.
 pub fn weld(tx: &mut Transaction, tolerance: f32) -> Result<WeldReport> {
     let mesh = tx.mesh();
-    let roots = weld_roots(mesh, tolerance)?;
+    let roots = weld_roots_keeping_seams(mesh, tolerance, mesh.uvs())?;
     let mut report = WeldReport::default();
     for (v, &r) in roots.iter().enumerate() {
         if r as usize != v {
@@ -254,6 +258,9 @@ pub struct RemoveReport {
 /// of any kind) that are below any bound that is set, and the vertices left
 /// unused. Triangles with a repeated vertex id belong to no component and stay.
 ///
+/// On a mesh with UVs, an edge also joins across a seam (coincident corners,
+/// compared exactly), so the UV islands of one surface count as one component.
+///
 /// # Errors
 /// [`OpsError::InvalidInput`] when no bound is set or `min_area` is negative,
 /// NaN or infinite; [`OpsError::Store`] when memory runs out.
@@ -275,7 +282,10 @@ pub fn remove_small_components(
     }
     let mesh = tx.mesh();
     let edges = EdgeMap::build(mesh)?;
-    let comps = components(mesh, &edges)?;
+    let mut comps = components(mesh, &edges)?;
+    if mesh.uvs().is_some() {
+        comps = joined_across_seams(mesh, &edges, comps)?;
+    }
     // Components come sorted by their smallest triangle id, so the first of
     // equals wins the final tie.
     let mut largest: Option<usize> = None;
@@ -312,6 +322,58 @@ pub fn remove_small_components(
         removed_triangles: doomed.len(),
         removed_vertices,
     })
+}
+
+/// `comps` (sorted by smallest triangle id) with those sharing an edge at
+/// coincident positions merged, in the same order. Such a merged component
+/// counts as closed only if each part is; nothing here reads that.
+fn joined_across_seams(
+    mesh: &Mesh,
+    edges: &EdgeMap,
+    comps: Vec<Component>,
+) -> Result<Vec<Component>> {
+    let roots = weld_roots(mesh, 0.0)?;
+    let mut owner = filled(mesh.triangle_slots(), u32::MAX)?;
+    for (i, c) in comps.iter().enumerate() {
+        for &t in &c.triangles {
+            owner[t as usize] = i as u32;
+        }
+    }
+    // Every edge at its welded corners, with the component using it.
+    let mut keyed: Vec<((VertexId, VertexId), u32)> = Vec::new();
+    reserve(&mut keyed, edges.len())?;
+    for ((a, b), tris) in edges.edges() {
+        let (ra, rb) = (roots[a as usize], roots[b as usize]);
+        keyed.push(((ra.min(rb), ra.max(rb)), owner[tris[0] as usize]));
+    }
+    keyed.sort_unstable();
+    let mut uf = UnionFind::new();
+    uf.reset(comps.len())?;
+    for w in keyed.windows(2) {
+        if w[0].0 == w[1].0 {
+            uf.union(w[0].1, w[1].1);
+        }
+    }
+    // A root is its set's smallest index, so parts arrive in order.
+    let mut merged: Vec<Component> = Vec::new();
+    let mut slot = filled(comps.len(), u32::MAX)?;
+    for (i, c) in comps.into_iter().enumerate() {
+        let root = uf.find(i as u32) as usize;
+        if slot[root] == u32::MAX {
+            slot[root] = merged.len() as u32;
+            push(&mut merged, c)?;
+        } else {
+            let m = &mut merged[slot[root] as usize];
+            reserve(&mut m.triangles, c.triangles.len())?;
+            m.triangles.extend_from_slice(&c.triangles);
+            m.area += c.area;
+            m.closed &= c.closed;
+        }
+    }
+    for m in &mut merged {
+        m.triangles.sort_unstable();
+    }
+    Ok(merged)
 }
 
 /// The alive vertices no triangle uses once the planned edits are applied:

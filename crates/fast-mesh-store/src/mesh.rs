@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adjacency::Adjacency;
-use crate::channel::{Channel, ChannelDesc, ChannelKind};
+use crate::channel::{Channel, ChannelDesc, ChannelKind, UV_CHANNEL};
 use crate::column::{Column, try_reserve, try_reserve_exact, try_vec};
 use crate::incidence::Incidence;
 use crate::{Patch, PatchSide, PatchState, Result, StoreError, TriangleId, VertexId};
@@ -87,6 +87,7 @@ impl fmt::Debug for Mesh {
                 &self
                     .channels
                     .iter()
+                    .filter(|c| !c.hidden)
                     .map(|c| c.desc.name.as_str())
                     .collect::<Vec<_>>(),
             )
@@ -368,6 +369,11 @@ impl Mesh {
         if !(1..=4).contains(&desc.width) {
             return Err(StoreError::InvalidArgument("channel width must be 1 to 4"));
         }
+        if desc.name == UV_CHANNEL && (desc.width != 2 || desc.kind != ChannelKind::Source) {
+            return Err(StoreError::InvalidArgument(
+                "the uv channel must be a source channel of width 2",
+            ));
+        }
         if self.channel_index(&desc.name).is_some() {
             return Err(StoreError::ChannelExists(desc.name));
         }
@@ -379,8 +385,53 @@ impl Mesh {
             id,
             desc,
             data: Column::from_vec(data),
+            hidden: false,
         });
         Ok(())
+    }
+
+    /// Adds the UV channel ([`UV_CHANNEL`]) with `uvs`: 2 finite values per
+    /// vertex slot. Like [`Mesh::add_channel`], not undoable. Meant for a mesh
+    /// being set up, before any edit.
+    ///
+    /// # Errors
+    /// [`StoreError::LengthMismatch`] for a wrong length,
+    /// [`StoreError::InvalidArgument`] for a non-finite value,
+    /// [`StoreError::ChannelExists`] when the mesh already has UVs. The mesh is
+    /// then unchanged.
+    pub fn add_uvs(&mut self, uvs: &[f32]) -> Result<()> {
+        let expected = self.vertex_slots() * 2;
+        if uvs.len() != expected {
+            return Err(StoreError::LengthMismatch {
+                expected,
+                got: uvs.len(),
+            });
+        }
+        if !uvs.iter().all(|x| x.is_finite()) {
+            return Err(StoreError::InvalidArgument("uvs must be finite"));
+        }
+        if self.channel_index(UV_CHANNEL).is_some() {
+            return Err(StoreError::ChannelExists(UV_CHANNEL.into()));
+        }
+        let mut data: Vec<f32> = Vec::new();
+        try_reserve_exact(&mut data, uvs.len())?;
+        data.extend_from_slice(uvs);
+        try_reserve(&mut self.channels, 1)?;
+        let id = self.next_channel_id;
+        self.next_channel_id += 1;
+        self.channels.push(Channel {
+            id,
+            desc: ChannelDesc::uv(),
+            data: Column::from_vec(data),
+            hidden: false,
+        });
+        Ok(())
+    }
+
+    /// Slot-aligned UVs, 2 values per vertex, or `None` for a mesh without
+    /// them. Shorthand for `channel(UV_CHANNEL)`.
+    pub fn uvs(&self) -> Option<&[f32]> {
+        self.channel(UV_CHANNEL)
     }
 
     /// Removes a channel. Not undoable; patches that recorded it skip it from now on.
@@ -413,10 +464,13 @@ impl Mesh {
     }
 
     pub(crate) fn channel_index(&self, name: &str) -> Option<usize> {
-        self.channels.iter().position(|c| c.desc.name == name)
+        self.channels
+            .iter()
+            .position(|c| !c.hidden && c.desc.name == name)
     }
 
-    /// Index of the channel with this id, or `None` if it was removed.
+    /// Index of the channel with this id, or `None` if it was removed. Finds
+    /// hidden channels too.
     pub(crate) fn channel_index_by_id(&self, id: u64) -> Option<usize> {
         self.channels.iter().position(|c| c.id == id)
     }

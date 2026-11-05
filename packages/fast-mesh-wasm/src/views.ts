@@ -33,8 +33,20 @@ export interface MeshViews {
    * provide it.
    */
   values?(): Float32Array | null;
+  /**
+   * Texture coordinates, 2 floats per vertex slot, or `null` for a mesh
+   * without them (never given, or dropped by an operation: see
+   * `docs/uv-channel.md`). Optional for other {@link SceneLike} hosts; `Scene`
+   * and `WorkerScene` provide it ({@link SceneMeshViews}).
+   */
+  uvs?(): Float32Array | null;
   /** 3 vertex indices per triangle slot; a removed triangle reads `0, 0, 0`. */
   indices(): Uint32Array;
+}
+
+/** {@link MeshViews} of `Scene` and `WorkerScene`, which always provide `uvs`. */
+export interface SceneMeshViews extends MeshViews {
+  uvs(): Float32Array | null;
 }
 
 /**
@@ -95,8 +107,8 @@ export function meshViews(
   index: number,
   generation: number,
   guard: ViewGuard | undefined,
-): MeshViews {
-  // `null` for a buffer that is off (pointer 0): normals, colours and values.
+): SceneMeshViews {
+  // `null` for a buffer that is off (pointer 0): normals, colours, values and UVs.
   const build = <T extends ArrayBufferView>(
     make: (buffer: ArrayBuffer, ptr: number, len: number) => T,
     ptr: (s: WasmScene) => number,
@@ -138,6 +150,12 @@ export function meshViews(
         f32,
         (s) => s.values_ptr(index, generation),
         (s) => s.values_len(index, generation),
+      ),
+    uvs: () =>
+      build(
+        f32,
+        (s) => s.uvs_ptr(index, generation),
+        (s) => s.uvs_len(index, generation),
       ),
     indices: () =>
       build(

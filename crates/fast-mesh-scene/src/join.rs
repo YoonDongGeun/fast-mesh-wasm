@@ -1,7 +1,7 @@
 //! Joining two meshes: append one's geometry into the other and bridge a
 //! loop on each, as one undo step, then remove the emptied mesh.
 
-use fast_mesh_ops::append::{AppendSource, append_mesh};
+use fast_mesh_ops::append::{AppendSource, append_mesh_with_uvs};
 use fast_mesh_ops::bridge::{BridgeOptions, bridge_loops};
 use fast_mesh_ops::{LoopId, OpsError, boundary_loops};
 use fast_mesh_store::{Mesh, StoreError, VertexId};
@@ -29,6 +29,9 @@ pub struct JoinReport {
     pub triangles_added: usize,
     /// Bridge triangles between the two loops.
     pub bridge_triangles_added: usize,
+    /// Only one mesh had UVs, so the result has none; undo restores the
+    /// target's.
+    pub uvs_dropped: bool,
 }
 
 fn oom() -> SceneError {
@@ -39,6 +42,8 @@ fn oom() -> SceneError {
 /// source loop's vertices in loop order.
 struct Source {
     source: AppendSource,
+    /// The source's UVs, per source position, when it has them.
+    uvs: Option<Vec<f32>>,
     /// Source position index per source-mesh vertex slot (`u32::MAX` for a
     /// dead slot).
     index_of: Vec<u32>,
@@ -90,6 +95,18 @@ fn prepare_source(
         *slot = idx;
         positions.push(q);
     }
+    let mut uvs = None;
+    if let Some(from) = source.uvs() {
+        let mut to: Vec<f32> = Vec::new();
+        to.try_reserve_exact(2 * positions.len())
+            .map_err(|_| oom())?;
+        for (v, &slot) in index_of.iter().enumerate() {
+            if slot != u32::MAX {
+                to.extend_from_slice(&from[2 * v..2 * v + 2]);
+            }
+        }
+        uvs = Some(to);
+    }
     let mut triangles: Vec<[u32; 3]> = Vec::new();
     triangles
         .try_reserve(source.triangle_count())
@@ -110,6 +127,7 @@ fn prepare_source(
             positions,
             triangles,
         },
+        uvs,
         index_of,
         loop_vertices,
     })
@@ -125,7 +143,9 @@ impl Scene {
     ///
     /// Only positions and triangles cross over: the source's channels are
     /// dropped, and the target's channels take their defaults on the new
-    /// vertices.
+    /// vertices. UVs are the exception: when both meshes have them they carry
+    /// over, and when only one has them the result has none
+    /// ([`JoinReport::uvs_dropped`]).
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
@@ -153,11 +173,12 @@ impl Scene {
         };
         let Source {
             source,
+            uvs,
             index_of,
             loop_vertices,
         } = prepared;
         let report = self.edit(a, |tx| -> std::result::Result<JoinReport, OpsError> {
-            let appended = append_mesh(tx, &source)?;
+            let appended = append_mesh_with_uvs(tx, &source, uvs.as_deref())?;
             // The copied loop is the one loop whose vertices are exactly the
             // copied source loop's: appended vertices are new ids, referenced
             // only by the copied triangles, so no other loop can hold them.
@@ -184,6 +205,7 @@ impl Scene {
                 vertices_added: appended.vertices_added,
                 triangles_added: appended.triangles_added,
                 bridge_triangles_added: bridged.triangles_added,
+                uvs_dropped: appended.uvs_dropped,
             })
         })?;
         self.remove_mesh(b)?;

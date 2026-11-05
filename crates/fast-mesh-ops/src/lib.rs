@@ -54,6 +54,9 @@
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
 //!   drags them along one vector.
+//! - UVs: every operation either keeps a mesh's UV channel aligned or drops
+//!   it undoably, never leaving stale values; the per-operation table is in
+//!   [`docs/uv-channel.md`](https://github.com/YoonDongGeun/fast-mesh-wasm/blob/main/docs/uv-channel.md).
 
 mod analyze;
 pub mod append;
@@ -78,10 +81,12 @@ pub mod subdivide;
 #[cfg(test)]
 mod test_util;
 mod topology;
+#[cfg(test)]
+mod uv_table;
 mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
-pub use append::{AppendReport, AppendSource, append_mesh};
+pub use append::{AppendReport, AppendSource, append_mesh, append_mesh_with_uvs};
 pub use auto_repair::{
     AutoRepairOptions, AutoRepairOptionsBuilder, AutoRepairReport, AutoRepairStage, auto_repair,
 };

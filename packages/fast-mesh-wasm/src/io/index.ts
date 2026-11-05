@@ -2,7 +2,7 @@
 // PLY and glTF, and glTF 2.0 assets (binary `.glb` or JSON `.gltf` with
 // embedded buffers) back in as one mesh per (node, primitive).
 // Pure TypeScript over a {@link SceneLike}: they read `scene.views(mesh)`
-// (positions, indices, normals, colors), so meshes edited, repaired or
+// (positions, indices, normals, colors, UVs), so meshes edited, repaired or
 // colored in the session export as they are. No WebAssembly, no Worker
 // wiring: `store.scene` is a `SceneLike` with synchronous views for both
 // local and Worker scenes.
@@ -93,6 +93,8 @@ interface Snapshot {
   normals: Float32Array | null;
   /** 4 bytes (RGBA) per vertex, or `null` without usable colors. */
   colors: Uint8Array | null;
+  /** 2 floats per vertex, or `null` without UVs. */
+  uvs: Float32Array | null;
   /** 3 compacted vertex ids per live triangle. */
   indices: Uint32Array;
   /** Live triangles. */
@@ -112,6 +114,7 @@ function snapshot(scene: SceneLike, mesh: MeshHandle, options?: ExportOptions): 
   const indices = views.indices().slice();
   const rawNormals = views.normals();
   const rawColors = views.colors();
+  const rawUvs = views.uvs?.() ?? null;
   const vertexSlots = positions.length / 3;
   const triangleSlots = indices.length / 3;
   // `Scene` normals can lag the slots on `"lazy"`/`"manual"` meshes until
@@ -124,6 +127,7 @@ function snapshot(scene: SceneLike, mesh: MeshHandle, options?: ExportOptions): 
     rawColors !== null && rawColors !== undefined && rawColors.length >= (4 / 3) * positions.length
       ? rawColors.slice()
       : null;
+  const uvs = rawUvs !== null && rawUvs.length >= (2 / 3) * positions.length ? rawUvs.slice() : null;
 
   // Live triangles, compacting vertices to the ones they use. Dead slots
   // read `0, 0, 0`; the remap drops unreferenced (dead) vertex slots.
@@ -154,6 +158,7 @@ function snapshot(scene: SceneLike, mesh: MeshHandle, options?: ExportOptions): 
   const outPositions = new Float32Array(3 * vertices);
   const outNormals = normals !== null ? new Float32Array(3 * vertices) : null;
   const outColors = colors !== null ? new Uint8Array(4 * vertices) : null;
+  const outUvs = uvs !== null ? new Float32Array(2 * vertices) : null;
   for (let v = 0; v < vertexSlots; v++) {
     const to = remap[v];
     if (to === -1) {
@@ -173,6 +178,10 @@ function snapshot(scene: SceneLike, mesh: MeshHandle, options?: ExportOptions): 
       outColors[4 * to + 2] = colors[4 * v + 2];
       outColors[4 * to + 3] = colors[4 * v + 3];
     }
+    if (outUvs !== null && uvs !== null) {
+      outUvs[2 * to] = uvs[2 * v];
+      outUvs[2 * to + 1] = uvs[2 * v + 1];
+    }
   }
 
   if (options?.applyPlacement !== false) {
@@ -182,6 +191,7 @@ function snapshot(scene: SceneLike, mesh: MeshHandle, options?: ExportOptions): 
     positions: outPositions,
     normals: outNormals,
     colors: outColors,
+    uvs: outUvs,
     indices: kept.subarray(0, 3 * triangles),
     triangles,
   };
@@ -458,7 +468,7 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
 
 /**
  * glTF 2.0: one node, one mesh, one `TRIANGLES` primitive with `POSITION`
- * (plus `NORMAL` where present and `COLOR_0` as normalized RGBA bytes where
+ * (plus `TEXCOORD_0` as float pairs where the mesh has UVs, `NORMAL` where present and `COLOR_0` as normalized RGBA bytes where
  * the mesh is colored). Binary (default) returns a `.glb`; `binary: false`
  * a `.gltf` JSON with the buffer embedded as a base64 data URI.
  *
@@ -473,7 +483,7 @@ export function exportGLTF(
 ): Uint8Array;
 /**
  * glTF 2.0 with `draco: true`: the same node, mesh and `TRIANGLES`
- * primitive, but the positions (plus normals and colors where present) ride
+ * primitive, but the positions (plus normals, colors and UVs where present) ride
  * a Draco bitstream in one buffer view instead of raw buffer views. The
  * primitive's accessors describe the decoded shape (POSITION keeps its
  * min/max); `extensionsUsed`/`extensionsRequired` name the extension.
@@ -507,6 +517,7 @@ export function exportGLTF(
   const vertices = snap.positions.length / 3;
   const useNormals = snap.normals !== null;
   const useColors = snap.colors !== null;
+  const useUvs = snap.uvs !== null;
 
   const positionBytes = new Uint8Array(snap.positions.buffer, snap.positions.byteOffset, snap.positions.byteLength);
   const normalBytes =
@@ -514,7 +525,7 @@ export function exportGLTF(
       ? new Uint8Array(snap.normals.buffer, snap.normals.byteOffset, snap.normals.byteLength)
       : null;
 
-  // One BIN buffer: positions, normals, colors (RGBA bytes), indices.
+  // One BIN buffer: positions, normals, colors (RGBA bytes), UVs, indices.
   const chunks: Uint8Array[] = [positionBytes];
   if (normalBytes !== null) {
     chunks.push(normalBytes);
@@ -523,6 +534,9 @@ export function exportGLTF(
   if (snap.colors !== null) {
     colorBytes = new Uint8Array(snap.colors.buffer, snap.colors.byteOffset, snap.colors.byteLength);
     chunks.push(colorBytes);
+  }
+  if (snap.uvs !== null) {
+    chunks.push(new Uint8Array(snap.uvs.buffer, snap.uvs.byteOffset, snap.uvs.byteLength));
   }
   const indicesCopy = new Uint32Array(snap.indices);
   const indicesChunk = new Uint8Array(indicesCopy.buffer, indicesCopy.byteOffset, indicesCopy.byteLength);
@@ -543,6 +557,7 @@ export function exportGLTF(
   const positionView = 0;
   const normalView = useNormals ? nextView++ : -1;
   const colorView = useColors ? nextView++ : -1;
+  const uvView = useUvs ? nextView++ : -1;
   // The indices live in the last buffer view.
   const attributes: Record<string, number> = { POSITION: 0 };
   let accessorIndex = 1;
@@ -551,6 +566,9 @@ export function exportGLTF(
   }
   if (useColors) {
     attributes["COLOR_0"] = accessorIndex++;
+  }
+  if (useUvs) {
+    attributes["TEXCOORD_0"] = accessorIndex++;
   }
 
   const accessors: unknown[] = [
@@ -561,6 +579,9 @@ export function exportGLTF(
   }
   if (useColors) {
     accessors.push({ bufferView: colorView, componentType: 5121, count: vertices, type: "VEC4", normalized: true });
+  }
+  if (useUvs) {
+    accessors.push({ bufferView: uvView, componentType: 5126, count: vertices, type: "VEC2" });
   }
   accessors.push({ bufferView: bufferViews.length - 1, componentType: 5125, count: snap.indices.length, type: "SCALAR" });
 
@@ -680,6 +701,8 @@ export interface DracoQuantizationBits {
   normal?: number;
   /** COLOR bits. Defaults to `8` (lossless for byte colors). */
   color?: number;
+  /** TEX_COORD bits, over the UVs' range. Defaults to `16`. */
+  uv?: number;
   /**
    * TEX_COORD bits. Defaults to `12`. Validated but currently unused: UVs
    * ride issue #137 (there is no UV channel to encode yet).
@@ -732,19 +755,21 @@ export interface DracoEncodeOptions extends DracoCompressionOptions {
    * COLOR attribute. Each value must be an integer 0..255.
    */
   colors?: ArrayLike<number>;
+  /** Texture coordinates: 2 finite numbers per vertex. */
+  uvs?: ArrayLike<number>;
 }
 
 /**
  * Encodes a triangle mesh into standalone Draco bytes (a `.drc` file):
- * positions always, plus the `normals`/`colors` options when given.
+ * positions always, plus the `normals`/`colors`/`uvs` options when given.
  * Positions encode as 32-bit floats (wider inputs narrow).
  *
  * The draco3d encoder (WASM) initializes on first use; its module is shared
  * across calls. Needs the `draco3d` package installed unless `options`
  * supplies the module or its `.wasm`.
  *
- * Decodes through {@link decodeDraco} (positions and faces only: it maps
- * POSITION alone, so normals and colors need draco3d's own decoder).
+ * Decodes through {@link decodeDraco} (positions, faces and UVs: normals and
+ * colors need draco3d's own decoder).
  */
 export async function encodeDraco(
   positions: ArrayLike<number>,
@@ -757,7 +782,9 @@ export async function encodeDraco(
   const checkedColors = checkedEncodeColors(options?.colors, checkedPositions.length / 3);
   const settings = encodeSettings(options);
   const module = await encoderOf(options);
-  return encodeMeshDraco(module, checkedPositions, checkedIndices, checkedNormals, checkedColors, settings).bytes;
+  const checkedUvs = checkedEncodeUvs(options?.uvs, checkedPositions.length / 3);
+  return encodeMeshDraco(module, checkedPositions, checkedIndices, checkedNormals, checkedColors, checkedUvs, settings)
+    .bytes;
 }
 
 /**
@@ -782,13 +809,15 @@ async function exportGLTFDraco(
   const indices = checkedEncodeIndices(snap.indices, vertices);
   const normals = checkedEncodeNormals(snap.normals, positions.length);
   const colors = checkedEncodeColors(snap.colors, vertices);
+  const uvs = checkedEncodeUvs(snap.uvs, vertices);
   const module = await encoderOf(options?.dracoOptions);
-  const { bytes, positionId, normalId, colorId } = encodeMeshDraco(
+  const { bytes, positionId, normalId, colorId, uvId } = encodeMeshDraco(
     module,
     positions,
     indices,
     normals,
     colors,
+    uvs,
     settings,
   );
 
@@ -806,6 +835,11 @@ async function exportGLTFDraco(
     attributes["COLOR_0"] = accessorIndex++;
     accessors.push({ componentType: 5121, count: vertices, type: "VEC4", normalized: true });
     dracoAttributes["COLOR_0"] = colorId as number;
+  }
+  if (uvs !== null) {
+    attributes["TEXCOORD_0"] = accessorIndex++;
+    accessors.push({ componentType: 5126, count: vertices, type: "VEC2" });
+    dracoAttributes["TEXCOORD_0"] = uvId as number;
   }
   accessors.push({ componentType: 5125, count: indices.length, type: "SCALAR" });
 
@@ -841,6 +875,7 @@ interface ResolvedEncodeSettings {
   positionBits: number;
   normalBits: number;
   colorBits: number;
+  uvBits: number;
   level: number;
   preserveFaceOrder: boolean;
 }
@@ -858,6 +893,7 @@ function encodeSettings(options?: DracoCompressionOptions): ResolvedEncodeSettin
     positionBits: checkedQuantizationBits(bits?.position, "position", 14),
     normalBits: checkedQuantizationBits(bits?.normal, "normal", 10),
     colorBits: checkedQuantizationBits(bits?.color, "color", 8),
+    uvBits: checkedQuantizationBits(bits?.uv, "uv", 16),
     level,
     preserveFaceOrder: options?.preserveFaceOrder === true,
   };
@@ -959,6 +995,23 @@ function checkedEncodeColors(
   return out;
 }
 
+/** Copies UVs to floats (`null` without), checking length and finiteness. */
+function checkedEncodeUvs(uvs: ArrayLike<number> | null | undefined, vertices: number): Float32Array | null {
+  if (uvs === null || uvs === undefined) {
+    return null;
+  }
+  if (uvs.length !== 2 * vertices) {
+    throw new Error(`Draco: uvs need 2 numbers per vertex (got length ${uvs.length} for ${vertices} vertices)`);
+  }
+  const out = Float32Array.from(uvs);
+  for (let i = 0; i < out.length; i++) {
+    if (!Number.isFinite(out[i])) {
+      throw new Error(`Draco: uv ${Math.floor(i / 2)} is not finite`);
+    }
+  }
+  return out;
+}
+
 /** draco3d@1.5's float-attribute mesh writer: `@types/draco3d@1.4` predates the `*ToMesh` names. */
 interface DracoMeshBuilder {
   AddFloatAttributeToMesh(mesh: Mesh, attribute: number, count: number, size: number, values: Float32Array): number;
@@ -970,10 +1023,11 @@ interface EncodedDracoMesh {
   positionId: number;
   normalId: number | null;
   colorId: number | null;
+  uvId: number | null;
 }
 
 /**
- * Builds the mesh (faces, POSITION, NORMAL/COLOR when present) and encodes
+ * Builds the mesh (faces, POSITION, NORMAL/COLOR/TEX_COORD when present) and encodes
  * it with the resolved settings. Colors ride a normalized uint8 attribute,
  * like glTF's `COLOR_0`. Throws when the encoder reports failure.
  */
@@ -983,6 +1037,7 @@ function encodeMeshDraco(
   indices: Uint32Array,
   normals: Float32Array | null,
   colors: Uint8Array | null,
+  uvs: Float32Array | null,
   settings: ResolvedEncodeSettings,
 ): EncodedDracoMesh {
   const mesh = new module.Mesh();
@@ -992,12 +1047,16 @@ function encodeMeshDraco(
     const positionId = builder.AddFloatAttributeToMesh(mesh, module.POSITION, positions.length / 3, 3, positions);
     let normalId: number | null = null;
     let colorId: number | null = null;
+    let uvId: number | null = null;
     if (normals !== null) {
       normalId = builder.AddFloatAttributeToMesh(mesh, module.NORMAL, normals.length / 3, 3, normals);
     }
     if (colors !== null) {
       colorId = builder.AddUInt8Attribute(mesh, module.COLOR, colors.length / 4, 4, colors);
       builder.SetNormalizedFlagForAttribute(mesh, colorId, true);
+    }
+    if (uvs !== null) {
+      uvId = builder.AddFloatAttributeToMesh(mesh, module.TEX_COORD, uvs.length / 2, 2, uvs);
     }
     const encoder = new module.Encoder();
     try {
@@ -1008,6 +1067,9 @@ function encodeMeshDraco(
       }
       if (colors !== null) {
         encoder.SetAttributeQuantization(module.COLOR, settings.colorBits);
+      }
+      if (uvs !== null) {
+        encoder.SetAttributeQuantization(module.TEX_COORD, settings.uvBits);
       }
       encoder.SetEncodingMethod(
         settings.preserveFaceOrder ? module.MESH_SEQUENTIAL_ENCODING : module.MESH_EDGEBREAKER_ENCODING,
@@ -1022,7 +1084,7 @@ function encodeMeshDraco(
         for (let i = 0; i < length; i++) {
           bytes[i] = out.GetValue(i);
         }
-        return { bytes, positionId, normalId, colorId };
+        return { bytes, positionId, normalId, colorId, uvId };
       } finally {
         module.destroy(out);
       }
@@ -1084,8 +1146,9 @@ async function createEncoderModule(wasmBinary?: Uint8Array | ArrayBuffer): Promi
  * Only uncompressed buffers are read. `KHR_draco_mesh_compression`
  * primitives throw (decode them with {@link importGLTFAsync}), as do sparse
  * accessors. External (non-embedded) `.bin` buffers load through
- * {@link importGLTFAsync}'s `resolveBuffer`. Animations, skins and materials
- * beyond per-vertex colors are skipped: the documented subset.
+ * {@link importGLTFAsync}'s `resolveBuffer`. Animations, skins, materials
+ * beyond per-vertex colors and `TEXCOORD_1` and up are skipped: the documented
+ * subset.
  */
 export interface ImportedMesh {
   /** The node name, else the mesh name, else `"mesh"` (deduplicated). */
@@ -1098,6 +1161,11 @@ export interface ImportedMesh {
   placement: Float64Array;
   /** RGBA bytes per vertex from `COLOR_0`, or `null` without colors. */
   colors: Uint8Array | null;
+  /**
+   * 2 floats per vertex from `TEXCOORD_0` (`scene.addMesh`'s `uvs`), or `null`
+   * without UVs. In glTF's convention: `v` points down from the image's top.
+   */
+  uvs: Float32Array | null;
 }
 
 /**
@@ -1195,6 +1263,8 @@ export interface DecodedDracoMesh {
   positions: Float64Array;
   /** 3 vertex ids per triangle. */
   indices: Uint32Array;
+  /** 2 floats per vertex from the texture-coordinate attribute, or `null` without one. */
+  uvs: Float32Array | null;
 }
 
 /**
@@ -1266,7 +1336,7 @@ export async function decodeDraco(
  * (non-embedded) `.bin` buffers load through `options.resolveBuffer`. A Draco
  * primitive's positions and faces come from its compressed buffer view
  * (attribute ids from the extension); its node placement still bakes into
- * world positions, while colors read as `null` (compressed attributes beyond
+ * world positions and its `TEXCOORD_0` UVs, while colors read as `null` (compressed attributes beyond
  * POSITION are not mapped).
  *
  * Primitives without the extension decode synchronously in place, so assets
@@ -1354,13 +1424,16 @@ async function createDecoderModule(wasmBinary?: Uint8Array | ArrayBuffer): Promi
  * Decodes Draco-compressed bytes into positions and faces. `what` prefixes
  * every error (`"Draco"` for files, `glTF: "name"` for primitives). Reads
  * POSITION by type, or the extension's attribute id when one is given (the
- * ids the encoder wrote need not match the decoder's lookup).
+ * ids the encoder wrote need not match the decoder's lookup), and likewise the
+ * UVs: by type when `uvId` is undefined (a file), by id for a primitive that
+ * maps them, not at all for `null`.
  */
 function decodeDracoMesh(
   module: DecoderModule,
   bytes: Uint8Array,
   what: string,
   positionId?: number,
+  uvId?: number | null,
 ): DecodedDracoMesh {
   const decoder = new module.Decoder();
   const buffer = new module.DecoderBuffer();
@@ -1400,6 +1473,29 @@ function decodeDracoMesh(
       } finally {
         module.destroy(floats);
       }
+      let uvAttribute: Attribute | undefined;
+      if (typeof uvId === "number") {
+        uvAttribute = checkedUniqueAttribute(decoder, mesh, uvId, what, "TEXCOORD_0");
+      } else if (uvId === undefined) {
+        const id = decoder.GetAttributeId(mesh, module.TEX_COORD);
+        uvAttribute = id < 0 ? undefined : decoder.GetAttribute(mesh, id);
+      }
+      let uvs: Float32Array | null = null;
+      if (uvAttribute !== undefined) {
+        if (uvAttribute.num_components() !== 2) {
+          throw new Error(`${what}: the Draco UV attribute has ${uvAttribute.num_components()} components (2 expected)`);
+        }
+        uvs = new Float32Array(2 * vertices);
+        const values = new module.DracoFloat32Array();
+        try {
+          decoder.GetAttributeFloatForAllPoints(mesh, uvAttribute, values);
+          for (let i = 0; i < uvs.length; i++) {
+            uvs[i] = values.GetValue(i);
+          }
+        } finally {
+          module.destroy(values);
+        }
+      }
       const faces = mesh.num_faces();
       const indices = new Uint32Array(3 * faces);
       const face = new module.DracoInt32Array();
@@ -1413,7 +1509,7 @@ function decodeDracoMesh(
       } finally {
         module.destroy(face);
       }
-      return { positions, indices };
+      return { positions, indices, uvs };
     } finally {
       module.destroy(mesh);
     }
@@ -1436,12 +1532,13 @@ function checkedPositionId(decoder: Decoder, mesh: Mesh, module: DecoderModule, 
 function checkedUniqueAttribute(
   decoder: Decoder,
   mesh: Mesh,
-  positionId: number,
+  id: number,
   what: string,
+  name = "POSITION",
 ): Attribute {
-  const attribute = decoder.GetAttributeByUniqueId(mesh, positionId);
+  const attribute = decoder.GetAttributeByUniqueId(mesh, id);
   if (attribute === undefined || attribute === null) {
-    throw new Error(`${what} points at missing Draco POSITION attribute ${positionId}`);
+    throw new Error(`${what} points at missing Draco ${name} attribute ${id}`);
   }
   return attribute;
 }
@@ -1500,9 +1597,26 @@ async function readPrimitiveDraco(
     }
     positionId = positionAttr as number;
   }
-  const decoded = decodeDracoMesh(module, buffer.subarray(base, end), what, positionId);
+  const uvAttr = (attributes as Record<string, unknown>)["TEXCOORD_0"];
+  if (uvAttr !== undefined && (!Number.isInteger(uvAttr) || (uvAttr as number) < 0)) {
+    throw new Error(`${what} has a bad KHR_draco_mesh_compression TEXCOORD_0 attribute id`);
+  }
+  const decoded = decodeDracoMesh(
+    module,
+    buffer.subarray(base, end),
+    what,
+    positionId,
+    uvAttr === undefined ? null : (uvAttr as number),
+  );
   // The node placement, baked: world positions, like the exporters write.
   const { positions, indices } = decoded;
+  // UVs left out of the bitstream may still ride a plain accessor.
+  const plainUvs = spec.primitive.attributes["TEXCOORD_0"];
+  const uvs =
+    decoded.uvs ??
+    (typeof plainUvs === "number" && doc.accessors?.[plainUvs]?.bufferView !== undefined
+      ? readUvs(doc, buffers, plainUvs, positions.length / 3, name)
+      : null);
   const world = spec.world;
   for (let i = 0; i < positions.length; i += 3) {
     const x = positions[i];
@@ -1512,7 +1626,7 @@ async function readPrimitiveDraco(
     positions[i + 1] = world[1] * x + world[5] * y + world[9] * z + world[13];
     positions[i + 2] = world[2] * x + world[6] * y + world[10] * z + world[14];
   }
-  return { name, positions, indices, placement: world.slice(), colors: null };
+  return { name, positions, indices, placement: world.slice(), colors: null, uvs };
 }
 
 /** The asset JSON, checked to be an object before the importers read it. */
@@ -1979,7 +2093,11 @@ function readPrimitive(
     typeof primitive.attributes["COLOR_0"] === "number"
       ? readColors(doc, buffers, primitive.attributes["COLOR_0"], positions.length / 3, name)
       : null;
-  return { name, positions, indices, placement: world.slice(), colors };
+  const uvs =
+    typeof primitive.attributes["TEXCOORD_0"] === "number"
+      ? readUvs(doc, buffers, primitive.attributes["TEXCOORD_0"], positions.length / 3, name)
+      : null;
+  return { name, positions, indices, placement: world.slice(), colors, uvs };
 }
 
 /** The deduplicated mesh name: the node name, else the mesh name, else `"mesh"`. */
@@ -2086,6 +2204,43 @@ function accessorCount(doc: GltfDocument, primitive: GltfPrimitive, name: string
     throw new Error(`glTF: "${name}" has a primitive without POSITION`);
   }
   return accessor.count;
+}
+
+function readUvs(
+  doc: GltfDocument,
+  buffers: Uint8Array[],
+  index: number,
+  vertices: number,
+  name: string,
+): Float32Array {
+  const data = accessorData(doc, buffers, index, "TEXCOORD_0");
+  if (data.components !== 2 || (data.componentType !== 5126 && data.componentType !== 5121 && data.componentType !== 5123)) {
+    throw new Error(`glTF: "${name}" has TEXCOORD_0 with ${data.components} ${data.size}-byte components (float, u8 or u16 VEC2)`);
+  }
+  if (data.count !== vertices) {
+    throw new Error(`glTF: "${name}" has ${data.count} UVs for ${vertices} vertices`);
+  }
+  const out = new Float32Array(2 * vertices);
+  if (data.buffer.length === 0) {
+    return out; // No buffer view: every element is zero.
+  }
+  for (let i = 0; i < vertices; i++) {
+    for (let c = 0; c < 2; c++) {
+      const at = data.base + i * data.stride + c * data.size;
+      // The integer types are normalized, as the spec requires of them.
+      const v =
+        data.componentType === 5126
+          ? data.view.getFloat32(at, true)
+          : data.componentType === 5121
+            ? data.view.getUint8(at) / 255
+            : data.view.getUint16(at, true) / 65535;
+      if (!Number.isFinite(v)) {
+        throw new Error(`glTF: "${name}" has a non-finite UV at vertex ${i}`);
+      }
+      out[2 * i + c] = v;
+    }
+  }
+  return out;
 }
 
 function readColors(

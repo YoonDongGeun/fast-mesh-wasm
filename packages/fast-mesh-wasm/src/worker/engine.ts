@@ -358,12 +358,12 @@ function packingFailed(e: unknown): ErrorWire {
 }
 
 /** Elements per slot of each buffer. */
-const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, indices: 3 } as const;
+const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, uvs: 2, indices: 3 } as const;
 
 type BufferName = keyof typeof STRIDE;
 
 /** A buffer's dirty ranges: the values change with the colours. */
-const rangesOf = (c: MeshChange, name: BufferName): Range[] | "all" => c[name === "values" ? "colors" : name];
+const rangesOf = (c: MeshChange, name: BufferName): Range[] | "all" => c[name === "values" ? "colors" : name] ?? [];
 
 /** Copies the dirty elements of `view` into a fresh buffer: the whole view for `"all"`. */
 function copyRanges(
@@ -805,6 +805,10 @@ class Engine {
     if (indices.length % 3 !== 0) {
       throw invalid("indices length must be a multiple of 3");
     }
+    const uvs = req.uvs === undefined ? undefined : new Float32Array(req.uvs);
+    if (uvs !== undefined && uvs.length !== (2 * positions.length) / 3) {
+      throw invalid("uvs need 2 values per vertex");
+    }
     const token = this.#meshAdds.beginUpload(positions.length / 3, indices.length / 3, {
       ...req.options,
       mode: "eager",
@@ -821,6 +825,13 @@ class Engine {
       for (let at = 0; at < indices.length; at += n) {
         this.#meshAdds.pushIndices(token, indices.subarray(at, at + n));
         await this.#maybeYield();
+      }
+      if (uvs !== undefined) {
+        const u = Math.max(1, Math.floor(bytes / uvs.BYTES_PER_ELEMENT));
+        for (let at = 0; at < uvs.length; at += u) {
+          this.#meshAdds.pushUvs(token, uvs.subarray(at, at + u));
+          await this.#maybeYield();
+        }
       }
     } catch (e) {
       try {
@@ -1648,7 +1659,11 @@ class Engine {
           throw invalid(`mesh client id ${req.id} is already in use`);
         }
         const positions = req.f64 ? new Float64Array(req.positions) : new Float32Array(req.positions);
-        const h = s.addMesh(positions, new Uint32Array(req.indices), { ...req.options, mode: "eager" });
+        const h = s.addMesh(positions, new Uint32Array(req.indices), {
+          ...req.options,
+          mode: "eager",
+          ...(req.uvs === undefined ? {} : { uvs: new Float32Array(req.uvs) }),
+        });
         this.#meshes.set(req.id, h);
         this.#meshIds.set(h, req.id);
         return;
@@ -1940,6 +1955,7 @@ class Engine {
           normals: v.normals()?.slice() ?? null,
           colors: v.colors()?.slice() ?? null,
           values: v.values?.()?.slice() ?? null,
+          uvs: v.uvs()?.slice() ?? null,
           indices: v.indices().slice(),
           placement: s.placement(h),
           matrix4: Array.from(s.matrix4(h)),
@@ -2081,6 +2097,7 @@ class Engine {
       normals: c.normals,
       colors: c.colors,
       indices: c.indices,
+      ...(c.uvs === undefined ? {} : { uvs: c.uvs }),
       fields: c.fieldsChanged.map((f) => this.#fieldIds.get(f) as ClientId),
       sections: c.sectionsChanged.map((x) => this.#sectionIds.get(x) as ClientId),
       vertexSlots: 0,

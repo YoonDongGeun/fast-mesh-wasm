@@ -112,6 +112,17 @@ requestAnimationFrame(frame);
 - Bound objects (and section groups) must sit under an untransformed parent: their matrices are driven as world matrices, so a transformed ancestor offsets them and is warned about once.
 - With `new Scene({ debug: true })`, the views the adapter copies from are checked `Proxy` objects (see the Scene API section for their cost); the mirrors it uploads are always plain typed arrays.
 
+#### Textures
+
+Add a mesh with `{ uvs }` (2 floats per vertex, read back zero-copy with `scene.views(mesh).uvs()`) and pass the texture to `bindMesh`:
+
+```ts
+const mesh = scene.addMesh(positions, indices, { uvs });
+const bound = bindMesh(scene, mesh, { map: texture });
+```
+
+`importGLTF` returns `uvs` from `TEXCOORD_0` and `exportGLTF` writes them. Every mesh operation keeps UVs aligned or drops them, undoably: `weld` keeps seams apart, `simplify`, `subdivide`, `remesh`, `fillHoles` and `cutByPlane` interpolate, and `boolean` drops them. See [docs/uv-channel.md](docs/uv-channel.md) for the table.
+
 #### Fragment shading
 
 Vertex colours interpolate across each triangle, so the edge between coloured and base-coloured vertices blurs over a triangle's width. `bindMesh(scene, mesh, { shading: "fragment", edgeSoftness })` colours every pixel from the interpolated field value through the colouring's rule instead (a lookup texture and a shader chunk added with `onBeforeCompile`): range edges and colour steps, such as a contact heatmap's tolerance band, are crisp iso-lines, and at a vertex the colour equals its vertex colour. Far (`Infinity`) and NaN values never tint their neighbours.

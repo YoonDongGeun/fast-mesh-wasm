@@ -1,8 +1,9 @@
 # IO: export / import
 
-Exporters read `scene.views(mesh)` (positions, indices, normals, colors),
-so meshes export exactly as they are — edited, repaired, or colored.
-Importers return plain arrays ready for `scene.addMesh`.
+Exporters read `scene.views(mesh)` (positions, indices, normals, colors,
+and UVs for glTF), so meshes export exactly as they are — edited, repaired,
+or colored. Importers return plain arrays ready for `scene.addMesh`; pass an
+imported mesh's `uvs` to it to keep them ([docs/uv-channel.md](../uv-channel.md)).
 
 ## Export one mesh
 

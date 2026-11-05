@@ -27,11 +27,15 @@
 //! - Isolated vertices, and triangles with a repeated vertex id, pass
 //!   through untouched.
 //!
+//! UVs ([`Mesh::uvs`](fast_mesh_store::Mesh::uvs)) stay linear: an old vertex
+//! keeps its UV even though it moves, and a new one takes its edge's midpoint.
+//! The two sides of a seam are boundaries, so they split in step.
+//!
 //! The stencils are convex combinations, so finite input stays finite, and
 //! every list is sorted explicitly, so results do not depend on hash
 //! iteration order.
 
-use fast_mesh_store::{Transaction, VertexId};
+use fast_mesh_store::{Transaction, UV_CHANNEL, VertexId};
 
 use crate::{OpsError, Result, push, reserve};
 
@@ -130,9 +134,14 @@ fn loop_beta(n: usize) -> f64 {
 }
 
 /// One Loop level over the working mesh: smooths every live vertex and
-/// splits every clean triangle into four. Returns whether any triangle was
-/// subdivided.
-fn step(pos: &mut Vec<[f32; 3]>, vlive: &mut Vec<bool>, tris: &mut Vec<WorkTri>) -> Result<bool> {
+/// splits every clean triangle into four, appending the new vertices' UVs to
+/// `uvs` when given. Returns whether any triangle was subdivided.
+fn step(
+    pos: &mut Vec<[f32; 3]>,
+    vlive: &mut Vec<bool>,
+    tris: &mut Vec<WorkTri>,
+    uvs: Option<&mut Vec<f32>>,
+) -> Result<bool> {
     let clean = tris.iter().filter(|t| t.clean).count();
     if clean == 0 {
         return Ok(false);
@@ -313,6 +322,14 @@ fn step(pos: &mut Vec<[f32; 3]>, vlive: &mut Vec<bool>, tris: &mut Vec<WorkTri>)
         }
     }
 
+    if let Some(uv) = uvs {
+        reserve(uv, 2 * edges.len())?;
+        for &(a, b) in &edges {
+            let (ia, ib) = (2 * a as usize, 2 * b as usize);
+            let mid = [0, 1].map(|c| 0.5 * (uv[ia + c] + uv[ib + c]));
+            uv.extend_from_slice(&mid);
+        }
+    }
     *pos = upd;
     reserve(pos, edge_point.len())?;
     pos.extend_from_slice(&edge_point);
@@ -366,9 +383,17 @@ pub fn subdivide(tx: &mut Transaction, options: &SubdivideOptions) -> Result<Sub
         )?;
     }
 
+    // The working UVs, on a mesh with them.
+    let mut uvs: Option<Vec<f32>> = None;
+    if let Some(from) = mesh.uvs() {
+        let mut copy = Vec::new();
+        reserve(&mut copy, from.len())?;
+        copy.extend_from_slice(from);
+        uvs = Some(copy);
+    }
     let mut subdivided = false;
     for _ in 0..options.levels {
-        if !step(&mut pos, &mut vlive, &mut tris)? {
+        if !step(&mut pos, &mut vlive, &mut tris, uvs.as_mut())? {
             break;
         }
         subdivided = true;
@@ -453,6 +478,9 @@ pub fn subdivide(tx: &mut Transaction, options: &SubdivideOptions) -> Result<Sub
     let map = |c: [u32; 3]| c.map(|v| real[v as usize] as VertexId);
     set_mapped.extend(set_t_to.iter().map(|&c| map(c)));
     add_mapped.extend(add_t.iter().map(|&c| map(c)));
+    if let Some(uv) = &uvs {
+        tx.write_channel(UV_CHANNEL, &added, &uv[2 * slots..])?;
+    }
     tx.set_triangles(&set_t, &set_mapped)?;
     tx.add_triangles(&add_mapped)?;
     Ok(SubdivideReport {

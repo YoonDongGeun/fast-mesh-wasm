@@ -137,6 +137,11 @@ impl AutoRepairReport {
 /// are not filled for nothing. Holes past `max_edges` are skipped and holes
 /// that cannot be filled are listed in [`FillReport`]; neither is an error.
 ///
+/// On a mesh with UVs a seam stays a seam: the weld keeps its two sides apart,
+/// UV islands of one surface count as one component, and loops with a seam
+/// edge are skipped with [`SkipReason::UvSeam`](crate::SkipReason::UvSeam).
+/// New fill vertices interpolate their rim's UVs.
+///
 /// ```
 /// use fast_mesh_ops::{AutoRepairOptions, auto_repair};
 /// use fast_mesh_store::Mesh;

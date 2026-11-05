@@ -17,12 +17,13 @@
 //!   Produces `n / 3` triangle ids.
 //! - `3` remove triangles: an id list of triangles.
 //! - `4` remove vertices: an id list of vertices.
+//! - `5` set UVs: an id list of vertices; takes `2 · n` values.
 //!
 //! An id list is `n, r, id × n, (slot, op, i) × r`: `n` ids, of which the
 //! `r` refs replace the id at `slot` (ascending) with id `i` of the result
 //! of the earlier op `op`, which must produce ids of the kind the list
-//! holds. `values` holds world positions (`xyz` each) in op order and must
-//! be used up exactly. The result is `[n, id × n]` per op, empty (`n = 0`)
+//! holds. `values` holds world positions (`xyz` each) and UVs (`uv` each) in
+//! op order and must be used up exactly. The result is `[n, id × n]` per op, empty (`n = 0`)
 //! for ops that add nothing.
 //!
 //! # Repair op list
@@ -70,7 +71,7 @@
 //!   flipped_outward_components`.
 //! - fill holes: `filled_n, (loop id, triangles_added, vertices_added,
 //!   converged, weights (0 none, 1 cotangent, 2 uniform), refine_capped)
-//!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean)) ×
+//!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean, 2 UV seam)) ×
 //!   skipped_n, failed_n, (loop id, reason (0 projection folds, 1 no valid
 //!   triangulation, 2 solver)) × failed_n`.
 //! - inflate: `moved, max_displacement`.
@@ -101,7 +102,7 @@ use fast_mesh_ops::{
     FairWeights, FillOptions, FillReport, LoopId, OffsetOptions, OpsError, ShellOptions,
     SkipReason,
 };
-use fast_mesh_store::{StoreError, Transaction};
+use fast_mesh_store::{StoreError, Transaction, UV_CHANNEL};
 
 use crate::error::{Error, codes};
 
@@ -192,6 +193,7 @@ enum Kind {
     AddTriangles,
     RemoveTriangles,
     RemoveVertices,
+    SetUvs,
 }
 
 impl Kind {
@@ -202,6 +204,7 @@ impl Kind {
             2 => Kind::AddTriangles,
             3 => Kind::RemoveTriangles,
             4 => Kind::RemoveVertices,
+            5 => Kind::SetUvs,
             _ => return Err(Error::invalid("unknown edit op")),
         })
     }
@@ -209,7 +212,9 @@ impl Kind {
     /// What the op's id list holds; `None` when it has none.
     fn takes(self) -> Option<Element> {
         match self {
-            Kind::SetPositions | Kind::AddTriangles | Kind::RemoveVertices => Some(Element::Vertex),
+            Kind::SetPositions | Kind::AddTriangles | Kind::RemoveVertices | Kind::SetUvs => {
+                Some(Element::Vertex)
+            }
             Kind::RemoveTriangles => Some(Element::Triangle),
             Kind::AddVertices => None,
         }
@@ -234,6 +239,8 @@ pub(crate) struct EditOp<'a> {
     refs: &'a [[u32; 3]],
     /// Local positions, for set positions and add vertices.
     positions: Vec<[f32; 3]>,
+    /// Flat `[u, v, ...]`, for set UVs.
+    uvs: Vec<f32>,
     /// How many ids the op produces.
     produced: usize,
 }
@@ -281,6 +288,15 @@ pub(crate) fn decode_edit<'a>(
                 positions.push(p);
             }
         }
+        let mut uvs = Vec::new();
+        if kind == Kind::SetUvs {
+            let flat = vals.take(n.checked_mul(2).ok_or_else(|| malformed(WHAT))?)?;
+            uvs.try_reserve_exact(flat.len()).map_err(|_| oom())?;
+            uvs.extend(flat.iter().map(|&x| x as f32));
+            if !uvs.iter().all(|x| x.is_finite()) {
+                return Err(Error::invalid("uvs must be finite"));
+            }
+        }
         let produced = match kind {
             Kind::AddVertices => n,
             Kind::AddTriangles if !n.is_multiple_of(3) => {
@@ -313,6 +329,7 @@ pub(crate) fn decode_edit<'a>(
             ids,
             refs,
             positions,
+            uvs,
             produced,
         });
     }
@@ -350,6 +367,10 @@ pub(crate) fn run_edit(tx: &mut Transaction, ops: &[EditOp]) -> Result<Vec<Vec<u
             }
             Kind::RemoveVertices => {
                 tx.remove_vertices(&ids)?;
+                Vec::new()
+            }
+            Kind::SetUvs => {
+                tx.write_channel(UV_CHANNEL, &ids, &op.uvs)?;
                 Vec::new()
             }
         };
@@ -680,6 +701,7 @@ fn put_fill(out: &mut Vec<f64>, r: &FillReport) -> Result<(), StoreError> {
         let reason = match reason {
             SkipReason::Bounds => 0.0,
             SkipReason::Unclean => 1.0,
+            SkipReason::UvSeam => 2.0,
         };
         put(out, &[reason])?;
     }

@@ -34,7 +34,7 @@ use crate::edit::{
     run_repair,
 };
 use crate::error::Error;
-use crate::render::{Dirty, Record, RenderState, encode};
+use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
 /// A scene of editable meshes with render buffers and change records.
 #[wasm_bindgen]
@@ -53,11 +53,13 @@ pub struct WasmScene {
 /// built and its BVH (and vertex normals) building.
 enum PendingAdd {
     /// The store uploads and builds in steps; `options` and `normals`
-    /// start the BVH build once it is done.
+    /// start the BVH build once it is done, with `uvs` (empty for none) on
+    /// the built mesh.
     Store {
         build: Box<MeshBuilder>,
         options: MeshOptions,
         normals: bool,
+        uvs: Vec<f32>,
     },
     /// The store is built; the BVH builds in steps: the build, its update
     /// mode and whether it gets vertex normals.
@@ -70,8 +72,12 @@ fn start_build(
     build: Box<MeshBuilder>,
     options: MeshOptions,
     normals: bool,
+    uvs: &[f32],
 ) -> Result<(Box<MeshBuild>, UpdateMode, bool), Error> {
-    let mesh = build.finish().ok_or(SceneError::Corrupted)?;
+    let mut mesh = build.finish().ok_or(SceneError::Corrupted)?;
+    if !uvs.is_empty() {
+        mesh.add_uvs(uvs)?;
+    }
     let mode = options.mode;
     let mut build = MeshBuild::new(mesh, options)?;
     // Computed in the build's steps; `added` then finds them on.
@@ -319,6 +325,29 @@ impl WasmScene {
         self.added(id, normals)
     }
 
+    /// [`WasmScene::add_mesh`] with UVs: 2 finite `f32`s per vertex
+    /// (`Mesh::add_uvs`). Nothing is added on error.
+    pub fn add_mesh_with_uvs(
+        &mut self,
+        positions: &[f64],
+        indices: &[u32],
+        uvs: &[f32],
+        origin: Option<Vec<f64>>,
+        mode: u8,
+        normals: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let mode = parse_mode(mode)?;
+        let mut mesh = mesh_from(positions, indices, origin)?;
+        mesh.add_uvs(uvs)?;
+        let options = MeshOptions {
+            mode,
+            defer_bvh: mode != UpdateMode::Eager,
+            ..MeshOptions::default()
+        };
+        let id = self.scene.add_mesh(mesh, options)?;
+        self.added(id, normals)
+    }
+
     /// [`WasmScene::add_mesh`] in steps: reserves a mesh of `vertices`
     /// vertices and `triangles` triangles outside the scene and returns the
     /// build's id. Its inputs upload in chunks
@@ -357,9 +386,29 @@ impl WasmScene {
                 build: Box::new(build),
                 options,
                 normals,
+                uvs: Vec::new(),
             },
         );
         Ok(id)
+    }
+
+    /// Appends a chunk of flat `[u, v, ...]` UVs to a mesh being added. The
+    /// chunks must add up to 2 per vertex; the build checks them when its
+    /// store is done and fails like [`WasmScene::add_mesh_with_uvs`].
+    pub fn add_mesh_push_uvs(&mut self, build: u32, chunk: &[f32]) -> Result<(), Error> {
+        match self
+            .adds
+            .get_mut(&build)
+            .ok_or_else(|| Error::invalid("no mesh is being added with this id"))?
+        {
+            PendingAdd::Store { uvs, .. } => {
+                uvs.try_reserve(chunk.len())
+                    .map_err(|_| fast_mesh_store::StoreError::OutOfMemory)?;
+                uvs.extend_from_slice(chunk);
+                Ok(())
+            }
+            PendingAdd::Bvh(..) => Err(Error::invalid("the mesh upload is finished")),
+        }
     }
 
     /// Appends a chunk of flat `[x, y, z, ...]` world positions to a mesh
@@ -402,9 +451,10 @@ impl WasmScene {
                 build: mut store,
                 options,
                 normals,
+                uvs,
             } => {
                 if store.step(budget as usize)? {
-                    let (b, mode, normals) = start_build(store, options, normals)?;
+                    let (b, mode, normals) = start_build(store, options, normals, &uvs)?;
                     self.adds.insert(build, PendingAdd::Bvh(b, mode, normals));
                 } else {
                     self.adds.insert(
@@ -413,6 +463,7 @@ impl WasmScene {
                             build: store,
                             options,
                             normals,
+                            uvs,
                         },
                     );
                 }
@@ -469,9 +520,10 @@ impl WasmScene {
                 build: mut store,
                 options,
                 normals,
+                uvs,
             } => {
                 while !store.step(usize::MAX)? {}
-                start_build(store, options, normals)?
+                start_build(store, options, normals, &uvs)?
             }
             PendingAdd::Bvh(b, mode, normals) => (b, mode, normals),
         };
@@ -667,6 +719,17 @@ impl WasmScene {
         Ok(n.map_or(0, |n| len(n.len() * 3)))
     }
 
+    /// Address of the UVs (`f32`, 2 per vertex slot), 0 for a mesh without
+    /// them.
+    pub fn uvs_ptr(&self, index: u32, generation: u32) -> Result<u32, Error> {
+        Ok(self.mesh(index, generation)?.uvs().map_or(0, addr))
+    }
+
+    /// Length of the UVs in `f32`s, 0 for a mesh without them.
+    pub fn uvs_len(&self, index: u32, generation: u32) -> Result<u32, Error> {
+        Ok(self.mesh(index, generation)?.uvs().map_or(0, <[_]>::len) as u32)
+    }
+
     /// Address of the colours (RGBA8, 4 bytes per vertex slot), 0 when the
     /// mesh has no colouring.
     pub fn colors_ptr(&self, index: u32, generation: u32) -> Result<u32, Error> {
@@ -731,6 +794,7 @@ impl WasmScene {
                     _ => Dirty::all(),
                 }
             };
+            let uvs = self.scene.mesh(c.id).is_ok_and(|m| uvs_reported(m, &c));
             records.push(Record {
                 mesh_index: c.id.index(),
                 mesh_generation: c.id.generation(),
@@ -738,6 +802,7 @@ impl WasmScene {
                 removed: c.removed,
                 placement_changed: c.placement_changed,
                 dirty,
+                uvs_reported: uvs,
                 fields: c.fields_changed.iter().map(|f| f.raw()).collect(),
                 sections: c.sections_changed.iter().map(|s| s.raw()).collect(),
             });
@@ -768,6 +833,7 @@ impl WasmScene {
                     added: false,
                     removed: false,
                     placement_changed: false,
+                    uvs_reported: mesh.uvs().is_some(),
                     dirty,
                     fields: Vec::new(),
                     sections: Vec::new(),
@@ -827,10 +893,10 @@ impl WasmScene {
     /// nothing changes when an op fails. `ops` and `values` are laid out as
     /// in [`crate::edit`]: `ops` is a `u32` sequence of op codes (0 set
     /// positions, 1 add vertices, 2 add triangles, 3 remove triangles, 4
-    /// remove vertices) with their id lists, whose refs name ids added by
+    /// remove vertices, 5 set UVs) with their id lists, whose refs name ids added by
     /// earlier ops of the list; `values` holds the world positions, mapped
     /// to local with the placement inverse and the origin in `f64`, then
-    /// stored as `f32`. Returns `[n, id × n]` per op: the new vertex or
+    /// stored as `f32`, and the UVs of op 5. Returns `[n, id × n]` per op: the new vertex or
     /// triangle ids, none for the other ops. The list is decoded and every
     /// ref checked before the mesh is touched.
     pub fn edit(

@@ -22,7 +22,7 @@ mod patch;
 mod transaction;
 
 pub use adjacency::{Adjacency, AdjacencyBuild, EdgeKind};
-pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy};
+pub use channel::{ChannelDesc, ChannelKind, TopologyPolicy, UV_CHANNEL};
 pub use compact::Remap;
 pub use error::StoreError;
 pub use history::History;

@@ -11,13 +11,31 @@
 //! first and committed through one [`Transaction`](fast_mesh_store::Transaction),
 //! which keeps the call atomic under sweep: either every collapse lands or
 //! nothing does.
+//!
+//! UVs ([`Mesh::uvs`](fast_mesh_store::Mesh::uvs)) follow: a survivor takes the
+//! UV at its new position's parameter along the collapsed edge. The quadrics
+//! ignore UVs, so textures can stretch. With `preserve_boundary`, seams (which
+//! are boundaries) stay exactly as they are.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use fast_mesh_store::{Transaction, TriangleId, VertexId};
+use fast_mesh_store::{Transaction, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::{OpsError, Result, filled, push, reserve};
+
+/// The parameter along `a`-`b` of the point nearest to `p`, in `[0, 1]`; the
+/// middle of a zero-length edge.
+fn edge_param(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f32 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if len2 > 0.0 {
+        let along = (p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1] + (p[2] - a[2]) * d[2];
+        (along / len2).clamp(0.0, 1.0) as f32
+    } else {
+        0.5
+    }
+}
 
 /// Options for [`simplify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +351,14 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
     reserve(&mut positions, base.len())?;
     positions.extend_from_slice(base);
     let slots = positions.len();
+    // The working UVs, on a mesh with them.
+    let mut uvs: Option<Vec<f32>> = None;
+    if let Some(from) = mesh.uvs() {
+        let mut copy = Vec::new();
+        reserve(&mut copy, from.len())?;
+        copy.extend_from_slice(from);
+        uvs = Some(copy);
+    }
     let mut tris: Vec<WorkTri> = Vec::new();
     reserve(&mut tris, mesh.triangle_slots())?;
     for t in 0..mesh.triangle_slots() as u32 {
@@ -546,6 +572,13 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
             continue;
         }
 
+        if let Some(uv) = &mut uvs {
+            let f = edge_param(keep_pos, pa, pb);
+            let (ia, ib, ik) = (2 * a as usize, 2 * b as usize, 2 * keep as usize);
+            let mixed = [0, 1].map(|c| uv[ia + c] + f * (uv[ib + c] - uv[ia + c]));
+            uv[ik] = mixed[0];
+            uv[ik + 1] = mixed[1];
+        }
         quadrics[keep as usize] = qsum;
         positions[keep as usize] = pnew32;
         moved[keep as usize] = true;
@@ -608,6 +641,18 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
     let mut set_t_to: Vec<[VertexId; 3]> = Vec::new();
     let mut del_t: Vec<TriangleId> = Vec::new();
     let mut del_v: Vec<VertexId> = Vec::new();
+    let mut set_uv: Vec<VertexId> = Vec::new();
+    let mut set_uv_to: Vec<f32> = Vec::new();
+    if let Some(uv) = &uvs {
+        for v in 0..slots as u32 {
+            if vlive[v as usize] && moved[v as usize] {
+                push(&mut set_uv, v)?;
+                let i = 2 * v as usize;
+                reserve(&mut set_uv_to, 2)?;
+                set_uv_to.extend_from_slice(&uv[i..i + 2]);
+            }
+        }
+    }
     let mut n_moved = 0;
     let mut n_rewired = 0;
     let mut n_dead_tri = 0;
@@ -659,6 +704,9 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         }
     }
     tx.set_positions(&set_p, &set_p_to)?;
+    if uvs.is_some() {
+        tx.write_channel(UV_CHANNEL, &set_uv, &set_uv_to)?;
+    }
     tx.set_triangles(&set_t, &set_t_to)?;
     tx.remove_triangles(&del_t)?;
     tx.remove_vertices(&del_v)?;
