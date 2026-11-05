@@ -199,6 +199,152 @@ describe("importGLTF TEXCOORD_0 forms", () => {
   });
 });
 
+/** `asset` with extra top-level document fields, like `extensionsRequired`. */
+function assetWith(bin: Uint8Array, uv: Record<string, unknown>, extra: Record<string, unknown>) {
+  const doc = jsonOf(asset(bin, uv));
+  return new TextEncoder().encode(JSON.stringify({ ...doc, ...extra }));
+}
+
+const QUANTIZED = { extensionsUsed: ["KHR_mesh_quantization"], extensionsRequired: ["KHR_mesh_quantization"] };
+const TRIANGLE = [0, 0, 0, 1, 0, 0, 0, 1, 0];
+
+describe("importGLTF unsupported TEXCOORD_0", () => {
+  const sparse = { count: 1, indices: { bufferView: 1, componentType: 5123 }, values: { bufferView: 1 } };
+  const unsupported: [string, Record<string, unknown>, ArrayBufferView, RegExp][] = [
+    ["normalized i8", { bufferView: 1, componentType: 5120, normalized: true }, new Int8Array(8), /KHR_mesh_quantization/],
+    ["normalized i16", { bufferView: 1, componentType: 5122, normalized: true }, new Int16Array(6), /KHR_mesh_quantization/],
+    ["raw i16", { bufferView: 1, componentType: 5122 }, new Int16Array(6), /KHR_mesh_quantization/],
+    ["raw u16", { bufferView: 1, componentType: 5123 }, new Uint16Array(6), /KHR_mesh_quantization/],
+    ["raw u8", { bufferView: 1, componentType: 5121 }, new Uint8Array(8), /KHR_mesh_quantization/],
+    ["u32", { bufferView: 1, componentType: 5125 }, new Uint32Array(6), /component type 5125/],
+    ["sparse float", { bufferView: 1, componentType: 5126, sparse }, new Float32Array(6), /sparse/],
+    ["sparse, no buffer view", { componentType: 5126, sparse }, new Float32Array(6), /sparse/],
+    ["sparse normalized u16", { bufferView: 1, componentType: 5123, normalized: true, sparse }, new Uint16Array(6), /sparse/],
+  ];
+  for (const [label, fields, bytes, reason] of unsupported) {
+    it(`imports the geometry of ${label} without UVs and says why`, async () => {
+      const file = asset(binWith(bytes), { count: 3, type: "VEC2", ...fields });
+      for (const [mesh] of [importGLTF(file), await importGLTFAsync(file)]) {
+        expect(Array.from(mesh.positions)).toEqual(TRIANGLE);
+        expect(Array.from(mesh.indices)).toEqual([0, 1, 2]);
+        expect(mesh.uvs).toBeNull();
+        expect(mesh.uvsSkipped).toMatch(reason);
+      }
+    });
+  }
+
+  it("skips a sparse accessor even with the quantization extension", () => {
+    const uv = { bufferView: 1, componentType: 5126, count: 3, type: "VEC2", sparse };
+    const [mesh] = importGLTF(assetWith(binWith(new Float32Array(6)), uv, QUANTIZED));
+    expect(Array.from(mesh.positions)).toEqual(TRIANGLE);
+    expect(mesh.uvs).toBeNull();
+    expect(mesh.uvsSkipped).toMatch(/sparse/);
+  });
+
+  it("skips only the primitive whose UVs are unsupported", () => {
+    const uv = { bufferView: 1, componentType: 5126, count: 3, type: "VEC2" };
+    const doc = jsonOf(asset(binWith(new Float32Array([0.25, 0.5, 0.75, 1, 0, 0])), uv));
+    doc.accessors.push({ bufferView: 1, componentType: 5122, normalized: true, count: 3, type: "VEC2" });
+    doc.meshes[0].primitives.push({ attributes: { POSITION: 0, TEXCOORD_0: 2 } });
+    const [good, bad] = importGLTF(new TextEncoder().encode(JSON.stringify(doc)));
+    expect(Array.from(good.uvs as Float32Array)).toEqual([0.25, 0.5, 0.75, 1, 0, 0]);
+    expect(good.uvsSkipped).toBeUndefined();
+    expect(Array.from(bad.positions)).toEqual(TRIANGLE);
+    expect(bad.uvs).toBeNull();
+    expect(bad.uvsSkipped).toMatch(/KHR_mesh_quantization/);
+  });
+
+  it("leaves normal UV files unaffected: nothing skipped", () => {
+    const forms: [Record<string, unknown>, ArrayBufferView][] = [
+      [{ componentType: 5126 }, new Float32Array(6)],
+      [{ componentType: 5121, normalized: true }, new Uint8Array(8)],
+      [{ componentType: 5123, normalized: true }, new Uint16Array(6)],
+    ];
+    for (const [fields, bytes] of forms) {
+      const [mesh] = importGLTF(asset(binWith(bytes), { bufferView: 1, count: 3, type: "VEC2", ...fields }));
+      expect(mesh.uvs).not.toBeNull();
+      expect(mesh.uvsSkipped).toBeUndefined();
+    }
+  });
+
+  it("a file without TEXCOORD_0 reports nothing either", () => {
+    const uv = { bufferView: 1, componentType: 5126, count: 3, type: "VEC2" };
+    const doc = jsonOf(asset(binWith(new Float32Array(6)), uv));
+    delete doc.meshes[0].primitives[0].attributes.TEXCOORD_0;
+    const [mesh] = importGLTF(new TextEncoder().encode(JSON.stringify(doc)));
+    expect(mesh.uvs).toBeNull();
+    expect(mesh.uvsSkipped).toBeUndefined();
+  });
+});
+
+// The expected values are the glTF 2.0 accessor equations worked by hand:
+// f = c / 255, c / 65535, max(c / 127, -1) and max(c / 32767, -1), or f = c
+// without `normalized`.
+describe("importGLTF TEXCOORD_0 with KHR_mesh_quantization", () => {
+  const read = (fields: Record<string, unknown>, bytes: ArrayBufferView, extra: Record<string, unknown> = QUANTIZED) =>
+    importGLTF(assetWith(binWith(bytes), { bufferView: 1, count: 3, type: "VEC2", ...fields }, extra))[0].uvs as Float32Array;
+
+  it("keeps non-normalized u8 and u16 as stored", () => {
+    expect(Array.from(read({ componentType: 5121 }, Uint8Array.from([0, 255, 51, 102, 200, 1, 0, 0])))).toEqual([0, 255, 51, 102, 200, 1]);
+    expect(Array.from(read({ componentType: 5123 }, Uint16Array.from([0, 65535, 40000, 2, 7, 32768])))).toEqual([0, 65535, 40000, 2, 7, 32768]);
+  });
+
+  it("keeps non-normalized i8 and i16 as stored", () => {
+    expect(Array.from(read({ componentType: 5120 }, Int8Array.from([-128, 127, 0, -1, 5, 6, 0, 0])))).toEqual([-128, 127, 0, -1, 5, 6]);
+    expect(Array.from(read({ componentType: 5122 }, Int16Array.from([-32768, 32767, 0, -1, 5, 6])))).toEqual([-32768, 32767, 0, -1, 5, 6]);
+  });
+
+  it("maps normalized i8 and i16 to [-1, 1]", () => {
+    const i8 = read({ componentType: 5120, normalized: true }, Int8Array.from([-128, -127, 127, 0, 64, -64, 0, 0]));
+    [-1, -1, 1, 0, 0.50393701, -0.50393701].forEach((x, i) => expect(i8[i]).toBeCloseTo(x, 6));
+    const i16 = read({ componentType: 5122, normalized: true }, Int16Array.from([-32768, -32767, 32767, 0, 16384, -16384]));
+    [-1, -1, 1, 0, 0.50001526, -0.50001526].forEach((x, i) => expect(i16[i]).toBeCloseTo(x, 6));
+  });
+
+  it("still normalizes u8 and u16 that ask for it", () => {
+    const u16 = read({ componentType: 5123, normalized: true }, Uint16Array.from([0, 65535, 13107, 26214, 0, 0]));
+    [0, 1, 0.2, 0.4, 0, 0].forEach((x, i) => expect(u16[i]).toBeCloseTo(x, 6));
+  });
+
+  it("accepts the extension named in extensionsUsed alone", () => {
+    const uvs = read({ componentType: 5123 }, Uint16Array.from([1, 2, 3, 4, 5, 6]), { extensionsUsed: ["KHR_mesh_quantization"] });
+    expect(Array.from(uvs)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("does not read those forms under another extension", () => {
+    const uv = { bufferView: 1, componentType: 5123, count: 3, type: "VEC2" };
+    const [mesh] = importGLTF(assetWith(binWith(new Uint16Array(6)), uv, { extensionsUsed: ["KHR_texture_transform"] }));
+    expect(mesh.uvs).toBeNull();
+  });
+
+  it("keeps a stride for the integer forms", () => {
+    const uv = { bufferView: 1, componentType: 5123, count: 3, type: "VEC2" };
+    const doc = jsonOf(assetWith(binWith(Uint16Array.from([1, 2, 99, 99, 3, 4, 99, 99, 5, 6])), uv, QUANTIZED));
+    doc.bufferViews[1].byteStride = 8;
+    const uvs = importGLTF(new TextEncoder().encode(JSON.stringify(doc)))[0].uvs as Float32Array;
+    expect(Array.from(uvs)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+});
+
+describe("Draco quantizationBits.texCoord", () => {
+  const encode = (quantizationBits: Record<string, number>) =>
+    encodeDraco(SEAM.positions, SEAM.indices, { uvs: SEAM.uvs, quantizationBits });
+
+  it("is an alias of uv", async () => {
+    expect(await encode({ texCoord: 3 })).toEqual(await encode({ uv: 3 }));
+    expect(await encode({ texCoord: 3 })).not.toEqual(await encode({}));
+  });
+
+  it("gives way to uv", async () => {
+    expect(await encode({ texCoord: 3, uv: 9 })).toEqual(await encode({ uv: 9 }));
+  });
+
+  it("is still validated", async () => {
+    await expect(encode({ texCoord: 0 })).rejects.toThrow(/texCoord quantization bits/);
+    await expect(encode({ texCoord: 0, uv: 9 })).rejects.toThrow(/texCoord quantization bits/);
+  });
+});
+
 describe("importGLTFAsync external buffers", () => {
   it("keeps UVs read through resolveBuffer", async () => {
     const s = new Scene();
@@ -277,6 +423,21 @@ describe("Draco", () => {
     await expect(
       encodeDraco(positions, SEAM.indices, { encoderModule: await encoder, uvs: new Float32Array(16).fill(Number.NaN) }),
     ).rejects.toThrow(/uv 0 is not finite/);
+  });
+
+  it("skips a sparse plain TEXCOORD_0 beside a Draco primitive", async () => {
+    const s = new Scene();
+    const m = s.addMesh(SEAM.positions, SEAM.indices, { normals: false });
+    const doc = jsonOf(await exportGLTF(s, m, { ...(await options()), binary: false }));
+    s.free();
+    doc.meshes[0].primitives[0].attributes.TEXCOORD_0 = doc.accessors.length;
+    const sparse = { count: 1, indices: { bufferView: 0, componentType: 5123 }, values: { bufferView: 0 } };
+    doc.accessors.push({ bufferView: 0, componentType: 5126, count: 8, type: "VEC2", sparse });
+    const bytes = new TextEncoder().encode(JSON.stringify(doc));
+    const [mesh] = await importGLTFAsync(bytes, { decoderModule: await decoder });
+    expect(mesh.indices.length).toBe(SEAM.indices.length);
+    expect(mesh.uvs).toBeNull();
+    expect(mesh.uvsSkipped).toMatch(/sparse/);
   });
 
   it("a bad TEXCOORD_0 id is an error", async () => {
