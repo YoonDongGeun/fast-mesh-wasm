@@ -233,8 +233,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     }
   };
 
-  // One "Auto repair" click: weld -> remove-degenerate -> orient ->
-  // remove-small-components -> fill holes as ONE repair call (one grouped
+  // One "Auto repair" click: the library's weld -> remove-degenerate -> orient
+  // -> remove-small-components -> fill holes as ONE repair call (one grouped
   // undo step, all-or-nothing), using this panel's live settings, with a
   // per-stage report and a before/after summary. The triangle-change effect
   // above re-analyses and refreshes the 3D overlays; the explicit analyse
@@ -252,7 +252,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
       const result = await runAutoRepairPipeline(
         {
           analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
-          repair: async (ops) => (await store.repair(mesh, ops)) as RepairReport[],
+          repair: (request) => store.repair(mesh, request),
         },
         settings,
       );

@@ -34,6 +34,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   holes (up to 64 edges by default; an empty limit fills any size, an open mesh's outer boundary
   included; optionally faired to follow the curvature). Each shows its report while the analysis
   refreshes; a repair, its undo and its redo all re-analyse, and an undo or redo clears the report.
+  Auto repair runs the library's whole pipeline with those settings as one undo step
+  (`store.repair(mesh, { kind: "auto", ... })`).
 - **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
   signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
