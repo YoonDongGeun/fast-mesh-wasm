@@ -19,6 +19,7 @@ fast-mesh-store = { path = "../crates/fast-mesh-store" }
 fast-mesh-bvh = { path = "../crates/fast-mesh-bvh" }
 fast-mesh-query = { path = "../crates/fast-mesh-query" }
 fast-mesh-ops = { path = "../crates/fast-mesh-ops" }
+fast-mesh-cli = { path = "../crates/fast-mesh-cli" }
 
 [[bin]]
 name = "fill"
@@ -39,3 +40,7 @@ path = "fuzz_targets/bvh.rs"
 [[bin]]
 name = "boolean"
 path = "fuzz_targets/boolean.rs"
+
+[[bin]]
+name = "parsers"
+path = "fuzz_targets/parsers.rs"

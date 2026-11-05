@@ -16,16 +16,17 @@ cargo-fuzz project.
 | `triangulate` | `triangulate` on arbitrary polygons with up to two holes; asserts every emitted triangle numbers a real point |
 | `bvh`         | `Bvh::build` plus `query_aabb` through both buffer constructors (`from_buffers`, `from_buffers_f64`); asserts every hit is a live triangle |
 | `boolean`     | `boolean_plan` plus `apply_boolean` on soup pairs (input rejection) and box pairs (split and classify) |
+| `parsers`     | The `fast-mesh` CLI's STL, OBJ, PLY and GLB parsers on arbitrary bytes; asserts the result invariants and a write and read back |
 
 Every target fuzzes the kernels' no-panic contract over small inputs; the
-`triangulate` and `bvh` targets additionally assert output invariants. Inputs
+`triangulate`, `bvh` and `parsers` targets additionally assert output invariants. Inputs
 are finite and bounded (see
 [`common.rs`](fuzz_targets/common.rs)); wider input spaces (non-finite
 coordinates, larger meshes) are future work once the current ones run clean.
 
-There are no file-format parsers in Rust to fuzz (STL/OBJ/PLY live in
-TypeScript): the buffer constructors are the parsers here, and the `bvh`
-target covers both.
+The package's file parsers live in TypeScript; in Rust, the buffer constructors
+(covered by the `bvh` target) and the CLI's file parsers (the `parsers` target)
+are the ones to fuzz.
 
 ## Running locally
 
