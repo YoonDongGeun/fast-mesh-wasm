@@ -1,5 +1,15 @@
 # fast-mesh-wasm
 
+## 0.5.2
+
+### Patch Changes
+
+- [#159](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/159) [`b2ac736`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/b2ac7369b6186a049078320d0e3db8817845392b) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add `scene.repair(mesh, { kind: "auto" })`: weld, remove degenerate, orient, remove small components and fill holes as one transaction (one undo step), with a report per stage. On `Scene`, `WorkerScene` and the store.
+
+- [#162](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/162) [`19a2dc7`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/19a2dc767083f03fc79aa734125d7d2fd8d1a89e) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Mesh registration. `scene.register(moving, fixed, { maxIterations, tolerance, overlap, maxDistance, maxSamples, apply })` rigidly aligns one mesh to another by trimmed point-to-plane ICP, starting from their current placements, and returns `{ placement, rmse, iterations, converged, status, applied, samples, inliers, conditioning }`. A converged result becomes the moving mesh's placement as one undo step (`apply: false` only returns it); a result that did not converge is never applied. Surfaces that do not determine the alignment, such as a plane sliding along itself, report `status: "underconstrained"` and `converged: false`. Only rotation and translation are solved: the moving scale is kept and the fixed scale followed. Also on `WorkerScene` (async).
+
+- [#161](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/161) [`89cb449`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/89cb44918799788e264a38c9ecae4a663db672f8) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add a UV channel end to end: `addMesh(positions, indices, { uvs })`, zero-copy `views(mesh).uvs()`, a `setUvs` edit op, `TEXCOORD_0` through glTF import and export (external buffers and Draco included), and `bindMesh`'s `uv` attribute and `map` option. Every operation keeps UVs aligned or drops them undoably (`docs/uv-channel.md`); weld keeps seams apart. Meshes without UVs behave as before.
+
 ## 0.5.1
 
 ### Patch Changes
