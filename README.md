@@ -631,16 +631,18 @@ Files are `.stl` (binary or ASCII), `.obj`, `.ply` (ASCII or binary little-endia
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Success. |
-| `1` | The operation or a file failed: malformed or truncated input, I/O, inputs a boolean refuses, an empty result. |
+| `1` | The operation or a file failed: malformed or truncated input, I/O, inputs a boolean refuses, an empty result, an invalid boolean result. |
 | `2` | Usage error: bad arguments, an unsupported extension, or an output that names an input without `--force`. |
 
 Reports go to stdout and diagnostics to stderr. With `--format json`, stdout holds one JSON object on success and nothing on failure, so a script can check the exit code and then parse. A hole `repair` leaves open is not a failure: it exits `0`, counts the hole in the report (`skipped`, `failed`) and warns on stderr.
 
 The output appears whole or not at all: it is written beside the target and renamed over it when complete, so a failed run leaves any existing file untouched.
 
-`boolean` refuses what the engine cannot resolve with `invalid input: boolean intersection too complex` (exit `1`); at present that includes many overlaps of curved surfaces, so check it on your data. Its report says whether the result is `closed`, and it warns on stderr when not.
+`boolean` refuses what the engine cannot resolve with `invalid input: boolean intersection too complex` (exit `1`); at present that includes many overlaps of curved surfaces, so check it on your data.
 
-Limits: a `.glb` becomes one mesh, with its node placements baked and its primitives merged. Draco and meshopt compression, GPU instancing, sparse accessors and buffers outside the GLB body are refused with an error. JSON `.gltf`, big-endian PLY and UVs are not supported. Other attributes (normals, colors, materials) are not carried across a conversion.
+`boolean` also checks its result before writing. One that is open, non-manifold or has orientation conflicts fails with `the engine produced an invalid result` and its defect counts (exit `1`), leaving any existing output untouched, even with `--force`. Today's engine produces such results for some inputs, including overlapping cubes depending on how their faces are triangulated ([#165](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/165)). The check is structural: it does not compare the result against the shape it should have.
+
+Limits: a `.glb` becomes one mesh, with its node placements baked and its primitives merged. Draco and meshopt compression, GPU instancing, sparse accessors and buffers outside the GLB body are refused with an error, as is a file whose nodes reuse their meshes for more than 1,048,576 node-primitive pairs (or file size / 16, if larger). JSON `.gltf`, big-endian PLY and UVs are not supported. Other attributes (normals, colors, materials) are not carried across a conversion.
 
 ## Supported environments
 
