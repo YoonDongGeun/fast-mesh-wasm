@@ -19,6 +19,47 @@ const IDENTITY = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 // A quarter turn about +z, row-major.
 const QUARTER_Z = [0, -1, 0, 1, 0, 0, 0, 0, 1];
 
+/**
+ * A lumpy closed surface without symmetries: a UV sphere pushed out by an
+ * analytic radius and squashed per axis, optionally moved by `shift`.
+ */
+function lump(stacks: number, slices: number) {
+  const point = (x: number, y: number, z: number) => {
+    const r = 1 + 0.25 * Math.sin(3 * x + 1) * Math.cos(2 * y) + 0.15 * Math.sin(4 * z);
+    return [1.3 * r * x, 0.9 * r * y, 0.6 * r * z];
+  };
+  const positions = [...point(0, 0, 1)];
+  for (let i = 1; i < stacks; i++) {
+    const phi = (Math.PI * i) / stacks;
+    for (let j = 0; j < slices; j++) {
+      const a = (2 * Math.PI * j) / slices;
+      positions.push(...point(Math.sin(phi) * Math.cos(a), Math.sin(phi) * Math.sin(a), Math.cos(phi)));
+    }
+  }
+  positions.push(...point(0, 0, -1));
+  const south = 1 + (stacks - 1) * slices;
+  const ring = (i: number, j: number) => 1 + (i - 1) * slices + (j % slices);
+  const indices: number[] = [];
+  for (let j = 0; j < slices; j++) {
+    indices.push(0, ring(1, j), ring(1, j + 1), south, ring(stacks - 1, j + 1), ring(stacks - 1, j));
+    for (let i = 1; i < stacks - 1; i++) {
+      indices.push(ring(i, j), ring(i + 1, j), ring(i + 1, j + 1), ring(i, j), ring(i + 1, j + 1), ring(i, j + 1));
+    }
+  }
+  return { positions, indices };
+}
+
+/** A small rotation about z, row-major. */
+function smallTurn(angle: number): number[] {
+  const [s, c] = [Math.sin(angle), Math.cos(angle)];
+  return [c, -s, 0, s, c, 0, 0, 0, 1];
+}
+
+function expectNear(got: readonly number[], want: readonly number[], tol: number) {
+  expect(got.length).toBe(want.length);
+  got.forEach((v, i) => expect(Math.abs(v - want[i])).toBeLessThan(tol));
+}
+
 function codeOf(fn: () => unknown): string {
   try {
     fn();
@@ -435,6 +476,125 @@ describe("Scene", () => {
       "INVALID_ARGUMENT",
     );
     expect(s.triangleCount(mesh)).toBe(12);
+  });
+
+  it("register_recovers_a_known_placement_and_undoes_as_one_step", () => {
+    const s = scene();
+    const { positions, indices } = lump(32, 64);
+    const fixed = s.addMesh(positions, indices);
+    const moving = s.addMesh(positions, indices);
+    const start = { rotation: smallTurn(0.08), translation: [0.05, -0.04, 0.03] as const, scale: [1, 1, 1] as const };
+    s.setPlacement(moving, { ...start, translation: [...start.translation], scale: [...start.scale] });
+    const r = s.register(moving, fixed);
+    expect(r.status).toBe("converged");
+    expect(r.converged).toBe(true);
+    expect(r.applied).toBe(true);
+    expect(r.rmse).toBeLessThan(1e-5);
+    expect(r.iterations).toBeGreaterThan(0);
+    expect(r.iterations).toBeLessThanOrEqual(50);
+    expect(r.samples).toBeGreaterThan(0);
+    expect(r.inliers).toBe(r.samples);
+    expect(r.conditioning).toBeGreaterThan(1e-6);
+    expectNear(r.placement.rotation as number[], IDENTITY, 1e-5);
+    expectNear(r.placement.translation, [0, 0, 0], 1e-5);
+    expect(r.placement.scale).toEqual([1, 1, 1]);
+    expect(s.placement(moving)).toEqual(r.placement);
+    // One undo step back to the start, and redo returns the result.
+    s.undo();
+    expectNear(s.placement(moving).rotation as number[], start.rotation, 1e-12);
+    expectNear(s.placement(moving).translation, start.translation, 1e-12);
+    s.redo();
+    expect(s.placement(moving)).toEqual(r.placement);
+  });
+
+  it("register_apply_false_leaves_the_scene_alone", () => {
+    const s = scene();
+    const { positions, indices } = lump(16, 32);
+    const fixed = s.addMesh(positions, indices);
+    const moving = s.addMesh(positions, indices);
+    const start = { rotation: smallTurn(0.05), translation: [0.04, 0, 0] as [number, number, number] };
+    s.setPlacement(moving, start);
+    const before = s.placement(moving);
+    const r = s.register(moving, fixed, { apply: false, maxIterations: 40, tolerance: 1e-7, maxSamples: 500 });
+    expect(r.converged).toBe(true);
+    expect(r.applied).toBe(false);
+    expect(r.samples).toBe(500);
+    expectNear(r.placement.translation, [0, 0, 0], 1e-4);
+    expect(s.placement(moving)).toEqual(before);
+  });
+
+  it("register_reports_a_plane_sliding_in_its_plane_as_not_converged", () => {
+    const s = scene();
+    const sheet = (n: number) => {
+      const positions: number[] = [];
+      const indices: number[] = [];
+      for (let y = 0; y <= n; y++) {
+        for (let x = 0; x <= n; x++) {
+          positions.push(x, y, 0);
+        }
+      }
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          const a = y * (n + 1) + x;
+          indices.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+        }
+      }
+      return { positions, indices };
+    };
+    const big = sheet(20);
+    const small = sheet(6);
+    const fixed = s.addMesh(big.positions, big.indices);
+    const moving = s.addMesh(small.positions, small.indices);
+    s.setPlacement(moving, { rotation: IDENTITY, translation: [4, 3, 0.5] });
+    const before = s.placement(moving);
+    const r = s.register(moving, fixed);
+    expect(r.status).toBe("underconstrained");
+    expect(r.converged).toBe(false);
+    expect(r.applied).toBe(false);
+    expect(s.placement(moving)).toEqual(before);
+    // Every number finite: z is fixed and the slide left alone.
+    expectNear(r.placement.translation, [4, 3, 0], 1e-5);
+    expect(Number.isFinite(r.rmse)).toBe(true);
+    expect(r.conditioning).toBeLessThan(1e-6);
+  });
+
+  it("register_keeps_the_moving_scale_and_measures_in_world_units", () => {
+    const s = scene();
+    const { positions, indices } = lump(24, 48);
+    const fixed = s.addMesh(positions, indices);
+    // The same shape stored at half size, placed with a scale of 2.
+    const moving = s.addMesh(positions.map((v) => v / 2), indices);
+    s.setPlacement(moving, { rotation: smallTurn(0.04), translation: [0.03, 0.02, -0.03], scale: [2, 2, 2] });
+    const r = s.register(moving, fixed);
+    expect(r.converged).toBe(true);
+    expect(r.placement.scale).toEqual([2, 2, 2]);
+    expectNear(r.placement.translation, [0, 0, 0], 1e-4);
+    // maxIterations 0 only measures: a lift of 0.5 is 0.5 off a flat patch.
+    const plane = s.addMesh([-9, -9, 0, 9, -9, 0, 9, 9, 0, -9, 9, 0], [0, 1, 2, 0, 2, 3]);
+    const patch = s.addMesh([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0], [0, 1, 2, 0, 2, 3]);
+    s.setPlacement(patch, { rotation: IDENTITY, translation: [0, 0, 0.5] });
+    const m = s.register(patch, plane, { maxIterations: 0 });
+    expect(m.status).toBe("maxIterations");
+    expect(m.iterations).toBe(0);
+    expect(m.rmse).toBeCloseTo(0.5, 6);
+  });
+
+  it("register_rejects_bad_input", () => {
+    const s = scene();
+    const { positions, indices } = lump(8, 16);
+    const a = s.addMesh(positions, indices);
+    const b = s.addMesh(positions, indices);
+    expect(codeOf(() => s.register(a, a))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { overlap: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { overlap: 1.5 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { tolerance: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { maxIterations: -1 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { maxIterations: Number.NaN }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { maxSamples: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, b, { maxDistance: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register({} as MeshHandle, b))).toBe("INVALID_ARGUMENT");
+    s.removeMesh(b);
+    expect(codeOf(() => s.register(a, b))).toBe("UNKNOWN_MESH");
   });
 
   it("measure_reports_area_and_volume", () => {

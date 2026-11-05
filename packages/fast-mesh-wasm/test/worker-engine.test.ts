@@ -313,6 +313,33 @@ describe("worker engine", () => {
     expectMirror(mirrors.get(1), ref, ra);
   });
 
+  it("register_replies_and_reports_the_placement_change", async () => {
+    const h = harness();
+    const ref = new Scene();
+    const box = {
+      positions: Float64Array.from([0, 0, 0, 3, 0, 0, 3, 2, 0, 0, 2, 0, 0, 0, 1, 3, 0, 1, 3, 2, 1, 0, 2, 1]),
+      indices: Uint32Array.from([
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+      ]),
+    };
+    const rf = ref.addMesh(box.positions, box.indices);
+    const rm = ref.addMesh(box.positions, box.indices);
+    const translation: [number, number, number] = [0.05, -0.03, 0.02];
+    ref.setPlacement(rm, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation });
+    await h.send([addMesh(1, box), addMesh(2, box)]);
+    const r = await h.send([
+      { kind: "setPlacement", rev: rev(), id: 2, rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation, key: "placement:2" },
+      { kind: "register", rev: rev(), moving: 2, fixed: 1, payload: {}, qid: 9 },
+    ]);
+    const want = ref.register(rm, rf);
+    expect(want.converged).toBe(true);
+    expect(replyOf(r, 9)).toEqual({ qid: 9, ok: true, value: want });
+    expect(r.placements.find((p) => p.id === 2)!.translation).toEqual(want.placement.translation);
+    // A mesh the engine does not know rejects under the query id.
+    const bad = await h.send([{ kind: "register", rev: rev(), moving: 2, fixed: 77, payload: {}, qid: 10 }]);
+    expect(replyOf(bad, 10)).toMatchObject({ qid: 10, ok: false });
+  });
+
   it("join_bridges_and_removes_source", async () => {
     const h = harness();
     const ref = scene();

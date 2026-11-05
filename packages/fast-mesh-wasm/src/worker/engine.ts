@@ -22,6 +22,7 @@ import {
   type FieldHandle,
   fieldSteps,
   type JoinOptions,
+  type RegisterOptions,
   meshAdds,
   type MeshChange,
   type MeshHandle,
@@ -878,6 +879,8 @@ class Engine {
         return this.#pending(req.id);
       case "join":
         return this.#pending(req.target, req.source);
+      case "register":
+        return this.#pending(req.moving, req.fixed);
       case "coloring":
         return this.#pending(req.id) || (req.rule !== null && this.#fieldPending(req.rule?.field));
       case "fetchFieldValues":
@@ -1257,7 +1260,8 @@ class Engine {
    * Whether the queued `req` makes a field step unit over `meshes` (the
    * meshes its fields are on and measured to) stale (§6.1): a drag move
    * (only with `moves`: within the starvation guard), a drag cancel or a
-   * placement, an edit, repair, compaction, join or removal of one of them,
+   * placement, a registration of one of them, an edit, repair, compaction,
+   * join or removal of one of them,
    * an undo or redo, or the removal of a field between two of them.
    */
   #makesStale(req: Request, meshes: Set<ClientId>, moves: boolean): boolean {
@@ -1276,6 +1280,8 @@ class Engine {
         return meshes.has(req.id);
       case "join":
         return meshes.has(req.target) || meshes.has(req.source);
+      case "register":
+        return meshes.has(req.moving);
       case "undo":
       case "redo":
         return true;
@@ -1694,6 +1700,11 @@ class Engine {
         if (req.qid !== undefined) {
           b.replies.push({ qid: req.qid, ok: true, value });
         }
+        return;
+      }
+      case "register": {
+        const value = s.register(this.#mesh(req.moving), this.#mesh(req.fixed), req.payload as RegisterOptions);
+        b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
       case "compact":
