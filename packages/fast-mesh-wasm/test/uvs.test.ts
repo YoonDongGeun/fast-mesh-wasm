@@ -127,6 +127,55 @@ describe("operations", () => {
   });
 });
 
+describe("cutByPlane across a UV seam", () => {
+  /** The box with its +x face its own island: slots 8 to 11 repeat corners 1, 2, 6 and 5. */
+  const seamedBox = (x = 0) => {
+    const { positions, indices } = box(x);
+    const split = new Map([[1, 8], [2, 9], [6, 10], [5, 11]]);
+    const extra = [1, 2, 6, 5].flatMap((v) => Array.from(positions.subarray(3 * v, 3 * v + 3)));
+    const faces = Uint32Array.from(indices);
+    for (let i = 24; i < 30; i++) {
+      faces[i] = split.get(faces[i]) as number;
+    }
+    return {
+      positions: Float64Array.from([...positions, ...extra]),
+      indices: faces,
+      uvs: Float32Array.from({ length: 24 }, (_, i) => i / 24),
+    };
+  };
+  const plane = { origin: [0, 0.5, 0] as [number, number, number], normal: [0, 1, 0] as [number, number, number] };
+
+  it("caps both sides, reports it and undoes", () => {
+    const s = new Scene();
+    const { positions, indices, uvs } = seamedBox();
+    const m = s.addMesh(positions, indices, { uvs, normals: false });
+    const r = s.cutByPlane(m, plane);
+    expect(r.capTriangles).toBeGreaterThanOrEqual(4);
+    expect(s.triangleCount(m)).toBe(r.keptTriangles);
+    expect(s.triangleCount(r.removed)).toBe(r.removedTriangles);
+    expect(s.views(m).uvs()?.length).toBe(2 * s.vertexSlots(m));
+    expect(s.views(r.removed).uvs()?.length).toBe(2 * s.vertexSlots(r.removed));
+    // Closed by position: a boolean checks that first, and rejects an open mesh.
+    // Far apart, so this tests the check and not the intersection.
+    const moved = seamedBox(5);
+    const tool = s.addMesh(moved.positions, moved.indices, { uvs: moved.uvs, normals: false });
+    expect(() => s.boolean(r.removed, tool, "union")).not.toThrow();
+    s.undo();
+    s.undo();
+    expect(s.triangleCount(m)).toBe(12);
+    expect(s.vertexCount(m)).toBe(12);
+    s.free();
+  });
+
+  it("leaves it open when asked, with nothing to report", () => {
+    const s = new Scene();
+    const { positions, indices, uvs } = seamedBox();
+    const m = s.addMesh(positions, indices, { uvs, normals: false });
+    expect(s.cutByPlane(m, plane, { cap: false }).capTriangles).toBe(0);
+    s.free();
+  });
+});
+
 describe("edit", () => {
   it("setUvs writes added vertices through refs, undoably", () => {
     const s = new Scene();

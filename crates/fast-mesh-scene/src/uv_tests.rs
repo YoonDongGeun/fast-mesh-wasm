@@ -286,6 +286,86 @@ fn cut_gives_both_sides_aligned_uvs_and_undoes() {
     );
 }
 
+/// Vertices, triangles, positions and UVs of `id`, for comparing states.
+fn state(scene: &Scene, id: MeshId) -> (usize, usize, Vec<[f32; 3]>, Vec<f32>) {
+    let m = scene.mesh(id).unwrap();
+    let alive = (0..m.vertex_slots() as u32).filter(|&v| m.is_vertex_alive(v));
+    let positions = alive.clone().map(|v| m.position(v).unwrap()).collect();
+    let uvs = m.uvs().unwrap();
+    let uvs = alive.flat_map(|v| [uvs[2 * v as usize], uvs[2 * v as usize + 1]]);
+    (
+        m.vertex_count(),
+        m.triangle_count(),
+        positions,
+        uvs.collect(),
+    )
+}
+
+#[test]
+fn a_cut_across_a_seam_closes_both_sides_reports_the_cap_and_undoes() {
+    let mut scene = Scene::new(SceneOptions::default());
+    let a = add(&mut scene, seamed_box(0.0, true));
+    let whole = volume6(scene.mesh(a).unwrap());
+    let before = state(&scene, a);
+    // Crosses the seamed face, whose corners are split.
+    let plane = Plane::new([0.0, 0.5, 0.0], [0.0, 1.0, 0.0]).unwrap();
+    let r = scene
+        .cut_by_plane(a, &CutOptions { plane, cap: true })
+        .unwrap();
+    let (kept, removed) = (scene.mesh(a).unwrap(), scene.mesh(r.added).unwrap());
+    // Each of the two rims closes against a seam, with at least two triangles.
+    assert!(r.cap_triangles >= 4, "{r:?}");
+    assert_eq!(r.kept_triangles, kept.triangle_count());
+    assert_eq!(r.removed_triangles, removed.triangle_count());
+    // Half the solid on each side, wound outward: a side left open or a cap
+    // wound wrong would not add up.
+    let (vk, vr) = (volume6(kept), volume6(removed));
+    assert!((vk - whole / 2.0).abs() < 1e-4, "{vk} of {whole}");
+    assert!((vr - whole / 2.0).abs() < 1e-4, "{vr} of {whole}");
+    let after = state(&scene, a);
+
+    // The undo brings back the seam exactly, and the redo the cap.
+    assert!(scene.undo().unwrap());
+    assert_eq!(state(&scene, a), before);
+    assert!(scene.redo().unwrap());
+    assert_eq!(state(&scene, a), after);
+
+    // What comes out is closed by position, which a boolean checks for itself.
+    let tool = add(&mut scene, seamed_box(0.25, true));
+    let b = scene.boolean(a, tool, BooleanOp::Union).unwrap();
+    assert!(b.uvs_dropped);
+    assert!(boundary_loops(scene.mesh(a).unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_cut_across_a_seam_changes_nothing() {
+    // The seamed face wound against the rest: closed by position, but the rim
+    // runs against itself. The seamed face is the last two triangles.
+    let seamed = seamed_box(0.0, true);
+    let positions: Vec<f32> = seamed.positions().iter().flatten().copied().collect();
+    let mut triangles = seamed.triangles().to_vec();
+    let face = triangles.len() - 2;
+    for t in &mut triangles[face..] {
+        t.swap(1, 2);
+    }
+    let indices: Vec<u32> = triangles.iter().flatten().copied().collect();
+    let mut mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+    mesh.add_uvs(seamed.uvs().unwrap()).unwrap();
+    let mut scene = Scene::new(SceneOptions::default());
+    let a = add(&mut scene, mesh);
+    let before = state(&scene, a);
+    let plane = Plane::new([0.0, 0.5, 0.0], [0.0, 1.0, 0.0]).unwrap();
+    let e = scene
+        .cut_by_plane(a, &CutOptions { plane, cap: true })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SceneError::Ops(OpsError::InvalidInput("a cut rim cannot be capped"))
+    );
+    assert_eq!(state(&scene, a), before);
+    assert!(!scene.undo().unwrap(), "nothing was recorded");
+}
+
 /// Two open quads facing each other, for a join.
 fn quads(a_uvs: bool, b_uvs: bool) -> (Scene, MeshId, MeshId, JoinOptions) {
     let mut a = Mesh::from_buffers(

@@ -12,9 +12,20 @@
 //! the surrounding density but not faired (`fair: false`). They follow the
 //! cut plane exactly instead of continuing the surrounding curvature.
 //!
-//! Only positions and triangles cross over: the removed mesh takes no
-//! channels, and new vertices (on both sides) take channel defaults, except
-//! that crossing vertices added to the kept mesh interpolate their parents.
+//! Only positions, triangles and UVs cross over: the removed mesh takes no
+//! other channels. Crossing vertices interpolate their parents.
+//!
+//! UV seams: on a mesh with UVs a rim is read by position, so a seam that
+//! crosses the plane does not stop it from closing. The rim's vertices stay
+//! the walls': where a seam splits a rim position in two the cap takes one of
+//! the two, and the cap's edge next to it closes against the other side's wall
+//! by position only, like any seam. So the cap's UVs are the wall's along the
+//! rim, one side's at a seam, and the weighted mean of the rim inside: the
+//! patch blends across the seam, and it is no island of its own. A rim that
+//! closes by position but cannot be capped (its walls wound against each
+//! other, or two rims or more than two sheets at one position) is an error.
+//! A mesh without UVs has no seams: it is read by vertex index only, and split
+//! vertices on it are a real boundary (weld it first).
 //!
 //! [`fill_holes`]: crate::fill_holes
 
@@ -23,16 +34,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use fast_mesh_query::Plane;
 use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, VertexId};
 
-use crate::fill::FillOptionsBuilder;
+use crate::fill::{FillOptions, FillOptionsBuilder, Plan};
+use crate::fill_dp::triangulate_loop;
 use crate::fill_holes;
-use crate::topology::{BoundaryLoop, LoopId, boundary_loops};
+use crate::refine::refine;
+use crate::topology::{BoundaryLoop, EdgeMap, LoopId, VertexFans, boundary_loops, point};
+use crate::weld::weld_roots;
 use crate::{OpsError, Result, filled, push, reserve};
 
 /// Options for [`cut_by_plane`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CutOptions {
-    /// Close both openings with flat, unfaired patches. Without it both
-    /// parts keep the open rim the cut leaves.
+    /// Close both openings with flat, unfaired patches, across UV seams on a
+    /// mesh with UVs. Without it both parts keep the open rim the cut leaves.
     pub cap: bool,
 }
 
@@ -72,10 +86,17 @@ fn oom() -> OpsError {
 /// split along it; with `options.cap` both openings are closed with flat,
 /// unfaired [`fill_holes`](crate::fill_holes) patches over the cut rim.
 ///
+/// A rim is capped when it closes: by vertex index, or, on a mesh with UVs,
+/// by exact position across seams (see the module docs for the cap's UVs).
+/// One that runs into a real boundary of an open mesh stays open. On a mesh
+/// without UVs split vertices are such a boundary: weld them first.
+///
 /// # Errors
 /// - [`OpsError::InvalidInput`] when the plane does not cut the mesh (every
 ///   triangle on one side), when a cut point leaves `f32` range, or, with
-///   `cap`, when a rim loop cannot be triangulated.
+///   `cap`, when a rim loop cannot be triangulated, or closes by position
+///   with its walls wound against each other, or two rims or more than two
+///   sheets at one position.
 /// - [`OpsError::StaleLoops`] when a rim loop vanished between listing and
 ///   filling (defensive: both come from the same mesh state).
 /// - [`OpsError::Store`] when memory runs out. Nothing is written then: the
@@ -116,6 +137,8 @@ pub fn cut_by_plane(
     }
     // One crossing per crossed edge, in id order so that both sides agree.
     // An endpoint exactly on the plane is the crossing: no new vertex.
+    // On a mesh with UVs, rims close by exact position.
+    let by_position = mesh.uvs().is_some();
     let mut at: BTreeMap<(VertexId, VertexId), VertexId> = BTreeMap::new();
     let mut point_of: BTreeMap<(VertexId, VertexId), [f64; 3]> = BTreeMap::new();
     for &t in &straddling {
@@ -138,8 +161,7 @@ pub fn cut_by_plane(
             } else if sb == 0.0 {
                 at.insert(e, b);
             } else {
-                let f = sa / (sa - sb);
-                point_of.insert(e, std::array::from_fn(|k| pa[k] + f * (pb[k] - pa[k])));
+                point_of.insert(e, crossing_point(pa, pb, sa, sb, by_position));
             }
         }
     }
@@ -284,7 +306,8 @@ pub fn cut_by_plane(
     // Close both openings with flat, unfaired patches over the cut rim.
     let mut cap_triangles = 0;
     if options.cap {
-        cap_triangles += cap_rim(tx, &kept_cut)?;
+        let rims = find_rims(tx.mesh(), &kept_cut, plane)?;
+        cap_triangles += cap_rims(tx, &rims)?;
     }
     let kept_triangles = tx.mesh().triangle_count();
 
@@ -311,29 +334,11 @@ pub fn cut_by_plane(
         removed.add_uvs(&rem_uvs)?;
     }
     if options.cap {
-        let loops = boundary_loops(&removed)?;
-        let mut rim: Vec<LoopId> = Vec::new();
-        for l in &loops {
-            if is_cut_rim(l, &rem_cut) {
-                push(&mut rim, l.id)?;
-            }
-        }
-        if !rim.is_empty() {
+        let rims = find_rims(&removed, &rem_cut, plane)?;
+        if !rims.whole.is_empty() || !rims.across_seams.is_empty() {
             let mut rtx = removed.begin_edit();
-            let before = rtx.mesh().triangle_count();
-            let report = fill_holes(
-                &mut rtx,
-                &FillOptionsBuilder::default()
-                    .loops(rim)
-                    .fair(false)
-                    .allow_unclean(true)
-                    .build(),
-            )?;
-            if !report.skipped.is_empty() || !report.failed.is_empty() {
-                return Err(OpsError::InvalidInput("a cut rim cannot be capped"));
-            }
+            cap_triangles += cap_rims(&mut rtx, &rims)?;
             rtx.commit()?;
-            cap_triangles += removed.triangle_count() - before;
         }
     }
     let removed_triangles = removed.triangle_count();
@@ -346,6 +351,17 @@ pub fn cut_by_plane(
             cap_triangles,
         },
     })
+}
+
+/// Where the plane crosses the edge `a`-`b`, whose ends have signed distances
+/// `sa` and `sb`. With `by_position`, the result does not depend on which end
+/// comes first: the ends are taken in position order, so the two sides of a
+/// seam, which hold the same edge under different ids, get the same point.
+fn crossing_point(a: [f64; 3], b: [f64; 3], sa: f64, sb: f64, by_position: bool) -> [f64; 3] {
+    let swap = by_position && b < a;
+    let (a, b, sa, sb) = if swap { (b, a, sb, sa) } else { (a, b, sa, sb) };
+    let f = sa / (sa - sb);
+    std::array::from_fn(|k| a[k] + f * (b[k] - a[k]))
 }
 
 /// The index of the lone vertex, whose side differs from the other two.
@@ -431,38 +447,228 @@ fn loop_edges(v: &[VertexId]) -> Vec<(u32, u32)> {
     out
 }
 
-/// Fills the rim loops of the kept mesh (every edge a cut edge) with a
-/// flat, unfaired patch. Returns the cap triangles added.
-fn cap_rim(tx: &mut Transaction, cut: &BTreeSet<(VertexId, VertexId)>) -> Result<usize> {
-    let loops = boundary_loops(tx.mesh())?;
-    let mut rim: Vec<LoopId> = Vec::new();
+/// The openings a cut left, ready to cap.
+struct Rims {
+    /// Boundary loops of nothing but cut edges.
+    whole: Vec<LoopId>,
+    /// On a mesh with UVs, the other boundary edges that lie along the cut,
+    /// each in its boundary loop's order.
+    across_seams: Vec<(VertexId, VertexId)>,
+}
+
+/// The rims of `mesh` after a cut along `plane` with cut edges `cut`. A side
+/// that keeps an edge in the plane marks it cut only if its neighbour across
+/// the edge straddles the plane, and the neighbour past a seam is another edge.
+/// So on a mesh with UVs a boundary edge with both ends exactly in the plane
+/// counts too.
+fn find_rims(mesh: &Mesh, cut: &BTreeSet<(VertexId, VertexId)>, plane: &Plane) -> Result<Rims> {
+    let loops = boundary_loops(mesh)?;
+    let seamed = mesh.uvs().is_some();
+    let in_plane = |v: VertexId| plane.signed_distance(point(mesh, v)) == 0.0;
+    let mut rims = Rims {
+        whole: Vec::new(),
+        across_seams: Vec::new(),
+    };
     for l in &loops {
-        if l.closed && loop_edges(&l.vertices).iter().all(|e| cut.contains(e)) {
-            push(&mut rim, l.id)?;
+        if is_cut_rim(l, cut) {
+            push(&mut rims.whole, l.id)?;
+        } else if seamed {
+            for e in loop_edges(&l.vertices) {
+                if cut.contains(&e) || (in_plane(e.0) && in_plane(e.1)) {
+                    push(&mut rims.across_seams, e)?;
+                }
+            }
         }
     }
-    if rim.is_empty() {
-        return Ok(0);
-    }
+    Ok(rims)
+}
+
+/// Caps `rims` with flat, unfaired patches. Returns the triangles added.
+fn cap_rims(tx: &mut Transaction, rims: &Rims) -> Result<usize> {
     let before = tx.mesh().triangle_count();
-    let report = fill_holes(
-        tx,
-        &FillOptionsBuilder::default()
-            .loops(rim)
-            .fair(false)
-            .allow_unclean(true)
-            .build(),
-    )?;
-    if !report.skipped.is_empty() || !report.failed.is_empty() {
-        return Err(OpsError::InvalidInput("a cut rim cannot be capped"));
+    if !rims.whole.is_empty() {
+        let report = fill_holes(
+            tx,
+            &FillOptionsBuilder::default()
+                .loops(rims.whole.clone())
+                .fair(false)
+                .allow_unclean(true)
+                .build(),
+        )?;
+        if !report.skipped.is_empty() || !report.failed.is_empty() {
+            return Err(OpsError::InvalidInput("a cut rim cannot be capped"));
+        }
+    }
+    if !rims.across_seams.is_empty() {
+        cap_across_seams(tx, &rims.across_seams)?;
     }
     Ok(tx.mesh().triangle_count() - before)
+}
+
+/// A rim that closes by position: at each step, the position's weld root and
+/// the vertex whose wall edge leaves it.
+type SeamRim = Vec<(VertexId, VertexId)>;
+
+/// The closed rims among boundary `edges` of `mesh`, reading vertices at one
+/// exact position (`roots`) as one. An edge group with an odd position runs
+/// into a real boundary and has no rim. One with only even positions that
+/// cannot be walked as a single cycle in its triangles' direction is an error.
+/// Two edges at one pair of positions, running opposite ways, already close
+/// against each other, like a seam in the plane: they are no part of a rim.
+fn seam_rims(
+    mesh: &Mesh,
+    edges: &[(VertexId, VertexId)],
+    roots: &[VertexId],
+) -> Result<Vec<SeamRim>> {
+    let map = EdgeMap::build(mesh)?;
+    // The directed edges between positions, each with its `from` vertices.
+    let mut directed: BTreeMap<(VertexId, VertexId), Vec<VertexId>> = BTreeMap::new();
+    for &(a, b) in edges {
+        // Only a true boundary edge has one triangle to take a direction from.
+        let [t] = map.triangles(a, b) else {
+            continue;
+        };
+        let [x, y, z] = mesh.triangles()[*t as usize];
+        let forward = [(x, y), (y, z), (z, x)].contains(&(a, b));
+        let (from, to) = if forward { (a, b) } else { (b, a) };
+        let (ra, rb) = (roots[from as usize], roots[to as usize]);
+        if ra != rb {
+            directed.entry((ra, rb)).or_default().push(from);
+        }
+    }
+    // Per position: the edges leaving it, how many arrive, and its neighbours.
+    let mut leaving: BTreeMap<VertexId, Vec<(VertexId, VertexId)>> = BTreeMap::new();
+    let mut arriving: BTreeMap<VertexId, usize> = BTreeMap::new();
+    let mut neighbours: BTreeMap<VertexId, Vec<VertexId>> = BTreeMap::new();
+    for (&(ra, rb), froms) in &directed {
+        let closed = directed.get(&(rb, ra)).map_or(0, Vec::len);
+        for &from in froms.iter().skip(closed) {
+            leaving.entry(ra).or_default().push((from, rb));
+            *arriving.entry(rb).or_default() += 1;
+            neighbours.entry(ra).or_default().push(rb);
+            neighbours.entry(rb).or_default().push(ra);
+        }
+    }
+    let mut rims: Vec<SeamRim> = Vec::new();
+    let mut seen: BTreeSet<VertexId> = BTreeSet::new();
+    let mut group: Vec<VertexId> = Vec::new();
+    for &start in neighbours.keys() {
+        if !seen.insert(start) {
+            continue;
+        }
+        group.clear();
+        push(&mut group, start)?;
+        let mut next = 0;
+        while let Some(&r) = group.get(next) {
+            next += 1;
+            for &n in &neighbours[&r] {
+                if seen.insert(n) {
+                    push(&mut group, n)?;
+                }
+            }
+        }
+        if group.iter().any(|r| neighbours[r].len() % 2 == 1) {
+            continue;
+        }
+        let single = |r: &VertexId| {
+            leaving.get(r).is_some_and(|l| l.len() == 1) && arriving.get(r) == Some(&1)
+        };
+        if !group.iter().all(single) {
+            return Err(OpsError::InvalidInput("a cut rim cannot be capped"));
+        }
+        let mut rim: SeamRim = Vec::new();
+        reserve(&mut rim, group.len())?;
+        let mut r = start;
+        loop {
+            let (from, to) = leaving[&r][0];
+            rim.push((r, from));
+            r = to;
+            if r == start {
+                break;
+            }
+        }
+        rims.push(rim);
+    }
+    Ok(rims)
+}
+
+/// Caps the rims that close by position among `edges`. The triangulation and
+/// refinement of [`fill_holes`] read a mesh whose rim closes by index, so they
+/// run on a scratch mesh: the triangles at the rims, with coincident vertices
+/// merged. The patches then go to the real mesh on the walls' rim vertices.
+fn cap_across_seams(tx: &mut Transaction, edges: &[(VertexId, VertexId)]) -> Result<()> {
+    let mesh = tx.mesh();
+    let roots = weld_roots(mesh, 0.0)?;
+    let rims = seam_rims(mesh, edges, &roots)?;
+    if rims.is_empty() {
+        return Ok(());
+    }
+    let mut on_rim = filled(mesh.vertex_slots(), false)?;
+    for rim in &rims {
+        for &(r, _) in rim {
+            on_rim[r as usize] = true;
+        }
+    }
+    const NONE: u32 = u32::MAX;
+    let mut local = filled(mesh.vertex_slots(), NONE)?;
+    let mut positions: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for t in 0..mesh.triangle_slots() as TriangleId {
+        let Some(tri) = mesh.triangle(t) else {
+            continue;
+        };
+        let tri = tri.map(|v| roots[v as usize]);
+        let distinct = tri[0] != tri[1] && tri[1] != tri[2] && tri[2] != tri[0];
+        if !distinct || !tri.iter().any(|&r| on_rim[r as usize]) {
+            continue;
+        }
+        reserve(&mut indices, 3)?;
+        for r in tri {
+            if local[r as usize] == NONE {
+                local[r as usize] = (positions.len() / 3) as u32;
+                reserve(&mut positions, 3)?;
+                positions.extend(mesh.positions()[r as usize]);
+            }
+            indices.push(local[r as usize]);
+        }
+    }
+    // No origin: the scratch mesh holds the very local positions of `mesh`.
+    let scratch = Mesh::from_buffers(&positions, &indices)?;
+    let map = EdgeMap::build(&scratch)?;
+    let fans = VertexFans::build(&scratch)?;
+    let defaults = FillOptions::default();
+    let mut plan = Plan::default();
+    let mut wall = filled(positions.len() / 3, NONE)?;
+    let mut order: Vec<VertexId> = Vec::new();
+    for rim in &rims {
+        order.clear();
+        reserve(&mut order, rim.len())?;
+        for &(r, from) in rim {
+            order.push(local[r as usize]);
+            wall[local[r as usize] as usize] = from;
+        }
+        let tris = triangulate_loop(&scratch, &order, &map, defaults.dp_limit, None)?
+            .map_err(|_| OpsError::InvalidInput("a cut rim cannot be capped"))?;
+        let mut patch = refine(
+            &scratch,
+            &fans,
+            &map,
+            &order,
+            &tris,
+            defaults.max_refine_vertices,
+        )?;
+        for v in &mut patch.old {
+            *v = wall[*v as usize];
+        }
+        plan.add(&patch)?;
+    }
+    plan.write(tx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{edit, grid_without};
+    use crate::test_util::{edit, grid_without, mesh_of};
     use fast_mesh_store::Mesh;
 
     /// A closed unit cube, outward wound.
@@ -603,5 +809,460 @@ mod tests {
                 .iter()
                 .all(|p| p[0] as f64 + out.removed.origin()[0] <= 3.5 + 1e-6)
         );
+    }
+
+    // ---- caps across UV seams
+
+    /// A tube around `z` of `slices` columns and `rows` rows, wound outward,
+    /// with a UV seam: column `slices` repeats column 0 exactly, `u` runs
+    /// along the columns and `v` up the rows. With `lids` both ends are
+    /// closed by a fan around a centre vertex, so the mesh is closed by
+    /// position, though its boundary loop by index runs along the seam.
+    fn seamed_tube(slices: u32, rows: u32, lids: bool) -> Mesh {
+        let (mut positions, mut uvs, mut triangles) = (Vec::new(), Vec::new(), Vec::new());
+        let id = |i: u32, j: u32| i * (slices + 1) + j;
+        for i in 0..=rows {
+            for j in 0..=slices {
+                let a = std::f32::consts::TAU * (j % slices) as f32 / slices as f32;
+                positions.extend([a.cos(), a.sin(), i as f32]);
+                uvs.extend([j as f32 / slices as f32, i as f32 / rows as f32]);
+            }
+        }
+        for i in 0..rows {
+            for j in 0..slices {
+                let (a, b) = (id(i, j), id(i, j + 1));
+                let (c, d) = (id(i + 1, j + 1), id(i + 1, j));
+                triangles.extend([[a, b, c], [a, c, d]]);
+            }
+        }
+        if lids {
+            let bottom = (positions.len() / 3) as u32;
+            positions.extend([0.0, 0.0, 0.0, 0.0, 0.0, rows as f32]);
+            uvs.extend([0.5, 0.0, 0.5, 1.0]);
+            for j in 0..slices {
+                triangles.push([bottom, id(0, j + 1), id(0, j)]);
+                triangles.push([bottom + 1, id(rows, j), id(rows, j + 1)]);
+            }
+        }
+        let mut mesh = mesh_of(&positions, &triangles);
+        mesh.add_uvs(&uvs).unwrap();
+        mesh
+    }
+
+    /// A unit cube with every triangle its own UV island: 36 vertices, every
+    /// edge a seam.
+    fn cube_of_islands() -> Mesh {
+        let whole = cube();
+        let (mut positions, mut uvs, mut triangles) = (Vec::new(), Vec::new(), Vec::new());
+        for (t, tri) in whole.triangles().iter().enumerate() {
+            let island = t as f32;
+            let base = (positions.len() / 3) as u32;
+            for (k, &v) in tri.iter().enumerate() {
+                positions.extend(whole.position(v).unwrap());
+                uvs.extend([island / 12.0, k as f32 / 3.0]);
+            }
+            triangles.push([base, base + 1, base + 2]);
+        }
+        let mut mesh = mesh_of(&positions, &triangles);
+        mesh.add_uvs(&uvs).unwrap();
+        mesh
+    }
+
+    /// `mesh` with exactly coincident vertices merged and no channels.
+    fn welded_by_position(mesh: &Mesh) -> Mesh {
+        let roots = crate::weld::weld_roots(mesh, 0.0).unwrap();
+        let positions: Vec<f32> = mesh.positions().iter().flatten().copied().collect();
+        let triangles: Vec<[u32; 3]> = (0..mesh.triangle_slots() as TriangleId)
+            .filter_map(|t| mesh.triangle(t))
+            .map(|t| t.map(|v| roots[v as usize]))
+            .collect();
+        mesh_of(&positions, &triangles)
+    }
+
+    /// Every edge, read by position, is used once in each direction.
+    fn assert_closed_by_position(mesh: &Mesh) {
+        let welded = welded_by_position(mesh);
+        let mut uses: BTreeMap<(u32, u32), i32> = BTreeMap::new();
+        for t in 0..welded.triangle_slots() as TriangleId {
+            let Some([a, b, c]) = welded.triangle(t) else {
+                continue;
+            };
+            // A plane within rounding of a vertex can leave a triangle without
+            // area: it spans its two positions both ways, which closes nothing.
+            if a == b || b == c || c == a {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, c), (c, a)] {
+                *uses.entry((x, y)).or_default() += 1;
+            }
+        }
+        for (&(a, b), &n) in &uses {
+            assert_eq!(n, 1, "edge {a}-{b}");
+            assert_eq!(uses.get(&(b, a)), Some(&1), "edge {b}-{a} is open");
+        }
+    }
+
+    /// Cuts `mesh` with a cap and checks what any capped cut of a mesh that
+    /// is closed by position owes: both sides closed by position and wound
+    /// outward, volume kept, an honest report, aligned UVs. Returns the kept
+    /// side and the output.
+    fn assert_cut_closes(mut mesh: Mesh, plane: &Plane) -> (Mesh, CutOutput) {
+        assert_closed_by_position(&mesh);
+        let whole = volume6(&mesh);
+        let triangles = mesh.triangle_count();
+        let out = cut_kept(&mut mesh, plane, true);
+        assert_closed_by_position(&mesh);
+        assert_closed_by_position(&out.removed);
+        let (vk, vr) = (volume6(&mesh), volume6(&out.removed));
+        assert!(vk > 0.0 && vr > 0.0, "{vk} {vr}");
+        assert!(
+            (vk + vr - whole).abs() < 1e-4 * whole,
+            "{vk} + {vr} != {whole}"
+        );
+        assert_eq!(out.report.kept_triangles, mesh.triangle_count());
+        assert_eq!(out.report.removed_triangles, out.removed.triangle_count());
+        assert!(out.report.cap_triangles > 0, "{:?}", out.report);
+        assert!(mesh.triangle_count() + out.removed.triangle_count() > triangles);
+        for m in [&mesh, &out.removed] {
+            assert_eq!(m.uvs().unwrap().len(), 2 * m.vertex_slots());
+            assert!(m.uvs().unwrap().iter().all(|u| u.is_finite()));
+        }
+        (mesh, out)
+    }
+
+    #[test]
+    fn a_seam_across_the_plane_is_capped_on_both_sides() {
+        let plane = plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]);
+        let (kept, out) = assert_cut_closes(seamed_tube(16, 3, true), &plane);
+        // The seam stays: its sides are apart by index on both parts, and
+        // the cap closes against them by position.
+        assert!(!boundary_loops(&kept).unwrap().is_empty());
+        assert!(!boundary_loops(&out.removed).unwrap().is_empty());
+        // Rim vertices keep the wall's `v` (half way up), so every cap vertex
+        // blends only values with that `v`.
+        for m in [&kept, &out.removed] {
+            let uvs = m.uvs().unwrap();
+            let on_plane = (0..m.vertex_slots() as VertexId)
+                .filter(|&v| {
+                    m.position(v)
+                        .is_some_and(|p| (f64::from(p[2]) + m.origin()[2] - 1.5).abs() < 1e-5)
+                })
+                .collect::<Vec<_>>();
+            assert!(on_plane.len() >= 17, "{}", on_plane.len());
+            for v in on_plane {
+                assert!((uvs[2 * v as usize + 1] - 0.5).abs() < 1e-5, "vertex {v}");
+                assert!((0.0..=1.0).contains(&uvs[2 * v as usize]), "vertex {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_edge_a_seam_is_capped_on_both_sides() {
+        for p in [
+            plane([0.5, 0.5, 0.5], [1.0, 0.0, 0.0]),
+            plane([0.25, 0.5, 0.5], [1.0, 0.25, 0.125]),
+            plane([0.5, 0.5, 0.5], [1.0, 1.0, 1.0]),
+        ] {
+            assert_cut_closes(cube_of_islands(), &p);
+        }
+    }
+
+    #[test]
+    fn oblique_cuts_across_a_seam_close() {
+        for p in [
+            plane([0.0, 0.0, 1.5], [0.3, 0.2, 1.0]),
+            plane([0.1, 0.0, 1.2], [1.0, 0.1, 1.0]),
+            // Through the axis and across the seam at an angle.
+            plane([0.0, 0.0, 1.5], [0.2, 1.0, 0.1]),
+        ] {
+            assert_cut_closes(seamed_tube(24, 3, true), &p);
+        }
+    }
+
+    #[test]
+    fn a_plane_through_the_seam_vertices_closes() {
+        // Through a row of vertices, the two sides of the seam included.
+        assert_cut_closes(
+            seamed_tube(16, 4, true),
+            &plane([0.0, 0.0, 2.0], [0.0, 0.0, 1.0]),
+        );
+        assert_cut_closes(
+            seamed_tube(16, 4, true),
+            &plane([0.0, 0.0, 2.0], [0.0, 0.0, -1.0]),
+        );
+    }
+
+    #[test]
+    fn a_plane_along_the_seam_closes() {
+        // The seam itself lies in the plane: one side keeps its edges and the
+        // other side's triangles leave.
+        assert_cut_closes(
+            seamed_tube(16, 3, true),
+            &plane([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        );
+        assert_cut_closes(
+            seamed_tube(16, 3, true),
+            &plane([0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        );
+    }
+
+    #[test]
+    fn a_plane_on_a_face_of_islands_closes_like_a_plain_cube() {
+        // Only that face stays: a flat sheet, closed against its own cap.
+        let on_face = plane([0.0, 0.0, 1.0], [0.0, 0.0, 1.0]);
+        let mut plain = cube();
+        let mut islands = cube_of_islands();
+        let (a, b) = (
+            cut_kept(&mut plain, &on_face, true),
+            cut_kept(&mut islands, &on_face, true),
+        );
+        assert!(a.report.cap_triangles > 0 && b.report.cap_triangles > 0);
+        assert_closed_by_position(&islands);
+        assert_closed_by_position(&b.removed);
+    }
+
+    #[test]
+    fn an_open_tube_with_a_seam_gets_its_cut_capped_and_its_ends_left() {
+        let mut mesh = seamed_tube(16, 3, false);
+        let out = cut_kept(&mut mesh, &plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]), true);
+        assert!(out.report.cap_triangles > 0);
+        // Only the far ends stay open by position.
+        for m in [&mesh, &out.removed] {
+            let open = boundary_loops(&welded_by_position(m)).unwrap();
+            assert_eq!(open.len(), 1, "{open:?}");
+            assert_eq!(open[0].vertices.len(), 16);
+        }
+    }
+
+    #[test]
+    fn an_open_sheet_with_a_seam_stays_open_without_an_error() {
+        // The cut runs from border to border: no rim closes, so no cap is due.
+        let mut mesh = seamed_tube(16, 3, false);
+        let half = plane([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        // Half a tube first, without a cap: an open sheet with no seam left
+        // on one side, cut again across the rows.
+        let out = cut_kept(&mut mesh, &half, false);
+        assert_eq!(out.report.cap_triangles, 0);
+        let across = plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]);
+        let again = cut_kept(&mut mesh, &across, true);
+        assert_eq!(again.report.cap_triangles, 0);
+        assert_eq!(boundary_loops(&mesh).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_rim_at_a_seam_wound_against_itself_is_an_error_and_writes_nothing() {
+        // The cube's islands, with one crossed face flipped: closed by
+        // position, but no patch can agree with both neighbours.
+        let whole = cube_of_islands();
+        let positions: Vec<f32> = whole.positions().iter().flatten().copied().collect();
+        let mut triangles = whole.triangles().to_vec();
+        // Triangles 4 and 5 are the front face (-y), crossed by `x = 0.5`.
+        triangles[4].swap(1, 2);
+        triangles[5].swap(1, 2);
+        let mut mesh = mesh_of(&positions, &triangles);
+        mesh.add_uvs(whole.uvs().unwrap()).unwrap();
+        let before = crate::test_util::parts(&mesh);
+        let mut tx = mesh.begin_edit();
+        let r = cut_by_plane(
+            &mut tx,
+            &plane([0.5, 0.0, 0.0], [1.0, 0.0, 0.0]),
+            &CutOptions::default(),
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            OpsError::InvalidInput("a cut rim cannot be capped")
+        );
+        tx.rollback();
+        assert_eq!(crate::test_util::parts(&mesh), before);
+    }
+
+    #[test]
+    fn overlaid_seamed_sheets_are_an_error_rather_than_a_silent_gap() {
+        let one = seamed_tube(16, 3, true);
+        let (p, t) = crate::test_util::parts(&one);
+        let base = (p.len() / 3) as u32;
+        let positions: Vec<f32> = p.iter().chain(&p).copied().collect();
+        let triangles: Vec<[u32; 3]> = t
+            .iter()
+            .copied()
+            .chain(t.iter().map(|x| x.map(|v| v + base)))
+            .collect();
+        let uvs: Vec<f32> = one.uvs().unwrap().repeat(2);
+        let mut mesh = mesh_of(&positions, &triangles);
+        mesh.add_uvs(&uvs).unwrap();
+        let mut tx = mesh.begin_edit();
+        let r = cut_by_plane(
+            &mut tx,
+            &plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]),
+            &CutOptions::default(),
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            OpsError::InvalidInput("a cut rim cannot be capped")
+        );
+        tx.rollback();
+    }
+
+    #[test]
+    fn cap_off_leaves_a_seamed_mesh_open() {
+        let mut mesh = seamed_tube(16, 3, true);
+        let out = cut_kept(&mut mesh, &plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]), false);
+        assert_eq!(out.report.cap_triangles, 0);
+        assert!(
+            !boundary_loops(&welded_by_position(&mesh))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn without_uvs_split_vertices_are_read_by_index_as_before() {
+        // No UV channel, no seams: duplicate vertices are a real boundary, as
+        // for every other operation that reads such a mesh. Weld it first.
+        let seamed = seamed_tube(16, 3, true);
+        let (p, t) = crate::test_util::parts(&seamed);
+        let mut mesh = mesh_of(&p, &t);
+        let out = cut_kept(&mut mesh, &plane([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]), true);
+        assert_eq!(out.report.cap_triangles, 0);
+        assert!(
+            !boundary_loops(&welded_by_position(&mesh))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_seamless_mesh_with_uvs_caps_exactly_as_one_without() {
+        let p = plane([0.5, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        let mut plain = cube();
+        let mut with_uvs = cube();
+        with_uvs.add_uvs(&[0.25; 16]).unwrap();
+        let (a, b) = (
+            cut_kept(&mut plain, &p, true),
+            cut_kept(&mut with_uvs, &p, true),
+        );
+        assert_eq!(a.report, b.report);
+        assert_eq!(
+            crate::test_util::parts(&plain),
+            crate::test_util::parts(&with_uvs)
+        );
+        assert_eq!(
+            crate::test_util::parts(&a.removed),
+            crate::test_util::parts(&b.removed)
+        );
+    }
+
+    #[test]
+    fn a_crossing_is_the_same_point_from_either_end_when_asked() {
+        let p = plane([0.1, 0.2, 0.3], [0.3, -0.7, 0.9]);
+        // A fixed walk over pairs on opposite sides, far from round numbers.
+        let at = |i: u32, s: f64| {
+            let t = f64::from(i);
+            [
+                s * (1.0 + (t * 0.37).sin()) / 3.0,
+                s * (t * 0.11).cos() / 7.0,
+                s * (2.0 + (t * 0.73).cos()) / 11.0,
+            ]
+        };
+        let mut differ = 0;
+        for i in 0..1000 {
+            let (a, b) = (at(i, 1.0), at(i + 1, -1.0));
+            let (sa, sb) = (p.signed_distance(a), p.signed_distance(b));
+            if (sa >= 0.0) == (sb >= 0.0) {
+                continue;
+            }
+            assert_eq!(
+                crossing_point(a, b, sa, sb, true),
+                crossing_point(b, a, sb, sa, true)
+            );
+            differ += usize::from(
+                crossing_point(a, b, sa, sb, false) != crossing_point(b, a, sb, sa, false),
+            );
+        }
+        // Otherwise the test shows nothing: id order does move the point.
+        assert!(differ > 0);
+    }
+
+    /// `mesh` welded by position, with no UV channel: the same solid, seamless.
+    fn seamless(mesh: &Mesh) -> Mesh {
+        let welded = welded_by_position(mesh);
+        let (p, t) = crate::test_util::parts(&welded);
+        mesh_of(&p, &t)
+    }
+
+    #[test]
+    fn a_sweep_of_planes_never_leaves_a_seamed_mesh_open() {
+        let meshes: [fn() -> Mesh; 3] = [
+            || seamed_tube(12, 3, true),
+            || seamed_tube(7, 2, true),
+            cube_of_islands,
+        ];
+        // Round values hit rows, columns and the seam; the others miss them.
+        let origins = [0.0, 0.25, 0.5, 1.0, 1.5, 0.3137];
+        let normals = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.3, -0.5, 0.8],
+            [-0.7, 0.2, 0.1],
+        ];
+        let mut cuts = 0;
+        for make in meshes {
+            for &o in &origins {
+                for &n in &normals {
+                    let p = plane(n.map(|c: f64| c * o), n);
+                    let mut mesh = make();
+                    let whole = volume6(&mesh);
+                    let mut tx = mesh.begin_edit();
+                    let r = cut_by_plane(&mut tx, &p, &CutOptions::default());
+                    let Ok(out) = r else {
+                        let err = r.unwrap_err();
+                        tx.rollback();
+                        // What may fail is what fails on the seamless solid.
+                        let mut plain = seamless(&make());
+                        let mut tx = plain.begin_edit();
+                        let same = cut_by_plane(&mut tx, &p, &CutOptions::default());
+                        assert_eq!(same.map(|o| o.report), Err(err), "{o} {n:?}");
+                        tx.rollback();
+                        continue;
+                    };
+                    tx.commit().unwrap();
+                    cuts += 1;
+                    assert_closed_by_position(&mesh);
+                    assert_closed_by_position(&out.removed);
+                    let sum = volume6(&mesh) + volume6(&out.removed);
+                    assert!(
+                        (sum - whole).abs() < 1e-4 * whole,
+                        "{o} {n:?}: {sum} {whole}"
+                    );
+                }
+            }
+        }
+        assert!(cuts > 80, "{cuts}");
+    }
+
+    #[test]
+    fn a_rim_above_the_search_limit_caps_across_a_seam_too() {
+        // More rim edges than `dp_limit`: the projection fallback, which needs
+        // the walls to flare away from the plane on both sides, so an
+        // hourglass cut at its waist.
+        let slices = FillOptions::default().dp_limit as u32 + 40;
+        let tube = seamed_tube(slices, 2, true);
+        let (mut p, t) = crate::test_util::parts(&tube);
+        for c in p.as_chunks_mut::<3>().0 {
+            if c[2] != 1.0 {
+                c[0] *= 2.0;
+                c[1] *= 2.0;
+            }
+        }
+        let mut hourglass = mesh_of(&p, &t);
+        hourglass.add_uvs(tube.uvs().unwrap()).unwrap();
+        let waist = plane([0.0, 0.0, 1.0], [0.0, 0.0, 1.0]);
+        let (kept, out) = assert_cut_closes(hourglass, &waist);
+        assert!(kept.triangle_count() > 2 * slices as usize);
+        assert!(out.removed.triangle_count() > 2 * slices as usize);
     }
 }

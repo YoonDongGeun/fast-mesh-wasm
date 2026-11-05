@@ -21,7 +21,8 @@ pub struct CutOptions {
     /// The cutting plane, in world coordinates. The `+` side
     /// (`signed_distance >= 0`) stays on the original mesh.
     pub plane: Plane,
-    /// Close both openings with flat, unfaired patches. Without it both
+    /// Close both openings with flat, unfaired patches, across UV seams on a
+    /// mesh with UVs. Without it both
     /// parts keep the open rim the cut leaves.
     pub cap: bool,
 }
@@ -72,7 +73,10 @@ impl Scene {
     /// as a new mesh, both with the mesh's placement, so the world shape is
     /// kept. With `options.cap` (the usual case) both openings are closed
     /// with flat, unfaired patches; without it both parts keep the open rim.
-    /// Cutting a closed mesh with `cap` yields two closed meshes.
+    /// Cutting a closed mesh with `cap` yields two closed meshes. On a mesh
+    /// with UVs, closed means closed by exact position, so seams count as
+    /// closed. A rim that runs into a real boundary stays open; on a mesh
+    /// without UVs, split vertices are such a boundary, so weld them first.
     ///
     /// The cut runs as one edit of the mesh, so it undoes in one step; the
     /// added mesh is permanent, like the removed source of [`Scene::join`].
