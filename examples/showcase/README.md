@@ -37,7 +37,7 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 - **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
   signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
-  from (mm)*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
+  from*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
   *Fast mode (large meshes)* bounds the fields at twice the larger of depth and colour from (so the
   coloured area's outer edge still softens with *Boundary softness*), and a deeper
   penetration shows the mesh colour. The colourings are drawn with fragment shading
@@ -77,8 +77,23 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   warning as the pair. Removing a member keeps the others coloured with their remaining partners.
 - **Status bar.** The scene's status, the engine's thread count (`WorkerScene.threads`), whether the
   page is cross-origin isolated, and on an error its message with Restart.
+- **Units.** The engine is unitless; this app reads its world unit as the millimetre, the unit DICOM
+  speaks, and every stored value stays in it. Two separate things convert:
+  - *Display unit* (mm or in, the button in the status bar): every length, area and volume readout
+    and length input follows, at the factor, its square or its cube. Text only: no mesh, slider
+    value or colouring moves. Mesh and section exports (STL, DXF, ...) stay in mm; the collision
+    CSV follows, and its header names the unit.
+  - *Import scale* (*Assume files in*, or any factor, above the mesh list): a file's numbers are
+    multiplied once as it loads, so its mesh is in mm from then on. It applies to the next files
+    opened or dropped, shows on the mesh's row, and does not persist. DICOM series and samples
+    never take it: their spacing is already in mm.
+
+  The display unit is per project with a global default: a project file stores its own (`units`),
+  a file without one takes the default, and picking a unit by hand also sets the default. Opening a
+  project never changes the default. The file stores each mesh's positions in mm, and its
+  `importScale` as provenance only, so reopening cannot scale a mesh twice.
 - **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
-  repair overlays, collision mode, the last-used heatmap sliders) persist in localStorage across
+  repair overlays, collision mode, the last-used heatmap sliders, the default display unit) persist in localStorage across
   reloads under versioned `fm.showcase.*` keys; Reset settings in the status bar restores the
   defaults. Meshes and projects stay file-based.
 
@@ -106,5 +121,6 @@ The scripted session selects and drags A with the gizmo and undoes it; checks th
 B and its readouts while A is dragged away; picks the open mesh C as B and expects the open-mesh
 warning; fills C's holes while it is coloured and undoes it; colours A, B and C as a contact group
 (colours on all three, the per-pair readouts, the hover tip, the pair matrix) and removes C from it;
-removes B while it is coloured; loads STL, OBJ and PLY files (and a broken one); then repeats a
+removes B while it is coloured; loads STL, OBJ and PLY files (and a broken one); drives the units
+(inch cubes through the import scale, readouts in both units, a project round trip); then repeats a
 short session with `?local` (the group's readouts included). It fails on any console error.
