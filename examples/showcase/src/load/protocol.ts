@@ -1,4 +1,5 @@
 // Messages between the page and the loader Worker (parser.worker.ts).
+import type { ImportScale } from "../panels/units";
 import type { Vec3 } from "./mesh-data";
 import type { PhantomKind } from "./phantom";
 import type { SampleKind } from "./vtkjs";
@@ -7,9 +8,11 @@ export type LoaderRequest =
   /**
    * Parse a file (read in the Worker: the page never touches its bytes).
    * `buffers` carries a `.gltf`/`.glb` asset's sibling `.bin` files from the
-   * same drop batch, for its external buffers.
+   * same drop batch, for its external buffers. `importScale` is applied once,
+   * to the parsed positions (unset: the numbers stay as they are). Only mesh
+   * files take one: a DICOM series states its spacing in mm.
    */
-  | { kind: "file"; id: number; file: File; buffers?: File[] }
+  | { kind: "file"; id: number; file: File; buffers?: File[]; importScale?: ImportScale }
   /** Stack DICOM files into their series and mesh each isosurface (`threshold` null takes Otsu's). */
   | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
   /** Mesh a procedural DICOM phantom through the same extraction pipeline. */
@@ -37,6 +40,8 @@ export interface LoadedMesh {
   volumeId: string | null;
   /** The suggested volume preset (a sample's descriptor hint), if any. */
   preset: string | null;
+  /** The scale already applied to `positions`, if any: provenance, never re-applied. */
+  importScale?: ImportScale;
 }
 
 /** A retained source volume, fetched for the volume view (values transferred). */

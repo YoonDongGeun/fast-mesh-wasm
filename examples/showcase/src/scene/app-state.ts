@@ -26,6 +26,7 @@ import {
   type ShowcaseSettings,
   type ShowcaseTheme,
 } from "../panels/settings";
+import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../panels/units";
 
 export interface Item {
   /** A React key. */
@@ -46,6 +47,8 @@ export interface Item {
   volumeId: string | null;
   /** The suggested volume preset (a sample's descriptor hint), if any. */
   preset: string | null;
+  /** How its numbers became millimetres on load: already applied, provenance only. */
+  importScale: ImportScale;
 }
 
 export type JobPhase = "reading" | "parsing" | "adding" | "done" | "error";
@@ -227,6 +230,12 @@ export interface AppSnapshot {
   heatmapParams: HeatmapParams | null;
   /** Fast heatmap mode (bounded fields; persisted: last-used, not undoable). */
   heatmapFast: boolean;
+  /** The display unit: the project's (text only, every stored value stays in mm). */
+  units: LengthUnit;
+  /** The display unit new sessions and older project files start on (persisted). */
+  defaultUnits: LengthUnit;
+  /** What files loaded from here on are assumed to be in (not persisted: a surprise on the next load). */
+  importScale: ImportScale;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -267,6 +276,9 @@ export class AppState {
     rightWidth: DEFAULT_SIDEBAR_WIDTH,
     heatmapParams: null,
     heatmapFast: false,
+    units: "mm",
+    defaultUnits: "mm",
+    importScale: NO_IMPORT_SCALE,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -288,6 +300,8 @@ export class AppState {
       sculptRemesh: initial.sculptRemesh,
       sculptLiveRemesh: initial.sculptLiveRemesh,
       maskRadius: initial.maskRadius,
+      units: initial.defaultUnits,
+      defaultUnits: initial.defaultUnits,
     };
   }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -331,6 +345,7 @@ export class AppState {
       radius: loaded.radius,
       volumeId: loaded.volumeId,
       preset: loaded.preset,
+      importScale: loaded.importScale ?? NO_IMPORT_SCALE,
     };
     let collision = this.#snap.collision;
     if (this.#autoPick) {
@@ -610,6 +625,21 @@ export class AppState {
     this.#set({ heatmapFast: fast });
   }
 
+  /** The display unit picked by hand: this project's, and the default from here on. Text only. */
+  setUnits(units: LengthUnit): void {
+    this.#set({ units, defaultUnits: units });
+  }
+
+  /** The display unit of a project just opened; `undefined` (an older file) takes the default, which it never changes. */
+  setProjectUnits(units: LengthUnit | undefined): void {
+    this.#set({ units: units ?? this.#snap.defaultUnits });
+  }
+
+  /** Sets what files loaded from here on are assumed to be in. Meshes already loaded stay as they are. */
+  setImportScale(importScale: ImportScale): void {
+    this.#set({ importScale });
+  }
+
   /**
    * Restores every persisted display setting to its default (the status
    * bar's "reset to defaults" button). Meshes, selection and history stay.
@@ -632,6 +662,9 @@ export class AppState {
       sculptRemesh: d.sculptRemesh,
       sculptLiveRemesh: d.sculptLiveRemesh,
       maskRadius: d.maskRadius,
+      units: d.defaultUnits,
+      defaultUnits: d.defaultUnits,
+      importScale: NO_IMPORT_SCALE,
     });
   }
 

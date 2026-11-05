@@ -11,6 +11,7 @@
 // inside load/save/reset, each guarded the way tour.ts guards its flag,
 // so private mode just means "no persistence".
 import type { CollisionMode, HeatmapParams, RepairOverlayKind } from "../scene/app-state";
+import type { LengthUnit } from "./units";
 
 /** The settings document's storage key: namespaced, with its version. */
 export const SETTINGS_KEY = "fm.showcase.settings.v1";
@@ -52,6 +53,8 @@ export interface ShowcaseSettings {
   sculptRemesh: boolean;
   sculptLiveRemesh: boolean;
   maskRadius: number;
+  /** The display unit new sessions and older project files start on; a project file's own wins. */
+  defaultUnits: LengthUnit;
 }
 
 /** A fresh defaults document (a new object every call: callers may keep it). */
@@ -73,6 +76,7 @@ export function defaultSettings(): ShowcaseSettings {
     sculptRemesh: true,
     sculptLiveRemesh: true,
     maskRadius: 0.25,
+    defaultUnits: "mm",
   };
 }
 
@@ -173,6 +177,7 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     sculptRemesh: asBoolean(doc.sculptRemesh, fallback.sculptRemesh),
     sculptLiveRemesh: asBoolean(doc.sculptLiveRemesh, fallback.sculptLiveRemesh),
     maskRadius: asNumber(doc.maskRadius, fallback.maskRadius, Number.MIN_VALUE),
+    defaultUnits: asLiteral(doc.defaultUnits, ["mm", "in"], fallback.defaultUnits),
   };
 }
 
@@ -222,6 +227,7 @@ export interface PersistedSnapshot {
   sculptRemesh: boolean;
   sculptLiveRemesh: boolean;
   maskRadius: number;
+  defaultUnits: LengthUnit;
 }
 
 /** Collects the snapshot's persisted slice into a storable document. */
@@ -243,5 +249,6 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     sculptRemesh: snap.sculptRemesh,
     sculptLiveRemesh: snap.sculptLiveRemesh,
     maskRadius: snap.maskRadius,
+    defaultUnits: snap.defaultUnits,
   };
 }

@@ -133,12 +133,23 @@ describe("settings storage", () => {
     expect(loadSettings()).toEqual(defaultSettings());
   });
 
+  it("the default unit survives storage, and older documents start on mm", () => {
+    stubStorage();
+    expect(defaultSettings().defaultUnits).toBe("mm");
+    saveSettings({ defaultUnits: "in" });
+    expect(loadSettings().defaultUnits).toBe("in");
+    // A document written before #145 has no such field; the rest stands.
+    expect(parseSettings({ version: 1, theme: "light" })).toMatchObject({ theme: "light", defaultUnits: "mm" });
+    expect(parseSettings({ version: 1, defaultUnits: "furlong" }).defaultUnits).toBe("mm");
+  });
+
   it("collects_a_snapshot", () => {
     const s = settingsFromSnapshot({
       ...defaultSettings(),
       heatmapParams: { depth: 1, gap: 2, tolerance: 0.5 },
     });
     expect(s.version).toBe(1);
+    expect(s.defaultUnits).toBe("mm");
     expect(s.heatmap).toEqual({ depth: 1, gap: 2, tolerance: 0.5 });
     expect(s.repairOverlays).toEqual({ holes: true, nonManifold: true, degenerate: true, components: true });
   });
