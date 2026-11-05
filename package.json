@@ -15,7 +15,6 @@
     "docs:js": "pnpm --filter fast-mesh-wasm run docs",
     "docs:rust": "cargo doc --workspace --no-deps",
     "smoke": "node scripts/smoke.mjs",
-    "setup:worktree": "node scripts/link-worktree-deps.mjs",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "pnpm build && changeset publish"
