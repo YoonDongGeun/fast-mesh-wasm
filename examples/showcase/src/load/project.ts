@@ -9,6 +9,14 @@
 // failing the whole file. Mesh geometry rides as base64 little-endian bytes
 // (f64 positions, u32 indices), so a round trip is bit-exact.
 //
+// Units (issue #145): positions are in the world unit, millimetres, whatever
+// the display unit. `units` names how the project displays them; a mesh's
+// `importScale` records how its file's numbers became millimetres. That
+// scale is already in the positions and is never applied here, so a reload
+// cannot scale a mesh twice. Both are optional: files without them load as
+// before, on the global default unit (`version` stays 1, the fields are
+// additive and older builds ignore them).
+//
 // The pure core (`encodeF64`/`decodeF64`, `encodeU32`/`decodeU32`,
 // `buildProjectDoc`, `parseProjectDoc`) touches no scene and is unit-tested;
 // `collectProject`/`restoreProject` are the thin store/app adapters, and
@@ -18,6 +26,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import type { DistanceColoring } from "fast-mesh-wasm/store";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState } from "../scene/app-state";
+import { type ImportScale, isImportUnit, type LengthUnit, NO_IMPORT_SCALE } from "../panels/units";
 import { bounds } from "./mesh-data";
 
 /** The project format version written by `buildProjectDoc`. */
@@ -67,6 +76,8 @@ export interface ProjectMesh {
   indices: string;
   placement: ProjectPlacement;
   coloring: ProjectColoring | null;
+  /** How the positions became mm on load (absent: as they were). Already applied: provenance only. */
+  importScale?: ImportScale;
 }
 
 /** One section as stored: meshes as indices into the doc's `meshes`. */
@@ -85,6 +96,8 @@ export interface ProjectDoc {
   selection: number | null;
   wireframe: boolean;
   edgeSoftness: number;
+  /** The project's display unit (absent in older files: the global default). */
+  units?: LengthUnit;
 }
 
 // ---- Base64 over raw bytes (Buffer in Node/tests, btoa/atob in browsers) ----
@@ -202,6 +215,7 @@ export interface ProjectMeshInput {
   translation: [x: number, y: number, z: number];
   scale?: [x: number, y: number, z: number];
   coloring: (Omit<ProjectColoring, "targets"> & { targets: number[] }) | null;
+  importScale?: ImportScale;
 }
 
 /** A section's serializable state, with meshes as mesh indices. */
@@ -218,6 +232,7 @@ export function buildProjectDoc(input: {
   selection: number | null;
   wireframe: boolean;
   edgeSoftness: number;
+  units?: LengthUnit;
 }): ProjectDoc {
   return {
     version: PROJECT_VERSION,
@@ -236,6 +251,7 @@ export function buildProjectDoc(input: {
       },
       coloring:
         m.coloring === null ? null : { ...m.coloring, targets: [...m.coloring.targets].sort((a, b) => a - b) },
+      ...(m.importScale === undefined ? {} : { importScale: { ...m.importScale } }),
     })),
     sections: input.sections.map((s) => ({
       plane: { origin: [...s.plane.origin] as [number, number, number], normal: [...s.plane.normal] as [number, number, number] },
@@ -245,6 +261,7 @@ export function buildProjectDoc(input: {
     selection: input.selection,
     wireframe: input.wireframe,
     edgeSoftness: input.edgeSoftness,
+    ...(input.units === undefined ? {} : { units: input.units }),
   };
 }
 
@@ -309,6 +326,14 @@ function readColoring(value: unknown, meshCount: number): ProjectColoring | null
   };
 }
 
+/** A mesh's stored import scale; `undefined` for a missing or unusable one. An unknown unit reads as custom. */
+function readImportScale(value: unknown): ImportScale | undefined {
+  if (!isRecord(value) || typeof value.factor !== "number" || !Number.isFinite(value.factor) || value.factor <= 0) {
+    return undefined;
+  }
+  return { factor: value.factor, units: isImportUnit(value.units) ? value.units : null };
+}
+
 /**
  * Parses project JSON into a doc, tolerantly: unknown fields are ignored, a
  * newer `version` still loads what is understood, and invalid entries fall
@@ -364,6 +389,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     const translation = numTriple(placement.translation) ?? [0, 0, 0];
     const scaleRaw = numTriple(placement.scale);
     const scale = scaleRaw !== null && scaleRaw.every((n) => n > 0) ? (scaleRaw as [number, number, number]) : undefined;
+    const importScale = readImportScale(raw.importScale);
     meshes.push({
       name: typeof raw.name === "string" && raw.name !== "" ? raw.name : `Mesh ${meshes.length + 1}`,
       color: Number.isFinite(Number(raw.color)) ? Number(raw.color) : 0x999999,
@@ -377,6 +403,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
         ...(scale === undefined ? {} : { scale }),
       },
       coloring: readColoring(raw.coloring, meshCount),
+      ...(importScale === undefined ? {} : { importScale }),
     });
   }
   if (meshes.length === 0) {
@@ -421,6 +448,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     selection,
     wireframe: root.wireframe === true,
     edgeSoftness: typeof root.edgeSoftness === "number" && Number.isFinite(root.edgeSoftness) && root.edgeSoftness >= 0 ? root.edgeSoftness : 0,
+    ...(root.units === "mm" || root.units === "in" ? { units: root.units } : {}),
   };
 }
 
@@ -468,6 +496,7 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
                 ...(coloring.base === undefined ? {} : { base: coloring.base }),
                 ...(coloring.nan === undefined ? {} : { nan: coloring.nan }),
               },
+        ...(item.importScale.factor === 1 ? {} : { importScale: item.importScale }),
       };
     }),
     sections: [...snap.sections.values()].map((s) => ({
@@ -481,6 +510,7 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
     selection: snap.selection === null ? null : (indexOf.get(snap.selection) ?? null),
     wireframe: app.getSnapshot().wireframe,
     edgeSoftness: app.getSnapshot().edgeSoftness,
+    units: app.getSnapshot().units,
   });
 }
 
@@ -503,7 +533,17 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
     const positions = decodeF64(mesh.positions, "positions");
     const indices = decodeU32(mesh.indices, "indices");
     const { center, radius } = bounds(positions);
-    const item = app.addMesh(store, { name: mesh.name, positions, indices, center, radius, volumeId: null, preset: null });
+    // The positions as stored, already in mm: `importScale` only rides along.
+    const item = app.addMesh(store, {
+      name: mesh.name,
+      positions,
+      indices,
+      center,
+      radius,
+      volumeId: null,
+      preset: null,
+      importScale: mesh.importScale ?? NO_IMPORT_SCALE,
+    });
     item.name = mesh.name;
     item.color = mesh.color;
     item.material.color.setHex(mesh.color);
@@ -552,6 +592,7 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   app.setMulti(selected === null ? [] : [selected]);
   app.setWireframe(doc.wireframe);
   app.setEdgeSoftness(doc.edgeSoftness);
+  app.setProjectUnits(doc.units);
 }
 
 // ---- Files: File System Access with a download/input fallback ----

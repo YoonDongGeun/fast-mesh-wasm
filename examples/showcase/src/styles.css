@@ -362,6 +362,16 @@ input[type="range"] {
   align-items: center;
   gap: 4px 8px;
 }
+.import-scale {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 4px 0;
+}
+.import-scale input[aria-invalid="true"] {
+  border-color: var(--error);
+}
 .field {
   display: inline-flex;
   align-items: center;
