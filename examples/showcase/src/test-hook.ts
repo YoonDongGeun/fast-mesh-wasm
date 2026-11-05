@@ -239,11 +239,11 @@ export function installTestHook(
           };
     },
     /**
-     * The scene quads' first corner handles on the page (CSS pixels), each
+     * The scene quads' `corner`th handles on the page (CSS pixels), each
      * with the screen direction of higher slices: `null` while the overlay
      * hides. The check drags a slice by one.
      */
-    sliceHandles: () => {
+    sliceHandles: (corner = 0) => {
       if (view.camera === null || view.canvas === null || view.sliceQuads === null) {
         return null;
       }
@@ -258,7 +258,7 @@ export function installTestHook(
       };
       const out: Record<string, { x: number; y: number; dx: number; dy: number } | null> = {};
       for (const axis of ["axial", "coronal", "sagittal"] as const) {
-        const at = quads.handleWorld(axis, 0);
+        const at = quads.handleWorld(axis, corner);
         const quad = quads.quadMesh(axis);
         if (at === null || quad === null) {
           out[axis] = null;
