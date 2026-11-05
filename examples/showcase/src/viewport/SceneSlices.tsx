@@ -26,6 +26,7 @@ import {
 } from "../panels/volume-slice";
 import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "./slice-drag";
 import { setSliceClip } from "./clip-planes";
+import { isExtraFinger } from "./touch";
 import { view } from "./view";
 import { matchVolume } from "./volume-box";
 
@@ -423,7 +424,7 @@ function SliceDrag(props: { app: AppState; quads: SceneSliceQuads; payload: Volu
     };
 
     const onDown = (e: PointerEvent): void => {
-      if (e.button !== 0 || drag !== null || view.dragging) {
+      if (e.button !== 0 || isExtraFinger(e) || drag !== null || view.dragging) {
         return;
       }
       const snap = app.getSnapshot();

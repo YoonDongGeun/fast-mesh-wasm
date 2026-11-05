@@ -44,6 +44,7 @@ import {
   unionMaskIds,
   worldPerPixel,
 } from "./sculpt";
+import { isExtraFinger, tapSlop } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { setWireOverlay } from "./wire";
 import {
@@ -131,7 +132,7 @@ export function Viewport(props: {
   const inspectTool = useApp(app, (s) => s.inspectTool);
   const onMissed = useCallback(
     (e: MouseEvent) => {
-      if (sculpt !== null || maskPaint || picking !== null || view.dragging || selection === null) {
+      if (sculpt !== null || maskPaint || picking !== null || view.dragging || view.multiTouch || selection === null) {
         return;
       }
       if (inspectTool !== null) {
@@ -144,7 +145,7 @@ export function Viewport(props: {
         return;
       }
       const down = downAt.current;
-      if (down === null || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) {
+      if (down === null || Math.hypot(e.clientX - down.x, e.clientY - down.y) > tapSlop(view.pointerType, 6)) {
         return;
       }
       // Through clickMulti: a shift-click on nothing is ignored, like on a mesh.
@@ -227,13 +228,17 @@ export function Viewport(props: {
   );
 }
 
-/** Records canvas pointerdowns, so a missed click can tell a drag from a tap. */
+/** Records canvas pointerdowns, so a missed click can tell a drag from a tap and a finger from a pinch. */
 function MissTracker(props: { track: { current: { x: number; y: number } | null } }) {
   const gl = useThree((s) => s.gl);
   useEffect(() => {
     const el = gl.domElement;
     const onDown = (e: PointerEvent) => {
-      props.track.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
+      view.pointerType = e.pointerType;
+      view.multiTouch = isExtraFinger(e);
+      if (!view.multiTouch) {
+        props.track.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
+      }
     };
     el.addEventListener("pointerdown", onDown);
     return () => el.removeEventListener("pointerdown", onDown);
@@ -295,8 +300,9 @@ function MeshView(props: {
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
-      // The end of an orbit drag that started on the mesh is not a click.
-      if (e.delta > 2) {
+      // The end of an orbit drag that started on the mesh is not a click,
+      // nor is a pinch's lift.
+      if (e.delta > tapSlop(view.pointerType, 2) || view.multiTouch) {
         return;
       }
       // A stroke's release on the mesh is not a click either.
@@ -467,6 +473,10 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
     let running = false;
     let last = -Infinity;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Touch has no hover: a tap asks for the point under it instead, and the
+    // tip stays until the next touch (which clears it).
+    let fingerAt: { x: number; y: number } | null = null;
+    let fingerDown = false;
     const run = () => {
       if (!alive || running || pending === null) {
         return;
@@ -491,7 +501,7 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
         .then(() => scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]))
         .then(
           (hit) => {
-            if (!alive) {
+            if (!alive || fingerDown) {
               return;
             }
             if (hit === null) {
@@ -519,17 +529,48 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
       pending = { x: e.clientX, y: e.clientY };
       run();
     };
-    const onLeave = () => {
+    const onLeave = (e: PointerEvent) => {
+      // A lifted finger leaves the canvas: that is when a tap's tip appears.
+      if (e.pointerType === "touch") {
+        return;
+      }
       pending = null;
       setHover(null);
     };
+    const onDown = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") {
+        return;
+      }
+      fingerDown = true;
+      fingerAt = isExtraFinger(e) ? null : { x: e.clientX, y: e.clientY };
+      pending = null;
+      setHover(null);
+    };
+    const onUp = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") {
+        return;
+      }
+      fingerDown = false;
+      const at = fingerAt;
+      fingerAt = null;
+      if (e.type === "pointerup" && at !== null && Math.hypot(e.clientX - at.x, e.clientY - at.y) <= tapSlop("touch", 0)) {
+        pending = at;
+        run();
+      }
+    };
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerleave", onLeave);
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
     return () => {
       alive = false;
       clearTimeout(timer);
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerleave", onLeave);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
       setHover(null);
     };
   }, [scene, camera, gl]);
@@ -1009,7 +1050,7 @@ function SculptLayer(props: {
       run();
     };
     const onDown = (e: PointerEvent) => {
-      if (e.button !== 0 || active !== -1 || view.dragging) {
+      if (e.button !== 0 || isExtraFinger(e) || active !== -1 || view.dragging) {
         return;
       }
       // Immediate: the stroke starts where the button lands, not a throttle later.
@@ -1018,8 +1059,9 @@ function SculptLayer(props: {
         .then(
           (hit) => {
             // The gizmo's own pointerdown runs first (its listeners attached
-            // first): a grab there owns the gesture, not a stroke.
-            if (!alive || active !== -1 || view.dragging) {
+            // first): a grab there owns the gesture, not a stroke. A second
+            // finger landed meanwhile: the camera's pinch owns it.
+            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
             const brush = brushRef.current;
@@ -1348,7 +1390,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       run();
     };
     const onDown = (e: PointerEvent) => {
-      if (e.button !== 0 || active !== -1 || view.dragging) {
+      if (e.button !== 0 || isExtraFinger(e) || active !== -1 || view.dragging) {
         return;
       }
       const mesh = selRef.current;
@@ -1360,7 +1402,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
         .then(() => cast(e.clientX, e.clientY))
         .then(
           (hit) => {
-            if (!alive || active !== -1 || view.dragging) {
+            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
             if (hit === null || hit.mesh !== mesh) {
@@ -1439,6 +1481,7 @@ function Controls(props: {
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
+  const size = useThree((s) => s.size);
   const [orbit, setOrbit] = useState<TrackballControls | null>(null);
   const [gizmo, setGizmo] = useState<TransformControls | null>(null);
   // Read when a focus request arrives: a new list of items is not a new request.
@@ -1468,13 +1511,36 @@ function Controls(props: {
     };
   }, [camera, gl]);
 
+  // The trackball caches the canvas's box; a rotated phone or a resized panel changes it.
+  useEffect(() => {
+    orbit?.handleResize();
+  }, [orbit, size]);
+
   useFrame(() => orbit?.update());
 
   useEffect(() => {
     if (orbit === null || bound === null) {
       return;
     }
-    const controls = new TransformControls(camera, gl.domElement);
+    // The gizmo takes every pointer on the canvas, so a second finger would
+    // grab a handle or move the one in hand, and its lift would end the drag.
+    // It stands down for that finger's events: this runs before its listeners.
+    const canvas = gl.domElement;
+    const gate = (e: PointerEvent) => {
+      controls.enabled = !isExtraFinger(e);
+    };
+    // It has no pointercancel of its own: a drag the system took over ends here.
+    const onCancel = (e: PointerEvent) => {
+      if (!isExtraFinger(e) && controls.dragging) {
+        controls.pointerUp(null);
+      }
+    };
+    const POINTER_EVENTS = ["pointerdown", "pointermove", "pointerup"] as const;
+    for (const type of POINTER_EVENTS) {
+      canvas.addEventListener(type, gate);
+    }
+    const controls = new TransformControls(camera, canvas);
+    canvas.addEventListener("pointercancel", onCancel);
     const helper = controls.getHelper();
     scene.add(helper);
     controls.attach(bound.object);
@@ -1487,6 +1553,10 @@ function Controls(props: {
     view.gizmo = controls;
     setGizmo(controls);
     return () => {
+      for (const type of POINTER_EVENTS) {
+        canvas.removeEventListener(type, gate);
+      }
+      canvas.removeEventListener("pointercancel", onCancel);
       controls.removeEventListener("dragging-changed", onDragging);
       detach();
       controls.detach();

@@ -59,6 +59,9 @@ export interface FocusRequest {
   box?: { center: readonly [number, number, number]; radius: number };
 }
 
+/** A finger is the main pointer here: the hints speak of tapping and pinching. */
+const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+
 export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
   const items = useApp(app, (s) => s.items);
@@ -404,8 +407,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             : picking !== null
               ? "Click the mesh to set the brush center · Esc cancels"
               : selection === null
-                ? "Click a mesh to select it · drag to rotate · scroll to zoom · drop files to load"
-                : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
+                ? coarsePointer
+                  ? "Tap a mesh to select it · drag to rotate · pinch to zoom · two fingers to pan"
+                  : "Click a mesh to select it · drag to rotate · scroll to zoom · drop files to load"
+                : coarsePointer
+                  ? "Drag the gizmo to move · tap empty space to deselect"
+                  : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
@@ -451,7 +458,7 @@ function SidebarHandle(props: { side: "left" | "right"; shell: RefObject<HTMLDiv
       onDoubleClick={() => setWidth(DEFAULT_SIDEBAR_WIDTH)}
       onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
       onPointerMove={(e) => {
-        if (e.buttons !== 1) {
+        if (e.buttons !== 1 || !e.isPrimary) {
           return;
         }
         const rect = shell.current?.getBoundingClientRect();

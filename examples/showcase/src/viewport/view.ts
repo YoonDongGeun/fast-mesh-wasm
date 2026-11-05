@@ -35,6 +35,12 @@ export const view: {
   hoverListeners: Set<() => void>;
   /** The scene's slice quads, for the test hook to project their handles. */
   sliceQuads: SceneSliceQuads | null;
+  /** The section gizmo's handle ball, for the test hook to project. */
+  sectionHandle: THREE.Object3D | null;
+  /** The pointer type of the canvas's latest press. */
+  pointerType: string;
+  /** True from a second finger's landing until the next gesture's first press: no tap, no tool. */
+  multiTouch: boolean;
 } = {
   camera: null,
   canvas: null,
@@ -46,6 +52,9 @@ export const view: {
   hover: null,
   hoverListeners: new Set(),
   sliceQuads: null,
+  sectionHandle: null,
+  pointerType: "mouse",
+  multiTouch: false,
 };
 
 /** Sets `view.dragging` and tells the listeners when it changes. */
