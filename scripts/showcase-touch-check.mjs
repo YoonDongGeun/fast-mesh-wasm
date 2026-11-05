@@ -9,6 +9,14 @@
 //   node scripts/showcase-touch-check.mjs --shots <dir> # save screenshots there
 //   node scripts/showcase-touch-check.mjs --swiftshader # software WebGL (the default on Linux and under CI)
 //   node scripts/showcase-touch-check.mjs --verbose     # echo the page's console
+//   node scripts/showcase-touch-check.mjs --slow-frames 1000 # block each frame that long (ms), like a slow runner
+//
+// Waits are on rendered frames and on state, never on a guess at how long a
+// frame takes: software WebGL on a CI runner can take over a second per frame.
+// The camera's matrices only change when a frame renders, so a screen point
+// read straight after moving the camera is stale. Without --shots the device
+// pixel ratio is 1 and the boot head (its volume is costly in software) goes
+// once its slice handles are checked.
 //
 // Checks (each prints PASS or FAIL; the exit code is 1 on any FAIL):
 // - layout-*: phone portrait, phone landscape and tablet portrait: the canvas
@@ -54,6 +62,7 @@ const option = (name, fallback) => {
 const verbose = flag("--verbose");
 const port = Number(option("--port", 4194));
 const shots = option("--shots", undefined);
+const slowFrames = option("--slow-frames", undefined);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -99,10 +108,30 @@ async function waitFor(expr, ms = 20_000) {
   }
 }
 
+/** Resolves after `n` rendered frames: what the last input did has been drawn, the camera's matrices included. */
+const frames = (n = 2) =>
+  page(`new Promise((done) => { let left = ${n}; const f = () => (--left > 0 ? requestAnimationFrame(f) : done(true)); requestAnimationFrame(f); })`);
+
+/** The value of `expr` once it has held for three frames (a drag's last move may land a frame late). */
+const settled = (expr) =>
+  page(`new Promise((done) => {
+    const t = performance.now();
+    let last;
+    let same = 0;
+    const f = () => {
+      const v = JSON.stringify(${expr});
+      same = v === last ? same + 1 : 0;
+      last = v;
+      if (same >= 3 || performance.now() - t > 15000) done(JSON.parse(v));
+      else requestAnimationFrame(f);
+    };
+    requestAnimationFrame(f);
+  })`);
+
 // ---- Device and fingers ----
 
 const metrics = (width, height) =>
-  browser.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 2, mobile: true });
+  browser.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: shots === undefined ? 1 : 2, mobile: true });
 
 /**
  * A touch event: `touchStart` with every finger on the glass (new ids land),
@@ -126,14 +155,14 @@ async function moveFingers(from, to, steps = 12) {
     await fingers("touchMove", at);
     await sleep(20);
   }
-  await sleep(60); // a frame, so the controls' update() ran
+  await frames(); // the controls' update() ran
 }
 
 async function tap(x, y) {
   await fingers("touchStart", { 0: [x, y] });
   await sleep(30);
   await lift();
-  await sleep(120);
+  await frames();
 }
 
 /** Taps a DOM element through the screen, so whatever covers it takes the tap instead. */
@@ -150,6 +179,22 @@ async function tapElement(selector) {
   }
   await sleep(50);
   await tap(c.x, c.y);
+}
+
+const AT_DEFAULT_POSE = `(() => { const p = __showcase.cameraPose().position; return Math.hypot(p[0] + 0.6, p[1] - 3.4, p[2] - 8.2) < 1e-9; })()`;
+/** Reset view, by a tap on its button or (`tapped` false) a click; on return the pose has been drawn. */
+async function resetView(tapped = true) {
+  if (tapped) {
+    await tapElement("[data-action=view-reset]");
+  } else {
+    await page(`document.querySelector("[data-action=view-reset]").click()`);
+  }
+  const done = await waitFor(AT_DEFAULT_POSE, 20_000);
+  if (done === undefined) {
+    throw new Error("Reset view did not reset the camera");
+  }
+  await page(`window.scrollTo(0, 0)`);
+  await frames();
 }
 
 const sub = (a, b) => a.map((v, i) => v - b[i]);
@@ -169,7 +214,7 @@ async function shot(name) {
     return;
   }
   mkdirSync(shots, { recursive: true });
-  await sleep(200);
+  await frames(3);
   const { data } = await browser.send("Page.captureScreenshot", { format: "png" });
   writeFileSync(join(shots, `${name}.png`), Buffer.from(data, "base64"));
 }
@@ -183,7 +228,7 @@ const C = "C · open shell + piece";
 
 /** The layout at the current metrics: no sideways scroll, a usable canvas, every panel's end reachable. */
 async function checkLayout(name, minWidth, minHeight) {
-  await sleep(300);
+  await frames(3);
   const facts = await page(`(async () => {
     const out = { overflow: document.documentElement.scrollWidth - window.innerWidth, blocked: [] };
     const r = __showcase_canvas().getBoundingClientRect();
@@ -226,6 +271,9 @@ try {
   );
   verdict("boot", boot !== undefined, boot === undefined ? q(await hook("items()")) : boot.name);
   await shot("phone-boot");
+  if (slowFrames !== undefined) {
+    await page(`(function f() { const t = performance.now(); while (performance.now() - t < ${Number(slowFrames)}); requestAnimationFrame(f); })()`);
+  }
 
   // ---- layout and targets ----
   await checkLayout("layout-phone", 350, 300);
@@ -244,7 +292,7 @@ try {
   await sleep(30);
   await moveFingers({ 0: bar, 1: [bar[0] + 40, bar[1] + 40] }, { 0: [bar[0] - 40, bar[1]], 1: [bar[0] + 200, bar[1] + 200] });
   await lift();
-  await sleep(200);
+  await frames();
   const zoom = await page(`visualViewport.scale`);
   verdict("overlay-pinch", zoom === 1, `page zoom ${zoom}`);
 
@@ -265,7 +313,7 @@ try {
     await moveFingers({ 0: [axial.x, axial.y] }, { 0: along });
     const dragged = await hook("mpr().slices.axial");
     await lift();
-    await sleep(100);
+    await frames();
     const at1 = await pose();
     const fresh = (await hook("sliceHandles()")).axial;
     await fingers("touchStart", { 0: empty });
@@ -275,7 +323,7 @@ try {
     await moveFingers({ 0: empty, 1: [fresh.x, fresh.y] }, { 0: empty, 1: [fresh.x - (axial.dx / n) * 80, fresh.y - (axial.dy / n) * 80] });
     const during = await hook("mpr().slices.axial");
     await lift();
-    await sleep(100);
+    await frames();
     verdict(
       "slice-finger",
       dragged !== before && moved(at0, at1) < 1e-9 && during === dragged,
@@ -292,11 +340,11 @@ try {
     60_000,
   );
   verdict("demo-tap", demo === true, "tapped the demo link; A, B and C drawn");
+  // Drop the head: its scene volume is by far the costliest thing to draw, and no later check needs it.
+  await page(`document.querySelector('[data-mesh*="headsq"] button.danger')?.click()`);
+  await waitFor(`!__showcase.items().some((m) => m.name.includes("headsq"))`, 20_000);
   await page(`window.scrollTo(0, 0)`);
-  await tapElement("[data-action=view-reset]");
-  await sleep(200);
-  await page(`window.scrollTo(0, 0)`);
-  await sleep(200);
+  await resetView();
   await shot("phone-demo");
 
   // ---- orbit ----
@@ -305,7 +353,7 @@ try {
   await fingers("touchStart", { 0: start });
   await moveFingers({ 0: start }, { 0: [start[0] + 120, start[1] - 60] });
   await lift();
-  await sleep(100);
+  await frames();
   const p1 = await pose();
   verdict(
     "orbit",
@@ -329,12 +377,12 @@ try {
   await twoDown(near);
   await moveFingers(near, far);
   await lift();
-  await sleep(100);
+  await frames();
   const p3 = await pose();
   await twoDown(far);
   await moveFingers(far, near);
   await lift();
-  await sleep(100);
+  await frames();
   const p4 = await pose();
   verdict(
     "pinch",
@@ -345,7 +393,7 @@ try {
   await twoDown(near);
   await moveFingers(near, panned);
   await lift();
-  await sleep(100);
+  await frames();
   const p5 = await pose();
   verdict(
     "pan",
@@ -358,14 +406,14 @@ try {
   await moveFingers(near, { 0: [near[0][0] - 10, cy], 1: [near[1][0] + 10, cy] }, 4);
   const stay = [near[0][0] - 10, cy];
   await fingers("touchEnd", { 1: [near[1][0] + 10, cy] });
-  await sleep(100);
+  await frames();
   const p6 = await pose();
   await moveFingers({ 0: stay }, { 0: [stay[0] + 2, stay[1]] }, 1);
   const p7 = await pose();
   await moveFingers({ 0: [stay[0] + 2, stay[1]] }, { 0: [stay[0] + 80, stay[1] - 30] });
   const p8 = await pose();
   await lift();
-  await sleep(100);
+  await frames();
   verdict(
     "pinch-to-orbit",
     moved(p6, p7) < 0.2 * p6.distance && moved(p7, p8) > 0.05 && Math.abs(p8.distance - p7.distance) < 1e-3,
@@ -373,22 +421,20 @@ try {
   );
 
   // ---- taps ----
-  await tapElement("[data-action=view-reset]");
-  await page(`window.scrollTo(0, 0)`);
-  await sleep(200);
+  await resetView();
   const overA = await hook(`screenPoint(${q(A)})`);
   await tap(overA.x, overA.y);
-  const tapped = await waitFor(`__showcase.selected() === ${q(A)}`, 3000);
+  const tapped = await waitFor(`__showcase.selected() === ${q(A)}`, 20_000);
   const before2 = await hook("selected()");
   const overB = await hook(`screenPoint(${q(B)})`);
   await twoDown({ 0: [overB.x, overB.y], 1: [overB.x + 30, overB.y] });
   await lift();
-  await sleep(300);
+  await frames(3);
   const afterTwo = await hook("selected()");
   const nothing = emptyPoint(await canvasRect());
   await twoDown({ 0: nothing, 1: [nothing[0] + 30, nothing[1]] });
   await lift();
-  await sleep(300);
+  await frames(3);
   const afterTwoEmpty = await hook("selected()");
   verdict(
     "tap",
@@ -398,57 +444,58 @@ try {
   await shot("phone-selected");
 
   // ---- gizmo: one finger drags, a second cannot disturb it ----
-  await waitFor(`__showcase.gizmo()?.mesh === ${q(A)}`, 3000);
-  await sleep(200);
+  const attached = await waitFor(`__showcase.gizmo()?.mesh === ${q(A)}`, 20_000);
+  await frames(); // the gizmo picks against matrices set when it is drawn
   const t0 = await hook(`translation(${q(A)})`);
   const from = await hook(`screenPoint(${q(A)})`);
   const cam0 = await pose();
   await fingers("touchStart", { 0: [from.x, from.y] });
-  const dragging = await waitFor("__showcase.dragging()", 2000);
+  const dragging = await waitFor("__showcase.dragging()", 20_000);
   const to = [from.x + 40, from.y - 30];
   await moveFingers({ 0: [from.x, from.y] }, { 0: to });
-  const t1 = await hook(`translation(${q(A)})`);
+  const t1 = await settled(`__showcase.translation(${q(A)})`);
   const spot = [from.x - 90, from.y + 120];
   await fingers("touchStart", { 0: to, 1: spot });
   await sleep(30);
   await moveFingers({ 0: to, 1: spot }, { 0: to, 1: [spot[0] - 40, spot[1] + 40] });
-  const t2 = await hook(`translation(${q(A)})`);
+  const t2 = await settled(`__showcase.translation(${q(A)})`);
   await fingers("touchEnd", { 1: [spot[0] - 40, spot[1] + 40] });
-  await sleep(60);
+  await frames();
   const still = await hook("dragging()");
   const to2 = [to[0] + 30, to[1]];
   await moveFingers({ 0: to }, { 0: to2 });
-  const t3 = await hook(`translation(${q(A)})`);
+  const t3 = await settled(`__showcase.translation(${q(A)})`);
   await lift();
-  await sleep(150);
+  await frames();
   const cam1 = await pose();
   await page(`document.querySelector("[data-action=undo]").click()`);
-  await waitFor(`Math.hypot(...__showcase.translation(${q(A)}).map((v, i) => v - ${q(t0)}[i])) < 1e-9`, 3000);
+  await waitFor(`Math.hypot(...__showcase.translation(${q(A)}).map((v, i) => v - ${q(t0)}[i])) < 1e-9`, 20_000);
   const undone = await hook(`translation(${q(A)})`);
   verdict(
     "gizmo",
-    dragging === true && len(sub(t1, t0)) > 1e-3 && len(sub(t2, t1)) < 1e-9 && still === true && len(sub(t3, t2)) > 1e-3 && moved(cam0, cam1) < 1e-9 && len(sub(undone, t0)) < 1e-9,
-    `moved ${fmt(len(sub(t1, t0)))}; second finger moved it ${fmt(len(sub(t2, t1)))}; still dragging ${still}; then ${fmt(len(sub(t3, t2)))}; camera ${fmt(moved(cam0, cam1))}; one undo left it ${fmt(len(sub(undone, t0)))} from the start`,
+    attached === true && dragging === true && len(sub(t1, t0)) > 1e-3 && len(sub(t2, t1)) < 1e-9 && still === true && len(sub(t3, t2)) > 1e-3 && moved(cam0, cam1) < 1e-9 && len(sub(undone, t0)) < 1e-9,
+    `gizmo on A ${attached === true}; moved ${fmt(len(sub(t1, t0)))}; second finger moved it ${fmt(len(sub(t2, t1)))}; still dragging ${still}; then ${fmt(len(sub(t3, t2)))}; camera ${fmt(moved(cam0, cam1))}; one undo left it ${fmt(len(sub(undone, t0)))} from the start`,
   );
 
   // ---- the system takes a drag over (touchcancel): it ends, and the camera works again ----
   const c0 = await hook(`screenPoint(${q(A)})`);
   await fingers("touchStart", { 0: [c0.x, c0.y] });
-  const cancelGrab = await waitFor("__showcase.dragging()", 2000);
+  const cancelGrab = await waitFor("__showcase.dragging()", 20_000);
   await moveFingers({ 0: [c0.x, c0.y] }, { 0: [c0.x + 20, c0.y - 10] }, 4);
   await fingers("touchCancel", {});
-  const cancelEnd = await waitFor("__showcase.dragging() === false", 1000);
+  const cancelEnd = await waitFor("__showcase.dragging() === false", 20_000);
+  const cancelled = await hook(`translation(${q(A)})`);
   await page(`document.querySelector("[data-action=undo]").click()`);
-  await sleep(300);
+  await waitFor(`Math.hypot(...__showcase.translation(${q(A)}).map((v, i) => v - ${q(cancelled)}[i])) > 1e-9`, 20_000);
+  await frames();
   const c1 = await pose();
   const cAt = emptyPoint(await canvasRect());
   await fingers("touchStart", { 0: cAt });
   await moveFingers({ 0: cAt }, { 0: [cAt[0] + 60, cAt[1] - 30] });
   await lift();
-  await sleep(100);
+  await frames();
   const c2 = await pose();
-  await page(`document.querySelector("[data-action=view-reset]").click()`);
-  await sleep(200);
+  await resetView(false);
   verdict(
     "gizmo-cancel",
     cancelGrab === true && cancelEnd === true && moved(c1, c2) > 0.1,
@@ -465,26 +512,38 @@ try {
   await sleep(30);
   const grabbed = await hook("dragging()");
   await moveFingers({ 0: orbitAt, 1: [handle.x, handle.y] }, { 0: orbitAt, 1: [handle.x + 50, handle.y + 20] });
-  const t5 = await hook(`translation(${q(A)})`);
+  const t5 = await settled(`__showcase.translation(${q(A)})`);
   await lift();
-  await sleep(150);
-  verdict("gizmo-second-finger", grabbed === false && len(sub(t5, t4)) < 1e-9, `dragging ${grabbed}; mesh moved ${fmt(len(sub(t5, t4)))}`);
+  await frames();
+  // The same handle under one finger does grab: otherwise the above proves nothing.
+  const grabAt = await hook(`screenPoint(${q(A)})`);
+  await fingers("touchStart", { 0: [grabAt.x, grabAt.y] });
+  const grabbable = await waitFor("__showcase.dragging()", 20_000);
+  await lift();
+  await waitFor("__showcase.dragging() === false", 20_000);
+  await frames();
+  verdict(
+    "gizmo-second-finger",
+    grabbed === false && len(sub(t5, t4)) < 1e-9 && grabbable === true,
+    `second finger: dragging ${grabbed}, mesh moved ${fmt(len(sub(t5, t4)))}; one finger on the handle: dragging ${grabbable === true}`,
+  );
 
   // ---- orbit with the gizmo gone: deselected, its dispose clears the inline touch-action ----
   const gone = emptyPoint(await canvasRect());
+  await sleep(400); // the app ignores a missed tap for 350 ms after a gizmo drag ends (onMissed)
   await tap(gone[0], gone[1]);
-  const cleared = await waitFor(`__showcase.selected() === null && __showcase.gizmo() === null`, 3000);
+  const cleared = await waitFor(`__showcase.selected() === null && __showcase.gizmo() === null`, 20_000);
   const touchAction = await page(`getComputedStyle(document.querySelector(".viewport")).touchAction`);
   const q0 = await pose();
   await fingers("touchStart", { 0: gone });
   await moveFingers({ 0: gone }, { 0: [gone[0] + 120, gone[1] - 60] });
   await lift();
-  await sleep(100);
+  await frames();
   const q1 = await pose();
   await twoDown(near);
   await moveFingers(near, far);
   await lift();
-  await sleep(100);
+  await frames();
   const q2 = await pose();
   verdict(
     "no-gizmo",
@@ -493,16 +552,13 @@ try {
   );
 
   // ---- section handle ----
-  // Without a selection the gizmo is sized by the first mesh: drop the far bigger head.
-  await page(`document.querySelector('[data-mesh*="headsq"] button.danger')?.click()`);
-  await waitFor(`!__showcase.items().some((m) => m.name.includes("headsq"))`, 5000);
-  await tapElement("[data-action=view-reset]");
+  await resetView();
   await page(`document.querySelector("[data-action=inspect-section]")?.click()`);
-  await sleep(100);
+  await waitFor(`document.querySelector("[data-action=section-enable]") !== null`, 20_000);
   await page(`document.querySelector("[data-action=section-enable]")?.click()`);
-  const sec = await waitFor(`__showcase.sectionHandle()`, 5000);
+  const sec = await waitFor(`__showcase.sectionHandle()`, 20_000);
   await page(`window.scrollTo(0, 0)`);
-  await sleep(300);
+  await frames();
   const secAt = await hook("sectionHandle()");
   if (sec === undefined || secAt === null) {
     verdict("section-finger", false, "no section handle");
@@ -517,16 +573,15 @@ try {
     await moveFingers({ 0: secEmpty, 1: [secAt.x, secAt.y] }, { 0: secEmpty, 1: [secAt.x + 40, secAt.y - 60] });
     const so1 = (await hook("inspectTools()")).section?.plane?.origin ?? null;
     await lift();
-    await sleep(150);
-    await page(`document.querySelector("[data-action=view-reset]")?.click()`);
-    await sleep(300);
+    await frames();
+    await resetView(false);
     const secAt2 = await hook("sectionHandle()");
     await fingers("touchStart", { 0: [secAt2.x, secAt2.y] });
-    const oneDrag = await waitFor("__showcase.dragging()", 1000);
+    const oneDrag = await waitFor("__showcase.dragging()", 20_000);
     await moveFingers({ 0: [secAt2.x, secAt2.y] }, { 0: [secAt2.x + 40, secAt2.y - 60] });
     const so2 = (await hook("inspectTools()")).section?.plane?.origin ?? null;
     await lift();
-    await sleep(150);
+    await frames();
     verdict(
       "section-finger",
       secDrag === false && so0 !== null && len(sub(so1, so0)) < 1e-9 && oneDrag === true && len(sub(so2, so1)) > 1e-3,
@@ -534,7 +589,7 @@ try {
     );
     await page(`document.querySelector("[data-action=section-disable]")?.click()`);
     await page(`document.querySelector("[data-action=inspect-section]")?.click()`);
-    await sleep(150);
+    await frames();
   }
 
   // ---- the hover tip's tap fallback ----
@@ -542,12 +597,10 @@ try {
   await waitFor(`document.querySelector('[data-group-member=${q(C)}]') !== null`, 10_000);
   await page(`document.querySelector('[data-group-member=${q(C)}]').click()`);
   await waitFor(`(() => { const g = __showcase.group(); return g.members.length === 3 && g.settled; })()`, 30_000);
-  await page(`document.querySelector("[data-action=view-reset]")?.click()`);
-  await page(`window.scrollTo(0, 0)`);
-  await sleep(400);
+  await resetView(false);
   const overA2 = await hook(`screenPoint(${q(A)})`);
   await tap(overA2.x, overA2.y);
-  const tipState = await waitFor(`(() => { const h = __showcase.group().hover; return h?.mesh === ${q(A)} && h.partner !== null && h; })()`, 8000);
+  const tipState = await waitFor(`(() => { const h = __showcase.group().hover; return h?.mesh === ${q(A)} && h.partner !== null && h; })()`, 30_000);
   const tipBox = await page(`(() => { const t = document.querySelector("[data-hover-tip]"); if (t === null) return null; const r = t.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, w: innerWidth, h: innerHeight, text: t.textContent }; })()`);
   await shot("phone-hover-tip");
   // Near the screen's edge the tip stays on screen.
@@ -557,7 +610,7 @@ try {
   await moveFingers({ 0: dragAt }, { 0: [dragAt[0] + 80, dragAt[1] - 40] });
   const tipDuring = await page(`document.querySelector("[data-hover-tip]") !== null`);
   await lift();
-  await sleep(150);
+  await frames();
   verdict(
     "hover-tap",
     tipState !== undefined && tipBox !== null && tipBox.left >= 0 && tipBox.right <= tipBox.w && tipDuring === false,
@@ -572,7 +625,7 @@ try {
   await checkLayout("layout-tablet", 400, 400);
   await shot("tablet");
   await metrics(390, 844);
-  await sleep(300);
+  await frames(3);
   await page(`document.querySelector(".sidebar-right button:not(:disabled)")?.scrollIntoView({ block: "center" })`);
   await shot("phone-panels");
 
@@ -580,11 +633,10 @@ try {
   await browser.send("Emulation.setTouchEmulationEnabled", { enabled: false });
   await browser.send("Emulation.clearDeviceMetricsOverride");
   await browser.send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
-  await sleep(400);
+  await frames();
   const mouse = (type, x, y, extra = {}) => browser.send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1, ...extra });
   const desk = await page(`({ coarse: matchMedia("(pointer: coarse)").matches, undo: document.querySelector("[data-action=undo]").getBoundingClientRect().height, box: getComputedStyle(document.querySelector(".toolbar")).flexWrap })`);
-  await page(`document.querySelector("[data-action=view-reset]").click()`);
-  await sleep(300);
+  await resetView(false);
   const mr = await canvasRect();
   const m0 = await pose();
   const mAt = [mr.left + 30, mr.bottom - 30];
@@ -595,18 +647,17 @@ try {
     await sleep(20);
   }
   await mouse("mouseReleased", mAt[0] + 120, mAt[1] - 60, { buttons: 0 });
-  await sleep(100);
+  await frames();
   const m1 = await pose();
   await browser.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: mr.left + 200, y: mr.bottom - 200, deltaX: 0, deltaY: -240 });
-  await sleep(150);
+  await frames(3);
   const m2 = await pose();
-  await page(`document.querySelector("[data-action=view-reset]").click()`);
-  await sleep(300);
+  await resetView(false);
   const mA = await hook(`screenPoint(${q(B)})`);
   await mouse("mouseMoved", mA.x, mA.y, { button: "none" });
   await mouse("mousePressed", mA.x, mA.y, { buttons: 1 });
   await mouse("mouseReleased", mA.x, mA.y, { buttons: 0 });
-  const mSel = await waitFor(`__showcase.selected() === ${q(B)}`, 3000);
+  const mSel = await waitFor(`__showcase.selected() === ${q(B)}`, 20_000);
   verdict(
     "mouse",
     !desk.coarse && desk.undo < 40 && desk.box !== "wrap" && moved(m0, m1) > 0.1 && Math.abs(m1.distance - m0.distance) < 1e-3 && m2.distance !== m1.distance && mSel === true,
