@@ -2650,6 +2650,34 @@ mod tests {
     }
 
     #[test]
+    fn auto_repair_one_undo_step() {
+        let mut s = WasmScene::new();
+        let (i, g) = damaged_hemisphere(&mut s, 0);
+        let triangles = s.triangle_count(i, g).unwrap();
+        let nan = f64::NAN;
+        let r = s.repair(i, g, &[15., nan, nan, nan, nan], &[]).unwrap();
+        // Each stage is the code of its op, then its report, in run order:
+        // weld, degenerate, orient (two flipped), components, fill.
+        assert_eq!(r[0], 0.);
+        assert_eq!(r[3], 1.);
+        assert_eq!(r[6], 3.);
+        assert_eq!(r[7], 2.);
+        assert_eq!(r[11], 2.);
+        assert_eq!(r[15], 4.);
+        assert!(r[16] > 0.);
+        assert_eq!(s.analyze(i, g, 0., false, 10).unwrap()[0], 0.);
+        assert!(s.undo().unwrap());
+        assert!(!s.can_undo());
+        assert_eq!(s.triangle_count(i, g).unwrap(), triangles);
+
+        // A bad tolerance changes nothing and records nothing.
+        let bad = [15., -1., nan, nan, nan];
+        assert_eq!(code(s.repair(i, g, &bad, &[])), codes::INVALID_ARGUMENT);
+        assert!(!s.can_undo());
+        assert_eq!(s.triangle_count(i, g).unwrap(), triangles);
+    }
+
+    #[test]
     fn stale_loops_error_code() {
         let mut s = WasmScene::new();
         let (i, g) = damaged_hemisphere(&mut s, 2);

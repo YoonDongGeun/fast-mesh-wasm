@@ -14,7 +14,7 @@ For every function, type and option the recipes use, see the
 | [Headless Node pipeline](headless-node.md) | Sync `Scene` in Node, plus the `createWorker` adapter for `WorkerScene` |
 | [IO: export / import](io-export-import.md) | `exportSTL` / `OBJ` / `PLY` / `glTF`, `importGLTF`, Draco |
 | [Selection + mask](selection-mask.md) | Brush / lasso / component picks, grow / shrink / invert, `isolate` |
-| [Auto-repair](auto-repair.md) | `analyze` → `repair` pipeline |
+| [Auto-repair](auto-repair.md) | `analyze` → `repair` (`{ kind: "auto" }` or your own ops) |
 | [Contact heatmap of two meshes](contact-heatmap.md) | Distance field + `setColoring` between a pair |
 | [Custom colormap + fragment shading](custom-colormap.md) | Custom stops, `center`, fragment shading via `bindMesh` |
 

@@ -368,6 +368,15 @@ describe.each([
     }
   });
 
+  it("repair_takes_the_auto_request", async () => {
+    const store = await start();
+    const { a } = withTwo(store);
+    await settle(store);
+    const report = await store.repair(a, { kind: "auto" });
+    expect(Object.keys(report)).toEqual(["weld", "removeDegenerate", "orient", "removeSmallComponents", "fillHoles"]);
+    expect(report.fillHoles.failed).toEqual([]);
+  });
+
   it("edit_and_repair_return_promises", async () => {
     const store = await start();
     const { a } = withTwo(store);

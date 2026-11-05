@@ -864,6 +864,35 @@ export interface CutReport {
 /** Which boolean for {@link Scene.boolean} to compute. */
 export type BooleanOp = "union" | "subtract" | "intersect";
 
+/**
+ * The standard cleanup pipeline for {@link Scene.repair}: weld, remove
+ * degenerate, orient, remove small components, fill holes, as one transaction.
+ * The library owns the order; an option left out takes the library's default.
+ */
+export interface AutoRepairRequest {
+  kind: "auto";
+  /** Vertices at most this far apart are welded, in mesh units. Default `1e-5`. */
+  weldTolerance?: number;
+  /** Components with fewer triangles are removed; the largest always stays. Default `500`. */
+  minTriangles?: number;
+  /** Fill only holes with at most this many edges; `Infinity` fills any size. Default `64`. */
+  maxEdges?: number;
+  /** Refine and fair each fill so it follows the surrounding curvature. Default `true`. */
+  fair?: boolean;
+}
+
+/**
+ * What an {@link AutoRepairRequest} did, one report per stage, keyed by the
+ * stage's {@link RepairOp} name. The keys iterate in the order the stages ran.
+ */
+export interface AutoRepairReport {
+  weld: WeldReport;
+  removeDegenerate: DegenerateReport;
+  orient: OrientReport;
+  removeSmallComponents: RemoveReport;
+  fillHoles: FillReport;
+}
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
   | WeldReport
@@ -1095,6 +1124,9 @@ const REPAIR_CODES = {
   subdivide: 14,
 } as const;
 
+/** The op code of an {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
+const AUTO_REPAIR_CODE = 15;
+
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
 const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
@@ -1134,6 +1166,10 @@ function encodeLoopId(id: LoopId, out: number[]): void {
     }
   }
   out.push(minVertex, len, Number(hash & 0xffffffffn), Number(hash >> 32n));
+}
+
+function isAutoRepair(op: RepairOp | readonly RepairOp[] | AutoRepairRequest): op is AutoRepairRequest {
+  return (op as AutoRepairRequest | undefined)?.kind === "auto";
 }
 
 /** A repair op list as the binding's `(ops, loops)`; see `crate::edit` in the Rust crate. */
@@ -1364,6 +1400,17 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
     case "subdivide":
       return { verticesAdded: r.next(), trianglesAdded: r.next() };
   }
+}
+
+/** An auto repair's result, stage by stage in the order they ran; see `crate::edit` in the Rust crate. */
+function decodeAutoReport(r: Reader): AutoRepairReport {
+  const ops = Object.keys(REPAIR_CODES) as RepairOp["op"][];
+  const stages: Partial<Record<RepairOp["op"], RepairReport>> = {};
+  while (r.at < r.data.length) {
+    const op = ops[r.next()];
+    stages[op] = decodeReport(op, r);
+  }
+  return stages as unknown as AutoRepairReport;
 }
 
 /** An analysis result; see `encode_analysis` in the Rust crate. */
@@ -2259,16 +2306,33 @@ export class Scene implements SceneLike {
    * Runs one repair operation and returns its report, or a list of them in
    * order and returns their reports. A list is one transaction: one undo step,
    * and when any operation fails nothing changes and nothing is recorded.
+   * `{ kind: "auto" }` runs the standard cleanup pipeline the same way and
+   * returns a report per stage; see {@link AutoRepairRequest}.
    *
    * @throws `INVALID_ARGUMENT` for invalid options (`fillHoles` needs a bound or `loops`); `STALE_LOOPS` when a loop id of `fillHoles` no longer matches a loop of the mesh.
    */
+  repair(mesh: MeshHandle, request: AutoRepairRequest): AutoRepairReport;
   repair<const O extends RepairOp>(mesh: MeshHandle, op: O): RepairReportOf<O>;
   repair<const O extends readonly RepairOp[]>(
     mesh: MeshHandle,
     ops: O,
   ): { -readonly [K in keyof O]: RepairReportOf<O[K]> };
-  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): RepairReport | RepairReport[] {
+  repair(
+    mesh: MeshHandle,
+    op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
+  ): RepairReport | RepairReport[] | AutoRepairReport {
     const { index, generation } = this.#id(mesh);
+    if (isAutoRepair(op)) {
+      const values = Float64Array.of(
+        AUTO_REPAIR_CODE,
+        optional(op.weldTolerance, "weldTolerance"),
+        optional(op.minTriangles, "minTriangles"),
+        optional(op.maxEdges, "maxEdges"),
+        op.fair === undefined ? Number.NaN : flagOf(op.fair, true),
+      );
+      const noLoops = new Uint32Array();
+      return decodeAutoReport(new Reader(call(() => this.#scene().repair(index, generation, values, noLoops))));
+    }
     const ops: readonly RepairOp[] = Array.isArray(op) ? op : [op as RepairOp];
     const { values, loops } = encodeRepair(ops);
     const r = new Reader(call(() => this.#scene().repair(index, generation, values, loops)));

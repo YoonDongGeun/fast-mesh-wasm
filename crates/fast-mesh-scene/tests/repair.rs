@@ -2,7 +2,7 @@
 //! step, Eager BVHs, fields and sections follow it like any other edit, and
 //! a repair error is a `SceneError::Ops` that leaves the scene unchanged.
 
-use fast_mesh_scene::ops::{self, FillOptions, OpsError};
+use fast_mesh_scene::ops::{self, AutoRepairOptions, FillOptions, OpsError};
 use fast_mesh_scene::{
     DistanceField, MeshId, MeshOptions, Plane, Scene, SceneError, SceneOptions, SectionDesc,
     SignMode, UpdateMode,
@@ -550,4 +550,19 @@ fn shell_closes_an_open_mesh_in_one_step() {
     assert!(!scene.can_undo());
     assert_eq!(scene.redo(), Ok(true));
     assert_eq!(scene.mesh(id).unwrap().triangle_count(), 12);
+}
+
+#[test]
+fn auto_repair_is_one_undo_step() {
+    let mut scene = Scene::new(SceneOptions::default());
+    let id = scene.add_mesh(damaged(), eager()).unwrap();
+    let before = alive(&scene, id);
+    let options = AutoRepairOptions::default();
+    let report = scene.edit(id, |tx| ops::auto_repair(tx, &options)).unwrap();
+    assert!(report.orient.flipped_triangles > 0);
+    assert!(!report.fill.filled.is_empty());
+    assert_ne!(alive(&scene, id), before);
+    assert!(scene.undo().unwrap());
+    assert!(!scene.can_undo());
+    assert_eq!(alive(&scene, id), before);
 }

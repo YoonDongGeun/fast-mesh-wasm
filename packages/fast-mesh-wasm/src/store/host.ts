@@ -11,6 +11,8 @@ import type {
   EditResult,
   FieldHandle,
   MeshHandle,
+  AutoRepairReport,
+  AutoRepairRequest,
   RepairOp,
   RepairReport,
   Scene,
@@ -34,6 +36,7 @@ export interface Host {
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void;
   edit(mesh: MeshHandle, ops: readonly EditOp[]): Promise<EditResult>;
   repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
+  repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
   undo(): void;
   redo(): void;
   canUndo(): boolean;
@@ -141,8 +144,8 @@ export function localHost(scene: Scene): Host {
     removeMesh: (mesh) => scene.removeMesh(mesh),
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => promised(() => scene.edit(mesh, ops)),
-    // One op or a list: the cast only picks an overload (both take either).
-    repair: (mesh, op) => promised(() => scene.repair(mesh, op as RepairOp)),
+    // One op, a list or auto: the cast only picks an overload (all take any of them).
+    repair: ((mesh: MeshHandle, op: RepairOp) => promised(() => scene.repair(mesh, op))) as Host["repair"],
     undo: () => {
       scene.undo();
     },
@@ -201,8 +204,8 @@ export function workerHost(scene: WorkerScene): Host {
     removeMesh: (mesh) => scene.removeMesh(mesh),
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => scene.edit(mesh, ops),
-    // One op or a list: the cast only picks an overload (both take either).
-    repair: (mesh, op) => scene.repair(mesh, op as RepairOp),
+    // One op, a list or auto: the cast only picks an overload (all take any of them).
+    repair: ((mesh: MeshHandle, op: RepairOp) => scene.repair(mesh, op)) as Host["repair"],
     undo: () => scene.undo(),
     redo: () => scene.redo(),
     canUndo: () => scene.canUndo,

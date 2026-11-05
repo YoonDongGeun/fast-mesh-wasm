@@ -312,6 +312,74 @@ function pyramid(): { positions: number[]; indices: number[] } {
 }
 
 describe("analyze and repair", () => {
+  it("auto_repair_is_the_op_list_in_one_call", () => {
+    const { positions, indices } = damagedHemisphere();
+    const a = scene();
+    const m = a.addMesh(positions, indices);
+    const triangles = a.triangleCount(m);
+    const report = a.repair(m, { kind: "auto" });
+    // The library's order and defaults.
+    expect(Object.keys(report)).toEqual(["weld", "removeDegenerate", "orient", "removeSmallComponents", "fillHoles"]);
+    const b = scene();
+    const n = b.addMesh(positions, indices);
+    const [weld, removeDegenerate, orient, removeSmallComponents, fillHoles] = b.repair(n, [
+      { op: "weld", tolerance: 1e-5 },
+      { op: "removeDegenerate" },
+      { op: "orient" },
+      { op: "removeSmallComponents", minTriangles: 500 },
+      { op: "fillHoles", maxEdges: 64 },
+    ]);
+    expect(report).toEqual({ weld, removeDegenerate, orient, removeSmallComponents, fillHoles });
+    expect(orient.flippedTriangles).toBe(2);
+    expect(Array.from(a.views(m).positions())).toEqual(Array.from(b.views(n).positions()));
+    expect(Array.from(a.views(m).indices())).toEqual(Array.from(b.views(n).indices()));
+
+    // One undo step.
+    expect(a.undo()).toBe(true);
+    expect(a.canUndo()).toBe(false);
+    expect(a.triangleCount(m)).toBe(triangles);
+  });
+
+  it("auto_repair_passes_its_options_through", () => {
+    const { positions, indices } = damagedHemisphere();
+    const s = scene();
+    const m = s.addMesh(positions, indices);
+    // Past every hole's bound: filled nothing, skipped all three.
+    const none = s.repair(m, { kind: "auto", maxEdges: 3 }).fillHoles;
+    expect([none.filled.length, none.skipped.length]).toEqual([0, 3]);
+    s.undo();
+    // Below the rim's size, then any size.
+    const small = s.repair(m, { kind: "auto", maxEdges: 16 }).fillHoles;
+    expect([small.filled.length, small.skipped.length]).toEqual([2, 1]);
+    s.undo();
+    const any = s.repair(m, { kind: "auto", maxEdges: Infinity, fair: false }).fillHoles;
+    expect(any.skipped).toEqual([]);
+    expect(any.filled.length + any.failed.length).toBe(3);
+  });
+
+  it("auto_repair_rejects_bad_options_and_changes_nothing", () => {
+    const { positions, indices } = damagedHemisphere();
+    const s = scene();
+    const m = s.addMesh(positions, indices);
+    const triangles = s.triangleCount(m);
+    for (const bad of [
+      { weldTolerance: -1 },
+      { weldTolerance: Number.NaN },
+      { minTriangles: 1.5 },
+      { minTriangles: -1 },
+      { maxEdges: 1.5 },
+      { maxEdges: -1 },
+      { maxEdges: Number.NaN },
+    ]) {
+      expect(codeOf(() => s.repair(m, { kind: "auto", ...bad }))).toBe("INVALID_ARGUMENT");
+    }
+    expect(s.canUndo()).toBe(false);
+    expect(s.triangleCount(m)).toBe(triangles);
+    // Only the auto request has a `kind`; other values are not ops either.
+    expect(codeOf(() => s.repair(m, { kind: "melt" } as never))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, [{ kind: "auto" }] as never))).toBe("INVALID_ARGUMENT");
+  });
+
   it("repair_pipeline_one_undo_step", () => {
     const s = scene();
     const { positions, indices } = damagedHemisphere();

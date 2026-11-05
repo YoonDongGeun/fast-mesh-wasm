@@ -1,19 +1,18 @@
-// The one-click auto-repair pipeline: the five ops in issue order with the
+// The one-click auto-repair button: the library's auto request with the
 // panel's live settings, a per-stage report plus a before/after summary, one
 // repair call (one grouped undo step), and an analyse-after that feeds the
 // #124 overlay refresh.
-import type { Analysis, RepairOp, RepairReport } from "fast-mesh-wasm";
+import { type Analysis, type AutoRepairReport, type AutoRepairRequest, type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it, vi } from "vitest";
 import {
-  AUTO_REPAIR_ANY_SIZE,
-  AUTO_REPAIR_STAGE_OPS,
-  buildAutoRepairOps,
+  buildAutoRepairRequest,
   describeAutoRepairStage,
   describeAutoRepairSummary,
   formatAutoRepairReport,
   runAutoRepairPipeline,
 } from "../src/panels/auto-repair";
 import { summarize, type AnalysisSummary } from "../src/panels/repair-summary";
+import { openShellWithPiece } from "../src/scene/demo";
 import { countRepairOverlays } from "../src/viewport/repair-overlays";
 
 /** An analysis with nothing to report, then the given fields. */
@@ -49,13 +48,13 @@ const loop = (len: number, perimeter: number, closed = true) => ({
 const settings = { weldTolerance: 1e-5, minTriangles: 500, maxEdges: 64, fair: true };
 
 /** One fake report per stage, in pipeline order. */
-function stageReports(): RepairReport[] {
-  return [
-    { mergedVertices: 3, removedTriangles: 1 },
-    { removedTriangles: 2, removedVertices: 4 },
-    { flippedTriangles: 10, patches: 2, nonOrientablePatches: 0, flippedOutwardComponents: 1 },
-    { removedComponents: 1, removedTriangles: 224, removedVertices: 114 },
-    {
+function stageReports(): AutoRepairReport {
+  return {
+    weld: { mergedVertices: 3, removedTriangles: 1 },
+    removeDegenerate: { removedTriangles: 2, removedVertices: 4 },
+    orient: { flippedTriangles: 10, patches: 2, nonOrientablePatches: 0, flippedOutwardComponents: 1 },
+    removeSmallComponents: { removedComponents: 1, removedTriangles: 224, removedVertices: 114 },
+    fillHoles: {
       filled: [
         {
           id: { minVertex: 0, len: 4, hash: 0n },
@@ -69,43 +68,36 @@ function stageReports(): RepairReport[] {
       skipped: [],
       failed: [],
     },
-  ];
+  };
 }
 
-describe("buildAutoRepairOps", () => {
-  it("runs_the_issue_order", () => {
-    expect(AUTO_REPAIR_STAGE_OPS).toEqual([
-      "weld",
-      "removeDegenerate",
-      "orient",
-      "removeSmallComponents",
-      "fillHoles",
-    ]);
-    expect(buildAutoRepairOps(settings).map((o) => o.op)).toEqual([...AUTO_REPAIR_STAGE_OPS]);
-  });
-
+describe("buildAutoRepairRequest", () => {
   it("shares_the_panel_settings", () => {
-    const [weld, _degenerate, _orient, small, fill] = buildAutoRepairOps(settings);
-    expect(weld).toEqual({ op: "weld", tolerance: 1e-5 });
-    expect(small).toEqual({ op: "removeSmallComponents", minTriangles: 500 });
-    expect(fill).toEqual({ op: "fillHoles", fair: true, maxEdges: 64 });
+    expect(buildAutoRepairRequest(settings)).toEqual({
+      kind: "auto",
+      weldTolerance: 1e-5,
+      minTriangles: 500,
+      maxEdges: 64,
+      fair: true,
+    });
     // Another panel state, another pipeline: tolerance, cutoff, limit, fairing all follow.
-    const [w2, , , s2, f2] = buildAutoRepairOps({ weldTolerance: 0.01, minTriangles: 10, maxEdges: 8, fair: false });
-    expect(w2).toEqual({ op: "weld", tolerance: 0.01 });
-    expect(s2).toEqual({ op: "removeSmallComponents", minTriangles: 10 });
-    expect(f2).toEqual({ op: "fillHoles", fair: false, maxEdges: 8 });
+    expect(buildAutoRepairRequest({ weldTolerance: 0.01, minTriangles: 10, maxEdges: 8, fair: false })).toEqual({
+      kind: "auto",
+      weldTolerance: 0.01,
+      minTriangles: 10,
+      maxEdges: 8,
+      fair: false,
+    });
   });
 
   it("empty_max_means_any_size", () => {
-    const fill = buildAutoRepairOps({ ...settings, maxEdges: 0 })[4];
-    expect(fill).toEqual({ op: "fillHoles", fair: true, maxEdges: AUTO_REPAIR_ANY_SIZE });
+    expect(buildAutoRepairRequest({ ...settings, maxEdges: 0 }).maxEdges).toBe(Number.POSITIVE_INFINITY);
   });
 });
 
 describe("auto-repair report", () => {
   it("describes_each_stage", () => {
-    const ops: RepairOp["op"][] = [...AUTO_REPAIR_STAGE_OPS];
-    const lines = ops.map((op, i) => describeAutoRepairStage(op, stageReports()[i]));
+    const lines = Object.entries(stageReports()).map(([op, r]) => describeAutoRepairStage(op as RepairOp["op"], r));
     expect(lines[0]).toBe("Weld: merged 3 vertices, removed 1 triangle");
     expect(lines[1]).toBe("Remove degenerate: removed 2 triangles, 4 vertices");
     expect(lines[2]).toBe("Orient: flipped 10 triangles in 2 patches (1 component turned outward)");
@@ -159,13 +151,13 @@ describe("runAutoRepairPipeline", () => {
   const afterSummary: AnalysisSummary = summarize(analysis({}));
 
   it("is_one_repair_call_between_two_analyses", async () => {
-    const repair = vi.fn(async (_ops: RepairOp[]) => stageReports());
+    const repair = vi.fn(async (_request: AutoRepairRequest) => stageReports());
     let analyses = 0;
     const analyze = vi.fn(async () => (analyses++ === 0 ? beforeSummary : afterSummary));
     const result = await runAutoRepairPipeline({ repair, analyze }, settings);
-    // Grouped undo: exactly one repair call with the whole five-op list.
+    // Grouped undo: exactly one repair call with the auto request.
     expect(repair).toHaveBeenCalledTimes(1);
-    expect(repair.mock.calls[0][0].map((o: RepairOp) => o.op)).toEqual([...AUTO_REPAIR_STAGE_OPS]);
+    expect(repair.mock.calls[0][0]).toEqual(buildAutoRepairRequest(settings));
     // Before and after: the second analysis feeds the overlay refresh.
     expect(analyze).toHaveBeenCalledTimes(2);
     expect(result.before).toBe(beforeSummary);
@@ -176,15 +168,53 @@ describe("runAutoRepairPipeline", () => {
   });
 
   it("a_failure_leaves_one_call_and_no_report", async () => {
-    const repair = vi.fn(async (_ops: RepairOp[]) => {
+    const repair = vi.fn(async (_request: AutoRepairRequest): Promise<AutoRepairReport> => {
       throw new Error("STALE_LOOPS");
     });
     const analyze = vi.fn(async () => beforeSummary);
     await expect(runAutoRepairPipeline({ repair, analyze }, settings)).rejects.toThrow("STALE_LOOPS");
-    // Still one call (the engine runs the list all-or-nothing): nothing half-repaired.
+    // Still one call (the engine runs the request all-or-nothing): nothing half-repaired.
     expect(repair).toHaveBeenCalledTimes(1);
     // Only the before analysis ran: no after-analysis on failure.
     expect(analyze).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("auto-repair on demo mesh C", () => {
+  // The button's report before the pipeline moved into the library (#140),
+  // from the TS op list: weld, degenerate, orient, components, fill.
+  const BEFORE_140 =
+    "Auto repair (one undo step): 2 holes → none, 2 components → 1 component, 0 degenerate triangles → none, " +
+    "0 orientation conflicts → none. Weld: merged 0 vertices, removed 0 triangles; " +
+    "Remove degenerate: removed 0 triangles, 0 vertices; Orient: flipped 0 triangles in 2 patches; " +
+    "Remove small components: removed 1 component (224 triangles); " +
+    "Fill holes: filled 2 holes (186 triangles, 61 vertices added)";
+
+  it.each([
+    ["the_panel_defaults", settings],
+    ["any_size_unfaired", { ...settings, maxEdges: 0, fair: false }],
+  ])("reports_the_same_as_the_op_list_with_%s", async (_name, panel) => {
+    const data = openShellWithPiece([-2.8, 1, 0], 0.8);
+    const scene = new Scene();
+    try {
+      const mesh = scene.addMesh(data.positions, data.indices);
+      const triangles = scene.triangleCount(mesh);
+      const result = await runAutoRepairPipeline(
+        {
+          analyze: async () => summarize(scene.analyze(mesh, { weldTolerance: panel.weldTolerance, maxListed: 64 })),
+          repair: async (request) => scene.repair(mesh, request),
+        },
+        panel,
+      );
+      expect(result.line).toBe(BEFORE_140);
+      expect(scene.triangleCount(mesh)).toBe(3960);
+      // One undo step back to the loaded mesh.
+      expect(scene.undo()).toBe(true);
+      expect(scene.canUndo()).toBe(false);
+      expect(scene.triangleCount(mesh)).toBe(triangles);
+    } finally {
+      scene.free();
+    }
   });
 });
 

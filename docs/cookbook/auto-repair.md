@@ -1,7 +1,7 @@
 # Auto-repair
 
 The standard cleanup pipeline: diagnose with `analyze`, fix with one
-`repair` transaction, verify with `measure`.
+`repair` call, verify with `measure`.
 
 ## Setup
 
@@ -65,10 +65,39 @@ if (report.orientationConflicts < 1) throw new Error("expected flipped winding")
 if (report.selfIntersects !== null) throw new Error("expected no self-intersection check");
 ```
 
-## Repair in one transaction
+## Repair in one call
 
-Pass a list: one undo step, and when any op fails nothing changes and
-nothing is recorded. Reports come back in order.
+`{ kind: "auto" }` runs weld → remove degenerate → orient → remove small
+components → fill holes as one transaction: one undo step, and when a
+stage fails nothing changes and nothing is recorded. The library owns the
+order and the defaults; pass only what you want to change.
+
+```ts
+const auto = scene.repair(mesh, {
+  kind: "auto",
+  weldTolerance: 1e-6, // default 1e-5, in mesh units
+  minTriangles: 8, // default 500; the largest component always stays
+  maxEdges: 64, // default 64; Infinity fills any size
+  fair: true, // default true: fills follow the surrounding curvature
+});
+
+// One report per stage, keyed by op name, iterating in the order they ran.
+if (auto.weld.mergedVertices !== 1) throw new Error("expected the duplicate merged");
+if (auto.removeDegenerate.removedTriangles !== 1) throw new Error("expected the degenerate triangle gone");
+if (auto.orient.flippedTriangles < 1) throw new Error("expected the flipped triangle fixed");
+if (auto.removeSmallComponents.removedTriangles !== 1) throw new Error("expected the floater gone");
+if (auto.fillHoles.filled.length !== 1) throw new Error("expected the bottom filled");
+
+// One undo step takes all of it back.
+scene.undo();
+if (scene.analyze(mesh).components.length !== 2) throw new Error("expected the damaged mesh back");
+```
+
+## Choose your own ops
+
+For another order or other options, pass a list: also one undo step, and
+when any op fails nothing changes and nothing is recorded. Reports come
+back in order.
 
 ```ts
 const [weld, deg, small, orient, fill] = scene.repair(mesh, [

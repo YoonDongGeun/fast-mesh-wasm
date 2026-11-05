@@ -32,6 +32,8 @@ import type {
   MeshDistance,
   RaycastOptions,
   RayHit,
+  AutoRepairReport,
+  AutoRepairRequest,
   RepairOp,
   RepairReport,
   RepairReportOf,
@@ -1723,16 +1725,20 @@ export class WorkerScene implements SceneLike {
     return this.#query("measure", () => ({ mesh: this.#live(mesh).id }), (v) => v);
   }
 
-  /** Runs one repair operation, or a list as one transaction; see `Scene.repair`. */
+  /** Runs one repair operation, a list as one transaction, or the auto pipeline; see `Scene.repair`. */
+  repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
   repair<const O extends RepairOp>(mesh: MeshHandle, op: O): Promise<RepairReportOf<O>>;
   repair<const O extends readonly RepairOp[]>(
     mesh: MeshHandle,
     ops: O,
   ): Promise<{ -readonly [K in keyof O]: RepairReportOf<O[K]> }>;
-  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]> {
+  repair(
+    mesh: MeshHandle,
+    op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
+  ): Promise<RepairReport | RepairReport[] | AutoRepairReport> {
     return this.#ask(
       (rev, qid) => ({ kind: "repair", rev, id: this.#live(mesh).id, payload: copyInput(op, "op"), qid }),
-      (v) => v as RepairReport | RepairReport[],
+      (v) => v as RepairReport | RepairReport[] | AutoRepairReport,
     );
   }
 

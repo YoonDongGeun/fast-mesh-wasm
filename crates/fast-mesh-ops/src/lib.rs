@@ -39,6 +39,9 @@
 //!   and faired to continue the surrounding curvature. Run [`orient()`]
 //!   first on meshes that may contain flipped triangles: a hole whose rim
 //!   crosses an orientation seam is not clean and is skipped.
+//! - Auto repair: [`auto_repair()`] runs the standard cleanup pipeline (weld,
+//!   remove degenerate, orient, remove small components, fill holes) in one
+//!   transaction, with a report per stage.
 //! - Measurement: [`measure`] reports a mesh's surface area (always) and
 //!   enclosed volume (when watertight, with the reason otherwise).
 //! - Simplification: [`simplify`](simplify::simplify) shrinks a mesh toward
@@ -54,6 +57,7 @@
 
 mod analyze;
 pub mod append;
+mod auto_repair;
 pub mod boolean;
 pub mod bridge;
 mod cleanup;
@@ -78,6 +82,9 @@ mod weld;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use append::{AppendReport, AppendSource, append_mesh};
+pub use auto_repair::{
+    AutoRepairOptions, AutoRepairOptionsBuilder, AutoRepairReport, AutoRepairStage, auto_repair,
+};
 pub use boolean::{BooleanOp, BooleanPlan, BooleanReport, apply_boolean, boolean_plan};
 pub use bridge::{BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops};
 pub use cleanup::{
