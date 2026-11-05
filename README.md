@@ -319,7 +319,7 @@ import { Scene } from "fast-mesh-wasm"; // Node entry: the .wasm loads from disk
 const scene = new Scene(); // no init() needed, as in browsers
 const upper = scene.addMesh(upperPositions, upperIndices);
 const lower = scene.addMesh(lowerPositions, lowerIndices);
-scene.repair(upper, [{ op: "removeDegenerate" }]);
+scene.repair(upper, { kind: "auto" }); // weld, remove degenerate, orient, remove small pieces, fill holes
 const gap = scene.addDistanceField({ name: "gap", on: upper, to: lower, maxDistance: 2 });
 scene.setColoring(upper, { field: gap, map: "turbo", range: [-0.5, 1] });
 const distance = scene.meshDistance(upper, lower)?.distance ?? Infinity;
