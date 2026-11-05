@@ -2,7 +2,7 @@
 // PLY and glTF, and glTF 2.0 assets (binary `.glb` or JSON `.gltf` with
 // embedded buffers) back in as one mesh per (node, primitive).
 // Pure TypeScript over a {@link SceneLike}: they read `scene.views(mesh)`
-// (positions, indices, normals, colors), so meshes edited, repaired or
+// (positions, indices, normals, colors, UVs), so meshes edited, repaired or
 // colored in the session export as they are. No WebAssembly, no Worker
 // wiring: `store.scene` is a `SceneLike` with synchronous views for both
 // local and Worker scenes.

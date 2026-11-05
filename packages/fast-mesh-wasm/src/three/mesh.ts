@@ -35,6 +35,16 @@ export interface BindMeshOptions {
    */
   material?: THREE.MeshStandardMaterial | THREE.MeshPhongMaterial | THREE.MeshLambertMaterial | THREE.MeshBasicMaterial;
   /**
+   * The texture to draw the mesh's UVs with: sets the material's `map`, and
+   * makes the default material's colour white. A `material` that already has
+   * a `map` needs no more. Either way the map is on while the mesh has UVs: an
+   * operation that drops them (see `docs/uv-channel.md`) takes it off rather
+   * than stretch one texel over the surface, and undo puts it back. The
+   * texture stays the caller's to dispose. glTF UVs want `texture.flipY = false`,
+   * as three's `GLTFLoader` sets.
+   */
+  map?: THREE.Texture;
+  /**
    * The colour shown while the mesh has no colouring. Defaults to the given
    * material's colour (left untouched), or light grey for the default material.
    */
@@ -86,8 +96,8 @@ export interface BindMeshOptions {
 export interface BoundMesh {
   /**
    * The mesh to add to a THREE.Scene. Its geometry has `position`, `normal`
-   * (when the scene mesh keeps normals), `color` (while colouring is on) and
-   * an index; its `matrix` is the scene mesh's world matrix
+   * (when the scene mesh keeps normals), `uv` (while it has UVs), `color`
+   * (while colouring is on) and an index; its `matrix` is the scene mesh's world matrix
    * (`matrixAutoUpdate` is off). The colour attribute is normalized `Uint16`
    * RGBA: the engine's sRGB colours converted to three's linear working space.
    */
@@ -155,6 +165,7 @@ const BUFFERS = {
   positions: { name: "position", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   normals: { name: "normal", itemSize: 3, normalized: false, make: (n: number) => new Float32Array(n) },
   colors: { name: "color", itemSize: 4, normalized: true, make: (n: number) => new Uint16Array(n) },
+  uvs: { name: "uv", itemSize: 2, normalized: false, make: (n: number) => new Float32Array(n) },
   // Fragment shading: (v · m, m, nan, far) per vertex, encoded by `encodeValues`.
   values: { name: "fmValue", itemSize: 4, normalized: false, make: (n: number) => new Float32Array(n) },
   indices: { name: "index", itemSize: 3, normalized: false, make: (n: number) => new Uint32Array(n) },
@@ -167,7 +178,8 @@ type BufferKey = keyof typeof BUFFERS;
  * {@link SceneLike.commitFrame}: dirty ranges are copied into the attributes'
  * mirrors and marked with `addUpdateRange`, attributes are recreated when the
  * mesh's slot counts change, the colour attribute comes and goes with the
- * mesh's colouring, and `object.matrix` follows its placement.
+ * mesh's colouring, the `uv` attribute with its UVs, and `object.matrix`
+ * follows its placement.
  *
  * Dead vertex slots keep stale positions, so the geometry's bounding box and
  * sphere are computed from the vertices of live triangles only (a removed
@@ -198,7 +210,12 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
   }
   checkSoftness(options.edgeSoftness ?? 0);
   const ownsMaterial = options.material === undefined;
-  const material: Material = options.material ?? new THREE.MeshStandardMaterial({ color: DEFAULT_COLOR });
+  const material: Material =
+    options.material ?? new THREE.MeshStandardMaterial({ color: options.map === undefined ? DEFAULT_COLOR : WHITE });
+  // The texture drawn while the mesh has UVs.
+  const givenMap = material.map;
+  const map = options.map ?? givenMap;
+  material.map = map;
   // Fragment shading needs the rule and the values (other hosts get vertex
   // colours) and a material built from three's shader chunks.
   const fragment =
@@ -213,8 +230,8 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     );
   }
   const keys: readonly BufferKey[] = fragment
-    ? ["positions", "normals", "values", "indices"]
-    : ["positions", "normals", "colors", "indices"];
+    ? ["positions", "normals", "values", "uvs", "indices"]
+    : ["positions", "normals", "colors", "uvs", "indices"];
   // The colour shown without colouring; vertex colours are multiplied by the
   // material colour, so it is white while colouring is on.
   if (options.color !== undefined) {
@@ -255,6 +272,8 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       case "values":
         // Off without a rule to draw them by.
         return shading === undefined ? null : (v.values?.() ?? null);
+      case "uvs":
+        return v.uvs?.() ?? null;
       case "indices":
         return v.indices();
     }
@@ -426,7 +445,7 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       const dirty: Range[] | "all" =
         change === undefined || (key === "values" && ruleChanged)
           ? "all"
-          : change[key === "values" ? "colors" : key];
+          : (change[key === "values" ? "colors" : key] ?? []);
       if (dirty !== "all" && dirty.length === 0 && !resized) {
         continue;
       }
@@ -482,6 +501,11 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       }
     }
     setColored(attributeOf(fragment ? "values" : "colors") !== undefined);
+    const shown = attributeOf("uvs") === undefined ? null : map;
+    if (material.map !== shown) {
+      material.map = shown;
+      material.needsUpdate = true;
+    }
     return geometryChanged;
   };
 
@@ -550,6 +574,10 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
       if (ownsMaterial) {
         material.dispose();
       } else {
+        if (material.map !== givenMap) {
+          material.map = givenMap;
+          material.needsUpdate = true;
+        }
         restoreMaterial?.();
       }
     },
