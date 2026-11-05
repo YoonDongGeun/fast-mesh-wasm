@@ -417,33 +417,33 @@ fn a_wrong_minimum_is_not_applied_unless_the_limit_allows_it() {
 }
 
 #[test]
-fn a_fit_resting_on_a_small_patch_is_not_applied() {
-    // The cutoff admits only the points near where the patch happens to touch.
+fn a_fit_resting_on_a_minority_of_the_points_is_not_applied() {
+    // The moving mesh is the fixed shape plus a larger part far away, beyond
+    // `max_distance`: the fit is exact but explains under half of the mesh.
+    let near = blob_buffers(24, 48, [1.0; 3], [0.0; 3]);
+    let far = blob_buffers(40, 80, [1.0; 3], [50.0, 0.0, 0.0]);
+    let base = (near.0.len() / 3) as u32;
+    let mut positions = near.0.clone();
+    positions.extend(&far.0);
+    let mut indices = near.1.clone();
+    indices.extend(far.1.iter().map(|i| i + base));
     let mut scene = Scene::new(SceneOptions::default());
-    let buffers = blob_buffers(32, 64, [1.0; 3], [0.0; 3]);
-    let fixed = add(&mut scene, mesh(&buffers));
-    let moving = add(&mut scene, mesh(&buffers));
-    scene
-        .set_placement(
-            moving,
-            Placement {
-                translation: [2.2, 0.0, 0.0],
-                ..Placement::IDENTITY
-            },
-        )
-        .unwrap();
+    let fixed = add(&mut scene, mesh(&near));
+    let moving = add(&mut scene, mesh(&(positions, indices)));
+    let start = nudged(&Placement::IDENTITY);
+    scene.set_placement(moving, start).unwrap();
     let options = RegisterOptions {
         icp: IcpOptions {
-            max_distance: 0.25,
-            tolerance: 1e-3,
+            max_distance: 1.0,
             ..IcpOptions::default()
         },
-        max_rmse: Some(f64::INFINITY),
         ..RegisterOptions::default()
     };
     let r = scene.register(moving, fixed, &options).unwrap();
+    assert!(r.converged, "{r:?}");
     assert_eq!(r.not_applied, Some(NotApplied::TooFewInliers), "{r:?}");
     assert!(r.inliers * 2 < r.samples, "{r:?}");
+    assert_eq!(scene.placement(moving).unwrap(), start);
 }
 
 #[test]
