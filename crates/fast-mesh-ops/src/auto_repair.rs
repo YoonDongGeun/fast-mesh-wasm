@@ -368,9 +368,9 @@ mod tests {
             fail_allocations_after(Some(n));
             let r = auto_repair(&mut tx, &options());
             fail_allocations_after(None);
-            if r.is_ok() {
+            if let Ok(report) = &r {
                 // Past every failure point: the sweep reached the last stage.
-                assert!(r.unwrap().fill.filled.len() > 1);
+                assert!(report.fill.filled.len() > 1);
                 assert!(n > 5);
                 break;
             }
