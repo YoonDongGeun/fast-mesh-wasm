@@ -106,10 +106,7 @@ fn a_boolean_with_itself_keeps_uvs() {
 
 #[test]
 fn evicting_a_boolean_from_the_history_forgets_the_uvs() {
-    let mut scene = Scene::new(SceneOptions {
-        history_budget: 0,
-        ..SceneOptions::default()
-    });
+    let mut scene = Scene::new(SceneOptions { history_budget: 0 });
     let a = add(&mut scene, planar(box_mesh(0.0)));
     let b = add(&mut scene, box_mesh(0.5));
     scene.boolean(a, b, BooleanOp::Union).unwrap();

@@ -30,7 +30,7 @@ The tests are one per row: `crates/fast-mesh-ops/src/uv_table.rs` and `crates/fa
 
 ## Seams
 
-A seam is two vertices at one position with different UVs. They are separate vertices, so to everything topological the seam is a boundary: `boundaryLoops` lists it, `analyze` counts it as open, and `fillHoles` on it would add a patch. To close such a mesh ignoring its texture, add it without `uvs` first.
+A seam is two vertices at one position with different UVs. They are separate vertices, so to everything topological the seam is a boundary: `analyze` counts it as open, `fillHoles` on it would add a patch, and `boolean`, which needs a closed mesh, rejects it. To treat such a mesh as closed, ignoring its texture, add it without `uvs` and weld it.
 
 ## Files
 
