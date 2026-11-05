@@ -21,18 +21,21 @@
 //!    - `32` normals all
 //!    - `64` colours all
 //!    - `128` indices all
+//!    - `256` UVs reported: a fifth range list follows (never set for a mesh
+//!      that has no UVs and did not just lose them)
+//!    - `512` UVs all
 //! 2. four range lists, for positions, normals, colours and indices, each
-//!    `n, start0, count0, ..., start(n-1), count(n-1)`. Ranges are in
-//!    elements (vertex slots, or triangle slots for indices), ascending and
-//!    disjoint. `n` is 0 when the buffer is "all" (its flag is set) or
-//!    unchanged.
+//!    `n, start0, count0, ..., start(n-1), count(n-1)`, and with flag `256`
+//!    a fifth for UVs. Ranges are in elements (vertex slots, or triangle
+//!    slots for indices), ascending and disjoint. `n` is 0 when the buffer is
+//!    "all" (its flag is set) or unchanged.
 //! 3. `fields_n, field ids...`
 //! 4. `sections_n, section ids...`
 //!
 //! The TypeScript decoder mirrors this layout.
 
 use fast_mesh_scene::MeshChanges;
-use fast_mesh_store::{Mesh, StoreError};
+use fast_mesh_store::{Mesh, StoreError, UV_CHANNEL};
 
 /// Dirty slots that are at most this many slots apart share one range.
 pub(crate) const RANGE_GAP: u32 = 8;
@@ -45,6 +48,8 @@ pub(crate) const FLAG_POSITIONS_ALL: u32 = 16;
 pub(crate) const FLAG_NORMALS_ALL: u32 = 32;
 pub(crate) const FLAG_COLORS_ALL: u32 = 64;
 pub(crate) const FLAG_INDICES_ALL: u32 = 128;
+pub(crate) const FLAG_UVS: u32 = 256;
+pub(crate) const FLAG_UVS_ALL: u32 = 512;
 
 /// The buffer sizes last reported for one mesh. The render buffers
 /// themselves live in the scene: positions and triangles in the store
@@ -69,6 +74,7 @@ pub(crate) struct Dirty {
     pub colors: Option<Vec<u32>>,
     /// Triangle slots.
     pub indices: Option<Vec<u32>>,
+    pub uvs: Option<Vec<u32>>,
     /// The vertex or triangle slot count changed since the previous report.
     /// Every list is then `None`.
     pub capacity_changed: bool,
@@ -83,6 +89,7 @@ impl Dirty {
             normals: None,
             colors: None,
             indices: None,
+            uvs: None,
             capacity_changed: true,
         }
     }
@@ -94,6 +101,7 @@ impl Dirty {
             normals: Some(Vec::new()),
             colors: Some(Vec::new()),
             indices: Some(Vec::new()),
+            uvs: Some(Vec::new()),
             capacity_changed: false,
         }
     }
@@ -109,6 +117,8 @@ pub(crate) struct Record {
     pub removed: bool,
     pub placement_changed: bool,
     pub dirty: Dirty,
+    /// Send the UV list: the mesh has UVs, or just lost them.
+    pub uvs_reported: bool,
     pub fields: Vec<u32>,
     pub sections: Vec<u32>,
 }
@@ -248,15 +258,50 @@ impl RenderState {
             Some(c) if !self.stale => slots(&[c], vs)?,
             _ => None,
         };
+        let uvs = if uvs_toggled(changes) {
+            None
+        } else if mesh.uvs().is_none() {
+            Some(Vec::new())
+        } else {
+            match set {
+                None => None,
+                // Like positions: a vertex listed as moved may be a reused slot
+                // with any channel changed, and undo rewrites dead slots.
+                Some(c) => {
+                    let written = c.channels.iter().find(|(n, _)| n == UV_CHANNEL);
+                    let written = written.map_or(&[][..], |(_, ids)| ids);
+                    slots(
+                        &[
+                            written,
+                            &c.vertices_added,
+                            &c.vertices_moved,
+                            &c.vertices_removed,
+                        ],
+                        vs,
+                    )?
+                }
+            }
+        };
         self.normals_len = normals_len;
         Ok(Dirty {
             positions,
             normals,
             colors,
             indices,
+            uvs,
             capacity_changed: false,
         })
     }
+}
+
+/// Whether the mesh's UV channel came or went whole in this report.
+fn uvs_toggled(changes: &MeshChanges) -> bool {
+    changes.channels_written.iter().any(|n| n == UV_CHANNEL)
+}
+
+/// Whether a record of `mesh` carries the UV list.
+pub(crate) fn uvs_reported(mesh: &Mesh, changes: &MeshChanges) -> bool {
+    mesh.uvs().is_some() || uvs_toggled(changes)
 }
 
 /// Merges ascending slot ids into `(start, count)` ranges. Slots with at
@@ -296,9 +341,13 @@ pub(crate) fn encode(records: &[Record], out: &mut Vec<u32>) {
             | flag(all(&d.positions), FLAG_POSITIONS_ALL)
             | flag(all(&d.normals), FLAG_NORMALS_ALL)
             | flag(all(&d.colors), FLAG_COLORS_ALL)
-            | flag(all(&d.indices), FLAG_INDICES_ALL);
+            | flag(all(&d.indices), FLAG_INDICES_ALL)
+            | flag(r.uvs_reported, FLAG_UVS)
+            | flag(r.uvs_reported && all(&d.uvs), FLAG_UVS_ALL);
         out.extend_from_slice(&[r.mesh_index, r.mesh_generation, flags]);
-        for set in [&d.positions, &d.normals, &d.colors, &d.indices] {
+        let sets = [&d.positions, &d.normals, &d.colors, &d.indices, &d.uvs];
+        let count = if r.uvs_reported { 5 } else { 4 };
+        for set in &sets[..count] {
             // A capacity change sends no ranges: every buffer is "all".
             let ranges = set
                 .as_deref()
@@ -350,6 +399,68 @@ mod tests {
     fn step(scene: &mut Scene, id: MeshId, state: &mut RenderState) -> Dirty {
         let ch = take(scene, id);
         state.apply(scene.mesh(id).unwrap(), &ch, 0).unwrap()
+    }
+
+    #[test]
+    fn uvs_are_dirty_for_added_and_written_vertices_and_all_when_toggled() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let mut mesh = quad();
+        mesh.add_uvs(&[0.; 8]).unwrap();
+        let id = scene.add_mesh(mesh, MeshOptions::default()).unwrap();
+        let mut state = RenderState::new(scene.mesh(id).unwrap());
+        let added = take(&mut scene, id);
+        assert!(uvs_reported(scene.mesh(id).unwrap(), &added));
+        state.apply(scene.mesh(id).unwrap(), &added, 0).unwrap();
+        // A moved vertex counts: it may be a reused slot.
+        scene
+            .edit(id, |tx| {
+                tx.write_channel(UV_CHANNEL, &[1], &[0.5, 0.5])?;
+                tx.set_positions(&[3], &[[0., 2., 0.]])
+            })
+            .unwrap();
+        assert_eq!(step(&mut scene, id, &mut state).uvs, Some(vec![1, 3]));
+        // Dropped: "all", and still reported though the mesh has none now.
+        scene.edit(id, |tx| tx.drop_channel(UV_CHANNEL)).unwrap();
+        let ch = take(&mut scene, id);
+        let mesh = scene.mesh(id).unwrap();
+        assert!(mesh.uvs().is_none() && uvs_reported(mesh, &ch));
+        assert_eq!(state.apply(mesh, &ch, 0).unwrap().uvs, None);
+        // Then a later change has nothing to say about them.
+        scene
+            .edit(id, |tx| tx.set_positions(&[3], &[[0., 3., 0.]]))
+            .unwrap();
+        let ch = take(&mut scene, id);
+        assert!(!uvs_reported(scene.mesh(id).unwrap(), &ch));
+        // Restored: "all".
+        assert!(scene.undo().unwrap());
+        assert!(scene.undo().unwrap());
+        let ch = take(&mut scene, id);
+        let mesh = scene.mesh(id).unwrap();
+        assert!(mesh.uvs().is_some());
+        assert_eq!(state.apply(mesh, &ch, 0).unwrap().uvs, None);
+    }
+
+    #[test]
+    fn a_mesh_without_uvs_has_the_same_record_words_as_ever() {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(quad(), MeshOptions::default()).unwrap();
+        let ch = take(&mut scene, id);
+        assert!(!uvs_reported(scene.mesh(id).unwrap(), &ch));
+        let record = Record {
+            mesh_index: 0,
+            mesh_generation: 0,
+            added: true,
+            removed: false,
+            placement_changed: false,
+            dirty: Dirty::clean(),
+            uvs_reported: false,
+            fields: vec![],
+            sections: vec![],
+        };
+        let mut out = Vec::new();
+        encode(&[record], &mut out);
+        // Count, id, flags, four empty lists, fields, sections.
+        assert_eq!(out, vec![1, 0, 0, FLAG_ADDED, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -482,6 +593,7 @@ mod tests {
             removed: false,
             placement_changed: true,
             dirty,
+            uvs_reported: false,
             fields: vec![],
             sections: vec![],
         };
@@ -537,12 +649,16 @@ mod tests {
         for _ in 0..n {
             let (mesh_index, mesh_generation, flags) = (next(), next(), next());
             let mut lists: Vec<Option<Vec<u32>>> = Vec::new();
-            for bit in [
+            let uvs_reported = flags & FLAG_UVS != 0;
+            let all = [
                 FLAG_POSITIONS_ALL,
                 FLAG_NORMALS_ALL,
                 FLAG_COLORS_ALL,
                 FLAG_INDICES_ALL,
-            ] {
+                FLAG_UVS_ALL,
+            ];
+            for bit in &all[..if uvs_reported { 5 } else { 4 }] {
+                let bit = *bit;
                 let ranges = next();
                 let mut slots = Vec::new();
                 for _ in 0..ranges {
@@ -573,8 +689,10 @@ mod tests {
                     normals: lists.next().unwrap(),
                     colors: lists.next().unwrap(),
                     indices: lists.next().unwrap(),
+                    uvs: lists.next().unwrap_or(Some(Vec::new())),
                     capacity_changed: flags & FLAG_CAPACITY != 0,
                 },
+                uvs_reported,
                 fields,
                 sections,
             });
@@ -594,6 +712,7 @@ mod tests {
                 removed: false,
                 placement_changed: true,
                 dirty: Dirty::all(),
+                uvs_reported: true,
                 fields: vec![11, 12],
                 sections: vec![],
             },
@@ -608,8 +727,10 @@ mod tests {
                     normals: Some(vec![5]),
                     colors: None,
                     indices: Some(vec![0, 1, 100, 101, 102]),
+                    uvs: Some(vec![]),
                     capacity_changed: false,
                 },
+                uvs_reported: false,
                 fields: vec![],
                 sections: vec![2, 9, 4],
             },
@@ -620,6 +741,7 @@ mod tests {
                 removed: true,
                 placement_changed: false,
                 dirty: Dirty::clean(),
+                uvs_reported: false,
                 fields: vec![],
                 sections: vec![],
             },
@@ -635,6 +757,7 @@ mod tests {
         // A capacity change makes every buffer "all", whatever the lists say.
         let mut grown = records[1].clone();
         grown.dirty.capacity_changed = true;
+        grown.uvs_reported = true;
         encode(std::slice::from_ref(&grown), &mut out);
         assert_eq!(decode(&out)[0].dirty, Dirty::all());
         encode(&[], &mut out);

@@ -165,7 +165,7 @@ async function expectMirrored(scene: WorkerScene, mesh: MeshHandle): Promise<voi
   scene.commitFrame();
   const dump = await pending;
   const v = scene.views(mesh);
-  for (const name of ["positions", "normals", "colors", "values", "indices"] as const) {
+  for (const name of ["positions", "normals", "colors", "values", "uvs", "indices"] as const) {
     expect(dump[name], `${name} dumped`).not.toBeUndefined();
     const want = bytes(dump[name]);
     const got = bytes(v[name]?.() ?? null);
@@ -190,6 +190,122 @@ function rng(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+describe("WorkerScene UVs", () => {
+  const quad = {
+    positions: Float64Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]),
+    indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+    uvs: Float32Array.from([0, 0, 0.25, 0, 0.25, 0.5, 0, 0.5]),
+  };
+  const facing = {
+    positions: Float64Array.from([0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1]),
+    indices: Uint32Array.from([0, 1, 2, 0, 2, 3]),
+  };
+
+  /** A sphere with a UV per vertex, large or small. */
+  const textured = () => {
+    const s = sphere([0, 0, 0]);
+    const uvs = new Float32Array((2 * s.positions.length) / 3);
+    for (let i = 0; i < uvs.length; i++) {
+      uvs[i] = i / uvs.length;
+    }
+    return { ...s, uvs };
+  };
+
+  it("mirrors them through add, repair and undo, and stays off without them", async () => {
+    const { scene } = await start();
+    const s = textured();
+    const m = scene.addMesh(s.positions, s.indices, { uvs: s.uvs });
+    const plain = scene.addMesh(s.positions, s.indices);
+    await settle(scene);
+    expect(scene.views(m).uvs()).toEqual(s.uvs);
+    expect(scene.views(plain).uvs()).toBeNull();
+    await expectMirrored(scene, m);
+    await expectMirrored(scene, plain);
+
+    await (async () => {
+      const r = scene.repair(m, { op: "subdivide" });
+      scene.commitFrame();
+      await r;
+    })();
+    await settle(scene);
+    expect(scene.views(m).uvs()?.length).toBe((2 * scene.views(m).positions().length) / 3);
+    await expectMirrored(scene, m);
+
+    scene.undo();
+    await settle(scene);
+    expect(scene.views(m).uvs()?.subarray(0, s.uvs.length)).toEqual(s.uvs);
+    await expectMirrored(scene, m);
+  });
+
+  it("builds them in a background add", async () => {
+    const scene = await createWorkerScene({
+      createWorker: () => new NodeWorker(),
+      backgroundAddTriangles: 1,
+    });
+    opened.push(scene);
+    const s = textured();
+    const m = scene.addMesh(s.positions, s.indices, { uvs: s.uvs });
+    await settle(scene);
+    await vi.waitFor(async () => {
+      await settle(scene);
+      expect(scene.status(`mesh:${scene.idOf(m)}`).status).toBe("ready");
+    });
+    expect(scene.views(m).uvs()).toEqual(s.uvs);
+    await expectMirrored(scene, m);
+  });
+
+  it("a background add with bad UVs fails its status", async () => {
+    const scene = await createWorkerScene({
+      createWorker: () => new NodeWorker(),
+      backgroundAddTriangles: 1,
+    });
+    opened.push(scene);
+    const s = textured();
+    for (const uvs of [s.uvs.subarray(2), s.uvs.slice().fill(Number.NaN)]) {
+      const m = scene.addMesh(s.positions, s.indices, { uvs });
+      await vi.waitFor(async () => {
+        await settle(scene);
+        expect(scene.status(`mesh:${scene.idOf(m)}`).status).toBe("error");
+      });
+    }
+  });
+
+  it("a join that drops them turns the mirror off, and undo brings it back", async () => {
+    const { scene } = await start();
+    const a = scene.addMesh(quad.positions, quad.indices, { uvs: quad.uvs });
+    const b = scene.addMesh(facing.positions, facing.indices);
+    const local = new Scene();
+    const la = local.addMesh(quad.positions, quad.indices);
+    const lb = local.addMesh(facing.positions, facing.indices);
+    const [loopA] = local.analyze(la).loops;
+    const [loopB] = local.analyze(lb).loops;
+    local.free();
+    await settle(scene);
+    const join = scene.join(a, b, { loopA: loopA.id, loopB: loopB.id });
+    scene.commitFrame();
+    await join;
+    await settle(scene);
+    expect(scene.views(a).uvs()).toBeNull();
+    await expectMirrored(scene, a);
+    scene.undo();
+    await settle(scene);
+    expect(scene.views(a).uvs()?.subarray(0, 8)).toEqual(quad.uvs);
+    await expectMirrored(scene, a);
+  });
+
+  it("a restart replays them", async () => {
+    const { scene } = await start();
+    const s = textured();
+    const m = scene.addMesh(s.positions, s.indices, { uvs: s.uvs });
+    await settle(scene);
+    await scene.restart();
+    scene.commitFrame();
+    await settle(scene);
+    expect(scene.views(m).uvs()).toEqual(s.uvs);
+    await expectMirrored(scene, m);
+  });
+});
 
 describe("WorkerScene", () => {
   it("multi_target_field_matches_local_scene", async () => {

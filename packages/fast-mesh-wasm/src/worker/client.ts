@@ -44,7 +44,7 @@ import type {
 } from "../scene.js";
 import { copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
-import { type MeshViews, ViewGuard } from "../views.js";
+import { type SceneMeshViews, ViewGuard } from "../views.js";
 import {
   type ClientId,
   type ColorRuleWire,
@@ -193,7 +193,7 @@ let createScene: (
 ) => [WorkerScene, Promise<void>];
 
 /** Elements per slot of each buffer. */
-const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, indices: 3 } as const;
+const STRIDE = { positions: 3, normals: 3, colors: 4, values: 1, uvs: 2, indices: 3 } as const;
 type BufferName = keyof typeof STRIDE;
 const BUFFERS = Object.keys(STRIDE) as BufferName[];
 const MAKE = {
@@ -201,6 +201,7 @@ const MAKE = {
   normals: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   colors: (b: ArrayBuffer | number) => new Uint8Array(b as ArrayBuffer),
   values: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
+  uvs: (b: ArrayBuffer | number) => new Float32Array(b as ArrayBuffer),
   indices: (b: ArrayBuffer | number) => new Uint32Array(b as ArrayBuffer),
 };
 
@@ -221,6 +222,9 @@ function transferOf(batch: Request[]): Transferable[] {
   for (const req of batch) {
     if (req.kind === "addMesh") {
       transfer.push(req.positions, req.indices);
+      if (req.uvs !== undefined) {
+        transfer.push(req.uvs);
+      }
     }
   }
   return transfer;
@@ -368,6 +372,8 @@ interface MeshState {
   colors: Uint8Array | null;
   /** The values behind the colours: mirrored over the colours' ranges. */
   values: Float32Array | null;
+  /** The UVs, for a mesh with them. */
+  uvs: Float32Array | null;
   indices: Uint32Array;
   /** The placement as the engine last reported it. */
   pose: Pose;
@@ -1233,6 +1239,7 @@ export class WorkerScene implements SceneLike {
       normals: c.normals,
       colors: c.colors,
       indices: c.indices,
+      ...(c.uvs === undefined ? {} : { uvs: c.uvs }),
       fieldsChanged: c.fields.flatMap((id) => this.#fields.get(id)?.handle ?? []),
       sectionsChanged: c.sections.flatMap((id) => this.#sections.get(id)?.handle ?? []),
     };
@@ -1246,16 +1253,17 @@ export class WorkerScene implements SceneLike {
     st.normals = null;
     st.colors = null;
     st.values = null;
+    st.uvs = null;
     st.shown = null;
     this.#guard?.bump();
   }
 
   #applyBuffer(st: MeshState, name: BufferName, c: MeshChangeWire): void {
-    const bytes = c.bytes[name];
+    const bytes = c.bytes[name] ?? null;
     // The values change with the colours.
-    const ranges = c[name === "values" ? "colors" : name];
+    const ranges = c[name === "values" ? "colors" : name] ?? [];
     if (bytes === null) {
-      if ((name === "normals" || name === "colors" || name === "values") && st[name] !== null) {
+      if ((name === "normals" || name === "colors" || name === "values" || name === "uvs") && st[name] !== null) {
         st[name] = null;
         this.#guard?.bump();
       }
@@ -1426,7 +1434,7 @@ export class WorkerScene implements SceneLike {
   addMesh(
     positions: Positions64,
     indices: Indices,
-    options: Pick<AddMeshOptions, "origin" | "normals"> = {},
+    options: Pick<AddMeshOptions, "origin" | "normals" | "uvs"> = {},
   ): MeshHandle {
     this.#alive();
     // Copies: the buffers are transferred.
@@ -1434,6 +1442,10 @@ export class WorkerScene implements SceneLike {
       x instanceof Float32Array ? x.slice() : Float64Array.from(x as ArrayLike<number>),
     );
     const i = copyArray(indices, "indices", (x) => Uint32Array.from(x as ArrayLike<number>));
+    const uvs =
+      options.uvs === undefined
+        ? undefined
+        : copyArray(options.uvs, "uvs", (x) => Float32Array.from(x as ArrayLike<number>));
     const origin: Vec3 | undefined =
       options.origin === undefined ? boxCentre(p) : [options.origin[0], options.origin[1], options.origin[2]];
     const id = ++this.#nextMesh;
@@ -1447,6 +1459,7 @@ export class WorkerScene implements SceneLike {
       normals: null,
       colors: null,
       values: null,
+      uvs: null,
       shown: null,
       pendingRules: new Map(),
       indices: new Uint32Array(0),
@@ -1472,6 +1485,7 @@ export class WorkerScene implements SceneLike {
       positions: p.buffer as ArrayBuffer,
       f64: !(p instanceof Float32Array),
       indices: i.buffer as ArrayBuffer,
+      ...(uvs === undefined ? {} : { uvs: uvs.buffer as ArrayBuffer }),
       options: { origin, normals: st.normalsOn },
     };
     this.#push(st.add);
@@ -1587,7 +1601,7 @@ export class WorkerScene implements SceneLike {
    * getter returns the current mirror; a mirror is replaced when the slot
    * count changes or a buffer turns on or off, so get views right before use.
    */
-  views(mesh: MeshHandle): MeshViews {
+  views(mesh: MeshHandle): SceneMeshViews {
     const st = this.#mirrored(mesh);
     const guard = this.#guard;
     const wrap = <T extends ArrayBufferView>(v: T): T => (guard === undefined ? v : guard.wrap(v));
@@ -1599,6 +1613,7 @@ export class WorkerScene implements SceneLike {
         this.#wantValues();
         return st.values === null ? null : wrap(st.values);
       },
+      uvs: () => (st.uvs === null ? null : wrap(st.uvs)),
       indices: () => wrap(st.indices),
     };
   }
@@ -2489,7 +2504,7 @@ export class WorkerScene implements SceneLike {
         continue;
       }
       if (st.live) {
-        const { positions, indices } = liveGeometry(st);
+        const { positions, indices, uvs } = liveGeometry(st);
         this.#push({
           kind: "addMesh",
           rev: ++this.#rev,
@@ -2497,6 +2512,7 @@ export class WorkerScene implements SceneLike {
           positions: positions.buffer as ArrayBuffer,
           f64: true,
           indices: indices.buffer as ArrayBuffer,
+          ...(uvs === null ? {} : { uvs: uvs.buffer as ArrayBuffer }),
           options: { origin: st.origin, normals: st.normalsOn },
           // The restart resolves with every mesh live.
           inline: true,
@@ -2752,7 +2768,7 @@ function copyArray<T>(value: unknown, what: string, copy: (x: unknown) => T): T 
  * slot order, as world positions before placement (local plus origin, in
  * `f64`, so the engine gets the same `f32` local positions back).
  */
-function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32Array } {
+function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32Array; uvs: Float32Array | null } {
   const idx = st.indices;
   const p = st.positions;
   const slots = p.length / 3;
@@ -2775,6 +2791,7 @@ function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32
     }
   }
   const positions = new Float64Array(3 * vertices);
+  const uvs = st.uvs === null ? null : new Float32Array(2 * vertices);
   const [ox, oy, oz] = st.origin;
   for (let v = 0; v < slots; v++) {
     const k = index[v];
@@ -2782,6 +2799,10 @@ function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32
       positions[3 * k] = p[3 * v] + ox;
       positions[3 * k + 1] = p[3 * v + 1] + oy;
       positions[3 * k + 2] = p[3 * v + 2] + oz;
+      if (uvs !== null && st.uvs !== null) {
+        uvs[2 * k] = st.uvs[2 * v];
+        uvs[2 * k + 1] = st.uvs[2 * v + 1];
+      }
     }
   }
   const indices = new Uint32Array(3 * triangles);
@@ -2797,7 +2818,7 @@ function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32
     indices[at++] = index[b];
     indices[at++] = index[c];
   }
-  return { positions, indices };
+  return { positions, indices, uvs };
 }
 
 /** Merges a later record into an earlier one of the same mesh. */
@@ -2821,6 +2842,7 @@ function merge(a: MeshChange, b: MeshChange): MeshChange {
     normals: mergeRanges(a.normals, b.normals),
     colors: mergeRanges(a.colors, b.colors),
     indices: mergeRanges(a.indices, b.indices),
+    ...(a.uvs === undefined && b.uvs === undefined ? {} : { uvs: mergeRanges(a.uvs ?? [], b.uvs ?? []) }),
     fieldsChanged: union(a.fieldsChanged, b.fieldsChanged),
     sectionsChanged: union(a.sectionsChanged, b.sectionsChanged),
   };

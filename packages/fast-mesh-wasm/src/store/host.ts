@@ -25,7 +25,7 @@ import type { Indices, PlacementInput, Positions64 } from "../api.js";
 import { addFieldKeyed, type KeyStatus, watchStatusKeys, type WorkerScene } from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
-export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals">;
+export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals" | "uvs">;
 
 /** What the store needs of a scene, the same on both hosts. */
 export interface Host {

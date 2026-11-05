@@ -85,6 +85,7 @@ export {
   type Range,
   type RaycastOptions,
   type RayHit,
+  type SceneMeshViews,
   type RelaxReport,
   type RemeshReport,
   type RemoveReport,

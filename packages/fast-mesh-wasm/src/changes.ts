@@ -12,6 +12,8 @@ const POSITIONS_ALL = 16;
 const NORMALS_ALL = 32;
 const COLORS_ALL = 64;
 const INDICES_ALL = 128;
+const UVS = 256;
+const UVS_ALL = 512;
 
 /** One mesh's record, with raw ids; the scene turns them into handles. */
 export interface RawChange {
@@ -25,6 +27,8 @@ export interface RawChange {
   normals: Range[] | "all";
   colors: Range[] | "all";
   indices: Range[] | "all";
+  /** Only for a mesh that has UVs or just lost them. */
+  uvs?: Range[] | "all";
   fields: number[];
   sections: number[];
 }
@@ -74,6 +78,7 @@ export function decodeChanges(msg: Uint32Array): RawChange[] {
       normals: ranges((flags & NORMALS_ALL) !== 0),
       colors: ranges((flags & COLORS_ALL) !== 0),
       indices: ranges((flags & INDICES_ALL) !== 0),
+      ...((flags & UVS) !== 0 ? { uvs: ranges((flags & UVS_ALL) !== 0) } : {}),
       fields: ids(),
       sections: ids(),
     });

@@ -57,7 +57,9 @@ export type Request =
       f64: boolean;
       /** `Uint32Array` bytes. */
       indices: ArrayBuffer;
-      /** `mode` is ignored: the Worker scene is always `"eager"`. */
+      /** `Float32Array` bytes of the UVs, for a mesh with them. */
+      uvs?: ArrayBuffer;
+      /** `mode` and `uvs` are ignored: the Worker scene is always `"eager"`, and `uvs` above is what crosses. */
       options: AddMeshOptions;
       /**
        * Add in place, in the batch's own result (a restart's replay), never
@@ -183,6 +185,7 @@ export interface QueryMap {
       normals: Float32Array | null;
       colors: Uint8Array | null;
       values: Float32Array | null;
+      uvs: Float32Array | null;
       indices: Uint32Array;
       placement: { rotation: number[]; translation: Vec3; scale: Vec3 };
       matrix4: number[];
@@ -202,9 +205,10 @@ export type RepairPayload = RepairOp | RepairOp[] | AutoRepairRequest;
  * `bytes` holds, per buffer, every dirty range's elements concatenated in
  * range order (positions and normals: 3 `f32` per vertex slot; colours: 4
  * bytes per vertex slot; values: 1 `f32` per vertex slot, over the colours'
- * ranges, once a `values` request turned them on; indices: 3 `u32` per triangle slot), or the whole buffer when the
+ * ranges, once a `values` request turned them on; UVs: 2 `f32` per vertex slot; indices: 3 `u32` per triangle slot), or the whole buffer when the
  * ranges are `"all"`. `null` for a buffer that is off (normals, colours and
- * values), and for every buffer of a removed mesh.
+ * values), and for every buffer of a removed mesh; UVs are absent when off.
+ * `uvs` is present only for a mesh that has UVs or just lost them.
  */
 export interface MeshChangeWire {
   id: ClientId;
@@ -216,6 +220,7 @@ export interface MeshChangeWire {
   normals: Range[] | "all";
   colors: Range[] | "all";
   indices: Range[] | "all";
+  uvs?: Range[] | "all";
   fields: ClientId[];
   sections: ClientId[];
   /** Slot counts after the change; 0 for a removed mesh. */
@@ -227,6 +232,7 @@ export interface MeshChangeWire {
     colors: ArrayBuffer | null;
     values: ArrayBuffer | null;
     indices: ArrayBuffer | null;
+    uvs?: ArrayBuffer;
   };
 }
 
