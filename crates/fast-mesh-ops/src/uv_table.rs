@@ -572,6 +572,165 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
     check(&|tx| offset(tx, &OffsetOptions { distance: 0.1 }).map(|_| ()));
 }
 
+// ---- what moving vertices does to a seam
+
+/// Two quads with a UV seam along `x = 1`, its corners at slots 1, 2 and 4, 5.
+/// `bend` lifts the far sides, so the two sides of the seam have different
+/// normals.
+fn seam_with_bend(bend: f32) -> Mesh {
+    let mut m = mesh_of(
+        &[
+            0., 0., bend, 1., 0., 0., 1., 1., 0., 0., 1., bend, //
+            1., 0., 0., 1., 1., 0., 2., 0., bend, 2., 1., bend,
+        ],
+        &[[0, 1, 2], [0, 2, 3], [4, 6, 7], [4, 7, 5]],
+    );
+    m.add_uvs(&[
+        0., 0., 0.4, 0., 0.4, 1., 0., 1., 0.6, 0., 0.6, 1., 1., 0., 1., 1.,
+    ])
+    .unwrap();
+    m
+}
+
+/// The distance between the two sides of `seam_with_bend`'s seam.
+fn seam_gap(m: &Mesh) -> f32 {
+    let (a, b) = (m.position(1).unwrap(), m.position(4).unwrap());
+    (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn offset_opens_a_bent_seam_and_keeps_a_flat_one() {
+    let options = OffsetOptions { distance: 0.1 };
+    let mut bent = seam_with_bend(1.);
+    edit(&mut bent, |tx| offset(tx, &options));
+    assert!(seam_gap(&bent) > 0.05, "{}", seam_gap(&bent));
+    let mut flat = seam_with_bend(0.);
+    edit(&mut flat, |tx| offset(tx, &options));
+    assert_eq!(seam_gap(&flat), 0.);
+}
+
+#[test]
+fn brushes_open_a_bent_seam_unless_the_move_is_the_callers() {
+    let brush = Brush {
+        center: [1., 0.5, 0.],
+        radius: 3.,
+        falloff: Falloff::Linear,
+        strength: 0.5,
+    };
+    let mut inflated = seam_with_bend(1.);
+    edit(&mut inflated, |tx| inflate(tx, &InflateOptions { brush }));
+    assert!(seam_gap(&inflated) > 0.01, "{}", seam_gap(&inflated));
+    for method in [SmoothMethod::Taubin, SmoothMethod::Laplacian] {
+        let options = SmoothOptions {
+            brush,
+            cycles: 1,
+            method,
+        };
+        let mut smoothed = seam_with_bend(1.);
+        // Lopsided, so the two sides have different neighbours.
+        let mut tx = smoothed.begin_edit();
+        tx.set_positions(&[0], &[[-1., 0., 2.]]).unwrap();
+        crate::deform::smooth(&mut tx, &options).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            seam_gap(&smoothed) > 0.01,
+            "{method:?}: {}",
+            seam_gap(&smoothed)
+        );
+    }
+    let mut grabbed = seam_with_bend(1.);
+    edit(&mut grabbed, |tx| {
+        let options = GrabOptions {
+            brush,
+            direction: [0., 0., 1.],
+        };
+        crate::deform::grab(tx, &options)
+    });
+    assert_eq!(seam_gap(&grabbed), 0.);
+}
+
+#[test]
+fn shell_walls_a_seam_and_opens_its_inner_surface() {
+    let options = ShellOptions { thickness: 0.1 };
+    // Each island has 4 border edges, with 2 wall triangles on each, and 2
+    // triangles copied. One welded sheet would have 6 border edges.
+    let mut flat = seam_with_bend(0.);
+    edit(&mut flat, |tx| shell(tx, &options));
+    assert_eq!(flat.triangle_count(), 4 + 4 + 2 * 8);
+    // Two of those walls stand along the seam itself, one for each island.
+    let on_seam = (0..flat.triangle_slots() as u32)
+        .filter_map(|t| flat.triangle(t))
+        .filter(|t| t.iter().all(|&v| flat.position(v).unwrap()[0] == 1.))
+        .count();
+    assert_eq!(on_seam, 4);
+    // Bent, the copies of the two sides move apart. Slots 8 + k copy slots k.
+    let mut bent = seam_with_bend(1.);
+    edit(&mut bent, |tx| shell(tx, &options));
+    let (a, b) = (bent.position(9).unwrap(), bent.position(12).unwrap());
+    assert!((a[0] - b[0]).abs() > 0.05, "{a:?} {b:?}");
+}
+
+/// A box with every face its own UV island: three vertices at each corner.
+fn box_of_faces() -> Mesh {
+    let whole = box_mesh([0., 0., 0.], [1., 1., 1.]);
+    let (mut positions, mut uvs, mut triangles) = (Vec::new(), Vec::new(), Vec::new());
+    // Each face is a quad, wound as [a, b, c], [a, c, d].
+    for (face, pair) in whole.triangles().as_chunks::<2>().0.iter().enumerate() {
+        let base = (positions.len() / 3) as u32;
+        let [a, b, c] = pair[0];
+        for (k, v) in [a, b, c, pair[1][2]].into_iter().enumerate() {
+            positions.extend(whole.position(v).unwrap());
+            uvs.extend([face as f32 / 6., k as f32 / 4.]);
+        }
+        triangles.extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
+    }
+    let mut m = mesh_of(&positions, &triangles);
+    m.add_uvs(&uvs).unwrap();
+    m
+}
+
+/// How many positions the mesh has, exactly.
+fn distinct_positions(m: &Mesh) -> usize {
+    let mut p: Vec<[u32; 3]> = alive(m)
+        .iter()
+        .map(|&v| m.position(v).unwrap().map(f32::to_bits))
+        .collect();
+    p.sort_unstable();
+    p.dedup();
+    p.len()
+}
+
+#[test]
+fn subdivide_keeps_a_seam_shut_along_it_but_opens_where_the_borders_part() {
+    let options = SubdivideOptions {
+        method: SubdivideMethod::Loop,
+        levels: 1,
+    };
+    let gap = |m: &Mesh, a: VertexId, b: VertexId| {
+        let (p, q) = (m.position(a).unwrap(), m.position(b).unwrap());
+        (0..3).map(|k| (p[k] - q[k]).abs()).fold(0.0, f32::max)
+    };
+    // Slot `5 y + 4` of the left chart and `25 + 5 y` of the right are one point.
+    let mut charts = two_charts(None);
+    edit(&mut charts, |tx| crate::subdivide::subdivide(tx, &options));
+    // Along the seam both sides follow the same boundary rule. Where it ends
+    // on the sheet's border, each side relaxes along its own: 3/4 v + 1/8 of
+    // neighbours that differ by 2 in x.
+    assert_eq!(gap(&charts, 14, 35), 0.);
+    assert_eq!(gap(&charts, 4, 25), 0.25);
+    // A corner shared by three islands: each copy follows its own island's
+    // border. The whole box has 18 edges (with face diagonals), so 26
+    // positions after one level if nothing opens.
+    let mut faces = box_of_faces();
+    assert_eq!(distinct_positions(&faces), 8);
+    edit(&mut faces, |tx| crate::subdivide::subdivide(tx, &options));
+    assert!(
+        distinct_positions(&faces) > 26,
+        "{}",
+        distinct_positions(&faces)
+    );
+}
+
 // ---- cut
 
 #[test]

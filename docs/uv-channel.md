@@ -18,13 +18,14 @@ Every operation either keeps the UVs aligned with the vertices or drops the chan
 | `repair(mesh, { kind: "auto" })` | Preserved and interpolated | One undo step of `weld`, `removeDegenerate`, `orient`, `removeSmallComponents` and `fillHoles`, each as in its row: seams stay, UV islands stay, and only holes without a seam edge are filled. It never drops UVs. |
 | `bridgeLoops` | Preserved | Adds triangles between existing vertices. |
 | `remesh` | Interpolated | Split and collapse vertices interpolate their parents; existing vertices do not move. Boundary vertices, so seams, are locked against collapses. |
-| `subdivide` | Interpolated | New vertices take their edge's UV midpoint (linear, not Loop's stencil), and old vertices keep their UV even though they move. |
+| `subdivide` | Interpolated | New vertices take their edge's UV midpoint (linear, not Loop's stencil), and old vertices keep their UV even though they move. A seam counts as a boundary, so it holds as a crease. Its two sides stay together along it, but where a seam ends on a real border, or three or more islands meet, each side relaxes along its own island's border and a crack opens. |
 | `simplify` | Interpolated | A survivor takes the UV at its new position's parameter along the collapsed edge. The error metric ignores UVs, so textures can stretch. With `preserveBoundary` (the default) seam vertices are left alone; without it the two sides of a seam may collapse differently and open a crack. |
-| `inflate`, `smooth`, `relax`, `grab`, `offset` | Preserved | Moves vertices; the texture moves with them. |
-| `shell` | Preserved | The inner surface copies its outer vertices' UVs. Wall triangles repeat the rim's UVs, so they sample a line of the texture. |
-| `cutByPlane` | Interpolated | Both sides keep their UVs. Crossing vertices interpolate along the cut edge, and cap vertices from the rim. The new mesh gets its own channel. |
+| `grab` | Preserved | Moves vertices; the texture moves with them. The two sides of a seam get the same move, so it stays shut. |
+| `inflate`, `smooth`, `relax`, `offset` | Preserved | Moves vertices; the texture moves with them. Each side of a seam moves by its own island's normals or neighbours, so a seam on a curved surface opens a crack. To keep it shut, add the mesh without `uvs` and weld it first. |
+| `shell` | Preserved | The inner surface copies its outer vertices' UVs. Wall triangles repeat the rim's UVs, so they sample a line of the texture. A seam is a rim here: each side gets a wall along it, so a closed mesh with seams comes out with walls inside it rather than as two nested surfaces, and on a curved surface the inner copies of the two sides move apart. To shell it as closed, add it without `uvs` and weld it. |
+| `cutByPlane` | Interpolated | Both sides keep their UVs. Crossing vertices interpolate along the cut edge, and cap vertices from the rim. The new mesh gets its own channel. Rims close across seams, see [Cuts across seams](#cuts-across-seams). |
 | `join` | Preserved or dropped | With UVs on both meshes they carry over. With UVs on one, the result has none: there is nothing to give the other side's vertices. |
-| `boolean` | Dropped | The result mixes split pieces and the other mesh's surface, which has no coordinates in this mesh's texture space. An open mesh with UVs is read with exactly coincident vertices merged, so seams on a closed surface are accepted, for either mesh; undo brings back the split vertices. A boolean of a mesh with itself changes nothing and keeps them. |
+| `boolean` | Dropped | The result mixes split pieces and the other mesh's surface, which has no coordinates in this mesh's texture space. An open mesh with UVs is read with exactly coincident vertices merged, so seams on a closed surface are accepted, for either mesh; undo brings back the split vertices. A boolean of a mesh with itself keeps them too: union and intersect change nothing, and subtract clears the mesh, as one undo step. |
 | `compact` | Preserved | Remapped with the slots. Afterwards earlier drops cannot be undone, as for all history. |
 | `edit` | Your call | `addVertices` gives new vertices the UV `(0, 0)`, and `setPositions` leaves UVs alone. Set them in the same edit with `{ op: "setUvs", vertices, uvs }`. |
 
@@ -38,9 +39,23 @@ A seam is two vertices at exactly one position with different UVs. They are sepa
 
 Seams are recognized by exact coincidence. Sides merely close to each other count as a real boundary.
 
+### Cuts across seams
+
+`cutByPlane` with a cap reads the rim of a mesh with UVs by exact position, so a mesh closed by position gives two parts closed by position, with `capTriangles` reporting the cap. A rim that does not close, because the mesh is really open there, stays open, as on any open mesh.
+
+The cap reuses the wall's rim vertices, so along the rim its UVs are the wall's, and vertices inside it take the mean of the rim's. Where a seam splits a rim position in two, the cap uses one of the two vertices, and its UVs blend across the seam there, as a `fillHoles` patch over a listed seam loop does. The cap is not a UV island of its own. Its edge next to the seam closes against the other side's wall by position only, so that edge is a new seam, which `analyze` counts as an open boundary and `Scene.boolean` accepts.
+
+A rim that closes by position but cannot be capped is an error, and a failed cut changes nothing: walls wound against each other across a seam (see `orient` above), or two rims or more than two sheets at one position.
+
+A mesh without UVs has no seams. It is read by vertex index only, so split vertices on it are a real boundary and the cut leaves that opening uncapped with no error: weld it first.
+
 ## Files
 
-`importGLTF` and `importGLTFAsync` read `TEXCOORD_0` (float, or normalized `u8`/`u16`) into `ImportedMesh.uvs`, including external buffers and Draco primitives. `exportGLTF` writes it as a float `VEC2` accessor, with or without `draco: true`. Draco quantizes UVs to 16 bits by default (`dracoOptions.quantizationBits.uv`). `TEXCOORD_1` and up are skipped, and so are materials and textures. STL, OBJ and PLY exports do not carry UVs.
+`importGLTF` and `importGLTFAsync` read `TEXCOORD_0` into `ImportedMesh.uvs`, including external buffers and Draco primitives: float, or normalized `u8`/`u16`. An asset declaring `KHR_mesh_quantization` may also use `i8` and `i16`, normalized to `[-1, 1]`, and any of the integer types without `normalized`, whose values stay as stored. Those usually rely on a `KHR_texture_transform` on the material, which is not read.
+
+Other forms never cost you the geometry: a sparse accessor, or a form glTF does not allow, imports with `uvs: null` and the reason in `ImportedMesh.uvsSkipped`. Malformed UVs (a wrong count or accessor type, non-finite values) still throw.
+
+`exportGLTF` writes it as a float `VEC2` accessor, with or without `draco: true`. Draco quantizes UVs to 16 bits by default (`dracoOptions.quantizationBits.uv`; `texCoord` is a deprecated alias). `TEXCOORD_1` and up are skipped, and so are materials and textures. STL, OBJ and PLY exports do not carry UVs.
 
 ## three.js
 
