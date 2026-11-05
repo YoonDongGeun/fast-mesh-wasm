@@ -74,7 +74,7 @@ Run `fast-mesh <command> --help` for a command's options.
 
 Exit codes:
   0  success
-  1  the operation or a file failed (bad input, I/O, empty result); nothing is written
+  1  the operation or a file failed (bad input, I/O, empty or invalid result); nothing is written
   2  usage error (bad arguments, or an output that would overwrite an input)
 
 Reports go to stdout, diagnostics to stderr. With --format json, stdout holds
@@ -110,7 +110,8 @@ Reports vertex and triangle counts, area, volume (when watertight) and defects.
 const BOOLEAN_HELP: &str = "\
 fast-mesh boolean <a> <b> --op <op> -o <out> [options]
 
-Combines two closed, manifold, consistently wound meshes.
+Combines two closed, manifold, consistently wound meshes. A result that is
+open, non-manifold or has orientation conflicts fails (exit 1), writing nothing.
 
   --op union|intersection|difference
                           difference is a minus b
