@@ -132,6 +132,7 @@ export function Viewport(props: {
   const inspectTool = useApp(app, (s) => s.inspectTool);
   const onMissed = useCallback(
     (e: MouseEvent) => {
+      console.log("DIAG missed", e.clientX, e.clientY, "dragging", view.dragging, "multi", view.multiTouch, "axis", view.gizmo?.axis ?? null, "sinceDrag", Date.now() - lastDragEnd.current, "down", JSON.stringify(downAt.current));
       if (sculpt !== null || maskPaint || picking !== null || view.dragging || view.multiTouch || selection === null) {
         return;
       }
@@ -300,6 +301,7 @@ function MeshView(props: {
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
+      console.log("DIAG click", item.name, "visible", e.object.visible, "delta", e.delta, "multi", view.multiTouch, "type", view.pointerType, "hits", e.intersections.map((h) => h.object.type + "@" + h.distance.toFixed(2)).join(","), "sculpted", sculpted, "tool", tool, "picking", picking);
       // The end of an orbit drag that started on the mesh is not a click,
       // nor is a pinch's lift.
       if (e.delta > tapSlop(view.pointerType, 2) || view.multiTouch) {

@@ -54,6 +54,8 @@ const option = (name, fallback) => {
 const verbose = flag("--verbose");
 const port = Number(option("--port", 4194));
 const shots = option("--shots", undefined);
+const throttle = option("--cpu-throttle", undefined);
+const slowFrame = option("--slow-frames", undefined);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -130,7 +132,9 @@ async function moveFingers(from, to, steps = 12) {
 }
 
 async function tap(x, y) {
+  const t0 = Date.now();
   await fingers("touchStart", { 0: [x, y] });
+  console.log('  tap: touchStart ack after', Date.now() - t0, 'ms');
   await sleep(30);
   await lift();
   await sleep(120);
@@ -213,6 +217,9 @@ async function checkLayout(name, minWidth, minHeight) {
 }
 
 try {
+  if (throttle !== undefined) {
+    await browser.send("Emulation.setCPUThrottlingRate", { rate: Number(throttle) });
+  }
   await metrics(390, 844);
   await browser.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
   await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
@@ -226,6 +233,10 @@ try {
   );
   verdict("boot", boot !== undefined, boot === undefined ? q(await hook("items()")) : boot.name);
   await shot("phone-boot");
+  if (slowFrame !== undefined) {
+    await page(`(function f() { const t = performance.now(); while (performance.now() - t < ${Number(slowFrame)}); requestAnimationFrame(f); })()`);
+  }
+  await page(`window.__log = []; for (const t of ['pointerdown','pointerup','pointercancel','click','contextmenu']) addEventListener(t, (e) => __log.push(t + ':' + (e.target.tagName) + ':' + (e.isPrimary ?? '') + ':' + Math.round(e.clientX) + ',' + Math.round(e.clientY)), true);`);
 
   // ---- layout and targets ----
   await checkLayout("layout-phone", 350, 300);
@@ -373,12 +384,18 @@ try {
   );
 
   // ---- taps ----
+  const stalePoint = await hook(`screenPoint(${q(A)})`);
   await tapElement("[data-action=view-reset]");
   await page(`window.scrollTo(0, 0)`);
   await sleep(200);
-  const overA = await hook(`screenPoint(${q(A)})`);
+  const overA = process.env.STALE ? stalePoint : await hook(`screenPoint(${q(A)})`);
+  console.log('  DIAG hit', await page(`document.elementFromPoint(${overA.x}, ${overA.y})?.className || document.elementFromPoint(${overA.x}, ${overA.y})?.tagName`));
+  console.log('  DIAG before', JSON.stringify(await pose()), JSON.stringify(overA), await hook('selected()'), JSON.stringify(await hook('gizmo()')));
+  await page('__log.length = 0');
   await tap(overA.x, overA.y);
   const tapped = await waitFor(`__showcase.selected() === ${q(A)}`, 3000);
+  console.log('  DIAG console', JSON.stringify(browser.consoleLines.filter((l) => l.includes('DIAG')).slice(-8)));
+  console.log('  DIAG after', tapped, JSON.stringify(await pose()), JSON.stringify(await hook(`screenPoint(${q(A)})`)), await hook('selected()'), JSON.stringify(await hook('gizmo()')), await page('JSON.stringify(__log)'), await hook('dragging()'));
   const before2 = await hook("selected()");
   const overB = await hook(`screenPoint(${q(B)})`);
   await twoDown({ 0: [overB.x, overB.y], 1: [overB.x + 30, overB.y] });
