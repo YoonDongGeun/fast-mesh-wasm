@@ -345,7 +345,7 @@ The parsers and writers do not depend on the engine's `parallel` feature, so the
 
 ## Registration (fast-mesh-ops)
 
-Results for `cargo bench -p fast-mesh-ops --bench ops -- icp` (and with `--features parallel`), measured on 2026-11-05.
+Results for `cargo bench -p fast-mesh-ops --bench ops -- icp` (and with `--features parallel`), measured on 2026-11-06, with the determination check below.
 
 - **Machine:** Intel Core i5-13600K, 32 GB RAM, Windows 11, shared with other builds and tests during the run, so the single-thread times are an upper bound and the intervals are wide. Compare only within this table.
 - **Toolchain:** Rust 1.99.0, release profile (LTO, `codegen-units = 1`)
@@ -353,11 +353,34 @@ Results for `cargo bench -p fast-mesh-ops --bench ops -- icp` (and with `--featu
 
 | Benchmark | Points used | Steps | Final rmse | One thread | `parallel`, default pool |
 | --- | --- | --- | --- | --- | --- |
-| `icp/100k_samples` (the `Scene::register` default cap) | 100,000 | 3 | 9.5e-6 | 737 ms | 65 ms |
-| `icp/100k_samples_overlap_0.8` | 80,000 of 100,000 | 3 | 9.2e-7 | 600 ms | 58 ms |
-| `icp/all_samples` | 1,505,209 | 3 | 9.5e-6 | 5.95 s | 553 ms |
+| `icp/100k_samples` (the `Scene::register` default cap) | 100,000 | 3 | 3.2e-14 | 3.15 s | 380 ms |
+| `icp/100k_samples_overlap_0.8` | 80,000 of 100,000 | 3 | 1.3e-14 | 2.63 s | 281 ms |
+| `icp/all_samples` | 1,505,209 | 3 | 4.5e-14 | 7.33 s | 939 ms |
 
-All three report `Converged` with conditioning about 4.8e-3, and the same steps and rmse with the feature on or off. Three steps here means four correspondence passes: the last one measures the final pose. The cost is almost all closest-point queries, at roughly 1 to 2 µs per point per pass on one thread, so a call costs about passes x points x that. The rmse floor is the rounding of `f32` coordinates near 700 in the correspondence search; the solver's own residuals are computed in `f64`. The default cap of 100,000 points makes the cost of a call independent of the moving mesh's size, apart from one pass over its triangles to pick the samples. This input is an easy case (identical surfaces, a small displacement): a poor initial guess or a partial overlap takes more steps, up to `max_iterations`.
+All three report `Converged` with conditioning about 4.8e-3, and the same steps and rmse with the feature on or off. Most of a call at the default cap is now the determination check: about 2.4 s on one thread and 0.3 s with `parallel` (before the check, on 2026-11-05: 737 ms and 65 ms). The check's cost is bounded by its 10,000 points, up to 12 restarts of up to 12 steps each, so it does not grow with the mesh; `all_samples` went from 5.95 s to 7.33 s. Measuring each distance again in `f64`, for an rmse accurate on long thin triangles, is too small to separate from the check and the noise of this shared machine. The rmse now reaches `f64` levels instead of the 9.5e-6 of `f32` rounding near 700. Three steps means four correspondence passes: the last one measures the final pose. The default cap makes the cost of a call independent of the moving mesh's size, apart from one pass over its triangles to pick the samples. This input is an easy case (identical surfaces, a small displacement): a poor initial guess or a partial overlap takes more steps, up to `max_iterations`.
+
+### Telling a determined pose from an undetermined one
+
+`icp` restarts from displaced poses, along each of the six eigenmotions, by 10% and 25% of the points' extent, on at most 10,000 points. A motion is undetermined when at least 25% of the displacement remains along it at the end of the restart, with an rmse at most 2.5 times the pose's (plus `1e-6` of the extent). `cargo test -p fast-mesh-ops --release --lib icp_survey -- --ignored --nocapture` prints these, at default options:
+
+| Case | Status | Undetermined motions | rmse |
+| --- | --- | --- | --- |
+| Asymmetric mesh, same or resampled, noise 0 to 1% of its size, overlap 1 or 0.8 | converged | 0 | 1.6e-16 to 5.8e-3 |
+| Box 3 x 2 x 1, and box 100 x 0.7 x 1 | converged | 0 | 1.3e-16, 3.9e-12 |
+| Terrain with 70% overlap, trimmed to 0.6 | converged | 0 | 5.2e-16 |
+| Terrain flattened 100 times (conditioning 2e-6), same or resampled | converged | 0 | 1.1e-15, 9.2e-6 |
+| Capped cylinder with one small bump, same or resampled | converged | 0 | 4.2e-16, 1.0e-3 |
+| Plane, same noise on both, 0.2 off | converged | 0 | 1.7e-2 |
+| Sphere 32 x 64 or 128 x 256 spun, or resampled | underconstrained | 3 | 4.9e-4, 3.0e-5, 1.5e-3 |
+| Capped cylinder, resampled | underconstrained | 1 (the spin) | 2.6e-4 |
+| Plane, exact or with noise 1e-3 | underconstrained | 3 | 5.6e-16, 5.6e-4 |
+| Terrain flattened 1000 times under noise 3e-3 | underconstrained | 3 | 1.7e-3 |
+| Sphere 8 x 16 (exact fits 22.5 degrees apart) | underconstrained | 1 | 5.1e-17 |
+
+Traced restart by restart on all rows except the flattened terrain and the bump (those were checked by outcome only), the fraction remaining was near 0 or near 1, and the rmse ratios of restarts that stayed away were at most 1.8 on undetermined motions and at least 3.5 on determined ones. That is the evidence for the two thresholds. It is a survey of synthetic surfaces, not a guarantee:
+
+- **False "undetermined":** a surface repeating within 25% of its size, such as a regular pattern with a trimmed overlap, is reported undetermined, correctly but perhaps not usefully. The 8 x 16 sphere above is this case. Noise that hides the relief does the same, which is the terrain flattened 1000 times.
+- **False "converged":** a symmetry farther away than the displacements (a cube's 90 degrees) is not seen, and a wrong local minimum from a far guess is locally determined. Half a turn off on the asymmetric mesh settles at rmse 3.9e-2 (about 3% of its extent), against 0.4% for a correct alignment at 1% noise; `max_rmse`, 1% of the extent by default, stops that from being applied, and is what a noisier scan must raise.
 
 ## JavaScript core (fast-mesh-wasm)
 
