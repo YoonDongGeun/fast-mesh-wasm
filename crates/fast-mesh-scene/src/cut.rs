@@ -79,7 +79,8 @@ impl Scene {
     /// Only positions and triangles cross over: the added mesh has no
     /// normals, colouring, fields or section entries, and new vertices take
     /// channel defaults (crossing vertices on the kept side interpolate
-    /// their parents).
+    /// their parents). UVs carry over to both sides, interpolated at the
+    /// crossing vertices and across the caps.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;

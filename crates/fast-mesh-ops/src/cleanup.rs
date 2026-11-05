@@ -8,7 +8,7 @@ use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
 use crate::analyze::{AREA_EPSILON, duplicate_triangles, is_degenerate};
 use crate::topology::{EdgeMap, components};
-use crate::weld::weld_roots;
+use crate::weld::weld_roots_keeping_seams;
 use crate::{OpsError, Result, filled, push, reserve};
 
 /// What [`weld()`] did.
@@ -29,6 +29,10 @@ pub struct WeldReport {
 /// ones that were unused before. Tolerance 0 merges exact duplicates only. A
 /// vertex with a non-finite coordinate is never merged. No vertex is created.
 ///
+/// On a mesh with UVs ([`Mesh::uvs`]), a pair also needs equal UVs (within
+/// `1e-6` per component) to merge, so the two sides of a UV seam stay apart
+/// and every kept vertex keeps its own UV. Without UVs nothing changes.
+///
 /// Rewiring can make two triangles share a vertex set, or give an edge a
 /// third triangle; run [`remove_degenerate()`] afterwards to drop duplicates.
 ///
@@ -37,7 +41,7 @@ pub struct WeldReport {
 /// [`OpsError::Store`] when memory runs out.
 pub fn weld(tx: &mut Transaction, tolerance: f32) -> Result<WeldReport> {
     let mesh = tx.mesh();
-    let roots = weld_roots(mesh, tolerance)?;
+    let roots = weld_roots_keeping_seams(mesh, tolerance, mesh.uvs())?;
     let mut report = WeldReport::default();
     for (v, &r) in roots.iter().enumerate() {
         if r as usize != v {

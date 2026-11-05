@@ -21,6 +21,8 @@ pub struct Transaction<'m> {
     popped_vertices: Vec<VertexId>,
     popped_triangles: Vec<TriangleId>,
     live_at_start: (usize, usize),
+    /// Ids of the channels dropped in this transaction.
+    dropped_channels: Vec<u64>,
     poisoned: bool,
     finished: bool,
 }
@@ -45,6 +47,7 @@ impl Mesh {
             removed_triangles: Vec::new(),
             popped_vertices: Vec::new(),
             popped_triangles: Vec::new(),
+            dropped_channels: Vec::new(),
             poisoned: false,
             finished: false,
         }
@@ -369,6 +372,34 @@ impl Transaction<'_> {
         })
     }
 
+    /// Drops a source channel as part of this edit: it reads as absent from
+    /// now on, undoing the edit restores it with its values, and redoing drops
+    /// it again. For an operation whose new values for the channel are not
+    /// well defined, where leaving it would mean stale values. The values stay
+    /// in memory, counted in [`Patch::byte_size`], until the patch is released
+    /// from its history or the mesh is compacted. A channel added later under
+    /// the same name is replaced when the edit is undone.
+    ///
+    /// # Errors
+    /// [`StoreError::UnknownChannel`], or [`StoreError::NotSourceChannel`] for
+    /// a derived channel; the transaction stays usable.
+    pub fn drop_channel(&mut self, name: &str) -> Result<()> {
+        let ci = self
+            .mesh
+            .channel_index(name)
+            .ok_or_else(|| StoreError::UnknownChannel(name.into()))?;
+        if self.mesh.channels[ci].desc.kind != ChannelKind::Source {
+            return Err(StoreError::NotSourceChannel(name.into()));
+        }
+        self.write(|tx| {
+            try_reserve_exact(&mut tx.dropped_channels, 1)?;
+            let channel = &mut tx.mesh.channels[ci];
+            channel.hidden = true;
+            tx.dropped_channels.push(channel.id);
+            Ok(())
+        })
+    }
+
     /// Ends the transaction and returns its patch. An empty transaction returns an
     /// empty patch and leaves the revision unchanged. If memory for the patch runs
     /// out, the transaction is rolled back and `OutOfMemory` is returned.
@@ -440,7 +471,7 @@ impl Transaction<'_> {
             let w = c.desc.width as u32;
             let written = c.data.journal_ids().iter().map(|&i| i / w).collect();
             let written = without(sorted(written), &allocated_v, &freed_v);
-            if !written.is_empty() {
+            if !written.is_empty() && !c.hidden {
                 channels.push((c.desc.name.clone(), written));
             }
             let patch = c.data.seal(prepared);
@@ -449,6 +480,22 @@ impl Transaction<'_> {
             }
         }
 
+        let dropped_channels = std::mem::take(&mut self.dropped_channels);
+        let dropped = |c: &&crate::channel::Channel| dropped_channels.contains(&c.id);
+        let mut channels_toggled: Vec<String> = m
+            .channels
+            .iter()
+            .filter(dropped)
+            .map(|c| c.desc.name.clone())
+            .collect();
+        channels_toggled.sort_unstable();
+        channels_toggled.dedup();
+        let dropped_bytes = m
+            .channels
+            .iter()
+            .filter(dropped)
+            .map(|c| c.data.len() * size_of::<f32>())
+            .sum();
         let changes = ChangeSet {
             vertices_added: created_v,
             vertices_removed: freed_v,
@@ -457,6 +504,7 @@ impl Transaction<'_> {
             triangles_removed: freed_t,
             triangles_changed: changed_t,
             channels,
+            channels_toggled,
         };
         if m.incidence_pending {
             // The journal still holds every rewritten triangle's old vertices.
@@ -486,6 +534,8 @@ impl Transaction<'_> {
             triangle_live: m.triangle_live.seal(prepared.triangle_live),
             vertex_refs: m.vertex_refs.seal(prepared.vertex_refs),
             channel_data,
+            dropped_channels,
+            dropped_bytes,
             changes,
         };
         Ok(patch)
@@ -506,6 +556,9 @@ impl Transaction<'_> {
         m.vertex_refs.rollback();
         for c in &mut m.channels {
             c.data.rollback();
+            if self.dropped_channels.contains(&c.id) {
+                c.hidden = false;
+            }
         }
         while let Some(v) = self.popped_vertices.pop() {
             m.vertex_free.push(v);
@@ -538,6 +591,149 @@ mod tests {
             &[0, 1, 2, 0, 2, 3],
         )
         .unwrap()
+    }
+
+    /// A quad with a UV per vertex: `u = 10 * v`, `v = v`.
+    fn quad_uv() -> Mesh {
+        let mut m = quad();
+        m.add_uvs(&[0., 0., 10., 1., 20., 2., 30., 3.]).unwrap();
+        m
+    }
+
+    #[test]
+    fn add_uvs_checks_its_input() {
+        let mut m = quad();
+        assert_eq!(
+            m.add_uvs(&[0.; 7]),
+            Err(StoreError::LengthMismatch {
+                expected: 8,
+                got: 7
+            })
+        );
+        let mut bad = [0.; 8];
+        bad[3] = f32::NAN;
+        assert!(matches!(
+            m.add_uvs(&bad),
+            Err(StoreError::InvalidArgument(_))
+        ));
+        assert!(m.uvs().is_none(), "a failed add leaves no channel");
+        m.add_uvs(&[0.; 8]).unwrap();
+        assert_eq!(
+            m.add_uvs(&[0.; 8]),
+            Err(StoreError::ChannelExists("uv".into()))
+        );
+        assert!(matches!(
+            quad().add_channel(ChannelDesc::source("uv", 3)),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn dropping_a_channel_undoes_and_redoes_with_its_values() {
+        let mut m = quad_uv();
+        let before = m.uvs().unwrap().to_vec();
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        // New slots keep the hidden column aligned.
+        let v = tx.add_vertices(&[[5.; 3]]).unwrap()[0];
+        tx.add_triangles(&[[0, 1, v]]).unwrap();
+        assert!(tx.mesh().uvs().is_none());
+        let patch = tx.commit().unwrap();
+        assert_eq!(patch.changes().channels_toggled, vec!["uv".to_string()]);
+        assert!(m.uvs().is_none());
+        assert!(patch.byte_size() >= before.len() * 4);
+
+        let undo = patch.revert(&mut m).unwrap();
+        assert_eq!(undo.channels_toggled, vec!["uv".to_string()]);
+        let back = m.uvs().unwrap();
+        assert_eq!(&back[..8], &before[..]);
+        assert_eq!(back.len(), 2 * m.vertex_slots());
+
+        patch.apply(&mut m).unwrap();
+        assert!(m.uvs().is_none());
+    }
+
+    #[test]
+    fn a_drop_alone_is_a_change_and_rolls_back() {
+        let mut m = quad_uv();
+        let revision = m.revision();
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        tx.rollback();
+        assert!(m.uvs().is_some());
+        assert_eq!(m.revision(), revision);
+        {
+            let mut tx = m.begin_edit();
+            tx.drop_channel("uv").unwrap();
+        }
+        assert!(m.uvs().is_some(), "dropping the transaction rolls back");
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        assert!(tx.drop_channel("uv").is_err(), "already gone");
+        let patch = tx.commit().unwrap();
+        assert!(!patch.is_empty());
+        assert_ne!(m.revision(), revision);
+    }
+
+    #[test]
+    fn a_derived_channel_cannot_be_dropped() {
+        let mut m = quad();
+        m.add_channel(ChannelDesc::derived("d", 1)).unwrap();
+        let mut tx = m.begin_edit();
+        assert_eq!(
+            tx.drop_channel("d"),
+            Err(StoreError::NotSourceChannel("d".into()))
+        );
+        assert_eq!(
+            tx.drop_channel("nope"),
+            Err(StoreError::UnknownChannel("nope".into()))
+        );
+    }
+
+    #[test]
+    fn undoing_a_drop_replaces_a_newer_channel_of_that_name() {
+        let mut m = quad_uv();
+        let before = m.uvs().unwrap().to_vec();
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        let patch = tx.commit().unwrap();
+        m.add_uvs(&[7.; 8]).unwrap();
+        patch.revert(&mut m).unwrap();
+        assert_eq!(m.uvs().unwrap(), &before[..]);
+    }
+
+    #[test]
+    fn releasing_a_drop_frees_the_values_and_compact_forgets_them() {
+        use crate::PatchSide;
+        let mut m = quad_uv();
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        let patch = tx.commit().unwrap();
+        assert_eq!(m.channels.len(), 1, "hidden, kept for undo");
+        patch.release(&mut m, PatchSide::Undoable);
+        assert!(m.channels.is_empty());
+
+        let mut m = quad_uv();
+        let mut tx = m.begin_edit();
+        tx.drop_channel("uv").unwrap();
+        tx.commit().unwrap();
+        m.compact().unwrap();
+        assert!(m.channels.is_empty());
+    }
+
+    #[test]
+    fn uvs_interpolate_and_undo_like_any_source_channel() {
+        let mut m = quad_uv();
+        let mut tx = m.begin_edit();
+        let v = tx
+            .add_vertex_with_parents([0.5, 0.0, 0.0], &[(0, 0.5), (1, 0.5)])
+            .unwrap();
+        tx.write_channel("uv", &[2], &[-1., -2.]).unwrap();
+        let patch = tx.commit().unwrap();
+        assert_eq!(&m.uvs().unwrap()[2 * v as usize..][..2], &[5., 0.5]);
+        assert_eq!(&m.uvs().unwrap()[4..6], &[-1., -2.]);
+        patch.revert(&mut m).unwrap();
+        assert_eq!(&m.uvs().unwrap()[4..6], &[20., 2.]);
     }
 
     #[test]

@@ -40,7 +40,8 @@ fn try_push<T>(v: &mut Vec<T>, x: T) -> Result<()> {
 impl Mesh {
     /// Removes dead slots and renumbers alive vertices and triangles in their current
     /// order. All existing patches become stale (`StalePatch`); use
-    /// [`crate::History::compact`] to clear a history at the same time.
+    /// [`crate::History::compact`] to clear a history at the same time. Channels
+    /// dropped by [`crate::Transaction::drop_channel`] are then gone for good.
     ///
     /// Failure-atomic: if memory runs out, the mesh is left unchanged.
     pub fn compact(&mut self) -> Result<Remap> {
@@ -74,7 +75,8 @@ impl Mesh {
         }
         let mut channel_data: Vec<Vec<f32>> = Vec::new();
         try_reserve_exact(&mut channel_data, self.channels.len())?;
-        for c in &self.channels {
+        // Hidden channels only served patches, which compacting makes stale.
+        for c in self.channels.iter().filter(|c| !c.hidden) {
             let w = c.desc.width;
             let data = c.data.as_slice();
             let mut compacted: Vec<f32> = Vec::new();
@@ -90,6 +92,7 @@ impl Mesh {
         let triangle_live = full_bits(tris.len())?;
 
         // Phase 2 (infallible): install the new columns and bump the revision.
+        self.channels.retain(|c| !c.hidden);
         for (c, data) in self.channels.iter_mut().zip(channel_data) {
             c.data = Column::from_vec(data);
         }

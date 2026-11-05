@@ -35,7 +35,7 @@ use fast_mesh_query::{
     ClosestOptions, Cull, PairSegment, Ray, RayOptions, Rigid, closest_point,
     intersecting_segments, raycast_all,
 };
-use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, VertexId};
+use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::analyze::analyze;
 use crate::{OpsError, Result, push, reserve};
@@ -59,6 +59,9 @@ pub struct BooleanReport {
     /// Triangles added (split pieces and the tool's kept pieces), minus the
     /// ones the cleanup merged or removed again.
     pub triangles_added: usize,
+    /// Mesh A's UVs were dropped: the result mixes split pieces and the tool's
+    /// surface, which have no UVs in A's space. Undo restores them.
+    pub uvs_dropped: bool,
 }
 
 /// The plan of [`boolean_plan`]: what to drop, rewrite and add on mesh A.
@@ -207,6 +210,10 @@ pub fn boolean_plan(
 /// transaction back, so the call stays atomic through
 /// [`Scene::edit`](https://docs.rs/fast-mesh-scene)-style callers.
 pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<BooleanReport> {
+    let uvs_dropped = tx.mesh().uvs().is_some();
+    if uvs_dropped {
+        tx.drop_channel(UV_CHANNEL)?;
+    }
     if !plan.drop_a.is_empty() {
         tx.remove_triangles(&plan.drop_a)?;
     }
@@ -242,6 +249,7 @@ pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<Boolean
     Ok(BooleanReport {
         kept_triangles: tx.mesh().triangle_count(),
         triangles_added: added,
+        uvs_dropped,
     })
 }
 

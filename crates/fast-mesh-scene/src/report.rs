@@ -91,7 +91,9 @@ pub struct MeshChanges {
     /// The channels written through
     /// [`Scene::derived_channel_mut`](crate::Scene::derived_channel_mut),
     /// added with [`Scene::add_channel`](crate::Scene::add_channel) or
-    /// removed with [`Scene::remove_channel`](crate::Scene::remove_channel)
+    /// removed with [`Scene::remove_channel`](crate::Scene::remove_channel),
+    /// or dropped or restored as a whole by an edit, its undo or redo
+    /// ([`ChangeSet::channels_toggled`]),
     /// since the last call, each name once, in the order first reported. A
     /// `derived_channel_mut` call counts as a write whether or not the slice
     /// is then written.

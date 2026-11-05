@@ -17,6 +17,11 @@ use crate::{OpsError, Result, filled, reserve};
 /// and 3.9 times. The sort stays sequential.
 pub(crate) const PAR_MIN_WELD_VERTS: usize = 16 * 1024;
 
+/// How far apart, per component, two UVs may be for their vertices to weld.
+/// Small enough to keep every real seam, large enough for the rounding of a
+/// `f32` near 1 in files that repeat a UV.
+pub(crate) const UV_WELD_TOLERANCE: f32 = 1e-6;
+
 /// Vertex slots (or keyed vertices) per chunk of a parallel weld.
 const WELD_CHUNK: usize = 8 * 1024;
 
@@ -56,6 +61,20 @@ pub(crate) fn check_tolerance(tolerance: f32) -> Result<()> {
 /// # Errors
 /// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite.
 pub(crate) fn weld_roots(mesh: &Mesh, tolerance: f32) -> Result<Vec<VertexId>> {
+    weld_roots_keeping_seams(mesh, tolerance, None)
+}
+
+/// [`weld_roots`] that also needs a pair's slot-aligned `uvs` to agree within
+/// [`UV_WELD_TOLERANCE`], so that the two sides of a UV seam stay apart.
+/// `None` is the position-only weld, at no cost.
+///
+/// # Errors
+/// [`OpsError::InvalidInput`] when `tolerance` is negative, NaN or infinite.
+pub(crate) fn weld_roots_keeping_seams(
+    mesh: &Mesh,
+    tolerance: f32,
+    uvs: Option<&[f32]>,
+) -> Result<Vec<VertexId>> {
     check_tolerance(tolerance)?;
     let slots = mesh.vertex_slots();
     let tol = f64::from(tolerance);
@@ -114,7 +133,7 @@ pub(crate) fn weld_roots(mesh: &Mesh, tolerance: f32) -> Result<Vec<VertexId>> {
         let uf = AtomicUnionFind::new(slots)?;
         let oom = || OpsError::Store(StoreError::OutOfMemory);
         par::map_range(cells.len(), WELD_CHUNK, 0, oom, |r| {
-            close_pairs(mesh, &cells, tol, r, |v, u| {
+            close_pairs(mesh, &cells, tol, uvs, r, |v, u| {
                 uf.union(v, u);
                 Ok(())
             })
@@ -127,7 +146,7 @@ pub(crate) fn weld_roots(mesh: &Mesh, tolerance: f32) -> Result<Vec<VertexId>> {
     }
     let mut uf = UnionFind::new();
     uf.reset(slots)?;
-    close_pairs(mesh, &cells, tol, 0..cells.len(), |v, u| {
+    close_pairs(mesh, &cells, tol, uvs, 0..cells.len(), |v, u| {
         uf.union(v, u);
         Ok(())
     })?;
@@ -197,11 +216,13 @@ impl AtomicUnionFind {
 
 /// Calls `found(v, u)` for each pair of the vertices `cells[range]` (`v`)
 /// and a vertex `u > v` in the same or an adjacent cell of the sorted
-/// `cells`, at most `tol` apart; stops at the first error.
+/// `cells`, at most `tol` apart (and with agreeing `uvs`, when given); stops at
+/// the first error.
 fn close_pairs(
     mesh: &Mesh,
     cells: &[(Cell, VertexId)],
     tol: f64,
+    uvs: Option<&[f32]>,
     range: std::ops::Range<usize>,
     mut found: impl FnMut(VertexId, VertexId) -> Result<()>,
 ) -> Result<()> {
@@ -209,6 +230,13 @@ fn close_pairs(
     // the adjacent cells.
     let reach = |(exact, _): (bool, i64)| if exact { 0 } else { 1 };
     let shift = |(exact, k): (bool, i64), d: i64| (exact, k + d);
+    let same_uv = |v: VertexId, u: VertexId| {
+        uvs.is_none_or(|uv| {
+            let (a, b) = (2 * v as usize, 2 * u as usize);
+            (uv[a] - uv[b]).abs() <= UV_WELD_TOLERANCE
+                && (uv[a + 1] - uv[b + 1]).abs() <= UV_WELD_TOLERANCE
+        })
+    };
     for &(c, v) in &cells[range] {
         let p = point(mesh, v);
         for dx in -reach(c[0])..=reach(c[0]) {
@@ -224,7 +252,7 @@ fn close_pairs(
                         PAIRS.with(|c| c.set(c.get() + 1));
                         let q = point(mesh, u);
                         let d2 = (0..3).map(|k| (q[k] - p[k]) * (q[k] - p[k])).sum::<f64>();
-                        if d2 <= tol * tol {
+                        if d2 <= tol * tol && same_uv(v, u) {
                             found(v, u)?;
                         }
                     }

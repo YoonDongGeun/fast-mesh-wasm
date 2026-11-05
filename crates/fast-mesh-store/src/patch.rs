@@ -17,6 +17,11 @@ pub struct ChangeSet {
     pub triangles_changed: Vec<TriangleId>,
     /// Source channels written for existing vertices: (channel name, vertex ids).
     pub channels: Vec<(String, Vec<VertexId>)>,
+    /// Channels that went away or came back whole (a
+    /// [`crate::Transaction::drop_channel`], its undo or redo), sorted by name:
+    /// read [`Mesh::channel`] for where they stand now. Their values are not
+    /// listed in [`ChangeSet::channels`].
+    pub channels_toggled: Vec<String>,
 }
 
 impl ChangeSet {
@@ -33,6 +38,7 @@ impl ChangeSet {
             && self.vertices_removed.is_empty()
             && self.vertices_moved.is_empty()
             && self.channels.iter().all(|(_, v)| v.is_empty())
+            && self.channels_toggled.is_empty()
     }
 
     /// Folds `later`, the change set of an edit (or undo or redo) made after `self`,
@@ -108,6 +114,12 @@ impl ChangeSet {
         }
         for (_, ids) in &mut self.channels {
             *ids = union(ids, &reborn_v);
+        }
+
+        for name in &later.channels_toggled {
+            if let Err(at) = self.channels_toggled.binary_search(name) {
+                self.channels_toggled.insert(at, name.clone());
+            }
         }
 
         self.vertices_added = vertices_added;
@@ -215,6 +227,11 @@ pub struct Patch {
     pub(crate) vertex_refs: ColumnPatch<u32>,
     /// Per source channel, keyed by channel id (not name).
     pub(crate) channel_data: Vec<(u64, ColumnPatch<f32>)>,
+    /// Ids of the channels this edit dropped: hidden when applied, back when
+    /// reverted.
+    pub(crate) dropped_channels: Vec<u64>,
+    /// Bytes of the dropped channels' values, kept on the mesh for this patch.
+    pub(crate) dropped_bytes: usize,
     pub(crate) changes: ChangeSet,
 }
 
@@ -260,6 +277,7 @@ impl Patch {
                 .map(|(_, p)| 8 + p.byte_size())
                 .sum::<usize>()
             + ids * 4
+            + self.dropped_bytes
     }
 
     /// Re-applies the patch (redo). The mesh must be at [`Patch::base_revision`].
@@ -318,6 +336,11 @@ impl Patch {
                 p.apply(&mut mesh.channels[i].data);
             }
         }
+        for &id in &self.dropped_channels {
+            if let Some(i) = mesh.channel_index_by_id(id) {
+                mesh.channels[i].hidden = true;
+            }
+        }
         mesh.live_vertices = mesh.live_vertices + c.vertices_added.len() - c.vertices_removed.len();
         mesh.live_triangles =
             mesh.live_triangles + c.triangles_added.len() - c.triangles_removed.len();
@@ -349,6 +372,18 @@ impl Patch {
                 p.revert(&mut mesh.channels[i].data);
             }
         }
+        for &id in &self.dropped_channels {
+            if let Some(i) = mesh.channel_index_by_id(id) {
+                // A channel added since under the same name gives way.
+                let name = mesh.channels[i].desc.name.clone();
+                if let Some(newer) = mesh.channel_index(&name) {
+                    mesh.channels.remove(newer);
+                }
+                if let Some(i) = mesh.channel_index_by_id(id) {
+                    mesh.channels[i].hidden = false;
+                }
+            }
+        }
         mesh.live_vertices = mesh.live_vertices + c.vertices_removed.len() - c.vertices_added.len();
         mesh.live_triangles =
             mesh.live_triangles + c.triangles_removed.len() - c.triangles_added.len();
@@ -378,6 +413,9 @@ impl Patch {
             PatchSide::Undoable => {
                 mesh.release_vertices(&c.vertices_removed);
                 mesh.release_triangles(&c.triangles_removed);
+                // The edit stays for good: so does the drop.
+                mesh.channels
+                    .retain(|ch| !(ch.hidden && self.dropped_channels.contains(&ch.id)));
             }
             PatchSide::Redoable => {
                 mesh.release_vertices(&c.vertices_added);
@@ -458,6 +496,7 @@ mod tests {
             triangles_removed: vec![0],
             triangles_changed: vec![1],
             channels: vec![("c".into(), vec![1, 3])],
+            channels_toggled: vec![],
         };
         let b = ChangeSet {
             vertices_added: vec![2],
@@ -467,6 +506,7 @@ mod tests {
             triangles_removed: vec![4],
             triangles_changed: vec![],
             channels: vec![("c".into(), vec![0]), ("d".into(), vec![1])],
+            channels_toggled: vec![],
         };
         a.merge(&b);
         assert_eq!(a.vertices_added, Vec::<u32>::new());

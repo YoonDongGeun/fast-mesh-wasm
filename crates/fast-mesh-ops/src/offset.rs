@@ -23,7 +23,7 @@
 //! self-intersections.
 
 use fast_mesh::compute_vertex_normals;
-use fast_mesh_store::{Mesh, Transaction, VertexId};
+use fast_mesh_store::{Mesh, Transaction, UV_CHANNEL, VertexId};
 
 use crate::topology::{EdgeMap, boundary_loops, proper_triangle};
 use crate::{DegenerateOptions, OpsError, Result, filled, push, remove_degenerate, reserve};
@@ -250,6 +250,9 @@ pub fn shell(tx: &mut Transaction, options: &ShellOptions) -> Result<ShellReport
     // The copy of every live vertex, in ascending id order, with each live
     // vertex's index in it. Planned from the untouched mesh, before writing.
     let mut copied: Vec<[f32; 3]> = Vec::new();
+    // On a mesh with UVs, each copy keeps its original's.
+    let source_uvs = mesh.uvs();
+    let mut copied_uvs: Vec<f32> = Vec::new();
     let mut at: Vec<Option<usize>> = filled(mesh.vertex_slots(), None)?;
     for (v, p) in positions.iter().enumerate() {
         let v = v as VertexId;
@@ -275,6 +278,10 @@ pub fn shell(tx: &mut Transaction, options: &ShellOptions) -> Result<ShellReport
             return Err(OpsError::InvalidInput("shell thickness leaves f32 range"));
         }
         push(&mut copied, q)?;
+        if let Some(uv) = source_uvs {
+            reserve(&mut copied_uvs, 2)?;
+            copied_uvs.extend_from_slice(&uv[2 * v as usize..2 * v as usize + 2]);
+        }
         at[v as usize] = Some(copied.len() - 1);
     }
     // The reversed copies and the wall quads, in ascending triangle and edge
@@ -313,7 +320,11 @@ pub fn shell(tx: &mut Transaction, options: &ShellOptions) -> Result<ShellReport
         )?;
     }
     report.loops_closed = boundary_loops(mesh)?.len();
+    let has_uvs = source_uvs.is_some();
     let fresh = tx.add_vertices(&copied)?;
+    if has_uvs {
+        tx.write_channel(UV_CHANNEL, &fresh, &copied_uvs)?;
+    }
     let resolve = |c: Corner| match c {
         Corner::Kept(v) => v,
         Corner::Copy(i) => fresh[i],

@@ -26,7 +26,7 @@ use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, VertexId};
 use crate::fill::FillOptionsBuilder;
 use crate::fill_holes;
 use crate::topology::{BoundaryLoop, LoopId, boundary_loops};
-use crate::{OpsError, Result, push, reserve};
+use crate::{OpsError, Result, filled, push, reserve};
 
 /// Options for [`cut_by_plane`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -300,6 +300,16 @@ pub fn cut_by_plane(
         flat_tris.extend_from_slice(t);
     }
     let mut removed = Mesh::from_buffers_f64_with_origin(&flat_positions, &flat_tris, origin)?;
+    // The removed side keeps its UVs, crossing vertices included: their slots
+    // still hold the interpolated values.
+    if let Some(uvs) = tx.mesh().uvs() {
+        let mut rem_uvs = filled(2 * rem_positions.len(), 0.0f32)?;
+        for (&v, &i) in &rem_index {
+            rem_uvs[2 * i as usize] = uvs[2 * v as usize];
+            rem_uvs[2 * i as usize + 1] = uvs[2 * v as usize + 1];
+        }
+        removed.add_uvs(&rem_uvs)?;
+    }
     if options.cap {
         let loops = boundary_loops(&removed)?;
         let mut rim: Vec<LoopId> = Vec::new();

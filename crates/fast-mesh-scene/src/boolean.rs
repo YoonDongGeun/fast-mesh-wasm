@@ -38,6 +38,9 @@ pub struct BooleanReport {
     /// Triangles added (split pieces and the tool's kept pieces), minus the
     /// ones the cleanup merged or removed again.
     pub triangles_added: usize,
+    /// A's UVs were dropped; undo restores them. The result mixes split pieces
+    /// and B's surface, which have no UVs in A's space.
+    pub uvs_dropped: bool,
 }
 
 impl Scene {
@@ -49,7 +52,8 @@ impl Scene {
     /// The combination runs as one edit of A, so it undoes in one step.
     /// Combining a mesh with itself is a no-op for union and intersect
     /// (nothing is recorded), and clears it for subtract. Only positions
-    /// and triangles cross over: new vertices take channel defaults.
+    /// and triangles cross over: new vertices take channel defaults, and A's
+    /// UV channel is dropped ([`BooleanReport::uvs_dropped`]).
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
@@ -90,6 +94,7 @@ impl Scene {
             return Ok(BooleanReport {
                 kept_triangles: report.kept_triangles,
                 triangles_added: report.triangles_added,
+                uvs_dropped: report.uvs_dropped,
             });
         }
         // A scaled placement on either side: the pair query would run on
@@ -121,6 +126,7 @@ impl Scene {
         Ok(BooleanReport {
             kept_triangles: report.kept_triangles,
             triangles_added: report.triangles_added,
+            uvs_dropped: report.uvs_dropped,
         })
     }
 
@@ -131,6 +137,7 @@ impl Scene {
             BooleanOp::Union | BooleanOp::Intersect => Ok(BooleanReport {
                 kept_triangles: self.mesh(a)?.triangle_count(),
                 triangles_added: 0,
+                uvs_dropped: false,
             }),
             BooleanOp::Subtract => {
                 self.edit(a, |tx| {
@@ -155,6 +162,7 @@ impl Scene {
                 Ok(BooleanReport {
                     kept_triangles: 0,
                     triangles_added: 0,
+                    uvs_dropped: false,
                 })
             }
         }

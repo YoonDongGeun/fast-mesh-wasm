@@ -39,6 +39,10 @@
 //!   affected mesh. Further consumers each get their own copy of every
 //!   report: [`Scene::subscribe`], [`Scene::take_changes_for`] and
 //!   [`Scene::unsubscribe`].
+//! - UVs: a mesh added with [`Mesh::add_uvs`](fast_mesh_store::Mesh::add_uvs)
+//!   keeps them through edits, undo and redo. Every operation preserves or
+//!   undoably drops them; see
+//!   [`docs/uv-channel.md`](https://github.com/YoonDongGeun/fast-mesh-wasm/blob/main/docs/uv-channel.md).
 //! - Maintenance: [`Scene::add_channel`], [`Scene::remove_channel`],
 //!   [`Scene::derived_channel_mut`] (all three reported, and the `field:`
 //!   prefix reserved) and [`Scene::compact`].
@@ -97,6 +101,8 @@ mod query;
 mod report;
 mod scene;
 mod sections;
+#[cfg(test)]
+mod uv_tests;
 
 pub use boolean::{BooleanOp, BooleanReport};
 pub use contacts::{Contact, ContactFilter};

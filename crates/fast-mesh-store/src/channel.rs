@@ -1,5 +1,14 @@
 use crate::column::Column;
 
+/// Name of the UV channel: a source channel of 2 values per vertex slot, in
+/// the file's own convention (glTF's has `v` pointing down), interpolated for
+/// new vertices. Read it with [`crate::Mesh::uvs`].
+///
+/// A mesh without it pays nothing. The name lives in the channel namespace;
+/// the plane `(u, v)` coordinates of a section are plain result fields and do
+/// not meet it.
+pub const UV_CHANNEL: &str = "uv";
+
 /// Whether a channel's values are undoable input or recomputable output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -56,6 +65,11 @@ impl ChannelDesc {
         }
     }
 
+    /// The UV channel: [`UV_CHANNEL`], a source channel of 2 interpolated values.
+    pub fn uv() -> Self {
+        Self::source(UV_CHANNEL, 2)
+    }
+
     pub fn with_policy(mut self, policy: TopologyPolicy) -> Self {
         self.policy = policy;
         self
@@ -74,6 +88,10 @@ pub(crate) struct Channel {
     pub(crate) desc: ChannelDesc,
     /// `width` values per vertex slot.
     pub(crate) data: Column<f32>,
+    /// Dropped by a committed edit whose patch can still bring it back: name
+    /// lookups skip it, while its column keeps following the slots so that
+    /// undo restores it exactly.
+    pub(crate) hidden: bool,
 }
 
 impl Channel {
@@ -115,6 +133,7 @@ mod tests {
             id: 0,
             desc,
             data: Column::from_vec(values.to_vec()),
+            hidden: false,
         }
     }
 
