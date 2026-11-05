@@ -122,13 +122,18 @@ impl IcpReport {
     }
 }
 
-/// Up to `max_samples` evenly spaced vertices of `mesh` that its alive
-/// triangles use, as their stored local positions, in vertex order. Vertices
-/// no triangle uses are not on the surface, so they are left out.
+/// Up to `max_samples` evenly spaced points on the surface of `mesh`, in its
+/// stored local coordinates, without the origin: its triangles' centroids,
+/// then the vertices its triangles use, the first of each stride of the two
+/// lists together.
+///
+/// Vertices alone will not do on a coarse mesh: a vertex is equally close to
+/// all the triangles around it, so its correspondences do not see all of a
+/// corner's planes (a box's eight corners can all report the same two faces).
 ///
 /// # Errors
 /// [`OpsError::Store`] when out of memory.
-pub fn sample_vertices(mesh: &Mesh, max_samples: usize) -> Result<Vec<[f32; 3]>> {
+pub fn sample_surface(mesh: &Mesh, max_samples: usize) -> Result<Vec<[f64; 3]>> {
     let mut used = filled(mesh.vertex_slots(), false)?;
     for t in 0..mesh.triangle_slots() {
         if let Some(c) = mesh.triangle(t as u32) {
@@ -137,22 +142,38 @@ pub fn sample_vertices(mesh: &Mesh, max_samples: usize) -> Result<Vec<[f32; 3]>>
             }
         }
     }
-    let count = used.iter().filter(|&&u| u).count();
-    let take = count.min(max_samples);
+    let total = mesh.triangle_count() + used.iter().filter(|&&u| u).count();
+    let take = total.min(max_samples);
     let mut out = Vec::new();
     reserve(&mut out, take)?;
     if take == 0 {
         return Ok(out);
     }
-    let used = used.iter().enumerate().filter(|(_, u)| **u);
-    for (seen, (v, _)) in used.enumerate() {
-        // Taken when it starts a new stride of `count / take`. `u128`: the
-        // product of two slot counts.
-        let next = (out.len() as u128 * count as u128).div_ceil(take as u128);
+    let mut seen = 0;
+    let mut offer = |out: &mut Vec<[f64; 3]>, p: [f64; 3]| {
+        // Taken when it starts a new stride of `total / take`. `u128`: the
+        // product of two counts.
+        let next = (out.len() as u128 * total as u128).div_ceil(take as u128);
         if out.len() < take && seen as u128 == next {
-            if let Some(p) = mesh.position(v as VertexId) {
-                out.push(p);
-            }
+            out.push(p);
+        }
+        seen += 1;
+    };
+    for t in 0..mesh.triangle_slots() {
+        let Some([a, b, c]) = mesh.triangle(t as u32) else {
+            continue;
+        };
+        if let (Some(a), Some(b), Some(c)) = (mesh.position(a), mesh.position(b), mesh.position(c))
+        {
+            let centroid = std::array::from_fn(|i| {
+                (f64::from(a[i]) + f64::from(b[i]) + f64::from(c[i])) / 3.0
+            });
+            offer(&mut out, centroid);
+        }
+    }
+    for (v, _) in used.iter().enumerate().filter(|(_, u)| **u) {
+        if let Some(p) = mesh.position(v as VertexId) {
+            offer(&mut out, p.map(f64::from));
         }
     }
     Ok(out)
@@ -411,11 +432,7 @@ pub fn icp(
             });
         }
     };
-    let (transform, rmse, inliers) = if settled == Some(status) {
-        last
-    } else {
-        best
-    };
+    let (transform, rmse, inliers) = if settled == Some(status) { last } else { best };
     Ok(IcpReport {
         transform,
         rmse,

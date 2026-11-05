@@ -5,16 +5,18 @@
 //! Operations that write (`orient`, `fill_holes`, `weld`,
 //! `remove_small_components`) are timed on a mesh rebuilt from buffers for every
 //! iteration, outside the timing, and include the transaction's commit. `analyze`
-//! reads only; its self-intersection variant takes a prebuilt BVH.
+//! reads only; its self-intersection variant takes a prebuilt BVH. `icp` reads
+//! only too, with a prebuilt BVH and points displaced from the same terrain.
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_ops::{
-    AnalyzeOptions, ComponentOptions, FillOptions, analyze, boundary_loops, fill_holes, orient,
-    remove_small_components, weld,
+    AnalyzeOptions, ComponentOptions, FillOptions, IcpOptions, analyze, boundary_loops, fill_holes,
+    icp, orient, remove_small_components, sample_surface, weld,
 };
+use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
 
 const N: u32 = 708;
@@ -323,12 +325,56 @@ fn bench_components(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_icp(c: &mut Criterion) {
+    let mesh = build(&terrain_buffers(N));
+    let bvh = Bvh::build(&mesh, &BuildOptions::default()).unwrap();
+    // The vertices displaced by the inverse of a known small motion: 0.1 degrees
+    // about z (1.2 at the far corner) and a third of a cell along each axis.
+    let (s, c0) = 0.002f64.sin_cos();
+    let truth = Rigid {
+        rotation: [[c0, -s, 0.0], [s, c0, 0.0], [0.0, 0.0, 1.0]],
+        translation: [0.3, -0.2, 0.1],
+    };
+    let inverse = truth.inverse();
+    let mut group = c.benchmark_group("icp");
+    group.sample_size(10);
+    for (name, samples, overlap) in [
+        ("100k_samples", 100_000, 1.0),
+        ("100k_samples_overlap_0.8", 100_000, 0.8),
+        ("all_samples", usize::MAX, 1.0),
+    ] {
+        let r = &inverse.rotation;
+        let t = inverse.translation;
+        let points: Vec<[f64; 3]> = sample_surface(&mesh, samples)
+            .unwrap()
+            .iter()
+            .map(|p| {
+                std::array::from_fn(|i| r[i][0] * p[0] + r[i][1] * p[1] + r[i][2] * p[2] + t[i])
+            })
+            .collect();
+        let options = IcpOptions {
+            overlap,
+            ..IcpOptions::default()
+        };
+        let r = icp(&points, &mesh, &bvh, &Rigid::IDENTITY, &options).unwrap();
+        println!(
+            "icp {name}: {} points, {} used, {} iterations, {:?}, rmse {:.2e}, conditioning {:.2e}",
+            r.samples, r.inliers, r.iterations, r.status, r.rmse, r.conditioning
+        );
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(icp(&points, &mesh, &bvh, &Rigid::IDENTITY, &options).unwrap()))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_analyze,
     bench_orient,
     bench_fill,
     bench_weld,
-    bench_components
+    bench_components,
+    bench_icp
 );
 criterion_main!(benches);

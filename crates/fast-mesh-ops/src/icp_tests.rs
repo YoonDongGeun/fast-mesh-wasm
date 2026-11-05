@@ -7,7 +7,7 @@ use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
 
 use super::*;
-use crate::test_util::{assert_parallel_identical, grid, mesh_of, parts, uv_sphere};
+use crate::test_util::{assert_parallel_identical, box_mesh, grid, mesh_of, parts, uv_sphere};
 
 /// A rotation of `angle` radians about the unit `axis`.
 fn turn(axis: [f64; 3], angle: f64) -> [[f64; 3]; 3] {
@@ -47,10 +47,10 @@ fn error(a: &Rigid, b: &Rigid) -> (f64, f64) {
 /// `truth` is the transform that puts them back on `mesh`.
 fn moved_points(mesh: &Mesh, truth: &Rigid) -> Vec<[f64; 3]> {
     let inverse = truth.inverse();
-    sample_vertices(mesh, usize::MAX)
+    sample_surface(mesh, usize::MAX)
         .unwrap()
         .iter()
-        .map(|p| inverse.apply(*p))
+        .map(|p| apply(&inverse, *p))
         .collect()
 }
 
@@ -69,7 +69,11 @@ fn blob(stacks: u32, slices: u32) -> Mesh {
         .flat_map(|d| {
             let (x, y, z) = (f64::from(d[0]), f64::from(d[1]), f64::from(d[2]));
             let r = 1.0 + 0.25 * (3.0 * x + 1.0).sin() * (2.0 * y).cos() + 0.15 * (4.0 * z).sin();
-            [(1.3 * r * x) as f32, (0.9 * r * y) as f32, (0.6 * r * z) as f32]
+            [
+                (1.3 * r * x) as f32,
+                (0.9 * r * y) as f32,
+                (0.6 * r * z) as f32,
+            ]
         })
         .collect();
     mesh_of(&shaped, &triangles)
@@ -194,10 +198,10 @@ fn a_sphere_finer_tessellation_constrains_its_spin_less() {
         let fixed = uv_sphere(stacks, slices, 1.0);
         let tree = bvh(&fixed);
         let center = [0.01, -0.02, 0.015];
-        let points: Vec<[f64; 3]> = sample_vertices(&fixed, usize::MAX)
+        let points: Vec<[f64; 3]> = sample_surface(&fixed, usize::MAX)
             .unwrap()
             .iter()
-            .map(|p| add(p.map(f64::from), center))
+            .map(|p| add(*p, center))
             .collect();
         let r = icp(
             &points,
@@ -239,10 +243,10 @@ fn a_tube_sliding_along_its_axis_is_underconstrained() {
     let fixed = mesh_of(&positions, &triangles);
     let tree = bvh(&fixed);
     let offset = [0.05, -0.03, 0.2];
-    let points: Vec<[f64; 3]> = sample_vertices(&fixed, usize::MAX)
+    let points: Vec<[f64; 3]> = sample_surface(&fixed, usize::MAX)
         .unwrap()
         .iter()
-        .map(|p| add(p.map(f64::from), offset))
+        .map(|p| add(*p, offset))
         .collect();
     let r = icp(
         &points,
@@ -258,7 +262,10 @@ fn a_tube_sliding_along_its_axis_is_underconstrained() {
     assert_eq!(r.status, IcpStatus::Underconstrained, "{r:?}");
     assert!(!r.converged());
     let t = r.transform.translation;
-    assert!((t[0] + 0.05).abs() < 1e-3 && (t[1] - 0.03).abs() < 1e-3, "{r:?}");
+    assert!(
+        (t[0] + 0.05).abs() < 1e-3 && (t[1] - 0.03).abs() < 1e-3,
+        "{r:?}"
+    );
     assert!(t[2].abs() < 1e-3, "{r:?}");
 }
 
@@ -345,10 +352,10 @@ fn plane_sliding_in_plane_is_not_converged_and_stays_finite() {
     let fixed = grid(40);
     let tree = bvh(&fixed);
     let offset = [3.5, 2.25, 0.5];
-    let points: Vec<[f64; 3]> = sample_vertices(&grid(20), usize::MAX)
+    let points: Vec<[f64; 3]> = sample_surface(&grid(20), usize::MAX)
         .unwrap()
         .iter()
-        .map(|p| add(p.map(f64::from), offset))
+        .map(|p| add(*p, offset))
         .collect();
     let r = icp(
         &points,
@@ -362,7 +369,12 @@ fn plane_sliding_in_plane_is_not_converged_and_stays_finite() {
     assert!(!r.converged());
     assert!(r.conditioning < MIN_CONDITIONING, "{r:?}");
     assert!(r.rmse.is_finite() && r.rmse < 1e-5, "{r:?}");
-    let values = r.transform.rotation.iter().flatten().chain(&r.transform.translation);
+    let values = r
+        .transform
+        .rotation
+        .iter()
+        .flatten()
+        .chain(&r.transform.translation);
     assert!(values.into_iter().all(|v| v.is_finite()), "{r:?}");
     // z is corrected, x and y are not slid.
     assert!((r.transform.translation[2] + 0.5).abs() < 1e-5, "{r:?}");
@@ -378,22 +390,27 @@ fn tilted_fine_plane_is_still_underconstrained() {
     // noise must not count as a constraint.
     let n = 300;
     let tilt = turn([1.0, 1.0, 0.3], 0.7);
-    let plane = |p: &[f32; 3]| -> [f64; 3] {
-        let q = [f64::from(p[0]) * 0.01, f64::from(p[1]) * 0.01, 0.0];
+    let plane = |p: [f64; 3]| -> [f64; 3] {
+        let q = [p[0] * 0.01, p[1] * 0.01, 0.0];
         [dot(tilt[0], q), dot(tilt[1], q), dot(tilt[2], q)]
     };
     let flat = grid(n);
     let (positions, triangles) = parts(&flat);
     let tilted: Vec<f32> = positions
         .chunks_exact(3)
-        .flat_map(|c| plane(&[c[0], c[1], c[2]]).map(|v| v as f32))
+        .flat_map(|c| plane([f64::from(c[0]), f64::from(c[1]), 0.0]).map(|v| v as f32))
         .collect();
     let fixed = mesh_of(&tilted, &triangles);
     let tree = bvh(&fixed);
-    let points: Vec<[f64; 3]> = sample_vertices(&grid(n / 3), usize::MAX)
+    let points: Vec<[f64; 3]> = sample_surface(&grid(n / 3), usize::MAX)
         .unwrap()
         .iter()
-        .map(|p| add(plane(p), [0.2 * tilt[0][0], 0.2 * tilt[1][0], 0.2 * tilt[2][0]]))
+        .map(|p| {
+            add(
+                plane(*p),
+                [0.2 * tilt[0][0], 0.2 * tilt[1][0], 0.2 * tilt[2][0]],
+            )
+        })
         .collect();
     let r = icp(
         &points,
@@ -434,10 +451,10 @@ fn zero_iterations_measure_the_initial_pose() {
     // The unit plane at height 2, seen from z = 0: every distance is 2.
     let fixed = grid(4);
     let tree = bvh(&fixed);
-    let points: Vec<[f64; 3]> = sample_vertices(&fixed, usize::MAX)
+    let points: Vec<[f64; 3]> = sample_surface(&fixed, usize::MAX)
         .unwrap()
         .iter()
-        .map(|p| add(p.map(f64::from), [0.0, 0.0, 2.0]))
+        .map(|p| add(*p, [0.0, 0.0, 2.0]))
         .collect();
     let r = icp(
         &points,
@@ -484,10 +501,7 @@ fn too_few_correspondences_are_reported_with_finite_numbers() {
 #[test]
 fn degenerate_triangles_do_not_produce_nan() {
     // All of the fixed mesh's triangles have zero area: no plane to use.
-    let fixed = mesh_of(
-        &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
-        &[[0, 1, 2]],
-    );
+    let fixed = mesh_of(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0], &[[0, 1, 2]]);
     let tree = bvh(&fixed);
     let points = [[0.5, 1.0, 0.0]; 8];
     let r = icp(
@@ -519,7 +533,13 @@ fn invalid_input_is_rejected() {
         assert!(invalid(run(&points, IcpOptions { tolerance, ..base })));
     }
     for max_distance in [0.0, -1.0, f32::NAN] {
-        assert!(invalid(run(&points, IcpOptions { max_distance, ..base })));
+        assert!(invalid(run(
+            &points,
+            IcpOptions {
+                max_distance,
+                ..base
+            }
+        )));
     }
     let empty = Mesh::new();
     let empty_tree = bvh(&empty);
@@ -551,10 +571,10 @@ fn invalid_input_is_rejected() {
 
 #[test]
 fn sampling_is_even_and_skips_unused_vertices() {
-    // Four vertices used, one floating and one dead slot in the middle.
+    // Two triangles on four vertices, one floating vertex and one dead slot.
     let mut mesh = mesh_of(
         &[
-            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 9.0, 9.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 8.0, 8.0,
+            0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 9.0, 9.0, 9.0, 3.0, 3.0, 0.0, 0.0, 3.0, 0.0, 8.0, 8.0,
             8.0,
         ],
         &[[0, 1, 3], [0, 3, 4]],
@@ -562,17 +582,47 @@ fn sampling_is_even_and_skips_unused_vertices() {
     let mut tx = mesh.begin_edit();
     tx.remove_vertices(&[5]).unwrap();
     let _ = tx.commit().unwrap();
+    let all = vec![
+        [2.0, 1.0, 0.0], // the centroids
+        [1.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0], // the used vertices
+        [3.0, 0.0, 0.0],
+        [3.0, 3.0, 0.0],
+        [0.0, 3.0, 0.0],
+    ];
+    assert_eq!(sample_surface(&mesh, usize::MAX).unwrap(), all);
     assert_eq!(
-        sample_vertices(&mesh, usize::MAX).unwrap(),
-        vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]
+        sample_surface(&mesh, 3).unwrap(),
+        vec![all[0], all[2], all[4]]
     );
-    assert_eq!(
-        sample_vertices(&mesh, 2).unwrap(),
-        vec![[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]
-    );
-    assert!(sample_vertices(&mesh, 0).unwrap().is_empty());
+    assert!(sample_surface(&mesh, 0).unwrap().is_empty());
     let big = grid(50);
-    assert_eq!(sample_vertices(&big, 100).unwrap().len(), 100);
+    assert_eq!(sample_surface(&big, 100).unwrap().len(), 100);
+}
+
+#[test]
+fn a_box_is_fully_constrained_from_its_own_samples() {
+    // Eight corners and twelve faces: the corners alone tie to too few planes.
+    let fixed = box_mesh([0.0; 3], [3.0, 2.0, 1.0]);
+    let tree = bvh(&fixed);
+    let truth = Rigid {
+        rotation: turn([1.0, 0.5, -0.2], 0.02),
+        translation: [0.05, -0.03, 0.02],
+    };
+    let points = moved_points(&fixed, &truth);
+    assert_eq!(points.len(), 20);
+    let r = icp(
+        &points,
+        &fixed,
+        &tree,
+        &Rigid::IDENTITY,
+        &IcpOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r.status, IcpStatus::Converged, "{r:?}");
+    let (rotation, translation) = error(&r.transform, &truth);
+    assert!(rotation < 1e-5 && translation < 1e-5, "{r:?}");
+    assert!(r.conditioning > 1e-3, "{r:?}");
 }
 
 #[test]

@@ -18,13 +18,14 @@
 
 use std::collections::BTreeMap;
 
-use fast_mesh_ops::{AnalyzeOptions, VolumeReason, analyze, measure_placed};
+use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions,
     DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, OutOfRange,
-    Placement, Plane, Scene, SceneClosestOptions, SceneError, SceneOptions, SceneRayOptions,
-    SectionDesc, SectionId, SectionStatus, SignMode, StepState, ThicknessField, UpdateMode,
+    Placement, Plane, RegisterOptions, Scene, SceneClosestOptions, SceneError, SceneOptions,
+    SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState, ThicknessField,
+    UpdateMode,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -1041,6 +1042,67 @@ impl WasmScene {
         ])
     }
 
+    /// Aligns the moving mesh to the fixed one by ICP from their current
+    /// placements; see [`Scene::register`]. The numeric options are NaN for
+    /// their defaults. Returns `[rotation (9, row-major), translation (3),
+    /// scale (3), rmse, iterations, status, applied, samples, inliers,
+    /// conditioning]`, with status 0 converged, 1 out of iterations, 2
+    /// underconstrained, 3 too few correspondences, 4 diverged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register(
+        &mut self,
+        moving_index: u32,
+        moving_generation: u32,
+        fixed_index: u32,
+        fixed_generation: u32,
+        max_iterations: f64,
+        tolerance: f64,
+        overlap: f64,
+        max_distance: f64,
+        max_samples: f64,
+        apply: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let moving = self.id(moving_index, moving_generation)?;
+        let fixed = self.id(fixed_index, fixed_generation)?;
+        let defaults = RegisterOptions::default();
+        let or = |v: f64, default: f64| if v.is_nan() { default } else { v };
+        let options = RegisterOptions {
+            icp: IcpOptions {
+                max_iterations: crate::edit::count_opt(max_iterations, "maxIterations")?
+                    .unwrap_or(defaults.icp.max_iterations),
+                tolerance: or(tolerance, defaults.icp.tolerance),
+                overlap: or(overlap, defaults.icp.overlap),
+                // Rounded to the query's f32; a cutoff needs no more.
+                max_distance: or(max_distance, f64::INFINITY) as f32,
+            },
+            max_samples: crate::edit::count_opt(max_samples, "maxSamples")?
+                .unwrap_or(defaults.max_samples),
+            apply,
+        };
+        let r = self.scene.register(moving, fixed, &options)?;
+        let status = match r.status {
+            IcpStatus::Converged => 0.0,
+            IcpStatus::MaxIterations => 1.0,
+            IcpStatus::Underconstrained => 2.0,
+            IcpStatus::TooFewCorrespondences => 3.0,
+            IcpStatus::Diverged => 4.0,
+        };
+        let mut out = Vec::with_capacity(22);
+        out.extend(r.placement.rotation.iter().flatten());
+        out.extend(r.placement.translation);
+        out.extend(r.placement.scale);
+        out.extend([
+            r.rmse,
+            count(r.iterations),
+            status,
+            f64::from(u8::from(r.applied)),
+            count(r.samples),
+            count(r.inliers),
+            r.conditioning,
+        ]);
+        Ok(out)
+    }
+
     /// Cuts a mesh with a world plane `[origin xyz, normal xyz]`: the `+`
     /// side stays on the mesh and the `-` side is added as a new mesh with
     /// the same placement. Returns `[kept index, kept generation, added
@@ -1826,6 +1888,47 @@ mod tests {
         // The cut undoes in one step.
         assert!(s.undo().unwrap());
         assert_eq!(s.triangle_count(i, g).unwrap(), 12);
+    }
+
+    #[test]
+    fn register_binding_lays_out_the_report() {
+        let mut s = WasmScene::new();
+        // A closed box with three different sides: all six motions constrained.
+        let positions: [f64; 24] = [
+            0., 0., 0., 3., 0., 0., 3., 2., 0., 0., 2., 0., //
+            0., 0., 1., 3., 0., 1., 3., 2., 1., 0., 2., 1.,
+        ];
+        let indices: [u32; 36] = [
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, //
+            0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, //
+            1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+        ];
+        let f = s.add_mesh(&positions, &indices, None, 0, false).unwrap();
+        let m = s.add_mesh(&positions, &indices, None, 0, false).unwrap();
+        s.set_placement(m[0], m[1], &IDENTITY, &[0.05, -0.03, 0.02], None)
+            .unwrap();
+        let nan = f64::NAN;
+        let r = s
+            .register(m[0], m[1], f[0], f[1], nan, nan, nan, nan, nan, true)
+            .unwrap();
+        assert_eq!(r.len(), 22);
+        // Back on the box: identity rotation, zero translation, unit scale.
+        for (got, want) in r[..9].iter().zip(&IDENTITY) {
+            assert!((got - want).abs() < 1e-6, "{r:?}");
+        }
+        assert!(r[9..12].iter().all(|v| v.abs() < 1e-6), "{r:?}");
+        assert_eq!(&r[12..15], &[1.0, 1.0, 1.0]);
+        assert!(r[15] < 1e-6, "{r:?}");
+        assert!(r[16] >= 1.0 && r[16] <= 50.0, "{r:?}");
+        assert_eq!(&r[17..21], &[0.0, 1.0, 20.0, 20.0], "{r:?}");
+        assert!(r[21] > 1e-6 && r[21] <= 1.0, "{r:?}");
+        // A bad count is rejected here; a bad range by the solver.
+        let bad = s.register(m[0], m[1], f[0], f[1], -1.0, nan, nan, nan, nan, true);
+        assert_eq!(code(bad), codes::INVALID_ARGUMENT);
+        let bad = s.register(m[0], m[1], f[0], f[1], nan, nan, 2.0, nan, nan, true);
+        assert_eq!(code(bad), codes::INVALID_ARGUMENT);
+        let bad = s.register(m[0], m[1], m[0], m[1], nan, nan, nan, nan, nan, true);
+        assert_eq!(code(bad), codes::INVALID_ARGUMENT);
     }
 
     #[test]

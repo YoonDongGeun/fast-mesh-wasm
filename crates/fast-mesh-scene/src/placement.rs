@@ -178,7 +178,7 @@ fn unit(a: [f64; 3]) -> [f64; 3] {
 }
 
 /// Gram-Schmidt on the rows, so the rotation is orthonormal to f64 rounding.
-fn orthonormalize(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn orthonormalize(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let r0 = unit(m[0]);
     let d = dot(m[1], r0);
     let r1 = unit([
