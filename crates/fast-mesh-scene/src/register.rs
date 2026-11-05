@@ -6,7 +6,7 @@
 //! are world distances.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_ops::{IcpOptions, IcpStatus, icp, sample_surface};
+use fast_mesh_ops::{IcpMotion, IcpOptions, IcpStatus, icp, sample_surface};
 use fast_mesh_query::Rigid;
 use fast_mesh_store::{Mesh, StoreError};
 
@@ -25,10 +25,35 @@ pub struct RegisterOptions {
     /// ([`fast_mesh_ops::sample_surface`]); at least 1. The `rmse` is measured
     /// on these. Default 100,000.
     pub max_samples: usize,
-    /// Whether a converged result becomes the moving mesh's placement, as one
-    /// undo step. A result that did not converge is never applied. Default
+    /// Whether a good result becomes the moving mesh's placement, as one undo
+    /// step: it must converge and pass the guards in [`NotApplied`]. Default
     /// true.
     pub apply: bool,
+    /// The largest `rmse`, in world units, that may be applied; `None` means
+    /// [`DEFAULT_MAX_RMSE_FRACTION`] of the moving points' extent. Zero or
+    /// greater; `f64::INFINITY` turns the guard off.
+    pub max_rmse: Option<f64>,
+}
+
+/// The default [`RegisterOptions::max_rmse`], as a fraction of the moving
+/// points' extent. A wrong local minimum measured about 3%, and the same mesh
+/// with noise of 1% of its size correctly aligned at about 0.4% (`icp_survey`
+/// in `fast-mesh-ops`). Scans noisier than this need their own limit.
+pub const DEFAULT_MAX_RMSE_FRACTION: f64 = 0.01;
+
+/// Why a result was not applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotApplied {
+    /// [`RegisterOptions::apply`] was false.
+    NotRequested,
+    /// The status is not [`IcpStatus::Converged`].
+    NotConverged,
+    /// `rmse` is above [`RegisterOptions::max_rmse`]: most likely a wrong local
+    /// minimum, which a converged status does not rule out.
+    RmseAboveLimit,
+    /// Fewer than half of the points `overlap` expects were within
+    /// `max_distance`: the fit rests on a small patch.
+    TooFewInliers,
 }
 
 impl Default for RegisterOptions {
@@ -37,12 +62,13 @@ impl Default for RegisterOptions {
             icp: IcpOptions::default(),
             max_samples: 100_000,
             apply: true,
+            max_rmse: None,
         }
     }
 }
 
 /// What [`Scene::register`] found.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegisterReport {
     /// The moving mesh's aligned placement, with its scale unchanged: the
     /// converged result, or the best estimate when it did not converge.
@@ -53,22 +79,31 @@ pub struct RegisterReport {
     pub rmse: f64,
     /// Solver steps taken.
     pub iterations: usize,
-    /// Whether the iteration settled with all six degrees of freedom
-    /// constrained. That is not proof of the right alignment, since ICP is
-    /// local: judge that from `rmse`.
+    /// Whether the iteration settled and the data determine every motion
+    /// locally ([`fast_mesh_ops::icp()`] tests this by restarting from displaced
+    /// poses). That is not proof of the right alignment, since ICP is local and
+    /// can settle in a wrong minimum: judge that from `rmse`.
     pub converged: bool,
     /// Why iteration stopped.
     pub status: IcpStatus,
     /// Whether `placement` was set on the moving mesh.
     pub applied: bool,
+    /// Why it was not; `None` exactly when `applied`.
+    pub not_applied: Option<NotApplied>,
+    /// The `rmse` limit that applied, in world units.
+    pub max_rmse: f64,
     /// Surface points of the moving mesh sampled.
     pub samples: usize,
     /// Sampled points used at `placement`: the rest were trimmed or out of
     /// range.
     pub inliers: usize,
-    /// How well the worst-constrained motion is determined; see
+    /// A warning of a weak motion, from geometry alone; see
     /// [`fast_mesh_ops::IcpReport::conditioning`].
     pub conditioning: f64,
+    /// The motions the data do not determine, in world coordinates; non-empty
+    /// only with [`IcpStatus::Underconstrained`]. The pose along them is
+    /// arbitrary.
+    pub undetermined: Vec<IcpMotion>,
 }
 
 /// `a` after `b`.
@@ -82,6 +117,21 @@ fn compose(a: &Rigid, b: &Rigid) -> Rigid {
         translation: std::array::from_fn(|i| {
             ra[i][0] * t[0] + ra[i][1] * t[1] + ra[i][2] * t[2] + a.translation[i]
         }),
+    }
+}
+
+/// A motion in the frame `frame`, in world coordinates.
+fn motion_to_world(m: &IcpMotion, frame: &Rigid) -> IcpMotion {
+    let r = &frame.rotation;
+    let turn = |v: [f64; 3]| -> [f64; 3] {
+        std::array::from_fn(|i| r[i][0] * v[0] + r[i][1] * v[1] + r[i][2] * v[2])
+    };
+    let about = turn(m.about);
+    IcpMotion {
+        translation: turn(m.translation),
+        rotation: turn(m.rotation),
+        about: std::array::from_fn(|i| about[i] + frame.translation[i]),
+        alternative_rmse: m.alternative_rmse,
     }
 }
 
@@ -109,11 +159,20 @@ impl Scene {
     /// the meshes roughly in place first, with [`Scene::set_placement`]; a
     /// good guess is off by a small part of the shape's features.
     ///
-    /// **Applying.** With [`RegisterOptions::apply`] (the default) a converged
-    /// result becomes `moving`'s placement as one undo step, or as part of the
-    /// open step. A result that did not converge changes nothing, whatever
-    /// the option, but its best estimate is returned; set it with
-    /// [`Scene::set_placement`] if it will do.
+    /// **Applying.** With [`RegisterOptions::apply`] (the default) a good result
+    /// becomes `moving`'s placement as one undo step, or as part of the open
+    /// step. Good means converged, with `rmse` within
+    /// [`RegisterOptions::max_rmse`] and enough points in range ([`NotApplied`]
+    /// says which failed). Anything else changes nothing, whatever the option,
+    /// but its estimate is returned; set it with [`Scene::set_placement`] if it
+    /// will do.
+    ///
+    /// **Undetermined poses.** A sphere's spin, a cylinder's spin and a plane's
+    /// slide are not fixed by the data, though facets or noise can make the
+    /// iteration settle on some value with a tiny `rmse`. Those report
+    /// [`IcpStatus::Underconstrained`], not converged, and list the motions in
+    /// `undetermined`. Coarse regular meshes count too: a 16-sided sphere has
+    /// exact fits 22.5 degrees apart.
     ///
     /// **Scales.** Only rotation and translation are solved. `moving`'s scale
     /// is applied to its points and kept as it is. `fixed`'s scale, uniform
@@ -128,8 +187,8 @@ impl Scene {
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
-    /// [`SceneError::InvalidInput`] when the ids are one mesh or `max_samples`
-    /// is zero; [`SceneError::StaleBvh`] for a stale Manual `fixed`;
+    /// [`SceneError::InvalidInput`] when the ids are one mesh, `max_samples` is
+    /// zero or `max_rmse` is negative or NaN; [`SceneError::StaleBvh`] for a stale Manual `fixed`;
     /// [`SceneError::Ops`] when a mesh has no triangles, an option is invalid,
     /// or a placement takes the points out of `f32` range in `fixed`'s
     /// frame. On error the scene is unchanged.
@@ -147,6 +206,9 @@ impl Scene {
         }
         if options.max_samples == 0 {
             return Err(SceneError::InvalidInput("max_samples must be at least 1"));
+        }
+        if options.max_rmse.is_some_and(|v| v.is_nan() || v < 0.0) {
+            return Err(SceneError::InvalidInput("max_rmse must be zero or greater"));
         }
         self.prepare(Some(&[fixed]))?;
         let (m, f) = (self.entry(moving)?, self.entry(fixed)?);
@@ -191,8 +253,22 @@ impl Scene {
             scale: moving_scale,
         };
         let converged = solved.converged();
-        let applied = options.apply && converged;
-        if applied {
+        let max_rmse = options
+            .max_rmse
+            .unwrap_or(DEFAULT_MAX_RMSE_FRACTION * solved.extent);
+        let expected = (options.icp.overlap * solved.samples as f64).ceil();
+        let not_applied = if !converged {
+            Some(NotApplied::NotConverged)
+        } else if !options.apply {
+            Some(NotApplied::NotRequested)
+        } else if solved.rmse > max_rmse {
+            Some(NotApplied::RmseAboveLimit)
+        } else if (solved.inliers as f64) * 2.0 < expected {
+            Some(NotApplied::TooFewInliers)
+        } else {
+            None
+        };
+        if not_applied.is_none() {
             self.set_placement(moving, placement)?;
         }
         Ok(RegisterReport {
@@ -201,10 +277,17 @@ impl Scene {
             iterations: solved.iterations,
             converged,
             status: solved.status,
-            applied,
+            applied: not_applied.is_none(),
+            not_applied,
+            max_rmse,
             samples: solved.samples,
             inliers: solved.inliers,
             conditioning: solved.conditioning,
+            undetermined: solved
+                .undetermined
+                .iter()
+                .map(|m| motion_to_world(m, &frame))
+                .collect(),
         })
     }
 }

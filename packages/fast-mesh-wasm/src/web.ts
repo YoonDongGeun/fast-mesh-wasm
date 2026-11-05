@@ -87,6 +87,8 @@ export {
   type RaycastOptions,
   type RayHit,
   type SceneMeshViews,
+  type RegisterMotion,
+  type RegisterNotApplied,
   type RegisterOptions,
   type RegisterResult,
   type RegisterStatus,

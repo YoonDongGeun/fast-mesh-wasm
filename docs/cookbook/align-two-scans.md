@@ -46,9 +46,12 @@ const guess = {
 };
 scene.setPlacement(moving, guess);
 
-const r = scene.register(moving, fixed);
-if (!r.converged || r.rmse > 1e-4) {
-  throw new Error(`alignment failed: ${r.status}, rmse ${r.rmse}`);
+// Applied only if it converged and its rmse is within `maxRmse` (by default 1%
+// of the moving mesh's extent). Tighten it for your data: it is checked before
+// anything moves, so a failure leaves the mesh where it was.
+const r = scene.register(moving, fixed, { maxRmse: 1e-3 });
+if (!r.applied) {
+  throw new Error(`alignment failed: ${r.status}, ${r.notApplied}, rmse ${r.rmse}`);
 }
 console.log(r.placement, r.rmse, r.iterations);
 
@@ -60,9 +63,10 @@ if (scene.placement(moving).translation[0] !== guess.translation[0]) {
 scene.redo();
 ```
 
-`converged` says the iteration settled and the surface determined every rigid
-motion. It does not say the fit is the right one: read `rmse` for that, in world
-units, over the points used.
+`converged` says the iteration settled and the data determine every rigid motion
+locally. It does not say the fit is the right one: a far guess can settle in a
+wrong minimum, which only `rmse` shows (world units, over the points used). That
+is what `maxRmse` is for, and `notApplied` says when it stopped a result.
 
 ## Partial overlap
 
@@ -86,12 +90,12 @@ console.log(`${trimmed.inliers} of ${trimmed.samples} points used`);
 
 ## Return only, and apply yourself
 
-`apply: false`, as above, leaves the scene alone. A result that did not converge
-is never applied, with or without it, but `placement` still holds the best
-estimate:
+`apply: false`, as above, leaves the scene alone, so you can check the result
+with your own rule first. A result that is not good is never applied, with or
+without it, but `placement` still holds the estimate:
 
 ```ts
-if (!trimmed.applied) {
+if (trimmed.notApplied === "notRequested") {
   scene.setPlacement(second, trimmed.placement);
 }
 ```
@@ -99,9 +103,12 @@ if (!trimmed.applied) {
 ## When it cannot converge
 
 Some surfaces do not determine the alignment. A plane can slide anywhere along
-itself, and a tube along its axis. `register` leaves such motions where the
-placement put them and reports `status: "underconstrained"`, with
-`converged: false`, rather than making up an answer:
+itself, a tube along its axis, and a sphere or a cylinder can spin. Facets or
+noise can still give the iteration something to settle on, with a tiny `rmse`, so
+`register` checks: it displaces the result along each motion and iterates again.
+If a restart stays away with a fit as good, the data do not choose. It reports
+`status: "underconstrained"` and `converged: false`, moves nothing, and lists the
+motions in `undetermined`:
 
 ```ts
 const quad = [-50, -50, 0, 50, -50, 0, 50, 50, 0, -50, 50, 0];
@@ -114,11 +121,16 @@ const sliding = scene.register(tile, ground);
 if (sliding.converged || sliding.status !== "underconstrained") {
   throw new Error("a plane on a plane must not report convergence");
 }
+// Three motions: the two slides and the spin about the plane's normal.
+for (const m of sliding.undetermined) {
+  console.log(m.translation, m.rotation, m.about);
+}
 ```
 
-`conditioning` tells how well the worst-determined motion is fixed. A sphere's
-spin is fixed only by its facets, so a sphere recovers its center reliably while
-its rotation means little, and the number falls the finer it is tessellated.
+The check is local. Regular meshes with exact fits close by count as undetermined
+(a 16-sided sphere fits every 22.5 degrees), while a cube's 90-degree symmetry does
+not. `conditioning` is a geometric warning only: a high value does not mean a
+motion is determined.
 
 ## Scales
 

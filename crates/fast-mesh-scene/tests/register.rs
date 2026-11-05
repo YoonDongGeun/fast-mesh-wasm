@@ -5,7 +5,8 @@
 
 use fast_mesh_scene::ops::{IcpOptions, IcpStatus};
 use fast_mesh_scene::{
-    MeshId, MeshOptions, Placement, RegisterOptions, Scene, SceneError, SceneOptions, UpdateMode,
+    MeshId, MeshOptions, NotApplied, Placement, RegisterOptions, Scene, SceneError, SceneOptions,
+    UpdateMode,
 };
 use fast_mesh_store::{Mesh, par};
 
@@ -289,6 +290,160 @@ fn fixed_non_uniform_scale_is_followed_in_world_units() {
     let r = scene.register(moving, fixed, &measure).unwrap();
     assert!((r.rmse - 0.75).abs() < 1e-6, "{r:?}");
     assert!(!r.converged && !r.applied, "{r:?}");
+}
+
+#[test]
+fn both_meshes_scaled_differently() {
+    // One shape, stored divided by a different scale per mesh.
+    let (scale_f, scale_m) = ([2.0, 0.5, 4.0], [0.25, 3.0, 1.5]);
+    let mut scene = Scene::new(SceneOptions::default());
+    let fixed = add(&mut scene, mesh(&blob_buffers(32, 64, scale_f, [0.0; 3])));
+    let moving = add(&mut scene, mesh(&blob_buffers(32, 64, scale_m, [0.0; 3])));
+    let on_fixed = Placement {
+        rotation: rotation(-0.5, 0.3),
+        translation: [-3.0, 1.0, 2.0],
+        scale: scale_f,
+    };
+    scene.set_placement(fixed, on_fixed).unwrap();
+    let target = Placement {
+        scale: scale_m,
+        ..on_fixed
+    };
+    let start = nudged(&target);
+    scene.set_placement(moving, start).unwrap();
+    let r = scene
+        .register(moving, fixed, &RegisterOptions::default())
+        .unwrap();
+    assert!(r.converged && r.applied, "{r:?}");
+    assert_eq!(r.placement.scale, scale_m);
+    assert_eq!(scene.placement(fixed).unwrap(), on_fixed);
+    assert!(close(&r.placement, &target, 1e-5), "{r:?}");
+    assert!(r.rmse < 1e-5, "{r:?}");
+    assert!(scene.undo().unwrap());
+    assert_eq!(scene.placement(moving).unwrap(), start);
+}
+
+#[test]
+fn an_undetermined_pose_is_not_converged_or_applied_and_names_the_motion() {
+    // A capped cylinder along the world x axis, resampled: its spin is free.
+    let cylinder = |rings: u32, around: u32| {
+        let mut positions = Vec::new();
+        for i in 0..=rings {
+            let x = 2.0 * f64::from(i) / f64::from(rings);
+            for j in 0..around {
+                let a = std::f64::consts::TAU * f64::from(j) / f64::from(around);
+                positions.extend([x as f32, a.cos() as f32, a.sin() as f32]);
+            }
+        }
+        let (start, end) = ((rings + 1) * around, (rings + 1) * around + 1);
+        positions.extend([0.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        let mut indices = Vec::new();
+        for j in 0..around {
+            let next = (j + 1) % around;
+            indices.extend([
+                start,
+                next,
+                j,
+                end,
+                rings * around + j,
+                rings * around + next,
+            ]);
+            for i in 0..rings {
+                let (a, b) = (i * around + j, i * around + next);
+                indices.extend([a, b, b + around, a, b + around, a + around]);
+            }
+        }
+        Mesh::from_buffers(&positions, &indices).unwrap()
+    };
+    let mut scene = Scene::new(SceneOptions::default());
+    let fixed = add(&mut scene, cylinder(40, 128));
+    let moving = add(&mut scene, cylinder(23, 97));
+    let start = Placement {
+        translation: [0.02, 0.01, -0.01],
+        ..Placement::IDENTITY
+    };
+    scene.set_placement(moving, start).unwrap();
+    let options = RegisterOptions {
+        icp: IcpOptions {
+            tolerance: 1e-3,
+            ..IcpOptions::default()
+        },
+        ..RegisterOptions::default()
+    };
+    let r = scene.register(moving, fixed, &options).unwrap();
+    assert_eq!(r.status, IcpStatus::Underconstrained, "{r:?}");
+    assert!(!r.converged && !r.applied, "{r:?}");
+    assert_eq!(r.not_applied, Some(NotApplied::NotConverged));
+    assert_eq!(scene.placement(moving).unwrap(), start);
+    assert_eq!(r.undetermined.len(), 1, "{r:?}");
+    // In world coordinates: a spin about x.
+    let w = r.undetermined[0].rotation;
+    assert!(w[0].abs() > 10.0 * w[1].abs().max(w[2].abs()), "{r:?}");
+}
+
+#[test]
+fn a_wrong_minimum_is_not_applied_unless_the_limit_allows_it() {
+    // Nearly half a turn off: it settles, locally determined, on a wrong fit.
+    let mut scene = Scene::new(SceneOptions::default());
+    let buffers = blob_buffers(32, 64, [1.0; 3], [0.0; 3]);
+    let fixed = add(&mut scene, mesh(&buffers));
+    let moving = add(&mut scene, mesh(&buffers));
+    let start = Placement {
+        rotation: rotation(2.8, 0.0),
+        ..Placement::IDENTITY
+    };
+    scene.set_placement(moving, start).unwrap();
+    let mut options = RegisterOptions {
+        icp: IcpOptions {
+            tolerance: 1e-3,
+            ..IcpOptions::default()
+        },
+        ..RegisterOptions::default()
+    };
+    let r = scene.register(moving, fixed, &options).unwrap();
+    assert!(r.converged, "{r:?}");
+    assert!(!r.applied, "{r:?}");
+    assert_eq!(r.not_applied, Some(NotApplied::RmseAboveLimit));
+    assert!(r.rmse > r.max_rmse, "{r:?}");
+    assert_eq!(scene.placement(moving).unwrap(), start);
+    options.max_rmse = Some(f64::INFINITY);
+    let r = scene.register(moving, fixed, &options).unwrap();
+    assert!(r.applied && r.not_applied.is_none(), "{r:?}");
+    options.max_rmse = Some(-1.0);
+    assert!(matches!(
+        scene.register(moving, fixed, &options),
+        Err(SceneError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn a_fit_resting_on_a_small_patch_is_not_applied() {
+    // The cutoff admits only the points near where the patch happens to touch.
+    let mut scene = Scene::new(SceneOptions::default());
+    let buffers = blob_buffers(32, 64, [1.0; 3], [0.0; 3]);
+    let fixed = add(&mut scene, mesh(&buffers));
+    let moving = add(&mut scene, mesh(&buffers));
+    scene
+        .set_placement(
+            moving,
+            Placement {
+                translation: [2.2, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+        )
+        .unwrap();
+    let options = RegisterOptions {
+        icp: IcpOptions {
+            max_distance: 0.25,
+            tolerance: 1e-3,
+            ..IcpOptions::default()
+        },
+        max_rmse: Some(f64::INFINITY),
+        ..RegisterOptions::default()
+    };
+    let r = scene.register(moving, fixed, &options).unwrap();
+    assert_eq!(r.not_applied, Some(NotApplied::TooFewInliers), "{r:?}");
+    assert!(r.inliers * 2 < r.samples, "{r:?}");
 }
 
 #[test]

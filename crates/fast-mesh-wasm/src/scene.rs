@@ -22,10 +22,10 @@ use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions,
-    DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, OutOfRange,
-    Placement, Plane, RegisterOptions, Scene, SceneClosestOptions, SceneError, SceneOptions,
-    SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState, ThicknessField,
-    UpdateMode,
+    DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, NotApplied,
+    OutOfRange, Placement, Plane, RegisterOptions, Scene, SceneClosestOptions, SceneError,
+    SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
+    ThicknessField, UpdateMode,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -1046,8 +1046,11 @@ impl WasmScene {
     /// placements; see [`Scene::register`]. The numeric options are NaN for
     /// their defaults. Returns `[rotation (9, row-major), translation (3),
     /// scale (3), rmse, iterations, status, applied, samples, inliers,
-    /// conditioning]`, with status 0 converged, 1 out of iterations, 2
-    /// underconstrained, 3 too few correspondences, 4 diverged.
+    /// conditioning, not applied, max rmse, then per undetermined motion
+    /// translation (3), rotation (3), about (3) and its other rmse]`, with
+    /// status 0 converged, 1 out of iterations, 2 underconstrained, 3 too few
+    /// correspondences, 4 diverged; and not applied 0 applied, 1 not requested,
+    /// 2 not converged, 3 rmse above the limit, 4 too few inliers.
     #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
@@ -1061,6 +1064,7 @@ impl WasmScene {
         max_distance: f64,
         max_samples: f64,
         apply: bool,
+        max_rmse: f64,
     ) -> Result<Vec<f64>, Error> {
         let moving = self.id(moving_index, moving_generation)?;
         let fixed = self.id(fixed_index, fixed_generation)?;
@@ -1078,6 +1082,7 @@ impl WasmScene {
             max_samples: crate::edit::count_opt(max_samples, "maxSamples")?
                 .unwrap_or(defaults.max_samples),
             apply,
+            max_rmse: (!max_rmse.is_nan()).then_some(max_rmse),
         };
         let r = self.scene.register(moving, fixed, &options)?;
         let status = match r.status {
@@ -1087,7 +1092,14 @@ impl WasmScene {
             IcpStatus::TooFewCorrespondences => 3.0,
             IcpStatus::Diverged => 4.0,
         };
-        let mut out = Vec::with_capacity(22);
+        let not_applied = match r.not_applied {
+            None => 0.0,
+            Some(NotApplied::NotRequested) => 1.0,
+            Some(NotApplied::NotConverged) => 2.0,
+            Some(NotApplied::RmseAboveLimit) => 3.0,
+            Some(NotApplied::TooFewInliers) => 4.0,
+        };
+        let mut out = Vec::with_capacity(24 + 10 * r.undetermined.len());
         out.extend(r.placement.rotation.iter().flatten());
         out.extend(r.placement.translation);
         out.extend(r.placement.scale);
@@ -1099,7 +1111,15 @@ impl WasmScene {
             count(r.samples),
             count(r.inliers),
             r.conditioning,
+            not_applied,
+            r.max_rmse,
         ]);
+        for m in &r.undetermined {
+            out.extend(m.translation);
+            out.extend(m.rotation);
+            out.extend(m.about);
+            out.push(m.alternative_rmse);
+        }
         Ok(out)
     }
 
@@ -1909,9 +1929,9 @@ mod tests {
             .unwrap();
         let nan = f64::NAN;
         let r = s
-            .register(m[0], m[1], f[0], f[1], nan, nan, nan, nan, nan, true)
+            .register(m[0], m[1], f[0], f[1], nan, nan, nan, nan, nan, true, nan)
             .unwrap();
-        assert_eq!(r.len(), 22);
+        assert_eq!(r.len(), 24);
         // Back on the box: identity rotation, zero translation, unit scale.
         for (got, want) in r[..9].iter().zip(&IDENTITY) {
             assert!((got - want).abs() < 1e-6, "{r:?}");
@@ -1922,12 +1942,14 @@ mod tests {
         assert!(r[16] >= 1.0 && r[16] <= 50.0, "{r:?}");
         assert_eq!(&r[17..21], &[0.0, 1.0, 20.0, 20.0], "{r:?}");
         assert!(r[21] > 1e-6 && r[21] <= 1.0, "{r:?}");
+        assert_eq!(r[22], 0.0, "{r:?}");
+        assert!(r[23] > 0.0, "{r:?}");
         // A bad count is rejected here; a bad range by the solver.
-        let bad = s.register(m[0], m[1], f[0], f[1], -1.0, nan, nan, nan, nan, true);
+        let bad = s.register(m[0], m[1], f[0], f[1], -1.0, nan, nan, nan, nan, true, nan);
         assert_eq!(code(bad), codes::INVALID_ARGUMENT);
-        let bad = s.register(m[0], m[1], f[0], f[1], nan, nan, 2.0, nan, nan, true);
+        let bad = s.register(m[0], m[1], f[0], f[1], nan, nan, 2.0, nan, nan, true, nan);
         assert_eq!(code(bad), codes::INVALID_ARGUMENT);
-        let bad = s.register(m[0], m[1], m[0], m[1], nan, nan, nan, nan, nan, true);
+        let bad = s.register(m[0], m[1], m[0], m[1], nan, nan, nan, nan, nan, true, nan);
         assert_eq!(code(bad), codes::INVALID_ARGUMENT);
     }
 

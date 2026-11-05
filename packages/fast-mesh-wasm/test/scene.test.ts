@@ -49,6 +49,20 @@ function lump(stacks: number, slices: number) {
   return { positions, indices };
 }
 
+/** A plain UV sphere of radius 1. */
+function lumpless(stacks: number, slices: number) {
+  const positions = [0, 0, 1];
+  for (let i = 1; i < stacks; i++) {
+    const phi = (Math.PI * i) / stacks;
+    for (let j = 0; j < slices; j++) {
+      const a = (2 * Math.PI * j) / slices;
+      positions.push(Math.sin(phi) * Math.cos(a), Math.sin(phi) * Math.sin(a), Math.cos(phi));
+    }
+  }
+  positions.push(0, 0, -1);
+  return { positions, indices: lump(stacks, slices).indices };
+}
+
 /** A small rotation about z, row-major. */
 function smallTurn(angle: number): number[] {
   const [s, c] = [Math.sin(angle), Math.cos(angle)];
@@ -495,6 +509,8 @@ describe("Scene", () => {
     expect(r.samples).toBeGreaterThan(0);
     expect(r.inliers).toBe(r.samples);
     expect(r.conditioning).toBeGreaterThan(1e-6);
+    expect(r.notApplied).toBeNull();
+    expect(r.undetermined).toEqual([]);
     expectNear(r.placement.rotation as number[], IDENTITY, 1e-5);
     expectNear(r.placement.translation, [0, 0, 0], 1e-5);
     expect(r.placement.scale).toEqual([1, 1, 1]);
@@ -556,6 +572,7 @@ describe("Scene", () => {
     expectNear(r.placement.translation, [4, 3, 0], 1e-5);
     expect(Number.isFinite(r.rmse)).toBe(true);
     expect(r.conditioning).toBeLessThan(1e-6);
+    expect(r.undetermined.length).toBe(3);
   });
 
   it("register_keeps_the_moving_scale_and_measures_in_world_units", () => {
@@ -577,6 +594,49 @@ describe("Scene", () => {
     expect(m.status).toBe("maxIterations");
     expect(m.iterations).toBe(0);
     expect(m.rmse).toBeCloseTo(0.5, 6);
+  });
+
+  it("register_with_bad_options_leaves_a_drag_running", () => {
+    const s = scene();
+    const { positions, indices } = lump(8, 16);
+    const a = s.addMesh(positions, indices);
+    const b = s.addMesh(positions, indices);
+    const d = s.drag(a);
+    d.move({ rotation: IDENTITY, translation: [0.5, 0, 0] });
+    expect(codeOf(() => s.register(a, b, { overlap: 2 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.register(a, a))).toBe("INVALID_ARGUMENT");
+    // Still the same drag: a second one is refused until it ends.
+    expect(codeOf(() => s.drag(a))).toBe("INVALID_ARGUMENT");
+    d.end();
+  });
+
+  it("register_does_not_apply_a_wrong_minimum_or_an_undetermined_pose", () => {
+    const s = scene();
+    const { positions, indices } = lump(32, 64);
+    const fixed = s.addMesh(positions, indices);
+    const moving = s.addMesh(positions, indices);
+    s.setPlacement(moving, { rotation: smallTurn(2.8), translation: [0, 0, 0] });
+    const before = s.placement(moving);
+    const r = s.register(moving, fixed, { tolerance: 1e-3 });
+    expect(r.converged).toBe(true);
+    expect(r.applied).toBe(false);
+    expect(r.notApplied).toBe("rmseAboveLimit");
+    expect(r.rmse).toBeGreaterThan(r.maxRmse);
+    expect(s.placement(moving)).toEqual(before);
+    expect(s.register(moving, fixed, { tolerance: 1e-3, maxRmse: Infinity }).applied).toBe(true);
+    // A sphere: its spin is free, so nothing is applied and the motions are named.
+    const ball = lumpless(32, 64);
+    const f = s.addMesh(ball.positions, ball.indices);
+    const m = s.addMesh(ball.positions, ball.indices);
+    s.setPlacement(m, { rotation: smallTurn(0.06), translation: [0, 0, 0] });
+    const u = s.register(m, f);
+    expect(u.status).toBe("underconstrained");
+    expect(u.converged).toBe(false);
+    expect(u.applied).toBe(false);
+    expect(u.notApplied).toBe("notConverged");
+    expect(u.undetermined.length).toBe(3);
+    expect(u.undetermined[0].rotation.length).toBe(3);
+    expect(u.undetermined[0].about.length).toBe(3);
   });
 
   it("register_rejects_bad_input", () => {
