@@ -14,6 +14,7 @@ crates/fast-mesh-query/  Raycast, closest-point, region and mesh-vs-mesh queries
 crates/fast-mesh-scene/  Scene: meshes, placements, update modes, world queries, contacts, fields, plane sections, multi-mesh undo.
 crates/fast-mesh-fields/  Per-vertex fields: signed distance (pseudonormal, fast winding), colormaps.
 crates/fast-mesh-ops/     Mesh repair: edge maps, components, boundary loops; analysis, weld, orient, hole filling.
+crates/fast-mesh-cli/     The native `fast-mesh` binary: repair, measure, boolean, convert; STL, OBJ, PLY and GLB parsers and writers.
 packages/fast-mesh-wasm/ The npm package: TypeScript entry points, tests, build config.
 examples/vite/           Browser example, also used by CI to check bundler support.
 examples/webgpu/         Scene API in raw WebGPU (no 3D library): the renderer-neutral pattern.
