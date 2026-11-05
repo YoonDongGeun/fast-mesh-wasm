@@ -7,6 +7,7 @@
 // The `download*` helpers wrap the File System Access picker fallback pattern
 // from `load/project.ts` (anchor download); they run only from click handlers.
 import type { SectionContour } from "fast-mesh-wasm";
+import { type LengthUnit, toDisplayLength } from "../panels/units";
 
 /** A contour's shape, without its scene origin: what the builders read. */
 export interface ContourLike {
@@ -142,19 +143,20 @@ function escapeCsv(cell: string): string {
 
 /**
  * The collision summary as CSV: one row per pair (`mesh_a`, `mesh_b`,
- * `min_gap`, `intersects`, `max_depth`), unmeasured gaps/depths empty.
- * Header only when there are no rows.
+ * `min_gap_<unit>`, `intersects`, `max_depth_<unit>`), unmeasured gaps/depths
+ * empty, lengths in `unit` at full precision (the rows hold mm). Header only
+ * when there are no rows.
  */
-export function collisionRowsToCsv(rows: readonly CollisionCsvRow[]): string {
-  const lines = ["mesh_a,mesh_b,min_gap,intersects,max_depth"];
+export function collisionRowsToCsv(rows: readonly CollisionCsvRow[], unit: LengthUnit = "mm"): string {
+  const lines = [`mesh_a,mesh_b,min_gap_${unit},intersects,max_depth_${unit}`];
   for (const r of rows) {
     lines.push(
       [
         escapeCsv(r.a),
         escapeCsv(r.b),
-        r.gap === null ? "" : String(r.gap),
+        r.gap === null ? "" : String(toDisplayLength(r.gap, unit)),
         r.intersects ? "yes" : "no",
-        r.depth === null ? "" : String(r.depth),
+        r.depth === null ? "" : String(toDisplayLength(r.depth, unit)),
       ].join(","),
     );
   }

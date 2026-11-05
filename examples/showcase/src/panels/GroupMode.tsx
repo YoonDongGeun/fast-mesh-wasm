@@ -8,12 +8,13 @@ import { useScene, useStoreSelector } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useMemo } from "react";
-import type { AppState, GroupSetup, Item } from "../scene/app-state";
+import { type AppState, type GroupSetup, type Item, useApp } from "../scene/app-state";
 import type { Heatmap } from "./CollisionPanel";
-import { formatDistance, mayBeDeeper } from "./collision-math";
+import { mayBeDeeper } from "./collision-math";
 import { groupPairs, type MemberValues, pairDepths, togglePair } from "./group-math";
 import { type GroupReadouts, inspect } from "./inspect";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
+import { formatLength, type LengthUnit } from "./units";
 
 /** The store's id of the panel's contact group. */
 const GROUP_ID = "showcase";
@@ -60,6 +61,7 @@ export function GroupMode(props: {
 }) {
   const { app, scene, items, group, heat } = props;
   const store = useScene();
+  const units = useApp(app, (s) => s.units);
   // Members still listed (a removal updates the group in the same tick).
   const members = useMemo(
     () => group.members.filter((m) => items.some((i) => i.mesh === m)),
@@ -184,7 +186,7 @@ export function GroupMode(props: {
       ) : (
         <>
           <GroupStatus members={members} />
-          <PairReadouts readouts={readouts} pairs={pairs} nameOf={short} bound={bound} />
+          <PairReadouts units={units} readouts={readouts} pairs={pairs} nameOf={short} bound={bound} />
           {warnings.map((w) => (
             <p key={w} className="warn small" data-warning>
               {w}
@@ -213,8 +215,9 @@ function PairReadouts(props: {
   pairs: readonly (readonly [MeshHandle, MeshHandle])[];
   nameOf: (m: MeshHandle) => string;
   bound: number;
+  units: LengthUnit;
 }) {
-  const { readouts: r, pairs, nameOf, bound } = props;
+  const { readouts: r, pairs, nameOf, bound, units } = props;
   const dash = "—";
   if (pairs.length === 0) {
     return <p className="muted small">No pairs: tick some in the matrix.</p>;
@@ -239,14 +242,14 @@ function PairReadouts(props: {
                 <td>
                   {nameOf(a)} ↔ {nameOf(b)}
                 </td>
-                <td>{p === undefined || p.gap === null ? dash : formatDistance(p.gap)}</td>
+                <td>{p === undefined || p.gap === null ? dash : formatLength(p.gap, units)}</td>
                 <td>{p === undefined ? dash : p.intersects ? "yes" : "no"}</td>
                 <td>
                   {p === undefined || p.depth === null
                     ? dash
                     : p.atLeast
-                      ? `≥ ${formatDistance(Math.max(p.depth, within))}`
-                      : formatDistance(p.depth)}
+                      ? `≥ ${formatLength(Math.max(p.depth, within), units)}`
+                      : formatLength(p.depth, units)}
                 </td>
               </tr>
             );
@@ -255,7 +258,7 @@ function PairReadouts(props: {
       </table>
       {Number.isFinite(within) ? (
         <p className="muted small">
-          Fast mode: distances are measured within {formatDistance(within)}; deeper penetration shows the mesh colour.
+          Fast mode: distances are measured within {formatLength(within, units)}; deeper penetration shows the mesh colour.
         </p>
       ) : null}
     </>

@@ -5,6 +5,7 @@
 import { demoMeshes } from "../scene/demo";
 import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
+import { NO_IMPORT_SCALE, scalePositions } from "../panels/units";
 import { parseMeshFilesAsync } from "./parse";
 import { PHANTOM_FIELD, phantomSlices } from "./phantom";
 import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
@@ -164,6 +165,7 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       });
       return;
     }
+    const importScale = req.importScale ?? NO_IMPORT_SCALE;
     const buffer = await req.file.arrayBuffer();
     progress(req.id, "reading", 0.15);
     if (isCancelled(req.id)) {
@@ -192,7 +194,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
     post({
       kind: "meshes",
       id: req.id,
-      meshes: parsed.map((m) => loaded(m.name, m.data)),
+      meshes: parsed.map((m) => {
+        // Before `loaded` takes the bounds: centre and radius are in mm too.
+        scalePositions(m.data.positions, importScale.factor);
+        return { ...loaded(m.name, m.data), importScale };
+      }),
     });
   } catch (error) {
     post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });

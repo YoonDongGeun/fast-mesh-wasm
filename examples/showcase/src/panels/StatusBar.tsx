@@ -20,6 +20,7 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
   const theme = useApp(app, (s) => s.theme);
   const leftVisible = useApp(app, (s) => s.leftVisible);
   const rightVisible = useApp(app, (s) => s.rightVisible);
+  const units = useApp(app, (s) => s.units);
 
   const restart = () => {
     setRestarting(true);
@@ -71,6 +72,16 @@ export function StatusBar(props: { engine: Engine; app: AppState }) {
         {engine.isolated ? "cross-origin isolated" : "not cross-origin isolated"}
       </span>
       <span className="settings" role="group" aria-label="Display settings">
+        <button
+          type="button"
+          data-action="units"
+          data-units={units}
+          aria-pressed={units === "in"}
+          onClick={() => app.setUnits(units === "mm" ? "in" : "mm")}
+          title={`Lengths show in ${units === "mm" ? "millimetres" : "inches"}: click to switch. Display only (no mesh changes), saved with the project, and the default from here on`}
+        >
+          {units}
+        </button>
         <button
           type="button"
           data-action="theme"

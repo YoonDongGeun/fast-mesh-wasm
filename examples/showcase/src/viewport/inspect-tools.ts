@@ -75,6 +75,27 @@ export function pointInBox(p: readonly [number, number, number], min: Vec3, max:
   );
 }
 
+/**
+ * A mesh's area and volume from `scene.measure`, `null` when there is no
+ * reading. A local `Scene` answers at once and a `WorkerScene` with a promise:
+ * this takes either.
+ */
+export async function readMeasure<M>(
+  scene: unknown,
+  mesh: M,
+): Promise<{ area: number; volume: number | null } | null> {
+  const maybe = scene as { measure?: (m: M) => { area: number; volume: number | null } | Promise<{ area: number; volume: number | null }> };
+  if (typeof maybe.measure !== "function") {
+    return null;
+  }
+  try {
+    const { area, volume } = await maybe.measure(mesh);
+    return { area, volume };
+  } catch {
+    return null; // removed meanwhile
+  }
+}
+
 /** A world coordinate with three decimals, for the ruler and query readouts. */
 export function formatCoord(v: number): string {
   return Number(v.toPrecision(4)).toString();

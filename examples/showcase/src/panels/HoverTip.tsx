@@ -8,9 +8,9 @@ import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useReducer, useRef, useSyncExternalStore } from "react";
-import type { Item } from "../scene/app-state";
+import { type AppState, type Item, useApp } from "../scene/app-state";
 import { view } from "../viewport/view";
-import { formatDistance } from "./collision-math";
+import { formatLength } from "./units";
 import { readMember } from "./GroupMode";
 import { type MemberValues, nearestPartner } from "./group-math";
 import { inspect } from "./inspect";
@@ -22,8 +22,9 @@ const subscribe = (l: () => void) => {
   return () => view.hoverListeners.delete(l);
 };
 
-export function HoverTip(props: { scene: Scene | WorkerScene; items: readonly Item[]; members: readonly MeshHandle[] }) {
-  const { scene, items, members } = props;
+export function HoverTip(props: { app: AppState; scene: Scene | WorkerScene; items: readonly Item[]; members: readonly MeshHandle[] }) {
+  const { app, scene, items, members } = props;
+  const units = useApp(app, (s) => s.units);
   const store = useScene();
   const hover = useSyncExternalStore(subscribe, () => view.hover);
   const [, rerender] = useReducer((n: number) => n + 1, 0);
@@ -122,7 +123,7 @@ export function HoverTip(props: { scene: Scene | WorkerScene; items: readonly It
         ? "reading…"
         : hit === null
           ? "no partner within range"
-          : `${hit.distance < 0 ? "inside" : "nearest to"} ${nameOf(hit.partner)}: ${formatDistance(Math.abs(hit.distance))}`}
+          : `${hit.distance < 0 ? "inside" : "nearest to"} ${nameOf(hit.partner)}: ${formatLength(Math.abs(hit.distance), units)}`}
     </div>
   );
 }

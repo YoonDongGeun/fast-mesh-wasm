@@ -103,6 +103,14 @@
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all).
+// - units-*: on a fresh page, 1 in cubes loaded with "Assume files in" inches
+//   span 25.4 once (units-import); the gap and the sliders read in both units
+//   and switching moves no stored value (units-collision), the group table,
+//   a hole's perimeter and a typed radius too (units-repair); area and volume
+//   convert squared and cubed (units-measure), the ruler by the factor
+//   (units-ruler); a project round trip keeps the geometry bit-exact, an older
+//   file loads on the default (units-project); a DICOM series ignores the
+//   import scale (units-dicom); the default survives a reload (units-default).
 // - local: a short pass with ?local (the synchronous Scene on the main
 //   thread): the demo meshes, the heatmap readouts, the Group mode's
 //   per-pair readouts (depths from `fieldNearest`), Fill holes on C and undo.
@@ -1400,6 +1408,248 @@ try {
   if (option("--screenshot", undefined) !== undefined) {
     const { data } = await browser.send("Page.captureScreenshot", { format: "png" });
     writeFileSync(option("--screenshot"), Buffer.from(data, "base64"));
+  }
+
+  // ---- units: the display unit changes text, the import scale the geometry, once ----
+  {
+  // A fresh page: 1 in cubes loaded "as inches", a known gap, known area and
+  // volume. Every expected string is written out: 1 in = 25.4 mm,
+  // 1 in² = 645.16 mm², 1 in³ = 16387.064 mm³.
+  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  const bootHead = await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)?.name`, 60_000);
+  await clickOn(`[data-mesh=${q(bootHead)}] button.danger`);
+  await waitFor(`__showcase.items().length === 0`, 10_000);
+  const unitCube = ([x, y, z], open = false) => {
+    const v = (a, b, c) => [x + a, y + b, z + c];
+    const quad = (a, b, c, d) => [[...a, ...b, ...c], [...a, ...c, ...d]];
+    const [p000, p100, p110, p010, p001, p101, p111, p011] = [
+      v(0, 0, 0), v(1, 0, 0), v(1, 1, 0), v(0, 1, 0), v(0, 0, 1), v(1, 0, 1), v(1, 1, 1), v(0, 1, 1),
+    ];
+    return [
+      ...quad(p000, p010, p110, p100),
+      ...(open ? [] : quad(p001, p101, p111, p011)),
+      ...quad(p000, p100, p101, p001),
+      ...quad(p100, p110, p111, p101),
+      ...quad(p110, p010, p011, p111),
+      ...quad(p010, p000, p001, p011),
+    ];
+  };
+  const setSelect = (control, value) =>
+    page(`(() => {
+      const el = document.querySelector('[data-control=${control}]');
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, ${q(value)});
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+  const textOf = (selector) => page(`document.querySelector(${q(selector)})?.textContent ?? null`);
+  const waitText = (selector, part, ms = 20_000) =>
+    waitFor(`document.querySelector(${q(selector)})?.textContent?.includes(${q(part)})`, ms);
+  const positionsOf = (name) => `__showcase.positions(${q(name)})`;
+  // The views hold f32 positions about the mesh's origin: the span is the size.
+  const spanOf = (name) => `(() => { const p = ${positionsOf(name)}; return Math.max(...p) - Math.min(...p); })()`;
+  const isInchCube = (span) => Math.abs(span - 25.4) < 1e-5;
+  const useInches = () => clickOn("[data-action=units]");
+
+  const unitFiles = {
+    "cube-a.stl": binaryStl(unitCube([0, 0, 0])),
+    "cube-b.stl": binaryStl(unitCube([2, 0, 0])),
+    "open-c.stl": binaryStl(unitCube([0, 3, 0], true)),
+  };
+  for (const [name, data] of Object.entries(unitFiles)) {
+    writeFileSync(join(fixtures, name), data);
+  }
+  const startUnits = await hook("units()");
+  await setSelect("import-units", "in");
+  await upload(Object.keys(unitFiles).map((n) => join(fixtures, n)));
+  const imported = await waitFor(
+    `(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn) && i; })()`,
+    30_000,
+  );
+  const sA = "cube-a.stl";
+  const sB = "cube-b.stl";
+  const extentA = await page(spanOf(sA));
+  const rowScale = await page(`document.querySelector('[data-mesh=${q(sA)}] [data-import-scale]')?.textContent ?? null`);
+  verdict(
+    "units-import",
+    startUnits.units === "mm" && imported !== undefined && isInchCube(extentA) && rowScale === "×25.4"
+      && Math.abs(imported[0].radius - (25.4 * Math.sqrt(3)) / 2) < 1e-9 && imported[0].importScale.factor === 25.4,
+    `started in ${startUnits.units}; a 1 unit cube loaded as inches spans ${extentA}, radius ${imported?.[0].radius}, row ${rowScale}`,
+  );
+
+  // A in the collision pair, B 1 in away; the readouts in both units.
+  await clickOn(`[data-mesh=${q(sA)}] .mesh-name`);
+  await pick("a", sA);
+  await pick("b", sB);
+  await waitFor(collision(`c.a === ${q(sA)} && c.b === ${q(sB)} && c.coloring[${q(sA)}]?.status === "ready" && c.readouts?.gap > 0`), 30_000);
+  const readoutsMm = await waitText(".readouts", "25.4 mm");
+  const labelMm = await page(`[...document.querySelectorAll(".slider-head > span:first-child")].some((e) => e.textContent === "Colour from (mm)")`);
+  const before = await page(`JSON.stringify([__showcase.collision().coloring, __showcase.settings().heatmap, ${positionsOf(sA)}])`);
+  await useInches();
+  const readoutsIn = await waitText(".readouts", "1 in");
+  const labels = await page(`[...document.querySelectorAll(".slider-head > span:first-child")].map((e) => e.textContent).join(" | ")`);
+  const after = await page(`JSON.stringify([__showcase.collision().coloring, __showcase.settings().heatmap, ${positionsOf(sA)}])`);
+  const noMove = before === after;
+  // Back through the input: dragging "Colour from" to 1 on the inch scale is 25.4 mm.
+  await setRange("gap", 1);
+  const gapStored = await waitFor(`(() => { const g = __showcase.settings().heatmap?.gap; return Math.abs(g - 25.4) < 1e-9 && g; })()`, 5000);
+  const gapRange = await waitFor(
+    `(() => { const r = __showcase.collision().coloring[${q(sA)}]?.range; return Math.abs(r?.[1] - 25.4) < 1e-9 && r; })()`,
+    10_000,
+  );
+  const gapShown = await page(`document.querySelector("[data-control=gap]").value`);
+  const csv = await hook("exportCsv()");
+  verdict(
+    "units-collision",
+    readoutsMm === true && labelMm === true && readoutsIn === true && noMove && labels.includes("Colour from (in)")
+      && !labels.includes("(mm)") && gapStored !== undefined && gapRange !== undefined && Math.abs(Number(gapShown) - 1) < 1e-9
+      && csv.startsWith("mesh_a,mesh_b,min_gap_in,intersects,max_depth_in\n"),
+    `gap reads 25.4 mm ${readoutsMm === true} and 1 in ${readoutsIn === true}; labels ${labels}; switching moved nothing ${noMove}; slider at ${gapShown} in stores ${gapStored} mm, colours to ${gapRange?.[1]}; CSV header ${csv.split("\n")[0]}`,
+  );
+
+  // The group table and the repair panel's perimeter and typed inputs.
+  await clickOn("[data-mode=group]");
+  const groupIn = await waitText(".pair-readouts", "1 in", 30_000);
+  await clickOn("[data-mode=pair]");
+  await clickOn(`[data-mesh="open-c.stl"] .mesh-name`);
+  const perimeterIn = await waitText(".holes", "perimeter 4 in");
+  await page(`(() => {
+    const el = document.querySelector('label.field[title="Brush radius"] input');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, "0.1");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  await sleep(100);
+  const typedIn = await page(`document.querySelector('label.field[title="Brush radius"] input').value`);
+  await useInches(); // to mm
+  const perimeterMm = await waitText(".holes", "perimeter 102 mm");
+  const typedMm = await page(`document.querySelector('label.field[title="Brush radius"] input').value`);
+  await useInches(); // back to inches
+  verdict(
+    "units-repair",
+    groupIn === true && perimeterIn === true && perimeterMm === true && typedIn === "0.1" && typedMm === "2.54",
+    `group table in inches ${groupIn === true}; perimeter 4 in ${perimeterIn === true}, 102 mm ${perimeterMm === true}; a radius typed as ${typedIn} in reads ${typedMm} mm`,
+  );
+
+  // Click-to-query: the point, the coloring value, area (squared) and volume (cubed).
+  await clickOn(`[data-mesh=${q(sA)}] .mesh-name`);
+  await clickOn(`[data-mesh=${q(sA)}] button[title="Point the camera at this mesh"]`);
+  await clickOn(`[data-mesh=${q(sA)}] .mesh-name`);
+  await clickOn("[data-action=inspect-query]");
+  await sleep(1000);
+  const onA = await hook(`screenPoint(${q(sA)})`);
+  await click(onA.x, onA.y);
+  const queried = await waitText("[data-readout=query]", "area", 10_000);
+  const queryIn = await textOf("[data-readout=query]");
+  await useInches(); // to mm
+  await waitText("[data-readout=query]", "mm²", 5000);
+  const queryMm = await textOf("[data-readout=query]");
+  await useInches();
+  const measureOk =
+    queried === true && queryIn?.includes("area 6 in²") && queryIn.includes("volume 1 in³")
+    && queryMm?.includes("area 3871 mm²") && queryMm.includes("volume 16387 mm³");
+  verdict("units-measure", measureOk === true, `in: "${queryIn}"; mm: "${queryMm}"`);
+
+  // The ruler, between two of A's vertices: the panel's distance and its unit.
+  await clickOn("[data-action=inspect-ruler]");
+  await sleep(300);
+  // Wider until the two clicks snap to different vertices (a third click restarts the ruler).
+  let ruled;
+  for (const reach of [60, 100, 140, 180, 220]) {
+    await click(onA.x - reach, onA.y);
+    await sleep(300);
+    await click(onA.x + reach, onA.y);
+    ruled = await waitFor(`__showcase.inspectTools().ruler.distance`, 2000);
+    if (ruled !== undefined) {
+      break;
+    }
+  }
+  await waitText("[data-readout=ruler]", " in", 5000);
+  const rulerIn = await textOf("[data-readout=ruler]");
+  await useInches(); // to mm
+  await waitText("[data-readout=ruler]", " mm", 5000);
+  const rulerMm = await textOf("[data-readout=ruler]");
+  await useInches();
+  // The ruler's distance is canonical (mm): the same number in both.
+  const sig3 = (x) => (x >= 100 ? x.toFixed(0) : String(Number(x.toPrecision(3))));
+  verdict(
+    "units-ruler",
+    ruled > 0 && rulerIn?.includes(`= ${sig3(ruled / 25.4)} in`) && rulerMm?.includes(`= ${sig3(ruled)} mm`),
+    `${ruled} mm; "${rulerIn}"; "${rulerMm}"`,
+  );
+  await clickOn("[data-action=ruler-clear]");
+  await clickOn("[data-action=inspect-ruler]");
+
+  // The project: units and scale stored; a reload scales nothing twice.
+  const savedText = await hook("saveProject()");
+  const saved = JSON.parse(savedText);
+  await page(`__showcase.openProject(${q(savedText)})`);
+  await waitFor(`(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn); })()`, 30_000);
+  await sleep(200);
+  const again = await hook("saveProject()");
+  const reopened = await page(`(() => {
+    const a = __showcase.items().find((m) => m.name === ${q(sA)});
+    return { radius: a.radius, scale: a.importScale, extent: ${spanOf(sA)} };
+  })()`);
+  const samePositions = JSON.parse(again).meshes.every((m, i) => m.positions === saved.meshes[i].positions);
+  // An older file (no units, no scale): same geometry, on the global default.
+  await useInches(); // the default, by hand, is mm now
+  const older = JSON.parse(savedText);
+  delete older.units;
+  for (const m of older.meshes) {
+    delete m.importScale;
+  }
+  await page(`__showcase.openProject(${q(JSON.stringify(older))})`);
+  await waitFor(`(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn); })()`, 30_000);
+  const olderOpen = await page(`({ u: __showcase.units(), a: __showcase.items().find((m) => m.name === ${q(sA)}), extent: ${spanOf(sA)} })`);
+  // A project in inches, opened with mm the default: the project's unit shows, the default stays.
+  await page(`__showcase.openProject(${q(savedText)})`);
+  await waitFor(`(() => { const i = __showcase.items(); return i.length === 3 && i.every((m) => m.drawn); })()`, 30_000);
+  const projectUnits = await hook("units()");
+  verdict(
+    "units-project",
+    saved.units === "in" && saved.meshes[0].importScale?.factor === 25.4 && samePositions && isInchCube(reopened.extent)
+      && reopened.scale.factor === 25.4 && Math.abs(reopened.radius - (25.4 * Math.sqrt(3)) / 2) < 1e-5
+      && olderOpen.u.units === "mm" && isInchCube(olderOpen.extent) && olderOpen.a.importScale.factor === 1
+      && projectUnits.units === "in" && projectUnits.defaultUnits === "mm",
+    `saved ${saved.units}, ×${saved.meshes[0].importScale?.factor}; reopened spans ${reopened.extent}, same bytes ${samePositions}; older file: ${olderOpen.u.units}, spans ${olderOpen.extent}, ×${olderOpen.a.importScale.factor}; project units ${projectUnits.units}, default ${projectUnits.defaultUnits}`,
+  );
+
+  // DICOM speaks mm: inches assumed for files changes nothing about a series.
+  await setSelect("import-units", "in");
+  await page(`(() => {
+    const dt = new DataTransfer();
+    for (const f of ${JSON.stringify(series.map((s) => ({ name: s.name, bytes: [...s.bytes] })))}) {
+      dt.items.add(new File([new Uint8Array(f.bytes).buffer], f.name));
+    }
+    const canvas = document.querySelector("canvas");
+    const r = canvas.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, dataTransfer: dt };
+    canvas.dispatchEvent(new DragEvent("dragover", opts));
+    canvas.dispatchEvent(new DragEvent("drop", opts));
+  })()`);
+  const seriesMesh = await waitFor(`__showcase.items().find((m) => m.name.includes("(iso ") && m.drawn)`, 30_000);
+  verdict(
+    "units-dicom",
+    // The sphere has a 2.5 voxel radius at 1 mm spacing: a half diagonal near 4.3 mm, not 110.
+    seriesMesh !== undefined && seriesMesh.importScale.factor === 1 && seriesMesh.radius > 2 && seriesMesh.radius < 8,
+    seriesMesh === undefined ? "no series" : `${seriesMesh.name}: radius ${seriesMesh.radius}, ×${seriesMesh.importScale.factor}`,
+  );
+
+  // The global default survives a reload; Reset settings restores mm.
+  await useInches(); // the project's in -> mm, by hand
+  await useInches(); // -> in, by hand: the default too
+  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  const reloaded = await hook("units()");
+  const buttonText = await textOf("[data-action=units]");
+  await clickOn("[data-action=reset-settings]");
+  const resetUnits = await hook("units()");
+  verdict(
+    "units-default",
+    reloaded.units === "in" && reloaded.defaultUnits === "in" && reloaded.importScale.factor === 1 && buttonText === "in"
+      && resetUnits.units === "mm" && resetUnits.defaultUnits === "mm",
+    `after a reload ${reloaded.units} (default ${reloaded.defaultUnits}, import ×${reloaded.importScale.factor}), after reset ${resetUnits.units}`,
+  );
+  await page("localStorage.clear(); true");
   }
 
   // ---- local: ?local, the synchronous Scene on the main thread ----

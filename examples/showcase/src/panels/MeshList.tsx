@@ -11,6 +11,7 @@ import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { IMPORT_UNITS, importScaleFromFactor, importScaleOf, isImportUnit, parseImportScale } from "./units";
 
 const PHASE: Record<Job["phase"], string> = {
   reading: "reading…",
@@ -77,6 +78,7 @@ export function MeshList(props: {
         />
       </header>
       <p className="muted small">STL (binary, ASCII), OBJ, PLY (ASCII, binary), DICOM series. Or drop files anywhere.</p>
+      <ImportScaleControl app={app} />
       <p className="muted small">
         DICOM demos:{" "}
         {(Object.keys(PHANTOM_NAMES) as PhantomKind[]).map((kind) => (
@@ -198,6 +200,63 @@ export function MeshList(props: {
   );
 }
 
+/**
+ * What files loaded from here on are assumed to be in: a unit, or any factor
+ * to millimetres. Multiplies the geometry once, on load (files and drops; a
+ * DICOM series states its own spacing). Meshes already loaded stay as they are.
+ */
+function ImportScaleControl(props: { app: AppState }) {
+  const { app } = props;
+  const scale = useApp(app, (s) => s.importScale);
+  // The factor as typed: an unusable one shows as invalid and is not applied.
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <div className="import-scale small">
+      <label className="field" title="The unit the next files' numbers are in">
+        Assume files in
+        <select
+          data-control="import-units"
+          value={scale.units ?? "custom"}
+          onChange={(e) => {
+            const units = e.currentTarget.value;
+            if (isImportUnit(units)) {
+              setDraft(null);
+              app.setImportScale(importScaleOf(units));
+            }
+          }}
+        >
+          {IMPORT_UNITS.map((u) => (
+            <option key={u} value={u}>
+              {u}
+            </option>
+          ))}
+          {scale.units === null ? <option value="custom">custom</option> : null}
+        </select>
+      </label>
+      <label className="field" title="Millimetres per file unit: the next files' numbers are multiplied by this once, on load">
+        ×
+        <input
+          type="number"
+          data-control="import-scale"
+          min={0}
+          step="any"
+          aria-invalid={draft !== null && parseImportScale(draft) === null}
+          value={draft ?? scale.factor}
+          onChange={(e) => {
+            const text = e.currentTarget.value;
+            setDraft(text);
+            const factor = parseImportScale(text);
+            if (factor !== null) {
+              app.setImportScale(importScaleFromFactor(factor));
+            }
+          }}
+          onBlur={() => setDraft(null)}
+        />
+      </label>
+    </div>
+  );
+}
+
 function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"]) => void }) {
   const { app, item, onFocus } = props;
   const store = useScene();
@@ -236,6 +295,15 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
         >
           {item.name}
         </button>
+        {item.importScale.factor === 1 ? null : (
+          <span
+            className="count"
+            data-import-scale={item.importScale.factor}
+            title={`Loaded as ${item.importScale.units ?? "a custom unit"}: its numbers were multiplied by ${item.importScale.factor} to millimetres, once`}
+          >
+            ×{item.importScale.factor}
+          </span>
+        )}
         <span className="count" title="triangles">
           {formatCount(triangles)}
         </span>

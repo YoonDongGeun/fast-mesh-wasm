@@ -129,10 +129,12 @@ export class Loader {
       }
       (await isDicomFile(file) ? dicom : mesh).push(file);
     }
+    // Mesh files only: a DICOM series states its own spacing, in mm.
+    const { importScale } = this.#app.getSnapshot();
     const jobs = mesh.map((file) =>
       isGltfName(file.name) && siblings.length > 0
-        ? this.#start(file.name, { kind: "file", id: 0, file, buffers: siblings })
-        : this.#start(file.name, { kind: "file", id: 0, file }),
+        ? this.#start(file.name, { kind: "file", id: 0, file, buffers: siblings, importScale })
+        : this.#start(file.name, { kind: "file", id: 0, file, importScale }),
     );
     if (dicom.length > 0) {
       const name = dicom.length === 1 ? dicom[0].name : `DICOM series (${dicom.length} files)`;
