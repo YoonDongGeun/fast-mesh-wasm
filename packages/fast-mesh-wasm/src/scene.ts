@@ -759,7 +759,7 @@ export interface FilledLoop {
 export interface FillReport {
   filled: FilledLoop[];
   /** Loops left out: beyond a bound, or unclean (or open). */
-  skipped: { id: LoopId; reason: "bounds" | "unclean" }[];
+  skipped: { id: LoopId; reason: "bounds" | "unclean" | "uvSeam" }[];
   /** Selected loops that could not be filled; they stay open. */
   failed: { id: LoopId; reason: "projectionFolds" | "noValidTriangulation" | "solver" }[];
 }
@@ -1371,7 +1371,7 @@ class Reader {
   }
 }
 
-const SKIP_REASONS = ["bounds", "unclean"] as const;
+const SKIP_REASONS = ["bounds", "unclean", "uvSeam"] as const;
 const FAIL_REASONS = ["projectionFolds", "noValidTriangulation", "solver"] as const;
 const WEIGHTS = [null, "cotangent", "uniform"] as const;
 

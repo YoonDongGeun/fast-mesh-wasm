@@ -12,8 +12,9 @@
 //! combined mesh in one step. Combining a mesh with itself is a no-op for
 //! union and intersect, and clears it for subtract.
 
+use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::Rigid;
-use fast_mesh_store::{StoreError, TriangleId, VertexId};
+use fast_mesh_store::{Mesh, StoreError, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::baked::baked_mesh;
 use crate::placement::relative_affine;
@@ -43,6 +44,23 @@ pub struct BooleanReport {
     pub uvs_dropped: bool,
 }
 
+/// Whether a boolean must read `mesh` with its UV seams closed: it has UVs and
+/// an open boundary. Whether that boundary is only seams is for the boolean's
+/// own input checks to find, on the welded copy.
+fn has_open_uvs(mesh: &Mesh) -> Result<bool> {
+    Ok(mesh.uvs().is_some() && !crate::ops::boundary_loops(mesh)?.is_empty())
+}
+
+/// `baked` with exact duplicates merged and a new BVH. Slot ids stay, so the
+/// same weld of the original gives the very mesh a plan was made for.
+fn welded(mut baked: Mesh, options: &BuildOptions) -> Result<(Mesh, Bvh)> {
+    let mut tx = baked.begin_edit();
+    crate::ops::weld(&mut tx, 0.0)?;
+    tx.commit()?;
+    let bvh = Bvh::build(&baked, options)?;
+    Ok((baked, bvh))
+}
+
 impl Scene {
     /// Combines mesh B into mesh A: union, subtract or intersect as placed
     /// in the world. The result replaces A with A's placement, so the world
@@ -53,7 +71,11 @@ impl Scene {
     /// Combining a mesh with itself is a no-op for union and intersect
     /// (nothing is recorded), and clears it for subtract. Only positions
     /// and triangles cross over: new vertices take channel defaults, and A's
-    /// UV channel is dropped ([`BooleanReport::uvs_dropped`]).
+    /// UV channel is dropped ([`BooleanReport::uvs_dropped`]). Since UVs do not
+    /// survive, a mesh with UVs is read with exactly coincident vertices
+    /// merged, so seams do not make a closed surface count as open; every
+    /// input check below applies to the merged geometry. B is unchanged, and
+    /// undo restores A's split vertices.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
@@ -79,6 +101,29 @@ impl Scene {
             BooleanOp::Subtract => crate::ops::BooleanOp::Subtract,
             BooleanOp::Intersect => crate::ops::BooleanOp::Intersect,
         };
+        // A with its seams closed, when it has them: the plan's vertex ids are
+        // then those of the same weld, run first in the edit below.
+        let (a_seams, b_seams) = (
+            has_open_uvs(&self.entry(a)?.mesh)?,
+            has_open_uvs(&self.entry(b)?.mesh)?,
+        );
+        let a_copy = if a_seams {
+            let ea = self.entry(a)?;
+            let options = ea.bvh.options();
+            let (baked, _) = baked_mesh(&ea.mesh, |l| l.map(f64::from), options)?;
+            Some(welded(baked, options)?)
+        } else {
+            None
+        };
+        let apply = |tx: &mut fast_mesh_store::Transaction, plan: &crate::ops::BooleanPlan| {
+            if a_seams {
+                tx.drop_channel(UV_CHANNEL)?;
+                crate::ops::weld(tx, 0.0)?;
+            }
+            let mut report = crate::ops::apply_boolean(tx, plan)?;
+            report.uvs_dropped |= a_seams;
+            Ok::<_, crate::ops::OpsError>(report)
+        };
         if self.is_rigid_pair(a, b)? {
             let plan = {
                 let (ea, eb) = (self.entry(a)?, self.entry(b)?);
@@ -88,9 +133,18 @@ impl Scene {
                     &eb.placement,
                     eb.mesh.origin(),
                 );
-                crate::ops::boolean_plan(&ea.mesh, &ea.bvh, &eb.mesh, &eb.bvh, &xf, ops_op)?
+                let b_copy = if b_seams {
+                    let options = eb.bvh.options();
+                    let (baked, _) = baked_mesh(&eb.mesh, |l| l.map(f64::from), options)?;
+                    Some(welded(baked, options)?)
+                } else {
+                    None
+                };
+                let (ma, ba) = a_copy.as_ref().map_or((&ea.mesh, &ea.bvh), |(m, b)| (m, b));
+                let (mb, bb) = b_copy.as_ref().map_or((&eb.mesh, &eb.bvh), |(m, b)| (m, b));
+                crate::ops::boolean_plan(ma, ba, mb, bb, &xf, ops_op)?
             };
-            let report = self.edit(a, |tx| crate::ops::apply_boolean(tx, &plan))?;
+            let report = self.edit(a, |tx| apply(tx, &plan))?;
             return Ok(BooleanReport {
                 kept_triangles: report.kept_triangles,
                 triangles_added: report.triangles_added,
@@ -113,16 +167,15 @@ impl Scene {
                 |l| affine.apply(l.map(f64::from)),
                 eb.bvh.options(),
             )?;
-            crate::ops::boolean_plan(
-                &ea.mesh,
-                &ea.bvh,
-                &baked,
-                &baked_bvh,
-                &Rigid::IDENTITY,
-                ops_op,
-            )?
+            let (baked, baked_bvh) = if b_seams {
+                welded(baked, eb.bvh.options())?
+            } else {
+                (baked, baked_bvh)
+            };
+            let (ma, ba) = a_copy.as_ref().map_or((&ea.mesh, &ea.bvh), |(m, b)| (m, b));
+            crate::ops::boolean_plan(ma, ba, &baked, &baked_bvh, &Rigid::IDENTITY, ops_op)?
         };
-        let report = self.edit(a, |tx| crate::ops::apply_boolean(tx, &plan))?;
+        let report = self.edit(a, |tx| apply(tx, &plan))?;
         Ok(BooleanReport {
             kept_triangles: report.kept_triangles,
             triangles_added: report.triangles_added,

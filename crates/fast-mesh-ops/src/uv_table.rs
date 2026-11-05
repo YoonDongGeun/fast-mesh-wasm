@@ -13,10 +13,10 @@ use crate::simplify::SimplifyOptions;
 use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
-    AppendSource, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions, FillOptions,
-    OffsetOptions, ShellOptions, append_mesh, append_mesh_with_uvs, apply_boolean, boolean_plan,
-    boundary_loops, bridge_loops, cut_by_plane, fill_holes, inflate, offset, orient,
-    remove_degenerate, remove_small_components, shell, weld,
+    AppendSource, AutoRepairOptions, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions,
+    FillOptions, OffsetOptions, ShellOptions, SkipReason, append_mesh, append_mesh_with_uvs,
+    apply_boolean, auto_repair, boolean_plan, boundary_loops, bridge_loops, cut_by_plane,
+    fill_holes, inflate, offset, orient, remove_degenerate, remove_small_components, shell, weld,
 };
 
 /// A planar UV of a position: linear, so anything interpolated stays on it.
@@ -206,6 +206,138 @@ fn orient_keeps_uvs() {
     let (r, _) = edit(&mut m, orient);
     assert!(r.flipped_triangles > 0);
     assert_kept(&m, &before);
+}
+
+#[test]
+fn remove_small_components_counts_uv_islands_as_one_surface() {
+    let mut m = two_charts(None);
+    let triangles = m.triangle_count();
+    let options = ComponentOptions {
+        min_triangles: Some(triangles),
+        ..Default::default()
+    };
+    let (r, _) = edit(&mut m, |tx| remove_small_components(tx, &options));
+    assert_eq!(r.removed_components, 0, "islands of one surface");
+    assert_eq!(m.triangle_count(), triangles);
+}
+
+// ---- auto_repair
+
+/// A flat `8 x 4` sheet of two charts split along `x = 4` with a UV seam, the
+/// right chart's UVs offset. `hole`, a cell of the left chart, is left out.
+fn two_charts(hole: Option<(u32, u32)>) -> Mesh {
+    let (mut positions, mut uvs, mut triangles) = (Vec::new(), Vec::new(), Vec::new());
+    for (chart, from) in [(0u32, 0u32), (1, 4)] {
+        let base = (positions.len() / 3) as u32;
+        let at = |x: u32, y: u32| base + y * 5 + x;
+        for y in 0..5u32 {
+            for x in 0..5u32 {
+                positions.extend([(from + x) as f32, y as f32, 0.0]);
+                uvs.extend([chart as f32 + x as f32 / 8.0, y as f32 / 8.0]);
+            }
+        }
+        for y in 0..4 {
+            for x in 0..4 {
+                if chart == 0 && hole == Some((x, y)) {
+                    continue;
+                }
+                triangles.push([at(x, y), at(x + 1, y), at(x + 1, y + 1)]);
+                triangles.push([at(x, y), at(x + 1, y + 1), at(x, y + 1)]);
+            }
+        }
+    }
+    let mut m = mesh_of(&positions, &triangles);
+    m.add_uvs(&uvs).unwrap();
+    m
+}
+
+#[test]
+fn auto_repair_keeps_seams_and_islands_and_fills_only_real_holes() {
+    let mut m = two_charts(Some((1, 1)));
+    let before = copy(&m);
+    let triangles = m.triangle_count();
+    let n = m.vertex_slots();
+    let options = AutoRepairOptions {
+        fair: false,
+        ..AutoRepairOptions::default()
+    };
+    let (r, _) = edit(&mut m, |tx| auto_repair(tx, &options));
+    assert_eq!(r.weld.merged_vertices, 0, "the seam stays");
+    assert_eq!(r.components.removed_components, 0, "both islands stay");
+    assert_eq!(r.fill.filled.len(), 1, "only the hole");
+    let seams = r
+        .fill
+        .skipped
+        .iter()
+        .filter(|(_, why)| *why == SkipReason::UvSeam);
+    assert_eq!(seams.count(), 2, "each chart's rim holds the seam");
+    assert_eq!(
+        m.triangle_count(),
+        triangles + r.fill.filled[0].triangles_added
+    );
+    assert_kept(&m, &before);
+    assert_eq!(m.uvs().unwrap().len(), 2 * m.vertex_slots());
+    assert!(m.vertex_slots() >= n);
+    // The hole's patch stays in its chart's UV range: never a stale default.
+    for v in n as u32..m.vertex_slots() as u32 {
+        if m.is_vertex_alive(v) {
+            let want = m.position(v).unwrap().map(|c| c / 8.0);
+            let got = uv_of(&m, v);
+            assert!((want[0] - got[0]).abs() < 1e-5 && (want[1] - got[1]).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn auto_repair_undoes_with_uvs_in_one_patch() {
+    let mut m = two_charts(Some((1, 1)));
+    let uvs = m.uvs().unwrap().to_vec();
+    let mut tx = m.begin_edit();
+    auto_repair(&mut tx, &AutoRepairOptions::default()).unwrap();
+    let patch = tx.commit().unwrap();
+    patch.revert(&mut m).unwrap();
+    assert_eq!(&m.uvs().unwrap()[..uvs.len()], &uvs[..]);
+    assert!(m.uvs().is_some());
+}
+
+#[test]
+fn auto_repair_still_welds_equal_uvs_and_ignores_seams_without_uvs() {
+    let mut m = seam_quads(false);
+    let (r, _) = edit(&mut m, |tx| auto_repair(tx, &AutoRepairOptions::default()));
+    assert_eq!(r.weld.merged_vertices, 2);
+    let seam = seam_quads(true);
+    let positions: Vec<f32> = seam.positions().iter().flatten().copied().collect();
+    let triangles: Vec<[u32; 3]> = (0..4u32).filter_map(|t| seam.triangle(t)).collect();
+    let mut plain = mesh_of(&positions, &triangles);
+    let (r, _) = edit(&mut plain, |tx| {
+        auto_repair(tx, &AutoRepairOptions::default())
+    });
+    assert_eq!(r.weld.merged_vertices, 2);
+}
+
+#[test]
+fn fill_skips_seam_loops_unless_they_are_listed() {
+    let mut m = two_charts(None);
+    let options = FillOptions {
+        max_edges: Some(64),
+        fair: false,
+        ..FillOptions::default()
+    };
+    let (r, _) = edit(&mut m, |tx| fill_holes(tx, &options));
+    assert!(r.filled.is_empty());
+    assert_eq!(r.skipped.len(), 2);
+    assert!(r.skipped.iter().all(|(_, why)| *why == SkipReason::UvSeam));
+
+    let mut listed = two_charts(None);
+    let id = boundary_loops(&listed).unwrap()[0].id;
+    let options = FillOptions {
+        loops: Some(vec![id]),
+        allow_unclean: true,
+        fair: false,
+        ..FillOptions::default()
+    };
+    let (r, _) = edit(&mut listed, |tx| fill_holes(tx, &options));
+    assert!(!r.skipped.iter().any(|(_, why)| *why == SkipReason::UvSeam));
 }
 
 // ---- operations that add vertices

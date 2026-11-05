@@ -12,6 +12,7 @@ use crate::fair::fair;
 use crate::fill_dp::triangulate_loop;
 use crate::refine::{RefinedPatch, refine};
 use crate::topology::{BoundaryLoop, EdgeMap, LoopId, VertexFans, loops_with};
+use crate::weld::weld_roots;
 use crate::{OpsError, Result, filled, push, reserve};
 
 /// Options for [`fill_holes`].
@@ -158,6 +159,10 @@ pub enum SkipReason {
     /// It is not clean (and unclean loops were not allowed), or it is an
     /// open chain.
     Unclean,
+    /// On a mesh with UVs, part of it is a seam: the other side of an edge lies
+    /// at the same positions, so there is no hole there to fill. Listing the
+    /// loop in [`FillOptions::loops`] fills it anyway.
+    UvSeam,
 }
 
 /// Why a selected loop could not be filled; it is left open.
@@ -305,7 +310,21 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
     // The diagonals of the patches planned so far, sorted.
     let mut chords: Vec<(VertexId, VertexId)> = Vec::new();
     let mut new_chords: Vec<(VertexId, VertexId)> = Vec::new();
-    for (l, _) in loops.iter().zip(&selected).filter(|(_, s)| **s) {
+    let seams = if options.loops.is_none() && mesh.uvs().is_some() {
+        loops_on_seams(mesh, &loops)?
+    } else {
+        filled(loops.len(), false)?
+    };
+    for ((l, _), &on_seam) in loops
+        .iter()
+        .zip(&selected)
+        .zip(&seams)
+        .filter(|((_, s), _)| **s)
+    {
+        if on_seam {
+            push(&mut report.skipped, (l.id, SkipReason::UvSeam))?;
+            continue;
+        }
         if !within_bounds(l, options) {
             push(&mut report.skipped, (l.id, SkipReason::Bounds))?;
             continue;
@@ -384,6 +403,31 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
     }
     plan.write(tx)?;
     Ok(report)
+}
+
+/// For each of `loops`, whether one of its edges has another boundary edge at
+/// exactly the same two positions, which is what a UV seam looks like.
+fn loops_on_seams(mesh: &fast_mesh_store::Mesh, loops: &[BoundaryLoop]) -> Result<Vec<bool>> {
+    let roots = weld_roots(mesh, 0.0)?;
+    let edge = |a: VertexId, b: VertexId| {
+        let (ra, rb) = (roots[a as usize], roots[b as usize]);
+        (ra.min(rb), ra.max(rb))
+    };
+    let mut keys: Vec<(VertexId, VertexId)> = Vec::new();
+    for l in loops {
+        for (i, &a) in l.vertices.iter().enumerate() {
+            push(&mut keys, edge(a, l.vertices[(i + 1) % l.vertices.len()]))?;
+        }
+    }
+    keys.sort_unstable();
+    let mut out = filled(loops.len(), false)?;
+    for (l, on_seam) in loops.iter().zip(&mut out) {
+        *on_seam = l.vertices.iter().enumerate().any(|(i, &a)| {
+            let key = edge(a, l.vertices[(i + 1) % l.vertices.len()]);
+            keys.partition_point(|k| *k <= key) - keys.partition_point(|k| *k < key) > 1
+        });
+    }
+    Ok(out)
 }
 
 /// A patch corner: a mesh vertex, or a vertex the plan adds (by its index

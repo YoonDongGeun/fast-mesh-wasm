@@ -11,9 +11,11 @@ Every operation either keeps the UVs aligned with the vertices or drops the chan
 | Operation | UVs | What happens |
 | --- | --- | --- |
 | `weld` | Preserved | A pair merges only if its positions are within the tolerance **and** its UVs agree within `1e-6` per component, so the two sides of a seam stay apart. Without UVs, the signature and results are unchanged. `analyze` still reports seam vertices as coincident: it is about positions. |
-| `removeDegenerate`, `removeSmallComponents` | Preserved | Only removes; survivors keep their UVs. |
+| `removeDegenerate` | Preserved | Only removes; survivors keep their UVs. |
+| `removeSmallComponents` | Preserved | Only removes. An edge also joins across a seam (exactly coincident corners), so the UV islands of one surface count as one component. |
 | `orient` | Preserved | Only flips winding. |
-| `fillHoles` | Interpolated | New interior vertices take the weighted mean of their creation parents, starting from the rim. A patch across a seam blends the two sides. |
+| `fillHoles` | Interpolated | New interior vertices take the weighted mean of their creation parents, starting from the rim. A loop with a seam edge is skipped with reason `"uvSeam"`, unless you list it in `loops`; then its patch blends the two sides. |
+| `repair(mesh, { kind: "auto" })` | Preserved and interpolated | One undo step of `weld`, `removeDegenerate`, `orient`, `removeSmallComponents` and `fillHoles`, each as in its row: seams stay, UV islands stay, and only holes without a seam edge are filled. It never drops UVs. |
 | `bridgeLoops` | Preserved | Adds triangles between existing vertices. |
 | `remesh` | Interpolated | Split and collapse vertices interpolate their parents; existing vertices do not move. Boundary vertices, so seams, are locked against collapses. |
 | `subdivide` | Interpolated | New vertices take their edge's UV midpoint (linear, not Loop's stencil), and old vertices keep their UV even though they move. |
@@ -22,7 +24,7 @@ Every operation either keeps the UVs aligned with the vertices or drops the chan
 | `shell` | Preserved | The inner surface copies its outer vertices' UVs. Wall triangles repeat the rim's UVs, so they sample a line of the texture. |
 | `cutByPlane` | Interpolated | Both sides keep their UVs. Crossing vertices interpolate along the cut edge, and cap vertices from the rim. The new mesh gets its own channel. |
 | `join` | Preserved or dropped | With UVs on both meshes they carry over. With UVs on one, the result has none: there is nothing to give the other side's vertices. |
-| `boolean` | Dropped | The result mixes split pieces and the other mesh's surface, which has no coordinates in this mesh's texture space. A boolean of a mesh with itself changes nothing and keeps them. |
+| `boolean` | Dropped | The result mixes split pieces and the other mesh's surface, which has no coordinates in this mesh's texture space. An open mesh with UVs is read with exactly coincident vertices merged, so seams on a closed surface are accepted, for either mesh; undo brings back the split vertices. A boolean of a mesh with itself changes nothing and keeps them. |
 | `compact` | Preserved | Remapped with the slots. Afterwards earlier drops cannot be undone, as for all history. |
 | `edit` | Your call | `addVertices` gives new vertices the UV `(0, 0)`, and `setPositions` leaves UVs alone. Set them in the same edit with `{ op: "setUvs", vertices, uvs }`. |
 
@@ -30,7 +32,11 @@ The tests are one per row: `crates/fast-mesh-ops/src/uv_table.rs` and `crates/fa
 
 ## Seams
 
-A seam is two vertices at one position with different UVs. They are separate vertices, so to everything topological the seam is a boundary: `analyze` counts it as open, `fillHoles` on it would add a patch, and `boolean`, which needs a closed mesh, rejects it. To treat such a mesh as closed, ignoring its texture, add it without `uvs` and weld it.
+A seam is two vertices at exactly one position with different UVs. They are separate vertices, so `analyze` counts the seam as an open boundary, and `orient` treats each UV island as its own open piece: it makes winding consistent within an island but cannot turn a closed surface outward across seams. To treat such a mesh as closed for those, add it without `uvs` and weld it.
+
+`Scene.boolean` needs no such step. Lower down, Rust's `boolean_plan` takes meshes as they are and rejects a seamed one as open.
+
+Seams are recognized by exact coincidence. Sides merely close to each other count as a real boundary.
 
 ## Files
 

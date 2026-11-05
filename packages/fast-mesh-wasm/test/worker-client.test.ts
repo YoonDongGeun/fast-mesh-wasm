@@ -202,6 +202,39 @@ describe("WorkerScene UVs", () => {
     indices: Uint32Array.from([0, 1, 2, 0, 2, 3]),
   };
 
+  /** A sheet of two UV islands with a seam along x = 4 and a hole in the first. */
+  const sheet = () => {
+    const positions: number[] = [];
+    const uvs: number[] = [];
+    const indices: number[] = [];
+    for (const [chart, from] of [
+      [0, 0],
+      [1, 4],
+    ]) {
+      const base = positions.length / 3;
+      for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 5; x++) {
+          positions.push(from + x, y, 0);
+          uvs.push(chart + x / 8, y / 8);
+        }
+      }
+      for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+          if (chart === 0 && x === 1 && y === 1) {
+            continue;
+          }
+          const a = base + 5 * y + x;
+          indices.push(a, a + 1, a + 6, a, a + 6, a + 5);
+        }
+      }
+    }
+    return {
+      positions: Float64Array.from(positions),
+      indices: Uint32Array.from(indices),
+      uvs: Float32Array.from(uvs),
+    };
+  };
+
   /** A sphere with a UV per vertex, large or small. */
   const textured = () => {
     const s = sphere([0, 0, 0]);
@@ -292,6 +325,29 @@ describe("WorkerScene UVs", () => {
     await settle(scene);
     expect(scene.views(a).uvs()?.subarray(0, 8)).toEqual(quad.uvs);
     await expectMirrored(scene, a);
+  });
+
+  it("auto repair keeps the mirror aligned, seams apart, and undoes", async () => {
+    const { scene } = await start();
+    const s = sheet();
+    const m = scene.addMesh(s.positions, s.indices, { uvs: s.uvs });
+    await settle(scene);
+    const repair = scene.repair(m, { kind: "auto", fair: false });
+    scene.commitFrame();
+    const report = await repair;
+    await settle(scene);
+    expect(report.weld.mergedVertices).toBe(0);
+    expect(report.removeSmallComponents.removedComponents).toBe(0);
+    expect(report.fillHoles.filled.length).toBe(1);
+    expect(report.fillHoles.skipped.map((x) => x.reason)).toEqual(["uvSeam", "uvSeam"]);
+    const uvs = scene.views(m).uvs();
+    expect(uvs?.length).toBe((2 * scene.views(m).positions().length) / 3);
+    expect(uvs?.subarray(0, s.uvs.length)).toEqual(s.uvs);
+    await expectMirrored(scene, m);
+    scene.undo();
+    await settle(scene);
+    expect(scene.views(m).uvs()?.subarray(0, s.uvs.length)).toEqual(s.uvs);
+    await expectMirrored(scene, m);
   });
 
   it("a restart replays them", async () => {

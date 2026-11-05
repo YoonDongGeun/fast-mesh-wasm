@@ -71,7 +71,7 @@
 //!   flipped_outward_components`.
 //! - fill holes: `filled_n, (loop id, triangles_added, vertices_added,
 //!   converged, weights (0 none, 1 cotangent, 2 uniform), refine_capped)
-//!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean)) ×
+//!   × filled_n, skipped_n, (loop id, reason (0 bounds, 1 unclean, 2 UV seam)) ×
 //!   skipped_n, failed_n, (loop id, reason (0 projection folds, 1 no valid
 //!   triangulation, 2 solver)) × failed_n`.
 //! - inflate: `moved, max_displacement`.
@@ -701,6 +701,7 @@ fn put_fill(out: &mut Vec<f64>, r: &FillReport) -> Result<(), StoreError> {
         let reason = match reason {
             SkipReason::Bounds => 0.0,
             SkipReason::Unclean => 1.0,
+            SkipReason::UvSeam => 2.0,
         };
         put(out, &[reason])?;
     }
