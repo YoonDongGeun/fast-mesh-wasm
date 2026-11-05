@@ -287,6 +287,7 @@ impl Evaluator<'_> {
     /// unknowns `(translation, rotation * extent)`. Corners are read in `f64`,
     /// so the residuals carry no `f32` query rounding. A correspondence on a
     /// zero-area triangle has no plane and is skipped.
+    #[allow(clippy::needless_range_loop)] // Matrix indices read better here.
     fn assemble(&self, center: [f64; 3], extent: f64) -> ([[f64; 6]; 6], [f64; 6], usize) {
         let mut h = [[0.0; 6]; 6];
         let mut g = [0.0; 6];
@@ -488,6 +489,7 @@ fn solve(h: &[[f64; 6]; 6], g: &[f64; 6]) -> ([f64; 6], f64) {
 
 /// The eigenvalues of a symmetric matrix and its eigenvectors (columns), by
 /// cyclic Jacobi rotations.
+#[allow(clippy::needless_range_loop)] // Matrix indices read better here.
 fn jacobi_eigen(mut a: [[f64; 6]; 6]) -> ([f64; 6], [[f64; 6]; 6]) {
     let mut v = [[0.0; 6]; 6];
     for (i, row) in v.iter_mut().enumerate() {

@@ -65,7 +65,9 @@ fn blob(stacks: u32, slices: u32) -> Mesh {
     let sphere = uv_sphere(stacks, slices, 1.0);
     let (positions, triangles) = parts(&sphere);
     let shaped: Vec<f32> = positions
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|d| {
             let (x, y, z) = (f64::from(d[0]), f64::from(d[1]), f64::from(d[2]));
             let r = 1.0 + 0.25 * (3.0 * x + 1.0).sin() * (2.0 * y).cos() + 0.15 * (4.0 * z).sin();
@@ -397,7 +399,9 @@ fn tilted_fine_plane_is_still_underconstrained() {
     let flat = grid(n);
     let (positions, triangles) = parts(&flat);
     let tilted: Vec<f32> = positions
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|c| plane([f64::from(c[0]), f64::from(c[1]), 0.0]).map(|v| v as f32))
         .collect();
     let fixed = mesh_of(&tilted, &triangles);
