@@ -14,6 +14,8 @@ import type {
   FieldHandle,
   MeshChange,
   MeshHandle,
+  AutoRepairReport,
+  AutoRepairRequest,
   RepairOp,
   RepairReport,
   Scene,
@@ -563,9 +565,14 @@ export class SceneStore {
   }
 
   /** Repairs a mesh (one undo step). */
-  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]> {
+  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
+  repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
+  repair(
+    mesh: MeshHandle,
+    op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
+  ): Promise<RepairReport | RepairReport[] | AutoRepairReport> {
     this.#alive();
-    return this.#settled(this.#host.repair(mesh, op));
+    return this.#settled(this.#host.repair(mesh, op as RepairOp));
   }
 
   /** Refreshes now (a synchronous host has applied the call) and once the promise settles. */

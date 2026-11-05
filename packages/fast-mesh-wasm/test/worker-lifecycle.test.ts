@@ -317,6 +317,37 @@ describe("poisoning while batches wait", () => {
 });
 
 describe("chunked repair", () => {
+  it("auto_repair_matches_the_scene_in_one_chunk", async () => {
+    const ops: string[] = [];
+    const send = engine({ onChunk: (c) => ops.push(c.kind) });
+    const s = sphere([0, 0, 0]);
+    const removed = [{ op: "removeTriangles" as const, triangles: [40, 41] }];
+    await send([addMeshReq(1, s), { kind: "edit", rev: rev(), id: 1, payload: removed }]);
+    const ref = new Scene();
+    try {
+      const m = ref.addMesh(s.positions, s.indices);
+      ref.edit(m, removed);
+      const request = { kind: "auto", weldTolerance: 1e-4 } as const;
+      const r = await send([{ kind: "repair", rev: rev(), id: 1, qid: 1, payload: request }]);
+      expect(r.replies[0]).toMatchObject({ ok: true });
+      const expected = ref.repair(m, request);
+      expect(expected.fillHoles.filled.length).toBe(1);
+      expect(r.replies[0].value).toEqual(expected);
+      expect(Object.keys(r.replies[0].value as object)).toEqual(Object.keys(expected));
+      // One transaction: not the list form's one operation per chunk.
+      expect(ops.filter((k) => k === "repairOp")).toHaveLength(0);
+      expect(r.history).toEqual({ canUndo: ref.canUndo(), canRedo: ref.canRedo() });
+      const undone = await send([{ kind: "undo", rev: rev() }]);
+      ref.undo();
+      expect(undone.history).toEqual({ canUndo: ref.canUndo(), canRedo: ref.canRedo() });
+      const bad = await send([{ kind: "repair", rev: rev(), id: 1, qid: 2, payload: { kind: "auto", maxEdges: -1 } }]);
+      expect(bad.replies[0]).toMatchObject({ ok: false, error: { code: "INVALID_ARGUMENT" } });
+      expect(bad.history).toEqual({ canUndo: ref.canUndo(), canRedo: ref.canRedo() });
+    } finally {
+      ref.free();
+    }
+  });
+
   it("repair_list_runs_in_steps", async () => {
     const ops: string[] = [];
     const send = engine({ onChunk: (c) => ops.push(c.kind) });

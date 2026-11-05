@@ -12,6 +12,7 @@ import type {
   EditOp,
   MeasureResult,
   RaycastOptions,
+  AutoRepairRequest,
   RepairOp,
   SectionPlane,
   SectionResult,
@@ -93,7 +94,7 @@ export type Request =
       kind: "edit" | "repair";
       rev: number;
       id: ClientId;
-      /** `EditOp[]` for `edit`; `RepairOp` or `RepairOp[]` for `repair`. */
+      /** `EditOp[]` for `edit`; `RepairOp`, `RepairOp[]` or `AutoRepairRequest` for `repair`. */
       payload: unknown;
       /** When set, the result (an `EditResult` or the repair report(s)) is replied under it. */
       qid?: number;
@@ -192,7 +193,7 @@ export interface QueryMap {
 /** `EditOp[]`, the `payload` of an `edit` request. */
 export type EditPayload = EditOp[];
 /** The `payload` of a `repair` request. */
-export type RepairPayload = RepairOp | RepairOp[];
+export type RepairPayload = RepairOp | RepairOp[] | AutoRepairRequest;
 
 /**
  * One mesh's change record (a `MeshChange` of the engine's scene) with

@@ -89,6 +89,8 @@ export {
   type RelaxReport,
   type RemeshReport,
   type RemoveReport,
+  type AutoRepairReport,
+  type AutoRepairRequest,
   type RepairOp,
   type RepairReport,
   type RepairReportOf,
