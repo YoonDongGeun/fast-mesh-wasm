@@ -41,6 +41,8 @@ export const view: {
   pointerType: string;
   /** True from a second finger's landing until the next gesture's first press: no tap, no tool. */
   multiTouch: boolean;
+  /** True when a tool took the canvas's latest press (a slice handle): its click is not a tap on nothing. */
+  pressTaken: boolean;
 } = {
   camera: null,
   canvas: null,
@@ -55,6 +57,7 @@ export const view: {
   sectionHandle: null,
   pointerType: "mouse",
   multiTouch: false,
+  pressTaken: false,
 };
 
 /** Sets `view.dragging` and tells the listeners when it changes. */

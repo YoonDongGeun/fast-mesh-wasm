@@ -31,6 +31,13 @@
 // - slice-finger: one finger on a slice handle drags the slice; a second finger
 //   landing on it during an orbit does not.
 // - section-finger: the same for the section plane's handle.
+// - slice-nudge: a finger or mouse press on a slice handle that moves less than
+//   the tap slop keeps the selection; the same press on nothing clears it.
+// - mixed-pinch: with one finger on the canvas and one on a toolbar button, the
+//   button's finger moves nothing, moving and lifting; the canvas's finger orbits.
+// - resting-*: with a finger resting on a panel, one canvas finger still taps and
+//   grabs the gizmo, a slice, the section handle and the hover tip; a second
+//   canvas finger still does not tap, and two still pinch.
 // - tap: a tap selects a mesh, a tap on nothing clears, a two-finger tap does neither.
 // - gizmo: one finger drags the handle; a second finger's moves and lift do not
 //   disturb the drag; it is one undo step.
@@ -181,6 +188,37 @@ async function tapElement(selector) {
   await tap(c.x, c.y);
 }
 
+/**
+ * A finger's place off the canvas, resting on a panel: the left gutter of the
+ * first sidebar on screen. The page must be scrolled to the top.
+ */
+async function panelPoint() {
+  const at = await page(`(() => {
+    for (const box of [".sidebar-left", ".sidebar-right"]) {
+      const r = document.querySelector(box).getBoundingClientRect();
+      const top = Math.max(r.top, 0);
+      const bottom = Math.min(r.bottom, innerHeight);
+      if (bottom - top >= 40) {
+        const p = [r.left + 3, (top + bottom) / 2];
+        return document.elementFromPoint(p[0], p[1]).closest("canvas, button") === null && p;
+      }
+    }
+    return false;
+  })()`);
+  if (!at) {
+    throw new Error("no panel on screen");
+  }
+  return at;
+}
+
+/** Arms a wait for the next click on the page; `clicked` resolves once it came and its effects are drawn. */
+const armClick = () => page(`void (window.__clicked = false, window.__onClick ??= () => (window.__clicked = true), addEventListener("click", window.__onClick, { capture: true, once: true }))`);
+const clicked = async () => {
+  const got = await waitFor("window.__clicked === true", 5_000);
+  await frames();
+  return got === true;
+};
+
 const AT_DEFAULT_POSE = `(() => { const p = __showcase.cameraPose().position; return Math.hypot(p[0] + 0.6, p[1] - 3.4, p[2] - 8.2) < 1e-9; })()`;
 /** Reset view, by a tap on its button or (`tapped` false) a click; on return the pose has been drawn. */
 async function resetView(tapped = true) {
@@ -296,6 +334,69 @@ try {
   const zoom = await page(`visualViewport.scale`);
   verdict("overlay-pinch", zoom === 1, `page zoom ${zoom}`);
 
+  // ---- a nudge of a slice handle is not a tap on nothing: finger, then mouse ----
+  {
+    const emptySpot = emptyPoint(await canvasRect());
+    const head = await page(`__showcase.items().find((m) => m.name.includes("headsq")).name`);
+    // The slices show while their mesh is selected, as it is after boot. The name's click toggles.
+    const selectHead = async () => {
+      if ((await hook("selected()")) !== head) {
+        await page(`document.querySelector('[data-mesh*="headsq"] .mesh-name').click()`);
+      }
+      await waitFor(`__showcase.sliceHandles()?.axial && __showcase.gizmo()?.mesh === ${q(head)}`, 20_000);
+      await frames();
+    };
+    const button = (type, x, y, extra = {}) => browser.send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1, ...extra });
+    const grabbing = () => page(`__showcase_canvas().style.cursor === "grabbing"`);
+    const fingerPress = async ([x, y], dx) => {
+      await armClick();
+      await fingers("touchStart", { 0: [x, y] });
+      const grabbed = await grabbing();
+      await sleep(30);
+      await fingers("touchMove", { 0: [x + dx, y] });
+      await lift();
+      return { click: await clicked(), grabbed };
+    };
+    const mousePress = async ([x, y], dx) => {
+      await armClick();
+      await button("mouseMoved", x, y, { button: "none" });
+      await frames();
+      await button("mousePressed", x, y, { buttons: 1 });
+      const grabbed = await grabbing();
+      await button("mouseMoved", x + dx, y, { buttons: 1 });
+      await button("mouseReleased", x + dx, y, { buttons: 0 });
+      return { click: await clicked(), grabbed };
+    };
+    // A slow frame can stretch a press into a long press, which clicks nothing: that try says nothing, so press again.
+    const pressUntilClick = async (press, at, dx) => {
+      let result;
+      for (let i = 0; i < 4 && !result?.click; i++) {
+        result = await press(at, dx);
+      }
+      return result;
+    };
+    const nudge = async (press, dx) => {
+      // The control: the same press on nothing is a tap, and clears.
+      await selectHead();
+      const onNothing = await pressUntilClick(press, emptySpot, dx);
+      const cleared = await waitFor(`__showcase.selected() === null`, 5_000);
+      await selectHead();
+      // A corner clear of the mesh, whose click would otherwise land on the mesh and keep it selected.
+      const h = (await hook("sliceHandles(1)")).coronal;
+      const onHandle = await pressUntilClick(press, [h.x, h.y], dx);
+      return { control: onNothing.click && cleared === true, clicked: onHandle.click, grabbed: onHandle.grabbed, kept: await hook("selected()") };
+    };
+    const byFinger = await nudge(fingerPress, 8);
+    // Within 2 px: three.js fiber reports no miss for a mouse click further than that.
+    const byMouse = await nudge(mousePress, 1);
+    verdict(
+      "slice-nudge",
+      [byFinger, byMouse].every((b) => b.control && b.clicked && b.grabbed && b.kept === head),
+      `finger ${q(byFinger)}; mouse ${q(byMouse)}`,
+    );
+    await selectHead(); // a failure here should not take the next checks' handles with it
+  }
+
   // ---- slice handles: a tool under one finger, not under a second ----
   const empty = emptyPoint(await canvasRect());
   // The boot head's slices: the camera frames them, so the handles are in view.
@@ -329,6 +430,23 @@ try {
       dragged !== before && moved(at0, at1) < 1e-9 && during === dragged,
       `one finger moved the slice ${before} -> ${dragged}, camera ${fmt(moved(at0, at1))}; a second finger left it at ${during}`,
     );
+  }
+
+  if (axial !== undefined) {
+    // With a finger resting on a panel, one canvas finger still drags a slice.
+    const rest = await panelPoint();
+    const h = (await hook("sliceHandles()")).axial;
+    const s0 = await hook("mpr().slices.axial");
+    const n = Math.hypot(h.dx, h.dy) || 1;
+    await fingers("touchStart", { 2: rest });
+    await sleep(30);
+    await fingers("touchStart", { 2: rest, 0: [h.x, h.y] });
+    await sleep(30);
+    await moveFingers({ 2: rest, 0: [h.x, h.y] }, { 2: rest, 0: [h.x - (h.dx / n) * 80, h.y - (h.dy / n) * 80] });
+    const s1 = await hook("mpr().slices.axial");
+    await lift();
+    await frames();
+    verdict("resting-slice", s1 !== s0, `slice ${s0} -> ${s1}`);
   }
 
   // ---- demo meshes, framed ----
@@ -420,6 +538,46 @@ try {
     `first step ${fmt(moved(p6, p7))}, then ${fmt(moved(p7, p8))}, distance ${fmt(p7.distance)} -> ${fmt(p8.distance)}`,
   );
 
+  // ---- one finger on the canvas, one on a toolbar button: only the canvas's drives the camera ----
+  await resetView();
+  {
+    const onCanvas = emptyPoint(await canvasRect());
+    const button = await page(`(() => { const r = document.querySelector("[data-action=view-reset]").getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()`);
+    const m0 = await pose();
+    await fingers("touchStart", { 0: onCanvas });
+    await sleep(30);
+    await fingers("touchStart", { 0: onCanvas, 1: button });
+    await sleep(30);
+    await frames();
+    const m1 = await pose();
+    // The button's finger moves alone.
+    const button2 = [button[0] + 30, button[1] + 20];
+    await moveFingers({ 0: onCanvas, 1: button }, { 0: onCanvas, 1: button2 });
+    const m2 = await pose();
+    // The canvas's finger orbits, smoothly, wherever the other has been.
+    const step = [onCanvas[0] + 2, onCanvas[1]];
+    await moveFingers({ 0: onCanvas, 1: button2 }, { 0: step, 1: button2 }, 1);
+    const m3 = await pose();
+    const end = [step[0] + 100, step[1] - 50];
+    await moveFingers({ 0: step, 1: button2 }, { 0: end, 1: button2 });
+    const m4 = await pose();
+    // The button's finger lifts: nothing moves, then or at the next step.
+    await fingers("touchEnd", { 1: button2 });
+    await frames();
+    const m5 = await pose();
+    const end2 = [end[0] + 2, end[1]];
+    await moveFingers({ 0: end }, { 0: end2 }, 1);
+    const m6 = await pose();
+    await lift();
+    await frames();
+    const small = 0.2 * m0.distance;
+    verdict(
+      "mixed-pinch",
+      moved(m0, m1) < 1e-9 && moved(m1, m2) < 1e-9 && moved(m2, m3) < small && moved(m3, m4) > 0.1 && targetMoved(m0, m4) < 1e-6 && Math.abs(m4.distance - m0.distance) < 1e-3 && moved(m4, m5) < small && moved(m5, m6) < small,
+      `landing ${fmt(moved(m0, m1))}; button finger's moves ${fmt(moved(m1, m2))}; canvas finger's first step ${fmt(moved(m2, m3))}, then ${fmt(moved(m3, m4))}, target ${fmt(targetMoved(m0, m4))}; button finger's lift ${fmt(moved(m4, m5))}, next step ${fmt(moved(m5, m6))}`,
+    );
+  }
+
   // ---- taps ----
   await resetView();
   const overA = await hook(`screenPoint(${q(A)})`);
@@ -442,6 +600,93 @@ try {
     `tap selected ${before2}; two-finger tap on B left ${afterTwo}; on nothing left ${afterTwoEmpty}`,
   );
   await shot("phone-selected");
+
+  // ---- a finger resting on a panel: the canvas's fingers count by themselves ----
+  {
+    await page(`window.scrollTo(0, 0)`);
+    await frames();
+    const rest = await panelPoint();
+    const restDown = async () => {
+      await fingers("touchStart", { 2: rest });
+      await sleep(30);
+    };
+    const allUp = async () => {
+      await lift();
+      await frames();
+    };
+    /** A tap by finger 0 with the resting finger down; whether it reached the page as a click. */
+    const restTap = async (x, y) => {
+      await armClick();
+      await fingers("touchStart", { 2: rest, 0: [x, y] });
+      await sleep(30);
+      await fingers("touchEnd", { 0: [x, y] });
+      return clicked();
+    };
+
+    // A tap selects; two canvas fingers do not; a tap on nothing clears.
+    await restDown();
+    const b0 = await hook(`screenPoint(${q(B)})`);
+    const tapClick = await restTap(b0.x, b0.y);
+    const selB = await waitFor(`__showcase.selected() === ${q(B)}`, 5_000);
+    await allUp();
+    await restDown();
+    const a0 = await hook(`screenPoint(${q(A)})`);
+    await fingers("touchStart", { 2: rest, 0: [a0.x, a0.y] });
+    await sleep(30);
+    await fingers("touchStart", { 2: rest, 0: [a0.x, a0.y], 1: [a0.x + 30, a0.y] });
+    await sleep(30);
+    await fingers("touchEnd", { 0: [a0.x, a0.y], 1: [a0.x + 30, a0.y] });
+    await frames(3);
+    const stillB = await hook("selected()");
+    await allUp();
+    await restDown();
+    const none = emptyPoint(await canvasRect());
+    const noneClick = await restTap(none[0], none[1]);
+    const cleared = await waitFor(`__showcase.selected() === null`, 5_000);
+    await allUp();
+
+    // The gizmo: B again, then grabbed by one canvas finger.
+    const b1 = await hook(`screenPoint(${q(B)})`);
+    await tap(b1.x, b1.y);
+    const gizmoOnB = await waitFor(`__showcase.gizmo()?.mesh === ${q(B)}`, 20_000);
+    await frames();
+    const tb0 = await hook(`translation(${q(B)})`);
+    const b2 = await hook(`screenPoint(${q(B)})`);
+    const cb0 = await pose();
+    await restDown();
+    await fingers("touchStart", { 2: rest, 0: [b2.x, b2.y] });
+    const grabbed = await waitFor("__showcase.dragging()", 5_000);
+    await moveFingers({ 2: rest, 0: [b2.x, b2.y] }, { 2: rest, 0: [b2.x + 40, b2.y - 30] });
+    const tb1 = await settled(`__showcase.translation(${q(B)})`);
+    await allUp();
+    await waitFor("__showcase.dragging() === false", 5_000);
+    const cb1 = await pose();
+    if (len(sub(tb1, tb0)) > 0) {
+      await page(`document.querySelector("[data-action=undo]").click()`);
+      await waitFor(`Math.hypot(...__showcase.translation(${q(B)}).map((v, i) => v - ${q(tb0)}[i])) < 1e-9`, 20_000);
+    }
+
+    // Two canvas fingers still pinch.
+    const d0 = await pose();
+    await restDown();
+    await fingers("touchStart", { 2: rest, 0: near[0] });
+    await sleep(30);
+    await fingers("touchStart", { 2: rest, ...near });
+    await sleep(30);
+    await moveFingers({ 2: rest, ...near }, { 2: rest, ...far });
+    const d1 = await pose();
+    await allUp();
+    verdict(
+      "resting-finger",
+      tapClick && selB === true && stillB === B && noneClick && cleared === true && gizmoOnB === true && grabbed === true && len(sub(tb1, tb0)) > 1e-3 && moved(cb0, cb1) < 1e-9 && d1.distance < d0.distance * 0.8,
+      `tap clicked ${tapClick}, selected ${selB === true}; two canvas fingers left ${stillB}; tap on nothing clicked ${noneClick}, cleared ${cleared === true}; gizmo grabbed ${grabbed === true}, moved ${fmt(len(sub(tb1, tb0)))}, camera ${fmt(moved(cb0, cb1))}; pinch ${fmt(d0.distance)} -> ${fmt(d1.distance)}`,
+    );
+
+    // Back as the next check expects: the default view, A selected and its gizmo up.
+    await resetView(false);
+    const a1 = await hook(`screenPoint(${q(A)})`);
+    await tap(a1.x, a1.y);
+  }
 
   // ---- gizmo: one finger drags, a second cannot disturb it ----
   const attached = await waitFor(`__showcase.gizmo()?.mesh === ${q(A)}`, 20_000);
@@ -587,6 +832,20 @@ try {
       secDrag === false && so0 !== null && len(sub(so1, so0)) < 1e-9 && oneDrag === true && len(sub(so2, so1)) > 1e-3,
       `second finger: dragging ${secDrag}, plane moved ${so0 === null ? "?" : fmt(len(sub(so1, so0)))}; one finger: dragging ${oneDrag === true}, plane moved ${so0 === null ? "?" : fmt(len(sub(so2, so1)))}`,
     );
+
+    // With a finger resting on a panel, one canvas finger still grabs the handle.
+    await page(`window.scrollTo(0, 0)`);
+    await frames();
+    const rest = await panelPoint();
+    const secAt3 = await hook("sectionHandle()");
+    await fingers("touchStart", { 2: rest });
+    await sleep(30);
+    await fingers("touchStart", { 2: rest, 0: [secAt3.x, secAt3.y] });
+    const restDrag = await waitFor("__showcase.dragging()", 5_000);
+    await lift();
+    await frames();
+    verdict("resting-section", restDrag === true, `dragging ${restDrag === true}`);
+
     await page(`document.querySelector("[data-action=section-disable]")?.click()`);
     await page(`document.querySelector("[data-action=inspect-section]")?.click()`);
     await frames();
@@ -616,6 +875,21 @@ try {
     tipState !== undefined && tipBox !== null && tipBox.left >= 0 && tipBox.right <= tipBox.w && tipDuring === false,
     `tip ${tipBox === null ? "absent" : `${q(tipBox.text)} at ${Math.round(tipBox.left)}..${Math.round(tipBox.right)} of ${tipBox.w}`}; shown during a later drag ${tipDuring}`,
   );
+
+  // A finger resting on a panel: a tap still shows the tip.
+  await page(`window.scrollTo(0, 0)`);
+  await frames();
+  const tipRest = await panelPoint();
+  const overA3 = await hook(`screenPoint(${q(A)})`);
+  await fingers("touchStart", { 2: tipRest });
+  await sleep(30);
+  await fingers("touchStart", { 2: tipRest, 0: [overA3.x, overA3.y] });
+  await sleep(30);
+  await fingers("touchEnd", { 0: [overA3.x, overA3.y] });
+  const tipRested = await waitFor(`document.querySelector("[data-hover-tip]") !== null`, 10_000);
+  await lift();
+  await frames();
+  verdict("resting-tip", tipRested === true, `tip shown ${tipRested === true}`);
 
   // ---- other shapes ----
   await metrics(844, 390);

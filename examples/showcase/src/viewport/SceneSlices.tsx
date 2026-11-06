@@ -480,6 +480,7 @@ function SliceDrag(props: { app: AppState; quads: SceneSliceQuads; payload: Volu
         count,
       };
       pointerId = e.pointerId;
+      view.pressTaken = true;
       try {
         canvas.setPointerCapture(e.pointerId);
       } catch {

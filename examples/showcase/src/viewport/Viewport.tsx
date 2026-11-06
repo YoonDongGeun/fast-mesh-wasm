@@ -44,7 +44,7 @@ import {
   unionMaskIds,
   worldPerPixel,
 } from "./sculpt";
-import { isExtraFinger, tapSlop } from "./touch";
+import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { setWireOverlay } from "./wire";
 import {
@@ -132,7 +132,7 @@ export function Viewport(props: {
   const inspectTool = useApp(app, (s) => s.inspectTool);
   const onMissed = useCallback(
     (e: MouseEvent) => {
-      if (sculpt !== null || maskPaint || picking !== null || view.dragging || view.multiTouch || selection === null) {
+      if (sculpt !== null || maskPaint || picking !== null || view.dragging || view.multiTouch || view.pressTaken || selection === null) {
         return;
       }
       if (inspectTool !== null) {
@@ -237,11 +237,13 @@ function MissTracker(props: { track: { current: { x: number; y: number } | null 
       view.pointerType = e.pointerType;
       view.multiTouch = isExtraFinger(e);
       if (!view.multiTouch) {
+        view.pressTaken = false;
         props.track.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
       }
     };
-    el.addEventListener("pointerdown", onDown);
-    return () => el.removeEventListener("pointerdown", onDown);
+    // Capture: before the tools' listeners, which may take this press.
+    el.addEventListener("pointerdown", onDown, true);
+    return () => el.removeEventListener("pointerdown", onDown, true);
   }, [gl, props.track]);
   return null;
 }
@@ -1491,6 +1493,7 @@ function Controls(props: {
   useEffect(() => {
     view.camera = camera;
     view.canvas = gl.domElement;
+    const unwatch = watchFingers(gl.domElement); // before the trackball: see touch.ts
     const o = new TrackballControls(camera, gl.domElement);
     o.target.set(-0.6, 0.9, 0);
     // No inertia: the camera stops where the pointer lifts (deterministic).
@@ -1500,6 +1503,7 @@ function Controls(props: {
     setOrbit(o);
     return () => {
       o.dispose();
+      unwatch();
       setOrbit((c) => (c === o ? null : c));
       if (view.camera === camera) {
         view.camera = null;
