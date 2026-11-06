@@ -7,6 +7,7 @@
 // mirrors back `views()`, and placements and section results are mirrored
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
+import { checkRegisterOptions } from "../register.js";
 import type { Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
@@ -1572,6 +1573,12 @@ export class WorkerScene implements SceneLike {
   register(moving: MeshHandle, fixed: MeshHandle, options: RegisterOptions = {}): Promise<RegisterResult> {
     const m = this.#live(moving);
     const f = this.#live(fixed);
+    try {
+      checkRegisterOptions(m === f, options);
+    } catch (e) {
+      // Before the drag ends, so a call that is going to fail changes nothing.
+      return Promise.reject(e);
+    }
     if (this.#drag?.mesh === m || this.#drag?.mesh === f) {
       this.#drag.end();
     }

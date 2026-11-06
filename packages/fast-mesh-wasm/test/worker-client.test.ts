@@ -507,6 +507,18 @@ describe("WorkerScene", () => {
     await expect(scene.register(moving, moving)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
   });
 
+  it("register_with_bad_options_leaves_a_drag_running", async () => {
+    const { scene } = await start();
+    const b = sphere([0, 0, 0], 1);
+    const m = scene.addMesh(b.positions, b.indices);
+    const f = scene.addMesh(b.positions, b.indices);
+    const d = scene.drag(m);
+    await expect(scene.register(m, f, { overlap: 2 })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(scene.register(m, m)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(() => scene.drag(m)).toThrow();
+    d.end();
+  });
+
   it("measure_matches_local_scene", async () => {
     const { scene } = await start();
     const local = new Scene();

@@ -12,31 +12,77 @@
 //! the iteration stopped moving with every degree of freedom constrained, not
 //! that the alignment is the right one: read [`IcpReport::rmse`] for that.
 //!
-//! Directions the surface does not constrain (a plane sliding in its own
-//! plane, a cylinder along its axis) are left out of each step instead of
-//! being solved from rounding noise, and are reported through
-//! [`IcpStatus::Underconstrained`].
+//! Directions with no constraint at all (a plane sliding in its own plane, a
+//! tube along its axis) are left out of each step instead of being solved from
+//! rounding noise.
+//!
+//! A settled iteration does not show that the data chose its pose: the facets
+//! of a tessellated sphere, or noise on a plane, give every step something to
+//! fit, so the normal equations look well conditioned and the iteration settles
+//! on an arbitrary spin or slide. So [`icp()`] checks. Along each of the six
+//! eigenmotions it displaces the pose and iterates again, on at most 10,000 of
+//! the points. A pose is determined along a motion when the restart comes back,
+//! or ends somewhere that fits clearly worse. When it stays displaced with a fit
+//! as good, the data do not choose, and the motion is reported in
+//! [`IcpReport::undetermined`] with the status [`IcpStatus::Underconstrained`].
+//! This is a local test: a symmetry farther away than the displacements (a cube
+//! turned by 90 degrees) is not seen.
 
 use fast_mesh_bvh::Bvh;
-use fast_mesh_query::{ClosestHit, ClosestOptions, QueryError, Rigid, closest_point_many};
-use fast_mesh_store::{Mesh, VertexId};
+use fast_mesh_query::{
+    ClosestHit, ClosestOptions, QueryError, Rigid, closest_point_many, distance_to_triangle,
+};
+use fast_mesh_store::{Mesh, VertexId, par};
 
 use crate::{OpsError, Result, filled, reserve};
 
 /// Fewest correspondences that can determine a rigid transform.
 const MIN_CORRESPONDENCES: usize = 6;
 
-/// A degree of freedom counts as constrained when its eigenvalue of the
-/// normalised normal equations is at least this fraction of the largest. The
-/// eigenvalue is a squared singular value, so this is a ratio of `1e-3` in
-/// how strongly the distances respond to that motion. It sits above the noise
-/// of `f32` positions, whose rounding jitters the face normals of a finely
-/// tessellated, tilted plane.
+/// A motion is left out of the steps when its eigenvalue of the normalised
+/// normal equations is below this fraction of the largest: it has no constraint
+/// worth solving. The eigenvalue is a squared singular value, so this is a ratio
+/// of `1e-3` in how strongly the distances respond to that motion. It sits above
+/// the noise of `f32` positions, whose rounding jitters the face normals of a
+/// finely tessellated, tilted plane. Passing it does not make a motion
+/// determined: see [`undetermined_motions`].
 pub(crate) const MIN_CONDITIONING: f64 = 1e-6;
 
 /// The largest rotation of one step, in radians. Larger steps are shortened:
 /// the linearisation means nothing that far out.
 const MAX_STEP_ANGLE: f64 = 0.5;
+
+/// The most points each restart of the determination check uses. The check's
+/// cost is bounded by this, whatever the size of the input.
+const PROBE_SAMPLES: usize = 10_000;
+
+/// How far the determination check displaces the pose, as root mean square
+/// point movement over the points' extent. Two distances, so that a repeating
+/// surface whose period makes one of them land back on the same fit is seen by
+/// the other.
+const PROBE_DISTANCES: [f64; 2] = [0.1, 0.25];
+
+/// The most steps of a restart of the determination check.
+const PROBE_STEPS: usize = 12;
+
+/// A restart stayed away if this fraction of the displacement along the motion
+/// remains at its end. Measured restarts end near 0 or near 1 (`icp_survey` in
+/// the tests, and `docs/benchmarks.md`).
+const PROBE_MOVED: f64 = 0.25;
+
+/// A different pose fits as well if its rmse is at most this multiple of the
+/// pose under test's. Without a noise model, fits this close cannot be told
+/// apart. Measured on `icp_survey`: at most 1.8 for flat motions, and at least
+/// 3.5 for restarts that stayed away from a pose the data do determine.
+const PROBE_AS_GOOD: f64 = 2.5;
+
+/// ... plus this fraction of the extent, the level below which rmse is rounding
+/// of the stored `f32` positions.
+const PROBE_RMSE_FLOOR: f64 = 1e-6;
+
+/// Distances per parallel chunk, and the fewest that go parallel.
+const DISTANCE_CHUNK: usize = 1024;
+const PAR_MIN_DISTANCES: usize = 4096;
 
 /// Options for [`icp()`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,15 +118,17 @@ impl Default for IcpOptions {
 /// Why [`icp()`] stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IcpStatus {
-    /// A step fell below the tolerance with all six degrees of freedom
-    /// constrained.
+    /// A step fell below the tolerance, and the determination check (see the
+    /// [module docs](self)) found every motion determined by the data.
     Converged,
-    /// `max_iterations` steps ran out first.
+    /// `max_iterations` steps ran out first, and no motion was found
+    /// undetermined (the check does not run with zero iterations).
     MaxIterations,
-    /// A step fell below the tolerance, but the used points leave a degree of
-    /// freedom unconstrained, so the transform along it is arbitrary: it
-    /// stayed where the initial transform put it. Distances are still
-    /// minimised along the other directions.
+    /// The data do not determine the pose: [`IcpReport::undetermined`] says
+    /// along which motions, when the check could tell. The pose along those is
+    /// arbitrary, whatever the rmse; distances are still minimised along the
+    /// rest. Iteration may also have run out of steps, wandering along such a
+    /// motion.
     Underconstrained,
     /// Fewer than six usable correspondences (see [`IcpOptions::max_distance`]).
     TooFewCorrespondences,
@@ -89,8 +137,9 @@ pub enum IcpStatus {
 }
 
 /// What [`icp()`] found. Every number is finite, except that `rmse` is
-/// infinite when no point has a correspondence.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// infinite when no point has a correspondence. `rmse` is measured in `f64` from
+/// the points to the chosen triangles.
+#[derive(Debug, Clone, PartialEq)]
 pub struct IcpReport {
     /// The transform from the points to the fixed mesh's local coordinates.
     /// When the status is [`IcpStatus::Converged`] or
@@ -109,10 +158,33 @@ pub struct IcpReport {
     /// Points used at `transform`.
     pub inliers: usize,
     /// The smallest eigenvalue over the largest of the normalised normal
-    /// equations at the last step, in `[0, 1]`: how well the worst-constrained
-    /// direction is determined. Below `1e-6` it counts as unconstrained. Zero
+    /// equations at the last step, in `[0, 1]`. Geometry only, with no reference
+    /// to noise: a low value warns of a weak motion, but a high one does not
+    /// show that the motion is determined, for which see `undetermined`. Zero
     /// when no step ran.
     pub conditioning: f64,
+    /// The motions the data do not determine: moving the pose along one and
+    /// iterating again ended at a different pose that fits as well. Empty when
+    /// the status is [`IcpStatus::Converged`]. Weakest first.
+    pub undetermined: Vec<IcpMotion>,
+    /// The points' extent: their largest distance from their centroid.
+    pub extent: f64,
+}
+
+/// A rigid motion the data do not determine, in the fixed mesh's local
+/// coordinates: a point `p` moves along `translation + rotation x (p - about)`,
+/// scaled so that the points move by 1 (root mean square).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IcpMotion {
+    /// The translation part.
+    pub translation: [f64; 3],
+    /// The rotation part, as an axis scaled by its rate.
+    pub rotation: [f64; 3],
+    /// The point the rotation turns about: the moved points' centroid.
+    pub about: [f64; 3],
+    /// The rmse of the other pose found along this motion (over at most
+    /// 10,000 of the points).
+    pub alternative_rmse: f64,
 }
 
 impl IcpReport {
@@ -211,7 +283,7 @@ struct Kept {
     /// The point's index.
     point: u32,
     /// The closest distance.
-    distance: f32,
+    distance: f64,
 }
 
 /// The inputs and working buffers of one call.
@@ -224,10 +296,36 @@ struct Evaluator<'a> {
     moved: Vec<[f64; 3]>,
     rounded: Vec<[f32; 3]>,
     hits: Vec<Option<ClosestHit>>,
+    distances: Vec<f64>,
     kept: Vec<Kept>,
 }
 
-impl Evaluator<'_> {
+impl<'a> Evaluator<'a> {
+    fn new(
+        points: &'a [[f64; 3]],
+        fixed: &'a Mesh,
+        bvh: &'a Bvh,
+        options: &IcpOptions,
+    ) -> Result<Self> {
+        let n = points.len();
+        let mut kept = Vec::new();
+        reserve(&mut kept, n)?;
+        Ok(Evaluator {
+            points,
+            fixed,
+            bvh,
+            query: ClosestOptions {
+                max_distance: options.max_distance,
+            },
+            keep: (options.overlap * n as f64).ceil().clamp(1.0, n as f64) as usize,
+            moved: filled(n, [0.0; 3])?,
+            rounded: filled(n, [0.0; 3])?,
+            hits: filled(n, None)?,
+            distances: filled(n, 0.0)?,
+            kept,
+        })
+    }
+
     /// Finds the correspondences at `transform` and trims them. Returns the
     /// rmse over the kept ones (infinite with none), or `None` when a moved
     /// point leaves `f32` range.
@@ -251,12 +349,34 @@ impl Evaluator<'_> {
             &self.query,
             &mut self.hits,
         )?;
+        // The query's `f32` distance picks the triangle. The distance itself is
+        // measured again in `f64`, since on long thin triangles the `f32` one
+        // is mostly rounding.
+        {
+            let (fixed, moved, hits) = (self.fixed, &self.moved, &self.hits);
+            par::for_each_chunk_mut(
+                &mut self.distances,
+                DISTANCE_CHUNK,
+                PAR_MIN_DISTANCES,
+                |i, slots| {
+                    let start = i * DISTANCE_CHUNK;
+                    for (k, slot) in slots.iter_mut().enumerate() {
+                        let Some(hit) = hits[start + k] else {
+                            continue;
+                        };
+                        *slot = corners_of(fixed, hit).map_or(f64::from(hit.distance), |c| {
+                            distance_to_triangle(moved[start + k], c)
+                        });
+                    }
+                },
+            );
+        }
         self.kept.clear();
         for (i, hit) in self.hits.iter().enumerate() {
-            if let Some(h) = hit {
+            if hit.is_some() {
                 self.kept.push(Kept {
                     point: i as u32,
-                    distance: h.distance,
+                    distance: self.distances[i],
                 });
             }
         }
@@ -274,11 +394,7 @@ impl Evaluator<'_> {
         if self.kept.is_empty() {
             return Ok(Some(f64::INFINITY));
         }
-        let sum: f64 = self
-            .kept
-            .iter()
-            .map(|k| f64::from(k.distance) * f64::from(k.distance))
-            .sum();
+        let sum: f64 = self.kept.iter().map(|k| k.distance * k.distance).sum();
         Ok(Some((sum / self.kept.len() as f64).sqrt()))
     }
 
@@ -326,10 +442,7 @@ impl Evaluator<'_> {
     /// A corner of the hit's triangle and its unit normal, or `None` for a
     /// triangle with no area.
     fn plane(&self, hit: ClosestHit) -> Option<([f64; 3], [f64; 3])> {
-        let [a, b, c] = self.fixed.triangle(hit.triangle)?;
-        let a = self.fixed.position(a)?.map(f64::from);
-        let b = self.fixed.position(b)?.map(f64::from);
-        let c = self.fixed.position(c)?.map(f64::from);
+        let [a, b, c] = corners_of(self.fixed, hit)?;
         Some((a, unit(cross(sub(b, a), sub(c, a)))?))
     }
 }
@@ -339,9 +452,10 @@ impl Evaluator<'_> {
 ///
 /// The report's transform maps the points to `fixed`'s local coordinates (the
 /// stored `f32` positions, without the origin). The correspondence search
-/// rounds moved points to `f32`; the plane distances the solver minimises are
-/// computed in `f64`. Results do not depend on the `parallel` feature or the
-/// thread count.
+/// rounds moved points to `f32`; the distances the solver minimises and reports
+/// are computed in `f64`. Results do not depend on the `parallel` feature or the
+/// thread count. The determination check adds a bounded cost: up to 12 restarts
+/// of up to 12 steps on at most 10,000 points.
 ///
 /// # Errors
 /// [`OpsError::InvalidInput`] for no points, non-finite points, a fixed mesh
@@ -357,27 +471,69 @@ pub fn icp(
 ) -> Result<IcpReport> {
     validate(points, fixed, options)?;
     initial.validate()?;
-    let n = points.len();
     let (center0, extent) = spread(points);
-    let keep = (options.overlap * n as f64).ceil().clamp(1.0, n as f64) as usize;
-    let mut eval = Evaluator {
-        points,
-        fixed,
-        bvh,
-        query: ClosestOptions {
-            max_distance: options.max_distance,
-        },
-        keep,
-        moved: filled(n, [0.0; 3])?,
-        rounded: filled(n, [0.0; 3])?,
-        hits: filled(n, None)?,
-        kept: Vec::new(),
-    };
-    reserve(&mut eval.kept, n)?;
+    let mut eval = Evaluator::new(points, fixed, bvh, options)?;
+    let run = iterate(
+        &mut eval,
+        initial,
+        center0,
+        extent,
+        options.max_iterations,
+        options.tolerance,
+    )?;
+    if run.iterations == 0 && run.status == IcpStatus::Diverged {
+        return Err(QueryError::InvalidInput("query point must be finite").into());
+    }
+    let mut status = run.status;
+    let mut undetermined = Vec::new();
+    // Only a pose iteration reached has anything to check; zero iterations
+    // were asked to measure, not to determine.
+    if run.iterations > 0
+        && matches!(
+            status,
+            IcpStatus::Converged | IcpStatus::MaxIterations | IcpStatus::Underconstrained
+        )
+    {
+        undetermined = undetermined_motions(points, fixed, bvh, &run, center0, extent, options)?;
+        if !undetermined.is_empty() {
+            status = IcpStatus::Underconstrained;
+        }
+    }
+    Ok(IcpReport {
+        transform: run.transform,
+        rmse: run.rmse,
+        iterations: run.iterations,
+        status,
+        samples: points.len(),
+        inliers: run.inliers,
+        conditioning: run.conditioning,
+        undetermined,
+        extent,
+    })
+}
 
-    let mut transform = *initial;
-    // The first evaluation always sets it, or returns.
-    let mut best = (*initial, f64::INFINITY, 0);
+/// Where one run of the iteration ended.
+struct Run {
+    transform: Rigid,
+    rmse: f64,
+    inliers: usize,
+    iterations: usize,
+    status: IcpStatus,
+    conditioning: f64,
+}
+
+/// Iterates from `start`. When the first evaluation already leaves `f32` range
+/// the status is [`IcpStatus::Diverged`] with no iterations.
+fn iterate(
+    eval: &mut Evaluator,
+    start: &Rigid,
+    center0: [f64; 3],
+    extent: f64,
+    max_iterations: usize,
+    tolerance: f64,
+) -> Result<Run> {
+    let mut transform = *start;
+    let mut best = (*start, f64::INFINITY, 0);
     let mut last = best;
     let mut evaluated = false;
     let mut iterations = 0;
@@ -386,9 +542,6 @@ pub fn icp(
     let mut settled = None;
     let status = loop {
         let Some(rmse) = eval.evaluate(&transform)? else {
-            if !evaluated {
-                return Err(QueryError::InvalidInput("query point must be finite").into());
-            }
             break IcpStatus::Diverged;
         };
         let inliers = eval.kept.len();
@@ -403,7 +556,7 @@ pub fn icp(
         if inliers < MIN_CORRESPONDENCES {
             break IcpStatus::TooFewCorrespondences;
         }
-        if iterations == options.max_iterations {
+        if iterations == max_iterations {
             break IcpStatus::MaxIterations;
         }
         let center = apply(&transform, center0);
@@ -425,7 +578,7 @@ pub fn icp(
         let rotation = rotation.map(|v| v * shrink);
         transform = compose_step(&transform, center, translation, rotation);
         // An upper bound on how far any point moved, over the extent.
-        if (norm(translation) + norm(rotation) * extent) / extent <= options.tolerance {
+        if (norm(translation) + norm(rotation) * extent) / extent <= tolerance {
             settled = Some(if conditioning >= MIN_CONDITIONING {
                 IcpStatus::Converged
             } else {
@@ -434,15 +587,127 @@ pub fn icp(
         }
     };
     let (transform, rmse, inliers) = if settled == Some(status) { last } else { best };
-    Ok(IcpReport {
+    Ok(Run {
         transform,
         rmse,
+        inliers,
         iterations,
         status,
-        samples: n,
-        inliers,
         conditioning,
     })
+}
+
+/// The determination check: a pose is determined if the data bring the
+/// iteration back to it. Along each of the six eigenmotions of the normal
+/// equations at `run`'s pose, restarts displaced by [`PROBE_DISTANCES`] and
+/// reports the motions along which a restart stayed away with a fit as good, so
+/// that the data do not choose between the two.
+fn undetermined_motions(
+    points: &[[f64; 3]],
+    fixed: &Mesh,
+    bvh: &Bvh,
+    run: &Run,
+    center0: [f64; 3],
+    extent: f64,
+    options: &IcpOptions,
+) -> Result<Vec<IcpMotion>> {
+    let take = points.len().min(PROBE_SAMPLES);
+    let mut subset = Vec::new();
+    reserve(&mut subset, take)?;
+    subset.extend((0..take).map(|i| points[i * points.len() / take]));
+    let mut eval = Evaluator::new(&subset, fixed, bvh, options)?;
+    let mut out = Vec::new();
+    let Some(reference) = eval.evaluate(&run.transform)? else {
+        return Ok(out);
+    };
+    if eval.kept.len() < MIN_CORRESPONDENCES {
+        return Ok(out);
+    }
+    let center = apply(&run.transform, center0);
+    let (h, _, rows) = eval.assemble(center, extent);
+    if rows < MIN_CORRESPONDENCES {
+        return Ok(out);
+    }
+    let mut here = Vec::new();
+    reserve(&mut here, eval.moved.len())?;
+    here.extend_from_slice(&eval.moved);
+    let (values, vectors) = jacobi_eigen(h);
+    // Weakest first, and independent of the order Jacobi left them in.
+    let mut order = [0, 1, 2, 3, 4, 5];
+    order.sort_by(|&a, &b| values[a].total_cmp(&values[b]).then(a.cmp(&b)));
+    for k in order {
+        let translation = [vectors[0][k], vectors[1][k], vectors[2][k]];
+        let rotation = [vectors[3][k], vectors[4][k], vectors[5][k]].map(|v| v / extent);
+        // Scaled so that the motion moves the points by one unit, rms.
+        let sum: f64 = here
+            .iter()
+            .map(|p| {
+                let d = add(translation, cross(rotation, sub(*p, center)));
+                dot(d, d)
+            })
+            .sum();
+        let rms = (sum / here.len() as f64).sqrt();
+        if rms <= 0.0 {
+            continue;
+        }
+        let translation = translation.map(|v| v / rms);
+        let rotation = rotation.map(|v| v / rms);
+        for fraction in PROBE_DISTANCES {
+            let distance = fraction * extent;
+            let start = compose_step(
+                &run.transform,
+                center,
+                translation.map(|v| v * distance),
+                rotation.map(|v| v * distance),
+            );
+            let restart = iterate(
+                &mut eval,
+                &start,
+                center0,
+                extent,
+                PROBE_STEPS,
+                options.tolerance,
+            )?;
+            if matches!(
+                restart.status,
+                IcpStatus::TooFewCorrespondences | IcpStatus::Diverged
+            ) {
+                continue;
+            }
+            // How much of the displacement along this motion is still there.
+            // Only along it: a restart may also wander along another motion,
+            // which is that motion's own result.
+            let sum: f64 = subset
+                .iter()
+                .zip(&here)
+                .map(|(p, h)| {
+                    let along = add(translation, cross(rotation, sub(*h, center)));
+                    dot(sub(apply(&restart.transform, *p), *h), along)
+                })
+                .sum();
+            let moved = (sum / here.len() as f64).abs();
+            let as_good = restart.rmse <= PROBE_AS_GOOD * reference + PROBE_RMSE_FLOOR * extent;
+            if moved >= PROBE_MOVED * distance && as_good {
+                out.push(IcpMotion {
+                    translation,
+                    rotation,
+                    about: center,
+                    alternative_rmse: restart.rmse,
+                });
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn corners_of(mesh: &Mesh, hit: ClosestHit) -> Option<[[f64; 3]; 3]> {
+    let [a, b, c] = mesh.triangle(hit.triangle)?;
+    Some([
+        mesh.position(a)?.map(f64::from),
+        mesh.position(b)?.map(f64::from),
+        mesh.position(c)?.map(f64::from),
+    ])
 }
 
 /// The centroid of `points` and their largest distance from it (1 when they

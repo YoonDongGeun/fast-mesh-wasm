@@ -2,6 +2,7 @@
 // views, per-frame change records and undo history. Wraps the raw `WasmScene`
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
+import { checkRegisterOptions } from "./register.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
@@ -890,21 +891,51 @@ export interface RegisterOptions {
    */
   maxSamples?: number;
   /**
-   * Whether a converged result becomes the moving mesh's placement, as one
-   * undo step. A result that did not converge is never applied, whatever
-   * this says. Default `true`.
+   * Whether a good result becomes the moving mesh's placement, as one undo
+   * step: it must converge, with `rmse` within `maxRmse` and at least half of
+   * the points `overlap` expects in range. Anything else is not applied,
+   * whatever this says; {@link RegisterResult.notApplied} says why. Default
+   * `true`.
    */
   apply?: boolean;
+  /**
+   * The largest `rmse` (world units) that may be applied, to keep a wrong local
+   * minimum from moving the mesh. Default: 1% of the moving points' extent,
+   * reported as {@link RegisterResult.maxRmse}. Scans noisier than that need
+   * their own limit; `Infinity` turns the guard off.
+   */
+  maxRmse?: number;
+}
+
+/** Why {@link Scene.register} did not apply its result. */
+export type RegisterNotApplied = "notRequested" | "notConverged" | "rmseAboveLimit" | "tooFewInliers";
+
+/**
+ * A rigid motion the data do not determine, in world coordinates: a point `p`
+ * moves along `translation + rotation x (p - about)`, scaled so that the moving
+ * mesh's points move by 1 (root mean square).
+ */
+export interface RegisterMotion {
+  translation: Vec3;
+  /** The rotation part, as an axis scaled by its rate. */
+  rotation: Vec3;
+  /** The point the rotation turns about: the moved points' centroid. */
+  about: Vec3;
+  /** The rmse of the other pose found along this motion, which fits as well. */
+  alternativeRmse: number;
 }
 
 /**
  * Why {@link Scene.register} stopped:
- * - `"converged"`: a step fell below the tolerance with all six rigid motions
- *   constrained.
- * - `"maxIterations"`: the steps ran out first.
- * - `"underconstrained"`: a step fell below the tolerance, but the surface
- *   does not determine some motion (a plane sliding in its plane, a tube along
- *   its axis), which stayed where the current placement put it.
+ * - `"converged"`: a step fell below the tolerance, and restarting from displaced
+ *   poses came back to the result, or only found worse fits: the data determine
+ *   every rigid motion locally.
+ * - `"maxIterations"`: the steps ran out first, with no motion found undetermined.
+ * - `"underconstrained"`: the data do not determine the pose. A restart stayed
+ *   displaced with a fit as good, as for a plane's slide, or a sphere's or a
+ *   cylinder's spin, even when facets or noise let the iteration settle with a
+ *   tiny `rmse`. {@link RegisterResult.undetermined} names the motions, and the
+ *   pose along them is arbitrary.
  * - `"tooFewCorrespondences"`: fewer than six points have a usable closest
  *   point.
  * - `"diverged"`: a step took points out of the range the query can represent.
@@ -927,26 +958,32 @@ export interface RegisterResult {
   iterations: number;
   /**
    * `status === "converged"`. ICP is local, so this says the iteration settled
-   * and the surface determined the result, not that it found the right
-   * alignment: judge that from `rmse`.
+   * and the data determine the result locally, not that it found the right
+   * alignment: a far guess can settle in a wrong minimum. `maxRmse` guards
+   * applying against that.
    */
   converged: boolean;
   /** Why iteration stopped. */
   status: RegisterStatus;
   /** Whether `placement` was set on the moving mesh. */
   applied: boolean;
+  /** Why it was not; `null` exactly when `applied`. */
+  notApplied: RegisterNotApplied | null;
+  /** The `rmse` limit that applied (world units). */
+  maxRmse: number;
   /** Points of the moving mesh sampled. */
   samples: number;
   /** Sampled points used at `placement`: the rest were trimmed or out of range. */
   inliers: number;
   /**
-   * How well the worst-constrained motion is determined, in `[0, 1]`: the
-   * smallest eigenvalue of the solver's normal equations over the largest at
-   * the last step. Below `1e-6` it counts as undetermined. A sphere's spin is
-   * determined only by its facets, so this falls as it is tessellated finer.
-   * 0 when no step ran.
+   * The smallest eigenvalue of the solver's normal equations over the largest
+   * at the last step, in `[0, 1]`; 0 when no step ran. Geometry only, with no
+   * reference to noise: a low value warns of a weak motion, but a high one does
+   * not show that it is determined. That is `undetermined`.
    */
   conditioning: number;
+  /** The motions the data do not determine; non-empty only when `"underconstrained"`. */
+  undetermined: RegisterMotion[];
 }
 
 /** Options of {@link Scene.cutByPlane}. */
@@ -1259,6 +1296,15 @@ const REGISTER_STATUSES: readonly RegisterStatus[] = [
   "underconstrained",
   "tooFewCorrespondences",
   "diverged",
+];
+
+/** The `not applied` codes of `WasmScene.register`, in order. */
+const REGISTER_NOT_APPLIED: readonly (RegisterNotApplied | null)[] = [
+  null,
+  "notRequested",
+  "notConverged",
+  "rmseAboveLimit",
+  "tooFewInliers",
 ];
 
 function optional(v: number | undefined, what: string): number {
@@ -1969,16 +2015,24 @@ export class Scene implements SceneLike {
    * Rigidly aligns the mesh `moving` to the mesh `fixed` by point-to-plane ICP,
    * with the closest points found through `fixed`'s BVH and trimmed by
    * `options.overlap`. A drag of either mesh ends first, recording its moves
-   * as one step.
+   * as one step, once the arguments have been checked.
    *
    * **The initial guess is the current placements.** ICP finds the nearest
    * fit, so put the meshes roughly in place first with `setPlacement`.
    *
-   * **Applying.** By default a converged result becomes `moving`'s placement
-   * as one undo step (`applied` in the result); `apply: false` only returns
-   * it. A result that did not converge is never applied, so a failed alignment
-   * does not move anything; `placement` still holds the best estimate, for
-   * `setPlacement` if it will do.
+   * **Applying.** By default a good result becomes `moving`'s placement as one
+   * undo step (`applied` in the result): converged, with `rmse` within `maxRmse`
+   * and enough points in range. Otherwise nothing moves, and `notApplied` says
+   * why; `placement` still holds the estimate, for `setPlacement` if it will do.
+   * `apply: false` only returns it.
+   *
+   * **Undetermined poses.** A plane's slide and a sphere's or a cylinder's spin
+   * are not fixed by the data, though facets or noise can let the iteration
+   * settle with a tiny `rmse`. These report `"underconstrained"` and list the
+   * motions in `undetermined`. So do coarse regular meshes with exact fits close
+   * by: a 16-sided sphere fits every 22.5 degrees. The check is local, so a
+   * cube's 90-degree symmetry does not count. It adds a bounded cost: up to 12
+   * restarts of up to 12 steps on at most 10,000 points.
    *
    * **Scales.** Only rotation and translation are solved. `moving`'s scale is
    * applied to its points and kept. `fixed`'s scale, uniform or not, is
@@ -1987,16 +2041,20 @@ export class Scene implements SceneLike {
    *
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
    * mesh twice, a mesh without triangles or an invalid option; `STALE_BVH` for
-   * a stale Manual `fixed`. Nothing changes on a throw.
+   * a stale Manual `fixed`. Bad options and one mesh twice change nothing,
+   * and a drag keeps running. The other errors come after a drag has ended, and
+   * change nothing else.
    */
   register(moving: MeshHandle, fixed: MeshHandle, options: RegisterOptions = {}): RegisterResult {
     const m = this.#id(moving);
     const f = this.#id(fixed);
+    checkRegisterOptions(moving === fixed, options);
     const maxIterations = optional(options.maxIterations, "maxIterations");
     const tolerance = optional(options.tolerance, "tolerance");
     const overlap = optional(options.overlap, "overlap");
     const maxDistance = optional(options.maxDistance, "maxDistance");
     const maxSamples = optional(options.maxSamples, "maxSamples");
+    const maxRmse = optional(options.maxRmse, "maxRmse");
     const apply = options.apply ?? true;
     if (this.#drag?.mesh === moving || this.#drag?.mesh === fixed) {
       this.#drag.end();
@@ -2013,9 +2071,19 @@ export class Scene implements SceneLike {
         maxDistance,
         maxSamples,
         apply,
+        maxRmse,
       ),
     );
     const status = REGISTER_STATUSES[r[17]];
+    const undetermined: RegisterMotion[] = [];
+    for (let at = 24; at < r.length; at += 10) {
+      undetermined.push({
+        translation: vec3At(r, at),
+        rotation: vec3At(r, at + 3),
+        about: vec3At(r, at + 6),
+        alternativeRmse: r[at + 9],
+      });
+    }
     return {
       placement: {
         rotation: Array.from(r.subarray(0, 9)),
@@ -2030,6 +2098,9 @@ export class Scene implements SceneLike {
       samples: r[19],
       inliers: r[20],
       conditioning: r[21],
+      notApplied: REGISTER_NOT_APPLIED[r[22]],
+      maxRmse: r[23],
+      undetermined,
     };
   }
 

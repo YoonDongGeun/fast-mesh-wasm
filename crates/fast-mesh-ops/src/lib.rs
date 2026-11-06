@@ -106,7 +106,7 @@ pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
 };
-pub use icp::{IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
+pub use icp::{IcpMotion, IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
 pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
 pub use offset::{
     OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,

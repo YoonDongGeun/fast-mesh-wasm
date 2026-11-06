@@ -29,7 +29,7 @@
 //!   as one undo step.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
-//!   moving mesh's placement as one undo step when it converges.
+//!   moving mesh's placement as one undo step when the result is good.
 //! - History: one undo history across all meshes, in steps.
 //!   [`Scene::begin_step`] / [`Scene::end_step`] group edits and placement
 //!   changes (otherwise each is its own step); [`Scene::undo`],
@@ -126,7 +126,7 @@ pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
 };
-pub use register::{RegisterOptions, RegisterReport};
+pub use register::{DEFAULT_MAX_RMSE_FRACTION, NotApplied, RegisterOptions, RegisterReport};
 pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};

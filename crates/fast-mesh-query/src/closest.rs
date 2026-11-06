@@ -129,6 +129,13 @@ pub fn closest_point(
     Ok(closest(mesh, bvh, p, opts))
 }
 
+/// The distance from `p` to a triangle, in `f64`: for measuring a result
+/// exactly when `f32` is not enough, as on long thin triangles, whose `f32`
+/// distances are dominated by rounding.
+pub fn distance_to_triangle(p: [f64; 3], corners: [[f64; 3]; 3]) -> f64 {
+    closest_on_triangle(p, corners).dist2.sqrt()
+}
+
 /// [`closest_point`] for many points: `out[i]` gets the result for `points[i]`.
 ///
 /// # Errors
