@@ -1177,7 +1177,15 @@ function SculptLayer(props: {
               inspect.sculpt.maskedDabs++;
             } else {
               const v = scene.views(mesh);
-              grabRegion = new GrabRegion(v.positions(), v.indices(), point, brush.radius, brush.falloff, brush.strength);
+              grabRegion = new GrabRegion(
+                v.positions(),
+                v.indices(),
+                point,
+                brush.radius,
+                brush.falloff,
+                brush.strength,
+                scene.origin(mesh),
+              );
             }
             syncDabs();
             clearInterval(buildup);

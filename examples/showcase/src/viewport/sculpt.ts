@@ -247,6 +247,7 @@ export class GrabRegion {
   readonly #radius: number;
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
+  readonly #origin: readonly [number, number, number];
   /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
@@ -257,7 +258,9 @@ export class GrabRegion {
     radius: number,
     falloff: "linear" | "smooth",
     strength: number,
+    origin: readonly [number, number, number] = [0, 0, 0],
   ) {
+    this.#origin = [origin[0], origin[1], origin[2]];
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
     this.#falloff = falloff;
@@ -384,15 +387,19 @@ export class GrabRegion {
     return at(low);
   }
 
-  /** Where the grabbed vertices belong at the total `drag`, three numbers per id. */
+  /**
+   * Where the grabbed vertices belong at the total `drag`, three numbers per id,
+   * as `setPositions` takes them: the region works in the mesh's stored
+   * positions, which are relative to its `origin`.
+   */
   positionsAt(drag: readonly [number, number, number]): Float64Array {
     this.#drag = [drag[0], drag[1], drag[2]];
     const out = new Float64Array(this.#rest.length);
     for (let k = 0; k < this.ids.length; k++) {
       const w = this.#weights[k];
-      out[3 * k] = this.#rest[3 * k] + w * drag[0];
-      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1];
-      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2];
+      out[3 * k] = this.#rest[3 * k] + w * drag[0] + this.#origin[0];
+      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1] + this.#origin[1];
+      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2] + this.#origin[2];
     }
     return out;
   }

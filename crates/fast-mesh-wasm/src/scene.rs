@@ -990,6 +990,13 @@ impl WasmScene {
         ])
     }
 
+    /// The mesh's origin: its stored positions are relative to it, and
+    /// `setPositions` takes positions with it added back.
+    pub fn origin(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self.scene.mesh(id)?.origin().to_vec())
+    }
+
     /// Runs repair operations on a mesh, in order, in one transaction: one
     /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
     /// and `loops` (`u32`, loop ids for fill holes) are laid out as in

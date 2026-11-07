@@ -1449,7 +1449,8 @@ try {
       stretch.unmoved > 0 &&
       stretch.trisAfter > stretch.trisBefore &&
       stretch.liveVerts > 0 &&
-      stretch.liveMoved > 0,
+      stretch.liveMoved === stretch.liveVerts &&
+      stretch.trisAfter < 3 * stretch.trisBefore,
     JSON.stringify(stretch ?? { stroked: stroked?.name, hover: hoverState }),
   );
 

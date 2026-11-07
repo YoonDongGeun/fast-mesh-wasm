@@ -332,6 +332,24 @@ describe("a live split during a grab along the surface", () => {
   });
 });
 
+describe("a grab on a mesh away from the world origin", () => {
+  it("moves_only_by_the_drag", () => {
+    const { positions, indices } = sphere(20, 40, R);
+    const offset: Vec = [5, 3, 1];
+    const away = positions.map((x, k) => x + offset[k % 3]);
+    const scene = new Scene();
+    const mesh = scene.addMesh(away, indices);
+    const v = scene.views(mesh);
+    const before = Float32Array.from(v.positions());
+    const center: Vec = [before[3], before[4], before[5]];
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1, scene.origin(mesh));
+    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0, 0]) }]);
+    expect(maxDifference(v.positions(), before)).toBeLessThan(1e-5);
+    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
+    expect(maxDifference(v.positions(), before)).toBeCloseTo(0.2, 3);
+  });
+});
+
 describe("GrabRegion", () => {
   const { positions, indices } = sphere(40, 80, R);
 

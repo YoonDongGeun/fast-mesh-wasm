@@ -2221,6 +2221,16 @@ export class Scene implements SceneLike {
   }
 
   /**
+   * The mesh's origin. `views(mesh).positions()` are relative to it, while
+   * `edit`'s `setPositions` and `addVertices` take positions with it added.
+   */
+  origin(mesh: MeshHandle): Vec3 {
+    const { index, generation } = this.#id(mesh);
+    const o = call(() => this.#peek().origin(index, generation));
+    return [o[0], o[1], o[2]];
+  }
+
+  /**
    * The column-major world matrix of the local render coordinates,
    * `placement · translate(origin)`, ready for renderers (convert to `f32`
    * yourself). The rotation columns carry the scale; normals need the

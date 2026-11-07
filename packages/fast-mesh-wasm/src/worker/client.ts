@@ -1630,6 +1630,14 @@ export class WorkerScene implements SceneLike {
    * getter returns the current mirror; a mirror is replaced when the slot
    * count changes or a buffer turns on or off, so get views right before use.
    */
+  /**
+   * The mesh's origin. `views(mesh).positions()` are relative to it, while
+   * `edit`'s `setPositions` and `addVertices` take positions with it added.
+   */
+  origin(mesh: MeshHandle): Vec3 {
+    return [...this.#live(mesh).origin] as Vec3;
+  }
+
   views(mesh: MeshHandle): SceneMeshViews {
     const st = this.#mirrored(mesh);
     const guard = this.#guard;
