@@ -824,34 +824,12 @@ export interface SculptMask {
 }
 
 /**
- * Whether `id` names a slot a triangle still uses: in range and on a live
- * (non-removed) triangle. Removed slots read `0, 0, 0`, so triples of three
- * zeros are skipped — mirroring the engine's `buildTopology`, where a
- * genuine all-zero triangle is degenerate (zero area) and losing it is
- * harmless.
- */
-function maskIdLive(indices: ArrayLike<number>, id: number, slots: number): boolean {
-  if (!Number.isInteger(id) || id < 0 || id >= slots) {
-    return false;
-  }
-  for (let t = 0; t + 2 < indices.length; t += 3) {
-    const a = indices[t];
-    const b = indices[t + 1];
-    const c = indices[t + 2];
-    if (a === 0 && b === 0 && c === 0) {
-      continue;
-    }
-    if (a === id || b === id || c === id) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Whether the mask still names live vertices of `mesh` over its current
- * buffers: every masked slot in range and used by a live triangle. The
- * per-dab gate (position moves never change this); the stroke start and
+ * buffers: every masked slot in range and used by a live triangle. Removed
+ * slots read `0, 0, 0`, so triples of three zeros are skipped — mirroring the
+ * engine's `buildTopology`, where a genuine all-zero triangle is degenerate
+ * (zero area) and losing it is harmless. One pass over the triangles, then one
+ * over the mask: painting calls this per dab. The stroke start and
  * paint/invert paths call `checkMask` to fail loudly instead.
  */
 export function maskUsable(
@@ -862,8 +840,30 @@ export function maskUsable(
   // A slots mismatch (splits grew the mesh, a compact shrank it) never
   // fails on its own: the ids may still name the same vertices (splits only
   // add), so liveness below decides. An empty mask protects nothing.
+  if (mask.vertices.length === 0) {
+    return true;
+  }
+  const used = new Uint8Array(slots);
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (a < slots) {
+      used[a] = 1;
+    }
+    if (b < slots) {
+      used[b] = 1;
+    }
+    if (c < slots) {
+      used[c] = 1;
+    }
+  }
   for (let k = 0; k < mask.vertices.length; k++) {
-    if (!maskIdLive(indices, mask.vertices[k], slots)) {
+    const id = mask.vertices[k];
+    if (!Number.isInteger(id) || id < 0 || id >= slots || used[id] === 0) {
       return false;
     }
   }

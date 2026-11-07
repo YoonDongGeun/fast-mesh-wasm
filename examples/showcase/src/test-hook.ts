@@ -31,6 +31,7 @@ export function installTestHook(
     }
     return item;
   };
+  const baseColors = new Map<unknown, THREE.Color>();
   const releases = new Map<"collision" | "group", () => void>();
   (globalThis as { __showcase?: unknown }).__showcase = {
     store,
@@ -103,6 +104,18 @@ export function installTestHook(
     heatmapRule: (options: ContactHeatmapOptions) => {
       const { maxDistance: _m, sign: _s, ...rule } = contactHeatmap(options);
       return rule;
+    },
+    /** Sets the mesh's base colour (`null` restores the one it had), like a project load does. */
+    meshColor: (name: string, hex: number | null) => {
+      const item = find(name);
+      if (hex === null) {
+        item.material.color.copy(baseColors.get(item.mesh) ?? item.material.color);
+        return;
+      }
+      if (!baseColors.has(item.mesh)) {
+        baseColors.set(item.mesh, item.material.color.clone());
+      }
+      item.material.color.setHex(hex);
     },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
@@ -217,7 +230,7 @@ export function installTestHook(
       return { ...r, analysis };
     },
     /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
-    sculpt: () => ({ ...inspect.sculpt }),
+    sculpt: () => ({ ...inspect.sculpt, maskOverlay: { ...inspect.sculpt.maskOverlay } }),
     /** The inspect tools: the armed tool, the ruler, the query, the section plane and the clip box. */
     inspectTools: () => ({
       tool: inspect.tools.tool,

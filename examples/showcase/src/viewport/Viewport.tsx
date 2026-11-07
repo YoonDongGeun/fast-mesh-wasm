@@ -47,6 +47,7 @@ import {
 } from "./sculpt";
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
+import { MaskOverlay } from "./mask-overlay";
 import { setWireOverlay } from "./wire";
 import {
   buildRepairOverlayGroup,
@@ -212,8 +213,8 @@ export function Viewport(props: {
           bound={bindings.get(item.mesh) ?? null}
         />
       ))}
-      {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
-      <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
+      {/* Sculpt and mask paint own the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
+      <Controls bound={sculpt !== null || maskPaint ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
       {sculpt !== null ? (
         <SculptLayer app={app} scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
@@ -391,8 +392,52 @@ function MeshView(props: {
         onBind={(b) => onBind(item.mesh, b)}
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
+      <SculptMaskOverlay app={app} item={item} bound={bound} />
     </>
   );
+}
+
+/**
+ * The sculpt mask's tint on its mesh (see `viewport/mask-overlay.ts`), while
+ * a sculpt tool or the mask paint is armed and it is not hidden. A child of
+ * the bound mesh, so it hides with it; the frame loop follows the mask and
+ * the mesh's triangles (a remesh, an undo), at most one build per frame.
+ */
+function SculptMaskOverlay(props: { app: AppState; item: Item; bound: MeshBinding | null }) {
+  const { app, item, bound } = props;
+  const masked = useApp(app, (s) => (s.sculptMask?.mesh === item.mesh ? s.sculptMask.vertices : null));
+  const armed = useApp(app, (s) => s.sculpt !== null || s.maskPaint);
+  const shown = useApp(app, (s) => s.sculptMaskShown);
+  const on = armed && shown && masked !== null;
+  const object = bound?.object ?? null;
+  const overlayRef = useRef<MaskOverlay | null>(null);
+  useLayoutEffect(() => {
+    if (!on || object === null) {
+      return;
+    }
+    const created = new MaskOverlay(object);
+    overlayRef.current = created;
+    return () => {
+      overlayRef.current = null;
+      created.dispose();
+      inspect.sculpt.maskOverlay.triangles = 0;
+    };
+  }, [on, object]);
+  useFrame(() => {
+    const overlay = overlayRef.current;
+    if (overlay === null || masked === null) {
+      return;
+    }
+    const start = performance.now();
+    if (overlay.sync(masked)) {
+      const stats = inspect.sculpt.maskOverlay;
+      stats.lastMs = performance.now() - start;
+      stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
+      stats.builds++;
+      stats.triangles = overlay.triangles;
+    }
+  });
+  return null;
 }
 
 /**

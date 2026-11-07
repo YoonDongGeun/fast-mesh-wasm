@@ -121,6 +121,11 @@ jobs:
       - name: Check the showcase on touch in Chrome
         timeout-minutes: 5
         run: node scripts/showcase-touch-check.mjs
+      # The sculpt mask on real pixels: its tint where painted, on light and dark meshes and over a
+      # heatmap, and a dab on its edge leaving masked positions byte-identical.
+      - name: Check the sculpt mask in Chrome
+        timeout-minutes: 5
+        run: node scripts/showcase-mask-check.mjs
       # The GitHub Pages build (pages.yml): rebuilt under /fast-mesh-wasm/ and served
       # without COOP/COEP; the service worker makes it isolated and threaded after one
       # reload, and without it the scene still runs single-threaded. Last of the
