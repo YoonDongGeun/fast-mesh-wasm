@@ -744,12 +744,12 @@ function SculptLayer(props: {
     };
 
     /**
-     * The mask's liveness over the mesh's current buffers, cached by slot
-     * count: `maskUsable` materialized, so a stroke start (and any re-cache
-     * when splits grow the mesh mid-stroke) pays one O(triangles) pass and
-     * every dab pays O(masked). Own dabs only move positions (liveness is
-     * untouched) and the live remesh only splits (old vertices stay alive),
-     * so the cache survives the stroke it gates.
+     * The mask's liveness over the mesh's current buffers: `maskUsable`
+     * materialized, so a stroke start (and any re-cache when the triangles
+     * change) pays one O(triangles) pass and every dab pays O(masked). Own
+     * dabs only move positions, so the cache survives the stroke it gates. A
+     * weld or an undo can kill a vertex and keep the slot count, so it goes
+     * with any change to the triangles (see `offTriangles`).
      */
     let maskCache: { slots: number; live: Uint8Array } | null = null;
     const maskLive = (
@@ -829,6 +829,13 @@ function SculptLayer(props: {
       }
       return fieldCache.field;
     };
+
+    const offTriangles = scene.onChanges((changes) => {
+      if (changes.some((c) => !c.removed && (c.capacityChanged || c.indices === "all" || c.indices.length > 0))) {
+        maskCache = null;
+        fieldCache = null;
+      }
+    });
 
     /** The one place a dab meets the mask: `op` with what it must hold in place. */
     const protectedDab = (mesh: MeshHandle, op: RepairOp): RepairOp => {
@@ -1333,6 +1340,7 @@ function SculptLayer(props: {
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("pointerleave", onLeave);
     return () => {
+      offTriangles();
       alive = false;
       clearTimeout(timer);
       canvas.removeEventListener("pointermove", onMove);

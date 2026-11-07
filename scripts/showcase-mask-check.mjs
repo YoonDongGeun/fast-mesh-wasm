@@ -28,6 +28,8 @@
 // - covered: a dab with only masked vertices in its ball is dropped: no undo step.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
+// - weld: with the brush armed and its caches filled, a weld that takes a masked
+//   vertex but keeps the slot count clears the mask loudly on the next dab, which lands.
 // - console: no uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -490,6 +492,42 @@ try {
     verdict(name, shift > 100, `surface ${q(base.map(Math.round))} -> tinted ${q(at.map(Math.round))}: distance ${fmt(shift)}`);
   }
   await hook(`meshColor(${q(A)}, null)`);
+
+  // ---- weld: a topology edit that keeps the slot count, with the brush armed ----
+  await frames();
+  await press(center);
+  await clickOn('[data-action="sculpt-mask-invert"]');
+  await frames();
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
+  // No remesh passes: their new slots would refresh a cache keyed on the slot count.
+  await clickOn('[data-action="sculpt-live-remesh"]');
+  await clickOn('[data-action="sculpt-remesh"]');
+  await stroke(center, 200);
+  const weldSlots = (await positions()).length;
+  const welded = await hook(`runRepair(${q(A)}, { op: "weld", tolerance: 0.03 })`);
+  await sleep(500);
+  const weldKept = (await positions()).length === weldSlots;
+  const w0 = await hook("sculpt()");
+  // On the mask's edge: the dab's ball holds masked vertices, some now dead.
+  await stroke(edge, 300);
+  const w1 = await hook("sculpt()");
+  const weldNotice = await hook("sculptMaskNotice()");
+  const weldMask = await hook("sculptMask()");
+  await clickOn('[data-action="sculpt-live-remesh"]');
+  await clickOn('[data-action="sculpt-remesh"]');
+  verdict(
+    "weld",
+    welded.mergedVertices > 0 && weldKept && weldMask === null && typeof weldNotice === "string" && w1.maskStale === w0.maskStale + 1 && w1.dabs > w0.dabs,
+    `weld ${q(welded)}, slots kept ${weldKept}; mask ${weldMask === null ? "cleared" : "kept"}, notice ${q(weldNotice)}; dabs ${w1.dabs - w0.dabs}`,
+  );
+  while (await page(`document.querySelector("[data-action=undo]")?.disabled === false`)) {
+    await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+    await sleep(60);
+  }
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await clickOn('[data-action="sculpt-mask-paint"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-mask-paint"]')?.getAttribute("aria-pressed") === "true"`);
 
   // ---- stale: a topology edit that takes a masked vertex clears the mask and its tint ----
   await frames();
