@@ -811,7 +811,8 @@ export interface FillReport {
  * Vertices a brush op (`inflate`, `smooth`, `relax`, `grab`) holds back.
  * After the op runs, each listed vertex's move is scaled by its weight: `0`
  * leaves it at exactly the bytes it had, `1` keeps the whole move. The op's
- * report describes its own move, before the scaling, and it stays one undo step.
+ * report describes its own move, before the scaling, and it stays one undo step;
+ * an op alone whose brush holds only vertices at `0` reports 0 and leaves no step.
  * List only what the brush can reach: every listed vertex costs time per call.
  *
  * @throws `INVALID_ARGUMENT` from `repair` when a vertex is not alive, a weight

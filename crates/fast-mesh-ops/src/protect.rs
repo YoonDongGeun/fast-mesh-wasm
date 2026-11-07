@@ -4,7 +4,7 @@
 //! what it did to the listed vertices. It knows nothing of the operation's
 //! insides, so brushes keep one code path whether or not anything is protected.
 
-use fast_mesh_store::{Transaction, VertexId};
+use fast_mesh_store::{Mesh, Transaction, VertexId};
 
 use crate::{OpsError, Result, reserve};
 
@@ -28,26 +28,11 @@ pub fn with_protection<R>(
     weights: &[f32],
     op: impl FnOnce(&mut Transaction) -> Result<R>,
 ) -> Result<R> {
-    if vertices.len() != weights.len() {
-        return Err(OpsError::InvalidInput(
-            "protection needs one weight per vertex",
-        ));
-    }
-    if weights.iter().any(|w| !(0.0..=1.0).contains(w)) {
-        return Err(OpsError::InvalidInput(
-            "protection weights must be between 0 and 1",
-        ));
-    }
-    let mesh = tx.mesh();
-    let positions = mesh.positions();
+    check_protection(tx.mesh(), vertices, weights)?;
+    let positions = tx.mesh().positions();
     let mut before: Vec<[f32; 3]> = Vec::new();
     reserve(&mut before, vertices.len())?;
-    for &v in vertices {
-        if !mesh.is_vertex_alive(v) {
-            return Err(OpsError::InvalidInput("a protected vertex is not alive"));
-        }
-        before.push(positions[v as usize]);
-    }
+    before.extend(vertices.iter().map(|&v| positions[v as usize]));
     // Reserved before `op` writes anything: running out of memory here leaves
     // the transaction untouched, like every operation.
     let mut ids: Vec<VertexId> = Vec::new();
@@ -79,6 +64,28 @@ pub fn with_protection<R>(
     Ok(report)
 }
 
+/// Checks a protection list the way [`with_protection`] does.
+///
+/// # Errors
+/// [`OpsError::InvalidInput`] when the lists differ in length, a weight is not
+/// in `[0, 1]`, or a listed vertex is not alive.
+pub fn check_protection(mesh: &Mesh, vertices: &[VertexId], weights: &[f32]) -> Result<()> {
+    if vertices.len() != weights.len() {
+        return Err(OpsError::InvalidInput(
+            "protection needs one weight per vertex",
+        ));
+    }
+    if weights.iter().any(|w| !(0.0..=1.0).contains(w)) {
+        return Err(OpsError::InvalidInput(
+            "protection weights must be between 0 and 1",
+        ));
+    }
+    if vertices.iter().any(|&v| !mesh.is_vertex_alive(v)) {
+        return Err(OpsError::InvalidInput("a protected vertex is not alive"));
+    }
+    Ok(())
+}
+
 fn same_bits(a: &[f32; 3], b: &[f32; 3]) -> bool {
     a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
 }
@@ -88,7 +95,6 @@ mod tests {
     use super::*;
     use crate::deform::{self, Brush, Falloff, GrabOptions, InflateOptions, SmoothOptions};
     use crate::test_util::{mesh_of, sweep};
-    use fast_mesh_store::Mesh;
 
     /// A flat grid of `n x n` quads in the xy plane, over [0, 1]².
     fn grid(n: u32) -> Mesh {

@@ -240,7 +240,7 @@ export function installTestHook(
       return { ...r, analysis };
     },
     /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
-    sculpt: () => ({ ...inspect.sculpt, maskOverlay: { ...inspect.sculpt.maskOverlay } }),
+    sculpt: () => ({ ...inspect.sculpt, maskOverlay: { ...inspect.sculpt.maskOverlay }, dabCost: { maskMs: [...inspect.sculpt.dabCost.maskMs], landMs: [...inspect.sculpt.dabCost.landMs] } }),
     /** The inspect tools: the armed tool, the ruler, the query, the section plane and the clip box. */
     inspectTools: () => ({
       tool: inspect.tools.tool,

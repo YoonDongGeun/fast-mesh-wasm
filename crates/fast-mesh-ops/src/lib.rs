@@ -116,7 +116,7 @@ pub use offset::{
     ShellReport, offset, shell,
 };
 pub use orient::{OrientReport, orient};
-pub use protect::with_protection;
+pub use protect::{check_protection, with_protection};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
 use fast_mesh_store::StoreError;

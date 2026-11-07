@@ -740,6 +740,23 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
   });
 
+  it("protect_leaves_no_step_when_it_holds_everything_under_the_brush", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const vertices = Array.from({ length: before.length / 3 }, (_, i) => i);
+    const r = s.repair(m, { op: "inflate", center, radius: 2, falloff: "linear", strength: 0.2, protect: { vertices } });
+    expect(r.moved).toBe(0);
+    expect(s.canUndo()).toBe(false);
+    // Nor inside a stroke's step, which then records nothing.
+    s.beginStep();
+    s.repair(m, { op: "inflate", center, radius: 2, falloff: "linear", strength: 0.2, protect: { vertices } });
+    s.endStep();
+    expect(s.canUndo()).toBe(false);
+  });
+
   it("protect_scales_a_move_by_its_weight", () => {
     const run = (weight: number | null) => {
       const s = scene();

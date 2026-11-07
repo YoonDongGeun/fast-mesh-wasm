@@ -16,6 +16,9 @@ export const MASK_SOFT_BAND = 0.25;
  */
 const PROTECT_REACH = 1.25;
 
+/** Past this many cells around a dab (a brush far wider than the field's), walking the field is cheaper. */
+const MAX_CELLS = 512;
+
 /** The mask's protection over one mesh's buffers (see {@link maskEdgeField}). */
 export interface MaskField {
   /** 1 on a masked slot. */
@@ -26,6 +29,68 @@ export interface MaskField {
   weights: Float32Array;
   /** The same weights per slot, 1 outside the field: for a move written directly (a grab). */
   scale: Float32Array;
+  /** Per id, where it rested at the build (`xyz`): masked ones must still be there. */
+  rest: Float32Array;
+  /** The ids by cell, so a dab finds those near it without walking them all. `null` without a band. */
+  grid: FieldGrid | null;
+}
+
+/** A uniform grid over the field's rest positions, in `[starts[c], starts[c + 1])` of `items`. */
+interface FieldGrid {
+  size: number;
+  cells: Map<number, number>;
+  starts: Uint32Array;
+  /** Indices into the field's `ids`. */
+  items: Uint32Array;
+}
+
+const cellKey = (x: number, y: number, z: number): number => (x * 73856093) ^ (y * 19349663) ^ (z * 83492791);
+
+function fieldGrid(rest: Float32Array, size: number): FieldGrid {
+  const n = rest.length / 3;
+  const cells = new Map<number, number>();
+  const slotOf = new Uint32Array(n);
+  const counts: number[] = [];
+  for (let k = 0; k < n; k++) {
+    const key = cellKey(Math.floor(rest[3 * k] / size), Math.floor(rest[3 * k + 1] / size), Math.floor(rest[3 * k + 2] / size));
+    let c = cells.get(key);
+    if (c === undefined) {
+      c = counts.length;
+      cells.set(key, c);
+      counts.push(0);
+    }
+    counts[c]++;
+    slotOf[k] = c;
+  }
+  const starts = new Uint32Array(counts.length + 1);
+  for (let c = 0; c < counts.length; c++) {
+    starts[c + 1] = starts[c] + counts[c];
+  }
+  const fill = starts.slice(0, counts.length);
+  const items = new Uint32Array(n);
+  for (let k = 0; k < n; k++) {
+    items[fill[slotOf[k]]++] = k;
+  }
+  return { size, cells, starts, items };
+}
+
+/**
+ * Whether every masked vertex is still where the field took it. A dab finds them
+ * by that position, so a move by anything else (a repair, an undo) would hide them
+ * from it. Own dabs never move them. O(masked): a stroke asks once, at its press.
+ */
+export function maskFieldCurrent(field: MaskField, positions: ArrayLike<number>): boolean {
+  const { ids, flags, rest } = field;
+  for (let k = 0; k < ids.length; k++) {
+    const v = ids[k];
+    if (
+      flags[v] === 1 &&
+      (positions[3 * v] !== rest[3 * k] || positions[3 * v + 1] !== rest[3 * k + 1] || positions[3 * v + 2] !== rest[3 * k + 2])
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -141,39 +206,15 @@ export function maskEdgeField(
       ids[at++] = v;
     }
   }
-  return { flags, ids, weights, scale };
-}
-
-/**
- * Whether the mask leaves a dab nothing to move: its ball holds a live vertex
- * and every live vertex in it is masked. Such a dab is dropped before the
- * scene, so a fully masked press leaves no undo step behind. Stops at the
- * first free vertex, so a dab with any free vertex pays little.
- */
-export function maskCoversDab(
-  flags: Uint8Array,
-  live: Uint8Array,
-  positions: ArrayLike<number>,
-  center: readonly [number, number, number],
-  radius: number,
-): boolean {
-  const r2 = radius * radius;
-  let any = false;
-  for (let v = 0; v < live.length; v++) {
-    if (live[v] === 0) {
-      continue;
-    }
-    const dx = positions[3 * v] - center[0];
-    const dy = positions[3 * v + 1] - center[1];
-    const dz = positions[3 * v + 2] - center[2];
-    if (dx * dx + dy * dy + dz * dz <= r2) {
-      if (flags[v] === 0) {
-        return false;
-      }
-      any = true;
-    }
+  const rest = new Float32Array(3 * count);
+  for (let k = 0; k < count; k++) {
+    rest[3 * k] = positions[3 * ids[k]];
+    rest[3 * k + 1] = positions[3 * ids[k] + 1];
+    rest[3 * k + 2] = positions[3 * ids[k] + 2];
   }
-  return any;
+  // A cell as wide as a dab's reach: a dab looks at the 27 cells around it.
+  const grid = band > 0 ? fieldGrid(rest, (band / MASK_SOFT_BAND) * PROTECT_REACH) : null;
+  return { flags, ids, weights, scale, rest, grid };
 }
 
 /**
@@ -225,7 +266,10 @@ export function maskMeetsRemesh(
 
 /**
  * `op` with the field's vertices within its reach protected, or `op` itself
- * when it is not a brush or none are near. O(field) per dab.
+ * when it is not a brush or none are near. The cost follows the field's
+ * vertices around the brush, not the whole field: masked vertices rest where the
+ * grid has them (`maskFieldCurrent`), and a band vertex a stroke moved out of
+ * its cell only loses some softness.
  */
 export function protectDab(op: RepairOp, field: MaskField, positions: ArrayLike<number>): RepairOp {
   if (op.op !== "inflate" && op.op !== "relax" && op.op !== "smooth" && op.op !== "grab") {
@@ -234,15 +278,37 @@ export function protectDab(op: RepairOp, field: MaskField, positions: ArrayLike<
   const [cx, cy, cz] = op.center;
   const reach = op.radius * PROTECT_REACH;
   const r2 = reach * reach;
-  const { ids, weights } = field;
+  const { ids, weights, grid } = field;
   const near: number[] = [];
-  for (let k = 0; k < ids.length; k++) {
+  const consider = (k: number) => {
     const v = ids[k];
     const dx = positions[3 * v] - cx;
     const dy = positions[3 * v + 1] - cy;
     const dz = positions[3 * v + 2] - cz;
     if (dx * dx + dy * dy + dz * dz <= r2) {
       near.push(k);
+    }
+  };
+  const span = grid === null ? Number.POSITIVE_INFINITY : (2 * reach) / grid.size + 2;
+  if (grid === null || span * span * span > MAX_CELLS) {
+    for (let k = 0; k < ids.length; k++) {
+      consider(k);
+    }
+  } else {
+    // Cells can share a key: each is walked once.
+    const seen = new Set<number>();
+    for (let x = Math.floor((cx - reach) / grid.size); x <= Math.floor((cx + reach) / grid.size); x++) {
+      for (let y = Math.floor((cy - reach) / grid.size); y <= Math.floor((cy + reach) / grid.size); y++) {
+        for (let z = Math.floor((cz - reach) / grid.size); z <= Math.floor((cz + reach) / grid.size); z++) {
+          const c = grid.cells.get(cellKey(x, y, z));
+          if (c !== undefined && !seen.has(c)) {
+            seen.add(c);
+            for (let i = grid.starts[c]; i < grid.starts[c + 1]; i++) {
+              consider(grid.items[i]);
+            }
+          }
+        }
+      }
     }
   }
   if (near.length === 0) {

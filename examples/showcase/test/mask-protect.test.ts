@@ -2,7 +2,7 @@
 // Bytes on a real engine: `scripts/showcase-mask-check.mjs`.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { maskCoversDab, maskEdgeField, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
+import { maskEdgeField, maskFieldCurrent, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
 import { maskUsable } from "../src/viewport/sculpt";
 
 /** A strip along x: vertices at (i, 0, 0) and (i, 1, 0), `2 * (n + 1)` slots. */
@@ -67,26 +67,7 @@ describe("maskEdgeField", () => {
 
 describe("a dab touching the mask's edge", () => {
   const { positions, indices, slots } = strip(8);
-  const live = new Uint8Array(slots).fill(1);
   const field = maskEdgeField(leftOf(3), positions, indices, slots, 1.5);
-
-  it("is_not_dropped_while_its_ball_holds_free_vertices", () => {
-    expect(maskCoversDab(field.flags, live, positions, [3.5, 0, 0], 2)).toBe(false);
-  });
-
-  it("is_dropped_when_every_vertex_in_its_ball_is_masked", () => {
-    expect(maskCoversDab(field.flags, live, positions, [1, 0, 0], 0.5)).toBe(true);
-  });
-
-  it("is_not_reported_covered_with_nothing_in_its_ball", () => {
-    expect(maskCoversDab(field.flags, live, positions, [1, 50, 0], 0.5)).toBe(false);
-  });
-
-  it("ignores_dead_slots_in_its_ball", () => {
-    const onlyMaskedLive = new Uint8Array(slots);
-    onlyMaskedLive[0] = 1;
-    expect(maskCoversDab(field.flags, onlyMaskedLive, positions, [1, 0, 0], 8)).toBe(true);
-  });
 
   it("protects_the_masked_vertices_it_reaches_at_weight_zero", () => {
     const op = protectDab(inflateAt([3.5, 0, 0], 2), field, positions) as RepairOp & {
@@ -118,6 +99,56 @@ describe("a dab touching the mask's edge", () => {
   it("leaves_a_non_brush_op_alone", () => {
     const op: RepairOp = { op: "remesh", center: [1, 0, 0], radius: 5 };
     expect(protectDab(op, field, positions)).toBe(op);
+  });
+});
+
+describe("a dab's field lookup", () => {
+  /** A bumpy grid large enough that the walk and the grid differ if they can. */
+  function wavy(n: number) {
+    const positions: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        positions.push(x * 0.1, y * 0.1, 0.2 * Math.sin(x * 0.7) * Math.cos(y * 0.4));
+      }
+    }
+    const indices: number[] = [];
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        indices.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    return { positions, indices, slots: (n + 1) * (n + 1) };
+  }
+
+  it("finds_what_a_walk_over_the_whole_field_finds", () => {
+    const { positions, indices, slots } = wavy(60);
+    const masked = Array.from({ length: slots }, (_, i) => i).filter((v) => positions[3 * v] < 3 && positions[3 * v + 1] > 1.5);
+    const radius = 0.6;
+    const field = maskEdgeField(masked, positions, indices, slots, radius * 0.25);
+    expect(field.grid).not.toBeNull();
+    for (const center of [[3, 1.5, 0], [0.2, 5.9, 0.1], [2.7, 3.3, -0.1], [5.5, 0.5, 0], [-1, -1, 0]] as [number, number, number][]) {
+      const op = protectDab(inflateAt(center, radius), field, positions) as RepairOp & { protect?: { vertices: Uint32Array; weights: Float32Array } };
+      const walk = protectDab(inflateAt(center, radius), { ...field, grid: null }, positions) as typeof op;
+      const pairs = (o: typeof op) =>
+        Array.from(o.protect?.vertices ?? [], (v, k) => [v, o.protect?.weights[k] ?? -1]).sort((a, b) => a[0] - b[0]);
+      expect(pairs(op)).toEqual(pairs(walk));
+    }
+  });
+
+  it("knows_when_something_else_moved_a_masked_vertex", () => {
+    const grid = wavy(10);
+    const { indices, slots } = grid;
+    const positions = Float32Array.from(grid.positions);
+    const field = maskEdgeField([0, 1, 2], positions, indices, slots, 0.1);
+    expect(maskFieldCurrent(field, positions)).toBe(true);
+    // A free vertex moving is a stroke at work; a masked one is someone else.
+    const free = positions.slice();
+    free[3 * 50] += 1;
+    expect(maskFieldCurrent(field, free)).toBe(true);
+    const moved = positions.slice();
+    moved[3 * 1 + 2] += 1;
+    expect(maskFieldCurrent(field, moved)).toBe(false);
   });
 });
 

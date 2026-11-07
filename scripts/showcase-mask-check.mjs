@@ -27,7 +27,7 @@
 //   positions byte-identical through the whole stroke; undo restores them.
 // - live: a stroke's live split pass runs over the mask and leaves its vertices
 //   alone; the stroke-end remesh stands down.
-// - covered: a dab with only masked vertices in its ball is dropped: no undo step.
+// - covered: a dab with only masked vertices in its ball moves nothing: no undo step.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
 // - weld: with the brush armed and its caches filled, a weld that takes a masked
@@ -496,8 +496,8 @@ try {
   const p3 = await positions();
   verdict(
     "covered",
-    s3.maskedDabs > s2.maskedDabs && s3.dabs === s2.dabs && sameOver(p3, p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
-    `${s3.maskedDabs - s2.maskedDabs} dropped, ${s3.dabs - s2.dabs} applied; positions unchanged ${sameOver(p3, p0)}`,
+    s3.maskedDabs > s2.maskedDabs && sameOver(p3, p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
+    `${s3.maskedDabs - s2.maskedDabs} of ${s3.dabs - s2.dabs} moved nothing; positions unchanged ${sameOver(p3, p0)}`,
   );
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await clickOn('[data-action="sculpt-mask-paint"]');
@@ -675,11 +675,22 @@ try {
       `${count} triangles; overlay build worst ${fmt(paint.maxMs)} ms while painting, ${fmt(inverted.lastMs)} ms for the inverted mask`,
     );
     // What the protection adds to a dab: the same hold under the inverted mask and without one.
+    // (The first dab on a mesh and the first under a new mask build indexes: medians leave them out.)
     /** Holds a brush at the press point; dabs applied and the window's frames. */
     const holdWindow = async () => {
-      const before = (await hook("sculpt()")).dabs;
+      const before = await hook("sculpt()");
       const r = await paintWindow(0, 40);
-      return { ...r, dabs: (await hook("sculpt()")).dabs - before };
+      const after = await hook("sculpt()");
+      const median = (all, from) => {
+        const xs = all.slice(from).sort((a, b) => a - b);
+        return xs.length === 0 ? 0 : xs[xs.length >> 1];
+      };
+      return {
+        ...r,
+        dabs: after.dabs - before.dabs,
+        maskMs: median(after.dabCost.maskMs, before.dabCost.maskMs.length),
+        landMs: median(after.dabCost.landMs, before.dabCost.landMs.length),
+      };
     };
     await clickOn('[data-action="sculpt-mask-paint"]');
     await clickOn('[data-action="sculpt-tool-inflate"]');
@@ -689,8 +700,8 @@ try {
     await clickOn('[data-action="sculpt-mask-clear"]');
     await frames();
     const free = await holdWindow();
-    console.log(`  1M dabs on the mask's edge: ${guarded.dabs} applied, ${line(guarded)}`);
-    console.log(`  1M dabs without a mask:     ${free.dabs} applied, ${line(free)}`);
+    console.log(`  1M dabs on the mask's edge: ${guarded.dabs} applied, median mask ${fmt(guarded.maskMs)} ms, landing ${fmt(guarded.landMs)} ms; ${line(guarded)}`);
+    console.log(`  1M dabs without a mask:     ${free.dabs} applied, median mask ${fmt(free.maskMs)} ms, landing ${fmt(free.landMs)} ms; ${line(free)}`);
     await clickOn('[data-action="sculpt-tool-inflate"]');
     rmSync(dir, { recursive: true, force: true });
   }
