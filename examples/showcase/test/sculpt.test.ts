@@ -1,5 +1,5 @@
 // The sculpt stroke: dab spacing and ops, one press-and-hold stroke
-// through a fake applier (lazy step, busy and spacing guards, one undo
+// through a fake applier (lazy step, queueing and spacing guards, one undo
 // step per stroke where the scene nests steps), and the brush picker's
 // tool-to-brush mapping (what the toolbox arms).
 //
@@ -7,13 +7,12 @@
 // manual, through the canvas (the e2e `sculpt-surface` path arms
 // `[data-action="sculpt-tool-inflate"]` and checks the surface returns):
 // the hover ball follows the surface point, press-and-hold paints dabs
-// (holding still builds up, fast moves creep without dotted trails),
+// (holding still builds up, fast moves leave no dotted trails),
 // grab drags the surface along with the pointer, and Esc disarms.
 import type { MeshHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_STRENGTHS,
-  GrabAnchor,
   LIVE_REMESH_MIN_DABS,
   LIVE_REMESH_MIN_MS,
   RELAX_PASSES,
@@ -172,7 +171,7 @@ describe("SculptStroke", () => {
       },
     );
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
-    expect(stroke.dab([1, 0, 0])).toBe("busy");
+    expect(stroke.dab([0, 0, 0], true)).toBe("busy");
     stroke.end();
     await stroke.done;
     expect(stroke.dabs).toBe(1);
@@ -231,51 +230,191 @@ describe("SculptStroke", () => {
     expect(calls).toEqual(["begin", "cancel"]);
   });
 
-  it("serializes_dabs_behind_a_slow_apply", async () => {
+  it("queues_dabs_behind_a_slow_apply_and_sends_them_together", async () => {
     const gate = deferred();
-    const seen: string[] = [];
+    const seen: number[] = [];
     const stroke = new SculptStroke(
       brush,
       {},
-      () => {
-        seen.push("apply");
+      (ops) => {
+        seen.push(ops.length);
         return gate.promise;
       },
     );
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
-    expect(stroke.dab([5, 0, 0])).toBe("busy");
-    expect(seen).toEqual(["apply"]);
+    // Nothing is dropped: one spacing is 0.15, so these are three more dabs.
+    expect(stroke.dab([0.15, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.45, 0, 0])).toBe("stamped");
+    expect(stroke.dabs).toBe(4);
+    expect(seen).toEqual([1]);
     gate.resolve();
     await tick();
-    expect(stroke.dab([5, 0, 0])).toBe("stamped");
+    expect(seen).toEqual([1, 3]);
     stroke.end();
     await stroke.done;
-    expect(seen).toEqual(["apply", "apply"]);
   });
 
-  it("creeps_toward_a_distant_pointer", async () => {
+  it("flush_sends_what_is_due_with_a_dab_in_flight", async () => {
+    const gate = deferred();
+    const seen: number[] = [];
+    const stroke = new SculptStroke(
+      brush,
+      {},
+      (ops) => {
+        seen.push(ops.length);
+        return gate.promise;
+      },
+    );
+    stroke.dab([0, 0, 0]);
+    stroke.dab([0.3, 0, 0]);
+    expect(seen).toEqual([1]);
+    stroke.flush();
+    expect(seen).toEqual([1, 2]);
+    gate.resolve();
+    stroke.end();
+    await stroke.done;
+  });
+
+  it("a_pass_runs_in_order_and_holds_the_end", async () => {
+    const calls: string[] = [];
+    const gate = deferred();
+    const stroke = new SculptStroke(
+      brush,
+      { beginStep: () => void calls.push("begin"), endStep: () => void calls.push("end") },
+      (ops) => {
+        calls.push(`apply ${ops.length}`);
+        return Promise.resolve();
+      },
+    );
+    stroke.dab([0, 0, 0]);
+    stroke.dab([0.3, 0, 0]);
+    const passed = stroke.pass(() => {
+      calls.push("pass");
+      return gate.promise;
+    });
+    stroke.dab([0.6, 0, 0]);
+    stroke.end();
+    expect(calls).toEqual(["begin", "apply 1", "apply 2", "pass", "apply 2"]);
+    gate.resolve();
+    await passed;
+    await stroke.done;
+    expect(calls.at(-1)).toBe("end");
+  });
+
+  it("the_end_waits_for_every_batch", async () => {
+    const calls: string[] = [];
+    const gate = deferred();
+    const stroke = new SculptStroke(
+      brush,
+      { beginStep: () => void calls.push("begin"), endStep: () => void calls.push("end") },
+      (ops) => {
+        calls.push(`apply ${ops.length}`);
+        return gate.promise;
+      },
+    );
+    stroke.dab([0, 0, 0]);
+    stroke.dab([0.3, 0, 0]);
+    stroke.end();
+    expect(calls).toEqual(["begin", "apply 1", "apply 2"]);
+    gate.resolve();
+    await stroke.done;
+    expect(calls).toEqual(["begin", "apply 1", "apply 2", "end"]);
+  });
+
+  it("lays_a_dab_every_spacing_along_a_fast_move", async () => {
     const centers: (readonly [number, number, number])[] = [];
     const stroke = new SculptStroke(
       brush,
       {},
-      (op) => {
-        centers.push((op as { center: readonly [number, number, number] }).center);
+      (ops) => {
+        centers.push(...ops.map((op) => (op as { center: readonly [number, number, number] }).center));
         return Promise.resolve();
       },
     );
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
     await tick();
-    // One spacing step toward the pointer, not the whole jump.
-    expect(stroke.dab([0.3, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.5, 0, 0])).toBe("stamped");
     await tick();
-    expect(centers.length).toBe(2);
-    expect(centers[1][0]).toBeCloseTo(0.15, 10);
-    // The next dab lands on the pointer itself.
-    expect(stroke.dab([0.3, 0, 0])).toBe("stamped");
+    expect(centers.map((c) => Number(c[0].toFixed(6)))).toEqual([0, 0.15, 0.3, 0.45]);
+    // The remainder carries over: the next sample goes on from the last dab.
+    expect(stroke.dab([0.55, 0, 0])).toBe("skipped");
+    expect(stroke.dab([0.65, 0, 0])).toBe("stamped");
     await tick();
-    expect(centers[2][0]).toBeCloseTo(0.3, 10);
+    expect(centers.at(-1)?.[0]).toBeCloseTo(0.6, 10);
     stroke.end();
     await stroke.done;
+  });
+
+  it("starts_over_after_a_lift", async () => {
+    const centers: (readonly [number, number, number])[] = [];
+    const stroke = new SculptStroke(
+      brush,
+      {},
+      (ops) => {
+        centers.push(...ops.map((op) => (op as { center: readonly [number, number, number] }).center));
+        return Promise.resolve();
+      },
+    );
+    stroke.dab([0, 0, 0]);
+    await tick();
+    stroke.lift();
+    expect(stroke.dab([1, 0, 0])).toBe("stamped");
+    stroke.end();
+    await stroke.done;
+    expect(centers).toEqual([
+      [0, 0, 0],
+      [1, 0, 0],
+    ]);
+  });
+
+  it("leaves_out_blocked_dabs_and_goes_on_past_them", async () => {
+    const centers: number[] = [];
+    const stroke = new SculptStroke(
+      brush,
+      {},
+      (ops) => {
+        centers.push(...ops.map((op) => (op as { center: readonly number[] }).center[0]));
+        return Promise.resolve();
+      },
+      (at) => at[0] > 0.2 && at[0] < 0.4,
+    );
+    stroke.dab([0, 0, 0]);
+    await tick();
+    stroke.dab([0.65, 0, 0]);
+    stroke.end();
+    await stroke.done;
+    expect(centers.map((x) => Number(x.toFixed(6)))).toEqual([0, 0.15, 0.45, 0.6]);
+  });
+
+  it("a_newer_move_replaces_one_that_has_not_started", async () => {
+    const ran: string[] = [];
+    let release = () => {};
+    const stroke = new SculptStroke(brush, {}, () => Promise.resolve());
+    stroke.move(
+      () => {
+        ran.push("first");
+        return new Promise<void>((r) => {
+          release = r;
+        });
+      },
+      [0, 0, 0],
+    );
+    for (const name of ["second", "third"]) {
+      stroke.move(
+        () => {
+          ran.push(name);
+          return Promise.resolve();
+        },
+        [1, 0, 0],
+      );
+    }
+    expect(ran).toEqual(["first"]);
+    release();
+    await tick();
+    expect(ran).toEqual(["first", "third"]);
+    stroke.end();
+    await stroke.done;
+    expect(stroke.bounds()?.center).toEqual([0.5, 0, 0]);
   });
 
   it("jumps_when_the_pointer_teleports", async () => {
@@ -283,8 +422,8 @@ describe("SculptStroke", () => {
     const stroke = new SculptStroke(
       brush,
       {},
-      (op) => {
-        centers.push((op as { center: readonly [number, number, number] }).center);
+      (ops) => {
+        centers.push(...ops.map((op) => (op as { center: readonly [number, number, number] }).center));
         return Promise.resolve();
       },
     );
@@ -310,32 +449,14 @@ describe("SculptStroke", () => {
     await stroke.done;
   });
 
-  it("grab_anchor_holds_the_press_point", () => {
-    const anchor = new GrabAnchor([1, 2, 3]);
-    expect(anchor.center).toEqual([1, 2, 3]);
-    // Later raycast hits never move it: only the consumed drag does.
-    expect(anchor.center).toEqual([1, 2, 3]);
-    // A copy: mutating it leaves the anchor alone.
-    const c = anchor.center;
-    c[0] = 99;
-    expect(anchor.center).toEqual([1, 2, 3]);
-  });
-
-  it("grab_anchor_advances_with_the_drag", () => {
-    const anchor = new GrabAnchor([1, 2, 3]);
-    anchor.advance([0.5, 0, 0]);
-    anchor.advance([0, -1, 2]);
-    expect(anchor.center).toEqual([1.5, 1, 5]);
-  });
-
   it("reads_a_getter_brush_live", async () => {
     let radius = 1;
     const seen: number[] = [];
     const stroke = new SculptStroke(
       () => ({ ...brush, radius }),
       {},
-      (op) => {
-        seen.push((op as { radius: number }).radius);
+      (ops) => {
+        seen.push(...ops.map((op) => (op as { radius: number }).radius));
         return Promise.resolve();
       },
     );
@@ -345,7 +466,8 @@ describe("SculptStroke", () => {
     expect(stroke.dab([1, 0, 0])).toBe("stamped");
     stroke.end();
     await stroke.done;
-    expect(seen).toEqual([1, 2]);
+    // The second radius applies from the second sample on, its spacing 0.3 over the distance 1.
+    expect(seen).toEqual([1, 2, 2, 2]);
   });
 });
 
@@ -374,7 +496,7 @@ describe("brush picker", () => {
   });
 
   it("starts_each_tool_at_its_own_strength", () => {
-    expect(DEFAULT_STRENGTHS).toEqual({ inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 });
+    expect(DEFAULT_STRENGTHS).toEqual({ inflate: 0.1, deflate: 0.1, smooth: 0.5, grab: 1 });
   });
 
   it("arms_inflate_up_and_deflate_down", () => {

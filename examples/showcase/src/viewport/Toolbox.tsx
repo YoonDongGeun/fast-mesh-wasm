@@ -105,7 +105,7 @@ export function SculptToolbox(props: { app: AppState }) {
           onChange={(e) => setRadius(Number(e.currentTarget.value))}
         />
       </label>
-      <label className="slider" title={tool === "grab" ? "How closely the surface follows the pointer" : "Displacement per dab"}>
+      <label className="slider" title={tool === "grab" ? "How closely the surface follows the pointer" : "Height of one dab, over the brush radius"}>
         strength <output>{fmt(strength)}</output>
         <input
           type="range"

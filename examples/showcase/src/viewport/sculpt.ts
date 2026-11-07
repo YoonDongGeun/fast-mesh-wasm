@@ -31,10 +31,12 @@ export function sculptOpForTool(tool: SculptTool): "inflate" | "relax" | "grab" 
 
 /**
  * Each tool's starting strength (grab at 1 follows the pointer exactly).
- * Inflate stays small: dabs overlap heavily along a sweep, so a dab-sized
- * 0.05 already builds a visible bump without folding.
+ * Inflate's is the height of one dab over the brush radius (see `dabOp`), so
+ * a stroke looks the same at any model size. It stays small: dabs overlap
+ * heavily along a sweep, so a tenth of the radius per dab already builds a
+ * visible bump without folding.
  */
-export const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.05, deflate: 0.05, smooth: 0.5, grab: 1 };
+export const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.1, deflate: 0.1, smooth: 0.5, grab: 1 };
 
 /** Laplacian passes per smooth dab (each melts the full weight toward the centroid). */
 export const RELAX_PASSES = 2;
@@ -62,14 +64,18 @@ export function sculptBrush(
   };
 }
 
-/** Past this many spacings a dab jumps to the pointer instead of creeping (see `SculptStroke.dab`). */
-export const CREEP_SPACINGS = 4;
+/**
+ * Past this many brush radii between two pointer samples the stroke jumps
+ * instead of laying dabs along the way: that is the pointer leaving one part
+ * of the surface for another, not a fast move (see `SculptStroke.dab`).
+ */
+export const TELEPORT_RADII = 8;
 
 /**
  * Past this many triangles sculpt remeshes stand down: the passes run
  * over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
  * regions), which would stall the worker and the dabs behind it. Dabs
- * themselves stay fluid (~20-30 ms), so sculpting keeps working.
+ * themselves cost by the brush region, so sculpting keeps working.
  */
 export const REMESH_TRI_LIMIT = 100_000;
 
@@ -112,7 +118,7 @@ export function liveRemeshDue(dabsSinceLive: number, msSinceLive: number, runnin
  * the remesh first would strand the dabs on a density they never painted.
  * The live pass must therefore never open or close a step itself; it just
  * repairs while the stroke's step is open. (On the Worker there is no step
- * nesting — one step per dab — so the passes land as their own steps
+ * nesting — one step per batch of dabs — so the passes land as their own steps
  * there; that divergence is inherent to the Worker scene, not a choice.)
  */
 
@@ -133,13 +139,17 @@ export function farEnough(
   return dx * dx + dy * dy + dz * dz >= spacing * spacing;
 }
 
-/** The repair op one dab applies at `center` (local coordinates). */
+/**
+ * The repair op one dab applies at `center` (local coordinates): the
+ * displacement step of a painted stroke. Inflate's strength is relative to
+ * the brush radius; the engine takes it in mesh units.
+ */
 export function dabOp(brush: SculptBrush, center: readonly [number, number, number]): RepairOp {
   const shared = {
     center: [center[0], center[1], center[2]] as [number, number, number],
     radius: brush.radius,
     falloff: brush.falloff,
-    strength: brush.strength,
+    strength: brush.op === "inflate" ? brush.strength * brush.radius : brush.strength,
   };
   if (brush.op === "relax") {
     return { op: "relax", ...shared, cycles: brush.cycles };
@@ -209,29 +219,121 @@ export function grabLocalDelta(
   return rotateByQuat(world, meshQuatConj);
 }
 
+/** The falloff weight at normalized distance `t`, as the engine's brushes compute it. */
+export function falloffWeight(falloff: "linear" | "smooth", t: number): number {
+  if (!(t < 1)) {
+    return 0;
+  }
+  const s = 1 - t;
+  return falloff === "linear" ? s : s * s * (3 - 2 * s);
+}
+
 /**
- * A grab stroke's locked anchor: dabs land here however the pointer's
- * raycast hits swim (off the lump, onto another mesh), so a drag never
- * re-grabs elsewhere mid-stroke. It advances by each consumed drag delta,
- * so the grasped lump stays inside the brush ball.
+ * What a grab stroke holds on to: the vertices under the brush at the press,
+ * where they rested and their weights. Each move is written from these and the
+ * total drag, so the shape depends on where the pointer is and not on how many
+ * events it took to get there. The displacement step of a grab stroke:
+ * `positionsAt` is all the stroke asks of it.
  */
-export class GrabAnchor {
-  #center: [number, number, number];
+export class GrabRegion {
+  /** The grabbed vertex slots, ascending. */
+  ids: Uint32Array;
+  #weights: Float32Array;
+  #rest: Float32Array;
+  readonly #center: readonly [number, number, number];
+  readonly #radius: number;
+  readonly #falloff: "linear" | "smooth";
+  readonly #strength: number;
+  /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
+  #drag: readonly [number, number, number] = [0, 0, 0];
 
-  constructor(start: readonly [number, number, number]) {
-    this.#center = [start[0], start[1], start[2]];
+  constructor(
+    positions: ArrayLike<number>,
+    indices: ArrayLike<number>,
+    center: readonly [number, number, number],
+    radius: number,
+    falloff: "linear" | "smooth",
+    strength: number,
+  ) {
+    this.#center = [center[0], center[1], center[2]];
+    this.#radius = radius;
+    this.#falloff = falloff;
+    this.#strength = strength;
+    this.ids = new Uint32Array();
+    this.#weights = new Float32Array();
+    this.#rest = new Float32Array();
+    this.rebase(positions, indices);
   }
 
-  /** The next dab's center (a copy). */
-  get center(): [number, number, number] {
-    return [...this.#center];
+  /** The weight of a vertex resting at `x, y, z`. */
+  #weight(x: number, y: number, z: number): number {
+    const c = this.#center;
+    const t = Math.hypot(x - c[0], y - c[1], z - c[2]) / this.#radius;
+    return this.#strength * falloffWeight(this.#falloff, t);
   }
 
-  /** Advances the anchor by a consumed drag delta. */
-  advance(delta: readonly [number, number, number]): void {
-    this.#center[0] += delta[0];
-    this.#center[1] += delta[1];
-    this.#center[2] += delta[2];
+  /**
+   * Takes the region again over `positions`, with every move sent so far
+   * landed: for a pass that added vertices or moved some mid-stroke. A vertex
+   * that is still where this region put it keeps its rest. Any other gets the
+   * rest position the drag would have carried here, by a few fixed-point steps,
+   * and then exactly the rest that lands on it now, so that nothing jumps.
+   */
+  rebase(positions: ArrayLike<number>, indices: ArrayLike<number>): void {
+    const drag = this.#drag;
+    const slots = positions.length / 3;
+    const reach = this.#radius + Math.abs(this.#strength) * Math.hypot(drag[0], drag[1], drag[2]);
+    const candidates = paintMaskIds(positions, indices, slots, this.#center, reach);
+    const known = new Map<number, number>();
+    this.ids.forEach((id, k) => known.set(id, k));
+    const ids: number[] = [];
+    const weights: number[] = [];
+    const rest: number[] = [];
+    const tolerance = 1e-5 * this.#radius;
+    for (let k = 0; k < candidates.length; k++) {
+      const id = candidates[k];
+      const [px, py, pz] = [positions[3 * id], positions[3 * id + 1], positions[3 * id + 2]];
+      const old = known.get(id);
+      if (old !== undefined) {
+        const w = this.#weights[old];
+        const [rx, ry, rz] = [this.#rest[3 * old], this.#rest[3 * old + 1], this.#rest[3 * old + 2]];
+        if (Math.hypot(rx + w * drag[0] - px, ry + w * drag[1] - py, rz + w * drag[2] - pz) <= tolerance) {
+          ids.push(id);
+          weights.push(w);
+          rest.push(rx, ry, rz);
+          continue;
+        }
+      }
+      let [ox, oy, oz] = [px, py, pz];
+      for (let step = 0; step < 4; step++) {
+        const w = this.#weight(ox, oy, oz);
+        ox = px - w * drag[0];
+        oy = py - w * drag[1];
+        oz = pz - w * drag[2];
+      }
+      const w = this.#weight(ox, oy, oz);
+      if (w !== 0) {
+        ids.push(id);
+        weights.push(w);
+        rest.push(px - w * drag[0], py - w * drag[1], pz - w * drag[2]);
+      }
+    }
+    this.ids = Uint32Array.from(ids);
+    this.#weights = Float32Array.from(weights);
+    this.#rest = Float32Array.from(rest);
+  }
+
+  /** Where the grabbed vertices belong at the total `drag`, three numbers per id. */
+  positionsAt(drag: readonly [number, number, number]): Float64Array {
+    this.#drag = [drag[0], drag[1], drag[2]];
+    const out = new Float64Array(this.#rest.length);
+    for (let k = 0; k < this.ids.length; k++) {
+      const w = this.#weights[k];
+      out[3 * k] = this.#rest[3 * k] + w * drag[0];
+      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1];
+      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2];
+    }
+    return out;
   }
 }
 
@@ -299,18 +401,26 @@ export interface StrokeSteps {
  * One press-and-hold stroke: dabs through `apply`, coalescing to one undo
  * step where the scene nests steps. Lazy: no step opens until the first dab
  * lands, and a stroke whose dabs all failed cancels its step instead.
+ *
+ * The dabs lie every spacing along the pointer's path, whatever its event rate
+ * and however long a dab takes: those that come due while one is in flight
+ * wait, and go together when it lands, so a slow scene lags but leaves no gaps.
  */
 export class SculptStroke {
   readonly #brush: () => SculptBrush;
   readonly #steps: StrokeSteps;
-  readonly #apply: (op: RepairOp) => Promise<unknown>;
+  readonly #apply: (ops: readonly RepairOp[]) => Promise<unknown>;
+  readonly #blocked: (at: readonly [number, number, number], radius: number) => boolean;
   #last: [number, number, number] | null = null;
   #min: [number, number, number] | null = null;
   #max: [number, number, number] | null = null;
-  #running: Promise<void> | null = null;
+  #queue: RepairOp[] = [];
+  #latest: (() => Promise<unknown>) | null = null;
+  #inFlight = 0;
   #begun = false;
   #landed = false;
   #ended = false;
+  #closed = false;
   #dabs = 0;
   #close!: () => void;
   /** Resolves once the stroke is ended and its step closed. */
@@ -318,12 +428,20 @@ export class SculptStroke {
 
   /**
    * `brush` is read live, per dab: pass a getter and the brush inputs stay
-   * adjustable mid-stroke (a plain brush is read as-is).
+   * adjustable mid-stroke (a plain brush is read as-is). `apply` gets the dabs
+   * that came due, in order, one or more at a time. A dab `blocked` says no
+   * to (the mask) is left out, and the path goes on past it.
    */
-  constructor(brush: SculptBrush | (() => SculptBrush), steps: StrokeSteps, apply: (op: RepairOp) => Promise<unknown>) {
+  constructor(
+    brush: SculptBrush | (() => SculptBrush),
+    steps: StrokeSteps,
+    apply: (ops: readonly RepairOp[]) => Promise<unknown>,
+    blocked: (at: readonly [number, number, number], radius: number) => boolean = () => false,
+  ) {
     this.#brush = typeof brush === "function" ? brush : () => brush;
     this.#steps = steps;
     this.#apply = apply;
+    this.#blocked = blocked;
     this.done = new Promise<void>((resolve) => {
       this.#close = resolve;
     });
@@ -335,53 +453,150 @@ export class SculptStroke {
   }
 
   /**
-   * Applies a dab at `center` (local coordinates): `skipped` when it is too
-   * close to the last (unless `force`, the hold-still buildup), `busy` while
-   * one runs, `ended` once the stroke closed. A dab within reach creeps one
-   * spacing toward the pointer (no dotted trails on fast moves); past
-   * `CREEP_SPACINGS` spacings it jumps straight there.
+   * Moves the stroke to `center` (local coordinates), laying a dab every
+   * spacing from the last one: `skipped` when it is under a spacing away,
+   * `ended` once the stroke closed. With `force` (the hold-still buildup,
+   * which goes by time and not by distance) one dab lands right there, or
+   * `busy` while one is in flight. Past `TELEPORT_RADII` radii it starts over
+   * at `center`, as after `lift`.
    */
   dab(center: readonly [number, number, number], force = false): "stamped" | "skipped" | "busy" | "ended" {
     if (this.#ended) {
       return "ended";
     }
-    if (this.#running !== null) {
-      return "busy";
-    }
     const brush = this.#brush();
-    const spacing = dabSpacing(brush.radius);
-    let at: [number, number, number] = [center[0], center[1], center[2]];
-    if (!force && this.#last !== null) {
-      const dx = center[0] - this.#last[0];
-      const dy = center[1] - this.#last[1];
-      const dz = center[2] - this.#last[2];
-      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (dist < spacing) {
-        return "skipped";
+    const at: [number, number, number] = [center[0], center[1], center[2]];
+    if (force || this.#last === null) {
+      if (force && this.#inFlight > 0) {
+        return "busy";
       }
-      if (dist <= CREEP_SPACINGS * spacing) {
-        const k = spacing / dist;
-        at = [this.#last[0] + dx * k, this.#last[1] + dy * k, this.#last[2] + dz * k];
-      }
+      this.#stamp(brush, at);
+      this.#sendIfIdle();
+      return "stamped";
     }
+    const spacing = dabSpacing(brush.radius);
+    const dx = at[0] - this.#last[0];
+    const dy = at[1] - this.#last[1];
+    const dz = at[2] - this.#last[2];
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist < spacing) {
+      return "skipped";
+    }
+    if (dist > TELEPORT_RADII * brush.radius) {
+      this.#stamp(brush, at);
+      this.#sendIfIdle();
+      return "stamped";
+    }
+    const [x, y, z] = this.#last;
+    const steps = Math.floor(dist / spacing);
+    for (let k = 1; k <= steps; k++) {
+      const u = (k * spacing) / dist;
+      this.#stamp(brush, [x + dx * u, y + dy * u, z + dz * u]);
+    }
+    this.#sendIfIdle();
+    return "stamped";
+  }
+
+  /** The pointer left the surface: the next `dab` starts over where it lands. */
+  lift(): void {
+    this.#last = null;
+  }
+
+  /**
+   * Writes a new displacement of a stroke that holds its own state (a grab):
+   * `edit` runs once nothing is in flight, and a newer `move` replaces one that
+   * has not started. `at` is where the brush is now, for `bounds`.
+   */
+  move(edit: () => Promise<unknown>, at: readonly [number, number, number]): "stamped" | "ended" {
+    if (this.#ended) {
+      return "ended";
+    }
+    this.#open();
+    this.#dabs++;
+    this.#cover(at);
+    this.#latest = edit;
+    this.#sendIfIdle();
+    return "stamped";
+  }
+
+  #sendIfIdle(): void {
+    if (this.#inFlight === 0) {
+      this.flush();
+    }
+  }
+
+  #open(): void {
     if (!this.#begun) {
       this.#begun = true;
       this.#steps.beginStep?.();
     }
-    this.#dabs++;
-    this.#last = at;
+  }
+
+  #cover(at: readonly [number, number, number]): void {
     if (this.#min === null || this.#max === null) {
-      this.#min = [...at];
-      this.#max = [...at];
+      this.#min = [at[0], at[1], at[2]];
+      this.#max = [at[0], at[1], at[2]];
     } else {
       for (let k = 0; k < 3; k++) {
         this.#min[k] = Math.min(this.#min[k], at[k]);
         this.#max[k] = Math.max(this.#max[k], at[k]);
       }
     }
+  }
+
+  #stamp(brush: SculptBrush, at: [number, number, number]): void {
+    this.#last = at;
+    if (this.#blocked(at, brush.radius)) {
+      return;
+    }
+    this.#open();
+    this.#dabs++;
+    this.#cover(at);
+    this.#queue.push(dabOp(brush, at));
+  }
+
+  /**
+   * Runs `work` in order with the stroke's own edits, after what is due and
+   * before what comes due next (a remesh): the stroke does not close, and sends
+   * nothing more, until it settles. A failure is the caller's to swallow.
+   */
+  pass(work: () => Promise<unknown>): Promise<void> {
+    this.flush();
+    return new Promise<void>((resolve) => {
+      this.#send(() => {
+        const running = work();
+        void running.then(
+          () => resolve(),
+          () => resolve(),
+        );
+        return running;
+      });
+    });
+  }
+
+  /**
+   * Sends what is due now, even with a dab still in flight: for a caller about
+   * to send something else that has to land after it (a remesh). On its own
+   * the stroke sends the next batch when the last one lands.
+   */
+  flush(): void {
+    if (this.#queue.length > 0) {
+      const ops = this.#queue;
+      this.#queue = [];
+      this.#send(() => this.#apply(ops));
+    }
+    if (this.#latest !== null) {
+      const edit = this.#latest;
+      this.#latest = null;
+      this.#send(edit);
+    }
+  }
+
+  #send(run: () => Promise<unknown>): void {
+    this.#inFlight++;
     let settled: Promise<void>;
     try {
-      settled = Promise.resolve(this.#apply(dabOp(brush, at))).then(
+      settled = Promise.resolve(run()).then(
         () => {
           this.#landed = true;
         },
@@ -394,13 +609,15 @@ export class SculptStroke {
       // The applier threw outright: a failed dab, like a rejection.
       settled = Promise.resolve();
     }
-    this.#running = settled.finally(() => {
-      this.#running = null;
-      if (this.#ended) {
+    void settled.finally(() => {
+      this.#inFlight--;
+      if (this.#inFlight === 0) {
+        this.flush();
+      }
+      if (this.#inFlight === 0 && this.#ended) {
         this.#finish();
       }
     });
-    return "stamped";
   }
 
   /**
@@ -425,18 +642,23 @@ export class SculptStroke {
     return { center, radius: grown };
   }
 
-  /** Closes the stroke: its step ends (or cancels, when nothing landed), once the running dab settles. */
+  /** Closes the stroke: its step ends (or cancels, when nothing landed), once what it sent settles. */
   end(): void {
     if (this.#ended) {
       return;
     }
     this.#ended = true;
-    if (this.#running === null) {
+    this.flush();
+    if (this.#inFlight === 0) {
       this.#finish();
     }
   }
 
   #finish(): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
     if (this.#begun) {
       if (this.#landed) {
         this.#steps.endStep?.();

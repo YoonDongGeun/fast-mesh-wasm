@@ -28,11 +28,11 @@ import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
 import { matchVolume } from "./volume-box";
 import {
+  GrabRegion,
   type SculptBrush,
   type SculptMask,
   SculptStroke,
   type StrokeSteps,
-  GrabAnchor,
   grabLocalDelta,
   interpolateHit,
   liveRemeshDue,
@@ -384,7 +384,9 @@ function MeshView(props: {
         shading="fragment"
         edgeSoftness={edgeSoftness}
         visible={!volumeShown}
-        onClick={onClick}
+        // While sculpting a click means nothing here, and listening for one
+        // costs a per-triangle three raycast on every press and release.
+        onClick={sculpted ? undefined : onClick}
         onBind={(b) => onBind(item.mesh, b)}
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
@@ -586,7 +588,7 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
  * paints dabs along the pointer (and builds up where it holds still;
  * grab drags the surface along instead). A press on empty space is the
  * orbit's, as usual; a stroke holds a single undo step on the sync scene
- * (the Worker has no step nesting: one step per dab there), and its end
+ * (the Worker has no step nesting: one step per batch of dabs there), and its end
  * remeshes the stroked region when asked. Dabs whose ball touches the
  * painted mask are dropped before they reach the scene. One raycast at a
  * time, through the engine's BVH, never three's per-triangle `Mesh.raycast`.
@@ -666,10 +668,14 @@ function SculptLayer(props: {
     let buildup: ReturnType<typeof setInterval> | undefined;
     /** The stroking pointer, or -1 when no stroke paints. */
     let active = -1;
-    /** The screen point the last grab delta started from. */
+    /** The pointer whose press is waiting on its raycast: a release meanwhile calls the stroke off. */
+    let pressing = -1;
+    /** The screen point the grab drag is measured from (the press). */
     let grabFrom: { x: number; y: number } | null = null;
-    /** The grab stroke's locked anchor (the press point), or null outside one. */
-    let grabAnchor: GrabAnchor | null = null;
+    /** The press point in local coordinates, or null outside a grab stroke. */
+    let grabPress: [number, number, number] | null = null;
+    /** What the grab stroke holds on to, or null while a masked press holds it still. */
+    let grabRegion: GrabRegion | null = null;
     /**
      * The armed mesh's mean edge length, taken once per armed session: the
      * remesh target every stroke converges back to (the engine's live mean
@@ -819,22 +825,34 @@ function SculptLayer(props: {
       liveAt = performance.now();
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
-      liveRunning = store
-        .repair(mesh, {
-          op: "remesh",
-          center: b.center,
-          radius: b.radius,
-          maxRounds: 2,
-          splitOnly: true,
-          targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
-        })
-        .catch(() => {
-          // A degenerate region (or a mesh removed meanwhile): the stroke
-          // paints on.
-        })
-        .finally(() => {
-          liveRunning = null;
-        });
+      // In order with the stroke's edits, so that the stroke's end waits for it.
+      liveRunning = stroke.pass(() =>
+        store
+          .repair(mesh, {
+            op: "remesh",
+            center: b.center,
+            radius: b.radius,
+            maxRounds: 2,
+            splitOnly: true,
+            targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
+          })
+          .catch(() => {
+            // A degenerate region (or a mesh removed meanwhile): the stroke
+            // paints on.
+          })
+          .then(() => {
+            liveRunning = null;
+            // The pass added vertices under the grab: take them along.
+            if (grabRegion !== null) {
+              try {
+                const v = scene.views(mesh);
+                grabRegion.rebase(v.positions(), v.indices());
+              } catch {
+                // Removed meanwhile: the next move finds out.
+              }
+            }
+          }),
+      );
     };
 
     const cast = (x: number, y: number) => {
@@ -882,13 +900,16 @@ function SculptLayer(props: {
       buildup = undefined;
       active = -1;
       grabFrom = null;
-      grabAnchor = null;
+      grabPress = null;
+      grabRegion = null;
       dirRef.current = [0, 0, 0];
       if (stroke !== null) {
         const s = stroke;
         syncDabs();
         stroke = null;
         inspect.sculpt.strokes++;
+        // What is due goes first: the stroke-end remesh must land after it.
+        s.flush();
         // The stroke-end remesh lands before the step closes: one undo step
         // for the stroke and its evening-out (on the sync scene). Stands
         // down on huge meshes, where a remesh would stall the worker.
@@ -920,7 +941,20 @@ function SculptLayer(props: {
       }
     };
 
-    /** Refreshes the grab drag vector from the pointer's screen delta since the last dab. */
+    /** Counts a stroke's work as landed; a failure means the mesh went away, and ends the stroke. */
+    const landing = (work: Promise<unknown>) =>
+      work
+        .then((r) => {
+          landed++;
+          return r;
+        })
+        .catch((err: unknown) => {
+          // Let the stroke count the failed dab.
+          endStroke();
+          throw err;
+        });
+
+    /** Refreshes the grab's total drag from the pointer's screen offset since the press. */
     const trackGrab = (x: number, y: number, point: readonly [number, number, number]) => {
       const from = grabFrom;
       const binding = view.bindings.get(brushRef.current.mesh);
@@ -947,34 +981,29 @@ function SculptLayer(props: {
     };
 
     /**
-     * Paints one grab dab at the locked anchor (no raycast: the pointer's
-     * hits may swim off the lump or onto another mesh, but the drag never
-     * re-grabs). Only a stamped dab consumes its delta and advances the
-     * anchor; a busy one retries it whole. A masked anchor holds: the delta
-     * is kept, like a busy dab, and retried on the next move.
+     * Writes the grabbed region at the pointer's total drag (no raycast: the
+     * pointer's hits may swim off the lump or onto another mesh, but the drag
+     * never re-grabs). A masked press holds the stroke still.
      */
     const paintGrab = (x: number, y: number) => {
-      if (stroke === null || grabAnchor === null) {
+      const s = stroke;
+      if (s === null || grabPress === null || grabRegion === null) {
         return;
       }
-      const at = grabAnchor.center;
+      trackGrab(x, y, grabPress);
+      const g = dirRef.current;
+      const region = grabRegion;
       const brush = brushRef.current;
-      if (dabProtected(brush.mesh, at, brush.radius)) {
-        inspect.sculpt.maskedDabs++;
-        syncDabs();
-        return;
-      }
-      trackGrab(x, y, at);
-      if (stroke.dab(at, true) === "stamped") {
-        const g = dirRef.current;
-        inspect.sculpt.grabTotal += Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-        grabAnchor.advance(g);
-        grabFrom = { x, y };
-        // Past the advance (where the ball shows): consecutive centers then
-        // differ by exactly the consumed delta the growth accounts.
-        inspect.sculpt.lastDab = grabAnchor.center;
-        showBall(grabAnchor.center);
-      }
+      const k = brush.strength;
+      const at: [number, number, number] = [grabPress[0] + k * g[0], grabPress[1] + k * g[1], grabPress[2] + k * g[2]];
+      s.move(
+        () =>
+          landing(store.edit(brush.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(g) }])),
+        at,
+      );
+      inspect.sculpt.grabTotal = Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+      inspect.sculpt.lastDab = at;
+      showBall(at);
       syncDabs();
       maybeLiveRemesh();
     };
@@ -1010,6 +1039,7 @@ function SculptLayer(props: {
             }
             if (hit === null || hit.mesh !== brushRef.current.mesh) {
               hideBall();
+              stroke?.lift();
             } else {
               let point: [number, number, number];
               try {
@@ -1023,12 +1053,7 @@ function SculptLayer(props: {
               inspect.sculpt.hovering = true;
               showBall(point);
               if (stroke !== null) {
-                // The mask drops the dab before the scene (counted, like a skip).
-                if (dabProtected(brushRef.current.mesh, point, brushRef.current.radius)) {
-                  inspect.sculpt.maskedDabs++;
-                } else {
-                  stroke.dab(point);
-                }
+                stroke.dab(point);
                 syncDabs();
                 maybeLiveRemesh();
               }
@@ -1055,6 +1080,7 @@ function SculptLayer(props: {
       if (e.button !== 0 || isExtraFinger(e) || active !== -1 || view.dragging) {
         return;
       }
+      pressing = e.pointerId;
       // Immediate: the stroke starts where the button lands, not a throttle later.
       Promise.resolve()
         .then(() => cast(e.clientX, e.clientY))
@@ -1063,7 +1089,7 @@ function SculptLayer(props: {
             // The gizmo's own pointerdown runs first (its listeners attached
             // first): a grab there owns the gesture, not a stroke. A second
             // finger landed meanwhile: the camera's pinch owns it.
-            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
+            if (!alive || active !== -1 || pressing !== e.pointerId || view.dragging || view.multiTouch) {
               return;
             }
             const brush = brushRef.current;
@@ -1094,23 +1120,30 @@ function SculptLayer(props: {
             landed = 0;
             liveDabs = 0;
             grabFrom = { x: e.clientX, y: e.clientY };
-            grabAnchor = brush.op === "grab" ? new GrabAnchor(point) : null;
+            grabPress = brush.op === "grab" ? point : null;
+            grabRegion = null;
             dirRef.current = [0, 0, 0];
+            // Where the scene nests steps, each dab is its own edit (its cost
+            // follows the brush). The Worker takes them as a list: it runs a
+            // list one op at a time too, as one undo step.
+            const nests = steps.beginStep !== undefined;
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,
-              (op) =>
-                store
-                  .repair(mesh, op)
-                  .then((r) => {
-                    landed++;
-                    return r;
-                  })
-                  .catch((err: unknown) => {
-                    // The mesh went away mid-stroke: end it, and let the stroke count the failed dab.
-                    endStroke();
-                    throw err;
-                  }),
+              (ops) =>
+                landing(
+                  nests || ops.length === 1
+                    ? Promise.all(ops.map((op) => store.repair(mesh, op)))
+                    : store.repair(mesh, ops),
+                ),
+              // The mask drops the dab before the scene (counted, like a skip).
+              (at, radius) => {
+                if (dabProtected(mesh, at, radius)) {
+                  inspect.sculpt.maskedDabs++;
+                  return true;
+                }
+                return false;
+              },
             );
             active = e.pointerId;
             stroke = s;
@@ -1118,16 +1151,17 @@ function SculptLayer(props: {
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            // Grab is move-driven only: the press locks the anchor, the first
+            // Grab is move-driven only: the press takes the region, the first
             // move paints (a click without a drag leaves no step, no remesh).
-            // A masked press paints nothing (the stroke still opens, so the
+            // A masked press holds it still (the stroke still opens, so the
             // loud stale check runs here too, before any dab lands).
             if (brush.op !== "grab") {
-              if (dabProtected(mesh, point, brushRef.current.radius)) {
-                inspect.sculpt.maskedDabs++;
-              } else {
-                s.dab(point);
-              }
+              s.dab(point);
+            } else if (dabProtected(mesh, point, brush.radius)) {
+              inspect.sculpt.maskedDabs++;
+            } else {
+              const v = scene.views(mesh);
+              grabRegion = new GrabRegion(v.positions(), v.indices(), point, brush.radius, brush.falloff, brush.strength);
             }
             syncDabs();
             clearInterval(buildup);
@@ -1138,11 +1172,7 @@ function SculptLayer(props: {
               }
               const at = hoverLocal;
               if (at !== null) {
-                if (dabProtected(mesh, at, brushRef.current.radius)) {
-                  inspect.sculpt.maskedDabs++;
-                } else {
-                  stroke?.dab(at, true);
-                }
+                stroke?.dab(at, true);
                 syncDabs();
                 maybeLiveRemesh();
               }
@@ -1154,11 +1184,13 @@ function SculptLayer(props: {
         );
     };
     const onUp = (e: PointerEvent) => {
+      pressing = -1;
       if (e.pointerId === active) {
         endStroke();
       }
     };
     const onLeave = (e: PointerEvent) => {
+      pressing = -1;
       if (stroke !== null) {
         if (e.pointerId === active) {
           endStroke();
