@@ -249,7 +249,7 @@ export class GrabRegion {
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
   readonly #origin: readonly [number, number, number];
-  readonly #hold: MaskField | null;
+  readonly #hold: () => MaskField | null;
   /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
@@ -261,10 +261,10 @@ export class GrabRegion {
     falloff: "linear" | "smooth",
     strength: number,
     origin: readonly [number, number, number] = [0, 0, 0],
-    hold: MaskField | null = null,
+    hold: MaskField | null | (() => MaskField | null) = null,
   ) {
     this.#origin = [origin[0], origin[1], origin[2]];
-    this.#hold = hold;
+    this.#hold = typeof hold === "function" ? hold : () => hold;
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
     this.#falloff = falloff;
@@ -277,11 +277,11 @@ export class GrabRegion {
 
   /**
    * What the mask leaves of a vertex's move: 0 on a masked one, which this
-   * region then never takes, so no write ever reaches it. A slot newer than
-   * the mask's field is free.
+   * region then never takes, so no write ever reaches it. Read fresh, since a
+   * split can add to the mask mid-stroke. A slot newer than the field is free.
    */
-  #held(id: number): number {
-    return this.#hold === null || id >= this.#hold.scale.length ? 1 : this.#hold.scale[id];
+  #held(id: number, field: MaskField | null): number {
+    return field === null || id >= field.scale.length ? 1 : field.scale[id];
   }
 
   /** The weight of a vertex resting at `x, y, z`. */
@@ -321,9 +321,10 @@ export class GrabRegion {
     const weights: number[] = [];
     const rest: number[] = [];
     const tolerance = 1e-5 * this.#radius;
+    const field = this.#hold();
     for (let k = 0; k < candidates.length; k++) {
       const id = candidates[k];
-      const held = this.#held(id);
+      const held = this.#held(id, field);
       if (held === 0) {
         continue;
       }
@@ -822,7 +823,8 @@ export class SculptStroke {
 // longer used by a live triangle (a collapse, compact, weld or isolate took
 // it). Surviving cases re-verify cheaply: splits add slots but keep the old
 // vertices alive, so a split stroke's mask carries over (the new vertices
-// land unmasked); undo/redo restores the buffers, and the mask with them
+// land unmasked, unless they split a masked edge: those join the mask, see
+// `inherited`); undo/redo restores the buffers, and the mask with them
 // when its ids are live again. The documented hole: a merge or compact can
 // remap ids while keeping them live, silently re-pointing the mask —
 // reselect after structural repairs, as with #106 selections.
@@ -839,6 +841,12 @@ export interface SculptMask {
   vertices: Uint32Array;
   /** `positions().length / 3` when painted; see the contract above. */
   slots: number;
+  /**
+   * The slots in `vertices` no one painted: splits between masked vertices,
+   * held like them. An undo takes them with the split and a redo brings them
+   * back, so one dying says nothing about the mask: it is skipped, not stale.
+   */
+  inherited?: ReadonlySet<number>;
 }
 
 /**
@@ -851,7 +859,7 @@ export interface SculptMask {
  * paint/invert paths call `checkMask` to fail loudly instead.
  */
 export function maskUsable(
-  mask: Pick<SculptMask, "vertices" | "slots">,
+  mask: Pick<SculptMask, "vertices" | "slots" | "inherited">,
   indices: ArrayLike<number>,
   slots: number,
 ): boolean {
@@ -881,7 +889,7 @@ export function maskUsable(
   }
   for (let k = 0; k < mask.vertices.length; k++) {
     const id = mask.vertices[k];
-    if (!Number.isInteger(id) || id < 0 || id >= slots || used[id] === 0) {
+    if ((!Number.isInteger(id) || id < 0 || id >= slots || used[id] === 0) && mask.inherited?.has(id) !== true) {
       return false;
     }
   }

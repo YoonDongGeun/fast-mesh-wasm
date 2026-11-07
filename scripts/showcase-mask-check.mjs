@@ -30,6 +30,9 @@
 // - covered: a dab with only masked vertices in its ball moves nothing: no undo step.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
+// - inherit: on a lump stretched before it was masked, a live split between masked
+//   vertices joins the mask: later grabs leave those vertices byte-identical, and
+//   an undo that takes them does not make the mask stale.
 // - weld: with the brush armed and its caches filled, a weld that takes a masked
 //   vertex but keeps the slot count clears the mask loudly on the next dab, which lands.
 // - follow: after the mesh's colours go, a structural change that keeps its
@@ -418,7 +421,9 @@ try {
   const s0 = await hook("sculpt()");
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
-  // Held until a live split pass ran, however slow the runner.
+  // The optional stroke-end remesh on, to see it stand down. Held until a live
+  // split pass ran, however slow the runner.
+  await clickOn('[data-action="sculpt-remesh"]');
   await mouse("mouseMoved", edge.x, edge.y, { button: "none" });
   await sleep(200);
   await mouse("mousePressed", edge.x, edge.y, { buttons: 1 });
@@ -426,6 +431,7 @@ try {
   await sleep(300);
   await mouse("mouseReleased", edge.x, edge.y, { buttons: 0 });
   await sleep(600);
+  await clickOn('[data-action="sculpt-remesh"]');
   const p1 = await positions();
   const s1 = await hook("sculpt()");
   await shot("edge-dabbed");
@@ -520,6 +526,85 @@ try {
   }
   await hook(`meshColor(${q(A)}, null)`);
 
+  // ---- inherit: splits between masked vertices are masked too ----
+  {
+    const setRadius = (value) =>
+      page(`(() => {
+        const el = document.querySelector('[data-action="sculpt-radius"]');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, ${q(String(value))});
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        return true;
+      })()`);
+    const arm = async (action) => {
+      await clickOn(`[data-action="${action}"]`);
+      await waitFor(`document.querySelector('[data-action="${action}"]')?.getAttribute("aria-pressed") === "true"`);
+    };
+    const drag = async (at, dx, dy, steps, whileHeld = async () => {}) => {
+      await mouse("mouseMoved", at.x, at.y, { button: "none" });
+      await sleep(200);
+      await mouse("mousePressed", at.x, at.y, { buttons: 1 });
+      await sleep(150);
+      for (let i = 1; i <= steps; i++) {
+        await mouse("mouseMoved", at.x + (dx * i) / steps, at.y + (dy * i) / steps, { buttons: 1 });
+        await sleep(60);
+      }
+      await whileHeld();
+      await mouse("mouseReleased", at.x + dx, at.y + dy, { buttons: 0 });
+      await sleep(500);
+    };
+    await frames();
+    await setRadius(0.6);
+    const blockStart = await positions();
+    await clickOn('[data-action="sculpt-mask-paint"]');
+    await arm("sculpt-tool-grab");
+    // A stroke with splitting on: the mesh now holds its rest sizes.
+    await drag({ x: center.x - 70, y: center.y + 20 }, -3, 3, 2);
+    // A lump pulled with no splits: stretched against them, and it stays stretched.
+    await clickOn('[data-action="sculpt-live-remesh"]');
+    await drag(center, 40, -70, 8);
+    await clickOn('[data-action="sculpt-live-remesh"]');
+    const afterLump = await positions();
+    await clickOn('[data-action="sculpt-tool-grab"]');
+    await arm("sculpt-mask-paint");
+    await press({ x: center.x + 20, y: center.y - 35 });
+    await press({ x: center.x + 10, y: center.y - 15 });
+    await press({ x: center.x + 30, y: center.y - 55 });
+    await clickOn('[data-action="sculpt-mask-paint"]');
+    await arm("sculpt-tool-grab");
+    const i0 = await hook("sculpt()");
+    await drag({ x: center.x - 70, y: center.y + 20 }, -40, 30, 8, () =>
+      waitFor(`__showcase.sculpt().liveRemeshes > ${i0.liveRemeshes}`, 15_000).then(() => sleep(400)),
+    );
+    const inherited = await hook("sculptMaskInherited()");
+    const before = await positions();
+    await drag({ x: center.x - 70, y: center.y + 20 }, -20, 40, 6);
+    const after = await positions();
+    const inheritedMoved = inherited.filter((v) => [0, 1, 2].some((c) => before[3 * v + c] !== after[3 * v + c])).length;
+    const freeNow = before.filter((x, i) => x !== after[i]).length;
+    // Back past the splits: their vertices die, and the mask must not read that as stale.
+    let inheritUndos = 0;
+    const undoTo = async (target) => {
+      while (inheritUndos < 300 && !sameOver(await positions(), target) && (await page(`document.querySelector("[data-action=undo]")?.disabled === false`))) {
+        await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+        inheritUndos++;
+        await sleep(40);
+      }
+    };
+    await undoTo(afterLump);
+    await stroke({ x: center.x - 70, y: center.y + 20 }, 100);
+    const inheritMask = await hook("sculptMask()");
+    verdict(
+      "inherit",
+      inherited.length > 0 && inheritedMoved === 0 && freeNow > 0 && inheritMask !== null && (await hook("sculptMaskNotice()")) === null,
+      `${inherited.length} inherited, ${inheritedMoved} moved, ${freeNow} coordinates of free vertices moved; after ${inheritUndos} undos mask ${inheritMask === null ? "cleared" : "kept"}`,
+    );
+    await undoTo(blockStart);
+    await clickOn('[data-action="sculpt-tool-grab"]');
+    await arm("sculpt-mask-paint");
+    await clickOn('[data-action="sculpt-mask-clear"]');
+    await setRadius(0.05);
+  }
+
   // ---- weld: a topology edit that keeps the slot count, with the brush armed ----
   await frames();
   await press(center);
@@ -527,9 +612,8 @@ try {
   await frames();
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
-  // No remesh passes: their new slots would refresh a cache keyed on the slot count.
+  // No split passes: their new slots would refresh a cache keyed on the slot count.
   await clickOn('[data-action="sculpt-live-remesh"]');
-  await clickOn('[data-action="sculpt-remesh"]');
   await stroke(center, 200);
   const weldSlots = (await positions()).length;
   const welded = await hook(`runRepair(${q(A)}, { op: "weld", tolerance: 0.03 })`);
@@ -542,7 +626,6 @@ try {
   const weldNotice = await hook("sculptMaskNotice()");
   const weldMask = await hook("sculptMask()");
   await clickOn('[data-action="sculpt-live-remesh"]');
-  await clickOn('[data-action="sculpt-remesh"]');
   verdict(
     "weld",
     welded.mergedVertices > 0 && weldKept && weldMask === null && typeof weldNotice === "string" && w1.maskStale === w0.maskStale + 1 && w1.dabs > w0.dabs,
@@ -697,6 +780,13 @@ try {
     await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
     await frames();
     const guarded = await holdWindow();
+    await clickOn('[data-action="sculpt-tool-grab"]');
+    await waitFor(`document.querySelector('[data-action="sculpt-tool-grab"]')?.getAttribute("aria-pressed") === "true"`);
+    const passes0 = (await hook("sculpt()")).liveRemeshes;
+    const grabbed = await paintWindow(160, 40);
+    console.log(`  1M grab on the mask's edge: ${(await hook("sculpt()")).liveRemeshes - passes0} split pass(es); ${line(grabbed)}`);
+    await clickOn('[data-action="sculpt-tool-inflate"]');
+    await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
     await clickOn('[data-action="sculpt-mask-clear"]');
     await frames();
     const free = await holdWindow();

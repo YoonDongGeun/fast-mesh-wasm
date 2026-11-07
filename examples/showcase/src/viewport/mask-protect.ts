@@ -218,6 +218,25 @@ export function maskEdgeField(
 }
 
 /**
+ * The vertices a split added between two held ones (`new, a, b` triples, as
+ * `splitStretched` reports them, in order, so a parent can be new itself). A
+ * masked edge splits when it stretched before the mask was painted. Left free,
+ * the new vertex would move under the next dab and the mask would not hold.
+ */
+export function inheritedSplits(held: (id: number) => boolean, splits: ArrayLike<number>): number[] {
+  const fresh: number[] = [];
+  const added = new Set<number>();
+  const isHeld = (id: number) => added.has(id) || held(id);
+  for (let k = 0; k + 2 < splits.length; k += 3) {
+    if (isHeld(splits[k + 1]) && isHeld(splits[k + 2])) {
+      added.add(splits[k]);
+      fresh.push(splits[k]);
+    }
+  }
+  return fresh;
+}
+
+/**
  * Whether a remesh of this region could take a masked vertex. A remesh tests
  * edge midpoints, not vertices, so it reaches past its radius along any edge
  * with a midpoint inside; and a collapse there leaves a new edge that the next

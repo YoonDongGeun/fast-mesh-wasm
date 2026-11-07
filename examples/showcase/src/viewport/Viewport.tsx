@@ -47,7 +47,15 @@ import {
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
-import { MASK_SOFT_BAND, type MaskField, maskEdgeField, maskFieldCurrent, maskMeetsRemesh, protectDab } from "./mask-protect";
+import {
+  inheritedSplits,
+  MASK_SOFT_BAND,
+  type MaskField,
+  maskEdgeField,
+  maskFieldCurrent,
+  maskMeetsRemesh,
+  protectDab,
+} from "./mask-protect";
 import { setWireOverlay } from "./wire";
 import {
   buildRepairOverlayGroup,
@@ -805,7 +813,7 @@ function SculptLayer(props: {
       if (checkedMask !== m.vertices) {
         for (let k = 0; k < m.vertices.length; k++) {
           const id = m.vertices[k];
-          if (id < 0 || id >= maskCache.live.length || maskCache.live[id] === 0) {
+          if ((id < 0 || id >= maskCache.live.length || maskCache.live[id] === 0) && m.inherited?.has(id) !== true) {
             return "stale";
           }
         }
@@ -826,6 +834,33 @@ function SculptLayer(props: {
       inspect.sculpt.maskStale++;
     };
 
+    /** The mask without inherited slots an undo took: a dead vertex cannot be protected. */
+    const heldNow = (vertices: Uint32Array): ArrayLike<number> => {
+      const inherited = maskRef.current?.inherited;
+      const live = maskCache?.live;
+      return inherited === undefined || live === undefined ? vertices : vertices.filter((v) => live[v] === 1 || !inherited.has(v));
+    };
+
+    /** Splits between masked vertices join the mask, in order with the stroke: before the next dab. */
+    const adoptSplits = (mesh: MeshHandle, splits: ArrayLike<number> | undefined): void => {
+      const m = maskRef.current;
+      if (m === null || m.mesh !== mesh || splits === undefined || splits.length === 0) {
+        return;
+      }
+      const painted = new Set(m.vertices);
+      const fresh = inheritedSplits((id) => painted.has(id), splits);
+      if (fresh.length === 0) {
+        return;
+      }
+      const next: SculptMask = {
+        ...m,
+        vertices: unionMaskIds(m.vertices, Uint32Array.from(fresh).sort()),
+        inherited: new Set([...(m.inherited ?? []), ...fresh]),
+      };
+      maskRef.current = next;
+      app.setSculptMask(next);
+    };
+
     /** The mask's protection, rebuilt when the mask, the slot count or the band changes. */
     let fieldCache: { vertices: Uint32Array; slots: number; band: number; field: MaskField } | null = null;
     const maskFieldOf = (
@@ -839,7 +874,7 @@ function SculptLayer(props: {
           vertices: gated.vertices,
           slots,
           band,
-          field: maskEdgeField(gated.vertices, gated.positions, gated.indices, slots, band),
+          field: maskEdgeField(heldNow(gated.vertices), gated.positions, gated.indices, slots, band),
         };
       }
       return fieldCache.field;
@@ -915,7 +950,10 @@ function SculptLayer(props: {
     const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) =>
       store
         .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: LIVE_MAX_SPLITS })
-        .then((report) => report as StretchReport)
+        .then((report) => {
+          adoptSplits(mesh, (report as StretchReport).vertices);
+          return report as StretchReport;
+        })
         .catch(() => {
           // A degenerate region, or a mesh removed meanwhile.
           return undefined;
@@ -1309,8 +1347,11 @@ function SculptLayer(props: {
             } else {
               checkMaskLive(mesh);
               const v = scene.views(mesh);
-              const gated = maskLive(mesh);
-              const hold = gated === null || gated === "stale" ? null : maskFieldOf(gated, brush.radius);
+              // Read at each rebase: a live split can add to the mask.
+              const hold = (): MaskField | null => {
+                const gated = maskLive(mesh);
+                return gated === null || gated === "stale" ? null : maskFieldOf(gated, brush.radius);
+              };
               const region = new GrabRegion(
                 v.positions(),
                 v.indices(),
@@ -1321,7 +1362,7 @@ function SculptLayer(props: {
                 scene.origin(mesh),
                 hold,
               );
-              if (region.ids.length === 0 && hold !== null) {
+              if (region.ids.length === 0 && hold() !== null) {
                 inspect.sculpt.maskedDabs++;
               } else {
                 grabRegion = region;
@@ -1506,7 +1547,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
           app.setSculptMask({ mesh, vertices: fresh, slots });
           return;
         }
-        app.setSculptMask({ mesh, vertices: unionMaskIds(prev.vertices, fresh), slots });
+        app.setSculptMask({ mesh, vertices: unionMaskIds(prev.vertices, fresh), slots, inherited: prev.inherited });
       } else {
         // A new mesh replaces the mask, like the sculpt brush re-arms.
         app.setSculptMask({ mesh, vertices: fresh, slots });

@@ -2,8 +2,8 @@
 // Bytes on a real engine: `scripts/showcase-mask-check.mjs`.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { maskEdgeField, maskFieldCurrent, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
-import { maskUsable } from "../src/viewport/sculpt";
+import { inheritedSplits, maskEdgeField, maskFieldCurrent, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
+import { GrabRegion, maskUsable } from "../src/viewport/sculpt";
 
 /** A strip along x: vertices at (i, 0, 0) and (i, 1, 0), `2 * (n + 1)` slots. */
 function strip(n: number): { positions: number[]; indices: number[]; slots: number } {
@@ -149,6 +149,114 @@ describe("a dab's field lookup", () => {
     const moved = positions.slice();
     moved[3 * 1 + 2] += 1;
     expect(maskFieldCurrent(field, moved)).toBe(false);
+  });
+});
+
+describe("a split between masked vertices", () => {
+  /** A 4 x 4 flat grid, stretched by a grab with no split, and the vertices now under a mask. */
+  function stretched() {
+    const n = 60;
+    const positions: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        positions.push((x / n) * 4, (y / n) * 4, 0);
+      }
+    }
+    const indices: number[] = [];
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        indices.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    const scene = new Scene();
+    const mesh = scene.addMesh(positions, indices);
+    const v = scene.views(mesh);
+    scene.repair(mesh, { op: "captureRestSizes" });
+    const first = new GrabRegion(v.positions(), v.indices(), [0, 0, 0], 1, "smooth", 1, scene.origin(mesh));
+    scene.edit(mesh, [{ op: "setPositions", vertices: first.ids, positions: first.positionsAt([0, 0, 1.5]) }]);
+    const local = v.positions();
+    const masked: number[] = [];
+    for (let i = 0; i < local.length / 3; i++) {
+      if (Math.hypot(local[3 * i], local[3 * i + 1]) < 0.9) {
+        masked.push(i);
+      }
+    }
+    const report = scene.repair(mesh, { op: "splitStretched", center: [0, 0, 0], radius: 3, maxSplits: 400 });
+    const set = new Set(masked);
+    const fresh = inheritedSplits((id) => set.has(id), report.vertices);
+    return { scene, mesh, v, masked, fresh };
+  }
+
+  const fieldOf = (s: ReturnType<typeof stretched>, ids: readonly number[]) =>
+    maskEdgeField(ids, s.v.positions(), s.v.indices(), s.v.positions().length / 3, 0.25);
+
+  const movedOf = (before: ArrayLike<number>, after: ArrayLike<number>, ids: readonly number[]) =>
+    ids.filter((i) => [0, 1, 2].some((c) => before[3 * i + c] !== after[3 * i + c])).length;
+
+  it("happens_on_an_edge_that_stretched_before_the_mask", () => {
+    expect(stretched().fresh.length).toBeGreaterThan(100);
+  });
+
+  it("follows_chains_through_new_vertices", () => {
+    // 10 between masked 0 and 1; 11 between 10 and masked 2; 12 has a free parent.
+    expect(inheritedSplits((id) => id < 3, [10, 0, 1, 11, 10, 2, 12, 11, 5])).toEqual([10, 11]);
+  });
+
+  it("holds_the_new_vertices_under_a_dab", () => {
+    const s = stretched();
+    const all = [...s.masked, ...s.fresh];
+    const before = Float32Array.from(s.v.positions());
+    const op = { op: "grab", center: [0, 0, 0.7], radius: 1.5, falloff: "smooth", strength: 1, direction: [0.3, 0, 0] } as const;
+    // What the owner would see without them: the mask holds, its new vertices do not.
+    s.scene.repair(s.mesh, protectDab(op, fieldOf(s, s.masked), s.v.positions()));
+    expect(movedOf(before, s.v.positions(), s.fresh)).toBeGreaterThan(0);
+    s.scene.undo();
+    s.scene.repair(s.mesh, protectDab(op, fieldOf(s, all), s.v.positions()));
+    expect(movedOf(before, s.v.positions(), all)).toBe(0);
+    expect(Array.from(s.v.positions())).not.toEqual(Array.from(before));
+  });
+
+  it("keeps_a_grab_out_through_each_rebase", () => {
+    const s = stretched();
+    const all = [...s.masked, ...s.fresh];
+    const before = Float32Array.from(s.v.positions());
+    const center: [number, number, number] = [0, 0, 0.7];
+    // The field the region reads now, then one that knows the next split's vertices.
+    let held = fieldOf(s, s.masked);
+    const region = new GrabRegion(s.v.positions(), s.v.indices(), center, 1.5, "smooth", 1, s.scene.origin(s.mesh), () => held);
+    held = fieldOf(s, all);
+    region.rebase(s.v.positions(), s.v.indices());
+    const inRegion = new Set(region.ids);
+    expect(all.some((id) => inRegion.has(id))).toBe(false);
+    for (let k = 1; k <= 6; k++) {
+      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0.1 * k, 0, 0]) }]);
+      const report = s.scene.repair(s.mesh, { op: "splitStretched", center, radius: 3, maxSplits: 200 });
+      // In the order the stroke goes: the split joins the mask, then the region is taken again.
+      const set = new Set(all);
+      const more = inheritedSplits((id) => set.has(id), report.vertices);
+      all.push(...more);
+      held = fieldOf(s, all);
+      region.rebase(s.v.positions(), s.v.indices(), report.vertices);
+      // And again with no split list, as after a pass that reports nothing.
+      region.rebase(s.v.positions(), s.v.indices());
+      const taken = new Set(region.ids);
+      expect(all.some((id) => taken.has(id))).toBe(false);
+      expect(movedOf(before, s.v.positions(), [...s.masked, ...s.fresh])).toBe(0);
+    }
+    expect(region.ids.length).toBeGreaterThan(0);
+  });
+
+  it("does_not_make_the_mask_stale_when_undo_takes_them", () => {
+    const s = stretched();
+    const vertices = Uint32Array.from([...s.masked, ...s.fresh].sort((a, b) => a - b));
+    const slots = s.v.positions().length / 3;
+    s.scene.undo();
+    const now = s.v.indices();
+    const inherited = new Set(s.fresh);
+    expect(maskUsable({ vertices, slots, inherited }, now, s.v.positions().length / 3)).toBe(true);
+    // Without the note it would read as a topology edit taking a masked vertex.
+    expect(maskUsable({ vertices, slots }, now, s.v.positions().length / 3)).toBe(false);
   });
 });
 

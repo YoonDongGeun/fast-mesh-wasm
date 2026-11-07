@@ -113,6 +113,8 @@ export function installTestHook(
       const m = app.getSnapshot().sculptMask;
       return m === null ? null : Array.from(m.vertices);
     },
+    /** The mask's slots added by splits, not painted. */
+    sculptMaskInherited: () => Array.from(app.getSnapshot().sculptMask?.inherited ?? []),
     /** Why the mask was last cleared against its will, if it was. */
     sculptMaskNotice: () => app.getSnapshot().sculptMaskNotice,
     /** Sets the mesh's base colour (`null` restores the one it had), like a project load does. */

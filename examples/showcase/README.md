@@ -141,7 +141,7 @@ short session with `?local` (the group's readouts included). It fails on any con
 The mask session (`scripts/showcase-mask-check.mjs`, `--big` adds the cost at 1M triangles) compares
 screenshots: the tint appears where painted, follows invert, hide and clear, reads on light and dark
 meshes, and leaves a heatmap's pixels alone. A dab on the mask's edge moves free vertices only and
-leaves masked positions byte-identical. Sculpt remeshes stand down where their region meets the mask.
+leaves masked positions byte-identical. The optional stroke-end remesh stands down where it could reach the mask; live splits run over it, and a split between masked vertices joins the mask.
 
 The touch session runs with phone metrics and multi-touch input through `Input.dispatchTouchEvent`,
 and asserts on the camera: one finger orbits, two pinch and pan, a second finger never starts a tool
