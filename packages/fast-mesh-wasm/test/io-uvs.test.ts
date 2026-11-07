@@ -440,6 +440,21 @@ describe("Draco", () => {
     expect(mesh.uvsSkipped).toMatch(/sparse/);
   });
 
+  it("reports a sparse plain TEXCOORD_0 without a buffer view beside a Draco primitive", async () => {
+    const s = new Scene();
+    const m = s.addMesh(SEAM.positions, SEAM.indices, { normals: false });
+    const doc = jsonOf(await exportGLTF(s, m, { ...(await options()), binary: false }));
+    s.free();
+    doc.meshes[0].primitives[0].attributes.TEXCOORD_0 = doc.accessors.length;
+    const sparse = { count: 1, indices: { bufferView: 0, componentType: 5123 }, values: { bufferView: 0 } };
+    doc.accessors.push({ componentType: 5126, count: 8, type: "VEC2", sparse });
+    const bytes = new TextEncoder().encode(JSON.stringify(doc));
+    const [mesh] = await importGLTFAsync(bytes, { decoderModule: await decoder });
+    expect(mesh.indices.length).toBe(SEAM.indices.length);
+    expect(mesh.uvs).toBeNull();
+    expect(mesh.uvsSkipped).toMatch(/sparse/);
+  });
+
   it("a bad TEXCOORD_0 id is an error", async () => {
     const s = new Scene();
     const doc = jsonOf(await exportGLTF(s, seamScene(s), { ...(await options()), binary: false }));
