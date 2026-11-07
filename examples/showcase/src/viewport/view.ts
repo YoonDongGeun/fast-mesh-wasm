@@ -27,6 +27,12 @@ export const view: {
   orbit: TrackballControls | null;
   /** True while the gizmo drags. */
   dragging: boolean;
+  /**
+   * A sculpt stroke is out, from its press until all it sent has landed. Undo
+   * and redo wait: a stroke writes from what it captured at the press, so the
+   * next move would write an undo straight back, inside its region only.
+   */
+  stroking: boolean;
   /** Called with `dragging` whenever it changes. */
   dragListeners: Set<(dragging: boolean) => void>;
   /** The vertex under the pointer while hovering is on (Group mode), else `null`. */
@@ -50,6 +56,7 @@ export const view: {
   gizmo: null,
   orbit: null,
   dragging: false,
+  stroking: false,
   dragListeners: new Set(),
   hover: null,
   hoverListeners: new Set(),
