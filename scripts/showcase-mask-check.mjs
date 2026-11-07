@@ -31,6 +31,7 @@
 // - quick: a release before the press's raycast answers still paints that press, and
 //   moving after it paints nothing.
 // - busy: so does a press whose down and up wait out a long frame together.
+// - busy-stroke: a sculpt press through a long frame dabs too, and leaves no stroke open.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
 // - inherit: on a lump stretched before it was masked, a live split between masked
@@ -405,6 +406,19 @@ try {
   const cleared = await diff("base", "cleared", 8);
   verdict("clear", cleared.count === 0 && (await hook("sculpt().maskOverlay.triangles")) === 0, `${cleared.count} pixels differ from the base`);
 
+  /** A 150 ms press whose down and up a long frame holds back, so they run together. */
+  async function pressInLongFrame(at) {
+    await mouse("mouseMoved", at.x, at.y, { button: "none" });
+    await sleep(150);
+    await page(`(setTimeout(() => { const t = performance.now(); while (performance.now() - t < 500); }), true)`);
+    await sleep(50);
+    const events = [mouse("mousePressed", at.x, at.y, { buttons: 1 })];
+    await sleep(150);
+    events.push(mouse("mouseReleased", at.x, at.y, { buttons: 0 }));
+    await Promise.all(events);
+    await sleep(300);
+  }
+
   // ---- quick: a release before the press's raycast answers still paints it, and ends it ----
   await mouse("mouseMoved", center.x, center.y, { button: "none" });
   await sleep(150);
@@ -425,15 +439,7 @@ try {
   await clickOn('[data-action="sculpt-mask-clear"]');
 
   // ---- busy: a long frame holds the down and the up until they run together ----
-  await mouse("mouseMoved", center.x, center.y, { button: "none" });
-  await sleep(150);
-  await page(`(setTimeout(() => { const t = performance.now(); while (performance.now() - t < 500); }), true)`);
-  await sleep(50);
-  const busyPress = [mouse("mousePressed", center.x, center.y, { buttons: 1 })];
-  await sleep(150);
-  busyPress.push(mouse("mouseReleased", center.x, center.y, { buttons: 0 }));
-  await Promise.all(busyPress);
-  await sleep(300);
+  await pressInLongFrame(center);
   const busyMasked = (await hook("sculptMask()"))?.length ?? 0;
   const busySelected = await page("__showcase.selected()");
   verdict("busy", busyMasked > 0 && busySelected === A, `${busyMasked} masked by a press in a long frame; selected ${q(busySelected)}`);
@@ -555,6 +561,27 @@ try {
     s3.maskedDabs > s2.maskedDabs && sameOver(p3, p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
     `${s3.maskedDabs - s2.maskedDabs} of ${s3.dabs - s2.dabs} moved nothing; positions unchanged ${sameOver(p3, p0)}`,
   );
+
+  // ---- busy-stroke: a sculpt press through a long frame still dabs, and ends ----
+  const busy0 = await hook("sculpt()");
+  await pressInLongFrame(edge);
+  await sleep(600);
+  const busy1 = await hook("sculpt()");
+  for (let k = 1; k <= 10; k++) {
+    await mouse("mouseMoved", edge.x + 4 * k, edge.y, { button: "none" });
+    await sleep(60);
+  }
+  await sleep(300);
+  const busy2 = await hook("sculpt()");
+  verdict(
+    "busy-stroke",
+    busy1.dabs > busy0.dabs && busy2.dabs === busy1.dabs,
+    `${busy1.dabs - busy0.dabs} dab(s) from a press in a long frame, ${busy2.dabs - busy1.dabs} from moving on`,
+  );
+  if (busy1.dabs > busy0.dabs) {
+    await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+    await sleep(300);
+  }
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await clickOn('[data-action="sculpt-mask-paint"]');
   await clickOn('[data-action="sculpt-mask-clear"]');
@@ -699,7 +726,7 @@ try {
   await sleep(500);
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
-  const staleBefore = (await hook("sculpt()")).maskStale;
+  const { maskStale: staleBefore, strokes: staleStrokes } = await hook("sculpt()");
   const onMesh = await hook(`screenPoint(${q(A)})`);
   await stroke(onMesh, 200);
   await frames();
@@ -708,7 +735,7 @@ try {
   verdict(
     "stale",
     (await hook("sculptMask()")) === null && typeof notice === "string" && (await hook("sculpt()")).maskStale === staleBefore + 1 && staleTris === 0,
-    `simplify ${q(simplified)}; mask ${q((await hook("sculptMask()"))?.length ?? null)}, notice ${q(notice)}; tint triangles ${staleTris}`,
+    `simplify ${q(simplified)}; mask ${q((await hook("sculptMask()"))?.length ?? null)}, notice ${q(notice)}; tint triangles ${staleTris}; ${(await hook("sculpt()")).strokes - staleStrokes} stroke(s)`,
   );
   await clickOn('[data-action="sculpt-tool-inflate"]');
 

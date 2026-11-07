@@ -1274,7 +1274,7 @@ function SculptLayer(props: {
             // The gizmo's own pointerdown runs first (its listeners attached
             // first): a grab there owns the gesture, not a stroke. A second
             // finger landed meanwhile: the camera's pinch owns it.
-            if (!alive || active !== -1 || pressing !== e.pointerId || view.dragging || view.multiTouch) {
+            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
             const brush = brushRef.current;
@@ -1392,6 +1392,12 @@ function SculptLayer(props: {
               }
             }
             syncDabs();
+            // Released meanwhile (a long frame runs the down and the up together): the
+            // press keeps its dab, but its release has gone by, so nothing else ends the stroke.
+            if (pressing !== e.pointerId) {
+              endStroke();
+              return;
+            }
             clearInterval(buildup);
             let builtAt = performance.now();
             buildup = setInterval(() => {
