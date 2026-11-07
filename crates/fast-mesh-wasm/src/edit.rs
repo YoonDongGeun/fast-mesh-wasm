@@ -43,6 +43,11 @@
 //! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles`.
 //! - `7` remesh: `cx, cy, cz, radius, target_length (NaN for the mesh mean),
 //!   max_rounds (NaN for the default), split_only (0 or 1)`.
+//! - `16` split stretched: `cx, cy, cz, radius, limit (NaN for the default),
+//!   max_splits (NaN for the default), smooth (0 or 1)`; see
+//!   [`fast_mesh_ops::stretch`].
+//! - `17` capture rest sizes: no values. Must be the only operation of its
+//!   list, because it is not an edit.
 //! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
 //!   ids are taken from `loops`.
 //! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
@@ -85,6 +90,8 @@
 //!   vertices_removed`.
 //! - simplify: `collapsed, triangles_removed, vertices_removed`.
 //! - subdivide: `vertices_added, triangles_added`.
+//! - split stretched: `splits, remaining`.
+//! - capture rest sizes: nothing.
 //!
 //! # Analysis
 //!
@@ -96,6 +103,7 @@ use fast_mesh_ops::deform::{
 };
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
 use fast_mesh_ops::simplify::SimplifyOptions;
+use fast_mesh_ops::stretch::StretchOptions;
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
     Analysis, AutoRepairOptions, AutoRepairStage, ComponentOptions, DegenerateOptions, FailReason,
@@ -408,6 +416,9 @@ pub(crate) enum RepairOp {
     Simplify(SimplifyOptions),
     Subdivide(SubdivideOptions),
     Auto(AutoRepairOptions),
+    SplitStretched(StretchOptions),
+    /// Not an edit: `WasmScene::repair` runs it outside the transaction.
+    CaptureRest,
 }
 
 /// A flag: 0 or 1.
@@ -651,6 +662,26 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 o.fair = flag(fair)?;
             }
             RepairOp::Auto(o)
+        } else if code == 16.0 {
+            let [cx, cy, cz, radius, limit, max_splits, smooth]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let mut o = StretchOptions {
+                region: Region {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                },
+                smooth: flag(smooth)?,
+                ..StretchOptions::default()
+            };
+            if let Some(limit) = bound(limit) {
+                o.limit = limit as f32;
+            }
+            if let Some(max_splits) = count_opt(max_splits, "maxSplits")? {
+                o.max_splits = u32::try_from(max_splits).unwrap_or(u32::MAX);
+            }
+            RepairOp::SplitStretched(o)
+        } else if code == 17.0 {
+            RepairOp::CaptureRest
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -802,6 +833,11 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                 let r = fast_mesh_ops::deform::smooth(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
+            RepairOp::SplitStretched(o) => {
+                let r = fast_mesh_ops::stretch::split_stretched(tx, o)?;
+                put(&mut out, &[count(r.splits), count(r.remaining)])?;
+            }
+            RepairOp::CaptureRest => {}
             RepairOp::Remesh(o) => {
                 let r = fast_mesh_ops::remesh::remesh(tx, o)?;
                 put(
@@ -1124,6 +1160,46 @@ mod tests {
         assert_eq!(code(&[3.], &[1]), codes::INVALID_ARGUMENT);
         assert_eq!(
             code(&[4., nan, nan, nan, 1., 0., 1., nan], &[1, 2, 3]),
+            codes::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn decode_repair_split_stretched() {
+        use fast_mesh_ops::remesh::Region;
+        use fast_mesh_ops::stretch::StretchOptions;
+        let nan = f64::NAN;
+        let region = Region {
+            center: [1.0, 2.0, 3.0],
+            radius: 4.0,
+        };
+        assert_eq!(
+            decode_repair(&[16., 1., 2., 3., 4., nan, nan, 1.], &[]).unwrap(),
+            vec![RepairOp::SplitStretched(StretchOptions {
+                region,
+                ..StretchOptions::default()
+            })]
+        );
+        assert_eq!(
+            decode_repair(&[16., 1., 2., 3., 4., 2., 7., 0.], &[]).unwrap(),
+            vec![RepairOp::SplitStretched(StretchOptions {
+                region,
+                limit: 2.0,
+                max_splits: 7,
+                smooth: false,
+            })]
+        );
+        assert_eq!(
+            decode_repair(&[17.], &[]).unwrap(),
+            vec![RepairOp::CaptureRest]
+        );
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(
+            code(&[16., 1., 2., 3., 4., nan, nan, 2.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[16., 1., 2., 3., 4., nan, -1., 1.]),
             codes::INVALID_ARGUMENT
         );
     }

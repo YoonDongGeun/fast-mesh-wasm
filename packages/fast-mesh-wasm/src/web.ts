@@ -115,6 +115,8 @@ export {
   type SimplifyReport,
   type SmoothReport,
   type SubdivideReport,
+  type StretchReport,
+  type CaptureRestReport,
   type VertexSelection,
   type WeldReport,
 } from "./scene.js";
