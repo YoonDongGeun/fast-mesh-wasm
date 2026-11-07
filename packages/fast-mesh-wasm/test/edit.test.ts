@@ -859,11 +859,20 @@ describe("analyze and repair", () => {
     expect(pass).toThrow();
     s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
     expect(pass().splits).toBe(0);
-    // Undoing past the capture forgets it, and the next one sees the original.
+    // Undoing the simplify brings back the sizes from before it, still true.
     expect(s.undo()).toBe(true);
-    expect(pass).toThrow();
-    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
     expect(pass().splits).toBe(0);
+
+    // Undoing an edit from before the capture forgets it.
+    const fresh = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+    const passFresh = () => s.repair(fresh, { op: "splitStretched", center, radius: 1000 });
+    s.repair(fresh, { op: "simplify", targetTriangles: 200 });
+    s.repair(fresh, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(passFresh().splits).toBe(0);
+    expect(s.undo()).toBe(true);
+    expect(passFresh).toThrow();
+    s.repair(fresh, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(passFresh().splits).toBe(0);
   });
 
   it("bridgeLoops_joins_two_rims", () => {
