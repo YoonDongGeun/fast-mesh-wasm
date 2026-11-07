@@ -191,6 +191,9 @@ export class MaskOverlay {
     const next = maskOverlayBuild(masked, index.array as ArrayLike<number>, slots, prev);
     this.#buffers = next;
     this.#upload(prev, next);
+    if (this.#geometry.getAttribute("position") !== position) {
+      this.#geometry.setAttribute("position", position);
+    }
     return true;
   }
 
@@ -220,6 +223,11 @@ export class MaskOverlay {
   }
 
   #upload(prev: MaskOverlayBuffers | null, next: MaskOverlayBuffers): void {
+    const current = this.#geometry.getIndex();
+    if (prev !== null && (prev.colors !== next.colors || (current !== null && current.array !== next.indices))) {
+      // A replaced array: disposing the geometry holding the old attribute is what frees its GL buffer.
+      this.#replaceGeometry();
+    }
     if (prev?.colors !== next.colors) {
       this.#geometry.setAttribute("color", new THREE.BufferAttribute(next.colors, 4, true));
     } else if (next.changed[0] < next.changed[1]) {
@@ -227,12 +235,12 @@ export class MaskOverlay {
       color.addUpdateRange(next.changed[0], next.changed[1] - next.changed[0]);
       color.needsUpdate = true;
     }
-    const current = this.#geometry.getIndex();
-    if (current === null || current.array !== next.indices) {
+    const held = this.#geometry.getIndex();
+    if (held === null || held.array !== next.indices) {
       this.#geometry.setIndex(new THREE.BufferAttribute(next.indices, 1));
     } else if (next.count > 0) {
-      current.addUpdateRange(0, next.count);
-      current.needsUpdate = true;
+      held.addUpdateRange(0, next.count);
+      held.needsUpdate = true;
     }
     this.#geometry.setDrawRange(0, next.count);
   }

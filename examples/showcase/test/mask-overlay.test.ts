@@ -121,6 +121,36 @@ describe("MaskOverlay", () => {
     third.dispose(); // No listener left behind to trip on.
   });
 
+  it("frees_replaced_colour_and_index_buffers", () => {
+    const m = host(400);
+    const overlay = new MaskOverlay(m);
+    overlay.sync([0]);
+    const small = overlayMesh(m).geometry;
+    let freed = false;
+    const smallIndex = small.getIndex();
+    small.addEventListener("dispose", () => {
+      // three drops the GL buffer of each attribute still on a disposed geometry.
+      freed = small.getIndex() === smallIndex;
+    });
+    // More triangles than the first index array holds: a new array, and a new attribute.
+    overlay.sync(Uint32Array.from({ length: 802 }, (_, i) => i));
+    expect(overlayMesh(m).geometry.getIndex()).not.toBe(smallIndex);
+    expect(freed).toBe(true);
+    // The grown slots: a new colour array too.
+    const position = new THREE.BufferAttribute(new Float32Array(3 * 900), 3);
+    m.geometry.setAttribute("position", position);
+    const mid = overlayMesh(m).geometry;
+    const midColor = mid.getAttribute("color");
+    let colorFreed = false;
+    mid.addEventListener("dispose", () => {
+      colorFreed = mid.getAttribute("color") === midColor;
+    });
+    overlay.sync(Uint32Array.of(0));
+    expect(overlayMesh(m).geometry.getAttribute("color")).not.toBe(midColor);
+    expect(colorFreed).toBe(true);
+    expect(overlayMesh(m).geometry.getAttribute("position")).toBe(position);
+  });
+
   it("clips_with_the_solid", () => {
     const m = host(2);
     const overlay = new MaskOverlay(m);
