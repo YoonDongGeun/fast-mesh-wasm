@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PREVIEW_SIZE, PreviewQueue, type PreviewHost, PreviewRender, type PreviewSource } from "../src/panels/mesh-preview";
+import { PREVIEW_SIZE, PreviewQueue, type PreviewHost, PreviewRender, type PreviewSource, turnChanged } from "../src/panels/mesh-preview";
 
 /** A closed axis-aligned box, its corners about `at`. */
 function box(at: [number, number, number], half: [number, number, number]) {
@@ -128,6 +128,29 @@ describe("PreviewRender", () => {
     expect(blue).toBeGreaterThan(100);
   });
 
+  it("draws a rotated placement like the same mesh with its vertices rotated", () => {
+    const mesh = box([0, 0, 0], [1, 2, 3]);
+    // A quarter turn about y, written out: (x, y, z) -> (z, y, -x).
+    const turned = new Float32Array(mesh.positions.length);
+    for (let i = 0; i < mesh.positions.length; i += 3) {
+      turned[i] = mesh.positions[i + 2];
+      turned[i + 1] = mesh.positions[i + 1];
+      turned[i + 2] = -mesh.positions[i];
+    }
+    const matrix = [0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 5, 6, 7, 1];
+    const placed = draw(source(mesh, 0x6ea8d9, matrix));
+    expect(placed).toEqual(draw(source({ positions: turned, indices: mesh.indices })));
+    expect(placed).not.toEqual(draw(source(mesh)));
+  });
+
+  it("has no image when every triangle collapsed to a line: nothing would show", () => {
+    const line = new PreviewRender([
+      source({ positions: new Float32Array([0, 0, 0, 1, 1, 1, 2, 2, 2]), indices: new Uint32Array([0, 1, 2]) }),
+    ]);
+    line.step(Infinity);
+    expect(line.image()).toBeNull();
+  });
+
   it("has no image without a drawable triangle: empty, flat to a point, or not finite", () => {
     const empty = new PreviewRender([source({ positions: new Float32Array(0), indices: new Uint32Array(0) })]);
     empty.step(Infinity);
@@ -140,6 +163,30 @@ describe("PreviewRender", () => {
     const point = new PreviewRender([source({ positions: new Float32Array(9).fill(2), indices: new Uint32Array([0, 1, 2]) })]);
     point.step(Infinity);
     expect(point.image()).toBeNull();
+  });
+});
+
+describe("turnChanged", () => {
+  const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  it("ignores a move: the picture is framed on the mesh", () => {
+    expect(turnChanged(identity, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 9, 8, 7, 1])).toBe(false);
+  });
+  it("ignores rounding: a move recomposes the matrix from its rotation", () => {
+    const m = [0.6, 0, -0.8, 0, 0, 1, 0, 0, 0.8, 0, 0.6, 0, 0, 0, 0, 1];
+    const rounded = m.map((v) => v * (1 + 2e-16));
+    rounded[12] = 3;
+    expect(turnChanged(m, rounded)).toBe(false);
+  });
+  it("sees a small turn, and a tiny mesh's scale", () => {
+    const c = Math.cos(1e-3);
+    const n = Math.sin(1e-3);
+    expect(turnChanged(identity, [c, 0, -n, 0, 0, 1, 0, 0, n, 0, c, 0, 0, 0, 0, 1])).toBe(true);
+    const tiny = [1e-9, 0, 0, 0, 0, 1e-9, 0, 0, 0, 0, 1e-9, 0, 0, 0, 0, 1];
+    expect(turnChanged(tiny, tiny.map((v, i) => (i === 0 ? 2e-9 : v)))).toBe(true);
+  });
+  it("sees a turn and a scale", () => {
+    expect(turnChanged(identity, [0, 0, -1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1])).toBe(true);
+    expect(turnChanged(identity, [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1])).toBe(true);
   });
 });
 

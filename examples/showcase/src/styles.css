@@ -300,6 +300,15 @@ input[type="range"] {
   border-radius: 3px;
   background: var(--panel);
 }
+.mesh-preview.empty {
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  border: 1px dashed var(--muted);
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+}
 .mesh-name {
   flex: 1;
   min-width: 0;

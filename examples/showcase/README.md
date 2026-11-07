@@ -26,7 +26,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 - **Mesh list.** Name, picture, triangle count, visibility, opacity; select, focus the camera, remove.
   A picture is drawn from the mesh's render views by a small software z-buffer
   (`src/panels/mesh-preview.ts`), in slices of a few milliseconds at idle, and redrawn once edits
-  have stopped for 400 ms and no pointer is pressed on the viewport. The built-in models' buttons show committed pictures
+  or turns have stopped for 400 ms and no pointer is pressed on the viewport. A mesh with nothing left
+  to draw shows an empty state. The built-in models' buttons show committed pictures
   (`public/previews`, about 15 KB in all, regenerated with `node scripts/showcase-previews.mjs --build`
   when a model changes), so showing the list loads no model.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through

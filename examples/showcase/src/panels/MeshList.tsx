@@ -296,10 +296,14 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
           />
         </label>
         <span className="swatch" style={{ background: swatch }} aria-hidden="true" />
-        {preview === null ? (
-          <span className="mesh-preview" aria-hidden="true" />
+        {preview.url !== null ? (
+          <img className="mesh-preview" src={preview.url} alt={`Preview of ${item.name}`} width={36} height={36} />
+        ) : preview.empty ? (
+          <span className="mesh-preview empty" role="img" aria-label={`${item.name} has nothing to draw`} data-preview-empty>
+            empty
+          </span>
         ) : (
-          <img className="mesh-preview" src={preview} alt={`Preview of ${item.name}`} width={36} height={36} />
+          <span className="mesh-preview" aria-hidden="true" />
         )}
         <button
           type="button"

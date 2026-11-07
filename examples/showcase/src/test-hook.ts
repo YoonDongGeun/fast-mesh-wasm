@@ -5,7 +5,7 @@ import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fas
 import * as THREE from "three";
 import type { Engine } from "./App";
 import { inspect } from "./panels/inspect";
-import { drawModelPreview, meshPreviewStats, redrawMeshPreview } from "./panels/mesh-preview";
+import { drawModelPreview, drawRowPreview, meshPreviewStats, redrawMeshPreview } from "./panels/mesh-preview";
 import { settingsFromSnapshot } from "./panels/settings";
 import { collectProject, parseProjectDoc, restoreProject } from "./load/project";
 import { type CollisionCsvRow, collisionRowsToCsv, contoursToDxf, contoursToSvg } from "./load/report";
@@ -55,8 +55,11 @@ export function installTestHook(
     /** The items from `from` on as a built-in model's picture: a data URL, or null with nothing to draw. */
     modelPreview: (from: number, type = "image/png", quality?: number) =>
       drawModelPreview(store.scene, app.getSnapshot().items.slice(from).map((i) => i.mesh))?.toDataURL(type, quality) ?? null,
-    /** The item at `index` drawn as a built-in model's picture, a PNG data URL (null with nothing to draw). */
-    rowPreview: (index: number) => drawModelPreview(store.scene, [app.getSnapshot().items[index].mesh])?.toDataURL() ?? null,
+    /** The item at `index` drawn as its row draws it, a PNG data URL (null with nothing to draw). */
+    rowPreview: (index: number) => {
+      const item = app.getSnapshot().items[index];
+      return drawRowPreview(store.scene, item.mesh, item.color)?.toDataURL() ?? null;
+    },
     /** A mesh's stored positions, as the engine holds them. */
     positions: (name: string) => Array.from(store.scene.views(find(name).mesh).positions()),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
