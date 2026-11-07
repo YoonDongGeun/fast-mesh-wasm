@@ -23,7 +23,12 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   bit-identical positions share a vertex.
 - **Demo meshes.** A (a blobby sphere), B (a rounded box penetrating A) and C (a shell with two holes
   and a floating piece) are generated in the same Worker when the app opens.
-- **Mesh list.** Name, triangle count, visibility, opacity; select, focus the camera, remove.
+- **Mesh list.** Name, picture, triangle count, visibility, opacity; select, focus the camera, remove.
+  A picture is drawn from the mesh's render views by a small software z-buffer
+  (`src/panels/mesh-preview.ts`), in slices of a few milliseconds at idle, and redrawn once edits
+  have stopped for 400 ms. The built-in models' buttons show committed pictures
+  (`public/previews`, about 15 KB in all, regenerated with `node scripts/showcase-previews.mjs --build`
+  when a model changes), so showing the list loads no model.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.

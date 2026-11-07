@@ -147,6 +147,23 @@ button.link {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+.model-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0;
+}
+.model-group > span {
+  flex-basis: 100%;
+}
+button.model-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 72px;
+  line-height: 1.2;
+  text-underline-offset: 2px;
+}
 button:hover:not(:disabled) {
   border-color: #4a5260;
 }
@@ -275,6 +292,13 @@ input[type="range"] {
   width: 10px;
   height: 10px;
   border-radius: 50%;
+}
+.mesh-preview {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 3px;
+  background: var(--panel);
 }
 .mesh-name {
   flex: 1;

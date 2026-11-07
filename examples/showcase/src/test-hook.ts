@@ -5,6 +5,7 @@ import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fas
 import * as THREE from "three";
 import type { Engine } from "./App";
 import { inspect } from "./panels/inspect";
+import { drawModelPreview, meshPreviewStats, redrawMeshPreview } from "./panels/mesh-preview";
 import { settingsFromSnapshot } from "./panels/settings";
 import { collectProject, parseProjectDoc, restoreProject } from "./load/project";
 import { type CollisionCsvRow, collisionRowsToCsv, contoursToDxf, contoursToSvg } from "./load/report";
@@ -47,6 +48,15 @@ export function installTestHook(
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
         visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
+    /** What the mesh's list picture cost, and how many were started and finished. */
+    meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
+    /** Draws the mesh's list picture again now, as an edit would after its quiet time. */
+    redrawMeshPreview: (name: string) => redrawMeshPreview(find(name).mesh),
+    /** The items from `from` on as a built-in model's picture: a data URL, or null with nothing to draw. */
+    modelPreview: (from: number, type = "image/png", quality?: number) =>
+      drawModelPreview(store.scene, app.getSnapshot().items.slice(from).map((i) => i.mesh))?.toDataURL(type, quality) ?? null,
+    /** The item at `index` drawn as a built-in model's picture, a PNG data URL (null with nothing to draw). */
+    rowPreview: (index: number) => drawModelPreview(store.scene, [app.getSnapshot().items[index].mesh])?.toDataURL() ?? null,
     /** A mesh's stored positions, as the engine holds them. */
     positions: (name: string) => Array.from(store.scene.views(find(name).mesh).positions()),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),

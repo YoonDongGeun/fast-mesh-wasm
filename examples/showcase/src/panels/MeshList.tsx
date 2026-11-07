@@ -11,6 +11,7 @@ import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { useMeshPreview } from "./mesh-preview";
 import { IMPORT_UNITS, importScaleFromFactor, importScaleOf, isImportUnit, parseImportScale } from "./units";
 
 const PHASE: Record<Job["phase"], string> = {
@@ -79,48 +80,39 @@ export function MeshList(props: {
       </header>
       <p className="muted small">STL (binary, ASCII), OBJ, PLY (ASCII, binary), DICOM series. Or drop files anywhere.</p>
       <ImportScaleControl app={app} />
-      <p className="muted small">
-        DICOM demos:{" "}
+      <div className="muted small model-group">
+        <span>DICOM demos:</span>
         {(Object.keys(PHANTOM_NAMES) as PhantomKind[]).map((kind) => (
-          <button
+          <ModelButton
             key={kind}
-            type="button"
-            className="link"
-            data-action={`dicom-demo-${kind}`}
+            action={`dicom-demo-${kind}`}
+            name={PHANTOM_NAMES[kind]}
             title={`Mesh a procedural ${PHANTOM_NAMES[kind].toLowerCase()} DICOM series`}
             onClick={() => onLoadPhantom(kind)}
-          >
-            {PHANTOM_NAMES[kind]}
-          </button>
+          />
         ))}
-      </p>
-      <p className="muted small">
-        Sample CT:{" "}
+      </div>
+      <div className="muted small model-group">
+        <span>Sample CT:</span>
         {(Object.keys(SAMPLE_NAMES) as SampleKind[]).map((kind) => (
-          <button
+          <ModelButton
             key={kind}
-            type="button"
-            className="link"
-            data-action={`sample-${kind}`}
+            action={`sample-${kind}`}
+            name={SAMPLE_NAMES[kind]}
             title={`Mesh the bundled ${SAMPLE_NAMES[kind].toLowerCase()} CT series`}
             onClick={() => onLoadSample(kind)}
-          >
-            {SAMPLE_NAMES[kind]}
-          </button>
+          />
         ))}
-      </p>
-      <p className="muted small">
-        Demo meshes:{" "}
-        <button
-          type="button"
-          className="link"
-          data-action="demo-meshes"
+      </div>
+      <div className="muted small model-group">
+        <span>Demo meshes:</span>
+        <ModelButton
+          action="demo-meshes"
+          name="A/B/C"
           title="Generate the demo meshes A, B and C"
           onClick={() => onLoadDemo()}
-        >
-          A/B/C
-        </button>
-      </p>
+        />
+      </div>
       <label
         className="check small"
         title={`Past ${formatTriangles(big.decimateTriangles)} a load is simplified to ${big.decimateTarget.toLocaleString("en")} triangles (the simplify op)`}
@@ -201,6 +193,27 @@ export function MeshList(props: {
 }
 
 /**
+ * A built-in model's button: its committed picture (public/previews, from
+ * scripts/showcase-previews.mjs, named after `action`) and name. Showing it
+ * loads no model.
+ */
+function ModelButton(props: { action: string; name: string; title: string; onClick: () => void }) {
+  const { action, name, title, onClick } = props;
+  return (
+    <button type="button" className="link model-card" data-action={action} title={title} onClick={onClick}>
+      <img
+        src={`${import.meta.env.BASE_URL}previews/${action}.webp`}
+        alt={`Preview of ${name}`}
+        width={48}
+        height={48}
+        decoding="async"
+      />
+      {name}
+    </button>
+  );
+}
+
+/**
  * What files loaded from here on are assumed to be in: a unit, or any factor
  * to millimetres. Multiplies the geometry once, on load (files and drops; a
  * DICOM series states its own spacing). Meshes already loaded stay as they are.
@@ -269,6 +282,7 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
   const multi = useApp(app, (s) => s.multi);
   const secondary = !selected && multi.includes(item.mesh);
   const swatch = `#${item.color.toString(16).padStart(6, "0")}`;
+  const preview = useMeshPreview(store, item);
 
   return (
     <li className={selected ? "mesh selected" : secondary ? "mesh secondary" : "mesh"} data-mesh={item.name}>
@@ -282,6 +296,11 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
           />
         </label>
         <span className="swatch" style={{ background: swatch }} aria-hidden="true" />
+        {preview === null ? (
+          <span className="mesh-preview" aria-hidden="true" />
+        ) : (
+          <img className="mesh-preview" src={preview} alt={`Preview of ${item.name}`} width={36} height={36} />
+        )}
         <button
           type="button"
           className="mesh-name"
