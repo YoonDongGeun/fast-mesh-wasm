@@ -855,9 +855,10 @@ function SculptLayer(props: {
     };
 
     /**
-     * Whether a remesh of this region would touch the mask. A remesh moves,
-     * and can collapse, what it covers, so it stands down there: the engine's
-     * remesh has no pinned vertices, and the mask promises they stay.
+     * Whether a stroke-end remesh of this region would touch the mask. A full
+     * pass can collapse what it covers, so it stands down there: the engine's
+     * remesh has no pinned vertices, and the mask promises they stay. The live
+     * pass needs no such check: it only splits, which keeps every id and position.
      */
     const remeshMeetsMask = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }): boolean => {
       const gated = maskLive(mesh);

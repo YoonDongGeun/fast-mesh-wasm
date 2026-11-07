@@ -25,6 +25,8 @@
 //   mask's vertices stay put with the stroke-end remesh on, which stands down.
 // - grab: a grab pressed on the mask's edge drags free vertices and leaves masked
 //   positions byte-identical through the whole stroke; undo restores them.
+// - live: a stroke's live split pass runs over the mask and leaves its vertices
+//   alone; the stroke-end remesh stands down.
 // - covered: a dab with only masked vertices in its ball is dropped: no undo step.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
@@ -397,11 +399,13 @@ try {
   const freeMoved = (a, b) => {
     const set = new Set(held);
     let n = 0;
-    for (let v = 0; v < a.length / 3; v++) {
+    for (let v = 0; v < Math.min(a.length, b.length) / 3; v++) {
       if (!set.has(v) && (a[3 * v] !== b[3 * v] || a[3 * v + 1] !== b[3 * v + 1] || a[3 * v + 2] !== b[3 * v + 2])) n++;
     }
     return n;
   };
+  /** The same positions over the first `b`'s slots: undoing a split leaves its slots, dead. */
+  const sameOver = (a, b) => b.every((x, i) => a[i] === x);
   const stroke = async (at, ms) => {
     await mouse("mouseMoved", at.x, at.y, { button: "none" });
     await sleep(200);
@@ -414,15 +418,22 @@ try {
   const s0 = await hook("sculpt()");
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
-  await stroke(edge, 500);
+  // Held until a live split pass ran, however slow the runner.
+  await mouse("mouseMoved", edge.x, edge.y, { button: "none" });
+  await sleep(200);
+  await mouse("mousePressed", edge.x, edge.y, { buttons: 1 });
+  const lived = await waitFor(`__showcase.sculpt().liveRemeshes > ${s0.liveRemeshes}`, 15_000);
+  await sleep(300);
+  await mouse("mouseReleased", edge.x, edge.y, { buttons: 0 });
+  await sleep(600);
   const p1 = await positions();
   const s1 = await hook("sculpt()");
   await shot("edge-dabbed");
   const stillMasked = await hook("sculptMask()");
   verdict(
     "protect",
-    s1.dabs > s0.dabs && s1.maskedDabs === s0.maskedDabs && heldMoved(p0, p1) === 0 && freeMoved(p0, p1) > 0 && q(stillMasked) === q(held) && p1.length === p0.length,
-    `${s1.dabs - s0.dabs} dabs, ${s1.maskedDabs - s0.maskedDabs} dropped; ${heldMoved(p0, p1)} of ${held.length} masked moved, ${freeMoved(p0, p1)} free moved; slots ${p0.length / 3} -> ${p1.length / 3}; remeshes ${s1.remeshes - s0.remeshes}`,
+    s1.dabs > s0.dabs && s1.maskedDabs === s0.maskedDabs && heldMoved(p0, p1) === 0 && freeMoved(p0, p1) > 0 && q(stillMasked) === q(held) && lived === true && s1.remeshes === s0.remeshes,
+    `${s1.dabs - s0.dabs} dabs, ${s1.maskedDabs - s0.maskedDabs} dropped; ${heldMoved(p0, p1)} of ${held.length} masked moved, ${freeMoved(p0, p1)} free moved; slots ${p0.length / 3} -> ${p1.length / 3}; live passes ${s1.liveRemeshes - s0.liveRemeshes}, stroke-end remeshes ${s1.remeshes - s0.remeshes}`,
   );
 
   // ---- undo: every position back, the mask kept ----
@@ -431,12 +442,12 @@ try {
     await page(`(document.querySelector("[data-action=undo]").click(), true)`);
     undos++;
     await sleep(40);
-    if (q(await positions()) === q(p0)) {
+    if (sameOver(await positions(), p0)) {
       break;
     }
   }
   const p2 = await positions();
-  verdict("undo", q(p2) === q(p0) && q(await hook("sculptMask()")) === q(held), `${undos} undo(s) back to the painted positions; mask kept ${q(await hook("sculptMask()")) === q(held)}`);
+  verdict("undo", sameOver(p2, p0) && q(await hook("sculptMask()")) === q(held), `${undos} undo(s) back to the painted positions; mask kept ${q(await hook("sculptMask()")) === q(held)}`);
 
   // ---- grab: a press on the mask's edge drags only free vertices ----
   await clickOn('[data-action="sculpt-tool-grab"]');
@@ -458,15 +469,15 @@ try {
   grabHeld = Math.max(grabHeld, heldMoved(g0, g1));
   const grabFree = freeMoved(g0, g1);
   let grabUndos = 0;
-  while (grabUndos < 50 && q(await positions()) !== q(g0) && (await page(`document.querySelector("[data-action=undo]")?.disabled === false`))) {
+  while (grabUndos < 50 && !sameOver(await positions(), g0) && (await page(`document.querySelector("[data-action=undo]")?.disabled === false`))) {
     await page(`(document.querySelector("[data-action=undo]").click(), true)`);
     grabUndos++;
     await sleep(60);
   }
   verdict(
     "grab",
-    grabHeld === 0 && grabFree > 0 && q(await positions()) === q(g0),
-    `${grabHeld} of ${held.length} masked moved at worst, ${grabFree} free moved; ${grabUndos} undo(s) restored ${q(await positions()) === q(g0)}`,
+    grabHeld === 0 && grabFree > 0 && sameOver(await positions(), g0),
+    `${grabHeld} of ${held.length} masked moved at worst, ${grabFree} free moved; ${grabUndos} undo(s) restored ${sameOver(await positions(), g0)}`,
   );
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
@@ -485,8 +496,8 @@ try {
   const p3 = await positions();
   verdict(
     "covered",
-    s3.maskedDabs > s2.maskedDabs && s3.dabs === s2.dabs && q(p3) === q(p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
-    `${s3.maskedDabs - s2.maskedDabs} dropped, ${s3.dabs - s2.dabs} applied; positions unchanged ${q(p3) === q(p0)}`,
+    s3.maskedDabs > s2.maskedDabs && s3.dabs === s2.dabs && sameOver(p3, p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
+    `${s3.maskedDabs - s2.maskedDabs} dropped, ${s3.dabs - s2.dabs} applied; positions unchanged ${sameOver(p3, p0)}`,
   );
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await clickOn('[data-action="sculpt-mask-paint"]');
