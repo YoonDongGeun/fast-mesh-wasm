@@ -44,16 +44,19 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 - **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
   signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
-  from*. *Colour from* 0 colours penetration only. Every vertex's distance is exact by default;
-  *Fast mode (large meshes)* bounds the fields at twice the larger of depth and colour from (so the
+  from*. *Colour from* 0 colours penetration only. Every vertex's distance is exact once the pointer
+  stops. While a gizmo drag or a sculpt stroke moves a large mesh (`scene.setFieldInteraction`, about
+  8,192 vertices a field per update), the vertices closest to the contact stay exact, a sweep brings the
+  others along, and they are all recomputed about 200 ms after the pointer stops or at once on release:
+  a few seconds at 1M triangles, in steps, while the page stays live. *Fast mode (large meshes)* bounds the fields at twice the larger of depth and colour from (so the
   coloured area's outer edge still softens with *Boundary softness*), and a deeper
   penetration shows the mesh colour. The colourings are drawn with fragment shading
   (`<FastMesh shading="fragment">`): each pixel is coloured from its interpolated distance, so the
   edge of the coloured area and the contact band are crisp iso-lines rather than blurred across a
   triangle. *Boundary softness* widens them into a blend that many distance units wide (0, the
   default, is a hard edge). Readouts, refreshed at most about four times a second as the
-  meshes change, paused while the gizmo drags (the colours stay live; reading field values would
-  force stale poses up to date) and refreshed when the drag ends:
+  meshes change, paused during a gizmo drag or a sculpt stroke (the colours stay live; reading field
+  values would force stale poses up to date) and refreshed when it ends:
   - **Max penetration**: the deepest negative value of either colouring
     (`store.fetchColoringValues`). In fast mode it is measured within the bound (the panel says
     so), and reads "≥ bound" while the meshes intersect and the deepest value is within 10% of the
@@ -109,7 +112,7 @@ URL options:
 | Option | Effect |
 | --- | --- |
 | `?local` | The synchronous `Scene` on the main thread instead of the Worker scene: queries, repairs and `analyze` (the repair panel's, and the collision warnings') then run on the main thread, so they block the page on a large mesh. The exact depth (the default) recomputes every coloured vertex on the main thread on every drag frame, so dragging large meshes stutters: use *Fast mode* there |
-| `?big` | Demo meshes A and B at about a million triangles each |
+| `?big` | Demo meshes A and B at about a million triangles each; `?big=N` at about N |
 | `?threads=N` | Ask for N engine threads |
 
 The dev and preview servers send the cross-origin isolation headers (COOP/COEP, a middleware in
@@ -123,6 +126,7 @@ node scripts/showcase-check.mjs --threads 4          # a scripted session in hea
 node scripts/showcase-check.mjs --big                # plus a 1M-triangle STL upload (main thread < 50 ms)
 node scripts/showcase-pages-check.mjs                # the Pages build: no headers, the service worker, the fallback
 node scripts/showcase-touch-check.mjs                # phone metrics, real multi-touch input (--shots <dir> saves screenshots)
+node scripts/showcase-heatmap-bench.mjs              # frame and colour update times of a drag and a stroke at 100k and 1M
 ```
 
 The scripted session selects and drags A with the gizmo and undoes it; checks the heatmap of A and

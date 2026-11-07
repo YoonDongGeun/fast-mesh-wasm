@@ -18,8 +18,8 @@ export interface BigFileOptions {
   decimateTarget: number;
   /** Whether heavy loads are decimated automatically (the list's checkbox). */
   decimateOnLoad: boolean;
-  /** `?big`: the demo button loads the ~1M-triangle A/B variants. */
-  demoBig: boolean;
+  /** `?big`: the demo button loads the ~1M-triangle A/B variants; `?big=N`: about N triangles each. */
+  demoBig: boolean | number;
 }
 
 /** Warn past 500k triangles, offer decimation past 1M, down to 200k. */
@@ -63,7 +63,7 @@ export function parseBigFileParams(search: string): BigFileOptions {
     decimateTriangles: num("decimate-tris", BIG_FILE_DEFAULTS.decimateTriangles),
     decimateTarget: num("decimate-target", BIG_FILE_DEFAULTS.decimateTarget),
     decimateOnLoad: params.get("decimate") === "0" ? false : BIG_FILE_DEFAULTS.decimateOnLoad,
-    demoBig: params.has("big"),
+    demoBig: params.has("big") ? num("big", 0) || true : false,
   };
 }
 

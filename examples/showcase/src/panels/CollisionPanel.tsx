@@ -13,6 +13,7 @@ import { type AppState, type CollisionPair, type HeatmapParams, type Item, useAp
 import { clampTolerance, deepestPenetration, niceScale, toleranceLimit } from "./collision-math";
 import { GroupMode } from "./GroupMode";
 import { inspect, type Readouts } from "./inspect";
+import { useFieldInteraction } from "./interaction";
 import { formatLength, formatLengthValue, fromDisplayLength, type LengthUnit, rangeToDisplay } from "./units";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 
@@ -26,6 +27,7 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
   const group = useApp(app, (s) => s.group);
   const shown = mode === "pair" ? [pair.a, pair.b] : group.members;
   const units = useApp(app, (s) => s.units);
+  useFieldInteraction(app, scene);
 
   // The sliders' scale follows the size of the meshes coloured: a file in
   // millimetres and the unit-sized demo meshes both get useful ranges.
