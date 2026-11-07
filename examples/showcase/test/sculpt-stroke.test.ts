@@ -350,6 +350,121 @@ describe("a grab on a mesh away from the world origin", () => {
   });
 });
 
+describe("a remesh during a long grab", () => {
+  it("new_vertices_stay_with_their_neighbours_past_the_drag_where_the_warp_folds", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
+    // Three radii out: the warp folds here, so no position maps back to one rest.
+    const far: Vec = [1.5, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    const slots = v.positions().length / 3;
+    const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 0.8, 0, 0], radius: 3 });
+    expect(v.positions().length / 3).toBeGreaterThan(slots);
+    region.rebase(v.positions(), v.indices(), r.vertices);
+    const further: Vec = [2.5, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    // Each new vertex stays between its neighbours as the lump goes on.
+    const positions = v.positions();
+    const indices = v.indices();
+    const sums = new Float64Array((positions.length / 3) * 4);
+    for (let t = 0; t + 2 < indices.length; t += 3) {
+      const corners = [indices[t], indices[t + 1], indices[t + 2]];
+      for (const a of corners) {
+        for (const b of corners) {
+          if (a !== b) {
+            for (let c = 0; c < 3; c++) {
+              sums[4 * a + c] += positions[3 * b + c];
+            }
+            sums[4 * a + 3]++;
+          }
+        }
+      }
+    }
+    const offAlongDrag = (from: number, to: number) => {
+      let worst = 0;
+      for (let k = from; k < to; k++) {
+        if (sums[4 * k + 3] > 0) {
+          worst = Math.max(worst, Math.abs(sums[4 * k] / sums[4 * k + 3] - positions[3 * k]));
+        }
+      }
+      return worst;
+    };
+    const fresh = offAlongDrag(slots, positions.length / 3);
+    const grabbed = offAlongDrag(0, slots);
+    // A steep lump puts every vertex off its neighbours: the new ones must not
+    // stand out from the old (weights from going back through the drag: three times).
+    expect(fresh).toBeLessThan(1.5 * grabbed);
+  });
+});
+
+describe("a grab released while a live pass is out", () => {
+  it("takes_the_new_vertices_along", async () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
+    // As on the Worker: requests run in the order sent, and answer later.
+    const fifo: (() => void)[] = [];
+    const send = (work: () => void) =>
+      new Promise<void>((resolve) =>
+        fifo.push(() => {
+          work();
+          resolve();
+        }),
+      );
+    const run = async () => {
+      while (fifo.length > 0) {
+        fifo.shift()?.();
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    };
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const stroke = new SculptStroke(sculptBrush("grab", s.mesh, 0.5, 1, "smooth"), {}, () => Promise.resolve());
+    const moveTo = (drag: Vec) =>
+      stroke.move(
+        () => {
+          // The ids and positions are read when it is sent, not when it runs.
+          const vertices = region.ids;
+          const positions = region.positionsAt(drag);
+          return send(() => s.scene.edit(s.mesh, [{ op: "setPositions", vertices, positions }]));
+        },
+        [R + drag[0], drag[1], drag[2]],
+      );
+    moveTo([0.3, 0, 0]);
+    await run();
+    const slots = v.positions().length / 3;
+    let splits: ArrayLike<number> | undefined;
+    void stroke.pass(() =>
+      send(() => {
+        splits = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0, 0], radius: 2 }).vertices;
+      }).then(() => region.rebase(v.positions(), v.indices(), splits)),
+    );
+    // The drag goes on during the pass, and the pointer lets go.
+    moveTo([0.9, 0, 0]);
+    stroke.flush();
+    stroke.end();
+    await run();
+    await stroke.done;
+    await run();
+    const now = v.positions();
+    expect(now.length / 3).toBeGreaterThan(slots);
+    // The tip of the lump is new vertices as well as old: both reach the drag.
+    let oldTip = 0;
+    let newTip = 0;
+    for (let k = 0; k < now.length / 3; k++) {
+      if (k < slots) {
+        oldTip = Math.max(oldTip, now[3 * k]);
+      } else {
+        newTip = Math.max(newTip, now[3 * k]);
+      }
+    }
+    expect(oldTip).toBeGreaterThan(R + 0.8);
+    // Without the rebase behind the pass they stay where the split left them.
+    expect(newTip).toBeGreaterThan(R + 0.4);
+  });
+});
+
 describe("GrabRegion", () => {
   const { positions, indices } = sphere(40, 80, R);
 

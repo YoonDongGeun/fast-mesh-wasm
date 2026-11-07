@@ -193,7 +193,10 @@ const SETTLE_BOUNDS_MS = 250;
  * Dead vertex slots keep stale positions, so the geometry's bounding box and
  * sphere are computed from the vertices of live triangles only (a removed
  * triangle reads `0, 0, 0` in the index). They are recomputed when positions
- * or indices change, never on placement-only frames.
+ * or indices change, never on placement-only frames. On a mesh of 65,536 vertex
+ * slots or more, a change that only moves up to an eighth of them grows them
+ * instead, so they can be larger than the mesh until 250 ms after the last such
+ * change.
  *
  * With `shading: "fragment"` the colour attribute is replaced by the
  * colouring's values (`fmValue`), coloured per fragment by a shader chunk the
@@ -475,7 +478,14 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     box.getCenter(sphere.center);
     sphere.radius = box.min.distanceTo(box.max) / 2;
     clearTimeout(settleBounds);
-    settleBounds = setTimeout(computeBounds, SETTLE_BOUNDS_MS);
+    settleBounds = setTimeout(() => {
+      try {
+        computeBounds();
+      } catch {
+        // The mesh or scene went before a frame could tell this binding; the
+        // grown bounds stand, and nothing draws from them any more.
+      }
+    }, SETTLE_BOUNDS_MS);
     return true;
   };
 

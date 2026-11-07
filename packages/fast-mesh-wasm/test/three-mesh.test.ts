@@ -591,6 +591,27 @@ describe("bindMesh", () => {
       expect(spy).toHaveBeenCalledTimes(2);
     });
 
+    it("settling_survives_the_mesh_or_scene_going_before_a_frame", () => {
+      vi.useFakeTimers();
+      try {
+        for (const gone of ["mesh", "scene"]) {
+          const { s, m } = large();
+          s.edit(m, [{ op: "setPositions", vertices: [1000], positions: [5, 5, 40] }]);
+          s.commitFrame();
+          // No commitFrame after this: the binding has not heard of it yet.
+          if (gone === "mesh") {
+            s.removeMesh(m);
+          } else {
+            s.free();
+            scenes = scenes.filter((x) => x !== s);
+          }
+          expect(() => vi.advanceTimersByTime(1000), gone).not.toThrow();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("stops_the_settling_when_the_mesh_goes", () => {
       vi.useFakeTimers();
       try {

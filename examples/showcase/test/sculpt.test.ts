@@ -294,11 +294,70 @@ describe("SculptStroke", () => {
     });
     stroke.dab([0.6, 0, 0]);
     stroke.end();
-    expect(calls).toEqual(["begin", "apply 1", "apply 2", "pass", "apply 2"]);
+    expect(calls).toEqual(["begin", "apply 1", "apply 2", "pass"]);
     gate.resolve();
     await passed;
     await stroke.done;
-    expect(calls.at(-1)).toBe("end");
+    expect(calls).toEqual(["begin", "apply 1", "apply 2", "pass", "apply 2", "end"]);
+  });
+
+  it("a_pass_holds_a_waiting_move_through_a_flush_and_the_end", async () => {
+    const calls: string[] = [];
+    const gate = deferred();
+    const stroke = new SculptStroke(
+      brush,
+      { beginStep: () => void calls.push("begin"), endStep: () => void calls.push("end") },
+      () => Promise.resolve(),
+    );
+    const move = (name: string) =>
+      stroke.move(
+        () => {
+          calls.push(name);
+          return Promise.resolve();
+        },
+        [0, 0, 0],
+      );
+    move("before");
+    await tick();
+    const passed = stroke.pass(() => {
+      calls.push("pass");
+      return gate.promise;
+    });
+    move("during");
+    // A release: what is waiting must still land after the pass.
+    stroke.flush();
+    stroke.end();
+    expect(calls).toEqual(["begin", "before", "pass"]);
+    gate.resolve();
+    await passed;
+    await stroke.done;
+    expect(calls).toEqual(["begin", "before", "pass", "during", "end"]);
+  });
+
+  it("a_second_pass_waits_for_the_first_and_what_was_due_before_it", async () => {
+    const calls: string[] = [];
+    const first = deferred();
+    const stroke = new SculptStroke(brush, {}, () => Promise.resolve());
+    stroke.pass(() => {
+      calls.push("live");
+      return first.promise;
+    });
+    stroke.move(
+      () => {
+        calls.push("move");
+        return Promise.resolve();
+      },
+      [0, 0, 0],
+    );
+    void stroke.pass(() => {
+      calls.push("end remesh");
+      return Promise.resolve();
+    });
+    stroke.end();
+    expect(calls).toEqual(["live"]);
+    first.resolve();
+    await stroke.done;
+    expect(calls).toEqual(["live", "move", "end remesh"]);
   });
 
   it("the_end_waits_for_every_batch", async () => {

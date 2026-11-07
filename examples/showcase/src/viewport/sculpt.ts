@@ -485,6 +485,10 @@ export class SculptStroke {
   #queue: RepairOp[] = [];
   #latest: (() => Promise<unknown>) | null = null;
   #inFlight = 0;
+  /** A pass is out: nothing else goes until it settles. */
+  #passing = false;
+  /** What came due behind a pass, in order; a `true` entry is a pass itself. */
+  #held: { run: () => Promise<unknown>; pass: boolean }[] = [];
   #begun = false;
   #landed = false;
   #ended = false;
@@ -629,25 +633,65 @@ export class SculptStroke {
    * nothing more, until it settles. A failure is the caller's to swallow.
    */
   pass(work: () => Promise<unknown>): Promise<void> {
-    this.flush();
     return new Promise<void>((resolve) => {
-      this.#send(() => {
+      const run = () => {
         const running = work();
         void running.then(
           () => resolve(),
           () => resolve(),
         );
         return running;
-      });
+      };
+      if (this.#passing) {
+        this.#hold();
+        this.#held.push({ run, pass: true });
+        return;
+      }
+      this.flush();
+      this.#startPass(run);
     });
+  }
+
+  #startPass(run: () => Promise<unknown>): void {
+    this.#passing = true;
+    this.#send(run, true);
+  }
+
+  /** Moves what is due behind the pass that is out. */
+  #hold(): void {
+    if (this.#queue.length > 0) {
+      const ops = this.#queue;
+      this.#queue = [];
+      this.#held.push({ run: () => this.#apply(ops), pass: false });
+    }
+    if (this.#latest !== null) {
+      this.#held.push({ run: this.#latest, pass: false });
+      this.#latest = null;
+    }
+  }
+
+  /** After a pass: what waited behind it, up to the next pass. */
+  #release(): void {
+    while (!this.#passing && this.#held.length > 0) {
+      const next = this.#held.shift();
+      if (next?.pass === true) {
+        this.#startPass(next.run);
+      } else if (next !== undefined) {
+        this.#send(next.run);
+      }
+    }
   }
 
   /**
    * Sends what is due now, even with a dab still in flight: for a caller about
    * to send something else that has to land after it (a remesh). On its own
-   * the stroke sends the next batch when the last one lands.
+   * the stroke sends the next batch when the last one lands. A pass that is out
+   * holds it: what is due goes when the pass settles.
    */
   flush(): void {
+    if (this.#passing) {
+      return;
+    }
     if (this.#queue.length > 0) {
       const ops = this.#queue;
       this.#queue = [];
@@ -660,7 +704,7 @@ export class SculptStroke {
     }
   }
 
-  #send(run: () => Promise<unknown>): void {
+  #send(run: () => Promise<unknown>, pass = false): void {
     this.#inFlight++;
     let settled: Promise<void>;
     try {
@@ -679,10 +723,14 @@ export class SculptStroke {
     }
     void settled.finally(() => {
       this.#inFlight--;
+      if (pass) {
+        this.#passing = false;
+        this.#release();
+      }
       if (this.#inFlight === 0) {
         this.flush();
       }
-      if (this.#inFlight === 0 && this.#ended) {
+      if (this.#inFlight === 0 && this.#ended && !this.#passing && this.#held.length === 0) {
         this.#finish();
       }
     });

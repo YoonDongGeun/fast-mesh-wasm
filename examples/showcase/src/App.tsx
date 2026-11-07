@@ -32,6 +32,7 @@ import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
+import { afterStroke } from "./viewport/view";
 import { VolumeOverlay } from "./viewport/VolumeOverlay";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
@@ -70,7 +71,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const grouped = useApp(app, (s) => s.collisionMode === "group");
   const members = useApp(app, (s) => s.group.members);
   const [selection, select] = useSelection();
-  const { canUndo, canRedo, undo, redo } = useHistory();
+  const { canUndo, canRedo, undo: undoNow, redo: redoNow } = useHistory();
+  const undo = useCallback(() => afterStroke(undoNow), [undoNow]);
+  const redo = useCallback(() => afterStroke(redoNow), [redoNow]);
   const [mode, setMode] = useState<GizmoMode>("translate");
   const [focus, setFocus] = useState<FocusRequest | null>(null);
   const [resetView, setResetView] = useState(0);
