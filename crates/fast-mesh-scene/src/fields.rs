@@ -8167,6 +8167,75 @@ mod tests {
         assert_matches(&mut scene, fb);
     }
 
+    /// A dab near the top of a unit ball.
+    fn ball_dab(strength: f32) -> crate::Dab {
+        crate::Dab::Inflate(fast_mesh_ops::InflateOptions {
+            brush: fast_mesh_ops::Brush {
+                center: [0.0, 0.0, 1.0],
+                radius: 0.8,
+                falloff: fast_mesh_ops::Falloff::Smooth,
+                strength,
+            },
+        })
+    }
+
+    #[test]
+    fn a_dab_marks_fields_due_and_a_stepped_update_refits() {
+        // Scene::dab of a target and of the mesh a field is on, stepped as the
+        // Worker steps it: due at once, refitted, with the bits of a new field.
+        let (mut scene, a, b, [fa, fb]) = interacting_pair(f64::INFINITY);
+        scene.set_defer_fields(true);
+        for (m, s) in [(b, 0.02), (a, 0.03), (b, -0.01)] {
+            assert!(scene.dab(m, &ball_dab(s)).unwrap().moved > 0);
+            assert!(!scene.field_status(fa).unwrap().current);
+            assert!(!scene.field_status(fb).unwrap().current);
+            counter::take_sign_steps();
+            step_all(&mut scene, 16);
+            assert_eq!(counter::take_sign_steps(), 0, "a refit, not a build");
+            assert!(scene.field_status(fa).unwrap().current);
+            assert!(scene.field_status(fb).unwrap().current);
+        }
+        scene.set_defer_fields(false);
+        let exact_a = scene
+            .add_distance_field(field("exact", a, b, f64::INFINITY))
+            .unwrap();
+        let exact_b = scene
+            .add_distance_field(field("exact", b, a, f64::INFINITY))
+            .unwrap();
+        assert_eq!(
+            bits(scene.field_values(fa).unwrap()),
+            bits(scene.field_values(exact_a).unwrap())
+        );
+        assert_eq!(
+            bits(scene.field_values(fb).unwrap()),
+            bits(scene.field_values(exact_b).unwrap())
+        );
+    }
+
+    #[test]
+    fn dabs_during_an_interaction_settle_to_the_exact_field() {
+        for stepped in [false, true] {
+            let (mut scene, a, b, [fa, fb]) = interacting_pair(f64::INFINITY);
+            let before = scene.field_values(fa).unwrap().to_vec();
+            scene.set_defer_fields(stepped);
+            scene.set_field_interaction(Some(4)).unwrap();
+            for (m, s) in [(a, 0.02), (b, 0.03), (a, 0.02)] {
+                scene.dab(m, &ball_dab(s)).unwrap();
+                if stepped {
+                    step_all(&mut scene, 16);
+                }
+            }
+            assert_ne!(bits(scene.field_values(fa).unwrap()), bits(&before));
+            scene.set_field_interaction(None).unwrap();
+            if stepped {
+                step_all(&mut scene, 16);
+                scene.set_defer_fields(false);
+            }
+            assert_matches(&mut scene, fa);
+            assert_matches(&mut scene, fb);
+        }
+    }
+
     #[test]
     fn interaction_rejects_a_zero_budget() {
         let (mut scene, ..) = interacting_pair(f64::INFINITY);
