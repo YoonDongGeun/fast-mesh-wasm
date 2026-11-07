@@ -120,6 +120,8 @@ export const inspect: {
     liveRemeshes: number;
     grabTotal: number;
     hovering: boolean;
+    /** How many times a brush cursor was laid on the surface: it has settled once this stops. */
+    cursorShows: number;
     lastDab: [number, number, number] | null;
     /** Dabs the mask dropped (every vertex in the ball was masked). */
     maskedDabs: number;
@@ -148,7 +150,7 @@ export const inspect: {
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sceneSlices: { id: null, shown: 0 },
   sceneVolume: { id: null, preset: "" },
-  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null, maskedDabs: 0, maskStale: 0, dabCost: { maskMs: [], landMs: [] }, maskOverlay: { triangles: 0, builds: 0, lastMs: 0, maxMs: 0 } },
+  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, cursorShows: 0, lastDab: null, maskedDabs: 0, maskStale: 0, dabCost: { maskMs: [], landMs: [] }, maskOverlay: { triangles: 0, builds: 0, lastMs: 0, maxMs: 0 } },
   tools: {
     tool: null,
     ruler: { a: [0, 0, 0], b: null, distance: null },

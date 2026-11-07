@@ -1031,6 +1031,7 @@ function SculptLayer(props: {
         binding.object.add(ball);
       }
       const brush = brushRef.current;
+      inspect.sculpt.cursorShows++;
       placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], brush.radius);
       // Which way the surface will go: along the normal, out or in. Smooth has no way, and a grab shows its drag.
       const [nx, ny, nz] = cursorNormal ?? [0, 0, 1];
@@ -1536,6 +1537,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       if (ball.parent !== binding.object) {
         binding.object.add(ball);
       }
+      inspect.sculpt.cursorShows++;
       placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], radiusRef.current);
     };
 

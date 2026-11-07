@@ -203,9 +203,20 @@ try {
    */
   async function shot(name) {
     await park();
-    // The brush ball goes once the parked pointer's raycast answers, which a
-    // slow runner takes frames over; it would tint the shot.
-    await waitFor("__showcase.sculpt().hovering === false", 10_000);
+    // The brush cursor goes once the parked pointer's raycast answers, which a slow
+    // runner takes frames over, and a raycast already out can still lay it down again
+    // first: it would tint the shot. So it has to stay gone for a while.
+    const started = Date.now();
+    for (let seen = -1, since = Date.now(); Date.now() - since < 400; await sleep(50)) {
+      const { hovering, cursorShows } = await hook("sculpt()");
+      if (hovering || cursorShows !== seen) {
+        seen = cursorShows;
+        since = Date.now();
+      }
+      if (Date.now() - started > 20_000) {
+        throw new Error("the brush cursor did not go");
+      }
+    }
     await frames();
     await page(`(() => {
       const s = document.createElement("style");
