@@ -842,15 +842,18 @@ function SculptLayer(props: {
       liveAt = performance.now();
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
+      // The region this pass adds to, even if the pointer lets go meanwhile:
+      // the moves waiting behind the pass still write it.
+      const region = grabRegion;
       // In order with the stroke's edits, so that the stroke's end waits for it.
       liveRunning = stroke.pass(() =>
         splitStretched(mesh, b).then((report) => {
           liveRunning = null;
           // The pass added vertices under the grab: take them along.
-          if (grabRegion !== null) {
+          if (region !== null) {
             try {
               const v = scene.views(mesh);
-              grabRegion.rebase(v.positions(), v.indices(), report?.vertices);
+              region.rebase(v.positions(), v.indices(), report?.vertices);
             } catch {
               // Removed meanwhile: the next move finds out.
             }
@@ -912,8 +915,12 @@ function SculptLayer(props: {
         syncDabs();
         stroke = null;
         inspect.sculpt.strokes++;
-        // What is due goes first: the passes below must land after it.
-        s.flush();
+        // Undo stays off until all of this has landed.
+        void s.done.then(() => {
+          if (stroke === null) {
+            view.stroking = false;
+          }
+        });
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
@@ -935,18 +942,21 @@ function SculptLayer(props: {
           if (b !== null && slots !== null && !remeshTooBig(slots)) {
             ensureDensity(mesh);
             inspect.sculpt.remeshes++;
-            void store
-              .repair(mesh, {
-                op: "remesh",
-                center: b.center,
-                radius: b.radius,
-                maxRounds: 4,
-                targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
-              })
-              .catch(() => {
-                // A degenerate region (or a mesh removed meanwhile): the
-                // stroke still ends.
-              });
+            // In order with the stroke: after what is due and any live pass.
+            void s.pass(() =>
+              store
+                .repair(mesh, {
+                  op: "remesh",
+                  center: b.center,
+                  radius: b.radius,
+                  maxRounds: 4,
+                  targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
+                })
+                .catch(() => {
+                  // A degenerate region (or a mesh removed meanwhile): the
+                  // stroke still ends.
+                }),
+            );
           }
         }
         s.end();
@@ -1163,6 +1173,7 @@ function SculptLayer(props: {
             );
             active = e.pointerId;
             stroke = s;
+            view.stroking = true;
             counted = 0;
             if (view.orbit !== null) {
               view.orbit.enabled = false;
