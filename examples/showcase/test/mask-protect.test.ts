@@ -1,8 +1,9 @@
 // Per-vertex mask protection: a dab near the mask moves the free side.
 // Bytes on a real engine: `scripts/showcase-mask-check.mjs`.
-import type { RepairOp } from "fast-mesh-wasm";
+import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { maskCoversDab, maskEdgeField, maskTouchesRegion, protectDab } from "../src/viewport/mask-protect";
+import { maskCoversDab, maskEdgeField, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
+import { maskUsable } from "../src/viewport/sculpt";
 
 /** A strip along x: vertices at (i, 0, 0) and (i, 1, 0), `2 * (n + 1)` slots. */
 function strip(n: number): { positions: number[]; indices: number[]; slots: number } {
@@ -120,11 +121,55 @@ describe("a dab touching the mask's edge", () => {
   });
 });
 
-describe("maskTouchesRegion", () => {
-  it("reports_a_masked_slot_inside_the_region", () => {
-    const { positions } = strip(4);
-    expect(maskTouchesRegion([0], positions, [1, 0, 0], 1)).toBe(true);
-    expect(maskTouchesRegion([0], positions, [3, 0, 0], 1)).toBe(false);
-    expect(maskTouchesRegion([], positions, [0, 0, 0], 9)).toBe(false);
+describe("a stroke-end remesh near the mask", () => {
+  /** A flat `n x n` grid over [0, 1]². */
+  function grid(n: number) {
+    const positions: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        positions.push(x / n, y / n, 0);
+      }
+    }
+    const indices: number[] = [];
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        indices.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    return { positions, indices };
+  }
+
+  it("is_refused_when_it_can_collapse_a_masked_vertex_just_outside_the_region", () => {
+    const n = 40;
+    const { positions, indices } = grid(n);
+    const scene = new Scene();
+    const mesh = scene.addMesh(positions, indices);
+    // Brush centers are local: the mesh's own origin is at the grid's middle.
+    const local = Float32Array.from(scene.views(mesh).positions());
+    const center: [number, number, number] = [local[3 * 840], local[3 * 840 + 1], local[3 * 840 + 2]];
+    const radius = 0.2;
+    // Vertices past the region, within half an edge of it: edges reaching them have midpoints inside.
+    const masked: number[] = [];
+    for (let v = 0; v < local.length / 3; v++) {
+      const d = Math.hypot(local[3 * v] - center[0], local[3 * v + 1] - center[1]);
+      if (d > radius && d < radius + 0.4 / n) {
+        masked.push(v);
+      }
+    }
+    expect(masked.length).toBeGreaterThan(0);
+    const guard = maskMeetsRemesh(masked, local, indices, center, radius);
+    scene.repair(mesh, { op: "remesh", center, radius, targetLength: 0.2, maxRounds: 4 });
+    // What the guard is for: the engine really takes one of them.
+    const now = scene.views(mesh);
+    const mask = { vertices: Uint32Array.from(masked), slots: local.length / 3 };
+    expect(maskUsable(mask, now.indices(), now.positions().length / 3)).toBe(false);
+    expect(guard).toBe(true);
+  });
+
+  it("is_allowed_well_away_from_the_mask", () => {
+    const { positions, indices } = grid(40);
+    expect(maskMeetsRemesh([0], positions, indices, [0.5, 0.5, 0], 0.2)).toBe(false);
+    expect(maskMeetsRemesh([], positions, indices, [0.5, 0.5, 0], 0.2)).toBe(false);
   });
 });

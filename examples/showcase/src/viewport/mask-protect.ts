@@ -176,20 +176,47 @@ export function maskCoversDab(
   return any;
 }
 
-/** Whether any masked slot is within `radius` of `center`. */
-export function maskTouchesRegion(
+/**
+ * Whether a remesh of this region could take a masked vertex. A remesh tests
+ * edge midpoints, not vertices, so it reaches past its radius along any edge
+ * with a midpoint inside; and a collapse there leaves a new edge that the next
+ * round may take. So: any live edge with a masked end, whose midpoint is within
+ * the radius plus that edge's length. O(triangles), once per stroke end.
+ */
+export function maskMeetsRemesh(
   masked: ArrayLike<number>,
   positions: ArrayLike<number>,
+  indices: ArrayLike<number>,
   center: readonly [number, number, number],
   radius: number,
 ): boolean {
-  const r2 = radius * radius;
+  if (masked.length === 0) {
+    return false;
+  }
+  const slots = positions.length / 3;
+  const flags = new Uint8Array(slots);
   for (let k = 0; k < masked.length; k++) {
-    const v = masked[k];
-    const dx = positions[3 * v] - center[0];
-    const dy = positions[3 * v + 1] - center[1];
-    const dz = positions[3 * v + 2] - center[2];
-    if (dx * dx + dy * dy + dz * dz <= r2) {
+    if (masked[k] < slots) {
+      flags[masked[k]] = 1;
+    }
+  }
+  const reaches = (a: number, b: number) => {
+    if (flags[a] === 0 && flags[b] === 0) {
+      return false;
+    }
+    const [ax, ay, az] = [positions[3 * a], positions[3 * a + 1], positions[3 * a + 2]];
+    const [bx, by, bz] = [positions[3 * b], positions[3 * b + 1], positions[3 * b + 2]];
+    const d = Math.hypot((ax + bx) / 2 - center[0], (ay + by) / 2 - center[1], (az + bz) / 2 - center[2]);
+    return d <= radius + Math.hypot(ax - bx, ay - by, az - bz);
+  };
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (reaches(a, b) || reaches(b, c) || reaches(c, a)) {
       return true;
     }
   }

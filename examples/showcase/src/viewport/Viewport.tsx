@@ -47,7 +47,7 @@ import {
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
-import { MASK_SOFT_BAND, type MaskField, maskCoversDab, maskEdgeField, maskTouchesRegion, protectDab } from "./mask-protect";
+import { MASK_SOFT_BAND, type MaskField, maskCoversDab, maskEdgeField, maskMeetsRemesh, protectDab } from "./mask-protect";
 import { setWireOverlay } from "./wire";
 import {
   buildRepairOverlayGroup,
@@ -853,7 +853,7 @@ function SculptLayer(props: {
      */
     const remeshMeetsMask = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }): boolean => {
       const gated = maskLive(mesh);
-      return gated !== null && gated !== "stale" && maskTouchesRegion(gated.vertices, gated.positions, b.center, b.radius);
+      return gated !== null && gated !== "stale" && maskMeetsRemesh(gated.vertices, gated.positions, gated.indices, b.center, b.radius);
     };
 
     /**
