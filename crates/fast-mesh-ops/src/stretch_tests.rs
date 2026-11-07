@@ -716,3 +716,41 @@ fn capture_replaces_the_rest_shape_without_an_edit() {
     );
     assert_eq!(pass(&mut mesh, all()).splits, 0);
 }
+
+/// Past 64 the float grid doubles: edges one grid step long at 63 land one step
+/// long at 66, twice their rest size, and their midpoints round onto an end.
+#[test]
+fn an_edge_too_short_to_split_at_float_precision_stops_the_pass() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let step = f32::EPSILON * 32.0;
+        let mut mesh = mesh_of(
+            &[
+                63.0 + step,
+                0.0,
+                0.0,
+                63.0 + 2.0 * step,
+                0.0,
+                0.0,
+                63.0 + step,
+                step,
+                0.0,
+            ],
+            &[[0, 1, 2]],
+        );
+        capture_rest_sizes(&mut mesh).unwrap();
+        let moved: Vec<[f32; 3]> = mesh
+            .positions()
+            .iter()
+            .map(|p| [p[0] + 3.0, p[1], p[2]])
+            .collect();
+        edit(&mut mesh, |t| Ok(t.set_positions(&[0, 1, 2], &moved)?));
+        let report = pass(&mut mesh, all());
+        tx.send((report.splits, mesh.triangle_count())).unwrap();
+    });
+    let (splits, triangles) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the pass must end");
+    assert!(splits < 100, "{splits} splits");
+    assert_eq!(triangles, 1 + splits);
+}

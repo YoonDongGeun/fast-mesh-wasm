@@ -239,14 +239,24 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
             continue;
         }
         let boundary = owners.len() != 2;
+        let mid = midpoint(&work.pos(edge.a), &work.pos(edge.b));
+        let pos = if options.smooth && !boundary {
+            let curved = work.curved_point(edge.a, edge.b, &owners);
+            if work.shortens(edge, curved) {
+                curved
+            } else {
+                mid
+            }
+        } else {
+            mid
+        };
+        // Too short to split at float precision: it stays as it is.
+        if !work.shortens(edge, pos) {
+            continue;
+        }
         if !boundary {
             interior += 1;
         }
-        let pos = if options.smooth && !boundary {
-            work.curved_point(edge.a, edge.b, &owners)
-        } else {
-            midpoint(&work.pos(edge.a), &work.pos(edge.b))
-        };
         work.split(edge.a, edge.b, pos, &owners, boundary, &mut heap)?;
         report.splits += 1;
     }
@@ -397,6 +407,15 @@ impl Work<'_> {
             (false, false) => return None,
         };
         Some(f64::from(size) * self.limit)
+    }
+
+    /// Whether a vertex at `pos` makes both halves of `edge` shorter than the
+    /// edge. It is what ends the pass: without it, a midpoint that rounds onto
+    /// an endpoint leaves a half as long as the edge, past its limit for ever.
+    fn shortens(&self, edge: Edge, pos: [f32; 3]) -> bool {
+        pos.iter().all(|x| x.is_finite())
+            && length(&self.pos(edge.a), &pos) < edge.len
+            && length(&pos, &self.pos(edge.b)) < edge.len
     }
 
     /// The edge as a heap entry when it is past its limit.
