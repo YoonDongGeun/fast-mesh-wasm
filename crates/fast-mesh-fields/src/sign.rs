@@ -805,7 +805,8 @@ impl SignData {
     /// is needed) when the mode is not pseudonormal, the topology changed,
     /// vertices or triangles were added or removed, the slot counts changed,
     /// the mesh's adjacency or incidence is not cached, the BVH is not
-    /// current, or a dirty triangle changed its degenerate status. On `true`
+    /// current, or a dirty triangle is or was zero-area or shares an edge with
+    /// a zero-area one (edge normals read faces through those). On `true`
     /// the data is current for `mesh` and `bvh` and identical to a rebuild.
     ///
     /// # Errors
@@ -851,6 +852,21 @@ impl SignData {
             let zero = face_normal(mesh, t as usize) == [0.0; 3];
             if self.degenerate.binary_search(&t).is_ok() != zero {
                 return Ok(false);
+            }
+            // An edge normal reads faces through a chain of zero-area triangles
+            // (see `across`), farther than the corners listed below: a dirty
+            // face next to a sliver, or a dirty sliver, needs a rebuild.
+            if zero {
+                return Ok(false);
+            }
+            for c in 3 * t..3 * t + 3 {
+                if adj.edge_kind(c) == EdgeKind::Interior
+                    && adj
+                        .opposite(c)
+                        .is_some_and(|o| self.degenerate.binary_search(&(o / 3)).is_ok())
+                {
+                    return Ok(false);
+                }
             }
         }
         // The vertices of the dirty triangles: exactly those whose normals
@@ -1468,5 +1484,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A sheet of `n` x `n` cells with slivers: every third row's middle
+    /// vertices collapse onto a neighbour, or onto the middle of an edge, so
+    /// that zero-area triangles lie in chains between faces. A fin hangs off
+    /// an edge (non-manifold), and a few triangles are removed.
+    fn sliver_sheet(n: u32) -> Mesh {
+        let w = n + 1;
+        let mut pos = Vec::new();
+        for y in 0..w {
+            for x in 0..w {
+                let (fx, fy) = (x as f32, y as f32);
+                let z = ((fx * 0.7).sin() + (fy * 0.5).cos()) * 0.25;
+                pos.extend([fx, fy, z]);
+            }
+        }
+        let at = |x: u32, y: u32| (3 * (y * w + x)) as usize;
+        for y in (1..n).step_by(3) {
+            for x in (1..n).step_by(2) {
+                let (v, l, r) = (at(x, y), at(x - 1, y), at(x + 1, y));
+                if x % 4 == 1 {
+                    // On its left neighbour: a zero-length edge.
+                    let p = [pos[l], pos[l + 1], pos[l + 2]];
+                    pos[v..v + 3].copy_from_slice(&p);
+                } else {
+                    // On the segment between its neighbours: a needle.
+                    for c in 0..3 {
+                        pos[v + c] = (pos[l + c] + pos[r + c]) / 2.0;
+                    }
+                }
+            }
+        }
+        let mut tri = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * w + x;
+                tri.extend([a, a + 1, a + w + 1, a, a + w + 1, a + w]);
+            }
+        }
+        // The fin over the first cell's edge.
+        let fin = pos.len() as u32 / 3;
+        pos.extend([0.5, 0.0, 2.0]);
+        tri.extend([0, 1, fin]);
+        let mut mesh = Mesh::from_buffers(&pos, &tri).unwrap();
+        let mut tx = mesh.begin_edit();
+        tx.remove_triangles(&[2 * n * (n - 1)]).unwrap();
+        tx.commit().unwrap();
+        mesh
+    }
+
+    #[test]
+    fn refit_across_a_chain_of_slivers_is_a_rebuild() {
+        // T, the zero-area S and D in a chain: T's edge normal across S reads
+        // D's face. Moving D's apex must not leave it stale.
+        let pos = [
+            0.0f32, 0.0, 0.0, // 0: the shared edge's ends
+            2.0, 0.0, 0.0, // 1
+            1.0, 0.0, 0.0, // 2: on the edge: S is (1, 0, 2)
+            1.0, -1.0, 0.0, // 3: T's apex
+            1.0, 1.0, 0.0, // 4: D's apex, over the edge (0, 2)
+            0.0, 0.0, -3.0, // 5: to close nothing, keeps a box
+        ];
+        let tri = [0u32, 3, 1, 1, 2, 0, 0, 2, 4, 2, 1, 4];
+        let mut mesh = Mesh::from_buffers(&pos, &tri).unwrap();
+        let mut bvh = build_bvh(&mesh);
+        let sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+        let mut tx = mesh.begin_edit();
+        tx.set_positions(&[4], &[[1.0, 1.0, 1.5]]).unwrap();
+        let patch = tx.commit().unwrap();
+        bvh.update(&mut mesh, patch.changes()).unwrap();
+        let mut refitted = sign.clone();
+        let done = refitted.try_refit(&mesh, &bvh, patch.changes()).unwrap();
+        let rebuilt = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+        if done {
+            assert_eq!(fingerprint(&refitted), fingerprint(&rebuilt));
+        }
+    }
+
+    #[test]
+    fn refit_is_a_rebuild_or_declines_over_random_edits() {
+        // The differential test: whatever the edit, a refit that runs gives
+        // the bits of a rebuild. Slivers, boundaries, a fin and dead triangles.
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        let (mut refits, mut declined) = (0, 0);
+        type Shape = (&'static str, fn() -> Mesh);
+        let shapes: [Shape; 3] = [
+            ("slivers", || sliver_sheet(14)),
+            ("torus", torus),
+            ("cube", cube),
+        ];
+        for (name, base) in shapes {
+            for round in 0..30 {
+                let mut mesh = base();
+                let mut bvh = build_bvh(&mesh);
+                let mut sign = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+                // Several edits in a row, each refitted on the last.
+                for edit in 0..3 {
+                    let slots = mesh.vertex_slots() as u32;
+                    let count = 1 + next() % 4;
+                    let mut moved = Vec::new();
+                    let mut positions = Vec::new();
+                    for _ in 0..count {
+                        let v = next() % slots;
+                        if moved.contains(&v) {
+                            continue;
+                        }
+                        let Some(p) = mesh.position(v) else { continue };
+                        let d = [next(), next(), next()].map(|r| (r % 2001) as f32 / 1000.0 - 1.0);
+                        moved.push(v);
+                        positions.push([p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+                    }
+                    if moved.is_empty() {
+                        continue;
+                    }
+                    let mut tx = mesh.begin_edit();
+                    tx.set_positions(&moved, &positions).unwrap();
+                    let patch = tx.commit().unwrap();
+                    bvh.update(&mut mesh, patch.changes()).unwrap();
+                    let rebuilt = SignData::build(&mut mesh, &bvh, SignMode::Pseudonormal).unwrap();
+                    if sign.try_refit(&mesh, &bvh, patch.changes()).unwrap() {
+                        refits += 1;
+                        assert_eq!(
+                            fingerprint(&sign),
+                            fingerprint(&rebuilt),
+                            "{name}, round {round}, edit {edit}, moved {moved:?}"
+                        );
+                    } else {
+                        declined += 1;
+                        sign = rebuilt;
+                    }
+                }
+            }
+        }
+        // Refits run, and fall-backs too.
+        assert!(refits > 100, "{refits}");
+        assert!(declined > 10, "{declined}");
     }
 }

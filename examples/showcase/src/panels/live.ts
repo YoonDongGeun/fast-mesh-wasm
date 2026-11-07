@@ -10,12 +10,14 @@ import type { Item } from "../scene/app-state";
 import { view } from "../viewport/view";
 import { topologyOf } from "./collision-math";
 import type { LiveProbe } from "./inspect";
+import { interaction } from "./interaction";
 
 /**
  * Outside a drag the readouts refresh at most this often (about 4 Hz), and
- * once more after the last change. During a gizmo drag they pause: reading
- * the field values forces every due field up to date, which would keep the
- * Worker from dropping recomputes of stale poses (the colours stay live).
+ * once more after the last change. During a gizmo drag or a sculpt stroke they
+ * pause: reading the field values forces every due field up to date, and the
+ * queries themselves cost the Worker hundreds of milliseconds at 1M triangles
+ * (the colours stay live).
  */
 const READOUT_PERIOD_MS = 250;
 /** A target is re-analysed this long after its triangles last changed. */
@@ -32,6 +34,10 @@ const TOPOLOGY_DELAY_MS = 250;
  * removed mid-query rejects: that refresh is dropped. `key` names the set of
  * meshes; a new key starts over. `probe` mirrors the state for the test hook.
  */
+function paused(): boolean {
+  return view.dragging || interaction.active;
+}
+
 export function useLiveReadouts<T>(
   store: SceneStore,
   meshes: readonly MeshHandle[] | null,
@@ -61,8 +67,8 @@ export function useLiveReadouts<T>(
 
     const kick = () => {
       probe.settled = !dirty && !running;
-      if (!alive || running || !dirty || view.dragging) {
-        // A drag pauses the readouts; its end kicks them again.
+      if (!alive || running || !dirty || paused()) {
+        // A drag or a stroke pauses the readouts; its end kicks them again.
         return;
       }
       const wait = last + READOUT_PERIOD_MS - performance.now();
@@ -91,9 +97,9 @@ export function useLiveReadouts<T>(
             if (!alive) {
               return;
             }
-            if (view.dragging) {
-              // Started before the drag: it describes the pre-drag pose.
-              // Drop it; the drag's end refreshes.
+            if (paused()) {
+              // Started before the gesture: it describes the state before it.
+              // Drop it; the gesture's end refreshes.
               dirty = true;
               probe.dropped++;
               return;
@@ -132,6 +138,7 @@ export function useLiveReadouts<T>(
       }
     };
     view.dragListeners.add(onDrag);
+    interaction.listeners.add(onDrag);
     poke.current = () => {
       dirty = true;
       kick();
@@ -141,6 +148,7 @@ export function useLiveReadouts<T>(
       alive = false;
       off();
       view.dragListeners.delete(onDrag);
+      interaction.listeners.delete(onDrag);
       clearTimeout(timer);
       poke.current = () => {};
       probe.settled = true;

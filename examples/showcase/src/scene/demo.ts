@@ -179,11 +179,14 @@ function merge(a: MeshData, b: MeshData): MeshData {
   return { positions, indices };
 }
 
-/** A, B and C; `big` makes A and B about a million triangles each. */
-export function demoMeshes(big: boolean): DemoMesh[] {
+/** A, B and C; `big` makes A and B about a million triangles each, a number about that many. */
+export function demoMeshes(big: boolean | number): DemoMesh[] {
+  // A has about 4 · rings² triangles (segments = 2 · rings), B 12 · n².
+  const rings = big === true ? 512 : big === false ? 64 : Math.max(2, Math.round(Math.sqrt(big / 4)));
+  const n = big === true ? 290 : big === false ? 32 : Math.max(2, Math.round(Math.sqrt(big / 12)));
   return [
-    { name: "A · blobby sphere", data: blobbySphere([0, 1, 0], 1, big ? 1024 : 128, big ? 512 : 64) },
-    { name: "B · rounded box", data: roundedBox([1.05, 1, 0.1], [0.55, 0.55, 0.55], 0.15, big ? 290 : 32) },
+    { name: "A · blobby sphere", data: blobbySphere([0, 1, 0], 1, 2 * rings, rings) },
+    { name: "B · rounded box", data: roundedBox([1.05, 1, 0.1], [0.55, 0.55, 0.55], 0.15, n) },
     { name: "C · open shell + piece", data: openShellWithPiece([-2.8, 1, 0], 0.8) },
   ];
 }

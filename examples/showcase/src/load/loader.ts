@@ -144,7 +144,7 @@ export class Loader {
   }
 
   /** Generates and adds the demo meshes A, B and C. */
-  loadDemo(big: boolean): Promise<Item[]> {
+  loadDemo(big: boolean | number): Promise<Item[]> {
     return this.#start(big ? "demo meshes (big)" : "demo meshes", { kind: "demo", id: 0, big });
   }
 

@@ -1596,6 +1596,14 @@ impl WasmScene {
         Ok(self.scene.set_coloring(id, None)?)
     }
 
+    /// Starts (a budget of `points`) or ends (`undefined`) an interaction; see
+    /// [`Scene::set_field_interaction`].
+    pub fn set_field_interaction(&mut self, points: Option<u32>) -> Result<(), Error> {
+        Ok(self
+            .scene
+            .set_field_interaction(points.map(|p| p as usize))?)
+    }
+
     // ---- Stepped field updates ----
 
     /// Defers Eager field updates to [`WasmScene::field_step`]; see

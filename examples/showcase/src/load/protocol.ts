@@ -23,8 +23,8 @@ export type LoaderRequest =
   | { kind: "volume"; id: number; volumeId: string }
   /** Drop a retained source volume (fire-and-forget: no reply). */
   | { kind: "dropVolume"; volumeId: string }
-  /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each. */
-  | { kind: "demo"; id: number; big: boolean }
+  /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each, a number about that many. */
+  | { kind: "demo"; id: number; big: boolean | number }
   /** Drop the worker-side job `id`: its late reply is ignored page-side. */
   | { kind: "cancel"; id: number };
 

@@ -7,7 +7,7 @@ import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Qua
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
-import { copyRule, encodeRule } from "./rule.js";
+import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
 import {
   brushPick,
@@ -2147,6 +2147,30 @@ export class Scene implements SceneLike {
   matrix4(mesh: MeshHandle): Float64Array {
     const { index, generation } = this.#id(mesh);
     return call(() => this.#peek().matrix4(index, generation));
+  }
+
+  /**
+   * Starts (`points`) or ends (`null`) an interaction: a gesture that changes
+   * a placement or a mesh many times a second (a drag, a brush stroke), during
+   * which a distance field too large to recompute per update stays live near
+   * the contact, and is made exact when the gesture ends.
+   *
+   * While it lasts, a field with more finite values than `points` updates
+   * only the vertices near its moved targets (within a margin that follows
+   * the work, about `points` vertices an update), the vertices an edit moved
+   * and a sweep of a quarter of `points` others. The rest keep their values
+   * and colours, out of date by at most how far the meshes moved since, so
+   * nothing turns far meanwhile. A smaller field updates as usual. Ending it
+   * recomputes the fields it left out of date: their values and colours are
+   * then those of an exact update. A gesture that changed nothing costs
+   * nothing. The results do not depend on the thread count.
+   *
+   * @throws `INVALID_ARGUMENT` unless `points` is `null` or an integer in
+   * `[1, 2^32)`.
+   */
+  setFieldInteraction(points: number | null): void {
+    const budget = checkInteractionPoints(points);
+    call(() => this.#scene().set_field_interaction(budget ?? undefined));
   }
 
   /** Sets when the mesh's derived data follows its edits; see {@link UpdateMode}. */

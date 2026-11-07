@@ -150,6 +150,8 @@ export type Request =
       desc?: SectionDescWire;
       key?: string;
     }
+  /** `Scene.setFieldInteraction`. */
+  | { kind: "fieldInteraction"; rev: number; points: number | null }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
   | { kind: "fetchFieldValues"; rev: number; qid: number; field: ClientId };
 

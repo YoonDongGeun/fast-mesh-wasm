@@ -367,6 +367,8 @@ pub struct Scene {
     pub(crate) next_section: u32,
     /// Eager field updates are left due (see [`Scene::set_defer_fields`]).
     pub(crate) defer_fields: bool,
+    /// The interaction tier's budget (see [`Scene::set_field_interaction`]).
+    pub(crate) field_interaction: Option<usize>,
     /// The open field step unit (see [`Scene::field_step`]).
     pub(crate) field_unit: Option<FieldUnit>,
     /// Reusable broadphase buffers for [`Scene::raycast`] and
@@ -404,6 +406,7 @@ impl Scene {
             sections: Vec::new(),
             next_section: 0,
             defer_fields: false,
+            field_interaction: None,
             field_unit: None,
             order_ray: Vec::new(),
             order_closest: Vec::new(),

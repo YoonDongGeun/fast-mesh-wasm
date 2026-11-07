@@ -67,6 +67,7 @@ function referenceColors(
   t: Vec3,
   edit?: (s: Scene, mesh: MeshHandle) => void,
   target: Vec3 = [0, 0, 0],
+  editTarget?: (s: Scene, mesh: MeshHandle) => void,
 ): Uint8Array {
   const s = new Scene();
   try {
@@ -75,6 +76,7 @@ function referenceColors(
     s.setPlacement(a, { rotation: IDENTITY, translation: t });
     s.setPlacement(b, { rotation: IDENTITY, translation: target });
     edit?.(s, a);
+    editTarget?.(s, b);
     const f = s.addDistanceField({ name: "d", on: a, to: b, maxDistance: MAX_DISTANCE });
     s.setColoring(a, { field: f, map: "turbo", range: [0, MAX_DISTANCE] });
     return (s.views(a).colors() as Uint8Array).slice();
@@ -285,6 +287,60 @@ describe("stepped field updates in the Worker", () => {
     expect(recolors(waited, 3)).toBe(true);
 
     expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(1)));
+  });
+
+  it("field_interaction_abandons_unit_and_settles_to_the_exact_colours", async () => {
+    const h = engine();
+    await setup(h);
+    const chunksBefore = h.chunks.length;
+    const t = pose(3);
+    // A recompute under way when the interaction starts is dropped.
+    let once = true;
+    h.onStep = () => {
+      if (once) {
+        once = false;
+        h.later([{ kind: "fieldInteraction", rev: rev(), points: 16 }]);
+      }
+    };
+    h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: t, key: "placement:1" }]);
+    await h.until(3);
+    h.onStep = undefined;
+    expect(h.chunks.slice(chunksBefore).filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    // Its end makes the colours exact, whatever it did meanwhile.
+    h.send([{ kind: "fieldInteraction", rev: rev(), points: null }]);
+    await h.until(4);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(t));
+  });
+
+  it("a_brush_dab_drives_a_stepped_update_of_the_field_measured_to_it", async () => {
+    // A lone brush repair takes the engine's dab path; its target's field
+    // recomputes in steps, within the interaction and exactly after it.
+    const dab = { op: "inflate", center: [0, 0, 0], radius: 1, falloff: "smooth", strength: 0.05 } as const;
+    const h = engine();
+    await setup(h);
+    const n = h.results.length;
+    const steps = h.chunks.length;
+    h.send([{ kind: "repair", rev: rev(), id: 2, qid: 91, payload: dab }]);
+    await h.until(n + 1);
+    expect(h.results[n].replies[0]).toMatchObject({ ok: true });
+    expect(h.chunks.slice(steps)).toContain("fieldStep");
+    expect(recolors(h.results[n], 1)).toBe(true);
+    const expected = referenceColors([0, 0, 0], undefined, [0, 0, 0], (s, target) => {
+      s.repair(target, dab);
+    });
+    expect(await dumpColors(h, 1)).toEqual(expected);
+
+    const m = h.results.length;
+    h.send([{ kind: "fieldInteraction", rev: rev(), points: 16 }]);
+    h.send([{ kind: "repair", rev: rev(), id: 2, qid: 92, payload: dab }]);
+    await h.until(m + 2);
+    h.send([{ kind: "fieldInteraction", rev: rev(), points: null }]);
+    await h.until(m + 3);
+    const twice = referenceColors([0, 0, 0], undefined, [0, 0, 0], (s, target) => {
+      s.repair(target, dab);
+      s.repair(target, dab);
+    });
+    expect(await dumpColors(h, 1)).toEqual(twice);
   });
 
   it("edit_abandons_unit", async () => {

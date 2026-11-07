@@ -230,7 +230,7 @@ Pseudonormal builds slower (it accumulates angle-weighted normals per vertex and
 | `SignData::build`, adjacency cached | 223 ms | 232 ms |
 | `SignData::build`, adjacency not cached | 340 ms | 339 ms |
 
-So a topology edit of B costs about 1.5 times the build alone, an estimated ~220 ms at the table's speed (scaled, not measured). Placement changes and edits of A do not rebuild the sign data. An incremental refit is planned for 5b.
+So a topology edit of B costs about 1.5 times the build alone, an estimated ~220 ms at the table's speed (scaled, not measured). Placement changes and edits of A do not rebuild the sign data. A position-only edit of B refits the sign data instead: since issue #173 in stepped updates too (see "The heatmap during a drag and a stroke").
 
 ### The 64-pose drag of two touching 1M terrains
 
@@ -244,6 +244,38 @@ The two `terrain(708)` meshes of the overhead group, B flipped above A and lifte
 | Time per pose | 1.79 ms | 3.62 ms |
 
 The candidate counts come from a counter that is not in the code (the one in the unit tests, made visible for a single run), so the benchmark itself prints only the recoloured counts. The largest counts are at pose 0, where the contact is widest (4,607 triangles of each mesh within 0.080); at the later poses it is a few hundred vertices. The time per pose is within the target of the design (a few ms per pose); the work per pose is not set by the number of vertices recomputed (a few hundred take well under 1 ms at 1 to 2 µs each), so the pair test that finds the candidates is likely the larger part, as `triangles_near` at this margin takes about 1.4 ms per pose (1.37 to 1.38 ms above, measured on another run). That split was not profiled. The two-sided case costs twice the one-sided one, since each side repeats the whole update.
+
+### The heatmap during a drag and a stroke (issue #173)
+
+`node scripts/showcase-heatmap-bench.mjs`, in the showcase on the page with default settings (A and B coloured against each other, `contactHeatmap` with `exactDepth`), measured on 2026-11-07: Chrome 156 headless, i5-13600K, 8 engine threads, Radeon RX 6800 (ANGLE D3D11), on a machine shared with other work (CPU load 40 to 90%). A drag or stroke of 4 s, pointer moves about every 16 ms, 2 to 3 runs each. A frame is the time between animation frames, which the headless page caps at 6.1 to 6.9 ms; an update is the time between deliveries of new colours.
+
+| Median (p95) | 100k drag | 100k stroke | 1M drag | 1M stroke |
+| --- | --- | --- | --- | --- |
+| Frame, before | 6.9 ms (7.0) | 6.9 ms (7.0) | 6.9 ms (7.0) | 6.9 ms (7.0) |
+| Frame, after | 6.1 ms (6.1) | 6.1 ms (6.1) | 6.1 ms (6.1) | 6.1 ms (6.1) |
+| Colour update, before | 285 ms (375) | 139 ms (202) | 3,608 ms | 4,841 ms |
+| Colour update, after | **30 ms** (37) | **38 ms** (90) | **79 ms** (134) | **61 ms** (103) |
+| Dabs per second, before / after | | 6.8 / 21.9 | | 0.5 / 14.6 |
+| Release to the last colours, before / after | 97 / 132 ms | 94 ms / none changed | 3.2 / 3.1 s | 4.3 / 3.4 s |
+
+- **Frame time was never what stuttered.** The Worker keeps the page at its cap in a drag or a stroke, before and after: the mesh moved smoothly and its colours came late. So the target to read is the colour update. It is not per frame at 1M: 12 updates a second in a drag. What limits it is about 18,000 closest-point queries per update in WebAssembly, on 8 threads of a busy machine; the budget (`INTERACTION_POINTS`, 8,192 vertices a field) sets it. In a fast drag at 1M the contact sweeps more vertices per update than the budget, so a stale band of contact colour trails it until the vertices come up or the pointer stops.
+- **After the pointer stops**, the exact field takes about 3 s at 1M, in steps, with the page live, and a new gesture drops it. Main-thread tasks of about 200 to 260 ms remain when those colours land at 1M (224 to 248 ms before the change). At rest the script finds 0 vertices off a field computed from scratch, at both sizes. That check covers the demo pair after these gestures: closed meshes, no zero-area triangles, no non-uniform scale. Those cases are covered by the differential tests in `crates/fast-mesh-fields/src/sign.rs` and `crates/fast-mesh-scene/src/fields.rs`.
+- **Rerun on the final code**, while a 3D game was also running on the machine (the exact field took 6 to 14 s instead of 3, which is the load: that path did not change): colour updates of 42 to 170 ms in a 100k drag, 48 to 78 ms in a 100k stroke, 151 to 170 ms in a 1M drag and 79 to 133 ms in a 1M stroke, with frames at the cap apart from spikes up to 73 ms, and 0 vertices off at rest. Take the table as the figure on a quieter machine and these as the sensitivity to load.
+
+What each cause came to:
+
+| Cause | Measured | Verdict |
+| --- | --- | --- |
+| Every vertex recomputed per update (`maxDistance: Infinity`) | 3.6 s per update at 1M, 285 ms at 100k | The main cause |
+| "The incremental path needs a finite bound" | Fast mode at default sliders: 361 ms at 100k, 3,355 ms at 1M, no better | Not enough: the bound is twice the slider range, which covers these meshes, so the near search gives up. A band of 0.005 still took 243 ms an update |
+| The near-triangle pair search | About 50 ms of each native update at 1M, whatever the candidates | A cause: the tier picks vertices from their last values instead, one pass over the slots |
+| The starvation guard (`STALE_GUARD_MS` 200): moves dropped every recompute longer than the gap between moves until the guard ran out | With everything else in place, back at 200 ms: 278 ms an update at 1M against 83, 229 ms p95 at 100k against 42 | A cause not in the issue |
+| Sign data rebuilt on every edit | With everything else in place, without the refit, at 1M: 111 ms an update and 8.6 dabs/s against 56 and 16.2; no difference at 100k | A cause, though the refit did exist: `update_fields` used it, stepped updates (every Worker scene) did not. It now declines beside zero-area triangles and after edits made while a target was baked, and rebuilds |
+| Readouts | Paused in a drag already. In a stroke they were not; left running, at 1M: 494 ms an update, 2.5 dabs/s against 56 and 16.2; no difference at 100k | No cause in a drag, the largest single one in a 1M stroke |
+| Bounds walked on the main thread per dab (`bindMesh` over a Worker scene) | About 46 ms per dab at 1M, the frames that passed the cap in a stroke (up to 56 ms) | A cause of frame hitches. Issue #182 fixed it independently (it grows the bounds per small edit): a profiled 1M stroke on this branch shows no `computeBounds` samples |
+| A missing BVH | The distance query has one | Not a cause, as the issue says |
+
+Ablation runs were one to two runs on the shared machine, compared with the run of the same series (83 and 56 ms an update, 16.2 dabs/s): read them as sizes, not as exact figures.
 
 ## Sections (fast-mesh-query, fast-mesh-scene)
 
