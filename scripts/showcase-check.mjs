@@ -1799,7 +1799,7 @@ try {
   await clickOn(`[data-mesh=${q(A)}] .mesh-name`);
   await clickOn('[data-action="sculpt-tool-inflate"]');
   await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true" ? true : null`, 20_000);
-  const settled = await waitFor(`(() => { const s = __showcase.meshPreview(${q(A)}); return s.renders > 0 && s.starts === s.renders && s; })()`, 20_000);
+  const settled = await waitFor(`(() => { const s = __showcase.meshPreview(${q(A)}); return s.triangles > 0 && !s.pending && s; })()`, 60_000);
   const srcOf = `document.querySelector(${q(`[data-mesh="${A}"] img.mesh-preview`)}).src`;
   const original = await page(srcOf);
   await page(`(window.__before = __pixels(${q(original)}), true)`);

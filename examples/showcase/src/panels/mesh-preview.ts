@@ -469,14 +469,11 @@ export class PreviewQueue<K = unknown> {
 }
 
 const queue = new PreviewQueue<MeshHandle>();
-const jobs = new Map<MeshHandle, PreviewJob>();
+const arms = new Map<MeshHandle, (quietMs: number) => void>();
 
 /** Redraws a mesh's picture now, as an edit would after its quiet time. For measuring. */
 export function redrawMeshPreview(mesh: MeshHandle): void {
-  const job = jobs.get(mesh);
-  if (job !== undefined) {
-    queue.invalidate(mesh, job, 0);
-  }
+  arms.get(mesh)?.(0);
 }
 
 /** Per mesh: pictures started and finished, and what the last one cost. Read by the browser check. */
@@ -485,12 +482,14 @@ export interface MeshPreviewStats {
   renders: number;
   triangles: number;
   last: PreviewRun | null;
+  /** A redraw is due or under way, or its picture is not on the page yet. A start an edit overtook never counts as a render. */
+  pending: boolean;
 }
 const stats = new Map<MeshHandle, MeshPreviewStats>();
 
 /** The stats of a mesh's picture (zeros before its first). */
 export function meshPreviewStats(mesh: MeshHandle): MeshPreviewStats {
-  return stats.get(mesh) ?? { starts: 0, renders: 0, triangles: 0, last: null };
+  return stats.get(mesh) ?? { starts: 0, renders: 0, triangles: 0, last: null, pending: true };
 }
 
 /** A canvas holding the picture, for encoding it. */
@@ -534,6 +533,12 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
   useEffect(() => {
     let live = true;
     let shown: string | null = null;
+    let armed = 0;
+    const settle = (at: number) => {
+      if (at === armed) {
+        stats.set(mesh, { ...meshPreviewStats(mesh), pending: false });
+      }
+    };
     const job: PreviewJob = {
       start: () => {
         const s = meshPreviewStats(mesh);
@@ -543,8 +548,10 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
       done: (render, run) => {
         const s = meshPreviewStats(mesh);
         stats.set(mesh, { ...s, renders: s.renders + 1, triangles: render.triangles, last: run });
+        const at = armed;
         const pixels = render.image();
         if (pixels === null) {
+          settle(at);
           return;
         }
         previewCanvas(pixels).toBlob((blob) => {
@@ -556,15 +563,21 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
           }
           shown = URL.createObjectURL(blob);
           setUrl(shown);
+          settle(at);
         });
       },
     };
-    jobs.set(mesh, job);
-    queue.invalidate(mesh, job, PREVIEW_FIRST_MS);
+    const arm = (quietMs: number) => {
+      armed++;
+      stats.set(mesh, { ...meshPreviewStats(mesh), pending: true });
+      queue.invalidate(mesh, job, quietMs);
+    };
+    arms.set(mesh, arm);
+    arm(PREVIEW_FIRST_MS);
     const off = store.scene.onChanges((changes) => {
       for (const c of changes) {
         if (c.mesh === mesh && !c.removed && (c.added || c.positions === "all" || c.indices === "all" || c.positions.length > 0 || c.indices.length > 0)) {
-          queue.invalidate(mesh, job);
+          arm(PREVIEW_QUIET_MS);
         }
       }
     });
@@ -576,7 +589,7 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
         URL.revokeObjectURL(shown);
       }
       stats.delete(mesh);
-      jobs.delete(mesh);
+      arms.delete(mesh);
     };
   }, [store, mesh, color]);
   return url;
