@@ -19,7 +19,9 @@
 // the surface by the pointer's drag, and dabs that touch a painted mask are dropped and
 // leave its vertices where they were, and a release before the press's raycast returns
 // opens no stroke, a grab released while a live pass is out leaves no vertex behind (Worker),
-// and Ctrl+Z during a grab changes nothing. It exits 1 on any failure.
+// and Ctrl+Z during a grab changes nothing; and on the demo meshes, with a brush left armed, a
+// stroke's release over another mesh keeps the brush, the next stroke lands, holding still builds
+// up finely, and a long grab along the surface does not fold it. It exits 1 on any failure.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -187,6 +189,102 @@ async function load(mode, path) {
   await sleep(1000);
 }
 
+/**
+ * What a person does on the demo meshes, with a brush left armed: strokes one after another
+ * over a mesh with another behind it, and a long grab along the surface.
+ */
+async function verifyOnDemo(check) {
+  const name = "B · rounded box";
+  const q = JSON.stringify(name);
+  await browser.goto(`${server.url}/`, "window.__showcase !== undefined");
+  await waitFor(`__showcase.items().some((m) => m.name.includes("headsq") && m.drawn)`);
+  await clickOn('[data-action="demo-meshes"]');
+  await waitFor(`__showcase.items().filter((m) => m.drawn).length >= 3`);
+  await page(`(document.querySelector('[data-mesh*="headsq"] button.danger')?.click(), true)`);
+  await waitFor(`!__showcase.items().some((m) => m.name.includes("headsq"))`);
+  await clickOn(`[data-mesh=${q}] .mesh-name`);
+  await sleep(300);
+  await page(`(document.activeElement?.blur?.(), true)`);
+  await browser.send("Input.dispatchKeyEvent", { type: "keyDown", key: "f", code: "KeyF", text: "f", windowsVirtualKeyCode: 70 });
+  await browser.send("Input.dispatchKeyEvent", { type: "keyUp", key: "f", code: "KeyF", windowsVirtualKeyCode: 70 });
+  await sleep(1000);
+  const armed = (tool) => page(`document.querySelector('[data-action="sculpt-tool-${tool}"]')?.getAttribute("aria-pressed") === "true"`);
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await sleep(300);
+  const c = await page(`__showcase.screenPoint(${q})`);
+  const hold = async (x, y, ms) => {
+    await mouse("mouseMoved", x, y, { button: "none" });
+    await sleep(200);
+    await mouse("mousePressed", x, y, { buttons: 1 });
+    await sleep(ms);
+    await mouse("mouseReleased", x, y, { buttons: 0 });
+    await sleep(500);
+  };
+  // Holding still makes no drag, so the release is a click, with mesh A behind the press.
+  const s0 = await page("__showcase.sculpt()");
+  await hold(c.x, c.y, 600);
+  const s1 = await page("__showcase.sculpt()");
+  check("demo first stroke", s1.strokes === s0.strokes + 1 && s1.dabs > s0.dabs, `${s1.strokes - s0.strokes} stroke, ${s1.dabs - s0.dabs} dabs`);
+  check("demo a stroke's release keeps the brush", await armed("inflate"), `armed ${await armed("inflate")}`);
+  await hold(c.x, c.y + 60, 600);
+  const s2 = await page("__showcase.sculpt()");
+  check("demo the next stroke lands", s2.strokes === s1.strokes + 1 && s2.dabs > s1.dabs, `${s2.strokes - s1.strokes} stroke, ${s2.dabs - s1.dabs} dabs`);
+  // Holding still builds up by the frame, not in steps a person can see.
+  await page(`(() => {
+    const a = window.__showcase;
+    const p = { times: [], last: a.sculpt().dabs, on: true };
+    const f = (t) => { const d = a.sculpt().dabs; if (d !== p.last) { p.times.push(t); p.last = d; } if (p.on) requestAnimationFrame(f); };
+    requestAnimationFrame(f);
+    window.__updates = p;
+    return true;
+  })()`);
+  await hold(c.x, c.y - 40, 800);
+  const times = await page("(window.__updates.on = false, window.__updates.times)");
+  const gaps = times.slice(1).map((t, k) => t - times[k]).sort((a, b) => a - b);
+  const median = gaps[gaps.length >> 1];
+  // Software rendering is slow in CI: the steps this replaced were 90 ms even on a fast machine.
+  check("demo holding still builds up finely", median !== undefined && median < 70, `updates every ${median?.toFixed(0)} ms (median)`);
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await sleep(100);
+  // A drag along the surface, longer than the brush radius: no triangle turns over.
+  await clickOn('[data-action="sculpt-tool-grab"]');
+  await sleep(300);
+  const start = await page(`__showcase.positions(${q})`);
+  const tris = await page(`__showcase.indices(${q})`);
+  await mouse("mouseMoved", c.x, c.y, { button: "none" });
+  await sleep(200);
+  await mouse("mousePressed", c.x, c.y, { buttons: 1 });
+  await sleep(60);
+  for (let k = 1; k <= 60; k++) {
+    await mouse("mouseMoved", c.x + 2 * k, c.y - k, { buttons: 1 });
+    await sleep(12);
+  }
+  await mouse("mouseReleased", c.x + 120, c.y - 60, { buttons: 0 });
+  await sleep(800);
+  const end = await page(`__showcase.positions(${q})`);
+  const after = await page(`__showcase.indices(${q})`);
+  let flipped = 0;
+  let moved = 0;
+  const cross = (p, a, b, c) => {
+    const u = [p[3 * b] - p[3 * a], p[3 * b + 1] - p[3 * a + 1], p[3 * b + 2] - p[3 * a + 2]];
+    const v = [p[3 * c] - p[3 * a], p[3 * c + 1] - p[3 * a + 1], p[3 * c + 2] - p[3 * a + 2]];
+    return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+  };
+  for (let t = 0; t + 2 < tris.length; t += 3) {
+    const [a, b, c2] = [tris[t], tris[t + 1], tris[t + 2]];
+    if (a === after[t] && b === after[t + 1] && c2 === after[t + 2] && !(a === 0 && b === 0 && c2 === 0)) {
+      const m = cross(start, a, b, c2);
+      const n = cross(end, a, b, c2);
+      if (m[0] * n[0] + m[1] * n[1] + m[2] * n[2] < 0) flipped++;
+    }
+  }
+  for (let k = 0; k + 2 < start.length; k += 3) {
+    if (start[k] !== end[k] || start[k + 1] !== end[k + 1] || start[k + 2] !== end[k + 2]) moved++;
+  }
+  check("demo a long grab along the surface does not fold it", flipped === 0 && moved > 50, `${moved} vertices moved, ${flipped} triangles turned over`);
+  await clickOn('[data-action="sculpt-tool-grab"]');
+}
+
 async function verify() {
   const { buf } = sphereStl(20_000);
   const path = join(fixtures, NAME);
@@ -350,7 +448,15 @@ async function verify() {
       await sleep(150);
       await mouse("mousePressed", gx, gy, { buttons: 1 });
       await sleep(80);
-      for (let k = 1; k <= 15; k++) {
+      // Out to the far end first: a longer drag can take in more of the surface, so
+      // that is what "outside the grab" has to be measured against.
+      for (let k = 1; k <= 30; k++) {
+        await mouse("mouseMoved", gx + 2 * k, gy, { buttons: 1 });
+        await sleep(12);
+      }
+      await sleep(300);
+      const peak = await positions();
+      for (let k = 29; k >= 15; k--) {
         await mouse("mouseMoved", gx + 2 * k, gy, { buttons: 1 });
         await sleep(12);
       }
@@ -370,7 +476,7 @@ async function verify() {
       // Outside what the grab moved, nothing should differ from before it: a difference is the seam.
       let outside = 0;
       for (let k = 0; k + 2 < original; k += 3) {
-        const grabbed = held[k] !== before[k] || held[k + 1] !== before[k + 1] || held[k + 2] !== before[k + 2];
+        const grabbed = peak[k] !== before[k] || peak[k + 1] !== before[k + 1] || peak[k + 2] !== before[k + 2];
         if (!grabbed && Math.hypot(end[k] - before[k], end[k + 1] - before[k + 1], end[k + 2] - before[k + 2]) > 0) {
           outside++;
         }
@@ -511,6 +617,7 @@ async function verify() {
     const errors = browser.consoleLines.filter((l) => /exception|error:/i.test(l));
     check(`${mode} console`, errors.length === 0, errors.slice(0, 3).join(" | ") || "clean");
   }
+  await verifyOnDemo(check);
   return failed;
 }
 

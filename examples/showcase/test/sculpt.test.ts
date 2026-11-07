@@ -67,8 +67,8 @@ function tick(): Promise<void> {
 
 describe("sculpt dabs", () => {
   it("spaces_dabs_tightly", () => {
-    expect(dabSpacing(1)).toBe(0.15);
-    expect(dabSpacing(0.4)).toBeCloseTo(0.06, 10);
+    expect(dabSpacing(1)).toBe(0.05);
+    expect(dabSpacing(0.4)).toBeCloseTo(0.02, 10);
     expect(dabSpacing(0)).toBeGreaterThan(0);
     expect(dabSpacing(-2)).toBeGreaterThan(0);
   });
@@ -188,8 +188,8 @@ describe("SculptStroke", () => {
     });
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
     await tick();
-    expect(stroke.dab([0.1, 0, 0])).toBe("skipped");
-    expect(stroke.dab([0.1, 0, 0], true)).toBe("stamped");
+    expect(stroke.dab([0.033333, 0, 0])).toBe("skipped");
+    expect(stroke.dab([0.033333, 0, 0], true)).toBe("stamped");
     expect(applies).toBe(2);
     stroke.end();
     await stroke.done;
@@ -241,9 +241,9 @@ describe("SculptStroke", () => {
       },
     );
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
-    // Nothing is dropped: one spacing is 0.15, so these are three more dabs.
-    expect(stroke.dab([0.15, 0, 0])).toBe("stamped");
-    expect(stroke.dab([0.45, 0, 0])).toBe("stamped");
+    // Nothing is dropped: one spacing is 0.05, so these are three more dabs.
+    expect(stroke.dab([0.05, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.16, 0, 0])).toBe("stamped");
     expect(stroke.dabs).toBe(4);
     expect(seen).toEqual([1]);
     gate.resolve();
@@ -265,7 +265,7 @@ describe("SculptStroke", () => {
       },
     );
     stroke.dab([0, 0, 0]);
-    stroke.dab([0.3, 0, 0]);
+    stroke.dab([0.1, 0, 0]);
     expect(seen).toEqual([1]);
     stroke.flush();
     expect(seen).toEqual([1, 2]);
@@ -286,12 +286,12 @@ describe("SculptStroke", () => {
       },
     );
     stroke.dab([0, 0, 0]);
-    stroke.dab([0.3, 0, 0]);
+    stroke.dab([0.1, 0, 0]);
     const passed = stroke.pass(() => {
       calls.push("pass");
       return gate.promise;
     });
-    stroke.dab([0.6, 0, 0]);
+    stroke.dab([0.2, 0, 0]);
     stroke.end();
     expect(calls).toEqual(["begin", "apply 1", "apply 2", "pass"]);
     gate.resolve();
@@ -371,7 +371,7 @@ describe("SculptStroke", () => {
       },
     );
     stroke.dab([0, 0, 0]);
-    stroke.dab([0.3, 0, 0]);
+    stroke.dab([0.1, 0, 0]);
     stroke.end();
     expect(calls).toEqual(["begin", "apply 1", "apply 2"]);
     gate.resolve();
@@ -391,14 +391,14 @@ describe("SculptStroke", () => {
     );
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
     await tick();
-    expect(stroke.dab([0.5, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.166667, 0, 0])).toBe("stamped");
     await tick();
-    expect(centers.map((c) => Number(c[0].toFixed(6)))).toEqual([0, 0.15, 0.3, 0.45]);
+    expect(centers.map((c) => Number(c[0].toFixed(6)))).toEqual([0, 0.05, 0.1, 0.15]);
     // The remainder carries over: the next sample goes on from the last dab.
-    expect(stroke.dab([0.55, 0, 0])).toBe("skipped");
-    expect(stroke.dab([0.65, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.183333, 0, 0])).toBe("skipped");
+    expect(stroke.dab([0.216667, 0, 0])).toBe("stamped");
     await tick();
-    expect(centers.at(-1)?.[0]).toBeCloseTo(0.6, 10);
+    expect(centers.at(-1)?.[0]).toBeCloseTo(0.2, 10);
     stroke.end();
     await stroke.done;
   });
@@ -434,14 +434,14 @@ describe("SculptStroke", () => {
         centers.push(...ops.map((op) => (op as { center: readonly number[] }).center[0]));
         return Promise.resolve();
       },
-      (at) => at[0] > 0.2 && at[0] < 0.4,
+      (at) => at[0] > 0.07 && at[0] < 0.13,
     );
     stroke.dab([0, 0, 0]);
     await tick();
-    stroke.dab([0.65, 0, 0]);
+    stroke.dab([0.216667, 0, 0]);
     stroke.end();
     await stroke.done;
-    expect(centers.map((x) => Number(x.toFixed(6)))).toEqual([0, 0.15, 0.45, 0.6]);
+    expect(centers.map((x) => Number(x.toFixed(6)))).toEqual([0, 0.05, 0.15, 0.2]);
   });
 
   it("a_newer_move_replaces_one_that_has_not_started", async () => {
@@ -521,10 +521,10 @@ describe("SculptStroke", () => {
     expect(stroke.dab([0, 0, 0])).toBe("stamped");
     await tick();
     radius = 2;
-    expect(stroke.dab([1, 0, 0])).toBe("stamped");
+    expect(stroke.dab([0.35, 0, 0])).toBe("stamped");
     stroke.end();
     await stroke.done;
-    // The second radius applies from the second sample on, its spacing 0.3 over the distance 1.
+    // The second radius applies from the second sample on, its spacing 0.1 over the distance 0.35.
     expect(seen).toEqual([1, 2, 2, 2]);
   });
 });

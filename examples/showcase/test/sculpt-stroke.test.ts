@@ -5,7 +5,7 @@
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import { maskEdgeField } from "../src/viewport/mask-protect";
-import { GrabRegion, SculptStroke, sculptBrush, type SculptBrush } from "../src/viewport/sculpt";
+import { GRAB_MAX_STRETCH, GrabRegion, SculptStroke, sculptBrush, type SculptBrush } from "../src/viewport/sculpt";
 
 type Vec = [number, number, number];
 
@@ -88,7 +88,7 @@ async function grabStroke(events: number) {
   const v = s.scene.views(s.mesh);
   const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
   for (let k = 1; k <= events; k++) {
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(dragAt(k / events)) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(dragAt(k / events)) }]);
   }
   return { out: Float32Array.from(v.positions()), start: s.start };
 }
@@ -191,7 +191,7 @@ describe("undo", () => {
       const drag = dragAt(k / 20);
       stroke.move(
         () => {
-          s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+          s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(drag) }]);
           return Promise.resolve();
         },
         [R + drag[0], drag[1], drag[2]],
@@ -215,7 +215,7 @@ describe("a remesh during a grab", () => {
     const center: Vec = [R, 0, 0];
     const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
     const half: Vec = [0.3, 0.1, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(half) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(half) }]);
     // The live pass: splits only, here over the grabbed region.
     const slotsBefore = v.positions().length / 3;
     s.scene.repair(s.mesh, { op: "remesh", center: [R + 0.3, 0.1, 0], radius: 1, maxRounds: 2, splitOnly: true, targetLength: 0.02 });
@@ -223,12 +223,12 @@ describe("a remesh during a grab", () => {
     const settled = Float32Array.from(v.positions());
     region.rebase(v.positions(), v.indices());
     // No pop: the same drag writes the same positions back.
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(half) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(half) }]);
     expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
     // New vertices follow on: every vertex in the middle of the grabbed lump
     // moves with the drag, old and new.
     const further: Vec = [0.6, 0.2, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(further) }]);
     const now = v.positions();
     const slots = settled.length / 3;
     let followers = 0;
@@ -255,18 +255,18 @@ describe("a live split during a long grab", () => {
     const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
     // A drag several radii long: the lump's sides stretch far past the limit.
     const far: Vec = [2.5, 0, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(far) }]);
     const slotsBefore = v.positions().length / 3;
     const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 1, 0, 0], radius: 4 });
     expect(r.splits).toBeGreaterThan(10);
     const settled = Float32Array.from(v.positions());
     region.rebase(v.positions(), v.indices(), r.vertices);
     // No pop: the same drag writes the same positions back.
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(far) }]);
     expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
     // Dragging on takes the new vertices along, each by its own part of the drag.
     const further: Vec = [3, 0, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(further) }]);
     const now = v.positions();
     const slots = settled.length / 3;
     let moved = 0;
@@ -294,12 +294,12 @@ describe("a live split during a grab along the surface", () => {
     // not say which part of the sheet a new vertex belongs to.
     for (let k = 1; k <= 60; k++) {
       const drag: Vec = [0, 0.05 * k, 0];
-      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+      s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(drag) }]);
       if (k % 4 === 0) {
         const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.025 * k, 0], radius: 4 });
         const settled = Float32Array.from(v.positions());
         region.rebase(v.positions(), v.indices(), r.vertices);
-        s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+        s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(drag) }]);
         expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
       }
     }
@@ -314,7 +314,7 @@ describe("a live split during a grab along the surface", () => {
     s.scene.repair(s.mesh, { op: "captureRestSizes" });
     const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
     const drag: Vec = [0, 1.5, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(drag) }]);
     const moving = new Set(region.ids);
     const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.75, 0], radius: 4 });
     expect(r.vertices.length / 3).toBe(r.splits);
@@ -344,9 +344,9 @@ describe("a grab on a mesh away from the world origin", () => {
     const before = Float32Array.from(v.positions());
     const center: Vec = [before[3], before[4], before[5]];
     const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1, scene.origin(mesh));
-    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0, 0]) }]);
+    scene.edit(mesh, [{ op: "setPositions", ...region.at([0, 0, 0]) }]);
     expect(maxDifference(v.positions(), before)).toBeLessThan(1e-5);
-    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
+    scene.edit(mesh, [{ op: "setPositions", ...region.at([0, 0.2, 0]) }]);
     expect(maxDifference(v.positions(), before)).toBeCloseTo(0.2, 3);
   });
 });
@@ -359,13 +359,13 @@ describe("a remesh during a long grab", () => {
     const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
     // Three radii out: the warp folds here, so no position maps back to one rest.
     const far: Vec = [1.5, 0, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(far) }]);
     const slots = v.positions().length / 3;
     const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 0.8, 0, 0], radius: 3 });
     expect(v.positions().length / 3).toBeGreaterThan(slots);
     region.rebase(v.positions(), v.indices(), r.vertices);
     const further: Vec = [2.5, 0, 0];
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at(further) }]);
     // Each new vertex stays between its neighbours as the lump goes on.
     const positions = v.positions();
     const indices = v.indices();
@@ -426,8 +426,7 @@ describe("a grab released while a live pass is out", () => {
       stroke.move(
         () => {
           // The ids and positions are read when it is sent, not when it runs.
-          const vertices = region.ids;
-          const positions = region.positionsAt(drag);
+          const { vertices, positions } = region.at(drag);
           return send(() => s.scene.edit(s.mesh, [{ op: "setPositions", vertices, positions }]));
         },
         [R + drag[0], drag[1], drag[2]],
@@ -488,7 +487,7 @@ describe("GrabRegion over a mask", () => {
     const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1, [0, 0, 0], field);
     expect(region.ids.length).toBeGreaterThan(0);
     for (let k = 1; k <= 8; k++) {
-      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.05 * k, 0]) }]);
+      s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at([0, 0.05 * k, 0]) }]);
       const now = new Uint8Array(v.positions().buffer, v.positions().byteOffset, v.positions().byteLength);
       const was = new Uint8Array(before.buffer);
       for (const id of ids) {
@@ -509,8 +508,8 @@ describe("GrabRegion over a mask", () => {
     const held = new Set(ids);
     expect(Array.from(region.ids).some((id) => held.has(id))).toBe(false);
     expect(region.ids.length).toBeLessThan(free.ids.length);
-    region.positionsAt([0, 0.2, 0]);
-    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
+    region.at([0, 0.2, 0]).positions;
+    s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at([0, 0.2, 0]) }]);
     region.rebase(v.positions(), v.indices());
     expect(Array.from(region.ids).some((id) => held.has(id))).toBe(false);
   });
@@ -531,7 +530,7 @@ describe("GrabRegion", () => {
   it("captures_the_vertices_under_the_brush_with_their_weights", () => {
     const region = new GrabRegion(positions, indices, [R, 0, 0], 0.5, "smooth", 1);
     expect(region.ids.length).toBeGreaterThan(5);
-    const out = region.positionsAt([0, 0, 0]);
+    const out = region.at([0, 0, 0]).positions;
     for (let k = 0; k < region.ids.length; k++) {
       const id = region.ids[k];
       expect(out[3 * k]).toBeCloseTo(positions[3 * id], 5);
@@ -542,8 +541,8 @@ describe("GrabRegion", () => {
   it("scales_the_drag_by_strength_and_falloff", () => {
     const full = new GrabRegion(positions, indices, [R, 0, 0], 0.5, "smooth", 1);
     const half = new GrabRegion(positions, indices, [R, 0, 0], 0.5, "smooth", 0.5);
-    const a = full.positionsAt([1, 0, 0]);
-    const b = half.positionsAt([1, 0, 0]);
+    const a = full.at([1, 0, 0]).positions;
+    const b = half.at([1, 0, 0]).positions;
     expect(full.ids).toEqual(half.ids);
     for (let k = 0; k < full.ids.length; k++) {
       const rest = positions[3 * full.ids[k]];
@@ -553,5 +552,130 @@ describe("GrabRegion", () => {
 
   it("is_empty_away_from_the_surface", () => {
     expect(new GrabRegion(positions, indices, [50, 0, 0], 0.5, "smooth", 1).ids.length).toBe(0);
+  });
+});
+
+describe("a grab never folds the surface", () => {
+  // A flat sheet with its normals along +z: a triangle turned over points the other way.
+  const sheet = (n: number, size: number) => {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    for (let j = 0; j <= n; j++) {
+      for (let i = 0; i <= n; i++) {
+        positions.push((i / n - 0.5) * size, (j / n - 0.5) * size, 0);
+      }
+    }
+    const at = (i: number, j: number) => j * (n + 1) + i;
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        indices.push(at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j), at(i + 1, j + 1), at(i, j + 1));
+      }
+    }
+    return { positions: Float32Array.from(positions), indices: Uint32Array.from(indices) };
+  };
+  const moved = (s: { positions: Float32Array }, region: GrabRegion, drag: [number, number, number]) => {
+    const out = Float32Array.from(s.positions);
+    const { vertices, positions } = region.at(drag);
+    vertices.forEach((v, k) => {
+      out[3 * v] = positions[3 * k];
+      out[3 * v + 1] = positions[3 * k + 1];
+      out[3 * v + 2] = positions[3 * k + 2];
+    });
+    return out;
+  };
+  const turnedOver = (p: Float32Array, indices: Uint32Array) => {
+    let count = 0;
+    for (let t = 0; t < indices.length; t += 3) {
+      const [a, b, c] = [indices[t], indices[t + 1], indices[t + 2]];
+      const area =
+        (p[3 * b] - p[3 * a]) * (p[3 * c + 1] - p[3 * a + 1]) - (p[3 * b + 1] - p[3 * a + 1]) * (p[3 * c] - p[3 * a]);
+      if (area <= 0) count++;
+    }
+    return count;
+  };
+
+  it.each(["smooth", "linear"] as const)("along the surface, at any length (%s)", (falloff) => {
+    const s = sheet(80, 8);
+    const radius = 0.5;
+    for (const length of [0.2, 0.5, 1, 2, 3]) {
+      const region = new GrabRegion(s.positions, s.indices, [0, 0, 0], radius, falloff, 1);
+      expect(turnedOver(moved(s, region, [length, 0, 0]), s.indices)).toBe(0);
+    }
+  });
+
+  it("the old fixed radius does fold at these lengths", () => {
+    // What the widening is for: smoothstep over a fixed 0.5 radius, dragged 1.
+    const s = sheet(80, 8);
+    const out = Float32Array.from(s.positions);
+    for (let v = 0; v < out.length / 3; v++) {
+      const t = Math.hypot(out[3 * v], out[3 * v + 1]) / 0.5;
+      if (t < 1) {
+        const u = 1 - t;
+        out[3 * v] += u * u * (3 - 2 * u);
+      }
+    }
+    expect(turnedOver(out, s.indices)).toBeGreaterThan(0);
+  });
+
+  it("the press follows the drag, and a short drag keeps the brush radius", () => {
+    const s = sheet(80, 8);
+    const region = new GrabRegion(s.positions, s.indices, [0, 0, 0], 0.5, "smooth", 1);
+    expect(region.influence([0.1, 0, 0])).toBe(0.5);
+    expect(region.influence([2, 0, 0])).toBeCloseTo((1.5 * 2) / GRAB_MAX_STRETCH, 5);
+    const out = moved(s, region, [2, 1, 0]);
+    const center = 40 * 81 + 40;
+    expect(out[3 * center]).toBeCloseTo(2, 5);
+    expect(out[3 * center + 1]).toBeCloseTo(1, 5);
+  });
+
+  it("depends on the total drag alone, also after it comes back", () => {
+    const s = sheet(40, 8);
+    const region = new GrabRegion(s.positions, s.indices, [0, 0, 0], 0.5, "smooth", 1);
+    moved(s, region, [3, 0, 0]);
+    const back = moved(s, region, [0.1, 0, 0]);
+    const direct = moved(s, new GrabRegion(s.positions, s.indices, [0, 0, 0], 0.5, "smooth", 1), [0.1, 0, 0]);
+    expect(Array.from(back)).toEqual(Array.from(direct));
+  });
+
+  it("pulling straight off the surface keeps the brush radius, however far", () => {
+    const s = sheet(80, 8);
+    const region = new GrabRegion(s.positions, s.indices, [0, 0, 0], 0.5, "smooth", 1);
+    expect(region.influence([0, 0, 3])).toBe(0.5);
+  });
+
+  it("surface ahead of a pull off it widens the influence", () => {
+    // A wall ahead of the press, at x = 1, which the lump's front would run over.
+    const s = sheet(40, 8);
+    const wall = s.positions.length / 3;
+    const positions = Float32Array.from([...s.positions, 1, 0, 2, 1, 1, 2, 1, 0, 3]);
+    const indices = Uint32Array.from([...s.indices, wall, wall + 1, wall + 2]);
+    const region = new GrabRegion(positions, indices, [0, 0, 2], 0.5, "smooth", 1);
+    expect(region.influence([3, 0, 0])).toBeGreaterThan(0.5);
+  });
+
+  it("a vertex added mid-drag stays where it landed, then moves with its edge", () => {
+    const s = sheet(40, 8);
+    const region = new GrabRegion(s.positions, s.indices, [0, 0, 0], 0.5, "smooth", 1);
+    const drag: [number, number, number] = [1.5, 0, 0];
+    const landed = moved(s, region, drag);
+    const [a, b] = [20 * 41 + 20, 20 * 41 + 21];
+    const fresh = landed.length / 3;
+    const at = [0, 1, 2].map((c) => (landed[3 * a + c] + landed[3 * b + c]) / 2);
+    const positions = Float32Array.from([...landed, ...at]);
+    const indices = Uint32Array.from([...s.indices, fresh, a, b]);
+    region.rebase(positions, indices, [fresh, a, b]);
+    const read = (edit: { vertices: Uint32Array; positions: Float64Array }, v: number) => {
+      const k = Array.from(edit.vertices).indexOf(v);
+      expect(k).toBeGreaterThanOrEqual(0);
+      return Array.from(edit.positions.subarray(3 * k, 3 * k + 3));
+    };
+    const same = read(region.at(drag), fresh);
+    for (const c of [0, 1, 2]) {
+      expect(same[c]).toBeCloseTo(at[c], 4);
+    }
+    const further = region.at([1.8, 0, 0]);
+    const [pa, pb, pf] = [read(further, a), read(further, b), read(further, fresh)];
+    // Its share of the extra drag is its edge's mean, whatever the widening does.
+    expect(pf[0] - at[0]).toBeCloseTo((pa[0] - landed[3 * a] + (pb[0] - landed[3 * b])) / 2, 4);
   });
 });

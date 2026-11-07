@@ -28,6 +28,7 @@ import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
 import { matchVolume } from "./volume-box";
 import {
+  faceNormal,
   GrabRegion,
   type SculptBrush,
   type SculptMask,
@@ -44,6 +45,7 @@ import {
   unionMaskIds,
   worldPerPixel,
 } from "./sculpt";
+import { easeNormal, makeBrushCursor, NORMAL_MARKER, placeBrushCursor, setBrushDirection } from "./brush-cursor";
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
@@ -70,7 +72,9 @@ const HOVER_PERIOD_MS = 50;
 /** The sculpt raycast runs at most this often while a stroke paints. */
 const STROKE_PERIOD_MS = 16;
 /** Hold-still buildup: a forced dab this often while the button stays down without moving. */
-const BUILDUP_MS = 90;
+const BUILDUP_MS = 16;
+/** Holding this long builds up one full dab's strength. */
+const BUILDUP_FULL_MS = 90;
 
 export function Viewport(props: {
   app: AppState;
@@ -325,8 +329,9 @@ function MeshView(props: {
       if (e.delta > tapSlop(view.pointerType, 2) || view.multiTouch) {
         return;
       }
-      // A stroke's release on the mesh is not a click either.
-      if (sculpted) {
+      // A stroke's release on the mesh is not a click either, nor on a mesh
+      // behind it, which the sculpted mesh's missing handler lets the click reach.
+      if (sculpted || view.pressTaken) {
         return;
       }
       // The inspect tools own the click while armed, and never select: the
@@ -645,7 +650,7 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
 }
 
 /**
- * The sculpt brush on its mesh: hover shows the brush ball (a translucent
+ * The sculpt brush on its mesh: hover shows the brush cursor (a translucent
  * sphere of the brush radius around the surface point), press-and-hold
  * paints dabs along the pointer (and builds up where it holds still;
  * grab drags the surface along instead). A press on empty space is the
@@ -682,27 +687,14 @@ function SculptLayer(props: {
   // stroke paints; outside React, so moves never re-render.
   const dirRef = useRef<[number, number, number]>([0, 0, 0]);
 
-  const ball = useMemo(() => {
-    const group = new THREE.Group();
-    group.add(
-      new THREE.Mesh(
-        new THREE.SphereGeometry(1, 40, 28),
-        new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.18, depthWrite: false }),
-      ),
-    );
-    group.add(
-      new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffd166 })),
-    );
-    group.visible = false;
-    return group;
-  }, []);
+  const ball = useMemo(() => makeBrushCursor(0xffd166), []);
   useEffect(() => {
     return () => {
       ball.removeFromParent();
       for (const child of ball.children) {
-        const mesh = child as THREE.Mesh;
-        mesh.geometry.dispose();
-        (mesh.material as THREE.Material).dispose();
+        const part = child as THREE.Mesh | THREE.Line;
+        part.geometry.dispose();
+        (part.material as THREE.Material).dispose();
       }
     };
   }, [ball]);
@@ -738,6 +730,8 @@ function SculptLayer(props: {
     let grabPress: [number, number, number] | null = null;
     /** What the grab stroke holds on to, or null while a masked press holds it still. */
     let grabRegion: GrabRegion | null = null;
+    /** The surface's way at the cursor, eased over the triangles it crosses. */
+    let cursorNormal: [number, number, number] | null = null;
     /**
      * The armed mesh's mean edge length, taken once per armed session: the
      * remesh target every stroke converges back to (the engine's live mean
@@ -971,7 +965,7 @@ function SculptLayer(props: {
       if (!liveRemeshDue(stroke.dabs - liveDabs, performance.now() - liveAt, liveRunning !== null)) {
         return;
       }
-      const b = stroke.bounds();
+      const b = strokeBounds(stroke, grabRegion, grabPress);
       if (b === null) {
         return;
       }
@@ -1009,22 +1003,24 @@ function SculptLayer(props: {
       return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
     };
 
-    /** The hit over the mesh's local views: its point. */
+    /** The hit over the mesh's local views: its point, and the surface's way there for the cursor. */
     const localHit = (hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
       const v = scene.views(brushRef.current.mesh);
       const indices = v.indices();
       const positions = v.positions();
       const corners = [indices[3 * hit.triangle], indices[3 * hit.triangle + 1], indices[3 * hit.triangle + 2]];
+      cursorNormal = easeNormal(cursorNormal, faceNormal(positions, corners[0], corners[1], corners[2]));
       return interpolateHit(positions, corners, hit.barycentric);
     };
 
     const hideBall = () => {
       hoverLocal = null;
+      cursorNormal = null;
       ball.visible = false;
       inspect.sculpt.hovering = false;
     };
 
-    /** The ball around the surface point: a child of the mesh, in its local frame. */
+    /** The cursor on the surface point: a child of the mesh, in its local frame. */
     const showBall = (point: readonly [number, number, number]) => {
       const binding = view.bindings.get(brushRef.current.mesh);
       if (binding === undefined) {
@@ -1034,9 +1030,29 @@ function SculptLayer(props: {
       if (ball.parent !== binding.object) {
         binding.object.add(ball);
       }
-      ball.visible = true;
-      ball.position.set(point[0], point[1], point[2]);
-      ball.scale.setScalar(Math.max(brushRef.current.radius, 1e-6));
+      const brush = brushRef.current;
+      placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], brush.radius);
+      // Which way the surface will go: along the normal, out or in. Smooth has no way, and a grab shows its drag.
+      const [nx, ny, nz] = cursorNormal ?? [0, 0, 1];
+      const out = brush.op === "inflate" ? Math.sign(brush.strength) * NORMAL_MARKER * brush.radius : 0;
+      setBrushDirection(ball, [out * nx, out * ny, out * nz]);
+    };
+
+    /** The cursor during a grab: where the press was and how far it reaches now, with the drag marked. */
+    const showGrab = (press: readonly [number, number, number], drag: readonly [number, number, number], reach: number) => {
+      showBall(press);
+      placeBrushCursor(ball, press, cursorNormal ?? [0, 0, 1], reach);
+      setBrushDirection(ball, drag);
+    };
+
+    /** Where a pass over `s` has to look: a grab's widened reach goes past the dabs' bounds. */
+    const strokeBounds = (s: SculptStroke, region: GrabRegion | null, press: readonly [number, number, number] | null) => {
+      const b = s.bounds();
+      if (b === null || region === null || press === null) {
+        return b;
+      }
+      const off = Math.hypot(press[0] - b.center[0], press[1] - b.center[1], press[2] - b.center[2]);
+      return { center: b.center, radius: Math.max(b.radius, off + region.reach * 1.5) };
     };
 
     const endStroke = () => {
@@ -1045,6 +1061,7 @@ function SculptLayer(props: {
       buildup = undefined;
       active = -1;
       grabFrom = null;
+      const lastBounds = stroke === null ? null : strokeBounds(stroke, grabRegion, grabPress);
       grabPress = null;
       grabRegion = null;
       dirRef.current = [0, 0, 0];
@@ -1064,7 +1081,7 @@ function SculptLayer(props: {
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
         if (liveRef.current) {
-          const b = s.bounds();
+          const b = lastBounds;
           if (b !== null) {
             const mesh = brushRef.current.mesh;
             inspect.sculpt.liveRemeshes++;
@@ -1162,12 +1179,12 @@ function SculptLayer(props: {
       const at: [number, number, number] = [grabPress[0] + k * g[0], grabPress[1] + k * g[1], grabPress[2] + k * g[2]];
       s.move(
         () =>
-          landing(store.edit(brush.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(g) }])),
+          landing(store.edit(brush.mesh, [{ op: "setPositions", ...region.at(g) }])),
         at,
       );
       inspect.sculpt.grabTotal = Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
       inspect.sculpt.lastDab = at;
-      showBall(at);
+      showGrab(grabPress, [k * g[0], k * g[1], k * g[2]], region.influence(g));
       syncDabs();
       maybeLiveRemesh();
     };
@@ -1187,8 +1204,11 @@ function SculptLayer(props: {
       const at = pending;
       pending = null;
       if (stroke !== null && brushRef.current.op === "grab") {
-        last = performance.now();
         paintGrab(at.x, at.y);
+        // From when it is done: where a move takes longer than the pointer's events
+        // (a wide grab of a huge mesh on the sync scene), the moves between are skipped
+        // instead of piling up, and the shape only depends on the last one.
+        last = performance.now();
         return;
       }
       running = true;
@@ -1334,6 +1354,8 @@ function SculptLayer(props: {
             active = e.pointerId;
             stroke = s;
             view.stroking = true;
+            // Its release is not a click on whatever is behind the mesh.
+            view.pressTaken = true;
             counted = 0;
             if (view.orbit !== null) {
               view.orbit.enabled = false;
@@ -1370,6 +1392,7 @@ function SculptLayer(props: {
             }
             syncDabs();
             clearInterval(buildup);
+            let builtAt = performance.now();
             buildup = setInterval(() => {
               // Grab is move-driven only: holding still must not drift.
               if (brushRef.current.op === "grab") {
@@ -1377,7 +1400,11 @@ function SculptLayer(props: {
               }
               const at = hoverLocal;
               if (at !== null) {
-                stroke?.dab(at, true);
+                // By the time gone, so a busy scene builds up as fast as an idle one.
+                const now = performance.now();
+                if (stroke?.dab(at, true, Math.min(1, (now - builtAt) / BUILDUP_FULL_MS)) === "stamped") {
+                  builtAt = now;
+                }
                 syncDabs();
                 maybeLiveRemesh();
               }
@@ -1447,33 +1474,21 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
   const radiusRef = useRef(radius);
   radiusRef.current = radius;
 
-  const ball = useMemo(() => {
-    const group = new THREE.Group();
-    group.add(
-      new THREE.Mesh(
-        new THREE.SphereGeometry(1, 40, 28),
-        new THREE.MeshBasicMaterial({ color: 0x6ea8d9, transparent: true, opacity: 0.18, depthWrite: false }),
-      ),
-    );
-    group.add(
-      new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12), new THREE.MeshBasicMaterial({ color: 0x6ea8d9 })),
-    );
-    group.visible = false;
-    return group;
-  }, []);
+  const ball = useMemo(() => makeBrushCursor(0x6ea8d9), []);
   useEffect(() => {
     return () => {
       ball.removeFromParent();
       for (const child of ball.children) {
-        const mesh = child as THREE.Mesh;
-        mesh.geometry.dispose();
-        (mesh.material as THREE.Material).dispose();
+        const part = child as THREE.Mesh | THREE.Line;
+        part.geometry.dispose();
+        (part.material as THREE.Material).dispose();
       }
     };
   }, [ball]);
 
   useEffect(() => {
     const canvas = gl.domElement;
+    let cursorNormal: [number, number, number] | null = null;
     const caster = new THREE.Raycaster();
     let alive = true;
     let running = false;
@@ -1495,21 +1510,23 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
     };
 
-    /** The hit over the mesh's local views: its point. */
+    /** The hit over the mesh's local views: its point, and the surface's way there for the cursor. */
     const localHit = (mesh: MeshHandle, hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
       const v = scene.views(mesh);
       const indices = v.indices();
       const positions = v.positions();
       const corners = [indices[3 * hit.triangle], indices[3 * hit.triangle + 1], indices[3 * hit.triangle + 2]];
+      cursorNormal = easeNormal(cursorNormal, faceNormal(positions, corners[0], corners[1], corners[2]));
       return interpolateHit(positions, corners, hit.barycentric);
     };
 
     const hideBall = () => {
+      cursorNormal = null;
       ball.visible = false;
       inspect.sculpt.hovering = false;
     };
 
-    /** The ball around the surface point: a child of the mesh, in its local frame. */
+    /** The cursor on the surface point: a child of the mesh, in its local frame. */
     const showBall = (mesh: MeshHandle, point: readonly [number, number, number]) => {
       const binding = view.bindings.get(mesh);
       if (binding === undefined) {
@@ -1519,9 +1536,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       if (ball.parent !== binding.object) {
         binding.object.add(ball);
       }
-      ball.visible = true;
-      ball.position.set(point[0], point[1], point[2]);
-      ball.scale.setScalar(Math.max(radiusRef.current, 1e-6));
+      placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], radiusRef.current);
     };
 
     /** Accumulates one sphere-brush pick at `point` into the mask. */
@@ -1657,6 +1672,8 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
             inspect.sculpt.hovering = true;
             showBall(mesh, point);
             active = e.pointerId;
+            // Its release is not a click on whatever is behind the mesh.
+            view.pressTaken = true;
             paintMesh = mesh;
             if (view.orbit !== null) {
               view.orbit.enabled = false;

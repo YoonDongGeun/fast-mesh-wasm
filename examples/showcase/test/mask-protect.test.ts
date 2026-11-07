@@ -174,7 +174,7 @@ describe("a split between masked vertices", () => {
     const v = scene.views(mesh);
     scene.repair(mesh, { op: "captureRestSizes" });
     const first = new GrabRegion(v.positions(), v.indices(), [0, 0, 0], 1, "smooth", 1, scene.origin(mesh));
-    scene.edit(mesh, [{ op: "setPositions", vertices: first.ids, positions: first.positionsAt([0, 0, 1.5]) }]);
+    scene.edit(mesh, [{ op: "setPositions", ...first.at([0, 0, 1.5]) }]);
     const local = v.positions();
     const masked: number[] = [];
     for (let i = 0; i < local.length / 3; i++) {
@@ -230,7 +230,7 @@ describe("a split between masked vertices", () => {
     const inRegion = new Set(region.ids);
     expect(all.some((id) => inRegion.has(id))).toBe(false);
     for (let k = 1; k <= 6; k++) {
-      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0.1 * k, 0, 0]) }]);
+      s.scene.edit(s.mesh, [{ op: "setPositions", ...region.at([0.1 * k, 0, 0]) }]);
       const report = s.scene.repair(s.mesh, { op: "splitStretched", center, radius: 3, maxSplits: 200 });
       // In the order the stroke goes: the split joins the mask, then the region is taken again.
       const set = new Set(all);
