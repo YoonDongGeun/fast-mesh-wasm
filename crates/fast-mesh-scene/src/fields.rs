@@ -3325,7 +3325,7 @@ impl Scene {
         let reach = |v: usize| -> f64 {
             let moved = stamps
                 .get(v)
-                .map_or(0.0, |&t| job.live_travel - f64::from(t));
+                .map_or(job.live_travel, |&t| job.live_travel - f64::from(t)); // No stamp yet: computed at 0.
             f64::from(values[v].abs()).min(md) - moved
         };
         let mut c: Vec<VertexId> = (0..values.len().min(slots))
@@ -3730,9 +3730,10 @@ impl Scene {
                 f.live.sweep = ((start as usize + swept) % slots) as u32;
             }
             f.live.margin = plan.margin;
+            // Vertices left out keep the stamp of before this update's motion.
+            f.live.stamps.resize(slots, f.live.travel as f32);
             f.live.travel = job.live_travel;
             let stamp = job.live_travel as f32;
-            f.live.stamps.resize(slots, stamp);
             for &v in &plan.candidates {
                 f.live.stamps[v as usize] = stamp;
             }
@@ -8463,5 +8464,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn interaction_counts_the_motion_before_its_first_update() {
+        // Apart, then the first update brings B against A: the vertex now in
+        // contact held a large value, and only the motion says it can be close.
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        scene.set_placement(b, at(4.0, 0.0, 0.0)).unwrap();
+        let fa = scene
+            .add_distance_field(field("d", a, b, f64::INFINITY))
+            .unwrap();
+        let slots = scene.field_values(fa).unwrap().len();
+        assert!(scene.field_values(fa).unwrap()[0] > 1.5);
+        scene.fields[0].live.sweep = slots as u32 / 2;
+        scene.set_field_interaction(Some(slots / 4)).unwrap();
+        scene.set_placement(b, at(2.0, 0.0, 0.0)).unwrap();
+        // Vertex 0 is (1, 0, 0), touching B's (-1, 0, 0) now.
+        assert!(scene.field_values(fa).unwrap()[0].abs() < 1e-3);
+        // A vertex left out is stamped with what it was computed at, so a
+        // later update still counts this motion for it.
+        let stamps = &scene.fields[0].live.stamps;
+        let left = stamps.iter().filter(|&&t| t == 0.0).count();
+        assert!(
+            left > 0,
+            "every vertex stamped as computed after the motion"
+        );
     }
 }
