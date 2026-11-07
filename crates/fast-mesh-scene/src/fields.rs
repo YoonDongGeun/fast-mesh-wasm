@@ -247,6 +247,12 @@ const NEAR_PAIRS_PER_SLOT: usize = 1;
 /// take about as long as a point.
 const SIGN_ELEMS_PER_POINT: usize = 32;
 
+/// Sign data elements of a build that one moved vertex of a refit stands for,
+/// in a step (see [`SIGN_ELEMS_PER_POINT`]): measured, a refit costs a few µs
+/// per moved vertex (its triangles' vertex and edge normals) where an element
+/// of a build costs about 30 ns. A larger edit builds in steps instead.
+const SIGN_ELEMS_PER_REFIT_VERTEX: usize = 4;
+
 /// Triangle pairs a near search tests per point of a
 /// [`FieldBudget::Points`] budget, in a step that searches: a test costs
 /// about 70 ns where most pairs are near (see [`NEAR_PAIRS_PER_SLOT`]), so
@@ -254,12 +260,36 @@ const SIGN_ELEMS_PER_POINT: usize = 32;
 /// search, so it may test more.
 const NEAR_TESTS_PER_POINT: usize = 16;
 
+/// The share of [`Scene::set_field_interaction`]'s budget that goes to a
+/// sweep over the vertices outside the near set, a run of consecutive slots per
+/// update, so that the colours away from the contact keep following the motion.
+/// Consecutive slots are mostly neighbours on the surface: a run reads as a
+/// band passing over the mesh, where scattered vertices read as speckle.
+const LIVE_SWEEP_SHARE: usize = 8;
+
+/// The share of [`Scene::set_field_interaction`]'s budget for the vertices an
+/// edit moved, and again for those around an edit of a target.
+const LIVE_EDIT_SHARE: usize = 4;
+
+/// The first band of the interaction tier's near vertices: this fraction of
+/// the diagonal of A's box.
+const LIVE_FIRST_MARGIN: f64 = 1.0 / 256.0;
+
+/// The interaction tier's band grows by this factor after an update under
+/// half of the budget (over it, it is the budget's last vertex).
+const LIVE_GROW: f64 = 1.25;
+
 /// A due field whose meshes are prepared: what its update recomputes.
 struct FieldJob {
     /// The field's index.
     i: usize,
     /// Every vertex is recomputed.
     full: bool,
+    /// An update of the interaction tier (see [`Scene::assemble_live_pick`]):
+    /// the other vertices keep their values.
+    live: bool,
+    /// In such an update, the field's `LiveState::travel` after this update.
+    live_travel: f64,
     /// Per target: it moved (see the module docs).
     moved: Vec<bool>,
     /// A's triangles changed since the last update.
@@ -314,6 +344,8 @@ impl FieldJob {
 
 /// The new state of a field, computed without writing anything.
 struct FieldPlan {
+    /// In the interaction tier: the band of the next update.
+    margin: f64,
     /// The vertices recomputed, ascending.
     candidates: Vec<VertexId>,
     /// The new value of every candidate, in candidate order.
@@ -344,6 +376,8 @@ struct Pick {
     all: bool,
     /// The near search passed its limit.
     aborted: bool,
+    /// In the interaction tier: the band of the next update.
+    margin: f64,
 }
 
 /// What is left of one step's budget (see
@@ -551,6 +585,28 @@ pub(crate) struct Field {
     finite: Vec<VertexId>,
     /// Per vertex slot of A at the last update: alive and used by a triangle.
     referenced: Vec<bool>,
+    /// What the interaction tier keeps (see [`Scene::set_field_interaction`]).
+    live: LiveState,
+}
+
+/// A field's state in the interaction tier.
+#[derive(Default)]
+struct LiveState {
+    /// An update of the tier left values out of date: the end of the
+    /// interaction recomputes every vertex.
+    stale: bool,
+    /// The band of the near vertices, in distance units; 0 until the first
+    /// update.
+    margin: f64,
+    /// The next vertex slot of the sweep (see [`LIVE_SWEEP_SHARE`]).
+    sweep: u32,
+    /// How far, at most, any vertex of A has moved relative to the targets
+    /// over the tier's updates (the sum of their moves).
+    travel: f64,
+    /// Per vertex slot of A: `travel` when its value was last computed.
+    stamps: Vec<f32>,
+    /// Per target: the `b_to_a` of the last update.
+    poses: Vec<Rigid>,
 }
 
 impl Field {
@@ -893,6 +949,7 @@ impl Scene {
             fresh: true,
             finite: Vec::new(),
             referenced: Vec::new(),
+            live: LiveState::default(),
         });
         Ok((id, eager))
     }
@@ -1553,7 +1610,8 @@ impl Scene {
                 .and_then(|e| e.hook(f.id))
                 .is_some_and(FieldHook::is_clean)
         };
-        !f.fresh && clean(f.desc.on) && f.desc.to.iter().all(|&m| clean(m))
+        let settled = !f.live.stale || self.field_interaction.is_some();
+        settled && !f.fresh && clean(f.desc.on) && f.desc.to.iter().all(|&m| clean(m))
     }
 
     /// Computed at least once, and nothing changed on its mesh since.
@@ -1912,6 +1970,59 @@ impl Scene {
     /// [`Scene::field_step`], [`Scene::update_fields`] or [`Scene::flush`].
     pub fn set_defer_fields(&mut self, on: bool) {
         self.defer_fields = on;
+    }
+
+    /// Starts (`Some(points)`) or ends (`None`) an interaction: a gesture
+    /// that changes a placement or a mesh many times a second, during which
+    /// a distance field too large to recompute per update stays live near
+    /// the contact and is made exact when the gesture ends.
+    ///
+    /// During an interaction, a field with more finite values than `points`
+    /// updates at most `points` vertices closest to the targets (no pair
+    /// search: a distance changes no faster than the motion, so its last value
+    /// and how far the meshes have moved since say which can be close), the
+    /// vertices around an edit, and a sweep of an eighth of `points` further
+    /// vertices. The others keep their values, so that nothing turns far or
+    /// loses its colour; those values are out of date by at most how far the
+    /// meshes moved since they were computed (for an edit of a target, by how
+    /// far it moved its surface, away from the edit's box), and
+    /// [`Scene::field_status`] does not report it. The band of the closest
+    /// vertices follows the work from the counts alone, so results are the
+    /// same with `parallel` on or off, for any thread count. A field of at
+    /// most `points` finite values updates exactly as usual.
+    ///
+    /// Ending the interaction recomputes every vertex of the fields it left
+    /// out of date, at once for Eager meshes unless fields are deferred (see
+    /// [`Scene::set_defer_fields`] and [`Scene::field_step`]); the values,
+    /// colours and reports are then those of an exact update. Starting one
+    /// again before that keeps them on the tier, and a gesture that changed
+    /// nothing leaves nothing to recompute. Drops an open step unit when
+    /// the setting changes.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidInput`] when `points` is `Some(0)`. The scene
+    /// is unchanged on error.
+    pub fn set_field_interaction(&mut self, points: Option<usize>) -> Result<()> {
+        if points == Some(0) {
+            return Err(SceneError::InvalidInput(
+                "an interaction's budget must be at least one point",
+            ));
+        }
+        if self.field_interaction == points {
+            return Ok(());
+        }
+        self.drop_field_unit();
+        self.field_interaction = points;
+        if points.is_none() {
+            self.run_eager_fields(None);
+        }
+        Ok(())
+    }
+
+    /// The budget of the interaction under way (see
+    /// [`Scene::set_field_interaction`]), if any.
+    pub fn field_interaction(&self) -> Option<usize> {
+        self.field_interaction
     }
 
     /// Computes part of the Eager fields that are due, so that a long
@@ -2317,7 +2428,7 @@ impl Scene {
                 Stage::Pick => {
                     // Choosing every vertex, or scanning for flipped ones,
                     // walks every vertex slot: a step of its own.
-                    if (f.all || f.job.topology) && !step.begin_heavy() {
+                    if (f.all || f.job.topology || f.job.live) && !step.begin_heavy() {
                         return Ok(false);
                     }
                     let near = std::mem::take(&mut f.near);
@@ -2385,6 +2496,21 @@ impl Scene {
             .get_mut(f.desc.to[k])
             .ok_or(SceneError::UnknownMesh)?;
         let slot = &mut f.sign_builds[k];
+        let resuming = slot.as_ref().is_some_and(|b| b.is_for(&eb.mesh, &eb.bvh));
+        // A small position-only edit refits around the dirty vertices, in
+        // this one step, with the bits of a build (see `SignData::try_refit`).
+        // Past about what a step of a build takes, it builds in steps.
+        if !resuming
+            && let (Some(sign), Some(changes)) = (
+                &mut f.sign[k],
+                eb.hook(f.id).and_then(|h| h.changes.as_ref()),
+            )
+            && changes.vertices_moved.len() <= elems / SIGN_ELEMS_PER_REFIT_VERTEX
+            && sign.try_refit(&eb.mesh, &eb.bvh, changes)?
+        {
+            *slot = None;
+            return Ok(true);
+        }
         let build = match slot {
             Some(b) if b.is_for(&eb.mesh, &eb.bvh) => b,
             _ => slot.insert(SignBuild::new(&eb.mesh, &eb.bvh, f.desc.sign)?),
@@ -2748,6 +2874,52 @@ impl Scene {
         Ok(job)
     }
 
+    /// The near margin of field `i`'s next interaction update: what its last
+    /// left, or at first a fraction of the diagonal of A's box.
+    fn live_margin(&self, i: usize) -> Result<f64> {
+        let margin = self.fields[i].live.margin;
+        if margin > 0.0 {
+            return Ok(margin);
+        }
+        let ea = self.entry(self.fields[i].desc.on)?;
+        let diagonal = ea
+            .bvh
+            .root_bounds()
+            .filter(|b| !b.is_empty())
+            .map_or(0.0, |b| {
+                let d = [0, 1, 2].map(|c| f64::from(b.max[c]) - f64::from(b.min[c]));
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            });
+        Ok(LIVE_FIRST_MARGIN * diagonal)
+    }
+
+    /// Field `i`'s `LiveState::travel` once its targets are at `b_to_a`: a
+    /// point of A has moved relative to a target by at most the farthest move
+    /// of a corner of A's box (a rigid move is affine, and the box holds A).
+    fn live_travel(&self, i: usize, b_to_a: &[Rigid]) -> Result<f64> {
+        let f = &self.fields[i];
+        let mut step = 0.0f64;
+        if f.live.poses.len() == b_to_a.len()
+            && let Some(b) = self
+                .entry(f.desc.on)?
+                .bvh
+                .root_bounds()
+                .filter(|b| !b.is_empty())
+        {
+            for (old, new) in f.live.poses.iter().zip(b_to_a) {
+                let (old, new) = (old.inverse(), new.inverse());
+                for k in 0..8 {
+                    let corner =
+                        std::array::from_fn(|d| if k >> d & 1 == 0 { b.min[d] } else { b.max[d] });
+                    let (p, q) = (old.apply(corner), new.apply(corner));
+                    let d: f64 = (0..3).map(|c| (p[c] - q[c]) * (p[c] - q[c])).sum();
+                    step = step.max(d.sqrt());
+                }
+            }
+        }
+        Ok(f.live.travel + step)
+    }
+
     /// [`Scene::prepare_field`] but the sign data: the BVHs, then what the
     /// update recomputes. A step unit builds the sign data in its steps.
     fn prepare_job(&mut self, i: usize) -> Result<FieldJob> {
@@ -2775,21 +2947,36 @@ impl Scene {
             self.prepare(Some(&to))?;
             return self.prepare_scaled_job(i, on, to, hook_a);
         }
-        let mut full = self.fields[i].fresh || md.is_infinite() || hook_a.changes.is_none();
+        let mut whole = self.fields[i].fresh || hook_a.changes.is_none();
         let mut moved = Vec::new();
         moved.try_reserve_exact(n).map_err(|_| oom())?;
         for &m in &to {
             let hook_b = hook(m)?;
-            full |= hook_b.changes.is_none();
+            whole |= hook_b.changes.is_none();
             moved.push(
                 hook_a.placement_changed
                     || hook_b.placement_changed
                     || hook_b.changes.as_ref().is_some_and(|c| !c.is_empty()),
             );
         }
+        // The interaction tier takes what is not due in full for itself.
+        let live = !whole
+            && self
+                .field_interaction
+                .is_some_and(|points| self.fields[i].finite.len() > points);
+        let full = !live && (whole || md.is_infinite() || self.fields[i].live.stale);
         // The targets' BVHs are always needed; A's only for a near set.
-        let need_near = !full && moved.contains(&true);
-        if need_near {
+        let need_near = !full && !live && moved.contains(&true);
+        // The tier queries A's BVH around an edit of a target.
+        let edited = live
+            && to.iter().any(|&m| {
+                self.entry(m)
+                    .ok()
+                    .and_then(|e| e.hook(self.fields[i].id))
+                    .and_then(|h| h.changes.as_ref())
+                    .is_some_and(|c| !c.is_empty())
+            });
+        if need_near || edited {
             to.push(on);
         }
         self.prepare(Some(&to))?;
@@ -2808,6 +2995,11 @@ impl Scene {
         for &m in &to {
             b_to_a.push(self.relative_transform(on, m)?);
         }
+        let live_travel = if live {
+            self.live_travel(i, &b_to_a)?
+        } else {
+            0.0
+        };
         let ma = &self.entry(on)?.mesh;
         let changes = hook_a.changes;
         let topology = changes.as_ref().is_some_and(ChangeSet::topology_changed);
@@ -2817,7 +3009,9 @@ impl Scene {
             let listed = changes.as_ref().map_or(0, |c| {
                 c.vertices_added.len() + c.vertices_moved.len() + c.vertices_removed.len()
             });
-            let known = if moved.contains(&true) {
+            let known = if live {
+                self.field_interaction.unwrap_or(0)
+            } else if moved.contains(&true) {
                 self.fields[i].finite.len()
             } else {
                 0
@@ -2844,6 +3038,8 @@ impl Scene {
             near_limit: near_pair_limit(ma.vertex_slots()),
             work,
             shared_near: None,
+            live,
+            live_travel,
             scaled: false,
             frame_scale: 1.0,
             temp_targets: Vec::new(),
@@ -2936,6 +3132,8 @@ impl Scene {
             // Every vertex against every target, plus one baked copy each.
             work: slots.saturating_mul(n),
             shared_near: None,
+            live: false,
+            live_travel: 0.0,
             scaled: true,
             frame_scale,
             temp_targets,
@@ -3024,6 +3222,9 @@ impl Scene {
         all: bool,
         aborted: bool,
     ) -> Result<Pick> {
+        if job.live {
+            return self.assemble_live_pick(job);
+        }
         let f = &self.fields[job.i];
         let ma = &self.entry(f.desc.on)?.mesh;
         let slots = ma.vertex_slots();
@@ -3068,7 +3269,141 @@ impl Scene {
             candidates,
             all,
             aborted,
+            margin: 0.0,
         })
+    }
+
+    /// The vertices an update of the interaction tier recomputes, from the
+    /// values alone (no pair search: one pass over the slots, whose cost does
+    /// not depend on how many triangles are close):
+    ///
+    /// - the near vertices. A distance changes no faster than the motion, so
+    ///   a vertex can now be within the band only when its value, less how
+    ///   far the meshes moved since it was computed, is. Over the budget, the
+    ///   smallest such first, and the next band is the last one taken. So
+    ///   the contact stays exact within the band, and a vertex farther away
+    ///   comes up as the motion adds up;
+    /// - what a target's edit may have changed the most: A's triangles in the
+    ///   box of its moved vertices (widened by the band), spread over them up
+    ///   to [`LIVE_EDIT_SHARE`] of the budget;
+    /// - A's own added and removed vertices, those whose "used by a triangle"
+    ///   state flipped, and those it moved, the closest to the targets first,
+    ///   up to the same share (the others differ by no more than they moved);
+    /// - the sweep (see [`LIVE_SWEEP_SHARE`]).
+    fn assemble_live_pick(&self, job: &FieldJob) -> Result<Pick> {
+        let f = &self.fields[job.i];
+        let ea = self.entry(f.desc.on)?;
+        let ma = &ea.mesh;
+        let slots = ma.vertex_slots();
+        let defined = |v: VertexId| ma.is_vertex_alive(v) && ma.corner_count(v) > 0;
+        let values = ma.channel(&f.channel).ok_or(SceneError::Corrupted)?;
+        let points = self.field_interaction.unwrap_or(1);
+        let margin = self.live_margin(job.i)?;
+        let md = f.desc.max_distance;
+        let stamps = &f.live.stamps;
+        // Less than the value by how far it may have moved; far values count
+        // as `max_distance`, the nearest they can be.
+        let reach = |v: usize| -> f64 {
+            let moved = stamps
+                .get(v)
+                .map_or(0.0, |&t| job.live_travel - f64::from(t));
+            f64::from(values[v].abs()).min(md) - moved
+        };
+        let mut c: Vec<VertexId> = (0..values.len().min(slots))
+            .filter(|&v| !values[v].is_nan() && reach(v) <= margin)
+            .map(|v| v as VertexId)
+            .collect();
+        let mut next = margin;
+        if c.len() > points {
+            let key = |&v: &VertexId| (reach(v as usize), v);
+            let (_, last, _) = c.select_nth_unstable_by(points - 1, |x, y| {
+                let (a, b) = (key(x), key(y));
+                a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+            });
+            let band = reach(*last as usize);
+            c.truncate(points);
+            // Overdue vertices take the budget: the band itself holds.
+            if band > 0.0 {
+                next = band;
+            }
+        } else if c.len() < points / 2 {
+            next = margin * LIVE_GROW;
+        }
+        let edits = (points / LIVE_EDIT_SHARE).max(1);
+        let pad = margin as f32;
+        let mut boxed = Vec::new();
+        for (k, &m) in f.desc.to.iter().enumerate() {
+            let eb = self.entry(m)?;
+            let Some(ch) = eb.hook(f.id).and_then(|h| h.changes.as_ref()) else {
+                continue;
+            };
+            let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for &v in ch.vertices_moved.iter().chain(&ch.vertices_added) {
+                if let Some(p) = eb.mesh.position(v) {
+                    let q = job.b_to_a[k].apply(p);
+                    for d in 0..3 {
+                        lo[d] = lo[d].min(q[d] as f32 - pad);
+                        hi[d] = hi[d].max(q[d] as f32 + pad);
+                    }
+                }
+            }
+            if lo[0] <= hi[0] {
+                boxed.clear();
+                ea.bvh.query_aabb(ma, lo, hi, &mut boxed);
+                boxed.sort_unstable();
+                let every = boxed.len().div_ceil(edits).max(1);
+                let tris = boxed.iter().step_by(every).filter_map(|&t| ma.triangle(t));
+                c.extend(tris.flatten());
+            }
+        }
+        if let Some(ch) = &job.changes {
+            c.extend_from_slice(&ch.vertices_added);
+            c.extend_from_slice(&ch.vertices_removed);
+            // A brush moves many vertices a little, and a vertex far from
+            // the targets costs many times one near them: those closest to
+            // the contact, within the budget.
+            let mut moved = ch.vertices_moved.clone();
+            if moved.len() > edits {
+                let key = |&v: &VertexId| (values.get(v as usize).map_or(0.0, |x| x.abs()), v);
+                moved.select_nth_unstable_by(edits - 1, |x, y| {
+                    let (a, b) = (key(x), key(y));
+                    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+                });
+                moved.truncate(edits);
+            }
+            c.extend_from_slice(&moved);
+        }
+        if job.topology {
+            for v in 0..slots as VertexId {
+                let was = f.referenced.get(v as usize).copied().unwrap_or(false);
+                if was != defined(v) {
+                    c.push(v);
+                }
+            }
+        }
+        let (start, count) = self.live_sweep(job.i, slots);
+        c.extend((0..count).map(|k| ((start as usize + k) % slots) as VertexId));
+        c.sort_unstable();
+        c.dedup();
+        Ok(Pick {
+            candidates: c,
+            all: false,
+            aborted: false,
+            margin: next,
+        })
+    }
+
+    /// The sweep of field `i` over `slots` vertex slots, this update: its
+    /// first slot and how many it visits (see [`LIVE_SWEEP_SHARE`]).
+    fn live_sweep(&self, i: usize, slots: usize) -> (u32, usize) {
+        if slots == 0 {
+            return (0, 0);
+        }
+        let count = self
+            .field_interaction
+            .map_or(0, |points| (points / LIVE_SWEEP_SHARE).max(1))
+            .min(slots);
+        (self.fields[i].live.sweep % slots as u32, count)
     }
 
     /// Appends the new values of `candidates`, a run of a prepared field's
@@ -3312,6 +3647,7 @@ impl Scene {
             candidates,
             all,
             aborted,
+            margin,
         } = pick;
         if values.len() != candidates.len() || nearest.len() != candidates.len() {
             return Err(SceneError::Corrupted);
@@ -3332,7 +3668,10 @@ impl Scene {
                 .zip(&values)
                 .filter(|(_, x)| x.is_finite())
                 .map(|(&v, _)| v);
-            if all {
+            if job.live {
+                // Unused until the update that ends the tier, which recomputes it.
+                Vec::new()
+            } else if all {
                 now.collect()
             } else {
                 let mut kept: Vec<VertexId> = f
@@ -3355,6 +3694,7 @@ impl Scene {
             finite,
             recomputed,
             aborted,
+            margin,
         })
     }
 
@@ -3363,6 +3703,21 @@ impl Scene {
     /// mesh is missing, or memory runs out.
     fn apply_field(&mut self, job: FieldJob, plan: FieldPlan) -> Result<()> {
         let i = job.i;
+        if job.live {
+            let slots = self.entry(self.fields[i].desc.on)?.mesh.vertex_slots();
+            let (start, swept) = self.live_sweep(i, slots);
+            let f = &mut self.fields[i];
+            if slots > 0 {
+                f.live.sweep = ((start as usize + swept) % slots) as u32;
+            }
+            f.live.margin = plan.margin;
+            f.live.travel = job.live_travel;
+            let stamp = job.live_travel as f32;
+            f.live.stamps.resize(slots, stamp);
+            for &v in &plan.candidates {
+                f.live.stamps[v as usize] = stamp;
+            }
+        }
         let (id, on) = (self.fields[i].id, self.fields[i].desc.on);
         let f = &mut self.fields[i];
         let ea = self.entries.get_mut(on).ok_or(SceneError::UnknownMesh)?;
@@ -3403,7 +3758,15 @@ impl Scene {
         }
         f.fresh = false;
         f.computed = true;
-        f.finite = plan.finite;
+        if job.live {
+            f.live.stale = true;
+        } else {
+            f.live.stale = false;
+            f.finite = plan.finite;
+            f.live.travel = 0.0;
+            f.live.stamps = Vec::new();
+        }
+        f.live.poses = job.b_to_a;
         if let Some(r) = plan.referenced {
             f.referenced = r;
         }
@@ -5550,12 +5913,25 @@ mod tests {
     /// A sheet A and a cube B with a field each way, both coloured, Eager
     /// meshes deferring their fields, everything current and drained.
     fn deferred_pair(max_distance: f64) -> (Scene, MeshId, MeshId, [FieldId; 2]) {
+        deferred_pair_signed(max_distance, SignMode::Auto)
+    }
+
+    /// [`deferred_pair`], with the fields' sign mode. Winding sign data have no
+    /// refit, so that an edit of a target always builds them in steps.
+    fn deferred_pair_signed(
+        max_distance: f64,
+        sign: SignMode,
+    ) -> (Scene, MeshId, MeshId, [FieldId; 2]) {
         let (mut scene, a, b) = sheet_and_cube(UpdateMode::Eager);
+        let signed = |mut d: DistanceField| {
+            d.sign = sign;
+            d
+        };
         let fa = scene
-            .add_distance_field(field("d", a, b, max_distance))
+            .add_distance_field(signed(field("d", a, b, max_distance)))
             .unwrap();
         let fb = scene
-            .add_distance_field(field("d", b, a, max_distance))
+            .add_distance_field(signed(field("d", b, a, max_distance)))
             .unwrap();
         for (m, f, rule) in [(a, fa, distance_rule(0.2, 0.1)), (b, fb, contact_rule(0.1))] {
             scene
@@ -7108,9 +7484,9 @@ mod tests {
         // After an edit of B, the field on A to B rebuilds B's sign data in
         // the unit's steps; a unit abandoned partway leaves the build to be
         // resumed, so the steps add up to those of an unbroken build.
-        let (mut scene, a, b, [fa, fb]) = deferred_pair(0.2);
-        let (mut twin, ..) = deferred_pair(0.2);
-        let (mut probe, ..) = deferred_pair(0.2);
+        let (mut scene, a, b, [fa, fb]) = deferred_pair_signed(0.2, SignMode::Winding);
+        let (mut twin, ..) = deferred_pair_signed(0.2, SignMode::Winding);
+        let (mut probe, ..) = deferred_pair_signed(0.2, SignMode::Winding);
         let edit = |s: &mut Scene| {
             s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, 0.29, -0.21]]))
                 .unwrap();
@@ -7336,7 +7712,7 @@ mod tests {
         // Review M3: an unfinished sign build kept with its field goes once
         // its mesh changes (at the next call that changes the scene), and
         // when the field is updated in one call or removed.
-        let (mut scene, _, b, [fa, _]) = deferred_pair(0.2);
+        let (mut scene, _, b, [fa, _]) = deferred_pair_signed(0.2, SignMode::Winding);
         let edit = |s: &mut Scene, z: f32| {
             s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, 0.29, z]]))
                 .unwrap();
@@ -7643,5 +8019,198 @@ mod tests {
         eager.set_placement(eb, nudge).unwrap();
         let want = scaled_values(&mut eager, ea, &[eb]).0;
         assert_eq!(bits(stepped.field_values(id).unwrap()), bits(&want));
+    }
+
+    // ---- Stepped sign data refit, and the interaction tier (issue #173) ----
+
+    #[test]
+    fn stepped_position_edit_refits_sign_data_like_a_rebuild() {
+        // A position-only edit of B: the stepped update refits B's sign data
+        // in one step instead of a whole build, with the same bits as an
+        // Eager update (which refits) and as a new field (a whole build).
+        let (mut scene, a, b, ids) = deferred_pair(f64::INFINITY);
+        let (mut twin, ..) = deferred_pair(f64::INFINITY);
+        twin.set_defer_fields(false);
+        let edit = |s: &mut Scene, y: f32| {
+            s.edit(b, |tx| tx.set_positions(&[0], &[[0.31, y, -0.21]]))
+                .unwrap();
+        };
+        for y in [0.29, 0.27, 0.33] {
+            edit(&mut scene, y);
+            edit(&mut twin, y);
+            counter::take_sign_steps();
+            step_all(&mut scene, 1);
+            assert_eq!(counter::take_sign_steps(), 0, "a refit, not a build");
+            assert_eq!(seen(&mut scene, [a, b]), seen(&mut twin, [a, b]));
+        }
+        scene.set_defer_fields(false);
+        let again = scene
+            .add_distance_field(field("again", a, b, f64::INFINITY))
+            .unwrap();
+        assert_eq!(
+            bits(scene.field_values(again).unwrap()),
+            bits(scene.field_values(ids[0]).unwrap())
+        );
+        // A topology edit cannot refit: it builds, in steps.
+        scene.set_defer_fields(true);
+        scene.edit(b, |tx| tx.remove_triangles(&[0])).unwrap();
+        counter::take_sign_steps();
+        step_all(&mut scene, 1);
+        assert!(counter::take_sign_steps() > 0);
+    }
+
+    /// A pair of balls, A at the origin and B overlapping it, a field each
+    /// way at `md`, both coloured.
+    fn interacting_pair(md: f64) -> (Scene, MeshId, MeshId, [FieldId; 2]) {
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        let b = scene.add_mesh(ball(), MeshOptions::default()).unwrap();
+        scene.set_placement(b, at(1.2, 0.0, 0.0)).unwrap();
+        let fa = scene.add_distance_field(field("d", a, b, md)).unwrap();
+        let fb = scene.add_distance_field(field("d", b, a, md)).unwrap();
+        for (m, f) in [(a, fa), (b, fb)] {
+            let rule = distance_rule(0.5, 0.5);
+            scene
+                .set_coloring(m, Some(Coloring { field: f, rule }))
+                .unwrap();
+        }
+        scene.take_changes();
+        (scene, a, b, [fa, fb])
+    }
+
+    #[test]
+    fn interaction_recomputes_a_budget_then_settles_to_the_exact_field() {
+        // Stepped and Eager updates, at an infinite bound and a wide one.
+        for md in [f64::INFINITY, 10.0] {
+            for stepped in [false, true] {
+                let (mut scene, a, b, [fa, fb]) = interacting_pair(md);
+                let slots = scene.field_values(fa).unwrap().len();
+                if stepped {
+                    scene.set_defer_fields(true);
+                }
+                scene.set_field_interaction(Some(slots / 8)).unwrap();
+                assert_eq!(scene.field_interaction(), Some(slots / 8));
+                for i in 1..=12 {
+                    counter::take();
+                    scene
+                        .set_placement(b, at(1.2 + 0.01 * f64::from(i), 0.0, 0.0))
+                        .unwrap();
+                    if stepped {
+                        step_all(&mut scene, 16);
+                    }
+                    let recomputed = counter::take();
+                    // Two fields: each its near vertices and its sweep, well
+                    // under the whole pair once the margin has settled.
+                    if i > 6 {
+                        assert!(recomputed < 2 * slots, "{recomputed} of {}", 2 * slots);
+                    }
+                    // Every vertex keeps a value: no far holes meanwhile.
+                    for f in [fa, fb] {
+                        assert!(scene.field_values(f).unwrap().iter().all(|x| x.is_finite()));
+                    }
+                }
+                // The pointer stops: the exact field, bit for bit a new one.
+                scene.set_field_interaction(None).unwrap();
+                assert_eq!(scene.field_interaction(), None);
+                if stepped {
+                    assert!(!scene.field_status(fa).unwrap().current);
+                    step_all(&mut scene, 16);
+                    scene.set_defer_fields(false);
+                }
+                let exact_a = scene.add_distance_field(field("exact", a, b, md)).unwrap();
+                let exact_b = scene.add_distance_field(field("exact", b, a, md)).unwrap();
+                assert_eq!(
+                    bits(scene.field_values(fa).unwrap()),
+                    bits(scene.field_values(exact_a).unwrap())
+                );
+                assert_eq!(
+                    bits(scene.field_values(fb).unwrap()),
+                    bits(scene.field_values(exact_b).unwrap())
+                );
+                // And against an independent full computation.
+                assert_matches(&mut scene, fa);
+                assert_matches(&mut scene, fb);
+                let rule = distance_rule(0.5, 0.5);
+                assert_colors(&scene, a, &rule, fa);
+                assert_colors(&scene, b, &rule, fb);
+            }
+        }
+    }
+
+    #[test]
+    fn interaction_without_a_change_costs_nothing_when_it_ends() {
+        let (mut scene, _, b, [fa, fb]) = interacting_pair(f64::INFINITY);
+        scene.set_field_interaction(Some(4)).unwrap();
+        scene.set_field_interaction(None).unwrap();
+        assert!(scene.field_status(fa).unwrap().current);
+        assert!(scene.field_status(fb).unwrap().current);
+        // A field of at most the budget stays exact during it.
+        scene.set_field_interaction(Some(1 << 20)).unwrap();
+        scene.set_placement(b, at(1.25, 0.0, 0.0)).unwrap();
+        assert_matches(&mut scene, fa);
+        scene.set_field_interaction(None).unwrap();
+        assert!(scene.field_status(fa).unwrap().current);
+    }
+
+    #[test]
+    fn interaction_covers_an_edit_of_either_mesh_and_settles() {
+        let (mut scene, a, b, [fa, fb]) = interacting_pair(f64::INFINITY);
+        scene.set_field_interaction(Some(16)).unwrap();
+        for (m, s) in [(a, 1.01f32), (b, 1.02), (a, 1.03)] {
+            scene
+                .edit(m, |tx| tx.set_positions(&[0], &[[s, 0.0, 0.0]]))
+                .unwrap();
+        }
+        // During it, the sign data of the edited target were refitted.
+        scene.set_field_interaction(None).unwrap();
+        assert_matches(&mut scene, fa);
+        assert_matches(&mut scene, fb);
+    }
+
+    #[test]
+    fn interaction_rejects_a_zero_budget() {
+        let (mut scene, ..) = interacting_pair(f64::INFINITY);
+        assert!(matches!(
+            scene.set_field_interaction(Some(0)),
+            Err(SceneError::InvalidInput(_))
+        ));
+        assert_eq!(scene.field_interaction(), None);
+    }
+
+    #[test]
+    fn interaction_is_bit_identical_for_any_thread_count() {
+        let run = |threads: Option<usize>| {
+            let go = || {
+                let (mut scene, a, b, [fa, _]) = interacting_pair(f64::INFINITY);
+                let slots = scene.field_values(fa).unwrap().len();
+                scene.set_defer_fields(true);
+                scene.set_field_interaction(Some(slots / 8)).unwrap();
+                let mut out = Vec::new();
+                for i in 1..=8 {
+                    scene
+                        .set_placement(b, at(1.2 + 0.015 * f64::from(i), 0.0, 0.0))
+                        .unwrap();
+                    step_all(&mut scene, 64);
+                    out.push(seen_values(&scene, [a, b]));
+                }
+                scene.set_field_interaction(None).unwrap();
+                step_all(&mut scene, 64);
+                out.push(seen_values(&scene, [a, b]));
+                out
+            };
+            match threads {
+                Some(k) => par::with_threads(k, go),
+                None => {
+                    par::set_force_sequential(true);
+                    let out = go();
+                    par::set_force_sequential(false);
+                    out
+                }
+            }
+        };
+        let want = run(None);
+        for k in [1, 8] {
+            assert_eq!(run(Some(k)), want, "{k} threads");
+        }
     }
 }
