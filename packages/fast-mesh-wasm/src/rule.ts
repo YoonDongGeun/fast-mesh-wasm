@@ -93,3 +93,11 @@ export function copyRule(rule: ColorRule): ColorRule {
   }
   return Object.freeze(copy) as unknown as ColorRule;
 }
+
+/** @internal The argument of `setFieldInteraction`, checked. */
+export function checkInteractionPoints(points: number | null): number | null {
+  if (points !== null && (!Number.isInteger(points) || points < 1 || points >= 2 ** 32)) {
+    throw new FastMeshError("INVALID_ARGUMENT", "an interaction's points must be null or an integer in [1, 2^32)");
+  }
+  return points;
+}

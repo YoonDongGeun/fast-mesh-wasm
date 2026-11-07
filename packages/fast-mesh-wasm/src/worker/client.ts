@@ -45,7 +45,7 @@ import type {
   SectionPlane,
   SectionResult,
 } from "../scene.js";
-import { copyRule } from "../rule.js";
+import { checkInteractionPoints, copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
 import { type SceneMeshViews, ViewGuard } from "../views.js";
 import {
@@ -2029,6 +2029,15 @@ export class WorkerScene implements SceneLike {
     this.#setSection(section, { plane: p }, (st) => {
       st.plane = normalised(p);
     });
+  }
+
+  /**
+   * Starts (`points`) or ends (`null`) an interaction; see
+   * {@link Scene.setFieldInteraction}. A recompute under way when it changes
+   * is dropped and starts over under the new setting.
+   */
+  setFieldInteraction(points: number | null): void {
+    this.#push({ kind: "fieldInteraction", rev: ++this.#rev, points: checkInteractionPoints(points) });
   }
 
   /** Changes the meshes a section cuts. Last wins per frame. */

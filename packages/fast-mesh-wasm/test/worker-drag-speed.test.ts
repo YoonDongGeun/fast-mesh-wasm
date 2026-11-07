@@ -287,6 +287,29 @@ describe("stepped field updates in the Worker", () => {
     expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(1)));
   });
 
+  it("field_interaction_abandons_unit_and_settles_to_the_exact_colours", async () => {
+    const h = engine();
+    await setup(h);
+    const chunksBefore = h.chunks.length;
+    const t = pose(3);
+    // A recompute under way when the interaction starts is dropped.
+    let once = true;
+    h.onStep = () => {
+      if (once) {
+        once = false;
+        h.later([{ kind: "fieldInteraction", rev: rev(), points: 16 }]);
+      }
+    };
+    h.send([{ kind: "setPlacement", rev: rev(), id: 1, rotation: IDENTITY, translation: t, key: "placement:1" }]);
+    await h.until(3);
+    h.onStep = undefined;
+    expect(h.chunks.slice(chunksBefore).filter((c) => c === "fieldStepAbandon")).toHaveLength(1);
+    // Its end makes the colours exact, whatever it did meanwhile.
+    h.send([{ kind: "fieldInteraction", rev: rev(), points: null }]);
+    await h.until(4);
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(t));
+  });
+
   it("edit_abandons_unit", async () => {
     const h = engine();
     await setup(h);

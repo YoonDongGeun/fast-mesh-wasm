@@ -110,7 +110,9 @@ export interface EngineOptions {
    * completed, a queued drag move no longer abandons the unit: it completes
    * and is published, and the newest pose follows. So a sustained drag whose
    * recompute outlasts the gaps between moves still updates its colours
-   * about every guard plus one recompute, each update exactly one pose.
+   * about every guard plus one recompute, each update exactly one pose. At
+   * the default of 0 a move never abandons a unit: every recompute that
+   * starts is shown, so its time alone sets the update rate.
    * Edits, repairs, compactions, removals, placements, undo, redo and drag
    * cancels always abandon, and so do drag moves once the drag's `end` is
    * queued (the final pose then follows within one recompute; a pointer
@@ -157,7 +159,7 @@ export interface EngineOptions {
 export const YIELD_MS = 4;
 
 /** The default {@link EngineOptions.staleGuardMs}. */
-export const STALE_GUARD_MS = 200;
+export const STALE_GUARD_MS = 0;
 
 /** The default {@link EngineOptions.stepPoints}. */
 export const STEP_POINTS = 4096;
@@ -1272,6 +1274,8 @@ class Engine {
           meshes.has(req.id) &&
           (req.phase === "cancel" || (moves && (req.phase === "move" || (req.phase === "end" && req.rotation !== undefined))))
         );
+      case "fieldInteraction":
+        return true;
       case "setPlacement":
       case "edit":
       case "repair":
@@ -1707,6 +1711,9 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "fieldInteraction":
+        s.setFieldInteraction(req.points);
+        return;
       case "compact":
         s.compact(this.#mesh(req.id));
         return;

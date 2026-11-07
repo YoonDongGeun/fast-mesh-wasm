@@ -331,6 +331,35 @@ describe("Scene", () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
+  it("field_interaction_keeps_values_then_settles_to_the_exact_field", () => {
+    const s = scene();
+    const mesh = grid(40);
+    const a = s.addMesh(mesh.positions, mesh.indices);
+    const b = s.addMesh(mesh.positions, mesh.indices);
+    s.setPlacement(b, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0.5, 0.5, 0.2] });
+    const field = s.addDistanceField({ name: "d", on: a, to: b, maxDistance: Infinity });
+    s.setColoring(a, { field, map: "turbo", range: [0, 2] });
+    const before = Array.from(s.fieldValues(field));
+    s.setFieldInteraction(64);
+    s.setPlacement(b, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0.5, 0.5, 0.25] });
+    const during = Array.from(s.fieldValues(field));
+    // Most vertices keep their value; none lost it.
+    const same = during.filter((x, k) => x === before[k]).length;
+    expect(same).toBeGreaterThan(during.length / 2);
+    expect(during.every((x) => Number.isFinite(x))).toBe(true);
+    s.setFieldInteraction(null);
+    const settled = Array.from(s.fieldValues(field));
+    const exact = s.addDistanceField({ name: "exact", on: a, to: b, maxDistance: Infinity });
+    expect(settled).toEqual(Array.from(s.fieldValues(exact)));
+  });
+
+  it("field_interaction_rejects_a_bad_budget", () => {
+    const s = scene();
+    for (const points of [0, -1, 1.5, Number.NaN, 2 ** 32]) {
+      expect(codeOf(() => s.setFieldInteraction(points))).toBe("INVALID_ARGUMENT");
+    }
+  });
+
   it("debug_warns_on_a_kept_values_view", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const s = scene({ debug: true });
