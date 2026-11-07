@@ -18,7 +18,7 @@
 // Ctrl+Z on the sync scene, the live remesh adds triangles during a stroke, a grab drags
 // the surface by the pointer's drag, and dabs that touch a painted mask are dropped and
 // leave its vertices where they were, and a release before the press's raycast returns
-// opens no stroke, a grab released while a live pass is out leaves no vertex behind (Worker),
+// keeps its one dab and leaves no stroke open, a grab released while a live pass is out leaves no vertex behind (Worker),
 // and Ctrl+Z during a grab changes nothing; and on the demo meshes, with a brush left armed, a
 // stroke's release over another mesh keeps the brush, the next stroke lands, holding still builds
 // up finely, and a long grab along the surface does not fold it. It exits 1 on any failure.
@@ -382,10 +382,10 @@ async function verify() {
     const still = await positions();
     check(`${mode} mask`, maskAfter.maskedDabs > maskBefore.maskedDabs && farthest(atMask, still) === 0, `${maskAfter.maskedDabs - maskBefore.maskedDabs} dropped, moved ${farthest(atMask, still)}`);
     await disarm("inflate");
-    // A release before the press's raycast returns (a busy scene): no stroke opens.
+    // A release before the press's raycast returns (a busy scene): the press keeps its
+    // one dab, and no stroke stays open.
     await arm("inflate");
     const raceBefore = await page("__showcase.sculpt()");
-    const raceStart = await positions();
     await page(`(() => {
       const scene = __showcase.store.scene;
       const raycast = scene.raycast;
@@ -402,6 +402,9 @@ async function verify() {
     await mouse("mouseReleased", rx, ry, { buttons: 0 });
     await sleep(700);
     await page("(window.__fastRaycast(), true)");
+    await sleep(400);
+    const raceLanded = await page("__showcase.sculpt()");
+    const raceStart = await positions();
     // The button is up: moving now paints only if a stroke was left open.
     for (let k = 1; k <= 10; k++) {
       await mouse("mouseMoved", rx + 4 * k, ry, { button: "none" });
@@ -412,8 +415,8 @@ async function verify() {
     const raceEnd = await positions();
     check(
       `${mode} release before the press lands`,
-      raceAfter.dabs === raceBefore.dabs && raceAfter.strokes === raceBefore.strokes && farthest(raceStart, raceEnd) === 0,
-      `${raceAfter.dabs - raceBefore.dabs} dabs, moved ${farthest(raceStart, raceEnd)}`,
+      raceLanded.dabs === raceBefore.dabs + 1 && raceLanded.strokes === raceBefore.strokes + 1 && raceAfter.dabs === raceLanded.dabs && raceAfter.strokes === raceLanded.strokes && farthest(raceStart, raceEnd) === 0,
+      `${raceLanded.dabs - raceBefore.dabs} dab(s) in ${raceLanded.strokes - raceBefore.strokes} stroke(s); then ${raceAfter.dabs - raceLanded.dabs} dabs from moving, moved ${farthest(raceStart, raceEnd)}`,
     );
     await drag(30, 0, 10, 110, 90);
     const raceLater = await page("__showcase.sculpt()");
