@@ -398,12 +398,8 @@ fn projected(
     let mut flat_loop = Vec::new();
     reserve(&mut flat_loop, n)?;
     flat_loop.extend(p.iter().map(|&q| flat(q)));
-
-    let origin = flat_loop[0];
-    let polygon_area: f64 = (1..n - 1)
-        .map(|i| orient2d(origin, flat_loop[i], flat_loop[i + 1]))
-        .sum();
-    if polygon_area.is_nan() || polygon_area <= 0.0 {
+    let area = flat_area(&flat_loop);
+    if area.is_nan() || area <= 0.0 {
         return Ok(Err(FailReason::ProjectionFolds));
     }
     // The mesh triangle on loop edge `a -> b` lies on the edge's left seen
@@ -422,8 +418,141 @@ fn projected(
             }
         }
     }
+    clip_flat(mesh, v, edges, &flat_loop, false)
+}
+
+/// Twice the signed area of a flat polygon.
+fn flat_area(flat_loop: &[[f64; 2]]) -> f64 {
+    let origin = flat_loop[0];
+    (1..flat_loop.len() - 1)
+        .map(|i| orient2d(origin, flat_loop[i], flat_loop[i + 1]))
+        .sum()
+}
+
+/// The loop `v`, which lies in the plane with normal `normal`, triangulated in
+/// projection onto that plane by ear clipping. Near-linear in the loop's size,
+/// where the search of [`triangulate_loop`] is cubic.
+///
+/// Unlike the best-fit projection, this does not look at the mesh triangles on
+/// the loop's edges: it is for a loop that really is flat, where the walls
+/// leaving it on the inner side of an edge (the part of a sphere above the cut)
+/// do not fold over the patch. It fails with [`FailReason::ProjectionFolds`]
+/// when the projection is not a simple polygon, and with
+/// [`FailReason::NoValidTriangulation`] when a diagonal repeats a mesh edge and
+/// cannot be flipped away.
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn triangulate_flat_loop(
+    mesh: &Mesh,
+    v: &[VertexId],
+    edges: &EdgeMap,
+    normal: [f64; 3],
+) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+    let n = v.len();
+    if n < 3 {
+        return Ok(Err(FailReason::NoValidTriangulation));
+    }
+    let helper = if normal[0].abs() < 0.6 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let u = cross(helper, normal);
+    let u = u.map(|x| x / dot(u, u).sqrt());
+    let w = cross(normal, u);
+    let mut flat_loop = Vec::new();
+    reserve(&mut flat_loop, n)?;
+    flat_loop.extend(v.iter().map(|&x| {
+        let q = point(mesh, x);
+        [dot(q, u), dot(q, w)]
+    }));
+    // The loop runs either way around the plane's normal, by which side the
+    // walls are on: counter-clockwise is what the clipping below needs.
+    let area = flat_area(&flat_loop);
+    if !area.is_finite() || area == 0.0 {
+        return Ok(Err(FailReason::ProjectionFolds));
+    }
+    if area < 0.0 {
+        for q in &mut flat_loop {
+            q[1] = -q[1];
+        }
+    }
+    clip_flat(mesh, v, edges, &flat_loop, true)
+}
+
+/// The most diagonals [`flip_wall_edges`] flips: a plane close to a few vertices
+/// needs a few.
+const MAX_CHORD_FLIPS: usize = 64;
+
+/// Flips diagonals of the triangulation `tris` that repeat an edge `edges` has,
+/// where the two triangles on one form a convex quad. A wall edge can join two
+/// rim vertices when the plane passes within rounding of the wall vertex: the
+/// crossings next to it then sit almost on it. What cannot be flipped stays, for
+/// the caller's check to refuse.
+fn flip_wall_edges(v: &[VertexId], edges: &EdgeMap, flat_loop: &[[f64; 2]], tris: &mut [[u32; 3]]) {
+    let n = v.len();
+    let taken = |x: u32, y: u32| {
+        let d = (x as usize + n - y as usize) % n;
+        d != 1 && d != n - 1 && edges.kind(v[x as usize], v[y as usize]).is_some()
+    };
+    let area = |a: u32, b: u32, c: u32| {
+        orient2d(
+            flat_loop[a as usize],
+            flat_loop[b as usize],
+            flat_loop[c as usize],
+        )
+    };
+    // A triangle rotated so that it starts with the directed edge `x -> y`.
+    let rotated = |t: [u32; 3], x: u32, y: u32| {
+        (0..3)
+            .map(|k| [t[k], t[(k + 1) % 3], t[(k + 2) % 3]])
+            .find(|r| r[0] == x && r[1] == y)
+    };
+    for _ in 0..MAX_CHORD_FLIPS {
+        let bad = tris.iter().enumerate().find_map(|(i, t)| {
+            let [a, b, c] = *t;
+            [(a, b), (b, c), (c, a)]
+                .into_iter()
+                .find(|&(x, y)| taken(x, y))
+                .map(|e| (i, e))
+        });
+        let Some((i, (p, q))) = bad else {
+            return;
+        };
+        let Some((j, far)) = tris
+            .iter()
+            .enumerate()
+            .find_map(|(j, t)| rotated(*t, q, p).map(|r| (j, r[2])))
+        else {
+            return;
+        };
+        let Some([_, _, near]) = rotated(tris[i], p, q) else {
+            return;
+        };
+        // The quad `p, far, q, near`: the other diagonal is `far`-`near`.
+        if taken(far, near) || area(p, far, near) <= 0.0 || area(far, q, near) <= 0.0 {
+            return;
+        }
+        tris[i] = [p, far, near];
+        tris[j] = [far, q, near];
+    }
+}
+
+/// Ear-clips the counter-clockwise flat polygon `flat_loop` of the loop `v`,
+/// wound against the loop. With `flip`, diagonals that repeat a mesh edge are
+/// flipped away where they can be, rather than failing the loop.
+fn clip_flat(
+    mesh: &Mesh,
+    v: &[VertexId],
+    edges: &EdgeMap,
+    flat_loop: &[[f64; 2]],
+    flip: bool,
+) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+    let n = v.len();
+    let polygon_area = flat_area(flat_loop);
     let mut tris = Vec::new();
-    if !triangulate(&flat_loop, &[], &mut tris)? {
+    if !triangulate(flat_loop, &[], &mut tris)? {
         return Ok(Err(FailReason::ProjectionFolds));
     }
     // A simple polygon is tiled exactly by counter-clockwise triangles.
@@ -445,9 +574,12 @@ fn projected(
     // Collinear points left out of every triangle go back in. The result
     // must still tile the polygon, with `n - 2` triangles; coincident points
     // give triangles without area and fail here.
-    let tris = restore_dropped(n, &tris)?;
+    let mut tris = restore_dropped(n, &tris)?;
     if tris.len() != n - 2 || !tiles(&tris) {
         return Ok(Err(FailReason::NoValidTriangulation));
+    }
+    if flip {
+        flip_wall_edges(v, edges, flat_loop, &mut tris);
     }
     let mut out = Vec::new();
     reserve(&mut out, n - 2)?;

@@ -1977,9 +1977,9 @@ export class Scene implements SceneLike {
    * source of {@link Scene.join}.
    *
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
-   * the plane does not cut the mesh or a rim cannot be capped, which includes
-   * a rim that closes by position with its walls wound against each other. A
-   * failed cut changes nothing.
+   * the plane does not cut the mesh or a rim cannot be capped, as listed in
+   * `docs/uv-channel.md`, for example a rim that closes by position with its
+   * walls wound against each other. A failed cut changes nothing.
    */
   cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): CutReport {
     const { index, generation } = this.#id(mesh);

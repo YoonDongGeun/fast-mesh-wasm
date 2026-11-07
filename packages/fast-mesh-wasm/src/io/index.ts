@@ -1628,7 +1628,8 @@ async function readPrimitiveDraco(
   const uvs =
     decoded.uvs !== null
       ? { uvs: decoded.uvs }
-      : typeof plainUvs === "number" && doc.accessors?.[plainUvs]?.bufferView !== undefined
+      : typeof plainUvs === "number" &&
+          (doc.accessors?.[plainUvs]?.bufferView !== undefined || doc.accessors?.[plainUvs]?.sparse !== undefined)
         ? readUvsUnlessSkipped(doc, buffers, plainUvs, positions.length / 3, name)
         : NO_UVS;
   const world = spec.world;
