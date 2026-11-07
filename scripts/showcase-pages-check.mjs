@@ -15,6 +15,7 @@
 //   threaded (threads > 1); two navigations, no more.
 // - scene: the CT head boots, the demo button loads A, B and C, and A
 //   and B are coloured against each other (the contact heatmap, with readouts).
+// - previews: the built-in models' pictures load under the subpath.
 // - stable: a reload in the same profile stays isolated and threaded with no
 //   extra reload (one navigation).
 // - blocked: with the service worker script unavailable (registration
@@ -69,6 +70,7 @@ const TYPES = {
   ".wasm": "application/wasm",
   ".css": "text/css",
   ".json": "application/json",
+  ".webp": "image/webp",
 };
 /** How the server answers for `coi-sw.js`: the real file, 404, or a worker that adds no headers. */
 let swMode = "real";
@@ -227,6 +229,8 @@ try {
       `crossOriginIsolated ${s.isolated}, controlled ${s.controlled}, ${s.mode} scene, threads ${s.threads}, ${navigations} navigation(s)`,
     );
     verdict("scene", s.ok, s.detail);
+    const pictures = await browser.evaluate(`Promise.all([...document.querySelectorAll(".model-card img")].map((i) => i.decode().then(() => i.naturalWidth, () => 0)))`);
+    verdict("previews", pictures.length > 0 && pictures.every((w) => w === 96), `model pictures under the subpath: ${q(pictures)}`);
 
     navigations = 0;
     await browser.goto(url, "document.readyState !== 'loading'");

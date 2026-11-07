@@ -23,6 +23,8 @@
 //   is big enough to use, no sideways page scroll, and the last control of
 //   each panel and of the status bar can be scrolled to and hit.
 // - targets: every toolbar, panel and status bar button is at least 44 px tall and wide.
+// - previews-phone: the model buttons' pictures fit the phone width with alt text and their data-action;
+//   a tap on one loads the model and lists its own picture.
 // - overlay-pinch: a pinch that starts on a viewport overlay does not zoom the page.
 // - orbit: one finger rotates about the target at a fixed distance.
 // - pinch: two fingers apart dolly in and together dolly out; the target stays.
@@ -902,6 +904,32 @@ try {
   await frames(3);
   await page(`document.querySelector(".sidebar-right button:not(:disabled)")?.scrollIntoView({ block: "center" })`);
   await shot("phone-panels");
+
+  // ---- previews on a phone: pictures fit, alt text, hooks kept; a tap loads the model and lists its picture ----
+  await page(`document.querySelector(".model-card").scrollIntoView({ block: "center" })`);
+  await frames();
+  const pictures = await page(`Promise.all([...document.querySelectorAll(".model-card")].map(async (b) => {
+    const img = b.querySelector("img");
+    await img.decode();
+    const r = b.getBoundingClientRect();
+    return { action: b.dataset.action, alt: img.alt, width: img.naturalWidth, fits: r.left >= 0 && r.right <= innerWidth, height: Math.round(r.height) };
+  }))`);
+  await shot("phone-previews");
+  const beforeTap = (await hook("items()")).length;
+  await tapElement("[data-action=dicom-demo-heart]");
+  const rowPicture = await waitFor(
+    `(() => { const all = [...document.querySelectorAll(".meshes > li")]; const img = all.at(-1)?.querySelector("img.mesh-preview"); return all.length > ${beforeTap} && img?.complete && img.naturalWidth === 96 && img.alt.length > 0 && innerWidth >= img.getBoundingClientRect().right && img.alt; })()`,
+    60_000,
+  );
+  const overflowAfter = await page(`document.documentElement.scrollWidth - innerWidth`);
+  await page(`document.querySelector(".meshes").lastElementChild.scrollIntoView({ block: "center" })`);
+  await shot("phone-rows");
+  await page(`window.scrollTo(0, 0)`);
+  verdict(
+    "previews-phone",
+    pictures.length === 6 && pictures.every((p) => p.action && p.alt && p.width === 96 && p.fits && p.height >= 44) && rowPicture !== undefined && overflowAfter <= 0,
+    `${pictures.length} pictures on buttons (tallest ${Math.max(...pictures.map((p) => p.height))}px), row: ${q(rowPicture ?? null)}, sideways overflow ${overflowAfter}px`,
+  );
 
   // ---- a mouse, after all that: desktop sizes, and the camera and clicks as before ----
   await browser.send("Emulation.setTouchEmulationEnabled", { enabled: false });
