@@ -1490,6 +1490,8 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
   useEffect(() => {
     const canvas = gl.domElement;
     let cursorNormal: [number, number, number] | null = null;
+    /** The pointer whose press is waiting on its raycast. */
+    let pressing = -1;
     const caster = new THREE.Raycaster();
     let alive = true;
     let running = false;
@@ -1654,12 +1656,14 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       if (mesh === null) {
         return;
       }
+      pressing = e.pointerId;
       // Immediate: the paint starts where the button lands, not a throttle later.
       Promise.resolve()
         .then(() => cast(e.clientX, e.clientY))
         .then(
           (hit) => {
-            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
+            // A release meanwhile calls it off: nothing would end the paint then.
+            if (!alive || active !== -1 || pressing !== e.pointerId || view.dragging || view.multiTouch) {
               return;
             }
             if (hit === null || hit.mesh !== mesh) {
@@ -1688,11 +1692,13 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
         );
     };
     const onUp = (e: PointerEvent) => {
+      pressing = -1;
       if (e.pointerId === active) {
         endPaint();
       }
     };
     const onLeave = (e: PointerEvent) => {
+      pressing = -1;
       if (active !== -1) {
         if (e.pointerId === active) {
           endPaint();
