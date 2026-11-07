@@ -190,6 +190,9 @@ try {
    */
   async function shot(name) {
     await park();
+    // The brush ball goes once the parked pointer's raycast answers, which a
+    // slow runner takes frames over; it would tint the shot.
+    await waitFor("__showcase.sculpt().hovering === false", 10_000);
     await frames();
     await page(`(() => {
       const s = document.createElement("style");
