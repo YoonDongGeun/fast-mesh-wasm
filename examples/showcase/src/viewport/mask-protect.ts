@@ -24,6 +24,8 @@ export interface MaskField {
   ids: Uint32Array;
   /** Per id: 0 on a masked slot, rising to 1 at the band's outer edge. */
   weights: Float32Array;
+  /** The same weights per slot, 1 outside the field: for a move written directly (a grab). */
+  scale: Float32Array;
 }
 
 /**
@@ -127,17 +129,19 @@ export function maskEdgeField(
   }
   const ids = new Uint32Array(count);
   const weights = new Float32Array(count);
+  const scale = new Float32Array(slots).fill(1);
   let at = 0;
   for (let v = 0; v < slots; v++) {
     if (flags[v] === 1) {
+      scale[v] = 0;
       ids[at++] = v;
     } else if (dist[v] < band) {
       const s = dist[v] / band;
-      weights[at] = s * s * (3 - 2 * s);
+      weights[at] = scale[v] = s * s * (3 - 2 * s);
       ids[at++] = v;
     }
   }
-  return { flags, ids, weights };
+  return { flags, ids, weights, scale };
 }
 
 /**

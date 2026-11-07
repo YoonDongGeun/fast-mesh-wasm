@@ -1,6 +1,7 @@
 // The sculpt stroke: what one dab applies, and one press-and-hold stroke
 // over the meshes (the viewport's ring and pointer loop drive it).
 import type { FastMeshErrorCode, MeshHandle, RepairOp } from "fast-mesh-wasm";
+import type { MaskField } from "./mask-protect";
 
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
@@ -248,6 +249,7 @@ export class GrabRegion {
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
   readonly #origin: readonly [number, number, number];
+  readonly #hold: MaskField | null;
   /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
@@ -259,8 +261,10 @@ export class GrabRegion {
     falloff: "linear" | "smooth",
     strength: number,
     origin: readonly [number, number, number] = [0, 0, 0],
+    hold: MaskField | null = null,
   ) {
     this.#origin = [origin[0], origin[1], origin[2]];
+    this.#hold = hold;
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
     this.#falloff = falloff;
@@ -269,6 +273,15 @@ export class GrabRegion {
     this.#weights = new Float32Array();
     this.#rest = new Float32Array();
     this.rebase(positions, indices);
+  }
+
+  /**
+   * What the mask leaves of a vertex's move: 0 on a masked one, which this
+   * region then never takes, so no write ever reaches it. A slot newer than
+   * the mask's field is free.
+   */
+  #held(id: number): number {
+    return this.#hold === null || id >= this.#hold.scale.length ? 1 : this.#hold.scale[id];
   }
 
   /** The weight of a vertex resting at `x, y, z`. */
@@ -310,6 +323,10 @@ export class GrabRegion {
     const tolerance = 1e-5 * this.#radius;
     for (let k = 0; k < candidates.length; k++) {
       const id = candidates[k];
+      const held = this.#held(id);
+      if (held === 0) {
+        continue;
+      }
       const [px, py, pz] = [positions[3 * id], positions[3 * id + 1], positions[3 * id + 2]];
       const old = known.get(id);
       if (old !== undefined) {
@@ -322,7 +339,7 @@ export class GrabRegion {
           continue;
         }
       }
-      const w = split.get(id) ?? this.#weightAt(px, py, pz, drag);
+      const w = split.get(id) ?? held * this.#weightAt(px, py, pz, drag);
       if (w !== 0) {
         ids.push(id);
         weights.push(w);

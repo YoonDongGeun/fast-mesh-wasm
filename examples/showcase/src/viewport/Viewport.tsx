@@ -1267,9 +1267,9 @@ function SculptLayer(props: {
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            // Grab is move-driven only: the press takes the region, the first
-            // move paints (a click without a drag leaves no step, no remesh).
-            // A masked press holds it still (the stroke still opens, so the
+            // Grab is move-driven only: the press takes the region without the
+            // masked vertices, the first move paints (a click without a drag
+            // leaves no step, no remesh). A fully masked press holds it still (the stroke still opens, so the
             // loud stale check runs here too, before any dab lands).
             if (brush.op !== "grab") {
               s.dab(point);
@@ -1277,6 +1277,8 @@ function SculptLayer(props: {
               inspect.sculpt.maskedDabs++;
             } else {
               const v = scene.views(mesh);
+              const gated = maskLive(mesh);
+              const hold = gated === null || gated === "stale" ? null : maskFieldOf(gated, brush.radius);
               grabRegion = new GrabRegion(
                 v.positions(),
                 v.indices(),
@@ -1285,6 +1287,7 @@ function SculptLayer(props: {
                 brush.falloff,
                 brush.strength,
                 scene.origin(mesh),
+                hold,
               );
             }
             syncDabs();

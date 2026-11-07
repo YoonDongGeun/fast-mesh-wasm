@@ -23,6 +23,8 @@
 // - protect: a dab on the mask's edge leaves every masked position byte-identical
 //   and moves free vertices; undo restores them all and keeps the mask; the
 //   mask's vertices stay put with the stroke-end remesh on, which stands down.
+// - grab: a grab pressed on the mask's edge drags free vertices and leaves masked
+//   positions byte-identical through the whole stroke; undo restores them.
 // - covered: a dab with only masked vertices in its ball is dropped: no undo step.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
@@ -417,6 +419,39 @@ try {
   }
   const p2 = await positions();
   verdict("undo", q(p2) === q(p0) && q(await hook("sculptMask()")) === q(held), `${undos} undo(s) back to the painted positions; mask kept ${q(await hook("sculptMask()")) === q(held)}`);
+
+  // ---- grab: a press on the mask's edge drags only free vertices ----
+  await clickOn('[data-action="sculpt-tool-grab"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-grab"]')?.getAttribute("aria-pressed") === "true"`);
+  const g0 = await positions();
+  await mouse("mouseMoved", edge.x, edge.y, { button: "none" });
+  await sleep(200);
+  await mouse("mousePressed", edge.x, edge.y, { buttons: 1 });
+  await sleep(200);
+  let grabHeld = 0;
+  for (let i = 1; i <= 6; i++) {
+    await mouse("mouseMoved", edge.x + 8 * i, edge.y - 5 * i, { buttons: 1 });
+    await sleep(120);
+    grabHeld = Math.max(grabHeld, heldMoved(g0, await positions()));
+  }
+  await mouse("mouseReleased", edge.x + 48, edge.y - 30, { buttons: 0 });
+  await sleep(500);
+  const g1 = await positions();
+  grabHeld = Math.max(grabHeld, heldMoved(g0, g1));
+  const grabFree = freeMoved(g0, g1);
+  let grabUndos = 0;
+  while (grabUndos < 50 && q(await positions()) !== q(g0) && (await page(`document.querySelector("[data-action=undo]")?.disabled === false`))) {
+    await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+    grabUndos++;
+    await sleep(60);
+  }
+  verdict(
+    "grab",
+    grabHeld === 0 && grabFree > 0 && q(await positions()) === q(g0),
+    `${grabHeld} of ${held.length} masked moved at worst, ${grabFree} free moved; ${grabUndos} undo(s) restored ${q(await positions()) === q(g0)}`,
+  );
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
 
   // ---- covered: a dab with only masked vertices in its ball is dropped ----
   await page(`(() => {

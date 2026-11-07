@@ -4,6 +4,7 @@
 // sync scene, and a remesh in the middle of a grab keeps it continuous.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
+import { maskEdgeField } from "../src/viewport/mask-protect";
 import { GrabRegion, SculptStroke, sculptBrush, type SculptBrush } from "../src/viewport/sculpt";
 
 type Vec = [number, number, number];
@@ -462,6 +463,65 @@ describe("a grab released while a live pass is out", () => {
     expect(oldTip).toBeGreaterThan(R + 0.8);
     // Without the rebase behind the pass they stay where the split left them.
     expect(newTip).toBeGreaterThan(R + 0.4);
+
+  });
+});
+
+describe("GrabRegion over a mask", () => {
+  /** A mask over the sphere's slots with x > 0.2, and what the stroke holds it with. */
+  function masked(positions: ArrayLike<number>, indices: ArrayLike<number>) {
+    const slots = positions.length / 3;
+    const ids: number[] = [];
+    for (let v = 0; v < slots; v++) {
+      if (positions[3 * v + 2] > 0) {
+        ids.push(v);
+      }
+    }
+    return { ids, field: maskEdgeField(ids, positions, indices, slots, 0.1) };
+  }
+
+  it("leaves_masked_vertices_byte_identical_through_a_grab", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const { ids, field } = masked(v.positions(), v.indices());
+    const before = Float32Array.from(v.positions());
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1, [0, 0, 0], field);
+    expect(region.ids.length).toBeGreaterThan(0);
+    for (let k = 1; k <= 8; k++) {
+      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.05 * k, 0]) }]);
+      const now = new Uint8Array(v.positions().buffer, v.positions().byteOffset, v.positions().byteLength);
+      const was = new Uint8Array(before.buffer);
+      for (const id of ids) {
+        for (let b = 12 * id; b < 12 * id + 12; b++) {
+          expect(now[b]).toBe(was[b]);
+        }
+      }
+    }
+    expect(Array.from(v.positions())).not.toEqual(Array.from(before));
+  });
+
+  it("scales_the_soft_band_and_keeps_it_through_a_rebase", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const { ids, field } = masked(v.positions(), v.indices());
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1, [0, 0, 0], field);
+    const free = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
+    const held = new Set(ids);
+    expect(Array.from(region.ids).some((id) => held.has(id))).toBe(false);
+    expect(region.ids.length).toBeLessThan(free.ids.length);
+    region.positionsAt([0, 0.2, 0]);
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
+    region.rebase(v.positions(), v.indices());
+    expect(Array.from(region.ids).some((id) => held.has(id))).toBe(false);
+  });
+
+  it("takes_nothing_when_the_press_is_fully_masked", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const slots = v.positions().length / 3;
+    const all = Array.from({ length: slots }, (_, i) => i);
+    const field = maskEdgeField(all, v.positions(), v.indices(), slots, 0.1);
+    expect(new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1, [0, 0, 0], field).ids.length).toBe(0);
   });
 });
 
