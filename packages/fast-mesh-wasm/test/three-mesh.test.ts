@@ -524,6 +524,90 @@ describe("bindMesh", () => {
     expect(bound.object.geometry.boundingBox!.max.x).toBeCloseTo(10 - 2.5, 5);
   });
 
+  describe("a_small_edit_of_a_large_mesh", () => {
+    /** A grid of 260 x 260 vertices, past the slot count where the bounds grow. */
+    function large() {
+      const n = 259;
+      const positions = new Float32Array((n + 1) * (n + 1) * 3);
+      const indices = new Uint32Array(n * n * 6);
+      let at = 0;
+      for (let y = 0; y <= n; y++) {
+        for (let x = 0; x <= n; x++) {
+          positions[at++] = x;
+          positions[at++] = y;
+          positions[at++] = 0;
+        }
+      }
+      at = 0;
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          const a = y * (n + 1) + x;
+          indices.set([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1], at);
+          at += 6;
+        }
+      }
+      const s = new Scene();
+      scenes.push(s);
+      const m = s.addMesh(positions, indices);
+      const bound = bindMesh(s, m);
+      s.commitFrame();
+      return { s, m, bound };
+    }
+
+    it("grows_the_bounds_without_walking_the_mesh_then_settles_exact", () => {
+      vi.useFakeTimers();
+      try {
+        const { s, m, bound } = large();
+        const spy = vi.spyOn(s, "bounds");
+        const box = bound.object.geometry.boundingBox!;
+        s.edit(m, [{ op: "setPositions", vertices: [1000], positions: [5, 5, 40] }]);
+        s.commitFrame();
+        expect(spy).not.toHaveBeenCalled();
+        expect(box.max.z).toBeCloseTo(40, 5);
+        expect(bound.object.geometry.boundingSphere!.containsPoint(new THREE.Vector3(5, 5, 40))).toBe(true);
+        // Back down: the bounds stay conservative while the edits go on.
+        s.edit(m, [{ op: "setPositions", vertices: [1000], positions: [5, 5, 0] }]);
+        s.commitFrame();
+        expect(spy).not.toHaveBeenCalled();
+        expect(box.max.z).toBeCloseTo(40, 5);
+        // The edits pause: exact again, once.
+        vi.advanceTimersByTime(1000);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(box.max.z).toBeCloseTo(0, 5);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("computes_them_when_the_edit_is_wide_or_changes_triangles", () => {
+      const { s, m } = large();
+      const spy = vi.spyOn(s, "bounds");
+      const all = Array.from({ length: 30_000 }, (_, k) => k);
+      s.edit(m, [{ op: "setPositions", vertices: all, positions: new Float64Array(all.length * 3).fill(1) }]);
+      s.commitFrame();
+      expect(spy).toHaveBeenCalledTimes(1);
+      s.edit(m, [{ op: "removeTriangles", triangles: [0] }]);
+      s.commitFrame();
+      expect(spy).toHaveBeenCalledTimes(2);
+    });
+
+    it("stops_the_settling_when_the_mesh_goes", () => {
+      vi.useFakeTimers();
+      try {
+        const { s, m } = large();
+        const spy = vi.spyOn(s, "bounds");
+        s.edit(m, [{ op: "setPositions", vertices: [1000], positions: [5, 5, 40] }]);
+        s.commitFrame();
+        s.removeMesh(m);
+        s.commitFrame();
+        vi.advanceTimersByTime(1000);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("bounds_fall_back_without_scene_bounds", () => {
     const { s, m, bound } = setup();
     // A host from before Scene.bounds: the adapter walks live triangles.
