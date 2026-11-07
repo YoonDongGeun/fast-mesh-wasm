@@ -86,6 +86,7 @@ export class PreviewRender {
   #offY = 0;
   #z: Float32Array | null = null;
   #rgb: Uint32Array | null = null;
+  #covered = false;
 
   constructor(sources: PreviewSource[]) {
     this.#sources = sources.map((source) => ({ source, view: viewOf(source.matrix) }));
@@ -124,10 +125,10 @@ export class PreviewRender {
     }
   }
 
-  /** The finished picture as RGBA (straight alpha), `PREVIEW_SIZE` square; `null` with nothing to draw. */
+  /** The finished picture as RGBA (straight alpha), `PREVIEW_SIZE` square; `null` when nothing shows. */
   image(): Uint8ClampedArray | null {
     const rgb = this.#rgb;
-    if (rgb === null) {
+    if (rgb === null || !this.#covered) {
       return null;
     }
     const out = new Uint8ClampedArray(4 * PREVIEW_SIZE * PREVIEW_SIZE);
@@ -291,6 +292,7 @@ export class PreviewRender {
               shaded = shade(ax, ay, az, bx, by, bz, cx, cy, cz, color);
             }
             rgb[at] = shaded;
+            this.#covered = true;
           }
         }
       }
@@ -561,17 +563,51 @@ export function drawModelPreview(scene: SceneStore["scene"], meshes: MeshHandle[
 }
 
 /**
+ * Whether two column-major placements differ in more than their move, which a
+ * framed picture does not show. Rounding does not count: a move recomposes the
+ * matrix from its rotation, so those numbers can change in their last digits.
+ */
+export function turnChanged(a: ArrayLike<number>, b: ArrayLike<number>): boolean {
+  const axes = [0, 1, 2, 4, 5, 6, 8, 9, 10];
+  const size = Math.max(...axes.map((i) => Math.abs(a[i])));
+  return axes.some((i) => Math.abs(a[i] - b[i]) > 1e-6 * size);
+}
+
+/** What a row's picture draws: the mesh as placed now, in its own colour. */
+function rowSource(scene: SceneStore["scene"], mesh: MeshHandle, color: number): PreviewSource {
+  return { views: () => scene.views(mesh), color, matrix: scene.matrix4(mesh) };
+}
+
+/** A row's picture drawn at once, to compare with the one in the list. */
+export function drawRowPreview(scene: SceneStore["scene"], mesh: MeshHandle, color: number): HTMLCanvasElement | null {
+  const render = new PreviewRender([rowSource(scene, mesh, color)]);
+  render.step(Infinity);
+  const pixels = render.image();
+  return pixels === null ? null : previewCanvas(pixels);
+}
+
+/** A row's picture: its URL, or none yet, or (`empty`) a mesh with nothing left to draw. */
+export interface MeshPreview {
+  url: string | null;
+  empty: boolean;
+}
+
+/**
  * The URL of a loaded mesh's picture (`null` until there is one), redrawn from
- * its render views after an edit. An `<img>` by design: the app and its checks
+ * its render views after an edit or a turn. An `<img>` by design: the app and its checks
  * take the page's first canvas for the viewport, and the list comes first.
  */
-export function useMeshPreview(store: SceneStore, item: Item): string | null {
-  const [url, setUrl] = useState<string | null>(null);
+export function useMeshPreview(store: SceneStore, item: Item): MeshPreview {
+  const [preview, setPreview] = useState<MeshPreview>({ url: null, empty: false });
   const { mesh, color } = item;
   useEffect(() => {
     let live = true;
     let shown: string | null = null;
     let armed = 0;
+    let drawn = 0;
+    // A load lists its mesh before its buffers arrive: empty only counts once they have.
+    let arrived = false;
+    let matrix: ArrayLike<number> | null = null;
     const settle = (at: number) => {
       if (at === armed) {
         stats.set(mesh, { ...meshPreviewStats(mesh), pending: false });
@@ -581,26 +617,37 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
       start: () => {
         const s = meshPreviewStats(mesh);
         stats.set(mesh, { ...s, starts: s.starts + 1 });
-        return new PreviewRender([{ views: () => store.scene.views(mesh), color }]);
+        const source = rowSource(store.scene, mesh, color);
+        matrix = source.matrix as ArrayLike<number>;
+        return new PreviewRender([source]);
       },
       done: (render, run) => {
         const s = meshPreviewStats(mesh);
         stats.set(mesh, { ...s, renders: s.renders + 1, triangles: render.triangles, last: run });
         const at = armed;
+        const turn = ++drawn; // a slower encode of an older picture must not land over this one
         const pixels = render.image();
         if (pixels === null) {
+          if (arrived) {
+            if (shown !== null) {
+              URL.revokeObjectURL(shown);
+              shown = null;
+            }
+            setPreview({ url: null, empty: true });
+          }
           settle(at);
           return;
         }
+        arrived = true;
         previewCanvas(pixels).toBlob((blob) => {
-          if (!live || blob === null) {
+          if (!live || blob === null || turn !== drawn) {
             return;
           }
           if (shown !== null) {
             URL.revokeObjectURL(shown);
           }
           shown = URL.createObjectURL(blob);
-          setUrl(shown);
+          setPreview({ url: shown, empty: false });
           settle(at);
         });
       },
@@ -614,7 +661,13 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
     arm(PREVIEW_FIRST_MS);
     const off = store.scene.onChanges((changes) => {
       for (const c of changes) {
-        if (c.mesh === mesh && !c.removed && (c.added || c.positions === "all" || c.indices === "all" || c.positions.length > 0 || c.indices.length > 0)) {
+        if (c.mesh !== mesh || c.removed) {
+          continue;
+        }
+        if (c.added || c.positions === "all" || c.indices === "all" || c.positions.length > 0 || c.indices.length > 0) {
+          arrived = true;
+          arm(PREVIEW_QUIET_MS);
+        } else if (c.placementChanged && matrix !== null && turnChanged(matrix, store.scene.matrix4(mesh))) {
           arm(PREVIEW_QUIET_MS);
         }
       }
@@ -630,5 +683,5 @@ export function useMeshPreview(store: SceneStore, item: Item): string | null {
       arms.delete(mesh);
     };
   }, [store, mesh, color]);
-  return url;
+  return preview;
 }

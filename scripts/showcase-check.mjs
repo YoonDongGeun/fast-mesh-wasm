@@ -116,9 +116,15 @@
 // - previews: on a fresh page, every built-in model's button shows its committed
 //   picture (right size, alt text, not blank, loaded before any click), and each
 //   picture matches that model once loaded better than any other model does.
-//   Each row's picture has the mesh's silhouette and alt text.
+//   Each row's picture is pixel for pixel the mesh as placed now, with alt text,
+//   and its colour is the row's swatch (read from the page, not from the renderer).
 // - previews-edit: a sculpt stroke on A starts no redraw while it runs, and A's
 //   picture changes after it; Undo brings the picture back.
+// - previews-rotate: a rotate gizmo drag starts no redraw while pressed, past the
+//   quiet time, and the picture follows on release, in the mesh's pose and colour.
+//   A move changes no picture and starts no redraw.
+// - previews-empty: a weld that removes every triangle replaces the old picture
+//   with the empty state, reading 0 triangles; Undo brings a picture back.
 // - local: a short pass with ?local (the synchronous Scene on the main
 //   thread): the demo meshes, the heatmap readouts, the Group mode's
 //   per-pair readouts (depths from `fieldNearest`), Fill holes on C and undo.
@@ -1763,24 +1769,29 @@ try {
     badCards.length === 0 && q(cards.map((c) => c.action)) === q(wantCards) && liveLoads.every((l) => l === true),
     badCards.length > 0 ? badCards.join("; ") : cards.map((c) => `${c.action} own ${fmt(matrix[c.action][c.action])}, nearest other ${fmt(nearestOther(c.action))}`).join("; "),
   );
-  // Each row's picture is of its own mesh: its silhouette (alpha) matches the mesh drawn now.
-  await waitFor(`document.querySelectorAll("img.mesh-preview").length === __showcase.items().length`, 60_000);
-  const rows = await page(`(async () => {
-    const out = [];
-    const items = __showcase.items();
-    const imgs = [...document.querySelectorAll(".meshes > li")].map((li) => li.querySelector("img.mesh-preview"));
-    for (let i = 0; i < imgs.length; i++) {
-      const shown = await __pixels(imgs[i].src);
-      const live = await __pixels(__showcase.rowPreview(i));
-      out.push({ name: items[i].name, alt: imgs[i].alt, silhouette: __diff(shown, live, 4, 3), blank: __blank(shown) });
-    }
-    return out;
+  // Each row's picture is of its own mesh, as placed now, in its own colour.
+  await page(`(() => {
+    // The mean colour's direction against the swatch's: shading scales a colour, it does not turn it.
+    window.__tint = (d, swatch) => {
+      const want = getComputedStyle(swatch).backgroundColor.match(/\\d+/g).slice(0, 3).map(Number);
+      const got = [0, 0, 0];
+      for (let i = 0; i < d.length; i += 4) { got[0] += d[i]; got[1] += d[i + 1]; got[2] += d[i + 2]; }
+      return (got[0] * want[0] + got[1] * want[1] + got[2] * want[2]) / (Math.hypot(...got) * Math.hypot(...want));
+    };
+    window.__rowFacts = async (li, i) => {
+      const img = li.querySelector("img.mesh-preview");
+      const shown = await __pixels(img.src);
+      return { name: li.dataset.mesh, alt: img.alt, diff: __diff(shown, await __pixels(__showcase.rowPreview(i))), tint: __tint(shown, li.querySelector(".swatch")), blank: __blank(shown) };
+    };
   })()`);
-  const badRows = rows.filter((r) => !(r.alt.includes(r.name) && r.silhouette < 1 && r.blank.covered > 0.02 && r.blank.spread > 3));
+  await waitFor(`document.querySelectorAll("img.mesh-preview").length === __showcase.items().length`, 60_000);
+  const rows = await page(`Promise.all([...document.querySelectorAll(".meshes > li")].map(__rowFacts))`);
+  const rowOk = (r) => r.diff < 0.5 && r.tint > 0.99 && r.blank.covered > 0.02 && r.blank.spread > 3;
+  const badRows = rows.filter((r) => !(rowOk(r) && r.alt.includes(r.name)));
   verdict(
     "previews-rows",
     rows.length >= 8 && badRows.length === 0,
-    badRows.length > 0 ? q(badRows) : `${rows.length} rows, worst silhouette difference ${fmt(Math.max(...rows.map((r) => r.silhouette)))}`,
+    badRows.length > 0 ? q(badRows) : `${rows.length} rows, worst difference ${fmt(Math.max(...rows.map((r) => r.diff)))}, lowest tint match ${fmt(Math.min(...rows.map((r) => r.tint)))}`,
   );
 
   // ---- previews-edit: a stroke does not redraw; the picture follows it ----
@@ -1828,6 +1839,81 @@ try {
     shapeChanged && !undoBefore && during.starts === settled.starts && changed !== null && changed > 0.05 && restored < 1,
     `shape changed ${shapeChanged}; ${during.starts - settled.starts} redraw(s) started during the stroke; picture changed by ${fmt(changed ?? NaN)} after it, ${fmt(restored ?? NaN)} from the original after Undo`,
   );
+
+  // ---- previews-rotate: a turn redraws after the press, a move not at all ----
+  const statsOfA = `__showcase.meshPreview(${q(A)})`;
+  const rowOfA = `(async () => { const li = document.querySelector(${q(`[data-mesh="${A}"]`)}); return __rowFacts(li, [...li.parentElement.children].indexOf(li)); })()`;
+  await waitFor(`${statsOfA}.pending === false`, 20_000);
+  const unturnedSrc = await page(srcOf);
+  await page(`(window.__unturned = __pixels(${q(unturnedSrc)}), true)`);
+  await clickOn('button[title="Rotate (R)"]');
+  await sleep(200);
+  const pivot = await hook(`screenPoint(${q(A)})`);
+  let ring = null;
+  for (const radius of [80, 100, 60, 120, 140, 40]) {
+    for (let a = 0; a < 16 && ring === null; a++) {
+      const at = { x: pivot.x + radius * Math.cos((a * Math.PI) / 8), y: pivot.y + radius * Math.sin((a * Math.PI) / 8) };
+      await mouse("mouseMoved", at.x, at.y, { button: "none" });
+      await sleep(30);
+      if ((await hook("gizmo()?.axis ?? null")) !== null) {
+        ring = at;
+      }
+    }
+    if (ring !== null) {
+      break;
+    }
+  }
+  const beforeTurn = await page(statsOfA);
+  const placementOfA = `Array.from(__showcase.store.scene.matrix4(__showcase.store.getSnapshot().selection)).join()`;
+  const matrixBefore = await page(placementOfA);
+  let heldStarts = null;
+  if (ring !== null) {
+    await mouse("mousePressed", ring.x, ring.y, { buttons: 1 });
+    for (let i = 1; i <= 20; i++) {
+      await mouse("mouseMoved", ring.x + i * 5, ring.y + i * 3, { buttons: 1 });
+      await sleep(16);
+    }
+    await sleep(700); // past the quiet time, still pressed
+    heldStarts = (await page(statsOfA)).starts - beforeTurn.starts;
+    await mouse("mouseReleased", ring.x + 100, ring.y + 60, { buttons: 0 });
+  }
+  const turned = await waitFor(`${srcOf} !== ${q(unturnedSrc)} && ${statsOfA}.pending === false`, 20_000);
+  const matrixTurned = (await page(placementOfA)) !== matrixBefore;
+  const turnedRow = turned === undefined ? null : await page(rowOfA);
+  const turnedBy = turned === undefined ? null : await page(`(async () => __diff(await __unturned, await __pixels(${srcOf})))()`);
+  await clickOn('button[title="Move (T)"]');
+  await waitFor(`__showcase.gizmo()?.mesh === ${q(A)}`, 5_000);
+  const beforeMove = await page(statsOfA);
+  const movedSrc = await page(srcOf);
+  const move = await dragGizmo(A, 60, -20, 8, 16);
+  await sleep(800); // past the quiet time
+  const afterMove = await page(statsOfA);
+  const moveQuiet = move.dragging && afterMove.starts === beforeMove.starts && (await page(srcOf)) === movedSrc;
+  verdict(
+    "previews-rotate",
+    ring !== null && matrixTurned && heldStarts === 0 && turnedRow !== null && rowOk(turnedRow) && turnedBy > 0.5 && moveQuiet,
+    `matrix turned ${matrixTurned}; ${heldStarts} redraw(s) started under the press; picture changed by ${fmt(turnedBy ?? NaN)}, against the mesh now ${fmt(turnedRow?.diff ?? NaN)}, tint match ${fmt(turnedRow?.tint ?? NaN)}; a move started ${afterMove.starts - beforeMove.starts} redraw(s)`,
+  );
+
+  // ---- previews-empty: nothing left to draw ----
+  await page(`(() => {
+    const el = document.querySelector('[data-repair-op="weld"]').closest(".op").querySelector("input");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, "100000");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  })()`);
+  await waitFor(`document.querySelector('[data-repair-op="weld"]').disabled === false`, 10_000);
+  await clickOn('[data-repair-op="weld"]');
+  const rowAll = q(`[data-mesh="${A}"]`);
+  const emptied = await waitFor(
+    `(() => { const r = document.querySelector(${rowAll}); const e = r.querySelector("[data-preview-empty]"); return e !== null && r.querySelector("img.mesh-preview") === null && r.querySelector(".count[title=triangles]").textContent === "0" && e.getAttribute("aria-label"); })()`,
+    20_000,
+  );
+  await clickOn("[data-action=undo]");
+  const backAgain = await waitFor(
+    `(() => { const r = document.querySelector(${rowAll}); return r.querySelector("[data-preview-empty]") === null && r.querySelector("img.mesh-preview") !== null && r.querySelector(".count[title=triangles]").textContent === "16,128"; })()`,
+    20_000,
+  );
+  verdict("previews-empty", typeof emptied === "string" && backAgain === true, `emptied: ${q(emptied ?? null)}; back after Undo: ${backAgain === true}`);
   }
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
