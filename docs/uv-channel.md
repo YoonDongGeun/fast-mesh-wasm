@@ -45,7 +45,16 @@ Seams are recognized by exact coincidence. Sides merely close to each other coun
 
 The cap reuses the wall's rim vertices, so along the rim its UVs are the wall's, and vertices inside it take the mean of the rim's. Where a seam splits a rim position in two, the cap uses one of the two vertices, and its UVs blend across the seam there, as a `fillHoles` patch over a listed seam loop does. The cap is not a UV island of its own. Its edge next to the seam closes against the other side's wall by position only, so that edge is a new seam, which `analyze` counts as an open boundary and `Scene.boolean` accepts.
 
-A rim that closes by position but cannot be capped is an error, and a failed cut changes nothing: walls wound against each other across a seam (see `orient` above), or two rims or more than two sheets at one position.
+A boundary edge that merely lies in the plane is not part of a rim unless its other side was cut. A real hole with its mouth exactly in the plane stays open, with or without UVs.
+
+Rims of any length cap, with or without seams, since a cut rim is flat and can be ear-clipped in the plane in near-linear time. Up to 2,048 edges a cap normally matches the density of its walls. A cap that had to be ear-clipped has at most 20,000 new vertices, as has any cap of a longer rim, so it can be coarser than its walls.
+
+A rim that closes by position but cannot be capped is an error, `a cut rim cannot be capped`, and a failed cut changes nothing. That happens when:
+
+- walls are wound against each other across a seam (see `orient` above);
+- two rims or more than two sheets meet at one position;
+- the rim crosses itself in the plane, which takes a self-intersecting mesh;
+- the plane passes within rounding of a wall vertex so that the flat patch would repeat a wall edge. This is rare even for planes aimed at a vertex, and moving the plane by a small amount avoids it.
 
 A mesh without UVs has no seams. It is read by vertex index only, so split vertices on it are a real boundary and the cut leaves that opening uncapped with no error: weld it first.
 
