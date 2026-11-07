@@ -34,10 +34,12 @@
 //! and is exact to second order on a smooth surface:
 //! `(a + b) / 2 - (((b - a) . na) na + ((a - b) . nb) nb) / 8`. An endpoint's
 //! normal averages only the triangles around it that face like the edge's own
-//! (within 60 degrees), so a flat face stays flat next to a hard edge.
+//! (within 45 degrees), so a flat face stays flat next to a hard edge. A
+//! gentler crease reads as a curve and rounds off: a flat face beside one bulges
+//! by up to about 5% of its edge.
 //!
 //! An exact midpoint is used on a boundary or non-manifold edge, on a sharp
-//! edge (owners more than 60 degrees apart), and wherever the curved point
+//! edge (owners more than 45 degrees apart), and wherever the curved point
 //! would fold a child triangle. The boundary rule is what keeps a UV seam
 //! closed: its two sides are separate vertices at one position, and both must
 //! compute the same new point.
@@ -78,9 +80,9 @@ pub const REST_SIZE_CHANNEL: &str = "rest_edge_size";
 pub const DEFAULT_STRETCH_LIMIT: f32 = 4.0 / 3.0;
 /// Default for [`StretchOptions::max_splits`].
 pub const DEFAULT_MAX_SPLITS: u32 = 1 << 20;
-/// Cosine of the angle (60 degrees) past which two faces count as separated
+/// Cosine of the angle (45 degrees) past which two faces count as separated
 /// by a sharp edge.
-const SHARP_COS: f64 = 0.5;
+const SHARP_COS: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 /// Options for [`split_stretched`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -296,6 +298,8 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
             tris: work.tris,
             added: work.added,
         };
+        // Before the first write, like the rest of the plan.
+        reserve(&mut report.vertices, edges.len())?;
         let ids = tx.keeping_bound_channels(|tx| plan.commit(tx))?;
         let resolve = |v: u32| {
             if (v as usize) < slots {
@@ -304,7 +308,6 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
                 ids[v as usize - slots]
             }
         };
-        reserve(&mut report.vertices, ids.len())?;
         for (&id, &(a, b)) in ids.iter().zip(&edges) {
             report.vertices.push([id, resolve(a), resolve(b)]);
         }

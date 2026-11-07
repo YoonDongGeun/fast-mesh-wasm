@@ -799,9 +799,9 @@ fn scale_all(tx: &mut Transaction, k: f32) -> Result<()> {
 
 #[test]
 fn a_topology_edit_outdates_the_sizes_until_they_are_retaken() {
-    let mut mesh = grid(40);
+    let mut mesh = grid(16);
     capture_rest_sizes(&mut mesh).unwrap();
-    edit(&mut mesh, |tx| simplified(tx, 800));
+    edit(&mut mesh, |tx| simplified(tx, 128));
     assert!(matches!(
         try_pass(&mut mesh),
         Err(OpsError::InvalidInput(_))
@@ -814,12 +814,12 @@ fn a_topology_edit_outdates_the_sizes_until_they_are_retaken() {
 
 #[test]
 fn a_remesh_outdates_the_sizes_and_undoing_it_brings_them_back() {
-    let mut mesh = graded(30);
+    let mut mesh = graded(16);
     capture_rest_sizes(&mut mesh).unwrap();
     let sizes = mesh.channel(REST_SIZE_CHANNEL).unwrap().to_vec();
     let mut history = History::new(1 << 26);
     let options = RemeshOptions::builder()
-        .center([15.0, 15.0, 0.0])
+        .center([8.0, 8.0, 0.0])
         .radius(100.0)
         .target_length(1.2)
         .max_rounds(4)
@@ -854,16 +854,16 @@ fn undoing_past_the_capture_forgets_it() {
     // A topology edit from before the capture: every live vertex gets a size
     // again, and a dab splits as it does on a fresh capture.
     let dabbed = |mesh: &mut Mesh| {
-        dab(mesh, [20.0, 20.0, 0.0], 8.0, 6.0);
+        dab(mesh, [8.0, 8.0, 0.0], 4.0, 3.0);
         pass(mesh, all()).splits
     };
-    let mut fresh = grid(40);
+    let mut fresh = grid(16);
     capture_rest_sizes(&mut fresh).unwrap();
     let expected = dabbed(&mut fresh);
     assert!(expected > 0);
-    let mut mesh = grid(40);
+    let mut mesh = grid(16);
     let mut history = History::new(1 << 26);
-    recorded(&mut mesh, &mut history, |tx| simplified(tx, 800));
+    recorded(&mut mesh, &mut history, |tx| simplified(tx, 128));
     capture_rest_sizes(&mut mesh).unwrap();
     history.undo(&mut mesh).unwrap().unwrap();
     assert!(matches!(
@@ -935,4 +935,45 @@ fn a_foreign_edit_in_the_same_transaction_still_outdates_the_sizes() {
         try_pass(&mut mesh),
         Err(OpsError::InvalidInput(_))
     ));
+}
+
+/// A plate with a crease along `x = 6`, bent by `bend` degrees.
+fn creased_plate(bend: f32) -> Mesh {
+    let g = grid(4);
+    let (sin, cos) = bend.to_radians().sin_cos();
+    let positions: Vec<f32> = g
+        .positions()
+        .iter()
+        .flat_map(|p| {
+            let (x, y) = (p[0] * 3.0, p[1] * 3.0);
+            if x <= 6.0 {
+                [x, y, 0.0]
+            } else {
+                [6.0 + (x - 6.0) * cos, y, (x - 6.0) * sin]
+            }
+        })
+        .collect();
+    mesh_of(&positions, &parts(&g).1)
+}
+
+/// The farthest a new vertex on the flat side leaves its plane, stretched by 2.
+fn flat_side_bulge(bend: f32) -> f64 {
+    let mut mesh = creased_plate(bend);
+    capture_rest_sizes(&mut mesh).unwrap();
+    let slots = mesh.vertex_slots();
+    edit(&mut mesh, |tx| scale_all(tx, 2.0));
+    assert!(pass(&mut mesh, all()).splits > 0);
+    (slots..mesh.vertex_slots())
+        .map(|v| mesh.positions()[v])
+        .filter(|p| p[0] < 12.0 - 1e-3)
+        .map(|p| f64::from(p[2].abs()))
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn a_flat_face_stays_flat_beside_a_crease() {
+    for bend in [50.0, 60.0, 90.0] {
+        let bulge = flat_side_bulge(bend);
+        assert!(bulge < 1e-4, "{bulge} beside a {bend} degree crease");
+    }
 }
