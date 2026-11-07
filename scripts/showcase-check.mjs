@@ -104,7 +104,7 @@
 //   the page's longest main-thread task while it loads stays under 50 ms
 //   (a PerformanceObserver long-task probe: no `longtask` entry at all),
 //   its list picture included (its cost is printed). The frame gaps while
-//   orbiting are printed with and without redrawing the picture throughout.
+//   zooming are printed with and without redrawing the picture throughout.
 // - units-*: on a fresh page, 1 in cubes loaded with "Assume files in" inches
 //   span 25.4 once (units-import); the gap and the sliders read in both units
 //   and switching moves no stored value (units-collision), the group table,
@@ -117,9 +117,8 @@
 //   picture (right size, alt text, not blank, loaded before any click), and each
 //   picture matches that model once loaded better than any other model does.
 //   Each row's picture has the mesh's silhouette and alt text.
-// - previews-edit: a sculpt stroke on A starts no redraw while it runs (at most
-//   a stray one, if a frame stalls past the quiet time), and A's picture changes
-//   after it; Undo brings the picture back.
+// - previews-edit: a sculpt stroke on A starts no redraw while it runs, and A's
+//   picture changes after it; Undo brings the picture back.
 // - local: a short pass with ?local (the synchronous Scene on the main
 //   thread): the demo meshes, the heatmap readouts, the Group mode's
 //   per-pair readouts (depths from `fieldNearest`), Fill holes on C and undo.
@@ -1410,11 +1409,10 @@ try {
     console.log(
       `  picture of ${bigPreview?.triangles} triangles: ${fmt(bigPreview?.last?.wallMs ?? NaN)} ms wall, ${fmt(bigPreview?.last?.busyMs ?? NaN)} ms on the main thread in ${bigPreview?.last?.slices} slices, longest ${fmt(bigPreview?.last?.longestSliceMs ?? NaN)} ms`,
     );
-    // Frame gaps while the viewport redraws every frame (an orbit), with and
-    // without the picture redrawing throughout.
-    const orbitGaps = async (redraw) => {
-      const r = await page(`(() => { const b = document.querySelector(".viewport canvas").getBoundingClientRect(); return { left: b.left, top: b.top, width: b.width, height: b.height }; })()`);
-      const y = r.top + r.height - 40;
+    // Frame gaps while the viewport redraws (a wheel zoom: no press, under which
+    // pictures wait), with and without the picture redrawing throughout.
+    const zoomGaps = async (redraw) => {
+      const r = await page(`(() => { const b = document.querySelector(".viewport canvas").getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; })()`);
       await page(`(() => {
         const g = { gaps: [], last: performance.now(), on: true };
         const f = (t) => { g.gaps.push(t - g.last); g.last = t; if (g.on) requestAnimationFrame(f); };
@@ -1422,25 +1420,22 @@ try {
         window.__gaps = g;
         ${redraw ? `g.timer = setInterval(() => __showcase.redrawMeshPreview("big-sphere.stl"), 200);` : ""}
       })()`);
-      await mouse("mouseMoved", r.left + 40, y, { button: "none" });
-      await mouse("mousePressed", r.left + 40, y, { buttons: 1 });
       for (let i = 1; i <= 120; i++) {
-        await mouse("mouseMoved", r.left + 40 + (i % 60) * 3, y - (i % 40), { buttons: 1 });
+        await browser.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: r.x, y: r.y, deltaX: 0, deltaY: i % 40 < 20 ? 20 : -20 });
         await sleep(16);
       }
-      await mouse("mouseReleased", r.left + 40, y, { buttons: 0 });
       const gaps = await page(`(() => { const g = window.__gaps; g.on = false; clearInterval(g.timer); return g.gaps.slice(1); })()`);
       const sorted = [...gaps].sort((a, b) => a - b);
       return { frames: gaps.length, median: sorted[gaps.length >> 1], p95: sorted[Math.floor(gaps.length * 0.95)], longest: sorted.at(-1), over33: gaps.filter((g) => g > 33.4).length };
     };
-    const quiet = await orbitGaps(false);
+    const quiet = await zoomGaps(false);
     const before = (await hook(`meshPreview("big-sphere.stl")`)).renders;
-    const busy = await orbitGaps(true);
+    const busy = await zoomGaps(true);
     await sleep(600);
     const after = await hook(`meshPreview("big-sphere.stl")`);
     const gapText = (g) => `${g.frames} frames, median ${fmt(g.median)} ms, p95 ${fmt(g.p95)} ms, longest ${fmt(g.longest)} ms, ${g.over33} over 33 ms`;
-    console.log(`  orbit without picture redraws: ${gapText(quiet)}`);
-    console.log(`  orbit with ${after.renders - before} picture redraws (last: ${fmt(after.last.busyMs)} ms busy, longest slice ${fmt(after.last.longestSliceMs)} ms): ${gapText(busy)}`);
+    console.log(`  zoom without picture redraws: ${gapText(quiet)}`);
+    console.log(`  zoom with ${after.renders - before} picture redraws (last: ${fmt(after.last.busyMs)} ms busy, longest slice ${fmt(after.last.longestSliceMs)} ms): ${gapText(busy)}`);
     console.log(
       `  loaded in ${big === undefined ? "-" : `${fmt(big)} ms`}; ${probe.tasks.length} long task(s)${probe.tasks.length > 0 ? ` (longest ${fmt(longest)} ms: ${probe.tasks.map((t) => fmt(t.duration)).join(", ")})` : ""}; longest frame gap ${fmt(probe.maxGap)} ms`,
     );
@@ -1830,7 +1825,7 @@ try {
   const restored = await page(pictureDiff);
   verdict(
     "previews-edit",
-    shapeChanged && !undoBefore && during.starts - settled.starts <= 1 && changed !== null && changed > 0.05 && restored < 1,
+    shapeChanged && !undoBefore && during.starts === settled.starts && changed !== null && changed > 0.05 && restored < 1,
     `shape changed ${shapeChanged}; ${during.starts - settled.starts} redraw(s) started during the stroke; picture changed by ${fmt(changed ?? NaN)} after it, ${fmt(restored ?? NaN)} from the original after Undo`,
   );
   }

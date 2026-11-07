@@ -149,7 +149,9 @@ function fakeHost() {
   let timers: { at: number; cb: () => void; id: number }[] = [];
   let idles: ((budget: number) => void)[] = [];
   let next = 1;
+  const state = { held: false };
   const host: PreviewHost = {
+    held: () => state.held,
     now: () => time,
     setTimer: (cb, ms) => {
       timers.push({ at: time + ms, cb, id: next });
@@ -164,6 +166,7 @@ function fakeHost() {
   };
   return {
     host,
+    state,
     advance(ms: number) {
       time += ms;
       for (const t of timers.filter((t) => t.at <= time)) {
@@ -213,6 +216,33 @@ describe("PreviewQueue", () => {
     f.advance(400);
     f.runIdle();
     expect(job.started).toBe(1);
+    expect(job.finished).toBe(1);
+  });
+
+  it("starts and draws nothing while held, however long, then carries on", () => {
+    const f = fakeHost();
+    const q = new PreviewQueue(f.host);
+    const job = fakeJob(2);
+    f.state.held = true; // a press on the viewport: edits can be further apart than the quiet time
+    q.invalidate("m", job, 400);
+    for (let i = 0; i < 50; i++) {
+      f.advance(100);
+      f.runIdle();
+    }
+    expect(job.started).toBe(0);
+    f.state.held = false;
+    f.advance(100);
+    f.runIdle(); // the first slice
+    expect(job.started).toBe(1);
+    f.state.held = true;
+    for (let i = 0; i < 50; i++) {
+      f.advance(100);
+      f.runIdle();
+    }
+    expect(job.finished).toBe(0); // a render under way waits too
+    f.state.held = false;
+    f.advance(100);
+    f.runIdle();
     expect(job.finished).toBe(1);
   });
 

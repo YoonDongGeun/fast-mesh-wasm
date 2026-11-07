@@ -3,7 +3,7 @@
 // (no GPU readback, no copy of the buffers to a Worker). It uses every
 // triangle, so nothing thins out at 1M: a pass costs tens of milliseconds, cut
 // across frames. Edits only postpone it: a stroke pays for a timer per frame
-// and the picture follows once the edits go quiet.
+// and the picture follows once the edits go quiet and the press has ended.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useState } from "react";
@@ -19,6 +19,8 @@ export const PREVIEW_QUIET_MS = 400;
 const PREVIEW_FIRST_MS = 150;
 /** Triangles between looks at the clock in the bounds pass; work units in the raster pass (a pixel tested is one). */
 const CHUNK = 16_384;
+/** How often a held queue looks again. */
+const HELD_RETRY_MS = 100;
 /** A triangle's own work in the raster pass, in pixels tested. */
 const TRIANGLE_WORK = 4;
 
@@ -342,9 +344,34 @@ export interface PreviewHost {
   clearTimer(id: number): void;
   /** Calls back when the page is idle, with a slice's budget in milliseconds. */
   idle(cb: (budgetMs: number) => void): void;
+  /** True while nothing may be drawn. */
+  held(): boolean;
+}
+
+/**
+ * The pointers pressed on the viewport. No picture is drawn under a press: on a
+ * slow machine a stroke's edits can come further apart than the quiet time, and
+ * a stroke or an orbit is when a frame matters most.
+ */
+const pressed = new Set<number>();
+if (typeof window !== "undefined") {
+  window.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.target instanceof Element && e.target.closest(".viewport canvas") !== null) {
+        pressed.add(e.pointerId);
+      }
+    },
+    { capture: true },
+  );
+  const release = (e: PointerEvent) => pressed.delete(e.pointerId);
+  window.addEventListener("pointerup", release, { capture: true });
+  window.addEventListener("pointercancel", release, { capture: true });
+  window.addEventListener("blur", () => pressed.clear());
 }
 
 const browserHost: PreviewHost = {
+  held: () => pressed.size > 0,
   now: () => performance.now(),
   setTimer: (cb, ms) => window.setTimeout(cb, ms),
   clearTimer: (id) => window.clearTimeout(id),
@@ -424,6 +451,13 @@ export class PreviewQueue<K = unknown> {
       }, due - now);
       return;
     }
+    if (this.#host.held()) {
+      this.#timer = this.#host.setTimer(() => {
+        this.#timer = null;
+        this.#pump();
+      }, HELD_RETRY_MS);
+      return;
+    }
     const { job } = this.#waiting.get(soonest as K) as { job: PreviewJob };
     this.#waiting.delete(soonest as K);
     let render: PreviewRender;
@@ -441,6 +475,10 @@ export class PreviewQueue<K = unknown> {
   #slice(active: ActiveRender<K>, budget: number): void {
     if (this.#active !== active) {
       return; // overtaken by an edit, or cancelled
+    }
+    if (this.#host.held()) {
+      this.#host.setTimer(() => this.#slice(active, budget), HELD_RETRY_MS);
+      return;
     }
     const t0 = this.#host.now();
     let finished: boolean;
