@@ -32,6 +32,8 @@
 //   vertex but keeps the slot count clears the mask loudly on the next dab, which lands.
 // - follow: after the mesh's colours go, a structural change that keeps its
 //   positions, the tint still follows a move of the masked vertices.
+// - removed: removing the selected mesh with the mask paint armed, and no mask on
+//   it, disarms the paint: the next selected mesh gets its gizmo back.
 // - console: no uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -565,6 +567,24 @@ try {
     `simplify ${q(simplified)}; mask ${q((await hook("sculptMask()"))?.length ?? null)}, notice ${q(notice)}; tint triangles ${staleTris}`,
   );
   await clickOn('[data-action="sculpt-tool-inflate"]');
+
+  // ---- removed: the paint goes with the mesh it was armed on ----
+  {
+    const other = (await hook("items()")).map((i) => i.name).find((n) => n !== A);
+    await clickOn(`[data-mesh=${q(other)}] .mesh-name`);
+    await waitFor(`__showcase.selected() === ${q(other)}`);
+    if (await page(`document.querySelector('[data-action="sculpt-mask-paint"]')?.getAttribute("aria-pressed") !== "true"`)) {
+      await clickOn('[data-action="sculpt-mask-paint"]');
+    }
+    await frames();
+    await clickOn(`[data-mesh=${q(other)}] button.danger`);
+    await waitFor(`__showcase.items().length === 1`);
+    await clickOn(`[data-mesh=${q(A)}] .mesh-name`);
+    await waitFor(`__showcase.selected() === ${q(A)}`);
+    const gizmo = await waitFor(`__showcase.gizmo()?.mesh === ${q(A)}`, 5000);
+    const armedAfter = await page(`document.querySelector('[data-action="sculpt-mask-paint"]')?.getAttribute("aria-pressed")`);
+    verdict("removed", gizmo === true && armedAfter === "false", `gizmo back ${gizmo === true}; paint armed ${armedAfter}`);
+  }
 
   // ---- big: what the tint costs while painting at 1M triangles ----
   if (flag("--big")) {

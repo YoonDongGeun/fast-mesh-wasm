@@ -127,6 +127,14 @@ export function Viewport(props: {
       view.dragListeners.delete(onDrag);
     };
   }, []);
+  // The paint works on the selection: with none left (the mesh was removed)
+  // it has nothing to work on, and would keep the next mesh's gizmo down.
+  useEffect(() => {
+    if (maskPaint && selection === null) {
+      app.setMaskPaint(false);
+    }
+  }, [app, maskPaint, selection]);
+
   // A tap on empty space clears the selection; sculpt and mask paint own the
   // pointer, and gizmo drags and orbits are not taps. While an inspect
   // tool is armed the selection stays put (the ruler and query click
