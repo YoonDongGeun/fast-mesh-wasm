@@ -347,6 +347,9 @@ describe("a grab on a mesh away from the world origin", () => {
     expect(maxDifference(v.positions(), before)).toBeLessThan(1e-5);
     scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
     expect(maxDifference(v.positions(), before)).toBeCloseTo(0.2, 3);
+  });
+});
+
 describe("a remesh during a long grab", () => {
   it("new_vertices_stay_with_their_neighbours_past_the_drag_where_the_warp_folds", () => {
     const s = setup();

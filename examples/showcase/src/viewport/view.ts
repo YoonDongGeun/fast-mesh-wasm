@@ -28,11 +28,13 @@ export const view: {
   /** True while the gizmo drags. */
   dragging: boolean;
   /**
-   * A sculpt stroke is out, from its press until all it sent has landed. Undo
-   * and redo wait: a stroke writes from what it captured at the press, so the
-   * next move would write an undo straight back, inside its region only.
+   * A sculpt stroke's button is down. Undo and redo do nothing: a stroke writes
+   * from what it captured at the press, so the next move would write an undo
+   * straight back, inside its region only. See `afterStroke`.
    */
   stroking: boolean;
+  /** A released stroke has not landed yet (its stroke-end remesh, say): settles when it has. */
+  strokeLanding: Promise<void> | null;
   /** Called with `dragging` whenever it changes. */
   dragListeners: Set<(dragging: boolean) => void>;
   /** The vertex under the pointer while hovering is on (Group mode), else `null`. */
@@ -57,6 +59,7 @@ export const view: {
   orbit: null,
   dragging: false,
   stroking: false,
+  strokeLanding: null,
   dragListeners: new Set(),
   hover: null,
   hoverListeners: new Set(),
@@ -66,6 +69,22 @@ export const view: {
   multiTouch: false,
   pressTaken: false,
 };
+
+/**
+ * Runs a history action unless a stroke's button is down, then it is ignored.
+ * Once the button is up it is the user's to ask for, so it waits for the stroke
+ * to land instead of being lost, and runs in the order asked.
+ */
+export function afterStroke(run: () => void): void {
+  if (view.stroking) {
+    return;
+  }
+  if (view.strokeLanding !== null) {
+    void view.strokeLanding.then(() => afterStroke(run));
+    return;
+  }
+  run();
+}
 
 /** Sets `view.dragging` and tells the listeners when it changes. */
 export function setDragging(dragging: boolean): void {

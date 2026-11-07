@@ -903,6 +903,7 @@ function SculptLayer(props: {
     };
 
     const endStroke = () => {
+      view.stroking = false;
       clearInterval(buildup);
       buildup = undefined;
       active = -1;
@@ -915,12 +916,13 @@ function SculptLayer(props: {
         syncDabs();
         stroke = null;
         inspect.sculpt.strokes++;
-        // Undo stays off until all of this has landed.
-        void s.done.then(() => {
-          if (stroke === null) {
-            view.stroking = false;
+        // Undo and redo wait for all of this to land.
+        const landing: Promise<void> = s.done.then(() => {
+          if (view.strokeLanding === landing) {
+            view.strokeLanding = null;
           }
         });
+        view.strokeLanding = landing;
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.

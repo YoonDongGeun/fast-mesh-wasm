@@ -32,7 +32,7 @@ import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
-import { view } from "./viewport/view";
+import { afterStroke } from "./viewport/view";
 import { VolumeOverlay } from "./viewport/VolumeOverlay";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
 
@@ -72,17 +72,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const members = useApp(app, (s) => s.group.members);
   const [selection, select] = useSelection();
   const { canUndo, canRedo, undo: undoNow, redo: redoNow } = useHistory();
-  // Not during a sculpt stroke (see `view.stroking`).
-  const undo = useCallback(() => {
-    if (!view.stroking) {
-      undoNow();
-    }
-  }, [undoNow]);
-  const redo = useCallback(() => {
-    if (!view.stroking) {
-      redoNow();
-    }
-  }, [redoNow]);
+  const undo = useCallback(() => afterStroke(undoNow), [undoNow]);
+  const redo = useCallback(() => afterStroke(redoNow), [redoNow]);
   const [mode, setMode] = useState<GizmoMode>("translate");
   const [focus, setFocus] = useState<FocusRequest | null>(null);
   const [resetView, setResetView] = useState(0);

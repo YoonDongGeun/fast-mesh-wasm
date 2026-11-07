@@ -383,6 +383,38 @@ async function verify() {
       await disarm("grab");
     }
 
+    // Ctrl+Z straight after the release, with the stroke-end remesh still out: it waits and lands.
+    await load(mode, path);
+    original = (await positions()).length;
+    const startShape = await positions();
+    await arm("inflate");
+    await setRemeshes(true, false);
+    await sleep(100);
+    await page(`(() => {
+      const store = __showcase.store;
+      const repair = store.repair;
+      store.repair = function (...args) {
+        const slow = !Array.isArray(args[1]) && args[1]?.op === "remesh";
+        const answer = repair.apply(this, args);
+        return slow ? answer.then((r) => new Promise((done) => setTimeout(() => done(r), 1200))) : answer;
+      };
+      window.__fastRepair = () => delete store.repair;
+      return true;
+    })()`);
+    await drag(40, 0, 15);
+    // \`drag\` waits 800 ms after the release: the remesh's answer is still 400 ms off.
+    await ctrlZ();
+    await sleep(1500);
+    await page("(window.__fastRepair(), true)");
+    const undoneLate = await positions();
+    const redoable = await page("__showcase.status().canRedo");
+    check(
+      `${mode} Ctrl+Z straight after a release`,
+      redoable === true && (mode !== "sync" || farthest(startShape, undoneLate) === 0),
+      `can redo ${redoable}; ${farthest(startShape, undoneLate).toFixed(3)} from the start`,
+    );
+    await disarm("inflate");
+
     // A grab released while a live pass is out: the pass's new vertices come along.
     if (mode === "worker") {
       await load(mode, path);
