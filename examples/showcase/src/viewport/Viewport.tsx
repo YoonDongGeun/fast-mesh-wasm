@@ -8,7 +8,7 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle, Scene } from "fast-mesh-wasm";
+import type { MeshHandle, Scene, StretchReport } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
@@ -816,8 +816,10 @@ function SculptLayer(props: {
     const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) =>
       store
         .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: LIVE_MAX_SPLITS })
+        .then((report) => report as StretchReport)
         .catch(() => {
           // A degenerate region, or a mesh removed meanwhile.
+          return undefined;
         });
 
     /**
@@ -842,13 +844,13 @@ function SculptLayer(props: {
       inspect.sculpt.liveRemeshes++;
       // In order with the stroke's edits, so that the stroke's end waits for it.
       liveRunning = stroke.pass(() =>
-        splitStretched(mesh, b).then(() => {
+        splitStretched(mesh, b).then((report) => {
           liveRunning = null;
           // The pass added vertices under the grab: take them along.
           if (grabRegion !== null) {
             try {
               const v = scene.views(mesh);
-              grabRegion.rebase(v.positions(), v.indices());
+              grabRegion.rebase(v.positions(), v.indices(), report?.vertices);
             } catch {
               // Removed meanwhile: the next move finds out.
             }

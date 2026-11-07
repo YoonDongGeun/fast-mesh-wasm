@@ -259,7 +259,7 @@ describe("a live split during a long grab", () => {
     const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 1, 0, 0], radius: 4 });
     expect(r.splits).toBeGreaterThan(10);
     const settled = Float32Array.from(v.positions());
-    region.rebase(v.positions(), v.indices());
+    region.rebase(v.positions(), v.indices(), r.vertices);
     // No pop: the same drag writes the same positions back.
     s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
     expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
@@ -278,6 +278,57 @@ describe("a live split during a long grab", () => {
     // On the lump's sides, weight follows height: a new vertex's share of the
     // drag is about how far along the drag it sits.
     expect(moved / (slots - slotsBefore)).toBeGreaterThan(0.9);
+  });
+});
+
+describe("a live split during a grab along the surface", () => {
+  it("gives_new_vertices_their_edge_weights_so_the_mesh_does_not_explode", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const center: Vec = [R, 0, 0];
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const before = v.indices().length / 3;
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
+    // Along the surface the front folds over itself, so a position alone does
+    // not say which part of the sheet a new vertex belongs to.
+    for (let k = 1; k <= 60; k++) {
+      const drag: Vec = [0, 0.05 * k, 0];
+      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+      if (k % 4 === 0) {
+        const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.025 * k, 0], radius: 4 });
+        const settled = Float32Array.from(v.positions());
+        region.rebase(v.positions(), v.indices(), r.vertices);
+        s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+        expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
+      }
+    }
+    const after = v.indices().length / 3;
+    // A single-sheet lump of about this much area needs a few thousand.
+    expect(after - before).toBeLessThan(8000);
+  });
+
+  it("carries_every_split_vertex_with_a_moving_parent", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
+    const drag: Vec = [0, 1.5, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+    const moving = new Set(region.ids);
+    const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.75, 0], radius: 4 });
+    expect(r.vertices.length / 3).toBe(r.splits);
+    expect(r.splits).toBeGreaterThan(0);
+    region.rebase(v.positions(), v.indices(), r.vertices);
+    const held = new Set(region.ids);
+    let parented = 0;
+    for (let k = 0; k < r.vertices.length; k += 3) {
+      if (moving.has(r.vertices[k + 1]) || moving.has(r.vertices[k + 2])) {
+        moving.add(r.vertices[k]);
+        parented++;
+        expect(held.has(r.vertices[k])).toBe(true);
+      }
+    }
+    expect(parented).toBe(r.splits);
   });
 });
 

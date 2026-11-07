@@ -113,13 +113,17 @@ impl Default for StretchOptions {
 }
 
 /// Outcome of [`split_stretched`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StretchReport {
     /// Edge splits performed.
     pub splits: usize,
     /// Edges still past the limit because [`StretchOptions::max_splits`] ran
     /// out.
     pub remaining: usize,
+    /// `[new, a, b]` per split, in order: the new vertex and its edge's
+    /// endpoints, which may be new vertices from earlier in this list. For a
+    /// caller that holds per-vertex state of its own and has to carry it over.
+    pub vertices: Vec<[VertexId; 3]>,
 }
 
 /// Records every vertex's rest size for [`split_stretched`]: the longest edge
@@ -243,6 +247,7 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
         sizes,
         limit: f64::from(options.limit),
         new_sizes: Vec::new(),
+        edges: Vec::new(),
         added: Vec::new(),
         tris: Vec::new(),
         tri_of: HashMap::new(),
@@ -284,12 +289,25 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
     }
     report.remaining = heap.len();
     if report.splits > 0 {
+        let slots = work.slots;
+        let edges = work.edges;
         let plan = Plan {
-            slots: work.slots,
+            slots,
             tris: work.tris,
             added: work.added,
         };
-        tx.keeping_bound_channels(|tx| plan.commit(tx))?;
+        let ids = tx.keeping_bound_channels(|tx| plan.commit(tx))?;
+        let resolve = |v: u32| {
+            if (v as usize) < slots {
+                v
+            } else {
+                ids[v as usize - slots]
+            }
+        };
+        reserve(&mut report.vertices, ids.len())?;
+        for (&id, &(a, b)) in ids.iter().zip(&edges) {
+            report.vertices.push([id, resolve(a), resolve(b)]);
+        }
     }
     Ok(report)
 }
@@ -392,6 +410,8 @@ struct Work<'a> {
     sizes: &'a [f32],
     limit: f64,
     new_sizes: Vec<f32>,
+    /// The edge each entry of `added` split.
+    edges: Vec<(u32, u32)>,
     added: Vec<NewVert>,
     tris: Vec<WorkTri>,
     tri_of: HashMap<TriangleId, usize>,
@@ -634,6 +654,7 @@ impl Work<'_> {
         let parents = blend_parents(a, b, self.slots, &self.added)?;
         let size = self.size(a) / 2.0 + self.size(b) / 2.0;
         push(&mut self.new_sizes, size)?;
+        push(&mut self.edges, (a, b))?;
         push(&mut self.added, NewVert { pos, parents })?;
         reserve_map(&mut self.row_of)?;
         self.row_of.insert(m, Vec::new());
@@ -688,7 +709,7 @@ struct Plan {
 impl Plan {
     /// Everything is reserved before the first write, so an allocation failure
     /// leaves an empty patch.
-    fn commit(self, tx: &mut Transaction) -> Result<()> {
+    fn commit(self, tx: &mut Transaction) -> Result<Vec<VertexId>> {
         let mut ids: Vec<VertexId> = Vec::new();
         reserve(&mut ids, self.added.len())?;
         let mut set_ids: Vec<TriangleId> = Vec::new();
@@ -723,7 +744,7 @@ impl Plan {
         }
         tx.set_triangles(&set_ids, &set_tris)?;
         tx.add_triangles(&new_tris)?;
-        Ok(())
+        Ok(ids)
     }
 }
 

@@ -278,18 +278,29 @@ export class GrabRegion {
   /**
    * Takes the region again over `positions`, with every move sent so far
    * landed: for a pass that added vertices or moved some mid-stroke. A vertex
-   * that is still where this region put it keeps its rest. Any other gets the
-   * weight of the rest position the drag would have carried here (see
-   * `#weightAt`), and then exactly the rest that lands on it now, so that
-   * nothing jumps.
+   * that is still where this region put it keeps its rest. A vertex from
+   * `splits` (`new, a, b` triples, as `splitStretched` reports them) gets the
+   * mean weight of its edge: its position alone cannot say, where the drag has
+   * folded the sheet over itself. Any other gets the weight of the rest position
+   * the drag would have carried here (see `#weightAt`). Each then takes exactly
+   * the rest that lands on it now, so that nothing jumps.
    */
-  rebase(positions: ArrayLike<number>, indices: ArrayLike<number>): void {
+  rebase(positions: ArrayLike<number>, indices: ArrayLike<number>, splits?: ArrayLike<number>): void {
     const drag = this.#drag;
     const slots = positions.length / 3;
     const reach = this.#radius + Math.abs(this.#strength) * Math.hypot(drag[0], drag[1], drag[2]);
-    const candidates = paintMaskIds(positions, indices, slots, this.#center, reach);
     const known = new Map<number, number>();
     this.ids.forEach((id, k) => known.set(id, k));
+    const split = new Map<number, number>();
+    const weightOf = (id: number): number => {
+      const k = known.get(id);
+      return split.get(id) ?? (k === undefined ? 0 : this.#weights[k]);
+    };
+    for (let k = 0; splits !== undefined && k + 2 < splits.length; k += 3) {
+      split.set(splits[k], (weightOf(splits[k + 1]) + weightOf(splits[k + 2])) / 2);
+    }
+    const inReach = paintMaskIds(positions, indices, slots, this.#center, reach);
+    const candidates = Uint32Array.from(new Set([...inReach, ...split.keys()])).sort();
     const ids: number[] = [];
     const weights: number[] = [];
     const rest: number[] = [];
@@ -308,7 +319,7 @@ export class GrabRegion {
           continue;
         }
       }
-      const w = this.#weightAt(px, py, pz, drag);
+      const w = split.get(id) ?? this.#weightAt(px, py, pz, drag);
       if (w !== 0) {
         ids.push(id);
         weights.push(w);

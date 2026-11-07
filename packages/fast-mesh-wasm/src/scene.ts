@@ -824,6 +824,12 @@ export interface StretchReport {
   splits: number;
   /** Edges still past the limit because `maxSplits` ran out, for a later call. */
   remaining: number;
+  /**
+   * `new, a, b` per split, in order: the new vertex and its edge's endpoints,
+   * which may be new vertices from earlier in the list. For a caller that holds
+   * per-vertex state of its own and has to carry it over.
+   */
+  vertices: Uint32Array;
 }
 
 /** What `captureRestSizes` did: nothing to report. */
@@ -1641,7 +1647,15 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
     case "subdivide":
       return { verticesAdded: r.next(), trianglesAdded: r.next() };
     case "splitStretched":
-      return { splits: r.next(), remaining: r.next() };
+    {
+      const splits = r.next();
+      const remaining = r.next();
+      const vertices = new Uint32Array(3 * splits);
+      for (let k = 0; k < vertices.length; k++) {
+        vertices[k] = r.next();
+      }
+      return { splits, remaining, vertices };
+    }
     case "captureRestSizes":
       return {};
   }

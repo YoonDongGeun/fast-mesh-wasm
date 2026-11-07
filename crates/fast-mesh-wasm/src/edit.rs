@@ -90,7 +90,7 @@
 //!   vertices_removed`.
 //! - simplify: `collapsed, triangles_removed, vertices_removed`.
 //! - subdivide: `vertices_added, triangles_added`.
-//! - split stretched: `splits, remaining`.
+//! - split stretched: `splits, remaining, (new vertex, a, b) x splits`.
 //! - capture rest sizes: nothing.
 //!
 //! # Analysis
@@ -842,6 +842,9 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::SplitStretched(o) => {
                 let r = fast_mesh_ops::stretch::split_stretched(tx, o)?;
                 put(&mut out, &[count(r.splits), count(r.remaining)])?;
+                for [id, a, b] in &r.vertices {
+                    put(&mut out, &[f64::from(*id), f64::from(*a), f64::from(*b)])?;
+                }
             }
             RepairOp::CaptureRest { .. } => {}
             RepairOp::Remesh(o) => {

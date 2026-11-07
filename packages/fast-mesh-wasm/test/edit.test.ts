@@ -801,7 +801,7 @@ describe("analyze and repair", () => {
     expect(() => s.repair(m, [{ op: "orient" }, { op: "captureRestSizes" }])).toThrow();
 
     // Nothing stretched yet: not one split, however coarse the far corner is.
-    expect(s.repair(m, { op: "splitStretched", center, radius: 100 })).toEqual({ splits: 0, remaining: 0 });
+    expect(s.repair(m, { op: "splitStretched", center, radius: 100 })).toEqual({ splits: 0, remaining: 0, vertices: new Uint32Array() });
     expect(s.canUndo()).toBe(false);
 
     s.repair(m, { op: "grab", center, radius: 5, falloff: "smooth", strength: 6, direction: [0, 0, 1] });

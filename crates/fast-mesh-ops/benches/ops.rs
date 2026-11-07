@@ -423,7 +423,10 @@ fn bench_stretch(c: &mut Criterion) {
         let mut tx = mesh.begin_edit();
         let r = split_stretched(&mut tx, &options).unwrap();
         tx.rollback();
-        eprintln!("split_stretched_{name}: {r:?}");
+        eprintln!(
+            "split_stretched_{name}: {} splits, {} remaining",
+            r.splits, r.remaining
+        );
         group.bench_function(format!("split_stretched_{name}"), |b| {
             b.iter(|| {
                 let mut tx = mesh.begin_edit();
