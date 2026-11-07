@@ -2588,6 +2588,10 @@ export class Scene implements SceneLike {
    * `{ kind: "auto" }` runs the standard cleanup pipeline the same way and
    * returns a report per stage; see {@link AutoRepairRequest}.
    *
+   * A single `inflate`, `relax` or `grab` costs by the vertices under the brush, not the
+   * mesh (it uses the BVH, and reaches only vertices a triangle uses); in a list
+   * they scan the mesh, so a sculpt stroke should send its dabs one at a time.
+   *
    * @throws `INVALID_ARGUMENT` for invalid options (`fillHoles` needs a bound or `loops`); `STALE_LOOPS` when a loop id of `fillHoles` no longer matches a loop of the mesh.
    */
   repair(mesh: MeshHandle, request: AutoRepairRequest): AutoRepairReport;

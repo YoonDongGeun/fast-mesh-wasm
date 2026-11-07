@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions,
+    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions, Dab,
     DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, NotApplied,
     OutOfRange, Placement, Plane, RegisterOptions, Scene, SceneClosestOptions, SceneError,
     SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
@@ -31,8 +31,8 @@ use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
 
 use crate::edit::{
-    count_opt, decode_edit, decode_repair, encode_added, encode_analysis, loop_id, run_edit,
-    run_repair,
+    RepairOp, count_opt, decode_edit, decode_repair, encode_added, encode_analysis, loop_id,
+    run_edit, run_repair,
 };
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
@@ -1005,6 +1005,19 @@ impl WasmScene {
     ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
         let decoded = decode_repair(ops, loops)?;
+        // One brush op alone runs as a dab, its cost following the brush
+        // region; in a list, the BVH cannot follow the ops inside the
+        // one transaction, so they scan.
+        let dab = match decoded.as_slice() {
+            [RepairOp::Inflate(o)] => Some(Dab::Inflate(*o)),
+            [RepairOp::Smooth(o)] => Some(Dab::Smooth(*o)),
+            [RepairOp::Grab(o)] => Some(Dab::Grab(*o)),
+            _ => None,
+        };
+        if let Some(dab) = dab {
+            let r = self.scene.dab(id, &dab)?;
+            return Ok(vec![count(r.moved), f64::from(r.max_displacement)]);
+        }
         Ok(self.scene.edit(id, |tx| run_repair(tx, &decoded))?)
     }
 

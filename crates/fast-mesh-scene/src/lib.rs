@@ -104,6 +104,7 @@ mod query;
 mod register;
 mod report;
 mod scene;
+mod sculpt;
 mod sections;
 #[cfg(test)]
 mod uv_tests;
@@ -130,4 +131,5 @@ pub use register::{DEFAULT_MAX_RMSE_FRACTION, NotApplied, RegisterOptions, Regis
 pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
+pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};

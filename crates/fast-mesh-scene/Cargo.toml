@@ -31,3 +31,7 @@ criterion = { version = "0.8.2", default-features = false }
 [[bench]]
 name = "scene"
 harness = false
+
+[[bench]]
+name = "sculpt"
+harness = false
