@@ -317,6 +317,67 @@ No target was set for these (the plan asks only that they be recorded), and noth
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 - **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
 
+## Sculpt strokes (issue #174)
+
+Measured on 2026-11-07, Intel Core i5-13600K, Windows 11, with other work sharing the machine (CPU load 65 to 100%), so read the ratios and not the last digit. The display runs at 144 Hz, so 6.9 ms is the best a frame can show.
+
+### One dab, native
+
+`cargo bench -p fast-mesh-scene --bench sculpt`: an Eager mesh with normals on, inside an open step, the change report drained per dab. Radius 8 holds 193 vertices at either size, radius 24 holds 1,781. `scan` is `Scene::edit` with the whole-mesh deform function, which is what a dab was before; `Scene::dab` finds the region through the BVH.
+
+| Tool | 100k, `scan` | 100k, `dab` | 1M, `scan` | 1M, `dab` | 1M, `dab` radius 24 |
+| --- | --- | --- | --- | --- | --- |
+| inflate | 2.36 ms | 292 µs | 22.2 ms | 135 µs | 1.73 ms |
+| smooth | 1.45 ms | 135 µs | 17.3 ms | 164 µs | 1.09 ms |
+| grab | 178 µs | 215 µs | 1.48 ms | 208 µs | 1.71 ms |
+
+The dab's cost stays put from 100k to 1M and follows the region: nine times the vertices costs about nine times as much. At 100k a grab's scan is as cheap as the search, so that cell does not improve. The first dab on a mesh also builds its vertex-to-triangles index, once: about 100 ms at 1M in wasm, 375 ms at worst on the loaded machine.
+
+### Frame times during a scripted stroke
+
+`node scripts/sculpt-frames.mjs`: the real showcase in headless Chrome with a GPU, a UV sphere, 240 pointer events along an arc at about 120 per second, stroke remeshes off. Times are animation-frame gaps; the longest includes the one-off index build where it falls in the stroke.
+
+| Scene, triangles, tool, radius | Before: median / p95 / longest | After: median / p95 / longest | Dabs before / after |
+| --- | --- | --- | --- |
+| sync, 100k, inflate, 0.1 | 6.9 / 7.0 / 27.8 ms | 6.9 / 7.0 / 27.8 ms | 135 / 195 |
+| sync, 100k, grab, 0.1 | 6.9 / 7.0 / 13.9 ms | 6.9 / 7.0 / 7.2 ms | 112 / 185 |
+| Worker, 100k, inflate, 0.1 | 6.9 / 7.0 / 13.9 ms | 6.9 / 7.0 / 20.8 ms | 93 / 182 |
+| Worker, 100k, grab, 0.1 | 6.9 / 7.0 / 34.7 ms | 6.9 / 7.0 / 7.0 ms | 107 / 117 |
+| sync, 1M, inflate, 0.1 | 34.7 / 69.4 / 180.6 ms | 6.9 / 7.0 / 27.8 ms | 288 in 10.1 s / 230 in 2.4 s |
+| sync, 1M, grab, 0.1 | 20.8 / 27.8 / 166.7 ms | 6.9 / 7.0 / 20.9 ms | 230 in 5.7 s / 107 in 1.9 s |
+| Worker, 1M, inflate, 0.1 | 7.0 / 55.6 / 180.6 ms | 6.9 / 7.0 / 34.7 ms | 49 in 4.2 s / 188 in 1.9 s |
+| Worker, 1M, grab, 0.1 | 7.0 / 62.6 / 152.8 ms | 6.9 / 7.0 / 48.6 ms | 108 in 7.3 s / 110 in 1.9 s |
+| sync, 1M, inflate, 0.5 | 7.0 / 34.7 / 159.7 ms | 6.9 / 7.0 / 90.3 ms | 60 in 3.1 s / 110 in 1.9 s |
+| sync, 1M, grab, 0.5 | 27.8 / 34.7 / 166.7 ms | 6.9 / 7.0 / 34.7 ms | 240 in 6.5 s / 121 in 2.2 s |
+| Worker, 1M, inflate, 0.5 | 6.9 / 55.6 / 173.6 ms | 6.9 / 7.0 / 34.7 ms | 45 in 3.7 s / 102 in 1.9 s |
+| Worker, 1M, grab, 0.5 | 7.0 / 55.6 / 118.1 ms | 6.9 / 7.0 / 13.9 ms | 92 in 5.9 s / 176 in 3.7 s |
+
+The seconds are how long the 240 events took to deliver: before, a busy main thread held them back to as much as five times the 1.9 s they should take. Dabs differ in meaning between the tools: inflate's should be about the path over the spacing, near 190 at radius 0.1, and fell to 49 to 93 on the Worker before; a grab's are writes, so a count is only how many frames it reached. One recording on the fully loaded machine lost its Worker 1M stroke altogether (the press's raycast came back after the release and left a stroke open). A release now calls such a press off; that recording is not in the table.
+
+### What the time went to
+
+A main-thread profile of the 1M strokes, before:
+
+| Cost | Sync | Worker main thread |
+| --- | --- | --- |
+| `bindMesh` recomputing the bounds on every change, over the whole mesh | about 24 ms per dab, 53% of the stroke | about 55 ms per change: the p95 above |
+| The dab itself, inflate: normals and copies over the whole mesh | about 16 ms per dab, 40% of the stroke | on the Worker thread |
+| The dab itself, grab: the vertex scan | about 1.5 ms per dab | on the Worker thread |
+| A three.js per-triangle raycast for `<FastMesh onClick>`, around a press or release | about 170 ms | about 170 ms: the longest task above |
+
+The largest cost was not one the issue listed. The sync column's wasm functions have no names in a release build, so the split is by elimination: the same function took 24 ms per dab on grab and inflate, the Worker's JavaScript fallback names `computeBounds` outright, and that function left the profile with the fix.
+
+The issue's other suspects, measured with the engine in Node on UV spheres of radius 2 (before 120 x 240, after 80 x 160), brush radius 0.5:
+
+| Suspect | Before | After |
+| --- | --- | --- |
+| Dabs dropped while one runs | 93 of about 190 on the Worker at 100k, 49 at 1M | none: they wait and go together |
+| Grab depends on the event rate | 30 events differ from 240 by 13% of the radius, 10 events by 39% | below 1e-5 mesh units at any rate: the last drag alone decides |
+| Inflate depends on the event rate | 30 events lost 37% of the height, 10 events 78%; 60 and up agree within 0.2% | every count from 10 to 480 within 2% of the radius, and the same dab count within one |
+| Inflate depends on the model size | peak over radius 10.4, 0.57 and 0.007 at scales 0.01, 1 and 100 | the same within 1% at each |
+| Normals recomputed per dab compound | no effect on timing dependence: the same dabs give the same shape | unchanged |
+| The linear falloff creases the rim | true of linear (the normal jumps by atan(0.25) at any resolution), but the showcase's default is `smooth`, whose step halves with the edge length | unchanged: smooth stays the default, linear stays an option |
+
 ## Command line (fast-mesh-cli)
 
 End-to-end runs of the `fast-mesh` binary, process start to exit, reading and writing files, measured on 2026-11-05.

@@ -5,9 +5,16 @@
 //! scaled by the brush [`strength`](Brush::strength) and the
 //! [`falloff`](Brush::falloff) weight of their distance from the brush
 //! center. A negative strength pulls instead of pushing.
+//!
+//! [`inflate`], [`smooth`] and [`grab`] cost O(mesh) per call: they scan every
+//! vertex, and the first two compute over the whole mesh. [`inflate_region`],
+//! [`smooth_region`] and [`grab_region`] move the same vertices to the same
+//! positions, bit for bit, from a candidate list and the mesh's incidence
+//! index, so that their cost follows the brush region. `Scene::dab` in
+//! `fast-mesh-scene` finds the candidates through the BVH.
 
 use fast_mesh::compute_vertex_normals;
-use fast_mesh_store::{Mesh, Transaction, VertexId};
+use fast_mesh_store::{Incidence, Mesh, Transaction, VertexId};
 
 use crate::topology::VertexFans;
 use crate::{OpsError, Result, push, reserve};
@@ -51,6 +58,27 @@ fn has_region_member(mesh: &Mesh, brush: &Brush) -> bool {
         let t = dist / brush.radius;
         t.is_finite() && t < 1.0
     })
+}
+
+/// The `strength * falloff` weight of a vertex at `p`, or `None` at or past
+/// the rim: the region loops' membership test.
+fn brush_weight(brush: &Brush, p: &[f32; 3]) -> Option<f32> {
+    let dist = brush
+        .center
+        .iter()
+        .zip(p)
+        .map(|(c, p)| (p - c).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    let t = dist / brush.radius;
+    (t.is_finite() && t < 1.0).then(|| brush.strength * falloff_value(brush.falloff, t))
+}
+
+/// The mesh's incidence index, which the region functions read fans from.
+fn region_index(mesh: &Mesh) -> Result<&Incidence> {
+    mesh.incidence().ok_or(OpsError::InvalidInput(
+        "region deforms need Mesh::ensure_incidence and no topology edit in the transaction",
+    ))
 }
 
 /// A deform brush: a sphere of influence with a falloff and a strength.
@@ -140,6 +168,25 @@ pub struct InflateReport {
     pub max_displacement: f32,
 }
 
+fn check_inflate(brush: &Brush) -> Result<()> {
+    if !brush.radius.is_finite() || brush.radius <= 0.0 {
+        return Err(OpsError::InvalidInput(
+            "inflate brush radius must be positive and finite",
+        ));
+    }
+    if brush.center.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput(
+            "inflate brush center must be finite",
+        ));
+    }
+    if !brush.strength.is_finite() {
+        return Err(OpsError::InvalidInput(
+            "inflate brush strength must be finite",
+        ));
+    }
+    Ok(())
+}
+
 /// Pushes the vertices under the brush along their smooth normals.
 ///
 /// - Region: every live vertex closer than `radius` to `center` (brute-force
@@ -158,21 +205,7 @@ pub struct InflateReport {
 /// Nothing is written in any of these cases.
 pub fn inflate(tx: &mut Transaction, options: &InflateOptions) -> Result<InflateReport> {
     let brush = &options.brush;
-    if !brush.radius.is_finite() || brush.radius <= 0.0 {
-        return Err(OpsError::InvalidInput(
-            "inflate brush radius must be positive and finite",
-        ));
-    }
-    if brush.center.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput(
-            "inflate brush center must be finite",
-        ));
-    }
-    if !brush.strength.is_finite() {
-        return Err(OpsError::InvalidInput(
-            "inflate brush strength must be finite",
-        ));
-    }
+    check_inflate(brush)?;
     let mesh = tx.mesh();
     let mut report = InflateReport::default();
     if mesh.vertex_slots() == 0 {
@@ -337,6 +370,23 @@ pub struct SmoothReport {
     pub max_displacement: f32,
 }
 
+fn check_smooth(brush: &Brush) -> Result<()> {
+    if !brush.radius.is_finite() || brush.radius <= 0.0 {
+        return Err(OpsError::InvalidInput(
+            "smooth brush radius must be positive and finite",
+        ));
+    }
+    if brush.center.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("smooth brush center must be finite"));
+    }
+    if !brush.strength.is_finite() {
+        return Err(OpsError::InvalidInput(
+            "smooth brush strength must be finite",
+        ));
+    }
+    Ok(())
+}
+
 /// Smooths the vertices under the brush, Taubin λ/μ or plain Laplacian.
 ///
 /// - Region: every live vertex closer than `radius` to `center` (brute-force
@@ -362,19 +412,7 @@ pub struct SmoothReport {
 /// Nothing is written in any of these cases.
 pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothReport> {
     let brush = &options.brush;
-    if !brush.radius.is_finite() || brush.radius <= 0.0 {
-        return Err(OpsError::InvalidInput(
-            "smooth brush radius must be positive and finite",
-        ));
-    }
-    if brush.center.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput("smooth brush center must be finite"));
-    }
-    if !brush.strength.is_finite() {
-        return Err(OpsError::InvalidInput(
-            "smooth brush strength must be finite",
-        ));
-    }
+    check_smooth(brush)?;
     let report = SmoothReport::default();
     if options.cycles == 0 {
         return Ok(report);
@@ -555,6 +593,25 @@ pub struct GrabReport {
     pub max_displacement: f32,
 }
 
+fn check_grab(options: &GrabOptions) -> Result<()> {
+    let brush = &options.brush;
+    if !brush.radius.is_finite() || brush.radius <= 0.0 {
+        return Err(OpsError::InvalidInput(
+            "grab brush radius must be positive and finite",
+        ));
+    }
+    if brush.center.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("grab brush center must be finite"));
+    }
+    if !brush.strength.is_finite() {
+        return Err(OpsError::InvalidInput("grab brush strength must be finite"));
+    }
+    if options.direction.iter().any(|c| !c.is_finite()) {
+        return Err(OpsError::InvalidInput("grab direction must be finite"));
+    }
+    Ok(())
+}
+
 /// Drags the vertices under the brush along one vector.
 ///
 /// - Region: every live vertex closer than `radius` to `center` (brute-force
@@ -573,20 +630,7 @@ pub struct GrabReport {
 /// Nothing is written in any of these cases.
 pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
     let brush = &options.brush;
-    if !brush.radius.is_finite() || brush.radius <= 0.0 {
-        return Err(OpsError::InvalidInput(
-            "grab brush radius must be positive and finite",
-        ));
-    }
-    if brush.center.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput("grab brush center must be finite"));
-    }
-    if !brush.strength.is_finite() {
-        return Err(OpsError::InvalidInput("grab brush strength must be finite"));
-    }
-    if options.direction.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput("grab direction must be finite"));
-    }
+    check_grab(options)?;
     let mesh = tx.mesh();
     let mut report = GrabReport::default();
     if mesh.vertex_slots() == 0 {
@@ -634,6 +678,249 @@ pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
     if !ids.is_empty() {
         tx.set_positions(&ids, &moved_to)?;
     }
+    Ok(report)
+}
+
+/// Writes `moved_to` over `ids`, once, if any vertex moved.
+fn write_moves(tx: &mut Transaction, ids: &[VertexId], moved_to: &[[f32; 3]]) -> Result<()> {
+    if !ids.is_empty() {
+        tx.set_positions(ids, moved_to)?;
+    }
+    Ok(())
+}
+
+/// [`inflate`] over the candidates in `region`, with its cost following them
+/// instead of the mesh: the same vertices move to the same positions, bit for
+/// bit, as long as `region` is ascending and holds every vertex under the
+/// brush that is used by a triangle. Candidates outside the brush, or dead,
+/// are ignored.
+///
+/// # Errors
+/// As for [`inflate`], and [`OpsError::InvalidInput`] without an incidence
+/// index ([`Mesh::ensure_incidence`] before the transaction, and no topology
+/// edit in it). Nothing is written in any of these cases.
+pub fn inflate_region(
+    tx: &mut Transaction,
+    options: &InflateOptions,
+    region: &[VertexId],
+) -> Result<InflateReport> {
+    let brush = &options.brush;
+    check_inflate(brush)?;
+    let mesh = tx.mesh();
+    let index = region_index(mesh)?;
+    let positions = mesh.positions();
+    let mut report = InflateReport::default();
+    let mut ids: Vec<VertexId> = Vec::new();
+    let mut moved_to: Vec<[f32; 3]> = Vec::new();
+    for &v in region {
+        if !mesh.is_vertex_alive(v) {
+            continue;
+        }
+        let p = &positions[v as usize];
+        let Some(w) = brush_weight(brush, p) else {
+            continue;
+        };
+        // As `compute_vertex_normals`: face normals in ascending triangle
+        // order, twice the area long, then normalized.
+        let mut n = [0.0f32; 3];
+        for &t in index.triangles(v) {
+            if let Some([a, b, c]) = mesh.triangle(t) {
+                let (pa, pb, pc) = (
+                    positions[a as usize],
+                    positions[b as usize],
+                    positions[c as usize],
+                );
+                let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+                let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+                n[0] += e1[1] * e2[2] - e1[2] * e2[1];
+                n[1] += e1[2] * e2[0] - e1[0] * e2[2];
+                n[2] += e1[0] * e2[1] - e1[1] * e2[0];
+            }
+        }
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len > 0.0 {
+            n.iter_mut().for_each(|x| *x /= len);
+        }
+        let length = n.iter().map(|n| (w * n).powi(2)).sum::<f32>().sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        push(&mut ids, v)?;
+        push(
+            &mut moved_to,
+            [p[0] + w * n[0], p[1] + w * n[1], p[2] + w * n[2]],
+        )?;
+        report.max_displacement = report.max_displacement.max(length);
+    }
+    report.moved = ids.len();
+    write_moves(tx, &ids, &moved_to)?;
+    Ok(report)
+}
+
+/// [`smooth`] over the candidates in `region`, with its cost following them
+/// instead of the mesh; see [`inflate_region`] for what `region` must hold.
+///
+/// # Errors
+/// As for [`inflate_region`].
+pub fn smooth_region(
+    tx: &mut Transaction,
+    options: &SmoothOptions,
+    region: &[VertexId],
+) -> Result<SmoothReport> {
+    /// A neighbor: a region member (it moves), or a fixed position.
+    #[derive(Clone, Copy)]
+    enum Source {
+        Member(u32),
+        Fixed([f32; 3]),
+    }
+    let brush = &options.brush;
+    check_smooth(brush)?;
+    let mut report = SmoothReport::default();
+    if options.cycles == 0 {
+        return Ok(report);
+    }
+    let mesh = tx.mesh();
+    let index = region_index(mesh)?;
+    let positions = mesh.positions();
+    let mut members: Vec<(VertexId, f32)> = Vec::new();
+    for &v in region {
+        if mesh.is_vertex_alive(v)
+            && let Some(w) = brush_weight(brush, &positions[v as usize])
+        {
+            push(&mut members, (v, w))?;
+        }
+    }
+    // Each member's neighbors once, ascending, resolved up front so that the
+    // passes only touch region-sized buffers.
+    let mut starts: Vec<u32> = Vec::new();
+    reserve(&mut starts, members.len() + 1)?;
+    starts.push(0);
+    let mut sources: Vec<Source> = Vec::new();
+    let mut adjacent: Vec<VertexId> = Vec::new();
+    for &(v, _) in &members {
+        adjacent.clear();
+        for &t in index.triangles(v) {
+            if let Some([a, b, c]) = mesh.triangle(t)
+                && a != b
+                && b != c
+                && a != c
+            {
+                for u in [a, b, c] {
+                    if u != v {
+                        push(&mut adjacent, u)?;
+                    }
+                }
+            }
+        }
+        adjacent.sort_unstable();
+        adjacent.dedup();
+        for &u in &adjacent {
+            let source = match members.binary_search_by_key(&u, |m| m.0) {
+                Ok(k) => Source::Member(k as u32),
+                Err(_) => Source::Fixed(positions[u as usize]),
+            };
+            push(&mut sources, source)?;
+        }
+        starts.push(sources.len() as u32);
+    }
+    let mut current: Vec<[f32; 3]> = Vec::new();
+    reserve(&mut current, members.len())?;
+    current.extend(members.iter().map(|&(v, _)| positions[v as usize]));
+    let mut before: Vec<[f32; 3]> = Vec::new();
+    reserve(&mut before, members.len())?;
+    let passes: &[f32] = match options.method {
+        SmoothMethod::Taubin => &[TAUBIN_LAMBDA, TAUBIN_MU],
+        SmoothMethod::Laplacian => &[1.0],
+    };
+    for _ in 0..options.cycles {
+        for &k in passes {
+            before.clear();
+            before.extend_from_slice(&current);
+            for (m, &(_, w)) in members.iter().enumerate() {
+                let adjacent = &sources[starts[m] as usize..starts[m + 1] as usize];
+                if adjacent.is_empty() {
+                    continue;
+                }
+                let mut centroid = [0.0f32; 3];
+                for source in adjacent {
+                    let q = match *source {
+                        Source::Member(u) => before[u as usize],
+                        Source::Fixed(q) => q,
+                    };
+                    for axis in 0..3 {
+                        centroid[axis] += q[axis];
+                    }
+                }
+                for c in &mut centroid {
+                    *c /= adjacent.len() as f32;
+                }
+                let p = before[m];
+                for axis in 0..3 {
+                    current[m][axis] = p[axis] + w * k * (centroid[axis] - p[axis]);
+                }
+            }
+        }
+    }
+    let mut ids: Vec<VertexId> = Vec::new();
+    let mut moved_to: Vec<[f32; 3]> = Vec::new();
+    for (m, &(v, _)) in members.iter().enumerate() {
+        let length = (0..3)
+            .map(|k| (current[m][k] - positions[v as usize][k]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        push(&mut ids, v)?;
+        push(&mut moved_to, current[m])?;
+        report.max_displacement = report.max_displacement.max(length);
+    }
+    report.moved = ids.len();
+    write_moves(tx, &ids, &moved_to)?;
+    Ok(report)
+}
+
+/// [`grab`] over the candidates in `region`, with its cost following them
+/// instead of the mesh; see [`inflate_region`] for what `region` must hold.
+/// Grab needs no incidence index. A vertex no triangle uses moves only if it
+/// is listed.
+///
+/// # Errors
+/// As for [`grab`].
+pub fn grab_region(
+    tx: &mut Transaction,
+    options: &GrabOptions,
+    region: &[VertexId],
+) -> Result<GrabReport> {
+    let brush = &options.brush;
+    check_grab(options)?;
+    let mesh = tx.mesh();
+    let positions = mesh.positions();
+    let mut report = GrabReport::default();
+    let mut ids: Vec<VertexId> = Vec::new();
+    let mut moved_to: Vec<[f32; 3]> = Vec::new();
+    for &v in region {
+        if !mesh.is_vertex_alive(v) {
+            continue;
+        }
+        let p = &positions[v as usize];
+        let Some(w) = brush_weight(brush, p) else {
+            continue;
+        };
+        let d = options.direction;
+        let length = d.iter().map(|d| (w * d).powi(2)).sum::<f32>().sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            continue;
+        }
+        push(&mut ids, v)?;
+        push(
+            &mut moved_to,
+            [p[0] + w * d[0], p[1] + w * d[1], p[2] + w * d[2]],
+        )?;
+        report.max_displacement = report.max_displacement.max(length);
+    }
+    report.moved = ids.len();
+    write_moves(tx, &ids, &moved_to)?;
     Ok(report)
 }
 
@@ -1153,5 +1440,227 @@ mod tests {
     fn grab_out_of_memory_is_reported_and_writes_nothing() {
         let options = grab_options([0.0; 3], 10.0, Falloff::Linear, 1.0, [2.0, 0.0, 0.0]);
         assert!(sweep(centered_grid(), |tx| grab(tx, &options).map(drop)) > 5);
+    }
+
+    /// A wavy grid, `n` quads a side, spacing 1, with a dead triangle.
+    fn wavy_grid(n: u32) -> Mesh {
+        let mut positions = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32, y as f32);
+                positions.extend([fx, fy, (fx * 0.7).sin() * (fy * 0.5).cos()]);
+            }
+        }
+        let mut triangles = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                triangles.extend([[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]);
+            }
+        }
+        let mut mesh = mesh_of(&positions, &triangles);
+        let mut tx = mesh.begin_edit();
+        tx.remove_triangles(&[10]).unwrap();
+        tx.commit().unwrap();
+        mesh.ensure_incidence().unwrap();
+        mesh
+    }
+
+    /// Every vertex slot, the widest legal region.
+    fn every_slot(mesh: &Mesh) -> Vec<VertexId> {
+        (0..mesh.vertex_slots() as VertexId).collect()
+    }
+
+    /// The positions after `f`, with its report.
+    fn after<R>(mesh: &mut Mesh, f: impl FnOnce(&mut Transaction) -> Result<R>) -> (R, Vec<f32>) {
+        let (r, _) = edit(mesh, f);
+        (r, parts(mesh).0)
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    #[test]
+    fn region_functions_match_the_whole_mesh_ones_bit_for_bit() {
+        let brush = Brush {
+            center: [5.3, 4.1, 0.0],
+            radius: 3.2,
+            falloff: Falloff::Smooth,
+            strength: 0.4,
+        };
+        // A near region and the full slot list, both ascending.
+        let near = |mesh: &Mesh| -> Vec<VertexId> {
+            (0..mesh.vertex_slots() as VertexId)
+                .filter(|&v| brush_weight(&brush, &mesh.positions()[v as usize]).is_some())
+                .collect()
+        };
+        let inflate_options = InflateOptions { brush };
+        let (mut a, mut b, mut c) = (wavy_grid(12), wavy_grid(12), wavy_grid(12));
+        let (ra, pa) = after(&mut a, |tx| inflate(tx, &inflate_options));
+        let region = near(&b);
+        let (rb, pb) = after(&mut b, |tx| inflate_region(tx, &inflate_options, &region));
+        let region = every_slot(&c);
+        let (rc, pc) = after(&mut c, |tx| inflate_region(tx, &inflate_options, &region));
+        assert_eq!(ra, rb);
+        assert_eq!(ra, rc);
+        assert_eq!(bits(&pa), bits(&pb));
+        assert_eq!(bits(&pa), bits(&pc));
+
+        for method in [SmoothMethod::Taubin, SmoothMethod::Laplacian] {
+            let smooth_options = SmoothOptions {
+                brush,
+                cycles: 3,
+                method,
+            };
+            let (mut a, mut b) = (wavy_grid(12), wavy_grid(12));
+            let (ra, pa) = after(&mut a, |tx| smooth(tx, &smooth_options));
+            let region = near(&b);
+            let (rb, pb) = after(&mut b, |tx| smooth_region(tx, &smooth_options, &region));
+            assert_eq!(ra, rb);
+            assert_eq!(bits(&pa), bits(&pb));
+        }
+
+        let grab_options = GrabOptions {
+            brush,
+            direction: [0.3, -0.2, 0.9],
+        };
+        let (mut a, mut b) = (wavy_grid(12), wavy_grid(12));
+        let (ra, pa) = after(&mut a, |tx| grab(tx, &grab_options));
+        let region = near(&b);
+        let (rb, pb) = after(&mut b, |tx| grab_region(tx, &grab_options, &region));
+        assert_eq!(ra, rb);
+        assert_eq!(bits(&pa), bits(&pb));
+    }
+
+    #[test]
+    fn region_functions_ignore_candidates_outside_the_brush() {
+        let mut mesh = wavy_grid(6);
+        let options = GrabOptions {
+            brush: Brush {
+                center: [0.0, 0.0, 0.0],
+                radius: 1.5,
+                falloff: Falloff::Smooth,
+                strength: 1.0,
+            },
+            direction: [0.0, 0.0, 1.0],
+        };
+        let region = every_slot(&mesh);
+        let (report, _) = after(&mut mesh, |tx| grab_region(tx, &options, &region));
+        assert!(report.moved > 0 && report.moved < 8);
+    }
+
+    #[test]
+    fn region_functions_need_the_incidence_index_and_validate() {
+        let mut mesh = centered_grid();
+        let region = every_slot(&mesh);
+        let good = InflateOptions::default();
+        let mut tx = mesh.begin_edit();
+        assert!(matches!(
+            inflate_region(&mut tx, &good, &region),
+            Err(OpsError::InvalidInput(_))
+        ));
+        drop(tx);
+        mesh.ensure_incidence().unwrap();
+        let bad = InflateOptions::builder().radius(0.0).build();
+        let mut tx = mesh.begin_edit();
+        assert!(matches!(
+            inflate_region(&mut tx, &bad, &region),
+            Err(OpsError::InvalidInput(_))
+        ));
+        let bad = SmoothOptions::builder().radius(-1.0).cycles(1).build();
+        assert!(matches!(
+            smooth_region(&mut tx, &bad, &region),
+            Err(OpsError::InvalidInput(_))
+        ));
+        let bad = GrabOptions::builder().direction([f32::NAN; 3]).build();
+        assert!(matches!(
+            grab_region(&mut tx, &bad, &region),
+            Err(OpsError::InvalidInput(_))
+        ));
+    }
+
+    /// The largest angle (radians) between neighboring vertex normals, over
+    /// the grid vertices whose normalized distance from `center` is in `band`.
+    fn max_normal_step(mesh: &Mesh, n: u32, center: f32, radius: f32, band: (f32, f32)) -> f32 {
+        let (positions, triangles) = parts(mesh);
+        let indices: Vec<u32> = triangles.iter().flatten().copied().collect();
+        let normals = compute_vertex_normals(&positions, &indices).unwrap();
+        let at = |x: u32, y: u32| ((y * (n + 1) + x) * 3) as usize;
+        let mut worst = 0.0f32;
+        for y in 1..n {
+            for x in 1..n {
+                let t = (x as f32 - center).hypot(y as f32 - center) / radius;
+                if t < band.0 || t > band.1 {
+                    continue;
+                }
+                let a = at(x, y);
+                for b in [at(x + 1, y), at(x, y + 1)] {
+                    let dot: f32 = (0..3).map(|k| normals[a + k] * normals[b + k]).sum();
+                    worst = worst.max(dot.clamp(-1.0, 1.0).acos());
+                }
+            }
+        }
+        worst
+    }
+
+    /// A flat grid inflated once at its centre.
+    fn flat_dabbed(n: u32, radius: f32, falloff: Falloff) -> Mesh {
+        let mut positions = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                positions.extend([x as f32, y as f32, 0.0]);
+            }
+        }
+        let mut triangles = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                triangles.extend([[a, a + 1, a + n + 2], [a, a + n + 2, a + n + 1]]);
+            }
+        }
+        let mut mesh = mesh_of(&positions, &triangles);
+        let c = n as f32 / 2.0;
+        let options = InflateOptions::builder()
+            .center([c, c, 0.0])
+            .radius(radius)
+            .falloff(falloff)
+            .strength(radius * 0.25)
+            .build();
+        edit(&mut mesh, |tx| inflate(tx, &options));
+        mesh
+    }
+
+    #[test]
+    fn smooth_falloff_has_no_crease_at_the_rim() {
+        // A crease is a jump in the normal that no mesh resolution removes.
+        // The steepest turn between neighboring normals over the rim, at two
+        // resolutions of the same relative dab: it halves with the edge length
+        // for the smooth falloff (the slope is continuous, only the curvature
+        // jumps), and stays at the full slope, atan(0.25), for the linear one.
+        let rim_step = |n: u32, falloff: Falloff| {
+            let radius = n as f32 / 4.0;
+            let band = (1.0 - 1.5 / radius, 1.0 + 1.5 / radius);
+            let mesh = flat_dabbed(n, radius, falloff);
+            max_normal_step(&mesh, n, n as f32 / 2.0, radius, band)
+        };
+        let (smooth_coarse, smooth_fine) = (
+            rim_step(160, Falloff::Smooth),
+            rim_step(320, Falloff::Smooth),
+        );
+        let (linear_coarse, linear_fine) = (
+            rim_step(160, Falloff::Linear),
+            rim_step(320, Falloff::Linear),
+        );
+        assert!(smooth_coarse < 0.06, "smooth rim step {smooth_coarse}");
+        assert!(
+            smooth_fine < 0.6 * smooth_coarse,
+            "smooth rim step shrinks with the edge: {smooth_coarse} to {smooth_fine}"
+        );
+        assert!(linear_coarse > 0.15, "linear rim step {linear_coarse}");
+        assert!(
+            linear_fine > 0.9 * linear_coarse,
+            "linear rim step stays: {linear_coarse} to {linear_fine}"
+        );
     }
 }

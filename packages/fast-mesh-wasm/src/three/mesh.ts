@@ -174,6 +174,15 @@ const BUFFERS = {
 type BufferKey = keyof typeof BUFFERS;
 
 /**
+ * From this many vertex slots, a change that moves few of them grows the bounds
+ * over what moved and leaves the exact ones for when the edits pause: walking
+ * every slot on every frame of a sculpt stroke was its largest single cost.
+ */
+const GROW_BOUNDS_MIN_SLOTS = 65_536;
+/** The bounds are made exact again this long after the last change that grew them. */
+const SETTLE_BOUNDS_MS = 250;
+
+/**
  * Binds a scene mesh to a new THREE.Mesh and keeps it in sync on every
  * {@link SceneLike.commitFrame}: dirty ranges are copied into the attributes'
  * mirrors and marked with `addUpdateRange`, attributes are recreated when the
@@ -420,6 +429,56 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
     sphere.radius = Math.sqrt(r2);
   };
 
+  let settleBounds: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * Grows the bounds over the positions `change` moved, when that is all it did
+   * and it moved few of a large mesh's slots; they stay conservative until the
+   * edits pause. Returns whether it did: if not, the caller computes them.
+   */
+  const growBounds = (change: MeshChange): boolean => {
+    const position = attributeOf("positions");
+    const box = geometry.boundingBox;
+    const sphere = geometry.boundingSphere;
+    const moved = change.positions;
+    if (
+      position === undefined ||
+      box === null ||
+      sphere === null ||
+      box.isEmpty() ||
+      moved === "all" ||
+      change.capacityChanged ||
+      change.indices === "all" ||
+      change.indices.length > 0 ||
+      vertexSlots < GROW_BOUNDS_MIN_SLOTS
+    ) {
+      return false;
+    }
+    let count = 0;
+    for (const [, n] of moved) {
+      count += n;
+    }
+    if (count * 8 > vertexSlots) {
+      return false;
+    }
+    const p = position.array;
+    for (const [start, n] of moved) {
+      for (let k = 3 * start; k < 3 * (start + n); k += 3) {
+        box.min.x = Math.min(box.min.x, p[k]);
+        box.min.y = Math.min(box.min.y, p[k + 1]);
+        box.min.z = Math.min(box.min.z, p[k + 2]);
+        box.max.x = Math.max(box.max.x, p[k]);
+        box.max.y = Math.max(box.max.y, p[k + 1]);
+        box.max.z = Math.max(box.max.z, p[k + 2]);
+      }
+    }
+    box.getCenter(sphere.center);
+    sphere.radius = box.min.distanceTo(box.max) / 2;
+    clearTimeout(settleBounds);
+    settleBounds = setTimeout(computeBounds, SETTLE_BOUNDS_MS);
+    return true;
+  };
+
   const updateMatrix = () => {
     object.matrix.fromArray(scene.matrix4(mesh));
     object.matrixWorldNeedsUpdate = true;
@@ -518,6 +577,7 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
   const detach = () => {
     unsubscribe?.();
     unsubscribe = undefined;
+    clearTimeout(settleBounds);
   };
   unsubscribe = scene.onChanges((changes) => {
     // A parent may have moved with no change to this mesh.
@@ -531,7 +591,8 @@ export function bindMesh(scene: SceneLike, mesh: MeshHandle, options: BindMeshOp
         detach();
         return;
       }
-      if (apply(c)) {
+      if (apply(c) && !growBounds(c)) {
+        clearTimeout(settleBounds);
         computeBounds();
       }
       if (c.placementChanged) {
