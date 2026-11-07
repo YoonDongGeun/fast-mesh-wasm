@@ -40,6 +40,15 @@ pub struct ChannelDesc {
     pub policy: TopologyPolicy,
     /// Value for new vertices without usable parents, and for derived channels.
     pub default: f32,
+    /// The values describe the mesh as it was when they were written, so they
+    /// stop being true when it changes in ways they cannot follow. A commit that
+    /// changes topology drops the channel, as
+    /// [`Transaction::drop_channel`](crate::Transaction::drop_channel) would (its
+    /// undo brings it back), unless the writes ran under
+    /// [`Transaction::keeping_bound_channels`](crate::Transaction::keeping_bound_channels).
+    /// Undoing or redoing a patch recorded before the channel was added removes
+    /// the channel for good: that takes the mesh to a state it never described.
+    pub topology_bound: bool,
 }
 
 impl ChannelDesc {
@@ -51,6 +60,7 @@ impl ChannelDesc {
             kind: ChannelKind::Source,
             policy: TopologyPolicy::Interpolate,
             default: 0.0,
+            topology_bound: false,
         }
     }
 
@@ -62,12 +72,19 @@ impl ChannelDesc {
             kind: ChannelKind::Derived,
             policy: TopologyPolicy::Default,
             default: f32::NAN,
+            topology_bound: false,
         }
     }
 
     /// The UV channel: [`UV_CHANNEL`], a source channel of 2 interpolated values.
     pub fn uv() -> Self {
         Self::source(UV_CHANNEL, 2)
+    }
+
+    /// Makes the channel [`topology_bound`](Self::topology_bound).
+    pub fn bound_to_topology(mut self) -> Self {
+        self.topology_bound = true;
+        self
     }
 
     pub fn with_policy(mut self, policy: TopologyPolicy) -> Self {

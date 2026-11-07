@@ -92,9 +92,10 @@ export function remeshTooBig(triangles: number): boolean {
  * once `LIVE_REMESH_MIN_DABS` dabs landed since the last pass, never two in
  * flight. A pass splits only the edges the stroke stretched past their limit
  * (`splitStretched`): what the stroke did not stretch keeps its vertices and
- * triangles, and the vertex ids a mask stores stay valid. The rest sizes come
- * from one `captureRestSizes` per armed session, before the first dab, so
- * repeated strokes measure against the same shape instead of ratcheting.
+ * triangles, and the vertex ids a mask stores stay valid. Each stroke asks for
+ * rest sizes before its first dab (`captureRestSizes`, `onlyIfMissing`), so
+ * repeated strokes measure against the same shape instead of ratcheting, until
+ * an edit outdates it and the engine drops the sizes.
  */
 export const LIVE_REMESH_MIN_DABS = 4;
 /** Minimum milliseconds between two live remesh passes of one stroke. */

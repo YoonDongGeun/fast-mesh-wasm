@@ -5,6 +5,7 @@
 use fast_mesh_store::{History, Mesh, Transaction, VertexId};
 
 use super::*;
+use crate::Result;
 use crate::deform::{Brush, Falloff, GrabOptions, grab};
 use crate::remesh::{RemeshOptions, remesh};
 use crate::test_util::{box_mesh, edit, fin, grid, mesh_of, parts, sweep, uv_sphere};
@@ -753,4 +754,185 @@ fn an_edge_too_short_to_split_at_float_precision_stops_the_pass() {
         .expect("the pass must end");
     assert!(splits < 100, "{splits} splits");
     assert_eq!(triangles, 1 + splits);
+}
+
+/// A pass over the whole mesh that leaves nothing behind when it fails.
+fn try_pass(mesh: &mut Mesh) -> Result<StretchReport> {
+    let mut tx = mesh.begin_edit();
+    let r = split_stretched(
+        &mut tx,
+        &StretchOptions {
+            region: all(),
+            ..StretchOptions::default()
+        },
+    );
+    tx.commit().unwrap();
+    r
+}
+
+fn recorded<R>(
+    mesh: &mut Mesh,
+    history: &mut History,
+    f: impl FnOnce(&mut Transaction) -> Result<R>,
+) -> R {
+    let mut tx = mesh.begin_edit();
+    let r = f(&mut tx).unwrap();
+    let patch = tx.commit().unwrap();
+    history.push(mesh, patch).unwrap();
+    r
+}
+
+fn simplified(tx: &mut Transaction, target_triangles: usize) -> Result<()> {
+    let options = crate::simplify::SimplifyOptions {
+        target_triangles,
+        ..crate::simplify::SimplifyOptions::default()
+    };
+    crate::simplify::simplify(tx, &options).map(|_| ())
+}
+
+fn scale_all(tx: &mut Transaction, k: f32) -> Result<()> {
+    let mesh = tx.mesh();
+    let ids: Vec<u32> = (0..mesh.vertex_slots() as u32).collect();
+    let moved: Vec<[f32; 3]> = mesh.positions().iter().map(|p| p.map(|x| x * k)).collect();
+    Ok(tx.set_positions(&ids, &moved)?)
+}
+
+#[test]
+fn a_topology_edit_outdates_the_sizes_until_they_are_retaken() {
+    let mut mesh = grid(40);
+    capture_rest_sizes(&mut mesh).unwrap();
+    edit(&mut mesh, |tx| simplified(tx, 800));
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
+    assert!(ensure_rest_sizes(&mut mesh).unwrap());
+    let before = parts(&mesh);
+    assert_eq!(pass(&mut mesh, all()).splits, 0);
+    assert_eq!(parts(&mesh), before);
+}
+
+#[test]
+fn a_remesh_outdates_the_sizes_and_undoing_it_brings_them_back() {
+    let mut mesh = graded(30);
+    capture_rest_sizes(&mut mesh).unwrap();
+    let sizes = mesh.channel(REST_SIZE_CHANNEL).unwrap().to_vec();
+    let mut history = History::new(1 << 26);
+    let options = RemeshOptions::builder()
+        .center([15.0, 15.0, 0.0])
+        .radius(100.0)
+        .target_length(1.2)
+        .max_rounds(4)
+        .build();
+    let report = recorded(&mut mesh, &mut history, |tx| remesh(tx, &options));
+    assert!(report.collapses > 0);
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
+    history.undo(&mut mesh).unwrap().unwrap();
+    assert_eq!(
+        mesh.channel(REST_SIZE_CHANNEL).unwrap()[..sizes.len()],
+        sizes[..]
+    );
+    assert_eq!(pass(&mut mesh, all()).splits, 0);
+}
+
+#[test]
+fn undoing_past_the_capture_forgets_it() {
+    // A position edit from before the capture.
+    let mut mesh = grid(10);
+    let mut history = History::new(1 << 26);
+    recorded(&mut mesh, &mut history, |tx| scale_all(tx, 0.25));
+    capture_rest_sizes(&mut mesh).unwrap();
+    history.undo(&mut mesh).unwrap().unwrap();
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
+
+    // A topology edit from before the capture: every live vertex gets a size
+    // again, and a dab splits as it does on a fresh capture.
+    let dabbed = |mesh: &mut Mesh| {
+        dab(mesh, [20.0, 20.0, 0.0], 8.0, 6.0);
+        pass(mesh, all()).splits
+    };
+    let mut fresh = grid(40);
+    capture_rest_sizes(&mut fresh).unwrap();
+    let expected = dabbed(&mut fresh);
+    assert!(expected > 0);
+    let mut mesh = grid(40);
+    let mut history = History::new(1 << 26);
+    recorded(&mut mesh, &mut history, |tx| simplified(tx, 800));
+    capture_rest_sizes(&mut mesh).unwrap();
+    history.undo(&mut mesh).unwrap().unwrap();
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
+    assert!(ensure_rest_sizes(&mut mesh).unwrap());
+    let sizes = mesh.channel(REST_SIZE_CHANNEL).unwrap();
+    for v in 0..mesh.vertex_slots() as u32 {
+        if mesh.corner_count(v) > 0 {
+            assert!(sizes[v as usize] > 0.0, "vertex {v}");
+        }
+    }
+    assert_eq!(dabbed(&mut mesh), expected);
+}
+
+#[test]
+fn redoing_an_edit_from_before_the_capture_forgets_it_too() {
+    let mut mesh = grid(10);
+    let mut history = History::new(1 << 26);
+    recorded(&mut mesh, &mut history, |tx| scale_all(tx, 2.0));
+    history.undo(&mut mesh).unwrap().unwrap();
+    capture_rest_sizes(&mut mesh).unwrap();
+    history.redo(&mut mesh).unwrap().unwrap();
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn own_splits_and_their_undo_keep_the_sizes_so_strokes_do_not_ratchet() {
+    let mut mesh = grid(20);
+    capture_rest_sizes(&mut mesh).unwrap();
+    let sizes = mesh.channel(REST_SIZE_CHANNEL).unwrap().to_vec();
+    let mut history = History::new(1 << 26);
+    dab(&mut mesh, [10.0, 10.0, 0.0], 5.0, 4.0);
+    let options = StretchOptions {
+        region: all(),
+        ..StretchOptions::default()
+    };
+    let report = recorded(&mut mesh, &mut history, |tx| split_stretched(tx, &options));
+    assert!(report.splits > 0);
+    // Already there: taken again, the stretched shape would pass for the rest.
+    assert!(!ensure_rest_sizes(&mut mesh).unwrap());
+    assert_eq!(
+        mesh.channel(REST_SIZE_CHANNEL).unwrap()[..sizes.len()],
+        sizes[..]
+    );
+    history.undo(&mut mesh).unwrap().unwrap();
+    assert!(!ensure_rest_sizes(&mut mesh).unwrap());
+    assert!(try_pass(&mut mesh).unwrap().splits > 0);
+}
+
+#[test]
+fn a_foreign_edit_in_the_same_transaction_still_outdates_the_sizes() {
+    let mut mesh = grid(20);
+    capture_rest_sizes(&mut mesh).unwrap();
+    let options = StretchOptions {
+        region: all(),
+        ..StretchOptions::default()
+    };
+    edit(&mut mesh, |tx| {
+        let t = tx.add_triangles(&[[0, 1, 22]])?[0];
+        tx.remove_triangles(&[t])?;
+        split_stretched(tx, &options)
+    });
+    assert!(matches!(
+        try_pass(&mut mesh),
+        Err(OpsError::InvalidInput(_))
+    ));
 }

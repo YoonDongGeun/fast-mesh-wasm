@@ -128,9 +128,15 @@ pub struct StretchReport {
 ///
 /// Call it before the deformation starts, and keep it across strokes that
 /// should share one density: capturing again accepts what earlier strokes
-/// stretched as the new rest shape. This is not an edit: no undo step, no
-/// journal entry, and the mesh's revision does not change. It costs one pass
-/// over the triangles and a sort of the vertices.
+/// stretched as the new rest shape, which [`ensure_rest_sizes`] avoids. This is
+/// not an edit: no undo step, no journal entry, and the mesh's revision does not
+/// change. It costs one pass over the triangles and a sort of the vertices.
+///
+/// The sizes last as long as they are true: a topology edit other than
+/// [`split_stretched`] drops them (undoing that edit brings them back), and so
+/// does undoing or redoing an edit from before the capture.
+/// [`split_stretched`] then fails until they are taken again. Moving vertices
+/// does not drop them, whichever tool does it: that is the stretch they measure.
 ///
 /// # Errors
 /// [`OpsError::Store`] when memory runs out; the mesh keeps any earlier
@@ -175,9 +181,25 @@ pub fn capture_rest_sizes(mesh: &mut Mesh) -> Result<()> {
     if mesh.channel(REST_SIZE_CHANNEL).is_some() {
         mesh.remove_channel(REST_SIZE_CHANNEL)?;
     }
-    mesh.add_channel_with_values(ChannelDesc::source(REST_SIZE_CHANNEL, 1), &sizes)?;
+    mesh.add_channel_with_values(
+        ChannelDesc::source(REST_SIZE_CHANNEL, 1).bound_to_topology(),
+        &sizes,
+    )?;
     mesh.ensure_incidence()?;
     Ok(())
+}
+
+/// [`capture_rest_sizes`] unless the mesh holds valid rest sizes. Returns
+/// whether it captured.
+///
+/// # Errors
+/// As for [`capture_rest_sizes`].
+pub fn ensure_rest_sizes(mesh: &mut Mesh) -> Result<bool> {
+    if mesh.channel(REST_SIZE_CHANNEL).is_some() {
+        return Ok(false);
+    }
+    capture_rest_sizes(mesh)?;
+    Ok(true)
 }
 
 /// Splits the edges under `options.region` that have stretched past
@@ -188,8 +210,8 @@ pub fn capture_rest_sizes(mesh: &mut Mesh) -> Result<()> {
 /// `tx` at the end: either every split lands or nothing does.
 ///
 /// # Errors
-/// [`OpsError::InvalidInput`] for an invalid region or limit, or when
-/// [`capture_rest_sizes`] has not run on this mesh.
+/// [`OpsError::InvalidInput`] for an invalid region or limit, or when the mesh
+/// holds no valid rest sizes: see [`capture_rest_sizes`].
 pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result<StretchReport> {
     let region = &options.region;
     if !region.radius.is_finite() || region.radius <= 0.0 {
@@ -267,7 +289,7 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
             tris: work.tris,
             added: work.added,
         };
-        plan.commit(tx)?;
+        tx.keeping_bound_channels(|tx| plan.commit(tx))?;
     }
     Ok(report)
 }

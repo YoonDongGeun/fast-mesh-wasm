@@ -46,8 +46,8 @@
 //! - `16` split stretched: `cx, cy, cz, radius, limit (NaN for the default),
 //!   max_splits (NaN for the default), smooth (0 or 1)`; see
 //!   [`fast_mesh_ops::stretch`].
-//! - `17` capture rest sizes: no values. Must be the only operation of its
-//!   list, because it is not an edit.
+//! - `17` capture rest sizes: `only_if_missing (0 or 1)`. Must be the only
+//!   operation of its list, because it is not an edit.
 //! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
 //!   ids are taken from `loops`.
 //! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
@@ -418,7 +418,9 @@ pub(crate) enum RepairOp {
     Auto(AutoRepairOptions),
     SplitStretched(StretchOptions),
     /// Not an edit: `WasmScene::repair` runs it outside the transaction.
-    CaptureRest,
+    CaptureRest {
+        only_if_missing: bool,
+    },
 }
 
 /// A flag: 0 or 1.
@@ -681,7 +683,11 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             }
             RepairOp::SplitStretched(o)
         } else if code == 17.0 {
-            RepairOp::CaptureRest
+            let [only_if_missing]: [f64; 1] =
+                words.take(1)?.try_into().map_err(|_| malformed(WHAT))?;
+            RepairOp::CaptureRest {
+                only_if_missing: flag(only_if_missing)?,
+            }
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -837,7 +843,7 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                 let r = fast_mesh_ops::stretch::split_stretched(tx, o)?;
                 put(&mut out, &[count(r.splits), count(r.remaining)])?;
             }
-            RepairOp::CaptureRest => {}
+            RepairOp::CaptureRest { .. } => {}
             RepairOp::Remesh(o) => {
                 let r = fast_mesh_ops::remesh::remesh(tx, o)?;
                 put(
@@ -1190,8 +1196,10 @@ mod tests {
             })]
         );
         assert_eq!(
-            decode_repair(&[17.], &[]).unwrap(),
-            vec![RepairOp::CaptureRest]
+            decode_repair(&[17., 1.], &[]).unwrap(),
+            vec![RepairOp::CaptureRest {
+                only_if_missing: true
+            }]
         );
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
         assert_eq!(

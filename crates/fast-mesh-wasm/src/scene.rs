@@ -1018,15 +1018,18 @@ impl WasmScene {
             let r = self.scene.dab(id, &dab)?;
             return Ok(vec![count(r.moved), f64::from(r.max_displacement)]);
         }
-        if decoded.iter().any(|op| matches!(op, RepairOp::CaptureRest)) {
-            // Not an edit, so it cannot join a transaction.
-            if decoded.len() != 1 {
-                return Err(Error::invalid(
-                    "captureRestSizes must be the only operation in its list",
-                ));
-            }
-            self.scene.capture_rest_sizes(id)?;
+        if let [RepairOp::CaptureRest { only_if_missing }] = decoded.as_slice() {
+            self.scene.capture_rest_sizes(id, *only_if_missing)?;
             return Ok(Vec::new());
+        }
+        if decoded
+            .iter()
+            .any(|op| matches!(op, RepairOp::CaptureRest { .. }))
+        {
+            // Not an edit, so it cannot join a transaction.
+            return Err(Error::invalid(
+                "captureRestSizes must be the only operation in its list",
+            ));
         }
         if decoded
             .iter()

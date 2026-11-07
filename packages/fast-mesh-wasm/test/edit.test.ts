@@ -833,6 +833,39 @@ describe("analyze and repair", () => {
     expect(s.repair(m, { op: "splitStretched", center, radius: 100 }).splits).toBe(0);
   });
 
+  it("splitStretched_needs_new_rest_sizes_after_an_edit_outdates_them", () => {
+    const n = 20;
+    const pos: number[] = [];
+    const tris: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        pos.push(x, y, 0);
+      }
+    }
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        tris.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    const s = scene();
+    const m = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+    const center = [0, 0, 0] as const;
+    const pass = () => s.repair(m, { op: "splitStretched", center, radius: 1000 });
+    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(pass().splits).toBe(0);
+    // A simplify outdates them: longer edges must not read as stretched.
+    s.repair(m, { op: "simplify", targetTriangles: 200 });
+    expect(pass).toThrow();
+    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(pass().splits).toBe(0);
+    // Undoing past the capture forgets it, and the next one sees the original.
+    expect(s.undo()).toBe(true);
+    expect(pass).toThrow();
+    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(pass().splits).toBe(0);
+  });
+
   it("bridgeLoops_joins_two_rims", () => {
     const s = scene();
     const m = s.addMesh(bridgePos, bridgeIdx);

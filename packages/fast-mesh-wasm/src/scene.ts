@@ -647,9 +647,14 @@ export type RepairOp =
        * Records each vertex's longest edge as its rest size, for
        * `splitStretched`. Run it before the deformation starts. Not an edit:
        * no undo step, and it must be the only op of its list. Running it again
-       * accepts the mesh as it is then as the new rest shape.
+       * accepts the mesh as it is then as the new rest shape; `onlyIfMissing`
+       * avoids that. The sizes last until a topology edit other than
+       * `splitStretched`, or an undo or redo of an edit from before the capture;
+       * undoing a topology edit from after it brings them back.
        */
       op: "captureRestSizes";
+      /** Keep rest sizes the mesh still holds. Unset means `false`. */
+      onlyIfMissing?: boolean;
     }
   | {
       /**
@@ -657,7 +662,8 @@ export type RepairOp =
        * splits once it is past `limit` times the smaller rest size of its
        * endpoints, measured by `captureRestSizes`. Existing vertices keep their
        * ids and positions, nothing collapses or flips, and a triangle with no
-       * split edge keeps its slot. Fails until `captureRestSizes` has run.
+       * split edge keeps its slot. Fails while the mesh holds no valid rest
+       * sizes: see `captureRestSizes`.
        */
       op: "splitStretched";
       /** Region center in local mesh coordinates; edges with an endpoint in the region are checked. */
@@ -1520,6 +1526,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         );
         break;
       case "captureRestSizes":
+        values.push(flagOf(o.onlyIfMissing, false));
         break;
     }
   }

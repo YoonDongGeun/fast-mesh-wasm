@@ -232,6 +232,9 @@ pub struct Patch {
     pub(crate) dropped_channels: Vec<u64>,
     /// Bytes of the dropped channels' values, kept on the mesh for this patch.
     pub(crate) dropped_bytes: usize,
+    /// The channel id the next added channel would have got when this patch was
+    /// recorded: a channel at or past it is newer than the patch.
+    pub(crate) channels_before: u64,
     pub(crate) changes: ChangeSet,
 }
 
@@ -319,6 +322,7 @@ impl Patch {
 
         // Phase C: write. From here on nothing can fail (the incidence index is
         // dropped instead if it cannot follow).
+        self.forget_newer_bound_channels(mesh);
         let c = &self.changes;
         let ids = [
             &c.triangles_added[..],
@@ -352,9 +356,18 @@ impl Patch {
         Ok(self.changes.clone())
     }
 
+    /// Removes the [`topology_bound`](crate::ChannelDesc::topology_bound)
+    /// channels added after this patch was recorded: its undo or redo takes the
+    /// mesh to a state they never described.
+    fn forget_newer_bound_channels(&self, mesh: &mut Mesh) {
+        mesh.channels
+            .retain(|c| !(c.desc.topology_bound && c.id >= self.channels_before));
+    }
+
     /// Undoes the patch. The mesh must be at [`Patch::revision`].
     pub fn revert(&self, mesh: &mut Mesh) -> Result<ChangeSet> {
         self.check(mesh, self.revision)?;
+        self.forget_newer_bound_channels(mesh);
         let c = &self.changes;
         let ids = [
             &c.triangles_added[..],

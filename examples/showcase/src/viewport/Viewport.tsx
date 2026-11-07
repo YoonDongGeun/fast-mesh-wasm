@@ -798,18 +798,17 @@ function SculptLayer(props: {
       }
     };
 
-    /** The mesh whose rest sizes this armed session captured. */
-    let restCaptured: MeshHandle | null = null;
-
-    /** Captures the rest sizes once per armed session: before the first dab, or nothing has a rest shape. */
+    /**
+     * Before the first dab: rest sizes unless the mesh holds valid ones. The
+     * engine drops them when an edit outdates them, so strokes share one rest
+     * shape for as long as it is true, and nothing here has to track that.
+     */
     const ensureRest = (mesh: MeshHandle): void => {
-      if (!liveRef.current || restCaptured === mesh) {
+      if (!liveRef.current) {
         return;
       }
-      restCaptured = mesh;
-      store.repair(mesh, { op: "captureRestSizes" }).catch(() => {
+      store.repair(mesh, { op: "captureRestSizes", onlyIfMissing: true }).catch(() => {
         // Removed meanwhile: the stroke paints on, and its passes fail alike.
-        restCaptured = null;
       });
     };
 

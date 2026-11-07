@@ -928,14 +928,19 @@ impl Scene {
     /// [`split_stretched`](fast_mesh_ops::stretch::split_stretched); see
     /// [`capture_rest_sizes`](fast_mesh_ops::stretch::capture_rest_sizes). Not
     /// an edit: no undo step and no change report, since no geometry changed
-    /// and nothing draws this channel.
+    /// and nothing draws this channel. With `only_if_missing`, valid rest sizes
+    /// stay as they are ([`ensure_rest_sizes`](fast_mesh_ops::stretch::ensure_rest_sizes)).
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or [`SceneError::Ops`] when memory runs out.
-    pub fn capture_rest_sizes(&mut self, id: MeshId) -> Result<()> {
+    pub fn capture_rest_sizes(&mut self, id: MeshId, only_if_missing: bool) -> Result<()> {
         self.drop_field_unit();
         let entry = self.entry_mut(id)?;
-        fast_mesh_ops::stretch::capture_rest_sizes(&mut entry.mesh)?;
+        if only_if_missing {
+            fast_mesh_ops::stretch::ensure_rest_sizes(&mut entry.mesh)?;
+        } else {
+            fast_mesh_ops::stretch::capture_rest_sizes(&mut entry.mesh)?;
+        }
         Ok(())
     }
 
