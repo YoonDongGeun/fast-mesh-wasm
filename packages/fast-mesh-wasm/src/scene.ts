@@ -618,6 +618,8 @@ export type RepairOp =
       falloff: "linear" | "smooth";
       /** Displacement scale; negative pulls instead of pushing. */
       strength: number;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
     }
   | {
       op: "smooth";
@@ -629,6 +631,8 @@ export type RepairOp =
       strength: number;
       /** How many Taubin λ/μ cycles to run; 0 moves nothing. */
       cycles: number;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
     }
   | {
       op: "remesh";
@@ -693,6 +697,8 @@ export type RepairOp =
       strength: number;
       /** The drag vector in local coordinates; zero moves nothing. */
       direction: Readonly<Vec3>;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
     }
   | {
       op: "relax";
@@ -704,6 +710,8 @@ export type RepairOp =
       strength: number;
       /** How many plain Laplacian passes to run; 0 moves nothing. */
       cycles: number;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
     }
   | {
       op: "offset";
@@ -797,6 +805,24 @@ export interface FillReport {
   skipped: { id: LoopId; reason: "bounds" | "unclean" | "uvSeam" }[];
   /** Selected loops that could not be filled; they stay open. */
   failed: { id: LoopId; reason: "projectionFolds" | "noValidTriangulation" | "solver" }[];
+}
+
+/**
+ * Vertices a brush op (`inflate`, `smooth`, `relax`, `grab`) holds back.
+ * After the op runs, each listed vertex's move is scaled by its weight: `0`
+ * leaves it at exactly the bytes it had, `1` keeps the whole move. The op's
+ * report describes its own move, before the scaling, and it stays one undo step;
+ * an op alone whose brush holds only vertices at `0` reports 0 and leaves no step.
+ * List only what the brush can reach: every listed vertex costs time per call.
+ *
+ * @throws `INVALID_ARGUMENT` from `repair` when a vertex is not alive, a weight
+ * is outside `[0, 1]`, or the lists differ in length.
+ */
+export interface VertexProtection {
+  /** The vertex slots to protect. */
+  vertices: Uint32Array | readonly number[];
+  /** One weight per vertex, each in `[0, 1]`; unset holds every listed vertex fully (all `0`). */
+  weights?: Float32Array | readonly number[];
 }
 
 /** What `inflate` did. */
@@ -1162,6 +1188,9 @@ interface ActiveDrag {
   applyPending(): void;
 }
 
+/** The repair list's prefix code for a {@link VertexProtection}. */
+const PROTECT_CODE = 32;
+
 const MODES: Record<UpdateMode, number> = { eager: 0, lazy: 1, manual: 2 };
 const MODE_NAMES: readonly UpdateMode[] = ["eager", "lazy", "manual"];
 
@@ -1407,11 +1436,34 @@ function isAutoRepair(op: RepairOp | readonly RepairOp[] | AutoRepairRequest): o
   return (op as AutoRepairRequest | undefined)?.kind === "auto";
 }
 
+/** The prefix that wraps the op after it in a {@link VertexProtection}; see `crate::edit` in the Rust crate. */
+function encodeProtect(protect: VertexProtection, values: number[]): void {
+  const { vertices, weights } = protect;
+  if (vertices?.length === undefined) {
+    throw invalid("protect.vertices must be an array of vertex ids");
+  }
+  const n = vertices.length;
+  if (weights !== undefined && weights.length !== n) {
+    throw invalid("protect.weights must have one weight per vertex");
+  }
+  values.push(PROTECT_CODE, n);
+  for (let k = 0; k < n; k++) {
+    values.push(vertices[k]);
+  }
+  for (let k = 0; k < n; k++) {
+    values.push(weights === undefined ? 0 : weights[k]);
+  }
+}
+
 /** A repair op list as the binding's `(ops, loops)`; see `crate::edit` in the Rust crate. */
 function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: Uint32Array } {
   const values: number[] = [];
   const loops: number[] = [];
   for (const o of ops) {
+    const protect = (o as { protect?: VertexProtection } | undefined)?.protect;
+    if (protect !== undefined) {
+      encodeProtect(protect, values);
+    }
     values.push(codeIn(REPAIR_CODES, o?.op, "repair op"));
     switch (o.op) {
       case "weld":

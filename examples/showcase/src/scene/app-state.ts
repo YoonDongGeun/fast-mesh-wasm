@@ -159,12 +159,13 @@ export interface AppSnapshot {
   /** The sculpt brush armed on a mesh, if any: hover shows its ball, press-and-hold paints. */
   sculpt: SculptBrush | null;
   /**
-   * The painted protected region on a mesh, if any: deform dabs whose ball
-   * touches a masked vertex are dropped (see `viewport/sculpt.ts`'s mask
-   * contract). `null` when never painted or cleared — loudly, with
+   * The painted protected region on a mesh, if any: deform dabs leave its
+   * vertices in place (see `viewport/sculpt.ts`'s mask contract). `null` when never painted or cleared — loudly, with
    * `sculptMaskNotice`, when a topology edit takes a masked vertex.
    */
   sculptMask: SculptMask | null;
+  /** Whether the mask's tint shows while a sculpt tool or the mask paint is armed. */
+  sculptMaskShown: boolean;
   /** The mask paint is armed: press-and-hold paints the protected region. */
   maskPaint: boolean;
   /** The mask paint radius, in mesh units. */
@@ -252,6 +253,7 @@ export class AppState {
     brushPick: null,
     sculpt: null,
     sculptMask: null,
+    sculptMaskShown: true,
     maskPaint: false,
     maskRadius: 0.25,
     sculptMaskNotice: null,
@@ -496,6 +498,11 @@ export class AppState {
   /** Stores the painted mask (`null` clears it by hand, and clears its notice). */
   setSculptMask(mask: SculptMask | null): void {
     this.#set(mask === null ? { sculptMask: null, sculptMaskNotice: null } : { sculptMask: mask });
+  }
+
+  /** Shows (`true`) or hides the mask's tint; the mask itself stays. */
+  setSculptMaskShown(on: boolean): void {
+    this.#set({ sculptMaskShown: on });
   }
 
   /** Arms (`true`) or disarms the mask paint. */

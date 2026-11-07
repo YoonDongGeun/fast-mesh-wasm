@@ -8,7 +8,7 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle, Scene, StretchReport } from "fast-mesh-wasm";
+import type { MeshHandle, RepairOp, Scene, StretchReport } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
@@ -37,7 +37,6 @@ import {
   interpolateHit,
   LIVE_MAX_SPLITS,
   liveRemeshDue,
-  maskBlocksDab,
   maskUsable,
   meanEdgeLength,
   paintMaskIds,
@@ -47,6 +46,16 @@ import {
 } from "./sculpt";
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
+import { MaskOverlay } from "./mask-overlay";
+import {
+  inheritedSplits,
+  MASK_SOFT_BAND,
+  type MaskField,
+  maskEdgeField,
+  maskFieldCurrent,
+  maskMeetsRemesh,
+  protectDab,
+} from "./mask-protect";
 import { setWireOverlay } from "./wire";
 import {
   buildRepairOverlayGroup,
@@ -126,6 +135,14 @@ export function Viewport(props: {
       view.dragListeners.delete(onDrag);
     };
   }, []);
+  // The paint works on the selection: with none left (the mesh was removed)
+  // it has nothing to work on, and would keep the next mesh's gizmo down.
+  useEffect(() => {
+    if (maskPaint && selection === null) {
+      app.setMaskPaint(false);
+    }
+  }, [app, maskPaint, selection]);
+
   // A tap on empty space clears the selection; sculpt and mask paint own the
   // pointer, and gizmo drags and orbits are not taps. While an inspect
   // tool is armed the selection stays put (the ruler and query click
@@ -212,8 +229,8 @@ export function Viewport(props: {
           bound={bindings.get(item.mesh) ?? null}
         />
       ))}
-      {/* Sculpt owns the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
-      <Controls bound={sculpt !== null ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
+      {/* Sculpt and mask paint own the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
+      <Controls bound={sculpt !== null || maskPaint ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
       {sculpt !== null ? (
         <SculptLayer app={app} scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
@@ -391,8 +408,52 @@ function MeshView(props: {
         onBind={(b) => onBind(item.mesh, b)}
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
+      <SculptMaskOverlay app={app} item={item} bound={bound} />
     </>
   );
+}
+
+/**
+ * The sculpt mask's tint on its mesh (see `viewport/mask-overlay.ts`), while
+ * a sculpt tool or the mask paint is armed and it is not hidden. A child of
+ * the bound mesh, so it hides with it; the frame loop follows the mask and
+ * the mesh's triangles (a remesh, an undo), at most one build per frame.
+ */
+function SculptMaskOverlay(props: { app: AppState; item: Item; bound: MeshBinding | null }) {
+  const { app, item, bound } = props;
+  const masked = useApp(app, (s) => (s.sculptMask?.mesh === item.mesh ? s.sculptMask.vertices : null));
+  const armed = useApp(app, (s) => s.sculpt !== null || s.maskPaint);
+  const shown = useApp(app, (s) => s.sculptMaskShown);
+  const on = armed && shown && masked !== null;
+  const object = bound?.object ?? null;
+  const overlayRef = useRef<MaskOverlay | null>(null);
+  useLayoutEffect(() => {
+    if (!on || object === null) {
+      return;
+    }
+    const created = new MaskOverlay(object);
+    overlayRef.current = created;
+    return () => {
+      overlayRef.current = null;
+      created.dispose();
+      inspect.sculpt.maskOverlay.triangles = 0;
+    };
+  }, [on, object]);
+  useFrame(() => {
+    const overlay = overlayRef.current;
+    if (overlay === null || masked === null) {
+      return;
+    }
+    const start = performance.now();
+    if (overlay.sync(masked)) {
+      const stats = inspect.sculpt.maskOverlay;
+      stats.lastMs = performance.now() - start;
+      stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
+      stats.builds++;
+      stats.triangles = overlay.triangles;
+    }
+  });
+  return null;
 }
 
 /**
@@ -590,8 +651,8 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
  * grab drags the surface along instead). A press on empty space is the
  * orbit's, as usual; a stroke holds a single undo step on the sync scene
  * (the Worker has no step nesting: one step per batch of dabs there), and its end
- * remeshes the stroked region when asked. Dabs whose ball touches the
- * painted mask are dropped before they reach the scene. One raycast at a
+ * remeshes the stroked region when asked. Dabs hold the painted mask's
+ * vertices in place and move the rest (`protectedDab`). One raycast at a
  * time, through the engine's BVH, never three's per-triangle `Mesh.raycast`.
  */
 function SculptLayer(props: {
@@ -699,15 +760,19 @@ function SculptLayer(props: {
     };
 
     /**
-     * The mask's liveness over the mesh's current buffers, cached by slot
-     * count: `maskUsable` materialized, so a stroke start (and any re-cache
-     * when splits grow the mesh mid-stroke) pays one O(triangles) pass and
-     * every dab pays O(masked). Own dabs only move positions (liveness is
-     * untouched) and the live remesh only splits (old vertices stay alive),
-     * so the cache survives the stroke it gates.
+     * The mask's liveness over the mesh's current buffers: `maskUsable`
+     * materialized, so a stroke start (and any re-cache when the triangles
+     * change) pays one O(triangles) pass and every dab pays O(masked). Own
+     * dabs only move positions, so the cache survives the stroke it gates. A
+     * weld or an undo can kill a vertex and keep the slot count, so it goes
+     * with any change to the triangles (see `offTriangles`).
      */
     let maskCache: { slots: number; live: Uint8Array } | null = null;
-    const maskLive = (mesh: MeshHandle): { vertices: Uint32Array; positions: ArrayLike<number> } | "stale" | null => {
+    /** The mask `maskCache` last vouched for. */
+    let checkedMask: Uint32Array | null = null;
+    const maskLive = (
+      mesh: MeshHandle,
+    ): { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number> } | "stale" | null => {
       const m = maskRef.current;
       if (m === null || m.mesh !== mesh) {
         return null;
@@ -723,6 +788,7 @@ function SculptLayer(props: {
       }
       const slots = positions.length / 3;
       if (maskCache === null || maskCache.slots !== slots) {
+        checkedMask = null;
         const live = new Uint8Array(slots);
         for (let t = 0; t + 2 < indices.length; t += 3) {
           const a = indices[t];
@@ -743,13 +809,17 @@ function SculptLayer(props: {
         }
         maskCache = { slots, live };
       }
-      for (let k = 0; k < m.vertices.length; k++) {
-        const id = m.vertices[k];
-        if (id < 0 || id >= maskCache.live.length || maskCache.live[id] === 0) {
-          return "stale";
+      // Once per mask over these triangles: every dab asks.
+      if (checkedMask !== m.vertices) {
+        for (let k = 0; k < m.vertices.length; k++) {
+          const id = m.vertices[k];
+          if ((id < 0 || id >= maskCache.live.length || maskCache.live[id] === 0) && m.inherited?.has(id) !== true) {
+            return "stale";
+          }
         }
+        checkedMask = m.vertices;
       }
-      return { vertices: m.vertices, positions };
+      return { vertices: m.vertices, positions, indices };
     };
 
     /**
@@ -764,21 +834,85 @@ function SculptLayer(props: {
       inspect.sculpt.maskStale++;
     };
 
-    /**
-     * Whether a dab at `point` is protected: its ball touches a masked
-     * vertex. A stale mask fails loudly once (cleared, never re-pointed)
-     * and the dab paints on.
-     */
-    const dabProtected = (mesh: MeshHandle, point: readonly [number, number, number], radius: number): boolean => {
+    /** The mask without inherited slots an undo took: a dead vertex cannot be protected. */
+    const heldNow = (vertices: Uint32Array): ArrayLike<number> => {
+      const inherited = maskRef.current?.inherited;
+      const live = maskCache?.live;
+      return inherited === undefined || live === undefined ? vertices : vertices.filter((v) => live[v] === 1 || !inherited.has(v));
+    };
+
+    /** Splits between masked vertices join the mask, in order with the stroke: before the next dab. */
+    const adoptSplits = (mesh: MeshHandle, splits: ArrayLike<number> | undefined): void => {
+      const m = maskRef.current;
+      if (m === null || m.mesh !== mesh || splits === undefined || splits.length === 0) {
+        return;
+      }
+      const painted = new Set(m.vertices);
+      const fresh = inheritedSplits((id) => painted.has(id), splits);
+      if (fresh.length === 0) {
+        return;
+      }
+      const next: SculptMask = {
+        ...m,
+        vertices: unionMaskIds(m.vertices, Uint32Array.from(fresh).sort()),
+        inherited: new Set([...(m.inherited ?? []), ...fresh]),
+      };
+      maskRef.current = next;
+      app.setSculptMask(next);
+    };
+
+    /** The mask's protection, rebuilt when the mask, the slot count or the band changes. */
+    let fieldCache: { vertices: Uint32Array; slots: number; band: number; field: MaskField } | null = null;
+    const maskFieldOf = (
+      gated: { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number> },
+      radius: number,
+    ): MaskField => {
+      const slots = gated.positions.length / 3;
+      const band = radius * MASK_SOFT_BAND;
+      if (fieldCache?.vertices !== gated.vertices || fieldCache.slots !== slots || fieldCache.band !== band) {
+        fieldCache = {
+          vertices: gated.vertices,
+          slots,
+          band,
+          field: maskEdgeField(heldNow(gated.vertices), gated.positions, gated.indices, slots, band),
+        };
+      }
+      return fieldCache.field;
+    };
+
+    const offTriangles = scene.onChanges((changes) => {
+      if (changes.some((c) => !c.removed && (c.capacityChanged || c.indices === "all" || c.indices.length > 0))) {
+        maskCache = null;
+        checkedMask = null;
+        fieldCache = null;
+      }
+    });
+
+    /** The one place a dab meets the mask: `op` with what it must hold in place. */
+    const protectedDab = (mesh: MeshHandle, op: RepairOp): RepairOp => {
       const gated = maskLive(mesh);
-      if (gated === null) {
-        return false;
+      if (gated === null || gated === "stale" || !("radius" in op)) {
+        return op;
       }
-      if (gated === "stale") {
+      return protectDab(op, maskFieldOf(gated, op.radius), gated.positions);
+    };
+
+    /**
+     * Whether a stroke-end remesh of this region would touch the mask. A full
+     * pass can collapse what it covers, so it stands down there: the engine's
+     * remesh has no pinned vertices, and the mask promises they stay. The live
+     * pass needs no such check: it only splits, which keeps every id and position.
+     */
+    const remeshMeetsMask = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }): boolean => {
+      const gated = maskLive(mesh);
+      return gated !== null && gated !== "stale" && maskMeetsRemesh(gated.vertices, gated.positions, gated.indices, b.center, b.radius);
+    };
+
+    /** A stale mask fails loudly once (cleared, never re-pointed), and the dab paints on. */
+    const checkMaskLive = (mesh: MeshHandle): void => {
+      if (maskLive(mesh) === "stale") {
         maskWentStale();
-        return false;
       }
-      return maskBlocksDab(gated.vertices, gated.positions, point, radius);
     };
 
     /** The remesh density anchor, taken lazily: only remeshes need it. */
@@ -816,7 +950,10 @@ function SculptLayer(props: {
     const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) =>
       store
         .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: LIVE_MAX_SPLITS })
-        .then((report) => report as StretchReport)
+        .then((report) => {
+          adoptSplits(mesh, (report as StretchReport).vertices);
+          return report as StretchReport;
+        })
         .catch(() => {
           // A degenerate region, or a mesh removed meanwhile.
           return undefined;
@@ -941,7 +1078,7 @@ function SculptLayer(props: {
           const b = s.bounds();
           const mesh = brushRef.current.mesh;
           const slots = triSlots(mesh);
-          if (b !== null && slots !== null && !remeshTooBig(slots)) {
+          if (b !== null && slots !== null && !remeshTooBig(slots) && !remeshMeetsMask(mesh, b)) {
             ensureDensity(mesh);
             inspect.sculpt.remeshes++;
             // In order with the stroke: after what is due and any live pass.
@@ -1158,21 +1295,42 @@ function SculptLayer(props: {
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,
-              (ops) =>
-                landing(
-                  nests || ops.length === 1
-                    ? Promise.all(ops.map((op) => store.repair(mesh, op)))
-                    : store.repair(mesh, ops),
-                ),
-              // The mask drops the dab before the scene (counted, like a skip).
-              (at, radius) => {
-                if (dabProtected(mesh, at, radius)) {
-                  inspect.sculpt.maskedDabs++;
-                  return true;
+              (ops) => {
+                const cost = inspect.sculpt.dabCost;
+                const start = performance.now();
+                const held = ops.map((op) => protectedDab(mesh, op));
+                const sent = performance.now();
+                if (cost.maskMs.length < 4096) {
+                  cost.maskMs.push(sent - start);
                 }
+                return landing(
+                  nests || held.length === 1
+                    ? Promise.all(held.map((op) => store.repair(mesh, op)))
+                    : store.repair(mesh, held),
+                ).then((reports) => {
+                  if (cost.landMs.length < 4096) {
+                    cost.landMs.push(performance.now() - sent);
+                  }
+                  // A dab with only masked vertices under it moved nothing (counted, like a skip).
+                  (reports as readonly { moved?: number }[]).forEach((r, k) => {
+                    if (r.moved === 0 && "protect" in held[k]) {
+                      inspect.sculpt.maskedDabs++;
+                      // Nothing moved, so nothing stretched: no live pass for this one.
+                      liveDabs++;
+                    }
+                  });
+                  return reports;
+                });
+              },
+              () => {
+                checkMaskLive(mesh);
                 return false;
               },
             );
+            // A repair or an undo since the last stroke may have moved masked vertices.
+            if (fieldCache !== null && !maskFieldCurrent(fieldCache.field, scene.views(mesh).positions())) {
+              fieldCache = null;
+            }
             active = e.pointerId;
             stroke = s;
             view.stroking = true;
@@ -1180,17 +1338,21 @@ function SculptLayer(props: {
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            // Grab is move-driven only: the press takes the region, the first
-            // move paints (a click without a drag leaves no step, no remesh).
-            // A masked press holds it still (the stroke still opens, so the
+            // Grab is move-driven only: the press takes the region without the
+            // masked vertices, the first move paints (a click without a drag
+            // leaves no step, no remesh). A fully masked press holds it still (the stroke still opens, so the
             // loud stale check runs here too, before any dab lands).
             if (brush.op !== "grab") {
               s.dab(point);
-            } else if (dabProtected(mesh, point, brush.radius)) {
-              inspect.sculpt.maskedDabs++;
             } else {
+              checkMaskLive(mesh);
               const v = scene.views(mesh);
-              grabRegion = new GrabRegion(
+              // Read at each rebase: a live split can add to the mask.
+              const hold = (): MaskField | null => {
+                const gated = maskLive(mesh);
+                return gated === null || gated === "stale" ? null : maskFieldOf(gated, brush.radius);
+              };
+              const region = new GrabRegion(
                 v.positions(),
                 v.indices(),
                 point,
@@ -1198,7 +1360,13 @@ function SculptLayer(props: {
                 brush.falloff,
                 brush.strength,
                 scene.origin(mesh),
+                hold,
               );
+              if (region.ids.length === 0 && hold() !== null) {
+                inspect.sculpt.maskedDabs++;
+              } else {
+                grabRegion = region;
+              }
             }
             syncDabs();
             clearInterval(buildup);
@@ -1243,6 +1411,7 @@ function SculptLayer(props: {
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("pointerleave", onLeave);
     return () => {
+      offTriangles();
       alive = false;
       clearTimeout(timer);
       canvas.removeEventListener("pointermove", onMove);
@@ -1378,7 +1547,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
           app.setSculptMask({ mesh, vertices: fresh, slots });
           return;
         }
-        app.setSculptMask({ mesh, vertices: unionMaskIds(prev.vertices, fresh), slots });
+        app.setSculptMask({ mesh, vertices: unionMaskIds(prev.vertices, fresh), slots, inherited: prev.inherited });
       } else {
         // A new mesh replaces the mask, like the sculpt brush re-arms.
         app.setSculptMask({ mesh, vertices: fresh, slots });

@@ -20,7 +20,6 @@ import {
   checkMask,
   invertMaskIds,
   liveRemeshDue,
-  maskBlocksDab,
   maskUsable,
   MaskError,
   paintMaskIds,
@@ -660,14 +659,6 @@ describe("sculpt mask", () => {
     expect([...invertMaskIds([0, 7], [0, 0, 0], 4)]).toEqual([]);
   });
 
-  it("blocks_dabs_whose_ball_touches_the_mask", () => {
-    expect(maskBlocksDab([0], positions, [0.05, 0, 0], 0.1)).toBe(true);
-    // The ball's edge counts, like the paint's own measure.
-    expect(maskBlocksDab([1], positions, [0, 0, 0], 1)).toBe(true);
-    expect(maskBlocksDab([3], positions, [0, 0, 0], 1)).toBe(false);
-    expect(maskBlocksDab([], positions, [0, 0, 0], 1)).toBe(false);
-  });
-
   it("usable_while_every_masked_slot_is_live", () => {
     expect(maskUsable(mask([0, 3]), indices, 4)).toBe(true);
     expect(maskUsable(mask([]), indices, 4)).toBe(true);
@@ -679,11 +670,8 @@ describe("sculpt mask", () => {
   });
 
   it("survives_position_only_stroke_edits", () => {
-    // A dab moves vertices without touching the slots: the mask stands,
-    // and the gate follows the moved positions.
-    const moved = [0.05, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0];
+    // A dab moves vertices without touching the slots: the mask stands.
     expect(maskUsable(mask([0, 3]), indices, 4)).toBe(true);
-    expect(maskBlocksDab([0], moved, [0.05, 0, 0], 0.1)).toBe(true);
   });
 
   it("survives_splits_that_keep_old_vertices_alive", () => {

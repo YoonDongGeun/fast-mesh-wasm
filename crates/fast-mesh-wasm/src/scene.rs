@@ -1012,17 +1012,28 @@ impl WasmScene {
     ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
         let decoded = decode_repair(ops, loops)?;
-        // One brush op alone runs as a dab, its cost following the brush
-        // region; in a list, the BVH cannot follow the ops inside the
-        // one transaction, so they scan.
-        let dab = match decoded.as_slice() {
-            [RepairOp::Inflate(o)] => Some(Dab::Inflate(*o)),
-            [RepairOp::Smooth(o)] => Some(Dab::Smooth(*o)),
-            [RepairOp::Grab(o)] => Some(Dab::Grab(*o)),
+        // One brush op alone runs as a dab, protected or not, its cost
+        // following the brush region; in a list, the BVH cannot follow the ops
+        // inside the one transaction, so they scan.
+        let dab_of = |op: &RepairOp| match op {
+            RepairOp::Inflate(o) => Some(Dab::Inflate(*o)),
+            RepairOp::Smooth(o) => Some(Dab::Smooth(*o)),
+            RepairOp::Grab(o) => Some(Dab::Grab(*o)),
             _ => None,
         };
-        if let Some(dab) = dab {
-            let r = self.scene.dab(id, &dab)?;
+        let dab = match decoded.as_slice() {
+            [
+                RepairOp::Protected {
+                    vertices,
+                    weights,
+                    op,
+                },
+            ] => dab_of(op).map(|d| (d, vertices.as_slice(), weights.as_slice())),
+            [op] => dab_of(op).map(|d| (d, &[][..], &[][..])),
+            _ => None,
+        };
+        if let Some((dab, vertices, weights)) = dab {
+            let r = self.scene.dab_protected(id, &dab, vertices, weights)?;
             return Ok(vec![count(r.moved), f64::from(r.max_displacement)]);
         }
         if let [RepairOp::CaptureRest { only_if_missing }] = decoded.as_slice() {

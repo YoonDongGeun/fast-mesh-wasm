@@ -1,6 +1,7 @@
 // `window.__showcase`: what scripts/showcase-check.mjs reads in headless
 // Chrome. Read-only views of the app; the check drives it through the UI
 // (the file input, mouse events on the canvas, the toolbar buttons).
+import type { RepairOp } from "fast-mesh-wasm";
 import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
 import type { Engine } from "./App";
@@ -31,6 +32,7 @@ export function installTestHook(
     }
     return item;
   };
+  const baseColors = new Map<unknown, THREE.Color>();
   const releases = new Map<"collision" | "group", () => void>();
   (globalThis as { __showcase?: unknown }).__showcase = {
     store,
@@ -103,6 +105,29 @@ export function installTestHook(
     heatmapRule: (options: ContactHeatmapOptions) => {
       const { maxDistance: _m, sign: _s, ...rule } = contactHeatmap(options);
       return rule;
+    },
+    /** Runs a repair on the named mesh, as a panel would. */
+    runRepair: (name: string, op: RepairOp) => store.repair(find(name).mesh, op),
+    /** The painted mask's vertex slots, ascending; `null` without one. */
+    sculptMask: () => {
+      const m = app.getSnapshot().sculptMask;
+      return m === null ? null : Array.from(m.vertices);
+    },
+    /** The mask's slots added by splits, not painted. */
+    sculptMaskInherited: () => Array.from(app.getSnapshot().sculptMask?.inherited ?? []),
+    /** Why the mask was last cleared against its will, if it was. */
+    sculptMaskNotice: () => app.getSnapshot().sculptMaskNotice,
+    /** Sets the mesh's base colour (`null` restores the one it had), like a project load does. */
+    meshColor: (name: string, hex: number | null) => {
+      const item = find(name);
+      if (hex === null) {
+        item.material.color.copy(baseColors.get(item.mesh) ?? item.material.color);
+        return;
+      }
+      if (!baseColors.has(item.mesh)) {
+        baseColors.set(item.mesh, item.material.color.clone());
+      }
+      item.material.color.setHex(hex);
     },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
@@ -217,7 +242,7 @@ export function installTestHook(
       return { ...r, analysis };
     },
     /** The sculpt brush: strokes painted, dabs applied, stroke-end and live remeshes, grab drag, and whether the ball shows. */
-    sculpt: () => ({ ...inspect.sculpt }),
+    sculpt: () => ({ ...inspect.sculpt, maskOverlay: { ...inspect.sculpt.maskOverlay }, dabCost: { maskMs: [...inspect.sculpt.dabCost.maskMs], landMs: [...inspect.sculpt.dabCost.landMs] } }),
     /** The inspect tools: the armed tool, the ruler, the query, the section plane and the clip box. */
     inspectTools: () => ({
       tool: inspect.tools.tool,

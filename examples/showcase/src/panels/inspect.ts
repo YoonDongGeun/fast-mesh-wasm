@@ -121,10 +121,14 @@ export const inspect: {
     grabTotal: number;
     hovering: boolean;
     lastDab: [number, number, number] | null;
-    /** Dabs the mask dropped (the ball touched a masked vertex). */
+    /** Dabs the mask dropped (every vertex in the ball was masked). */
     maskedDabs: number;
     /** Masks cleared against their will (a topology edit took a masked vertex). */
     maskStale: number;
+    /** Stroke dabs: per send (bounded), the main-thread ms the mask took and the ms from sending to landing. */
+    dabCost: { maskMs: number[]; landMs: number[] };
+    /** The mask overlay: triangles drawn (0 when hidden), rebuilds, and the build time in ms, last and worst. */
+    maskOverlay: { triangles: number; builds: number; lastMs: number; maxMs: number };
   };
 } = {
   collision: { ...liveProbe(), warnings: [] },
@@ -144,7 +148,7 @@ export const inspect: {
   slices: { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false },
   sceneSlices: { id: null, shown: 0 },
   sceneVolume: { id: null, preset: "" },
-  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null, maskedDabs: 0, maskStale: 0 },
+  sculpt: { strokes: 0, dabs: 0, remeshes: 0, liveRemeshes: 0, grabTotal: 0, hovering: false, lastDab: null, maskedDabs: 0, maskStale: 0, dabCost: { maskMs: [], landMs: [] }, maskOverlay: { triangles: 0, builds: 0, lastMs: 0, maxMs: 0 } },
   tools: {
     tool: null,
     ruler: { a: [0, 0, 0], b: null, distance: null },

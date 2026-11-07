@@ -69,6 +69,7 @@ export {
   type FindContactsOptions,
   type GrabReport,
   type InflateReport,
+  type VertexProtection,
   type IsolateReport,
   type JoinOptions,
   type JoinReport,

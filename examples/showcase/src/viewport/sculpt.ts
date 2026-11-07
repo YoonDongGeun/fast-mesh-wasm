@@ -1,6 +1,7 @@
 // The sculpt stroke: what one dab applies, and one press-and-hold stroke
 // over the meshes (the viewport's ring and pointer loop drive it).
 import type { FastMeshErrorCode, MeshHandle, RepairOp } from "fast-mesh-wasm";
+import type { MaskField } from "./mask-protect";
 
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
@@ -248,6 +249,7 @@ export class GrabRegion {
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
   readonly #origin: readonly [number, number, number];
+  readonly #hold: () => MaskField | null;
   /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
@@ -259,8 +261,10 @@ export class GrabRegion {
     falloff: "linear" | "smooth",
     strength: number,
     origin: readonly [number, number, number] = [0, 0, 0],
+    hold: MaskField | null | (() => MaskField | null) = null,
   ) {
     this.#origin = [origin[0], origin[1], origin[2]];
+    this.#hold = typeof hold === "function" ? hold : () => hold;
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
     this.#falloff = falloff;
@@ -269,6 +273,15 @@ export class GrabRegion {
     this.#weights = new Float32Array();
     this.#rest = new Float32Array();
     this.rebase(positions, indices);
+  }
+
+  /**
+   * What the mask leaves of a vertex's move: 0 on a masked one, which this
+   * region then never takes, so no write ever reaches it. Read fresh, since a
+   * split can add to the mask mid-stroke. A slot newer than the field is free.
+   */
+  #held(id: number, field: MaskField | null): number {
+    return field === null || id >= field.scale.length ? 1 : field.scale[id];
   }
 
   /** The weight of a vertex resting at `x, y, z`. */
@@ -308,8 +321,13 @@ export class GrabRegion {
     const weights: number[] = [];
     const rest: number[] = [];
     const tolerance = 1e-5 * this.#radius;
+    const field = this.#hold();
     for (let k = 0; k < candidates.length; k++) {
       const id = candidates[k];
+      const held = this.#held(id, field);
+      if (held === 0) {
+        continue;
+      }
       const [px, py, pz] = [positions[3 * id], positions[3 * id + 1], positions[3 * id + 2]];
       const old = known.get(id);
       if (old !== undefined) {
@@ -322,7 +340,7 @@ export class GrabRegion {
           continue;
         }
       }
-      const w = split.get(id) ?? this.#weightAt(px, py, pz, drag);
+      const w = split.get(id) ?? held * this.#weightAt(px, py, pz, drag);
       if (w !== 0) {
         ids.push(id);
         weights.push(w);
@@ -788,9 +806,10 @@ export class SculptStroke {
 
 // ---- Sculpt mask (#130) ----
 //
-// A painted protected region the deform brushes skip: the mask stores the
-// painted vertex slots, and every dab whose ball touches one is dropped
-// before it reaches the scene.
+// A painted protected region the deform brushes leave in place: the mask
+// stores the painted vertex slots, and every dab carries the ones it can
+// reach to the engine, which holds them byte-identical while the free
+// vertices move (see `viewport/mask-protect.ts`).
 //
 // The storage contract answers #130's question against #106's selection
 // contract. A selection snapshot pins the mesh's content stamp, so the
@@ -804,7 +823,8 @@ export class SculptStroke {
 // longer used by a live triangle (a collapse, compact, weld or isolate took
 // it). Surviving cases re-verify cheaply: splits add slots but keep the old
 // vertices alive, so a split stroke's mask carries over (the new vertices
-// land unmasked); undo/redo restores the buffers, and the mask with them
+// land unmasked, unless they split a masked edge: those join the mask, see
+// `inherited`); undo/redo restores the buffers, and the mask with them
 // when its ids are live again. The documented hole: a merge or compact can
 // remap ids while keeping them live, silently re-pointing the mask —
 // reselect after structural repairs, as with #106 selections.
@@ -821,19 +841,35 @@ export interface SculptMask {
   vertices: Uint32Array;
   /** `positions().length / 3` when painted; see the contract above. */
   slots: number;
+  /**
+   * The slots in `vertices` no one painted: splits between masked vertices,
+   * held like them. An undo takes them with the split and a redo brings them
+   * back, so one dying says nothing about the mask: it is skipped, not stale.
+   */
+  inherited?: ReadonlySet<number>;
 }
 
 /**
- * Whether `id` names a slot a triangle still uses: in range and on a live
- * (non-removed) triangle. Removed slots read `0, 0, 0`, so triples of three
- * zeros are skipped — mirroring the engine's `buildTopology`, where a
- * genuine all-zero triangle is degenerate (zero area) and losing it is
- * harmless.
+ * Whether the mask still names live vertices of `mesh` over its current
+ * buffers: every masked slot in range and used by a live triangle. Removed
+ * slots read `0, 0, 0`, so triples of three zeros are skipped — mirroring the
+ * engine's `buildTopology`, where a genuine all-zero triangle is degenerate
+ * (zero area) and losing it is harmless. One pass over the triangles, then one
+ * over the mask: painting calls this per dab. The stroke start and
+ * paint/invert paths call `checkMask` to fail loudly instead.
  */
-function maskIdLive(indices: ArrayLike<number>, id: number, slots: number): boolean {
-  if (!Number.isInteger(id) || id < 0 || id >= slots) {
-    return false;
+export function maskUsable(
+  mask: Pick<SculptMask, "vertices" | "slots" | "inherited">,
+  indices: ArrayLike<number>,
+  slots: number,
+): boolean {
+  // A slots mismatch (splits grew the mesh, a compact shrank it) never
+  // fails on its own: the ids may still name the same vertices (splits only
+  // add), so liveness below decides. An empty mask protects nothing.
+  if (mask.vertices.length === 0) {
+    return true;
   }
+  const used = new Uint8Array(slots);
   for (let t = 0; t + 2 < indices.length; t += 3) {
     const a = indices[t];
     const b = indices[t + 1];
@@ -841,29 +877,19 @@ function maskIdLive(indices: ArrayLike<number>, id: number, slots: number): bool
     if (a === 0 && b === 0 && c === 0) {
       continue;
     }
-    if (a === id || b === id || c === id) {
-      return true;
+    if (a < slots) {
+      used[a] = 1;
+    }
+    if (b < slots) {
+      used[b] = 1;
+    }
+    if (c < slots) {
+      used[c] = 1;
     }
   }
-  return false;
-}
-
-/**
- * Whether the mask still names live vertices of `mesh` over its current
- * buffers: every masked slot in range and used by a live triangle. The
- * per-dab gate (position moves never change this); the stroke start and
- * paint/invert paths call `checkMask` to fail loudly instead.
- */
-export function maskUsable(
-  mask: Pick<SculptMask, "vertices" | "slots">,
-  indices: ArrayLike<number>,
-  slots: number,
-): boolean {
-  // A slots mismatch (splits grew the mesh, a compact shrank it) never
-  // fails on its own: the ids may still name the same vertices (splits only
-  // add), so liveness below decides. An empty mask protects nothing.
   for (let k = 0; k < mask.vertices.length; k++) {
-    if (!maskIdLive(indices, mask.vertices[k], slots)) {
+    const id = mask.vertices[k];
+    if ((!Number.isInteger(id) || id < 0 || id >= slots || used[id] === 0) && mask.inherited?.has(id) !== true) {
       return false;
     }
   }
@@ -1023,29 +1049,4 @@ export function invertMaskIds(
     }
   }
   return Uint32Array.from(out);
-}
-
-/**
- * Whether a dab at `center` is protected: any masked slot within its ball
- * (`<= radius`, the paint's own measure). The dab is then dropped before it
- * reaches the scene — the brushes skip the region instead of scaling it, so
- * a fully masked lump never drifts under buildup.
- */
-export function maskBlocksDab(
-  masked: ArrayLike<number>,
-  positions: ArrayLike<number>,
-  center: readonly [number, number, number],
-  radius: number,
-): boolean {
-  const r2 = radius * radius;
-  for (let k = 0; k < masked.length; k++) {
-    const v = masked[k];
-    const dx = positions[v * 3] - center[0];
-    const dy = positions[v * 3 + 1] - center[1];
-    const dz = positions[v * 3 + 2] - center[2];
-    if (dx * dx + dy * dy + dz * dz <= r2) {
-      return true;
-    }
-  }
-  return false;
 }

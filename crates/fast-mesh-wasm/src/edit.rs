@@ -65,6 +65,11 @@
 //!   [`AutoRepairOptions`]. Its report is, for each stage in the order it
 //!   ran, the code of the op that stage is, then that op's report.
 //!
+//! - `32` protect: `n, id × n, weight × n`, then the op it wraps, which must
+//!   be inflate, smooth, grab or relax. That op runs under
+//!   [`with_protection`](fast_mesh_ops::with_protection) and reports as usual;
+//!   `32` adds no report of its own. Its code stays clear of the ops, which count up.
+//!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
 //!
@@ -421,6 +426,12 @@ pub(crate) enum RepairOp {
     CaptureRest {
         only_if_missing: bool,
     },
+    /// A brush op whose moves are scaled per vertex.
+    Protected {
+        vertices: Vec<u32>,
+        weights: Vec<f32>,
+        op: Box<RepairOp>,
+    },
 }
 
 /// A flag: 0 or 1.
@@ -472,6 +483,25 @@ pub(crate) fn loop_id(w: [u32; 4]) -> LoopId {
     }
 }
 
+/// Decodes a protection's `n, id × n, weight × n`; the range of a weight and
+/// the liveness of a vertex are checked when it runs.
+fn decode_protect(words: &mut Cursor<'_, f64>) -> Result<(Vec<u32>, Vec<f32>), Error> {
+    let n = count_opt(words.next()?, "protect count")?.ok_or_else(|| malformed("repair"))?;
+    let ids = words.take(n)?;
+    let weights = words.take(n)?;
+    let mut vertices = Vec::new();
+    vertices
+        .try_reserve_exact(n)
+        .map_err(|_| Error::invalid("protect is too large"))?;
+    for &id in ids {
+        if !(id >= 0.0 && id <= f64::from(u32::MAX) && id.fract() == 0.0) {
+            return Err(Error::invalid("protect vertices must be u32 integers"));
+        }
+        vertices.push(id as u32);
+    }
+    Ok((vertices, weights.iter().map(|&w| w as f32).collect()))
+}
+
 /// Decodes a repair op list (see the module docs). The operations check
 /// their own options when they run.
 ///
@@ -483,8 +513,17 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
     let mut words = Cursor::new(ops, WHAT);
     let mut ids = Cursor::new(loops, WHAT);
     let mut out = Vec::new();
+    // The protection read last, waiting for the op it wraps.
+    let mut protect: Option<(Vec<u32>, Vec<f32>)> = None;
     while !words.is_empty() {
         let code = words.next()?;
+        if code == 32.0 {
+            if protect.is_some() {
+                return Err(malformed(WHAT));
+            }
+            protect = Some(decode_protect(&mut words)?);
+            continue;
+        }
         let op = if code == 0.0 {
             RepairOp::Weld(words.next()? as f32)
         } else if code == 1.0 {
@@ -692,7 +731,27 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             return Err(Error::invalid("unknown repair op"));
         };
         out.try_reserve(1).map_err(|_| oom())?;
-        out.push(op);
+        out.push(match protect.take() {
+            None => op,
+            Some((vertices, weights)) => {
+                if !matches!(
+                    op,
+                    RepairOp::Inflate(_) | RepairOp::Smooth(_) | RepairOp::Grab(_)
+                ) {
+                    return Err(Error::invalid(
+                        "protect applies to inflate, smooth, relax and grab",
+                    ));
+                }
+                RepairOp::Protected {
+                    vertices,
+                    weights,
+                    op: Box::new(op),
+                }
+            }
+        });
+    }
+    if protect.is_some() {
+        return Err(malformed(WHAT));
     }
     if !ids.is_empty() {
         return Err(malformed(WHAT));
@@ -830,6 +889,16 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                     put(&mut out, &[code])?;
                     put_stage(&mut out, stage)?;
                 }
+            }
+            RepairOp::Protected {
+                vertices,
+                weights,
+                op,
+            } => {
+                let report = fast_mesh_ops::with_protection(tx, vertices, weights, |tx| {
+                    run_repair(tx, std::slice::from_ref(op))
+                })?;
+                put(&mut out, &report)?;
             }
             RepairOp::Inflate(o) => {
                 let r = fast_mesh_ops::deform::inflate(tx, o)?;
@@ -1325,6 +1394,36 @@ mod tests {
         assert_eq!(code(&[8., nan], &[0, 4, 11]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[8., -1.], &full), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[8., 1.5], &full), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_protect() {
+        let brush = [5., 1., 2., 3., 4., 1., 0.5];
+        let mut list = vec![32., 2., 7., 9., 0., 0.25];
+        list.extend(brush);
+        let d = decode_repair(&list, &[]).unwrap();
+        let [
+            RepairOp::Protected {
+                vertices,
+                weights,
+                op,
+            },
+        ] = d.as_slice()
+        else {
+            panic!("expected one protected op: {d:?}");
+        };
+        assert_eq!(vertices, &[7, 9]);
+        assert_eq!(weights, &[0.0, 0.25]);
+        assert!(matches!(**op, RepairOp::Inflate(_)));
+
+        // Nothing to wrap, two in a row, or an op that is not a brush.
+        assert!(decode_repair(&[32., 0.], &[]).is_err());
+        assert!(decode_repair(&[32., 0., 32., 0., 5.], &[]).is_err());
+        assert!(decode_repair(&[32., 0., 3.], &[]).is_err());
+        // Cut short, and an id that is not a u32.
+        assert!(decode_repair(&[32., 2., 7.], &[]).is_err());
+        assert!(decode_repair(&[32., 1., 0.5, 0.], &[]).is_err());
+        assert!(decode_repair(&[32., 1., -1., 0.], &[]).is_err());
     }
 
     #[test]

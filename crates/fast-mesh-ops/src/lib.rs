@@ -55,7 +55,8 @@
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
-//!   drags them along one vector.
+//!   drags them along one vector. [`with_protection()`] holds chosen vertices
+//!   back from any of them, per vertex.
 //! - UVs: every operation either keeps a mesh's UV channel aligned or drops
 //!   it undoably, never leaving stale values; the per-operation table is in
 //!   [`docs/uv-channel.md`](https://github.com/YoonDongGeun/fast-mesh-wasm/blob/main/docs/uv-channel.md).
@@ -76,6 +77,7 @@ pub mod icp;
 mod measure;
 mod offset;
 mod orient;
+pub mod protect;
 mod refine;
 pub mod remesh;
 pub mod simplify;
@@ -114,6 +116,7 @@ pub use offset::{
     ShellReport, offset, shell,
 };
 pub use orient::{OrientReport, orient};
+pub use protect::{check_protection, with_protection};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
 use fast_mesh_store::StoreError;
