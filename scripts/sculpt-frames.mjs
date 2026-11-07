@@ -18,7 +18,8 @@
 // Ctrl+Z on the sync scene, the live remesh adds triangles during a stroke, a grab drags
 // the surface by the pointer's drag, and dabs that touch a painted mask are dropped and
 // leave its vertices where they were, and a release before the press's raycast returns
-// opens no stroke. It exits 1 on any failure.
+// opens no stroke, a grab released while a live pass is out leaves no vertex behind (Worker),
+// and Ctrl+Z during a grab changes nothing. It exits 1 on any failure.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -38,6 +39,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EVENTS = 240;
 const EVENT_MS = 8;
 const NAME = "sculpt-sphere.stl";
+/** How far a new vertex may stand off its neighbours in `--verify`'s released-during-a-pass check. */
+const GRAB_SPIKE = 0.15;
 
 /** A UV sphere of radius 2 as a binary STL, `2 * segments * (rings - 1)` triangles. */
 function sphereStl(triangles) {
@@ -319,6 +322,160 @@ async function verify() {
     check(`${mode} the next press still paints`, raceLater.strokes === raceAfter.strokes + 1 && raceLater.dabs > raceAfter.dabs, `${raceLater.dabs - raceAfter.dabs} dabs`);
     await disarm("inflate");
 
+    const setRemeshes = (end, live) =>
+      page(`(() => {
+        for (const [action, on] of [["sculpt-remesh", ${end}], ["sculpt-live-remesh", ${live}]]) {
+          const el = document.querySelector('[data-action="' + action + '"]');
+          if (el.checked !== on) el.click();
+        }
+        return true;
+      })()`);
+
+    // Ctrl+Z during a grab, once and twice, over an earlier stroke.
+    for (const presses of [1, 2]) {
+      await load(mode, path);
+      original = (await positions()).length;
+      await arm("inflate");
+      await setRemeshes(false, false);
+      await sleep(100);
+      await drag(40, 0, 20, -120);
+      await disarm("inflate");
+      const before = await positions();
+      await arm("grab");
+      await setRemeshes(false, false);
+      await sleep(100);
+      const at = await page(`__showcase.screenPoint(${q})`);
+      const [gx, gy] = [at.x + 20, at.y - 120];
+      await mouse("mouseMoved", gx, gy, { button: "none" });
+      await sleep(150);
+      await mouse("mousePressed", gx, gy, { buttons: 1 });
+      await sleep(80);
+      for (let k = 1; k <= 15; k++) {
+        await mouse("mouseMoved", gx + 2 * k, gy, { buttons: 1 });
+        await sleep(12);
+      }
+      await sleep(300);
+      const held = await positions();
+      for (let k = 0; k < presses; k++) {
+        await ctrlZ();
+      }
+      const undone = await positions();
+      for (let k = 16; k <= 30; k++) {
+        await mouse("mouseMoved", gx + 2 * k, gy, { buttons: 1 });
+        await sleep(12);
+      }
+      await mouse("mouseReleased", gx + 60, gy, { buttons: 0 });
+      await sleep(500);
+      const end = await positions();
+      // Outside what the grab moved, nothing should differ from before it: a difference is the seam.
+      let outside = 0;
+      for (let k = 0; k + 2 < original; k += 3) {
+        const grabbed = held[k] !== before[k] || held[k + 1] !== before[k + 1] || held[k + 2] !== before[k + 2];
+        if (!grabbed && Math.hypot(end[k] - before[k], end[k + 1] - before[k + 1], end[k + 2] - before[k + 2]) > 0) {
+          outside++;
+        }
+      }
+      check(
+        `${mode} Ctrl+Z x${presses} during a grab`,
+        farthest(held, undone) === 0 && outside === 0,
+        `it moved the surface by ${farthest(held, undone).toFixed(3)}; ${outside} vertices outside the grab changed`,
+      );
+      await disarm("grab");
+    }
+
+    // A grab released while a live pass is out: the pass's new vertices come along.
+    if (mode === "worker") {
+      await load(mode, path);
+      original = (await positions()).length;
+      await arm("grab");
+      await setRemeshes(false, true);
+      await sleep(100);
+      // Drag far enough to stretch the region, so that the pass has something to split.
+      const start = await page(`__showcase.screenPoint(${q})`);
+      const [px, py] = [start.x, start.y + 110];
+      await mouse("mouseMoved", px, py, { button: "none" });
+      await sleep(150);
+      const liveBefore = await page("__showcase.sculpt().liveRemeshes");
+      await mouse("mousePressed", px, py, { buttons: 1 });
+      await sleep(80);
+      let reach = 0;
+      for (; reach < 60; reach += 3) {
+        await mouse("mouseMoved", px + reach, py, { buttons: 1 });
+        await sleep(12);
+      }
+      // Let the earlier pass land, then hold the next one's answer back.
+      await waitFor(`__showcase.status().status === "idle"`);
+      await sleep(700);
+      await page(`(() => {
+        const store = __showcase.store;
+        const repair = store.repair;
+        store.repair = function (...args) {
+          return repair.apply(this, args).then((r) => new Promise((done) => setTimeout(() => done(r), 1500)));
+        };
+        window.__fastRepair = () => delete store.repair;
+        return true;
+      })()`);
+      const passesThen = await page("__showcase.sculpt().liveRemeshes");
+      // The pass goes out on the next moves; the drag goes on far, and lets go, while it is out.
+      for (let k = 0; k < 8 && (await page("__showcase.sculpt().liveRemeshes")) === passesThen; k++) {
+        reach += 3;
+        await mouse("mouseMoved", px + reach, py, { buttons: 1 });
+        await sleep(30);
+      }
+      for (let k = 0; k < 15; k++) {
+        reach += 6;
+        await mouse("mouseMoved", px + reach, py, { buttons: 1 });
+        await sleep(8);
+      }
+      await mouse("mouseReleased", px + reach, py, { buttons: 0 });
+      await sleep(2500);
+      await page("(window.__fastRepair(), true)");
+      const final = await positions();
+      const live = (await page("__showcase.sculpt().liveRemeshes")) - liveBefore;
+      // A new vertex left behind while its neighbours jump stands off them: the
+      // largest distance of any vertex from its neighbours' centroid, new and old
+      // apart (a long drag stretches edges either way, so edge length cannot tell).
+      const triangles = await page(`__showcase.indices(${q})`);
+      const slots = final.length / 3;
+      const sums = new Float64Array(slots * 4);
+      for (let t = 0; t + 2 < triangles.length; t += 3) {
+        const corners = [triangles[t], triangles[t + 1], triangles[t + 2]];
+        if (corners[0] === corners[1] && corners[1] === corners[2]) {
+          continue;
+        }
+        for (const v of corners) {
+          for (const u of corners) {
+            if (u !== v) {
+              for (let c = 0; c < 3; c++) {
+                sums[4 * v + c] += final[3 * u + c];
+              }
+              sums[4 * v + 3]++;
+            }
+          }
+        }
+      }
+      let spike = 0;
+      let spikeOld = 0;
+      for (let v = 0; v < slots; v++) {
+        const n = sums[4 * v + 3];
+        if (n > 0) {
+          const off = Math.hypot(sums[4 * v] / n - final[3 * v], sums[4 * v + 1] / n - final[3 * v + 1], sums[4 * v + 2] / n - final[3 * v + 2]);
+          if (3 * v < original) {
+            spikeOld = Math.max(spikeOld, off);
+          } else {
+            spike = Math.max(spike, off);
+          }
+        }
+      }
+      const added = (final.length - original) / 3;
+      check("worker grab released during a live pass", live > 0 && added > 0 && spike < GRAB_SPIKE, `${live} pass(es), ${added} new vertices; off their neighbours by ${spike.toFixed(3)} (new), ${spikeOld.toFixed(3)} (old)`);
+      await disarm("grab");
+      await setRemeshes(true, true);
+    }
+
+    await arm("inflate");
+    await setRemeshes(true, true);
+    await disarm("inflate");
     const errors = browser.consoleLines.filter((l) => /exception|error:/i.test(l));
     check(`${mode} console`, errors.length === 0, errors.slice(0, 3).join(" | ") || "clean");
   }
