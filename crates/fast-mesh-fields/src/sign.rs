@@ -1572,7 +1572,8 @@ mod tests {
             state >> 8
         };
         let (mut refits, mut declined) = (0, 0);
-        let shapes: [(&str, fn() -> Mesh); 3] = [
+        type Shape = (&'static str, fn() -> Mesh);
+        let shapes: [Shape; 3] = [
             ("slivers", || sliver_sheet(14)),
             ("torus", torus),
             ("cube", cube),
