@@ -2,7 +2,7 @@
 // mesh. Four tools arm the sculpt brush (inflate, deflate, smooth, grab),
 // with the brush radius and per-tool strength on sliders, the falloff, and
 // the stretch-split and stroke-end remesh toggles; the viewport paints the strokes.
-// The mask group paints the protected region the brushes skip (invert and
+// The mask group paints the protected region the brushes hold (invert and
 // clear included); mask painting disarms the sculpt brush and vice versa.
 import type { MeshHandle } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
@@ -174,7 +174,7 @@ function arm(
 }
 
 /**
- * The mask group: paint the protected region the deform brushes skip, with
+ * The mask group: paint the protected region the deform brushes hold, with
  * invert and clear. Paint accumulates sphere-brush picks on the selected
  * mesh (a new mesh replaces the mask); invert and clear work in place over
  * the mirrored views, failing loudly when a topology edit took a masked

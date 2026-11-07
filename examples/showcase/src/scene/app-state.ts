@@ -159,9 +159,8 @@ export interface AppSnapshot {
   /** The sculpt brush armed on a mesh, if any: hover shows its ball, press-and-hold paints. */
   sculpt: SculptBrush | null;
   /**
-   * The painted protected region on a mesh, if any: deform dabs whose ball
-   * touches a masked vertex are dropped (see `viewport/sculpt.ts`'s mask
-   * contract). `null` when never painted or cleared — loudly, with
+   * The painted protected region on a mesh, if any: deform dabs leave its
+   * vertices in place (see `viewport/sculpt.ts`'s mask contract). `null` when never painted or cleared — loudly, with
    * `sculptMaskNotice`, when a topology edit takes a masked vertex.
    */
   sculptMask: SculptMask | null;

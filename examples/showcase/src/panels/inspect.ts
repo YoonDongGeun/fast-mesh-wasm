@@ -121,7 +121,7 @@ export const inspect: {
     grabTotal: number;
     hovering: boolean;
     lastDab: [number, number, number] | null;
-    /** Dabs the mask dropped (the ball touched a masked vertex). */
+    /** Dabs the mask dropped (every vertex in the ball was masked). */
     maskedDabs: number;
     /** Masks cleared against their will (a topology edit took a masked vertex). */
     maskStale: number;

@@ -720,6 +720,57 @@ describe("analyze and repair", () => {
     expect(maxZ()).toBeLessThan(melted);
   });
 
+  it("protect_holds_listed_vertices_byte_identical_and_moves_the_rest", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const held = [0, 1, 4];
+    const brush = { center, radius: 2, falloff: "linear", strength: 0.2 } as const;
+    const report = s.repair(m, { op: "inflate", ...brush, protect: { vertices: held } });
+    expect(report.moved).toBeGreaterThan(0);
+    const after = s.views(m).positions();
+    for (const v of held) {
+      expect(Array.from(after.subarray(3 * v, 3 * v + 3))).toEqual(Array.from(before.subarray(3 * v, 3 * v + 3)));
+    }
+    expect(Array.from(after)).not.toEqual(Array.from(before));
+    // One undo step, and it restores everything.
+    s.undo();
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
+  it("protect_scales_a_move_by_its_weight", () => {
+    const run = (weight: number | null) => {
+      const s = scene();
+      const { positions, indices } = flatGrid();
+      const m = s.addMesh(positions, indices);
+      const p = s.views(m).positions();
+      const center: Vec3 = [p[12], p[13], p[14]];
+      const op = { op: "grab", center, radius: 3, falloff: "linear", strength: 1, direction: [0, 0, 1] } as const;
+      s.repair(m, weight === null ? op : { ...op, protect: { vertices: [4], weights: [weight] } });
+      return s.views(m).positions()[14];
+    };
+    expect(run(0.5)).toBeCloseTo((run(null) + run(0)) * 0.5, 5);
+    expect(run(1)).toBe(run(null));
+    expect(run(0)).not.toBe(run(null));
+  });
+
+  it("protect_rejects_bad_input_and_non_brush_ops", () => {
+    const s = scene();
+    const { positions, indices } = flatGrid();
+    const m = s.addMesh(positions, indices);
+    const before = Float32Array.from(s.views(m).positions());
+    const center: Vec3 = [before[12], before[13], before[14]];
+    const good = { op: "inflate", center, radius: 2, falloff: "linear", strength: 0.2 } as const;
+    expect(codeOf(() => s.repair(m, { ...good, protect: { vertices: [99999] } }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, protect: { vertices: [0.5] } }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, protect: { vertices: [0], weights: [2] } }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { ...good, protect: { vertices: [0], weights: [] } }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "orient", protect: { vertices: [0] } } as never))).toBe("INVALID_ARGUMENT");
+    expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
   it("relax_rejects_invalid_brush", () => {
     const s = scene();
     const { positions, indices } = flatGrid();

@@ -788,9 +788,10 @@ export class SculptStroke {
 
 // ---- Sculpt mask (#130) ----
 //
-// A painted protected region the deform brushes skip: the mask stores the
-// painted vertex slots, and every dab whose ball touches one is dropped
-// before it reaches the scene.
+// A painted protected region the deform brushes leave in place: the mask
+// stores the painted vertex slots, and every dab carries the ones it can
+// reach to the engine, which holds them byte-identical while the free
+// vertices move (see `viewport/mask-protect.ts`).
 //
 // The storage contract answers #130's question against #106's selection
 // contract. A selection snapshot pins the mesh's content stamp, so the
@@ -1023,29 +1024,4 @@ export function invertMaskIds(
     }
   }
   return Uint32Array.from(out);
-}
-
-/**
- * Whether a dab at `center` is protected: any masked slot within its ball
- * (`<= radius`, the paint's own measure). The dab is then dropped before it
- * reaches the scene — the brushes skip the region instead of scaling it, so
- * a fully masked lump never drifts under buildup.
- */
-export function maskBlocksDab(
-  masked: ArrayLike<number>,
-  positions: ArrayLike<number>,
-  center: readonly [number, number, number],
-  radius: number,
-): boolean {
-  const r2 = radius * radius;
-  for (let k = 0; k < masked.length; k++) {
-    const v = masked[k];
-    const dx = positions[v * 3] - center[0];
-    const dy = positions[v * 3 + 1] - center[1];
-    const dz = positions[v * 3 + 2] - center[2];
-    if (dx * dx + dy * dy + dz * dz <= r2) {
-      return true;
-    }
-  }
-  return false;
 }

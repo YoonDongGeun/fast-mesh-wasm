@@ -20,6 +20,12 @@
 //   colour and no pixel away from the tint, and clearing restores the pixels.
 // - big (--big): a 1M-triangle sphere; painting with the tint shown and hidden,
 //   the overlay's build time, frame gaps and long tasks. Passes on the build time.
+// - protect: a dab on the mask's edge leaves every masked position byte-identical
+//   and moves free vertices; undo restores them all and keeps the mask; the
+//   mask's vertices stay put with the stroke-end remesh on, which stands down.
+// - covered: a dab with only masked vertices in its ball is dropped: no undo step.
+// - stale: a topology edit that takes a masked vertex clears the mask and its
+//   tint, with the notice.
 // - console: no uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -355,6 +361,81 @@ try {
   const cleared = await diff("base", "cleared", 8);
   verdict("clear", cleared.count === 0 && (await hook("sculpt().maskOverlay.triangles")) === 0, `${cleared.count} pixels differ from the base`);
 
+  // ---- protect: a dab on the mask's edge moves only free vertices ----
+  const positions = () => hook(`positions(${q(A)})`);
+  await press(center);
+  await frames();
+  const held = await hook("sculptMask()");
+  await shot("edge-tint");
+  const paintedTint = await diff("base", "edge-tint", 24, center, TINT_REACH);
+  // On the tint's rim, along +x: half the brush ball over the mask.
+  const edge = { x: paintedTint.box[2] + rect.x, y: center.y };
+  const heldMoved = (a, b) => held.filter((v) => a[3 * v] !== b[3 * v] || a[3 * v + 1] !== b[3 * v + 1] || a[3 * v + 2] !== b[3 * v + 2]).length;
+  const freeMoved = (a, b) => {
+    const set = new Set(held);
+    let n = 0;
+    for (let v = 0; v < a.length / 3; v++) {
+      if (!set.has(v) && (a[3 * v] !== b[3 * v] || a[3 * v + 1] !== b[3 * v + 1] || a[3 * v + 2] !== b[3 * v + 2])) n++;
+    }
+    return n;
+  };
+  const stroke = async (at, ms) => {
+    await mouse("mouseMoved", at.x, at.y, { button: "none" });
+    await sleep(200);
+    await mouse("mousePressed", at.x, at.y, { buttons: 1 });
+    await sleep(ms);
+    await mouse("mouseReleased", at.x, at.y, { buttons: 0 });
+    await sleep(600);
+  };
+  const p0 = await positions();
+  const s0 = await hook("sculpt()");
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
+  await stroke(edge, 500);
+  const p1 = await positions();
+  const s1 = await hook("sculpt()");
+  await shot("edge-dabbed");
+  const stillMasked = await hook("sculptMask()");
+  verdict(
+    "protect",
+    s1.dabs > s0.dabs && s1.maskedDabs === s0.maskedDabs && heldMoved(p0, p1) === 0 && freeMoved(p0, p1) > 0 && q(stillMasked) === q(held) && p1.length === p0.length,
+    `${s1.dabs - s0.dabs} dabs, ${s1.maskedDabs - s0.maskedDabs} dropped; ${heldMoved(p0, p1)} of ${held.length} masked moved, ${freeMoved(p0, p1)} free moved; slots ${p0.length / 3} -> ${p1.length / 3}; remeshes ${s1.remeshes - s0.remeshes}`,
+  );
+
+  // ---- undo: every position back, the mask kept ----
+  let undos = 0;
+  while (undos < 200 && (await page(`document.querySelector("[data-action=undo]")?.disabled === false`))) {
+    await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+    undos++;
+    await sleep(40);
+    if (q(await positions()) === q(p0)) {
+      break;
+    }
+  }
+  const p2 = await positions();
+  verdict("undo", q(p2) === q(p0) && q(await hook("sculptMask()")) === q(held), `${undos} undo(s) back to the painted positions; mask kept ${q(await hook("sculptMask()")) === q(held)}`);
+
+  // ---- covered: a dab with only masked vertices in its ball is dropped ----
+  await page(`(() => {
+    const el = document.querySelector('[data-action="sculpt-radius"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, "0.05");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  const s2 = await hook("sculpt()");
+  const undoBefore = await page(`document.querySelector("[data-action=undo]")?.disabled`);
+  await stroke(center, 300);
+  const s3 = await hook("sculpt()");
+  const p3 = await positions();
+  verdict(
+    "covered",
+    s3.maskedDabs > s2.maskedDabs && s3.dabs === s2.dabs && q(p3) === q(p0) && (await page(`document.querySelector("[data-action=undo]")?.disabled`)) === undoBefore,
+    `${s3.maskedDabs - s2.maskedDabs} dropped, ${s3.dabs - s2.dabs} applied; positions unchanged ${q(p3) === q(p0)}`,
+  );
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await clickOn('[data-action="sculpt-mask-paint"]');
+  await clickOn('[data-action="sculpt-mask-clear"]');
+
   // ---- light and dark: the tint is far from the surface colour on both ----
   for (const [name, hex] of [
     ["light", 0xf2f2f2],
@@ -371,6 +452,29 @@ try {
     verdict(name, shift > 100, `surface ${q(base.map(Math.round))} -> tinted ${q(at.map(Math.round))}: distance ${fmt(shift)}`);
   }
   await hook(`meshColor(${q(A)}, null)`);
+
+  // ---- stale: a topology edit that takes a masked vertex clears the mask and its tint ----
+  await frames();
+  await press(center);
+  // Nearly the whole mesh, so the collapses below are sure to take a masked vertex.
+  await clickOn('[data-action="sculpt-mask-invert"]');
+  await frames();
+  const simplified = await hook(`runRepair(${q(A)}, { op: "simplify", targetTriangles: 200 })`);
+  await sleep(500);
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
+  const staleBefore = (await hook("sculpt()")).maskStale;
+  const onMesh = await hook(`screenPoint(${q(A)})`);
+  await stroke(onMesh, 200);
+  await frames();
+  const notice = await hook("sculptMaskNotice()");
+  const staleTris = await hook("sculpt().maskOverlay.triangles");
+  verdict(
+    "stale",
+    (await hook("sculptMask()")) === null && typeof notice === "string" && (await hook("sculpt()")).maskStale === staleBefore + 1 && staleTris === 0,
+    `simplify ${q(simplified)}; mask ${q((await hook("sculptMask()"))?.length ?? null)}, notice ${q(notice)}; tint triangles ${staleTris}`,
+  );
+  await clickOn('[data-action="sculpt-tool-inflate"]');
 
   // ---- big: what the tint costs while painting at 1M triangles ----
   if (flag("--big")) {
@@ -449,7 +553,24 @@ try {
       paint.builds > before.builds && paint.triangles > 0 && inverted.triangles > paint.triangles && paint.maxMs < 50,
       `${count} triangles; overlay build worst ${fmt(paint.maxMs)} ms while painting, ${fmt(inverted.lastMs)} ms for the inverted mask`,
     );
+    // What the protection adds to a dab: the same hold under the inverted mask and without one.
+    /** Holds a brush at the press point; dabs applied and the window's frames. */
+    const holdWindow = async () => {
+      const before = (await hook("sculpt()")).dabs;
+      const r = await paintWindow(0, 40);
+      return { ...r, dabs: (await hook("sculpt()")).dabs - before };
+    };
+    await clickOn('[data-action="sculpt-mask-paint"]');
+    await clickOn('[data-action="sculpt-tool-inflate"]');
+    await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true"`);
+    await frames();
+    const guarded = await holdWindow();
     await clickOn('[data-action="sculpt-mask-clear"]');
+    await frames();
+    const free = await holdWindow();
+    console.log(`  1M dabs on the mask's edge: ${guarded.dabs} applied, ${line(guarded)}`);
+    console.log(`  1M dabs without a mask:     ${free.dabs} applied, ${line(free)}`);
+    await clickOn('[data-action="sculpt-tool-inflate"]');
     rmSync(dir, { recursive: true, force: true });
   }
 

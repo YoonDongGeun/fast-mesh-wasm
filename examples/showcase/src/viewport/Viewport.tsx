@@ -8,7 +8,7 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle, Scene, StretchReport } from "fast-mesh-wasm";
+import type { MeshHandle, RepairOp, Scene, StretchReport } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
@@ -37,7 +37,6 @@ import {
   interpolateHit,
   LIVE_MAX_SPLITS,
   liveRemeshDue,
-  maskBlocksDab,
   maskUsable,
   meanEdgeLength,
   paintMaskIds,
@@ -48,6 +47,7 @@ import {
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
+import { MASK_SOFT_BAND, type MaskField, maskCoversDab, maskEdgeField, maskTouchesRegion, protectDab } from "./mask-protect";
 import { setWireOverlay } from "./wire";
 import {
   buildRepairOverlayGroup,
@@ -635,8 +635,8 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
  * grab drags the surface along instead). A press on empty space is the
  * orbit's, as usual; a stroke holds a single undo step on the sync scene
  * (the Worker has no step nesting: one step per batch of dabs there), and its end
- * remeshes the stroked region when asked. Dabs whose ball touches the
- * painted mask are dropped before they reach the scene. One raycast at a
+ * remeshes the stroked region when asked. Dabs hold the painted mask's
+ * vertices in place and move the rest (`protectedDab`). One raycast at a
  * time, through the engine's BVH, never three's per-triangle `Mesh.raycast`.
  */
 function SculptLayer(props: {
@@ -752,7 +752,9 @@ function SculptLayer(props: {
      * so the cache survives the stroke it gates.
      */
     let maskCache: { slots: number; live: Uint8Array } | null = null;
-    const maskLive = (mesh: MeshHandle): { vertices: Uint32Array; positions: ArrayLike<number> } | "stale" | null => {
+    const maskLive = (
+      mesh: MeshHandle,
+    ): { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number>; live: Uint8Array } | "stale" | null => {
       const m = maskRef.current;
       if (m === null || m.mesh !== mesh) {
         return null;
@@ -794,7 +796,7 @@ function SculptLayer(props: {
           return "stale";
         }
       }
-      return { vertices: m.vertices, positions };
+      return { vertices: m.vertices, positions, indices, live: maskCache.live };
     };
 
     /**
@@ -809,10 +811,48 @@ function SculptLayer(props: {
       inspect.sculpt.maskStale++;
     };
 
+    /** The mask's protection, rebuilt when the mask, the slot count or the band changes. */
+    let fieldCache: { vertices: Uint32Array; slots: number; band: number; field: MaskField } | null = null;
+    const maskFieldOf = (
+      gated: { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number>; live: Uint8Array },
+      radius: number,
+    ): MaskField => {
+      const slots = gated.live.length;
+      const band = radius * MASK_SOFT_BAND;
+      if (fieldCache?.vertices !== gated.vertices || fieldCache.slots !== slots || fieldCache.band !== band) {
+        fieldCache = {
+          vertices: gated.vertices,
+          slots,
+          band,
+          field: maskEdgeField(gated.vertices, gated.positions, gated.indices, slots, band),
+        };
+      }
+      return fieldCache.field;
+    };
+
+    /** The one place a dab meets the mask: `op` with what it must hold in place. */
+    const protectedDab = (mesh: MeshHandle, op: RepairOp): RepairOp => {
+      const gated = maskLive(mesh);
+      if (gated === null || gated === "stale" || !("radius" in op)) {
+        return op;
+      }
+      return protectDab(op, maskFieldOf(gated, op.radius), gated.positions);
+    };
+
     /**
-     * Whether a dab at `point` is protected: its ball touches a masked
-     * vertex. A stale mask fails loudly once (cleared, never re-pointed)
-     * and the dab paints on.
+     * Whether a remesh of this region would touch the mask. A remesh moves,
+     * and can collapse, what it covers, so it stands down there: the engine's
+     * remesh has no pinned vertices, and the mask promises they stay.
+     */
+    const remeshMeetsMask = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }): boolean => {
+      const gated = maskLive(mesh);
+      return gated !== null && gated !== "stale" && maskTouchesRegion(gated.vertices, gated.positions, b.center, b.radius);
+    };
+
+    /**
+     * Whether the mask leaves a dab at `point` nothing to move: every vertex
+     * in its ball is masked. A stale mask fails loudly once (cleared, never
+     * re-pointed) and the dab paints on.
      */
     const dabProtected = (mesh: MeshHandle, point: readonly [number, number, number], radius: number): boolean => {
       const gated = maskLive(mesh);
@@ -823,7 +863,7 @@ function SculptLayer(props: {
         maskWentStale();
         return false;
       }
-      return maskBlocksDab(gated.vertices, gated.positions, point, radius);
+      return maskCoversDab(maskFieldOf(gated, radius).flags, gated.live, gated.positions, point, radius);
     };
 
     /** The remesh density anchor, taken lazily: only remeshes need it. */
@@ -986,7 +1026,7 @@ function SculptLayer(props: {
           const b = s.bounds();
           const mesh = brushRef.current.mesh;
           const slots = triSlots(mesh);
-          if (b !== null && slots !== null && !remeshTooBig(slots)) {
+          if (b !== null && slots !== null && !remeshTooBig(slots) && !remeshMeetsMask(mesh, b)) {
             ensureDensity(mesh);
             inspect.sculpt.remeshes++;
             // In order with the stroke: after what is due and any live pass.
@@ -1203,13 +1243,15 @@ function SculptLayer(props: {
             const s = new SculptStroke(
               () => ({ ...brushRef.current, direction: dirRef.current }),
               steps,
-              (ops) =>
-                landing(
-                  nests || ops.length === 1
-                    ? Promise.all(ops.map((op) => store.repair(mesh, op)))
-                    : store.repair(mesh, ops),
-                ),
-              // The mask drops the dab before the scene (counted, like a skip).
+              (ops) => {
+                const held = ops.map((op) => protectedDab(mesh, op));
+                return landing(
+                  nests || held.length === 1
+                    ? Promise.all(held.map((op) => store.repair(mesh, op)))
+                    : store.repair(mesh, held),
+                );
+              },
+              // The mask drops a dab it leaves nothing to move (counted, like a skip).
               (at, radius) => {
                 if (dabProtected(mesh, at, radius)) {
                   inspect.sculpt.maskedDabs++;

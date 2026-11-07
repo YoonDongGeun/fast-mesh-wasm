@@ -1,6 +1,7 @@
 // `window.__showcase`: what scripts/showcase-check.mjs reads in headless
 // Chrome. Read-only views of the app; the check drives it through the UI
 // (the file input, mouse events on the canvas, the toolbar buttons).
+import type { RepairOp } from "fast-mesh-wasm";
 import { type ContactHeatmapOptions, contactHeatmap, type SceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
 import type { Engine } from "./App";
@@ -105,6 +106,15 @@ export function installTestHook(
       const { maxDistance: _m, sign: _s, ...rule } = contactHeatmap(options);
       return rule;
     },
+    /** Runs a repair on the named mesh, as a panel would. */
+    runRepair: (name: string, op: RepairOp) => store.repair(find(name).mesh, op),
+    /** The painted mask's vertex slots, ascending; `null` without one. */
+    sculptMask: () => {
+      const m = app.getSnapshot().sculptMask;
+      return m === null ? null : Array.from(m.vertices);
+    },
+    /** Why the mask was last cleared against its will, if it was. */
+    sculptMaskNotice: () => app.getSnapshot().sculptMaskNotice,
     /** Sets the mesh's base colour (`null` restores the one it had), like a project load does. */
     meshColor: (name: string, hex: number | null) => {
       const item = find(name);
