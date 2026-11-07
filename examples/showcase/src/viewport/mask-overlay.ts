@@ -102,7 +102,7 @@ export function maskOverlayBuild(
 /** The overlay on one bound mesh: created when shown, disposed when it goes. */
 export class MaskOverlay {
   readonly #host: THREE.Mesh;
-  readonly #geometry = new THREE.BufferGeometry();
+  #geometry = new THREE.BufferGeometry();
   readonly #material = new THREE.MeshBasicMaterial({
     color: MASK_TINT,
     vertexColors: true,
@@ -120,9 +120,18 @@ export class MaskOverlay {
   #mask: ArrayLike<number> | null = null;
   #indexSeen: THREE.BufferAttribute | null = null;
   #indexVersion = -1;
+  /** The host dropped its GL buffers: this geometry's binding state may hold the old ones. */
+  #hostDropped = false;
+  readonly #onHostDispose = () => {
+    this.#hostDropped = true;
+  };
 
   constructor(host: THREE.Mesh) {
     this.#host = host;
+    // The binding disposes its geometry on a structural change that can keep
+    // the position attribute, whose new GL buffer a binding state of ours
+    // would never see: the tint would stop following the surface.
+    host.geometry.addEventListener("dispose", this.#onHostDispose);
     this.#mesh = new THREE.Mesh(this.#geometry, this.#material);
     // The binding's object never updates its matrix: the child inherits it.
     this.#mesh.matrixAutoUpdate = false;
@@ -159,6 +168,10 @@ export class MaskOverlay {
       return false;
     }
     this.#mesh.visible = true;
+    if (this.#hostDropped) {
+      this.#hostDropped = false;
+      this.#replaceGeometry();
+    }
     if (this.#geometry.getAttribute("position") !== position) {
       this.#geometry.setAttribute("position", position);
     }
@@ -181,6 +194,31 @@ export class MaskOverlay {
     return true;
   }
 
+  /**
+   * A new geometry, so a new binding state, taking over this one's attributes.
+   * Disposing the old one frees their GL buffers (the next render uploads them
+   * whole), but never the position's: that attribute is the binding's.
+   */
+  #replaceGeometry(): void {
+    const old = this.#geometry;
+    const fresh = new THREE.BufferGeometry();
+    const color = old.getAttribute("color") as THREE.BufferAttribute | undefined;
+    const index = old.getIndex();
+    if (color !== undefined) {
+      color.clearUpdateRanges();
+      fresh.setAttribute("color", color);
+    }
+    if (index !== null) {
+      index.clearUpdateRanges();
+      fresh.setIndex(index);
+    }
+    fresh.setDrawRange(old.drawRange.start, old.drawRange.count);
+    old.deleteAttribute("position");
+    old.dispose();
+    this.#geometry = fresh;
+    this.#mesh.geometry = fresh;
+  }
+
   #upload(prev: MaskOverlayBuffers | null, next: MaskOverlayBuffers): void {
     if (prev?.colors !== next.colors) {
       this.#geometry.setAttribute("color", new THREE.BufferAttribute(next.colors, 4, true));
@@ -201,6 +239,7 @@ export class MaskOverlay {
 
   /** Removes the overlay. The position attribute is the binding's: it must survive the disposal. */
   dispose(): void {
+    this.#host.geometry.removeEventListener("dispose", this.#onHostDispose);
     this.#host.remove(this.#mesh);
     this.#geometry.deleteAttribute("position");
     this.#geometry.dispose();

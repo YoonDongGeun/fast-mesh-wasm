@@ -102,6 +102,25 @@ describe("MaskOverlay", () => {
     expect(overlayMesh(m).geometry.getAttribute("position")).toBe(grown);
   });
 
+  it("takes_a_fresh_geometry_when_the_host_drops_its_buffers", () => {
+    // The renderer deletes the host's GL buffers; a kept binding state would keep drawing the old one.
+    const m = host(2);
+    const overlay = new MaskOverlay(m);
+    overlay.sync([0]);
+    const before = overlayMesh(m).geometry;
+    m.geometry.dispose();
+    overlay.sync([0]);
+    const after = overlayMesh(m).geometry;
+    expect(after).not.toBe(before);
+    expect(after.getAttribute("position")).toBe(m.geometry.getAttribute("position"));
+    expect(after.getAttribute("color")).toBeDefined();
+    expect(after.getIndex()?.array).toBeDefined();
+    expect(after.drawRange.count).toBe(3 * overlay.triangles);
+    overlay.dispose();
+    const third = m.geometry;
+    third.dispose(); // No listener left behind to trip on.
+  });
+
   it("clips_with_the_solid", () => {
     const m = host(2);
     const overlay = new MaskOverlay(m);

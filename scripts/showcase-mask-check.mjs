@@ -30,6 +30,8 @@
 //   tint, with the notice.
 // - weld: with the brush armed and its caches filled, a weld that takes a masked
 //   vertex but keeps the slot count clears the mask loudly on the next dab, which lands.
+// - follow: after the mesh's colours go, a structural change that keeps its
+//   positions, the tint still follows a move of the masked vertices.
 // - console: no uncaught exception, in the page or its Workers.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -301,10 +303,22 @@ try {
     `vertex colours ${q(colors0)} unchanged ${q(colors0) === q(colors1)}; tinted ${heatTint.count} (${heatTint.near} within ${TINT_REACH} px of the press); ${heatClear.count} pixels differ after clear`,
   );
 
-  // A plain surface from here on: without B, A has no contact colours.
-  await clickOn('[data-action="sculpt-mask-paint"]');
+  // A plain surface from here on: without B, A has no contact colours. That
+  // drops the colour attribute while the tint shows, keeping the positions.
+  await press(center);
   await clickOn(`[data-mesh=${q(B)}] button.danger`);
   await waitFor(`__showcase.items().length === 2 && __showcase.collision().coloring[${q(A)}] === undefined`);
+  await frames(8);
+
+  // ---- follow: the tint stays on the surface after that ----
+  await hook(`runRepair(${q(A)}, { op: "offset", distance: 0.15 })`);
+  await shot("follow");
+  const followed = await meanAt("follow", center);
+  verdict("follow", followed[0] - followed[1] > 60, `after an offset the press reads ${q(followed.map(Math.round))}: tinted ${followed[0] - followed[1] > 60}`);
+  await page(`(document.querySelector("[data-action=undo]").click(), true)`);
+  await sleep(300);
+  await clickOn('[data-action="sculpt-mask-clear"]');
+  await clickOn('[data-action="sculpt-mask-paint"]');
   await frames(8);
 
   // ---- paint ----
