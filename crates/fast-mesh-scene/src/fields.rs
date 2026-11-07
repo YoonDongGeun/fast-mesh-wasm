@@ -515,6 +515,10 @@ pub(crate) struct FieldHook {
     /// Merged changes; `None` means "everything".
     pub(crate) changes: Option<ChangeSet>,
     pub(crate) placement_changed: bool,
+    /// On a target: edits were reset from `changes` while the target was baked
+    /// (see `FieldJob::temp_targets`), which its sign data never saw. They
+    /// cannot be refitted from `changes` then: the next update builds them.
+    pub(crate) sign_missed_edits: bool,
 }
 
 impl FieldHook {
@@ -523,7 +527,14 @@ impl FieldHook {
             field,
             changes: Some(ChangeSet::default()),
             placement_changed: false,
+            sign_missed_edits: false,
         }
+    }
+
+    /// The changes to refit the target's sign data from, when they hold every
+    /// edit since those were last current.
+    fn refit_changes(&self) -> Option<&ChangeSet> {
+        self.changes.as_ref().filter(|_| !self.sign_missed_edits)
     }
 
     fn is_clean(&self) -> bool {
@@ -671,9 +682,14 @@ impl Entry {
         self.hooks.iter().find(|h| h.field == id)
     }
 
-    fn reset_hook(&mut self, id: FieldId) {
+    /// Empties the field's hook. With `baked` (a target its sign data were not
+    /// used for in this update), it remembers any edits those data missed.
+    fn reset_hook(&mut self, id: FieldId, baked: bool) {
         if let Some(h) = self.hooks.iter_mut().find(|h| h.field == id) {
+            let missed =
+                baked && (h.sign_missed_edits || h.changes.as_ref().is_none_or(|c| !c.is_empty()));
             *h = FieldHook::new(id);
+            h.sign_missed_edits = missed;
         }
     }
 
@@ -1797,7 +1813,7 @@ impl Scene {
             })
             .collect();
         ea.mesh.derived_channel_mut(&channel)?[..slots].copy_from_slice(&values);
-        ea.reset_hook(id);
+        ea.reset_hook(id, false);
         if !changed.is_empty() {
             ea.report_field(id);
         }
@@ -1907,7 +1923,7 @@ impl Scene {
             })
             .collect();
         ea.mesh.derived_channel_mut(&channel)?[..slots].copy_from_slice(&values);
-        ea.reset_hook(id);
+        ea.reset_hook(id, false);
         if !changed.is_empty() {
             ea.report_field(id);
         }
@@ -2503,7 +2519,7 @@ impl Scene {
         if !resuming
             && let (Some(sign), Some(changes)) = (
                 &mut f.sign[k],
-                eb.hook(f.id).and_then(|h| h.changes.as_ref()),
+                eb.hook(f.id).and_then(FieldHook::refit_changes),
             )
             && changes.vertices_moved.len() <= elems / SIGN_ELEMS_PER_REFIT_VERTEX
             && sign.try_refit(&eb.mesh, &eb.bvh, changes)?
@@ -2856,7 +2872,10 @@ impl Scene {
             // A position-only edit refits around the dirty vertices; anything
             // else rebuilds over the whole mesh.
             let id = f.id;
-            let refitted = match (&mut f.sign[k], eb.hook(id).and_then(|h| h.changes.as_ref())) {
+            let refitted = match (
+                &mut f.sign[k],
+                eb.hook(id).and_then(FieldHook::refit_changes),
+            ) {
                 (Some(s), Some(changes)) => s.try_refit(&eb.mesh, &eb.bvh, changes)?,
                 _ => false,
             };
@@ -3740,7 +3759,7 @@ impl Scene {
         for (&v, &n) in plan.candidates.iter().zip(&plan.nearest) {
             f.nearest[v as usize] = n;
         }
-        ea.reset_hook(id);
+        ea.reset_hook(id, false);
         if !plan.changed.is_empty() {
             ea.report_field(id);
         }
@@ -3751,9 +3770,10 @@ impl Scene {
             let dirty = cs.update(values, &plan.changed);
             ea.report_colors(Some(&dirty));
         }
-        for &m in &f.desc.to {
+        for (k, &m) in f.desc.to.iter().enumerate() {
             if let Some(eb) = self.entries.get_mut(m) {
-                eb.reset_hook(id);
+                let baked = job.temp_targets.get(k).is_some_and(Option::is_some);
+                eb.reset_hook(id, baked);
             }
         }
         f.fresh = false;
@@ -8280,6 +8300,168 @@ mod tests {
         let want = run(None);
         for k in [1, 8] {
             assert_eq!(run(Some(k)), want, "{k} threads");
+        }
+    }
+
+    /// Whether the fields of a pair hold the bits of a new field, computed from
+    /// scratch: the sign data they used then matched a full build.
+    fn assert_like_a_new_field(scene: &mut Scene, id: FieldId, step: &str) {
+        let (on, to, md, sign) = {
+            let f = scene.fields.iter().find(|f| f.id == id).unwrap();
+            (
+                f.desc.on,
+                f.desc.to.clone(),
+                f.desc.max_distance,
+                f.desc.sign,
+            )
+        };
+        let defer = scene.defer_fields;
+        scene.set_defer_fields(false);
+        let fresh = scene
+            .add_distance_field(DistanceField {
+                name: "fresh".to_owned(),
+                on,
+                to,
+                max_distance: md,
+                sign,
+            })
+            .unwrap();
+        let got = bits(scene.field_values(id).unwrap());
+        let want = bits(scene.field_values(fresh).unwrap());
+        scene.remove_field(fresh).unwrap();
+        scene.set_defer_fields(defer);
+        let off = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(off, 0, "{step}: {off} of {} values differ", got.len());
+    }
+
+    /// Mirrors every vertex of `m` in z: the surface stays, its normals turn
+    /// over, so that sign data that miss it read every sign wrong.
+    fn mirror(scene: &mut Scene, m: MeshId) {
+        let mesh = &scene.entry(m).unwrap().mesh;
+        let ids: Vec<VertexId> = (0..mesh.vertex_slots() as VertexId).collect();
+        let at: Vec<[f32; 3]> = ids
+            .iter()
+            .map(|&v| {
+                let p = mesh.position(v).unwrap();
+                [p[0], p[1], -p[2]]
+            })
+            .collect();
+        scene.edit(m, |tx| tx.set_positions(&ids, &at)).unwrap();
+    }
+
+    /// Runs what is due, stepped or at once.
+    fn bring_up_to_date(scene: &mut Scene, stepped: bool) {
+        if stepped {
+            step_all(scene, 16);
+        } else {
+            scene.update_fields().unwrap();
+        }
+    }
+
+    #[test]
+    fn refit_after_a_baked_target_is_a_rebuild() {
+        // While a target is non-uniformly scaled its real sign data are unused
+        // and its edits go unseen by them: back to rigid, they must not pass
+        // for current after a refit that sees no moved vertices.
+        for stepped in [false, true] {
+            let (mut scene, _, b, [fa, _]) = interacting_pair(f64::INFINITY);
+            scene.set_defer_fields(stepped);
+            let rigid = at(1.2, 0.0, 0.0);
+            let scaled = Placement {
+                scale: [2.0, 1.0, 1.0],
+                ..rigid
+            };
+            scene.set_placement(b, scaled).unwrap();
+            bring_up_to_date(&mut scene, stepped);
+            mirror(&mut scene, b);
+            bring_up_to_date(&mut scene, stepped);
+            scene.set_placement(b, rigid).unwrap();
+            bring_up_to_date(&mut scene, stepped);
+            assert_like_a_new_field(&mut scene, fa, "rigid again");
+            // And it goes on refitting afterwards.
+            scene
+                .edit(b, |tx| tx.set_positions(&[0], &[[1.1, 0.0, 0.0]]))
+                .unwrap();
+            bring_up_to_date(&mut scene, stepped);
+            assert_like_a_new_field(&mut scene, fa, "an edit after it");
+        }
+    }
+
+    #[test]
+    fn sequences_of_edits_match_a_new_field() {
+        // The differential test through the scene: edits, dabs, undo, redo,
+        // rigid and scaled placements, interactions, abandoned units. After each
+        // update the fields hold the bits of a new field.
+        let mut rng = Lcg(0x5eed);
+        for stepped in [false, true] {
+            for round in 0..24 {
+                let (mut scene, a, b, ids) = interacting_pair(f64::INFINITY);
+                if round % 2 == 1 {
+                    // Slivers in the target: a vertex on its neighbour.
+                    let p = scene.entry(b).unwrap().mesh.position(7).unwrap();
+                    scene.edit(b, |tx| tx.set_positions(&[6], &[p])).unwrap();
+                }
+                scene.set_defer_fields(stepped);
+                let meshes = [a, b];
+                let mut interacting = false;
+                for op in 0..16 {
+                    let r = (rng.next() * 1e9) as usize;
+                    let m = meshes[(r >> 4) % 2];
+                    let slots = scene.field_values(ids[0]).unwrap().len() as u32;
+                    let v = (rng.next() * f64::from(slots)) as u32;
+                    let what = r % 9;
+                    let s = 0.8 + rng.next() as f32 / 2.0;
+                    match what {
+                        0..=2 => {
+                            let _ = scene
+                                .edit(m, |tx| tx.set_positions(&[v], &[[s, s - 1.0, 1.1 - s]]));
+                        }
+                        3 => {
+                            scene.dab(m, &ball_dab(0.02)).unwrap();
+                        }
+                        8 => mirror(&mut scene, m),
+                        4 => {
+                            if scene.can_undo() {
+                                scene.undo().unwrap();
+                            }
+                        }
+                        5 => {
+                            let scale = if r & 256 == 0 {
+                                [1.0, 1.0, 1.0]
+                            } else {
+                                [1.5, 1.0, 1.0]
+                            };
+                            scene
+                                .set_placement(
+                                    b,
+                                    Placement {
+                                        scale,
+                                        ..at(1.2, 0.0, f64::from(s) - 1.0)
+                                    },
+                                )
+                                .unwrap();
+                        }
+                        6 => {
+                            interacting = !interacting;
+                            let points = interacting.then_some(4);
+                            scene.set_field_interaction(points).unwrap();
+                        }
+                        _ => {
+                            if stepped {
+                                // A unit dropped partway.
+                                let _ = scene.field_step(FieldBudget::Points(2));
+                                scene.abandon_field_step();
+                            }
+                        }
+                    }
+                    bring_up_to_date(&mut scene, stepped);
+                    if !interacting {
+                        let step = format!("stepped {stepped}, round {round}, op {op} ({what})");
+                        assert_like_a_new_field(&mut scene, ids[0], &step);
+                        assert_like_a_new_field(&mut scene, ids[1], &step);
+                    }
+                }
+            }
         }
     }
 }
