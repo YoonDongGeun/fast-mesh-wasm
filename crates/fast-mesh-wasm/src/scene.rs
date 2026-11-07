@@ -1128,7 +1128,8 @@ impl WasmScene {
     /// the same placement. Returns `[kept index, kept generation, added
     /// index, added generation, kept triangles, removed triangles, cap
     /// triangles]`. With `cap` (the usual case) both openings are closed
-    /// with flat, unfaired patches; without it both parts keep the open rim.
+    /// with flat, unfaired patches, across UV seams on a mesh with UVs;
+    /// without it both parts keep the open rim.
     /// The cut undoes in one step; the added mesh stays, like the removed
     /// source of [`WasmScene::join`].
     pub fn cut_by_plane(

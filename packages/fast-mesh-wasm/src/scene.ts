@@ -989,8 +989,9 @@ export interface RegisterResult {
 /** Options of {@link Scene.cutByPlane}. */
 export interface CutOptions {
   /**
-   * Close both openings with flat, unfaired patches. Defaults to `true`;
-   * without it both parts keep the open rim the cut leaves.
+   * Close both openings with flat, unfaired patches, across UV seams on a
+   * mesh with UVs. Defaults to `true`; without it both parts keep the open
+   * rim the cut leaves.
    */
   cap?: boolean;
 }
@@ -1966,14 +1967,19 @@ export class Scene implements SceneLike {
    * (`signedDistance >= 0`) stays on the mesh and the `-` side is added as
    * a new mesh with the same placement, so the world shape is kept.
    * Cutting a closed mesh with `cap` (the default) yields two closed
-   * meshes, capped with flat, unfaired patches.
+   * meshes, capped with flat, unfaired patches. On a mesh with UVs, closed
+   * means closed by exact position, so seams count as closed: the cap's UVs
+   * come from the rim and blend across a seam. A rim that runs into a real
+   * boundary of an open mesh stays open. A mesh without UVs is read by vertex
+   * index, so its split vertices are such a boundary: weld it first.
    *
    * The cut undoes in one step; the added mesh stays, like the removed
    * source of {@link Scene.join}.
    *
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
-   * the plane does not cut the mesh or a rim cannot be capped. A failed cut
-   * changes nothing.
+   * the plane does not cut the mesh or a rim cannot be capped, which includes
+   * a rim that closes by position with its walls wound against each other. A
+   * failed cut changes nothing.
    */
   cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): CutReport {
     const { index, generation } = this.#id(mesh);

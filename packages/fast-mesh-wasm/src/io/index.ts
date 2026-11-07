@@ -704,8 +704,9 @@ export interface DracoQuantizationBits {
   /** TEX_COORD bits, over the UVs' range. Defaults to `16`. */
   uv?: number;
   /**
-   * TEX_COORD bits. Defaults to `12`. Validated but currently unused: UVs
-   * ride issue #137 (there is no UV channel to encode yet).
+   * The same as {@link DracoQuantizationBits.uv}, which wins when both are set.
+   *
+   * @deprecated Use `uv`.
    */
   texCoord?: number;
 }
@@ -883,8 +884,6 @@ interface ResolvedEncodeSettings {
 /** Validates the quantization/level/order options before the module loads. */
 function encodeSettings(options?: DracoCompressionOptions): ResolvedEncodeSettings {
   const bits = options?.quantizationBits;
-  // Validated for #137; nothing encodes UVs yet.
-  checkedQuantizationBits(bits?.texCoord, "texCoord", 12);
   const level = options?.compressionLevel ?? 5;
   if (!Number.isInteger(level) || level < 0 || level > 10) {
     throw new Error(`Draco: the compression level must be an integer from 0 to 10 (got ${options?.compressionLevel})`);
@@ -893,7 +892,7 @@ function encodeSettings(options?: DracoCompressionOptions): ResolvedEncodeSettin
     positionBits: checkedQuantizationBits(bits?.position, "position", 14),
     normalBits: checkedQuantizationBits(bits?.normal, "normal", 10),
     colorBits: checkedQuantizationBits(bits?.color, "color", 8),
-    uvBits: checkedQuantizationBits(bits?.uv, "uv", 16),
+    uvBits: checkedQuantizationBits(bits?.uv, "uv", checkedQuantizationBits(bits?.texCoord, "texCoord", 16)),
     level,
     preserveFaceOrder: options?.preserveFaceOrder === true,
   };
@@ -1145,7 +1144,8 @@ async function createEncoderModule(wasmBinary?: Uint8Array | ArrayBuffer): Promi
  *
  * Only uncompressed buffers are read. `KHR_draco_mesh_compression`
  * primitives throw (decode them with {@link importGLTFAsync}), as do sparse
- * accessors. External (non-embedded) `.bin` buffers load through
+ * accessors, except a sparse `TEXCOORD_0`, which is skipped like any other
+ * unsupported UVs: see {@link ImportedMesh.uvsSkipped}. External (non-embedded) `.bin` buffers load through
  * {@link importGLTFAsync}'s `resolveBuffer`. Animations, skins, materials
  * beyond per-vertex colors and `TEXCOORD_1` and up are skipped: the documented
  * subset.
@@ -1164,8 +1164,21 @@ export interface ImportedMesh {
   /**
    * 2 floats per vertex from `TEXCOORD_0` (`scene.addMesh`'s `uvs`), or `null`
    * without UVs. In glTF's convention: `v` points down from the image's top.
+   *
+   * Read as glTF defines it: float as stored, and normalized `u8`/`u16` mapped
+   * to `[0, 1]`. An asset declaring `KHR_mesh_quantization` may also use `i8`
+   * and `i16`, normalized to `[-1, 1]`, and any of the integer types without
+   * `normalized`, whose values stay as stored. Such values usually rely on a
+   * `KHR_texture_transform` on the material to scale them, which is not read.
    */
   uvs: Float32Array | null;
+  /**
+   * Why a present `TEXCOORD_0` was left out, so `uvs` is `null` while the
+   * geometry still imports: a sparse accessor, or a component type glTF does
+   * not allow for it. Absent when nothing was skipped. Malformed UVs (a wrong
+   * count or accessor type, non-finite values) throw instead.
+   */
+  uvsSkipped?: string;
 }
 
 /**
@@ -1613,10 +1626,11 @@ async function readPrimitiveDraco(
   // UVs left out of the bitstream may still ride a plain accessor.
   const plainUvs = spec.primitive.attributes["TEXCOORD_0"];
   const uvs =
-    decoded.uvs ??
-    (typeof plainUvs === "number" && doc.accessors?.[plainUvs]?.bufferView !== undefined
-      ? readUvs(doc, buffers, plainUvs, positions.length / 3, name)
-      : null);
+    decoded.uvs !== null
+      ? { uvs: decoded.uvs }
+      : typeof plainUvs === "number" && doc.accessors?.[plainUvs]?.bufferView !== undefined
+        ? readUvsUnlessSkipped(doc, buffers, plainUvs, positions.length / 3, name)
+        : NO_UVS;
   const world = spec.world;
   for (let i = 0; i < positions.length; i += 3) {
     const x = positions[i];
@@ -1626,7 +1640,7 @@ async function readPrimitiveDraco(
     positions[i + 1] = world[1] * x + world[5] * y + world[9] * z + world[13];
     positions[i + 2] = world[2] * x + world[6] * y + world[10] * z + world[14];
   }
-  return { name, positions, indices, placement: world.slice(), colors: null, uvs };
+  return { name, positions, indices, placement: world.slice(), colors: null, ...uvs };
 }
 
 /** The asset JSON, checked to be an object before the importers read it. */
@@ -1646,6 +1660,8 @@ interface GltfDocument {
   accessors?: GltfAccessor[];
   bufferViews?: GltfBufferView[];
   buffers?: { byteLength: number; uri?: string }[];
+  extensionsUsed?: string[];
+  extensionsRequired?: string[];
 }
 
 interface GltfNode {
@@ -2095,9 +2111,9 @@ function readPrimitive(
       : null;
   const uvs =
     typeof primitive.attributes["TEXCOORD_0"] === "number"
-      ? readUvs(doc, buffers, primitive.attributes["TEXCOORD_0"], positions.length / 3, name)
-      : null;
-  return { name, positions, indices, placement: world.slice(), colors, uvs };
+      ? readUvsUnlessSkipped(doc, buffers, primitive.attributes["TEXCOORD_0"], positions.length / 3, name)
+      : NO_UVS;
+  return { name, positions, indices, placement: world.slice(), colors, ...uvs };
 }
 
 /** The deduplicated mesh name: the node name, else the mesh name, else `"mesh"`. */
@@ -2206,6 +2222,53 @@ function accessorCount(doc: GltfDocument, primitive: GltfPrimitive, name: string
   return accessor.count;
 }
 
+/** The `uvs` and `uvsSkipped` fields of a primitive without `TEXCOORD_0`. */
+const NO_UVS: Pick<ImportedMesh, "uvs" | "uvsSkipped"> = { uvs: null };
+
+/**
+ * Why glTF's `TEXCOORD_0` accessor `index` cannot be read, or `null` when it
+ * can. Core glTF 2.0 allows float and normalized `u8`/`u16`;
+ * `KHR_mesh_quantization` adds `i8`/`i16` and the integer types without
+ * `normalized`. A missing accessor, or one of the wrong shape, is malformed
+ * rather than unsupported: {@link readUvs} throws on it.
+ */
+function uvSkipReason(doc: GltfDocument, index: number): string | null {
+  const accessor = doc.accessors?.[index];
+  if (accessor === undefined) {
+    return null;
+  }
+  if (accessor.sparse !== undefined) {
+    return "TEXCOORD_0 is a sparse accessor, which is not supported";
+  }
+  const { componentType: type, normalized } = accessor;
+  if (type === 5126 || ((type === 5121 || type === 5123) && normalized === true)) {
+    return null;
+  }
+  if (type !== 5120 && type !== 5121 && type !== 5122 && type !== 5123) {
+    return `TEXCOORD_0 has component type ${type}, which glTF does not allow for it`;
+  }
+  if (doc.extensionsUsed?.includes(QUANTIZATION) || doc.extensionsRequired?.includes(QUANTIZATION)) {
+    return null;
+  }
+  const form = `${normalized === true ? "normalized" : "non-normalized"} ${COMPONENT_NAME[type]}`;
+  return `TEXCOORD_0 is ${form}, which glTF allows only with ${QUANTIZATION}`;
+}
+
+const QUANTIZATION = "KHR_mesh_quantization";
+const COMPONENT_NAME: Record<number, string> = { 5120: "i8", 5121: "u8", 5122: "i16", 5123: "u16" };
+
+/** {@link readUvs}, or no UVs and the reason when the accessor is unsupported. */
+function readUvsUnlessSkipped(
+  doc: GltfDocument,
+  buffers: Uint8Array[],
+  index: number,
+  vertices: number,
+  name: string,
+): Pick<ImportedMesh, "uvs" | "uvsSkipped"> {
+  const uvsSkipped = uvSkipReason(doc, index);
+  return uvsSkipped === null ? { uvs: readUvs(doc, buffers, index, vertices, name) } : { uvs: null, uvsSkipped };
+}
+
 function readUvs(
   doc: GltfDocument,
   buffers: Uint8Array[],
@@ -2214,8 +2277,8 @@ function readUvs(
   name: string,
 ): Float32Array {
   const data = accessorData(doc, buffers, index, "TEXCOORD_0");
-  if (data.components !== 2 || (data.componentType !== 5126 && data.componentType !== 5121 && data.componentType !== 5123)) {
-    throw new Error(`glTF: "${name}" has TEXCOORD_0 with ${data.components} ${data.size}-byte components (float, u8 or u16 VEC2)`);
+  if (data.components !== 2) {
+    throw new Error(`glTF: "${name}" has TEXCOORD_0 with ${data.components} ${data.size}-byte components (VEC2 expected)`);
   }
   if (data.count !== vertices) {
     throw new Error(`glTF: "${name}" has ${data.count} UVs for ${vertices} vertices`);
@@ -2224,16 +2287,11 @@ function readUvs(
   if (data.buffer.length === 0) {
     return out; // No buffer view: every element is zero.
   }
+  const normalized = doc.accessors?.[index]?.normalized === true;
   for (let i = 0; i < vertices; i++) {
     for (let c = 0; c < 2; c++) {
       const at = data.base + i * data.stride + c * data.size;
-      // The integer types are normalized, as the spec requires of them.
-      const v =
-        data.componentType === 5126
-          ? data.view.getFloat32(at, true)
-          : data.componentType === 5121
-            ? data.view.getUint8(at) / 255
-            : data.view.getUint16(at, true) / 65535;
+      const v = uvComponent(data, at, normalized);
       if (!Number.isFinite(v)) {
         throw new Error(`glTF: "${name}" has a non-finite UV at vertex ${i}`);
       }
@@ -2241,6 +2299,30 @@ function readUvs(
     }
   }
   return out;
+}
+
+/** One UV component at byte `at`, by glTF's accessor equations: float as stored, integers as stored or normalized. */
+function uvComponent(data: AccessorData, at: number, normalized: boolean): number {
+  switch (data.componentType) {
+    case 5120: {
+      const c = data.view.getInt8(at);
+      return normalized ? Math.max(c / 127, -1) : c;
+    }
+    case 5121: {
+      const c = data.view.getUint8(at);
+      return normalized ? c / 255 : c;
+    }
+    case 5122: {
+      const c = data.view.getInt16(at, true);
+      return normalized ? Math.max(c / 32767, -1) : c;
+    }
+    case 5123: {
+      const c = data.view.getUint16(at, true);
+      return normalized ? c / 65535 : c;
+    }
+    default:
+      return data.view.getFloat32(at, true);
+  }
 }
 
 function readColors(

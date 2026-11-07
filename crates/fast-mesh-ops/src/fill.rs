@@ -443,7 +443,7 @@ type NewVertex = ([f32; 3], [(Corner, f32); 3]);
 
 /// The vertices and triangles of every patch planned, ready to write.
 #[derive(Default)]
-struct Plan {
+pub(crate) struct Plan {
     /// New vertices in creation order; a new parent is always an earlier
     /// new vertex.
     vertices: Vec<NewVertex>,
@@ -452,7 +452,7 @@ struct Plan {
 
 impl Plan {
     /// Appends `patch`, translating its local indices.
-    fn add(&mut self, patch: &RefinedPatch) -> Result<()> {
+    pub(crate) fn add(&mut self, patch: &RefinedPatch) -> Result<()> {
         let base = self.vertices.len();
         let old = patch.old.len();
         if u32::try_from(base + patch.new_vertices()).is_err() {
@@ -477,7 +477,7 @@ impl Plan {
     /// Writes the new vertices in creation order, with
     /// `add_vertex_with_parents`, then every triangle. Everything is reserved
     /// before the first write.
-    fn write(&self, tx: &mut Transaction) -> Result<()> {
+    pub(crate) fn write(&self, tx: &mut Transaction) -> Result<()> {
         if self.triangles.is_empty() {
             return Ok(());
         }
