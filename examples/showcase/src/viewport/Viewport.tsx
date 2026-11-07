@@ -1662,8 +1662,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
         .then(() => cast(e.clientX, e.clientY))
         .then(
           (hit) => {
-            // A release meanwhile calls it off: nothing would end the paint then.
-            if (!alive || active !== -1 || pressing !== e.pointerId || view.dragging || view.multiTouch) {
+            if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
             if (hit === null || hit.mesh !== mesh) {
@@ -1677,6 +1676,12 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
             }
             inspect.sculpt.hovering = true;
             showBall(mesh, point);
+            // Released meanwhile (a long frame runs the down and the up together): the
+            // press still paints where it landed, but nothing would end a paint left open.
+            if (pressing !== e.pointerId) {
+              paintAt(mesh, point);
+              return;
+            }
             active = e.pointerId;
             // Its release is not a click on whatever is behind the mesh.
             view.pressTaken = true;
