@@ -102,7 +102,9 @@
 //   chest) and stay enabled below it (the vessel).
 // - big (--big): a generated 1M-triangle binary STL through the file input;
 //   the page's longest main-thread task while it loads stays under 50 ms
-//   (a PerformanceObserver long-task probe: no `longtask` entry at all).
+//   (a PerformanceObserver long-task probe: no `longtask` entry at all),
+//   its list picture included (its cost is printed). The frame gaps while
+//   orbiting are printed with and without redrawing the picture throughout.
 // - units-*: on a fresh page, 1 in cubes loaded with "Assume files in" inches
 //   span 25.4 once (units-import); the gap and the sliders read in both units
 //   and switching moves no stored value (units-collision), the group table,
@@ -111,6 +113,13 @@
 //   (units-ruler); a project round trip keeps the geometry bit-exact, an older
 //   file loads on the default (units-project); a DICOM series ignores the
 //   import scale (units-dicom); the default survives a reload (units-default).
+// - previews: on a fresh page, every built-in model's button shows its committed
+//   picture (right size, alt text, not blank, loaded before any click), and each
+//   picture matches that model once loaded better than any other model does.
+//   Each row's picture has the mesh's silhouette and alt text.
+// - previews-edit: a sculpt stroke on A starts no redraw while it runs (at most
+//   a stray one, if a frame stalls past the quiet time), and A's picture changes
+//   after it; Undo brings the picture back.
 // - local: a short pass with ?local (the synchronous Scene on the main
 //   thread): the demo meshes, the heatmap readouts, the Group mode's
 //   per-pair readouts (depths from `fieldNearest`), Fill holes on C and undo.
@@ -1373,6 +1382,8 @@ try {
       requestAnimationFrame(frame);
       window.__probe = probe;
     })()`);
+    // Measured at 1M: left on, the load would simplify the mesh first.
+    await page(`(() => { const box = document.querySelector("[data-action=decimate-on-load]"); if (box.checked) box.click(); })()`);
     await sleep(500); // a quiet baseline before the upload
     await page("(__probe.start = performance.now(), __probe.maxGap = 0, true)");
     await upload([path]);
@@ -1382,6 +1393,7 @@ try {
       180_000,
     );
     await sleep(1000); // a few more frames with the mesh drawn
+    const bigPreview = await waitFor(`(() => { const s = __showcase.meshPreview("big-sphere.stl"); return s.triangles > 0 && s; })()`, 30_000);
     const probe = await page(
       "(__probe.on = false, { tasks: __probe.tasks.filter((t) => t.start >= __probe.start), maxGap: __probe.maxGap, triangles: __showcase.items().find((i) => i.name === 'big-sphere.stl')?.triangles })",
     );
@@ -1396,11 +1408,45 @@ try {
       setTimeout(() => resolve(false), 3000);
     })`);
     console.log(
+      `  picture of ${bigPreview?.triangles} triangles: ${fmt(bigPreview?.last?.wallMs ?? NaN)} ms wall, ${fmt(bigPreview?.last?.busyMs ?? NaN)} ms on the main thread in ${bigPreview?.last?.slices} slices, longest ${fmt(bigPreview?.last?.longestSliceMs ?? NaN)} ms`,
+    );
+    // Frame gaps while the viewport redraws every frame (an orbit), with and
+    // without the picture redrawing throughout.
+    const orbitGaps = async (redraw) => {
+      const r = await page(`(() => { const b = document.querySelector(".viewport canvas").getBoundingClientRect(); return { left: b.left, top: b.top, width: b.width, height: b.height }; })()`);
+      const y = r.top + r.height - 40;
+      await page(`(() => {
+        const g = { gaps: [], last: performance.now(), on: true };
+        const f = (t) => { g.gaps.push(t - g.last); g.last = t; if (g.on) requestAnimationFrame(f); };
+        requestAnimationFrame(f);
+        window.__gaps = g;
+        ${redraw ? `g.timer = setInterval(() => __showcase.redrawMeshPreview("big-sphere.stl"), 200);` : ""}
+      })()`);
+      await mouse("mouseMoved", r.left + 40, y, { button: "none" });
+      await mouse("mousePressed", r.left + 40, y, { buttons: 1 });
+      for (let i = 1; i <= 120; i++) {
+        await mouse("mouseMoved", r.left + 40 + (i % 60) * 3, y - (i % 40), { buttons: 1 });
+        await sleep(16);
+      }
+      await mouse("mouseReleased", r.left + 40, y, { buttons: 0 });
+      const gaps = await page(`(() => { const g = window.__gaps; g.on = false; clearInterval(g.timer); return g.gaps.slice(1); })()`);
+      const sorted = [...gaps].sort((a, b) => a - b);
+      return { frames: gaps.length, median: sorted[gaps.length >> 1], p95: sorted[Math.floor(gaps.length * 0.95)], longest: sorted.at(-1), over33: gaps.filter((g) => g > 33.4).length };
+    };
+    const quiet = await orbitGaps(false);
+    const before = (await hook(`meshPreview("big-sphere.stl")`)).renders;
+    const busy = await orbitGaps(true);
+    await sleep(600);
+    const after = await hook(`meshPreview("big-sphere.stl")`);
+    const gapText = (g) => `${g.frames} frames, median ${fmt(g.median)} ms, p95 ${fmt(g.p95)} ms, longest ${fmt(g.longest)} ms, ${g.over33} over 33 ms`;
+    console.log(`  orbit without picture redraws: ${gapText(quiet)}`);
+    console.log(`  orbit with ${after.renders - before} picture redraws (last: ${fmt(after.last.busyMs)} ms busy, longest slice ${fmt(after.last.longestSliceMs)} ms): ${gapText(busy)}`);
+    console.log(
       `  loaded in ${big === undefined ? "-" : `${fmt(big)} ms`}; ${probe.tasks.length} long task(s)${probe.tasks.length > 0 ? ` (longest ${fmt(longest)} ms: ${probe.tasks.map((t) => fmt(t.duration)).join(", ")})` : ""}; longest frame gap ${fmt(probe.maxGap)} ms`,
     );
     verdict(
       "big",
-      big !== undefined && probe.triangles === count && probe.tasks.length === 0 && calibrated,
+      big !== undefined && probe.triangles === count && probe.tasks.length === 0 && calibrated && bigPreview !== undefined && bigPreview.triangles === count,
       `${count.toLocaleString("en")} triangles; longest main-thread task ${probe.tasks.length === 0 ? "under 50 ms (no long task)" : `${fmt(longest)} ms`}; the probe sees an 80 ms task: ${calibrated}`,
     );
   }
@@ -1650,6 +1696,143 @@ try {
     `after a reload ${reloaded.units} (default ${reloaded.defaultUnits}, import ×${reloaded.importScale.factor}), after reset ${resetUnits.units}`,
   );
   await page("localStorage.clear(); true");
+  }
+
+  // ---- previews: each built-in model's picture, and the loaded meshes' ----
+  {
+  await browser.goto(`http://127.0.0.1:${port}/`, "window.__showcase !== undefined");
+  await waitFor(`__showcase.items().find((m) => m.name.includes("headsq") && m.drawn)`, 60_000);
+  // Decoded to premultiplied RGBA at the picture's size, so empty pixels compare equal.
+  await page(`(() => {
+    window.__pixels = async (src) => {
+      const img = new Image();
+      img.src = src;
+      await img.decode();
+      const c = document.createElement("canvas");
+      c.width = c.height = 96;
+      const g = c.getContext("2d");
+      g.drawImage(img, 0, 0, 96, 96);
+      const d = g.getImageData(0, 0, 96, 96).data;
+      for (let i = 0; i < d.length; i += 4) { const a = d[i + 3] / 255; d[i] *= a; d[i + 1] *= a; d[i + 2] *= a; }
+      return d;
+    };
+    window.__diff = (a, b, step = 1, from = 0) => { let n = 0, sum = 0; for (let i = from; i < a.length; i += step) { sum += Math.abs(a[i] - b[i]); n++; } return sum / n; };
+    window.__blank = (d) => {
+      let covered = 0, sum = 0, sq = 0;
+      for (let i = 0; i < d.length; i += 4) { if (d[i + 3] > 0) { covered++; const l = (d[i] + d[i + 1] + d[i + 2]) / 3; sum += l; sq += l * l; } }
+      const mean = sum / Math.max(covered, 1);
+      return { covered: covered / (d.length / 4), spread: Math.sqrt(Math.max(0, sq / Math.max(covered, 1) - mean * mean)) };
+    };
+  })()`);
+  const cards = await page(`Promise.all([...document.querySelectorAll(".model-card")].map(async (b) => {
+    const img = b.querySelector("img");
+    await img.decode();
+    return { action: b.dataset.action, src: img.src, alt: img.alt, width: img.naturalWidth, height: img.naturalHeight, blank: __blank(await __pixels(img.src)) };
+  }))`);
+  const wantCards = ["dicom-demo-vessels", "dicom-demo-brain", "dicom-demo-heart", "sample-headsq", "sample-lidc2", "demo-meshes"];
+  const liveLoads = [];
+  for (const card of cards) {
+    const from = await hook("items().length");
+    await clickOn(`[data-action=${card.action}]`);
+    liveLoads.push(
+      await waitFor(
+        `(() => { const all = __showcase.items(); return all.length > ${from} && all.slice(${from}).every((m) => m.drawn) && __showcase.jobs().every((j) => j.phase === "done"); })()`,
+        120_000,
+      ),
+    );
+    await page(`(window.__live ??= {}, window.__live[${q(card.action)}] = __showcase.modelPreview(${from}), true)`);
+  }
+  // Every committed picture against every model's live drawing.
+  const matrix = await page(`(async () => {
+    const out = {};
+    const cards = [...document.querySelectorAll(".model-card")].map((b) => [b.dataset.action, b.querySelector("img").src]);
+    for (const [name, src] of cards) {
+      const shown = await __pixels(src);
+      out[name] = {};
+      for (const [other] of cards) {
+        out[name][other] = __diff(shown, await __pixels(__live[other]));
+      }
+    }
+    return out;
+  })()`);
+  const nearestOther = (action) => Math.min(...Object.entries(matrix[action] ?? {}).filter(([k]) => k !== action).map(([, v]) => v));
+  const badCards = cards
+    .filter((c) => {
+      const own = matrix[c.action]?.[c.action];
+      // Own: the same pixels but for WebP's loss. Another model is far off.
+      return !(c.width === 96 && c.height === 96 && c.alt.length > 0 && c.blank.covered > 0.02 && c.blank.spread > 3 && own < 6 && nearestOther(c.action) > 2 * own);
+    })
+    .map((c) => `${c.action}: ${c.width}x${c.height}, alt ${q(c.alt)}, covered ${fmt(c.blank.covered)}, spread ${fmt(c.blank.spread)}, own ${fmt(matrix[c.action]?.[c.action] ?? NaN)}, nearest other ${fmt(nearestOther(c.action))}`);
+  verdict(
+    "previews",
+    badCards.length === 0 && q(cards.map((c) => c.action)) === q(wantCards) && liveLoads.every((l) => l === true),
+    badCards.length > 0 ? badCards.join("; ") : cards.map((c) => `${c.action} own ${fmt(matrix[c.action][c.action])}, nearest other ${fmt(nearestOther(c.action))}`).join("; "),
+  );
+  // Each row's picture is of its own mesh: its silhouette (alpha) matches the mesh drawn now.
+  await waitFor(`document.querySelectorAll("img.mesh-preview").length === __showcase.items().length`, 60_000);
+  const rows = await page(`(async () => {
+    const out = [];
+    const items = __showcase.items();
+    const imgs = [...document.querySelectorAll(".meshes > li")].map((li) => li.querySelector("img.mesh-preview"));
+    for (let i = 0; i < imgs.length; i++) {
+      const shown = await __pixels(imgs[i].src);
+      const live = await __pixels(__showcase.rowPreview(i));
+      out.push({ name: items[i].name, alt: imgs[i].alt, silhouette: __diff(shown, live, 4, 3), blank: __blank(shown) });
+    }
+    return out;
+  })()`);
+  const badRows = rows.filter((r) => !(r.alt.includes(r.name) && r.silhouette < 1 && r.blank.covered > 0.02 && r.blank.spread > 3));
+  verdict(
+    "previews-rows",
+    rows.length >= 8 && badRows.length === 0,
+    badRows.length > 0 ? q(badRows) : `${rows.length} rows, worst silhouette difference ${fmt(Math.max(...rows.map((r) => r.silhouette)))}`,
+  );
+
+  // ---- previews-edit: a stroke does not redraw; the picture follows it ----
+  await page(`(() => {
+    for (const li of document.querySelectorAll(".meshes > li")) {
+      if (![${q(A)}, ${q(B)}, ${q(C)}].includes(li.dataset.mesh)) li.querySelector("button.danger").click();
+    }
+  })()`);
+  await waitFor(`__showcase.items().length === 3`, 20_000);
+  await clickOn("[data-action=view-reset]");
+  await clickOn(`[data-mesh=${q(A)}] .mesh-name`);
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  await waitFor(`document.querySelector('[data-action="sculpt-tool-inflate"]')?.getAttribute("aria-pressed") === "true" ? true : null`, 20_000);
+  const settled = await waitFor(`(() => { const s = __showcase.meshPreview(${q(A)}); return s.renders > 0 && s.starts === s.renders && s; })()`, 20_000);
+  const srcOf = `document.querySelector(${q(`[data-mesh="${A}"] img.mesh-preview`)}).src`;
+  const original = await page(srcOf);
+  await page(`(window.__before = __pixels(${q(original)}), true)`);
+  await sleep(100);
+  const strokeAt = await hook(`screenPoint(${q(A)})`);
+  const shapeOf = `__showcase.positions(${q(A)}).join()`;
+  const shapeBefore = await page(shapeOf);
+  const undoBefore = await hook("status().canUndo");
+  await mouse("mouseMoved", strokeAt.x, strokeAt.y, { button: "none" });
+  await mouse("mousePressed", strokeAt.x, strokeAt.y, { buttons: 1 });
+  for (let i = 1; i <= 30; i++) {
+    await mouse("mouseMoved", strokeAt.x + (i % 8) * 2, strokeAt.y + (i % 5) * 2, { buttons: 1 });
+    await sleep(16);
+  }
+  const during = await hook(`meshPreview(${q(A)})`);
+  await mouse("mouseReleased", strokeAt.x, strokeAt.y, { buttons: 0 });
+  const edited = await waitFor(`(() => { const s = __showcase.meshPreview(${q(A)}); return s.renders > ${settled.renders} && ${srcOf} !== ${q(original)} && s; })()`, 20_000);
+  const shapeChanged = (await page(shapeOf)) !== shapeBefore;
+  const changed = edited === undefined ? null : await page(`(async () => __diff(await __before, await __pixels(${srcOf})))()`);
+  await clickOn('[data-action="sculpt-tool-inflate"]');
+  // Live remeshing splits a stroke into several undo steps: back to the start.
+  for (let i = 0; i < 200 && (await hook("status().canUndo")); i++) {
+    await clickOn("[data-action=undo]");
+    await sleep(20);
+  }
+  const pictureDiff = `(async () => __diff(await __before, await __pixels(${srcOf})))()`;
+  await waitFor(`${pictureDiff}.then((d) => d < 1)`, 20_000);
+  const restored = await page(pictureDiff);
+  verdict(
+    "previews-edit",
+    shapeChanged && !undoBefore && during.starts - settled.starts <= 1 && changed !== null && changed > 0.05 && restored < 1,
+    `shape changed ${shapeChanged}; ${during.starts - settled.starts} redraw(s) started during the stroke; picture changed by ${fmt(changed ?? NaN)} after it, ${fmt(restored ?? NaN)} from the original after Undo`,
+  );
   }
 
   // ---- local: ?local, the synchronous Scene on the main thread ----
