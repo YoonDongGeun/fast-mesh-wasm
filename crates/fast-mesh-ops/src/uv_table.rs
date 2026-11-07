@@ -359,6 +359,35 @@ fn fill_holes_interpolates_new_vertices() {
 }
 
 #[test]
+fn split_stretched_interpolates_and_keeps_old_uvs() {
+    use crate::stretch::{StretchOptions, capture_rest_sizes, split_stretched};
+    let mut m = with_planar(grid(6));
+    let before = m.uvs().unwrap().to_vec();
+    capture_rest_sizes(&mut m).unwrap();
+    let ids: Vec<VertexId> = (0..m.vertex_slots() as VertexId).collect();
+    let doubled: Vec<[f32; 3]> = m.positions().iter().map(|p| p.map(|x| x * 2.0)).collect();
+    edit(&mut m, |tx| Ok(tx.set_positions(&ids, &doubled)?));
+    let options = StretchOptions {
+        region: Region {
+            center: [0.0; 3],
+            radius: 1e6,
+        },
+        ..StretchOptions::default()
+    };
+    let (r, _) = edit(&mut m, |tx| split_stretched(tx, &options));
+    assert!(r.splits > 0);
+    let uvs = m.uvs().unwrap();
+    assert_eq!(uvs[..before.len()], before[..]);
+    // The flat doubled grid: new positions lie on the doubled mapping.
+    for v in ids.len()..m.vertex_slots() {
+        let p = m.positions()[v];
+        let uv = uv_of(&m, v as VertexId);
+        let want = planar([p[0] / 2.0, p[1] / 2.0, 0.0]);
+        assert!((uv[0] - want[0]).abs() < 1e-4 && (uv[1] - want[1]).abs() < 1e-4);
+    }
+}
+
+#[test]
 fn remesh_interpolates_splits_and_collapses() {
     let mut m = with_planar(grid(6));
     let options = RemeshOptions {

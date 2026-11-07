@@ -62,6 +62,7 @@ export function installTestHook(
     },
     /** A mesh's stored positions, as the engine holds them. */
     positions: (name: string) => Array.from(store.scene.views(find(name).mesh).positions()),
+    indices: (name: string) => Array.from(store.scene.views(find(name).mesh).indices()),
     jobs: () => app.getSnapshot().jobs.map((j) => ({ ...j })),
     /** The large-file UX state: the decimate toggle and the URL thresholds. */
     bigFile: () => {

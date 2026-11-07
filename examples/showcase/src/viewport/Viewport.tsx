@@ -8,7 +8,7 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle, Scene } from "fast-mesh-wasm";
+import type { MeshHandle, Scene, StretchReport } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
@@ -35,6 +35,7 @@ import {
   type StrokeSteps,
   grabLocalDelta,
   interpolateHit,
+  LIVE_MAX_SPLITS,
   liveRemeshDue,
   maskBlocksDab,
   maskUsable,
@@ -798,12 +799,33 @@ function SculptLayer(props: {
     };
 
     /**
-     * Remeshes the stroked region live (see `liveRemeshDue` for the
-     * per-frame budget): split-only, so the triangle count only grows and
-     * the surface never pops down mid-stroke. The stroke-end pass evens the
-     * density out fully. Same undo step as the stroke (it just repairs while
-     * the stroke's step is open, never opening one). Stands down on huge
-     * meshes, where a remesh would stall the worker behind the dabs.
+     * Before the first dab: rest sizes unless the mesh holds valid ones. The
+     * engine drops them when an edit outdates them, so strokes share one rest
+     * shape for as long as it is true, and nothing here has to track that.
+     */
+    const ensureRest = (mesh: MeshHandle): void => {
+      if (!liveRef.current) {
+        return;
+      }
+      store.repair(mesh, { op: "captureRestSizes", onlyIfMissing: true }).catch(() => {
+        // Removed meanwhile: the stroke paints on, and its passes fail alike.
+      });
+    };
+
+    /** Splits what the stroke stretched inside `b`; the stroke paints on if it fails. */
+    const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) =>
+      store
+        .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: LIVE_MAX_SPLITS })
+        .then((report) => report as StretchReport)
+        .catch(() => {
+          // A degenerate region, or a mesh removed meanwhile.
+          return undefined;
+        });
+
+    /**
+     * Splits the triangles the stroke stretched, live (see `liveRemeshDue`
+     * for the per-frame budget). Same undo step as the stroke (it just
+     * repairs while the stroke's step is open, never opening one).
      */
     const maybeLiveRemesh = () => {
       if (!liveRef.current || stroke === null) {
@@ -817,41 +839,23 @@ function SculptLayer(props: {
         return;
       }
       const mesh = brushRef.current.mesh;
-      const slots = triSlots(mesh);
-      if (slots === null || remeshTooBig(slots)) {
-        return;
-      }
-      ensureDensity(mesh);
       liveAt = performance.now();
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
       // In order with the stroke's edits, so that the stroke's end waits for it.
       liveRunning = stroke.pass(() =>
-        store
-          .repair(mesh, {
-            op: "remesh",
-            center: b.center,
-            radius: b.radius,
-            maxRounds: 2,
-            splitOnly: true,
-            targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
-          })
-          .catch(() => {
-            // A degenerate region (or a mesh removed meanwhile): the stroke
-            // paints on.
-          })
-          .then(() => {
-            liveRunning = null;
-            // The pass added vertices under the grab: take them along.
-            if (grabRegion !== null) {
-              try {
-                const v = scene.views(mesh);
-                grabRegion.rebase(v.positions(), v.indices());
-              } catch {
-                // Removed meanwhile: the next move finds out.
-              }
+        splitStretched(mesh, b).then((report) => {
+          liveRunning = null;
+          // The pass added vertices under the grab: take them along.
+          if (grabRegion !== null) {
+            try {
+              const v = scene.views(mesh);
+              grabRegion.rebase(v.positions(), v.indices(), report?.vertices);
+            } catch {
+              // Removed meanwhile: the next move finds out.
             }
-          }),
+          }
+        }),
       );
     };
 
@@ -908,11 +912,22 @@ function SculptLayer(props: {
         syncDabs();
         stroke = null;
         inspect.sculpt.strokes++;
-        // What is due goes first: the stroke-end remesh must land after it.
+        // What is due goes first: the passes below must land after it.
         s.flush();
-        // The stroke-end remesh lands before the step closes: one undo step
-        // for the stroke and its evening-out (on the sync scene). Stands
-        // down on huge meshes, where a remesh would stall the worker.
+        // The last dabs since the live pass get their splits before the step
+        // closes: one undo step for the stroke and its splits (on the sync
+        // scene). `pass` keeps them in order, and the stroke open until they land.
+        if (liveRef.current) {
+          const b = s.bounds();
+          if (b !== null) {
+            const mesh = brushRef.current.mesh;
+            inspect.sculpt.liveRemeshes++;
+            void s.pass(() => splitStretched(mesh, b));
+          }
+        }
+        // The optional evening-out, off by default: it rewrites its whole
+        // region, and it stands down on huge meshes, where it would stall the
+        // worker.
         if (remeshRef.current && landed > 0) {
           const b = s.bounds();
           const mesh = brushRef.current.mesh;
@@ -1117,6 +1132,7 @@ function SculptLayer(props: {
               cancelStep: typeof maybe.cancelStep === "function" ? () => maybe.cancelStep?.() : undefined,
             };
             const mesh = brush.mesh;
+            ensureRest(mesh);
             landed = 0;
             liveDabs = 0;
             grabFrom = { x: e.clientX, y: e.clientY };
@@ -1161,7 +1177,15 @@ function SculptLayer(props: {
               inspect.sculpt.maskedDabs++;
             } else {
               const v = scene.views(mesh);
-              grabRegion = new GrabRegion(v.positions(), v.indices(), point, brush.radius, brush.falloff, brush.strength);
+              grabRegion = new GrabRegion(
+                v.positions(),
+                v.indices(),
+                point,
+                brush.radius,
+                brush.falloff,
+                brush.strength,
+                scene.origin(mesh),
+              );
             }
             syncDabs();
             clearInterval(buildup);

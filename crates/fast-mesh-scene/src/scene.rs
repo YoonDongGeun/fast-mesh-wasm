@@ -927,6 +927,36 @@ impl Scene {
         Ok(())
     }
 
+    /// Records the mesh's rest sizes for
+    /// [`split_stretched`](fast_mesh_ops::stretch::split_stretched); see
+    /// [`capture_rest_sizes`](fast_mesh_ops::stretch::capture_rest_sizes). Not
+    /// an edit: no undo step and no change report, since no geometry changed
+    /// and nothing draws this channel. With `only_if_missing`, valid rest sizes
+    /// stay as they are ([`ensure_rest_sizes`](fast_mesh_ops::stretch::ensure_rest_sizes)).
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`], or [`SceneError::Ops`] when memory runs out.
+    pub fn capture_rest_sizes(&mut self, id: MeshId, only_if_missing: bool) -> Result<()> {
+        self.drop_field_unit();
+        let entry = self.entry_mut(id)?;
+        if only_if_missing {
+            fast_mesh_ops::stretch::ensure_rest_sizes(&mut entry.mesh)?;
+        } else {
+            fast_mesh_ops::stretch::capture_rest_sizes(&mut entry.mesh)?;
+        }
+        Ok(())
+    }
+
+    /// Builds the mesh's vertex index if it is not cached, so that an operation
+    /// run next can follow it instead of scanning every triangle.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`], or the store's error when memory runs out.
+    pub fn ensure_incidence(&mut self, id: MeshId) -> Result<()> {
+        self.entry_mut(id)?.mesh.ensure_incidence()?;
+        Ok(())
+    }
+
     /// Removes a channel from the mesh and returns its description. Not
     /// undoable, as in the store; reported in
     /// [`MeshChanges::channels_written`]. Recorded patches skip the removed

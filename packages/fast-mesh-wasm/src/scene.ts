@@ -643,6 +643,40 @@ export type RepairOp =
       splitOnly?: boolean;
     }
   | {
+      /**
+       * Records each vertex's longest edge as its rest size, for
+       * `splitStretched`. Run it before the deformation starts. Not an edit:
+       * no undo step, and it must be the only op of its list. Running it again
+       * accepts the mesh as it is then as the new rest shape; `onlyIfMissing`
+       * avoids that. The sizes last until a topology edit other than
+       * `splitStretched`, or an undo or redo of an edit from before the capture;
+       * undoing a topology edit from after it brings them back.
+       */
+      op: "captureRestSizes";
+      /** Keep rest sizes the mesh still holds. Unset means `false`. */
+      onlyIfMissing?: boolean;
+    }
+  | {
+      /**
+       * Splits the edges a deformation stretched, and nothing else: an edge
+       * splits once it is past `limit` times the smaller rest size of its
+       * endpoints, measured by `captureRestSizes`. Existing vertices keep their
+       * ids and positions, nothing collapses or flips, and a triangle with no
+       * split edge keeps its slot. Fails while the mesh holds no valid rest
+       * sizes: see `captureRestSizes`.
+       */
+      op: "splitStretched";
+      /** Region center in local mesh coordinates; edges with an endpoint in the region are checked. */
+      center: Readonly<Vec3>;
+      radius: number;
+      /** Multiple of the rest size an edge may reach, above 1; unset means 4/3. */
+      limit?: number;
+      /** Most interior splits per call, the longest first; boundary edges do not count. Unset means 2^20. */
+      maxSplits?: number;
+      /** New interior vertices follow the surface's curvature; `false` uses midpoints. Unset means `true`. */
+      smooth?: boolean;
+    }
+  | {
       op: "bridgeLoops";
       /** The two loops to connect, from `analyze(mesh).loops`. Order is insignificant. */
       loops: readonly [LoopId, LoopId];
@@ -784,6 +818,22 @@ export interface RemeshReport {
   flips: number;
   rounds: number;
 }
+
+/** What `splitStretched` did. */
+export interface StretchReport {
+  splits: number;
+  /** Edges still past the limit because `maxSplits` ran out, for a later call. */
+  remaining: number;
+  /**
+   * `new, a, b` per split, in order: the new vertex and its edge's endpoints,
+   * which may be new vertices from earlier in the list. For a caller that holds
+   * per-vertex state of its own and has to carry it over.
+   */
+  vertices: Uint32Array;
+}
+
+/** What `captureRestSizes` did: nothing to report. */
+export type CaptureRestReport = Record<string, never>;
 
 /** What `bridgeLoops` did. */
 export interface BridgeReport {
@@ -1058,7 +1108,9 @@ export type RepairReport =
   | OffsetReport
   | ShellReport
   | SimplifyReport
-  | SubdivideReport;
+  | SubdivideReport
+  | StretchReport
+  | CaptureRestReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -1091,7 +1143,11 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                             ? SimplifyReport
                             : O extends { op: "subdivide" }
                               ? SubdivideReport
-                              : RepairReport;
+                              : O extends { op: "splitStretched" }
+                                ? StretchReport
+                                : O extends { op: "captureRestSizes" }
+                                  ? CaptureRestReport
+                                  : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -1281,6 +1337,8 @@ const REPAIR_CODES = {
   shell: 12,
   simplify: 13,
   subdivide: 14,
+  splitStretched: 16,
+  captureRestSizes: 17,
 } as const;
 
 /** The op code of an {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
@@ -1464,6 +1522,18 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.levels, "levels"),
         );
         break;
+      case "splitStretched":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          optional(o.limit, "limit"),
+          optional(o.maxSplits, "maxSplits"),
+          flagOf(o.smooth, true),
+        );
+        break;
+      case "captureRestSizes":
+        values.push(flagOf(o.onlyIfMissing, false));
+        break;
     }
   }
   return { values: Float64Array.from(values), loops: Uint32Array.from(loops) };
@@ -1576,6 +1646,18 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { collapsed: r.next(), trianglesRemoved: r.next(), verticesRemoved: r.next() };
     case "subdivide":
       return { verticesAdded: r.next(), trianglesAdded: r.next() };
+    case "splitStretched":
+    {
+      const splits = r.next();
+      const remaining = r.next();
+      const vertices = new Uint32Array(3 * splits);
+      for (let k = 0; k < vertices.length; k++) {
+        vertices[k] = r.next();
+      }
+      return { splits, remaining, vertices };
+    }
+    case "captureRestSizes":
+      return {};
   }
 }
 
@@ -2136,6 +2218,16 @@ export class Scene implements SceneLike {
       translation: [p[9], p[10], p[11]],
       scale: [p[12], p[13], p[14]],
     };
+  }
+
+  /**
+   * The mesh's origin. `views(mesh).positions()` are relative to it, while
+   * `edit`'s `setPositions` and `addVertices` take positions with it added.
+   */
+  origin(mesh: MeshHandle): Vec3 {
+    const { index, generation } = this.#id(mesh);
+    const o = call(() => this.#peek().origin(index, generation));
+    return [o[0], o[1], o[2]];
   }
 
   /**

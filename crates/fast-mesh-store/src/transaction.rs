@@ -23,6 +23,10 @@ pub struct Transaction<'m> {
     live_at_start: (usize, usize),
     /// Ids of the channels dropped in this transaction.
     dropped_channels: Vec<u64>,
+    /// A topology write ran outside [`Transaction::keeping_bound_channels`].
+    outdates_bound_channels: bool,
+    /// Inside [`Transaction::keeping_bound_channels`].
+    keeping_bound_channels: bool,
     poisoned: bool,
     finished: bool,
 }
@@ -48,6 +52,8 @@ impl Mesh {
             popped_vertices: Vec::new(),
             popped_triangles: Vec::new(),
             dropped_channels: Vec::new(),
+            outdates_bound_channels: false,
+            keeping_bound_channels: false,
             poisoned: false,
             finished: false,
         }
@@ -178,7 +184,19 @@ impl Transaction<'_> {
         Ok(id)
     }
 
+    /// Runs `f`, whose topology writes do not outdate
+    /// [`topology_bound`](crate::ChannelDesc::topology_bound) channels: for an
+    /// operation that keeps those channels true itself. Writes outside it, in
+    /// the same transaction, still do.
+    pub fn keeping_bound_channels<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = std::mem::replace(&mut self.keeping_bound_channels, true);
+        let r = f(self);
+        self.keeping_bound_channels = outer;
+        r
+    }
+
     fn alloc_triangle(&mut self, tri: [VertexId; 3]) -> Result<TriangleId> {
+        self.outdates_bound_channels |= !self.keeping_bound_channels;
         let m = &mut *self.mesh;
         m.on_topology_write();
         let id = match m.triangle_free.pop() {
@@ -295,6 +313,7 @@ impl Transaction<'_> {
         }
         self.write(|tx| {
             if !ids.is_empty() {
+                tx.outdates_bound_channels |= !tx.keeping_bound_channels;
                 tx.mesh.on_topology_write();
             }
             for &t in ids {
@@ -326,6 +345,7 @@ impl Transaction<'_> {
         }
         self.write(|tx| {
             if !ids.is_empty() {
+                tx.outdates_bound_channels |= !tx.keeping_bound_channels;
                 tx.mesh.on_topology_write();
             }
             for (&t, &tri) in ids.iter().zip(triangles) {
@@ -411,6 +431,12 @@ impl Transaction<'_> {
         }
         // Phase 1 (fallible, writes nothing): build every patch vector while all
         // journals are intact. If memory runs out, roll back as if never committed.
+        if self.outdates_bound_channels
+            && try_reserve_exact(&mut self.dropped_channels, self.mesh.channels.len()).is_err()
+        {
+            self.rollback_inner();
+            return Err(StoreError::OutOfMemory);
+        }
         let prepared = match PreparedColumns::new(self.mesh) {
             Ok(p) => p,
             Err(e) => {
@@ -420,6 +446,14 @@ impl Transaction<'_> {
         };
         // Phase 2 (infallible): consume the journals.
         let m = &mut *self.mesh;
+        if self.outdates_bound_channels {
+            for c in &mut m.channels {
+                if c.desc.topology_bound && !c.hidden {
+                    c.hidden = true;
+                    self.dropped_channels.push(c.id);
+                }
+            }
+        }
 
         // Slots allocated and removed within this transaction were never visible:
         // they go straight back to the free lists.
@@ -536,6 +570,7 @@ impl Transaction<'_> {
             channel_data,
             dropped_channels,
             dropped_bytes,
+            channels_before: m.next_channel_id,
             changes,
         };
         Ok(patch)

@@ -56,7 +56,7 @@ describe("parseSettings", () => {
       heatmap: { depth: 1, gap: 2, tolerance: 0.5 },
       heatmapFast: true,
       decimateOnLoad: false,
-      sculptRemesh: "eventually",
+      sculptEvenOut: "eventually",
       maskRadius: -2,
     });
     expect(s.theme).toBe("light");
@@ -71,7 +71,7 @@ describe("parseSettings", () => {
     expect(s.heatmap).toEqual({ depth: 1, gap: 2, tolerance: 0.5 });
     expect(s.heatmapFast).toBe(true);
     expect(s.decimateOnLoad).toBe(false);
-    expect(s.sculptRemesh).toBe(true);
+    expect(s.sculptEvenOut).toBe(false);
     expect(s.maskRadius).toBe(0.25);
   });
 
@@ -146,6 +146,7 @@ describe("settings storage", () => {
   it("collects_a_snapshot", () => {
     const s = settingsFromSnapshot({
       ...defaultSettings(),
+      sculptRemesh: false,
       heatmapParams: { depth: 1, gap: 2, tolerance: 0.5 },
     });
     expect(s.version).toBe(1);

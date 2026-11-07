@@ -72,33 +72,36 @@ export function sculptBrush(
 export const TELEPORT_RADII = 8;
 
 /**
- * Past this many triangles sculpt remeshes stand down: the passes run
- * over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
- * regions), which would stall the worker and the dabs behind it. Dabs
- * themselves cost by the brush region, so sculpting keeps working.
+ * Past this many triangles the optional "even out" remesh stands down: it
+ * runs over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
+ * regions), which would stall the worker and the dabs behind it. Dabs cost by
+ * the brush region, and the stretch splits by the stretched edges: neither has
+ * such a limit.
  */
 export const REMESH_TRI_LIMIT = 100_000;
 
-/** Whether `triangles` stands sculpt remeshes (live and stroke-end) down. */
+/** Whether `triangles` stands the optional stroke-end remesh down. */
 export function remeshTooBig(triangles: number): boolean {
   return triangles > REMESH_TRI_LIMIT;
 }
 
 /**
- * Live remesh while sculpting (#129): the per-frame budget.
+ * Stretch splits while sculpting (#129, #175): the per-frame budget.
  *
  * At most one live pass per stroke region per `LIVE_REMESH_MIN_MS`, and only
  * once `LIVE_REMESH_MIN_DABS` dabs landed since the last pass, never two in
- * flight. The pass itself is split-only (`splitOnly`, `maxRounds: 2` at the
- * call site), so the triangle count only grows mid-stroke and the surface
- * never pops down; the stroke-end pass evens the density out fully. Past
- * `REMESH_TRI_LIMIT` triangles both passes stand down: a whole-mesh remesh
- * would stall the worker behind the dabs (#64 chunks a repair list one op
- * per message-loop turn, but a single remesh op is still one long chunk).
+ * flight. A pass splits only the edges the stroke stretched past their limit
+ * (`splitStretched`): what the stroke did not stretch keeps its vertices and
+ * triangles, and the vertex ids a mask stores stay valid. Each stroke asks for
+ * rest sizes before its first dab (`captureRestSizes`, `onlyIfMissing`), so
+ * repeated strokes measure against the same shape instead of ratcheting, until
+ * an edit outdates it and the engine drops the sizes.
  */
 export const LIVE_REMESH_MIN_DABS = 4;
 /** Minimum milliseconds between two live remesh passes of one stroke. */
-export const LIVE_REMESH_MIN_MS = 600;
+export const LIVE_REMESH_MIN_MS = 150;
+/** Most interior splits one pass makes; a later pass takes the rest, longest first. */
+export const LIVE_MAX_SPLITS = 50_000;
 
 /**
  * Whether a live remesh pass may fire: enough new dabs since the last pass,
@@ -244,6 +247,7 @@ export class GrabRegion {
   readonly #radius: number;
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
+  readonly #origin: readonly [number, number, number];
   /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
@@ -254,7 +258,9 @@ export class GrabRegion {
     radius: number,
     falloff: "linear" | "smooth",
     strength: number,
+    origin: readonly [number, number, number] = [0, 0, 0],
   ) {
+    this.#origin = [origin[0], origin[1], origin[2]];
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
     this.#falloff = falloff;
@@ -275,17 +281,29 @@ export class GrabRegion {
   /**
    * Takes the region again over `positions`, with every move sent so far
    * landed: for a pass that added vertices or moved some mid-stroke. A vertex
-   * that is still where this region put it keeps its rest. Any other gets the
-   * rest position the drag would have carried here, by a few fixed-point steps,
-   * and then exactly the rest that lands on it now, so that nothing jumps.
+   * that is still where this region put it keeps its rest. A vertex from
+   * `splits` (`new, a, b` triples, as `splitStretched` reports them) gets the
+   * mean weight of its edge: its position alone cannot say, where the drag has
+   * folded the sheet over itself. Any other gets the weight of the rest position
+   * the drag would have carried here (see `#weightAt`). Each then takes exactly
+   * the rest that lands on it now, so that nothing jumps.
    */
-  rebase(positions: ArrayLike<number>, indices: ArrayLike<number>): void {
+  rebase(positions: ArrayLike<number>, indices: ArrayLike<number>, splits?: ArrayLike<number>): void {
     const drag = this.#drag;
     const slots = positions.length / 3;
     const reach = this.#radius + Math.abs(this.#strength) * Math.hypot(drag[0], drag[1], drag[2]);
-    const candidates = paintMaskIds(positions, indices, slots, this.#center, reach);
     const known = new Map<number, number>();
     this.ids.forEach((id, k) => known.set(id, k));
+    const split = new Map<number, number>();
+    const weightOf = (id: number): number => {
+      const k = known.get(id);
+      return split.get(id) ?? (k === undefined ? 0 : this.#weights[k]);
+    };
+    for (let k = 0; splits !== undefined && k + 2 < splits.length; k += 3) {
+      split.set(splits[k], (weightOf(splits[k + 1]) + weightOf(splits[k + 2])) / 2);
+    }
+    const inReach = paintMaskIds(positions, indices, slots, this.#center, reach);
+    const candidates = Uint32Array.from(new Set([...inReach, ...split.keys()])).sort();
     const ids: number[] = [];
     const weights: number[] = [];
     const rest: number[] = [];
@@ -304,14 +322,7 @@ export class GrabRegion {
           continue;
         }
       }
-      let [ox, oy, oz] = [px, py, pz];
-      for (let step = 0; step < 4; step++) {
-        const w = this.#weight(ox, oy, oz);
-        ox = px - w * drag[0];
-        oy = py - w * drag[1];
-        oz = pz - w * drag[2];
-      }
-      const w = this.#weight(ox, oy, oz);
+      const w = split.get(id) ?? this.#weightAt(px, py, pz, drag);
       if (w !== 0) {
         ids.push(id);
         weights.push(w);
@@ -323,15 +334,72 @@ export class GrabRegion {
     this.#rest = Float32Array.from(rest);
   }
 
-  /** Where the grabbed vertices belong at the total `drag`, three numbers per id. */
+  /**
+   * The weight `w` of a vertex at `x, y, z` under `drag`: one with
+   * `w = weight(p - w * drag)`. Fixed-point steps diverge once the drag is
+   * longer than the falloff, which leaves the vertices on a long lump's sides
+   * behind, so this solves for the share `u = w / strength` directly.
+   *
+   * The falloff is largest at `top`, where the line through `p` along the drag
+   * passes closest to the center, and falls beyond it. So above `top`, the
+   * excess `falloff - u` only falls and has at most one root, found by
+   * bisection. That largest root is the one on the surface: a vertex that was
+   * dragged here rested where the brush weighed it most, and the smaller
+   * roots, down to 0 for a point now outside the ball, are off the surface.
+   * With no root above `top`, the vertex lies past the lump's rim, and the
+   * largest root below it is found by scanning.
+   */
+  #weightAt(x: number, y: number, z: number, drag: readonly [number, number, number]): number {
+    const s = this.#strength;
+    const [ax, ay, az] = [s * drag[0], s * drag[1], s * drag[2]];
+    const c = this.#center;
+    const length2 = ax * ax + ay * ay + az * az;
+    if (length2 === 0) {
+      return this.#weight(x, y, z);
+    }
+    const at = (u: number): number => this.#weight(x - u * ax, y - u * ay, z - u * az);
+    const excess = (u: number): number => at(u) / s - u;
+    const closest = ((x - c[0]) * ax + (y - c[1]) * ay + (z - c[2]) * az) / length2;
+    const top = Math.min(1, Math.max(0, closest));
+    let low = top;
+    let high = 1;
+    if (excess(top) < 0) {
+      const STEPS = 16;
+      high = top;
+      low = 0;
+      for (let k = STEPS - 1; k >= 0; k--) {
+        const u = (top * k) / STEPS;
+        if (excess(u) >= 0) {
+          low = u;
+          break;
+        }
+        high = u;
+      }
+    }
+    for (let k = 0; k < 30; k++) {
+      const mid = (low + high) / 2;
+      if (excess(mid) >= 0) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    return at(low);
+  }
+
+  /**
+   * Where the grabbed vertices belong at the total `drag`, three numbers per id,
+   * as `setPositions` takes them: the region works in the mesh's stored
+   * positions, which are relative to its `origin`.
+   */
   positionsAt(drag: readonly [number, number, number]): Float64Array {
     this.#drag = [drag[0], drag[1], drag[2]];
     const out = new Float64Array(this.#rest.length);
     for (let k = 0; k < this.ids.length; k++) {
       const w = this.#weights[k];
-      out[3 * k] = this.#rest[3 * k] + w * drag[0];
-      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1];
-      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2];
+      out[3 * k] = this.#rest[3 * k] + w * drag[0] + this.#origin[0];
+      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1] + this.#origin[1];
+      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2] + this.#origin[2];
     }
     return out;
   }
@@ -687,7 +755,7 @@ export class SculptStroke {
 // the ids stop naming live vertices: a masked slot out of range, or no
 // longer used by a live triangle (a collapse, compact, weld or isolate took
 // it). Surviving cases re-verify cheaply: splits add slots but keep the old
-// vertices alive, so a remeshed stroke's mask carries over (the new vertices
+// vertices alive, so a split stroke's mask carries over (the new vertices
 // land unmasked); undo/redo restores the buffers, and the mask with them
 // when its ids are live again. The documented hole: a merge or compact can
 // remap ids while keeping them live, silently re-pointing the mask —

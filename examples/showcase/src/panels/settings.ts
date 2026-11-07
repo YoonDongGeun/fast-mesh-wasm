@@ -50,7 +50,11 @@ export interface ShowcaseSettings {
   heatmap: HeatmapParams | null;
   heatmapFast: boolean;
   decimateOnLoad: boolean;
-  sculptRemesh: boolean;
+  /**
+   * The app's `sculptRemesh`. A new key, not the old `sculptRemesh`: that one
+   * saved the old default of `true`, which must not keep the remesh on.
+   */
+  sculptEvenOut: boolean;
   sculptLiveRemesh: boolean;
   maskRadius: number;
   /** The display unit new sessions and older project files start on; a project file's own wins. */
@@ -73,7 +77,7 @@ export function defaultSettings(): ShowcaseSettings {
     heatmap: null,
     heatmapFast: false,
     decimateOnLoad: true,
-    sculptRemesh: true,
+    sculptEvenOut: false,
     sculptLiveRemesh: true,
     maskRadius: 0.25,
     defaultUnits: "mm",
@@ -174,7 +178,7 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     heatmap: parseHeatmap(doc.heatmap),
     heatmapFast: asBoolean(doc.heatmapFast, fallback.heatmapFast),
     decimateOnLoad: asBoolean(doc.decimateOnLoad, fallback.decimateOnLoad),
-    sculptRemesh: asBoolean(doc.sculptRemesh, fallback.sculptRemesh),
+    sculptEvenOut: asBoolean(doc.sculptEvenOut, fallback.sculptEvenOut),
     sculptLiveRemesh: asBoolean(doc.sculptLiveRemesh, fallback.sculptLiveRemesh),
     maskRadius: asNumber(doc.maskRadius, fallback.maskRadius, Number.MIN_VALUE),
     defaultUnits: asLiteral(doc.defaultUnits, ["mm", "in"], fallback.defaultUnits),
@@ -246,7 +250,7 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     heatmap: snap.heatmapParams === null ? null : { ...snap.heatmapParams },
     heatmapFast: snap.heatmapFast,
     decimateOnLoad: snap.decimateOnLoad,
-    sculptRemesh: snap.sculptRemesh,
+    sculptEvenOut: snap.sculptRemesh,
     sculptLiveRemesh: snap.sculptLiveRemesh,
     maskRadius: snap.maskRadius,
     defaultUnits: snap.defaultUnits,

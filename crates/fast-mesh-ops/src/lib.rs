@@ -80,6 +80,7 @@ mod refine;
 pub mod remesh;
 pub mod simplify;
 mod sparse;
+pub mod stretch;
 pub mod subdivide;
 #[cfg(test)]
 mod test_util;

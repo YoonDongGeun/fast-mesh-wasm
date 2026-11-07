@@ -1348,11 +1348,11 @@ try {
     `volume=${sculptVol === true} armed=${sculptArmed === true} surface=${sculptSurface === true} back=${sculptBack === true}`,
   );
 
-  // ---- remesh-gate: remesh options stand down on huge meshes ----
-  // The chest (591 k) disables both remesh checkboxes; the vessel (27 k)
-  // keeps them enabled.
+  // ---- remesh-gate: the optional remesh stands down on huge meshes ----
+  // The chest (591 k) disables it but keeps the stretch splits, whose cost
+  // follows the stretched edges; the vessel (27 k) keeps both enabled.
   const gateOff = await waitFor(
-    `document.querySelector('[data-action="sculpt-remesh"]')?.disabled === true && document.querySelector('[data-action="sculpt-live-remesh"]')?.disabled === true ? true : null`,
+    `document.querySelector('[data-action="sculpt-remesh"]')?.disabled === true && document.querySelector('[data-action="sculpt-live-remesh"]')?.disabled === false ? true : null`,
     20_000,
   );
   if (vessel !== undefined) {
@@ -1369,6 +1369,95 @@ try {
     "remesh-gate",
     gateOff === true && gateOn === true,
     `chest disabled=${gateOff === true} vessel enabled=${gateOn === true}`,
+  );
+
+  // ---- stretch-stroke: a real grab stroke splits what it stretched, nothing else ----
+  // A demo mesh's buffers before and after a long drag on the canvas, compared in the page.
+  let stretch = null;
+  let hoverState = null;
+  const stroked = (await hook("items()")).find((m) => m.volumeId === null && m.triangles > 10_000);
+  if (stroked !== undefined) {
+    const name = JSON.stringify(stroked.name);
+    await clickOn(`[data-mesh=${name}] .mesh-name`);
+    // Fill the view with it, so that the hover finds it and the drag is a sane length.
+    await page(`[...document.querySelectorAll(${JSON.stringify(`[data-mesh=${name}] button`)})].find((b) => b.textContent === "Focus")?.click()`);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await clickOn('[data-action="sculpt-tool-grab"]');
+    await waitFor(`document.querySelector('[data-action="sculpt-tool-grab"]')?.getAttribute("aria-pressed") === "true" ? true : null`, 5000);
+    await page(`(() => { window.__before = { p: __showcase.positions(${name}), i: __showcase.indices(${name}), s: __showcase.sculpt() }; })()`);
+    // Hover until the brush ball shows: then the pointer is on the mesh.
+    const center = await hook(`screenPoint(${name})`);
+    const box = await page(`(() => { const r = document.querySelector("main canvas").getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })()`);
+    const tries = [center];
+    for (let row = 1; row < 16; row++) {
+      for (let col = 1; col < 16; col++) {
+        tries.push({ x: box.x + (box.w * col) / 16, y: box.y + (box.h * row) / 16 });
+      }
+    }
+    let at = null;
+    for (const t of tries) {
+      await mouse("mouseMoved", t.x, t.y, { button: "none" });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      if ((await hook("sculpt().hovering")) === true) {
+        at = t;
+        break;
+      }
+    }
+    hoverState = await hook("sculpt()");
+    if (at !== null) {
+      await mouse("mousePressed", at.x, at.y);
+      for (let k = 1; k <= 60; k++) {
+        await mouse("mouseMoved", at.x, at.y - k * 4);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        // Mid-stroke, once a live pass has landed: what it added must come along from here on.
+        if (k === 40) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await page(`(() => { window.__mid = __showcase.positions(${name}); })()`);
+        }
+      }
+      await mouse("mouseReleased", at.x, at.y - 240);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      stretch = await page(`(() => {
+        const { p, i, s } = window.__before;
+        const q = __showcase.positions(${name});
+        const j = __showcase.indices(${name});
+        const now = __showcase.sculpt();
+        const moved = (v) => p[3 * v] !== q[3 * v] || p[3 * v + 1] !== q[3 * v + 1] || p[3 * v + 2] !== q[3 * v + 2];
+        let movedCount = 0;
+        for (let v = 0; v < p.length / 3; v++) movedCount += moved(v) ? 1 : 0;
+        let unmoved = 0;
+        let rewritten = 0;
+        for (let t = 0; t < i.length; t += 3) {
+          if (!moved(i[t]) && !moved(i[t + 1]) && !moved(i[t + 2])) {
+            unmoved++;
+            if (j[t] !== i[t] || j[t + 1] !== i[t + 1] || j[t + 2] !== i[t + 2]) rewritten++;
+          }
+        }
+        const mid = window.__mid;
+        let liveVerts = 0;
+        let liveMoved = 0;
+        for (let v = p.length / 3; v < mid.length / 3; v++) {
+          liveVerts++;
+          if (mid[3 * v] !== q[3 * v] || mid[3 * v + 1] !== q[3 * v + 1] || mid[3 * v + 2] !== q[3 * v + 2]) liveMoved++;
+        }
+        return { liveVerts, liveMoved, slotsBefore: p.length / 3, slotsAfter: q.length / 3, trisBefore: i.length / 3, trisAfter: j.length / 3, movedCount, unmoved, rewritten, passes: now.liveRemeshes - s.liveRemeshes, remeshes: now.remeshes - s.remeshes, dabs: now.dabs - s.dabs };
+      })()`);
+    }
+    await clickOn('[data-action="sculpt-tool-grab"]');
+  }
+  verdict(
+    "stretch-stroke",
+    stretch !== null &&
+      stretch.dabs > 0 &&
+      stretch.passes > 0 &&
+      stretch.remeshes === 0 &&
+      stretch.rewritten === 0 &&
+      stretch.unmoved > 0 &&
+      stretch.trisAfter > stretch.trisBefore &&
+      stretch.liveVerts > 0 &&
+      stretch.liveMoved === stretch.liveVerts &&
+      stretch.trisAfter < 3 * stretch.trisBefore,
+    JSON.stringify(stretch ?? { stroked: stroked?.name, hover: hoverState }),
   );
 
   // ---- big: a 1M-triangle STL upload keeps the main thread responsive (RF4) ----

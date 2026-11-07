@@ -775,6 +775,106 @@ describe("analyze and repair", () => {
     );
   });
 
+  it("splitStretched_leaves_everything_it_did_not_stretch_identical", () => {
+    // A grid with cells from nearly nothing to coarse: a mean length fits neither end.
+    const n = 30;
+    const warp = (v: number) => n * (v / n) ** 3;
+    const pos: number[] = [];
+    const tris: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        pos.push(warp(x), warp(y), 0);
+      }
+    }
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        tris.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    const s = scene();
+    const m = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+    const center = [15, 15, 0] as const;
+    expect(() => s.repair(m, { op: "splitStretched", center, radius: 100 })).toThrow();
+    expect(s.repair(m, { op: "captureRestSizes" })).toEqual({});
+    expect(s.canUndo()).toBe(false);
+    expect(() => s.repair(m, [{ op: "orient" }, { op: "captureRestSizes" }])).toThrow();
+
+    // Nothing stretched yet: not one split, however coarse the far corner is.
+    expect(s.repair(m, { op: "splitStretched", center, radius: 100 })).toEqual({ splits: 0, remaining: 0, vertices: new Uint32Array() });
+    expect(s.canUndo()).toBe(false);
+
+    s.repair(m, { op: "grab", center, radius: 5, falloff: "smooth", strength: 6, direction: [0, 0, 1] });
+    const dabbed = Float32Array.from(s.views(m).positions());
+    const before = Uint32Array.from(s.views(m).indices());
+    const moved = (v: number) => dabbed[3 * v + 2] !== 0;
+
+    const r = s.repair(m, { op: "splitStretched", center, radius: 100 });
+    expect(r.splits).toBeGreaterThan(0);
+    expect(r.remaining).toBe(0);
+
+    const positions = s.views(m).positions();
+    const indices = s.views(m).indices();
+    expect(Array.from(positions.subarray(0, dabbed.length))).toEqual(Array.from(dabbed));
+    expect(indices.length).toBeGreaterThan(before.length);
+    let unstretched = 0;
+    for (let t = 0; t < before.length; t += 3) {
+      if (!moved(before[t]) && !moved(before[t + 1]) && !moved(before[t + 2])) {
+        unstretched++;
+        expect(Array.from(indices.subarray(t, t + 3))).toEqual(Array.from(before.subarray(t, t + 3)));
+      }
+    }
+    expect(unstretched).toBeGreaterThan(1000);
+
+    expect(s.undo()).toBe(true);
+    expect(Array.from(s.views(m).indices().subarray(0, before.length))).toEqual(Array.from(before));
+    expect(Array.from(s.views(m).positions().subarray(0, dabbed.length))).toEqual(Array.from(dabbed));
+    expect(s.redo()).toBe(true);
+    expect(s.repair(m, { op: "splitStretched", center, radius: 100 }).splits).toBe(0);
+  });
+
+  it("splitStretched_needs_new_rest_sizes_after_an_edit_outdates_them", () => {
+    const n = 20;
+    const pos: number[] = [];
+    const tris: number[] = [];
+    for (let y = 0; y <= n; y++) {
+      for (let x = 0; x <= n; x++) {
+        pos.push(x, y, 0);
+      }
+    }
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const a = y * (n + 1) + x;
+        tris.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+      }
+    }
+    const s = scene();
+    const m = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+    const center = [0, 0, 0] as const;
+    const pass = () => s.repair(m, { op: "splitStretched", center, radius: 1000 });
+    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(pass().splits).toBe(0);
+    // A simplify outdates them: longer edges must not read as stretched.
+    s.repair(m, { op: "simplify", targetTriangles: 200 });
+    expect(pass).toThrow();
+    s.repair(m, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(pass().splits).toBe(0);
+    // Undoing the simplify brings back the sizes from before it, still true.
+    expect(s.undo()).toBe(true);
+    expect(pass().splits).toBe(0);
+
+    // Undoing an edit from before the capture forgets it.
+    const fresh = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+    const passFresh = () => s.repair(fresh, { op: "splitStretched", center, radius: 1000 });
+    s.repair(fresh, { op: "simplify", targetTriangles: 200 });
+    s.repair(fresh, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(passFresh().splits).toBe(0);
+    expect(s.undo()).toBe(true);
+    expect(passFresh).toThrow();
+    s.repair(fresh, { op: "captureRestSizes", onlyIfMissing: true });
+    expect(passFresh().splits).toBe(0);
+  });
+
   it("bridgeLoops_joins_two_rims", () => {
     const s = scene();
     const m = s.addMesh(bridgePos, bridgeIdx);

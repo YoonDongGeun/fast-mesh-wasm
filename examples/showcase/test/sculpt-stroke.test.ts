@@ -245,6 +245,111 @@ describe("a remesh during a grab", () => {
   });
 });
 
+describe("a live split during a long grab", () => {
+  it("moves_the_new_vertices_with_the_region", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const center: Vec = [R, 0, 0];
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
+    // A drag several radii long: the lump's sides stretch far past the limit.
+    const far: Vec = [2.5, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    const slotsBefore = v.positions().length / 3;
+    const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 1, 0, 0], radius: 4 });
+    expect(r.splits).toBeGreaterThan(10);
+    const settled = Float32Array.from(v.positions());
+    region.rebase(v.positions(), v.indices(), r.vertices);
+    // No pop: the same drag writes the same positions back.
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
+    // Dragging on takes the new vertices along, each by its own part of the drag.
+    const further: Vec = [3, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    const now = v.positions();
+    const slots = settled.length / 3;
+    let moved = 0;
+    for (let k = slotsBefore; k < slots; k++) {
+      const by = now[3 * k] - settled[3 * k];
+      expect(by).toBeLessThanOrEqual(0.5 + 1e-3);
+      expect(by).toBeGreaterThanOrEqual(-1e-3);
+      moved += by > 1e-3 ? 1 : 0;
+    }
+    // On the lump's sides, weight follows height: a new vertex's share of the
+    // drag is about how far along the drag it sits.
+    expect(moved / (slots - slotsBefore)).toBeGreaterThan(0.9);
+  });
+});
+
+describe("a live split during a grab along the surface", () => {
+  it("gives_new_vertices_their_edge_weights_so_the_mesh_does_not_explode", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const center: Vec = [R, 0, 0];
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const before = v.indices().length / 3;
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
+    // Along the surface the front folds over itself, so a position alone does
+    // not say which part of the sheet a new vertex belongs to.
+    for (let k = 1; k <= 60; k++) {
+      const drag: Vec = [0, 0.05 * k, 0];
+      s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+      if (k % 4 === 0) {
+        const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.025 * k, 0], radius: 4 });
+        const settled = Float32Array.from(v.positions());
+        region.rebase(v.positions(), v.indices(), r.vertices);
+        s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+        expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
+      }
+    }
+    const after = v.indices().length / 3;
+    // A single-sheet lump of about this much area needs a few thousand.
+    expect(after - before).toBeLessThan(8000);
+  });
+
+  it("carries_every_split_vertex_with_a_moving_parent", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const region = new GrabRegion(v.positions(), v.indices(), [R, 0, 0], 0.5, "smooth", 1);
+    const drag: Vec = [0, 1.5, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(drag) }]);
+    const moving = new Set(region.ids);
+    const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R, 0.75, 0], radius: 4 });
+    expect(r.vertices.length / 3).toBe(r.splits);
+    expect(r.splits).toBeGreaterThan(0);
+    region.rebase(v.positions(), v.indices(), r.vertices);
+    const held = new Set(region.ids);
+    let parented = 0;
+    for (let k = 0; k < r.vertices.length; k += 3) {
+      if (moving.has(r.vertices[k + 1]) || moving.has(r.vertices[k + 2])) {
+        moving.add(r.vertices[k]);
+        parented++;
+        expect(held.has(r.vertices[k])).toBe(true);
+      }
+    }
+    expect(parented).toBe(r.splits);
+  });
+});
+
+describe("a grab on a mesh away from the world origin", () => {
+  it("moves_only_by_the_drag", () => {
+    const { positions, indices } = sphere(20, 40, R);
+    const offset: Vec = [5, 3, 1];
+    const away = positions.map((x, k) => x + offset[k % 3]);
+    const scene = new Scene();
+    const mesh = scene.addMesh(away, indices);
+    const v = scene.views(mesh);
+    const before = Float32Array.from(v.positions());
+    const center: Vec = [before[3], before[4], before[5]];
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1, scene.origin(mesh));
+    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0, 0]) }]);
+    expect(maxDifference(v.positions(), before)).toBeLessThan(1e-5);
+    scene.edit(mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt([0, 0.2, 0]) }]);
+    expect(maxDifference(v.positions(), before)).toBeCloseTo(0.2, 3);
+  });
+});
+
 describe("GrabRegion", () => {
   const { positions, indices } = sphere(40, 80, R);
 

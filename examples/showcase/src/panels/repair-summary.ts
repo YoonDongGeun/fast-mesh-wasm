@@ -153,6 +153,12 @@ export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: 
       const r = report as Extract<RepairReport, { verticesAdded: number; trianglesAdded: number }>;
       return `Subdivide: added ${plural(r.verticesAdded, "vertex", "vertices")} and ${plural(r.trianglesAdded, "triangle")}`;
     }
+    case "splitStretched": {
+      const r = report as Extract<RepairReport, { splits: number; remaining: number }>;
+      return `Split stretched: ${plural(r.splits, "split")}`;
+    }
+    case "captureRestSizes":
+      return "Captured rest sizes";
     default: {
       const _exhaustive: never = op;
       throw new Error(`unreachable repair op: ${String(_exhaustive)}`);

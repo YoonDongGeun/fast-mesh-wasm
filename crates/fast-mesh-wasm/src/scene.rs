@@ -990,6 +990,13 @@ impl WasmScene {
         ])
     }
 
+    /// The mesh's origin: its stored positions are relative to it, and
+    /// `setPositions` takes positions with it added back.
+    pub fn origin(&self, index: u32, generation: u32) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self.scene.mesh(id)?.origin().to_vec())
+    }
+
     /// Runs repair operations on a mesh, in order, in one transaction: one
     /// undo step, and nothing changes when an operation fails. `ops` (`f64`)
     /// and `loops` (`u32`, loop ids for fill holes) are laid out as in
@@ -1017,6 +1024,25 @@ impl WasmScene {
         if let Some(dab) = dab {
             let r = self.scene.dab(id, &dab)?;
             return Ok(vec![count(r.moved), f64::from(r.max_displacement)]);
+        }
+        if let [RepairOp::CaptureRest { only_if_missing }] = decoded.as_slice() {
+            self.scene.capture_rest_sizes(id, *only_if_missing)?;
+            return Ok(Vec::new());
+        }
+        if decoded
+            .iter()
+            .any(|op| matches!(op, RepairOp::CaptureRest { .. }))
+        {
+            // Not an edit, so it cannot join a transaction.
+            return Err(Error::invalid(
+                "captureRestSizes must be the only operation in its list",
+            ));
+        }
+        if decoded
+            .iter()
+            .any(|op| matches!(op, RepairOp::SplitStretched(_)))
+        {
+            self.scene.ensure_incidence(id)?;
         }
         Ok(self.scene.edit(id, |tx| run_repair(tx, &decoded))?)
     }
