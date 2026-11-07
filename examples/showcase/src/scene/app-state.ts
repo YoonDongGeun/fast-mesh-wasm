@@ -171,10 +171,10 @@ export interface AppSnapshot {
   maskRadius: number;
   /** Why the mask was last cleared against its will (`null` when it stands or was cleared by hand). */
   sculptMaskNotice: string | null;
-  /** A stroke's end evens its region out with a remesh (in the same undo step on the sync scene). */
+  /** A stroke's end also remeshes its whole region (in the same undo step on the sync scene). Off by default: it rewrites what the stroke did not touch. */
   sculptRemesh: boolean;
   /**
-   * A stroke is remeshed live while it paints, so no triangle balloons mid-stroke.
+   * A stroke splits the triangles it stretches, so no triangle balloons mid-stroke.
    * Same undo step as the stroke (see `liveRemeshDue`'s semantics note in
    * `viewport/sculpt.ts`): the live passes repair inside the stroke's open
    * step and never open one of their own.
@@ -255,7 +255,7 @@ export class AppState {
     maskPaint: false,
     maskRadius: 0.25,
     sculptMaskNotice: null,
-    sculptRemesh: true,
+    sculptRemesh: false,
     sculptLiveRemesh: true,
     edgeSoftness: 0,
     wireframe: false,
@@ -297,7 +297,7 @@ export class AppState {
       heatmapParams: initial.heatmap === null ? null : { ...initial.heatmap },
       heatmapFast: initial.heatmapFast,
       decimateOnLoad: initial.decimateOnLoad,
-      sculptRemesh: initial.sculptRemesh,
+      sculptRemesh: initial.sculptEvenOut,
       sculptLiveRemesh: initial.sculptLiveRemesh,
       maskRadius: initial.maskRadius,
       units: initial.defaultUnits,
@@ -659,7 +659,7 @@ export class AppState {
       heatmapParams: d.heatmap,
       heatmapFast: d.heatmapFast,
       decimateOnLoad: d.decimateOnLoad,
-      sculptRemesh: d.sculptRemesh,
+      sculptRemesh: d.sculptEvenOut,
       sculptLiveRemesh: d.sculptLiveRemesh,
       maskRadius: d.maskRadius,
       units: d.defaultUnits,

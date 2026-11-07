@@ -72,33 +72,35 @@ export function sculptBrush(
 export const TELEPORT_RADII = 8;
 
 /**
- * Past this many triangles sculpt remeshes stand down: the passes run
- * over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
- * regions), which would stall the worker and the dabs behind it. Dabs
- * themselves cost by the brush region, so sculpting keeps working.
+ * Past this many triangles the optional "even out" remesh stands down: it
+ * runs over the whole mesh (measured ~2.6 s floor on 300 k, minutes for wide
+ * regions), which would stall the worker and the dabs behind it. Dabs cost by
+ * the brush region, and the stretch splits by the stretched edges: neither has
+ * such a limit.
  */
 export const REMESH_TRI_LIMIT = 100_000;
 
-/** Whether `triangles` stands sculpt remeshes (live and stroke-end) down. */
+/** Whether `triangles` stands the optional stroke-end remesh down. */
 export function remeshTooBig(triangles: number): boolean {
   return triangles > REMESH_TRI_LIMIT;
 }
 
 /**
- * Live remesh while sculpting (#129): the per-frame budget.
+ * Stretch splits while sculpting (#129, #175): the per-frame budget.
  *
  * At most one live pass per stroke region per `LIVE_REMESH_MIN_MS`, and only
  * once `LIVE_REMESH_MIN_DABS` dabs landed since the last pass, never two in
- * flight. The pass itself is split-only (`splitOnly`, `maxRounds: 2` at the
- * call site), so the triangle count only grows mid-stroke and the surface
- * never pops down; the stroke-end pass evens the density out fully. Past
- * `REMESH_TRI_LIMIT` triangles both passes stand down: a whole-mesh remesh
- * would stall the worker behind the dabs (#64 chunks a repair list one op
- * per message-loop turn, but a single remesh op is still one long chunk).
+ * flight. A pass splits only the edges the stroke stretched past their limit
+ * (`splitStretched`): what the stroke did not stretch keeps its vertices and
+ * triangles, and the vertex ids a mask stores stay valid. The rest sizes come
+ * from one `captureRestSizes` per armed session, before the first dab, so
+ * repeated strokes measure against the same shape instead of ratcheting.
  */
 export const LIVE_REMESH_MIN_DABS = 4;
 /** Minimum milliseconds between two live remesh passes of one stroke. */
-export const LIVE_REMESH_MIN_MS = 600;
+export const LIVE_REMESH_MIN_MS = 150;
+/** Most interior splits one pass makes; a later pass takes the rest, longest first. */
+export const LIVE_MAX_SPLITS = 50_000;
 
 /**
  * Whether a live remesh pass may fire: enough new dabs since the last pass,
@@ -687,7 +689,7 @@ export class SculptStroke {
 // the ids stop naming live vertices: a masked slot out of range, or no
 // longer used by a live triangle (a collapse, compact, weld or isolate took
 // it). Surviving cases re-verify cheaply: splits add slots but keep the old
-// vertices alive, so a remeshed stroke's mask carries over (the new vertices
+// vertices alive, so a split stroke's mask carries over (the new vertices
 // land unmasked); undo/redo restores the buffers, and the mask with them
 // when its ids are live again. The documented hole: a merge or compact can
 // remap ids while keeping them live, silently re-pointing the mask —

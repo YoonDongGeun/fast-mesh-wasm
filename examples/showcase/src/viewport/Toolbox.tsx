@@ -1,7 +1,7 @@
 // The sculpt toolbox: a floating strip over the viewport for the selected
 // mesh. Four tools arm the sculpt brush (inflate, deflate, smooth, grab),
 // with the brush radius and per-tool strength on sliders, the falloff, and
-// the stroke-end and live remeshes toggles; the viewport paints the strokes.
+// the stretch-split and stroke-end remesh toggles; the viewport paints the strokes.
 // The mask group paints the protected region the brushes skip (invert and
 // clear included); mask painting disarms the sculpt brush and vice versa.
 import type { MeshHandle } from "fast-mesh-wasm";
@@ -62,7 +62,7 @@ export function SculptToolbox(props: { app: AppState }) {
   if (item === null || selection === null) {
     return null;
   }
-  // Remeshes stand down on huge meshes, where one would stall the worker.
+  // The optional remesh stands down on huge meshes, where it would stall the worker.
   const tooBig = remeshTooBig(item.triangles);
   const remeshTitle = tooBig
     ? `Stands down past ${REMESH_TRI_LIMIT.toLocaleString("en")} triangles: a remesh would stall the worker`
@@ -130,7 +130,10 @@ export function SculptToolbox(props: { app: AppState }) {
       </label>
       <label
         className="check"
-        title={remeshTitle ?? "Even the stroked region out with a remesh when the stroke ends"}
+        title={
+          remeshTitle ??
+          "Remesh the stroked region when the stroke ends. Rewrites everything in the region, including what the stroke did not touch"
+        }
       >
         <input
           type="checkbox"
@@ -143,19 +146,15 @@ export function SculptToolbox(props: { app: AppState }) {
       </label>
       <label
         className="check"
-        title={
-          remeshTitle ??
-          "Split stretched triangles while the stroke paints (never collapses: the count only grows mid-stroke)"
-        }
+        title="Split triangles once the stroke stretches them past their limit. Everything else stays exactly as it is"
       >
         <input
           type="checkbox"
           data-action="sculpt-live-remesh"
           checked={liveRemesh}
-          disabled={tooBig}
           onChange={(e) => app.setSculptLiveRemesh(e.currentTarget.checked)}
         />
-        even out while painting
+        split stretched triangles
       </label>
       <MaskTools app={app} selection={selection} radius={item.radius} />
     </div>
