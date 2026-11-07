@@ -916,7 +916,7 @@ function SculptLayer(props: {
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
-        if (liveRef.current && landed > 0) {
+        if (liveRef.current) {
           const b = s.bounds();
           if (b !== null) {
             const mesh = brushRef.current.mesh;

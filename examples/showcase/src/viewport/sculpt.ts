@@ -278,8 +278,9 @@ export class GrabRegion {
    * Takes the region again over `positions`, with every move sent so far
    * landed: for a pass that added vertices or moved some mid-stroke. A vertex
    * that is still where this region put it keeps its rest. Any other gets the
-   * rest position the drag would have carried here, by a few fixed-point steps,
-   * and then exactly the rest that lands on it now, so that nothing jumps.
+   * weight of the rest position the drag would have carried here (see
+   * `#weightAt`), and then exactly the rest that lands on it now, so that
+   * nothing jumps.
    */
   rebase(positions: ArrayLike<number>, indices: ArrayLike<number>): void {
     const drag = this.#drag;
@@ -306,14 +307,7 @@ export class GrabRegion {
           continue;
         }
       }
-      let [ox, oy, oz] = [px, py, pz];
-      for (let step = 0; step < 4; step++) {
-        const w = this.#weight(ox, oy, oz);
-        ox = px - w * drag[0];
-        oy = py - w * drag[1];
-        oz = pz - w * drag[2];
-      }
-      const w = this.#weight(ox, oy, oz);
+      const w = this.#weightAt(px, py, pz, drag);
       if (w !== 0) {
         ids.push(id);
         weights.push(w);
@@ -323,6 +317,59 @@ export class GrabRegion {
     this.ids = Uint32Array.from(ids);
     this.#weights = Float32Array.from(weights);
     this.#rest = Float32Array.from(rest);
+  }
+
+  /**
+   * The weight `w` of a vertex at `x, y, z` under `drag`: one with
+   * `w = weight(p - w * drag)`. Fixed-point steps diverge once the drag is
+   * longer than the falloff, which leaves the vertices on a long lump's sides
+   * behind, so this solves for the share `u = w / strength` directly.
+   *
+   * The falloff is largest at `top`, where the line through `p` along the drag
+   * passes closest to the center, and falls beyond it. So above `top`, the
+   * excess `falloff - u` only falls and has at most one root, found by
+   * bisection. That largest root is the one on the surface: a vertex that was
+   * dragged here rested where the brush weighed it most, and the smaller
+   * roots, down to 0 for a point now outside the ball, are off the surface.
+   * With no root above `top`, the vertex lies past the lump's rim, and the
+   * largest root below it is found by scanning.
+   */
+  #weightAt(x: number, y: number, z: number, drag: readonly [number, number, number]): number {
+    const s = this.#strength;
+    const [ax, ay, az] = [s * drag[0], s * drag[1], s * drag[2]];
+    const c = this.#center;
+    const length2 = ax * ax + ay * ay + az * az;
+    if (length2 === 0) {
+      return this.#weight(x, y, z);
+    }
+    const at = (u: number): number => this.#weight(x - u * ax, y - u * ay, z - u * az);
+    const excess = (u: number): number => at(u) / s - u;
+    const closest = ((x - c[0]) * ax + (y - c[1]) * ay + (z - c[2]) * az) / length2;
+    const top = Math.min(1, Math.max(0, closest));
+    let low = top;
+    let high = 1;
+    if (excess(top) < 0) {
+      const STEPS = 16;
+      high = top;
+      low = 0;
+      for (let k = STEPS - 1; k >= 0; k--) {
+        const u = (top * k) / STEPS;
+        if (excess(u) >= 0) {
+          low = u;
+          break;
+        }
+        high = u;
+      }
+    }
+    for (let k = 0; k < 30; k++) {
+      const mid = (low + high) / 2;
+      if (excess(mid) >= 0) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    return at(low);
   }
 
   /** Where the grabbed vertices belong at the total `drag`, three numbers per id. */

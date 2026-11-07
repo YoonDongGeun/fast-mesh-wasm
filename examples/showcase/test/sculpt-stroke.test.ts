@@ -245,6 +245,42 @@ describe("a remesh during a grab", () => {
   });
 });
 
+describe("a live split during a long grab", () => {
+  it("moves_the_new_vertices_with_the_region", () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    const center: Vec = [R, 0, 0];
+    s.scene.repair(s.mesh, { op: "captureRestSizes" });
+    const region = new GrabRegion(v.positions(), v.indices(), center, 0.5, "smooth", 1);
+    // A drag several radii long: the lump's sides stretch far past the limit.
+    const far: Vec = [2.5, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    const slotsBefore = v.positions().length / 3;
+    const r = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 1, 0, 0], radius: 4 });
+    expect(r.splits).toBeGreaterThan(10);
+    const settled = Float32Array.from(v.positions());
+    region.rebase(v.positions(), v.indices());
+    // No pop: the same drag writes the same positions back.
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(far) }]);
+    expect(maxDifference(v.positions(), settled)).toBeLessThan(1e-3);
+    // Dragging on takes the new vertices along, each by its own part of the drag.
+    const further: Vec = [3, 0, 0];
+    s.scene.edit(s.mesh, [{ op: "setPositions", vertices: region.ids, positions: region.positionsAt(further) }]);
+    const now = v.positions();
+    const slots = settled.length / 3;
+    let moved = 0;
+    for (let k = slotsBefore; k < slots; k++) {
+      const by = now[3 * k] - settled[3 * k];
+      expect(by).toBeLessThanOrEqual(0.5 + 1e-3);
+      expect(by).toBeGreaterThanOrEqual(-1e-3);
+      moved += by > 1e-3 ? 1 : 0;
+    }
+    // On the lump's sides, weight follows height: a new vertex's share of the
+    // drag is about how far along the drag it sits.
+    expect(moved / (slots - slotsBefore)).toBeGreaterThan(0.9);
+  });
+});
+
 describe("GrabRegion", () => {
   const { positions, indices } = sphere(40, 80, R);
 
