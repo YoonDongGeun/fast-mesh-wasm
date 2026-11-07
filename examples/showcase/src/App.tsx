@@ -406,7 +406,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         </div>
         <p className="hint">
           {sculpt !== null
-            ? "Hover shows the brush ball · press-and-hold to sculpt · drag to grab · Esc disarms"
+            ? "Hover shows the brush · press-and-hold to sculpt · drag to grab · Esc disarms"
             : maskPaint
               ? "Press and hold to paint the mask · Esc disarms"
             : picking !== null

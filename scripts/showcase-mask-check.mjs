@@ -28,6 +28,7 @@
 // - live: a stroke's live split pass runs over the mask and leaves its vertices
 //   alone; the stroke-end remesh stands down.
 // - covered: a dab with only masked vertices in its ball moves nothing: no undo step.
+// - quick: a release before the press's raycast answers paints nothing, and moving after it neither.
 // - stale: a topology edit that takes a masked vertex clears the mask and its
 //   tint, with the notice.
 // - inherit: on a lump stretched before it was masked, a live split between masked
@@ -203,9 +204,20 @@ try {
    */
   async function shot(name) {
     await park();
-    // The brush ball goes once the parked pointer's raycast answers, which a
-    // slow runner takes frames over; it would tint the shot.
-    await waitFor("__showcase.sculpt().hovering === false", 10_000);
+    // The brush cursor goes once the parked pointer's raycast answers, which a slow
+    // runner takes frames over, and a raycast already out can still lay it down again
+    // first: it would tint the shot. So it has to stay gone for a while.
+    const started = Date.now();
+    for (let seen = -1, since = Date.now(); Date.now() - since < 400; await sleep(50)) {
+      const { hovering, cursorShows } = await hook("sculpt()");
+      if (hovering || cursorShows !== seen) {
+        seen = cursorShows;
+        since = Date.now();
+      }
+      if (Date.now() - started > 20_000) {
+        throw new Error(`the brush cursor did not go: hovering ${hovering}, laid down ${cursorShows} times`);
+      }
+    }
     await frames();
     await page(`(() => {
       const s = document.createElement("style");
@@ -388,6 +400,24 @@ try {
   await shot("cleared");
   const cleared = await diff("base", "cleared", 8);
   verdict("clear", cleared.count === 0 && (await hook("sculpt().maskOverlay.triangles")) === 0, `${cleared.count} pixels differ from the base`);
+
+  // ---- quick: a release before the press's raycast answers paints nothing, and ends it ----
+  await mouse("mouseMoved", center.x, center.y, { button: "none" });
+  await sleep(150);
+  await Promise.all([
+    mouse("mousePressed", center.x, center.y, { buttons: 1 }),
+    mouse("mouseReleased", center.x, center.y, { buttons: 0 }),
+  ]);
+  await sleep(300);
+  // With the button up, moving over the mesh must not paint.
+  for (let k = 1; k <= 10; k++) {
+    await mouse("mouseMoved", center.x + 4 * k, center.y, { button: "none" });
+    await sleep(60);
+  }
+  await frames();
+  const quick = await hook("sculptMask()");
+  verdict("quick", quick === null || quick.length === 0, `${quick?.length ?? 0} masked after a press released at once`);
+  await clickOn('[data-action="sculpt-mask-clear"]').catch(() => {});
 
   // ---- protect: a dab on the mask's edge moves only free vertices ----
   const positions = () => hook(`positions(${q(A)})`);

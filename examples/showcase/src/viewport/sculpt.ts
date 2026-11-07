@@ -126,10 +126,16 @@ export function liveRemeshDue(dabsSinceLive: number, msSinceLive: number, runnin
  * there; that divergence is inherent to the Worker scene, not a choice.)
  */
 
-/** Dab spacing: 15% of the radius (never zero, so dabs terminate). */
+/**
+ * Dab spacing: 5% of the radius (never zero, so dabs terminate). Close enough
+ * that one dab is too small to see on its own, so a stroke grows instead of stepping.
+ */
 export function dabSpacing(radius: number): number {
-  return Math.max(radius * 0.15, 1e-6);
+  return Math.max(radius * 0.05, 1e-6);
 }
+
+/** What one spaced dab applies of the brush's strength: the same bump per distance, in finer steps. */
+export const DAB_SHARE = 1 / 3;
 
 /** Whether `at` is at least `spacing` from the last dab: a new dab. */
 export function farEnough(
@@ -148,12 +154,12 @@ export function farEnough(
  * displacement step of a painted stroke. Inflate's strength is relative to
  * the brush radius; the engine takes it in mesh units.
  */
-export function dabOp(brush: SculptBrush, center: readonly [number, number, number]): RepairOp {
+export function dabOp(brush: SculptBrush, center: readonly [number, number, number], share = 1): RepairOp {
   const shared = {
     center: [center[0], center[1], center[2]] as [number, number, number],
     radius: brush.radius,
     falloff: brush.falloff,
-    strength: brush.op === "inflate" ? brush.strength * brush.radius : brush.strength,
+    strength: (brush.op === "inflate" ? brush.strength * brush.radius : brush.strength) * share,
   };
   if (brush.op === "relax") {
     return { op: "relax", ...shared, cycles: brush.cycles };
@@ -233,24 +239,58 @@ export function falloffWeight(falloff: "linear" | "smooth", t: number): number {
 }
 
 /**
- * What a grab stroke holds on to: the vertices under the brush at the press,
- * where they rested and their weights. Each move is written from these and the
- * total drag, so the shape depends on where the pointer is and not on how many
- * events it took to get there. The displacement step of a grab stroke:
- * `positionsAt` is all the stroke asks of it.
+ * The most a grab may stretch the surface along its drag: its displacement grows
+ * by at most this much per unit of distance. Under 1, points moving along the drag
+ * cannot pass each other, so the surface cannot fold over itself.
+ */
+export const GRAB_MAX_STRETCH = 0.8;
+
+/** The steepest slope of each falloff over the normalized distance. */
+const FALLOFF_SLOPE = { linear: 1, smooth: 1.5 } as const;
+
+/**
+ * What a grab stroke holds on to: where the vertices rested at the press. Each
+ * move is written from these and the total drag, so the shape depends on where
+ * the pointer is and not on how many events it took to get there. A vertex moves
+ * by `strength * falloff(distance / influence) * drag`.
+ *
+ * A surface folds where it lies ahead of the press along the drag, and the front
+ * of the lump runs over it. So the influence is the brush radius while nothing
+ * lies ahead, as in pulling straight off the surface, which may go as far as it
+ * likes. With surface ahead, as in dragging along it, the influence widens with
+ * the drag just enough to keep the stretch under `GRAB_MAX_STRETCH`, and takes more
+ * of the surface along. The vertex at the press follows the pointer either way.
  */
 export class GrabRegion {
-  /** The grabbed vertex slots, ascending. */
+  /** The vertex slots the last move wrote. */
   ids: Uint32Array;
-  #weights: Float32Array;
+  /** Where each slot rests: three numbers per slot. */
   #rest: Float32Array;
+  /** Which slots a live triangle uses. */
+  #live: Uint8Array;
+  /** What the mask leaves of each slot's move. */
+  #scale: Float32Array;
+  /** The vertices a pass added, in the order it made them: `new, a, b`. Each moves as the mean of its edge. */
+  #splits: number[] = [];
+  /** Which slots are in `#splits`. */
+  #isSplit: Uint8Array;
+  /** Which slots a move has written, so that a shrinking influence puts them back. */
+  #touched: Uint8Array;
+  /** The vertices the influence could reach, without the masked ones. */
+  #near: Uint32Array;
+  /** How far `#near` goes. */
+  #reach = 0;
+  /** The influence of the last move. */
+  #influence: number;
+  /** The widest influence so far. */
+  #peak: number;
   readonly #center: readonly [number, number, number];
   readonly #radius: number;
   readonly #falloff: "linear" | "smooth";
   readonly #strength: number;
   readonly #origin: readonly [number, number, number];
   readonly #hold: () => MaskField | null;
-  /** The drag of the last `positionsAt`: what the mesh shows, once it landed. */
+  /** The drag of the last `at`: what the mesh shows, once it landed. */
   #drag: readonly [number, number, number] = [0, 0, 0];
 
   constructor(
@@ -267,89 +307,188 @@ export class GrabRegion {
     this.#hold = typeof hold === "function" ? hold : () => hold;
     this.#center = [center[0], center[1], center[2]];
     this.#radius = radius;
+    this.#influence = radius;
+    this.#peak = radius;
     this.#falloff = falloff;
     this.#strength = strength;
     this.ids = new Uint32Array();
-    this.#weights = new Float32Array();
-    this.#rest = new Float32Array();
-    this.rebase(positions, indices);
+    this.#near = new Uint32Array();
+    const slots = positions.length / 3;
+    this.#rest = Float32Array.from(positions as ArrayLike<number>);
+    this.#live = liveSlots(indices, slots);
+    this.#touched = new Uint8Array(slots);
+    this.#isSplit = new Uint8Array(slots);
+    this.#scale = new Float32Array(slots);
+    const field = this.#hold();
+    for (let v = 0; v < slots; v++) {
+      this.#scale[v] = this.#held(v, field);
+    }
+    this.#take(radius);
+    this.at([0, 0, 0]);
+  }
+
+  /** The longest reach a drag this long could need: the influence that holds whatever lies ahead. */
+  #widest(drag: readonly [number, number, number]): number {
+    const length = Math.abs(this.#strength) * Math.hypot(drag[0], drag[1], drag[2]);
+    return (FALLOFF_SLOPE[this.#falloff] * length) / GRAB_MAX_STRETCH;
   }
 
   /**
-   * What the mask leaves of a vertex's move: 0 on a masked one, which this
-   * region then never takes, so no write ever reaches it. Read fresh, since a
-   * split can add to the mask mid-stroke. A slot newer than the field is free.
+   * The radius a `drag` reaches: the brush's, or wider by how much surface lies
+   * ahead of the press along the drag. A vertex counts by how straight ahead it
+   * lies, and less toward the edge of the widest reach, so that the influence
+   * grows smoothly as the drag brings more of the surface in.
    */
+  influence(drag: readonly [number, number, number]): number {
+    const widest = this.#widest(drag);
+    if (widest <= this.#radius) {
+      return this.#radius;
+    }
+    if (widest > this.#reach) {
+      // Well past it, so that a long drag scans the mesh only a few times.
+      this.#take(widest * 1.25);
+    }
+    const length = Math.hypot(drag[0], drag[1], drag[2]);
+    const sign = Math.sign(this.#strength);
+    const [ux, uy, uz] = [(sign * drag[0]) / length, (sign * drag[1]) / length, (sign * drag[2]) / length];
+    const [cx, cy, cz] = this.#center;
+    const rest = this.#rest;
+    let ahead = 0;
+    for (let k = 0; k < this.#near.length; k++) {
+      const v = this.#near[k];
+      const dx = rest[3 * v] - cx;
+      const dy = rest[3 * v + 1] - cy;
+      const dz = rest[3 * v + 2] - cz;
+      const along = dx * ux + dy * uy + dz * uz;
+      if (along <= 0) {
+        continue;
+      }
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (distance < widest) {
+        ahead = Math.max(ahead, (along / distance) * Math.min(1, 2 * (1 - distance / widest)));
+      }
+    }
+    return Math.max(this.#radius, widest * ahead);
+  }
+
+  /** How far from the press the grab has reached so far. */
+  get reach(): number {
+    return this.#peak;
+  }
+
+  /** What the mask leaves of a vertex's move: 0 on a masked one. A slot newer than the field is free. */
   #held(id: number, field: MaskField | null): number {
     return field === null || id >= field.scale.length ? 1 : field.scale[id];
   }
 
-  /** The weight of a vertex resting at `x, y, z`. */
+  /** The vertices out to `reach`, without the masked ones: no write ever reaches those. */
+  #take(reach: number): void {
+    this.#reach = reach;
+    const [cx, cy, cz] = this.#center;
+    const rest = this.#rest;
+    const reach2 = reach * reach;
+    const near: number[] = [];
+    for (let v = 0; v < this.#live.length; v++) {
+      if (this.#live[v] === 0 || this.#scale[v] === 0) {
+        continue;
+      }
+      const dx = rest[3 * v] - cx;
+      const dy = rest[3 * v + 1] - cy;
+      const dz = rest[3 * v + 2] - cz;
+      if (dx * dx + dy * dy + dz * dz <= reach2) {
+        near.push(v);
+      }
+    }
+    this.#near = Uint32Array.from(near);
+  }
+
+  /** The share of the drag a vertex resting at `x, y, z` takes by its falloff alone. */
   #weight(x: number, y: number, z: number): number {
     const c = this.#center;
-    const t = Math.hypot(x - c[0], y - c[1], z - c[2]) / this.#radius;
-    return this.#strength * falloffWeight(this.#falloff, t);
+    return this.#strength * falloffWeight(this.#falloff, Math.hypot(x - c[0], y - c[1], z - c[2]) / this.#influence);
+  }
+
+  /** The share of the drag each split vertex takes: the mean of its edge, in the order they were made. */
+  #splitWeights(): Map<number, number> {
+    const weights = new Map<number, number>();
+    const rest = this.#rest;
+    const of = (v: number) =>
+      weights.get(v) ?? this.#scale[v] * this.#weight(rest[3 * v], rest[3 * v + 1], rest[3 * v + 2]);
+    for (let k = 0; k + 2 < this.#splits.length; k += 3) {
+      const v = this.#splits[k];
+      weights.set(v, (this.#scale[v] * (of(this.#splits[k + 1]) + of(this.#splits[k + 2]))) / 2);
+    }
+    return weights;
   }
 
   /**
    * Takes the region again over `positions`, with every move sent so far
-   * landed: for a pass that added vertices or moved some mid-stroke. A vertex
-   * that is still where this region put it keeps its rest. A vertex from
-   * `splits` (`new, a, b` triples, as `splitStretched` reports them) gets the
-   * mean weight of its edge: its position alone cannot say, where the drag has
-   * folded the sheet over itself. Any other gets the weight of the rest position
-   * the drag would have carried here (see `#weightAt`). Each then takes exactly
-   * the rest that lands on it now, so that nothing jumps.
+   * landed: for a pass that added vertices or moved some mid-stroke. A vertex that
+   * is still where this region put it keeps its rest. A vertex from `splits`
+   * (`new, a, b` triples, as `splitStretched` reports them) moves as the mean of
+   * its edge from here on: its position alone cannot say which part of the surface
+   * it belongs to. Any other gets the weight of the rest position the drag would
+   * have carried here (see `#weightAt`). Each then rests exactly where it lands on
+   * it now, so that nothing jumps.
    */
   rebase(positions: ArrayLike<number>, indices: ArrayLike<number>, splits?: ArrayLike<number>): void {
     const drag = this.#drag;
     const slots = positions.length / 3;
-    const reach = this.#radius + Math.abs(this.#strength) * Math.hypot(drag[0], drag[1], drag[2]);
-    const known = new Map<number, number>();
-    this.ids.forEach((id, k) => known.set(id, k));
-    const split = new Map<number, number>();
-    const weightOf = (id: number): number => {
-      const k = known.get(id);
-      return split.get(id) ?? (k === undefined ? 0 : this.#weights[k]);
-    };
+    const oldSlots = this.#live.length;
+    const oldRest = this.#rest;
+    const oldLive = this.#live;
+    const oldScale = this.#scale;
+    const live = liveSlots(indices, slots);
+    const rest = new Float32Array(positions.length);
+    const scale = new Float32Array(slots);
+    const touched = new Uint8Array(slots);
+    touched.set(this.#touched.subarray(0, Math.min(oldSlots, slots)));
+    const isSplit = new Uint8Array(slots);
+    isSplit.set(this.#isSplit.subarray(0, Math.min(oldSlots, slots)));
     for (let k = 0; splits !== undefined && k + 2 < splits.length; k += 3) {
-      split.set(splits[k], (weightOf(splits[k + 1]) + weightOf(splits[k + 2])) / 2);
+      this.#splits.push(splits[k], splits[k + 1], splits[k + 2]);
+      isSplit[splits[k]] = 1;
     }
-    const inReach = paintMaskIds(positions, indices, slots, this.#center, reach);
-    const candidates = Uint32Array.from(new Set([...inReach, ...split.keys()])).sort();
-    const ids: number[] = [];
-    const weights: number[] = [];
-    const rest: number[] = [];
-    const tolerance = 1e-5 * this.#radius;
     const field = this.#hold();
-    for (let k = 0; k < candidates.length; k++) {
-      const id = candidates[k];
-      const held = this.#held(id, field);
-      if (held === 0) {
+    const tolerance = 1e-5 * this.#radius;
+    const put = (v: number, x: number, y: number, z: number, share: number) => {
+      rest[3 * v] = x;
+      rest[3 * v + 1] = y;
+      rest[3 * v + 2] = z;
+      scale[v] = share;
+    };
+    for (let v = 0; v < slots; v++) {
+      const [px, py, pz] = [positions[3 * v], positions[3 * v + 1], positions[3 * v + 2]];
+      const held = this.#held(v, field);
+      if (live[v] === 0 || held === 0 || isSplit[v] === 1) {
+        put(v, px, py, pz, held);
         continue;
       }
-      const [px, py, pz] = [positions[3 * id], positions[3 * id + 1], positions[3 * id + 2]];
-      const old = known.get(id);
-      if (old !== undefined) {
-        const w = this.#weights[old];
-        const [rx, ry, rz] = [this.#rest[3 * old], this.#rest[3 * old + 1], this.#rest[3 * old + 2]];
+      if (v < oldSlots && oldLive[v] === 1) {
+        const [rx, ry, rz] = [oldRest[3 * v], oldRest[3 * v + 1], oldRest[3 * v + 2]];
+        const w = oldScale[v] * this.#weight(rx, ry, rz);
         if (Math.hypot(rx + w * drag[0] - px, ry + w * drag[1] - py, rz + w * drag[2] - pz) <= tolerance) {
-          ids.push(id);
-          weights.push(w);
-          rest.push(rx, ry, rz);
+          put(v, rx, ry, rz, held);
           continue;
         }
       }
-      const w = split.get(id) ?? held * this.#weightAt(px, py, pz, drag);
-      if (w !== 0) {
-        ids.push(id);
-        weights.push(w);
-        rest.push(px - w * drag[0], py - w * drag[1], pz - w * drag[2]);
-      }
+      const w = held * this.#weightAt(px, py, pz, drag);
+      put(v, px - w * drag[0], py - w * drag[1], pz - w * drag[2], held);
+      touched[v] = 1;
     }
-    this.ids = Uint32Array.from(ids);
-    this.#weights = Float32Array.from(weights);
-    this.#rest = Float32Array.from(rest);
+    this.#rest = rest;
+    this.#live = live;
+    this.#scale = scale;
+    this.#touched = touched;
+    this.#isSplit = isSplit;
+    for (const [v, w] of this.#splitWeights()) {
+      rest[3 * v] = positions[3 * v] - w * drag[0];
+      rest[3 * v + 1] = positions[3 * v + 1] - w * drag[1];
+      rest[3 * v + 2] = positions[3 * v + 2] - w * drag[2];
+      touched[v] = w === 0 ? touched[v] : 1;
+    }
+    this.#take(Math.max(this.#reach, this.#influence));
+    this.at(drag);
   }
 
   /**
@@ -406,21 +545,64 @@ export class GrabRegion {
   }
 
   /**
-   * Where the grabbed vertices belong at the total `drag`, three numbers per id,
-   * as `setPositions` takes them: the region works in the mesh's stored
-   * positions, which are relative to its `origin`.
+   * The edit that puts the grabbed vertices where they belong at the total `drag`,
+   * as `setPositions` takes it: the region works in the mesh's stored positions,
+   * which are relative to its `origin`. A longer drag can take in more vertices.
    */
-  positionsAt(drag: readonly [number, number, number]): Float64Array {
+  at(drag: readonly [number, number, number]): { vertices: Uint32Array; positions: Float64Array } {
     this.#drag = [drag[0], drag[1], drag[2]];
-    const out = new Float64Array(this.#rest.length);
-    for (let k = 0; k < this.ids.length; k++) {
-      const w = this.#weights[k];
-      out[3 * k] = this.#rest[3 * k] + w * drag[0] + this.#origin[0];
-      out[3 * k + 1] = this.#rest[3 * k + 1] + w * drag[1] + this.#origin[1];
-      out[3 * k + 2] = this.#rest[3 * k + 2] + w * drag[2] + this.#origin[2];
+    this.#influence = this.influence(drag);
+    this.#peak = Math.max(this.#peak, this.#influence);
+    if (this.#influence > this.#reach) {
+      this.#take(this.#influence * 1.25);
     }
-    return out;
+    const near = this.#near;
+    const rest = this.#rest;
+    const splitWeights = this.#splitWeights();
+    const room = near.length + splitWeights.size;
+    const ids = new Uint32Array(room);
+    const out = new Float64Array(3 * room);
+    let n = 0;
+    const write = (v: number, w: number) => {
+      if (w === 0 && this.#touched[v] === 0) {
+        return;
+      }
+      this.#touched[v] = 1;
+      ids[n] = v;
+      out[3 * n] = rest[3 * v] + w * drag[0] + this.#origin[0];
+      out[3 * n + 1] = rest[3 * v + 1] + w * drag[1] + this.#origin[1];
+      out[3 * n + 2] = rest[3 * v + 2] + w * drag[2] + this.#origin[2];
+      n++;
+    };
+    for (let k = 0; k < near.length; k++) {
+      const v = near[k];
+      if (this.#isSplit[v] === 0) {
+        write(v, this.#scale[v] * this.#weight(rest[3 * v], rest[3 * v + 1], rest[3 * v + 2]));
+      }
+    }
+    for (const [v, w] of splitWeights) {
+      if (this.#scale[v] !== 0) {
+        write(v, w);
+      }
+    }
+    this.ids = ids.subarray(0, n);
+    return { vertices: this.ids, positions: out.subarray(0, 3 * n) };
   }
+}
+
+/** Which slots a live triangle uses (a removed triangle reads `0, 0, 0`). */
+function liveSlots(indices: ArrayLike<number>, slots: number): Uint8Array {
+  const used = new Uint8Array(slots);
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const [a, b, c] = [indices[t], indices[t + 1], indices[t + 2]];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    used[a] = 1;
+    used[b] = 1;
+    used[c] = 1;
+  }
+  return used;
 }
 
 /**
@@ -546,11 +728,11 @@ export class SculptStroke {
    * Moves the stroke to `center` (local coordinates), laying a dab every
    * spacing from the last one: `skipped` when it is under a spacing away,
    * `ended` once the stroke closed. With `force` (the hold-still buildup,
-   * which goes by time and not by distance) one dab lands right there, or
-   * `busy` while one is in flight. Past `TELEPORT_RADII` radii it starts over
+   * which goes by time and not by distance) one dab lands right there with
+   * `share` of the strength, or `busy` while one is in flight. Past `TELEPORT_RADII` radii it starts over
    * at `center`, as after `lift`.
    */
-  dab(center: readonly [number, number, number], force = false): "stamped" | "skipped" | "busy" | "ended" {
+  dab(center: readonly [number, number, number], force = false, share = 1): "stamped" | "skipped" | "busy" | "ended" {
     if (this.#ended) {
       return "ended";
     }
@@ -560,7 +742,7 @@ export class SculptStroke {
       if (force && this.#inFlight > 0) {
         return "busy";
       }
-      this.#stamp(brush, at);
+      this.#stamp(brush, at, force ? share : DAB_SHARE);
       this.#sendIfIdle();
       return "stamped";
     }
@@ -573,7 +755,7 @@ export class SculptStroke {
       return "skipped";
     }
     if (dist > TELEPORT_RADII * brush.radius) {
-      this.#stamp(brush, at);
+      this.#stamp(brush, at, DAB_SHARE);
       this.#sendIfIdle();
       return "stamped";
     }
@@ -581,7 +763,7 @@ export class SculptStroke {
     const steps = Math.floor(dist / spacing);
     for (let k = 1; k <= steps; k++) {
       const u = (k * spacing) / dist;
-      this.#stamp(brush, [x + dx * u, y + dy * u, z + dz * u]);
+      this.#stamp(brush, [x + dx * u, y + dy * u, z + dz * u], DAB_SHARE);
     }
     this.#sendIfIdle();
     return "stamped";
@@ -634,7 +816,7 @@ export class SculptStroke {
     }
   }
 
-  #stamp(brush: SculptBrush, at: [number, number, number]): void {
+  #stamp(brush: SculptBrush, at: [number, number, number], share: number): void {
     this.#last = at;
     if (this.#blocked(at, brush.radius)) {
       return;
@@ -642,7 +824,7 @@ export class SculptStroke {
     this.#open();
     this.#dabs++;
     this.#cover(at);
-    this.#queue.push(dabOp(brush, at));
+    this.#queue.push(dabOp(brush, at, share));
   }
 
   /**
