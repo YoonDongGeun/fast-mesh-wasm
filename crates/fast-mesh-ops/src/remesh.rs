@@ -237,9 +237,9 @@ struct WorkTri {
 
 /// A midpoint vertex waiting for commit. `parents` weights the new vertex
 /// over live base vertices so channels interpolate; positions are exact.
-struct NewVert {
-    pos: [f32; 3],
-    parents: Vec<(VertexId, f32)>,
+pub(crate) struct NewVert {
+    pub(crate) pos: [f32; 3],
+    pub(crate) parents: Vec<(VertexId, f32)>,
 }
 
 fn in_region(p: &[f32; 3], region: &Region) -> bool {
@@ -283,7 +283,7 @@ fn dist(a: &[f32; 3], b: &[f32; 3]) -> f64 {
     dx.hypot(dy).hypot(dz)
 }
 
-fn midpoint(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
+pub(crate) fn midpoint(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
     [
         (a[0] + b[0]) / 2.0,
         (a[1] + b[1]) / 2.0,
@@ -733,7 +733,7 @@ fn validate_flip(ctx: &FlipCtx, a: u32, b: u32, o1: usize, o2: usize) -> Option<
 }
 
 /// Whether `corners` winds the edge `a -> b` (as opposed to `b -> a`).
-fn runs_directed(corners: &[u32; 3], a: u32, b: u32) -> bool {
+pub(crate) fn runs_directed(corners: &[u32; 3], a: u32, b: u32) -> bool {
     (corners[0] == a && corners[1] == b)
         || (corners[1] == a && corners[2] == b)
         || (corners[2] == a && corners[0] == b)
@@ -760,16 +760,16 @@ fn snapshot_pairs(tris: &[WorkTri], vlive: &[bool]) -> Result<Vec<((u32, u32), u
     Ok(pairs)
 }
 
-fn degenerate(corners: &[u32; 3]) -> bool {
+pub(crate) fn degenerate(corners: &[u32; 3]) -> bool {
     corners[0] == corners[1] || corners[1] == corners[2] || corners[2] == corners[0]
 }
 
-fn carries(corners: &[u32; 3], a: u32, b: u32) -> bool {
+pub(crate) fn carries(corners: &[u32; 3], a: u32, b: u32) -> bool {
     corners.contains(&a) && corners.contains(&b)
 }
 
 /// The corner of a triangle carrying `(a, b)` that is neither endpoint.
-fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
+pub(crate) fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
     if corners[0] != a && corners[0] != b {
         corners[0]
     } else if corners[1] != a && corners[1] != b {
@@ -779,19 +779,19 @@ fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
     }
 }
 
-fn f64v(p: &[f32; 3]) -> [f64; 3] {
+pub(crate) fn f64v(p: &[f32; 3]) -> [f64; 3] {
     [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]
 }
 
-fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -836,7 +836,12 @@ fn max_cos_angle(corners: &[u32; 3], positions: &[[f32; 3]]) -> Option<f64> {
 /// Weights a midpoint over live base vertices. Endpoints created by earlier
 /// rounds contribute their own weights halved, merged by vertex id, so the
 /// weights always describe the exact midpoint over the base mesh.
-fn blend_parents(a: u32, b: u32, slots: usize, added: &[NewVert]) -> Result<Vec<(VertexId, f32)>> {
+pub(crate) fn blend_parents(
+    a: u32,
+    b: u32,
+    slots: usize,
+    added: &[NewVert],
+) -> Result<Vec<(VertexId, f32)>> {
     let mut entries: Vec<(u32, f32)> = Vec::new();
     for v in [a, b] {
         if (v as usize) < slots {

@@ -390,6 +390,28 @@ impl Mesh {
         Ok(())
     }
 
+    /// Adds a channel holding `values` (`width` per vertex slot) from the
+    /// start. Like [`Mesh::add_channel`], not undoable and no edit: no undo
+    /// step and no journal entry, whatever the channel's size.
+    ///
+    /// # Errors
+    /// [`StoreError::LengthMismatch`] for a wrong length, or as for
+    /// [`Mesh::add_channel`]. The mesh is then unchanged.
+    pub fn add_channel_with_values(&mut self, desc: ChannelDesc, values: &[f32]) -> Result<()> {
+        let expected = self.vertex_slots() * desc.width;
+        if values.len() != expected {
+            return Err(StoreError::LengthMismatch {
+                expected,
+                got: values.len(),
+            });
+        }
+        self.add_channel(desc)?;
+        if let Some(channel) = self.channels.last_mut() {
+            channel.data.as_mut_slice().copy_from_slice(values);
+        }
+        Ok(())
+    }
+
     /// Adds the UV channel ([`UV_CHANNEL`]) with `uvs`: 2 finite values per
     /// vertex slot. Like [`Mesh::add_channel`], not undoable. Meant for a mesh
     /// being set up, before any edit.

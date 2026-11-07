@@ -317,6 +317,19 @@ No target was set for these (the plan asks only that they be recorded), and noth
 - **Accuracy of fairing.** On a unit UV sphere (64 rings, 128 segments) with holes of 10, 20 and 30 degrees, the largest `| |p| - 1 |` over the new vertices is 0.0005, 0.0018 and 0.0082 with fairing, and 0.0103, 0.0507 and 0.1182 without (the `unfaired_patch_is_flatter` test, printed once).
 - **Weights.** All ten holes of the fair-on fill used cotangent weights and converged; none needed the uniform retry (printed once by the bench).
 
+### Splitting what a stroke stretched
+
+Results for `cargo bench -p fast-mesh-ops --bench ops -- "ops stretch"`, measured on 2026-11-07 on the machine above with other work sharing it (upper bounds). One stroke of 48 grab dabs over `terrain(224)` and `terrain(708)`, region radius 64. Each pass is planned, written and rolled back.
+
+| Benchmark | 100k triangles | 1M triangles | Notes |
+| --- | --- | --- | --- |
+| `capture_rest_sizes` | 4.6 ms | 53 ms | Once per armed session, before the first dab. |
+| `split_stretched` | 2.4 ms | 8.7 ms | 398 and 439 splits. Most of the 1M time is the scan of the vertices against the region. |
+| `split_stretched`, whole mesh in the region, nothing past the limit | 5.4 ms | 49 ms | The worst read: every edge is measured. |
+| `remesh` with `splitOnly`, for comparison | 31 ms | 353 ms | 1,050 and 1,054 splits, measured against a fixed target rather than the stretch. Copies and sorts the whole mesh every pass. |
+
+The full `remesh` over the same 100k stroke took 689 ms in a one-off run through `Scene::edit` (1,045 splits, 1,827 collapses, 3,218 flips); it was not run at 1M. In that run, 12 `split_stretched` passes through `Scene::edit`, with its eager BVH and normals update, took a mean of 5.0 ms at 100k and 9.6 ms at 1M (worst 16 ms). Through the wasm package in Node, the same 12 passes took a mean of 10.8 ms at 100k and 11.5 ms at 1M (worst 22 ms), against 87 ms and 893 ms for one split-only `remesh` on the stroked mesh; `capture_rest_sizes` took 17 ms and 61 ms.
+
 ## Sculpt strokes (issue #174)
 
 Measured on 2026-11-07, Intel Core i5-13600K, Windows 11, with other work sharing the machine (CPU load 65 to 100%), so read the ratios and not the last digit. The display runs at 144 Hz, so 6.9 ms is the best a frame can show.
@@ -1025,7 +1038,7 @@ pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue 
 pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
-cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld, remove_small_components and icp on 1M triangles
+cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld, remove_small_components and icp on 1M triangles; capture_rest_sizes, split_stretched and split-only remesh on 100k and 1M
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)
 cargo bench -p fast-mesh-scene --features parallel          # any of the above with the parallel feature (same for the other crates)

@@ -12,6 +12,9 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
+use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions, grab};
+use fast_mesh_ops::remesh::{Region, RemeshOptions, remesh};
+use fast_mesh_ops::stretch::{StretchOptions, capture_rest_sizes, split_stretched};
 use fast_mesh_ops::{
     AnalyzeOptions, ComponentOptions, FillOptions, IcpOptions, analyze, boundary_loops, fill_holes,
     icp, orient, remove_small_components, sample_surface, weld,
@@ -368,6 +371,102 @@ fn bench_icp(c: &mut Criterion) {
     group.finish();
 }
 
+/// One stroke over the terrain's middle: 48 grab dabs, nothing split yet.
+fn stroked(n: u32) -> (Mesh, Region) {
+    let mut mesh = build(&terrain_buffers(n));
+    capture_rest_sizes(&mut mesh).unwrap();
+    let c = n as f32 / 2.0;
+    for k in 0..48 {
+        let brush = Brush {
+            center: [c + k as f32 / 2.0, c, 0.0],
+            radius: 12.0,
+            falloff: Falloff::Smooth,
+            strength: 2.0,
+        };
+        let options = GrabOptions {
+            brush,
+            direction: [0.0, 0.0, 1.0],
+        };
+        let mut tx = mesh.begin_edit();
+        grab(&mut tx, &options).unwrap();
+        tx.commit().unwrap();
+    }
+    let region = Region {
+        center: [c, c, 0.0],
+        radius: 64.0,
+    };
+    (mesh, region)
+}
+
+/// `split_stretched` against the remesh it replaces, on one stroke. The plan
+/// and its writes are timed, then rolled back so every sample starts alike.
+fn bench_stretch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ops stretch");
+    group.sample_size(10);
+    for (name, n) in [("100k", 224), ("1M", N)] {
+        let buffers = terrain_buffers(n);
+        group.bench_function(format!("capture_rest_sizes_{name}"), |b| {
+            b.iter_batched(
+                || build(&buffers),
+                |mut mesh| {
+                    capture_rest_sizes(&mut mesh).unwrap();
+                    mesh
+                },
+                BatchSize::PerIteration,
+            )
+        });
+        let (mut mesh, region) = stroked(n);
+        let options = StretchOptions {
+            region,
+            ..StretchOptions::default()
+        };
+        let mut tx = mesh.begin_edit();
+        let r = split_stretched(&mut tx, &options).unwrap();
+        tx.rollback();
+        eprintln!("split_stretched_{name}: {r:?}");
+        group.bench_function(format!("split_stretched_{name}"), |b| {
+            b.iter(|| {
+                let mut tx = mesh.begin_edit();
+                black_box(split_stretched(&mut tx, &options).unwrap());
+                tx.rollback();
+            })
+        });
+        let whole = StretchOptions {
+            region: Region {
+                center: [0.0; 3],
+                radius: 1e6,
+            },
+            limit: 1e6,
+            ..StretchOptions::default()
+        };
+        group.bench_function(format!("split_stretched_nothing_to_do_whole_{name}"), |b| {
+            b.iter(|| {
+                let mut tx = mesh.begin_edit();
+                black_box(split_stretched(&mut tx, &whole).unwrap());
+                tx.rollback();
+            })
+        });
+        let live = RemeshOptions {
+            region,
+            target_length: Some(1.1),
+            max_rounds: 2,
+            split_only: true,
+        };
+        let mut tx = mesh.begin_edit();
+        let r = remesh(&mut tx, &live).unwrap();
+        tx.rollback();
+        eprintln!("remesh_split_only_{name}: {r:?}");
+        group.bench_function(format!("remesh_split_only_{name}"), |b| {
+            b.iter(|| {
+                let mut tx = mesh.begin_edit();
+                black_box(remesh(&mut tx, &live).unwrap());
+                tx.rollback();
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_analyze,
@@ -375,6 +474,7 @@ criterion_group!(
     bench_fill,
     bench_weld,
     bench_components,
-    bench_icp
+    bench_icp,
+    bench_stretch
 );
 criterion_main!(benches);
