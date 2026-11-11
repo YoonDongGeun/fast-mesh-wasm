@@ -34,12 +34,17 @@
 //! and is exact to second order on a smooth surface:
 //! `(a + b) / 2 - (((b - a) . na) na + ((a - b) . nb) nb) / 8`. An endpoint's
 //! normal averages only the triangles around it that face like the edge's own
-//! (within 45 degrees), so a flat face stays flat next to a hard edge. A
-//! gentler crease reads as a curve and rounds off: a flat face beside one bulges
-//! by up to about 5% of its edge.
+//! (within [`StretchOptions::sharp_angle`], 45 degrees by default), so a flat
+//! face stays flat next to a hard edge. A gentler crease reads as a curve and
+//! rounds off: at the default, a flat face beside a 10, 30 or 44 degree crease
+//! bulges by 0.07, 0.20 or 0.28 on a 6.0 edge. Nothing local tells such a crease
+//! from a coarse curved surface, where a quad's diagonal has coplanar owners
+//! and tilted neighbours too, so the angle is the caller's: below a model's
+//! gentlest crease keeps its flat faces flat, and rounds a coarse curved surface
+//! less.
 //!
 //! An exact midpoint is used on a boundary or non-manifold edge, on a sharp
-//! edge (owners more than 45 degrees apart), and wherever the curved point
+//! edge (owners more than `sharp_angle` apart), and wherever the curved point
 //! would fold a child triangle. The boundary rule is what keeps a UV seam
 //! closed: its two sides are separate vertices at one position, and both must
 //! compute the same new point.
@@ -80,9 +85,8 @@ pub const REST_SIZE_CHANNEL: &str = "rest_edge_size";
 pub const DEFAULT_STRETCH_LIMIT: f32 = 4.0 / 3.0;
 /// Default for [`StretchOptions::max_splits`].
 pub const DEFAULT_MAX_SPLITS: u32 = 1 << 20;
-/// Cosine of the angle (45 degrees) past which two faces count as separated
-/// by a sharp edge.
-const SHARP_COS: f64 = std::f64::consts::FRAC_1_SQRT_2;
+/// Default for [`StretchOptions::sharp_angle`], in degrees.
+pub const DEFAULT_SHARP_ANGLE: f32 = 45.0;
 
 /// Options for [`split_stretched`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,6 +105,12 @@ pub struct StretchOptions {
     /// New interior vertices follow the surface's curvature. `false` puts
     /// every new vertex at its edge's midpoint.
     pub smooth: bool,
+    /// With `smooth`, the angle in degrees past which two faces count as
+    /// separated by a crease: a new vertex there sits at the edge's midpoint,
+    /// and the faces beyond it do not tilt a curved point's normals. Lower keeps
+    /// gentler creases sharp and their flat faces flat, and rounds a coarse
+    /// curved surface less; see the module docs. Must be in `(0, 180]`.
+    pub sharp_angle: f32,
 }
 
 impl Default for StretchOptions {
@@ -110,6 +120,7 @@ impl Default for StretchOptions {
             limit: DEFAULT_STRETCH_LIMIT,
             max_splits: DEFAULT_MAX_SPLITS,
             smooth: true,
+            sharp_angle: DEFAULT_SHARP_ANGLE,
         }
     }
 }
@@ -235,6 +246,11 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
             "stretch limit must be finite and above 1",
         ));
     }
+    if !(options.sharp_angle > 0.0 && options.sharp_angle <= 180.0) {
+        return Err(OpsError::InvalidInput(
+            "stretch sharp angle must be above 0 and at most 180 degrees",
+        ));
+    }
     let mesh = tx.mesh();
     let Some(sizes) = mesh.channel(REST_SIZE_CHANNEL) else {
         return Err(OpsError::InvalidInput(
@@ -248,6 +264,7 @@ pub fn split_stretched(tx: &mut Transaction, options: &StretchOptions) -> Result
         slots: mesh.vertex_slots(),
         sizes,
         limit: f64::from(options.limit),
+        sharp_cos: sharp_cos(options.sharp_angle),
         new_sizes: Vec::new(),
         edges: Vec::new(),
         added: Vec::new(),
@@ -412,6 +429,8 @@ struct Work<'a> {
     slots: usize,
     sizes: &'a [f32],
     limit: f64,
+    /// The cosine of [`StretchOptions::sharp_angle`].
+    sharp_cos: f64,
     new_sizes: Vec<f32>,
     /// The edge each entry of `added` split.
     edges: Vec<(u32, u32)>,
@@ -587,7 +606,7 @@ impl Work<'_> {
             }
             let n = self.normal(c);
             let Some(direction) = unit(n) else { continue };
-            if dot3(direction, facing) >= SHARP_COS {
+            if dot3(direction, facing) >= self.sharp_cos {
                 sum = [sum[0] + n[0], sum[1] + n[1], sum[2] + n[2]];
             }
         }
@@ -604,7 +623,7 @@ impl Work<'_> {
         let (Some(n0), Some(n1)) = (n0, n1) else {
             return mid;
         };
-        if dot3(n0, n1) < SHARP_COS {
+        if dot3(n0, n1) < self.sharp_cos {
             return mid;
         }
         let Some(facing) = unit([n0[0] + n1[0], n0[1] + n1[1], n0[2] + n1[2]]) else {
@@ -748,6 +767,16 @@ impl Plan {
         tx.set_triangles(&set_ids, &set_tris)?;
         tx.add_triangles(&new_tris)?;
         Ok(ids)
+    }
+}
+
+/// The cosine of `degrees`; 45 gives exactly `1 / sqrt(2)`, the threshold this
+/// had before it was an option.
+fn sharp_cos(degrees: f32) -> f64 {
+    if degrees == DEFAULT_SHARP_ANGLE {
+        std::f64::consts::FRAC_1_SQRT_2
+    } else {
+        f64::from(degrees).to_radians().cos()
     }
 }
 

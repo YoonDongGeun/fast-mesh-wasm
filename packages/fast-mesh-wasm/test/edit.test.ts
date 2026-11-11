@@ -901,6 +901,52 @@ describe("analyze and repair", () => {
     expect(s.repair(m, { op: "splitStretched", center, radius: 100 }).splits).toBe(0);
   });
 
+  it("splitStretched_sharpAngle_keeps_a_gentle_crease_and_its_flat_face", () => {
+    // A 12 x 12 plate of 3.0 cells, bent 30 degrees up along x = 6; then scaled by 2.
+    const plate = (sharpAngle: number | undefined) => {
+      const n = 4;
+      const [sin, cos] = [Math.sin(Math.PI / 6), Math.cos(Math.PI / 6)];
+      const pos: number[] = [];
+      const tris: number[] = [];
+      for (let y = 0; y <= n; y++) {
+        for (let x = 0; x <= n; x++) {
+          const [px, py] = [3 * x, 3 * y];
+          pos.push(...(px <= 6 ? [px, py, 0] : [6 + (px - 6) * cos, py, (px - 6) * sin]));
+        }
+      }
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          const a = y * (n + 1) + x;
+          tris.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+        }
+      }
+      const s = scene();
+      const m = s.addMesh(Float32Array.from(pos), Uint32Array.from(tris));
+      s.repair(m, { op: "captureRestSizes" });
+      const slots = pos.length / 3;
+      s.edit(m, [{ op: "setPositions", vertices: Uint32Array.from({ length: slots }, (_, i) => i), positions: Float64Array.from(pos, (v) => 2 * v) }]);
+      const r = s.repair(m, { op: "splitStretched", center: [12, 12, 0], radius: 100, sharpAngle });
+      expect(r.splits).toBeGreaterThan(0);
+      // Local positions are relative to the mesh's origin.
+      const p = s.views(m).positions();
+      const o = s.origin(m);
+      let bulge = 0;
+      for (let v = slots; v < p.length / 3; v++) {
+        if (p[3 * v] + o[0] < 12 - 1e-3) {
+          bulge = Math.max(bulge, Math.abs(p[3 * v + 2] + o[2]));
+        }
+      }
+      return { s, m, bulge };
+    };
+    expect(plate(undefined).bulge).toBeGreaterThan(0.05);
+    expect(plate(15).bulge).toBeLessThan(6e-3);
+    const { s, m } = plate(undefined);
+    for (const sharpAngle of [0, -1, 181, Number.POSITIVE_INFINITY]) {
+      expect(() => s.repair(m, { op: "splitStretched", center: [0, 0, 0], radius: 100, sharpAngle })).toThrow();
+    }
+    expect(() => s.repair(m, { op: "splitStretched", center: [0, 0, 0], radius: 100, sharpAngle: Number.NaN })).toThrow(/sharpAngle/);
+  });
+
   it("splitStretched_needs_new_rest_sizes_after_an_edit_outdates_them", () => {
     const n = 20;
     const pos: number[] = [];
