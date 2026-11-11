@@ -102,14 +102,14 @@ function addMeshReq(id: ClientId, mesh: { positions: Float64Array; indices: Uint
   };
 }
 
-function moveReq(k: number): Request {
+function moveReq(k: number, at: (k: number) => Vec3 = pose): Request {
   return {
     kind: "drag",
     rev: rev(),
     id: 1,
     phase: "move",
     rotation: IDENTITY,
-    translation: pose(k),
+    translation: at(k),
     key: "placement:1",
   };
 }
@@ -585,6 +585,15 @@ function colorMirror(start: Uint8Array) {
   };
 }
 
+/**
+ * The `k`th pose of a storm: distinct for each `k`, and never far. A storm runs to
+ * thousands of moves, and `pose` runs off with `k`: out of `MAX_DISTANCE` of the
+ * target every colour is the same, so the final pose would change none.
+ */
+function stormPose(k: number): Vec3 {
+  return [0.3 * Math.sin(0.9 * k), 0.3 * Math.cos(0.7 * k), 0.1 * Math.sin(0.4 * k)];
+}
+
 describe("starvation guard", () => {
   it("starvation_guard_publishes_during_storm", async () => {
     const GUARD = 15;
@@ -597,21 +606,25 @@ describe("starvation guard", () => {
     const chunksBefore = h.chunks.length;
 
     // A move on every step, in its own batch, for a while: a storm that
-    // never lets a unit finish within the guard.
+    // never lets a unit finish within the guard. At most one move waits behind
+    // the batch that is running: a backlog would make every move superseded
+    // by the next, so no unit would open. That happens when the first unit
+    // outlasts the guard, as on a cold engine.
     let k = 1;
     let pending = false;
     const until = performance.now() + 250;
     h.onStep = () => {
-      if (!pending && performance.now() < until) {
+      const waiting = k - (h.results.length - first);
+      if (!pending && waiting <= 1 && performance.now() < until) {
         pending = true;
-        const next = moveReq(++k);
+        const next = moveReq(++k, stormPose);
         queueMicrotask(() => {
           pending = false;
           h.send([next]);
         });
       }
     };
-    h.send([moveReq(1)]);
+    h.send([moveReq(1, stormPose)]);
     // The moves stop; the last pose completes.
     while (performance.now() < until || pending) {
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -636,8 +649,8 @@ describe("starvation guard", () => {
     expect(published.length).toBeGreaterThan(1);
     // The final pose completes.
     expect(recolors(results[results.length - 1], 1)).toBe(true);
-    expect(published[published.length - 1]).toEqual(pose(k));
-    expect(await dumpColors(h, 1)).toEqual(referenceColors(pose(k)));
+    expect(published[published.length - 1]).toEqual(stormPose(k));
+    expect(await dumpColors(h, 1)).toEqual(referenceColors(stormPose(k)));
   });
 
   it("moves_within_guard_abandon", async () => {
