@@ -82,6 +82,7 @@ dependencies = [
  "fast-mesh-bvh",
  "fast-mesh-query",
  "fast-mesh-store",
+ "robust",
 ]
 
 [[package]]

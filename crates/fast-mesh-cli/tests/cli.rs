@@ -812,8 +812,9 @@ fn boolean_never_reports_a_wrong_result_as_success() {
     }
 }
 
-/// Two cubes sharing only an edge: their union really is non-manifold, so this
-/// stays a refusal whatever happens to the engine.
+/// Two cubes sharing only an edge: de-pinching splits the shared edge into
+/// distinct 2-manifold fans (#165), so their union is closed with volume 2 and
+/// their intersection is empty (which cannot be written as a mesh file).
 fn edge_touching_cubes(dir: &Dir) -> (PathBuf, PathBuf) {
     (
         dir.file("a.obj", &masked_cube_obj(0, [0.0; 3])),
@@ -822,36 +823,73 @@ fn edge_touching_cubes(dir: &Dir) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn boolean_refuses_a_non_manifold_result_without_output() {
-    let dir = Dir::new("boolean-non-manifold");
+fn edge_touching_cubes_union_is_manifold_and_empty_intersection_writes_nothing() {
+    let dir = Dir::new("boolean-edge-touch");
     let (a, b) = edge_touching_cubes(&dir);
     let output = dir.path("out.obj");
     for format in ["text", "json"] {
         let o = run(&args![
             "boolean", &a, &b, "--op", "union", "-o", &output, "--format", format
         ]);
-        assert_invalid_result_refusal(&o, "1 non-manifold edge");
+        assert_eq!(code(&o), 0, "{format}: {}", stderr(&o));
+        let json = measure_json(&output);
+        assert_eq!(field(&json, "closed"), "true", "{format}: {json}");
+        assert_eq!(number(&json, "non_manifold_edges"), 0.0, "{format}: {json}");
+        assert_eq!(
+            number(&json, "orientation_conflicts"),
+            0.0,
+            "{format}: {json}"
+        );
+        assert!((number(&json, "volume") - 2.0).abs() < 1e-6, "{json}");
+        fs::remove_file(&output).unwrap();
+    }
+
+    for format in ["text", "json"] {
+        let o = run(&args![
+            "boolean",
+            &a,
+            &b,
+            "--op",
+            "intersection",
+            "-o",
+            &output,
+            "--format",
+            format
+        ]);
+        assert_eq!(code(&o), 1, "{format}: {}", stderr(&o));
+        assert_eq!(stdout(&o), "", "stdout holds nothing on failure");
+        assert!(stderr(&o).contains("no triangles"), "{}", stderr(&o));
         assert_eq!(dir.names(), ["a.obj", "b.obj"], "{format}");
     }
 }
 
 #[test]
-fn an_invalid_boolean_result_leaves_an_existing_output_alone() {
+fn a_failed_boolean_leaves_an_existing_output_alone() {
     let dir = Dir::new("boolean-keeps-output");
     let (a, b) = edge_touching_cubes(&dir);
     let out = dir.file("out.obj", b"previous contents");
     let before = fs::read(&a).unwrap();
     for extra in [None, Some("--force")] {
-        let mut args = args!["boolean", &a, &b, "--op", "union", "-o", &out].to_vec();
+        let mut args = args!["boolean", &a, &b, "--op", "intersection", "-o", &out].to_vec();
         args.extend(extra.map(OsString::from));
-        assert_invalid_result_refusal(&run(&args), "non-manifold");
+        let o = run(&args);
+        assert_eq!(code(&o), 1, "{}", stderr(&o));
+        assert_eq!(stdout(&o), "", "stdout holds nothing on failure");
         assert_eq!(fs::read(&out).unwrap(), b"previous contents");
     }
     // Not even when `--force` lets the output name an input.
     let o = run(&args![
-        "boolean", &a, &b, "--op", "union", "-o", &a, "--force"
+        "boolean",
+        &a,
+        &b,
+        "--op",
+        "intersection",
+        "-o",
+        &a,
+        "--force"
     ]);
-    assert_invalid_result_refusal(&o, "non-manifold");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert_eq!(stdout(&o), "", "stdout holds nothing on failure");
     assert_eq!(fs::read(&a).unwrap(), before);
     assert_eq!(dir.names(), ["a.obj", "b.obj", "out.obj"]);
 }
