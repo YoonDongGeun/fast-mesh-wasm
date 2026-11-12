@@ -44,7 +44,8 @@
 //! - `7` remesh: `cx, cy, cz, radius, target_length (NaN for the mesh mean),
 //!   max_rounds (NaN for the default), split_only (0 or 1)`.
 //! - `16` split stretched: `cx, cy, cz, radius, limit (NaN for the default),
-//!   max_splits (NaN for the default), smooth (0 or 1)`; see
+//!   max_splits (NaN for the default), smooth (0 or 1), sharp_angle in degrees
+//!   (NaN for the default)`; see
 //!   [`fast_mesh_ops::stretch`].
 //! - `17` capture rest sizes: `only_if_missing (0 or 1)`. Must be the only
 //!   operation of its list, because it is not an edit.
@@ -704,8 +705,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             }
             RepairOp::Auto(o)
         } else if code == 16.0 {
-            let [cx, cy, cz, radius, limit, max_splits, smooth]: [f64; 7] =
-                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [cx, cy, cz, radius, limit, max_splits, smooth, sharp_angle]: [f64; 8] =
+                words.take(8)?.try_into().map_err(|_| malformed(WHAT))?;
             let mut o = StretchOptions {
                 region: Region {
                     center: [cx as f32, cy as f32, cz as f32],
@@ -719,6 +720,10 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             }
             if let Some(max_splits) = count_opt(max_splits, "maxSplits")? {
                 o.max_splits = u32::try_from(max_splits).unwrap_or(u32::MAX);
+            }
+            if !sharp_angle.is_nan() {
+                // Out of range (an infinity too) fails in `split_stretched`.
+                o.sharp_angle = sharp_angle as f32;
             }
             RepairOp::SplitStretched(o)
         } else if code == 17.0 {
@@ -1252,19 +1257,20 @@ mod tests {
             radius: 4.0,
         };
         assert_eq!(
-            decode_repair(&[16., 1., 2., 3., 4., nan, nan, 1.], &[]).unwrap(),
+            decode_repair(&[16., 1., 2., 3., 4., nan, nan, 1., nan], &[]).unwrap(),
             vec![RepairOp::SplitStretched(StretchOptions {
                 region,
                 ..StretchOptions::default()
             })]
         );
         assert_eq!(
-            decode_repair(&[16., 1., 2., 3., 4., 2., 7., 0.], &[]).unwrap(),
+            decode_repair(&[16., 1., 2., 3., 4., 2., 7., 0., 20.], &[]).unwrap(),
             vec![RepairOp::SplitStretched(StretchOptions {
                 region,
                 limit: 2.0,
                 max_splits: 7,
                 smooth: false,
+                sharp_angle: 20.0,
             })]
         );
         assert_eq!(

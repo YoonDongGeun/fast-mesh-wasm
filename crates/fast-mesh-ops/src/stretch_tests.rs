@@ -605,6 +605,16 @@ fn it_needs_a_capture_and_valid_options() {
             Err(OpsError::InvalidInput(_))
         ));
     }
+    for sharp_angle in [0.0, -10.0, 180.5, f32::NAN, f32::INFINITY] {
+        let bad = StretchOptions { sharp_angle, ..ok };
+        assert!(matches!(
+            run(&mut mesh, bad),
+            Err(OpsError::InvalidInput(_))
+        ));
+    }
+    for sharp_angle in [0.5, 180.0] {
+        assert!(run(&mut mesh, StretchOptions { sharp_angle, ..ok }).is_ok());
+    }
     let bad = StretchOptions {
         region: Region {
             center: [f32::NAN; 3],
@@ -958,11 +968,30 @@ fn creased_plate(bend: f32) -> Mesh {
 
 /// The farthest a new vertex on the flat side leaves its plane, stretched by 2.
 fn flat_side_bulge(bend: f32) -> f64 {
+    flat_side_bulge_at(bend, DEFAULT_SHARP_ANGLE)
+}
+
+/// [`flat_side_bulge`] with creases past `sharp_angle` degrees kept sharp.
+fn flat_side_bulge_at(bend: f32, sharp_angle: f32) -> f64 {
     let mut mesh = creased_plate(bend);
     capture_rest_sizes(&mut mesh).unwrap();
     let slots = mesh.vertex_slots();
     edit(&mut mesh, |tx| scale_all(tx, 2.0));
-    assert!(pass(&mut mesh, all()).splits > 0);
+    let report = {
+        let mut tx = mesh.begin_edit();
+        let r = split_stretched(
+            &mut tx,
+            &StretchOptions {
+                region: all(),
+                sharp_angle,
+                ..StretchOptions::default()
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        r
+    };
+    assert!(report.splits > 0);
     (slots..mesh.vertex_slots())
         .map(|v| mesh.positions()[v])
         .filter(|p| p[0] < 12.0 - 1e-3)
@@ -976,4 +1005,44 @@ fn a_flat_face_stays_flat_beside_a_crease() {
         let bulge = flat_side_bulge(bend);
         assert!(bulge < 1e-4, "{bulge} beside a {bend} degree crease");
     }
+}
+
+#[test]
+fn a_lower_sharp_angle_keeps_a_gentle_crease_and_its_flat_face() {
+    // The plate's cells are 3.0 before the stretch, 6.0 after.
+    for bend in [10.0, 30.0, 44.0] {
+        let rounded = flat_side_bulge(bend);
+        let kept = flat_side_bulge_at(bend, bend / 2.0);
+        assert!(
+            rounded > 0.05,
+            "the default rounds a {bend} degree crease: {rounded}"
+        );
+        assert!(
+            kept < 1e-3 * 6.0,
+            "{kept} beside a {bend} degree crease kept sharp"
+        );
+    }
+}
+
+#[test]
+fn the_default_sharp_angle_is_the_old_fixed_one() {
+    let mut a = creased_plate(30.0);
+    let mut b = creased_plate(30.0);
+    for mesh in [&mut a, &mut b] {
+        capture_rest_sizes(mesh).unwrap();
+        edit(mesh, |tx| scale_all(tx, 2.0));
+    }
+    assert!(pass(&mut a, all()).splits > 0);
+    let mut tx = b.begin_edit();
+    split_stretched(
+        &mut tx,
+        &StretchOptions {
+            region: all(),
+            sharp_angle: 45.0,
+            ..StretchOptions::default()
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(mesh_positions_equal(&a, &b));
 }

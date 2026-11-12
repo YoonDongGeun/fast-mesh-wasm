@@ -679,6 +679,16 @@ export type RepairOp =
       maxSplits?: number;
       /** New interior vertices follow the surface's curvature; `false` uses midpoints. Unset means `true`. */
       smooth?: boolean;
+      /**
+       * With `smooth`, the angle in degrees past which two faces count as
+       * separated by a crease, in `(0, 180]`; unset means 45. A new vertex on
+       * such an edge sits at its midpoint, and faces beyond it do not tilt a
+       * curved point. A gentler crease rounds off, and a flat face beside it
+       * bulges: at 45, 0.20 beside a 30 degree crease on a 6.0 edge. Set it below
+       * a model's gentlest crease to keep that crease's flat faces flat; a coarse
+       * curved surface then rounds less.
+       */
+      sharpAngle?: number;
     }
   | {
       op: "bridgeLoops";
@@ -1581,6 +1591,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.limit, "limit"),
           optional(o.maxSplits, "maxSplits"),
           flagOf(o.smooth, true),
+          optional(o.sharpAngle, "sharpAngle"),
         );
         break;
       case "captureRestSizes":
