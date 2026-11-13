@@ -55,7 +55,9 @@
 //!   dx, dy, dz`.
 //! - `10` relax: like `6` smooth, but plain Laplacian passes instead of
 //!   Taubin λ/μ cycles.
-//! - `11` offset: `distance`.
+//! - `11` offset: `distance, algorithm (0 normal, 1 fhEdt, 2 bvhSdf; NaN for
+//!   the default), voxel_size (NaN for automatic), max_voxels (NaN for the
+//!   default)`.
 //! - `12` shell: `thickness`.
 //! - `13` simplify: `target_triangles, preserve_boundary (0 or 1)`.
 //! - `14` subdivide: `method (0 loop, NaN for the default), levels (NaN
@@ -91,7 +93,9 @@
 //! - bridge loops: `triangles_added`.
 //! - grab: `moved, max_displacement`.
 //! - relax: `moved, max_displacement`.
-//! - offset: `moved, max_displacement, degenerate_removed, vertices_removed`.
+//! - offset: `moved, max_displacement, degenerate_removed, vertices_removed,
+//!   vertices_added, triangles_added, triangles_removed, voxel_size,
+//!   uvs_dropped`.
 //! - shell: `vertices_added, triangles_added, loops_closed, degenerate_removed,
 //!   vertices_removed`.
 //! - simplify: `collapsed, triangles_removed, vertices_removed`.
@@ -113,8 +117,8 @@ use fast_mesh_ops::stretch::StretchOptions;
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
     Analysis, AutoRepairOptions, AutoRepairStage, ComponentOptions, DegenerateOptions, FailReason,
-    FairWeights, FillOptions, FillReport, LoopId, OffsetOptions, OpsError, ShellOptions,
-    SkipReason,
+    FairWeights, FillOptions, FillReport, LoopId, OffsetAlgorithm, OffsetOptions, OpsError,
+    ShellOptions, SkipReason,
 };
 use fast_mesh_store::{StoreError, Transaction, UV_CHANNEL};
 
@@ -417,7 +421,7 @@ pub(crate) enum RepairOp {
     Remesh(RemeshOptions),
     Bridge(BridgeOptions),
     Grab(GrabOptions),
-    Offset(f32),
+    Offset(OffsetOptions),
     Shell(f32),
     Simplify(SimplifyOptions),
     Subdivide(SubdivideOptions),
@@ -649,7 +653,48 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 direction: [dx as f32, dy as f32, dz as f32],
             })
         } else if code == 11.0 {
-            RepairOp::Offset(words.next()? as f32)
+            let [distance, alg, voxel_size, max_voxels]: [f64; 4] =
+                words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
+            let voxel_size = if voxel_size.is_nan() {
+                None
+            } else if voxel_size.is_finite() && voxel_size > 0.0 {
+                let h = voxel_size as f32;
+                if !h.is_finite() || h <= 0.0 {
+                    return Err(Error::invalid("voxelSize must be positive and finite"));
+                }
+                Some(h)
+            } else {
+                return Err(Error::invalid("voxelSize must be positive and finite"));
+            };
+            // Reject values past JS `Number.MAX_SAFE_INTEGER` (2^53 - 1); on
+            // wasm32 `count_opt`'s `v as usize` saturates safely at `usize::MAX`
+            // (`u32::MAX`) without wrapping.
+            if !max_voxels.is_nan() && max_voxels > 9_007_199_254_740_991.0 {
+                return Err(Error::invalid("maxVoxels is too large"));
+            }
+            let max_voxels = match count_opt(max_voxels, "maxVoxels")? {
+                None => OffsetOptions::default().max_voxels,
+                Some(n) if n < 64 => {
+                    return Err(Error::invalid("maxVoxels must be at least 64"));
+                }
+                Some(n) => n,
+            };
+            let algorithm = if alg.is_nan() || alg == 0.0 {
+                OffsetAlgorithm::Normal
+            } else if alg == 1.0 {
+                OffsetAlgorithm::FhEdt { voxel_size }
+            } else if alg == 2.0 {
+                OffsetAlgorithm::BvhSdf { voxel_size }
+            } else {
+                return Err(Error::invalid(
+                    "algorithm must be 0 (normal), 1 (fhEdt) or 2 (bvhSdf)",
+                ));
+            };
+            RepairOp::Offset(OffsetOptions {
+                distance: distance as f32,
+                algorithm,
+                max_voxels,
+            })
         } else if code == 12.0 {
             RepairOp::Shell(words.next()? as f32)
         } else if code == 13.0 {
@@ -941,13 +986,8 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                 let r = fast_mesh_ops::deform::grab(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
-            RepairOp::Offset(distance) => {
-                let r = fast_mesh_ops::offset(
-                    tx,
-                    &OffsetOptions {
-                        distance: *distance,
-                    },
-                )?;
+            RepairOp::Offset(o) => {
+                let r = fast_mesh_ops::offset(tx, o)?;
                 put(
                     &mut out,
                     &[
@@ -955,6 +995,11 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                         f64::from(r.max_displacement),
                         count(r.degenerate_removed),
                         count(r.vertices_removed),
+                        count(r.vertices_added),
+                        count(r.triangles_added),
+                        count(r.triangles_removed),
+                        f64::from(r.voxel_size),
+                        f64::from(u8::from(r.uvs_dropped)),
                     ],
                 )?;
             }
@@ -1463,17 +1508,161 @@ mod tests {
 
     #[test]
     fn decode_repair_offset_shell() {
-        let d = decode_repair(&[11., 0.5], &[]).unwrap();
-        assert_eq!(d, vec![RepairOp::Offset(0.5)]);
+        let nan = f64::NAN;
+        let d = decode_repair(&[11., 0.5, nan, nan, nan], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Offset(OffsetOptions {
+                distance: 0.5,
+                algorithm: OffsetAlgorithm::Normal,
+                max_voxels: OffsetOptions::default().max_voxels,
+            })]
+        );
+        let d = decode_repair(&[11., -2., 0., 0.25, 1024.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Offset(OffsetOptions {
+                distance: -2.0,
+                algorithm: OffsetAlgorithm::Normal,
+                max_voxels: 1024,
+            })]
+        );
+        let d = decode_repair(&[11., 0.25, 1., 0.125, 4096.], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Offset(OffsetOptions {
+                distance: 0.25,
+                algorithm: OffsetAlgorithm::FhEdt {
+                    voxel_size: Some(0.125)
+                },
+                max_voxels: 4096,
+            })]
+        );
+        let d = decode_repair(&[11., 0.0, 2., nan, nan], &[]).unwrap();
+        assert_eq!(
+            d,
+            vec![RepairOp::Offset(OffsetOptions {
+                distance: 0.0,
+                algorithm: OffsetAlgorithm::BvhSdf { voxel_size: None },
+                max_voxels: OffsetOptions::default().max_voxels,
+            })]
+        );
         let d = decode_repair(&[12., 0.25], &[]).unwrap();
         assert_eq!(d, vec![RepairOp::Shell(0.25)]);
-        // The values ride through as f32; range checks belong to the ops.
-        let d = decode_repair(&[11., -2.], &[]).unwrap();
-        assert_eq!(d, vec![RepairOp::Offset(-2.0)]);
+
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
         assert_eq!(code(&[11.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[11., 0.5, nan, nan, nan, 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        // Invalid algorithm codes.
+        assert_eq!(code(&[11., 0.5, 3., nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, -1., nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1.5, nan, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[11., 0.5, f64::INFINITY, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        // Invalid voxel_size values.
+        assert_eq!(code(&[11., 0.5, 1., 0.0, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1., -1.0, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[11., 0.5, 1., f64::INFINITY, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(code(&[11., 0.5, 1., 1e-46, nan]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1., 1e300, nan]), codes::INVALID_ARGUMENT);
+        // Invalid max_voxels values.
+        assert_eq!(code(&[11., 0.5, 1., nan, 16.0]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1., nan, 63.0]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1., nan, -1.0]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[11., 0.5, 1., nan, 64.5]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[11., 0.5, 1., nan, f64::INFINITY]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(code(&[11., 0.5, 1., nan, 1e20]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[12.]), codes::INVALID_ARGUMENT);
-        assert_eq!(code(&[11., 0.5, 1.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn run_repair_offset_reports_nine_words() {
+        use fast_mesh_store::Mesh;
+
+        let unit_cube = |with_uvs: bool| {
+            let positions = [
+                0.0f32, 0.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                1.0, 1.0, 0.0, //
+                0.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, //
+                1.0, 0.0, 1.0, //
+                1.0, 1.0, 1.0, //
+                0.0, 1.0, 1.0,
+            ];
+            let indices = [
+                0u32, 2, 1, 0, 3, 2, //
+                4, 5, 6, 4, 6, 7, //
+                0, 1, 5, 0, 5, 4, //
+                2, 3, 7, 2, 7, 6, //
+                1, 2, 6, 1, 6, 5, //
+                3, 0, 4, 3, 4, 7,
+            ];
+            let mut m = Mesh::from_buffers(&positions, &indices).unwrap();
+            if with_uvs {
+                m.add_uvs(&[0.0f32; 16]).unwrap();
+            }
+            m
+        };
+
+        let nan = f64::NAN;
+        // Normal offset: 9 words, zero volumetric counts, uvs_dropped = 0.
+        let mut m = unit_cube(true);
+        let ops = decode_repair(&[11., 0.25, nan, nan, nan], &[]).unwrap();
+        let mut tx = m.begin_edit();
+        let out = run_repair(&mut tx, &ops).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(out.len(), 9);
+        assert_eq!(out[0], 8.0); // moved
+        assert!((out[1] - 0.25).abs() < 1e-5); // max_displacement
+        assert_eq!(out[2], 0.0); // degenerate_removed
+        assert_eq!(out[3], 0.0); // vertices_removed
+        assert_eq!(out[4], 0.0); // vertices_added
+        assert_eq!(out[5], 0.0); // triangles_added
+        assert_eq!(out[6], 0.0); // triangles_removed
+        assert_eq!(out[7], 0.0); // voxel_size
+        assert_eq!(out[8], 0.0); // uvs_dropped
+        assert!(m.uvs().is_some());
+
+        // FhEdt offset on plain cube: 9 words, positive volumetric counts, uvs_dropped = 0.
+        let mut m = unit_cube(false);
+        let ops = decode_repair(&[11., 0.1, 1., 0.2, 64_000.], &[]).unwrap();
+        let mut tx = m.begin_edit();
+        let out = run_repair(&mut tx, &ops).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(out.len(), 9);
+        assert!(out[4] > 0.0); // vertices_added
+        assert!(out[5] > 0.0); // triangles_added
+        assert_eq!(out[6], 12.0); // triangles_removed
+        assert!((out[7] - 0.2).abs() < 1e-6); // voxel_size
+        assert_eq!(out[8], 0.0); // uvs_dropped
+
+        // BvhSdf offset on textured cube: drops UV_CHANNEL and reports uvs_dropped = 1.
+        let mut m = unit_cube(true);
+        let ops = decode_repair(&[11., 0.1, 2., 0.2, 64_000.], &[]).unwrap();
+        let mut tx = m.begin_edit();
+        let out = run_repair(&mut tx, &ops).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(out.len(), 9);
+        assert!(out[4] > 0.0); // vertices_added
+        assert!(out[5] > 0.0); // triangles_added
+        assert_eq!(out[6], 12.0); // triangles_removed
+        assert!((out[7] - 0.2).abs() < 1e-6); // voxel_size
+        assert_eq!(out[8], 1.0); // uvs_dropped
+        assert!(m.uvs().is_none());
     }
 
     #[test]

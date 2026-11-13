@@ -62,6 +62,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-mesh-fields"
+version = "0.1.0"
+dependencies = [
+ "fast-mesh-bvh",
+ "fast-mesh-query",
+ "fast-mesh-store",
+ "robust",
+]
+
+[[package]]
 name = "fast-mesh-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -80,6 +90,7 @@ version = "0.1.0"
 dependencies = [
  "fast-mesh",
  "fast-mesh-bvh",
+ "fast-mesh-fields",
  "fast-mesh-query",
  "fast-mesh-store",
 ]

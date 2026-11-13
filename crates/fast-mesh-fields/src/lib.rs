@@ -31,8 +31,10 @@
 mod color;
 mod curvature;
 mod distance;
+mod edt;
 mod error;
 mod geom;
+mod grid;
 mod multi;
 mod sign;
 #[cfg(test)]
@@ -43,7 +45,12 @@ mod winding;
 pub use color::{ColorRule, Colormap, OutOfRange, color_of};
 pub use curvature::curvatures;
 pub use distance::signed_distances;
+pub use edt::{edt_3d_mask, edt_3d_sq, fh_signed_grid, fh_unsigned_grid};
 pub use error::{FieldsError, Result};
+pub use grid::{
+    DEFAULT_AUTO_GRID_RES, DEFAULT_MAX_VOXELS, GridSpec, ScalarGrid, bvh_signed_grid,
+    bvh_unsigned_grid,
+};
 pub use multi::{Target, signed_distances_multi};
 pub use sign::{SignBuild, SignData, SignMode, SignStatus};
 pub use thickness::thicknesses;

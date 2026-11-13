@@ -74,6 +74,7 @@ mod fair;
 mod fill;
 mod fill_dp;
 pub mod icp;
+pub mod marching_cubes;
 mod measure;
 mod offset;
 mod orient;
@@ -110,10 +111,11 @@ pub use fill::{
     fill_holes,
 };
 pub use icp::{IcpMotion, IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
+pub use marching_cubes::{IsoMesh, marching_cubes, marching_cubes_raw};
 pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
 pub use offset::{
-    OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions, ShellOptionsBuilder,
-    ShellReport, offset, shell,
+    OffsetAlgorithm, OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions,
+    ShellOptionsBuilder, ShellReport, offset, offset_with_bvh, shell,
 };
 pub use orient::{OrientReport, orient};
 pub use protect::{check_protection, with_protection};
