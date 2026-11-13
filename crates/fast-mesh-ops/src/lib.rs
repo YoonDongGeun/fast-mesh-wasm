@@ -80,6 +80,7 @@ mod orient;
 pub mod protect;
 mod refine;
 pub mod remesh;
+pub mod sculpt;
 pub mod simplify;
 mod sparse;
 pub mod stretch;
@@ -103,7 +104,13 @@ pub use cleanup::{
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
 pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
-pub use deform::{Brush, Falloff, InflateOptions, InflateOptionsBuilder, InflateReport, inflate};
+pub use sculpt::{
+    Brush, Falloff, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions, InflateOptionsBuilder,
+    InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod, SmoothOptions,
+    SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry, TAUBIN_LAMBDA,
+    TAUBIN_MU, capture_stroke_state, ensure_stroke_state, inflate, inflate_region,
+    inflate_region_with_stroke, smooth, smooth_region,
+};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,

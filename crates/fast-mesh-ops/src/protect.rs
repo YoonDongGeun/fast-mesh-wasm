@@ -159,7 +159,13 @@ mod tests {
     #[test]
     fn inflate_moves_only_free_vertices() {
         holds(|tx| {
-            deform::inflate(tx, &InflateOptions { brush: brush() })?;
+            deform::inflate(
+                tx,
+                &InflateOptions {
+                    brush: brush(),
+                    ..Default::default()
+                },
+            )?;
             Ok(())
         });
     }
@@ -232,7 +238,13 @@ mod tests {
             };
             let mut tx = mesh.begin_edit();
             with_protection(&mut tx, &ids, &weights, |tx| {
-                deform::inflate(tx, &InflateOptions { brush: brush() })
+                deform::inflate(
+                    tx,
+                    &InflateOptions {
+                        brush: brush(),
+                        ..Default::default()
+                    },
+                )
             })
             .unwrap();
             tx.commit().unwrap();
@@ -253,7 +265,13 @@ mod tests {
         let before = mesh.positions().to_vec();
         let mut tx = mesh.begin_edit();
         with_protection(&mut tx, &held, &weights, |tx| {
-            deform::inflate(tx, &InflateOptions { brush: brush() })
+            deform::inflate(
+                tx,
+                &InflateOptions {
+                    brush: brush(),
+                    ..Default::default()
+                },
+            )
         })
         .unwrap();
         let patch = tx.commit().unwrap();
@@ -269,7 +287,13 @@ mod tests {
         let weights = vec![0.0; held.len()];
         let failures = sweep(mesh, |tx| {
             with_protection(tx, &held, &weights, |tx| {
-                deform::inflate(tx, &InflateOptions { brush: brush() })?;
+                deform::inflate(
+                    tx,
+                    &InflateOptions {
+                        brush: brush(),
+                        ..Default::default()
+                    },
+                )?;
                 Ok(())
             })
         });

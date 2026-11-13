@@ -580,7 +580,10 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
         assert_kept(&m, &before);
     };
     check(&|tx| {
-        let options = InflateOptions { brush: brush() };
+        let options = InflateOptions {
+            brush: brush(),
+            ..Default::default()
+        };
         inflate(tx, &options).map(|_| ())
     });
     check(&|tx| {
@@ -588,6 +591,7 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
             brush: brush(),
             cycles: 2,
             method: SmoothMethod::default(),
+            ..Default::default()
         };
         crate::deform::smooth(tx, &options).map(|_| ())
     });
@@ -647,13 +651,22 @@ fn brushes_open_a_bent_seam_unless_the_move_is_the_callers() {
         strength: 0.5,
     };
     let mut inflated = seam_with_bend(1.);
-    edit(&mut inflated, |tx| inflate(tx, &InflateOptions { brush }));
+    edit(&mut inflated, |tx| {
+        inflate(
+            tx,
+            &InflateOptions {
+                brush,
+                ..Default::default()
+            },
+        )
+    });
     assert!(seam_gap(&inflated) > 0.01, "{}", seam_gap(&inflated));
     for method in [SmoothMethod::Taubin, SmoothMethod::Laplacian] {
         let options = SmoothOptions {
             brush,
             cycles: 1,
             method,
+            ..Default::default()
         };
         let mut smoothed = seam_with_bend(1.);
         // Lopsided, so the two sides have different neighbours.

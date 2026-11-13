@@ -581,6 +581,7 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     falloff: falloff(fo)?,
                     strength: strength as f32,
                 },
+                ..Default::default()
             })
         } else if code == 6.0 || code == 10.0 {
             let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
@@ -605,6 +606,7 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 } else {
                     SmoothMethod::Taubin
                 },
+                ..Default::default()
             })
         } else if code == 7.0 {
             let [cx, cy, cz, radius, target, rounds, split]: [f64; 7] =
@@ -1156,6 +1158,7 @@ mod tests {
                 },
                 cycles: u32::MAX,
                 method: SmoothMethod::Taubin,
+                ..Default::default()
             })]
         );
     }
@@ -1176,6 +1179,7 @@ mod tests {
                 },
                 cycles: 2,
                 method: SmoothMethod::Laplacian,
+                ..Default::default()
             })]
         );
         // Code 6 keeps Taubin.

@@ -209,6 +209,7 @@ mod protected_tests {
                 falloff: Falloff::Smooth,
                 strength: 0.5,
             },
+            ..Default::default()
         });
         (scene, id, held, dab)
     }
@@ -319,11 +320,15 @@ mod tests {
         for k in 0..12 {
             let b = brush([6.0 + k as f32, 9.0, 0.5]);
             out.push(match k % 3 {
-                0 => Dab::Inflate(InflateOptions { brush: b }),
+                0 => Dab::Inflate(InflateOptions {
+                    brush: b,
+                    ..Default::default()
+                }),
                 1 => Dab::Smooth(SmoothOptions {
                     brush: b,
                     cycles: 2,
                     method: SmoothMethod::Laplacian,
+                    ..Default::default()
                 }),
                 _ => Dab::Grab(GrabOptions {
                     brush: b,
@@ -398,6 +403,7 @@ mod tests {
                 id,
                 &Dab::Inflate(InflateOptions {
                     brush: brush([12.0, 12.0, 0.0]),
+                    ..Default::default()
                 }),
             )
             .unwrap();
@@ -435,7 +441,13 @@ mod tests {
         let mut bad = brush([0.0; 3]);
         bad.radius = -1.0;
         assert!(matches!(
-            scene.dab(id, &Dab::Inflate(InflateOptions { brush: bad })),
+            scene.dab(
+                id,
+                &Dab::Inflate(InflateOptions {
+                    brush: bad,
+                    ..Default::default()
+                })
+            ),
             Err(SceneError::Ops(_))
         ));
     }
@@ -445,6 +457,7 @@ mod tests {
         let (mut scene, id) = scene_with(UpdateMode::Manual);
         let dab = Dab::Inflate(InflateOptions {
             brush: brush([12.0, 12.0, 0.0]),
+            ..Default::default()
         });
         scene.dab(id, &dab).unwrap();
         // The BVH is stale now: the next dab cannot use it, and must not fail.

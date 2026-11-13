@@ -8197,6 +8197,7 @@ mod tests {
                 falloff: fast_mesh_ops::Falloff::Smooth,
                 strength,
             },
+            ..Default::default()
         })
     }
 
