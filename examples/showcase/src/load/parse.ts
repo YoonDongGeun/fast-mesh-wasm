@@ -7,10 +7,11 @@ import { parseGltf, parseGltfAsync, type GltfParseOptions, type NamedMeshData } 
 import { parseObj } from "./obj";
 import { parsePly } from "./ply";
 import { parseStl } from "./stl";
+import { parse3mf } from "./threemf";
 import { checkMesh } from "./mesh-data";
 
 /** The extensions the app reads, for the file picker's `accept`. */
-export const MESH_EXTENSIONS = [".stl", ".obj", ".ply", ".gltf", ".glb", ".drc", ".dcm", ".dicom"];
+export const MESH_EXTENSIONS = [".stl", ".obj", ".ply", ".3mf", ".gltf", ".glb", ".drc", ".dcm", ".dicom"];
 
 /** @throws for an unknown extension or a file its parser rejects. */
 export function parseMeshFile(name: string, buffer: ArrayBuffer): MeshData {
@@ -22,6 +23,8 @@ export function parseMeshFile(name: string, buffer: ArrayBuffer): MeshData {
       return parseObj(buffer);
     case ".ply":
       return parsePly(buffer);
+    case ".3mf":
+      throw new Error(`${name}: 3MF archives parse asynchronously, parse it with parseMeshFilesAsync`);
     case ".gltf":
     case ".glb":
       // A glTF asset can hold several meshes: it needs the plural entry.
@@ -35,7 +38,7 @@ export function parseMeshFile(name: string, buffer: ArrayBuffer): MeshData {
       throw new Error(`${name}: DICOM loads as a series (drop the whole series, one file per slice)`);
     default:
       throw new Error(
-        `cannot read ${ext === "" ? "files without an extension" : `${ext} files`} (STL, OBJ, PLY, glTF/GLB, DRC or DICOM)`,
+        `cannot read ${ext === "" ? "files without an extension" : `${ext} files`} (STL, OBJ, PLY, 3MF, glTF/GLB, DRC or DICOM)`,
       );
   }
 }
@@ -56,10 +59,9 @@ export function parseMeshFiles(name: string, buffer: ArrayBuffer): NamedMeshData
 
 /**
  * Parses a mesh file like {@link parseMeshFiles}, and additionally decodes
- * `.drc` files and Draco-compressed (`KHR_draco_mesh_compression`) glTF
- * assets through the draco3d decoder, and resolves a `.gltf`/`.glb` asset's
- * external `.bin` buffers from `options.buffers`. Formats without Draco or
- * external buffers parse on the sync path.
+ * `.3mf` containers, `.drc` files, and Draco-compressed (`KHR_draco_mesh_compression`)
+ * glTF assets through the draco3d decoder, resolving `.gltf`/`.glb` external
+ * `.bin` buffers from `options.buffers`.
  *
  * @throws for an unknown extension or a file its parser rejects.
  */
@@ -69,6 +71,9 @@ export async function parseMeshFilesAsync(
   options?: GltfParseOptions,
 ): Promise<NamedMeshData[]> {
   const ext = /\.[^./\\]+$/.exec(name)?.[0].toLowerCase() ?? "";
+  if (ext === ".3mf") {
+    return parse3mf(name, buffer);
+  }
   if (ext === ".drc") {
     return [{ name, data: await parseDrc(buffer) }];
   }

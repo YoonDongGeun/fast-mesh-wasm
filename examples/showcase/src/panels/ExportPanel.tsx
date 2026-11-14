@@ -29,6 +29,7 @@ const MESH_FORMATS: { format: MeshExportFormat; label: string }[] = [
   { format: "stl", label: "STL" },
   { format: "obj", label: "OBJ" },
   { format: "ply", label: "PLY" },
+  { format: "3mf", label: "3MF" },
   { format: "gltf", label: "glTF" },
   { format: "glb", label: "GLB" },
 ];

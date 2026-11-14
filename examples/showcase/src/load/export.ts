@@ -3,10 +3,10 @@
 // scenes alike) and the `fast-mesh-wasm/io` encoders do the rest, so meshes
 // edited, repaired or colored in the session export as they are.
 import type { MeshHandle, SceneLike } from "fast-mesh-wasm";
-import { exportGLTF, exportOBJ, exportPLY, exportSTL } from "fast-mesh-wasm/io";
+import { export3MFSync, exportGLTF, exportOBJ, exportPLY, exportSTL } from "fast-mesh-wasm/io";
 
 /** The formats the showcase offers for download. */
-export type MeshExportFormat = "stl" | "obj" | "ply" | "gltf" | "glb";
+export type MeshExportFormat = "stl" | "obj" | "ply" | "3mf" | "gltf" | "glb";
 
 /** The file extension (and download MIME type) of each format. */
 export function exportFileInfo(format: MeshExportFormat): { extension: string; mime: string } {
@@ -17,6 +17,8 @@ export function exportFileInfo(format: MeshExportFormat): { extension: string; m
       return { extension: "obj", mime: "text/plain" };
     case "ply":
       return { extension: "ply", mime: "text/plain" };
+    case "3mf":
+      return { extension: "3mf", mime: "model/3mf" };
     case "gltf":
       return { extension: "gltf", mime: "model/gltf+json" };
     case "glb":
@@ -26,8 +28,8 @@ export function exportFileInfo(format: MeshExportFormat): { extension: string; m
 
 /**
  * Encodes one mesh. `name` seeds the format's internal name (`solid`, `o`,
- * glTF node); the bytes always hold world coordinates. Throws what the
- * encoders throw (unknown mesh, missing live triangles are left to them).
+ * glTF node, 3MF object); the bytes always hold world coordinates. Throws what
+ * the encoders throw (unknown mesh, missing live triangles are left to them).
  */
 export function exportMeshBytes(
   scene: SceneLike,
@@ -42,6 +44,8 @@ export function exportMeshBytes(
       return exportOBJ(scene, mesh, { name });
     case "ply":
       return exportPLY(scene, mesh);
+    case "3mf":
+      return export3MFSync(scene, mesh, { name });
     case "gltf":
       return exportGLTF(scene, mesh, { binary: false, name });
     case "glb":
