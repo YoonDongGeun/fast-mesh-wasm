@@ -16,8 +16,9 @@ use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions, grab};
 use fast_mesh_ops::remesh::{Region, RemeshOptions, remesh};
 use fast_mesh_ops::stretch::{StretchOptions, capture_rest_sizes, split_stretched};
 use fast_mesh_ops::{
-    AnalyzeOptions, ComponentOptions, FillOptions, IcpOptions, analyze, boundary_loops, fill_holes,
-    icp, orient, remove_small_components, sample_surface, weld,
+    AnalyzeOptions, BooleanOp, ComponentOptions, FillOptions, IcpOptions, analyze, apply_boolean,
+    boolean_plan, boundary_loops, fill_holes, icp, orient, remove_small_components, sample_surface,
+    weld,
 };
 use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
@@ -470,6 +471,77 @@ fn bench_stretch(c: &mut Criterion) {
     group.finish();
 }
 
+/// Closed outward-wound UV sphere of radius `r` (`2 * (stacks - 1) * slices` triangles).
+fn sphere(r: f32, stacks: u32, slices: u32) -> Mesh {
+    use std::f64::consts::PI;
+    let mut positions = Vec::with_capacity(((1 + (stacks - 1) * slices + 1) * 3) as usize);
+    positions.extend([0.0, 0.0, r]);
+    for i in 1..stacks {
+        let theta = PI * f64::from(i) / f64::from(stacks);
+        let (rs, rc) = (f64::from(r) * theta.sin(), f64::from(r) * theta.cos());
+        for j in 0..slices {
+            let phi = 2.0 * PI * f64::from(j) / f64::from(slices);
+            positions.extend([(rs * phi.cos()) as f32, (rs * phi.sin()) as f32, rc as f32]);
+        }
+    }
+    let south = (positions.len() / 3) as u32;
+    positions.extend([0.0, 0.0, -r]);
+
+    let ring = |i: u32, j: u32| 1 + (i - 1) * slices + j % slices;
+    let mut indices = Vec::with_capacity((2 * (stacks - 1) * slices * 3) as usize);
+    for j in 0..slices {
+        indices.extend([0, ring(1, j), ring(1, j + 1)]);
+        for i in 1..stacks - 1 {
+            let (a, b, c, d) = (
+                ring(i, j),
+                ring(i + 1, j),
+                ring(i + 1, j + 1),
+                ring(i, j + 1),
+            );
+            indices.extend([a, b, c, a, c, d]);
+        }
+        indices.extend([ring(stacks - 1, j), south, ring(stacks - 1, j + 1)]);
+    }
+    Mesh::from_buffers(&positions, &indices).unwrap()
+}
+
+fn bench_boolean(c: &mut Criterion) {
+    let mut a = sphere(1.0, N, N);
+    let b = sphere(1.0, N, N);
+    let bvh_a = Bvh::build(&a, &BuildOptions::default()).unwrap();
+    let bvh_b = Bvh::build(&b, &BuildOptions::default()).unwrap();
+    let xf = Rigid {
+        translation: [0.31, 0.17, 0.23],
+        ..Rigid::IDENTITY
+    };
+    let mut group = c.benchmark_group("ops boolean");
+    group.sample_size(10);
+    for (name, op) in [
+        ("boolean_1m_spheres_union", BooleanOp::Union),
+        ("boolean_1m_spheres_subtract", BooleanOp::Subtract),
+        ("boolean_1m_spheres_intersect", BooleanOp::Intersect),
+    ] {
+        let plan = boolean_plan(&a, &bvh_a, &b, &bvh_b, &xf, op).unwrap();
+        let mut tx = a.begin_edit();
+        let r = apply_boolean(&mut tx, &plan).unwrap();
+        tx.rollback();
+        eprintln!(
+            "{name}: {} + {} triangles; report: {r:?}",
+            a.triangle_count(),
+            b.triangle_count()
+        );
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let plan = boolean_plan(&a, &bvh_a, &b, &bvh_b, &xf, op).unwrap();
+                let mut tx = a.begin_edit();
+                black_box(apply_boolean(&mut tx, &plan).unwrap());
+                tx.rollback();
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_analyze,
@@ -478,6 +550,7 @@ criterion_group!(
     bench_weld,
     bench_components,
     bench_icp,
-    bench_stretch
+    bench_stretch,
+    bench_boolean
 );
 criterion_main!(benches);
