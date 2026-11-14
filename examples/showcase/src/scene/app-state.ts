@@ -54,7 +54,7 @@ export interface Item {
   importScale: ImportScale;
 }
 
-export type JobPhase = "reading" | "parsing" | "adding" | "done" | "error";
+export type JobPhase = "reading" | "parsing" | "decimating" | "adding" | "done" | "error";
 
 /** One file (or the demo set) being loaded. */
 export interface Job {
@@ -62,7 +62,7 @@ export interface Job {
   name: string;
   phase: JobPhase;
   message?: string;
-  /** Load progress, 0..1, while reading/parsing/adding (unset: indeterminate). */
+  /** Load progress, 0..1, while reading/parsing/decimating/adding (unset: indeterminate). */
   progress?: number;
   /** Post-load summary (triangles, time, decimation) shown on done jobs. */
   summary?: string;

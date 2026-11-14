@@ -8,6 +8,7 @@ import {
   BIG_FILE_DEFAULTS,
   BIG_WARN_TRIANGLES,
   bigFilePlan,
+  decimateStepTargets,
   decimateTargetFor,
   estimateMeshBytes,
   formatLoadMs,
@@ -56,6 +57,19 @@ describe("big-file plan", () => {
     expect(decimateTargetFor(1_000_000, 200_000)).toBe(200_000);
     expect(decimateTargetFor(200_000, 200_000)).toBeNull();
     expect(decimateTargetFor(10, 200_000)).toBeNull();
+  });
+
+  it("decimate_step_targets", () => {
+    const steps = decimateStepTargets(1_000_000, 200_000, 5);
+    expect(steps).toHaveLength(5);
+    expect(steps.at(-1)).toBe(200_000);
+    for (let i = 0; i < steps.length; i++) {
+      expect(steps[i]).toBeLessThan(i === 0 ? 1_000_000 : steps[i - 1]);
+    }
+    expect(decimateStepTargets(103, 100, 5)).toEqual([102, 101, 100]);
+    expect(decimateStepTargets(1_000, 200, 1)).toEqual([200]);
+    expect(decimateStepTargets(200, 200, 5)).toEqual([]);
+    expect(decimateStepTargets(50, 200, 5)).toEqual([]);
   });
 });
 
@@ -108,6 +122,8 @@ describe("app-state large-file jobs", () => {
     const app = new AppState();
     app.setJob({ id: 7, name: "big.stl", phase: "parsing", progress: 0.5 });
     expect(app.getSnapshot().jobs).toEqual([{ id: 7, name: "big.stl", phase: "parsing", progress: 0.5 }]);
+    app.setJob({ id: 7, name: "big.stl", phase: "decimating", progress: 0.8 });
+    expect(app.getSnapshot().jobs).toEqual([{ id: 7, name: "big.stl", phase: "decimating", progress: 0.8 }]);
     app.setJob({ id: 7, name: "big.stl", phase: "done", progress: 1, summary: "big.stl: 1.00 M in 2.3 s" });
     expect(app.getSnapshot().jobs[0]?.summary).toBe("big.stl: 1.00 M in 2.3 s");
   });

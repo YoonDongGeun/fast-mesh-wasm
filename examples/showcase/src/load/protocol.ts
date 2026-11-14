@@ -4,6 +4,11 @@ import type { Vec3 } from "./mesh-data";
 import type { PhantomKind } from "./phantom";
 import type { SampleKind } from "./vtkjs";
 
+export interface DecimateOnLoadOptions {
+  threshold: number;
+  target: number;
+}
+
 export type LoaderRequest =
   /**
    * Parse a file (read in the Worker: the page never touches its bytes).
@@ -12,19 +17,26 @@ export type LoaderRequest =
    * to the parsed positions (unset: the numbers stay as they are). Only mesh
    * files take one: a DICOM series states its spacing in mm.
    */
-  | { kind: "file"; id: number; file: File; buffers?: File[]; importScale?: ImportScale }
+  | {
+      kind: "file";
+      id: number;
+      file: File;
+      buffers?: File[];
+      importScale?: ImportScale;
+      decimate?: DecimateOnLoadOptions;
+    }
   /** Stack DICOM files into their series and mesh each isosurface (`threshold` null takes Otsu's). */
-  | { kind: "dicom"; id: number; files: File[]; threshold: number | null }
+  | { kind: "dicom"; id: number; files: File[]; threshold: number | null; decimate?: DecimateOnLoadOptions }
   /** Mesh a procedural DICOM phantom through the same extraction pipeline. */
-  | { kind: "phantom"; id: number; phantom: PhantomKind }
+  | { kind: "phantom"; id: number; phantom: PhantomKind; decimate?: DecimateOnLoadOptions }
   /** Mesh a bundled sample CT through the same extraction pipeline. */
-  | { kind: "sample"; id: number; sample: SampleKind }
+  | { kind: "sample"; id: number; sample: SampleKind; decimate?: DecimateOnLoadOptions }
   /** Fetch a retained source volume (page cache miss). */
   | { kind: "volume"; id: number; volumeId: string }
   /** Drop a retained source volume (fire-and-forget: no reply). */
   | { kind: "dropVolume"; volumeId: string }
   /** Generate the demo meshes (spec §6.8); `big` makes A and B about a million triangles each, a number about that many. */
-  | { kind: "demo"; id: number; big: boolean | number }
+  | { kind: "demo"; id: number; big: boolean | number; decimate?: DecimateOnLoadOptions }
   /** Drop the worker-side job `id`: its late reply is ignored page-side. */
   | { kind: "cancel"; id: number };
 
@@ -42,6 +54,8 @@ export interface LoadedMesh {
   preset: string | null;
   /** The scale already applied to `positions`, if any: provenance, never re-applied. */
   importScale?: ImportScale;
+  /** Set when the worker decimated this mesh on load. */
+  decimated?: { from: number; to: number };
 }
 
 /** A retained source volume, fetched for the volume view (values transferred). */
@@ -60,7 +74,7 @@ export interface VolumePayload {
 export type LoaderReply =
   | { kind: "parsing"; id: number }
   /** Coarse stage progress (the parsers run as single calls; see #64). */
-  | { kind: "progress"; id: number; phase: "reading" | "parsing"; fraction: number }
+  | { kind: "progress"; id: number; phase: "reading" | "parsing" | "decimating"; fraction: number }
   | { kind: "meshes"; id: number; meshes: LoadedMesh[] }
   | { kind: "volume"; id: number; volume: VolumePayload }
   | { kind: "error"; id: number; message: string };

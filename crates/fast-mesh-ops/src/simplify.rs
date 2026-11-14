@@ -113,11 +113,17 @@ struct HeapEntry {
     cost: f64,
     a: u32,
     b: u32,
+    ver_a: u32,
+    ver_b: u32,
 }
 
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.cost == other.cost && self.a == other.a && self.b == other.b
+        self.cost == other.cost
+            && self.a == other.a
+            && self.b == other.b
+            && self.ver_a == other.ver_a
+            && self.ver_b == other.ver_b
     }
 }
 
@@ -132,13 +138,15 @@ impl PartialOrd for HeapEntry {
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // `BinaryHeap` pops the greatest: rank cheaper edges greater, with
-        // the vertex ids breaking ties deterministically.
+        // the vertex ids and versions breaking ties deterministically.
         other
             .cost
             .partial_cmp(&self.cost)
             .unwrap_or(Ordering::Equal)
             .then_with(|| other.a.cmp(&self.a))
             .then_with(|| other.b.cmp(&self.b))
+            .then_with(|| other.ver_a.cmp(&self.ver_a))
+            .then_with(|| other.ver_b.cmp(&self.ver_b))
     }
 }
 
@@ -216,14 +224,14 @@ fn optimal_position(q: &Quadric, a: [f64; 3], b: [f64; 3]) -> ([f64; 3], f64) {
     let (a22, b2) = (q[7], q[8]);
     let det = a00 * (a11 * a22 - a12 * a12) - a01 * (a01 * a22 - a12 * a02)
         + a02 * (a01 * a12 - a11 * a02);
-    if det.is_finite() && det != 0.0 {
+    if det.is_finite() && det.abs() > 1e-12 {
         // Adjugate over the determinant (Cramer on `A x = -b`).
         let inv = [
             (a11 * a22 - a12 * a12) / det,
             (a02 * a12 - a01 * a22) / det,
             (a01 * a12 - a11 * a02) / det,
-            (a11 * a22 - a12 * a12) / det,
             (a02 * a12 - a01 * a22) / det,
+            (a00 * a22 - a02 * a02) / det,
             (a02 * a01 - a00 * a12) / det,
             (a01 * a12 - a11 * a02) / det,
             (a02 * a01 - a00 * a12) / det,
@@ -236,15 +244,8 @@ fn optimal_position(q: &Quadric, a: [f64; 3], b: [f64; 3]) -> ([f64; 3], f64) {
         let p = [x, y, z];
         if p.iter().all(|c| c.is_finite()) {
             let cost = quad_error(q, p);
-            if cost.is_finite() {
-                return (
-                    p,
-                    if cost < 0.0 && cost > -1e-9 {
-                        0.0
-                    } else {
-                        cost
-                    },
-                );
+            if cost.is_finite() && cost >= -1e-9 * (1.0 + q[9].abs()) {
+                return (p, cost.max(0.0));
             }
         }
     }
@@ -285,42 +286,58 @@ fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
     }
 }
 
-/// The alive working triangles carrying the edge `(a, b)`.
-fn owners_of(a: u32, b: u32, v2t: &[Vec<u32>], tris: &[WorkTri]) -> Result<Vec<usize>> {
-    let mut owners = Vec::new();
-    reserve(&mut owners, 4)?;
+/// Reusable scratch buffers for edge collapses inside [`simplify`].
+#[derive(Default)]
+struct CollapseScratch {
+    owners: Vec<usize>,
+    na: Vec<u32>,
+    nb: Vec<u32>,
+    apexes: Vec<u32>,
+    common: Vec<u32>,
+    fan: Vec<usize>,
+    v2t_drop: Vec<u32>,
+    ring: Vec<u32>,
+}
+
+/// Fills `owners` with the sorted, unique alive working triangles carrying `(a, b)`.
+fn fill_owners(
+    a: u32,
+    b: u32,
+    v2t: &[Vec<u32>],
+    tris: &[WorkTri],
+    owners: &mut Vec<usize>,
+) -> Result<()> {
+    owners.clear();
+    reserve(owners, 4)?;
     for &i in &v2t[a as usize] {
         let t = &tris[i as usize];
         if t.alive && carries(&t.corners, a, b) {
-            push(&mut owners, i as usize)?;
+            push(owners, i as usize)?;
         }
     }
     owners.sort_unstable();
     owners.dedup();
-    Ok(owners)
+    Ok(())
 }
 
-/// The alive vertices sharing an alive triangle with `v`, without `v` itself.
-fn neighbors_of(v: u32, v2t: &[Vec<u32>], tris: &[WorkTri]) -> Result<Vec<u32>> {
-    let mut out = Vec::new();
-    reserve(&mut out, 16)?;
+/// Fills `out` with the sorted, unique alive vertices sharing an alive triangle with `v`.
+fn fill_neighbors(v: u32, v2t: &[Vec<u32>], tris: &[WorkTri], out: &mut Vec<u32>) -> Result<()> {
+    out.clear();
+    reserve(out, 16)?;
     for &i in &v2t[v as usize] {
         let t = &tris[i as usize];
-        if !t.alive {
-            continue;
-        }
-        if !t.corners.contains(&v) {
+        if !t.alive || !t.corners.contains(&v) {
             continue;
         }
         for &w in &t.corners {
             if w != v {
-                push(&mut out, w)?;
+                push(out, w)?;
             }
         }
     }
     out.sort_unstable();
     out.dedup();
-    Ok(out)
+    Ok(())
 }
 
 fn tri_normal(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> [f64; 3] {
@@ -435,6 +452,9 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         }
     }
 
+    let mut vlive = filled(slots, true)?;
+    let mut moved = filled(slots, false)?;
+    let mut v_ver = filled(slots, 0u32)?;
     let mut heap = BinaryHeap::new();
     heap.try_reserve(pairs.len())
         .map_err(|_| OpsError::Store(fast_mesh_store::StoreError::OutOfMemory))?;
@@ -451,64 +471,65 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
             f64v(&positions[a as usize]),
             f64v(&positions[b as usize]),
         );
-        heap.push(HeapEntry { cost, a, b });
+        heap.push(HeapEntry {
+            cost,
+            a,
+            b,
+            ver_a: 0,
+            ver_b: 0,
+        });
     }
 
-    let mut vlive = filled(slots, true)?;
-    let mut moved = filled(slots, false)?;
     let mut collapsed = 0usize;
-    // Fresh neighbor lists after each collapse, so candidate edges are
-    // re-armed with current quadrics.
-    let mut scratch: Vec<u32> = Vec::new();
+    let mut sc = CollapseScratch::default();
 
     while live > options.target_triangles {
         let Some(top) = heap.pop() else {
             break;
         };
         let (a, b) = (top.a, top.b);
-        if !vlive[a as usize] || !vlive[b as usize] {
+        if !vlive[a as usize]
+            || !vlive[b as usize]
+            || v_ver[a as usize] != top.ver_a
+            || v_ver[b as usize] != top.ver_b
+        {
             continue;
         }
-        let owners = owners_of(a, b, &v2t, &tris)?;
-        if owners.is_empty() || owners.len() > 2 {
+        fill_owners(a, b, &v2t, &tris, &mut sc.owners)?;
+        if sc.owners.is_empty() || sc.owners.len() > 2 {
             continue;
         }
-        // Recompute with current quadrics; a stale heap cost re-queues.
+        // Link condition: the common neighbours must be exactly the apexes
+        // of the owners, or the merge would duplicate triangles.
+        fill_neighbors(a, &v2t, &tris, &mut sc.na)?;
+        fill_neighbors(b, &v2t, &tris, &mut sc.nb)?;
+        sc.apexes.clear();
+        reserve(&mut sc.apexes, sc.owners.len())?;
+        for &o in &sc.owners {
+            push(&mut sc.apexes, apex_of(&tris[o].corners, a, b))?;
+        }
+        sc.apexes.sort_unstable();
+        sc.apexes.dedup();
+        if sc.apexes.len() != sc.owners.len() {
+            continue;
+        }
+        sc.common.clear();
+        reserve(&mut sc.common, sc.na.len().min(sc.nb.len()))?;
+        for &w in &sc.na {
+            if w != a && w != b && sc.nb.binary_search(&w).is_ok() {
+                push(&mut sc.common, w)?;
+            }
+        }
+        if sc.common != sc.apexes {
+            continue;
+        }
         let mut qsum = [0.0; 10];
         for k in 0..10 {
             qsum[k] = quadrics[a as usize][k] + quadrics[b as usize][k];
         }
         let pa = f64v(&positions[a as usize]);
         let pb = f64v(&positions[b as usize]);
-        let (pnew, fresh) = optimal_position(&qsum, pa, pb);
-        if fresh > top.cost + 1e-9 * (1.0 + top.cost.abs()) {
-            heap.push(HeapEntry { cost: fresh, a, b });
-            continue;
-        }
-        // Link condition: the common neighbours must be exactly the apexes
-        // of the owners, or the merge would duplicate triangles.
-        let na = neighbors_of(a, &v2t, &tris)?;
-        let nb = neighbors_of(b, &v2t, &tris)?;
-        let mut apexes = Vec::new();
-        reserve(&mut apexes, owners.len())?;
-        for &o in &owners {
-            push(&mut apexes, apex_of(&tris[o].corners, a, b))?;
-        }
-        apexes.sort_unstable();
-        apexes.dedup();
-        if apexes.len() != owners.len() {
-            continue;
-        }
-        let mut common = Vec::new();
-        reserve(&mut common, na.len().min(nb.len()))?;
-        for &w in &na {
-            if w != a && w != b && nb.binary_search(&w).is_ok() {
-                push(&mut common, w)?;
-            }
-        }
-        if common != apexes {
-            continue;
-        }
+        let (pnew, _cost) = optimal_position(&qsum, pa, pb);
         // Keep the smaller id so repeated runs agree on the survivor.
         let (keep, drop) = if a < b { (a, b) } else { (b, a) };
         if !pnew.iter().all(|c| c.is_finite()) {
@@ -520,30 +541,26 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         }
         // No folded fan triangle: every repointed triangle must keep the
         // sign of its normal and a non-zero area.
-        let mut fan: Vec<usize> = Vec::new();
-        reserve(&mut fan, na.len() + nb.len())?;
-        {
-            let mut seen: Vec<usize> = Vec::new();
-            for &v in &[a, b] {
-                for &i in &v2t[v as usize] {
-                    if !tris[i as usize].alive || owners.contains(&(i as usize)) {
-                        continue;
-                    }
-                    if seen.contains(&(i as usize)) {
-                        continue;
-                    }
-                    push(&mut seen, i as usize)?;
-                    push(&mut fan, i as usize)?;
+        sc.fan.clear();
+        reserve(&mut sc.fan, sc.na.len() + sc.nb.len())?;
+        for &v in &[a, b] {
+            for &i in &v2t[v as usize] {
+                let idx = i as usize;
+                if !tris[idx].alive || sc.owners.contains(&idx) {
+                    continue;
                 }
+                push(&mut sc.fan, idx)?;
             }
         }
+        sc.fan.sort_unstable();
+        sc.fan.dedup();
         let keep_pos = [
             f64::from(pnew32[0]),
             f64::from(pnew32[1]),
             f64::from(pnew32[2]),
         ];
         let mut folds = false;
-        for &i in &fan {
+        for &i in &sc.fan {
             let old = tris[i].corners;
             let pts = [
                 f64v(&positions[old[0] as usize]),
@@ -582,35 +599,53 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         quadrics[keep as usize] = qsum;
         positions[keep as usize] = pnew32;
         moved[keep as usize] = true;
-        for &o in &owners {
+        for &o in &sc.owners {
             tris[o].alive = false;
         }
-        live -= owners.len();
-        for &i in &fan {
-            let c = tris[i].corners.map(|v| if v == drop { keep } else { v });
-            tris[i].corners = c;
-            push(&mut v2t[keep as usize], i as u32)?;
-        }
+        live -= sc.owners.len();
+        // Prune dead triangles from `keep`'s adjacency, then transfer only the
+        // surviving triangles from `drop` into `keep` without duplicates.
+        v2t[keep as usize].retain(|&i| tris[i as usize].alive);
+        sc.v2t_drop.clear();
+        reserve(&mut sc.v2t_drop, v2t[drop as usize].len())?;
+        sc.v2t_drop.extend_from_slice(&v2t[drop as usize]);
         v2t[drop as usize].clear();
+        reserve(&mut v2t[keep as usize], sc.v2t_drop.len())?;
+        for &idx in &sc.v2t_drop {
+            let t = &mut tris[idx as usize];
+            if !t.alive {
+                continue;
+            }
+            t.corners = t.corners.map(|v| if v == drop { keep } else { v });
+            push(&mut v2t[keep as usize], idx)?;
+        }
+        v2t[keep as usize].sort_unstable();
+        v2t[keep as usize].dedup();
         vlive[drop as usize] = false;
+        v_ver[keep as usize] = v_ver[keep as usize].wrapping_add(1);
         collapsed += 1;
 
-        // Re-arm the survivor's edges with current quadrics.
-        scratch.clear();
-        reserve(&mut scratch, 16)?;
+        // Re-arm the survivor's edges with current quadrics and vertex versions.
+        sc.ring.clear();
+        reserve(&mut sc.ring, 16)?;
         for &i in &v2t[keep as usize] {
             let t = &tris[i as usize];
             if !t.alive || !t.corners.contains(&keep) {
                 continue;
             }
             for &w in &t.corners {
-                if w != keep && vlive[w as usize] && !scratch.contains(&w) {
-                    push(&mut scratch, w)?;
+                if w != keep && vlive[w as usize] {
+                    push(&mut sc.ring, w)?;
                 }
             }
         }
-        scratch.sort_unstable();
-        for &w in scratch.iter() {
+        sc.ring.sort_unstable();
+        sc.ring.dedup();
+        if heap.capacity() - heap.len() < sc.ring.len() {
+            heap.try_reserve(sc.ring.len())
+                .map_err(|_| OpsError::Store(fast_mesh_store::StoreError::OutOfMemory))?;
+        }
+        for &w in &sc.ring {
             if options.preserve_boundary && (is_boundary[keep as usize] || is_boundary[w as usize])
             {
                 continue;
@@ -625,8 +660,22 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
                 f64v(&positions[lo as usize]),
                 f64v(&positions[hi as usize]),
             );
-            heap.push(HeapEntry { cost, a: lo, b: hi });
+            heap.push(HeapEntry {
+                cost,
+                a: lo,
+                b: hi,
+                ver_a: v_ver[lo as usize],
+                ver_b: v_ver[hi as usize],
+            });
         }
+    }
+
+    #[cfg(test)]
+    for list in &v2t {
+        assert!(
+            list.windows(2).all(|w| w[0] < w[1]),
+            "duplicate or unsorted entry in v2t: {list:?}"
+        );
     }
 
     if collapsed == 0 {
@@ -888,5 +937,37 @@ mod tests {
             Ok(())
         });
         assert!(n > 0);
+    }
+
+    #[test]
+    fn simplify_large_mesh_without_v2t_bloat() {
+        let mut mesh = uv_sphere(160, 320, 1.0);
+        let before = live_count(&mesh);
+        assert!(before >= 100_000, "fixture too small: {before}");
+
+        let started = std::time::Instant::now();
+        let options = SimplifyOptions::builder().target_triangles(10_000).build();
+        let (report, empty) = edit(&mut mesh, |tx| simplify(tx, &options));
+        let elapsed = started.elapsed();
+
+        assert!(!empty);
+        assert!(report.collapsed > 0, "expected collapses, got {report:?}");
+        let now = live_count(&mesh);
+        assert!(now <= 10_000, "expected at most 10_000 tris, got {now}");
+        assert!(now > 0);
+        assert!(
+            elapsed.as_secs_f64() < 10.0,
+            "100k->10k simplify took too long: {elapsed:?}"
+        );
+        assert_no_degenerate(&mesh);
+
+        let analysis = crate::analyze(&mesh, &crate::AnalyzeOptions::default()).unwrap();
+        assert_eq!(analysis.non_manifold_edges, 0);
+        assert!(analysis.non_manifold_vertices.is_empty());
+        assert_eq!(analysis.duplicate, 0);
+        assert_eq!(analysis.degenerate, 0);
+        assert_eq!(analysis.orientation_conflicts, 0);
+        assert!(analysis.loops.is_empty());
+        assert!(analysis.pinch_vertices.is_empty());
     }
 }

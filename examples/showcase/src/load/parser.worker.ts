@@ -1,16 +1,37 @@
-// The loader Worker: reads and parses mesh files, and generates the demo
-// meshes, off the main thread. Results go back as transferred typed arrays,
-// so the page only calls `store.addMesh` (which transfers them on to the
-// scene Worker).
+// The loader Worker: reads and parses mesh files, generates the demo meshes,
+// and decimates oversized loads off the main thread. Results go back as
+// transferred typed arrays, so the page only calls `store.addMesh` (which
+// transfers them on to the scene Worker).
 import { demoMeshes } from "../scene/demo";
+import { NO_IMPORT_SCALE, scalePositions } from "../panels/units";
+import { decimateStepTargets, decimateTargetFor } from "./big-file";
 import { extractSeries, meshSlices } from "./extract";
 import { bounds, type MeshData } from "./mesh-data";
-import { NO_IMPORT_SCALE, scalePositions } from "../panels/units";
 import { parseMeshFilesAsync } from "./parse";
 import { PHANTOM_FIELD, phantomSlices } from "./phantom";
-import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
+import type { DecimateOnLoadOptions, LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
 import type { DicomVolume } from "./series";
 import { loadSample } from "./vtkjs";
+
+let wasmReady: Promise<typeof import("fast-mesh-wasm")> | null = null;
+
+function loadWasm(): Promise<typeof import("fast-mesh-wasm")> {
+  if (wasmReady === null) {
+    wasmReady = (async () => {
+      const mod = await import("fast-mesh-wasm");
+      await mod.init();
+      return mod;
+    })().catch((err) => {
+      wasmReady = null;
+      throw err;
+    });
+  }
+  return wasmReady;
+}
+
+function yieldForCancel(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 function post(reply: LoaderReply): void {
   const transfer =
@@ -55,8 +76,94 @@ function postCancelled(id: number): void {
   post({ kind: "error", id, message: "cancelled" });
 }
 
-function progress(id: number, phase: "reading" | "parsing", fraction: number): void {
+function progress(id: number, phase: "reading" | "parsing" | "decimating", fraction: number): void {
   post({ kind: "progress", id, phase, fraction });
+}
+
+async function maybeDecimate(
+  id: number,
+  meshes: LoadedMesh[],
+  decimate?: DecimateOnLoadOptions,
+): Promise<LoadedMesh[] | null> {
+  if (decimate === undefined) {
+    return meshes;
+  }
+  const total = meshes.reduce((n, m) => n + Math.round(m.indices.length / 3), 0);
+  const plan = meshes
+    .map((mesh) => {
+      const from = Math.round(mesh.indices.length / 3);
+      return decimateTargetFor(from, decimate.target) === null
+        ? null
+        : { mesh, from, steps: decimateStepTargets(from, decimate.target, 5) };
+    })
+    .filter((entry): entry is { mesh: LoadedMesh; from: number; steps: number[] } => entry !== null);
+  if (total < decimate.threshold || plan.length === 0) {
+    return meshes;
+  }
+  const totalSteps = plan.reduce((n, entry) => n + entry.steps.length, 0);
+  if (totalSteps === 0) {
+    return meshes;
+  }
+
+  progress(id, "decimating", 0.72);
+  await yieldForCancel();
+  if (isCancelled(id)) {
+    return null;
+  }
+  const { Scene } = await loadWasm();
+  if (isCancelled(id)) {
+    return null;
+  }
+
+  let completedSteps = 0;
+  for (const { mesh, from, steps } of plan) {
+    const scene = new Scene();
+    try {
+      const h = scene.addMesh(mesh.positions, mesh.indices, { mode: "manual", normals: false });
+      try {
+        for (const stepTarget of steps) {
+          await yieldForCancel();
+          if (isCancelled(id)) {
+            return null;
+          }
+          scene.repair(h, { op: "simplify", targetTriangles: stepTarget });
+          completedSteps += 1;
+          progress(id, "decimating", 0.72 + (0.2 * completedSteps) / totalSteps);
+        }
+        scene.compact(h);
+        const views = scene.views(h);
+        const posLocal = views.positions();
+        const idx = views.indices().slice();
+        const [ox, oy, oz] = scene.origin(h);
+        const positions = new Float64Array(posLocal.length);
+        for (let i = 0; i < posLocal.length; i += 3) {
+          positions[i] = posLocal[i] + ox;
+          positions[i + 1] = posLocal[i + 1] + oy;
+          positions[i + 2] = posLocal[i + 2] + oz;
+        }
+        const nextBounds = bounds(positions);
+        mesh.positions = positions;
+        mesh.indices = idx;
+        mesh.center = nextBounds.center;
+        mesh.radius = nextBounds.radius;
+        mesh.decimated = { from, to: Math.round(idx.length / 3) };
+      } catch {
+        // Leave original mesh intact if simplify rejects the geometry.
+      }
+    } finally {
+      scene.free();
+    }
+  }
+  return meshes;
+}
+
+async function postMeshes(id: number, meshes: LoadedMesh[], decimate?: DecimateOnLoadOptions): Promise<void> {
+  const ready = await maybeDecimate(id, meshes, decimate);
+  if (ready === null) {
+    postCancelled(id);
+    return;
+  }
+  post({ kind: "meshes", id, meshes: ready });
 }
 
 self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
@@ -81,7 +188,7 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         postCancelled(req.id);
         return;
       }
-      post({ kind: "meshes", id: req.id, meshes });
+      await postMeshes(req.id, meshes, req.decimate);
       return;
     }
     if (req.kind === "volume") {
@@ -112,14 +219,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         return;
       }
       progress(req.id, "parsing", 0.7);
-      post({
-        kind: "meshes",
-        id: req.id,
-        meshes: extracted.map((m) => {
-          retain(m.volume, false);
-          return loaded(m.name, m.data, m.seriesUid);
-        }),
+      const meshes = extracted.map((m) => {
+        retain(m.volume, false);
+        return loaded(m.name, m.data, m.seriesUid);
       });
+      await postMeshes(req.id, meshes, req.decimate);
       return;
     }
     if (req.kind === "phantom") {
@@ -131,14 +235,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         return;
       }
       progress(req.id, "parsing", 0.7);
-      post({
-        kind: "meshes",
-        id: req.id,
-        meshes: meshed.map((m) => {
-          retain(m.volume, PHANTOM_FIELD[req.phantom] === "sdf");
-          return loaded(m.name, m.data, m.seriesUid);
-        }),
+      const meshes = meshed.map((m) => {
+        retain(m.volume, PHANTOM_FIELD[req.phantom] === "sdf");
+        return loaded(m.name, m.data, m.seriesUid);
       });
+      await postMeshes(req.id, meshes, req.decimate);
       return;
     }
     if (req.kind === "sample") {
@@ -155,14 +256,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
         return;
       }
       progress(req.id, "parsing", 0.7);
-      post({
-        kind: "meshes",
-        id: req.id,
-        meshes: meshed.map((m) => {
-          retain(m.volume, false);
-          return loaded(m.name, m.data, m.seriesUid, preset);
-        }),
+      const meshes = meshed.map((m) => {
+        retain(m.volume, false);
+        return loaded(m.name, m.data, m.seriesUid, preset);
       });
+      await postMeshes(req.id, meshes, req.decimate);
       return;
     }
     const importScale = req.importScale ?? NO_IMPORT_SCALE;
@@ -191,15 +289,12 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       return;
     }
     progress(req.id, "parsing", 0.7);
-    post({
-      kind: "meshes",
-      id: req.id,
-      meshes: parsed.map((m) => {
-        // Before `loaded` takes the bounds: centre and radius are in mm too.
-        scalePositions(m.data.positions, importScale.factor);
-        return { ...loaded(m.name, m.data), importScale };
-      }),
+    const meshes = parsed.map((m) => {
+      // Before `loaded` takes the bounds: centre and radius are in mm too.
+      scalePositions(m.data.positions, importScale.factor);
+      return { ...loaded(m.name, m.data), importScale };
     });
+    await postMeshes(req.id, meshes, req.decimate);
   } catch (error) {
     post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });
   }
