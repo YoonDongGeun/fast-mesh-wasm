@@ -1,5 +1,34 @@
 # fast-mesh-wasm
 
+## 0.7.0
+
+### Minor Changes
+
+- [#204](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/204) [`67d83d0`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/67d83d0af2a0aa7f09b7bb3d394e2ca47e59108c) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add selectable 3D distance-transform and Marching Cubes surface offsetting algorithms (`"fhEdt"` Felzenszwalb-Huttenlocher 3D Euclidean Distance Transform + Manifold Marching Cubes, and `"bvhSdf"` exact BVH Signed/Unsigned Distance Field + Manifold Marching Cubes) alongside `"normal"` displacement in `Scene.repair(mesh, { op: "offset", ... })`, `WorkerScene`, and `SceneStore`.
+
+- [#223](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/223) [`df6a491`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/df6a491af4b4981a53b42eb79ed00b9100679349) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Organize public mesh processing APIs across Rust (`fast-mesh-ops`, `fast-mesh-scene`, `fast-mesh-cli`) and TypeScript (`Scene`, `WorkerScene`) into seven cohesive domain namespaces (`repair`, `sculpt`, `remesh`, `boolean`, `deform`, `inspect`, `align`) with full backwards compatibility for existing callable signatures and top-level helpers.
+
+- [#222](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/222) [`f058b43`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/f058b4301f45b395114b2145e4180b4b44ae3fdc) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add pure-TypeScript streaming mesh codecs and format expansion (`zip.ts`, `threemf.ts`, `ply.ts`, `stl.ts`, `obj.ts`, `stream.ts`), adding 3MF import/export with `<basematerials>`/`<m:colorgroup>` vertex colors and Production Extension support, binary/ASCII PLY import with UV round-trips, binary/ASCII STL import with spatial-hash vertex welding, OBJ vertex-color import/export, and bounded `ReadableStream`/`Blob` loading with `AbortSignal` for `Scene` and `WorkerScene`.
+
+- [#219](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/219) [`94d310f`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/94d310f665cfa258219db2b95b9931874b9749f4) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add non-manifold topology healing (`makeManifold`), self-intersection resolution (`resolveSelfIntersections` with `none`, `deleteAndFill`, `cutAndStitch`, and `voxelHeal` modes), sliver cleanup (`cleanupSlivers`), and domain `autoRepair` presets (`general`, `scan3d`, `print3d`, `cadImport`) across Rust ops, Wasm bindings, TypeScript SDK/Worker, and Showcase UI.
+
+- [#217](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/217) [`544b892`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/544b892e77a9354e053593290d411b5f0544fcac) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Expose the sculpt brush domain across `Scene`, `WorkerScene`, and `SceneStore`:
+  
+  - Add `sculpt(mesh, op)` and `SculptOp` / `SculptReport` / `SculptReportOf` (100% backwards-compatible with `repair(mesh, op)` and `RepairOp`).
+  - Add `InflateMethod` (`"vertexNormal" | "averageNormal" | "strokeNormal"`), `SmoothMethod` (`"taubin" | "laplacian" | "hcLaplacian" | "cotangent"`), and `GrabMethod` (`"sphere" | "geodesic" | "kelvinlet"` with `poisson`, `fromStroke`, and fold-safe `adaptiveReach`), plus `captureStrokeState`.
+  - Add `flatten` (`"both" | "peaks" | "valleys"`), `crease` (`pinch`), `clay` (`"round" | "strips"`), and `twist` (`"vortex" | "kelvinlet"`).
+  - Add composable `SurfaceFilter` (`"none" | "peaksOnly" | "valleysOnly" | "normalAngle"`), local-axis `Symmetry` (`{ x, y, z }`), geodesic soft-band `VertexProtection.band`, and `verticesInSphere(mesh, center, radius)`.
+
+- [#201](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/201) [`7dabaf4`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/7dabaf48c3fd4992ef68363697c2c987c7dc2a84) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - `splitStretched` takes `sharpAngle`, the angle in degrees past which two faces count as separated by a crease (45 by default, as before). Set it below a model's gentlest crease to keep the flat faces beside that crease flat when edges split. At the default, a flat face beside a 30 degree crease bulges by 0.20 on a 6.0 edge.
+
+### Patch Changes
+
+- [#203](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/203) [`52949e7`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/52949e7ae21c7b509292912f6557bbc3e13bceb5) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Replace the boolean mesh splitter (`boolean_plan` / `apply_boolean`, `Scene.boolean`, `WorkerScene.boolean`, and CLI `boolean`) with a canonical simplex-keyed arrangement using exact `orient3d`/`orient2d` predicates, constrained 2D sub-triangulation, seam-bounded patch classification via generalized winding numbers, and strict 2-manifold edge/vertex fan de-pinching ([#165](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/165)). Generic curved overlaps (spheres, tori, shells), varied face triangulations, and coplanar, edge-touching, or vertex-touching solids now produce watertight, outward-wound 2-manifold outputs free of boundary loops, orientation conflicts, and pinch vertices.
+
+- [#218](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/218) [`eee00c6`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/eee00c63cce986d201c4cb551700e80ef6171892) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Eliminate quadratic adjacency growth and redundant heap re-evaluations in mesh simplification, and run stepped decimation off the main thread in the showcase loader.
+
+- [#220](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/220) [`88fe125`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/88fe1255d2a13bf6a5ddf5d372325d17096c2c1c) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Enable Wasm `simd128` (`+simd128`, `--enable-simd`), add reusable thread-local scratch pools (`ScratchPool`, `ScratchU32`, `ScratchF32`, etc.) in `fast-mesh-store`, implement 4-wide SIMD128 BVH/query ray and closest-point kernels in `fast-mesh-bvh` and `fast-mesh-query`, and optimize Felzenszwalb-Huttenlocher EDT and Marching Cubes hot paths.
+
 ## 0.6.0
 
 ### Minor Changes
