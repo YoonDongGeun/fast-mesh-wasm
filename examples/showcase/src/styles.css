@@ -581,6 +581,24 @@ input[type="range"] {
   display: flex;
   gap: 4px;
 }
+.camera-bar {
+  position: absolute;
+  bottom: 30px;
+  right: 10px;
+  max-width: calc(100% - 20px);
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.camera-bar .group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--overlay);
+  pointer-events: auto;
+}
 .toolbox {
   position: absolute;
   top: 64px;
@@ -1105,26 +1123,6 @@ input[type="range"] {
 
 
 /* #195 Workbench expansion */
-.camera-bar {
-  position: absolute;
-  bottom: 30px;
-  right: 10px;
-  max-width: calc(100% - 20px);
-  display: flex;
-  justify-content: flex-end;
-  pointer-events: none;
-}
-
-.camera-bar .group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 4px;
-  border-radius: var(--radius);
-  background: var(--overlay);
-  pointer-events: auto;
-}
-
 .mesh-actions {
   display: flex;
   flex-wrap: wrap;

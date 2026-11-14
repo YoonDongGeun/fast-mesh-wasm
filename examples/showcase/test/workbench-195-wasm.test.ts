@@ -2,6 +2,7 @@
 // Boolean CSG (+ keepOriginals), Destructive Plane Cut (+/-/cap), Offset/Shell,
 // Quadric Simplify + Loop Subdivide, Rigid ICP + 1 undo step, Distance/Thickness/Curvature fields
 // (sync Scene and WorkerScene bridge), Transform Scale, Duplicate & Mirror winding, and Camera framing.
+import { readFileSync } from "node:fs";
 import {
   type EditOp,
   type MeshHandle,
@@ -525,5 +526,37 @@ describe("Issue #195 Real-WASM Workbench Integration", () => {
 
     const { halfHeight } = perspectiveToOrthoHalfExtents(45, 20, 1.5);
     expect(orthoToPerspectiveDistance(halfHeight, -halfHeight, 1, 45)).toBeCloseTo(20, 8);
+  });
+
+  it("places base .camera-bar before @media (pointer: coarse) so coarse touch hides it without wrapping desktop .toolbar", () => {
+    const stylesCss = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const coarseMatch = /@media\s*\(\s*pointer\s*:\s*coarse\s*\)\s*\{/.exec(stylesCss);
+    expect(coarseMatch).not.toBeNull();
+    const coarseStart = coarseMatch!.index;
+    let depth = 0;
+    let coarseEnd = stylesCss.length;
+    for (let i = stylesCss.indexOf("{", coarseStart); i < stylesCss.length; i++) {
+      const ch = stylesCss[i];
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          coarseEnd = i + 1;
+          break;
+        }
+      }
+    }
+
+    const beforeCoarse = stylesCss.slice(0, coarseStart);
+    const coarseBlock = stylesCss.slice(coarseStart, coarseEnd);
+    const afterCoarse = stylesCss.slice(coarseEnd);
+
+    const baseCameraIdx = beforeCoarse.indexOf(".camera-bar");
+    expect(baseCameraIdx).toBeGreaterThanOrEqual(0);
+    expect(beforeCoarse.slice(baseCameraIdx)).toMatch(/\.camera-bar\s*\{[^}]*display\s*:\s*flex/);
+    expect(coarseBlock).toMatch(/\.camera-bar\s*\{[^}]*display\s*:\s*none/);
+    expect(afterCoarse).not.toMatch(/\.camera-bar[^{]*\{[^}]*display\s*:/);
+    expect(afterCoarse).not.toMatch(/\.camera-bar\b/);
+    expect(beforeCoarse).not.toMatch(/\.toolbar\s*\{[^}]*flex-wrap\s*:\s*wrap/);
   });
 });
