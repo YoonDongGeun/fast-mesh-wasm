@@ -7,6 +7,35 @@
 
 use crate::Aabb;
 
+trait KeyEval<K> {
+    fn eval_one(&mut self, a: &Aabb) -> Option<K>;
+    fn eval_pair(&mut self, a: &Aabb, b: &Aabb) -> (Option<K>, Option<K>);
+}
+
+struct SingleKey<F>(F);
+
+impl<K, F: FnMut(&Aabb) -> Option<K>> KeyEval<K> for SingleKey<F> {
+    fn eval_one(&mut self, a: &Aabb) -> Option<K> {
+        (self.0)(a)
+    }
+
+    fn eval_pair(&mut self, a: &Aabb, b: &Aabb) -> (Option<K>, Option<K>) {
+        ((self.0)(a), (self.0)(b))
+    }
+}
+
+struct PairKey<F>(F);
+
+impl<K, F: FnMut(&Aabb, &Aabb) -> (Option<K>, Option<K>)> KeyEval<K> for PairKey<F> {
+    fn eval_one(&mut self, a: &Aabb) -> Option<K> {
+        (self.0)(a, &Aabb::EMPTY).0
+    }
+
+    fn eval_pair(&mut self, a: &Aabb, b: &Aabb) -> (Option<K>, Option<K>) {
+        (self.0)(a, b)
+    }
+}
+
 pub(crate) const NONE: u32 = u32::MAX;
 pub(crate) const LEAF_BIT: u32 = 1 << 31;
 
@@ -126,22 +155,43 @@ impl Arena {
     /// Children whose key is `None` are skipped; `visit` gets each node's key
     /// and returns whether to descend (ignored for leaves). `key` runs once per
     /// node, except inside a subtree that does not fit on the stack: that one is
-    /// finished at once by [`Arena::traverse_by_key_stackless`], in the same
+    /// finished at once by [`Arena::traverse_by_pair_stackless`], in the same
     /// order, where `key` may run again for the same node.
     pub(crate) fn traverse_by_key<const N: usize, K: Copy + PartialOrd>(
         &self,
         root: u32,
-        mut key: impl FnMut(&Aabb) -> Option<K>,
+        key: impl FnMut(&Aabb) -> Option<K>,
+        visit: impl FnMut(u32, &Node, K) -> bool,
+    ) {
+        self.traverse_by_pair_impl::<N, K, _>(root, SingleKey(key), visit);
+    }
+
+    /// Pair-keyed variant of [`Arena::traverse_by_key`] that evaluates both
+    /// children of an inner node in a single call, enabling 4-wide / SIMD
+    /// culling while preserving identical child ordering and stackless overflow.
+    pub(crate) fn traverse_by_pair<const N: usize, K: Copy + PartialOrd>(
+        &self,
+        root: u32,
+        pair_key: impl FnMut(&Aabb, &Aabb) -> (Option<K>, Option<K>),
+        visit: impl FnMut(u32, &Node, K) -> bool,
+    ) {
+        self.traverse_by_pair_impl::<N, K, _>(root, PairKey(pair_key), visit);
+    }
+
+    fn traverse_by_pair_impl<const N: usize, K: Copy + PartialOrd, E: KeyEval<K>>(
+        &self,
+        root: u32,
+        mut eval: E,
         mut visit: impl FnMut(u32, &Node, K) -> bool,
     ) {
         if root == NONE {
             return;
         }
-        let Some(root_key) = key(&self.nodes[root as usize].bounds) else {
+        let Some(root_key) = eval.eval_one(&self.nodes[root as usize].bounds) else {
             return;
         };
         if N == 0 {
-            self.traverse_by_key_stackless(root, root_key, key, visit);
+            self.traverse_by_pair_stackless(root, root_key, &mut eval, visit);
             return;
         }
         let mut stack = [(root, root_key); N];
@@ -153,7 +203,7 @@ impl Arena {
             if !visit(cur, node, k) || node.is_leaf() {
                 continue;
             }
-            let [(first, kf), (second, ks)] = self.children_by_key(node, &mut key);
+            let [(first, kf), (second, ks)] = self.children_by_pair(node, &mut eval);
             // The second child goes below the first. It always fits, as an
             // entry was just popped.
             if let Some(ks) = ks {
@@ -167,22 +217,21 @@ impl Arena {
                 } else {
                     // Finished right away, before the second child is popped:
                     // the order the stack would have given.
-                    self.traverse_by_key_stackless(first, kf, &mut key, &mut visit);
+                    self.traverse_by_pair_stackless(first, kf, &mut eval, &mut visit);
                 }
             }
         }
     }
 
-    /// [`Arena::traverse_by_key`] without a stack, walking parent links: the
-    /// overflow fallback. `root_key` is `root`'s key. Each inner node's child
-    /// keys are evaluated again on the way back up, to tell which child the walk
-    /// returns from, so `key` must be pure (an impure one can skip subtrees or
-    /// loop forever, though it stays memory-safe).
-    pub(crate) fn traverse_by_key_stackless<K: Copy + PartialOrd>(
+    /// [`Arena::traverse_by_pair_impl`] without a stack, walking parent links:
+    /// the overflow fallback. `root_key` is `root`'s key. Each inner node's
+    /// child keys are evaluated again on the way back up, to tell which child
+    /// the walk returns from, so keys must be pure.
+    fn traverse_by_pair_stackless<K: Copy + PartialOrd, E: KeyEval<K>>(
         &self,
         root: u32,
         root_key: K,
-        mut key: impl FnMut(&Aabb) -> Option<K>,
+        eval: &mut E,
         mut visit: impl FnMut(u32, &Node, K) -> bool,
     ) {
         let stop = self.parents[root as usize];
@@ -197,7 +246,7 @@ impl Arena {
             if from == parent {
                 // First arrival from above.
                 if visit(cur, node, k) && !node.is_leaf() {
-                    let [(first, kf), (second, ks)] = self.children_by_key(node, &mut key);
+                    let [(first, kf), (second, ks)] = self.children_by_pair(node, eval);
                     if let Some(kf) = kf {
                         (next, k) = (first, kf);
                     } else if let Some(ks) = ks {
@@ -205,7 +254,7 @@ impl Arena {
                     }
                 }
             } else {
-                let [(first, _), (second, ks)] = self.children_by_key(node, &mut key);
+                let [(first, _), (second, ks)] = self.children_by_pair(node, eval);
                 if from == first
                     && let Some(ks) = ks
                 {
@@ -220,19 +269,91 @@ impl Arena {
         }
     }
 
-    /// The children of an inner node with their keys, in visiting order: the
-    /// smaller key first, the left child on ties or when either key is `None`.
-    pub(crate) fn children_by_key<K: Copy + PartialOrd>(
+    fn children_by_pair<K: Copy + PartialOrd, E: KeyEval<K>>(
         &self,
         node: &Node,
-        key: &mut impl FnMut(&Aabb) -> Option<K>,
+        eval: &mut E,
     ) -> [(u32, Option<K>); 2] {
-        let kl = key(&self.nodes[node.a as usize].bounds);
-        let kr = key(&self.nodes[node.b as usize].bounds);
+        let (kl, kr) = eval.eval_pair(
+            &self.nodes[node.a as usize].bounds,
+            &self.nodes[node.b as usize].bounds,
+        );
         if matches!((kl, kr), (Some(l), Some(r)) if r < l) {
             [(node.b, kr), (node.a, kl)]
         } else {
             [(node.a, kl), (node.b, kr)]
+        }
+    }
+
+    /// Visits every leaf whose node bounds overlap `query`, batching two-child
+    /// and four-grandchild tests through [`crate::Aabb4`] in pre-order DFS
+    /// without heap allocations.
+    pub(crate) fn traverse_aabb_leaves(
+        &self,
+        root: u32,
+        query: &Aabb,
+        mut visit_leaf: impl FnMut(&[u32]),
+    ) {
+        if root == NONE || !self.nodes[root as usize].bounds.overlaps(query) {
+            return;
+        }
+        let mut stack = [0u32; crate::TRAVERSE_STACK];
+        stack[0] = root;
+        let mut len = 1usize;
+        while len > 0 {
+            len -= 1;
+            let cur = stack[len];
+            let node = &self.nodes[cur as usize];
+            if node.is_leaf() {
+                visit_leaf(&self.refs[node.leaf_range()]);
+                continue;
+            }
+            let a = node.a;
+            let b = node.b;
+            let na = &self.nodes[a as usize];
+            let nb = &self.nodes[b as usize];
+            let mask = crate::Aabb4::from_two(&na.bounds, &nb.bounds).overlaps_aabb(query);
+            let hit_a = (mask & 1) != 0;
+            let hit_b = (mask & 2) != 0;
+
+            if hit_a && hit_b && !na.is_leaf() && !nb.is_leaf() && len + 4 <= crate::TRAVERSE_STACK
+            {
+                let gmask = crate::Aabb4::from_aabbs([
+                    &self.nodes[na.a as usize].bounds,
+                    &self.nodes[na.b as usize].bounds,
+                    &self.nodes[nb.a as usize].bounds,
+                    &self.nodes[nb.b as usize].bounds,
+                ])
+                .overlaps_aabb(query);
+                for (lane, child) in [(3, nb.b), (2, nb.a), (1, na.b), (0, na.a)] {
+                    if (gmask & (1 << lane)) != 0 {
+                        stack[len] = child;
+                        len += 1;
+                    }
+                }
+                continue;
+            }
+
+            if hit_b {
+                stack[len] = b;
+                len += 1;
+            }
+            if hit_a {
+                if len < crate::TRAVERSE_STACK {
+                    stack[len] = a;
+                    len += 1;
+                } else {
+                    self.traverse(a, |_, n| {
+                        if !n.bounds.overlaps(query) {
+                            return false;
+                        }
+                        if n.is_leaf() {
+                            visit_leaf(&self.refs[n.leaf_range()]);
+                        }
+                        true
+                    });
+                }
+            }
         }
     }
 

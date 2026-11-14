@@ -1,6 +1,12 @@
 //! Felzenszwalb-Huttenlocher (2012) 3D Euclidean distance transforms and mesh voxelization grids.
 
-use fast_mesh_store::{Mesh, TriangleId, par};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use fast_mesh_store::{
+    Mesh, SCRATCH_F64, SCRATCH_U8, SCRATCH_USIZE, ScratchF64, ScratchPool, ScratchU8, ScratchUsize,
+    TriangleId, par,
+};
 use robust::{Coord, orient2d};
 
 use crate::geom::{cross, dot, sub, triangle_normal, widen};
@@ -16,22 +22,37 @@ const PAR_MIN_EDT_VOXELS: usize = 16_384;
 /// 1D lines grouped per parallel task during [`edt_3d_sq`].
 const EDT_LINE_CHUNK: usize = 64;
 
-/// Scratch buffers for a 1D lower parabolic envelope of length up to `cap`.
+/// Columns processed together during strided Y/Z EDT passes for L1 cache-line reuse.
+const EDT_COL_BLOCK: usize = 8;
+
+thread_local! {
+    static SIGNED_CROSSINGS_POOL: RefCell<Vec<Vec<(u32, f64)>>> =
+        const { RefCell::new(Vec::new()) };
+}
+static SIGNED_CROSSINGS_SCRATCH: ScratchPool<(u32, f64)> = ScratchPool::new(&SIGNED_CROSSINGS_POOL);
+
+/// Reusable thread-local scratch buffers for 1D lower parabolic envelopes of
+/// length up to `cap`, supporting up to `EDT_COL_BLOCK` concurrent lanes.
 struct EdtScratch {
-    f: Vec<f64>,
-    d: Vec<f64>,
-    v: Vec<usize>,
-    z: Vec<f64>,
+    f: ScratchF64,
+    d: ScratchF64,
+    v: ScratchUsize,
+    z: ScratchF64,
 }
 
 impl EdtScratch {
-    fn new(cap: usize) -> Result<Self> {
-        Ok(EdtScratch {
-            f: filled(cap, 0.0)?,
-            d: filled(cap, 0.0)?,
-            v: filled(cap, 0)?,
-            z: filled(cap + 1, 0.0)?,
-        })
+    fn acquire(cap: usize, lanes: usize) -> Result<Self> {
+        let oom = || FieldsError::OutOfMemory;
+        let line_elems = cap * lanes;
+        let mut f = SCRATCH_F64.try_acquire_with(line_elems, allocation_allowed, oom)?;
+        f.resize(line_elems, 0.0);
+        let mut d = SCRATCH_F64.try_acquire_with(line_elems, allocation_allowed, oom)?;
+        d.resize(line_elems, 0.0);
+        let mut v = SCRATCH_USIZE.try_acquire_with(cap, allocation_allowed, oom)?;
+        v.resize(cap, 0);
+        let mut z = SCRATCH_F64.try_acquire_with(cap + 1, allocation_allowed, oom)?;
+        z.resize(cap + 1, 0.0);
+        Ok(EdtScratch { f, d, v, z })
     }
 }
 
@@ -155,7 +176,8 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
     let parallel = total >= PAR_MIN_EDT_VOXELS && par::enabled() && !par::force_sequential();
     if !parallel {
         let max_dim = nx.max(ny).max(nz);
-        let mut sc = EdtScratch::new(max_dim)?;
+        let lanes = if ny > 1 || nz > 1 { EDT_COL_BLOCK } else { 1 };
+        let mut sc = EdtScratch::acquire(max_dim, lanes)?;
 
         if nx > 1 {
             for row in buf.chunks_mut(nx) {
@@ -166,40 +188,38 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
 
         if ny > 1 {
             let nxy = nx * ny;
-            for iz in 0..nz {
-                let z_base = iz * nxy;
-                for ix in 0..nx {
-                    for iy in 0..ny {
-                        sc.f[iy] = buf[z_base + iy * nx + ix];
-                    }
-                    edt_1d(
-                        &sc.f[..ny],
-                        &mut sc.d[..ny],
-                        &mut sc.v[..ny],
-                        &mut sc.z[..=ny],
-                    );
-                    for iy in 0..ny {
-                        buf[z_base + iy * nx + ix] = sc.d[iy];
-                    }
-                }
+            for z_slice in buf.chunks_exact_mut(nxy) {
+                edt_y_slice_blocked(nx, ny, z_slice, &mut sc);
             }
         }
 
         if nz > 1 {
             let nxy = nx * ny;
-            for col in 0..nxy {
+            let mut col = 0;
+            while col < nxy {
+                let width = (nxy - col).min(EDT_COL_BLOCK);
                 for iz in 0..nz {
-                    sc.f[iz] = buf[iz * nxy + col];
+                    let row = &buf[iz * nxy + col..iz * nxy + col + width];
+                    for (k, &val) in row.iter().enumerate() {
+                        sc.f[k * nz + iz] = val;
+                    }
                 }
-                edt_1d(
-                    &sc.f[..nz],
-                    &mut sc.d[..nz],
-                    &mut sc.v[..nz],
-                    &mut sc.z[..=nz],
-                );
+                for k in 0..width {
+                    let base = k * nz;
+                    edt_1d(
+                        &sc.f[base..base + nz],
+                        &mut sc.d[base..base + nz],
+                        &mut sc.v[..nz],
+                        &mut sc.z[..=nz],
+                    );
+                }
                 for iz in 0..nz {
-                    out_sq[iz * nxy + col] = sc.d[iz] as f32;
+                    let out_row = &mut out_sq[iz * nxy + col..iz * nxy + col + width];
+                    for (k, dst) in out_row.iter_mut().enumerate() {
+                        *dst = sc.d[k * nz + iz] as f32;
+                    }
                 }
+                col += width;
             }
         } else {
             for (o, &b) in out_sq.iter_mut().zip(&buf) {
@@ -211,93 +231,109 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
 
     let oom = || FieldsError::OutOfMemory;
 
-    // Pass 1: X lines (contiguous rows of length nx).
+    // Pass 1: X lines (contiguous rows of length nx), evaluated in place.
     if nx > 1 {
         let n_rows = ny * nz;
-        let batch_rows = (262_144 / nx).max(EDT_LINE_CHUNK * 2);
-        let mut row_start = 0;
-        while row_start < n_rows {
-            let row_end = (row_start + batch_rows).min(n_rows);
-            let batch_len = row_end - row_start;
-            allocation_allowed()?;
-            let parts = {
-                let buf_ref = &buf;
-                par::map_range(batch_len, EDT_LINE_CHUNK, 0, oom, |r| {
-                    let mut sc = EdtScratch::new(nx)?;
-                    let mut part = Vec::new();
-                    reserve_exact(&mut part, r.len() * nx)?;
-                    for local in r {
-                        let row = row_start + local;
-                        let slice = &buf_ref[row * nx..(row + 1) * nx];
-                        edt_1d(slice, &mut sc.d[..nx], &mut sc.v[..nx], &mut sc.z[..=nx]);
-                        part.extend_from_slice(&sc.d[..nx]);
-                    }
-                    Ok(part)
-                })?
-            };
-            let mut cursor = row_start * nx;
-            for part in parts {
-                buf[cursor..cursor + part.len()].copy_from_slice(&part);
-                cursor += part.len();
+        let chunk_rows = EDT_LINE_CHUNK.min((n_rows / 4).max(1));
+        let failed = AtomicBool::new(false);
+        par::for_each_chunk_mut(&mut buf, chunk_rows * nx, PAR_MIN_EDT_VOXELS, |_, chunk| {
+            if failed.load(Ordering::Relaxed) {
+                return;
             }
-            row_start = row_end;
+            let Ok(mut sc) = EdtScratch::acquire(nx, 1) else {
+                failed.store(true, Ordering::Relaxed);
+                return;
+            };
+            for row in chunk.chunks_exact_mut(nx) {
+                sc.f[..nx].copy_from_slice(row);
+                edt_1d(&sc.f[..nx], row, &mut sc.v[..nx], &mut sc.z[..=nx]);
+            }
+        });
+        if failed.load(Ordering::Relaxed) {
+            return Err(FieldsError::OutOfMemory);
         }
     }
 
-    // Pass 2: Y lines (indexed by c = iz * nx + ix).
+    // Pass 2: Y lines (disjoint Z slices can run directly in place when nz >= 4).
     if ny > 1 {
-        let n_cols = nx * nz;
-        let batch_cols = (262_144 / ny).max(EDT_LINE_CHUNK * 2);
-        let mut col_start = 0;
-        while col_start < n_cols {
-            let col_end = (col_start + batch_cols).min(n_cols);
-            let batch_len = col_end - col_start;
-            allocation_allowed()?;
-            let parts = {
-                let buf_ref = &buf;
-                par::map_range(batch_len, EDT_LINE_CHUNK, 0, oom, |r| {
-                    let mut sc = EdtScratch::new(ny)?;
-                    let mut part = Vec::new();
-                    reserve_exact(&mut part, r.len() * ny)?;
-                    for local in r {
-                        let c = col_start + local;
+        let nxy = nx * ny;
+        if nz >= 4 {
+            let z_chunk = (nz / 16).clamp(1, 4);
+            let failed = AtomicBool::new(false);
+            par::for_each_chunk_mut(
+                &mut buf,
+                z_chunk * nxy,
+                PAR_MIN_EDT_VOXELS,
+                |_, z_chunk_buf| {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let Ok(mut sc) = EdtScratch::acquire(ny, EDT_COL_BLOCK) else {
+                        failed.store(true, Ordering::Relaxed);
+                        return;
+                    };
+                    for z_slice in z_chunk_buf.chunks_exact_mut(nxy) {
+                        edt_y_slice_blocked(nx, ny, z_slice, &mut sc);
+                    }
+                },
+            );
+            if failed.load(Ordering::Relaxed) {
+                return Err(FieldsError::OutOfMemory);
+            }
+        } else {
+            let n_cols = nx * nz;
+            let batch_cols = (262_144 / ny).max(EDT_LINE_CHUNK * 2);
+            let mut col_start = 0;
+            while col_start < n_cols {
+                let col_end = (col_start + batch_cols).min(n_cols);
+                let batch_len = col_end - col_start;
+                allocation_allowed()?;
+                let parts = {
+                    let buf_ref = &buf;
+                    par::map_range(batch_len, EDT_LINE_CHUNK, 0, oom, |r| {
+                        let mut sc = EdtScratch::acquire(ny, 1)?;
+                        let mut part = Vec::new();
+                        reserve_exact(&mut part, r.len() * ny)?;
+                        for local in r {
+                            let c = col_start + local;
+                            let iz = c / nx;
+                            let ix = c % nx;
+                            let z_base = iz * nxy;
+                            for iy in 0..ny {
+                                sc.f[iy] = buf_ref[z_base + iy * nx + ix];
+                            }
+                            edt_1d(
+                                &sc.f[..ny],
+                                &mut sc.d[..ny],
+                                &mut sc.v[..ny],
+                                &mut sc.z[..=ny],
+                            );
+                            part.extend_from_slice(&sc.d[..ny]);
+                        }
+                        Ok(part)
+                    })?
+                };
+                let mut offset = col_start;
+                for part in parts {
+                    let count = part.len() / ny;
+                    for i in 0..count {
+                        let c = offset + i;
                         let iz = c / nx;
                         let ix = c % nx;
-                        let z_base = iz * nx * ny;
-                        for iy in 0..ny {
-                            sc.f[iy] = buf_ref[z_base + iy * nx + ix];
+                        let z_base = iz * nxy;
+                        let src = &part[i * ny..(i + 1) * ny];
+                        for (iy, &val) in src.iter().enumerate() {
+                            buf[z_base + iy * nx + ix] = val;
                         }
-                        edt_1d(
-                            &sc.f[..ny],
-                            &mut sc.d[..ny],
-                            &mut sc.v[..ny],
-                            &mut sc.z[..=ny],
-                        );
-                        part.extend_from_slice(&sc.d[..ny]);
                     }
-                    Ok(part)
-                })?
-            };
-            let mut offset = col_start;
-            for part in parts {
-                let count = part.len() / ny;
-                for i in 0..count {
-                    let c = offset + i;
-                    let iz = c / nx;
-                    let ix = c % nx;
-                    let z_base = iz * nx * ny;
-                    let src = &part[i * ny..(i + 1) * ny];
-                    for (iy, &val) in src.iter().enumerate() {
-                        buf[z_base + iy * nx + ix] = val;
-                    }
+                    offset += count;
                 }
-                offset += count;
+                col_start = col_end;
             }
-            col_start = col_end;
         }
     }
 
-    // Pass 3: Z lines (indexed by col = iy * nx + ix).
+    // Pass 3: Z lines (8-column strip-mined gather for cache-line reuse).
     if nz > 1 {
         let nxy = nx * ny;
         let batch_cols = (262_144 / nz).max(EDT_LINE_CHUNK * 2);
@@ -309,23 +345,32 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
             let parts = {
                 let buf_ref = &buf;
                 par::map_range(batch_len, EDT_LINE_CHUNK, 0, oom, |r| {
-                    let mut sc = EdtScratch::new(nz)?;
+                    let mut sc = EdtScratch::acquire(nz, EDT_COL_BLOCK)?;
                     let mut part = Vec::new();
                     reserve_exact(&mut part, r.len() * nz)?;
-                    for local in r {
-                        let col = col_start + local;
+                    let mut local = r.start;
+                    while local < r.end {
+                        let width = (r.end - local).min(EDT_COL_BLOCK);
+                        let col0 = col_start + local;
                         for iz in 0..nz {
-                            sc.f[iz] = buf_ref[iz * nxy + col];
+                            let row = &buf_ref[iz * nxy + col0..iz * nxy + col0 + width];
+                            for (k, &val) in row.iter().enumerate() {
+                                sc.f[k * nz + iz] = val;
+                            }
                         }
-                        edt_1d(
-                            &sc.f[..nz],
-                            &mut sc.d[..nz],
-                            &mut sc.v[..nz],
-                            &mut sc.z[..=nz],
-                        );
-                        for &val in &sc.d[..nz] {
-                            part.push(val as f32);
+                        for k in 0..width {
+                            let base = k * nz;
+                            edt_1d(
+                                &sc.f[base..base + nz],
+                                &mut sc.d[base..base + nz],
+                                &mut sc.v[..nz],
+                                &mut sc.z[..=nz],
+                            );
+                            for &val in &sc.d[base..base + nz] {
+                                part.push(val as f32);
+                            }
                         }
+                        local += width;
                     }
                     Ok(part)
                 })?
@@ -333,12 +378,17 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
             let mut offset = col_start;
             for part in parts {
                 let count = part.len() / nz;
-                for i in 0..count {
-                    let col = offset + i;
-                    let src = &part[i * nz..(i + 1) * nz];
-                    for (iz, &val) in src.iter().enumerate() {
-                        out_sq[iz * nxy + col] = val;
+                let mut i = 0;
+                while i < count {
+                    let width = (count - i).min(EDT_COL_BLOCK);
+                    let col0 = offset + i;
+                    for iz in 0..nz {
+                        let out_row = &mut out_sq[iz * nxy + col0..iz * nxy + col0 + width];
+                        for (k, dst) in out_row.iter_mut().enumerate() {
+                            *dst = part[(i + k) * nz + iz];
+                        }
                     }
+                    i += width;
                 }
                 offset += count;
             }
@@ -351,6 +401,37 @@ pub fn edt_3d_sq(dims: [usize; 3], cost: &[f32], out_sq: &mut [f32]) -> Result<(
     }
 
     Ok(())
+}
+
+/// Evaluates all Y lines within one contiguous `(ny * nx)` Z slice in
+/// `EDT_COL_BLOCK`-wide X strips so every gather/scatter hits full cache lines.
+fn edt_y_slice_blocked(nx: usize, ny: usize, z_slice: &mut [f64], sc: &mut EdtScratch) {
+    let mut ix0 = 0;
+    while ix0 < nx {
+        let width = (nx - ix0).min(EDT_COL_BLOCK);
+        for iy in 0..ny {
+            let row = &z_slice[iy * nx + ix0..iy * nx + ix0 + width];
+            for (k, &val) in row.iter().enumerate() {
+                sc.f[k * ny + iy] = val;
+            }
+        }
+        for k in 0..width {
+            let base = k * ny;
+            edt_1d(
+                &sc.f[base..base + ny],
+                &mut sc.d[base..base + ny],
+                &mut sc.v[..ny],
+                &mut sc.z[..=ny],
+            );
+        }
+        for iy in 0..ny {
+            let row = &mut z_slice[iy * nx + ix0..iy * nx + ix0 + width];
+            for (k, dst) in row.iter_mut().enumerate() {
+                *dst = sc.d[k * ny + iy];
+            }
+        }
+        ix0 += width;
+    }
 }
 
 /// Binary mask 3D Euclidean distance transform in local units:
@@ -573,35 +654,16 @@ pub fn fh_unsigned_grid(mesh: &Mesh, spec: GridSpec, max_voxels: usize) -> Resul
     }
 
     let parallel = total >= PAR_MIN_EDT_VOXELS && par::enabled() && !par::force_sequential();
-    let mask = if !parallel {
-        let mut mask = filled(total, false)?;
-        for (iz, tri_ids) in slice_tris.iter().enumerate() {
-            rasterize_unsigned_z_slice(
-                &spec,
-                &tris,
-                tri_ids,
-                iz,
-                half_h,
-                &mut mask[iz * nxy..(iz + 1) * nxy],
-            );
+    let mut mask = filled(total, false)?;
+    if !parallel {
+        for (iz, slice_mask) in mask.chunks_exact_mut(nxy).enumerate() {
+            rasterize_unsigned_z_slice(&spec, &tris, &slice_tris[iz], iz, half_h, slice_mask);
         }
-        mask
     } else {
-        let oom = || FieldsError::OutOfMemory;
-        allocation_allowed()?;
-        let parts = par::map_range(nz, 1, 0, oom, |r| {
-            let iz = r.start;
-            let mut slice_mask = filled(nxy, false)?;
-            rasterize_unsigned_z_slice(&spec, &tris, &slice_tris[iz], iz, half_h, &mut slice_mask);
-            Ok(slice_mask)
-        })?;
-        let mut mask = Vec::new();
-        reserve_exact(&mut mask, total)?;
-        for part in parts {
-            mask.extend_from_slice(&part);
-        }
-        mask
-    };
+        par::for_each_chunk_mut(&mut mask, nxy, PAR_MIN_EDT_VOXELS, |iz, slice_mask| {
+            rasterize_unsigned_z_slice(&spec, &tris, &slice_tris[iz], iz, half_h, slice_mask);
+        });
+    }
 
     drop(slice_tris);
     drop(tris);
@@ -657,21 +719,24 @@ fn classify_signed_y_row(
     z_tris: &[OrientedZTri],
     tri_ids: &[u32],
     iy: usize,
-    row_inside: &mut [bool],
+    row_inside: &mut [u8],
 ) -> Result<usize> {
     let nx = spec.dims[0];
     let nz = spec.dims[2];
+    if tri_ids.is_empty() {
+        return Ok(0);
+    }
     let ry = f64::from(spec.origin[1] + iy as f32 * spec.voxel_size);
+    let oom = || FieldsError::OutOfMemory;
 
-    let mut col_crossings: Vec<Vec<f64>> = filled(nx, Vec::new())?;
+    let mut crossings = SIGNED_CROSSINGS_SCRATCH.try_acquire_with(
+        tri_ids.len().max(16),
+        allocation_allowed,
+        oom,
+    )?;
     for &ti in tri_ids {
         let zt = &z_tris[ti as usize];
-        for (ix, crossings) in col_crossings
-            .iter_mut()
-            .enumerate()
-            .take(zt.ix1 + 1)
-            .skip(zt.ix0)
-        {
+        for ix in zt.ix0..=zt.ix1 {
             let rx = f64::from(spec.origin[0] + ix as f32 * spec.voxel_size);
             let (ok01, d01) = edge_left_sos(zt.p0, zt.p1, rx, ry);
             if !ok01 {
@@ -689,27 +754,35 @@ fn classify_signed_y_row(
             let b2 = d01 / zt.area2;
             let z_cross = (zt.p0[2] + b1 * (zt.p1[2] - zt.p0[2]) + b2 * (zt.p2[2] - zt.p0[2]))
                 .clamp(zt.z_min, zt.z_max);
-            push(crossings, z_cross)?;
+            crossings.try_push_with((ix as u32, z_cross), allocation_allowed, oom)?;
         }
     }
 
+    if crossings.is_empty() {
+        return Ok(0);
+    }
+    crossings.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
     let mut inside_count = 0usize;
-    for (ix, crossings) in col_crossings.iter_mut().enumerate() {
-        if crossings.is_empty() {
-            continue;
+    let mut start = 0usize;
+    while start < crossings.len() {
+        let ix = crossings[start].0 as usize;
+        let mut end = start + 1;
+        while end < crossings.len() && crossings[end].0 as usize == ix {
+            end += 1;
         }
-        crossings.sort_unstable_by(f64::total_cmp);
-        let mut cur = 0usize;
+        let mut cur = start;
         for iz in 0..nz {
             let z_node = f64::from(spec.origin[2] + iz as f32 * spec.voxel_size);
-            while cur < crossings.len() && crossings[cur] <= z_node {
+            while cur < end && crossings[cur].1 <= z_node {
                 cur += 1;
             }
-            if ((crossings.len() - cur) & 1) == 1 {
-                row_inside[iz * nx + ix] = true;
+            if ((end - cur) & 1) == 1 {
+                row_inside[iz * nx + ix] = 1;
                 inside_count += 1;
             }
         }
+        start = end;
     }
     Ok(inside_count)
 }
@@ -793,17 +866,24 @@ pub fn fh_signed_grid(mesh: &Mesh, spec: GridSpec, max_voxels: usize) -> Result<
     let parallel = total >= PAR_MIN_EDT_VOXELS && par::enabled() && !par::force_sequential();
     let (inside, inside_count) = if !parallel {
         let mut inside = filled(total, false)?;
-        let mut row_buf = filled(nx * nz, false)?;
+        let mut row_buf: ScratchU8 =
+            SCRATCH_U8
+                .try_acquire_with(nx * nz, allocation_allowed, || FieldsError::OutOfMemory)?;
+        row_buf.resize(nx * nz, 0);
         let mut count = 0usize;
         for (iy, tri_ids) in row_tris.iter().enumerate() {
-            row_buf.fill(false);
+            row_buf.fill(0);
             let c = classify_signed_y_row(&spec, &z_tris, tri_ids, iy, &mut row_buf)?;
             if c > 0 {
                 count += c;
                 for iz in 0..nz {
                     let dst = (iz * ny + iy) * nx;
                     let src = iz * nx;
-                    inside[dst..dst + nx].copy_from_slice(&row_buf[src..src + nx]);
+                    for (ix, &flag) in row_buf[src..src + nx].iter().enumerate() {
+                        if flag != 0 {
+                            inside[dst + ix] = true;
+                        }
+                    }
                 }
             }
         }
@@ -813,7 +893,7 @@ pub fn fh_signed_grid(mesh: &Mesh, spec: GridSpec, max_voxels: usize) -> Result<
         allocation_allowed()?;
         let parts = par::map_range(ny, 1, 0, oom, |r| {
             let iy = r.start;
-            let mut row_buf = filled(nx * nz, false)?;
+            let mut row_buf = filled(nx * nz, 0u8)?;
             let c = classify_signed_y_row(&spec, &z_tris, &row_tris[iy], iy, &mut row_buf)?;
             Ok((row_buf, c))
         })?;
@@ -825,7 +905,11 @@ pub fn fh_signed_grid(mesh: &Mesh, spec: GridSpec, max_voxels: usize) -> Result<
                 for iz in 0..nz {
                     let dst = (iz * ny + iy) * nx;
                     let src = iz * nx;
-                    inside[dst..dst + nx].copy_from_slice(&row_buf[src..src + nx]);
+                    for (ix, &flag) in row_buf[src..src + nx].iter().enumerate() {
+                        if flag != 0 {
+                            inside[dst + ix] = true;
+                        }
+                    }
                 }
             }
         }

@@ -146,6 +146,109 @@ impl Bvh {
             .traverse_by_key::<N, K>(self.root, key, |i, n, k| visit(NodeId(i), &self.view(n), k));
     }
 
+    /// Pair-keyed variant of [`Bvh::traverse_by_key`] that tests both children
+    /// of each inner node together.
+    pub fn traverse_by_pair<K: Copy + PartialOrd>(
+        &self,
+        pair_key: impl FnMut(&Aabb, &Aabb) -> (Option<K>, Option<K>),
+        visit: impl FnMut(NodeId, &NodeView, K) -> bool,
+    ) {
+        self.traverse_by_pair_with::<TRAVERSE_STACK, K>(pair_key, visit);
+    }
+
+    /// [`Bvh::traverse_by_pair`] with an `N`-entry stack, so tests can force
+    /// the overflow fallback.
+    pub(crate) fn traverse_by_pair_with<const N: usize, K: Copy + PartialOrd>(
+        &self,
+        pair_key: impl FnMut(&Aabb, &Aabb) -> (Option<K>, Option<K>),
+        mut visit: impl FnMut(NodeId, &NodeView, K) -> bool,
+    ) {
+        self.arena
+            .traverse_by_pair::<N, K>(self.root, pair_key, |i, n, k| {
+                visit(NodeId(i), &self.view(n), k)
+            });
+    }
+
+    /// Nearest-first ray-AABB traversal backed by [`crate::Aabb4`].
+    ///
+    /// Visits leaf triangle slices whose boxes intersect the conservative ray
+    /// slab `[min_t, cur_max]`. `visit_leaf` receives `(triangles, entry_t)`
+    /// and returns `Some(new_max_t)` to tighten the upper distance bound for
+    /// subsequent pruning, or `None` to stop traversal immediately.
+    pub fn traverse_ray_slab(
+        &self,
+        origin: [f32; 3],
+        inv_dir: [f32; 3],
+        min_t: f32,
+        max_t: f32,
+        mut visit_leaf: impl FnMut(&[TriangleId], f32) -> Option<f32>,
+    ) {
+        let mut cur_max = max_t;
+        let mut stopped = false;
+        self.arena.traverse_by_pair::<TRAVERSE_STACK, f32>(
+            self.root,
+            |a, b| {
+                let (mask, enter) =
+                    crate::Aabb4::from_two(a, b).ray_slab(origin, inv_dir, min_t, max_t);
+                (
+                    ((mask & 1) != 0).then_some(enter[0]),
+                    ((mask & 2) != 0).then_some(enter[1]),
+                )
+            },
+            |_, node, entry| {
+                if stopped || entry > cur_max {
+                    return false;
+                }
+                if node.is_leaf() {
+                    let tris = &self.arena.refs[node.leaf_range()];
+                    match visit_leaf(tris, entry) {
+                        Some(new_max) => cur_max = cur_max.min(new_max),
+                        None => stopped = true,
+                    }
+                }
+                !stopped
+            },
+        );
+    }
+
+    /// Nearest-first squared-distance traversal backed by [`crate::Aabb4`].
+    ///
+    /// Visits leaf triangle slices whose boxes have squared distance at most
+    /// `cur_max2` from `q`. `visit_leaf` returns `Some(new_max2)` to tighten the
+    /// pruning radius, or `None` to stop traversal immediately.
+    pub fn traverse_dist2(
+        &self,
+        q: [f32; 3],
+        max_dist2: f32,
+        mut visit_leaf: impl FnMut(&[TriangleId], f32) -> Option<f32>,
+    ) {
+        let mut cur_max2 = max_dist2;
+        let mut stopped = false;
+        self.arena.traverse_by_pair::<TRAVERSE_STACK, f32>(
+            self.root,
+            |a, b| {
+                let d2 = crate::Aabb4::from_two(a, b).point_dist2(q);
+                (
+                    (d2[0] <= max_dist2).then_some(d2[0]),
+                    (d2[1] <= max_dist2).then_some(d2[1]),
+                )
+            },
+            |_, node, d2| {
+                if stopped || d2 > cur_max2 {
+                    return false;
+                }
+                if node.is_leaf() {
+                    let tris = &self.arena.refs[node.leaf_range()];
+                    match visit_leaf(tris, d2) {
+                        Some(new_max2) => cur_max2 = cur_max2.min(new_max2),
+                        None => stopped = true,
+                    }
+                }
+                !stopped
+            },
+        );
+    }
+
     /// Visits the subtree rooted at `root` in depth-first pre-order (left child
     /// first), without a stack. `visit` returns whether to descend into the
     /// node's children (ignored for leaves). `root` must come from this BVH and
@@ -726,5 +829,65 @@ mod tests {
             },
         );
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn traverse_by_pair_and_slab_match_single_key() {
+        let mut tris = Vec::new();
+        let mut verts = Vec::new();
+        for i in 0..80 {
+            let x = (i % 10) as f32 * 2.0;
+            let y = (i / 10) as f32 * 2.0;
+            let base = (verts.len() / 3) as u32;
+            verts.extend_from_slice(&[x, y, 0.0, x + 1.0, y, 0.0, x, y + 1.0, 0.2]);
+            tris.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+        let mesh = Mesh::from_buffers(&verts, &tris).unwrap();
+        let bvh = build(&mesh);
+
+        let score = |b: &Aabb| (b.min[0] <= 12.0).then_some(b.min[0] + b.min[1]);
+        let mut single = Vec::new();
+        bvh.traverse_by_key(score, |id, _, k| {
+            single.push((id.0, k));
+            true
+        });
+        for stack_sz in [0usize, 2, TRAVERSE_STACK] {
+            let mut paired = Vec::new();
+            let pair = |a: &Aabb, b: &Aabb| (score(a), score(b));
+            if stack_sz == 0 {
+                bvh.traverse_by_pair_with::<0, _>(pair, |id, _, k| {
+                    paired.push((id.0, k));
+                    true
+                });
+            } else if stack_sz == 2 {
+                bvh.traverse_by_pair_with::<2, _>(pair, |id, _, k| {
+                    paired.push((id.0, k));
+                    true
+                });
+            } else {
+                bvh.traverse_by_pair(pair, |id, _, k| {
+                    paired.push((id.0, k));
+                    true
+                });
+            }
+            assert_eq!(paired, single);
+        }
+
+        let origin = [3.5, 4.5, -5.0];
+        let dir = [0.15, 0.05, 1.0];
+        let inv = [1.0 / dir[0], 1.0 / dir[1], 1.0 / dir[2]];
+        let mut slab_leaves = Vec::new();
+        bvh.traverse_ray_slab(origin, inv, 0.0, 50.0, |leaf, enter| {
+            slab_leaves.push((leaf.to_vec(), enter));
+            Some(50.0)
+        });
+        assert!(!slab_leaves.is_empty());
+
+        let mut dist_leaves = Vec::new();
+        bvh.traverse_dist2([4.0, 4.0, 0.0], 25.0, |leaf, d2| {
+            dist_leaves.push((leaf.to_vec(), d2));
+            Some(25.0)
+        });
+        assert!(!dist_leaves.is_empty());
     }
 }

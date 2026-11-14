@@ -1,11 +1,12 @@
 //! Closest-point queries against a mesh, accelerated by its BVH.
 
-use std::cell::Cell;
-
-use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
+#[cfg(test)]
+use fast_mesh_bvh::Aabb;
+use fast_mesh_bvh::Bvh;
 use fast_mesh_store::{Mesh, TriangleId, par};
 
 use crate::ray::{PAR_MIN_QUERIES, QUERY_CHUNK, points};
+use crate::simd::{Tri4, closest_on_triangles4};
 use crate::tri::{TriClosest, closest_on_triangle};
 use crate::{Feature, QueryError, Result, check};
 
@@ -41,6 +42,7 @@ pub struct ClosestHit {
 }
 
 /// Squared distance from `q` to the box `b`; zero when `q` is inside.
+#[cfg(test)]
 pub(crate) fn box_dist2(q: [f32; 3], b: &Aabb) -> f32 {
     let mut d2 = 0.0;
     for (i, &c) in q.iter().enumerate() {
@@ -71,37 +73,44 @@ fn validate_opts(opts: &ClosestOptions) -> Result<()> {
     Ok(())
 }
 
+fn update_best(
+    best: &mut Option<(TriangleId, TriClosest<f32>)>,
+    max2: f32,
+    id: TriangleId,
+    c: TriClosest<f32>,
+) -> f32 {
+    let better = match *best {
+        None => c.dist2 <= max2,
+        Some((bid, b)) => c.dist2 < b.dist2 || (c.dist2 == b.dist2 && id < bid),
+    };
+    if better {
+        *best = Some((id, c));
+        c.dist2
+    } else {
+        best.map_or(max2, |(_, b)| b.dist2)
+    }
+}
+
 fn closest(mesh: &Mesh, bvh: &Bvh, q: [f32; 3], opts: &ClosestOptions) -> Option<ClosestHit> {
     let max2 = opts.max_distance * opts.max_distance;
-    let best: Cell<Option<(TriangleId, TriClosest<f32>)>> = Cell::new(None);
-    let best_dist2 = || best.get().map_or(max2, |(_, c)| c.dist2);
-    bvh.traverse_by_key(
-        |b| {
-            let d2 = box_dist2(q, b);
-            (d2 <= max2).then_some(d2)
-        },
-        |_, node, d2| {
-            // Boxes at exactly the best distance are still visited, so that a
-            // tie can go to the smaller id.
-            if d2 > best_dist2() {
-                return false;
+    let mut best: Option<(TriangleId, TriClosest<f32>)> = None;
+    bvh.traverse_dist2(q, max2, |triangles, _| {
+        let mut cur_max2 = best.map_or(max2, |(_, c)| c.dist2);
+        let (chunks, rem) = triangles.as_chunks::<4>();
+        for &chunk in chunks {
+            let tri4 = Tri4::from_mesh(mesh, chunk);
+            let candidates = closest_on_triangles4(q, &tri4);
+            for (lane, c) in candidates.into_iter().enumerate() {
+                cur_max2 = update_best(&mut best, max2, chunk[lane], c);
             }
-            if let NodeKind::Leaf { triangles } = node.kind {
-                for &id in triangles {
-                    let c = closest_on_triangle(q, points(mesh, id));
-                    let better = match best.get() {
-                        None => c.dist2 <= max2,
-                        Some((bid, b)) => c.dist2 < b.dist2 || (c.dist2 == b.dist2 && id < bid),
-                    };
-                    if better {
-                        best.set(Some((id, c)));
-                    }
-                }
-            }
-            true
-        },
-    );
-    best.get().map(|(triangle, c)| ClosestHit {
+        }
+        for &id in rem {
+            let c = closest_on_triangle(q, points(mesh, id));
+            cur_max2 = update_best(&mut best, max2, id, c);
+        }
+        Some(cur_max2)
+    });
+    best.map(|(triangle, c)| ClosestHit {
         triangle,
         point: c.point,
         distance: c.dist2.sqrt(),

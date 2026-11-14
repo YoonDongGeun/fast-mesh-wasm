@@ -10,15 +10,15 @@
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions, grab};
 use fast_mesh_ops::remesh::{Region, RemeshOptions, remesh};
 use fast_mesh_ops::stretch::{StretchOptions, capture_rest_sizes, split_stretched};
 use fast_mesh_ops::{
     AnalyzeOptions, BooleanOp, ComponentOptions, FillOptions, IcpOptions, analyze, apply_boolean,
-    boolean_plan, boundary_loops, fill_holes, icp, orient, remove_small_components, sample_surface,
-    weld,
+    boolean_plan, boundary_loops, fill_holes, icp, marching_cubes_raw, orient,
+    remove_small_components, sample_surface, weld,
 };
 use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
@@ -163,31 +163,33 @@ fn terrain_with_specks(n: u32, count: u32) -> Buffers {
 }
 
 fn bench_analyze(c: &mut Criterion) {
-    let mesh = build(&terrain_buffers(N));
-    let bvh = Bvh::build(&mesh, &BuildOptions::default()).unwrap();
-    let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
-    eprintln!(
-        "analyze_1M: {} triangles, {} loops, {} components",
-        mesh.triangle_count(),
-        a.loops.len(),
-        a.components.len()
-    );
-    let with = AnalyzeOptions {
-        self_intersection: Some(&bvh),
-        ..AnalyzeOptions::default()
-    };
-    let a = analyze(&mesh, &with).unwrap();
-    eprintln!("analyze_1M: self_intersects = {:?}", a.self_intersects);
+    for (label, n) in [("100k", 224u32), ("1M", N)] {
+        let mesh = build(&terrain_buffers(n));
+        let bvh = Bvh::build(&mesh, &BuildOptions::default()).unwrap();
+        let a = analyze(&mesh, &AnalyzeOptions::default()).unwrap();
+        eprintln!(
+            "analyze_{label}: {} triangles, {} loops, {} components",
+            mesh.triangle_count(),
+            a.loops.len(),
+            a.components.len()
+        );
+        let with = AnalyzeOptions {
+            self_intersection: Some(&bvh),
+            ..AnalyzeOptions::default()
+        };
+        let a = analyze(&mesh, &with).unwrap();
+        eprintln!("analyze_{label}: self_intersects = {:?}", a.self_intersects);
 
-    let mut group = c.benchmark_group("ops analyze_1M");
-    group.sample_size(10);
-    group.bench_function("analyze", |b| {
-        b.iter(|| black_box(analyze(&mesh, &AnalyzeOptions::default()).unwrap()))
-    });
-    group.bench_function("analyze with self-intersection", |b| {
-        b.iter(|| black_box(analyze(&mesh, &with).unwrap()))
-    });
-    group.finish();
+        let mut group = c.benchmark_group(format!("ops analyze_{label}"));
+        group.sample_size(10);
+        group.bench_function("analyze", |b| {
+            b.iter(|| black_box(analyze(&mesh, &AnalyzeOptions::default()).unwrap()))
+        });
+        group.bench_function("analyze with self-intersection", |b| {
+            b.iter(|| black_box(analyze(&mesh, &with).unwrap()))
+        });
+        group.finish();
+    }
 }
 
 fn bench_orient(c: &mut Criterion) {
@@ -543,6 +545,49 @@ fn bench_boolean(c: &mut Criterion) {
     group.finish();
 }
 
+fn sphere_sdf(dims: [usize; 3]) -> Vec<f32> {
+    let [nx, ny, nz] = dims;
+    let center = [
+        (nx.saturating_sub(1)) as f32 * 0.5,
+        (ny.saturating_sub(1)) as f32 * 0.5,
+        (nz.saturating_sub(1)) as f32 * 0.5,
+    ];
+    let radius = (nx.min(ny).min(nz) as f32) * 0.38;
+    let mut values = vec![0.0f32; nx * ny * nz];
+    for iz in 0..nz {
+        let dz = iz as f32 - center[2];
+        for iy in 0..ny {
+            let dy = iy as f32 - center[1];
+            let row = (iz * ny + iy) * nx;
+            for ix in 0..nx {
+                let dx = ix as f32 - center[0];
+                values[row + ix] = (dx * dx + dy * dy + dz * dz).sqrt() - radius;
+            }
+        }
+    }
+    values
+}
+
+fn bench_marching_cubes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("marching_cubes");
+    group.sample_size(10);
+    for dim in [128usize, 256usize] {
+        let dims = [dim, dim, dim];
+        let values = sphere_sdf(dims);
+        let preview = marching_cubes_raw([0.0; 3], dims, 1.0, &values, 0.0).unwrap();
+        eprintln!(
+            "marching_cubes/{dim}_cubed: {} vertices, {} triangles",
+            preview.positions.len(),
+            preview.triangles.len()
+        );
+        group.throughput(Throughput::Elements((dim * dim * dim) as u64));
+        group.bench_function(format!("{dim}_cubed"), |b| {
+            b.iter(|| black_box(marching_cubes_raw([0.0; 3], dims, 1.0, &values, 0.0).unwrap()))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_analyze,
@@ -552,6 +597,7 @@ criterion_group!(
     bench_components,
     bench_icp,
     bench_stretch,
-    bench_boolean
+    bench_boolean,
+    bench_marching_cubes
 );
 criterion_main!(benches);

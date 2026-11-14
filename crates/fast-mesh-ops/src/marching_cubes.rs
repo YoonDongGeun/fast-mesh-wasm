@@ -49,6 +49,46 @@ const EDGE_DESC: [(u8, u8, u8, u8); 12] = [
     (1, 1, 0, 2), // 11: (1,1,0)-(1,1,1)
 ];
 
+/// Precomputed 12-bit owner edge mask indexed by `(bx) | (by << 1) | (bz << 2)`,
+/// where `bx = (ix + 1 == cx)`, `by = (iy + 1 == cy)`, `bz = (iz + 1 == cz)`.
+const OWNER_MASK: [u16; 8] = {
+    let mut masks = [0u16; 8];
+    let mut flags = 0usize;
+    while flags < 8 {
+        let bx = (flags & 1) != 0;
+        let by = (flags & 2) != 0;
+        let bz = (flags & 4) != 0;
+        let mut m = 0u16;
+        let mut e = 0usize;
+        while e < 12 {
+            let (dx0, dy0, dz0, _) = EDGE_DESC[e];
+            if (dx0 == 0 || bx) && (dy0 == 0 || by) && (dz0 == 0 || bz) {
+                m |= 1u16 << e;
+            }
+            e += 1;
+        }
+        masks[flags] = m;
+        flags += 1;
+    }
+    masks
+};
+
+#[inline]
+fn advance_cursor(keys: &[u64], cursor: &mut usize, min_key: u64) {
+    let mut i = *cursor;
+    if i >= keys.len() || keys[i] >= min_key {
+        return;
+    }
+    let quick = (i + 8).min(keys.len());
+    while i < quick && keys[i] < min_key {
+        i += 1;
+    }
+    if i == quick && i < keys.len() && keys[i] < min_key {
+        i += keys[i..].partition_point(|&k| k < min_key);
+    }
+    *cursor = i;
+}
+
 /// Precomputed triangulation for one 8-corner inside/outside bitmask.
 #[derive(Clone, Copy)]
 struct CubeCase {
@@ -431,68 +471,62 @@ pub fn marching_cubes_raw(
         let rem = range.start / cx;
         let mut iy = rem % cy;
         let mut iz = rem / cy;
+        let mut prev_mask = 0u8;
+        let mut can_slide = false;
 
         for cube_idx in range {
             let base = (iz * ny + iy) * nx + ix;
-            let mut mask = 0u8;
-            if values[base] < iso_value {
-                mask |= 1 << 0;
-            }
-            if values[base + 1] < iso_value {
-                mask |= 1 << 1;
-            }
-            if values[base + nx] < iso_value {
-                mask |= 1 << 2;
-            }
-            if values[base + nx + 1] < iso_value {
-                mask |= 1 << 3;
-            }
-            if values[base + nxy] < iso_value {
-                mask |= 1 << 4;
-            }
-            if values[base + nxy + 1] < iso_value {
-                mask |= 1 << 5;
-            }
-            if values[base + nxy + nx] < iso_value {
-                mask |= 1 << 6;
-            }
-            if values[base + nxy + nx + 1] < iso_value {
-                mask |= 1 << 7;
-            }
+            let mask = if can_slide {
+                ((prev_mask >> 1) & 0x55)
+                    | (((values[base + 1] < iso_value) as u8) << 1)
+                    | (((values[base + nx + 1] < iso_value) as u8) << 3)
+                    | (((values[base + nxy + 1] < iso_value) as u8) << 5)
+                    | (((values[base + nxy + nx + 1] < iso_value) as u8) << 7)
+            } else {
+                ((values[base] < iso_value) as u8)
+                    | (((values[base + 1] < iso_value) as u8) << 1)
+                    | (((values[base + nx] < iso_value) as u8) << 2)
+                    | (((values[base + nx + 1] < iso_value) as u8) << 3)
+                    | (((values[base + nxy] < iso_value) as u8) << 4)
+                    | (((values[base + nxy + 1] < iso_value) as u8) << 5)
+                    | (((values[base + nxy + nx] < iso_value) as u8) << 6)
+                    | (((values[base + nxy + nx + 1] < iso_value) as u8) << 7)
+            };
+            prev_mask = mask;
 
             let case = &CASES[mask as usize];
             if case.tri_count > 0 {
                 grow_push(&mut cubes, (cube_idx, mask))?;
                 tri_count += case.tri_count as usize;
 
-                let mut em = case.edge_mask;
+                let owner_idx = ((ix + 1 == cx) as usize)
+                    | (((iy + 1 == cy) as usize) << 1)
+                    | (((iz + 1 == cz) as usize) << 2);
+                let mut em = case.edge_mask & OWNER_MASK[owner_idx];
                 while em != 0 {
                     let e = em.trailing_zeros() as usize;
                     em &= em - 1;
                     let (dx0, dy0, dz0, axis) = EDGE_DESC[e];
-                    // Emit each global lattice edge once from its unique owner cube.
-                    if (dx0 == 0 || ix + 1 == cx)
-                        && (dy0 == 0 || iy + 1 == cy)
-                        && (dz0 == 0 || iz + 1 == cz)
-                    {
-                        let gx = ix + dx0 as usize;
-                        let gy = iy + dy0 as usize;
-                        let gz = iz + dz0 as usize;
-                        let node = (gz * ny + gy) * nx + gx;
-                        let key = ((node as u64) << 2) | (axis as u64);
-                        grow_push(&mut keys, key)?;
-                    }
+                    let gx = ix + dx0 as usize;
+                    let gy = iy + dy0 as usize;
+                    let gz = iz + dz0 as usize;
+                    let node = (gz * ny + gy) * nx + gx;
+                    let key = ((node as u64) << 2) | (axis as u64);
+                    grow_push(&mut keys, key)?;
                 }
             }
 
             ix += 1;
             if ix == cx {
                 ix = 0;
+                can_slide = false;
                 iy += 1;
                 if iy == cy {
                     iy = 0;
                     iz += 1;
                 }
+            } else {
+                can_slide = true;
             }
         }
 
@@ -565,12 +599,15 @@ pub fn marching_cubes_raw(
         let mut out = Vec::new();
         reserve(&mut out, part_tris)?;
 
+        let mut cursors = [0usize; 4];
         for &(cube_idx, mask) in slice {
             let ix = cube_idx % cx;
             let rem = cube_idx / cx;
             let iy = rem % cy;
             let iz = rem / cy;
 
+            let n0 = (iz * ny + iy) * nx + ix;
+            let rails = [n0, n0 + nx, n0 + nxy, n0 + nxy + nx];
             let case = &CASES[mask as usize];
             let mut local_verts = [0u32; 12];
             let mut em = case.edge_mask;
@@ -578,15 +615,19 @@ pub fn marching_cubes_raw(
                 let e = em.trailing_zeros() as usize;
                 em &= em - 1;
                 let (dx0, dy0, dz0, axis) = EDGE_DESC[e];
-                let gx = ix + dx0 as usize;
-                let gy = iy + dy0 as usize;
-                let gz = iz + dz0 as usize;
-                let node = (gz * ny + gy) * nx + gx;
-                let key = ((node as u64) << 2) | (axis as u64);
-                let vid = unique_keys
-                    .binary_search(&key)
-                    .expect("active edge key must be present") as u32;
-                local_verts[e] = vid;
+                let rail = ((dz0 as usize) << 1) | (dy0 as usize);
+                let base_key = (rails[rail] as u64) << 2;
+                advance_cursor(&unique_keys, &mut cursors[rail], base_key);
+                let key = (((rails[rail] + dx0 as usize) as u64) << 2) | (axis as u64);
+                let mut j = cursors[rail];
+                while j < unique_keys.len() && unique_keys[j] < key {
+                    j += 1;
+                }
+                assert!(
+                    j < unique_keys.len() && unique_keys[j] == key,
+                    "active edge key must be present"
+                );
+                local_verts[e] = j as u32;
             }
 
             for tri in &case.tris[..case.tri_count as usize] {

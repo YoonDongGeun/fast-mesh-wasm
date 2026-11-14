@@ -23,6 +23,7 @@ mod build;
 mod error;
 mod node;
 mod options;
+pub mod simd;
 mod tree;
 mod update;
 
@@ -32,5 +33,6 @@ pub use error::{BvhError, Result};
 pub use node::TRAVERSE_STACK;
 pub use node::{NodeId, NodeKind, NodeView};
 pub use options::{BuildOptions, Quality, UpdatePolicy};
+pub use simd::Aabb4;
 pub use tree::{Bvh, BvhBuild};
 pub use update::{Strategy, UpdateReport};
