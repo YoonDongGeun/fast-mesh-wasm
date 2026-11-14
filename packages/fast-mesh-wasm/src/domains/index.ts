@@ -34,13 +34,16 @@ export {
   type WorkerInspectDomain,
 } from "./inspect.js";
 export {
+  type AdaptiveRemeshOptions,
   createRemeshDomain,
+  type IsotropicRemeshOptions,
   type RegionRemeshOptions,
   type RemeshBackend,
   type RemeshDomain,
   type RemeshReturn,
   type SimplifyOptions,
   type SubdivideOptions,
+  type SurfaceRemeshOptions,
   type SyncRemeshDomain,
   type VoxelRemeshOptions,
   type WorkerRemeshDomain,

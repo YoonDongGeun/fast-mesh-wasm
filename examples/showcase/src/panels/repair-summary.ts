@@ -15,6 +15,7 @@ import type {
   SelfIntersectReport,
   SelfIntersectionMode,
   SliverReport,
+  SurfaceRemeshReport,
 } from "fast-mesh-wasm";
 import { type LengthUnit, toDisplayLength } from "./units";
 
@@ -209,6 +210,11 @@ export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: 
     case "cleanupSlivers": {
       const r = report as SliverReport;
       return `Cleanup slivers: collapsed ${plural(r.collapsedNeedles, "needle")}, flipped ${plural(r.flippedCaps, "cap")}, removed ${plural(r.removedDegenerate, "degenerate triangle")}`;
+    }
+    case "remeshSurface": {
+      const r = report as SurfaceRemeshReport;
+      const dropped = r.uvsDropped ? " (UVs dropped)" : "";
+      return `Surface remesh: ${plural(r.splits, "split")}, ${plural(r.collapses, "collapse")}, ${plural(r.flips, "flip")} in ${plural(r.iterationsRun, "iteration")}${dropped}`;
     }
     default: {
       const _exhaustive: never = op;

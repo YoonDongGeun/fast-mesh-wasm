@@ -38,6 +38,9 @@ fn edge_param(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f32 {
 }
 
 /// Options for [`simplify`].
+///
+/// For attribute-aware, error-bounded, ratio-based, or crease-locked
+/// decimation, use [`DecimateOptions`] with [`simplify_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimplifyOptions {
     /// Stop once this many triangles are alive. Must be at least 1; a target
@@ -90,8 +93,133 @@ impl SimplifyOptionsBuilder {
     }
 }
 
-/// Outcome of [`simplify`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Extended options for [`simplify_with`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecimateOptions {
+    /// Stop once this many triangles are alive (used when `target_ratio` is `None`).
+    /// Must be at least 1 unless `target_ratio` or `max_deviation` is set.
+    pub target_triangles: usize,
+    /// Target fraction of input live triangles in `(0.0, 1.0]`. When `Some(r)`,
+    /// resolves the triangle budget to `(live * r).round().max(1.0) as usize`.
+    pub target_ratio: Option<f32>,
+    /// Maximum allowed geometric root-quadric deviation. Collapses whose
+    /// geometric quadric error exceeds `delta^2` are stopped/skipped cleanly.
+    pub max_deviation: Option<f64>,
+    /// Keep boundary vertices in place: no edge touching a boundary vertex
+    /// collapses. Default `true`, so open rims keep their shape.
+    pub preserve_boundary: bool,
+    /// Use Hoppe (1999) appearance-aware UV quadrics, protect UV chart borders,
+    /// and block collapses that fold 2D UV triangles. Default `false`.
+    pub preserve_uvs: bool,
+    /// Penalize perpendicular displacement off sharp dihedral edges exceeding
+    /// [`DecimateOptions::crease_angle_deg`] and lock crease corners. Default `false`.
+    pub lock_creases: bool,
+    /// Dihedral angle threshold in degrees (`[0.0, 180.0]`) for crease detection
+    /// when [`DecimateOptions::lock_creases`] is `true`. Default `30.0`.
+    pub crease_angle_deg: f32,
+    /// Reject collapses that invert any 1-ring incident triangle normal by 90°
+    /// or more. Default `true`.
+    pub prevent_normal_inversion: bool,
+}
+
+/// Type alias for [`DecimateOptions`].
+pub type SimplifyExtendedOptions = DecimateOptions;
+
+impl Default for DecimateOptions {
+    fn default() -> Self {
+        DecimateOptions {
+            target_triangles: 0,
+            target_ratio: None,
+            max_deviation: None,
+            preserve_boundary: true,
+            preserve_uvs: false,
+            lock_creases: false,
+            crease_angle_deg: 30.0,
+            prevent_normal_inversion: true,
+        }
+    }
+}
+
+impl From<SimplifyOptions> for DecimateOptions {
+    fn from(o: SimplifyOptions) -> Self {
+        DecimateOptions {
+            target_triangles: o.target_triangles,
+            preserve_boundary: o.preserve_boundary,
+            ..DecimateOptions::default()
+        }
+    }
+}
+
+impl DecimateOptions {
+    /// A builder for [`DecimateOptions`].
+    pub fn builder() -> DecimateOptionsBuilder {
+        DecimateOptionsBuilder::default()
+    }
+}
+
+/// Builder for [`DecimateOptions`].
+#[derive(Debug, Clone, Default)]
+pub struct DecimateOptionsBuilder {
+    options: DecimateOptions,
+}
+
+impl DecimateOptionsBuilder {
+    /// Stop once this many triangles are alive (when `target_ratio` is `None`).
+    pub fn target_triangles(mut self, target: usize) -> Self {
+        self.options.target_triangles = target;
+        self
+    }
+
+    /// Fraction of live triangles to keep, in `(0.0, 1.0]`.
+    pub fn target_ratio(mut self, ratio: f32) -> Self {
+        self.options.target_ratio = Some(ratio);
+        self
+    }
+
+    /// Maximum allowed geometric root-quadric error in mesh units.
+    pub fn max_deviation(mut self, max_deviation: f64) -> Self {
+        self.options.max_deviation = Some(max_deviation);
+        self
+    }
+
+    /// Keep boundary vertices in place.
+    pub fn preserve_boundary(mut self, preserve: bool) -> Self {
+        self.options.preserve_boundary = preserve;
+        self
+    }
+
+    /// Enable Hoppe (1999) appearance-aware UV quadrics and anti-tear checks.
+    pub fn preserve_uvs(mut self, preserve: bool) -> Self {
+        self.options.preserve_uvs = preserve;
+        self
+    }
+
+    /// Lock sharp crease edges/corners and restrict ridge sliding along creases.
+    pub fn lock_creases(mut self, lock: bool) -> Self {
+        self.options.lock_creases = lock;
+        self
+    }
+
+    /// Dihedral crease angle threshold in degrees (`[0.0, 180.0]`).
+    pub fn crease_angle_deg(mut self, deg: f32) -> Self {
+        self.options.crease_angle_deg = deg;
+        self
+    }
+
+    /// Reject 1-ring triangle normal inversions (`> 90°`) on collapse.
+    pub fn prevent_normal_inversion(mut self, prevent: bool) -> Self {
+        self.options.prevent_normal_inversion = prevent;
+        self
+    }
+
+    /// The options as set.
+    pub fn build(self) -> DecimateOptions {
+        self.options
+    }
+}
+
+/// Outcome of [`simplify`] and [`simplify_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SimplifyReport {
     /// Edge collapses performed.
     pub collapsed: usize,
@@ -99,6 +227,8 @@ pub struct SimplifyReport {
     pub triangles_removed: usize,
     /// Vertices removed (one per collapse).
     pub vertices_removed: usize,
+    /// Maximum root-quadric geometric error observed across accepted collapses.
+    pub max_deviation_achieved: f64,
 }
 
 /// A working triangle: `id` is its slot in the store.
@@ -174,6 +304,32 @@ fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// Weighted quadric of any unit plane `n . p + d = 0` (`d = -n . p0`).
+fn plane_quadric(n: [f64; 3], p0: [f64; 3], weight: f64) -> Quadric {
+    let d = -dot3(n, p0);
+    if !d.is_finite() {
+        return [0.0; 10];
+    }
+    outer_quadric([n[0], n[1], n[2], d], weight)
+}
+
+/// Weighted symmetric outer product `weight * v * v^T` as upper triangle.
+fn outer_quadric(v: [f64; 4], weight: f64) -> Quadric {
+    let mut q = [0.0; 10];
+    let mut k = 0;
+    for i in 0..4 {
+        for j in i..4 {
+            let val = weight * v[i] * v[j];
+            if !val.is_finite() {
+                return [0.0; 10];
+            }
+            q[k] = val;
+            k += 1;
+        }
+    }
+    q
+}
+
 /// The quadric of one face plane: squared distance to it.
 fn face_quadric(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Quadric {
     let n = cross3(sub3(p1, p0), sub3(p2, p0));
@@ -185,20 +341,124 @@ fn face_quadric(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> Quadric {
     if !n.iter().all(|c| c.is_finite()) {
         return [0.0; 10];
     }
-    let d = -dot3(n, p0);
-    if !d.is_finite() {
-        return [0.0; 10];
+    plane_quadric(n, p0, 1.0)
+}
+
+fn add_quadric(dst: &mut Quadric, src: &Quadric) {
+    for k in 0..10 {
+        dst[k] += src[k];
     }
-    let v = [n[0], n[1], n[2], d];
-    let mut q = [0.0; 10];
-    let mut k = 0;
-    for i in 0..4 {
-        for j in i..4 {
-            q[k] = v[i] * v[j];
-            k += 1;
+}
+
+/// Additive Hoppe (1999) appearance-attribute accumulator for scalar `(u, v)`
+/// channels, Schur-complemented back to a 3D spatial quadric over `p`.
+#[derive(Clone, Copy, Default)]
+struct AttrQuadric {
+    w: f64,
+    gu: [f64; 3],
+    du: f64,
+    gv: [f64; 3],
+    dv: f64,
+    q_lin: Quadric,
+}
+
+impl AttrQuadric {
+    fn from_face(p: [[f64; 3]; 3], uv: [[f64; 2]; 3], weight: f64) -> Self {
+        if !weight.is_finite() || weight <= 0.0 {
+            return Self::default();
+        }
+        let e1 = sub3(p[1], p[0]);
+        let e2 = sub3(p[2], p[0]);
+        let n = cross3(e1, e2);
+        let n2 = dot3(n, n);
+        if !n2.is_finite() || n2 <= 1e-24 {
+            return Self::default();
+        }
+        let c1 = cross3(e2, n);
+        let c2 = cross3(n, e1);
+        let g1 = [c1[0] / n2, c1[1] / n2, c1[2] / n2];
+        let g2 = [c2[0] / n2, c2[1] / n2, c2[2] / n2];
+
+        let du1 = uv[1][0] - uv[0][0];
+        let du2 = uv[2][0] - uv[0][0];
+        let dv1 = uv[1][1] - uv[0][1];
+        let dv2 = uv[2][1] - uv[0][1];
+        let gu = [
+            du1 * g1[0] + du2 * g2[0],
+            du1 * g1[1] + du2 * g2[1],
+            du1 * g1[2] + du2 * g2[2],
+        ];
+        let gv = [
+            dv1 * g1[0] + dv2 * g2[0],
+            dv1 * g1[1] + dv2 * g2[1],
+            dv1 * g1[2] + dv2 * g2[2],
+        ];
+        let du = uv[0][0] - dot3(gu, p[0]);
+        let dv = uv[0][1] - dot3(gv, p[0]);
+        if !gu.iter().all(|c| c.is_finite())
+            || !gv.iter().all(|c| c.is_finite())
+            || !du.is_finite()
+            || !dv.is_finite()
+        {
+            return Self::default();
+        }
+        let qu = outer_quadric([gu[0], gu[1], gu[2], du], weight);
+        let qv = outer_quadric([gv[0], gv[1], gv[2], dv], weight);
+        let mut q_lin = qu;
+        add_quadric(&mut q_lin, &qv);
+        Self {
+            w: weight,
+            gu: [gu[0] * weight, gu[1] * weight, gu[2] * weight],
+            du: du * weight,
+            gv: [gv[0] * weight, gv[1] * weight, gv[2] * weight],
+            dv: dv * weight,
+            q_lin,
         }
     }
-    q
+
+    fn merge(&self, other: &Self) -> Self {
+        let mut q_lin = self.q_lin;
+        add_quadric(&mut q_lin, &other.q_lin);
+        Self {
+            w: self.w + other.w,
+            gu: [
+                self.gu[0] + other.gu[0],
+                self.gu[1] + other.gu[1],
+                self.gu[2] + other.gu[2],
+            ],
+            du: self.du + other.du,
+            gv: [
+                self.gv[0] + other.gv[0],
+                self.gv[1] + other.gv[1],
+                self.gv[2] + other.gv[2],
+            ],
+            dv: self.dv + other.dv,
+            q_lin,
+        }
+    }
+
+    /// Schur complement reducing the 5D `(x, y, z, u, v)` quadric into 3D.
+    fn schur_3d(&self) -> Quadric {
+        if !self.w.is_finite() || self.w <= 1e-24 {
+            return [0.0; 10];
+        }
+        let inv_w = 1.0 / self.w;
+        let sub_u = outer_quadric([self.gu[0], self.gu[1], self.gu[2], self.du], inv_w);
+        let sub_v = outer_quadric([self.gv[0], self.gv[1], self.gv[2], self.dv], inv_w);
+        let mut out = self.q_lin;
+        for k in 0..10 {
+            out[k] -= sub_u[k] + sub_v[k];
+        }
+        out
+    }
+}
+
+fn cross2d(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f64 {
+    let abx = f64::from(b[0]) - f64::from(a[0]);
+    let aby = f64::from(b[1]) - f64::from(a[1]);
+    let acx = f64::from(c[0]) - f64::from(a[0]);
+    let acy = f64::from(c[1]) - f64::from(a[1]);
+    abx * acy - aby * acx
 }
 
 /// The quadric error of `p`: `p^T A p + 2 b^T p + q33`.
@@ -286,7 +546,7 @@ fn apex_of(corners: &[u32; 3], a: u32, b: u32) -> u32 {
     }
 }
 
-/// Reusable scratch buffers for edge collapses inside [`simplify`].
+/// Reusable scratch buffers for edge collapses inside [`simplify_with`].
 #[derive(Default)]
 struct CollapseScratch {
     owners: Vec<usize>,
@@ -297,6 +557,7 @@ struct CollapseScratch {
     fan: Vec<usize>,
     v2t_drop: Vec<u32>,
     ring: Vec<u32>,
+    tri_keys: Vec<[u32; 3]>,
 }
 
 /// Fills `owners` with the sorted, unique alive working triangles carrying `(a, b)`.
@@ -344,6 +605,132 @@ fn tri_normal(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> [f64; 3] {
     cross3(sub3(p1, p0), sub3(p2, p0))
 }
 
+fn sorted_triple(mut c: [u32; 3]) -> [u32; 3] {
+    if c[0] > c[1] {
+        c.swap(0, 1);
+    }
+    if c[1] > c[2] {
+        c.swap(1, 2);
+    }
+    if c[0] > c[1] {
+        c.swap(0, 1);
+    }
+    c
+}
+
+const CREASE_PENALTY_WEIGHT: f64 = 100.0;
+
+fn validate_decimate(options: &DecimateOptions) -> Result<()> {
+    if let Some(r) = options.target_ratio
+        && (!r.is_finite() || r <= 0.0 || r > 1.0)
+    {
+        return Err(OpsError::InvalidInput(
+            "simplify target_ratio must be finite and in (0, 1]",
+        ));
+    }
+    if let Some(d) = options.max_deviation
+        && (!d.is_finite() || d < 0.0)
+    {
+        return Err(OpsError::InvalidInput(
+            "simplify max_deviation must be finite and non-negative",
+        ));
+    }
+    if !options.crease_angle_deg.is_finite() || !(0.0..=180.0).contains(&options.crease_angle_deg) {
+        return Err(OpsError::InvalidInput(
+            "simplify crease_angle_deg must be finite and in [0, 180]",
+        ));
+    }
+    if options.target_triangles == 0
+        && options.target_ratio.is_none()
+        && options.max_deviation.is_none()
+    {
+        return Err(OpsError::InvalidInput(
+            "simplify target_triangles must be at least 1",
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluates collapse candidate `(a, b)`, respecting boundary, crease, and UV seam locks.
+/// Returns `(target_pos_f64, heap_cost, geom_cost)` or `None` when forbidden by constraints.
+#[allow(clippy::too_many_arguments)]
+fn candidate_solve(
+    a: u32,
+    b: u32,
+    options: &DecimateOptions,
+    has_uvs: bool,
+    positions: &[[f32; 3]],
+    is_boundary: &[bool],
+    vert_crease: &[u8],
+    crease_adj: &[Vec<u32>],
+    quadrics: &[Quadric],
+    aux_quadrics: Option<&[Quadric]>,
+    attr_quadrics: Option<&[AttrQuadric]>,
+) -> Option<([f64; 3], f64, f64)> {
+    let ba = is_boundary[a as usize];
+    let bb = is_boundary[b as usize];
+    if options.preserve_boundary && (ba || bb) {
+        return None;
+    }
+
+    let mut forced: Option<[f64; 3]> = None;
+    let pa = f64v(&positions[a as usize]);
+    let pb = f64v(&positions[b as usize]);
+
+    if options.lock_creases {
+        let ca = vert_crease[a as usize];
+        let cb = vert_crease[b as usize];
+        let is_ce = crease_adj[a as usize].contains(&b);
+        if ca == 2 && cb == 2 {
+            return None;
+        }
+        if ca >= 1 && cb >= 1 && !is_ce {
+            return None;
+        }
+        if ca == 2 || (ca >= 1 && cb == 0) {
+            forced = Some(pa);
+        } else if cb == 2 || (cb >= 1 && ca == 0) {
+            forced = Some(pb);
+        }
+    }
+
+    if forced.is_none() && options.preserve_uvs && has_uvs && ba != bb {
+        forced = Some(if ba { pa } else { pb });
+    }
+
+    let mut q_geom = quadrics[a as usize];
+    add_quadric(&mut q_geom, &quadrics[b as usize]);
+    let mut q_total = q_geom;
+    if let Some(aux) = aux_quadrics {
+        add_quadric(&mut q_total, &aux[a as usize]);
+        add_quadric(&mut q_total, &aux[b as usize]);
+    }
+    if let Some(attr) = attr_quadrics {
+        let merged = attr[a as usize].merge(&attr[b as usize]).schur_3d();
+        add_quadric(&mut q_total, &merged);
+    }
+
+    let (pnew, heap_cost) = if let Some(fp) = forced {
+        let cost = quad_error(&q_total, fp);
+        let c = if cost.is_finite() {
+            cost.max(0.0)
+        } else {
+            let d = sub3(pa, pb);
+            dot3(d, d)
+        };
+        (fp, c)
+    } else {
+        optimal_position(&q_total, pa, pb)
+    };
+    let raw_geom = quad_error(&q_geom, pnew);
+    let geom_cost = if raw_geom.is_finite() {
+        raw_geom.max(0.0)
+    } else {
+        heap_cost
+    };
+    Some((pnew, heap_cost, geom_cost))
+}
+
 /// Shrinks the mesh toward `options.target_triangles` by quadric-error edge
 /// collapses (see the module docs). Boundary vertices stay put when
 /// `preserve_boundary` is set. Stops early when no valid collapse is left,
@@ -357,18 +744,27 @@ fn tri_normal(p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]) -> [f64; 3] {
 /// [`OpsError::InvalidInput`] for a zero target; [`OpsError::Store`] when
 /// memory runs out.
 pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<SimplifyReport> {
-    if options.target_triangles == 0 {
-        return Err(OpsError::InvalidInput(
-            "simplify target_triangles must be at least 1",
-        ));
-    }
+    simplify_with(tx, &DecimateOptions::from(*options))
+}
+
+/// Shrinks the mesh according to [`DecimateOptions`] with optional ratio target,
+/// geometric error bound, Hoppe UV preservation, crease locking, and fold checks.
+///
+/// # Errors
+/// [`OpsError::InvalidInput`] on invalid options; [`OpsError::Store`] on OOM.
+pub fn simplify_with(tx: &mut Transaction, options: &DecimateOptions) -> Result<SimplifyReport> {
+    validate_decimate(options)?;
     let mesh = tx.mesh();
     let base = mesh.positions();
     let mut positions: Vec<[f32; 3]> = Vec::new();
     reserve(&mut positions, base.len())?;
     positions.extend_from_slice(base);
     let slots = positions.len();
-    // The working UVs, on a mesh with them.
+    let mut was_alive = filled(slots, false)?;
+    for (v, alive) in was_alive.iter_mut().enumerate() {
+        *alive = mesh.is_vertex_alive(v as VertexId);
+    }
+
     let mut uvs: Option<Vec<f32>> = None;
     if let Some(from) = mesh.uvs() {
         let mut copy = Vec::new();
@@ -395,7 +791,14 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         )?;
     }
     let mut live = tris.len();
-    if live <= options.target_triangles {
+    let target = if let Some(r) = options.target_ratio {
+        ((live as f64) * f64::from(r)).round().max(1.0) as usize
+    } else if options.target_triangles > 0 {
+        options.target_triangles
+    } else {
+        1
+    };
+    if live <= target {
         return Ok(SimplifyReport::default());
     }
 
@@ -410,38 +813,175 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
             f64v(&positions[c[2] as usize]),
         );
         for &v in &c {
-            for k in 0..10 {
-                quadrics[v as usize][k] += q[k];
-            }
+            add_quadric(&mut quadrics[v as usize], &q);
         }
     }
 
-    // Boundary vertices: endpoints of edges one live triangle uses.
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
-    reserve(&mut pairs, 3 * tris.len())?;
-    for tri in &tris {
+    // Collect undirected edges paired with owning working triangle indices.
+    let mut edge_tris: Vec<((u32, u32), u32)> = Vec::new();
+    reserve(&mut edge_tris, 3 * tris.len())?;
+    for (ti, tri) in tris.iter().enumerate() {
         let c = tri.corners;
         for k in 0..3 {
-            push(&mut pairs, key(c[k], c[(k + 1) % 3]))?;
+            push(&mut edge_tris, (key(c[k], c[(k + 1) % 3]), ti as u32))?;
         }
     }
-    pairs.sort_unstable();
+    edge_tris.sort_unstable();
+
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    reserve(&mut pairs, edge_tris.len() / 2 + 1)?;
     let mut is_boundary = filled(slots, false)?;
+    let mut aux_quadrics: Option<Vec<Quadric>> = if options.lock_creases {
+        let mut aq = Vec::new();
+        reserve(&mut aq, slots)?;
+        aq.resize(slots, [0.0; 10]);
+        Some(aq)
+    } else {
+        None
+    };
+    let mut crease_adj: Vec<Vec<u32>> = Vec::new();
+    if options.lock_creases {
+        reserve(&mut crease_adj, slots)?;
+        crease_adj.resize_with(slots, Vec::new);
+    }
+    let cos_crease = f64::from(options.crease_angle_deg).to_radians().cos();
+
     {
         let mut start = 0;
-        while start < pairs.len() {
+        while start < edge_tris.len() {
+            let e = edge_tris[start].0;
             let mut end = start + 1;
-            while end < pairs.len() && pairs[end] == pairs[start] {
+            while end < edge_tris.len() && edge_tris[end].0 == e {
                 end += 1;
             }
-            if end - start == 1 {
-                is_boundary[pairs[start].0 as usize] = true;
-                is_boundary[pairs[start].1 as usize] = true;
+            push(&mut pairs, e)?;
+            let count = end - start;
+            if count == 1 {
+                is_boundary[e.0 as usize] = true;
+                is_boundary[e.1 as usize] = true;
+            } else if options.lock_creases {
+                let mut is_sharp = count > 2;
+                if count == 2 {
+                    let t0 = tris[edge_tris[start].1 as usize].corners;
+                    let t1 = tris[edge_tris[start + 1].1 as usize].corners;
+                    let n0 = tri_normal(
+                        f64v(&positions[t0[0] as usize]),
+                        f64v(&positions[t0[1] as usize]),
+                        f64v(&positions[t0[2] as usize]),
+                    );
+                    let n1 = tri_normal(
+                        f64v(&positions[t1[0] as usize]),
+                        f64v(&positions[t1[1] as usize]),
+                        f64v(&positions[t1[2] as usize]),
+                    );
+                    let l0 = dot3(n0, n0).sqrt();
+                    let l1 = dot3(n1, n1).sqrt();
+                    if l0 > 0.0 && l1 > 0.0 {
+                        let c = (dot3(n0, n1) / (l0 * l1)).clamp(-1.0, 1.0);
+                        is_sharp = c < cos_crease - 1e-12;
+                    }
+                }
+                if is_sharp {
+                    push(&mut crease_adj[e.0 as usize], e.1)?;
+                    push(&mut crease_adj[e.1 as usize], e.0)?;
+                    let p0 = f64v(&positions[e.0 as usize]);
+                    let p1 = f64v(&positions[e.1 as usize]);
+                    let edir = sub3(p1, p0);
+                    let elen = dot3(edir, edir).sqrt();
+                    if elen > 1e-12
+                        && let Some(aq) = &mut aux_quadrics
+                    {
+                        let d_unit = [edir[0] / elen, edir[1] / elen, edir[2] / elen];
+                        for &(_, ti) in &edge_tris[start..end] {
+                            let tc = tris[ti as usize].corners;
+                            let fn_raw = tri_normal(
+                                f64v(&positions[tc[0] as usize]),
+                                f64v(&positions[tc[1] as usize]),
+                                f64v(&positions[tc[2] as usize]),
+                            );
+                            let fn_len = dot3(fn_raw, fn_raw).sqrt();
+                            if fn_len > 1e-12 {
+                                let nf =
+                                    [fn_raw[0] / fn_len, fn_raw[1] / fn_len, fn_raw[2] / fn_len];
+                                let perp_raw = cross3(d_unit, nf);
+                                let pl = dot3(perp_raw, perp_raw).sqrt();
+                                if pl > 1e-12 {
+                                    let pn = [perp_raw[0] / pl, perp_raw[1] / pl, perp_raw[2] / pl];
+                                    let pq = plane_quadric(pn, p0, CREASE_PENALTY_WEIGHT);
+                                    add_quadric(&mut aq[e.0 as usize], &pq);
+                                    add_quadric(&mut aq[e.1 as usize], &pq);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             start = end;
         }
     }
-    pairs.dedup();
+
+    let mut vert_crease = filled(slots, 0u8)?;
+    if options.lock_creases {
+        for v in 0..slots {
+            crease_adj[v].sort_unstable();
+            crease_adj[v].dedup();
+            let deg = crease_adj[v].len();
+            if deg == 1 || deg >= 3 {
+                vert_crease[v] = 2;
+            } else if deg == 2 {
+                let pv = f64v(&positions[v]);
+                let p0 = f64v(&positions[crease_adj[v][0] as usize]);
+                let p1 = f64v(&positions[crease_adj[v][1] as usize]);
+                let d0 = sub3(p0, pv);
+                let d1 = sub3(p1, pv);
+                let l0 = dot3(d0, d0).sqrt();
+                let l1 = dot3(d1, d1).sqrt();
+                let sharp_turn = if l0 > 1e-12 && l1 > 1e-12 {
+                    dot3(d0, d1) / (l0 * l1) > -0.5
+                } else {
+                    true
+                };
+                vert_crease[v] = if sharp_turn { 2 } else { 1 };
+            }
+        }
+    }
+
+    let mut attr_quadrics: Option<Vec<AttrQuadric>> = None;
+    if options.preserve_uvs
+        && let Some(uv) = &uvs
+    {
+        let mut sum_pos = 0.0;
+        let mut sum_uv = 0.0;
+        for &(u, v) in &pairs {
+            let d3 = sub3(f64v(&positions[u as usize]), f64v(&positions[v as usize]));
+            sum_pos += dot3(d3, d3).sqrt();
+            let du = f64::from(uv[2 * u as usize]) - f64::from(uv[2 * v as usize]);
+            let dv = f64::from(uv[2 * u as usize + 1]) - f64::from(uv[2 * v as usize + 1]);
+            sum_uv += (du * du + dv * dv).sqrt();
+        }
+        let uv_scale = if sum_uv > 1e-12 {
+            (sum_pos / sum_uv).clamp(1e-4, 1e4)
+        } else {
+            1.0
+        };
+        let uv_weight = 0.25 * uv_scale * uv_scale;
+        let mut aq = Vec::new();
+        reserve(&mut aq, slots)?;
+        aq.resize(slots, AttrQuadric::default());
+        for tri in &tris {
+            let c = tri.corners;
+            let pts = c.map(|v| f64v(&positions[v as usize]));
+            let uvs_f = c.map(|v| {
+                let i = 2 * v as usize;
+                [f64::from(uv[i]), f64::from(uv[i + 1])]
+            });
+            let fq = AttrQuadric::from_face(pts, uvs_f, uv_weight);
+            for &v in &c {
+                aq[v as usize] = aq[v as usize].merge(&fq);
+            }
+        }
+        attr_quadrics = Some(aq);
+    }
 
     let mut v2t: Vec<Vec<u32>> = Vec::new();
     reserve(&mut v2t, slots)?;
@@ -452,25 +992,28 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         }
     }
 
-    let mut vlive = filled(slots, true)?;
+    let mut vlive = was_alive.clone();
     let mut moved = filled(slots, false)?;
     let mut v_ver = filled(slots, 0u32)?;
     let mut heap = BinaryHeap::new();
     heap.try_reserve(pairs.len())
         .map_err(|_| OpsError::Store(fast_mesh_store::StoreError::OutOfMemory))?;
     for &(a, b) in &pairs {
-        if options.preserve_boundary && (is_boundary[a as usize] || is_boundary[b as usize]) {
+        let Some((_, cost, _)) = candidate_solve(
+            a,
+            b,
+            options,
+            uvs.is_some(),
+            &positions,
+            &is_boundary,
+            &vert_crease,
+            &crease_adj,
+            &quadrics,
+            aux_quadrics.as_deref(),
+            attr_quadrics.as_deref(),
+        ) else {
             continue;
-        }
-        let mut q = [0.0; 10];
-        for k in 0..10 {
-            q[k] = quadrics[a as usize][k] + quadrics[b as usize][k];
-        }
-        let (_, cost) = optimal_position(
-            &q,
-            f64v(&positions[a as usize]),
-            f64v(&positions[b as usize]),
-        );
+        };
         heap.push(HeapEntry {
             cost,
             a,
@@ -480,13 +1023,22 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         });
     }
 
+    let max_cost2 = options.max_deviation.map(|d| d * d);
+    let pure_geom = !options.preserve_uvs && !options.lock_creases;
+    let mut max_dev_achieved = 0.0f64;
     let mut collapsed = 0usize;
     let mut sc = CollapseScratch::default();
 
-    while live > options.target_triangles {
+    while live > target {
         let Some(top) = heap.pop() else {
             break;
         };
+        if pure_geom
+            && let Some(limit2) = max_cost2
+            && top.cost > limit2
+        {
+            break;
+        }
         let (a, b) = (top.a, top.b);
         if !vlive[a as usize]
             || !vlive[b as usize]
@@ -523,13 +1075,28 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         if sc.common != sc.apexes {
             continue;
         }
-        let mut qsum = [0.0; 10];
-        for k in 0..10 {
-            qsum[k] = quadrics[a as usize][k] + quadrics[b as usize][k];
+
+        let Some((pnew, _heap_cost, geom_cost)) = candidate_solve(
+            a,
+            b,
+            options,
+            uvs.is_some(),
+            &positions,
+            &is_boundary,
+            &vert_crease,
+            &crease_adj,
+            &quadrics,
+            aux_quadrics.as_deref(),
+            attr_quadrics.as_deref(),
+        ) else {
+            continue;
+        };
+        if let Some(limit2) = max_cost2
+            && geom_cost > limit2
+        {
+            continue;
         }
-        let pa = f64v(&positions[a as usize]);
-        let pb = f64v(&positions[b as usize]);
-        let (pnew, _cost) = optimal_position(&qsum, pa, pb);
+
         // Keep the smaller id so repeated runs agree on the survivor.
         let (keep, drop) = if a < b { (a, b) } else { (b, a) };
         if !pnew.iter().all(|c| c.is_finite()) {
@@ -539,8 +1106,9 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         if !pnew32.iter().all(|c| c.is_finite()) {
             continue;
         }
-        // No folded fan triangle: every repointed triangle must keep the
-        // sign of its normal and a non-zero area.
+        let pa = f64v(&positions[a as usize]);
+        let pb = f64v(&positions[b as usize]);
+
         sc.fan.clear();
         reserve(&mut sc.fan, sc.na.len() + sc.nb.len())?;
         for &v in &[a, b] {
@@ -559,9 +1127,23 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
             f64::from(pnew32[1]),
             f64::from(pnew32[2]),
         ];
+
+        let candidate_uv = uvs.as_ref().map(|uv| {
+            let f = edge_param(keep_pos, pa, pb);
+            let (ia, ib) = (2 * a as usize, 2 * b as usize);
+            [
+                uv[ia] + f * (uv[ib] - uv[ia]),
+                uv[ia + 1] + f * (uv[ib + 1] - uv[ia + 1]),
+            ]
+        });
+
+        sc.tri_keys.clear();
+        reserve(&mut sc.tri_keys, sc.fan.len())?;
         let mut folds = false;
         for &i in &sc.fan {
             let old = tris[i].corners;
+            let mapped = old.map(|v| if v == drop { keep } else { v });
+            push(&mut sc.tri_keys, sorted_triple(mapped))?;
             let pts = [
                 f64v(&positions[old[0] as usize]),
                 f64v(&positions[old[1] as usize]),
@@ -580,25 +1162,82 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
                 }
             });
             let after = tri_normal(new[0], new[1], new[2]);
-            if dot3(after, after) == 0.0 || dot3(after, before) <= 0.0 {
+            if dot3(after, after) == 0.0
+                || (options.prevent_normal_inversion && dot3(after, before) <= 0.0)
+            {
                 folds = true;
                 break;
+            }
+            if options.preserve_uvs
+                && let (Some(uv), Some(new_uv)) = (&uvs, candidate_uv)
+            {
+                let uv_v = |v: u32| -> [f32; 2] { [uv[2 * v as usize], uv[2 * v as usize + 1]] };
+                let buv = cross2d(uv_v(old[0]), uv_v(old[1]), uv_v(old[2]));
+                if buv.abs() > 1e-16 {
+                    let auv_pts = old.map(|v| {
+                        if v == keep || v == drop {
+                            new_uv
+                        } else {
+                            uv_v(v)
+                        }
+                    });
+                    let auv = cross2d(auv_pts[0], auv_pts[1], auv_pts[2]);
+                    if auv * buv <= 0.0 || auv.abs() <= 1e-16 {
+                        folds = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !folds && sc.tri_keys.len() > 1 {
+            sc.tri_keys.sort_unstable();
+            if sc.tri_keys.windows(2).any(|w| w[0] == w[1]) {
+                folds = true;
             }
         }
         if folds {
             continue;
         }
 
-        if let Some(uv) = &mut uvs {
-            let f = edge_param(keep_pos, pa, pb);
-            let (ia, ib, ik) = (2 * a as usize, 2 * b as usize, 2 * keep as usize);
-            let mixed = [0, 1].map(|c| uv[ia + c] + f * (uv[ib + c] - uv[ia + c]));
-            uv[ik] = mixed[0];
-            uv[ik + 1] = mixed[1];
+        if let (Some(uv), Some(new_uv)) = (&mut uvs, candidate_uv) {
+            let ik = 2 * keep as usize;
+            uv[ik] = new_uv[0];
+            uv[ik + 1] = new_uv[1];
         }
+        let mut qsum = quadrics[keep as usize];
+        add_quadric(&mut qsum, &quadrics[drop as usize]);
         quadrics[keep as usize] = qsum;
+        if let Some(aux) = &mut aux_quadrics {
+            let extra = aux[drop as usize];
+            add_quadric(&mut aux[keep as usize], &extra);
+        }
+        if let Some(attr) = &mut attr_quadrics {
+            attr[keep as usize] = attr[keep as usize].merge(&attr[drop as usize]);
+        }
+        if options.lock_creases {
+            vert_crease[keep as usize] = vert_crease[a as usize].max(vert_crease[b as usize]);
+            let drop_neighbors = core::mem::take(&mut crease_adj[drop as usize]);
+            crease_adj[keep as usize].retain(|&w| w != keep && w != drop);
+            for w in drop_neighbors {
+                crease_adj[w as usize].retain(|&u| u != drop);
+                if w != keep && vlive[w as usize] {
+                    push(&mut crease_adj[keep as usize], w)?;
+                    push(&mut crease_adj[w as usize], keep)?;
+                    crease_adj[w as usize].sort_unstable();
+                    crease_adj[w as usize].dedup();
+                }
+            }
+            crease_adj[keep as usize].sort_unstable();
+            crease_adj[keep as usize].dedup();
+        }
+        is_boundary[keep as usize] |= is_boundary[drop as usize];
         positions[keep as usize] = pnew32;
         moved[keep as usize] = true;
+        let dev = geom_cost.max(0.0).sqrt();
+        if dev > max_dev_achieved {
+            max_dev_achieved = dev;
+        }
+
         for &o in &sc.owners {
             tris[o].alive = false;
         }
@@ -646,20 +1285,22 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
                 .map_err(|_| OpsError::Store(fast_mesh_store::StoreError::OutOfMemory))?;
         }
         for &w in &sc.ring {
-            if options.preserve_boundary && (is_boundary[keep as usize] || is_boundary[w as usize])
-            {
-                continue;
-            }
             let (lo, hi) = key(keep, w);
-            let mut q = [0.0; 10];
-            for k in 0..10 {
-                q[k] = quadrics[lo as usize][k] + quadrics[hi as usize][k];
-            }
-            let (_, cost) = optimal_position(
-                &q,
-                f64v(&positions[lo as usize]),
-                f64v(&positions[hi as usize]),
-            );
+            let Some((_, cost, _)) = candidate_solve(
+                lo,
+                hi,
+                options,
+                uvs.is_some(),
+                &positions,
+                &is_boundary,
+                &vert_crease,
+                &crease_adj,
+                &quadrics,
+                aux_quadrics.as_deref(),
+                attr_quadrics.as_deref(),
+            ) else {
+                continue;
+            };
             heap.push(HeapEntry {
                 cost,
                 a: lo,
@@ -707,9 +1348,12 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
     let mut n_dead_tri = 0;
     let mut n_dead_vert = 0;
     for v in 0..slots as u32 {
-        if !vlive[v as usize] {
+        if was_alive[v as usize] && !vlive[v as usize] {
             n_dead_vert += 1;
-        } else if moved[v as usize] && positions[v as usize] != base[v as usize] {
+        } else if vlive[v as usize]
+            && moved[v as usize]
+            && positions[v as usize] != base[v as usize]
+        {
             n_moved += 1;
         }
     }
@@ -732,9 +1376,12 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
     reserve(&mut del_t, n_dead_tri)?;
     reserve(&mut del_v, n_dead_vert)?;
     for v in 0..slots as u32 {
-        if !vlive[v as usize] {
+        if was_alive[v as usize] && !vlive[v as usize] {
             del_v.push(v);
-        } else if moved[v as usize] && positions[v as usize] != base[v as usize] {
+        } else if vlive[v as usize]
+            && moved[v as usize]
+            && positions[v as usize] != base[v as usize]
+        {
             set_p.push(v);
             set_p_to.push(positions[v as usize]);
         }
@@ -766,6 +1413,7 @@ pub fn simplify(tx: &mut Transaction, options: &SimplifyOptions) -> Result<Simpl
         collapsed,
         triangles_removed: started - live_now,
         vertices_removed: del_v.len(),
+        max_deviation_achieved: max_dev_achieved,
     })
 }
 
@@ -969,5 +1617,91 @@ mod tests {
         assert_eq!(analysis.orientation_conflicts, 0);
         assert!(analysis.loops.is_empty());
         assert!(analysis.pinch_vertices.is_empty());
+    }
+
+    #[test]
+    fn decimate_target_ratio_and_max_deviation_bound() {
+        let mut sphere = uv_sphere(16, 32, 1.0);
+        let initial = live_count(&sphere);
+        let opts = DecimateOptions::builder()
+            .target_ratio(0.5)
+            .max_deviation(0.05)
+            .build();
+        let (report, empty) = edit(&mut sphere, |tx| simplify_with(tx, &opts));
+        assert!(!empty);
+        assert!(report.collapsed > 0);
+        assert!(report.max_deviation_achieved <= 0.05 + 1e-12);
+        assert!(live_count(&sphere) < initial);
+
+        let mut tighter = uv_sphere(16, 32, 1.0);
+        let strict = DecimateOptions::builder()
+            .target_triangles(16)
+            .max_deviation(0.0005)
+            .build();
+        let (strict_report, _) = edit(&mut tighter, |tx| simplify_with(tx, &strict));
+        assert!(strict_report.max_deviation_achieved <= 0.0005 + 1e-12);
+        assert!(live_count(&tighter) > live_count(&sphere));
+    }
+
+    #[test]
+    fn decimate_validation_rejects_bad_inputs() {
+        let mut mesh = box_mesh([0.0; 3], [1.0; 3]);
+        let bad = [
+            DecimateOptions::builder().target_ratio(0.0).build(),
+            DecimateOptions::builder().target_ratio(1.5).build(),
+            DecimateOptions::builder().target_ratio(f32::NAN).build(),
+            DecimateOptions::builder().max_deviation(-0.1).build(),
+            DecimateOptions::builder().crease_angle_deg(181.0).build(),
+        ];
+        for o in &bad {
+            let mut tx = mesh.begin_edit();
+            assert!(matches!(
+                simplify_with(&mut tx, o),
+                Err(OpsError::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn decimate_locks_sharp_box_corners_and_creases() {
+        let mut cube = box_mesh([0.0; 3], [1.0; 3]);
+        let opts = DecimateOptions::builder()
+            .target_triangles(4)
+            .lock_creases(true)
+            .crease_angle_deg(30.0)
+            .build();
+        let (report, empty) = edit(&mut cube, |tx| simplify_with(tx, &opts));
+        assert!(empty);
+        assert_eq!(report.collapsed, 0);
+        assert_eq!(live_count(&cube), 12);
+    }
+
+    #[test]
+    fn decimate_preserve_uvs_avoids_uv_folding() {
+        let mut m = grid(10);
+        let uvs: Vec<f32> = m
+            .positions()
+            .iter()
+            .flat_map(|p| [p[0] / 10.0, p[1] / 10.0])
+            .collect();
+        m.add_uvs(&uvs).unwrap();
+        let opts = DecimateOptions::builder()
+            .target_ratio(0.3)
+            .preserve_uvs(true)
+            .build();
+        let (report, empty) = edit(&mut m, |tx| simplify_with(tx, &opts));
+        assert!(!empty);
+        assert!(report.collapsed > 0);
+        let out_uvs = m.uvs().unwrap();
+        for t in 0..m.triangle_slots() as u32 {
+            if let Some([a, b, c]) = m.triangle(t) {
+                let area = cross2d(
+                    [out_uvs[2 * a as usize], out_uvs[2 * a as usize + 1]],
+                    [out_uvs[2 * b as usize], out_uvs[2 * b as usize + 1]],
+                    [out_uvs[2 * c as usize], out_uvs[2 * c as usize + 1]],
+                );
+                assert!(area > 0.0, "folded UV triangle {a},{b},{c}: area={area}");
+            }
+        }
     }
 }

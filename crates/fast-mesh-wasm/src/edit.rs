@@ -90,6 +90,16 @@
 //!   3 cadImport), self_intersection_mode (NaN preset default, 0..=3),
 //!   weld_tolerance, min_triangles, max_edges (NaN preset default, Infinity
 //!   unbounded, or integer), fair, voxel_size, max_voxels`.
+//! - `27` remesh surface: `mode (0/NaN isotropic, 1 adaptive),
+//!   target_edge_length, min_edge_length, max_edge_length, iterations,
+//!   smooth_strength, project_to_surface, lock_boundaries, lock_creases,
+//!   crease_angle_deg`, NaN (except `target_edge_length`) meaning defaults of
+//!   [`SurfaceRemeshOptions`].
+//! - `28` extended simplify: `target_triangles, target_ratio, max_deviation,
+//!   preserve_boundary, preserve_uvs, lock_creases, crease_angle_deg,
+//!   prevent_normal_inversion`, NaN meaning defaults of [`DecimateOptions`]
+//!   with at least one of `target_triangles`, `target_ratio`, or
+//!   `max_deviation` required.
 //!
 //! - `32` protect: `n, band (0.0 when unset), id × n, weight × n`, wrapping a
 //!   brush op (`5, 6, 9, 10, 19, 20, 21, 22`), composable in either order with
@@ -117,6 +127,8 @@
 //! - inflate: `moved, max_displacement`.
 //! - smooth: `moved, max_displacement`.
 //! - remesh: `splits, collapses, flips, rounds`.
+//! - remesh surface: `initial_triangles, final_triangles, splits, collapses,
+//!   flips, iterations_run, uvs_dropped`.
 //! - bridge loops: `triangles_added`.
 //! - grab: `moved, max_displacement`.
 //! - relax: `moved, max_displacement`.
@@ -129,7 +141,8 @@
 //!   uvs_dropped`.
 //! - shell: `vertices_added, triangles_added, loops_closed, degenerate_removed,
 //!   vertices_removed`.
-//! - simplify: `collapsed, triangles_removed, vertices_removed`.
+//! - simplify: `collapsed, triangles_removed, vertices_removed,
+//!   max_deviation_achieved`.
 //! - subdivide: `vertices_added, triangles_added`.
 //! - split stretched: `splits, remaining, (new vertex, a, b) x splits`.
 //! - make manifold: `removed_duplicate_triangles, pruned_fin_triangles,
@@ -148,14 +161,16 @@
 
 use fast_mesh_ops::bridge::BridgeOptions;
 use fast_mesh_ops::protect::with_protection_band;
-use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
+use fast_mesh_ops::remesh::{
+    REMESH_MAX_ROUNDS, Region, RemeshOptions, SurfaceRemeshMode, SurfaceRemeshOptions,
+};
 use fast_mesh_ops::sculpt::{
     Brush, ClayOptions, ClayProfile, CreaseOptions, Falloff, FlattenMode, FlattenOptions,
     GrabMethod, GrabOptions, InflateMethod, InflateOptions, SmoothMethod, SmoothOptions,
     SurfaceFilter, Symmetry, TwistMethod, TwistOptions, clay, crease, flatten, grab, inflate,
     smooth, twist,
 };
-use fast_mesh_ops::simplify::SimplifyOptions;
+use fast_mesh_ops::simplify::{DecimateOptions, SimplifyOptions};
 use fast_mesh_ops::stretch::{StretchOptions, StretchReport};
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
@@ -479,6 +494,8 @@ pub(crate) enum RepairOp {
     CleanupSlivers(SliverOptions),
     AutoPreset(AutoRepairOptions),
     SplitStretched(StretchOptions),
+    RemeshSurface(SurfaceRemeshOptions),
+    SimplifyExtended(DecimateOptions),
     /// Not an edit: `WasmScene::repair` runs it outside the transaction.
     CaptureRest {
         only_if_missing: bool,
@@ -558,17 +575,67 @@ fn opt_flag(v: f64, default: bool) -> Result<bool, Error> {
     if v.is_nan() { Ok(default) } else { flag(v) }
 }
 
-fn opt_voxel_size(voxel_size: f64) -> Result<Option<f32>, Error> {
-    if voxel_size.is_nan() {
+fn opt_positive_f32(v: f64, what: &str) -> Result<Option<f32>, Error> {
+    if v.is_nan() {
         Ok(None)
-    } else if voxel_size.is_finite() && voxel_size > 0.0 {
-        let h = voxel_size as f32;
-        if !h.is_finite() || h <= 0.0 {
-            return Err(Error::invalid("voxelSize must be positive and finite"));
+    } else if v.is_finite() && v > 0.0 {
+        let f = v as f32;
+        if !f.is_finite() || f <= 0.0 {
+            return Err(Error::invalid(&format!(
+                "{what} must be positive and finite"
+            )));
         }
-        Ok(Some(h))
+        Ok(Some(f))
     } else {
-        Err(Error::invalid("voxelSize must be positive and finite"))
+        Err(Error::invalid(&format!(
+            "{what} must be positive and finite"
+        )))
+    }
+}
+
+fn opt_voxel_size(voxel_size: f64) -> Result<Option<f32>, Error> {
+    opt_positive_f32(voxel_size, "voxelSize")
+}
+
+fn opt_unit_ratio(v: f64, what: &str) -> Result<Option<f32>, Error> {
+    if v.is_nan() {
+        Ok(None)
+    } else if v.is_finite() && v > 0.0 && v <= 1.0 {
+        let r = v as f32;
+        if !r.is_finite() || r <= 0.0 || r > 1.0 {
+            return Err(Error::invalid(&format!(
+                "{what} must be finite and in (0, 1]"
+            )));
+        }
+        Ok(Some(r))
+    } else {
+        Err(Error::invalid(&format!(
+            "{what} must be finite and in (0, 1]"
+        )))
+    }
+}
+
+fn opt_non_neg_f64(v: f64, what: &str) -> Result<Option<f64>, Error> {
+    if v.is_nan() {
+        Ok(None)
+    } else if v.is_finite() && v >= 0.0 {
+        Ok(Some(v))
+    } else {
+        Err(Error::invalid(&format!(
+            "{what} must be finite and non-negative"
+        )))
+    }
+}
+
+fn opt_ranged_f32(v: f64, lo: f64, hi: f64, default: f32, what: &str) -> Result<f32, Error> {
+    if v.is_nan() {
+        Ok(default)
+    } else if v.is_finite() && (lo..=hi).contains(&v) {
+        Ok(v as f32)
+    } else {
+        Err(Error::invalid(&format!(
+            "{what} must be finite and in [{lo}, {hi}]"
+        )))
     }
 }
 
@@ -1416,6 +1483,117 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 b = b.max_voxels(opt_max_voxels(max_voxels, default_mv)?);
             }
             RepairOp::AutoPreset(b.build())
+        } else if code == 27.0 {
+            let [
+                mode,
+                target_len,
+                min_len,
+                max_len,
+                iters,
+                smooth_strength,
+                project,
+                lock_bounds,
+                lock_creases,
+                crease_deg,
+            ]: [f64; 10] = words.take(10)?.try_into().map_err(|_| malformed(WHAT))?;
+            let defaults = SurfaceRemeshOptions::default();
+            let mode = if mode.is_nan() || mode == 0.0 {
+                SurfaceRemeshMode::Isotropic
+            } else if mode == 1.0 {
+                SurfaceRemeshMode::Adaptive
+            } else {
+                return Err(Error::invalid("mode must be 0 (isotropic) or 1 (adaptive)"));
+            };
+            let target_edge_length = opt_positive_f32(target_len, "targetEdgeLength")?
+                .ok_or_else(|| Error::invalid("targetEdgeLength is required"))?;
+            let min_edge_length = opt_positive_f32(min_len, "minEdgeLength")?;
+            let max_edge_length = opt_positive_f32(max_len, "maxEdgeLength")?;
+            if let (Some(lo), Some(hi)) = (min_edge_length, max_edge_length)
+                && lo > hi
+            {
+                return Err(Error::invalid(
+                    "minEdgeLength must not exceed maxEdgeLength",
+                ));
+            }
+            if !iters.is_nan() && iters > f64::from(u32::MAX) {
+                return Err(Error::invalid("iterations is too large"));
+            }
+            let iterations = count_opt(iters, "iterations")?.unwrap_or(defaults.iterations);
+            let smooth_strength = opt_ranged_f32(
+                smooth_strength,
+                0.0,
+                1.0,
+                defaults.smooth_strength,
+                "smoothStrength",
+            )?;
+            let project_to_surface = opt_flag(project, defaults.project_to_surface)?;
+            let lock_boundaries = opt_flag(lock_bounds, defaults.lock_boundaries)?;
+            let lock_creases = opt_flag(lock_creases, defaults.lock_creases)?;
+            let crease_angle_deg = opt_ranged_f32(
+                crease_deg,
+                0.0,
+                180.0,
+                defaults.crease_angle_deg,
+                "creaseAngleDeg",
+            )?;
+            RepairOp::RemeshSurface(SurfaceRemeshOptions {
+                mode,
+                target_edge_length,
+                min_edge_length,
+                max_edge_length,
+                iterations,
+                smooth_strength,
+                project_to_surface,
+                lock_boundaries,
+                lock_creases,
+                crease_angle_deg,
+            })
+        } else if code == 28.0 {
+            let [
+                target,
+                ratio,
+                max_dev,
+                preserve_boundary,
+                preserve_uvs,
+                lock_creases,
+                crease_deg,
+                prevent_inversion,
+            ]: [f64; 8] = words.take(8)?.try_into().map_err(|_| malformed(WHAT))?;
+            let defaults = DecimateOptions::default();
+            let target_opt = count_opt(target, "targetTriangles")?;
+            if matches!(target_opt, Some(0)) {
+                return Err(Error::invalid("targetTriangles must be at least 1"));
+            }
+            let target_ratio = opt_unit_ratio(ratio, "targetRatio")?;
+            let max_deviation = opt_non_neg_f64(max_dev, "maxDeviation")?;
+            if target_opt.is_none() && target_ratio.is_none() && max_deviation.is_none() {
+                return Err(Error::invalid(
+                    "simplify requires targetTriangles, targetRatio, or maxDeviation",
+                ));
+            }
+            let target_triangles = target_opt.unwrap_or(0);
+            let preserve_boundary = opt_flag(preserve_boundary, defaults.preserve_boundary)?;
+            let preserve_uvs = opt_flag(preserve_uvs, defaults.preserve_uvs)?;
+            let lock_creases = opt_flag(lock_creases, defaults.lock_creases)?;
+            let crease_angle_deg = opt_ranged_f32(
+                crease_deg,
+                0.0,
+                180.0,
+                defaults.crease_angle_deg,
+                "creaseAngleDeg",
+            )?;
+            let prevent_normal_inversion =
+                opt_flag(prevent_inversion, defaults.prevent_normal_inversion)?;
+            RepairOp::SimplifyExtended(DecimateOptions {
+                target_triangles,
+                target_ratio,
+                max_deviation,
+                preserve_boundary,
+                preserve_uvs,
+                lock_creases,
+                crease_angle_deg,
+                prevent_normal_inversion,
+            })
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -1757,6 +1935,34 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                         count(r.collapsed),
                         count(r.triangles_removed),
                         count(r.vertices_removed),
+                        r.max_deviation_achieved,
+                    ],
+                )?;
+            }
+            RepairOp::SimplifyExtended(o) => {
+                let r = fast_mesh_ops::simplify::simplify_with(tx, o)?;
+                put(
+                    &mut out,
+                    &[
+                        count(r.collapsed),
+                        count(r.triangles_removed),
+                        count(r.vertices_removed),
+                        r.max_deviation_achieved,
+                    ],
+                )?;
+            }
+            RepairOp::RemeshSurface(o) => {
+                let r = fast_mesh_ops::remesh::remesh_surface(tx, o)?;
+                put(
+                    &mut out,
+                    &[
+                        count(r.initial_triangles),
+                        count(r.final_triangles),
+                        count(r.splits),
+                        count(r.collapses),
+                        count(r.flips),
+                        count(r.iterations_run),
+                        f64::from(u8::from(r.uvs_dropped)),
                     ],
                 )?;
             }
@@ -2762,5 +2968,142 @@ mod tests {
             code(&[26., 9., nan, nan, nan, nan, nan, nan, nan]),
             codes::INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn decode_repair_remesh_surface_and_extended_simplify() {
+        let nan = f64::NAN;
+        assert_eq!(
+            decode_repair(
+                &[27., nan, 0.25, nan, nan, nan, nan, nan, nan, nan, nan],
+                &[]
+            )
+            .unwrap(),
+            vec![RepairOp::RemeshSurface(SurfaceRemeshOptions {
+                target_edge_length: 0.25,
+                ..SurfaceRemeshOptions::default()
+            })]
+        );
+        assert_eq!(
+            decode_repair(&[27., 1., 0.2, 0.08, 0.4, 3., 0.75, 0., 0., 0., 45.], &[]).unwrap(),
+            vec![RepairOp::RemeshSurface(SurfaceRemeshOptions {
+                mode: SurfaceRemeshMode::Adaptive,
+                target_edge_length: 0.2,
+                min_edge_length: Some(0.08),
+                max_edge_length: Some(0.4),
+                iterations: 3,
+                smooth_strength: 0.75,
+                project_to_surface: false,
+                lock_boundaries: false,
+                lock_creases: false,
+                crease_angle_deg: 45.0,
+            })]
+        );
+
+        assert_eq!(
+            decode_repair(&[28., 40., nan, nan, nan, nan, nan, nan, nan], &[]).unwrap(),
+            vec![RepairOp::SimplifyExtended(DecimateOptions {
+                target_triangles: 40,
+                ..DecimateOptions::default()
+            })]
+        );
+        assert_eq!(
+            decode_repair(&[28., nan, 0.5, 0.05, 0., 1., 1., 25., 0.], &[]).unwrap(),
+            vec![RepairOp::SimplifyExtended(DecimateOptions {
+                target_triangles: 0,
+                target_ratio: Some(0.5),
+                max_deviation: Some(0.05),
+                preserve_boundary: false,
+                preserve_uvs: true,
+                lock_creases: true,
+                crease_angle_deg: 25.0,
+                prevent_normal_inversion: false,
+            })]
+        );
+
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(
+            code(&[27., 2., 0.2, nan, nan, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[27., 0., nan, nan, nan, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[27., 0., 0.2, 0.5, 0.2, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[27., 0., 0.2, nan, nan, nan, 1.5, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[28., nan, nan, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[28., 0., 0.5, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[28., nan, 1.5, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[28., nan, 0.5, -0.1, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[28., nan, 0.5, nan, nan, nan, nan, 181., nan]),
+            codes::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn run_repair_remesh_surface_and_extended_simplify() {
+        use fast_mesh_store::Mesh;
+
+        let positions = [
+            0.0f32, 0.0, 0.0, //
+            1.0, 0.0, 0.0, //
+            1.0, 1.0, 0.0, //
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 1.0, //
+            1.0, 0.0, 1.0, //
+            1.0, 1.0, 1.0, //
+            0.0, 1.0, 1.0,
+        ];
+        let indices = [
+            0u32, 2, 1, 0, 3, 2, //
+            4, 5, 6, 4, 6, 7, //
+            0, 1, 5, 0, 5, 4, //
+            2, 3, 7, 2, 7, 6, //
+            1, 2, 6, 1, 6, 5, //
+            3, 0, 4, 3, 4, 7,
+        ];
+        let mut m = Mesh::from_buffers(&positions, &indices).unwrap();
+        let uv_data: Vec<f32> = (0..8).flat_map(|i| [i as f32 * 0.1, 0.0]).collect();
+        m.add_uvs(&uv_data).unwrap();
+
+        let nan = f64::NAN;
+        let ops = decode_repair(&[27., 0., 0.35, nan, nan, 2., 0.5, 1., 1., 1., 30.], &[]).unwrap();
+        let mut tx = m.begin_edit();
+        let out = run_repair(&mut tx, &ops).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(out.len(), 7);
+        assert_eq!(out[0], 12.0);
+        assert!(out[1] > 12.0);
+        assert_eq!(out[5], 2.0);
+        assert_eq!(out[6], 1.0);
+        assert!(m.uvs().is_none());
+
+        let simp_ops = decode_repair(&[28., nan, 0.5, nan, 1., 0., 0., 30., 1.], &[]).unwrap();
+        let mut tx2 = m.begin_edit();
+        let simp_out = run_repair(&mut tx2, &simp_ops).unwrap();
+        tx2.commit().unwrap();
+        assert_eq!(simp_out.len(), 4);
+        assert!(simp_out[0] > 0.0);
+        assert!(simp_out[3].is_finite() && simp_out[3] >= 0.0);
     }
 }
