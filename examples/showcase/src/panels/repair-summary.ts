@@ -1,7 +1,7 @@
 // What the repair panel shows: an `Analysis` reduced to the counts it lists
 // (holes largest first, components largest first), and one line per repair
 // report.
-import type { Analysis, JoinReport, LoopId, RepairOp, RepairReport } from "fast-mesh-wasm";
+import type { Analysis, JoinReport, LoopId, OffsetReport, RepairOp, RepairReport } from "fast-mesh-wasm";
 import { type LengthUnit, toDisplayLength } from "./units";
 
 export interface AnalysisSummary {
@@ -138,7 +138,13 @@ export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: 
       return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "offset": {
-      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      const r = report as OffsetReport;
+      if (r.trianglesAdded > 0 || r.trianglesRemoved > 0) {
+        if (r.trianglesAdded === 0) {
+          return "Offset: cleared mesh";
+        }
+        return `Offset: rebuilt ${plural(r.trianglesAdded, "triangle")}, ${plural(r.verticesAdded, "vertex", "vertices")} (voxel ${fmtLength(r.voxelSize)})`;
+      }
       return `Offset: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
     case "shell": {

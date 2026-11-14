@@ -19,6 +19,7 @@ parallel = ["fast-mesh-store/parallel", "fast-mesh-bvh/parallel", "fast-mesh-que
 fast-mesh-store.workspace = true
 fast-mesh-bvh.workspace = true
 fast-mesh-query.workspace = true
+robust = "1.2.0"
 
 [dev-dependencies]
 fast-mesh-store = { workspace = true, features = ["test-counters"] }

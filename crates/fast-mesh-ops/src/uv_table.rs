@@ -14,9 +14,10 @@ use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
     AppendSource, AutoRepairOptions, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions,
-    FillOptions, OffsetOptions, ShellOptions, SkipReason, append_mesh, append_mesh_with_uvs,
-    apply_boolean, auto_repair, boolean_plan, boundary_loops, bridge_loops, cut_by_plane,
-    fill_holes, inflate, offset, orient, remove_degenerate, remove_small_components, shell, weld,
+    FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions, SkipReason, append_mesh,
+    append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan, boundary_loops, bridge_loops,
+    cut_by_plane, fill_holes, inflate, offset, orient, remove_degenerate, remove_small_components,
+    shell, weld,
 };
 
 /// A planar UV of a position: linear, so anything interpolated stays on it.
@@ -598,7 +599,16 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
         };
         crate::deform::grab(tx, &options).map(|_| ())
     });
-    check(&|tx| offset(tx, &OffsetOptions { distance: 0.1 }).map(|_| ()));
+    check(&|tx| {
+        offset(
+            tx,
+            &OffsetOptions {
+                distance: 0.1,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    });
 }
 
 // ---- what moving vertices does to a seam
@@ -629,7 +639,10 @@ fn seam_gap(m: &Mesh) -> f32 {
 
 #[test]
 fn offset_opens_a_bent_seam_and_keeps_a_flat_one() {
-    let options = OffsetOptions { distance: 0.1 };
+    let options = OffsetOptions {
+        distance: 0.1,
+        ..Default::default()
+    };
     let mut bent = seam_with_bend(1.);
     edit(&mut bent, |tx| offset(tx, &options));
     assert!(seam_gap(&bent) > 0.05, "{}", seam_gap(&bent));
@@ -900,4 +913,65 @@ fn a_large_seamed_weld_is_identical_in_parallel() {
         crate::weld::weld_roots_keeping_seams(&m, 0.01, m.uvs()).unwrap()
     };
     crate::test_util::assert_parallel_identical("seamed weld", run);
+}
+
+#[test]
+fn volumetric_offset_drops_uvs_merges_seams_and_reverts_cleanly() {
+    let live_snapshot = |m: &Mesh| {
+        let verts: Vec<(VertexId, [f32; 3])> = alive(m)
+            .into_iter()
+            .map(|v| (v, m.position(v).unwrap()))
+            .collect();
+        let tris: Vec<[VertexId; 3]> = (0..m.triangle_slots() as u32)
+            .filter_map(|t| m.triangle(t))
+            .collect();
+        (verts, tris)
+    };
+
+    for alg in [
+        OffsetAlgorithm::FhEdt {
+            voxel_size: Some(0.08),
+        },
+        OffsetAlgorithm::BvhSdf {
+            voxel_size: Some(0.08),
+        },
+    ] {
+        for distance in [-0.15f32, 0.15f32] {
+            let mut m = box_of_faces();
+            let orig_snap = live_snapshot(&m);
+            let orig_uvs = m.uvs().unwrap().to_vec();
+            assert!(!boundary_loops(&m).unwrap().is_empty(), "seams start open");
+
+            let opts = OffsetOptions::builder()
+                .distance(distance)
+                .algorithm(alg)
+                .build();
+            let mut tx = m.begin_edit();
+            let r = offset(&mut tx, &opts).unwrap();
+            assert!(r.uvs_dropped);
+            assert!(tx.mesh().uvs().is_none());
+            let patch = tx.commit().unwrap();
+
+            assert!(m.uvs().is_none());
+            assert!(
+                boundary_loops(&m).unwrap().is_empty(),
+                "alg={alg:?} d={distance} must weld seams into a closed solid"
+            );
+            let vol = crate::measure(&m).unwrap().volume.unwrap();
+            if distance < 0.0 {
+                assert!(vol < 0.8 && vol > 0.15, "shrunk volume {vol}");
+            } else {
+                assert!(vol > 1.3, "expanded volume {vol}");
+            }
+
+            let rebuilt_snap = live_snapshot(&m);
+            patch.revert(&mut m).unwrap();
+            assert_eq!(live_snapshot(&m), orig_snap);
+            assert_eq!(&m.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+
+            patch.apply(&mut m).unwrap();
+            assert!(m.uvs().is_none());
+            assert_eq!(live_snapshot(&m), rebuilt_snap);
+        }
+    }
 }

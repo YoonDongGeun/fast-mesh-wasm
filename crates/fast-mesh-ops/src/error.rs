@@ -40,6 +40,20 @@ impl From<QueryError> for OpsError {
     }
 }
 
+/// Field kernel errors map out-of-memory to [`OpsError::Store`] with
+/// [`StoreError::OutOfMemory`], store and query errors to their counterparts,
+/// and invalid inputs directly.
+impl From<fast_mesh_fields::FieldsError> for OpsError {
+    fn from(e: fast_mesh_fields::FieldsError) -> Self {
+        match e {
+            fast_mesh_fields::FieldsError::OutOfMemory => OpsError::Store(StoreError::OutOfMemory),
+            fast_mesh_fields::FieldsError::Store(s) => OpsError::Store(s),
+            fast_mesh_fields::FieldsError::Query(q) => OpsError::from(q),
+            fast_mesh_fields::FieldsError::InvalidInput(msg) => OpsError::InvalidInput(msg),
+        }
+    }
+}
+
 impl fmt::Display for OpsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -87,5 +101,15 @@ mod tests {
             "invalid input: no bound"
         );
         assert!(OpsError::StaleLoops.source().is_none());
+
+        let f_oom: OpsError = fast_mesh_fields::FieldsError::OutOfMemory.into();
+        assert_eq!(f_oom, OpsError::Store(StoreError::OutOfMemory));
+        let f_store: OpsError =
+            fast_mesh_fields::FieldsError::Store(StoreError::InvalidTriangle(3)).into();
+        assert_eq!(f_store, OpsError::Store(StoreError::InvalidTriangle(3)));
+        let f_query: OpsError = fast_mesh_fields::FieldsError::Query(QueryError::StaleBvh).into();
+        assert_eq!(f_query, OpsError::Query(QueryError::StaleBvh));
+        let f_in: OpsError = fast_mesh_fields::FieldsError::InvalidInput("bad grid").into();
+        assert_eq!(f_in, OpsError::InvalidInput("bad grid"));
     }
 }

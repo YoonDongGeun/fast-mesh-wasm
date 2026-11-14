@@ -80,6 +80,7 @@ export {
   type MeshDistance,
   type MeshHandle,
   type MeshViews,
+  type OffsetAlgorithm,
   type OffsetReport,
   type OrientReport,
   type OutOfRange,
