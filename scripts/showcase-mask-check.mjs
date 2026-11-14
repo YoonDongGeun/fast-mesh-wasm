@@ -420,13 +420,17 @@ try {
   }
 
   // ---- quick: a release before the press's raycast answers still paints it, and ends it ----
+  // Mask paint now queries the Worker via `store.verticesInSphere` after `raycast`, so wait
+  // for the overlay build like `press()` does rather than racing a fixed 300 ms sleep.
+  const beforeQuickBuilds = await hook("sculpt().maskOverlay.builds");
   await mouse("mouseMoved", center.x, center.y, { button: "none" });
   await sleep(150);
   await Promise.all([
     mouse("mousePressed", center.x, center.y, { buttons: 1 }),
     mouse("mouseReleased", center.x, center.y, { buttons: 0 }),
   ]);
-  await sleep(300);
+  await waitFor(`__showcase.sculpt().maskOverlay.builds > ${beforeQuickBuilds}`, 10_000);
+  await frames();
   const quickPainted = (await hook("sculptMask()"))?.length ?? 0;
   // With the button up, moving over the mesh must not paint.
   for (let k = 1; k <= 10; k++) {
@@ -439,7 +443,10 @@ try {
   await clickOn('[data-action="sculpt-mask-clear"]');
 
   // ---- busy: a long frame holds the down and the up until they run together ----
+  const beforeBusyBuilds = await hook("sculpt().maskOverlay.builds");
   await pressInLongFrame(center);
+  await waitFor(`__showcase.sculpt().maskOverlay.builds > ${beforeBusyBuilds}`, 10_000);
+  await frames();
   const busyMasked = (await hook("sculptMask()"))?.length ?? 0;
   const busySelected = await page("__showcase.selected()");
   verdict("busy", busyMasked > 0 && busySelected === A, `${busyMasked} masked by a press in a long frame; selected ${q(busySelected)}`);

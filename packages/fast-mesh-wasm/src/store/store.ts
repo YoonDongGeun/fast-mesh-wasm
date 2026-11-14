@@ -4,7 +4,7 @@
 // visibility, colouring) and sections are declarative: a change updates
 // `desired` at once and reaches the scene at the next `commitFrame()` (or on
 // a microtask while no frame loop runs), the last value per frame winning.
-import type { Indices, PlacementInput, Positions64 } from "../api.js";
+import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
 import { FastMeshError, reportListenerError } from "../core.js";
 import type {
   ColorRule,
@@ -18,7 +18,11 @@ import type {
   AutoRepairRequest,
   RepairOp,
   RepairReport,
+  RepairReportOf,
   Scene,
+  SculptOp,
+  SculptReport,
+  SculptReportOf,
   SectionDesc,
   SectionHandle,
   SectionPlane,
@@ -565,14 +569,42 @@ export class SceneStore {
   }
 
   /** Repairs a mesh (one undo step). */
-  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
   repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
+  repair<const O extends RepairOp>(mesh: MeshHandle, op: O): Promise<RepairReportOf<O>>;
+  repair<const O extends readonly RepairOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): Promise<{ -readonly [K in keyof O]: RepairReportOf<O[K]> }>;
+  repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
   repair(
     mesh: MeshHandle,
     op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
   ): Promise<RepairReport | RepairReport[] | AutoRepairReport> {
     this.#alive();
     return this.#settled(this.#host.repair(mesh, op as RepairOp));
+  }
+
+  /** Sculpts a mesh (`Scene.sculpt`), updating the snapshot when it settles. */
+  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): Promise<SculptReportOf<O>>;
+  sculpt<const O extends readonly SculptOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): Promise<{ -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]>;
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]> {
+    this.#alive();
+    return this.#settled(this.#host.sculpt(mesh, op));
+  }
+
+  /**
+   * Live triangle-used vertex ids of `mesh` inside the closed local-space
+   * sphere `(center, radius)`, in ascending order; see `Scene.verticesInSphere`.
+   */
+  verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array> {
+    if (this.#disposed) {
+      return Promise.reject(invalid("the store is disposed"));
+    }
+    return this.#host.verticesInSphere(mesh, center, radius);
   }
 
   /** Refreshes now (a synchronous host has applied the call) and once the promise settles. */

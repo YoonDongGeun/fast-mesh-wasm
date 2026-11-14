@@ -387,6 +387,7 @@ fn stroked(n: u32) -> (Mesh, Region) {
         let options = GrabOptions {
             brush,
             direction: [0.0, 0.0, 1.0],
+            ..Default::default()
         };
         let mut tx = mesh.begin_edit();
         grab(&mut tx, &options).unwrap();

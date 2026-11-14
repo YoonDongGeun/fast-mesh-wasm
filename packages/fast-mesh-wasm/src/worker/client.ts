@@ -8,7 +8,7 @@
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
 import { checkRegisterOptions } from "../register.js";
-import type { Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
+import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "../handles.js";
@@ -40,6 +40,9 @@ import type {
   RepairOp,
   RepairReport,
   RepairReportOf,
+  SculptOp,
+  SculptReport,
+  SculptReportOf,
   SectionDesc,
   SectionGap,
   SectionPlane,
@@ -378,6 +381,8 @@ interface MeshState {
   /** The UVs, for a mesh with them. */
   uvs: Float32Array | null;
   indices: Uint32Array;
+  /** Mirrored local-render bounds, or `undefined` if none were ever sent. */
+  bounds: Bounds | null | undefined;
   /** The placement as the engine last reported it. */
   pose: Pose;
   /**
@@ -1231,6 +1236,9 @@ export class WorkerScene implements SceneLike {
       for (const name of BUFFERS) {
         this.#applyBuffer(st, name, c);
       }
+      if (c.bounds !== undefined) {
+        st.bounds = cloneBounds(c.bounds);
+      }
     }
     const record: MeshChange = {
       mesh: st.handle,
@@ -1257,6 +1265,7 @@ export class WorkerScene implements SceneLike {
     st.colors = null;
     st.values = null;
     st.uvs = null;
+    st.bounds = null;
     st.shown = null;
     this.#guard?.bump();
   }
@@ -1466,6 +1475,7 @@ export class WorkerScene implements SceneLike {
       shown: null,
       pendingRules: new Map(),
       indices: new Uint32Array(0),
+      bounds: undefined,
       pose: poseOf(IDENTITY, [0, 0, 0], known, [1, 1, 1]),
       local: undefined,
       localUntil: 0,
@@ -1623,6 +1633,18 @@ export class WorkerScene implements SceneLike {
   /** The column-major world matrix of the mesh's local render coordinates, as mirrored. */
   matrix4(mesh: MeshHandle): Float64Array {
     return this.#shown(this.#mirrored(mesh)).matrix4.slice();
+  }
+
+  /**
+   * The box around the vertices the live triangles use, in the mesh's local
+   * render coordinates, mirrored from the Worker. `null` without live triangles.
+   */
+  bounds(mesh: MeshHandle): Bounds | null {
+    const st = this.#mirrored(mesh);
+    if (st.bounds === undefined) {
+      return undefined as unknown as Bounds | null;
+    }
+    return cloneBounds(st.bounds);
   }
 
   /**
@@ -1791,6 +1813,38 @@ export class WorkerScene implements SceneLike {
     return this.#ask(
       (rev, qid) => ({ kind: "repair", rev, id: this.#live(mesh).id, payload: copyInput(op, "op"), qid }),
       (v) => v as RepairReport | RepairReport[] | AutoRepairReport,
+    );
+  }
+
+  /** Sculpt domain entry point; see `Scene.sculpt`. */
+  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): Promise<SculptReportOf<O>>;
+  sculpt<const O extends readonly SculptOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): Promise<{ -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]> {
+    return this.repair(mesh, op as RepairOp) as Promise<SculptReport | SculptReport[]>;
+  }
+
+  /**
+   * Live triangle-used vertex ids of `mesh` inside the closed local-space
+   * sphere `(center, radius)`, in ascending order; see `Scene.verticesInSphere`.
+   */
+  verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array> {
+    return this.#query(
+      "verticesInSphere",
+      () => {
+        const id = this.#live(mesh).id;
+        const c = center as readonly number[] | undefined;
+        if (c?.length !== 3 || ![c[0], c[1], c[2]].every((x) => typeof x === "number" && Number.isFinite(x))) {
+          throw invalid("center must be 3 finite numbers");
+        }
+        if (typeof radius !== "number" || !Number.isFinite(radius) || radius < 0) {
+          throw invalid("radius must be a finite non-negative number");
+        }
+        return { mesh: id, center: [c[0], c[1], c[2]] as Vec3, radius };
+      },
+      (v) => v,
     );
   }
 
@@ -2814,6 +2868,18 @@ function copyArray<T>(value: unknown, what: string, copy: (x: unknown) => T): T 
  * slot order, as world positions before placement (local plus origin, in
  * `f64`, so the engine gets the same `f32` local positions back).
  */
+function cloneBounds(b: Bounds | null): Bounds | null {
+  if (b === null) {
+    return null;
+  }
+  return {
+    min: [b.min[0], b.min[1], b.min[2]],
+    max: [b.max[0], b.max[1], b.max[2]],
+    center: [b.center[0], b.center[1], b.center[2]],
+    size: [b.size[0], b.size[1], b.size[2]],
+  };
+}
+
 function liveGeometry(st: MeshState): { positions: Float64Array; indices: Uint32Array; uvs: Float32Array | null } {
   const idx = st.indices;
   const p = st.positions;

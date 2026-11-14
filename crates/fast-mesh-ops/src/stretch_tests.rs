@@ -56,6 +56,7 @@ fn dab(mesh: &mut Mesh, center: [f32; 3], radius: f32, strength: f32) {
                     strength,
                 },
                 direction: [0.0, 0.0, 1.0],
+                ..Default::default()
             },
         )
     });

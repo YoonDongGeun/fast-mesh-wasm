@@ -939,7 +939,8 @@ describe("WorkerScene", () => {
     await settle(scene);
     scene.commitFrame();
     await expectInSync();
-    expect(geometry.boundingSphere!.radius).toBeCloseTo(1, 3);
+    // With WorkerScene.bounds present, bindMesh uses the AABB half-diagonal (matching Scene).
+    expect(geometry.boundingSphere!.radius).toBeCloseTo(Math.sqrt(3), 3);
     const lines = drawn.group.children[0] as THREE.LineSegments;
     expect(lines.geometry.getAttribute("position").count).toBeGreaterThan(0);
 
@@ -1403,6 +1404,135 @@ describe("WorkerScene", () => {
       code = (e as FastMeshError).code;
     }
     expect(code).toBe("INVALID_ARGUMENT");
+  });
+
+  it("bounds_mirror_accurate_bounds_across_ops_and_avoids_js_index_walk", async () => {
+    const { scene } = await start();
+    const sync = new Scene();
+    const s = sphere([0, 0, 0], 1, 8, 16);
+    const ref = sync.addMesh(s.positions, s.indices);
+    const m = scene.addMesh(s.positions, s.indices);
+    const bound = bindMesh(scene, m);
+    const geometry = bound.object.geometry;
+    const expandSpy = vi.spyOn(THREE.Box3.prototype, "expandByPoint");
+
+    const expectBoundsMatch = () => {
+      const wb = scene.bounds(m);
+      const sb = sync.bounds(ref);
+      expect(wb).not.toBeNull();
+      expect(sb).not.toBeNull();
+      for (let i = 0; i < 3; i++) {
+        expect(wb!.min[i]).toBeCloseTo(sb!.min[i], 5);
+        expect(wb!.max[i]).toBeCloseTo(sb!.max[i], 5);
+        expect(wb!.center[i]).toBeCloseTo(sb!.center[i], 5);
+        expect(wb!.size[i]).toBeCloseTo(sb!.size[i], 5);
+      }
+      expect(geometry.boundingBox!.min.x).toBeCloseTo(wb!.min[0], 5);
+      expect(geometry.boundingBox!.min.y).toBeCloseTo(wb!.min[1], 5);
+      expect(geometry.boundingBox!.min.z).toBeCloseTo(wb!.min[2], 5);
+      expect(geometry.boundingBox!.max.x).toBeCloseTo(wb!.max[0], 5);
+      expect(geometry.boundingBox!.max.y).toBeCloseTo(wb!.max[1], 5);
+      expect(geometry.boundingBox!.max.z).toBeCloseTo(wb!.max[2], 5);
+    };
+
+    try {
+      // 1. Initial addMesh: before settlement mirrors aren't ready (`undefined`); after commitFrame
+      //    WorkerScene.bounds matches Scene.bounds without walking triangles via expandByPoint.
+      expect(scene.bounds(m)).toBeUndefined();
+      await settle(scene);
+      scene.commitFrame();
+      expectBoundsMatch();
+      expect(expandSpy).not.toHaveBeenCalled();
+
+      // 2. Sculpt (`captureRestSizes` + `grab`) shifts bounds outward and stays off JS index walk.
+      await scene.repair(m, { op: "captureRestSizes" });
+      sync.repair(ref, { op: "captureRestSizes" });
+      const grabOp = {
+        op: "grab" as const,
+        center: [0, 0, 1] as Vec3,
+        radius: 0.9,
+        falloff: "smooth" as const,
+        strength: 1,
+        direction: [0, 0, 2.5] as Vec3,
+      };
+      await scene.sculpt(m, grabOp);
+      sync.sculpt(ref, grabOp);
+      scene.commitFrame();
+      expectBoundsMatch();
+      expect(expandSpy).not.toHaveBeenCalled();
+
+      // 3. Topology edit (`splitStretched`): slot reallocations/new triangles still deliver Worker bounds.
+      const splitOp = {
+        op: "splitStretched" as const,
+        center: [0, 0, 1] as Vec3,
+        radius: 2.5,
+        maxSplits: 8,
+      };
+      const wSplit = await scene.repair(m, splitOp);
+      const sSplit = sync.repair(ref, splitOp);
+      expect((wSplit as { splits: number }).splits).toBeGreaterThan(0);
+      expect((wSplit as { splits: number }).splits).toBe((sSplit as { splits: number }).splits);
+      scene.commitFrame();
+      expectBoundsMatch();
+      expect(expandSpy).not.toHaveBeenCalled();
+
+      // 4. Undo reverts topology and positions; WorkerScene.bounds restores pre-split bounds.
+      scene.undo();
+      await settle(scene);
+      sync.undo();
+      scene.commitFrame();
+      expectBoundsMatch();
+      scene.undo();
+      await settle(scene);
+      sync.undo();
+      scene.commitFrame();
+      expectBoundsMatch();
+      expect(expandSpy).not.toHaveBeenCalled();
+
+      // 5. Defensive fallback: if a synthetic/legacy wire omits `bounds`, WorkerScene.bounds returns
+      //    `undefined` so `bindMesh` still falls back to walking triangles via `expandByPoint`.
+      let strippedWorker: NodeWorker | undefined;
+      const legacyScene = await createWorkerScene({
+        createWorker: () => {
+          const inner = new NodeWorker();
+          strippedWorker = inner;
+          const proxy: WorkerLike = {
+            postMessage: (msg, transfer) => inner.postMessage(msg, transfer),
+            addEventListener: (type, cb) => {
+              if (type === "message") {
+                inner.addEventListener("message", (ev) => {
+                  const data = ev.data as { changes?: Array<{ bounds?: unknown }> };
+                  if (Array.isArray(data?.changes)) {
+                    for (const ch of data.changes) {
+                      delete ch.bounds;
+                    }
+                  }
+                  cb(ev);
+                });
+              } else {
+                inner.addEventListener(type, cb);
+              }
+            },
+            terminate: () => inner.terminate(),
+          };
+          return proxy;
+        },
+      });
+      opened.push(legacyScene);
+      const lm = legacyScene.addMesh(s.positions, s.indices);
+      const lbound = bindMesh(legacyScene, lm);
+      await settle(legacyScene);
+      legacyScene.commitFrame();
+      expect(legacyScene.bounds(lm)).toBeUndefined();
+      expect(expandSpy).toHaveBeenCalled();
+      expect(lbound.object.geometry.boundingBox!.max.z).toBeCloseTo(1, 5);
+      lbound.dispose();
+      void strippedWorker;
+    } finally {
+      expandSpy.mockRestore();
+      bound.dispose();
+      sync.free();
+    }
   });
 
   it("volumetric_offset_and_undo_mirrors_cleanly", async () => {

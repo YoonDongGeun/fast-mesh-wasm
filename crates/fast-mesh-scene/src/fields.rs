@@ -6625,7 +6625,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 43] = [
+        let calls: [(&str, Call); 51] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -6753,6 +6753,33 @@ mod tests {
             }),
             ("set_section_fill", |s, x| {
                 s.set_section_fill(x.section, true).unwrap();
+            }),
+            ("capture_rest_sizes", |s, x| {
+                s.capture_rest_sizes(x.c, false).unwrap();
+            }),
+            ("ensure_incidence", |s, x| {
+                s.ensure_incidence(x.c).unwrap();
+            }),
+            ("capture_stroke_state", |s, x| {
+                s.capture_stroke_state(x.c, false).unwrap();
+            }),
+            ("split_stretched", |s, x| {
+                let _ = s.split_stretched(x.c, &fast_mesh_ops::stretch::StretchOptions::default());
+            }),
+            ("dab", |s, x| {
+                let dab = crate::Dab::Inflate(Default::default());
+                s.dab(x.c, &dab).unwrap();
+            }),
+            ("dab_protected", |s, x| {
+                let dab = crate::Dab::Inflate(Default::default());
+                s.dab_protected(x.c, &dab, &[], &[]).unwrap();
+            }),
+            ("dab_protected_band", |s, x| {
+                let dab = crate::Dab::Inflate(Default::default());
+                s.dab_protected_band(x.c, &dab, &[], &[], 0.1).unwrap();
+            }),
+            ("vertices_in_sphere", |s, x| {
+                s.vertices_in_sphere(x.c, [0.0, 0.0, 0.0], 0.5).unwrap();
             }),
         ];
         for (name, call) in calls {
@@ -8197,6 +8224,7 @@ mod tests {
                 falloff: fast_mesh_ops::Falloff::Smooth,
                 strength,
             },
+            ..Default::default()
         })
     }
 

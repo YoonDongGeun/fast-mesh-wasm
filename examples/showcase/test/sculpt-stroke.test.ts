@@ -4,8 +4,18 @@
 // sync scene, and a remesh in the middle of a grab keeps it continuous.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { maskEdgeField } from "../src/viewport/mask-protect";
-import { GRAB_MAX_STRETCH, GrabRegion, SculptStroke, sculptBrush, type SculptBrush } from "../src/viewport/sculpt";
+import { inheritedSplits, MASK_SOFT_BAND, maskEdgeField, protectMaskedDab } from "../src/viewport/mask-protect";
+import {
+  dabOperation,
+  GRAB_MAX_STRETCH,
+  GrabRegion,
+  SculptStroke,
+  sculptBrush,
+  strokeRegionSpheres,
+  symmetricRemeshOps,
+  unionMaskIds,
+  type SculptBrush,
+} from "../src/viewport/sculpt";
 
 type Vec = [number, number, number];
 
@@ -677,5 +687,237 @@ describe("a grab never folds the surface", () => {
     const [pa, pb, pf] = [read(further, a), read(further, b), read(further, fresh)];
     // Its share of the extra drag is its edge's mean, whatever the widening does.
     expect(pf[0] - at[0]).toBeCloseTo((pa[0] - landed[3 * a] + (pb[0] - landed[3 * b])) / 2, 4);
+  });
+});
+
+describe("engine-driven Grab + masked dabs + live splits (#177, #192, #197)", () => {
+  it("preserves_masked_and_inherited_split_vertices_and_undoes_in_one_Ctrl_Z_step_on_sync_scene", async () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    s.scene.repair(s.mesh, { op: "captureRestSizes", onlyIfMissing: true });
+
+    // Paint mask via engine BVH verticesInSphere near [R, 0.25, 0.25]
+    let masked = s.scene.verticesInSphere(s.mesh, [R, 0.25, 0.25], 0.35);
+    expect(masked.length).toBeGreaterThan(5);
+    let inherited = new Set<number>();
+
+    const before = Float32Array.from(v.positions());
+    const press: Vec = [R, 0, 0];
+    const radius = 0.6;
+    const stroke = new SculptStroke(
+      sculptBrush("grab", s.mesh, radius, 1, "smooth"),
+      {
+        beginStep: () => s.scene.beginStep(),
+        endStep: () => s.scene.endStep(),
+        cancelStep: () => s.scene.cancelStep(),
+      },
+      () => Promise.resolve(),
+    );
+
+    // Press queues captureStrokeState in-order before moves, without opening an undo step on its own.
+    void stroke.pass(() => {
+      s.scene.repair(s.mesh, { op: "captureStrokeState", onlyIfMissing: false });
+      return Promise.resolve();
+    });
+
+    const moveGrab = (drag: Vec) =>
+      stroke.move(
+        () => {
+          const curPos = v.positions();
+          const live = new Uint8Array(curPos.length / 3).fill(1);
+          const grabOp = dabOperation(
+            { ...sculptBrush("grab", s.mesh, radius, 1, "smooth"), direction: drag },
+            press,
+          );
+          const heldOp = protectMaskedDab(grabOp, masked, curPos, live);
+          s.scene.repair(s.mesh, heldOp);
+          return Promise.resolve();
+        },
+        [press[0] + drag[0], press[1] + drag[1], press[2] + drag[2]],
+      );
+
+    moveGrab([0.6, 0, 0]);
+    await stroke.pass(() => {
+      const rep = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 0.3, 0, 0], radius: 2 });
+      const set = new Set(masked);
+      const fresh = inheritedSplits((id) => set.has(id), rep.vertices);
+      if (fresh.length > 0) {
+        masked = unionMaskIds(masked, Uint32Array.from(fresh).sort((a, b) => a - b));
+        inherited = new Set([...inherited, ...fresh]);
+      }
+      return Promise.resolve();
+    });
+    const afterSplitPos = Float32Array.from(v.positions());
+    const splitSlots = afterSplitPos.length / 3;
+    expect(splitSlots).toBeGreaterThan(before.length / 3);
+
+    moveGrab([1.2, 0.2, 0]);
+    stroke.end();
+    await stroke.done;
+
+    const finalPos = v.positions();
+    expect(maxDifference(finalPos.subarray(0, before.length), before)).toBeGreaterThan(0.8);
+
+    // Every original masked vertex stayed byte-identical throughout the grab + live split.
+    const wasBytes = new Uint8Array(before.buffer);
+    const nowBytes = new Uint8Array(finalPos.buffer, finalPos.byteOffset, finalPos.byteLength);
+    for (const id of masked) {
+      if (3 * id < before.length) {
+        for (let b = 12 * id; b < 12 * id + 12; b++) {
+          expect(nowBytes[b]).toBe(wasBytes[b]);
+        }
+      } else {
+        // Inherited split midpoint stayed byte-identical after its split created it.
+        for (let c = 0; c < 3; c++) {
+          expect(finalPos[3 * id + c]).toBe(afterSplitPos[3 * id + c]);
+        }
+      }
+    }
+
+    // Band parameter check
+    expect(MASK_SOFT_BAND).toBeGreaterThan(0);
+
+    // Single Ctrl+Z undoes the entire grab stroke + live splits back to original mesh!
+    expect(s.scene.canUndo()).toBe(true);
+    s.scene.undo();
+    expect(s.scene.vertexCount(s.mesh)).toBe(before.length / 3);
+    expect(v.positions().length).toBeGreaterThanOrEqual(before.length);
+    expect(maxDifference(v.positions().subarray(0, before.length), before)).toBe(0);
+    expect(s.scene.canUndo()).toBe(false);
+  });
+
+  it("cancels step when only setup pass settles and subsequent dab or move fails", async () => {
+    const calls: string[] = [];
+    const brush = sculptBrush("inflate", 0 as never, 0.5, 0.25, "smooth");
+    const setupGate = new Promise<void>((r) => setTimeout(r, 10));
+
+    // 1. Setup `pass` followed by a rejecting queued `dab`: `pass` settles while `#begun === true`,
+    //    yet `#landed` stays false so `end()` cancels the step cleanly.
+    {
+      const stroke = new SculptStroke(
+        brush,
+        {
+          beginStep: () => void calls.push("begin"),
+          endStep: () => void calls.push("end"),
+          cancelStep: () => void calls.push("cancel"),
+        },
+        () => Promise.reject(new Error("mesh removed")),
+      );
+      void stroke.pass(() => setupGate);
+      stroke.dab([0, 0, 0]);
+      stroke.end();
+      await stroke.done;
+      expect(calls).toEqual(["begin", "cancel"]);
+    }
+
+    // 2. Setup `pass` followed by a rejecting `move`: still cancels instead of committing.
+    {
+      const moveCalls: string[] = [];
+      const stroke = new SculptStroke(
+        sculptBrush("grab", 0 as never, 0.5, 1, "smooth"),
+        {
+          beginStep: () => void moveCalls.push("begin"),
+          endStep: () => void moveCalls.push("end"),
+          cancelStep: () => void moveCalls.push("cancel"),
+        },
+        () => Promise.resolve(),
+      );
+      void stroke.pass(() => Promise.resolve());
+      stroke.move(() => Promise.reject(new Error("grab aborted")), [0.1, 0, 0]);
+      stroke.end();
+      await stroke.done;
+      expect(moveCalls).toEqual(["begin", "cancel"]);
+    }
+  });
+
+  it("symmetrizes live splitStretched and stroke-end remesh across mirrored lobes locally", async () => {
+    const { positions, indices } = sphere(12, 24, 2);
+    const scene = new Scene();
+    const mesh = scene.addMesh(positions, indices, { origin: [0, 0, 0] });
+    scene.repair(mesh, { op: "captureRestSizes" });
+    scene.repair(mesh, { op: "captureStrokeState" });
+
+    const symmetry = { x: true, y: false, z: false };
+    const press: Vec = [2, 0, 0];
+    const radius = 0.65;
+    const brush = {
+      ...sculptBrush("grab", mesh, radius, 1, "smooth"),
+      symmetry,
+    };
+    const stroke = new SculptStroke(
+      brush,
+      {
+        beginStep: () => scene.beginStep(),
+        endStep: () => scene.endStep(),
+        cancelStep: () => scene.cancelStep(),
+      },
+      () => Promise.resolve(),
+    );
+
+    const before = Float32Array.from(scene.views(mesh).positions());
+    const drag: Vec = [0.85, 0, 0];
+    stroke.move(
+      () => {
+        scene.repair(mesh, dabOperation({ ...brush, direction: drag }, press));
+        return Promise.resolve();
+      },
+      [press[0] + drag[0], press[1] + drag[1], press[2] + drag[2]],
+    );
+
+    const rawBounds = stroke.bounds()!;
+    const spheres = strokeRegionSpheres(rawBounds, symmetry);
+    expect(spheres).toHaveLength(2);
+    expect(spheres[0].center[0]).toBeGreaterThan(2);
+    expect(spheres[1].center[0]).toBeLessThan(-2);
+    expect(spheres[0].radius).toBe(rawBounds.radius);
+    expect(spheres[1].radius).toBe(rawBounds.radius);
+
+    let totalSplits = 0;
+    const splitCenters: number[] = [];
+    await stroke.pass(async () => {
+      for (const sp of spheres) {
+        const rep = scene.repair(mesh, {
+          op: "splitStretched",
+          center: sp.center,
+          radius: sp.radius,
+          maxSplits: 64,
+        });
+        totalSplits += rep.splits;
+        splitCenters.push(rep.splits);
+      }
+    });
+    expect(splitCenters[0]).toBeGreaterThan(0);
+    expect(splitCenters[1]).toBeGreaterThan(0);
+    expect(totalSplits).toBeGreaterThanOrEqual(2);
+
+    // Stroke-end symmetric remesh skips a lobe that meets the mask while still remeshing the mirror lobe.
+    const ops = symmetricRemeshOps(
+      rawBounds,
+      symmetry,
+      (sp) => sp.center[0] > 0, // pretend +x lobe meets mask, -x does not
+      2,
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0].op).toBe("remesh");
+    expect(ops[0].center[0]).toBeLessThan(-2);
+
+    await stroke.pass(() => {
+      scene.repair(mesh, ops);
+      return Promise.resolve();
+    });
+    stroke.end();
+    await stroke.done;
+
+    // Locality check: vertices on the x = 0 symmetry meridian outside both spheres must stay untouched.
+    const after = scene.views(mesh).positions();
+    for (let id = 0; id < before.length / 3; id++) {
+      const bx = before[3 * id];
+      if (Math.abs(bx) < 0.05) {
+        expect(after[3 * id]).toBe(before[3 * id]);
+        expect(after[3 * id + 1]).toBe(before[3 * id + 1]);
+        expect(after[3 * id + 2]).toBe(before[3 * id + 2]);
+      }
+    }
+    scene.free();
   });
 });

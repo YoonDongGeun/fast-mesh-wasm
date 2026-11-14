@@ -581,7 +581,10 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
         assert_kept(&m, &before);
     };
     check(&|tx| {
-        let options = InflateOptions { brush: brush() };
+        let options = InflateOptions {
+            brush: brush(),
+            ..Default::default()
+        };
         inflate(tx, &options).map(|_| ())
     });
     check(&|tx| {
@@ -589,6 +592,7 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
             brush: brush(),
             cycles: 2,
             method: SmoothMethod::default(),
+            ..Default::default()
         };
         crate::deform::smooth(tx, &options).map(|_| ())
     });
@@ -596,8 +600,69 @@ fn inflate_smooth_grab_and_offset_keep_uvs_on_their_vertices() {
         let options = GrabOptions {
             brush: brush(),
             direction: [0., 0., 1.],
+            ..Default::default()
         };
         crate::deform::grab(tx, &options).map(|_| ())
+    });
+    check(&|tx| {
+        let options = GrabOptions {
+            brush: brush(),
+            direction: [0., 0., 1.],
+            method: crate::sculpt::GrabMethod::Geodesic,
+            ..Default::default()
+        };
+        crate::sculpt::grab(tx, &options).map(|_| ())
+    });
+    check(&|tx| {
+        let options = GrabOptions {
+            brush: brush(),
+            direction: [0., 0., 1.],
+            method: crate::sculpt::GrabMethod::Kelvinlet,
+            ..Default::default()
+        };
+        crate::sculpt::grab(tx, &options).map(|_| ())
+    });
+    check(&|tx| {
+        crate::sculpt::flatten(
+            tx,
+            &crate::sculpt::FlattenOptions {
+                brush: brush(),
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    });
+    check(&|tx| {
+        crate::sculpt::crease(
+            tx,
+            &crate::sculpt::CreaseOptions {
+                brush: brush(),
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    });
+    check(&|tx| {
+        crate::sculpt::clay(
+            tx,
+            &crate::sculpt::ClayOptions {
+                brush: brush(),
+                profile: crate::sculpt::ClayProfile::Strips,
+                tangent: Some([1., 0., 0.]),
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    });
+    check(&|tx| {
+        crate::sculpt::twist(
+            tx,
+            &crate::sculpt::TwistOptions {
+                brush: brush(),
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
     });
     check(&|tx| {
         offset(
@@ -660,13 +725,22 @@ fn brushes_open_a_bent_seam_unless_the_move_is_the_callers() {
         strength: 0.5,
     };
     let mut inflated = seam_with_bend(1.);
-    edit(&mut inflated, |tx| inflate(tx, &InflateOptions { brush }));
+    edit(&mut inflated, |tx| {
+        inflate(
+            tx,
+            &InflateOptions {
+                brush,
+                ..Default::default()
+            },
+        )
+    });
     assert!(seam_gap(&inflated) > 0.01, "{}", seam_gap(&inflated));
     for method in [SmoothMethod::Taubin, SmoothMethod::Laplacian] {
         let options = SmoothOptions {
             brush,
             cycles: 1,
             method,
+            ..Default::default()
         };
         let mut smoothed = seam_with_bend(1.);
         // Lopsided, so the two sides have different neighbours.
@@ -685,10 +759,41 @@ fn brushes_open_a_bent_seam_unless_the_move_is_the_callers() {
         let options = GrabOptions {
             brush,
             direction: [0., 0., 1.],
+            ..Default::default()
         };
         crate::deform::grab(tx, &options)
     });
     assert_eq!(seam_gap(&grabbed), 0.);
+    for method in [
+        crate::sculpt::GrabMethod::Geodesic,
+        crate::sculpt::GrabMethod::Kelvinlet,
+    ] {
+        let mut m = seam_with_bend(1.);
+        edit(&mut m, |tx| {
+            crate::sculpt::grab(
+                tx,
+                &GrabOptions {
+                    brush,
+                    direction: [0., 0., 1.],
+                    method,
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(seam_gap(&m), 0., "{method:?}");
+    }
+    let mut creased = seam_with_bend(1.);
+    edit(&mut creased, |tx| {
+        crate::sculpt::crease(
+            tx,
+            &crate::sculpt::CreaseOptions {
+                brush,
+                pinch: 0.5,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(seam_gap(&creased) > 0.01, "{}", seam_gap(&creased));
 }
 
 #[test]

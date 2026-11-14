@@ -2,7 +2,7 @@
 // Everything here survives structured clone; bulk data travels as transferred
 // `ArrayBuffer`s. Meshes, fields and sections are named by client ids, which
 // the main side allocates synchronously; the engine maps them to its handles.
-import type { Vec3 } from "../api.js";
+import type { Bounds, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import type {
   AddMeshOptions,
@@ -183,6 +183,7 @@ export interface QueryMap {
   };
   analyze: { args: { mesh: ClientId; options?: AnalyzeOptions }; value: unknown };
   measure: { args: { mesh: ClientId }; value: MeasureResult };
+  verticesInSphere: { args: { mesh: ClientId; center: Vec3; radius: number }; value: Uint32Array };
   fieldStatus: { args: { field: ClientId }; value: unknown };
   fieldNearest: { args: { field: ClientId }; value: unknown };
   fieldTargetStatus: { args: { field: ClientId }; value: unknown };
@@ -239,6 +240,8 @@ export interface MeshChangeWire {
   /** Slot counts after the change; 0 for a removed mesh. */
   vertexSlots: number;
   triangleSlots: number;
+  /** Local-render bounds after a geometry change; omitted when geometry is unchanged. */
+  bounds?: Bounds | null;
   bytes: {
     positions: ArrayBuffer | null;
     normals: ArrayBuffer | null;

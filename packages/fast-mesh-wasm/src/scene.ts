@@ -586,33 +586,50 @@ export interface AnalyzeOptions {
   maxListed?: number;
 }
 
+/** Which normal direction `inflate` pushes vertices along. */
+export type InflateMethod = "vertexNormal" | "averageNormal" | "strokeNormal";
+
+/** Surface relaxation kernel for `smooth`. */
+export type SmoothMethod = "taubin" | "laplacian" | "hcLaplacian" | "cotangent";
+
+/** Spatial or elastic kernel for `grab`. */
+export type GrabMethod = "sphere" | "geodesic" | "kelvinlet";
+
+/** Which side(s) of the brush plane `flatten` projects toward the plane. */
+export type FlattenMode = "both" | "peaks" | "valleys";
+
+/** Footprint profile for `clay`. */
+export type ClayProfile = "round" | "strips";
+
+/** Rotational kernel for `twist`. */
+export type TwistMethod = "vortex" | "kelvinlet";
+
 /** Surface offsetting / reconstruction algorithm for `repair(mesh, { op: "offset", ... })`. */
 export type OffsetAlgorithm = "normal" | "fhEdt" | "bvhSdf";
 
 /**
- * One repair operation for {@link Scene.repair}. Distances and areas are in
- * mesh units (equal to world units). They are converted to `f32`, so a
- * tolerance or area below the `f32` range rounds to 0.
+ * Composable per-vertex surface feature mask multiplied into a brush's
+ * spatial falloff.
  */
-export type RepairOp =
-  | { op: "weld"; tolerance: number }
-  | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
-  | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
-  | { op: "orient" }
-  | {
-      op: "fillHoles";
-      maxEdges?: number;
-      maxPerimeter?: number;
-      maxArea?: number;
-      loops?: readonly LoopId[];
-      allowUnclean?: boolean;
-      fair?: boolean;
-      dpLimit?: number;
-      /** Reject a minimum-weight triangulation past this dihedral, in radians. */
-      maxDihedral?: number;
-      /** Stop refining a patch once it has this many new vertices. */
-      maxRefineVertices?: number;
-    }
+export type SurfaceFilter =
+  | { kind: "none" }
+  | { kind: "peaksOnly"; threshold?: number; contrast?: number }
+  | { kind: "valleysOnly"; threshold?: number; contrast?: number }
+  | { kind: "normalAngle"; normal?: Readonly<Vec3>; maxAngleDeg?: number };
+
+/** Mirror symmetry axes across local coordinate planes `x = 0`, `y = 0`, `z = 0`. */
+export interface Symmetry {
+  x?: boolean;
+  y?: boolean;
+  z?: boolean;
+}
+
+/**
+ * One sculpt brush, stroke capture, or dynamic-topology operation for
+ * {@link Scene.sculpt} (and accepted identically by {@link Scene.repair}).
+ * Distances are in local mesh units.
+ */
+export type SculptOp =
   | {
       op: "inflate";
       /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
@@ -621,6 +638,12 @@ export type RepairOp =
       falloff: "linear" | "smooth";
       /** Displacement scale; negative pulls instead of pushing. */
       strength: number;
+      /** Normal evaluation mode; unset means `"vertexNormal"`. */
+      method?: InflateMethod;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
       /** Vertices this op must hold in place, or move less. */
       protect?: VertexProtection;
     }
@@ -632,10 +655,144 @@ export type RepairOp =
       falloff: "linear" | "smooth";
       /** Displacement scale; the per-vertex weight is `strength * falloff`. */
       strength: number;
-      /** How many Taubin λ/μ cycles to run; 0 moves nothing. */
+      /** How many relaxation cycles to run; 0 moves nothing. */
       cycles: number;
+      /** Relaxation kernel; unset means `"taubin"`. */
+      method?: SmoothMethod;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
       /** Vertices this op must hold in place, or move less. */
       protect?: VertexProtection;
+    }
+  | {
+      op: "relax";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; the per-vertex weight is `strength * falloff`. */
+      strength: number;
+      /** How many plain Laplacian passes to run; 0 moves nothing. */
+      cycles: number;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      op: "grab";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Displacement scale; the per-vertex offset is `strength * falloff * direction`. */
+      strength: number;
+      /** The drag vector in local coordinates; zero moves nothing. */
+      direction: Readonly<Vec3>;
+      /** Spatial or elastic kernel; unset means `"sphere"`. */
+      method?: GrabMethod;
+      /** Elastic Poisson ratio in `[0, 0.5]` for `"kelvinlet"`; unset means `0.4`. */
+      poisson?: number;
+      /** Evaluate offsets from stroke-start rest positions (`captureStrokeState`). */
+      fromStroke?: boolean;
+      /** Automatically widen brush reach on tangential surface drags to prevent fold-over. */
+      adaptiveReach?: boolean;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      op: "flatten";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Projection blend scale toward the brush plane. */
+      strength: number;
+      /** Which side(s) of the plane to project; unset means `"both"`. */
+      mode?: FlattenMode;
+      /** Explicit plane origin in local coordinates; unset fits the falloff-weighted centroid. */
+      planeOrigin?: Readonly<Vec3>;
+      /** Explicit non-zero plane normal in local coordinates; unset fits the falloff-weighted average normal. */
+      planeNormal?: Readonly<Vec3>;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      op: "crease";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Normal groove/ridge scale (`< 0` carves a crease, `> 0` raises a ridge, `0` pinches only). */
+      strength: number;
+      /** Tangent-plane radial pinch factor in `[0, 1]`; unset means `0.5`. */
+      pinch?: number;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      op: "clay";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Buildup/carve scale (`> 0` builds up, `< 0` carves down). */
+      strength: number;
+      /** Footprint profile (`"round"` or `"strips"`); unset means `"round"`. */
+      profile?: ClayProfile;
+      /** Optional stroke tangent direction in local coordinates for `"strips"`. */
+      tangent?: Readonly<Vec3>;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      op: "twist";
+      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
+      center: Readonly<Vec3>;
+      radius: number;
+      falloff: "linear" | "smooth";
+      /** Twist angle scale in radians. */
+      strength: number;
+      /** Rotational kernel; unset means `"vortex"`. */
+      method?: TwistMethod;
+      /** Explicit non-zero twist axis in local coordinates; unset uses the average brush normal. */
+      axis?: Readonly<Vec3>;
+      /** Optional per-vertex surface feature mask. */
+      filter?: SurfaceFilter;
+      /** Optional mirror symmetry across local coordinate planes. */
+      symmetry?: Symmetry;
+      /** Vertices this op must hold in place, or move less. */
+      protect?: VertexProtection;
+    }
+  | {
+      /**
+       * Snapshots lazy stroke-start rest positions and smooth normals for
+       * `inflate` (`method: "strokeNormal"`) and `grab` (`fromStroke: true`).
+       * Not an edit: no undo step, and it must be the only op of its list.
+       */
+      op: "captureStrokeState";
+      /** Keep an already active stroke snapshot on this mesh. Unset means `false`. */
+      onlyIfMissing?: boolean;
     }
   | {
       op: "remesh";
@@ -692,6 +849,32 @@ export type RepairOp =
        * curved surface then rounds less.
        */
       sharpAngle?: number;
+    };
+
+/**
+ * One repair operation for {@link Scene.repair}. Distances and areas are in
+ * mesh units (equal to world units). They are converted to `f32`, so a
+ * tolerance or area below the `f32` range rounds to 0.
+ */
+export type RepairOp =
+  | SculptOp
+  | { op: "weld"; tolerance: number }
+  | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
+  | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
+  | { op: "orient" }
+  | {
+      op: "fillHoles";
+      maxEdges?: number;
+      maxPerimeter?: number;
+      maxArea?: number;
+      loops?: readonly LoopId[];
+      allowUnclean?: boolean;
+      fair?: boolean;
+      dpLimit?: number;
+      /** Reject a minimum-weight triangulation past this dihedral, in radians. */
+      maxDihedral?: number;
+      /** Stop refining a patch once it has this many new vertices. */
+      maxRefineVertices?: number;
     }
   | {
       op: "bridgeLoops";
@@ -699,32 +882,6 @@ export type RepairOp =
       loops: readonly [LoopId, LoopId];
       /** Maximum vertices per loop; unset means the default (128). */
       maxEdges?: number;
-    }
-  | {
-      op: "grab";
-      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
-      center: Readonly<Vec3>;
-      radius: number;
-      falloff: "linear" | "smooth";
-      /** Displacement scale; the per-vertex offset is `strength * falloff * direction`. */
-      strength: number;
-      /** The drag vector in local coordinates; zero moves nothing. */
-      direction: Readonly<Vec3>;
-      /** Vertices this op must hold in place, or move less. */
-      protect?: VertexProtection;
-    }
-  | {
-      op: "relax";
-      /** Brush center in local mesh coordinates, as in `views(mesh).positions()`. */
-      center: Readonly<Vec3>;
-      radius: number;
-      falloff: "linear" | "smooth";
-      /** Displacement scale; the per-vertex weight is `strength * falloff`. */
-      strength: number;
-      /** How many plain Laplacian passes to run; 0 moves nothing. */
-      cycles: number;
-      /** Vertices this op must hold in place, or move less. */
-      protect?: VertexProtection;
     }
   | {
       op: "offset";
@@ -836,21 +993,24 @@ export interface FillReport {
 }
 
 /**
- * Vertices a brush op (`inflate`, `smooth`, `relax`, `grab`) holds back.
+ * Vertices a brush op holds back, with optional geodesic soft-band feathering.
  * After the op runs, each listed vertex's move is scaled by its weight: `0`
- * leaves it at exactly the bytes it had, `1` keeps the whole move. The op's
- * report describes its own move, before the scaling, and it stays one undo step;
- * an op alone whose brush holds only vertices at `0` reports 0 and leaves no step.
- * List only what the brush can reach: every listed vertex costs time per call.
+ * leaves it at exactly the bytes it had, `1` keeps the whole move. When
+ * `band > 0`, vertices within geodesic surface distance `band` of `0`-weight
+ * vertices feather smoothly across `[0, band]`. The op's report describes its
+ * own move before scaling, and it stays one undo step; an op alone whose brush
+ * holds only vertices at `0` reports 0 and leaves no step.
  *
- * @throws `INVALID_ARGUMENT` from `repair` when a vertex is not alive, a weight
- * is outside `[0, 1]`, or the lists differ in length.
+ * @throws `INVALID_ARGUMENT` when a vertex is not alive, a weight is outside
+ * `[0, 1]`, `band` is negative or non-finite, or the lists differ in length.
  */
 export interface VertexProtection {
   /** The vertex slots to protect. */
-  vertices: Uint32Array | readonly number[];
+  vertices: Indices;
   /** One weight per vertex, each in `[0, 1]`; unset holds every listed vertex fully (all `0`). */
-  weights?: Float32Array | readonly number[];
+  weights?: ArrayLike<number>;
+  /** Geodesic soft-falloff transition band width in local units around `0`-weight vertices; unset means `0`. */
+  band?: number;
 }
 
 /** What `inflate` did. */
@@ -864,6 +1024,33 @@ export interface SmoothReport {
   moved: number;
   maxDisplacement: number;
 }
+
+/** What `flatten` did. */
+export interface FlattenReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** What `crease` did. */
+export interface CreaseReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** What `clay` did. */
+export interface ClayReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** What `twist` did. */
+export interface TwistReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** What `captureStrokeState` did: nothing to report. */
+export type CaptureStrokeReport = Record<string, never>;
 
 /** What `remesh` did. */
 export interface RemeshReport {
@@ -1156,25 +1343,61 @@ export interface AutoRepairReport {
   fillHoles: FillReport;
 }
 
+/** The report of a {@link SculptOp}. */
+export type SculptReport =
+  | InflateReport
+  | SmoothReport
+  | RelaxReport
+  | GrabReport
+  | FlattenReport
+  | CreaseReport
+  | ClayReport
+  | TwistReport
+  | CaptureStrokeReport
+  | CaptureRestReport
+  | StretchReport
+  | RemeshReport;
+
+/** The report type of a sculpt op. */
+export type SculptReportOf<O extends SculptOp> = O extends { op: "inflate" }
+  ? InflateReport
+  : O extends { op: "smooth" }
+    ? SmoothReport
+    : O extends { op: "relax" }
+      ? RelaxReport
+      : O extends { op: "grab" }
+        ? GrabReport
+        : O extends { op: "flatten" }
+          ? FlattenReport
+          : O extends { op: "crease" }
+            ? CreaseReport
+            : O extends { op: "clay" }
+              ? ClayReport
+              : O extends { op: "twist" }
+                ? TwistReport
+                : O extends { op: "captureStrokeState" }
+                  ? CaptureStrokeReport
+                  : O extends { op: "captureRestSizes" }
+                    ? CaptureRestReport
+                    : O extends { op: "splitStretched" }
+                      ? StretchReport
+                      : O extends { op: "remesh" }
+                        ? RemeshReport
+                        : SculptReport;
+
 /** The report of a {@link RepairOp}. */
 export type RepairReport =
+  | SculptReport
   | WeldReport
   | DegenerateReport
   | RemoveReport
   | OrientReport
   | FillReport
-  | InflateReport
-  | SmoothReport
-  | RemeshReport
   | BridgeReport
-  | GrabReport
-  | RelaxReport
   | OffsetReport
   | ShellReport
   | SimplifyReport
-  | SubdivideReport
-  | StretchReport
-  | CaptureRestReport;
+  | SubdivideReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -1199,19 +1422,29 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                     ? GrabReport
                     : O extends { op: "relax" }
                       ? RelaxReport
-                      : O extends { op: "offset" }
-                        ? OffsetReport
-                        : O extends { op: "shell" }
-                          ? ShellReport
-                          : O extends { op: "simplify" }
-                            ? SimplifyReport
-                            : O extends { op: "subdivide" }
-                              ? SubdivideReport
-                              : O extends { op: "splitStretched" }
-                                ? StretchReport
-                                : O extends { op: "captureRestSizes" }
-                                  ? CaptureRestReport
-                                  : RepairReport;
+                      : O extends { op: "flatten" }
+                        ? FlattenReport
+                        : O extends { op: "crease" }
+                          ? CreaseReport
+                          : O extends { op: "clay" }
+                            ? ClayReport
+                            : O extends { op: "twist" }
+                              ? TwistReport
+                              : O extends { op: "captureStrokeState" }
+                                ? CaptureStrokeReport
+                                : O extends { op: "offset" }
+                                  ? OffsetReport
+                                  : O extends { op: "shell" }
+                                    ? ShellReport
+                                    : O extends { op: "simplify" }
+                                      ? SimplifyReport
+                                      : O extends { op: "subdivide" }
+                                        ? SubdivideReport
+                                        : O extends { op: "splitStretched" }
+                                          ? StretchReport
+                                          : O extends { op: "captureRestSizes" }
+                                            ? CaptureRestReport
+                                            : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -1228,6 +1461,8 @@ interface ActiveDrag {
 
 /** The repair list's prefix code for a {@link VertexProtection}. */
 const PROTECT_CODE = 32;
+/** The repair list's prefix code for {@link Symmetry} and {@link SurfaceFilter}. */
+const BRUSH_MODIFIERS_CODE = 33;
 
 const MODES: Record<UpdateMode, number> = { eager: 0, lazy: 1, manual: 2 };
 const MODE_NAMES: readonly UpdateMode[] = ["eager", "lazy", "manual"];
@@ -1406,12 +1641,46 @@ const REPAIR_CODES = {
   subdivide: 14,
   splitStretched: 16,
   captureRestSizes: 17,
+  captureStrokeState: 18,
+  flatten: 19,
+  crease: 20,
+  clay: 21,
+  twist: 22,
 } as const;
 
 /** The op code of an {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
 const AUTO_REPAIR_CODE = 15;
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
+const INFLATE_METHOD_CODES: Record<InflateMethod, number> = {
+  vertexNormal: 0,
+  averageNormal: 1,
+  strokeNormal: 2,
+};
+const SMOOTH_METHOD_CODES: Record<SmoothMethod, number> = {
+  taubin: 0,
+  laplacian: 1,
+  hcLaplacian: 2,
+  cotangent: 3,
+};
+const GRAB_METHOD_CODES: Record<GrabMethod, number> = {
+  sphere: 0,
+  geodesic: 1,
+  kelvinlet: 2,
+};
+const FLATTEN_MODE_CODES: Record<FlattenMode, number> = {
+  both: 0,
+  peaks: 1,
+  valleys: 2,
+};
+const CLAY_PROFILE_CODES: Record<ClayProfile, number> = {
+  round: 0,
+  strips: 1,
+};
+const TWIST_METHOD_CODES: Record<TwistMethod, number> = {
+  vortex: 0,
+  kelvinlet: 1,
+};
 const OFFSET_ALGORITHM_CODES = { normal: 0, fhEdt: 1, bvhSdf: 2 } as const;
 const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
@@ -1475,9 +1744,21 @@ function isAutoRepair(op: RepairOp | readonly RepairOp[] | AutoRepairRequest): o
   return (op as AutoRepairRequest | undefined)?.kind === "auto";
 }
 
+function optionalVec3(v: Readonly<Vec3> | undefined, what: string, values: number[]): void {
+  if (v === undefined) {
+    values.push(0, 0, 0, 0);
+    return;
+  }
+  const c = v as readonly number[];
+  if (c?.length !== 3 || ![c[0], c[1], c[2]].every((x) => typeof x === "number" && Number.isFinite(x))) {
+    throw invalid(`${what} must be 3 finite numbers`);
+  }
+  values.push(1, c[0], c[1], c[2]);
+}
+
 /** The prefix that wraps the op after it in a {@link VertexProtection}; see `crate::edit` in the Rust crate. */
 function encodeProtect(protect: VertexProtection, values: number[]): void {
-  const { vertices, weights } = protect;
+  const { vertices, weights, band } = protect;
   if (vertices?.length === undefined) {
     throw invalid("protect.vertices must be an array of vertex ids");
   }
@@ -1485,7 +1766,7 @@ function encodeProtect(protect: VertexProtection, values: number[]): void {
   if (weights !== undefined && weights.length !== n) {
     throw invalid("protect.weights must have one weight per vertex");
   }
-  values.push(PROTECT_CODE, n);
+  values.push(PROTECT_CODE, n, optional(band, "protect.band"));
   for (let k = 0; k < n; k++) {
     values.push(vertices[k]);
   }
@@ -1494,16 +1775,68 @@ function encodeProtect(protect: VertexProtection, values: number[]): void {
   }
 }
 
+/** Encodes prefix `33` (`brushModifiers`: symmetry + surface filter) before a brush op. */
+function encodeBrushModifiers(
+  symmetry: Symmetry | undefined,
+  filter: SurfaceFilter | undefined,
+  values: number[],
+): void {
+  if (symmetry === undefined && filter === undefined) {
+    return;
+  }
+  let symMask = 0;
+  if (symmetry !== undefined) {
+    if (typeof symmetry !== "object" || symmetry === null) {
+      throw invalid("symmetry must be an object");
+    }
+    if (symmetry.x) symMask |= 1;
+    if (symmetry.y) symMask |= 2;
+    if (symmetry.z) symMask |= 4;
+  }
+  let filterKind = 0;
+  let p0 = Number.NaN;
+  let p1 = Number.NaN;
+  let normal: Readonly<Vec3> | undefined;
+  if (filter !== undefined) {
+    if (typeof filter !== "object" || filter === null) {
+      throw invalid("filter must be an object");
+    }
+    switch (filter.kind) {
+      case "none":
+        break;
+      case "peaksOnly":
+      case "valleysOnly":
+        filterKind = filter.kind === "peaksOnly" ? 1 : 2;
+        p0 = optional(filter.threshold, "filter.threshold");
+        p1 = optional(filter.contrast, "filter.contrast");
+        break;
+      case "normalAngle":
+        filterKind = 3;
+        p0 = optional(filter.maxAngleDeg, "filter.maxAngleDeg");
+        normal = filter.normal;
+        break;
+      default:
+        throw invalid('filter.kind must be "none", "peaksOnly", "valleysOnly" or "normalAngle"');
+    }
+  }
+  values.push(BRUSH_MODIFIERS_CODE, symMask, filterKind, p0, p1);
+  optionalVec3(normal, "filter.normal", values);
+}
+
 /** A repair op list as the binding's `(ops, loops)`; see `crate::edit` in the Rust crate. */
 function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: Uint32Array } {
   const values: number[] = [];
   const loops: number[] = [];
   for (const o of ops) {
+    const code = codeIn(REPAIR_CODES, o?.op, "repair op");
     const protect = (o as { protect?: VertexProtection } | undefined)?.protect;
     if (protect !== undefined) {
       encodeProtect(protect, values);
     }
-    values.push(codeIn(REPAIR_CODES, o?.op, "repair op"));
+    const symmetry = (o as { symmetry?: Symmetry } | undefined)?.symmetry;
+    const filter = (o as { filter?: SurfaceFilter } | undefined)?.filter;
+    encodeBrushModifiers(symmetry, filter, values);
+    values.push(code);
     switch (o.op) {
       case "weld":
         values.push(optional(o.tolerance, "tolerance"));
@@ -1550,9 +1883,19 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.radius, "radius"),
           codeIn(FALLOFF_CODES, o.falloff, "falloff"),
           optional(o.strength, "strength"),
+          o.method === undefined ? Number.NaN : codeIn(INFLATE_METHOD_CODES, o.method, "inflate method"),
         );
         break;
       case "smooth":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          optional(o.cycles, "cycles"),
+          o.method === undefined ? Number.NaN : codeIn(SMOOTH_METHOD_CODES, o.method, "smooth method"),
+        );
+        break;
       case "relax":
         centerOf(o.center, values);
         values.push(
@@ -1592,9 +1935,57 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         if (d?.length !== 3 || ![d[0], d[1], d[2]].every(Number.isFinite)) {
           throw invalid("direction must be 3 finite numbers");
         }
-        values.push(d[0], d[1], d[2]);
+        values.push(
+          d[0],
+          d[1],
+          d[2],
+          o.method === undefined ? Number.NaN : codeIn(GRAB_METHOD_CODES, o.method, "grab method"),
+          optional(o.poisson, "poisson"),
+          flagOf(o.fromStroke, false),
+          flagOf(o.adaptiveReach, false),
+        );
         break;
       }
+      case "flatten":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          o.mode === undefined ? Number.NaN : codeIn(FLATTEN_MODE_CODES, o.mode, "flatten mode"),
+        );
+        optionalVec3(o.planeOrigin, "planeOrigin", values);
+        optionalVec3(o.planeNormal, "planeNormal", values);
+        break;
+      case "crease":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          optional(o.pinch, "pinch"),
+        );
+        break;
+      case "clay":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          o.profile === undefined ? Number.NaN : codeIn(CLAY_PROFILE_CODES, o.profile, "clay profile"),
+        );
+        optionalVec3(o.tangent, "tangent", values);
+        break;
+      case "twist":
+        centerOf(o.center, values);
+        values.push(
+          optional(o.radius, "radius"),
+          codeIn(FALLOFF_CODES, o.falloff, "falloff"),
+          optional(o.strength, "strength"),
+          o.method === undefined ? Number.NaN : codeIn(TWIST_METHOD_CODES, o.method, "twist method"),
+        );
+        optionalVec3(o.axis, "axis", values);
+        break;
       case "offset": {
         const distance = optional(o.distance, "distance");
         const alg =
@@ -1649,6 +2040,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         );
         break;
       case "captureRestSizes":
+      case "captureStrokeState":
         values.push(flagOf(o.onlyIfMissing, false));
         break;
     }
@@ -1734,16 +2126,18 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
         failed: r.many(() => ({ id: r.loopId(), reason: FAIL_REASONS[r.next()] })),
       };
     case "inflate":
-      return { moved: r.next(), maxDisplacement: r.next() };
     case "smooth":
     case "relax":
+    case "grab":
+    case "flatten":
+    case "crease":
+    case "clay":
+    case "twist":
       return { moved: r.next(), maxDisplacement: r.next() };
     case "remesh":
       return { splits: r.next(), collapses: r.next(), flips: r.next(), rounds: r.next() };
     case "bridgeLoops":
       return { trianglesAdded: r.next() };
-    case "grab":
-      return { moved: r.next(), maxDisplacement: r.next() };
     case "offset":
       return {
         moved: r.next(),
@@ -1779,6 +2173,7 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
       return { splits, remaining, vertices };
     }
     case "captureRestSizes":
+    case "captureStrokeState":
       return {};
   }
 }
@@ -2865,6 +3260,41 @@ export class Scene implements SceneLike {
     const r = new Reader(call(() => this.#scene().repair(index, generation, values, loops)));
     const reports = ops.map((o) => decodeReport(o.op, r));
     return Array.isArray(op) ? reports : reports[0];
+  }
+
+  /**
+   * Sculpt domain entry point: runs one {@link SculptOp} and returns its
+   * report, or a list of sculpt operations in one transaction and returns
+   * their reports. Delegates to {@link Scene.repair} on the same wire path.
+   */
+  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): SculptReportOf<O>;
+  sculpt<const O extends readonly SculptOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): { -readonly [K in keyof O]: SculptReportOf<O[K]> };
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): SculptReport | SculptReport[] {
+    return this.repair(mesh, op as RepairOp) as SculptReport | SculptReport[];
+  }
+
+  /**
+   * Live triangle-used vertex ids of `mesh` inside the closed local-space
+   * sphere `(center, radius)`, in ascending order. Brings a `"lazy"` BVH up
+   * to date first; throws `STALE_BVH` on a stale `"manual"` mesh.
+   *
+   * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
+   * `center` is not 3 finite numbers or `radius` is negative or non-finite;
+   * `STALE_BVH` for a stale `"manual"` mesh.
+   */
+  verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const c = center as readonly number[] | undefined;
+    if (c?.length !== 3 || ![c[0], c[1], c[2]].every((x) => typeof x === "number" && Number.isFinite(x))) {
+      throw invalid("center must be 3 finite numbers");
+    }
+    if (typeof radius !== "number" || !Number.isFinite(radius) || radius < 0) {
+      throw invalid("radius must be a finite non-negative number");
+    }
+    return call(() => this.#scene().vertices_in_sphere(index, generation, c[0], c[1], c[2], radius));
   }
 
   // ---- Queries (world space) ----

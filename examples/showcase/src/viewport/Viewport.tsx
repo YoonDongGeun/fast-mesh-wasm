@@ -28,21 +28,24 @@ import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
 import { matchVolume } from "./volume-box";
 import {
+  dabOperation,
   faceNormal,
-  GrabRegion,
+  grabLocalDelta,
+  interpolateHit,
+  liveMaxSplits,
+  liveRemeshDue,
+  meanEdgeLength,
+  reflectCenters,
+  remeshTooBig,
   type SculptBrush,
   type SculptMask,
   SculptStroke,
+  strokeRegionSpheres,
   type StrokeSteps,
-  grabLocalDelta,
-  interpolateHit,
-  LIVE_MAX_SPLITS,
-  liveRemeshDue,
-  maskUsable,
-  meanEdgeLength,
-  paintMaskIds,
-  remeshTooBig,
+  symmetricRemeshOps,
+  toSymmetry,
   unionMaskIds,
+  widestGrabReach,
   worldPerPixel,
 } from "./sculpt";
 import { easeNormal, makeBrushCursor, NORMAL_MARKER, placeBrushCursor, setBrushDirection } from "./brush-cursor";
@@ -50,13 +53,11 @@ import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
 import {
+  applyMaskPaintStep,
   inheritedSplits,
-  MASK_SOFT_BAND,
-  type MaskField,
-  maskEdgeField,
-  maskFieldCurrent,
+  MaskLiveTracker,
   maskMeetsRemesh,
-  protectDab,
+  protectMaskedDab,
 } from "./mask-protect";
 import { setWireOverlay } from "./wire";
 import {
@@ -124,6 +125,7 @@ export function Viewport(props: {
     wireframe,
     loader,
   } = props;
+  const store = useScene();
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
   const downAt = useRef<{ x: number; y: number } | null>(null);
@@ -206,6 +208,13 @@ export function Viewport(props: {
   }, [bindings]);
   const selected = selection === null ? null : (bindings.get(selection) ?? null);
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
+  // Shared live-mask cache between MaskLayer and SculptLayer so switching from
+  // mask paint into sculpting preserves O(1) verticesInSphere trust on dab 1.
+  const maskTracker = useMemo(() => new MaskLiveTracker(scene, store), [scene, store]);
+  useEffect(() => {
+    maskTracker.attach();
+    return () => maskTracker.dispose();
+  }, [maskTracker]);
 
   return (
     <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
@@ -229,6 +238,7 @@ export function Viewport(props: {
           onPickPoint={onPickPoint}
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
+          suppressClick={sculpt?.mesh === item.mesh || (maskPaint && sculpt === null && item.mesh === selection)}
           wireframe={wireframe}
           bound={bindings.get(item.mesh) ?? null}
         />
@@ -237,10 +247,17 @@ export function Viewport(props: {
       <Controls bound={sculpt !== null || maskPaint ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
       {hoverable ? <HoverRay scene={scene} /> : null}
       {sculpt !== null ? (
-        <SculptLayer app={app} scene={scene} sculpt={sculpt} remesh={sculptRemesh} liveRemesh={sculptLiveRemesh} />
+        <SculptLayer
+          app={app}
+          scene={scene}
+          sculpt={sculpt}
+          remesh={sculptRemesh}
+          liveRemesh={sculptLiveRemesh}
+          maskTracker={maskTracker}
+        />
       ) : null}
       {/* Mask paint owns the pointer while armed (like sculpt, it disarms the gizmo's claim); sculpt wins when both arm. */}
-      {maskPaint && sculpt === null ? <MaskLayer app={app} scene={scene} /> : null}
+      {maskPaint && sculpt === null ? <MaskLayer app={app} scene={scene} maskTracker={maskTracker} /> : null}
       <PickCursor picking={picking !== null || sculpt !== null} />
       <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
@@ -299,13 +316,30 @@ function MeshView(props: {
   scene: Scene | WorkerScene;
   /** The sculpt brush is armed on this mesh: clicks paint, they never select or pick. */
   sculpted: boolean;
+  /** True while sculpting or mask painting owns pointer clicks on this mesh. */
+  suppressClick: boolean;
   /** Lay the wireframe overlay over the shaded solid. */
   wireframe: boolean;
   /** The mesh's binding, once `<FastMesh onBind>` delivers it. */
   bound: MeshBinding | null;
 }) {
-  const { app, item, selected, volumeShown, secondary, edgeSoftness, onPick, onBind, picking, onPickPoint, scene, sculpted, wireframe, bound } =
-    props;
+  const {
+    app,
+    item,
+    selected,
+    volumeShown,
+    secondary,
+    edgeSoftness,
+    onPick,
+    onBind,
+    picking,
+    onPickPoint,
+    scene,
+    sculpted,
+    suppressClick,
+    wireframe,
+    bound,
+  } = props;
   // The armed inspect tool, if any: ruler and query clicks land here instead of selecting.
   const tool = useApp(app, (s) => s.inspectTool);
   useLayoutEffect(() => {
@@ -331,7 +365,7 @@ function MeshView(props: {
       }
       // A stroke's release on the mesh is not a click either, nor on a mesh
       // behind it, which the sculpted mesh's missing handler lets the click reach.
-      if (sculpted || view.pressTaken) {
+      if (sculpted || suppressClick || view.pressTaken) {
         return;
       }
       // The inspect tools own the click while armed, and never select: the
@@ -397,7 +431,7 @@ function MeshView(props: {
           // Removed meanwhile: the pick stays armed.
         });
     },
-    [item.mesh, onPick, picking, onPickPoint, scene, sculpted, tool, app],
+    [item.mesh, onPick, picking, onPickPoint, scene, sculpted, suppressClick, tool, app],
   );
   return (
     <>
@@ -407,9 +441,9 @@ function MeshView(props: {
         shading="fragment"
         edgeSoftness={edgeSoftness}
         visible={!volumeShown}
-        // While sculpting a click means nothing here, and listening for one
-        // costs a per-triangle three raycast on every press and release.
-        onClick={sculpted ? undefined : onClick}
+        // While sculpting this mesh or mask-painting the selected mesh a click means nothing
+        // here, and listening for one costs a per-triangle three raycast on every press and release.
+        onClick={sculpted || suppressClick ? undefined : onClick}
         onBind={(b) => onBind(item.mesh, b)}
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
@@ -666,8 +700,9 @@ function SculptLayer(props: {
   sculpt: SculptBrush;
   remesh: boolean;
   liveRemesh: boolean;
+  maskTracker: MaskLiveTracker;
 }) {
-  const { app, scene, sculpt, remesh, liveRemesh } = props;
+  const { app, scene, sculpt, remesh, liveRemesh, maskTracker } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
@@ -728,8 +763,8 @@ function SculptLayer(props: {
     let grabFrom: { x: number; y: number } | null = null;
     /** The press point in local coordinates, or null outside a grab stroke. */
     let grabPress: [number, number, number] | null = null;
-    /** What the grab stroke holds on to, or null while a masked press holds it still. */
-    let grabRegion: GrabRegion | null = null;
+    /** Peak O(1) grab influence reach seen during the stroke, or 0 outside a grab stroke. */
+    let grabPeakReach = 0;
     /** The surface's way at the cursor, eased over the triangles it crosses. */
     let cursorNormal: [number, number, number] | null = null;
     /**
@@ -753,68 +788,8 @@ function SculptLayer(props: {
       }
     };
 
-    /**
-     * The mask's liveness over the mesh's current buffers: `maskUsable`
-     * materialized, so a stroke start (and any re-cache when the triangles
-     * change) pays one O(triangles) pass and every dab pays O(masked). Own
-     * dabs only move positions, so the cache survives the stroke it gates. A
-     * weld or an undo can kill a vertex and keep the slot count, so it goes
-     * with any change to the triangles (see `offTriangles`).
-     */
-    let maskCache: { slots: number; live: Uint8Array } | null = null;
-    /** The mask `maskCache` last vouched for. */
-    let checkedMask: Uint32Array | null = null;
-    const maskLive = (
-      mesh: MeshHandle,
-    ): { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number> } | "stale" | null => {
-      const m = maskRef.current;
-      if (m === null || m.mesh !== mesh) {
-        return null;
-      }
-      let positions: ArrayLike<number>;
-      let indices: ArrayLike<number>;
-      try {
-        const v = scene.views(mesh);
-        positions = v.positions();
-        indices = v.indices();
-      } catch {
-        return null;
-      }
-      const slots = positions.length / 3;
-      if (maskCache === null || maskCache.slots !== slots) {
-        checkedMask = null;
-        const live = new Uint8Array(slots);
-        for (let t = 0; t + 2 < indices.length; t += 3) {
-          const a = indices[t];
-          const b = indices[t + 1];
-          const c = indices[t + 2];
-          if (a === 0 && b === 0 && c === 0) {
-            continue;
-          }
-          if (a >= 0 && a < slots) {
-            live[a] = 1;
-          }
-          if (b >= 0 && b < slots) {
-            live[b] = 1;
-          }
-          if (c >= 0 && c < slots) {
-            live[c] = 1;
-          }
-        }
-        maskCache = { slots, live };
-      }
-      // Once per mask over these triangles: every dab asks.
-      if (checkedMask !== m.vertices) {
-        for (let k = 0; k < m.vertices.length; k++) {
-          const id = m.vertices[k];
-          if ((id < 0 || id >= maskCache.live.length || maskCache.live[id] === 0) && m.inherited?.has(id) !== true) {
-            return "stale";
-          }
-        }
-        checkedMask = m.vertices;
-      }
-      return { vertices: m.vertices, positions, indices };
-    };
+    /** Splits between masked vertices join the mask, in order with the stroke: before the next dab. */
+    const maskLive = (mesh: MeshHandle) => maskTracker.liveSnapshot(mesh, maskRef.current);
 
     /**
      * Fails the mask loudly: clears it with its notice (the toolbox shows
@@ -822,21 +797,15 @@ function SculptLayer(props: {
      * masked vertex never silently re-points the brush.
      */
     const maskWentStale = () => {
-      maskCache = null;
+      const staleMesh = maskRef.current?.mesh;
+      maskRef.current = null;
+      maskTracker.invalidate(staleMesh);
       app.setSculptMask(null);
       app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
       inspect.sculpt.maskStale++;
     };
 
-    /** The mask without inherited slots an undo took: a dead vertex cannot be protected. */
-    const heldNow = (vertices: Uint32Array): ArrayLike<number> => {
-      const inherited = maskRef.current?.inherited;
-      const live = maskCache?.live;
-      return inherited === undefined || live === undefined ? vertices : vertices.filter((v) => live[v] === 1 || !inherited.has(v));
-    };
-
-    /** Splits between masked vertices join the mask, in order with the stroke: before the next dab. */
-    const adoptSplits = (mesh: MeshHandle, splits: ArrayLike<number> | undefined): void => {
+    const adoptSplits = (mesh: MeshHandle, splits: ArrayLike<number> | undefined, slots?: number): void => {
       const m = maskRef.current;
       if (m === null || m.mesh !== mesh || splits === undefined || splits.length === 0) {
         return;
@@ -851,44 +820,20 @@ function SculptLayer(props: {
         vertices: unionMaskIds(m.vertices, Uint32Array.from(fresh).sort()),
         inherited: new Set([...(m.inherited ?? []), ...fresh]),
       };
+      if (slots !== undefined) {
+        maskTracker.trustSplits(mesh, m.vertices, next.vertices, slots);
+      }
       maskRef.current = next;
       app.setSculptMask(next);
     };
 
-    /** The mask's protection, rebuilt when the mask, the slot count or the band changes. */
-    let fieldCache: { vertices: Uint32Array; slots: number; band: number; field: MaskField } | null = null;
-    const maskFieldOf = (
-      gated: { vertices: Uint32Array; positions: ArrayLike<number>; indices: ArrayLike<number> },
-      radius: number,
-    ): MaskField => {
-      const slots = gated.positions.length / 3;
-      const band = radius * MASK_SOFT_BAND;
-      if (fieldCache?.vertices !== gated.vertices || fieldCache.slots !== slots || fieldCache.band !== band) {
-        fieldCache = {
-          vertices: gated.vertices,
-          slots,
-          band,
-          field: maskEdgeField(heldNow(gated.vertices), gated.positions, gated.indices, slots, band),
-        };
-      }
-      return fieldCache.field;
-    };
-
-    const offTriangles = scene.onChanges((changes) => {
-      if (changes.some((c) => !c.removed && (c.capacityChanged || c.indices === "all" || c.indices.length > 0))) {
-        maskCache = null;
-        checkedMask = null;
-        fieldCache = null;
-      }
-    });
-
-    /** The one place a dab meets the mask: `op` with what it must hold in place. */
+    /** The one place a dab meets the mask: `op` with engine-localized soft-band protection in O(|masked|). */
     const protectedDab = (mesh: MeshHandle, op: RepairOp): RepairOp => {
       const gated = maskLive(mesh);
       if (gated === null || gated === "stale" || !("radius" in op)) {
         return op;
       }
-      return protectDab(op, maskFieldOf(gated, op.radius), gated.positions);
+      return protectMaskedDab(op, gated.vertices, gated.positions, gated.live);
     };
 
     /**
@@ -909,7 +854,7 @@ function SculptLayer(props: {
       }
     };
 
-    /** The remesh density anchor, taken lazily: only remeshes need it. */
+    /** The remesh density anchor, taken lazily: only remeshes on <=100k meshes need it. */
     const ensureDensity = (mesh: MeshHandle): void => {
       if (densityAnchor !== null && densityAnchor.mesh === mesh) {
         return;
@@ -917,7 +862,11 @@ function SculptLayer(props: {
       densityAnchor = null;
       try {
         const v = scene.views(mesh);
-        const mean = meanEdgeLength(v.positions(), v.indices());
+        const indices = v.indices();
+        if (remeshTooBig(indices.length / 3)) {
+          return;
+        }
+        const mean = meanEdgeLength(v.positions(), indices);
         if (mean !== null && mean > 0 && Number.isFinite(mean)) {
           densityAnchor = { mesh, length: mean };
         }
@@ -941,17 +890,31 @@ function SculptLayer(props: {
     };
 
     /** Splits what the stroke stretched inside `b`; the stroke paints on if it fails. */
-    const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) =>
-      store
-        .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: LIVE_MAX_SPLITS })
+    const splitStretched = (mesh: MeshHandle, b: { center: [number, number, number]; radius: number }) => {
+      maskTracker.beginSplit(mesh);
+      return store
+        .repair(mesh, { op: "splitStretched", center: b.center, radius: b.radius, maxSplits: liveMaxSplits(triSlots(mesh)) })
         .then((report) => {
-          adoptSplits(mesh, (report as StretchReport).vertices);
-          return report as StretchReport;
+          const sr = report as StretchReport;
+          const changed = sr.splits > 0 || sr.vertices.length > 0;
+          let slots: number | undefined;
+          if (changed) {
+            try {
+              slots = scene.views(mesh).positions().length / 3;
+            } catch {
+              slots = undefined;
+            }
+          }
+          maskTracker.endSplit(mesh, changed, slots, sr.vertices);
+          adoptSplits(mesh, sr.vertices, slots);
+          return sr;
         })
         .catch(() => {
+          maskTracker.endSplit(mesh, false);
           // A degenerate region, or a mesh removed meanwhile.
           return undefined;
         });
+    };
 
     /**
      * Splits the triangles the stroke stretched, live (see `liveRemeshDue`
@@ -965,32 +928,29 @@ function SculptLayer(props: {
       if (!liveRemeshDue(stroke.dabs - liveDabs, performance.now() - liveAt, liveRunning !== null)) {
         return;
       }
-      const b = strokeBounds(stroke, grabRegion, grabPress);
+      const b = strokeBounds(stroke, grabPeakReach, grabPress);
       if (b === null) {
         return;
       }
       const mesh = brushRef.current.mesh;
+      const spheres = strokeRegionSpheres(b, brushRef.current.symmetry);
       liveAt = performance.now();
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
-      // The region this pass adds to, even if the pointer lets go meanwhile:
-      // the moves waiting behind the pass still write it.
-      const region = grabRegion;
-      // In order with the stroke's edits, so that the stroke's end waits for it.
-      liveRunning = stroke.pass(() =>
-        splitStretched(mesh, b).then((report) => {
-          liveRunning = null;
-          // The pass added vertices under the grab: take them along.
-          if (region !== null) {
-            try {
-              const v = scene.views(mesh);
-              region.rebase(v.positions(), v.indices(), report?.vertices);
-            } catch {
-              // Removed meanwhile: the next move finds out.
-            }
+      // In order with the stroke's edits, so that the stroke's end waits for it
+      // and the engine's StrokeSnapshot interpolates any new split midpoints.
+      // Dispatch each mirrored sphere sequentially so every repair stays a single
+      // `splitStretched` op recognized by `MaskLiveTracker`.
+      liveRunning = stroke.pass(async () => {
+        try {
+          for (const sphere of spheres) {
+            await splitStretched(mesh, sphere);
           }
-        }),
-      );
+        } finally {
+          liveRunning = null;
+          liveAt = performance.now();
+        }
+      });
     };
 
     const cast = (x: number, y: number) => {
@@ -1035,7 +995,12 @@ function SculptLayer(props: {
       placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], brush.radius);
       // Which way the surface will go: along the normal, out or in. Smooth has no way, and a grab shows its drag.
       const [nx, ny, nz] = cursorNormal ?? [0, 0, 1];
-      const out = brush.op === "inflate" ? Math.sign(brush.strength) * NORMAL_MARKER * brush.radius : 0;
+      const out =
+        brush.op === "inflate"
+          ? Math.sign(brush.strength) * NORMAL_MARKER * brush.radius
+          : brush.op === "crease" && brush.tool === "crease"
+            ? -NORMAL_MARKER * brush.radius
+            : 0;
       setBrushDirection(ball, [out * nx, out * ny, out * nz]);
     };
 
@@ -1047,13 +1012,13 @@ function SculptLayer(props: {
     };
 
     /** Where a pass over `s` has to look: a grab's widened reach goes past the dabs' bounds. */
-    const strokeBounds = (s: SculptStroke, region: GrabRegion | null, press: readonly [number, number, number] | null) => {
+    const strokeBounds = (s: SculptStroke, peakReach: number, press: readonly [number, number, number] | null) => {
       const b = s.bounds();
-      if (b === null || region === null || press === null) {
+      if (b === null || peakReach <= 0 || press === null) {
         return b;
       }
       const off = Math.hypot(press[0] - b.center[0], press[1] - b.center[1], press[2] - b.center[2]);
-      return { center: b.center, radius: Math.max(b.radius, off + region.reach * 1.5) };
+      return { center: b.center, radius: Math.max(b.radius, off + peakReach * 1.5) };
     };
 
     const endStroke = () => {
@@ -1062,9 +1027,9 @@ function SculptLayer(props: {
       buildup = undefined;
       active = -1;
       grabFrom = null;
-      const lastBounds = stroke === null ? null : strokeBounds(stroke, grabRegion, grabPress);
+      const lastBounds = stroke === null ? null : strokeBounds(stroke, grabPeakReach, grabPress);
       grabPress = null;
-      grabRegion = null;
+      grabPeakReach = 0;
       dirRef.current = [0, 0, 0];
       if (stroke !== null) {
         const s = stroke;
@@ -1081,39 +1046,53 @@ function SculptLayer(props: {
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
-        if (liveRef.current) {
-          const b = lastBounds;
-          if (b !== null) {
-            const mesh = brushRef.current.mesh;
-            inspect.sculpt.liveRemeshes++;
-            void s.pass(() => splitStretched(mesh, b));
-          }
+        if (liveRef.current && lastBounds !== null) {
+          const mesh = brushRef.current.mesh;
+          const spheres = strokeRegionSpheres(lastBounds, brushRef.current.symmetry);
+          inspect.sculpt.liveRemeshes++;
+          void s.pass(async () => {
+            for (const sphere of spheres) {
+              await splitStretched(mesh, sphere);
+            }
+          });
         }
         // The optional evening-out, off by default: it rewrites its whole
         // region, and it stands down on huge meshes, where it would stall the
         // worker.
         if (remeshRef.current && landed > 0) {
-          const b = s.bounds();
+          const b = lastBounds;
           const mesh = brushRef.current.mesh;
           const slots = triSlots(mesh);
-          if (b !== null && slots !== null && !remeshTooBig(slots) && !remeshMeetsMask(mesh, b)) {
+          if (b !== null && slots !== null && !remeshTooBig(slots)) {
             ensureDensity(mesh);
-            inspect.sculpt.remeshes++;
-            // In order with the stroke: after what is due and any live pass.
-            void s.pass(() =>
-              store
-                .repair(mesh, {
-                  op: "remesh",
-                  center: b.center,
-                  radius: b.radius,
-                  maxRounds: 4,
-                  targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
-                })
-                .catch(() => {
-                  // A degenerate region (or a mesh removed meanwhile): the
-                  // stroke still ends.
-                }),
+            const targetLength = densityAnchor?.mesh === mesh ? densityAnchor.length : undefined;
+            const ops = symmetricRemeshOps(
+              b,
+              brushRef.current.symmetry,
+              (sp) => remeshMeetsMask(mesh, sp),
+              4,
+              targetLength,
             );
+            if (ops.length > 0) {
+              inspect.sculpt.remeshes++;
+              // In order with the stroke: after what is due and any live pass, so
+              // invalidation happens once the remesh pass executes (never pre-empted by
+              // an earlier live split pass registering #splitPending).
+              void s.pass(() => {
+                maskTracker.noteTopologyMutation(mesh);
+                return store
+                  .repair(mesh, ops.length === 1 ? ops[0] : ops)
+                  .then((r) => {
+                    maskTracker.noteTopologyMutation(mesh);
+                    return r;
+                  })
+                  .catch(() => {
+                    maskTracker.noteTopologyMutation(mesh);
+                    // A degenerate region (or a mesh removed meanwhile): the
+                    // stroke still ends.
+                  });
+              });
+            }
           }
         }
         s.end();
@@ -1163,29 +1142,50 @@ function SculptLayer(props: {
     };
 
     /**
-     * Writes the grabbed region at the pointer's total drag (no raycast: the
-     * pointer's hits may swim off the lump or onto another mesh, but the drag
-     * never re-grabs). A masked press holds the stroke still.
+     * Drives the engine's localized `grab` op from the stroke's pre-stroke
+     * rest snapshot (`fromStroke: true, adaptiveReach: true`) in O(brush),
+     * with O(1) cursor reach and O(|masked|) protection (#197).
      */
     const paintGrab = (x: number, y: number) => {
       const s = stroke;
-      if (s === null || grabPress === null || grabRegion === null) {
+      const press = grabPress;
+      if (s === null || press === null) {
         return;
       }
-      trackGrab(x, y, grabPress);
-      const g = dirRef.current;
-      const region = grabRegion;
+      trackGrab(x, y, press);
+      const g: [number, number, number] = [dirRef.current[0], dirRef.current[1], dirRef.current[2]];
       const brush = brushRef.current;
       const k = brush.strength;
-      const at: [number, number, number] = [grabPress[0] + k * g[0], grabPress[1] + k * g[1], grabPress[2] + k * g[2]];
+      const reach = widestGrabReach(brush.radius, brush.falloff, brush.methods?.grab ?? "sphere", brush.strength, g);
+      grabPeakReach = Math.max(grabPeakReach, reach);
+      const at: [number, number, number] = [press[0] + k * g[0], press[1] + k * g[1], press[2] + k * g[2]];
+      const mesh = brush.mesh;
       s.move(
-        () =>
-          landing(store.edit(brush.mesh, [{ op: "setPositions", ...region.at(g) }])),
+        () => {
+          const cost = inspect.sculpt.dabCost;
+          const start = performance.now();
+          const rawOp = dabOperation({ ...brushRef.current, mesh, tool: "grab", direction: g }, press);
+          const heldOp = protectedDab(mesh, rawOp);
+          const sent = performance.now();
+          if (cost.maskMs.length < 4096) {
+            cost.maskMs.push(sent - start);
+          }
+          return landing(store.repair(mesh, heldOp)).then((r) => {
+            if (cost.landMs.length < 4096) {
+              cost.landMs.push(performance.now() - sent);
+            }
+            if ((r as { moved?: number }).moved === 0 && "protect" in heldOp) {
+              inspect.sculpt.maskedDabs++;
+              liveDabs++;
+            }
+            return r;
+          });
+        },
         at,
       );
       inspect.sculpt.grabTotal = Math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
       inspect.sculpt.lastDab = at;
-      showGrab(grabPress, [k * g[0], k * g[1], k * g[2]], region.influence(g));
+      showGrab(press, [k * g[0], k * g[1], k * g[2]], reach);
       syncDabs();
       maybeLiveRemesh();
     };
@@ -1307,7 +1307,7 @@ function SculptLayer(props: {
             liveDabs = 0;
             grabFrom = { x: e.clientX, y: e.clientY };
             grabPress = brush.op === "grab" ? point : null;
-            grabRegion = null;
+            grabPeakReach = 0;
             dirRef.current = [0, 0, 0];
             // Where the scene nests steps, each dab is its own edit (its cost
             // follows the brush). The Worker takes them as a list: it runs a
@@ -1348,10 +1348,6 @@ function SculptLayer(props: {
                 return false;
               },
             );
-            // A repair or an undo since the last stroke may have moved masked vertices.
-            if (fieldCache !== null && !maskFieldCurrent(fieldCache.field, scene.views(mesh).positions())) {
-              fieldCache = null;
-            }
             active = e.pointerId;
             stroke = s;
             view.stroking = true;
@@ -1361,35 +1357,18 @@ function SculptLayer(props: {
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            // Grab is move-driven only: the press takes the region without the
-            // masked vertices, the first move paints (a click without a drag
-            // leaves no step, no remesh). A fully masked press holds it still (the stroke still opens, so the
-            // loud stale check runs here too, before any dab lands).
+            const needsStrokeState =
+              brush.op === "grab" || (brush.op === "inflate" && brush.methods?.inflate === "strokeNormal");
+            if (needsStrokeState) {
+              void s.pass(() => store.repair(mesh, { op: "captureStrokeState", onlyIfMissing: false }).catch(() => undefined));
+            }
+            // Grab is move-driven only: the first move paints from the engine's
+            // O(1) rest snapshot (a click without a drag leaves no step, no remesh).
             if (brush.op !== "grab") {
               s.dab(point);
             } else {
               checkMaskLive(mesh);
-              const v = scene.views(mesh);
-              // Read at each rebase: a live split can add to the mask.
-              const hold = (): MaskField | null => {
-                const gated = maskLive(mesh);
-                return gated === null || gated === "stale" ? null : maskFieldOf(gated, brush.radius);
-              };
-              const region = new GrabRegion(
-                v.positions(),
-                v.indices(),
-                point,
-                brush.radius,
-                brush.falloff,
-                brush.strength,
-                scene.origin(mesh),
-                hold,
-              );
-              if (region.ids.length === 0 && hold() !== null) {
-                inspect.sculpt.maskedDabs++;
-              } else {
-                grabRegion = region;
-              }
+              grabPeakReach = brush.radius;
             }
             syncDabs();
             // Released meanwhile (a long frame runs the down and the up together): the
@@ -1445,7 +1424,6 @@ function SculptLayer(props: {
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("pointerleave", onLeave);
     return () => {
-      offTriangles();
       alive = false;
       clearTimeout(timer);
       canvas.removeEventListener("pointermove", onMove);
@@ -1456,7 +1434,7 @@ function SculptLayer(props: {
       endStroke();
       hideBall();
     };
-  }, [scene, camera, gl, store, ball, app]);
+  }, [scene, camera, gl, store, ball, app, maskTracker]);
 
   return null;
 }
@@ -1469,8 +1447,9 @@ function SculptLayer(props: {
  * `viewport/sculpt.ts`'s mask contract). One raycast at a time, through the
  * engine's BVH.
  */
-function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
-  const { app, scene } = props;
+function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTracker: MaskLiveTracker }) {
+  const { app, scene, maskTracker } = props;
+  const store = useScene();
   const [selection] = useSelection();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
@@ -1508,6 +1487,8 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
     let active = -1;
     /** The mesh the paint accumulates on (the selection at press). */
     let paintMesh: MeshHandle | null = null;
+    /** Serializes async `verticesInSphere` picks so rapid moves never race `sculptMask`. */
+    let paintTail: Promise<void> = Promise.resolve();
 
     const cast = (x: number, y: number) => {
       const r = canvas.getBoundingClientRect();
@@ -1549,38 +1530,40 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       placeBrushCursor(ball, point, cursorNormal ?? [0, 0, 1], radiusRef.current);
     };
 
-    /** Accumulates one sphere-brush pick at `point` into the mask. */
-    const paintAt = (mesh: MeshHandle, point: readonly [number, number, number]) => {
-      let positions: ArrayLike<number>;
-      let indices: ArrayLike<number>;
-      try {
-        const v = scene.views(mesh);
-        positions = v.positions();
-        indices = v.indices();
-      } catch {
-        return; // Removed meanwhile: the next move asks again.
-      }
-      const slots = positions.length / 3;
-      const fresh = paintMaskIds(positions, indices, slots, point, radiusRef.current);
-      const prev = app.getSnapshot().sculptMask;
-      if (prev !== null && prev.mesh === mesh) {
-        if (!maskUsable(prev, indices, slots)) {
-          // Loud, never a silent reinterpretation: drop it, count it, paint fresh.
+    /** Accumulates one BVH-localized sphere pick (plus active symmetry mirrors) into the mask. */
+    const paintAt = async (mesh: MeshHandle, point: readonly [number, number, number]): Promise<void> => {
+      const radius = radiusRef.current;
+      const sym = toSymmetry(app.getSnapshot().sculptSymmetry);
+      const centers = reflectCenters(point, sym);
+      await applyMaskPaintStep({
+        mesh,
+        centers,
+        radius,
+        verticesInSphere: (m, c, r) => store.verticesInSphere(m, c, r),
+        views: (m) => scene.views(m),
+        tracker: maskTracker,
+        isAlive: () => alive,
+        getPrevMask: () => app.getSnapshot().sculptMask,
+        setMask: (next) => app.setSculptMask(next),
+        onStale: () => {
           app.setSculptMask(null);
           app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
           inspect.sculpt.maskStale++;
-          app.setSculptMask({ mesh, vertices: fresh, slots });
-          return;
-        }
-        app.setSculptMask({ mesh, vertices: unionMaskIds(prev.vertices, fresh), slots, inherited: prev.inherited });
-      } else {
-        // A new mesh replaces the mask, like the sculpt brush re-arms.
-        app.setSculptMask({ mesh, vertices: fresh, slots });
-      }
-      // A successful paint resolves the loud notice.
-      if (app.getSnapshot().sculptMaskNotice !== null) {
-        app.setSculptMaskNotice(null);
-      }
+        },
+        clearNotice: () => {
+          if (app.getSnapshot().sculptMaskNotice !== null) {
+            app.setSculptMaskNotice(null);
+          }
+        },
+      });
+    };
+
+    const enqueuePaint = (mesh: MeshHandle, point: readonly [number, number, number]): Promise<void> => {
+      paintTail = paintTail.then(
+        () => paintAt(mesh, point),
+        () => paintAt(mesh, point),
+      );
+      return paintTail;
     };
 
     /** Ends the paint: the orbit goes back to the gesture. */
@@ -1611,40 +1594,38 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       const mesh = paintMesh ?? selRef.current;
       Promise.resolve()
         .then(() => (mesh === null ? null : cast(at.x, at.y)))
-        .then(
-          (hit) => {
-            running = false;
-            if (!alive || mesh === null) {
-              return;
+        .then(async (hit) => {
+          if (!alive || mesh === null) {
+            return;
+          }
+          if (hit === null || hit.mesh !== mesh) {
+            if (active === -1) {
+              hideBall();
             }
-            if (hit === null || hit.mesh !== mesh) {
-              if (active === -1) {
-                hideBall();
-              }
-            } else {
-              let point: [number, number, number];
-              try {
-                point = localHit(mesh, hit);
-              } catch {
-                // Removed meanwhile: the next move asks again.
-                run();
-                return;
-              }
-              inspect.sculpt.hovering = true;
-              showBall(mesh, point);
-              if (active !== -1 && paintMesh !== null) {
-                paintAt(paintMesh, point);
-              }
-            }
+            return;
+          }
+          let point: [number, number, number];
+          try {
+            point = localHit(mesh, hit);
+          } catch {
+            // Removed meanwhile: the next move asks again.
+            return;
+          }
+          inspect.sculpt.hovering = true;
+          showBall(mesh, point);
+          if (active !== -1 && paintMesh !== null) {
+            await enqueuePaint(paintMesh, point);
+          }
+        })
+        .catch(() => {
+          // Removed meanwhile: the next move asks again.
+        })
+        .finally(() => {
+          running = false;
+          if (alive) {
             run();
-          },
-          () => {
-            running = false;
-            if (alive) {
-              run();
-            }
-          },
-        );
+          }
+        });
     };
 
     const onMove = (e: PointerEvent) => {
@@ -1685,7 +1666,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
             // Released meanwhile (a long frame runs the down and the up together): the
             // press still paints where it landed, but nothing would end a paint left open.
             if (pressing !== e.pointerId) {
-              paintAt(mesh, point);
+              void enqueuePaint(mesh, point);
               return;
             }
             active = e.pointerId;
@@ -1695,7 +1676,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
             if (view.orbit !== null) {
               view.orbit.enabled = false;
             }
-            paintAt(mesh, point);
+            void enqueuePaint(mesh, point);
           },
           () => {
             // Removed meanwhile: the next press asks again.
@@ -1735,7 +1716,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene }) {
       endPaint();
       hideBall();
     };
-  }, [scene, camera, gl, ball, app]);
+  }, [scene, store, camera, gl, ball, app, maskTracker]);
 
   return null;
 }

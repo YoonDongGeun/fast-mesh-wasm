@@ -16,12 +16,14 @@ import type {
   RepairOp,
   RepairReport,
   Scene,
+  SculptOp,
+  SculptReport,
   SectionDesc,
   SectionHandle,
   SectionPlane,
 } from "../scene.js";
 import type { SceneLike } from "../scene-like.js";
-import type { Indices, PlacementInput, Positions64 } from "../api.js";
+import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
 import { addFieldKeyed, type KeyStatus, watchStatusKeys, type WorkerScene } from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
@@ -37,6 +39,8 @@ export interface Host {
   edit(mesh: MeshHandle, ops: readonly EditOp[]): Promise<EditResult>;
   repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
   repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]>;
+  verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array>;
   undo(): void;
   redo(): void;
   canUndo(): boolean;
@@ -146,6 +150,8 @@ export function localHost(scene: Scene): Host {
     edit: (mesh, ops) => promised(() => scene.edit(mesh, ops)),
     // One op, a list or auto: the cast only picks an overload (all take any of them).
     repair: ((mesh: MeshHandle, op: RepairOp) => promised(() => scene.repair(mesh, op))) as Host["repair"],
+    sculpt: ((mesh: MeshHandle, op: SculptOp) => promised(() => scene.sculpt(mesh, op))) as Host["sculpt"],
+    verticesInSphere: (mesh, center, radius) => promised(() => scene.verticesInSphere(mesh, center, radius)),
     undo: () => {
       scene.undo();
     },
@@ -206,6 +212,8 @@ export function workerHost(scene: WorkerScene): Host {
     edit: (mesh, ops) => scene.edit(mesh, ops),
     // One op, a list or auto: the cast only picks an overload (all take any of them).
     repair: ((mesh: MeshHandle, op: RepairOp) => scene.repair(mesh, op)) as Host["repair"],
+    sculpt: ((mesh: MeshHandle, op: SculptOp) => scene.sculpt(mesh, op)) as Host["sculpt"],
+    verticesInSphere: (mesh, center, radius) => scene.verticesInSphere(mesh, center, radius),
     undo: () => scene.undo(),
     redo: () => scene.redo(),
     canUndo: () => scene.canUndo,
