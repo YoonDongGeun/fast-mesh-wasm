@@ -276,6 +276,7 @@ pub fn inflate_region_with_stroke(
                 push(&mut candidates, v)?;
             }
         }
+        candidates.sort_unstable();
         candidates.dedup();
         if candidates.is_empty() {
             return Ok(InflateReport::default());

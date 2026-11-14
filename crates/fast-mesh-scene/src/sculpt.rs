@@ -333,6 +333,7 @@ mod tests {
                 _ => Dab::Grab(GrabOptions {
                     brush: b,
                     direction: [0.2, 0.1, 0.5],
+                    ..Default::default()
                 }),
             });
         }
@@ -435,6 +436,7 @@ mod tests {
         let far = Dab::Grab(GrabOptions {
             brush: brush([1000.0, 0.0, 0.0]),
             direction: [0.0, 0.0, 1.0],
+            ..Default::default()
         });
         assert_eq!(scene.dab(id, &far).unwrap(), DabReport::default());
         assert!(!scene.can_undo());
@@ -479,6 +481,7 @@ mod tests {
                     strength: 1.0,
                 },
                 direction: [0.0, 0.0, 1.0],
+                ..Default::default()
             });
             assert!(scene.dab(id, &dab).unwrap().moved > 0);
             at[2] += 1.0;

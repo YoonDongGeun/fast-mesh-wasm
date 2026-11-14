@@ -105,11 +105,16 @@ pub use cleanup::{
 };
 pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
 pub use sculpt::{
-    Brush, Falloff, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions, InflateOptionsBuilder,
-    InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod, SmoothOptions,
-    SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry, TAUBIN_LAMBDA,
-    TAUBIN_MU, capture_stroke_state, ensure_stroke_state, inflate, inflate_region,
-    inflate_region_with_stroke, smooth, smooth_region,
+    Brush, ClayOptions, ClayOptionsBuilder, ClayProfile, ClayReport, CreaseOptions,
+    CreaseOptionsBuilder, CreaseReport, Falloff, FlattenMode, FlattenOptions,
+    FlattenOptionsBuilder, FlattenReport, GRAB_MAX_STRETCH, GrabMethod, GrabOptions,
+    GrabOptionsBuilder, GrabReport, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions,
+    InflateOptionsBuilder, InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod,
+    SmoothOptions, SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry,
+    TAUBIN_LAMBDA, TAUBIN_MU, TwistMethod, TwistOptions, TwistOptionsBuilder, TwistReport,
+    capture_stroke_state, clay, clay_region, crease, crease_region, ensure_stroke_state, flatten,
+    flatten_region, grab, grab_region, grab_region_with_stroke, grab_widest_reach, inflate,
+    inflate_region, inflate_region_with_stroke, smooth, smooth_region, twist, twist_region,
 };
 pub use error::{OpsError, Result};
 pub use fill::{
@@ -123,7 +128,7 @@ pub use offset::{
     ShellReport, offset, shell,
 };
 pub use orient::{OrientReport, orient};
-pub use protect::{check_protection, with_protection};
+pub use protect::{check_protection, with_protection, with_protection_band};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
 use fast_mesh_store::StoreError;

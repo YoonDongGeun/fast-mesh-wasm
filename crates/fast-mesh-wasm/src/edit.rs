@@ -649,6 +649,7 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     strength: strength as f32,
                 },
                 direction: [dx as f32, dy as f32, dz as f32],
+                ..Default::default()
             })
         } else if code == 11.0 {
             RepairOp::Offset(words.next()? as f32)
@@ -1451,6 +1452,7 @@ mod tests {
                     strength: 0.5,
                 },
                 direction: [5.0, 6.0, 7.0],
+                ..Default::default()
             })]
         );
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;

@@ -1,22 +1,35 @@
 //! Brush sculpting domain: stroke state channels, surface filters, mirror
 //! symmetry, and localized region-parity brush kernels.
 
+mod crease;
 mod filter;
+mod grab;
 mod inflate;
+mod plane;
 mod smooth;
 mod stroke;
 #[cfg(test)]
 mod tests;
+mod twist;
 
 use fast_mesh_store::{Incidence, Mesh, Transaction, TriangleId, VertexId};
 
 use crate::topology::proper_triangle;
 use crate::{OpsError, Result, push};
 
+pub use crease::{CreaseOptions, CreaseOptionsBuilder, CreaseReport, crease, crease_region};
 pub use filter::{SurfaceFilter, Symmetry};
+pub use grab::{
+    GRAB_MAX_STRETCH, GrabMethod, GrabOptions, GrabOptionsBuilder, GrabReport, grab, grab_region,
+    grab_region_with_stroke, grab_widest_reach,
+};
 pub use inflate::{
     InflateMethod, InflateOptions, InflateOptionsBuilder, InflateReport, inflate, inflate_region,
     inflate_region_with_stroke,
+};
+pub use plane::{
+    ClayOptions, ClayOptionsBuilder, ClayProfile, ClayReport, FlattenMode, FlattenOptions,
+    FlattenOptionsBuilder, FlattenReport, clay, clay_region, flatten, flatten_region,
 };
 pub use smooth::{
     HC_ALPHA, HC_BETA, SmoothMethod, SmoothOptions, SmoothOptionsBuilder, SmoothReport,
@@ -26,6 +39,7 @@ pub use stroke::{
     STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, StrokeSlice, capture_stroke_state,
     ensure_stroke_state,
 };
+pub use twist::{TwistMethod, TwistOptions, TwistOptionsBuilder, TwistReport, twist, twist_region};
 
 /// How a brush's effect fades from its center (`t = 0`) to its rim (`t = 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +103,7 @@ pub(crate) fn normalized_dist(center: [f32; 3], radius: f32, p: &[f32; 3]) -> Op
 
 /// The `strength * falloff` weight of a vertex at `p`, or `None` at or past
 /// the rim.
+#[cfg(test)]
 pub(crate) fn brush_weight(brush: &Brush, p: &[f32; 3]) -> Option<f32> {
     normalized_dist(brush.center, brush.radius, p)
         .map(|t| brush.strength * falloff_value(brush.falloff, t))

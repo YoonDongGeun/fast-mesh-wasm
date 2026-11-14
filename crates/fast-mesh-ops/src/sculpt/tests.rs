@@ -2,10 +2,13 @@ use fast_mesh::compute_vertex_normals;
 use fast_mesh_store::{Mesh, Transaction, VertexId};
 
 use super::{
-    Brush, Falloff, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions, STROKE_NORMAL_CHANNEL,
-    STROKE_POS_CHANNEL, SmoothMethod, SmoothOptions, StrokeSlice, SurfaceFilter, Symmetry,
-    TAUBIN_LAMBDA, TAUBIN_MU, capture_stroke_state, ensure_stroke_state, inflate, inflate_region,
-    inflate_region_with_stroke, smooth, smooth_region,
+    Brush, ClayOptions, ClayProfile, CreaseOptions, Falloff, FlattenMode, FlattenOptions,
+    GRAB_MAX_STRETCH, GrabMethod, GrabOptions, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions,
+    STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod, SmoothOptions, StrokeSlice,
+    SurfaceFilter, Symmetry, TAUBIN_LAMBDA, TAUBIN_MU, TwistMethod, TwistOptions,
+    capture_stroke_state, clay, clay_region, crease, crease_region, ensure_stroke_state, flatten,
+    flatten_region, grab, grab_region, grab_region_with_stroke, grab_widest_reach, inflate,
+    inflate_region, inflate_region_with_stroke, smooth, smooth_region, twist, twist_region,
 };
 use crate::OpsError;
 use crate::remesh::Region;
@@ -1007,4 +1010,835 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
 
     // Confirm Transaction parameter type works directly in signatures.
     let _: fn(&mut Transaction, &InflateOptions) -> crate::Result<_> = inflate;
+}
+
+#[test]
+fn grab_geodesic_isolates_air_gap_sheets_and_bridges_uv_seams() {
+    // 1. Two parallel disconnected sheets z = 0.0 and z = 0.05 (radius = 1.0, center = [0, 0, 0]).
+    let two_sheets = || {
+        let mut positions = Vec::new();
+        let mut triangles = Vec::new();
+        for (sheet, z) in [(0u32, 0.0f32), (1u32, 0.05f32)] {
+            let base = sheet * 25;
+            for iy in -2i32..=2 {
+                for ix in -2i32..=2 {
+                    positions.extend([ix as f32 * 0.25, iy as f32 * 0.25, z]);
+                }
+            }
+            for iy in 0..4u32 {
+                for ix in 0..4u32 {
+                    let a = base + iy * 5 + ix;
+                    triangles.extend([[a, a + 1, a + 6], [a, a + 6, a + 5]]);
+                }
+            }
+        }
+        mesh_of(&positions, &triangles)
+    };
+
+    let brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: 1.0,
+        falloff: Falloff::Smooth,
+        strength: 0.4,
+    };
+
+    let mut sphere_mesh = two_sheets();
+    let before = sphere_mesh.positions().to_vec();
+    edit(&mut sphere_mesh, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: [0.0, 0.0, 1.0],
+                method: GrabMethod::Sphere,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(
+        (25..50).any(|v| sphere_mesh.positions()[v] != before[v]),
+        "Sphere grab moves the opposing z = 0.05 sheet across the air gap"
+    );
+
+    let mut geo_mesh = two_sheets();
+    let (rep, _) = edit(&mut geo_mesh, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: [0.0, 0.0, 1.0],
+                method: GrabMethod::Geodesic,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(rep.moved > 0);
+    assert!(
+        (0..25).any(|v| geo_mesh.positions()[v][2] > 0.1),
+        "Geodesic grab moves the z = 0.0 seed sheet"
+    );
+    for v in 25..50 {
+        assert_eq!(
+            geo_mesh.positions()[v].map(f32::to_bits),
+            before[v].map(f32::to_bits),
+            "Geodesic grab must leave z = 0.05 sheet byte-identical (vertex {v})"
+        );
+    }
+
+    // 2. Single sheet split down x = 0 by a UV seam (duplicate vertex IDs with identical coords,
+    //    including -0.0 vs +0.0 on the seam).
+    let seamed_sheet = || {
+        let mut positions = Vec::new();
+        let mut triangles = Vec::new();
+        // Left half x in [-2..=0], right half x in [0..=2], separate vertex IDs along x = 0.
+        for (half_idx, x_start) in [(0u32, -2i32), (1u32, 0i32)] {
+            let base = half_idx * 15;
+            for iy in -2i32..=2 {
+                for ix in 0..=2i32 {
+                    let raw_x = (x_start + ix) as f32 * 0.25;
+                    let x = if half_idx == 1 && raw_x == 0.0 {
+                        -0.0 // exercise -0.0 / +0.0 canonicalization across seam
+                    } else {
+                        raw_x
+                    };
+                    positions.extend([x, iy as f32 * 0.25, 0.0]);
+                }
+            }
+            for iy in 0..4u32 {
+                for ix in 0..2u32 {
+                    let a = base + iy * 3 + ix;
+                    triangles.extend([[a, a + 1, a + 4], [a, a + 4, a + 3]]);
+                }
+            }
+        }
+        mesh_of(&positions, &triangles)
+    };
+
+    let mut seamed = seamed_sheet();
+    // Seed strictly on the left half (-0.25, 0, 0) so reaching the right half MUST cross the x = 0 seam.
+    edit(&mut seamed, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush: Brush {
+                    center: [-0.25, 0.0, 0.0],
+                    radius: 0.9,
+                    falloff: Falloff::Smooth,
+                    strength: 0.5,
+                },
+                direction: [0.1, -0.05, 0.4],
+                method: GrabMethod::Geodesic,
+                ..Default::default()
+            },
+        )
+    });
+    // Right half interior vertex (+0.25, 0, 0) is slot 15 + 2*3 + 1 = 22: must have moved!
+    assert!(
+        seamed.positions()[22][2] > 0.05,
+        "Geodesic must cross UV seam onto right chart: got {:?}",
+        seamed.positions()[22]
+    );
+    // Seam pairs: left seam is ix=2 (`iy * 3 + 2`), right seam is ix=0 (`15 + iy * 3`).
+    for iy in 0..5usize {
+        let p_left = seamed.positions()[iy * 3 + 2];
+        let p_right = seamed.positions()[15 + iy * 3];
+        let gap = (0..3)
+            .map(|k| (p_left[k] - p_right[k]).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            gap, 0.0,
+            "UV seam row {iy} must stay watertight: left={p_left:?}, right={p_right:?}"
+        );
+    }
+}
+
+#[test]
+fn grab_kelvinlet_calibrates_center_couples_poisson_and_validates() {
+    let sheet = || {
+        let mut positions = Vec::new();
+        let n = 10i32;
+        for iy in -n..=n {
+            for ix in -n..=n {
+                positions.extend([ix as f32 * 0.2, iy as f32 * 0.2, 0.0]);
+            }
+        }
+        let side = (2 * n + 1) as u32;
+        let mut triangles = Vec::new();
+        for iy in 0..(2 * n) as u32 {
+            for ix in 0..(2 * n) as u32 {
+                let a = iy * side + ix;
+                triangles.extend([[a, a + 1, a + side + 1], [a, a + side + 1, a + side]]);
+            }
+        }
+        mesh_of(&positions, &triangles)
+    };
+
+    let brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: 1.5,
+        falloff: Falloff::Smooth,
+        strength: 0.6,
+    };
+    let dir = [1.0f32, 0.0, 0.0];
+    let center_id = 10 * 21 + 10;
+    let diag_id = 13 * 21 + 13; // (0.6, 0.6, 0.0): off-axis in first quadrant
+
+    let mut m_high = sheet();
+    let before = m_high.positions().to_vec();
+    edit(&mut m_high, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: dir,
+                method: GrabMethod::Kelvinlet,
+                poisson: 0.45,
+                ..Default::default()
+            },
+        )
+    });
+    let mut m_zero = sheet();
+    edit(&mut m_zero, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: dir,
+                method: GrabMethod::Kelvinlet,
+                poisson: 0.0,
+                ..Default::default()
+            },
+        )
+    });
+
+    // Center displacement at r = 0 equals strength * direction within 1e-6 for any valid poisson.
+    for m in [&m_high, &m_zero] {
+        let pc = m.positions()[center_id];
+        assert!((pc[0] - 0.6).abs() < 1e-6, "center dx got {}", pc[0]);
+        assert!(pc[1].abs() < 1e-6 && pc[2].abs() < 1e-6);
+    }
+
+    // Outside R_eff (e.g. corner (-2.0, -2.0, 0.0), r = 2.828 >= 1.5), displacement is 0.0.
+    assert_eq!(
+        m_high.positions()[0].map(f32::to_bits),
+        before[0].map(f32::to_bits)
+    );
+
+    // Off-axis vertex at (0.6, 0.6, 0): pulling along +x induces lateral dy != 0,
+    // and poisson = 0.45 differs distinctly from poisson = 0.0.
+    let dy_high = m_high.positions()[diag_id][1] - before[diag_id][1];
+    let dy_zero = m_zero.positions()[diag_id][1] - before[diag_id][1];
+    assert!(dy_high.abs() > 1e-3, "off-axis lateral dy should be non-zero: {dy_high}");
+    assert!(
+        (dy_high - dy_zero).abs() > 5e-3,
+        "poisson 0.45 ({dy_high}) vs 0.0 ({dy_zero}) must produce distinct lateral coupling"
+    );
+
+    // Invalid poisson < 0.0, > 0.5, or NaN rejected with InvalidInput and writes nothing.
+    for bad_nu in [-0.01f32, 0.51, f32::NAN, f32::INFINITY] {
+        let mut tx = m_high.begin_edit();
+        assert!(matches!(
+            grab(
+                &mut tx,
+                &GrabOptions {
+                    brush,
+                    direction: dir,
+                    method: GrabMethod::Kelvinlet,
+                    poisson: bad_nu,
+                    ..Default::default()
+                }
+            ),
+            Err(OpsError::InvalidInput(_))
+        ));
+        assert!(tx.commit().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn grab_adaptive_reach_widens_tangential_drag_without_folding_and_snaps_back() {
+    assert_eq!(GRAB_MAX_STRETCH, 0.8);
+    let b_lin = Brush {
+        center: [0.0; 3],
+        radius: 0.2,
+        falloff: Falloff::Linear,
+        strength: 1.0,
+    };
+    let b_sm = Brush {
+        falloff: Falloff::Smooth,
+        ..b_lin
+    };
+    assert!((grab_widest_reach(&b_lin, [1.2, 0.0, 0.0], GrabMethod::Sphere) - 1.5).abs() < 1e-6);
+    assert!((grab_widest_reach(&b_sm, [1.2, 0.0, 0.0], GrabMethod::Sphere) - 2.25).abs() < 1e-6);
+    assert!(
+        (grab_widest_reach(&b_sm, [1.2, 0.0, 0.0], GrabMethod::Kelvinlet) - 2.625).abs() < 1e-6
+    );
+
+    // Fine flat grid in [-3, 3]^2, spacing 0.1.
+    let fine_plane = || {
+        let n = 30i32;
+        let side = (2 * n + 1) as u32;
+        let mut positions = Vec::new();
+        for iy in -n..=n {
+            for ix in -n..=n {
+                positions.extend([ix as f32 * 0.1, iy as f32 * 0.1, 0.0]);
+            }
+        }
+        let mut triangles = Vec::new();
+        for iy in 0..(2 * n) as u32 {
+            for ix in 0..(2 * n) as u32 {
+                let a = iy * side + ix;
+                triangles.extend([[a, a + 1, a + side + 1], [a, a + side + 1, a + side]]);
+            }
+        }
+        mesh_of(&positions, &triangles)
+    };
+
+    let brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: 0.2,
+        falloff: Falloff::Smooth,
+        strength: 1.0,
+    };
+
+    // 1. Tangential drag along +x (L = 1.2, R = 0.2): widens R_eff to 2.25 and flips zero normals.
+    let mut tang = fine_plane();
+    let before = tang.positions().to_vec();
+    edit(&mut tang, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: [1.2, 0.0, 0.0],
+                adaptive_reach: true,
+                ..Default::default()
+            },
+        )
+    });
+    // Vertex at (1.5, 0.0, 0.0) is well past R = 0.2 yet inside R_wide = 2.25, so it moves!
+    let far_v = (30 * 61 + 45) as usize;
+    assert!(
+        tang.positions()[far_v][0] > before[far_v][0] + 0.1,
+        "tangential adaptive_reach must widen past R = 0.2"
+    );
+    // Every triangle keeps strictly positive +z orientation (zero folds!).
+    for t in 0..tang.triangle_slots() as u32 {
+        let [a, b, c] = tang.triangle(t).unwrap();
+        let (pa, pb, pc) = (
+            tang.positions()[a as usize],
+            tang.positions()[b as usize],
+            tang.positions()[c as usize],
+        );
+        let nz = (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0]);
+        assert!(nz > 1e-6, "triangle {t} folded: nz = {nz}");
+    }
+
+    // 2. Normal pull straight off flat plane (+z): all surface offsets have along == 0, so R_eff == R = 0.2!
+    let mut horn = fine_plane();
+    edit(&mut horn, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: [0.0, 0.0, 1.2],
+                adaptive_reach: true,
+                ..Default::default()
+            },
+        )
+    });
+    for (p0, p1) in before.iter().zip(horn.positions()) {
+        let r = p0[0].hypot(p0[1]);
+        if r >= 0.2 {
+            assert_eq!(
+                p0.map(f32::to_bits),
+                p1.map(f32::to_bits),
+                "normal pull off flat plane must stay narrow (R_eff == R): r={r}"
+            );
+        }
+    }
+
+    // 3. Snap-back with `from_stroke: true, adaptive_reach: true`:
+    //    Move 1 (`[1.0, 0, 0]`) moves wide vertices (`R_wide = 1.875`);
+    //    Move 2 (`[0.05, 0, 0]`) shrinks `R_eff` back to `R = 0.2` and snaps outer vertices
+    //    back to `rest_pos` bit-for-bit!
+    let mut stroke_mesh = fine_plane();
+    capture_stroke_state(&mut stroke_mesh).unwrap();
+    let rest_bits = bits_of(&stroke_mesh);
+
+    let (rep1, _) = edit(&mut stroke_mesh, |tx| {
+        grab(
+            tx,
+            &GrabOptions {
+                brush,
+                direction: [1.0, 0.0, 0.0],
+                from_stroke: true,
+                adaptive_reach: true,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(rep1.moved > 50);
+    let mid_v = (30 * 61 + 40) as usize; // (1.0, 0.0, 0.0): moved on Move 1, outside R = 0.2 on Move 2
+    assert_ne!(
+        stroke_mesh.positions()[mid_v].map(f32::to_bits),
+        rest_bits[mid_v]
+    );
+
+    let short_opts = GrabOptions {
+        brush,
+        direction: [0.05, 0.0, 0.0],
+        from_stroke: true,
+        adaptive_reach: true,
+        ..Default::default()
+    };
+    let (rep2, _) = edit(&mut stroke_mesh, |tx| grab(tx, &short_opts));
+    assert!(rep2.moved > 0);
+    for (v, p) in stroke_mesh.positions().iter().enumerate() {
+        let r = before[v][0].hypot(before[v][1]);
+        if r >= 0.2 {
+            assert_eq!(
+                p.map(f32::to_bits),
+                rest_bits[v],
+                "outer vertex {v} (r={r}) must snap back to rest_pos bit-for-bit"
+            );
+        }
+    }
+    // Repeating the identical Move 2 writes nothing (`same_bits` skip -> moved == 0).
+    let mut tx = stroke_mesh.begin_edit();
+    let rep3 = grab(&mut tx, &short_opts).unwrap();
+    assert_eq!(rep3.moved, 0);
+    assert!(tx.commit().unwrap().is_empty());
+}
+
+#[test]
+fn extra_brushes_flatten_crease_clay_and_twist_follow_expected_geometry() {
+    // 1. Flatten: Both vs Peaks (scrape) vs Valleys (fill) against explicit z = 0 plane.
+    let bumpy = || {
+        symmetric_sheet(6, |x, y| {
+            let r_peak = ((x + 2.0).powi(2) + y * y).sqrt();
+            let r_pit = ((x - 2.0).powi(2) + y * y).sqrt();
+            (1.8 - r_peak).max(0.0) - (1.8 - r_pit).max(0.0)
+        })
+    };
+    let flat_brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: 20.0,
+        falloff: Falloff::Linear,
+        strength: 0.8,
+    };
+    let before_bumpy = bumpy().positions().to_vec();
+
+    let mut m_both = bumpy();
+    edit(&mut m_both, |tx| {
+        flatten(
+            tx,
+            &FlattenOptions {
+                brush: flat_brush,
+                mode: FlattenMode::Both,
+                plane_origin: Some([0.0, 0.0, 0.0]),
+                plane_normal: Some([0.0, 0.0, 1.0]),
+                ..Default::default()
+            },
+        )
+    });
+    let mut m_peaks = bumpy();
+    edit(&mut m_peaks, |tx| {
+        flatten(
+            tx,
+            &FlattenOptions {
+                brush: flat_brush,
+                mode: FlattenMode::Peaks,
+                plane_origin: Some([0.0, 0.0, 0.0]),
+                plane_normal: Some([0.0, 0.0, 1.0]),
+                ..Default::default()
+            },
+        )
+    });
+    let mut m_valleys = bumpy();
+    edit(&mut m_valleys, |tx| {
+        flatten(
+            tx,
+            &FlattenOptions {
+                brush: flat_brush,
+                mode: FlattenMode::Valleys,
+                plane_origin: Some([0.0, 0.0, 0.0]),
+                plane_normal: Some([0.0, 0.0, 1.0]),
+                ..Default::default()
+            },
+        )
+    });
+
+    for (i, p0) in before_bumpy.iter().enumerate() {
+        let (pb, pp, pv) = (
+            m_both.positions()[i],
+            m_peaks.positions()[i],
+            m_valleys.positions()[i],
+        );
+        if p0[2] > 0.2 {
+            assert!(pb[2] < p0[2] && pb[2] > 0.0, "Both lowers peak toward z=0");
+            assert!(pp[2] < p0[2], "Peaks scrapes z > 0 down");
+            assert_eq!(pv.map(f32::to_bits), p0.map(f32::to_bits), "Valleys leaves z > 0 untouched");
+        } else if p0[2] < -0.2 {
+            assert!(pb[2] > p0[2] && pb[2] < 0.0, "Both raises valley toward z=0");
+            assert_eq!(pp.map(f32::to_bits), p0.map(f32::to_bits), "Peaks leaves z < 0 untouched");
+            assert!(pv[2] > p0[2], "Valleys fills z < 0 up");
+        }
+    }
+
+    // 2. Crease & pure Pinch on flat sheet z = 0.
+    let mut creased = symmetric_sheet(5, |_, _| 0.0);
+    let before_flat = creased.positions().to_vec();
+    edit(&mut creased, |tx| {
+        crease(
+            tx,
+            &CreaseOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 3.5,
+                    falloff: Falloff::Smooth,
+                    strength: -0.6,
+                },
+                pinch: 0.5,
+                ..Default::default()
+            },
+        )
+    });
+    for (p0, p1) in before_flat.iter().zip(creased.positions()) {
+        let r0 = p0[0].hypot(p0[1]);
+        let r1 = p1[0].hypot(p1[1]);
+        if r0 < 3.5 {
+            assert!(p1[2] < -1e-4, "Crease with strength < 0 carves groove: {p0:?} -> {p1:?}");
+            if r0 > 0.0 {
+                assert!(r1 < r0, "Crease with pinch > 0 pulls radially inward: {r0} -> {r1}");
+            }
+        }
+    }
+
+    let mut pinched = symmetric_sheet(5, |_, _| 0.0);
+    edit(&mut pinched, |tx| {
+        crease(
+            tx,
+            &CreaseOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 3.5,
+                    falloff: Falloff::Linear,
+                    strength: 0.0,
+                },
+                pinch: 0.6,
+                ..Default::default()
+            },
+        )
+    });
+    let mut pinched_any = false;
+    for (p0, p1) in before_flat.iter().zip(pinched.positions()) {
+        assert_eq!(p1[2].to_bits(), 0.0f32.to_bits(), "pure Pinch keeps z == 0.0");
+        let r0 = p0[0].hypot(p0[1]);
+        let r1 = p1[0].hypot(p1[1]);
+        if r0 > 0.0 && r0 < 3.5 {
+            assert!(r1 < r0);
+            pinched_any = true;
+        }
+    }
+    assert!(pinched_any);
+
+    // 3. Clay: Round vs Strips (`h = 0.25 * R * sign(strength)`, Strips square 2R x 2R reaches (±0.8R, ±0.8R)).
+    let r_clay = 2.5f32; // (±0.8 * 2.5, ±0.8 * 2.5) = (±2.0, ±2.0), exact integer grid vertices!
+    let clay_brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: r_clay,
+        falloff: Falloff::Smooth,
+        strength: 1.0,
+    };
+    let mut clay_round = symmetric_sheet(5, |_, _| 0.0);
+    edit(&mut clay_round, |tx| {
+        clay(
+            tx,
+            &ClayOptions {
+                brush: clay_brush,
+                profile: ClayProfile::Round,
+                tangent: Some([1.0, 0.0, 0.0]),
+                ..Default::default()
+            },
+        )
+    });
+    let mut clay_strips = symmetric_sheet(5, |_, _| 0.0);
+    edit(&mut clay_strips, |tx| {
+        clay(
+            tx,
+            &ClayOptions {
+                brush: clay_brush,
+                profile: ClayProfile::Strips,
+                tangent: Some([1.0, 0.0, 0.0]),
+                ..Default::default()
+            },
+        )
+    });
+    let center_slot = 5 * 11 + 5;
+    let want_h = 0.25 * r_clay; // 0.625
+    assert!((clay_round.positions()[center_slot][2] - want_h).abs() < 1e-6);
+    assert!((clay_strips.positions()[center_slot][2] - want_h).abs() < 1e-6);
+    for (ix, iy) in [(-2i32, -2i32), (2, -2), (-2, 2), (2, 2)] {
+        // (±2.0, ±2.0) = (±0.8 R, ±0.8 R), Euclidean r = 2.8284 > 2.5
+        let slot = ((iy + 5) * 11 + (ix + 5)) as usize;
+        assert_eq!(
+            clay_round.positions()[slot][2].to_bits(),
+            0.0f32.to_bits(),
+            "Round clay must not reach Euclidean r > R corner ({ix}, {iy})"
+        );
+        assert!(
+            clay_strips.positions()[slot][2] > 0.05,
+            "Clay Strips 2R x 2R box must lift (±0.8R, ±0.8R) corner ({ix}, {iy}): got {}",
+            clay_strips.positions()[slot][2]
+        );
+    }
+
+    // 4. Twist: Vortex preserves axial height & cylindrical radius; Kelvinlet twists smoothly;
+    //    Symmetry { x: true } flips strength by det(M) = -1 so mirrored vortices counter-rotate!
+    let mut vortex = symmetric_sheet(6, |_, _| 0.5);
+    let before_vortex = vortex.positions().to_vec();
+    let angle = 0.7f32;
+    edit(&mut vortex, |tx| {
+        twist(
+            tx,
+            &TwistOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.5],
+                    radius: 4.5,
+                    falloff: Falloff::Smooth,
+                    strength: angle,
+                },
+                axis: Some([0.0, 0.0, 1.0]),
+                method: TwistMethod::Vortex,
+                ..Default::default()
+            },
+        )
+    });
+    for (p0, p1) in before_vortex.iter().zip(vortex.positions()) {
+        assert!((p1[2] - p0[2]).abs() < 1e-6, "Vortex preserves axial height z");
+        let r0 = p0[0].hypot(p0[1]);
+        let r1 = p1[0].hypot(p1[1]);
+        assert!((r1 - r0).abs() < 1e-5, "Vortex preserves cylindrical radius: {r0} vs {r1}");
+    }
+    // Check exact rotation at (1, 0, 0.5): t = 1 / 4.5
+    let v_1_0 = (6 * 13 + 7) as usize;
+    let t_1 = 1.0f32 / 4.5;
+    let s_1 = 1.0 - t_1;
+    let theta_1 = angle * s_1 * s_1 * (3.0 - 2.0 * s_1);
+    assert!((vortex.positions()[v_1_0][0] - theta_1.cos()).abs() < 1e-5);
+    assert!((vortex.positions()[v_1_0][1] - theta_1.sin()).abs() < 1e-5);
+
+    for method in [TwistMethod::Vortex, TwistMethod::Kelvinlet] {
+        let half = 8i32;
+        let side = (2 * half + 1) as usize;
+        let mut sym_twist = symmetric_sheet(half, |x, y| 0.04 * (x * x + y * y));
+        let before_sym = sym_twist.positions().to_vec();
+        edit(&mut sym_twist, |tx| {
+            twist(
+                tx,
+                &TwistOptions {
+                    brush: Brush {
+                        center: [4.5, 0.5, 0.82],
+                        radius: 3.0,
+                        falloff: Falloff::Smooth,
+                        strength: 0.65,
+                    },
+                    axis: Some([0.0, 0.0, 1.0]),
+                    method,
+                    symmetry: Symmetry {
+                        x: true,
+                        y: false,
+                        z: false,
+                    },
+                    ..Default::default()
+                },
+            )
+        });
+        let after = sym_twist.positions();
+        let mut moved_pairs = 0;
+        for iy in -half..=half {
+            for ix in 1..=half {
+                let vp = (iy + half) as usize * side + (ix + half) as usize;
+                let vn = (iy + half) as usize * side + (-ix + half) as usize;
+                let (pp, pn) = (after[vp], after[vn]);
+                if pp != before_sym[vp] {
+                    moved_pairs += 1;
+                }
+                assert!(
+                    (pn[0] - (-pp[0])).abs() < 1e-5
+                        && (pn[1] - pp[1]).abs() < 1e-5
+                        && (pn[2] - pp[2]).abs() < 1e-5,
+                    "{method:?} mirror counter-rotation mismatch at ({ix}, {iy}): +x={pp:?}, -x={pn:?}"
+                );
+            }
+        }
+        assert!(moved_pairs > 4);
+    }
+}
+
+#[test]
+fn task2_region_parity_bit_for_bit_and_oom_sweeps_all_brushes() {
+    let base_mesh = || {
+        let mut m = symmetric_sheet(6, |x, y| (0.6 * x).sin() * (0.5 * y).cos() + 0.1 * x);
+        let mut tx = m.begin_edit();
+        tx.remove_triangles(&[7]).unwrap();
+        tx.commit().unwrap();
+        m.ensure_incidence().unwrap();
+        m
+    };
+
+    let region_for = |mesh: &Mesh, center: [f32; 3], reach: f32, sym: Symmetry| -> Vec<VertexId> {
+        let (masks, count) = sym.active_masks();
+        (0..mesh.vertex_slots() as VertexId)
+            .filter(|&v| {
+                let p = mesh.positions()[v as usize];
+                masks[..count].iter().any(|&bits| {
+                    let c = [
+                        if bits & 1 != 0 { -center[0] } else { center[0] },
+                        if bits & 2 != 0 { -center[1] } else { center[1] },
+                        if bits & 4 != 0 { -center[2] } else { center[2] },
+                    ];
+                    let d = ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2))
+                        .sqrt();
+                    d / reach < 1.0
+                })
+            })
+            .collect()
+    };
+
+    let brush = Brush {
+        center: [1.4, -0.9, 0.2],
+        radius: 3.1,
+        falloff: Falloff::Smooth,
+        strength: 0.45,
+    };
+    let sym = Symmetry {
+        x: true,
+        y: true,
+        z: false,
+    };
+    let filter = SurfaceFilter::PeaksOnly {
+        threshold: 0.01,
+        contrast: 0.5,
+    };
+
+    // 1. Grab across Sphere, Geodesic, Kelvinlet (+ adaptive_reach & from_stroke)
+    for method in [GrabMethod::Sphere, GrabMethod::Geodesic, GrabMethod::Kelvinlet] {
+        for adaptive_reach in [false, true] {
+            let opts = GrabOptions {
+                brush,
+                direction: [1.6, -0.8, 0.4],
+                method,
+                poisson: 0.42,
+                from_stroke: true,
+                adaptive_reach,
+                filter,
+                symmetry: sym,
+            };
+            let (mut whole, mut reg) = (base_mesh(), base_mesh());
+            capture_stroke_state(&mut whole).unwrap();
+            capture_stroke_state(&mut reg).unwrap();
+            let reach = if adaptive_reach {
+                grab_widest_reach(&brush, opts.direction, method)
+            } else {
+                brush.radius
+            };
+            let mut candidates = region_for(&reg, brush.center, reach, sym);
+            // Reverse + duplicate to also exercise unsorted/dedup handling in *_region!
+            candidates.reverse();
+            if let Some(&first) = candidates.first() {
+                candidates.push(first);
+            }
+            let (rw, _) = edit(&mut whole, |tx| grab(tx, &opts));
+            let (rr, _) = edit(&mut reg, |tx| grab_region(tx, &opts, &candidates));
+            let mut reg_ws = base_mesh();
+            capture_stroke_state(&mut reg_ws).unwrap();
+            let (rws, _) = edit(&mut reg_ws, |tx| {
+                grab_region_with_stroke(tx, &opts, &candidates, None, &[])
+            });
+            assert_eq!(rw, rr, "{method:?} adaptive={adaptive_reach}");
+            assert_eq!(rw, rws, "{method:?} adaptive={adaptive_reach}");
+            assert_eq!(bits_of(&whole), bits_of(&reg), "{method:?} adaptive={adaptive_reach}");
+            assert_eq!(bits_of(&whole), bits_of(&reg_ws), "{method:?} adaptive={adaptive_reach}");
+            assert!(sweep(base_mesh(), |tx| grab(tx, &opts).map(drop)) >= 3);
+        }
+    }
+
+    // 2. Flatten across Both, Peaks, Valleys
+    for mode in [FlattenMode::Both, FlattenMode::Peaks, FlattenMode::Valleys] {
+        let opts = FlattenOptions {
+            brush,
+            mode,
+            plane_origin: None,
+            plane_normal: None,
+            filter: SurfaceFilter::None,
+            symmetry: sym,
+        };
+        let (mut whole, mut reg) = (base_mesh(), base_mesh());
+        let candidates = region_for(&reg, brush.center, brush.radius, sym);
+        let (rw, _) = edit(&mut whole, |tx| flatten(tx, &opts));
+        let (rr, _) = edit(&mut reg, |tx| flatten_region(tx, &opts, &candidates));
+        assert_eq!(rw, rr, "{mode:?}");
+        assert_eq!(bits_of(&whole), bits_of(&reg), "{mode:?}");
+        assert!(sweep(base_mesh(), |tx| flatten(tx, &opts).map(drop)) >= 3);
+    }
+
+    // 3. Crease
+    {
+        let opts = CreaseOptions {
+            brush: Brush {
+                strength: -0.35,
+                ..brush
+            },
+            pinch: 0.65,
+            filter,
+            symmetry: sym,
+        };
+        let (mut whole, mut reg) = (base_mesh(), base_mesh());
+        let candidates = region_for(&reg, brush.center, brush.radius, sym);
+        let (rw, _) = edit(&mut whole, |tx| crease(tx, &opts));
+        let (rr, _) = edit(&mut reg, |tx| crease_region(tx, &opts, &candidates));
+        assert_eq!(rw, rr);
+        assert_eq!(bits_of(&whole), bits_of(&reg));
+        assert!(sweep(base_mesh(), |tx| crease(tx, &opts).map(drop)) >= 3);
+    }
+
+    // 4. Clay across Round & Strips (query radius sqrt(3) * R for Strips)
+    for profile in [ClayProfile::Round, ClayProfile::Strips] {
+        let opts = ClayOptions {
+            brush,
+            profile,
+            tangent: Some([1.0, 0.3, 0.0]),
+            filter: SurfaceFilter::None,
+            symmetry: sym,
+        };
+        let reach = match profile {
+            ClayProfile::Round => brush.radius,
+            ClayProfile::Strips => brush.radius * 3.0f32.sqrt(),
+        };
+        let (mut whole, mut reg) = (base_mesh(), base_mesh());
+        let candidates = region_for(&reg, brush.center, reach, sym);
+        let (rw, _) = edit(&mut whole, |tx| clay(tx, &opts));
+        let (rr, _) = edit(&mut reg, |tx| clay_region(tx, &opts, &candidates));
+        assert_eq!(rw, rr, "{profile:?}");
+        assert_eq!(bits_of(&whole), bits_of(&reg), "{profile:?}");
+        assert!(sweep(base_mesh(), |tx| clay(tx, &opts).map(drop)) >= 3);
+    }
+
+    // 5. Twist across Vortex & Kelvinlet
+    for method in [TwistMethod::Vortex, TwistMethod::Kelvinlet] {
+        let opts = TwistOptions {
+            brush,
+            axis: None,
+            method,
+            filter,
+            symmetry: sym,
+        };
+        let (mut whole, mut reg) = (base_mesh(), base_mesh());
+        let candidates = region_for(&reg, brush.center, brush.radius, sym);
+        let (rw, _) = edit(&mut whole, |tx| twist(tx, &opts));
+        let (rr, _) = edit(&mut reg, |tx| twist_region(tx, &opts, &candidates));
+        assert_eq!(rw, rr, "{method:?}");
+        assert_eq!(bits_of(&whole), bits_of(&reg), "{method:?}");
+        assert!(sweep(base_mesh(), |tx| twist(tx, &opts).map(drop)) >= 3);
+    }
 }

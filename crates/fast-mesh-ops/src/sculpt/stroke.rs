@@ -67,26 +67,60 @@ pub fn capture_stroke_state(mesh: &mut Mesh) -> Result<()> {
         }
     }
 
-    // Check fault-injection gate before mutating channels so OOM leaves prior state intact.
+    // Save any prior stroke channels fallibly before mutating so OOM leaves prior state intact.
+    let old_pos = if let Some(ch) = mesh.channel(STROKE_POS_CHANNEL) {
+        let mut copy = Vec::new();
+        reserve(&mut copy, ch.len())?;
+        copy.extend_from_slice(ch);
+        Some(copy)
+    } else {
+        None
+    };
+    let old_nrm = if let Some(ch) = mesh.channel(STROKE_NORMAL_CHANNEL) {
+        let mut copy = Vec::new();
+        reserve(&mut copy, ch.len())?;
+        copy.extend_from_slice(ch);
+        Some(copy)
+    } else {
+        None
+    };
+
     allocation_allowed()?;
-    if mesh.channel(STROKE_POS_CHANNEL).is_some() {
+    if old_pos.is_some() {
         mesh.remove_channel(STROKE_POS_CHANNEL)?;
     }
-    if mesh.channel(STROKE_NORMAL_CHANNEL).is_some() {
+    if old_nrm.is_some() {
         mesh.remove_channel(STROKE_NORMAL_CHANNEL)?;
     }
-    mesh.add_channel_with_values(
+    let pos_desc = || {
         ChannelDesc::source(STROKE_POS_CHANNEL, 3)
             .bound_to_topology()
-            .with_default(f32::NAN),
-        &flat,
-    )?;
-    mesh.add_channel_with_values(
+            .with_default(f32::NAN)
+    };
+    let nrm_desc = || {
         ChannelDesc::source(STROKE_NORMAL_CHANNEL, 3)
             .bound_to_topology()
-            .with_default(f32::NAN),
-        &normals,
-    )?;
+            .with_default(f32::NAN)
+    };
+    if let Err(err) = mesh.add_channel_with_values(pos_desc(), &flat) {
+        if let Some(prev) = &old_pos {
+            let _ = mesh.add_channel_with_values(pos_desc(), prev);
+        }
+        if let Some(prev) = &old_nrm {
+            let _ = mesh.add_channel_with_values(nrm_desc(), prev);
+        }
+        return Err(err.into());
+    }
+    if let Err(err) = mesh.add_channel_with_values(nrm_desc(), &normals) {
+        let _ = mesh.remove_channel(STROKE_POS_CHANNEL);
+        if let Some(prev) = &old_pos {
+            let _ = mesh.add_channel_with_values(pos_desc(), prev);
+        }
+        if let Some(prev) = &old_nrm {
+            let _ = mesh.add_channel_with_values(nrm_desc(), prev);
+        }
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -105,7 +139,6 @@ pub fn ensure_stroke_state(mesh: &mut Mesh) -> Result<()> {
 /// Reads vertex `v`'s stroke-start rest position from `stroke` or
 /// [`STROKE_POS_CHANNEL`], falling back to its current position when absent or
 /// non-finite.
-#[allow(dead_code)]
 pub(crate) fn stroke_position_at(
     mesh: &Mesh,
     stroke: Option<StrokeSlice<'_>>,

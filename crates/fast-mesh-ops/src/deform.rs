@@ -1,234 +1,19 @@
-//! Brush deformation compatibility re-exports (delegating [`sculpt`](crate::sculpt)
-//! items) plus `grab` / `grab_region`.
+//! Brush deformation compatibility re-exports delegating to [`crate::sculpt`].
 //!
-//! [`inflate`], [`smooth`], stroke channels, [`SurfaceFilter`], and
-//! [`Symmetry`] live in [`crate::sculpt`] and are re-exported here for
-//! backwards compatibility.
+//! All brush algorithms, extra brushes, stroke channels, [`SurfaceFilter`],
+//! and [`Symmetry`] live in [`crate::sculpt`] and are re-exported here so
+//! existing `fast_mesh_ops::deform::*` imports compile unchanged.
 
-use fast_mesh_store::{Transaction, VertexId};
-
-pub use crate::sculpt::{
-    Brush, Falloff, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions, InflateOptionsBuilder,
-    InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod, SmoothOptions,
-    SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry, TAUBIN_LAMBDA,
-    TAUBIN_MU, capture_stroke_state, ensure_stroke_state, inflate, inflate_region,
-    inflate_region_with_stroke, smooth, smooth_region,
-};
-use crate::sculpt::{brush_weight, falloff_value, write_moves};
-use crate::{OpsError, Result, push};
-
-/// Options for [`grab`].
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct GrabOptions {
-    /// The brush to apply.
-    pub brush: Brush,
-    /// The drag vector in local coordinates: each region vertex moves
-    /// `strength * falloff * direction`. Must be finite; a zero vector moves
-    /// nothing.
-    pub direction: [f32; 3],
-}
-
-impl GrabOptions {
-    /// A builder for [`GrabOptions`]: the default brush until set, no drag.
-    pub fn builder() -> GrabOptionsBuilder {
-        GrabOptionsBuilder::default()
-    }
-}
-
-/// A builder for [`GrabOptions`], see [`GrabOptions::builder`].
-#[derive(Debug, Clone, Default)]
-pub struct GrabOptionsBuilder {
-    options: GrabOptions,
-}
-
-impl GrabOptionsBuilder {
-    /// Center of the brush in local coordinates.
-    pub fn center(mut self, center: [f32; 3]) -> Self {
-        self.options.brush.center = center;
-        self
-    }
-
-    /// Radius of influence in local units.
-    pub fn radius(mut self, radius: f32) -> Self {
-        self.options.brush.radius = radius;
-        self
-    }
-
-    /// How the effect fades with distance from the center.
-    pub fn falloff(mut self, falloff: Falloff) -> Self {
-        self.options.brush.falloff = falloff;
-        self
-    }
-
-    /// Displacement scale; the per-vertex offset is `strength * falloff *
-    /// direction`.
-    pub fn strength(mut self, strength: f32) -> Self {
-        self.options.brush.strength = strength;
-        self
-    }
-
-    /// The drag vector in local coordinates.
-    pub fn direction(mut self, direction: [f32; 3]) -> Self {
-        self.options.direction = direction;
-        self
-    }
-
-    /// The options as set.
-    pub fn build(self) -> GrabOptions {
-        self.options
-    }
-}
-
-/// What [`grab`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct GrabReport {
-    /// How many vertices moved (displacement above 0).
-    pub moved: usize,
-    /// The largest displacement applied, in local units; 0 when nothing
-    /// moved.
-    pub max_displacement: f32,
-}
-
-fn check_grab(options: &GrabOptions) -> Result<()> {
-    let brush = &options.brush;
-    if !brush.radius.is_finite() || brush.radius <= 0.0 {
-        return Err(OpsError::InvalidInput(
-            "grab brush radius must be positive and finite",
-        ));
-    }
-    if brush.center.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput("grab brush center must be finite"));
-    }
-    if !brush.strength.is_finite() {
-        return Err(OpsError::InvalidInput("grab brush strength must be finite"));
-    }
-    if options.direction.iter().any(|c| !c.is_finite()) {
-        return Err(OpsError::InvalidInput("grab direction must be finite"));
-    }
-    Ok(())
-}
-
-/// Drags the vertices under the brush along one vector.
-///
-/// - Region: every live vertex closer than `radius` to `center` (brute-force
-///   distance check), each displaced by `strength * falloff * direction`,
-///   where `falloff` is the [`Falloff`] weight of its normalized distance.
-///   Unlike [`inflate`], the direction is the caller's, not the normals'.
-/// - The move is written once, in a single `set_positions` call over the
-///   vertices whose displacement is above 0; an empty region, or a zero
-///   `direction`, writes nothing. History is untouched.
-///
-/// # Errors
-/// - [`OpsError::InvalidInput`] when the radius is not positive, or any brush
-///   number (center, radius, strength) or the direction is not finite.
-/// - [`OpsError::Store`] when memory runs out.
-///
-/// Nothing is written in any of these cases.
-pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
-    let brush = &options.brush;
-    check_grab(options)?;
-    let mesh = tx.mesh();
-    let mut report = GrabReport::default();
-    if mesh.vertex_slots() == 0 {
-        return Ok(report);
-    }
-    let positions = mesh.positions();
-    let mut ids: Vec<VertexId> = Vec::new();
-    let mut moved_to: Vec<[f32; 3]> = Vec::new();
-    for (v, p) in positions.iter().enumerate() {
-        let v = v as VertexId;
-        if !mesh.is_vertex_alive(v) {
-            continue;
-        }
-        let dist = brush
-            .center
-            .iter()
-            .zip(p)
-            .map(|(c, p)| (p - c).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        let t = dist / brush.radius;
-        if !t.is_finite() || t >= 1.0 {
-            continue;
-        }
-        let w = brush.strength * falloff_value(brush.falloff, t);
-        let displaced = [
-            p[0] + w * options.direction[0],
-            p[1] + w * options.direction[1],
-            p[2] + w * options.direction[2],
-        ];
-        let length = options
-            .direction
-            .iter()
-            .map(|d| (w * d).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        if !length.is_finite() || length <= 0.0 {
-            continue;
-        }
-        push(&mut ids, v)?;
-        push(&mut moved_to, displaced)?;
-        report.max_displacement = report.max_displacement.max(length);
-    }
-    report.moved = ids.len();
-    if !ids.is_empty() {
-        tx.set_positions(&ids, &moved_to)?;
-    }
-    Ok(report)
-}
-
-/// [`grab`] over the candidates in `region`, with its cost following them
-/// instead of the mesh; see [`inflate_region`] for what `region` must hold.
-/// Grab needs no incidence index. A vertex no triangle uses moves only if it
-/// is listed.
-///
-/// # Errors
-/// As for [`grab`].
-pub fn grab_region(
-    tx: &mut Transaction,
-    options: &GrabOptions,
-    region: &[VertexId],
-) -> Result<GrabReport> {
-    let brush = &options.brush;
-    check_grab(options)?;
-    let mesh = tx.mesh();
-    let positions = mesh.positions();
-    let mut report = GrabReport::default();
-    let mut ids: Vec<VertexId> = Vec::new();
-    let mut moved_to: Vec<[f32; 3]> = Vec::new();
-    for &v in region {
-        if !mesh.is_vertex_alive(v) {
-            continue;
-        }
-        let p = &positions[v as usize];
-        let Some(w) = brush_weight(brush, p) else {
-            continue;
-        };
-        let d = options.direction;
-        let length = d.iter().map(|d| (w * d).powi(2)).sum::<f32>().sqrt();
-        if !length.is_finite() || length <= 0.0 {
-            continue;
-        }
-        push(&mut ids, v)?;
-        push(
-            &mut moved_to,
-            [p[0] + w * d[0], p[1] + w * d[1], p[2] + w * d[2]],
-        )?;
-        report.max_displacement = report.max_displacement.max(length);
-    }
-    report.moved = ids.len();
-    write_moves(tx, &ids, &moved_to)?;
-    Ok(report)
-}
+pub use crate::sculpt::*;
 
 #[cfg(test)]
 mod tests {
     use fast_mesh::compute_vertex_normals;
-    use fast_mesh_store::Mesh;
+    use fast_mesh_store::{Mesh, Transaction, VertexId};
 
     use super::*;
-    use crate::OpsError;
-    use crate::fail_allocations_after;
+    use crate::sculpt::{brush_weight, falloff_value};
+    use crate::{OpsError, Result, fail_allocations_after};
     use crate::test_util::{edit, mesh_of, parts, sweep};
 
     /// A 3x3 flat grid in `z = 0`, spacing 1, centered at the origin; vertex
@@ -808,6 +593,7 @@ mod tests {
         let grab_options = GrabOptions {
             brush,
             direction: [0.3, -0.2, 0.9],
+            ..Default::default()
         };
         let (mut a, mut b) = (wavy_grid(12), wavy_grid(12));
         let (ra, pa) = after(&mut a, |tx| grab(tx, &grab_options));
@@ -828,6 +614,7 @@ mod tests {
                 strength: 1.0,
             },
             direction: [0.0, 0.0, 1.0],
+            ..Default::default()
         };
         let region = every_slot(&mesh);
         let (report, _) = after(&mut mesh, |tx| grab_region(tx, &options, &region));

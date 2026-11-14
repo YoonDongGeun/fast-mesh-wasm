@@ -253,6 +253,7 @@ pub fn smooth_region(
                 push(&mut candidates, v)?;
             }
         }
+        candidates.sort_unstable();
         candidates.dedup();
         if candidates.is_empty() {
             return Ok(SmoothReport::default());
