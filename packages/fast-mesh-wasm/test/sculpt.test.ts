@@ -629,6 +629,36 @@ describe.each(HARNESSES)("sculpt domain ($label)", (harness) => {
   });
 });
 
+describe("store history.canUndo across captureStrokeState and sculpt", () => {
+  it.each(["sync", "worker"] as const)(
+    "keeps history.canUndo false after captureStrokeState and flips true after sculpt (%s)",
+    async (backend) => {
+      const s = backend === "sync" ? makeSync() : await makeWorker();
+      const store = makeStore(s);
+      const g = gridMesh(3, 1);
+      const m = store.addMesh(g.positions, g.indices, { origin: [0, 0, 0] });
+      if (backend === "worker") {
+        await (s as Awaited<ReturnType<typeof makeWorker>>).measure(m);
+      }
+      expect(store.getSnapshot().history.canUndo).toBe(false);
+
+      await store.sculpt(m, { op: "captureStrokeState" });
+      expect(store.getSnapshot().history.canUndo).toBe(false);
+
+      await store.sculpt(m, {
+        op: "grab",
+        center: [0, 0, 0],
+        radius: 2,
+        falloff: "smooth",
+        strength: 0.6,
+        direction: [0, 0, 1],
+        fromStroke: true,
+      });
+      expect(store.getSnapshot().history.canUndo).toBe(true);
+    },
+  );
+});
+
 describe("sync Scene.sculpt synchronous error semantics", () => {
   it("throws FastMeshError synchronously on bad options without mutating or recording undo", () => {
     const s = makeSync();

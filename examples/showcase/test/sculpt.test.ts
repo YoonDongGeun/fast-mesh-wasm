@@ -27,6 +27,8 @@ import {
   MaskError,
   paintMaskIds,
   sculptBrush,
+  strokeRegionSpheres,
+  symmetricRemeshOps,
   type SculptBrush,
   type SculptMask,
   type SculptTool,
@@ -923,5 +925,41 @@ describe("sculpt mask", () => {
       expect((e as MaskError).code).toBe("INVALID_ARGUMENT");
     }
     expect(() => checkMask(mask([0]), mesh, indices, 4)).not.toThrow();
+  });
+});
+
+describe("strokeRegionSpheres and symmetricRemeshOps", () => {
+  it("expands mirrored spheres locally across active axes and filters mask per lobe", () => {
+    const b = { center: [1.5, -0.5, 0.25] as const, radius: 0.6 };
+
+    // Single axis symmetry: 2 distinct local spheres without widening one global sphere.
+    expect(strokeRegionSpheres(b, { x: true, y: false, z: false })).toEqual([
+      { center: [1.5, -0.5, 0.25], radius: 0.6 },
+      { center: [-1.5, -0.5, 0.25], radius: 0.6 },
+    ]);
+
+    // Multi-axis symmetry: 8 quadrants, each preserving radius 0.6.
+    const eight = strokeRegionSpheres(b, { x: true, y: true, z: true });
+    expect(eight).toHaveLength(8);
+    expect(eight.every((sp) => sp.radius === 0.6)).toBe(true);
+
+    // Center on x = 0 symmetry plane deduplicates cleanly.
+    expect(strokeRegionSpheres({ center: [0, 1, 2], radius: 0.4 }, { x: true, y: false, z: false })).toEqual([
+      { center: [0, 1, 2], radius: 0.4 },
+    ]);
+
+    // Per-lobe mask filtering skips masked lobes while keeping unmasked mirror lobes.
+    const ops = symmetricRemeshOps(
+      b,
+      { x: true, y: true, z: false },
+      (sp) => sp.center[0] > 0 && sp.center[1] < 0, // skip (+1.5, -0.5) only
+      4,
+      0.12,
+    );
+    expect(ops).toEqual([
+      { op: "remesh", center: [-1.5, -0.5, 0.25], radius: 0.6, maxRounds: 4, targetLength: 0.12 },
+      { op: "remesh", center: [1.5, 0.5, 0.25], radius: 0.6, maxRounds: 4, targetLength: 0.12 },
+      { op: "remesh", center: [-1.5, 0.5, 0.25], radius: 0.6, maxRounds: 4, targetLength: 0.12 },
+    ]);
   });
 });

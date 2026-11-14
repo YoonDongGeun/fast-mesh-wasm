@@ -2143,6 +2143,16 @@ class Engine {
     }
     wire.vertexSlots = this.#scene.vertexSlots(c.mesh);
     wire.triangleSlots = this.#scene.triangleSlots(c.mesh);
+    if (
+      c.added ||
+      c.capacityChanged ||
+      c.positions === "all" ||
+      c.positions.length > 0 ||
+      c.indices === "all" ||
+      c.indices.length > 0
+    ) {
+      wire.bounds = this.#scene.bounds(c.mesh);
+    }
     // A background add's buffers copied out before it landed, while its
     // content stamp says the mesh is unchanged since: sent as they are.
     let packed = c.added ? this.#packed.get(c.mesh) : undefined;

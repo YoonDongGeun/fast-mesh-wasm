@@ -553,6 +553,8 @@ export function protectMaskedDab(
 export interface MaskLiveScene {
   views(mesh: MeshHandle): { positions(): ArrayLike<number>; indices(): ArrayLike<number> };
   onChanges(listener: (changes: MeshChange[]) => void): () => void;
+  status?(key: string): { status?: string };
+  onStatus?(listener: () => void): () => void;
   undo?: () => unknown;
   redo?: () => unknown;
   cancelStep?: () => unknown;
@@ -566,7 +568,7 @@ export interface MaskLiveScene {
 
 export interface MaskLiveStore {
   subscribe?(listener: () => void): () => void;
-  getSnapshot?(): { status?: string };
+  getSnapshot?(): { status?: string; history?: { status?: string; canUndo?: boolean; canRedo?: boolean } };
   undo?: () => void;
   redo?: () => void;
   repair?: (...args: never[]) => unknown;
@@ -708,6 +710,18 @@ export class MaskLiveTracker {
     this.#store = store ?? null;
   }
 
+  #isHistoryComputing(): boolean {
+    const historyStatus = this.#scene.status?.("history")?.status;
+    if (historyStatus !== undefined) {
+      return historyStatus === "computing";
+    }
+    const snap = this.#store?.getSnapshot?.();
+    if (snap?.history?.status !== undefined) {
+      return snap.history.status === "computing";
+    }
+    return snap?.status === "computing";
+  }
+
   attach(): void {
     if (this.#off !== null) {
       return;
@@ -738,7 +752,7 @@ export class MaskLiveTracker {
         tracker.noteTopologyMutation();
         try {
           const result = orig.apply(this ?? target, args);
-          if (trackAsyncStatus && tracker.#store?.getSnapshot?.().status !== "computing") {
+          if (trackAsyncStatus && !tracker.#isHistoryComputing()) {
             tracker.#pendingAsyncHistory = Math.max(0, tracker.#pendingAsyncHistory - 1);
           }
           if (isPromiseLike(result)) {
@@ -817,6 +831,19 @@ export class MaskLiveTracker {
     addHook(this.#scene, "repair", wrapRepairOrSculpt(this.#scene));
     addHook(this.#scene, "sculpt", wrapRepairOrSculpt(this.#scene));
 
+    const clearHistoryIfDone = () => {
+      if (this.#pendingAsyncHistory > 0) {
+        this.noteTopologyMutation();
+        if (!this.#isHistoryComputing()) {
+          this.#pendingAsyncHistory = 0;
+        }
+      }
+    };
+
+    if (typeof this.#scene.onStatus === "function") {
+      cleanups.push(this.#scene.onStatus(clearHistoryIfDone));
+    }
+
     if (this.#store !== null) {
       addHook(this.#store, "undo", wrapGlobalMutation(this.#store, true));
       addHook(this.#store, "redo", wrapGlobalMutation(this.#store, true));
@@ -825,16 +852,7 @@ export class MaskLiveTracker {
       addHook(this.#store, "repair", wrapRepairOrSculpt(this.#store));
       addHook(this.#store, "sculpt", wrapRepairOrSculpt(this.#store));
       if (typeof this.#store.subscribe === "function") {
-        cleanups.push(
-          this.#store.subscribe(() => {
-            if (this.#pendingAsyncHistory > 0) {
-              this.noteTopologyMutation();
-              if (this.#store?.getSnapshot?.().status !== "computing") {
-                this.#pendingAsyncHistory = 0;
-              }
-            }
-          }),
-        );
+        cleanups.push(this.#store.subscribe(clearHistoryIfDone));
       }
     }
 

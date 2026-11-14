@@ -547,12 +547,12 @@ fn flatten_candidates<'f>(
                     }
                 }
                 FlattenMode::Peaks => {
-                    if !(signed_dist > 0.0) {
+                    if signed_dist <= 0.0 || signed_dist.is_nan() {
                         continue;
                     }
                 }
                 FlattenMode::Valleys => {
-                    if !(signed_dist < 0.0) {
+                    if signed_dist >= 0.0 || signed_dist.is_nan() {
                         continue;
                     }
                 }
@@ -844,7 +844,8 @@ fn clay_candidates<'f>(
                 + (p[1] - o_base[1]) * plane_n[1]
                 + (p[2] - o_base[2]) * plane_n[2]
                 - offset_h;
-            if !(d_plane * sign < 0.0) {
+            let signed = d_plane * sign;
+            if signed >= 0.0 || signed.is_nan() {
                 continue;
             }
 

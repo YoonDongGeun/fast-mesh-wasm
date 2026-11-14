@@ -564,41 +564,53 @@ fn eval_grab_kelvinlet(
     (a_m, dp)
 }
 
-fn effective_pass_radius(
-    mesh: &Mesh,
-    brush: &Brush,
+struct PassRadiusInput<'a> {
+    mesh: &'a Mesh,
+    brush: &'a Brush,
     center_m: [f32; 3],
     dir_m: [f32; 3],
     method: GrabMethod,
     adaptive_reach: bool,
-    candidates: &[VertexId],
-    base_positions: &[[f32; 3]],
-    sorted_zero_protected: &[VertexId],
-) -> f32 {
-    if !adaptive_reach {
-        return brush.radius;
+    candidates: &'a [VertexId],
+    base_positions: &'a [[f32; 3]],
+    sorted_zero_protected: &'a [VertexId],
+}
+
+fn effective_pass_radius(input: &PassRadiusInput<'_>) -> f32 {
+    if !input.adaptive_reach {
+        return input.brush.radius;
     }
+    let dir_m = input.dir_m;
     let dir_len = (dir_m[0] * dir_m[0] + dir_m[1] * dir_m[1] + dir_m[2] * dir_m[2]).sqrt();
-    let length = brush.strength.abs() * dir_len;
-    let slope = grab_slope(brush.falloff, method);
+    let length = input.brush.strength.abs() * dir_len;
+    let slope = grab_slope(input.brush.falloff, input.method);
     let r_wide = length * slope / GRAB_MAX_STRETCH;
-    if !(r_wide > brush.radius && r_wide.is_finite() && dir_len > 0.0 && brush.strength != 0.0) {
-        return brush.radius;
+    if !(r_wide > input.brush.radius
+        && r_wide.is_finite()
+        && dir_len > 0.0
+        && input.brush.strength != 0.0)
+    {
+        return input.brush.radius;
     }
 
-    let sign = if brush.strength < 0.0 { -1.0f32 } else { 1.0f32 };
+    let sign = if input.brush.strength < 0.0 {
+        -1.0f32
+    } else {
+        1.0f32
+    };
     let ux = sign * dir_m[0] / dir_len;
     let uy = sign * dir_m[1] / dir_len;
     let uz = sign * dir_m[2] / dir_len;
 
     let mut ahead = 0.0f32;
-    for (&v, p) in candidates.iter().zip(base_positions) {
-        if mesh.corner_count(v) == 0 || sorted_zero_protected.binary_search(&v).is_ok() {
+    for (&v, p) in input.candidates.iter().zip(input.base_positions) {
+        if input.mesh.corner_count(v) == 0 || input.sorted_zero_protected.binary_search(&v).is_ok()
+        {
             continue;
         }
-        let dx = p[0] - center_m[0];
-        let dy = p[1] - center_m[1];
-        let dz = p[2] - center_m[2];
+        let dx = p[0] - input.center_m[0];
+        let dy = p[1] - input.center_m[1];
+        let dz = p[2] - input.center_m[2];
         let along = dx * ux + dy * uy + dz * uz;
         if along <= 0.0 {
             continue;
@@ -611,7 +623,7 @@ fn effective_pass_radius(
             }
         }
     }
-    brush.radius.max(r_wide * ahead)
+    input.brush.radius.max(r_wide * ahead)
 }
 
 fn grab_candidates<'f>(
@@ -680,17 +692,17 @@ fn grab_candidates<'f>(
     for &bits in &masks[..mask_count] {
         let center_m = reflect_vec(bits, brush.center);
         let dir_m = reflect_vec(bits, options.direction);
-        let r_eff = effective_pass_radius(
+        let r_eff = effective_pass_radius(&PassRadiusInput {
             mesh,
             brush,
             center_m,
             dir_m,
-            options.method,
-            options.adaptive_reach,
+            method: options.method,
+            adaptive_reach: options.adaptive_reach,
             candidates,
-            &base_positions,
-            sorted_zp,
-        );
+            base_positions: &base_positions,
+            sorted_zero_protected: sorted_zp,
+        });
         let auto_normal = need_auto_normal.then(|| {
             falloff_weighted_normal(
                 candidates,

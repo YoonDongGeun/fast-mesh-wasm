@@ -1043,6 +1043,9 @@ impl Scene {
             return Ok(r);
         }
         entry.record_changes(patch.changes());
+        if !patch.changes().vertices_moved.is_empty() {
+            entry.stroke.invalidate_on_mesh(&mut entry.mesh);
+        }
         self.history
             .record(&mut self.entries, Change::Edit(id, patch));
         if let Some(entry) = self.entries.get_mut(id) {

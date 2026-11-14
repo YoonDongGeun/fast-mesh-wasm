@@ -1008,5 +1008,100 @@ describe("engine-localized protectMaskedDab and incremental maskCache (#197)", (
     expect(await pWorker).toBe(false);
     expect(asyncSetMask).toBe(0);
     asyncTracker.dispose();
+
+    // Case F: Pre-existing unrelated store error (`status: "error"`) must NOT short-circuit
+    // `#pendingAsyncHistory` while history status (`history.status` or `scene.status("history")`)
+    // is `"computing"`.
+    {
+      let historyStatus = "idle";
+      const errSubs = new Set<() => void>();
+      const errStore = {
+        getSnapshot: () => ({ status: "error", history: { status: historyStatus } }),
+        subscribe(fn: () => void) {
+          errSubs.add(fn);
+          return () => errSubs.delete(fn);
+        },
+        undo() {
+          historyStatus = "computing";
+          for (const fn of [...errSubs]) fn();
+        },
+      };
+      const trackerWithHistoryField = new MaskLiveTracker(scene, errStore);
+      trackerWithHistoryField.attach();
+      origTrust(mesh, redoMask.vertices, 6, true);
+      errStore.undo();
+      let resolveHistoryField!: (ids: Uint32Array) => void;
+      let errSetMask = 0;
+      const pHistoryField = applyMaskPaintStep({
+        mesh,
+        centers: [[2, 0.2, 0]],
+        radius: 0.5,
+        verticesInSphere: () => new Promise<Uint32Array>((r) => (resolveHistoryField = r)),
+        views: spiedViews,
+        tracker: trackerWithHistoryField,
+        isAlive: () => true,
+        getPrevMask: () => redoMask,
+        setMask: () => {
+          errSetMask++;
+        },
+        onStale: () => {},
+      });
+      historyStatus = "idle";
+      for (const fn of [...errSubs]) fn();
+      resolveHistoryField(new Uint32Array([5]));
+      expect(await pHistoryField).toBe(false);
+      expect(errSetMask).toBe(0);
+      trackerWithHistoryField.dispose();
+
+      // WorkerScene-style `scene.status("history")` + `scene.onStatus` alongside unrelated store error.
+      let workerHistoryStatus = "idle";
+      const workerStatusListeners = new Set<() => void>();
+      const workerStyleScene = {
+        views: (h: typeof mesh) => scene.views(h),
+        onChanges: (fn: (changes: Parameters<Parameters<typeof scene.onChanges>[0]>[0]) => void) => scene.onChanges(fn),
+        status: (key: string) => ({ status: key === "history" ? workerHistoryStatus : "error" }),
+        onStatus: (fn: () => void) => {
+          workerStatusListeners.add(fn);
+          return () => workerStatusListeners.delete(fn);
+        },
+      };
+      const workerStoreSubs = new Set<() => void>();
+      const workerErrStore = {
+        getSnapshot: () => ({ status: "error" }),
+        subscribe(fn: () => void) {
+          workerStoreSubs.add(fn);
+          return () => workerStoreSubs.delete(fn);
+        },
+        undo() {
+          workerHistoryStatus = "computing";
+          for (const fn of [...workerStatusListeners]) fn();
+        },
+      };
+      const workerTracker = new MaskLiveTracker(workerStyleScene, workerErrStore);
+      workerTracker.attach();
+      workerErrStore.undo();
+      let resolveWorkerErr!: (ids: Uint32Array) => void;
+      let workerErrSetMask = 0;
+      const pWorkerErr = applyMaskPaintStep({
+        mesh,
+        centers: [[2, 0.2, 0]],
+        radius: 0.5,
+        verticesInSphere: () => new Promise<Uint32Array>((r) => (resolveWorkerErr = r)),
+        views: spiedViews,
+        tracker: workerTracker,
+        isAlive: () => true,
+        getPrevMask: () => redoMask,
+        setMask: () => {
+          workerErrSetMask++;
+        },
+        onStale: () => {},
+      });
+      workerHistoryStatus = "idle";
+      for (const fn of [...workerStatusListeners]) fn();
+      resolveWorkerErr(new Uint32Array([5]));
+      expect(await pWorkerErr).toBe(false);
+      expect(workerErrSetMask).toBe(0);
+      workerTracker.dispose();
+    }
   });
 });

@@ -553,10 +553,7 @@ fn decode_protect(words: &mut Cursor<'_, f64>) -> Result<(Vec<u32>, Vec<f32>, f3
     };
     let ids = words.take(n)?;
     let raw_weights = words.take(n)?;
-    let mut vertices = Vec::new();
-    vertices
-        .try_reserve_exact(n)
-        .map_err(|_| Error::invalid("protect is too large"))?;
+    let mut vertices = reserved(n)?;
     for &id in ids {
         if !(id >= 0.0 && id <= f64::from(u32::MAX) && id.fract() == 0.0) {
             return Err(Error::invalid("protect vertices must be u32 integers"));
@@ -1275,9 +1272,17 @@ fn put_stage(out: &mut Vec<f64>, stage: AutoRepairStage) -> Result<(), StoreErro
 }
 
 pub(crate) fn put_stretch(out: &mut Vec<f64>, r: &StretchReport) -> Result<(), StoreError> {
-    put(out, &[count(r.splits), count(r.remaining)])?;
+    let words = r
+        .vertices
+        .len()
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(2))
+        .ok_or(StoreError::OutOfMemory)?;
+    out.try_reserve(words)
+        .map_err(|_| StoreError::OutOfMemory)?;
+    out.extend_from_slice(&[count(r.splits), count(r.remaining)]);
     for [id, a, b] in &r.vertices {
-        put(out, &[f64::from(*id), f64::from(*a), f64::from(*b)])?;
+        out.extend_from_slice(&[f64::from(*id), f64::from(*a), f64::from(*b)]);
     }
     Ok(())
 }

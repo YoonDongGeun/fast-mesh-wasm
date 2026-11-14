@@ -40,7 +40,9 @@ import {
   type SculptBrush,
   type SculptMask,
   SculptStroke,
+  strokeRegionSpheres,
   type StrokeSteps,
+  symmetricRemeshOps,
   toSymmetry,
   unionMaskIds,
   widestGrabReach,
@@ -931,17 +933,24 @@ function SculptLayer(props: {
         return;
       }
       const mesh = brushRef.current.mesh;
+      const spheres = strokeRegionSpheres(b, brushRef.current.symmetry);
       liveAt = performance.now();
       liveDabs = stroke.dabs;
       inspect.sculpt.liveRemeshes++;
       // In order with the stroke's edits, so that the stroke's end waits for it
       // and the engine's StrokeSnapshot interpolates any new split midpoints.
-      liveRunning = stroke.pass(() =>
-        splitStretched(mesh, b).then(() => {
+      // Dispatch each mirrored sphere sequentially so every repair stays a single
+      // `splitStretched` op recognized by `MaskLiveTracker`.
+      liveRunning = stroke.pass(async () => {
+        try {
+          for (const sphere of spheres) {
+            await splitStretched(mesh, sphere);
+          }
+        } finally {
           liveRunning = null;
           liveAt = performance.now();
-        }),
-      );
+        }
+      });
     };
 
     const cast = (x: number, y: number) => {
@@ -1037,47 +1046,53 @@ function SculptLayer(props: {
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
-        if (liveRef.current) {
-          const b = lastBounds;
-          if (b !== null) {
-            const mesh = brushRef.current.mesh;
-            inspect.sculpt.liveRemeshes++;
-            void s.pass(() => splitStretched(mesh, b));
-          }
+        if (liveRef.current && lastBounds !== null) {
+          const mesh = brushRef.current.mesh;
+          const spheres = strokeRegionSpheres(lastBounds, brushRef.current.symmetry);
+          inspect.sculpt.liveRemeshes++;
+          void s.pass(async () => {
+            for (const sphere of spheres) {
+              await splitStretched(mesh, sphere);
+            }
+          });
         }
         // The optional evening-out, off by default: it rewrites its whole
         // region, and it stands down on huge meshes, where it would stall the
         // worker.
         if (remeshRef.current && landed > 0) {
-          const b = s.bounds();
+          const b = lastBounds;
           const mesh = brushRef.current.mesh;
           const slots = triSlots(mesh);
-          if (b !== null && slots !== null && !remeshTooBig(slots) && !remeshMeetsMask(mesh, b)) {
+          if (b !== null && slots !== null && !remeshTooBig(slots)) {
             ensureDensity(mesh);
-            inspect.sculpt.remeshes++;
-            // In order with the stroke: after what is due and any live pass, so
-            // invalidation happens once the remesh pass executes (never pre-empted by
-            // an earlier live split pass registering #splitPending).
-            void s.pass(() => {
-              maskTracker.noteTopologyMutation(mesh);
-              return store
-                .repair(mesh, {
-                  op: "remesh",
-                  center: b.center,
-                  radius: b.radius,
-                  maxRounds: 4,
-                  targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
-                })
-                .then((r) => {
-                  maskTracker.noteTopologyMutation(mesh);
-                  return r;
-                })
-                .catch(() => {
-                  maskTracker.noteTopologyMutation(mesh);
-                  // A degenerate region (or a mesh removed meanwhile): the
-                  // stroke still ends.
-                });
-            });
+            const targetLength = densityAnchor?.mesh === mesh ? densityAnchor.length : undefined;
+            const ops = symmetricRemeshOps(
+              b,
+              brushRef.current.symmetry,
+              (sp) => remeshMeetsMask(mesh, sp),
+              4,
+              targetLength,
+            );
+            if (ops.length > 0) {
+              inspect.sculpt.remeshes++;
+              // In order with the stroke: after what is due and any live pass, so
+              // invalidation happens once the remesh pass executes (never pre-empted by
+              // an earlier live split pass registering #splitPending).
+              void s.pass(() => {
+                maskTracker.noteTopologyMutation(mesh);
+                return store
+                  .repair(mesh, ops.length === 1 ? ops[0] : ops)
+                  .then((r) => {
+                    maskTracker.noteTopologyMutation(mesh);
+                    return r;
+                  })
+                  .catch(() => {
+                    maskTracker.noteTopologyMutation(mesh);
+                    // A degenerate region (or a mesh removed meanwhile): the
+                    // stroke still ends.
+                  });
+              });
+            }
           }
         }
         s.end();

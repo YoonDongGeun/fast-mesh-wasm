@@ -1077,10 +1077,15 @@ fn grab_geodesic_isolates_air_gap_sheets_and_bridges_uv_seams() {
         (0..25).any(|v| geo_mesh.positions()[v][2] > 0.1),
         "Geodesic grab moves the z = 0.0 seed sheet"
     );
-    for v in 25..50 {
+    for (offset, (after_pos, before_pos)) in geo_mesh.positions()[25..50]
+        .iter()
+        .zip(&before[25..50])
+        .enumerate()
+    {
+        let v = 25 + offset;
         assert_eq!(
-            geo_mesh.positions()[v].map(f32::to_bits),
-            before[v].map(f32::to_bits),
+            after_pos.map(f32::to_bits),
+            before_pos.map(f32::to_bits),
             "Geodesic grab must leave z = 0.05 sheet byte-identical (vertex {v})"
         );
     }
@@ -1950,4 +1955,113 @@ fn asymmetric_multipass_scratch_reuse_reserves_without_infallible_realloc() {
             sweep(asym_mesh(), |tx| smooth_region(tx, &sm_opts, &all_ids).map(drop)) >= 6
         );
     }
+}
+
+#[test]
+fn grab_region_with_stroke_uses_slice_adaptive_reach_and_zero_protected() {
+    // 3x3 connected grid over x in [0, 1, 2], y in [0, 1, 2]:
+    // vertex index = iy * 3 + ix
+    // v0=(0,0,0), v1=(1,0,0) [perp outside R=0.6], v2=(2,0,0),
+    // v3=(0,1,0) [ahead @ dist=1.0], v6=(0,2,0) [ahead @ dist=2.0].
+    let mut positions = Vec::new();
+    let mut triangles = Vec::new();
+    for iy in 0..3u32 {
+        for ix in 0..3u32 {
+            positions.extend([ix as f32, iy as f32, 0.0]);
+        }
+    }
+    for iy in 0..2u32 {
+        for ix in 0..2u32 {
+            let a = iy * 3 + ix;
+            triangles.extend([[a, a + 1, a + 4], [a, a + 4, a + 3]]);
+        }
+    }
+    let rest_mesh = mesh_of(&positions, &triangles);
+    let rest_positions = rest_mesh.positions().to_vec();
+    let rest_normals = vec![[0.0, 0.0, 1.0]; rest_positions.len()];
+    let candidates: Vec<VertexId> = (0..9).collect();
+
+    // Perturb seed v0 WITHOUT capturing any stroke channel on the mesh itself:
+    // passing `Some(StrokeSlice)` must supply the rest base for `from_stroke: true`.
+    let perturbed_seed = |shift: [f32; 3]| {
+        let mut m = mesh_of(&positions, &triangles);
+        let p0 = rest_positions[0];
+        edit(&mut m, |tx| {
+            tx.set_positions(&[0], &[[p0[0] + shift[0], p0[1] + shift[1], p0[2] + shift[2]]])?;
+            Ok(())
+        });
+        m
+    };
+
+    let brush = Brush {
+        center: [0.0, 0.0, 0.0],
+        radius: 0.6,
+        falloff: Falloff::Linear,
+        strength: 1.0,
+    };
+    let opts = GrabOptions {
+        brush,
+        direction: [0.0, 12.0, 0.0],
+        from_stroke: true,
+        adaptive_reach: true,
+        ..Default::default()
+    };
+    let slice = StrokeSlice {
+        positions: &rest_positions,
+        normals: &rest_normals,
+    };
+
+    // Case 1: All ahead vertices (y > 0 => indices 3..9) are zero-protected.
+    // `effective_pass_radius` skips zero-protected vertices when measuring `ahead`,
+    // so radius stays 0.6 and perpendicular v1=(1,0,0) does not move.
+    let mut gated = perturbed_seed([0.0, 0.0, 0.5]);
+    let all_ahead_zp: Vec<VertexId> = vec![3, 4, 5, 6, 7, 8];
+    edit(&mut gated, |tx| {
+        grab_region_with_stroke(tx, &opts, &candidates, Some(slice), &all_ahead_zp)
+    });
+    assert!(
+        (gated.positions()[0][1] - 12.0).abs() < 1e-4,
+        "seed v0 must move from StrokeSlice rest pos even with ahead vertices protected"
+    );
+    assert!(
+        (gated.positions()[0][2]).abs() < 1e-5,
+        "from_stroke must use StrokeSlice z=0 rather than perturbed z=0.5"
+    );
+    assert_eq!(
+        gated.positions()[1].map(f32::to_bits),
+        rest_positions[1].map(f32::to_bits),
+        "perpendicular v1 at dist=1.0 must remain untouched when ahead vertices are zero-protected"
+    );
+
+    // Case 2: Unprotect v3=(0,1,0) while keeping ahead vertices 4..9 in zero_protected.
+    // Adaptive reach now widens past r=1.0, moving v1, then zero-direction snaps back to StrokeSlice.
+    let mut widened = perturbed_seed([0.0, 0.0, 0.5]);
+    let partial_zp: Vec<VertexId> = vec![4, 5, 6, 7, 8];
+    edit(&mut widened, |tx| {
+        grab_region_with_stroke(tx, &opts, &candidates, Some(slice), &partial_zp)
+    });
+    assert!(
+        widened.positions()[1][1] > 0.5,
+        "unprotected ahead v3 must widen adaptive_reach to pull perpendicular v1=(1,0,0), got y={}",
+        widened.positions()[1][1]
+    );
+
+    // Zero-direction snap-back must return vertices inside reach back to StrokeSlice.positions.
+    let reset_opts = GrabOptions {
+        direction: [0.0, 0.0, 0.0],
+        ..opts
+    };
+    edit(&mut widened, |tx| {
+        grab_region_with_stroke(tx, &reset_opts, &candidates, Some(slice), &partial_zp)
+    });
+    assert_eq!(
+        widened.positions()[0].map(f32::to_bits),
+        rest_positions[0].map(f32::to_bits),
+        "zero-direction grab must restore v0 exactly to StrokeSlice.positions"
+    );
+    assert_eq!(
+        widened.positions()[1].map(f32::to_bits),
+        rest_positions[1].map(f32::to_bits),
+        "zero-direction grab must restore v1 exactly to StrokeSlice.positions"
+    );
 }

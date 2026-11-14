@@ -116,7 +116,9 @@ impl LocalDistTable {
     }
 }
 
-fn in_aabb(p: [f32; 3], bounds: Option<([f64; 3], [f64; 3])>) -> bool {
+type AabbBounds = ([f64; 3], [f64; 3]);
+
+fn in_aabb(p: [f32; 3], bounds: Option<AabbBounds>) -> bool {
     let Some((lo, hi)) = bounds else {
         return true;
     };
@@ -214,7 +216,7 @@ pub fn with_protection_band<R, E: From<OpsError>>(
         }
         explicit.truncate(write);
 
-        let bounds: Option<([f64; 3], [f64; 3])> = region.and_then(|reg| {
+        let bounds: Option<AabbBounds> = region.map(|reg| {
             let mut lo = [f64::INFINITY; 3];
             let mut hi = [f64::NEG_INFINITY; 3];
             let mut any = false;
@@ -230,13 +232,13 @@ pub fn with_protection_band<R, E: From<OpsError>>(
                 }
             }
             if !any {
-                return Some(([1.0; 3], [-1.0; 3]));
+                return ([1.0; 3], [-1.0; 3]);
             }
             let pad = band_f64 * (1.0 + 1e-5) + 1e-5;
-            Some((
+            (
                 [lo[0] - pad, lo[1] - pad, lo[2] - pad],
                 [hi[0] + pad, hi[1] + pad, hi[2] + pad],
-            ))
+            )
         });
 
         let fans = if mesh.incidence().is_none() {

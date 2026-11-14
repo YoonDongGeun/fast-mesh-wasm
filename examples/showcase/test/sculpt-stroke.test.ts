@@ -5,7 +5,17 @@
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import { inheritedSplits, MASK_SOFT_BAND, maskEdgeField, protectMaskedDab } from "../src/viewport/mask-protect";
-import { dabOperation, GRAB_MAX_STRETCH, GrabRegion, SculptStroke, sculptBrush, unionMaskIds, type SculptBrush } from "../src/viewport/sculpt";
+import {
+  dabOperation,
+  GRAB_MAX_STRETCH,
+  GrabRegion,
+  SculptStroke,
+  sculptBrush,
+  strokeRegionSpheres,
+  symmetricRemeshOps,
+  unionMaskIds,
+  type SculptBrush,
+} from "../src/viewport/sculpt";
 
 type Vec = [number, number, number];
 
@@ -774,5 +784,140 @@ describe("engine-driven Grab + masked dabs + live splits (#177, #192, #197)", ()
     expect(v.positions().length).toBeGreaterThanOrEqual(before.length);
     expect(maxDifference(v.positions().subarray(0, before.length), before)).toBe(0);
     expect(s.scene.canUndo()).toBe(false);
+  });
+
+  it("cancels step when only setup pass settles and subsequent dab or move fails", async () => {
+    const calls: string[] = [];
+    const brush = sculptBrush("inflate", 0 as never, 0.5, 0.25, "smooth");
+    const setupGate = new Promise<void>((r) => setTimeout(r, 10));
+
+    // 1. Setup `pass` followed by a rejecting queued `dab`: `pass` settles while `#begun === true`,
+    //    yet `#landed` stays false so `end()` cancels the step cleanly.
+    {
+      const stroke = new SculptStroke(
+        brush,
+        {
+          beginStep: () => void calls.push("begin"),
+          endStep: () => void calls.push("end"),
+          cancelStep: () => void calls.push("cancel"),
+        },
+        () => Promise.reject(new Error("mesh removed")),
+      );
+      void stroke.pass(() => setupGate);
+      stroke.dab([0, 0, 0]);
+      stroke.end();
+      await stroke.done;
+      expect(calls).toEqual(["begin", "cancel"]);
+    }
+
+    // 2. Setup `pass` followed by a rejecting `move`: still cancels instead of committing.
+    {
+      const moveCalls: string[] = [];
+      const stroke = new SculptStroke(
+        sculptBrush("grab", 0 as never, 0.5, 1, "smooth"),
+        {
+          beginStep: () => void moveCalls.push("begin"),
+          endStep: () => void moveCalls.push("end"),
+          cancelStep: () => void moveCalls.push("cancel"),
+        },
+        () => Promise.resolve(),
+      );
+      void stroke.pass(() => Promise.resolve());
+      stroke.move(() => Promise.reject(new Error("grab aborted")), [0.1, 0, 0]);
+      stroke.end();
+      await stroke.done;
+      expect(moveCalls).toEqual(["begin", "cancel"]);
+    }
+  });
+
+  it("symmetrizes live splitStretched and stroke-end remesh across mirrored lobes locally", async () => {
+    const { positions, indices } = sphere(12, 24, 2);
+    const scene = new Scene();
+    const mesh = scene.addMesh(positions, indices, { origin: [0, 0, 0] });
+    scene.repair(mesh, { op: "captureRestSizes" });
+    scene.repair(mesh, { op: "captureStrokeState" });
+
+    const symmetry = { x: true, y: false, z: false };
+    const press: Vec = [2, 0, 0];
+    const radius = 0.65;
+    const brush = {
+      ...sculptBrush("grab", mesh, radius, 1, "smooth"),
+      symmetry,
+    };
+    const stroke = new SculptStroke(
+      brush,
+      {
+        beginStep: () => scene.beginStep(),
+        endStep: () => scene.endStep(),
+        cancelStep: () => scene.cancelStep(),
+      },
+      () => Promise.resolve(),
+    );
+
+    const before = Float32Array.from(scene.views(mesh).positions());
+    const drag: Vec = [0.85, 0, 0];
+    stroke.move(
+      () => {
+        scene.repair(mesh, dabOperation({ ...brush, direction: drag }, press));
+        return Promise.resolve();
+      },
+      [press[0] + drag[0], press[1] + drag[1], press[2] + drag[2]],
+    );
+
+    const rawBounds = stroke.bounds()!;
+    const spheres = strokeRegionSpheres(rawBounds, symmetry);
+    expect(spheres).toHaveLength(2);
+    expect(spheres[0].center[0]).toBeGreaterThan(2);
+    expect(spheres[1].center[0]).toBeLessThan(-2);
+    expect(spheres[0].radius).toBe(rawBounds.radius);
+    expect(spheres[1].radius).toBe(rawBounds.radius);
+
+    let totalSplits = 0;
+    const splitCenters: number[] = [];
+    await stroke.pass(async () => {
+      for (const sp of spheres) {
+        const rep = scene.repair(mesh, {
+          op: "splitStretched",
+          center: sp.center,
+          radius: sp.radius,
+          maxSplits: 64,
+        });
+        totalSplits += rep.splits;
+        splitCenters.push(rep.splits);
+      }
+    });
+    expect(splitCenters[0]).toBeGreaterThan(0);
+    expect(splitCenters[1]).toBeGreaterThan(0);
+    expect(totalSplits).toBeGreaterThanOrEqual(2);
+
+    // Stroke-end symmetric remesh skips a lobe that meets the mask while still remeshing the mirror lobe.
+    const ops = symmetricRemeshOps(
+      rawBounds,
+      symmetry,
+      (sp) => sp.center[0] > 0, // pretend +x lobe meets mask, -x does not
+      2,
+    );
+    expect(ops).toHaveLength(1);
+    expect(ops[0].op).toBe("remesh");
+    expect(ops[0].center[0]).toBeLessThan(-2);
+
+    await stroke.pass(() => {
+      scene.repair(mesh, ops);
+      return Promise.resolve();
+    });
+    stroke.end();
+    await stroke.done;
+
+    // Locality check: vertices on the x = 0 symmetry meridian outside both spheres must stay untouched.
+    const after = scene.views(mesh).positions();
+    for (let id = 0; id < before.length / 3; id++) {
+      const bx = before[3 * id];
+      if (Math.abs(bx) < 0.05) {
+        expect(after[3 * id]).toBe(before[3 * id]);
+        expect(after[3 * id + 1]).toBe(before[3 * id + 1]);
+        expect(after[3 * id + 2]).toBe(before[3 * id + 2]);
+      }
+    }
+    scene.free();
   });
 });

@@ -847,65 +847,6 @@ mod tests {
         Mesh::from_buffers(&positions, &indices).unwrap()
     }
 
-    fn apply_whole_dab(scene: &mut Scene, id: MeshId, dab: &Dab) -> DabReport {
-        use fast_mesh_ops::sculpt::{clay, crease, flatten, grab, inflate, smooth, twist};
-        scene
-            .edit(id, |tx| -> std::result::Result<DabReport, SceneError> {
-                Ok(match dab {
-                    Dab::Inflate(o) => {
-                        let r = inflate(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Smooth(o) => {
-                        let r = smooth(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Grab(o) => {
-                        let r = grab(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Flatten(o) => {
-                        let r = flatten(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Crease(o) => {
-                        let r = crease(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Clay(o) => {
-                        let r = clay(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                    Dab::Twist(o) => {
-                        let r = twist(tx, o)?;
-                        DabReport {
-                            moved: r.moved,
-                            max_displacement: r.max_displacement,
-                        }
-                    }
-                })
-            })
-            .unwrap()
-    }
-
     #[test]
     fn all_brushes_methods_filters_and_symmetry_match_whole_mesh_bit_for_bit() {
         use fast_mesh_ops::sculpt::{
@@ -1137,11 +1078,11 @@ mod tests {
                     ..Default::default()
                 });
                 let r_pre_a = sa.dab(ia, &pre).unwrap();
-                let r_pre_b = apply_whole_dab(&mut sb, ib, &pre);
+                let r_pre_b = whole(&mut sb, ib, &pre);
                 assert_eq!(r_pre_a, r_pre_b, "pre-dab {mode:?} case {idx}");
 
                 let ra = sa.dab(ia, dab).unwrap();
-                let rb = apply_whole_dab(&mut sb, ib, dab);
+                let rb = whole(&mut sb, ib, dab);
                 assert_eq!(ra, rb, "{mode:?} case {idx}: {dab:?}");
                 assert_eq!(bits(&sa, ia), bits(&sb, ib), "{mode:?} case {idx}: {dab:?}");
             }
@@ -1473,6 +1414,133 @@ mod tests {
             assert!(s.dab(id, &pull).unwrap().moved > 0);
             s.compact(id).unwrap();
             assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+        }
+    }
+
+    #[test]
+    fn external_position_only_edit_mid_stroke_invalidates_stroke_for_grab_and_inflate() {
+        use fast_mesh_ops::sculpt::InflateMethod;
+
+        let find_vertex = |scene: &Scene, id: MeshId, tx: f32, ty: f32| -> u32 {
+            scene
+                .mesh(id)
+                .unwrap()
+                .positions()
+                .iter()
+                .position(|p| (p[0] - tx).abs() < 1e-4 && (p[1] - ty).abs() < 1e-4)
+                .unwrap() as u32
+        };
+
+        // 1. Grab (`from_stroke: true`): external position-only `scene.edit` mid-stroke
+        //    must invalidate `entry.stroke` so a zero-direction probe does not snap back.
+        {
+            let mut s = Scene::new(SceneOptions::default());
+            let id = s
+                .add_mesh(symmetric_terrain(5), MeshOptions::default())
+                .unwrap();
+            let v_center = find_vertex(&s, id, 0.0, 0.0);
+
+            s.capture_stroke_state(id, false).unwrap();
+            let pull = Dab::Grab(GrabOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 2.0,
+                    falloff: Falloff::Smooth,
+                    strength: 0.6,
+                },
+                direction: [0.0, 0.0, 1.0],
+                from_stroke: true,
+                ..Default::default()
+            });
+            assert!(s.dab(id, &pull).unwrap().moved > 0);
+
+            // External position-only edit mid-stroke: no topology changes, only `vertices_moved`.
+            let p_before = s.mesh(id).unwrap().positions()[v_center as usize];
+            s.edit(id, |tx| {
+                tx.set_positions(&[v_center], &[[p_before[0], p_before[1], p_before[2] + 0.5]])
+            })
+            .unwrap();
+
+            let zero_snap_probe = Dab::Grab(GrabOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 2.0,
+                    falloff: Falloff::Smooth,
+                    strength: 0.6,
+                },
+                direction: [0.0, 0.0, 0.0],
+                from_stroke: true,
+                ..Default::default()
+            });
+            assert_eq!(
+                s.dab(id, &zero_snap_probe).unwrap(),
+                DabReport::default(),
+                "position-only scene.edit must invalidate stroke snapshot for grab(from_stroke: true)"
+            );
+        }
+
+        // 2. Inflate (`InflateMethod::StrokeNormal`): external position-only `scene.edit`
+        //    mid-stroke must invalidate `entry.stroke` so inflate falls back to post-edit
+        //    smooth normals rather than stale pre-edit stroke normals.
+        {
+            let inflate_dab = Dab::Inflate(InflateOptions {
+                brush: Brush {
+                    center: [0.0, 0.0, 0.0],
+                    radius: 2.0,
+                    falloff: Falloff::Smooth,
+                    strength: 0.25,
+                },
+                method: InflateMethod::StrokeNormal,
+                ..Default::default()
+            });
+
+            // `s`: capture stroke -> run an inflate dab so `entry.stroke.rest_normal` is lazily
+            // populated with pre-edit normals -> external position-only `scene.edit` lifts
+            // neighbor `(0.5, 0.0)` strongly upward -> next `inflate(StrokeNormal)` must match
+            // a fresh scene (with the same pre-dab + edit and NO active stroke) bit-for-bit.
+            let mut s = Scene::new(SceneOptions::default());
+            let id = s
+                .add_mesh(symmetric_terrain(5), MeshOptions::default())
+                .unwrap();
+            let v_center = find_vertex(&s, id, 0.0, 0.0);
+            let v_right = find_vertex(&s, id, 0.5, 0.0);
+
+            s.capture_stroke_state(id, false).unwrap();
+            assert!(s.dab(id, &inflate_dab).unwrap().moved > 0);
+            let p_right = s.mesh(id).unwrap().positions()[v_right as usize];
+            s.edit(id, |tx| {
+                tx.set_positions(&[v_right], &[[p_right[0], p_right[1], 12.0]])
+            })
+            .unwrap();
+
+            let mut fresh = Scene::new(SceneOptions::default());
+            let fresh_id = fresh
+                .add_mesh(symmetric_terrain(5), MeshOptions::default())
+                .unwrap();
+            assert!(fresh.dab(fresh_id, &inflate_dab).unwrap().moved > 0);
+            fresh
+                .edit(fresh_id, |tx| {
+                    tx.set_positions(&[v_right], &[[p_right[0], p_right[1], 12.0]])
+                })
+                .unwrap();
+            assert_eq!(bits(&s, id), bits(&fresh, fresh_id));
+
+            let before_center = s.mesh(id).unwrap().positions()[v_center as usize];
+            let rs = s.dab(id, &inflate_dab).unwrap();
+            let rf = fresh.dab(fresh_id, &inflate_dab).unwrap();
+            assert_eq!(rs, rf);
+            assert_eq!(
+                bits(&s, id),
+                bits(&fresh, fresh_id),
+                "position-only scene.edit must invalidate stroke normals so inflate matches fresh smooth normals"
+            );
+            let after_center = s.mesh(id).unwrap().positions()[v_center as usize];
+            let post_edit_dx = after_center[0] - before_center[0];
+            let post_edit_dz = after_center[2] - before_center[2];
+            assert!(
+                post_edit_dx.abs() > post_edit_dz.abs() * 2.0,
+                "post-edit normal must reflect steep tilt from v_right=12.0 (dx={post_edit_dx}, dz={post_edit_dz})"
+            );
         }
     }
 

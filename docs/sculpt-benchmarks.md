@@ -115,13 +115,13 @@ Command: `node scripts/sculpt-frames.mjs --tris 100000,1000000 --tools inflate,g
 | `worker` | 99,852 | `inflate` | 6.1 | 6.1 | 6.2 | 0.0 | 587 dabs in 1922 ms |
 | `worker` | 99,852 | `grab` | 6.1 | 6.1 | 6.2 | 0.0 | 108 dabs in 1925 ms |
 | `sync` (`?local`) | 999,996 | `inflate` | 6.1 | 6.1 | 12.1 | 0.0 | 639 dabs in 1921 ms |
-| `sync` (`?local`) | 999,996 | `grab` | 6.1 | 97.0 | 127.2 | 125.0 | 160 dabs in 12162 ms |
+| `sync` (`?local`) | 999,996 | `grab` | 7.0 | 97.2 | 132.0 | 125.0 | 164 dabs in 12308 ms |
 | `worker` | 999,996 | `inflate` | 6.1 | 6.1 | 6.2 | 0.0 | 621 dabs in 1929 ms |
-| `worker` | 999,996 | `grab` | 6.1 | 30.3 | 42.4 | 0.0 | 94 dabs in 2185 ms |
+| `worker` | 999,996 | `grab` | 6.9 | 7.0 | 7.0 | 0.0 | 111 dabs in 1926 ms |
 
 Notes on `999,996`-triangle `grab` in `sculpt-frames.mjs`:
 - A `60 px`-radius circle (`120 px` diameter) across the framed radius-`2` sphere corresponds to a `~1.2`-unit tangential displacement (`12×` the `0.1` brush radius). Fold-safe `adaptive_reach` (`GRAB_MAX_STRETCH = 0.8`) widens the influence radius past `~1.4` units and moves `~122k+` vertices (`~25%` of the 500k-vertex mesh) per dab.
-- On `worker`, heavy Wasm work runs off the main thread (`p95 = 30.3 ms < 33 ms`, `longTask = 0.0 ms < 50 ms`). On `sync` (`?local`), running those `~122k`-vertex edits + BVH updates on the main thread reaches `p95 = 97.0 ms` (`125.0 ms` max task).
+- On `worker`, heavy Wasm work AND local bounds calculation (`WorkerScene.bounds`) run off the main thread (`p95 = 7.0 ms`, `max = 7.0 ms`, `longTask = 0.0 ms` — eliminating the previous `30.3 ms` p95 / `42.4 ms` max `SETTLE_BOUNDS_MS` `computeBounds()` JS triangle walk). On `sync` (`?local`), running those `~122k`-vertex edits + BVH updates on the main thread reaches `p95 = 97.2 ms` (`125.0 ms` max task).
 
 ### 2. 1M Mask Paint & Masked Live-Split Strokes (`999,996` Triangles)
 
@@ -134,10 +134,11 @@ Measured in Chrome CDP (`PerformanceObserver` `longtask` + `requestAnimationFram
 | `sync` (`?local`) | `mask+live+inflate` (`r = 0.25`) | 6.1 | 6.1 | 60.6 | 67.0 | `144` dabs (`128` masked drops), `2` live passes (`+0` verts); one-off main-thread incidence index build on first sculpt dab |
 | `worker` | `mask+live+inflate` (`r = 0.25`) | 6.1 | 6.1 | 48.5 | 56.0 | `123` dabs (`111` masked drops), `2` live passes (`+0` verts) |
 | `sync` (`?local`) | `mask+live+grab` (`55 px`, `r = 0.15`) | 6.1 | 12.2 | 1733.7 | 1707.0 | `62` dabs (`52` masked drops), `3` live passes (`+186` verts); single-threaded Wasm BVH rebuild after split triggers max spike |
-| `worker` | `mask+live+grab` (`55 px`, `r = 0.15`) | 6.1 | 6.1 | 84.9 | 89.0 | `72` dabs (`56` masked drops), `2` live passes (`+179` verts); main-thread `three/mesh.ts:computeBounds` on `indices` growth |
-| `worker` | `mask+live+grab` (`120 px`, `r = 0.25`) | 6.1 | 6.1 | 103.1 | 107.0 | `66` dabs (`20` masked drops), `3` live passes (`+2,025` verts); capped per pass instead of spiraling unboundedly |
+| `worker` | `mask+live+grab` (`55 px`, `r = 0.15`) | 6.9 | 7.0 | 20.8 | 0.0 | `80` dabs (`67` masked drops), `2` live passes (`+216` verts); `WorkerScene.bounds` eliminates `computeBounds` JS index walk |
+| `worker` | `mask+live+grab` (`120 px`, `r = 0.25`) | 6.9 | 7.0 | 27.8 | 0.0 | `79` dabs (`30` masked drops), `4` live passes (`+6,000` verts); capped per pass with off-thread bounds (`0.0 ms` long task) |
 
 Key Showcase #197 fixes:
 - **Mask Painting (`<FastMesh onClick>` + `verticesInSphere`):** Suppressing Three.js's per-triangle pointer click handler while `maskPaint` is armed eliminated the `105–106 ms` main-thread raycast stall on both Sync and Worker (`maskPaint` dropped to `p95 = 6.1 ms`, `longTask = 0.0 ms`).
 - **Shared `MaskLiveTracker` & O(|mask|) Protection:** Sharing one `MaskLiveTracker` across `MaskLayer` and `SculptLayer` preserves `verticesInSphere` live trust across stroke handoff and `adoptSplits` without `O(triangles)` `buildMaskLiveCache` rescans on Dab 1; `protectMaskedDab` emits localized `protect.band` ops in `O(|masked|)`.
-- **Bounded 1M Live Splits:** Updating the live cooldown timer on `splitStretched` completion and capping passes above `100k` triangles at `LIVE_HUGE_MAX_SPLITS = 2,000` prevents Sync 1M grab strokes from spiraling into `+922k`-vertex cascades. Remaining spikes during 1M topology-changing live splits occur in Worker `three/mesh.ts:computeBounds()` (`72–107 ms`) or Sync main-thread Wasm BVH rebuilds (`~1.5–1.9 s` when splits/large grabs cross BVH rebuild thresholds).
+- **Worker-Computed Mesh Bounds (`MeshChangeWire.bounds` + `WorkerScene.bounds`):** Computing `Scene.bounds` inside the Worker on geometry changes and forwarding it on `MeshChangeWire` lets `bindMesh` skip `three/mesh.ts`'s `O(triangles)` JS index scan — cutting 1M `worker` `grab` max frames from `42.4 ms` to `7.0 ms` and 1M `worker mask+live+grab` max frames from `84.9–103.1 ms` (`89–107 ms` long tasks) down to `20.8–27.8 ms` (`0.0 ms` long tasks).
+- **Bounded 1M Live Splits:** Updating the live cooldown timer on `splitStretched` completion and capping passes above `100k` triangles at `LIVE_HUGE_MAX_SPLITS = 2,000` prevents Sync 1M grab strokes from spiraling into `+922k`-vertex cascades; remaining multi-hundred-ms spikes on 1M topology-changing live splits occur only on Sync main-thread Wasm BVH rebuilds (`~1.5–1.9 s`).

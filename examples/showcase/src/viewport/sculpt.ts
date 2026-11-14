@@ -327,6 +327,47 @@ export function reflectCenters(
   return out;
 }
 
+export interface RegionSphere {
+  center: [number, number, number];
+  radius: number;
+}
+
+/**
+ * Expands a stroke bounding sphere across active symmetry planes so live
+ * `splitStretched` and stroke-end `remesh` cover each mirrored lobe locally.
+ */
+export function strokeRegionSpheres(
+  bounds: { center: readonly [number, number, number]; radius: number },
+  symmetry?: SculptSymmetrySettings,
+): RegionSphere[] {
+  return reflectCenters(bounds.center, toSymmetry(symmetry)).map((center) => ({
+    center,
+    radius: bounds.radius,
+  }));
+}
+
+/**
+ * Builds stroke-end `remesh` ops for every active symmetry lobe whose sphere
+ * does not meet the mask (`meetsMask(sphere) === false`).
+ */
+export function symmetricRemeshOps(
+  bounds: { center: readonly [number, number, number]; radius: number },
+  symmetry: SculptSymmetrySettings | undefined,
+  meetsMask: (sphere: RegionSphere) => boolean,
+  maxRounds: number,
+  targetLength?: number,
+): Extract<RepairOp, { op: "remesh" }>[] {
+  return strokeRegionSpheres(bounds, symmetry)
+    .filter((sp) => !meetsMask(sp))
+    .map((sp) => ({
+      op: "remesh" as const,
+      center: sp.center,
+      radius: sp.radius,
+      maxRounds,
+      targetLength,
+    }));
+}
+
 /**
  * Maps an armed `SculptBrush` (including algorithm, filter, symmetry, and optional
  * stroke tangent) to the exact `RepairOp` / `SculptOp` payload for one dab.
@@ -1238,7 +1279,7 @@ export class SculptStroke {
     try {
       settled = Promise.resolve(run()).then(
         () => {
-          if (!pass || this.#begun) {
+          if (!pass) {
             this.#landed = true;
           }
         },
