@@ -46,6 +46,8 @@ export interface StlExportOptions extends ExportOptions {
 export interface ObjExportOptions extends ExportOptions {
   /** The `o` object name. Defaults to `"mesh"`. */
   name?: string;
+  /** Append `r g b` 0..1 vertex colors on `v` lines when present. Defaults to `true`. */
+  vertexColors?: boolean;
 }
 
 /** Options of {@link exportPLY}. */
@@ -361,9 +363,10 @@ export function exportOBJ(scene: SceneLike, mesh: MeshHandle, options?: ObjExpor
   const snap = snapshot(scene, mesh, options);
   const name = options?.name ?? "mesh";
   const vertices = snap.positions.length / 3;
+  const useColors = snap.colors !== null && options?.vertexColors !== false;
   const parts: string[] = [`o ${name}\n`];
   for (let v = 0; v < vertices; v++) {
-    if (snap.colors !== null) {
+    if (useColors && snap.colors !== null) {
       const r = (snap.colors[4 * v] / 255).toPrecision(8);
       const g = (snap.colors[4 * v + 1] / 255).toPrecision(8);
       const b = (snap.colors[4 * v + 2] / 255).toPrecision(8);
@@ -398,6 +401,7 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
   const vertices = snap.positions.length / 3;
   const useNormals = snap.normals !== null;
   const useColors = snap.colors !== null;
+  const useUvs = snap.uvs !== null;
   const header = [
     "ply",
     `format ${options?.binary === false ? "ascii 1.0" : "binary_little_endian 1.0"}`,
@@ -407,6 +411,7 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
     "property float z",
     ...(useNormals ? ["property float nx", "property float ny", "property float nz"] : []),
     ...(useColors ? ["property uchar red", "property uchar green", "property uchar blue", "property uchar alpha"] : []),
+    ...(useUvs ? ["property float s", "property float t"] : []),
     `element face ${snap.triangles}`,
     "property list uchar uint vertex_indices",
     "end_header",
@@ -422,6 +427,9 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
       if (useColors) {
         line += ` ${snap.colors?.[4 * v]} ${snap.colors?.[4 * v + 1]} ${snap.colors?.[4 * v + 2]} ${snap.colors?.[4 * v + 3]}`;
       }
+      if (useUvs) {
+        line += ` ${(snap.uvs as Float32Array)[2 * v]} ${(snap.uvs as Float32Array)[2 * v + 1]}`;
+      }
       parts.push(`${line}\n`);
     }
     for (let t = 0; t < snap.triangles; t++) {
@@ -430,7 +438,7 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
     return new TextEncoder().encode(parts.join(""));
   }
   const head = new TextEncoder().encode(header);
-  const floatsPerVertex = 3 + (useNormals ? 3 : 0);
+  const floatsPerVertex = 3 + (useNormals ? 3 : 0) + (useUvs ? 2 : 0);
   const body = new Uint8Array(vertices * (4 * floatsPerVertex + (useColors ? 4 : 0)) + snap.triangles * 13);
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
   let at = 0;
@@ -451,6 +459,11 @@ export function exportPLY(scene: SceneLike, mesh: MeshHandle, options?: PlyExpor
       body[at + 2] = snap.colors?.[4 * v + 2] ?? 0;
       body[at + 3] = snap.colors?.[4 * v + 3] ?? 0;
       at += 4;
+    }
+    if (useUvs) {
+      view.setFloat32(at, (snap.uvs as Float32Array)[2 * v], true);
+      view.setFloat32(at + 4, (snap.uvs as Float32Array)[2 * v + 1], true);
+      at += 8;
     }
   }
   for (let t = 0; t < snap.triangles; t++) {
@@ -1179,6 +1192,8 @@ export interface ImportedMesh {
    * count or accessor type, non-finite values) throw instead.
    */
   uvsSkipped?: string;
+  /** Optional vertex normals (3 floats per vertex), when supplied by the format (e.g. PLY, OBJ). */
+  normals?: Float32Array | null;
 }
 
 /**
@@ -2370,3 +2385,44 @@ function readColors(
   }
   return out;
 }
+
+export {
+  crc32,
+  readZip,
+  writeZip,
+  writeZipSync,
+  validateZipEntryName,
+  DEFAULT_MAX_ZIP_FILE_BYTES,
+  DEFAULT_MAX_ZIP_ENTRIES,
+  type ZipEntryInput,
+  type ZipReadOptions,
+  type ZipWriteOptions,
+  type ZipEntry,
+} from "./zip.js";
+
+export {
+  import3MF,
+  export3MF,
+  export3MFSync,
+  type ThreeMfExportOptions,
+  type ThreeMfImportOptions,
+  type ThreeMfUnit,
+} from "./threemf.js";
+
+export { importPLY, type PlyImportOptions } from "./ply.js";
+
+export { importSTL, type StlImportOptions } from "./stl.js";
+
+export { importOBJ, type ObjImportOptions } from "./obj.js";
+
+export {
+  parseMeshStream,
+  loadMeshStream,
+  detectMeshFormat,
+  type MeshFileFormat,
+  type ImportOptions,
+  type IoProgress,
+  type MeshStreamSource,
+  type MeshLoadTarget,
+} from "./stream.js";
+

@@ -26,7 +26,15 @@ async function isDicomFile(file: File): Promise<boolean> {
   if (ext === ".dcm" || ext === ".dicom") {
     return true;
   }
-  if (ext === ".stl" || ext === ".obj" || ext === ".ply" || ext === ".gltf" || ext === ".glb" || ext === ".drc") {
+  if (
+    ext === ".stl" ||
+    ext === ".obj" ||
+    ext === ".ply" ||
+    ext === ".3mf" ||
+    ext === ".gltf" ||
+    ext === ".glb" ||
+    ext === ".drc"
+  ) {
     return false;
   }
   try {

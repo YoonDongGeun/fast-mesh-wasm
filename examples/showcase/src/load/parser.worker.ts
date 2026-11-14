@@ -63,6 +63,7 @@ const volumes = new Map<string, { values: Float32Array; pseudoHu: boolean; meta:
  * for jobs it already settled, so either side may win the race.
  */
 const cancelled = new Set<number>();
+const activeAborts = new Map<number, AbortController>();
 
 function isCancelled(id: number): boolean {
   if (cancelled.has(id)) {
@@ -78,6 +79,68 @@ function postCancelled(id: number): void {
 
 function progress(id: number, phase: "reading" | "parsing" | "decimating", fraction: number): void {
   post({ kind: "progress", id, phase, fraction });
+}
+
+async function readFileStreaming(
+  id: number,
+  file: File,
+  signal: AbortSignal,
+): Promise<ArrayBuffer> {
+  if (typeof file.stream !== "function") {
+    const buf = await file.arrayBuffer();
+    progress(id, "reading", 0.15);
+    return buf;
+  }
+  const reader = file.stream().getReader();
+  const total = file.size;
+  const chunks: Uint8Array[] = [];
+  let bytesRead = 0;
+  let lastProgressAt = -Infinity;
+
+  const onAbort = () => {
+    chunks.length = 0;
+    void reader.cancel(signal.reason).catch(() => {});
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    progress(id, "reading", 0.02);
+    while (true) {
+      if (signal.aborted) {
+        throw new DOMException("cancelled", "AbortError");
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (signal.aborted) {
+        throw new DOMException("cancelled", "AbortError");
+      }
+      if (value && value.byteLength > 0) {
+        bytesRead += value.byteLength;
+        chunks.push(new Uint8Array(value));
+        const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (now - lastProgressAt >= 16) {
+          lastProgressAt = now;
+          const frac = total > 0 ? Math.min(1, bytesRead / total) : 0.5;
+          progress(id, "reading", 0.02 + 0.3 * frac);
+        }
+      }
+    }
+    progress(id, "reading", 0.32);
+    const out = new Uint8Array(bytesRead);
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      out.set(chunks[i], offset);
+      offset += chunks[i].byteLength;
+    }
+    chunks.length = 0;
+    return out.buffer;
+  } catch (err) {
+    chunks.length = 0;
+    await reader.cancel(err).catch(() => {});
+    throw err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 async function maybeDecimate(
@@ -174,8 +237,11 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
   }
   if (req.kind === "cancel") {
     cancelled.add(req.id);
+    activeAborts.get(req.id)?.abort();
     return;
   }
+  const abortCtrl = new AbortController();
+  activeAborts.set(req.id, abortCtrl);
   try {
     if (req.kind === "demo") {
       progress(req.id, "parsing", 0.2);
@@ -264,8 +330,7 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
       return;
     }
     const importScale = req.importScale ?? NO_IMPORT_SCALE;
-    const buffer = await req.file.arrayBuffer();
-    progress(req.id, "reading", 0.15);
+    const buffer = await readFileStreaming(req.id, req.file, abortCtrl.signal);
     if (isCancelled(req.id)) {
       postCancelled(req.id);
       return;
@@ -296,7 +361,13 @@ self.onmessage = async (event: MessageEvent<LoaderRequest>) => {
     });
     await postMeshes(req.id, meshes, req.decimate);
   } catch (error) {
-    post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });
+    if (isCancelled(req.id) || abortCtrl.signal.aborted) {
+      postCancelled(req.id);
+    } else {
+      post({ kind: "error", id: req.id, message: error instanceof Error ? error.message : String(error) });
+    }
+  } finally {
+    activeAborts.delete(req.id);
   }
 };
 
