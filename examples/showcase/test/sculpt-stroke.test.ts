@@ -4,8 +4,8 @@
 // sync scene, and a remesh in the middle of a grab keeps it continuous.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { maskEdgeField } from "../src/viewport/mask-protect";
-import { GRAB_MAX_STRETCH, GrabRegion, SculptStroke, sculptBrush, type SculptBrush } from "../src/viewport/sculpt";
+import { inheritedSplits, MASK_SOFT_BAND, maskEdgeField, protectMaskedDab } from "../src/viewport/mask-protect";
+import { dabOperation, GRAB_MAX_STRETCH, GrabRegion, SculptStroke, sculptBrush, unionMaskIds, type SculptBrush } from "../src/viewport/sculpt";
 
 type Vec = [number, number, number];
 
@@ -677,5 +677,102 @@ describe("a grab never folds the surface", () => {
     const [pa, pb, pf] = [read(further, a), read(further, b), read(further, fresh)];
     // Its share of the extra drag is its edge's mean, whatever the widening does.
     expect(pf[0] - at[0]).toBeCloseTo((pa[0] - landed[3 * a] + (pb[0] - landed[3 * b])) / 2, 4);
+  });
+});
+
+describe("engine-driven Grab + masked dabs + live splits (#177, #192, #197)", () => {
+  it("preserves_masked_and_inherited_split_vertices_and_undoes_in_one_Ctrl_Z_step_on_sync_scene", async () => {
+    const s = setup();
+    const v = s.scene.views(s.mesh);
+    s.scene.repair(s.mesh, { op: "captureRestSizes", onlyIfMissing: true });
+
+    // Paint mask via engine BVH verticesInSphere near [R, 0.25, 0.25]
+    let masked = s.scene.verticesInSphere(s.mesh, [R, 0.25, 0.25], 0.35);
+    expect(masked.length).toBeGreaterThan(5);
+    let inherited = new Set<number>();
+
+    const before = Float32Array.from(v.positions());
+    const press: Vec = [R, 0, 0];
+    const radius = 0.6;
+    const stroke = new SculptStroke(
+      sculptBrush("grab", s.mesh, radius, 1, "smooth"),
+      {
+        beginStep: () => s.scene.beginStep(),
+        endStep: () => s.scene.endStep(),
+        cancelStep: () => s.scene.cancelStep(),
+      },
+      () => Promise.resolve(),
+    );
+
+    // Press queues captureStrokeState in-order before moves, without opening an undo step on its own.
+    void stroke.pass(() => {
+      s.scene.repair(s.mesh, { op: "captureStrokeState", onlyIfMissing: false });
+      return Promise.resolve();
+    });
+
+    const moveGrab = (drag: Vec) =>
+      stroke.move(
+        () => {
+          const curPos = v.positions();
+          const live = new Uint8Array(curPos.length / 3).fill(1);
+          const grabOp = dabOperation(
+            { ...sculptBrush("grab", s.mesh, radius, 1, "smooth"), direction: drag },
+            press,
+          );
+          const heldOp = protectMaskedDab(grabOp, masked, curPos, live, inherited);
+          s.scene.repair(s.mesh, heldOp);
+          return Promise.resolve();
+        },
+        [press[0] + drag[0], press[1] + drag[1], press[2] + drag[2]],
+      );
+
+    moveGrab([0.6, 0, 0]);
+    await stroke.pass(() => {
+      const rep = s.scene.repair(s.mesh, { op: "splitStretched", center: [R + 0.3, 0, 0], radius: 2 });
+      const set = new Set(masked);
+      const fresh = inheritedSplits((id) => set.has(id), rep.vertices);
+      if (fresh.length > 0) {
+        masked = unionMaskIds(masked, Uint32Array.from(fresh).sort((a, b) => a - b));
+        inherited = new Set([...inherited, ...fresh]);
+      }
+      return Promise.resolve();
+    });
+    const afterSplitPos = Float32Array.from(v.positions());
+    const splitSlots = afterSplitPos.length / 3;
+    expect(splitSlots).toBeGreaterThan(before.length / 3);
+
+    moveGrab([1.2, 0.2, 0]);
+    stroke.end();
+    await stroke.done;
+
+    const finalPos = v.positions();
+    expect(maxDifference(finalPos.subarray(0, before.length), before)).toBeGreaterThan(0.8);
+
+    // Every original masked vertex stayed byte-identical throughout the grab + live split.
+    const wasBytes = new Uint8Array(before.buffer);
+    const nowBytes = new Uint8Array(finalPos.buffer, finalPos.byteOffset, finalPos.byteLength);
+    for (const id of masked) {
+      if (3 * id < before.length) {
+        for (let b = 12 * id; b < 12 * id + 12; b++) {
+          expect(nowBytes[b]).toBe(wasBytes[b]);
+        }
+      } else {
+        // Inherited split midpoint stayed byte-identical after its split created it.
+        for (let c = 0; c < 3; c++) {
+          expect(finalPos[3 * id + c]).toBe(afterSplitPos[3 * id + c]);
+        }
+      }
+    }
+
+    // Band parameter check
+    expect(MASK_SOFT_BAND).toBeGreaterThan(0);
+
+    // Single Ctrl+Z undoes the entire grab stroke + live splits back to original mesh!
+    expect(s.scene.canUndo()).toBe(true);
+    s.scene.undo();
+    expect(s.scene.vertexCount(s.mesh)).toBe(before.length / 3);
+    expect(v.positions().length).toBeGreaterThanOrEqual(before.length);
+    expect(maxDifference(v.positions().subarray(0, before.length), before)).toBe(0);
+    expect(s.scene.canUndo()).toBe(false);
   });
 });

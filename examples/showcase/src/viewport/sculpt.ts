@@ -1,46 +1,161 @@
 // The sculpt stroke: what one dab applies, and one press-and-hold stroke
 // over the meshes (the viewport's ring and pointer loop drive it).
-import type { FastMeshErrorCode, MeshHandle, RepairOp } from "fast-mesh-wasm";
+import type {
+  FastMeshErrorCode,
+  GrabMethod,
+  InflateMethod,
+  MeshHandle,
+  RepairOp,
+  SmoothMethod,
+  SurfaceFilter,
+  Symmetry,
+  TwistMethod,
+} from "fast-mesh-wasm";
+import type {
+  SculptFilterKind,
+  SculptFilterSettings,
+  SculptMethods,
+  SculptSymmetrySettings,
+} from "../panels/settings";
 import type { MaskField } from "./mask-protect";
+
+export type SculptOpName = "inflate" | "smooth" | "relax" | "grab" | "flatten" | "crease" | "clay" | "twist";
+
+/** The toolbox's brush picker (the viewport paints its strokes). */
+export type SculptTool =
+  | "inflate"
+  | "deflate"
+  | "smooth"
+  | "grab"
+  | "flatten"
+  | "scrape"
+  | "fill"
+  | "crease"
+  | "pinch"
+  | "clay"
+  | "clayStrips"
+  | "twist";
 
 /** A sculpt brush armed on a mesh (app-state `sculpt`). */
 export interface SculptBrush {
   mesh: MeshHandle;
-  op: "inflate" | "relax" | "grab";
+  tool?: SculptTool;
+  op: SculptOpName;
   radius: number;
   strength: number;
   falloff: "linear" | "smooth";
   cycles: number;
   /** The grab drag vector in local coordinates (the grab tool only). */
   direction: [number, number, number];
+  methods?: SculptMethods;
+  grabPoisson?: number;
+  filter?: SculptFilterSettings;
+  symmetry?: SculptSymmetrySettings;
 }
 
-/** The toolbox's brush picker (the viewport paints its strokes). */
-export type SculptTool = "inflate" | "deflate" | "smooth" | "grab";
+const DEFAULT_SCULPT_METHODS: SculptMethods = {
+  inflate: "vertexNormal",
+  smooth: "laplacian",
+  grab: "sphere",
+  twist: "vortex",
+};
+
+export interface MethodOption<M extends string> {
+  value: M;
+  label: string;
+  description: string;
+}
+
+export const INFLATE_METHOD_OPTIONS: readonly MethodOption<InflateMethod>[] = [
+  { value: "vertexNormal", label: "Vertex normal", description: "Displace each vertex along its live smooth normal" },
+  { value: "averageNormal", label: "Average normal", description: "Push uniformly along the brush's falloff-weighted normal" },
+  { value: "strokeNormal", label: "Stroke normal", description: "Follow frozen pre-stroke normals to prevent folding" },
+];
+
+export const SMOOTH_METHOD_OPTIONS: readonly MethodOption<SmoothMethod>[] = [
+  { value: "laplacian", label: "Laplacian", description: "Fast uniform umbrella relaxation that melts bumps quickly" },
+  { value: "taubin", label: "Taubin", description: "Two-step λ/μ low-pass filter that preserves volume" },
+  { value: "hcLaplacian", label: "HC-Laplacian", description: "Humphrey-class pushback toward original form" },
+  { value: "cotangent", label: "Cotangent", description: "Mean-curvature cotangent weights independent of triangulation" },
+];
+
+export const GRAB_METHOD_OPTIONS: readonly MethodOption<GrabMethod>[] = [
+  { value: "sphere", label: "Sphere", description: "Euclidean brush sphere with fold-safe adaptive reach" },
+  { value: "geodesic", label: "Geodesic", description: "Surface-connected geodesic distance that respects gaps" },
+  { value: "kelvinlet", label: "Kelvinlet", description: "Regularized elastic Green's function deformation" },
+];
+
+export const TWIST_METHOD_OPTIONS: readonly MethodOption<TwistMethod>[] = [
+  { value: "vortex", label: "Vortex", description: "Rigid falloff-weighted Rodrigues rotation around brush normal" },
+  { value: "kelvinlet", label: "Kelvinlet", description: "Elastic rotational Kelvinlet swirl with smooth shear" },
+];
+
+export const FILTER_KIND_OPTIONS: readonly MethodOption<SculptFilterKind>[] = [
+  { value: "none", label: "None", description: "Affect all surface features inside the brush" },
+  { value: "peaksOnly", label: "Peaks only", description: "Mask brush to convex ridges and outward bumps" },
+  { value: "valleysOnly", label: "Valleys only", description: "Mask brush to concave grooves and cavities" },
+  { value: "normalAngle", label: "Normal angle", description: "Restrict brush to faces within a normal cone" },
+];
 
 /**
  * The repair op a tool paints (deflate is inflate with a flipped strength;
- * smooth paints plain-Laplacian relax: Taubin λ/μ converges too slowly to
- * melt under a brush).
+ * scrape/fill are flatten peak/valley modes; pinch is zero-normal crease).
  */
-export function sculptOpForTool(tool: SculptTool): "inflate" | "relax" | "grab" {
-  if (tool === "smooth") {
-    return "relax";
+export function sculptOpForTool(
+  tool: SculptTool,
+): "inflate" | "smooth" | "grab" | "flatten" | "crease" | "clay" | "twist" {
+  switch (tool) {
+    case "inflate":
+    case "deflate":
+      return "inflate";
+    case "smooth":
+      return "smooth";
+    case "grab":
+      return "grab";
+    case "flatten":
+    case "scrape":
+    case "fill":
+      return "flatten";
+    case "crease":
+    case "pinch":
+      return "crease";
+    case "clay":
+    case "clayStrips":
+      return "clay";
+    case "twist":
+      return "twist";
   }
-  return tool === "grab" ? "grab" : "inflate";
 }
 
 /**
  * Each tool's starting strength (grab at 1 follows the pointer exactly).
- * Inflate's is the height of one dab over the brush radius (see `dabOp`), so
- * a stroke looks the same at any model size. It stays small: dabs overlap
- * heavily along a sweep, so a tenth of the radius per dab already builds a
- * visible bump without folding.
+ * Inflate's is the height of one dab over the brush radius (see `dabOperation`),
+ * so a stroke looks the same at any model size.
  */
-export const DEFAULT_STRENGTHS: Record<SculptTool, number> = { inflate: 0.1, deflate: 0.1, smooth: 0.5, grab: 1 };
+export const DEFAULT_STRENGTHS: Record<SculptTool, number> = {
+  inflate: 0.1,
+  deflate: 0.1,
+  smooth: 0.5,
+  grab: 1,
+  flatten: 0.5,
+  scrape: 0.5,
+  fill: 0.5,
+  crease: 0.15,
+  pinch: 0.5,
+  clay: 0.5,
+  clayStrips: 0.5,
+  twist: 0.5,
+};
 
 /** Laplacian passes per smooth dab (each melts the full weight toward the centroid). */
 export const RELAX_PASSES = 2;
+
+export interface SculptBrushExtras {
+  methods?: SculptMethods;
+  grabPoisson?: number;
+  filter?: SculptFilterSettings;
+  symmetry?: SculptSymmetrySettings;
+}
 
 /**
  * Arms (or steers) the sculpt brush for `tool` with a dab-sized strength.
@@ -53,15 +168,21 @@ export function sculptBrush(
   radius: number,
   strength: number,
   falloff: "linear" | "smooth",
+  extras?: SculptBrushExtras,
 ): SculptBrush {
   return {
     mesh,
+    tool,
     op: sculptOpForTool(tool),
     radius,
     strength: tool === "deflate" ? -Math.abs(strength) : Math.abs(strength),
     falloff,
     cycles: RELAX_PASSES,
     direction: [0, 0, 0],
+    ...(extras?.methods !== undefined ? { methods: { ...extras.methods } } : {}),
+    ...(extras?.grabPoisson !== undefined ? { grabPoisson: extras.grabPoisson } : {}),
+    ...(extras?.filter !== undefined ? { filter: { ...extras.filter } } : {}),
+    ...(extras?.symmetry !== undefined ? { symmetry: { ...extras.symmetry } } : {}),
   };
 }
 
@@ -103,6 +224,13 @@ export const LIVE_REMESH_MIN_DABS = 4;
 export const LIVE_REMESH_MIN_MS = 150;
 /** Most interior splits one pass makes; a later pass takes the rest, longest first. */
 export const LIVE_MAX_SPLITS = 50_000;
+/** Per-pass split cap above `REMESH_TRI_LIMIT`, avoiding 50k-split cascades on 1M meshes. */
+export const LIVE_HUGE_MAX_SPLITS = 2_000;
+
+/** Max splits per live pass for `triangles` (`LIVE_MAX_SPLITS` up to 100k, capped above). */
+export function liveMaxSplits(triangles: number | null): number {
+  return triangles !== null && remeshTooBig(triangles) ? LIVE_HUGE_MAX_SPLITS : LIVE_MAX_SPLITS;
+}
 
 /**
  * Whether a live remesh pass may fire: enough new dabs since the last pass,
@@ -149,25 +277,198 @@ export function farEnough(
   return dx * dx + dy * dy + dz * dz >= spacing * spacing;
 }
 
+/** Converts persisted filter settings into an engine `SurfaceFilter` (`undefined` when `"none"`). */
+export function toSurfaceFilter(filter?: SculptFilterSettings): SurfaceFilter | undefined {
+  if (filter === undefined || filter.kind === "none") {
+    return undefined;
+  }
+  if (filter.kind === "peaksOnly" || filter.kind === "valleysOnly") {
+    return {
+      kind: filter.kind,
+      threshold: filter.threshold,
+      contrast: filter.contrast,
+    };
+  }
+  return {
+    kind: "normalAngle",
+    maxAngleDeg: filter.maxAngleDeg,
+  };
+}
+
+/** Converts persisted symmetry settings into an engine `Symmetry` (`undefined` when all off). */
+export function toSymmetry(symmetry?: SculptSymmetrySettings): Symmetry | undefined {
+  if (symmetry === undefined || (!symmetry.x && !symmetry.y && !symmetry.z)) {
+    return undefined;
+  }
+  return { x: symmetry.x, y: symmetry.y, z: symmetry.z };
+}
+
+/** Active mirror-reflected centers across local `x = 0`, `y = 0`, `z = 0` planes. */
+export function reflectCenters(
+  center: readonly [number, number, number],
+  symmetry?: Symmetry,
+): [number, number, number][] {
+  const [cx, cy, cz] = center;
+  const sx = symmetry?.x === true;
+  const sy = symmetry?.y === true;
+  const sz = symmetry?.z === true;
+  const out: [number, number, number][] = [];
+  for (let bits = 0; bits < 8; bits++) {
+    if (((bits & 1) !== 0 && !sx) || ((bits & 2) !== 0 && !sy) || ((bits & 4) !== 0 && !sz)) {
+      continue;
+    }
+    const rx = (bits & 1) !== 0 ? (cx === 0 ? 0 : -cx) : cx;
+    const ry = (bits & 2) !== 0 ? (cy === 0 ? 0 : -cy) : cy;
+    const rz = (bits & 4) !== 0 ? (cz === 0 ? 0 : -cz) : cz;
+    if (!out.some((p) => p[0] === rx && p[1] === ry && p[2] === rz)) {
+      out.push([rx, ry, rz]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Maps an armed `SculptBrush` (including algorithm, filter, symmetry, and optional
+ * stroke tangent) to the exact `RepairOp` / `SculptOp` payload for one dab.
+ */
+export function dabOperation(
+  brush: SculptBrush,
+  center: readonly [number, number, number],
+  share = 1,
+  tangent?: readonly [number, number, number],
+): RepairOp {
+  const c: [number, number, number] = [center[0], center[1], center[2]];
+  if (brush.tool === undefined) {
+    const shared = {
+      center: c,
+      radius: brush.radius,
+      falloff: brush.falloff,
+      strength: (brush.op === "inflate" ? brush.strength * brush.radius : brush.strength) * share,
+    };
+    if (brush.op === "relax") {
+      return { op: "relax", ...shared, cycles: brush.cycles };
+    }
+    if (brush.op === "grab") {
+      return { op: "grab", ...shared, direction: [...brush.direction] as [number, number, number] };
+    }
+    return { op: "inflate", ...shared };
+  }
+
+  const methods = brush.methods ?? DEFAULT_SCULPT_METHODS;
+  const filter = toSurfaceFilter(brush.filter);
+  const symmetry = toSymmetry(brush.symmetry);
+  const mods = {
+    ...(filter !== undefined ? { filter } : {}),
+    ...(symmetry !== undefined ? { symmetry } : {}),
+  };
+
+  switch (brush.tool) {
+    case "inflate":
+    case "deflate":
+      return {
+        op: "inflate",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: brush.strength * brush.radius * share,
+        method: methods.inflate,
+        ...mods,
+      };
+    case "smooth":
+      return {
+        op: "smooth",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: Math.abs(brush.strength) * share,
+        cycles: brush.cycles,
+        method: methods.smooth,
+        ...mods,
+      };
+    case "grab":
+      return {
+        op: "grab",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: brush.strength * share,
+        direction: [brush.direction[0], brush.direction[1], brush.direction[2]],
+        method: methods.grab,
+        ...(methods.grab === "kelvinlet" ? { poisson: brush.grabPoisson ?? 0.4 } : {}),
+        fromStroke: true,
+        adaptiveReach: true,
+        ...mods,
+      };
+    case "flatten":
+    case "scrape":
+    case "fill":
+      return {
+        op: "flatten",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: Math.abs(brush.strength) * share,
+        mode: brush.tool === "scrape" ? "peaks" : brush.tool === "fill" ? "valleys" : "both",
+        ...mods,
+      };
+    case "crease":
+      return {
+        op: "crease",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: -Math.abs(brush.strength) * brush.radius * share,
+        pinch: Math.min(1, 0.5 * share),
+        ...mods,
+      };
+    case "pinch":
+      return {
+        op: "crease",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: 0,
+        pinch: Math.min(1, Math.abs(brush.strength) * share),
+        ...mods,
+      };
+    case "clay":
+    case "clayStrips":
+      return {
+        op: "clay",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: Math.abs(brush.strength) * share,
+        profile: brush.tool === "clayStrips" ? "strips" : "round",
+        ...(brush.tool === "clayStrips" && tangent !== undefined
+          ? { tangent: [tangent[0], tangent[1], tangent[2]] as [number, number, number] }
+          : {}),
+        ...mods,
+      };
+    case "twist":
+      return {
+        op: "twist",
+        center: c,
+        radius: brush.radius,
+        falloff: brush.falloff,
+        strength: brush.strength * share,
+        method: methods.twist,
+        ...mods,
+      };
+  }
+}
+
 /**
  * The repair op one dab applies at `center` (local coordinates): the
- * displacement step of a painted stroke. Inflate's strength is relative to
- * the brush radius; the engine takes it in mesh units.
+ * displacement step of a painted stroke.
  */
-export function dabOp(brush: SculptBrush, center: readonly [number, number, number], share = 1): RepairOp {
-  const shared = {
-    center: [center[0], center[1], center[2]] as [number, number, number],
-    radius: brush.radius,
-    falloff: brush.falloff,
-    strength: (brush.op === "inflate" ? brush.strength * brush.radius : brush.strength) * share,
-  };
-  if (brush.op === "relax") {
-    return { op: "relax", ...shared, cycles: brush.cycles };
-  }
-  if (brush.op === "grab") {
-    return { op: "grab", ...shared, direction: [...brush.direction] as [number, number, number] };
-  }
-  return { op: "inflate", ...shared };
+export function dabOp(
+  brush: SculptBrush,
+  center: readonly [number, number, number],
+  share = 1,
+  tangent?: readonly [number, number, number],
+): RepairOp {
+  return dabOperation(brush, center, share, tangent);
 }
 
 /** The unit face normal of the triangle `(a, b, c)` over flat positions. */
@@ -247,6 +548,23 @@ export const GRAB_MAX_STRETCH = 0.8;
 
 /** The steepest slope of each falloff over the normalized distance. */
 const FALLOFF_SLOPE = { linear: 1, smooth: 1.5 } as const;
+
+/**
+ * O(1) upper bound on a fold-safe adaptive grab's influence radius (matching
+ * `grab_widest_reach` in `fast-mesh-ops`), for the cursor ring and live-split
+ * bounds without scanning mesh vertices on the main thread (#197).
+ */
+export function widestGrabReach(
+  radius: number,
+  falloff: "linear" | "smooth",
+  method: GrabMethod,
+  strength: number,
+  drag: readonly [number, number, number],
+): number {
+  const slope = method === "kelvinlet" ? 1.75 : FALLOFF_SLOPE[falloff];
+  const len = Math.abs(strength) * Math.hypot(drag[0], drag[1], drag[2]);
+  return Math.max(radius, (slope * len) / GRAB_MAX_STRETCH);
+}
 
 /**
  * What a grab stroke holds on to: where the vertices rested at the press. Each
@@ -680,6 +998,7 @@ export class SculptStroke {
   readonly #apply: (ops: readonly RepairOp[]) => Promise<unknown>;
   readonly #blocked: (at: readonly [number, number, number], radius: number) => boolean;
   #last: [number, number, number] | null = null;
+  #lastTangent: [number, number, number] | undefined = undefined;
   #min: [number, number, number] | null = null;
   #max: [number, number, number] | null = null;
   #queue: RepairOp[] = [];
@@ -742,7 +1061,7 @@ export class SculptStroke {
       if (force && this.#inFlight > 0) {
         return "busy";
       }
-      this.#stamp(brush, at, force ? share : DAB_SHARE);
+      this.#stamp(brush, at, force ? share : DAB_SHARE, force ? this.#lastTangent : undefined);
       this.#sendIfIdle();
       return "stamped";
     }
@@ -755,15 +1074,18 @@ export class SculptStroke {
       return "skipped";
     }
     if (dist > TELEPORT_RADII * brush.radius) {
+      this.#lastTangent = undefined;
       this.#stamp(brush, at, DAB_SHARE);
       this.#sendIfIdle();
       return "stamped";
     }
     const [x, y, z] = this.#last;
+    const tangent: [number, number, number] = [dx / dist, dy / dist, dz / dist];
+    this.#lastTangent = tangent;
     const steps = Math.floor(dist / spacing);
     for (let k = 1; k <= steps; k++) {
       const u = (k * spacing) / dist;
-      this.#stamp(brush, [x + dx * u, y + dy * u, z + dz * u], DAB_SHARE);
+      this.#stamp(brush, [x + dx * u, y + dy * u, z + dz * u], DAB_SHARE, tangent);
     }
     this.#sendIfIdle();
     return "stamped";
@@ -772,6 +1094,7 @@ export class SculptStroke {
   /** The pointer left the surface: the next `dab` starts over where it lands. */
   lift(): void {
     this.#last = null;
+    this.#lastTangent = undefined;
   }
 
   /**
@@ -816,7 +1139,12 @@ export class SculptStroke {
     }
   }
 
-  #stamp(brush: SculptBrush, at: [number, number, number], share: number): void {
+  #stamp(
+    brush: SculptBrush,
+    at: [number, number, number],
+    share: number,
+    tangent?: readonly [number, number, number],
+  ): void {
     this.#last = at;
     if (this.#blocked(at, brush.radius)) {
       return;
@@ -824,7 +1152,7 @@ export class SculptStroke {
     this.#open();
     this.#dabs++;
     this.#cover(at);
-    this.#queue.push(dabOp(brush, at, share));
+    this.#queue.push(dabOperation(brush, at, share, tangent));
   }
 
   /**
@@ -910,7 +1238,9 @@ export class SculptStroke {
     try {
       settled = Promise.resolve(run()).then(
         () => {
-          this.#landed = true;
+          if (!pass || this.#begun) {
+            this.#landed = true;
+          }
         },
         () => {
           // A dab rejected (the mesh was removed meanwhile): the stroke

@@ -2,7 +2,18 @@
 // Bytes on a real engine: `scripts/showcase-mask-check.mjs`.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { inheritedSplits, maskEdgeField, maskFieldCurrent, maskMeetsRemesh, protectDab } from "../src/viewport/mask-protect";
+import {
+  inheritedSplits,
+  MASK_SOFT_BAND,
+  maskEdgeField,
+  maskFieldCurrent,
+  MaskLiveTracker,
+  maskMeetsRemesh,
+  protectDab,
+  protectMaskedDab,
+  updateMaskLiveFromRanges,
+  updateMaskLiveFromSplits,
+} from "../src/viewport/mask-protect";
 import { GrabRegion, maskUsable } from "../src/viewport/sculpt";
 
 /** A strip along x: vertices at (i, 0, 0) and (i, 1, 0), `2 * (n + 1)` slots. */
@@ -310,5 +321,207 @@ describe("a stroke-end remesh near the mask", () => {
     const { positions, indices } = grid(40);
     expect(maskMeetsRemesh([0], positions, indices, [0.5, 0.5, 0], 0.2)).toBe(false);
     expect(maskMeetsRemesh([], positions, indices, [0.5, 0.5, 0], 0.2)).toBe(false);
+  });
+});
+
+describe("engine-localized protectMaskedDab and incremental maskCache (#197)", () => {
+  it("filters_only_masked_vertices_near_active_symmetry_spheres_with_soft_band", () => {
+    // Vertices at x = -4, -1, 1, 4 along x axis
+    const positions = new Float32Array([-4, 0, 0, -1, 0, 0, 1, 0, 0, 4, 0, 0]);
+    const live = new Uint8Array([1, 1, 1, 1]);
+    const masked = new Uint32Array([0, 1, 2, 3]);
+    const baseOp: RepairOp = {
+      op: "inflate",
+      center: [1.1, 0, 0],
+      radius: 0.4,
+      falloff: "smooth",
+      strength: 0.05,
+      symmetry: { x: true, y: false, z: false },
+    };
+    const decorated = protectMaskedDab(baseOp, masked, positions, live) as Extract<RepairOp, { op: "inflate" }>;
+    expect(decorated.protect).toBeDefined();
+    // Both +1 and reflected -1 are within (0.4 + 0.1) * 1.25 = 0.625 of [1.1,0,0] / [-1.1,0,0]; +/-4 are excluded.
+    expect(Array.from(decorated.protect?.vertices ?? [])).toEqual([1, 2]);
+    expect(Array.from(decorated.protect?.weights ?? [])).toEqual([0, 0]);
+    expect(decorated.protect?.band).toBeCloseTo(0.4 * MASK_SOFT_BAND, 6);
+
+    // Dead inherited split vertex is excluded so check_protection never rejects after undo.
+    const liveAfterUndo = new Uint8Array([1, 0, 1, 1]);
+    const afterUndo = protectMaskedDab(baseOp, masked, positions, liveAfterUndo, new Set([1])) as Extract<
+      RepairOp,
+      { op: "inflate" }
+    >;
+    expect(Array.from(afterUndo.protect?.vertices ?? [])).toEqual([2]);
+  });
+
+  it("updates_mask_live_incrementally_on_ranges_and_splits_and_invalidates_on_removal", () => {
+    const live = new Uint8Array([1, 1, 1, 0]);
+    const indices = new Uint32Array([0, 1, 2, 1, 2, 3, 2, 3, 4]);
+    const grown = updateMaskLiveFromRanges({ slots: 4, live }, indices, 5, [[1, 2]]);
+    expect(grown).not.toBeNull();
+    expect(grown?.slots).toBe(5);
+    expect(Array.from(grown?.live ?? [])).toEqual([1, 1, 1, 1, 1]);
+
+    // A removed triangle (0, 0, 0) in a dirty range invalidates the cache.
+    const withDead = new Uint32Array([0, 1, 2, 0, 0, 0, 2, 3, 4]);
+    expect(updateMaskLiveFromRanges(grown!, withDead, 5, [[1, 1]])).toBeNull();
+
+    // Split growth marks new split slots live in O(splits) without scanning indices.
+    const splitGrown = updateMaskLiveFromSplits({ slots: 3, live: new Uint8Array([1, 1, 1]) }, 5, [3, 0, 1, 4, 1, 2]);
+    expect(splitGrown.slots).toBe(5);
+    expect(Array.from(splitGrown.live)).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  it("retains_live_cache_across_post_split_commitFrame_without_rescanning_all_triangles", () => {
+    const scene = new Scene();
+    const s = strip(3);
+    const mesh = scene.addMesh(Float64Array.from(s.positions), Uint32Array.from(s.indices));
+    scene.commitFrame();
+    const mask = { mesh, vertices: Uint32Array.from([0, 1]) };
+
+    // Count full-triangle scans by observing index element reads via Proxy once cache is active.
+    let indexElementReads = 0;
+    const origViews = scene.views.bind(scene);
+    const wrappedScene = {
+      views(m: typeof mesh) {
+        const v = origViews(m);
+        return {
+          positions: () => v.positions(),
+          indices: () =>
+            new Proxy(v.indices(), {
+              get(target, prop, receiver) {
+                if (typeof prop === "string" && /^\d+$/.test(prop)) {
+                  indexElementReads++;
+                }
+                const value = Reflect.get(target, prop, target);
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            }),
+        };
+      },
+      onChanges: (cb: Parameters<typeof scene.onChanges>[0]) => scene.onChanges(cb),
+    };
+
+    const tracker = new MaskLiveTracker(wrappedScene);
+    const first = tracker.liveSnapshot(mesh, mask);
+    expect(first).not.toBeNull();
+    expect(first).not.toBe("stale");
+    expect(indexElementReads).toBeGreaterThan(0);
+
+    // A position-only dab keeps the cache with zero index element reads.
+    indexElementReads = 0;
+    scene.repair(mesh, { op: "inflate", center: [2, 0.5, 0], radius: 0.8, falloff: "smooth", strength: 0.2 });
+    scene.commitFrame();
+    const afterDab = tracker.liveSnapshot(mesh, mask);
+    expect(afterDab).not.toBe("stale");
+    expect(indexElementReads).toBe(0);
+
+    // Split + capacity change delivered at a later commitFrame() after endSplit keeps cache live without rescanning.
+    indexElementReads = 0;
+    tracker.beginSplit(mesh);
+    scene.repair(mesh, { op: "captureRestSizes", onlyIfMissing: false });
+    scene.repair(mesh, {
+      op: "grab",
+      center: [1.5, 0.5, 0],
+      radius: 1.2,
+      falloff: "smooth",
+      strength: 1,
+      direction: [0, 0, 2.0],
+    });
+    const splitRep = scene.repair(mesh, { op: "splitStretched", center: [1.5, 0.5, 0], radius: 3, maxSplits: 16 });
+    expect(splitRep.splits).toBeGreaterThan(0);
+    const newSlots = origViews(mesh).positions().length / 3;
+    tracker.endSplit(mesh, true, newSlots, splitRep.vertices);
+    scene.commitFrame();
+    const afterSplit = tracker.liveSnapshot(mesh, mask);
+    expect(afterSplit).not.toBeNull();
+    expect(afterSplit).not.toBe("stale");
+    expect(typeof afterSplit === "object" && afterSplit !== null ? afterSplit.live.length : 0).toBe(newSlots);
+    expect(indexElementReads).toBe(0);
+
+    // maskUsable still agrees on the rebuilt mesh, and a real undo invalidates cleanly without crash.
+    const rawViews = origViews(mesh);
+    expect(maskUsable({ vertices: mask.vertices, slots: rawViews.positions().length / 3 }, rawViews.indices(), rawViews.positions().length / 3)).toBe(true);
+    scene.undo();
+    scene.undo();
+    scene.commitFrame();
+    tracker.liveSnapshot(mesh, mask);
+    expect(indexElementReads).toBeGreaterThan(0);
+    tracker.dispose();
+  });
+
+  it("trusts_shared_mask_paint_and_split_adoption_with_zero_triangle_scans_until_undo", () => {
+    const scene = new Scene();
+    const s = strip(3);
+    const mesh = scene.addMesh(Float64Array.from(s.positions), Uint32Array.from(s.indices));
+    scene.commitFrame();
+    const origViews = scene.views.bind(scene);
+    let indexElementReads = 0;
+    const shared = new MaskLiveTracker({
+      views(m) {
+        const v = origViews(m);
+        return {
+          positions: () => v.positions(),
+          indices: () =>
+            new Proxy(v.indices(), {
+              get(target, prop) {
+                if (typeof prop === "string" && /^\d+$/.test(prop)) {
+                  indexElementReads++;
+                }
+                const value = Reflect.get(target, prop, target);
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            }),
+        };
+      },
+      onChanges: (cb) => scene.onChanges(cb),
+    });
+
+    const slots = origViews(mesh).positions().length / 3;
+    const picked = Uint32Array.from(scene.verticesInSphere(mesh, [0.5, 0.5, 0], 1.1));
+    expect(picked.length).toBeGreaterThan(0);
+    shared.trust(mesh, picked, slots, true);
+
+    // MaskLayer checkMask and SculptLayer liveSnapshot both run with 0 triangle index reads.
+    expect(shared.checkMask(mesh, { mesh, vertices: picked })).toEqual({ ok: true, slots });
+    const snap = shared.liveSnapshot(mesh, { mesh, vertices: picked });
+    expect(snap).not.toBeNull();
+    expect(snap).not.toBe("stale");
+    expect(indexElementReads).toBe(0);
+
+    // Live splits update trusted state cleanly with 0 triangle scans too.
+    shared.beginSplit(mesh);
+    scene.repair(mesh, { op: "captureRestSizes", onlyIfMissing: false });
+    scene.repair(mesh, {
+      op: "grab",
+      center: [1.5, 0.5, 0],
+      radius: 1.2,
+      falloff: "smooth",
+      strength: 1,
+      direction: [0, 0, 2.0],
+    });
+    const sr = scene.repair(mesh, { op: "splitStretched", center: [1.5, 0.5, 0], radius: 3, maxSplits: 16 });
+    const afterSlots = origViews(mesh).positions().length / 3;
+    shared.endSplit(mesh, sr.splits > 0, afterSlots, sr.vertices);
+    const nextMask = Uint32Array.from(new Set([...picked, ...Array.from(sr.vertices).filter((_, k) => k % 3 === 0)])).sort(
+      (a, b) => a - b,
+    );
+    shared.trustSplits(mesh, picked, nextMask, afterSlots);
+    scene.commitFrame();
+
+    const inherited = new Set(Array.from(sr.vertices).filter((_, k) => k % 3 === 0));
+    const afterSplitSnap = shared.liveSnapshot(mesh, { mesh, vertices: nextMask, inherited });
+    expect(afterSplitSnap).not.toBeNull();
+    expect(afterSplitSnap).not.toBe("stale");
+    expect(indexElementReads).toBe(0);
+
+    // Undo drops trust and forces full triangle validation so dead inherited splits stay live===0.
+    scene.undo();
+    scene.undo();
+    scene.commitFrame();
+    const afterUndo = shared.liveSnapshot(mesh, { mesh, vertices: nextMask, inherited });
+    expect(afterUndo).not.toBeNull();
+    expect(indexElementReads).toBeGreaterThan(0);
+    shared.dispose();
   });
 });

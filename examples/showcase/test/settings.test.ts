@@ -12,6 +12,7 @@ import {
   settingsFromSnapshot,
 } from "../src/panels/settings";
 import { markTourSeen, tourSeen } from "../src/panels/tour";
+import { AppState } from "../src/scene/app-state";
 
 const LEGACY_SEEN_KEY = "fast-mesh-showcase.seen-tour";
 
@@ -92,6 +93,100 @@ describe("parseSettings", () => {
     const b = defaultSettings();
     expect(a).toEqual(b);
     expect(a.repairOverlays).not.toBe(b.repairOverlays);
+    expect(a.sculptMethods).not.toBe(b.sculptMethods);
+    expect(a.sculptFilter).not.toBe(b.sculptFilter);
+    expect(a.sculptSymmetry).not.toBe(b.sculptSymmetry);
+    expect(a.sculptMethods).toEqual({
+      inflate: "vertexNormal",
+      smooth: "laplacian",
+      grab: "sphere",
+      twist: "vortex",
+    });
+    expect(a.sculptGrabPoisson).toBe(0.4);
+    expect(a.sculptFilter).toEqual({
+      kind: "none",
+      threshold: 0.05,
+      contrast: 0.5,
+      maxAngleDeg: 45,
+    });
+    expect(a.sculptSymmetry).toEqual({ x: false, y: false, z: false });
+  });
+
+  it("parses_and_validates_sculpt_methods_poisson_filter_and_symmetry", () => {
+    const valid = parseSettings({
+      version: 1,
+      sculptMethods: {
+        inflate: "strokeNormal",
+        smooth: "cotangent",
+        grab: "kelvinlet",
+        twist: "kelvinlet",
+      },
+      sculptGrabPoisson: 0.25,
+      sculptFilter: {
+        kind: "peaksOnly",
+        threshold: 0.2,
+        contrast: 0.8,
+        maxAngleDeg: 30,
+      },
+      sculptSymmetry: { x: true, y: false, z: true },
+    });
+    expect(valid.sculptMethods).toEqual({
+      inflate: "strokeNormal",
+      smooth: "cotangent",
+      grab: "kelvinlet",
+      twist: "kelvinlet",
+    });
+    expect(valid.sculptGrabPoisson).toBe(0.25);
+    expect(valid.sculptFilter).toEqual({
+      kind: "peaksOnly",
+      threshold: 0.2,
+      contrast: 0.8,
+      maxAngleDeg: 30,
+    });
+    expect(valid.sculptSymmetry).toEqual({ x: true, y: false, z: true });
+
+    const corrupt = parseSettings({
+      version: 1,
+      sculptMethods: {
+        inflate: "bogus",
+        smooth: 42,
+        grab: "geodesic",
+        twist: null,
+      },
+      sculptGrabPoisson: 0.9,
+      sculptFilter: {
+        kind: "imaginary",
+        threshold: -0.1,
+        contrast: 1.5,
+        maxAngleDeg: 0,
+      },
+      sculptSymmetry: { x: "yes", y: true, z: 1 },
+    });
+    expect(corrupt.sculptMethods).toEqual({
+      inflate: "vertexNormal",
+      smooth: "laplacian",
+      grab: "geodesic",
+      twist: "vortex",
+    });
+    expect(corrupt.sculptGrabPoisson).toBe(0.4);
+    expect(corrupt.sculptFilter).toEqual({
+      kind: "none",
+      threshold: 0.05,
+      contrast: 0.5,
+      maxAngleDeg: 45,
+    });
+    expect(corrupt.sculptSymmetry).toEqual({ x: false, y: true, z: false });
+
+    expect(parseSettings({ version: 1, sculptGrabPoisson: -0.01 }).sculptGrabPoisson).toBe(0.4);
+    expect(parseSettings({ version: 1, sculptGrabPoisson: Number.NaN }).sculptGrabPoisson).toBe(0.4);
+    expect(parseSettings({ version: 1, sculptGrabPoisson: 0 }).sculptGrabPoisson).toBe(0);
+    expect(parseSettings({ version: 1, sculptGrabPoisson: 0.5 }).sculptGrabPoisson).toBe(0.5);
+    expect(parseSettings({ version: 1, sculptFilter: { kind: "normalAngle", maxAngleDeg: 181 } }).sculptFilter).toEqual({
+      kind: "normalAngle",
+      threshold: 0.05,
+      contrast: 0.5,
+      maxAngleDeg: 45,
+    });
   });
 });
 
@@ -148,11 +243,66 @@ describe("settings storage", () => {
       ...defaultSettings(),
       sculptRemesh: false,
       heatmapParams: { depth: 1, gap: 2, tolerance: 0.5 },
+      sculptMethods: { inflate: "averageNormal", smooth: "hcLaplacian", grab: "geodesic", twist: "kelvinlet" },
+      sculptGrabPoisson: 0.35,
+      sculptFilter: { kind: "valleysOnly", threshold: 0.12, contrast: 0.7, maxAngleDeg: 60 },
+      sculptSymmetry: { x: true, y: false, z: false },
     });
     expect(s.version).toBe(1);
     expect(s.defaultUnits).toBe("mm");
     expect(s.heatmap).toEqual({ depth: 1, gap: 2, tolerance: 0.5 });
     expect(s.repairOverlays).toEqual({ holes: true, nonManifold: true, degenerate: true, components: true });
+    expect(s.sculptMethods).toEqual({
+      inflate: "averageNormal",
+      smooth: "hcLaplacian",
+      grab: "geodesic",
+      twist: "kelvinlet",
+    });
+    expect(s.sculptGrabPoisson).toBe(0.35);
+    expect(s.sculptFilter).toEqual({ kind: "valleysOnly", threshold: 0.12, contrast: 0.7, maxAngleDeg: 60 });
+    expect(s.sculptSymmetry).toEqual({ x: true, y: false, z: false });
+  });
+
+  it("round_trips_sculpt_settings_through_storage_and_app_state", () => {
+    stubStorage();
+    saveSettings({
+      sculptMethods: { inflate: "strokeNormal", smooth: "taubin", grab: "kelvinlet", twist: "kelvinlet" },
+      sculptGrabPoisson: 0.3,
+      sculptFilter: { kind: "normalAngle", threshold: 0.1, contrast: 0.4, maxAngleDeg: 35 },
+      sculptSymmetry: { x: true, y: true, z: false },
+    });
+    const loaded = loadSettings();
+    const app = new AppState(loaded);
+    expect(app.getSnapshot().sculptMethods).toEqual({
+      inflate: "strokeNormal",
+      smooth: "taubin",
+      grab: "kelvinlet",
+      twist: "kelvinlet",
+    });
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(0.3);
+    expect(app.getSnapshot().sculptFilter).toEqual({
+      kind: "normalAngle",
+      threshold: 0.1,
+      contrast: 0.4,
+      maxAngleDeg: 35,
+    });
+    expect(app.getSnapshot().sculptSymmetry).toEqual({ x: true, y: true, z: false });
+
+    app.setSculptMethods({ smooth: "cotangent" });
+    app.setSculptGrabPoisson(0.15);
+    app.setSculptFilter({ kind: "peaksOnly", threshold: 0.25 });
+    app.setSculptSymmetry({ z: true });
+    expect(app.getSnapshot().sculptMethods.smooth).toBe("cotangent");
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(0.15);
+    expect(app.getSnapshot().sculptFilter).toMatchObject({ kind: "peaksOnly", threshold: 0.25 });
+    expect(app.getSnapshot().sculptSymmetry).toEqual({ x: true, y: true, z: true });
+
+    app.resetDisplaySettings();
+    const d = defaultSettings();
+    expect(app.getSnapshot().sculptMethods).toEqual(d.sculptMethods);
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(d.sculptGrabPoisson);
+    expect(app.getSnapshot().sculptFilter).toEqual(d.sculptFilter);
+    expect(app.getSnapshot().sculptSymmetry).toEqual(d.sculptSymmetry);
   });
 });
 

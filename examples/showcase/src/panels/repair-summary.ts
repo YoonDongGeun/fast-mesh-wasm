@@ -133,6 +133,24 @@ export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: 
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
       return `Grab: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
     }
+    case "flatten": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Flatten: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
+    }
+    case "crease": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Crease: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
+    }
+    case "clay": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Clay: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
+    }
+    case "twist": {
+      const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
+      return `Twist: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;
+    }
+    case "captureStrokeState":
+      return "Captured stroke state";
     case "relax": {
       const r = report as Extract<RepairReport, { moved: number; maxDisplacement: number }>;
       return `Relax: moved ${plural(r.moved, "vertex", "vertices")} (max ${fmtLength(r.maxDisplacement)})`;

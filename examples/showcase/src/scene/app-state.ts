@@ -23,6 +23,9 @@ import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
   defaultSettings,
+  type SculptFilterSettings,
+  type SculptMethods,
+  type SculptSymmetrySettings,
   type ShowcaseSettings,
   type ShowcaseTheme,
 } from "../panels/settings";
@@ -181,6 +184,14 @@ export interface AppSnapshot {
    * step and never open one of their own.
    */
   sculptLiveRemesh: boolean;
+  /** Per-brush algorithm selections (#177, #192; persisted). */
+  sculptMethods: SculptMethods;
+  /** Kelvinlet grab Poisson ratio in `[0, 0.5]` (#177; persisted). */
+  sculptGrabPoisson: number;
+  /** Composable surface feature filter (#177, #192; persisted). */
+  sculptFilter: SculptFilterSettings;
+  /** Mirror symmetry axes across local coordinate planes (#192; persisted). */
+  sculptSymmetry: SculptSymmetrySettings;
   /**
    * The width, in distance units, of the blend at the heatmap's colour
    * boundaries (fragment shading's `edgeSoftness`); 0 is a hard edge.
@@ -259,6 +270,20 @@ export class AppState {
     sculptMaskNotice: null,
     sculptRemesh: false,
     sculptLiveRemesh: true,
+    sculptMethods: {
+      inflate: "vertexNormal",
+      smooth: "laplacian",
+      grab: "sphere",
+      twist: "vortex",
+    },
+    sculptGrabPoisson: 0.4,
+    sculptFilter: {
+      kind: "none",
+      threshold: 0.05,
+      contrast: 0.5,
+      maxAngleDeg: 45,
+    },
+    sculptSymmetry: { x: false, y: false, z: false },
     edgeSoftness: 0,
     wireframe: false,
     multi: [],
@@ -302,6 +327,10 @@ export class AppState {
       sculptRemesh: initial.sculptEvenOut,
       sculptLiveRemesh: initial.sculptLiveRemesh,
       maskRadius: initial.maskRadius,
+      sculptMethods: { ...initial.sculptMethods },
+      sculptGrabPoisson: initial.sculptGrabPoisson,
+      sculptFilter: { ...initial.sculptFilter },
+      sculptSymmetry: { ...initial.sculptSymmetry },
       units: initial.defaultUnits,
       defaultUnits: initial.defaultUnits,
     };
@@ -544,6 +573,29 @@ export class AppState {
     this.#set({ sculptLiveRemesh: on });
   }
 
+  /** Updates per-brush sculpt algorithm selections (persisted). */
+  setSculptMethods(patch: Partial<SculptMethods>): void {
+    this.#set({ sculptMethods: { ...this.#snap.sculptMethods, ...patch } });
+  }
+
+  /** Updates the Kelvinlet grab Poisson ratio in `[0, 0.5]` (persisted). */
+  setSculptGrabPoisson(poisson: number): void {
+    if (!Number.isFinite(poisson)) {
+      return;
+    }
+    this.#set({ sculptGrabPoisson: Math.min(0.5, Math.max(0, poisson)) });
+  }
+
+  /** Updates composable surface filter settings (persisted). */
+  setSculptFilter(patch: Partial<SculptFilterSettings>): void {
+    this.#set({ sculptFilter: { ...this.#snap.sculptFilter, ...patch } });
+  }
+
+  /** Updates mirror symmetry axis toggles (persisted). */
+  setSculptSymmetry(patch: Partial<SculptSymmetrySettings>): void {
+    this.#set({ sculptSymmetry: { ...this.#snap.sculptSymmetry, ...patch } });
+  }
+
   /** Sets the heatmap's boundary softness (a display setting: not undoable). */
   setEdgeSoftness(width: number): void {
     this.#set({ edgeSoftness: width });
@@ -669,6 +721,10 @@ export class AppState {
       sculptRemesh: d.sculptEvenOut,
       sculptLiveRemesh: d.sculptLiveRemesh,
       maskRadius: d.maskRadius,
+      sculptMethods: { ...d.sculptMethods },
+      sculptGrabPoisson: d.sculptGrabPoisson,
+      sculptFilter: { ...d.sculptFilter },
+      sculptSymmetry: { ...d.sculptSymmetry },
       units: d.defaultUnits,
       defaultUnits: d.defaultUnits,
       importScale: NO_IMPORT_SCALE,
@@ -689,5 +745,6 @@ export class AppState {
 
 /** A slice of the app state; the component re-renders when it changes (`Object.is`). */
 export function useApp<T>(app: AppState, select: (s: AppSnapshot) => T): T {
-  return useSyncExternalStore(app.subscribe, () => select(app.getSnapshot()));
+  const getSlice = () => select(app.getSnapshot());
+  return useSyncExternalStore(app.subscribe, getSlice, getSlice);
 }

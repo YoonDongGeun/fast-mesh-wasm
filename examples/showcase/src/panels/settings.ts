@@ -10,8 +10,31 @@
 // Pure helpers (no DOM at import, like tour.ts): storage is touched only
 // inside load/save/reset, each guarded the way tour.ts guards its flag,
 // so private mode just means "no persistence".
+import type { GrabMethod, InflateMethod, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
 import type { CollisionMode, HeatmapParams, RepairOverlayKind } from "../scene/app-state";
 import type { LengthUnit } from "./units";
+
+export interface SculptMethods {
+  inflate: InflateMethod;
+  smooth: SmoothMethod;
+  grab: GrabMethod;
+  twist: TwistMethod;
+}
+
+export type SculptFilterKind = "none" | "peaksOnly" | "valleysOnly" | "normalAngle";
+
+export interface SculptFilterSettings {
+  kind: SculptFilterKind;
+  threshold: number;
+  contrast: number;
+  maxAngleDeg: number;
+}
+
+export interface SculptSymmetrySettings {
+  x: boolean;
+  y: boolean;
+  z: boolean;
+}
 
 /** The settings document's storage key: namespaced, with its version. */
 export const SETTINGS_KEY = "fm.showcase.settings.v1";
@@ -57,6 +80,14 @@ export interface ShowcaseSettings {
   sculptEvenOut: boolean;
   sculptLiveRemesh: boolean;
   maskRadius: number;
+  /** Per-brush algorithm choices (#177, #192). */
+  sculptMethods: SculptMethods;
+  /** Kelvinlet grab Poisson ratio in `[0, 0.5]` (#177). */
+  sculptGrabPoisson: number;
+  /** Composable surface feature filter (#177, #192). */
+  sculptFilter: SculptFilterSettings;
+  /** Mirror symmetry axes across local `x = 0`, `y = 0`, `z = 0` planes (#192). */
+  sculptSymmetry: SculptSymmetrySettings;
   /** The display unit new sessions and older project files start on; a project file's own wins. */
   defaultUnits: LengthUnit;
 }
@@ -80,6 +111,20 @@ export function defaultSettings(): ShowcaseSettings {
     sculptEvenOut: false,
     sculptLiveRemesh: true,
     maskRadius: 0.25,
+    sculptMethods: {
+      inflate: "vertexNormal",
+      smooth: "laplacian",
+      grab: "sphere",
+      twist: "vortex",
+    },
+    sculptGrabPoisson: 0.4,
+    sculptFilter: {
+      kind: "none",
+      threshold: 0.05,
+      contrast: 0.5,
+      maxAngleDeg: 45,
+    },
+    sculptSymmetry: { x: false, y: false, z: false },
     defaultUnits: "mm",
   };
 }
@@ -148,6 +193,14 @@ function parseHeatmap(value: unknown): HeatmapParams | null {
   return { depth, gap, tolerance };
 }
 
+function asBoundedNumber(value: unknown, fallback: number, min: number, max: number, minInclusive = true): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const okMin = minInclusive ? value >= min : value > min;
+  return okMin && value <= max ? value : fallback;
+}
+
 /**
  * Reads a stored document tolerantly: a wrong version, a corrupt shape or
  * a mistyped field falls back to the defaults (per field, so one bad
@@ -159,6 +212,9 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     return fallback;
   }
   const overlays = isRecord(doc.repairOverlays) ? doc.repairOverlays : {};
+  const methods = isRecord(doc.sculptMethods) ? doc.sculptMethods : {};
+  const filter = isRecord(doc.sculptFilter) ? doc.sculptFilter : {};
+  const symmetry = isRecord(doc.sculptSymmetry) ? doc.sculptSymmetry : {};
   return {
     version: SETTINGS_VERSION,
     theme: asLiteral(doc.theme, ["dark", "light"], fallback.theme),
@@ -181,6 +237,32 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     sculptEvenOut: asBoolean(doc.sculptEvenOut, fallback.sculptEvenOut),
     sculptLiveRemesh: asBoolean(doc.sculptLiveRemesh, fallback.sculptLiveRemesh),
     maskRadius: asNumber(doc.maskRadius, fallback.maskRadius, Number.MIN_VALUE),
+    sculptMethods: {
+      inflate: asLiteral(
+        methods.inflate,
+        ["vertexNormal", "averageNormal", "strokeNormal"],
+        fallback.sculptMethods.inflate,
+      ),
+      smooth: asLiteral(
+        methods.smooth,
+        ["taubin", "laplacian", "hcLaplacian", "cotangent"],
+        fallback.sculptMethods.smooth,
+      ),
+      grab: asLiteral(methods.grab, ["sphere", "geodesic", "kelvinlet"], fallback.sculptMethods.grab),
+      twist: asLiteral(methods.twist, ["vortex", "kelvinlet"], fallback.sculptMethods.twist),
+    },
+    sculptGrabPoisson: asBoundedNumber(doc.sculptGrabPoisson, fallback.sculptGrabPoisson, 0, 0.5),
+    sculptFilter: {
+      kind: asLiteral(filter.kind, ["none", "peaksOnly", "valleysOnly", "normalAngle"], fallback.sculptFilter.kind),
+      threshold: asBoundedNumber(filter.threshold, fallback.sculptFilter.threshold, 0, 1),
+      contrast: asBoundedNumber(filter.contrast, fallback.sculptFilter.contrast, 0, 1),
+      maxAngleDeg: asBoundedNumber(filter.maxAngleDeg, fallback.sculptFilter.maxAngleDeg, 0, 180, false),
+    },
+    sculptSymmetry: {
+      x: asBoolean(symmetry.x, fallback.sculptSymmetry.x),
+      y: asBoolean(symmetry.y, fallback.sculptSymmetry.y),
+      z: asBoolean(symmetry.z, fallback.sculptSymmetry.z),
+    },
     defaultUnits: asLiteral(doc.defaultUnits, ["mm", "in"], fallback.defaultUnits),
   };
 }
@@ -231,6 +313,10 @@ export interface PersistedSnapshot {
   sculptRemesh: boolean;
   sculptLiveRemesh: boolean;
   maskRadius: number;
+  sculptMethods: SculptMethods;
+  sculptGrabPoisson: number;
+  sculptFilter: SculptFilterSettings;
+  sculptSymmetry: SculptSymmetrySettings;
   defaultUnits: LengthUnit;
 }
 
@@ -253,6 +339,10 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     sculptEvenOut: snap.sculptRemesh,
     sculptLiveRemesh: snap.sculptLiveRemesh,
     maskRadius: snap.maskRadius,
+    sculptMethods: { ...snap.sculptMethods },
+    sculptGrabPoisson: snap.sculptGrabPoisson,
+    sculptFilter: { ...snap.sculptFilter },
+    sculptSymmetry: { ...snap.sculptSymmetry },
     defaultUnits: snap.defaultUnits,
   };
 }

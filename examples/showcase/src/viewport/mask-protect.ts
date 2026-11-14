@@ -4,7 +4,8 @@
 // reach at weight 0, so they stay byte-identical, and the free vertices in a
 // soft band around the mask at a weight rising to 1, so no crease forms along
 // the border. The brush itself is untouched; this only decorates its op.
-import type { RepairOp } from "fast-mesh-wasm";
+import type { MeshChange, MeshHandle, RepairOp } from "fast-mesh-wasm";
+import { reflectCenters, widestGrabReach } from "./sculpt";
 
 /** The soft band's width, as a fraction of the brush radius. */
 export const MASK_SOFT_BAND = 0.25;
@@ -291,7 +292,16 @@ export function maskMeetsRemesh(
  * its cell only loses some softness.
  */
 export function protectDab(op: RepairOp, field: MaskField, positions: ArrayLike<number>): RepairOp {
-  if (op.op !== "inflate" && op.op !== "relax" && op.op !== "smooth" && op.op !== "grab") {
+  if (
+    op.op !== "inflate" &&
+    op.op !== "relax" &&
+    op.op !== "smooth" &&
+    op.op !== "grab" &&
+    op.op !== "flatten" &&
+    op.op !== "crease" &&
+    op.op !== "clay" &&
+    op.op !== "twist"
+  ) {
     return op;
   }
   const [cx, cy, cz] = op.center;
@@ -340,4 +350,518 @@ export function protectDab(op: RepairOp, field: MaskField, positions: ArrayLike<
     scaled[k] = weights[near[k]];
   }
   return { ...op, protect: { vertices, weights: scaled } };
+}
+
+export interface MaskLiveCache {
+  slots: number;
+  live: Uint8Array;
+}
+
+/** Materializes triangle-used vertex liveness once when no incremental cache exists. */
+export function buildMaskLiveCache(indices: ArrayLike<number>, slots: number): MaskLiveCache {
+  const live = new Uint8Array(slots);
+  for (let t = 0; t + 2 < indices.length; t += 3) {
+    const a = indices[t];
+    const b = indices[t + 1];
+    const c = indices[t + 2];
+    if (a === 0 && b === 0 && c === 0) {
+      continue;
+    }
+    if (a >= 0 && a < slots) {
+      live[a] = 1;
+    }
+    if (b >= 0 && b < slots) {
+      live[b] = 1;
+    }
+    if (c >= 0 && c < slots) {
+      live[c] = 1;
+    }
+  }
+  return { slots, live };
+}
+
+/**
+ * Updates `cache` incrementally over dirty triangle `[start, count]` ranges in
+ * `O(dirty_ranges)`. Returns `null` when slots shrank or any dirty triangle is
+ * a zeroed `(0, 0, 0)` removal slot that may have killed a vertex.
+ */
+export function updateMaskLiveFromRanges(
+  cache: MaskLiveCache,
+  indices: ArrayLike<number>,
+  slots: number,
+  ranges: readonly (readonly [number, number])[],
+): MaskLiveCache | null {
+  if (slots < cache.slots) {
+    return null;
+  }
+  const triLimit = Math.floor(indices.length / 3);
+  for (const [start, count] of ranges) {
+    const end = Math.min(triLimit, start + count);
+    for (let t = Math.max(0, start); t < end; t++) {
+      const i = 3 * t;
+      const a = indices[i];
+      const b = indices[i + 1];
+      const c = indices[i + 2];
+      if (a === 0 && b === 0 && c === 0) {
+        return null;
+      }
+    }
+  }
+  let live = cache.live;
+  if (slots > cache.slots) {
+    live = new Uint8Array(slots);
+    live.set(cache.live);
+  }
+  for (const [start, count] of ranges) {
+    const end = Math.min(triLimit, start + count);
+    for (let t = Math.max(0, start); t < end; t++) {
+      const i = 3 * t;
+      const a = indices[i];
+      const b = indices[i + 1];
+      const c = indices[i + 2];
+      if (a >= 0 && a < slots) {
+        live[a] = 1;
+      }
+      if (b >= 0 && b < slots) {
+        live[b] = 1;
+      }
+      if (c >= 0 && c < slots) {
+        live[c] = 1;
+      }
+    }
+  }
+  return { slots, live };
+}
+
+/**
+ * Updates `cache` in `O(splits)` across `splitStretched` capacity growth:
+ * edge splits never kill existing live vertices and only append live midpoint
+ * slots `[new, a, b]`.
+ */
+export function updateMaskLiveFromSplits(
+  cache: MaskLiveCache,
+  slots: number,
+  splitTriples?: ArrayLike<number>,
+): MaskLiveCache {
+  const target = Math.max(cache.slots, slots);
+  let live = cache.live;
+  if (target > cache.slots) {
+    live = new Uint8Array(target);
+    live.set(cache.live);
+    live.fill(1, cache.slots, target);
+  }
+  if (splitTriples !== undefined) {
+    for (let k = 0; k < splitTriples.length; k++) {
+      const id = splitTriples[k];
+      if (id >= 0 && id < target) {
+        live[id] = 1;
+      }
+    }
+  }
+  return { slots: target, live };
+}
+
+function opQueryRadius(
+  op: Extract<
+    RepairOp,
+    { op: "inflate" | "relax" | "smooth" | "grab" | "flatten" | "crease" | "clay" | "twist" }
+  >,
+): number {
+  if (op.op === "clay" && op.profile === "strips") {
+    return op.radius * Math.sqrt(3);
+  }
+  if (op.op === "grab" && op.adaptiveReach === true) {
+    return widestGrabReach(op.radius, op.falloff, op.method ?? "sphere", op.strength, op.direction);
+  }
+  return op.radius;
+}
+
+/**
+ * Decorates a brush `op` with engine-localized soft-band protection (#197):
+ * scans ONLY `masked` (`O(|masked|)` — zero triangle-index scans or CSR
+ * builds), keeping live masked vertices near any active symmetry sphere at
+ * weight `0` with `band = op.radius * MASK_SOFT_BAND`.
+ */
+export function protectMaskedDab(
+  op: RepairOp,
+  masked: ArrayLike<number>,
+  positions: ArrayLike<number>,
+  live: Uint8Array,
+  inherited?: ReadonlySet<number>,
+): RepairOp {
+  if (
+    op.op !== "inflate" &&
+    op.op !== "relax" &&
+    op.op !== "smooth" &&
+    op.op !== "grab" &&
+    op.op !== "flatten" &&
+    op.op !== "crease" &&
+    op.op !== "clay" &&
+    op.op !== "twist"
+  ) {
+    return op;
+  }
+  if (masked.length === 0) {
+    return op;
+  }
+  const band = op.radius * MASK_SOFT_BAND;
+  const reach = (opQueryRadius(op) + band) * PROTECT_REACH;
+  const r2 = reach * reach;
+  const centers = reflectCenters(op.center, op.symmetry);
+  const near: number[] = [];
+  let prev = -1;
+  for (let k = 0; k < masked.length; k++) {
+    const id = masked[k];
+    if (id === prev || id < 0 || id >= live.length || 3 * id + 2 >= positions.length) {
+      continue;
+    }
+    if (live[id] === 0) {
+      // Dead inherited splits (after undo) or stale slots cannot be passed to check_protection.
+      if (inherited?.has(id) === true) {
+        continue;
+      }
+      continue;
+    }
+    const px = positions[3 * id];
+    const py = positions[3 * id + 1];
+    const pz = positions[3 * id + 2];
+    let hit = false;
+    for (let m = 0; m < centers.length; m++) {
+      const c = centers[m];
+      const dx = px - c[0];
+      const dy = py - c[1];
+      const dz = pz - c[2];
+      if (dx * dx + dy * dy + dz * dz <= r2) {
+        hit = true;
+        break;
+      }
+    }
+    if (hit) {
+      near.push(id);
+      prev = id;
+    }
+  }
+  if (near.length === 0) {
+    return op;
+  }
+  const vertices = Uint32Array.from(near);
+  const weights = new Float32Array(vertices.length);
+  return { ...op, protect: { vertices, weights, band } };
+}
+
+export interface MaskLiveScene {
+  views(mesh: MeshHandle): { positions(): ArrayLike<number>; indices(): ArrayLike<number> };
+  onChanges(listener: (changes: MeshChange[]) => void): () => void;
+}
+
+export interface LiveMaskSnapshot {
+  vertices: Uint32Array;
+  positions: ArrayLike<number>;
+  indices: ArrayLike<number>;
+  live: Uint8Array;
+}
+
+const EMPTY_LIVE = new Uint8Array(0);
+
+/**
+ * Tracks live triangle vertex flags across `Scene` / `WorkerScene` frames:
+ * materializes `buildMaskLiveCache` at most once per untrusted non-empty mask,
+ * updates incrementally across `splitStretched` (including `commitFrame()` runs
+ * after `splitStretched` settles) and partial dirty triangle ranges, and lets
+ * mask painting mark freshly queried `verticesInSphere` masks live in O(1).
+ */
+export class MaskLiveTracker {
+  readonly #scene: MaskLiveScene;
+  readonly #off: () => void;
+  #cache: MaskLiveCache | null = null;
+  #cacheMesh: MeshHandle | null = null;
+  #checkedMask: Uint32Array | null = null;
+  #trustedMesh: MeshHandle | null = null;
+  #trustedSlots = 0;
+  #trustedClean = false;
+  #trustedLive: Uint8Array | null = null;
+  #trustedLiveMesh: MeshHandle | null = null;
+  #trustedLiveMask: Uint32Array | null = null;
+  #splittingMesh: MeshHandle | null = null;
+  readonly #splitPending = new Set<MeshHandle>();
+  readonly #topoVersion = new Map<MeshHandle, number>();
+
+  constructor(scene: MaskLiveScene) {
+    this.#scene = scene;
+    this.#off = scene.onChanges((changes) => this.#onChanges(changes));
+  }
+
+  dispose(): void {
+    this.#off();
+    this.invalidate();
+  }
+
+  topologyVersion(mesh: MeshHandle): number {
+    return this.#topoVersion.get(mesh) ?? 0;
+  }
+
+  invalidate(mesh?: MeshHandle): void {
+    if (mesh === undefined || this.#cacheMesh === mesh) {
+      this.#cache = null;
+      this.#cacheMesh = null;
+      this.#checkedMask = null;
+    }
+    if (mesh === undefined || this.#trustedMesh === mesh) {
+      this.#trustedMesh = null;
+      this.#trustedClean = false;
+      this.#clearTrustedLive();
+      if (this.#cacheMesh === null) {
+        this.#checkedMask = null;
+      }
+    }
+    if (mesh === undefined) {
+      this.#splittingMesh = null;
+      this.#splitPending.clear();
+    } else {
+      if (this.#splittingMesh === mesh) {
+        this.#splittingMesh = null;
+      }
+      this.#splitPending.delete(mesh);
+    }
+  }
+
+  beginSplit(mesh: MeshHandle): void {
+    this.#splittingMesh = mesh;
+  }
+
+  endSplit(mesh: MeshHandle, changed: boolean, slots?: number, splitVertices?: ArrayLike<number>): void {
+    if (this.#splittingMesh === mesh) {
+      this.#splittingMesh = null;
+    }
+    if (!changed) {
+      return;
+    }
+    this.#splitPending.add(mesh);
+    if (this.#cache !== null && this.#cacheMesh === mesh && slots !== undefined) {
+      this.#cache = updateMaskLiveFromSplits(this.#cache, slots, splitVertices);
+      if (this.#trustedMesh === mesh) {
+        this.#trustedSlots = this.#cache.slots;
+      }
+    } else if (this.#trustedMesh === mesh && slots !== undefined) {
+      this.#trustedSlots = Math.max(this.#trustedSlots, slots);
+      this.#clearTrustedLive();
+    }
+  }
+
+  trust(mesh: MeshHandle, vertices: Uint32Array, slots: number, clean = true): void {
+    this.#trustedMesh = mesh;
+    this.#trustedSlots = slots;
+    this.#checkedMask = vertices;
+    this.#trustedClean = clean;
+    this.#clearTrustedLive();
+  }
+
+  trustSplits(mesh: MeshHandle, prevVertices: Uint32Array, nextVertices: Uint32Array, slots: number): void {
+    if (this.#trustedMesh !== mesh || this.#checkedMask !== prevVertices || !this.#trustedClean) {
+      return;
+    }
+    this.#trustedSlots = slots;
+    this.#checkedMask = nextVertices;
+    this.#clearTrustedLive();
+  }
+
+  #clearTrustedLive(): void {
+    this.#trustedLive = null;
+    this.#trustedLiveMesh = null;
+    this.#trustedLiveMask = null;
+  }
+
+  #ensureTrustedLive(mesh: MeshHandle, vertices: Uint32Array, slots: number): Uint8Array {
+    if (
+      this.#trustedLive !== null &&
+      this.#trustedLive.length === slots &&
+      this.#trustedLiveMesh === mesh &&
+      this.#trustedLiveMask === vertices
+    ) {
+      return this.#trustedLive;
+    }
+    const live = new Uint8Array(slots);
+    for (let k = 0; k < vertices.length; k++) {
+      const id = vertices[k];
+      if (id >= 0 && id < slots) {
+        live[id] = 1;
+      }
+    }
+    this.#trustedLive = live;
+    this.#trustedLiveMesh = mesh;
+    this.#trustedLiveMask = vertices;
+    return live;
+  }
+
+  checkMask(
+    mesh: MeshHandle,
+    mask: { mesh: MeshHandle; vertices: Uint32Array; inherited?: ReadonlySet<number> } | null,
+  ): { ok: boolean; slots: number } | null {
+    if (mask === null || mask.mesh !== mesh) {
+      return null;
+    }
+    let positions: ArrayLike<number>;
+    let indices: ArrayLike<number>;
+    try {
+      const v = this.#scene.views(mesh);
+      positions = v.positions();
+      indices = v.indices();
+    } catch {
+      return null;
+    }
+    const slots = positions.length / 3;
+    if (mask.vertices.length === 0) {
+      return { ok: true, slots };
+    }
+    if (this.#trustedMesh === mesh && this.#trustedSlots === slots && this.#checkedMask === mask.vertices) {
+      return { ok: true, slots };
+    }
+    const snap = this.#snapshotWith(mesh, mask, positions, indices, slots);
+    if (snap === null) {
+      return null;
+    }
+    return { ok: snap !== "stale", slots };
+  }
+
+  liveSnapshot(
+    mesh: MeshHandle,
+    mask: { mesh: MeshHandle; vertices: Uint32Array; inherited?: ReadonlySet<number> } | null,
+  ): LiveMaskSnapshot | "stale" | null {
+    if (mask === null || mask.mesh !== mesh) {
+      return null;
+    }
+    let positions: ArrayLike<number>;
+    let indices: ArrayLike<number>;
+    try {
+      const v = this.#scene.views(mesh);
+      positions = v.positions();
+      indices = v.indices();
+    } catch {
+      return null;
+    }
+    const slots = positions.length / 3;
+    if (mask.vertices.length === 0) {
+      const live =
+        this.#cache !== null && this.#cacheMesh === mesh && this.#cache.slots === slots ? this.#cache.live : EMPTY_LIVE;
+      return { vertices: mask.vertices, positions, indices, live };
+    }
+    return this.#snapshotWith(mesh, mask, positions, indices, slots);
+  }
+
+  #snapshotWith(
+    mesh: MeshHandle,
+    mask: { vertices: Uint32Array; inherited?: ReadonlySet<number> },
+    positions: ArrayLike<number>,
+    indices: ArrayLike<number>,
+    slots: number,
+  ): LiveMaskSnapshot | "stale" | null {
+    if (this.#cache === null || this.#cacheMesh !== mesh || this.#cache.slots !== slots) {
+      if (
+        this.#trustedMesh === mesh &&
+        this.#trustedSlots === slots &&
+        this.#checkedMask === mask.vertices &&
+        (this.#trustedClean || mask.inherited === undefined || mask.inherited.size === 0)
+      ) {
+        return {
+          vertices: mask.vertices,
+          positions,
+          indices,
+          live: this.#ensureTrustedLive(mesh, mask.vertices, slots),
+        };
+      }
+      this.#checkedMask = null;
+      this.#trustedMesh = null;
+      this.#trustedClean = false;
+      this.#clearTrustedLive();
+      this.#cache = buildMaskLiveCache(indices, slots);
+      this.#cacheMesh = mesh;
+    }
+    if (this.#checkedMask !== mask.vertices) {
+      for (let k = 0; k < mask.vertices.length; k++) {
+        const id = mask.vertices[k];
+        if ((id < 0 || id >= this.#cache.live.length || this.#cache.live[id] === 0) && mask.inherited?.has(id) !== true) {
+          return "stale";
+        }
+      }
+      this.#checkedMask = mask.vertices;
+      this.#trustedMesh = mesh;
+      this.#trustedSlots = slots;
+      this.#trustedClean = mask.inherited === undefined || mask.inherited.size === 0;
+    }
+    return { vertices: mask.vertices, positions, indices, live: this.#cache.live };
+  }
+
+  #onChanges(changes: readonly MeshChange[]): void {
+    for (const c of changes) {
+      if (c.removed) {
+        if (this.#cacheMesh === c.mesh) {
+          this.#cache = null;
+          this.#cacheMesh = null;
+          this.#checkedMask = null;
+        }
+        if (this.#trustedMesh === c.mesh) {
+          this.#trustedMesh = null;
+          this.#trustedClean = false;
+          this.#clearTrustedLive();
+          this.#checkedMask = null;
+        }
+        if (this.#splittingMesh === c.mesh) {
+          this.#splittingMesh = null;
+        }
+        this.#splitPending.delete(c.mesh);
+        this.#topoVersion.delete(c.mesh);
+        continue;
+      }
+      if (!c.capacityChanged && c.indices !== "all" && c.indices.length === 0) {
+        continue;
+      }
+      this.#topoVersion.set(c.mesh, (this.#topoVersion.get(c.mesh) ?? 0) + 1);
+      const hadPendingSplit = this.#splitPending.delete(c.mesh);
+      const fromSplit = this.#splittingMesh === c.mesh || hadPendingSplit;
+      if (fromSplit) {
+        if (this.#cacheMesh === c.mesh && this.#cache !== null) {
+          try {
+            const slots = this.#scene.views(c.mesh).positions().length / 3;
+            this.#cache = updateMaskLiveFromSplits(this.#cache, slots);
+            if (this.#trustedMesh === c.mesh) {
+              this.#trustedSlots = this.#cache.slots;
+            }
+          } catch {
+            this.invalidate(c.mesh);
+          }
+        } else if (this.#trustedMesh === c.mesh) {
+          try {
+            const slots = this.#scene.views(c.mesh).positions().length / 3;
+            this.#trustedSlots = Math.max(this.#trustedSlots, slots);
+            this.#clearTrustedLive();
+          } catch {
+            this.invalidate(c.mesh);
+          }
+        }
+        continue;
+      }
+      if (c.indices === "all" || c.capacityChanged) {
+        this.invalidate(c.mesh);
+        continue;
+      }
+      if (this.#trustedMesh === c.mesh) {
+        this.#trustedMesh = null;
+        this.#trustedClean = false;
+        this.#clearTrustedLive();
+        this.#checkedMask = null;
+      }
+      if (this.#cacheMesh === c.mesh && this.#cache !== null) {
+        try {
+          const v = this.#scene.views(c.mesh);
+          const updated = updateMaskLiveFromRanges(this.#cache, v.indices(), v.positions().length / 3, c.indices);
+          this.#cache = updated;
+          if (updated === null) {
+            this.invalidate(c.mesh);
+          }
+        } catch {
+          this.invalidate(c.mesh);
+        }
+      }
+    }
+  }
 }

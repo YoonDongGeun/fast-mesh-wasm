@@ -13,12 +13,15 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_STRENGTHS,
+  LIVE_HUGE_MAX_SPLITS,
+  LIVE_MAX_SPLITS,
   LIVE_REMESH_MIN_DABS,
   LIVE_REMESH_MIN_MS,
   RELAX_PASSES,
   SculptStroke,
   checkMask,
   invertMaskIds,
+  liveMaxSplits,
   liveRemeshDue,
   maskUsable,
   MaskError,
@@ -28,17 +31,22 @@ import {
   type SculptMask,
   type SculptTool,
   dabOp,
+  dabOperation,
   dabSpacing,
   faceNormal,
   farEnough,
   grabLocalDelta,
   interpolateHit,
   meanEdgeLength,
+  reflectCenters,
   remeshTooBig,
   sculptOpForTool,
+  toSurfaceFilter,
   unionMaskIds,
+  widestGrabReach,
   worldPerPixel,
 } from "../src/viewport/sculpt";
+import { defaultSettings } from "../src/panels/settings";
 
 const brush: SculptBrush = {
   mesh: 7 as unknown as MeshHandle,
@@ -542,11 +550,19 @@ describe("brush picker", () => {
   const mesh = 7 as unknown as MeshHandle;
 
   it("maps_each_tool_to_its_repair_op", () => {
-    const ops: Record<SculptTool, "inflate" | "relax" | "grab"> = {
+    const ops: Record<SculptTool, "inflate" | "smooth" | "grab" | "flatten" | "crease" | "clay" | "twist"> = {
       inflate: "inflate",
       deflate: "inflate",
-      smooth: "relax",
+      smooth: "smooth",
       grab: "grab",
+      flatten: "flatten",
+      scrape: "flatten",
+      fill: "flatten",
+      crease: "crease",
+      pinch: "crease",
+      clay: "clay",
+      clayStrips: "clay",
+      twist: "twist",
     };
     for (const [tool, op] of Object.entries(ops)) {
       expect(sculptOpForTool(tool as SculptTool)).toBe(op);
@@ -554,7 +570,20 @@ describe("brush picker", () => {
   });
 
   it("starts_each_tool_at_its_own_strength", () => {
-    expect(DEFAULT_STRENGTHS).toEqual({ inflate: 0.1, deflate: 0.1, smooth: 0.5, grab: 1 });
+    expect(DEFAULT_STRENGTHS).toEqual({
+      inflate: 0.1,
+      deflate: 0.1,
+      smooth: 0.5,
+      grab: 1,
+      flatten: 0.5,
+      scrape: 0.5,
+      fill: 0.5,
+      crease: 0.15,
+      pinch: 0.5,
+      clay: 0.5,
+      clayStrips: 0.5,
+      twist: 0.5,
+    });
   });
 
   it("arms_inflate_up_and_deflate_down", () => {
@@ -565,39 +594,222 @@ describe("brush picker", () => {
     expect(sculptBrush("deflate", mesh, 0.25, 0.05, "smooth").op).toBe("inflate");
   });
 
-  it("arms_smooth_as_relax_with_passes", () => {
-    const brush = sculptBrush("smooth", mesh, 0.25, 0.5, "smooth");
-    expect(brush.op).toBe("relax");
-    expect(brush.cycles).toBe(RELAX_PASSES);
-    expect(dabOp(brush, [1, 2, 3])).toEqual({
-      op: "relax",
+  it("arms_smooth_with_laplacian_default_and_passes", () => {
+    const b = sculptBrush("smooth", mesh, 0.25, 0.5, "smooth");
+    expect(b.op).toBe("smooth");
+    expect(b.cycles).toBe(RELAX_PASSES);
+    expect(dabOp(b, [1, 2, 3])).toEqual({
+      op: "smooth",
       center: [1, 2, 3],
       radius: 0.25,
       falloff: "smooth",
       strength: 0.5,
       cycles: RELAX_PASSES,
+      method: "laplacian",
     });
   });
 
   it("arms_grab_follow_at_full_strength", () => {
-    const brush = sculptBrush("grab", mesh, 0.25, 1, "smooth");
-    expect(brush.op).toBe("grab");
-    expect(brush.direction).toEqual([0, 0, 0]);
-    expect(dabOp(brush, [1, 2, 3])).toEqual({
+    const b = sculptBrush("grab", mesh, 0.25, 1, "smooth");
+    expect(b.op).toBe("grab");
+    expect(b.direction).toEqual([0, 0, 0]);
+    expect(dabOp(b, [1, 2, 3])).toEqual({
       op: "grab",
       center: [1, 2, 3],
       radius: 0.25,
       falloff: "smooth",
       strength: 1,
       direction: [0, 0, 0],
+      method: "sphere",
+      fromStroke: true,
+      adaptiveReach: true,
     });
   });
 
   it("carries_radius_and_falloff_through", () => {
-    const brush = sculptBrush("inflate", mesh, 0.4, 0.05, "linear");
-    expect(brush.mesh).toBe(mesh);
-    expect(brush.radius).toBe(0.4);
-    expect(brush.falloff).toBe("linear");
+    const b = sculptBrush("inflate", mesh, 0.4, 0.05, "linear");
+    expect(b.mesh).toBe(mesh);
+    expect(b.radius).toBe(0.4);
+    expect(b.falloff).toBe("linear");
+  });
+
+  it("dabOperation_maps_every_tool_algorithm_filter_and_symmetry", () => {
+    const d = defaultSettings();
+    const center = [1, 2, 3] as const;
+
+    // Inflate methods + deflate negative scaling
+    const infStroke = sculptBrush("inflate", mesh, 0.5, 0.2, "smooth", {
+      methods: { ...d.sculptMethods, inflate: "strokeNormal" },
+      filter: { kind: "peaksOnly", threshold: 0.1, contrast: 0.6, maxAngleDeg: 45 },
+      symmetry: { x: true, y: false, z: true },
+    });
+    expect(dabOperation(infStroke, center, 0.5)).toEqual({
+      op: "inflate",
+      center: [1, 2, 3],
+      radius: 0.5,
+      falloff: "smooth",
+      strength: 0.2 * 0.5 * 0.5,
+      method: "strokeNormal",
+      filter: { kind: "peaksOnly", threshold: 0.1, contrast: 0.6 },
+      symmetry: { x: true, y: false, z: true },
+    });
+    const defAvg = sculptBrush("deflate", mesh, 0.5, 0.2, "linear", {
+      methods: { ...d.sculptMethods, inflate: "averageNormal" },
+    });
+    expect(dabOperation(defAvg, center)).toEqual({
+      op: "inflate",
+      center: [1, 2, 3],
+      radius: 0.5,
+      falloff: "linear",
+      strength: -0.2 * 0.5,
+      method: "averageNormal",
+    });
+
+    // Smooth methods
+    for (const sm of ["taubin", "laplacian", "hcLaplacian", "cotangent"] as const) {
+      const sb = sculptBrush("smooth", mesh, 0.4, 0.6, "smooth", {
+        methods: { ...d.sculptMethods, smooth: sm },
+      });
+      expect(dabOperation(sb, center, 0.5)).toEqual({
+        op: "smooth",
+        center: [1, 2, 3],
+        radius: 0.4,
+        falloff: "smooth",
+        strength: 0.3,
+        cycles: RELAX_PASSES,
+        method: sm,
+      });
+    }
+
+    // Grab methods including kelvinlet poisson
+    const grabKelv = {
+      ...sculptBrush("grab", mesh, 0.4, 1, "smooth", {
+        methods: { ...d.sculptMethods, grab: "kelvinlet" },
+        grabPoisson: 0.35,
+        symmetry: { x: true, y: false, z: false },
+      }),
+      direction: [0.5, -0.25, 0] as [number, number, number],
+    };
+    expect(dabOperation(grabKelv, center)).toEqual({
+      op: "grab",
+      center: [1, 2, 3],
+      radius: 0.4,
+      falloff: "smooth",
+      strength: 1,
+      direction: [0.5, -0.25, 0],
+      method: "kelvinlet",
+      poisson: 0.35,
+      fromStroke: true,
+      adaptiveReach: true,
+      symmetry: { x: true, y: false, z: false },
+    });
+
+    // Flatten / Scrape / Fill
+    expect(dabOperation(sculptBrush("flatten", mesh, 0.4, 0.5, "smooth"), center)).toMatchObject({
+      op: "flatten",
+      mode: "both",
+      strength: 0.5,
+    });
+    expect(dabOperation(sculptBrush("scrape", mesh, 0.4, 0.5, "smooth"), center)).toMatchObject({
+      op: "flatten",
+      mode: "peaks",
+      strength: 0.5,
+    });
+    expect(dabOperation(sculptBrush("fill", mesh, 0.4, 0.5, "smooth"), center)).toMatchObject({
+      op: "flatten",
+      mode: "valleys",
+      strength: 0.5,
+    });
+
+    // Crease vs Pinch
+    const creaseOp = dabOperation(sculptBrush("crease", mesh, 0.5, 0.2, "smooth"), center, 0.5);
+    expect(creaseOp).toEqual({
+      op: "crease",
+      center: [1, 2, 3],
+      radius: 0.5,
+      falloff: "smooth",
+      strength: -0.2 * 0.5 * 0.5,
+      pinch: 0.25,
+    });
+    const pinchOp = dabOperation(sculptBrush("pinch", mesh, 0.5, 0.8, "smooth"), center, 0.5);
+    expect(pinchOp).toEqual({
+      op: "crease",
+      center: [1, 2, 3],
+      radius: 0.5,
+      falloff: "smooth",
+      strength: 0,
+      pinch: 0.4,
+    });
+
+    // Clay & ClayStrips (with stroke tangent)
+    expect(dabOperation(sculptBrush("clay", mesh, 0.4, 0.6, "smooth"), center, 0.5)).toEqual({
+      op: "clay",
+      center: [1, 2, 3],
+      radius: 0.4,
+      falloff: "smooth",
+      strength: 0.3,
+      profile: "round",
+    });
+    expect(dabOperation(sculptBrush("clayStrips", mesh, 0.4, 0.6, "smooth"), center, 0.5, [0, 1, 0])).toEqual({
+      op: "clay",
+      center: [1, 2, 3],
+      radius: 0.4,
+      falloff: "smooth",
+      strength: 0.3,
+      profile: "strips",
+      tangent: [0, 1, 0],
+    });
+
+    // Twist methods + normalAngle filter
+    const twistKelv = sculptBrush("twist", mesh, 0.4, 0.5, "smooth", {
+      methods: { ...d.sculptMethods, twist: "kelvinlet" },
+      filter: { kind: "normalAngle", threshold: 0.05, contrast: 0.5, maxAngleDeg: 30 },
+    });
+    expect(dabOperation(twistKelv, center, 0.5)).toEqual({
+      op: "twist",
+      center: [1, 2, 3],
+      radius: 0.4,
+      falloff: "smooth",
+      strength: 0.25,
+      method: "kelvinlet",
+      filter: { kind: "normalAngle", maxAngleDeg: 30 },
+    });
+    expect(toSurfaceFilter({ kind: "valleysOnly", threshold: 0.2, contrast: 0.7, maxAngleDeg: 45 })).toEqual({
+      kind: "valleysOnly",
+      threshold: 0.2,
+      contrast: 0.7,
+    });
+    expect(toSurfaceFilter({ kind: "none", threshold: 0.05, contrast: 0.5, maxAngleDeg: 45 })).toBeUndefined();
+  });
+
+  it("propagates_stroke_tangent_into_clayStrips_dabs_and_computes_O1_grab_reach", async () => {
+    const ops: unknown[] = [];
+    const cb = sculptBrush("clayStrips", mesh, 1, 0.6, "smooth");
+    const stroke = new SculptStroke(cb, {}, (batch) => {
+      ops.push(...batch);
+      return Promise.resolve();
+    });
+    stroke.dab([0, 0, 0]);
+    await tick();
+    stroke.dab([0, 0.12, 0]);
+    stroke.end();
+    await stroke.done;
+    expect(ops.length).toBe(3);
+    expect((ops[0] as { tangent?: unknown }).tangent).toBeUndefined();
+    expect((ops[1] as { tangent?: readonly number[] }).tangent).toEqual([0, 1, 0]);
+    expect((ops[2] as { tangent?: readonly number[] }).tangent).toEqual([0, 1, 0]);
+
+    expect(widestGrabReach(0.5, "smooth", "sphere", 1, [0.1, 0, 0])).toBe(0.5);
+    expect(widestGrabReach(0.5, "smooth", "sphere", 1, [2, 0, 0])).toBeCloseTo((1.5 * 2) / 0.8, 6);
+    expect(widestGrabReach(0.5, "linear", "kelvinlet", 1, [2, 0, 0])).toBeCloseTo((1.75 * 2) / 0.8, 6);
+
+    expect(reflectCenters([1, 2, 3], { x: false, y: false, z: false })).toEqual([[1, 2, 3]]);
+    expect(reflectCenters([1, 2, 3], { x: true, y: true, z: false })).toEqual([
+      [1, 2, 3],
+      [-1, 2, 3],
+      [1, -2, 3],
+      [-1, -2, 3],
+    ]);
   });
 });
 
@@ -617,6 +829,14 @@ describe("live remesh gate", () => {
     // budget, so long strokes still even out while painting.
     expect(LIVE_REMESH_MIN_DABS).toBeLessThanOrEqual(8);
     expect(LIVE_REMESH_MIN_MS).toBeLessThanOrEqual(1000);
+  });
+
+  it("caps_per_pass_live_splits_above_remesh_limit", () => {
+    expect(liveMaxSplits(null)).toBe(LIVE_MAX_SPLITS);
+    expect(liveMaxSplits(20_000)).toBe(LIVE_MAX_SPLITS);
+    expect(liveMaxSplits(100_000)).toBe(LIVE_MAX_SPLITS);
+    expect(liveMaxSplits(100_001)).toBe(LIVE_HUGE_MAX_SPLITS);
+    expect(liveMaxSplits(1_000_000)).toBe(LIVE_HUGE_MAX_SPLITS);
   });
 });
 
