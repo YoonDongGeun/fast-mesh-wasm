@@ -1,0 +1,44 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke_only:
+        description: "Run compile check + quick smoke benchmark pass only"
+        required: false
+        type: boolean
+        default: true
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    name: Compile & smoke benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile workspace benchmarks (default & parallel)
+        run: |
+          cargo bench --workspace --no-run
+          cargo bench -p fast-mesh-bvh -p fast-mesh-query -p fast-mesh-fields -p fast-mesh-ops --features fast-mesh-fields/parallel,fast-mesh-ops/parallel --no-run
+      - name: Run benchmark harness smoke tests
+        run: |
+          cargo test -p fast-mesh-bvh --bench bvh
+          cargo test -p fast-mesh-query --bench query
+          cargo test -p fast-mesh-fields --bench fields --features parallel
+          cargo test -p fast-mesh-ops --bench ops --features parallel
+      - name: Quick timing smoke check (EDT & Marching Cubes)
+        run: |
+          cargo bench -p fast-mesh-fields --bench fields --features parallel -- edt_3d_sq/128_cubed --sample-size 10 --warm-up-time 1 --measurement-time 1
+          cargo bench -p fast-mesh-ops --bench ops --features parallel -- marching_cubes/128_cubed --sample-size 10 --warm-up-time 1 --measurement-time 1

@@ -23,12 +23,12 @@ pub(crate) struct RayPre {
     pub dir: [f32; 3],
     /// `1 / dir`, with zero components giving infinities.
     pub inv_dir: [f32; 3],
-    kx: usize,
-    ky: usize,
-    kz: usize,
-    sx: f32,
-    sy: f32,
-    sz: f32,
+    pub(crate) kx: usize,
+    pub(crate) ky: usize,
+    pub(crate) kz: usize,
+    pub(crate) sx: f32,
+    pub(crate) sy: f32,
+    pub(crate) sz: f32,
 }
 
 impl RayPre {

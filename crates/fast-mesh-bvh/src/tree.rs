@@ -6,7 +6,7 @@ use fast_mesh_store::{Mesh, TriangleId};
 use crate::arena::{Arena, NONE, Node};
 use crate::build::{Prims, TreeBuild, build_full, expected_nodes};
 use crate::error::{Result, try_reserve, try_reserve_exact, try_reserve_map, try_vec};
-use crate::{Aabb, BuildOptions, NodeId, NodeKind, UpdatePolicy};
+use crate::{Aabb, Aabb4, BuildOptions, NodeId, UpdatePolicy};
 
 /// Source of [`Bvh::generation`] values, shared by every BVH in the process so
 /// that no two trees (or states of one tree) ever share a value.
@@ -517,18 +517,21 @@ impl Bvh {
         debug_assert!(self.is_current(mesh), "query_aabb on a stale BVH");
         let query = Aabb::new(min, max);
         let (positions, triangles) = (mesh.positions(), mesh.triangles());
-        self.traverse(|_, node| {
-            if !node.bounds.overlaps(&query) {
-                return false;
-            }
-            if let NodeKind::Leaf { triangles: leaf } = node.kind {
-                for &t in leaf {
-                    if Aabb::of_triangle(positions, triangles[t as usize]).overlaps(&query) {
+        self.arena.traverse_aabb_leaves(self.root, &query, |leaf| {
+            let (chunks, rem) = leaf.as_chunks::<4>();
+            for &chunk in chunks {
+                let mask = Aabb4::of_triangles(mesh, chunk).overlaps_aabb(&query);
+                for (lane, t) in chunk.into_iter().enumerate() {
+                    if (mask & (1 << lane)) != 0 {
                         out.push(t);
                     }
                 }
             }
-            true
+            for &t in rem {
+                if Aabb::of_triangle(positions, triangles[t as usize]).overlaps(&query) {
+                    out.push(t);
+                }
+            }
         });
     }
 

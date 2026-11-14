@@ -1,10 +1,14 @@
 //! Ray casts against a mesh, accelerated by its BVH.
 
-use fast_mesh_bvh::{Aabb, Bvh, NodeKind};
+#[cfg(test)]
+use fast_mesh_bvh::Aabb;
+use fast_mesh_bvh::Bvh;
 use fast_mesh_store::{Mesh, TriangleId, par};
 
+use crate::error::{QueryError, Result};
+use crate::simd::{Tri4, ray_triangles4};
 use crate::tri::{RayPre, TriHit, ray_triangle};
-use crate::{Appender, Cull, QueryError, Result, check};
+use crate::{Appender, Cull, check};
 
 /// A ray `origin + t * dir`, in mesh-local coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,10 +64,13 @@ pub struct RayHit {
 }
 
 /// `γ₃ = 3ε / (1 − 3ε)` with `ε = f32::EPSILON / 2` (Pharr et al., Ize 2013).
+#[cfg(test)]
 const GAMMA3: f32 = 3.0 * (f32::EPSILON / 2.0) / (1.0 - 3.0 * (f32::EPSILON / 2.0));
 /// Factor that moves a slab distance away from zero.
+#[cfg(test)]
 const GROW: f32 = 1.0 + 2.0 * GAMMA3;
 /// Factor that moves a slab distance towards zero.
+#[cfg(test)]
 const SHRINK: f32 = 1.0 - 2.0 * GAMMA3;
 
 /// Slab test of the ray against `b`. Returns the entry `t`, clamped to
@@ -80,6 +87,7 @@ const SHRINK: f32 = 1.0 - 2.0 * GAMMA3;
 /// and the entry stays at or below the triangle's computed `t`; what rounds
 /// past that subtraction is relative-scale, covered by the widening.
 /// `box_enter_never_exceeds_triangle_t_at_large_coords` pins the invariant.
+#[cfg(test)]
 pub(crate) fn ray_box(pre: &RayPre, b: &Aabb, min_t: f32, max_t: f32) -> Option<f32> {
     let mut enter = f32::NEG_INFINITY;
     let mut exit = f32::INFINITY;
@@ -145,36 +153,20 @@ fn make_hit(pre: &RayPre, p: [[f32; 3]; 3], triangle: TriangleId, h: TriHit) -> 
     }
 }
 
-/// Visits, nearest box first, every node whose box the ray meets within
-/// `[opts.min_t, bound()]`, calling `leaf` for each triangle of a visited leaf.
-/// `bound` is read again before each node, so it can shrink as hits are found;
-/// it must stay within `[opts.min_t, opts.max_t]`.
-fn walk(
-    bvh: &Bvh,
-    pre: &RayPre,
-    opts: &RayOptions,
-    bound: impl Fn() -> Option<f32>,
-    mut leaf: impl FnMut(TriangleId),
+fn update_ray_best(
+    best: &mut Option<(TriangleId, TriHit)>,
+    max_t: &mut f32,
+    id: TriangleId,
+    h: TriHit,
 ) {
-    bvh.traverse_by_key(
-        |b| ray_box(pre, b, opts.min_t, opts.max_t),
-        |_, node, entry| {
-            // The box meets `[min_t, max_t]` and is entered at `entry >= min_t`,
-            // so it meets `[min_t, bound]` exactly when `entry <= bound`.
-            let Some(max_t) = bound() else {
-                return false;
-            };
-            if entry > max_t {
-                return false;
-            }
-            if let NodeKind::Leaf { triangles } = node.kind {
-                for &id in triangles {
-                    leaf(id);
-                }
-            }
-            true
-        },
-    );
+    let better = match *best {
+        None => true,
+        Some((bid, bh)) => h.t < bh.t || (h.t == bh.t && id < bid),
+    };
+    if better {
+        *best = Some((id, h));
+        *max_t = h.t;
+    }
 }
 
 fn closest(
@@ -185,31 +177,34 @@ fn closest(
     opts: &RayOptions,
 ) -> Option<RayHit> {
     let pre = RayPre::new(origin, dir);
-    let best: std::cell::Cell<Option<(TriangleId, TriHit)>> = std::cell::Cell::new(None);
-    let best_t = || best.get().map_or(opts.max_t, |(_, h)| h.t);
-    walk(
-        bvh,
-        &pre,
-        opts,
-        // Boxes entered exactly at `best_t` are still visited, so that a tie
-        // can go to the smaller id.
-        || Some(best_t()),
-        |id| {
-            let Some(h) = ray_triangle(&pre, points(mesh, id), opts.cull, opts.min_t, best_t())
-            else {
-                return;
-            };
-            let better = match best.get() {
-                None => true,
-                Some((bid, bh)) => h.t < bh.t || (h.t == bh.t && id < bid),
-            };
-            if better {
-                best.set(Some((id, h)));
+    let mut best: Option<(TriangleId, TriHit)> = None;
+    bvh.traverse_ray_slab(
+        pre.origin,
+        pre.inv_dir,
+        opts.min_t,
+        opts.max_t,
+        |triangles, _| {
+            let mut max_t = best.map_or(opts.max_t, |(_, h)| h.t);
+            let (chunks, rem) = triangles.as_chunks::<4>();
+            for &chunk in chunks {
+                let tri4 = Tri4::from_mesh(mesh, chunk);
+                let hits = ray_triangles4(&pre, &tri4, opts.cull, opts.min_t, max_t);
+                for (lane, hit) in hits.into_iter().enumerate() {
+                    if let Some(h) = hit {
+                        update_ray_best(&mut best, &mut max_t, chunk[lane], h);
+                    }
+                }
             }
+            for &id in rem {
+                if let Some(h) = ray_triangle(&pre, points(mesh, id), opts.cull, opts.min_t, max_t)
+                {
+                    update_ray_best(&mut best, &mut max_t, id, h);
+                }
+            }
+            Some(max_t)
         },
     );
-    best.get()
-        .map(|(id, h)| make_hit(&pre, points(mesh, id), id, h))
+    best.map(|(id, h)| make_hit(&pre, points(mesh, id), id, h))
 }
 
 /// The nearest hit with `opts.min_t <= t <= opts.max_t`, or `None`. Equal `t`
@@ -241,24 +236,36 @@ pub fn raycast_any(mesh: &Mesh, bvh: &Bvh, ray: &Ray, opts: &RayOptions) -> Resu
     validate_opts(opts)?;
     check(mesh, bvh)?;
     let pre = RayPre::new(ray.origin, ray.dir);
-    let found: std::cell::Cell<Option<(TriangleId, TriHit)>> = std::cell::Cell::new(None);
-    walk(
-        bvh,
-        &pre,
-        opts,
-        || found.get().is_none().then_some(opts.max_t),
-        |id| {
-            if found.get().is_none()
-                && let Some(h) =
-                    ray_triangle(&pre, points(mesh, id), opts.cull, opts.min_t, opts.max_t)
-            {
-                found.set(Some((id, h)));
+    let mut found: Option<(TriangleId, TriHit)> = None;
+    bvh.traverse_ray_slab(
+        pre.origin,
+        pre.inv_dir,
+        opts.min_t,
+        opts.max_t,
+        |triangles, _| {
+            let (chunks, rem) = triangles.as_chunks::<4>();
+            for &chunk in chunks {
+                let tri4 = Tri4::from_mesh(mesh, chunk);
+                let hits = ray_triangles4(&pre, &tri4, opts.cull, opts.min_t, opts.max_t);
+                for (lane, hit) in hits.into_iter().enumerate() {
+                    if let Some(h) = hit {
+                        found = Some((chunk[lane], h));
+                        return None;
+                    }
+                }
             }
+            for &id in rem {
+                if let Some(h) =
+                    ray_triangle(&pre, points(mesh, id), opts.cull, opts.min_t, opts.max_t)
+                {
+                    found = Some((id, h));
+                    return None;
+                }
+            }
+            Some(opts.max_t)
         },
     );
-    Ok(found
-        .get()
-        .map(|(id, h)| make_hit(&pre, points(mesh, id), id, h)))
+    Ok(found.map(|(id, h)| make_hit(&pre, points(mesh, id), id, h)))
 }
 
 /// Appends every hit with `opts.min_t <= t <= opts.max_t` to `out`, sorted by
@@ -290,25 +297,40 @@ pub fn raycast_all(
     check(mesh, bvh)?;
     let pre = RayPre::new(ray.origin, ray.dir);
     let mut ap = Appender::new(out);
-    let failed: std::cell::Cell<Option<QueryError>> = std::cell::Cell::new(None);
-    walk(
-        bvh,
-        &pre,
-        opts,
-        || failed.get().is_none().then_some(opts.max_t),
-        |id| {
-            if failed.get().is_some() {
-                return;
+    let mut failed: Option<QueryError> = None;
+    bvh.traverse_ray_slab(
+        pre.origin,
+        pre.inv_dir,
+        opts.min_t,
+        opts.max_t,
+        |triangles, _| {
+            let (chunks, rem) = triangles.as_chunks::<4>();
+            for &chunk in chunks {
+                let tri4 = Tri4::from_mesh(mesh, chunk);
+                let hits = ray_triangles4(&pre, &tri4, opts.cull, opts.min_t, opts.max_t);
+                for (lane, hit) in hits.into_iter().enumerate() {
+                    if let Some(h) = hit {
+                        let id = chunk[lane];
+                        if let Err(e) = ap.push(make_hit(&pre, points(mesh, id), id, h)) {
+                            failed = Some(e);
+                            return None;
+                        }
+                    }
+                }
             }
-            let p = points(mesh, id);
-            if let Some(h) = ray_triangle(&pre, p, opts.cull, opts.min_t, opts.max_t)
-                && let Err(e) = ap.push(make_hit(&pre, p, id, h))
-            {
-                failed.set(Some(e));
+            for &id in rem {
+                let p = points(mesh, id);
+                if let Some(h) = ray_triangle(&pre, p, opts.cull, opts.min_t, opts.max_t)
+                    && let Err(e) = ap.push(make_hit(&pre, p, id, h))
+                {
+                    failed = Some(e);
+                    return None;
+                }
             }
+            Some(opts.max_t)
         },
     );
-    if let Some(e) = failed.get() {
+    if let Some(e) = failed {
         return Err(e);
     }
     ap.appended()

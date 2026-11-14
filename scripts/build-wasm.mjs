@@ -16,7 +16,7 @@
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // The nightly for the threaded artifact (`-Z build-std` and wasm atomics are
@@ -34,7 +34,10 @@ const pkgDir = join(root, "packages", "fast-mesh-wasm");
 const threads = process.argv.includes("--threads");
 const outDir = join(pkgDir, "src", threads ? "wasm-threads" : "wasm");
 // Its own target dir, so the nightly's rebuilt std never invalidates the stable build's cache.
-const targetDir = join(root, "target", ...(threads ? ["wasm-threads"] : []));
+const baseTargetDir = process.env.CARGO_TARGET_DIR
+  ? resolve(root, process.env.CARGO_TARGET_DIR)
+  : join(root, "target");
+const targetDir = join(baseTargetDir, ...(threads ? ["wasm-threads"] : []));
 const rawWasm = join(targetDir, "wasm32-unknown-unknown", "release", "fast_mesh_wasm.wasm");
 const bgWasm = join(outDir, "fast_mesh_wasm_bg.wasm");
 
@@ -96,7 +99,7 @@ if (threads) {
   // `--max-memory` is 4 GiB (65536 pages), wasm32's limit: a shared memory needs a
   // maximum, and 10M-triangle scenes must still fit.
   const rustflags = [
-    "-C target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128",
     "-C link-arg=--shared-memory",
     "-C link-arg=--max-memory=4294967296",
     "-C link-arg=--import-memory",
@@ -122,7 +125,12 @@ if (threads) {
     { RUSTFLAGS: rustflags },
   );
 } else {
-  run("cargo", testBuild ? [...cargoArgs, "--features", "test-panic"] : cargoArgs);
+  const rustflags = [process.env.RUSTFLAGS, "-C target-feature=+simd128"]
+    .filter(Boolean)
+    .join(" ");
+  run("cargo", testBuild ? [...cargoArgs, "--features", "test-panic"] : cargoArgs, {
+    RUSTFLAGS: rustflags,
+  });
 }
 
 rmSync(outDir, { recursive: true, force: true });
@@ -140,6 +148,7 @@ const features = [
   "--enable-nontrapping-float-to-int",
   "--enable-reference-types",
   "--enable-sign-ext",
+  "--enable-simd",
   ...(threads ? ["--enable-threads"] : []),
 ];
 run(process.execPath, [wasmOpt, bgWasm, "-O3", ...features, "-o", bgWasm]);

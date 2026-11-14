@@ -59,6 +59,7 @@ mod region;
 mod rigid;
 mod section;
 mod selfpairs;
+mod simd;
 mod slice;
 #[cfg(test)]
 mod test_util;
