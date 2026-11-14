@@ -17,6 +17,7 @@ import { IMPORT_UNITS, importScaleFromFactor, importScaleOf, isImportUnit, parse
 const PHASE: Record<Job["phase"], string> = {
   reading: "reading…",
   parsing: "parsing…",
+  decimating: "decimating…",
   adding: "adding…",
   done: "loaded",
   error: "failed",

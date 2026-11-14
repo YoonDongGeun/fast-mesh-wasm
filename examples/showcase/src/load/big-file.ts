@@ -87,6 +87,36 @@ export function decimateTargetFor(triangles: number, target: number): number | n
 }
 
 /**
+ * Strictly decreasing triangle targets from `from` down to `target` in at most
+ * `maxSteps` steps, so worker decimation reports smooth progress and yields
+ * for cancellation checkpoints between steps.
+ */
+export function decimateStepTargets(from: number, target: number, maxSteps = 5): number[] {
+  const hi = Math.floor(from);
+  const lo = Math.max(1, Math.floor(target));
+  if (!Number.isFinite(hi) || !Number.isFinite(lo) || hi <= lo) {
+    return [];
+  }
+  const steps = Math.max(1, Math.min(Math.floor(maxSteps) || 1, hi - lo));
+  const out: number[] = [];
+  let prev = hi;
+  for (let i = 1; i <= steps; i++) {
+    let next = i === steps ? lo : Math.round(hi - ((hi - lo) * i) / steps);
+    if (next >= prev) {
+      next = prev - 1;
+    }
+    if (next < lo) {
+      next = lo;
+    }
+    if (next < prev) {
+      out.push(next);
+      prev = next;
+    }
+  }
+  return out;
+}
+
+/**
  * Rough in-memory bytes for a mesh: positions as f64 (24 B/vertex) plus
  * indices as u32 (12 B/triangle). Unknown vertex counts assume a closed
  * mesh (`tris / 2 + 2` vertices).

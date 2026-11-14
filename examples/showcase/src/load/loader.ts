@@ -8,7 +8,7 @@
 // op, with a post-load summary on the done job.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../scene/app-state";
-import { BIG_FILE_DEFAULTS, decimateTargetFor, parseBigFileParams, summarizeLoad } from "./big-file";
+import { BIG_FILE_DEFAULTS, parseBigFileParams, summarizeLoad } from "./big-file";
 import { isDicom } from "./dicom";
 import { PHANTOM_NAMES, type PhantomKind } from "./phantom";
 import type { LoadedMesh, LoaderReply, LoaderRequest, VolumePayload } from "./protocol";
@@ -193,13 +193,23 @@ export class Loader {
     this.#volumes.clear();
   }
 
-  #start(name: string, request: LoaderRequest): Promise<Item[]> {
+  #start(
+    name: string,
+    request: Extract<LoaderRequest, { kind: "file" | "dicom" | "phantom" | "sample" | "demo" }>,
+  ): Promise<Item[]> {
     const id = this.#nextJob++;
     this.#startedAt.set(id, Date.now());
     this.#app.setJob({ id, name, phase: "reading", progress: 0 });
+    const { decimateTriangles, decimateTarget } = loadThresholds();
+    const decimate =
+      this.#app.getSnapshot().decimateOnLoad === true
+        ? { threshold: decimateTriangles, target: decimateTarget }
+        : undefined;
+    const payload: LoaderRequest =
+      decimate === undefined ? { ...request, id } : { ...request, id, decimate };
     return new Promise((resolve) => {
       this.#waiting.set(id, { name, resolve });
-      this.#workerFor().postMessage({ ...request, id });
+      this.#workerFor().postMessage(payload);
     });
   }
 
@@ -290,13 +300,14 @@ export class Loader {
   }
 
   /**
-   * Adds the parsed meshes, decimates heavy loads (#118 simplify), then
-   * awaits the scene. Registers in `#landing` before the first await so
-   * `cancelJob` drops the pending add: no orphan meshes.
+   * Adds the parsed (and optionally worker-decimated) meshes, then awaits
+   * the scene. Registers in `#landing` before any await so `cancelJob` drops
+   * pending adds cleanly with no orphan meshes.
    */
   async #land(id: number, name: string, meshes: LoadedMesh[], resolve: (items: Item[]) => void): Promise<void> {
     const t0 = this.#startedAt.get(id) ?? Date.now();
-    this.#app.setJob({ id, name, phase: "adding", progress: 0.8 });
+    const decimated = summarizeDecimated(meshes);
+    this.#app.setJob({ id, name, phase: "adding", progress: decimated !== null ? 0.94 : 0.8 });
     let items: Item[] = [];
     try {
       items = meshes.map((m) => this.#app.addMesh(this.#store, m));
@@ -337,45 +348,7 @@ export class Loader {
         resolve([]);
       },
     });
-    const decimated = await this.#maybeDecimate(id, name, items);
-    if (settled) {
-      return;
-    }
     this.#awaitAdded(id, name, items, t0, decimated, finish);
-  }
-
-  /**
-   * Decimate-on-load: past the `?decimate-tris=` threshold (and opted in),
-   * simplifies each oversized mesh down to `?decimate-target=` through the
-   * #118 simplify op, one undo step per mesh. Returns what changed, for the
-   * post-load summary (`null` when nothing qualified).
-   */
-  async #maybeDecimate(id: number, name: string, items: Item[]): Promise<{ from: number; to: number } | null> {
-    const { decimateTriangles, decimateTarget } = loadThresholds();
-    if (this.#app.getSnapshot().decimateOnLoad !== true) {
-      return null;
-    }
-    const total = items.reduce((n, i) => n + i.triangles, 0);
-    const big = items.filter((i) => decimateTargetFor(i.triangles, decimateTarget) !== null);
-    if (total < decimateTriangles || big.length === 0) {
-      return null;
-    }
-    this.#app.setJob({ id, name, phase: "adding", progress: 0.9 });
-    let from = 0;
-    let to = 0;
-    for (const item of big) {
-      if (this.#cancelled.has(id)) {
-        return null;
-      }
-      from += item.triangles;
-      try {
-        await this.#store.repair(item.mesh, { op: "simplify", targetTriangles: decimateTarget });
-        to += Math.round(this.#store.scene.views(item.mesh).indices().length / 3);
-      } catch {
-        to += item.triangles;
-      }
-    }
-    return { from, to };
   }
 
   /**
@@ -454,6 +427,21 @@ export class Loader {
     const offStore = this.#store.subscribe(check);
     check();
   }
+}
+
+/** Combines per-mesh worker decimation tallies for the job summary (`null` when none ran). */
+function summarizeDecimated(meshes: readonly LoadedMesh[]): { from: number; to: number } | null {
+  let from = 0;
+  let to = 0;
+  let any = false;
+  for (const m of meshes) {
+    if (m.decimated !== undefined) {
+      any = true;
+      from += m.decimated.from;
+      to += m.decimated.to;
+    }
+  }
+  return any ? { from, to } : null;
 }
 
 /** Clamps a worker fraction into 0..1 (a corrupt reply never widens the bar). */
