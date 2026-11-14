@@ -39,8 +39,9 @@
 //!   allow_unclean, fair, dp_limit, max_dihedral, max_refine_vertices`;
 //!   `loop_count` (NaN for no id list) loop ids are taken from `loops`.
 //! - `5` inflate: `cx, cy, cz, radius, falloff (0 linear, 1 smooth),
-//!   strength`.
-//! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles`.
+//!   strength, method (NaN/0 vertexNormal, 1 averageNormal, 2 strokeNormal)`.
+//! - `6` smooth: `cx, cy, cz, radius, falloff, strength, cycles,
+//!   method (NaN/0 taubin, 1 laplacian, 2 hcLaplacian, 3 cotangent)`.
 //! - `7` remesh: `cx, cy, cz, radius, target_length (NaN for the mesh mean),
 //!   max_rounds (NaN for the default), split_only (0 or 1)`.
 //! - `16` split stretched: `cx, cy, cz, radius, limit (NaN for the default),
@@ -49,12 +50,23 @@
 //!   [`fast_mesh_ops::stretch`].
 //! - `17` capture rest sizes: `only_if_missing (0 or 1)`. Must be the only
 //!   operation of its list, because it is not an edit.
+//! - `18` capture stroke state: `only_if_missing (0 or 1)`. Must be the only
+//!   operation of its list, because it is not an edit.
+//! - `19` flatten: `cx, cy, cz, radius, falloff, strength, mode (0 both,
+//!   1 peaks, 2 valleys), has_origin (0/1), ox, oy, oz, has_normal (0/1),
+//!   nx, ny, nz`.
+//! - `20` crease: `cx, cy, cz, radius, falloff, strength, pinch (NaN for 0.5)`.
+//! - `21` clay: `cx, cy, cz, radius, falloff, strength, profile (0 round,
+//!   1 strips), has_tangent (0/1), tx, ty, tz`.
+//! - `22` twist: `cx, cy, cz, radius, falloff, strength, method (0 vortex,
+//!   1 kelvinlet), has_axis (0/1), ax, ay, az`.
 //! - `8` bridge loops: `max_edges (NaN for the default)`; exactly two loop
 //!   ids are taken from `loops`.
 //! - `9` grab: `cx, cy, cz, radius, falloff (0 linear, 1 smooth), strength,
-//!   dx, dy, dz`.
-//! - `10` relax: like `6` smooth, but plain Laplacian passes instead of
-//!   Taubin λ/μ cycles.
+//!   dx, dy, dz, method (NaN/0 sphere, 1 geodesic, 2 kelvinlet),
+//!   poisson (NaN for 0.4), from_stroke (0/1), adaptive_reach (0/1)`.
+//! - `10` relax: `cx, cy, cz, radius, falloff, strength, cycles` (plain
+//!   Laplacian passes).
 //! - `11` offset: `distance`.
 //! - `12` shell: `thickness`.
 //! - `13` simplify: `target_triangles, preserve_boundary (0 or 1)`.
@@ -66,10 +78,14 @@
 //!   [`AutoRepairOptions`]. Its report is, for each stage in the order it
 //!   ran, the code of the op that stage is, then that op's report.
 //!
-//! - `32` protect: `n, id × n, weight × n`, then the op it wraps, which must
-//!   be inflate, smooth, grab or relax. That op runs under
-//!   [`with_protection`](fast_mesh_ops::with_protection) and reports as usual;
-//!   `32` adds no report of its own. Its code stays clear of the ops, which count up.
+//! - `32` protect: `n, band (0.0 when unset), id × n, weight × n`, wrapping a
+//!   brush op (`5, 6, 9, 10, 19, 20, 21, 22`), composable in either order with
+//!   `33`. Runs under [`with_protection_band`](fast_mesh_ops::protect::with_protection_band)
+//!   and reports as usual; `32` adds no report of its own.
+//! - `33` brush modifiers: `sym_mask (0..=7 bitmask: x=1, y=2, z=4),
+//!   filter_kind (0 none, 1 peaksOnly, 2 valleysOnly, 3 normalAngle), p0, p1,
+//!   has_vec (0/1), vx, vy, vz`, wrapping a brush op (`5, 6, 9, 10, 19, 20,
+//!   21, 22`) and composable in either order with `32`.
 //!
 //! A loop id is four `u32`s: `min_vertex, len, hash low, hash high`. The
 //! reports, concatenated in op order (`f64`):
@@ -91,6 +107,10 @@
 //! - bridge loops: `triangles_added`.
 //! - grab: `moved, max_displacement`.
 //! - relax: `moved, max_displacement`.
+//! - flatten: `moved, max_displacement`.
+//! - crease: `moved, max_displacement`.
+//! - clay: `moved, max_displacement`.
+//! - twist: `moved, max_displacement`.
 //! - offset: `moved, max_displacement, degenerate_removed, vertices_removed`.
 //! - shell: `vertices_added, triangles_added, loops_closed, degenerate_removed,
 //!   vertices_removed`.
@@ -98,18 +118,23 @@
 //! - subdivide: `vertices_added, triangles_added`.
 //! - split stretched: `splits, remaining, (new vertex, a, b) x splits`.
 //! - capture rest sizes: nothing.
+//! - capture stroke state: nothing.
 //!
 //! # Analysis
 //!
 //! One `f64` array, see [`encode_analysis`].
 
 use fast_mesh_ops::bridge::BridgeOptions;
-use fast_mesh_ops::deform::{
-    Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions,
-};
+use fast_mesh_ops::protect::with_protection_band;
 use fast_mesh_ops::remesh::{REMESH_MAX_ROUNDS, Region, RemeshOptions};
+use fast_mesh_ops::sculpt::{
+    Brush, ClayOptions, ClayProfile, CreaseOptions, Falloff, FlattenMode, FlattenOptions,
+    GrabMethod, GrabOptions, InflateMethod, InflateOptions, SmoothMethod, SmoothOptions,
+    SurfaceFilter, Symmetry, TwistMethod, TwistOptions, clay, crease, flatten, grab, inflate,
+    smooth, twist,
+};
 use fast_mesh_ops::simplify::SimplifyOptions;
-use fast_mesh_ops::stretch::StretchOptions;
+use fast_mesh_ops::stretch::{StretchOptions, StretchReport};
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
     Analysis, AutoRepairOptions, AutoRepairStage, ComponentOptions, DegenerateOptions, FailReason,
@@ -417,6 +442,10 @@ pub(crate) enum RepairOp {
     Remesh(RemeshOptions),
     Bridge(BridgeOptions),
     Grab(GrabOptions),
+    Flatten(FlattenOptions),
+    Crease(CreaseOptions),
+    Clay(ClayOptions),
+    Twist(TwistOptions),
     Offset(f32),
     Shell(f32),
     Simplify(SimplifyOptions),
@@ -427,10 +456,15 @@ pub(crate) enum RepairOp {
     CaptureRest {
         only_if_missing: bool,
     },
+    /// Not an edit: `WasmScene::repair` runs it outside the transaction.
+    CaptureStroke {
+        only_if_missing: bool,
+    },
     /// A brush op whose moves are scaled per vertex.
     Protected {
         vertices: Vec<u32>,
         weights: Vec<f32>,
+        band: f32,
         op: Box<RepairOp>,
     },
 }
@@ -455,6 +489,23 @@ fn falloff(v: f64) -> Result<Falloff, Error> {
     } else {
         Err(Error::invalid("falloff must be 0 (linear) or 1 (smooth)"))
     }
+}
+
+fn finite_vec3(raw: [f64; 3], what: &str) -> Result<[f32; 3], Error> {
+    let v = [raw[0] as f32, raw[1] as f32, raw[2] as f32];
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(Error::invalid(&format!("{what} must be finite")));
+    }
+    Ok(v)
+}
+
+fn nonzero_vec3(raw: [f64; 3], what: &str) -> Result<[f32; 3], Error> {
+    let v = finite_vec3(raw, what)?;
+    let len = (f64::from(v[0]).powi(2) + f64::from(v[1]).powi(2) + f64::from(v[2]).powi(2)).sqrt();
+    if !(len > 0.0 && len.is_finite()) {
+        return Err(Error::invalid(&format!("{what} must be non-zero")));
+    }
+    Ok(v)
 }
 
 /// A count, or `None` for NaN.
@@ -484,12 +535,24 @@ pub(crate) fn loop_id(w: [u32; 4]) -> LoopId {
     }
 }
 
-/// Decodes a protection's `n, id × n, weight × n`; the range of a weight and
-/// the liveness of a vertex are checked when it runs.
-fn decode_protect(words: &mut Cursor<'_, f64>) -> Result<(Vec<u32>, Vec<f32>), Error> {
+/// Decodes a protection's `n, band, id × n, weight × n`; the range of a weight
+/// and the liveness of a vertex are checked when it runs.
+fn decode_protect(words: &mut Cursor<'_, f64>) -> Result<(Vec<u32>, Vec<f32>, f32), Error> {
     let n = count_opt(words.next()?, "protect count")?.ok_or_else(|| malformed("repair"))?;
+    let band_raw = words.next()?;
+    let band = if band_raw.is_nan() {
+        0.0
+    } else {
+        let b = band_raw as f32;
+        if !b.is_finite() || b < 0.0 {
+            return Err(Error::invalid(
+                "protect band must be finite and non-negative",
+            ));
+        }
+        b
+    };
     let ids = words.take(n)?;
-    let weights = words.take(n)?;
+    let raw_weights = words.take(n)?;
     let mut vertices = Vec::new();
     vertices
         .try_reserve_exact(n)
@@ -500,7 +563,145 @@ fn decode_protect(words: &mut Cursor<'_, f64>) -> Result<(Vec<u32>, Vec<f32>), E
         }
         vertices.push(id as u32);
     }
-    Ok((vertices, weights.iter().map(|&w| w as f32).collect()))
+    let mut weights = reserved(n)?;
+    weights.extend(raw_weights.iter().map(|&w| w as f32));
+    Ok((vertices, weights, band))
+}
+
+/// Decodes brush modifiers `33`:
+/// `sym_mask (0..=7), filter_kind (0..=3), p0, p1, has_vec (0/1), vx, vy, vz`.
+fn decode_brush_modifiers(words: &mut Cursor<'_, f64>) -> Result<(Symmetry, SurfaceFilter), Error> {
+    let [sym_mask, filter_kind, p0, p1, has_vec, vx, vy, vz]: [f64; 8] =
+        words.take(8)?.try_into().map_err(|_| malformed("repair"))?;
+    let mask = count_opt(sym_mask, "symmetry mask")?.ok_or_else(|| malformed("repair"))?;
+    if mask > 7 {
+        return Err(Error::invalid("symmetry mask must be in 0..=7"));
+    }
+    let symmetry = Symmetry {
+        x: (mask & 1) != 0,
+        y: (mask & 2) != 0,
+        z: (mask & 4) != 0,
+    };
+    let has_vec = flag(has_vec)?;
+    let filter = if filter_kind == 0.0 {
+        if has_vec {
+            return Err(malformed("repair"));
+        }
+        SurfaceFilter::None
+    } else if filter_kind == 1.0 || filter_kind == 2.0 {
+        if has_vec {
+            return Err(malformed("repair"));
+        }
+        let threshold = if p0.is_nan() { 0.0 } else { p0 as f32 };
+        if !(0.0..=1.0).contains(&threshold) {
+            return Err(Error::invalid(
+                "surface filter threshold must be finite and in [0, 1]",
+            ));
+        }
+        let contrast = if p1.is_nan() { 0.5 } else { p1 as f32 };
+        if !(0.0..=1.0).contains(&contrast) {
+            return Err(Error::invalid(
+                "surface filter contrast must be finite and in [0, 1]",
+            ));
+        }
+        if filter_kind == 1.0 {
+            SurfaceFilter::PeaksOnly {
+                threshold,
+                contrast,
+            }
+        } else {
+            SurfaceFilter::ValleysOnly {
+                threshold,
+                contrast,
+            }
+        }
+    } else if filter_kind == 3.0 {
+        let max_angle_deg = if p0.is_nan() { 45.0 } else { p0 as f32 };
+        if !(max_angle_deg > 0.0 && max_angle_deg <= 180.0) {
+            return Err(Error::invalid(
+                "surface filter maxAngleDeg must be finite and in (0, 180]",
+            ));
+        }
+        let normal = if has_vec {
+            Some(nonzero_vec3([vx, vy, vz], "surface filter normal")?)
+        } else {
+            None
+        };
+        SurfaceFilter::NormalAngle {
+            normal,
+            max_angle_deg,
+        }
+    } else {
+        return Err(Error::invalid("surface filter kind must be 0..=3"));
+    };
+    Ok((symmetry, filter))
+}
+
+fn is_brush_op(op: &RepairOp) -> bool {
+    matches!(
+        op,
+        RepairOp::Inflate(_)
+            | RepairOp::Smooth(_)
+            | RepairOp::Grab(_)
+            | RepairOp::Flatten(_)
+            | RepairOp::Crease(_)
+            | RepairOp::Clay(_)
+            | RepairOp::Twist(_)
+    )
+}
+
+fn apply_brush_modifiers(
+    op: &mut RepairOp,
+    symmetry: Symmetry,
+    filter: SurfaceFilter,
+) -> Result<(), Error> {
+    match op {
+        RepairOp::Inflate(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Smooth(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Grab(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Flatten(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Crease(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Clay(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        RepairOp::Twist(o) => {
+            o.symmetry = symmetry;
+            o.filter = filter;
+        }
+        _ => {
+            return Err(Error::invalid(
+                "brushModifiers applies only to brush operations",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_cycles(cycles: f64) -> Result<u32, Error> {
+    // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
+    // which on wasm32 equals `u32::MAX`, so without this check any
+    // larger value would decode to billions of cycles.
+    if !cycles.is_nan() && cycles > f64::from(u32::MAX) {
+        return Err(Error::invalid("cycles is too large"));
+    }
+    let cycles = count_opt(cycles, "cycles")?.unwrap_or_default();
+    u32::try_from(cycles).map_err(|_| Error::invalid("cycles is too large"))
 }
 
 /// Decodes a repair op list (see the module docs). The operations check
@@ -514,8 +715,9 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
     let mut words = Cursor::new(ops, WHAT);
     let mut ids = Cursor::new(loops, WHAT);
     let mut out = Vec::new();
-    // The protection read last, waiting for the op it wraps.
-    let mut protect: Option<(Vec<u32>, Vec<f32>)> = None;
+    // Prefix wrappers (`32` protect and `33` brushModifiers), composable in either order.
+    let mut protect: Option<(Vec<u32>, Vec<f32>, f32)> = None;
+    let mut modifiers: Option<(Symmetry, SurfaceFilter)> = None;
     while !words.is_empty() {
         let code = words.next()?;
         if code == 32.0 {
@@ -525,7 +727,14 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             protect = Some(decode_protect(&mut words)?);
             continue;
         }
-        let op = if code == 0.0 {
+        if code == 33.0 {
+            if modifiers.is_some() {
+                return Err(malformed(WHAT));
+            }
+            modifiers = Some(decode_brush_modifiers(&mut words)?);
+            continue;
+        }
+        let mut op = if code == 0.0 {
             RepairOp::Weld(words.next()? as f32)
         } else if code == 1.0 {
             let [eps, unused] = words.take(2)?.try_into().map_err(|_| malformed(WHAT))?;
@@ -572,8 +781,17 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             }
             RepairOp::Fill(o)
         } else if code == 5.0 {
-            let [cx, cy, cz, radius, fo, strength]: [f64; 6] =
-                words.take(6)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [cx, cy, cz, radius, fo, strength, method]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let method = if method.is_nan() || method == 0.0 {
+                InflateMethod::VertexNormal
+            } else if method == 1.0 {
+                InflateMethod::AverageNormal
+            } else if method == 2.0 {
+                InflateMethod::StrokeNormal
+            } else {
+                return Err(Error::invalid("inflate method must be 0..=2"));
+            };
             RepairOp::Inflate(InflateOptions {
                 brush: Brush {
                     center: [cx as f32, cy as f32, cz as f32],
@@ -581,18 +799,23 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     falloff: falloff(fo)?,
                     strength: strength as f32,
                 },
+                method,
                 ..Default::default()
             })
-        } else if code == 6.0 || code == 10.0 {
-            let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
-                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
-            // Before `count_opt`: `v as usize` saturates at `usize::MAX`,
-            // which on wasm32 equals `u32::MAX`, so without this check any
-            // larger value would decode to billions of cycles.
-            if !cycles.is_nan() && cycles > f64::from(u32::MAX) {
-                return Err(Error::invalid("cycles is too large"));
-            }
-            let cycles = count_opt(cycles, "cycles")?.unwrap_or_default();
+        } else if code == 6.0 {
+            let [cx, cy, cz, radius, fo, strength, cycles, method]: [f64; 8] =
+                words.take(8)?.try_into().map_err(|_| malformed(WHAT))?;
+            let method = if method.is_nan() || method == 0.0 {
+                SmoothMethod::Taubin
+            } else if method == 1.0 {
+                SmoothMethod::Laplacian
+            } else if method == 2.0 {
+                SmoothMethod::HcLaplacian
+            } else if method == 3.0 {
+                SmoothMethod::Cotangent
+            } else {
+                return Err(Error::invalid("smooth method must be 0..=3"));
+            };
             RepairOp::Smooth(SmoothOptions {
                 brush: Brush {
                     center: [cx as f32, cy as f32, cz as f32],
@@ -600,12 +823,22 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     falloff: falloff(fo)?,
                     strength: strength as f32,
                 },
-                cycles: u32::try_from(cycles).map_err(|_| Error::invalid("cycles is too large"))?,
-                method: if code == 10.0 {
-                    SmoothMethod::Laplacian
-                } else {
-                    SmoothMethod::Taubin
+                cycles: decode_cycles(cycles)?,
+                method,
+                ..Default::default()
+            })
+        } else if code == 10.0 {
+            let [cx, cy, cz, radius, fo, strength, cycles]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            RepairOp::Smooth(SmoothOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
                 },
+                cycles: decode_cycles(cycles)?,
+                method: SmoothMethod::Laplacian,
                 ..Default::default()
             })
         } else if code == 7.0 {
@@ -639,8 +872,41 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 max_edges: count_opt(max_e, "maxEdges")?,
             })
         } else if code == 9.0 {
-            let [cx, cy, cz, radius, fo, strength, dx, dy, dz]: [f64; 9] =
-                words.take(9)?.try_into().map_err(|_| malformed(WHAT))?;
+            let [
+                cx,
+                cy,
+                cz,
+                radius,
+                fo,
+                strength,
+                dx,
+                dy,
+                dz,
+                method,
+                poisson,
+                from_stroke,
+                adaptive_reach,
+            ]: [f64; 13] = words.take(13)?.try_into().map_err(|_| malformed(WHAT))?;
+            let method = if method.is_nan() || method == 0.0 {
+                GrabMethod::Sphere
+            } else if method == 1.0 {
+                GrabMethod::Geodesic
+            } else if method == 2.0 {
+                GrabMethod::Kelvinlet
+            } else {
+                return Err(Error::invalid("grab method must be 0..=2"));
+            };
+            let poisson = if poisson.is_nan() {
+                0.4
+            } else {
+                let p = poisson as f32;
+                if !(0.0..=0.5).contains(&p) {
+                    return Err(Error::invalid(
+                        "grab poisson must be finite and in [0, 0.5]",
+                    ));
+                }
+                p
+            };
             RepairOp::Grab(GrabOptions {
                 brush: Brush {
                     center: [cx as f32, cy as f32, cz as f32],
@@ -649,6 +915,10 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                     strength: strength as f32,
                 },
                 direction: [dx as f32, dy as f32, dz as f32],
+                method,
+                poisson,
+                from_stroke: flag(from_stroke)?,
+                adaptive_reach: flag(adaptive_reach)?,
                 ..Default::default()
             })
         } else if code == 11.0 {
@@ -735,30 +1005,180 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
             RepairOp::CaptureRest {
                 only_if_missing: flag(only_if_missing)?,
             }
+        } else if code == 18.0 {
+            let [only_if_missing]: [f64; 1] =
+                words.take(1)?.try_into().map_err(|_| malformed(WHAT))?;
+            RepairOp::CaptureStroke {
+                only_if_missing: flag(only_if_missing)?,
+            }
+        } else if code == 19.0 {
+            let [
+                cx,
+                cy,
+                cz,
+                radius,
+                fo,
+                strength,
+                mode,
+                has_origin,
+                ox,
+                oy,
+                oz,
+                has_normal,
+                nx,
+                ny,
+                nz,
+            ]: [f64; 15] = words.take(15)?.try_into().map_err(|_| malformed(WHAT))?;
+            let mode = if mode.is_nan() || mode == 0.0 {
+                FlattenMode::Both
+            } else if mode == 1.0 {
+                FlattenMode::Peaks
+            } else if mode == 2.0 {
+                FlattenMode::Valleys
+            } else {
+                return Err(Error::invalid("flatten mode must be 0..=2"));
+            };
+            let plane_origin = if flag(has_origin)? {
+                Some(finite_vec3([ox, oy, oz], "flatten planeOrigin")?)
+            } else {
+                None
+            };
+            let plane_normal = if flag(has_normal)? {
+                Some(nonzero_vec3([nx, ny, nz], "flatten planeNormal")?)
+            } else {
+                None
+            };
+            RepairOp::Flatten(FlattenOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                mode,
+                plane_origin,
+                plane_normal,
+                ..Default::default()
+            })
+        } else if code == 20.0 {
+            let [cx, cy, cz, radius, fo, strength, pinch]: [f64; 7] =
+                words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let pinch = if pinch.is_nan() {
+                0.5
+            } else {
+                let p = pinch as f32;
+                if !(0.0..=1.0).contains(&p) {
+                    return Err(Error::invalid("crease pinch must be finite and in [0, 1]"));
+                }
+                p
+            };
+            RepairOp::Crease(CreaseOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                pinch,
+                ..Default::default()
+            })
+        } else if code == 21.0 {
+            let [
+                cx,
+                cy,
+                cz,
+                radius,
+                fo,
+                strength,
+                profile,
+                has_tangent,
+                tx,
+                ty,
+                tz,
+            ]: [f64; 11] = words.take(11)?.try_into().map_err(|_| malformed(WHAT))?;
+            let profile = if profile.is_nan() || profile == 0.0 {
+                ClayProfile::Round
+            } else if profile == 1.0 {
+                ClayProfile::Strips
+            } else {
+                return Err(Error::invalid("clay profile must be 0..=1"));
+            };
+            let tangent = if flag(has_tangent)? {
+                Some(nonzero_vec3([tx, ty, tz], "clay tangent")?)
+            } else {
+                None
+            };
+            RepairOp::Clay(ClayOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                profile,
+                tangent,
+                ..Default::default()
+            })
+        } else if code == 22.0 {
+            let [
+                cx,
+                cy,
+                cz,
+                radius,
+                fo,
+                strength,
+                method,
+                has_axis,
+                ax,
+                ay,
+                az,
+            ]: [f64; 11] = words.take(11)?.try_into().map_err(|_| malformed(WHAT))?;
+            let method = if method.is_nan() || method == 0.0 {
+                TwistMethod::Vortex
+            } else if method == 1.0 {
+                TwistMethod::Kelvinlet
+            } else {
+                return Err(Error::invalid("twist method must be 0..=1"));
+            };
+            let axis = if flag(has_axis)? {
+                Some(nonzero_vec3([ax, ay, az], "twist axis")?)
+            } else {
+                None
+            };
+            RepairOp::Twist(TwistOptions {
+                brush: Brush {
+                    center: [cx as f32, cy as f32, cz as f32],
+                    radius: radius as f32,
+                    falloff: falloff(fo)?,
+                    strength: strength as f32,
+                },
+                axis,
+                method,
+                ..Default::default()
+            })
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
+        if let Some((symmetry, filter)) = modifiers.take() {
+            apply_brush_modifiers(&mut op, symmetry, filter)?;
+        }
         out.try_reserve(1).map_err(|_| oom())?;
         out.push(match protect.take() {
             None => op,
-            Some((vertices, weights)) => {
-                if !matches!(
-                    op,
-                    RepairOp::Inflate(_) | RepairOp::Smooth(_) | RepairOp::Grab(_)
-                ) {
-                    return Err(Error::invalid(
-                        "protect applies to inflate, smooth, relax and grab",
-                    ));
+            Some((vertices, weights, band)) => {
+                if !is_brush_op(&op) {
+                    return Err(Error::invalid("protect applies only to brush operations"));
                 }
                 RepairOp::Protected {
                     vertices,
                     weights,
+                    band,
                     op: Box::new(op),
                 }
             }
         });
     }
-    if protect.is_some() {
+    if protect.is_some() || modifiers.is_some() {
         return Err(malformed(WHAT));
     }
     if !ids.is_empty() {
@@ -854,6 +1274,14 @@ fn put_stage(out: &mut Vec<f64>, stage: AutoRepairStage) -> Result<(), StoreErro
     }
 }
 
+pub(crate) fn put_stretch(out: &mut Vec<f64>, r: &StretchReport) -> Result<(), StoreError> {
+    put(out, &[count(r.splits), count(r.remaining)])?;
+    for [id, a, b] in &r.vertices {
+        put(out, &[f64::from(*id), f64::from(*a), f64::from(*b)])?;
+    }
+    Ok(())
+}
+
 /// Runs decoded repair ops in `tx`, in order, and returns their reports
 /// (see the module docs).
 ///
@@ -901,29 +1329,31 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::Protected {
                 vertices,
                 weights,
+                band,
                 op,
             } => {
-                let report = fast_mesh_ops::with_protection(tx, vertices, weights, |tx| {
+                let report = with_protection_band(tx, None, vertices, weights, *band, |tx| {
                     run_repair(tx, std::slice::from_ref(op))
                 })?;
                 put(&mut out, &report)?;
             }
             RepairOp::Inflate(o) => {
-                let r = fast_mesh_ops::deform::inflate(tx, o)?;
+                let r = inflate(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
             RepairOp::Smooth(o) => {
-                let r = fast_mesh_ops::deform::smooth(tx, o)?;
+                let r = smooth(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
             RepairOp::SplitStretched(o) => {
                 let r = fast_mesh_ops::stretch::split_stretched(tx, o)?;
-                put(&mut out, &[count(r.splits), count(r.remaining)])?;
-                for [id, a, b] in &r.vertices {
-                    put(&mut out, &[f64::from(*id), f64::from(*a), f64::from(*b)])?;
-                }
+                put_stretch(&mut out, &r)?;
             }
-            RepairOp::CaptureRest { .. } => {}
+            RepairOp::CaptureRest { .. } | RepairOp::CaptureStroke { .. } => {
+                return Err(OpsError::InvalidInput(
+                    "capture op must be the only operation in its list",
+                ));
+            }
             RepairOp::Remesh(o) => {
                 let r = fast_mesh_ops::remesh::remesh(tx, o)?;
                 put(
@@ -941,7 +1371,23 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
                 put(&mut out, &[count(r.triangles_added)])?;
             }
             RepairOp::Grab(o) => {
-                let r = fast_mesh_ops::deform::grab(tx, o)?;
+                let r = grab(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Flatten(o) => {
+                let r = flatten(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Crease(o) => {
+                let r = crease(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Clay(o) => {
+                let r = clay(tx, o)?;
+                put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
+            }
+            RepairOp::Twist(o) => {
+                let r = twist(tx, o)?;
                 put(&mut out, &[count(r.moved), f64::from(r.max_displacement)])?;
             }
             RepairOp::Offset(distance) => {
@@ -1143,7 +1589,8 @@ mod tests {
 
     #[test]
     fn decode_repair_rejects_cycles_edges() {
-        let smooth = |cycles: f64| decode_repair(&[6., 0., 0., 0., 1., 0., 1., cycles], &[]);
+        let smooth =
+            |cycles: f64| decode_repair(&[6., 0., 0., 0., 1., 0., 1., cycles, f64::NAN], &[]);
         let code = |cycles: f64| smooth(cycles).unwrap_err().code;
         assert_eq!(code(-1.), codes::INVALID_ARGUMENT);
         assert_eq!(code(2f64.powi(32)), codes::INVALID_ARGUMENT);
@@ -1183,12 +1630,14 @@ mod tests {
                 ..Default::default()
             })]
         );
-        // Code 6 keeps Taubin.
-        let d = decode_repair(&[6., 1., 2., 3., 4., 1., 0.5, 2.], &[]).unwrap();
-        assert!(matches!(
-            d.as_slice(),
-            [RepairOp::Smooth(o)] if o.method == SmoothMethod::Taubin
-        ));
+        // Code 6 keeps Taubin when method is NaN or 0, and supports 1..=3.
+        for method in [f64::NAN, 0.] {
+            let d = decode_repair(&[6., 1., 2., 3., 4., 1., 0.5, 2., method], &[]).unwrap();
+            assert!(matches!(
+                d.as_slice(),
+                [RepairOp::Smooth(o)] if o.method == SmoothMethod::Taubin
+            ));
+        }
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
         assert_eq!(code(&[10.]), codes::INVALID_ARGUMENT);
         assert_eq!(
@@ -1409,14 +1858,15 @@ mod tests {
 
     #[test]
     fn decode_repair_protect() {
-        let brush = [5., 1., 2., 3., 4., 1., 0.5];
-        let mut list = vec![32., 2., 7., 9., 0., 0.25];
+        let brush = [5., 1., 2., 3., 4., 1., 0.5, f64::NAN];
+        let mut list = vec![32., 2., 0.75, 7., 9., 0., 0.25];
         list.extend(brush);
         let d = decode_repair(&list, &[]).unwrap();
         let [
             RepairOp::Protected {
                 vertices,
                 weights,
+                band,
                 op,
             },
         ] = d.as_slice()
@@ -1425,23 +1875,50 @@ mod tests {
         };
         assert_eq!(vertices, &[7, 9]);
         assert_eq!(weights, &[0.0, 0.25]);
+        assert_eq!(*band, 0.75);
         assert!(matches!(**op, RepairOp::Inflate(_)));
 
-        // Nothing to wrap, two in a row, or an op that is not a brush.
-        assert!(decode_repair(&[32., 0.], &[]).is_err());
-        assert!(decode_repair(&[32., 0., 32., 0., 5.], &[]).is_err());
-        assert!(decode_repair(&[32., 0., 3.], &[]).is_err());
+        // Nothing to wrap, two in a row, negative band, or an op that is not a brush.
+        assert!(decode_repair(&[32., 0., 0.], &[]).is_err());
+        assert!(
+            decode_repair(
+                &[32., 0., 0., 32., 0., 0., 5., 0., 0., 0., 1., 0., 1., 0.],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(decode_repair(&[32., 0., -0.1, 5., 0., 0., 0., 1., 0., 1., 0.], &[]).is_err());
+        assert!(decode_repair(&[32., 0., 0., 3.], &[]).is_err());
         // Cut short, and an id that is not a u32.
-        assert!(decode_repair(&[32., 2., 7.], &[]).is_err());
-        assert!(decode_repair(&[32., 1., 0.5, 0.], &[]).is_err());
-        assert!(decode_repair(&[32., 1., -1., 0.], &[]).is_err());
+        assert!(decode_repair(&[32., 2., 0., 7.], &[]).is_err());
+        assert!(decode_repair(&[32., 1., 0., 0.5, 0.], &[]).is_err());
+        assert!(decode_repair(&[32., 1., 0., -1., 0.], &[]).is_err());
     }
 
     #[test]
     fn decode_repair_grab() {
-        use fast_mesh_ops::deform::{Brush, Falloff, GrabOptions};
+        use fast_mesh_ops::sculpt::{Brush, Falloff, GrabMethod, GrabOptions};
 
-        let d = decode_repair(&[9., 1., 2., 3., 4., 1., 0.5, 5., 6., 7.], &[]).unwrap();
+        let d = decode_repair(
+            &[
+                9.,
+                1.,
+                2.,
+                3.,
+                4.,
+                1.,
+                0.5,
+                5.,
+                6.,
+                7.,
+                f64::NAN,
+                f64::NAN,
+                0.,
+                0.,
+            ],
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             d,
             vec![RepairOp::Grab(GrabOptions {
@@ -1455,6 +1932,28 @@ mod tests {
                 ..Default::default()
             })]
         );
+        let d2 = decode_repair(
+            &[9., 1., 2., 3., 4., 0., 0.5, 1., 0., 0., 2., 0.25, 1., 1.],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            d2,
+            vec![RepairOp::Grab(GrabOptions {
+                brush: Brush {
+                    center: [1.0, 2.0, 3.0],
+                    radius: 4.0,
+                    falloff: Falloff::Linear,
+                    strength: 0.5,
+                },
+                direction: [1.0, 0.0, 0.0],
+                method: GrabMethod::Kelvinlet,
+                poisson: 0.25,
+                from_stroke: true,
+                adaptive_reach: true,
+                ..Default::default()
+            })]
+        );
         let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
         assert_eq!(code(&[9.]), codes::INVALID_ARGUMENT);
         assert_eq!(
@@ -1462,7 +1961,136 @@ mod tests {
             codes::INVALID_ARGUMENT
         );
         assert_eq!(
-            code(&[9., 0., 0., 0., 1., 2., 1., 0., 0., 0.]),
+            code(&[9., 0., 0., 0., 1., 2., 1., 0., 0., 0., 0., 0.4, 0., 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[9., 0., 0., 0., 1., 1., 1., 1., 0., 0., 2., 0.9, 0., 0.]),
+            codes::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn decode_repair_sculpt_methods_and_modifiers() {
+        use fast_mesh_ops::sculpt::{
+            ClayOptions, ClayProfile, CreaseOptions, FlattenMode, FlattenOptions, InflateMethod,
+            SmoothMethod, SurfaceFilter, Symmetry, TwistMethod, TwistOptions,
+        };
+
+        let nan = f64::NAN;
+        // Inflate methods 0..=2 and smooth methods 0..=3.
+        let d = decode_repair(
+            &[
+                5., 0., 0., 0., 1., 1., 0.2, 2., //
+                6., 0., 0., 0., 1., 1., 0.5, 3., 3., //
+                18., 1., //
+                19., 0., 0., 0., 2., 1., 0.8, 1., 1., 1., 2., 3., 0., 0., 0., 0., //
+                20., 0., 0., 0., 1., 1., 0.4, 0.7, //
+                21., 0., 0., 0., 1., 0., 0.5, 1., 1., 1., 0., 0., //
+                22., 0., 0., 0., 1., 1., 1.2, 1., 1., 0., 0., 1.,
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            d[0],
+            RepairOp::Inflate(o) if o.method == InflateMethod::StrokeNormal
+        ));
+        assert!(matches!(
+            d[1],
+            RepairOp::Smooth(o) if o.method == SmoothMethod::Cotangent && o.cycles == 3
+        ));
+        assert_eq!(
+            d[2],
+            RepairOp::CaptureStroke {
+                only_if_missing: true
+            }
+        );
+        assert!(matches!(
+            d[3],
+            RepairOp::Flatten(FlattenOptions {
+                mode: FlattenMode::Peaks,
+                plane_origin: Some([1.0, 2.0, 3.0]),
+                plane_normal: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            d[4],
+            RepairOp::Crease(CreaseOptions { pinch, .. }) if (pinch - 0.7).abs() < 1e-6
+        ));
+        assert!(matches!(
+            d[5],
+            RepairOp::Clay(ClayOptions {
+                profile: ClayProfile::Strips,
+                tangent: Some([1.0, 0.0, 0.0]),
+                ..
+            })
+        ));
+        assert!(matches!(
+            d[6],
+            RepairOp::Twist(TwistOptions {
+                method: TwistMethod::Kelvinlet,
+                axis: Some([0.0, 0.0, 1.0]),
+                ..
+            })
+        ));
+
+        // 32 (protect) and 33 (brushModifiers) compose in BOTH wire orders.
+        let p = [32., 1., 0.5, 4., 0.];
+        let m = [33., 3., 3., 30., 0., 1., 0., 0., 1.];
+        let b = [5., 0., 0., 0., 1., 1., 0.5, 1.];
+        let mut order_a = Vec::new();
+        order_a.extend(p);
+        order_a.extend(m);
+        order_a.extend(b);
+        let mut order_b = Vec::new();
+        order_b.extend(m);
+        order_b.extend(p);
+        order_b.extend(b);
+        let da = decode_repair(&order_a, &[]).unwrap();
+        let db = decode_repair(&order_b, &[]).unwrap();
+        assert_eq!(da, db);
+        let [
+            RepairOp::Protected {
+                vertices, band, op, ..
+            },
+        ] = da.as_slice()
+        else {
+            panic!("expected protected op");
+        };
+        assert_eq!(vertices, &[4]);
+        assert_eq!(*band, 0.5);
+        let RepairOp::Inflate(inf) = **op else {
+            panic!("expected inflate");
+        };
+        assert_eq!(inf.method, InflateMethod::AverageNormal);
+        assert_eq!(
+            inf.symmetry,
+            Symmetry {
+                x: true,
+                y: true,
+                z: false
+            }
+        );
+        assert_eq!(
+            inf.filter,
+            SurfaceFilter::NormalAngle {
+                normal: Some([0.0, 0.0, 1.0]),
+                max_angle_deg: 30.0,
+            }
+        );
+
+        // Invalid maxAngleDeg (0) and non-brush wrapped by 33 fail up front.
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(
+            code(&[
+                33., 0., 3., 0., 0., 0., 0., 0., 0., 5., 0., 0., 0., 1., 1., 0.5, nan
+            ]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[33., 1., 0., 0., 0., 0., 0., 0., 0., 3.]),
             codes::INVALID_ARGUMENT
         );
     }

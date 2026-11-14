@@ -40,6 +40,9 @@ import type {
   RepairOp,
   RepairReport,
   RepairReportOf,
+  SculptOp,
+  SculptReport,
+  SculptReportOf,
   SectionDesc,
   SectionGap,
   SectionPlane,
@@ -1791,6 +1794,38 @@ export class WorkerScene implements SceneLike {
     return this.#ask(
       (rev, qid) => ({ kind: "repair", rev, id: this.#live(mesh).id, payload: copyInput(op, "op"), qid }),
       (v) => v as RepairReport | RepairReport[] | AutoRepairReport,
+    );
+  }
+
+  /** Sculpt domain entry point; see `Scene.sculpt`. */
+  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): Promise<SculptReportOf<O>>;
+  sculpt<const O extends readonly SculptOp[]>(
+    mesh: MeshHandle,
+    ops: O,
+  ): Promise<{ -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
+  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]> {
+    return this.repair(mesh, op as RepairOp) as Promise<SculptReport | SculptReport[]>;
+  }
+
+  /**
+   * Live triangle-used vertex ids of `mesh` inside the closed local-space
+   * sphere `(center, radius)`, in ascending order; see `Scene.verticesInSphere`.
+   */
+  verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array> {
+    return this.#query(
+      "verticesInSphere",
+      () => {
+        const id = this.#live(mesh).id;
+        const c = center as readonly number[] | undefined;
+        if (c?.length !== 3 || ![c[0], c[1], c[2]].every((x) => typeof x === "number" && Number.isFinite(x))) {
+          throw invalid("center must be 3 finite numbers");
+        }
+        if (typeof radius !== "number" || !Number.isFinite(radius) || radius < 0) {
+          throw invalid("radius must be a finite non-negative number");
+        }
+        return { mesh: id, center: [c[0], c[1], c[2]] as Vec3, radius };
+      },
+      (v) => v,
     );
   }
 

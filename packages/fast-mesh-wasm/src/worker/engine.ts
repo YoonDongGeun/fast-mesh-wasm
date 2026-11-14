@@ -1474,7 +1474,14 @@ class Engine {
    */
   #inSteps(req: Extract<Request, { kind: "edit" | "repair" }>): boolean {
     return (
-      Array.isArray(req.payload) && req.payload.length > 1 && this.#drag === undefined && !this.#scene.canRedo()
+      Array.isArray(req.payload) &&
+      req.payload.length > 1 &&
+      !req.payload.some((o) => {
+        const name = (o as { op?: unknown } | null)?.op;
+        return name === "captureRestSizes" || name === "captureStrokeState";
+      }) &&
+      this.#drag === undefined &&
+      !this.#scene.canRedo()
     );
   }
 
@@ -1769,7 +1776,7 @@ class Engine {
       case "section":
         this.#runSection(req);
         return;
-      case "query":
+      case "query": {
         if (
           req.name === "fieldStatus" ||
           req.name === "fieldNearest" ||
@@ -1778,8 +1785,13 @@ class Engine {
         ) {
           this.#settleFields();
         }
-        b.replies.push({ qid: req.qid, ok: true, value: this.#query(req.name, req.args) });
+        const value = this.#query(req.name, req.args);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        if (req.name === "verticesInSphere" && value instanceof Uint32Array) {
+          b.transfer.push(value.buffer);
+        }
         return;
+      }
       case "fetchFieldValues": {
         this.#settleFields();
         const values = s.fieldValues(this.#field(req.field)).slice();
@@ -1945,6 +1957,10 @@ class Engine {
       case "measure": {
         const a = args as QueryMap["measure"]["args"];
         return s.measure(this.#mesh(a.mesh));
+      }
+      case "verticesInSphere": {
+        const a = args as QueryMap["verticesInSphere"]["args"];
+        return s.verticesInSphere(this.#mesh(a.mesh), a.center, a.radius);
       }
       case "fieldTargetStatus": {
         const a = args as QueryMap["fieldTargetStatus"]["args"];

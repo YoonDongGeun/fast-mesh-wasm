@@ -32,7 +32,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::edit::{
     RepairOp, count_opt, decode_edit, decode_repair, encode_added, encode_analysis, loop_id,
-    run_edit, run_repair,
+    put_stretch, run_edit, run_repair,
 };
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
@@ -1019,6 +1019,10 @@ impl WasmScene {
             RepairOp::Inflate(o) => Some(Dab::Inflate(*o)),
             RepairOp::Smooth(o) => Some(Dab::Smooth(*o)),
             RepairOp::Grab(o) => Some(Dab::Grab(*o)),
+            RepairOp::Flatten(o) => Some(Dab::Flatten(*o)),
+            RepairOp::Crease(o) => Some(Dab::Crease(*o)),
+            RepairOp::Clay(o) => Some(Dab::Clay(*o)),
+            RepairOp::Twist(o) => Some(Dab::Twist(*o)),
             _ => None,
         };
         let dab = match decoded.as_slice() {
@@ -1026,14 +1030,17 @@ impl WasmScene {
                 RepairOp::Protected {
                     vertices,
                     weights,
+                    band,
                     op,
                 },
-            ] => dab_of(op).map(|d| (d, vertices.as_slice(), weights.as_slice())),
-            [op] => dab_of(op).map(|d| (d, &[][..], &[][..])),
+            ] => dab_of(op).map(|d| (d, vertices.as_slice(), weights.as_slice(), *band)),
+            [op] => dab_of(op).map(|d| (d, &[][..], &[][..], 0.0)),
             _ => None,
         };
-        if let Some((dab, vertices, weights)) = dab {
-            let r = self.scene.dab_protected(id, &dab, vertices, weights)?;
+        if let Some((dab, vertices, weights, band)) = dab {
+            let r = self
+                .scene
+                .dab_protected_band(id, &dab, vertices, weights, band)?;
             return Ok(vec![count(r.moved), f64::from(r.max_displacement)]);
         }
         if let [RepairOp::CaptureRest { only_if_missing }] = decoded.as_slice() {
@@ -1049,6 +1056,26 @@ impl WasmScene {
                 "captureRestSizes must be the only operation in its list",
             ));
         }
+        if let [RepairOp::CaptureStroke { only_if_missing }] = decoded.as_slice() {
+            self.scene.capture_stroke_state(id, *only_if_missing)?;
+            return Ok(Vec::new());
+        }
+        if decoded
+            .iter()
+            .any(|op| matches!(op, RepairOp::CaptureStroke { .. }))
+        {
+            // Not an edit, so it cannot join a transaction.
+            return Err(Error::invalid(
+                "captureStrokeState must be the only operation in its list",
+            ));
+        }
+        if let [RepairOp::SplitStretched(o)] = decoded.as_slice() {
+            self.scene.ensure_incidence(id)?;
+            let r = self.scene.split_stretched(id, o)?;
+            let mut out = Vec::new();
+            put_stretch(&mut out, &r)?;
+            return Ok(out);
+        }
         if decoded
             .iter()
             .any(|op| matches!(op, RepairOp::SplitStretched(_)))
@@ -1056,6 +1083,24 @@ impl WasmScene {
             self.scene.ensure_incidence(id)?;
         }
         Ok(self.scene.edit(id, |tx| run_repair(tx, &decoded))?)
+    }
+
+    /// Live triangle-used vertex ids of a mesh inside the closed local-space
+    /// sphere `(cx, cy, cz, radius)`, in ascending order. Brings a Lazy BVH up
+    /// to date first; refuses a stale Manual BVH with `STALE_BVH`.
+    pub fn vertices_in_sphere(
+        &mut self,
+        index: u32,
+        generation: u32,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        radius: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self
+            .scene
+            .vertices_in_sphere(id, [cx as f32, cy as f32, cz as f32], radius as f32)?)
     }
 
     /// Joins mesh B into mesh A: copies B's geometry into A, bridges the two
@@ -3085,5 +3130,65 @@ mod tests {
         assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
         assert!(s.undo().unwrap());
         assert_eq!(s.triangle_count(ai, ag).unwrap(), 2);
+    }
+
+    #[test]
+    fn sculpt_stroke_survives_split_stretched_and_vertices_in_sphere() {
+        let mut s = WasmScene::new();
+        // 5x5 flat grid on [-2, 2]^2 (z = 0), origin = [0, 0, 0].
+        let mut pos = Vec::new();
+        let mut tris = Vec::new();
+        let n = 4u32;
+        for y in 0..=n {
+            for x in 0..=n {
+                pos.extend([f64::from(x) - 2.0, f64::from(y) - 2.0, 0.0]);
+            }
+        }
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * (n + 1) + x;
+                tris.extend([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]);
+            }
+        }
+        let id = s.add_mesh(&pos, &tris, None, 0, true).unwrap();
+        let (i, g) = (id[0], id[1]);
+
+        // vertices_in_sphere around center (0, 0, 0) with radius 0.5 finds only center vertex 12.
+        assert_eq!(
+            s.vertices_in_sphere(i, g, 0., 0., 0., 0.5).unwrap(),
+            vec![12]
+        );
+        assert_eq!(
+            code(s.vertices_in_sphere(i, g + 1, 0., 0., 0., 1.)),
+            codes::UNKNOWN_MESH
+        );
+        assert_eq!(
+            code(s.vertices_in_sphere(i, g, 0., 0., 0., -0.1)),
+            codes::INVALID_ARGUMENT
+        );
+
+        // captureStrokeState cannot mix in a multi-op list.
+        assert_eq!(
+            code(s.repair(i, g, &[3., 18., 0.], &[])),
+            codes::INVALID_ARGUMENT
+        );
+
+        // Capture rest sizes + stroke state, grab from stroke, splitStretched, then grab from stroke again!
+        assert_eq!(s.repair(i, g, &[17., 0.], &[]).unwrap(), Vec::<f64>::new());
+        assert_eq!(s.repair(i, g, &[18., 0.], &[]).unwrap(), Vec::<f64>::new());
+        let nan = f64::NAN;
+        let grab1 = [9., 0., 0., 0., 1.5, 1., 1., 0., 0., 2., 0., nan, 1., 1.];
+        let r1 = s.repair(i, g, &grab1, &[]).unwrap();
+        assert!(r1[0] > 0.0);
+        // Single splitStretched op routes through Scene::split_stretched so stroke state survives.
+        let split = [16., 0., 0., 0., 10., nan, nan, 1., nan];
+        let sr = s.repair(i, g, &split, &[]).unwrap();
+        assert!(sr[0] > 0.0, "expected splits: {sr:?}");
+        // Subsequent from_stroke grab evaluates relative to the original z=0 rest plane (not cumulative!).
+        let grab2 = [9., 0., 0., 0., 1.5, 1., 1., 0., 0., 2.5, 0., nan, 1., 1.];
+        let r2 = s.repair(i, g, &grab2, &[]).unwrap();
+        assert!(r2[0] > 0.0);
+        let mesh = s.scene.mesh(s.id(i, g).unwrap()).unwrap();
+        assert!((mesh.positions()[12][2] - 2.5).abs() < 1e-4);
     }
 }

@@ -19,4 +19,25 @@ export {
   sectionState,
   type Status,
 } from "./snapshot.js";
+export type {
+  CaptureRestReport,
+  CaptureStrokeReport,
+  ClayProfile,
+  ClayReport,
+  CreaseReport,
+  FlattenMode,
+  FlattenReport,
+  GrabMethod,
+  InflateMethod,
+  RepairReportOf,
+  SculptOp,
+  SculptReport,
+  SculptReportOf,
+  SmoothMethod,
+  SurfaceFilter,
+  Symmetry,
+  TwistMethod,
+  TwistReport,
+  VertexProtection,
+} from "../scene.js";
 export { createSceneStore, SceneStore, type SectionPatch } from "./store.js";

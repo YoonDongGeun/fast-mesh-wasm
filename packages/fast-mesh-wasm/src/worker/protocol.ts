@@ -183,6 +183,7 @@ export interface QueryMap {
   };
   analyze: { args: { mesh: ClientId; options?: AnalyzeOptions }; value: unknown };
   measure: { args: { mesh: ClientId }; value: MeasureResult };
+  verticesInSphere: { args: { mesh: ClientId; center: Vec3; radius: number }; value: Uint32Array };
   fieldStatus: { args: { field: ClientId }; value: unknown };
   fieldNearest: { args: { field: ClientId }; value: unknown };
   fieldTargetStatus: { args: { field: ClientId }; value: unknown };
