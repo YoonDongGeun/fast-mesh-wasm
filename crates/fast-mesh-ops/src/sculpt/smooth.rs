@@ -200,8 +200,12 @@ pub fn smooth(tx: &mut Transaction, options: &SmoothOptions) -> Result<SmoothRep
             continue;
         }
         let hit = masks[..mask_count].iter().any(|&bits| {
-            normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                .is_some()
+            normalized_dist(
+                reflect_vec(bits, options.brush.center),
+                options.brush.radius,
+                p,
+            )
+            .is_some()
         });
         if hit {
             push(&mut candidates, v)?;
@@ -247,8 +251,12 @@ pub fn smooth_region(
             }
             let p = &positions[v as usize];
             let hit = masks[..mask_count].iter().any(|&bits| {
-                normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                    .is_some()
+                normalized_dist(
+                    reflect_vec(bits, options.brush.center),
+                    options.brush.radius,
+                    p,
+                )
+                .is_some()
             });
             if hit {
                 push(&mut candidates, v)?;
@@ -371,7 +379,10 @@ fn smooth_candidates<'f>(
         }
     }
 
-    let need_auto_normal = matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+    let need_auto_normal = matches!(
+        options.filter,
+        SurfaceFilter::NormalAngle { normal: None, .. }
+    );
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 
     // Reusable per-pass scratch buffers.

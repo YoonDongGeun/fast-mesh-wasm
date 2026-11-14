@@ -196,10 +196,9 @@ fn grab_slope(falloff: Falloff, method: GrabMethod) -> f32 {
 /// choose for `(brush, direction, method)`:
 /// `(|brush.strength| * ||direction|| * slope / GRAB_MAX_STRETCH).max(brush.radius)`.
 pub fn grab_widest_reach(brush: &Brush, direction: [f32; 3], method: GrabMethod) -> f32 {
-    let dir_len = (direction[0] * direction[0]
-        + direction[1] * direction[1]
-        + direction[2] * direction[2])
-        .sqrt();
+    let dir_len =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
     let length = brush.strength.abs() * dir_len;
     let slope = grab_slope(brush.falloff, method);
     let wide = length * slope / GRAB_MAX_STRETCH;
@@ -291,9 +290,9 @@ pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
         if options.from_stroke && !same_bits(&curr, &base) {
             return true;
         }
-        masks[..mask_count]
-            .iter()
-            .any(|&bits| normalized_dist(reflect_vec(bits, options.brush.center), max_reach, &base).is_some())
+        masks[..mask_count].iter().any(|&bits| {
+            normalized_dist(reflect_vec(bits, options.brush.center), max_reach, &base).is_some()
+        })
     });
     if !any_work {
         return Ok(GrabReport::default());
@@ -325,14 +324,9 @@ pub fn grab(tx: &mut Transaction, options: &GrabOptions) -> Result<GrabReport> {
         None
     };
 
-    let (ids, moved_to, report) = grab_candidates(
-        mesh,
-        options,
-        &candidates,
-        None,
-        &[],
-        |v| fans.as_ref().map_or(&[], |f| f.fan(v)),
-    )?;
+    let (ids, moved_to, report) = grab_candidates(mesh, options, &candidates, None, &[], |v| {
+        fans.as_ref().map_or(&[], |f| f.fan(v))
+    })?;
     write_moves(tx, &ids, &moved_to)?;
     Ok(report)
 }
@@ -412,14 +406,9 @@ pub fn grab_region_with_stroke(
             return Ok(GrabReport::default());
         }
 
-        grab_candidates(
-            mesh,
-            options,
-            &candidates,
-            stroke,
-            zero_protected,
-            |v| index.map_or(&[], |idx| idx.triangles(v)),
-        )?
+        grab_candidates(mesh, options, &candidates, stroke, zero_protected, |v| {
+            index.map_or(&[], |idx| idx.triangles(v))
+        })?
     };
     write_moves(tx, &ids, &moved_to)?;
     Ok(report)
@@ -678,7 +667,10 @@ fn grab_candidates<'f>(
         }
     }
 
-    let need_auto_normal = matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+    let need_auto_normal = matches!(
+        options.filter,
+        SurfaceFilter::NormalAngle { normal: None, .. }
+    );
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 
     // Reusable Geodesic scratch buffers across symmetry passes.
@@ -735,11 +727,7 @@ fn grab_candidates<'f>(
                     }
                     let w = brush.strength * a_m;
                     let dp = [w * dir_m[0], w * dir_m[1], w * dir_m[2]];
-                    let single_pos = [
-                        p_base[0] + dp[0],
-                        p_base[1] + dp[1],
-                        p_base[2] + dp[2],
-                    ];
+                    let single_pos = [p_base[0] + dp[0], p_base[1] + dp[1], p_base[2] + dp[2]];
                     envelopes[cand_idx].add(a_m, dp, single_pos);
                 }
             }
@@ -766,22 +754,16 @@ fn grab_candidates<'f>(
                         p_base[1] - center_m[1],
                         p_base[2] - center_m[2],
                     ];
-                    let (a_m, dp) =
-                        eval_grab_kelvinlet(offset, r_eff, t, g, options.poisson, phi);
+                    let (a_m, dp) = eval_grab_kelvinlet(offset, r_eff, t, g, options.poisson, phi);
                     if a_m > 0.0 {
-                        let single_pos = [
-                            p_base[0] + dp[0],
-                            p_base[1] + dp[1],
-                            p_base[2] + dp[2],
-                        ];
+                        let single_pos = [p_base[0] + dp[0], p_base[1] + dp[1], p_base[2] + dp[2]];
                         envelopes[cand_idx].add(a_m, dp, single_pos);
                     }
                 }
             }
             GrabMethod::Geodesic => {
                 pass_in_sphere.clear();
-                for (cand_idx, (&v, &p_base)) in
-                    candidates.iter().zip(&base_positions).enumerate()
+                for (cand_idx, (&v, &p_base)) in candidates.iter().zip(&base_positions).enumerate()
                 {
                     if normalized_dist(center_m, r_eff, &p_base).is_some() {
                         push(&mut pass_in_sphere, (cand_idx, v, p_base))?;
@@ -951,11 +933,7 @@ fn grab_candidates<'f>(
                     }
                     let w = brush.strength * a_m;
                     let dp = [w * dir_m[0], w * dir_m[1], w * dir_m[2]];
-                    let single_pos = [
-                        p_base[0] + dp[0],
-                        p_base[1] + dp[1],
-                        p_base[2] + dp[2],
-                    ];
+                    let single_pos = [p_base[0] + dp[0], p_base[1] + dp[1], p_base[2] + dp[2]];
                     envelopes[cand_idx].add(a_m, dp, single_pos);
                 }
             }

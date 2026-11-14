@@ -104,18 +104,6 @@ pub use cleanup::{
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
 pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
-pub use sculpt::{
-    Brush, ClayOptions, ClayOptionsBuilder, ClayProfile, ClayReport, CreaseOptions,
-    CreaseOptionsBuilder, CreaseReport, Falloff, FlattenMode, FlattenOptions,
-    FlattenOptionsBuilder, FlattenReport, GRAB_MAX_STRETCH, GrabMethod, GrabOptions,
-    GrabOptionsBuilder, GrabReport, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions,
-    InflateOptionsBuilder, InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod,
-    SmoothOptions, SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry,
-    TAUBIN_LAMBDA, TAUBIN_MU, TwistMethod, TwistOptions, TwistOptionsBuilder, TwistReport,
-    capture_stroke_state, clay, clay_region, crease, crease_region, ensure_stroke_state, flatten,
-    flatten_region, grab, grab_region, grab_region_with_stroke, grab_widest_reach, inflate,
-    inflate_region, inflate_region_with_stroke, smooth, smooth_region, twist, twist_region,
-};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
@@ -129,6 +117,18 @@ pub use offset::{
 };
 pub use orient::{OrientReport, orient};
 pub use protect::{check_protection, with_protection, with_protection_band};
+pub use sculpt::{
+    Brush, ClayOptions, ClayOptionsBuilder, ClayProfile, ClayReport, CreaseOptions,
+    CreaseOptionsBuilder, CreaseReport, Falloff, FlattenMode, FlattenOptions,
+    FlattenOptionsBuilder, FlattenReport, GRAB_MAX_STRETCH, GrabMethod, GrabOptions,
+    GrabOptionsBuilder, GrabReport, HC_ALPHA, HC_BETA, InflateMethod, InflateOptions,
+    InflateOptionsBuilder, InflateReport, STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, SmoothMethod,
+    SmoothOptions, SmoothOptionsBuilder, SmoothReport, StrokeSlice, SurfaceFilter, Symmetry,
+    TAUBIN_LAMBDA, TAUBIN_MU, TwistMethod, TwistOptions, TwistOptionsBuilder, TwistReport,
+    capture_stroke_state, clay, clay_region, crease, crease_region, ensure_stroke_state, flatten,
+    flatten_region, grab, grab_region, grab_region_with_stroke, grab_widest_reach, inflate,
+    inflate_region, inflate_region_with_stroke, smooth, smooth_region, twist, twist_region,
+};
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 
 use fast_mesh_store::StoreError;

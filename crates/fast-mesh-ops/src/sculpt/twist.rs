@@ -198,8 +198,12 @@ pub fn twist(tx: &mut Transaction, options: &TwistOptions) -> Result<TwistReport
             continue;
         }
         let hit = masks[..mask_count].iter().any(|&bits| {
-            normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                .is_some()
+            normalized_dist(
+                reflect_vec(bits, options.brush.center),
+                options.brush.radius,
+                p,
+            )
+            .is_some()
         });
         if hit {
             push(&mut candidates, v)?;
@@ -251,8 +255,12 @@ pub fn twist_region(
             }
             let p = &positions[v as usize];
             let hit = masks[..mask_count].iter().any(|&bits| {
-                normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                    .is_some()
+                normalized_dist(
+                    reflect_vec(bits, options.brush.center),
+                    options.brush.radius,
+                    p,
+                )
+                .is_some()
             });
             if hit {
                 push(&mut candidates, v)?;
@@ -305,7 +313,10 @@ fn twist_candidates<'f>(
     }
 
     let need_auto_normal = options.axis.is_none()
-        || matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+        || matches!(
+            options.filter,
+            SurfaceFilter::NormalAngle { normal: None, .. }
+        );
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 
     for &bits in &masks[..mask_count] {

@@ -172,8 +172,12 @@ pub fn crease(tx: &mut Transaction, options: &CreaseOptions) -> Result<CreaseRep
             continue;
         }
         let hit = masks[..mask_count].iter().any(|&bits| {
-            normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                .is_some()
+            normalized_dist(
+                reflect_vec(bits, options.brush.center),
+                options.brush.radius,
+                p,
+            )
+            .is_some()
         });
         if hit {
             push(&mut candidates, v)?;
@@ -217,8 +221,12 @@ pub fn crease_region(
             }
             let p = &positions[v as usize];
             let hit = masks[..mask_count].iter().any(|&bits| {
-                normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                    .is_some()
+                normalized_dist(
+                    reflect_vec(bits, options.brush.center),
+                    options.brush.radius,
+                    p,
+                )
+                .is_some()
             });
             if hit {
                 push(&mut candidates, v)?;
@@ -267,7 +275,10 @@ fn crease_candidates<'f>(
         }
     }
 
-    let need_auto_normal = matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+    let need_auto_normal = matches!(
+        options.filter,
+        SurfaceFilter::NormalAngle { normal: None, .. }
+    );
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 
     for &bits in &masks[..mask_count] {
@@ -303,11 +314,7 @@ fn crease_candidates<'f>(
             }
 
             let normal_scale = brush.strength * f_val * a_m;
-            let offset = [
-                center_m[0] - p[0],
-                center_m[1] - p[1],
-                center_m[2] - p[2],
-            ];
+            let offset = [center_m[0] - p[0], center_m[1] - p[1], center_m[2] - p[2]];
             let proj = offset[0] * n_v[0] + offset[1] * n_v[1] + offset[2] * n_v[2];
             let tan = [
                 offset[0] - proj * n_v[0],

@@ -1457,7 +1457,10 @@ mod tests {
             // External position-only edit mid-stroke: no topology changes, only `vertices_moved`.
             let p_before = s.mesh(id).unwrap().positions()[v_center as usize];
             s.edit(id, |tx| {
-                tx.set_positions(&[v_center], &[[p_before[0], p_before[1], p_before[2] + 0.5]])
+                tx.set_positions(
+                    &[v_center],
+                    &[[p_before[0], p_before[1], p_before[2] + 0.5]],
+                )
             })
             .unwrap();
 

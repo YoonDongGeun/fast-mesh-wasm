@@ -13,8 +13,8 @@ mod tests {
 
     use super::*;
     use crate::sculpt::{brush_weight, falloff_value};
-    use crate::{OpsError, Result, fail_allocations_after};
     use crate::test_util::{edit, mesh_of, parts, sweep};
+    use crate::{OpsError, Result, fail_allocations_after};
 
     /// A 3x3 flat grid in `z = 0`, spacing 1, centered at the origin; vertex
     /// `(x, y)` has id `y * 3 + x`, wound counter-clockwise from `+z`.

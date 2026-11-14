@@ -38,7 +38,12 @@ fn symmetric_sheet(half: i32, lift: impl Fn(f32, f32) -> f32) -> Mesh {
     let mut triangles = Vec::new();
     for iy in -half..half {
         for ix in -half..half {
-            let (a, b, c, d) = (at(ix, iy), at(ix + 1, iy), at(ix + 1, iy + 1), at(ix, iy + 1));
+            let (a, b, c, d) = (
+                at(ix, iy),
+                at(ix + 1, iy),
+                at(ix + 1, iy + 1),
+                at(ix, iy + 1),
+            );
             // Mirror diagonal choice across quadrants so connectivity is x- and y-symmetric.
             let same_sign = (ix >= 0) == (iy >= 0);
             if same_sign {
@@ -349,8 +354,7 @@ fn smooth_hc_laplacian_resists_sphere_shrinkage_while_reducing_noise() {
             .positions()
             .iter()
             .map(|p| {
-                (f64::from(p[0]).powi(2) + f64::from(p[1]).powi(2) + f64::from(p[2]).powi(2))
-                    .sqrt()
+                (f64::from(p[0]).powi(2) + f64::from(p[1]).powi(2) + f64::from(p[2]).powi(2)).sqrt()
             })
             .collect();
         let mean = radii.iter().sum::<f64>() / radii.len() as f64;
@@ -412,9 +416,7 @@ fn smooth_cotangent_keeps_irregular_flat_interior_vertex_stationary() {
     // Vertex 0 at (0, 0, 0), surrounded by a coarse left rim and a densely subdivided right rim
     // on the plane z = 0.
     let mut positions = vec![0.0f32, 0.0, 0.0];
-    let ring_angles_deg: [f64; 9] = [
-        -60.0, -35.0, -15.0, 0.0, 15.0, 35.0, 60.0, 140.0, 220.0,
-    ];
+    let ring_angles_deg: [f64; 9] = [-60.0, -35.0, -15.0, 0.0, 15.0, 35.0, 60.0, 140.0, 220.0];
     for &deg in &ring_angles_deg {
         let rad = deg.to_radians();
         positions.extend([rad.cos() as f32, rad.sin() as f32, 0.0]);
@@ -562,12 +564,12 @@ fn surface_filter_peaks_valleys_and_normal_angle_selectively_mask_features() {
         let mut triangles = Vec::new();
         // 6 faces: +z, -z, +x, -x, +y, -y (outward wound)
         let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
-            ([-1.0, -1.0, 1.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]),   // +z
-            ([-1.0, 1.0, -1.0], [2.0, 0.0, 0.0], [0.0, -2.0, 0.0]),  // -z
-            ([1.0, -1.0, -1.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]),   // +x
-            ([-1.0, 1.0, -1.0], [0.0, -2.0, 0.0], [0.0, 0.0, 2.0]),  // -x
-            ([1.0, 1.0, -1.0], [-2.0, 0.0, 0.0], [0.0, 0.0, 2.0]),   // +y
-            ([-1.0, -1.0, -1.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]),  // -y
+            ([-1.0, -1.0, 1.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]), // +z
+            ([-1.0, 1.0, -1.0], [2.0, 0.0, 0.0], [0.0, -2.0, 0.0]), // -z
+            ([1.0, -1.0, -1.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]), // +x
+            ([-1.0, 1.0, -1.0], [0.0, -2.0, 0.0], [0.0, 0.0, 2.0]), // -x
+            ([1.0, 1.0, -1.0], [-2.0, 0.0, 0.0], [0.0, 0.0, 2.0]), // +y
+            ([-1.0, -1.0, -1.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]), // -y
         ];
         for (origin, u_dir, v_dir) in faces {
             let base = (positions.len() / 3) as u32;
@@ -810,9 +812,21 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
                 let p = mesh.positions()[v as usize];
                 masks[..count].iter().any(|&bits| {
                     let c = [
-                        if bits & 1 != 0 { -brush.center[0] } else { brush.center[0] },
-                        if bits & 2 != 0 { -brush.center[1] } else { brush.center[1] },
-                        if bits & 4 != 0 { -brush.center[2] } else { brush.center[2] },
+                        if bits & 1 != 0 {
+                            -brush.center[0]
+                        } else {
+                            brush.center[0]
+                        },
+                        if bits & 2 != 0 {
+                            -brush.center[1]
+                        } else {
+                            brush.center[1]
+                        },
+                        if bits & 4 != 0 {
+                            -brush.center[2]
+                        } else {
+                            brush.center[2]
+                        },
                     ];
                     let d2 = (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2);
                     d2.sqrt() / brush.radius < 1.0
@@ -883,8 +897,12 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
                     capture_stroke_state(&mut whole).unwrap();
                     capture_stroke_state(&mut reg).unwrap();
                     // Perturb a vertex first so stroke normal differs from current normal!
-                    edit(&mut whole, |tx| Ok(tx.set_positions(&[40], &[[0.0, 0.0, 1.5]])?));
-                    edit(&mut reg, |tx| Ok(tx.set_positions(&[40], &[[0.0, 0.0, 1.5]])?));
+                    edit(&mut whole, |tx| {
+                        Ok(tx.set_positions(&[40], &[[0.0, 0.0, 1.5]])?)
+                    });
+                    edit(&mut reg, |tx| {
+                        Ok(tx.set_positions(&[40], &[[0.0, 0.0, 1.5]])?)
+                    });
                     reg.ensure_incidence().unwrap();
                 }
                 let candidates = region_union(&reg, &brush, symmetry);
@@ -917,8 +935,12 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
             .as_chunks::<3>()
             .0
             .to_vec();
-        edit(&mut a, |tx| Ok(tx.set_positions(&[42], &[[0.2, -0.3, 1.4]])?));
-        edit(&mut b, |tx| Ok(tx.set_positions(&[42], &[[0.2, -0.3, 1.4]])?));
+        edit(&mut a, |tx| {
+            Ok(tx.set_positions(&[42], &[[0.2, -0.3, 1.4]])?)
+        });
+        edit(&mut b, |tx| {
+            Ok(tx.set_positions(&[42], &[[0.2, -0.3, 1.4]])?)
+        });
         b.ensure_incidence().unwrap();
         let opts = InflateOptions {
             brush,
@@ -990,7 +1012,11 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
     assert!(sweep(base_mesh(), |tx| inflate(tx, &inf_opts).map(drop)) > 3);
     let reg_mesh = base_mesh();
     let reg_ids = region_union(&reg_mesh, &brush, oom_sym);
-    assert!(sweep(reg_mesh, |tx| inflate_region(tx, &inf_opts, &reg_ids).map(drop)) > 3);
+    assert!(
+        sweep(reg_mesh, |tx| inflate_region(tx, &inf_opts, &reg_ids)
+            .map(drop))
+            > 3
+    );
 
     for method in [SmoothMethod::HcLaplacian, SmoothMethod::Cotangent] {
         let sm_opts = SmoothOptions {
@@ -1005,7 +1031,11 @@ fn region_parity_bit_for_bit_and_oom_rollback_sweeps() {
         };
         assert!(sweep(base_mesh(), |tx| smooth(tx, &sm_opts).map(drop)) > 4);
         let reg_mesh = base_mesh();
-        assert!(sweep(reg_mesh, |tx| smooth_region(tx, &sm_opts, &reg_ids).map(drop)) > 4);
+        assert!(
+            sweep(reg_mesh, |tx| smooth_region(tx, &sm_opts, &reg_ids)
+                .map(drop))
+                > 4
+        );
     }
 
     // Confirm Transaction parameter type works directly in signatures.
@@ -1233,7 +1263,10 @@ fn grab_kelvinlet_calibrates_center_couples_poisson_and_validates() {
     // and poisson = 0.45 differs distinctly from poisson = 0.0.
     let dy_high = m_high.positions()[diag_id][1] - before[diag_id][1];
     let dy_zero = m_zero.positions()[diag_id][1] - before[diag_id][1];
-    assert!(dy_high.abs() > 1e-3, "off-axis lateral dy should be non-zero: {dy_high}");
+    assert!(
+        dy_high.abs() > 1e-3,
+        "off-axis lateral dy should be non-zero: {dy_high}"
+    );
     assert!(
         (dy_high - dy_zero).abs() > 5e-3,
         "poisson 0.45 ({dy_high}) vs 0.0 ({dy_zero}) must produce distinct lateral coupling"
@@ -1481,10 +1514,21 @@ fn extra_brushes_flatten_crease_clay_and_twist_follow_expected_geometry() {
         if p0[2] > 0.2 {
             assert!(pb[2] < p0[2] && pb[2] > 0.0, "Both lowers peak toward z=0");
             assert!(pp[2] < p0[2], "Peaks scrapes z > 0 down");
-            assert_eq!(pv.map(f32::to_bits), p0.map(f32::to_bits), "Valleys leaves z > 0 untouched");
+            assert_eq!(
+                pv.map(f32::to_bits),
+                p0.map(f32::to_bits),
+                "Valleys leaves z > 0 untouched"
+            );
         } else if p0[2] < -0.2 {
-            assert!(pb[2] > p0[2] && pb[2] < 0.0, "Both raises valley toward z=0");
-            assert_eq!(pp.map(f32::to_bits), p0.map(f32::to_bits), "Peaks leaves z < 0 untouched");
+            assert!(
+                pb[2] > p0[2] && pb[2] < 0.0,
+                "Both raises valley toward z=0"
+            );
+            assert_eq!(
+                pp.map(f32::to_bits),
+                p0.map(f32::to_bits),
+                "Peaks leaves z < 0 untouched"
+            );
             assert!(pv[2] > p0[2], "Valleys fills z < 0 up");
         }
     }
@@ -1511,9 +1555,15 @@ fn extra_brushes_flatten_crease_clay_and_twist_follow_expected_geometry() {
         let r0 = p0[0].hypot(p0[1]);
         let r1 = p1[0].hypot(p1[1]);
         if r0 < 3.5 {
-            assert!(p1[2] < -1e-4, "Crease with strength < 0 carves groove: {p0:?} -> {p1:?}");
+            assert!(
+                p1[2] < -1e-4,
+                "Crease with strength < 0 carves groove: {p0:?} -> {p1:?}"
+            );
             if r0 > 0.0 {
-                assert!(r1 < r0, "Crease with pinch > 0 pulls radially inward: {r0} -> {r1}");
+                assert!(
+                    r1 < r0,
+                    "Crease with pinch > 0 pulls radially inward: {r0} -> {r1}"
+                );
             }
         }
     }
@@ -1536,7 +1586,11 @@ fn extra_brushes_flatten_crease_clay_and_twist_follow_expected_geometry() {
     });
     let mut pinched_any = false;
     for (p0, p1) in before_flat.iter().zip(pinched.positions()) {
-        assert_eq!(p1[2].to_bits(), 0.0f32.to_bits(), "pure Pinch keeps z == 0.0");
+        assert_eq!(
+            p1[2].to_bits(),
+            0.0f32.to_bits(),
+            "pure Pinch keeps z == 0.0"
+        );
         let r0 = p0[0].hypot(p0[1]);
         let r1 = p1[0].hypot(p1[1]);
         if r0 > 0.0 && r0 < 3.5 {
@@ -1619,10 +1673,16 @@ fn extra_brushes_flatten_crease_clay_and_twist_follow_expected_geometry() {
         )
     });
     for (p0, p1) in before_vortex.iter().zip(vortex.positions()) {
-        assert!((p1[2] - p0[2]).abs() < 1e-6, "Vortex preserves axial height z");
+        assert!(
+            (p1[2] - p0[2]).abs() < 1e-6,
+            "Vortex preserves axial height z"
+        );
         let r0 = p0[0].hypot(p0[1]);
         let r1 = p1[0].hypot(p1[1]);
-        assert!((r1 - r0).abs() < 1e-5, "Vortex preserves cylindrical radius: {r0} vs {r1}");
+        assert!(
+            (r1 - r0).abs() < 1e-5,
+            "Vortex preserves cylindrical radius: {r0} vs {r1}"
+        );
     }
     // Check exact rotation at (1, 0, 0.5): t = 1 / 4.5
     let v_1_0 = (6 * 13 + 7) as usize;
@@ -1727,7 +1787,11 @@ fn task2_region_parity_bit_for_bit_and_oom_sweeps_all_brushes() {
     };
 
     // 1. Grab across Sphere, Geodesic, Kelvinlet (+ adaptive_reach & from_stroke)
-    for method in [GrabMethod::Sphere, GrabMethod::Geodesic, GrabMethod::Kelvinlet] {
+    for method in [
+        GrabMethod::Sphere,
+        GrabMethod::Geodesic,
+        GrabMethod::Kelvinlet,
+    ] {
         for adaptive_reach in [false, true] {
             let opts = GrabOptions {
                 brush,
@@ -1762,8 +1826,16 @@ fn task2_region_parity_bit_for_bit_and_oom_sweeps_all_brushes() {
             });
             assert_eq!(rw, rr, "{method:?} adaptive={adaptive_reach}");
             assert_eq!(rw, rws, "{method:?} adaptive={adaptive_reach}");
-            assert_eq!(bits_of(&whole), bits_of(&reg), "{method:?} adaptive={adaptive_reach}");
-            assert_eq!(bits_of(&whole), bits_of(&reg_ws), "{method:?} adaptive={adaptive_reach}");
+            assert_eq!(
+                bits_of(&whole),
+                bits_of(&reg),
+                "{method:?} adaptive={adaptive_reach}"
+            );
+            assert_eq!(
+                bits_of(&whole),
+                bits_of(&reg_ws),
+                "{method:?} adaptive={adaptive_reach}"
+            );
             assert!(sweep(base_mesh(), |tx| grab(tx, &opts).map(drop)) >= 3);
         }
     }
@@ -1928,7 +2000,11 @@ fn asymmetric_multipass_scratch_reuse_reserves_without_infallible_realloc() {
     assert_eq!(rw, rr);
     assert_eq!(bits_of(&gw), bits_of(&gr));
     assert!(sweep(asym_mesh(), |tx| grab(tx, &geo_opts).map(drop)) >= 8);
-    assert!(sweep(asym_mesh(), |tx| grab_region(tx, &geo_opts, &all_ids).map(drop)) >= 8);
+    assert!(
+        sweep(asym_mesh(), |tx| grab_region(tx, &geo_opts, &all_ids)
+            .map(drop))
+            >= 8
+    );
 
     // 2. Smooth across all 4 methods (`starts`, `current`, `before`, `hc_lap`, `hc_b`, `raw_cot_scratch`)
     for method in [
@@ -1952,7 +2028,9 @@ fn asymmetric_multipass_scratch_reuse_reserves_without_infallible_realloc() {
         assert_eq!(bits_of(&sw), bits_of(&sr), "{method:?}");
         assert!(sweep(asym_mesh(), |tx| smooth(tx, &sm_opts).map(drop)) >= 6);
         assert!(
-            sweep(asym_mesh(), |tx| smooth_region(tx, &sm_opts, &all_ids).map(drop)) >= 6
+            sweep(asym_mesh(), |tx| smooth_region(tx, &sm_opts, &all_ids)
+                .map(drop))
+                >= 6
         );
     }
 }
@@ -1987,7 +2065,10 @@ fn grab_region_with_stroke_uses_slice_adaptive_reach_and_zero_protected() {
         let mut m = mesh_of(&positions, &triangles);
         let p0 = rest_positions[0];
         edit(&mut m, |tx| {
-            tx.set_positions(&[0], &[[p0[0] + shift[0], p0[1] + shift[1], p0[2] + shift[2]]])?;
+            tx.set_positions(
+                &[0],
+                &[[p0[0] + shift[0], p0[1] + shift[1], p0[2] + shift[2]]],
+            )?;
             Ok(())
         });
         m

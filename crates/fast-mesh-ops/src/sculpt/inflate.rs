@@ -171,8 +171,12 @@ pub fn inflate(tx: &mut Transaction, options: &InflateOptions) -> Result<Inflate
             continue;
         }
         let hit = masks[..mask_count].iter().any(|&bits| {
-            normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                .is_some()
+            normalized_dist(
+                reflect_vec(bits, options.brush.center),
+                options.brush.radius,
+                p,
+            )
+            .is_some()
         });
         if hit {
             push(&mut candidates, v)?;
@@ -214,14 +218,10 @@ pub fn inflate(tx: &mut Transaction, options: &InflateOptions) -> Result<Inflate
         None
     };
 
-    let (ids, moved_to, report) = inflate_candidates(
-        mesh,
-        options,
-        &candidates,
-        &cand_normals,
-        None,
-        |v| fans.as_ref().map_or(&[], |f| f.fan(v)),
-    )?;
+    let (ids, moved_to, report) =
+        inflate_candidates(mesh, options, &candidates, &cand_normals, None, |v| {
+            fans.as_ref().map_or(&[], |f| f.fan(v))
+        })?;
     write_moves(tx, &ids, &moved_to)?;
     Ok(report)
 }
@@ -269,8 +269,12 @@ pub fn inflate_region_with_stroke(
             }
             let p = &positions[v as usize];
             let hit = masks[..mask_count].iter().any(|&bits| {
-                normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                    .is_some()
+                normalized_dist(
+                    reflect_vec(bits, options.brush.center),
+                    options.brush.radius,
+                    p,
+                )
+                .is_some()
             });
             if hit {
                 push(&mut candidates, v)?;
@@ -324,7 +328,10 @@ fn inflate_candidates<'f>(
     }
 
     let need_avg_normal = options.method == InflateMethod::AverageNormal
-        || matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+        || matches!(
+            options.filter,
+            SurfaceFilter::NormalAngle { normal: None, .. }
+        );
 
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 

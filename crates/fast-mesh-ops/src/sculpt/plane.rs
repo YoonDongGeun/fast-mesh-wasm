@@ -389,8 +389,12 @@ pub fn flatten(tx: &mut Transaction, options: &FlattenOptions) -> Result<Flatten
             continue;
         }
         let hit = masks[..mask_count].iter().any(|&bits| {
-            normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                .is_some()
+            normalized_dist(
+                reflect_vec(bits, options.brush.center),
+                options.brush.radius,
+                p,
+            )
+            .is_some()
         });
         if hit {
             push(&mut candidates, v)?;
@@ -443,8 +447,12 @@ pub fn flatten_region(
             }
             let p = &positions[v as usize];
             let hit = masks[..mask_count].iter().any(|&bits| {
-                normalized_dist(reflect_vec(bits, options.brush.center), options.brush.radius, p)
-                    .is_some()
+                normalized_dist(
+                    reflect_vec(bits, options.brush.center),
+                    options.brush.radius,
+                    p,
+                )
+                .is_some()
             });
             if hit {
                 push(&mut candidates, v)?;
@@ -498,7 +506,10 @@ fn flatten_candidates<'f>(
     }
 
     let need_auto_normal = options.plane_normal.is_none()
-        || matches!(options.filter, SurfaceFilter::NormalAngle { normal: None, .. });
+        || matches!(
+            options.filter,
+            SurfaceFilter::NormalAngle { normal: None, .. }
+        );
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
 
     for &bits in &masks[..mask_count] {
@@ -770,7 +781,11 @@ fn clay_candidates<'f>(
         }
     }
 
-    let sign = if brush.strength < 0.0 { -1.0f32 } else { 1.0f32 };
+    let sign = if brush.strength < 0.0 {
+        -1.0f32
+    } else {
+        1.0f32
+    };
     let offset_h = 0.25 * brush.radius * sign;
     let strength_abs = brush.strength.abs();
     let mut envelopes = filled(candidates.len(), MaxEnvelope::default())?;
@@ -798,18 +813,20 @@ fn clay_candidates<'f>(
         if plane_n == [0.0; 3] {
             continue;
         }
-        let Some(o_base) = falloff_weighted_centroid(
-            candidates,
-            positions,
-            center_m,
-            brush.radius,
-            brush.falloff,
-        )
-        .or_else(|| {
-            (reach > brush.radius).then(|| {
-                falloff_weighted_centroid(candidates, positions, center_m, reach, brush.falloff)
-            })?
-        }) else {
+        let Some(o_base) =
+            falloff_weighted_centroid(candidates, positions, center_m, brush.radius, brush.falloff)
+                .or_else(|| {
+                    (reach > brush.radius).then(|| {
+                        falloff_weighted_centroid(
+                            candidates,
+                            positions,
+                            center_m,
+                            reach,
+                            brush.falloff,
+                        )
+                    })?
+                })
+        else {
             continue;
         };
 

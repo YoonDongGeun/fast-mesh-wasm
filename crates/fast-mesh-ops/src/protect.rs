@@ -258,7 +258,12 @@ pub fn with_protection_band<R, E: From<OpsError>>(
         }
 
         let mut adjacent: Vec<VertexId> = Vec::new();
-        while let Some(BandEntry { dist: d_u, v: u, idx }) = heap.pop() {
+        while let Some(BandEntry {
+            dist: d_u,
+            v: u,
+            idx,
+        }) = heap.pop()
+        {
             if d_u > table.dist[idx as usize] {
                 continue;
             }
@@ -693,14 +698,9 @@ mod tests {
         let all_region: Vec<VertexId> = (0..reg_mesh.vertex_slots() as VertexId).collect();
         {
             let mut tx = reg_mesh.begin_edit();
-            with_protection_band(
-                &mut tx,
-                Some(&all_region),
-                &held,
-                &zeros,
-                band,
-                |tx| deform::grab_region(tx, &wide_grab, &all_region),
-            )
+            with_protection_band(&mut tx, Some(&all_region), &held, &zeros, band, |tx| {
+                deform::grab_region(tx, &wide_grab, &all_region)
+            })
             .unwrap();
             tx.commit().unwrap();
         }

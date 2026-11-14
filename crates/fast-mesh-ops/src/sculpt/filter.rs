@@ -184,7 +184,11 @@ pub(crate) fn vertex_prominence(
     if !(mean_len > 0.0 && mean_len.is_finite()) {
         return 0.0;
     }
-    let diff = [p_v[0] - centroid[0], p_v[1] - centroid[1], p_v[2] - centroid[2]];
+    let diff = [
+        p_v[0] - centroid[0],
+        p_v[1] - centroid[1],
+        p_v[2] - centroid[2],
+    ];
     let h = (diff[0] * n_v[0] + diff[1] * n_v[1] + diff[2] * n_v[2]) / mean_len;
     if h.is_finite() { h } else { 0.0 }
 }
@@ -271,9 +275,10 @@ pub(crate) fn eval_surface_filter(
             let ref_unit = match normal {
                 Some(explicit) => {
                     let r = reflect_vec(bits, explicit);
-                    let len =
-                        (f64::from(r[0]).powi(2) + f64::from(r[1]).powi(2) + f64::from(r[2]).powi(2))
-                            .sqrt();
+                    let len = (f64::from(r[0]).powi(2)
+                        + f64::from(r[1]).powi(2)
+                        + f64::from(r[2]).powi(2))
+                    .sqrt();
                     if !(len > 0.0 && len.is_finite()) {
                         return 0.0;
                     }
@@ -293,8 +298,8 @@ pub(crate) fn eval_surface_filter(
                     avg
                 }
             };
-            let cos_theta =
-                (n_v[0] * ref_unit[0] + n_v[1] * ref_unit[1] + n_v[2] * ref_unit[2]).clamp(-1.0, 1.0);
+            let cos_theta = (n_v[0] * ref_unit[0] + n_v[1] * ref_unit[1] + n_v[2] * ref_unit[2])
+                .clamp(-1.0, 1.0);
             let angle = cos_theta.acos();
             let max_rad = max_angle_deg.to_radians();
             let inner = 0.75 * max_rad;
@@ -341,9 +346,10 @@ impl MaxEnvelope {
             return None;
         }
         if self.hits == 1 {
-            let length = (self.sum_dp[0].powi(2) + self.sum_dp[1].powi(2) + self.sum_dp[2].powi(2))
-                .sqrt();
-            return (length.is_finite() && length > 0.0
+            let length =
+                (self.sum_dp[0].powi(2) + self.sum_dp[1].powi(2) + self.sum_dp[2].powi(2)).sqrt();
+            return (length.is_finite()
+                && length > 0.0
                 && self.single_pos.iter().all(|x| x.is_finite()))
             .then_some((self.single_pos, length));
         }
