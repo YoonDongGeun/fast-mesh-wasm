@@ -1341,6 +1341,18 @@ mod tests {
             ..Default::default()
         });
 
+        let non_stroke_pull = Dab::Grab(GrabOptions {
+            brush: Brush {
+                center: [0.0, 0.0, 0.0],
+                radius: 2.0,
+                falloff: Falloff::Smooth,
+                strength: 0.6,
+            },
+            direction: [0.0, 0.0, 1.0],
+            from_stroke: false,
+            ..Default::default()
+        });
+
         // (a) Non-split_stretched topology edit invalidates stroke
         {
             let mut s = Scene::new(SceneOptions::default());
@@ -1352,28 +1364,103 @@ mod tests {
             s.edit(id, |tx| tx.remove_triangles(&[0])).unwrap();
             assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
         }
-        // (b) undo / redo invalidates stroke
+        // (b) undo and redo invalidate stroke (with `curr != rest_pos` at probe time,
+        // plus placement-only and cross-mesh undo steps)
         {
             let mut s = Scene::new(SceneOptions::default());
             let id = s
                 .add_mesh(symmetric_terrain(5), MeshOptions::default())
                 .unwrap();
-            s.dab(id, &pull).unwrap();
+            // Step 1: P0 -> P1.
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            let p1 = bits(&s, id);
+            // Step 2: P1 -> P2, capture stroke at P2, then P2 -> P3 (all in one step).
+            s.begin_step();
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            let p2 = bits(&s, id);
+            assert_ne!(p1, p2);
             s.capture_stroke_state(id, false).unwrap();
             assert!(s.dab(id, &pull).unwrap().moved > 0);
-            s.undo().unwrap();
+            s.end_step().unwrap();
+            // Undo Step 2 reverts mesh to P1 (`curr == P1 != P2 == rest_pos`):
+            // if stroke were NOT invalidated, `zero_snap_probe` would snap P1 -> P2!
+            assert!(s.undo().unwrap());
+            assert_eq!(bits(&s, id), p1);
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+
+            // Now arm stroke at P1 and populate `rest_pos = P1` via a 0-move dab
+            // (which leaves the redo stack intact), then `redo()` Step 2 to P3 (`!= P1`):
+            // `curr == P3 != P1 == rest_pos`, so if `redo()` failed to invalidate `stroke`,
+            // `zero_snap_probe` would immediately snap P3 -> P1 (`moved > 0`)!
+            s.capture_stroke_state(id, false).unwrap();
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+            assert!(s.can_redo());
+            assert!(s.redo().unwrap());
+            assert_ne!(bits(&s, id), p1);
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+            // Also verify `epoch == 0` after `redo()` even when `touched` was empty before `redo()`:
+            assert!(s.undo().unwrap());
+            s.capture_stroke_state(id, false).unwrap();
+            assert!(s.redo().unwrap());
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            s.capture_stroke_state(id, true).unwrap();
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+
+            // Placement-only step undo and cross-mesh edit undo also invalidate `id`'s stroke
+            // while `id`'s vertices remain at `curr != rest_pos`!
+            s.capture_stroke_state(id, false).unwrap();
+            assert!(s.dab(id, &pull).unwrap().moved > 0);
+            s.set_placement(
+                id,
+                crate::Placement {
+                    translation: [1.0, 0.0, 0.0],
+                    ..crate::Placement::IDENTITY
+                },
+            )
+            .unwrap();
+            assert!(s.undo().unwrap()); // undoes placement (`done` has `(id, None)`)
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+
+            let other = s
+                .add_mesh(symmetric_terrain(3), MeshOptions::default())
+                .unwrap();
+            s.capture_stroke_state(id, false).unwrap();
+            assert!(s.dab(id, &pull).unwrap().moved > 0);
+            s.edit(other, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 3.0]]))
+                .unwrap();
+            assert!(s.undo().unwrap()); // undoes `other` (`done` does not mention `id`)
             assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
         }
-        // (c) cancel_step invalidates stroke
+        // (c) cancel_step invalidates stroke both when reverting to `curr != rest_pos`
+        // AND when cancelling an empty open step (`done` is empty)
         {
             let mut s = Scene::new(SceneOptions::default());
             let id = s
                 .add_mesh(symmetric_terrain(5), MeshOptions::default())
                 .unwrap();
+            // P0 -> P1 outside open step.
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            let p1 = bits(&s, id);
+            // Inside open step: P1 -> P2, capture stroke at P2, then P2 -> P3.
             s.begin_step();
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            let p2 = bits(&s, id);
+            assert_ne!(p1, p2);
             s.capture_stroke_state(id, false).unwrap();
             assert!(s.dab(id, &pull).unwrap().moved > 0);
+            // `cancel_step` reverts to P1 (`!= P2 == rest_pos`): must move 0 on probe!
             s.cancel_step().unwrap();
+            assert_eq!(bits(&s, id), p1);
+            assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
+
+            // Empty open step: `begin_step` -> `capture_stroke_state(id, false)` -> `cancel_step`
+            // (`done` is empty!) must also reset `epoch = 0`, so `non_stroke_pull` +
+            // `capture_stroke_state(id, true)` captures post-move positions rather than P1!
+            s.begin_step();
+            s.capture_stroke_state(id, false).unwrap();
+            s.cancel_step().unwrap();
+            assert!(s.dab(id, &non_stroke_pull).unwrap().moved > 0);
+            s.capture_stroke_state(id, true).unwrap();
             assert_eq!(s.dab(id, &zero_snap_probe).unwrap(), DabReport::default());
         }
         // (d) compact invalidates stroke

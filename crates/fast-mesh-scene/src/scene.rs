@@ -161,6 +161,10 @@ impl StrokeSnapshot {
         self.touched.clear();
     }
 
+    pub(crate) fn is_active_or_materialized(&self) -> bool {
+        self.epoch != 0 || self.channels_materialized
+    }
+
     pub(crate) fn invalidate_on_mesh(&mut self, mesh: &mut Mesh) {
         self.clear_captured_slots();
         self.epoch = 0;
@@ -1089,6 +1093,7 @@ impl Scene {
     /// entry first.
     fn after_corrupted<T>(&mut self, r: Result<T>) -> Result<T> {
         if r.as_ref().err() == Some(&SceneError::Corrupted) {
+            self.invalidate_all_strokes();
             self.run_eager(None);
         }
         r
@@ -1128,6 +1133,7 @@ impl Scene {
         self.drop_field_unit();
         let done = self.history.undo(&mut self.entries);
         let done = self.after_corrupted(done)?;
+        self.invalidate_all_strokes();
         Ok(done.map(|d| self.absorb(d)).is_some())
     }
 
@@ -1141,6 +1147,7 @@ impl Scene {
         self.drop_field_unit();
         let done = self.history.redo(&mut self.entries);
         let done = self.after_corrupted(done)?;
+        self.invalidate_all_strokes();
         Ok(done.map(|d| self.absorb(d)).is_some())
     }
 
@@ -1166,17 +1173,23 @@ impl Scene {
         Ok(())
     }
 
+    fn invalidate_all_strokes(&mut self) {
+        for (_, e) in self.entries.iter_mut() {
+            if e.stroke.is_active_or_materialized() {
+                e.stroke.invalidate_on_mesh(&mut e.mesh);
+            }
+        }
+    }
+
     /// Feeds the outcome of an undo, redo or cancel into the reports and
     /// pending changes, then runs the Eager updates (BVHs, then fields and
     /// sections), as after an edit.
     fn absorb(&mut self, done: Vec<Done>) {
+        self.invalidate_all_strokes();
         for (id, changes) in &done {
             if let Some(e) = self.entries.get_mut(*id) {
                 match changes {
-                    Some(c) => {
-                        e.stroke.invalidate_on_mesh(&mut e.mesh);
-                        e.record_changes(c);
-                    }
+                    Some(c) => e.record_changes(c),
                     None => e.report_placement(),
                 }
             }
