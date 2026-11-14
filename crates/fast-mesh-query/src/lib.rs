@@ -61,6 +61,7 @@ mod section;
 mod selfpairs;
 mod simd;
 mod slice;
+mod surface_path;
 #[cfg(test)]
 mod test_util;
 mod tri;
@@ -84,6 +85,7 @@ pub use section::{Fill, Gap2, contour_gap, contour_length, fill, signed_area};
 pub use selfpairs::self_intersecting_pairs;
 pub use selfpairs::self_intersects;
 pub use slice::{Contour, Slice, slice};
+pub use surface_path::{SurfacePathPoint, shortest_surface_path};
 pub use tri::{Cull, Feature};
 
 /// Checks that `bvh` was built for `mesh` and is up to date with it.
