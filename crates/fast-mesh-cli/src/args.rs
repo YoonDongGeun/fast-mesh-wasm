@@ -5,7 +5,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use fast_mesh_cli::io::Format;
-use fast_mesh_ops::{AutoRepairOptions, BooleanOp};
+use fast_mesh_ops::boolean::BooleanOp;
+use fast_mesh_ops::repair::AutoRepairOptions;
 
 /// How reports are printed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,13 @@ pub struct Input {
     pub format: Format,
 }
 
+/// How [`Command::Simplify`] determines its target triangle count.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SimplifyTarget {
+    Triangles(usize),
+    Ratio(f64),
+}
+
 /// What to do.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -45,10 +53,29 @@ pub enum Command {
         input: Input,
         report: OutputFormat,
     },
+    Analyze {
+        input: Input,
+        weld_tolerance: f32,
+        self_intersection: bool,
+        report: OutputFormat,
+    },
     Boolean {
         a: Input,
         b: Input,
         op: BooleanOp,
+        output: Output,
+        report: OutputFormat,
+    },
+    Simplify {
+        input: Input,
+        target: SimplifyTarget,
+        preserve_boundary: bool,
+        output: Output,
+        report: OutputFormat,
+    },
+    Subdivide {
+        input: Input,
+        levels: u32,
         output: Output,
         report: OutputFormat,
     },
@@ -60,9 +87,17 @@ pub enum Command {
 }
 
 pub const HELP: &str = "\
-fast-mesh: mesh repair, measurement, booleans and format conversion
+fast-mesh: mesh repair, inspection, remeshing, booleans and format conversion
 
 Usage:
+  fast-mesh repair auto <in> -o <out> [repair options] [output options]
+  fast-mesh inspect measure <in> [--format text|json]
+  fast-mesh inspect analyze <in> [--weld-tolerance <d>] [--self-intersection] [--format text|json]
+  fast-mesh remesh simplify <in> -o <out> (--triangles <n> | --ratio <r>) [--lock-boundary] [output options]
+  fast-mesh remesh subdivide <in> -o <out> [--levels <n>] [output options]
+  fast-mesh boolean union|intersection|difference <a> <b> -o <out> [output options]
+
+Legacy aliases:
   fast-mesh repair <in> -o <out> --auto [repair options] [output options]
   fast-mesh measure <in> [--format text|json]
   fast-mesh boolean <a> <b> --op union|intersection|difference -o <out> [output options]
@@ -82,12 +117,13 @@ one JSON object on success and nothing on failure.
 ";
 
 const REPAIR_HELP: &str = "\
+fast-mesh repair auto <in> -o <out> [options]
 fast-mesh repair <in> -o <out> --auto [options]
 
 Runs the standard cleanup: weld, remove degenerate triangles, orient, remove
 small components, fill holes.
 
-  --auto                  Run the whole pipeline (required)
+  --auto                  Run the whole pipeline (required without `auto` subcommand)
   --weld-tolerance <d>    Weld vertices at most this far apart (default 1e-5)
   --min-triangles <n>     Remove components with fewer triangles; the largest
                           always stays (default 500)
@@ -96,6 +132,21 @@ small components, fill holes.
   -o, --output <path>     The output file
   --ascii                 Text form of .stl and .ply
   --force                 Allow the output to overwrite the input
+  --format text|json      The report's format (default text)
+";
+
+const INSPECT_HELP: &str = "\
+fast-mesh inspect <subcommand> <in> [options]
+
+Subcommands:
+  measure <in>            Report vertex/triangle counts, area, volume and manifold status
+  analyze <in>            Inspect mesh defects (loops, coincident, degenerate, non-manifold, pinches)
+
+Analyze options:
+  --weld-tolerance <d>    Tolerance for coincident vertices (default 0)
+  --self-intersection     Build BVH and check for self-intersecting triangles
+
+Common options:
   --format text|json      The report's format (default text)
 ";
 
@@ -108,13 +159,33 @@ Reports vertex and triangle counts, area, volume (when watertight) and defects.
 ";
 
 const BOOLEAN_HELP: &str = "\
+fast-mesh boolean union|intersection|difference <a> <b> -o <out> [options]
 fast-mesh boolean <a> <b> --op <op> -o <out> [options]
 
 Combines two closed, manifold, consistently wound meshes. A result that is
 open, non-manifold or has orientation conflicts fails (exit 1), writing nothing.
 
   --op union|intersection|difference
-                          difference is a minus b
+                          difference is a minus b (legacy flag without subcommand)
+  -o, --output <path>     The output file
+  --ascii                 Text form of .stl and .ply
+  --force                 Allow the output to overwrite an input
+  --format text|json      The report's format (default text)
+";
+
+const REMESH_HELP: &str = "\
+fast-mesh remesh <subcommand> <in> -o <out> [options]
+
+Subcommands:
+  simplify <in> -o <out>  Shrink mesh via quadric-error edge collapse
+    --triangles <n>       Target triangle count (>= 1; mutually exclusive with --ratio)
+    --ratio <r>           Target fraction of input triangles in (0, 1]
+    --lock-boundary       Keep boundary vertices in place
+
+  subdivide <in> -o <out> Refine mesh via Loop subdivision
+    --levels <n>          Subdivision levels >= 1 (default 1)
+
+Output options:
   -o, --output <path>     The output file
   --ascii                 Text form of .stl and .ply
   --force                 Allow the output to overwrite an input
@@ -291,36 +362,31 @@ fn repair_options(parsed: &mut Parsed) -> Result<AutoRepairOptions, String> {
     Ok(options)
 }
 
+fn boolean_op_from_str(s: &str) -> Option<BooleanOp> {
+    match s {
+        "union" => Some(BooleanOp::Union),
+        "intersection" => Some(BooleanOp::Intersect),
+        "difference" => Some(BooleanOp::Subtract),
+        _ => None,
+    }
+}
+
 /// Parses the arguments after the program name. An `Err` is a usage error.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let first = args.next().ok_or("no command given")?;
     let command = first.to_str().unwrap_or("");
     match command {
         "-h" | "--help" | "help" => return Ok(Command::Help(HELP)),
         "-V" | "--version" => return Ok(Command::Version),
+        "inspect" => return parse_inspect(args),
+        "remesh" => return parse_remesh(args),
+        "repair" => return parse_repair(args),
+        "boolean" => return parse_boolean(args),
         _ => {}
     }
     let (spec, help): (&[(&'static str, bool)], &'static str) = match command {
-        "repair" => (
-            &[
-                OUTPUT[0],
-                OUTPUT[1],
-                OUTPUT[2],
-                FORMAT,
-                ("--auto", false),
-                ("--weld-tolerance", true),
-                ("--min-triangles", true),
-                ("--max-edges", true),
-                ("--no-fair", false),
-            ],
-            REPAIR_HELP,
-        ),
         "measure" => (&[FORMAT], MEASURE_HELP),
-        "boolean" => (
-            &[OUTPUT[0], OUTPUT[1], OUTPUT[2], FORMAT, ("--op", true)],
-            BOOLEAN_HELP,
-        ),
         "convert" => (&[OUTPUT[0], OUTPUT[1], OUTPUT[2], FORMAT], CONVERT_HELP),
         other => return Err(format!("unknown command \"{other}\"")),
     };
@@ -329,43 +395,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     };
     let report = report_format(&mut parsed)?;
     match command {
-        "repair" => {
-            let [path] = positionals(&mut parsed, "one input file")?;
-            if !parsed.flag("--auto") {
-                return Err("repair needs --auto (the whole pipeline)".into());
-            }
-            Ok(Command::Repair {
-                options: repair_options(&mut parsed)?,
-                input: input(path)?,
-                output: output(&mut parsed)?,
-                report,
-            })
-        }
         "measure" => {
             let [path] = positionals(&mut parsed, "one input file")?;
             Ok(Command::Measure {
                 input: input(path)?,
-                report,
-            })
-        }
-        "boolean" => {
-            let [a, b] = positionals(&mut parsed, "two input files")?;
-            let op = match parsed.text("--op")?.as_deref() {
-                Some("union") => BooleanOp::Union,
-                Some("intersection") => BooleanOp::Intersect,
-                Some("difference") => BooleanOp::Subtract,
-                Some(other) => {
-                    return Err(format!(
-                        "--op must be union, intersection or difference, not {other}"
-                    ));
-                }
-                None => return Err("boolean needs --op".into()),
-            };
-            Ok(Command::Boolean {
-                a: input(a)?,
-                b: input(b)?,
-                op,
-                output: output(&mut parsed)?,
                 report,
             })
         }
@@ -377,5 +410,213 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 report,
             })
         }
+    }
+}
+
+fn parse_repair(
+    mut args: std::iter::Peekable<impl Iterator<Item = OsString>>,
+) -> Result<Command, String> {
+    let has_auto_sub = args.peek().and_then(|s| s.to_str()) == Some("auto");
+    if has_auto_sub {
+        args.next();
+    }
+    const REPAIR_SPEC: [(&str, bool); 9] = [
+        OUTPUT[0],
+        OUTPUT[1],
+        OUTPUT[2],
+        FORMAT,
+        ("--auto", false),
+        ("--weld-tolerance", true),
+        ("--min-triangles", true),
+        ("--max-edges", true),
+        ("--no-fair", false),
+    ];
+    let Some(mut parsed) = split(args, &REPAIR_SPEC)? else {
+        return Ok(Command::Help(REPAIR_HELP));
+    };
+    let report = report_format(&mut parsed)?;
+    let [path] = positionals(&mut parsed, "one input file")?;
+    let has_auto_flag = parsed.flag("--auto");
+    if !has_auto_sub && !has_auto_flag {
+        return Err("repair needs --auto (or `fast-mesh repair auto <in>`)".into());
+    }
+    Ok(Command::Repair {
+        options: repair_options(&mut parsed)?,
+        input: input(path)?,
+        output: output(&mut parsed)?,
+        report,
+    })
+}
+
+fn parse_boolean(
+    mut args: std::iter::Peekable<impl Iterator<Item = OsString>>,
+) -> Result<Command, String> {
+    if let Some(sub_op) = args
+        .peek()
+        .and_then(|s| s.to_str())
+        .and_then(boolean_op_from_str)
+    {
+        args.next();
+        const SUB_SPEC: [(&str, bool); 4] = [OUTPUT[0], OUTPUT[1], OUTPUT[2], FORMAT];
+        let Some(mut parsed) = split(args, &SUB_SPEC)? else {
+            return Ok(Command::Help(BOOLEAN_HELP));
+        };
+        let report = report_format(&mut parsed)?;
+        let [a, b] = positionals(&mut parsed, "two input files")?;
+        return Ok(Command::Boolean {
+            a: input(a)?,
+            b: input(b)?,
+            op: sub_op,
+            output: output(&mut parsed)?,
+            report,
+        });
+    }
+    const BOOLEAN_SPEC: [(&str, bool); 5] =
+        [OUTPUT[0], OUTPUT[1], OUTPUT[2], FORMAT, ("--op", true)];
+    let Some(mut parsed) = split(args, &BOOLEAN_SPEC)? else {
+        return Ok(Command::Help(BOOLEAN_HELP));
+    };
+    let report = report_format(&mut parsed)?;
+    let [a, b] = positionals(&mut parsed, "two input files")?;
+    let op = match parsed.text("--op")?.as_deref() {
+        Some(raw) => boolean_op_from_str(raw)
+            .ok_or_else(|| format!("--op must be union, intersection or difference, not {raw}"))?,
+        None => return Err("boolean needs --op".into()),
+    };
+    Ok(Command::Boolean {
+        a: input(a)?,
+        b: input(b)?,
+        op,
+        output: output(&mut parsed)?,
+        report,
+    })
+}
+
+fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let sub = args
+        .next()
+        .ok_or("inspect requires a subcommand: measure or analyze")?;
+    let sub_name = sub.to_str().unwrap_or("");
+    match sub_name {
+        "-h" | "--help" => Ok(Command::Help(INSPECT_HELP)),
+        "measure" => {
+            let Some(mut parsed) = split(args, &[FORMAT])? else {
+                return Ok(Command::Help(INSPECT_HELP));
+            };
+            let report = report_format(&mut parsed)?;
+            let [path] = positionals(&mut parsed, "one input file")?;
+            Ok(Command::Measure {
+                input: input(path)?,
+                report,
+            })
+        }
+        "analyze" => {
+            const ANALYZE_SPEC: [(&str, bool); 3] = [
+                FORMAT,
+                ("--weld-tolerance", true),
+                ("--self-intersection", false),
+            ];
+            let Some(mut parsed) = split(args, &ANALYZE_SPEC)? else {
+                return Ok(Command::Help(INSPECT_HELP));
+            };
+            let report = report_format(&mut parsed)?;
+            let weld_tolerance = match number::<f32>(&mut parsed, "--weld-tolerance")? {
+                None => 0.0,
+                Some(t) if t.is_finite() && t >= 0.0 => t,
+                Some(t) => {
+                    return Err(format!(
+                        "--weld-tolerance must be finite and not negative, not {t}"
+                    ));
+                }
+            };
+            let self_intersection = parsed.flag("--self-intersection");
+            let [path] = positionals(&mut parsed, "one input file")?;
+            Ok(Command::Analyze {
+                input: input(path)?,
+                weld_tolerance,
+                self_intersection,
+                report,
+            })
+        }
+        other => Err(format!(
+            "unknown inspect subcommand \"{other}\" (expected measure or analyze)"
+        )),
+    }
+}
+
+fn parse_remesh(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let sub = args
+        .next()
+        .ok_or("remesh requires a subcommand: simplify or subdivide")?;
+    let sub_name = sub.to_str().unwrap_or("");
+    match sub_name {
+        "-h" | "--help" => Ok(Command::Help(REMESH_HELP)),
+        "simplify" => {
+            const SIMPLIFY_SPEC: [(&str, bool); 7] = [
+                OUTPUT[0],
+                OUTPUT[1],
+                OUTPUT[2],
+                FORMAT,
+                ("--triangles", true),
+                ("--ratio", true),
+                ("--lock-boundary", false),
+            ];
+            let Some(mut parsed) = split(args, &SIMPLIFY_SPEC)? else {
+                return Ok(Command::Help(REMESH_HELP));
+            };
+            let report = report_format(&mut parsed)?;
+            let triangles = number::<usize>(&mut parsed, "--triangles")?;
+            let ratio = number::<f64>(&mut parsed, "--ratio")?;
+            let target = match (triangles, ratio) {
+                (Some(_), Some(_)) => {
+                    return Err("simplify takes --triangles or --ratio, not both".into());
+                }
+                (None, None) => {
+                    return Err("simplify requires --triangles <n> or --ratio <r>".into());
+                }
+                (Some(0), None) => {
+                    return Err("--triangles must be at least 1".into());
+                }
+                (Some(n), None) => SimplifyTarget::Triangles(n),
+                (None, Some(r)) => {
+                    if !r.is_finite() || r <= 0.0 || r > 1.0 {
+                        return Err(format!("--ratio must be in (0, 1], not {r}"));
+                    }
+                    SimplifyTarget::Ratio(r)
+                }
+            };
+            let preserve_boundary = parsed.flag("--lock-boundary");
+            let [path] = positionals(&mut parsed, "one input file")?;
+            Ok(Command::Simplify {
+                input: input(path)?,
+                target,
+                preserve_boundary,
+                output: output(&mut parsed)?,
+                report,
+            })
+        }
+        "subdivide" => {
+            const SUBDIVIDE_SPEC: [(&str, bool); 5] =
+                [OUTPUT[0], OUTPUT[1], OUTPUT[2], FORMAT, ("--levels", true)];
+            let Some(mut parsed) = split(args, &SUBDIVIDE_SPEC)? else {
+                return Ok(Command::Help(REMESH_HELP));
+            };
+            let report = report_format(&mut parsed)?;
+            let levels = match number::<u32>(&mut parsed, "--levels")? {
+                Some(0) => return Err("--levels must be at least 1".into()),
+                Some(n) => n,
+                None => 1,
+            };
+            let [path] = positionals(&mut parsed, "one input file")?;
+            Ok(Command::Subdivide {
+                input: input(path)?,
+                levels,
+                output: output(&mut parsed)?,
+                report,
+            })
+        }
+        other => Err(format!(
+            "unknown remesh subcommand \"{other}\" (expected simplify or subdivide)"
+        )),
     }
 }

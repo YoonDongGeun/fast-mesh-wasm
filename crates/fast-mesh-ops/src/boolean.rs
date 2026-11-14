@@ -34,6 +34,12 @@ use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, Ver
 use crate::analyze::analyze;
 use crate::{OpsError, Result, filled, push, reserve};
 
+pub use crate::cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
+pub use crate::offset::{
+    OffsetAlgorithm, OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions,
+    ShellOptionsBuilder, ShellReport, offset, offset_with_bvh, shell,
+};
+
 /// Which boolean to compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {

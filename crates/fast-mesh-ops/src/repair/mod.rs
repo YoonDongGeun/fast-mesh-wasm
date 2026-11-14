@@ -15,6 +15,22 @@ pub mod presets;
 pub mod self_intersect;
 pub mod sliver;
 
+pub use crate::analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
+pub use crate::auto_repair::{
+    AutoRepairOptions, AutoRepairOptionsBuilder, AutoRepairReport, AutoRepairStage, auto_repair,
+};
+pub use crate::bridge::{
+    BRIDGE_DEFAULT_MAX_EDGES, BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops,
+};
+pub use crate::cleanup::{
+    ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
+    DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
+};
+pub use crate::fill::{
+    FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
+    fill_holes,
+};
+pub use crate::orient::{OrientReport, orient};
 pub use manifold::{ManifoldOptions, ManifoldOptionsBuilder, ManifoldReport, make_manifold};
 pub use presets::AutoRepairPreset;
 pub use self_intersect::{

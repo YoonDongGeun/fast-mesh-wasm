@@ -93,6 +93,7 @@ mod baked;
 mod boolean;
 mod contacts;
 mod cut;
+mod domains;
 mod error;
 mod fields;
 mod history;
@@ -112,6 +113,10 @@ mod uv_tests;
 pub use boolean::{BooleanOp, BooleanReport};
 pub use contacts::{Contact, ContactFilter};
 pub use cut::{CutOptions, CutReport};
+pub use domains::{
+    SceneAlignOps, SceneBooleanOps, SceneDeformOps, SceneInspectOps, SceneRemeshOps,
+    SceneRepairOps, SceneSculptOps,
+};
 pub use error::{Result, SceneError};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,

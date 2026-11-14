@@ -11,6 +11,26 @@ import { checkRegisterOptions } from "../register.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
+import {
+  createAlignDomain,
+  createBooleanDomain,
+  createDeformDomain,
+  createInspectDomain,
+  createRemeshDomain,
+  createRepairDomain,
+  createSculptDomain,
+  type DeformBackend,
+  type RemeshBackend,
+  type RepairBackend,
+  type SculptBackend,
+  type WorkerAlignDomain,
+  type WorkerBooleanDomain,
+  type WorkerDeformDomain,
+  type WorkerInspectDomain,
+  type WorkerRemeshDomain,
+  type WorkerRepairDomain,
+  type WorkerSculptDomain,
+} from "../domains/index.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "../handles.js";
 import type {
   AddMeshOptions,
@@ -672,6 +692,76 @@ export class WorkerScene implements SceneLike {
   #warned = false;
   /** The current Worker's crash channel (see `#watch`), while it may run threaded. */
   #crashWatch: BroadcastChannel | undefined;
+
+  /**
+   * Callable async repair domain (`worker.repair(mesh, op)` and `worker.repair.<method>(...)`).
+   */
+  readonly repair: WorkerRepairDomain = createRepairDomain({
+    repair: ((mesh: MeshHandle, op: RepairOp | readonly RepairOp[] | AutoRepairRequest) =>
+      this.#runRepair(mesh, op)) as RepairBackend<true>["repair"],
+    analyze: (mesh, options) => this.analyze(mesh, options),
+    join: (target, source, options) => this.join(target, source, options),
+  });
+
+  /**
+   * Callable async sculpt domain (`worker.sculpt(mesh, op)` and `worker.sculpt.<method>(...)`).
+   */
+  readonly sculpt: WorkerSculptDomain = createSculptDomain({
+    sculpt: ((mesh: MeshHandle, op: SculptOp | readonly SculptOp[]) =>
+      this.#runRepair(mesh, op as RepairOp)) as SculptBackend<true>["sculpt"],
+    verticesInSphere: (mesh, center, radius) => this.verticesInSphere(mesh, center, radius),
+  });
+
+  /** Async remesh, simplification, subdivision, and volumetric reconstruction domain. */
+  readonly remesh: WorkerRemeshDomain = createRemeshDomain({
+    repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<true>["repair"],
+  });
+
+  /** Callable async boolean, offsetting, and shell domain (`offset` and `shell` execute in worker). */
+  readonly boolean: WorkerBooleanDomain = createBooleanDomain({
+    isAsync: true,
+    repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<true>["repair"],
+  });
+
+  /** Async surface deformation and vertex-protection domain. */
+  readonly deform: WorkerDeformDomain = createDeformDomain({
+    sculpt: ((mesh: MeshHandle, op: SculptOp) =>
+      this.#runRepair(mesh, op as RepairOp)) as DeformBackend<true>["sculpt"],
+  });
+
+  /** Async defect analysis, metrology, queries, fields, and section inspection domain. */
+  readonly inspect: WorkerInspectDomain = createInspectDomain({
+    analyze: (mesh, options) => this.analyze(mesh, options),
+    measure: (mesh) => this.measure(mesh),
+    bounds: (mesh) => this.bounds(mesh),
+    raycast: (origin, direction, options) => this.raycast(origin, direction, options),
+    closestPoint: (point, options) => this.closestPoint(point, options),
+    meshDistance: (a, b, options) => this.meshDistance(a, b, options),
+    intersects: (a, b) => this.intersects(a, b),
+    findContacts: (options) => this.findContacts(options),
+    addDistanceField: (desc) => this.addDistanceField(desc),
+    removeField: (field) => this.removeField(field),
+    fieldValues: (field) => this.fetchFieldValues(field),
+    fieldNearest: (field) => this.fetchFieldNearest(field),
+    fieldStatus: (field) => this.fieldStatus(field),
+    fieldTargetStatus: (field) => this.fieldTargetStatus(field),
+    setColoring: (mesh, rule) => this.setColoring(mesh, rule),
+    coloring: (mesh) => this.coloring(mesh),
+    addSection: (desc) => this.addSection(desc),
+    setSectionPlane: (section, plane) => this.setSectionPlane(section, plane),
+    sectionPlane: (section) => this.sectionPlane(section),
+    setSectionMeshes: (section, meshes) => this.setSectionMeshes(section, meshes),
+    setSectionFill: (section, fill) => this.setSectionFill(section, fill),
+    removeSection: (section) => this.removeSection(section),
+    section: (section, mesh) => this.section(section, mesh),
+    sectionGap: (section, a, b) => this.sectionGap(section, a, b),
+  });
+
+  /** Async rigid registration and alignment domain. */
+  readonly align: WorkerAlignDomain = createAlignDomain({
+    register: (moving, fixed, options) => this.register(moving, fixed, options),
+  });
+
   /** Use {@link createWorkerScene}. */
   private constructor(make: () => WorkerLike, options: { debug: boolean; init: InitMessage }) {
     this.#make = make;
@@ -1524,6 +1614,8 @@ export class WorkerScene implements SceneLike {
    * Joins `source` into `target`; see `Scene.join`. The source stays usable
    * until the join lands: only a successful result removes it (a failed join
    * changes nothing, engine-side or here).
+   *
+   * @deprecated Use `workerScene.repair.join()` instead.
    */
   join(target: MeshHandle, source: MeshHandle, options: JoinOptions): Promise<JoinReport> {
     const ta = this.#live(target);
@@ -1579,6 +1671,8 @@ export class WorkerScene implements SceneLike {
    * result reaches `placement()` with its batch, like a `setPlacement`.
    * Not replayed by a restart: an unanswered one rejects with
    * `INSTANCE_POISONED`, like an edit.
+   *
+   * @deprecated Use `workerScene.align.register()` instead.
    */
   register(moving: MeshHandle, fixed: MeshHandle, options: RegisterOptions = {}): Promise<RegisterResult> {
     const m = this.#live(moving);
@@ -1785,7 +1879,11 @@ export class WorkerScene implements SceneLike {
     this.#push({ kind: "compact", rev: ++this.#rev, id: st.id });
   }
 
-  /** A report of the mesh's defects; see `Scene.analyze`. */
+  /**
+   * A report of the mesh's defects; see `Scene.analyze`.
+   *
+   * @deprecated Use `workerScene.inspect.analyze()` or `workerScene.repair.analyze()` instead.
+   */
   analyze(mesh: MeshHandle, options?: AnalyzeOptions): Promise<Analysis> {
     return this.#query(
       "analyze",
@@ -1794,19 +1892,17 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Scalar measurements of a mesh; see `Scene.measure`. */
+  /**
+   * Scalar measurements of a mesh; see `Scene.measure`.
+   *
+   * @deprecated Use `workerScene.inspect.measure()` instead.
+   */
   measure(mesh: MeshHandle): Promise<MeasureResult> {
     return this.#query("measure", () => ({ mesh: this.#live(mesh).id }), (v) => v);
   }
 
   /** Runs one repair operation, a list as one transaction, or the auto pipeline; see `Scene.repair`. */
-  repair(mesh: MeshHandle, request: AutoRepairRequest): Promise<AutoRepairReport>;
-  repair<const O extends RepairOp>(mesh: MeshHandle, op: O): Promise<RepairReportOf<O>>;
-  repair<const O extends readonly RepairOp[]>(
-    mesh: MeshHandle,
-    ops: O,
-  ): Promise<{ -readonly [K in keyof O]: RepairReportOf<O[K]> }>;
-  repair(
+  #runRepair(
     mesh: MeshHandle,
     op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
   ): Promise<RepairReport | RepairReport[] | AutoRepairReport> {
@@ -1816,19 +1912,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Sculpt domain entry point; see `Scene.sculpt`. */
-  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): Promise<SculptReportOf<O>>;
-  sculpt<const O extends readonly SculptOp[]>(
-    mesh: MeshHandle,
-    ops: O,
-  ): Promise<{ -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
-  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): Promise<SculptReport | SculptReport[]> {
-    return this.repair(mesh, op as RepairOp) as Promise<SculptReport | SculptReport[]>;
-  }
-
   /**
    * Live triangle-used vertex ids of `mesh` inside the closed local-space
    * sphere `(center, radius)`, in ascending order; see `Scene.verticesInSphere`.
+   *
+   * @deprecated Use `workerScene.sculpt.verticesInSphere()` instead.
    */
   verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array> {
     return this.#query(
@@ -1905,7 +1993,11 @@ export class WorkerScene implements SceneLike {
 
   // ---- Fields and colours ----
 
-  /** Adds a signed distance field; see `Scene.addDistanceField`. */
+  /**
+   * Adds a signed distance field; see `Scene.addDistanceField`.
+   *
+   * @deprecated Use `workerScene.inspect.addDistanceField()` instead.
+   */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
     return this.#addField(desc, undefined);
   }
@@ -2173,7 +2265,11 @@ export class WorkerScene implements SceneLike {
 
   // ---- Queries ----
 
-  /** The nearest hit of a world ray over every mesh, or `null`; see `Scene.raycast`. */
+  /**
+   * The nearest hit of a world ray over every mesh, or `null`; see `Scene.raycast`.
+   *
+   * @deprecated Use `workerScene.inspect.raycast()` instead.
+   */
   raycast(origin: Readonly<Vec3>, direction: Readonly<Vec3>, options?: RaycastOptions): Promise<RayHit | null> {
     return this.#query(
       "raycast",
@@ -2182,7 +2278,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** The surface point nearest to a world point, or `null`; see `Scene.closestPoint`. */
+  /**
+   * The surface point nearest to a world point, or `null`; see `Scene.closestPoint`.
+   *
+   * @deprecated Use `workerScene.inspect.closestPoint()` instead.
+   */
   closestPoint(point: Readonly<Vec3>, options: ClosestPointOptions = {}): Promise<ClosestHit | null> {
     return this.#query(
       "closestPoint",
@@ -2197,7 +2297,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** The distance between two meshes' surfaces, or `null`; see `Scene.meshDistance`. */
+  /**
+   * The distance between two meshes' surfaces, or `null`; see `Scene.meshDistance`.
+   *
+   * @deprecated Use `workerScene.inspect.meshDistance()` instead.
+   */
   meshDistance(a: MeshHandle, b: MeshHandle, options?: { maxDistance?: number }): Promise<MeshDistance | null> {
     return this.#query(
       "meshDistance",
@@ -2206,7 +2310,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Whether two meshes intersect or touch as placed. */
+  /**
+   * Whether two meshes intersect or touch as placed.
+   *
+   * @deprecated Use `workerScene.inspect.intersects()` instead.
+   */
   intersects(a: MeshHandle, b: MeshHandle): Promise<boolean> {
     return this.#query(
       "intersects",
@@ -2215,7 +2323,11 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Every mesh pair (or every pair of `pairs`) within `margin`; see `Scene.findContacts`. */
+  /**
+   * Every mesh pair (or every pair of `pairs`) within `margin`; see `Scene.findContacts`.
+   *
+   * @deprecated Use `workerScene.inspect.findContacts()` instead.
+   */
   findContacts(options: FindContactsOptions = {}): Promise<Contact[]> {
     return this.#query(
       "findContacts",

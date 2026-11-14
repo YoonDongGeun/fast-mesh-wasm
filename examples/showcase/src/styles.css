@@ -1038,3 +1038,63 @@ input[type="range"] {
     white-space: normal;
   }
 }
+
+/* ---- Seven-domain workbench navigator ---- */
+.workbench-domains .domains-header {
+  justify-content: space-between;
+  align-items: center;
+}
+.domains-header-actions {
+  display: flex;
+  gap: 4px;
+}
+.domain-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.domain-tabs button {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+.domain-summary {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.domain-summary-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.domain-summary-head code,
+.domain-map code {
+  font-size: 11px;
+  color: var(--accent);
+}
+.domain-summary p {
+  margin: 4px 0 0;
+}
+.domain-map {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.domain-map li {
+  padding: 5px 7px;
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.domain-slot.domain-subdued {
+  opacity: 0.65;
+}
+

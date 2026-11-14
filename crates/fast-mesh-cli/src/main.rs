@@ -13,13 +13,15 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-use args::{Command, Input, Output, OutputFormat};
+use args::{Command, Input, Output, OutputFormat, SimplifyTarget};
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_cli::io::{self, MeshData};
-use fast_mesh_ops::{
-    AutoRepairReport, BooleanOp, MeasureReport, VolumeReason, apply_boolean, auto_repair,
-    boolean_plan, measure,
+use fast_mesh_ops::boolean::{BooleanOp, apply_boolean, boolean_plan};
+use fast_mesh_ops::inspect::{AnalyzeOptions, MeasureReport, VolumeReason, analyze, measure};
+use fast_mesh_ops::remesh::{
+    SimplifyOptions, SubdivideMethod, SubdivideOptions, simplify, subdivide,
 };
+use fast_mesh_ops::repair::{AutoRepairOptions, AutoRepairReport, FilledLoop, auto_repair};
 use fast_mesh_query::Rigid;
 use fast_mesh_store::Mesh;
 use report::Value;
@@ -67,6 +69,15 @@ fn run() -> Result<(), Failure> {
         Command::Help(text) => print(text),
         Command::Version => print(&format!("fast-mesh {}\n", env!("CARGO_PKG_VERSION"))),
         Command::Measure { input, report } => emit(&run_measure(&input)?, report),
+        Command::Analyze {
+            input,
+            weld_tolerance,
+            self_intersection,
+            report,
+        } => emit(
+            &run_analyze(&input, weld_tolerance, self_intersection)?,
+            report,
+        ),
         Command::Repair {
             input,
             output,
@@ -86,6 +97,27 @@ fn run() -> Result<(), Failure> {
         } => {
             refuse_overwrite(&output, &[&a, &b])?;
             let value = run_boolean(&a, &b, op, &output)?;
+            emit(&value, report)
+        }
+        Command::Simplify {
+            input,
+            target,
+            preserve_boundary,
+            output,
+            report,
+        } => {
+            refuse_overwrite(&output, &[&input])?;
+            let value = run_simplify(&input, target, preserve_boundary, &output)?;
+            emit(&value, report)
+        }
+        Command::Subdivide {
+            input,
+            levels,
+            output,
+            report,
+        } => {
+            refuse_overwrite(&output, &[&input])?;
+            let value = run_subdivide(&input, levels, &output)?;
             emit(&value, report)
         }
         Command::Convert {
@@ -221,6 +253,57 @@ fn run_measure(input: &Input) -> Result<Value, Failure> {
     ]))
 }
 
+fn run_analyze(
+    input: &Input,
+    weld_tolerance: f32,
+    self_intersection: bool,
+) -> Result<Value, Failure> {
+    let data = read(input)?;
+    let mesh = to_mesh(&data, input)?;
+    let bvh = if self_intersection {
+        Some(
+            Bvh::build(&mesh, &BuildOptions::default())
+                .map_err(|e| Failure::Runtime(format!("{}: {e}", input.path.display())))?,
+        )
+    } else {
+        None
+    };
+    let options = AnalyzeOptions {
+        weld_tolerance,
+        self_intersection: bvh.as_ref(),
+        ..AnalyzeOptions::default()
+    };
+    let report = analyze(&mesh, &options).map_err(runtime)?;
+    Ok(Value::Object(vec![
+        ("command", Value::Text("analyze".into())),
+        ("input", path_text(&input.path)),
+        ("vertices", Value::Count(mesh.vertex_count())),
+        ("triangles", Value::Count(mesh.triangle_count())),
+        ("boundary_loops", Value::Count(report.loops.len())),
+        ("coincident_groups", Value::Count(report.coincident_groups)),
+        ("degenerate", Value::Count(report.degenerate)),
+        ("duplicate", Value::Count(report.duplicate)),
+        (
+            "non_manifold_edges",
+            Value::Count(report.non_manifold_edges),
+        ),
+        (
+            "non_manifold_vertices",
+            Value::Count(report.non_manifold_vertices.len()),
+        ),
+        ("pinch_vertices", Value::Count(report.pinch_vertices.len())),
+        ("components", Value::Count(report.components.len())),
+        (
+            "orientation_conflicts",
+            Value::Count(report.orientation_conflicts),
+        ),
+        (
+            "self_intersects",
+            report.self_intersects.map_or(Value::Null, Value::Bool),
+        ),
+    ]))
+}
+
 fn counts(mesh: &Mesh) -> Value {
     Value::Object(vec![
         ("vertices", Value::Count(mesh.vertex_count())),
@@ -231,7 +314,7 @@ fn counts(mesh: &Mesh) -> Value {
 fn run_repair(
     input: &Input,
     output: &Output,
-    options: &fast_mesh_ops::AutoRepairOptions,
+    options: &AutoRepairOptions,
 ) -> Result<Value, Failure> {
     let data = read(input)?;
     let mut mesh = to_mesh(&data, input)?;
@@ -263,7 +346,7 @@ fn warn_open_holes(repair: &AutoRepairReport) {
 }
 
 fn repair_stages(r: &AutoRepairReport) -> Value {
-    let added = |f: fn(&fast_mesh_ops::FilledLoop) -> usize| r.fill.filled.iter().map(f).sum();
+    let added = |f: fn(&FilledLoop) -> usize| r.fill.filled.iter().map(f).sum();
     Value::Object(vec![
         (
             "weld",
@@ -372,6 +455,73 @@ fn run_boolean(a: &Input, b: &Input, op: BooleanOp, output: &Output) -> Result<V
         ("closed", Value::Bool(result.closed)),
         ("kept_triangles", Value::Count(applied.kept_triangles)),
         ("triangles_added", Value::Count(applied.triangles_added)),
+    ]))
+}
+
+fn run_simplify(
+    input: &Input,
+    target: SimplifyTarget,
+    preserve_boundary: bool,
+    output: &Output,
+) -> Result<Value, Failure> {
+    let data = read(input)?;
+    let mut mesh = to_mesh(&data, input)?;
+    drop(data);
+    if mesh.triangle_count() == 0 {
+        return Err(Failure::Runtime(format!(
+            "{}: mesh has no triangles to simplify",
+            input.path.display()
+        )));
+    }
+    let target_triangles = match target {
+        SimplifyTarget::Triangles(n) => n,
+        SimplifyTarget::Ratio(r) => ((mesh.triangle_count() as f64) * r).round().max(1.0) as usize,
+    };
+    let before = counts(&mesh);
+    let options = SimplifyOptions {
+        target_triangles,
+        preserve_boundary,
+    };
+    let mut tx = mesh.begin_edit();
+    let report = simplify(&mut tx, &options).map_err(runtime)?;
+    tx.commit().map_err(runtime)?;
+    write(&from_mesh(&mesh)?, output)?;
+    Ok(Value::Object(vec![
+        ("command", Value::Text("simplify".into())),
+        ("input", path_text(&input.path)),
+        ("output", path_text(&output.path)),
+        ("target_triangles", Value::Count(target_triangles)),
+        ("preserve_boundary", Value::Bool(preserve_boundary)),
+        ("collapsed", Value::Count(report.collapsed)),
+        ("triangles_removed", Value::Count(report.triangles_removed)),
+        ("vertices_removed", Value::Count(report.vertices_removed)),
+        ("before", before),
+        ("after", counts(&mesh)),
+    ]))
+}
+
+fn run_subdivide(input: &Input, levels: u32, output: &Output) -> Result<Value, Failure> {
+    let data = read(input)?;
+    let mut mesh = to_mesh(&data, input)?;
+    drop(data);
+    let before = counts(&mesh);
+    let options = SubdivideOptions {
+        method: SubdivideMethod::Loop,
+        levels,
+    };
+    let mut tx = mesh.begin_edit();
+    let report = subdivide(&mut tx, &options).map_err(runtime)?;
+    tx.commit().map_err(runtime)?;
+    write(&from_mesh(&mesh)?, output)?;
+    Ok(Value::Object(vec![
+        ("command", Value::Text("subdivide".into())),
+        ("input", path_text(&input.path)),
+        ("output", path_text(&output.path)),
+        ("levels", Value::Count(levels as usize)),
+        ("triangles_added", Value::Count(report.triangles_added)),
+        ("vertices_added", Value::Count(report.vertices_added)),
+        ("before", before),
+        ("after", counts(&mesh)),
     ]))
 }
 

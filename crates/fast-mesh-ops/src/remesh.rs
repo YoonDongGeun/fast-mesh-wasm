@@ -13,6 +13,12 @@ use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
 use crate::{OpsError, Result, push, reserve};
 
+pub use crate::marching_cubes::{IsoMesh, marching_cubes, marching_cubes_raw};
+pub use crate::simplify::{SimplifyOptions, SimplifyOptionsBuilder, SimplifyReport, simplify};
+pub use crate::subdivide::{
+    SubdivideMethod, SubdivideOptions, SubdivideOptionsBuilder, SubdivideReport, subdivide,
+};
+
 /// Edges longer than this multiple of the target length are split.
 pub const SPLIT_FACTOR: f64 = 4.0 / 3.0;
 /// Edges shorter than this multiple of the target length collapse.

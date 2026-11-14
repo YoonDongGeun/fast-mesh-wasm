@@ -29,6 +29,7 @@ import { RepairPanel } from "./panels/RepairPanel";
 import { DEFAULT_SIDEBAR_WIDTH } from "./panels/settings";
 import { StatusBar } from "./panels/StatusBar";
 import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
+import { domainMatchesPanel, WorkbenchDomains, type WorkbenchDomainId } from "./panels/WorkbenchDomains";
 import { type AppState, useApp } from "./scene/app-state";
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
@@ -80,6 +81,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [dropping, setDropping] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [tourStep, setTourStep] = useState<number | null>(null);
+  const [activeDomain, setActiveDomain] = useState<WorkbenchDomainId | null>(null);
   // The persisted display settings: the theme (as `data-theme` on the
   // root, for the light overrides) and the sidebars (shown, widths).
   const theme = useApp(app, (s) => s.theme);
@@ -423,13 +425,24 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
       </main>
       <aside className="sidebar sidebar-right" style={rightVisible ? undefined : { display: "none" }}>
         <SidebarHandle side="right" shell={shellRef} app={app} />
-        <RepairPanel app={app} scene={engine.scene} />
-        <CollisionPanel app={app} scene={engine.scene} />
-        <InspectPanel app={app} scene={engine.scene} />
-        <ExportPanel app={app} scene={engine.scene} />
-        <Suspense fallback={null}>
-          <VolumePanel app={app} loader={loader} />
-        </Suspense>
+        <WorkbenchDomains activeDomain={activeDomain} onSelectDomain={setActiveDomain} />
+        <div className={domainMatchesPanel(activeDomain, "repair") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="repair">
+          <RepairPanel app={app} scene={engine.scene} />
+        </div>
+        <div className={domainMatchesPanel(activeDomain, "collision") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="collision">
+          <CollisionPanel app={app} scene={engine.scene} />
+        </div>
+        <div className={domainMatchesPanel(activeDomain, "inspect") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="inspect">
+          <InspectPanel app={app} scene={engine.scene} />
+        </div>
+        <div className={domainMatchesPanel(activeDomain, "export") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="export">
+          <ExportPanel app={app} scene={engine.scene} />
+        </div>
+        <div className={domainMatchesPanel(activeDomain, "volume") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="volume">
+          <Suspense fallback={null}>
+            <VolumePanel app={app} loader={loader} />
+          </Suspense>
+        </div>
       </aside>
       <StatusBar engine={engine} app={app} />
       {helpOpen ? (
