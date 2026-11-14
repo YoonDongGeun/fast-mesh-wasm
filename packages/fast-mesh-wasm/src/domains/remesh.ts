@@ -7,6 +7,7 @@ import type {
   RepairReportOf,
   SimplifyReport,
   SubdivideReport,
+  SurfaceRemeshReport,
 } from "../scene.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
@@ -14,6 +15,15 @@ export type RemeshReturn<Async extends boolean, T> = Async extends true ? Promis
 
 /** Options for {@link RemeshDomain.region} / {@link RemeshDomain.remesh}. */
 export type RegionRemeshOptions = Omit<Extract<RepairOp, { op: "remesh" }>, "op">;
+
+/** Options for {@link RemeshDomain.surface}. */
+export type SurfaceRemeshOptions = Omit<Extract<RepairOp, { op: "remeshSurface" }>, "op">;
+
+/** Options for {@link RemeshDomain.isotropic}. */
+export type IsotropicRemeshOptions = Omit<SurfaceRemeshOptions, "mode">;
+
+/** Options for {@link RemeshDomain.adaptive}. */
+export type AdaptiveRemeshOptions = Omit<SurfaceRemeshOptions, "mode">;
 
 /** Options for {@link RemeshDomain.simplify}. */
 export type SimplifyOptions = Omit<Extract<RepairOp, { op: "simplify" }>, "op">;
@@ -40,6 +50,12 @@ export interface RemeshBackend<Async extends boolean = false> {
 export interface RemeshDomain<Async extends boolean = false> {
   remesh(mesh: MeshHandle, options: RegionRemeshOptions): RemeshReturn<Async, RemeshReport>;
   region(mesh: MeshHandle, options: RegionRemeshOptions): RemeshReturn<Async, RemeshReport>;
+  surface(mesh: MeshHandle, options: SurfaceRemeshOptions): RemeshReturn<Async, SurfaceRemeshReport>;
+  isotropic(
+    mesh: MeshHandle,
+    options: IsotropicRemeshOptions,
+  ): RemeshReturn<Async, SurfaceRemeshReport>;
+  adaptive(mesh: MeshHandle, options: AdaptiveRemeshOptions): RemeshReturn<Async, SurfaceRemeshReport>;
   simplify(mesh: MeshHandle, options: SimplifyOptions): RemeshReturn<Async, SimplifyReport>;
   subdivide(mesh: MeshHandle, options?: SubdivideOptions): RemeshReturn<Async, SubdivideReport>;
   voxel(mesh: MeshHandle, options?: VoxelRemeshOptions): RemeshReturn<Async, OffsetReport>;
@@ -59,6 +75,12 @@ export function createRemeshDomain<Async extends boolean>(backend: RemeshBackend
   return {
     remesh: region,
     region,
+    surface: (mesh: MeshHandle, options: SurfaceRemeshOptions) =>
+      backend.repair(mesh, { op: "remeshSurface", ...options }),
+    isotropic: (mesh: MeshHandle, options: IsotropicRemeshOptions) =>
+      backend.repair(mesh, { op: "remeshSurface", ...options, mode: "isotropic" }),
+    adaptive: (mesh: MeshHandle, options: AdaptiveRemeshOptions) =>
+      backend.repair(mesh, { op: "remeshSurface", ...options, mode: "adaptive" }),
     simplify: (mesh: MeshHandle, options: SimplifyOptions) =>
       backend.repair(mesh, { op: "simplify", ...options }),
     subdivide: (mesh: MeshHandle, options: SubdivideOptions = {}) =>

@@ -37,6 +37,7 @@ export {
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
 export type { SceneDomainsLike, SceneLike } from "./scene-like.js";
 export {
+  type AdaptiveRemeshOptions,
   type AlignBackend,
   type AlignDomain,
   type AlignReturn,
@@ -68,6 +69,7 @@ export {
   type FlattenOp,
   type GrabOp,
   type InflateOp,
+  type IsotropicRemeshOptions,
   type InspectBackend,
   type InspectDomain,
   type InspectReturn,
@@ -91,6 +93,7 @@ export {
   type SmoothOp,
   type SplitStretchedOptions,
   type SubdivideOptions,
+  type SurfaceRemeshOptions,
   type SyncAlignDomain,
   type SyncBooleanDomain,
   type SyncDeformDomain,
@@ -198,6 +201,8 @@ export {
   type SimplifyReport,
   type SmoothReport,
   type SubdivideReport,
+  type SurfaceRemeshMode,
+  type SurfaceRemeshReport,
   type StretchReport,
   type CaptureRestReport,
   type CaptureStrokeReport,

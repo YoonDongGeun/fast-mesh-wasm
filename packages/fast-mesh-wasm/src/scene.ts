@@ -992,12 +992,84 @@ export type RepairOp =
   | {
       op: "simplify";
       /**
-       * Stop once this many triangles are alive; must be at least 1. A target
+       * Stop once this many triangles are alive; must be at least 1 when set.
+       * Optional when `targetRatio` or `maxDeviation` is provided; a target
        * at or above the live count leaves the mesh alone.
        */
-      targetTriangles: number;
+      targetTriangles?: number;
+      /**
+       * Target fraction of live input triangles in `(0, 1]`. When provided,
+       * resolves the triangle budget to `(live * targetRatio).round().max(1)`.
+       */
+      targetRatio?: number;
+      /**
+       * Maximum allowed root-quadric geometric deviation; collapses exceeding
+       * `maxDeviation^2` stop or skip cleanly.
+       */
+      maxDeviation?: number;
       /** Keep boundary vertices in place; defaults to `true`. */
       preserveBoundary?: boolean;
+      /**
+       * Use Hoppe appearance-aware UV quadrics, protect UV chart borders, and
+       * block collapses that fold 2D UV triangles; defaults to `false`.
+       */
+      preserveUvs?: boolean;
+      /**
+       * Penalize perpendicular displacement off sharp dihedral creases above
+       * `creaseAngleDeg` and lock crease corners; defaults to `false`.
+       */
+      lockCreases?: boolean;
+      /**
+       * Dihedral angle threshold in degrees (`[0, 180]`) for feature creases
+       * when `lockCreases` is enabled; defaults to `30`.
+       */
+      creaseAngleDeg?: number;
+      /**
+       * Reject collapses that invert any 1-ring incident triangle normal by
+       * `90` degrees or more; defaults to `true`.
+       */
+      preventNormalInversion?: boolean;
+    }
+  | {
+      op: "remeshSurface";
+      /** Uniform `"isotropic"` (default) or curvature-`"adaptive"` edge sizing. */
+      mode?: SurfaceRemeshMode;
+      /** Nominal target edge length in local mesh units (positive finite). */
+      targetEdgeLength: number;
+      /**
+       * Lower edge-length bound in `"adaptive"` mode; defaults to
+       * `0.35 * targetEdgeLength`.
+       */
+      minEdgeLength?: number;
+      /**
+       * Upper edge-length bound in `"adaptive"` mode; defaults to
+       * `2 * targetEdgeLength`.
+       */
+      maxEdgeLength?: number;
+      /**
+       * Number of split/collapse/flip/relax/reproject passes (capped at `64`);
+       * defaults to `5`.
+       */
+      iterations?: number;
+      /** Tangential relaxation strength in `[0, 1]`; defaults to `0.5`. */
+      smoothStrength?: number;
+      /**
+       * Reproject moved interior vertices onto the input reference surface via
+       * BVH; defaults to `true`.
+       */
+      projectToSurface?: boolean;
+      /** Keep open boundary vertices fixed; defaults to `true`. */
+      lockBoundaries?: boolean;
+      /**
+       * Detect sharp dihedral edges above `creaseAngleDeg` and preserve sharp
+       * creases and corners; defaults to `true`.
+       */
+      lockCreases?: boolean;
+      /**
+       * Dihedral angle threshold in degrees (`[0, 180]`) for feature creases;
+       * defaults to `30`.
+       */
+      creaseAngleDeg?: number;
     }
   | {
       op: "subdivide";
@@ -1123,6 +1195,27 @@ export interface TwistReport {
 /** What `captureStrokeState` did: nothing to report. */
 export type CaptureStrokeReport = Record<string, never>;
 
+/** Edge sizing strategy for `remeshSurface`. */
+export type SurfaceRemeshMode = "isotropic" | "adaptive";
+
+/** What `remeshSurface` did. */
+export interface SurfaceRemeshReport {
+  /** Alive triangles before remeshing. */
+  initialTriangles: number;
+  /** Alive triangles after remeshing. */
+  finalTriangles: number;
+  /** Edge splits performed across all passes. */
+  splits: number;
+  /** Edge collapses performed across all passes. */
+  collapses: number;
+  /** Valence-reducing interior edge flips performed across all passes. */
+  flips: number;
+  /** Iterations executed. */
+  iterationsRun: number;
+  /** Whether a UV channel existed and was dropped undoably. */
+  uvsDropped: boolean;
+}
+
 /** What `remesh` did. */
 export interface RemeshReport {
   splits: number;
@@ -1206,6 +1299,8 @@ export interface SimplifyReport {
   trianglesRemoved: number;
   /** Vertices removed (one per collapse). */
   verticesRemoved: number;
+  /** Maximum root-quadric geometric error observed across accepted collapses. */
+  maxDeviationAchieved: number;
 }
 
 /** What `subdivide` did. */
@@ -1507,6 +1602,7 @@ export type RepairReport =
   | OffsetReport
   | ShellReport
   | SimplifyReport
+  | SurfaceRemeshReport
   | SubdivideReport
   | ManifoldReport
   | SelfIntersectReport
@@ -1557,13 +1653,15 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
                                     ? ShellReport
                                     : O extends { op: "simplify" }
                                       ? SimplifyReport
-                                      : O extends { op: "subdivide" }
-                                        ? SubdivideReport
-                                        : O extends { op: "splitStretched" }
-                                          ? StretchReport
-                                          : O extends { op: "captureRestSizes" }
-                                            ? CaptureRestReport
-                                            : RepairReport;
+                                      : O extends { op: "remeshSurface" }
+                                        ? SurfaceRemeshReport
+                                        : O extends { op: "subdivide" }
+                                          ? SubdivideReport
+                                          : O extends { op: "splitStretched" }
+                                            ? StretchReport
+                                            : O extends { op: "captureRestSizes" }
+                                              ? CaptureRestReport
+                                              : RepairReport;
 
 /** The scene's view of its active drag. */
 interface ActiveDrag {
@@ -1756,7 +1854,7 @@ const REPAIR_CODES = {
   relax: 10,
   offset: 11,
   shell: 12,
-  simplify: 13,
+  simplify: 28,
   subdivide: 14,
   splitStretched: 16,
   captureRestSizes: 17,
@@ -1768,6 +1866,7 @@ const REPAIR_CODES = {
   makeManifold: 23,
   resolveSelfIntersections: 24,
   cleanupSlivers: 25,
+  remeshSurface: 27,
 } as const;
 
 /** The op code of a legacy {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
@@ -1839,6 +1938,10 @@ const TWIST_METHOD_CODES: Record<TwistMethod, number> = {
 };
 const OFFSET_ALGORITHM_CODES = { normal: 0, fhEdt: 1, bvhSdf: 2 } as const;
 const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
+const SURFACE_REMESH_MODE_CODES: Record<SurfaceRemeshMode, number> = {
+  isotropic: 0,
+  adaptive: 1,
+};
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
 /** The `status` codes of `WasmScene.register`, in order. */
@@ -2175,9 +2278,43 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         values.push(optional(o.thickness, "thickness"));
         break;
       case "simplify":
+        if (
+          o.targetTriangles === undefined &&
+          o.targetRatio === undefined &&
+          o.maxDeviation === undefined
+        ) {
+          throw invalid("simplify requires targetTriangles, targetRatio, or maxDeviation");
+        }
         values.push(
           optional(o.targetTriangles, "targetTriangles"),
+          optional(o.targetRatio, "targetRatio"),
+          optional(o.maxDeviation, "maxDeviation"),
           flagOf(o.preserveBoundary, true),
+          flagOf(o.preserveUvs, false),
+          flagOf(o.lockCreases, false),
+          optional(o.creaseAngleDeg, "creaseAngleDeg"),
+          flagOf(o.preventNormalInversion, true),
+        );
+        break;
+      case "remeshSurface":
+        if (
+          typeof o.targetEdgeLength !== "number" ||
+          !Number.isFinite(o.targetEdgeLength) ||
+          o.targetEdgeLength <= 0
+        ) {
+          throw invalid("targetEdgeLength must be positive and finite");
+        }
+        values.push(
+          o.mode === undefined ? Number.NaN : codeIn(SURFACE_REMESH_MODE_CODES, o.mode, "mode"),
+          o.targetEdgeLength,
+          optional(o.minEdgeLength, "minEdgeLength"),
+          optional(o.maxEdgeLength, "maxEdgeLength"),
+          optional(o.iterations, "iterations"),
+          optional(o.smoothStrength, "smoothStrength"),
+          flagOf(o.projectToSurface, true),
+          flagOf(o.lockBoundaries, true),
+          flagOf(o.lockCreases, true),
+          optional(o.creaseAngleDeg, "creaseAngleDeg"),
         );
         break;
       case "subdivide":
@@ -2343,7 +2480,22 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
         verticesRemoved: r.next(),
       };
     case "simplify":
-      return { collapsed: r.next(), trianglesRemoved: r.next(), verticesRemoved: r.next() };
+      return {
+        collapsed: r.next(),
+        trianglesRemoved: r.next(),
+        verticesRemoved: r.next(),
+        maxDeviationAchieved: r.next(),
+      };
+    case "remeshSurface":
+      return {
+        initialTriangles: r.next(),
+        finalTriangles: r.next(),
+        splits: r.next(),
+        collapses: r.next(),
+        flips: r.next(),
+        iterationsRun: r.next(),
+        uvsDropped: r.flag(),
+      };
     case "subdivide":
       return { verticesAdded: r.next(), trianglesAdded: r.next() };
     case "splitStretched":

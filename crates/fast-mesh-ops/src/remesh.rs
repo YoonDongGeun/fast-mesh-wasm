@@ -14,7 +14,14 @@ use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 use crate::{OpsError, Result, push, reserve};
 
 pub use crate::marching_cubes::{IsoMesh, marching_cubes, marching_cubes_raw};
-pub use crate::simplify::{SimplifyOptions, SimplifyOptionsBuilder, SimplifyReport, simplify};
+pub use crate::remesh_surface::{
+    SurfaceRemeshMode, SurfaceRemeshOptions, SurfaceRemeshOptionsBuilder, SurfaceRemeshReport,
+    remesh_surface, remesh_surface_with_mask,
+};
+pub use crate::simplify::{
+    DecimateOptions, DecimateOptionsBuilder, SimplifyExtendedOptions, SimplifyOptions,
+    SimplifyOptionsBuilder, SimplifyReport, simplify, simplify_with,
+};
 pub use crate::subdivide::{
     SubdivideMethod, SubdivideOptions, SubdivideOptionsBuilder, SubdivideReport, subdivide,
 };

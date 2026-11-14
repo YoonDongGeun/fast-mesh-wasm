@@ -104,6 +104,7 @@ mod orient;
 pub mod protect;
 mod refine;
 pub mod remesh;
+pub mod remesh_surface;
 pub mod repair;
 pub mod sculpt;
 pub mod simplify;
@@ -143,6 +144,10 @@ pub use offset::{
 };
 pub use orient::{OrientReport, orient};
 pub use protect::{check_protection, with_protection, with_protection_band};
+pub use remesh_surface::{
+    SurfaceRemeshMode, SurfaceRemeshOptions, SurfaceRemeshOptionsBuilder, SurfaceRemeshReport,
+    remesh_surface, remesh_surface_with_mask,
+};
 pub use repair::{
     AutoRepairPreset, ManifoldOptions, ManifoldOptionsBuilder, ManifoldReport,
     SelfIntersectOptions, SelfIntersectOptionsBuilder, SelfIntersectReport, SelfIntersectionMode,
@@ -160,6 +165,10 @@ pub use sculpt::{
     capture_stroke_state, clay, clay_region, crease, crease_region, ensure_stroke_state, flatten,
     flatten_region, grab, grab_region, grab_region_with_stroke, grab_widest_reach, inflate,
     inflate_region, inflate_region_with_stroke, smooth, smooth_region, twist, twist_region,
+};
+pub use simplify::{
+    DecimateOptions, DecimateOptionsBuilder, SimplifyExtendedOptions, SimplifyOptions,
+    SimplifyOptionsBuilder, SimplifyReport, simplify, simplify_with,
 };
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
 

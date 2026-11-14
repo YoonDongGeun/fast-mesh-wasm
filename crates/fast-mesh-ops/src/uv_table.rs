@@ -8,8 +8,8 @@ use fast_mesh_store::{Mesh, VertexId};
 
 use crate::bridge::BridgeOptions;
 use crate::deform::{Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions};
-use crate::remesh::{Region, RemeshOptions};
-use crate::simplify::SimplifyOptions;
+use crate::remesh::{Region, RemeshOptions, SurfaceRemeshOptions, remesh_surface};
+use crate::simplify::{DecimateOptions, SimplifyOptions, simplify_with};
 use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
@@ -1292,4 +1292,40 @@ fn auto_repair_presets_uv_contract() {
     assert!(b.uvs().is_none());
     patch.revert(&mut b).unwrap();
     assert_eq!(&b.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+}
+
+#[test]
+fn remesh_surface_drops_uvs_and_undo_restores() {
+    let mut m = with_planar(grid(6));
+    let before = m.uvs().unwrap().to_vec();
+    let opts = SurfaceRemeshOptions::builder()
+        .target_edge_length(0.5)
+        .iterations(2)
+        .build();
+    let mut tx = m.begin_edit();
+    let report = remesh_surface(&mut tx, &opts).unwrap();
+    assert!(report.uvs_dropped);
+    assert!(report.iterations_run > 0);
+    let patch = tx.commit().unwrap();
+    assert!(m.uvs().is_none());
+    patch.revert(&mut m).unwrap();
+    assert_eq!(&m.uvs().unwrap()[..before.len()], &before[..]);
+}
+
+#[test]
+fn simplify_with_preserve_uvs_keeps_uv_channel_and_undo_restores() {
+    let mut m = with_planar(grid(10));
+    let before = m.uvs().unwrap().to_vec();
+    let opts = DecimateOptions::builder()
+        .target_ratio(0.4)
+        .preserve_uvs(true)
+        .build();
+    let mut tx = m.begin_edit();
+    let r = simplify_with(&mut tx, &opts).unwrap();
+    assert!(r.collapsed > 0);
+    let patch = tx.commit().unwrap();
+    assert!(m.uvs().is_some());
+    assert_planar(&m, 1e-3);
+    patch.revert(&mut m).unwrap();
+    assert_eq!(&m.uvs().unwrap()[..before.len()], &before[..]);
 }
