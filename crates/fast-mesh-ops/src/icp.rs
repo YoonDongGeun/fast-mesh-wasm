@@ -37,7 +37,7 @@ use fast_mesh_store::{Mesh, VertexId, par};
 use crate::{OpsError, Result, filled, reserve};
 
 /// Fewest correspondences that can determine a rigid transform.
-const MIN_CORRESPONDENCES: usize = 6;
+pub(crate) const MIN_CORRESPONDENCES: usize = 6;
 
 /// A motion is left out of the steps when its eigenvalue of the normalised
 /// normal equations is below this fraction of the largest: it has no constraint
@@ -50,7 +50,7 @@ pub(crate) const MIN_CONDITIONING: f64 = 1e-6;
 
 /// The largest rotation of one step, in radians. Larger steps are shortened:
 /// the linearisation means nothing that far out.
-const MAX_STEP_ANGLE: f64 = 0.5;
+pub(crate) const MAX_STEP_ANGLE: f64 = 0.5;
 
 /// The most points each restart of the determination check uses. The check's
 /// cost is bounded by this, whatever the size of the input.
@@ -81,8 +81,8 @@ const PROBE_AS_GOOD: f64 = 2.5;
 const PROBE_RMSE_FLOOR: f64 = 1e-6;
 
 /// Distances per parallel chunk, and the fewest that go parallel.
-const DISTANCE_CHUNK: usize = 1024;
-const PAR_MIN_DISTANCES: usize = 4096;
+pub(crate) const DISTANCE_CHUNK: usize = 1024;
+pub(crate) const PAR_MIN_DISTANCES: usize = 4096;
 
 /// Options for [`icp()`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -701,7 +701,7 @@ fn undetermined_motions(
     Ok(out)
 }
 
-fn corners_of(mesh: &Mesh, hit: ClosestHit) -> Option<[[f64; 3]; 3]> {
+pub(crate) fn corners_of(mesh: &Mesh, hit: ClosestHit) -> Option<[[f64; 3]; 3]> {
     let [a, b, c] = mesh.triangle(hit.triangle)?;
     Some([
         mesh.position(a)?.map(f64::from),
@@ -712,7 +712,7 @@ fn corners_of(mesh: &Mesh, hit: ClosestHit) -> Option<[[f64; 3]; 3]> {
 
 /// The centroid of `points` and their largest distance from it (1 when they
 /// all coincide, so that dividing by it is safe).
-fn spread(points: &[[f64; 3]]) -> ([f64; 3], f64) {
+pub(crate) fn spread(points: &[[f64; 3]]) -> ([f64; 3], f64) {
     let mut sum = [0.0; 3];
     for p in points {
         sum = add(sum, *p);
@@ -755,7 +755,7 @@ fn solve(h: &[[f64; 6]; 6], g: &[f64; 6]) -> ([f64; 6], f64) {
 /// The eigenvalues of a symmetric matrix and its eigenvectors (columns), by
 /// cyclic Jacobi rotations.
 #[allow(clippy::needless_range_loop)] // Matrix indices read better here.
-fn jacobi_eigen(mut a: [[f64; 6]; 6]) -> ([f64; 6], [[f64; 6]; 6]) {
+pub(crate) fn jacobi_eigen(mut a: [[f64; 6]; 6]) -> ([f64; 6], [[f64; 6]; 6]) {
     let mut v = [[0.0; 6]; 6];
     for (i, row) in v.iter_mut().enumerate() {
         row[i] = 1.0;
@@ -802,7 +802,7 @@ fn jacobi_eigen(mut a: [[f64; 6]; 6]) -> ([f64; 6], [[f64; 6]; 6]) {
 
 /// `transform` followed by the rotation vector `rotation` about `center` and
 /// the step `translation`, re-orthonormalised.
-fn compose_step(
+pub(crate) fn compose_step(
     transform: &Rigid,
     center: [f64; 3],
     translation: [f64; 3],
@@ -822,7 +822,7 @@ fn compose_step(
 }
 
 /// Rodrigues' formula for a rotation vector.
-fn rotation_of(w: [f64; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn rotation_of(w: [f64; 3]) -> [[f64; 3]; 3] {
     let angle = norm(w);
     // sin(a)/a and (1 - cos(a))/a², with their limits near zero.
     let (s, c) = if angle < 1e-8 {
@@ -853,7 +853,7 @@ fn rotation_of(w: [f64; 3]) -> [[f64; 3]; 3] {
 /// Gram-Schmidt on the rows; the third row is the cross product, which keeps
 /// the determinant at +1. The input is within rounding of a rotation, so the
 /// fallbacks are never reached in practice.
-fn orthonormal(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn orthonormal(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let r0 = unit(m[0]).unwrap_or([1.0, 0.0, 0.0]);
     let d = dot(m[1], r0);
     let r1 = unit([
@@ -865,25 +865,25 @@ fn orthonormal(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     [r0, r1, cross(r0, r1)]
 }
 
-fn apply(x: &Rigid, p: [f64; 3]) -> [f64; 3] {
+pub(crate) fn apply(x: &Rigid, p: [f64; 3]) -> [f64; 3] {
     let r = &x.rotation;
     let t = x.translation;
     std::array::from_fn(|i| r[i][0] * p[0] + r[i][1] * p[1] + r[i][2] * p[2] + t[i])
 }
 
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -891,15 +891,21 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn norm(a: [f64; 3]) -> f64 {
+pub(crate) fn norm(a: [f64; 3]) -> f64 {
     dot(a, a).sqrt()
 }
 
 /// `a` over its length, or `None` for the zero vector.
-fn unit(a: [f64; 3]) -> Option<[f64; 3]> {
+pub(crate) fn unit(a: [f64; 3]) -> Option<[f64; 3]> {
     let n = norm(a);
     (n > 0.0).then(|| a.map(|c| c / n))
 }
+
+pub use crate::align::{
+    CoarseAlignMethod, IcpObjective, LandmarkAlignment, LandmarkPair, RegistrationOptions,
+    RegistrationReport, SymmetryPlaneReport, align_landmarks, detect_symmetry_plane,
+    register_multistage,
+};
 
 #[cfg(test)]
 #[path = "icp_tests.rs"]

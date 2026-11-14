@@ -1042,3 +1042,196 @@ fn icp_survey() {
         }
     }
 }
+
+#[test]
+fn align_internal_svd_3x3_ranks_and_scales() {
+    use crate::align::{CoarseAlignMethod, IcpObjective, RegistrationOptions, svd_3x3};
+
+    let check_svd = |m: [[f64; 3]; 3], scale: f64| {
+        let (u, d, v) = svd_3x3(m);
+        assert!(d[0] >= d[1] && d[1] >= d[2] && d[2] >= 0.0);
+        for i in 0..3 {
+            for j in 0..3 {
+                let utu: f64 = (0..3).map(|k| u[k][i] * u[k][j]).sum();
+                let vtv: f64 = (0..3).map(|k| v[k][i] * v[k][j]).sum();
+                let target = if i == j { 1.0 } else { 0.0 };
+                assert!((utu - target).abs() < 1e-12, "U^T U mismatch at ({i},{j})");
+                assert!((vtv - target).abs() < 1e-12, "V^T V mismatch at ({i},{j})");
+                let rec: f64 = (0..3).map(|k| u[i][k] * d[k] * v[j][k]).sum();
+                assert!(
+                    (rec - m[i][j]).abs() <= 1e-11 * scale.max(1e-12),
+                    "SVD recon mismatch at ({i},{j}): rec={rec} m={}",
+                    m[i][j]
+                );
+            }
+        }
+        (u, d, v)
+    };
+
+    // Rank-3 full matrix with negative determinant and extreme magnitudes.
+    let base = [[2.0, -1.0, 0.5], [0.5, 3.0, -1.5], [-1.0, 0.2, -2.5]];
+    check_svd(base, 5.0);
+    let huge = base.map(|r| r.map(|x| x * 1e100));
+    check_svd(huge, 5e100);
+    let tiny = base.map(|r| r.map(|x| x * 1e-100));
+    check_svd(tiny, 5e-100);
+
+    // Zero matrix.
+    let (_u0, d0, _v0) = check_svd([[0.0; 3]; 3], 1.0);
+    assert_eq!(d0, [0.0; 3]);
+
+    // Rank-2 planar outer sum.
+    let rank2 = [[1.0, 2.0, -0.5], [-0.5, 1.0, 1.5], [0.0, 0.0, 0.0]];
+    let (_u2, d2, _v2) = check_svd(rank2, 3.0);
+    assert!(d2[1] > 0.1 && d2[2] == 0.0, "expected rank 2, got {d2:?}");
+
+    // Rank-1 collinear outer product.
+    let rank1 = [[1.0, -2.0, 3.0], [2.0, -4.0, 6.0], [-1.0, 2.0, -3.0]];
+    let (_u1, d1, _v1) = check_svd(rank1, 10.0);
+    assert!(d1[0] > 1.0 && d1[1] == 0.0 && d1[2] == 0.0, "got {d1:?}");
+    let _ = (
+        CoarseAlignMethod::None,
+        IcpObjective::SymmetricNormal,
+        RegistrationOptions::default(),
+    );
+}
+
+#[test]
+fn align_internal_axis_angle_round_trip() {
+    use crate::align::axis_angle_of;
+
+    for angle in [
+        0.0,
+        1e-12,
+        1e-6,
+        0.7,
+        std::f64::consts::PI - 1e-7,
+        std::f64::consts::PI,
+    ] {
+        let r = turn([1.0, -2.0, 0.5], angle);
+        let w = axis_angle_of(r);
+        let rec = rotation_of(w);
+        let max_err = (0..3)
+            .flat_map(|i| (0..3).map(move |j| (r[i][j] - rec[i][j]).abs()))
+            .fold(0.0_f64, f64::max);
+        assert!(max_err < 1e-13, "angle={angle} max_err={max_err}");
+    }
+}
+
+#[test]
+fn align_internal_ldlt_6x6_and_closest_triangle() {
+    use crate::align::{closest_on_triangle_f64, solve_ldlt_6x6};
+    use fast_mesh_query::distance_to_triangle;
+
+    let h = [
+        [6.0, 1.0, 0.0, 0.5, -0.2, 0.1],
+        [1.0, 5.0, 0.3, 0.0, 0.4, -0.3],
+        [0.0, 0.3, 4.0, -0.2, 0.1, 0.2],
+        [0.5, 0.0, -0.2, 3.0, 0.2, 0.0],
+        [-0.2, 0.4, 0.1, 0.2, 2.5, 0.1],
+        [0.1, -0.3, 0.2, 0.0, 0.1, 2.0],
+    ];
+    let x_true = [1.0, -2.0, 0.5, 0.25, -0.75, 1.5];
+    let g: [f64; 6] = std::array::from_fn(|i| (0..6).map(|j| h[i][j] * x_true[j]).sum());
+    let (x, cond) = solve_ldlt_6x6(h, g).expect("SPD system should solve");
+    assert!(cond > 0.01);
+    for i in 0..6 {
+        assert!((x[i] - x_true[i]).abs() < 1e-12);
+    }
+
+    // Rank-deficient 6x6 returns None.
+    let mut sing = h;
+    sing[5] = [0.0; 6];
+    for row in &mut sing {
+        row[5] = 0.0;
+    }
+    assert!(solve_ldlt_6x6(sing, g).is_none());
+
+    let tri = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]];
+    for p in [
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 0.5],
+        [-1.0, 1.0, 0.5],
+        [2.0, 2.0, 0.5],
+        [0.5, 0.5, 3.0],
+    ] {
+        let (q, bary) = closest_on_triangle_f64(p, tri);
+        let sum_b = bary[0] + bary[1] + bary[2];
+        assert!((sum_b - 1.0).abs() < 1e-14);
+        let d_q = norm(sub(p, q));
+        let d_ref = distance_to_triangle(p, tri);
+        assert!((d_q - d_ref).abs() < 1e-14, "d_q={d_q} d_ref={d_ref}");
+    }
+}
+
+#[test]
+fn align_oom_sweeps() {
+    use crate::OpsError;
+    use crate::align::{
+        CoarseAlignMethod, IcpObjective, RegistrationOptions, detect_symmetry_plane,
+        register_multistage,
+    };
+    use fast_mesh_store::StoreError;
+
+    struct DisarmOnDrop;
+    impl Drop for DisarmOnDrop {
+        fn drop(&mut self) {
+            crate::fail_allocations_after(None);
+        }
+    }
+    let _guard = DisarmOnDrop;
+
+    let tgt = blob(16, 24);
+    let src = blob(16, 24);
+    let bvh = Bvh::build(&tgt, &BuildOptions::default()).unwrap();
+    let opts = RegistrationOptions {
+        coarse_method: CoarseAlignMethod::OrientedBoundingBox,
+        objective: IcpObjective::SymmetricNormal,
+        max_iterations: 4,
+        tolerance: 1e-4,
+        overlap: 1.0,
+        max_distance: None,
+        target_rmse: 0.0,
+        sample_count: 300,
+        anderson_window: 3,
+    };
+
+    let mut limit = 0usize;
+    loop {
+        crate::fail_allocations_after(Some(limit));
+        let res = register_multistage(&src, &tgt, &bvh, None, &opts);
+        crate::fail_allocations_after(None);
+        match res {
+            Ok(_) => break,
+            Err(OpsError::Store(StoreError::OutOfMemory)) => limit += 1,
+            Err(other) => panic!("unexpected registration error at alloc {limit}: {other:?}"),
+        }
+        assert!(limit < 10_000, "allocation sweep exceeded bound");
+    }
+    assert!(
+        limit > 0,
+        "expected fallible allocations during register_multistage"
+    );
+
+    let box_tgt = box_mesh([-2.0, -1.0, -0.5], [2.0, 1.0, 0.5]);
+    let box_bvh = Bvh::build(&box_tgt, &BuildOptions::default()).unwrap();
+    let mut sym_limit = 0usize;
+    loop {
+        crate::fail_allocations_after(Some(sym_limit));
+        let res = detect_symmetry_plane(&box_tgt, &box_bvh);
+        crate::fail_allocations_after(None);
+        match res {
+            Ok(_) => break,
+            Err(OpsError::Store(StoreError::OutOfMemory)) => sym_limit += 1,
+            Err(other) => panic!("unexpected symmetry error at alloc {sym_limit}: {other:?}"),
+        }
+        assert!(
+            sym_limit < 10_000,
+            "symmetry allocation sweep exceeded bound"
+        );
+    }
+    assert!(
+        sym_limit > 0,
+        "expected fallible allocations during detect_symmetry_plane"
+    );
+}
