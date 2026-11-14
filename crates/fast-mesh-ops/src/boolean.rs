@@ -23,22 +23,84 @@
 //! and A's UV channel is dropped when present ([`BooleanReport::uvs_dropped`]).
 
 mod arrangement;
+mod batch;
 mod cdt;
 mod classify;
+mod perturbation;
+mod voxel;
 mod winding;
 
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_query::Rigid;
 use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
-use crate::analyze::analyze;
-use crate::{OpsError, Result, filled, push, reserve};
+use crate::analyze::{AREA_EPSILON, analyze};
+use crate::{OpsError, Result, allocation_allowed, filled, push, reserve};
 
 pub use crate::cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
 pub use crate::offset::{
     OffsetAlgorithm, OffsetOptions, OffsetOptionsBuilder, OffsetReport, ShellOptions,
     ShellOptionsBuilder, ShellReport, offset, offset_with_bvh, shell,
 };
+pub use batch::{CsgNode, boolean_batch};
+
+/// Backend strategy for CSG boolean evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BooleanMethod {
+    /// Exact symbolic-perturbation mesh arrangement and CDT classification.
+    #[default]
+    Manifold,
+    /// Volumetric BVH signed distance field boolean with Marching Cubes extraction.
+    BvhSdf,
+    /// Volumetric Felzenszwalb-Huttenlocher exact EDT boolean with Marching Cubes extraction.
+    FhEdt,
+}
+
+/// Configuration options for [`boolean`] and [`apply_boolean_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BooleanOptions {
+    /// CSG operation to perform.
+    pub op: BooleanOp,
+    /// Evaluation backend (`Manifold`, `BvhSdf`, or `FhEdt`).
+    pub method: BooleanMethod,
+    /// Coplanar and seam tolerance scale (local units). Default `1e-5`.
+    pub coplanar_tolerance: f64,
+    /// Whether to collapse short/needle triangles along boolean seam edges in `Manifold` mode.
+    pub snap_slivers: bool,
+    /// Optional explicit voxel size for volumetric modes (`BvhSdf` / `FhEdt`).
+    pub voxel_pitch: Option<f32>,
+    /// Optional upper bound on output triangle count via bounded quadric simplification.
+    pub max_triangles: Option<u32>,
+}
+
+impl Default for BooleanOptions {
+    fn default() -> Self {
+        Self {
+            op: BooleanOp::Union,
+            method: BooleanMethod::Manifold,
+            coplanar_tolerance: 1e-5,
+            snap_slivers: true,
+            voxel_pitch: None,
+            max_triangles: None,
+        }
+    }
+}
+
+pub(super) fn validate_options(options: &BooleanOptions) -> Result<()> {
+    if !options.coplanar_tolerance.is_finite() || options.coplanar_tolerance < 0.0 {
+        return Err(OpsError::InvalidInput(
+            "coplanar_tolerance must be finite and non-negative",
+        ));
+    }
+    if let Some(pitch) = options.voxel_pitch
+        && (!pitch.is_finite() || pitch <= 0.0)
+    {
+        return Err(OpsError::InvalidInput(
+            "voxel_pitch must be finite and positive",
+        ));
+    }
+    Ok(())
+}
 
 /// Which boolean to compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,9 +189,18 @@ pub fn boolean_plan(
 /// stays atomic through [`Scene::edit`](https://docs.rs/fast-mesh-scene)-style
 /// callers.
 pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<BooleanReport> {
+    let (report, _) = apply_boolean_core(tx, plan, false)?;
+    Ok(report)
+}
+
+fn apply_boolean_core(
+    tx: &mut Transaction,
+    plan: &BooleanPlan,
+    track_seams: bool,
+) -> Result<(BooleanReport, Vec<bool>)> {
     // Pre-compute orphaned live vertices and reserve all temporary buffers
     // BEFORE issuing any write to `tx`, keeping OOM failures strictly atomic.
-    let (unused, mut set_ids, mut set_tris, mut add_tris, total_added) = {
+    let (unused, mut set_ids, mut set_tris, mut add_tris, total_added, v_slots_before) = {
         let mesh = tx.mesh();
         let v_slots = mesh.vertex_slots();
         let t_slots = mesh.triangle_slots();
@@ -195,7 +266,13 @@ pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<Boolean
         reserve(&mut set_tris, plan.rewrite.len())?;
         reserve(&mut add_tris, total_added)?;
 
-        (unused, set_ids, set_tris, add_tris, total_added)
+        (unused, set_ids, set_tris, add_tris, total_added, v_slots)
+    };
+
+    let mut seam_verts: Vec<bool> = if track_seams {
+        filled(v_slots_before + plan.fresh.len(), false)?
+    } else {
+        Vec::new()
     };
 
     let uvs_dropped = tx.mesh().uvs().is_some();
@@ -208,6 +285,29 @@ pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<Boolean
     } else {
         tx.add_vertices(&plan.fresh)?
     };
+    if track_seams {
+        let needed = fresh
+            .iter()
+            .copied()
+            .fold(v_slots_before, |acc, v| acc.max(v as usize + 1));
+        if needed > seam_verts.len() {
+            let grow = needed - seam_verts.len();
+            reserve(&mut seam_verts, grow)?;
+            seam_verts.resize(needed, false);
+        }
+        for &v in &fresh {
+            seam_verts[v as usize] = true;
+        }
+        for tri in &plan.tool {
+            for &r in tri {
+                if let PRef::Live(v) = r
+                    && (v as usize) < seam_verts.len()
+                {
+                    seam_verts[v as usize] = true;
+                }
+            }
+        }
+    }
     let at = |r: PRef| match r {
         PRef::Live(v) => v,
         PRef::Fresh(i) => fresh[i as usize],
@@ -237,15 +337,198 @@ pub fn apply_boolean(tx: &mut Transaction, plan: &BooleanPlan) -> Result<Boolean
         tx.remove_vertices(&unused)?;
     }
 
-    Ok(BooleanReport {
-        kept_triangles: tx.mesh().triangle_count(),
-        triangles_added: total_added,
-        uvs_dropped,
-    })
+    Ok((
+        BooleanReport {
+            kept_triangles: tx.mesh().triangle_count(),
+            triangles_added: total_added,
+            uvs_dropped,
+        },
+        seam_verts,
+    ))
+}
+
+/// Computes CSG boolean `options.op` between `mesh_a` and `mesh_b` (with `mesh_b` placed
+/// in `mesh_a`'s frame via `b_in_a`), returning a new mesh and [`BooleanReport`].
+pub fn boolean(
+    mesh_a: &Mesh,
+    mesh_b: &Mesh,
+    b_in_a: Rigid,
+    options: &BooleanOptions,
+) -> Result<(Mesh, BooleanReport)> {
+    validate_options(options)?;
+    b_in_a.validate()?;
+
+    match options.method {
+        BooleanMethod::Manifold => {
+            allocation_allowed()?;
+            let mut out = clone_mesh_fallible(mesh_a)?;
+            let mut tx = out.begin_edit();
+            let report = apply_boolean_with_options(&mut tx, mesh_b, b_in_a, options)?;
+            let _ = tx.commit()?;
+            Ok((out, report))
+        }
+        BooleanMethod::BvhSdf | BooleanMethod::FhEdt => {
+            let (mut out, mut report) = voxel::boolean_voxel(mesh_a, mesh_b, &b_in_a, options)?;
+            if let Some(cap) = options.max_triangles {
+                cap_mesh_triangles(&mut out, cap)?;
+                report.kept_triangles = out.triangle_count();
+            }
+            Ok((out, report))
+        }
+    }
+}
+
+/// Applies CSG boolean `options.op` between `tx.mesh()` and `mesh_b` inside an active
+/// [`Transaction`], optionally snapping seam slivers and simplifying to `max_triangles`.
+pub fn apply_boolean_with_options(
+    tx: &mut Transaction<'_>,
+    mesh_b: &Mesh,
+    b_in_a: Rigid,
+    options: &BooleanOptions,
+) -> Result<BooleanReport> {
+    validate_options(options)?;
+    b_in_a.validate()?;
+
+    match options.method {
+        BooleanMethod::Manifold => {
+            let plan = {
+                let mesh_a = tx.mesh();
+                let bvh_a = Bvh::build(mesh_a, &BuildOptions::default())?;
+                let bvh_b = Bvh::build(mesh_b, &BuildOptions::default())?;
+                boolean_plan(mesh_a, &bvh_a, mesh_b, &bvh_b, &b_in_a, options.op)?
+            };
+            apply_manifold_plan_with_options(tx, &plan, options)
+        }
+        BooleanMethod::BvhSdf | BooleanMethod::FhEdt => {
+            let (mut out, mut report) = voxel::boolean_voxel(tx.mesh(), mesh_b, &b_in_a, options)?;
+            if let Some(cap) = options.max_triangles {
+                cap_mesh_triangles(&mut out, cap)?;
+                report.kept_triangles = out.triangle_count();
+            }
+            replace_tx_with_mesh(tx, &out)?;
+            Ok(report)
+        }
+    }
+}
+
+fn apply_manifold_plan_with_options(
+    tx: &mut Transaction<'_>,
+    plan: &BooleanPlan,
+    options: &BooleanOptions,
+) -> Result<BooleanReport> {
+    if !options.snap_slivers && options.max_triangles.is_none() {
+        return apply_boolean_core(tx, plan, false).map(|(r, _)| r);
+    }
+    let mut scratch = clone_mesh_fallible(tx.mesh())?;
+    let mut report = {
+        let mut stx = scratch.begin_edit();
+        let (mut report, seam_verts) = apply_boolean_core(&mut stx, plan, options.snap_slivers)?;
+        if options.snap_slivers {
+            snap_seam_slivers(&mut stx, &seam_verts, options.coplanar_tolerance)?;
+            report.kept_triangles = stx.mesh().triangle_count();
+        }
+        if let Some(cap) = options.max_triangles {
+            cap_tx_triangles(&mut stx, cap)?;
+            report.kept_triangles = stx.mesh().triangle_count();
+        }
+        let _ = stx.commit()?;
+        report
+    };
+    replace_tx_with_mesh(tx, &scratch)?;
+    report.kept_triangles = tx.mesh().triangle_count();
+    Ok(report)
+}
+
+pub(super) fn cap_mesh_triangles(mesh: &mut Mesh, cap: u32) -> Result<()> {
+    if mesh.triangle_count() <= cap as usize {
+        return Ok(());
+    }
+    let mut tx = mesh.begin_edit();
+    cap_tx_triangles(&mut tx, cap)?;
+    let _ = tx.commit()?;
+    Ok(())
+}
+
+fn cap_tx_triangles(tx: &mut Transaction<'_>, cap: u32) -> Result<()> {
+    if tx.mesh().triangle_count() <= cap as usize {
+        return Ok(());
+    }
+    let _ = crate::simplify::simplify(
+        tx,
+        &crate::simplify::SimplifyOptions {
+            target_triangles: cap as usize,
+            preserve_boundary: true,
+        },
+    )?;
+    Ok(())
+}
+
+fn replace_tx_with_mesh(tx: &mut Transaction<'_>, src: &Mesh) -> Result<()> {
+    let mut drop_tris: Vec<TriangleId> = Vec::new();
+    let mut drop_verts: Vec<VertexId> = Vec::new();
+    {
+        let mesh = tx.mesh();
+        reserve(&mut drop_tris, mesh.triangle_count())?;
+        for t in 0..mesh.triangle_slots() as TriangleId {
+            if mesh.is_triangle_alive(t) {
+                push(&mut drop_tris, t)?;
+            }
+        }
+        reserve(&mut drop_verts, mesh.vertex_count())?;
+        for v in 0..mesh.vertex_slots() as VertexId {
+            if mesh.is_vertex_alive(v) {
+                push(&mut drop_verts, v)?;
+            }
+        }
+    }
+
+    let mut src_remap: Vec<u32> = filled(src.vertex_slots(), u32::MAX)?;
+    let mut add_pos: Vec<[f32; 3]> = Vec::new();
+    let mut add_tris: Vec<[u32; 3]> = Vec::new();
+    let src_pos = src.positions();
+    for t in 0..src.triangle_slots() as TriangleId {
+        let Some(tri) = src.triangle(t) else {
+            continue;
+        };
+        let mut mapped = [0u32; 3];
+        for (k, v) in tri.into_iter().enumerate() {
+            let idx = if src_remap[v as usize] != u32::MAX {
+                src_remap[v as usize]
+            } else {
+                let next = u32::try_from(add_pos.len())
+                    .map_err(|_| OpsError::Store(StoreError::OutOfMemory))?;
+                push(&mut add_pos, src_pos[v as usize])?;
+                src_remap[v as usize] = next;
+                next
+            };
+            mapped[k] = idx;
+        }
+        push(&mut add_tris, mapped)?;
+    }
+
+    if tx.mesh().uvs().is_some() {
+        tx.drop_channel(UV_CHANNEL)?;
+    }
+    if !drop_tris.is_empty() {
+        tx.remove_triangles(&drop_tris)?;
+    }
+    if !drop_verts.is_empty() {
+        tx.remove_vertices(&drop_verts)?;
+    }
+    if !add_pos.is_empty() {
+        let added_verts = tx.add_vertices(&add_pos)?;
+        for tri in &mut add_tris {
+            *tri = tri.map(|i| added_verts[i as usize]);
+        }
+        if !add_tris.is_empty() {
+            tx.add_triangles(&add_tris)?;
+        }
+    }
+    Ok(())
 }
 
 /// Rejects inputs no boolean can consume.
-fn check_input(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
+pub(super) fn check_input(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
     let options = crate::AnalyzeOptions {
         weld_tolerance: 0.0,
         self_intersection: Some(bvh),
@@ -282,8 +565,49 @@ fn check_input(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
     Ok(())
 }
 
+/// Copies a mesh slot-for-slot (positions, triangles, dead slots, and UVs) with fallible allocations.
+fn clone_mesh_fallible(src: &Mesh) -> Result<Mesh> {
+    let mut positions: Vec<f32> = Vec::new();
+    reserve(&mut positions, src.vertex_slots() * 3)?;
+    for p in src.positions() {
+        positions.extend_from_slice(p);
+    }
+    let mut indices: Vec<u32> = Vec::new();
+    reserve(&mut indices, src.triangle_slots() * 3)?;
+    for t in src.triangles() {
+        indices.extend_from_slice(t);
+    }
+    let mut out = Mesh::from_buffers(&positions, &indices)?;
+    if let Some(uvs) = src.uvs() {
+        out.add_uvs(uvs)?;
+    }
+    let mut dead_tris: Vec<TriangleId> = Vec::new();
+    for t in 0..src.triangle_slots() as TriangleId {
+        if src.triangle(t).is_none() {
+            push(&mut dead_tris, t)?;
+        }
+    }
+    let mut dead_verts: Vec<VertexId> = Vec::new();
+    for v in 0..src.vertex_slots() as VertexId {
+        if !src.is_vertex_alive(v) {
+            push(&mut dead_verts, v)?;
+        }
+    }
+    if !dead_tris.is_empty() || !dead_verts.is_empty() {
+        let mut tx = out.begin_edit();
+        if !dead_tris.is_empty() {
+            tx.remove_triangles(&dead_tris)?;
+        }
+        if !dead_verts.is_empty() {
+            tx.remove_vertices(&dead_verts)?;
+        }
+        let _ = tx.commit()?;
+    }
+    Ok(out)
+}
+
 /// Mesh B mapped into A's frame, slot for slot.
-fn map_tool(b: &Mesh, xf: &Rigid) -> Result<Mesh> {
+pub(super) fn map_tool(b: &Mesh, xf: &Rigid) -> Result<Mesh> {
     let mut positions: Vec<f32> = Vec::new();
     reserve(&mut positions, b.vertex_slots() * 3)?;
     for p in b.positions() {
@@ -325,6 +649,516 @@ fn map_tool(b: &Mesh, xf: &Rigid) -> Result<Mesh> {
         let _ = tx.commit()?;
     }
     Ok(mapped)
+}
+
+#[inline]
+fn sub3_f64(a: [f32; 3], b: [f32; 3]) -> [f64; 3] {
+    [
+        f64::from(a[0]) - f64::from(b[0]),
+        f64::from(a[1]) - f64::from(b[1]),
+        f64::from(a[2]) - f64::from(b[2]),
+    ]
+}
+
+#[inline]
+fn dot3_f64(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+#[inline]
+fn cross3_f64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn tri_geom(pos: &[[f32; 3]], tri: [VertexId; 3]) -> Option<([f64; 3], f64, f64)> {
+    let [pa, pb, pc] = tri.map(|v| pos[v as usize]);
+    let ab = sub3_f64(pb, pa);
+    let ac = sub3_f64(pc, pa);
+    let bc = sub3_f64(pc, pb);
+    let max_len2 = dot3_f64(ab, ab).max(dot3_f64(ac, ac)).max(dot3_f64(bc, bc));
+    let n = cross3_f64(ab, ac);
+    let n_len = dot3_f64(n, n).sqrt();
+    if n_len <= 0.0 || !n_len.is_finite() {
+        return None;
+    }
+    let area = 0.5 * n_len;
+    Some(([n[0] / n_len, n[1] / n_len, n[2] / n_len], area, max_len2))
+}
+
+fn sorted_triple(mut tri: [VertexId; 3]) -> [VertexId; 3] {
+    tri.sort_unstable();
+    tri
+}
+
+fn is_closed_manifold_vertex(
+    vert_tris: &[Vec<u32>],
+    tris: &[[VertexId; 3]],
+    t_alive: &[bool],
+    v: VertexId,
+    links: &mut Vec<(VertexId, VertexId)>,
+) -> bool {
+    links.clear();
+    for &t in &vert_tris[v as usize] {
+        if !t_alive[t as usize] {
+            continue;
+        }
+        let tri = tris[t as usize];
+        let Some(pos_v) = tri.iter().position(|&c| c == v) else {
+            return false;
+        };
+        let next = tri[(pos_v + 1) % 3];
+        let prev = tri[(pos_v + 2) % 3];
+        if next == prev || next == v || prev == v {
+            return false;
+        }
+        links.push((next, prev));
+    }
+    let fan_len = links.len();
+    if fan_len < 3 {
+        return false;
+    }
+    let start = links[0].0;
+    let mut cur = links[0].1;
+    let mut visited = 1usize;
+    while cur != start {
+        let mut found = None;
+        for &(a, b) in links.iter().skip(1) {
+            if a == cur {
+                if found.is_some() {
+                    return false;
+                }
+                found = Some(b);
+            }
+        }
+        let Some(nxt) = found else {
+            return false;
+        };
+        cur = nxt;
+        visited += 1;
+        if visited > fan_len {
+            return false;
+        }
+    }
+    visited == fan_len
+}
+
+fn fill_neighbors(
+    vert_tris: &[Vec<u32>],
+    tris: &[[VertexId; 3]],
+    t_alive: &[bool],
+    v: VertexId,
+    exclude: VertexId,
+    out: &mut Vec<VertexId>,
+) -> Result<()> {
+    out.clear();
+    for &t in &vert_tris[v as usize] {
+        if !t_alive[t as usize] {
+            continue;
+        }
+        for &c in &tris[t as usize] {
+            if c != v && c != exclude {
+                push(out, c)?;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(())
+}
+
+fn edge_incident_tris(
+    vert_tris: &[Vec<u32>],
+    tris: &[[VertexId; 3]],
+    t_alive: &[bool],
+    u: VertexId,
+    v: VertexId,
+) -> Option<[u32; 2]> {
+    let mut found = [u32::MAX; 2];
+    let mut count = 0usize;
+    for &t in &vert_tris[u as usize] {
+        if !t_alive[t as usize] {
+            continue;
+        }
+        if tris[t as usize].contains(&v) {
+            if count >= 2 {
+                return None;
+            }
+            found[count] = t;
+            count += 1;
+        }
+    }
+    (count == 2).then_some(found)
+}
+
+fn opp_vertex(tri: [VertexId; 3], u: VertexId, v: VertexId) -> Option<VertexId> {
+    tri.into_iter().find(|&c| c != u && c != v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_collapse_seam_edge(
+    pos: &mut [[f32; 3]],
+    pos_dirty: &mut [bool],
+    tris: &mut [[VertexId; 3]],
+    t_alive: &mut [bool],
+    t_dirty: &mut [bool],
+    v_removed: &mut [bool],
+    vert_tris: &mut [Vec<u32>],
+    is_seam_vert: &[bool],
+    u: VertexId,
+    v: VertexId,
+    links: &mut Vec<(VertexId, VertexId)>,
+    nb_u: &mut Vec<VertexId>,
+    nb_v: &mut Vec<VertexId>,
+    affected: &mut Vec<u32>,
+    keys: &mut Vec<[VertexId; 3]>,
+) -> Result<bool> {
+    let Some([t0, t1]) = edge_incident_tris(vert_tris, tris, t_alive, u, v) else {
+        return Ok(false);
+    };
+    let (Some(opp0), Some(opp1)) = (
+        opp_vertex(tris[t0 as usize], u, v),
+        opp_vertex(tris[t1 as usize], u, v),
+    ) else {
+        return Ok(false);
+    };
+    if opp0 == opp1 {
+        return Ok(false);
+    }
+
+    if !is_closed_manifold_vertex(vert_tris, tris, t_alive, u, links)
+        || !is_closed_manifold_vertex(vert_tris, tris, t_alive, v, links)
+    {
+        return Ok(false);
+    }
+
+    fill_neighbors(vert_tris, tris, t_alive, u, v, nb_u)?;
+    fill_neighbors(vert_tris, tris, t_alive, v, u, nb_v)?;
+    let mut common = 0usize;
+    for &w in nb_u.iter() {
+        if nb_v.binary_search(&w).is_ok() {
+            if w != opp0 && w != opp1 {
+                return Ok(false);
+            }
+            common += 1;
+        }
+    }
+    if common != 2 {
+        return Ok(false);
+    }
+
+    affected.clear();
+    for &t in vert_tris[u as usize].iter().chain(&vert_tris[v as usize]) {
+        if t_alive[t as usize] && t != t0 && t != t1 {
+            push(affected, t)?;
+        }
+    }
+    affected.sort_unstable();
+    affected.dedup();
+    if affected.is_empty() {
+        return Ok(false);
+    }
+
+    let seam_u = (u as usize) < is_seam_vert.len() && is_seam_vert[u as usize];
+    let seam_v = (v as usize) < is_seam_vert.len() && is_seam_vert[v as usize];
+    let (keep, drop) = if !seam_u && seam_v {
+        (u, v)
+    } else if !seam_v && seam_u {
+        (v, u)
+    } else if u < v {
+        (u, v)
+    } else {
+        (v, u)
+    };
+
+    keys.clear();
+    reserve(keys, affected.len())?;
+    for &t in affected.iter() {
+        let mut tri = tris[t as usize];
+        for c in &mut tri {
+            if *c == drop {
+                *c = keep;
+            }
+        }
+        if tri[0] == tri[1] || tri[1] == tri[2] || tri[2] == tri[0] {
+            return Ok(false);
+        }
+        keys.push(sorted_triple(tri));
+    }
+    keys.sort_unstable();
+    if keys.windows(2).any(|w| w[0] == w[1]) {
+        return Ok(false);
+    }
+
+    let p_keep = pos[keep as usize];
+    let p_drop = pos[drop as usize];
+    let mid = [
+        0.5 * (p_keep[0] + p_drop[0]),
+        0.5 * (p_keep[1] + p_drop[1]),
+        0.5 * (p_keep[2] + p_drop[2]),
+    ];
+    let candidates = [(p_keep, false), (mid, true), (p_drop, true)];
+    let mut chosen: Option<([f32; 3], bool)> = None;
+
+    for &(cand_p, changed_pos) in &candidates {
+        if !cand_p.iter().all(|c| c.is_finite()) {
+            continue;
+        }
+        let mut ok = true;
+        for &t in affected.iter() {
+            let tri_old = tris[t as usize];
+            if !changed_pos && !tri_old.contains(&drop) {
+                continue;
+            }
+            let Some((n_old, _, _)) = tri_geom(pos, tri_old) else {
+                ok = false;
+                break;
+            };
+            let mut tri_new = tri_old;
+            for c in &mut tri_new {
+                if *c == drop {
+                    *c = keep;
+                }
+            }
+            pos[keep as usize] = cand_p;
+            let after = tri_geom(pos, tri_new);
+            pos[keep as usize] = p_keep;
+            match after {
+                Some((n_new, area_new, len2_new))
+                    if dot3_f64(n_old, n_new) > 0.5 && area_new > AREA_EPSILON * len2_new => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            chosen = Some((cand_p, changed_pos));
+            break;
+        }
+    }
+
+    let Some((new_p, changed_pos)) = chosen else {
+        return Ok(false);
+    };
+
+    if changed_pos {
+        pos[keep as usize] = new_p;
+        pos_dirty[keep as usize] = true;
+    }
+    t_alive[t0 as usize] = false;
+    t_alive[t1 as usize] = false;
+    v_removed[drop as usize] = true;
+    for &dead_t in &[t0, t1] {
+        for vc in tris[dead_t as usize] {
+            if let Some(idx) = vert_tris[vc as usize].iter().position(|&x| x == dead_t) {
+                vert_tris[vc as usize].swap_remove(idx);
+            }
+        }
+    }
+    for &t in affected.iter() {
+        let tri = &mut tris[t as usize];
+        let mut replaced = false;
+        for c in tri.iter_mut() {
+            if *c == drop {
+                *c = keep;
+                replaced = true;
+            }
+        }
+        if replaced {
+            t_dirty[t as usize] = true;
+            if !vert_tris[keep as usize].contains(&t) {
+                push(&mut vert_tris[keep as usize], t)?;
+            }
+        }
+    }
+    vert_tris[drop as usize].clear();
+
+    Ok(true)
+}
+
+/// Collapses needle and short triangles along boolean seam edges when strictly
+/// manifold-preserving (closed degree-2 vertices, link condition, no fold or
+/// duplicate triangles).
+fn snap_seam_slivers(
+    tx: &mut Transaction,
+    is_seam_vert: &[bool],
+    coplanar_tolerance: f64,
+) -> Result<()> {
+    let mesh = tx.mesh();
+    let v_slots = mesh.vertex_slots();
+    let t_slots = mesh.triangle_slots();
+    if mesh.triangle_count() == 0 {
+        return Ok(());
+    }
+
+    let mut pos: Vec<[f32; 3]> = Vec::new();
+    reserve(&mut pos, v_slots)?;
+    pos.extend_from_slice(mesh.positions());
+    let mut pos_dirty = filled(v_slots, false)?;
+    let mut tris: Vec<[VertexId; 3]> = filled(t_slots, [0; 3])?;
+    let mut t_alive = filled(t_slots, false)?;
+    let mut t_dirty = filled(t_slots, false)?;
+    let mut v_removed = filled(v_slots, false)?;
+    let mut vert_tris: Vec<Vec<u32>> = filled(v_slots, Vec::new())?;
+
+    let mut bmin = [f64::INFINITY; 3];
+    let mut bmax = [f64::NEG_INFINITY; 3];
+    for t in 0..t_slots {
+        let Some(tri) = mesh.triangle(t as TriangleId) else {
+            continue;
+        };
+        tris[t] = tri;
+        t_alive[t] = true;
+        for v in tri {
+            push(&mut vert_tris[v as usize], t as u32)?;
+            let p = pos[v as usize];
+            for k in 0..3 {
+                let c = f64::from(p[k]);
+                bmin[k] = bmin[k].min(c);
+                bmax[k] = bmax[k].max(c);
+            }
+        }
+    }
+
+    let diag =
+        ((bmax[0] - bmin[0]).powi(2) + (bmax[1] - bmin[1]).powi(2) + (bmax[2] - bmin[2]).powi(2))
+            .sqrt();
+    if !diag.is_finite() || diag <= 0.0 {
+        return Ok(());
+    }
+
+    let short_edge_tol = (1e-6 * diag).max(coplanar_tolerance).min(5e-3 * diag);
+    let short_edge_tol2 = short_edge_tol * short_edge_tol;
+    let sliver_edge_cap = (5e-3 * diag).max(10.0 * short_edge_tol).min(2e-2 * diag);
+    let sliver_edge_cap2 = sliver_edge_cap * sliver_edge_cap;
+    const SLIVER_AREA_RATIO: f64 = 1e-4;
+
+    let mut candidates: Vec<(f64, VertexId, VertexId)> = Vec::new();
+    for t in 0..t_slots {
+        if !t_alive[t] {
+            continue;
+        }
+        let tri = tris[t];
+        let e_len2 = [0, 1, 2].map(|i| {
+            let d = sub3_f64(pos[tri[i] as usize], pos[tri[(i + 1) % 3] as usize]);
+            dot3_f64(d, d)
+        });
+        let max_len2 = e_len2[0].max(e_len2[1]).max(e_len2[2]);
+        let min_idx = if e_len2[1] < e_len2[0] && e_len2[1] <= e_len2[2] {
+            1
+        } else if e_len2[2] < e_len2[0] && e_len2[2] < e_len2[1] {
+            2
+        } else {
+            0
+        };
+        let is_sliver = match tri_geom(&pos, tri) {
+            Some((_, area, _)) => area <= SLIVER_AREA_RATIO * max_len2,
+            None => true,
+        };
+        for i in 0..3 {
+            let u = tri[i];
+            let v = tri[(i + 1) % 3];
+            let seam_u = (u as usize) < is_seam_vert.len() && is_seam_vert[u as usize];
+            let seam_v = (v as usize) < is_seam_vert.len() && is_seam_vert[v as usize];
+            if !seam_u && !seam_v {
+                continue;
+            }
+            let l2 = e_len2[i];
+            let want =
+                l2 <= short_edge_tol2 || (is_sliver && i == min_idx && l2 <= sliver_edge_cap2);
+            if want {
+                let (lo, hi) = if u < v { (u, v) } else { (v, u) };
+                push(&mut candidates, (l2, lo, hi))?;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    candidates.sort_unstable_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    let mut links: Vec<(VertexId, VertexId)> = Vec::new();
+    let mut nb_u: Vec<VertexId> = Vec::new();
+    let mut nb_v: Vec<VertexId> = Vec::new();
+    let mut affected: Vec<u32> = Vec::new();
+    let mut keys: Vec<[VertexId; 3]> = Vec::new();
+    let mut any_collapsed = false;
+
+    for &(_, lo, hi) in &candidates {
+        if v_removed[lo as usize] || v_removed[hi as usize] {
+            continue;
+        }
+        if try_collapse_seam_edge(
+            &mut pos,
+            &mut pos_dirty,
+            &mut tris,
+            &mut t_alive,
+            &mut t_dirty,
+            &mut v_removed,
+            &mut vert_tris,
+            is_seam_vert,
+            lo,
+            hi,
+            &mut links,
+            &mut nb_u,
+            &mut nb_v,
+            &mut affected,
+            &mut keys,
+        )? {
+            any_collapsed = true;
+        }
+    }
+
+    if !any_collapsed {
+        return Ok(());
+    }
+
+    let mut mod_v_ids: Vec<VertexId> = Vec::new();
+    let mut mod_v_pos: Vec<[f32; 3]> = Vec::new();
+    let mut rem_v_ids: Vec<VertexId> = Vec::new();
+    for v in 0..v_slots {
+        if v_removed[v] {
+            push(&mut rem_v_ids, v as VertexId)?;
+        } else if pos_dirty[v] {
+            push(&mut mod_v_ids, v as VertexId)?;
+            push(&mut mod_v_pos, pos[v])?;
+        }
+    }
+
+    let mut mod_t_ids: Vec<TriangleId> = Vec::new();
+    let mut mod_t_tris: Vec<[VertexId; 3]> = Vec::new();
+    let mut rem_t_ids: Vec<TriangleId> = Vec::new();
+    for t in 0..t_slots {
+        if !t_alive[t] && mesh.is_triangle_alive(t as TriangleId) {
+            push(&mut rem_t_ids, t as TriangleId)?;
+        } else if t_alive[t] && t_dirty[t] {
+            push(&mut mod_t_ids, t as TriangleId)?;
+            push(&mut mod_t_tris, tris[t])?;
+        }
+    }
+
+    if !mod_v_ids.is_empty() {
+        tx.set_positions(&mod_v_ids, &mod_v_pos)?;
+    }
+    if !mod_t_ids.is_empty() {
+        tx.set_triangles(&mod_t_ids, &mod_t_tris)?;
+    }
+    if !rem_t_ids.is_empty() {
+        tx.remove_triangles(&rem_t_ids)?;
+    }
+    if !rem_v_ids.is_empty() {
+        tx.remove_vertices(&rem_v_ids)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -845,10 +1679,74 @@ mod tests {
     }
 
     #[test]
+    fn boolean_options_and_batch_oom_sweep_are_atomic() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::fail_allocations_after(None);
+            }
+        }
+        let _reset = Reset;
+
+        let a = cube();
+        let b = box_mesh([0.5, 0.0, 0.0], [1.5, 1.0, 1.0]);
+        let c = box_mesh([0.0, 0.5, 0.0], [1.0, 1.5, 1.0]);
+
+        for method in [
+            BooleanMethod::Manifold,
+            BooleanMethod::BvhSdf,
+            BooleanMethod::FhEdt,
+        ] {
+            let opts = BooleanOptions {
+                op: BooleanOp::Union,
+                method,
+                voxel_pitch: Some(0.25),
+                ..BooleanOptions::default()
+            };
+            let steps = crate::test_util::sweep(clone_mesh_fallible(&a).unwrap(), |tx| {
+                apply_boolean_with_options(tx, &b, Rigid::IDENTITY, &opts).map(|_| ())
+            });
+            assert!(steps > 0, "{method:?} should test at least one allocation");
+        }
+
+        let tree = CsgNode::reduce_all(BooleanOp::Union, 3).unwrap();
+        let batch_opts = BooleanOptions {
+            op: BooleanOp::Union,
+            method: BooleanMethod::FhEdt,
+            voxel_pitch: Some(0.25),
+            ..BooleanOptions::default()
+        };
+        for after in 0..60 {
+            crate::fail_allocations_after(Some(after));
+            let res = boolean_batch(
+                &[
+                    (&a, Rigid::IDENTITY),
+                    (&b, Rigid::IDENTITY),
+                    (&c, Rigid::IDENTITY),
+                ],
+                &tree,
+                &batch_opts,
+            );
+            crate::fail_allocations_after(None);
+            match res {
+                Ok(out) => {
+                    assert!(out.triangle_count() > 0);
+                    break;
+                }
+                Err(OpsError::Store(StoreError::OutOfMemory)) => {}
+                Err(other) => panic!("batch after={after}: unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn production_boolean_uses_no_untracked_allocs_or_hash_collections() {
         for (name, src) in [
             ("boolean.rs", include_str!("boolean.rs")),
             ("classify.rs", include_str!("boolean/classify.rs")),
+            ("perturbation.rs", include_str!("boolean/perturbation.rs")),
+            ("voxel.rs", include_str!("boolean/voxel.rs")),
+            ("batch.rs", include_str!("boolean/batch.rs")),
         ] {
             let prod = src.split("#[cfg(test)]").next().unwrap();
             for forbidden in [

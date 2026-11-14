@@ -17,8 +17,9 @@ use fast_mesh_query::Rigid;
 use fast_mesh_store::{Mesh, StoreError, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::baked::baked_mesh;
-use crate::placement::relative_affine;
-use crate::{MeshId, Result, Scene};
+use crate::ops::boolean::{BooleanMethod, BooleanOptions, CsgNode};
+use crate::placement::{is_relative_rigid, relative_affine, relative_rigid};
+use crate::{MeshId, MeshOptions, Placement, Result, Scene};
 
 /// Which boolean to compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +221,165 @@ impl Scene {
             }
         }
     }
+
+    /// Computes a world-space CSG boolean between `a` and `b` using [`BooleanOptions`],
+    /// replacing `a` in a single atomic undo step.
+    ///
+    /// Supports both [`BooleanMethod::Manifold`] (with optional seam sliver snapping and
+    /// `max_triangles` simplification) and volumetric fallbacks (`BvhSdf`, `FhEdt`).
+    pub fn boolean_with_options(
+        &mut self,
+        a: MeshId,
+        b: MeshId,
+        options: &BooleanOptions,
+    ) -> Result<BooleanReport> {
+        self.entry(a)?;
+        self.entry(b)?;
+        let scene_op = match options.op {
+            crate::ops::BooleanOp::Union => BooleanOp::Union,
+            crate::ops::BooleanOp::Subtract => BooleanOp::Subtract,
+            crate::ops::BooleanOp::Intersect => BooleanOp::Intersect,
+        };
+        if a == b {
+            if matches!(options.op, crate::ops::BooleanOp::Subtract) {
+                return self.boolean_self(a, BooleanOp::Subtract);
+            }
+            if options.method == BooleanMethod::Manifold && options.max_triangles.is_none() {
+                return self.boolean_self(a, scene_op);
+            }
+        }
+
+        self.prepare(Some(&[a, b]))?;
+        let (a_seams, b_seams) = (
+            has_open_uvs(&self.entry(a)?.mesh)?,
+            has_open_uvs(&self.entry(b)?.mesh)?,
+        );
+
+        let (tool_mesh, xf): (Mesh, Rigid) = {
+            let (ea, eb) = (self.entry(a)?, self.entry(b)?);
+            if is_relative_rigid(&ea.placement, &eb.placement) {
+                let xf = relative_rigid(
+                    &ea.placement,
+                    ea.mesh.origin(),
+                    &eb.placement,
+                    eb.mesh.origin(),
+                );
+                let (baked, _) = baked_mesh(&eb.mesh, |l| l.map(f64::from), eb.bvh.options())?;
+                let mb = if b_seams {
+                    welded(baked, eb.bvh.options())?.0
+                } else {
+                    baked
+                };
+                (mb, xf)
+            } else {
+                let affine = relative_affine(
+                    &ea.placement,
+                    ea.mesh.origin(),
+                    &eb.placement,
+                    eb.mesh.origin(),
+                );
+                let (baked, _) = baked_mesh(
+                    &eb.mesh,
+                    |l| affine.apply(l.map(f64::from)),
+                    eb.bvh.options(),
+                )?;
+                let baked = if b_seams {
+                    welded(baked, eb.bvh.options())?.0
+                } else {
+                    baked
+                };
+                (baked, Rigid::IDENTITY)
+            }
+        };
+
+        let report = self.edit(a, |tx| {
+            if a_seams {
+                tx.drop_channel(UV_CHANNEL)?;
+                crate::ops::weld(tx, 0.0)?;
+            }
+            let mut r =
+                crate::ops::boolean::apply_boolean_with_options(tx, &tool_mesh, xf, options)?;
+            r.uvs_dropped |= a_seams;
+            Ok::<_, crate::ops::OpsError>(r)
+        })?;
+
+        Ok(BooleanReport {
+            kept_triangles: report.kept_triangles,
+            triangles_added: report.triangles_added,
+            uvs_dropped: report.uvs_dropped,
+        })
+    }
+
+    /// Evaluates an N-ary CSG tree over `meshes` in world coordinates and inserts
+    /// the combined mesh into the scene at [`Placement::IDENTITY`], returning its [`MeshId`].
+    ///
+    /// Source meshes remain untouched in the scene.
+    pub fn boolean_batch(
+        &mut self,
+        meshes: &[MeshId],
+        tree: &CsgNode,
+        options: &BooleanOptions,
+    ) -> Result<MeshId> {
+        for &id in meshes {
+            self.entry(id)?;
+        }
+        self.prepare(Some(meshes))?;
+
+        let mut prepared: Vec<(Option<Mesh>, Rigid)> = Vec::new();
+        prepared
+            .try_reserve_exact(meshes.len())
+            .map_err(|_| StoreError::OutOfMemory)?;
+
+        for &id in meshes {
+            let entry = self.entry(id)?;
+            let has_seams = has_open_uvs(&entry.mesh)?;
+            if !entry.placement.is_scaled() && !has_seams {
+                let xf = relative_rigid(
+                    &Placement::IDENTITY,
+                    [0.0; 3],
+                    &entry.placement,
+                    entry.mesh.origin(),
+                );
+                prepared.push((None, xf));
+            } else {
+                let affine = relative_affine(
+                    &Placement::IDENTITY,
+                    [0.0; 3],
+                    &entry.placement,
+                    entry.mesh.origin(),
+                );
+                let (baked, _) = baked_mesh(
+                    &entry.mesh,
+                    |l| affine.apply(l.map(f64::from)),
+                    entry.bvh.options(),
+                )?;
+                let baked = if has_seams {
+                    welded(baked, entry.bvh.options())?.0
+                } else {
+                    baked
+                };
+                prepared.push((Some(baked), Rigid::IDENTITY));
+            }
+        }
+
+        let mut pairs: Vec<(&Mesh, Rigid)> = Vec::new();
+        pairs
+            .try_reserve_exact(meshes.len())
+            .map_err(|_| StoreError::OutOfMemory)?;
+        for (i, &id) in meshes.iter().enumerate() {
+            let (ref baked_opt, xf) = prepared[i];
+            let mesh_ref = match baked_opt {
+                Some(m) => m,
+                None => &self.entry(id)?.mesh,
+            };
+            pairs.push((mesh_ref, xf));
+        }
+
+        let combined = crate::ops::boolean::boolean_batch(&pairs, tree, options)?;
+        drop(pairs);
+        drop(prepared);
+        self.add_mesh(combined, MeshOptions::default())
+    }
 }
 
 #[cfg(test)]
@@ -401,5 +561,97 @@ mod tests {
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), 0);
         assert!(scene.undo().unwrap());
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), before);
+    }
+
+    #[test]
+    fn boolean_with_options_supports_volumetric_and_manifold_modes_with_undo() {
+        use crate::ops::boolean::{BooleanMethod, BooleanOp, BooleanOptions};
+
+        let mut scene = Scene::new(SceneOptions::default());
+        let mut mesh_a = cube();
+        mesh_a.add_uvs(&[0.0; 16]).unwrap();
+        let a = scene.add_mesh(mesh_a, MeshOptions::default()).unwrap();
+        let b = placed_cube(
+            &mut scene,
+            Placement {
+                translation: [0.5, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+        );
+        scene.take_changes();
+
+        let before = scene.mesh(a).unwrap().triangle_count();
+        let opts = BooleanOptions {
+            op: BooleanOp::Union,
+            method: BooleanMethod::BvhSdf,
+            voxel_pitch: Some(0.1),
+            ..BooleanOptions::default()
+        };
+        let report = scene.boolean_with_options(a, b, &opts).unwrap();
+        assert!(report.uvs_dropped);
+        assert!(report.kept_triangles > 0);
+        assert!(
+            crate::ops::boundary_loops(scene.mesh(a).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!((world_volume6(&scene, a) - 9.0).abs() < 0.75);
+
+        assert!(scene.undo().unwrap());
+        assert_eq!(scene.mesh(a).unwrap().triangle_count(), before);
+        assert!(scene.mesh(a).unwrap().uvs().is_some());
+    }
+
+    #[test]
+    fn scene_boolean_batch_reduces_multiple_placed_meshes() {
+        use crate::ops::boolean::{BooleanMethod, BooleanOp, BooleanOptions, CsgNode};
+
+        let mut scene = Scene::new(SceneOptions::default());
+        let id0 = placed_cube(&mut scene, Placement::IDENTITY);
+        let id1 = placed_cube(
+            &mut scene,
+            Placement {
+                translation: [0.5, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+        );
+        let id2 = placed_cube(
+            &mut scene,
+            Placement {
+                translation: [1.0, 0.0, 0.0],
+                ..Placement::IDENTITY
+            },
+        );
+        let tree = CsgNode::reduce_all(BooleanOp::Union, 3).unwrap();
+
+        for method in [
+            BooleanMethod::Manifold,
+            BooleanMethod::BvhSdf,
+            BooleanMethod::FhEdt,
+        ] {
+            let opts = BooleanOptions {
+                op: BooleanOp::Union,
+                method,
+                voxel_pitch: Some(0.1),
+                ..BooleanOptions::default()
+            };
+            let out_id = scene.boolean_batch(&[id0, id1, id2], &tree, &opts).unwrap();
+            let mesh = scene.mesh(out_id).unwrap();
+            assert!(
+                crate::ops::boundary_loops(mesh).unwrap().is_empty(),
+                "{method:?}"
+            );
+            let tol = if method == BooleanMethod::Manifold {
+                1e-3
+            } else {
+                0.75
+            };
+            assert!(
+                (world_volume6(&scene, out_id) - 12.0).abs() < tol,
+                "{method:?}: vol6={}",
+                world_volume6(&scene, out_id)
+            );
+            assert_eq!(scene.mesh(id0).unwrap().triangle_count(), 12);
+        }
     }
 }
