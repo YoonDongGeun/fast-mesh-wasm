@@ -17,6 +17,10 @@ use fast_mesh_store::{Incidence, Mesh, Transaction, TriangleId, VertexId};
 use crate::topology::proper_triangle;
 use crate::{OpsError, Result, push};
 
+pub use crate::stretch::{
+    DEFAULT_MAX_SPLITS, DEFAULT_SHARP_ANGLE, DEFAULT_STRETCH_LIMIT, REST_SIZE_CHANNEL,
+    StretchOptions, StretchReport, capture_rest_sizes, ensure_rest_sizes, split_stretched,
+};
 pub use crease::{CreaseOptions, CreaseOptionsBuilder, CreaseReport, crease, crease_region};
 pub use filter::{SurfaceFilter, Symmetry};
 pub use grab::{

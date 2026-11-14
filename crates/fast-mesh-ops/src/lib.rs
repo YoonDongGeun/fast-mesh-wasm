@@ -1,4 +1,25 @@
-//! Repair operations on meshes stored in [`fast_mesh_store`].
+//! Mesh geometry operations organized across seven cohesive domains on [`fast_mesh_store`]:
+//!
+//! - [`repair`]: defect analysis, welding, degenerate/small-component cleanup,
+//!   consistent winding (`orient`), hole filling, loop bridging, manifoldization,
+//!   sliver cleanup, self-intersection resolution, presets, and `auto_repair`.
+//! - [`sculpt`]: brush sculpting (`inflate`, `smooth`, `grab`, `flatten`, `clay`,
+//!   `crease`, `twist`), stroke state, falloff/symmetry/filters, and adaptive
+//!   stretch splitting (`split_stretched`).
+//! - [`remesh`]: isotropic region remeshing, quadric simplification (`simplify`),
+//!   Loop subdivision (`subdivide`), and Manifold Marching Cubes (`marching_cubes`).
+//! - [`boolean`]: exact 3D CSG booleans (`boolean_plan`, `apply_boolean`),
+//!   plane cutting (`cut_by_plane`), surface offsetting (`offset`), and shell
+//!   solidification (`shell`).
+//! - [`deform`]: brush deformation algorithms paired with per-vertex protection
+//!   (`with_protection`, `with_protection_band`, `check_protection`).
+//! - [`inspect`]: read-only mesh defect analysis (`analyze`), surface area and
+//!   enclosed volume measurement (`measure`, `measure_placed`), and boundary loop
+//!   topology extraction (`boundary_loops`).
+//! - [`align`]: rigid point-to-plane ICP registration (`icp`) and deterministic
+//!   surface sampling (`sample_surface`).
+//!
+//! Legacy top-level re-exports remain available for backwards compatibility.
 //!
 //! Operations read the mesh through a transaction's `tx.mesh()`, build the
 //! maps they need from its triangles, compute and validate their whole plan,
@@ -61,6 +82,7 @@
 //!   it undoably, never leaving stale values; the per-operation table is in
 //!   [`docs/uv-channel.md`](https://github.com/YoonDongGeun/fast-mesh-wasm/blob/main/docs/uv-channel.md).
 
+pub mod align;
 mod analyze;
 pub mod append;
 mod auto_repair;
@@ -74,6 +96,7 @@ mod fair;
 mod fill;
 mod fill_dp;
 pub mod icp;
+pub mod inspect;
 pub mod marching_cubes;
 mod measure;
 mod offset;

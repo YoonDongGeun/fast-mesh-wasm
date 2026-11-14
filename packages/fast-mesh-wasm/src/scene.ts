@@ -6,6 +6,26 @@ import { checkRegisterOptions } from "./register.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
+import {
+  createAlignDomain,
+  createBooleanDomain,
+  createDeformDomain,
+  createInspectDomain,
+  createRemeshDomain,
+  createRepairDomain,
+  createSculptDomain,
+  type DeformBackend,
+  type RemeshBackend,
+  type RepairBackend,
+  type SculptBackend,
+  type SyncAlignDomain,
+  type SyncBooleanDomain,
+  type SyncDeformDomain,
+  type SyncInspectDomain,
+  type SyncRemeshDomain,
+  type SyncRepairDomain,
+  type SyncSculptDomain,
+} from "./domains/index.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
 import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
@@ -2556,6 +2576,83 @@ export class Scene implements SceneLike {
   #stepDepth = 0;
   #drag: ActiveDrag | undefined;
 
+  /**
+   * Callable repair domain (`scene.repair(mesh, op)` and `scene.repair.<method>(...)`).
+   */
+  readonly repair: SyncRepairDomain = createRepairDomain({
+    repair: ((mesh: MeshHandle, op: RepairOp | readonly RepairOp[] | AutoRepairRequest) =>
+      this.#runRepair(mesh, op)) as RepairBackend<false>["repair"],
+    analyze: (mesh, options) => this.analyze(mesh, options),
+    join: (target, source, options) => this.join(target, source, options),
+  });
+
+  /**
+   * Callable sculpt domain (`scene.sculpt(mesh, op)` and `scene.sculpt.<method>(...)`).
+   */
+  readonly sculpt: SyncSculptDomain = createSculptDomain({
+    sculpt: ((mesh: MeshHandle, op: SculptOp | readonly SculptOp[]) =>
+      this.#runRepair(mesh, op as RepairOp)) as SculptBackend<false>["sculpt"],
+    verticesInSphere: (mesh, center, radius) => this.verticesInSphere(mesh, center, radius),
+    beginStep: () => this.beginStep(),
+    endStep: () => this.endStep(),
+    cancelStep: () => this.cancelStep(),
+  });
+
+  /** Remesh, simplification, subdivision, and volumetric reconstruction domain. */
+  readonly remesh: SyncRemeshDomain = createRemeshDomain({
+    repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<false>["repair"],
+  });
+
+  /** Callable boolean, cutting, offsetting, and shell domain. */
+  readonly boolean: SyncBooleanDomain = createBooleanDomain({
+    isAsync: false,
+    repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<false>["repair"],
+    boolean: (target, source, op) => this.#runBoolean(target, source, op),
+    cutByPlane: (mesh, plane, options) => this.cutByPlane(mesh, plane, options),
+  });
+
+  /** Surface deformation and vertex-protection domain. */
+  readonly deform: SyncDeformDomain = createDeformDomain({
+    sculpt: ((mesh: MeshHandle, op: SculptOp) =>
+      this.#runRepair(mesh, op as RepairOp)) as DeformBackend<false>["sculpt"],
+  });
+
+  /** Defect analysis, metrology, queries, fields, and section inspection domain. */
+  readonly inspect: SyncInspectDomain = createInspectDomain({
+    analyze: (mesh, options) => this.analyze(mesh, options),
+    measure: (mesh) => this.measure(mesh),
+    bounds: (mesh) => this.bounds(mesh),
+    raycast: (origin, direction, options) => this.raycast(origin, direction, options),
+    closestPoint: (point, options) => this.closestPoint(point, options),
+    meshDistance: (a, b, options) => this.meshDistance(a, b, options),
+    intersects: (a, b) => this.intersects(a, b),
+    findContacts: (options) => this.findContacts(options),
+    addDistanceField: (desc) => this.addDistanceField(desc),
+    addThicknessField: (desc) => this.addThicknessField(desc),
+    addCurvatureField: (desc) => this.addCurvatureField(desc),
+    removeField: (field) => this.removeField(field),
+    fieldValues: (field) => this.fieldValues(field),
+    fieldNearest: (field) => this.fieldNearest(field),
+    fieldStatus: (field) => this.fieldStatus(field),
+    fieldTargetStatus: (field) => this.fieldTargetStatus(field),
+    setColoring: (mesh, rule) => this.setColoring(mesh, rule),
+    coloring: (mesh) => this.coloring(mesh),
+    addSection: (desc) => this.addSection(desc),
+    setSectionPlane: (section, plane) => this.setSectionPlane(section, plane),
+    sectionPlane: (section) => this.sectionPlane(section),
+    setSectionMeshes: (section, meshes) => this.setSectionMeshes(section, meshes),
+    setSectionFill: (section, fill) => this.setSectionFill(section, fill),
+    removeSection: (section) => this.removeSection(section),
+    section: (section, mesh) => this.section(section, mesh),
+    sectionGap: (section, a, b) => this.sectionGap(section, a, b),
+    updateSections: () => this.updateSections(),
+  });
+
+  /** Rigid registration and alignment domain. */
+  readonly align: SyncAlignDomain = createAlignDomain({
+    register: (moving, fixed, options) => this.register(moving, fixed, options),
+  });
+
   constructor(options: SceneOptions = {}) {
     ensureInitialized("new Scene()");
     this.#raw = call(() => new RawScene());
@@ -2729,6 +2826,7 @@ export class Scene implements SceneLike {
    * one step; the removal is permanent. A drag of the source ends first,
    * recording its moves as one step, so they survive a failed join.
    *
+   * @deprecated Use `scene.repair.join()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
    * mesh twice or loops that cannot bridge; `STALE_LOOPS` for a loop that is
    * not there. A failed join changes nothing.
@@ -2767,6 +2865,7 @@ export class Scene implements SceneLike {
    * The cut undoes in one step; the added mesh stays, like the removed
    * source of {@link Scene.join}.
    *
+   * @deprecated Use `scene.boolean.cut()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
    * the plane does not cut the mesh or a rim cannot be capped, as listed in
    * `docs/uv-channel.md`, for example a rim that closes by position with its
@@ -2798,7 +2897,7 @@ export class Scene implements SceneLike {
    * input that is not closed, manifold and consistently wound. A failed
    * boolean changes nothing.
    */
-  boolean(target: MeshHandle, source: MeshHandle, op: BooleanOp): MeshHandle {
+  #runBoolean(target: MeshHandle, source: MeshHandle, op: BooleanOp): MeshHandle {
     const ta = this.#id(target);
     const sb = this.#id(source);
     const code = codeIn({ union: 0, subtract: 1, intersect: 2 }, op, "op");
@@ -2836,6 +2935,7 @@ export class Scene implements SceneLike {
    * followed exactly on a copy baked through it, so each such call costs a BVH
    * build. All distances are in world units.
    *
+   * @deprecated Use `scene.align.register()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
    * mesh twice, a mesh without triangles or an invalid option; `STALE_BVH` for
    * a stale Manual `fixed`. Bad options and one mesh twice change nothing,
@@ -3376,6 +3476,7 @@ export class Scene implements SceneLike {
    * triangles, non-manifold edges and vertices, components, orientation
    * conflicts and, on request, self-intersection.
    *
+   * @deprecated Use `scene.inspect.analyze()` or `scene.repair.analyze()` instead.
    * @throws `INVALID_ARGUMENT` for a negative or non-finite `weldTolerance`; `STALE_BVH`, see {@link AnalyzeOptions.selfIntersection}.
    */
   analyze(mesh: MeshHandle, options: AnalyzeOptions = {}): Analysis {
@@ -3396,6 +3497,8 @@ export class Scene implements SceneLike {
    * non-manifold mesh still gets its area; only `volume` is `null`, with
    * `volumeReason` saying why. A read-only call: it leaves every view
    * valid.
+   *
+   * @deprecated Use `scene.inspect.measure()` instead.
    */
   measure(mesh: MeshHandle): MeasureResult {
     const { index, generation } = this.#id(mesh);
@@ -3418,20 +3521,8 @@ export class Scene implements SceneLike {
    * and when any operation fails nothing changes and nothing is recorded.
    * `{ kind: "auto" }` runs the standard cleanup pipeline the same way and
    * returns a report per stage; see {@link AutoRepairRequest}.
-   *
-   * A single `inflate`, `relax` or `grab` costs by the vertices under the brush, not the
-   * mesh (it uses the BVH, and reaches only vertices a triangle uses); in a list
-   * they scan the mesh, so a sculpt stroke should send its dabs one at a time.
-   *
-   * @throws `INVALID_ARGUMENT` for invalid options (`fillHoles` needs a bound or `loops`); `STALE_LOOPS` when a loop id of `fillHoles` no longer matches a loop of the mesh.
    */
-  repair(mesh: MeshHandle, request: AutoRepairRequest): AutoRepairReport;
-  repair<const O extends RepairOp>(mesh: MeshHandle, op: O): RepairReportOf<O>;
-  repair<const O extends readonly RepairOp[]>(
-    mesh: MeshHandle,
-    ops: O,
-  ): { -readonly [K in keyof O]: RepairReportOf<O[K]> };
-  repair(
+  #runRepair(
     mesh: MeshHandle,
     op: RepairOp | readonly RepairOp[] | AutoRepairRequest,
   ): RepairReport | RepairReport[] | AutoRepairReport {
@@ -3479,24 +3570,11 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * Sculpt domain entry point: runs one {@link SculptOp} and returns its
-   * report, or a list of sculpt operations in one transaction and returns
-   * their reports. Delegates to {@link Scene.repair} on the same wire path.
-   */
-  sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): SculptReportOf<O>;
-  sculpt<const O extends readonly SculptOp[]>(
-    mesh: MeshHandle,
-    ops: O,
-  ): { -readonly [K in keyof O]: SculptReportOf<O[K]> };
-  sculpt(mesh: MeshHandle, op: SculptOp | readonly SculptOp[]): SculptReport | SculptReport[] {
-    return this.repair(mesh, op as RepairOp) as SculptReport | SculptReport[];
-  }
-
-  /**
    * Live triangle-used vertex ids of `mesh` inside the closed local-space
    * sphere `(center, radius)`, in ascending order. Brings a `"lazy"` BVH up
    * to date first; throws `STALE_BVH` on a stale `"manual"` mesh.
    *
+   * @deprecated Use `scene.sculpt.verticesInSphere()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
    * `center` is not 3 finite numbers or `radius` is negative or non-finite;
    * `STALE_BVH` for a stale `"manual"` mesh.
@@ -3520,6 +3598,7 @@ export class Scene implements SceneLike {
    * need not be unit length; `distance` is in world units. Lazy meshes are
    * brought up to date first.
    *
+   * @deprecated Use `scene.inspect.raycast()` instead.
    * @throws `INVALID_ARGUMENT` for a non-finite origin or a zero direction; `STALE_BVH` for a stale `"manual"` mesh.
    */
   raycast(origin: Readonly<Vec3>, direction: Readonly<Vec3>, options: RaycastOptions = {}): RayHit | null {
@@ -3545,6 +3624,8 @@ export class Scene implements SceneLike {
   /**
    * The surface point nearest to a world point, over every mesh or one, or
    * `null` when none is within `maxDistance`.
+   *
+   * @deprecated Use `scene.inspect.closestPoint()` instead.
    */
   closestPoint(point: Readonly<Vec3>, options: ClosestPointOptions = {}): ClosestHit | null {
     const s = this.#scene();
@@ -3572,6 +3653,8 @@ export class Scene implements SceneLike {
    * The distance between two meshes' surfaces as placed, with a closest pair
    * of points, or `null` when it exceeds `maxDistance` (default `Infinity`)
    * or a mesh has no triangle.
+   *
+   * @deprecated Use `scene.inspect.meshDistance()` instead.
    */
   meshDistance(a: MeshHandle, b: MeshHandle, options: { maxDistance?: number } = {}): MeshDistance | null {
     const ia = this.#id(a);
@@ -3586,14 +3669,22 @@ export class Scene implements SceneLike {
     return { distance: d[0], a: vec3At(d, 1), b: vec3At(d, 4), triangleA: d[7], triangleB: d[8] };
   }
 
-  /** Whether two meshes intersect or touch as placed. */
+  /**
+   * Whether two meshes intersect or touch as placed.
+   *
+   * @deprecated Use `scene.inspect.intersects()` instead.
+   */
   intersects(a: MeshHandle, b: MeshHandle): boolean {
     const ia = this.#id(a);
     const ib = this.#id(b);
     return call(() => this.#scene().intersects(ia.index, ia.generation, ib.index, ib.generation));
   }
 
-  /** Every mesh pair (or every pair of `pairs`) within `margin`, sorted by mesh id. */
+  /**
+   * Every mesh pair (or every pair of `pairs`) within `margin`, sorted by mesh id.
+   *
+   * @deprecated Use `scene.inspect.findContacts()` instead.
+   */
   findContacts(options: FindContactsOptions = {}): Contact[] {
     const s = this.#scene();
     const pairs = options.pairs === undefined ? undefined : this.#flatIds(options.pairs.flat());
@@ -3781,6 +3872,7 @@ export class Scene implements SceneLike {
    * edits and placements by the mesh modes, like normals. Removing a mesh of
    * `to` removes it from the field, or the field with its last target.
    *
+   * @deprecated Use `scene.inspect.addDistanceField()` instead.
    * @throws `INVALID_ARGUMENT` when `to` is empty, holds `on` or a mesh twice, `maxDistance` is negative or NaN, or the name is taken.
    */
   addDistanceField(desc: DistanceFieldDesc): FieldHandle {
@@ -3794,6 +3886,7 @@ export class Scene implements SceneLike {
    * `maxDistance` read `Infinity`. It follows edits and placements by the
    * mesh modes, like normals, and colours like any field.
    *
+   * @deprecated Use `scene.inspect.addThicknessField()` instead.
    * @throws `INVALID_ARGUMENT` when `maxDistance` is negative or NaN, or the name is taken.
    */
   addThicknessField(desc: ThicknessFieldDesc): FieldHandle {
@@ -3812,6 +3905,7 @@ export class Scene implements SceneLike {
    * negative in bowls, zero on flats). It follows edits and placements by
    * the mesh modes, like normals, and colours like any field.
    *
+   * @deprecated Use `scene.inspect.addCurvatureField()` instead.
    * @throws `INVALID_ARGUMENT` when the name is taken.
    */
   addCurvatureField(desc: CurvatureFieldDesc): FieldHandle {

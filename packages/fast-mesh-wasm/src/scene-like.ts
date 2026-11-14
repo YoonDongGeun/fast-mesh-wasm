@@ -5,6 +5,22 @@
 // instances of the same nominal classes (`new MeshHandle()`,
 // `new SectionHandle()`) and keeps its own map from them to its ids.
 import type { Bounds, Placement } from "./api.js";
+import type {
+  SyncAlignDomain,
+  SyncBooleanDomain,
+  SyncDeformDomain,
+  SyncInspectDomain,
+  SyncRemeshDomain,
+  SyncRepairDomain,
+  SyncSculptDomain,
+  WorkerAlignDomain,
+  WorkerBooleanDomain,
+  WorkerDeformDomain,
+  WorkerInspectDomain,
+  WorkerRemeshDomain,
+  WorkerRepairDomain,
+  WorkerSculptDomain,
+} from "./domains/index.js";
 import type { MeshViews } from "./views.js";
 import type {
   ColorRule,
@@ -16,11 +32,23 @@ import type {
   SectionResult,
 } from "./scene.js";
 
+/** Domain-separated capability surface exposed by both `Scene` and `WorkerScene`. */
+export interface SceneDomainsLike {
+  readonly repair?: SyncRepairDomain | WorkerRepairDomain;
+  readonly sculpt?: SyncSculptDomain | WorkerSculptDomain;
+  readonly remesh?: SyncRemeshDomain | WorkerRemeshDomain;
+  readonly boolean?: SyncBooleanDomain | WorkerBooleanDomain;
+  readonly deform?: SyncDeformDomain | WorkerDeformDomain;
+  readonly inspect?: SyncInspectDomain | WorkerInspectDomain;
+  readonly align?: SyncAlignDomain | WorkerAlignDomain;
+}
+
 /**
  * What the adapters need from a scene: render buffers, placements, section
  * results, change notification and drags. All methods are synchronous.
+ * `Scene` and `WorkerScene` also attach the seven optional domain namespaces.
  */
-export interface SceneLike {
+export interface SceneLike extends SceneDomainsLike {
   /**
    * Views of the mesh's render buffers. Slot counts follow from them, so
    * `positions()` must be exactly 3 × vertex slots long and `indices()`

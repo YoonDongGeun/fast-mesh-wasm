@@ -1,9 +1,11 @@
-//! Brush deformation compatibility re-exports delegating to [`crate::sculpt`].
+//! Brush deformation & protection domain, re-exporting [`crate::sculpt`] and
+//! [`crate::protect`].
 //!
 //! All brush algorithms, extra brushes, stroke channels, [`SurfaceFilter`],
-//! and [`Symmetry`] live in [`crate::sculpt`] and are re-exported here so
-//! existing `fast_mesh_ops::deform::*` imports compile unchanged.
+//! [`Symmetry`], and vertex protection wrappers live here so both
+//! `fast_mesh_ops::deform::*` and protected deformation imports work uniformly.
 
+pub use crate::protect::{check_protection, with_protection, with_protection_band};
 pub use crate::sculpt::*;
 
 #[cfg(test)]
