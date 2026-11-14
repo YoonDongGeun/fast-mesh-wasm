@@ -581,6 +581,24 @@ input[type="range"] {
   display: flex;
   gap: 4px;
 }
+.camera-bar {
+  position: absolute;
+  bottom: 30px;
+  right: 10px;
+  max-width: calc(100% - 20px);
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.camera-bar .group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--overlay);
+  pointer-events: auto;
+}
 .toolbox {
   position: absolute;
   top: 64px;
@@ -942,6 +960,11 @@ input[type="range"] {
   .toolbox {
     display: none;
   }
+  /* Coarse touch viewports use direct orbit/pinch + Reset view, keeping
+     .viewport corners clear for .volume-overlay and bottom-edge touch gestures. */
+  .camera-bar {
+    display: none;
+  }
   .hover-tip {
     max-width: 228px;
     white-space: normal;
@@ -1098,3 +1121,60 @@ input[type="range"] {
   opacity: 0.65;
 }
 
+
+/* #195 Workbench expansion */
+.mesh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.mesh-actions select {
+  width: auto;
+  min-width: 56px;
+}
+
+.transform-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.modeling-panel h3,
+.surface-field-panel h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.align-panel .align-report dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.surface-field-panel .legend {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.surface-field-panel .legend-bar {
+  height: 10px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+.surface-field-panel .legend-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}

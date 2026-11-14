@@ -13,7 +13,15 @@ export type WorkbenchDomainId =
   | "inspect"
   | "align";
 
-export type WorkbenchPanelKey = "repair" | "collision" | "inspect" | "export" | "volume";
+export type WorkbenchPanelKey =
+  | "transform"
+  | "repair"
+  | "modeling"
+  | "collision"
+  | "align"
+  | "inspect"
+  | "export"
+  | "volume";
 
 export interface WorkbenchDomainMeta {
   readonly id: WorkbenchDomainId;
@@ -51,7 +59,7 @@ export const WORKBENCH_DOMAINS: readonly WorkbenchDomainMeta[] = [
     api: "scene.remesh",
     cli: "fast-mesh remesh simplify|subdivide",
     operations: ["region", "simplify", "subdivide", "voxel"],
-    panels: ["repair"],
+    panels: ["modeling", "repair"],
   },
   {
     id: "boolean",
@@ -60,7 +68,7 @@ export const WORKBENCH_DOMAINS: readonly WorkbenchDomainMeta[] = [
     api: "scene.boolean",
     cli: "fast-mesh boolean union|intersection|difference",
     operations: ["union", "difference", "intersection", "cut", "offset", "shell"],
-    panels: ["repair"],
+    panels: ["modeling", "repair"],
   },
   {
     id: "deform",
@@ -87,7 +95,7 @@ export const WORKBENCH_DOMAINS: readonly WorkbenchDomainMeta[] = [
     api: "scene.align",
     cli: "fast_mesh_ops::align",
     operations: ["register"],
-    panels: ["collision"],
+    panels: ["align", "collision"],
   },
 ];
 

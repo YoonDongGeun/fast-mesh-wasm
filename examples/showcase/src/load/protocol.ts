@@ -56,6 +56,10 @@ export interface LoadedMesh {
   importScale?: ImportScale;
   /** Set when the worker decimated this mesh on load. */
   decimated?: { from: number; to: number };
+  /** Optional per-vertex sRGB colors (4 RGBA bytes per vertex), used by Duplicate. */
+  colors?: Uint8Array;
+  /** Optional per-vertex UVs (2 floats per vertex), used by Duplicate. */
+  uvs?: Float32Array;
 }
 
 /** A retained source volume, fetched for the volume view (values transferred). */

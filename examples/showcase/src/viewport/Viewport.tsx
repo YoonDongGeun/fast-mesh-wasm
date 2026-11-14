@@ -22,7 +22,16 @@ import type { Loader } from "../load/loader";
 import { inspect } from "../panels/inspect";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { applyMeshScale } from "../scene/transform-math";
+import { evaluateSurfaceColormap } from "../scene/workbench-ops";
 import { InspectLayers, pickVertex } from "./InspectLayers";
+import {
+  applyCameraPose,
+  computeSceneBounds,
+  orthoToPerspectiveDistance,
+  perspectiveToOrthoHalfExtents,
+  presetPose,
+} from "./camera";
 import { setSliceClip } from "./clip-planes";
 import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
@@ -66,7 +75,7 @@ import {
   disposeRepairOverlayGroup,
 } from "./repair-overlays";
 
-export type GizmoMode = "translate" | "rotate";
+export type GizmoMode = "translate" | "rotate" | "scale";
 
 /** The hover raycast runs at most this often while the pointer moves. */
 const HOVER_PERIOD_MS = 50;
@@ -244,7 +253,15 @@ export function Viewport(props: {
         />
       ))}
       {/* Sculpt and mask paint own the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
-      <Controls bound={sculpt !== null || maskPaint ? null : selected} mode={mode} focus={focus} resetView={resetView} radiusOf={radiusOf} />
+      <Controls
+        app={app}
+        items={items}
+        bound={sculpt !== null || maskPaint ? null : selected}
+        mode={mode}
+        focus={focus}
+        resetView={resetView}
+        radiusOf={radiusOf}
+      />
       {hoverable ? <HoverRay scene={scene} /> : null}
       {sculpt !== null ? (
         <SculptLayer
@@ -448,8 +465,75 @@ function MeshView(props: {
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
       <SculptMaskOverlay app={app} item={item} bound={bound} />
+      <SurfaceFieldOverlay app={app} item={item} bound={bound} />
     </>
   );
+}
+
+/**
+ * Vertex-colored overlay for client-evaluated surface fields (Gaussian curvature
+ * or WorkerScene Thickness/Mean curvature) rendered over `bound.object` without
+ * fighting `<FastMesh>`'s native shader uniforms.
+ */
+function SurfaceFieldOverlay(props: { app: AppState; item: Item; bound: MeshBinding | null }) {
+  const { app, item, bound } = props;
+  const field = useApp(app, (s) => (s.surfaceFieldValues?.mesh === item.mesh ? s.surfaceFieldValues : null));
+  const overlayMesh = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    const m = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+    const mesh = new THREE.Mesh(g, m);
+    mesh.matrixAutoUpdate = false;
+    mesh.renderOrder = 1;
+    return mesh;
+  }, []);
+
+  useEffect(() => {
+    const parent = bound?.object ?? null;
+    if (parent === null || field === null) {
+      overlayMesh.visible = false;
+      return;
+    }
+    const srcGeom = parent.geometry;
+    const posAttr = srcGeom.getAttribute("position");
+    const idxAttr = srcGeom.getIndex();
+    if (!posAttr || !idxAttr) {
+      overlayMesh.visible = false;
+      return;
+    }
+    const vertCount = posAttr.count;
+    const colors = new Float32Array(vertCount * 3);
+    for (let i = 0; i < vertCount; i++) {
+      const val = i < field.values.length ? field.values[i] : Number.NaN;
+      const [r, g, b] = evaluateSurfaceColormap(field.map, val, field.min, field.max);
+      colors[3 * i] = r;
+      colors[3 * i + 1] = g;
+      colors[3 * i + 2] = b;
+    }
+    overlayMesh.geometry.setAttribute("position", posAttr);
+    overlayMesh.geometry.setIndex(idxAttr);
+    overlayMesh.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    overlayMesh.geometry.computeBoundingSphere();
+    overlayMesh.visible = true;
+    parent.add(overlayMesh);
+    return () => {
+      parent.remove(overlayMesh);
+    };
+  }, [bound, field, overlayMesh]);
+
+  useEffect(() => {
+    return () => {
+      overlayMesh.geometry.dispose();
+      (overlayMesh.material as THREE.Material).dispose();
+    };
+  }, [overlayMesh]);
+
+  return null;
 }
 
 /**
@@ -1727,36 +1811,107 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
  * each new `focus` request.
  */
 function Controls(props: {
+  app: AppState;
+  items: readonly Item[];
   bound: MeshBinding | null;
   mode: GizmoMode;
   focus: FocusRequest | null;
   resetView: number;
   radiusOf: (mesh: MeshHandle) => number;
 }) {
-  const { bound, mode, focus, resetView, radiusOf } = props;
+  const { app, items, bound, mode, focus, resetView, radiusOf } = props;
   const store = useScene();
   const camera = useThree((s) => s.camera);
+  const setThree = useThree((s) => s.set);
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   const size = useThree((s) => s.size);
+  const cameraProjection = useApp(app, (s) => s.cameraProjection);
+  const cameraPresetRequest = useApp(app, (s) => s.cameraPresetRequest);
   const [orbit, setOrbit] = useState<TrackballControls | null>(null);
   const [gizmo, setGizmo] = useState<TransformControls | null>(null);
-  // Read when a focus request arrives: a new list of items is not a new request.
+  // Read when a focus/preset request arrives: a new list of items is not a new request.
   const radiusRef = useRef(radiusOf);
   radiusRef.current = radiusOf;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const perspCamRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const orthoCamRef = useRef<THREE.OrthographicCamera | null>(null);
+  const orbitTargetRef = useRef(new THREE.Vector3(-0.6, 0.9, 0));
+  const lastResetViewRef = useRef(0);
+  const lastFocusRef = useRef<FocusRequest | null>(null);
+  const lastPresetSeqRef = useRef(0);
+
+  if (camera instanceof THREE.PerspectiveCamera) {
+    perspCamRef.current = camera;
+  } else if (camera instanceof THREE.OrthographicCamera) {
+    orthoCamRef.current = camera;
+  }
+
+  // Switch seamlessly between PerspectiveCamera and OrthographicCamera while keeping pose & framing.
+  useEffect(() => {
+    const aspect = size.height > 0 ? size.width / size.height : 1;
+    const target = orbit?.target ?? orbitTargetRef.current;
+    orbitTargetRef.current.copy(target);
+    if (cameraProjection === "orthographic" && camera instanceof THREE.PerspectiveCamera) {
+      const dist = Math.max(camera.position.distanceTo(target), 1e-3);
+      const { halfHeight, halfWidth } = perspectiveToOrthoHalfExtents(camera.fov, dist, aspect);
+      const ortho =
+        orthoCamRef.current ??
+        new THREE.OrthographicCamera(
+          -halfWidth,
+          halfWidth,
+          halfHeight,
+          -halfHeight,
+          -Math.max(dist * 50, 500),
+          Math.max(dist * 50, 500),
+        );
+      ortho.left = -halfWidth;
+      ortho.right = halfWidth;
+      ortho.top = halfHeight;
+      ortho.bottom = -halfHeight;
+      ortho.zoom = 1;
+      ortho.near = -Math.max(dist * 50, 500);
+      ortho.far = Math.max(dist * 50, 500);
+      ortho.position.copy(camera.position);
+      ortho.up.copy(camera.up);
+      ortho.lookAt(target);
+      ortho.updateProjectionMatrix();
+      orthoCamRef.current = ortho;
+      setThree({ camera: ortho });
+    } else if (cameraProjection === "perspective" && camera instanceof THREE.OrthographicCamera) {
+      const persp = perspCamRef.current ?? new THREE.PerspectiveCamera(45, aspect, 0.01, 5000);
+      const dist = orthoToPerspectiveDistance(camera.top, camera.bottom, camera.zoom, persp.fov);
+      const dir = camera.position.clone().sub(target);
+      if (dir.lengthSq() === 0) {
+        dir.set(0, 0, 1);
+      }
+      dir.normalize();
+      persp.position.copy(target).addScaledVector(dir, dist);
+      persp.up.copy(camera.up);
+      persp.aspect = aspect;
+      persp.near = Math.max(dist / 1000, 1e-4);
+      persp.far = Math.max(dist * 100, 100);
+      persp.lookAt(target);
+      persp.updateProjectionMatrix();
+      perspCamRef.current = persp;
+      setThree({ camera: persp });
+    }
+  }, [cameraProjection, camera, orbit, setThree, size.width, size.height]);
 
   useEffect(() => {
     view.camera = camera;
     view.canvas = gl.domElement;
     const unwatch = watchFingers(gl.domElement); // before the trackball: see touch.ts
     const o = new TrackballControls(camera, gl.domElement);
-    o.target.set(-0.6, 0.9, 0);
+    o.target.copy(orbitTargetRef.current);
     // No inertia: the camera stops where the pointer lifts (deterministic).
     o.staticMoving = true;
     o.update();
     view.orbit = o;
     setOrbit(o);
     return () => {
+      orbitTargetRef.current.copy(o.target);
       o.dispose();
       unwatch();
       setOrbit((c) => (c === o ? null : c));
@@ -1773,10 +1928,18 @@ function Controls(props: {
   // The trackball caches the canvas's box; a rotated phone or a resized panel changes it.
   useEffect(() => {
     orbit?.handleResize();
-  }, [orbit, size]);
+    if (camera instanceof THREE.OrthographicCamera && size.width > 0 && size.height > 0) {
+      const halfH = Math.abs(camera.top - camera.bottom) / 2;
+      const halfW = halfH * (size.width / size.height);
+      camera.left = -halfW;
+      camera.right = halfW;
+      camera.updateProjectionMatrix();
+    }
+  }, [orbit, size, camera]);
 
   useFrame(() => orbit?.update());
 
+  const isScale = mode === "scale";
   useEffect(() => {
     if (orbit === null || bound === null) {
       return;
@@ -1803,10 +1966,31 @@ function Controls(props: {
     const helper = controls.getHelper();
     scene.add(helper);
     controls.attach(bound.object);
-    const detach = attachTransformControls(controls, store.scene, bound);
+    const detach = isScale ? null : attachTransformControls(controls, store.scene, bound);
+    if (isScale) {
+      controls.setMode("scale");
+    }
     const onDragging = (e: { value: unknown }) => {
-      orbit.enabled = e.value !== true;
-      setDragging(e.value === true);
+      const active = e.value === true;
+      orbit.enabled = !active;
+      setDragging(active);
+      if (isScale && !active) {
+        const sx = bound.object.scale.x;
+        const sy = bound.object.scale.y;
+        const sz = bound.object.scale.z;
+        bound.object.scale.set(1, 1, 1);
+        if (
+          Number.isFinite(sx) &&
+          Number.isFinite(sy) &&
+          Number.isFinite(sz) &&
+          sx > 0 &&
+          sy > 0 &&
+          sz > 0 &&
+          (Math.abs(sx - 1) > 1e-4 || Math.abs(sy - 1) > 1e-4 || Math.abs(sz - 1) > 1e-4)
+        ) {
+          void applyMeshScale(store, bound.mesh, [sx, sy, sz]);
+        }
+      }
     };
     controls.addEventListener("dragging-changed", onDragging);
     view.gizmo = controls;
@@ -1817,7 +2001,8 @@ function Controls(props: {
       }
       canvas.removeEventListener("pointercancel", onCancel);
       controls.removeEventListener("dragging-changed", onDragging);
-      detach();
+      detach?.();
+      bound.object.scale.set(1, 1, 1);
       controls.detach();
       scene.remove(helper);
       controls.dispose();
@@ -1828,7 +2013,7 @@ function Controls(props: {
       }
       setGizmo((g) => (g === controls ? null : g));
     };
-  }, [store, camera, gl, scene, orbit, bound]);
+  }, [store, camera, gl, scene, orbit, bound, isScale]);
 
   useEffect(() => {
     gizmo?.setMode(mode);
@@ -1837,27 +2022,57 @@ function Controls(props: {
   // Reset view: the default pose (and an upright camera: the trackball
   // may have rolled it).
   useEffect(() => {
-    if (orbit === null || resetView === 0) {
+    if (orbit === null || resetView === 0 || resetView === lastResetViewRef.current) {
       return;
     }
+    lastResetViewRef.current = resetView;
     camera.position.set(-0.6, 3.4, 8.2);
     camera.up.set(0, 1, 0);
+    orbitTargetRef.current.set(-0.6, 0.9, 0);
+    orbit.target.set(-0.6, 0.9, 0);
     if (camera instanceof THREE.PerspectiveCamera) {
       camera.near = 0.01;
       camera.far = 5000;
       camera.updateProjectionMatrix();
+    } else if (camera instanceof THREE.OrthographicCamera) {
+      const dist = camera.position.distanceTo(orbit.target);
+      const aspect = size.height > 0 ? size.width / size.height : 1;
+      const { halfHeight, halfWidth } = perspectiveToOrthoHalfExtents(45, dist, aspect);
+      camera.left = -halfWidth;
+      camera.right = halfWidth;
+      camera.top = halfHeight;
+      camera.bottom = -halfHeight;
+      camera.zoom = 1;
+      camera.near = -Math.max(dist * 50, 500);
+      camera.far = Math.max(dist * 50, 500);
+      camera.updateProjectionMatrix();
     }
-    orbit.target.set(-0.6, 0.9, 0);
     orbit.update();
-  }, [orbit, resetView, camera]);
+  }, [orbit, resetView, camera, size.width, size.height]);
+
+  // Camera presets: frame the scene bounds along Front / Back / Left / Right / Top / Bottom.
+  useEffect(() => {
+    if (orbit === null || cameraPresetRequest === null || cameraPresetRequest.n === lastPresetSeqRef.current) {
+      return;
+    }
+    lastPresetSeqRef.current = cameraPresetRequest.n;
+    const bounds = computeSceneBounds(itemsRef.current, store.scene, app);
+    const pose = presetPose(cameraPresetRequest.preset, bounds);
+    const aspect = size.height > 0 ? size.width / size.height : 1;
+    applyCameraPose(camera, pose, aspect, cameraProjection);
+    orbitTargetRef.current.set(pose.target[0], pose.target[1], pose.target[2]);
+    orbit.target.set(pose.target[0], pose.target[1], pose.target[2]);
+    orbit.update();
+  }, [orbit, cameraPresetRequest, cameraProjection, store, app, camera, size.width, size.height]);
 
   // Focus: the orbit target to the mesh's centre (its origin, where the
   // gizmo sits), the camera back along the requested (or current)
   // direction. A focus box frames that world box instead of the mesh.
   useEffect(() => {
-    if (orbit === null || focus === null) {
+    if (orbit === null || focus === null || focus === lastFocusRef.current) {
       return;
     }
+    lastFocusRef.current = focus;
     let center: THREE.Vector3;
     let radius: number;
     if (focus.box !== undefined) {
@@ -1882,15 +2097,27 @@ function Controls(props: {
     }
     const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 45;
     const distance = (radius * 1.15) / Math.sin(THREE.MathUtils.degToRad(fov) / 2);
+    orbitTargetRef.current.copy(center);
     orbit.target.copy(center);
     camera.position.copy(center).addScaledVector(dir.normalize(), distance);
     if (camera instanceof THREE.PerspectiveCamera) {
       camera.near = Math.max(distance / 1000, 1e-4);
       camera.far = Math.max(distance * 100, 100);
       camera.updateProjectionMatrix();
+    } else if (camera instanceof THREE.OrthographicCamera) {
+      const aspect = size.height > 0 ? size.width / size.height : 1;
+      const { halfHeight, halfWidth } = perspectiveToOrthoHalfExtents(fov, distance, aspect);
+      camera.left = -halfWidth;
+      camera.right = halfWidth;
+      camera.top = halfHeight;
+      camera.bottom = -halfHeight;
+      camera.zoom = 1;
+      camera.near = -Math.max(distance * 50, 500);
+      camera.far = Math.max(distance * 50, 500);
+      camera.updateProjectionMatrix();
     }
     orbit.update();
-  }, [orbit, focus, store, camera]);
+  }, [orbit, focus, store, camera, size.width, size.height]);
 
   return null;
 }
