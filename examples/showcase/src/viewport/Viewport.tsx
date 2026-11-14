@@ -51,6 +51,7 @@ import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
 import {
+  applyMaskPaintStep,
   inheritedSplits,
   MaskLiveTracker,
   maskMeetsRemesh,
@@ -122,6 +123,7 @@ export function Viewport(props: {
     wireframe,
     loader,
   } = props;
+  const store = useScene();
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
   const downAt = useRef<{ x: number; y: number } | null>(null);
@@ -206,8 +208,11 @@ export function Viewport(props: {
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
   // Shared live-mask cache between MaskLayer and SculptLayer so switching from
   // mask paint into sculpting preserves O(1) verticesInSphere trust on dab 1.
-  const maskTracker = useMemo(() => new MaskLiveTracker(scene), [scene]);
-  useEffect(() => () => maskTracker.dispose(), [maskTracker]);
+  const maskTracker = useMemo(() => new MaskLiveTracker(scene, store), [scene, store]);
+  useEffect(() => {
+    maskTracker.attach();
+    return () => maskTracker.dispose();
+  }, [maskTracker]);
 
   return (
     <Canvas camera={{ position: [-0.6, 3.4, 8.2], fov: 45, near: 0.01, far: 5000 }} onPointerMissed={onMissed}>
@@ -231,7 +236,7 @@ export function Viewport(props: {
           onPickPoint={onPickPoint}
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
-          suppressClick={sculpt?.mesh === item.mesh || (maskPaint && sculpt === null)}
+          suppressClick={sculpt?.mesh === item.mesh || (maskPaint && sculpt === null && item.mesh === selection)}
           wireframe={wireframe}
           bound={bindings.get(item.mesh) ?? null}
         />
@@ -434,8 +439,8 @@ function MeshView(props: {
         shading="fragment"
         edgeSoftness={edgeSoftness}
         visible={!volumeShown}
-        // While sculpting or mask painting a click means nothing here, and listening
-        // for one costs a per-triangle three raycast on every press and release.
+        // While sculpting this mesh or mask-painting the selected mesh a click means nothing
+        // here, and listening for one costs a per-triangle three raycast on every press and release.
         onClick={sculpted || suppressClick ? undefined : onClick}
         onBind={(b) => onBind(item.mesh, b)}
       />
@@ -790,7 +795,9 @@ function SculptLayer(props: {
      * masked vertex never silently re-points the brush.
      */
     const maskWentStale = () => {
-      maskTracker.invalidate(maskRef.current?.mesh);
+      const staleMesh = maskRef.current?.mesh;
+      maskRef.current = null;
+      maskTracker.invalidate(staleMesh);
       app.setSculptMask(null);
       app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
       inspect.sculpt.maskStale++;
@@ -824,7 +831,7 @@ function SculptLayer(props: {
       if (gated === null || gated === "stale" || !("radius" in op)) {
         return op;
       }
-      return protectMaskedDab(op, gated.vertices, gated.positions, gated.live, maskRef.current?.inherited);
+      return protectMaskedDab(op, gated.vertices, gated.positions, gated.live);
     };
 
     /**
@@ -1047,11 +1054,13 @@ function SculptLayer(props: {
           const slots = triSlots(mesh);
           if (b !== null && slots !== null && !remeshTooBig(slots) && !remeshMeetsMask(mesh, b)) {
             ensureDensity(mesh);
-            maskTracker.invalidate(mesh);
             inspect.sculpt.remeshes++;
-            // In order with the stroke: after what is due and any live pass.
-            void s.pass(() =>
-              store
+            // In order with the stroke: after what is due and any live pass, so
+            // invalidation happens once the remesh pass executes (never pre-empted by
+            // an earlier live split pass registering #splitPending).
+            void s.pass(() => {
+              maskTracker.noteTopologyMutation(mesh);
+              return store
                 .repair(mesh, {
                   op: "remesh",
                   center: b.center,
@@ -1059,11 +1068,16 @@ function SculptLayer(props: {
                   maxRounds: 4,
                   targetLength: densityAnchor?.mesh === mesh ? densityAnchor.length : undefined,
                 })
+                .then((r) => {
+                  maskTracker.noteTopologyMutation(mesh);
+                  return r;
+                })
                 .catch(() => {
+                  maskTracker.noteTopologyMutation(mesh);
                   // A degenerate region (or a mesh removed meanwhile): the
                   // stroke still ends.
-                }),
-            );
+                });
+            });
           }
         }
         s.end();
@@ -1135,7 +1149,7 @@ function SculptLayer(props: {
         () => {
           const cost = inspect.sculpt.dabCost;
           const start = performance.now();
-          const rawOp = dabOperation({ ...brushRef.current, tool: brushRef.current.tool ?? "grab", direction: g }, press);
+          const rawOp = dabOperation({ ...brushRef.current, mesh, tool: "grab", direction: g }, press);
           const heldOp = protectedDab(mesh, rawOp);
           const sent = performance.now();
           if (cost.maskMs.length < 4096) {
@@ -1506,61 +1520,27 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
       const radius = radiusRef.current;
       const sym = toSymmetry(app.getSnapshot().sculptSymmetry);
       const centers = reflectCenters(point, sym);
-      const topoBefore = maskTracker.topologyVersion(mesh);
-      let picked: Uint32Array[];
-      try {
-        picked = await Promise.all(centers.map((c) => store.verticesInSphere(mesh, c, radius)));
-      } catch {
-        return; // Removed meanwhile or stale BVH: the next move asks again.
-      }
-      if (!alive) {
-        return;
-      }
-      let slots: number;
-      try {
-        slots = scene.views(mesh).positions().length / 3;
-      } catch {
-        return; // Removed meanwhile: the next move asks again.
-      }
-      let fresh = picked[0] ?? new Uint32Array(0);
-      for (let k = 1; k < picked.length; k++) {
-        fresh = unionMaskIds(fresh, picked[k]);
-      }
-      const topoSame = topoBefore === maskTracker.topologyVersion(mesh);
-      const prev = app.getSnapshot().sculptMask;
-      if (prev !== null && prev.mesh === mesh) {
-        const check = maskTracker.checkMask(mesh, prev);
-        if (check === null) {
-          return;
-        }
-        if (!check.ok) {
-          // Loud, never a silent reinterpretation: drop it, count it, paint fresh.
-          maskTracker.invalidate(mesh);
+      await applyMaskPaintStep({
+        mesh,
+        centers,
+        radius,
+        verticesInSphere: (m, c, r) => store.verticesInSphere(m, c, r),
+        views: (m) => scene.views(m),
+        tracker: maskTracker,
+        isAlive: () => alive,
+        getPrevMask: () => app.getSnapshot().sculptMask,
+        setMask: (next) => app.setSculptMask(next),
+        onStale: () => {
           app.setSculptMask(null);
           app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
           inspect.sculpt.maskStale++;
-          if (topoSame) {
-            maskTracker.trust(mesh, fresh, slots);
+        },
+        clearNotice: () => {
+          if (app.getSnapshot().sculptMaskNotice !== null) {
+            app.setSculptMaskNotice(null);
           }
-          app.setSculptMask({ mesh, vertices: fresh, slots });
-          return;
-        }
-        const nextVertices = unionMaskIds(prev.vertices, fresh);
-        if (topoSame) {
-          maskTracker.trust(mesh, nextVertices, slots, prev.inherited === undefined || prev.inherited.size === 0);
-        }
-        app.setSculptMask({ mesh, vertices: nextVertices, slots, inherited: prev.inherited });
-      } else {
-        // A new mesh replaces the mask, like the sculpt brush re-arms.
-        if (topoSame) {
-          maskTracker.trust(mesh, fresh, slots);
-        }
-        app.setSculptMask({ mesh, vertices: fresh, slots });
-      }
-      // A successful paint resolves the loud notice.
-      if (app.getSnapshot().sculptMaskNotice !== null) {
-        app.setSculptMaskNotice(null);
-      }
+        },
+      });
     };
 
     const enqueuePaint = (mesh: MeshHandle, point: readonly [number, number, number]): Promise<void> => {

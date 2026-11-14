@@ -304,6 +304,50 @@ describe("settings storage", () => {
     expect(app.getSnapshot().sculptFilter).toEqual(d.sculptFilter);
     expect(app.getSnapshot().sculptSymmetry).toEqual(d.sculptSymmetry);
   });
+
+  it("clamps_and_validates_setSculptFilter_and_setSculptGrabPoisson", () => {
+    stubStorage();
+    const app = new AppState(defaultSettings());
+
+    app.setSculptGrabPoisson(Number.NaN);
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(0.4);
+    app.setSculptGrabPoisson(-0.5);
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(0);
+    app.setSculptGrabPoisson(0.9);
+    expect(app.getSnapshot().sculptGrabPoisson).toBe(0.5);
+
+    app.setSculptFilter({ threshold: -1, contrast: 2, maxAngleDeg: 300 });
+    expect(app.getSnapshot().sculptFilter).toEqual({
+      kind: "none",
+      threshold: 0,
+      contrast: 1,
+      maxAngleDeg: 180,
+    });
+
+    app.setSculptFilter({
+      kind: "badKind" as never,
+      threshold: Number.NaN,
+      contrast: Number.POSITIVE_INFINITY,
+      maxAngleDeg: 0,
+    });
+    expect(app.getSnapshot().sculptFilter).toEqual({
+      kind: "none",
+      threshold: 0,
+      contrast: 1,
+      maxAngleDeg: 180,
+    });
+
+    app.setSculptFilter({ maxAngleDeg: -15 });
+    expect(app.getSnapshot().sculptFilter.maxAngleDeg).toBe(180);
+
+    app.setSculptFilter({ maxAngleDeg: Number.NaN, kind: "valleysOnly", threshold: 0.42, contrast: 0.65 });
+    expect(app.getSnapshot().sculptFilter).toEqual({
+      kind: "valleysOnly",
+      threshold: 0.42,
+      contrast: 0.65,
+      maxAngleDeg: 180,
+    });
+  });
 });
 
 describe("tour storage", () => {

@@ -586,9 +586,26 @@ export class AppState {
     this.#set({ sculptGrabPoisson: Math.min(0.5, Math.max(0, poisson)) });
   }
 
-  /** Updates composable surface filter settings (persisted). */
+  /** Updates composable surface filter settings clamped to `settings.ts` bounds (persisted). */
   setSculptFilter(patch: Partial<SculptFilterSettings>): void {
-    this.#set({ sculptFilter: { ...this.#snap.sculptFilter, ...patch } });
+    const cur = this.#snap.sculptFilter;
+    const kind =
+      patch.kind === "none" || patch.kind === "peaksOnly" || patch.kind === "valleysOnly" || patch.kind === "normalAngle"
+        ? patch.kind
+        : cur.kind;
+    const threshold =
+      patch.threshold !== undefined && Number.isFinite(patch.threshold)
+        ? Math.min(1, Math.max(0, patch.threshold))
+        : cur.threshold;
+    const contrast =
+      patch.contrast !== undefined && Number.isFinite(patch.contrast)
+        ? Math.min(1, Math.max(0, patch.contrast))
+        : cur.contrast;
+    const maxAngleDeg =
+      patch.maxAngleDeg !== undefined && Number.isFinite(patch.maxAngleDeg) && patch.maxAngleDeg > 0
+        ? Math.min(180, patch.maxAngleDeg)
+        : cur.maxAngleDeg;
+    this.#set({ sculptFilter: { kind, threshold, contrast, maxAngleDeg } });
   }
 
   /** Updates mirror symmetry axis toggles (persisted). */

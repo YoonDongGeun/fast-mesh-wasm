@@ -5,7 +5,7 @@
 // soft band around the mask at a weight rising to 1, so no crease forms along
 // the border. The brush itself is untouched; this only decorates its op.
 import type { MeshChange, MeshHandle, RepairOp } from "fast-mesh-wasm";
-import { reflectCenters, widestGrabReach } from "./sculpt";
+import { reflectCenters, unionMaskIds, widestGrabReach } from "./sculpt";
 
 /** The soft band's width, as a fraction of the brush radius. */
 export const MASK_SOFT_BAND = 0.25;
@@ -396,13 +396,27 @@ export function updateMaskLiveFromRanges(
   }
   const triLimit = Math.floor(indices.length / 3);
   for (const [start, count] of ranges) {
-    const end = Math.min(triLimit, start + count);
-    for (let t = Math.max(0, start); t < end; t++) {
+    if (!Number.isInteger(start) || !Number.isInteger(count) || start < 0 || count < 0 || start + count > triLimit) {
+      return null;
+    }
+    const end = start + count;
+    for (let t = start; t < end; t++) {
       const i = 3 * t;
       const a = indices[i];
       const b = indices[i + 1];
       const c = indices[i + 2];
-      if (a === 0 && b === 0 && c === 0) {
+      if (
+        (a === 0 && b === 0 && c === 0) ||
+        !Number.isInteger(a) ||
+        a < 0 ||
+        a >= slots ||
+        !Number.isInteger(b) ||
+        b < 0 ||
+        b >= slots ||
+        !Number.isInteger(c) ||
+        c < 0 ||
+        c >= slots
+      ) {
         return null;
       }
     }
@@ -413,21 +427,12 @@ export function updateMaskLiveFromRanges(
     live.set(cache.live);
   }
   for (const [start, count] of ranges) {
-    const end = Math.min(triLimit, start + count);
-    for (let t = Math.max(0, start); t < end; t++) {
+    const end = start + count;
+    for (let t = start; t < end; t++) {
       const i = 3 * t;
-      const a = indices[i];
-      const b = indices[i + 1];
-      const c = indices[i + 2];
-      if (a >= 0 && a < slots) {
-        live[a] = 1;
-      }
-      if (b >= 0 && b < slots) {
-        live[b] = 1;
-      }
-      if (c >= 0 && c < slots) {
-        live[c] = 1;
-      }
+      live[indices[i]] = 1;
+      live[indices[i + 1]] = 1;
+      live[indices[i + 2]] = 1;
     }
   }
   return { slots, live };
@@ -487,7 +492,6 @@ export function protectMaskedDab(
   masked: ArrayLike<number>,
   positions: ArrayLike<number>,
   live: Uint8Array,
-  inherited?: ReadonlySet<number>,
 ): RepairOp {
   if (
     op.op !== "inflate" &&
@@ -517,9 +521,6 @@ export function protectMaskedDab(
     }
     if (live[id] === 0) {
       // Dead inherited splits (after undo) or stale slots cannot be passed to check_protection.
-      if (inherited?.has(id) === true) {
-        continue;
-      }
       continue;
     }
     const px = positions[3 * id];
@@ -552,6 +553,26 @@ export function protectMaskedDab(
 export interface MaskLiveScene {
   views(mesh: MeshHandle): { positions(): ArrayLike<number>; indices(): ArrayLike<number> };
   onChanges(listener: (changes: MeshChange[]) => void): () => void;
+  undo?: () => unknown;
+  redo?: () => unknown;
+  cancelStep?: () => unknown;
+  repair?: (...args: never[]) => unknown;
+  edit?: (...args: never[]) => unknown;
+  sculpt?: (...args: never[]) => unknown;
+  compact?: (...args: never[]) => unknown;
+  join?: (...args: never[]) => unknown;
+  removeMesh?: (...args: never[]) => unknown;
+}
+
+export interface MaskLiveStore {
+  subscribe?(listener: () => void): () => void;
+  getSnapshot?(): { status?: string };
+  undo?: () => void;
+  redo?: () => void;
+  repair?: (...args: never[]) => unknown;
+  edit?: (...args: never[]) => unknown;
+  sculpt?: (...args: never[]) => unknown;
+  removeMesh?: (mesh: MeshHandle) => void;
 }
 
 export interface LiveMaskSnapshot {
@@ -561,7 +582,95 @@ export interface LiveMaskSnapshot {
   live: Uint8Array;
 }
 
+export interface MaskPaintState {
+  mesh: MeshHandle;
+  vertices: Uint32Array;
+  slots: number;
+  inherited?: ReadonlySet<number>;
+}
+
 const EMPTY_LIVE = new Uint8Array(0);
+
+const POSITION_OR_CAPTURE_OPS = new Set([
+  "inflate",
+  "relax",
+  "smooth",
+  "grab",
+  "flatten",
+  "crease",
+  "clay",
+  "twist",
+  "captureRestSizes",
+  "captureStrokeState",
+]);
+
+function isPositionOrCaptureSingle(op: unknown): boolean {
+  return (
+    typeof op === "object" &&
+    op !== null &&
+    typeof (op as { op?: unknown }).op === "string" &&
+    POSITION_OR_CAPTURE_OPS.has((op as { op: string }).op)
+  );
+}
+
+function isPositionOrCaptureOp(op: unknown): boolean {
+  return Array.isArray(op) ? op.every(isPositionOrCaptureSingle) : isPositionOrCaptureSingle(op);
+}
+
+function isSplitOp(op: unknown): boolean {
+  return !Array.isArray(op) && typeof op === "object" && op !== null && (op as { op?: unknown }).op === "splitStretched";
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+function hookMethod(
+  target: object,
+  key: string,
+  makeWrapper: (orig: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown,
+): (() => void) | null {
+  const rec = target as Record<string, unknown>;
+  const fn = rec[key];
+  if (typeof fn !== "function") {
+    return null;
+  }
+  const orig = fn as (...args: unknown[]) => unknown;
+  const existed = Object.prototype.hasOwnProperty.call(target, key);
+  const prevDesc = Object.getOwnPropertyDescriptor(target, key);
+  const wrapper = makeWrapper(orig);
+  try {
+    Object.defineProperty(target, key, {
+      value: wrapper,
+      configurable: true,
+      writable: true,
+      enumerable: prevDesc?.enumerable ?? false,
+    });
+  } catch {
+    return null;
+  }
+  return () => {
+    const curDesc = Object.getOwnPropertyDescriptor(target, key);
+    if (curDesc?.value !== wrapper) {
+      return;
+    }
+    if (existed && prevDesc !== undefined) {
+      Object.defineProperty(target, key, prevDesc);
+    } else {
+      Reflect.deleteProperty(target, key);
+    }
+  };
+}
+
+interface PendingSplit {
+  prevSlots: number | null;
+  expectedSlots?: number;
+  expectedTris?: number;
+}
 
 /**
  * Tracks live triangle vertex flags across `Scene` / `WorkerScene` frames:
@@ -569,10 +678,14 @@ const EMPTY_LIVE = new Uint8Array(0);
  * updates incrementally across `splitStretched` (including `commitFrame()` runs
  * after `splitStretched` settles) and partial dirty triangle ranges, and lets
  * mask painting mark freshly queried `verticesInSphere` masks live in O(1).
+ *
+ * Construct with no side effects; call `attach()` / `dispose()` in `useEffect`
+ * so React `<StrictMode>` unmount/remount cycles re-subscribe cleanly.
  */
 export class MaskLiveTracker {
   readonly #scene: MaskLiveScene;
-  readonly #off: () => void;
+  readonly #store: MaskLiveStore | null;
+  #off: (() => void) | null = null;
   #cache: MaskLiveCache | null = null;
   #cacheMesh: MeshHandle | null = null;
   #checkedMask: Uint32Array | null = null;
@@ -583,24 +696,198 @@ export class MaskLiveTracker {
   #trustedLiveMesh: MeshHandle | null = null;
   #trustedLiveMask: Uint32Array | null = null;
   #splittingMesh: MeshHandle | null = null;
-  readonly #splitPending = new Set<MeshHandle>();
+  readonly #splitStartSlots = new Map<MeshHandle, number | null>();
+  readonly #splitPending = new Map<MeshHandle, PendingSplit>();
+  readonly #splitSuppressed = new Set<MeshHandle>();
   readonly #topoVersion = new Map<MeshHandle, number>();
+  #globalTopoEpoch = 0;
+  #pendingAsyncHistory = 0;
 
-  constructor(scene: MaskLiveScene) {
+  constructor(scene: MaskLiveScene, store?: MaskLiveStore) {
     this.#scene = scene;
-    this.#off = scene.onChanges((changes) => this.#onChanges(changes));
+    this.#store = store ?? null;
+  }
+
+  attach(): void {
+    if (this.#off !== null) {
+      return;
+    }
+    this.invalidate();
+    this.#splitSuppressed.clear();
+    this.#pendingAsyncHistory = 0;
+    this.#globalTopoEpoch++;
+
+    const cleanups: (() => void)[] = [];
+    cleanups.push(this.#scene.onChanges((changes) => this.#onChanges(changes)));
+
+    const addHook = (target: object | null, key: string, wrap: (orig: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown) => {
+      if (target === null) {
+        return;
+      }
+      const unhook = hookMethod(target, key, wrap);
+      if (unhook !== null) {
+        cleanups.push(unhook);
+      }
+    };
+
+    const wrapGlobalMutation = (target: object, trackAsyncStatus: boolean) => (orig: (...args: unknown[]) => unknown) =>
+      function (this: unknown, ...args: unknown[]): unknown {
+        if (trackAsyncStatus) {
+          tracker.#pendingAsyncHistory++;
+        }
+        tracker.noteTopologyMutation();
+        try {
+          const result = orig.apply(this ?? target, args);
+          if (trackAsyncStatus && tracker.#store?.getSnapshot?.().status !== "computing") {
+            tracker.#pendingAsyncHistory = Math.max(0, tracker.#pendingAsyncHistory - 1);
+          }
+          if (isPromiseLike(result)) {
+            void Promise.resolve(result).then(
+              () => tracker.noteTopologyMutation(),
+              () => tracker.noteTopologyMutation(),
+            );
+          }
+          return result;
+        } catch (err) {
+          if (trackAsyncStatus) {
+            tracker.#pendingAsyncHistory = Math.max(0, tracker.#pendingAsyncHistory - 1);
+          }
+          throw err;
+        }
+      };
+
+    const wrapMeshMutation = (target: object) => (orig: (...args: unknown[]) => unknown) =>
+      function (this: unknown, ...args: unknown[]): unknown {
+        const mesh = args[0] as MeshHandle | undefined;
+        tracker.noteTopologyMutation(mesh);
+        const result = orig.apply(this ?? target, args);
+        if (isPromiseLike(result)) {
+          void Promise.resolve(result).then(
+            () => tracker.noteTopologyMutation(mesh),
+            () => tracker.noteTopologyMutation(mesh),
+          );
+        }
+        return result;
+      };
+
+    const wrapRepairOrSculpt = (target: object) => (orig: (...args: unknown[]) => unknown) =>
+      function (this: unknown, ...args: unknown[]): unknown {
+        const mesh = args[0] as MeshHandle | undefined;
+        const op = args[1];
+        if (isPositionOrCaptureOp(op) || isSplitOp(op)) {
+          if (mesh !== undefined) {
+            tracker.#bumpTopo(mesh);
+          } else {
+            tracker.#globalTopoEpoch++;
+          }
+          const result = orig.apply(this ?? target, args);
+          if (isPromiseLike(result)) {
+            void Promise.resolve(result).then(
+              () => {
+                if (mesh !== undefined) {
+                  tracker.#bumpTopo(mesh);
+                } else {
+                  tracker.#globalTopoEpoch++;
+                }
+              },
+              () => {},
+            );
+          }
+          return result;
+        }
+        tracker.noteTopologyMutation(mesh);
+        const result = orig.apply(this ?? target, args);
+        if (isPromiseLike(result)) {
+          void Promise.resolve(result).then(
+            () => tracker.noteTopologyMutation(mesh),
+            () => tracker.noteTopologyMutation(mesh),
+          );
+        }
+        return result;
+      };
+
+    const tracker = this;
+    addHook(this.#scene, "undo", wrapGlobalMutation(this.#scene, false));
+    addHook(this.#scene, "redo", wrapGlobalMutation(this.#scene, false));
+    addHook(this.#scene, "cancelStep", wrapGlobalMutation(this.#scene, false));
+    addHook(this.#scene, "join", wrapGlobalMutation(this.#scene, false));
+    addHook(this.#scene, "compact", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "edit", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "removeMesh", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "repair", wrapRepairOrSculpt(this.#scene));
+    addHook(this.#scene, "sculpt", wrapRepairOrSculpt(this.#scene));
+
+    if (this.#store !== null) {
+      addHook(this.#store, "undo", wrapGlobalMutation(this.#store, true));
+      addHook(this.#store, "redo", wrapGlobalMutation(this.#store, true));
+      addHook(this.#store, "edit", wrapMeshMutation(this.#store));
+      addHook(this.#store, "removeMesh", wrapMeshMutation(this.#store));
+      addHook(this.#store, "repair", wrapRepairOrSculpt(this.#store));
+      addHook(this.#store, "sculpt", wrapRepairOrSculpt(this.#store));
+      if (typeof this.#store.subscribe === "function") {
+        cleanups.push(
+          this.#store.subscribe(() => {
+            if (this.#pendingAsyncHistory > 0) {
+              this.noteTopologyMutation();
+              if (this.#store?.getSnapshot?.().status !== "computing") {
+                this.#pendingAsyncHistory = 0;
+              }
+            }
+          }),
+        );
+      }
+    }
+
+    this.#off = () => {
+      for (let i = cleanups.length - 1; i >= 0; i--) {
+        cleanups[i]();
+      }
+    };
   }
 
   dispose(): void {
-    this.#off();
+    if (this.#off !== null) {
+      const off = this.#off;
+      this.#off = null;
+      off();
+    }
+    this.#pendingAsyncHistory = 0;
     this.invalidate();
+    this.#splitSuppressed.clear();
+    this.#globalTopoEpoch++;
   }
 
   topologyVersion(mesh: MeshHandle): number {
-    return this.#topoVersion.get(mesh) ?? 0;
+    return (this.#topoVersion.get(mesh) ?? 0) + this.#globalTopoEpoch;
   }
 
-  invalidate(mesh?: MeshHandle): void {
+  #bumpTopo(mesh: MeshHandle): void {
+    this.#topoVersion.set(mesh, (this.#topoVersion.get(mesh) ?? 0) + 1);
+  }
+
+  /**
+   * Synchronously invalidates cached/trusted masks and increments the topology
+   * version before `commitFrame()` flushes `onChanges`.
+   */
+  noteTopologyMutation(mesh?: MeshHandle): void {
+    if (mesh === undefined) {
+      this.#globalTopoEpoch++;
+      if (this.#splittingMesh !== null) {
+        this.#splitSuppressed.add(this.#splittingMesh);
+      }
+      for (const pendingMesh of this.#splitPending.keys()) {
+        this.#splitSuppressed.add(pendingMesh);
+      }
+    } else {
+      this.#bumpTopo(mesh);
+      if (this.#splittingMesh === mesh || this.#splitPending.has(mesh)) {
+        this.#splitSuppressed.add(mesh);
+      }
+    }
+    this.invalidate(mesh);
+  }
+
+  #clearCacheAndTrust(mesh?: MeshHandle): void {
     if (mesh === undefined || this.#cacheMesh === mesh) {
       this.#cache = null;
       this.#cacheMesh = null;
@@ -614,29 +901,65 @@ export class MaskLiveTracker {
         this.#checkedMask = null;
       }
     }
+  }
+
+  invalidate(mesh?: MeshHandle): void {
+    this.#clearCacheAndTrust(mesh);
     if (mesh === undefined) {
+      if (this.#splittingMesh !== null) {
+        this.#splitSuppressed.add(this.#splittingMesh);
+      }
       this.#splittingMesh = null;
+      this.#splitStartSlots.clear();
       this.#splitPending.clear();
     } else {
       if (this.#splittingMesh === mesh) {
+        this.#splitSuppressed.add(mesh);
         this.#splittingMesh = null;
       }
+      this.#splitStartSlots.delete(mesh);
       this.#splitPending.delete(mesh);
     }
   }
 
   beginSplit(mesh: MeshHandle): void {
+    this.#splitSuppressed.delete(mesh);
     this.#splittingMesh = mesh;
+    let prevSlots: number | null = null;
+    try {
+      prevSlots = this.#scene.views(mesh).positions().length / 3;
+    } catch {
+      prevSlots =
+        this.#cacheMesh === mesh && this.#cache !== null
+          ? this.#cache.slots
+          : this.#trustedMesh === mesh
+            ? this.#trustedSlots
+            : null;
+    }
+    this.#splitStartSlots.set(mesh, prevSlots);
   }
 
   endSplit(mesh: MeshHandle, changed: boolean, slots?: number, splitVertices?: ArrayLike<number>): void {
+    const prevSlots = this.#splitStartSlots.get(mesh) ?? null;
+    this.#splitStartSlots.delete(mesh);
     if (this.#splittingMesh === mesh) {
       this.#splittingMesh = null;
     }
-    if (!changed) {
+    const suppressed = this.#splitSuppressed.has(mesh);
+    if (!changed || suppressed) {
+      this.#splitPending.delete(mesh);
+      if (suppressed) {
+        this.#clearCacheAndTrust(mesh);
+      }
       return;
     }
-    this.#splitPending.add(mesh);
+    let expectedTris: number | undefined;
+    try {
+      expectedTris = Math.floor(this.#scene.views(mesh).indices().length / 3);
+    } catch {
+      expectedTris = undefined;
+    }
+    this.#splitPending.set(mesh, { prevSlots, expectedSlots: slots, expectedTris });
     if (this.#cache !== null && this.#cacheMesh === mesh && slots !== undefined) {
       this.#cache = updateMaskLiveFromSplits(this.#cache, slots, splitVertices);
       if (this.#trustedMesh === mesh) {
@@ -794,52 +1117,99 @@ export class MaskLiveTracker {
   #onChanges(changes: readonly MeshChange[]): void {
     for (const c of changes) {
       if (c.removed) {
-        if (this.#cacheMesh === c.mesh) {
-          this.#cache = null;
-          this.#cacheMesh = null;
-          this.#checkedMask = null;
-        }
-        if (this.#trustedMesh === c.mesh) {
-          this.#trustedMesh = null;
-          this.#trustedClean = false;
-          this.#clearTrustedLive();
-          this.#checkedMask = null;
-        }
+        this.#clearCacheAndTrust(c.mesh);
         if (this.#splittingMesh === c.mesh) {
           this.#splittingMesh = null;
         }
+        this.#splitStartSlots.delete(c.mesh);
         this.#splitPending.delete(c.mesh);
+        this.#splitSuppressed.delete(c.mesh);
         this.#topoVersion.delete(c.mesh);
         continue;
       }
       if (!c.capacityChanged && c.indices !== "all" && c.indices.length === 0) {
         continue;
       }
-      this.#topoVersion.set(c.mesh, (this.#topoVersion.get(c.mesh) ?? 0) + 1);
-      const hadPendingSplit = this.#splitPending.delete(c.mesh);
-      const fromSplit = this.#splittingMesh === c.mesh || hadPendingSplit;
+      this.#bumpTopo(c.mesh);
+      const pending = this.#splitPending.get(c.mesh);
+      this.#splitPending.delete(c.mesh);
+      const suppressed = this.#splitSuppressed.delete(c.mesh);
+      const activeSplit = this.#splittingMesh === c.mesh;
+      const fromSplit = !suppressed && (activeSplit || pending !== undefined);
+
       if (fromSplit) {
-        if (this.#cacheMesh === c.mesh && this.#cache !== null) {
-          try {
-            const slots = this.#scene.views(c.mesh).positions().length / 3;
-            this.#cache = updateMaskLiveFromSplits(this.#cache, slots);
-            if (this.#trustedMesh === c.mesh) {
-              this.#trustedSlots = this.#cache.slots;
-            }
-          } catch {
-            this.invalidate(c.mesh);
-          }
-        } else if (this.#trustedMesh === c.mesh) {
-          try {
-            const slots = this.#scene.views(c.mesh).positions().length / 3;
-            this.#trustedSlots = Math.max(this.#trustedSlots, slots);
-            this.#clearTrustedLive();
-          } catch {
-            this.invalidate(c.mesh);
-          }
+        // An "all" rebuild without capacity growth (undo back to same capacity,
+        // remesh, overflow, or coalesced rebuild) cannot come from a pure split.
+        if (c.indices === "all" && !c.capacityChanged) {
+          this.invalidate(c.mesh);
+          continue;
         }
-        continue;
+        try {
+          const v = this.#scene.views(c.mesh);
+          const slots = v.positions().length / 3;
+          const indices = v.indices();
+          const triSlots = Math.floor(indices.length / 3);
+          const startSlots = pending !== undefined ? pending.prevSlots : (this.#splitStartSlots.get(c.mesh) ?? null);
+          const splitDimsMatch =
+            pending !== undefined
+              ? pending.expectedSlots !== undefined &&
+                slots === pending.expectedSlots &&
+                (pending.expectedTris === undefined || triSlots === pending.expectedTris) &&
+                (startSlots === null || slots > startSlots)
+              : startSlots !== null && slots > startSlots;
+
+          if (c.indices === "all") {
+            if (!splitDimsMatch) {
+              this.invalidate(c.mesh);
+              continue;
+            }
+            if (this.#cacheMesh === c.mesh && this.#cache !== null) {
+              this.#cache = updateMaskLiveFromSplits(this.#cache, slots);
+              if (this.#trustedMesh === c.mesh) {
+                this.#trustedSlots = this.#cache.slots;
+              }
+            } else if (this.#trustedMesh === c.mesh) {
+              this.#trustedSlots = slots;
+              this.#clearTrustedLive();
+            }
+            continue;
+          }
+
+          // Dirty triangle ranges alongside split: never skip range validation.
+          if (
+            pending !== undefined &&
+            ((pending.expectedSlots !== undefined && slots !== pending.expectedSlots) ||
+              (pending.expectedTris !== undefined && triSlots !== pending.expectedTris))
+          ) {
+            this.invalidate(c.mesh);
+            continue;
+          }
+          if (this.#trustedMesh === c.mesh && c.indices.length > 0) {
+            this.#trustedMesh = null;
+            this.#trustedClean = false;
+            this.#clearTrustedLive();
+            this.#checkedMask = null;
+          }
+          if (this.#cacheMesh === c.mesh && this.#cache !== null) {
+            const grown = updateMaskLiveFromSplits(this.#cache, slots);
+            const updated = updateMaskLiveFromRanges(grown, indices, slots, c.indices);
+            if (updated === null) {
+              this.invalidate(c.mesh);
+              continue;
+            }
+            this.#cache = updated;
+            continue;
+          }
+          if (c.indices.length > 0) {
+            this.invalidate(c.mesh);
+            continue;
+          }
+        } catch {
+          this.invalidate(c.mesh);
+          continue;
+        }
       }
+
       if (c.indices === "all" || c.capacityChanged) {
         this.invalidate(c.mesh);
         continue;
@@ -864,4 +1234,76 @@ export class MaskLiveTracker {
       }
     }
   }
+}
+
+/**
+ * Executes a single serialized mask-paint step against `verticesInSphere`, checking
+ * `tracker.topologyVersion(mesh)` across the async `await` BEFORE touching
+ * `views(mesh)`, `checkMask`, or `trust` so an undo/redo/cancelStep/non-split
+ * repair settling in the microtask window before `commitFrame()` cannot trust
+ * stale vertex IDs.
+ */
+export async function applyMaskPaintStep(params: {
+  mesh: MeshHandle;
+  centers: readonly (readonly [number, number, number])[];
+  radius: number;
+  verticesInSphere: (mesh: MeshHandle, center: readonly [number, number, number], radius: number) => Promise<Uint32Array>;
+  views: (mesh: MeshHandle) => { positions(): ArrayLike<number> };
+  tracker: MaskLiveTracker;
+  isAlive: () => boolean;
+  getPrevMask: () => MaskPaintState | null;
+  setMask: (next: MaskPaintState | null) => void;
+  onStale: () => void;
+  clearNotice?: () => void;
+}): Promise<boolean> {
+  const { mesh, centers, radius, verticesInSphere, views, tracker, isAlive, getPrevMask, setMask, onStale, clearNotice } =
+    params;
+  const epochBefore = tracker.topologyVersion(mesh);
+  let picked: Uint32Array[];
+  try {
+    picked = await Promise.all(centers.map((c) => verticesInSphere(mesh, c, radius)));
+  } catch {
+    return false;
+  }
+  if (!isAlive() || epochBefore !== tracker.topologyVersion(mesh)) {
+    return false;
+  }
+  let slots: number;
+  try {
+    slots = views(mesh).positions().length / 3;
+  } catch {
+    return false;
+  }
+  if (epochBefore !== tracker.topologyVersion(mesh)) {
+    return false;
+  }
+  let fresh = picked[0] ?? new Uint32Array(0);
+  for (let k = 1; k < picked.length; k++) {
+    fresh = unionMaskIds(fresh, picked[k]);
+  }
+  const prev = getPrevMask();
+  if (prev !== null && prev.mesh === mesh) {
+    const check = tracker.checkMask(mesh, prev);
+    if (check === null || epochBefore !== tracker.topologyVersion(mesh)) {
+      return false;
+    }
+    if (!check.ok) {
+      // Loud, never a silent reinterpretation: drop it, count it, paint fresh.
+      tracker.invalidate(mesh);
+      onStale();
+      if (epochBefore === tracker.topologyVersion(mesh)) {
+        tracker.trust(mesh, fresh, slots);
+      }
+      setMask({ mesh, vertices: fresh, slots });
+      return true;
+    }
+    const nextVertices = unionMaskIds(prev.vertices, fresh);
+    tracker.trust(mesh, nextVertices, slots, prev.inherited === undefined || prev.inherited.size === 0);
+    setMask({ mesh, vertices: nextVertices, slots, inherited: prev.inherited });
+  } else {
+    tracker.trust(mesh, fresh, slots);
+    setMask({ mesh, vertices: fresh, slots });
+  }
+  clearNotice?.();
+  return true;
 }

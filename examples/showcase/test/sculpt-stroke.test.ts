@@ -719,7 +719,7 @@ describe("engine-driven Grab + masked dabs + live splits (#177, #192, #197)", ()
             { ...sculptBrush("grab", s.mesh, radius, 1, "smooth"), direction: drag },
             press,
           );
-          const heldOp = protectMaskedDab(grabOp, masked, curPos, live, inherited);
+          const heldOp = protectMaskedDab(grabOp, masked, curPos, live);
           s.scene.repair(s.mesh, heldOp);
           return Promise.resolve();
         },
