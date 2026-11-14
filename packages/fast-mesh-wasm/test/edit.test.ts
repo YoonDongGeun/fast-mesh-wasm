@@ -1,7 +1,7 @@
 // Geometry edit op lists, compaction, analysis and repair through the Node
 // entry's sources.
 import { afterEach, describe, expect, it } from "vitest";
-import { FastMeshError, type LoopId, Scene, type Vec3 } from "../src/node.js";
+import { FastMeshError, type LoopId, type OffsetAlgorithm, Scene, type Vec3 } from "../src/node.js";
 
 // Two triangles on the XY plane facing +Z.
 const quad = [0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0];
@@ -1141,7 +1141,17 @@ describe("analyze and repair", () => {
     expect(s.canUndo()).toBe(false);
     const before = Float32Array.from(s.views(m).positions());
     const r = s.repair(m, { op: "offset", distance: 0.5 });
-    expect(r).toEqual({ moved: 4, maxDisplacement: 0.5, degenerateRemoved: 0, verticesRemoved: 0 });
+    expect(r).toEqual({
+      moved: 4,
+      maxDisplacement: 0.5,
+      degenerateRemoved: 0,
+      verticesRemoved: 0,
+      verticesAdded: 0,
+      trianglesAdded: 0,
+      trianglesRemoved: 0,
+      voxelSize: 0,
+      uvsDropped: false,
+    });
     const after = s.views(m).positions();
     // A flat quad wound from +z: every vertex moves exactly 0.5 up.
     for (let v = 0; v < 4; v++) {
@@ -1172,8 +1182,148 @@ describe("analyze and repair", () => {
     expect(codeOf(() => s.repair(m, { op: "offset", distance: "0.5" as never }))).toBe(
       "INVALID_ARGUMENT",
     );
+    expect(
+      codeOf(() => s.repair(m, { op: "offset", distance: 0.1, algorithm: "bogus" as never })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", voxelSize: 0 })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() =>
+        s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", voxelSize: -0.1 }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() =>
+        s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", voxelSize: Infinity }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() =>
+        s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", voxelSize: NaN }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() => s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", maxVoxels: 10 })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() =>
+        s.repair(m, { op: "offset", distance: 0.1, algorithm: "fhEdt", maxVoxels: 63.5 }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
     expect(s.canUndo()).toBe(undoable);
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(before));
+  });
+
+  it("offset_volumetric_closed_solid_fhedt_and_bvhsdf", () => {
+    // Outward-wound unit cube [0, 1]^3 (8 vertices, 12 triangles).
+    const cubePos = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const cubeTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5, 3,
+      0, 4, 3, 4, 7,
+    ];
+
+    const algorithms: readonly OffsetAlgorithm[] = ["fhEdt", "bvhSdf"];
+    for (const algorithm of algorithms) {
+      for (const [distance, voxelSize] of [
+        [0.15, 0.12],
+        [0, 0.12],
+        [-0.15, 0.1],
+        [0.15, undefined],
+      ] as const) {
+        const s = scene();
+        const m = s.addMesh(cubePos, cubeTris);
+        const r = s.repair(m, {
+          op: "offset",
+          distance,
+          algorithm,
+          voxelSize,
+          maxVoxels: voxelSize === undefined ? 64_000 : undefined,
+        });
+        expect(r.verticesAdded).toBeGreaterThan(0);
+        expect(r.trianglesAdded).toBeGreaterThan(0);
+        expect(r.trianglesRemoved).toBe(12);
+        expect(r.voxelSize).toBeGreaterThan(0);
+        if (voxelSize !== undefined) {
+          expect(r.voxelSize).toBeCloseTo(voxelSize, 6);
+        }
+        expect(r.uvsDropped).toBe(false);
+
+        const afterVerts = s.vertexCount(m);
+        const afterTris = s.triangleCount(m);
+        const a = s.analyze(m);
+        expect(a.loops.length).toBe(0);
+        expect(a.nonManifoldEdges).toBe(0);
+        expect(a.orientationConflicts).toBe(0);
+
+        // Undo restores the exact original cube counts, and redo restores the offset mesh.
+        expect(s.undo()).toBe(true);
+        expect(s.vertexCount(m)).toBe(8);
+        expect(s.triangleCount(m)).toBe(12);
+        expect(s.redo()).toBe(true);
+        expect(s.vertexCount(m)).toBe(afterVerts);
+        expect(s.triangleCount(m)).toBe(afterTris);
+      }
+    }
+  });
+
+  it("offset_volumetric_open_sheet_thickens_and_rejects_nonpositive", () => {
+    const s = scene();
+    const m = s.addMesh(quad, quadTris);
+    // Open sheet rejects distance <= 0 without touching undo history.
+    expect(
+      codeOf(() => s.repair(m, { op: "offset", distance: 0, algorithm: "fhEdt", voxelSize: 0.15 })),
+    ).toBe("INVALID_ARGUMENT");
+    expect(
+      codeOf(() =>
+        s.repair(m, { op: "offset", distance: -0.2, algorithm: "fhEdt", voxelSize: 0.15 }),
+      ),
+    ).toBe("INVALID_ARGUMENT");
+    expect(s.canUndo()).toBe(false);
+
+    // Positive distance builds a closed capsule shell around the open sheet.
+    const r = s.repair(m, { op: "offset", distance: 0.25, algorithm: "fhEdt", voxelSize: 0.15 });
+    expect(r.verticesAdded).toBeGreaterThan(0);
+    expect(r.trianglesAdded).toBeGreaterThan(0);
+    expect(r.trianglesRemoved).toBe(2);
+    expect(r.uvsDropped).toBe(false);
+    const a = s.analyze(m);
+    expect(a.loops.length).toBe(0);
+    expect(a.nonManifoldEdges).toBe(0);
+    expect(a.orientationConflicts).toBe(0);
+  });
+
+  it("offset_volumetric_drops_uvs_and_undo_restores_them", () => {
+    const cubePos = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
+    const cubeTris = [
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5, 3,
+      0, 4, 3, 4, 7,
+    ];
+    const uvs = Float32Array.from([
+      0, 0, 1, 0, 1, 1, 0, 1, 0.25, 0.25, 0.75, 0.25, 0.75, 0.75, 0.25, 0.75,
+    ]);
+    const s = scene();
+    const m = s.addMesh(cubePos, cubeTris, { uvs });
+    s.takeChanges();
+
+    const r = s.repair(m, { op: "offset", distance: 0.15, algorithm: "bvhSdf", voxelSize: 0.15 });
+    expect(r.uvsDropped).toBe(true);
+    expect(s.views(m).uvs()).toBeNull();
+    const changes = s.takeChanges();
+    expect(changes.find((c) => c.mesh === m)?.uvs).toBe("all");
+
+    expect(s.undo()).toBe(true);
+    const restored = s.views(m).uvs();
+    expect(restored).not.toBeNull();
+    const liveRestored = restored!.subarray(0, uvs.length);
+    expect(Buffer.from(liveRestored.buffer, liveRestored.byteOffset, liveRestored.byteLength)).toEqual(
+      Buffer.from(uvs.buffer, uvs.byteOffset, uvs.byteLength),
+    );
+    s.compact(m);
+    const compacted = s.views(m).uvs()!;
+    expect(Buffer.from(compacted.buffer, compacted.byteOffset, compacted.byteLength)).toEqual(
+      Buffer.from(uvs.buffer, uvs.byteOffset, uvs.byteLength),
+    );
   });
 
   it("shell_closes_an_open_mesh", () => {

@@ -4,7 +4,7 @@
 // overlays drawing those issues on the mesh, and the library's repair ops,
 // each one undo step through `store.repair`.
 // Analysis is read-only: the app calls it on its own scene.
-import type { MeshHandle, RepairOp, RepairReport, Scene } from "fast-mesh-wasm";
+import type { MeshHandle, OffsetAlgorithm, RepairOp, RepairReport, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -55,6 +55,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [cycles, setCycles] = useState(3);
   const [targetLength, setTargetLength] = useState("");
   const [maxRounds, setMaxRounds] = useState("");
+  const [offsetAlgorithm, setOffsetAlgorithm] = useState<OffsetAlgorithm>("normal");
+  const [offsetDistance, setOffsetDistance] = useState(0.5);
+  const [offsetVoxelSize, setOffsetVoxelSize] = useState("");
+  const [shellThickness, setShellThickness] = useState(1);
   const brushPick = useApp(app, (s) => s.brushPick);
   const [bridgeA, setBridgeA] = useState("");
   const [bridgeB, setBridgeB] = useState("");
@@ -329,6 +333,11 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
 
   const s = analysis?.mesh === mesh ? analysis.summary : null;
   const disabled = busy !== null;
+  const offsetLabel = offsetAlgorithm !== "normal" && offsetDistance === 0 ? "Voxel remesh" : "Offset";
+  const offsetDisabled =
+    disabled ||
+    (offsetAlgorithm === "normal" && offsetDistance === 0) ||
+    (offsetAlgorithm !== "normal" && offsetVoxelSize !== "" && !(Number(offsetVoxelSize) > 0));
   return (
     <section className="panel" aria-label="Repair" data-repair={item.name} data-tour="repair">
       <header className="panel-head">
@@ -574,6 +583,92 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Deform: inflate puffs the brush up (negative dents), smooth relaxes it, remesh retriangulates it.</p>
+      </div>
+
+      <div className="ops">
+        <div className="op">
+          <span className="op-label">Offset</span>
+          <label className="field" title="Surface offsetting or volumetric reconstruction algorithm">
+            algorithm
+            <select
+              data-offset-algorithm
+              value={offsetAlgorithm}
+              onChange={(e) => setOffsetAlgorithm(e.currentTarget.value as OffsetAlgorithm)}
+            >
+              <option value="normal">Normal displacement</option>
+              <option value="fhEdt">FH 3D EDT + Marching Cubes</option>
+              <option value="bvhSdf">BVH SDF + Marching Cubes</option>
+            </select>
+          </label>
+          <label
+            className="field"
+            title="Signed offset distance (positive outward, negative inward; 0 voxel-remeshes volumetric modes)"
+          >
+            distance ({units})
+            <LengthInput data-offset-distance mm={offsetDistance} unit={units} onMm={setOffsetDistance} />
+          </label>
+          {offsetAlgorithm !== "normal" ? (
+            <label className="field" title="Grid voxel spacing (empty: automatic bbox diagonal / 64)">
+              voxel ({units})
+              <input
+                type="number"
+                min={0}
+                step="any"
+                placeholder="auto"
+                data-offset-voxel-size
+                value={offsetVoxelSize === "" ? "" : lengthInputValue(Number(offsetVoxelSize), units)}
+                onChange={(e) => {
+                  const typed = e.currentTarget.value;
+                  setOffsetVoxelSize(typed === "" ? "" : String(fromDisplayLength(Number(typed), units)));
+                }}
+              />
+            </label>
+          ) : null}
+          <button
+            type="button"
+            data-repair-op="offset"
+            data-offset-run
+            disabled={offsetDisabled}
+            onClick={() =>
+              void run(offsetLabel, {
+                op: "offset",
+                distance: offsetDistance,
+                algorithm: offsetAlgorithm,
+                ...(offsetAlgorithm !== "normal" && offsetVoxelSize !== ""
+                  ? { voxelSize: Number(offsetVoxelSize) }
+                  : {}),
+              })
+            }
+          >
+            {offsetLabel}
+          </button>
+        </div>
+        <div className="op">
+          <span className="op-label">Shell</span>
+          <label className="field" title="Wall thickness of the hollowed or thickened shell">
+            thickness ({units})
+            <LengthInput
+              min={0}
+              data-shell-thickness
+              mm={shellThickness}
+              unit={units}
+              onMm={(mm) => setShellThickness(Math.max(0, mm))}
+            />
+          </label>
+          <button
+            type="button"
+            data-repair-op="shell"
+            data-shell-run
+            disabled={disabled || !(shellThickness > 0)}
+            onClick={() => void run("Shell", { op: "shell", thickness: shellThickness })}
+          >
+            Shell
+          </button>
+        </div>
+        <p className="muted small">
+          Offset: Normal moves existing vertices; FH 3D EDT and BVH SDF rebuild a self-intersection-free Marching Cubes
+          surface and voxel-remesh at distance 0. Shell hollows or thickens with inner walls.
+        </p>
       </div>
 
       <div className="ops">

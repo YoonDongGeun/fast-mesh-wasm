@@ -604,6 +604,9 @@ export type ClayProfile = "round" | "strips";
 /** Rotational kernel for `twist`. */
 export type TwistMethod = "vortex" | "kelvinlet";
 
+/** Surface offsetting / reconstruction algorithm for `repair(mesh, { op: "offset", ... })`. */
+export type OffsetAlgorithm = "normal" | "fhEdt" | "bvhSdf";
+
 /**
  * Composable per-vertex surface feature mask multiplied into a brush's
  * spatial falloff.
@@ -883,12 +886,27 @@ export type RepairOp =
   | {
       op: "offset";
       /**
-       * How far to move the surface along its smooth normals, in mesh units
-       * (equal to world units). Positive follows the normals (outward on an
-       * outward-wound closed mesh); negative sinks inward. Must be finite;
-       * 0 moves nothing.
+       * Offset distance in local mesh units.
+       * - `"normal"` (default): moves vertices along smooth normals (`0` moves nothing).
+       * - `"fhEdt"` / `"bvhSdf"`: on closed outward-wound solids, positive expands,
+       *   negative shrinks, and `0` voxel-remeshes at the current surface; on open
+       *   sheets, `distance > 0` builds a closed thickened shell and `distance <= 0`
+       *   throws `INVALID_ARGUMENT`. Drops UVs (`uvsDropped: true`, undoable).
        */
       distance: number;
+      /** Offsetting algorithm; defaults to `"normal"`. */
+      algorithm?: OffsetAlgorithm;
+      /**
+       * Grid spacing in local mesh units for `"fhEdt"` and `"bvhSdf"`; must be
+       * positive and finite when provided. Omit for automatic (`bbox_diag / 64`,
+       * clamped to `maxVoxels`). Ignored when `algorithm` is `"normal"`.
+       */
+      voxelSize?: number;
+      /**
+       * Maximum 3D grid voxel count (`nx * ny * nz`) for `"fhEdt"` and `"bvhSdf"`;
+       * must be an integer `>= 64`. Defaults to `16_777_216` (`256^3`).
+       */
+      maxVoxels?: number;
     }
   | {
       op: "shell";
@@ -1081,8 +1099,18 @@ export interface OffsetReport {
   maxDisplacement: number;
   /** Degenerate triangles the cleanup pass removed. */
   degenerateRemoved: number;
-  /** Vertices the cleanup pass removed. */
+  /** Vertices removed (cleanup pass for `"normal"`, replaced + cleanup for volumetric). */
   verticesRemoved: number;
+  /** New vertices added by Marching Cubes (`0` for `"normal"`). */
+  verticesAdded: number;
+  /** New triangles added by Marching Cubes (`0` for `"normal"`). */
+  trianglesAdded: number;
+  /** Original triangles replaced (`0` for `"normal"`). */
+  trianglesRemoved: number;
+  /** Voxel spacing used in local mesh units (`0` for `"normal"`). */
+  voxelSize: number;
+  /** Whether the `"uv"` channel was dropped (`false` for `"normal"` or meshes without UVs). */
+  uvsDropped: boolean;
 }
 
 /** What `shell` did. */
@@ -1653,6 +1681,7 @@ const TWIST_METHOD_CODES: Record<TwistMethod, number> = {
   vortex: 0,
   kelvinlet: 1,
 };
+const OFFSET_ALGORITHM_CODES = { normal: 0, fhEdt: 1, bvhSdf: 2 } as const;
 const SUBDIVIDE_METHOD_CODES = { loop: 0 } as const;
 
 /** An optional number for the binding: NaN when unset; an explicit NaN is rejected. */
@@ -1957,9 +1986,34 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
         );
         optionalVec3(o.axis, "axis", values);
         break;
-      case "offset":
-        values.push(optional(o.distance, "distance"));
+      case "offset": {
+        const distance = optional(o.distance, "distance");
+        const alg =
+          o.algorithm === undefined
+            ? Number.NaN
+            : codeIn(OFFSET_ALGORITHM_CODES, o.algorithm, "algorithm");
+        let voxelSize = Number.NaN;
+        if (o.voxelSize !== undefined) {
+          if (typeof o.voxelSize !== "number" || !Number.isFinite(o.voxelSize) || o.voxelSize <= 0) {
+            throw invalid("voxelSize must be positive and finite");
+          }
+          voxelSize = o.voxelSize;
+        }
+        let maxVoxels = Number.NaN;
+        if (o.maxVoxels !== undefined) {
+          if (
+            typeof o.maxVoxels !== "number" ||
+            !Number.isInteger(o.maxVoxels) ||
+            o.maxVoxels < 64 ||
+            o.maxVoxels > Number.MAX_SAFE_INTEGER
+          ) {
+            throw invalid("maxVoxels must be an integer of at least 64");
+          }
+          maxVoxels = o.maxVoxels;
+        }
+        values.push(distance, alg, voxelSize, maxVoxels);
         break;
+      }
       case "shell":
         values.push(optional(o.thickness, "thickness"));
         break;
@@ -2090,6 +2144,11 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
         maxDisplacement: r.next(),
         degenerateRemoved: r.next(),
         verticesRemoved: r.next(),
+        verticesAdded: r.next(),
+        trianglesAdded: r.next(),
+        trianglesRemoved: r.next(),
+        voxelSize: r.next(),
+        uvsDropped: r.flag(),
       };
     case "shell":
       return {

@@ -1535,6 +1535,44 @@ describe("WorkerScene", () => {
     }
   });
 
+  it("volumetric_offset_and_undo_mirrors_cleanly", async () => {
+    const { scene } = await start();
+    const s = sphere([0, 0, 0], 1, 6, 12);
+    const uvs = new Float32Array((2 * s.positions.length) / 3);
+    for (let i = 0; i < uvs.length; i++) {
+      uvs[i] = i / uvs.length;
+    }
+    const m = scene.addMesh(s.positions, s.indices, { uvs });
+    await settle(scene);
+    const beforePos = Float32Array.from(scene.views(m).positions());
+    const beforeIdx = Uint32Array.from(scene.views(m).indices());
+
+    const pending = scene.repair(m, {
+      op: "offset",
+      distance: 0.15,
+      algorithm: "fhEdt",
+      voxelSize: 0.15,
+    });
+    scene.commitFrame();
+    const r = await pending;
+    await settle(scene);
+
+    expect(r.verticesAdded).toBeGreaterThan(0);
+    expect(r.trianglesAdded).toBeGreaterThan(0);
+    expect(r.trianglesRemoved).toBe(beforeIdx.length / 3);
+    expect(r.voxelSize).toBeCloseTo(0.15, 6);
+    expect(r.uvsDropped).toBe(true);
+    expect(scene.views(m).uvs()).toBeNull();
+    await expectMirrored(scene, m);
+
+    scene.undo();
+    await settle(scene);
+    expect(scene.views(m).positions().subarray(0, beforePos.length)).toEqual(beforePos);
+    expect(scene.views(m).indices().subarray(0, beforeIdx.length)).toEqual(beforeIdx);
+    expect(scene.views(m).uvs()?.subarray(0, uvs.length)).toEqual(uvs);
+    await expectMirrored(scene, m);
+  });
+
   it("package_worker_export_resolves", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("worker.js", dist))).toBe(true);

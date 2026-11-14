@@ -331,6 +331,7 @@ dependencies = [
  "fast-mesh-bvh",
  "fast-mesh-query",
  "fast-mesh-store",
+ "robust",
 ]
 
 [[package]]
@@ -340,9 +341,11 @@ dependencies = [
  "criterion",
  "fast-mesh",
  "fast-mesh-bvh",
+ "fast-mesh-fields",
  "fast-mesh-query",
  "fast-mesh-store",
  "proptest",
+ "robust",
 ]
 
 [[package]]
