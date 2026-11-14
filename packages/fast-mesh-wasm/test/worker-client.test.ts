@@ -1573,6 +1573,55 @@ describe("WorkerScene", () => {
     await expectMirrored(scene, m);
   });
 
+  it("worker_healing_ops_and_preset_auto_repair_match_sync_and_undo", async () => {
+    const { scene } = await start();
+    const sync = new Scene();
+    try {
+      const bowtiePos = [0, 0, 0, -1, 1, 0, 1, 1, 0, -1, -1, 0, 1, -1, 0];
+      const bowtieIdx = [0, 2, 1, 0, 3, 4];
+      const uvs = [0.5, 0.5, 0, 1, 1, 1, 0, 0, 1, 0];
+      const wm = scene.addMesh(bowtiePos, bowtieIdx, { uvs });
+      const sm = sync.addMesh(bowtiePos, bowtieIdx, { uvs });
+      await settle(scene);
+
+      const pManifold = scene.repair(wm, { op: "makeManifold" });
+      scene.commitFrame();
+      const wr = await pManifold;
+      const sr = sync.repair(sm, { op: "makeManifold" });
+      await settle(scene);
+      expect(wr).toEqual(sr);
+      expect(scene.views(wm).uvs()?.subarray(10, 12)).toEqual(Float32Array.of(0.5, 0.5));
+      await expectMirrored(scene, wm);
+
+      scene.undo();
+      sync.undo();
+      await settle(scene);
+      await expectMirrored(scene, wm);
+
+      const s = sphere([0, 0, 0], 1, 6, 12);
+      for (let v = 0; v < s.positions.length; v += 3) {
+        if (s.positions[v + 2] > 0.65) {
+          s.positions[v + 2] = -s.positions[v + 2] * 1.4;
+        }
+      }
+      const wPoked = scene.addMesh(s.positions, s.indices);
+      const sPoked = sync.addMesh(s.positions, s.indices);
+      await settle(scene);
+
+      const pAuto = scene.repair(wPoked, { kind: "auto", preset: "print3d" });
+      scene.commitFrame();
+      const wAuto = await pAuto;
+      const sAuto = sync.repair(sPoked, { kind: "auto", preset: "print3d" });
+      await settle(scene);
+      expect(wAuto).toEqual(sAuto);
+      expect(wAuto.makeManifold).toBeDefined();
+      expect(wAuto.resolveSelfIntersections?.remainingPairs).toBe(0);
+      await expectMirrored(scene, wPoked);
+    } finally {
+      sync.free();
+    }
+  });
+
   it("package_worker_export_resolves", () => {
     const dist = new URL("../dist/", import.meta.url);
     expect(existsSync(new URL("worker.js", dist))).toBe(true);

@@ -4,7 +4,15 @@
 // overlays drawing those issues on the mesh, and the library's repair ops,
 // each one undo step through `store.repair`.
 // Analysis is read-only: the app calls it on its own scene.
-import type { MeshHandle, OffsetAlgorithm, RepairOp, RepairReport, Scene } from "fast-mesh-wasm";
+import type {
+  AutoRepairPreset,
+  MeshHandle,
+  OffsetAlgorithm,
+  RepairOp,
+  RepairReport,
+  Scene,
+  SelfIntersectionMode,
+} from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -16,7 +24,17 @@ import {
   AUTO_REPAIR_ANY_SIZE,
   runAutoRepairPipeline,
 } from "./auto-repair";
-import { type AnalysisSummary, describeJoin, describeReport, plural, summarize } from "./repair-summary";
+import {
+  type AnalysisSummary,
+  AUTO_REPAIR_PRESET_LABELS,
+  buildPresetAutoRepairRequest,
+  describeJoin,
+  describeReport,
+  formatPresetAutoRepairReport,
+  plural,
+  SELF_INTERSECTION_MODE_LABELS,
+  summarize,
+} from "./repair-summary";
 import { formatLength, fromDisplayLength, lengthInputValue, type LengthUnit } from "./units";
 import { LengthInput } from "./LengthInput";
 
@@ -48,6 +66,12 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [minTriangles, setMinTriangles] = useState(500);
   const [maxEdges, setMaxEdges] = useState(DEFAULT_MAX_EDGES);
   const [fair, setFair] = useState(true);
+  const [preset, setPreset] = useState<AutoRepairPreset>("general");
+  const [siOverride, setSiOverride] = useState<SelfIntersectionMode | "auto">("auto");
+  const [healSiMode, setHealSiMode] = useState<SelfIntersectionMode>("deleteAndFill");
+  const [siVoxelSize, setSiVoxelSize] = useState("");
+  const [checkSelfIntersections, setCheckSelfIntersections] = useState(false);
+  const [selfIntersects, setSelfIntersects] = useState<boolean | null>(null);
   const [center, setCenter] = useState<readonly [number, number, number]>([0, 0, 0]);
   const [brushRadius, setBrushRadius] = useState(1);
   const [strength, setStrength] = useState(1);
@@ -154,16 +178,23 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const own = useRef<{ pending: boolean; timer?: ReturnType<typeof setTimeout> }>({ pending: false });
   const weldRef = useRef(weldTolerance);
   weldRef.current = weldTolerance;
+  const checkSiRef = useRef(checkSelfIntersections);
+  checkSiRef.current = checkSelfIntersections;
 
   const analyze = useCallback(
     async (target: MeshHandle) => {
       const n = ++seq.current;
       setAnalyzing(true);
       try {
-        const a = await scene.analyze(target, { weldTolerance: weldRef.current, maxListed: MAX_LISTED });
+        const a = await scene.analyze(target, {
+          weldTolerance: weldRef.current,
+          maxListed: MAX_LISTED,
+          selfIntersection: checkSiRef.current,
+        });
         if (n === seq.current) {
           const summary = summarize(a);
           setAnalysis({ mesh: target, summary });
+          setSelfIntersects(a.selfIntersects);
           // The 3D overlay shares the raw analysis (loop vertices, edge and
           // triangle lists the summary drops); a new object refreshes it.
           app.setRepairAnalysis({ mesh: target, analysis: a });
@@ -188,6 +219,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     if (mesh === null) {
       seq.current++;
       setAnalysis(null);
+      setSelfIntersects(null);
       setAnalyzing(false);
       inspect.repair.analysis = null;
       app.setRepairAnalysis(null);
@@ -255,15 +287,48 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     own.current.pending = true;
     try {
       const settings = { weldTolerance, minTriangles, maxEdges, fair };
-      const result = await runAutoRepairPipeline(
-        {
-          analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
-          repair: (request) => store.repair(mesh, request),
-        },
-        settings,
-      );
-      setReport({ mesh, line: result.line, failed: false });
-      inspect.repair.report = result.line;
+      if (preset === "general" && siOverride === "auto") {
+        const result = await runAutoRepairPipeline(
+          {
+            analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
+            repair: (request) => store.repair(mesh, request),
+          },
+          settings,
+        );
+        setReport({ mesh, line: result.line, failed: false });
+        inspect.repair.report = result.line;
+      } else {
+        const inspectSi = checkSelfIntersections || preset === "print3d" || siOverride !== "auto";
+        const aBefore = await scene.analyze(mesh, {
+          weldTolerance,
+          maxListed: MAX_LISTED,
+          selfIntersection: inspectSi,
+        });
+        const request = buildPresetAutoRepairRequest({
+          preset,
+          selfIntersectionMode: siOverride === "auto" ? undefined : siOverride,
+          ...settings,
+          ...(siVoxelSize !== "" && Number(siVoxelSize) > 0 ? { voxelSize: Number(siVoxelSize) } : {}),
+        });
+        const r = await store.repair(mesh, request);
+        const aAfter = await scene.analyze(mesh, {
+          weldTolerance,
+          maxListed: MAX_LISTED,
+          selfIntersection: inspectSi,
+        });
+        const formatted = formatPresetAutoRepairReport(
+          preset,
+          r,
+          summarize(aBefore),
+          summarize(aAfter),
+          aBefore.selfIntersects,
+          aAfter.selfIntersects,
+          units,
+        );
+        setSelfIntersects(aAfter.selfIntersects);
+        setReport({ mesh, line: formatted.line, failed: false });
+        inspect.repair.report = formatted.line;
+      }
       void analyze(mesh);
     } catch (e) {
       const line = `Auto repair failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -353,7 +418,23 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         <p className="muted small">{analyzing ? "Analysing…" : "No analysis."}</p>
       ) : (
         <>
-          <AnalysisList summary={s} stale={analyzing} unit={units} />
+          <AnalysisList summary={s} selfIntersects={selfIntersects} stale={analyzing} unit={units} />
+          <label className="check" title="Include triangle self-intersection detection in live analysis">
+            <input
+              type="checkbox"
+              data-check-self-intersections
+              checked={checkSelfIntersections}
+              onChange={(e) => {
+                const on = e.currentTarget.checked;
+                setCheckSelfIntersections(on);
+                checkSiRef.current = on;
+                if (mesh !== null) {
+                  void analyze(mesh);
+                }
+              }}
+            />
+            Check self-intersections
+          </label>
           <OverlayToggles app={app} summary={s} />
         </>
       )}
@@ -446,17 +527,110 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </label>
         </div>
         <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
+        <div className="op">
+          <button
+            type="button"
+            data-repair-op="makeManifold"
+            disabled={disabled}
+            onClick={() => void run("Make manifold", { op: "makeManifold" })}
+          >
+            Make manifold
+          </button>
+          <button
+            type="button"
+            data-repair-op="cleanupSlivers"
+            disabled={disabled}
+            onClick={() => void run("Cleanup slivers", { op: "cleanupSlivers" })}
+          >
+            Cleanup slivers
+          </button>
+        </div>
+        <div className="op">
+          <button
+            type="button"
+            data-repair-op="resolveSelfIntersections"
+            disabled={disabled}
+            onClick={() =>
+              void run("Resolve self-intersections", {
+                op: "resolveSelfIntersections",
+                mode: healSiMode,
+                ...(healSiMode === "voxelHeal" && siVoxelSize !== "" && Number(siVoxelSize) > 0
+                  ? { voxelSize: Number(siVoxelSize) }
+                  : {}),
+              })
+            }
+          >
+            Resolve self-intersections
+          </button>
+          <label className="field" title="Self-intersection resolution mode">
+            mode
+            <select
+              data-si-mode
+              value={healSiMode}
+              onChange={(e) => setHealSiMode(e.currentTarget.value as SelfIntersectionMode)}
+            >
+              {(Object.keys(SELF_INTERSECTION_MODE_LABELS) as SelfIntersectionMode[]).map((mode) => (
+                <option key={mode} value={mode}>
+                  {SELF_INTERSECTION_MODE_LABELS[mode]}
+                </option>
+              ))}
+            </select>
+          </label>
+          {healSiMode === "voxelHeal" ? (
+            <label className="field" title="Voxel spacing (empty = automatic)">
+              voxel ({units})
+              <input
+                type="number"
+                min={0}
+                step="any"
+                placeholder="auto"
+                data-si-voxel
+                value={siVoxelSize}
+                onChange={(e) => setSiVoxelSize(e.currentTarget.value)}
+              />
+            </label>
+          ) : null}
+        </div>
       </div>
 
       <div className="ops">
         <div className="op">
+          <label className="field" title="Domain repair preset selecting pipeline stages and tolerances">
+            preset
+            <select
+              data-repair-preset
+              value={preset}
+              onChange={(e) => setPreset(e.currentTarget.value as AutoRepairPreset)}
+            >
+              {(Object.keys(AUTO_REPAIR_PRESET_LABELS) as AutoRepairPreset[]).map((p) => (
+                <option key={p} value={p}>
+                  {AUTO_REPAIR_PRESET_LABELS[p]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" title="Override self-intersection healing stage for Auto repair">
+            intersections
+            <select
+              data-repair-si-mode
+              value={siOverride}
+              onChange={(e) => setSiOverride(e.currentTarget.value as SelfIntersectionMode | "auto")}
+            >
+              <option value="auto">Preset default</option>
+              {(Object.keys(SELF_INTERSECTION_MODE_LABELS) as SelfIntersectionMode[]).map((mode) => (
+                <option key={mode} value={mode}>
+                  {SELF_INTERSECTION_MODE_LABELS[mode]}
+                </option>
+              ))}
+            </select>
+          </label>
           <button type="button" data-repair-op="autoRepair" disabled={disabled} onClick={() => void runAuto()}>
             Auto repair
           </button>
           <p className="muted small">
-            Order: weld → remove degenerate → orient → remove small components → fill holes. Uses the tolerance,
-            “below”, “max edges” and “fair” settings above; one grouped undo step (Ctrl+Z). Reports one line per
-            stage with before → after counts.
+            {preset === "general" && siOverride === "auto"
+              ? "Order: weld → remove degenerate → orient → remove small components → fill holes. Uses the tolerance, “below”, “max edges” and “fair” settings above; one grouped undo step (Ctrl+Z). Reports one line per stage with before → after counts."
+              : `Preset ${AUTO_REPAIR_PRESET_LABELS[preset]}: tailors healing stages and tolerances (${preset === "print3d" ? "watertight solid with self-intersection healing + volumetric fallback" : preset === "scan3d" ? "non-manifold healing, outlier pruning, slivers & smooth hole filling" : preset === "cadImport" ? "duplicate & non-manifold cleanup keeping sharp CAD boundaries open" : "standard 5-stage cleanup"}) in one undo step (Ctrl+Z).`}
           </p>
         </div>
       </div>
@@ -804,8 +978,13 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   );
 }
 
-function AnalysisList(props: { summary: AnalysisSummary; stale: boolean; unit: LengthUnit }) {
-  const { summary: s, stale, unit } = props;
+function AnalysisList(props: {
+  summary: AnalysisSummary;
+  selfIntersects: boolean | null;
+  stale: boolean;
+  unit: LengthUnit;
+}) {
+  const { summary: s, selfIntersects, stale, unit } = props;
   const bad = (n: number) => (n > 0 ? "warn" : undefined);
   return (
     <dl
@@ -854,6 +1033,10 @@ function AnalysisList(props: { summary: AnalysisSummary; stale: boolean; unit: L
       <dd className={bad(s.degenerate + s.duplicate)}>
         {plural(s.degenerate, "triangle")}
         {s.duplicate > 0 ? `, ${plural(s.duplicate, "duplicate")}` : ""}
+      </dd>
+      <dt>Self-intersections</dt>
+      <dd className={selfIntersects ? "warn" : undefined}>
+        {selfIntersects === null ? "not checked" : selfIntersects ? "detected" : "none"}
       </dd>
     </dl>
   );

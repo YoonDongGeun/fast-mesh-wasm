@@ -851,6 +851,54 @@ export type SculptOp =
       sharpAngle?: number;
     };
 
+/** Domain preset for {@link AutoRepairRequest}. */
+export type AutoRepairPreset = "general" | "scan3d" | "print3d" | "cadImport";
+
+/** Strategy for {@link resolveSelfIntersections} and {@link AutoRepairRequest}. */
+export type SelfIntersectionMode = "none" | "deleteAndFill" | "cutAndStitch" | "voxelHeal";
+
+/** Options for the `"makeManifold"` repair op. */
+export interface ManifoldOptions {
+  /** Remove exact duplicate triangles sharing the same unordered vertex triple. Defaults to `true`. */
+  removeDuplicates?: boolean;
+  /** Prune small dangling boundary fins attached to non-manifold edges. Defaults to `true`. */
+  pruneFins?: boolean;
+  /** Separate non-manifold edges (`> 2` incident faces) across sheets. Defaults to `true`. */
+  splitNonManifoldEdges?: boolean;
+  /** Separate pinch (bow-tie) vertices into distinct fan components. Defaults to `true`. */
+  splitPinchVertices?: boolean;
+}
+
+/** Options for the `"resolveSelfIntersections"` repair op. */
+export interface SelfIntersectOptions {
+  /** Resolution mode. Defaults to `"deleteAndFill"`. */
+  mode?: SelfIntersectionMode;
+  /** Number of 1-ring neighbor layers deleted around colliding faces (`"deleteAndFill"` and local fallback). Defaults to `1`. */
+  ringExpansion?: number;
+  /** Explicit voxel pitch in mesh units for `"voxelHeal"`. Omit for automatic sizing. */
+  voxelSize?: number;
+  /** Maximum voxel count for `"voxelHeal"` (`>= 64`). Defaults to `16_777_216` (`256^3`). */
+  maxVoxels?: number;
+  /** Optional hole boundary edge cap passed to `fillHoles`. Defaults to unbounded. */
+  maxHoleEdges?: number;
+  /** Whether hole patches in `"deleteAndFill"` are faired. Defaults to `true`. */
+  fair?: boolean;
+  /** Spatial weld tolerance for shared cut seam vertices in `"cutAndStitch"`. Defaults to `1e-5`. */
+  stitchTolerance?: number;
+}
+
+/** Options for the `"cleanupSlivers"` repair op. */
+export interface SliverOptions {
+  /** Maximum allowed circumradius-to-2-inradius aspect ratio (`>= 1`). Defaults to `20`. */
+  maxAspectRatio?: number;
+  /** Minimum interior angle threshold in degrees (`[0, 60]`). Defaults to `2`. */
+  minAngleDeg?: number;
+  /** Maximum interior angle threshold in degrees (`[60, 180]`). Defaults to `176`. */
+  maxAngleDeg?: number;
+  /** Maximum cleanup passes over the mesh. Defaults to `3`. */
+  maxIterations?: number;
+}
+
 /**
  * One repair operation for {@link Scene.repair}. Distances and areas are in
  * mesh units (equal to world units). They are converted to `f32`, so a
@@ -862,6 +910,9 @@ export type RepairOp =
   | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
   | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
   | { op: "orient" }
+  | ({ op: "makeManifold" } & ManifoldOptions)
+  | ({ op: "resolveSelfIntersections" } & SelfIntersectOptions)
+  | ({ op: "cleanupSlivers" } & SliverOptions)
   | {
       op: "fillHoles";
       maxEdges?: number;
@@ -1145,6 +1196,34 @@ export interface SubdivideReport {
   trianglesAdded: number;
 }
 
+/** What `makeManifold` did. */
+export interface ManifoldReport {
+  removedDuplicateTriangles: number;
+  prunedFinTriangles: number;
+  splitNonManifoldEdges: number;
+  splitPinchVertices: number;
+  verticesAdded: number;
+  removedVertices: number;
+}
+
+/** What `resolveSelfIntersections` did. */
+export interface SelfIntersectReport {
+  initialPairs: number;
+  remainingPairs: number;
+  removedTriangles: number;
+  addedTriangles: number;
+  modeUsed: SelfIntersectionMode;
+  uvsDropped: boolean;
+}
+
+/** What `cleanupSlivers` did. */
+export interface SliverReport {
+  collapsedNeedles: number;
+  flippedCaps: number;
+  removedDegenerate: number;
+  removedVertices: number;
+}
+
 /** Options of {@link Scene.join}. */
 export interface JoinOptions {
   /** The loop on the target, from `analyze(target).loops`. */
@@ -1321,11 +1400,19 @@ export type BooleanOp = "union" | "subtract" | "intersect";
  */
 export interface AutoRepairRequest {
   kind: "auto";
-  /** Vertices at most this far apart are welded, in mesh units. Default `1e-5`. */
+  /** Domain preset configuring stages and defaults. Defaults to `"general"`. */
+  preset?: AutoRepairPreset;
+  /** Optional self-intersection resolution override for this run. */
+  selfIntersectionMode?: SelfIntersectionMode;
+  /** Voxel spacing in mesh units for volumetric healing (`"voxelHeal"` or `"print3d"` fallback). */
+  voxelSize?: number;
+  /** Maximum voxel count (`>= 64`) for volumetric healing. Defaults to `16_777_216`. */
+  maxVoxels?: number;
+  /** Vertices at most this far apart are welded, in mesh units. Default depends on `preset` (`1e-5` for `"general"`). */
   weldTolerance?: number;
-  /** Components with fewer triangles are removed; the largest always stays. Default `500`. */
+  /** Components with fewer triangles are removed; the largest always stays. Default depends on `preset` (`500` for `"general"`). */
   minTriangles?: number;
-  /** Fill only holes with at most this many edges; `Infinity` fills any size. Default `64`. */
+  /** Fill only holes with at most this many edges; `Infinity` fills any size (`"cadImport"` preserves open boundaries unless finite). Default depends on `preset` (`64` for `"general"`). */
   maxEdges?: number;
   /** Refine and fair each fill so it follows the surrounding curvature. Default `true`. */
   fair?: boolean;
@@ -1341,6 +1428,9 @@ export interface AutoRepairReport {
   orient: OrientReport;
   removeSmallComponents: RemoveReport;
   fillHoles: FillReport;
+  makeManifold?: ManifoldReport;
+  cleanupSlivers?: SliverReport;
+  resolveSelfIntersections?: SelfIntersectReport;
 }
 
 /** The report of a {@link SculptOp}. */
@@ -1397,7 +1487,10 @@ export type RepairReport =
   | OffsetReport
   | ShellReport
   | SimplifyReport
-  | SubdivideReport;
+  | SubdivideReport
+  | ManifoldReport
+  | SelfIntersectReport
+  | SliverReport;
 
 /** The report type of a repair op. */
 export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
@@ -1408,7 +1501,13 @@ export type RepairReportOf<O extends RepairOp> = O extends { op: "weld" }
       ? RemoveReport
       : O extends { op: "orient" }
         ? OrientReport
-        : O extends { op: "fillHoles" }
+        : O extends { op: "makeManifold" }
+          ? ManifoldReport
+          : O extends { op: "resolveSelfIntersections" }
+            ? SelfIntersectReport
+            : O extends { op: "cleanupSlivers" }
+              ? SliverReport
+              : O extends { op: "fillHoles" }
           ? FillReport
           : O extends { op: "inflate" }
             ? InflateReport
@@ -1646,10 +1745,47 @@ const REPAIR_CODES = {
   crease: 20,
   clay: 21,
   twist: 22,
+  makeManifold: 23,
+  resolveSelfIntersections: 24,
+  cleanupSlivers: 25,
 } as const;
 
-/** The op code of an {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
+/** The op code of a legacy {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
 const AUTO_REPAIR_CODE = 15;
+/** The op code of an extended preset {@link AutoRepairRequest}; see `crate::edit` in the Rust crate. */
+const AUTO_REPAIR_PRESET_CODE = 26;
+
+const AUTO_STAGE_OPS: Record<number, RepairOp["op"]> = {
+  0: "weld",
+  1: "removeDegenerate",
+  2: "removeSmallComponents",
+  3: "orient",
+  4: "fillHoles",
+  23: "makeManifold",
+  24: "resolveSelfIntersections",
+  25: "cleanupSlivers",
+};
+
+const PRESET_CODES: Record<AutoRepairPreset, number> = {
+  general: 0,
+  scan3d: 1,
+  print3d: 2,
+  cadImport: 3,
+};
+
+const SELF_INTERSECTION_MODES: readonly SelfIntersectionMode[] = [
+  "none",
+  "deleteAndFill",
+  "cutAndStitch",
+  "voxelHeal",
+];
+
+const SELF_INTERSECTION_MODE_CODES: Record<SelfIntersectionMode, number> = {
+  none: 0,
+  deleteAndFill: 1,
+  cutAndStitch: 2,
+  voxelHeal: 3,
+};
 
 const FALLOFF_CODES = { linear: 0, smooth: 1 } as const;
 const INFLATE_METHOD_CODES: Record<InflateMethod, number> = {
@@ -1715,6 +1851,26 @@ function optional(v: number | undefined, what: string): number {
 
 function flagOf(v: boolean | undefined, fallback: boolean): number {
   return (v ?? fallback) ? 1 : 0;
+}
+
+function optVoxelSize(v: number | undefined): number {
+  if (v === undefined) {
+    return Number.NaN;
+  }
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    throw invalid("voxelSize must be positive and finite");
+  }
+  return v;
+}
+
+function optMaxVoxels(v: number | undefined): number {
+  if (v === undefined) {
+    return Number.NaN;
+  }
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 64 || v > Number.MAX_SAFE_INTEGER) {
+    throw invalid("maxVoxels must be an integer of at least 64");
+  }
+  return v;
 }
 
 /** A brush center as 3 values; anything else is `INVALID_ARGUMENT`. */
@@ -1992,26 +2148,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           o.algorithm === undefined
             ? Number.NaN
             : codeIn(OFFSET_ALGORITHM_CODES, o.algorithm, "algorithm");
-        let voxelSize = Number.NaN;
-        if (o.voxelSize !== undefined) {
-          if (typeof o.voxelSize !== "number" || !Number.isFinite(o.voxelSize) || o.voxelSize <= 0) {
-            throw invalid("voxelSize must be positive and finite");
-          }
-          voxelSize = o.voxelSize;
-        }
-        let maxVoxels = Number.NaN;
-        if (o.maxVoxels !== undefined) {
-          if (
-            typeof o.maxVoxels !== "number" ||
-            !Number.isInteger(o.maxVoxels) ||
-            o.maxVoxels < 64 ||
-            o.maxVoxels > Number.MAX_SAFE_INTEGER
-          ) {
-            throw invalid("maxVoxels must be an integer of at least 64");
-          }
-          maxVoxels = o.maxVoxels;
-        }
-        values.push(distance, alg, voxelSize, maxVoxels);
+        values.push(distance, alg, optVoxelSize(o.voxelSize), optMaxVoxels(o.maxVoxels));
         break;
       }
       case "shell":
@@ -2042,6 +2179,33 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
       case "captureRestSizes":
       case "captureStrokeState":
         values.push(flagOf(o.onlyIfMissing, false));
+        break;
+      case "makeManifold":
+        values.push(
+          flagOf(o.removeDuplicates, true),
+          flagOf(o.pruneFins, true),
+          flagOf(o.splitNonManifoldEdges, true),
+          flagOf(o.splitPinchVertices, true),
+        );
+        break;
+      case "resolveSelfIntersections":
+        values.push(
+          o.mode === undefined ? Number.NaN : codeIn(SELF_INTERSECTION_MODE_CODES, o.mode, "mode"),
+          optional(o.ringExpansion, "ringExpansion"),
+          optVoxelSize(o.voxelSize),
+          optMaxVoxels(o.maxVoxels),
+          optional(o.maxHoleEdges, "maxHoleEdges"),
+          flagOf(o.fair, true),
+          optional(o.stitchTolerance, "stitchTolerance"),
+        );
+        break;
+      case "cleanupSlivers":
+        values.push(
+          optional(o.maxAspectRatio, "maxAspectRatio"),
+          optional(o.minAngleDeg, "minAngleDeg"),
+          optional(o.maxAngleDeg, "maxAngleDeg"),
+          optional(o.maxIterations, "maxIterations"),
+        );
         break;
     }
   }
@@ -2175,15 +2339,43 @@ function decodeReport(op: RepairOp["op"], r: Reader): RepairReport {
     case "captureRestSizes":
     case "captureStrokeState":
       return {};
+    case "makeManifold":
+      return {
+        removedDuplicateTriangles: r.next(),
+        prunedFinTriangles: r.next(),
+        splitNonManifoldEdges: r.next(),
+        splitPinchVertices: r.next(),
+        verticesAdded: r.next(),
+        removedVertices: r.next(),
+      };
+    case "resolveSelfIntersections":
+      return {
+        initialPairs: r.next(),
+        remainingPairs: r.next(),
+        removedTriangles: r.next(),
+        addedTriangles: r.next(),
+        modeUsed: SELF_INTERSECTION_MODES[r.next()],
+        uvsDropped: r.flag(),
+      };
+    case "cleanupSlivers":
+      return {
+        collapsedNeedles: r.next(),
+        flippedCaps: r.next(),
+        removedDegenerate: r.next(),
+        removedVertices: r.next(),
+      };
   }
 }
 
 /** An auto repair's result, stage by stage in the order they ran; see `crate::edit` in the Rust crate. */
 function decodeAutoReport(r: Reader): AutoRepairReport {
-  const ops = Object.keys(REPAIR_CODES) as RepairOp["op"][];
   const stages: Partial<Record<RepairOp["op"], RepairReport>> = {};
   while (r.at < r.data.length) {
-    const op = ops[r.next()];
+    const code = r.next();
+    const op = AUTO_STAGE_OPS[code];
+    if (op === undefined) {
+      throw invalid(`unknown auto repair stage code ${code}`);
+    }
     stages[op] = decodeReport(op, r);
   }
   return stages as unknown as AutoRepairReport;
@@ -3245,14 +3437,38 @@ export class Scene implements SceneLike {
   ): RepairReport | RepairReport[] | AutoRepairReport {
     const { index, generation } = this.#id(mesh);
     if (isAutoRepair(op)) {
+      const noLoops = new Uint32Array();
+      if (
+        op.preset === undefined &&
+        op.selfIntersectionMode === undefined &&
+        op.voxelSize === undefined &&
+        op.maxVoxels === undefined
+      ) {
+        const values = Float64Array.of(
+          AUTO_REPAIR_CODE,
+          optional(op.weldTolerance, "weldTolerance"),
+          optional(op.minTriangles, "minTriangles"),
+          optional(op.maxEdges, "maxEdges"),
+          op.fair === undefined ? Number.NaN : flagOf(op.fair, true),
+        );
+        return decodeAutoReport(new Reader(call(() => this.#scene().repair(index, generation, values, noLoops))));
+      }
+      const preset = op.preset === undefined ? Number.NaN : codeIn(PRESET_CODES, op.preset, "preset");
+      const siMode =
+        op.selfIntersectionMode === undefined
+          ? Number.NaN
+          : codeIn(SELF_INTERSECTION_MODE_CODES, op.selfIntersectionMode, "selfIntersectionMode");
       const values = Float64Array.of(
-        AUTO_REPAIR_CODE,
+        AUTO_REPAIR_PRESET_CODE,
+        preset,
+        siMode,
         optional(op.weldTolerance, "weldTolerance"),
         optional(op.minTriangles, "minTriangles"),
         optional(op.maxEdges, "maxEdges"),
         op.fair === undefined ? Number.NaN : flagOf(op.fair, true),
+        optVoxelSize(op.voxelSize),
+        optMaxVoxels(op.maxVoxels),
       );
-      const noLoops = new Uint32Array();
       return decodeAutoReport(new Reader(call(() => this.#scene().repair(index, generation, values, noLoops))));
     }
     const ops: readonly RepairOp[] = Array.isArray(op) ? op : [op as RepairOp];

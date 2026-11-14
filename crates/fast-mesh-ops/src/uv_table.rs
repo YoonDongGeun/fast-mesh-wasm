@@ -1080,3 +1080,216 @@ fn volumetric_offset_drops_uvs_merges_seams_and_reverts_cleanly() {
         }
     }
 }
+
+#[test]
+fn make_manifold_duplicates_and_preserves_uvs_with_undo() {
+    let mut m = mesh_of(
+        &[
+            0.0, 0.0, 0.0, // pinch vertex
+            -1.0, 1.0, 0.0, // 1
+            1.0, 1.0, 0.0, // 2
+            -1.0, -1.0, 0.0, // 3
+            1.0, -1.0, 0.0, // 4
+        ],
+        &[[0, 2, 1], [0, 3, 4]],
+    );
+    let orig_uvs = vec![0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0];
+    m.add_uvs(&orig_uvs).unwrap();
+    let mut tx = m.begin_edit();
+    let r = crate::make_manifold(&mut tx, &crate::ManifoldOptions::default()).unwrap();
+    assert_eq!(r.split_pinch_vertices, 1);
+    assert_eq!(r.vertices_added, 1);
+    let patch = tx.commit().unwrap();
+    assert_eq!(m.vertex_count(), 6);
+    assert_eq!(&m.uvs().unwrap()[10..12], &[0.5, 0.5]);
+
+    patch.revert(&mut m).unwrap();
+    assert_eq!(m.vertex_count(), 5);
+    assert_eq!(&m.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+}
+
+#[test]
+fn cleanup_slivers_preserves_interpolated_uvs_and_undoes() {
+    let mut m = with_planar(mesh_of(
+        &[
+            0.0, 0.0, 0.0, // 0
+            2.0, 0.0, 0.0, // 1
+            0.995, 1.0, 0.0, // 2
+            1.005, 1.0, 0.0, // 3
+            0.0, 2.0, 0.0, // 4
+            2.0, 2.0, 0.0, // 5
+        ],
+        &[
+            [0, 1, 2],
+            [1, 3, 2], // needle: short edge (2, 3) length 0.01
+            [0, 2, 4],
+            [2, 5, 4],
+            [2, 3, 5], // needle: short edge (2, 3) length 0.01
+            [1, 5, 3],
+        ],
+    ));
+    let orig_uvs = m.uvs().unwrap().to_vec();
+    let orig_verts = m.vertex_count();
+    let mut tx = m.begin_edit();
+    let r = crate::cleanup_slivers(&mut tx, &crate::SliverOptions::default()).unwrap();
+    assert_eq!(r.collapsed_needles, 1);
+    let patch = tx.commit().unwrap();
+    for v in alive(&m) {
+        let p = m.position(v).unwrap();
+        let got = uv_of(&m, v);
+        let want = planar(p);
+        assert!(
+            (got[0] - want[0]).abs() < 1e-4 && (got[1] - want[1]).abs() < 1e-4,
+            "uv drifted at v={v}: got={got:?} want={want:?}"
+        );
+    }
+
+    patch.revert(&mut m).unwrap();
+    assert_eq!(m.vertex_count(), orig_verts);
+    assert_eq!(&m.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+}
+
+#[test]
+fn resolve_self_intersections_uv_contract_and_undo() {
+    // 1) DeleteAndFill preserves UVs & undoes.
+    let mut poked = uv_sphere(12, 8, 1.0);
+    // Invert a pole region into the sphere so opposite triangles intersect.
+    edit(&mut poked, |tx| {
+        let mut moved = Vec::new();
+        for v in 0..tx.mesh().vertex_slots() as u32 {
+            if let Some(p) = tx.mesh().position(v)
+                && p[2] > 0.65
+            {
+                moved.push((v, [p[0], p[1], -p[2] * 1.4]));
+            }
+        }
+        let ids: Vec<u32> = moved.iter().map(|(v, _)| *v).collect();
+        let pos: Vec<[f32; 3]> = moved.iter().map(|(_, p)| *p).collect();
+        tx.set_positions(&ids, &pos)?;
+        Ok(())
+    });
+    let mut poked = with_planar(poked);
+    let orig_uvs = poked.uvs().unwrap().to_vec();
+    let mut tx = poked.begin_edit();
+    let r = crate::resolve_self_intersections(
+        &mut tx,
+        None,
+        &crate::SelfIntersectOptions::builder()
+            .mode(crate::SelfIntersectionMode::DeleteAndFill)
+            .build(),
+    )
+    .unwrap();
+    assert!(!r.uvs_dropped);
+    assert!(r.initial_pairs > 0);
+    assert!(tx.mesh().uvs().is_some());
+    let patch = tx.commit().unwrap();
+    patch.revert(&mut poked).unwrap();
+    assert_eq!(&poked.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+
+    // 2) CutAndStitch keeps/interpolates planar UVs on split vertices.
+    let mut crossed = with_planar(mesh_of(
+        &[
+            // Tri A in z = 0
+            -1.0, -1.0, 0.0, // 0
+            1.0, -1.0, 0.0, // 1
+            0.0, 1.0, 0.0, // 2
+            // Tri B crossing through z = 0 along y = 0, x in [-0.6, 0.6]
+            -0.6, 0.0, -0.5, // 3
+            0.6, 0.0, -0.5, // 4
+            0.0, 0.0, 0.5, // 5
+        ],
+        &[[0, 1, 2], [3, 4, 5]],
+    ));
+    let orig_crossed_uvs = crossed.uvs().unwrap().to_vec();
+    let mut tx = crossed.begin_edit();
+    let r = crate::resolve_self_intersections(
+        &mut tx,
+        None,
+        &crate::SelfIntersectOptions::builder()
+            .mode(crate::SelfIntersectionMode::CutAndStitch)
+            .build(),
+    )
+    .unwrap();
+    assert!(!r.uvs_dropped);
+    assert!(r.initial_pairs > 0);
+    let patch = tx.commit().unwrap();
+    assert!(crossed.uvs().is_some());
+    patch.revert(&mut crossed).unwrap();
+    assert_eq!(
+        &crossed.uvs().unwrap()[..orig_crossed_uvs.len()],
+        &orig_crossed_uvs[..]
+    );
+
+    // 3) VoxelHeal drops UVs explicitly and restores them on undo.
+    let mut b = box_of_faces();
+    let orig_box_uvs = b.uvs().unwrap().to_vec();
+    let mut tx = b.begin_edit();
+    let r = crate::resolve_self_intersections(
+        &mut tx,
+        None,
+        &crate::SelfIntersectOptions::builder()
+            .mode(crate::SelfIntersectionMode::VoxelHeal)
+            .voxel_size(Some(0.12))
+            .build(),
+    )
+    .unwrap();
+    assert!(r.uvs_dropped);
+    assert!(tx.mesh().uvs().is_none());
+    let patch = tx.commit().unwrap();
+    assert!(b.uvs().is_none());
+    patch.revert(&mut b).unwrap();
+    assert_eq!(&b.uvs().unwrap()[..orig_box_uvs.len()], &orig_box_uvs[..]);
+}
+
+#[test]
+fn auto_repair_presets_uv_contract() {
+    // Scan3D & CadImport preserve UVs on clean/seamed meshes and undo cleanly.
+    for preset in [
+        crate::AutoRepairPreset::Scan3D,
+        crate::AutoRepairPreset::CadImport,
+    ] {
+        let mut m = two_charts(Some((1, 1)));
+        let orig_uvs = m.uvs().unwrap().to_vec();
+        let mut tx = m.begin_edit();
+        let r = auto_repair(
+            &mut tx,
+            &AutoRepairOptions::builder()
+                .preset(preset)
+                .fair(false)
+                .build(),
+        )
+        .unwrap();
+        assert!(
+            !r.self_intersections
+                .as_ref()
+                .is_some_and(|si| si.uvs_dropped)
+        );
+        let patch = tx.commit().unwrap();
+        assert!(m.uvs().is_some());
+        patch.revert(&mut m).unwrap();
+        assert_eq!(&m.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+    }
+
+    // Print3D explicitly records uvs_dropped when VoxelHeal runs (directly or on fallback).
+    let mut b = box_of_faces();
+    let orig_uvs = b.uvs().unwrap().to_vec();
+    let mut tx = b.begin_edit();
+    let r = auto_repair(
+        &mut tx,
+        &AutoRepairOptions::builder()
+            .preset(crate::AutoRepairPreset::Print3D)
+            .self_intersection_mode(Some(crate::SelfIntersectionMode::VoxelHeal))
+            .voxel_size(Some(0.12))
+            .build(),
+    )
+    .unwrap();
+    assert!(
+        r.self_intersections
+            .as_ref()
+            .is_some_and(|si| si.uvs_dropped)
+    );
+    let patch = tx.commit().unwrap();
+    assert!(b.uvs().is_none());
+    patch.revert(&mut b).unwrap();
+    assert_eq!(&b.uvs().unwrap()[..orig_uvs.len()], &orig_uvs[..]);
+}

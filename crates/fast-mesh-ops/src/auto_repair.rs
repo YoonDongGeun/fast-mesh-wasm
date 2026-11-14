@@ -1,10 +1,19 @@
 //! The standard cleanup pipeline as one call.
 
-use fast_mesh_store::Transaction;
+use fast_mesh_fields::DEFAULT_MAX_VOXELS;
+use fast_mesh_store::{Mesh, Transaction};
 
+use crate::repair::manifold::{ManifoldOptions, ManifoldReport, make_manifold};
+use crate::repair::presets::AutoRepairPreset;
+use crate::repair::self_intersect::{
+    SelfIntersectOptions, SelfIntersectReport, SelfIntersectionMode, find_self_intersecting_pairs,
+    resolve_self_intersections, voxel_heal_surface,
+};
+use crate::repair::sliver::{SliverOptions, SliverReport, cleanup_slivers};
+use crate::topology::{EdgeMap, pinch_vertices};
 use crate::{
     ComponentOptions, DegenerateOptions, DegenerateReport, FillOptions, FillReport, OrientReport,
-    RemoveReport, Result, WeldReport,
+    RemoveReport, Result, WeldReport, push,
 };
 
 /// Options for [`auto_repair()`].
@@ -14,14 +23,27 @@ pub struct AutoRepairOptions {
     /// `1e-5`.
     pub weld_tolerance: f32,
     /// Components with fewer triangles are removed; the largest component
-    /// always stays. Default `500`.
+    /// always stays. Default `500`. (`0` skips small-component pruning.)
     pub min_triangles: usize,
     /// Fill only holes with at most this many edges; `None` fills any size,
-    /// an open mesh's outer boundary included. Default `Some(64)`.
+    /// an open mesh's outer boundary included (under [`AutoRepairPreset::CadImport`],
+    /// `None` leaves boundaries open). Default `Some(64)`.
     pub max_edges: Option<usize>,
     /// Refine and fair each fill so that it continues the surrounding
     /// curvature ([`FillOptions::fair`]). Default `true`.
     pub fair: bool,
+    /// Domain preset configuring pipeline stages and default parameters.
+    /// Default [`AutoRepairPreset::General`].
+    pub preset: AutoRepairPreset,
+    /// Optional self-intersection resolution override. When `None`, follows
+    /// the preset default (`None` for `General`/`Scan3D`/`CadImport`,
+    /// `DeleteAndFill` with `VoxelHeal` fallback for `Print3D`).
+    pub self_intersection_mode: Option<SelfIntersectionMode>,
+    /// Optional explicit voxel pitch for [`SelfIntersectionMode::VoxelHeal`]
+    /// (including `Print3D` volumetric fallback).
+    pub voxel_size: Option<f32>,
+    /// Maximum voxel budget for volumetric healing. Default [`DEFAULT_MAX_VOXELS`].
+    pub max_voxels: usize,
 }
 
 impl Default for AutoRepairOptions {
@@ -31,11 +53,20 @@ impl Default for AutoRepairOptions {
             min_triangles: 500,
             max_edges: Some(64),
             fair: true,
+            preset: AutoRepairPreset::General,
+            self_intersection_mode: None,
+            voxel_size: None,
+            max_voxels: DEFAULT_MAX_VOXELS,
         }
     }
 }
 
 impl AutoRepairOptions {
+    /// Options initialized with the defaults of `preset`.
+    pub fn for_preset(preset: AutoRepairPreset) -> Self {
+        preset.default_options()
+    }
+
     /// A builder for [`AutoRepairOptions`]: every option unset, as
     /// [`Default`], until set.
     pub fn builder() -> AutoRepairOptionsBuilder {
@@ -47,30 +78,91 @@ impl AutoRepairOptions {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AutoRepairOptionsBuilder {
     options: AutoRepairOptions,
+    weld_set: bool,
+    min_set: bool,
+    max_set: bool,
+    fair_set: bool,
+    si_set: bool,
+    voxel_set: bool,
+    max_voxels_set: bool,
 }
 
 impl AutoRepairOptionsBuilder {
+    /// Selects a domain [`AutoRepairPreset`], applying its defaults to any
+    /// unset option while preserving previously overridden fields.
+    pub fn preset(mut self, preset: AutoRepairPreset) -> Self {
+        let mut base = preset.default_options();
+        if self.weld_set {
+            base.weld_tolerance = self.options.weld_tolerance;
+        }
+        if self.min_set {
+            base.min_triangles = self.options.min_triangles;
+        }
+        if self.max_set {
+            base.max_edges = self.options.max_edges;
+        }
+        if self.fair_set {
+            base.fair = self.options.fair;
+        }
+        if self.si_set {
+            base.self_intersection_mode = self.options.self_intersection_mode;
+        }
+        if self.voxel_set {
+            base.voxel_size = self.options.voxel_size;
+        }
+        if self.max_voxels_set {
+            base.max_voxels = self.options.max_voxels;
+        }
+        self.options = base;
+        self
+    }
+
     /// Vertices at most this far apart are welded, in local units.
     pub fn weld_tolerance(mut self, weld_tolerance: f32) -> Self {
         self.options.weld_tolerance = weld_tolerance;
+        self.weld_set = true;
         self
     }
 
     /// Components with fewer triangles are removed.
     pub fn min_triangles(mut self, min_triangles: usize) -> Self {
         self.options.min_triangles = min_triangles;
+        self.min_set = true;
         self
     }
 
     /// Fill only holes with at most this many edges; `None` fills any size.
     pub fn max_edges(mut self, max_edges: Option<usize>) -> Self {
         self.options.max_edges = max_edges;
+        self.max_set = true;
         self
     }
 
     /// Whether to refine and fair each fill.
     pub fn fair(mut self, fair: bool) -> Self {
         self.options.fair = fair;
+        self.fair_set = true;
+        self
+    }
+
+    /// Override self-intersection resolution mode.
+    pub fn self_intersection_mode(mut self, mode: Option<SelfIntersectionMode>) -> Self {
+        self.options.self_intersection_mode = mode;
+        self.si_set = true;
+        self
+    }
+
+    /// Explicit voxel size for [`SelfIntersectionMode::VoxelHeal`].
+    pub fn voxel_size(mut self, voxel_size: Option<f32>) -> Self {
+        self.options.voxel_size = voxel_size;
+        self.voxel_set = true;
+        self
+    }
+
+    /// Maximum voxel budget for [`SelfIntersectionMode::VoxelHeal`].
+    pub fn max_voxels(mut self, max_voxels: usize) -> Self {
+        self.options.max_voxels = max_voxels;
+        self.max_voxels_set = true;
         self
     }
 
@@ -93,6 +185,12 @@ pub struct AutoRepairReport {
     pub components: RemoveReport,
     /// The fill-holes stage.
     pub fill: FillReport,
+    /// Non-manifold healing stage, when run.
+    pub manifold: Option<ManifoldReport>,
+    /// Sliver cleanup stage, when run.
+    pub slivers: Option<SliverReport>,
+    /// Self-intersection resolution stage, when run.
+    pub self_intersections: Option<SelfIntersectReport>,
 }
 
 /// One stage's report in an [`AutoRepairReport`].
@@ -108,11 +206,16 @@ pub enum AutoRepairStage<'a> {
     Components(&'a RemoveReport),
     /// The fill-holes stage.
     Fill(&'a FillReport),
+    /// The make-manifold stage.
+    Manifold(&'a ManifoldReport),
+    /// The cleanup-slivers stage.
+    Slivers(&'a SliverReport),
+    /// The resolve-self-intersections stage.
+    SelfIntersections(&'a SelfIntersectReport),
 }
 
 impl AutoRepairReport {
-    /// The stages' reports in the order they ran, for showing them without
-    /// repeating that order.
+    /// The core five stages' reports in legacy pipeline order.
     pub fn stages(&self) -> [AutoRepairStage<'_>; 5] {
         [
             AutoRepairStage::Weld(&self.weld),
@@ -122,14 +225,139 @@ impl AutoRepairReport {
             AutoRepairStage::Fill(&self.fill),
         ]
     }
+
+    /// Every stage report that ran for `options`, in execution order.
+    pub fn executed_stages(&self, options: &AutoRepairOptions) -> Result<Vec<AutoRepairStage<'_>>> {
+        let mut out = Vec::new();
+        push(&mut out, AutoRepairStage::Weld(&self.weld))?;
+        push(&mut out, AutoRepairStage::Degenerate(&self.degenerate))?;
+        match options.preset {
+            AutoRepairPreset::General => {
+                if let Some(m) = &self.manifold {
+                    push(&mut out, AutoRepairStage::Manifold(m))?;
+                }
+                push(&mut out, AutoRepairStage::Orient(&self.orient))?;
+                push(&mut out, AutoRepairStage::Components(&self.components))?;
+                if let Some(s) = &self.slivers {
+                    push(&mut out, AutoRepairStage::Slivers(s))?;
+                }
+                push(&mut out, AutoRepairStage::Fill(&self.fill))?;
+                if let Some(si) = &self.self_intersections {
+                    push(&mut out, AutoRepairStage::SelfIntersections(si))?;
+                }
+            }
+            AutoRepairPreset::Scan3D => {
+                if let Some(m) = &self.manifold {
+                    push(&mut out, AutoRepairStage::Manifold(m))?;
+                }
+                push(&mut out, AutoRepairStage::Components(&self.components))?;
+                push(&mut out, AutoRepairStage::Orient(&self.orient))?;
+                if let Some(s) = &self.slivers {
+                    push(&mut out, AutoRepairStage::Slivers(s))?;
+                }
+                push(&mut out, AutoRepairStage::Fill(&self.fill))?;
+                if let Some(si) = &self.self_intersections {
+                    push(&mut out, AutoRepairStage::SelfIntersections(si))?;
+                }
+            }
+            AutoRepairPreset::Print3D => {
+                if let Some(m) = &self.manifold {
+                    push(&mut out, AutoRepairStage::Manifold(m))?;
+                }
+                push(&mut out, AutoRepairStage::Components(&self.components))?;
+                push(&mut out, AutoRepairStage::Orient(&self.orient))?;
+                push(&mut out, AutoRepairStage::Fill(&self.fill))?;
+                if let Some(si) = &self.self_intersections {
+                    push(&mut out, AutoRepairStage::SelfIntersections(si))?;
+                }
+            }
+            AutoRepairPreset::CadImport => {
+                if let Some(m) = &self.manifold {
+                    push(&mut out, AutoRepairStage::Manifold(m))?;
+                }
+                push(&mut out, AutoRepairStage::Orient(&self.orient))?;
+                if let Some(s) = &self.slivers {
+                    push(&mut out, AutoRepairStage::Slivers(s))?;
+                }
+                if options.max_edges.is_some()
+                    || !self.fill.filled.is_empty()
+                    || !self.fill.skipped.is_empty()
+                    || !self.fill.failed.is_empty()
+                {
+                    push(&mut out, AutoRepairStage::Fill(&self.fill))?;
+                }
+                if let Some(si) = &self.self_intersections {
+                    push(&mut out, AutoRepairStage::SelfIntersections(si))?;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Repairs a mesh with the standard cleanup pipeline: [`weld()`](crate::weld)
-/// → [`remove_degenerate()`](crate::remove_degenerate) →
-/// [`orient()`](crate::orient) →
-/// [`remove_small_components()`](crate::remove_small_components) →
-/// [`fill_holes()`](crate::fill_holes), all in `tx`, so committing it makes
-/// one undo step.
+fn is_closed_manifold(mesh: &Mesh) -> Result<bool> {
+    if mesh.triangle_count() == 0 {
+        return Ok(false);
+    }
+    let edges = EdgeMap::build(mesh)?;
+    if edges.len() == 0 {
+        return Ok(false);
+    }
+    for (_, tris) in edges.edges() {
+        if tris.len() != 2 {
+            return Ok(false);
+        }
+    }
+    Ok(pinch_vertices(mesh, &edges)?.is_empty())
+}
+
+fn run_small_components(tx: &mut Transaction, min_triangles: usize) -> Result<RemoveReport> {
+    if min_triangles == 0 {
+        return Ok(RemoveReport::default());
+    }
+    crate::remove_small_components(
+        tx,
+        &ComponentOptions {
+            min_triangles: Some(min_triangles),
+            ..ComponentOptions::default()
+        },
+    )
+}
+
+fn run_fill(tx: &mut Transaction, max_edges: Option<usize>, fair: bool) -> Result<FillReport> {
+    crate::fill_holes(
+        tx,
+        &FillOptions {
+            // The fill needs a bound: "any size" is one that every loop meets.
+            max_edges: Some(max_edges.unwrap_or(usize::MAX)),
+            fair,
+            ..FillOptions::default()
+        },
+    )
+}
+
+fn run_self_intersection_stage(
+    tx: &mut Transaction,
+    options: &AutoRepairOptions,
+    mode: SelfIntersectionMode,
+) -> Result<SelfIntersectReport> {
+    resolve_self_intersections(
+        tx,
+        None,
+        &SelfIntersectOptions {
+            mode,
+            voxel_size: options.voxel_size,
+            max_voxels: options.max_voxels,
+            max_hole_edges: options.max_edges,
+            fair: options.fair,
+            ..SelfIntersectOptions::default()
+        },
+    )
+}
+
+/// Repairs a mesh with either the backward-compatible cleanup pipeline
+/// ([`AutoRepairPreset::General`]) or a domain-tailored preset (`Scan3D`,
+/// `Print3D`, `CadImport`), all in `tx`, so committing it makes one undo step.
 ///
 /// The order matters: welding stitches coincident vertices and can leave
 /// duplicate triangles for the next stage, orienting makes hole rims clean
@@ -168,30 +396,125 @@ impl AutoRepairReport {
 pub fn auto_repair(tx: &mut Transaction, options: &AutoRepairOptions) -> Result<AutoRepairReport> {
     let weld = crate::weld(tx, options.weld_tolerance)?;
     let degenerate = crate::remove_degenerate(tx, &DegenerateOptions::default())?;
-    let orient = crate::orient(tx)?;
-    let components = crate::remove_small_components(
-        tx,
-        &ComponentOptions {
-            min_triangles: Some(options.min_triangles),
-            ..ComponentOptions::default()
-        },
-    )?;
-    let fill = crate::fill_holes(
-        tx,
-        &FillOptions {
-            // The fill needs a bound: "any size" is one that every loop meets.
-            max_edges: Some(options.max_edges.unwrap_or(usize::MAX)),
-            fair: options.fair,
-            ..FillOptions::default()
-        },
-    )?;
-    Ok(AutoRepairReport {
-        weld,
-        degenerate,
-        orient,
-        components,
-        fill,
-    })
+
+    match options.preset {
+        AutoRepairPreset::General => {
+            let orient = crate::orient(tx)?;
+            let components = run_small_components(tx, options.min_triangles)?;
+            let fill = run_fill(tx, options.max_edges, options.fair)?;
+            let self_intersections = match options.self_intersection_mode {
+                Some(mode) if mode != SelfIntersectionMode::None => {
+                    Some(run_self_intersection_stage(tx, options, mode)?)
+                }
+                _ => None,
+            };
+            Ok(AutoRepairReport {
+                weld,
+                degenerate,
+                orient,
+                components,
+                fill,
+                manifold: None,
+                slivers: None,
+                self_intersections,
+            })
+        }
+        AutoRepairPreset::Scan3D => {
+            let manifold = make_manifold(tx, &ManifoldOptions::default())?;
+            let components = run_small_components(tx, options.min_triangles)?;
+            let orient = crate::orient(tx)?;
+            let slivers = cleanup_slivers(tx, &SliverOptions::default())?;
+            let fill = run_fill(tx, options.max_edges, options.fair)?;
+            let self_intersections = match options.self_intersection_mode {
+                Some(mode) if mode != SelfIntersectionMode::None => {
+                    Some(run_self_intersection_stage(tx, options, mode)?)
+                }
+                _ => None,
+            };
+            Ok(AutoRepairReport {
+                weld,
+                degenerate,
+                orient,
+                components,
+                fill,
+                manifold: Some(manifold),
+                slivers: Some(slivers),
+                self_intersections,
+            })
+        }
+        AutoRepairPreset::Print3D => {
+            let manifold = make_manifold(tx, &ManifoldOptions::default())?;
+            let components = run_small_components(tx, options.min_triangles)?;
+            let mut orient_r = crate::orient(tx)?;
+            let fill = run_fill(tx, options.max_edges, options.fair)?;
+            let post_fill_orient = crate::orient(tx)?;
+            orient_r.flipped_triangles += post_fill_orient.flipped_triangles;
+            orient_r.flipped_outward_components += post_fill_orient.flipped_outward_components;
+
+            let mode = options
+                .self_intersection_mode
+                .unwrap_or(SelfIntersectionMode::DeleteAndFill);
+            let self_intersections = if mode == SelfIntersectionMode::None {
+                Some(run_self_intersection_stage(tx, options, mode)?)
+            } else {
+                let mut si = run_self_intersection_stage(tx, options, mode)?;
+                let needs_voxel_fallback = mode != SelfIntersectionMode::VoxelHeal
+                    && (si.remaining_pairs > 0 || !is_closed_manifold(tx.mesh())?)
+                    && tx.mesh().triangle_count() > 0;
+                if needs_voxel_fallback {
+                    let (r_vox, a_vox, dropped) =
+                        voxel_heal_surface(tx, options.voxel_size, options.max_voxels)?;
+                    si.removed_triangles += r_vox;
+                    si.added_triangles += a_vox;
+                    si.uvs_dropped |= dropped;
+                    si.mode_used = SelfIntersectionMode::VoxelHeal;
+                    si.remaining_pairs = find_self_intersecting_pairs(tx.mesh(), None)?.len();
+                }
+                let final_orient = crate::orient(tx)?;
+                orient_r.flipped_triangles += final_orient.flipped_triangles;
+                orient_r.flipped_outward_components += final_orient.flipped_outward_components;
+                Some(si)
+            };
+
+            Ok(AutoRepairReport {
+                weld,
+                degenerate,
+                orient: orient_r,
+                components,
+                fill,
+                manifold: Some(manifold),
+                slivers: None,
+                self_intersections,
+            })
+        }
+        AutoRepairPreset::CadImport => {
+            let manifold = make_manifold(tx, &ManifoldOptions::default())?;
+            let components = run_small_components(tx, options.min_triangles)?;
+            let orient = crate::orient(tx)?;
+            let slivers = cleanup_slivers(tx, &SliverOptions::default())?;
+            let fill = if let Some(limit) = options.max_edges {
+                run_fill(tx, Some(limit), false)?
+            } else {
+                FillReport::default()
+            };
+            let self_intersections = match options.self_intersection_mode {
+                Some(mode) if mode != SelfIntersectionMode::None => {
+                    Some(run_self_intersection_stage(tx, options, mode)?)
+                }
+                _ => None,
+            };
+            Ok(AutoRepairReport {
+                weld,
+                degenerate,
+                orient,
+                components,
+                fill,
+                manifold: Some(manifold),
+                slivers: Some(slivers),
+                self_intersections,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +553,7 @@ mod tests {
                 min_triangles: 3,
                 max_edges: None,
                 fair: false,
+                ..AutoRepairOptions::default()
             }
         );
     }
@@ -259,6 +583,7 @@ mod tests {
                         ..FillOptions::default()
                     },
                 )?,
+                ..AutoRepairReport::default()
             })
         });
         assert_eq!(r, expected);
@@ -384,5 +709,89 @@ mod tests {
             assert_eq!(parts(&mesh), before, "failure point {n}");
             n += 1;
         }
+    }
+
+    #[test]
+    fn preset_scan3d_heals_manifold_slivers_and_holes() {
+        let mut mesh = damaged_sphere();
+        // Also attach a dangling non-manifold fin to verify Scan3D invokes make_manifold.
+        edit(&mut mesh, |tx| {
+            let v = tx.add_vertices(&[[0.0, 3.0, 0.0]])?;
+            tx.add_triangles(&[[10, 11, v[0]]])?;
+            Ok(())
+        });
+        let opts = AutoRepairOptions::for_preset(AutoRepairPreset::Scan3D);
+        let (r, _) = edit(&mut mesh, |tx| auto_repair(tx, &opts));
+        assert!(r.manifold.is_some());
+        assert!(r.slivers.is_some());
+        assert!(r.self_intersections.is_none());
+        let a = crate::analyze::analyze(&mesh, &crate::analyze::AnalyzeOptions::default()).unwrap();
+        assert_eq!(a.non_manifold_edges, 0);
+        assert!(a.pinch_vertices.is_empty());
+        assert!(a.loops.is_empty());
+    }
+
+    #[test]
+    fn preset_print3d_produces_watertight_self_intersection_free_mesh() {
+        let mut mesh = crate::test_util::crossed_boxes();
+        let opts = AutoRepairOptions::builder()
+            .preset(AutoRepairPreset::Print3D)
+            .voxel_size(Some(0.15))
+            .build();
+        let (r, _) = edit(&mut mesh, |tx| auto_repair(tx, &opts));
+        assert!(r.manifold.is_some());
+        let si = r
+            .self_intersections
+            .expect("Print3D resolves self-intersections");
+        assert_eq!(si.remaining_pairs, 0);
+        let bvh =
+            fast_mesh_bvh::Bvh::build(&mesh, &fast_mesh_bvh::BuildOptions::default()).unwrap();
+        let a = crate::analyze::analyze(
+            &mesh,
+            &crate::analyze::AnalyzeOptions {
+                self_intersection: Some(&bvh),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(a.non_manifold_edges, 0);
+        assert!(a.pinch_vertices.is_empty());
+        assert!(a.loops.is_empty());
+        assert_eq!(a.self_intersects, Some(false));
+    }
+
+    #[test]
+    fn preset_cad_import_preserves_open_boundaries_and_respects_max_edges() {
+        // Open box (top face removed = 4-edge boundary loop) + dangling fin.
+        let cells: Vec<(u32, u32)> = (1..3).flat_map(|y| (1..3).map(move |x| (x, y))).collect();
+        let mut open_grid = grid_without(6, &cells);
+        let opts_open = AutoRepairOptions::for_preset(AutoRepairPreset::CadImport);
+        let (r_open, _) = edit(&mut open_grid, |tx| auto_repair(tx, &opts_open));
+        assert!(r_open.manifold.is_some());
+        assert!(r_open.slivers.is_some());
+        assert!(r_open.fill.filled.is_empty());
+        // Both inner 8-edge hole and outer 24-edge boundary remain open.
+        assert_eq!(
+            crate::analyze::analyze(&open_grid, &crate::analyze::AnalyzeOptions::default())
+                .unwrap()
+                .loops
+                .len(),
+            2
+        );
+
+        // Bounded max_edges fills only the small inner hole, leaving outer boundary open.
+        let opts_bounded = AutoRepairOptions::builder()
+            .preset(AutoRepairPreset::CadImport)
+            .max_edges(Some(10))
+            .build();
+        let (r_bounded, _) = edit(&mut open_grid, |tx| auto_repair(tx, &opts_bounded));
+        assert_eq!(r_bounded.fill.filled.len(), 1);
+        assert_eq!(
+            crate::analyze::analyze(&open_grid, &crate::analyze::AnalyzeOptions::default())
+                .unwrap()
+                .loops
+                .len(),
+            1
+        );
     }
 }

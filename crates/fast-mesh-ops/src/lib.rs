@@ -81,6 +81,7 @@ mod orient;
 pub mod protect;
 mod refine;
 pub mod remesh;
+pub mod repair;
 pub mod sculpt;
 pub mod simplify;
 mod sparse;
@@ -119,6 +120,12 @@ pub use offset::{
 };
 pub use orient::{OrientReport, orient};
 pub use protect::{check_protection, with_protection, with_protection_band};
+pub use repair::{
+    AutoRepairPreset, ManifoldOptions, ManifoldOptionsBuilder, ManifoldReport,
+    SelfIntersectOptions, SelfIntersectOptionsBuilder, SelfIntersectReport, SelfIntersectionMode,
+    SliverOptions, SliverOptionsBuilder, SliverReport, cleanup_slivers, make_manifold,
+    resolve_self_intersections,
+};
 pub use sculpt::{
     Brush, ClayOptions, ClayOptionsBuilder, ClayProfile, ClayReport, CreaseOptions,
     CreaseOptionsBuilder, CreaseReport, Falloff, FlattenMode, FlattenOptions,
