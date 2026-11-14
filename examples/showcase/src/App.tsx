@@ -22,15 +22,55 @@ import { ExportPanel } from "./panels/ExportPanel";
 import { GroupsBar } from "./panels/GroupsBar";
 import { HelpOverlay, TourCard } from "./panels/Help";
 import { HoverTip } from "./panels/HoverTip";
+import { AlignPanel } from "./panels/AlignPanel";
 import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
+import { ModelingPanel } from "./panels/ModelingPanel";
 import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
+import { TransformPanel } from "./panels/TransformPanel";
 import { DEFAULT_SIDEBAR_WIDTH } from "./panels/settings";
 import { StatusBar } from "./panels/StatusBar";
 import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
 import { domainMatchesPanel, WorkbenchDomains, type WorkbenchDomainId } from "./panels/WorkbenchDomains";
-import { type AppState, useApp } from "./scene/app-state";
+import { type AppState, type CameraPreset, useApp } from "./scene/app-state";
+
+const CAMERA_PRESETS: readonly { id: CameraPreset; label: string }[] = [
+  { id: "front", label: "Front" },
+  { id: "back", label: "Back" },
+  { id: "left", label: "Left" },
+  { id: "right", label: "Right" },
+  { id: "top", label: "Top" },
+  { id: "bottom", label: "Bottom" },
+];
+
+function CameraToolbarGroup({ app }: { app: AppState }) {
+  const projection = useApp(app, (s) => s.cameraProjection);
+  return (
+    <div className="group camera-group" aria-label="Camera views and projection">
+      {CAMERA_PRESETS.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          data-camera-preset={p.id}
+          onClick={() => app.requestCameraPreset(p.id)}
+          title={`${p.label} view`}
+        >
+          {p.label}
+        </button>
+      ))}
+      <button
+        type="button"
+        data-action="camera-projection"
+        aria-pressed={projection === "orthographic"}
+        onClick={() => app.toggleCameraProjection()}
+        title="Toggle Perspective / Orthographic projection"
+      >
+        {projection === "perspective" ? "Perspective" : "Orthographic"}
+      </button>
+    </div>
+  );
+}
 import { selectMesh } from "./scene/selection";
 import { SculptToolbox } from "./viewport/Toolbox";
 import { afterStroke } from "./viewport/view";
@@ -265,6 +305,8 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         setMode("translate");
       } else if (key === "r") {
         setMode("rotate");
+      } else if (key === "s") {
+        setMode("scale");
       } else if (key === "f" && selection !== null) {
         focusOn(selection);
       } else if (key === "w") {
@@ -377,10 +419,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             <button type="button" aria-pressed={mode === "rotate"} onClick={() => setMode("rotate")} title="Rotate (R)">
               Rotate <kbd>R</kbd>
             </button>
+            <button type="button" data-action="mode-scale" aria-pressed={mode === "scale"} onClick={() => setMode("scale")} title="Scale (S)">
+              Scale <kbd>S</kbd>
+            </button>
             <button type="button" data-action="view-reset" onClick={() => setResetView((n) => n + 1)} title="Reset the camera">
               Reset view
             </button>
           </div>
+          <CameraToolbarGroup app={app} />
           <div className="group">
             <button type="button" data-action="undo" disabled={!canUndo} onClick={undo} title="Undo (Ctrl+Z)">
               Undo
@@ -419,15 +465,22 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
                   : "Click a mesh to select it · drag to rotate · scroll to zoom · drop files to load"
                 : coarsePointer
                   ? "Drag the gizmo to move · tap empty space to deselect"
-                  : "Drag the gizmo to move · T/R move or rotate · F focus · Esc deselect · drop files to load"}
+                  : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Esc deselect · drop files to load"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
       <aside className="sidebar sidebar-right" style={rightVisible ? undefined : { display: "none" }}>
         <SidebarHandle side="right" shell={shellRef} app={app} />
+        <TransformPanel app={app} mode={mode} onMode={setMode} />
         <WorkbenchDomains activeDomain={activeDomain} onSelectDomain={setActiveDomain} />
+        <div className={domainMatchesPanel(activeDomain, "modeling") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="modeling">
+          <ModelingPanel app={app} />
+        </div>
         <div className={domainMatchesPanel(activeDomain, "repair") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="repair">
           <RepairPanel app={app} scene={engine.scene} />
+        </div>
+        <div className={domainMatchesPanel(activeDomain, "align") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="align">
+          <AlignPanel app={app} />
         </div>
         <div className={domainMatchesPanel(activeDomain, "collision") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="collision">
           <CollisionPanel app={app} scene={engine.scene} />
