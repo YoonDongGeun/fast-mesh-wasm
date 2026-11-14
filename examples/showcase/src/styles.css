@@ -942,6 +942,11 @@ input[type="range"] {
   .toolbox {
     display: none;
   }
+  /* Coarse touch viewports use direct orbit/pinch + Reset view, keeping
+     .viewport corners clear for .volume-overlay and bottom-edge touch gestures. */
+  .camera-bar {
+    display: none;
+  }
   .hover-tip {
     max-width: 228px;
     white-space: normal;
@@ -1100,12 +1105,24 @@ input[type="range"] {
 
 
 /* #195 Workbench expansion */
-.toolbar {
-  flex-wrap: wrap;
+.camera-bar {
+  position: absolute;
+  bottom: 30px;
+  right: 10px;
+  max-width: calc(100% - 20px);
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
 }
 
-.toolbar .camera-group {
+.camera-bar .group {
+  display: flex;
   flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--overlay);
+  pointer-events: auto;
 }
 
 .mesh-actions {

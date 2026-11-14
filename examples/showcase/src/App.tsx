@@ -426,7 +426,6 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               Reset view
             </button>
           </div>
-          <CameraToolbarGroup app={app} />
           <div className="group">
             <button type="button" data-action="undo" disabled={!canUndo} onClick={undo} title="Undo (Ctrl+Z)">
               Undo
@@ -451,6 +450,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
               Help <kbd>?</kbd>
             </button>
           </div>
+        </div>
+        <div className="camera-bar" role="toolbar" aria-label="Camera views and projection">
+          <CameraToolbarGroup app={app} />
         </div>
         <p className="hint">
           {sculpt !== null
