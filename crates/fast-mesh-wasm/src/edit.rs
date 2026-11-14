@@ -79,6 +79,17 @@
 //!   for any size), fair`, NaN meaning the default of
 //!   [`AutoRepairOptions`]. Its report is, for each stage in the order it
 //!   ran, the code of the op that stage is, then that op's report.
+//! - `23` make manifold: `remove_duplicates, prune_fins,
+//!   split_non_manifold_edges, split_pinch_vertices` (0/1 or NaN for true).
+//! - `24` resolve self intersections: `mode (0 none, 1/NaN deleteAndFill,
+//!   2 cutAndStitch, 3 voxelHeal), ring_expansion, voxel_size, max_voxels,
+//!   max_hole_edges (NaN/Infinity for None), fair, stitch_tolerance`.
+//! - `25` cleanup slivers: `max_aspect_ratio, min_angle_deg, max_angle_deg,
+//!   max_iterations`.
+//! - `26` preset auto repair: `preset (0/NaN general, 1 scan3d, 2 print3d,
+//!   3 cadImport), self_intersection_mode (NaN preset default, 0..=3),
+//!   weld_tolerance, min_triangles, max_edges (NaN preset default, Infinity
+//!   unbounded, or integer), fair, voxel_size, max_voxels`.
 //!
 //! - `32` protect: `n, band (0.0 when unset), id × n, weight × n`, wrapping a
 //!   brush op (`5, 6, 9, 10, 19, 20, 21, 22`), composable in either order with
@@ -121,6 +132,13 @@
 //! - simplify: `collapsed, triangles_removed, vertices_removed`.
 //! - subdivide: `vertices_added, triangles_added`.
 //! - split stretched: `splits, remaining, (new vertex, a, b) x splits`.
+//! - make manifold: `removed_duplicate_triangles, pruned_fin_triangles,
+//!   split_non_manifold_edges, split_pinch_vertices, vertices_added,
+//!   removed_vertices`.
+//! - resolve self intersections: `initial_pairs, remaining_pairs,
+//!   removed_triangles, added_triangles, mode_used (0..=3), uvs_dropped`.
+//! - cleanup slivers: `collapsed_needles, flipped_caps, removed_degenerate,
+//!   removed_vertices`.
 //! - capture rest sizes: nothing.
 //! - capture stroke state: nothing.
 //!
@@ -141,9 +159,10 @@ use fast_mesh_ops::simplify::SimplifyOptions;
 use fast_mesh_ops::stretch::{StretchOptions, StretchReport};
 use fast_mesh_ops::subdivide::{SubdivideMethod, SubdivideOptions};
 use fast_mesh_ops::{
-    Analysis, AutoRepairOptions, AutoRepairStage, ComponentOptions, DegenerateOptions, FailReason,
-    FairWeights, FillOptions, FillReport, LoopId, OffsetAlgorithm, OffsetOptions, OpsError,
-    ShellOptions, SkipReason,
+    Analysis, AutoRepairOptions, AutoRepairPreset, AutoRepairStage, ComponentOptions,
+    DegenerateOptions, FailReason, FairWeights, FillOptions, FillReport, LoopId, ManifoldOptions,
+    OffsetAlgorithm, OffsetOptions, OpsError, SelfIntersectOptions, SelfIntersectionMode,
+    ShellOptions, SkipReason, SliverOptions,
 };
 use fast_mesh_store::{StoreError, Transaction, UV_CHANNEL};
 
@@ -455,6 +474,10 @@ pub(crate) enum RepairOp {
     Simplify(SimplifyOptions),
     Subdivide(SubdivideOptions),
     Auto(AutoRepairOptions),
+    MakeManifold(ManifoldOptions),
+    ResolveSelfIntersections(SelfIntersectOptions),
+    CleanupSlivers(SliverOptions),
+    AutoPreset(AutoRepairOptions),
     SplitStretched(StretchOptions),
     /// Not an edit: `WasmScene::repair` runs it outside the transaction.
     CaptureRest {
@@ -529,6 +552,76 @@ pub(crate) fn count_opt(v: f64, what: &str) -> Result<Option<usize>, Error> {
 /// A bound, or `None` for NaN; the operation checks its range.
 fn bound(v: f64) -> Option<f64> {
     (!v.is_nan()).then_some(v)
+}
+
+fn opt_flag(v: f64, default: bool) -> Result<bool, Error> {
+    if v.is_nan() { Ok(default) } else { flag(v) }
+}
+
+fn opt_voxel_size(voxel_size: f64) -> Result<Option<f32>, Error> {
+    if voxel_size.is_nan() {
+        Ok(None)
+    } else if voxel_size.is_finite() && voxel_size > 0.0 {
+        let h = voxel_size as f32;
+        if !h.is_finite() || h <= 0.0 {
+            return Err(Error::invalid("voxelSize must be positive and finite"));
+        }
+        Ok(Some(h))
+    } else {
+        Err(Error::invalid("voxelSize must be positive and finite"))
+    }
+}
+
+fn opt_max_voxels(max_voxels: f64, default: usize) -> Result<usize, Error> {
+    // Reject values past JS `Number.MAX_SAFE_INTEGER` (2^53 - 1); on wasm32
+    // `count_opt`'s `v as usize` saturates safely at `usize::MAX`.
+    if !max_voxels.is_nan() && max_voxels > 9_007_199_254_740_991.0 {
+        return Err(Error::invalid("maxVoxels is too large"));
+    }
+    match count_opt(max_voxels, "maxVoxels")? {
+        None => Ok(default),
+        Some(n) if n < 64 => Err(Error::invalid("maxVoxels must be at least 64")),
+        Some(n) => Ok(n),
+    }
+}
+
+fn opt_u32_count(v: f64, what: &str, default: u32) -> Result<u32, Error> {
+    if !v.is_nan() && v > f64::from(u32::MAX) {
+        return Err(Error::invalid(&format!("{what} is too large")));
+    }
+    Ok(count_opt(v, what)?.unwrap_or(default as usize) as u32)
+}
+
+fn decode_si_mode(v: f64, allow_nan_unset: bool) -> Result<Option<SelfIntersectionMode>, Error> {
+    if v.is_nan() {
+        return Ok(if allow_nan_unset {
+            None
+        } else {
+            Some(SelfIntersectionMode::DeleteAndFill)
+        });
+    }
+    if v == 0.0 {
+        Ok(Some(SelfIntersectionMode::None))
+    } else if v == 1.0 {
+        Ok(Some(SelfIntersectionMode::DeleteAndFill))
+    } else if v == 2.0 {
+        Ok(Some(SelfIntersectionMode::CutAndStitch))
+    } else if v == 3.0 {
+        Ok(Some(SelfIntersectionMode::VoxelHeal))
+    } else {
+        Err(Error::invalid(
+            "selfIntersectionMode must be 0 (none), 1 (deleteAndFill), 2 (cutAndStitch) or 3 (voxelHeal)",
+        ))
+    }
+}
+
+fn si_mode_code(mode: SelfIntersectionMode) -> f64 {
+    match mode {
+        SelfIntersectionMode::None => 0.0,
+        SelfIntersectionMode::DeleteAndFill => 1.0,
+        SelfIntersectionMode::CutAndStitch => 2.0,
+        SelfIntersectionMode::VoxelHeal => 3.0,
+    }
 }
 
 pub(crate) fn loop_id(w: [u32; 4]) -> LoopId {
@@ -925,30 +1018,8 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
         } else if code == 11.0 {
             let [distance, alg, voxel_size, max_voxels]: [f64; 4] =
                 words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
-            let voxel_size = if voxel_size.is_nan() {
-                None
-            } else if voxel_size.is_finite() && voxel_size > 0.0 {
-                let h = voxel_size as f32;
-                if !h.is_finite() || h <= 0.0 {
-                    return Err(Error::invalid("voxelSize must be positive and finite"));
-                }
-                Some(h)
-            } else {
-                return Err(Error::invalid("voxelSize must be positive and finite"));
-            };
-            // Reject values past JS `Number.MAX_SAFE_INTEGER` (2^53 - 1); on
-            // wasm32 `count_opt`'s `v as usize` saturates safely at `usize::MAX`
-            // (`u32::MAX`) without wrapping.
-            if !max_voxels.is_nan() && max_voxels > 9_007_199_254_740_991.0 {
-                return Err(Error::invalid("maxVoxels is too large"));
-            }
-            let max_voxels = match count_opt(max_voxels, "maxVoxels")? {
-                None => OffsetOptions::default().max_voxels,
-                Some(n) if n < 64 => {
-                    return Err(Error::invalid("maxVoxels must be at least 64"));
-                }
-                Some(n) => n,
-            };
+            let voxel_size = opt_voxel_size(voxel_size)?;
+            let max_voxels = opt_max_voxels(max_voxels, OffsetOptions::default().max_voxels)?;
             let algorithm = if alg.is_nan() || alg == 0.0 {
                 OffsetAlgorithm::Normal
             } else if alg == 1.0 {
@@ -1198,6 +1269,153 @@ pub(crate) fn decode_repair(ops: &[f64], loops: &[u32]) -> Result<Vec<RepairOp>,
                 method,
                 ..Default::default()
             })
+        } else if code == 23.0 {
+            let [rm_dup, prune_fins, split_edges, split_pinch]: [f64; 4] =
+                words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
+            let defaults = ManifoldOptions::default();
+            RepairOp::MakeManifold(ManifoldOptions {
+                remove_duplicates: opt_flag(rm_dup, defaults.remove_duplicates)?,
+                prune_fins: opt_flag(prune_fins, defaults.prune_fins)?,
+                split_non_manifold_edges: opt_flag(split_edges, defaults.split_non_manifold_edges)?,
+                split_pinch_vertices: opt_flag(split_pinch, defaults.split_pinch_vertices)?,
+            })
+        } else if code == 24.0 {
+            let [
+                mode,
+                ring,
+                voxel_size,
+                max_voxels,
+                max_hole_edges,
+                fair,
+                stitch,
+            ]: [f64; 7] = words.take(7)?.try_into().map_err(|_| malformed(WHAT))?;
+            let defaults = SelfIntersectOptions::default();
+            let mode = decode_si_mode(mode, false)?.unwrap_or(defaults.mode);
+            let ring_expansion = opt_u32_count(ring, "ringExpansion", defaults.ring_expansion)?;
+            let voxel_size = opt_voxel_size(voxel_size)?;
+            let max_voxels = opt_max_voxels(max_voxels, defaults.max_voxels)?;
+            let max_hole_edges = if max_hole_edges == f64::INFINITY || max_hole_edges.is_nan() {
+                None
+            } else {
+                count_opt(max_hole_edges, "maxHoleEdges")?
+            };
+            let fair = opt_flag(fair, defaults.fair)?;
+            let stitch_tolerance = if stitch.is_nan() {
+                defaults.stitch_tolerance
+            } else {
+                let t = stitch as f32;
+                if !t.is_finite() || t < 0.0 {
+                    return Err(Error::invalid(
+                        "stitchTolerance must be finite and non-negative",
+                    ));
+                }
+                t
+            };
+            RepairOp::ResolveSelfIntersections(SelfIntersectOptions {
+                mode,
+                ring_expansion,
+                voxel_size,
+                max_voxels,
+                max_hole_edges,
+                fair,
+                stitch_tolerance,
+            })
+        } else if code == 25.0 {
+            let [max_aspect, min_angle, max_angle, max_iters]: [f64; 4] =
+                words.take(4)?.try_into().map_err(|_| malformed(WHAT))?;
+            let defaults = SliverOptions::default();
+            let max_aspect_ratio = if max_aspect.is_nan() {
+                defaults.max_aspect_ratio
+            } else {
+                let a = max_aspect as f32;
+                if !a.is_finite() || a < 1.0 {
+                    return Err(Error::invalid(
+                        "maxAspectRatio must be finite and at least 1",
+                    ));
+                }
+                a
+            };
+            let min_angle_deg = if min_angle.is_nan() {
+                defaults.min_angle_deg
+            } else {
+                let a = min_angle as f32;
+                if !a.is_finite() || !(0.0..=60.0).contains(&a) {
+                    return Err(Error::invalid("minAngleDeg must be finite and in [0, 60]"));
+                }
+                a
+            };
+            let max_angle_deg = if max_angle.is_nan() {
+                defaults.max_angle_deg
+            } else {
+                let a = max_angle as f32;
+                if !a.is_finite() || !(60.0..=180.0).contains(&a) {
+                    return Err(Error::invalid(
+                        "maxAngleDeg must be finite and in [60, 180]",
+                    ));
+                }
+                a
+            };
+            if min_angle_deg > max_angle_deg {
+                return Err(Error::invalid("minAngleDeg must not exceed maxAngleDeg"));
+            }
+            let max_iterations =
+                opt_u32_count(max_iters, "maxIterations", defaults.max_iterations)?;
+            RepairOp::CleanupSlivers(SliverOptions {
+                max_aspect_ratio,
+                min_angle_deg,
+                max_angle_deg,
+                max_iterations,
+            })
+        } else if code == 26.0 {
+            let [
+                preset,
+                si_mode,
+                weld,
+                min_t,
+                max_e,
+                fair,
+                voxel_size,
+                max_voxels,
+            ]: [f64; 8] = words.take(8)?.try_into().map_err(|_| malformed(WHAT))?;
+            let preset = if preset.is_nan() || preset == 0.0 {
+                AutoRepairPreset::General
+            } else if preset == 1.0 {
+                AutoRepairPreset::Scan3D
+            } else if preset == 2.0 {
+                AutoRepairPreset::Print3D
+            } else if preset == 3.0 {
+                AutoRepairPreset::CadImport
+            } else {
+                return Err(Error::invalid(
+                    "preset must be 0 (general), 1 (scan3d), 2 (print3d) or 3 (cadImport)",
+                ));
+            };
+            let mut b = AutoRepairOptions::builder().preset(preset);
+            if let Some(m) = decode_si_mode(si_mode, true)? {
+                b = b.self_intersection_mode(Some(m));
+            }
+            if let Some(weld) = bound(weld) {
+                b = b.weld_tolerance(weld as f32);
+            }
+            if let Some(min_t) = count_opt(min_t, "minTriangles")? {
+                b = b.min_triangles(min_t);
+            }
+            if max_e == f64::INFINITY {
+                b = b.max_edges(None);
+            } else if let Some(max_e) = count_opt(max_e, "maxEdges")? {
+                b = b.max_edges(Some(max_e));
+            }
+            if !fair.is_nan() {
+                b = b.fair(flag(fair)?);
+            }
+            if let Some(h) = opt_voxel_size(voxel_size)? {
+                b = b.voxel_size(Some(h));
+            }
+            if !max_voxels.is_nan() {
+                let default_mv = AutoRepairOptions::default().max_voxels;
+                b = b.max_voxels(opt_max_voxels(max_voxels, default_mv)?);
+            }
+            RepairOp::AutoPreset(b.build())
         } else {
             return Err(Error::invalid("unknown repair op"));
         };
@@ -1284,6 +1502,19 @@ fn put_fill(out: &mut Vec<f64>, r: &FillReport) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn auto_stage_code(stage: AutoRepairStage<'_>) -> f64 {
+    match stage {
+        AutoRepairStage::Weld(_) => 0.0,
+        AutoRepairStage::Degenerate(_) => 1.0,
+        AutoRepairStage::Components(_) => 2.0,
+        AutoRepairStage::Orient(_) => 3.0,
+        AutoRepairStage::Fill(_) => 4.0,
+        AutoRepairStage::Manifold(_) => 23.0,
+        AutoRepairStage::SelfIntersections(_) => 24.0,
+        AutoRepairStage::Slivers(_) => 25.0,
+    }
+}
+
 /// Appends the report of one of the ops an auto repair is made of (see the
 /// module docs).
 fn put_stage(out: &mut Vec<f64>, stage: AutoRepairStage) -> Result<(), StoreError> {
@@ -1313,6 +1544,37 @@ fn put_stage(out: &mut Vec<f64>, stage: AutoRepairStage) -> Result<(), StoreErro
             ],
         ),
         AutoRepairStage::Fill(r) => put_fill(out, r),
+        AutoRepairStage::Manifold(r) => put(
+            out,
+            &[
+                count(r.removed_duplicate_triangles),
+                count(r.pruned_fin_triangles),
+                count(r.split_non_manifold_edges),
+                count(r.split_pinch_vertices),
+                count(r.vertices_added),
+                count(r.removed_vertices),
+            ],
+        ),
+        AutoRepairStage::Slivers(r) => put(
+            out,
+            &[
+                count(r.collapsed_needles),
+                count(r.flipped_caps),
+                count(r.removed_degenerate),
+                count(r.removed_vertices),
+            ],
+        ),
+        AutoRepairStage::SelfIntersections(r) => put(
+            out,
+            &[
+                count(r.initial_pairs),
+                count(r.remaining_pairs),
+                count(r.removed_triangles),
+                count(r.added_triangles),
+                si_mode_code(r.mode_used),
+                f64::from(u8::from(r.uvs_dropped)),
+            ],
+        ),
     }
 }
 
@@ -1365,16 +1627,28 @@ pub(crate) fn run_repair(tx: &mut Transaction, ops: &[RepairOp]) -> Result<Vec<f
             RepairOp::Auto(o) => {
                 let r = fast_mesh_ops::auto_repair(tx, o)?;
                 for stage in r.stages() {
-                    let code = match stage {
-                        AutoRepairStage::Weld(_) => 0.0,
-                        AutoRepairStage::Degenerate(_) => 1.0,
-                        AutoRepairStage::Components(_) => 2.0,
-                        AutoRepairStage::Orient(_) => 3.0,
-                        AutoRepairStage::Fill(_) => 4.0,
-                    };
-                    put(&mut out, &[code])?;
+                    put(&mut out, &[auto_stage_code(stage)])?;
                     put_stage(&mut out, stage)?;
                 }
+            }
+            RepairOp::AutoPreset(o) => {
+                let r = fast_mesh_ops::auto_repair(tx, o)?;
+                for stage in r.executed_stages(o)? {
+                    put(&mut out, &[auto_stage_code(stage)])?;
+                    put_stage(&mut out, stage)?;
+                }
+            }
+            RepairOp::MakeManifold(o) => {
+                let r = fast_mesh_ops::make_manifold(tx, o)?;
+                put_stage(&mut out, AutoRepairStage::Manifold(&r))?;
+            }
+            RepairOp::ResolveSelfIntersections(o) => {
+                let r = fast_mesh_ops::resolve_self_intersections(tx, None, o)?;
+                put_stage(&mut out, AutoRepairStage::SelfIntersections(&r))?;
+            }
+            RepairOp::CleanupSlivers(o) => {
+                let r = fast_mesh_ops::cleanup_slivers(tx, o)?;
+                put_stage(&mut out, AutoRepairStage::Slivers(&r))?;
             }
             RepairOp::Protected {
                 vertices,
@@ -2344,6 +2618,7 @@ mod tests {
                 min_triangles: 3,
                 max_edges: None,
                 fair: false,
+                ..AutoRepairOptions::default()
             })]
         );
         let d = decode_repair(&[15., nan, nan, 8., 1.], &[]).unwrap();
@@ -2390,5 +2665,102 @@ mod tests {
         assert_eq!(code(&[14., 0., -1.]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[14., 0., 2f64.powi(32)]), codes::INVALID_ARGUMENT);
         assert_eq!(code(&[14., 0., 1., 0.]), codes::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn decode_repair_healing_ops_and_presets() {
+        let nan = f64::NAN;
+        assert_eq!(
+            decode_repair(&[23., nan, nan, nan, nan], &[]).unwrap(),
+            vec![RepairOp::MakeManifold(ManifoldOptions::default())]
+        );
+        assert_eq!(
+            decode_repair(&[23., 1., 0., 1., 0.], &[]).unwrap(),
+            vec![RepairOp::MakeManifold(ManifoldOptions {
+                remove_duplicates: true,
+                prune_fins: false,
+                split_non_manifold_edges: true,
+                split_pinch_vertices: false,
+            })]
+        );
+
+        assert_eq!(
+            decode_repair(&[24., nan, nan, nan, nan, nan, nan, nan], &[]).unwrap(),
+            vec![RepairOp::ResolveSelfIntersections(
+                SelfIntersectOptions::default()
+            )]
+        );
+        assert_eq!(
+            decode_repair(&[24., 3., 2., 0.25, 1024., 16., 0., 1e-4], &[]).unwrap(),
+            vec![RepairOp::ResolveSelfIntersections(SelfIntersectOptions {
+                mode: SelfIntersectionMode::VoxelHeal,
+                ring_expansion: 2,
+                voxel_size: Some(0.25),
+                max_voxels: 1024,
+                max_hole_edges: Some(16),
+                fair: false,
+                stitch_tolerance: 1e-4,
+            })]
+        );
+
+        assert_eq!(
+            decode_repair(&[25., nan, nan, nan, nan], &[]).unwrap(),
+            vec![RepairOp::CleanupSlivers(SliverOptions::default())]
+        );
+        assert_eq!(
+            decode_repair(&[25., 30., 5., 170., 4.], &[]).unwrap(),
+            vec![RepairOp::CleanupSlivers(SliverOptions {
+                max_aspect_ratio: 30.0,
+                min_angle_deg: 5.0,
+                max_angle_deg: 170.0,
+                max_iterations: 4,
+            })]
+        );
+
+        assert_eq!(
+            decode_repair(&[26., 2., nan, nan, nan, nan, nan, nan, nan], &[]).unwrap(),
+            vec![RepairOp::AutoPreset(AutoRepairOptions::for_preset(
+                AutoRepairPreset::Print3D
+            ))]
+        );
+        assert_eq!(
+            decode_repair(&[26., 3., 2., 1e-6, 0., 12., 0., nan, nan], &[]).unwrap(),
+            vec![RepairOp::AutoPreset(
+                AutoRepairOptions::builder()
+                    .preset(AutoRepairPreset::CadImport)
+                    .self_intersection_mode(Some(SelfIntersectionMode::CutAndStitch))
+                    .weld_tolerance(1e-6)
+                    .min_triangles(0)
+                    .max_edges(Some(12))
+                    .fair(false)
+                    .build()
+            )]
+        );
+
+        let code = |ops: &[f64]| decode_repair(ops, &[]).unwrap_err().code;
+        assert_eq!(code(&[23., 2., 1., 1., 1.]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[24., 4., 1., nan, nan, nan, 1., 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[24., 1., 1., 0., nan, nan, 1., 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[24., 1., 1., nan, 32., nan, 1., 0.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            code(&[24., 1., 1., nan, nan, nan, 1., -1.]),
+            codes::INVALID_ARGUMENT
+        );
+        assert_eq!(code(&[25., 0.5, 2., 176., 3.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[25., 20., 70., 176., 3.]), codes::INVALID_ARGUMENT);
+        assert_eq!(code(&[25., 20., 2., 50., 3.]), codes::INVALID_ARGUMENT);
+        assert_eq!(
+            code(&[26., 9., nan, nan, nan, nan, nan, nan, nan]),
+            codes::INVALID_ARGUMENT
+        );
     }
 }

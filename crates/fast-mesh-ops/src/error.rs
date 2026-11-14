@@ -54,6 +54,19 @@ impl From<fast_mesh_fields::FieldsError> for OpsError {
     }
 }
 
+/// BVH errors map out-of-memory and store errors directly, mesh mismatch to
+/// [`OpsError::Query`], and invalid options to [`OpsError::InvalidInput`].
+impl From<fast_mesh_bvh::BvhError> for OpsError {
+    fn from(e: fast_mesh_bvh::BvhError) -> Self {
+        match e {
+            fast_mesh_bvh::BvhError::OutOfMemory => OpsError::Store(StoreError::OutOfMemory),
+            fast_mesh_bvh::BvhError::Store(s) => OpsError::Store(s),
+            fast_mesh_bvh::BvhError::MeshMismatch => OpsError::Query(QueryError::MeshMismatch),
+            fast_mesh_bvh::BvhError::InvalidOptions(msg) => OpsError::InvalidInput(msg),
+        }
+    }
+}
+
 impl fmt::Display for OpsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

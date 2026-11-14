@@ -379,7 +379,7 @@ fn joined_across_seams(
 /// The alive vertices no triangle uses once the planned edits are applied:
 /// triangles `removed` (ascending) are gone, and `rewired[i]` (ascending) has
 /// the corners `rewired_to[i]`. Ascending.
-fn unused_vertices(
+pub(crate) fn unused_vertices(
     mesh: &Mesh,
     removed: &[TriangleId],
     rewired: &[TriangleId],

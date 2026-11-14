@@ -1369,4 +1369,161 @@ describe("analyze and repair", () => {
     expect(Array.from(s.views(m).positions())).toEqual(Array.from(beforePos));
     expect(Array.from(s.views(m).indices())).toEqual(Array.from(beforeIdx));
   });
+
+  it("make_manifold_repairs_bowtie_and_duplicate_with_uvs_and_undo", () => {
+    const s = scene();
+    const pos = [
+      0, 0, 0,
+      -1, 1, 0,
+      1, 1, 0,
+      -1, -1, 0,
+      1, -1, 0,
+    ];
+    const tris = [0, 2, 1, 0, 3, 4, 0, 2, 1];
+    const uvs = [0.5, 0.5, 0, 1, 1, 1, 0, 0, 1, 0];
+    const m = s.addMesh(pos, tris, { uvs });
+    const r = s.repair(m, { op: "makeManifold" });
+    expect(r).toEqual({
+      removedDuplicateTriangles: 1,
+      prunedFinTriangles: 0,
+      splitNonManifoldEdges: 0,
+      splitPinchVertices: 1,
+      verticesAdded: 1,
+      removedVertices: 0,
+    });
+    expect(s.triangleCount(m)).toBe(2);
+    expect(s.vertexCount(m)).toBe(6);
+    const afterUvs = s.views(m).uvs()!;
+    expect(Array.from(afterUvs.subarray(10, 12))).toEqual([0.5, 0.5]);
+    const a = s.analyze(m);
+    expect(a.duplicate).toBe(0);
+    expect(a.nonManifoldEdges).toBe(0);
+    expect(Array.from(a.pinchVertices)).toEqual([]);
+
+    expect(s.undo()).toBe(true);
+    expect(s.triangleCount(m)).toBe(3);
+    expect(s.vertexCount(m)).toBe(5);
+    expect(Array.from(s.views(m).uvs()!.subarray(0, uvs.length))).toEqual(uvs);
+  });
+
+  it("cleanup_slivers_collapses_needles_flips_caps_and_rejects_bad_options", () => {
+    const s = scene();
+    const needlePos = [
+      0, 0, 0,
+      2, 0, 0,
+      0.995, 1, 0,
+      1.005, 1, 0,
+      0, 2, 0,
+      2, 2, 0,
+    ];
+    const needleIdx = [0, 1, 2, 1, 3, 2, 0, 2, 4, 2, 5, 4, 2, 3, 5, 1, 5, 3];
+    const needleUvs = [0, 0, 1, 0, 0.4, 0.5, 0.6, 0.5, 0, 1, 1, 1];
+    const mn = s.addMesh(needlePos, needleIdx, { uvs: needleUvs });
+    const rn = s.repair(mn, { op: "cleanupSlivers" });
+    expect(rn.collapsedNeedles).toBe(1);
+    expect(s.triangleCount(mn)).toBe(4);
+    expect(s.vertexCount(mn)).toBe(5);
+    expect(Array.from(s.views(mn).uvs()!.subarray(4, 6))).toEqual([0.5, 0.5]);
+    expect(s.undo()).toBe(true);
+    expect(s.triangleCount(mn)).toBe(6);
+
+    const mc = s.addMesh([0, 0, 0, 1, -1, 0, 2, 0, 0, 1, 0.01, 0], [0, 1, 2, 0, 2, 3]);
+    const rc = s.repair(mc, { op: "cleanupSlivers" });
+    expect(rc.flippedCaps).toBe(1);
+    expect(s.triangleCount(mc)).toBe(2);
+
+    expect(codeOf(() => s.repair(mc, { op: "cleanupSlivers", maxAspectRatio: 0.5 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(mc, { op: "cleanupSlivers", minAngleDeg: 70 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(mc, { op: "cleanupSlivers", maxAngleDeg: 50 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(mc, { op: "cleanupSlivers", minAngleDeg: 50, maxAngleDeg: 70, maxIterations: -1 }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+  });
+
+  it("resolve_self_intersections_modes_uvs_undo_and_validation", () => {
+    const buildPokedSphere = () => {
+      const stacks = 10;
+      const slices = 16;
+      const pos: number[] = [0, 0, 1];
+      for (let i = 1; i < stacks; i++) {
+        const phi = (Math.PI * i) / stacks;
+        for (let j = 0; j < slices; j++) {
+          const theta = (2 * Math.PI * j) / slices;
+          pos.push(Math.sin(phi) * Math.cos(theta), Math.sin(phi) * Math.sin(theta), Math.cos(phi));
+        }
+      }
+      pos.push(0, 0, -1);
+      const south = pos.length / 3 - 1;
+      for (let v = 0; v < pos.length; v += 3) {
+        if (pos[v + 2] > 0.65) {
+          pos[v + 2] = -pos[v + 2] * 1.4;
+        }
+      }
+      const ring = (i: number, j: number) => 1 + (i - 1) * slices + (j % slices);
+      const idx: number[] = [];
+      for (let j = 0; j < slices; j++) {
+        idx.push(0, ring(1, j), ring(1, j + 1));
+        idx.push(south, ring(stacks - 1, j + 1), ring(stacks - 1, j));
+        for (let i = 1; i < stacks - 1; i++) {
+          const a = ring(i, j);
+          const b = ring(i + 1, j);
+          const c = ring(i + 1, j + 1);
+          const d = ring(i, j + 1);
+          idx.push(a, b, c, a, c, d);
+        }
+      }
+      const uvs = Array.from({ length: (pos.length / 3) * 2 }, (_, k) => (k % 2 === 0 ? 0.25 : 0.75));
+      return { pos, idx, uvs };
+    };
+
+    const s = scene();
+    const { pos, idx, uvs } = buildPokedSphere();
+    const m = s.addMesh(pos, idx, { uvs });
+
+    const rNone = s.repair(m, { op: "resolveSelfIntersections", mode: "none" });
+    expect(rNone.initialPairs).toBeGreaterThan(0);
+    expect(rNone.remainingPairs).toBe(rNone.initialPairs);
+    expect(rNone.removedTriangles).toBe(0);
+    expect(rNone.modeUsed).toBe("none");
+    expect(rNone.uvsDropped).toBe(false);
+
+    const rDel = s.repair(m, { op: "resolveSelfIntersections", mode: "deleteAndFill" });
+    expect(rDel.initialPairs).toBeGreaterThan(0);
+    expect(rDel.remainingPairs).toBe(0);
+    expect(rDel.modeUsed).toBe("deleteAndFill");
+    expect(rDel.uvsDropped).toBe(false);
+    expect(s.views(m).uvs()).not.toBeNull();
+    expect(s.analyze(m, { selfIntersection: true }).selfIntersects).toBe(false);
+    expect(s.undo()).toBe(true);
+    expect(Array.from(s.views(m).uvs()!.subarray(0, uvs.length))).toEqual(uvs);
+
+    const rVox = s.repair(m, { op: "resolveSelfIntersections", mode: "voxelHeal", voxelSize: 0.12 });
+    expect(rVox.initialPairs).toBeGreaterThan(0);
+    expect(rVox.remainingPairs).toBe(0);
+    expect(rVox.modeUsed).toBe("voxelHeal");
+    expect(rVox.uvsDropped).toBe(true);
+    expect(s.views(m).uvs()).toBeNull();
+    expect(s.measure(m).closed).toBe(true);
+    expect(s.undo()).toBe(true);
+    expect(Array.from(s.views(m).uvs()!.subarray(0, uvs.length))).toEqual(uvs);
+
+    // CutAndStitch on crossed box triangles: removes intersecting pairs without dropping UVs.
+    const crossedPos = [
+      -1, -1, 0, 1, -1, 0, 0, 1, 0,
+      -0.6, 0, -0.5, 0.6, 0, -0.5, 0, 0, 0.5,
+    ];
+    const crossedUvs = [0, 0, 1, 0, 0.5, 1, 0.1, 0.2, 0.9, 0.2, 0.5, 0.8];
+    const mx = s.addMesh(crossedPos, [0, 1, 2, 3, 4, 5], { uvs: crossedUvs });
+    const rCut = s.repair(mx, { op: "resolveSelfIntersections", mode: "cutAndStitch" });
+    expect(rCut.initialPairs).toBeGreaterThan(0);
+    expect(rCut.modeUsed).toBe("cutAndStitch");
+    expect(rCut.uvsDropped).toBe(false);
+    expect(s.views(mx).uvs()).not.toBeNull();
+
+    expect(codeOf(() => s.repair(m, { op: "resolveSelfIntersections", voxelSize: 0 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "resolveSelfIntersections", maxVoxels: 32 }))).toBe("INVALID_ARGUMENT");
+    expect(codeOf(() => s.repair(m, { op: "resolveSelfIntersections", stitchTolerance: -0.1 }))).toBe(
+      "INVALID_ARGUMENT",
+    );
+  });
 });

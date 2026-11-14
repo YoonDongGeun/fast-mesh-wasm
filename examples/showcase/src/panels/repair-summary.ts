@@ -1,7 +1,21 @@
 // What the repair panel shows: an `Analysis` reduced to the counts it lists
 // (holes largest first, components largest first), and one line per repair
 // report.
-import type { Analysis, JoinReport, LoopId, OffsetReport, RepairOp, RepairReport } from "fast-mesh-wasm";
+import type {
+  Analysis,
+  AutoRepairPreset,
+  AutoRepairReport,
+  AutoRepairRequest,
+  JoinReport,
+  LoopId,
+  ManifoldReport,
+  OffsetReport,
+  RepairOp,
+  RepairReport,
+  SelfIntersectReport,
+  SelfIntersectionMode,
+  SliverReport,
+} from "fast-mesh-wasm";
 import { type LengthUnit, toDisplayLength } from "./units";
 
 export interface AnalysisSummary {
@@ -183,11 +197,107 @@ export function describeReport(op: RepairOp["op"], report: RepairReport, unit?: 
     }
     case "captureRestSizes":
       return "Captured rest sizes";
+    case "makeManifold": {
+      const r = report as ManifoldReport;
+      return `Make manifold: removed ${plural(r.removedDuplicateTriangles, "duplicate")}, pruned ${plural(r.prunedFinTriangles, "fin")}, split ${plural(r.splitNonManifoldEdges, "non-manifold edge")} and ${plural(r.splitPinchVertices, "pinch vertex", "pinch vertices")}`;
+    }
+    case "resolveSelfIntersections": {
+      const r = report as SelfIntersectReport;
+      const dropped = r.uvsDropped ? " (UVs dropped)" : "";
+      return `Self-intersections (${r.modeUsed}): ${r.initialPairs} → ${r.remainingPairs} pairs (-${plural(r.removedTriangles, "triangle")}, +${plural(r.addedTriangles, "triangle")})${dropped}`;
+    }
+    case "cleanupSlivers": {
+      const r = report as SliverReport;
+      return `Cleanup slivers: collapsed ${plural(r.collapsedNeedles, "needle")}, flipped ${plural(r.flippedCaps, "cap")}, removed ${plural(r.removedDegenerate, "degenerate triangle")}`;
+    }
     default: {
       const _exhaustive: never = op;
       throw new Error(`unreachable repair op: ${String(_exhaustive)}`);
     }
   }
+}
+
+export const AUTO_REPAIR_PRESET_LABELS: Record<AutoRepairPreset, string> = {
+  general: "General",
+  scan3d: "3D Scan",
+  print3d: "3D Print",
+  cadImport: "CAD Import",
+};
+
+export const SELF_INTERSECTION_MODE_LABELS: Record<SelfIntersectionMode, string> = {
+  none: "None",
+  deleteAndFill: "Delete & Fill",
+  cutAndStitch: "Cut & Stitch",
+  voxelHeal: "Voxel Heal",
+};
+
+export interface PresetRepairSettings {
+  preset: AutoRepairPreset;
+  selfIntersectionMode?: SelfIntersectionMode;
+  weldTolerance: number;
+  minTriangles: number;
+  /** Maximum hole edges (`0` means unbounded for fill presets, or keep boundary openings for `cadImport`). */
+  maxEdges: number;
+  fair: boolean;
+  voxelSize?: number;
+}
+
+export function buildPresetAutoRepairRequest(settings: PresetRepairSettings): AutoRepairRequest {
+  const req: AutoRepairRequest = {
+    kind: "auto",
+    preset: settings.preset,
+    weldTolerance: settings.weldTolerance,
+    minTriangles: settings.minTriangles,
+    fair: settings.fair,
+  };
+  if (settings.preset === "cadImport") {
+    if (settings.maxEdges > 0) {
+      req.maxEdges = settings.maxEdges;
+    }
+  } else {
+    req.maxEdges = settings.maxEdges > 0 ? settings.maxEdges : Number.POSITIVE_INFINITY;
+  }
+  if (settings.selfIntersectionMode !== undefined) {
+    req.selfIntersectionMode = settings.selfIntersectionMode;
+  }
+  if (settings.voxelSize !== undefined) {
+    req.voxelSize = settings.voxelSize;
+  }
+  return req;
+}
+
+function beforeAfterCount(n: readonly [number, number], word: string, words = `${word}s`): string {
+  return `${plural(n[0], word, words)} → ${n[1] === 0 ? "none" : plural(n[1], word, words)}`;
+}
+
+export function formatPresetAutoRepairReport(
+  preset: AutoRepairPreset,
+  report: AutoRepairReport,
+  before: AnalysisSummary,
+  after: AnalysisSummary,
+  beforeSi?: boolean | null,
+  afterSi?: boolean | null,
+  unit?: LengthUnit,
+): { stageLines: string[]; summaryLine: string; line: string } {
+  const stageLines: string[] = [];
+  for (const [op, r] of Object.entries(report)) {
+    if (r !== undefined) {
+      stageLines.push(describeReport(op as RepairOp["op"], r as RepairReport, unit));
+    }
+  }
+  const parts = [
+    beforeAfterCount([before.holes.length, after.holes.length], "hole"),
+    beforeAfterCount([before.nonManifoldEdges, after.nonManifoldEdges], "non-manifold edge"),
+    beforeAfterCount([before.pinchVertices, after.pinchVertices], "pinch vertex", "pinch vertices"),
+    beforeAfterCount([before.components.length, after.components.length], "component"),
+  ];
+  if (beforeSi !== null && beforeSi !== undefined && afterSi !== null && afterSi !== undefined) {
+    parts.push(`self-intersections ${beforeSi ? "yes" : "none"} → ${afterSi ? "yes" : "none"}`);
+  }
+  const summaryLine = parts.join(", ");
+  const label = AUTO_REPAIR_PRESET_LABELS[preset];
+  const line = `Auto repair (${label}, one undo step): ${summaryLine}. ${stageLines.join("; ")}`;
+  return { stageLines, summaryLine, line };
 }
 
 /** One line for a join report. */
