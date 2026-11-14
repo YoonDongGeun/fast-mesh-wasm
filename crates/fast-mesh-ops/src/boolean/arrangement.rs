@@ -985,11 +985,19 @@ pub(super) fn build_arrangement(
         raw_origin.push(orig);
     }
 
-    // Unify all keys that quantize to identical [f32; 3] bit patterns, preferring LiveA (§5.4).
+    // Unify all keys that quantize to identical [f32; 3] bit patterns (flushing
+    // sub-f64 near-zero trigonometric residuals <= 1e-15 * scale onto 0.0 so exact
+    // zero axes share bit patterns with ~6e-17 sin/cos artifacts), preferring LiveA.
+    let max_coord = raw_pos
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |acc, &c| acc.max(f64::from(c).abs()));
+    let flush_zero_tol = (max_coord * 1e-15).max(1e-24) as f32;
     let mut by_bits: Vec<([u32; 3], usize)> = Vec::new();
     reserve(&mut by_bits, num_raw)?;
     for (idx, &p) in raw_pos.iter().enumerate() {
-        by_bits.push((pos_bits(p), idx));
+        let flushed = p.map(|c| if c.abs() <= flush_zero_tol { 0.0 } else { c });
+        by_bits.push((pos_bits(flushed), idx));
     }
     by_bits.sort_unstable();
 

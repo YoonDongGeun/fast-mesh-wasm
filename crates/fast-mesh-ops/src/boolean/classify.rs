@@ -7,6 +7,7 @@ use robust::{Coord, orient2d};
 
 use super::arrangement::{ArrOrigin, ArrVertexId, Arrangement, orient3d_exact};
 use super::cdt::triangulate_constrained;
+use super::perturbation::{PerturbKey, orient3d_sos, ray_winding_sos};
 use super::winding::WindingTree;
 use super::{BooleanOp, BooleanPlan, PRef};
 use crate::topology::{EdgeMap, UnionFind, components};
@@ -720,11 +721,21 @@ fn classify_side_patches(
         let p0 = positions[rep.verts[0] as usize].map(f64::from);
         let p1 = positions[rep.verts[1] as usize].map(f64::from);
         let p2 = positions[rep.verts[2] as usize].map(f64::from);
-        let w = tree.winding_number(other_mesh, other_bvh, tri_centroid(p0, p1, p2));
+        let cen = tri_centroid(p0, p1, p2);
+        let w = tree.winding_number(other_mesh, other_bvh, cen);
         if w < -0.5 {
             return Err(OpsError::InvalidInput("boolean input is wound inward"));
         }
-        let inside = w > 0.5;
+        let inside = if (0.25..=0.75).contains(&w) {
+            let side_sign = if is_a { -1 } else { 1 };
+            let rw = ray_winding_sos(other_mesh, other_bvh, cen, side_sign);
+            if rw < 0 {
+                return Err(OpsError::InvalidInput("boolean input is wound inward"));
+            }
+            rw > 0
+        } else {
+            w > 0.5
+        };
         patch_keep[pid] = keep_non_coplanar(op, is_a, inside);
     }
 
@@ -1236,7 +1247,9 @@ fn order_pinch_edge_dihedral(
 
     // Refine any near-tied dihedral angles (within 1e-9 rad) using exact
     // `orient3d_exact(p_lo, p_hi, wa, wb)`. Note `y + 0.0` maps `-0.0` to `+0.0`,
-    // so `+pi` never splits to `-pi`.
+    // so `+pi` never splits to `-pi`. On exact coplanar ties (`o == 0`), separate
+    // adjacent solid wedges cleanly (`false` before `true`) and break same-sense
+    // ties via canonical vertex-ID-keyed Simulation-of-Simplicity (`orient3d_sos`).
     let m = items.len();
     for _pass in 0..m {
         let mut swapped = false;
@@ -1244,7 +1257,24 @@ fn order_pinch_edge_dihedral(
             if (items[idx + 1].theta - items[idx].theta).abs() < 1e-9 {
                 let wa = positions[items[idx].opp_v as usize].map(f64::from);
                 let wb = positions[items[idx + 1].opp_v as usize].map(f64::from);
-                if orient3d_exact(p_lo, p_hi, wa, wb) < 0 {
+                let o = orient3d_exact(p_lo, p_hi, wa, wb);
+                let need_swap = if o < 0 {
+                    true
+                } else if o == 0 {
+                    if items[idx].starts_solid != items[idx + 1].starts_solid {
+                        items[idx].starts_solid && !items[idx + 1].starts_solid
+                    } else {
+                        orient3d_sos(
+                            (p_lo, PerturbKey::arr(edge.0)),
+                            (p_hi, PerturbKey::arr(edge.1)),
+                            (wa, PerturbKey::arr(items[idx].opp_v)),
+                            (wb, PerturbKey::arr(items[idx + 1].opp_v)),
+                        ) > 0
+                    }
+                } else {
+                    false
+                };
+                if need_swap {
                     items.swap(idx, idx + 1);
                     swapped = true;
                 }
