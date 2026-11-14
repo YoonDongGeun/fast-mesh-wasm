@@ -69,6 +69,15 @@ fuzz_target!(|input: BooleanInput| {
         return;
     };
     let mut tx = a.begin_edit();
-    let _ = apply_boolean(&mut tx, &plan);
-    let _ = tx.commit();
+    if apply_boolean(&mut tx, &plan).is_ok() && tx.commit().is_ok() {
+        let m = fast_mesh_ops::measure(&a).expect("measure");
+        if a.triangle_count() > 0 {
+            assert!(m.closed, "open or non-manifold boolean output: {m:?}");
+            assert_eq!(
+                m.non_manifold_edges, 0,
+                "non-manifold boolean output: {m:?}"
+            );
+            assert_eq!(m.orientation_conflicts, 0, "orientation conflicts: {m:?}");
+        }
+    }
 });

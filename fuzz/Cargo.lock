@@ -93,6 +93,7 @@ dependencies = [
  "fast-mesh-fields",
  "fast-mesh-query",
  "fast-mesh-store",
+ "robust",
 ]
 
 [[package]]

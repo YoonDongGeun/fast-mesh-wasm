@@ -362,6 +362,21 @@ Results for `cargo bench -p fast-mesh-ops --bench ops -- "ops stretch"`, measure
 
 The full `remesh` over the same 100k stroke took 689 ms in a one-off run through `Scene::edit` (1,045 splits, 1,827 collapses, 3,218 flips); it was not run at 1M. In that run, 12 `split_stretched` passes through `Scene::edit`, with its eager BVH and normals update, took a mean of 5.0 ms at 100k and 9.6 ms at 1M (worst 16 ms). Through the wasm package in Node, the same 12 passes took a mean of 10.8 ms at 100k and 11.5 ms at 1M (worst 22 ms), against 87 ms and 893 ms for one split-only `remesh` on the stroked mesh; `capture_rest_sizes` took 17 ms and 61 ms.
 
+### Boolean (fast-mesh-ops)
+
+Results for `cargo bench -p fast-mesh-ops --bench ops -- "ops boolean"`, measured on 2026-11-12 on the machine and toolchain above (10 samples per benchmark).
+
+- **Meshes:** two outward-wound UV spheres `sphere(1.0, 708, 708)` (`1,001,112` triangles and `500,558` vertices each) with prebuilt default SAH `Bvh`s; B is placed at generic offset `Rigid { translation: [0.31, 0.17, 0.23], ..Rigid::IDENTITY }`.
+- **Timing:** each sample runs `boolean_plan(&a, &bvh_a, &b, &bvh_b, &xf, op)` (which includes mapping B into A's frame, building `tool_bvh`, `intersecting_pairs`, canonical simplex arrangement, constrained 2D sub-triangulation, seam-bounded patch flood-fill, dipole `WindingTree` build + 1 query per patch, manifold fan de-pinching, and watertightness verification), then `apply_boolean(&mut tx, &plan)` and `tx.rollback()` so `bvh_a` stays current across samples without mixing initial BVH construction of A and B into the loop.
+
+| Benchmark | Single-threaded | `--features parallel` | Speed-up | Output (`kept_triangles` / `triangles_added`) |
+| --- | --- | --- | --- | --- |
+| `boolean_1m_spheres_union` | 5.41 s (`[5.34, 5.49]` s) | 3.21 s (median 3.22 s, `[3.17, 3.25]` s) | 1.68× | 1,192,872 / 600,504 |
+| `boolean_1m_spheres_subtract` | 5.22 s (`[5.14, 5.29]` s) | 3.07 s (median 3.07 s, `[3.03, 3.10]` s) | 1.70× | 1,011,960 / 419,592 |
+| `boolean_1m_spheres_intersect` | 5.05 s (`[4.96, 5.18]` s) | 2.95 s (median 2.92 s, `[2.90, 3.03]` s) | 1.71× | 831,048 / 419,592 |
+
+Patch-level generalized winding classification evaluates one winding query per seam-bounded patch rather than per-triangle raycasts over all 2M triangles; `--features parallel` accelerates `tool_bvh` SAH construction and `intersecting_pairs`, cutting total 1M-vs-1M runtime from ~5.0–5.4 s to ~2.9–3.2 s with bit-identical output.
+
 ## Sculpt strokes (issue #174)
 
 Measured on 2026-11-07, Intel Core i5-13600K, Windows 11, with other work sharing the machine (CPU load 65 to 100%), so read the ratios and not the last digit. The display runs at 144 Hz, so 6.9 ms is the best a frame can show.
@@ -1070,7 +1085,8 @@ pnpm build && pnpm --filter fast-mesh-wasm bench -- --worker --queued   # issue 
 pnpm build && pnpm --filter fast-mesh-wasm bench:store   # the store over 1000 meshes: per-action cost and add bursts on a Scene, placement status changes on a WorkerScene (add --quick for a short run)
 pnpm build && node scripts/browser-check.mjs --build --bench --kind 9a   # the threaded Worker against threads: 1 in headless Chrome (1M; --kind native, --n 2236 --lock-step 4 --seconds 30 for 10M, --threads N for another pool size)
 cargo bench -p fast-mesh-scene --bench scene -- "wide drag"   # the native wide-range drag (1M; FAST_MESH_BENCH_LARGE=1 adds 10M, and the 6 x 1M many-mesh drag) and opening a step unit
-cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld, remove_small_components and icp on 1M triangles; capture_rest_sizes, split_stretched and split-only remesh on 100k and 1M
+cargo bench -p fast-mesh-ops                          # analyze, orient, fill_holes (fair on and off), weld, remove_small_components, icp and boolean on 1M triangles; capture_rest_sizes, split_stretched and split-only remesh on 100k and 1M
+cargo bench -p fast-mesh-ops --bench ops -- "ops boolean"   # 1M-vs-1M overlapping UV sphere booleans (union, subtract, intersect); add --features parallel for multithreaded BVH + pair search
 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # the many-mesh drags (6 x 30k crossing, touching and apart)
 FAST_MESH_BENCH_LARGE=1 cargo bench -p fast-mesh-scene --bench scene -- "many meshes"   # adds 6 x 1M (about 10 minutes without the feature)
 cargo bench -p fast-mesh-scene --features parallel          # any of the above with the parallel feature (same for the other crates)

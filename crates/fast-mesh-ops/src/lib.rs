@@ -23,12 +23,12 @@
 //!   orientation conflicts and, given a BVH, self-intersection.
 //! - Orientation: [`orient()`] makes the winding consistent patch by patch
 //!   and turns closed components outward.
-//! - Booleans: [`boolean_plan`] splits every triangle of mesh A that mesh B
-//!   crosses (and vice versa) so that each piece lies strictly on one side
-//!   of the other mesh, classifies the pieces for [`BooleanOp`] and
-//!   [`apply_boolean`] writes the plan, stitching both rims without any
-//!   winding assumption. Inputs must be closed, manifold and consistently
-//!   wound.
+//! - Booleans: [`boolean_plan`] builds a canonical simplex-keyed intersection
+//!   arrangement between mesh A and mesh B, sub-triangulates cut faces in 2D,
+//!   classifies connected seam-bounded patches for [`BooleanOp`] via exact
+//!   coplanar predicates and generalized winding numbers, and de-pinches into a
+//!   verified 2-manifold; [`apply_boolean`] writes the plan atomically. Inputs
+//!   must be closed, 2-manifold, and outward wound (`signed_volume > 0`).
 //! - Offsetting and shells: [`offset`] moves a surface along its smooth
 //!   normals by a signed distance, and [`shell`] solidifies a mesh into a
 //!   printable shell of wall `thickness` by adding a reversed inner copy and

@@ -21,6 +21,7 @@ fast-mesh-store.workspace = true
 fast-mesh-bvh.workspace = true
 fast-mesh-query.workspace = true
 fast-mesh-fields.workspace = true
+robust = "1.2.0"
 
 [dev-dependencies]
 fast-mesh-query = { workspace = true, features = ["fault-injection"] }

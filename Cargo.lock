@@ -345,6 +345,7 @@ dependencies = [
  "fast-mesh-query",
  "fast-mesh-store",
  "proptest",
+ "robust",
 ]
 
 [[package]]
