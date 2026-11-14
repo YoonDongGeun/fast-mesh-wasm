@@ -1,7 +1,12 @@
 //! The scene: a registry of meshes with BVHs and placements.
 
 use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, BvhBuild, UpdatePolicy};
-use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, Remap, StoreError, Transaction, VertexId};
+use fast_mesh_ops::sculpt::{STROKE_NORMAL_CHANNEL, STROKE_POS_CHANNEL, StrokeSlice};
+use fast_mesh_ops::stretch::{REST_SIZE_CHANNEL, StretchOptions, StretchReport};
+use fast_mesh_query::{Region as QueryRegion, vertices_in};
+use fast_mesh_store::{
+    ChangeSet, ChannelDesc, Incidence, Mesh, Remap, StoreError, Transaction, VertexId,
+};
 
 use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickField};
 use crate::history::{Change, Done, History};
@@ -60,6 +65,440 @@ impl Default for SceneOptions {
     }
 }
 
+fn try_reserve_to<T>(v: &mut Vec<T>, target_len: usize) -> std::result::Result<(), StoreError> {
+    if v.capacity() < target_len {
+        v.try_reserve(target_len.saturating_sub(v.len()))
+            .map_err(|_| StoreError::OutOfMemory)?;
+    }
+    Ok(())
+}
+
+fn try_reserve_extra<T>(v: &mut Vec<T>, extra: usize) -> std::result::Result<(), StoreError> {
+    try_reserve_to(v, v.len().saturating_add(extra))
+}
+
+/// Computes `u`'s area-weighted smooth normal over its incident alive triangles,
+/// matching [`fast_mesh::compute_vertex_normals`] bit-for-bit.
+fn local_vertex_normal(mesh: &Mesh, inc: &Incidence, u: VertexId) -> [f32; 3] {
+    let positions = mesh.positions();
+    let mut normal = [0.0f32; 3];
+    for &t in inc.triangles(u) {
+        let Some(tri) = mesh.triangle(t) else {
+            continue;
+        };
+        let (pa, pb, pc) = (
+            positions[tri[0] as usize],
+            positions[tri[1] as usize],
+            positions[tri[2] as usize],
+        );
+        let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        for corner in tri {
+            if corner == u {
+                normal[0] += n[0];
+                normal[1] += n[1];
+                normal[2] += n[2];
+            }
+        }
+    }
+    let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if len > 0.0 {
+        normal.iter_mut().for_each(|x| *x /= len);
+    }
+    normal
+}
+
+/// Pre-allocated barycentric base-vertex parent lists for [`Scene::split_stretched`].
+pub(crate) struct PreparedSplits {
+    entries: Vec<(VertexId, f32)>,
+    offsets: Vec<usize>,
+}
+
+/// Lazy `O(1)` stroke-start position and normal cache on [`Entry`].
+///
+/// Pointer-down ([`Scene::capture_stroke_state`]) bumps `epoch` in `O(1)` without
+/// scanning the mesh. Before each dab mutates `region`, [`Self::capture_region_with_one_ring`]
+/// populates `rest_pos[u]` and `rest_normal[u]` for every vertex in `region` and its
+/// 1-ring whose `slot_epoch[u] != epoch`. Uncaptured slots always hold `[f32::NAN; 3]`
+/// so [`StrokeSlice`] falls back seamlessly to current mesh state.
+#[derive(Default)]
+pub(crate) struct StrokeSnapshot {
+    /// Active stroke epoch (`0` = no active snapshot).
+    pub(crate) epoch: u32,
+    /// Monotonically increasing epoch counter.
+    next_epoch: u32,
+    /// Per-slot epoch when `rest_pos` / `rest_normal` were captured.
+    slot_epoch: Vec<u32>,
+    /// Slot-aligned stroke-start positions (`[f32::NAN; 3]` when uncaptured).
+    rest_pos: Vec<[f32; 3]>,
+    /// Slot-aligned stroke-start smooth normals (`[f32::NAN; 3]` when uncaptured).
+    rest_normal: Vec<[f32; 3]>,
+    /// Slots currently populated with finite values for `epoch`.
+    captured: Vec<VertexId>,
+    /// Vertices displaced at least once during `epoch`.
+    pub(crate) touched: Vec<VertexId>,
+    /// Per-slot epoch when added to `touched`.
+    touched_epoch: Vec<u32>,
+    /// Whether `STROKE_POS_CHANNEL` and `STROKE_NORMAL_CHANNEL` were materialized
+    /// onto `Entry::mesh` for a stale-Manual fallback.
+    channels_materialized: bool,
+}
+
+impl StrokeSnapshot {
+    fn clear_captured_slots(&mut self) {
+        for v in self.captured.drain(..) {
+            let idx = v as usize;
+            if idx < self.rest_pos.len() {
+                self.rest_pos[idx] = [f32::NAN; 3];
+                self.rest_normal[idx] = [f32::NAN; 3];
+            }
+        }
+        self.touched.clear();
+    }
+
+    pub(crate) fn invalidate_on_mesh(&mut self, mesh: &mut Mesh) {
+        self.clear_captured_slots();
+        self.epoch = 0;
+        if self.channels_materialized {
+            let _ = mesh.remove_channel(STROKE_POS_CHANNEL);
+            let _ = mesh.remove_channel(STROKE_NORMAL_CHANNEL);
+            self.channels_materialized = false;
+        }
+    }
+
+    pub(crate) fn begin(&mut self, mesh: &mut Mesh, only_if_missing: bool) {
+        if only_if_missing {
+            if self.epoch != 0 {
+                return;
+            }
+            if mesh.channel(STROKE_POS_CHANNEL).is_some()
+                && mesh.channel(STROKE_NORMAL_CHANNEL).is_some()
+            {
+                return;
+            }
+        }
+        self.clear_captured_slots();
+        if self.channels_materialized || mesh.channel(STROKE_POS_CHANNEL).is_some() {
+            let _ = mesh.remove_channel(STROKE_POS_CHANNEL);
+        }
+        if self.channels_materialized || mesh.channel(STROKE_NORMAL_CHANNEL).is_some() {
+            let _ = mesh.remove_channel(STROKE_NORMAL_CHANNEL);
+        }
+        self.channels_materialized = false;
+        if self.next_epoch == u32::MAX {
+            self.slot_epoch.fill(0);
+            self.touched_epoch.fill(0);
+            self.next_epoch = 0;
+        }
+        self.next_epoch += 1;
+        self.epoch = self.next_epoch;
+    }
+
+    fn ensure_slot_len(&mut self, slots: usize) -> std::result::Result<(), StoreError> {
+        if self.slot_epoch.len() < slots {
+            try_reserve_to(&mut self.slot_epoch, slots)?;
+            try_reserve_to(&mut self.rest_pos, slots)?;
+            try_reserve_to(&mut self.rest_normal, slots)?;
+            try_reserve_to(&mut self.touched_epoch, slots)?;
+            self.slot_epoch.resize(slots, 0);
+            self.rest_pos.resize(slots, [f32::NAN; 3]);
+            self.rest_normal.resize(slots, [f32::NAN; 3]);
+            self.touched_epoch.resize(slots, 0);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_region_with_one_ring(
+        &mut self,
+        mesh: &Mesh,
+        region: &[VertexId],
+    ) -> std::result::Result<(), StoreError> {
+        if self.epoch == 0 || region.is_empty() {
+            return Ok(());
+        }
+        let Some(inc) = mesh.incidence() else {
+            return Ok(());
+        };
+        let slots = mesh.vertex_slots();
+        self.ensure_slot_len(slots)?;
+        let positions = mesh.positions();
+        let epoch = self.epoch;
+
+        for &v in region {
+            if !mesh.is_vertex_alive(v) {
+                continue;
+            }
+            let vi = v as usize;
+            if self.slot_epoch[vi] != epoch {
+                try_reserve_extra(&mut self.captured, 1)?;
+                self.slot_epoch[vi] = epoch;
+                self.rest_pos[vi] = positions[vi];
+                self.rest_normal[vi] = local_vertex_normal(mesh, inc, v);
+                self.captured.push(v);
+            }
+            for &t in inc.triangles(v) {
+                let Some(tri) = mesh.triangle(t) else {
+                    continue;
+                };
+                for u in tri {
+                    if !mesh.is_vertex_alive(u) {
+                        continue;
+                    }
+                    let ui = u as usize;
+                    if self.slot_epoch[ui] != epoch {
+                        try_reserve_extra(&mut self.captured, 1)?;
+                        self.slot_epoch[ui] = epoch;
+                        self.rest_pos[ui] = positions[ui];
+                        self.rest_normal[ui] = local_vertex_normal(mesh, inc, u);
+                        self.captured.push(u);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Materializes `STROKE_POS_CHANNEL` and `STROKE_NORMAL_CHANNEL` onto `mesh`
+    /// when a stale Manual BVH forces a dab onto the whole-mesh fallback path,
+    /// preserving all slots already captured earlier in `self.epoch`.
+    pub(crate) fn materialize_channels_for_fallback(&mut self, mesh: &mut Mesh) -> Result<()> {
+        if self.epoch == 0 {
+            return Ok(());
+        }
+        if self.channels_materialized
+            && mesh.channel(STROKE_POS_CHANNEL).is_some()
+            && mesh.channel(STROKE_NORMAL_CHANNEL).is_some()
+        {
+            return Ok(());
+        }
+        mesh.ensure_incidence()?;
+        let slots = mesh.vertex_slots();
+        self.ensure_slot_len(slots)?;
+        try_reserve_to(&mut self.captured, slots)?;
+
+        let mut flat_pos: Vec<f32> = Vec::new();
+        let mut flat_nrm: Vec<f32> = Vec::new();
+        try_reserve_to(&mut flat_pos, slots * 3)?;
+        try_reserve_to(&mut flat_nrm, slots * 3)?;
+
+        {
+            let inc = mesh.incidence().expect("ensured above");
+            let positions = mesh.positions();
+            let epoch = self.epoch;
+            for (u, &pos) in positions.iter().enumerate().take(slots) {
+                let vid = u as VertexId;
+                if !mesh.is_vertex_alive(vid) {
+                    flat_pos.extend_from_slice(&[f32::NAN; 3]);
+                    flat_nrm.extend_from_slice(&[f32::NAN; 3]);
+                    continue;
+                }
+                if self.slot_epoch[u] != epoch {
+                    self.slot_epoch[u] = epoch;
+                    self.rest_pos[u] = pos;
+                    self.rest_normal[u] = local_vertex_normal(mesh, inc, vid);
+                    self.captured.push(vid);
+                }
+                flat_pos.extend_from_slice(&self.rest_pos[u]);
+                flat_nrm.extend_from_slice(&self.rest_normal[u]);
+            }
+        }
+
+        let pos_desc = || {
+            ChannelDesc::source(STROKE_POS_CHANNEL, 3)
+                .bound_to_topology()
+                .with_default(f32::NAN)
+        };
+        let nrm_desc = || {
+            ChannelDesc::source(STROKE_NORMAL_CHANNEL, 3)
+                .bound_to_topology()
+                .with_default(f32::NAN)
+        };
+        if mesh.channel(STROKE_POS_CHANNEL).is_some() {
+            mesh.remove_channel(STROKE_POS_CHANNEL)?;
+        }
+        if mesh.channel(STROKE_NORMAL_CHANNEL).is_some() {
+            mesh.remove_channel(STROKE_NORMAL_CHANNEL)?;
+        }
+        mesh.add_channel_with_values(pos_desc(), &flat_pos)?;
+        if let Err(err) = mesh.add_channel_with_values(nrm_desc(), &flat_nrm) {
+            let _ = mesh.remove_channel(STROKE_POS_CHANNEL);
+            return Err(err.into());
+        }
+        self.channels_materialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_for_moved(
+        &mut self,
+        slots: usize,
+        max_new_moved: usize,
+    ) -> std::result::Result<(), StoreError> {
+        if self.epoch == 0 {
+            return Ok(());
+        }
+        self.ensure_slot_len(slots)?;
+        try_reserve_extra(&mut self.touched, max_new_moved)
+    }
+
+    pub(crate) fn record_moved_reserved(&mut self, moved: &[VertexId]) {
+        if self.epoch == 0 {
+            return;
+        }
+        let epoch = self.epoch;
+        for &v in moved {
+            let idx = v as usize;
+            if self.touched_epoch[idx] != epoch {
+                self.touched_epoch[idx] = epoch;
+                debug_assert!(self.touched.capacity() > self.touched.len());
+                self.touched.push(v);
+            }
+        }
+    }
+
+    pub(crate) fn prepare_splits(
+        &mut self,
+        post_slots: usize,
+        splits: &[[VertexId; 3]],
+    ) -> std::result::Result<PreparedSplits, StoreError> {
+        self.ensure_slot_len(post_slots)?;
+        try_reserve_extra(&mut self.captured, splits.len())?;
+        try_reserve_extra(&mut self.touched, splits.len())?;
+
+        let mut sorted_new: Vec<(VertexId, u32)> = Vec::new();
+        try_reserve_to(&mut sorted_new, splits.len())?;
+        for (i, &[new_v, _, _]) in splits.iter().enumerate() {
+            sorted_new.push((new_v, i as u32));
+        }
+        sorted_new.sort_unstable_by_key(|&(v, _)| v);
+
+        let mut entries: Vec<(VertexId, f32)> = Vec::new();
+        try_reserve_to(&mut entries, splits.len() * 2)?;
+        let mut offsets: Vec<usize> = Vec::new();
+        try_reserve_to(&mut offsets, splits.len() + 1)?;
+        offsets.push(0);
+
+        let mut scratch: Vec<(VertexId, f32)> = Vec::new();
+        for (i, &[_, a, b]) in splits.iter().enumerate() {
+            scratch.clear();
+            for end in [a, b] {
+                if let Ok(pos) = sorted_new.binary_search_by_key(&end, |&(v, _)| v)
+                    && sorted_new[pos].1 < i as u32
+                {
+                    let j = sorted_new[pos].1 as usize;
+                    let range = offsets[j]..offsets[j + 1];
+                    try_reserve_extra(&mut scratch, range.len())?;
+                    for &(id, w) in &entries[range] {
+                        scratch.push((id, 0.5 * w));
+                    }
+                } else {
+                    try_reserve_extra(&mut scratch, 1)?;
+                    scratch.push((end, 0.5));
+                }
+            }
+            scratch.sort_unstable_by_key(|&(id, _)| id);
+            try_reserve_extra(&mut entries, scratch.len())?;
+            let start = entries.len();
+            for &(id, w) in &scratch {
+                if entries.len() > start
+                    && let Some(last) = entries.last_mut()
+                    && last.0 == id
+                {
+                    last.1 += w;
+                } else {
+                    entries.push((id, w));
+                }
+            }
+            offsets.push(entries.len());
+        }
+
+        Ok(PreparedSplits { entries, offsets })
+    }
+
+    pub(crate) fn apply_splits_reserved(
+        &mut self,
+        positions: &[[f32; 3]],
+        splits: &[[VertexId; 3]],
+        prepared: &PreparedSplits,
+    ) {
+        if self.epoch == 0 {
+            return;
+        }
+        let epoch = self.epoch;
+        for (i, &[new_v, a, b]) in splits.iter().enumerate() {
+            let parents = &prepared.entries[prepared.offsets[i]..prepared.offsets[i + 1]];
+            let total: f32 = parents.iter().map(|p| p.1).sum();
+            let (pm, nm) = if total == 0.0 {
+                ([f32::NAN; 3], [f32::NAN; 3])
+            } else {
+                let pm = std::array::from_fn(|k| {
+                    parents
+                        .iter()
+                        .map(|&(v, w)| {
+                            let vi = v as usize;
+                            let p = if self.slot_epoch[vi] == epoch {
+                                self.rest_pos[vi]
+                            } else {
+                                positions[vi]
+                            };
+                            p[k] * w
+                        })
+                        .sum::<f32>()
+                        / total
+                });
+                let nm = std::array::from_fn(|k| {
+                    parents
+                        .iter()
+                        .map(|&(v, w)| {
+                            let vi = v as usize;
+                            let n = if self.slot_epoch[vi] == epoch {
+                                self.rest_normal[vi]
+                            } else {
+                                [0.0; 3]
+                            };
+                            n[k] * w
+                        })
+                        .sum::<f32>()
+                        / total
+                });
+                (pm, nm)
+            };
+
+            let idx = new_v as usize;
+            if self.slot_epoch[idx] != epoch {
+                debug_assert!(self.captured.capacity() > self.captured.len());
+                self.captured.push(new_v);
+            }
+            self.slot_epoch[idx] = epoch;
+            self.rest_pos[idx] = pm;
+            self.rest_normal[idx] = nm;
+
+            let cur = positions[idx];
+            let diff = cur[0].to_bits() != pm[0].to_bits()
+                || cur[1].to_bits() != pm[1].to_bits()
+                || cur[2].to_bits() != pm[2].to_bits();
+            let parent_touched = self.touched_epoch.get(a as usize).copied() == Some(epoch)
+                || self.touched_epoch.get(b as usize).copied() == Some(epoch);
+            if (parent_touched || diff) && self.touched_epoch[idx] != epoch {
+                self.touched_epoch[idx] = epoch;
+                debug_assert!(self.touched.capacity() > self.touched.len());
+                self.touched.push(new_v);
+            }
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> Option<StrokeSlice<'_>> {
+        (self.epoch != 0).then_some(StrokeSlice {
+            positions: &self.rest_pos,
+            normals: &self.rest_normal,
+        })
+    }
+}
+
 /// One mesh of the scene with everything attached to it.
 pub(crate) struct Entry {
     pub(crate) mesh: Mesh,
@@ -92,6 +531,8 @@ pub(crate) struct Entry {
     /// The mesh's world box, cached across queries (see
     /// [`CachedBox`](crate::query::CachedBox)).
     pub(crate) wbox: Option<CachedBox>,
+    /// Lazy `O(1)` stroke-start snapshot for sculpt dabs.
+    pub(crate) stroke: StrokeSnapshot,
 }
 
 impl Entry {
@@ -101,6 +542,7 @@ impl Entry {
     /// match. The caller then calls [`Entry::after_change`], which rebuilds
     /// an Eager BVH right away.
     pub(crate) fn flag_unknown(&mut self) {
+        self.stroke.invalidate_on_mesh(&mut self.mesh);
         self.pending = Some(ChangeSet::default());
         self.rebuild = true;
         self.wbox = None;
@@ -174,8 +616,22 @@ impl Entry {
 
     /// Folds a commit's (or undo's or redo's) changes into the BVH's pending
     /// changes, into every subscriber's report, into every field and
-    /// section hook and into the normals' pending changes.
+    /// section hook and into the normals' pending changes. Any topology or
+    /// vertex-slot change invalidates the lazy stroke snapshot.
     pub(crate) fn record_changes(&mut self, changes: &ChangeSet) {
+        if changes.topology_changed()
+            || !changes.vertices_added.is_empty()
+            || !changes.vertices_removed.is_empty()
+        {
+            self.stroke.invalidate_on_mesh(&mut self.mesh);
+        }
+        self.record_changes_keeping_stroke(changes);
+    }
+
+    /// Like [`Entry::record_changes`], without invalidating `self.stroke`
+    /// (used by [`Scene::split_stretched`] after updating `self.stroke`
+    /// across the new midpoint vertices).
+    pub(crate) fn record_changes_keeping_stroke(&mut self, changes: &ChangeSet) {
         self.content += 1;
         match &mut self.pending {
             Some(p) => p.merge(changes),
@@ -352,7 +808,7 @@ pub struct Scene {
     /// The id the next `subscribe` hands out.
     next_subscriber: u64,
     /// The shared undo history across all meshes.
-    history: History,
+    pub(crate) history: History,
     /// The registered fields, in registration order.
     pub(crate) fields: Vec<Field>,
     /// The registered thickness fields, in registration order.
@@ -496,6 +952,7 @@ impl Scene {
             normals: None,
             content: 0,
             wbox: None,
+            stroke: StrokeSnapshot::default(),
         })
     }
 
@@ -639,7 +1096,7 @@ impl Scene {
 
     /// Updates the Eager fields and section entries involving `touched`
     /// (all with `None`), swallowing failures (§6.3).
-    fn run_eager(&mut self, touched: Option<&[MeshId]>) {
+    pub(crate) fn run_eager(&mut self, touched: Option<&[MeshId]>) {
         self.run_eager_fields(touched);
         self.run_eager_sections(touched);
     }
@@ -716,7 +1173,10 @@ impl Scene {
         for (id, changes) in &done {
             if let Some(e) = self.entries.get_mut(*id) {
                 match changes {
-                    Some(c) => e.record_changes(c),
+                    Some(c) => {
+                        e.stroke.invalidate_on_mesh(&mut e.mesh);
+                        e.record_changes(c);
+                    }
                     None => e.report_placement(),
                 }
             }
@@ -947,12 +1407,129 @@ impl Scene {
         Ok(())
     }
 
+    /// Arms a lazy `O(1)` stroke-start position and smooth-normal snapshot on
+    /// mesh `id` for subsequent [`Scene::dab`] calls (`InflateMethod::StrokeNormal`
+    /// and `GrabOptions { from_stroke: true }`).
+    ///
+    /// Not an edit: records no undo step and reports no change. With
+    /// `only_if_missing`, an already-active stroke snapshot stays as it is.
+    /// Non-[`Scene::split_stretched`] topology edits, [`Scene::undo`],
+    /// [`Scene::redo`], [`Scene::cancel_step`], and [`Scene::compact`]
+    /// invalidate the snapshot cleanly.
+    ///
+    /// # Errors
+    /// [`SceneError::UnknownMesh`] for a stale id.
+    pub fn capture_stroke_state(&mut self, id: MeshId, only_if_missing: bool) -> Result<()> {
+        self.drop_field_unit();
+        let entry = self.entry_mut(id)?;
+        entry.stroke.begin(&mut entry.mesh, only_if_missing);
+        Ok(())
+    }
+
+    /// Runs [`split_stretched`](fast_mesh_ops::stretch::split_stretched) on
+    /// mesh `id` as one undoable edit while carrying any active
+    /// [`Scene::capture_stroke_state`] snapshot across newly split midpoint
+    /// vertices in `O(splits)`.
+    ///
+    /// # Errors
+    /// As for [`Scene::edit`] with [`fast_mesh_ops::stretch::split_stretched`].
+    pub fn split_stretched(
+        &mut self,
+        id: MeshId,
+        options: &StretchOptions,
+    ) -> Result<StretchReport> {
+        self.drop_field_unit();
+        let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
+
+        let valid_opts = options.region.radius.is_finite()
+            && options.region.radius > 0.0
+            && options.region.center.iter().all(|c| c.is_finite())
+            && options.limit.is_finite()
+            && options.limit > 1.0
+            && options.sharp_angle > 0.0
+            && options.sharp_angle <= 180.0
+            && entry.mesh.channel(REST_SIZE_CHANNEL).is_some();
+
+        if entry.stroke.epoch != 0 && valid_opts {
+            entry.mesh.ensure_incidence()?;
+            let mut seeds: Vec<VertexId> = Vec::new();
+            let bvh_ok = if entry.mode == UpdateMode::Manual && !entry.is_current() {
+                false
+            } else {
+                entry.update_bvh().is_ok()
+                    && vertices_in(
+                        &entry.mesh,
+                        &entry.bvh,
+                        &QueryRegion::Sphere {
+                            center: options.region.center,
+                            radius: options.region.radius,
+                        },
+                        &mut seeds,
+                    )
+                    .is_ok()
+            };
+            if !bvh_ok {
+                seeds.clear();
+                let r2 = f64::from(options.region.radius) * f64::from(options.region.radius);
+                let c = options.region.center.map(f64::from);
+                let positions = entry.mesh.positions();
+                for (v, p) in positions.iter().enumerate() {
+                    let vid = v as VertexId;
+                    if !entry.mesh.is_vertex_alive(vid) {
+                        continue;
+                    }
+                    let dx = f64::from(p[0]) - c[0];
+                    let dy = f64::from(p[1]) - c[1];
+                    let dz = f64::from(p[2]) - c[2];
+                    if dx * dx + dy * dy + dz * dz <= r2 {
+                        try_reserve_extra(&mut seeds, 1)?;
+                        seeds.push(vid);
+                    }
+                }
+            }
+            entry
+                .stroke
+                .capture_region_with_one_ring(&entry.mesh, &seeds)?;
+        }
+
+        self.history.reserve()?;
+        let mut tx = entry.mesh.begin_edit();
+        let report = fast_mesh_ops::stretch::split_stretched(&mut tx, options)?;
+        let prepared = if entry.stroke.epoch != 0 && !report.vertices.is_empty() {
+            Some(
+                entry
+                    .stroke
+                    .prepare_splits(tx.mesh().vertex_slots(), &report.vertices)?,
+            )
+        } else {
+            None
+        };
+        let patch = tx.commit()?;
+        if patch.is_empty() {
+            return Ok(report);
+        }
+        if let Some(prep) = &prepared {
+            entry
+                .stroke
+                .apply_splits_reserved(entry.mesh.positions(), &report.vertices, prep);
+        }
+        entry.record_changes_keeping_stroke(patch.changes());
+        self.history
+            .record(&mut self.entries, Change::Edit(id, patch));
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.after_change();
+        }
+        self.run_eager(Some(&[id]));
+        Ok(report)
+    }
+
     /// Builds the mesh's vertex index if it is not cached, so that an operation
     /// run next can follow it instead of scanning every triangle.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`], or the store's error when memory runs out.
     pub fn ensure_incidence(&mut self, id: MeshId) -> Result<()> {
+        self.drop_field_unit();
         self.entry_mut(id)?.mesh.ensure_incidence()?;
         Ok(())
     }
@@ -1018,6 +1595,7 @@ impl Scene {
         self.drop_field_unit();
         let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
         let remap = entry.mesh.compact()?;
+        entry.stroke.invalidate_on_mesh(&mut entry.mesh);
         // The slots of dropped patches no longer exist: nothing to release.
         self.history.forget(id, None);
         // Every slot id changed; the BVH update rebuilds from scratch because
