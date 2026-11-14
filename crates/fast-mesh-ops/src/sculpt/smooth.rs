@@ -9,8 +9,9 @@ use super::filter::{
     vertex_prominence,
 };
 use super::{
-    Brush, Falloff, collect_proper_neighbors, falloff_value, has_any_region_member,
-    normalized_dist, region_index, vertex_normal_from_triangles, write_moves,
+    Brush, Falloff, clear_and_reserve, collect_proper_neighbors, falloff_value,
+    has_any_region_member, normalized_dist, region_index, vertex_normal_from_triangles,
+    write_moves,
 };
 use crate::topology::{VertexFans, cross, dot, proper_triangle, sub};
 use crate::{OpsError, Result, filled, push, reserve};
@@ -297,12 +298,9 @@ fn compute_cotangent_row(
     raw_scratch: &mut Vec<f64>,
     out_weights: &mut Vec<f32>,
 ) -> Result<()> {
-    raw_scratch.clear();
-    let needed = adjacent.len().saturating_sub(raw_scratch.capacity());
-    if needed > 0 {
-        reserve(raw_scratch, needed)?;
-    }
+    let raw_cap = clear_and_reserve(raw_scratch, adjacent.len())?;
     raw_scratch.resize(adjacent.len(), 0.0);
+    debug_assert_eq!(raw_scratch.capacity(), raw_cap);
 
     let pv = positions[v as usize];
     for &t in triangles {
@@ -425,11 +423,7 @@ fn smooth_candidates<'f>(
         }
 
         let m_len = pass_members.len();
-        starts.clear();
-        let need_starts = (m_len + 1).saturating_sub(starts.capacity());
-        if need_starts > 0 {
-            reserve(&mut starts, need_starts)?;
-        }
+        let starts_cap = clear_and_reserve(&mut starts, m_len + 1)?;
         starts.push(0);
         sources.clear();
         cot_weights.clear();
@@ -457,19 +451,13 @@ fn smooth_candidates<'f>(
             }
             starts.push(sources.len() as u32);
         }
+        debug_assert_eq!(starts.capacity(), starts_cap);
 
-        current.clear();
-        let need_cur = m_len.saturating_sub(current.capacity());
-        if need_cur > 0 {
-            reserve(&mut current, need_cur)?;
-        }
+        let cur_cap = clear_and_reserve(&mut current, m_len)?;
         current.extend(pass_members.iter().map(|&(_, v, _)| positions[v as usize]));
+        debug_assert_eq!(current.capacity(), cur_cap);
 
-        before.clear();
-        let need_bef = m_len.saturating_sub(before.capacity());
-        if need_bef > 0 {
-            reserve(&mut before, need_bef)?;
-        }
+        let bef_cap = clear_and_reserve(&mut before, m_len)?;
 
         match options.method {
             SmoothMethod::Taubin | SmoothMethod::Laplacian => {
@@ -482,6 +470,7 @@ fn smooth_candidates<'f>(
                     for &k in sub_passes {
                         before.clear();
                         before.extend_from_slice(&current);
+                        debug_assert_eq!(before.capacity(), bef_cap);
                         for (m, &(_, _, a_m)) in pass_members.iter().enumerate() {
                             let row = &sources[starts[m] as usize..starts[m + 1] as usize];
                             if row.is_empty() {
@@ -511,23 +500,18 @@ fn smooth_candidates<'f>(
                 }
             }
             SmoothMethod::HcLaplacian => {
-                hc_lap.clear();
-                let need_lap = m_len.saturating_sub(hc_lap.capacity());
-                if need_lap > 0 {
-                    reserve(&mut hc_lap, need_lap)?;
-                }
+                let lap_cap = clear_and_reserve(&mut hc_lap, m_len)?;
                 hc_lap.resize(m_len, [0.0; 3]);
+                debug_assert_eq!(hc_lap.capacity(), lap_cap);
 
-                hc_b.clear();
-                let need_b = m_len.saturating_sub(hc_b.capacity());
-                if need_b > 0 {
-                    reserve(&mut hc_b, need_b)?;
-                }
+                let b_cap = clear_and_reserve(&mut hc_b, m_len)?;
                 hc_b.resize(m_len, [0.0; 3]);
+                debug_assert_eq!(hc_b.capacity(), b_cap);
 
                 for _ in 0..options.cycles {
                     before.clear();
                     before.extend_from_slice(&current);
+                    debug_assert_eq!(before.capacity(), bef_cap);
                     for (m, &(_, v, _)) in pass_members.iter().enumerate() {
                         let row = &sources[starts[m] as usize..starts[m + 1] as usize];
                         let q_m = before[m];
@@ -591,6 +575,7 @@ fn smooth_candidates<'f>(
                 for _ in 0..options.cycles {
                     before.clear();
                     before.extend_from_slice(&current);
+                    debug_assert_eq!(before.capacity(), bef_cap);
                     for (m, &(_, _, a_m)) in pass_members.iter().enumerate() {
                         let lo = starts[m] as usize;
                         let hi = starts[m + 1] as usize;

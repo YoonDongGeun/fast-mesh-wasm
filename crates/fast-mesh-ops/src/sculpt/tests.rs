@@ -1842,3 +1842,112 @@ fn task2_region_parity_bit_for_bit_and_oom_sweeps_all_brushes() {
         assert!(sweep(base_mesh(), |tx| twist(tx, &opts).map(drop)) >= 3);
     }
 }
+
+#[test]
+fn asymmetric_multipass_scratch_reuse_reserves_without_infallible_realloc() {
+    // Pass 0 (`+x`, center `[+4, 0, 0]`, radius `1.5`): 3x3 grid (`m0 = 9`, max valence `6`).
+    // Pass 1 (`-x`, center `[-4, 0, 0]`, radius `1.5`): 10-spoke wheel + 3 extra fan vertices
+    // (`m1 = 14`, hub valence `10`), hitting `C < m <= 2 * C` (`9 < 14 <= 18` and `6 < 10 <= 12`)
+    // across all cleared scratch vectors in `GrabMethod::Geodesic` and `SmoothMethod::*`!
+    let asym_mesh = || {
+        let mut positions = Vec::new();
+        let mut triangles = Vec::new();
+
+        // Patch 0 (`+x`, 9 vertices, slots 0..9): 3x3 grid in [3.5..=4.5] x [-0.5..=0.5]
+        for iy in -1i32..=1 {
+            for ix in -1i32..=1 {
+                let z = if ix == 0 && iy == 0 { 0.25 } else { 0.0 };
+                positions.extend([4.0 + ix as f32 * 0.5, iy as f32 * 0.5, z]);
+            }
+        }
+        for iy in 0..2u32 {
+            for ix in 0..2u32 {
+                let a = iy * 3 + ix;
+                triangles.extend([[a, a + 1, a + 4], [a, a + 4, a + 3]]);
+            }
+        }
+
+        // Patch 1 (`-x`, 14 vertices, slots 9..23):
+        // Slots 9..19: 10-gon ring of radius 0.8 around (-4, 0, 0)
+        // Slot 19: hub at (-4, 0, 0.3) with valence 10 (`6 < 10 <= 12` vs Patch 0's max valence 6!)
+        // Slots 20..23: 3 outer tabs at radius 1.1 attached to ring edges (`m1 = 14`, `9 < 14 <= 18`!)
+        let ring_base = 9u32;
+        let spokes = 10u32;
+        for k in 0..spokes {
+            let ang = (k as f32) * std::f32::consts::TAU / (spokes as f32);
+            positions.extend([-4.0 + 0.8 * ang.cos(), 0.8 * ang.sin(), 0.0]);
+        }
+        let hub = ring_base + spokes; // 19
+        positions.extend([-4.0, 0.0, 0.3]);
+        for k in 0..spokes {
+            let next = (k + 1) % spokes;
+            triangles.push([hub, ring_base + k, ring_base + next]);
+        }
+        for k in 0..3u32 {
+            let ang = ((k as f32) + 0.5) * std::f32::consts::TAU / (spokes as f32);
+            let tab = hub + 1 + k;
+            positions.extend([-4.0 + 1.1 * ang.cos(), 1.1 * ang.sin(), 0.05]);
+            triangles.push([ring_base + k, tab, ring_base + k + 1]);
+        }
+
+        let mut m = mesh_of(&positions, &triangles);
+        m.ensure_incidence().unwrap();
+        m
+    };
+
+    let brush = Brush {
+        center: [4.0, 0.0, 0.0],
+        radius: 1.8,
+        falloff: Falloff::Smooth,
+        strength: 0.5,
+    };
+    let sym_x = Symmetry {
+        x: true,
+        y: false,
+        z: false,
+    };
+    let all_ids: Vec<VertexId> = (0..23).collect();
+
+    // 1. Geodesic Grab (`seam_order`, `seam_next`, `geo_dist` reused from m0 = 9 to m1 = 14)
+    let geo_opts = GrabOptions {
+        brush,
+        direction: [0.2, -0.1, 0.6],
+        method: GrabMethod::Geodesic,
+        symmetry: sym_x,
+        ..Default::default()
+    };
+    let (mut gw, mut gr) = (asym_mesh(), asym_mesh());
+    let (rw, _) = edit(&mut gw, |tx| grab(tx, &geo_opts));
+    let (rr, _) = edit(&mut gr, |tx| grab_region(tx, &geo_opts, &all_ids));
+    assert_eq!(rw.moved, 23);
+    assert_eq!(rw, rr);
+    assert_eq!(bits_of(&gw), bits_of(&gr));
+    assert!(sweep(asym_mesh(), |tx| grab(tx, &geo_opts).map(drop)) >= 8);
+    assert!(sweep(asym_mesh(), |tx| grab_region(tx, &geo_opts, &all_ids).map(drop)) >= 8);
+
+    // 2. Smooth across all 4 methods (`starts`, `current`, `before`, `hc_lap`, `hc_b`, `raw_cot_scratch`)
+    for method in [
+        SmoothMethod::Taubin,
+        SmoothMethod::Laplacian,
+        SmoothMethod::HcLaplacian,
+        SmoothMethod::Cotangent,
+    ] {
+        let sm_opts = SmoothOptions {
+            brush,
+            cycles: 2,
+            method,
+            filter: SurfaceFilter::None,
+            symmetry: sym_x,
+        };
+        let (mut sw, mut sr) = (asym_mesh(), asym_mesh());
+        let (rw, _) = edit(&mut sw, |tx| smooth(tx, &sm_opts));
+        let (rr, _) = edit(&mut sr, |tx| smooth_region(tx, &sm_opts, &all_ids));
+        assert!(rw.moved > 0, "{method:?}");
+        assert_eq!(rw, rr, "{method:?}");
+        assert_eq!(bits_of(&sw), bits_of(&sr), "{method:?}");
+        assert!(sweep(asym_mesh(), |tx| smooth(tx, &sm_opts).map(drop)) >= 6);
+        assert!(
+            sweep(asym_mesh(), |tx| smooth_region(tx, &sm_opts, &all_ids).map(drop)) >= 6
+        );
+    }
+}

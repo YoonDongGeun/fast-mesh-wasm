@@ -175,6 +175,17 @@ pub(crate) fn vertex_normal_from_triangles(mesh: &Mesh, triangles: &[TriangleId]
     n
 }
 
+/// Clears `v` and fallibly ensures `v.capacity() >= len` (`v.len() == 0` right
+/// after `clear()`, so `reserve(v, len)` requests exact capacity `0 + len`).
+pub(crate) fn clear_and_reserve<T>(v: &mut Vec<T>, len: usize) -> Result<usize> {
+    v.clear();
+    if v.capacity() < len {
+        crate::reserve(v, len)?;
+    }
+    debug_assert!(v.capacity() >= len);
+    Ok(v.capacity())
+}
+
 /// Collects the ascending deduplicated 1-ring neighbors of `v` from proper
 /// triangles in `triangles`.
 pub(crate) fn collect_proper_neighbors(

@@ -13,8 +13,8 @@ use super::filter::{
 };
 use super::stroke::{StrokeSlice, stroke_position_at};
 use super::{
-    Brush, Falloff, collect_proper_neighbors, falloff_value, normalized_dist, region_index,
-    vertex_normal_from_triangles, write_moves,
+    Brush, Falloff, clear_and_reserve, collect_proper_neighbors, falloff_value, normalized_dist,
+    region_index, vertex_normal_from_triangles, write_moves,
 };
 use crate::topology::{VertexFans, cross, dot, proper_triangle, sub};
 use crate::{OpsError, Result, allocation_allowed, filled, push, reserve};
@@ -823,23 +823,17 @@ fn grab_candidates<'f>(
                 let d0 = best_d0_sq.sqrt();
 
                 // Zero-cost UV seam circular ring by sorted ([u32; 3] bits, local_idx).
-                seam_order.clear();
-                let need_so = m.saturating_sub(seam_order.capacity());
-                if need_so > 0 {
-                    reserve(&mut seam_order, need_so)?;
-                }
+                let so_cap = clear_and_reserve(&mut seam_order, m)?;
                 for (k, &(_, _, p)) in pass_in_sphere.iter().enumerate() {
                     let key = p.map(|x| (x + 0.0).to_bits());
                     seam_order.push((key, k as u32));
                 }
+                debug_assert_eq!(seam_order.capacity(), so_cap);
                 seam_order.sort_unstable();
 
-                seam_next.clear();
-                let need_sn = m.saturating_sub(seam_next.capacity());
-                if need_sn > 0 {
-                    reserve(&mut seam_next, need_sn)?;
-                }
+                let sn_cap = clear_and_reserve(&mut seam_next, m)?;
                 seam_next.resize(m, 0);
+                debug_assert_eq!(seam_next.capacity(), sn_cap);
                 let mut start = 0;
                 while start < m {
                     let group = seam_order[start].0;
@@ -854,12 +848,9 @@ fn grab_candidates<'f>(
                     start = end;
                 }
 
-                geo_dist.clear();
-                let need_gd = m.saturating_sub(geo_dist.capacity());
-                if need_gd > 0 {
-                    reserve(&mut geo_dist, need_gd)?;
-                }
+                let gd_cap = clear_and_reserve(&mut geo_dist, m)?;
                 geo_dist.resize(m, f64::INFINITY);
+                debug_assert_eq!(geo_dist.capacity(), gd_cap);
                 heap.clear();
 
                 let seed_corners = mesh.triangle(seed_tri).unwrap_or([0; 3]);
