@@ -1,5 +1,11 @@
 # fast-mesh-wasm
 
+## 0.8.0
+
+### Minor Changes
+
+- [#225](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/225) [`be71ade`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/be71ade0675a358b6710d9c32fc92d99fc9e26dd) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add Botsch-Kobbelt isotropic and curvature-adaptive surface remeshing (`Scene.remesh.isotropic`, `Scene.remesh.adaptive`, `Scene.remesh.surface`, and `{ op: "remeshSurface", ... }`) plus attribute-aware, error-bounded, and crease-locked QEM decimation (`targetRatio`, `maxDeviation`, `preserveUvs`, `lockCreases`, `creaseAngleDeg`, `preventNormalInversion`, and `maxDeviationAchieved`) across `Scene` and `WorkerScene`.
+
 ## 0.7.0
 
 ### Minor Changes
