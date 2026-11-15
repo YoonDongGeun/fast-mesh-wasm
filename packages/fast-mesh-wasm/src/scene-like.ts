@@ -4,7 +4,7 @@
 // pass them back to these methods. A host other than `Scene` hands out
 // instances of the same nominal classes (`new MeshHandle()`,
 // `new SectionHandle()`) and keeps its own map from them to its ids.
-import type { Bounds, Placement } from "./api.js";
+import type { Bounds, Indices, Placement, Vec3 } from "./api.js";
 import type {
   SyncAlignDomain,
   SyncBooleanDomain,
@@ -23,13 +23,22 @@ import type {
 } from "./domains/index.js";
 import type { MeshViews } from "./views.js";
 import type {
+  BridgeStats,
   ColorRule,
   DragSession,
+  DyntopoDabReport,
+  DyntopoOptions,
+  DyntopoReport,
+  FillContinuityStats,
+  FillHolesContinuityOptions,
   MeshChange,
   MeshHandle,
+  PartialBridgeOptions,
+  SculptBrushOp,
   SectionHandle,
   SectionPlane,
   SectionResult,
+  VertexProtection,
 } from "./scene.js";
 
 /** Domain-separated capability surface exposed by both `Scene` and `WorkerScene`. */
@@ -73,6 +82,39 @@ export interface SceneLike extends SceneDomainsLike {
   endStep?(): void;
   /** Cancels and reverts the active history step when supported by the scene host. */
   cancelStep?(): void;
+  /** Fills a single boundary loop with selectable G0/G1/G2 continuity. */
+  fillHoleContinuity?(
+    mesh: MeshHandle,
+    loopIndex: number,
+    options?: FillHolesContinuityOptions,
+  ): FillContinuityStats | Promise<FillContinuityStats>;
+  /** Fills all eligible holes with selectable G0/G1/G2 continuity. */
+  fillAllHolesContinuity?(
+    mesh: MeshHandle,
+    options?: FillHolesContinuityOptions,
+  ): FillContinuityStats | Promise<FillContinuityStats>;
+  /** Bridges two boundary vertex arcs or index ranges. */
+  bridgePartialArcs?(
+    mesh: MeshHandle,
+    loopA: Indices,
+    loopB: Indices,
+    options?: PartialBridgeOptions,
+  ): BridgeStats | Promise<BridgeStats>;
+  /** Applies localized dynamic topology remeshing inside sphere `(center, radius)`. */
+  applyDyntopo?(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    options?: DyntopoOptions,
+    pinned?: Indices,
+  ): DyntopoReport | Promise<DyntopoReport>;
+  /** Applies localized dynamic topology followed by a brush dab. */
+  dyntopoDab?(
+    mesh: MeshHandle,
+    dab: SculptBrushOp,
+    options?: DyntopoOptions,
+    protection?: VertexProtection,
+  ): DyntopoDabReport | Promise<DyntopoDabReport>;
   /**
    * The rule the mesh is coloured by, or `null` without colouring. Optional:
    * `bindMesh`'s fragment shading needs it (with `views(mesh).values`) and

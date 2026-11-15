@@ -1509,8 +1509,8 @@ describe("WorkerScene", () => {
                   }
                   cb(ev);
                 });
-              } else {
-                inner.addEventListener(type, cb);
+              } else if (type === "error") {
+                inner.addEventListener("error", cb);
               }
             },
             terminate: () => inner.terminate(),

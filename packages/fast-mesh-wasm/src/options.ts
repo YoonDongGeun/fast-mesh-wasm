@@ -1,7 +1,7 @@
 // Wasm-free input normalization and validation helpers shared between
 // `Scene`, `WorkerScene`, domain builders, and the Worker `Engine`.
 import { FastMeshError } from "./core.js";
-import type { Vec3 } from "./api.js";
+import type { Indices, Vec3 } from "./api.js";
 import type { MeshHandle } from "./handles.js";
 import type {
   BooleanMethod,
@@ -10,13 +10,20 @@ import type {
   CoarseAlignMethod,
   CsgNode,
   DeviationOptions,
+  DyntopoMode,
+  DyntopoOptions,
+  FillContinuity,
+  FillHolesContinuityOptions,
   GeodesicMethod,
   GeodesicOptions,
   IcpObjective,
   LandmarkPair,
   OverhangOptions,
+  PartialBridgeOptions,
   QualityMetric,
   RegistrationOptions,
+  SculptBrushOp,
+  SculptOp,
   SurfacePathOptions,
   SurfacePathPoint,
   TriangleQualityOptions,
@@ -428,4 +435,188 @@ export function normalizeRegistrationOptions(sameMesh: boolean, options: Registr
     sampleCount: checkOptionalInt(options.sampleCount, "sampleCount", 1),
     andersonWindow: checkOptionalInt(options.andersonWindow, "andersonWindow", 0),
   };
+}
+
+export const FILL_CONTINUITY_CODES: Record<FillContinuity, number> = {
+  flat: 0,
+  tangent: 1,
+  curvature: 2,
+};
+
+export const FILL_CONTINUITY_FROM_CODE: readonly FillContinuity[] = ["flat", "tangent", "curvature"];
+
+export const DYNTOPO_MODE_CODES: Record<DyntopoMode, number> = {
+  "split-collapse": 0,
+  "split-only": 1,
+  "brush-relative": 2,
+  "constant-detail": 3,
+};
+
+export interface NormalizedFillHolesContinuityOptions {
+  continuity: FillContinuity;
+  maxHolePerimeter?: number;
+  maxHoleVertices?: number;
+  refinePatch: boolean;
+  smoothIterations?: number;
+  detectIslands: boolean;
+}
+
+export interface NormalizedPartialBridgeOptions {
+  loopAIndex: number;
+  arcARange: [number, number];
+  loopBIndex: number;
+  arcBRange: [number, number];
+  twistOffset: number;
+  subdivisions?: number;
+}
+
+export interface NormalizedDyntopoOptions {
+  mode: DyntopoMode;
+  detailSize?: number;
+  minDetailRatio?: number;
+  maxDetailRatio?: number;
+  equalizeValence: boolean;
+  smoothTangent: boolean;
+}
+
+function checkOptionalBoolean(v: unknown, defaultValue: boolean, what: string): boolean {
+  if (v === undefined) {
+    return defaultValue;
+  }
+  if (typeof v !== "boolean") {
+    throw invalid(`${what} must be a boolean`);
+  }
+  return v;
+}
+
+export function checkU32Int(v: number, what: string): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v >= 0x1_0000_0000) {
+    throw invalid(`${what} must be a non-negative u32 integer`);
+  }
+  return v;
+}
+
+export function normalizeU32List(ids: Indices | undefined, what: string): number[] {
+  if (ids === undefined) {
+    return [];
+  }
+  if (
+    !Array.isArray(ids) &&
+    !(ids instanceof Uint32Array) &&
+    !(ids instanceof Int32Array) &&
+    !(ids instanceof Uint16Array)
+  ) {
+    throw invalid(`${what} must be an array or typed integer array`);
+  }
+  const out = new Array<number>(ids.length);
+  for (let i = 0; i < ids.length; i++) {
+    out[i] = checkU32Int(ids[i], `${what}[${i}]`);
+  }
+  return out;
+}
+
+export function normalizeFillHolesContinuityOptions(
+  options: FillHolesContinuityOptions = {},
+): NormalizedFillHolesContinuityOptions {
+  if (!options || typeof options !== "object") {
+    throw invalid("options must be an object");
+  }
+  const continuity = options.continuity ?? "curvature";
+  codeIn(FILL_CONTINUITY_CODES, continuity, "continuity");
+  return {
+    continuity,
+    maxHolePerimeter: checkOptionalPositive(options.maxHolePerimeter, "maxHolePerimeter", false),
+    maxHoleVertices: checkOptionalInt(options.maxHoleVertices, "maxHoleVertices", 0),
+    refinePatch: checkOptionalBoolean(options.refinePatch, true, "refinePatch"),
+    smoothIterations: checkOptionalInt(options.smoothIterations, "smoothIterations", 0),
+    detectIslands: checkOptionalBoolean(options.detectIslands, true, "detectIslands"),
+  };
+}
+
+function normalizeArcRange(
+  range: readonly [number, number] | undefined,
+  fallback: readonly [number, number],
+  what: string,
+): [number, number] {
+  if (range === undefined) {
+    return [fallback[0], fallback[1]];
+  }
+  const a = range as readonly number[];
+  if (!Array.isArray(a) || a.length !== 2) {
+    throw invalid(`${what} must be a [start, end] pair`);
+  }
+  return [checkU32Int(a[0], `${what}[0]`), checkU32Int(a[1], `${what}[1]`)];
+}
+
+export function normalizePartialBridgeOptions(
+  options: PartialBridgeOptions = {},
+): NormalizedPartialBridgeOptions {
+  if (!options || typeof options !== "object") {
+    throw invalid("options must be an object");
+  }
+  const twist = options.twistOffset ?? 0;
+  if (typeof twist !== "number" || !Number.isInteger(twist) || twist < -0x8000_0000 || twist > 0x7fff_ffff) {
+    throw invalid("twistOffset must be a 32-bit integer");
+  }
+  return {
+    loopAIndex: checkOptionalInt(options.loopAIndex, "loopAIndex", 0) ?? 0,
+    arcARange: normalizeArcRange(options.arcARange, [0, 1], "arcARange"),
+    loopBIndex: checkOptionalInt(options.loopBIndex, "loopBIndex", 0) ?? 0,
+    arcBRange: normalizeArcRange(options.arcBRange, [2, 3], "arcBRange"),
+    twistOffset: twist,
+    subdivisions: checkOptionalInt(options.subdivisions, "subdivisions", 0),
+  };
+}
+
+export function normalizeDyntopoOptions(options: DyntopoOptions = {}): NormalizedDyntopoOptions {
+  if (!options || typeof options !== "object") {
+    throw invalid("options must be an object");
+  }
+  const mode = options.mode ?? "split-collapse";
+  codeIn(DYNTOPO_MODE_CODES, mode, "dyntopo mode");
+  const detailSize = checkOptionalPositive(options.detailSize, "detailSize", false);
+  const minDetailRatio = checkOptionalPositive(options.minDetailRatio, "minDetailRatio", true);
+  const maxDetailRatio = checkOptionalPositive(options.maxDetailRatio, "maxDetailRatio", false);
+  if (
+    minDetailRatio !== undefined &&
+    maxDetailRatio !== undefined &&
+    minDetailRatio >= maxDetailRatio
+  ) {
+    throw invalid("minDetailRatio must be smaller than maxDetailRatio");
+  }
+  return {
+    mode,
+    detailSize,
+    minDetailRatio,
+    maxDetailRatio,
+    equalizeValence: checkOptionalBoolean(options.equalizeValence, true, "equalizeValence"),
+    smoothTangent: checkOptionalBoolean(options.smoothTangent, false, "smoothTangent"),
+  };
+}
+
+export function normalizeDyntopoCenterRadius(
+  center: Readonly<Vec3>,
+  radius: number,
+): { center: Vec3; radius: number } {
+  const c = normalizeVec3(center, "center");
+  const r = checkOptionalPositive(radius, "radius", false);
+  if (r === undefined) {
+    throw invalid("radius must be positive and finite");
+  }
+  return { center: c, radius: r };
+}
+
+export function isBrushSculptOp(op: SculptOp): op is SculptBrushOp {
+  return (
+    op !== null &&
+    typeof op === "object" &&
+    (op.op === "inflate" ||
+      op.op === "smooth" ||
+      op.op === "relax" ||
+      op.op === "grab" ||
+      op.op === "flatten" ||
+      op.op === "crease" ||
+      op.op === "clay" ||
+      op.op === "twist")
+  );
 }

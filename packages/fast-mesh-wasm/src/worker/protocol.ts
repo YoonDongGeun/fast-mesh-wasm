@@ -4,7 +4,12 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
-import type { NormalizedBooleanOptions } from "../options.js";
+import type {
+  NormalizedBooleanOptions,
+  NormalizedDyntopoOptions,
+  NormalizedFillHolesContinuityOptions,
+  NormalizedPartialBridgeOptions,
+} from "../options.js";
 import type {
   AddMeshOptions,
   AnalyzeOptions,
@@ -25,6 +30,7 @@ import type {
   RaycastOptions,
   RegistrationOptions,
   RepairOp,
+  SculptBrushOp,
   SectionPlane,
   SectionResult,
   SurfacePathOptions,
@@ -177,6 +183,53 @@ export type Request =
       rev: number;
       id: ClientId;
       payload: { points: Vec3[]; closed: boolean; deleteInside: boolean; snapTolerance?: number };
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "fillHoleContinuity";
+      rev: number;
+      id: ClientId;
+      loopIndex: number;
+      options: NormalizedFillHolesContinuityOptions;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "fillAllHolesContinuity";
+      rev: number;
+      id: ClientId;
+      options: NormalizedFillHolesContinuityOptions;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "bridgePartialArcs";
+      rev: number;
+      id: ClientId;
+      loopA: number[];
+      loopB: number[];
+      options: NormalizedPartialBridgeOptions;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "applyDyntopo";
+      rev: number;
+      id: ClientId;
+      center: Vec3;
+      radius: number;
+      options: NormalizedDyntopoOptions;
+      pinned: number[];
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "dyntopoDab";
+      rev: number;
+      id: ClientId;
+      dab: SculptBrushOp;
+      options: NormalizedDyntopoOptions;
       qid: number;
       key?: string;
     }
@@ -459,6 +512,11 @@ export function keyOf(req: Request): string | undefined {
     case "repair":
     case "cutByPlane":
     case "trimByCurve":
+    case "fillHoleContinuity":
+    case "fillAllHolesContinuity":
+    case "bridgePartialArcs":
+    case "applyDyntopo":
+    case "dyntopoDab":
       return `edit:${req.id}`;
     case "join":
     case "boolean":

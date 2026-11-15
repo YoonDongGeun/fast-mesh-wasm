@@ -575,7 +575,7 @@ fn opt_flag(v: f64, default: bool) -> Result<bool, Error> {
     if v.is_nan() { Ok(default) } else { flag(v) }
 }
 
-fn opt_positive_f32(v: f64, what: &str) -> Result<Option<f32>, Error> {
+pub(crate) fn opt_positive_f32(v: f64, what: &str) -> Result<Option<f32>, Error> {
     if v.is_nan() {
         Ok(None)
     } else if v.is_finite() && v > 0.0 {

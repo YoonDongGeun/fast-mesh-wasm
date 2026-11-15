@@ -7,22 +7,32 @@ import {
   BOOLEAN_METHOD_CODES,
   BOOLEAN_OP_CODES,
   checkSurfacePathOptions,
+  checkU32Int,
   COARSE_ALIGN_CODES,
+  DYNTOPO_MODE_CODES,
   encodeCsgTree,
+  FILL_CONTINUITY_CODES,
+  FILL_CONTINUITY_FROM_CODE,
   GEODESIC_METHOD_CODES,
   ICP_OBJECTIVE_CODES,
+  isBrushSculptOp,
   normalizeBooleanArgs,
   normalizeCsgBatchArgs,
   normalizeDeviationOptions,
+  normalizeDyntopoCenterRadius,
+  normalizeDyntopoOptions,
+  normalizeFillHolesContinuityOptions,
   normalizeGeodesicOptions,
   normalizeLandmarkPairs,
   normalizeOverhangOptions,
+  normalizePartialBridgeOptions,
   normalizeQualityArgs,
   QUALITY_METRIC_CODES,
   normalizeRegistrationOptions,
   normalizeSourceVertices,
   normalizeSurfacePathTarget,
   normalizeTrimCurveArgs,
+  normalizeU32List,
 } from "./options.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
@@ -1706,13 +1716,110 @@ export interface RegistrationReport {
   converged: boolean;
 }
 
-/** Result of {@link Scene.detectSymmetryPlane}. */
+/** Symmetry plane result of {@link Scene.detectSymmetryPlane}. */
 export interface SymmetryPlaneReport {
   planeNormal: Vec3;
   planePoint: Vec3;
   symmetryErrorRms: number;
   symmetryScore: number;
 }
+
+/** Continuity mode across boundary seam edges for {@link Scene.fillHoleContinuity} (#210). */
+export type FillContinuity = "flat" | "tangent" | "curvature";
+
+/** Options for {@link Scene.fillHoleContinuity} and {@link Scene.fillAllHolesContinuity} (#210). */
+export interface FillHolesContinuityOptions {
+  /** Continuity mode (`"curvature"` by default). */
+  continuity?: FillContinuity;
+  /** Maximum boundary loop perimeter to fill (unbounded when unset). */
+  maxHolePerimeter?: number;
+  /** Maximum boundary vertex count to fill (unbounded when unset). */
+  maxHoleVertices?: number;
+  /** Refine and fair the interior patch (`true` by default). */
+  refinePatch?: boolean;
+  /** Iterative relaxation rounds during refinement (`1` by default). */
+  smoothIterations?: number;
+  /** Detect and merge nested island loops enclosed inside the hole (`true` by default). */
+  detectIslands?: boolean;
+}
+
+/** Result statistics returned by continuity hole filling (#210). */
+export interface FillContinuityStats {
+  loopIndex: number;
+  filledVertices: number;
+  filledTriangles: number;
+  perimeter: number;
+  maxDihedralAngleDeg: number;
+  continuity: FillContinuity;
+  islandLoopsMerged: number;
+  converged: boolean;
+}
+
+/** Options for {@link Scene.bridgePartialArcs} (#210). */
+export interface PartialBridgeOptions {
+  /** Index of the first boundary loop (`0` by default; overridden when `loopA` vertices are provided). */
+  loopAIndex?: number;
+  /** Inclusive-start vertex index pair `[start, end]` along loop A (`[0, 1]` by default). */
+  arcARange?: readonly [number, number];
+  /** Index of the second boundary loop (`0` by default; overridden when `loopB` vertices are provided). */
+  loopBIndex?: number;
+  /** Inclusive-start vertex index pair `[start, end]` along loop B (`[2, 3]` by default). */
+  arcBRange?: readonly [number, number];
+  /** Cyclic offset applied when pairing `arcB` vertices (`0` by default). */
+  twistOffset?: number;
+  /** Explicit grid subdivisions across the bridge (auto-matched when omitted). */
+  subdivisions?: number;
+}
+
+/** Result statistics returned by {@link Scene.bridgePartialArcs} (#210). */
+export interface BridgeStats {
+  trianglesAdded: number;
+  verticesAdded: number;
+  resultingLoops: number;
+  arcAVertices: number;
+  arcBVertices: number;
+}
+
+/** Dynamic topology detail policy (#212). */
+export type DyntopoMode = "split-collapse" | "split-only" | "brush-relative" | "constant-detail";
+
+/** Configuration for localized dynamic topology remeshing (#212). */
+export interface DyntopoOptions {
+  /** Detail sizing and split/collapse mode (`"split-collapse"` by default). */
+  mode?: DyntopoMode;
+  /** Target edge length in local units (or brush radius multiplier for `"brush-relative"`). */
+  detailSize?: number;
+  /** Collapse threshold multiplier relative to `detailSize` (`0.4` by default). */
+  minDetailRatio?: number;
+  /** Split threshold multiplier relative to `detailSize` (`1.33` by default). */
+  maxDetailRatio?: number;
+  /** Equalize vertex valence via Delaunay/valence interior edge flips (`true` by default). */
+  equalizeValence?: boolean;
+  /** Apply tangential relaxation inside the ROI (`false` by default). */
+  smoothTangent?: boolean;
+}
+
+/** Topological delta returned by {@link Scene.applyDyntopo} (#212). */
+export interface DyntopoReport {
+  splits: number;
+  collapses: number;
+  flips: number;
+  smoothed: number;
+  createdVertices: Uint32Array;
+  removedVertices: Uint32Array;
+}
+
+/** Combined brush and dynamic topology report returned by {@link Scene.dyntopoDab} (#212). */
+export interface DyntopoDabReport extends DyntopoReport {
+  moved: number;
+  maxDisplacement: number;
+}
+
+/** Sculpt brush ops that operate over a localized brush sphere and support Dyntopo. */
+export type SculptBrushOp = Extract<
+  SculptOp,
+  { op: "inflate" | "smooth" | "relax" | "grab" | "flatten" | "crease" | "clay" | "twist" }
+>;
 
 /**
  * The standard cleanup pipeline for {@link Scene.repair}: weld, remove
@@ -2898,6 +3005,35 @@ interface MeshAdds {
 /** Set by `Scene`'s static block. */
 let meshAddsOf: (scene: Scene) => MeshAdds;
 
+function decodeFillContinuityStats(raw: Float64Array): FillContinuityStats {
+  return {
+    loopIndex: raw[0],
+    filledVertices: raw[1],
+    filledTriangles: raw[2],
+    perimeter: raw[3],
+    maxDihedralAngleDeg: raw[4],
+    continuity: FILL_CONTINUITY_FROM_CODE[raw[5]] ?? "curvature",
+    islandLoopsMerged: raw[6],
+    converged: raw[7] === 1,
+  };
+}
+
+function decodeDyntopoPatch(raw: Float64Array, offset: number): DyntopoReport {
+  const newCount = raw[offset + 4];
+  const removedCount = raw[offset + 5];
+  const start = offset + 6;
+  return {
+    splits: raw[offset],
+    collapses: raw[offset + 1],
+    flips: raw[offset + 2],
+    smoothed: raw[offset + 3],
+    createdVertices: Uint32Array.from(raw.subarray(start, start + newCount)),
+    removedVertices: Uint32Array.from(
+      raw.subarray(start + newCount, start + newCount + removedCount),
+    ),
+  };
+}
+
 /** @internal The stepped mesh adds of `scene` (see {@link MeshAdds}); for the Worker engine. */
 export function meshAdds(scene: Scene): MeshAdds {
   return meshAddsOf(scene);
@@ -2942,6 +3078,9 @@ export class Scene implements SceneLike {
       this.#runRepair(mesh, op)) as RepairBackend<false>["repair"],
     analyze: (mesh, options) => this.analyze(mesh, options),
     join: (target, source, options) => this.join(target, source, options),
+    fillHoleContinuity: (mesh, loopIndex, options) => this.fillHoleContinuity(mesh, loopIndex, options),
+    fillAllHolesContinuity: (mesh, options) => this.fillAllHolesContinuity(mesh, options),
+    bridgePartialArcs: (mesh, loopA, loopB, options) => this.bridgePartialArcs(mesh, loopA, loopB, options),
   });
 
   /**
@@ -2954,6 +3093,9 @@ export class Scene implements SceneLike {
     beginStep: () => this.beginStep(),
     endStep: () => this.endStep(),
     cancelStep: () => this.cancelStep(),
+    applyDyntopo: (mesh, center, radius, options, pinned) =>
+      this.applyDyntopo(mesh, center, radius, options, pinned),
+    dyntopoDab: (mesh, dab, options, protection) => this.dyntopoDab(mesh, dab, options, protection),
   });
 
   /** Remesh, simplification, subdivision, and volumetric reconstruction domain. */
@@ -3366,6 +3508,167 @@ export class Scene implements SceneLike {
       trianglesRemoved: r[3],
       verticesAdded: r[4],
       seamEdges: r[5],
+    };
+  }
+
+  /**
+   * Fills a single boundary loop with selectable continuity (`"flat"`, `"tangent"`, or `"curvature"`)
+   * and nested island detection (one undo step).
+   */
+  fillHoleContinuity(
+    mesh: MeshHandle,
+    loopIndex: number,
+    options: FillHolesContinuityOptions = {},
+  ): FillContinuityStats {
+    const { index, generation } = this.#id(mesh);
+    const loopIdx = checkU32Int(loopIndex, "loopIndex");
+    const norm = normalizeFillHolesContinuityOptions(options);
+    const raw = call(() =>
+      this.#scene().fill_hole_continuity(
+        index,
+        generation,
+        loopIdx,
+        FILL_CONTINUITY_CODES[norm.continuity],
+        optional(norm.maxHolePerimeter, "maxHolePerimeter"),
+        optional(norm.maxHoleVertices, "maxHoleVertices"),
+        norm.refinePatch,
+        optional(norm.smoothIterations, "smoothIterations"),
+        norm.detectIslands,
+      ),
+    );
+    return decodeFillContinuityStats(raw);
+  }
+
+  /**
+   * Fills all eligible boundary loops with selectable continuity (one undo step).
+   */
+  fillAllHolesContinuity(
+    mesh: MeshHandle,
+    options: FillHolesContinuityOptions = {},
+  ): FillContinuityStats {
+    const { index, generation } = this.#id(mesh);
+    const norm = normalizeFillHolesContinuityOptions(options);
+    const raw = call(() =>
+      this.#scene().fill_all_holes_continuity(
+        index,
+        generation,
+        FILL_CONTINUITY_CODES[norm.continuity],
+        optional(norm.maxHolePerimeter, "maxHolePerimeter"),
+        optional(norm.maxHoleVertices, "maxHoleVertices"),
+        norm.refinePatch,
+        optional(norm.smoothIterations, "smoothIterations"),
+        norm.detectIslands,
+      ),
+    );
+    return decodeFillContinuityStats(raw);
+  }
+
+  /**
+   * Bridges two boundary arcs (resolved from `loopA`/`loopB` vertex arrays when non-empty,
+   * or via `options.loopAIndex`/`arcARange` and `loopBIndex`/`arcBRange`) in one undo step.
+   */
+  bridgePartialArcs(
+    mesh: MeshHandle,
+    loopA: Indices = [],
+    loopB: Indices = [],
+    options: PartialBridgeOptions = {},
+  ): BridgeStats {
+    const { index, generation } = this.#id(mesh);
+    const vertsA = normalizeU32List(loopA, "loopA");
+    const vertsB = normalizeU32List(loopB, "loopB");
+    const norm = normalizePartialBridgeOptions(options);
+    const raw = call(() =>
+      this.#scene().bridge_partial_arcs(
+        index,
+        generation,
+        Uint32Array.from(vertsA),
+        Uint32Array.from(vertsB),
+        norm.loopAIndex,
+        norm.arcARange[0],
+        norm.arcARange[1],
+        norm.loopBIndex,
+        norm.arcBRange[0],
+        norm.arcBRange[1],
+        norm.twistOffset,
+        optional(norm.subdivisions, "subdivisions"),
+      ),
+    );
+    return {
+      trianglesAdded: raw[0],
+      verticesAdded: raw[1],
+      resultingLoops: raw[2],
+      arcAVertices: raw[3],
+      arcBVertices: raw[4],
+    };
+  }
+
+  /**
+   * Applies localized dynamic topology remeshing inside sphere `(center, radius)`,
+   * locking any `pinned` vertex IDs (one undo step).
+   */
+  applyDyntopo(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    options: DyntopoOptions = {},
+    pinned: Indices = [],
+  ): DyntopoReport {
+    const { index, generation } = this.#id(mesh);
+    const cr = normalizeDyntopoCenterRadius(center, radius);
+    const norm = normalizeDyntopoOptions(options);
+    const pinnedList = normalizeU32List(pinned, "pinned");
+    const raw = call(() =>
+      this.#scene().apply_dyntopo(
+        index,
+        generation,
+        Float64Array.from(cr.center),
+        cr.radius,
+        DYNTOPO_MODE_CODES[norm.mode],
+        optional(norm.detailSize, "detailSize"),
+        optional(norm.minDetailRatio, "minDetailRatio"),
+        optional(norm.maxDetailRatio, "maxDetailRatio"),
+        norm.equalizeValence,
+        norm.smoothTangent,
+        Uint32Array.from(pinnedList),
+      ),
+    );
+    return decodeDyntopoPatch(raw, 0);
+  }
+
+  /**
+   * Applies localized dynamic topology remeshing followed by a brush dab (with optional
+   * `protection`), coalescing cleanly inside an active `beginStep`/`endStep`.
+   */
+  dyntopoDab(
+    mesh: MeshHandle,
+    dab: SculptBrushOp,
+    options: DyntopoOptions = {},
+    protection?: VertexProtection,
+  ): DyntopoDabReport {
+    const { index, generation } = this.#id(mesh);
+    if (!isBrushSculptOp(dab)) {
+      throw invalid("dyntopoDab requires a brush sculpt operation");
+    }
+    const norm = normalizeDyntopoOptions(options);
+    const effective = protection !== undefined ? ({ ...dab, protect: protection } as SculptBrushOp) : dab;
+    const encoded = encodeRepair([effective]);
+    const raw = call(() =>
+      this.#scene().dyntopo_dab(
+        index,
+        generation,
+        encoded.values,
+        DYNTOPO_MODE_CODES[norm.mode],
+        optional(norm.detailSize, "detailSize"),
+        optional(norm.minDetailRatio, "minDetailRatio"),
+        optional(norm.maxDetailRatio, "maxDetailRatio"),
+        norm.equalizeValence,
+        norm.smoothTangent,
+      ),
+    );
+    return {
+      moved: raw[0],
+      maxDisplacement: raw[1],
+      ...decodeDyntopoPatch(raw, 2),
     };
   }
 

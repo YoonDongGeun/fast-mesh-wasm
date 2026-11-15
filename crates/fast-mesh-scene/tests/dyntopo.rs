@@ -271,10 +271,12 @@ fn scene_apply_dyntopo_handles_manual_lazy_and_eager_modes() {
 
 #[test]
 fn one_million_triangle_localized_dyntopo_stays_sub_8ms_and_compact() {
-    // `terrain(708)` has 2 * 708 * 708 = 1,002,528 triangles (~502,681 vertices).
-    let mesh = terrain(708);
+    // Release tests the 1M-tri terrain (`2 * 708 * 708 = 1,002,528` tris, ~502,681 verts).
+    // Debug runs use `terrain(180)` (64,800 tris, >1.8 MB full mesh vs 256 KB `history_budget`)
+    // so delta-compactness and localized ROI invariants still verify quickly without multi-minute debug BVH builds.
+    let n = if cfg!(debug_assertions) { 180 } else { 708 };
+    let mesh = terrain(n);
     let initial_tris = mesh.triangle_count();
-    assert!(initial_tris >= 1_000_000);
 
     // Tight 256 KB undo budget: a full-mesh clone (> 24 MB) would exceed it and be
     // immediately evicted (`can_undo() == false`), proving compact delta patches.
@@ -330,6 +332,7 @@ fn one_million_triangle_localized_dyntopo_stays_sub_8ms_and_compact() {
 
     #[cfg(not(debug_assertions))]
     {
+        assert!(initial_tris >= 1_000_000);
         assert!(
             median_ms < 8.0 && max_ms < 8.0,
             "1M-tri dyntopo dab exceeded 8ms budget: median={median_ms:.3}ms, max={max_ms:.3}ms"

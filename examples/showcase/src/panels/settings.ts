@@ -10,9 +10,16 @@
 // Pure helpers (no DOM at import, like tour.ts): storage is touched only
 // inside load/save/reset, each guarded the way tour.ts guards its flag,
 // so private mode just means "no persistence".
-import type { GrabMethod, InflateMethod, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
+import type { DyntopoMode, GrabMethod, InflateMethod, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
 import type { CollisionMode, HeatmapParams, RepairOverlayKind } from "../scene/app-state";
 import type { LengthUnit } from "./units";
+
+export const DYNTOPO_MODES: readonly DyntopoMode[] = [
+  "brush-relative",
+  "constant-detail",
+  "split-collapse",
+  "split-only",
+];
 
 export interface SculptMethods {
   inflate: InflateMethod;
@@ -79,6 +86,12 @@ export interface ShowcaseSettings {
    */
   sculptEvenOut: boolean;
   sculptLiveRemesh: boolean;
+  /** Dynamic Topology (Dyntopo) live edge split/collapse during sculpt strokes (#212). */
+  sculptDyntopo: boolean;
+  /** Dynamic Topology detail/operation policy (#212). */
+  sculptDyntopoMode: DyntopoMode;
+  /** Dynamic Topology target detail ratio (`(0.01, 2]`, fraction of brush or mesh radius) (#212). */
+  sculptDyntopoDetail: number;
   maskRadius: number;
   /** Per-brush algorithm choices (#177, #192). */
   sculptMethods: SculptMethods;
@@ -110,6 +123,9 @@ export function defaultSettings(): ShowcaseSettings {
     decimateOnLoad: true,
     sculptEvenOut: false,
     sculptLiveRemesh: true,
+    sculptDyntopo: false,
+    sculptDyntopoMode: "brush-relative",
+    sculptDyntopoDetail: 0.25,
     maskRadius: 0.25,
     sculptMethods: {
       inflate: "vertexNormal",
@@ -236,6 +252,9 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
     decimateOnLoad: asBoolean(doc.decimateOnLoad, fallback.decimateOnLoad),
     sculptEvenOut: asBoolean(doc.sculptEvenOut, fallback.sculptEvenOut),
     sculptLiveRemesh: asBoolean(doc.sculptLiveRemesh, fallback.sculptLiveRemesh),
+    sculptDyntopo: asBoolean(doc.sculptDyntopo, fallback.sculptDyntopo),
+    sculptDyntopoMode: asLiteral(doc.sculptDyntopoMode, DYNTOPO_MODES, fallback.sculptDyntopoMode),
+    sculptDyntopoDetail: asBoundedNumber(doc.sculptDyntopoDetail, fallback.sculptDyntopoDetail, 0.01, 2),
     maskRadius: asNumber(doc.maskRadius, fallback.maskRadius, Number.MIN_VALUE),
     sculptMethods: {
       inflate: asLiteral(
@@ -312,6 +331,9 @@ export interface PersistedSnapshot {
   decimateOnLoad: boolean;
   sculptRemesh: boolean;
   sculptLiveRemesh: boolean;
+  sculptDyntopo: boolean;
+  sculptDyntopoMode: DyntopoMode;
+  sculptDyntopoDetail: number;
   maskRadius: number;
   sculptMethods: SculptMethods;
   sculptGrabPoisson: number;
@@ -338,6 +360,9 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     decimateOnLoad: snap.decimateOnLoad,
     sculptEvenOut: snap.sculptRemesh,
     sculptLiveRemesh: snap.sculptLiveRemesh,
+    sculptDyntopo: snap.sculptDyntopo,
+    sculptDyntopoMode: snap.sculptDyntopoMode,
+    sculptDyntopoDetail: snap.sculptDyntopoDetail,
     maskRadius: snap.maskRadius,
     sculptMethods: { ...snap.sculptMethods },
     sculptGrabPoisson: snap.sculptGrabPoisson,

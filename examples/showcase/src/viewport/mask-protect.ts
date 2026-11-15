@@ -830,6 +830,11 @@ export class MaskLiveTracker {
     addHook(this.#scene, "removeMesh", wrapMeshMutation(this.#scene));
     addHook(this.#scene, "repair", wrapRepairOrSculpt(this.#scene));
     addHook(this.#scene, "sculpt", wrapRepairOrSculpt(this.#scene));
+    addHook(this.#scene, "fillHoleContinuity", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "fillAllHolesContinuity", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "bridgePartialArcs", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "applyDyntopo", wrapMeshMutation(this.#scene));
+    addHook(this.#scene, "dyntopoDab", wrapMeshMutation(this.#scene));
 
     const clearHistoryIfDone = () => {
       if (this.#pendingAsyncHistory > 0) {
