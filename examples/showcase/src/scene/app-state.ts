@@ -147,6 +147,37 @@ export interface InspectQuery {
   point: Vec3;
 }
 
+export type SurfaceFieldMode = "none" | "distance" | "thickness" | "meanCurvature" | "gaussianCurvature";
+
+export type SurfaceColormap = "turbo" | "viridis" | "coolwarm" | "grayscale";
+
+export interface SurfaceFieldState {
+  mode: SurfaceFieldMode;
+  mesh: MeshHandle | null;
+  target: MeshHandle | null;
+  map: SurfaceColormap;
+  min: number;
+  max: number;
+  maxDistance: number;
+}
+
+export interface SurfaceFieldOverlayData {
+  mesh: MeshHandle;
+  values: Float32Array;
+  map: SurfaceColormap;
+  min: number;
+  max: number;
+}
+
+export type CameraProjection = "perspective" | "orthographic";
+
+export type CameraPreset = "front" | "back" | "left" | "right" | "top" | "bottom";
+
+export interface CameraPresetRequest {
+  preset: CameraPreset;
+  n: number;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -248,6 +279,14 @@ export interface AppSnapshot {
   defaultUnits: LengthUnit;
   /** What files loaded from here on are assumed to be in (not persisted: a surprise on the next load). */
   importScale: ImportScale;
+  /** Active surface field analysis controls in InspectPanel (#195). */
+  surfaceField: SurfaceFieldState;
+  /** Per-vertex scalar values for fields rendered via the client overlay (Gaussian curvature, WorkerScene thickness/mean curvature). */
+  surfaceFieldValues: SurfaceFieldOverlayData | null;
+  /** Viewport camera projection mode (#195). */
+  cameraProjection: CameraProjection;
+  /** Latest camera preset request; `n` distinguishes repeated clicks (#195). */
+  cameraPresetRequest: CameraPresetRequest | null;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -306,6 +345,18 @@ export class AppState {
     units: "mm",
     defaultUnits: "mm",
     importScale: NO_IMPORT_SCALE,
+    surfaceField: {
+      mode: "none",
+      mesh: null,
+      target: null,
+      map: "turbo",
+      min: 0,
+      max: 10,
+      maxDistance: 20,
+    },
+    surfaceFieldValues: null,
+    cameraProjection: "perspective",
+    cameraPresetRequest: null,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -361,7 +412,11 @@ export class AppState {
   /** Adds a loaded mesh to the store (its arrays are transferred to a Worker scene) and lists it. */
   addMesh(store: SceneStore, loaded: LoadedMesh): Item {
     const triangles = loaded.indices.length / 3;
-    const mesh = store.addMesh(loaded.positions, loaded.indices, { origin: loaded.center });
+    const mesh = store.addMesh(loaded.positions, loaded.indices, {
+      origin: loaded.center,
+      ...(loaded.colors ? { colors: loaded.colors } : {}),
+      ...(loaded.uvs ? { uvs: loaded.uvs } : {}),
+    });
     const color = PALETTE[this.#nextColor++ % PALETTE.length];
     // Double-sided: open meshes (and their insides) stay visible.
     const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55, side: THREE.DoubleSide });
@@ -459,6 +514,17 @@ export class AppState {
       sculptMaskNotice: this.#snap.sculptMask?.mesh === item.mesh ? null : this.#snap.sculptMaskNotice,
       repairAnalysis: this.#snap.repairAnalysis?.mesh === item.mesh ? null : this.#snap.repairAnalysis,
       inspectQuery: this.#snap.inspectQuery?.mesh === item.mesh ? null : this.#snap.inspectQuery,
+      surfaceField:
+        this.#snap.surfaceField.mesh === item.mesh || this.#snap.surfaceField.target === item.mesh
+          ? {
+              ...this.#snap.surfaceField,
+              mesh: this.#snap.surfaceField.mesh === item.mesh ? null : this.#snap.surfaceField.mesh,
+              target: this.#snap.surfaceField.target === item.mesh ? null : this.#snap.surfaceField.target,
+              mode: this.#snap.surfaceField.mesh === item.mesh ? "none" : this.#snap.surfaceField.mode,
+            }
+          : this.#snap.surfaceField,
+      surfaceFieldValues:
+        this.#snap.surfaceFieldValues?.mesh === item.mesh ? null : this.#snap.surfaceFieldValues,
     });
   }
 
@@ -659,6 +725,36 @@ export class AppState {
   /** Sets the axis-aligned clip box in world coordinates (`null` clears it). */
   setClipBox(box: { min: Vec3; max: Vec3 } | null): void {
     this.#set({ clipBox: box });
+  }
+
+  /** Updates the Inspect surface field analysis controls (#195). */
+  setSurfaceField(patch: Partial<SurfaceFieldState>): void {
+    this.#set({ surfaceField: { ...this.#snap.surfaceField, ...patch } });
+  }
+
+  /** Sets or clears client-evaluated surface field overlay values (#195). */
+  setSurfaceFieldValues(values: SurfaceFieldOverlayData | null): void {
+    this.#set({ surfaceFieldValues: values });
+  }
+
+  /** Switches the viewport camera projection mode (#195). */
+  setCameraProjection(cameraProjection: CameraProjection): void {
+    if (this.#snap.cameraProjection !== cameraProjection) {
+      this.#set({ cameraProjection });
+    }
+  }
+
+  /** Toggles between Perspective and Orthographic projection (#195). */
+  toggleCameraProjection(): CameraProjection {
+    const next: CameraProjection = this.#snap.cameraProjection === "perspective" ? "orthographic" : "perspective";
+    this.#set({ cameraProjection: next });
+    return next;
+  }
+
+  /** Requests the viewport to frame the scene from a standard camera preset (#195). */
+  requestCameraPreset(preset: CameraPreset): void {
+    const prevN = this.#snap.cameraPresetRequest?.n ?? 0;
+    this.#set({ cameraPresetRequest: { preset, n: prevN + 1 } });
   }
 
   /** Whether heavy loads are decimated on load (the mesh list's checkbox). */

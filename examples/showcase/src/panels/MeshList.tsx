@@ -11,6 +11,7 @@ import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
 import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
+import { duplicateMesh, type MirrorAxis, mirrorMesh } from "../scene/workbench-ops";
 import { useMeshPreview } from "./mesh-preview";
 import { IMPORT_UNITS, importScaleFromFactor, importScaleOf, isImportUnit, parseImportScale } from "./units";
 
@@ -47,9 +48,14 @@ export function MeshList(props: {
   onFocus: (mesh: Item["mesh"]) => void;
 }) {
   const { app, onLoad, onCancelLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus } = props;
+  const store = useScene();
+  const [selection] = useSelection();
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
   const decimateOnLoad = useApp(app, (s) => s.decimateOnLoad);
+  const [mirrorAxis, setMirrorAxis] = useState<MirrorAxis>("x");
+  const [mirrorBusy, setMirrorBusy] = useState(false);
+  const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const input = useRef<HTMLInputElement>(null);
   const big = useMemo(bigFileParams, []);
   const heavy = items.filter((i) => i.triangles >= big.warnTriangles);
@@ -183,6 +189,45 @@ export function MeshList(props: {
           ))}
         </ul>
       ) : null}
+      <div className="mesh-actions" role="group" aria-label="Selected mesh actions">
+        <button
+          type="button"
+          data-action="mesh-duplicate"
+          disabled={selectedItem === null || mirrorBusy}
+          title="Clone selected mesh's live geometry, attributes, and placement"
+          onClick={() => {
+            if (selectedItem) {
+              duplicateMesh(store, app, selectedItem);
+            }
+          }}
+        >
+          Duplicate
+        </button>
+        <select
+          aria-label="Mirror axis"
+          data-action="mirror-axis"
+          value={mirrorAxis}
+          disabled={selectedItem === null || mirrorBusy}
+          onChange={(e) => setMirrorAxis(e.currentTarget.value as MirrorAxis)}
+        >
+          <option value="x">X axis</option>
+          <option value="y">Y axis</option>
+          <option value="z">Z axis</option>
+        </select>
+        <button
+          type="button"
+          data-action="mesh-mirror"
+          disabled={selectedItem === null || mirrorBusy}
+          title="Mirror selected mesh across chosen axis and flip triangle winding"
+          onClick={() => {
+            if (!selectedItem) return;
+            setMirrorBusy(true);
+            void mirrorMesh(store, selectedItem.mesh, mirrorAxis).finally(() => setMirrorBusy(false));
+          }}
+        >
+          Mirror
+        </button>
+      </div>
       <ul className="meshes">
         {items.map((item) => (
           <MeshRow key={item.id} app={app} item={item} onFocus={onFocus} />
