@@ -407,7 +407,10 @@ pub fn fill_holes(tx: &mut Transaction, options: &FillOptions) -> Result<FillRep
 
 /// For each of `loops`, whether one of its edges has another boundary edge at
 /// exactly the same two positions, which is what a UV seam looks like.
-fn loops_on_seams(mesh: &fast_mesh_store::Mesh, loops: &[BoundaryLoop]) -> Result<Vec<bool>> {
+pub(crate) fn loops_on_seams(
+    mesh: &fast_mesh_store::Mesh,
+    loops: &[BoundaryLoop],
+) -> Result<Vec<bool>> {
     let roots = weld_roots(mesh, 0.0)?;
     let edge = |a: VertexId, b: VertexId| {
         let (ra, rb) = (roots[a as usize], roots[b as usize]);
@@ -500,7 +503,7 @@ impl Plan {
 }
 
 /// Merges the sorted `extra` into the sorted `into`, from the back.
-fn merge_sorted(
+pub(crate) fn merge_sorted(
     into: &mut Vec<(VertexId, VertexId)>,
     extra: &[(VertexId, VertexId)],
 ) -> Result<()> {

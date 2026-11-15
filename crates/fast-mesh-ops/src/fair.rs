@@ -11,8 +11,23 @@ use fast_mesh_store::{Mesh, VertexId};
 use crate::fill::{FailReason, FairWeights};
 use crate::refine::RefinedPatch;
 use crate::sparse;
-use crate::topology::{VertexFans, cross, dot, point, sub};
+use crate::topology::{EdgeMap, VertexFans, cross, dot, point, sub};
 use crate::{Result, filled, push, reserve};
+
+/// Geometric continuity mode used when fairing a filled hole patch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum FillContinuity {
+    /// Minimal-area / minimal-dihedral DP triangulation (Liepa stage 1), with
+    /// optional interior refinement and no harmonic or biharmonic fairing.
+    Flat,
+    /// `G1` tangent continuity via cotangent Laplace-Beltrami harmonic membrane
+    /// fairing (`L x_interior = 0` with pinned boundary positions).
+    TangentG1,
+    /// `G2` curvature continuity via thin-plate biharmonic fairing (`L^2 x_interior = 0`)
+    /// incorporating boundary position and 1-ring boundary vertex constraints.
+    #[default]
+    CurvatureG2,
+}
 
 /// A solve counts as converged once its residual is this small relative to
 /// the right-hand side.
@@ -64,6 +79,13 @@ pub(crate) fn fair(
     fans: &VertexFans,
     patch: &mut RefinedPatch,
 ) -> Result<std::result::Result<FairResult, FailReason>> {
+    if patch.points.len() == patch.old.len() {
+        return Ok(Ok(FairResult {
+            converged: true,
+            iterations: 0,
+            weights: FairWeights::Cotangent,
+        }));
+    }
     let system = System::build(mesh, fans, patch)?;
     let cotangent = system.solve(patch, FairWeights::Cotangent)?;
     let Some(chosen) = choose(cotangent, || system.solve(patch, FairWeights::Uniform))? else {
@@ -76,6 +98,259 @@ pub(crate) fn fair(
         iterations: chosen.iterations,
         weights: chosen.weights,
     }))
+}
+
+/// Solves the `G1` harmonic membrane problem `L x_interior = 0` with the
+/// boundary vertices of `patch` pinned at their current positions.
+///
+/// Uses cotangent Laplace weights (clamped to `CLAMP * mean`) factored with
+/// nested-dissection sparse LDLᵀ, falling back to Jacobi-preconditioned PCG
+/// and then uniform weights when needed.
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn fair_harmonic_g1(
+    mesh: &Mesh,
+    fans: &VertexFans,
+    patch: &mut RefinedPatch,
+) -> Result<std::result::Result<FairResult, FailReason>> {
+    if patch.points.len() == patch.old.len() {
+        return Ok(Ok(FairResult {
+            converged: true,
+            iterations: 0,
+            weights: FairWeights::Cotangent,
+        }));
+    }
+    let system = System::build(mesh, fans, patch)?;
+    let cotangent = system.solve_harmonic(patch, FairWeights::Cotangent)?;
+    let Some(chosen) = choose(cotangent, || {
+        system.solve_harmonic(patch, FairWeights::Uniform)
+    })?
+    else {
+        return Ok(Err(FailReason::Solver));
+    };
+    let first = patch.old.len();
+    patch.points[first..].copy_from_slice(&chosen.x);
+    Ok(Ok(FairResult {
+        converged: chosen.converged,
+        iterations: chosen.iterations,
+        weights: chosen.weights,
+    }))
+}
+
+/// Applies the requested [`FillContinuity`] fairing to `patch`, running
+/// `smooth_iterations.max(1)` outer solve + interior Delaunay relaxation
+/// passes when `continuity` is not [`FillContinuity::Flat`].
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn fair_with_continuity(
+    mesh: &Mesh,
+    fans: &VertexFans,
+    edges: &EdgeMap,
+    patch: &mut RefinedPatch,
+    continuity: FillContinuity,
+    smooth_iterations: usize,
+) -> Result<std::result::Result<FairResult, FailReason>> {
+    if continuity == FillContinuity::Flat || patch.points.len() == patch.old.len() {
+        return Ok(Ok(FairResult {
+            converged: true,
+            iterations: 0,
+            weights: FairWeights::Cotangent,
+        }));
+    }
+    let passes = smooth_iterations.max(1);
+    let mut last = FairResult {
+        converged: true,
+        iterations: 0,
+        weights: FairWeights::Cotangent,
+    };
+    for pass in 0..passes {
+        let res = match continuity {
+            FillContinuity::Flat => unreachable!(),
+            FillContinuity::TangentG1 => fair_harmonic_g1(mesh, fans, patch)?,
+            FillContinuity::CurvatureG2 => fair(mesh, fans, patch)?,
+        };
+        let Ok(r) = res else {
+            return Ok(res);
+        };
+        last = r;
+        if pass + 1 < passes {
+            let flipped = relax_interior_delaunay(patch, edges)?;
+            // G1 membrane with fixed weights on fixed triangles is idempotent unless
+            // edge flips altered the interior triangulation; G2 also updates curved
+            // cotangent weights and 1-ring areas on one extra pass.
+            if !flipped && continuity == FillContinuity::TangentG1 {
+                break;
+            }
+        }
+    }
+    Ok(Ok(last))
+}
+
+/// Flips interior patch edges that violate the intrinsic 3D Delaunay criterion
+/// (`cot alpha + cot beta < 0`) when doing so preserves non-degenerate triangles
+/// without folding over or duplicating an existing edge.
+///
+/// Boundary edges and edges belonging to the existing mesh (`edges`) are never
+/// flipped. Returns `true` if at least one flip occurred.
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn relax_interior_delaunay(patch: &mut RefinedPatch, edges: &EdgeMap) -> Result<bool> {
+    let nt = patch.triangles.len();
+    if nt < 2 {
+        return Ok(false);
+    }
+    let old_len = patch.old.len();
+    let max_sweeps = 4usize;
+    let mut any_flipped = false;
+
+    for _ in 0..max_sweeps {
+        let mut records: Vec<(u32, u32, bool, u32, u32)> = Vec::new();
+        reserve(&mut records, 3 * nt)?;
+        for (ti, &t) in patch.triangles.iter().enumerate() {
+            for e in 0..3 {
+                let (u, v, opp) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
+                let (lo, hi, fwd) = if u < v { (u, v, true) } else { (v, u, false) };
+                records.push((lo, hi, fwd, ti as u32, opp));
+            }
+        }
+        records.sort_unstable();
+
+        let mut existing_edges: Vec<(u32, u32)> = Vec::new();
+        reserve(&mut existing_edges, records.len())?;
+        for r in &records {
+            if existing_edges.last().copied() != Some((r.0, r.1)) {
+                existing_edges.push((r.0, r.1));
+            }
+        }
+
+        let mut touched = filled(nt, false)?;
+        let mut added_diags: Vec<(u32, u32)> = Vec::new();
+        let mut sweep_flipped = false;
+
+        let mut idx = 0usize;
+        while idx < records.len() {
+            let (lo, hi) = (records[idx].0, records[idx].1);
+            let mut end = idx + 1;
+            while end < records.len() && records[end].0 == lo && records[end].1 == hi {
+                end += 1;
+            }
+            if end - idx == 2 {
+                let r0 = records[idx];
+                let r1 = records[idx + 1];
+                if r0.2 != r1.2 {
+                    let (fwd_rec, rev_rec) = if r0.2 { (r0, r1) } else { (r1, r0) };
+                    let (t1, a) = (fwd_rec.3 as usize, fwd_rec.4);
+                    let (t2, b) = (rev_rec.3 as usize, rev_rec.4);
+                    if !touched[t1] && !touched[t2] && a != b {
+                        let is_mesh_edge = (lo as usize) < old_len
+                            && (hi as usize) < old_len
+                            && edges
+                                .kind(patch.old[lo as usize], patch.old[hi as usize])
+                                .is_some();
+                        if !is_mesh_edge {
+                            let diag = (a.min(b), a.max(b));
+                            let dup_mesh = (diag.0 as usize) < old_len
+                                && (diag.1 as usize) < old_len
+                                && edges
+                                    .kind(patch.old[diag.0 as usize], patch.old[diag.1 as usize])
+                                    .is_some();
+                            let dup_patch = existing_edges.binary_search(&diag).is_ok()
+                                || added_diags.contains(&diag);
+                            if !dup_mesh
+                                && !dup_patch
+                                && should_flip_quad(&patch.points, lo, hi, a, b)
+                            {
+                                // t1 = (lo, hi, a), t2 = (hi, lo, b) -> [b, hi, a], [a, lo, b].
+                                patch.triangles[t1] = [b, hi, a];
+                                patch.triangles[t2] = [a, lo, b];
+                                touched[t1] = true;
+                                touched[t2] = true;
+                                push(&mut added_diags, diag)?;
+                                sweep_flipped = true;
+                                any_flipped = true;
+                            }
+                        }
+                    }
+                }
+            }
+            idx = end;
+        }
+        if !sweep_flipped {
+            break;
+        }
+    }
+    Ok(any_flipped)
+}
+
+/// Checks the intrinsic 3D Delaunay condition plus non-degenerate, non-folding
+/// orientation before flipping `(lo, hi)` between `(lo, hi, a)` and `(hi, lo, b)`.
+fn should_flip_quad(points: &[[f64; 3]], lo: u32, hi: u32, a: u32, b: u32) -> bool {
+    let (plo, phi, pa, pb) = (
+        points[lo as usize],
+        points[hi as usize],
+        points[a as usize],
+        points[b as usize],
+    );
+    let Some(cot_a) = corner_cot(pa, plo, phi) else {
+        return false;
+    };
+    let Some(cot_b) = corner_cot(pb, phi, plo) else {
+        return false;
+    };
+    if cot_a + cot_b >= -1e-6 {
+        return false;
+    }
+    let Some(n_old1) = unit_tri_normal(plo, phi, pa) else {
+        return false;
+    };
+    let Some(n_old2) = unit_tri_normal(phi, plo, pb) else {
+        return false;
+    };
+    if dot(n_old1, n_old2) < 0.0 {
+        return false;
+    }
+    let Some(n_new1) = unit_tri_normal(pb, phi, pa) else {
+        return false;
+    };
+    let Some(n_new2) = unit_tri_normal(pa, plo, pb) else {
+        return false;
+    };
+    let avg = [
+        n_old1[0] + n_old2[0],
+        n_old1[1] + n_old2[1],
+        n_old1[2] + n_old2[2],
+    ];
+    let avg_len = dot(avg, avg).sqrt();
+    if avg_len <= 1e-12 {
+        return false;
+    }
+    let avg_n = [avg[0] / avg_len, avg[1] / avg_len, avg[2] / avg_len];
+    if dot(n_new1, avg_n) <= 0.25 || dot(n_new2, avg_n) <= 0.25 || dot(n_new1, n_new2) <= 0.25 {
+        return false;
+    }
+    // Check the new diagonal's cotangent sum improves strictly over negative.
+    let (Some(new_cot_lo), Some(new_cot_hi)) = (corner_cot(plo, pb, pa), corner_cot(phi, pa, pb))
+    else {
+        return false;
+    };
+    new_cot_lo + new_cot_hi > cot_a + cot_b + 1e-6
+}
+
+fn corner_cot(p: [f64; 3], q: [f64; 3], r: [f64; 3]) -> Option<f64> {
+    let (u, w) = (sub(q, p), sub(r, p));
+    let c = cross(u, w);
+    let sin = dot(c, c).sqrt();
+    let denom = DEGENERATE * (dot(u, u) * dot(w, w)).sqrt();
+    (sin > denom && denom.is_finite()).then(|| dot(u, w) / sin)
+}
+
+fn unit_tri_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<[f64; 3]> {
+    let n = cross(sub(b, a), sub(c, a));
+    let len = dot(n, n).sqrt();
+    (len.is_finite() && len > 1e-15).then(|| [n[0] / len, n[1] / len, n[2] / len])
 }
 
 /// The solution to keep: the cotangent one when it converged, else the
@@ -411,6 +686,288 @@ impl System {
             weights,
         }))
     }
+
+    /// Solves the `G1` harmonic system `L_II x_int = -L_IB x_bnd` with `weights`;
+    /// returns `None` when weights or solved positions are non-finite.
+    fn solve_harmonic(
+        &self,
+        patch: &RefinedPatch,
+        weights: FairWeights,
+    ) -> Result<Option<Attempt>> {
+        let (np, first) = (self.patch_len, self.first_free);
+        let free = np - first;
+        if free == 0 {
+            return Ok(Some(Attempt {
+                x: Vec::new(),
+                converged: true,
+                iterations: 0,
+                residual: 0.0,
+                weights,
+            }));
+        }
+        let cotangent = weights == FairWeights::Cotangent;
+        let mut interior_count = 0usize;
+        let mut raw_sum = 0.0f64;
+        for &((a, b), w) in &self.edges {
+            let (a, b) = (a as usize, b as usize);
+            if a < np && b < np && (a >= first || b >= first) {
+                interior_count += 1;
+                raw_sum += w;
+            }
+        }
+        if interior_count == 0 {
+            return Ok(None);
+        }
+        let floor = if cotangent {
+            let mean = raw_sum / interior_count as f64;
+            if !(mean.is_finite() && mean > 0.0) {
+                return Ok(None);
+            }
+            CLAMP * mean
+        } else {
+            0.0
+        };
+
+        let mut entries: Vec<(u32, u32, f64)> = Vec::new();
+        reserve(&mut entries, 3 * interior_count)?;
+        let mut rhs = [
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+        ];
+        for &((a, b), raw_w) in &self.edges {
+            let (a, b) = (a as usize, b as usize);
+            if a >= np || b >= np || (a < first && b < first) {
+                continue;
+            }
+            let w = if cotangent { raw_w.max(floor) } else { 1.0 };
+            if !w.is_finite() {
+                return Ok(None);
+            }
+            match (a >= first, b >= first) {
+                (true, true) => {
+                    let (ui, uj) = ((a - first) as u32, (b - first) as u32);
+                    entries.push((ui, ui, w));
+                    entries.push((uj, uj, w));
+                    entries.push((ui, uj, -w));
+                }
+                (true, false) => {
+                    let ui = (a - first) as u32;
+                    entries.push((ui, ui, w));
+                    let p = self.points[b];
+                    for d in 0..3 {
+                        rhs[d][ui as usize] += w * p[d];
+                    }
+                }
+                (false, true) => {
+                    let uj = (b - first) as u32;
+                    entries.push((uj, uj, w));
+                    let p = self.points[a];
+                    for d in 0..3 {
+                        rhs[d][uj as usize] += w * p[d];
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+        if rhs.iter().flatten().any(|v| !v.is_finite()) {
+            return Ok(None);
+        }
+
+        let (row_starts, cols, vals) = build_symmetric_csr(free, &entries)?;
+        let mut xs = [
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+            filled(free, 0.0f64)?,
+        ];
+        let mut ax = filled(free, 0.0f64)?;
+        let mut x0 = filled(free, 0.0f64)?;
+
+        let mut converged = false;
+        let mut residual = f64::INFINITY;
+        let mut iterations = 0usize;
+
+        if let Some(factor) = sparse::factor_spd_ordered(free, &entries, &self.order)? {
+            let mut ok = true;
+            let mut rel_max = 0.0f64;
+            for d in 0..3 {
+                factor.solve(&rhs[d], &mut xs[d])?;
+                let (c, rel, finite) = eval_csr_residual(
+                    &row_starts,
+                    &cols,
+                    &vals,
+                    &xs[d],
+                    &rhs[d],
+                    &patch.points[first..np],
+                    d,
+                    &mut x0,
+                    &mut ax,
+                );
+                if !finite {
+                    ok = false;
+                    break;
+                }
+                ok &= c;
+                rel_max = rel_max.max(rel);
+            }
+            if ok {
+                converged = true;
+                residual = rel_max;
+            }
+        }
+
+        if !converged {
+            let max_iters = (free * 4).max(128);
+            let mut pcg_conv = true;
+            let mut pcg_res = 0.0f64;
+            let csr = sparse::SymCsr {
+                n: free,
+                row_starts: &row_starts,
+                cols: &cols,
+                vals: &vals,
+            };
+            for d in 0..3 {
+                for (dst, pt) in xs[d][..free].iter_mut().zip(&patch.points[first..np]) {
+                    *dst = pt[d];
+                }
+                let r = sparse::solve_pcg(&csr, &rhs[d], &mut xs[d], TOLERANCE, max_iters)?;
+                iterations = iterations.max(r.iterations);
+                let (c, rel, finite) = eval_csr_residual(
+                    &row_starts,
+                    &cols,
+                    &vals,
+                    &xs[d],
+                    &rhs[d],
+                    &patch.points[first..np],
+                    d,
+                    &mut x0,
+                    &mut ax,
+                );
+                if !finite {
+                    return Ok(None);
+                }
+                pcg_conv &= c && r.converged;
+                pcg_res = pcg_res.max(rel);
+            }
+            converged = pcg_conv;
+            residual = pcg_res;
+        }
+
+        let mut x = filled(free, [0.0f64; 3])?;
+        for (xi, ((&vx, &vy), &vz)) in x
+            .iter_mut()
+            .zip(xs[0].iter().zip(xs[1].iter()).zip(xs[2].iter()))
+        {
+            *xi = [vx, vy, vz];
+        }
+        Ok(Some(Attempt {
+            x,
+            converged,
+            iterations,
+            residual,
+            weights,
+        }))
+    }
+}
+
+/// Evaluates `|rhs - A x|` for CSR `A` against the tolerance reference norm.
+#[allow(clippy::too_many_arguments)]
+fn eval_csr_residual(
+    row_starts: &[u32],
+    cols: &[u32],
+    vals: &[f64],
+    x: &[f64],
+    rhs: &[f64],
+    init_points: &[[f64; 3]],
+    axis: usize,
+    x0: &mut [f64],
+    ax: &mut [f64],
+) -> (bool, f64, bool) {
+    if x.iter().any(|v| !v.is_finite()) {
+        return (false, f64::INFINITY, false);
+    }
+    let res = csr_residual(row_starts, cols, vals, x, rhs, ax);
+    if !res.is_finite() {
+        return (false, f64::INFINITY, false);
+    }
+    let rhs_norm = norm(rhs);
+    let reference = if rhs_norm > 0.0 {
+        rhs_norm
+    } else {
+        for (i, xi) in x0.iter_mut().enumerate() {
+            *xi = init_points[i][axis];
+        }
+        csr_residual(row_starts, cols, vals, x0, rhs, ax)
+    };
+    let conv = res <= TOLERANCE * reference;
+    let rel = if reference > 0.0 {
+        res / reference
+    } else {
+        0.0
+    };
+    (conv, rel, true)
+}
+
+/// Converts symmetric undirected/diagonal triplets into sorted merged CSR.
+fn build_symmetric_csr(
+    n: usize,
+    entries: &[(u32, u32, f64)],
+) -> Result<(Vec<u32>, Vec<u32>, Vec<f64>)> {
+    let mut triplets: Vec<(u32, u32, f64)> = Vec::new();
+    reserve(&mut triplets, entries.len() * 2)?;
+    for &(u, v, w) in entries {
+        triplets.push((u, v, w));
+        if u != v {
+            triplets.push((v, u, w));
+        }
+    }
+    triplets.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2)));
+
+    let mut row_starts = filled(n + 1, 0u32)?;
+    let mut cols: Vec<u32> = Vec::new();
+    let mut vals: Vec<f64> = Vec::new();
+    reserve(&mut cols, triplets.len())?;
+    reserve(&mut vals, triplets.len())?;
+
+    let mut i = 0usize;
+    while i < triplets.len() {
+        let r = triplets[i].0;
+        let c = triplets[i].1;
+        let mut sum = triplets[i].2;
+        i += 1;
+        while i < triplets.len() && triplets[i].0 == r && triplets[i].1 == c {
+            sum += triplets[i].2;
+            i += 1;
+        }
+        cols.push(c);
+        vals.push(sum);
+        row_starts[r as usize + 1] += 1;
+    }
+    for r in 0..n {
+        row_starts[r + 1] += row_starts[r];
+    }
+    Ok((row_starts, cols, vals))
+}
+
+fn csr_residual(
+    row_starts: &[u32],
+    cols: &[u32],
+    vals: &[f64],
+    x: &[f64],
+    rhs: &[f64],
+    ax: &mut [f64],
+) -> f64 {
+    let mut s = 0.0;
+    for i in 0..rhs.len() {
+        let mut sum = 0.0;
+        for t in row_starts[i] as usize..row_starts[i + 1] as usize {
+            sum += vals[t] * x[cols[t] as usize];
+        }
+        ax[i] = sum;
+        let diff = rhs[i] - sum;
+        s += diff * diff;
+    }
+    s.sqrt()
 }
 
 /// `|rhs - Bᵀ B x|`, with `B` in compressed rows; `bx` (one entry per row
@@ -571,5 +1128,188 @@ mod tests {
             Err(FailReason::Solver)
         );
         assert_eq!(patch.points, before);
+    }
+
+    #[test]
+    fn harmonic_g1_reproduces_tilted_plane_and_saddle() {
+        let mesh = tilted_hole();
+        let (fans, mut patch) = refined(&mesh);
+        assert!(patch.new_vertices() > 0);
+        let r = fair_harmonic_g1(&mesh, &fans, &mut patch).unwrap().unwrap();
+        assert!(r.converged && r.iterations == 0);
+        let first = patch.old.len();
+        for p in &patch.points[first..] {
+            assert!((p[2] - 0.3 * p[0] - 0.2 * p[1]).abs() < 1e-6, "{p:?}");
+            assert!((2.0..=6.0).contains(&p[0]) && (2.0..=6.0).contains(&p[1]));
+        }
+
+        // Saddle hole z = 0.08 * ((x - 4)^2 - (y - 4)^2) obeys the maximum principle.
+        let (mut pos, tris) = parts(&tilted_hole());
+        for p in pos.chunks_mut(3) {
+            let (dx, dy) = (p[0] - 4.0, p[1] - 4.0);
+            p[2] = 0.08 * (dx * dx - dy * dy);
+        }
+        let saddle = mesh_of(&pos, &tris);
+        let (sfans, mut spatch) = refined(&saddle);
+        let sr = fair_harmonic_g1(&saddle, &sfans, &mut spatch)
+            .unwrap()
+            .unwrap();
+        assert!(sr.converged);
+        let old_len = spatch.old.len();
+        let min_z = spatch.points[..old_len]
+            .iter()
+            .map(|p| p[2])
+            .fold(f64::INFINITY, f64::min);
+        let max_z = spatch.points[..old_len]
+            .iter()
+            .map(|p| p[2])
+            .fold(f64::NEG_INFINITY, f64::max);
+        for p in &spatch.points[old_len..] {
+            assert!(
+                p[2] >= min_z - 1e-6 && p[2] <= max_z + 1e-6,
+                "z={} outside [{min_z}, {max_z}]",
+                p[2]
+            );
+        }
+    }
+
+    #[test]
+    fn continuity_modes_fit_sphere_and_cylinder() {
+        let cells: Vec<(u32, u32)> = (2..6).flat_map(|y| (2..6).map(move |x| (x, y))).collect();
+        let (mut spos, stris) = parts(&grid_without(8, &cells));
+        let radius = 10.0f32;
+        for p in spos.chunks_mut(3) {
+            let (x, y) = (p[0] - 4.0, p[1] - 4.0);
+            p[2] = (radius * radius - x * x - y * y).sqrt();
+        }
+        let sphere_cap = mesh_of(&spos, &stris);
+        let loops = boundary_loops(&sphere_cap).unwrap();
+        let hole = loops.iter().min_by_key(|l| l.vertices.len()).unwrap();
+        let edges = EdgeMap::build(&sphere_cap).unwrap();
+        let fans = VertexFans::build(&sphere_cap).unwrap();
+        let base_tris = triangulate_loop(&sphere_cap, &hole.vertices, &edges, 200, None)
+            .unwrap()
+            .unwrap();
+
+        let radial_err = |patch: &RefinedPatch| -> f64 {
+            patch.points[patch.old.len()..]
+                .iter()
+                .map(|p| {
+                    let r = ((p[0] - 4.0).powi(2) + (p[1] - 4.0).powi(2) + p[2] * p[2]).sqrt();
+                    (r - radius as f64).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+
+        let mut p_flat =
+            refine(&sphere_cap, &fans, &edges, &hole.vertices, &base_tris, None).unwrap();
+        let before = p_flat.points.clone();
+        fair_with_continuity(
+            &sphere_cap,
+            &fans,
+            &edges,
+            &mut p_flat,
+            FillContinuity::Flat,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p_flat.points, before);
+
+        let mut p_g1 =
+            refine(&sphere_cap, &fans, &edges, &hole.vertices, &base_tris, None).unwrap();
+        fair_with_continuity(
+            &sphere_cap,
+            &fans,
+            &edges,
+            &mut p_g1,
+            FillContinuity::TangentG1,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut p_g2 =
+            refine(&sphere_cap, &fans, &edges, &hole.vertices, &base_tris, None).unwrap();
+        fair_with_continuity(
+            &sphere_cap,
+            &fans,
+            &edges,
+            &mut p_g2,
+            FillContinuity::CurvatureG2,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            radial_err(&p_g2) < radial_err(&p_g1) * 0.25 && radial_err(&p_g2) < 0.05,
+            "sphere G2 err={} vs G1 err={}",
+            radial_err(&p_g2),
+            radial_err(&p_g1)
+        );
+
+        // Cylinder patch: y unchanged, x^2 + z^2 = R^2 centered at x = 4.
+        let (mut cpos, ctris) = parts(&grid_without(8, &cells));
+        for p in cpos.chunks_mut(3) {
+            let x = p[0] - 4.0;
+            p[2] = (radius * radius - x * x).sqrt();
+        }
+        let cyl = mesh_of(&cpos, &ctris);
+        let cloops = boundary_loops(&cyl).unwrap();
+        let chole = cloops.iter().min_by_key(|l| l.vertices.len()).unwrap();
+        let cedges = EdgeMap::build(&cyl).unwrap();
+        let cfans = VertexFans::build(&cyl).unwrap();
+        let ctris_base = triangulate_loop(&cyl, &chole.vertices, &cedges, 200, None)
+            .unwrap()
+            .unwrap();
+        let mut cyl_g2 = refine(&cyl, &cfans, &cedges, &chole.vertices, &ctris_base, None).unwrap();
+        fair_with_continuity(
+            &cyl,
+            &cfans,
+            &cedges,
+            &mut cyl_g2,
+            FillContinuity::CurvatureG2,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        let cyl_err = cyl_g2.points[cyl_g2.old.len()..]
+            .iter()
+            .map(|p| (((p[0] - 4.0).powi(2) + p[2] * p[2]).sqrt() - radius as f64).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            cyl_err < 0.05,
+            "cylinder G2 radial error too high: {cyl_err}"
+        );
+    }
+
+    #[test]
+    fn relax_interior_delaunay_flips_bad_diagonal() {
+        let mesh = tilted_hole();
+        let edges = EdgeMap::build(&mesh).unwrap();
+        // Flat elongated diamond: diagonal (0, 2) is much longer than (1, 3).
+        let mut patch = RefinedPatch {
+            old: vec![0, 10, 20],
+            points: vec![
+                [0.0, 0.0, 0.0],
+                [5.0, -0.5, 0.0],
+                [10.0, 0.0, 0.0],
+                [5.0, 0.5, 0.0],
+            ],
+            parents: vec![[(0, 0.5), (1, 0.5), (2, 0.0)]],
+            triangles: vec![[0, 2, 3], [2, 0, 1]],
+            capped: false,
+        };
+        assert!(relax_interior_delaunay(&mut patch, &edges).unwrap());
+        let has_short_diag = patch
+            .triangles
+            .iter()
+            .any(|t| t.contains(&1) && t.contains(&3));
+        assert!(
+            has_short_diag,
+            "expected flip to (1, 3): {:?}",
+            patch.triangles
+        );
     }
 }

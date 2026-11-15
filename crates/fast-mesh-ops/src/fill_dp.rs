@@ -105,7 +105,7 @@ pub(crate) fn triangulate_loop(
 
 /// The unit normal of triangle `[a, b, c]` (positions), or zero when it is
 /// degenerate.
-fn unit_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+pub(crate) fn unit_normal(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
     let n = cross(sub(b, a), sub(c, a));
     let longest = [sub(b, a), sub(c, b), sub(a, c)]
         .iter()
@@ -293,36 +293,58 @@ fn smallest_eigenvector(mut a: [[f64; 3]; 3]) -> [f64; 3] {
     [v[0][i], v[1][i], v[2][i]]
 }
 
-/// `tris` (counter-clockwise, numbering the `n` loop points) with the loop
-/// points that no triangle uses put back. Where a triangle `x, y, c` has an
-/// edge `x -> y` over a run of unused points `d1 .. dk` (the loop between `x`
-/// and `y`, forward), those points lie on that edge, and the triangle becomes
-/// the fan `x d1 c`, `d1 d2 c`, ..., `dk y c`, keeping its winding.
-fn restore_dropped(n: usize, tris: &[[u32; 3]]) -> Result<Vec<[u32; 3]>> {
-    let mut used = filled(n, false)?;
+/// `tris` (counter-clockwise) with dropped collinear ring vertices put back.
+/// Each ring is `(start, len, forward)`, where `forward` indicates whether
+/// stepping `+1` modulo `len` keeps the filled region on the left of edges.
+fn restore_dropped_multi(
+    total_verts: usize,
+    rings: &[(usize, usize, bool)],
+    tris: &[[u32; 3]],
+) -> Result<Vec<[u32; 3]>> {
+    let mut used = filled(total_verts, false)?;
     for t in tris {
         for &i in t {
             used[i as usize] = true;
         }
     }
+    let mut ring_of = filled(total_verts, 0u32)?;
+    let mut next_on_ring = filled(total_verts, 0u32)?;
+    for (r_idx, &(start, len, forward)) in rings.iter().enumerate() {
+        for local in 0..len {
+            let v = start + local;
+            ring_of[v] = r_idx as u32;
+            let next_local = if forward {
+                (local + 1) % len
+            } else {
+                (local + len - 1) % len
+            };
+            next_on_ring[v] = (start + next_local) as u32;
+        }
+    }
+
     let mut work = Vec::new();
     reserve(&mut work, tris.len())?;
     work.extend_from_slice(tris);
     let mut out = Vec::new();
-    reserve(&mut out, n.saturating_sub(2).max(tris.len()))?;
-    let next = |i: u32| ((i as usize + 1) % n) as u32;
+    reserve(&mut out, total_verts.saturating_sub(2).max(tris.len()))?;
     while let Some(t) = work.pop() {
         let run = (0..3).find(|&e| {
             let (x, y) = (t[e], t[(e + 1) % 3]);
-            let mut d = next(x);
+            if ring_of[x as usize] != ring_of[y as usize] {
+                return false;
+            }
+            let mut d = next_on_ring[x as usize];
             if d == y {
                 return false;
             }
+            let max_steps = rings[ring_of[x as usize] as usize].1;
+            let mut steps = 0usize;
             while d != y {
-                if used[d as usize] {
+                if used[d as usize] || steps >= max_steps {
                     return false;
                 }
-                d = next(d);
+                d = next_on_ring[d as usize];
+                steps += 1;
             }
             true
         });
@@ -331,29 +353,146 @@ fn restore_dropped(n: usize, tris: &[[u32; 3]]) -> Result<Vec<[u32; 3]>> {
             continue;
         };
         let (x, y, c) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
-        let (mut prev, mut d) = (x, next(x));
+        let mut prev = x;
+        let mut d = next_on_ring[x as usize];
         while d != y {
             push(&mut work, [prev, d, c])?;
             used[d as usize] = true;
             prev = d;
-            d = next(d);
+            d = next_on_ring[d as usize];
         }
         push(&mut work, [prev, y, c])?;
     }
     Ok(out)
 }
 
-/// Twice the signed area of the 2D triangle `a, b, c`.
-fn orient2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
-    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+/// Splits any unpaired non-boundary halfedge `(x, y)` when ring vertices lie
+/// strictly collinearly along `flat[x] -> flat[y]` (which happens when earcut
+/// bridges a hole to an outer vertex across collinear boundary/bridge edges).
+fn split_collinear_halfedges(
+    flat: &[[f64; 2]],
+    rings: &[(usize, usize, bool)],
+    tris: &mut Vec<[u32; 3]>,
+) -> Result<()> {
+    let total_verts = flat.len();
+    let mut next_on_ring = filled(total_verts, 0u32)?;
+    for &(start, len, forward) in rings {
+        for local in 0..len {
+            let v = start + local;
+            let next_local = if forward {
+                (local + 1) % len
+            } else {
+                (local + len - 1) % len
+            };
+            next_on_ring[v] = (start + next_local) as u32;
+        }
+    }
+
+    let mut on_seg: Vec<(f64, u32)> = Vec::new();
+    let max_passes = total_verts + 4;
+    for _ in 0..max_passes {
+        let mut dir_edges: Vec<(u32, u32)> = Vec::new();
+        reserve(&mut dir_edges, tris.len() * 3)?;
+        for t in tris.iter() {
+            dir_edges.push((t[0], t[1]));
+            dir_edges.push((t[1], t[2]));
+            dir_edges.push((t[2], t[0]));
+        }
+        dir_edges.sort_unstable();
+
+        let mut split_target: Option<(usize, usize, Vec<u32>)> = None;
+        for (ti, t) in tris.iter().enumerate() {
+            for e in 0..3 {
+                let (x, y) = (t[e], t[(e + 1) % 3]);
+                if next_on_ring[x as usize] == y {
+                    continue;
+                }
+                if dir_edges.binary_search(&(y, x)).is_ok() {
+                    continue;
+                }
+                let (px, py) = (flat[x as usize], flat[y as usize]);
+                let dx = py[0] - px[0];
+                let dy = py[1] - px[1];
+                let len2 = dx * dx + dy * dy;
+                if !(len2.is_finite() && len2 > 0.0) {
+                    continue;
+                }
+                on_seg.clear();
+                for (vi, &pv) in flat.iter().enumerate() {
+                    let v = vi as u32;
+                    if v == x || v == y {
+                        continue;
+                    }
+                    let cross = orient2d(px, py, pv);
+                    if cross.abs() > 1e-10 * len2 {
+                        continue;
+                    }
+                    let proj = (pv[0] - px[0]) * dx + (pv[1] - px[1]) * dy;
+                    let param = proj / len2;
+                    if param > 1e-10 && param < 1.0 - 1e-10 {
+                        push(&mut on_seg, (param, v))?;
+                    }
+                }
+                if !on_seg.is_empty() {
+                    on_seg.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    let mut mids: Vec<u32> = Vec::new();
+                    reserve(&mut mids, on_seg.len())?;
+                    for &(_, v) in &on_seg {
+                        mids.push(v);
+                    }
+                    split_target = Some((ti, e, mids));
+                    break;
+                }
+            }
+            if split_target.is_some() {
+                break;
+            }
+        }
+        let Some((ti, e, mids)) = split_target else {
+            break;
+        };
+        let t = tris[ti];
+        let (x, y, c) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
+        tris[ti] = [x, mids[0], c];
+        reserve(tris, mids.len())?;
+        let mut prev = mids[0];
+        for &m in &mids[1..] {
+            tris.push([prev, m, c]);
+            prev = m;
+        }
+        tris.push([prev, y, c]);
+    }
+    Ok(())
 }
 
-/// The loop `v` triangulated in projection onto its best-fit plane.
-fn projected(
-    mesh: &Mesh,
-    v: &[VertexId],
-    edges: &EdgeMap,
-) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+/// Restores collinear points dropped along a single counter-clockwise loop.
+fn restore_dropped(n: usize, tris: &[[u32; 3]]) -> Result<Vec<[u32; 3]>> {
+    restore_dropped_multi(n, &[(0, n, true)], tris)
+}
+
+/// Best-fit projection plane `(centre, normal, u, w)` of a closed loop.
+#[derive(Clone, Copy)]
+pub(crate) struct PlaneFrame {
+    pub(crate) centre: [f64; 3],
+    pub(crate) normal: [f64; 3],
+    pub(crate) u: [f64; 3],
+    pub(crate) w: [f64; 3],
+}
+
+impl PlaneFrame {
+    /// Projects `q` into the 2D right-handed plane frame `(u, w)`.
+    pub(crate) fn project(&self, q: [f64; 3]) -> [f64; 2] {
+        let d = sub(q, self.centre);
+        [dot(d, self.u), dot(d, self.w)]
+    }
+}
+
+/// Computes the PCA best-fit plane of `v`, oriented so that `v` winds
+/// counter-clockwise around `normal` (matching its Newell vector).
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn best_fit_frame(mesh: &Mesh, v: &[VertexId]) -> Result<PlaneFrame> {
     let n = v.len();
     let mut p = Vec::new();
     reserve(&mut p, n)?;
@@ -362,7 +501,7 @@ fn projected(
     for q in &p {
         centre = [centre[0] + q[0], centre[1] + q[1], centre[2] + q[2]];
     }
-    let centre = centre.map(|c| c / n as f64);
+    let centre = centre.map(|c| c / n.max(1) as f64);
     let mut cov = [[0.0; 3]; 3];
     // The vector area, `sum p_i x p_(i+1)` about the centre: the loop runs
     // counter-clockwise around it.
@@ -381,23 +520,43 @@ fn projected(
     if dot(normal, newell) < 0.0 {
         normal = normal.map(|x| -x);
     }
-    // A frame `(u, w)` with `u x w = normal`, so the loop projects
-    // counter-clockwise when it is not folded.
     let helper = if normal[0].abs() < 0.6 {
         [1.0, 0.0, 0.0]
     } else {
         [0.0, 1.0, 0.0]
     };
-    let u = cross(helper, normal);
-    let u = u.map(|x| x / dot(u, u).sqrt());
-    let w = cross(normal, u);
-    let flat = |q: [f64; 3]| {
-        let d = sub(q, centre);
-        [dot(d, u), dot(d, w)]
+    let raw_u = cross(helper, normal);
+    let u_len = dot(raw_u, raw_u).sqrt();
+    let u = if u_len > 0.0 && u_len.is_finite() {
+        raw_u.map(|x| x / u_len)
+    } else {
+        [1.0, 0.0, 0.0]
     };
+    let w = cross(normal, u);
+    Ok(PlaneFrame {
+        centre,
+        normal,
+        u,
+        w,
+    })
+}
+
+/// Twice the signed area of the 2D triangle `a, b, c`.
+pub(crate) fn orient2d(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+/// The loop `v` triangulated in projection onto its best-fit plane.
+fn projected(
+    mesh: &Mesh,
+    v: &[VertexId],
+    edges: &EdgeMap,
+) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+    let n = v.len();
+    let frame = best_fit_frame(mesh, v)?;
     let mut flat_loop = Vec::new();
     reserve(&mut flat_loop, n)?;
-    flat_loop.extend(p.iter().map(|&q| flat(q)));
+    flat_loop.extend(v.iter().map(|&x| frame.project(point(mesh, x))));
     let area = flat_area(&flat_loop);
     if area.is_nan() || area <= 0.0 {
         return Ok(Err(FailReason::ProjectionFolds));
@@ -412,7 +571,11 @@ fn projected(
                 .into_iter()
                 .find(|&x| x != a && x != b)
                 .expect("proper triangle");
-            let side = orient2d(flat_loop[i], flat_loop[(i + 1) % n], flat(point(mesh, x)));
+            let side = orient2d(
+                flat_loop[i],
+                flat_loop[(i + 1) % n],
+                frame.project(point(mesh, x)),
+            );
             if side.is_nan() || side >= 0.0 {
                 return Ok(Err(FailReason::ProjectionFolds));
             }
@@ -422,11 +585,63 @@ fn projected(
 }
 
 /// Twice the signed area of a flat polygon.
-fn flat_area(flat_loop: &[[f64; 2]]) -> f64 {
+pub(crate) fn flat_area(flat_loop: &[[f64; 2]]) -> f64 {
     let origin = flat_loop[0];
     (1..flat_loop.len() - 1)
         .map(|i| orient2d(origin, flat_loop[i], flat_loop[i + 1]))
         .sum()
+}
+
+/// `true` when `v` behaves like the outer perimeter of an approximately planar
+/// open sheet (such as a grid border or an island rim): adjacent mesh triangles
+/// are nearly coplanar with `v`'s plane and lie strictly inside `v`'s 2D
+/// projection, so filling `v` directly would fold triangles back over the mesh.
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn is_coplanar_outer_rim(mesh: &Mesh, v: &[VertexId], edges: &EdgeMap) -> Result<bool> {
+    let n = v.len();
+    if n < 3 {
+        return Ok(false);
+    }
+    let frame = best_fit_frame(mesh, v)?;
+    let mut flat_loop = Vec::new();
+    reserve(&mut flat_loop, n)?;
+    flat_loop.extend(v.iter().map(|&x| frame.project(point(mesh, x))));
+    let area = flat_area(&flat_loop);
+    if !area.is_finite() || area <= 0.0 {
+        return Ok(false);
+    }
+    let mut checked = 0usize;
+    let mut coplanar_inside = 0usize;
+    for i in 0..n {
+        let (a, b) = (v[i], v[(i + 1) % n]);
+        let Some(&t_idx) = edges.triangles(a, b).first() else {
+            continue;
+        };
+        let tri = mesh.triangles()[t_idx as usize];
+        let Some(x) = tri.into_iter().find(|&u| u != a && u != b) else {
+            continue;
+        };
+        let tri_n = unit_normal(
+            point(mesh, tri[0]),
+            point(mesh, tri[1]),
+            point(mesh, tri[2]),
+        );
+        if tri_n == [0.0; 3] {
+            continue;
+        }
+        checked += 1;
+        let side = orient2d(
+            flat_loop[i],
+            flat_loop[(i + 1) % n],
+            frame.project(point(mesh, x)),
+        );
+        if side.is_finite() && side > 0.0 && dot(tri_n, frame.normal) > 0.25 {
+            coplanar_inside += 1;
+        }
+    }
+    Ok(checked > 0 && coplanar_inside * 4 >= checked * 3)
 }
 
 /// The loop `v`, which lies in the plane with normal `normal`, triangulated in
@@ -603,6 +818,272 @@ fn clip_flat(
     Ok(Ok(out))
 }
 
+/// Triangulates an `outer` boundary loop containing zero or more nested inner
+/// `islands` via projected multi-ring ear clipping, collinear restoration, and
+/// constrained 2D Delaunay edge relaxation.
+///
+/// Output triangles are wound consistently against `outer` (and against inner
+/// islands whose loop directions oppose `outer`).
+///
+/// # Errors
+/// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+pub(crate) fn triangulate_with_islands(
+    mesh: &Mesh,
+    outer: &[VertexId],
+    islands: &[&[VertexId]],
+    edges: &EdgeMap,
+) -> Result<std::result::Result<Vec<[VertexId; 3]>, FailReason>> {
+    if islands.is_empty() {
+        return triangulate_loop(mesh, outer, edges, 200, None);
+    }
+    if outer.len() < 3 || islands.iter().any(|isl| isl.len() < 3) {
+        return Ok(Err(FailReason::NoValidTriangulation));
+    }
+
+    let frame = best_fit_frame(mesh, outer)?;
+    let total_verts = islands.iter().fold(outer.len(), |s, isl| s + isl.len());
+    let mut all_verts = Vec::new();
+    reserve(&mut all_verts, total_verts)?;
+    let mut flat_all = Vec::new();
+    reserve(&mut flat_all, total_verts)?;
+
+    all_verts.extend_from_slice(outer);
+    flat_all.extend(outer.iter().map(|&v| frame.project(point(mesh, v))));
+    let outer_area = flat_area(&flat_all[..outer.len()]);
+    if !outer_area.is_finite() || outer_area <= 0.0 {
+        return Ok(Err(FailReason::ProjectionFolds));
+    }
+
+    // Check adjacent mesh faces outside `outer` do not fold over it.
+    for i in 0..outer.len() {
+        let (a, b) = (outer[i], outer[(i + 1) % outer.len()]);
+        if let Some(&t) = edges.triangles(a, b).first() {
+            let Some(x) = mesh.triangles()[t as usize]
+                .into_iter()
+                .find(|&u| u != a && u != b)
+            else {
+                continue;
+            };
+            let side = orient2d(
+                flat_all[i],
+                flat_all[(i + 1) % outer.len()],
+                frame.project(point(mesh, x)),
+            );
+            if side.is_nan() || side >= 0.0 {
+                return Ok(Err(FailReason::ProjectionFolds));
+            }
+        }
+    }
+
+    let mut rings: Vec<(usize, usize, bool)> = Vec::new();
+    reserve(&mut rings, 1 + islands.len())?;
+    rings.push((0, outer.len(), true));
+
+    let mut target_area = outer_area;
+    let mut boundary_edges: Vec<(u32, u32)> = Vec::new();
+    reserve(&mut boundary_edges, total_verts)?;
+    for i in 0..outer.len() {
+        let u = i as u32;
+        let v = ((i + 1) % outer.len()) as u32;
+        boundary_edges.push((u.min(v), u.max(v)));
+    }
+
+    for &isl in islands {
+        let start = flat_all.len();
+        all_verts.extend_from_slice(isl);
+        flat_all.extend(isl.iter().map(|&v| frame.project(point(mesh, v))));
+        let isl_area = flat_area(&flat_all[start..]);
+        if !isl_area.is_finite() || isl_area == 0.0 {
+            return Ok(Err(FailReason::ProjectionFolds));
+        }
+        target_area -= isl_area.abs();
+        rings.push((start, isl.len(), isl_area < 0.0));
+        for i in 0..isl.len() {
+            let u = (start + i) as u32;
+            let v = (start + (i + 1) % isl.len()) as u32;
+            boundary_edges.push((u.min(v), u.max(v)));
+        }
+    }
+    if !target_area.is_finite() || target_area <= 0.0 {
+        return Ok(Err(FailReason::ProjectionFolds));
+    }
+    boundary_edges.sort_unstable();
+    boundary_edges.dedup();
+
+    let hole_slices: Vec<&[[f64; 2]]> = rings[1..]
+        .iter()
+        .map(|&(start, len, _)| &flat_all[start..start + len])
+        .collect();
+    let mut tris = Vec::new();
+    if !triangulate(&flat_all[..outer.len()], &hole_slices, &mut tris)? {
+        return Ok(Err(FailReason::ProjectionFolds));
+    }
+
+    let tiles = |cand: &[[u32; 3]]| {
+        let mut sum = 0.0;
+        for t in cand {
+            let [a, b, c] = t.map(|idx| flat_all[idx as usize]);
+            let a2 = orient2d(a, b, c);
+            if a2.is_nan() || a2 <= 0.0 {
+                return false;
+            }
+            sum += a2;
+        }
+        (sum - target_area).abs() <= 1e-7 * target_area
+    };
+    if !tiles(&tris) {
+        return Ok(Err(FailReason::ProjectionFolds));
+    }
+
+    split_collinear_halfedges(&flat_all, &rings, &mut tris)?;
+    let mut tris = restore_dropped_multi(total_verts, &rings, &tris)?;
+    let expected_tris = total_verts + 2 * islands.len() - 2;
+    if tris.len() != expected_tris || !tiles(&tris) {
+        return Ok(Err(FailReason::NoValidTriangulation));
+    }
+
+    constrain_delaunay_2d(&flat_all, &all_verts, &boundary_edges, edges, &mut tris)?;
+
+    let mut out = Vec::new();
+    reserve(&mut out, tris.len())?;
+    for t in &tris {
+        let [a, b, c] = t.map(|idx| all_verts[idx as usize]);
+        let [i, j, k] = *t;
+        let bad_chord = [(i, j), (j, k), (k, i)].iter().any(|&(x, y)| {
+            let e = (x.min(y), x.max(y));
+            boundary_edges.binary_search(&e).is_err()
+                && edges
+                    .kind(all_verts[x as usize], all_verts[y as usize])
+                    .is_some()
+        });
+        if a == b || b == c || a == c || bad_chord || existing_triangle(mesh, edges, [a, b, c]) {
+            return Ok(Err(FailReason::NoValidTriangulation));
+        }
+        out.push([c, b, a]);
+    }
+    Ok(Ok(out))
+}
+
+/// Relaxes interior 2D triangles via constrained Delaunay edge flips while
+/// preserving all constrained boundary edges and avoiding existing mesh chords.
+fn constrain_delaunay_2d(
+    flat: &[[f64; 2]],
+    all_verts: &[VertexId],
+    boundary_edges: &[(u32, u32)],
+    mesh_edges: &EdgeMap,
+    tris: &mut [[u32; 3]],
+) -> Result<()> {
+    let nt = tris.len();
+    if nt < 2 {
+        return Ok(());
+    }
+    for _ in 0..16 {
+        let mut records: Vec<(u32, u32, bool, u32, u32)> = Vec::new();
+        reserve(&mut records, 3 * nt)?;
+        for (ti, &t) in tris.iter().enumerate() {
+            for e in 0..3 {
+                let (u, v, opp) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
+                let (lo, hi, fwd) = if u < v { (u, v, true) } else { (v, u, false) };
+                records.push((lo, hi, fwd, ti as u32, opp));
+            }
+        }
+        records.sort_unstable();
+
+        let mut existing: Vec<(u32, u32)> = Vec::new();
+        reserve(&mut existing, records.len())?;
+        for r in &records {
+            if existing.last().copied() != Some((r.0, r.1)) {
+                existing.push((r.0, r.1));
+            }
+        }
+
+        let mut touched = filled(nt, false)?;
+        let mut added_diags: Vec<(u32, u32)> = Vec::new();
+        let mut flipped = false;
+
+        let mut idx = 0usize;
+        while idx < records.len() {
+            let (lo, hi) = (records[idx].0, records[idx].1);
+            let mut end = idx + 1;
+            while end < records.len() && records[end].0 == lo && records[end].1 == hi {
+                end += 1;
+            }
+            if end - idx == 2 {
+                let r0 = records[idx];
+                let r1 = records[idx + 1];
+                if r0.2 != r1.2 && boundary_edges.binary_search(&(lo, hi)).is_err() {
+                    let (fwd_rec, rev_rec) = if r0.2 { (r0, r1) } else { (r1, r0) };
+                    let (t1, a) = (fwd_rec.3 as usize, fwd_rec.4);
+                    let (t2, b) = (rev_rec.3 as usize, rev_rec.4);
+                    if !touched[t1] && !touched[t2] && a != b {
+                        let diag = (a.min(b), a.max(b));
+                        let dup_mesh = mesh_edges
+                            .kind(all_verts[diag.0 as usize], all_verts[diag.1 as usize])
+                            .is_some()
+                            && boundary_edges.binary_search(&diag).is_err();
+                        let dup = dup_mesh
+                            || existing.binary_search(&diag).is_ok()
+                            || added_diags.contains(&diag);
+                        if !dup && should_flip_2d(flat, lo, hi, a, b, all_verts, mesh_edges) {
+                            tris[t1] = [b, hi, a];
+                            tris[t2] = [a, lo, b];
+                            touched[t1] = true;
+                            touched[t2] = true;
+                            push(&mut added_diags, diag)?;
+                            flipped = true;
+                        }
+                    }
+                }
+            }
+            idx = end;
+        }
+        if !flipped {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn should_flip_2d(
+    flat: &[[f64; 2]],
+    lo: u32,
+    hi: u32,
+    a: u32,
+    b: u32,
+    all_verts: &[VertexId],
+    mesh_edges: &EdgeMap,
+) -> bool {
+    let (plo, phi, pa, pb) = (
+        flat[lo as usize],
+        flat[hi as usize],
+        flat[a as usize],
+        flat[b as usize],
+    );
+    // Flipped CCW triangles: [pb, phi, pa] and [pa, plo, pb].
+    let area1 = orient2d(pb, phi, pa);
+    let area2 = orient2d(pa, plo, pb);
+    if !(area1.is_finite() && area2.is_finite() && area1 > 1e-12 && area2 > 1e-12) {
+        return false;
+    }
+    let old1 = orient2d(pa, plo, phi);
+    let old2 = orient2d(pb, phi, plo);
+    if old1 <= 1e-12 || old2 <= 1e-12 {
+        return false;
+    }
+    let is_bad_chord = mesh_edges
+        .kind(all_verts[lo as usize], all_verts[hi as usize])
+        .is_some();
+    let cot2 = |p: [f64; 2], q: [f64; 2], r: [f64; 2], area: f64| {
+        ((q[0] - p[0]) * (r[0] - p[0]) + (q[1] - p[1]) * (r[1] - p[1])) / area
+    };
+    let old_cot = cot2(pa, plo, phi, old1) + cot2(pb, phi, plo, old2);
+    if is_bad_chord {
+        return true;
+    }
+    let new_cot = cot2(plo, pb, pa, area2) + cot2(phi, pa, pb, area1);
+    old_cot < -1e-6 && new_cot > old_cot + 1e-6
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +1126,74 @@ mod tests {
             assert!((ae[r] - lambda * e[r]).abs() < 1e-9);
         }
         assert!(lambda < 0.1);
+    }
+
+    #[test]
+    fn triangulate_with_islands_and_outer_rim_detection() {
+        use crate::boundary_loops;
+        use crate::test_util::*;
+
+        // 8x8 grid with middle 4x4 carved out and a 2x2 island kept at the center (3..5, 3..5).
+        let mut cells = Vec::new();
+        for y in 2..6u32 {
+            for x in 2..6u32 {
+                if !((3..5).contains(&x) && (3..5).contains(&y)) {
+                    cells.push((x, y));
+                }
+            }
+        }
+        // Build combined mesh keeping the center island (3..5, 3..5) separated by empty ring.
+        // Wait: (3,3)..(5,5) shares corners only if diagonal cells exist; removing 1..7 keeping 3..5 leaves clean moat.
+        let mut moat = Vec::new();
+        for y in 1..7u32 {
+            for x in 1..7u32 {
+                if !((3..5).contains(&x) && (3..5).contains(&y)) {
+                    moat.push((x, y));
+                }
+            }
+        }
+        drop(cells);
+        let mesh = grid_without(8, &moat);
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 3);
+        let edges = EdgeMap::build(&mesh).unwrap();
+
+        // Outer sheet border: longest perimeter (32 edges), adjacent triangles coplanar inside.
+        let outer_border = loops.iter().max_by_key(|l| l.vertices.len()).unwrap();
+        assert!(is_coplanar_outer_rim(&mesh, &outer_border.vertices, &edges).unwrap());
+
+        // Inner moat hole (24 edges, from x/y in 1..7): adjacent triangles lie outside.
+        let hole = loops
+            .iter()
+            .find(|l| l.vertices.len() == 24)
+            .expect("24-vertex hole");
+        assert!(!is_coplanar_outer_rim(&mesh, &hole.vertices, &edges).unwrap());
+
+        // Center 2x2 island border (8 edges): coplanar outer rim of the island itself.
+        let island = loops
+            .iter()
+            .min_by_key(|l| l.vertices.len())
+            .expect("8-vertex island");
+        assert_eq!(island.vertices.len(), 8);
+        assert!(is_coplanar_outer_rim(&mesh, &island.vertices, &edges).unwrap());
+
+        let tris = triangulate_with_islands(&mesh, &hole.vertices, &[&island.vertices], &edges)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tris.len(), 24 + 8);
+        // Combined mesh + patch triangles must be closed around the island/hole (only outer_border remains!).
+        let (_, mut base_tris) = parts(&mesh);
+        let (pos, _) = parts(&mesh);
+        for t in tris {
+            base_tris.push(t);
+        }
+        let patched = mesh_of(&pos, &base_tris);
+        let after = boundary_loops(&patched).unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "expected only outer sheet border left: {after:?}"
+        );
+        assert_eq!(after[0].vertices.len(), outer_border.vertices.len());
     }
 }
