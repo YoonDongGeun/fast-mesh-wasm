@@ -9,10 +9,14 @@
 //!   reconstruction.
 //! - [`presets::AutoRepairPreset`] configures domain-tailored pipelines for
 //!   [`auto_repair`](crate::auto_repair).
+//! - [`selection`] provides face/region selection, crease flood-fill, visible
+//!   frustum/lasso picking, topological boundary operations, mesh split/extract/delete,
+//!   and vertex-mask interoperation.
 
 pub mod fill_continuity;
 pub mod manifold;
 pub mod presets;
+pub mod selection;
 pub mod self_intersect;
 pub mod sliver;
 
@@ -38,6 +42,7 @@ pub use fill_continuity::{
 };
 pub use manifold::{ManifoldOptions, ManifoldOptionsBuilder, ManifoldReport, make_manifold};
 pub use presets::AutoRepairPreset;
+pub use selection::*;
 pub use self_intersect::{
     SelfIntersectOptions, SelfIntersectOptionsBuilder, SelfIntersectReport, SelfIntersectionMode,
     resolve_self_intersections,
