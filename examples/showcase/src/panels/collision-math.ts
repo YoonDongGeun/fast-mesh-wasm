@@ -2,7 +2,14 @@
 // (contactHeatmap's validation), the deepest-penetration readout from the
 // fields' values, a target's topology from its analysis, and how distances
 // are printed.
-import type { Analysis } from "fast-mesh-wasm";
+import type {
+  Analysis,
+  CollisionMode,
+  CollisionRule,
+  CollisionStepReport,
+  MeshHandle,
+} from "fast-mesh-wasm";
+import type { Wave6CollisionState } from "../scene/wave6-state";
 
 /** The smallest of 1, 2 or 5 times a power of ten that is at least `r` (1 for a non-positive `r`). */
 export function niceScale(r: number): number {
@@ -112,4 +119,88 @@ export function formatDistance(x: number): string {
     return `${m}e${Number(e)}`;
   }
   return a >= 100 ? x.toFixed(0) : String(Number(x.toPrecision(3)));
+}
+
+export const DEFAULT_COLLISION_STIFFNESS = 0.5;
+export const DEFAULT_CONTACT_MARGIN = 0.0;
+
+function clampNonNegative(value: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : fallback;
+}
+
+function clampUnitInterval(value: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
+}
+
+/** Build a full `CollisionRule` from showcase `Wave6CollisionState`, mapping `cutBackend` to `cutMethod`. */
+export function buildCollisionRule(
+  collision: Wave6CollisionState,
+  overrides?: {
+    mode?: CollisionMode;
+    stiffness?: number;
+    contactMargin?: number;
+  },
+): CollisionRule {
+  return {
+    mode: overrides?.mode ?? collision.mode,
+    role: collision.role,
+    distanceBackend: collision.distanceBackend,
+    cutMethod: collision.cutBackend,
+    cutTrigger: collision.cutTrigger,
+    softSolver: collision.softSolver,
+    materialMemory: collision.materialMemory,
+    compliance: clampNonNegative(collision.compliance, Math.fround(0.05)),
+    stiffness: clampNonNegative(
+      overrides?.stiffness ?? DEFAULT_COLLISION_STIFFNESS,
+      DEFAULT_COLLISION_STIFFNESS,
+    ),
+    recoveryRate: clampUnitInterval(collision.recoveryRate, 1.0),
+    contactMargin: clampNonNegative(
+      overrides?.contactMargin ?? DEFAULT_CONTACT_MARGIN,
+      DEFAULT_CONTACT_MARGIN,
+    ),
+    selfCollisionGuard: collision.preventSelfIntersection,
+    rigidSlide: collision.rigidSlide,
+  };
+}
+
+/** Stable string key for comparing two normalized `CollisionRule` payloads. */
+export function collisionRuleSignature(rule: CollisionRule): string {
+  return JSON.stringify([
+    rule.mode,
+    rule.role,
+    rule.distanceBackend,
+    rule.cutMethod,
+    rule.cutTrigger,
+    rule.softSolver,
+    rule.materialMemory,
+    rule.compliance,
+    rule.stiffness,
+    rule.recoveryRate,
+    rule.contactMargin,
+    rule.selfCollisionGuard,
+    rule.rigidSlide,
+  ]);
+}
+
+/** Human-readable summary of a `CollisionStepReport` for UI readouts and `wave6.collision.lastStepSummary`. */
+export function summarizeCollisionStepReport(report: CollisionStepReport<MeshHandle>): string {
+  const parts: string[] = [];
+  if (Number.isFinite(report.minClearance)) {
+    parts.push(`clearance ${formatDistance(report.minClearance)}`);
+  }
+  parts.push(`${report.activePairs.length} active pair${report.activePairs.length === 1 ? "" : "s"}`);
+  if (report.cutsExecuted > 0) {
+    parts.push(`${report.cutsExecuted} cut${report.cutsExecuted === 1 ? "" : "s"}`);
+  }
+  if (report.softVerticesDeformed > 0) {
+    parts.push(`${report.softVerticesDeformed} soft vert${report.softVerticesDeformed === 1 ? "" : "s"}`);
+  }
+  if (report.elasticRecoveryCount > 0) {
+    parts.push(`${report.elasticRecoveryCount} recovered`);
+  }
+  if (report.selfIntersectionGuardTriggered) {
+    parts.push("self-guard triggered");
+  }
+  return parts.join(" · ");
 }
