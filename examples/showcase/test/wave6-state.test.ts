@@ -1,5 +1,5 @@
 import { Scene } from "fast-mesh-wasm";
-import { createSceneStore } from "fast-mesh-wasm/store";
+import { createSceneStore, meshState } from "fast-mesh-wasm/store";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppState } from "../src/scene/app-state";
 import { DEFAULT_WAVE6_STATE } from "../src/scene/wave6-state";
@@ -50,6 +50,7 @@ describe("Showcase Wave 6 AppState & adoptSceneMesh", () => {
     const extracted = scene.repair.extractSelectedFaces(item.mesh, [0, 1]);
     store.commitFrame();
     const adopted = app.adoptSceneMesh(store, extracted, "box-extracted");
+    expect(meshState(store.getSnapshot(), adopted.mesh).desired.visible).toBe(true);
     expect(adopted.triangles).toBe(2);
     expect(app.adoptSceneMesh(store, extracted, "dup")).toBe(adopted);
     expect(app.getSnapshot().items.map((i) => i.id)).toEqual([item.id, adopted.id]);

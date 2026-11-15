@@ -406,6 +406,27 @@ export class SceneStore {
   }
 
   /**
+   * Registers an already-created scene `MeshHandle` in the store so snapshots,
+   * dirty-buffer tracking, and `meshState` work cleanly for it.
+   */
+  adoptMesh(handle: MeshHandle): MeshHandle {
+    this.#alive();
+    if (this.#meshes.has(handle)) {
+      return handle;
+    }
+    this.#meshes.set(handle, {
+      handle,
+      id: this.#host.idOf(handle),
+      display: DEFAULT_DISPLAY,
+      desired: DEFAULT_DISPLAY,
+      sent: null,
+    });
+    this.#dirtyMeshes.add(handle);
+    this.#update();
+    return handle;
+  }
+
+  /**
    * Removes a mesh; it leaves the snapshot (and the selection) at once. The
    * scene drops the fields measured to it alone, and the colourings by them:
    * a mesh coloured by distance to it alone shows no colouring, keeps its

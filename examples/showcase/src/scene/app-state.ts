@@ -512,6 +512,7 @@ export class AppState {
     if (existing !== undefined) {
       return existing;
     }
+    store.adoptMesh(mesh);
     const views = store.scene.views(mesh);
     const triangles = views.indices().length / 3;
     const pos = views.positions();
