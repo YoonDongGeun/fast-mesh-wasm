@@ -6,9 +6,11 @@
 // The mask group paints the protected region the brushes hold (invert and
 // clear included); mask painting disarms the sculpt brush and vice versa.
 import type { GrabMethod, InflateMethod, MeshHandle, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
-import { useScene, useSelection } from "fast-mesh-wasm/react";
-import { useEffect, useState } from "react";
+import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
+import { meshState, type SceneSnapshot } from "fast-mesh-wasm/store";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { inspect } from "../panels/inspect";
+import { LengthInput } from "../panels/LengthInput";
 import type {
   SculptFilterKind,
   SculptFilterSettings,
@@ -16,7 +18,7 @@ import type {
   SculptSymmetrySettings,
 } from "../panels/settings";
 import { formatLength } from "../panels/units";
-import { type AppState, useApp } from "../scene/app-state";
+import { type AppState, type Item, useApp } from "../scene/app-state";
 import {
   DEFAULT_STRENGTHS,
   FILTER_KIND_OPTIONS,
@@ -33,6 +35,70 @@ import {
 } from "./sculpt";
 
 export type { SculptTool };
+
+/** Filters `items` down to visible, unlocked meshes that sculpt/mask tools can target (#229). */
+export function eligibleSculptItems(items: readonly Item[], storeSnapshot: SceneSnapshot): Item[] {
+  return items.filter((item) => !item.locked && meshState(storeSnapshot, item.mesh).desired.visible);
+}
+
+/**
+ * Resolves which visible, unlocked mesh sculpt/mask UI controls operate on (#229).
+ * When `pinToActive` is true, restricts to `selection` (or the current target if unset).
+ * Otherwise keeps `currentTarget` if still eligible, falling back to `selection` then first eligible item.
+ */
+export function resolveSculptTargetItem(
+  items: readonly Item[],
+  storeSnapshot: SceneSnapshot,
+  selection: MeshHandle | null,
+  currentTarget: MeshHandle | null,
+  pinToActive: boolean,
+): Item | null {
+  return resolveTargetFromEligible(eligibleSculptItems(items, storeSnapshot), selection, currentTarget, pinToActive);
+}
+
+/** Returns true when at least one eligible target can arm a sculpt brush or mask paint (#229). */
+export function canArmSculpt(
+  items: readonly Item[],
+  storeSnapshot: SceneSnapshot,
+  selection: MeshHandle | null,
+  pinToActive: boolean,
+): boolean {
+  const eligible = eligibleSculptItems(items, storeSnapshot);
+  if (eligible.length === 0) {
+    return false;
+  }
+  return pinToActive ? (selection === null ? false : eligible.some((i) => i.mesh === selection)) : true;
+}
+
+function resolveTargetFromEligible(
+  eligible: readonly Item[],
+  selection: MeshHandle | null,
+  currentTarget: MeshHandle | null,
+  pinToActive: boolean,
+): Item | null {
+  if (eligible.length === 0) {
+    return null;
+  }
+  if (pinToActive) {
+    if (selection !== null) {
+      return eligible.find((i) => i.mesh === selection) ?? null;
+    }
+    return null;
+  }
+  if (currentTarget !== null) {
+    const existing = eligible.find((i) => i.mesh === currentTarget);
+    if (existing !== undefined) {
+      return existing;
+    }
+  }
+  if (selection !== null) {
+    const selected = eligible.find((i) => i.mesh === selection);
+    if (selected !== undefined) {
+      return selected;
+    }
+  }
+  return eligible[0];
+}
 
 const TOOLS: { tool: SculptTool; label: string; title: string }[] = [
   { tool: "inflate", label: "Inflate", title: "Puff the surface up along its normals" },
@@ -57,6 +123,8 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
   const selection = props.selection !== undefined ? props.selection : storeSelection;
   const items = useApp(app, (s) => s.items);
   const sculpt = useApp(app, (s) => s.sculpt);
+  const mask = useApp(app, (s) => s.sculptMask);
+  const pinToActive = useApp(app, (s) => s.sculptPinToActive);
   const remesh = useApp(app, (s) => s.sculptRemesh);
   const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
   const methods = useApp(app, (s) => s.sculptMethods);
@@ -64,13 +132,26 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
   const filter = useApp(app, (s) => s.sculptFilter);
   const symmetry = useApp(app, (s) => s.sculptSymmetry);
   const units = useApp(app, (s) => s.units);
-  const item = items.find((i) => i.mesh === selection) ?? null;
+  const visMask = useStoreSelector((s) =>
+    items.map((i) => (!i.locked && meshState(s, i.mesh).desired.visible ? "1" : "0")).join(""),
+  );
+  const eligibleItems = useMemo(
+    () => items.filter((_, idx) => visMask[idx] === "1"),
+    [items, visMask],
+  );
+  const preferredCurrent = sculpt?.mesh ?? mask?.mesh ?? null;
+  const targetItem = useMemo(
+    () => resolveTargetFromEligible(eligibleItems, selection, preferredCurrent, pinToActive),
+    [eligibleItems, selection, preferredCurrent, pinToActive],
+  );
+  const targetMesh = targetItem?.mesh ?? null;
   const [tool, setTool] = useState<SculptTool>(() => sculpt?.tool ?? "inflate");
   const [radius, setRadius] = useState(0.25);
   const [strengths, setStrengths] = useState<Record<SculptTool, number>>(DEFAULT_STRENGTHS);
   const [falloff, setFalloff] = useState<"linear" | "smooth">("smooth");
-  const armed = sculpt !== null && sculpt.mesh === selection;
+  const armed = sculpt !== null && targetMesh !== null && sculpt.mesh === targetMesh;
   const activeTool = armed && sculpt.tool !== undefined ? sculpt.tool : tool;
+  const lastTargetMeshRef = useRef<MeshHandle | null>(null);
 
   useEffect(() => {
     if (armed && sculpt.tool !== undefined && sculpt.tool !== tool) {
@@ -78,31 +159,48 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
     }
   }, [armed, sculpt?.tool, tool]);
 
-  // The radius follows the mesh; the rest are preferences and persist.
+  // If all eligible meshes disappear (hidden/locked/removed), disarm sculpting.
   useEffect(() => {
-    if (item !== null) {
-      setRadius(item.radius / 4);
+    if (targetMesh === null && sculpt !== null) {
+      app.setSculpt(null);
     }
-  }, [item]);
+  }, [app, targetMesh, sculpt]);
+
+  // The radius follows the target mesh (adopting hover-scaled radius if already armed there).
+  useEffect(() => {
+    if (targetItem === null) {
+      lastTargetMeshRef.current = null;
+      return;
+    }
+    if (lastTargetMeshRef.current !== targetItem.mesh) {
+      lastTargetMeshRef.current = targetItem.mesh;
+      if (sculpt !== null && sculpt.mesh === targetItem.mesh) {
+        setRadius(sculpt.radius);
+        return;
+      }
+      setRadius(targetItem.radius / 4);
+    }
+  }, [targetItem?.mesh, targetItem?.radius, sculpt]);
 
   // While armed, the toolbox drives the sculpt brush live (sliders and pickers
   // stay adjustable mid-stroke).
   useEffect(() => {
-    if (armed && selection !== null) {
-      arm(app, selection, activeTool, radius, strengths[activeTool], falloff, {
+    if (armed && targetMesh !== null) {
+      arm(app, targetMesh, activeTool, radius, strengths[activeTool], falloff, {
         methods,
         grabPoisson,
         filter,
         symmetry,
       });
     }
-  }, [app, armed, selection, activeTool, radius, strengths, falloff, methods, grabPoisson, filter, symmetry]);
+  }, [app, armed, targetMesh, activeTool, radius, strengths, falloff, methods, grabPoisson, filter, symmetry]);
 
-  if (item === null || selection === null) {
+  if (eligibleItems.length === 0) {
     return null;
   }
+  const targetRadius = targetItem?.radius ?? 1;
   // The optional remesh stands down on huge meshes, where it would stall the worker.
-  const tooBig = remeshTooBig(item.triangles);
+  const tooBig = targetItem !== null && remeshTooBig(targetItem.triangles);
   const remeshTitle = tooBig
     ? `Stands down past ${REMESH_TRI_LIMIT.toLocaleString("en")} triangles: a remesh would stall the worker`
     : null;
@@ -118,16 +216,24 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
             type="button"
             data-action={`sculpt-tool-${t.tool}`}
             aria-pressed={armed && activeTool === t.tool}
-            title={t.title}
+            disabled={targetMesh === null}
+            title={
+              targetMesh === null
+                ? "Select an unlocked visible mesh or uncheck Pin to active mesh to sculpt"
+                : t.title
+            }
             onClick={() => {
               if (armed && activeTool === t.tool) {
                 app.setSculpt(null);
                 return;
               }
+              if (targetMesh === null) {
+                return;
+              }
               setTool(t.tool);
               // One pointer owner: sculpting disarms the mask paint.
               app.setMaskPaint(false);
-              arm(app, selection, t.tool, radius, strengths[t.tool], falloff, {
+              arm(app, targetMesh, t.tool, radius, strengths[t.tool], falloff, {
                 methods,
                 grabPoisson,
                 filter,
@@ -174,17 +280,21 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
           ) : null}
         </div>
       ) : null}
-      <label className="slider" title="Brush radius">
+      <label className="slider" title="Brush radius slider">
         radius <output>{formatLength(radius, units)}</output>
         <input
           type="range"
           data-action="sculpt-radius"
           min={0.01}
-          max={Math.max(item.radius, 0.02)}
+          max={Math.max(targetRadius, 0.02)}
           step={0.01}
-          value={Math.min(radius, Math.max(item.radius, 0.02))}
+          value={Math.min(radius, Math.max(targetRadius, 0.02))}
           onChange={(e) => setRadius(Number(e.currentTarget.value))}
         />
+      </label>
+      <label className="field" title="Brush radius">
+        radius ({units})
+        <LengthInput min={0} mm={radius} unit={units} onMm={(mm) => setRadius(Math.max(0.01, mm))} />
       </label>
       <label
         className="slider"
@@ -333,7 +443,19 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
         />
         split stretched triangles
       </label>
-      <MaskTools app={app} selection={selection} radius={item.radius} />
+      <label
+        className="check"
+        title="Restrict sculpt and mask strokes to the selected mesh only (Alt+Click any mesh to quick-pin)"
+      >
+        <input
+          type="checkbox"
+          data-action="sculpt-pin-mesh"
+          checked={pinToActive}
+          onChange={(e) => app.setSculptPinToActive(e.currentTarget.checked)}
+        />
+        Pin to active mesh
+      </label>
+      <MaskTools app={app} targetMesh={targetMesh} radius={targetRadius} />
     </div>
   );
 }
@@ -413,8 +535,8 @@ function arm(
  * vertex. The counts come from the app; the notice is the loud half of the
  * mask contract (see `viewport/sculpt.ts`).
  */
-function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number }) {
-  const { app, selection, radius } = props;
+function MaskTools(props: { app: AppState; targetMesh: MeshHandle | null; radius: number }) {
+  const { app, targetMesh, radius } = props;
   const store = useScene();
   const mask = useApp(app, (s) => s.sculptMask);
   const painting = useApp(app, (s) => s.maskPaint);
@@ -426,7 +548,7 @@ function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number
   useEffect(() => {
     app.setMaskRadius(radius / 4);
   }, [app, radius]);
-  const sameMesh = mask !== null && mask.mesh === selection;
+  const sameMesh = mask !== null && targetMesh !== null && mask.mesh === targetMesh;
 
   /** Clears a mask its mesh outlived: loud, with the notice, never silent. */
   const staleClear = () => {
@@ -436,14 +558,14 @@ function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number
   };
 
   const onInvert = () => {
-    if (mask === null || !sameMesh) {
+    if (mask === null || !sameMesh || targetMesh === null) {
       return;
     }
     try {
-      const v = store.scene.views(selection);
+      const v = store.scene.views(targetMesh);
       const slots = v.positions().length / 3;
-      checkMask(mask, selection, v.indices(), slots);
-      app.setSculptMask({ mesh: selection, vertices: invertMaskIds(mask.vertices, v.indices(), slots), slots });
+      checkMask(mask, targetMesh, v.indices(), slots);
+      app.setSculptMask({ mesh: targetMesh, vertices: invertMaskIds(mask.vertices, v.indices(), slots), slots });
     } catch {
       // Removed meanwhile, or stale: a stale mask never silently reinterprets.
       staleClear();
@@ -457,8 +579,12 @@ function MaskTools(props: { app: AppState; selection: MeshHandle; radius: number
           type="button"
           data-action="sculpt-mask-paint"
           aria-pressed={painting}
+          disabled={targetMesh === null}
           title="Paint the protected region the brushes skip (disarms the sculpt brush)"
           onClick={() => {
+            if (targetMesh === null) {
+              return;
+            }
             const on = !painting;
             if (on) {
               // One pointer owner: mask painting disarms the sculpt brush.

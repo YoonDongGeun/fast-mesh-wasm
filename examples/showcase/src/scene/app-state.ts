@@ -11,6 +11,7 @@ import type { Vec3 } from "../load/mesh-data";
 import type { LoadedMesh } from "../load/protocol";
 import type { SliceAxis } from "../panels/volume-slice";
 import type { SculptBrush, SculptMask } from "../viewport/sculpt";
+import { installDiagnosticShader } from "../viewport/shading";
 import {
   createGroup,
   dropMember,
@@ -52,6 +53,10 @@ export interface Item {
   preset: string | null;
   /** How its numbers became millimetres on load: already applied, provenance only. */
   importScale: ImportScale;
+  /** Whether object transforms, sculpting, and masking are locked on this mesh (#235). */
+  locked: boolean;
+  /** Per-mesh diagnostic shading override, or `null` to follow scene shading (#235). */
+  shadingOverride: DiagnosticShadingMode | null;
 }
 
 export type JobPhase = "reading" | "parsing" | "decimating" | "adding" | "done" | "error";
@@ -178,6 +183,35 @@ export interface CameraPresetRequest {
   n: number;
 }
 
+export interface CameraDirectionRequest {
+  dir: readonly [number, number, number];
+  up: readonly [number, number, number];
+  n: number;
+}
+
+/** MeshInspector-style workspace ribbon tab (#228). */
+export type WorkbenchTab = "home" | "select" | "repair" | "edit" | "sculpt" | "align" | "volume" | "inspect";
+
+/** Diagnostic shading modes across the viewport (#232). */
+export type DiagnosticShadingMode =
+  | "smooth"
+  | "flat"
+  | "autoCrease"
+  | "wireframeShaded"
+  | "matcap"
+  | "backfaceWarning";
+
+/** Extended Mesh Healer defect overlay toggles (#235). */
+export type HealerOverlayKind = "selfIntersections" | "inverted" | "slivers";
+
+/** Focus request targeting a defect region or object from the Mesh Healer (#235). */
+export interface FocusTargetRequest {
+  mesh: MeshHandle;
+  center: Vec3;
+  radius: number;
+  n: number;
+}
+
 export interface AppSnapshot {
   items: readonly Item[];
   jobs: readonly Job[];
@@ -287,6 +321,22 @@ export interface AppSnapshot {
   cameraProjection: CameraProjection;
   /** Latest camera preset request; `n` distinguishes repeated clicks (#195). */
   cameraPresetRequest: CameraPresetRequest | null;
+  /** Arbitrary ViewCube edge/corner direction request (#232). */
+  cameraDirectionRequest: CameraDirectionRequest | null;
+  /** Active workspace ribbon tab driving tier-2 shelf and single right inspector (#228). */
+  activeTab: WorkbenchTab;
+  /** Whether sculpt/mask hover restricts to `selection` instead of any visible unlocked mesh (#229). */
+  sculptPinToActive: boolean;
+  /** Viewport diagnostic shading mode (#232). */
+  shadingMode: DiagnosticShadingMode;
+  /** Dihedral crease threshold in degrees for Auto-Crease shading (#232). */
+  creaseAngleDeg: number;
+  /** Extended Mesh Healer 3D defect overlays (#235). */
+  healerOverlays: Record<HealerOverlayKind, boolean>;
+  /** Latest defect focus request for camera framing (#235). */
+  healerFocusRequest: FocusTargetRequest | null;
+  /** Whether the Ctrl+K command palette modal is open (#235). */
+  commandPaletteOpen: boolean;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -357,6 +407,14 @@ export class AppState {
     surfaceFieldValues: null,
     cameraProjection: "perspective",
     cameraPresetRequest: null,
+    cameraDirectionRequest: null,
+    activeTab: "home",
+    sculptPinToActive: false,
+    shadingMode: "smooth",
+    creaseAngleDeg: 35,
+    healerOverlays: { selfIntersections: true, inverted: true, slivers: true },
+    healerFocusRequest: null,
+    commandPaletteOpen: false,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -420,6 +478,7 @@ export class AppState {
     const color = PALETTE[this.#nextColor++ % PALETTE.length];
     // Double-sided: open meshes (and their insides) stay visible.
     const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55, side: THREE.DoubleSide });
+    installDiagnosticShader(material);
     const item: Item = {
       id: this.#nextItem++,
       mesh,
@@ -432,6 +491,8 @@ export class AppState {
       volumeId: loaded.volumeId,
       preset: loaded.preset,
       importScale: loaded.importScale ?? NO_IMPORT_SCALE,
+      locked: false,
+      shadingOverride: null,
     };
     let collision = this.#snap.collision;
     if (this.#autoPick) {
@@ -525,6 +586,8 @@ export class AppState {
           : this.#snap.surfaceField,
       surfaceFieldValues:
         this.#snap.surfaceFieldValues?.mesh === item.mesh ? null : this.#snap.surfaceFieldValues,
+      healerFocusRequest:
+        this.#snap.healerFocusRequest?.mesh === item.mesh ? null : this.#snap.healerFocusRequest,
     });
   }
 
@@ -686,7 +749,91 @@ export class AppState {
 
   /** Draws every mesh wireframed or solid (a display setting: not undoable). */
   setWireframe(on: boolean): void {
-    this.#set({ wireframe: on });
+    this.#set({
+      wireframe: on,
+      ...(on === false && this.#snap.shadingMode === "wireframeShaded" ? { shadingMode: "smooth" } : {}),
+    });
+  }
+
+  /** Sets the active workspace ribbon tab (#228). */
+  setActiveTab(activeTab: WorkbenchTab): void {
+    if (this.#snap.activeTab !== activeTab) {
+      this.#set({ activeTab });
+    }
+  }
+
+  /** Sets whether sculpt/mask paint restricts hover to `selection` (#229). */
+  setSculptPinToActive(sculptPinToActive: boolean): void {
+    this.#set({ sculptPinToActive });
+  }
+
+  /** Sets the viewport diagnostic shading mode (#232). */
+  setShadingMode(shadingMode: DiagnosticShadingMode): void {
+    this.#set({
+      shadingMode,
+      ...(shadingMode === "wireframeShaded" ? {} : {}),
+    });
+  }
+
+  /** Sets the dihedral crease threshold (degrees) for Auto-Crease shading (#232). */
+  setCreaseAngleDeg(deg: number): void {
+    if (!Number.isFinite(deg)) {
+      return;
+    }
+    this.#set({ creaseAngleDeg: Math.min(175, Math.max(5, deg)) });
+  }
+
+  /** Toggles an extended Mesh Healer defect overlay (#235). */
+  setHealerOverlay(kind: HealerOverlayKind, on: boolean): void {
+    if (this.#snap.healerOverlays[kind] === on) {
+      return;
+    }
+    this.#set({ healerOverlays: { ...this.#snap.healerOverlays, [kind]: on } });
+  }
+
+  /** Frames the camera onto a defect cluster or world sphere on `mesh` (#235). */
+  focusDefect(mesh: MeshHandle, center: Vec3, radius: number): void {
+    const prevN = this.#snap.healerFocusRequest?.n ?? 0;
+    this.#set({
+      healerFocusRequest: { mesh, center: [center[0], center[1], center[2]], radius: Math.max(1e-3, radius), n: prevN + 1 },
+    });
+  }
+
+  /** Opens or closes the Ctrl+K command search palette (#235). */
+  setCommandPaletteOpen(commandPaletteOpen: boolean): void {
+    if (this.#snap.commandPaletteOpen !== commandPaletteOpen) {
+      this.#set({ commandPaletteOpen });
+    }
+  }
+
+  /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */
+  setMeshLocked(mesh: MeshHandle, locked: boolean): void {
+    let changed = false;
+    const items = this.#snap.items.map((item) => {
+      if (item.mesh !== mesh || item.locked === locked) {
+        return item;
+      }
+      changed = true;
+      return { ...item, locked };
+    });
+    if (changed) {
+      this.#set({ items });
+    }
+  }
+
+  /** Sets or clears a per-mesh diagnostic shading override (#235). */
+  setMeshShadingOverride(mesh: MeshHandle, shadingOverride: DiagnosticShadingMode | null): void {
+    let changed = false;
+    const items = this.#snap.items.map((item) => {
+      if (item.mesh !== mesh || item.shadingOverride === shadingOverride) {
+        return item;
+      }
+      changed = true;
+      return { ...item, shadingOverride };
+    });
+    if (changed) {
+      this.#set({ items });
+    }
   }
 
   /** Draws (`on`) or hides a repair-issue kind in 3D (a display setting: not undoable). */
@@ -755,6 +902,12 @@ export class AppState {
   requestCameraPreset(preset: CameraPreset): void {
     const prevN = this.#snap.cameraPresetRequest?.n ?? 0;
     this.#set({ cameraPresetRequest: { preset, n: prevN + 1 } });
+  }
+
+  /** Requests the viewport to orbit/snap along an arbitrary ViewCube direction (#232). */
+  requestCameraDirection(dir: readonly [number, number, number], up: readonly [number, number, number]): void {
+    const prevN = this.#snap.cameraDirectionRequest?.n ?? 0;
+    this.#set({ cameraDirectionRequest: { dir: [...dir], up: [...up], n: prevN + 1 } });
   }
 
   /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
@@ -841,6 +994,10 @@ export class AppState {
       units: d.defaultUnits,
       defaultUnits: d.defaultUnits,
       importScale: NO_IMPORT_SCALE,
+      shadingMode: "smooth",
+      creaseAngleDeg: 35,
+      healerOverlays: { selfIntersections: true, inverted: true, slivers: true },
+      sculptPinToActive: false,
     });
   }
 

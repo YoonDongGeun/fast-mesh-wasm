@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // Offset, Shell, and Voxel remesh report lines (`describeReport`) and
-// `RepairPanel` controls (`[data-offset-*]`, `[data-shell-*]`).
+// `ModelingPanel` controls (`[data-modeling-offset-*]`, `[data-modeling-shell-*]`).
 import type { Analysis, MeshHandle, OffsetReport, RepairOp, RepairReport, Scene, ShellReport } from "fast-mesh-wasm";
 import { SceneProvider } from "fast-mesh-wasm/react";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
@@ -8,8 +8,8 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppState } from "../../scene/app-state";
+import { ModelingPanel } from "../ModelingPanel";
 import { describeReport } from "../repair-summary";
-import { RepairPanel } from "../RepairPanel";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -56,7 +56,7 @@ afterEach(async () => {
   }
 });
 
-async function mountRepairPanel(options?: {
+async function mountModelingPanel(options?: {
   units?: "mm" | "in";
   onRepair?: (mesh: MeshHandle, op: RepairOp) => RepairReport;
 }): Promise<{
@@ -128,7 +128,7 @@ async function mountRepairPanel(options?: {
   let root: Root;
   await act(async () => {
     root = createRoot(container);
-    root.render(createElement(SceneProvider, { store }, createElement(RepairPanel, { app, scene })));
+    root.render(createElement(SceneProvider, { store }, createElement(ModelingPanel, { app })));
   });
 
   cleanups.push(async () => {
@@ -216,20 +216,19 @@ describe("describeReport for offset", () => {
   });
 });
 
-describe("RepairPanel Offset & Shell controls", () => {
+describe("ModelingPanel Offset & Shell controls", () => {
   it("runs normal offset by default, hides voxel size, and disables normal offset at distance 0", async () => {
-    const { container, mesh, repairSpy } = await mountRepairPanel();
+    const { container, mesh, repairSpy } = await mountModelingPanel();
 
-    const algorithm = container.querySelector<HTMLSelectElement>("[data-offset-algorithm]");
-    const distance = container.querySelector<HTMLInputElement>("[data-offset-distance]");
-    const runBtn = container.querySelector<HTMLButtonElement>("[data-offset-run]");
+    const algorithm = container.querySelector<HTMLSelectElement>("[data-modeling-offset-algorithm]");
+    const distance = container.querySelector<HTMLInputElement>("[data-modeling-offset-distance]");
+    const runBtn = container.querySelector<HTMLButtonElement>("[data-modeling-offset-run]");
 
     expect(algorithm).not.toBeNull();
     expect(distance).not.toBeNull();
     expect(runBtn).not.toBeNull();
-    expect(algorithm?.value).toBe("normal");
-    expect(container.querySelector("[data-offset-voxel-size]")).toBeNull();
-    expect(runBtn?.getAttribute("data-repair-op")).toBe("offset");
+    expect(algorithm?.value).toBe("auto");
+    expect(container.querySelector("[data-modeling-offset-voxel-size]")).toBeNull();
     expect(runBtn?.textContent).toBe("Offset");
     expect(runBtn?.disabled).toBe(false);
 
@@ -241,7 +240,7 @@ describe("RepairPanel Offset & Shell controls", () => {
       distance: -0.75,
       algorithm: "normal",
     });
-    expect(container.querySelector("[data-repair-report]")?.textContent).toContain(
+    expect(container.querySelector("[data-modeling-report]")?.textContent).toContain(
       "Offset: moved 4 vertices (max 0.75 mm)",
     );
 
@@ -251,14 +250,14 @@ describe("RepairPanel Offset & Shell controls", () => {
   });
 
   it("switches to fhEdt and bvhSdf, toggles Voxel remesh at distance 0, and forwards voxelSize", async () => {
-    const { container, mesh, repairSpy } = await mountRepairPanel();
+    const { container, mesh, repairSpy } = await mountModelingPanel();
 
-    const algorithm = container.querySelector<HTMLSelectElement>("[data-offset-algorithm]")!;
-    const distance = container.querySelector<HTMLInputElement>("[data-offset-distance]")!;
-    const runBtn = container.querySelector<HTMLButtonElement>("[data-offset-run]")!;
+    const algorithm = container.querySelector<HTMLSelectElement>("[data-modeling-offset-algorithm]")!;
+    const distance = container.querySelector<HTMLInputElement>("[data-modeling-offset-distance]")!;
+    const runBtn = container.querySelector<HTMLButtonElement>("[data-modeling-offset-run]")!;
 
     await setSelectValue(algorithm, "fhEdt");
-    const voxelInput = container.querySelector<HTMLInputElement>("[data-offset-voxel-size]");
+    const voxelInput = container.querySelector<HTMLInputElement>("[data-modeling-offset-voxel-size]");
     expect(voxelInput).not.toBeNull();
     expect(voxelInput?.value).toBe("");
     expect(runBtn.textContent).toBe("Offset");
@@ -273,7 +272,7 @@ describe("RepairPanel Offset & Shell controls", () => {
       distance: 0,
       algorithm: "fhEdt",
     });
-    expect(container.querySelector("[data-repair-report]")?.textContent).toContain(
+    expect(container.querySelector("[data-modeling-report]")?.textContent).toContain(
       "Offset: rebuilt 120 triangles, 62 vertices (voxel 0.25 mm)",
     );
 
@@ -307,7 +306,7 @@ describe("RepairPanel Offset & Shell controls", () => {
   });
 
   it("displays cleared mesh summary when volumetric inward offset erodes all triangles", async () => {
-    const { container, repairSpy } = await mountRepairPanel({
+    const { container, repairSpy } = await mountModelingPanel({
       onRepair: () =>
         offsetReport({
           verticesRemoved: 4,
@@ -318,33 +317,32 @@ describe("RepairPanel Offset & Shell controls", () => {
         }),
     });
 
-    const algorithm = container.querySelector<HTMLSelectElement>("[data-offset-algorithm]")!;
-    const distance = container.querySelector<HTMLInputElement>("[data-offset-distance]")!;
-    const runBtn = container.querySelector<HTMLButtonElement>("[data-offset-run]")!;
+    const algorithm = container.querySelector<HTMLSelectElement>("[data-modeling-offset-algorithm]")!;
+    const distance = container.querySelector<HTMLInputElement>("[data-modeling-offset-distance]")!;
+    const runBtn = container.querySelector<HTMLButtonElement>("[data-modeling-offset-run]")!;
 
     await setSelectValue(algorithm, "bvhSdf");
     await setInputValue(distance, "-10");
     await clickButton(runBtn);
 
     expect(repairSpy).toHaveBeenCalledOnce();
-    expect(container.querySelector("[data-repair-report]")?.textContent).toContain("Offset: cleared mesh");
+    expect(container.querySelector("[data-modeling-report]")?.textContent).toContain("Offset: cleared mesh");
   });
 
   it("converts Offset distance, voxelSize, and Shell thickness from inches to mm", async () => {
-    const { container, mesh, repairSpy } = await mountRepairPanel({ units: "in" });
+    const { container, mesh, repairSpy } = await mountModelingPanel({ units: "in" });
 
-    const algorithm = container.querySelector<HTMLSelectElement>("[data-offset-algorithm]")!;
-    const distance = container.querySelector<HTMLInputElement>("[data-offset-distance]")!;
-    const offsetRun = container.querySelector<HTMLButtonElement>("[data-offset-run]")!;
-    const shellThickness = container.querySelector<HTMLInputElement>("[data-shell-thickness]");
-    const shellRun = container.querySelector<HTMLButtonElement>("[data-shell-run]");
+    const algorithm = container.querySelector<HTMLSelectElement>("[data-modeling-offset-algorithm]")!;
+    const distance = container.querySelector<HTMLInputElement>("[data-modeling-offset-distance]")!;
+    const offsetRun = container.querySelector<HTMLButtonElement>("[data-modeling-offset-run]")!;
+    const shellThickness = container.querySelector<HTMLInputElement>("[data-modeling-shell-thickness]");
+    const shellRun = container.querySelector<HTMLButtonElement>("[data-modeling-shell-run]");
 
     expect(shellThickness).not.toBeNull();
     expect(shellRun).not.toBeNull();
-    expect(shellRun?.getAttribute("data-repair-op")).toBe("shell");
 
     await setSelectValue(algorithm, "fhEdt");
-    const voxelInput = container.querySelector<HTMLInputElement>("[data-offset-voxel-size]")!;
+    const voxelInput = container.querySelector<HTMLInputElement>("[data-modeling-offset-voxel-size]")!;
     await setInputValue(distance, "0.1");
     await setInputValue(voxelInput, "0.05");
     await clickButton(offsetRun);
@@ -355,7 +353,7 @@ describe("RepairPanel Offset & Shell controls", () => {
       algorithm: "fhEdt",
       voxelSize: 1.27,
     });
-    expect(container.querySelector("[data-repair-report]")?.textContent).toContain("(voxel 0.05 in)");
+    expect(container.querySelector("[data-modeling-report]")?.textContent).toContain("(voxel 0.05 in)");
 
     await setInputValue(shellThickness!, "0");
     expect(shellRun?.disabled).toBe(true);
@@ -368,7 +366,7 @@ describe("RepairPanel Offset & Shell controls", () => {
       op: "shell",
       thickness: 2.54,
     });
-    expect(container.querySelector("[data-repair-report]")?.textContent).toContain(
+    expect(container.querySelector("[data-modeling-report]")?.textContent).toContain(
       "Shell: added 4 vertices and 4 triangles",
     );
   });

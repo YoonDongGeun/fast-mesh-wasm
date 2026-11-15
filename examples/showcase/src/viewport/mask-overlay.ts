@@ -168,13 +168,8 @@ export class MaskOverlay {
       return false;
     }
     this.#mesh.visible = true;
-    if (this.#hostDropped) {
-      this.#hostDropped = false;
-      this.#replaceGeometry();
-    }
-    if (this.#geometry.getAttribute("position") !== position) {
-      this.#geometry.setAttribute("position", position);
-    }
+    const hostDropped = this.#hostDropped;
+    this.#hostDropped = false;
     const slots = position.count;
     const stale =
       this.#mask !== masked ||
@@ -182,6 +177,12 @@ export class MaskOverlay {
       this.#indexVersion !== index.version ||
       this.#buffers?.colors.length !== 4 * slots;
     if (!stale) {
+      if (hostDropped) {
+        this.#replaceGeometry();
+      }
+      if (this.#geometry.getAttribute("position") !== position) {
+        this.#geometry.setAttribute("position", position);
+      }
       return false;
     }
     this.#mask = masked;
@@ -190,7 +191,7 @@ export class MaskOverlay {
     const prev = this.#buffers;
     const next = maskOverlayBuild(masked, index.array as ArrayLike<number>, slots, prev);
     this.#buffers = next;
-    this.#upload(prev, next);
+    this.#upload(prev, next, hostDropped);
     if (this.#geometry.getAttribute("position") !== position) {
       this.#geometry.setAttribute("position", position);
     }
@@ -198,22 +199,25 @@ export class MaskOverlay {
   }
 
   /**
-   * A new geometry, so a new binding state, taking over this one's attributes.
-   * Disposing the old one frees their GL buffers (the next render uploads them
-   * whole), but never the position's: that attribute is the binding's.
+   * A new geometry, so a new binding state, taking over this one's kept attributes.
+   * Detaches any attribute kept on `fresh` (`position`, and kept `color`/`index`) BEFORE
+   * `old.dispose()` so Three's `WebGLGeometries.onGeometryDispose` never deletes GPU buffers
+   * that `fresh` continues to use, while leaving replaced attributes on `old` to be freed.
    */
-  #replaceGeometry(): void {
+  #replaceGeometry(drop: { color?: boolean; index?: boolean } = {}): void {
     const old = this.#geometry;
     const fresh = new THREE.BufferGeometry();
     const color = old.getAttribute("color") as THREE.BufferAttribute | undefined;
     const index = old.getIndex();
-    if (color !== undefined) {
+    if (color !== undefined && !drop.color) {
       color.clearUpdateRanges();
       fresh.setAttribute("color", color);
+      old.deleteAttribute("color");
     }
-    if (index !== null) {
+    if (index !== null && !drop.index) {
       index.clearUpdateRanges();
       fresh.setIndex(index);
+      old.setIndex(null);
     }
     fresh.setDrawRange(old.drawRange.start, old.drawRange.count);
     old.deleteAttribute("position");
@@ -222,11 +226,14 @@ export class MaskOverlay {
     this.#mesh.geometry = fresh;
   }
 
-  #upload(prev: MaskOverlayBuffers | null, next: MaskOverlayBuffers): void {
+  #upload(prev: MaskOverlayBuffers | null, next: MaskOverlayBuffers, hostDropped: boolean): void {
     const current = this.#geometry.getIndex();
-    if (prev !== null && (prev.colors !== next.colors || (current !== null && current.array !== next.indices))) {
-      // A replaced array: disposing the geometry holding the old attribute is what frees its GL buffer.
-      this.#replaceGeometry();
+    const dropColor = prev !== null && prev.colors !== next.colors;
+    const dropIndex = prev !== null && current !== null && current.array !== next.indices;
+    if (hostDropped || dropColor || dropIndex) {
+      // A replaced array (or dropped host VAO): replace the geometry once so replaced
+      // attributes stay on `old` to free their GL buffers while kept ones detach cleanly.
+      this.#replaceGeometry({ color: dropColor, index: dropIndex });
     }
     if (prev?.colors !== next.colors) {
       this.#geometry.setAttribute("color", new THREE.BufferAttribute(next.colors, 4, true));

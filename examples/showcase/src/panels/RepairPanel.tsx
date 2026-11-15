@@ -5,9 +5,9 @@
 // each one undo step through `store.repair`.
 // Analysis is read-only: the app calls it on its own scene.
 import type {
+  Analysis,
   AutoRepairPreset,
   MeshHandle,
-  OffsetAlgorithm,
   RepairOp,
   RepairReport,
   Scene,
@@ -18,8 +18,15 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { REPAIR_OVERLAY_KINDS, type AppState, type Item, type RepairOverlayKind, useApp } from "../scene/app-state";
 import { nextJoinSource } from "../scene/selection";
+import { countHealerOverlays, type HealerOverlayCounts } from "../viewport/healer-overlays";
 import { REPAIR_OVERLAY_COLORS } from "../viewport/repair-overlays";
 import { inspect } from "./inspect";
+import {
+  buildSelectiveHealOps,
+  formatHealerDelta,
+  MeshHealerSection,
+  type SelectiveHealCategory,
+} from "./MeshHealerSection";
 import {
   AUTO_REPAIR_ANY_SIZE,
   runAutoRepairPipeline,
@@ -35,7 +42,7 @@ import {
   SELF_INTERSECTION_MODE_LABELS,
   summarize,
 } from "./repair-summary";
-import { formatLength, fromDisplayLength, lengthInputValue, type LengthUnit } from "./units";
+import { formatLength, type LengthUnit } from "./units";
 import { LengthInput } from "./LengthInput";
 
 /** The most entries the analysis lists (counts stay exact). */
@@ -62,6 +69,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [analyzing, setAnalyzing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [report, setReport] = useState<{ mesh: MeshHandle; line: string; failed: boolean } | null>(null);
+  const [healerDelta, setHealerDelta] = useState<{ mesh: MeshHandle; text: string } | null>(null);
+  const repairAnalysis = useApp(app, (snap) => snap.repairAnalysis);
   const [weldTolerance, setWeldTolerance] = useState(1e-5);
   const [minTriangles, setMinTriangles] = useState(500);
   const [maxEdges, setMaxEdges] = useState(DEFAULT_MAX_EDGES);
@@ -72,18 +81,6 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [siVoxelSize, setSiVoxelSize] = useState("");
   const [checkSelfIntersections, setCheckSelfIntersections] = useState(false);
   const [selfIntersects, setSelfIntersects] = useState<boolean | null>(null);
-  const [center, setCenter] = useState<readonly [number, number, number]>([0, 0, 0]);
-  const [brushRadius, setBrushRadius] = useState(1);
-  const [strength, setStrength] = useState(1);
-  const [falloff, setFalloff] = useState<"linear" | "smooth">("smooth");
-  const [cycles, setCycles] = useState(3);
-  const [targetLength, setTargetLength] = useState("");
-  const [maxRounds, setMaxRounds] = useState("");
-  const [offsetAlgorithm, setOffsetAlgorithm] = useState<OffsetAlgorithm>("normal");
-  const [offsetDistance, setOffsetDistance] = useState(0.5);
-  const [offsetVoxelSize, setOffsetVoxelSize] = useState("");
-  const [shellThickness, setShellThickness] = useState(1);
-  const brushPick = useApp(app, (s) => s.brushPick);
   const [bridgeA, setBridgeA] = useState("");
   const [bridgeB, setBridgeB] = useState("");
   const [loopMax, setLoopMax] = useState(128);
@@ -108,23 +105,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     }
     setJoinSource((cur) => nextJoinSource(ids, cur));
   }, [mesh, multi, items]);
-  // The brush follows the mesh: its bounding center and a quarter of its
-  // half-diagonal. Strength and the rest are preferences and persist.
-  useEffect(() => {
-    if (item !== null) {
-      setCenter(item.center);
-      setBrushRadius(item.radius / 4);
-    }
-  }, [item]);
-  // A landed pick for this mesh becomes the center (and clears the pick).
-  useEffect(() => {
-    if (brushPick !== null && brushPick.point !== null && brushPick.mesh === mesh) {
-      setCenter(brushPick.point);
-      app.setBrushPick(null);
-    }
-  }, [app, brushPick, mesh]);
   // Loop picks are loop ids: a fresh analysis (or mesh) invalidates them.
-  // A sculpt brush belongs to its mesh: selecting away disarms it.
+  // Note: selecting another mesh no longer disarms an active sculpt brush (#228, #229).
   useEffect(() => {
     setBridgeA("");
     setBridgeB("");
@@ -132,10 +114,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     setJoinSource("");
     setJoinLoopB("");
     setSourceSummary(null);
-    if (app.getSnapshot().sculpt !== null) {
-      app.setSculpt(null);
-    }
-  }, [app, mesh]);
+  }, [mesh]);
   useEffect(() => {
     setBridgeA("");
     setBridgeB("");
@@ -233,6 +212,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           own.current.pending = false;
         } else {
           setReport(null);
+          setHealerDelta(null);
           inspect.repair.report = null;
         }
         clearTimeout(timer);
@@ -275,8 +255,16 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   // -> remove-small-components -> fill holes as ONE repair call (one grouped
   // undo step, all-or-nothing), using this panel's live settings, with a
   // per-stage report and a before/after summary. The triangle-change effect
-  // above re-analyses and refreshes the 3D overlays; the explicit analyse
-  // covers a clean mesh (no change, no effect run).
+  const snapshotHealerCounts = (targetMesh: MeshHandle, raw: Analysis): HealerOverlayCounts | null => {
+    try {
+      const views = scene.views(targetMesh);
+      return countHealerOverlays(raw, views.positions(), views.indices());
+    } catch {
+      return null;
+    }
+  };
+
+  // Run the repair pipeline as a single undo step and record the before/after delta.
   const runAuto = async () => {
     if (mesh === null || busy !== null) {
       return;
@@ -288,6 +276,14 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     try {
       const settings = { weldTolerance, minTriangles, maxEdges, fair };
       if (preset === "general" && siOverride === "auto") {
+        let beforeExtra: HealerOverlayCounts | null = null;
+        let afterExtra: HealerOverlayCounts | null = null;
+        try {
+          const rawBefore = await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED });
+          beforeExtra = snapshotHealerCounts(mesh, rawBefore);
+        } catch {
+          beforeExtra = null;
+        }
         const result = await runAutoRepairPipeline(
           {
             analyze: async () => summarize(await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED })),
@@ -295,6 +291,16 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           },
           settings,
         );
+        try {
+          const rawAfter = await scene.analyze(mesh, { weldTolerance, maxListed: MAX_LISTED });
+          afterExtra = snapshotHealerCounts(mesh, rawAfter);
+        } catch {
+          afterExtra = null;
+        }
+        setHealerDelta({
+          mesh,
+          text: formatHealerDelta(result.before, result.after, beforeExtra, afterExtra),
+        });
         setReport({ mesh, line: result.line, failed: false });
         inspect.repair.report = result.line;
       } else {
@@ -304,6 +310,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           maxListed: MAX_LISTED,
           selfIntersection: inspectSi,
         });
+        const beforeExtra = snapshotHealerCounts(mesh, aBefore);
         const request = buildPresetAutoRepairRequest({
           preset,
           selfIntersectionMode: siOverride === "auto" ? undefined : siOverride,
@@ -316,22 +323,85 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           maxListed: MAX_LISTED,
           selfIntersection: inspectSi,
         });
+        const afterExtra = snapshotHealerCounts(mesh, aAfter);
+        const beforeSummary = summarize(aBefore);
+        const afterSummary = summarize(aAfter);
         const formatted = formatPresetAutoRepairReport(
           preset,
           r,
-          summarize(aBefore),
-          summarize(aAfter),
+          beforeSummary,
+          afterSummary,
           aBefore.selfIntersects,
           aAfter.selfIntersects,
           units,
         );
         setSelfIntersects(aAfter.selfIntersects);
+        setHealerDelta({
+          mesh,
+          text: formatHealerDelta(beforeSummary, afterSummary, beforeExtra, afterExtra),
+        });
         setReport({ mesh, line: formatted.line, failed: false });
         inspect.repair.report = formatted.line;
       }
       void analyze(mesh);
     } catch (e) {
       const line = `Auto repair failed: ${e instanceof Error ? e.message : String(e)}`;
+      setReport({ mesh, line, failed: true });
+      inspect.repair.report = line;
+    } finally {
+      setBusy(null);
+      inspect.repair.busy = null;
+      if (own.current.pending) {
+        own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
+      }
+    }
+  };
+
+  const runSelective = async (cats: Record<SelectiveHealCategory, boolean>) => {
+    if (mesh === null || busy !== null) {
+      return;
+    }
+    const ops = buildSelectiveHealOps(cats, {
+      weldTolerance,
+      minTriangles,
+      maxEdges,
+      fair,
+      anySize: ANY_SIZE,
+      selfIntersectionMode: healSiMode,
+      siVoxelSize,
+    });
+    if (ops.length === 0) return;
+    setBusy("Selective heal");
+    inspect.repair.busy = "Selective heal";
+    clearTimeout(own.current.timer);
+    own.current.pending = true;
+    try {
+      const inspectSi = checkSelfIntersections || cats.resolveSelfIntersections;
+      const aBefore = await scene.analyze(mesh, {
+        weldTolerance,
+        maxListed: MAX_LISTED,
+        selfIntersection: inspectSi,
+      });
+      const beforeExtra = snapshotHealerCounts(mesh, aBefore);
+      const reports = (await store.repair(mesh, ops)) as RepairReport[];
+      const aAfter = await scene.analyze(mesh, {
+        weldTolerance,
+        maxListed: MAX_LISTED,
+        selfIntersection: inspectSi,
+      });
+      const afterExtra = snapshotHealerCounts(mesh, aAfter);
+      const beforeSummary = summarize(aBefore);
+      const afterSummary = summarize(aAfter);
+      const delta = formatHealerDelta(beforeSummary, afterSummary, beforeExtra, afterExtra);
+      const stageLines = ops.map((op, i) => describeReport(op.op, reports[i]!, units));
+      const line = `Selective heal (${plural(ops.length, "stage")}, one undo step): ${delta}. ${stageLines.join("; ")}`;
+      setSelfIntersects(aAfter.selfIntersects);
+      setHealerDelta({ mesh, text: delta });
+      setReport({ mesh, line, failed: false });
+      inspect.repair.report = line;
+      void analyze(mesh);
+    } catch (e) {
+      const line = `Selective heal failed: ${e instanceof Error ? e.message : String(e)}`;
       setReport({ mesh, line, failed: true });
       inspect.repair.report = line;
     } finally {
@@ -398,11 +468,6 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
 
   const s = analysis?.mesh === mesh ? analysis.summary : null;
   const disabled = busy !== null;
-  const offsetLabel = offsetAlgorithm !== "normal" && offsetDistance === 0 ? "Voxel remesh" : "Offset";
-  const offsetDisabled =
-    disabled ||
-    (offsetAlgorithm === "normal" && offsetDistance === 0) ||
-    (offsetAlgorithm !== "normal" && offsetVoxelSize !== "" && !(Number(offsetVoxelSize) > 0));
   return (
     <section className="panel" aria-label="Repair" data-repair={item.name} data-tour="repair">
       <header className="panel-head">
@@ -436,6 +501,18 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
             Check self-intersections
           </label>
           <OverlayToggles app={app} summary={s} />
+          {mesh !== null ? (
+            <MeshHealerSection
+              app={app}
+              scene={scene}
+              mesh={mesh}
+              rawAnalysis={repairAnalysis?.mesh === mesh ? repairAnalysis.analysis : null}
+              summary={s}
+              disabled={disabled}
+              deltaLine={healerDelta?.mesh === mesh ? healerDelta.text : null}
+              onRunSelective={runSelective}
+            />
+          ) : null}
         </>
       )}
 
@@ -633,216 +710,6 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
               : `Preset ${AUTO_REPAIR_PRESET_LABELS[preset]}: tailors healing stages and tolerances (${preset === "print3d" ? "watertight solid with self-intersection healing + volumetric fallback" : preset === "scan3d" ? "non-manifold healing, outlier pruning, slivers & smooth hole filling" : preset === "cadImport" ? "duplicate & non-manifold cleanup keeping sharp CAD boundaries open" : "standard 5-stage cleanup"}) in one undo step (Ctrl+Z).`}
           </p>
         </div>
-      </div>
-
-      <div className="ops">
-        <div className="op">
-          <span className="op-label">Brush</span>
-          <label className="field" title="Brush center in local mesh coordinates">
-            center ({units})
-            <LengthInput aria-label="Brush center x" mm={center[0]} unit={units} onMm={(mm) => setCenter([mm, center[1], center[2]])} />
-            <LengthInput aria-label="Brush center y" mm={center[1]} unit={units} onMm={(mm) => setCenter([center[0], mm, center[2]])} />
-            <LengthInput aria-label="Brush center z" mm={center[2]} unit={units} onMm={(mm) => setCenter([center[0], center[1], mm])} />
-          </label>
-          <button
-            type="button"
-            data-action="pick-center"
-            aria-pressed={brushPick !== null && brushPick.point === null && brushPick.mesh === mesh}
-            disabled={disabled}
-            title="Click the mesh to set the brush center"
-            onClick={() =>
-              app.setBrushPick(
-                brushPick !== null && brushPick.point === null && brushPick.mesh === mesh
-                  ? null
-                  : { mesh: item.mesh, point: null },
-              )
-            }
-          >
-            {brushPick !== null && brushPick.point === null && brushPick.mesh === mesh ? "Picking…" : "Pick"}
-          </button>
-          <label className="field" title="Brush radius">
-            radius ({units})
-            <LengthInput min={0} mm={brushRadius} unit={units} onMm={(mm) => setBrushRadius(Math.max(0, mm))} />
-          </label>
-          <label className="field" title="Displacement scale (negative dents): always in mm for Inflate, a weight for Smooth">
-            strength
-            <input
-              type="number"
-              step="any"
-              value={strength}
-              onChange={(e) => setStrength(Number(e.currentTarget.value) || 0)}
-            />
-          </label>
-          <label className="field" title="How the strength falls off with distance">
-            falloff
-            <select value={falloff} onChange={(e) => setFalloff(e.currentTarget.value as "linear" | "smooth")}>
-              <option value="smooth">smooth</option>
-              <option value="linear">linear</option>
-            </select>
-          </label>
-        </div>
-        <div className="op">
-          <button
-            type="button"
-            data-repair-op="inflate"
-            disabled={disabled}
-            onClick={() =>
-              void run("Inflate", { op: "inflate", center, radius: brushRadius, falloff, strength })
-            }
-          >
-            Inflate
-          </button>
-          <button
-            type="button"
-            data-repair-op="smooth"
-            disabled={disabled}
-            onClick={() =>
-              void run("Smooth", { op: "smooth", center, radius: brushRadius, falloff, strength, cycles })
-            }
-          >
-            Smooth
-          </button>
-          <label className="field" title="Taubin smoothing cycles">
-            cycles
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={cycles}
-              onChange={(e) => setCycles(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
-            />
-          </label>
-        </div>
-        <div className="op">
-          <button
-            type="button"
-            data-repair-op="remesh"
-            disabled={disabled}
-            onClick={() =>
-              void run("Remesh", {
-                op: "remesh",
-                center,
-                radius: brushRadius,
-                ...(targetLength === "" ? {} : { targetLength: Number(targetLength) }),
-                ...(maxRounds === "" ? {} : { maxRounds: Number(maxRounds) }),
-              })
-            }
-          >
-            Remesh
-          </button>
-          <label className="field" title="Target edge length (empty: the mesh mean)">
-            length ({units})
-            <input
-              type="number"
-              min={0}
-              step="any"
-              placeholder="auto"
-              value={targetLength === "" ? "" : lengthInputValue(Number(targetLength), units)}
-              onChange={(e) => {
-                const typed = e.currentTarget.value;
-                setTargetLength(typed === "" ? "" : String(fromDisplayLength(Number(typed), units)));
-              }}
-            />
-          </label>
-          <label className="field" title="Split/collapse/flip rounds (empty: default)">
-            rounds
-            <input
-              type="number"
-              min={0}
-              step={1}
-              placeholder="auto"
-              value={maxRounds}
-              onChange={(e) => setMaxRounds(e.currentTarget.value)}
-            />
-          </label>
-        </div>
-        <p className="muted small">Deform: inflate puffs the brush up (negative dents), smooth relaxes it, remesh retriangulates it.</p>
-      </div>
-
-      <div className="ops">
-        <div className="op">
-          <span className="op-label">Offset</span>
-          <label className="field" title="Surface offsetting or volumetric reconstruction algorithm">
-            algorithm
-            <select
-              data-offset-algorithm
-              value={offsetAlgorithm}
-              onChange={(e) => setOffsetAlgorithm(e.currentTarget.value as OffsetAlgorithm)}
-            >
-              <option value="normal">Normal displacement</option>
-              <option value="fhEdt">FH 3D EDT + Marching Cubes</option>
-              <option value="bvhSdf">BVH SDF + Marching Cubes</option>
-            </select>
-          </label>
-          <label
-            className="field"
-            title="Signed offset distance (positive outward, negative inward; 0 voxel-remeshes volumetric modes)"
-          >
-            distance ({units})
-            <LengthInput data-offset-distance mm={offsetDistance} unit={units} onMm={setOffsetDistance} />
-          </label>
-          {offsetAlgorithm !== "normal" ? (
-            <label className="field" title="Grid voxel spacing (empty: automatic bbox diagonal / 64)">
-              voxel ({units})
-              <input
-                type="number"
-                min={0}
-                step="any"
-                placeholder="auto"
-                data-offset-voxel-size
-                value={offsetVoxelSize === "" ? "" : lengthInputValue(Number(offsetVoxelSize), units)}
-                onChange={(e) => {
-                  const typed = e.currentTarget.value;
-                  setOffsetVoxelSize(typed === "" ? "" : String(fromDisplayLength(Number(typed), units)));
-                }}
-              />
-            </label>
-          ) : null}
-          <button
-            type="button"
-            data-repair-op="offset"
-            data-offset-run
-            disabled={offsetDisabled}
-            onClick={() =>
-              void run(offsetLabel, {
-                op: "offset",
-                distance: offsetDistance,
-                algorithm: offsetAlgorithm,
-                ...(offsetAlgorithm !== "normal" && offsetVoxelSize !== ""
-                  ? { voxelSize: Number(offsetVoxelSize) }
-                  : {}),
-              })
-            }
-          >
-            {offsetLabel}
-          </button>
-        </div>
-        <div className="op">
-          <span className="op-label">Shell</span>
-          <label className="field" title="Wall thickness of the hollowed or thickened shell">
-            thickness ({units})
-            <LengthInput
-              min={0}
-              data-shell-thickness
-              mm={shellThickness}
-              unit={units}
-              onMm={(mm) => setShellThickness(Math.max(0, mm))}
-            />
-          </label>
-          <button
-            type="button"
-            data-repair-op="shell"
-            data-shell-run
-            disabled={disabled || !(shellThickness > 0)}
-            onClick={() => void run("Shell", { op: "shell", thickness: shellThickness })}
-          >
-            Shell
-          </button>
-        </div>
-        <p className="muted small">
-          Offset: Normal moves existing vertices; FH 3D EDT and BVH SDF rebuild a self-intersection-free Marching Cubes
-          surface and voxel-remesh at distance 0. Shell hollows or thickens with inner walls.
-        </p>
       </div>
 
       <div className="ops">

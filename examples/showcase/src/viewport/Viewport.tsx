@@ -10,7 +10,8 @@
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
 import type { MeshHandle, RepairOp, Scene, StretchReport } from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
-import { useScene, useSelection } from "fast-mesh-wasm/react";
+import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
+import { meshState, type SceneSnapshot } from "fast-mesh-wasm/store";
 import { attachTransformControls, type MeshBinding } from "fast-mesh-wasm/three";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
@@ -28,6 +29,7 @@ import { InspectLayers, pickVertex } from "./InspectLayers";
 import {
   applyCameraPose,
   computeSceneBounds,
+  directionPose,
   orthoToPerspectiveDistance,
   perspectiveToOrthoHalfExtents,
   presetPose,
@@ -68,12 +70,15 @@ import {
   maskMeetsRemesh,
   protectMaskedDab,
 } from "./mask-protect";
-import { setWireOverlay } from "./wire";
 import {
-  buildRepairOverlayGroup,
+  type AppliedShadingState,
+  clearMeshDiagnosticShading,
+  syncMeshDiagnosticShading,
+} from "./shading";
+import {
   countRepairOverlays,
-  disposeRepairOverlayGroup,
 } from "./repair-overlays";
+import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "./healer-overlays";
 
 export type GizmoMode = "translate" | "rotate" | "scale";
 
@@ -137,6 +142,12 @@ export function Viewport(props: {
   const store = useScene();
   const [selection, select] = useSelection();
   const multi = useApp(app, (s) => s.multi);
+  const visMask = useStoreSelector((s) =>
+    items.map((i) => (!i.locked && meshState(s, i.mesh).desired.visible ? "1" : "0")).join(""),
+  );
+  const hasEligibleMesh = visMask.includes("1");
+  const maskArmedOnRef = useRef<MeshHandle | null>(null);
+  const wasMaskPaintRef = useRef(false);
   const downAt = useRef<{ x: number; y: number } | null>(null);
   const lastDragEnd = useRef(0);
   useEffect(() => {
@@ -150,13 +161,24 @@ export function Viewport(props: {
       view.dragListeners.delete(onDrag);
     };
   }, []);
-  // The paint works on the selection: with none left (the mesh was removed)
-  // it has nothing to work on, and would keep the next mesh's gizmo down.
+  // Disarm mask paint if the mesh it was armed on was removed or no visible unlocked meshes remain (#229).
   useEffect(() => {
-    if (maskPaint && selection === null) {
+    if (!maskPaint) {
+      wasMaskPaintRef.current = false;
+      maskArmedOnRef.current = null;
+      return;
+    }
+    if (!wasMaskPaintRef.current) {
+      wasMaskPaintRef.current = true;
+      maskArmedOnRef.current = selection;
+    } else if (selection !== null) {
+      maskArmedOnRef.current = selection;
+    }
+    const armedMesh = maskArmedOnRef.current;
+    if (!hasEligibleMesh || (armedMesh !== null && !items.some((i) => i.mesh === armedMesh))) {
       app.setMaskPaint(false);
     }
-  }, [app, maskPaint, selection]);
+  }, [app, maskPaint, selection, items, hasEligibleMesh]);
 
   // A tap on empty space clears the selection; sculpt and mask paint own the
   // pointer, and gizmo drags and orbits are not taps. While an inspect
@@ -216,6 +238,8 @@ export function Viewport(props: {
     view.bindings = bindings;
   }, [bindings]);
   const selected = selection === null ? null : (bindings.get(selection) ?? null);
+  const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
+  const pointerOwnedByPaint = sculpt !== null || maskPaint;
   const radiusOf = useCallback((mesh: MeshHandle) => items.find((i) => i.mesh === mesh)?.radius ?? 1, [items]);
   // Shared live-mask cache between MaskLayer and SculptLayer so switching from
   // mask paint into sculpting preserves O(1) verticesInSphere trust on dab 1.
@@ -247,16 +271,16 @@ export function Viewport(props: {
           onPickPoint={onPickPoint}
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
-          suppressClick={sculpt?.mesh === item.mesh || (maskPaint && sculpt === null && item.mesh === selection)}
+          suppressClick={pointerOwnedByPaint}
           wireframe={wireframe}
           bound={bindings.get(item.mesh) ?? null}
         />
       ))}
-      {/* Sculpt and mask paint own the pointer while armed: the gizmo stands down, so a press on its handles still paints. */}
+      {/* Sculpt and mask paint (or a locked item) stand the gizmo down cleanly (#229, #235). */}
       <Controls
         app={app}
         items={items}
-        bound={sculpt !== null || maskPaint ? null : selected}
+        bound={pointerOwnedByPaint || selectedItem?.locked ? null : selected}
         mode={mode}
         focus={focus}
         resetView={resetView}
@@ -359,19 +383,47 @@ function MeshView(props: {
   } = props;
   // The armed inspect tool, if any: ruler and query clicks land here instead of selecting.
   const tool = useApp(app, (s) => s.inspectTool);
+  const globalShading = useApp(app, (s) => s.shadingMode);
+  const creaseAngleDeg = useApp(app, (s) => s.creaseAngleDeg);
+  const effectiveShading = item.shadingOverride ?? globalShading;
+  const shadingStateRef = useRef<AppliedShadingState | null>(null);
   useLayoutEffect(() => {
     item.material.emissive.set(selected ? 0x3a2a08 : secondary ? 0x1c1a10 : 0x000000);
   }, [item.material, selected, secondary]);
   useLayoutEffect(() => {
     if (bound !== null) {
-      setWireOverlay(bound.object, wireframe);
+      shadingStateRef.current = syncMeshDiagnosticShading({
+        bound,
+        material: item.material,
+        mode: effectiveShading,
+        globalWireframe: wireframe,
+        creaseAngleDeg,
+        prev: shadingStateRef.current,
+      });
     }
     return () => {
       if (bound !== null) {
-        setWireOverlay(bound.object, false);
+        clearMeshDiagnosticShading(bound, item.material);
+        shadingStateRef.current = null;
       }
     };
-  }, [bound, wireframe]);
+  }, [bound, item.material, effectiveShading, wireframe, creaseAngleDeg]);
+  useFrame(() => {
+    if (bound !== null && effectiveShading === "autoCrease") {
+      const idxCount = bound.object.geometry.getIndex()?.count ?? 0;
+      const triCount = Math.floor(idxCount / 3);
+      if (shadingStateRef.current?.triCount !== triCount) {
+        shadingStateRef.current = syncMeshDiagnosticShading({
+          bound,
+          material: item.material,
+          mode: effectiveShading,
+          globalWireframe: wireframe,
+          creaseAngleDeg,
+          prev: shadingStateRef.current,
+        });
+      }
+    }
+  });
   const onClick = useCallback(
     (e: ThreeEvent<MouseEvent>) => {
       e.stopPropagation();
@@ -598,6 +650,7 @@ function RepairOverlays(props: {
   const { app, scene, item, bound } = props;
   const analysis = useApp(app, (s) => s.repairAnalysis);
   const kinds = useApp(app, (s) => s.repairOverlays);
+  const healerKinds = useApp(app, (s) => s.healerOverlays);
   useLayoutEffect(() => {
     const object = bound?.object ?? null;
     if (object === null) {
@@ -620,7 +673,7 @@ function RepairOverlays(props: {
       inspect.repair.overlays.counts = none;
       return;
     }
-    const group = buildRepairOverlayGroup(analysis.analysis, positions, indices, kinds);
+    const group = buildHealerOverlayGroup(analysis.analysis, positions, indices, kinds, healerKinds);
     const all = countRepairOverlays(analysis.analysis);
     inspect.repair.overlays.counts = {
       holes: kinds.holes ? all.holes : 0,
@@ -634,10 +687,10 @@ function RepairOverlays(props: {
     return () => {
       if (group !== null) {
         object.remove(group);
-        disposeRepairOverlayGroup(group);
+        disposeHealerOverlayGroup(group);
       }
     };
-  }, [scene, item.mesh, bound, analysis, kinds]);
+  }, [scene, item.mesh, bound, analysis, kinds, healerKinds]);
   return null;
 }
 
@@ -767,16 +820,95 @@ function HoverRay(props: { scene: Scene | WorkerScene }) {
   return null;
 }
 
+/** Scales a brush radius proportionally when hover-retargeting from `fromItem` to `toItem` (#229). */
+export function scaleBrushRadiusForTarget(
+  currentRadius: number,
+  fromItem: Pick<Item, "radius"> | undefined,
+  toItem: Pick<Item, "radius"> | undefined,
+): number {
+  if (fromItem === undefined || toItem === undefined || !(fromItem.radius > 0) || !(toItem.radius > 0)) {
+    return currentRadius;
+  }
+  const scaled = (currentRadius / fromItem.radius) * toItem.radius;
+  return Math.max(0.01, Math.min(toItem.radius, scaled));
+}
+
+/**
+ * Evaluates whether `hitMesh` may be sculpted/painted given the active stroke lock,
+ * `"Pin to active mesh"` mode, `selection`, and per-item lock/visibility (#229).
+ */
+export function shouldAllowStrokeHit(params: {
+  hitMesh: MeshHandle;
+  strokeTargetMesh: MeshHandle | null;
+  pinToActive: boolean;
+  selection: MeshHandle | null;
+  fallbackMesh: MeshHandle | null;
+  items: readonly Item[];
+  storeSnapshot: SceneSnapshot;
+}): boolean {
+  const { hitMesh, strokeTargetMesh, pinToActive, selection, fallbackMesh, items, storeSnapshot } = params;
+  if (strokeTargetMesh !== null) {
+    return hitMesh === strokeTargetMesh;
+  }
+  const item = items.find((i) => i.mesh === hitMesh);
+  if (item === undefined || item.locked || !meshState(storeSnapshot, hitMesh).desired.visible) {
+    return false;
+  }
+  if (!pinToActive) {
+    return true;
+  }
+  const pinnedMesh = selection ?? fallbackMesh;
+  return pinnedMesh !== null && hitMesh === pinnedMesh;
+}
+
+/** Raycasts skipping invisible (hidden) meshes so hidden meshes never occlude sculpt/mask hits (#229). */
+export async function raycastVisibleSurface(
+  scene: Scene | WorkerScene,
+  origin: readonly [number, number, number],
+  direction: readonly [number, number, number],
+  isVisible: (mesh: MeshHandle) => boolean,
+): Promise<Awaited<ReturnType<Scene["raycast"]>>> {
+  let minDistance = 0;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const hit = await scene.raycast(origin, direction, minDistance > 0 ? { minDistance } : undefined);
+    if (hit === null || isVisible(hit.mesh)) {
+      return hit;
+    }
+    minDistance = hit.distance + 1e-4;
+  }
+  return null;
+}
+
+/** Handles Alt+Click quick pin/unpin on a hovered eligible mesh (#229). */
+export function applyAltPinClick(params: {
+  app: AppState;
+  select: (mesh: MeshHandle | null) => void;
+  selection: MeshHandle | null;
+  hitMesh: MeshHandle;
+  pinToActive: boolean;
+}): boolean {
+  const { app, select, selection, hitMesh, pinToActive } = params;
+  if (pinToActive && selection === hitMesh) {
+    app.setSculptPinToActive(false);
+    return false;
+  }
+  selectMesh(app, select, selection, hitMesh, false);
+  app.setSculptPinToActive(true);
+  return true;
+}
+
 /**
  * The sculpt brush on its mesh: hover shows the brush cursor (a translucent
- * sphere of the brush radius around the surface point), press-and-hold
- * paints dabs along the pointer (and builds up where it holds still;
- * grab drags the surface along instead). A press on empty space is the
- * orbit's, as usual; a stroke holds a single undo step on the sync scene
- * (the Worker has no step nesting: one step per batch of dabs there), and its end
- * remeshes the stroked region when asked. Dabs hold the painted mask's
- * vertices in place and move the rest (`protectedDab`). One raycast at a
- * time, through the engine's BVH, never three's per-triangle `Mesh.raycast`.
+ * sphere of the brush radius around the surface point) over any visible,
+ * unlocked mesh (or only `selection` when pinned), press-and-hold locks onto
+ * that hit mesh until pointerup and paints dabs along the pointer (and builds
+ * up where it holds still; grab drags the surface along instead). A press on
+ * empty space is the orbit's, as usual; a stroke holds a single undo step on
+ * the sync scene (the Worker has no step nesting: one step per batch of dabs
+ * there), and its end remeshes the stroked region when asked. Dabs hold the
+ * painted mask's vertices in place and move the rest (`protectedDab`). One
+ * raycast at a time, through the engine's BVH, never three's per-triangle
+ * `Mesh.raycast`.
  */
 function SculptLayer(props: {
   app: AppState;
@@ -788,8 +920,11 @@ function SculptLayer(props: {
 }) {
   const { app, scene, sculpt, remesh, liveRemesh, maskTracker } = props;
   const store = useScene();
+  const [selection, select] = useSelection();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
+  const items = useApp(app, (s) => s.items);
+  const pinToActive = useApp(app, (s) => s.sculptPinToActive);
   // The brush inputs drive the armed brush live; the stroke survives them.
   const brushRef = useRef(sculpt);
   brushRef.current = sculpt;
@@ -797,6 +932,14 @@ function SculptLayer(props: {
   remeshRef.current = remesh;
   const liveRef = useRef(liveRemesh);
   liveRef.current = liveRemesh;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const pinRef = useRef(pinToActive);
+  pinRef.current = pinToActive;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const selectRef = useRef(select);
+  selectRef.current = select;
   // The mask reads live (paint can accumulate between strokes); the layer
   // never re-renders for it.
   const mask = useApp(app, (s) => s.sculptMask);
@@ -828,6 +971,8 @@ function SculptLayer(props: {
     let pending: { x: number; y: number; period: number } | null = null;
     let hoverLocal: [number, number, number] | null = null;
     let stroke: SculptStroke | null = null;
+    /** Locked target mesh captured at pointerdown for the duration of the active stroke (#229). */
+    let strokeTargetMesh: MeshHandle | null = null;
     /** Dabs applied so far (a stroke-end remesh needs at least one). */
     let landed = 0;
     /** Dabs already counted live (the rest settle at the stroke's end). */
@@ -1016,7 +1161,7 @@ function SculptLayer(props: {
       if (b === null) {
         return;
       }
-      const mesh = brushRef.current.mesh;
+      const mesh = strokeTargetMesh ?? brushRef.current.mesh;
       const spheres = strokeRegionSpheres(b, brushRef.current.symmetry);
       liveAt = performance.now();
       liveDabs = stroke.dabs;
@@ -1037,6 +1182,44 @@ function SculptLayer(props: {
       });
     };
 
+    const isVisibleMesh = (mesh: MeshHandle): boolean => {
+      if (!itemsRef.current.some((i) => i.mesh === mesh)) {
+        return false;
+      }
+      return meshState(store.getSnapshot(), mesh).desired.visible;
+    };
+
+    const isEligibleMesh = (mesh: MeshHandle): boolean => {
+      const item = itemsRef.current.find((i) => i.mesh === mesh);
+      return item !== undefined && !item.locked && meshState(store.getSnapshot(), mesh).desired.visible;
+    };
+
+    const canTargetHit = (mesh: MeshHandle): boolean =>
+      shouldAllowStrokeHit({
+        hitMesh: mesh,
+        strokeTargetMesh,
+        pinToActive: pinRef.current,
+        selection: selectionRef.current,
+        fallbackMesh: brushRef.current.mesh,
+        items: itemsRef.current,
+        storeSnapshot: store.getSnapshot(),
+      });
+
+    /** Hover-retargets the sculpt brush to `nextMesh` without changing `selection` (#229). */
+    const retargetHoverBrush = (nextMesh: MeshHandle): void => {
+      if (brushRef.current.mesh === nextMesh) {
+        return;
+      }
+      const fromItem = itemsRef.current.find((i) => i.mesh === brushRef.current.mesh);
+      const toItem = itemsRef.current.find((i) => i.mesh === nextMesh);
+      const nextRadius = scaleBrushRadiusForTarget(brushRef.current.radius, fromItem, toItem);
+      const updated = { ...brushRef.current, mesh: nextMesh, radius: nextRadius };
+      brushRef.current = updated;
+      hoverLocal = null;
+      cursorNormal = null;
+      app.setSculpt(updated);
+    };
+
     const cast = (x: number, y: number) => {
       const r = canvas.getBoundingClientRect();
       caster.setFromCamera(
@@ -1044,12 +1227,17 @@ function SculptLayer(props: {
         camera,
       );
       const { origin, direction } = caster.ray;
-      return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
+      return raycastVisibleSurface(
+        scene,
+        [origin.x, origin.y, origin.z],
+        [direction.x, direction.y, direction.z],
+        isVisibleMesh,
+      );
     };
 
     /** The hit over the mesh's local views: its point, and the surface's way there for the cursor. */
-    const localHit = (hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
-      const v = scene.views(brushRef.current.mesh);
+    const localHit = (mesh: MeshHandle, hit: { triangle: number; barycentric: readonly [number, number, number] }) => {
+      const v = scene.views(mesh);
       const indices = v.indices();
       const positions = v.positions();
       const corners = [indices[3 * hit.triangle], indices[3 * hit.triangle + 1], indices[3 * hit.triangle + 2]];
@@ -1065,8 +1253,8 @@ function SculptLayer(props: {
     };
 
     /** The cursor on the surface point: a child of the mesh, in its local frame. */
-    const showBall = (point: readonly [number, number, number]) => {
-      const binding = view.bindings.get(brushRef.current.mesh);
+    const showBall = (point: readonly [number, number, number], mesh: MeshHandle = strokeTargetMesh ?? brushRef.current.mesh) => {
+      const binding = view.bindings.get(mesh);
       if (binding === undefined) {
         hideBall();
         return;
@@ -1106,6 +1294,8 @@ function SculptLayer(props: {
     };
 
     const endStroke = () => {
+      const mesh = strokeTargetMesh ?? brushRef.current.mesh;
+      strokeTargetMesh = null;
       view.stroking = false;
       clearInterval(buildup);
       buildup = undefined;
@@ -1131,7 +1321,6 @@ function SculptLayer(props: {
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
         if (liveRef.current && lastBounds !== null) {
-          const mesh = brushRef.current.mesh;
           const spheres = strokeRegionSpheres(lastBounds, brushRef.current.symmetry);
           inspect.sculpt.liveRemeshes++;
           void s.pass(async () => {
@@ -1145,7 +1334,6 @@ function SculptLayer(props: {
         // worker.
         if (remeshRef.current && landed > 0) {
           const b = lastBounds;
-          const mesh = brushRef.current.mesh;
           const slots = triSlots(mesh);
           if (b !== null && slots !== null && !remeshTooBig(slots)) {
             ensureDensity(mesh);
@@ -1202,7 +1390,8 @@ function SculptLayer(props: {
     /** Refreshes the grab's total drag from the pointer's screen offset since the press. */
     const trackGrab = (x: number, y: number, point: readonly [number, number, number]) => {
       const from = grabFrom;
-      const binding = view.bindings.get(brushRef.current.mesh);
+      const activeMesh = strokeTargetMesh ?? brushRef.current.mesh;
+      const binding = view.bindings.get(activeMesh);
       if (from === null || binding === undefined) {
         return;
       }
@@ -1243,7 +1432,7 @@ function SculptLayer(props: {
       const reach = widestGrabReach(brush.radius, brush.falloff, brush.methods?.grab ?? "sphere", brush.strength, g);
       grabPeakReach = Math.max(grabPeakReach, reach);
       const at: [number, number, number] = [press[0] + k * g[0], press[1] + k * g[1], press[2] + k * g[2]];
-      const mesh = brush.mesh;
+      const mesh = strokeTargetMesh ?? brush.mesh;
       s.move(
         () => {
           const cost = inspect.sculpt.dabCost;
@@ -1306,13 +1495,17 @@ function SculptLayer(props: {
             if (!alive) {
               return;
             }
-            if (hit === null || hit.mesh !== brushRef.current.mesh) {
+            if (hit === null || !canTargetHit(hit.mesh)) {
               hideBall();
               stroke?.lift();
             } else {
+              if (stroke === null && hit.mesh !== brushRef.current.mesh) {
+                retargetHoverBrush(hit.mesh);
+              }
+              const hitMesh = strokeTargetMesh ?? hit.mesh;
               let point: [number, number, number];
               try {
-                point = localHit(hit);
+                point = localHit(hitMesh, hit);
               } catch {
                 // Removed meanwhile: the next move asks again.
                 run();
@@ -1320,7 +1513,7 @@ function SculptLayer(props: {
               }
               hoverLocal = point;
               inspect.sculpt.hovering = true;
-              showBall(point);
+              showBall(point, hitMesh);
               if (stroke !== null) {
                 stroke.dab(point);
                 syncDabs();
@@ -1349,6 +1542,7 @@ function SculptLayer(props: {
       if (e.button !== 0 || isExtraFinger(e) || active !== -1 || view.dragging) {
         return;
       }
+      const altPressed = e.altKey;
       pressing = e.pointerId;
       // Immediate: the stroke starts where the button lands, not a throttle later.
       Promise.resolve()
@@ -1361,19 +1555,44 @@ function SculptLayer(props: {
             if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
-            const brush = brushRef.current;
-            if (hit === null || hit.mesh !== brush.mesh) {
-              return; // empty space (or another mesh): the orbit keeps the gesture.
+            if (hit === null) {
+              return; // empty space: the orbit keeps the gesture.
             }
+            if (altPressed) {
+              if (!isEligibleMesh(hit.mesh)) {
+                return;
+              }
+              view.pressTaken = true;
+              const nowPinned = applyAltPinClick({
+                app,
+                select: selectRef.current,
+                selection: selectionRef.current,
+                hitMesh: hit.mesh,
+                pinToActive: pinRef.current,
+              });
+              if (nowPinned) {
+                retargetHoverBrush(hit.mesh);
+              }
+              return;
+            }
+            if (!canTargetHit(hit.mesh)) {
+              return;
+            }
+            if (hit.mesh !== brushRef.current.mesh) {
+              retargetHoverBrush(hit.mesh);
+            }
+            strokeTargetMesh = hit.mesh;
+            const brush = brushRef.current;
             let point: [number, number, number];
             try {
-              point = localHit(hit);
+              point = localHit(hit.mesh, hit);
             } catch {
+              strokeTargetMesh = null;
               return;
             }
             hoverLocal = point;
             inspect.sculpt.hovering = true;
-            showBall(point);
+            showBall(point, hit.mesh);
             // Step nesting is the sync scene's; the Worker steps per dab.
             const maybe = scene as unknown as {
               beginStep?: () => void;
@@ -1385,7 +1604,7 @@ function SculptLayer(props: {
               endStep: typeof maybe.endStep === "function" ? () => maybe.endStep?.() : undefined,
               cancelStep: typeof maybe.cancelStep === "function" ? () => maybe.cancelStep?.() : undefined,
             };
-            const mesh = brush.mesh;
+            const mesh = strokeTargetMesh;
             ensureRest(mesh);
             landed = 0;
             liveDabs = 0;
@@ -1393,12 +1612,10 @@ function SculptLayer(props: {
             grabPress = brush.op === "grab" ? point : null;
             grabPeakReach = 0;
             dirRef.current = [0, 0, 0];
-            // Where the scene nests steps, each dab is its own edit (its cost
-            // follows the brush). The Worker takes them as a list: it runs a
-            // list one op at a time too, as one undo step.
-            const nests = steps.beginStep !== undefined;
+            // Sync `Scene` sends one dab per edit under nested steps; `WorkerScene`
+            // (which exposes `.status`) always batches multiple dabs in a single RPC.
             const s = new SculptStroke(
-              () => ({ ...brushRef.current, direction: dirRef.current }),
+              () => ({ ...brushRef.current, mesh, direction: dirRef.current }),
               steps,
               (ops) => {
                 const cost = inspect.sculpt.dabCost;
@@ -1409,7 +1626,7 @@ function SculptLayer(props: {
                   cost.maskMs.push(sent - start);
                 }
                 return landing(
-                  nests || held.length === 1
+                  !("status" in scene) || held.length === 1
                     ? Promise.all(held.map((op) => store.repair(mesh, op)))
                     : store.repair(mesh, held),
                 ).then((reports) => {
@@ -1534,12 +1751,20 @@ function SculptLayer(props: {
 function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTracker: MaskLiveTracker }) {
   const { app, scene, maskTracker } = props;
   const store = useScene();
-  const [selection] = useSelection();
+  const [selection, select] = useSelection();
   const camera = useThree((s) => s.camera);
   const gl = useThree((s) => s.gl);
-  // The selection and radius drive the paint live, outside React.
+  const items = useApp(app, (s) => s.items);
+  const pinToActive = useApp(app, (s) => s.sculptPinToActive);
+  // The selection, items, pin toggle and radius drive the paint live, outside React.
   const selRef = useRef(selection);
   selRef.current = selection;
+  const selectRef = useRef(select);
+  selectRef.current = select;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const pinRef = useRef(pinToActive);
+  pinRef.current = pinToActive;
   const radius = useApp(app, (s) => s.maskRadius);
   const radiusRef = useRef(radius);
   radiusRef.current = radius;
@@ -1574,6 +1799,29 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
     /** Serializes async `verticesInSphere` picks so rapid moves never race `sculptMask`. */
     let paintTail: Promise<void> = Promise.resolve();
 
+    const isVisibleMesh = (mesh: MeshHandle): boolean => {
+      if (!itemsRef.current.some((i) => i.mesh === mesh)) {
+        return false;
+      }
+      return meshState(store.getSnapshot(), mesh).desired.visible;
+    };
+
+    const isEligibleMesh = (mesh: MeshHandle): boolean => {
+      const item = itemsRef.current.find((i) => i.mesh === mesh);
+      return item !== undefined && !item.locked && meshState(store.getSnapshot(), mesh).desired.visible;
+    };
+
+    const canMaskTarget = (mesh: MeshHandle): boolean =>
+      shouldAllowStrokeHit({
+        hitMesh: mesh,
+        strokeTargetMesh: paintMesh,
+        pinToActive: pinRef.current,
+        selection: selRef.current,
+        fallbackMesh: null,
+        items: itemsRef.current,
+        storeSnapshot: store.getSnapshot(),
+      });
+
     const cast = (x: number, y: number) => {
       const r = canvas.getBoundingClientRect();
       caster.setFromCamera(
@@ -1581,7 +1829,12 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
         camera,
       );
       const { origin, direction } = caster.ray;
-      return scene.raycast([origin.x, origin.y, origin.z], [direction.x, direction.y, direction.z]);
+      return raycastVisibleSurface(
+        scene,
+        [origin.x, origin.y, origin.z],
+        [direction.x, direction.y, direction.z],
+        isVisibleMesh,
+      );
     };
 
     /** The hit over the mesh's local views: its point, and the surface's way there for the cursor. */
@@ -1675,19 +1928,19 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
       pending = null;
       running = true;
       last = performance.now();
-      const mesh = paintMesh ?? selRef.current;
       Promise.resolve()
-        .then(() => (mesh === null ? null : cast(at.x, at.y)))
+        .then(() => cast(at.x, at.y))
         .then(async (hit) => {
-          if (!alive || mesh === null) {
+          if (!alive) {
             return;
           }
-          if (hit === null || hit.mesh !== mesh) {
+          if (hit === null || !canMaskTarget(hit.mesh)) {
             if (active === -1) {
               hideBall();
             }
             return;
           }
+          const mesh = paintMesh ?? hit.mesh;
           let point: [number, number, number];
           try {
             point = localHit(mesh, hit);
@@ -1723,10 +1976,7 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
       if (e.button !== 0 || isExtraFinger(e) || active !== -1 || view.dragging) {
         return;
       }
-      const mesh = selRef.current;
-      if (mesh === null) {
-        return;
-      }
+      const altPressed = e.altKey;
       pressing = e.pointerId;
       // Immediate: the paint starts where the button lands, not a throttle later.
       Promise.resolve()
@@ -1736,9 +1986,27 @@ function MaskLayer(props: { app: AppState; scene: Scene | WorkerScene; maskTrack
             if (!alive || active !== -1 || view.dragging || view.multiTouch) {
               return;
             }
-            if (hit === null || hit.mesh !== mesh) {
-              return; // empty space (or another mesh): the orbit keeps the gesture.
+            if (hit === null) {
+              return;
             }
+            if (altPressed) {
+              if (!isEligibleMesh(hit.mesh)) {
+                return;
+              }
+              view.pressTaken = true;
+              applyAltPinClick({
+                app,
+                select: selectRef.current,
+                selection: selRef.current,
+                hitMesh: hit.mesh,
+                pinToActive: pinRef.current,
+              });
+              return;
+            }
+            if (!canMaskTarget(hit.mesh)) {
+              return;
+            }
+            const mesh = hit.mesh;
             let point: [number, number, number];
             try {
               point = localHit(mesh, hit);
@@ -1828,6 +2096,8 @@ function Controls(props: {
   const size = useThree((s) => s.size);
   const cameraProjection = useApp(app, (s) => s.cameraProjection);
   const cameraPresetRequest = useApp(app, (s) => s.cameraPresetRequest);
+  const cameraDirectionRequest = useApp(app, (s) => s.cameraDirectionRequest);
+  const healerFocusRequest = useApp(app, (s) => s.healerFocusRequest);
   const [orbit, setOrbit] = useState<TrackballControls | null>(null);
   const [gizmo, setGizmo] = useState<TransformControls | null>(null);
   // Read when a focus/preset request arrives: a new list of items is not a new request.
@@ -1841,6 +2111,8 @@ function Controls(props: {
   const lastResetViewRef = useRef(0);
   const lastFocusRef = useRef<FocusRequest | null>(null);
   const lastPresetSeqRef = useRef(0);
+  const lastDirSeqRef = useRef(0);
+  const lastHealerFocusSeqRef = useRef(0);
 
   if (camera instanceof THREE.PerspectiveCamera) {
     perspCamRef.current = camera;
@@ -2065,6 +2337,67 @@ function Controls(props: {
     orbit.update();
   }, [orbit, cameraPresetRequest, cameraProjection, store, app, camera, size.width, size.height]);
 
+  // Arbitrary ViewCube edge/corner direction snapping (#232).
+  useEffect(() => {
+    if (orbit === null || cameraDirectionRequest === null || cameraDirectionRequest.n === lastDirSeqRef.current) {
+      return;
+    }
+    lastDirSeqRef.current = cameraDirectionRequest.n;
+    const bounds = computeSceneBounds(itemsRef.current, store.scene, app);
+    const pose = directionPose(cameraDirectionRequest.dir, cameraDirectionRequest.up, bounds);
+    const aspect = size.height > 0 ? size.width / size.height : 1;
+    applyCameraPose(camera, pose, aspect, cameraProjection);
+    orbitTargetRef.current.set(pose.target[0], pose.target[1], pose.target[2]);
+    orbit.target.set(pose.target[0], pose.target[1], pose.target[2]);
+    orbit.update();
+  }, [orbit, cameraDirectionRequest, cameraProjection, store, app, camera, size.width, size.height]);
+
+  // Mesh Healer defect-hotspot framing (#235).
+  useEffect(() => {
+    if (orbit === null || healerFocusRequest === null || healerFocusRequest.n === lastHealerFocusSeqRef.current) {
+      return;
+    }
+    lastHealerFocusSeqRef.current = healerFocusRequest.n;
+    const center = new THREE.Vector3(
+      healerFocusRequest.center[0],
+      healerFocusRequest.center[1],
+      healerFocusRequest.center[2],
+    );
+    try {
+      const m = store.scene.matrix4(healerFocusRequest.mesh);
+      center.applyMatrix4(new THREE.Matrix4().fromArray(m));
+    } catch {
+      // Fall back to supplied coordinates if matrix is unavailable.
+    }
+    const radius = Math.max(healerFocusRequest.radius, 0.05);
+    const dir = camera.position.clone().sub(orbit.target);
+    if (dir.lengthSq() === 0) {
+      dir.set(0, 0.35, 1);
+    }
+    const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 45;
+    const distance = (radius * 1.65) / Math.sin(THREE.MathUtils.degToRad(fov) / 2);
+    orbitTargetRef.current.copy(center);
+    orbit.target.copy(center);
+    camera.position.copy(center).addScaledVector(dir.normalize(), distance);
+    if (camera instanceof THREE.PerspectiveCamera) {
+      camera.near = Math.max(distance / 1000, 1e-4);
+      camera.far = Math.max(distance * 100, 100);
+      camera.updateProjectionMatrix();
+    } else if (camera instanceof THREE.OrthographicCamera) {
+      const aspect = size.height > 0 ? size.width / size.height : 1;
+      const { halfHeight, halfWidth } = perspectiveToOrthoHalfExtents(fov, distance, aspect);
+      camera.left = -halfWidth;
+      camera.right = halfWidth;
+      camera.top = halfHeight;
+      camera.bottom = -halfHeight;
+      camera.zoom = 1;
+      camera.near = -Math.max(distance * 50, 500);
+      camera.far = Math.max(distance * 50, 500);
+      camera.updateProjectionMatrix();
+    }
+    orbit.update();
+  }, [orbit, healerFocusRequest, store, camera, size.width, size.height]);
+
   // Focus: the orbit target to the mesh's centre (its origin, where the
   // gizmo sits), the camera back along the requested (or current)
   // direction. A focus box frames that world box instead of the mesh.
@@ -2096,7 +2429,9 @@ function Controls(props: {
       dir.set(0, 0.4, 1);
     }
     const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 45;
-    const distance = (radius * 1.15) / Math.sin(THREE.MathUtils.degToRad(fov) / 2);
+    // Frame individual meshes slightly tighter so shorter ribbon-hosted viewports keep brush drags local.
+    const fitScale = focus.box !== undefined ? 1.15 : 1.0;
+    const distance = (radius * fitScale) / Math.sin(THREE.MathUtils.degToRad(fov) / 2);
     orbitTargetRef.current.copy(center);
     orbit.target.copy(center);
     camera.position.copy(center).addScaledVector(dir.normalize(), distance);
