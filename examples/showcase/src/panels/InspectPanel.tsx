@@ -4,10 +4,22 @@
 // thickness/curvature/distance colorings), a draggable section plane
 // (wired to `setSectionPlane` through the store) and an axis-aligned clip
 // box for looking inside meshes. Scalar mesh numbers reuse `measure`.
-import type { FieldHandle, MeshHandle, Scene } from "fast-mesh-wasm";
+import {
+  type ContourSlice,
+  type FieldHandle,
+  type FittedPrimitive,
+  type FittedPrimitiveReport,
+  type MeshHandle,
+  type PrimitiveKindInput,
+  type Scene,
+  type Vec3,
+  sliceContoursExport,
+} from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
+import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useRef, useState } from "react";
+import { type ContourLike, contoursToDxf, downloadReportText, reportFileName } from "../load/report";
 import {
   type AppState,
   type InspectTool,
@@ -17,6 +29,7 @@ import {
   type SurfaceFieldState,
   useApp,
 } from "../scene/app-state";
+import { type Wave6MetrologyState } from "../scene/wave6-state";
 import {
   applySurfaceField,
   clearAppliedSurfaceField,
@@ -26,6 +39,16 @@ import { formatCoord, readMeasure, rulerDistance } from "../viewport/inspect-too
 import { inspect } from "./inspect";
 import { LengthInput } from "./LengthInput";
 import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "./units";
+
+const INITIAL_METROLOGY: Wave6MetrologyState = {
+  fittedPrimitive: null,
+  showPrimitiveOverlay: true,
+  contourSlices: null,
+  showContoursOverlay: true,
+  pointCloud: null,
+  showPointCloudOverlay: true,
+  pointCloudReport: null,
+};
 
 const TOOLS: { tool: InspectTool; label: string; title: string }[] = [
   { tool: "ruler", label: "Ruler", title: "Click two vertices to measure their distance (snaps to vertices)" },
@@ -54,6 +77,7 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
   const clip = useApp(app, (s) => s.clipBox);
   const units = useApp(app, (s) => s.units);
   const overlayValues = useApp(app, (s) => s.surfaceFieldValues);
+  const metrology = useApp(app, (s) => s.wave6?.metrology ?? INITIAL_METROLOGY);
   const item = items.find((i) => i.mesh === selection) ?? null;
 
   const distance = ruler !== null && ruler.b !== null ? rulerDistance(ruler.a, ruler.b) : null;
@@ -151,6 +175,8 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
       <SectionControls app={app} scene={scene} store={store} items={items} item={item} section={section} active={tool === "section"} unit={units} />
       {tool === "clip" || clip !== null ? <ClipControls app={app} scene={scene} items={items} item={item} clip={clip} unit={units} /> : null}
       <SurfaceFieldControls app={app} items={items} selection={selection} unit={units} />
+      <PrimitiveFitControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
+      <ContourSliceControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
     </section>
   );
 }
@@ -757,4 +783,551 @@ function fitWorldBox(
   } catch {
     return null; // removed meanwhile
   }
+}
+
+type DatumAxisKey = "posZ" | "negZ" | "posY" | "posX";
+
+const PRIMITIVE_KINDS: PrimitiveKindInput[] = ["auto", "plane", "sphere", "cylinder", "cone"];
+
+const DATUM_AXIS_OPTIONS: { id: DatumAxisKey; label: string; vec: Vec3 }[] = [
+  { id: "posZ", label: "+Z", vec: [0, 0, 1] },
+  { id: "negZ", label: "-Z", vec: [0, 0, -1] },
+  { id: "posY", label: "+Y", vec: [0, 1, 0] },
+  { id: "posX", label: "+X", vec: [1, 0, 0] },
+];
+
+type ContourPlaneAxis = Axis | "custom";
+
+function formatVec3Unitless(v: readonly [number, number, number]): string {
+  return `(${v[0].toFixed(3)}, ${v[1].toFixed(3)}, ${v[2].toFixed(3)})`;
+}
+
+function summarizePrimitiveGeometry(primitive: FittedPrimitive, unit: LengthUnit): string[] {
+  switch (primitive.kind) {
+    case "plane":
+      return [
+        `Origin: ${formatPoint(primitive.origin, unit)}`,
+        `Normal: ${formatVec3Unitless(primitive.normal)}`,
+      ];
+    case "sphere":
+      return [
+        `Center: ${formatPoint(primitive.center, unit)}`,
+        `Radius: ${formatLength(primitive.radius, unit)}`,
+      ];
+    case "cylinder":
+      return [
+        `Origin: ${formatPoint(primitive.axisOrigin, unit)}`,
+        `Axis: ${formatVec3Unitless(primitive.axisDir)}`,
+        `Radius: ${formatLength(primitive.radius, unit)}`,
+        `Height: ${formatLength(primitive.height, unit)}`,
+      ];
+    case "cone": {
+      const deg = ((primitive.halfAngleRad * 180) / Math.PI).toFixed(2);
+      return [
+        `Apex: ${formatPoint(primitive.apex, unit)}`,
+        `Axis: ${formatVec3Unitless(primitive.axisDir)}`,
+        `Half-angle: ${deg}°`,
+        `Height: ${formatLength(primitive.height, unit)}`,
+      ];
+    }
+  }
+}
+
+function worldCenter(scene: SceneStore["scene"], item: Item | null): [number, number, number] {
+  if (item === null) {
+    return [0, 0, 0];
+  }
+  try {
+    const m = scene.matrix4(item.mesh);
+    return [
+      m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12],
+      m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13],
+      m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14],
+    ];
+  } catch {
+    return [0, 0, 0];
+  }
+}
+
+function normalizeNormalVec(v: readonly [number, number, number]): [number, number, number] {
+  const len = Math.hypot(v[0], v[1], v[2]);
+  if (!Number.isFinite(len) || len < 1e-8) {
+    return [0, 0, 1];
+  }
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+
+function safeTriggerDownload(text: string, fileName: string, mime: string): void {
+  if (typeof document === "undefined" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+    return;
+  }
+  downloadReportText(text, fileName, mime);
+}
+
+/** Converts multi-slice Wave 6 contours into minimal R12 DXF entities. */
+export function exportContourSlicesDxf(slices: readonly ContourSlice[]): string {
+  const origin: Vec3 = slices[0]?.planeOrigin ?? [0, 0, 0];
+  const normal: Vec3 = slices[0]?.planeNormal ?? [0, 0, 1];
+  const contours: ContourLike[] = [];
+  for (const slice of slices) {
+    for (const loop of slice.loops) {
+      contours.push({ points: loop.points3d, closed: loop.closed });
+    }
+  }
+  return contoursToDxf(contours, origin, normal);
+}
+
+/** #234 Primitive fitting and datum alignment controls inside the Inspect panel. */
+function PrimitiveFitControls(props: {
+  app: AppState;
+  store: SceneStore;
+  items: readonly Item[];
+  item: Item | null;
+  metrology: Wave6MetrologyState;
+  unit: LengthUnit;
+}) {
+  const { app, store, items, item, metrology, unit } = props;
+  const targetItem = item ?? items[0] ?? null;
+  const [kind, setKind] = useState<PrimitiveKindInput>("auto");
+  const [targetAxis, setTargetAxis] = useState<DatumAxisKey>("posZ");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const inspectDomain = store?.scene?.inspect;
+  const canFit = typeof inspectDomain?.fitPrimitive === "function";
+  const canAlign = typeof inspectDomain?.alignToFittedPrimitive === "function";
+  const fitted: FittedPrimitiveReport | null = metrology.fittedPrimitive;
+
+  const onFit = async () => {
+    if (targetItem === null || !inspectDomain?.fitPrimitive) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const report = await Promise.resolve(inspectDomain.fitPrimitive(targetItem.mesh, { kind }));
+      app.updateWave6((prev) => ({
+        ...prev,
+        metrology: {
+          ...prev.metrology,
+          fittedPrimitive: report,
+          showPrimitiveOverlay: true,
+        },
+      }));
+      setStatus(`Fitted ${report.primitive.kind} (${report.inlierCount} inliers)`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onAlign = async () => {
+    if (targetItem === null || fitted === null || !inspectDomain?.alignToFittedPrimitive) {
+      return;
+    }
+    const axisOpt = DATUM_AXIS_OPTIONS.find((a) => a.id === targetAxis) ?? DATUM_AXIS_OPTIONS[0];
+    setBusy(true);
+    setError(null);
+    try {
+      await Promise.resolve(
+        inspectDomain.alignToFittedPrimitive(targetItem.mesh, fitted.primitive, axisOpt.vec, [0, 0, 0]),
+      );
+      store.commitFrame();
+      setStatus(`Aligned ${targetItem.name} datum to ${axisOpt.label}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="op" data-inspect-primitive-fit>
+      <div className="op-head">
+        <strong>Primitive Fit &amp; Datum</strong>
+        {fitted !== null ? (
+          <button
+            type="button"
+            data-action="inspect-fit-clear"
+            onClick={() => {
+              app.updateWave6((prev) => ({
+                ...prev,
+                metrology: { ...prev.metrology, fittedPrimitive: null },
+              }));
+              setStatus(null);
+              setError(null);
+            }}
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+
+      <p className="muted small">
+        {targetItem === null ? "Load a mesh to fit a geometric primitive." : `Target: ${targetItem.name}`}
+      </p>
+
+      <div className="op-row">
+        <label className="field">
+          kind
+          <select
+            aria-label="Primitive kind"
+            data-inspect-fit-kind
+            value={kind}
+            disabled={busy}
+            onChange={(e) => setKind(e.currentTarget.value as PrimitiveKindInput)}
+          >
+            {PRIMITIVE_KINDS.map((k) => (
+              <option key={k} value={k}>
+                {k}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          data-action="inspect-fit-primitive"
+          disabled={busy || targetItem === null || !canFit}
+          onClick={() => void onFit()}
+        >
+          {busy ? "Working..." : "Fit"}
+        </button>
+      </div>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          data-inspect-fit-overlay
+          checked={metrology.showPrimitiveOverlay}
+          onChange={(e) => {
+            const checked = e.currentTarget.checked;
+            app.updateWave6((prev) => ({
+              ...prev,
+              metrology: { ...prev.metrology, showPrimitiveOverlay: checked },
+            }));
+          }}
+        />
+        Show datum overlay
+      </label>
+
+      {fitted !== null ? (
+        <div className="readout" data-inspect-fit-report>
+          <p>
+            Kind: <strong>{fitted.primitive.kind}</strong> · Inliers: {fitted.inlierCount} (
+            {(fitted.inlierRatio * 100).toFixed(1)}%)
+          </p>
+          <p>
+            RMS: {formatLength(fitted.rmsError, unit)} · Max: {formatLength(fitted.maxError, unit)}
+          </p>
+          {summarizePrimitiveGeometry(fitted.primitive, unit).map((line) => (
+            <p key={line}>{line}</p>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="op-row">
+        <label className="field">
+          target axis
+          <select
+            aria-label="Datum target axis"
+            data-inspect-align-axis
+            value={targetAxis}
+            disabled={busy || fitted === null}
+            onChange={(e) => setTargetAxis(e.currentTarget.value as DatumAxisKey)}
+          >
+            {DATUM_AXIS_OPTIONS.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          data-action="inspect-align-datum"
+          disabled={busy || targetItem === null || fitted === null || !canAlign}
+          onClick={() => void onAlign()}
+        >
+          Align Datum
+        </button>
+      </div>
+
+      {status !== null ? <p className="muted small">{status}</p> : null}
+      {error !== null ? (
+        <p className="report error small" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** #234 Section contour slicing and SVG/DXF export inside the Inspect panel. */
+function ContourSliceControls(props: {
+  app: AppState;
+  store: SceneStore;
+  items: readonly Item[];
+  item: Item | null;
+  metrology: Wave6MetrologyState;
+  unit: LengthUnit;
+}) {
+  const { app, store, items, item, metrology, unit } = props;
+  const targetItem = item ?? items[0] ?? null;
+  const [planeAxis, setPlaneAxis] = useState<ContourPlaneAxis>("z");
+  const [customNormal, setCustomNormal] = useState<[number, number, number]>([0, 0, 1]);
+  const [offsetMm, setOffsetMm] = useState(0);
+  const [stackCount, setStackCount] = useState(1);
+  const [stepMm, setStepMm] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [exportState, setExportState] = useState<{ format: "svg" | "dxf"; text: string; fileName: string } | null>(
+    null,
+  );
+
+  const inspectDomain = store?.scene?.inspect;
+  const canSlice =
+    typeof inspectDomain?.sliceContours === "function" && typeof inspectDomain?.sliceContourStack === "function";
+  const slices = metrology.contourSlices;
+
+  const activeNormal = (): [number, number, number] =>
+    planeAxis === "custom" ? normalizeNormalVec(customNormal) : AXIS_NORMAL[planeAxis];
+
+  const onSlice = async () => {
+    if (targetItem === null || !inspectDomain?.sliceContours || !inspectDomain?.sliceContourStack) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setExportState(null);
+    try {
+      const n = activeNormal();
+      const center = worldCenter(store.scene, targetItem);
+      const origin: [number, number, number] = [
+        center[0] + n[0] * offsetMm,
+        center[1] + n[1] * offsetMm,
+        center[2] + n[2] * offsetMm,
+      ];
+      const count = Math.max(1, Math.round(stackCount));
+      const nextSlices =
+        count > 1
+          ? await Promise.resolve(inspectDomain.sliceContourStack(targetItem.mesh, origin, n, Math.max(0.001, stepMm), count))
+          : [await Promise.resolve(inspectDomain.sliceContours(targetItem.mesh, origin, n))];
+      app.updateWave6((prev) => ({
+        ...prev,
+        metrology: {
+          ...prev.metrology,
+          contourSlices: nextSlices,
+          showContoursOverlay: true,
+        },
+      }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onExport = (format: "svg" | "dxf") => {
+    if (slices === null || slices.length === 0) {
+      return;
+    }
+    setError(null);
+    try {
+      const text = format === "svg" ? sliceContoursExport(slices, "svg") : exportContourSlicesDxf(slices);
+      const stem = `${targetItem?.name ?? "contours"}-section`;
+      const fileName = reportFileName(stem, format);
+      const mime = format === "svg" ? "image/svg+xml" : "application/dxf";
+      safeTriggerDownload(text, fileName, mime);
+      setExportState({ format, text, fileName });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const totalLoops = slices === null ? 0 : slices.reduce((sum, s) => sum + s.loops.length, 0);
+  const totalPerimeter = slices === null ? 0 : slices.reduce((sum, s) => sum + s.totalPerimeter, 0);
+  const totalArea = slices === null ? 0 : slices.reduce((sum, s) => sum + s.totalArea, 0);
+
+  return (
+    <div className="op" data-inspect-contours>
+      <div className="op-head">
+        <strong>Section Contours</strong>
+        {slices !== null ? (
+          <button
+            type="button"
+            data-action="inspect-contours-clear"
+            onClick={() => {
+              app.updateWave6((prev) => ({
+                ...prev,
+                metrology: { ...prev.metrology, contourSlices: null },
+              }));
+              setExportState(null);
+              setError(null);
+            }}
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+
+      <div className="op-row">
+        <label className="field">
+          plane axis
+          <select
+            aria-label="Contour plane axis"
+            data-inspect-contour-axis
+            value={planeAxis}
+            disabled={busy}
+            onChange={(e) => setPlaneAxis(e.currentTarget.value as ContourPlaneAxis)}
+          >
+            <option value="z">Z (0, 0, 1)</option>
+            <option value="y">Y (0, 1, 0)</option>
+            <option value="x">X (1, 0, 0)</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <label className="field">
+          offset ({unit})
+          <LengthInput
+            aria-label="Contour offset"
+            data-inspect-contour-offset
+            mm={offsetMm}
+            unit={unit}
+            onMm={setOffsetMm}
+          />
+        </label>
+      </div>
+
+      {planeAxis === "custom" ? (
+        <div className="op-row">
+          {(["X", "Y", "Z"] as const).map((label, idx) => (
+            <label key={label} className="field">
+              n{label.toLowerCase()}
+              <input
+                type="number"
+                step="any"
+                aria-label={`Contour normal ${label}`}
+                data-inspect-contour-normal={label.toLowerCase()}
+                value={customNormal[idx]}
+                onChange={(e) => {
+                  const v = Number(e.currentTarget.value);
+                  if (!Number.isFinite(v)) {
+                    return;
+                  }
+                  const next: [number, number, number] = [...customNormal] as [number, number, number];
+                  next[idx] = v;
+                  setCustomNormal(next);
+                }}
+              />
+            </label>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="op-row">
+        <label className="field">
+          stack count
+          <input
+            type="number"
+            aria-label="Contour stack count"
+            data-inspect-contour-count
+            min={1}
+            max={100}
+            step={1}
+            value={stackCount}
+            onChange={(e) => {
+              const n = Number(e.currentTarget.value);
+              if (Number.isFinite(n)) {
+                setStackCount(Math.max(1, Math.min(100, Math.round(n))));
+              }
+            }}
+          />
+        </label>
+        <label className="field">
+          step ({unit})
+          <LengthInput
+            aria-label="Contour stack step"
+            data-inspect-contour-step
+            min={0.001}
+            mm={stepMm}
+            unit={unit}
+            onMm={(mm) => setStepMm(Math.max(0.001, mm))}
+          />
+        </label>
+        <button
+          type="button"
+          data-action="inspect-slice-contours"
+          disabled={busy || targetItem === null || !canSlice}
+          onClick={() => void onSlice()}
+        >
+          {busy ? "Slicing..." : "Slice Contours"}
+        </button>
+      </div>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          data-inspect-contours-overlay
+          checked={metrology.showContoursOverlay}
+          onChange={(e) => {
+            const checked = e.currentTarget.checked;
+            app.updateWave6((prev) => ({
+              ...prev,
+              metrology: { ...prev.metrology, showContoursOverlay: checked },
+            }));
+          }}
+        />
+        Show contour overlay
+      </label>
+
+      {slices !== null ? (
+        <>
+          <div className="readout" data-inspect-contours-summary>
+            <p>
+              Slices: {slices.length} · Loops: {totalLoops}
+            </p>
+            <p>
+              Perimeter: {formatLength(totalPerimeter, unit)} · Area: {formatArea(totalArea, unit)}
+            </p>
+          </div>
+          <div className="op-row">
+            <button
+              type="button"
+              data-action="inspect-export-svg"
+              disabled={slices.length === 0}
+              onClick={() => onExport("svg")}
+            >
+              Export SVG
+            </button>
+            <button
+              type="button"
+              data-action="inspect-export-dxf"
+              disabled={slices.length === 0}
+              onClick={() => onExport("dxf")}
+            >
+              Export DXF
+            </button>
+          </div>
+        </>
+      ) : null}
+
+      {exportState !== null ? (
+        <div className="report" data-inspect-contour-export-preview>
+          <p className="small muted">
+            Exported {exportState.format.toUpperCase()} ({exportState.fileName}, {exportState.text.length} chars)
+          </p>
+          <pre className="small">{exportState.text.slice(0, 600)}</pre>
+        </div>
+      ) : null}
+
+      {error !== null ? (
+        <p className="report error small" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
 }
