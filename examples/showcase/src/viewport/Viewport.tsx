@@ -96,6 +96,10 @@ import {
   countRepairOverlays,
 } from "./repair-overlays";
 import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "./healer-overlays";
+import { DeformHandlesLayer } from "./DeformHandlesLayer";
+import { FaceSelectionLayer } from "./FaceSelectionLayer";
+import { HollowPlaceToolsLayer } from "./HollowPlaceToolsLayer";
+import { MetrologyOverlaysLayer } from "./MetrologyOverlaysLayer";
 
 export type GizmoMode = "translate" | "rotate" | "scale";
 
@@ -197,14 +201,28 @@ export function Viewport(props: {
     }
   }, [app, maskPaint, selection, items, hasEligibleMesh]);
 
-  // A tap on empty space clears the selection; sculpt and mask paint own the
-  // pointer, and gizmo drags and orbits are not taps. While an inspect
-  // tool is armed the selection stays put (the ruler and query click
-  // meshes without selecting them).
+  // A tap on empty space clears the selection; sculpt, mask paint, and Wave 6
+  // viewport tools own the pointer, and gizmo drags and orbits are not taps.
+  // While an inspect tool is armed the selection stays put (the ruler and query
+  // click meshes without selecting them).
   const inspectTool = useApp(app, (s) => s.inspectTool);
+  const wave6SelectTool = useApp(app, (s) => s.wave6.select.activeTool);
+  const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
+  const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
+  const pointerOwnedByWave6 =
+    wave6SelectTool !== null || wave6DeformTool !== null || wave6PrintTool !== null;
   const onMissed = useCallback(
     (e: MouseEvent) => {
-      if (sculpt !== null || maskPaint || picking !== null || view.dragging || view.multiTouch || view.pressTaken || selection === null) {
+      if (
+        sculpt !== null ||
+        maskPaint ||
+        pointerOwnedByWave6 ||
+        picking !== null ||
+        view.dragging ||
+        view.multiTouch ||
+        view.pressTaken ||
+        selection === null
+      ) {
         return;
       }
       if (inspectTool !== null) {
@@ -223,7 +241,7 @@ export function Viewport(props: {
       // Through clickMulti: a shift-click on nothing is ignored, like on a mesh.
       selectMesh(app, select, selection, null, e.shiftKey);
     },
-    [app, select, selection, sculpt, maskPaint, picking, inspectTool],
+    [app, select, selection, sculpt, maskPaint, pointerOwnedByWave6, picking, inspectTool],
   );
   const mpr = useApp(app, (s) => s.volumeMpr);
   // The mesh shown as the scene volume instead of its surface, if any.
@@ -288,16 +306,16 @@ export function Viewport(props: {
           onPickPoint={onPickPoint}
           scene={scene}
           sculpted={sculpt?.mesh === item.mesh}
-          suppressClick={pointerOwnedByPaint}
+          suppressClick={pointerOwnedByPaint || pointerOwnedByWave6}
           wireframe={wireframe}
           bound={bindings.get(item.mesh) ?? null}
         />
       ))}
-      {/* Sculpt and mask paint (or a locked item) stand the gizmo down cleanly (#229, #235). */}
+      {/* Sculpt, mask paint, and Wave 6 pointer tools (or a locked item) stand the gizmo down cleanly (#229, #235). */}
       <Controls
         app={app}
         items={items}
-        bound={pointerOwnedByPaint || selectedItem?.locked ? null : selected}
+        bound={pointerOwnedByPaint || pointerOwnedByWave6 || selectedItem?.locked ? null : selected}
         mode={mode}
         focus={focus}
         resetView={resetView}
@@ -316,11 +334,15 @@ export function Viewport(props: {
       ) : null}
       {/* Mask paint owns the pointer while armed (like sculpt, it disarms the gizmo's claim); sculpt wins when both arm. */}
       {maskPaint && sculpt === null ? <MaskLayer app={app} scene={scene} maskTracker={maskTracker} /> : null}
-      <PickCursor picking={picking !== null || sculpt !== null} />
+      <PickCursor picking={picking !== null || sculpt !== null || wave6SelectTool !== null || wave6PrintTool !== null} />
       <MissTracker track={downAt} />
       <SceneSlices app={app} loader={loader} scene={scene} />
       <SceneVolume app={app} loader={loader} scene={scene} />
       <InspectLayers app={app} scene={scene} items={items} />
+      <FaceSelectionLayer app={app} store={store} />
+      <DeformHandlesLayer app={app} store={store} />
+      <MetrologyOverlaysLayer app={app} store={store} />
+      <HollowPlaceToolsLayer app={app} store={store} />
     </Canvas>
   );
 }

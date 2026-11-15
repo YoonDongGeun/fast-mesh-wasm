@@ -116,3 +116,9 @@ impl From<StoreError> for Error {
         SceneError::Store(e).into()
     }
 }
+
+impl From<OpsError> for Error {
+    fn from(e: OpsError) -> Error {
+        SceneError::Ops(e).into()
+    }
+}

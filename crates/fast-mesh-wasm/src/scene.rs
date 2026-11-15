@@ -2443,6 +2443,743 @@ impl WasmScene {
             }
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — #233 Face Selection
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_faces_screen(
+        &mut self,
+        index: u32,
+        generation: u32,
+        shape_kind: u8,
+        shape_data: &[f64],
+        view_proj16: &[f64],
+        camera_origin3: &[f64],
+        camera_forward3: &[f64],
+        is_orthographic: bool,
+        visible_only: bool,
+        reject_backfaces: bool,
+        include_touching: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let shape = crate::wave6::parse_screen_shape(shape_kind, shape_data)?;
+        let opts = crate::wave6::parse_screen_options(
+            view_proj16,
+            camera_origin3,
+            camera_forward3,
+            is_orthographic,
+            visible_only,
+            reject_backfaces,
+            include_touching,
+        )?;
+        Ok(self.scene.select_faces_screen(id, &shape, &opts)?)
+    }
+
+    pub fn select_faces_in_sphere(
+        &mut self,
+        index: u32,
+        generation: u32,
+        center3: &[f64],
+        radius: f64,
+        normal3: Option<Vec<f64>>,
+        cone_angle_rad: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let center = crate::wave6::vec3_f64(center3, "center")?;
+        let cone = match normal3 {
+            None => None,
+            Some(dir) => {
+                if !cone_angle_rad.is_finite() {
+                    return Err(Error::invalid("coneAngleRad must be finite"));
+                }
+                Some((crate::wave6::vec3_f64(&dir, "normal")?, cone_angle_rad))
+            }
+        };
+        Ok(self
+            .scene
+            .select_faces_in_sphere_world(id, center, radius, cone)?)
+    }
+
+    pub fn select_by_crease_angle(
+        &self,
+        index: u32,
+        generation: u32,
+        seed_tri: u32,
+        max_dihedral_rad: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self
+            .scene
+            .select_by_crease_angle(id, seed_tri, max_dihedral_rad)?)
+    }
+
+    pub fn select_connected_shell(
+        &self,
+        index: u32,
+        generation: u32,
+        seed_tri: u32,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self.scene.select_connected_shell(id, seed_tri)?)
+    }
+
+    pub fn select_small_face_islands(
+        &self,
+        index: u32,
+        generation: u32,
+        max_face_count: f64,
+        max_area: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let max_faces = crate::wave6::req_count(max_face_count, "maxFaceCount")?;
+        let max_area = if max_area.is_nan() {
+            None
+        } else {
+            Some(max_area)
+        };
+        Ok(self
+            .scene
+            .select_small_face_islands(id, max_faces, max_area)?)
+    }
+
+    pub fn grow_face_selection(
+        &self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        rings: f64,
+        adjacency: u8,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let rings = crate::wave6::req_count(rings, "rings")?;
+        let adj = crate::wave6::parse_adjacency(adjacency)?;
+        Ok(self
+            .scene
+            .grow_face_selection(id, selected_tris, rings, adj)?)
+    }
+
+    pub fn shrink_face_selection(
+        &self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        rings: f64,
+        adjacency: u8,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let rings = crate::wave6::req_count(rings, "rings")?;
+        let adj = crate::wave6::parse_adjacency(adjacency)?;
+        Ok(self
+            .scene
+            .shrink_face_selection(id, selected_tris, rings, adj)?)
+    }
+
+    pub fn fill_selection_holes(
+        &self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        max_hole_tris: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let max_holes = crate::wave6::req_count(max_hole_tris, "maxHoleTris")?;
+        Ok(self
+            .scene
+            .fill_selection_holes(id, selected_tris, max_holes)?)
+    }
+
+    pub fn smooth_selection_boundary(
+        &self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        iterations: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let iters = crate::wave6::req_count(iterations, "iterations")?;
+        Ok(self
+            .scene
+            .smooth_selection_boundary(id, selected_tris, iters)?)
+    }
+
+    pub fn face_selection_to_vertex_mask(
+        &self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+    ) -> Result<Vec<f32>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self
+            .scene
+            .face_selection_to_vertex_mask(id, selected_tris)?)
+    }
+
+    pub fn vertex_mask_to_face_selection(
+        &self,
+        index: u32,
+        generation: u32,
+        mask: &[f32],
+        threshold: f32,
+        require_all_vertices: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        Ok(self
+            .scene
+            .vertex_mask_to_face_selection(id, mask, threshold, require_all_vertices)?)
+    }
+
+    pub fn delete_selected_faces(
+        &mut self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let report = self.scene.delete_selected_faces(id, selected_tris)?;
+        Ok(crate::wave6::encode_face_edit_report(&report))
+    }
+
+    pub fn extract_selected_faces(
+        &mut self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        normals: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let new_id = self.scene.extract_selected_faces(id, selected_tris)?;
+        self.added(new_id, normals)
+    }
+
+    pub fn split_selected_faces(
+        &mut self,
+        index: u32,
+        generation: u32,
+        selected_tris: &[u32],
+        normals: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let (new_id, report) = self.scene.split_selected_faces(id, selected_tris)?;
+        let mut out = self.added(new_id, normals)?;
+        out.push(report.removed_triangles as u32);
+        out.push(report.removed_vertices as u32);
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — #193 Free-Form Deformation
+    // -----------------------------------------------------------------------
+
+    pub fn build_ffd_lattice(
+        &self,
+        index: u32,
+        generation: u32,
+        dims: &[u32],
+        basis: u8,
+        padding: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let [nx, ny, nz]: [u32; 3] = dims
+            .try_into()
+            .map_err(|_| Error::invalid("dims must be [nx, ny, nz]"))?;
+        let basis = crate::wave6::parse_ffd_basis(basis)?;
+        let lattice = self.scene.build_ffd_lattice(
+            id,
+            [nx as usize, ny as usize, nz as usize],
+            basis,
+            padding,
+        )?;
+        crate::wave6::encode_ffd_lattice(&lattice)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_ffd(
+        &mut self,
+        index: u32,
+        generation: u32,
+        dims: &[u32],
+        basis: u8,
+        frame15: &[f64],
+        offsets: &[f64],
+        outside_mode: u8,
+        region_center: Option<Vec<f64>>,
+        region_radius: f64,
+        vertices: Option<Vec<u32>>,
+        protected_verts: Option<Vec<u32>>,
+        protection_weights: Option<Vec<f32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        crate::wave6::check_live_mesh(&self.scene, id)?;
+        let op = crate::wave6::decode_ffd_op(
+            dims,
+            basis,
+            frame15,
+            offsets,
+            outside_mode,
+            region_center,
+            region_radius,
+            vertices,
+        )?;
+        let rep = crate::wave6::apply_freeform_with_protection(
+            &mut self.scene,
+            id,
+            &op,
+            protected_verts,
+            protection_weights,
+        )?;
+        Ok(crate::wave6::encode_freeform_report(&rep))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_arap(
+        &mut self,
+        index: u32,
+        generation: u32,
+        anchor_verts: &[u32],
+        anchor_pos: &[f64],
+        anchor_has_pos: &[u8],
+        handle_verts: &[u32],
+        handle_targets: &[f64],
+        weights: u8,
+        solver: u8,
+        iterations: f64,
+        tolerance: f64,
+        region_center: Option<Vec<f64>>,
+        region_radius: f64,
+        vertices: Option<Vec<u32>>,
+        protected_verts: Option<Vec<u32>>,
+        protection_weights: Option<Vec<f32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        crate::wave6::check_live_mesh(&self.scene, id)?;
+        let op = crate::wave6::decode_arap_op(
+            anchor_verts,
+            anchor_pos,
+            anchor_has_pos,
+            handle_verts,
+            handle_targets,
+            weights,
+            solver,
+            iterations,
+            tolerance,
+            region_center,
+            region_radius,
+            vertices,
+        )?;
+        let rep = crate::wave6::apply_freeform_with_protection(
+            &mut self.scene,
+            id,
+            &op,
+            protected_verts,
+            protection_weights,
+        )?;
+        Ok(crate::wave6::encode_freeform_report(&rep))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_kelvinlet(
+        &mut self,
+        index: u32,
+        generation: u32,
+        center3: &[f64],
+        load_kind: u8,
+        load_data: &[f64],
+        epsilon: f64,
+        nu: f64,
+        mu: f64,
+        scale_mode: u8,
+        scale_alpha: f64,
+        sym_x: bool,
+        sym_y: bool,
+        sym_z: bool,
+        region_center: Option<Vec<f64>>,
+        region_radius: f64,
+        vertices: Option<Vec<u32>>,
+        protected_verts: Option<Vec<u32>>,
+        protection_weights: Option<Vec<f32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        crate::wave6::check_live_mesh(&self.scene, id)?;
+        let op = crate::wave6::decode_kelvinlet_op(
+            center3,
+            load_kind,
+            load_data,
+            epsilon,
+            nu,
+            mu,
+            scale_mode,
+            scale_alpha,
+            sym_x,
+            sym_y,
+            sym_z,
+            region_center,
+            region_radius,
+            vertices,
+        )?;
+        let rep = crate::wave6::apply_freeform_with_protection(
+            &mut self.scene,
+            id,
+            &op,
+            protected_verts,
+            protection_weights,
+        )?;
+        Ok(crate::wave6::encode_freeform_report(&rep))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_xpbd(
+        &mut self,
+        index: u32,
+        generation: u32,
+        substeps: f64,
+        iterations: f64,
+        dt: f64,
+        stretch_compliance: f64,
+        bend_compliance: f64,
+        volume_compliance: f64,
+        damping: f64,
+        gravity3: &[f64],
+        pin_verts: &[u32],
+        pin_targets: &[f64],
+        handle_verts: &[u32],
+        handle_targets: &[f64],
+        handle_compliances: &[f64],
+        self_collision: bool,
+        collision_thickness: f64,
+        protected_verts: Option<Vec<u32>>,
+        protection_weights: Option<Vec<f32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        crate::wave6::check_live_mesh(&self.scene, id)?;
+        let op = crate::wave6::decode_xpbd_op(
+            substeps,
+            iterations,
+            dt,
+            stretch_compliance,
+            bend_compliance,
+            volume_compliance,
+            damping,
+            gravity3,
+            pin_verts,
+            pin_targets,
+            handle_verts,
+            handle_targets,
+            handle_compliances,
+            self_collision,
+            collision_thickness,
+        )?;
+        let rep = crate::wave6::apply_freeform_with_protection(
+            &mut self.scene,
+            id,
+            &op,
+            protected_verts,
+            protection_weights,
+        )?;
+        Ok(crate::wave6::encode_freeform_report(&rep))
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — #194 Inter-Object Collision
+    // -----------------------------------------------------------------------
+
+    pub fn set_default_collision_rule(&mut self, rule_flat16: &[f64]) -> Result<(), Error> {
+        let rule = crate::wave6::decode_collision_rule(rule_flat16)?;
+        Ok(self.scene.set_default_collision_rule(rule)?)
+    }
+
+    pub fn default_collision_rule(&self) -> Vec<f64> {
+        crate::wave6::encode_collision_rule(self.scene.default_collision_rule())
+    }
+
+    pub fn set_collision_rule(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+        rule_flat16: &[f64],
+    ) -> Result<(), Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        let rule = crate::wave6::decode_collision_rule(rule_flat16)?;
+        Ok(self.scene.set_collision_rule(a, b, rule)?)
+    }
+
+    pub fn clear_collision_rule(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+    ) -> Result<bool, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        Ok(self.scene.clear_collision_rule(a, b)?)
+    }
+
+    pub fn collision_rule(
+        &self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        let rule = self.scene.collision_rule(a, b)?;
+        Ok(crate::wave6::encode_collision_rule(&rule))
+    }
+
+    pub fn has_active_collision_response(&self, index: u32, generation: u32) -> bool {
+        self.id(index, generation)
+            .is_ok_and(|id| self.scene.has_active_collision_response(id))
+    }
+
+    pub fn move_with_collision(
+        &mut self,
+        index: u32,
+        generation: u32,
+        rotation: &[f64],
+        translation: &[f64],
+        scale: Option<Vec<f64>>,
+        is_release: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let target = crate::wave6::parse_placement(rotation, translation, scale)?;
+        let report = self.scene.move_with_collision(id, target, is_release)?;
+        crate::wave6::encode_collision_step_report(&self.scene, id, &report)
+    }
+
+    pub fn commit_collision_interaction(
+        &mut self,
+        index: u32,
+        generation: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let report = self.scene.commit_collision_interaction(id)?;
+        crate::wave6::encode_collision_step_report(&self.scene, id, &report)
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — #234 Primitive Fit, Contours & Point Cloud
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fit_primitive(
+        &self,
+        index: u32,
+        generation: u32,
+        subset_tris: Option<Vec<u32>>,
+        kind: i32,
+        inlier_threshold: f64,
+        ransac_iterations: f64,
+        lm_iterations: f64,
+        seed: f64,
+        min_inlier_ratio: f64,
+        normal_weight: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let kind = crate::wave6::parse_primitive_kind(kind)?;
+        let opts = crate::wave6::parse_fit_options(
+            inlier_threshold,
+            ransac_iterations,
+            lm_iterations,
+            seed,
+            min_inlier_ratio,
+            normal_weight,
+        )?;
+        let rep = self
+            .scene
+            .fit_primitive_world(id, subset_tris.as_deref(), kind, &opts)?;
+        crate::wave6::encode_fit_report(&rep)
+    }
+
+    pub fn align_to_fitted_primitive(
+        &mut self,
+        index: u32,
+        generation: u32,
+        prim9: &[f64],
+        target_axis3: &[f64],
+        target_origin3: &[f64],
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let prim = crate::wave6::decode_fitted_primitive(prim9)?;
+        let axis = crate::wave6::vec3_f64(target_axis3, "targetAxis")?;
+        let origin = crate::wave6::vec3_f64(target_origin3, "targetOrigin")?;
+        let placement = self
+            .scene
+            .align_to_fitted_primitive(id, &prim, axis, origin)?;
+        Ok(crate::wave6::encode_placement(&placement))
+    }
+
+    pub fn slice_contours(
+        &self,
+        index: u32,
+        generation: u32,
+        origin3: &[f64],
+        normal3: &[f64],
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let origin = crate::wave6::vec3_f64(origin3, "origin")?;
+        let normal = crate::wave6::vec3_f64(normal3, "normal")?;
+        let slice = self.scene.slice_contours_world(id, origin, normal)?;
+        crate::wave6::encode_contour_slices(&[slice])
+    }
+
+    pub fn slice_contour_stack(
+        &self,
+        index: u32,
+        generation: u32,
+        origin3: &[f64],
+        normal3: &[f64],
+        spacing: f64,
+        count: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let origin = crate::wave6::vec3_f64(origin3, "origin")?;
+        let normal = crate::wave6::vec3_f64(normal3, "normal")?;
+        let n = crate::wave6::req_count(count, "count")?;
+        let slices = self
+            .scene
+            .slice_contour_stack_world(id, origin, normal, spacing, n)?;
+        crate::wave6::encode_contour_slices(&slices)
+    }
+
+    pub fn reconstruct_point_cloud(
+        &mut self,
+        packed_cloud: &[f32],
+        method: u8,
+        voxel_size: f64,
+        ball_radius: f64,
+        k_neighbors: f64,
+        normals: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let cloud = crate::wave6::decode_point_cloud_f32(packed_cloud)?;
+        let opts =
+            crate::wave6::parse_reconstruct_options(method, voxel_size, ball_radius, k_neighbors)?;
+        let id = self.scene.reconstruct_point_cloud(&cloud, &opts)?;
+        self.added(id, normals)
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — #236 Hollow, Drain Holes & Place Mesh
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hollow_mesh(
+        &mut self,
+        index: u32,
+        generation: u32,
+        wall_thickness: f64,
+        backend: u8,
+        voxel_size: f64,
+        max_voxels: f64,
+        max_cavity_triangles: f64,
+        min_cavity_volume: f64,
+        modulation_verts: Option<Vec<u32>>,
+        modulation_weights: Option<Vec<f32>>,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let opts = crate::wave6::parse_hollow_options(
+            wall_thickness,
+            backend,
+            voxel_size,
+            max_voxels,
+            max_cavity_triangles,
+            min_cavity_volume,
+            modulation_verts,
+            modulation_weights,
+        )?;
+        let rep = self.scene.hollow_mesh(id, &opts)?;
+        Ok(crate::wave6::encode_hollow_report(&rep))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn punch_drain_hole(
+        &mut self,
+        index: u32,
+        generation: u32,
+        surface_point3: &[f64],
+        surface_normal3: &[f64],
+        diameter: f64,
+        depth: f64,
+        outer_chamfer: f64,
+        taper_angle_deg: f64,
+        segments: u32,
+        boolean_method: u8,
+        fallback_bvh_sdf: bool,
+        generate_plug: bool,
+        plug_clearance: f64,
+        plug_normals: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let (spec, opts) = crate::wave6::parse_drain_hole(
+            surface_point3,
+            surface_normal3,
+            diameter,
+            depth,
+            outer_chamfer,
+            taper_angle_deg,
+            segments,
+            boolean_method,
+            fallback_bvh_sdf,
+            generate_plug,
+            plug_clearance,
+        )?;
+        let (rep, plugs) = self.scene.punch_drain_hole_world(id, &spec, &opts)?;
+        let mut plug_ids = Vec::with_capacity(plugs.len() * 2);
+        for plug_id in plugs {
+            let pair = self.added(plug_id, plug_normals)?;
+            plug_ids.extend_from_slice(&pair);
+        }
+        crate::wave6::encode_drain_report(&rep, &plug_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_mesh(
+        &mut self,
+        target_index: u32,
+        target_generation: u32,
+        stamp_index: u32,
+        stamp_generation: u32,
+        hit_point3: &[f64],
+        hit_normal3: &[f64],
+        up_axis: u8,
+        twist_angle_rad: f64,
+        uniform_scale: f64,
+        embed_depth: f64,
+        mode: u8,
+        conform_to_surface: bool,
+        boolean_method: u8,
+        normals: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let target = self.id(target_index, target_generation)?;
+        let stamp = self.id(stamp_index, stamp_generation)?;
+        let (hp, hn, params) = crate::wave6::parse_place_params(
+            hit_point3,
+            hit_normal3,
+            up_axis,
+            twist_angle_rad,
+            uniform_scale,
+            embed_depth,
+            mode,
+            conform_to_surface,
+            boolean_method,
+        )?;
+        let (rep, added) = self
+            .scene
+            .place_mesh_world(target, stamp, hp, hn, &params)?;
+        let added_pair = match added {
+            Some(new_id) => {
+                let pair = self.added(new_id, normals)?;
+                Some([pair[0], pair[1]])
+            }
+            None => None,
+        };
+        Ok(crate::wave6::encode_place_report(&rep, added_pair))
+    }
 }
 
 /// `[index, generation, triangle, point xyz, distance]` of a closest hit.

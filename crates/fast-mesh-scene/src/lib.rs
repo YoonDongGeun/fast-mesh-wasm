@@ -109,6 +109,7 @@ mod sculpt;
 mod sections;
 #[cfg(test)]
 mod uv_tests;
+mod wave6_ops;
 
 pub use boolean::{BooleanMethod, BooleanOp, BooleanOptions, BooleanReport, CsgNode};
 pub use contacts::{
@@ -149,3 +150,4 @@ pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};
+pub use wave6_ops::Vec3;

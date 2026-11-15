@@ -2,7 +2,7 @@
 // Repair and Collision panels on the right and the
 // status bar along the bottom. Files dropped anywhere on the page load.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { useHistory, useSelection } from "fast-mesh-wasm/react";
+import { useHistory, useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import {
   Suspense,
@@ -19,6 +19,7 @@ import { parseBigFileParams } from "./load/big-file";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
 import { CommandPalette } from "./panels/CommandPalette";
+import { DeformPanel } from "./panels/DeformPanel";
 import { ExportPanel } from "./panels/ExportPanel";
 import { GroupsBar } from "./panels/GroupsBar";
 import { HelpOverlay, TourCard } from "./panels/Help";
@@ -27,6 +28,7 @@ import { AlignPanel } from "./panels/AlignPanel";
 import { InspectPanel } from "./panels/InspectPanel";
 import { MeshList } from "./panels/MeshList";
 import { ModelingPanel } from "./panels/ModelingPanel";
+import { PointsPanel } from "./panels/PointsPanel";
 import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
 import {
@@ -37,11 +39,13 @@ import {
   VolumeFallbackCard,
   WorkbenchRibbon,
 } from "./panels/Ribbon";
+import { SelectPanel } from "./panels/SelectPanel";
 import { TransformPanel } from "./panels/TransformPanel";
 import { DEFAULT_SIDEBAR_WIDTH } from "./panels/settings";
 import { StatusBar } from "./panels/StatusBar";
 import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
 import { type AppState, useApp, type WorkbenchTab } from "./scene/app-state";
+import { FaceSelectionMarquee } from "./viewport/FaceSelectionLayer";
 import { ViewportNavigationHud } from "./viewport/ViewCube";
 import { selectMesh } from "./scene/selection";
 import { afterStroke } from "./viewport/view";
@@ -77,6 +81,7 @@ const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: 
 
 export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
+  const store = useScene();
   const items = useApp(app, (s) => s.items);
   const edgeSoftness = useApp(app, (s) => s.edgeSoftness);
   const wireframe = useApp(app, (s) => s.wireframe);
@@ -145,6 +150,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const sculptRemesh = useApp(app, (s) => s.sculptRemesh);
   const sculptLiveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
   const maskPaint = useApp(app, (s) => s.maskPaint);
+  const wave6SelectTool = useApp(app, (s) => s.wave6.select.activeTool);
+  const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
+  const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -318,12 +326,18 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         } else if (tourStep !== null) {
           endTour();
         } else {
-          // Sculpt first (it owns the pointer), then the mask paint, then a
-          // pick (it never selects), then the selection.
+          // Sculpt first (it owns the pointer), then mask paint, then active Wave 6 tool,
+          // then brush pick (never selects), then mesh selection.
+          const hasWave6Tool =
+            snap.wave6.select.activeTool !== null ||
+            snap.wave6.deform.activeTool !== null ||
+            snap.wave6.printPrep.activeTool !== null;
           if (snap.sculpt !== null) {
             app.setSculpt(null);
           } else if (snap.maskPaint) {
             app.setMaskPaint(false);
+          } else if (hasWave6Tool) {
+            app.disarmWave6Tools();
           } else if (snap.brushPick !== null) {
             app.setBrushPick(null);
           } else {
@@ -331,10 +345,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           }
         }
       } else if (key === "t") {
+        app.disarmWave6Tools();
         setMode("translate");
       } else if (key === "r") {
+        app.disarmWave6Tools();
         setMode("rotate");
       } else if (key === "s") {
+        app.disarmWave6Tools();
         setMode("scale");
       } else if (key === "f" && selection !== null) {
         focusOn(selection);
@@ -459,6 +476,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           wireframe={wireframe}
           loader={loader}
         />
+        <FaceSelectionMarquee />
         {grouped ? <HoverTip app={app} scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
@@ -467,15 +485,23 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             ? "Hover any visible mesh to see brush · drag to sculpt · Esc disarms"
             : maskPaint
               ? "Hover any visible mesh · drag to paint mask · Esc disarms"
-            : picking !== null
-              ? "Click the mesh to set the brush center · Esc cancels"
-              : selection === null
-                ? coarsePointer
-                  ? "Tap a mesh to select it · drag to rotate · pinch to zoom · two fingers to pan"
-                  : "Click a mesh to select it · drag to rotate · scroll to zoom · Ctrl+K search · drop files to load"
-                : coarsePointer
-                  ? "Drag the gizmo to move · tap empty space to deselect"
-                  : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Ctrl+K search · Esc deselect"}
+              : wave6SelectTool !== null
+                ? `Use ${wave6SelectTool} selection on mesh · Esc disarms`
+                : wave6DeformTool !== null
+                  ? "Drag deformation handle in viewport · Esc disarms"
+                  : wave6PrintTool === "drainHole"
+                    ? "Click mesh surface to punch drain hole · Esc disarms"
+                    : wave6PrintTool === "placeStamp"
+                      ? "Click mesh surface to align and place stamp · Esc disarms"
+                      : picking !== null
+                        ? "Click the mesh to set the brush center · Esc cancels"
+                        : selection === null
+                          ? coarsePointer
+                            ? "Tap a mesh to select it · drag to rotate · pinch to zoom · two fingers to pan"
+                            : "Click a mesh to select it · drag to rotate · scroll to zoom · Ctrl+K search · drop files to load"
+                          : coarsePointer
+                            ? "Drag the gizmo to move · tap empty space to deselect"
+                            : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Ctrl+K search · Esc deselect"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
@@ -496,11 +522,25 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           <TransformPanel app={app} mode={mode} onMode={setMode} />
         </div>
         <div
+          className={tabMatchesSlot(activeTab, "select") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="select"
+          onClickCapture={() => activateTabForSlot("select")}
+        >
+          <SelectPanel app={app} store={store} />
+        </div>
+        <div
           className={tabMatchesSlot(activeTab, "sculpt") ? "inspector-slot" : "inspector-slot inspector-hidden"}
           data-inspector-slot="sculpt"
           onClickCapture={() => activateTabForSlot("sculpt")}
         >
           <SculptInspectorCard app={app} selection={selection} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "deform") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="deform"
+          onClickCapture={() => activateTabForSlot("sculpt")}
+        >
+          <DeformPanel app={app} store={store} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "modeling") ? "inspector-slot" : "inspector-slot inspector-hidden"}
@@ -515,6 +555,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onClickCapture={() => activateTabForSlot("repair")}
         >
           <RepairPanel app={app} scene={engine.scene} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "points") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="points"
+          onClickCapture={() => activateTabForSlot("align")}
+        >
+          <PointsPanel app={app} store={store} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "align") ? "inspector-slot" : "inspector-slot inspector-hidden"}

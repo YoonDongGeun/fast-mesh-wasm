@@ -16,6 +16,14 @@ import type {
   TrimCurveOptions,
   TrimReport,
 } from "../scene.js";
+import type {
+  DrainHoleOptions,
+  DrainHoleReport,
+  HollowOptions,
+  HollowReport,
+  PlaceMeshOptions,
+  PlaceMeshReport,
+} from "../wave6.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
 export type BooleanReturn<Async extends boolean, T> = Async extends true ? Promise<T> : T;
@@ -47,6 +55,9 @@ export interface BooleanBackend<Async extends boolean = false> {
     optionsOrCurve: TrimCurveOptions | readonly (Readonly<Vec3> | SurfacePathPoint)[],
     maybeOptions?: Omit<TrimCurveOptions, "points">,
   ) => BooleanReturn<Async, TrimReport>;
+  hollowMesh(mesh: MeshHandle, options: HollowOptions): BooleanReturn<Async, HollowReport>;
+  punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): BooleanReturn<Async, DrainHoleReport>;
+  placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): BooleanReturn<Async, PlaceMeshReport>;
 }
 
 /**
@@ -100,6 +111,9 @@ export interface BooleanDomain<Async extends boolean = false> {
   ): BooleanReturn<Async, TrimReport>;
   offset(mesh: MeshHandle, options: OffsetOptions): BooleanReturn<Async, OffsetReport>;
   shell(mesh: MeshHandle, thickness: number | ShellOptions): BooleanReturn<Async, ShellReport>;
+  hollowMesh(mesh: MeshHandle, options: HollowOptions): BooleanReturn<Async, HollowReport>;
+  punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): BooleanReturn<Async, DrainHoleReport>;
+  placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): BooleanReturn<Async, PlaceMeshReport>;
 }
 
 /** Synchronous boolean domain exposed by `Scene.boolean`. */
@@ -184,5 +198,9 @@ export function createBooleanDomain<Async extends boolean>(backend: BooleanBacke
         op: "shell",
         thickness: typeof thickness === "number" ? thickness : thickness.thickness,
       }),
+    hollowMesh: (mesh: MeshHandle, options: HollowOptions) => backend.hollowMesh(mesh, options),
+    punchDrainHole: (mesh: MeshHandle, options: DrainHoleOptions) => backend.punchDrainHole(mesh, options),
+    placeMesh: (target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions) =>
+      backend.placeMesh(target, stamp, options),
   }) as BooleanDomain<Async>;
 }

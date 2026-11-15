@@ -73,13 +73,13 @@ export function fuzzyMatchCommand(query: string, text: string): number | null {
 
 export const TAB_LABELS: readonly { tab: WorkbenchTab; label: string; keywords: string }[] = [
   { tab: "home", label: "Home Workspace", keywords: "tab home open recent project overview" },
-  { tab: "select", label: "Select & Transform", keywords: "tab select gizmo move rotate scale groups" },
+  { tab: "select", label: "Select & Transform", keywords: "tab select gizmo move rotate scale groups face lasso box brush shell split extract" },
   { tab: "repair", label: "Mesh Repair & Healer", keywords: "tab heal repair holes manifold slivers intersections" },
-  { tab: "edit", label: "Mesh Edit & Modeling", keywords: "tab modeling offset shell decimate boolean remesh" },
-  { tab: "sculpt", label: "Sculpt & Deform", keywords: "tab sculpt inflate smooth flatten crease grab clay twist mask" },
-  { tab: "align", label: "Points & Align", keywords: "tab align register collision distance gap pick" },
+  { tab: "edit", label: "Mesh Edit & Modeling", keywords: "tab modeling offset shell decimate boolean remesh hollow drain hole place stamp" },
+  { tab: "sculpt", label: "Sculpt & Deform", keywords: "tab sculpt inflate smooth flatten crease grab clay twist mask deform ffd arap kelvinlet xpbd self collision" },
+  { tab: "align", label: "Points & Align", keywords: "tab align register point cloud sor ror poisson bpa reconstruct collision rule rigid cut soft distance gap pick" },
   { tab: "volume", label: "Voxel / CT Volume", keywords: "tab volume dicom mpr hu window slice" },
-  { tab: "inspect", label: "Inspect & Measure", keywords: "tab inspect ruler measure section clip curvature thickness" },
+  { tab: "inspect", label: "Inspect & Measure", keywords: "tab inspect ruler measure section clip curvature thickness primitive fit plane sphere cylinder cone datum contour svg dxf" },
 ];
 
 const SHADING_COMMANDS: readonly { mode: DiagnosticShadingMode; label: string; keywords: string }[] = [
@@ -184,6 +184,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setSculpt(null);
         app.setMaskPaint(false);
+        app.disarmWave6Tools();
         app.setActiveTab("select");
       },
     },
@@ -196,6 +197,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setSculpt(null);
         app.setMaskPaint(false);
+        app.disarmWave6Tools();
         ctx.onSetMode("translate");
         app.setActiveTab("select");
       },
@@ -209,6 +211,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setSculpt(null);
         app.setMaskPaint(false);
+        app.disarmWave6Tools();
         ctx.onSetMode("rotate");
         app.setActiveTab("select");
       },
@@ -222,8 +225,182 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setSculpt(null);
         app.setMaskPaint(false);
+        app.disarmWave6Tools();
         ctx.onSetMode("scale");
         app.setActiveTab("select");
+      },
+    },
+    {
+      id: "tool:select-box",
+      title: "Select: Box Face Selection",
+      category: "Tool",
+      keywords: "select face marquee box frustum extract split delete",
+      run: () => {
+        app.setSculpt(null);
+        app.setMaskPaint(false);
+        app.updateWave6((prev) => ({
+          ...prev,
+          select: { ...prev.select, activeTool: "box" },
+          deform: { ...prev.deform, activeTool: null },
+          printPrep: { ...prev.printPrep, activeTool: null },
+        }));
+        app.setActiveTab("select");
+      },
+    },
+    {
+      id: "tool:select-lasso",
+      title: "Select: Lasso Face Selection",
+      category: "Tool",
+      keywords: "select face lasso freehand polygon extract split",
+      run: () => {
+        app.setSculpt(null);
+        app.setMaskPaint(false);
+        app.updateWave6((prev) => ({
+          ...prev,
+          select: { ...prev.select, activeTool: "lasso" },
+          deform: { ...prev.deform, activeTool: null },
+          printPrep: { ...prev.printPrep, activeTool: null },
+        }));
+        app.setActiveTab("select");
+      },
+    },
+    {
+      id: "tool:select-brush",
+      title: "Select: Brush Face Selection",
+      category: "Tool",
+      keywords: "select face brush paint sphere grow shrink",
+      run: () => {
+        app.setSculpt(null);
+        app.setMaskPaint(false);
+        app.updateWave6((prev) => ({
+          ...prev,
+          select: { ...prev.select, activeTool: "brush" },
+          deform: { ...prev.deform, activeTool: null },
+          printPrep: { ...prev.printPrep, activeTool: null },
+        }));
+        app.setActiveTab("select");
+      },
+    },
+    {
+      id: "tool:deform-ffd",
+      title: "Deform: FFD Lattice",
+      category: "Tool",
+      keywords: "deform ffd freeform lattice cage control points",
+      run: () => {
+        app.updateWave6((prev) => ({
+          ...prev,
+          deform: { ...prev.deform, algorithm: "ffd" },
+        }));
+        app.setActiveTab("sculpt");
+      },
+    },
+    {
+      id: "tool:deform-arap",
+      title: "Deform: ARAP Surface",
+      category: "Tool",
+      keywords: "deform arap rigid anchor handle protect",
+      run: () => {
+        app.updateWave6((prev) => ({
+          ...prev,
+          deform: { ...prev.deform, algorithm: "arap" },
+        }));
+        app.setActiveTab("sculpt");
+      },
+    },
+    {
+      id: "tool:deform-kelvinlet",
+      title: "Deform: Kelvinlets",
+      category: "Tool",
+      keywords: "deform kelvinlet grab pinch twist scale elastic",
+      run: () => {
+        app.updateWave6((prev) => ({
+          ...prev,
+          deform: { ...prev.deform, algorithm: "kelvinlet" },
+        }));
+        app.setActiveTab("sculpt");
+      },
+    },
+    {
+      id: "tool:deform-xpbd",
+      title: "Deform: XPBD Elastic / Cloth",
+      category: "Tool",
+      keywords: "deform xpbd cloth elastic self collision gravity",
+      run: () => {
+        app.updateWave6((prev) => ({
+          ...prev,
+          deform: { ...prev.deform, algorithm: "xpbd" },
+        }));
+        app.setActiveTab("sculpt");
+      },
+    },
+    {
+      id: "tool:print-drain-hole",
+      title: "Print Prep: Punch Drain Hole",
+      category: "Tool",
+      keywords: "hollow drain hole resin plug chamfer print prep",
+      run: () => {
+        app.setSculpt(null);
+        app.setMaskPaint(false);
+        app.updateWave6((prev) => ({
+          ...prev,
+          select: { ...prev.select, activeTool: null },
+          deform: { ...prev.deform, activeTool: null },
+          printPrep: { ...prev.printPrep, activeTool: "drainHole" },
+        }));
+        app.setActiveTab("edit");
+      },
+    },
+    {
+      id: "tool:print-place-stamp",
+      title: "Print Prep: Surface Stamp (Place Mesh)",
+      category: "Tool",
+      keywords: "place mesh stamp surface align peg boss normal",
+      run: () => {
+        app.setSculpt(null);
+        app.setMaskPaint(false);
+        app.updateWave6((prev) => ({
+          ...prev,
+          select: { ...prev.select, activeTool: null },
+          deform: { ...prev.deform, activeTool: null },
+          printPrep: { ...prev.printPrep, activeTool: "placeStamp" },
+        }));
+        app.setActiveTab("edit");
+      },
+    },
+    {
+      id: "tool:points-panel",
+      title: "Points: Point Cloud & Surface Reconstruction",
+      category: "Tool",
+      keywords: "points cloud xyz ply pcd pts sor ror voxel normals poisson bpa reconstruct",
+      run: () => {
+        app.setActiveTab("align");
+      },
+    },
+    {
+      id: "tool:collision-rules",
+      title: "Collision: Inter-Object Response Rules",
+      category: "Tool",
+      keywords: "collision response rigid cut soft deform passthrough rule drag",
+      run: () => {
+        app.setActiveTab("align");
+      },
+    },
+    {
+      id: "tool:inspect-primitive-fit",
+      title: "Inspect: Fit Primitive & Align Datum",
+      category: "Tool",
+      keywords: "inspect fit primitive plane sphere cylinder cone datum align",
+      run: () => {
+        app.setActiveTab("inspect");
+      },
+    },
+    {
+      id: "tool:inspect-contours",
+      title: "Inspect: Section Contours & SVG/DXF",
+      category: "Tool",
+      keywords: "inspect contours slice svg dxf perimeter area",
+      run: () => {
+        app.setActiveTab("inspect");
       },
     },
     {

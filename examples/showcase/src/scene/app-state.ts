@@ -31,6 +31,7 @@ import {
   type ShowcaseTheme,
 } from "../panels/settings";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../panels/units";
+import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 
 export interface Item {
   /** A React key. */
@@ -343,6 +344,8 @@ export interface AppSnapshot {
   healerFocusRequest: FocusTargetRequest | null;
   /** Whether the Ctrl+K command palette modal is open (#235). */
   commandPaletteOpen: boolean;
+  /** Wave 6 feature states (#233, #193, #194, #234, #236). */
+  wave6: Wave6State;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -424,6 +427,7 @@ export class AppState {
     healerOverlays: { selfIntersections: true, inverted: true, slivers: true },
     healerFocusRequest: null,
     commandPaletteOpen: false,
+    wave6: createDefaultWave6State(),
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -487,6 +491,65 @@ export class AppState {
       ...(loaded.colors ? { colors: loaded.colors } : {}),
       ...(loaded.uvs ? { uvs: loaded.uvs } : {}),
     });
+    return this.#registerItem(mesh, {
+      name: loaded.name,
+      triangles,
+      center: loaded.center,
+      radius: loaded.radius,
+      volumeId: loaded.volumeId,
+      preset: loaded.preset,
+      importScale: loaded.importScale ?? NO_IMPORT_SCALE,
+    });
+  }
+
+  /**
+   * Registers an already-created `MeshHandle` (from scene ops such as face
+   * extraction/splitting, point-cloud reconstruction, drain plugs, or placed
+   * stamps) in `items` with a freshly created material.
+   */
+  adoptSceneMesh(store: SceneStore, mesh: MeshHandle, name: string): Item {
+    const existing = this.#snap.items.find((it) => it.mesh === mesh);
+    if (existing !== undefined) {
+      return existing;
+    }
+    store.adoptMesh(mesh);
+    const views = store.scene.views(mesh);
+    const triangles = views.indices().length / 3;
+    const pos = views.positions();
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let z0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    let z1 = -Infinity;
+    for (let i = 0; i < pos.length; i += 3) {
+      const x = pos[i];
+      const y = pos[i + 1];
+      const z = pos[i + 2];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      if (z < z0) z0 = z;
+      if (z > z1) z1 = z;
+    }
+    const center: Vec3 = x0 <= x1 ? [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2] : [0, 0, 0];
+    const radius = x0 <= x1 ? Math.hypot(x1 - x0, y1 - y0, z1 - z0) / 2 : 1;
+    return this.#registerItem(mesh, {
+      name,
+      triangles,
+      center,
+      radius,
+      volumeId: null,
+      preset: null,
+      importScale: NO_IMPORT_SCALE,
+    });
+  }
+
+  #registerItem(
+    mesh: MeshHandle,
+    meta: Pick<Item, "name" | "triangles" | "center" | "radius" | "volumeId" | "preset" | "importScale">,
+  ): Item {
     const color = PALETTE[this.#nextColor++ % PALETTE.length];
     // Double-sided: open meshes (and their insides) stay visible.
     const material = new THREE.MeshStandardMaterial({ color, roughness: 0.55, side: THREE.DoubleSide });
@@ -494,15 +557,15 @@ export class AppState {
     const item: Item = {
       id: this.#nextItem++,
       mesh,
-      name: loaded.name,
+      name: meta.name,
       material,
       color,
-      triangles,
-      center: loaded.center,
-      radius: loaded.radius,
-      volumeId: loaded.volumeId,
-      preset: loaded.preset,
-      importScale: loaded.importScale ?? NO_IMPORT_SCALE,
+      triangles: meta.triangles,
+      center: meta.center,
+      radius: meta.radius,
+      volumeId: meta.volumeId,
+      preset: meta.preset,
+      importScale: meta.importScale,
       locked: false,
       shadingOverride: null,
     };
@@ -574,6 +637,25 @@ export class AppState {
   }
 
   #dropLists(item: Item, detached: { collision: CollisionPair; group: GroupSetup }): void {
+    const prevWave6 = this.#snap.wave6;
+    const hasSelected = item.id in prevWave6.select.selectedByMesh;
+    const stampCleared = prevWave6.printPrep.placeParams.stampMeshId === item.id;
+    let wave6 = prevWave6;
+    if (hasSelected || stampCleared) {
+      let select = prevWave6.select;
+      if (hasSelected) {
+        const { [item.id]: _dropped, ...rest } = prevWave6.select.selectedByMesh;
+        select = { ...prevWave6.select, selectedByMesh: rest };
+      }
+      let printPrep = prevWave6.printPrep;
+      if (stampCleared) {
+        printPrep = {
+          ...prevWave6.printPrep,
+          placeParams: { ...prevWave6.printPrep.placeParams, stampMeshId: null },
+        };
+      }
+      wave6 = { ...prevWave6, select, printPrep };
+    }
     this.#set({
       items: this.#snap.items.filter((i) => i !== item),
       collision: detached.collision,
@@ -600,6 +682,7 @@ export class AppState {
         this.#snap.surfaceFieldValues?.mesh === item.mesh ? null : this.#snap.surfaceFieldValues,
       healerFocusRequest:
         this.#snap.healerFocusRequest?.mesh === item.mesh ? null : this.#snap.healerFocusRequest,
+      wave6,
     });
   }
 
@@ -1043,6 +1126,28 @@ export class AppState {
 
   dropJob(id: number): void {
     this.#set({ jobs: this.#snap.jobs.filter((j) => j.id !== id) });
+  }
+
+  /** Updates the Wave 6 state slice cleanly via partial object or updater callback. */
+  updateWave6(patch: Partial<Wave6State> | ((prev: Wave6State) => Wave6State)): void {
+    const next = typeof patch === "function" ? patch(this.#snap.wave6) : { ...this.#snap.wave6, ...patch };
+    this.#set({ wave6: next });
+  }
+
+  /** Disarms any active Wave 6 viewport interaction tool while preserving results. */
+  disarmWave6Tools(): void {
+    const w = this.#snap.wave6;
+    if (w.select.activeTool === null && w.deform.activeTool === null && w.printPrep.activeTool === null) {
+      return;
+    }
+    this.#set({
+      wave6: {
+        ...w,
+        select: w.select.activeTool === null ? w.select : { ...w.select, activeTool: null },
+        deform: w.deform.activeTool === null ? w.deform : { ...w.deform, activeTool: null },
+        printPrep: w.printPrep.activeTool === null ? w.printPrep : { ...w.printPrep, activeTool: null },
+      },
+    });
   }
 }
 

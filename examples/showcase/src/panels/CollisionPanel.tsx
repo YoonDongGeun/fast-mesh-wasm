@@ -4,17 +4,42 @@
 // readouts of the deepest penetration, the gap, whether they intersect and
 // the triangles in contact; and a contact group (`store.setContactGroup`),
 // several meshes each coloured by its nearest partner, with readouts per pair.
-import type { MeshHandle, Scene } from "fast-mesh-wasm";
+import type {
+  BooleanMethod,
+  CollisionDistanceBackend,
+  CollisionMode,
+  CollisionRole,
+  CollisionRule,
+  CollisionStepReport,
+  CutTrigger,
+  MaterialMemory,
+  MeshHandle,
+  PlacementInput,
+  Scene,
+  SoftDeformSolver,
+} from "fast-mesh-wasm";
 import { useMeshDisplay, useScene } from "fast-mesh-wasm/react";
 import { contactHeatmap, type DistanceColoring } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { type AppState, type CollisionPair, type HeatmapParams, type Item, useApp } from "../scene/app-state";
-import { clampTolerance, deepestPenetration, niceScale, toleranceLimit } from "./collision-math";
+import { createDefaultWave6State, type Wave6CollisionState } from "../scene/wave6-state";
+import {
+  buildCollisionRule,
+  clampTolerance,
+  collisionRuleSignature,
+  DEFAULT_COLLISION_STIFFNESS,
+  DEFAULT_CONTACT_MARGIN,
+  deepestPenetration,
+  formatDistance,
+  niceScale,
+  summarizeCollisionStepReport,
+  toleranceLimit,
+} from "./collision-math";
 import { GroupMode } from "./GroupMode";
 import { inspect, type Readouts } from "./inspect";
 import { useFieldInteraction } from "./interaction";
-import { formatLength, formatLengthValue, fromDisplayLength, type LengthUnit, rangeToDisplay } from "./units";
+import { formatLength, formatLengthValue, fromDisplayLength, type LengthUnit, rangeToDisplay, toDisplayLength } from "./units";
 import { meshesKey, useLiveReadouts, useTopologyWarnings } from "./live";
 
 export type Heatmap = Omit<DistanceColoring, "distanceTo">;
@@ -138,7 +163,469 @@ export function CollisionPanel(props: { app: AppState; scene: Scene | WorkerScen
       ) : (
         <GroupMode app={app} scene={scene} items={items} group={group} heat={heat} />
       )}
+      <InterObjectRulesSection app={app} scene={scene} items={items} pair={pair} unit={units} />
     </section>
+  );
+}
+
+const MODE_OPTIONS: ReadonlyArray<{ value: CollisionMode; label: string }> = [
+  { value: "passThrough", label: "passThrough (Overlap)" },
+  { value: "rigid", label: "rigid (Block / Slide)" },
+  { value: "cut", label: "cut (Boolean)" },
+  { value: "softDeform", label: "softDeform (Soft Deform)" },
+];
+
+const ROLE_OPTIONS: ReadonlyArray<{ value: CollisionRole; label: string }> = [
+  { value: "symmetric", label: "Symmetric" },
+  { value: "movingIsCutter", label: "Moving Is Cutter" },
+  { value: "movingIsTarget", label: "Moving Is Target" },
+];
+
+const DISTANCE_BACKEND_OPTIONS: ReadonlyArray<{ value: CollisionDistanceBackend; label: string }> = [
+  { value: "bvhSdf", label: "BVH SDF" },
+  { value: "fhEdt", label: "FH-EDT" },
+];
+
+const CUT_BACKEND_OPTIONS: ReadonlyArray<{ value: BooleanMethod; label: string }> = [
+  { value: "manifold", label: "Manifold" },
+  { value: "bvhSdf", label: "BVH SDF" },
+  { value: "fhEdt", label: "FH-EDT" },
+];
+
+const CUT_TRIGGER_OPTIONS: ReadonlyArray<{ value: CutTrigger; label: string }> = [
+  { value: "onRelease", label: "On Release" },
+  { value: "liveStep", label: "Live Step" },
+];
+
+const SOFT_SOLVER_OPTIONS: ReadonlyArray<{ value: SoftDeformSolver; label: string }> = [
+  { value: "sdfLaplacian", label: "SDF Laplacian" },
+  { value: "kelvinlet", label: "Kelvinlet" },
+  { value: "xpbd", label: "XPBD" },
+];
+
+const MEMORY_OPTIONS: ReadonlyArray<{ value: MaterialMemory; label: string }> = [
+  { value: "elastic", label: "Elastic (Rollback)" },
+  { value: "plastic", label: "Plastic (Retain)" },
+];
+
+const INITIAL_DEFAULT_RULE_SIG = collisionRuleSignature(
+  buildCollisionRule(createDefaultWave6State().collision),
+);
+
+interface PairOverrideEntry {
+  a: MeshHandle;
+  b: MeshHandle;
+  mode: CollisionMode;
+}
+
+function canonicalPairKey(a: MeshHandle, b: MeshHandle): string {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
+}
+
+function RuleSelect<T extends string>(props: {
+  label: string;
+  control: string;
+  value: T;
+  options: ReadonlyArray<{ value: T; label: string }>;
+  onChange: (value: T) => void;
+}) {
+  const dataAttr = { [`data-collision-${props.control}`]: "" } as Record<string, string>;
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <select {...dataAttr} value={props.value} onChange={(e) => props.onChange(e.currentTarget.value as T)}>
+        {props.options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function RuleRange(props: {
+  label: string;
+  control: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  displayValue: string;
+  onChange: (value: number) => void;
+}) {
+  const dataAttr = { [`data-collision-${props.control}`]: "" } as Record<string, string>;
+  return (
+    <label className="slider">
+      <span className="slider-head">
+        <span>{props.label}</span>
+        <output>{props.displayValue}</output>
+      </span>
+      <input
+        type="range"
+        {...dataAttr}
+        min={props.min}
+        max={props.max}
+        step={props.step}
+        value={props.value}
+        onChange={(e) => props.onChange(Number(e.currentTarget.value))}
+      />
+    </label>
+  );
+}
+
+/** Wave 6 inter-object collision response rules, pair overrides, and step probe. */
+function InterObjectRulesSection(props: {
+  app: AppState;
+  scene: Scene | WorkerScene;
+  items: readonly Item[];
+  pair: CollisionPair;
+  unit: LengthUnit;
+}) {
+  const { app, scene, items, pair, unit } = props;
+  const store = useScene();
+  const collision = useApp(app, (s) => s.wave6.collision);
+  const [stiffness, setStiffness] = useState(DEFAULT_COLLISION_STIFFNESS);
+  const [contactMargin, setContactMargin] = useState(DEFAULT_CONTACT_MARGIN);
+  const [pairOverrides, setPairOverrides] = useState<Record<string, PairOverrideEntry>>({});
+  const [lastReport, setLastReport] = useState<CollisionStepReport<MeshHandle> | null>(null);
+  const [nudging, setNudging] = useState(false);
+  const [nudgeError, setNudgeError] = useState<string | null>(null);
+
+  const lastSceneRef = useRef<object | null>(store.scene);
+  const lastSyncedSigRef = useRef<string>(INITIAL_DEFAULT_RULE_SIG);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  if (lastSceneRef.current !== store.scene) {
+    lastSceneRef.current = store.scene;
+    lastSyncedSigRef.current = INITIAL_DEFAULT_RULE_SIG;
+  }
+
+  const liveMeshes = useMemo(() => new Set(items.map((item) => item.mesh)), [items]);
+  useEffect(() => {
+    setPairOverrides((prev) => {
+      let changed = false;
+      const next: Record<string, PairOverrideEntry> = {};
+      for (const [key, entry] of Object.entries(prev)) {
+        if (liveMeshes.has(entry.a) && liveMeshes.has(entry.b)) {
+          next[key] = entry;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [liveMeshes]);
+
+  function syncSceneRules(
+    nextState: Wave6CollisionState,
+    nextStiffness: number,
+    nextMargin: number,
+    overrides: Record<string, PairOverrideEntry>,
+  ) {
+    const rule: CollisionRule = buildCollisionRule(nextState, {
+      stiffness: nextStiffness,
+      contactMargin: nextMargin,
+    });
+    const sig = collisionRuleSignature(rule);
+    if (sig === lastSyncedSigRef.current) {
+      return;
+    }
+    lastSyncedSigRef.current = sig;
+    store.scene.setDefaultCollisionRule?.(rule);
+    for (const entry of Object.values(overrides)) {
+      store.scene.setCollisionRule?.(
+        entry.a,
+        entry.b,
+        buildCollisionRule(nextState, {
+          mode: entry.mode,
+          stiffness: nextStiffness,
+          contactMargin: nextMargin,
+        }),
+      );
+    }
+  }
+
+  useEffect(() => {
+    syncSceneRules(collision, stiffness, contactMargin, pairOverrides);
+  }, [collision, stiffness, contactMargin, pairOverrides, store]);
+
+  function applyCollisionPatch(patch: Partial<Wave6CollisionState>) {
+    const nextState: Wave6CollisionState = { ...collision, ...patch };
+    app.updateWave6((prev) => ({
+      ...prev,
+      collision: { ...prev.collision, ...patch },
+    }));
+    syncSceneRules(nextState, stiffness, contactMargin, pairOverrides);
+  }
+
+  function applyStiffness(raw: number) {
+    const next = Number.isFinite(raw) ? Math.max(0, raw) : DEFAULT_COLLISION_STIFFNESS;
+    setStiffness(next);
+    syncSceneRules(collision, next, contactMargin, pairOverrides);
+  }
+
+  function applyContactMargin(displayValue: number) {
+    const mm = fromDisplayLength(displayValue, unit);
+    const next = Number.isFinite(mm) ? Math.max(0, mm) : DEFAULT_CONTACT_MARGIN;
+    setContactMargin(next);
+    syncSceneRules(collision, stiffness, next, pairOverrides);
+  }
+
+  const activePair =
+    pair.a !== null && pair.b !== null && pair.a !== pair.b ? ([pair.a, pair.b] as const) : null;
+  const activePairKey = activePair ? canonicalPairKey(activePair[0], activePair[1]) : null;
+  const activePairMode = activePairKey ? pairOverrides[activePairKey]?.mode : undefined;
+
+  function setPairOverride(a: MeshHandle, b: MeshHandle, mode: CollisionMode | "default") {
+    const key = canonicalPairKey(a, b);
+    if (mode === "default") {
+      clearPairOverride(a, b);
+      return;
+    }
+    const rule = buildCollisionRule(collision, { mode, stiffness, contactMargin });
+    store.scene.setCollisionRule?.(a, b, rule);
+    setPairOverrides((prev) => ({ ...prev, [key]: { a, b, mode } }));
+  }
+
+  function clearPairOverride(a: MeshHandle, b: MeshHandle) {
+    const key = canonicalPairKey(a, b);
+    void store.scene.clearCollisionRule?.(a, b);
+    setPairOverrides((prev) => {
+      if (!(key in prev)) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }
+
+  async function nudgeBTowardA() {
+    if (!activePair || typeof store.scene.moveWithCollision !== "function") {
+      return;
+    }
+    const [a, b] = activePair;
+    setNudging(true);
+    setNudgeError(null);
+    try {
+      const [boundsA, boundsB, placeB] = await Promise.all([
+        Promise.resolve(scene.bounds(a)),
+        Promise.resolve(scene.bounds(b)),
+        Promise.resolve(scene.placement(b)),
+      ]);
+      if (!boundsA || !boundsB) {
+        if (mountedRef.current) {
+          setNudgeError("Empty mesh cannot be nudged.");
+        }
+        return;
+      }
+      const dx = boundsA.center[0] - boundsB.center[0];
+      const dy = boundsA.center[1] - boundsB.center[1];
+      const dz = boundsA.center[2] - boundsB.center[2];
+      const dist = Math.hypot(dx, dy, dz);
+      const step = dist > 1e-6 ? Math.min(dist, Math.max(0.5, dist * 0.5)) : 0;
+      const sx = dist > 1e-6 ? (dx / dist) * step : 0.25;
+      const sy = dist > 1e-6 ? (dy / dist) * step : 0;
+      const sz = dist > 1e-6 ? (dz / dist) * step : 0;
+      const nextPlacement: PlacementInput = {
+        rotation: placeB.rotation,
+        translation: [placeB.translation[0] + sx, placeB.translation[1] + sy, placeB.translation[2] + sz],
+        scale: placeB.scale,
+      };
+      const report = await Promise.resolve(store.scene.moveWithCollision(b, nextPlacement, true));
+      if (!mountedRef.current) {
+        return;
+      }
+      const summary = summarizeCollisionStepReport(report);
+      setLastReport(report);
+      app.updateWave6((prev) => ({
+        ...prev,
+        collision: { ...prev.collision, lastStepSummary: summary },
+      }));
+    } catch (err) {
+      if (mountedRef.current) {
+        setNudgeError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (mountedRef.current) {
+        setNudging(false);
+      }
+    }
+  }
+
+  const marginRange = rangeToDisplay({ min: 0, max: 10, step: 0.05, value: contactMargin }, unit);
+
+  return (
+    <div className="ops" data-collision-rules>
+      <div className="panel-head">
+        <h3>Inter-Object Response Rules</h3>
+      </div>
+
+      <RuleSelect
+        label="Default Response"
+        control="default-mode"
+        value={collision.mode}
+        options={MODE_OPTIONS}
+        onChange={(mode) => applyCollisionPatch({ mode })}
+      />
+
+      {activePair ? (
+        <div className="ops">
+          <RuleSelect
+            label="Pair A↔B Rule"
+            control="pair-mode"
+            value={activePairMode ?? "default"}
+            options={[
+              { value: "default", label: `Use Default (${collision.mode})` },
+              ...MODE_OPTIONS,
+            ]}
+            onChange={(mode) => setPairOverride(activePair[0], activePair[1], mode)}
+          />
+          <button
+            type="button"
+            data-collision-pair-clear
+            disabled={activePairMode === undefined}
+            onClick={() => clearPairOverride(activePair[0], activePair[1])}
+          >
+            Clear Override
+          </button>
+        </div>
+      ) : (
+        <p className="muted small">Pick A and B above to configure a pair override rule.</p>
+      )}
+
+      <RuleSelect
+        label="Role"
+        control="role"
+        value={collision.role}
+        options={ROLE_OPTIONS}
+        onChange={(role) => applyCollisionPatch({ role })}
+      />
+      <RuleSelect
+        label="Distance Backend"
+        control="distance-backend"
+        value={collision.distanceBackend}
+        options={DISTANCE_BACKEND_OPTIONS}
+        onChange={(distanceBackend) => applyCollisionPatch({ distanceBackend })}
+      />
+      <RuleSelect
+        label="Cut Method"
+        control="cut-backend"
+        value={collision.cutBackend}
+        options={CUT_BACKEND_OPTIONS}
+        onChange={(cutBackend) => applyCollisionPatch({ cutBackend })}
+      />
+      <RuleSelect
+        label="Cut Trigger"
+        control="cut-trigger"
+        value={collision.cutTrigger}
+        options={CUT_TRIGGER_OPTIONS}
+        onChange={(cutTrigger) => applyCollisionPatch({ cutTrigger })}
+      />
+      <RuleSelect
+        label="Soft Solver"
+        control="soft-solver"
+        value={collision.softSolver}
+        options={SOFT_SOLVER_OPTIONS}
+        onChange={(softSolver) => applyCollisionPatch({ softSolver })}
+      />
+      <RuleSelect
+        label="Material Memory"
+        control="memory"
+        value={collision.materialMemory}
+        options={MEMORY_OPTIONS}
+        onChange={(materialMemory) => applyCollisionPatch({ materialMemory })}
+      />
+
+      <RuleRange
+        label="Compliance"
+        control="compliance"
+        min={0}
+        max={1}
+        step={0.01}
+        value={collision.compliance}
+        displayValue={formatDistance(collision.compliance)}
+        onChange={(val) => applyCollisionPatch({ compliance: Number.isFinite(val) ? Math.max(0, val) : 0 })}
+      />
+      <RuleRange
+        label="Soft Stiffness"
+        control="stiffness"
+        min={0}
+        max={2}
+        step={0.05}
+        value={stiffness}
+        displayValue={formatDistance(stiffness)}
+        onChange={applyStiffness}
+      />
+      <RuleRange
+        label="Elastic Recovery"
+        control="recovery"
+        min={0}
+        max={1}
+        step={0.05}
+        value={collision.recoveryRate}
+        displayValue={formatDistance(collision.recoveryRate)}
+        onChange={(val) => applyCollisionPatch({ recoveryRate: Number.isFinite(val) ? Math.min(1, Math.max(0, val)) : 1 })}
+      />
+      <RuleRange
+        label="Contact Margin"
+        control="margin"
+        min={marginRange.min}
+        max={marginRange.max}
+        step={marginRange.step}
+        value={toDisplayLength(contactMargin, unit)}
+        displayValue={formatLength(contactMargin, unit)}
+        onChange={applyContactMargin}
+      />
+
+      <label className="check">
+        <input
+          type="checkbox"
+          data-collision-rigid-slide
+          checked={collision.rigidSlide}
+          onChange={(e) => applyCollisionPatch({ rigidSlide: e.currentTarget.checked })}
+        />
+        Rigid slide along contact
+      </label>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          data-collision-self-guard
+          checked={collision.preventSelfIntersection}
+          onChange={(e) => applyCollisionPatch({ preventSelfIntersection: e.currentTarget.checked })}
+        />
+        Prevent self-intersection
+      </label>
+
+      {activePair && (
+        <div className="ops">
+          <button
+            type="button"
+            data-collision-nudge
+            disabled={nudging || typeof store.scene.moveWithCollision !== "function"}
+            onClick={() => void nudgeBTowardA()}
+          >
+            {nudging ? "Nudging..." : "Nudge B toward A"}
+          </button>
+        </div>
+      )}
+
+      {(lastReport || collision.lastStepSummary) && (
+        <p className="report small" data-collision-report>
+          {collision.lastStepSummary ?? (lastReport ? summarizeCollisionStepReport(lastReport) : "")}
+        </p>
+      )}
+      {nudgeError && <p className="warn small">{nudgeError}</p>}
+    </div>
   );
 }
 
