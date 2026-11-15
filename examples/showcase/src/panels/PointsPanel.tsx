@@ -1,23 +1,16 @@
 // Point cloud import, sampling, filtering, normal estimation & surface
 // reconstruction panel (#234).
-import {
-  type MeshHandle,
-  type PackedPointCloud,
-  type SurfaceReconstructMethod,
-  type Vec3,
-  packPointCloud,
-  parsePointCloudBytes,
-  parsePointCloudText,
-  pointCloudEstimateNormals,
-  pointCloudRor,
-  pointCloudSor,
-  pointCloudVoxelDownsample,
-  unpackPointCloud,
+import type {
+  MeshHandle,
+  PackedPointCloud,
+  SurfaceReconstructMethod,
+  Vec3,
 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useState, useSyncExternalStore } from "react";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import { type Wave6MetrologyState } from "../scene/wave6-state";
+import { ensureWave6Wasm, packPointCloudLocal, unpackPointCloudLocal } from "../scene/wave6-wasm-lazy";
 import { LengthInput } from "./LengthInput";
 import { formatPoint } from "./units";
 
@@ -48,7 +41,7 @@ export function computePointCloudBounds(cloud: PackedPointCloud): { min: Vec3; m
   if (cloud.count === 0) {
     return null;
   }
-  const { positions } = unpackPointCloud(cloud);
+  const { positions } = unpackPointCloudLocal(cloud);
   let minX = Infinity;
   let minY = Infinity;
   let minZ = Infinity;
@@ -92,7 +85,7 @@ export function createSyntheticSphereCloud(count = 256, radius = 1): PackedPoint
     normals[3 * i + 1] = y;
     normals[3 * i + 2] = nz;
   }
-  return packPointCloud(positions, normals);
+  return packPointCloudLocal(positions, normals);
 }
 
 /** Normalizes `.pts` text into `x y z` / `x y z r g b` rows before calling `parsePointCloudText`. */
@@ -124,7 +117,8 @@ function normalizePtsText(raw: string): string {
 }
 
 /** Parses `.xyz`, `.ply`, `.pts`, or `.pcd` file bytes using SDK parsers. */
-export function parsePointCloudFileContent(fileName: string, bytes: Uint8Array): PackedPointCloud {
+export async function parsePointCloudFileContent(fileName: string, bytes: Uint8Array): Promise<PackedPointCloud> {
+  const { parsePointCloudBytes, parsePointCloudText } = await ensureWave6Wasm();
   const lower = fileName.toLowerCase();
   if (lower.endsWith(".ply")) {
     return parsePointCloudBytes(bytes);
@@ -273,7 +267,7 @@ export function sampleMeshToPointCloud(
     }
   }
 
-  return packPointCloud(
+  return packPointCloudLocal(
     Float32Array.from(outPos),
     Float32Array.from(outNorm),
     outCol === undefined ? undefined : Float32Array.from(outCol),
@@ -331,7 +325,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
     setError(null);
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const parsed = parsePointCloudFileContent(file.name, bytes);
+      const parsed = await parsePointCloudFileContent(file.name, bytes);
       commitCloud(parsed, `Loaded ${parsed.count.toLocaleString()} points from ${file.name}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -368,12 +362,14 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
     commitCloud(synthetic, `Generated synthetic sphere cloud (${synthetic.count} points)`);
   };
 
-  const onFilterSor = () => {
+  const onFilterSor = async () => {
     if (cloud === null || cloud.count === 0) {
       return;
     }
+    setBusy(true);
     setError(null);
     try {
+      const { pointCloudSor } = await ensureWave6Wasm();
       const k = Math.max(1, Math.min(cloud.count - 1, Math.round(sorK)));
       const res = pointCloudSor(cloud, k, Math.max(0.01, sorStdRatio));
       commitCloud(
@@ -382,15 +378,19 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
     }
   };
 
-  const onFilterRor = () => {
+  const onFilterRor = async () => {
     if (cloud === null || cloud.count === 0) {
       return;
     }
+    setBusy(true);
     setError(null);
     try {
+      const { pointCloudRor } = await ensureWave6Wasm();
       const res = pointCloudRor(cloud, Math.max(1e-4, rorRadius), Math.max(0, Math.round(rorMinNeighbors)));
       commitCloud(
         res.cloud,
@@ -398,33 +398,43 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
     }
   };
 
-  const onVoxelDownsample = () => {
+  const onVoxelDownsample = async () => {
     if (cloud === null || cloud.count === 0) {
       return;
     }
+    setBusy(true);
     setError(null);
     try {
+      const { pointCloudVoxelDownsample } = await ensureWave6Wasm();
       const next = pointCloudVoxelDownsample(cloud, Math.max(1e-4, voxelSize));
       commitCloud(next, `Voxel downsampled ${cloud.count} -> ${next.count} points`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
     }
   };
 
-  const onEstimateNormals = () => {
+  const onEstimateNormals = async () => {
     if (cloud === null || cloud.count < 3) {
       return;
     }
+    setBusy(true);
     setError(null);
     try {
+      const { pointCloudEstimateNormals } = await ensureWave6Wasm();
       const k = Math.max(3, Math.min(cloud.count - 1, Math.round(normalsK)));
       const next = pointCloudEstimateNormals(cloud, k);
       commitCloud(next, `Estimated normals (k=${k}) on ${next.count} points`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -436,7 +446,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
     setError(null);
     try {
       const k = Math.max(3, Math.min(Math.max(3, cloud.count - 1), Math.round(reconstructK)));
-      const workingCloud = cloud.hasNormals ? cloud : pointCloudEstimateNormals(cloud, k);
+      const workingCloud = cloud.hasNormals ? cloud : (await ensureWave6Wasm()).pointCloudEstimateNormals(cloud, k);
       const sdkMethod = RECONSTRUCT_METHOD_MAP[reconstructMethod];
       const handle = await Promise.resolve(
         store.scene.inspect.reconstructPointCloud(workingCloud, {
@@ -590,7 +600,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
             type="button"
             data-action="points-filter-sor"
             disabled={busy || cloud === null || cloud.count < 2}
-            onClick={onFilterSor}
+            onClick={() => void onFilterSor()}
           >
             SOR
           </button>
@@ -624,7 +634,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
             type="button"
             data-action="points-filter-ror"
             disabled={busy || cloud === null || cloud.count === 0}
-            onClick={onFilterRor}
+            onClick={() => void onFilterRor()}
           >
             ROR
           </button>
@@ -646,7 +656,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
             type="button"
             data-action="points-voxel-downsample"
             disabled={busy || cloud === null || cloud.count === 0}
-            onClick={onVoxelDownsample}
+            onClick={() => void onVoxelDownsample()}
           >
             Voxel Downsample
           </button>
@@ -669,7 +679,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
             type="button"
             data-action="points-estimate-normals"
             disabled={busy || cloud === null || cloud.count < 3}
-            onClick={onEstimateNormals}
+            onClick={() => void onEstimateNormals()}
           >
             Estimate Normals
           </button>

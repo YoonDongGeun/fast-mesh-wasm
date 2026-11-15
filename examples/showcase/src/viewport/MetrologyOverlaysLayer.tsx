@@ -1,17 +1,17 @@
 // 3D viewport overlays for #234: active packed point cloud (`THREE.Points`),
 // sliced contour loops (`THREE.LineSegments`), and fitted primitive datum guides.
 import "@react-three/fiber";
-import {
-  type ContourSlice,
-  type FittedPrimitiveReport,
-  type PackedPointCloud,
-  type Vec3,
-  unpackPointCloud,
+import type {
+  ContourSlice,
+  FittedPrimitiveReport,
+  PackedPointCloud,
+  Vec3,
 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useLayoutEffect, useMemo } from "react";
 import * as THREE from "three";
 import { type AppState, useApp } from "../scene/app-state";
+import { unpackPointCloudLocal } from "../scene/wave6-wasm-lazy";
 import { type Wave6MetrologyState } from "../scene/wave6-state";
 
 export interface MetrologyOverlaysLayerProps {
@@ -58,7 +58,7 @@ export function buildPointCloudGeometry(cloud: PackedPointCloud | null): THREE.B
   if (cloud === null || cloud.count === 0) {
     return emptyGeometry();
   }
-  const { positions, normals, colors } = unpackPointCloud(cloud);
+  const { positions, normals, colors } = unpackPointCloudLocal(cloud);
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   if (normals !== null) {

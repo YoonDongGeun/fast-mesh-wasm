@@ -41,9 +41,12 @@ export type InspectorSlot =
   | "home"
   | "project"
   | "transform"
+  | "select"
   | "sculpt"
+  | "deform"
   | "repair"
   | "modeling"
+  | "points"
   | "align"
   | "collision"
   | "volume"
@@ -56,15 +59,15 @@ export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean 
     case "home":
       return slot === "home" || slot === "project" || slot === "export";
     case "select":
-      return slot === "transform";
+      return slot === "transform" || slot === "select";
     case "repair":
       return slot === "repair";
     case "edit":
       return slot === "modeling";
     case "sculpt":
-      return slot === "sculpt";
+      return slot === "sculpt" || slot === "deform";
     case "align":
-      return slot === "align" || slot === "collision";
+      return slot === "points" || slot === "align" || slot === "collision";
     case "volume":
       return slot === "volume";
     case "inspect":
@@ -134,12 +137,27 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
   const sculpt = useApp(app, (s) => s.sculpt);
   const maskPaint = useApp(app, (s) => s.maskPaint);
   const healerOverlays = useApp(app, (s) => s.healerOverlays);
+  const faceSelectTool = useApp(app, (s) => s.wave6.select.activeTool);
+  const deformAlgo = useApp(app, (s) => s.wave6.deform.algorithm);
+  const deformTool = useApp(app, (s) => s.wave6.deform.activeTool);
 
   const pickMode = (next: GizmoMode) => {
     if (sculpt !== null) app.setSculpt(null);
     if (maskPaint) app.setMaskPaint(false);
+    app.disarmWave6Tools();
     onSetMode(next);
     app.setActiveTab("select");
+  };
+
+  const toggleFaceSelectTool = (tool: "box" | "lasso" | "brush" | "shell") => {
+    if (sculpt !== null) app.setSculpt(null);
+    if (maskPaint) app.setMaskPaint(false);
+    app.updateWave6((prev) => ({
+      ...prev,
+      select: { ...prev.select, activeTool: prev.select.activeTool === tool ? null : tool },
+      deform: { ...prev.deform, activeTool: null },
+      printPrep: { ...prev.printPrep, activeTool: null },
+    }));
   };
 
   return (
@@ -248,6 +266,45 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
         >
           <SculptToolbox app={app} />
         </div>
+        {activeTab === "sculpt" ? (
+          <div className="ribbon-strip ribbon-strip-compact" data-ribbon-deform-strip>
+            <div className="group" aria-label="Free-form deformation">
+              {(
+                [
+                  ["ffd", "FFD"],
+                  ["arap", "ARAP"],
+                  ["kelvinlet", "Kelvinlet"],
+                  ["xpbd", "XPBD"],
+                ] as const
+              ).map(([alg, label]) => (
+                <button
+                  key={alg}
+                  type="button"
+                  data-ribbon-deform-algo={alg}
+                  aria-pressed={deformAlgo === alg}
+                  onClick={() => {
+                    app.updateWave6((prev) => ({
+                      ...prev,
+                      deform: { ...prev.deform, algorithm: alg },
+                    }));
+                    focusElement('[data-inspector-slot="deform"]');
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+              {deformTool !== null ? (
+                <button
+                  type="button"
+                  data-ribbon-deform-disarm
+                  onClick={() => app.disarmWave6Tools()}
+                >
+                  Disarm Deform
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
 
         {activeTab === "home" ? (
           <div className="ribbon-strip">
@@ -309,6 +366,34 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                 onClick={() => app.toggleCameraProjection()}
               >
                 {ortho ? "Orthographic" : "Perspective"}
+              </button>
+            </div>
+            <div className="group" aria-label="Face selection">
+              {(
+                [
+                  ["box", "Box Select"],
+                  ["lasso", "Lasso"],
+                  ["brush", "Brush"],
+                  ["shell", "Shell"],
+                ] as const
+              ).map(([toolId, label]) => (
+                <button
+                  key={toolId}
+                  type="button"
+                  data-ribbon-select-tool={toolId}
+                  aria-pressed={faceSelectTool === toolId}
+                  onClick={() => toggleFaceSelectTool(toolId)}
+                >
+                  {label}
+                </button>
+              ))}
+              <button
+                type="button"
+                data-ribbon-select-clear
+                disabled={!hasItems}
+                onClick={() => triggerClick('[data-select-action="clear"]')}
+              >
+                Clear Faces
               </button>
             </div>
             <div className="group ribbon-shading-strip" aria-label="Diagnostic shading">
@@ -387,6 +472,15 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" onClick={() => focusElement("[data-modeling-subdivide-run]")}>
                 Subdivide
               </button>
+              <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
+                Hollow
+              </button>
+              <button type="button" data-ribbon-focus="drain" onClick={() => focusElement("[data-modeling-drain-section]")}>
+                Drain Hole
+              </button>
+              <button type="button" data-ribbon-focus="place" onClick={() => focusElement("[data-modeling-place-section]")}>
+                Surface Stamp
+              </button>
               <button
                 type="button"
                 aria-pressed={shadingMode === "wireframeShaded"}
@@ -419,6 +513,16 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => focusElement("[data-align-pick]")}>
                 Landmark Align
+              </button>
+              <button type="button" data-ribbon-focus="points" onClick={() => focusElement("[data-points-panel]")}>
+                Point Cloud
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="collision-rules"
+                onClick={() => focusElement("[data-collision-rules]")}
+              >
+                Collision Rules
               </button>
             </div>
           </div>
@@ -467,6 +571,12 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                   {label}
                 </button>
               ))}
+              <button type="button" data-ribbon-focus="fit" onClick={() => focusElement("[data-inspect-primitive-fit]")}>
+                Fit Primitive
+              </button>
+              <button type="button" data-ribbon-focus="contours" onClick={() => focusElement("[data-inspect-contours]")}>
+                Contours
+              </button>
               <button
                 type="button"
                 aria-pressed={shadingMode === "backfaceWarning"}

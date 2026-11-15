@@ -4,16 +4,15 @@
 // thickness/curvature/distance colorings), a draggable section plane
 // (wired to `setSectionPlane` through the store) and an axis-aligned clip
 // box for looking inside meshes. Scalar mesh numbers reuse `measure`.
-import {
-  type ContourSlice,
-  type FieldHandle,
-  type FittedPrimitive,
-  type FittedPrimitiveReport,
-  type MeshHandle,
-  type PrimitiveKindInput,
-  type Scene,
-  type Vec3,
-  sliceContoursExport,
+import type {
+  ContourSlice,
+  FieldHandle,
+  FittedPrimitive,
+  FittedPrimitiveReport,
+  MeshHandle,
+  PrimitiveKindInput,
+  Scene,
+  Vec3,
 } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
@@ -30,6 +29,7 @@ import {
   useApp,
 } from "../scene/app-state";
 import { type Wave6MetrologyState } from "../scene/wave6-state";
+import { ensureWave6Wasm } from "../scene/wave6-wasm-lazy";
 import {
   applySurfaceField,
   clearAppliedSurfaceField,
@@ -1130,13 +1130,14 @@ function ContourSliceControls(props: {
     }
   };
 
-  const onExport = (format: "svg" | "dxf") => {
+  const onExport = async (format: "svg" | "dxf") => {
     if (slices === null || slices.length === 0) {
       return;
     }
     setError(null);
     try {
-      const text = format === "svg" ? sliceContoursExport(slices, "svg") : exportContourSlicesDxf(slices);
+      const text =
+        format === "svg" ? (await ensureWave6Wasm()).sliceContoursExport(slices, "svg") : exportContourSlicesDxf(slices);
       const stem = `${targetItem?.name ?? "contours"}-section`;
       const fileName = reportFileName(stem, format);
       const mime = format === "svg" ? "image/svg+xml" : "application/dxf";
@@ -1298,7 +1299,7 @@ function ContourSliceControls(props: {
               type="button"
               data-action="inspect-export-svg"
               disabled={slices.length === 0}
-              onClick={() => onExport("svg")}
+              onClick={() => void onExport("svg")}
             >
               Export SVG
             </button>
@@ -1306,7 +1307,7 @@ function ContourSliceControls(props: {
               type="button"
               data-action="inspect-export-dxf"
               disabled={slices.length === 0}
-              onClick={() => onExport("dxf")}
+              onClick={() => void onExport("dxf")}
             >
               Export DXF
             </button>

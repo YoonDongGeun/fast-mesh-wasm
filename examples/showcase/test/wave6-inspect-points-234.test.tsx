@@ -287,11 +287,11 @@ describe("#234 InspectPanel preservation, primitive fitting, datum alignment & c
 });
 
 describe("#234 PointsPanel parsing, sampling, filtering & surface reconstruction", () => {
-  it("parses XYZ, PTS (with header & intensity), ASCII PLY, and PCD point clouds", () => {
+  it("parses XYZ, PTS (with header & intensity), ASCII PLY, and PCD point clouds", async () => {
     const xyz = parsePointCloudText("0 0 0\n1 0 0\n0 1 0\n0 0 1\n", "xyz");
     expect(xyz.count).toBe(4);
 
-    const pts = parsePointCloudFileContent(
+    const pts = await parsePointCloudFileContent(
       "scan.pts",
       new TextEncoder().encode("3\n0 0 0 120\n1 0 0 200\n0 1 0 250\n"),
     );
@@ -315,7 +315,7 @@ describe("#234 PointsPanel parsing, sampling, filtering & surface reconstruction
     );
     expect(ply.count).toBe(3);
 
-    const pcd = parsePointCloudFileContent(
+    const pcd = await parsePointCloudFileContent(
       "scan.pcd",
       new TextEncoder().encode(
         [
@@ -337,7 +337,7 @@ describe("#234 PointsPanel parsing, sampling, filtering & surface reconstruction
     expect(pcd.count).toBe(2);
   });
 
-  it("runs point cloud parse -> SOR/ROR/Voxel/Normals -> reconstructPointCloud -> adoptSceneMesh -> visible in SceneStore", () => {
+  it("runs point cloud parse -> SOR/ROR/Voxel/Normals -> reconstructPointCloud -> adoptSceneMesh -> visible in SceneStore", async () => {
     const { scene, store, app } = createHarness();
 
     // Build sphere XYZ text + 1 gross outlier at (50, 50, 50)
@@ -348,7 +348,7 @@ describe("#234 PointsPanel parsing, sampling, filtering & surface reconstruction
       xyzLines.push(`${baseSphere.data[off]} ${baseSphere.data[off + 1]} ${baseSphere.data[off + 2]}`);
     }
     xyzLines.push("50 50 50");
-    const parsed = parsePointCloudFileContent("sphere.xyz", new TextEncoder().encode(xyzLines.join("\n")));
+    const parsed = await parsePointCloudFileContent("sphere.xyz", new TextEncoder().encode(xyzLines.join("\n")));
     expect(parsed.count).toBe(201);
 
     // SOR removes outlier

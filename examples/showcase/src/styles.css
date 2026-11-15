@@ -621,6 +621,10 @@ input[type="range"] {
   width: 100%;
   min-width: max-content;
 }
+.ribbon-strip.ribbon-strip-compact {
+  width: auto;
+  flex-shrink: 0;
+}
 .ribbon-strip .group {
   display: flex;
   flex-wrap: nowrap;
@@ -634,8 +638,9 @@ input[type="range"] {
   white-space: nowrap;
 }
 .ribbon-sculpt-wrap {
-  width: 100%;
+  width: auto;
   min-width: max-content;
+  flex: 1 0 auto;
 }
 .ribbon-hidden,
 .inspector-slot.inspector-hidden {
