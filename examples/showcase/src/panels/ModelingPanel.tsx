@@ -1,6 +1,16 @@
 // Modeling & Resampling panel (#195): Boolean CSG (with Keep originals), destructive Plane Cut,
 // Offset & Shell (Solidify), Quadric Simplify, and Loop Subdivide.
-import type { CutReport, MeshHandle, OffsetReport, ShellReport, SimplifyReport, SubdivideReport } from "fast-mesh-wasm";
+import type {
+  CutReport,
+  HollowBackend,
+  HollowOptions,
+  MeshHandle,
+  OffsetReport,
+  PlaceUpAxis,
+  ShellReport,
+  SimplifyReport,
+  SubdivideReport,
+} from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import { useEffect, useState } from "react";
 import { type AppState, type Item, useApp } from "../scene/app-state";
@@ -18,6 +28,13 @@ import {
   runSubdivide,
 } from "../scene/workbench-ops";
 import { computeLocalExtents } from "../scene/transform-math";
+import {
+  executeDrainHoleAtHit,
+  findCenterSurfaceHit,
+  getPlaceAlignToNormal,
+  runHollowMeshOp,
+  setPlaceAlignToNormal,
+} from "../viewport/HollowPlaceToolsLayer";
 import { LengthInput } from "./LengthInput";
 import { describeReport } from "./repair-summary";
 import { formatLength, fromDisplayLength, lengthInputValue } from "./units";
@@ -30,6 +47,109 @@ function pickOtherMesh(items: readonly Item[], primary: MeshHandle | null, curre
 }
 
 export function ModelingPanel(props: { app: AppState }) {
+  const prepStore = useScene();
+  const prepUnit = useApp(props.app, (s) => s.units);
+  const printPrep = useApp(props.app, (s) => s.wave6.printPrep);
+  const [hollowWallMm, setHollowWallMm] = useState(1.5);
+  const [hollowBackend, setHollowBackend] = useState<HollowBackend>("bvhSdf");
+  const [hollowVoxelSizeText, setHollowVoxelSizeText] = useState("");
+  const [hollowMaxVoxels, setHollowMaxVoxels] = useState(524288);
+  const [hollowCapInnerShell, setHollowCapInnerShell] = useState(false);
+  const [drainSavedDepthMm, setDrainSavedDepthMm] = useState(12.0);
+  const [placeAlignToNormal, setPlaceAlignState] = useState(() => getPlaceAlignToNormal(props.app));
+  const [prepBusy, setPrepBusy] = useState<string | null>(null);
+  const [prepReport, setPrepReport] = useState<{ label: string; text: string; error?: boolean } | null>(null);
+
+  const drainThrough = printPrep.drainParams.depth <= 0;
+
+  const updatePrintPrep = (patch: Partial<typeof printPrep>) => {
+    const current = props.app.getSnapshot().wave6.printPrep;
+    props.app.updateWave6({ printPrep: { ...current, ...patch } });
+  };
+
+  const updateDrainParams = (patch: Partial<typeof printPrep.drainParams>) => {
+    const current = props.app.getSnapshot().wave6.printPrep;
+    props.app.updateWave6({
+      printPrep: { ...current, drainParams: { ...current.drainParams, ...patch } },
+    });
+  };
+
+  const updatePlaceParams = (patch: Partial<typeof printPrep.placeParams>) => {
+    const current = props.app.getSnapshot().wave6.printPrep;
+    props.app.updateWave6({
+      printPrep: { ...current, placeParams: { ...current.placeParams, ...patch } },
+    });
+  };
+
+  const runHollowAction = async (target: Item) => {
+    setPrepBusy("Hollow Mesh");
+    try {
+      const parsedVoxel = hollowVoxelSizeText.trim() === "" ? undefined : Number(hollowVoxelSizeText);
+      const options: HollowOptions = {
+        wallThickness: Math.max(0.1, hollowWallMm),
+        backend: hollowBackend,
+        ...(parsedVoxel !== undefined && Number.isFinite(parsedVoxel) && parsedVoxel > 0
+          ? { voxelSize: parsedVoxel }
+          : {}),
+        maxVoxels: hollowMaxVoxels,
+        ...(hollowCapInnerShell ? { maxCavityTriangles: 12000 } : {}),
+      };
+      const res = await runHollowMeshOp({ store: prepStore, mesh: target.mesh, options });
+      setPrepReport({
+        label: "Hollow Mesh",
+        text: `${res.beforeTriangles} -> ${res.afterTriangles} tris · ${res.report.cavitiesCreated} cavity (${res.report.cavityTriangles} cavity tris, ${res.report.cavityVolume.toFixed(1)} mm3)`,
+        error: false,
+      });
+    } catch (err) {
+      setPrepReport({
+        label: "Hollow Mesh",
+        text: err instanceof Error ? err.message : String(err),
+        error: true,
+      });
+    } finally {
+      setPrepBusy(null);
+    }
+  };
+
+  const runPunchCenterAction = async (target: Item) => {
+    setPrepBusy("Drain Hole");
+    try {
+      const hit = await findCenterSurfaceHit(prepStore.scene, target.mesh);
+      if (hit === null) {
+        throw new Error("Could not find a surface point on the active mesh.");
+      }
+      const res = await executeDrainHoleAtHit({
+        store: prepStore,
+        app: props.app,
+        target: target.mesh,
+        targetName: target.name,
+        hitPoint: hit.point,
+        hitNormal: hit.normal,
+        drainParams: printPrep.drainParams,
+        through: drainThrough,
+      });
+      const plugText = res.plugs.length > 0 ? ` · ${res.plugs.length} plug adopted` : "";
+      setPrepReport({
+        label: "Drain Hole",
+        text: `${res.beforeTriangles} -> ${res.afterTriangles} tris (${res.report.holesPunched} hole${plugText})`,
+        error: false,
+      });
+    } catch (err) {
+      setPrepReport({
+        label: "Drain Hole",
+        text: err instanceof Error ? err.message : String(err),
+        error: true,
+      });
+    } finally {
+      setPrepBusy(null);
+    }
+  };
+
+  const togglePrintPrepTool = (tool: "drainHole" | "placeStamp") => {
+    const next = printPrep.activeTool === tool ? null : tool;
+    updatePrintPrep({ activeTool: next });
+    void prepStore.commitFrame();
+  };
   const { app } = props;
   const store = useScene();
   const [selection] = useSelection();
@@ -574,6 +694,356 @@ export function ModelingPanel(props: { app: AppState }) {
               </button>
             </div>
           </div>
+
+          <div className="op" data-modeling-hollow-section>
+            <span className="muted">5. Print Prep — Hollow Mesh</span>
+            <div className="op-row">
+              <label className="field">
+                <span>Wall</span>
+                <LengthInput
+                  mm={hollowWallMm}
+                  unit={prepUnit}
+                  data-modeling-hollow-thickness
+                  onMm={(mm) => setHollowWallMm(Math.max(0.1, mm))}
+                />
+              </label>
+              <label className="field">
+                <span>Backend</span>
+                <select
+                  value={hollowBackend}
+                  data-modeling-hollow-backend
+                  onChange={(e) => setHollowBackend(e.target.value as HollowBackend)}
+                >
+                  <option value="bvhSdf">BVH SDF</option>
+                  <option value="fhEdt">Fast EDT</option>
+                </select>
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="field">
+                <span>Voxel (mm)</span>
+                <input
+                  type="number"
+                  min={0.05}
+                  step={0.1}
+                  placeholder="Auto"
+                  value={hollowVoxelSizeText}
+                  data-modeling-hollow-voxel-size
+                  onChange={(e) => setHollowVoxelSizeText(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Max Voxels</span>
+                <select
+                  value={hollowMaxVoxels}
+                  data-modeling-hollow-max-voxels
+                  onChange={(e) => setHollowMaxVoxels(Number(e.target.value))}
+                >
+                  <option value={262144}>256k</option>
+                  <option value={524288}>512k</option>
+                  <option value={1048576}>1M</option>
+                  <option value={2097152}>2M</option>
+                </select>
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={hollowCapInnerShell}
+                  data-modeling-hollow-inner-shell
+                  onChange={(e) => setHollowCapInnerShell(e.target.checked)}
+                />
+                <span>Cap inner shell (≤12k tris)</span>
+              </label>
+              <button
+                type="button"
+                className="primary"
+                disabled={disabled || prepBusy !== null}
+                data-modeling-hollow-run
+                onClick={() => void runHollowAction(activeItem)}
+              >
+                Hollow Mesh
+              </button>
+            </div>
+          </div>
+
+          <div className="op" data-modeling-drain-section>
+            <span className="muted">6. Print Prep — Drain Hole</span>
+            <div className="op-row">
+              <label className="field">
+                <span>Radius</span>
+                <LengthInput
+                  mm={printPrep.drainParams.diameter * 0.5}
+                  unit={prepUnit}
+                  data-modeling-drain-radius
+                  onMm={(mm) => updateDrainParams({ diameter: Math.max(0.2, mm * 2) })}
+                />
+              </label>
+              <label className="field">
+                <span>Depth</span>
+                <LengthInput
+                  mm={drainThrough ? drainSavedDepthMm : printPrep.drainParams.depth}
+                  unit={prepUnit}
+                  disabled={drainThrough}
+                  data-modeling-drain-depth
+                  onMm={(mm) => {
+                    const next = Math.max(0.2, mm);
+                    setDrainSavedDepthMm(next);
+                    updateDrainParams({ depth: next });
+                  }}
+                />
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="field">
+                <span>Chamfer</span>
+                <LengthInput
+                  mm={printPrep.drainParams.outerChamfer}
+                  unit={prepUnit}
+                  data-modeling-drain-chamfer
+                  onMm={(mm) => updateDrainParams({ outerChamfer: Math.max(0, mm) })}
+                />
+              </label>
+              <label className="field">
+                <span>Taper (°)</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={45}
+                  step={1}
+                  value={printPrep.drainParams.taperDeg}
+                  data-modeling-drain-taper
+                  onChange={(e) =>
+                    updateDrainParams({
+                      taperDeg: Math.max(0, Math.min(45, Number(e.target.value) || 0)),
+                    })
+                  }
+                />
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={drainThrough}
+                  data-modeling-drain-through
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      if (printPrep.drainParams.depth > 0) {
+                        setDrainSavedDepthMm(printPrep.drainParams.depth);
+                      }
+                      updateDrainParams({ depth: 0 });
+                    } else {
+                      updateDrainParams({ depth: Math.max(0.5, drainSavedDepthMm) });
+                    }
+                  }}
+                />
+                <span>Through wall</span>
+              </label>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={printPrep.drainParams.generatePlug}
+                  data-modeling-drain-plug
+                  onChange={(e) => updateDrainParams({ generatePlug: e.target.checked })}
+                />
+                <span>Create plug</span>
+              </label>
+            </div>
+            <div className="op-row">
+              <button
+                type="button"
+                className={printPrep.activeTool === "drainHole" ? "primary" : undefined}
+                aria-pressed={printPrep.activeTool === "drainHole"}
+                disabled={disabled || prepBusy !== null}
+                data-modeling-drain-tool
+                onClick={() => togglePrintPrepTool("drainHole")}
+              >
+                Pick Surface Point to Punch Hole
+              </button>
+              <button
+                type="button"
+                disabled={disabled || prepBusy !== null}
+                data-modeling-drain-center
+                onClick={() => void runPunchCenterAction(activeItem)}
+              >
+                Punch at Center
+              </button>
+            </div>
+          </div>
+
+          <div className="op" data-modeling-place-section>
+            <span className="muted">7. Print Prep — Surface Stamp (Place Mesh)</span>
+            <div className="op-row">
+              <label className="field">
+                <span>Stamp</span>
+                <select
+                  value={printPrep.placeParams.stampSource}
+                  data-modeling-place-source
+                  onChange={(e) =>
+                    updatePlaceParams({
+                      stampSource: e.target.value as typeof printPrep.placeParams.stampSource,
+                    })
+                  }
+                >
+                  <option value="peg">Peg</option>
+                  <option value="hexBoss">Hex Boss</option>
+                  <option value="dome">Dome</option>
+                  <option value="cube">Cube</option>
+                  <option value="sceneMesh">Scene Mesh</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>Scene Stamp</span>
+                <select
+                  value={printPrep.placeParams.stampMeshId === null ? "" : String(printPrep.placeParams.stampMeshId)}
+                  data-modeling-place-stamp-mesh
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === "") {
+                      updatePlaceParams({
+                        stampMeshId: null,
+                        ...(printPrep.placeParams.stampSource === "sceneMesh"
+                          ? { stampSource: "peg" }
+                          : {}),
+                      });
+                    } else {
+                      updatePlaceParams({
+                        stampSource: "sceneMesh",
+                        stampMeshId: Number(val),
+                      });
+                    }
+                  }}
+                >
+                  <option value="">Built-in preset</option>
+                  {items
+                    .filter((item) => item.mesh !== activeItem.mesh)
+                    .map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="field">
+                <span>Mode</span>
+                <select
+                  value={printPrep.placeParams.mode}
+                  data-modeling-place-mode
+                  onChange={(e) =>
+                    updatePlaceParams({
+                      mode: e.target.value as typeof printPrep.placeParams.mode,
+                    })
+                  }
+                >
+                  <option value="embedUnion">Embed & Union</option>
+                  <option value="engraveSubtract">Engrave</option>
+                  <option value="keepSeparate">Keep Separate</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>Up Axis</span>
+                <select
+                  value={printPrep.placeParams.upAxis}
+                  data-modeling-place-up-axis
+                  onChange={(e) =>
+                    updatePlaceParams({ upAxis: e.target.value as PlaceUpAxis })
+                  }
+                >
+                  <option value="posZ">+Z (posZ)</option>
+                  <option value="negZ">-Z (negZ)</option>
+                  <option value="posY">+Y (posY)</option>
+                  <option value="negY">-Y (negY)</option>
+                </select>
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="field">
+                <span>Scale</span>
+                <input
+                  type="number"
+                  min={0.05}
+                  step={0.1}
+                  value={printPrep.placeParams.uniformScale}
+                  data-modeling-place-scale
+                  onChange={(e) =>
+                    updatePlaceParams({
+                      uniformScale: Math.max(0.05, Number(e.target.value) || 1),
+                    })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span>Embed</span>
+                <LengthInput
+                  mm={printPrep.placeParams.embedDepth}
+                  unit={prepUnit}
+                  data-modeling-place-embed-depth
+                  onMm={(mm) => updatePlaceParams({ embedDepth: mm })}
+                />
+              </label>
+              <label className="field">
+                <span>Spin (°)</span>
+                <input
+                  type="number"
+                  step={5}
+                  value={printPrep.placeParams.twistDeg}
+                  data-modeling-place-spin
+                  onChange={(e) =>
+                    updatePlaceParams({ twistDeg: Number(e.target.value) || 0 })
+                  }
+                />
+              </label>
+            </div>
+            <div className="op-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={placeAlignToNormal}
+                  data-modeling-place-align-normal
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setPlaceAlignState(checked);
+                    setPlaceAlignToNormal(props.app, checked);
+                  }}
+                />
+                <span>Align to normal</span>
+              </label>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={printPrep.placeParams.conformToSurface}
+                  data-modeling-place-conform
+                  onChange={(e) =>
+                    updatePlaceParams({ conformToSurface: e.target.checked })
+                  }
+                />
+                <span>Conform to surface</span>
+              </label>
+            </div>
+            <div className="op-row">
+              <button
+                type="button"
+                className={printPrep.activeTool === "placeStamp" ? "primary" : undefined}
+                aria-pressed={printPrep.activeTool === "placeStamp"}
+                disabled={disabled || prepBusy !== null}
+                data-modeling-place-tool
+                onClick={() => togglePrintPrepTool("placeStamp")}
+              >
+                Click Surface to Place Stamp
+              </button>
+            </div>
+          </div>
+
+          {prepBusy !== null ? <p className="muted busy">{prepBusy}...</p> : null}
+          {prepReport !== null ? (
+            <p className={prepReport.error ? "report error" : "report"} data-modeling-print-prep-report>
+              <strong>{prepReport.label}:</strong> {prepReport.text}
+            </p>
+          ) : null}
         </>
       )}
 
