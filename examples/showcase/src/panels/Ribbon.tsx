@@ -5,16 +5,19 @@
  *   the always-mounted `<SculptToolbox>` (CSS-hidden outside `Sculpt & Deform`
  *   so E2E controls and sliders stay live and queryable).
  */
-import type { MeshHandle } from "fast-mesh-wasm";
+import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
+import { useScene } from "fast-mesh-wasm/react";
 import {
   type AppState,
   type InspectTool,
   useApp,
   type WorkbenchTab,
 } from "../scene/app-state";
+import { applyDyntopoRoi, DYNTOPO_MODE_OPTIONS } from "../viewport/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../viewport/shading";
 import { SculptToolbox } from "../viewport/Toolbox";
 import type { GizmoMode } from "../viewport/Viewport";
+import { formatLength } from "./units";
 
 export interface WorkbenchTabMeta {
   id: WorkbenchTab;
@@ -540,17 +543,24 @@ export function HomeOverviewCard(props: { app: AppState; itemCount: number; onRe
 
 export function SculptInspectorCard(props: { app: AppState; selection: MeshHandle | null }) {
   const { app, selection } = props;
+  const store = useScene();
   const sculpt = useApp(app, (s) => s.sculpt);
   const maskPaint = useApp(app, (s) => s.maskPaint);
   const mask = useApp(app, (s) => s.sculptMask);
+  const brushPick = useApp(app, (s) => s.brushPick);
   const pinToActive = useApp(app, (s) => s.sculptPinToActive);
   const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
   const remesh = useApp(app, (s) => s.sculptRemesh);
+  const dyntopo = useApp(app, (s) => s.sculptDyntopo);
+  const dyntopoMode = useApp(app, (s) => s.sculptDyntopoMode);
+  const dyntopoDetail = useApp(app, (s) => s.sculptDyntopoDetail);
   const symmetry = useApp(app, (s) => s.sculptSymmetry);
   const shadingMode = useApp(app, (s) => s.shadingMode);
+  const units = useApp(app, (s) => s.units);
   const items = useApp(app, (s) => s.items);
   const targetMesh = sculpt?.mesh ?? mask?.mesh ?? selection;
   const targetItem = targetMesh === null ? null : (items.find((i) => i.mesh === targetMesh) ?? null);
+  const targetRadius = targetItem?.radius ?? 1;
 
   return (
     <section className="panel sculpt-inspector-panel" aria-label="Sculpt Parameters" data-panel="sculpt-inspector">
@@ -591,6 +601,71 @@ export function SculptInspectorCard(props: { app: AppState; selection: MeshHandl
           />
           Remesh stroke region on release
         </label>
+      </div>
+      <div className="op">
+        <h3>Dynamic Topology (Dyntopo)</h3>
+        <label className="check">
+          <input
+            type="checkbox"
+            data-action="sculpt-inspector-dyntopo"
+            checked={dyntopo}
+            onChange={(e) => app.setSculptDyntopo(e.currentTarget.checked)}
+          />
+          Enable Dynamic Topology
+        </label>
+        <label className="field">
+          Mode
+          <select
+            data-action="sculpt-inspector-dyntopo-mode"
+            value={dyntopoMode}
+            onChange={(e) => app.setSculptDyntopoMode(e.currentTarget.value as DyntopoMode)}
+          >
+            {DYNTOPO_MODE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="slider">
+          Detail{" "}
+          <output>
+            {dyntopoMode === "brush-relative"
+              ? `${Math.round(dyntopoDetail * 100)}%`
+              : formatLength(dyntopoDetail * targetRadius, units)}
+          </output>
+          <input
+            type="range"
+            data-action="sculpt-inspector-dyntopo-detail"
+            min={0.04}
+            max={0.8}
+            step={0.01}
+            value={Math.min(0.8, Math.max(0.04, dyntopoDetail))}
+            onChange={(e) => app.setSculptDyntopoDetail(Number(e.currentTarget.value))}
+          />
+        </label>
+        <button
+          type="button"
+          data-action="sculpt-inspector-dyntopo-apply"
+          disabled={targetItem === null}
+          onClick={() => {
+            if (targetItem === null) {
+              return;
+            }
+            void applyDyntopoRoi({
+              scene: store.scene,
+              store,
+              target: targetItem,
+              brushPick,
+              mask,
+              mode: dyntopoMode,
+              detail: dyntopoDetail,
+              brushRadius: sculpt?.radius ?? targetItem.radius * 0.25,
+            });
+          }}
+        >
+          Subdivide / Clean Dyntopo ROI
+        </button>
       </div>
       <div className="op">
         <h3>Mirror Symmetry</h3>

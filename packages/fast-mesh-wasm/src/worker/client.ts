@@ -10,17 +10,24 @@
 import { checkRegisterOptions } from "../register.js";
 import {
   checkSurfacePathOptions,
+  checkU32Int,
+  isBrushSculptOp,
   normalizeBooleanArgs,
   normalizeCsgBatchArgs,
   normalizeDeviationOptions,
+  normalizeDyntopoCenterRadius,
+  normalizeDyntopoOptions,
+  normalizeFillHolesContinuityOptions,
   normalizeGeodesicOptions,
   normalizeLandmarkPairs,
   normalizeOverhangOptions,
+  normalizePartialBridgeOptions,
   normalizeQualityArgs,
   normalizeRegistrationOptions,
   normalizeSourceVertices,
   normalizeSurfacePathTarget,
   normalizeTrimCurveArgs,
+  normalizeU32List,
   normalizeVec3,
 } from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
@@ -53,6 +60,7 @@ import type {
   AnalyzeOptions,
   BooleanOp,
   BooleanOptions,
+  BridgeStats,
   ClosestHit,
   ClosestPointOptions,
   ColorRule,
@@ -64,9 +72,14 @@ import type {
   DeviationStats,
   DistanceFieldDesc,
   DragSession,
+  DyntopoDabReport,
+  DyntopoOptions,
+  DyntopoReport,
   EditOp,
   EditResult,
   FieldStatus,
+  FillContinuityStats,
+  FillHolesContinuityOptions,
   FindContactsOptions,
   GeodesicOptions,
   JoinOptions,
@@ -76,6 +89,7 @@ import type {
   MeasureResult,
   OverhangOptions,
   OverhangReport,
+  PartialBridgeOptions,
   QualityMetric,
   QualityReport,
   RegisterOptions,
@@ -91,6 +105,7 @@ import type {
   RepairOp,
   RepairReport,
   RepairReportOf,
+  SculptBrushOp,
   SculptOp,
   SculptReport,
   SculptReportOf,
@@ -104,6 +119,7 @@ import type {
   TriangleQualityOptions,
   TrimCurveOptions,
   TrimReport,
+  VertexProtection,
 } from "../scene.js";
 import { checkInteractionPoints, copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
@@ -741,6 +757,9 @@ export class WorkerScene implements SceneLike {
       this.#runRepair(mesh, op)) as RepairBackend<true>["repair"],
     analyze: (mesh, options) => this.analyze(mesh, options),
     join: (target, source, options) => this.join(target, source, options),
+    fillHoleContinuity: (mesh, loopIndex, options) => this.fillHoleContinuity(mesh, loopIndex, options),
+    fillAllHolesContinuity: (mesh, options) => this.fillAllHolesContinuity(mesh, options),
+    bridgePartialArcs: (mesh, loopA, loopB, options) => this.bridgePartialArcs(mesh, loopA, loopB, options),
   });
 
   /**
@@ -753,6 +772,9 @@ export class WorkerScene implements SceneLike {
     beginStep: () => this.beginStep(),
     endStep: () => this.endStep(),
     cancelStep: () => this.cancelStep(),
+    applyDyntopo: (mesh, center, radius, options, pinned) =>
+      this.applyDyntopo(mesh, center, radius, options, pinned),
+    dyntopoDab: (mesh, dab, options, protection) => this.dyntopoDab(mesh, dab, options, protection),
   });
 
   /** Async remesh, simplification, subdivision, and volumetric reconstruction domain. */
@@ -1948,6 +1970,129 @@ export class WorkerScene implements SceneLike {
         const r = v as Omit<TrimReport, "kept">;
         return { kept: mesh, ...r };
       },
+    );
+  }
+
+  /** Fills a single boundary loop with selectable G0/G1/G2 continuity. */
+  fillHoleContinuity(
+    mesh: MeshHandle,
+    loopIndex: number,
+    options: FillHolesContinuityOptions = {},
+  ): Promise<FillContinuityStats> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const norm = normalizeFillHolesContinuityOptions(options);
+        const loopIdx = checkU32Int(loopIndex, "loopIndex");
+        this.#endDragOn(st);
+        return { kind: "fillHoleContinuity", rev, id: st.id, loopIndex: loopIdx, options: norm, qid };
+      },
+      (v) => v as FillContinuityStats,
+    );
+  }
+
+  /** Fills all eligible holes with selectable G0/G1/G2 continuity. */
+  fillAllHolesContinuity(
+    mesh: MeshHandle,
+    options: FillHolesContinuityOptions = {},
+  ): Promise<FillContinuityStats> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const norm = normalizeFillHolesContinuityOptions(options);
+        this.#endDragOn(st);
+        return { kind: "fillAllHolesContinuity", rev, id: st.id, options: norm, qid };
+      },
+      (v) => v as FillContinuityStats,
+    );
+  }
+
+  /** Bridges two boundary vertex arcs or index ranges. */
+  bridgePartialArcs(
+    mesh: MeshHandle,
+    loopA: Indices = [],
+    loopB: Indices = [],
+    options: PartialBridgeOptions = {},
+  ): Promise<BridgeStats> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const vertsA = normalizeU32List(loopA, "loopA");
+        const vertsB = normalizeU32List(loopB, "loopB");
+        const norm = normalizePartialBridgeOptions(options);
+        this.#endDragOn(st);
+        return {
+          kind: "bridgePartialArcs",
+          rev,
+          id: st.id,
+          loopA: vertsA,
+          loopB: vertsB,
+          options: norm,
+          qid,
+        };
+      },
+      (v) => v as BridgeStats,
+    );
+  }
+
+  /** Runs localized dynamic topology remeshing inside sphere `(center, radius)`. */
+  applyDyntopo(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    options: DyntopoOptions = {},
+    pinned: Indices = [],
+  ): Promise<DyntopoReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const cr = normalizeDyntopoCenterRadius(center, radius);
+        const norm = normalizeDyntopoOptions(options);
+        const pinnedList = normalizeU32List(pinned, "pinned");
+        this.#endDragOn(st);
+        return {
+          kind: "applyDyntopo",
+          rev,
+          id: st.id,
+          center: cr.center,
+          radius: cr.radius,
+          options: norm,
+          pinned: pinnedList,
+          qid,
+        };
+      },
+      (v) => v as DyntopoReport,
+    );
+  }
+
+  /** Applies localized dynamic topology remeshing followed by a brush dab. */
+  dyntopoDab(
+    mesh: MeshHandle,
+    dab: SculptBrushOp,
+    options: DyntopoOptions = {},
+    protection?: VertexProtection,
+  ): Promise<DyntopoDabReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        if (!isBrushSculptOp(dab)) {
+          throw invalid("dyntopoDab requires a brush sculpt operation");
+        }
+        const norm = normalizeDyntopoOptions(options);
+        const effective = protection !== undefined ? ({ ...dab, protect: protection } as SculptBrushOp) : { ...dab };
+        if (effective.protect !== undefined) {
+          effective.protect = {
+            vertices: normalizeU32List(effective.protect.vertices, "protect.vertices"),
+            ...(effective.protect.weights !== undefined
+              ? { weights: Array.from(effective.protect.weights) }
+              : {}),
+            ...(effective.protect.band !== undefined ? { band: effective.protect.band } : {}),
+          };
+        }
+        this.#endDragOn(st);
+        return { kind: "dyntopoDab", rev, id: st.id, dab: effective, options: norm, qid };
+      },
+      (v) => v as DyntopoDabReport,
     );
   }
 

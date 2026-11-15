@@ -1,10 +1,14 @@
+import type { Indices } from "../api.js";
 import type {
   Analysis,
   AnalyzeOptions,
   AutoRepairReport,
   AutoRepairRequest,
   BridgeReport,
+  BridgeStats,
   DegenerateReport,
+  FillContinuityStats,
+  FillHolesContinuityOptions,
   FillReport,
   JoinOptions,
   JoinReport,
@@ -12,6 +16,7 @@ import type {
   ManifoldReport,
   MeshHandle,
   OrientReport,
+  PartialBridgeOptions,
   RemoveReport,
   RepairOp,
   RepairReportOf,
@@ -65,6 +70,21 @@ export interface RepairBackend<Async extends boolean = false> {
   ): RepairReturn<Async, { -readonly [K in keyof O]: RepairReportOf<O[K]> }>;
   analyze(mesh: MeshHandle, options?: AnalyzeOptions): RepairReturn<Async, Analysis>;
   join(target: MeshHandle, source: MeshHandle, options: JoinOptions): RepairReturn<Async, JoinReport>;
+  fillHoleContinuity(
+    mesh: MeshHandle,
+    loopIndex: number,
+    options?: FillHolesContinuityOptions,
+  ): RepairReturn<Async, FillContinuityStats>;
+  fillAllHolesContinuity(
+    mesh: MeshHandle,
+    options?: FillHolesContinuityOptions,
+  ): RepairReturn<Async, FillContinuityStats>;
+  bridgePartialArcs(
+    mesh: MeshHandle,
+    loopA: Indices,
+    loopB: Indices,
+    options?: PartialBridgeOptions,
+  ): RepairReturn<Async, BridgeStats>;
 }
 
 /**
@@ -89,8 +109,23 @@ export interface RepairDomain<Async extends boolean = false> {
   removeSmallComponents(mesh: MeshHandle, options?: SmallComponentOptions): RepairReturn<Async, RemoveReport>;
   orient(mesh: MeshHandle): RepairReturn<Async, OrientReport>;
   fillHoles(mesh: MeshHandle, options?: FillHolesOptions): RepairReturn<Async, FillReport>;
+  fillHoleContinuity(
+    mesh: MeshHandle,
+    loopIndex: number,
+    options?: FillHolesContinuityOptions,
+  ): RepairReturn<Async, FillContinuityStats>;
+  fillAllHolesContinuity(
+    mesh: MeshHandle,
+    options?: FillHolesContinuityOptions,
+  ): RepairReturn<Async, FillContinuityStats>;
   bridge(mesh: MeshHandle, options: BridgeLoopsOptions): RepairReturn<Async, BridgeReport>;
   bridgeLoops(mesh: MeshHandle, options: BridgeLoopsOptions): RepairReturn<Async, BridgeReport>;
+  bridgePartialArcs(
+    mesh: MeshHandle,
+    loopA: Indices,
+    loopB: Indices,
+    options?: PartialBridgeOptions,
+  ): RepairReturn<Async, BridgeStats>;
   join(target: MeshHandle, source: MeshHandle, options: JoinOptions): RepairReturn<Async, JoinReport>;
   makeManifold(mesh: MeshHandle, options?: ManifoldOptions): RepairReturn<Async, ManifoldReport>;
   resolveSelfIntersections(mesh: MeshHandle, options?: SelfIntersectOptions): RepairReturn<Async, SelfIntersectReport>;
@@ -165,8 +200,14 @@ export function createRepairDomain<Async extends boolean>(backend: RepairBackend
     orient: (mesh: MeshHandle) => backend.repair(mesh, { op: "orient" }),
     fillHoles: (mesh: MeshHandle, options: FillHolesOptions = {}) =>
       backend.repair(mesh, { op: "fillHoles", ...options }),
+    fillHoleContinuity: (mesh: MeshHandle, loopIndex: number, options?: FillHolesContinuityOptions) =>
+      backend.fillHoleContinuity(mesh, loopIndex, options),
+    fillAllHolesContinuity: (mesh: MeshHandle, options?: FillHolesContinuityOptions) =>
+      backend.fillAllHolesContinuity(mesh, options),
     bridge: bridgeLoops,
     bridgeLoops,
+    bridgePartialArcs: (mesh: MeshHandle, loopA: Indices, loopB: Indices, options?: PartialBridgeOptions) =>
+      backend.bridgePartialArcs(mesh, loopA, loopB, options),
     join: (target: MeshHandle, source: MeshHandle, options: JoinOptions) => backend.join(target, source, options),
     makeManifold: (mesh: MeshHandle, options: ManifoldOptions = {}) =>
       backend.repair(mesh, { op: "makeManifold", ...options }),

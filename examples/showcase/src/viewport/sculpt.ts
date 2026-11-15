@@ -1,6 +1,8 @@
 // The sculpt stroke: what one dab applies, and one press-and-hold stroke
 // over the meshes (the viewport's ring and pointer loop drive it).
 import type {
+  DyntopoMode,
+  DyntopoOptions,
   FastMeshErrorCode,
   GrabMethod,
   InflateMethod,
@@ -96,6 +98,88 @@ export const FILTER_KIND_OPTIONS: readonly MethodOption<SculptFilterKind>[] = [
   { value: "valleysOnly", label: "Valleys only", description: "Mask brush to concave grooves and cavities" },
   { value: "normalAngle", label: "Normal angle", description: "Restrict brush to faces within a normal cone" },
 ];
+
+export const DYNTOPO_MODE_OPTIONS: readonly MethodOption<DyntopoMode>[] = [
+  { value: "brush-relative", label: "Brush Relative", description: "Target edge length scales with brush radius." },
+  { value: "constant-detail", label: "Constant Detail", description: "Target fixed mesh-space edge length." },
+  { value: "split-collapse", label: "Split & Collapse", description: "Refines long edges and collapses short ones." },
+  { value: "split-only", label: "Subdivide Only", description: "Splits stretched edges without collapsing short ones." },
+];
+
+/** Builds engine {@link DyntopoOptions} from showcase mode/detail state (#212). */
+export function buildDyntopoOptions(
+  mode: DyntopoMode,
+  detailRatio: number,
+  meshRadius = 1,
+): DyntopoOptions {
+  const safeDetail = Number.isFinite(detailRatio) && detailRatio > 0 ? detailRatio : 0.25;
+  const safeMeshRadius = Number.isFinite(meshRadius) && meshRadius > 0 ? meshRadius : 1;
+  return {
+    mode,
+    detailSize: mode === "brush-relative" ? safeDetail : Math.max(1e-4, safeDetail * safeMeshRadius),
+    equalizeValence: true,
+    smoothTangent: true,
+  };
+}
+
+/** Normalized inner-ring radius ratio `(0..1]` for the brush cursor detail indicator (#212). */
+export function dyntopoCursorRatio(
+  mode: DyntopoMode,
+  detailRatio: number,
+  meshRadius: number,
+  brushRadius: number,
+): number {
+  const opts = buildDyntopoOptions(mode, detailRatio, meshRadius);
+  if (mode === "brush-relative") {
+    return opts.detailSize ?? 0.25;
+  }
+  return (opts.detailSize ?? 0.25) / Math.max(brushRadius, 1e-6);
+}
+
+/** Runs localized one-click Dyntopo subdivision/cleanup around the brush pick or item center (#212). */
+export function applyDyntopoRoi(params: {
+  scene: {
+    applyDyntopo?: (
+      mesh: MeshHandle,
+      center: readonly [number, number, number],
+      radius: number,
+      options?: DyntopoOptions,
+      pinned?: ArrayLike<number>,
+    ) => unknown;
+  };
+  store?: {
+    beginStep(): void;
+    endStep(): void;
+    cancelStep(): void;
+  };
+  target: { mesh: MeshHandle; center: readonly [number, number, number]; radius: number };
+  brushPick: { mesh: MeshHandle; point: readonly [number, number, number] | null } | null;
+  mask: SculptMask | null;
+  mode: DyntopoMode;
+  detail: number;
+  brushRadius: number;
+}): Promise<void> {
+  const { scene, store, target, brushPick, mask, mode, detail, brushRadius } = params;
+  if (typeof scene.applyDyntopo !== "function") {
+    return Promise.resolve();
+  }
+  const center =
+    brushPick !== null && brushPick.mesh === target.mesh && brushPick.point !== null
+      ? brushPick.point
+      : target.center;
+  const roiRadius = Math.max(brushRadius, target.radius * 0.5);
+  const opts = buildDyntopoOptions(mode, detail, target.radius);
+  const pinned = mask !== null && mask.mesh === target.mesh ? mask.vertices : [];
+  store?.beginStep();
+  return Promise.resolve(scene.applyDyntopo(target.mesh, center, roiRadius, opts, pinned)).then(
+    () => {
+      store?.endStep();
+    },
+    () => {
+      store?.cancelStep();
+    },
+  );
+}
 
 /**
  * The repair op a tool paints (deflate is inflate with a flipped strength;

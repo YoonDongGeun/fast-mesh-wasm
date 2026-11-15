@@ -7,6 +7,9 @@
 import type {
   Analysis,
   AutoRepairPreset,
+  BridgeStats,
+  FillContinuity,
+  FillContinuityStats,
   MeshHandle,
   RepairOp,
   RepairReport,
@@ -75,6 +78,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [minTriangles, setMinTriangles] = useState(500);
   const [maxEdges, setMaxEdges] = useState(DEFAULT_MAX_EDGES);
   const [fair, setFair] = useState(true);
+  const [continuity, setContinuity] = useState<FillContinuity>("curvature");
+  const [refinePatch, setRefinePatch] = useState(true);
+  const [detectIslands, setDetectIslands] = useState(true);
+  const [continuityLoop, setContinuityLoop] = useState("all");
   const [preset, setPreset] = useState<AutoRepairPreset>("general");
   const [siOverride, setSiOverride] = useState<SelfIntersectionMode | "auto">("auto");
   const [healSiMode, setHealSiMode] = useState<SelfIntersectionMode>("deleteAndFill");
@@ -83,6 +90,14 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   const [selfIntersects, setSelfIntersects] = useState<boolean | null>(null);
   const [bridgeA, setBridgeA] = useState("");
   const [bridgeB, setBridgeB] = useState("");
+  const [partialA, setPartialA] = useState("");
+  const [partialB, setPartialB] = useState("");
+  const [arcAStart, setArcAStart] = useState(0);
+  const [arcAEnd, setArcAEnd] = useState(3);
+  const [arcBStart, setArcBStart] = useState(0);
+  const [arcBEnd, setArcBEnd] = useState(3);
+  const [partialTwist, setPartialTwist] = useState(0);
+  const [partialSubdiv, setPartialSubdiv] = useState(1);
   const [loopMax, setLoopMax] = useState(128);
   const [joinSource, setJoinSource] = useState<number | "">("");
   const [joinLoopA, setJoinLoopA] = useState("");
@@ -110,6 +125,9 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   useEffect(() => {
     setBridgeA("");
     setBridgeB("");
+    setPartialA("");
+    setPartialB("");
+    setContinuityLoop("all");
     setJoinLoopA("");
     setJoinSource("");
     setJoinLoopB("");
@@ -118,6 +136,9 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   useEffect(() => {
     setBridgeA("");
     setBridgeB("");
+    setPartialA("");
+    setPartialB("");
+    setContinuityLoop("all");
     setJoinLoopA("");
   }, [analysis]);
   useEffect(() => {
@@ -225,7 +246,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     };
   }, [store, mesh, analyze]);
 
-  const run = async (label: string, op: RepairOp) => {
+  const runBusy = async (label: string, action: () => Promise<string>) => {
     if (mesh === null || busy !== null) {
       return;
     }
@@ -234,8 +255,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     clearTimeout(own.current.timer);
     own.current.pending = true;
     try {
-      const r = (await store.repair(mesh, op)) as RepairReport;
-      const line = describeReport(op.op, r, units);
+      const line = await action();
       setReport({ mesh, line, failed: false });
       inspect.repair.report = line;
     } catch (e) {
@@ -249,6 +269,81 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
         own.current.timer = setTimeout(() => (own.current.pending = false), OWN_CHANGE_MS);
       }
     }
+  };
+
+  const run = async (label: string, op: RepairOp) =>
+    runBusy(label, async () => {
+      const r = (await store.repair(mesh!, op)) as RepairReport;
+      return describeReport(op.op, r, units);
+    });
+
+  const runWithUndo = async (label: string, work: () => Promise<string>) =>
+    runBusy(label, async () => {
+      store.beginStep();
+      try {
+        const line = await work();
+        store.endStep();
+        void analyze(mesh!);
+        return line;
+      } catch (err) {
+        store.cancelStep();
+        throw err;
+      }
+    });
+
+  const runContinuityFill = async () => {
+    if (mesh === null) {
+      return;
+    }
+    const modeLabel = continuity === "flat" ? "G0" : continuity === "tangent" ? "G1" : "G2";
+    await runWithUndo(`Fill continuity (${modeLabel})`, async () => {
+      const stats: FillContinuityStats =
+        continuityLoop === "all"
+          ? await scene.fillAllHolesContinuity(mesh, {
+              continuity,
+              refinePatch,
+              detectIslands,
+              ...(maxEdges > 0 ? { maxHoleVertices: maxEdges } : {}),
+            })
+          : await scene.fillHoleContinuity(mesh, Number(continuityLoop), {
+              continuity,
+              refinePatch,
+              detectIslands,
+            });
+      if (stats.filledTriangles === 0) {
+        return `Fill continuity (${modeLabel}): no matching holes filled`;
+      }
+      const islands =
+        stats.islandLoopsMerged > 0 ? `, ${plural(stats.islandLoopsMerged, "island")} merged` : "";
+      return `Fill continuity (${modeLabel}): +${plural(stats.filledTriangles, "triangle")}, +${plural(stats.filledVertices, "vertex", "vertices")}${islands}`;
+    });
+  };
+
+  const runPartialBridge = async () => {
+    if (mesh === null || partialA === "" || partialB === "") {
+      return;
+    }
+    const targetA = holeTargets[Number(partialA)];
+    const targetB = holeTargets[Number(partialB)];
+    if (targetA === undefined || targetB === undefined) {
+      return;
+    }
+    await runWithUndo("Bridge partial arcs", async () => {
+      const stats: BridgeStats = await scene.bridgePartialArcs(
+        mesh,
+        targetA.vertices ?? [],
+        targetB.vertices ?? [],
+        {
+          loopAIndex: targetA.loopIndex,
+          arcARange: [arcAStart, arcAEnd],
+          loopBIndex: targetB.loopIndex,
+          arcBRange: [arcBStart, arcBEnd],
+          twistOffset: partialTwist,
+          subdivisions: partialSubdiv,
+        },
+      );
+      return `Arc bridge: +${plural(stats.trianglesAdded, "triangle")}, +${plural(stats.verticesAdded, "vertex", "vertices")} (arcs ${stats.arcAVertices}x${stats.arcBVertices}, ${plural(stats.resultingLoops, "loop")} left)`;
+    });
   };
 
   // One "Auto repair" click: the library's weld -> remove-degenerate -> orient
@@ -467,6 +562,14 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
   }
 
   const s = analysis?.mesh === mesh ? analysis.summary : null;
+  const rawLoops = repairAnalysis?.mesh === mesh ? repairAnalysis.analysis.loops : [];
+  const holeTargets = (s?.holes ?? []).map((h, displayIndex) => {
+    const rawIdx = rawLoops.findIndex(
+      (l) => l.closed && l.id.minVertex === h.id.minVertex && l.id.len === h.id.len,
+    );
+    const loopIndex = rawIdx >= 0 ? rawIdx : displayIndex;
+    return { ...h, displayIndex, loopIndex, vertices: rawLoops[loopIndex]?.vertices };
+  });
   const disabled = busy !== null;
   return (
     <section className="panel" aria-label="Repair" data-repair={item.name} data-tour="repair">
@@ -601,6 +704,62 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           <label className="check" title="Refine and fair the patch so it follows the surrounding curvature">
             <input type="checkbox" checked={fair} onChange={(e) => setFair(e.currentTarget.checked)} />
             Fair (follow curvature)
+          </label>
+        </div>
+        <div className="op" data-continuity-fill="true">
+          <button
+            type="button"
+            data-repair-op="fillContinuity"
+            disabled={disabled}
+            title="Fill holes using selectable G0/G1/G2 boundary continuity (#210)"
+            onClick={() => void runContinuityFill()}
+          >
+            Fill continuity
+          </button>
+          <label className="field" title="Boundary seam continuity across filled patch">
+            continuity
+            <select
+              data-continuity-mode="true"
+              value={continuity}
+              onChange={(e) => setContinuity(e.currentTarget.value as FillContinuity)}
+            >
+              <option value="flat">Flat (G0)</option>
+              <option value="tangent">Tangent (G1)</option>
+              <option value="curvature">Curvature (G2)</option>
+            </select>
+          </label>
+          <label className="field" title="Fill all eligible holes or one specific boundary loop">
+            target
+            <select
+              data-continuity-target="true"
+              value={continuityLoop}
+              onChange={(e) => setContinuityLoop(e.currentTarget.value)}
+            >
+              <option value="all">All holes</option>
+              {holeTargets.map((h) => (
+                <option key={h.displayIndex} value={String(h.loopIndex)}>
+                  #{h.displayIndex + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="check" title="Subdivide and smooth interior patch triangles">
+            <input
+              type="checkbox"
+              data-continuity-refine="true"
+              checked={refinePatch}
+              onChange={(e) => setRefinePatch(e.currentTarget.checked)}
+            />
+            Refine Patch
+          </label>
+          <label className="check" title="Detect and merge enclosed nested island loops inside holes">
+            <input
+              type="checkbox"
+              data-continuity-islands="true"
+              checked={detectIslands}
+              onChange={(e) => setDetectIslands(e.currentTarget.checked)}
+            />
+            Detect Islands
           </label>
         </div>
         <p className="muted small">Fill holes: an empty max fills any size, including an open mesh's outer boundary.</p>
@@ -762,6 +921,109 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
               onChange={(e) => setLoopMax(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
             />
           </label>
+        </div>
+        <div className="op" data-partial-bridge="true">
+          <span className="op-label">Arc bridge</span>
+          <label className="field" title="First boundary loop">
+            loop A
+            <select
+              data-partial-bridge-loop="a"
+              value={partialA}
+              onChange={(e) => setPartialA(e.currentTarget.value)}
+            >
+              <option value="">—</option>
+              {holeTargets.map((h) => (
+                <option key={h.displayIndex} value={h.displayIndex}>
+                  #{h.displayIndex + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" title="Start..end vertex indices along loop A">
+            arc A
+            <input
+              type="number"
+              data-partial-arc="a-start"
+              min={0}
+              step={1}
+              value={arcAStart}
+              onChange={(e) => setArcAStart(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+            <span>-</span>
+            <input
+              type="number"
+              data-partial-arc="a-end"
+              min={0}
+              step={1}
+              value={arcAEnd}
+              onChange={(e) => setArcAEnd(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+          </label>
+          <label className="field" title="Second boundary loop (may match loop A to split a hole)">
+            loop B
+            <select
+              data-partial-bridge-loop="b"
+              value={partialB}
+              onChange={(e) => setPartialB(e.currentTarget.value)}
+            >
+              <option value="">—</option>
+              {holeTargets.map((h) => (
+                <option key={h.displayIndex} value={h.displayIndex}>
+                  #{h.displayIndex + 1} · {h.edges} edges
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field" title="Start..end vertex indices along loop B">
+            arc B
+            <input
+              type="number"
+              data-partial-arc="b-start"
+              min={0}
+              step={1}
+              value={arcBStart}
+              onChange={(e) => setArcBStart(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+            <span>-</span>
+            <input
+              type="number"
+              data-partial-arc="b-end"
+              min={0}
+              step={1}
+              value={arcBEnd}
+              onChange={(e) => setArcBEnd(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+          </label>
+          <label className="field" title="Cyclic offset along arc B">
+            twist
+            <input
+              type="number"
+              data-partial-twist="true"
+              step={1}
+              value={partialTwist}
+              onChange={(e) => setPartialTwist(Math.round(Number(e.currentTarget.value)) || 0)}
+            />
+          </label>
+          <label className="field" title="Interior bridge subdivisions">
+            subdiv
+            <input
+              type="number"
+              data-partial-subdiv="true"
+              min={0}
+              step={1}
+              value={partialSubdiv}
+              onChange={(e) => setPartialSubdiv(Math.max(0, Math.round(Number(e.currentTarget.value)) || 0))}
+            />
+          </label>
+          <button
+            type="button"
+            data-repair-op="bridgePartialArcs"
+            disabled={disabled || partialA === "" || partialB === ""}
+            title="Bridge two partial boundary arcs with undo (#210)"
+            onClick={() => void runPartialBridge()}
+          >
+            Bridge arc
+          </button>
         </div>
         <div className="op">
           <span className="op-label">Join</span>

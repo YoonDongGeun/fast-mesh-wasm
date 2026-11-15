@@ -8,7 +8,15 @@
 // (`scene.raycast`, async on the Worker), one at a time and at most every
 // HOVER_PERIOD_MS, never three's per-triangle `Mesh.raycast`.
 import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
-import type { MeshHandle, RepairOp, Scene, StretchReport } from "fast-mesh-wasm";
+import type {
+  DyntopoDabReport,
+  MeshHandle,
+  RepairOp,
+  Scene,
+  SculptBrushOp,
+  StretchReport,
+  VertexProtection,
+} from "fast-mesh-wasm";
 import { FastMesh } from "fast-mesh-wasm/r3f";
 import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
 import { meshState, type SceneSnapshot } from "fast-mesh-wasm/store";
@@ -39,7 +47,9 @@ import { SceneSlices } from "./SceneSlices";
 import { SceneVolume } from "./SceneVolume";
 import { matchVolume } from "./volume-box";
 import {
+  buildDyntopoOptions,
   dabOperation,
+  dyntopoCursorRatio,
   faceNormal,
   grabLocalDelta,
   interpolateHit,
@@ -59,7 +69,14 @@ import {
   widestGrabReach,
   worldPerPixel,
 } from "./sculpt";
-import { easeNormal, makeBrushCursor, NORMAL_MARKER, placeBrushCursor, setBrushDirection } from "./brush-cursor";
+import {
+  easeNormal,
+  makeBrushCursor,
+  NORMAL_MARKER,
+  placeBrushCursor,
+  setBrushDirection,
+  setBrushDyntopoIndicator,
+} from "./brush-cursor";
 import { isExtraFinger, tapSlop, watchFingers } from "./touch";
 import { setDragging, setHover, view } from "./view";
 import { MaskOverlay } from "./mask-overlay";
@@ -932,8 +949,19 @@ function SculptLayer(props: {
   remeshRef.current = remesh;
   const liveRef = useRef(liveRemesh);
   liveRef.current = liveRemesh;
+  const dyntopo = useApp(app, (s) => s.sculptDyntopo);
+  const dyntopoMode = useApp(app, (s) => s.sculptDyntopoMode);
+  const dyntopoDetail = useApp(app, (s) => s.sculptDyntopoDetail);
+  const dyntopoRef = useRef(dyntopo);
+  dyntopoRef.current = dyntopo;
+  const dyntopoModeRef = useRef(dyntopoMode);
+  dyntopoModeRef.current = dyntopoMode;
+  const dyntopoDetailRef = useRef(dyntopoDetail);
+  dyntopoDetailRef.current = dyntopoDetail;
   const itemsRef = useRef(items);
   itemsRef.current = items;
+  const meshRadiusOf = (mesh: MeshHandle): number =>
+    itemsRef.current.find((i) => i.mesh === mesh)?.radius ?? 1;
   const pinRef = useRef(pinToActive);
   pinRef.current = pinToActive;
   const selectionRef = useRef(selection);
@@ -1151,7 +1179,7 @@ function SculptLayer(props: {
      * repairs while the stroke's step is open, never opening one).
      */
     const maybeLiveRemesh = () => {
-      if (!liveRef.current || stroke === null) {
+      if (dyntopoRef.current || !liveRef.current || stroke === null) {
         return;
       }
       if (!liveRemeshDue(stroke.dabs - liveDabs, performance.now() - liveAt, liveRunning !== null)) {
@@ -1274,6 +1302,17 @@ function SculptLayer(props: {
             ? -NORMAL_MARKER * brush.radius
             : 0;
       setBrushDirection(ball, [out * nx, out * ny, out * nz]);
+      setBrushDyntopoIndicator(
+        ball,
+        dyntopoRef.current
+          ? dyntopoCursorRatio(
+              dyntopoModeRef.current,
+              dyntopoDetailRef.current,
+              meshRadiusOf(brush.mesh),
+              brush.radius,
+            )
+          : null,
+      );
     };
 
     /** The cursor during a grab: where the press was and how far it reaches now, with the drag marked. */
@@ -1320,7 +1359,7 @@ function SculptLayer(props: {
         // The last dabs since the live pass get their splits before the step
         // closes: one undo step for the stroke and its splits (on the sync
         // scene). `pass` keeps them in order, and the stroke open until they land.
-        if (liveRef.current && lastBounds !== null) {
+        if (!dyntopoRef.current && liveRef.current && lastBounds !== null) {
           const spheres = strokeRegionSpheres(lastBounds, brushRef.current.symmetry);
           inspect.sculpt.liveRemeshes++;
           void s.pass(async () => {
@@ -1332,7 +1371,7 @@ function SculptLayer(props: {
         // The optional evening-out, off by default: it rewrites its whole
         // region, and it stands down on huge meshes, where it would stall the
         // worker.
-        if (remeshRef.current && landed > 0) {
+        if (!dyntopoRef.current && remeshRef.current && landed > 0) {
           const b = lastBounds;
           const slots = triSlots(mesh);
           if (b !== null && slots !== null && !remeshTooBig(slots)) {
@@ -1593,16 +1632,12 @@ function SculptLayer(props: {
             hoverLocal = point;
             inspect.sculpt.hovering = true;
             showBall(point, hit.mesh);
-            // Step nesting is the sync scene's; the Worker steps per dab.
-            const maybe = scene as unknown as {
-              beginStep?: () => void;
-              endStep?: () => void;
-              cancelStep?: () => void;
-            };
+            // Step nesting is the sync scene's (or any Dyntopo stroke); non-dyntopo Worker steps per dab.
+            const useSteps = !("status" in scene) || dyntopoRef.current;
             const steps: StrokeSteps = {
-              beginStep: typeof maybe.beginStep === "function" ? () => maybe.beginStep?.() : undefined,
-              endStep: typeof maybe.endStep === "function" ? () => maybe.endStep?.() : undefined,
-              cancelStep: typeof maybe.cancelStep === "function" ? () => maybe.cancelStep?.() : undefined,
+              beginStep: useSteps ? () => store.beginStep() : undefined,
+              endStep: useSteps ? () => store.endStep() : undefined,
+              cancelStep: useSteps ? () => store.cancelStep() : undefined,
             };
             const mesh = strokeTargetMesh;
             ensureRest(mesh);
@@ -1625,22 +1660,44 @@ function SculptLayer(props: {
                 if (cost.maskMs.length < 4096) {
                   cost.maskMs.push(sent - start);
                 }
-                return landing(
-                  !("status" in scene) || held.length === 1
+                const dispatch = async (): Promise<
+                  readonly { moved?: number; removedVertices?: Uint32Array }[]
+                > => {
+                  if (dyntopoRef.current) {
+                    const opts = buildDyntopoOptions(
+                      dyntopoModeRef.current,
+                      dyntopoDetailRef.current,
+                      meshRadiusOf(mesh),
+                    );
+                    const reports: DyntopoDabReport[] = [];
+                    for (const op of held) {
+                      const protect = "protect" in op ? (op as { protect?: VertexProtection }).protect : undefined;
+                      reports.push(await scene.dyntopoDab(mesh, op as SculptBrushOp, opts, protect));
+                    }
+                    return reports;
+                  }
+                  return (!("status" in scene) || held.length === 1
                     ? Promise.all(held.map((op) => store.repair(mesh, op)))
-                    : store.repair(mesh, held),
-                ).then((reports) => {
+                    : store.repair(mesh, held)) as Promise<readonly { moved?: number }[]>;
+                };
+                return landing(dispatch()).then((reports) => {
                   if (cost.landMs.length < 4096) {
                     cost.landMs.push(performance.now() - sent);
                   }
-                  // A dab with only masked vertices under it moved nothing (counted, like a skip).
-                  (reports as readonly { moved?: number }[]).forEach((r, k) => {
+                  let anyRemoved = false;
+                  (reports as readonly { moved?: number; removedVertices?: Uint32Array }[]).forEach((r, k) => {
+                    if ((r.removedVertices?.length ?? 0) > 0) {
+                      anyRemoved = true;
+                    }
                     if (r.moved === 0 && "protect" in held[k]) {
                       inspect.sculpt.maskedDabs++;
                       // Nothing moved, so nothing stretched: no live pass for this one.
                       liveDabs++;
                     }
                   });
+                  if (anyRemoved) {
+                    checkMaskLive(mesh);
+                  }
                   return reports;
                 });
               },

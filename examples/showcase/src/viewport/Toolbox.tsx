@@ -5,7 +5,7 @@
 // remesh toggles; the viewport paints the strokes.
 // The mask group paints the protected region the brushes hold (invert and
 // clear included); mask painting disarms the sculpt brush and vice versa.
-import type { GrabMethod, InflateMethod, MeshHandle, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
+import type { DyntopoMode, GrabMethod, InflateMethod, MeshHandle, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
 import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
 import { meshState, type SceneSnapshot } from "fast-mesh-wasm/store";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -20,7 +20,9 @@ import type {
 import { formatLength } from "../panels/units";
 import { type AppState, type Item, useApp } from "../scene/app-state";
 import {
+  applyDyntopoRoi,
   DEFAULT_STRENGTHS,
+  DYNTOPO_MODE_OPTIONS,
   FILTER_KIND_OPTIONS,
   GRAB_METHOD_OPTIONS,
   INFLATE_METHOD_OPTIONS,
@@ -119,14 +121,19 @@ const fmt = (v: number): string => String(Number(v.toPrecision(3)));
 
 export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | null }) {
   const { app } = props;
+  const store = useScene();
   const [storeSelection] = useSelection();
   const selection = props.selection !== undefined ? props.selection : storeSelection;
   const items = useApp(app, (s) => s.items);
   const sculpt = useApp(app, (s) => s.sculpt);
   const mask = useApp(app, (s) => s.sculptMask);
+  const brushPick = useApp(app, (s) => s.brushPick);
   const pinToActive = useApp(app, (s) => s.sculptPinToActive);
   const remesh = useApp(app, (s) => s.sculptRemesh);
   const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
+  const dyntopo = useApp(app, (s) => s.sculptDyntopo);
+  const dyntopoMode = useApp(app, (s) => s.sculptDyntopoMode);
+  const dyntopoDetail = useApp(app, (s) => s.sculptDyntopoDetail);
   const methods = useApp(app, (s) => s.sculptMethods);
   const grabPoisson = useApp(app, (s) => s.sculptGrabPoisson);
   const filter = useApp(app, (s) => s.sculptFilter);
@@ -455,6 +462,75 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
         />
         Pin to active mesh
       </label>
+      <div className="toolbox-section" role="group" aria-label="Dynamic topology">
+        <button
+          type="button"
+          data-action="sculpt-dyntopo"
+          aria-pressed={dyntopo}
+          title="Dynamic Topology: live edge splitting, collapsing, and valence equalization during sculpt strokes"
+          onClick={() => app.setSculptDyntopo(!dyntopo)}
+        >
+          Dyntopo
+        </button>
+        {dyntopo ? (
+          <>
+            <label className="field" title="Dynamic topology detail policy">
+              mode
+              <select
+                data-action="sculpt-dyntopo-mode"
+                value={dyntopoMode}
+                onChange={(e) => app.setSculptDyntopoMode(e.currentTarget.value as DyntopoMode)}
+              >
+                {DYNTOPO_MODE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="slider" title="Target detail size (fraction of brush or mesh radius)">
+              detail{" "}
+              <output>
+                {dyntopoMode === "brush-relative"
+                  ? `${Math.round(dyntopoDetail * 100)}%`
+                  : formatLength(dyntopoDetail * targetRadius, units)}
+              </output>
+              <input
+                type="range"
+                data-action="sculpt-dyntopo-detail"
+                min={0.04}
+                max={0.8}
+                step={0.01}
+                value={Math.min(0.8, Math.max(0.04, dyntopoDetail))}
+                onChange={(e) => app.setSculptDyntopoDetail(Number(e.currentTarget.value))}
+              />
+            </label>
+            <button
+              type="button"
+              data-action="sculpt-dyntopo-apply"
+              disabled={targetItem === null}
+              title="Clean/subdivide local Dyntopo ROI around brush center or mesh center"
+              onClick={() => {
+                if (targetItem === null) {
+                  return;
+                }
+                void applyDyntopoRoi({
+                  scene: store.scene,
+                  store,
+                  target: targetItem,
+                  brushPick,
+                  mask,
+                  mode: dyntopoMode,
+                  detail: dyntopoDetail,
+                  brushRadius: radius,
+                });
+              }}
+            >
+              Remesh ROI
+            </button>
+          </>
+        ) : null}
+      </div>
       <MaskTools app={app} targetMesh={targetMesh} radius={targetRadius} />
     </div>
   );

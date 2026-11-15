@@ -3,7 +3,7 @@
 // contact group. A tiny
 // external store, so the loader (outside React) and the components share it;
 // read it with `useApp`.
-import type { Analysis, MeshHandle, SectionHandle, SectionPlane } from "fast-mesh-wasm";
+import type { Analysis, DyntopoMode, MeshHandle, SectionHandle, SectionPlane } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import * as THREE from "three";
@@ -249,6 +249,12 @@ export interface AppSnapshot {
    * step and never open one of their own.
    */
   sculptLiveRemesh: boolean;
+  /** Whether Dynamic Topology (Dyntopo) runs during sculpt strokes (#212; persisted). */
+  sculptDyntopo: boolean;
+  /** Dynamic Topology split/collapse mode (#212; persisted). */
+  sculptDyntopoMode: DyntopoMode;
+  /** Dynamic Topology detail ratio in `(0.01, 2]` (#212; persisted). */
+  sculptDyntopoDetail: number;
   /** Per-brush algorithm selections (#177, #192; persisted). */
   sculptMethods: SculptMethods;
   /** Kelvinlet grab Poisson ratio in `[0, 0.5]` (#177; persisted). */
@@ -359,6 +365,9 @@ export class AppState {
     sculptMaskNotice: null,
     sculptRemesh: false,
     sculptLiveRemesh: true,
+    sculptDyntopo: false,
+    sculptDyntopoMode: "brush-relative",
+    sculptDyntopoDetail: 0.25,
     sculptMethods: {
       inflate: "vertexNormal",
       smooth: "laplacian",
@@ -435,6 +444,9 @@ export class AppState {
       decimateOnLoad: initial.decimateOnLoad,
       sculptRemesh: initial.sculptEvenOut,
       sculptLiveRemesh: initial.sculptLiveRemesh,
+      sculptDyntopo: initial.sculptDyntopo,
+      sculptDyntopoMode: initial.sculptDyntopoMode,
+      sculptDyntopoDetail: initial.sculptDyntopoDetail,
       maskRadius: initial.maskRadius,
       sculptMethods: { ...initial.sculptMethods },
       sculptGrabPoisson: initial.sculptGrabPoisson,
@@ -700,6 +712,24 @@ export class AppState {
   /** Whether a stroke is remeshed live while it paints. */
   setSculptLiveRemesh(on: boolean): void {
     this.#set({ sculptLiveRemesh: on });
+  }
+
+  /** Enables or disables Dynamic Topology during sculpt strokes (#212; persisted). */
+  setSculptDyntopo(on: boolean): void {
+    this.#set({ sculptDyntopo: on });
+  }
+
+  /** Sets the Dynamic Topology split/collapse mode (#212; persisted). */
+  setSculptDyntopoMode(mode: DyntopoMode): void {
+    this.#set({ sculptDyntopoMode: mode });
+  }
+
+  /** Sets the Dynamic Topology detail ratio clamped to `[0.01, 2]` (#212; persisted). */
+  setSculptDyntopoDetail(detail: number): void {
+    if (!Number.isFinite(detail)) {
+      return;
+    }
+    this.#set({ sculptDyntopoDetail: Math.min(2, Math.max(0.01, detail)) });
   }
 
   /** Updates per-brush sculpt algorithm selections (persisted). */
@@ -986,6 +1016,9 @@ export class AppState {
       decimateOnLoad: d.decimateOnLoad,
       sculptRemesh: d.sculptEvenOut,
       sculptLiveRemesh: d.sculptLiveRemesh,
+      sculptDyntopo: d.sculptDyntopo,
+      sculptDyntopoMode: d.sculptDyntopoMode,
+      sculptDyntopoDetail: d.sculptDyntopoDetail,
       maskRadius: d.maskRadius,
       sculptMethods: { ...d.sculptMethods },
       sculptGrabPoisson: d.sculptGrabPoisson,

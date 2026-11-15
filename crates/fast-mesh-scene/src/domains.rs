@@ -18,11 +18,12 @@ use fast_mesh_ops::remesh::{
     RemeshOptions, RemeshReport, SimplifyOptions, SimplifyReport, SubdivideOptions, SubdivideReport,
 };
 use fast_mesh_ops::repair::{
-    AutoRepairOptions, AutoRepairReport, ComponentOptions, DegenerateOptions, DegenerateReport,
-    FillOptions, FillReport, ManifoldOptions, ManifoldReport, OrientReport, RemoveReport,
-    SelfIntersectOptions, SelfIntersectReport, SliverOptions, SliverReport, WeldReport,
+    AutoRepairOptions, AutoRepairReport, BridgeStats, ComponentOptions, DegenerateOptions,
+    DegenerateReport, FillHolesOptions, FillOptions, FillReport, FillStats, ManifoldOptions,
+    ManifoldReport, OrientReport, PartialBridgeOptions, RemoveReport, SelfIntersectOptions,
+    SelfIntersectReport, SliverOptions, SliverReport, WeldReport,
 };
-use fast_mesh_ops::sculpt::{StretchOptions, StretchReport};
+use fast_mesh_ops::sculpt::{DyntopoOptions, DyntopoPatch, StretchOptions, StretchReport};
 use fast_mesh_store::VertexId;
 
 use crate::{
@@ -51,6 +52,32 @@ pub trait SceneRepairOps {
 
     /// Fills matching boundary loops on mesh `id`.
     fn fill_holes(&mut self, id: MeshId, options: &FillOptions) -> Result<FillReport>;
+
+    /// Fills a single boundary loop on mesh `id` with configurable geometric continuity.
+    fn fill_hole_continuity(
+        &mut self,
+        id: MeshId,
+        loop_index: usize,
+        options: &FillHolesOptions,
+    ) -> Result<FillStats>;
+
+    /// Fills all non-rim boundary holes on mesh `id` with configurable geometric continuity
+    /// and island merging.
+    fn fill_all_holes_continuity(
+        &mut self,
+        id: MeshId,
+        options: &FillHolesOptions,
+    ) -> Result<FillStats>;
+
+    /// Bridges two partial boundary arcs (specified either by explicit vertex arcs or
+    /// index ranges in `options`) on mesh `id`.
+    fn bridge_partial_arcs(
+        &mut self,
+        id: MeshId,
+        loop_a: &[VertexId],
+        loop_b: &[VertexId],
+        options: &PartialBridgeOptions,
+    ) -> Result<BridgeStats>;
 
     /// Repairs topological non-manifold defects on mesh `id`.
     fn make_manifold(&mut self, id: MeshId, options: &ManifoldOptions) -> Result<ManifoldReport>;
@@ -99,6 +126,81 @@ impl SceneRepairOps for Scene {
 
     fn fill_holes(&mut self, id: MeshId, options: &FillOptions) -> Result<FillReport> {
         self.edit(id, |tx| crate::ops::repair::fill_holes(tx, options))
+    }
+
+    fn fill_hole_continuity(
+        &mut self,
+        id: MeshId,
+        loop_index: usize,
+        options: &FillHolesOptions,
+    ) -> Result<FillStats> {
+        self.edit(id, |tx| {
+            crate::ops::repair::fill_hole(tx, loop_index, options)
+        })
+    }
+
+    fn fill_all_holes_continuity(
+        &mut self,
+        id: MeshId,
+        options: &FillHolesOptions,
+    ) -> Result<FillStats> {
+        self.edit(id, |tx| {
+            let per_hole = crate::ops::repair::fill_all_holes(tx, options)?;
+            let mut iter = per_hole.into_iter();
+            match iter.next() {
+                None => Ok::<_, crate::ops::OpsError>(FillStats {
+                    loop_index: 0,
+                    filled_vertices: 0,
+                    filled_triangles: 0,
+                    perimeter: 0.0,
+                    max_dihedral_angle_deg: 0.0,
+                    continuity: options.continuity,
+                    island_loops_merged: 0,
+                    converged: true,
+                }),
+                Some(mut combined) => {
+                    combined.continuity = options.continuity;
+                    for stat in iter {
+                        combined.filled_vertices += stat.filled_vertices;
+                        combined.filled_triangles += stat.filled_triangles;
+                        combined.perimeter += stat.perimeter;
+                        combined.max_dihedral_angle_deg = combined
+                            .max_dihedral_angle_deg
+                            .max(stat.max_dihedral_angle_deg);
+                        combined.island_loops_merged += stat.island_loops_merged;
+                        combined.converged &= stat.converged;
+                    }
+                    Ok(combined)
+                }
+            }
+        })
+    }
+
+    fn bridge_partial_arcs(
+        &mut self,
+        id: MeshId,
+        loop_a: &[VertexId],
+        loop_b: &[VertexId],
+        options: &PartialBridgeOptions,
+    ) -> Result<BridgeStats> {
+        self.edit(id, |tx| {
+            if loop_a.is_empty() && loop_b.is_empty() {
+                return crate::ops::repair::bridge_partial_arcs(tx, options);
+            }
+            let loops = crate::ops::boundary_loops(tx.mesh())?;
+            let mut resolved = *options;
+            if !loop_a.is_empty() {
+                let (idx, range) = resolve_partial_bridge_arc(&loops, loop_a)?;
+                resolved.loop_a_index = idx;
+                resolved.arc_a_range = range;
+            }
+            if !loop_b.is_empty() {
+                let (idx, range) = resolve_partial_bridge_arc(&loops, loop_b)?;
+                resolved.loop_b_index = idx;
+                resolved.arc_b_range = range;
+            }
+            crate::ops::repair::bridge_partial_arcs(tx, &resolved)
+        })
     }
 
     fn make_manifold(&mut self, id: MeshId, options: &ManifoldOptions) -> Result<ManifoldReport> {
@@ -159,6 +261,45 @@ pub trait SceneSculptOps {
         center: [f32; 3],
         radius: f32,
     ) -> Result<Vec<VertexId>>;
+
+    /// Runs localized dynamic-topology refinement inside a sphere on mesh `id`.
+    fn apply_dyntopo(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+    ) -> Result<DyntopoPatch>;
+
+    /// Runs localized dynamic-topology refinement while locking `pinned` vertices.
+    fn apply_dyntopo_protected(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+        pinned: &[VertexId],
+    ) -> Result<DyntopoPatch>;
+
+    /// Runs localized dynamic-topology refinement followed by a sculpt dab on mesh `id`.
+    fn dyntopo_dab(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+    ) -> Result<(DyntopoPatch, DabReport)>;
+
+    /// Runs localized dynamic-topology refinement followed by a sculpt dab with vertex
+    /// protection weights and a geodesic falloff band on mesh `id`.
+    fn dyntopo_dab_protected_band(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+        vertices: &[VertexId],
+        weights: &[f32],
+        band: f32,
+    ) -> Result<(DyntopoPatch, DabReport)>;
 }
 
 impl SceneSculptOps for Scene {
@@ -186,6 +327,84 @@ impl SceneSculptOps for Scene {
     ) -> Result<Vec<VertexId>> {
         Scene::vertices_in_sphere(self, id, center, radius)
     }
+
+    fn apply_dyntopo(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+    ) -> Result<DyntopoPatch> {
+        Scene::apply_dyntopo(self, id, center, radius, options)
+    }
+
+    fn apply_dyntopo_protected(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+        pinned: &[VertexId],
+    ) -> Result<DyntopoPatch> {
+        Scene::apply_dyntopo_protected(self, id, center, radius, options, pinned)
+    }
+
+    fn dyntopo_dab(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+    ) -> Result<(DyntopoPatch, DabReport)> {
+        Scene::dyntopo_dab(self, id, dab, options)
+    }
+
+    fn dyntopo_dab_protected_band(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+        vertices: &[VertexId],
+        weights: &[f32],
+        band: f32,
+    ) -> Result<(DyntopoPatch, DabReport)> {
+        Scene::dyntopo_dab_protected_band(self, id, dab, options, vertices, weights, band)
+    }
+}
+
+fn resolve_partial_bridge_arc(
+    loops: &[crate::ops::BoundaryLoop],
+    arc: &[VertexId],
+) -> std::result::Result<(usize, (usize, usize)), crate::ops::OpsError> {
+    if arc.len() < 2 {
+        return Err(crate::ops::OpsError::InvalidInput(
+            "bridge arc requires at least two vertices",
+        ));
+    }
+    for (loop_idx, b_loop) in loops.iter().enumerate() {
+        let lv = &b_loop.vertices;
+        let n = lv.len();
+        if n < 2 || arc.len() > n {
+            continue;
+        }
+        let Some(start) = lv.iter().position(|&v| v == arc[0]) else {
+            continue;
+        };
+        if (0..arc.len()).all(|k| lv[(start + k) % n] == arc[k]) {
+            let end = (start + arc.len() - 1) % n;
+            return Ok((loop_idx, (start, end)));
+        }
+        if (0..arc.len()).all(|k| lv[(start + n - k) % n] == arc[k]) {
+            let end_fwd = (start + n - (arc.len() - 1)) % n;
+            return Ok((loop_idx, (end_fwd, start)));
+        }
+        if arc.len() == 2 && arc[0] != arc[1] && lv.contains(&arc[1]) {
+            let end = lv.iter().position(|&v| v == arc[1]).expect("checked above");
+            return Ok((loop_idx, (start, end)));
+        }
+    }
+    Err(crate::ops::OpsError::InvalidInput(
+        "bridge arc vertices do not form a contiguous boundary arc",
+    ))
 }
 
 /// Remesh domain operations on [`Scene`].
@@ -782,5 +1001,127 @@ mod tests {
         )
         .unwrap();
         assert!(ds.sample_count > 0);
+    }
+
+    #[test]
+    fn scene_domain_dyntopo_and_continuity_repair_delegate_cleanly() {
+        use fast_mesh_ops::repair::FillContinuity;
+        use fast_mesh_ops::sculpt::DyntopoMode;
+
+        // Open-box mesh with 1 missing quad face (2 triangles -> 4-vertex hole loop)
+        let mut positions = vec![
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+        ];
+        // Build a 4x4 grid missing the center cell [1..2, 1..2] -> outer rim + center hole loop
+        positions.clear();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                positions.extend_from_slice(&[x as f32, y as f32, 0.0]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..3u32 {
+            for x in 0..3u32 {
+                if x == 1 && y == 1 {
+                    continue;
+                }
+                let v0 = y * 4 + x;
+                let v1 = v0 + 1;
+                let v2 = v0 + 5;
+                let v3 = v0 + 4;
+                indices.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+            }
+        }
+        let hole_mesh = Mesh::from_buffers(&positions, &indices).unwrap();
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(hole_mesh, MeshOptions::default()).unwrap();
+
+        // Find the inner 4-vertex hole loop index via boundary_loops
+        let loops = fast_mesh_ops::boundary_loops(scene.mesh(id).unwrap()).unwrap();
+        let inner_idx = loops.iter().position(|l| l.vertices.len() == 4).unwrap();
+        let inner_stats = SceneRepairOps::fill_hole_continuity(
+            &mut scene,
+            id,
+            inner_idx,
+            &FillHolesOptions::builder()
+                .continuity(FillContinuity::CurvatureG2)
+                .refine_patch(true)
+                .build(),
+        )
+        .unwrap();
+        assert!(inner_stats.filled_triangles >= 2);
+        assert_eq!(inner_stats.continuity, FillContinuity::CurvatureG2);
+
+        scene.undo().unwrap();
+        let all_stats = SceneRepairOps::fill_all_holes_continuity(
+            &mut scene,
+            id,
+            &FillHolesOptions::builder()
+                .continuity(FillContinuity::TangentG1)
+                .refine_patch(false)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(all_stats.filled_triangles, 2);
+
+        scene.undo().unwrap();
+        let inner_verts = loops[inner_idx].vertices.clone();
+        let bridge_stats = SceneRepairOps::bridge_partial_arcs(
+            &mut scene,
+            id,
+            &inner_verts[0..2],
+            &inner_verts[2..4],
+            &PartialBridgeOptions::default(),
+        )
+        .unwrap();
+        assert!(bridge_stats.triangles_added > 0);
+
+        let dyntopo_opts = DyntopoOptions {
+            mode: DyntopoMode::SplitOnly,
+            detail_size: 0.4,
+            ..Default::default()
+        };
+        let patch =
+            SceneSculptOps::apply_dyntopo(&mut scene, id, [1.5, 1.5, 0.0], 1.2, &dyntopo_opts)
+                .unwrap();
+        assert!(patch.splits > 0);
+
+        let alive_v = (0..scene.mesh(id).unwrap().vertex_slots() as VertexId)
+            .find(|&v| scene.mesh(id).unwrap().position(v).is_some())
+            .unwrap();
+        let _ = SceneSculptOps::apply_dyntopo_protected(
+            &mut scene,
+            id,
+            [1.5, 1.5, 0.0],
+            0.8,
+            &dyntopo_opts,
+            &[alive_v],
+        )
+        .unwrap();
+
+        let dab = Dab::Inflate(InflateOptions {
+            brush: Brush {
+                center: [1.5, 1.5, 0.0],
+                radius: 1.0,
+                falloff: Falloff::Smooth,
+                strength: 0.1,
+            },
+            ..Default::default()
+        });
+        let (_, dab_rep) =
+            SceneSculptOps::dyntopo_dab(&mut scene, id, &dab, &dyntopo_opts).unwrap();
+        assert!(dab_rep.moved > 0);
+        let (_, band_rep) = SceneSculptOps::dyntopo_dab_protected_band(
+            &mut scene,
+            id,
+            &dab,
+            &dyntopo_opts,
+            &[alive_v],
+            &[0.0],
+            0.25,
+        )
+        .unwrap();
+        assert!(band_rep.moved > 0);
     }
 }

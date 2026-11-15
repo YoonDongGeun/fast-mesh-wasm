@@ -1,21 +1,27 @@
-import type { Vec3 } from "../api.js";
+import type { Indices, Vec3 } from "../api.js";
 import { FastMeshError } from "../core.js";
+import { isBrushSculptOp, normalizeDyntopoOptions } from "../options.js";
 import type {
   CaptureRestReport,
   CaptureStrokeReport,
   ClayReport,
   CreaseReport,
+  DyntopoDabReport,
+  DyntopoOptions,
+  DyntopoReport,
   FlattenReport,
   GrabReport,
   InflateReport,
   MeshHandle,
   RelaxReport,
+  SculptBrushOp,
   SculptOp,
   SculptReportOf,
   SmoothReport,
   StretchReport,
   SurfaceFilter,
   TwistReport,
+  VertexProtection,
 } from "../scene.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
@@ -46,6 +52,12 @@ export interface BeginStrokeOptions {
 /** Sculpt operations that support composable per-vertex surface filters. */
 export type FilteredSculptOp = Extract<SculptOp, { filter?: SurfaceFilter }>;
 
+/** Options for {@link SculptDomain.dab}. */
+export interface SculptDabOptions {
+  /** Override or disable (`null`) dynamic topology for this dab. */
+  dyntopo?: DyntopoOptions | null;
+}
+
 /** Low-level host backend used by {@link createSculptDomain}. */
 export interface SculptBackend<Async extends boolean = false> {
   sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): SculptReturn<Async, SculptReportOf<O>>;
@@ -57,6 +69,19 @@ export interface SculptBackend<Async extends boolean = false> {
   beginStep?: () => void;
   endStep?: () => void;
   cancelStep?: () => void;
+  applyDyntopo(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    options?: DyntopoOptions,
+    pinned?: Indices,
+  ): SculptReturn<Async, DyntopoReport>;
+  dyntopoDab(
+    mesh: MeshHandle,
+    dab: SculptBrushOp,
+    options?: DyntopoOptions,
+    protection?: VertexProtection,
+  ): SculptReturn<Async, DyntopoDabReport>;
 }
 
 /**
@@ -74,13 +99,33 @@ export interface SculptDomain<Async extends boolean = false> {
   ): SculptReturn<Async, { -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
 
   beginStroke(mesh: MeshHandle, options?: BeginStrokeOptions): SculptReturn<Async, CaptureStrokeReport>;
-  dab<const O extends SculptOp>(mesh: MeshHandle, op: O): SculptReturn<Async, SculptReportOf<O>>;
+  dab<const O extends SculptOp>(
+    mesh: MeshHandle,
+    op: O,
+    options?: SculptDabOptions,
+  ): SculptReturn<Async, SculptReportOf<O>>;
   dab<const O extends readonly SculptOp[]>(
     mesh: MeshHandle,
     ops: O,
+    options?: SculptDabOptions,
   ): SculptReturn<Async, { -readonly [K in keyof O]: SculptReportOf<O[K]> }>;
   endStroke(): void;
   cancelStroke(): void;
+  setDyntopo(options: DyntopoOptions | null): void;
+  getDyntopo(): DyntopoOptions | null;
+  applyDyntopo(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    options?: DyntopoOptions,
+    pinned?: Indices,
+  ): SculptReturn<Async, DyntopoReport>;
+  dyntopoDab(
+    mesh: MeshHandle,
+    dab: SculptBrushOp,
+    options?: DyntopoOptions,
+    protection?: VertexProtection,
+  ): SculptReturn<Async, DyntopoDabReport>;
 
   filter<T extends FilteredSculptOp>(op: T, surfaceFilter: SurfaceFilter): T & { filter: SurfaceFilter };
   filter<const O extends FilteredSculptOp>(
@@ -125,6 +170,21 @@ export function createSculptDomain<Async extends boolean>(backend: SculptBackend
 
   let strokeDepth = 0;
   let activeStroke = false;
+  let dyntopoOptions: DyntopoOptions | null = null;
+
+  const dabFn = ((
+    mesh: MeshHandle,
+    op: SculptOp | readonly SculptOp[],
+    options?: SculptDabOptions,
+  ) => {
+    if (!Array.isArray(op) && isBrushSculptOp(op as SculptOp)) {
+      const effectiveDyntopo = options?.dyntopo !== undefined ? options.dyntopo : dyntopoOptions;
+      if (effectiveDyntopo !== null) {
+        return backend.dyntopoDab(mesh, op as SculptBrushOp, effectiveDyntopo);
+      }
+    }
+    return backend.sculpt(mesh, op as SculptOp);
+  }) as SculptDomain<Async>["dab"];
 
   const filterFn = (<const O extends FilteredSculptOp>(
     meshOrOp: MeshHandle | O,
@@ -194,7 +254,7 @@ export function createSculptDomain<Async extends boolean>(backend: SculptBackend
         throw err;
       }
     },
-    dab: callable,
+    dab: dabFn,
     endStroke: (): void => {
       if (strokeDepth > 0 && backend.endStep !== undefined) {
         strokeDepth--;
@@ -217,6 +277,28 @@ export function createSculptDomain<Async extends boolean>(backend: SculptBackend
           : "no active sculpt stroke",
       );
     },
+    setDyntopo: (options: DyntopoOptions | null): void => {
+      if (options === null) {
+        dyntopoOptions = null;
+        return;
+      }
+      normalizeDyntopoOptions(options);
+      dyntopoOptions = { ...options };
+    },
+    getDyntopo: (): DyntopoOptions | null => (dyntopoOptions === null ? null : { ...dyntopoOptions }),
+    applyDyntopo: (
+      mesh: MeshHandle,
+      center: Readonly<Vec3>,
+      radius: number,
+      options?: DyntopoOptions,
+      pinned?: Indices,
+    ) => backend.applyDyntopo(mesh, center, radius, options, pinned),
+    dyntopoDab: (
+      mesh: MeshHandle,
+      dab: SculptBrushOp,
+      options?: DyntopoOptions,
+      protection?: VertexProtection,
+    ) => backend.dyntopoDab(mesh, dab, options, protection),
     filter: filterFn,
     inflate: (mesh: MeshHandle, op: InflateOp) => backend.sculpt(mesh, { op: "inflate", ...op }),
     smooth: (mesh: MeshHandle, op: SmoothOp) => backend.sculpt(mesh, { op: "smooth", ...op }),

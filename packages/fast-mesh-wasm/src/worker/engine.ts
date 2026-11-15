@@ -883,6 +883,11 @@ class Engine {
       case "edit":
       case "repair":
       case "trimByCurve":
+      case "fillHoleContinuity":
+      case "fillAllHolesContinuity":
+      case "bridgePartialArcs":
+      case "applyDyntopo":
+      case "dyntopoDab":
         return this.#pending(req.id);
       case "join":
       case "boolean":
@@ -987,6 +992,11 @@ class Engine {
       case "compact":
       case "cutByPlane":
       case "trimByCurve":
+      case "fillHoleContinuity":
+      case "fillAllHolesContinuity":
+      case "bridgePartialArcs":
+      case "applyDyntopo":
+      case "dyntopoDab":
       case "removeMesh":
         return req.id === id;
       case "boolean":
@@ -1296,6 +1306,11 @@ class Engine {
       case "compact":
       case "cutByPlane":
       case "trimByCurve":
+      case "fillHoleContinuity":
+      case "fillAllHolesContinuity":
+      case "bridgePartialArcs":
+      case "applyDyntopo":
+      case "dyntopoDab":
       case "removeMesh":
         return meshes.has(req.id);
       case "boolean":
@@ -1784,6 +1799,43 @@ class Engine {
             seamEdges: r.seamEdges,
           },
         });
+        return;
+      }
+      case "fillHoleContinuity": {
+        const value = s.fillHoleContinuity(this.#mesh(req.id), req.loopIndex, req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "fillAllHolesContinuity": {
+        const value = s.fillAllHolesContinuity(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "bridgePartialArcs": {
+        const value = s.bridgePartialArcs(this.#mesh(req.id), req.loopA, req.loopB, req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "applyDyntopo": {
+        const value = s.applyDyntopo(this.#mesh(req.id), req.center, req.radius, req.options, req.pinned);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        if (value.createdVertices.buffer instanceof ArrayBuffer) {
+          b.transfer.push(value.createdVertices.buffer);
+        }
+        if (value.removedVertices.buffer instanceof ArrayBuffer) {
+          b.transfer.push(value.removedVertices.buffer);
+        }
+        return;
+      }
+      case "dyntopoDab": {
+        const value = s.dyntopoDab(this.#mesh(req.id), req.dab, req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        if (value.createdVertices.buffer instanceof ArrayBuffer) {
+          b.transfer.push(value.createdVertices.buffer);
+        }
+        if (value.removedVertices.buffer instanceof ArrayBuffer) {
+          b.transfer.push(value.removedVertices.buffer);
+        }
         return;
       }
       case "alignByLandmarks": {

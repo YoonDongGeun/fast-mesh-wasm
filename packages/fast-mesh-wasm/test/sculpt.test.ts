@@ -299,7 +299,7 @@ describe.each(HARNESSES)("sculpt domain ($label)", (harness) => {
     const mSphere = await h.addMesh(sheets.positions, sheets.indices);
     const mGeo = await h.addMesh(sheets.positions, sheets.indices);
     const grabBase = {
-      op: "grab",
+      op: "grab" as const,
       center: [0, 0, 0] as Vec3,
       radius: 1.2,
       falloff: "smooth" as const,

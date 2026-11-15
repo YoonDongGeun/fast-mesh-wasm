@@ -8,6 +8,7 @@ export const NORMAL_MARKER = 0.6;
 const Z = new THREE.Vector3(0, 0, 1);
 const MARKER = "direction-marker";
 const LINK = "direction-link";
+const DYNTOPO_RING = "dyntopo-detail-ring";
 
 /** A hidden cursor in `color`, one unit in radius: `placeBrushCursor` lays it on the surface. */
 export function makeBrushCursor(color: number): THREE.Group {
@@ -21,6 +22,12 @@ export function makeBrushCursor(color: number): THREE.Group {
     new THREE.RingGeometry(0.97, 1, 64),
     new THREE.MeshBasicMaterial({ ...onTop, opacity: 0.85, side: THREE.DoubleSide }),
   );
+  const detailRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.92, 1, 48),
+    new THREE.MeshBasicMaterial({ ...onTop, opacity: 0.72, side: THREE.DoubleSide }),
+  );
+  detailRing.name = DYNTOPO_RING;
+  detailRing.visible = false;
   const center = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 8), new THREE.MeshBasicMaterial({ ...onTop }));
   const marker = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), new THREE.MeshBasicMaterial({ ...onTop }));
   marker.name = MARKER;
@@ -32,13 +39,31 @@ export function makeBrushCursor(color: number): THREE.Group {
   link.name = LINK;
   link.visible = false;
   // Everything frustum-culled with the disc alone would vanish with the marker still on screen.
-  for (const part of [disc, rim, center, marker, link]) {
+  for (const part of [disc, rim, detailRing, center, marker, link]) {
     part.frustumCulled = false;
     part.renderOrder = 10;
     group.add(part);
   }
   group.visible = false;
   return group;
+}
+
+/**
+ * Shows or hides an inner Dyntopo detail indicator ring scaled to `detailRatio` of the brush radius,
+ * or hides it when `null` (#212).
+ */
+export function setBrushDyntopoIndicator(cursor: THREE.Group, detailRatio: number | null): void {
+  const ring = cursor.getObjectByName(DYNTOPO_RING);
+  if (ring === undefined) {
+    return;
+  }
+  if (detailRatio === null || !Number.isFinite(detailRatio) || detailRatio <= 0) {
+    ring.visible = false;
+    return;
+  }
+  const s = Math.min(0.95, Math.max(0.05, detailRatio));
+  ring.scale.setScalar(s);
+  ring.visible = true;
 }
 
 /** Lays the cursor on the surface at `point`, facing along the unit `normal`, in its parent's frame. */

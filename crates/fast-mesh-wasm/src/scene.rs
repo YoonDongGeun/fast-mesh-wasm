@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use fast_mesh_ops::repair::{FillContinuity, FillHolesOptions, FillStats, PartialBridgeOptions};
+use fast_mesh_ops::sculpt::{DyntopoMode, DyntopoOptions, DyntopoPatch};
 use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
@@ -26,15 +28,16 @@ use fast_mesh_scene::{
     FieldBudget, FieldId, GeodesicMethod, GeodesicOptions, IcpObjective, JoinOptions, LandmarkPair,
     MeshBuild, MeshId, MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane,
     QualityMetric, RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError,
-    SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
-    ThicknessField, TrimCurveOptions, UpdateMode, ops::BooleanOp as OpsBooleanOp,
+    SceneOptions, SceneRayOptions, SceneRepairOps as _, SectionDesc, SectionId, SectionStatus,
+    SignMode, StepState, ThicknessField, TrimCurveOptions, UpdateMode,
+    ops::BooleanOp as OpsBooleanOp,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
 
 use crate::edit::{
     RepairOp, count_opt, decode_edit, decode_repair, encode_added, encode_analysis, loop_id,
-    put_stretch, run_edit, run_repair,
+    opt_positive_f32, put_stretch, run_edit, run_repair,
 };
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
@@ -1017,29 +1020,7 @@ impl WasmScene {
         // One brush op alone runs as a dab, protected or not, its cost
         // following the brush region; in a list, the BVH cannot follow the ops
         // inside the one transaction, so they scan.
-        let dab_of = |op: &RepairOp| match op {
-            RepairOp::Inflate(o) => Some(Dab::Inflate(*o)),
-            RepairOp::Smooth(o) => Some(Dab::Smooth(*o)),
-            RepairOp::Grab(o) => Some(Dab::Grab(*o)),
-            RepairOp::Flatten(o) => Some(Dab::Flatten(*o)),
-            RepairOp::Crease(o) => Some(Dab::Crease(*o)),
-            RepairOp::Clay(o) => Some(Dab::Clay(*o)),
-            RepairOp::Twist(o) => Some(Dab::Twist(*o)),
-            _ => None,
-        };
-        let dab = match decoded.as_slice() {
-            [
-                RepairOp::Protected {
-                    vertices,
-                    weights,
-                    band,
-                    op,
-                },
-            ] => dab_of(op).map(|d| (d, vertices.as_slice(), weights.as_slice(), *band)),
-            [op] => dab_of(op).map(|d| (d, &[][..], &[][..], 0.0)),
-            _ => None,
-        };
-        if let Some((dab, vertices, weights, band)) = dab {
+        if let Some((dab, vertices, weights, band)) = extract_dab(&decoded) {
             let r = self
                 .scene
                 .dab_protected_band(id, &dab, vertices, weights, band)?;
@@ -1717,6 +1698,194 @@ impl WasmScene {
         Ok(out)
     }
 
+    // ---- Wave 5: Hole continuity (#210) & Dynamic topology (#212) ----
+
+    /// Fills boundary loop `loop_index` with selectable continuity (`0` flat,
+    /// `1` tangent G1, `2` curvature G2). `max_hole_perimeter`,
+    /// `max_hole_vertices`, and `smooth_iterations` accept `NaN` for defaults.
+    /// Returns `[loopIndex, filledVertices, filledTriangles, perimeter, maxDihedralAngleDeg, continuityCode, islandLoopsMerged, converged]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_hole_continuity(
+        &mut self,
+        index: u32,
+        generation: u32,
+        loop_index: u32,
+        continuity: u8,
+        max_hole_perimeter: f64,
+        max_hole_vertices: f64,
+        refine_patch: bool,
+        smooth_iterations: f64,
+        _detect_islands: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let options = parse_fill_holes_continuity_options(
+            continuity,
+            max_hole_perimeter,
+            max_hole_vertices,
+            refine_patch,
+            smooth_iterations,
+        )?;
+        let stats = self
+            .scene
+            .fill_hole_continuity(id, loop_index as usize, &options)?;
+        Ok(encode_fill_stats(&stats))
+    }
+
+    /// Fills all eligible boundary holes with selectable continuity (`0` flat,
+    /// `1` tangent G1, `2` curvature G2).
+    /// Returns aggregated `[loopIndex, filledVertices, filledTriangles, perimeter, maxDihedralAngleDeg, continuityCode, islandLoopsMerged, converged]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_all_holes_continuity(
+        &mut self,
+        index: u32,
+        generation: u32,
+        continuity: u8,
+        max_hole_perimeter: f64,
+        max_hole_vertices: f64,
+        refine_patch: bool,
+        smooth_iterations: f64,
+        _detect_islands: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let options = parse_fill_holes_continuity_options(
+            continuity,
+            max_hole_perimeter,
+            max_hole_vertices,
+            refine_patch,
+            smooth_iterations,
+        )?;
+        let stats = self.scene.fill_all_holes_continuity(id, &options)?;
+        Ok(encode_fill_stats(&stats))
+    }
+
+    /// Bridges two boundary arcs (resolved from `loop_a`/`loop_b` vertex lists
+    /// when non-empty, or by `loop_*_index` + `arc_*_start`/`arc_*_end`).
+    /// `subdivisions` accepts `NaN` for automatic matching.
+    /// Returns `[trianglesAdded, verticesAdded, resultingLoops, arcAVertices, arcBVertices]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bridge_partial_arcs(
+        &mut self,
+        index: u32,
+        generation: u32,
+        loop_a: &[u32],
+        loop_b: &[u32],
+        loop_a_index: u32,
+        arc_a_start: u32,
+        arc_a_end: u32,
+        loop_b_index: u32,
+        arc_b_start: u32,
+        arc_b_end: u32,
+        twist_offset: i32,
+        subdivisions: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let options = PartialBridgeOptions {
+            loop_a_index: loop_a_index as usize,
+            arc_a_range: (arc_a_start as usize, arc_a_end as usize),
+            loop_b_index: loop_b_index as usize,
+            arc_b_range: (arc_b_start as usize, arc_b_end as usize),
+            twist_offset: twist_offset as isize,
+            subdivisions: count_opt(subdivisions, "subdivisions")?,
+        };
+        let stats = self
+            .scene
+            .bridge_partial_arcs(id, loop_a, loop_b, &options)?;
+        Ok(vec![
+            len(stats.triangles_added),
+            len(stats.vertices_added),
+            len(stats.resulting_loops),
+            len(stats.arc_a_vertices),
+            len(stats.arc_b_vertices),
+        ])
+    }
+
+    /// Applies localized dynamic topology remeshing inside sphere `(center, radius)`.
+    /// `mode`: 0 split-collapse, 1 split-only, 2 brush-relative, 3 constant-detail.
+    /// Returns `[splits, collapses, flips, smoothed, newCount, removedCount, ...newVertices, ...removedVertices]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_dyntopo(
+        &mut self,
+        index: u32,
+        generation: u32,
+        center: &[f64],
+        radius: f64,
+        mode: u8,
+        detail_size: f64,
+        min_detail_ratio: f64,
+        max_detail_ratio: f64,
+        equalize_valence: bool,
+        smooth_tangent: bool,
+        pinned: &[u32],
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let c = vec3(center, "center must have 3 values")?;
+        if !c.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+            return Err(Error::invalid("center and radius must be finite"));
+        }
+        let options = parse_dyntopo_options(
+            mode,
+            detail_size,
+            min_detail_ratio,
+            max_detail_ratio,
+            equalize_valence,
+            smooth_tangent,
+        )?;
+        let patch = self.scene.apply_dyntopo_protected(
+            id,
+            [c[0] as f32, c[1] as f32, c[2] as f32],
+            radius as f32,
+            &options,
+            pinned,
+        )?;
+        let mut out =
+            Vec::with_capacity(6 + patch.new_vertices.len() + patch.removed_vertices.len());
+        encode_dyntopo_patch(&mut out, &patch);
+        Ok(out)
+    }
+
+    /// Applies localized dynamic topology remeshing followed by a brush dab
+    /// encoded in `ops` (single brush op with optional `protect` and
+    /// `brushModifiers` prefixes).
+    /// Returns `[moved, maxDisplacement, splits, collapses, flips, smoothed, newCount, removedCount, ...newVertices, ...removedVertices]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dyntopo_dab(
+        &mut self,
+        index: u32,
+        generation: u32,
+        ops: &[f64],
+        mode: u8,
+        detail_size: f64,
+        min_detail_ratio: f64,
+        max_detail_ratio: f64,
+        equalize_valence: bool,
+        smooth_tangent: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let options = parse_dyntopo_options(
+            mode,
+            detail_size,
+            min_detail_ratio,
+            max_detail_ratio,
+            equalize_valence,
+            smooth_tangent,
+        )?;
+        let decoded = decode_repair(ops, &[])?;
+        let Some((dab, vertices, weights, band)) = extract_dab(&decoded) else {
+            return Err(Error::invalid(
+                "dyntopoDab expects a single brush operation",
+            ));
+        };
+        let (patch, report) = self
+            .scene
+            .dyntopo_dab_protected_band(id, &dab, &options, vertices, weights, band)?;
+        let mut out =
+            Vec::with_capacity(8 + patch.new_vertices.len() + patch.removed_vertices.len());
+        out.push(count(report.moved));
+        out.push(f64::from(report.max_displacement));
+        encode_dyntopo_patch(&mut out, &patch);
+        Ok(out)
+    }
+
     // ---- Queries (world space) ----
 
     /// The nearest hit of a world ray over every mesh with
@@ -2390,6 +2559,147 @@ fn decode_csg_node(words: &[f64], cursor: &mut usize, depth: usize) -> Result<Cs
     } else {
         Err(Error::invalid("csg node tag must be 0 (leaf) or 1 (op)"))
     }
+}
+
+fn dab_of(op: &RepairOp) -> Option<Dab> {
+    match op {
+        RepairOp::Inflate(o) => Some(Dab::Inflate(*o)),
+        RepairOp::Smooth(o) => Some(Dab::Smooth(*o)),
+        RepairOp::Grab(o) => Some(Dab::Grab(*o)),
+        RepairOp::Flatten(o) => Some(Dab::Flatten(*o)),
+        RepairOp::Crease(o) => Some(Dab::Crease(*o)),
+        RepairOp::Clay(o) => Some(Dab::Clay(*o)),
+        RepairOp::Twist(o) => Some(Dab::Twist(*o)),
+        _ => None,
+    }
+}
+
+fn extract_dab(decoded: &[RepairOp]) -> Option<(Dab, &[u32], &[f32], f32)> {
+    match decoded {
+        [
+            RepairOp::Protected {
+                vertices,
+                weights,
+                band,
+                op,
+            },
+        ] => dab_of(op).map(|d| (d, vertices.as_slice(), weights.as_slice(), *band)),
+        [op] => dab_of(op).map(|d| (d, &[][..], &[][..], 0.0)),
+        _ => None,
+    }
+}
+
+fn parse_fill_continuity(code: u8) -> Result<FillContinuity, Error> {
+    match code {
+        0 => Ok(FillContinuity::Flat),
+        1 => Ok(FillContinuity::TangentG1),
+        2 => Ok(FillContinuity::CurvatureG2),
+        _ => Err(Error::invalid(
+            "continuity must be 0 (flat), 1 (tangent) or 2 (curvature)",
+        )),
+    }
+}
+
+fn fill_continuity_code(continuity: FillContinuity) -> f64 {
+    match continuity {
+        FillContinuity::Flat => 0.0,
+        FillContinuity::TangentG1 => 1.0,
+        FillContinuity::CurvatureG2 => 2.0,
+    }
+}
+
+fn parse_fill_holes_continuity_options(
+    continuity: u8,
+    max_hole_perimeter: f64,
+    max_hole_vertices: f64,
+    refine_patch: bool,
+    smooth_iterations: f64,
+) -> Result<FillHolesOptions, Error> {
+    let defaults = FillHolesOptions::default();
+    Ok(FillHolesOptions {
+        continuity: parse_fill_continuity(continuity)?,
+        max_hole_perimeter: opt_positive_f32(max_hole_perimeter, "maxHolePerimeter")?,
+        max_hole_vertices: count_opt(max_hole_vertices, "maxHoleVertices")?,
+        refine_patch,
+        smooth_iterations: count_opt(smooth_iterations, "smoothIterations")?
+            .unwrap_or(defaults.smooth_iterations),
+    })
+}
+
+fn encode_fill_stats(stats: &FillStats) -> Vec<f64> {
+    vec![
+        count(stats.loop_index),
+        count(stats.filled_vertices),
+        count(stats.filled_triangles),
+        stats.perimeter,
+        stats.max_dihedral_angle_deg,
+        fill_continuity_code(stats.continuity),
+        count(stats.island_loops_merged),
+        if stats.converged { 1.0 } else { 0.0 },
+    ]
+}
+
+fn opt_finite_f32(v: f64, default: f32, what: &str) -> Result<f32, Error> {
+    if v.is_nan() {
+        Ok(default)
+    } else if v.is_finite() {
+        let out = v as f32;
+        if !out.is_finite() {
+            return Err(Error::invalid(&format!("{what} out of f32 range")));
+        }
+        Ok(out)
+    } else {
+        Err(Error::invalid(&format!("{what} must be finite")))
+    }
+}
+
+fn parse_dyntopo_options(
+    mode: u8,
+    detail_size: f64,
+    min_detail_ratio: f64,
+    max_detail_ratio: f64,
+    equalize_valence: bool,
+    smooth_tangent: bool,
+) -> Result<DyntopoOptions, Error> {
+    let defaults = DyntopoOptions::default();
+    let mode = match mode {
+        0 => DyntopoMode::SplitCollapse,
+        1 => DyntopoMode::SplitOnly,
+        2 => DyntopoMode::BrushRelative,
+        3 => DyntopoMode::ConstantDetail,
+        _ => {
+            return Err(Error::invalid(
+                "mode must be 0 (split-collapse), 1 (split-only), 2 (brush-relative) or 3 (constant-detail)",
+            ));
+        }
+    };
+    Ok(DyntopoOptions {
+        mode,
+        detail_size: opt_finite_f32(detail_size, defaults.detail_size, "detailSize")?,
+        min_detail_ratio: opt_finite_f32(
+            min_detail_ratio,
+            defaults.min_detail_ratio,
+            "minDetailRatio",
+        )?,
+        max_detail_ratio: opt_finite_f32(
+            max_detail_ratio,
+            defaults.max_detail_ratio,
+            "maxDetailRatio",
+        )?,
+        equalize_valence,
+        smooth_tangent,
+    })
+}
+
+fn encode_dyntopo_patch(out: &mut Vec<f64>, patch: &DyntopoPatch) {
+    out.push(count(patch.splits));
+    out.push(count(patch.collapses));
+    out.push(count(patch.flips));
+    out.push(count(patch.smoothed));
+    out.push(count(patch.new_vertices.len()));
+    out.push(count(patch.removed_vertices.len()));
+    out.extend(patch.new_vertices.iter().map(|&v| f64::from(v)));
+    out.extend(patch.removed_vertices.iter().map(|&v| f64::from(v)));
 }
 
 #[cfg(test)]
@@ -3864,5 +4174,124 @@ mod tests {
             .unwrap();
         assert_eq!(tr.len(), 6);
         assert!(tr[3] > 0);
+    }
+
+    #[test]
+    fn wave5_continuity_fill_bridge_and_dyntopo_roundtrip() {
+        let mut s = WasmScene::new();
+
+        // 4x4 planar grid missing the center quad -> outer rim + 4-vertex inner hole.
+        let mut positions = Vec::new();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                positions.extend_from_slice(&[x as f64, y as f64, 0.0]);
+            }
+        }
+        let mut indices = Vec::new();
+        for y in 0..3u32 {
+            for x in 0..3u32 {
+                if x == 1 && y == 1 {
+                    continue;
+                }
+                let v0 = y * 4 + x;
+                let v1 = v0 + 1;
+                let v2 = v0 + 5;
+                let v3 = v0 + 4;
+                indices.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+            }
+        }
+        let grid = s.add_mesh(&positions, &indices, None, 0, false).unwrap();
+        let gid = s.id(grid[0], grid[1]).unwrap();
+        let loops = fast_mesh_ops::boundary_loops(s.scene.mesh(gid).unwrap()).unwrap();
+        let inner_idx = loops.iter().position(|l| l.vertices.len() == 4).unwrap() as u32;
+        let inner_verts = loops[inner_idx as usize].vertices.clone();
+        let initial_tris = s.scene.mesh(gid).unwrap().triangle_count();
+        let fill_stats = s
+            .fill_hole_continuity(
+                grid[0],
+                grid[1],
+                inner_idx,
+                2,
+                f64::NAN,
+                f64::NAN,
+                true,
+                1.0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(fill_stats.len(), 8);
+        assert!(fill_stats[2] > 0.0);
+        assert_eq!(fill_stats[5], 2.0);
+        assert!(s.scene.mesh(gid).unwrap().triangle_count() > initial_tris);
+
+        s.undo().unwrap();
+        assert_eq!(s.scene.mesh(gid).unwrap().triangle_count(), initial_tris);
+
+        let fill_all = s
+            .fill_all_holes_continuity(grid[0], grid[1], 1, f64::NAN, f64::NAN, false, 0.0, true)
+            .unwrap();
+        assert_eq!(fill_all.len(), 8);
+        assert_eq!(fill_all[5], 1.0);
+        assert!(fill_all[2] >= 2.0);
+
+        s.undo().unwrap();
+        let bridged = s
+            .bridge_partial_arcs(
+                grid[0],
+                grid[1],
+                &inner_verts[0..2],
+                &inner_verts[2..4],
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                f64::NAN,
+            )
+            .unwrap();
+        assert_eq!(bridged.len(), 5);
+        assert!(bridged[0] > 0);
+
+        // Localized dyntopo + dyntopo_dab + stroke undo coalescing.
+        let sheet = s
+            .add_mesh(
+                &[0., 0., 0., 4., 0., 0., 4., 4., 0., 0., 4., 0.],
+                &[0, 1, 2, 0, 2, 3],
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        let patch = s
+            .apply_dyntopo(
+                sheet[0],
+                sheet[1],
+                &[2.0, 2.0, 0.0],
+                4.0,
+                1,
+                0.75,
+                0.35,
+                1.2,
+                true,
+                false,
+                &[],
+            )
+            .unwrap();
+        assert!(patch.len() >= 6);
+        assert!(patch[0] > 0.0);
+
+        s.begin_step();
+        let dab_ops = [5.0, 2.0, 2.0, 0.0, 2.0, 1.0, 0.25, 0.0];
+        let dab_res = s
+            .dyntopo_dab(
+                sheet[0], sheet[1], &dab_ops, 2, 0.25, 0.4, 1.33, true, false,
+            )
+            .unwrap();
+        assert!(dab_res.len() >= 8);
+        assert_eq!(dab_res[6] as usize + dab_res[7] as usize + 8, dab_res.len());
+        s.end_step().unwrap();
+        s.undo().unwrap();
     }
 }

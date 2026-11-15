@@ -316,8 +316,9 @@ describe("surface remesh and extended simplify (#208 & #211)", () => {
     expect(creaseReport.collapsed).toBeGreaterThan(0);
     expect(s.inspect.analyze(mBox).nonManifoldEdges).toBe(0);
     const bounds = s.inspect.bounds(mBox);
-    expect(bounds.min).toEqual([-1, -1, -1]);
-    expect(bounds.max).toEqual([1, 1, 1]);
+    expect(bounds).not.toBeNull();
+    expect(bounds!.min).toEqual([-1, -1, -1]);
+    expect(bounds!.max).toEqual([1, 1, 1]);
   });
 
   it("rejects invalid surface remesh and simplify arguments cleanly", () => {

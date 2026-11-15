@@ -76,6 +76,7 @@ export {
   type InflateOp,
   type RelaxOp,
   type SculptBackend,
+  type SculptDabOptions,
   type SculptDomain,
   type SculptReturn,
   type SmoothOp,
