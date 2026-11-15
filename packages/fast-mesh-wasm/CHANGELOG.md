@@ -1,5 +1,23 @@
 # fast-mesh-wasm
 
+## 0.8.0
+
+### Minor Changes
+
+- [#225](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/225) [`be71ade`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/be71ade0675a358b6710d9c32fc92d99fc9e26dd) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add Botsch-Kobbelt isotropic and curvature-adaptive surface remeshing (`Scene.remesh.isotropic`, `Scene.remesh.adaptive`, `Scene.remesh.surface`, and `{ op: "remeshSurface", ... }`) plus attribute-aware, error-bounded, and crease-locked QEM decimation (`targetRatio`, `maxDeviation`, `preserveUvs`, `lockCreases`, `creaseAngleDeg`, `preventNormalInversion`, and `maxDeviationAchieved`) across `Scene` and `WorkerScene`.
+
+- [#241](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/241) [`589c957`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/589c957d7958d7dd2d7d60fbe943f8fd0b750272) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Add nested step/stroke undo coalescing on `WorkerScene` and `SceneStore` (`beginStep`, `endStep`, `cancelStep`, ordered worker step RPCs, and React `useHistory` controls), plus Wasm/SDK/Worker bindings for manifold/CSG boolean options (`boolean`, `booleanBatch`, `cutByPlane`), printability/quality inspection (`overhangs`, `triangleQuality`, `meshDeviation`), geodesic distances and surface paths (`geodesicDistances`, `shortestSurfacePath`), conformal curve trimming (`trimByCurve`), and multi-stage registration and symmetry detection (`alignByLandmarks`, `registerMultistage`, `detectSymmetryPlane`).
+
+- [#247](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/247) [`7c091de`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/7c091de9affe2847f5a1c653858063f1a8304402) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Expose selectable continuity hole filling (G0/G1/G2, patch refinement, nested island detection) and partial arc bridging ([#210](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/210)), plus localized dynamic topology sculpting (`applyDyntopo`, `dyntopoDab`, and `SculptDomain` configuration) ([#212](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/212)) across Wasm FFI, TypeScript SDK, Worker client, and Showcase.
+
+- [#248](https://github.com/YoonDongGeun/fast-mesh-wasm/pull/248) [`11a832f`](https://github.com/YoonDongGeun/fast-mesh-wasm/commit/11a832f5860eada85da649f8f54544a0637dff99) Thanks [@YoonDongGeun](https://github.com/YoonDongGeun)! - Ship Wave 6 end-to-end Scene, Wasm FFI, TypeScript SDK, Worker client, domain facade, and Showcase UI workflows:
+  
+  - Interactive face selection (lasso, box, brush, crease, shell, topological grow/shrink/invert/holes/smooth/islands, mask bridge, and extract/split/delete) ([#233](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/233))
+  - Free-form deformation engines (FFD B-spline/Bezier lattices, ARAP handles, Elastic Kelvinlets, and XPBD cloth/elastic with vertex protection and self-collision avoidance) ([#193](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/193))
+  - Inter-object collision response modes (`passThrough`, `rigid`, `cut`, `softDeform`) integrated into interactive `drag`, `moveWithCollision`, and pair/group rules ([#194](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/194))
+  - Geometric primitive fitting (plane, sphere, cylinder, cone), datum alignment, section contours (SVG/JSON/CSV/DXF export), and point cloud parsing/filtering/normal estimation/surface reconstruction ([#234](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/234))
+  - SDF hollowing, chamfered drain-hole punching with removable plugs, and surface-aligned `placeMesh` stamping ([#236](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/236))
+
 ## 0.7.0
 
 ### Minor Changes
