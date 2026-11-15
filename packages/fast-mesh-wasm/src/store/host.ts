@@ -43,6 +43,9 @@ export interface Host {
   verticesInSphere(mesh: MeshHandle, center: Readonly<Vec3>, radius: number): Promise<Uint32Array>;
   undo(): void;
   redo(): void;
+  beginStep(): void;
+  endStep(): void;
+  cancelStep(): void;
   canUndo(): boolean;
   canRedo(): boolean;
   /** The state of a request key (`mesh:<id>`, `display:<id>`, ...). */
@@ -158,6 +161,9 @@ export function localHost(scene: Scene): Host {
     redo: () => {
       scene.redo();
     },
+    beginStep: () => scene.beginStep(),
+    endStep: () => scene.endStep(),
+    cancelStep: () => scene.cancelStep(),
     canUndo: () => scene.canUndo(),
     canRedo: () => scene.canRedo(),
     status: (key) => {
@@ -216,6 +222,9 @@ export function workerHost(scene: WorkerScene): Host {
     verticesInSphere: (mesh, center, radius) => scene.verticesInSphere(mesh, center, radius),
     undo: () => scene.undo(),
     redo: () => scene.redo(),
+    beginStep: () => scene.beginStep(),
+    endStep: () => scene.endStep(),
+    cancelStep: () => scene.cancelStep(),
     canUndo: () => scene.canUndo,
     canRedo: () => scene.canRedo,
     status: (key) => {

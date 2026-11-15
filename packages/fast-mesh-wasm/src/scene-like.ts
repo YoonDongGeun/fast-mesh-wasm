@@ -67,6 +67,12 @@ export interface SceneLike extends SceneDomainsLike {
   /** Flushes pending changes to the listeners and returns them. */
   commitFrame(): MeshChange[];
   drag(mesh: MeshHandle): DragSession;
+  /** Opens a nested history step when supported by the scene host. */
+  beginStep?(): void;
+  /** Ends one open history step nesting level when supported by the scene host. */
+  endStep?(): void;
+  /** Cancels and reverts the active history step when supported by the scene host. */
+  cancelStep?(): void;
   /**
    * The rule the mesh is coloured by, or `null` without colouring. Optional:
    * `bindMesh`'s fragment shading needs it (with `views(mesh).values`) and

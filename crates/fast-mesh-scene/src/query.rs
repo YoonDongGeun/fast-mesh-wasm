@@ -13,10 +13,15 @@
 //! something in.
 
 use fast_mesh_bvh::{Aabb, Bvh};
-use fast_mesh_query::{ClosestHit, ClosestOptions, Cull, Ray, RayHit, RayOptions, Rigid};
+pub use fast_mesh_query::SurfacePathPoint;
+use fast_mesh_query::{
+    ClosestHit, ClosestOptions, Cull, Ray, RayHit, RayOptions, Rigid,
+    shortest_surface_path as query_shortest_surface_path,
+};
 use fast_mesh_store::{Mesh, StoreError, TriangleId};
 
 use crate::baked::baked_mesh;
+use crate::fields::baked_world_mesh;
 use crate::placement::{is_relative_rigid, local_to_world, relative_rigid, world_to_local};
 use crate::scene::Entry;
 use crate::{MeshId, Placement, Result, Scene, SceneError};
@@ -1011,6 +1016,59 @@ impl Scene {
             round_up(margin / s),
             out_a,
             out_b,
+        )?)
+    }
+
+    /// Extracts the intrinsic shortest path along mesh `id` from `sources` to
+    /// `target_vertex` following gradient descent on `distances` (such as
+    /// computed by [`Scene::geodesic_distances`]).
+    ///
+    /// Appends [`SurfacePathPoint`] samples ordered from the reached source to
+    /// `target_vertex`, with `position` mapped into world space. Does not
+    /// modify the scene or its history.
+    pub fn shortest_surface_path(
+        &self,
+        id: MeshId,
+        distances: &[f32],
+        sources: &[u32],
+        target_vertex: u32,
+        out: &mut Vec<SurfacePathPoint>,
+    ) -> Result<()> {
+        let entry = self.entry(id)?;
+        let orig_len = out.len();
+        if let Some(s) = entry.placement.uniform_scale() {
+            if s == 1.0 {
+                query_shortest_surface_path(&entry.mesh, distances, sources, target_vertex, out)?;
+            } else {
+                let mut local_dist = Vec::new();
+                local_dist
+                    .try_reserve_exact(distances.len())
+                    .map_err(|_| SceneError::Store(StoreError::OutOfMemory))?;
+                for &d in distances {
+                    let scaled = if d.is_finite() && d >= 0.0 {
+                        (f64::from(d) / s) as f32
+                    } else {
+                        d
+                    };
+                    local_dist.push(scaled);
+                }
+                query_shortest_surface_path(&entry.mesh, &local_dist, sources, target_vertex, out)?;
+            }
+            let origin = entry.mesh.origin();
+            for pt in &mut out[orig_len..] {
+                let w = local_to_world(&entry.placement, origin, pt.position.map(f64::from));
+                pt.position = w.map(|c| c as f32);
+            }
+            return Ok(());
+        }
+
+        let (baked, _) = baked_world_mesh(entry)?;
+        Ok(query_shortest_surface_path(
+            &baked,
+            distances,
+            sources,
+            target_vertex,
+            out,
         )?)
     }
 }
@@ -2248,5 +2306,66 @@ pub(crate) mod tests {
         scene.triangles_near(b, b, 0.0, &mut sa, &mut sb).unwrap();
         let n = scene.mesh(b).unwrap().triangle_count();
         assert_eq!((sa.len(), sb.len()), (n, n));
+    }
+
+    #[test]
+    fn shortest_surface_path_maps_world_placement() {
+        use crate::{GeodesicMethod, GeodesicOptions};
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene
+            .add_mesh(
+                cube([-1.0, -1.0, -1.0], 2.0),
+                MeshOptions {
+                    placement: Placement {
+                        rotation: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                        translation: [5.0, -2.0, 1.0],
+                        scale: [2.0, 2.0, 2.0],
+                    },
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        let mut dist = Vec::new();
+        scene
+            .geodesic_distances(
+                id,
+                &[0],
+                &GeodesicOptions {
+                    method: GeodesicMethod::Dijkstra,
+                    max_distance: None,
+                    time_step_scale: 1.0,
+                },
+                &mut dist,
+            )
+            .unwrap();
+        let target_v = (0..scene.mesh(id).unwrap().vertex_slots() as u32)
+            .max_by(|&a, &b| dist[a as usize].total_cmp(&dist[b as usize]))
+            .unwrap();
+        let mut path = Vec::new();
+        scene
+            .shortest_surface_path(id, &dist, &[0], target_v, &mut path)
+            .unwrap();
+        assert!(path.len() >= 2);
+        let expected_start = scene
+            .local_to_world(
+                id,
+                scene.mesh(id).unwrap().position(0).unwrap().map(f64::from),
+            )
+            .unwrap();
+        let expected_end = scene
+            .local_to_world(
+                id,
+                scene
+                    .mesh(id)
+                    .unwrap()
+                    .position(target_v)
+                    .unwrap()
+                    .map(f64::from),
+            )
+            .unwrap();
+        for i in 0..3 {
+            assert!((f64::from(path[0].position[i]) - expected_start[i]).abs() < 1e-4);
+            assert!((f64::from(path.last().unwrap().position[i]) - expected_end[i]).abs() < 1e-4);
+        }
     }
 }

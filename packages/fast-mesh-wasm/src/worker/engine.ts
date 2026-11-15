@@ -547,6 +547,8 @@ class Engine {
   readonly #goneEntries: { section: ClientId; mesh: ClientId }[] = [];
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]> } | undefined;
+  /** Mirrors `this.#scene`'s open step depth so step/drag/inSteps invariants stay aligned. */
+  #stepDepth = 0;
   readonly #debug: boolean;
   readonly #onChunk: EngineOptions["onChunk"];
   readonly #tick = messageTick();
@@ -872,16 +874,22 @@ class Engine {
     switch (req.kind) {
       case "addMesh":
       case "removeMesh":
+      case "booleanBatch":
+      case "cutByPlane":
         return true;
       case "compact":
       case "setPlacement":
       case "drag":
       case "edit":
       case "repair":
+      case "trimByCurve":
         return this.#pending(req.id);
       case "join":
+      case "boolean":
         return this.#pending(req.target, req.source);
       case "register":
+      case "alignByLandmarks":
+      case "registerMultistage":
         return this.#pending(req.moving, req.fixed);
       case "coloring":
         return this.#pending(req.id) || (req.rule !== null && this.#fieldPending(req.rule?.field));
@@ -898,6 +906,8 @@ class Engine {
           a?: ClientId;
           b?: ClientId;
           mesh?: ClientId;
+          source?: ClientId;
+          target?: ClientId;
           field?: ClientId;
           options?: { mesh?: ClientId };
           pairs?: [ClientId, ClientId][];
@@ -914,7 +924,7 @@ class Engine {
           case "findContacts":
             return a.pairs === undefined || this.#pending(...a.pairs.flat());
           default:
-            return this.#pending(a.a, a.b, a.mesh);
+            return this.#pending(a.a, a.b, a.mesh, a.source, a.target);
         }
       }
       default:
@@ -975,8 +985,12 @@ class Engine {
       case "edit":
       case "repair":
       case "compact":
+      case "cutByPlane":
+      case "trimByCurve":
       case "removeMesh":
         return req.id === id;
+      case "boolean":
+        return req.target === id;
       case "join":
         return req.target === id || req.source === id;
       case "undo":
@@ -1280,11 +1294,17 @@ class Engine {
       case "edit":
       case "repair":
       case "compact":
+      case "cutByPlane":
+      case "trimByCurve":
       case "removeMesh":
         return meshes.has(req.id);
+      case "boolean":
+        return meshes.has(req.target);
       case "join":
         return meshes.has(req.target) || meshes.has(req.source);
       case "register":
+      case "alignByLandmarks":
+      case "registerMultistage":
         return meshes.has(req.moving);
       case "undo":
       case "redo":
@@ -1481,6 +1501,7 @@ class Engine {
         return name === "captureRestSizes" || name === "captureStrokeState";
       }) &&
       this.#drag === undefined &&
+      this.#stepDepth === 0 &&
       !this.#scene.canRedo()
     );
   }
@@ -1718,6 +1739,63 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "boolean": {
+        s.boolean(this.#mesh(req.target), this.#mesh(req.source), req.payload.op, req.payload);
+        b.replies.push({ qid: req.qid, ok: true, value: undefined });
+        return;
+      }
+      case "booleanBatch": {
+        if (this.#meshes.has(req.addedId) || this.#adds.some((a) => a.id === req.addedId)) {
+          throw invalid(`mesh client id ${req.addedId} is already in use`);
+        }
+        const added = s.booleanBatch(this.#meshList(req.meshes), req.tree, req.options);
+        this.#meshes.set(req.addedId, added);
+        this.#meshIds.set(added, req.addedId);
+        b.replies.push({ qid: req.qid, ok: true, value: undefined });
+        return;
+      }
+      case "cutByPlane": {
+        if (this.#meshes.has(req.addedId) || this.#adds.some((a) => a.id === req.addedId)) {
+          throw invalid(`mesh client id ${req.addedId} is already in use`);
+        }
+        const r = s.cutByPlane(this.#mesh(req.id), req.plane, { cap: req.cap });
+        this.#meshes.set(req.addedId, r.removed);
+        this.#meshIds.set(r.removed, req.addedId);
+        b.replies.push({
+          qid: req.qid,
+          ok: true,
+          value: {
+            keptTriangles: r.keptTriangles,
+            removedTriangles: r.removedTriangles,
+            capTriangles: r.capTriangles,
+          },
+        });
+        return;
+      }
+      case "trimByCurve": {
+        const r = s.trimByCurve(this.#mesh(req.id), req.payload);
+        b.replies.push({
+          qid: req.qid,
+          ok: true,
+          value: {
+            trianglesAdded: r.trianglesAdded,
+            trianglesRemoved: r.trianglesRemoved,
+            verticesAdded: r.verticesAdded,
+            seamEdges: r.seamEdges,
+          },
+        });
+        return;
+      }
+      case "alignByLandmarks": {
+        const value = s.alignByLandmarks(this.#mesh(req.moving), this.#mesh(req.fixed), req.pairs, req.allowScaling);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "registerMultistage": {
+        const value = s.registerMultistage(this.#mesh(req.moving), this.#mesh(req.fixed), req.payload);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "fieldInteraction":
         s.setFieldInteraction(req.points);
         return;
@@ -1750,9 +1828,17 @@ class Engine {
       }
       case "undo":
         s.undo();
+        this.#stepDepth = 0;
+        if (this.#drag !== undefined && !this.#drag.session.active) {
+          this.#drag = undefined;
+        }
         return;
       case "redo":
         s.redo();
+        this.#stepDepth = 0;
+        if (this.#drag !== undefined && !this.#drag.session.active) {
+          this.#drag = undefined;
+        }
         return;
       case "clearHistory":
         if (this.#drag !== undefined) {
@@ -1761,7 +1847,30 @@ class Engine {
           this.#drag = undefined;
         }
         s.clearHistory();
+        this.#stepDepth = 0;
         return;
+      case "step":
+        switch (req.phase) {
+          case "begin":
+            s.beginStep();
+            this.#stepDepth++;
+            return;
+          case "end":
+            s.endStep();
+            this.#stepDepth = Math.max(0, this.#stepDepth - 1);
+            if (this.#drag !== undefined && !this.#drag.session.active) {
+              this.#drag = undefined;
+            }
+            return;
+          case "cancel":
+            s.cancelStep();
+            this.#stepDepth = 0;
+            if (this.#drag !== undefined && !this.#drag.session.active) {
+              this.#drag = undefined;
+            }
+            return;
+        }
+        throw invalid(`unknown step phase ${(req as { phase: unknown }).phase}`);
       case "coloring":
         s.setColoring(this.#mesh(req.id), req.rule === null ? null : this.#rule(req.rule));
         b.colorings.push({ id: req.id, rev: req.rev });
@@ -1787,8 +1896,24 @@ class Engine {
         }
         const value = this.#query(req.name, req.args);
         b.replies.push({ qid: req.qid, ok: true, value });
-        if (req.name === "verticesInSphere" && value instanceof Uint32Array) {
-          b.transfer.push(value.buffer);
+        const pushOwned = (view: unknown) => {
+          if (
+            ArrayBuffer.isView(view) &&
+            view.byteOffset === 0 &&
+            view.byteLength === view.buffer.byteLength &&
+            view.buffer instanceof ArrayBuffer
+          ) {
+            b.transfer.push(view.buffer);
+          }
+        };
+        if (req.name === "verticesInSphere" || req.name === "geodesicDistances") {
+          pushOwned(value);
+        } else if (req.name === "overhangs") {
+          pushOwned((value as QueryMap["overhangs"]["value"]).vertexAnglesDeg);
+        } else if (req.name === "triangleQuality") {
+          pushOwned((value as QueryMap["triangleQuality"]["value"]).vertexQuality);
+        } else if (req.name === "meshDeviation") {
+          pushOwned((value as QueryMap["meshDeviation"]["value"]).vertexDeviations);
         }
         return;
       }
@@ -1978,6 +2103,30 @@ class Engine {
         const a = args as QueryMap["sectionGap"]["args"];
         return s.sectionGap(this.#section(a.section), this.#mesh(a.a), this.#mesh(a.b));
       }
+      case "overhangs": {
+        const a = args as QueryMap["overhangs"]["args"];
+        return s.overhangs(this.#mesh(a.mesh), a.options);
+      }
+      case "triangleQuality": {
+        const a = args as QueryMap["triangleQuality"]["args"];
+        return s.triangleQuality(this.#mesh(a.mesh), a.metric, a.sliverThreshold);
+      }
+      case "meshDeviation": {
+        const a = args as QueryMap["meshDeviation"]["args"];
+        return s.meshDeviation(this.#mesh(a.source), this.#mesh(a.target), a.options);
+      }
+      case "geodesicDistances": {
+        const a = args as QueryMap["geodesicDistances"]["args"];
+        return s.geodesicDistances(this.#mesh(a.mesh), a.sources, a.options);
+      }
+      case "shortestSurfacePath": {
+        const a = args as QueryMap["shortestSurfacePath"]["args"];
+        return s.shortestSurfacePath(this.#mesh(a.mesh), a.sources, a.targetVertex, a.options);
+      }
+      case "detectSymmetryPlane": {
+        const a = args as QueryMap["detectSymmetryPlane"]["args"];
+        return s.detectSymmetryPlane(this.#mesh(a.mesh));
+      }
       case "debugDump": {
         if (!this.#debug) {
           throw invalid(`unknown query ${name}`);
@@ -2140,6 +2289,9 @@ class Engine {
     };
     if (c.removed) {
       return wire;
+    }
+    if (c.added) {
+      wire.origin = this.#scene.origin(c.mesh);
     }
     wire.vertexSlots = this.#scene.vertexSlots(c.mesh);
     wire.triangleSlots = this.#scene.triangleSlots(c.mesh);

@@ -4,18 +4,32 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import type { NormalizedBooleanOptions } from "../options.js";
 import type {
   AddMeshOptions,
   AnalyzeOptions,
+  AutoRepairRequest,
   ColorRule,
+  CsgNode,
+  DeviationOptions,
+  DeviationStats,
   DistanceFieldDesc,
   EditOp,
+  GeodesicOptions,
+  LandmarkPair,
   MeasureResult,
+  OverhangOptions,
+  OverhangReport,
+  QualityMetric,
+  QualityReport,
   RaycastOptions,
-  AutoRepairRequest,
+  RegistrationOptions,
   RepairOp,
   SectionPlane,
   SectionResult,
+  SurfacePathOptions,
+  SurfacePathPoint,
+  SymmetryPlaneReport,
 } from "../scene.js";
 
 /** A mesh, field or section id allocated on the main side. Unique per kind. */
@@ -127,6 +141,64 @@ export type Request =
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }
+  /** Opens, closes, or cancels a history step matching `Scene.beginStep`/`endStep`/`cancelStep`. */
+  | { kind: "step"; rev: number; phase: "begin" | "end" | "cancel" }
+  | {
+      kind: "boolean";
+      rev: number;
+      target: ClientId;
+      source: ClientId;
+      payload: NormalizedBooleanOptions;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "booleanBatch";
+      rev: number;
+      meshes: ClientId[];
+      tree: CsgNode;
+      options: NormalizedBooleanOptions;
+      addedId: ClientId;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "cutByPlane";
+      rev: number;
+      id: ClientId;
+      addedId: ClientId;
+      plane: SectionPlane;
+      cap: boolean;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "trimByCurve";
+      rev: number;
+      id: ClientId;
+      payload: { points: Vec3[]; closed: boolean; deleteInside: boolean; snapTolerance?: number };
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "alignByLandmarks";
+      rev: number;
+      moving: ClientId;
+      fixed: ClientId;
+      pairs: LandmarkPair[];
+      allowScaling: boolean;
+      qid: number;
+      key?: string;
+    }
+  | {
+      kind: "registerMultistage";
+      rev: number;
+      moving: ClientId;
+      fixed: ClientId;
+      payload: RegistrationOptions;
+      qid: number;
+      key?: string;
+    }
   | { kind: "coloring"; rev: number; id: ClientId; rule: ColorRuleWire | null; key: string }
   /**
    * Turns on the mirror of the colours' values (`views(mesh).values()`):
@@ -191,6 +263,15 @@ export interface QueryMap {
     args: { section: ClientId; a: ClientId; b: ClientId };
     value: { distance: number; a: Vec3; b: Vec3 } | null;
   };
+  overhangs: { args: { mesh: ClientId; options?: OverhangOptions }; value: OverhangReport };
+  triangleQuality: { args: { mesh: ClientId; metric: QualityMetric; sliverThreshold: number }; value: QualityReport };
+  meshDeviation: { args: { source: ClientId; target: ClientId; options?: DeviationOptions }; value: DeviationStats };
+  geodesicDistances: { args: { mesh: ClientId; sources: number[]; options?: GeodesicOptions }; value: Float32Array };
+  shortestSurfacePath: {
+    args: { mesh: ClientId; sources: number[]; targetVertex: number; options?: SurfacePathOptions };
+    value: SurfacePathPoint[];
+  };
+  detectSymmetryPlane: { args: { mesh: ClientId }; value: SymmetryPlaneReport };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
   debugDump: {
     args: { mesh: ClientId };
@@ -240,6 +321,8 @@ export interface MeshChangeWire {
   /** Slot counts after the change; 0 for a removed mesh. */
   vertexSlots: number;
   triangleSlots: number;
+  /** World origin when `added` is true (so Worker-created meshes mirror `origin()`). */
+  origin?: Vec3;
   /** Local-render bounds after a geometry change; omitted when geometry is unchanged. */
   bounds?: Bounds | null;
   bytes: {
@@ -374,9 +457,17 @@ export function keyOf(req: Request): string | undefined {
     case "compact":
     case "edit":
     case "repair":
+    case "cutByPlane":
+    case "trimByCurve":
       return `edit:${req.id}`;
     case "join":
+    case "boolean":
       return `edit:${req.target}`;
+    case "booleanBatch":
+      return `mesh:${req.addedId}`;
+    case "alignByLandmarks":
+    case "registerMultistage":
+      return `placement:${req.moving}`;
     case "undo":
     case "redo":
     case "clearHistory":

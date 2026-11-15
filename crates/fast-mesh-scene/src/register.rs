@@ -6,8 +6,11 @@
 //! are world distances.
 
 use fast_mesh_bvh::Bvh;
+pub use fast_mesh_ops::align::{
+    CoarseAlignMethod, IcpObjective, LandmarkAlignment, LandmarkPair, RegistrationOptions,
+    RegistrationReport, SymmetryPlaneReport,
+};
 use fast_mesh_ops::align::{
-    LandmarkAlignment, LandmarkPair, RegistrationOptions, RegistrationReport, SymmetryPlaneReport,
     align_landmarks, detect_symmetry_plane, motion_to_rigid, register_multistage, rigid_to_matrix4,
     rigid_to_motion,
 };

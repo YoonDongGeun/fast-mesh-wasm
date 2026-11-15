@@ -453,7 +453,15 @@ describe("fast-mesh-wasm/react", () => {
   });
 
   it("history_controls_stable", () => {
-    const { store, a } = setup();
+    const scene = new Scene();
+    const store = createSceneStore(scene);
+    disposers.push(() => {
+      store.dispose();
+      scene.free();
+    });
+    const t = tetra();
+    const a = store.addMesh(t.positions, t.indices);
+    store.commitFrame();
     const seen: ReturnType<typeof useHistory>[] = [];
     function Spy() {
       seen.push(useHistory());
@@ -475,6 +483,34 @@ describe("fast-mesh-wasm/react", () => {
     // The actions keep their identity across a history change.
     expect(last.undo).toBe(first.undo);
     expect(last.redo).toBe(first.redo);
+    expect(last.beginStep).toBe(first.beginStep);
+    expect(last.endStep).toBe(first.endStep);
+    expect(last.cancelStep).toBe(first.cancelStep);
+
+    // Step controls coalesce placements and reactively flip canUndo on endStep/cancelStep.
+    act(() => {
+      last.beginStep();
+      store.setPlacement(a, { rotation: IDENTITY, translation: [2, 0, 0] });
+      store.setPlacement(a, { rotation: IDENTITY, translation: [3, 0, 0] });
+      last.cancelStep();
+      store.commitFrame();
+    });
+    expect(seen.at(-1)?.canUndo).toBe(true);
+    expect(scene.placement(a).translation).toEqual([1, 0, 0]);
+
+    act(() => {
+      last.beginStep();
+      store.setPlacement(a, { rotation: IDENTITY, translation: [4, 0, 0] });
+      store.setPlacement(a, { rotation: IDENTITY, translation: [5, 0, 0] });
+      last.endStep();
+      store.commitFrame();
+    });
+    expect(scene.placement(a).translation).toEqual([5, 0, 0]);
+    act(() => {
+      last.undo();
+      store.commitFrame();
+    });
+    expect(scene.placement(a).translation).toEqual([1, 0, 0]);
   });
 
   it("inline_selector_keeps_identity", () => {

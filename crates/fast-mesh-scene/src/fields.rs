@@ -71,12 +71,19 @@
 use fast_mesh_bvh::Bvh;
 use fast_mesh_fields::{
     ColorRule, FieldsError, SignBuild, SignData, SignMode, SignStatus, Target, color_of,
-    curvatures, signed_distances, signed_distances_multi, thicknesses,
+    curvatures, geodesic_distances as field_geodesic_distances,
+    mesh_deviation as field_mesh_deviation, overhangs as field_overhangs, signed_distances,
+    signed_distances_multi, thicknesses, triangle_quality as field_triangle_quality,
+};
+pub use fast_mesh_fields::{
+    DeviationOptions, DeviationStats, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions,
+    OverhangOptions, OverhangReport, QualityMetric, QualityReport,
 };
 use fast_mesh_query::{NearSearch, Rigid};
 use fast_mesh_store::{ChangeSet, ChannelDesc, Mesh, StoreError, TriangleId, VertexId, par};
 
 use crate::baked::baked_mesh;
+use crate::placement::{is_relative_rigid, local_to_world, relative_rigid};
 
 use crate::query::round_up;
 use crate::scene::{Entry, FIELD_PREFIX};
@@ -3932,6 +3939,298 @@ pub(crate) mod counter {
     }
 }
 
+pub(crate) fn baked_world_mesh(entry: &Entry) -> Result<(Mesh, Bvh)> {
+    let placement = entry.placement;
+    let origin = entry.mesh.origin();
+    baked_mesh(
+        &entry.mesh,
+        |l| local_to_world(&placement, origin, l.map(f64::from)),
+        entry.bvh.options(),
+    )
+}
+
+fn scale_finite_values(values: &mut [f32], scale: f64) {
+    for v in values {
+        if v.is_finite() {
+            *v = (f64::from(*v) * scale) as f32;
+        }
+    }
+}
+
+fn scale_deviation_stats(mut stats: DeviationStats, scale: f64) -> DeviationStats {
+    if stats.sample_count > 0 {
+        let s = scale as f32;
+        stats.min *= s;
+        stats.max *= s;
+        stats.mean *= s;
+        stats.rms *= s;
+        stats.p95 *= s;
+    }
+    stats
+}
+
+impl Scene {
+    /// Computes printability overhang angles on mesh `id` relative to the
+    /// world-space upward `options.build_direction`.
+    ///
+    /// Writes per-vertex area-weighted overhang angles (degrees, aligned with
+    /// vertex slot indices) into `vertex_angles_deg` and returns [`OverhangReport`]
+    /// with `total_support_area` in world square units. Does not modify the
+    /// scene or its history.
+    pub fn overhangs(
+        &self,
+        id: MeshId,
+        options: &OverhangOptions,
+        vertex_angles_deg: &mut Vec<f32>,
+    ) -> Result<OverhangReport> {
+        let entry = self.entry(id)?;
+        if let Some(s) = entry.placement.uniform_scale() {
+            let d = options.build_direction;
+            let local_dir = if d.iter().all(|c| c.is_finite()) {
+                let r = &entry.placement.rotation;
+                let ld = [
+                    r[0][0] * f64::from(d[0])
+                        + r[1][0] * f64::from(d[1])
+                        + r[2][0] * f64::from(d[2]),
+                    r[0][1] * f64::from(d[0])
+                        + r[1][1] * f64::from(d[1])
+                        + r[2][1] * f64::from(d[2]),
+                    r[0][2] * f64::from(d[0])
+                        + r[1][2] * f64::from(d[1])
+                        + r[2][2] * f64::from(d[2]),
+                ];
+                let norm = (ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2]).sqrt();
+                if norm > 0.0 {
+                    ld.map(|c| (c / norm) as f32)
+                } else {
+                    [0.0; 3]
+                }
+            } else {
+                d
+            };
+            let local_opts = OverhangOptions {
+                build_direction: local_dir,
+                critical_angle_deg: options.critical_angle_deg,
+            };
+            let mut report = field_overhangs(&entry.mesh, &local_opts, vertex_angles_deg)?;
+            report.total_support_area *= s * s;
+            return Ok(report);
+        }
+
+        let (baked, _) = baked_world_mesh(entry)?;
+        Ok(field_overhangs(&baked, options, vertex_angles_deg)?)
+    }
+
+    /// Evaluates triangle shape quality on mesh `id` in world coordinates.
+    ///
+    /// Writes per-vertex worst-incident quality values (aligned with vertex slot
+    /// indices) into `vertex_quality` and returns [`QualityReport`]. Does not
+    /// modify the scene or its history.
+    pub fn triangle_quality(
+        &self,
+        id: MeshId,
+        metric: QualityMetric,
+        sliver_threshold: f32,
+        vertex_quality: &mut Vec<f32>,
+    ) -> Result<QualityReport> {
+        let entry = self.entry(id)?;
+        if entry.placement.uniform_scale().is_some() {
+            return Ok(field_triangle_quality(
+                &entry.mesh,
+                metric,
+                sliver_threshold,
+                vertex_quality,
+            )?);
+        }
+        let (baked, _) = baked_world_mesh(entry)?;
+        Ok(field_triangle_quality(
+            &baked,
+            metric,
+            sliver_threshold,
+            vertex_quality,
+        )?)
+    }
+
+    /// Computes geodesic surface distances from `sources` (vertex slot ids on
+    /// `id`) in world length units.
+    ///
+    /// Writes `mesh.vertex_slots()` distances into `out` (with `f32::INFINITY`
+    /// for dead slots, unreachable components, or distances exceeding
+    /// `options.max_distance`). Does not modify the scene or its history.
+    pub fn geodesic_distances(
+        &self,
+        id: MeshId,
+        sources: &[u32],
+        options: &GeodesicOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        let entry = self.entry(id)?;
+        if let Some(s) = entry.placement.uniform_scale() {
+            if s == 1.0 {
+                return Ok(field_geodesic_distances(
+                    &entry.mesh,
+                    sources,
+                    options,
+                    out,
+                )?);
+            }
+            let local_max = match options.max_distance {
+                Some(d) if d.is_finite() && d >= 0.0 => {
+                    let scaled = (f64::from(d) / s) as f32;
+                    if !scaled.is_finite() {
+                        let (baked, _) = baked_world_mesh(entry)?;
+                        return Ok(field_geodesic_distances(&baked, sources, options, out)?);
+                    }
+                    Some(scaled)
+                }
+                other => other,
+            };
+            let local_opts = GeodesicOptions {
+                method: options.method,
+                max_distance: local_max,
+                time_step_scale: options.time_step_scale,
+            };
+            field_geodesic_distances(&entry.mesh, sources, &local_opts, out)?;
+            scale_finite_values(out, s);
+            return Ok(());
+        }
+
+        let (baked, _) = baked_world_mesh(entry)?;
+        Ok(field_geodesic_distances(&baked, sources, options, out)?)
+    }
+
+    /// Computes vertex-to-surface deviation from `source` to `target` in world
+    /// units.
+    ///
+    /// Writes per-vertex deviations (aligned with `source`'s vertex slot
+    /// indices) into `out` and returns [`DeviationStats`]. Ensures `target`'s
+    /// BVH is up to date (returning [`SceneError::StaleBvh`] under
+    /// `UpdateMode::Manual` when stale).
+    pub fn mesh_deviation(
+        &mut self,
+        source: MeshId,
+        target: MeshId,
+        options: &DeviationOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<DeviationStats> {
+        self.drop_field_unit();
+        if options.max_distance.is_nan() || options.max_distance < 0.0 {
+            return Err(SceneError::Fields(FieldsError::InvalidInput(
+                "max_distance must be zero or greater, and not NaN",
+            )));
+        }
+        self.entry(source)?;
+        self.entry(target)?;
+        self.prepare(Some(&[target]))?;
+
+        let (src_rigid, tgt_uniform) = {
+            let es = self.entry(source)?;
+            let et = self.entry(target)?;
+            (
+                is_relative_rigid(&et.placement, &es.placement),
+                et.placement.uniform_scale(),
+            )
+        };
+
+        if src_rigid {
+            let target_sign = if options.signed {
+                let et = self
+                    .entries
+                    .get_mut(target)
+                    .ok_or(SceneError::UnknownMesh)?;
+                Some(SignData::build(&mut et.mesh, &et.bvh, SignMode::Auto)?)
+            } else {
+                None
+            };
+            let es = self.entry(source)?;
+            let et = self.entry(target)?;
+            let xf = relative_rigid(
+                &et.placement,
+                et.mesh.origin(),
+                &es.placement,
+                es.mesh.origin(),
+            );
+            return Ok(field_mesh_deviation(
+                &es.mesh,
+                &et.mesh,
+                &et.bvh,
+                target_sign.as_ref(),
+                xf,
+                options,
+                out,
+            )?);
+        }
+
+        if let Some(s) = tgt_uniform {
+            let scaled_max = if options.max_distance.is_finite() && options.max_distance >= 0.0 {
+                (f64::from(options.max_distance) / s) as f32
+            } else {
+                options.max_distance
+            };
+            if scaled_max.is_finite() || !options.max_distance.is_finite() {
+                let baked_src = {
+                    let es = self.entry(source)?;
+                    let et = self.entry(target)?;
+                    let (ps, pt) = (es.placement, et.placement);
+                    let os = es.mesh.origin();
+                    baked_mesh(
+                        &es.mesh,
+                        |l| pt.inverse_apply(local_to_world(&ps, os, l.map(f64::from))),
+                        es.bvh.options(),
+                    )?
+                    .0
+                };
+                let target_sign = if options.signed {
+                    let et = self
+                        .entries
+                        .get_mut(target)
+                        .ok_or(SceneError::UnknownMesh)?;
+                    Some(SignData::build(&mut et.mesh, &et.bvh, SignMode::Auto)?)
+                } else {
+                    None
+                };
+                let et = self.entry(target)?;
+                let local_opts = DeviationOptions {
+                    signed: options.signed,
+                    max_distance: scaled_max,
+                };
+                let stats = field_mesh_deviation(
+                    &baked_src,
+                    &et.mesh,
+                    &et.bvh,
+                    target_sign.as_ref(),
+                    Rigid::IDENTITY,
+                    &local_opts,
+                    out,
+                )?;
+                scale_finite_values(out, s);
+                return Ok(scale_deviation_stats(stats, s));
+            }
+        }
+
+        let (baked_src, _) = baked_world_mesh(self.entry(source)?)?;
+        let (mut baked_tgt, baked_tgt_bvh) = baked_world_mesh(self.entry(target)?)?;
+        let target_sign = if options.signed {
+            Some(SignData::build(
+                &mut baked_tgt,
+                &baked_tgt_bvh,
+                SignMode::Auto,
+            )?)
+        } else {
+            None
+        };
+        Ok(field_mesh_deviation(
+            &baked_src,
+            &baked_tgt,
+            &baked_tgt_bvh,
+            target_sign.as_ref(),
+            Rigid::IDENTITY,
+            options,
+            out,
+        )?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fast_mesh_fields::{Colormap, OutOfRange, SignData, color_of, signed_distances};
@@ -6089,7 +6388,7 @@ mod tests {
         }
         // No targets: nearest and target lists are empty, status is the
         // placeholder, and the field lists on its mesh.
-        assert_eq!(scene.field_nearest(id).unwrap(), &[]);
+        assert_eq!(scene.field_nearest(id).unwrap(), &[] as &[u32]);
         assert_eq!(scene.field_targets(id).unwrap(), &[]);
         assert!(scene.field_target_status(id).unwrap().is_empty());
         assert_eq!(scene.fields_on(m).unwrap(), vec![id]);
@@ -6343,7 +6642,7 @@ mod tests {
         assert!((mean - 1.0).abs() < 0.3, "{mean}");
         // No targets: nearest and target lists are empty, status is the
         // placeholder, and the field lists on its mesh.
-        assert_eq!(scene.field_nearest(id).unwrap(), &[]);
+        assert_eq!(scene.field_nearest(id).unwrap(), &[] as &[u32]);
         assert_eq!(scene.field_targets(id).unwrap(), &[]);
         assert!(scene.field_target_status(id).unwrap().is_empty());
         assert_eq!(scene.fields_on(m).unwrap(), vec![id]);
@@ -6625,7 +6924,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 51] = [
+        let calls: [(&str, Call); 58] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -6780,6 +7079,50 @@ mod tests {
             }),
             ("vertices_in_sphere", |s, x| {
                 s.vertices_in_sphere(x.c, [0.0, 0.0, 0.0], 0.5).unwrap();
+            }),
+            ("mesh_deviation", |s, x| {
+                let mut out = Vec::new();
+                s.mesh_deviation(x.c, x.b, &DeviationOptions::default(), &mut out)
+                    .unwrap();
+            }),
+            ("trim_by_curve", |s, x| {
+                let opts = crate::TrimCurveOptions {
+                    points: vec![[4.8, -0.2, 0.0], [5.2, -0.2, 0.0], [5.0, 0.2, 0.0]],
+                    closed: true,
+                    delete_inside: true,
+                    snap_tolerance: 0.0,
+                };
+                s.trim_by_curve(x.c, &opts).unwrap();
+            }),
+            ("boolean_with_options", |s, x| {
+                let _ = s.boolean_with_options(x.b, x.b, &crate::BooleanOptions::default());
+            }),
+            ("boolean_batch", |s, x| {
+                let opts = crate::BooleanOptions::default();
+                let _ = s.boolean_batch(&[x.b], &crate::CsgNode::Leaf(0), &opts);
+            }),
+            ("align_by_landmarks", |s, x| {
+                let pairs = [
+                    crate::LandmarkPair {
+                        source: [0.0, 0.0, 0.0],
+                        target: [0.0, 0.0, 0.0],
+                    },
+                    crate::LandmarkPair {
+                        source: [1.0, 0.0, 0.0],
+                        target: [1.0, 0.0, 0.0],
+                    },
+                    crate::LandmarkPair {
+                        source: [0.0, 1.0, 0.0],
+                        target: [0.0, 1.0, 0.0],
+                    },
+                ];
+                s.align_by_landmarks(x.c, x.b, &pairs, false).unwrap();
+            }),
+            ("register_multistage", |s, x| {
+                let _ = s.register_multistage(x.c, x.b, &crate::RegistrationOptions::default());
+            }),
+            ("detect_symmetry_plane", |s, x| {
+                s.detect_symmetry_plane(x.b).unwrap();
             }),
         ];
         for (name, call) in calls {
@@ -8520,5 +8863,105 @@ mod tests {
             left > 0,
             "every vertex stamped as computed after the motion"
         );
+    }
+
+    #[test]
+    fn immediate_inspect_fields_respect_placements() {
+        let mut scene = Scene::new(SceneOptions::default());
+        // Rotate unit cube by 90 deg around X and scale uniformly by 2.
+        let rot = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]];
+        let cube_id = scene
+            .add_mesh(
+                crate::query::tests::cube([-1.0, -1.0, -1.0], 2.0),
+                MeshOptions {
+                    placement: Placement {
+                        rotation: rot,
+                        translation: [3.0, 0.0, 0.0],
+                        scale: [2.0, 2.0, 2.0],
+                    },
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+
+        let mut angles = Vec::new();
+        let ov_rep = scene
+            .overhangs(
+                cube_id,
+                &OverhangOptions {
+                    build_direction: [0.0, 0.0, 1.0],
+                    critical_angle_deg: 45.0,
+                },
+                &mut angles,
+            )
+            .unwrap();
+        assert_eq!(ov_rep.overhang_face_count, 2);
+        // cube() has side 2 (face area 4) scaled by 2 => side 4 (area 16).
+        assert!(
+            (ov_rep.total_support_area - 16.0).abs() < 1e-4,
+            "{ov_rep:?}"
+        );
+        assert_eq!(angles.len(), scene.mesh(cube_id).unwrap().vertex_slots());
+
+        let mut qual = Vec::new();
+        let q_rep = scene
+            .triangle_quality(cube_id, QualityMetric::MinAngleDeg, 20.0, &mut qual)
+            .unwrap();
+        assert_eq!(q_rep.live_triangle_count, 12);
+        assert_eq!(q_rep.sliver_triangle_count, 0);
+        assert!((q_rep.min - 45.0).abs() < 1e-2, "{q_rep:?}");
+        assert_eq!(qual.len(), scene.mesh(cube_id).unwrap().vertex_slots());
+
+        let mut geo = Vec::new();
+        scene
+            .geodesic_distances(
+                cube_id,
+                &[0],
+                &GeodesicOptions {
+                    method: GeodesicMethod::Dijkstra,
+                    max_distance: None,
+                    time_step_scale: 1.0,
+                },
+                &mut geo,
+            )
+            .unwrap();
+        assert_eq!(geo[0], 0.0);
+        // Nearest edge on scaled cube has length 4.
+        let min_nonzero = geo
+            .iter()
+            .copied()
+            .filter(|&d| d > 0.0 && d.is_finite())
+            .fold(f32::INFINITY, f32::min);
+        assert!((min_nonzero - 4.0).abs() < 1e-3, "{min_nonzero}");
+
+        // Deviation from translated box matches translation distance.
+        let target_id = scene
+            .add_mesh(
+                crate::query::tests::cube([-1.0, -1.0, -1.0], 2.0),
+                MeshOptions {
+                    placement: Placement {
+                        rotation: rot,
+                        translation: [4.5, 0.0, 0.0],
+                        scale: [2.0, 2.0, 2.0],
+                    },
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        let mut dev = Vec::new();
+        let d_stats = scene
+            .mesh_deviation(
+                cube_id,
+                target_id,
+                &DeviationOptions {
+                    signed: true,
+                    max_distance: f32::INFINITY,
+                },
+                &mut dev,
+            )
+            .unwrap();
+        assert_eq!(d_stats.sample_count, 8);
+        assert!((d_stats.max - 1.5).abs() < 1e-4, "{d_stats:?}");
+        assert_eq!(dev.len(), 8);
     }
 }

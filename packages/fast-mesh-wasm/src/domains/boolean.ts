@@ -1,6 +1,9 @@
 import { FastMeshError } from "../core.js";
+import type { Vec3 } from "../api.js";
 import type {
   BooleanOp,
+  BooleanOptions,
+  CsgNode,
   CutOptions,
   CutReport,
   MeshHandle,
@@ -9,6 +12,9 @@ import type {
   RepairReportOf,
   SectionPlane,
   ShellReport,
+  SurfacePathPoint,
+  TrimCurveOptions,
+  TrimReport,
 } from "../scene.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
@@ -24,8 +30,23 @@ export type ShellOptions = Omit<Extract<RepairOp, { op: "shell" }>, "op">;
 export interface BooleanBackend<Async extends boolean = false> {
   readonly isAsync: Async;
   repair<const O extends RepairOp>(mesh: MeshHandle, op: O): BooleanReturn<Async, RepairReportOf<O>>;
-  boolean?: (target: MeshHandle, source: MeshHandle, op: BooleanOp) => BooleanReturn<Async, MeshHandle>;
+  boolean?: (
+    target: MeshHandle,
+    source: MeshHandle,
+    op: BooleanOp,
+    options?: Omit<BooleanOptions, "op">,
+  ) => BooleanReturn<Async, MeshHandle>;
+  booleanBatch?: (
+    meshesOrTree: readonly MeshHandle[] | CsgNode,
+    treeOrOptions?: CsgNode | BooleanOptions,
+    maybeOptions?: BooleanOptions,
+  ) => BooleanReturn<Async, MeshHandle>;
   cutByPlane?: (mesh: MeshHandle, plane: SectionPlane, options?: CutOptions) => BooleanReturn<Async, CutReport>;
+  trimByCurve?: (
+    mesh: MeshHandle,
+    optionsOrCurve: TrimCurveOptions | readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    maybeOptions?: Omit<TrimCurveOptions, "points">,
+  ) => BooleanReturn<Async, TrimReport>;
 }
 
 /**
@@ -33,15 +54,50 @@ export interface BooleanBackend<Async extends boolean = false> {
  * (`scene.boolean(...)` and `scene.boolean.<method>(...)`).
  */
 export interface BooleanDomain<Async extends boolean = false> {
-  (target: MeshHandle, source: MeshHandle, op: BooleanOp): BooleanReturn<Async, MeshHandle>;
+  (
+    target: MeshHandle,
+    source: MeshHandle,
+    op: BooleanOp,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle>;
 
-  union(target: MeshHandle, source: MeshHandle): BooleanReturn<Async, MeshHandle>;
-  difference(target: MeshHandle, source: MeshHandle): BooleanReturn<Async, MeshHandle>;
-  subtract(target: MeshHandle, source: MeshHandle): BooleanReturn<Async, MeshHandle>;
-  intersection(target: MeshHandle, source: MeshHandle): BooleanReturn<Async, MeshHandle>;
-  intersect(target: MeshHandle, source: MeshHandle): BooleanReturn<Async, MeshHandle>;
+  union(target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">): BooleanReturn<Async, MeshHandle>;
+  difference(
+    target: MeshHandle,
+    source: MeshHandle,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle>;
+  subtract(
+    target: MeshHandle,
+    source: MeshHandle,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle>;
+  intersection(
+    target: MeshHandle,
+    source: MeshHandle,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle>;
+  intersect(
+    target: MeshHandle,
+    source: MeshHandle,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle>;
+  batch(meshes: readonly MeshHandle[], tree: CsgNode, options?: BooleanOptions): BooleanReturn<Async, MeshHandle>;
+  batch(tree: CsgNode, options?: BooleanOptions): BooleanReturn<Async, MeshHandle>;
+  booleanBatch(
+    meshes: readonly MeshHandle[],
+    tree: CsgNode,
+    options?: BooleanOptions,
+  ): BooleanReturn<Async, MeshHandle>;
+  booleanBatch(tree: CsgNode, options?: BooleanOptions): BooleanReturn<Async, MeshHandle>;
   cut(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): BooleanReturn<Async, CutReport>;
   cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): BooleanReturn<Async, CutReport>;
+  trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): BooleanReturn<Async, TrimReport>;
+  trimByCurve(
+    mesh: MeshHandle,
+    curve: readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    options?: Omit<TrimCurveOptions, "points">,
+  ): BooleanReturn<Async, TrimReport>;
   offset(mesh: MeshHandle, options: OffsetOptions): BooleanReturn<Async, OffsetReport>;
   shell(mesh: MeshHandle, thickness: number | ShellOptions): BooleanReturn<Async, ShellReport>;
 }
@@ -55,7 +111,7 @@ export type WorkerBooleanDomain = BooleanDomain<true>;
 function unsupportedError(isAsync: boolean, name: string): never | Promise<never> {
   const err = new FastMeshError(
     "INVALID_ARGUMENT",
-    `${name} requires synchronous Scene (worker boolean/cut RPCs are not enabled)`,
+    `${name} is not supported by this boolean backend`,
   );
   if (isAsync) {
     return Promise.reject(err);
@@ -65,11 +121,27 @@ function unsupportedError(isAsync: boolean, name: string): never | Promise<never
 
 /** Builds a callable {@link BooleanDomain} backed by `backend`. */
 export function createBooleanDomain<Async extends boolean>(backend: BooleanBackend<Async>): BooleanDomain<Async> {
-  const runBoolean = (target: MeshHandle, source: MeshHandle, op: BooleanOp): BooleanReturn<Async, MeshHandle> => {
+  const runBoolean = (
+    target: MeshHandle,
+    source: MeshHandle,
+    op: BooleanOp,
+    options?: Omit<BooleanOptions, "op">,
+  ): BooleanReturn<Async, MeshHandle> => {
     if (backend.boolean === undefined) {
       return unsupportedError(backend.isAsync, `boolean("${op}")`) as unknown as BooleanReturn<Async, MeshHandle>;
     }
-    return backend.boolean(target, source, op);
+    return backend.boolean(target, source, op, options);
+  };
+
+  const batch = (
+    meshesOrTree: readonly MeshHandle[] | CsgNode,
+    treeOrOptions?: CsgNode | BooleanOptions,
+    maybeOptions?: BooleanOptions,
+  ): BooleanReturn<Async, MeshHandle> => {
+    if (backend.booleanBatch === undefined) {
+      return unsupportedError(backend.isAsync, "boolean.batch") as unknown as BooleanReturn<Async, MeshHandle>;
+    }
+    return backend.booleanBatch(meshesOrTree, treeOrOptions, maybeOptions);
   };
 
   const cut = (mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): BooleanReturn<Async, CutReport> => {
@@ -79,14 +151,33 @@ export function createBooleanDomain<Async extends boolean>(backend: BooleanBacke
     return backend.cutByPlane(mesh, plane, options);
   };
 
+  const trimByCurve = (
+    mesh: MeshHandle,
+    optionsOrCurve: TrimCurveOptions | readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    maybeOptions?: Omit<TrimCurveOptions, "points">,
+  ): BooleanReturn<Async, TrimReport> => {
+    if (backend.trimByCurve === undefined) {
+      return unsupportedError(backend.isAsync, "boolean.trimByCurve") as unknown as BooleanReturn<Async, TrimReport>;
+    }
+    return backend.trimByCurve(mesh, optionsOrCurve, maybeOptions);
+  };
+
   return Object.assign(runBoolean, {
-    union: (target: MeshHandle, source: MeshHandle) => runBoolean(target, source, "union"),
-    difference: (target: MeshHandle, source: MeshHandle) => runBoolean(target, source, "subtract"),
-    subtract: (target: MeshHandle, source: MeshHandle) => runBoolean(target, source, "subtract"),
-    intersection: (target: MeshHandle, source: MeshHandle) => runBoolean(target, source, "intersect"),
-    intersect: (target: MeshHandle, source: MeshHandle) => runBoolean(target, source, "intersect"),
+    union: (target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">) =>
+      runBoolean(target, source, "union", options),
+    difference: (target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">) =>
+      runBoolean(target, source, "subtract", options),
+    subtract: (target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">) =>
+      runBoolean(target, source, "subtract", options),
+    intersection: (target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">) =>
+      runBoolean(target, source, "intersect", options),
+    intersect: (target: MeshHandle, source: MeshHandle, options?: Omit<BooleanOptions, "op">) =>
+      runBoolean(target, source, "intersect", options),
+    batch,
+    booleanBatch: batch,
     cut,
     cutByPlane: cut,
+    trimByCurve,
     offset: (mesh: MeshHandle, options: OffsetOptions) => backend.repair(mesh, { op: "offset", ...options }),
     shell: (mesh: MeshHandle, thickness: number | ShellOptions) =>
       backend.repair(mesh, {

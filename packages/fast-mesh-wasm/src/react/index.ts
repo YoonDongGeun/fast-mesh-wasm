@@ -136,19 +136,25 @@ export interface HistoryControls {
   canRedo: boolean;
   undo(): void;
   redo(): void;
+  beginStep(): void;
+  endStep(): void;
+  cancelStep(): void;
 }
 
 const selectHistory = (s: SceneSnapshot) => s.history;
 
-/** Undo and redo, with whether each is available. The object and its actions keep their identity while history is unchanged; the actions are stable per store. */
+/** Undo, redo, and step transaction controls, with availability flags. The actions are stable per store. */
 export function useHistory(): HistoryControls {
   const store = useScene();
   const history = useStoreSelector(selectHistory);
   const undo = useCallback(() => store.undo(), [store]);
   const redo = useCallback(() => store.redo(), [store]);
+  const beginStep = useCallback(() => store.beginStep(), [store]);
+  const endStep = useCallback(() => store.endStep(), [store]);
+  const cancelStep = useCallback(() => store.cancelStep(), [store]);
   return useMemo(
-    () => ({ canUndo: history.canUndo, canRedo: history.canRedo, undo, redo }),
-    [history, undo, redo],
+    () => ({ canUndo: history.canUndo, canRedo: history.canRedo, undo, redo, beginStep, endStep, cancelStep }),
+    [history, undo, redo, beginStep, endStep, cancelStep],
   );
 }
 
