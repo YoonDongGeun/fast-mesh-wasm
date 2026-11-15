@@ -40,6 +40,11 @@ import type {
   SectionResult,
   VertexProtection,
 } from "./scene.js";
+import type {
+  CollisionRule,
+  CollisionRuleInput,
+  CollisionStepReport,
+} from "./wave6.js";
 
 /** Domain-separated capability surface exposed by both `Scene` and `WorkerScene`. */
 export interface SceneDomainsLike {
@@ -128,4 +133,16 @@ export interface SceneLike extends SceneDomainsLike {
    * without it.
    */
   bounds?(mesh: MeshHandle): Bounds | null;
+  setDefaultCollisionRule?(rule: CollisionRuleInput): void;
+  defaultCollisionRule?(): CollisionRule | Promise<CollisionRule>;
+  setCollisionRule?(a: MeshHandle, b: MeshHandle, rule: CollisionRuleInput): void;
+  clearCollisionRule?(a: MeshHandle, b: MeshHandle): boolean | Promise<boolean>;
+  collisionRule?(a: MeshHandle, b: MeshHandle): CollisionRule | Promise<CollisionRule>;
+  hasActiveCollisionResponse?(mesh: MeshHandle): boolean | Promise<boolean>;
+  moveWithCollision?(
+    mesh: MeshHandle,
+    placement: import("./api.js").PlacementInput,
+    isRelease?: boolean,
+  ): CollisionStepReport | Promise<CollisionStepReport>;
+  commitCollisionInteraction?(mesh: MeshHandle): CollisionStepReport | Promise<CollisionStepReport>;
 }

@@ -77,9 +77,151 @@ import {
 } from "./selection.js";
 import { meshViews, type SceneMeshViews, ViewGuard } from "./views.js";
 import { WasmScene } from "./wasm/fast_mesh_wasm.js";
+import {
+  checkBooleanArg,
+  checkNonNegativeArg,
+  checkU32Arg,
+  cloudBuffer,
+  decodeCollisionRule,
+  decodeCollisionStepReport,
+  decodeContourSlices,
+  decodeDrainHoleReport,
+  decodeFaceEditReport,
+  decodeFfdLattice,
+  decodeFitPrimitiveReport,
+  decodeFreeformReport,
+  decodeHollowReport,
+  decodePlaceMeshReport,
+  decodePlacement15,
+  encodeCollisionRule,
+  normalizeAlignToPrimitiveArgs,
+  normalizeArapArgs,
+  normalizeBuildFfdLatticeArgs,
+  normalizeCollisionRule,
+  normalizeDrainHoleArgs,
+  normalizeFfdArgs,
+  normalizeFitPrimitiveArgs,
+  normalizeGrowShrinkArgs,
+  normalizeHollowArgs,
+  normalizeKelvinletArgs,
+  normalizePlaceMeshArgs,
+  normalizePlacementInputArgs,
+  normalizeReconstructArgs,
+  normalizeScreenSelectArgs,
+  normalizeSelectInSphereArgs,
+  normalizeSelectSmallIslandsArgs,
+  normalizeSliceContoursArgs,
+  normalizeSliceContourStackArgs,
+  normalizeU32Selection,
+  normalizeVertexMaskSelectArgs,
+  normalizeXpbdArgs,
+  type AdjacencyKind,
+  type ArapOptions,
+  type CollisionRule,
+  type CollisionRuleInput,
+  type CollisionStepReport,
+  type ContourSlice,
+  type DrainHoleOptions,
+  type DrainHoleReport,
+  type FaceEditReport,
+  type FaceSelectionNormalCone,
+  type FfdBasisInput,
+  type FfdLatticeData,
+  type FfdOptions,
+  type FitPrimitiveOptions,
+  type FittedPrimitive,
+  type FittedPrimitiveReport,
+  type FreeformReport,
+  type HollowOptions,
+  type HollowReport,
+  type KelvinletOptions,
+  type PackedPointCloud,
+  type PlaceMeshOptions,
+  type PlaceMeshReport,
+  type ScreenSelectionShape,
+  type ScreenSelectOptions,
+  type SplitFacesReport,
+  type SurfaceReconstructOptions,
+  type XpbdOptions,
+} from "./wave6.js";
 
 export type { Range } from "./changes.js";
 export type { MeshViews, SceneMeshViews } from "./views.js";
+export {
+  DEFAULT_COLLISION_RULE,
+  packPointCloud,
+  unpackPointCloud,
+  type AdjacencyKind,
+  type ArapAnchorInput,
+  type ArapHandleInput,
+  type ArapOptions,
+  type ArapSolver,
+  type ArapWeights,
+  type CollisionDistanceBackend,
+  type CollisionMode,
+  type CollisionPairOutcome,
+  type CollisionRole,
+  type CollisionRule,
+  type CollisionRuleInput,
+  type CollisionStepReport,
+  type ContourExportFormat,
+  type ContourLoop,
+  type ContourSlice,
+  type CutTrigger,
+  type DrainHoleOptions,
+  type DrainHoleReport,
+  type FaceEditReport,
+  type FaceSelectionNormalCone,
+  type FfdBasis,
+  type FfdBasisInput,
+  type FfdFrameData,
+  type FfdLattice,
+  type FfdLatticeData,
+  type FfdOptions,
+  type FfdOutsideMode,
+  type FitPrimitiveOptions,
+  type FittedPrimitive,
+  type FittedPrimitiveReport,
+  type FreeformProtection,
+  type FreeformReport,
+  type FreeformScope,
+  type HollowBackend,
+  type HollowOptions,
+  type HollowReport,
+  type KelvinletLoad,
+  type KelvinletOptions,
+  type KelvinletScale,
+  type MaterialMemory,
+  type OutlierReport,
+  type PackedPointCloud,
+  type PlaceMeshOptions,
+  type PlaceMeshReport,
+  type PlaceMode,
+  type PlaceTransform,
+  type PlaceUpAxis,
+  type PointCloudFilterResult,
+  type PointCloudFormat,
+  type PrimitiveKind,
+  type PrimitiveKindInput,
+  type ScreenSelectionShape,
+  type ScreenSelectOptions,
+  type SoftDeformSolver,
+  type SplitFacesReport,
+  type SurfaceReconstructMethod,
+  type SurfaceReconstructOptions,
+  type XpbdHandleInput,
+  type XpbdOptions,
+  type XpbdPinInput,
+} from "./wave6.js";
+export {
+  parsePointCloudBytes,
+  parsePointCloudText,
+  pointCloudEstimateNormals,
+  pointCloudRor,
+  pointCloudSor,
+  pointCloudVoxelDownsample,
+  sliceContoursExport,
+} from "./wave6-wasm.js";
 export type {
   BrushSelect,
   ComponentSelect,
@@ -3081,6 +3223,28 @@ export class Scene implements SceneLike {
     fillHoleContinuity: (mesh, loopIndex, options) => this.fillHoleContinuity(mesh, loopIndex, options),
     fillAllHolesContinuity: (mesh, options) => this.fillAllHolesContinuity(mesh, options),
     bridgePartialArcs: (mesh, loopA, loopB, options) => this.bridgePartialArcs(mesh, loopA, loopB, options),
+    selectFacesScreen: (mesh, shape, options) => this.selectFacesScreen(mesh, shape, options),
+    selectFacesInSphere: (mesh, center, radius, normalCone) =>
+      this.selectFacesInSphere(mesh, center, radius, normalCone),
+    selectByCreaseAngle: (mesh, seedTri, maxDihedralRad) =>
+      this.selectByCreaseAngle(mesh, seedTri, maxDihedralRad),
+    selectConnectedShell: (mesh, seedTri) => this.selectConnectedShell(mesh, seedTri),
+    selectSmallFaceIslands: (mesh, maxFaceCount, maxArea) =>
+      this.selectSmallFaceIslands(mesh, maxFaceCount, maxArea),
+    growFaceSelection: (mesh, selectedTris, rings, adjacency) =>
+      this.growFaceSelection(mesh, selectedTris, rings, adjacency),
+    shrinkFaceSelection: (mesh, selectedTris, rings, adjacency) =>
+      this.shrinkFaceSelection(mesh, selectedTris, rings, adjacency),
+    fillSelectionHoles: (mesh, selectedTris, maxHoleTris) =>
+      this.fillSelectionHoles(mesh, selectedTris, maxHoleTris),
+    smoothSelectionBoundary: (mesh, selectedTris, iterations) =>
+      this.smoothSelectionBoundary(mesh, selectedTris, iterations),
+    faceSelectionToVertexMask: (mesh, selectedTris) => this.faceSelectionToVertexMask(mesh, selectedTris),
+    vertexMaskToFaceSelection: (mesh, mask, threshold, requireAllVertices) =>
+      this.vertexMaskToFaceSelection(mesh, mask, threshold, requireAllVertices),
+    deleteSelectedFaces: (mesh, selectedTris) => this.deleteSelectedFaces(mesh, selectedTris),
+    extractSelectedFaces: (mesh, selectedTris, options) => this.extractSelectedFaces(mesh, selectedTris, options),
+    splitSelectedFaces: (mesh, selectedTris, options) => this.splitSelectedFaces(mesh, selectedTris, options),
   });
 
   /**
@@ -3117,12 +3281,20 @@ export class Scene implements SceneLike {
       Array.isArray(optionsOrCurve)
         ? this.trimByCurve(mesh, optionsOrCurve, maybeOptions)
         : this.trimByCurve(mesh, optionsOrCurve as TrimCurveOptions),
+    hollowMesh: (mesh, options) => this.hollowMesh(mesh, options),
+    punchDrainHole: (mesh, options) => this.punchDrainHole(mesh, options),
+    placeMesh: (target, stamp, options) => this.placeMesh(target, stamp, options),
   });
 
   /** Surface deformation and vertex-protection domain. */
   readonly deform: SyncDeformDomain = createDeformDomain({
     sculpt: ((mesh: MeshHandle, op: SculptOp) =>
       this.#runRepair(mesh, op as RepairOp)) as DeformBackend<false>["sculpt"],
+    buildFfdLattice: (mesh, dims, basis, padding) => this.buildFfdLattice(mesh, dims, basis, padding),
+    applyFfd: (mesh, options) => this.applyFfd(mesh, options),
+    applyArap: (mesh, options) => this.applyArap(mesh, options),
+    applyKelvinlet: (mesh, options) => this.applyKelvinlet(mesh, options),
+    applyXpbd: (mesh, options) => this.applyXpbd(mesh, options),
   });
 
   /** Defect analysis, metrology, queries, printability/quality/geodesic fields, paths, and section inspection domain. */
@@ -3161,6 +3333,13 @@ export class Scene implements SceneLike {
     section: (section, mesh) => this.section(section, mesh),
     sectionGap: (section, a, b) => this.sectionGap(section, a, b),
     updateSections: () => this.updateSections(),
+    fitPrimitive: (mesh, options) => this.fitPrimitive(mesh, options),
+    alignToFittedPrimitive: (mesh, primitive, targetAxis, targetOrigin) =>
+      this.alignToFittedPrimitive(mesh, primitive, targetAxis, targetOrigin),
+    sliceContours: (mesh, origin, normal) => this.sliceContours(mesh, origin, normal),
+    sliceContourStack: (mesh, origin, normal, spacing, count) =>
+      this.sliceContourStack(mesh, origin, normal, spacing, count),
+    reconstructPointCloud: (cloud, options) => this.reconstructPointCloud(cloud, options),
   });
 
   /** Rigid registration, landmark SVD, multi-stage alignment, and symmetry detection domain. */
@@ -4193,10 +4372,12 @@ export class Scene implements SceneLike {
     }
     const coalesce = options.coalesce ?? false;
     const start = this.placement(mesh);
+    const collisionActive = this.hasActiveCollisionResponse(mesh);
     const outermost = this.#stepDepth === 0;
     this.beginStep();
     const depth = this.#stepDepth;
     let active = true;
+    let moved = false;
     /** The latest coalesced pose, not yet applied. */
     let pending: PlacementInput | undefined;
     const finish = (): boolean => {
@@ -4213,11 +4394,19 @@ export class Scene implements SceneLike {
         this.endStep();
       }
     };
+    const applyPose = (pose: PlacementInput) => {
+      if (!collisionActive) {
+        this.setPlacement(mesh, pose);
+        return;
+      }
+      moved = true;
+      this.moveWithCollision(mesh, pose, false);
+    };
     const applyPending = () => {
       if (pending !== undefined) {
         const pose = pending;
         pending = undefined;
-        this.setPlacement(mesh, pose);
+        applyPose(pose);
       }
     };
     const session: DragSession & ActiveDrag = {
@@ -4231,7 +4420,7 @@ export class Scene implements SceneLike {
           throw invalid("the drag is over");
         }
         if (!coalesce) {
-          this.setPlacement(mesh, placement);
+          applyPose(placement);
           return;
         }
         // Validate the shape and the values now, so a bad pose throws here
@@ -4259,6 +4448,9 @@ export class Scene implements SceneLike {
         if (finish()) {
           try {
             applyPending();
+            if (collisionActive && moved) {
+              this.commitCollisionInteraction(mesh);
+            }
           } finally {
             close();
           }
@@ -5209,5 +5401,518 @@ export class Scene implements SceneLike {
       this.#scene().section_gap(raw, ia.index, ia.generation, ib.index, ib.generation),
     );
     return g.length === 0 ? null : { distance: g[0], a: vec3At(g, 1), b: vec3At(g, 4) };
+  }
+
+  #hasNormals(index: number, generation: number): boolean {
+    const s = this.#peek();
+    return s.normals_len(index, generation) > 0 || s.vertex_count(index, generation) === 0;
+  }
+
+  // ---- #233 Face Selection ----
+
+  /** Selects triangles enclosed by or intersecting a screen-space rectangle or lasso in NDC. */
+  selectFacesScreen(mesh: MeshHandle, shape: ScreenSelectionShape, options: ScreenSelectOptions): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeScreenSelectArgs(shape, options);
+    return call(() =>
+      this.#scene().select_faces_screen(
+        index,
+        generation,
+        n.shapeKind,
+        n.shapeData,
+        n.viewProj,
+        Float64Array.from(n.cameraOrigin),
+        Float64Array.from(n.cameraForward),
+        n.isOrthographic,
+        n.visibleOnly,
+        n.rejectBackfaces,
+        n.includeTouching,
+      ),
+    );
+  }
+
+  /** Selects triangles intersecting a world-space sphere (optionally restricted by a normal cone). */
+  selectFacesInSphere(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    normalCone?: FaceSelectionNormalCone,
+  ): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeSelectInSphereArgs(center, radius, normalCone);
+    return call(() =>
+      this.#scene().select_faces_in_sphere(index, generation, n.center, n.radius, n.normal, n.coneAngleRad),
+    );
+  }
+
+  /** Flood-fills triangles across edges whose dihedral angle does not exceed `maxDihedralRad`. */
+  selectByCreaseAngle(mesh: MeshHandle, seedTri: number, maxDihedralRad: number): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() =>
+      this.#peek().select_by_crease_angle(
+        index,
+        generation,
+        checkU32Arg(seedTri, "seedTri"),
+        checkNonNegativeArg(maxDihedralRad, "maxDihedralRad"),
+      ),
+    );
+  }
+
+  /** Selects the edge-connected shell containing `seedTri`. */
+  selectConnectedShell(mesh: MeshHandle, seedTri: number): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#peek().select_connected_shell(index, generation, checkU32Arg(seedTri, "seedTri")));
+  }
+
+  /** Selects small edge-connected face islands bounded by `maxFaceCount` and optional `maxArea`. */
+  selectSmallFaceIslands(mesh: MeshHandle, maxFaceCount: number, maxArea?: number): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeSelectSmallIslandsArgs(maxFaceCount, maxArea);
+    return call(() => this.#peek().select_small_face_islands(index, generation, n.maxFaceCount, n.maxArea));
+  }
+
+  /** Expands `selectedTris` outward by `rings` topological rings. */
+  growFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings = 1,
+    adjacency: AdjacencyKind = "edge",
+  ): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeGrowShrinkArgs(selectedTris, rings, adjacency);
+    return call(() => this.#peek().grow_face_selection(index, generation, n.selectedTris, n.rings, n.adjacency));
+  }
+
+  /** Erodes `selectedTris` inward by `rings` topological rings. */
+  shrinkFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings = 1,
+    adjacency: AdjacencyKind = "edge",
+  ): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeGrowShrinkArgs(selectedTris, rings, adjacency);
+    return call(() => this.#peek().shrink_face_selection(index, generation, n.selectedTris, n.rings, n.adjacency));
+  }
+
+  /** Fills interior unselected triangle holes up to `maxHoleTris`. */
+  fillSelectionHoles(mesh: MeshHandle, selectedTris: Indices, maxHoleTris: number): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() =>
+      this.#peek().fill_selection_holes(
+        index,
+        generation,
+        normalizeU32Selection(selectedTris),
+        checkU32Arg(maxHoleTris, "maxHoleTris"),
+      ),
+    );
+  }
+
+  /** Smooths jagged boundaries of a face selection via majority-neighbor voting. */
+  smoothSelectionBoundary(mesh: MeshHandle, selectedTris: Indices, iterations = 1): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() =>
+      this.#peek().smooth_selection_boundary(
+        index,
+        generation,
+        normalizeU32Selection(selectedTris),
+        checkU32Arg(iterations, "iterations"),
+      ),
+    );
+  }
+
+  /** Converts a face selection into per-vertex `[0, 1]` coverage weights aligned with `vertexSlots()`. */
+  faceSelectionToVertexMask(mesh: MeshHandle, selectedTris: Indices): Float32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#peek().face_selection_to_vertex_mask(index, generation, normalizeU32Selection(selectedTris)));
+  }
+
+  /** Converts a per-vertex scalar mask into selected triangle indices. */
+  vertexMaskToFaceSelection(
+    mesh: MeshHandle,
+    mask: Float32Array | ArrayLike<number>,
+    threshold = 0.5,
+    requireAllVertices = false,
+  ): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeVertexMaskSelectArgs(mask, threshold, requireAllVertices);
+    return call(() =>
+      this.#peek().vertex_mask_to_face_selection(index, generation, n.mask, n.threshold, n.requireAllVertices),
+    );
+  }
+
+  /** Deletes `selectedTris` from `mesh` in one undo step. */
+  deleteSelectedFaces(mesh: MeshHandle, selectedTris: Indices): FaceEditReport {
+    const { index, generation } = this.#id(mesh);
+    const raw = call(() => this.#scene().delete_selected_faces(index, generation, normalizeU32Selection(selectedTris)));
+    return decodeFaceEditReport(raw);
+  }
+
+  /** Extracts `selectedTris` into a new standalone mesh preserving exact world coordinates. */
+  extractSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): MeshHandle {
+    const { index, generation } = this.#id(mesh);
+    const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
+    const id = call(() =>
+      this.#scene().extract_selected_faces(index, generation, normalizeU32Selection(selectedTris), normals),
+    );
+    return this.#meshHandle(id[0], id[1]);
+  }
+
+  /** Splits `selectedTris` off into a new detached mesh and removes them from `mesh` in one undo step. */
+  splitSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): SplitFacesReport {
+    const { index, generation } = this.#id(mesh);
+    const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
+    const raw = call(() =>
+      this.#scene().split_selected_faces(index, generation, normalizeU32Selection(selectedTris), normals),
+    );
+    return {
+      detached: this.#meshHandle(raw[0], raw[1]),
+      removedTriangles: raw[2],
+      removedVertices: raw[3],
+    };
+  }
+
+  // ---- #193 Free-Form Deformation ----
+
+  /** Builds a zero-offset world-aligned FFD lattice around `mesh`. */
+  buildFfdLattice(
+    mesh: MeshHandle,
+    dims: readonly [number, number, number],
+    basis: FfdBasisInput = "bernstein",
+    padding = 0,
+  ): FfdLatticeData {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeBuildFfdLatticeArgs(dims, basis, padding);
+    return decodeFfdLattice(call(() => this.#peek().build_ffd_lattice(index, generation, n.dims, n.basis, n.padding)));
+  }
+
+  /** Applies Free-Form Deformation (FFD) in one undo step. */
+  applyFfd(mesh: MeshHandle, options: FfdOptions): FreeformReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeFfdArgs(options);
+    return decodeFreeformReport(
+      call(() =>
+        this.#scene().apply_ffd(
+          index,
+          generation,
+          n.dims,
+          n.basis,
+          n.frame15,
+          n.offsets,
+          n.outsideMode,
+          n.regionCenter,
+          n.regionRadius,
+          n.vertices,
+          n.protectedVerts,
+          n.protectionWeights,
+        ),
+      ),
+    );
+  }
+
+  /** Applies As-Rigid-As-Possible (ARAP) surface deformation in one undo step. */
+  applyArap(mesh: MeshHandle, options: ArapOptions): FreeformReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeArapArgs(options);
+    return decodeFreeformReport(
+      call(() =>
+        this.#scene().apply_arap(
+          index,
+          generation,
+          n.anchorVerts,
+          n.anchorPos,
+          n.anchorHasPos,
+          n.handleVerts,
+          n.handleTargets,
+          n.weights,
+          n.solver,
+          n.iterations,
+          n.tolerance,
+          n.regionCenter,
+          n.regionRadius,
+          n.vertices,
+          n.protectedVerts,
+          n.protectionWeights,
+        ),
+      ),
+    );
+  }
+
+  /** Applies a regularized elastic Kelvinlet deformation in one undo step. */
+  applyKelvinlet(mesh: MeshHandle, options: KelvinletOptions): FreeformReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeKelvinletArgs(options);
+    return decodeFreeformReport(
+      call(() =>
+        this.#scene().apply_kelvinlet(
+          index,
+          generation,
+          n.center,
+          n.loadKind,
+          n.loadData,
+          n.epsilon,
+          n.nu,
+          n.mu,
+          n.scaleMode,
+          n.scaleAlpha,
+          n.symX,
+          n.symY,
+          n.symZ,
+          n.regionCenter,
+          n.regionRadius,
+          n.vertices,
+          n.protectedVerts,
+          n.protectionWeights,
+        ),
+      ),
+    );
+  }
+
+  /** Runs an XPBD soft-body solve with optional self-collision handling in one undo step. */
+  applyXpbd(mesh: MeshHandle, options: XpbdOptions): FreeformReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeXpbdArgs(options);
+    return decodeFreeformReport(
+      call(() =>
+        this.#scene().apply_xpbd(
+          index,
+          generation,
+          n.substeps,
+          n.iterations,
+          n.dt,
+          n.stretchCompliance,
+          n.bendCompliance,
+          n.volumeCompliance,
+          n.damping,
+          n.gravity,
+          n.pinVerts,
+          n.pinTargets,
+          n.handleVerts,
+          n.handleTargets,
+          n.handleCompliances,
+          n.selfCollision,
+          n.collisionThickness,
+          n.protectedVerts,
+          n.protectionWeights,
+        ),
+      ),
+    );
+  }
+
+  // ---- #194 Inter-Object Collision ----
+
+  /** Sets the scene's fallback inter-object collision rule. */
+  setDefaultCollisionRule(rule: CollisionRuleInput): void {
+    const flat = encodeCollisionRule(normalizeCollisionRule(rule));
+    call(() => this.#scene().set_default_collision_rule(flat));
+  }
+
+  /** Returns the scene's fallback inter-object collision rule. */
+  defaultCollisionRule(): CollisionRule {
+    return decodeCollisionRule(call(() => this.#peek().default_collision_rule()));
+  }
+
+  /** Configures the collision response rule for unordered pair `(a, b)`. */
+  setCollisionRule(a: MeshHandle, b: MeshHandle, rule: CollisionRuleInput): void {
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    const flat = encodeCollisionRule(normalizeCollisionRule(rule));
+    call(() => this.#scene().set_collision_rule(ia.index, ia.generation, ib.index, ib.generation, flat));
+  }
+
+  /** Clears any pair-specific collision override for `(a, b)`, returning `true` if one existed. */
+  clearCollisionRule(a: MeshHandle, b: MeshHandle): boolean {
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    return call(() => this.#scene().clear_collision_rule(ia.index, ia.generation, ib.index, ib.generation));
+  }
+
+  /** Returns the effective collision rule for `(a, b)`. */
+  collisionRule(a: MeshHandle, b: MeshHandle): CollisionRule {
+    const ia = this.#id(a);
+    const ib = this.#id(b);
+    return decodeCollisionRule(call(() => this.#peek().collision_rule(ia.index, ia.generation, ib.index, ib.generation)));
+  }
+
+  /** True when `mesh` participates in at least one active non-passThrough collision rule. */
+  hasActiveCollisionResponse(mesh: MeshHandle): boolean {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#peek().has_active_collision_response(index, generation));
+  }
+
+  /** Moves `mesh` toward `placement` with inter-object collision detection and response. */
+  moveWithCollision(mesh: MeshHandle, placement: PlacementInput, isRelease = false): CollisionStepReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizePlacementInputArgs(placement);
+    const scale: Vec3 = n.scale ? [n.scale[0], n.scale[1], n.scale[2]] : (this.placement(mesh).scale ?? [1, 1, 1]);
+    const raw = call(() =>
+      this.#scene().move_with_collision(
+        index,
+        generation,
+        n.rotation,
+        n.translation,
+        n.scale,
+        checkBooleanArg(isRelease, false, "isRelease"),
+      ),
+    );
+    return decodeCollisionStepReport(raw, (i, g) => this.#meshHandle(i, g), scale);
+  }
+
+  /** Finalizes queued release actions (deferred cuts, elastic recovery) for `mesh`. */
+  commitCollisionInteraction(mesh: MeshHandle): CollisionStepReport {
+    const { index, generation } = this.#id(mesh);
+    const scale = this.placement(mesh).scale;
+    const raw = call(() => this.#scene().commit_collision_interaction(index, generation));
+    return decodeCollisionStepReport(raw, (i, g) => this.#meshHandle(i, g), scale);
+  }
+
+  // ---- #234 Primitive Fit, Contours & Point Cloud ----
+
+  /** Fits a geometric primitive (`plane`, `sphere`, `cylinder`, `cone`, or `auto`) in world space. */
+  fitPrimitive(mesh: MeshHandle, options: FitPrimitiveOptions = {}): FittedPrimitiveReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeFitPrimitiveArgs(options);
+    return decodeFitPrimitiveReport(
+      call(() =>
+        this.#peek().fit_primitive(
+          index,
+          generation,
+          n.subsetTris,
+          n.kind,
+          n.inlierThreshold,
+          n.ransacIterations,
+          n.lmIterations,
+          n.seed,
+          n.minInlierRatio,
+          n.normalWeight,
+        ),
+      ),
+    );
+  }
+
+  /** Rigidly aligns `mesh`'s fitted datum onto `targetAxis` and `targetOrigin` in one undo step. */
+  alignToFittedPrimitive(
+    mesh: MeshHandle,
+    primitive: FittedPrimitive,
+    targetAxis: Readonly<Vec3>,
+    targetOrigin: Readonly<Vec3>,
+  ): Placement {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeAlignToPrimitiveArgs(primitive, targetAxis, targetOrigin);
+    return decodePlacement15(
+      call(() => this.#scene().align_to_fitted_primitive(index, generation, n.prim9, n.targetAxis, n.targetOrigin)),
+    );
+  }
+
+  /** Slices world-space planar contours through `mesh`. */
+  sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): ContourSlice {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeSliceContoursArgs(origin, normal);
+    return decodeContourSlices(call(() => this.#peek().slice_contours(index, generation, n.origin, n.normal)))[0];
+  }
+
+  /** Slices an evenly spaced stack of `count` parallel contours through `mesh`. */
+  sliceContourStack(
+    mesh: MeshHandle,
+    origin: Readonly<Vec3>,
+    normal: Readonly<Vec3>,
+    spacing: number,
+    count: number,
+  ): ContourSlice[] {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeSliceContourStackArgs(origin, normal, spacing, count);
+    return decodeContourSlices(
+      call(() => this.#peek().slice_contour_stack(index, generation, n.origin, n.normal, n.spacing, n.count)),
+    );
+  }
+
+  /** Reconstructs a triangle mesh from a packed point cloud and adds it to the scene. */
+  reconstructPointCloud(
+    cloud: PackedPointCloud | Float32Array,
+    options: SurfaceReconstructOptions = {},
+  ): MeshHandle {
+    const buf = cloudBuffer(cloud);
+    const n = normalizeReconstructArgs(options);
+    const id = call(() =>
+      this.#scene().reconstruct_point_cloud(buf, n.method, n.voxelSize, n.ballRadius, n.kNeighbors, n.normals),
+    );
+    return this.#meshHandle(id[0], id[1]);
+  }
+
+  // ---- #236 Hollow, Drain Holes & Place Mesh ----
+
+  /** Hollows `mesh` with optional per-vertex wall thickness modulation in one undo step. */
+  hollowMesh(mesh: MeshHandle, options: HollowOptions): HollowReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeHollowArgs(options);
+    return decodeHollowReport(
+      call(() =>
+        this.#scene().hollow_mesh(
+          index,
+          generation,
+          n.wallThickness,
+          n.backend,
+          n.voxelSize,
+          n.maxVoxels,
+          n.maxCavityTriangles,
+          n.minCavityVolume,
+          n.modulationVerts,
+          n.modulationWeights,
+        ),
+      ),
+    );
+  }
+
+  /** Punches a tapered/chamfered drain hole in `mesh` (with optional plug generation) in one undo step. */
+  punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): DrainHoleReport {
+    const { index, generation } = this.#id(mesh);
+    const n = normalizeDrainHoleArgs(options);
+    const plugNormals = n.plugNormals ?? this.#hasNormals(index, generation);
+    const raw = call(() =>
+      this.#scene().punch_drain_hole(
+        index,
+        generation,
+        n.surfacePoint,
+        n.surfaceNormal,
+        n.diameter,
+        n.depth,
+        n.outerChamfer,
+        n.taperAngleDeg,
+        n.segments,
+        n.booleanMethod,
+        n.fallbackBvhSdf,
+        n.generatePlug,
+        n.plugClearance,
+        plugNormals,
+      ),
+    );
+    return decodeDrainHoleReport(raw, (i, g) => this.#meshHandle(i, g));
+  }
+
+  /** Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping. */
+  placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
+    const t = this.#id(target);
+    const s = this.#id(stamp);
+    const n = normalizePlaceMeshArgs(options);
+    const normals = n.normals ?? this.#hasNormals(s.index, s.generation);
+    const raw = call(() =>
+      this.#scene().place_mesh(
+        t.index,
+        t.generation,
+        s.index,
+        s.generation,
+        n.hitPoint,
+        n.hitNormal,
+        n.upAxis,
+        n.twistAngleRad,
+        n.uniformScale,
+        n.embedDepth,
+        n.mode,
+        n.conformToSurface,
+        n.booleanMethod,
+        normals,
+      ),
+    );
+    return decodePlaceMeshReport(raw, (i, g) => this.#meshHandle(i, g));
   }
 }

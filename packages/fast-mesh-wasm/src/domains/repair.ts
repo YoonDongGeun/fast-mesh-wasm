@@ -1,4 +1,4 @@
-import type { Indices } from "../api.js";
+import type { Indices, Vec3 } from "../api.js";
 import type {
   Analysis,
   AnalyzeOptions,
@@ -26,6 +26,14 @@ import type {
   SliverReport,
   WeldReport,
 } from "../scene.js";
+import type {
+  AdjacencyKind,
+  FaceEditReport,
+  FaceSelectionNormalCone,
+  ScreenSelectionShape,
+  ScreenSelectOptions,
+  SplitFacesReport,
+} from "../wave6.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
 export type RepairReturn<Async extends boolean, T> = Async extends true ? Promise<T> : T;
@@ -85,6 +93,64 @@ export interface RepairBackend<Async extends boolean = false> {
     loopB: Indices,
     options?: PartialBridgeOptions,
   ): RepairReturn<Async, BridgeStats>;
+  selectFacesScreen(
+    mesh: MeshHandle,
+    shape: ScreenSelectionShape,
+    options: ScreenSelectOptions,
+  ): RepairReturn<Async, Uint32Array>;
+  selectFacesInSphere(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    normalCone?: FaceSelectionNormalCone,
+  ): RepairReturn<Async, Uint32Array>;
+  selectByCreaseAngle(mesh: MeshHandle, seedTri: number, maxDihedralRad: number): RepairReturn<Async, Uint32Array>;
+  selectConnectedShell(mesh: MeshHandle, seedTri: number): RepairReturn<Async, Uint32Array>;
+  selectSmallFaceIslands(
+    mesh: MeshHandle,
+    maxFaceCount: number,
+    maxArea?: number,
+  ): RepairReturn<Async, Uint32Array>;
+  growFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings?: number,
+    adjacency?: AdjacencyKind,
+  ): RepairReturn<Async, Uint32Array>;
+  shrinkFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings?: number,
+    adjacency?: AdjacencyKind,
+  ): RepairReturn<Async, Uint32Array>;
+  fillSelectionHoles(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    maxHoleTris: number,
+  ): RepairReturn<Async, Uint32Array>;
+  smoothSelectionBoundary(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    iterations?: number,
+  ): RepairReturn<Async, Uint32Array>;
+  faceSelectionToVertexMask(mesh: MeshHandle, selectedTris: Indices): RepairReturn<Async, Float32Array>;
+  vertexMaskToFaceSelection(
+    mesh: MeshHandle,
+    mask: Float32Array | ArrayLike<number>,
+    threshold?: number,
+    requireAllVertices?: boolean,
+  ): RepairReturn<Async, Uint32Array>;
+  deleteSelectedFaces(mesh: MeshHandle, selectedTris: Indices): RepairReturn<Async, FaceEditReport>;
+  extractSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options?: { normals?: boolean },
+  ): RepairReturn<Async, MeshHandle>;
+  splitSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options?: { normals?: boolean },
+  ): RepairReturn<Async, SplitFacesReport>;
 }
 
 /**
@@ -130,6 +196,64 @@ export interface RepairDomain<Async extends boolean = false> {
   makeManifold(mesh: MeshHandle, options?: ManifoldOptions): RepairReturn<Async, ManifoldReport>;
   resolveSelfIntersections(mesh: MeshHandle, options?: SelfIntersectOptions): RepairReturn<Async, SelfIntersectReport>;
   cleanupSlivers(mesh: MeshHandle, options?: SliverOptions): RepairReturn<Async, SliverReport>;
+  selectFacesScreen(
+    mesh: MeshHandle,
+    shape: ScreenSelectionShape,
+    options: ScreenSelectOptions,
+  ): RepairReturn<Async, Uint32Array>;
+  selectFacesInSphere(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    normalCone?: FaceSelectionNormalCone,
+  ): RepairReturn<Async, Uint32Array>;
+  selectByCreaseAngle(mesh: MeshHandle, seedTri: number, maxDihedralRad: number): RepairReturn<Async, Uint32Array>;
+  selectConnectedShell(mesh: MeshHandle, seedTri: number): RepairReturn<Async, Uint32Array>;
+  selectSmallFaceIslands(
+    mesh: MeshHandle,
+    maxFaceCount: number,
+    maxArea?: number,
+  ): RepairReturn<Async, Uint32Array>;
+  growFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings?: number,
+    adjacency?: AdjacencyKind,
+  ): RepairReturn<Async, Uint32Array>;
+  shrinkFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings?: number,
+    adjacency?: AdjacencyKind,
+  ): RepairReturn<Async, Uint32Array>;
+  fillSelectionHoles(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    maxHoleTris: number,
+  ): RepairReturn<Async, Uint32Array>;
+  smoothSelectionBoundary(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    iterations?: number,
+  ): RepairReturn<Async, Uint32Array>;
+  faceSelectionToVertexMask(mesh: MeshHandle, selectedTris: Indices): RepairReturn<Async, Float32Array>;
+  vertexMaskToFaceSelection(
+    mesh: MeshHandle,
+    mask: Float32Array | ArrayLike<number>,
+    threshold?: number,
+    requireAllVertices?: boolean,
+  ): RepairReturn<Async, Uint32Array>;
+  deleteSelectedFaces(mesh: MeshHandle, selectedTris: Indices): RepairReturn<Async, FaceEditReport>;
+  extractSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options?: { normals?: boolean },
+  ): RepairReturn<Async, MeshHandle>;
+  splitSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options?: { normals?: boolean },
+  ): RepairReturn<Async, SplitFacesReport>;
 }
 
 /** Synchronous repair domain exposed by `Scene.repair`. */
@@ -215,5 +339,40 @@ export function createRepairDomain<Async extends boolean>(backend: RepairBackend
       backend.repair(mesh, { op: "resolveSelfIntersections", ...options }),
     cleanupSlivers: (mesh: MeshHandle, options: SliverOptions = {}) =>
       backend.repair(mesh, { op: "cleanupSlivers", ...options }),
+    selectFacesScreen: (mesh: MeshHandle, shape: ScreenSelectionShape, options: ScreenSelectOptions) =>
+      backend.selectFacesScreen(mesh, shape, options),
+    selectFacesInSphere: (
+      mesh: MeshHandle,
+      center: Readonly<Vec3>,
+      radius: number,
+      normalCone?: FaceSelectionNormalCone,
+    ) => backend.selectFacesInSphere(mesh, center, radius, normalCone),
+    selectByCreaseAngle: (mesh: MeshHandle, seedTri: number, maxDihedralRad: number) =>
+      backend.selectByCreaseAngle(mesh, seedTri, maxDihedralRad),
+    selectConnectedShell: (mesh: MeshHandle, seedTri: number) => backend.selectConnectedShell(mesh, seedTri),
+    selectSmallFaceIslands: (mesh: MeshHandle, maxFaceCount: number, maxArea?: number) =>
+      backend.selectSmallFaceIslands(mesh, maxFaceCount, maxArea),
+    growFaceSelection: (mesh: MeshHandle, selectedTris: Indices, rings?: number, adjacency?: AdjacencyKind) =>
+      backend.growFaceSelection(mesh, selectedTris, rings, adjacency),
+    shrinkFaceSelection: (mesh: MeshHandle, selectedTris: Indices, rings?: number, adjacency?: AdjacencyKind) =>
+      backend.shrinkFaceSelection(mesh, selectedTris, rings, adjacency),
+    fillSelectionHoles: (mesh: MeshHandle, selectedTris: Indices, maxHoleTris: number) =>
+      backend.fillSelectionHoles(mesh, selectedTris, maxHoleTris),
+    smoothSelectionBoundary: (mesh: MeshHandle, selectedTris: Indices, iterations?: number) =>
+      backend.smoothSelectionBoundary(mesh, selectedTris, iterations),
+    faceSelectionToVertexMask: (mesh: MeshHandle, selectedTris: Indices) =>
+      backend.faceSelectionToVertexMask(mesh, selectedTris),
+    vertexMaskToFaceSelection: (
+      mesh: MeshHandle,
+      mask: Float32Array | ArrayLike<number>,
+      threshold?: number,
+      requireAllVertices?: boolean,
+    ) => backend.vertexMaskToFaceSelection(mesh, mask, threshold, requireAllVertices),
+    deleteSelectedFaces: (mesh: MeshHandle, selectedTris: Indices) =>
+      backend.deleteSelectedFaces(mesh, selectedTris),
+    extractSelectedFaces: (mesh: MeshHandle, selectedTris: Indices, options?: { normals?: boolean }) =>
+      backend.extractSelectedFaces(mesh, selectedTris, options),
+    splitSelectedFaces: (mesh: MeshHandle, selectedTris: Indices, options?: { normals?: boolean }) =>
+      backend.splitSelectedFaces(mesh, selectedTris, options),
   }) as RepairDomain<Async>;
 }

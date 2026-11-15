@@ -125,19 +125,78 @@ import { checkInteractionPoints, copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
 import { type SceneMeshViews, ViewGuard } from "../views.js";
 import {
+  type AdjacencyKind,
+  type ArapOptions,
+  checkBooleanArg,
+  checkPositiveArg,
+  checkU32Arg,
+  cloudBuffer,
+  type CollisionRule,
+  type CollisionRuleInput,
+  type CollisionStepReport,
+  type ContourSlice,
+  DEFAULT_COLLISION_RULE,
+  type DrainHoleOptions,
+  type DrainHoleReport,
+  type FaceEditReport,
+  type FaceSelectionNormalCone,
+  type FfdBasisInput,
+  type FfdLatticeData,
+  type FfdOptions,
+  type FitPrimitiveOptions,
+  type FittedPrimitive,
+  type FittedPrimitiveReport,
+  type FreeformReport,
+  type HollowOptions,
+  type HollowReport,
+  type KelvinletOptions,
+  normalizeAlignToPrimitiveArgs,
+  normalizeArapArgs,
+  normalizeBuildFfdLatticeArgs,
+  normalizeCollisionRule,
+  normalizeDrainHoleArgs,
+  normalizeFfdArgs,
+  normalizeFitPrimitiveArgs,
+  normalizeGrowShrinkArgs,
+  normalizeHollowArgs,
+  normalizeKelvinletArgs,
+  normalizePlacementInputArgs,
+  normalizePlaceMeshArgs,
+  normalizeReconstructArgs,
+  normalizeScreenSelectArgs,
+  normalizeSelectInSphereArgs,
+  normalizeSelectSmallIslandsArgs,
+  normalizeSliceContoursArgs,
+  normalizeSliceContourStackArgs,
+  normalizeU32Selection,
+  normalizeVertexMaskSelectArgs,
+  normalizeXpbdArgs,
+  type PackedPointCloud,
+  type PlaceMeshOptions,
+  type PlaceMeshReport,
+  type ScreenSelectionShape,
+  type ScreenSelectOptions,
+  type SplitFacesReport,
+  type SurfaceReconstructOptions,
+  type XpbdOptions,
+} from "../wave6.js";
+import {
   type ClientId,
   type ColorRuleWire,
+  type DrainHoleReportWire,
   type ErrorWire,
   type FieldDescWire,
   type InitMessage,
   isLastWins,
   keyOf,
   type MeshChangeWire,
+  type PlaceMeshReportWire,
   type PoolCrash,
   type QueryMap,
   type Request,
   type Result,
   type SectionDescWire,
+  type SplitFacesReportWire,
   supersedes,
   type WorkerMessage,
 } from "./protocol.js";
@@ -748,6 +807,10 @@ export class WorkerScene implements SceneLike {
   #warned = false;
   /** The current Worker's crash channel (see `#watch`), while it may run threaded. */
   #crashWatch: BroadcastChannel | undefined;
+  /** Default collision response rule persisted across Worker restarts. */
+  #defaultCollisionRule: CollisionRule = { ...DEFAULT_COLLISION_RULE };
+  /** Explicit per-pair collision rules keyed canonically by sorted ClientId pair. */
+  readonly #collisionRules = new Map<string, { a: MeshState; b: MeshState; rule: CollisionRule }>();
 
   /**
    * Callable async repair domain (`worker.repair(mesh, op)` and `worker.repair.<method>(...)`).
@@ -760,6 +823,25 @@ export class WorkerScene implements SceneLike {
     fillHoleContinuity: (mesh, loopIndex, options) => this.fillHoleContinuity(mesh, loopIndex, options),
     fillAllHolesContinuity: (mesh, options) => this.fillAllHolesContinuity(mesh, options),
     bridgePartialArcs: (mesh, loopA, loopB, options) => this.bridgePartialArcs(mesh, loopA, loopB, options),
+    selectFacesScreen: (mesh, shape, options) => this.selectFacesScreen(mesh, shape, options),
+    selectFacesInSphere: (mesh, center, radius, normalCone) =>
+      this.selectFacesInSphere(mesh, center, radius, normalCone),
+    selectByCreaseAngle: (mesh, seedTri, maxDihedralRad) => this.selectByCreaseAngle(mesh, seedTri, maxDihedralRad),
+    selectConnectedShell: (mesh, seedTri) => this.selectConnectedShell(mesh, seedTri),
+    selectSmallFaceIslands: (mesh, maxFaceCount, maxArea) => this.selectSmallFaceIslands(mesh, maxFaceCount, maxArea),
+    growFaceSelection: (mesh, selectedTris, rings, adjacency) =>
+      this.growFaceSelection(mesh, selectedTris, rings, adjacency),
+    shrinkFaceSelection: (mesh, selectedTris, rings, adjacency) =>
+      this.shrinkFaceSelection(mesh, selectedTris, rings, adjacency),
+    fillSelectionHoles: (mesh, selectedTris, maxHoleTris) => this.fillSelectionHoles(mesh, selectedTris, maxHoleTris),
+    smoothSelectionBoundary: (mesh, selectedTris, iterations) =>
+      this.smoothSelectionBoundary(mesh, selectedTris, iterations),
+    faceSelectionToVertexMask: (mesh, selectedTris) => this.faceSelectionToVertexMask(mesh, selectedTris),
+    vertexMaskToFaceSelection: (mesh, mask, threshold, requireAllVertices) =>
+      this.vertexMaskToFaceSelection(mesh, mask, threshold, requireAllVertices),
+    deleteSelectedFaces: (mesh, selectedTris) => this.deleteSelectedFaces(mesh, selectedTris),
+    extractSelectedFaces: (mesh, selectedTris, options) => this.extractSelectedFaces(mesh, selectedTris, options),
+    splitSelectedFaces: (mesh, selectedTris, options) => this.splitSelectedFaces(mesh, selectedTris, options),
   });
 
   /**
@@ -796,12 +878,20 @@ export class WorkerScene implements SceneLike {
       Array.isArray(optionsOrCurve)
         ? this.trimByCurve(mesh, optionsOrCurve, maybeOptions)
         : this.trimByCurve(mesh, optionsOrCurve as TrimCurveOptions),
+    hollowMesh: (mesh, options) => this.hollowMesh(mesh, options),
+    punchDrainHole: (mesh, options) => this.punchDrainHole(mesh, options),
+    placeMesh: (target, stamp, options) => this.placeMesh(target, stamp, options),
   });
 
   /** Async surface deformation and vertex-protection domain. */
   readonly deform: WorkerDeformDomain = createDeformDomain({
     sculpt: ((mesh: MeshHandle, op: SculptOp) =>
       this.#runRepair(mesh, op as RepairOp)) as DeformBackend<true>["sculpt"],
+    buildFfdLattice: (mesh, dims, basis, padding) => this.buildFfdLattice(mesh, dims, basis, padding),
+    applyFfd: (mesh, options) => this.applyFfd(mesh, options),
+    applyArap: (mesh, options) => this.applyArap(mesh, options),
+    applyKelvinlet: (mesh, options) => this.applyKelvinlet(mesh, options),
+    applyXpbd: (mesh, options) => this.applyXpbd(mesh, options),
   });
 
   /** Async defect analysis, printability/quality inspection, metrology, geodesics, queries, fields, and section domain. */
@@ -837,6 +927,13 @@ export class WorkerScene implements SceneLike {
     removeSection: (section) => this.removeSection(section),
     section: (section, mesh) => this.section(section, mesh),
     sectionGap: (section, a, b) => this.sectionGap(section, a, b),
+    fitPrimitive: (mesh, options) => this.fitPrimitive(mesh, options),
+    alignToFittedPrimitive: (mesh, primitive, targetAxis, targetOrigin) =>
+      this.alignToFittedPrimitive(mesh, primitive, targetAxis, targetOrigin),
+    sliceContours: (mesh, origin, normal) => this.sliceContours(mesh, origin, normal),
+    sliceContourStack: (mesh, origin, normal, spacing, count) =>
+      this.sliceContourStack(mesh, origin, normal, spacing, count),
+    reconstructPointCloud: (cloud, options) => this.reconstructPointCloud(cloud, options),
   });
 
   /** Async rigid registration, multi-stage alignment, landmark SVD, and symmetry domain. */
@@ -1330,6 +1427,16 @@ export class WorkerScene implements SceneLike {
           scale: p.scale as Vec3,
           matrix4: Float64Array.from(p.matrix4),
         };
+        if (
+          p.authoritative &&
+          st.local !== undefined &&
+          st.localUntil === Number.POSITIVE_INFINITY &&
+          r.rev >= (this.#latest.get(`placement:${st.id}`) ?? 0) &&
+          !samePose(st.local, st.pose)
+        ) {
+          st.local = st.pose;
+          this.#optimistic.add(st);
+        }
       }
     }
     for (const s of r.sections) {
@@ -1771,6 +1878,11 @@ export class WorkerScene implements SceneLike {
     for (const s of this.#sections.values()) {
       if (!s.removed) {
         s.meshes = s.meshes.filter((m) => m !== st);
+      }
+    }
+    for (const [key, entry] of [...this.#collisionRules.entries()]) {
+      if (entry.a === st || entry.b === st) {
+        this.#collisionRules.delete(key);
       }
     }
   }
@@ -2437,6 +2549,589 @@ export class WorkerScene implements SceneLike {
       },
       (v) => v,
     );
+  }
+
+  // ---- Wave 6: Face selection (#233), freeform deform (#193), collision (#194), metrology (#234), print prep (#236) ----
+
+  selectFacesScreen(mesh: MeshHandle, shape: ScreenSelectionShape, options: ScreenSelectOptions): Promise<Uint32Array> {
+    return this.#query(
+      "selectFacesScreen",
+      () => {
+        const id = this.#live(mesh).id;
+        normalizeScreenSelectArgs(shape, options);
+        return { mesh: id, shape: copyInput(shape, "shape"), options: copyInput(options, "options") };
+      },
+      (v) => v,
+    );
+  }
+
+  selectFacesInSphere(
+    mesh: MeshHandle,
+    center: Readonly<Vec3>,
+    radius: number,
+    normalCone?: FaceSelectionNormalCone,
+  ): Promise<Uint32Array> {
+    return this.#query(
+      "selectFacesInSphere",
+      () => {
+        const id = this.#live(mesh).id;
+        normalizeSelectInSphereArgs(center, radius, normalCone);
+        return {
+          mesh: id,
+          center: [center[0], center[1], center[2]] as Vec3,
+          radius,
+          ...(normalCone === undefined
+            ? {}
+            : {
+                normalCone: {
+                  normal: [normalCone.normal[0], normalCone.normal[1], normalCone.normal[2]] as Vec3,
+                  angleRad: normalCone.angleRad,
+                },
+              }),
+        };
+      },
+      (v) => v,
+    );
+  }
+
+  selectByCreaseAngle(mesh: MeshHandle, seedTri: number, maxDihedralRad: number): Promise<Uint32Array> {
+    return this.#query(
+      "selectByCreaseAngle",
+      () => ({
+        mesh: this.#live(mesh).id,
+        seedTri: checkU32Arg(seedTri, "seedTri"),
+        maxDihedralRad,
+      }),
+      (v) => v,
+    );
+  }
+
+  selectConnectedShell(mesh: MeshHandle, seedTri: number): Promise<Uint32Array> {
+    return this.#query(
+      "selectConnectedShell",
+      () => ({ mesh: this.#live(mesh).id, seedTri: checkU32Arg(seedTri, "seedTri") }),
+      (v) => v,
+    );
+  }
+
+  selectSmallFaceIslands(mesh: MeshHandle, maxFaceCount: number, maxArea?: number): Promise<Uint32Array> {
+    return this.#query(
+      "selectSmallFaceIslands",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeSelectSmallIslandsArgs(maxFaceCount, maxArea);
+        return { mesh: id, maxFaceCount: n.maxFaceCount, ...(maxArea === undefined ? {} : { maxArea: n.maxArea }) };
+      },
+      (v) => v,
+    );
+  }
+
+  growFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings = 1,
+    adjacency: AdjacencyKind = "edge",
+  ): Promise<Uint32Array> {
+    return this.#query(
+      "growFaceSelection",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeGrowShrinkArgs(selectedTris, rings, adjacency);
+        return { mesh: id, selectedTris: n.selectedTris, rings: n.rings, adjacency };
+      },
+      (v) => v,
+    );
+  }
+
+  shrinkFaceSelection(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    rings = 1,
+    adjacency: AdjacencyKind = "edge",
+  ): Promise<Uint32Array> {
+    return this.#query(
+      "shrinkFaceSelection",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeGrowShrinkArgs(selectedTris, rings, adjacency);
+        return { mesh: id, selectedTris: n.selectedTris, rings: n.rings, adjacency };
+      },
+      (v) => v,
+    );
+  }
+
+  fillSelectionHoles(mesh: MeshHandle, selectedTris: Indices, maxHoleTris: number): Promise<Uint32Array> {
+    return this.#query(
+      "fillSelectionHoles",
+      () => ({
+        mesh: this.#live(mesh).id,
+        selectedTris: normalizeU32Selection(selectedTris),
+        maxHoleTris: checkU32Arg(maxHoleTris, "maxHoleTris"),
+      }),
+      (v) => v,
+    );
+  }
+
+  smoothSelectionBoundary(mesh: MeshHandle, selectedTris: Indices, iterations = 1): Promise<Uint32Array> {
+    return this.#query(
+      "smoothSelectionBoundary",
+      () => ({
+        mesh: this.#live(mesh).id,
+        selectedTris: normalizeU32Selection(selectedTris),
+        iterations: checkU32Arg(iterations, "iterations"),
+      }),
+      (v) => v,
+    );
+  }
+
+  faceSelectionToVertexMask(mesh: MeshHandle, selectedTris: Indices): Promise<Float32Array> {
+    return this.#query(
+      "faceSelectionToVertexMask",
+      () => ({ mesh: this.#live(mesh).id, selectedTris: normalizeU32Selection(selectedTris) }),
+      (v) => v,
+    );
+  }
+
+  vertexMaskToFaceSelection(
+    mesh: MeshHandle,
+    mask: Float32Array | ArrayLike<number>,
+    threshold = 0.5,
+    requireAllVertices = false,
+  ): Promise<Uint32Array> {
+    return this.#query(
+      "vertexMaskToFaceSelection",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeVertexMaskSelectArgs(mask, threshold, requireAllVertices);
+        return { mesh: id, mask: n.mask, threshold: n.threshold, requireAllVertices: n.requireAllVertices };
+      },
+      (v) => v,
+    );
+  }
+
+  deleteSelectedFaces(mesh: MeshHandle, selectedTris: Indices): Promise<FaceEditReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const tris = normalizeU32Selection(selectedTris);
+        this.#endDragOn(st);
+        return { kind: "deleteSelectedFaces", rev, id: st.id, selectedTris: tris, qid };
+      },
+      (v) => v as FaceEditReport,
+    );
+  }
+
+  extractSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options: { normals?: boolean } = {},
+  ): Promise<MeshHandle> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const tris = normalizeU32Selection(selectedTris);
+        const normals = checkBooleanArg(options?.normals, st.normalsOn, "options.normals");
+        this.#endDragOn(st);
+        added = this.#allocMeshState(st.origin, normals);
+        return { kind: "extractSelectedFaces", rev, id: st.id, addedId: added.id, selectedTris: tris, normals, qid };
+      },
+      () => (added as MeshState).handle,
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  splitSelectedFaces(
+    mesh: MeshHandle,
+    selectedTris: Indices,
+    options: { normals?: boolean } = {},
+  ): Promise<SplitFacesReport> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const tris = normalizeU32Selection(selectedTris);
+        const normals = checkBooleanArg(options?.normals, st.normalsOn, "options.normals");
+        this.#endDragOn(st);
+        added = this.#allocMeshState(st.origin, normals);
+        return { kind: "splitSelectedFaces", rev, id: st.id, addedId: added.id, selectedTris: tris, normals, qid };
+      },
+      (v) => {
+        const r = v as SplitFacesReportWire;
+        return {
+          detached: this.#handleOf(r.detached),
+          removedTriangles: r.removedTriangles,
+          removedVertices: r.removedVertices,
+        };
+      },
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  buildFfdLattice(
+    mesh: MeshHandle,
+    dims: readonly [number, number, number],
+    basis: FfdBasisInput = "bernstein",
+    padding = 0,
+  ): Promise<FfdLatticeData> {
+    return this.#query(
+      "buildFfdLattice",
+      () => {
+        const id = this.#live(mesh).id;
+        normalizeBuildFfdLatticeArgs(dims, basis, padding);
+        return { mesh: id, dims: [dims[0], dims[1], dims[2]] as [number, number, number], basis, padding };
+      },
+      (v) => v,
+    );
+  }
+
+  applyFfd(mesh: MeshHandle, options: FfdOptions): Promise<FreeformReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        normalizeFfdArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "applyFfd", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as FreeformReport,
+    );
+  }
+
+  applyArap(mesh: MeshHandle, options: ArapOptions): Promise<FreeformReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        normalizeArapArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "applyArap", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as FreeformReport,
+    );
+  }
+
+  applyKelvinlet(mesh: MeshHandle, options: KelvinletOptions): Promise<FreeformReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        normalizeKelvinletArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "applyKelvinlet", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as FreeformReport,
+    );
+  }
+
+  applyXpbd(mesh: MeshHandle, options: XpbdOptions): Promise<FreeformReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        normalizeXpbdArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "applyXpbd", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as FreeformReport,
+    );
+  }
+
+  setDefaultCollisionRule(rule: CollisionRuleInput): void {
+    this.#alive();
+    const normalized = normalizeCollisionRule(rule);
+    this.#defaultCollisionRule = normalized;
+    this.#push({ kind: "setDefaultCollisionRule", rev: ++this.#rev, rule: { ...normalized } });
+  }
+
+  defaultCollisionRule(): CollisionRule {
+    this.#alive();
+    return { ...this.#defaultCollisionRule };
+  }
+
+  setCollisionRule(a: MeshHandle, b: MeshHandle, rule: CollisionRuleInput): void {
+    const sa = this.#live(a);
+    const sb = this.#live(b);
+    if (sa === sb) {
+      throw invalid("collision rule requires two distinct meshes");
+    }
+    const normalized = normalizeCollisionRule(rule);
+    this.#collisionRules.set(collisionPairKey(sa.id, sb.id), { a: sa, b: sb, rule: normalized });
+    this.#push({ kind: "setCollisionRule", rev: ++this.#rev, a: sa.id, b: sb.id, rule: { ...normalized } });
+  }
+
+  clearCollisionRule(a: MeshHandle, b: MeshHandle): boolean {
+    const sa = this.#live(a);
+    const sb = this.#live(b);
+    if (sa === sb) {
+      throw invalid("collision rule requires two distinct meshes");
+    }
+    const existed = this.#collisionRules.delete(collisionPairKey(sa.id, sb.id));
+    this.#push({ kind: "clearCollisionRule", rev: ++this.#rev, a: sa.id, b: sb.id });
+    return existed;
+  }
+
+  collisionRule(a: MeshHandle, b: MeshHandle): CollisionRule {
+    const sa = this.#live(a);
+    const sb = this.#live(b);
+    if (sa === sb) {
+      throw invalid("collision rule requires two distinct meshes");
+    }
+    const entry = this.#collisionRules.get(collisionPairKey(sa.id, sb.id));
+    return entry !== undefined ? { ...entry.rule } : { ...this.#defaultCollisionRule };
+  }
+
+  hasActiveCollisionResponse(mesh: MeshHandle): boolean {
+    const st = this.#live(mesh);
+    if (this.#defaultCollisionRule.mode !== "passThrough") {
+      return true;
+    }
+    for (const entry of this.#collisionRules.values()) {
+      if ((entry.a === st || entry.b === st) && !entry.a.removed && !entry.b.removed && entry.rule.mode !== "passThrough") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  moveWithCollision(
+    mesh: MeshHandle,
+    placement: PlacementInput,
+    isRelease = false,
+  ): Promise<CollisionStepReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const norm = normalizePlacementInputArgs(placement);
+        const release = checkBooleanArg(isRelease, false, "isRelease");
+        this.#endDragOn(st);
+        const wirePlacement: PlacementInput = {
+          rotation: Array.from(norm.rotation),
+          translation: [norm.translation[0], norm.translation[1], norm.translation[2]],
+          ...(norm.scale === undefined ? {} : { scale: [norm.scale[0], norm.scale[1], norm.scale[2]] }),
+        };
+        return { kind: "moveWithCollision", rev, id: st.id, placement: wirePlacement, isRelease: release, qid };
+      },
+      (v) => this.#mapCollisionReport(v as CollisionStepReport<ClientId>),
+    );
+  }
+
+  commitCollisionInteraction(mesh: MeshHandle): Promise<CollisionStepReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        this.#endDragOn(st);
+        return { kind: "commitCollisionInteraction", rev, id: st.id, qid };
+      },
+      (v) => this.#mapCollisionReport(v as CollisionStepReport<ClientId>),
+    );
+  }
+
+  fitPrimitive(mesh: MeshHandle, options: FitPrimitiveOptions = {}): Promise<FittedPrimitiveReport> {
+    return this.#query(
+      "fitPrimitive",
+      () => {
+        const id = this.#live(mesh).id;
+        normalizeFitPrimitiveArgs(options);
+        return { mesh: id, options: copyInput(options, "options") };
+      },
+      (v) => v,
+    );
+  }
+
+  alignToFittedPrimitive(
+    mesh: MeshHandle,
+    primitive: FittedPrimitive,
+    targetAxis: Readonly<Vec3>,
+    targetOrigin: Readonly<Vec3>,
+  ): Promise<Placement> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const n = normalizeAlignToPrimitiveArgs(primitive, targetAxis, targetOrigin);
+        this.#endDragOn(st);
+        return {
+          kind: "alignToFittedPrimitive",
+          rev,
+          id: st.id,
+          primitive: copyInput(primitive, "primitive"),
+          targetAxis: [n.targetAxis[0], n.targetAxis[1], n.targetAxis[2]] as Vec3,
+          targetOrigin: [n.targetOrigin[0], n.targetOrigin[1], n.targetOrigin[2]] as Vec3,
+          qid,
+        };
+      },
+      (v) => v as Placement,
+    );
+  }
+
+  sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): Promise<ContourSlice> {
+    return this.#query(
+      "sliceContours",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeSliceContoursArgs(origin, normal);
+        return {
+          mesh: id,
+          origin: [n.origin[0], n.origin[1], n.origin[2]] as Vec3,
+          normal: [n.normal[0], n.normal[1], n.normal[2]] as Vec3,
+        };
+      },
+      (v) => v,
+    );
+  }
+
+  sliceContourStack(
+    mesh: MeshHandle,
+    origin: Readonly<Vec3>,
+    normal: Readonly<Vec3>,
+    spacing: number,
+    count: number,
+  ): Promise<ContourSlice[]> {
+    return this.#query(
+      "sliceContourStack",
+      () => {
+        const id = this.#live(mesh).id;
+        const n = normalizeSliceContourStackArgs(origin, normal, spacing, count);
+        return {
+          mesh: id,
+          origin: [n.origin[0], n.origin[1], n.origin[2]] as Vec3,
+          normal: [n.normal[0], n.normal[1], n.normal[2]] as Vec3,
+          spacing: n.spacing,
+          count: n.count,
+        };
+      },
+      (v) => v,
+    );
+  }
+
+  reconstructPointCloud(
+    cloud: PackedPointCloud | Float32Array,
+    options: SurfaceReconstructOptions = {},
+  ): Promise<MeshHandle> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        this.#alive();
+        const buf = cloudBuffer(cloud).slice();
+        normalizeReconstructArgs(options);
+        const normals = checkBooleanArg(options?.normals, true, "options.normals");
+        added = this.#allocMeshState([0, 0, 0], normals);
+        return {
+          kind: "reconstructPointCloud",
+          rev,
+          addedId: added.id,
+          cloud: buf,
+          options: copyInput(options, "options"),
+          qid,
+        };
+      },
+      () => (added as MeshState).handle,
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  hollowMesh(mesh: MeshHandle, options: HollowOptions): Promise<HollowReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        normalizeHollowArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "hollowMesh", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as HollowReport,
+    );
+  }
+
+  punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): Promise<DrainHoleReport> {
+    let plug: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const n = normalizeDrainHoleArgs(options);
+        const plugNormals = checkBooleanArg(n.plugNormals, st.normalsOn, "options.plugNormals");
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        plug = n.generatePlug ? this.#allocMeshState(st.origin, plugNormals) : undefined;
+        return {
+          kind: "punchDrainHole",
+          rev,
+          id: st.id,
+          ...(plug === undefined ? {} : { plugId: plug.id }),
+          options: cloned,
+          qid,
+        };
+      },
+      (v) => {
+        const r = v as DrainHoleReportWire;
+        if (plug !== undefined && !r.plugs.includes(plug.id)) {
+          this.#discardPlaceholder(plug);
+        }
+        return {
+          ...r,
+          plugs: r.plugs.map((pid) => this.#handleOf(pid)),
+        };
+      },
+    ).catch((e) => {
+      this.#discardPlaceholder(plug);
+      throw e;
+    });
+  }
+
+  placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): Promise<PlaceMeshReport> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const stTarget = this.#live(target);
+        const stStamp = this.#live(stamp);
+        const n = normalizePlaceMeshArgs(options);
+        const normals = checkBooleanArg(n.normals, stStamp.normalsOn, "options.normals");
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(stTarget, stStamp);
+        added = (options.mode ?? "keepSeparate") === "keepSeparate"
+          ? this.#allocMeshState(stTarget.origin, normals)
+          : undefined;
+        return {
+          kind: "placeMesh",
+          rev,
+          target: stTarget.id,
+          stamp: stStamp.id,
+          ...(added === undefined ? {} : { addedId: added.id }),
+          options: cloned,
+          qid,
+        };
+      },
+      (v) => {
+        const r = v as PlaceMeshReportWire;
+        if (added !== undefined && r.added !== added.id) {
+          this.#discardPlaceholder(added);
+        }
+        return {
+          ...r,
+          added: r.added === null ? null : this.#handleOf(r.added),
+        };
+      },
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  #mapCollisionReport(r: CollisionStepReport<ClientId>): CollisionStepReport {
+    return {
+      ...r,
+      activePairs: r.activePairs.map((p) => ({
+        ...p,
+        other: this.#handleOf(p.other),
+      })),
+      modifiedMeshes: r.modifiedMeshes.map((id) => this.#handleOf(id)),
+    };
   }
 
   // ---- History ----
@@ -3368,6 +4063,24 @@ export class WorkerScene implements SceneLike {
       };
       this.#push({ kind: "section", rev: ++this.#rev, section: s.id, op: "add", desc });
     }
+    this.#push({
+      kind: "setDefaultCollisionRule",
+      rev: ++this.#rev,
+      rule: { ...this.#defaultCollisionRule },
+    });
+    for (const [key, entry] of [...this.#collisionRules.entries()]) {
+      if (!entry.a.removed && !entry.b.removed && replayed.has(entry.a.id) && replayed.has(entry.b.id)) {
+        this.#push({
+          kind: "setCollisionRule",
+          rev: ++this.#rev,
+          a: entry.a.id,
+          b: entry.b.id,
+          rule: { ...entry.rule },
+        });
+      } else if (!replayed.has(entry.a.id) || !replayed.has(entry.b.id)) {
+        this.#collisionRules.delete(key);
+      }
+    }
     const rev = this.#push({ kind: "clearHistory", rev: ++this.#rev });
     // Declarative keys the replay covers without a request of their own
     // compute until its result.
@@ -3649,6 +4362,10 @@ function checkPlane(plane: SectionPlane): SectionPlane {
     throw invalid("plane normal must not be zero");
   }
   return { origin, normal };
+}
+
+function collisionPairKey(a: ClientId, b: ClientId): string {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
 }
 
 /**

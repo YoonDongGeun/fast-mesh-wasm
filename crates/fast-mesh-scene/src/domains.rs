@@ -12,28 +12,36 @@
 //! All methods delegate cleanly to [`Scene`] without duplicating core logic.
 
 use fast_mesh_bvh::Aabb;
-use fast_mesh_ops::boolean::{OffsetOptions, OffsetReport, ShellOptions, ShellReport};
-use fast_mesh_ops::inspect::{Analysis, AnalyzeOptions, BoundaryLoop, MeasureReport};
+use fast_mesh_ops::boolean::{
+    DrainHoleOptions, DrainHoleReport, DrainHoleSpec, HollowOptions, HollowReport, OffsetOptions,
+    OffsetReport, PlaceMeshParams, PlaceMeshReport, ShellOptions, ShellReport,
+};
+use fast_mesh_ops::deform::{FfdBasis, FfdLattice, FreeformOp, FreeformReport};
+use fast_mesh_ops::inspect::{
+    Analysis, AnalyzeOptions, BoundaryLoop, ContourSlice, FitPrimitiveOptions, FitPrimitiveReport,
+    FittedPrimitive, MeasureReport, PointCloud, PrimitiveKind, SurfaceReconstructOptions,
+};
 use fast_mesh_ops::remesh::{
     RemeshOptions, RemeshReport, SimplifyOptions, SimplifyReport, SubdivideOptions, SubdivideReport,
 };
 use fast_mesh_ops::repair::{
-    AutoRepairOptions, AutoRepairReport, BridgeStats, ComponentOptions, DegenerateOptions,
-    DegenerateReport, FillHolesOptions, FillOptions, FillReport, FillStats, ManifoldOptions,
-    ManifoldReport, OrientReport, PartialBridgeOptions, RemoveReport, SelfIntersectOptions,
-    SelfIntersectReport, SliverOptions, SliverReport, WeldReport,
+    AdjacencyKind, AutoRepairOptions, AutoRepairReport, BridgeStats, ComponentOptions,
+    DegenerateOptions, DegenerateReport, FaceEditReport, FillHolesOptions, FillOptions, FillReport,
+    FillStats, ManifoldOptions, ManifoldReport, OrientReport, PartialBridgeOptions, RemoveReport,
+    ScreenSelectOptions, ScreenSelectionShape, SelfIntersectOptions, SelfIntersectReport,
+    SliverOptions, SliverReport, WeldReport,
 };
 use fast_mesh_ops::sculpt::{DyntopoOptions, DyntopoPatch, StretchOptions, StretchReport};
-use fast_mesh_store::VertexId;
+use fast_mesh_store::{TriangleId, VertexId};
 
 use crate::{
     BooleanOp, BooleanOptions, BooleanReport, Contact, ContactFilter, CsgNode, CurvatureField,
     CutOptions, CutReport, Dab, DabReport, DeviationOptions, DeviationStats, DistanceField,
     FieldId, GeodesicOptions, JoinOptions, JoinReport, LandmarkAlignment, LandmarkPair, MeshId,
-    OverhangOptions, OverhangReport, QualityMetric, QualityReport, RegisterOptions, RegisterReport,
-    RegistrationOptions, RegistrationReport, Result, Scene, SceneClosestHit, SceneClosestOptions,
-    SceneMeshDistance, SceneRayHit, SceneRayOptions, SectionDesc, SectionId, SurfacePathPoint,
-    SymmetryPlaneReport, ThicknessField, TrimCurveOptions, TrimReport,
+    OverhangOptions, OverhangReport, Placement, QualityMetric, QualityReport, RegisterOptions,
+    RegisterReport, RegistrationOptions, RegistrationReport, Result, Scene, SceneClosestHit,
+    SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions, SectionDesc, SectionId,
+    SurfacePathPoint, SymmetryPlaneReport, ThicknessField, TrimCurveOptions, TrimReport, Vec3,
 };
 
 /// Repair domain operations on [`Scene`].
@@ -105,6 +113,105 @@ pub trait SceneRepairOps {
         id: MeshId,
         options: &ComponentOptions,
     ) -> Result<RemoveReport>;
+
+    /// Selects triangles inside/touching a 2D screen-space rectangle or lasso polygon.
+    fn select_faces_screen(
+        &mut self,
+        id: MeshId,
+        shape: &ScreenSelectionShape,
+        world_opts: &ScreenSelectOptions,
+    ) -> Result<Vec<u32>>;
+
+    /// Selects triangles intersecting a world sphere, optionally filtered by a world normal cone.
+    fn select_faces_in_sphere_world(
+        &mut self,
+        id: MeshId,
+        world_center: Vec3,
+        world_radius: f64,
+        world_normal_cone: Option<(Vec3, f64)>,
+    ) -> Result<Vec<u32>>;
+
+    /// Flood-selects triangles edge-connected to `seed_tri` within `max_dihedral_rad`.
+    fn select_by_crease_angle(
+        &self,
+        id: MeshId,
+        seed_tri: TriangleId,
+        max_dihedral_rad: f64,
+    ) -> Result<Vec<u32>>;
+
+    /// Selects the entire edge-connected shell containing `seed_tri`.
+    fn select_connected_shell(&self, id: MeshId, seed_tri: TriangleId) -> Result<Vec<u32>>;
+
+    /// Selects edge-connected face islands matching triangle count and area limits.
+    fn select_small_face_islands(
+        &self,
+        id: MeshId,
+        max_face_count: usize,
+        max_area: Option<f64>,
+    ) -> Result<Vec<u32>>;
+
+    /// Grows `selected_tris` outward by `rings` across `adjacency`.
+    fn grow_face_selection(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        rings: usize,
+        adjacency: AdjacencyKind,
+    ) -> Result<Vec<u32>>;
+
+    /// Shrinks `selected_tris` inward by `rings` across `adjacency`.
+    fn shrink_face_selection(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        rings: usize,
+        adjacency: AdjacencyKind,
+    ) -> Result<Vec<u32>>;
+
+    /// Fills interior pockets of unselected faces up to `max_hole_tris` triangles.
+    fn fill_selection_holes(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        max_hole_tris: usize,
+    ) -> Result<Vec<u32>>;
+
+    /// Smooths the border of `selected_tris` by majority voting for `iterations` passes.
+    fn smooth_selection_boundary(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        iterations: usize,
+    ) -> Result<Vec<u32>>;
+
+    /// Converts `selected_tris` into a dense per-vertex-slot weight mask.
+    fn face_selection_to_vertex_mask(&self, id: MeshId, selected_tris: &[u32]) -> Result<Vec<f32>>;
+
+    /// Converts a dense per-vertex-slot weight mask into sorted triangle indices.
+    fn vertex_mask_to_face_selection(
+        &self,
+        id: MeshId,
+        mask: &[f32],
+        threshold: f32,
+        require_all_vertices: bool,
+    ) -> Result<Vec<u32>>;
+
+    /// Deletes `selected_tris` and newly orphaned vertices from `id`.
+    fn delete_selected_faces(
+        &mut self,
+        id: MeshId,
+        selected_tris: &[u32],
+    ) -> Result<FaceEditReport>;
+
+    /// Extracts `selected_tris` into a new scene mesh preserving exact world coordinates.
+    fn extract_selected_faces(&mut self, id: MeshId, selected_tris: &[u32]) -> Result<MeshId>;
+
+    /// Splits `selected_tris` out of `id` into a new scene mesh preserving world coordinates.
+    fn split_selected_faces(
+        &mut self,
+        id: MeshId,
+        selected_tris: &[u32],
+    ) -> Result<(MeshId, FaceEditReport)>;
 }
 
 impl SceneRepairOps for Scene {
@@ -237,6 +344,119 @@ impl SceneRepairOps for Scene {
         self.edit(id, |tx| {
             crate::ops::repair::remove_small_components(tx, options)
         })
+    }
+
+    fn select_faces_screen(
+        &mut self,
+        id: MeshId,
+        shape: &ScreenSelectionShape,
+        world_opts: &ScreenSelectOptions,
+    ) -> Result<Vec<u32>> {
+        Scene::select_faces_screen(self, id, shape, world_opts)
+    }
+
+    fn select_faces_in_sphere_world(
+        &mut self,
+        id: MeshId,
+        world_center: Vec3,
+        world_radius: f64,
+        world_normal_cone: Option<(Vec3, f64)>,
+    ) -> Result<Vec<u32>> {
+        Scene::select_faces_in_sphere_world(self, id, world_center, world_radius, world_normal_cone)
+    }
+
+    fn select_by_crease_angle(
+        &self,
+        id: MeshId,
+        seed_tri: TriangleId,
+        max_dihedral_rad: f64,
+    ) -> Result<Vec<u32>> {
+        Scene::select_by_crease_angle(self, id, seed_tri, max_dihedral_rad)
+    }
+
+    fn select_connected_shell(&self, id: MeshId, seed_tri: TriangleId) -> Result<Vec<u32>> {
+        Scene::select_connected_shell(self, id, seed_tri)
+    }
+
+    fn select_small_face_islands(
+        &self,
+        id: MeshId,
+        max_face_count: usize,
+        max_area: Option<f64>,
+    ) -> Result<Vec<u32>> {
+        Scene::select_small_face_islands(self, id, max_face_count, max_area)
+    }
+
+    fn grow_face_selection(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        rings: usize,
+        adjacency: AdjacencyKind,
+    ) -> Result<Vec<u32>> {
+        Scene::grow_face_selection(self, id, selected_tris, rings, adjacency)
+    }
+
+    fn shrink_face_selection(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        rings: usize,
+        adjacency: AdjacencyKind,
+    ) -> Result<Vec<u32>> {
+        Scene::shrink_face_selection(self, id, selected_tris, rings, adjacency)
+    }
+
+    fn fill_selection_holes(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        max_hole_tris: usize,
+    ) -> Result<Vec<u32>> {
+        Scene::fill_selection_holes(self, id, selected_tris, max_hole_tris)
+    }
+
+    fn smooth_selection_boundary(
+        &self,
+        id: MeshId,
+        selected_tris: &[u32],
+        iterations: usize,
+    ) -> Result<Vec<u32>> {
+        Scene::smooth_selection_boundary(self, id, selected_tris, iterations)
+    }
+
+    fn face_selection_to_vertex_mask(&self, id: MeshId, selected_tris: &[u32]) -> Result<Vec<f32>> {
+        Scene::face_selection_to_vertex_mask(self, id, selected_tris)
+    }
+
+    fn vertex_mask_to_face_selection(
+        &self,
+        id: MeshId,
+        mask: &[f32],
+        threshold: f32,
+        require_all_vertices: bool,
+    ) -> Result<Vec<u32>> {
+        Scene::vertex_mask_to_face_selection(self, id, mask, threshold, require_all_vertices)
+    }
+
+    fn delete_selected_faces(
+        &mut self,
+        id: MeshId,
+        selected_tris: &[u32],
+    ) -> Result<FaceEditReport> {
+        Scene::delete_selected_faces(self, id, selected_tris)
+    }
+
+    fn extract_selected_faces(&mut self, id: MeshId, selected_tris: &[u32]) -> Result<MeshId> {
+        Scene::extract_selected_faces(self, id, selected_tris)
+    }
+
+    fn split_selected_faces(
+        &mut self,
+        id: MeshId,
+        selected_tris: &[u32],
+    ) -> Result<(MeshId, FaceEditReport)> {
+        Scene::split_selected_faces(self, id, selected_tris)
     }
 }
 
@@ -465,6 +685,27 @@ pub trait SceneBooleanOps {
 
     /// Solidifies mesh `id` into a walled shell of the given thickness.
     fn shell(&mut self, id: MeshId, options: &ShellOptions) -> Result<ShellReport>;
+
+    /// Hollows solid mesh `id` by carving an inner cavity.
+    fn hollow_mesh(&mut self, id: MeshId, options: &HollowOptions) -> Result<HollowReport>;
+
+    /// Punches a cylindrical/tapered drain hole into `id` in world coordinates.
+    fn punch_drain_hole_world(
+        &mut self,
+        id: MeshId,
+        world_spec: &DrainHoleSpec,
+        options: &DrainHoleOptions,
+    ) -> Result<(DrainHoleReport, Vec<MeshId>)>;
+
+    /// Places `stamp` onto `target` at a world surface point and normal.
+    fn place_mesh_world(
+        &mut self,
+        target: MeshId,
+        stamp: MeshId,
+        hit_point_world: Vec3,
+        hit_normal_world: Vec3,
+        params: &PlaceMeshParams,
+    ) -> Result<(PlaceMeshReport, Option<MeshId>)>;
 }
 
 impl SceneBooleanOps for Scene {
@@ -505,6 +746,37 @@ impl SceneBooleanOps for Scene {
     fn shell(&mut self, id: MeshId, options: &ShellOptions) -> Result<ShellReport> {
         self.edit(id, |tx| crate::ops::boolean::shell(tx, options))
     }
+
+    fn hollow_mesh(&mut self, id: MeshId, options: &HollowOptions) -> Result<HollowReport> {
+        Scene::hollow_mesh(self, id, options)
+    }
+
+    fn punch_drain_hole_world(
+        &mut self,
+        id: MeshId,
+        world_spec: &DrainHoleSpec,
+        options: &DrainHoleOptions,
+    ) -> Result<(DrainHoleReport, Vec<MeshId>)> {
+        Scene::punch_drain_hole_world(self, id, world_spec, options)
+    }
+
+    fn place_mesh_world(
+        &mut self,
+        target: MeshId,
+        stamp: MeshId,
+        hit_point_world: Vec3,
+        hit_normal_world: Vec3,
+        params: &PlaceMeshParams,
+    ) -> Result<(PlaceMeshReport, Option<MeshId>)> {
+        Scene::place_mesh_world(
+            self,
+            target,
+            stamp,
+            hit_point_world,
+            hit_normal_world,
+            params,
+        )
+    }
 }
 
 /// Deform domain operations (with vertex protection) on [`Scene`].
@@ -527,6 +799,27 @@ pub trait SceneDeformOps {
         weights: &[f32],
         band: f32,
     ) -> Result<DabReport>;
+
+    /// Builds an identity-offset FFD control lattice enclosing `id`.
+    fn build_ffd_lattice(
+        &self,
+        id: MeshId,
+        dims: [usize; 3],
+        basis: FfdBasis,
+        padding: f64,
+    ) -> Result<FfdLattice>;
+
+    /// Applies an atomic freeform deformation (FFD, ARAP, Kelvinlet, or XPBD) on `id`.
+    fn apply_freeform(&mut self, id: MeshId, op: &FreeformOp) -> Result<FreeformReport>;
+
+    /// Applies a freeform deformation on `id` with optional per-vertex protection weights.
+    fn apply_freeform_protected(
+        &mut self,
+        id: MeshId,
+        op: &FreeformOp,
+        protected_vertices: &[u32],
+        protection_weights: Option<&[f32]>,
+    ) -> Result<FreeformReport>;
 }
 
 impl SceneDeformOps for Scene {
@@ -549,6 +842,30 @@ impl SceneDeformOps for Scene {
         band: f32,
     ) -> Result<DabReport> {
         Scene::dab_protected_band(self, id, dab, vertices, weights, band)
+    }
+
+    fn build_ffd_lattice(
+        &self,
+        id: MeshId,
+        dims: [usize; 3],
+        basis: FfdBasis,
+        padding: f64,
+    ) -> Result<FfdLattice> {
+        Scene::build_ffd_lattice(self, id, dims, basis, padding)
+    }
+
+    fn apply_freeform(&mut self, id: MeshId, op: &FreeformOp) -> Result<FreeformReport> {
+        Scene::apply_freeform(self, id, op)
+    }
+
+    fn apply_freeform_protected(
+        &mut self,
+        id: MeshId,
+        op: &FreeformOp,
+        protected_vertices: &[u32],
+        protection_weights: Option<&[f32]>,
+    ) -> Result<FreeformReport> {
+        Scene::apply_freeform_protected(self, id, op, protected_vertices, protection_weights)
     }
 }
 
@@ -664,6 +981,44 @@ pub trait SceneInspectOps {
         target_vertex: u32,
         out: &mut Vec<SurfacePathPoint>,
     ) -> Result<()>;
+
+    /// Fits an analytical geometric primitive to `id` (or `subset_tris`) in world space.
+    fn fit_primitive_world(
+        &self,
+        id: MeshId,
+        subset_tris: Option<&[u32]>,
+        kind: Option<PrimitiveKind>,
+        options: &FitPrimitiveOptions,
+    ) -> Result<FitPrimitiveReport>;
+
+    /// Rigidly aligns `id`'s world placement so `primitive` aligns to `(target_axis, target_origin)`.
+    fn align_to_fitted_primitive(
+        &mut self,
+        id: MeshId,
+        primitive: &FittedPrimitive,
+        target_axis: Vec3,
+        target_origin: Vec3,
+    ) -> Result<Placement>;
+
+    /// Slices closed and open polyline contours through `id` on a world plane.
+    fn slice_contours_world(&self, id: MeshId, origin: Vec3, normal: Vec3) -> Result<ContourSlice>;
+
+    /// Slices `count` parallel contour layers separated by world `spacing`.
+    fn slice_contour_stack_world(
+        &self,
+        id: MeshId,
+        origin: Vec3,
+        normal: Vec3,
+        spacing: f64,
+        count: usize,
+    ) -> Result<Vec<ContourSlice>>;
+
+    /// Reconstructs a surface mesh from a point cloud and adds it to the scene.
+    fn reconstruct_point_cloud(
+        &mut self,
+        cloud: &PointCloud,
+        options: &SurfaceReconstructOptions,
+    ) -> Result<MeshId>;
 }
 
 impl SceneInspectOps for Scene {
@@ -795,6 +1150,49 @@ impl SceneInspectOps for Scene {
         out: &mut Vec<SurfacePathPoint>,
     ) -> Result<()> {
         Scene::shortest_surface_path(self, id, distances, sources, target_vertex, out)
+    }
+
+    fn fit_primitive_world(
+        &self,
+        id: MeshId,
+        subset_tris: Option<&[u32]>,
+        kind: Option<PrimitiveKind>,
+        options: &FitPrimitiveOptions,
+    ) -> Result<FitPrimitiveReport> {
+        Scene::fit_primitive_world(self, id, subset_tris, kind, options)
+    }
+
+    fn align_to_fitted_primitive(
+        &mut self,
+        id: MeshId,
+        primitive: &FittedPrimitive,
+        target_axis: Vec3,
+        target_origin: Vec3,
+    ) -> Result<Placement> {
+        Scene::align_to_fitted_primitive(self, id, primitive, target_axis, target_origin)
+    }
+
+    fn slice_contours_world(&self, id: MeshId, origin: Vec3, normal: Vec3) -> Result<ContourSlice> {
+        Scene::slice_contours_world(self, id, origin, normal)
+    }
+
+    fn slice_contour_stack_world(
+        &self,
+        id: MeshId,
+        origin: Vec3,
+        normal: Vec3,
+        spacing: f64,
+        count: usize,
+    ) -> Result<Vec<ContourSlice>> {
+        Scene::slice_contour_stack_world(self, id, origin, normal, spacing, count)
+    }
+
+    fn reconstruct_point_cloud(
+        &mut self,
+        cloud: &PointCloud,
+        options: &SurfaceReconstructOptions,
+    ) -> Result<MeshId> {
+        Scene::reconstruct_point_cloud(self, cloud, options)
     }
 }
 

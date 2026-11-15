@@ -32,9 +32,11 @@ import {
   type SectionPlane,
 } from "../scene.js";
 import type { MeshViews } from "../views.js";
+import type { CollisionStepReport } from "../wave6.js";
 import {
   type ClientId,
   type ColorRuleWire,
+  type DrainHoleReportWire,
   type ErrorWire,
   type FieldDescWire,
   type InitMessage,
@@ -42,9 +44,11 @@ import {
   isLastWins,
   keyOf,
   type MeshChangeWire,
+  type PlaceMeshReportWire,
   type QueryMap,
   type Request,
   type Result,
+  type SplitFacesReportWire,
   supersedes,
   type WorkerMessage,
 } from "./protocol.js";
@@ -546,7 +550,9 @@ class Engine {
   /** Section entries ended by mesh removals this batch, reported as `null`. */
   readonly #goneEntries: { section: ClientId; mesh: ClientId }[] = [];
   /** The active drag, by the dragged mesh's client id. */
-  #drag: { id: ClientId; session: ReturnType<Scene["drag"]> } | undefined;
+  #drag: { id: ClientId; session: ReturnType<Scene["drag"]>; collisionActive: boolean } | undefined;
+  /** Meshes whose authoritative placement must be emitted in the next result even if delta is 0. */
+  readonly #forcePlacements = new Set<ClientId>();
   /** Mirrors `this.#scene`'s open step depth so step/drag/inSteps invariants stay aligned. */
   #stepDepth = 0;
   readonly #debug: boolean;
@@ -876,6 +882,13 @@ class Engine {
       case "removeMesh":
       case "booleanBatch":
       case "cutByPlane":
+      case "extractSelectedFaces":
+      case "splitSelectedFaces":
+      case "reconstructPointCloud":
+      case "punchDrainHole":
+      case "placeMesh":
+      case "moveWithCollision":
+      case "commitCollisionInteraction":
         return true;
       case "compact":
       case "setPlacement":
@@ -888,10 +901,22 @@ class Engine {
       case "bridgePartialArcs":
       case "applyDyntopo":
       case "dyntopoDab":
+      case "deleteSelectedFaces":
+      case "applyFfd":
+      case "applyArap":
+      case "applyKelvinlet":
+      case "applyXpbd":
+      case "alignToFittedPrimitive":
+      case "hollowMesh":
         return this.#pending(req.id);
       case "join":
       case "boolean":
         return this.#pending(req.target, req.source);
+      case "setCollisionRule":
+      case "clearCollisionRule":
+        return this.#pending(req.a, req.b);
+      case "setDefaultCollisionRule":
+        return false;
       case "register":
       case "alignByLandmarks":
       case "registerMultistage":
@@ -997,12 +1022,23 @@ class Engine {
       case "bridgePartialArcs":
       case "applyDyntopo":
       case "dyntopoDab":
+      case "deleteSelectedFaces":
+      case "splitSelectedFaces":
+      case "applyFfd":
+      case "applyArap":
+      case "applyKelvinlet":
+      case "applyXpbd":
+      case "hollowMesh":
+      case "punchDrainHole":
       case "removeMesh":
         return req.id === id;
       case "boolean":
+      case "placeMesh":
         return req.target === id;
       case "join":
         return req.target === id || req.source === id;
+      case "moveWithCollision":
+      case "commitCollisionInteraction":
       case "undo":
       case "redo":
         return true;
@@ -1311,9 +1347,19 @@ class Engine {
       case "bridgePartialArcs":
       case "applyDyntopo":
       case "dyntopoDab":
+      case "deleteSelectedFaces":
+      case "splitSelectedFaces":
+      case "applyFfd":
+      case "applyArap":
+      case "applyKelvinlet":
+      case "applyXpbd":
+      case "alignToFittedPrimitive":
+      case "hollowMesh":
+      case "punchDrainHole":
       case "removeMesh":
         return meshes.has(req.id);
       case "boolean":
+      case "placeMesh":
         return meshes.has(req.target);
       case "join":
         return meshes.has(req.target) || meshes.has(req.source);
@@ -1321,6 +1367,8 @@ class Engine {
       case "alignByLandmarks":
       case "registerMultistage":
         return meshes.has(req.moving);
+      case "moveWithCollision":
+      case "commitCollisionInteraction":
       case "undo":
       case "redo":
         return true;
@@ -1848,6 +1896,138 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "deleteSelectedFaces": {
+        const value = s.deleteSelectedFaces(this.#mesh(req.id), req.selectedTris);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "extractSelectedFaces": {
+        this.#ensureUnused(req.addedId);
+        const added = s.extractSelectedFaces(this.#mesh(req.id), req.selectedTris, { normals: req.normals });
+        this.#bindAdded(req.addedId, added);
+        b.replies.push({ qid: req.qid, ok: true, value: undefined });
+        return;
+      }
+      case "splitSelectedFaces": {
+        this.#ensureUnused(req.addedId);
+        const r = s.splitSelectedFaces(this.#mesh(req.id), req.selectedTris, { normals: req.normals });
+        this.#bindAdded(req.addedId, r.detached);
+        const value: SplitFacesReportWire = {
+          detached: req.addedId,
+          removedTriangles: r.removedTriangles,
+          removedVertices: r.removedVertices,
+        };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "applyFfd": {
+        const value = s.applyFfd(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "applyArap": {
+        const value = s.applyArap(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "applyKelvinlet": {
+        const value = s.applyKelvinlet(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "applyXpbd": {
+        const value = s.applyXpbd(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "setDefaultCollisionRule":
+        s.setDefaultCollisionRule(req.rule);
+        return;
+      case "setCollisionRule":
+        s.setCollisionRule(this.#mesh(req.a), this.#mesh(req.b), req.rule);
+        return;
+      case "clearCollisionRule":
+        s.clearCollisionRule(this.#mesh(req.a), this.#mesh(req.b));
+        return;
+      case "moveWithCollision": {
+        const r = s.moveWithCollision(this.#mesh(req.id), req.placement, req.isRelease);
+        b.replies.push({ qid: req.qid, ok: true, value: this.#mapCollisionReport(r) });
+        return;
+      }
+      case "commitCollisionInteraction": {
+        const r = s.commitCollisionInteraction(this.#mesh(req.id));
+        b.replies.push({ qid: req.qid, ok: true, value: this.#mapCollisionReport(r) });
+        return;
+      }
+      case "alignToFittedPrimitive": {
+        const value = s.alignToFittedPrimitive(this.#mesh(req.id), req.primitive, req.targetAxis, req.targetOrigin);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "reconstructPointCloud": {
+        this.#ensureUnused(req.addedId);
+        const added = s.reconstructPointCloud(req.cloud, req.options);
+        this.#bindAdded(req.addedId, added);
+        b.replies.push({ qid: req.qid, ok: true, value: undefined });
+        return;
+      }
+      case "hollowMesh": {
+        const value = s.hollowMesh(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "punchDrainHole": {
+        if (req.plugId !== undefined) {
+          this.#ensureUnused(req.plugId);
+        }
+        const r = s.punchDrainHole(this.#mesh(req.id), req.options);
+        const plugIds: ClientId[] = [];
+        if (r.plugs.length > 0) {
+          if (r.plugs.length > 1 || req.plugId === undefined) {
+            for (const h of r.plugs) {
+              s.removeMesh(h);
+            }
+            throw invalid("punchDrainHole produced unexpected plug count");
+          }
+          this.#bindAdded(req.plugId, r.plugs[0]);
+          plugIds.push(req.plugId);
+        }
+        const value: DrainHoleReportWire = {
+          holesPunched: r.holesPunched,
+          keptTriangles: r.keptTriangles,
+          usedFallback: r.usedFallback,
+          plugs: plugIds,
+          methodUsed: r.methodUsed,
+          uvsDropped: r.uvsDropped,
+        };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "placeMesh": {
+        if (req.addedId !== undefined) {
+          this.#ensureUnused(req.addedId);
+        }
+        const r = s.placeMesh(this.#mesh(req.target), this.#mesh(req.stamp), req.options);
+        let addedId: ClientId | null = null;
+        if (r.added !== null) {
+          if (req.addedId === undefined) {
+            s.removeMesh(r.added);
+            throw invalid("placeMesh produced an unexpected detached mesh");
+          }
+          this.#bindAdded(req.addedId, r.added);
+          addedId = req.addedId;
+        }
+        const value: PlaceMeshReportWire = {
+          transform: r.transform,
+          keptTriangles: r.keptTriangles,
+          usedFallback: r.usedFallback,
+          conformMaxDisplacement: r.conformMaxDisplacement,
+          added: addedId,
+          uvsDropped: r.uvsDropped,
+        };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "fieldInteraction":
         s.setFieldInteraction(req.points);
         return;
@@ -1958,8 +2138,38 @@ class Engine {
             b.transfer.push(view.buffer);
           }
         };
-        if (req.name === "verticesInSphere" || req.name === "geodesicDistances") {
+        if (
+          req.name === "verticesInSphere" ||
+          req.name === "geodesicDistances" ||
+          req.name === "selectFacesScreen" ||
+          req.name === "selectFacesInSphere" ||
+          req.name === "selectByCreaseAngle" ||
+          req.name === "selectConnectedShell" ||
+          req.name === "selectSmallFaceIslands" ||
+          req.name === "growFaceSelection" ||
+          req.name === "shrinkFaceSelection" ||
+          req.name === "fillSelectionHoles" ||
+          req.name === "smoothSelectionBoundary" ||
+          req.name === "faceSelectionToVertexMask" ||
+          req.name === "vertexMaskToFaceSelection"
+        ) {
           pushOwned(value);
+        } else if (req.name === "buildFfdLattice") {
+          pushOwned((value as QueryMap["buildFfdLattice"]["value"]).offsets);
+        } else if (req.name === "fitPrimitive") {
+          pushOwned((value as QueryMap["fitPrimitive"]["value"]).residuals);
+        } else if (req.name === "sliceContours") {
+          for (const loop of (value as QueryMap["sliceContours"]["value"]).loops) {
+            pushOwned(loop.points2d);
+            pushOwned(loop.points3d);
+          }
+        } else if (req.name === "sliceContourStack") {
+          for (const slice of value as QueryMap["sliceContourStack"]["value"]) {
+            for (const loop of slice.loops) {
+              pushOwned(loop.points2d);
+              pushOwned(loop.points3d);
+            }
+          }
         } else if (req.name === "overhangs") {
           pushOwned((value as QueryMap["overhangs"]["value"]).vertexAnglesDeg);
         } else if (req.name === "triangleQuality") {
@@ -1993,8 +2203,10 @@ class Engine {
       };
     };
     if (req.phase === "begin") {
-      const session = this.#scene.drag(this.#mesh(req.id));
-      this.#drag = { id: req.id, session };
+      const handle = this.#mesh(req.id);
+      const session = this.#scene.drag(handle);
+      const collisionActive = this.#scene.hasActiveCollisionResponse(handle);
+      this.#drag = { id: req.id, session, collisionActive };
       return;
     }
     this.#mesh(req.id);
@@ -2005,6 +2217,9 @@ class Engine {
     switch (req.phase) {
       case "move":
         drag.session.move(pose());
+        if (drag.collisionActive) {
+          this.#forcePlacements.add(req.id);
+        }
         return;
       case "end":
         this.#drag = undefined;
@@ -2014,9 +2229,12 @@ class Engine {
           } finally {
             drag.session.end();
           }
-          return;
+        } else {
+          drag.session.end();
         }
-        drag.session.end();
+        if (drag.collisionActive) {
+          this.#forcePlacements.add(req.id);
+        }
         return;
       case "cancel":
         this.#drag = undefined;
@@ -2179,6 +2397,66 @@ class Engine {
         const a = args as QueryMap["detectSymmetryPlane"]["args"];
         return s.detectSymmetryPlane(this.#mesh(a.mesh));
       }
+      case "selectFacesScreen": {
+        const a = args as QueryMap["selectFacesScreen"]["args"];
+        return s.selectFacesScreen(this.#mesh(a.mesh), a.shape, a.options);
+      }
+      case "selectFacesInSphere": {
+        const a = args as QueryMap["selectFacesInSphere"]["args"];
+        return s.selectFacesInSphere(this.#mesh(a.mesh), a.center, a.radius, a.normalCone);
+      }
+      case "selectByCreaseAngle": {
+        const a = args as QueryMap["selectByCreaseAngle"]["args"];
+        return s.selectByCreaseAngle(this.#mesh(a.mesh), a.seedTri, a.maxDihedralRad);
+      }
+      case "selectConnectedShell": {
+        const a = args as QueryMap["selectConnectedShell"]["args"];
+        return s.selectConnectedShell(this.#mesh(a.mesh), a.seedTri);
+      }
+      case "selectSmallFaceIslands": {
+        const a = args as QueryMap["selectSmallFaceIslands"]["args"];
+        return s.selectSmallFaceIslands(this.#mesh(a.mesh), a.maxFaceCount, a.maxArea);
+      }
+      case "growFaceSelection": {
+        const a = args as QueryMap["growFaceSelection"]["args"];
+        return s.growFaceSelection(this.#mesh(a.mesh), a.selectedTris, a.rings, a.adjacency);
+      }
+      case "shrinkFaceSelection": {
+        const a = args as QueryMap["shrinkFaceSelection"]["args"];
+        return s.shrinkFaceSelection(this.#mesh(a.mesh), a.selectedTris, a.rings, a.adjacency);
+      }
+      case "fillSelectionHoles": {
+        const a = args as QueryMap["fillSelectionHoles"]["args"];
+        return s.fillSelectionHoles(this.#mesh(a.mesh), a.selectedTris, a.maxHoleTris);
+      }
+      case "smoothSelectionBoundary": {
+        const a = args as QueryMap["smoothSelectionBoundary"]["args"];
+        return s.smoothSelectionBoundary(this.#mesh(a.mesh), a.selectedTris, a.iterations);
+      }
+      case "faceSelectionToVertexMask": {
+        const a = args as QueryMap["faceSelectionToVertexMask"]["args"];
+        return s.faceSelectionToVertexMask(this.#mesh(a.mesh), a.selectedTris);
+      }
+      case "vertexMaskToFaceSelection": {
+        const a = args as QueryMap["vertexMaskToFaceSelection"]["args"];
+        return s.vertexMaskToFaceSelection(this.#mesh(a.mesh), a.mask, a.threshold, a.requireAllVertices);
+      }
+      case "buildFfdLattice": {
+        const a = args as QueryMap["buildFfdLattice"]["args"];
+        return s.buildFfdLattice(this.#mesh(a.mesh), a.dims, a.basis, a.padding);
+      }
+      case "fitPrimitive": {
+        const a = args as QueryMap["fitPrimitive"]["args"];
+        return s.fitPrimitive(this.#mesh(a.mesh), a.options);
+      }
+      case "sliceContours": {
+        const a = args as QueryMap["sliceContours"]["args"];
+        return s.sliceContours(this.#mesh(a.mesh), a.origin, a.normal);
+      }
+      case "sliceContourStack": {
+        const a = args as QueryMap["sliceContourStack"]["args"];
+        return s.sliceContourStack(this.#mesh(a.mesh), a.origin, a.normal, a.spacing, a.count);
+      }
       case "debugDump": {
         if (!this.#debug) {
           throw invalid(`unknown query ${name}`);
@@ -2214,13 +2492,17 @@ class Engine {
     const changes: MeshChangeWire[] = [];
     const placements: Result["placements"] = [];
     const sections: Result["sections"] = [];
+    const forced = new Set(this.#forcePlacements);
+    this.#forcePlacements.clear();
     for (const c of frame) {
       const id = this.#meshId(c.mesh);
       changes.push(this.#change(c, id, b));
       if (c.removed) {
+        forced.delete(id);
         continue;
       }
-      if (c.added || c.placementChanged) {
+      const isForced = forced.delete(id);
+      if (c.added || c.placementChanged || isForced) {
         const p = s.placement(c.mesh);
         placements.push({
           id,
@@ -2228,6 +2510,7 @@ class Engine {
           translation: p.translation,
           scale: p.scale as number[],
           matrix4: Array.from(s.matrix4(c.mesh)),
+          ...(isForced ? { authoritative: true } : {}),
         });
       }
       for (const sh of c.sectionsChanged) {
@@ -2243,6 +2526,21 @@ class Engine {
         }
         sections.push({ section, mesh: id, result });
       }
+    }
+    for (const id of forced) {
+      const h = this.#meshes.get(id);
+      if (h === undefined) {
+        continue;
+      }
+      const p = s.placement(h);
+      placements.push({
+        id,
+        rotation: p.rotation,
+        translation: p.translation,
+        scale: p.scale as number[],
+        matrix4: Array.from(s.matrix4(h)),
+        authoritative: true,
+      });
     }
     // A removed mesh's record carries nothing else: report its entries gone.
     for (const { section, mesh } of this.#goneEntries.splice(0)) {
@@ -2380,5 +2678,34 @@ class Engine {
       }
     }
     return wire;
+  }
+
+  #ensureUnused(id: ClientId): void {
+    if (this.#meshes.has(id) || this.#adds.some((a) => a.id === id)) {
+      throw invalid(`mesh client id ${id} is already in use`);
+    }
+  }
+
+  #bindAdded(id: ClientId, handle: MeshHandle): void {
+    this.#ensureUnused(id);
+    this.#meshes.set(id, handle);
+    this.#meshIds.set(handle, id);
+  }
+
+  #mapCollisionReport(r: ReturnType<Scene["moveWithCollision"]>): CollisionStepReport<ClientId> {
+    return {
+      appliedPlacement: r.appliedPlacement,
+      appliedQuaternion: r.appliedQuaternion,
+      activePairs: r.activePairs.map((p) => ({
+        ...p,
+        other: this.#meshId(p.other),
+      })),
+      modifiedMeshes: r.modifiedMeshes.map((m) => this.#meshId(m)),
+      minClearance: r.minClearance,
+      cutsExecuted: r.cutsExecuted,
+      softVerticesDeformed: r.softVerticesDeformed,
+      elasticRecoveryCount: r.elasticRecoveryCount,
+      selfIntersectionGuardTriggered: r.selfIntersectionGuardTriggered,
+    };
   }
 }

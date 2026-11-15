@@ -933,6 +933,23 @@ impl Scene {
         Ok(self.collision.rule(a, b))
     }
 
+    /// Returns `true` if `moving` is a live mesh and either the scene's default collision rule
+    /// or any explicit pair rule involving `moving` and another live mesh has a mode other than
+    /// [`CollisionMode::PassThrough`].
+    pub fn has_active_collision_response(&self, moving: MeshId) -> bool {
+        if self.entry(moving).is_err() {
+            return false;
+        }
+        if self.collision.default_rule.mode != CollisionMode::PassThrough {
+            return true;
+        }
+        self.collision.pair_rules.iter().any(|(&(a, b), rule)| {
+            rule.mode != CollisionMode::PassThrough
+                && ((a == moving && self.entry(b).is_ok())
+                    || (b == moving && self.entry(a).is_ok()))
+        })
+    }
+
     /// Moves `id` toward `target_placement` and applies configured collision responses against all
     /// other live meshes in one undoable step.
     ///

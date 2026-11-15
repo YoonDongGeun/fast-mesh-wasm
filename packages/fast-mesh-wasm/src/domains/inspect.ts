@@ -1,4 +1,4 @@
-import type { Bounds, Vec3 } from "../api.js";
+import type { Bounds, Placement, Vec3 } from "../api.js";
 import { FastMeshError } from "../core.js";
 import type {
   Analysis,
@@ -34,6 +34,14 @@ import type {
   ThicknessFieldDesc,
   TriangleQualityOptions,
 } from "../scene.js";
+import type {
+  ContourSlice,
+  FitPrimitiveOptions,
+  FittedPrimitive,
+  FittedPrimitiveReport,
+  PackedPointCloud,
+  SurfaceReconstructOptions,
+} from "../wave6.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
 export type InspectReturn<Async extends boolean, T> = Async extends true ? Promise<T> : T;
@@ -89,6 +97,25 @@ export interface InspectBackend<Async extends boolean = false> {
   section(section: SectionHandle, mesh: MeshHandle): SectionResult;
   sectionGap(section: SectionHandle, a: MeshHandle, b: MeshHandle): InspectReturn<Async, SectionGap | null>;
   updateSections?: () => void;
+  fitPrimitive(mesh: MeshHandle, options?: FitPrimitiveOptions): InspectReturn<Async, FittedPrimitiveReport>;
+  alignToFittedPrimitive(
+    mesh: MeshHandle,
+    primitive: FittedPrimitive,
+    targetAxis: Readonly<Vec3>,
+    targetOrigin: Readonly<Vec3>,
+  ): InspectReturn<Async, Placement>;
+  sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): InspectReturn<Async, ContourSlice>;
+  sliceContourStack(
+    mesh: MeshHandle,
+    origin: Readonly<Vec3>,
+    normal: Readonly<Vec3>,
+    spacing: number,
+    count: number,
+  ): InspectReturn<Async, ContourSlice[]>;
+  reconstructPointCloud(
+    cloud: PackedPointCloud | Float32Array,
+    options?: SurfaceReconstructOptions,
+  ): InspectReturn<Async, MeshHandle>;
 }
 
 /** Metrology, defect analysis, raycasting, printability/quality/geodesic fields, surface paths, and cross-section inspection domain. */
@@ -148,6 +175,25 @@ export interface InspectDomain<Async extends boolean = false> {
   section(section: SectionHandle, mesh: MeshHandle): SectionResult;
   sectionGap(section: SectionHandle, a: MeshHandle, b: MeshHandle): InspectReturn<Async, SectionGap | null>;
   updateSections(): void;
+  fitPrimitive(mesh: MeshHandle, options?: FitPrimitiveOptions): InspectReturn<Async, FittedPrimitiveReport>;
+  alignToFittedPrimitive(
+    mesh: MeshHandle,
+    primitive: FittedPrimitive,
+    targetAxis: Readonly<Vec3>,
+    targetOrigin: Readonly<Vec3>,
+  ): InspectReturn<Async, Placement>;
+  sliceContours(mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>): InspectReturn<Async, ContourSlice>;
+  sliceContourStack(
+    mesh: MeshHandle,
+    origin: Readonly<Vec3>,
+    normal: Readonly<Vec3>,
+    spacing: number,
+    count: number,
+  ): InspectReturn<Async, ContourSlice[]>;
+  reconstructPointCloud(
+    cloud: PackedPointCloud | Float32Array,
+    options?: SurfaceReconstructOptions,
+  ): InspectReturn<Async, MeshHandle>;
 }
 
 /** Synchronous inspect domain exposed by `Scene.inspect`. */
@@ -224,5 +270,23 @@ export function createInspectDomain<Async extends boolean>(backend: InspectBacke
     section: (section: SectionHandle, mesh: MeshHandle) => backend.section(section, mesh),
     sectionGap: (section: SectionHandle, a: MeshHandle, b: MeshHandle) => backend.sectionGap(section, a, b),
     updateSections: () => backend.updateSections?.(),
+    fitPrimitive: (mesh: MeshHandle, options?: FitPrimitiveOptions) => backend.fitPrimitive(mesh, options),
+    alignToFittedPrimitive: (
+      mesh: MeshHandle,
+      primitive: FittedPrimitive,
+      targetAxis: Readonly<Vec3>,
+      targetOrigin: Readonly<Vec3>,
+    ) => backend.alignToFittedPrimitive(mesh, primitive, targetAxis, targetOrigin),
+    sliceContours: (mesh: MeshHandle, origin: Readonly<Vec3>, normal: Readonly<Vec3>) =>
+      backend.sliceContours(mesh, origin, normal),
+    sliceContourStack: (
+      mesh: MeshHandle,
+      origin: Readonly<Vec3>,
+      normal: Readonly<Vec3>,
+      spacing: number,
+      count: number,
+    ) => backend.sliceContourStack(mesh, origin, normal, spacing, count),
+    reconstructPointCloud: (cloud: PackedPointCloud | Float32Array, options?: SurfaceReconstructOptions) =>
+      backend.reconstructPointCloud(cloud, options),
   };
 }

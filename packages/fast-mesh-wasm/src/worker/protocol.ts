@@ -2,7 +2,7 @@
 // Everything here survives structured clone; bulk data travels as transferred
 // `ArrayBuffer`s. Meshes, fields and sections are named by client ids, which
 // the main side allocates synchronously; the engine maps them to its handles.
-import type { Bounds, Vec3 } from "../api.js";
+import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import type {
   NormalizedBooleanOptions,
@@ -37,6 +37,38 @@ import type {
   SurfacePathPoint,
   SymmetryPlaneReport,
 } from "../scene.js";
+import type {
+  AdjacencyKind,
+  ArapOptions,
+  CollisionRule,
+  CollisionStepReport,
+  ContourSlice,
+  DrainHoleOptions,
+  DrainHoleReport,
+  FaceEditReport,
+  FaceSelectionNormalCone,
+  FfdBasisInput,
+  FfdLatticeData,
+  FfdOptions,
+  FitPrimitiveOptions,
+  FittedPrimitive,
+  FittedPrimitiveReport,
+  FreeformReport,
+  HollowOptions,
+  HollowReport,
+  KelvinletOptions,
+  PlaceMeshOptions,
+  PlaceMeshReport,
+  ScreenSelectionShape,
+  ScreenSelectOptions,
+  SplitFacesReport,
+  SurfaceReconstructOptions,
+  XpbdOptions,
+} from "../wave6.js";
+
+export type SplitFacesReportWire = Omit<SplitFacesReport, "detached"> & { detached: ClientId };
+export type DrainHoleReportWire = Omit<DrainHoleReport, "plugs"> & { plugs: ClientId[] };
+export type PlaceMeshReportWire = Omit<PlaceMeshReport, "added"> & { added: ClientId | null };
 
 /** A mesh, field or section id allocated on the main side. Unique per kind. */
 export type ClientId = number;
@@ -277,6 +309,23 @@ export type Request =
     }
   /** `Scene.setFieldInteraction`. */
   | { kind: "fieldInteraction"; rev: number; points: number | null }
+  | { kind: "deleteSelectedFaces"; rev: number; id: ClientId; selectedTris: Uint32Array; qid: number }
+  | { kind: "extractSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
+  | { kind: "splitSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
+  | { kind: "applyFfd"; rev: number; id: ClientId; options: FfdOptions; qid: number }
+  | { kind: "applyArap"; rev: number; id: ClientId; options: ArapOptions; qid: number }
+  | { kind: "applyKelvinlet"; rev: number; id: ClientId; options: KelvinletOptions; qid: number }
+  | { kind: "applyXpbd"; rev: number; id: ClientId; options: XpbdOptions; qid: number }
+  | { kind: "setDefaultCollisionRule"; rev: number; rule: CollisionRule }
+  | { kind: "setCollisionRule"; rev: number; a: ClientId; b: ClientId; rule: CollisionRule }
+  | { kind: "clearCollisionRule"; rev: number; a: ClientId; b: ClientId }
+  | { kind: "moveWithCollision"; rev: number; id: ClientId; placement: PlacementInput; isRelease: boolean; qid: number }
+  | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
+  | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
+  | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
+  | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
+  | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
   | { kind: "fetchFieldValues"; rev: number; qid: number; field: ClientId };
 
@@ -325,6 +374,21 @@ export interface QueryMap {
     value: SurfacePathPoint[];
   };
   detectSymmetryPlane: { args: { mesh: ClientId }; value: SymmetryPlaneReport };
+  selectFacesScreen: { args: { mesh: ClientId; shape: ScreenSelectionShape; options: ScreenSelectOptions }; value: Uint32Array };
+  selectFacesInSphere: { args: { mesh: ClientId; center: Vec3; radius: number; normalCone?: FaceSelectionNormalCone }; value: Uint32Array };
+  selectByCreaseAngle: { args: { mesh: ClientId; seedTri: number; maxDihedralRad: number }; value: Uint32Array };
+  selectConnectedShell: { args: { mesh: ClientId; seedTri: number }; value: Uint32Array };
+  selectSmallFaceIslands: { args: { mesh: ClientId; maxFaceCount: number; maxArea?: number }; value: Uint32Array };
+  growFaceSelection: { args: { mesh: ClientId; selectedTris: Uint32Array; rings: number; adjacency: AdjacencyKind }; value: Uint32Array };
+  shrinkFaceSelection: { args: { mesh: ClientId; selectedTris: Uint32Array; rings: number; adjacency: AdjacencyKind }; value: Uint32Array };
+  fillSelectionHoles: { args: { mesh: ClientId; selectedTris: Uint32Array; maxHoleTris: number }; value: Uint32Array };
+  smoothSelectionBoundary: { args: { mesh: ClientId; selectedTris: Uint32Array; iterations: number }; value: Uint32Array };
+  faceSelectionToVertexMask: { args: { mesh: ClientId; selectedTris: Uint32Array }; value: Float32Array };
+  vertexMaskToFaceSelection: { args: { mesh: ClientId; mask: Float32Array; threshold: number; requireAllVertices: boolean }; value: Uint32Array };
+  buildFfdLattice: { args: { mesh: ClientId; dims: [number, number, number]; basis: FfdBasisInput; padding: number }; value: FfdLatticeData };
+  fitPrimitive: { args: { mesh: ClientId; options: FitPrimitiveOptions }; value: FittedPrimitiveReport };
+  sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
+  sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
   debugDump: {
     args: { mesh: ClientId };
@@ -404,7 +468,7 @@ export interface Result {
   /** Change records, ranges applied in order; never drop them. */
   changes: MeshChangeWire[];
   /** Placement and `matrix4` (column-major) of every mesh added or moved. */
-  placements: { id: ClientId; rotation: number[]; translation: number[]; scale: number[]; matrix4: number[] }[];
+  placements: { id: ClientId; rotation: number[]; translation: number[]; scale: number[]; matrix4: number[]; authoritative?: boolean }[];
   /**
    * Every changed section entry. `result` is `null` once the entry is gone:
    * the section was removed, no longer cuts the mesh, or the mesh was
@@ -517,12 +581,28 @@ export function keyOf(req: Request): string | undefined {
     case "bridgePartialArcs":
     case "applyDyntopo":
     case "dyntopoDab":
+    case "deleteSelectedFaces":
+    case "splitSelectedFaces":
+    case "applyFfd":
+    case "applyArap":
+    case "applyKelvinlet":
+    case "applyXpbd":
+    case "hollowMesh":
+    case "punchDrainHole":
       return `edit:${req.id}`;
     case "join":
     case "boolean":
       return `edit:${req.target}`;
     case "booleanBatch":
+    case "extractSelectedFaces":
+    case "reconstructPointCloud":
       return `mesh:${req.addedId}`;
+    case "placeMesh":
+      return req.addedId !== undefined ? `mesh:${req.addedId}` : `edit:${req.target}`;
+    case "alignToFittedPrimitive":
+    case "moveWithCollision":
+    case "commitCollisionInteraction":
+      return `placement:${req.id}`;
     case "alignByLandmarks":
     case "registerMultistage":
       return `placement:${req.moving}`;

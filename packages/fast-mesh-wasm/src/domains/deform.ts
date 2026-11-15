@@ -13,6 +13,15 @@ import type {
   VertexProtection,
 } from "../scene.js";
 import type { ClayOp, CreaseOp, FlattenOp, GrabOp, InflateOp, RelaxOp, SmoothOp, TwistOp } from "./sculpt.js";
+import type {
+  ArapOptions,
+  FfdBasisInput,
+  FfdLatticeData,
+  FfdOptions,
+  FreeformReport,
+  KelvinletOptions,
+  XpbdOptions,
+} from "../wave6.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
 export type DeformReturn<Async extends boolean, T> = Async extends true ? Promise<T> : T;
@@ -23,6 +32,16 @@ export type ProtectedSculptOp = Extract<SculptOp, { protect?: VertexProtection }
 /** Low-level host backend used by {@link createDeformDomain}. */
 export interface DeformBackend<Async extends boolean = false> {
   sculpt<const O extends SculptOp>(mesh: MeshHandle, op: O): DeformReturn<Async, SculptReportOf<O>>;
+  buildFfdLattice(
+    mesh: MeshHandle,
+    dims: readonly [number, number, number],
+    basis?: FfdBasisInput,
+    padding?: number,
+  ): DeformReturn<Async, FfdLatticeData>;
+  applyFfd(mesh: MeshHandle, options: FfdOptions): DeformReturn<Async, FreeformReport>;
+  applyArap(mesh: MeshHandle, options: ArapOptions): DeformReturn<Async, FreeformReport>;
+  applyKelvinlet(mesh: MeshHandle, options: KelvinletOptions): DeformReturn<Async, FreeformReport>;
+  applyXpbd(mesh: MeshHandle, options: XpbdOptions): DeformReturn<Async, FreeformReport>;
 }
 
 /** Surface deformation and vertex-protection domain. */
@@ -43,6 +62,17 @@ export interface DeformDomain<Async extends boolean = false> {
     op: O,
     protection: VertexProtection,
   ): DeformReturn<Async, SculptReportOf<O>>;
+
+  buildFfdLattice(
+    mesh: MeshHandle,
+    dims: readonly [number, number, number],
+    basis?: FfdBasisInput,
+    padding?: number,
+  ): DeformReturn<Async, FfdLatticeData>;
+  applyFfd(mesh: MeshHandle, options: FfdOptions): DeformReturn<Async, FreeformReport>;
+  applyArap(mesh: MeshHandle, options: ArapOptions): DeformReturn<Async, FreeformReport>;
+  applyKelvinlet(mesh: MeshHandle, options: KelvinletOptions): DeformReturn<Async, FreeformReport>;
+  applyXpbd(mesh: MeshHandle, options: XpbdOptions): DeformReturn<Async, FreeformReport>;
 }
 
 /** Synchronous deformation domain exposed by `Scene.deform`. */
@@ -79,5 +109,15 @@ export function createDeformDomain<Async extends boolean>(backend: DeformBackend
     clay: (mesh: MeshHandle, op: ClayOp) => backend.sculpt(mesh, { op: "clay", ...op }),
     twist: (mesh: MeshHandle, op: TwistOp) => backend.sculpt(mesh, { op: "twist", ...op }),
     protect: protectFn,
+    buildFfdLattice: (
+      mesh: MeshHandle,
+      dims: readonly [number, number, number],
+      basis?: FfdBasisInput,
+      padding?: number,
+    ) => backend.buildFfdLattice(mesh, dims, basis, padding),
+    applyFfd: (mesh: MeshHandle, options: FfdOptions) => backend.applyFfd(mesh, options),
+    applyArap: (mesh: MeshHandle, options: ArapOptions) => backend.applyArap(mesh, options),
+    applyKelvinlet: (mesh: MeshHandle, options: KelvinletOptions) => backend.applyKelvinlet(mesh, options),
+    applyXpbd: (mesh: MeshHandle, options: XpbdOptions) => backend.applyXpbd(mesh, options),
   };
 }

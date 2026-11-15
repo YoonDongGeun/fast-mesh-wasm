@@ -12,6 +12,8 @@ mod error;
 mod pool;
 mod render;
 mod scene;
+mod wave6;
+pub use wave6::*;
 
 /// `initThreadPool(n)` (threaded artifact only): starts rayon's pool on `n`
 /// Web Workers that share this module and its memory. Await it once, right
