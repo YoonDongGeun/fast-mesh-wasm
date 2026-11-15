@@ -2,6 +2,7 @@
 //! symmetry, and localized region-parity brush kernels.
 
 mod crease;
+mod dyntopo;
 mod filter;
 mod grab;
 mod inflate;
@@ -22,6 +23,12 @@ pub use crate::stretch::{
     StretchOptions, StretchReport, capture_rest_sizes, ensure_rest_sizes, split_stretched,
 };
 pub use crease::{CreaseOptions, CreaseOptionsBuilder, CreaseReport, crease, crease_region};
+pub use dyntopo::{
+    DEFAULT_DYNTOPO_DETAIL_SIZE, DEFAULT_DYNTOPO_MAX_RATIO, DEFAULT_DYNTOPO_MIN_RATIO, DyntopoMode,
+    DyntopoOptions, DyntopoPatch, DyntopoReport, apply_dyntopo, apply_dyntopo_in_roi,
+    apply_dyntopo_in_roi_binary_parents, apply_dyntopo_protected, apply_dyntopo_with_bvh,
+    validate_dyntopo_inputs,
+};
 pub use filter::{SurfaceFilter, Symmetry};
 pub use grab::{
     GRAB_MAX_STRETCH, GrabMethod, GrabOptions, GrabOptionsBuilder, GrabReport, grab, grab_region,

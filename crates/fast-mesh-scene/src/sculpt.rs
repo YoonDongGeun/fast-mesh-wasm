@@ -3,14 +3,15 @@
 use fast_mesh_ops::OpsError;
 use fast_mesh_ops::protect::{check_protection, with_protection_band};
 use fast_mesh_ops::sculpt::{
-    Brush, ClayOptions, ClayProfile, CreaseOptions, FlattenOptions, GrabOptions, InflateOptions,
-    STROKE_POS_CHANNEL, SmoothOptions, SurfaceFilter, Symmetry, TwistOptions, clay, clay_region,
-    crease, crease_region, flatten, flatten_region, grab, grab_region_with_stroke,
-    grab_widest_reach, inflate, inflate_region_with_stroke, smooth, smooth_region, twist,
-    twist_region,
+    Brush, ClayOptions, ClayProfile, CreaseOptions, DyntopoOptions, DyntopoPatch, FlattenOptions,
+    GrabOptions, InflateOptions, STROKE_POS_CHANNEL, SmoothOptions, SurfaceFilter, Symmetry,
+    TwistOptions, apply_dyntopo_in_roi, apply_dyntopo_in_roi_binary_parents,
+    apply_dyntopo_protected, clay, clay_region, crease, crease_region, flatten, flatten_region,
+    grab, grab_region_with_stroke, grab_widest_reach, inflate, inflate_region_with_stroke, smooth,
+    smooth_region, twist, twist_region, validate_dyntopo_inputs,
 };
-use fast_mesh_query::{Region, vertices_in};
-use fast_mesh_store::{StoreError, VertexId};
+use fast_mesh_query::{Region, triangles_in, vertices_in};
+use fast_mesh_store::{StoreError, TriangleId, VertexId};
 
 use crate::history::Change;
 use crate::scene::Entry;
@@ -152,6 +153,45 @@ pub struct DabReport {
     pub moved: usize,
     /// The largest displacement applied, in local units; 0 when nothing moved.
     pub max_displacement: f32,
+}
+
+fn extend_dyntopo_patch(
+    dst: &mut DyntopoPatch,
+    src: &DyntopoPatch,
+) -> std::result::Result<(), StoreError> {
+    dst.splits += src.splits;
+    dst.collapses += src.collapses;
+    dst.flips += src.flips;
+    dst.smoothed += src.smoothed;
+    dst.vertices
+        .try_reserve(src.vertices.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.new_vertices
+        .try_reserve(src.new_vertices.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.removed_vertices
+        .try_reserve(src.removed_vertices.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.removed_triangles
+        .try_reserve(src.removed_triangles.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.created_triangles
+        .try_reserve(src.created_triangles.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.modified_triangles
+        .try_reserve(src.modified_triangles.len())
+        .map_err(|_| StoreError::OutOfMemory)?;
+    dst.vertices.extend_from_slice(&src.vertices);
+    dst.new_vertices.extend_from_slice(&src.new_vertices);
+    dst.removed_vertices
+        .extend_from_slice(&src.removed_vertices);
+    dst.removed_triangles
+        .extend_from_slice(&src.removed_triangles);
+    dst.created_triangles
+        .extend_from_slice(&src.created_triangles);
+    dst.modified_triangles
+        .extend_from_slice(&src.modified_triangles);
+    Ok(())
 }
 
 /// The ascending candidate vertices under `dab`, through the mesh's BVH, with
@@ -453,6 +493,257 @@ impl Scene {
             &mut out,
         )?;
         Ok(out)
+    }
+
+    /// Applies localized dynamic topology inside the local-space sphere
+    /// `(center, radius)` of mesh `id`.
+    ///
+    /// Queries the BVH for ROI triangles intersecting the sphere in
+    /// `O(log N + K)` (with a mesh-scan fallback only when `id` is in
+    /// [`UpdateMode::Manual`] with a stale BVH), caches/reuses vertex-triangle
+    /// incidence, interpolates active stroke-rest state and bound channels onto
+    /// created vertices, records one compact delta undo patch, and incrementally
+    /// schedules/updates BVH and vertex normals.
+    ///
+    /// # Errors
+    /// - [`SceneError::UnknownMesh`] for a stale id.
+    /// - [`SceneError::Ops`] ([`OpsError::InvalidInput`]) on invalid geometry
+    ///   parameters (`center`, `radius`, `options`).
+    /// - [`SceneError::Store`] on out-of-memory. Nothing changes on error.
+    pub fn apply_dyntopo(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+    ) -> Result<DyntopoPatch> {
+        self.apply_dyntopo_protected(id, center, radius, options, &[])
+    }
+
+    /// Like [`Scene::apply_dyntopo`], locking every vertex in `pinned` so it is
+    /// never collapsed, flipped across, or smoothed tangentially.
+    ///
+    /// # Errors
+    /// As for [`Scene::apply_dyntopo`], plus [`SceneError::Ops`] when any vertex
+    /// in `pinned` is not alive.
+    pub fn apply_dyntopo_protected(
+        &mut self,
+        id: MeshId,
+        center: [f32; 3],
+        radius: f32,
+        options: &DyntopoOptions,
+        pinned: &[VertexId],
+    ) -> Result<DyntopoPatch> {
+        self.drop_field_unit();
+        validate_dyntopo_inputs(center, radius, options)?;
+        let entry = self.entries.get_mut(id).ok_or(SceneError::UnknownMesh)?;
+        for &v in pinned {
+            if !entry.mesh.is_vertex_alive(v) {
+                return Err(SceneError::Ops(OpsError::InvalidInput(
+                    "dyntopo pinned vertex is not alive",
+                )));
+            }
+        }
+
+        let bvh_ready = if entry.mode == UpdateMode::Manual && !entry.is_current() {
+            false
+        } else {
+            entry.update_bvh().is_ok()
+        };
+
+        let roi_tris: Option<Vec<TriangleId>> = if bvh_ready {
+            entry.mesh.ensure_incidence()?;
+            let mut tris = Vec::new();
+            triangles_in(
+                &entry.mesh,
+                &entry.bvh,
+                &Region::Sphere { center, radius },
+                &mut tris,
+            )?;
+            tris.sort_unstable();
+            tris.dedup();
+            if tris.is_empty() {
+                return Ok(DyntopoPatch::default());
+            }
+            Some(tris)
+        } else {
+            None
+        };
+
+        let mut max_moved = 0usize;
+        if entry.stroke.epoch != 0 {
+            match &roi_tris {
+                Some(tris) => {
+                    let mut roi_verts = Vec::new();
+                    roi_verts
+                        .try_reserve(tris.len() * 3)
+                        .map_err(|_| StoreError::OutOfMemory)?;
+                    for &t in tris {
+                        if let Some(corners) = entry.mesh.triangle(t) {
+                            roi_verts.extend(corners);
+                        }
+                    }
+                    roi_verts.sort_unstable();
+                    roi_verts.dedup();
+                    max_moved = roi_verts.len();
+                    entry
+                        .stroke
+                        .capture_region_with_one_ring(&entry.mesh, &roi_verts)?;
+                }
+                None => {
+                    entry
+                        .stroke
+                        .materialize_channels_for_fallback(&mut entry.mesh)?;
+                    max_moved = entry.mesh.vertex_slots();
+                }
+            }
+        }
+
+        self.history.reserve()?;
+        entry
+            .stroke
+            .reserve_for_moved(entry.mesh.vertex_slots(), max_moved)?;
+
+        let stroke_active = entry.stroke.epoch != 0;
+        let (report, prepared, patch) = {
+            let mut tx = entry.mesh.begin_edit();
+            let report = match &roi_tris {
+                Some(tris) => {
+                    if stroke_active {
+                        apply_dyntopo_in_roi_binary_parents(
+                            &mut tx, center, radius, options, tris, pinned,
+                        )?
+                    } else {
+                        apply_dyntopo_in_roi(&mut tx, center, radius, options, tris, pinned)?
+                    }
+                }
+                None => apply_dyntopo_protected(&mut tx, center, radius, options, pinned)?,
+            };
+            let prepared = if stroke_active && !report.vertices.is_empty() {
+                Some(
+                    entry
+                        .stroke
+                        .prepare_splits(tx.mesh().vertex_slots(), &report.vertices)?,
+                )
+            } else {
+                None
+            };
+            let patch = tx.commit()?;
+            (report, prepared, patch)
+        };
+
+        if patch.is_empty() {
+            return Ok(report);
+        }
+        if let Some(prep) = &prepared {
+            entry
+                .stroke
+                .apply_splits_reserved(entry.mesh.positions(), &report.vertices, prep);
+        }
+        if options.smooth_tangent && !patch.changes().vertices_moved.is_empty() {
+            entry
+                .stroke
+                .record_moved_reserved(&patch.changes().vertices_moved);
+        }
+        entry.record_changes_keeping_stroke(patch.changes());
+        self.history
+            .record(&mut self.entries, Change::Edit(id, patch));
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.after_change();
+        }
+        self.run_eager(Some(&[id]));
+        Ok(report)
+    }
+
+    /// Runs localized dynamic topology together with a brush [`Dab`] as a single
+    /// undoable step.
+    ///
+    /// Executes localized dyntopo under each mirrored symmetry sphere before the
+    /// brush dab (so coarse triangles refine before sampling) and cleans up any
+    /// stretched/sliver edges afterward if the dab moved vertices.
+    ///
+    /// # Errors
+    /// Combines the validation and error semantics of [`Scene::apply_dyntopo`]
+    /// and [`Scene::dab`].
+    pub fn dyntopo_dab(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+    ) -> Result<(DyntopoPatch, DabReport)> {
+        self.dyntopo_dab_protected_band(id, dab, options, &[], &[], 0.0)
+    }
+
+    /// Like [`Scene::dyntopo_dab`], pinning and protecting the given vertices
+    /// with per-vertex weights.
+    pub fn dyntopo_dab_protected(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+        vertices: &[VertexId],
+        weights: &[f32],
+    ) -> Result<(DyntopoPatch, DabReport)> {
+        self.dyntopo_dab_protected_band(id, dab, options, vertices, weights, 0.0)
+    }
+
+    /// Like [`Scene::dyntopo_dab_protected`] with a geodesic protection transition
+    /// band of width `band`.
+    pub fn dyntopo_dab_protected_band(
+        &mut self,
+        id: MeshId,
+        dab: &Dab,
+        options: &DyntopoOptions,
+        vertices: &[VertexId],
+        weights: &[f32],
+        band: f32,
+    ) -> Result<(DyntopoPatch, DabReport)> {
+        self.drop_field_unit();
+        {
+            let entry = self.entry(id)?;
+            check_protection(&entry.mesh, vertices, weights)?;
+        }
+        if !band.is_finite() || band < 0.0 {
+            return Err(SceneError::Ops(OpsError::InvalidInput(
+                "protection band must be finite and non-negative",
+            )));
+        }
+        if !dab.is_valid() {
+            return Err(SceneError::Ops(OpsError::InvalidInput(
+                "invalid sculpt brush dab options",
+            )));
+        }
+        let base_center = dab.brush().center;
+        let radius = dab.brush().radius;
+        validate_dyntopo_inputs(base_center, radius, options)?;
+
+        let mut agg = DyntopoPatch::default();
+        let (masks, mask_count) = dab.symmetry().active_masks();
+
+        self.begin_step();
+        let res = (|| -> Result<(DyntopoPatch, DabReport)> {
+            for &bits in &masks[..mask_count] {
+                let c = reflect_vec(bits, base_center);
+                let p = self.apply_dyntopo_protected(id, c, radius, options, vertices)?;
+                extend_dyntopo_patch(&mut agg, &p)?;
+            }
+
+            let dab_report = self.dab_protected_band(id, dab, vertices, weights, band)?;
+
+            if dab_report.moved > 0 && !matches!(dab, Dab::Smooth(_)) {
+                for &bits in &masks[..mask_count] {
+                    let c = reflect_vec(bits, base_center);
+                    let p = self.apply_dyntopo_protected(id, c, radius, options, vertices)?;
+                    extend_dyntopo_patch(&mut agg, &p)?;
+                }
+            }
+
+            Ok((agg, dab_report))
+        })();
+        let end_res = self.end_step();
+        let report = res?;
+        end_res?;
+        Ok(report)
     }
 }
 
