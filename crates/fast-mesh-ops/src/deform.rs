@@ -1,12 +1,126 @@
-//! Brush deformation & protection domain, re-exporting [`crate::sculpt`] and
-//! [`crate::protect`].
+//! Free-form deformation, brush deformation, and vertex protection domain.
 //!
-//! All brush algorithms, extra brushes, stroke channels, [`SurfaceFilter`],
-//! [`Symmetry`], and vertex protection wrappers live here so both
-//! `fast_mesh_ops::deform::*` and protected deformation imports work uniformly.
+//! Includes 3D Sederberg-Parry [`ffd`], As-Rigid-As-Possible ([`arap`]),
+//! regularized elastostatic [`kelvinlet`]s, Extended Position-Based Dynamics
+//! ([`xpbd`]) with self-collision avoidance, alongside brush algorithms
+//! (`crate::sculpt`) and vertex protection (`crate::protect`).
+
+pub mod arap;
+pub mod ffd;
+pub mod kelvinlet;
+pub mod xpbd;
 
 pub use crate::protect::{check_protection, with_protection, with_protection_band};
 pub use crate::sculpt::*;
+pub use arap::{
+    ArapAnchor, ArapHandle, ArapOptions, ArapReport, ArapSolver, ArapWeights, apply_arap,
+};
+pub use ffd::{
+    FfdBasis, FfdFrame, FfdLattice, FfdOptions, FfdOutsideMode, apply_ffd, apply_ffd_protected,
+};
+pub use kelvinlet::{
+    KelvinletLoad, KelvinletOptions, KelvinletScale, apply_kelvinlet, apply_kelvinlet_protected,
+};
+pub use xpbd::{XpbdOptions, XpbdReport, apply_xpbd};
+
+use crate::Result;
+use fast_mesh_store::{Transaction, VertexId};
+
+/// Unified summary report returned by [`apply_ffd`], [`apply_kelvinlet`], and [`apply_freeform`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FreeformReport {
+    /// Number of active/simulated vertices evaluated.
+    pub vertices_evaluated: usize,
+    /// Number of vertices whose world positions changed.
+    pub vertices_moved: usize,
+    /// Maximum Euclidean displacement across moved vertices.
+    pub max_displacement: f32,
+    /// Solver iterations or substeps executed (`1` for closed-form analytic operators).
+    pub iterations: usize,
+    /// Whether an iterative solver converged within tolerance (`true` for analytic operators).
+    pub converged: bool,
+    /// Number of narrow-phase self-collision contacts resolved (`0` unless enabled in XPBD).
+    pub self_collision_contacts_resolved: usize,
+}
+
+impl FreeformReport {
+    /// Returns an empty no-op report (`0` evaluated, `0` moved, `converged: true`).
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            vertices_evaluated: 0,
+            vertices_moved: 0,
+            max_displacement: 0.0,
+            iterations: 0,
+            converged: true,
+            self_collision_contacts_resolved: 0,
+        }
+    }
+}
+
+impl From<ArapReport> for FreeformReport {
+    #[inline]
+    fn from(r: ArapReport) -> Self {
+        Self {
+            vertices_evaluated: r.vertices_evaluated,
+            vertices_moved: r.vertices_moved,
+            max_displacement: r.max_displacement,
+            iterations: r.iterations_run,
+            converged: r.converged,
+            self_collision_contacts_resolved: 0,
+        }
+    }
+}
+
+impl From<XpbdReport> for FreeformReport {
+    #[inline]
+    fn from(r: XpbdReport) -> Self {
+        Self {
+            vertices_evaluated: r.vertices_evaluated,
+            vertices_moved: r.vertices_moved,
+            max_displacement: r.max_displacement,
+            iterations: r.total_iterations,
+            converged: true,
+            self_collision_contacts_resolved: r.self_collision_contacts_resolved,
+        }
+    }
+}
+
+/// Unified free-form deformation operator dispatched by [`apply_freeform`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum FreeformOp {
+    /// 3D Sederberg-Parry Free-Form Deformation cage.
+    Ffd(FfdOptions),
+    /// As-Rigid-As-Possible surface deformation.
+    Arap(ArapOptions),
+    /// Regularized elastostatic Kelvinlet load.
+    Kelvinlet(KelvinletOptions),
+    /// Extended Position-Based Dynamics solver.
+    Xpbd(XpbdOptions),
+}
+
+/// Applies any [`FreeformOp`] variant atomically to `tx`.
+pub fn apply_freeform(tx: &mut Transaction, op: &FreeformOp) -> Result<FreeformReport> {
+    match op {
+        FreeformOp::Ffd(opts) => apply_ffd(tx, opts),
+        FreeformOp::Arap(opts) => apply_arap(tx, opts).map(FreeformReport::from),
+        FreeformOp::Kelvinlet(opts) => apply_kelvinlet(tx, opts),
+        FreeformOp::Xpbd(opts) => apply_xpbd(tx, opts).map(FreeformReport::from),
+    }
+}
+
+/// Applies any [`FreeformOp`] variant modulated by per-vertex protection weights
+/// (`0` leaves vertex frozen at rest bits, `1` keeps full deformation).
+pub fn apply_freeform_protected(
+    tx: &mut Transaction,
+    op: &FreeformOp,
+    protected_vertices: &[VertexId],
+    protection_weights: &[f32],
+) -> Result<FreeformReport> {
+    with_protection(tx, protected_vertices, protection_weights, |tx| {
+        apply_freeform(tx, op)
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -727,5 +841,115 @@ mod tests {
             linear_fine > 0.9 * linear_coarse,
             "linear rim step stays: {linear_coarse} to {linear_fine}"
         );
+    }
+
+    #[test]
+    fn freeform_oom_leaves_transaction_untouched() {
+        use crate::test_util::{grid, uv_sphere};
+
+        let cloth = grid(4);
+        let mut lattice =
+            FfdLattice::with_mesh(&cloth, [3, 3, 3], FfdBasis::Bernstein, 0.1).unwrap();
+        lattice.set_offset(2, 2, 2, [0.5, 0.2, 0.0]).unwrap();
+        let ffd_opts = FfdOptions::new(lattice);
+        let ffd_points = sweep(grid(4), |tx| apply_ffd(tx, &ffd_opts).map(|_| ()));
+        assert!(ffd_points > 0);
+
+        let v0: VertexId = 0;
+        let v_last: VertexId = cloth.vertex_slots() as u32 - 1;
+        let arap_opts = ArapOptions::new()
+            .with_anchors(vec![ArapAnchor::pin(v0)])
+            .with_handles(vec![
+                ArapHandle::from_displacement(&cloth, v_last, [0.0, 0.0, 0.5]).unwrap(),
+            ])
+            .with_iterations(3);
+        let arap_points = sweep(grid(4), |tx| apply_arap(tx, &arap_opts).map(|_| ()));
+        assert!(arap_points > 0);
+
+        let sphere = uv_sphere(4, 6, 1.0);
+        let kel_opts = KelvinletOptions::new(
+            [0.0, 0.0, 0.0],
+            KelvinletLoad::Grab {
+                force: [0.0, 1.0, 0.0],
+            },
+        );
+        let kel_points = sweep(sphere, |tx| apply_kelvinlet(tx, &kel_opts).map(|_| ()));
+        assert!(kel_points > 0);
+
+        let xpbd_opts = XpbdOptions::new()
+            .with_substeps(2)
+            .with_iterations(2)
+            .with_pins(vec![(v0, cloth.positions()[0])])
+            .with_gravity([0.0, -1.0, 0.0])
+            .with_self_collision(true, 0.05);
+        let xpbd_points = sweep(grid(4), |tx| apply_xpbd(tx, &xpbd_opts).map(|_| ()));
+        assert!(xpbd_points > 0);
+    }
+
+    #[test]
+    fn freeform_parallel_determinism_unit() {
+        use crate::test_util::{assert_identical_across_threads, assert_parallel_identical, grid};
+
+        let to_bits = |m: &Mesh| -> Vec<[u32; 3]> {
+            m.positions()
+                .iter()
+                .map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])
+                .collect()
+        };
+
+        // grid(48) has 49*49 = 2401 vertices (> PAR_THRESHOLD = 2048).
+        assert_parallel_identical("ffd", || {
+            let mut m = grid(48);
+            let mut lat =
+                FfdLattice::with_mesh(&m, [3, 2, 3], FfdBasis::CubicBSpline, 0.1).unwrap();
+            lat.set_offset(2, 1, 2, [0.3, 0.7, -0.2]).unwrap();
+            let opts = FfdOptions::new(lat);
+            let mut tx = m.begin_edit();
+            apply_ffd(&mut tx, &opts).unwrap();
+            tx.commit().unwrap();
+            to_bits(&m)
+        });
+
+        assert_parallel_identical("kelvinlet", || {
+            let mut m = grid(48);
+            let opts = KelvinletOptions::new(
+                [24.0, 0.0, 24.0],
+                KelvinletLoad::Grab {
+                    force: [0.0, 1.5, 0.0],
+                },
+            )
+            .with_epsilon(4.0);
+            let mut tx = m.begin_edit();
+            apply_kelvinlet(&mut tx, &opts).unwrap();
+            tx.commit().unwrap();
+            to_bits(&m)
+        });
+
+        assert_parallel_identical("arap", || {
+            let mut m = grid(48);
+            let opts = ArapOptions::new()
+                .with_anchors(vec![ArapAnchor::pin(0), ArapAnchor::pin(48)])
+                .with_handles(vec![ArapHandle::new(2400, [48.0, 5.0, 48.0])])
+                .with_solver(ArapSolver::Pcg)
+                .with_iterations(4);
+            let mut tx = m.begin_edit();
+            apply_arap(&mut tx, &opts).unwrap();
+            tx.commit().unwrap();
+            to_bits(&m)
+        });
+
+        assert_identical_across_threads("xpbd", || {
+            let mut m = grid(8);
+            let opts = XpbdOptions::new()
+                .with_substeps(3)
+                .with_iterations(4)
+                .with_pins(vec![(0, [0.0, 0.0, 0.0]), (8, [8.0, 0.0, 0.0])])
+                .with_gravity([0.0, -5.0, 0.0])
+                .with_self_collision(true, 0.1);
+            let mut tx = m.begin_edit();
+            apply_xpbd(&mut tx, &opts).unwrap();
+            tx.commit().unwrap();
+            to_bits(&m)
+        });
     }
 }
