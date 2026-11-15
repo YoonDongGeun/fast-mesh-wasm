@@ -370,83 +370,125 @@ fn rigid_stops_cleanly_without_interpenetration_or_tunneling() {
 
 #[test]
 fn rigid_slides_tangentially_along_angled_surface() {
-    let mut scene = Scene::new(SceneOptions::default());
-    // Flat slab rotated 45 deg about Y: top normal points (+X, 0, +Z) / sqrt(2).
-    let ramp = scene
-        .add_mesh(
-            box_mesh([-3.0, -3.0, -0.5], [3.0, 3.0, 0.0]),
-            MeshOptions {
-                placement: Placement {
-                    rotation: ry_deg(45.0),
-                    translation: [0.0, 0.0, 0.0],
-                    scale: [1.0; 3],
+    let angles_deg = [
+        45.0,
+        45.0 - 1e-7,
+        45.0 + 1e-7,
+        27.3,
+        27.3 - 1e-7,
+        27.3 + 1e-7,
+        61.7,
+        61.7 - 1e-7,
+        61.7 + 1e-7,
+    ];
+
+    for angle_deg in angles_deg {
+        let mut scene = Scene::new(SceneOptions::default());
+        // Flat slab rotated `angle_deg` about Y: top normal points (+sin, 0, +cos).
+        let ramp = scene
+            .add_mesh(
+                box_mesh([-3.0, -3.0, -0.5], [3.0, 3.0, 0.0]),
+                MeshOptions {
+                    placement: Placement {
+                        rotation: ry_deg(angle_deg),
+                        translation: [0.0, 0.0, 0.0],
+                        scale: [1.0; 3],
+                    },
+                    ..MeshOptions::default()
                 },
-                ..MeshOptions::default()
-            },
-        )
-        .unwrap();
+            )
+            .unwrap();
 
-    let start = translate([0.0, 0.0, 2.0]);
-    let sphere = scene
-        .add_mesh(
-            icosphere([0.0, 0.0, 0.0], 0.4, 2),
-            MeshOptions {
-                placement: start,
-                ..MeshOptions::default()
-            },
-        )
-        .unwrap();
+        let start = translate([0.0, 0.0, 2.0]);
+        let sphere = scene
+            .add_mesh(
+                icosphere([0.0, 0.0, 0.0], 0.4, 2),
+                MeshOptions {
+                    placement: start,
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
 
-    // Compare slide vs no-slide from the exact same drop.
-    scene
-        .set_collision_rule(
-            ramp,
-            sphere,
-            CollisionRule {
-                mode: CollisionMode::Rigid,
-                rigid_slide: false,
-                ..CollisionRule::default()
-            },
-        )
-        .unwrap();
-    let drop_target = translate([0.0, 0.0, -2.0]);
-    let rep_no_slide = scene
-        .move_with_collision(sphere, drop_target, true)
-        .unwrap();
-    assert_eq!(scene.intersects(ramp, sphere), Ok(false));
-    assert!(rep_no_slide.final_placement.translation[0].abs() < 1e-6);
+        // Compare slide vs no-slide from the exact same drop.
+        scene
+            .set_collision_rule(
+                ramp,
+                sphere,
+                CollisionRule {
+                    mode: CollisionMode::Rigid,
+                    rigid_slide: false,
+                    ..CollisionRule::default()
+                },
+            )
+            .unwrap();
+        let drop_target = translate([0.0, 0.0, -2.0]);
+        let rep_no_slide = scene
+            .move_with_collision(sphere, drop_target, true)
+            .unwrap();
+        assert_eq!(
+            scene.intersects(ramp, sphere),
+            Ok(false),
+            "no-slide intersects(ramp, sphere) at angle {angle_deg}"
+        );
+        assert_eq!(
+            scene.intersects(sphere, ramp),
+            Ok(false),
+            "no-slide intersects(sphere, ramp) at angle {angle_deg}"
+        );
+        assert!(
+            rep_no_slide.min_clearance >= 1e-5 && rep_no_slide.min_clearance < 0.01,
+            "expected positive skin clearance for no-slide at {angle_deg}: {}",
+            rep_no_slide.min_clearance
+        );
+        assert!(rep_no_slide.final_placement.translation[0].abs() < 1e-6);
 
-    scene.undo().unwrap();
-    assert_eq!(scene.placement(sphere).unwrap(), start);
+        scene.undo().unwrap();
+        assert_eq!(scene.placement(sphere).unwrap(), start);
 
-    scene
-        .set_collision_rule(
-            ramp,
-            sphere,
-            CollisionRule {
-                mode: CollisionMode::Rigid,
-                rigid_slide: true,
-                ..CollisionRule::default()
-            },
-        )
-        .unwrap();
-    let rep_slide = scene
-        .move_with_collision(sphere, drop_target, true)
-        .unwrap();
-    assert_eq!(scene.intersects(ramp, sphere), Ok(false));
-    assert_eq!(rep_slide.active_pairs.len(), 1);
-    assert!(rep_slide.active_pairs[0].contact_blocked);
-    assert!(rep_slide.active_pairs[0].slidden);
-    assert!(
-        rep_slide.final_placement.translation[0] > 0.4,
-        "expected significant +X tangential slide down 45 deg ramp, got {:?}",
-        rep_slide.final_placement.translation
-    );
-    assert!(
-        rep_slide.final_placement.translation[2]
-            < rep_no_slide.final_placement.translation[2] - 0.3,
-        "expected sphere to slide further down slope in Z"
-    );
+        scene
+            .set_collision_rule(
+                ramp,
+                sphere,
+                CollisionRule {
+                    mode: CollisionMode::Rigid,
+                    rigid_slide: true,
+                    ..CollisionRule::default()
+                },
+            )
+            .unwrap();
+        let rep_slide = scene
+            .move_with_collision(sphere, drop_target, true)
+            .unwrap();
+        assert_eq!(
+            scene.intersects(ramp, sphere),
+            Ok(false),
+            "slide intersects(ramp, sphere) at angle {angle_deg}"
+        );
+        assert_eq!(
+            scene.intersects(sphere, ramp),
+            Ok(false),
+            "slide intersects(sphere, ramp) at angle {angle_deg}"
+        );
+        assert!(
+            rep_slide.min_clearance >= 1e-5 && rep_slide.min_clearance < 0.01,
+            "expected positive skin clearance for slide at {angle_deg}: {}",
+            rep_slide.min_clearance
+        );
+        assert_eq!(rep_slide.active_pairs.len(), 1);
+        assert!(rep_slide.active_pairs[0].contact_blocked);
+        assert!(rep_slide.active_pairs[0].slidden);
+        assert!(
+            rep_slide.final_placement.translation[0] > 0.4,
+            "expected significant +X tangential slide down {angle_deg} deg ramp, got {:?}",
+            rep_slide.final_placement.translation
+        );
+        assert!(
+            rep_slide.final_placement.translation[2]
+                < rep_no_slide.final_placement.translation[2] - 0.3,
+            "expected sphere to slide further down slope in Z at {angle_deg} deg"
+        );
+    }
 }
 
 #[test]

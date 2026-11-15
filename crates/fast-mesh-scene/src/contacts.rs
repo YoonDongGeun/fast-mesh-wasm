@@ -678,13 +678,7 @@ fn pair_intersects_with_placements(
     eb: &Entry,
     pb: &Placement,
 ) -> Result<bool> {
-    let wa = placement_world_box(ea, pa);
-    let wb = placement_world_box(eb, pb);
-    if wa.is_empty() || wb.is_empty() {
-        return Ok(false);
-    }
-    let pad = 1e-6 * (1.0 + vec_norm(vec_sub(wa.max, wa.min)) + vec_norm(vec_sub(wb.max, wb.min)));
-    if wa.distance_to_box(&wb) > pad {
+    if ea.mesh.triangle_count() == 0 || eb.mesh.triangle_count() == 0 {
         return Ok(false);
     }
     if is_relative_rigid(pa, pb) {
@@ -692,6 +686,15 @@ fn pair_intersects_with_placements(
         return Ok(fast_mesh_query::intersects(
             &ea.mesh, &ea.bvh, &eb.mesh, &eb.bvh, &xf,
         )?);
+    }
+    let wa = placement_world_box(ea, pa);
+    let wb = placement_world_box(eb, pb);
+    if wa.is_empty() || wb.is_empty() {
+        return Ok(false);
+    }
+    let pad = 1e-3 * (1.0 + vec_norm(vec_sub(wa.max, wa.min)) + vec_norm(vec_sub(wb.max, wb.min)));
+    if wa.distance_to_box(&wb) > pad {
+        return Ok(false);
     }
     if let Some(sa) = pa.uniform_scale() {
         let _ = sa;
@@ -740,6 +743,16 @@ fn pair_intersects_with_placements(
         &bb,
         &Rigid::IDENTITY,
     )?)
+}
+
+fn pair_intersects_symmetric(
+    ea: &Entry,
+    pa: &Placement,
+    eb: &Entry,
+    pb: &Placement,
+) -> Result<bool> {
+    Ok(pair_intersects_with_placements(ea, pa, eb, pb)?
+        || pair_intersects_with_placements(eb, pb, ea, pa)?)
 }
 
 struct PairSurfaceDistance {
@@ -1209,53 +1222,189 @@ impl Scene {
         Ok(out[0] < 0.0)
     }
 
-    fn solve_rigid_sweep(
+    fn rigid_pose_intersects_any(
         &self,
+        id: MeshId,
+        pose: &Placement,
+        partners: &[(MeshId, CollisionRule)],
+    ) -> Result<Option<MeshId>> {
+        let moved_entry = self.entry(id)?;
+        for &(partner, _) in partners {
+            let pe = self.entry(partner)?;
+            if pair_intersects_symmetric(moved_entry, pose, pe, &pe.placement)? {
+                return Ok(Some(partner));
+            }
+        }
+        Ok(None)
+    }
+
+    fn rigid_pose_intersects_scene(
+        &mut self,
+        id: MeshId,
+        pose: &Placement,
+        partners: &[(MeshId, CollisionRule)],
+    ) -> Result<bool> {
+        let saved = self.entry(id)?.placement;
+        self.entries
+            .get_mut(id)
+            .ok_or(SceneError::UnknownMesh)?
+            .placement = *pose;
+        let mut hit = false;
+        let mut first_err: Option<SceneError> = None;
+        for &(partner, _) in partners {
+            match self.intersects(id, partner).and_then(|a| {
+                if a {
+                    Ok(true)
+                } else {
+                    self.intersects(partner, id)
+                }
+            }) {
+                Ok(true) => {
+                    hit = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    first_err = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.placement = saved;
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(hit)
+    }
+
+    fn min_rigid_partner_distance(
+        &self,
+        id: MeshId,
+        pose: &Placement,
+        partners: &[(MeshId, CollisionRule)],
+    ) -> Result<f64> {
+        let ea = self.entry(id)?;
+        let mut min_dist = f64::INFINITY;
+        for &(partner, _) in partners {
+            let eb = self.entry(partner)?;
+            if let Some(sd) = pair_distance_with_placements(ea, pose, eb, &eb.placement)?
+                && sd.distance < min_dist
+            {
+                min_dist = sd.distance;
+            }
+        }
+        Ok(min_dist)
+    }
+
+    fn ensure_rigid_clearance(
+        &mut self,
+        id: MeshId,
+        pose: Placement,
+        partners: &[(MeshId, CollisionRule)],
+        fallback_normal: Option<[f64; 3]>,
+        fallback_motion: [f64; 3],
+        skin: f64,
+    ) -> Result<Option<Placement>> {
+        let is_clear = |scene: &mut Scene, cand: &Placement| -> Result<(bool, f64)> {
+            if scene
+                .rigid_pose_intersects_any(id, cand, partners)?
+                .is_some()
+                || scene.rigid_pose_intersects_scene(id, cand, partners)?
+            {
+                return Ok((false, 0.0));
+            }
+            let d = scene.min_rigid_partner_distance(id, cand, partners)?;
+            Ok((true, d))
+        };
+
+        let (clear0, dist0) = is_clear(self, &pose)?;
+        if clear0 && dist0 >= 0.25 * skin {
+            return Ok(Some(pose));
+        }
+
+        let push_normal = self
+            .rigid_contact_normal(id, &pose, partners, fallback_motion)?
+            .map(|(_, n)| n)
+            .or(fallback_normal);
+
+        let mut best_clear: Option<Placement> = if clear0 { Some(pose) } else { None };
+        if let Some(n) = push_normal {
+            for &mult in &[1.0, 2.0, 4.0] {
+                let cand = Placement {
+                    translation: vec_add(pose.translation, vec_scale(n, mult * skin)),
+                    ..pose
+                };
+                let (clear, dist) = is_clear(self, &cand)?;
+                if clear {
+                    if dist >= 0.25 * skin {
+                        return Ok(Some(cand));
+                    }
+                    if best_clear.is_none() {
+                        best_clear = Some(cand);
+                    }
+                }
+            }
+        }
+        Ok(best_clear)
+    }
+
+    fn solve_rigid_sweep(
+        &mut self,
         id: MeshId,
         start: Placement,
         target: Placement,
         partners: &[(MeshId, CollisionRule)],
     ) -> Result<(Placement, BTreeMap<MeshId, RigidPairOutcome>)> {
         let mut outcomes: BTreeMap<MeshId, RigidPairOutcome> = BTreeMap::new();
-        let moved_entry = self.entry(id)?;
-        let moving_box = placement_world_box(moved_entry, &start);
-        let moving_diag = if moving_box.is_empty() {
-            1.0
-        } else {
-            vec_norm(vec_sub(moving_box.max, moving_box.min)).max(1e-3)
+        let (moving_diag, min_extent) = {
+            let moved_entry = self.entry(id)?;
+            let moving_box = placement_world_box(moved_entry, &start);
+            let moving_diag = if moving_box.is_empty() {
+                1.0
+            } else {
+                vec_norm(vec_sub(moving_box.max, moving_box.min)).max(1e-3)
+            };
+            let mut min_extent = moving_diag;
+            for &(partner, _) in partners {
+                let pe = self.entry(partner)?;
+                let pb = placement_world_box(pe, &pe.placement);
+                if !pb.is_empty() {
+                    let d = vec_norm(vec_sub(pb.max, pb.min)).max(1e-3);
+                    if d < min_extent {
+                        min_extent = d;
+                    }
+                }
+            }
+            (moving_diag, min_extent)
         };
         let disp = vec_norm(vec_sub(target.translation, start.translation));
-        let mut min_extent = moving_diag;
-        for &(partner, _) in partners {
-            let pb = placement_world_box(self.entry(partner)?, &self.entry(partner)?.placement);
-            if !pb.is_empty() {
-                let d = vec_norm(vec_sub(pb.max, pb.min)).max(1e-3);
-                if d < min_extent {
-                    min_extent = d;
-                }
-            }
-        }
         let steps = ((disp / (0.25 * min_extent)).ceil() as usize).clamp(1, 32);
+        let skin = 1e-4 * moving_diag.min(min_extent).max(1.0);
 
-        let check_any = |pose: &Placement| -> Result<Option<MeshId>> {
-            for &(partner, _) in partners {
-                if pair_intersects_with_placements(
-                    moved_entry,
-                    pose,
-                    self.entry(partner)?,
-                    &self.entry(partner)?.placement,
-                )? {
-                    return Ok(Some(partner));
-                }
-            }
-            Ok(None)
-        };
-
-        if let Some(hit_start) = check_any(&start)? {
-            if check_any(&target)?.is_none() {
+        if let Some(hit_start) = self.rigid_pose_intersects_any(id, &start, partners)? {
+            if self
+                .rigid_pose_intersects_any(id, &target, partners)?
+                .is_none()
+                && !self.rigid_pose_intersects_scene(id, &target, partners)?
+            {
                 return Ok((target, outcomes));
             }
             outcomes.entry(hit_start).or_default().blocked = true;
+            return Ok((start, outcomes));
+        }
+        if self.rigid_pose_intersects_scene(id, &start, partners)? {
+            if self
+                .rigid_pose_intersects_any(id, &target, partners)?
+                .is_none()
+                && !self.rigid_pose_intersects_scene(id, &target, partners)?
+            {
+                return Ok((target, outcomes));
+            }
+            if let Some(&(first_partner, _)) = partners.first() {
+                outcomes.entry(first_partner).or_default().blocked = true;
+            }
             return Ok((start, outcomes));
         }
 
@@ -1268,11 +1417,18 @@ impl Scene {
                 step as f64 / steps as f64
             };
             let cand = interpolate(&start, &target, t);
-            if check_any(&cand)?.is_some() {
+            if self
+                .rigid_pose_intersects_any(id, &cand, partners)?
+                .is_some()
+            {
                 bracket = Some((prev_t, t));
                 break;
             }
             prev_t = t;
+        }
+
+        if bracket.is_none() && self.rigid_pose_intersects_scene(id, &target, partners)? {
+            bracket = Some((prev_t, 1.0));
         }
 
         let Some((mut lo, mut hi)) = bracket else {
@@ -1282,28 +1438,75 @@ impl Scene {
         for _ in 0..34 {
             let mid = 0.5 * (lo + hi);
             let cand = interpolate(&start, &target, mid);
-            if check_any(&cand)?.is_some() {
+            if self
+                .rigid_pose_intersects_any(id, &cand, partners)?
+                .is_some()
+            {
                 hi = mid;
             } else {
                 lo = mid;
             }
         }
 
-        let mut current = interpolate(&start, &target, lo);
+        let contact_pose = interpolate(&start, &target, lo);
         let probe_t = hi.min((lo + 1e-4).min(1.0));
         let probe_pose = interpolate(&start, &target, probe_t);
         let mut primary_blocker: Option<(MeshId, CollisionRule)> = None;
-        for &(partner, rule) in partners {
-            let pe = self.entry(partner)?;
-            if pair_intersects_with_placements(moved_entry, &probe_pose, pe, &pe.placement)?
-                || pair_intersects_with_placements(moved_entry, &target, pe, &pe.placement)?
-            {
-                outcomes.entry(partner).or_default().blocked = true;
-                if primary_blocker.is_none() {
-                    primary_blocker = Some((partner, rule));
+        {
+            let moved_entry = self.entry(id)?;
+            for &(partner, rule) in partners {
+                let pe = self.entry(partner)?;
+                if pair_intersects_symmetric(moved_entry, &probe_pose, pe, &pe.placement)?
+                    || pair_intersects_symmetric(moved_entry, &target, pe, &pe.placement)?
+                {
+                    outcomes.entry(partner).or_default().blocked = true;
+                    if primary_blocker.is_none() {
+                        primary_blocker = Some((partner, rule));
+                    }
                 }
             }
         }
+
+        let sweep_vec = vec_sub(target.translation, start.translation);
+        let contact_normal = self.rigid_contact_normal(id, &contact_pose, partners, sweep_vec)?;
+        let back_t = if disp > 1e-12 {
+            let sweep_dir = vec_scale(sweep_vec, 1.0 / disp);
+            let cos_angle = contact_normal
+                .map(|(_, n)| (-vec_dot(sweep_dir, n)).clamp(0.1, 1.0))
+                .unwrap_or(1.0);
+            ((skin / cos_angle) / disp).min(lo)
+        } else {
+            0.0
+        };
+        let backed = interpolate(&start, &target, (lo - back_t).max(0.0));
+        let needs_normal_fix = self
+            .rigid_pose_intersects_any(id, &backed, partners)?
+            .is_some()
+            || self.rigid_pose_intersects_scene(id, &backed, partners)?
+            || ((lo > back_t || disp <= 1e-12)
+                && self.min_rigid_partner_distance(id, &backed, partners)? < 0.25 * skin);
+        let mut current = if needs_normal_fix {
+            if let Some(safe) = self.ensure_rigid_clearance(
+                id,
+                backed,
+                partners,
+                contact_normal.map(|(_, n)| n),
+                sweep_vec,
+                skin,
+            )? {
+                safe
+            } else if !self.rigid_pose_intersects_scene(id, &contact_pose, partners)? {
+                contact_pose
+            } else {
+                start
+            }
+        } else {
+            backed
+        };
+        if self.rigid_pose_intersects_scene(id, &current, partners)? {
+            current = start;
+        }
+        let pre_slide_safe = current;
 
         if let Some((_, blocker_rule)) = primary_blocker
             && blocker_rule.rigid_slide
@@ -1330,7 +1533,8 @@ impl Scene {
                     break;
                 }
                 let tang = vec_sub(rem_t, vec_scale(normal, into));
-                if vec_norm(tang) <= 1e-11 {
+                let tang_len = vec_norm(tang);
+                if tang_len <= 1e-11 {
                     break;
                 }
                 let slide_base = current;
@@ -1339,52 +1543,107 @@ impl Scene {
                     ..slide_base
                 };
 
-                let mut s_lo = 0.0;
-                let mut s_hi = 1.0;
-                let lift_pose =
-                    if check_any(&interpolate(&slide_base, &slide_goal, 1e-3))?.is_some() {
-                        let lift = vec_scale(normal, (5e-6 * moving_diag).max(1e-6));
-                        let lifted = Placement {
-                            translation: vec_add(slide_base.translation, lift),
-                            ..slide_base
-                        };
-                        if check_any(&lifted)?.is_none() {
-                            Some(lifted)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                let base_too_close = self.min_rigid_partner_distance(id, &slide_base, partners)?
+                    < 0.5 * skin
+                    || self
+                        .rigid_pose_intersects_any(
+                            id,
+                            &interpolate(&slide_base, &slide_goal, 1e-3),
+                            partners,
+                        )?
+                        .is_some();
+                let origin_pose = if base_too_close {
+                    let lifted = Placement {
+                        translation: vec_add(slide_base.translation, vec_scale(normal, skin)),
+                        ..slide_base
                     };
-                let origin_pose = lift_pose.unwrap_or(slide_base);
+                    if self
+                        .rigid_pose_intersects_any(id, &lifted, partners)?
+                        .is_none()
+                        && !self.rigid_pose_intersects_scene(id, &lifted, partners)?
+                    {
+                        lifted
+                    } else {
+                        slide_base
+                    }
+                } else {
+                    slide_base
+                };
+
                 let shifted_goal = Placement {
                     translation: vec_add(origin_pose.translation, tang),
                     ..origin_pose
                 };
-                if check_any(&shifted_goal)?.is_none() {
+                let mut s_lo = 0.0;
+                let mut s_hi = 1.0;
+                let s_hit = if self
+                    .rigid_pose_intersects_any(id, &shifted_goal, partners)?
+                    .is_none()
+                    && !self.rigid_pose_intersects_scene(id, &shifted_goal, partners)?
+                {
                     s_lo = 1.0;
+                    false
                 } else {
                     for _ in 0..28 {
                         let mid = 0.5 * (s_lo + s_hi);
-                        if check_any(&interpolate(&origin_pose, &shifted_goal, mid))?.is_some() {
+                        if self
+                            .rigid_pose_intersects_any(
+                                id,
+                                &interpolate(&origin_pose, &shifted_goal, mid),
+                                partners,
+                            )?
+                            .is_some()
+                        {
                             s_hi = mid;
                         } else {
                             s_lo = mid;
                         }
                     }
-                }
-                let slid_pose = interpolate(&origin_pose, &shifted_goal, s_lo);
+                    let back_s = (skin / tang_len).min(0.5 * s_lo);
+                    s_lo = (s_lo - back_s).max(0.0);
+                    true
+                };
+
+                let cand = interpolate(&origin_pose, &shifted_goal, s_lo);
+                let Some(slid_pose) = self.ensure_rigid_clearance(
+                    id,
+                    cand,
+                    partners,
+                    Some(normal),
+                    vec_scale(tang, -1.0),
+                    skin,
+                )?
+                else {
+                    break;
+                };
+
                 if vec_norm(vec_sub(slid_pose.translation, current.translation)) > 1e-10 {
                     let o = outcomes.entry(blocker_id).or_default();
                     o.blocked = true;
                     o.slidden = true;
                     current = slid_pose;
+                } else {
+                    break;
                 }
                 rem_t = vec_scale(tang, 1.0 - s_lo);
-                if s_lo >= 1.0 - 1e-9 || s_lo <= 1e-6 {
+                if !s_hit || s_lo >= 1.0 - 1e-9 || s_lo <= 1e-6 {
                     break;
                 }
             }
+        }
+
+        if self.rigid_pose_intersects_scene(id, &current, partners)? {
+            current = if !self.rigid_pose_intersects_scene(id, &pre_slide_safe, partners)? {
+                for o in outcomes.values_mut() {
+                    o.slidden = false;
+                }
+                pre_slide_safe
+            } else {
+                for o in outcomes.values_mut() {
+                    o.slidden = false;
+                }
+                start
+            };
         }
 
         Ok((current, outcomes))
@@ -1410,13 +1669,27 @@ impl Scene {
             };
             if better {
                 let mut n = if sd.distance > 1e-10 {
-                    vec_normalize(vec_sub(sd.point_a, sd.point_b), [0.0, 1.0, 0.0])
-                } else {
-                    let mut tn = world_triangle_normal(eb, &eb.placement, sd.triangle_b);
-                    if vec_dot(tn, motion) > 0.0 {
-                        tn = vec_scale(tn, -1.0);
+                    let mut n_sep = vec_normalize(vec_sub(sd.point_a, sd.point_b), [0.0, 1.0, 0.0]);
+                    if vec_dot(n_sep, motion) > 0.0 {
+                        n_sep = vec_scale(n_sep, -1.0);
                     }
-                    tn
+                    // When separation is small (`f32` subtraction `point_a - point_b` can suffer
+                    // cancellation), prefer the exact `f64` obstacle face normal when aligned.
+                    if sd.distance < 1e-2 {
+                        let mut tn = world_triangle_normal(eb, &eb.placement, sd.triangle_b);
+                        if vec_dot(tn, n_sep) < 0.0 {
+                            tn = vec_scale(tn, -1.0);
+                        }
+                        if vec_dot(tn, n_sep) > 0.995 {
+                            tn
+                        } else {
+                            n_sep
+                        }
+                    } else {
+                        n_sep
+                    }
+                } else {
+                    world_triangle_normal(eb, &eb.placement, sd.triangle_b)
                 };
                 if vec_dot(n, motion) > 0.0 {
                     n = vec_scale(n, -1.0);
