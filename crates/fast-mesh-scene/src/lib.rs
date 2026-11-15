@@ -111,7 +111,11 @@ mod sections;
 mod uv_tests;
 
 pub use boolean::{BooleanMethod, BooleanOp, BooleanOptions, BooleanReport, CsgNode};
-pub use contacts::{Contact, ContactFilter};
+pub use contacts::{
+    CollisionDistanceBackend, CollisionMode, CollisionPairReport, CollisionRole, CollisionRule,
+    CollisionStepReport, Contact, ContactFilter, CutTrigger, MaterialMemory, SoftDeformSolver,
+    ordered_pair,
+};
 pub use cut::{CutOptions, CutReport, TrimCurveOptions, TrimReport};
 pub use domains::{
     SceneAlignOps, SceneBooleanOps, SceneDeformOps, SceneInspectOps, SceneRemeshOps,

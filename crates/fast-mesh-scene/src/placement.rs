@@ -284,6 +284,140 @@ pub(crate) fn relative_rigid(
     }
 }
 
+/// Geodesically interpolates between two valid [`Placement`]s at parameter
+/// `t` clamped to `[0.0, 1.0]`, keeping `rotation` orthonormal.
+pub(crate) fn interpolate(a: &Placement, b: &Placement, t: f64) -> Placement {
+    let t = t.clamp(0.0, 1.0);
+    if t == 0.0 {
+        return *a;
+    }
+    if t == 1.0 {
+        return *b;
+    }
+    let translation =
+        std::array::from_fn(|i| a.translation[i] + t * (b.translation[i] - a.translation[i]));
+    let scale = std::array::from_fn(|i| a.scale[i] + t * (b.scale[i] - a.scale[i]));
+    let (ra, rb) = (&a.rotation, &b.rotation);
+    if ra == rb {
+        return Placement {
+            rotation: *ra,
+            translation,
+            scale,
+        };
+    }
+    // Relative rotation `R_rel = R_b * R_a^T`.
+    let rel: [[f64; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| rb[i][0] * ra[j][0] + rb[i][1] * ra[j][1] + rb[i][2] * ra[j][2])
+    });
+    let trace = rel[0][0] + rel[1][1] + rel[2][2];
+    let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let theta = cos_theta.acos();
+
+    let delta = if theta < 1e-12 {
+        let mut lin = [[0.0; 3]; 3];
+        for (i, row) in lin.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                let id = if i == j { 1.0 } else { 0.0 };
+                *cell = id + t * (rel[i][j] - id);
+            }
+        }
+        orthonormalize(lin)
+    } else {
+        let mut axis = if theta < std::f64::consts::PI - 1e-6 {
+            [
+                rel[2][1] - rel[1][2],
+                rel[0][2] - rel[2][0],
+                rel[1][0] - rel[0][1],
+            ]
+        } else {
+            let xx = ((rel[0][0] + 1.0) * 0.5).max(0.0).sqrt();
+            let yy = ((rel[1][1] + 1.0) * 0.5).max(0.0).sqrt();
+            let zz = ((rel[2][2] + 1.0) * 0.5).max(0.0).sqrt();
+            if xx >= yy && xx >= zz {
+                [
+                    xx,
+                    if rel[0][1] + rel[1][0] >= 0.0 {
+                        yy
+                    } else {
+                        -yy
+                    },
+                    if rel[0][2] + rel[2][0] >= 0.0 {
+                        zz
+                    } else {
+                        -zz
+                    },
+                ]
+            } else if yy >= zz {
+                [
+                    if rel[0][1] + rel[1][0] >= 0.0 {
+                        xx
+                    } else {
+                        -xx
+                    },
+                    yy,
+                    if rel[1][2] + rel[2][1] >= 0.0 {
+                        zz
+                    } else {
+                        -zz
+                    },
+                ]
+            } else {
+                [
+                    if rel[0][2] + rel[2][0] >= 0.0 {
+                        xx
+                    } else {
+                        -xx
+                    },
+                    if rel[1][2] + rel[2][1] >= 0.0 {
+                        yy
+                    } else {
+                        -yy
+                    },
+                    zz,
+                ]
+            }
+        };
+        let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        if len > 0.0 {
+            axis = [axis[0] / len, axis[1] / len, axis[2] / len];
+        } else {
+            axis = [0.0, 0.0, 1.0];
+        }
+        let phi = theta * t;
+        let (s, c) = phi.sin_cos();
+        let omc = 1.0 - c;
+        let [kx, ky, kz] = axis;
+        [
+            [
+                c + kx * kx * omc,
+                kx * ky * omc - kz * s,
+                kx * kz * omc + ky * s,
+            ],
+            [
+                ky * kx * omc + kz * s,
+                c + ky * ky * omc,
+                ky * kz * omc - kx * s,
+            ],
+            [
+                kz * kx * omc - ky * s,
+                kz * ky * omc + kx * s,
+                c + kz * kz * omc,
+            ],
+        ]
+    };
+
+    let rot: [[f64; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            delta[i][0] * ra[0][j] + delta[i][1] * ra[1][j] + delta[i][2] * ra[2][j]
+        })
+    });
+    Placement {
+        rotation: orthonormalize(rot),
+        translation,
+        scale,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +665,21 @@ mod tests {
         for (b, l) in back.iter().zip(local) {
             assert!((b - l).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn interpolate_endpoints_and_midpoint() {
+        let a = p(Placement::IDENTITY.rotation, [0.0, 0.0, 0.0]);
+        let b = p(RZ90, [4.0, -2.0, 8.0]);
+        assert_eq!(interpolate(&a, &b, 0.0), a);
+        assert_eq!(interpolate(&a, &b, 1.0), b);
+        let mid = interpolate(&a, &b, 0.5);
+        assert_eq!(mid.validate(), Ok(()));
+        assert!((mid.translation[0] - 2.0).abs() < 1e-12);
+        assert!((mid.translation[1] + 1.0).abs() < 1e-12);
+        assert!((mid.translation[2] - 4.0).abs() < 1e-12);
+        let sq = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((mid.rotation[0][0] - sq).abs() < 1e-6);
+        assert!((mid.rotation[1][0] - sq).abs() < 1e-6);
     }
 }
