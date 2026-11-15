@@ -388,6 +388,7 @@ export function ModelingPanel(props: { app: AppState }) {
                     min={0}
                     step="any"
                     aria-label="Offset voxel size"
+                    data-modeling-offset-voxel-size
                     placeholder="auto"
                     value={offsetVoxelSize === "" ? "" : lengthInputValue(Number(offsetVoxelSize), units)}
                     onChange={(e) => {
@@ -400,7 +401,13 @@ export function ModelingPanel(props: { app: AppState }) {
               <button
                 type="button"
                 data-modeling-offset-run
-                disabled={disabled || (offsetAlgorithm === "normal" && offsetDistance === 0)}
+                disabled={
+                  disabled ||
+                  (offsetAlgorithm !== "bvhSdf" && offsetAlgorithm !== "fhEdt" && offsetDistance === 0) ||
+                  ((offsetAlgorithm === "bvhSdf" || offsetAlgorithm === "fhEdt") &&
+                    offsetVoxelSize !== "" &&
+                    !(Number(offsetVoxelSize) > 0))
+                }
                 onClick={() => {
                   if (!activeItem) return;
                   void runAction("Offset", async () => {
@@ -415,7 +422,9 @@ export function ModelingPanel(props: { app: AppState }) {
                   });
                 }}
               >
-                Offset
+                {(offsetAlgorithm === "bvhSdf" || offsetAlgorithm === "fhEdt") && offsetDistance === 0
+                  ? "Voxel remesh"
+                  : "Offset"}
               </button>
             </div>
             <div className="op-row">

@@ -18,6 +18,7 @@ import {
 import { parseBigFileParams } from "./load/big-file";
 import type { Loader } from "./load/loader";
 import { CollisionPanel } from "./panels/CollisionPanel";
+import { CommandPalette } from "./panels/CommandPalette";
 import { ExportPanel } from "./panels/ExportPanel";
 import { GroupsBar } from "./panels/GroupsBar";
 import { HelpOverlay, TourCard } from "./panels/Help";
@@ -28,51 +29,21 @@ import { MeshList } from "./panels/MeshList";
 import { ModelingPanel } from "./panels/ModelingPanel";
 import { ProjectPanel } from "./panels/ProjectPanel";
 import { RepairPanel } from "./panels/RepairPanel";
+import {
+  HomeOverviewCard,
+  InspectorHeader,
+  SculptInspectorCard,
+  tabMatchesSlot,
+  VolumeFallbackCard,
+  WorkbenchRibbon,
+} from "./panels/Ribbon";
 import { TransformPanel } from "./panels/TransformPanel";
 import { DEFAULT_SIDEBAR_WIDTH } from "./panels/settings";
 import { StatusBar } from "./panels/StatusBar";
 import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "./panels/tour";
-import { domainMatchesPanel, WorkbenchDomains, type WorkbenchDomainId } from "./panels/WorkbenchDomains";
-import { type AppState, type CameraPreset, useApp } from "./scene/app-state";
-
-const CAMERA_PRESETS: readonly { id: CameraPreset; label: string }[] = [
-  { id: "front", label: "Front" },
-  { id: "back", label: "Back" },
-  { id: "left", label: "Left" },
-  { id: "right", label: "Right" },
-  { id: "top", label: "Top" },
-  { id: "bottom", label: "Bottom" },
-];
-
-function CameraToolbarGroup({ app }: { app: AppState }) {
-  const projection = useApp(app, (s) => s.cameraProjection);
-  return (
-    <div className="group camera-group" aria-label="Camera views and projection">
-      {CAMERA_PRESETS.map((p) => (
-        <button
-          key={p.id}
-          type="button"
-          data-camera-preset={p.id}
-          onClick={() => app.requestCameraPreset(p.id)}
-          title={`${p.label} view`}
-        >
-          {p.label}
-        </button>
-      ))}
-      <button
-        type="button"
-        data-action="camera-projection"
-        aria-pressed={projection === "orthographic"}
-        onClick={() => app.toggleCameraProjection()}
-        title="Toggle Perspective / Orthographic projection"
-      >
-        {projection === "perspective" ? "Perspective" : "Orthographic"}
-      </button>
-    </div>
-  );
-}
+import { type AppState, useApp, type WorkbenchTab } from "./scene/app-state";
+import { ViewportNavigationHud } from "./viewport/ViewCube";
 import { selectMesh } from "./scene/selection";
-import { SculptToolbox } from "./viewport/Toolbox";
 import { afterStroke } from "./viewport/view";
 import { VolumeOverlay } from "./viewport/VolumeOverlay";
 import { type GizmoMode, Viewport } from "./viewport/Viewport";
@@ -121,7 +92,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const [dropping, setDropping] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [tourStep, setTourStep] = useState<number | null>(null);
-  const [activeDomain, setActiveDomain] = useState<WorkbenchDomainId | null>(null);
+  const activeTab = useApp(app, (s) => s.activeTab);
+  const ortho = useApp(app, (s) => s.cameraProjection === "orthographic");
+  const units = useApp(app, (s) => s.units);
+  const inspectTool = useApp(app, (s) => s.inspectTool);
+  const collisionMode = useApp(app, (s) => s.collisionMode);
+  const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
+  const selectedIsVolume = selectedItem !== null && selectedItem.volumeId !== null;
+  const hasVolume = items.some((i) => i.volumeId !== null);
   // The persisted display settings: the theme (as `data-theme` on the
   // root, for the light overrides) and the sidebars (shown, widths).
   const theme = useApp(app, (s) => s.theme);
@@ -259,15 +237,61 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     }
   }, []);
 
-  // ---- Keyboard: undo/redo, gizmo mode, focus, deselect, help ----
+  const prevSelectedVolumeRef = useRef<boolean>(false);
+  const prevSculptActiveRef = useRef<boolean>(false);
+  const prevInspectToolRef = useRef(inspectTool);
+  const prevCollisionModeRef = useRef(collisionMode);
+
+  // Contextual workspace auto-switching (#228) on meaningful trigger transitions.
+  useEffect(() => {
+    const wasVol = prevSelectedVolumeRef.current;
+    prevSelectedVolumeRef.current = selectedIsVolume;
+    if (!wasVol && selectedIsVolume) {
+      app.setActiveTab("volume");
+    } else if (wasVol && !selectedIsVolume && app.getSnapshot().activeTab === "volume") {
+      app.setActiveTab(selection === null ? "home" : "select");
+    }
+  }, [app, selectedIsVolume, selection]);
+
+  useEffect(() => {
+    const nowActive = sculpt !== null || maskPaint;
+    const wasActive = prevSculptActiveRef.current;
+    prevSculptActiveRef.current = nowActive;
+    if (!wasActive && nowActive) {
+      app.setActiveTab("sculpt");
+    }
+  }, [app, sculpt, maskPaint]);
+
+  useEffect(() => {
+    const was = prevInspectToolRef.current;
+    prevInspectToolRef.current = inspectTool;
+    if (was === null && inspectTool !== null) {
+      app.setActiveTab("inspect");
+    }
+  }, [app, inspectTool]);
+
+  useEffect(() => {
+    const was = prevCollisionModeRef.current;
+    prevCollisionModeRef.current = collisionMode;
+    if (was !== collisionMode) {
+      app.setActiveTab("align");
+    }
+  }, [app, collisionMode]);
+
+  // ---- Keyboard: undo/redo, command palette, gizmo mode, focus, deselect, help ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && key === "k") {
+        e.preventDefault();
+        app.setCommandPaletteOpen(!app.getSnapshot().commandPaletteOpen);
+        return;
+      }
       // Typing in a field (the opacity slider, say) is not a shortcut.
       const target = e.target as HTMLElement | null;
       if (target !== null && (target.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName))) {
         return;
       }
-      const key = e.key.toLowerCase();
       if ((e.ctrlKey || e.metaKey) && key === "z") {
         e.preventDefault();
         if (e.shiftKey) {
@@ -280,17 +304,22 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         redo();
       } else if (e.ctrlKey || e.metaKey || e.altKey) {
         // Other modified keys are the browser's.
+      } else if (key === "/") {
+        e.preventDefault();
+        app.setCommandPaletteOpen(true);
       } else if (key === "?") {
         setHelpOpen((v) => !v);
       } else if (key === "escape") {
-        if (helpOpen) {
+        const snap = app.getSnapshot();
+        if (snap.commandPaletteOpen) {
+          app.setCommandPaletteOpen(false);
+        } else if (helpOpen) {
           setHelpOpen(false);
         } else if (tourStep !== null) {
           endTour();
         } else {
           // Sculpt first (it owns the pointer), then the mask paint, then a
           // pick (it never selects), then the selection.
-          const snap = app.getSnapshot();
           if (snap.sculpt !== null) {
             app.setSculpt(null);
           } else if (snap.maskPaint) {
@@ -356,8 +385,30 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     "--left-w": leftVisible ? `${leftWidth}px` : "0px",
     "--right-w": rightVisible ? `${rightWidth}px` : "0px",
   } as CSSProperties;
+  const activateTabForSlot = (targetTab: WorkbenchTab) => {
+    app.setActiveTab(targetTab);
+  };
   return (
     <div ref={shellRef} className="app" style={shellStyle}>
+      <WorkbenchRibbon
+        app={app}
+        mode={mode}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        wireframe={wireframe}
+        selection={selection}
+        hasItems={items.length > 0}
+        hasVolume={hasVolume}
+        onSetMode={setMode}
+        onResetView={() => setResetView((n) => n + 1)}
+        onFocusSelection={() => {
+          if (selection !== null) focusOn(selection);
+        }}
+        onClearSelection={() => selectMesh(app, select, selection, null, false)}
+        onUndo={undo}
+        onRedo={redo}
+        onOpenHelp={() => setHelpOpen(true)}
+      />
       <aside className="sidebar sidebar-left" style={leftVisible ? undefined : { display: "none" }}>
         <SidebarHandle side="left" shell={shellRef} app={app} />
         <MeshList
@@ -408,98 +459,121 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           wireframe={wireframe}
           loader={loader}
         />
-        <SculptToolbox app={app} />
         {grouped ? <HoverTip app={app} scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
-        <div className="toolbar" role="toolbar" aria-label="Viewport tools" data-tour="gizmo">
-          <div className="group">
-            <button type="button" aria-pressed={mode === "translate"} onClick={() => setMode("translate")} title="Move (T)">
-              Move <kbd>T</kbd>
-            </button>
-            <button type="button" aria-pressed={mode === "rotate"} onClick={() => setMode("rotate")} title="Rotate (R)">
-              Rotate <kbd>R</kbd>
-            </button>
-            <button type="button" data-action="mode-scale" aria-pressed={mode === "scale"} onClick={() => setMode("scale")} title="Scale (S)">
-              Scale <kbd>S</kbd>
-            </button>
-            <button type="button" data-action="view-reset" onClick={() => setResetView((n) => n + 1)} title="Reset the camera">
-              Reset view
-            </button>
-          </div>
-          <div className="group">
-            <button type="button" data-action="undo" disabled={!canUndo} onClick={undo} title="Undo (Ctrl+Z)">
-              Undo
-            </button>
-            <button type="button" data-action="redo" disabled={!canRedo} onClick={redo} title="Redo (Ctrl+Shift+Z)">
-              Redo
-            </button>
-          </div>
-          <div className="group">
-            <button
-              type="button"
-              data-action="wire"
-              aria-pressed={wireframe}
-              onClick={() => app.setWireframe(!wireframe)}
-              title="Draw every mesh wireframed (W)"
-            >
-              Wire
-            </button>
-          </div>
-          <div className="group">
-            <button type="button" data-action="help" onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)">
-              Help <kbd>?</kbd>
-            </button>
-          </div>
-        </div>
-        <div className="camera-bar" role="toolbar" aria-label="Camera views and projection">
-          <CameraToolbarGroup app={app} />
-        </div>
+        <ViewportNavigationHud app={app} />
         <p className="hint">
           {sculpt !== null
-            ? "Hover shows the brush · press-and-hold to sculpt · drag to grab · Esc disarms"
+            ? "Hover any visible mesh to see brush · drag to sculpt · Esc disarms"
             : maskPaint
-              ? "Press and hold to paint the mask · Esc disarms"
+              ? "Hover any visible mesh · drag to paint mask · Esc disarms"
             : picking !== null
               ? "Click the mesh to set the brush center · Esc cancels"
               : selection === null
                 ? coarsePointer
                   ? "Tap a mesh to select it · drag to rotate · pinch to zoom · two fingers to pan"
-                  : "Click a mesh to select it · drag to rotate · scroll to zoom · drop files to load"
+                  : "Click a mesh to select it · drag to rotate · scroll to zoom · Ctrl+K search · drop files to load"
                 : coarsePointer
                   ? "Drag the gizmo to move · tap empty space to deselect"
-                  : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Esc deselect · drop files to load"}
+                  : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Ctrl+K search · Esc deselect"}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
       <aside className="sidebar sidebar-right" style={rightVisible ? undefined : { display: "none" }}>
         <SidebarHandle side="right" shell={shellRef} app={app} />
-        <TransformPanel app={app} mode={mode} onMode={setMode} />
-        <WorkbenchDomains activeDomain={activeDomain} onSelectDomain={setActiveDomain} />
-        <div className={domainMatchesPanel(activeDomain, "modeling") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="modeling">
+        <InspectorHeader app={app} activeTab={activeTab} />
+        <div
+          className={tabMatchesSlot(activeTab, "home") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="home"
+        >
+          <HomeOverviewCard app={app} itemCount={items.length} onResetView={() => setResetView((n) => n + 1)} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "transform") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="transform"
+          onClickCapture={() => activateTabForSlot("select")}
+        >
+          <TransformPanel app={app} mode={mode} onMode={setMode} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "sculpt") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="sculpt"
+          onClickCapture={() => activateTabForSlot("sculpt")}
+        >
+          <SculptInspectorCard app={app} selection={selection} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "modeling") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="modeling"
+          onClickCapture={() => activateTabForSlot("edit")}
+        >
           <ModelingPanel app={app} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "repair") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="repair">
+        <div
+          className={tabMatchesSlot(activeTab, "repair") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="repair"
+          onClickCapture={() => activateTabForSlot("repair")}
+        >
           <RepairPanel app={app} scene={engine.scene} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "align") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="align">
+        <div
+          className={tabMatchesSlot(activeTab, "align") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="align"
+          onClickCapture={() => activateTabForSlot("align")}
+        >
           <AlignPanel app={app} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "collision") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="collision">
+        <div
+          className={tabMatchesSlot(activeTab, "collision") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="collision"
+          onClickCapture={() => activateTabForSlot("align")}
+        >
           <CollisionPanel app={app} scene={engine.scene} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "inspect") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="inspect">
+        <div
+          className={tabMatchesSlot(activeTab, "inspect") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="inspect"
+          onClickCapture={() => activateTabForSlot("inspect")}
+        >
           <InspectPanel app={app} scene={engine.scene} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "export") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="export">
+        <div
+          className={tabMatchesSlot(activeTab, "export") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="export"
+          onClickCapture={() => activateTabForSlot("home")}
+        >
           <ExportPanel app={app} scene={engine.scene} />
         </div>
-        <div className={domainMatchesPanel(activeDomain, "volume") ? "domain-slot" : "domain-slot domain-subdued"} data-domain-slot="volume">
+        <div
+          className={tabMatchesSlot(activeTab, "volume") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="volume"
+          onClickCapture={() => activateTabForSlot("volume")}
+        >
+          {!selectedIsVolume ? <VolumeFallbackCard app={app} /> : null}
           <Suspense fallback={null}>
             <VolumePanel app={app} loader={loader} />
           </Suspense>
         </div>
       </aside>
       <StatusBar engine={engine} app={app} />
+      <CommandPalette
+        app={app}
+        items={items}
+        selection={selection}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        ortho={ortho}
+        units={units}
+        onSelectItem={(mesh) => {
+          selectMesh(app, select, selection, mesh, false);
+          focusOn(mesh);
+        }}
+        onSetMode={setMode}
+        onResetView={() => setResetView((n) => n + 1)}
+        onUndo={undo}
+        onRedo={redo}
+        onOpenHelp={() => setHelpOpen(true)}
+      />
       {helpOpen ? (
         <HelpOverlay
           onClose={() => setHelpOpen(false)}

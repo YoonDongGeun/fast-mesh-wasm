@@ -100,22 +100,26 @@ export function computeSceneBounds(
   return { center: [center.x, center.y, center.z], radius };
 }
 
-/** Computes camera pose framing `bounds` from one of the 6 standard axis presets. */
-export function presetPose(
-  preset: CameraPreset,
+/** Computes a camera pose framing `bounds` from an arbitrary normalized direction & up vector (#232). */
+export function directionPose(
+  dir: readonly [number, number, number],
+  up: readonly [number, number, number],
   bounds: SceneCameraBounds,
   fovDeg = 45,
 ): CameraPresetPose {
-  const { dir, up } = PRESET_AXES[preset];
+  const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+  const nx = dir[0] / len;
+  const ny = dir[1] / len;
+  const nz = dir[2] / len;
   const r = Math.max(bounds.radius, 0.25);
   const halfFov = THREE.MathUtils.degToRad(fovDeg / 2);
   const distance = (r * 2.4) / Math.sin(halfFov);
   const halfHeight = Math.tan(halfFov) * distance;
   return {
     position: [
-      bounds.center[0] + dir[0] * distance,
-      bounds.center[1] + dir[1] * distance,
-      bounds.center[2] + dir[2] * distance,
+      bounds.center[0] + nx * distance,
+      bounds.center[1] + ny * distance,
+      bounds.center[2] + nz * distance,
     ],
     target: [...bounds.center],
     up: [...up],
@@ -124,6 +128,16 @@ export function presetPose(
     far: Math.max(distance * 100, 100),
     halfHeight,
   };
+}
+
+/** Computes camera pose framing `bounds` from one of the 6 standard axis presets. */
+export function presetPose(
+  preset: CameraPreset,
+  bounds: SceneCameraBounds,
+  fovDeg = 45,
+): CameraPresetPose {
+  const { dir, up } = PRESET_AXES[preset];
+  return directionPose(dir, up, bounds, fovDeg);
 }
 
 /** Computes OrthographicCamera half-extents matching a PerspectiveCamera at `distance`. */

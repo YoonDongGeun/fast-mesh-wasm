@@ -176,4 +176,80 @@ describe("MaskOverlay", () => {
     expect(disposedWith).toBeUndefined();
     expect(m.geometry.getAttribute("position")).toBe(position);
   });
+
+  it("keeps_live_gpu_buffers_across_host_dispose_and_split_stretched_passes", () => {
+    // Simulates Three.js WebGLGeometries.onGeometryDispose + WebGLAttributes:
+    // rendering populates `gpuBuffers`; geometry.dispose() removes every attribute still on that geometry.
+    const gpuBuffers = new WeakSet<THREE.BufferAttribute | THREE.InterleavedBufferAttribute>();
+    const listened = new WeakSet<THREE.BufferGeometry>();
+    const simulateRender = (g: THREE.BufferGeometry) => {
+      if (!listened.has(g)) {
+        listened.add(g);
+        g.addEventListener("dispose", () => {
+          const idx = g.getIndex();
+          if (idx !== null) gpuBuffers.delete(idx);
+          for (const key of Object.keys(g.attributes)) {
+            gpuBuffers.delete(g.attributes[key]);
+          }
+        });
+      }
+      const idx = g.getIndex();
+      if (idx !== null) gpuBuffers.add(idx);
+      for (const key of Object.keys(g.attributes)) {
+        gpuBuffers.add(g.attributes[key]);
+      }
+    };
+
+    const m = host(400);
+    const overlay = new MaskOverlay(m);
+    const mask = Uint32Array.of(0, 1, 2);
+    overlay.sync(mask);
+    simulateRender(overlayMesh(m).geometry);
+
+    // 1. Structural host disposal without array reallocation (#hostDropped path).
+    m.geometry.dispose();
+    overlay.sync(mask);
+    const g1 = overlayMesh(m).geometry;
+    const c1 = g1.getAttribute("color");
+    const i1 = g1.getIndex()!;
+    expect(gpuBuffers.has(c1)).toBe(true);
+    expect(gpuBuffers.has(i1)).toBe(true);
+    simulateRender(g1);
+
+    // 2. Host structural disposal + slot growth (splitStretched grows positions while index capacity holds).
+    m.geometry.dispose();
+    m.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * 900), 3));
+    overlay.sync(mask);
+    const g2 = overlayMesh(m).geometry;
+    expect(g2).not.toBe(g1);
+    // Old color buffer was replaced and freed; new color is freshly attached, and kept index buffer survived old.dispose().
+    expect(gpuBuffers.has(c1)).toBe(false);
+    expect(gpuBuffers.has(g2.getAttribute("color"))).toBe(false); // newly created wrapper ready for WebGLAttributes upload
+    expect(g2.getAttribute("color")).not.toBe(c1);
+    expect(gpuBuffers.has(i1)).toBe(true);
+    expect(g2.getIndex()).toBe(i1);
+    simulateRender(g2);
+
+    // 3. Index buffer grows while slot capacity holds (repeated splitStretched passes + undo shrink).
+    const c2 = g2.getAttribute("color");
+    const wideMask = Uint32Array.from({ length: 802 }, (_, i) => i);
+    m.geometry.setIndex(new THREE.BufferAttribute(strip(600), 1));
+    overlay.sync(wideMask);
+    const g3 = overlayMesh(m).geometry;
+    expect(gpuBuffers.has(i1)).toBe(false); // old index buffer freed
+    expect(g3.getIndex()).not.toBe(i1);
+    expect(gpuBuffers.has(c2)).toBe(true); // kept color buffer survived
+    expect(g3.getAttribute("color")).toBe(c2);
+    expect(g3.drawRange.count).toBe(3 * overlay.triangles);
+    simulateRender(g3);
+
+    // 4. Undo shrinks triangle count back without wiping live buffers.
+    overlay.sync(mask);
+    expect(gpuBuffers.has(g3.getAttribute("color"))).toBe(true);
+    expect(gpuBuffers.has(g3.getIndex()!)).toBe(true);
+    expect(g3.drawRange.count).toBe(9);
+    expect(g3.drawRange.count).toBe(3 * overlay.triangles);
+
+    overlay.dispose();
+  });
 });

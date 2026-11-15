@@ -9,7 +9,7 @@ import { BIG_FILE_DEFAULTS, estimateMeshBytes, formatMeshBytes, formatTriangles,
 import { MESH_EXTENSIONS } from "../load/parse";
 import { PHANTOM_NAMES, type PhantomKind } from "../load/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../load/vtkjs";
-import { type AppState, type Item, type Job, useApp } from "../scene/app-state";
+import { type AppState, type DiagnosticShadingMode, type Item, type Job, useApp } from "../scene/app-state";
 import { selectMesh } from "../scene/selection";
 import { duplicateMesh, type MirrorAxis, mirrorMesh } from "../scene/workbench-ops";
 import { useMeshPreview } from "./mesh-preview";
@@ -53,8 +53,23 @@ export function MeshList(props: {
   const items = useApp(app, (s) => s.items);
   const jobs = useApp(app, (s) => s.jobs);
   const decimateOnLoad = useApp(app, (s) => s.decimateOnLoad);
+  const meshGroups = useApp(app, (s) => s.meshGroups);
+  const ruler = useApp(app, (s) => s.ruler);
+  const inspectSection = useApp(app, (s) => s.inspectSection);
+  const clipBox = useApp(app, (s) => s.clipBox);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<number, boolean>>({});
   const [mirrorAxis, setMirrorAxis] = useState<MirrorAxis>("x");
   const [mirrorBusy, setMirrorBusy] = useState(false);
+  const groupByMesh = useMemo(() => {
+    const map = new Map<Item["mesh"], { id: number; name: string }>();
+    for (const g of meshGroups) {
+      for (const m of g.members) {
+        map.set(m, { id: g.id, name: g.name });
+      }
+    }
+    return map;
+  }, [meshGroups]);
+  const volumes = useMemo(() => items.filter((i) => i.volumeId !== null), [items]);
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const input = useRef<HTMLInputElement>(null);
   const big = useMemo(bigFileParams, []);
@@ -228,12 +243,102 @@ export function MeshList(props: {
           Mirror
         </button>
       </div>
+      {meshGroups.length > 0 ? (
+        <div className="scene-tree-groups" data-scene-tree-groups role="region" aria-label="Scene group folders">
+          {meshGroups.map((g) => {
+            const collapsed = Boolean(collapsedGroups[g.id]);
+            return (
+              <button
+                key={g.id}
+                type="button"
+                className="tree-group-toggle"
+                data-tree-group={g.id}
+                aria-expanded={!collapsed}
+                onClick={() =>
+                  setCollapsedGroups((prev) => ({
+                    ...prev,
+                    [g.id]: !collapsed,
+                  }))
+                }
+              >
+                <span aria-hidden="true">{collapsed ? "▸" : "▾"}</span> {g.name} ({g.members.length})
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
       <ul className="meshes">
-        {items.map((item) => (
-          <MeshRow key={item.id} app={app} item={item} onFocus={onFocus} />
-        ))}
+        {items.map((item) => {
+          const group = groupByMesh.get(item.mesh) ?? null;
+          const collapsed = group !== null && Boolean(collapsedGroups[group.id]);
+          return (
+            <MeshRow
+              key={item.id}
+              app={app}
+              item={item}
+              groupName={group?.name ?? null}
+              collapsed={collapsed}
+              onFocus={onFocus}
+            />
+          );
+        })}
       </ul>
       {items.length === 0 && jobs.length === 0 ? <p className="muted">No meshes. Open or drop a file.</p> : null}
+      {volumes.length > 0 || ruler !== null || inspectSection !== null || clipBox !== null ? (
+        <div className="scene-tree-extras" data-scene-tree-extras aria-label="Volumes and annotations">
+          <p className="muted small">Volumes &amp; annotations</p>
+          <ul className="tree-extras-list">
+            {volumes.map((v) => (
+              <li key={`vol-${v.id}`} className="tree-extra-row" data-tree-volume={v.name}>
+                <span className="tree-node-tag">CT</span>
+                <span className="tree-extra-name">{v.name}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onFocus(v.mesh);
+                    app.setActiveTab("volume");
+                  }}
+                >
+                  Open CT
+                </button>
+              </li>
+            ))}
+            {inspectSection !== null ? (
+              <li className="tree-extra-row" data-tree-artifact="section">
+                <span className="tree-node-tag">Section</span>
+                <span className="tree-extra-name">
+                  Normal ({inspectSection.plane.normal.map((n) => n.toFixed(1)).join(", ")})
+                </span>
+                <button type="button" onClick={() => app.setActiveTab("inspect")}>
+                  Inspect
+                </button>
+              </li>
+            ) : null}
+            {ruler !== null ? (
+              <li className="tree-extra-row" data-tree-artifact="ruler">
+                <span className="tree-node-tag">Ruler</span>
+                <span className="tree-extra-name">
+                  {ruler.b !== null
+                    ? `${Math.hypot(ruler.b[0] - ruler.a[0], ruler.b[1] - ruler.a[1], ruler.b[2] - ruler.a[2]).toFixed(2)} mm`
+                    : "1 point placed"}
+                </span>
+                <button type="button" onClick={() => app.setRuler(null)}>
+                  Clear
+                </button>
+              </li>
+            ) : null}
+            {clipBox !== null ? (
+              <li className="tree-extra-row" data-tree-artifact="clipBox">
+                <span className="tree-node-tag">Clip Box</span>
+                <span className="tree-extra-name">Active bounds</span>
+                <button type="button" onClick={() => app.setClipBox(null)}>
+                  Clear
+                </button>
+              </li>
+            ) : null}
+          </ul>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -316,8 +421,14 @@ function ImportScaleControl(props: { app: AppState }) {
   );
 }
 
-function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"]) => void }) {
-  const { app, item, onFocus } = props;
+function MeshRow(props: {
+  app: AppState;
+  item: Item;
+  groupName: string | null;
+  collapsed: boolean;
+  onFocus: (mesh: Item["mesh"]) => void;
+}) {
+  const { app, item, groupName, collapsed, onFocus } = props;
   const store = useScene();
   const [selection, select] = useSelection();
   const [state, setDisplay] = useMeshDisplay(item.mesh);
@@ -329,9 +440,17 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
   const secondary = !selected && multi.includes(item.mesh);
   const swatch = `#${item.color.toString(16).padStart(6, "0")}`;
   const preview = useMeshPreview(store, item);
+  const rowClasses = [
+    "mesh",
+    selected ? "selected" : secondary ? "secondary" : "",
+    groupName !== null ? "tree-child" : "",
+    item.locked ? "locked" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <li className={selected ? "mesh selected" : secondary ? "mesh secondary" : "mesh"} data-mesh={item.name}>
+    <li className={rowClasses} data-mesh={item.name} hidden={collapsed} style={collapsed ? { display: "none" } : undefined}>
       <div className="mesh-head">
         <label className="check" title={`${item.name}: tick for grouping`}>
           <input
@@ -364,6 +483,16 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
         >
           {item.name}
         </button>
+        {groupName !== null ? (
+          <span className="tree-group-badge" title={`Member of ${groupName}`}>
+            {groupName}
+          </span>
+        ) : null}
+        {item.volumeId !== null ? (
+          <span className="tree-vol-badge" title="CT / DICOM volume">
+            CT
+          </span>
+        ) : null}
         {item.importScale.factor === 1 ? null : (
           <span
             className="count"
@@ -399,6 +528,35 @@ function MeshRow(props: { app: AppState; item: Item; onFocus: (mesh: Item["mesh"
         <button type="button" onClick={() => onFocus(item.mesh)} title="Point the camera at this mesh">
           Focus
         </button>
+        <button
+          type="button"
+          className="tree-lock-btn"
+          data-lock={item.name}
+          aria-pressed={item.locked}
+          title={item.locked ? "Unlock mesh (allow moving & sculpting)" : "Lock mesh (block moving & sculpting)"}
+          onClick={() => app.setMeshLocked(item.mesh, !item.locked)}
+        >
+          {item.locked ? "Locked" : "Lock"}
+        </button>
+        <select
+          className="tree-shading-pill"
+          data-mesh-shading={item.name}
+          aria-label={`${item.name} shading override`}
+          title="Per-object viewport shading override"
+          value={item.shadingOverride ?? ""}
+          onChange={(e) => {
+            const v = e.currentTarget.value;
+            app.setMeshShadingOverride(item.mesh, v === "" ? null : (v as DiagnosticShadingMode));
+          }}
+        >
+          <option value="">Shading: Auto</option>
+          <option value="smooth">Smooth</option>
+          <option value="flat">Flat</option>
+          <option value="autoCrease">Auto-Crease</option>
+          <option value="wireframeShaded">Wire + Shaded</option>
+          <option value="matcap">MatCap</option>
+          <option value="backfaceWarning">Backface Warn</option>
+        </select>
         <button type="button" className="danger" onClick={() => app.removeMesh(store, item)} title="Remove the mesh">
           Remove
         </button>

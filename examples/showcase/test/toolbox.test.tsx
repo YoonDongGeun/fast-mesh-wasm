@@ -6,7 +6,17 @@ import { describe, expect, it } from "vitest";
 import { describeReport } from "../src/panels/repair-summary";
 import { AppState } from "../src/scene/app-state";
 import { selectMesh } from "../src/scene/selection";
-import { SculptToolbox } from "../src/viewport/Toolbox";
+import {
+  applyAltPinClick,
+  scaleBrushRadiusForTarget,
+  shouldAllowStrokeHit,
+} from "../src/viewport/Viewport";
+import {
+  SculptToolbox,
+  canArmSculpt,
+  eligibleSculptItems,
+  resolveSculptTargetItem,
+} from "../src/viewport/Toolbox";
 import { sculptBrush, type SculptTool } from "../src/viewport/sculpt";
 
 function makeSelectedApp() {
@@ -128,6 +138,156 @@ describe("SculptToolbox UI controls (#177, #192)", () => {
       </SceneProvider>,
     );
     expect(angleHtml).toContain(`data-action="sculpt-filter-angle"`);
+
+    store.dispose();
+  });
+});
+
+describe("Hover-to-sculpt & stroke-start lock (#229)", () => {
+  const TET_POS = new Float64Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  const TET_IDX = new Uint32Array([0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2]);
+
+  function makeTwoMeshApp() {
+    const scene = new Scene();
+    const store = new SceneStore(scene);
+    const app = new AppState();
+    const a = app.addMesh(store, {
+      name: "alpha",
+      positions: TET_POS,
+      indices: TET_IDX,
+      center: [0, 0, 0],
+      radius: 1,
+      volumeId: null,
+      preset: null,
+    });
+    const b = app.addMesh(store, {
+      name: "beta",
+      positions: TET_POS,
+      indices: TET_IDX,
+      center: [3, 0, 0],
+      radius: 3,
+      volumeId: null,
+      preset: null,
+    });
+    return { scene, store, app, a, b };
+  }
+
+  it("renders_sculpt_and_mask_controls_enabled_when_selection_is_null", () => {
+    const { store, app } = makeTwoMeshApp();
+    expect(canArmSculpt(app.getSnapshot().items, store.getSnapshot(), null, false)).toBe(true);
+    const html = renderToStaticMarkup(
+      <SceneProvider store={store}>
+        <SculptToolbox app={app} selection={null} />
+      </SceneProvider>,
+    );
+    expect(html).toContain(`data-action="sculpt-tool-inflate"`);
+    expect(html).not.toMatch(/data-action="sculpt-tool-inflate"[^>]*disabled/);
+    expect(html).toContain(`data-action="sculpt-mask-paint"`);
+    expect(html).not.toMatch(/data-action="sculpt-mask-paint"[^>]*disabled/);
+    expect(html).toContain(`data-action="sculpt-pin-mesh"`);
+    expect(store.getSnapshot().selection).toBeNull();
+    store.dispose();
+  });
+
+  it("excludes_hidden_and_locked_meshes_and_honors_stroke_lock_without_mutating_selection", () => {
+    const { store, app, a, b } = makeTwoMeshApp();
+    expect(eligibleSculptItems(app.getSnapshot().items, store.getSnapshot()).map((i) => i.mesh)).toEqual([
+      a.mesh,
+      b.mesh,
+    ]);
+
+    // Lock beta: excluded from eligible list & stroke hits while visible alpha stays eligible.
+    app.setMeshLocked(b.mesh, true);
+    expect(eligibleSculptItems(app.getSnapshot().items, store.getSnapshot()).map((i) => i.mesh)).toEqual([a.mesh]);
+    expect(
+      shouldAllowStrokeHit({
+        hitMesh: b.mesh,
+        strokeTargetMesh: null,
+        pinToActive: false,
+        selection: null,
+        fallbackMesh: a.mesh,
+        items: app.getSnapshot().items,
+        storeSnapshot: store.getSnapshot(),
+      }),
+    ).toBe(false);
+
+    // Unlock beta, hide alpha via display visibility: beta becomes fallback target.
+    app.setMeshLocked(b.mesh, false);
+    store.setDisplay(a.mesh, { visible: false });
+    expect(resolveSculptTargetItem(app.getSnapshot().items, store.getSnapshot(), null, a.mesh, false)?.mesh).toBe(
+      b.mesh,
+    );
+
+    // Restore both visible: unpinned hover allows hitting beta even when selection is alpha (or null).
+    store.setDisplay(a.mesh, { visible: true });
+    expect(
+      shouldAllowStrokeHit({
+        hitMesh: b.mesh,
+        strokeTargetMesh: null,
+        pinToActive: false,
+        selection: a.mesh,
+        fallbackMesh: a.mesh,
+        items: app.getSnapshot().items,
+        storeSnapshot: store.getSnapshot(),
+      }),
+    ).toBe(true);
+
+    // Stroke-start lock onto alpha rejects beta mid-stroke when dragging off silhouette.
+    expect(
+      shouldAllowStrokeHit({
+        hitMesh: b.mesh,
+        strokeTargetMesh: a.mesh,
+        pinToActive: false,
+        selection: null,
+        fallbackMesh: a.mesh,
+        items: app.getSnapshot().items,
+        storeSnapshot: store.getSnapshot(),
+      }),
+    ).toBe(false);
+
+    // Pin to active mesh restricts hover hits to selection only.
+    expect(
+      shouldAllowStrokeHit({
+        hitMesh: b.mesh,
+        strokeTargetMesh: null,
+        pinToActive: true,
+        selection: a.mesh,
+        fallbackMesh: a.mesh,
+        items: app.getSnapshot().items,
+        storeSnapshot: store.getSnapshot(),
+      }),
+    ).toBe(false);
+
+    // Brush cursor radius scales proportionally across differently-sized meshes.
+    expect(scaleBrushRadiusForTarget(0.25, a, b)).toBeCloseTo(0.75, 6);
+
+    // Alt+Click pins hit mesh as active selection and toggles off cleanly on repeat Alt+Click.
+    let sel: typeof a.mesh | null = null;
+    const pinned = applyAltPinClick({
+      app,
+      select: (m) => {
+        sel = m;
+        store.select(m);
+      },
+      selection: sel,
+      hitMesh: b.mesh,
+      pinToActive: false,
+    });
+    expect(pinned).toBe(true);
+    expect(sel).toBe(b.mesh);
+    expect(app.getSnapshot().sculptPinToActive).toBe(true);
+    const unpinned = applyAltPinClick({
+      app,
+      select: (m) => {
+        sel = m;
+        store.select(m);
+      },
+      selection: b.mesh,
+      hitMesh: b.mesh,
+      pinToActive: true,
+    });
+    expect(unpinned).toBe(false);
+    expect(app.getSnapshot().sculptPinToActive).toBe(false);
 
     store.dispose();
   });
