@@ -8,6 +8,21 @@
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
 import { checkRegisterOptions } from "../register.js";
+import {
+  checkSurfacePathOptions,
+  normalizeBooleanArgs,
+  normalizeCsgBatchArgs,
+  normalizeDeviationOptions,
+  normalizeGeodesicOptions,
+  normalizeLandmarkPairs,
+  normalizeOverhangOptions,
+  normalizeQualityArgs,
+  normalizeRegistrationOptions,
+  normalizeSourceVertices,
+  normalizeSurfacePathTarget,
+  normalizeTrimCurveArgs,
+  normalizeVec3,
+} from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
@@ -36,21 +51,37 @@ import type {
   AddMeshOptions,
   Analysis,
   AnalyzeOptions,
+  BooleanOp,
+  BooleanOptions,
   ClosestHit,
   ClosestPointOptions,
   ColorRule,
   Contact,
+  CsgNode,
+  CutOptions,
+  CutReport,
+  DeviationOptions,
+  DeviationStats,
   DistanceFieldDesc,
   DragSession,
   EditOp,
   EditResult,
   FieldStatus,
   FindContactsOptions,
+  GeodesicOptions,
   JoinOptions,
   JoinReport,
+  LandmarkAlignment,
+  LandmarkPair,
   MeasureResult,
+  OverhangOptions,
+  OverhangReport,
+  QualityMetric,
+  QualityReport,
   RegisterOptions,
   RegisterResult,
+  RegistrationOptions,
+  RegistrationReport,
   MeshChange,
   MeshDistance,
   RaycastOptions,
@@ -67,6 +98,12 @@ import type {
   SectionGap,
   SectionPlane,
   SectionResult,
+  SurfacePathOptions,
+  SurfacePathPoint,
+  SymmetryPlaneReport,
+  TriangleQualityOptions,
+  TrimCurveOptions,
+  TrimReport,
 } from "../scene.js";
 import { checkInteractionPoints, copyRule } from "../rule.js";
 import type { SceneLike } from "../scene-like.js";
@@ -554,7 +591,9 @@ interface Ready {
 interface DragState {
   mesh: MeshState;
   active: boolean;
+  stepDepth: number;
   end(): void;
+  abandon(rev: number, restore?: boolean): void;
 }
 
 /** Set by `WorkerScene`'s static block: the test-only {@link debugDump}. */
@@ -665,6 +704,7 @@ export class WorkerScene implements SceneLike {
   /** The values mirror is on (a `values()` read asked for it). */
   #values = false;
   #drag: DragState | undefined;
+  #stepDepth = 0;
   #poison: FastMeshError | undefined;
   #terminated = false;
   /** The current Worker's start. */
@@ -710,6 +750,9 @@ export class WorkerScene implements SceneLike {
     sculpt: ((mesh: MeshHandle, op: SculptOp | readonly SculptOp[]) =>
       this.#runRepair(mesh, op as RepairOp)) as SculptBackend<true>["sculpt"],
     verticesInSphere: (mesh, center, radius) => this.verticesInSphere(mesh, center, radius),
+    beginStep: () => this.beginStep(),
+    endStep: () => this.endStep(),
+    cancelStep: () => this.cancelStep(),
   });
 
   /** Async remesh, simplification, subdivision, and volumetric reconstruction domain. */
@@ -717,10 +760,20 @@ export class WorkerScene implements SceneLike {
     repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<true>["repair"],
   });
 
-  /** Callable async boolean, offsetting, and shell domain (`offset` and `shell` execute in worker). */
+  /** Callable async boolean, CSG batch, cut, curve-trim, offset, and shell domain. */
   readonly boolean: WorkerBooleanDomain = createBooleanDomain({
     isAsync: true,
     repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<true>["repair"],
+    boolean: (target, source, op, options) => this.#runBoolean(target, source, op, options),
+    booleanBatch: (meshesOrTree, treeOrOptions, maybeOptions) =>
+      Array.isArray(meshesOrTree)
+        ? this.booleanBatch(meshesOrTree, treeOrOptions as CsgNode, maybeOptions)
+        : this.booleanBatch(meshesOrTree as CsgNode, treeOrOptions as BooleanOptions | undefined),
+    cutByPlane: (mesh, plane, options) => this.cutByPlane(mesh, plane, options),
+    trimByCurve: (mesh, optionsOrCurve, maybeOptions) =>
+      Array.isArray(optionsOrCurve)
+        ? this.trimByCurve(mesh, optionsOrCurve, maybeOptions)
+        : this.trimByCurve(mesh, optionsOrCurve as TrimCurveOptions),
   });
 
   /** Async surface deformation and vertex-protection domain. */
@@ -729,7 +782,7 @@ export class WorkerScene implements SceneLike {
       this.#runRepair(mesh, op as RepairOp)) as DeformBackend<true>["sculpt"],
   });
 
-  /** Async defect analysis, metrology, queries, fields, and section inspection domain. */
+  /** Async defect analysis, printability/quality inspection, metrology, geodesics, queries, fields, and section domain. */
   readonly inspect: WorkerInspectDomain = createInspectDomain({
     analyze: (mesh, options) => this.analyze(mesh, options),
     measure: (mesh) => this.measure(mesh),
@@ -739,6 +792,13 @@ export class WorkerScene implements SceneLike {
     meshDistance: (a, b, options) => this.meshDistance(a, b, options),
     intersects: (a, b) => this.intersects(a, b),
     findContacts: (options) => this.findContacts(options),
+    overhangs: (mesh, options) => this.overhangs(mesh, options),
+    triangleQuality: (mesh, metricOrOptions, sliverThreshold) =>
+      this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
+    meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
+    geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    shortestSurfacePath: (mesh, sources, targetVertex, options) =>
+      this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
     removeField: (field) => this.removeField(field),
     fieldValues: (field) => this.fetchFieldValues(field),
@@ -757,9 +817,13 @@ export class WorkerScene implements SceneLike {
     sectionGap: (section, a, b) => this.sectionGap(section, a, b),
   });
 
-  /** Async rigid registration and alignment domain. */
+  /** Async rigid registration, multi-stage alignment, landmark SVD, and symmetry domain. */
   readonly align: WorkerAlignDomain = createAlignDomain({
     register: (moving, fixed, options) => this.register(moving, fixed, options),
+    alignByLandmarks: (moving, fixed, pairs, allowScaling) =>
+      this.alignByLandmarks(moving, fixed, pairs, allowScaling),
+    registerMultistage: (moving, fixed, options) => this.registerMultistage(moving, fixed, options),
+    detectSymmetryPlane: (mesh) => this.detectSymmetryPlane(mesh),
   });
 
   /** Use {@link createWorkerScene}. */
@@ -1116,6 +1180,7 @@ export class WorkerScene implements SceneLike {
       this.#drag.active = false;
       this.#drag = undefined;
     }
+    this.#stepDepth = 0;
     for (const st of this.#meshes.values()) {
       if (st.local !== undefined && !samePose(st.local, st.pose)) {
         this.#optimistic.add(st);
@@ -1322,6 +1387,10 @@ export class WorkerScene implements SceneLike {
       if (c.added) {
         st.live = true;
         st.add = undefined;
+        if (c.origin !== undefined) {
+          st.origin = [...c.origin] as Vec3;
+          st.pose = poseOf(st.pose.rotation, st.pose.translation, st.origin, st.pose.scale);
+        }
       }
       for (const name of BUFFERS) {
         this.#applyBuffer(st, name, c);
@@ -1550,13 +1619,28 @@ export class WorkerScene implements SceneLike {
         : copyArray(options.uvs, "uvs", (x) => Float32Array.from(x as ArrayLike<number>));
     const origin: Vec3 | undefined =
       options.origin === undefined ? boxCentre(p) : [options.origin[0], options.origin[1], options.origin[2]];
+    const st = this.#allocMeshState(origin ?? [0, 0, 0], options.normals ?? true);
+    st.add = {
+      kind: "addMesh",
+      rev: ++this.#rev,
+      id: st.id,
+      positions: p.buffer as ArrayBuffer,
+      f64: !(p instanceof Float32Array),
+      indices: i.buffer as ArrayBuffer,
+      ...(uvs === undefined ? {} : { uvs: uvs.buffer as ArrayBuffer }),
+      options: { origin, normals: st.normalsOn },
+    };
+    this.#push(st.add);
+    return st.handle;
+  }
+
+  #allocMeshState(knownOrigin: Vec3, normalsOn: boolean): MeshState {
     const id = ++this.#nextMesh;
     const handle = new MeshHandle();
-    const known = origin ?? [0, 0, 0];
     const st: MeshState = {
       id,
       handle,
-      origin: known,
+      origin: knownOrigin,
       positions: new Float32Array(0),
       normals: null,
       colors: null,
@@ -1566,7 +1650,7 @@ export class WorkerScene implements SceneLike {
       pendingRules: new Map(),
       indices: new Uint32Array(0),
       bounds: undefined,
-      pose: poseOf(IDENTITY, [0, 0, 0], known, [1, 1, 1]),
+      pose: poseOf(IDENTITY, [0, 0, 0], knownOrigin, [1, 1, 1]),
       local: undefined,
       localUntil: 0,
       requested: undefined,
@@ -1575,24 +1659,28 @@ export class WorkerScene implements SceneLike {
       gone: false,
       coloring: null,
       live: false,
-      normalsOn: options.normals ?? true,
+      normalsOn,
       add: undefined,
       sent: false,
     };
     this.#meshes.set(id, st);
     this.#byMesh.set(handle, st);
-    st.add = {
-      kind: "addMesh",
-      rev: ++this.#rev,
-      id,
-      positions: p.buffer as ArrayBuffer,
-      f64: !(p instanceof Float32Array),
-      indices: i.buffer as ArrayBuffer,
-      ...(uvs === undefined ? {} : { uvs: uvs.buffer as ArrayBuffer }),
-      options: { origin, normals: st.normalsOn },
-    };
-    this.#push(st.add);
-    return handle;
+    return st;
+  }
+
+  #discardPlaceholder(st: MeshState | undefined): void {
+    if (st !== undefined && !st.live) {
+      st.removed = true;
+      st.gone = true;
+      this.#meshes.delete(st.id);
+      this.#byMesh.delete(st.handle);
+    }
+  }
+
+  #endDragOn(...meshes: MeshState[]): void {
+    if (this.#drag !== undefined && meshes.includes(this.#drag.mesh)) {
+      this.#drag.end();
+    }
   }
 
   /**
@@ -1690,6 +1778,176 @@ export class WorkerScene implements SceneLike {
     return this.#ask(
       (rev, qid) => ({ kind: "register", rev, moving: m.id, fixed: f.id, payload, qid }),
       (v) => v as RegisterResult,
+    );
+  }
+
+  /**
+   * Aligns `moving` to `fixed` using corresponding world-space landmark pairs
+   * via Umeyama N-point SVD (see `Scene.alignByLandmarks`).
+   */
+  alignByLandmarks(
+    moving: MeshHandle,
+    fixed: MeshHandle,
+    pairs: readonly LandmarkPair[],
+    allowScaling = false,
+  ): Promise<LandmarkAlignment> {
+    return this.#ask(
+      (rev, qid) => {
+        const m = this.#live(moving);
+        const f = this.#live(fixed);
+        normalizeLandmarkPairs(m === f, pairs, allowScaling);
+        this.#endDragOn(m, f);
+        return {
+          kind: "alignByLandmarks",
+          rev,
+          moving: m.id,
+          fixed: f.id,
+          pairs: pairs.map((p) => ({
+            source: normalizeVec3(p.source, "pair.source"),
+            target: normalizeVec3(p.target, "pair.target"),
+          })),
+          allowScaling,
+          qid,
+        };
+      },
+      (v) => v as LandmarkAlignment,
+    );
+  }
+
+  /**
+   * Runs multi-stage coarse + fine ICP registration from `moving` to `fixed`
+   * (see `Scene.registerMultistage`).
+   */
+  registerMultistage(
+    moving: MeshHandle,
+    fixed: MeshHandle,
+    options: RegistrationOptions = {},
+  ): Promise<RegistrationReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const m = this.#live(moving);
+        const f = this.#live(fixed);
+        const payload = normalizeRegistrationOptions(m === f, options);
+        this.#endDragOn(m, f);
+        return { kind: "registerMultistage", rev, moving: m.id, fixed: f.id, payload, qid };
+      },
+      (v) => v as RegistrationReport,
+    );
+  }
+
+  /** Detects the dominant world-space reflection symmetry plane of `mesh`. */
+  detectSymmetryPlane(mesh: MeshHandle): Promise<SymmetryPlaneReport> {
+    return this.#query("detectSymmetryPlane", () => ({ mesh: this.#live(mesh).id }), (v) => v);
+  }
+
+  /** Async boolean CSG operation backing {@link WorkerScene.boolean}. */
+  #runBoolean(
+    target: MeshHandle,
+    source: MeshHandle,
+    op: BooleanOp,
+    options?: Omit<BooleanOptions, "op">,
+  ): Promise<MeshHandle> {
+    return this.#ask(
+      (rev, qid) => {
+        const ta = this.#live(target);
+        const sb = this.#live(source);
+        const payload = normalizeBooleanArgs(op, options);
+        this.#endDragOn(ta, sb);
+        return { kind: "boolean", rev, target: ta.id, source: sb.id, payload, qid };
+      },
+      () => target,
+    );
+  }
+
+  /** Evaluates an N-ary CSG boolean tree in the Worker and returns the new mesh handle. */
+  booleanBatch(meshes: readonly MeshHandle[], tree: CsgNode, options?: BooleanOptions): Promise<MeshHandle>;
+  booleanBatch(tree: CsgNode, options?: BooleanOptions): Promise<MeshHandle>;
+  booleanBatch(
+    meshesOrTree: readonly MeshHandle[] | CsgNode,
+    treeOrOptions?: CsgNode | BooleanOptions,
+    maybeOptions?: BooleanOptions,
+  ): Promise<MeshHandle> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const { meshes, tree, options } = normalizeCsgBatchArgs(meshesOrTree, treeOrOptions, maybeOptions);
+        const states = meshes.map((m) => this.#live(m));
+        added = this.#allocMeshState([0, 0, 0], states[0]?.normalsOn ?? true);
+        return {
+          kind: "booleanBatch",
+          rev,
+          meshes: states.map((s) => s.id),
+          tree,
+          options,
+          addedId: added.id,
+          qid,
+        };
+      },
+      () => (added as MeshState).handle,
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  /** Cuts `mesh` by `plane` in the Worker (see `Scene.cutByPlane`). */
+  cutByPlane(mesh: MeshHandle, plane: SectionPlane, options?: CutOptions): Promise<CutReport> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        if (plane == null || typeof plane !== "object") {
+          throw invalid("plane must be an object");
+        }
+        const origin = normalizeVec3(plane.origin, "plane.origin");
+        const normal = normalizeVec3(plane.normal, "plane.normal");
+        const cap = options?.cap ?? true;
+        if (typeof cap !== "boolean") {
+          throw invalid("cap must be a boolean");
+        }
+        this.#endDragOn(st);
+        added = this.#allocMeshState(st.origin, st.normalsOn);
+        return { kind: "cutByPlane", rev, id: st.id, addedId: added.id, plane: { origin, normal }, cap, qid };
+      },
+      (v) => {
+        const r = v as { keptTriangles: number; removedTriangles: number; capTriangles: number };
+        return {
+          kept: mesh,
+          removed: (added as MeshState).handle,
+          keptTriangles: r.keptTriangles,
+          removedTriangles: r.removedTriangles,
+          capTriangles: r.capTriangles,
+        };
+      },
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  /** Conformatively imprints a world-space polyline onto `mesh` and optionally trims inside/outside. */
+  trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): Promise<TrimReport>;
+  trimByCurve(
+    mesh: MeshHandle,
+    curve: readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    options?: Omit<TrimCurveOptions, "points">,
+  ): Promise<TrimReport>;
+  trimByCurve(
+    mesh: MeshHandle,
+    optionsOrCurve: TrimCurveOptions | readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    maybeOptions?: Omit<TrimCurveOptions, "points">,
+  ): Promise<TrimReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const payload = normalizeTrimCurveArgs(optionsOrCurve, maybeOptions);
+        this.#endDragOn(st);
+        return { kind: "trimByCurve", rev, id: st.id, payload, qid };
+      },
+      (v) => {
+        const r = v as Omit<TrimReport, "kept">;
+        return { kept: mesh, ...r };
+      },
     );
   }
 
@@ -1804,6 +2062,8 @@ export class WorkerScene implements SceneLike {
     if (this.#drag?.active) {
       throw invalid("a drag is already active; end or cancel it first");
     }
+    this.#stepDepth++;
+    const dragDepth = this.#stepDepth;
     // From where the mesh will be: the newest of a held drag pose and a
     // queued or in-flight setPlacement, by revision; else the engine's pose.
     const start =
@@ -1821,6 +2081,7 @@ export class WorkerScene implements SceneLike {
       }
       d.active = false;
       this.#drag = undefined;
+      this.#stepDepth = Math.min(this.#stepDepth, dragDepth - 1);
       if (this.#terminated) {
         return true;
       }
@@ -1830,8 +2091,21 @@ export class WorkerScene implements SceneLike {
     const d: DragState = {
       mesh: st,
       active: true,
+      stepDepth: dragDepth,
       end: () => {
         finish("end");
+      },
+      abandon: (rev, restore = false) => {
+        if (!d.active) {
+          return;
+        }
+        d.active = false;
+        this.#drag = undefined;
+        st.localUntil = rev;
+        if (restore) {
+          st.local = start;
+          this.#optimistic.add(st);
+        }
       },
     };
     this.#drag = d;
@@ -1936,22 +2210,160 @@ export class WorkerScene implements SceneLike {
     );
   }
 
+  /** Evaluates world-space printability overhangs against `buildDirection` (see `Scene.overhangs`). */
+  overhangs(mesh: MeshHandle, options: OverhangOptions = {}): Promise<OverhangReport> {
+    return this.#query(
+      "overhangs",
+      () => ({ mesh: this.#live(mesh).id, options: normalizeOverhangOptions(options) }),
+      (v) => v,
+    );
+  }
+
+  /** Computes per-triangle geometric quality and worst-incident vertex quality (see `Scene.triangleQuality`). */
+  triangleQuality(
+    mesh: MeshHandle,
+    metricOrOptions: QualityMetric | TriangleQualityOptions = "radiusRatio",
+    sliverThreshold?: number,
+  ): Promise<QualityReport> {
+    return this.#query(
+      "triangleQuality",
+      () => {
+        const id = this.#live(mesh).id;
+        const norm = normalizeQualityArgs(metricOrOptions, sliverThreshold);
+        return { mesh: id, metric: norm.metric, sliverThreshold: norm.sliverThreshold };
+      },
+      (v) => v,
+    );
+  }
+
+  /** Computes vertex-wise Hausdorff or signed distance deviation from `source` to `target`. */
+  meshDeviation(source: MeshHandle, target: MeshHandle, options: DeviationOptions = {}): Promise<DeviationStats> {
+    return this.#query(
+      "meshDeviation",
+      () => ({
+        source: this.#live(source).id,
+        target: this.#live(target).id,
+        options: normalizeDeviationOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /** Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"` or `"heatMethod"`). */
+  geodesicDistances(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    options: GeodesicOptions = {},
+  ): Promise<Float32Array> {
+    return this.#query(
+      "geodesicDistances",
+      () => ({
+        mesh: this.#live(mesh).id,
+        sources: Array.from(normalizeSourceVertices(sources)),
+        options: normalizeGeodesicOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /** Traces an intrinsic shortest path along the surface of `mesh` to `targetVertex`. */
+  shortestSurfacePath(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options: SurfacePathOptions = {},
+  ): Promise<SurfacePathPoint[]> {
+    return this.#query(
+      "shortestSurfacePath",
+      () => {
+        const id = this.#live(mesh).id;
+        const src = Array.from(normalizeSourceVertices(sources));
+        const target = normalizeSurfacePathTarget(targetVertex);
+        const checked = checkSurfacePathOptions(options);
+        return {
+          mesh: id,
+          sources: src,
+          targetVertex: target,
+          options: {
+            ...checked.geodesic,
+            ...(checked.distances === undefined ? {} : { distances: checked.distances.slice() }),
+          },
+        };
+      },
+      (v) => v,
+    );
+  }
+
   // ---- History ----
 
   /** Undoes the latest step; an active drag is ended first. */
   undo(): void {
     this.#alive();
     this.#drag?.end();
+    this.#stepDepth = 0;
     this.#forgetRequested();
     this.#push({ kind: "undo", rev: ++this.#rev });
+    this.#scheduleFlush();
   }
 
   /** Redoes the latest undone step; an active drag is ended first. */
   redo(): void {
     this.#alive();
     this.#drag?.end();
+    this.#stepDepth = 0;
     this.#forgetRequested();
     this.#push({ kind: "redo", rev: ++this.#rev });
+    this.#scheduleFlush();
+  }
+
+  /** Closes an open step and drops every undo and redo step. */
+  clearHistory(): void {
+    this.#alive();
+    this.#drag?.end();
+    this.#stepDepth = 0;
+    this.#forgetRequested();
+    this.#push({ kind: "clearHistory", rev: ++this.#rev });
+    this.#scheduleFlush();
+  }
+
+  /**
+   * Opens a history step, or one more nesting level of the open one. Edits,
+   * repairs, and placement changes until the matching {@link WorkerScene.endStep}
+   * are coalesced into a single undo entry.
+   */
+  beginStep(): void {
+    this.#alive();
+    this.#stepDepth++;
+    this.#push({ kind: "step", rev: ++this.#rev, phase: "begin" });
+    this.#scheduleFlush();
+  }
+
+  /** Ends one nesting level of the open step. Throws `STEP_NOT_OPEN` when none is open. */
+  endStep(): void {
+    this.#alive();
+    if (this.#stepDepth === 0) {
+      throw new FastMeshError("STEP_NOT_OPEN", "no history step is open");
+    }
+    const closingDrag = this.#drag !== undefined && this.#stepDepth <= this.#drag.stepDepth;
+    const rev = this.#push({ kind: "step", rev: ++this.#rev, phase: "end" });
+    this.#stepDepth--;
+    if (closingDrag && this.#drag !== undefined) {
+      this.#drag.abandon(rev, false);
+    }
+    this.#scheduleFlush();
+  }
+
+  /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
+  cancelStep(): void {
+    this.#alive();
+    if (this.#stepDepth === 0) {
+      throw new FastMeshError("STEP_NOT_OPEN", "no history step is open");
+    }
+    const rev = this.#push({ kind: "step", rev: ++this.#rev, phase: "cancel" });
+    this.#stepDepth = 0;
+    this.#drag?.abandon(rev, true);
+    this.#forgetRequested();
+    this.#scheduleFlush();
   }
 
   /**
@@ -2636,6 +3048,7 @@ export class WorkerScene implements SceneLike {
       this.#drag.active = false;
       this.#drag = undefined;
     }
+    this.#stepDepth = 0;
     for (const st of this.#meshes.values()) {
       if (!samePose(this.#shown(st), poses.get(st) as Pose)) {
         this.#optimistic.add(st);
@@ -2866,6 +3279,7 @@ export class WorkerScene implements SceneLike {
       this.#drag.active = false;
       this.#drag = undefined;
     }
+    this.#stepDepth = 0;
     this.#worker.terminate();
     this.#unwatch();
     this.#dropHandoff();

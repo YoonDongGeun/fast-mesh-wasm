@@ -21,11 +21,13 @@ use std::collections::BTreeMap;
 use fast_mesh_ops::{AnalyzeOptions, IcpOptions, IcpStatus, VolumeReason, analyze, measure_placed};
 use fast_mesh_query::Cull;
 use fast_mesh_scene::{
-    BooleanOp, ColorRule, Coloring, Colormap, ContactFilter, CurvatureField, CutOptions, Dab,
-    DistanceField, FieldBudget, FieldId, JoinOptions, MeshBuild, MeshId, MeshOptions, NotApplied,
-    OutOfRange, Placement, Plane, RegisterOptions, Scene, SceneClosestOptions, SceneError,
+    BooleanMethod, BooleanOp, BooleanOptions, CoarseAlignMethod, ColorRule, Coloring, Colormap,
+    ContactFilter, CsgNode, CurvatureField, CutOptions, Dab, DeviationOptions, DistanceField,
+    FieldBudget, FieldId, GeodesicMethod, GeodesicOptions, IcpObjective, JoinOptions, LandmarkPair,
+    MeshBuild, MeshId, MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane,
+    QualityMetric, RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError,
     SceneOptions, SceneRayOptions, SectionDesc, SectionId, SectionStatus, SignMode, StepState,
-    ThicknessField, UpdateMode,
+    ThicknessField, TrimCurveOptions, UpdateMode, ops::BooleanOp as OpsBooleanOp,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -1180,13 +1182,7 @@ impl WasmScene {
             max_rmse: (!max_rmse.is_nan()).then_some(max_rmse),
         };
         let r = self.scene.register(moving, fixed, &options)?;
-        let status = match r.status {
-            IcpStatus::Converged => 0.0,
-            IcpStatus::MaxIterations => 1.0,
-            IcpStatus::Underconstrained => 2.0,
-            IcpStatus::TooFewCorrespondences => 3.0,
-            IcpStatus::Diverged => 4.0,
-        };
+        let status = icp_status_code(r.status);
         let not_applied = match r.not_applied {
             None => 0.0,
             Some(NotApplied::NotRequested) => 1.0,
@@ -1286,6 +1282,439 @@ impl WasmScene {
             len(r.kept_triangles),
             len(r.triangles_added),
         ])
+    }
+
+    /// Combines mesh B into mesh A in the world using full boolean options:
+    /// `op` (0 union, 1 subtract, 2 intersect), `method` (0 manifold,
+    /// 1 bvhSdf, 2 fhEdt), `coplanarTolerance` (`NaN` -> 1e-5), `snapSlivers`,
+    /// `voxelPitch` (`NaN` -> auto), `maxTriangles` (`NaN` -> unbounded).
+    /// Returns `[a_index, a_generation, kept_triangles, triangles_added]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn boolean_with_options(
+        &mut self,
+        a_index: u32,
+        a_generation: u32,
+        b_index: u32,
+        b_generation: u32,
+        op: u8,
+        method: u8,
+        coplanar_tolerance: f64,
+        snap_slivers: bool,
+        voxel_pitch: f64,
+        max_triangles: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let a = self.id(a_index, a_generation)?;
+        let b = self.id(b_index, b_generation)?;
+        let options = parse_boolean_options(
+            op,
+            method,
+            coplanar_tolerance,
+            snap_slivers,
+            voxel_pitch,
+            max_triangles,
+        )?;
+        let r = self.scene.boolean_with_options(a, b, &options)?;
+        Ok(vec![
+            a_index,
+            a_generation,
+            len(r.kept_triangles),
+            len(r.triangles_added),
+        ])
+    }
+
+    /// Evaluates an N-ary CSG boolean tree over `meshes` (`[idx0, gen0, ...]`)
+    /// using prefix-encoded `tree` (`[0, leafIdx]` for Leaf, `[1, op, ...left, ...right]`
+    /// for Op) and inserts the resulting mesh at identity placement.
+    /// Returns `[added_index, added_generation]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn boolean_batch(
+        &mut self,
+        meshes: &[u32],
+        tree: &[f64],
+        op: u8,
+        method: u8,
+        coplanar_tolerance: f64,
+        snap_slivers: bool,
+        voxel_pitch: f64,
+        max_triangles: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let ids = self.ids(meshes)?;
+        let options = parse_boolean_options(
+            op,
+            method,
+            coplanar_tolerance,
+            snap_slivers,
+            voxel_pitch,
+            max_triangles,
+        )?;
+        let mut cursor = 0usize;
+        let node = decode_csg_node(tree, &mut cursor, 0)?;
+        if cursor != tree.len() {
+            return Err(Error::invalid("csg tree contains trailing data"));
+        }
+        let added = self.scene.boolean_batch(&ids, &node, &options)?;
+        self.added(added, false)
+    }
+
+    /// Conformatively imprints a world-space polyline (`points`: flat `[x, y, z, ...]`)
+    /// onto mesh `(index, generation)` and optionally trims the enclosed interior
+    /// (`closed && delete_inside`) or exterior side.
+    /// Returns `[index, generation, triangles_added, triangles_removed, vertices_added, seam_edges]`.
+    pub fn trim_by_curve(
+        &mut self,
+        index: u32,
+        generation: u32,
+        points: &[f64],
+        closed: bool,
+        delete_inside: bool,
+        snap_tolerance: f64,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        if !points.len().is_multiple_of(3) {
+            return Err(Error::invalid("points length must be a multiple of 3"));
+        }
+        let parsed_points: Vec<[f64; 3]> = points.as_chunks::<3>().0.to_vec();
+        let snap = if snap_tolerance.is_nan() {
+            0.0
+        } else {
+            snap_tolerance
+        };
+        let r = self.scene.trim_by_curve(
+            id,
+            &TrimCurveOptions {
+                points: parsed_points,
+                closed,
+                delete_inside,
+                snap_tolerance: snap,
+            },
+        )?;
+        Ok(vec![
+            index,
+            generation,
+            len(r.triangles_added),
+            len(r.triangles_removed),
+            len(r.vertices_added),
+            len(r.seam_edges),
+        ])
+    }
+
+    /// Aligns `moving` onto `fixed` from 3D landmark pairs (`source_points`,
+    /// `target_points`, each flat `[x, y, z, ...]`). Updates `moving`'s placement
+    /// and returns `[rotation(9), translation(3), scale(3), alignment_scale, rmse]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn align_by_landmarks(
+        &mut self,
+        moving_index: u32,
+        moving_generation: u32,
+        fixed_index: u32,
+        fixed_generation: u32,
+        source_points: &[f64],
+        target_points: &[f64],
+        allow_scaling: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let moving = self.id(moving_index, moving_generation)?;
+        let fixed = self.id(fixed_index, fixed_generation)?;
+        if !source_points.len().is_multiple_of(3) || !target_points.len().is_multiple_of(3) {
+            return Err(Error::invalid(
+                "landmark coordinate arrays must be multiples of 3",
+            ));
+        }
+        if source_points.len() != target_points.len() {
+            return Err(Error::invalid(
+                "source and target landmark counts must match",
+            ));
+        }
+        let pairs: Vec<LandmarkPair> = source_points
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(target_points.as_chunks::<3>().0.iter())
+            .map(|(&source, &target)| LandmarkPair { source, target })
+            .collect();
+        let alignment = self
+            .scene
+            .align_by_landmarks(moving, fixed, &pairs, allow_scaling)?;
+        let placement = self.scene.placement(moving)?;
+        let mut out = Vec::with_capacity(17);
+        out.extend(placement.rotation.iter().flatten());
+        out.extend(placement.translation);
+        out.extend(placement.scale);
+        out.push(alignment.scale);
+        out.push(alignment.rmse);
+        Ok(out)
+    }
+
+    /// Multi-stage coarse + fine registration of `moving` onto `fixed`.
+    /// `coarse_method`: 0 none, 1 pcaCentroid, 2 orientedBoundingBox.
+    /// `objective`: 0 pointToPoint, 1 pointToPlane, 2 symmetricNormal.
+    /// Returns `[rotation(9), translation(3), scale(3), transform_col_major(16),
+    /// final_rmse, iterations, status, converged]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_multistage(
+        &mut self,
+        moving_index: u32,
+        moving_generation: u32,
+        fixed_index: u32,
+        fixed_generation: u32,
+        coarse_method: u8,
+        objective: u8,
+        max_iterations: f64,
+        tolerance: f64,
+        overlap: f64,
+        max_distance: f64,
+        target_rmse: f64,
+        sample_count: f64,
+        anderson_window: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let moving = self.id(moving_index, moving_generation)?;
+        let fixed = self.id(fixed_index, fixed_generation)?;
+        let coarse_method = match coarse_method {
+            0 => CoarseAlignMethod::None,
+            1 => CoarseAlignMethod::PcaCentroid,
+            2 => CoarseAlignMethod::OrientedBoundingBox,
+            _ => {
+                return Err(Error::invalid(
+                    "coarseMethod must be 0 (none), 1 (pcaCentroid) or 2 (orientedBoundingBox)",
+                ));
+            }
+        };
+        let objective = match objective {
+            0 => IcpObjective::PointToPoint,
+            1 => IcpObjective::PointToPlane,
+            2 => IcpObjective::SymmetricNormal,
+            _ => {
+                return Err(Error::invalid(
+                    "objective must be 0 (pointToPoint), 1 (pointToPlane) or 2 (symmetricNormal)",
+                ));
+            }
+        };
+        let defaults = RegistrationOptions::default();
+        let or = |v: f64, default: f64| if v.is_nan() { default } else { v };
+        let options = RegistrationOptions {
+            coarse_method,
+            objective,
+            max_iterations: crate::edit::count_opt(max_iterations, "maxIterations")?
+                .unwrap_or(defaults.max_iterations),
+            tolerance: or(tolerance, defaults.tolerance),
+            overlap: or(overlap, defaults.overlap),
+            max_distance: if max_distance.is_nan() {
+                None
+            } else {
+                Some(max_distance)
+            },
+            target_rmse: or(target_rmse, defaults.target_rmse),
+            sample_count: crate::edit::count_opt(sample_count, "sampleCount")?
+                .unwrap_or(defaults.sample_count),
+            anderson_window: crate::edit::count_opt(anderson_window, "andersonWindow")?
+                .unwrap_or(defaults.anderson_window),
+        };
+        let r = self.scene.register_multistage(moving, fixed, &options)?;
+        let placement = self.scene.placement(moving)?;
+        let mut out = Vec::with_capacity(35);
+        out.extend(placement.rotation.iter().flatten());
+        out.extend(placement.translation);
+        out.extend(placement.scale);
+        out.extend(r.transform);
+        out.push(r.final_rmse);
+        out.push(count(r.iterations));
+        out.push(icp_status_code(r.status));
+        out.push(f64::from(u8::from(r.converged)));
+        Ok(out)
+    }
+
+    /// Detects the dominant reflection symmetry plane of `(index, generation)`
+    /// in world coordinates.
+    /// Returns `[normal_xyz(3), point_xyz(3), symmetry_error_rms, symmetry_score]`.
+    pub fn detect_symmetry_plane(
+        &mut self,
+        index: u32,
+        generation: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let r = self.scene.detect_symmetry_plane(id)?;
+        Ok(vec![
+            r.plane_normal[0],
+            r.plane_normal[1],
+            r.plane_normal[2],
+            r.plane_point[0],
+            r.plane_point[1],
+            r.plane_point[2],
+            r.symmetry_error_rms,
+            r.symmetry_score,
+        ])
+    }
+
+    /// Printability overhang inspection in world coordinates.
+    /// Returns `[total_support_area, overhang_face_count, max_overhang_angle_deg, ...vertex_angles_deg]`.
+    pub fn overhangs(
+        &self,
+        index: u32,
+        generation: u32,
+        build_direction: &[f64],
+        critical_angle_deg: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let dir = vec3(build_direction, "buildDirection must have 3 values")?;
+        let defaults = OverhangOptions::default();
+        let angle = if critical_angle_deg.is_nan() {
+            defaults.critical_angle_deg
+        } else {
+            critical_angle_deg as f32
+        };
+        let opts = OverhangOptions {
+            build_direction: [dir[0] as f32, dir[1] as f32, dir[2] as f32],
+            critical_angle_deg: angle,
+        };
+        let mut angles = Vec::new();
+        let report = self.scene.overhangs(id, &opts, &mut angles)?;
+        let mut out = Vec::with_capacity(3 + angles.len());
+        out.push(report.total_support_area);
+        out.push(count(report.overhang_face_count));
+        out.push(f64::from(report.max_overhang_angle_deg));
+        out.extend(angles.into_iter().map(f64::from));
+        Ok(out)
+    }
+
+    /// Triangle quality evaluation in world coordinates.
+    /// `metric`: 0 radiusRatio, 1 minAngleDeg, 2 aspectRatio.
+    /// Returns `[min, max, mean, sliver_triangle_count, live_triangle_count, ...vertex_quality]`.
+    pub fn triangle_quality(
+        &self,
+        index: u32,
+        generation: u32,
+        metric: u8,
+        sliver_threshold: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let metric = match metric {
+            0 => QualityMetric::RadiusRatio,
+            1 => QualityMetric::MinAngleDeg,
+            2 => QualityMetric::AspectRatio,
+            _ => {
+                return Err(Error::invalid(
+                    "metric must be 0 (radiusRatio), 1 (minAngleDeg) or 2 (aspectRatio)",
+                ));
+            }
+        };
+        let mut vertex_q = Vec::new();
+        let report =
+            self.scene
+                .triangle_quality(id, metric, sliver_threshold as f32, &mut vertex_q)?;
+        let mut out = Vec::with_capacity(5 + vertex_q.len());
+        out.push(f64::from(report.min));
+        out.push(f64::from(report.max));
+        out.push(f64::from(report.mean));
+        out.push(count(report.sliver_triangle_count));
+        out.push(count(report.live_triangle_count));
+        out.extend(vertex_q.into_iter().map(f64::from));
+        Ok(out)
+    }
+
+    /// Vertex-to-surface Hausdorff/signed deviation from `source` to `target` in world units.
+    /// Returns `[min, max, mean, rms, p95, sample_count, ...vertex_deviations]`.
+    pub fn mesh_deviation(
+        &mut self,
+        source_index: u32,
+        source_generation: u32,
+        target_index: u32,
+        target_generation: u32,
+        signed: bool,
+        max_distance: f64,
+    ) -> Result<Vec<f64>, Error> {
+        let source = self.id(source_index, source_generation)?;
+        let target = self.id(target_index, target_generation)?;
+        let opts = DeviationOptions {
+            signed,
+            max_distance: if max_distance.is_nan() {
+                f32::INFINITY
+            } else {
+                max_distance as f32
+            },
+        };
+        let mut values = Vec::new();
+        let stats = self
+            .scene
+            .mesh_deviation(source, target, &opts, &mut values)?;
+        let mut out = Vec::with_capacity(6 + values.len());
+        out.push(f64::from(stats.min));
+        out.push(f64::from(stats.max));
+        out.push(f64::from(stats.mean));
+        out.push(f64::from(stats.rms));
+        out.push(f64::from(stats.p95));
+        out.push(count(stats.sample_count));
+        out.extend(values.into_iter().map(f64::from));
+        Ok(out)
+    }
+
+    /// Geodesic distances from `sources` (vertex slot indices) in world units.
+    /// `method`: 0 dijkstra, 1 heatMethod. `max_distance`: `NaN` or `Infinity` -> unbounded.
+    pub fn geodesic_distances(
+        &self,
+        index: u32,
+        generation: u32,
+        sources: &[u32],
+        method: u8,
+        max_distance: f64,
+        time_step_scale: f64,
+    ) -> Result<Vec<f32>, Error> {
+        let id = self.id(index, generation)?;
+        let method = match method {
+            0 => GeodesicMethod::Dijkstra,
+            1 => GeodesicMethod::HeatMethod,
+            _ => {
+                return Err(Error::invalid(
+                    "method must be 0 (dijkstra) or 1 (heatMethod)",
+                ));
+            }
+        };
+        let max_distance = if max_distance.is_nan() || max_distance == f64::INFINITY {
+            None
+        } else {
+            Some(max_distance as f32)
+        };
+        let defaults = GeodesicOptions::default();
+        let time_step_scale = if time_step_scale.is_nan() {
+            defaults.time_step_scale
+        } else {
+            time_step_scale
+        };
+        let opts = GeodesicOptions {
+            method,
+            max_distance,
+            time_step_scale,
+        };
+        let mut out = Vec::new();
+        self.scene
+            .geodesic_distances(id, sources, &opts, &mut out)?;
+        Ok(out)
+    }
+
+    /// Traces the intrinsic shortest surface path from `sources` to `target_vertex`
+    /// using vertex `distances` (aligned with `mesh.vertex_slots()`).
+    /// Returns `[px, py, pz, triangle, u, v, w, ...]` (7 f64 values per point).
+    pub fn shortest_surface_path(
+        &self,
+        index: u32,
+        generation: u32,
+        distances: &[f32],
+        sources: &[u32],
+        target_vertex: u32,
+    ) -> Result<Vec<f64>, Error> {
+        let id = self.id(index, generation)?;
+        let mut path = Vec::new();
+        self.scene
+            .shortest_surface_path(id, distances, sources, target_vertex, &mut path)?;
+        let mut out = Vec::with_capacity(path.len() * 7);
+        for pt in path {
+            out.push(f64::from(pt.position[0]));
+            out.push(f64::from(pt.position[1]));
+            out.push(f64::from(pt.position[2]));
+            out.push(f64::from(pt.triangle));
+            out.push(f64::from(pt.barycentric[0]));
+            out.push(f64::from(pt.barycentric[1]));
+            out.push(f64::from(pt.barycentric[2]));
+        }
+        Ok(out)
     }
 
     // ---- Queries (world space) ----
@@ -1857,6 +2286,110 @@ fn closest_record(h: fast_mesh_scene::SceneClosestHit) -> Vec<f64> {
     out.extend_from_slice(&h.point);
     out.push(h.distance);
     out
+}
+
+fn icp_status_code(status: IcpStatus) -> f64 {
+    match status {
+        IcpStatus::Converged => 0.0,
+        IcpStatus::MaxIterations => 1.0,
+        IcpStatus::Underconstrained => 2.0,
+        IcpStatus::TooFewCorrespondences => 3.0,
+        IcpStatus::Diverged => 4.0,
+    }
+}
+
+fn parse_ops_boolean_op(op: u8) -> Result<OpsBooleanOp, Error> {
+    match op {
+        0 => Ok(OpsBooleanOp::Union),
+        1 => Ok(OpsBooleanOp::Subtract),
+        2 => Ok(OpsBooleanOp::Intersect),
+        _ => Err(Error::invalid(
+            "op must be 0 (union), 1 (subtract) or 2 (intersect)",
+        )),
+    }
+}
+
+fn parse_boolean_options(
+    op: u8,
+    method: u8,
+    coplanar_tolerance: f64,
+    snap_slivers: bool,
+    voxel_pitch: f64,
+    max_triangles: f64,
+) -> Result<BooleanOptions, Error> {
+    let op = parse_ops_boolean_op(op)?;
+    let method = match method {
+        0 => BooleanMethod::Manifold,
+        1 => BooleanMethod::BvhSdf,
+        2 => BooleanMethod::FhEdt,
+        _ => {
+            return Err(Error::invalid(
+                "method must be 0 (manifold), 1 (bvhSdf) or 2 (fhEdt)",
+            ));
+        }
+    };
+    let defaults = BooleanOptions::default();
+    let coplanar_tolerance = if coplanar_tolerance.is_nan() {
+        defaults.coplanar_tolerance
+    } else {
+        coplanar_tolerance
+    };
+    let voxel_pitch = if voxel_pitch.is_nan() {
+        None
+    } else if !voxel_pitch.is_finite() || voxel_pitch <= 0.0 {
+        return Err(Error::invalid("voxelPitch must be finite and positive"));
+    } else {
+        Some(voxel_pitch as f32)
+    };
+    let max_triangles = match crate::edit::count_opt(max_triangles, "maxTriangles")? {
+        Some(n) => {
+            Some(u32::try_from(n).map_err(|_| Error::invalid("maxTriangles exceeds u32 range"))?)
+        }
+        None => None,
+    };
+    Ok(BooleanOptions {
+        op,
+        method,
+        coplanar_tolerance,
+        snap_slivers,
+        voxel_pitch,
+        max_triangles,
+    })
+}
+
+fn decode_csg_node(words: &[f64], cursor: &mut usize, depth: usize) -> Result<CsgNode, Error> {
+    if depth > 256 {
+        return Err(Error::invalid("csg tree nesting depth exceeds limit"));
+    }
+    let tag = *words
+        .get(*cursor)
+        .ok_or_else(|| Error::invalid("truncated csg tree"))?;
+    *cursor += 1;
+    if tag == 0.0 {
+        let leaf_idx = *words
+            .get(*cursor)
+            .ok_or_else(|| Error::invalid("truncated csg leaf index"))?;
+        *cursor += 1;
+        let idx = crate::edit::count_opt(leaf_idx, "leafIndex")?
+            .ok_or_else(|| Error::invalid("csg leaf index must not be NaN"))?;
+        Ok(CsgNode::Leaf(idx))
+    } else if tag == 1.0 {
+        let op_word = *words
+            .get(*cursor)
+            .ok_or_else(|| Error::invalid("truncated csg op code"))?;
+        *cursor += 1;
+        if !op_word.is_finite() || op_word.fract() != 0.0 || !(0.0..=2.0).contains(&op_word) {
+            return Err(Error::invalid(
+                "csg op must be 0 (union), 1 (subtract) or 2 (intersect)",
+            ));
+        }
+        let op = parse_ops_boolean_op(op_word as u8)?;
+        let left = Box::new(decode_csg_node(words, cursor, depth + 1)?);
+        let right = Box::new(decode_csg_node(words, cursor, depth + 1)?);
+        Ok(CsgNode::Op { op, left, right })
+    } else {
+        Err(Error::invalid("csg node tag must be 0 (leaf) or 1 (op)"))
+    }
 }
 
 #[cfg(test)]
@@ -3190,5 +3723,146 @@ mod tests {
         assert!(r2[0] > 0.0);
         let mesh = s.scene.mesh(s.id(i, g).unwrap()).unwrap();
         assert!((mesh.positions()[12][2] - 2.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn wave4_boolean_inspect_curve_and_align_bindings_roundtrip() {
+        let mut s = WasmScene::new();
+        // Unit cube centered at origin (-1..1).
+        let cube_pos = [
+            -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0,
+            1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
+        ];
+        let cube_idx = [
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6,
+            5, 3, 0, 4, 3, 4, 7,
+        ];
+        let a = s.add_mesh(&cube_pos, &cube_idx, None, 0, false).unwrap();
+        let b = s.add_mesh(&cube_pos, &cube_idx, None, 0, false).unwrap();
+        s.set_placement(
+            b[0],
+            b[1],
+            &[1., 0., 0., 0., 1., 0., 0., 0., 1.],
+            &[0.5, 0., 0.],
+            None,
+        )
+        .unwrap();
+
+        // Symmetry & overhangs & quality & geodesic & path & deviation.
+        let sym = s.detect_symmetry_plane(a[0], a[1]).unwrap();
+        assert_eq!(sym.len(), 8);
+        assert!(sym[7] > 0.99);
+
+        let ov = s.overhangs(a[0], a[1], &[0., 0., 1.], 45.0).unwrap();
+        assert_eq!(ov[1], 2.0);
+        assert_eq!(ov.len(), 3 + 8);
+
+        let qual = s.triangle_quality(a[0], a[1], 1, 15.0).unwrap();
+        assert_eq!(qual[4], 12.0);
+        assert_eq!(qual.len(), 5 + 8);
+
+        let geo = s
+            .geodesic_distances(a[0], a[1], &[0], 0, f64::NAN, f64::NAN)
+            .unwrap();
+        assert_eq!(geo[0], 0.0);
+        let path = s.shortest_surface_path(a[0], a[1], &geo, &[0], 6).unwrap();
+        assert!(path.len().is_multiple_of(7));
+        assert!(path.len() >= 14);
+
+        let dev = s
+            .mesh_deviation(a[0], a[1], b[0], b[1], true, f64::NAN)
+            .unwrap();
+        assert_eq!(dev[5], 8.0);
+        assert_eq!(dev.len(), 6 + 8);
+
+        // Landmarks + multistage registration.
+        let lm = s
+            .align_by_landmarks(
+                a[0],
+                a[1],
+                b[0],
+                b[1],
+                &[0., 0., 0., 1., 0., 0., 0., 1., 0.],
+                &[0.5, 0., 0., 1.5, 0., 0., 0.5, 1., 0.],
+                false,
+            )
+            .unwrap();
+        assert_eq!(lm.len(), 17);
+        assert!(lm[16] < 1e-6);
+
+        let ms = s
+            .register_multistage(
+                a[0],
+                a[1],
+                b[0],
+                b[1],
+                1,
+                2,
+                30.,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                200.,
+                f64::NAN,
+            )
+            .unwrap();
+        assert_eq!(ms.len(), 35);
+        assert!(ms[31] < 0.05);
+
+        // Boolean with options + booleanBatch.
+        let batch = s
+            .boolean_batch(
+                &[a[0], a[1], b[0], b[1]],
+                &[1., 0., 0., 0., 0., 1.],
+                0,
+                1,
+                f64::NAN,
+                true,
+                0.25,
+                f64::NAN,
+            )
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+
+        let bw = s
+            .boolean_with_options(
+                a[0],
+                a[1],
+                b[0],
+                b[1],
+                0,
+                0,
+                f64::NAN,
+                true,
+                f64::NAN,
+                f64::NAN,
+            )
+            .unwrap();
+        assert_eq!(bw.len(), 4);
+        assert!(bw[2] > 0);
+
+        // Curve trim on a 2x2 planar quad mesh.
+        let sheet = s
+            .add_mesh(
+                &[0., 0., 0., 2., 0., 0., 2., 2., 0., 0., 2., 0.],
+                &[0, 1, 2, 0, 2, 3],
+                None,
+                0,
+                false,
+            )
+            .unwrap();
+        let tr = s
+            .trim_by_curve(
+                sheet[0],
+                sheet[1],
+                &[0.5, 0.5, 0., 1.5, 0.5, 0., 1.0, 1.5, 0.],
+                true,
+                true,
+                0.,
+            )
+            .unwrap();
+        assert_eq!(tr.len(), 6);
+        assert!(tr[3] > 0);
     }
 }

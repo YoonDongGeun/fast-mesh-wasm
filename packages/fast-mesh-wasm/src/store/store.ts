@@ -643,6 +643,27 @@ export class SceneStore {
     this.#update();
   }
 
+  /** Opens a nested transaction step; edits/repairs/placements coalesce until {@link endStep}. */
+  beginStep(): void {
+    this.#alive();
+    this.#host.beginStep();
+    this.#update();
+  }
+
+  /** Commits one level of the open step transaction. Throws `STEP_NOT_OPEN` when none is open. */
+  endStep(): void {
+    this.#alive();
+    this.#host.endStep();
+    this.#update();
+  }
+
+  /** Reverts and discards the active step transaction, however deeply nested. */
+  cancelStep(): void {
+    this.#alive();
+    this.#host.cancelStep();
+    this.#update();
+  }
+
   // ---- Display ----
 
   /**

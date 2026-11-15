@@ -110,9 +110,9 @@ mod sections;
 #[cfg(test)]
 mod uv_tests;
 
-pub use boolean::{BooleanOp, BooleanReport};
+pub use boolean::{BooleanMethod, BooleanOp, BooleanOptions, BooleanReport, CsgNode};
 pub use contacts::{Contact, ContactFilter};
-pub use cut::{CutOptions, CutReport};
+pub use cut::{CutOptions, CutReport, TrimCurveOptions, TrimReport};
 pub use domains::{
     SceneAlignOps, SceneBooleanOps, SceneDeformOps, SceneInspectOps, SceneRemeshOps,
     SceneRepairOps, SceneSculptOps,
@@ -124,15 +124,22 @@ pub use fast_mesh_fields::{
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
 pub use fields::{
-    Coloring, CurvatureField, DistanceField, FieldBudget, FieldStatus, StepState, ThicknessField,
+    Coloring, CurvatureField, DeviationOptions, DeviationStats, DistanceField, FieldBudget,
+    FieldStatus, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, OverhangOptions,
+    OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
 pub use placement::Placement;
 pub use query::{
     SceneClosestHit, SceneClosestOptions, SceneMeshDistance, SceneRayHit, SceneRayOptions,
+    SurfacePathPoint,
 };
-pub use register::{DEFAULT_MAX_RMSE_FRACTION, NotApplied, RegisterOptions, RegisterReport};
+pub use register::{
+    CoarseAlignMethod, DEFAULT_MAX_RMSE_FRACTION, IcpObjective, LandmarkAlignment, LandmarkPair,
+    NotApplied, RegisterOptions, RegisterReport, RegistrationOptions, RegistrationReport,
+    SymmetryPlaneReport,
+};
 pub use report::SectionId;
 pub use report::{FieldId, MeshChanges, SubscriberId};
 pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};

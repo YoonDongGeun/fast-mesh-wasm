@@ -3,6 +3,27 @@
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
 import { checkRegisterOptions } from "./register.js";
+import {
+  BOOLEAN_METHOD_CODES,
+  BOOLEAN_OP_CODES,
+  checkSurfacePathOptions,
+  COARSE_ALIGN_CODES,
+  encodeCsgTree,
+  GEODESIC_METHOD_CODES,
+  ICP_OBJECTIVE_CODES,
+  normalizeBooleanArgs,
+  normalizeCsgBatchArgs,
+  normalizeDeviationOptions,
+  normalizeGeodesicOptions,
+  normalizeLandmarkPairs,
+  normalizeOverhangOptions,
+  normalizeQualityArgs,
+  QUALITY_METRIC_CODES,
+  normalizeRegistrationOptions,
+  normalizeSourceVertices,
+  normalizeSurfacePathTarget,
+  normalizeTrimCurveArgs,
+} from "./options.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
 import { call, ensureInitialized, FastMeshError, finalizer, release, wasmMemory } from "./core.js";
@@ -1508,6 +1529,191 @@ export interface CutReport {
 /** Which boolean for {@link Scene.boolean} to compute. */
 export type BooleanOp = "union" | "subtract" | "intersect";
 
+/** Execution backend for boolean CSG operations. */
+export type BooleanMethod = "manifold" | "bvhSdf" | "fhEdt";
+
+/** Options for {@link Scene.boolean}, {@link Scene.booleanBatch}, and {@link BooleanDomain} operations. */
+export interface BooleanOptions {
+  /** Boolean operation when invoking a generic boolean call. */
+  op?: BooleanOp;
+  /** Exact topological arrangement (`"manifold"`, default) or volumetric Marching Cubes fallback (`"bvhSdf"`, `"fhEdt"`). */
+  method?: BooleanMethod;
+  /** Coplanar facet snap/classification tolerance in mesh units. */
+  coplanarTolerance?: number;
+  /** Collapse needle/sliver triangles created along cut seams (default `true`). */
+  snapSlivers?: boolean;
+  /** Voxel pitch for `"bvhSdf"` / `"fhEdt"` volumetric fallback (defaults to automatic pitch). */
+  voxelPitch?: number;
+  /** Optional target triangle budget for post-boolean simplification. */
+  maxTriangles?: number;
+}
+
+/** A node of an N-ary CSG boolean tree over meshes or mesh indices. */
+export type CsgNode =
+  | { kind: "leaf"; meshIndex: number }
+  | { kind: "leaf"; mesh: MeshHandle }
+  | { kind: "op"; op: BooleanOp; left: CsgNode; right: CsgNode };
+
+/** Options for conforming polyline imprinting and closed-curve trimming via {@link Scene.trimByCurve}. */
+export interface TrimCurveOptions {
+  /** World-space polyline vertices to imprint onto the mesh surface. */
+  points: readonly Readonly<Vec3>[];
+  /** Treat the curve as a closed loop and split interior/exterior components (default `false`). */
+  closed?: boolean;
+  /** When `closed` is `true`, delete the enclosed interior (`true`, default) or exterior (`false`). */
+  deleteInside?: boolean;
+  /** Snap tolerance in world units (`0` / omitted chooses automatically). */
+  snapTolerance?: number;
+}
+
+/** Statistics returned by {@link Scene.trimByCurve}. */
+export interface TrimReport {
+  /** Handle of the trimmed mesh (`kept`). */
+  kept: MeshHandle;
+  trianglesAdded: number;
+  trianglesRemoved: number;
+  verticesAdded: number;
+  seamEdges: number;
+}
+
+/** Options for printability overhang inspection via {@link Scene.overhangs}. */
+export interface OverhangOptions {
+  /** Build direction vector in world coordinates (defaults to `[0, 0, 1]`). */
+  buildDirection?: Readonly<Vec3>;
+  /** Critical overhang angle from horizontal in degrees (defaults to `45`). */
+  criticalAngleDeg?: number;
+}
+
+/** Overhang report and per-vertex overhang angles returned by {@link Scene.overhangs}. */
+export interface OverhangReport {
+  totalSupportArea: number;
+  overhangFaceCount: number;
+  maxOverhangAngleDeg: number;
+  /** Per-vertex overhang angles in degrees, aligned with `views(mesh).positions()` slots. */
+  vertexAnglesDeg: Float32Array;
+}
+
+/** Element quality metric evaluated by {@link Scene.triangleQuality}. */
+export type QualityMetric = "radiusRatio" | "minAngleDeg" | "aspectRatio";
+
+/** Options for {@link Scene.triangleQuality}. */
+export interface TriangleQualityOptions {
+  metric?: QualityMetric;
+  /** Threshold below (or above for `"aspectRatio"`) which a live triangle counts as a sliver. */
+  sliverThreshold?: number;
+}
+
+/** Triangle quality report and per-vertex worst-incident quality returned by {@link Scene.triangleQuality}. */
+export interface QualityReport {
+  min: number;
+  max: number;
+  mean: number;
+  sliverTriangleCount: number;
+  liveTriangleCount: number;
+  /** Worst incident triangle quality per vertex slot, aligned with `views(mesh).positions()`. */
+  vertexQuality: Float32Array;
+}
+
+/** Options for Hausdorff / signed mesh deviation inspection via {@link Scene.meshDeviation}. */
+export interface DeviationOptions {
+  /** Return signed deviations using target normals (`false` = unsigned Euclidean distance, default). */
+  signed?: boolean;
+  /** Optional maximum search distance cutoff in world units. */
+  maxDistance?: number;
+}
+
+/** Mesh-to-mesh deviation statistics and per-vertex deviations returned by {@link Scene.meshDeviation}. */
+export interface DeviationStats {
+  min: number;
+  max: number;
+  mean: number;
+  rms: number;
+  p95: number;
+  sampleCount: number;
+  /** Per-vertex deviations in world units, aligned with `views(source).positions()` slots. */
+  vertexDeviations: Float32Array;
+}
+
+/** Algorithm used by {@link Scene.geodesicDistances}. */
+export type GeodesicMethod = "dijkstra" | "heatMethod";
+
+/** Options for surface geodesic distance evaluation via {@link Scene.geodesicDistances}. */
+export interface GeodesicOptions {
+  /** `"dijkstra"` (fast graph distance, default) or `"heatMethod"` (Crane PDE diffusion). */
+  method?: GeodesicMethod;
+  /** Optional maximum distance cutoff in world units. */
+  maxDistance?: number;
+  /** Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`. */
+  timeStepScale?: number;
+}
+
+/** Sample point along an intrinsic surface shortest path. */
+export interface SurfacePathPoint {
+  /** World-space position on the surface. */
+  position: Vec3;
+  /** Triangle slot index containing this point. */
+  triangle: number;
+  /** Barycentric coordinates `[u, v, w]` inside `triangle`. */
+  barycentric: Vec3;
+}
+
+/** Options for {@link Scene.shortestSurfacePath}. */
+export interface SurfacePathOptions extends GeodesicOptions {
+  /** Precomputed geodesic distances from {@link Scene.geodesicDistances}. */
+  distances?: Float32Array;
+}
+
+/** Corresponding world-space landmark pair `(source, target)` for {@link Scene.alignByLandmarks}. */
+export interface LandmarkPair {
+  source: Readonly<Vec3>;
+  target: Readonly<Vec3>;
+}
+
+/** Result of N-point Umeyama landmark SVD alignment via {@link Scene.alignByLandmarks}. */
+export interface LandmarkAlignment {
+  placement: Placement;
+  scale: number;
+  rmse: number;
+}
+
+/** Coarse pre-alignment strategy for {@link Scene.registerMultistage}. */
+export type CoarseAlignMethod = "none" | "pcaCentroid" | "orientedBoundingBox";
+
+/** Fine ICP error metric for {@link Scene.registerMultistage}. */
+export type IcpObjective = "pointToPoint" | "pointToPlane" | "symmetricNormal";
+
+/** Options for multi-stage coarse + ICP registration via {@link Scene.registerMultistage}. */
+export interface RegistrationOptions {
+  coarseMethod?: CoarseAlignMethod;
+  objective?: IcpObjective;
+  maxIterations?: number;
+  tolerance?: number;
+  overlap?: number;
+  maxDistance?: number;
+  targetRmse?: number;
+  sampleCount?: number;
+  andersonWindow?: number;
+}
+
+/** Result of {@link Scene.registerMultistage}. */
+export interface RegistrationReport {
+  placement: Placement;
+  /** Column-major 4x4 transform matrix applied to `moving`. */
+  transform: number[];
+  finalRmse: number;
+  iterations: number;
+  status: RegisterStatus;
+  converged: boolean;
+}
+
+/** Result of {@link Scene.detectSymmetryPlane}. */
+export interface SymmetryPlaneReport {
+  planeNormal: Vec3;
+  planePoint: Vec3;
+  symmetryErrorRms: number;
+  symmetryScore: number;
+}
+
 /**
  * The standard cleanup pipeline for {@link Scene.repair}: weld, remove
  * degenerate, orient, remove small components, fill holes, as one transaction.
@@ -2755,12 +2961,20 @@ export class Scene implements SceneLike {
     repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<false>["repair"],
   });
 
-  /** Callable boolean, cutting, offsetting, and shell domain. */
+  /** Callable boolean, cutting, trimming, offsetting, and shell domain. */
   readonly boolean: SyncBooleanDomain = createBooleanDomain({
     isAsync: false,
     repair: ((mesh: MeshHandle, op: RepairOp) => this.#runRepair(mesh, op)) as RemeshBackend<false>["repair"],
-    boolean: (target, source, op) => this.#runBoolean(target, source, op),
+    boolean: (target, source, op, options) => this.#runBoolean(target, source, op, options),
+    booleanBatch: (meshesOrTree, treeOrOptions, maybeOptions) =>
+      Array.isArray(meshesOrTree)
+        ? this.booleanBatch(meshesOrTree, treeOrOptions as CsgNode, maybeOptions)
+        : this.booleanBatch(meshesOrTree as CsgNode, treeOrOptions as BooleanOptions | undefined),
     cutByPlane: (mesh, plane, options) => this.cutByPlane(mesh, plane, options),
+    trimByCurve: (mesh, optionsOrCurve, maybeOptions) =>
+      Array.isArray(optionsOrCurve)
+        ? this.trimByCurve(mesh, optionsOrCurve, maybeOptions)
+        : this.trimByCurve(mesh, optionsOrCurve as TrimCurveOptions),
   });
 
   /** Surface deformation and vertex-protection domain. */
@@ -2769,7 +2983,7 @@ export class Scene implements SceneLike {
       this.#runRepair(mesh, op as RepairOp)) as DeformBackend<false>["sculpt"],
   });
 
-  /** Defect analysis, metrology, queries, fields, and section inspection domain. */
+  /** Defect analysis, metrology, queries, printability/quality/geodesic fields, paths, and section inspection domain. */
   readonly inspect: SyncInspectDomain = createInspectDomain({
     analyze: (mesh, options) => this.analyze(mesh, options),
     measure: (mesh) => this.measure(mesh),
@@ -2779,6 +2993,13 @@ export class Scene implements SceneLike {
     meshDistance: (a, b, options) => this.meshDistance(a, b, options),
     intersects: (a, b) => this.intersects(a, b),
     findContacts: (options) => this.findContacts(options),
+    overhangs: (mesh, options) => this.overhangs(mesh, options),
+    triangleQuality: (mesh, metricOrOptions, sliverThreshold) =>
+      this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
+    meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
+    geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    shortestSurfacePath: (mesh, sources, targetVertex, options) =>
+      this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
     addThicknessField: (desc) => this.addThicknessField(desc),
     addCurvatureField: (desc) => this.addCurvatureField(desc),
@@ -2800,9 +3021,13 @@ export class Scene implements SceneLike {
     updateSections: () => this.updateSections(),
   });
 
-  /** Rigid registration and alignment domain. */
+  /** Rigid registration, landmark SVD, multi-stage alignment, and symmetry detection domain. */
   readonly align: SyncAlignDomain = createAlignDomain({
     register: (moving, fixed, options) => this.register(moving, fixed, options),
+    alignByLandmarks: (moving, fixed, pairs, allowScaling) =>
+      this.alignByLandmarks(moving, fixed, pairs, allowScaling),
+    registerMultistage: (moving, fixed, options) => this.registerMultistage(moving, fixed, options),
+    detectSymmetryPlane: (mesh) => this.detectSymmetryPlane(mesh),
   });
 
   constructor(options: SceneOptions = {}) {
@@ -3049,14 +3274,99 @@ export class Scene implements SceneLike {
    * input that is not closed, manifold and consistently wound. A failed
    * boolean changes nothing.
    */
-  #runBoolean(target: MeshHandle, source: MeshHandle, op: BooleanOp): MeshHandle {
+  #runBoolean(
+    target: MeshHandle,
+    source: MeshHandle,
+    op: BooleanOp,
+    options?: Omit<BooleanOptions, "op">,
+  ): MeshHandle {
     const ta = this.#id(target);
     const sb = this.#id(source);
-    const code = codeIn({ union: 0, subtract: 1, intersect: 2 }, op, "op");
+    const norm = normalizeBooleanArgs(op, options);
+    const r =
+      options === undefined
+        ? call(() => this.#scene().boolean(ta.index, ta.generation, sb.index, sb.generation, BOOLEAN_OP_CODES[norm.op]))
+        : call(() =>
+            this.#scene().boolean_with_options(
+              ta.index,
+              ta.generation,
+              sb.index,
+              sb.generation,
+              BOOLEAN_OP_CODES[norm.op],
+              BOOLEAN_METHOD_CODES[norm.method],
+              optional(norm.coplanarTolerance, "coplanarTolerance"),
+              norm.snapSlivers,
+              optional(norm.voxelPitch, "voxelPitch"),
+              optional(norm.maxTriangles, "maxTriangles"),
+            ),
+          );
+    return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Evaluates an N-ary CSG tree over `meshes` (or handle-leaf nodes) and inserts
+   * the resulting mesh into the scene at identity placement (one undo step).
+   */
+  booleanBatch(meshes: readonly MeshHandle[], tree: CsgNode, options?: BooleanOptions): MeshHandle;
+  booleanBatch(tree: CsgNode, options?: BooleanOptions): MeshHandle;
+  booleanBatch(
+    meshesOrTree: readonly MeshHandle[] | CsgNode,
+    treeOrOptions?: CsgNode | BooleanOptions,
+    maybeOptions?: BooleanOptions,
+  ): MeshHandle {
+    const { meshes, tree, options } = normalizeCsgBatchArgs(meshesOrTree, treeOrOptions, maybeOptions);
+    const ids = this.#flatIds(meshes);
+    const encodedTree = Float64Array.from(encodeCsgTree(tree));
     const r = call(() =>
-      this.#scene().boolean(ta.index, ta.generation, sb.index, sb.generation, code),
+      this.#scene().boolean_batch(
+        ids,
+        encodedTree,
+        BOOLEAN_OP_CODES[options.op],
+        BOOLEAN_METHOD_CODES[options.method],
+        optional(options.coplanarTolerance, "coplanarTolerance"),
+        options.snapSlivers,
+        optional(options.voxelPitch, "voxelPitch"),
+        optional(options.maxTriangles, "maxTriangles"),
+      ),
     );
     return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Conformatively imprints a world-space polyline onto `mesh` and optionally
+   * deletes the enclosed interior (or exterior) when `closed: true` (one undo step).
+   */
+  trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): TrimReport;
+  trimByCurve(
+    mesh: MeshHandle,
+    curve: readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    options?: Omit<TrimCurveOptions, "points">,
+  ): TrimReport;
+  trimByCurve(
+    mesh: MeshHandle,
+    optionsOrCurve: TrimCurveOptions | readonly (Readonly<Vec3> | SurfacePathPoint)[],
+    maybeOptions?: Omit<TrimCurveOptions, "points">,
+  ): TrimReport {
+    const { index, generation } = this.#id(mesh);
+    const norm = normalizeTrimCurveArgs(optionsOrCurve, maybeOptions);
+    const flatPoints = Float64Array.from(norm.points.flat());
+    const r = call(() =>
+      this.#scene().trim_by_curve(
+        index,
+        generation,
+        flatPoints,
+        norm.closed,
+        norm.deleteInside,
+        optional(norm.snapTolerance, "snapTolerance"),
+      ),
+    );
+    return {
+      kept: this.#meshHandle(r[0], r[1]),
+      trianglesAdded: r[2],
+      trianglesRemoved: r[3],
+      verticesAdded: r[4],
+      seamEdges: r[5],
+    };
   }
 
   /**
@@ -3150,6 +3460,103 @@ export class Scene implements SceneLike {
       notApplied: REGISTER_NOT_APPLIED[r[22]],
       maxRmse: r[23],
       undetermined,
+    };
+  }
+
+  /**
+   * Aligns `moving` onto `fixed` from N corresponding world-space landmark pairs
+   * using Umeyama SVD (one undo step).
+   */
+  alignByLandmarks(
+    moving: MeshHandle,
+    fixed: MeshHandle,
+    pairs: readonly LandmarkPair[],
+    allowScaling = false,
+  ): LandmarkAlignment {
+    const m = this.#id(moving);
+    const f = this.#id(fixed);
+    const norm = normalizeLandmarkPairs(moving === fixed, pairs, allowScaling);
+    if (this.#drag?.mesh === moving || this.#drag?.mesh === fixed) {
+      this.#drag.end();
+    }
+    const r = call(() =>
+      this.#scene().align_by_landmarks(
+        m.index,
+        m.generation,
+        f.index,
+        f.generation,
+        norm.sourcePoints,
+        norm.targetPoints,
+        norm.allowScaling,
+      ),
+    );
+    return {
+      placement: {
+        rotation: Array.from(r.subarray(0, 9)),
+        translation: vec3At(r, 9),
+        scale: vec3At(r, 12),
+      },
+      scale: r[15],
+      rmse: r[16],
+    };
+  }
+
+  /**
+   * Runs coarse pre-alignment (PCA centroid or OBB) followed by iterative ICP
+   * with selectable error objective (`pointToPoint`, `pointToPlane`, or
+   * `symmetricNormal`) and applies the placement to `moving` (one undo step).
+   */
+  registerMultistage(
+    moving: MeshHandle,
+    fixed: MeshHandle,
+    options: RegistrationOptions = {},
+  ): RegistrationReport {
+    const m = this.#id(moving);
+    const f = this.#id(fixed);
+    const norm = normalizeRegistrationOptions(moving === fixed, options);
+    if (this.#drag?.mesh === moving || this.#drag?.mesh === fixed) {
+      this.#drag.end();
+    }
+    const r = call(() =>
+      this.#scene().register_multistage(
+        m.index,
+        m.generation,
+        f.index,
+        f.generation,
+        COARSE_ALIGN_CODES[norm.coarseMethod],
+        ICP_OBJECTIVE_CODES[norm.objective],
+        optional(norm.maxIterations, "maxIterations"),
+        optional(norm.tolerance, "tolerance"),
+        optional(norm.overlap, "overlap"),
+        optional(norm.maxDistance, "maxDistance"),
+        optional(norm.targetRmse, "targetRmse"),
+        optional(norm.sampleCount, "sampleCount"),
+        optional(norm.andersonWindow, "andersonWindow"),
+      ),
+    );
+    return {
+      placement: {
+        rotation: Array.from(r.subarray(0, 9)),
+        translation: vec3At(r, 9),
+        scale: vec3At(r, 12),
+      },
+      transform: Array.from(r.subarray(15, 31)),
+      finalRmse: r[31],
+      iterations: r[32],
+      status: REGISTER_STATUSES[r[33]],
+      converged: r[34] === 1,
+    };
+  }
+
+  /** Detects the dominant reflection symmetry plane of `mesh` in world space. */
+  detectSymmetryPlane(mesh: MeshHandle): SymmetryPlaneReport {
+    const { index, generation } = this.#id(mesh);
+    const r = call(() => this.#scene().detect_symmetry_plane(index, generation));
+    return {
+      planeNormal: vec3At(r, 0),
+      planePoint: vec3At(r, 3),
+      symmetryErrorRms: r[6],
+      symmetryScore: r[7],
     };
   }
 
@@ -3858,6 +4265,129 @@ export class Scene implements SceneLike {
       at = start + na + nb;
     }
     return out;
+  }
+
+  /** Evaluates printability overhang angles and support surface area in world coordinates. */
+  overhangs(mesh: MeshHandle, options: OverhangOptions = {}): OverhangReport {
+    const { index, generation } = this.#id(mesh);
+    const norm = normalizeOverhangOptions(options);
+    const r = call(() =>
+      this.#scene().overhangs(
+        index,
+        generation,
+        Float64Array.from(norm.buildDirection),
+        optional(norm.criticalAngleDeg, "criticalAngleDeg"),
+      ),
+    );
+    return {
+      totalSupportArea: r[0],
+      overhangFaceCount: r[1],
+      maxOverhangAngleDeg: r[2],
+      vertexAnglesDeg: Float32Array.from(r.subarray(3)),
+    };
+  }
+
+  /** Evaluates triangle element quality metrics across `mesh` in world coordinates. */
+  triangleQuality(
+    mesh: MeshHandle,
+    metricOrOptions: QualityMetric | TriangleQualityOptions = "radiusRatio",
+    sliverThreshold?: number,
+  ): QualityReport {
+    const { index, generation } = this.#id(mesh);
+    const norm = normalizeQualityArgs(metricOrOptions, sliverThreshold);
+    const r = call(() =>
+      this.#scene().triangle_quality(index, generation, QUALITY_METRIC_CODES[norm.metric], norm.sliverThreshold),
+    );
+    return {
+      min: r[0],
+      max: r[1],
+      mean: r[2],
+      sliverTriangleCount: r[3],
+      liveTriangleCount: r[4],
+      vertexQuality: Float32Array.from(r.subarray(5)),
+    };
+  }
+
+  /** Computes vertex-to-surface Hausdorff / signed deviation from `source` to `target` in world units. */
+  meshDeviation(source: MeshHandle, target: MeshHandle, options: DeviationOptions = {}): DeviationStats {
+    const src = this.#id(source);
+    const tgt = this.#id(target);
+    const norm = normalizeDeviationOptions(options);
+    const r = call(() =>
+      this.#scene().mesh_deviation(
+        src.index,
+        src.generation,
+        tgt.index,
+        tgt.generation,
+        norm.signed,
+        optional(norm.maxDistance, "maxDistance"),
+      ),
+    );
+    return {
+      min: r[0],
+      max: r[1],
+      mean: r[2],
+      rms: r[3],
+      p95: r[4],
+      sampleCount: r[5],
+      vertexDeviations: Float32Array.from(r.subarray(6)),
+    };
+  }
+
+  /** Computes per-vertex surface geodesic distances from `sources` in world units. */
+  geodesicDistances(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    options: GeodesicOptions = {},
+  ): Float32Array {
+    const { index, generation } = this.#id(mesh);
+    const src = normalizeSourceVertices(sources);
+    const norm = normalizeGeodesicOptions(options);
+    return call(() =>
+      this.#scene().geodesic_distances(
+        index,
+        generation,
+        src,
+        GEODESIC_METHOD_CODES[norm.method],
+        optional(norm.maxDistance, "maxDistance"),
+        optional(norm.timeStepScale, "timeStepScale"),
+      ),
+    );
+  }
+
+  /** Traces the intrinsic shortest surface path from `sources` to `targetVertex` in world coordinates. */
+  shortestSurfacePath(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options: SurfacePathOptions = {},
+  ): SurfacePathPoint[] {
+    const { index, generation } = this.#id(mesh);
+    const src = normalizeSourceVertices(sources);
+    const target = normalizeSurfacePathTarget(targetVertex);
+    const { distances, geodesic } = checkSurfacePathOptions(options);
+    const dists =
+      distances ??
+      call(() =>
+        this.#scene().geodesic_distances(
+          index,
+          generation,
+          src,
+          GEODESIC_METHOD_CODES[geodesic.method],
+          optional(geodesic.maxDistance, "maxDistance"),
+          optional(geodesic.timeStepScale, "timeStepScale"),
+        ),
+      );
+    const r = call(() => this.#scene().shortest_surface_path(index, generation, dists, src, target));
+    const points: SurfacePathPoint[] = [];
+    for (let at = 0; at < r.length; at += 7) {
+      points.push({
+        position: vec3At(r, at),
+        triangle: r[at + 3],
+        barycentric: vec3At(r, at + 4),
+      });
+    }
+    return points;
   }
 
   // ---- Selections ----

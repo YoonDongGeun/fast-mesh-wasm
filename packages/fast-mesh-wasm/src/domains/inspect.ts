@@ -8,13 +8,20 @@ import type {
   ColorRule,
   Contact,
   CurvatureFieldDesc,
+  DeviationOptions,
+  DeviationStats,
   DistanceFieldDesc,
   FieldHandle,
   FieldStatus,
   FindContactsOptions,
+  GeodesicOptions,
   MeasureResult,
   MeshDistance,
   MeshHandle,
+  OverhangOptions,
+  OverhangReport,
+  QualityMetric,
+  QualityReport,
   RaycastOptions,
   RayHit,
   SectionDesc,
@@ -22,7 +29,10 @@ import type {
   SectionHandle,
   SectionPlane,
   SectionResult,
+  SurfacePathOptions,
+  SurfacePathPoint,
   ThicknessFieldDesc,
+  TriangleQualityOptions,
 } from "../scene.js";
 
 /** Return type parameterized over synchronous (`Scene`) vs worker (`WorkerScene`) hosts. */
@@ -42,6 +52,24 @@ export interface InspectBackend<Async extends boolean = false> {
   ): InspectReturn<Async, MeshDistance | null>;
   intersects(a: MeshHandle, b: MeshHandle): InspectReturn<Async, boolean>;
   findContacts(options?: FindContactsOptions): InspectReturn<Async, Contact[]>;
+  overhangs(mesh: MeshHandle, options?: OverhangOptions): InspectReturn<Async, OverhangReport>;
+  triangleQuality(
+    mesh: MeshHandle,
+    metricOrOptions?: QualityMetric | TriangleQualityOptions,
+    sliverThreshold?: number,
+  ): InspectReturn<Async, QualityReport>;
+  meshDeviation(source: MeshHandle, target: MeshHandle, options?: DeviationOptions): InspectReturn<Async, DeviationStats>;
+  geodesicDistances(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    options?: GeodesicOptions,
+  ): InspectReturn<Async, Float32Array>;
+  shortestSurfacePath(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options?: SurfacePathOptions,
+  ): InspectReturn<Async, SurfacePathPoint[]>;
   addDistanceField(desc: DistanceFieldDesc): FieldHandle;
   addThicknessField?: (desc: ThicknessFieldDesc) => FieldHandle;
   addCurvatureField?: (desc: CurvatureFieldDesc) => FieldHandle;
@@ -63,7 +91,7 @@ export interface InspectBackend<Async extends boolean = false> {
   updateSections?: () => void;
 }
 
-/** Metrology, defect analysis, raycasting, distance/thickness/curvature fields, and cross-section inspection domain. */
+/** Metrology, defect analysis, raycasting, printability/quality/geodesic fields, surface paths, and cross-section inspection domain. */
 export interface InspectDomain<Async extends boolean = false> {
   analyze(mesh: MeshHandle, options?: AnalyzeOptions): InspectReturn<Async, Analysis>;
   measure(mesh: MeshHandle): InspectReturn<Async, MeasureResult>;
@@ -77,6 +105,30 @@ export interface InspectDomain<Async extends boolean = false> {
   ): InspectReturn<Async, MeshDistance | null>;
   intersects(a: MeshHandle, b: MeshHandle): InspectReturn<Async, boolean>;
   findContacts(options?: FindContactsOptions): InspectReturn<Async, Contact[]>;
+  overhangs(mesh: MeshHandle, options?: OverhangOptions): InspectReturn<Async, OverhangReport>;
+  triangleQuality(
+    mesh: MeshHandle,
+    metricOrOptions?: QualityMetric | TriangleQualityOptions,
+    sliverThreshold?: number,
+  ): InspectReturn<Async, QualityReport>;
+  meshDeviation(source: MeshHandle, target: MeshHandle, options?: DeviationOptions): InspectReturn<Async, DeviationStats>;
+  geodesicDistances(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    options?: GeodesicOptions,
+  ): InspectReturn<Async, Float32Array>;
+  shortestSurfacePath(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options?: SurfacePathOptions,
+  ): InspectReturn<Async, SurfacePathPoint[]>;
+  findSurfacePath(
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options?: SurfacePathOptions,
+  ): InspectReturn<Async, SurfacePathPoint[]>;
   addDistanceField(desc: DistanceFieldDesc): FieldHandle;
   addThicknessField(desc: ThicknessFieldDesc): FieldHandle;
   addCurvatureField(desc: CurvatureFieldDesc): FieldHandle;
@@ -106,6 +158,13 @@ export type WorkerInspectDomain = InspectDomain<true>;
 
 /** Builds an {@link InspectDomain} backed by `backend`. */
 export function createInspectDomain<Async extends boolean>(backend: InspectBackend<Async>): InspectDomain<Async> {
+  const shortestSurfacePath = (
+    mesh: MeshHandle,
+    sources: number | readonly number[],
+    targetVertex: number,
+    options?: SurfacePathOptions,
+  ) => backend.shortestSurfacePath(mesh, sources, targetVertex, options);
+
   return {
     analyze: (mesh: MeshHandle, options?: AnalyzeOptions) => backend.analyze(mesh, options),
     measure: (mesh: MeshHandle) => backend.measure(mesh),
@@ -117,6 +176,18 @@ export function createInspectDomain<Async extends boolean>(backend: InspectBacke
       backend.meshDistance(a, b, options),
     intersects: (a: MeshHandle, b: MeshHandle) => backend.intersects(a, b),
     findContacts: (options?: FindContactsOptions) => backend.findContacts(options),
+    overhangs: (mesh: MeshHandle, options?: OverhangOptions) => backend.overhangs(mesh, options),
+    triangleQuality: (
+      mesh: MeshHandle,
+      metricOrOptions?: QualityMetric | TriangleQualityOptions,
+      sliverThreshold?: number,
+    ) => backend.triangleQuality(mesh, metricOrOptions, sliverThreshold),
+    meshDeviation: (source: MeshHandle, target: MeshHandle, options?: DeviationOptions) =>
+      backend.meshDeviation(source, target, options),
+    geodesicDistances: (mesh: MeshHandle, sources: number | readonly number[], options?: GeodesicOptions) =>
+      backend.geodesicDistances(mesh, sources, options),
+    shortestSurfacePath,
+    findSurfacePath: shortestSurfacePath,
     addDistanceField: (desc: DistanceFieldDesc) => backend.addDistanceField(desc),
     addThicknessField: (desc: ThicknessFieldDesc) => {
       if (backend.addThicknessField === undefined) {

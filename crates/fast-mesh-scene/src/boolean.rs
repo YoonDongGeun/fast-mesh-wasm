@@ -17,7 +17,7 @@ use fast_mesh_query::Rigid;
 use fast_mesh_store::{Mesh, StoreError, TriangleId, UV_CHANNEL, VertexId};
 
 use crate::baked::baked_mesh;
-use crate::ops::boolean::{BooleanMethod, BooleanOptions, CsgNode};
+pub use crate::ops::boolean::{BooleanMethod, BooleanOptions, CsgNode};
 use crate::placement::{is_relative_rigid, relative_affine, relative_rigid};
 use crate::{MeshId, MeshOptions, Placement, Result, Scene};
 
@@ -233,6 +233,7 @@ impl Scene {
         b: MeshId,
         options: &BooleanOptions,
     ) -> Result<BooleanReport> {
+        self.drop_field_unit();
         self.entry(a)?;
         self.entry(b)?;
         let scene_op = match options.op {
@@ -320,6 +321,7 @@ impl Scene {
         tree: &CsgNode,
         options: &BooleanOptions,
     ) -> Result<MeshId> {
+        self.drop_field_unit();
         for &id in meshes {
             self.entry(id)?;
         }

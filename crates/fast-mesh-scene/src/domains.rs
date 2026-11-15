@@ -26,10 +26,13 @@ use fast_mesh_ops::sculpt::{StretchOptions, StretchReport};
 use fast_mesh_store::VertexId;
 
 use crate::{
-    BooleanOp, BooleanReport, Contact, ContactFilter, CurvatureField, CutOptions, CutReport, Dab,
-    DabReport, DistanceField, FieldId, JoinOptions, JoinReport, MeshId, RegisterOptions,
-    RegisterReport, Result, Scene, SceneClosestHit, SceneClosestOptions, SceneMeshDistance,
-    SceneRayHit, SceneRayOptions, SectionDesc, SectionId, ThicknessField,
+    BooleanOp, BooleanOptions, BooleanReport, Contact, ContactFilter, CsgNode, CurvatureField,
+    CutOptions, CutReport, Dab, DabReport, DeviationOptions, DeviationStats, DistanceField,
+    FieldId, GeodesicOptions, JoinOptions, JoinReport, LandmarkAlignment, LandmarkPair, MeshId,
+    OverhangOptions, OverhangReport, QualityMetric, QualityReport, RegisterOptions, RegisterReport,
+    RegistrationOptions, RegistrationReport, Result, Scene, SceneClosestHit, SceneClosestOptions,
+    SceneMeshDistance, SceneRayHit, SceneRayOptions, SectionDesc, SectionId, SurfacePathPoint,
+    SymmetryPlaneReport, ThicknessField, TrimCurveOptions, TrimReport,
 };
 
 /// Repair domain operations on [`Scene`].
@@ -216,8 +219,27 @@ pub trait SceneBooleanOps {
     /// Computes a world-space CSG boolean (`op`) between `a` and `b`, updating `a`.
     fn boolean(&mut self, a: MeshId, b: MeshId, op: BooleanOp) -> Result<BooleanReport>;
 
+    /// Computes a world-space CSG boolean with configurable solver options.
+    fn boolean_with_options(
+        &mut self,
+        a: MeshId,
+        b: MeshId,
+        options: &BooleanOptions,
+    ) -> Result<BooleanReport>;
+
+    /// Evaluates an N-ary CSG boolean tree over `meshes` and adds the resulting mesh.
+    fn boolean_batch(
+        &mut self,
+        meshes: &[MeshId],
+        tree: &CsgNode,
+        options: &BooleanOptions,
+    ) -> Result<MeshId>;
+
     /// Cuts mesh `id` with a world plane and adds the removed side to the scene.
     fn cut_by_plane(&mut self, id: MeshId, options: &CutOptions) -> Result<CutReport>;
+
+    /// Conformatively imprints a world polyline on `id` and optionally trims inside/outside.
+    fn trim_by_curve(&mut self, id: MeshId, options: &TrimCurveOptions) -> Result<TrimReport>;
 
     /// Offsets mesh `id` along its normals or via volumetric SDF reconstruction.
     fn offset(&mut self, id: MeshId, options: &OffsetOptions) -> Result<OffsetReport>;
@@ -231,8 +253,30 @@ impl SceneBooleanOps for Scene {
         Scene::boolean(self, a, b, op)
     }
 
+    fn boolean_with_options(
+        &mut self,
+        a: MeshId,
+        b: MeshId,
+        options: &BooleanOptions,
+    ) -> Result<BooleanReport> {
+        Scene::boolean_with_options(self, a, b, options)
+    }
+
+    fn boolean_batch(
+        &mut self,
+        meshes: &[MeshId],
+        tree: &CsgNode,
+        options: &BooleanOptions,
+    ) -> Result<MeshId> {
+        Scene::boolean_batch(self, meshes, tree, options)
+    }
+
     fn cut_by_plane(&mut self, id: MeshId, options: &CutOptions) -> Result<CutReport> {
         Scene::cut_by_plane(self, id, options)
+    }
+
+    fn trim_by_curve(&mut self, id: MeshId, options: &TrimCurveOptions) -> Result<TrimReport> {
+        Scene::trim_by_curve(self, id, options)
     }
 
     fn offset(&mut self, id: MeshId, options: &OffsetOptions) -> Result<OffsetReport> {
@@ -356,6 +400,51 @@ pub trait SceneInspectOps {
 
     /// Returns the world-space axis-aligned bounding box of mesh `id`.
     fn bounds(&self, id: MeshId) -> Result<Option<Aabb>>;
+
+    /// Computes printability overhang angles relative to a world build direction.
+    fn overhangs(
+        &self,
+        id: MeshId,
+        options: &OverhangOptions,
+        vertex_angles_deg: &mut Vec<f32>,
+    ) -> Result<OverhangReport>;
+
+    /// Evaluates vertex-to-surface deviation from `source` to `target` in world units.
+    fn mesh_deviation(
+        &mut self,
+        source: MeshId,
+        target: MeshId,
+        options: &DeviationOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<DeviationStats>;
+
+    /// Evaluates triangle shape quality in world coordinates.
+    fn triangle_quality(
+        &self,
+        id: MeshId,
+        metric: QualityMetric,
+        sliver_threshold: f32,
+        vertex_quality: &mut Vec<f32>,
+    ) -> Result<QualityReport>;
+
+    /// Computes geodesic surface distances from `sources` in world length units.
+    fn geodesic_distances(
+        &self,
+        id: MeshId,
+        sources: &[u32],
+        options: &GeodesicOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<()>;
+
+    /// Traces the intrinsic shortest path from `sources` to `target_vertex`.
+    fn shortest_surface_path(
+        &self,
+        id: MeshId,
+        distances: &[f32],
+        sources: &[u32],
+        target_vertex: u32,
+        out: &mut Vec<SurfacePathPoint>,
+    ) -> Result<()>;
 }
 
 impl SceneInspectOps for Scene {
@@ -438,6 +527,56 @@ impl SceneInspectOps for Scene {
     fn bounds(&self, id: MeshId) -> Result<Option<Aabb>> {
         Scene::bounds(self, id)
     }
+
+    fn overhangs(
+        &self,
+        id: MeshId,
+        options: &OverhangOptions,
+        vertex_angles_deg: &mut Vec<f32>,
+    ) -> Result<OverhangReport> {
+        Scene::overhangs(self, id, options, vertex_angles_deg)
+    }
+
+    fn mesh_deviation(
+        &mut self,
+        source: MeshId,
+        target: MeshId,
+        options: &DeviationOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<DeviationStats> {
+        Scene::mesh_deviation(self, source, target, options, out)
+    }
+
+    fn triangle_quality(
+        &self,
+        id: MeshId,
+        metric: QualityMetric,
+        sliver_threshold: f32,
+        vertex_quality: &mut Vec<f32>,
+    ) -> Result<QualityReport> {
+        Scene::triangle_quality(self, id, metric, sliver_threshold, vertex_quality)
+    }
+
+    fn geodesic_distances(
+        &self,
+        id: MeshId,
+        sources: &[u32],
+        options: &GeodesicOptions,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        Scene::geodesic_distances(self, id, sources, options, out)
+    }
+
+    fn shortest_surface_path(
+        &self,
+        id: MeshId,
+        distances: &[f32],
+        sources: &[u32],
+        target_vertex: u32,
+        out: &mut Vec<SurfacePathPoint>,
+    ) -> Result<()> {
+        Scene::shortest_surface_path(self, id, distances, sources, target_vertex, out)
+    }
 }
 
 /// Alignment domain operations on [`Scene`].
@@ -449,6 +588,26 @@ pub trait SceneAlignOps {
         fixed: MeshId,
         options: &RegisterOptions,
     ) -> Result<RegisterReport>;
+
+    /// Aligns `moving` onto `fixed` from landmark correspondences.
+    fn align_by_landmarks(
+        &mut self,
+        moving: MeshId,
+        fixed: MeshId,
+        pairs: &[LandmarkPair],
+        allow_scaling: bool,
+    ) -> Result<LandmarkAlignment>;
+
+    /// Runs multi-stage global + fine registration of `moving` onto `fixed`.
+    fn register_multistage(
+        &mut self,
+        moving: MeshId,
+        fixed: MeshId,
+        options: &RegistrationOptions,
+    ) -> Result<RegistrationReport>;
+
+    /// Detects the dominant reflection symmetry plane of mesh `id`.
+    fn detect_symmetry_plane(&mut self, id: MeshId) -> Result<SymmetryPlaneReport>;
 }
 
 impl SceneAlignOps for Scene {
@@ -459,6 +618,29 @@ impl SceneAlignOps for Scene {
         options: &RegisterOptions,
     ) -> Result<RegisterReport> {
         Scene::register(self, moving, fixed, options)
+    }
+
+    fn align_by_landmarks(
+        &mut self,
+        moving: MeshId,
+        fixed: MeshId,
+        pairs: &[LandmarkPair],
+        allow_scaling: bool,
+    ) -> Result<LandmarkAlignment> {
+        Scene::align_by_landmarks(self, moving, fixed, pairs, allow_scaling)
+    }
+
+    fn register_multistage(
+        &mut self,
+        moving: MeshId,
+        fixed: MeshId,
+        options: &RegistrationOptions,
+    ) -> Result<RegistrationReport> {
+        Scene::register_multistage(self, moving, fixed, options)
+    }
+
+    fn detect_symmetry_plane(&mut self, id: MeshId) -> Result<SymmetryPlaneReport> {
+        Scene::detect_symmetry_plane(self, id)
     }
 }
 
@@ -554,5 +736,51 @@ mod tests {
         let align_rep =
             SceneAlignOps::register(&mut scene, id, other, &RegisterOptions::default()).unwrap();
         assert!(align_rep.samples > 0);
+
+        let sym = SceneAlignOps::detect_symmetry_plane(&mut scene, other).unwrap();
+        assert!(sym.symmetry_error_rms.is_finite());
+
+        let mut angles = Vec::new();
+        let ov =
+            SceneInspectOps::overhangs(&scene, other, &OverhangOptions::default(), &mut angles)
+                .unwrap();
+        assert!(ov.overhang_face_count > 0);
+
+        let mut qual = Vec::new();
+        let qr = SceneInspectOps::triangle_quality(
+            &scene,
+            other,
+            QualityMetric::RadiusRatio,
+            0.1,
+            &mut qual,
+        )
+        .unwrap();
+        assert!(qr.live_triangle_count > 0);
+
+        let mut dist = Vec::new();
+        SceneInspectOps::geodesic_distances(
+            &scene,
+            other,
+            &[0],
+            &GeodesicOptions::default(),
+            &mut dist,
+        )
+        .unwrap();
+        assert_eq!(dist[0], 0.0);
+
+        let mut path = Vec::new();
+        SceneInspectOps::shortest_surface_path(&scene, other, &dist, &[0], 1, &mut path).unwrap();
+        assert!(path.len() >= 2);
+
+        let mut dev = Vec::new();
+        let ds = SceneInspectOps::mesh_deviation(
+            &mut scene,
+            other,
+            other,
+            &DeviationOptions::default(),
+            &mut dev,
+        )
+        .unwrap();
+        assert!(ds.sample_count > 0);
     }
 }

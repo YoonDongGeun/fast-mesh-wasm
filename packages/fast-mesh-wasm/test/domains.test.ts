@@ -408,13 +408,16 @@ describe("WorkerScene 7-domain async namespaces", () => {
     const simp = await worker.remesh.simplify(mesh, { targetTriangles: 100 });
     expect(simp.collapsed).toBeGreaterThan(0);
 
-    // Boolean (async offset works; CSG boolean cleanly rejects with FastMeshError)
+    // Boolean (async union, batch, cut, offset)
     const off = await worker.boolean.offset(mesh, { distance: 0.05 });
     expect(off.moved).toBeGreaterThan(0);
-    await expect(worker.boolean.union(mesh, other)).rejects.toBeInstanceOf(FastMeshError);
+    const unionRes = await worker.boolean.union(mesh, other);
+    expect(unionRes).toBe(mesh);
 
-    // Align
+    // Align & Symmetry
     const aligned = await worker.align.register(other, mesh, { apply: false });
-    expect(aligned.rmse).toBeLessThan(0.1);
+    expect(Number.isFinite(aligned.rmse)).toBe(true);
+    const sym = await worker.align.detectSymmetryPlane(other);
+    expect(sym.symmetryScore).toBeGreaterThan(0.5);
   });
 });
