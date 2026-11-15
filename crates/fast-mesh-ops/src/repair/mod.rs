@@ -10,6 +10,7 @@
 //! - [`presets::AutoRepairPreset`] configures domain-tailored pipelines for
 //!   [`auto_repair`](crate::auto_repair).
 
+pub mod fill_continuity;
 pub mod manifold;
 pub mod presets;
 pub mod self_intersect;
@@ -20,7 +21,8 @@ pub use crate::auto_repair::{
     AutoRepairOptions, AutoRepairOptionsBuilder, AutoRepairReport, AutoRepairStage, auto_repair,
 };
 pub use crate::bridge::{
-    BRIDGE_DEFAULT_MAX_EDGES, BridgeOptions, BridgeOptionsBuilder, BridgeReport, bridge_loops,
+    BRIDGE_DEFAULT_MAX_EDGES, BridgeOptions, BridgeOptionsBuilder, BridgeReport, BridgeStats,
+    PartialBridgeOptions, PartialBridgeOptionsBuilder, bridge_loops, bridge_partial_arcs,
 };
 pub use crate::cleanup::{
     ComponentOptions, ComponentOptionsBuilder, DegenerateOptions, DegenerateOptionsBuilder,
@@ -31,6 +33,9 @@ pub use crate::fill::{
     fill_holes,
 };
 pub use crate::orient::{OrientReport, orient};
+pub use fill_continuity::{
+    FillContinuity, FillHolesOptions, FillHolesOptionsBuilder, FillStats, fill_all_holes, fill_hole,
+};
 pub use manifold::{ManifoldOptions, ManifoldOptionsBuilder, ManifoldReport, make_manifold};
 pub use presets::AutoRepairPreset;
 pub use self_intersect::{

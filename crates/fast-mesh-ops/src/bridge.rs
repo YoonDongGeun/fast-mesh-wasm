@@ -71,6 +71,125 @@ pub struct BridgeReport {
     pub triangles_added: usize,
 }
 
+/// Options for [`bridge_partial_arcs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PartialBridgeOptions {
+    /// Boundary loop index (in [`boundary_loops`] order) containing the first arc.
+    pub loop_a_index: usize,
+    /// Inclusive vertex-index range `(start, end)` along `loop_a_index` (`start != end`;
+    /// wraps modulo loop length when `start > end`).
+    pub arc_a_range: (usize, usize),
+    /// Boundary loop index (in [`boundary_loops`] order) containing the second arc.
+    /// May equal `loop_a_index` to split a single hole loop into smaller loops.
+    pub loop_b_index: usize,
+    /// Inclusive vertex-index range `(start, end)` along `loop_b_index`.
+    pub arc_b_range: (usize, usize),
+    /// Cyclic vertex shift applied along `loop_b_index` to `arc_b_range`.
+    pub twist_offset: isize,
+    /// Optional number of interior span subdivisions across the bridge width
+    /// (`None` or `Some(0)` adds no interior vertices).
+    pub subdivisions: Option<usize>,
+}
+
+impl Default for PartialBridgeOptions {
+    fn default() -> Self {
+        Self {
+            loop_a_index: 0,
+            arc_a_range: (0, 1),
+            loop_b_index: 0,
+            arc_b_range: (2, 3),
+            twist_offset: 0,
+            subdivisions: None,
+        }
+    }
+}
+
+impl PartialBridgeOptions {
+    /// Starts a builder targeting `(loop_a_index, arc_a_range)` and
+    /// `(loop_b_index, arc_b_range)`.
+    pub fn builder(
+        loop_a_index: usize,
+        arc_a_range: (usize, usize),
+        loop_b_index: usize,
+        arc_b_range: (usize, usize),
+    ) -> PartialBridgeOptionsBuilder {
+        PartialBridgeOptionsBuilder {
+            options: Self {
+                loop_a_index,
+                arc_a_range,
+                loop_b_index,
+                arc_b_range,
+                twist_offset: 0,
+                subdivisions: None,
+            },
+        }
+    }
+}
+
+/// Builder for [`PartialBridgeOptions`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PartialBridgeOptionsBuilder {
+    options: PartialBridgeOptions,
+}
+
+impl PartialBridgeOptionsBuilder {
+    /// Sets `loop_a_index`.
+    pub fn loop_a_index(mut self, index: usize) -> Self {
+        self.options.loop_a_index = index;
+        self
+    }
+
+    /// Sets `arc_a_range`.
+    pub fn arc_a_range(mut self, range: (usize, usize)) -> Self {
+        self.options.arc_a_range = range;
+        self
+    }
+
+    /// Sets `loop_b_index`.
+    pub fn loop_b_index(mut self, index: usize) -> Self {
+        self.options.loop_b_index = index;
+        self
+    }
+
+    /// Sets `arc_b_range`.
+    pub fn arc_b_range(mut self, range: (usize, usize)) -> Self {
+        self.options.arc_b_range = range;
+        self
+    }
+
+    /// Sets `twist_offset`.
+    pub fn twist_offset(mut self, twist_offset: isize) -> Self {
+        self.options.twist_offset = twist_offset;
+        self
+    }
+
+    /// Sets `subdivisions`.
+    pub fn subdivisions(mut self, subdivisions: Option<usize>) -> Self {
+        self.options.subdivisions = subdivisions;
+        self
+    }
+
+    /// Builds [`PartialBridgeOptions`]. Validation runs inside [`bridge_partial_arcs`].
+    pub fn build(self) -> PartialBridgeOptions {
+        self.options
+    }
+}
+
+/// Summary of a [`bridge_partial_arcs`] operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct BridgeStats {
+    /// Triangles added to stitch the two arcs.
+    pub triangles_added: usize,
+    /// Interior bridge vertices added (non-zero when `subdivisions` is set).
+    pub vertices_added: usize,
+    /// Number of boundary loops on the mesh after bridging.
+    pub resulting_loops: usize,
+    /// Vertex count on `arc_a`.
+    pub arc_a_vertices: usize,
+    /// Vertex count on `arc_b`.
+    pub arc_b_vertices: usize,
+}
+
 /// Stitches a tube between the two loops in `options`.
 ///
 /// The first loop (smaller id) is traversed backward and the second
@@ -149,6 +268,329 @@ pub fn bridge_loops(tx: &mut Transaction, options: &BridgeOptions) -> Result<Bri
     };
     tx.add_triangles(&strip)?;
     Ok(report)
+}
+
+/// Maximum interior subdivisions permitted along a partial bridge.
+const MAX_PARTIAL_SUBDIVISIONS: usize = 64;
+
+/// Bridges two boundary sub-arcs with a manifold, minimum-area triangle strip,
+/// splitting a single loop into smaller loops or partially connecting two loops.
+///
+/// The sub-arcs may lie on the same boundary loop (splitting complex saddle
+/// holes into two simpler closed loops) or on distinct loops. `twist_offset`
+/// cyclically rotates `arc_b_range` along `loop_b_index`, and optional
+/// `subdivisions` inserts linear barycentric vertex rows across the bridge with
+/// smooth UV interpolation via [`Transaction::add_vertex_with_parents`].
+///
+/// All geometry, chord, and allocation checks complete before `tx` is mutated.
+///
+/// # Errors
+/// - [`OpsError::InvalidInput`] for out-of-bounds loop indices, invalid or
+///   overlapping arc ranges, non-finite coordinates, degenerate triangles, or
+///   existing mesh edge collisions.
+/// - [`OpsError::Store`] on store / memory exhaustion.
+pub fn bridge_partial_arcs(
+    tx: &mut Transaction,
+    options: &PartialBridgeOptions,
+) -> Result<BridgeStats> {
+    let subdivisions = options.subdivisions.unwrap_or(0);
+    if subdivisions > MAX_PARTIAL_SUBDIVISIONS {
+        return Err(OpsError::InvalidInput(
+            "bridge subdivisions exceeds supported limit",
+        ));
+    }
+
+    let mesh = tx.mesh();
+    let loops = boundary_loops(mesh)?;
+    let la = loops
+        .get(options.loop_a_index)
+        .ok_or(OpsError::InvalidInput("loop_a_index out of bounds"))?;
+    let lb = loops
+        .get(options.loop_b_index)
+        .ok_or(OpsError::InvalidInput("loop_b_index out of bounds"))?;
+    for l in [la, lb] {
+        if !l.closed || !l.clean || l.vertices.len() < 3 {
+            return Err(OpsError::InvalidInput(
+                "bridge loops must be closed and clean",
+            ));
+        }
+    }
+
+    let (arc_a, a_start, a_end) = extract_arc(&la.vertices, options.arc_a_range, 0)?;
+    let (arc_b_fwd, b_start, b_end) =
+        extract_arc(&lb.vertices, options.arc_b_range, options.twist_offset)?;
+
+    // Ensure the two arcs share no vertices so triangles never collapse or pinch.
+    let mut a_sorted: Vec<VertexId> = Vec::new();
+    reserve(&mut a_sorted, arc_a.len())?;
+    a_sorted.extend_from_slice(&arc_a);
+    a_sorted.sort_unstable();
+    for &v in &arc_b_fwd {
+        if a_sorted.binary_search(&v).is_ok() {
+            return Err(OpsError::InvalidInput(
+                "partial bridge arcs must not share vertices",
+            ));
+        }
+    }
+
+    for &v in arc_a.iter().chain(&arc_b_fwd) {
+        if !point(mesh, v).iter().all(|c| c.is_finite()) {
+            return Err(OpsError::InvalidInput(
+                "bridge arc positions must be finite",
+            ));
+        }
+    }
+
+    // Walk arc_a forward and arc_b backward so triangles wind opposite to
+    // both rim loops (agreeing with adjacent mesh faces on both sides).
+    let k = arc_a.len();
+    let m = arc_b_fwd.len();
+    let mut arc_b_rev: Vec<VertexId> = Vec::new();
+    reserve(&mut arc_b_rev, m)?;
+    arc_b_rev.extend(arc_b_fwd.iter().copied().rev());
+
+    let mut pu: Vec<[f64; 3]> = Vec::new();
+    reserve(&mut pu, k)?;
+    for &v in &arc_a {
+        pu.push(point(mesh, v));
+    }
+    let mut pv: Vec<[f64; 3]> = Vec::new();
+    reserve(&mut pv, m)?;
+    for &v in &arc_b_rev {
+        pv.push(point(mesh, v));
+    }
+
+    let cells = k
+        .checked_mul(m)
+        .ok_or(OpsError::InvalidInput("bridge arc DP table overflow"))?;
+    let mut cost: Vec<f64> = Vec::new();
+    reserve(&mut cost, cells)?;
+    cost.extend(std::iter::repeat_n(f64::INFINITY, cells));
+    let mut back: Vec<u8> = Vec::new();
+    reserve(&mut back, cells)?;
+    back.extend(std::iter::repeat_n(0, cells));
+
+    let total = dp_fill(&pu, &pv, &mut cost, &mut back);
+    if !total.is_finite() {
+        return Err(OpsError::InvalidInput("bridge triangulation cost invalid"));
+    }
+
+    // Recover staircase steps (0 = step along u, 1 = step along v) from (0, 0) to (k-1, m-1).
+    let steps = (k - 1) + (m - 1);
+    let mut path_steps: Vec<u8> = Vec::new();
+    reserve(&mut path_steps, steps)?;
+    let (mut iu, mut jv) = (k - 1, m - 1);
+    while iu > 0 || jv > 0 {
+        let step_u = if jv == 0 {
+            true
+        } else if iu == 0 {
+            false
+        } else {
+            back[iu * m + jv] == 0
+        };
+        if step_u {
+            path_steps.push(0);
+            iu -= 1;
+        } else {
+            path_steps.push(1);
+            jv -= 1;
+        }
+    }
+    path_steps.reverse();
+
+    // Record the (u_idx, v_idx) rung vertices along the staircase and validate every triangle/chord.
+    let mut rungs: Vec<(usize, usize)> = Vec::new();
+    reserve(&mut rungs, steps + 1)?;
+    let (mut ci, mut cj) = (0usize, 0usize);
+    rungs.push((ci, cj));
+    for &s in &path_steps {
+        let tri = if s == 0 {
+            ci += 1;
+            [arc_a[ci], arc_a[ci - 1], arc_b_rev[cj]]
+        } else {
+            cj += 1;
+            [arc_a[ci], arc_b_rev[cj - 1], arc_b_rev[cj]]
+        };
+        let area2 = tri_area2(
+            &point(mesh, tri[0]),
+            &point(mesh, tri[1]),
+            &point(mesh, tri[2]),
+        );
+        if !area2.is_finite() || area2 == 0.0 {
+            return Err(OpsError::InvalidInput("bridge triangulation is degenerate"));
+        }
+        rungs.push((ci, cj));
+    }
+
+    let same_loop = options.loop_a_index == options.loop_b_index;
+    let n_a = la.vertices.len();
+    let gap1_edges = if same_loop {
+        (b_start + n_a - a_end) % n_a
+    } else {
+        0
+    };
+    let gap2_edges = if same_loop {
+        (a_start + n_a - b_end) % n_a
+    } else {
+        0
+    };
+
+    let edges = EdgeMap::build(mesh)?;
+    for (r_idx, &(ui, vj)) in rungs.iter().enumerate() {
+        let (p, q) = (arc_a[ui], arc_b_rev[vj]);
+        let incident = edges.triangles(p, q);
+        if r_idx > 0 && r_idx < steps {
+            if !incident.is_empty() {
+                return Err(OpsError::InvalidInput("bridge diagonal already exists"));
+            }
+        } else if !incident.is_empty() {
+            let closes_single_gap = same_loop
+                && incident.len() == 1
+                && ((r_idx == 0 && gap2_edges == 1) || (r_idx == steps && gap1_edges == 1));
+            if !closes_single_gap {
+                return Err(OpsError::InvalidInput("bridge diagonal already exists"));
+            }
+            if subdivisions > 0 {
+                return Err(OpsError::InvalidInput(
+                    "cannot subdivide across an existing boundary edge",
+                ));
+            }
+        }
+    }
+
+    let resulting_loops = if same_loop {
+        loops.len() - 1 + usize::from(gap1_edges >= 2) + usize::from(gap2_edges >= 2)
+    } else {
+        loops.len() - 1
+    };
+
+    // Reserve all output memory BEFORE mutating tx so OOM leaves tx untouched.
+    let tris_per_step = 2 * subdivisions + 1;
+    let total_tris = steps
+        .checked_mul(tris_per_step)
+        .ok_or(OpsError::InvalidInput("bridge triangle count overflow"))?;
+    let total_new_verts = (steps + 1)
+        .checked_mul(subdivisions)
+        .ok_or(OpsError::InvalidInput("bridge vertex count overflow"))?;
+
+    type BridgeVertexSpec = ([f32; 3], [(VertexId, f32); 2]);
+    let mut vert_specs: Vec<BridgeVertexSpec> = Vec::new();
+    reserve(&mut vert_specs, total_new_verts)?;
+    if subdivisions > 0 {
+        let rows = (subdivisions + 1) as f64;
+        for &(ui, vj) in &rungs {
+            let (ua, vb) = (arc_a[ui], arc_b_rev[vj]);
+            let (pa, pb) = (point(mesh, ua), point(mesh, vb));
+            for row in 1..=subdivisions {
+                let t = row as f64 / rows;
+                let omt = 1.0 - t;
+                let pos = [
+                    (omt * pa[0] + t * pb[0]) as f32,
+                    (omt * pa[1] + t * pb[1]) as f32,
+                    (omt * pa[2] + t * pb[2]) as f32,
+                ];
+                vert_specs.push((pos, [(ua, omt as f32), (vb, t as f32)]));
+            }
+        }
+    }
+
+    let mut new_verts: Vec<VertexId> = Vec::new();
+    reserve(&mut new_verts, total_new_verts)?;
+    let mut out_tris: Vec<[VertexId; 3]> = Vec::new();
+    reserve(&mut out_tris, total_tris)?;
+
+    // All fallible fast-mesh-ops reservations are complete; now commit vertices and triangles.
+    for (pos, parents) in &vert_specs {
+        let id = tx.add_vertex_with_parents(*pos, parents)?;
+        new_verts.push(id);
+    }
+
+    let rung_vertex = |r_idx: usize, row: usize| -> VertexId {
+        if row == 0 {
+            arc_a[rungs[r_idx].0]
+        } else if row == subdivisions + 1 {
+            arc_b_rev[rungs[r_idx].1]
+        } else {
+            new_verts[r_idx * subdivisions + (row - 1)]
+        }
+    };
+
+    for (r, &s) in path_steps.iter().enumerate() {
+        if subdivisions == 0 {
+            let tri = if s == 0 {
+                [
+                    arc_a[rungs[r + 1].0],
+                    arc_a[rungs[r].0],
+                    arc_b_rev[rungs[r].1],
+                ]
+            } else {
+                [
+                    arc_a[rungs[r].0],
+                    arc_b_rev[rungs[r].1],
+                    arc_b_rev[rungs[r + 1].1],
+                ]
+            };
+            out_tris.push(tri);
+            continue;
+        }
+        if s == 0 {
+            for row in 0..subdivisions {
+                let (p0, p1) = (rung_vertex(r, row), rung_vertex(r, row + 1));
+                let (q0, q1) = (rung_vertex(r + 1, row), rung_vertex(r + 1, row + 1));
+                out_tris.push([q0, p0, p1]);
+                out_tris.push([q0, p1, q1]);
+            }
+            let ps = rung_vertex(r, subdivisions);
+            let qs = rung_vertex(r + 1, subdivisions);
+            let tip = rung_vertex(r, subdivisions + 1);
+            out_tris.push([qs, ps, tip]);
+        } else {
+            let u_tip = rung_vertex(r, 0);
+            let p1 = rung_vertex(r, 1);
+            let q1 = rung_vertex(r + 1, 1);
+            out_tris.push([u_tip, p1, q1]);
+            for row in 1..=subdivisions {
+                let (p0, p1) = (rung_vertex(r, row), rung_vertex(r, row + 1));
+                let (q0, q1) = (rung_vertex(r + 1, row), rung_vertex(r + 1, row + 1));
+                out_tris.push([q0, p0, p1]);
+                out_tris.push([q0, p1, q1]);
+            }
+        }
+    }
+
+    tx.add_triangles(&out_tris)?;
+    Ok(BridgeStats {
+        triangles_added: out_tris.len(),
+        vertices_added: new_verts.len(),
+        resulting_loops,
+        arc_a_vertices: k,
+        arc_b_vertices: m,
+    })
+}
+
+/// Extracts an inclusive vertex arc from `loop_verts` after shifting `(start, end)`
+/// by `twist_offset` modulo `loop_verts.len()`, returning `(arc, shifted_start, shifted_end)`.
+fn extract_arc(
+    loop_verts: &[VertexId],
+    range: (usize, usize),
+    twist_offset: isize,
+) -> Result<(Vec<VertexId>, usize, usize)> {
+    let n = loop_verts.len();
+    let (raw_s, raw_e) = range;
+    if raw_s >= n || raw_e >= n || raw_s == raw_e {
+        return Err(OpsError::InvalidInput("invalid bridge arc range"));
+    }
+    let shift =
+        |idx: usize| -> usize { ((idx as isize + twist_offset).rem_euclid(n as isize)) as usize };
+    let start = shift(raw_s);
+    let end = shift(raw_e);
+    let steps = (end + n - start) % n;
+    let mut arc: Vec<VertexId> = Vec::new();
+    reserve(&mut arc, steps + 1)?;
+    for step in 0..=steps {
+        arc.push(loop_verts[(start + step) % n]);
+    }
+    Ok((arc, start, end))
 }
 
 fn loop_key(id: &LoopId) -> (u32, u32, u64) {
@@ -518,5 +960,150 @@ mod tests {
             Ok(())
         });
         assert!(n > 0);
+    }
+
+    #[test]
+    fn partial_bridge_splits_hole_into_two_independent_loops() {
+        use crate::test_util::grid_without;
+        // 8x8 grid missing a 4x4 interior hole (2 boundary loops: outer grid border + 16-vertex hole).
+        let hole_cells: Vec<(u32, u32)> =
+            (2..6).flat_map(|y| (2..6).map(move |x| (x, y))).collect();
+        let mut mesh = grid_without(8, &hole_cells);
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 2);
+        let hole_idx = loops
+            .iter()
+            .position(|l| l.vertices.len() == 16)
+            .expect("16-vertex hole");
+        let n = loops[hole_idx].vertices.len();
+
+        // Take two separated 3-vertex arcs on opposite sides of the 16-vertex hole.
+        let options = PartialBridgeOptions::builder(hole_idx, (1, 3), hole_idx, (9, 11)).build();
+        let (stats, _) = edit(&mut mesh, |tx| bridge_partial_arcs(tx, &options));
+        assert_eq!(stats.arc_a_vertices, 3);
+        assert_eq!(stats.arc_b_vertices, 3);
+        assert_eq!(stats.vertices_added, 0);
+        assert_eq!(stats.triangles_added, 4);
+        assert_eq!(stats.resulting_loops, 3);
+
+        let after_loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(after_loops.len(), 3);
+        assert!(
+            after_loops
+                .iter()
+                .all(|l| l.closed && l.clean && (l.vertices.len() < n || l.vertices.len() == 32))
+        );
+        let edges = EdgeMap::build(&mesh).unwrap();
+        for (e, tris) in edges.edges() {
+            assert!(tris.len() <= 2, "non-manifold edge after split: {e:?}");
+        }
+    }
+
+    #[test]
+    fn partial_bridge_cross_loops_with_twist_subdivisions_and_uvs() {
+        // Two detached 2x1 strips in z = 0 facing +Z separated along Y, with UV channels.
+        let pos = vec![
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0,
+            0.0, 0.0, 3.0, 0.0, 1.0, 3.0, 0.0, 2.0, 3.0, 0.0, 0.0, 4.0, 0.0, 1.0, 4.0, 0.0, 2.0,
+            4.0, 0.0,
+        ];
+        let tris = vec![
+            [0, 1, 4],
+            [0, 4, 3],
+            [1, 2, 5],
+            [1, 5, 4],
+            [6, 7, 10],
+            [6, 10, 9],
+            [7, 8, 11],
+            [7, 11, 10],
+        ];
+        let mut mesh = mesh_of(&pos, &tris);
+        let uvs: Vec<f32> = (0..12)
+            .flat_map(|i| [pos[3 * i] * 0.5, pos[3 * i + 1] * 0.25])
+            .collect();
+        mesh.add_uvs(&uvs).unwrap();
+
+        let loops = boundary_loops(&mesh).unwrap();
+        assert_eq!(loops.len(), 2);
+        let find_idx =
+            |loop_verts: &[VertexId], v: VertexId| loop_verts.iter().position(|&x| x == v).unwrap();
+        let l0 = loops.iter().position(|l| l.vertices.contains(&4)).unwrap();
+        let l1 = 1 - l0;
+        let a_s = find_idx(&loops[l0].vertices, 5);
+        let a_e = find_idx(&loops[l0].vertices, 3);
+        let b_s_target = find_idx(&loops[l1].vertices, 6);
+        let b_e_target = find_idx(&loops[l1].vertices, 8);
+        let len1 = loops[l1].vertices.len();
+        // Shift raw range by -2 and cancel with twist_offset = +2.
+        let b_s_raw = (b_s_target + len1 - 2) % len1;
+        let b_e_raw = (b_e_target + len1 - 2) % len1;
+
+        let options = PartialBridgeOptions::builder(l0, (a_s, a_e), l1, (b_s_raw, b_e_raw))
+            .twist_offset(2)
+            .subdivisions(Some(2))
+            .build();
+        let (stats, _) = edit(&mut mesh, |tx| bridge_partial_arcs(tx, &options));
+        assert_eq!(stats.arc_a_vertices, 3);
+        assert_eq!(stats.arc_b_vertices, 3);
+        assert_eq!(stats.vertices_added, 5 * 2);
+        assert_eq!(stats.triangles_added, 4 * 5);
+        assert_eq!(stats.resulting_loops, 1);
+
+        let uv_after = mesh.uvs().unwrap();
+        for vi in 12..mesh.vertex_slots() {
+            let p = mesh.position(vi as VertexId).unwrap();
+            let u = uv_after[2 * vi];
+            let v = uv_after[2 * vi + 1];
+            assert!((u - p[0] * 0.5).abs() < 1e-5, "uv mismatch x: {u} vs {p:?}");
+            assert!(
+                (v - p[1] * 0.25).abs() < 1e-5,
+                "uv mismatch y: {v} vs {p:?}"
+            );
+        }
+        let edges = EdgeMap::build(&mesh).unwrap();
+        for (_e, tris) in edges.edges() {
+            assert!(tris.len() <= 2);
+        }
+    }
+
+    #[test]
+    fn partial_bridge_rejects_invalid_inputs_and_sweep_is_atomic() {
+        use crate::test_util::grid_without;
+        let hole_cells: Vec<(u32, u32)> =
+            (2..6).flat_map(|y| (2..6).map(move |x| (x, y))).collect();
+        let mut mesh = grid_without(8, &hole_cells);
+        let before = parts(&mesh);
+        let loops = boundary_loops(&mesh).unwrap();
+        let hole_idx = loops.iter().position(|l| l.vertices.len() == 16).unwrap();
+
+        let bad_cases = [
+            PartialBridgeOptions::builder(99, (0, 2), hole_idx, (8, 10)).build(),
+            PartialBridgeOptions::builder(hole_idx, (3, 3), hole_idx, (8, 10)).build(),
+            PartialBridgeOptions::builder(hole_idx, (0, 5), hole_idx, (4, 8)).build(),
+            PartialBridgeOptions::builder(hole_idx, (0, 2), hole_idx, (3, 5))
+                .subdivisions(Some(1))
+                .build(),
+        ];
+        for opts in &bad_cases {
+            let mut tx = mesh.begin_edit();
+            assert!(
+                matches!(
+                    bridge_partial_arcs(&mut tx, opts),
+                    Err(OpsError::InvalidInput(_))
+                ),
+                "expected InvalidInput for {opts:?}"
+            );
+            drop(tx);
+        }
+        assert_eq!(parts(&mesh), before);
+
+        let valid = PartialBridgeOptions::builder(hole_idx, (1, 3), hole_idx, (9, 11))
+            .subdivisions(Some(2))
+            .build();
+        let points = sweep(mesh, |tx| {
+            bridge_partial_arcs(tx, &valid)?;
+            Ok(())
+        });
+        assert!(points > 0);
     }
 }

@@ -126,6 +126,101 @@ pub(crate) fn factor_ordered(
             }
         }
     }
+    numeric_ldlt(n, col_starts, row_idx, vals, diag, order)
+}
+
+/// Factors a symmetric positive definite matrix `A` given as unique or
+/// duplicate triangle entries `(row, col, val)` (with each off-diagonal
+/// undirected pair supplied once, or duplicate entries summed), eliminating in
+/// `order` (`order[p]` is the original index at position `p`).
+///
+/// `None` when the matrix is not numerically positive definite (a zero,
+/// negative, or non-finite pivot).
+///
+/// # Errors
+/// [`OpsError::Store`] when memory runs out.
+pub(crate) fn factor_spd_ordered(
+    n: usize,
+    entries: &[(u32, u32, f64)],
+    order: &[u32],
+) -> Result<Option<Factor>> {
+    if n > u32::MAX as usize {
+        return Err(OpsError::Store(StoreError::OutOfMemory));
+    }
+    let mut inv = filled(n, 0u32)?;
+    for (p, &k) in order.iter().enumerate() {
+        inv[k as usize] = p as u32;
+    }
+    let mut diag = filled(n, 0.0f64)?;
+    let mut pairs: Vec<(u64, f64)> = Vec::new();
+    reserve(&mut pairs, entries.len())?;
+    for &(u, v, w) in entries {
+        let (p, q) = (inv[u as usize], inv[v as usize]);
+        if p == q {
+            diag[p as usize] += w;
+        } else {
+            pairs.push(((p.max(q) as u64) << 32 | p.min(q) as u64, w));
+        }
+    }
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut up_starts: Vec<u32> = Vec::new();
+    reserve(&mut up_starts, n + 1)?;
+    up_starts.push(0);
+    let mut up_rows: Vec<u32> = Vec::new();
+    let mut up_vals: Vec<f64> = Vec::new();
+    reserve(&mut up_rows, pairs.len())?;
+    reserve(&mut up_vals, pairs.len())?;
+    let mut cur_col = 0usize;
+    let mut i = 0usize;
+    while i < pairs.len() {
+        let key = pairs[i].0;
+        let col = (key >> 32) as usize;
+        let row = key as u32;
+        let mut sum = pairs[i].1;
+        i += 1;
+        while i < pairs.len() && pairs[i].0 == key {
+            sum += pairs[i].1;
+            i += 1;
+        }
+        while cur_col < col {
+            up_starts.push(up_rows.len() as u32);
+            cur_col += 1;
+        }
+        up_rows.push(row);
+        up_vals.push(sum);
+    }
+    while cur_col < n {
+        up_starts.push(up_rows.len() as u32);
+        cur_col += 1;
+    }
+    let parent = etree(n, &up_starts, &up_rows)?;
+    let (col_starts, row_idx) = patterns(n, &up_starts, &up_rows, &parent)?;
+    let mut vals = filled(row_idx.len(), 0.0f64)?;
+    for k in 0..n {
+        let k_u32 = k as u32;
+        for t in up_starts[k] as usize..up_starts[k + 1] as usize {
+            let p = up_rows[t] as usize;
+            let col = col_starts[p] as usize..col_starts[p + 1] as usize;
+            let at = row_idx[col.clone()]
+                .binary_search(&k_u32)
+                .expect("A entry is in L")
+                + col.start;
+            vals[at] += up_vals[t];
+        }
+    }
+    numeric_ldlt(n, col_starts, row_idx, vals, diag, order)
+}
+
+/// Shared left-looking numeric LDLᵀ over the symbolic pattern `(col_starts, row_idx)`.
+fn numeric_ldlt(
+    n: usize,
+    col_starts: Vec<u32>,
+    row_idx: Vec<u32>,
+    mut vals: Vec<f64>,
+    mut diag: Vec<f64>,
+    order: &[u32],
+) -> Result<Option<Factor>> {
+    let total = row_idx.len();
     // The row lists: for each row, the (column, value slot) pairs above it,
     // in column order.
     let mut row_counts = filled(n, 0u32)?;
@@ -203,6 +298,173 @@ pub(crate) fn factor_ordered(
         diag,
         order: kept,
     }))
+}
+
+/// Result of a Preconditioned Conjugate Gradient solve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PcgResult {
+    pub(crate) converged: bool,
+    pub(crate) iterations: usize,
+    pub(crate) residual: f64,
+}
+
+/// Borrowed Compressed Sparse Row (CSR) view of a square symmetric matrix.
+pub(crate) struct SymCsr<'a> {
+    pub(crate) n: usize,
+    pub(crate) row_starts: &'a [u32],
+    pub(crate) cols: &'a [u32],
+    pub(crate) vals: &'a [f64],
+}
+
+/// Solves a symmetric positive definite CSR system `A x = rhs` via
+/// Jacobi-preconditioned Conjugate Gradient.
+///
+/// # Errors
+/// [`OpsError::Store`] when memory runs out.
+pub(crate) fn solve_pcg(
+    csr: &SymCsr<'_>,
+    rhs: &[f64],
+    x: &mut [f64],
+    tol: f64,
+    max_iters: usize,
+) -> Result<PcgResult> {
+    let SymCsr {
+        n,
+        row_starts,
+        cols,
+        vals,
+    } = *csr;
+    if n == 0 {
+        return Ok(PcgResult {
+            converged: true,
+            iterations: 0,
+            residual: 0.0,
+        });
+    }
+    let mut inv_diag = filled(n, 0.0f64)?;
+    for i in 0..n {
+        let mut diag = 0.0;
+        for t in row_starts[i] as usize..row_starts[i + 1] as usize {
+            if cols[t] as usize == i {
+                diag += vals[t];
+            }
+        }
+        if !(diag.is_finite() && diag > 0.0) {
+            return Ok(PcgResult {
+                converged: false,
+                iterations: 0,
+                residual: f64::INFINITY,
+            });
+        }
+        inv_diag[i] = 1.0 / diag;
+    }
+
+    let mut r = filled(n, 0.0f64)?;
+    let mut z = filled(n, 0.0f64)?;
+    let mut p = filled(n, 0.0f64)?;
+    let mut ap = filled(n, 0.0f64)?;
+
+    let rhs_norm = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mut r_norm2 = 0.0;
+    for i in 0..n {
+        let mut ax = 0.0;
+        for t in row_starts[i] as usize..row_starts[i + 1] as usize {
+            ax += vals[t] * x[cols[t] as usize];
+        }
+        r[i] = rhs[i] - ax;
+        r_norm2 += r[i] * r[i];
+    }
+    let ref_norm = if rhs_norm > 0.0 {
+        rhs_norm
+    } else {
+        r_norm2.sqrt()
+    };
+    if !r_norm2.is_finite() {
+        return Ok(PcgResult {
+            converged: false,
+            iterations: 0,
+            residual: f64::INFINITY,
+        });
+    }
+    if ref_norm == 0.0 || r_norm2.sqrt() <= tol * ref_norm {
+        return Ok(PcgResult {
+            converged: true,
+            iterations: 0,
+            residual: if ref_norm > 0.0 {
+                r_norm2.sqrt() / ref_norm
+            } else {
+                0.0
+            },
+        });
+    }
+
+    let mut rz = 0.0;
+    for i in 0..n {
+        z[i] = inv_diag[i] * r[i];
+        p[i] = z[i];
+        rz += r[i] * z[i];
+    }
+
+    let mut iterations = 0usize;
+    let mut converged = false;
+    let mut rel_res = r_norm2.sqrt() / ref_norm;
+
+    for iter in 0..max_iters {
+        iterations = iter + 1;
+        let mut pap = 0.0;
+        for i in 0..n {
+            let mut sum = 0.0;
+            for t in row_starts[i] as usize..row_starts[i + 1] as usize {
+                sum += vals[t] * p[cols[t] as usize];
+            }
+            ap[i] = sum;
+            pap += p[i] * sum;
+        }
+        if !(pap.is_finite() && pap > 0.0) {
+            break;
+        }
+        let alpha = rz / pap;
+        if !alpha.is_finite() {
+            break;
+        }
+        r_norm2 = 0.0;
+        for i in 0..n {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * ap[i];
+            r_norm2 += r[i] * r[i];
+        }
+        if !r_norm2.is_finite() {
+            return Ok(PcgResult {
+                converged: false,
+                iterations,
+                residual: f64::INFINITY,
+            });
+        }
+        rel_res = r_norm2.sqrt() / ref_norm;
+        if rel_res <= tol {
+            converged = true;
+            break;
+        }
+        let mut rz_next = 0.0;
+        for i in 0..n {
+            z[i] = inv_diag[i] * r[i];
+            rz_next += r[i] * z[i];
+        }
+        if !(rz_next.is_finite() && rz != 0.0) {
+            break;
+        }
+        let beta = rz_next / rz;
+        for i in 0..n {
+            p[i] = z[i] + beta * p[i];
+        }
+        rz = rz_next;
+    }
+
+    Ok(PcgResult {
+        converged,
+        iterations,
+        residual: rel_res,
+    })
 }
 
 /// The elimination tree of the permuted `BᵀB`, from its strict upper
@@ -600,5 +862,88 @@ mod tests {
         // vertices are the middle columns' separator.
         let tail: Vec<u32> = order[order.len() - 8..].to_vec();
         assert!(tail.iter().all(|&v| v % n == 3 || v % n == 4));
+    }
+
+    #[test]
+    fn factor_spd_ordered_solves_merged_triplets_and_rejects_singular() {
+        // 3x3 SPD system with duplicate off-diagonal and diagonal entries:
+        // [4 -1  0]   [1]   [2]
+        // [-1 4 -1] * [2] = [4]
+        // [0 -1  4]   [3]   [10]
+        let entries = [
+            (0, 0, 2.5),
+            (0, 0, 1.5),
+            (0, 1, -0.4),
+            (1, 0, -0.6),
+            (1, 1, 4.0),
+            (2, 1, -1.0),
+            (2, 2, 4.0),
+        ];
+        let order = [2, 0, 1];
+        let factor = factor_spd_ordered(3, &entries, &order)
+            .expect("ok")
+            .expect("spd");
+        let rhs = [2.0, 4.0, 10.0];
+        let mut x = [0.0; 3];
+        factor.solve(&rhs, &mut x).expect("solve ok");
+        assert!((x[0] - 1.0).abs() < 1e-12);
+        assert!((x[1] - 2.0).abs() < 1e-12);
+        assert!((x[2] - 3.0).abs() < 1e-12);
+
+        // Singular / indefinite matrix returns Ok(None).
+        let singular = [(0, 0, 1.0), (1, 1, 1.0), (0, 1, 1.0)];
+        assert!(
+            factor_spd_ordered(2, &singular, &[0, 1])
+                .expect("ok")
+                .is_none()
+        );
+
+        // Empty system succeeds cleanly.
+        let empty = factor_spd_ordered(0, &[], &[])
+            .expect("ok")
+            .expect("empty spd");
+        let mut empty_x = [];
+        empty.solve(&[], &mut empty_x).expect("empty solve ok");
+    }
+
+    #[test]
+    fn solve_pcg_converges_and_handles_edge_cases() {
+        // 4x4 1D Laplacian with Dirichlet endpoints: diag=2, offdiag=-1.
+        let row_starts = [0u32, 2, 5, 8, 10];
+        let cols = [0u32, 1, 0, 1, 2, 1, 2, 3, 2, 3];
+        let vals = [2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0];
+        // True x = [1, 2, 3, 4] -> A x = [0, 0, 0, 5]
+        let rhs = [0.0, 0.0, 0.0, 5.0];
+        let csr = SymCsr {
+            n: 4,
+            row_starts: &row_starts,
+            cols: &cols,
+            vals: &vals,
+        };
+        let mut x = [0.0; 4];
+        let res = solve_pcg(&csr, &rhs, &mut x, 1e-12, 64).expect("ok");
+        assert!(res.converged);
+        assert!(res.residual < 1e-11);
+        for (i, &xi) in x.iter().enumerate() {
+            assert!((xi - (i + 1) as f64).abs() < 1e-10, "x[{i}] = {xi}");
+        }
+
+        // Zero RHS with zero initial guess converges in 0 iterations.
+        let mut zero_x = [0.0; 4];
+        let zres = solve_pcg(&csr, &[0.0; 4], &mut zero_x, 1e-12, 16).expect("ok");
+        assert!(zres.converged);
+        assert_eq!(zres.iterations, 0);
+
+        // Zero diagonal stops cleanly with converged = false.
+        let bad_vals = [0.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0];
+        let bad_csr = SymCsr {
+            n: 4,
+            row_starts: &row_starts,
+            cols: &cols,
+            vals: &bad_vals,
+        };
+        let mut bx = [0.0; 4];
+        let bres = solve_pcg(&bad_csr, &rhs, &mut bx, 1e-12, 16).expect("ok");
+        assert!(!bres.converged);
     }
 }
