@@ -180,7 +180,7 @@ pub fn offset_with_bvh(
     }
 }
 
-fn build_work_bvh(work: &Mesh) -> Result<Bvh> {
+pub(crate) fn build_work_bvh(work: &Mesh) -> Result<Bvh> {
     Bvh::build(work, &BuildOptions::default()).map_err(|e| match e {
         BvhError::OutOfMemory => OpsError::Store(StoreError::OutOfMemory),
         _ => OpsError::InvalidInput("volumetric offset BVH failed to build"),
@@ -188,7 +188,7 @@ fn build_work_bvh(work: &Mesh) -> Result<Bvh> {
 }
 
 /// Returns `(closed_and_consistently_oriented, signed_volume)` for compact `work`.
-fn classify_solid(work: &Mesh) -> Result<(bool, f64)> {
+pub(crate) fn classify_solid(work: &Mesh) -> Result<(bool, f64)> {
     let edges = EdgeMap::build(work)?;
     let mut closed_oriented = false;
     let mut any_edge = false;
@@ -229,7 +229,7 @@ fn classify_solid(work: &Mesh) -> Result<(bool, f64)> {
     Ok((closed_oriented, signed_volume))
 }
 
-fn clean_iso_mesh(iso: IsoMesh) -> Result<(IsoMesh, DegenerateReport)> {
+pub(crate) fn clean_iso_mesh(iso: IsoMesh) -> Result<(IsoMesh, DegenerateReport)> {
     if iso.triangles.is_empty() {
         return Ok((
             IsoMesh::default(),
@@ -280,7 +280,7 @@ fn clean_iso_mesh(iso: IsoMesh) -> Result<(IsoMesh, DegenerateReport)> {
     ))
 }
 
-fn choose_grid_spec(
+pub(crate) fn choose_grid_spec(
     min: [f32; 3],
     max: [f32; 3],
     diag: f64,
@@ -341,38 +341,20 @@ fn choose_grid_spec(
     )?)
 }
 
-fn offset_volumetric(
-    tx: &mut Transaction,
-    bvh: Option<&Bvh>,
-    options: &OffsetOptions,
-    voxel_size: Option<f32>,
-    use_bvh: bool,
-) -> Result<OffsetReport> {
-    if options.max_voxels < 64 {
-        return Err(OpsError::InvalidInput("max_voxels must be at least 64"));
-    }
-    if let Some(h) = voxel_size
-        && (!h.is_finite() || h <= 0.0)
-    {
-        return Err(OpsError::InvalidInput(
-            "voxel_size must be positive and finite",
-        ));
-    }
+pub(crate) struct CompactWorkMesh {
+    pub(crate) mesh: Mesh,
+    pub(crate) min: [f32; 3],
+    pub(crate) max: [f32; 3],
+    pub(crate) had_uvs: bool,
+    pub(crate) had_skipped_tri: bool,
+    pub(crate) has_positive_area: bool,
+    pub(crate) vertex_to_work: Vec<u32>,
+    pub(crate) weld_roots: Option<Vec<VertexId>>,
+}
 
-    let mesh = tx.mesh();
-    if mesh.triangle_count() == 0 {
-        return Ok(OffsetReport::default());
-    }
+/// Builds a compact UV-less working mesh, welding exact `0.0`-coincident UV seams when UVs exist.
+pub(crate) fn compact_work_mesh(mesh: &Mesh) -> Result<CompactWorkMesh> {
     let positions = mesh.positions();
-    for (v, p) in positions.iter().enumerate() {
-        if mesh.is_vertex_alive(v as VertexId) && !p.iter().all(|c| c.is_finite()) {
-            return Err(OpsError::InvalidInput(
-                "offset needs finite vertex positions",
-            ));
-        }
-    }
-
-    // Build compact UV-less working mesh, welding exact 0.0-coincident UV seams when UVs exist.
     let had_uvs = mesh.uvs().is_some();
     let roots = if had_uvs {
         Some(crate::weld::weld_roots(mesh, 0.0)?)
@@ -438,19 +420,68 @@ fn offset_volumetric(
         push(&mut work_tris, mapped)?;
     }
 
-    if !has_positive_area {
-        return Err(OpsError::InvalidInput(
-            "volumetric offset requires at least one non-degenerate triangle",
-        ));
-    }
-
     let mut work = Mesh::new();
-    {
+    if has_positive_area {
         let mut wtx = work.begin_edit();
         wtx.add_vertices(&work_positions)?;
         wtx.add_triangles(&work_tris)?;
         wtx.commit()?;
     }
+
+    Ok(CompactWorkMesh {
+        mesh: work,
+        min,
+        max,
+        had_uvs,
+        had_skipped_tri,
+        has_positive_area,
+        vertex_to_work: remap,
+        weld_roots: roots,
+    })
+}
+
+fn offset_volumetric(
+    tx: &mut Transaction,
+    bvh: Option<&Bvh>,
+    options: &OffsetOptions,
+    voxel_size: Option<f32>,
+    use_bvh: bool,
+) -> Result<OffsetReport> {
+    if options.max_voxels < 64 {
+        return Err(OpsError::InvalidInput("max_voxels must be at least 64"));
+    }
+    if let Some(h) = voxel_size
+        && (!h.is_finite() || h <= 0.0)
+    {
+        return Err(OpsError::InvalidInput(
+            "voxel_size must be positive and finite",
+        ));
+    }
+
+    let mesh = tx.mesh();
+    if mesh.triangle_count() == 0 {
+        return Ok(OffsetReport::default());
+    }
+    let positions = mesh.positions();
+    for (v, p) in positions.iter().enumerate() {
+        if mesh.is_vertex_alive(v as VertexId) && !p.iter().all(|c| c.is_finite()) {
+            return Err(OpsError::InvalidInput(
+                "offset needs finite vertex positions",
+            ));
+        }
+    }
+
+    let compact = compact_work_mesh(mesh)?;
+    if !compact.has_positive_area {
+        return Err(OpsError::InvalidInput(
+            "volumetric offset requires at least one non-degenerate triangle",
+        ));
+    }
+    let mut work = compact.mesh;
+    let min = compact.min;
+    let max = compact.max;
+    let had_uvs = compact.had_uvs;
+    let had_skipped_tri = compact.had_skipped_tri;
 
     let (closed_oriented, signed_volume) = classify_solid(&work)?;
     if closed_oriented {

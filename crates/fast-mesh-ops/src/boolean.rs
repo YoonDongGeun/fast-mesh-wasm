@@ -26,7 +26,9 @@ mod arrangement;
 mod batch;
 mod cdt;
 mod classify;
+pub mod hollow;
 mod perturbation;
+pub mod place_mesh;
 mod voxel;
 mod winding;
 
@@ -43,6 +45,14 @@ pub use crate::offset::{
     ShellOptionsBuilder, ShellReport, offset, offset_with_bvh, shell,
 };
 pub use batch::{CsgNode, boolean_batch};
+pub use hollow::{
+    DrainHoleOptions, DrainHoleReport, DrainHoleSpec, HollowBackend, HollowOptions, HollowReport,
+    hollow_mesh, punch_drain_hole, punch_drain_holes,
+};
+pub use place_mesh::{
+    PlaceMeshParams, PlaceMeshReport, PlaceMode, PlaceTransform, PlaceUpAxis,
+    align_up_axis_rotation, compute_place_transform, place_mesh,
+};
 
 /// Backend strategy for CSG boolean evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -463,7 +473,7 @@ fn cap_tx_triangles(tx: &mut Transaction<'_>, cap: u32) -> Result<()> {
     Ok(())
 }
 
-fn replace_tx_with_mesh(tx: &mut Transaction<'_>, src: &Mesh) -> Result<()> {
+pub(super) fn replace_tx_with_mesh(tx: &mut Transaction<'_>, src: &Mesh) -> Result<()> {
     let mut drop_tris: Vec<TriangleId> = Vec::new();
     let mut drop_verts: Vec<VertexId> = Vec::new();
     {
@@ -566,7 +576,7 @@ pub(super) fn check_input(mesh: &Mesh, bvh: &Bvh) -> Result<()> {
 }
 
 /// Copies a mesh slot-for-slot (positions, triangles, dead slots, and UVs) with fallible allocations.
-fn clone_mesh_fallible(src: &Mesh) -> Result<Mesh> {
+pub(super) fn clone_mesh_fallible(src: &Mesh) -> Result<Mesh> {
     let mut positions: Vec<f32> = Vec::new();
     reserve(&mut positions, src.vertex_slots() * 3)?;
     for p in src.positions() {
@@ -1747,6 +1757,8 @@ mod tests {
             ("perturbation.rs", include_str!("boolean/perturbation.rs")),
             ("voxel.rs", include_str!("boolean/voxel.rs")),
             ("batch.rs", include_str!("boolean/batch.rs")),
+            ("hollow.rs", include_str!("boolean/hollow.rs")),
+            ("place_mesh.rs", include_str!("boolean/place_mesh.rs")),
         ] {
             let prod = src.split("#[cfg(test)]").next().unwrap();
             for forbidden in [
