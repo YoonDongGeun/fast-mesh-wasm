@@ -836,6 +836,8 @@ pub struct Scene {
     /// back cleared, so queries after the first do not allocate.
     pub(crate) order_ray: Vec<RayCandidate>,
     pub(crate) order_closest: Vec<ClosestCandidate>,
+    /// Per-pair and default collision rules and elastic rest states.
+    pub(crate) collision: crate::contacts::CollisionState,
     /// Test-only count of section entry recomputes.
     #[cfg(test)]
     pub(crate) section_recomputes: usize,
@@ -870,6 +872,7 @@ impl Scene {
             field_unit: None,
             order_ray: Vec::new(),
             order_closest: Vec::new(),
+            collision: crate::contacts::CollisionState::default(),
             #[cfg(test)]
             section_recomputes: 0,
             #[cfg(test)]
@@ -987,6 +990,7 @@ impl Scene {
         }
         let kept_on = self.drop_fields_of(id);
         self.drop_sections_of(id);
+        self.collision.drop_mesh(id);
         let mut entry = self.entries.remove(id).ok_or(SceneError::UnknownMesh)?;
         self.history.forget(id, Some(&mut entry.mesh));
         for (s, r) in self.subscribers.iter_mut().zip(&mut entry.reports) {
@@ -1614,6 +1618,7 @@ impl Scene {
         entry.stroke.invalidate_on_mesh(&mut entry.mesh);
         // The slots of dropped patches no longer exist: nothing to release.
         self.history.forget(id, None);
+        self.collision.drop_rest_state(id);
         // Every slot id changed; the BVH update rebuilds from scratch because
         // the mesh's epoch changed, whatever the pending changes say.
         entry.pending = Some(ChangeSet::default());

@@ -237,6 +237,11 @@ impl History {
         }
     }
 
+    /// True if an interactive step is currently open.
+    pub(crate) fn is_open(&self) -> bool {
+        self.depth > 0
+    }
+
     /// True if `undo` would undo something (including the open step).
     pub(crate) fn can_undo(&self) -> bool {
         !self.undo.is_empty() || !self.open.changes.is_empty()
