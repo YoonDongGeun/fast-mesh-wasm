@@ -7,6 +7,7 @@
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -215,6 +216,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => triggerClick('[data-action="demo-meshes"]')}>
                 Load Sample Stage
+              </button>
+              <button
+                type="button"
+                data-action="create-primitive"
+                title="Create a box, cylinder, sphere, torus or other shape"
+                onClick={() => createDialogOf(app).open()}
+              >
+                Create Shape…
               </button>
               <button type="button" onClick={onResetView}>
                 Reset View

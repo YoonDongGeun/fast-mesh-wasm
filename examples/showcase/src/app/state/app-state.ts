@@ -582,6 +582,16 @@ export class AppState {
     });
   }
 
+  /**
+   * Lists a mesh its caller added to the store and fills itself (the Create
+   * dialog adds an empty mesh and its geometry as one undoable edit), with
+   * the size it will have: the triangle count, centre (its origin) and half
+   * diagonal.
+   */
+  listMesh(mesh: MeshHandle, meta: Pick<Item, "name" | "triangles" | "center" | "radius">): Item {
+    return this.#registerItem(mesh, { ...meta, volumeId: null, preset: null, importScale: NO_IMPORT_SCALE });
+  }
+
   #registerItem(
     mesh: MeshHandle,
     meta: Pick<Item, "name" | "triangles" | "center" | "radius" | "volumeId" | "preset" | "importScale">,

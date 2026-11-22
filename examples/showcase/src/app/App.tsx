@@ -10,6 +10,7 @@ import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
+import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -195,6 +196,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         {grouped ? <HoverTip app={app} scene={engine.scene} items={items} members={members} /> : null}
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
+        <CreatePrimitiveDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,

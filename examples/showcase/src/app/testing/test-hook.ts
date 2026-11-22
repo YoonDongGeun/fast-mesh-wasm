@@ -18,6 +18,7 @@ import { view } from "../../viewport/ux/view";
 import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays";
 import { hasWireOverlay } from "../../features/view/ui/wire";
 import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
+import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 
 export function installTestHook(
   store: SceneStore,
@@ -51,6 +52,11 @@ export function installTestHook(
         drawn: (view.bindings.get(i.mesh)?.object.geometry.getIndex()?.count ?? 0) > 0,
         visible: view.bindings.get(i.mesh)?.object.visible ?? false,
       })),
+    /** The Create dialog: whether it is open, its shape, and the preview's triangles (0 with none). */
+    createDialog: () => {
+      const d = createDialogOf(app).getSnapshot();
+      return { open: d.open, kind: d.kind, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),
     /** Draws the mesh's list picture again now, as an edit would after its quiet time. */

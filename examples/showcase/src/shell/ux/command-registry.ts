@@ -5,6 +5,7 @@
 // object.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
+import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
 import { triggerClick } from "./panel-triggers";
@@ -141,6 +142,8 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     });
   }
+
+  cmds.push(...createPrimitiveCommands(app));
 
   cmds.push(
     {

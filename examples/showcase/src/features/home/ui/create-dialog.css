@@ -1,0 +1,77 @@
+/* The Create dialog (#259): a panel floating over the viewport's top-left
+   corner, no scrim, so the live preview stays visible. */
+.create-dialog {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 15;
+  width: min(340px, calc(100% - 16px));
+  max-height: calc(100% - 48px);
+  overflow: auto;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--toolbox-bg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+}
+.create-dialog .panel-head {
+  margin-bottom: 8px;
+}
+.create-shapes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.create-fields,
+.create-place {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.create-dialog .field {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.create-dialog input[type="number"],
+.create-dialog input[type="text"] {
+  width: 84px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.create-dialog .create-name input {
+  width: 180px;
+}
+.create-vec {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+.create-vec > span {
+  flex: 1;
+}
+.create-vec input[type="number"] {
+  width: 64px;
+}
+.create-problem {
+  color: var(--error);
+}
+.create-dialog .op-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+@media (max-width: 600px) {
+  .create-dialog {
+    right: 8px;
+    width: auto;
+  }
+}

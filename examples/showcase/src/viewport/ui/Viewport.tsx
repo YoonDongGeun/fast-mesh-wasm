@@ -24,6 +24,7 @@ import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
 import { evaluateOverlayColor } from "../../engine/workbench-ops";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
+import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
@@ -211,6 +212,7 @@ export function Viewport(props: {
       <MetrologyOverlaysLayer app={app} store={store} />
       <HollowPlaceToolsLayer app={app} store={store} />
       <PlacementPicksLayer app={app} store={store} />
+      <CreatePreviewLayer app={app} />
     </Canvas>
   );
 }
