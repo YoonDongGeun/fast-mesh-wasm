@@ -23,7 +23,8 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import * as THREE from "three";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { InspectPanel, exportContourSlicesDxf } from "../src/features/inspect/ui/InspectPanel";
+import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
+import { exportContourSlicesDxf } from "../src/features/inspect/ux/use-contour-slices";
 import {
   PointsPanel,
   computePointCloudBounds,

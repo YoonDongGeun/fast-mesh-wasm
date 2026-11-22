@@ -1,7 +1,16 @@
 // Inspection math: the ruler, vertex snapping, section dragging and the
-// clip box. Pure (no three, no DOM), so vitest covers it; the viewport
-// layers and the inspect panel wire it up.
+// clip box, plus the panel's tool table. Pure (no three, no DOM), so vitest
+// covers it; the viewport layers and the inspect panel wire it up.
+import type { InspectTool } from "../../../app/state/app-state";
 import type { Vec3 } from "../../../io/mesh-data";
+
+/** The inspect panel's tool buttons: the tool each arms, its label and its tooltip. */
+export const INSPECT_TOOLS: { tool: InspectTool; label: string; title: string }[] = [
+  { tool: "ruler", label: "Ruler", title: "Click two vertices to measure their distance (snaps to vertices)" },
+  { tool: "query", label: "Query", title: "Click a vertex to read its coloring value" },
+  { tool: "section", label: "Section", title: "Cut the meshes with a draggable plane" },
+  { tool: "clip", label: "Clip box", title: "Keep an axis-aligned world-space box, clip the rest away" },
+];
 
 /** The distance between two world points, for the ruler. */
 export function rulerDistance(a: readonly [number, number, number], b: readonly [number, number, number]): number {

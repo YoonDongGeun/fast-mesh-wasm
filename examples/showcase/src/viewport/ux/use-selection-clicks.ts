@@ -7,7 +7,7 @@ import type { MeshHandle, Scene } from "fast-mesh-wasm";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { type RefObject, useCallback, useEffect, useRef } from "react";
 import type { AppState, InspectTool } from "../../app/state/app-state";
-import { pickVertex } from "../../features/inspect/ui/InspectLayers";
+import { pickVertex } from "../../features/inspect/ux/pick-vertex";
 import { selectMesh } from "../../features/select/ux/selection";
 import type { SculptBrush } from "../../features/sculpt/ux/sculpt";
 import { localHitPoint } from "./surface-raycast";

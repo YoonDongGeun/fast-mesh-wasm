@@ -4,39 +4,32 @@
 // thickness/curvature/distance colorings), a draggable section plane
 // (wired to `setSectionPlane` through the store) and an axis-aligned clip
 // box for looking inside meshes. Scalar mesh numbers reuse `measure`.
-import type {
-  ContourSlice,
-  FieldHandle,
-  FittedPrimitive,
-  FittedPrimitiveReport,
-  MeshHandle,
-  PrimitiveKindInput,
-  Scene,
-  Vec3,
-} from "fast-mesh-wasm";
+import type { MeshHandle, PrimitiveKindInput, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useRef, useState } from "react";
-import { type ContourLike, contoursToDxf, downloadReportText, reportFileName } from "../../../io/report";
-import {
-  type AppState,
-  type InspectTool,
-  type Item,
-  type SurfaceColormap,
-  type SurfaceFieldMode,
-  type SurfaceFieldState,
-  useApp,
-} from "../../../app/state/app-state";
+import { type AppState, type Item, type SurfaceColormap, useApp } from "../../../app/state/app-state";
 import { type Wave6MetrologyState } from "../../../app/state/wave6-state";
-import { ensureWave6Wasm } from "../../../engine/wave6-wasm-lazy";
+import { formatCoord, INSPECT_TOOLS, rulerDistance } from "../ux/inspect-tools";
 import {
-  applySurfaceField,
-  clearAppliedSurfaceField,
-  isWorkerScene,
-} from "../../../engine/workbench-ops";
-import { formatCoord, readMeasure, rulerDistance } from "../ux/inspect-tools";
-import { inspect } from "../../../app/state/readouts";
+  AXES,
+  type PanelSection,
+  clipBoxWithEnd,
+  clipSliderBounds,
+  fitWorldBox,
+  sectionActions,
+  sectionReadout,
+} from "../ux/section-clip";
+import { type ContourPlaneAxis, useContourSlices } from "../ux/use-contour-slices";
+import { usePublishInspectTools, useQueryReadout } from "../ux/use-inspect-readouts";
+import {
+  DATUM_AXIS_OPTIONS,
+  type DatumAxisKey,
+  PRIMITIVE_KINDS,
+  summarizePrimitiveGeometry,
+  usePrimitiveFit,
+} from "../ux/use-primitive-fit";
+import { COLORMAPS, SURFACE_FIELD_MODES, useSurfaceField } from "../ux/use-surface-field";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "../../../shared/ux/units";
 
@@ -48,21 +41,6 @@ const INITIAL_METROLOGY: Wave6MetrologyState = {
   pointCloud: null,
   showPointCloudOverlay: true,
   pointCloudReport: null,
-};
-
-const TOOLS: { tool: InspectTool; label: string; title: string }[] = [
-  { tool: "ruler", label: "Ruler", title: "Click two vertices to measure their distance (snaps to vertices)" },
-  { tool: "query", label: "Query", title: "Click a vertex to read its coloring value" },
-  { tool: "section", label: "Section", title: "Cut the meshes with a draggable plane" },
-  { tool: "clip", label: "Clip box", title: "Keep an axis-aligned world-space box, clip the rest away" },
-];
-
-type Axis = "x" | "y" | "z";
-const AXES: Axis[] = ["x", "y", "z"];
-const AXIS_NORMAL: Record<Axis, [number, number, number]> = {
-  x: [1, 0, 0],
-  y: [0, 1, 0],
-  z: [0, 0, 1],
 };
 
 export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene }) {
@@ -82,76 +60,14 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
 
   const distance = ruler !== null && ruler.b !== null ? rulerDistance(ruler.a, ruler.b) : null;
 
-  // The query's coloring value (whatever the mesh is colored by, including client-side surface fields)
-  // and the mesh's scalars, refreshed per hit. A mesh without a coloring has none.
-  const [queryValue, setQueryValue] = useState<number | null>(null);
-  const [queryMeasure, setQueryMeasure] = useState<{ area: number; volume: number | null } | null>(null);
-  useEffect(() => {
-    if (query === null) {
-      setQueryValue(null);
-      setQueryMeasure(null);
-      return;
-    }
-    let alive = true;
-    if (overlayValues !== null && overlayValues.mesh === query.mesh) {
-      const val = overlayValues.values[query.slot];
-      setQueryValue(val !== undefined && Number.isFinite(val) ? val : null);
-    } else {
-      store
-        .fetchColoringValues(query.mesh)
-        .then((values) => {
-          if (alive) {
-            setQueryValue(values === null ? null : (values[query.slot] ?? null));
-          }
-        })
-        .catch(() => {
-          if (alive) {
-            setQueryValue(null);
-          }
-        });
-    }
-    void readMeasure(scene, query.mesh).then((m) => {
-      if (alive) {
-        setQueryMeasure(m);
-      }
-    });
-    return () => {
-      alive = false;
-    };
-  }, [store, scene, query, overlayValues]);
-
-  // The test hook's view of the tools (names, not handles).
-  useEffect(() => {
-    const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? null;
-    inspect.tools.tool = tool;
-    inspect.tools.ruler =
-      ruler === null
-        ? { a: [0, 0, 0], b: null, distance: null }
-        : { a: [...ruler.a], b: ruler.b === null ? null : [...ruler.b], distance };
-    inspect.tools.query =
-      query === null
-        ? null
-        : {
-            mesh: nameOf(query.mesh) ?? "?",
-            slot: query.slot,
-            point: [...query.point],
-            value: queryValue,
-          };
-    inspect.tools.section =
-      section === null
-        ? null
-        : {
-            plane: { origin: [...section.plane.origin], normal: [...section.plane.normal] },
-            meshes: items.length,
-          };
-    inspect.tools.clip = clip === null ? null : { min: [...clip.min], max: [...clip.max] };
-  });
+  const { queryValue, queryMeasure } = useQueryReadout(store, scene, query, overlayValues);
+  usePublishInspectTools({ items, tool, ruler, distance, query, queryValue, section, clip });
 
   return (
     <section className="panel" aria-label="Inspect">
       <h2>Inspect</h2>
       <div className="modes" role="group" aria-label="Inspection tool">
-        {TOOLS.map((t) => (
+        {INSPECT_TOOLS.map((t) => (
           <button
             key={t.tool}
             type="button"
@@ -181,21 +97,6 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
   );
 }
 
-const SURFACE_FIELD_MODES: readonly { id: SurfaceFieldMode; label: string; title: string }[] = [
-  { id: "none", label: "Off", title: "Turn off surface field analysis" },
-  { id: "distance", label: "Distance", title: "Contact distance field to another mesh" },
-  { id: "thickness", label: "Thickness", title: "Wall thickness to opposite surface" },
-  { id: "meanCurvature", label: "Mean κ", title: "Signed mean curvature (addCurvatureField)" },
-  { id: "gaussianCurvature", label: "Gauss κ", title: "Discrete Gaussian curvature (angle defect / area)" },
-];
-
-const COLORMAPS: readonly { id: SurfaceColormap; label: string; gradient: string }[] = [
-  { id: "turbo", label: "Turbo", gradient: "linear-gradient(90deg,#30123b,#287ced,#2ed673,#f9b724,#7a0403)" },
-  { id: "viridis", label: "Viridis", gradient: "linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725)" },
-  { id: "coolwarm", label: "Coolwarm", gradient: "linear-gradient(90deg,#3b4cc0,#dddddd,#b40426)" },
-  { id: "grayscale", label: "Grayscale", gradient: "linear-gradient(90deg,#000000,#ffffff)" },
-];
-
 function SurfaceFieldControls(props: {
   app: AppState;
   items: readonly Item[];
@@ -203,86 +104,8 @@ function SurfaceFieldControls(props: {
   unit: LengthUnit;
 }) {
   const { app, items, selection, unit } = props;
-  const store = useScene();
-  const sf = useApp(app, (s) => s.surfaceField);
-  const overlayValues = useApp(app, (s) => s.surfaceFieldValues);
-
-  const activeFieldRef = useRef<{ mesh: MeshHandle | null; field: FieldHandle | null }>({ mesh: null, field: null });
-  const [summary, setSummary] = useState<{ min: number; max: number; mean: number; count: number } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const inspectedMesh =
-    (sf.mesh !== null && items.some((i) => i.mesh === sf.mesh) ? sf.mesh : null) ??
-    (selection !== null && items.some((i) => i.mesh === selection) ? selection : null) ??
-    items[0]?.mesh ??
-    null;
-  const targetMesh =
-    (sf.target !== null && items.some((i) => i.mesh === sf.target) && sf.target !== inspectedMesh ? sf.target : null) ??
-    items.find((i) => i.mesh !== inspectedMesh)?.mesh ??
-    null;
-
-  const computeAndApply = async (nextState: SurfaceFieldState, autoRange: boolean) => {
-    clearAppliedSurfaceField(store, app, activeFieldRef.current);
-    activeFieldRef.current = { mesh: null, field: null };
-    setError(null);
-    if (nextState.mode === "none" || nextState.mesh === null) {
-      setSummary(null);
-      return;
-    }
-    setBusy(true);
-    try {
-      const applied = await applySurfaceField({ store, app, state: nextState, autoRange });
-      activeFieldRef.current = { mesh: applied.mesh, field: applied.field };
-      setSummary(applied.summary);
-    } catch (e) {
-      setSummary(null);
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const switchMode = (mode: SurfaceFieldMode) => {
-    const nextState: SurfaceFieldState = {
-      ...sf,
-      mode,
-      mesh: inspectedMesh,
-      target: targetMesh,
-    };
-    app.setSurfaceField(nextState);
-    void computeAndApply(nextState, true);
-  };
-
-  const updateAppearance = (patch: { map?: SurfaceColormap; min?: number; max?: number }) => {
-    const nextMap = patch.map ?? sf.map;
-    const nextMin = patch.min ?? sf.min;
-    const nextMax = patch.max ?? sf.max;
-    app.setSurfaceField({ map: nextMap, min: nextMin, max: nextMax });
-    if (sf.mode === "none" || inspectedMesh === null) return;
-    const lo = nextMin;
-    const hi = nextMax > nextMin ? nextMax : nextMin + 1;
-
-    if (overlayValues !== null && overlayValues.mesh === inspectedMesh) {
-      app.setSurfaceFieldValues({ ...overlayValues, map: nextMap, min: lo, max: hi });
-      return;
-    }
-    if (sf.mode === "distance" && isWorkerScene(store.scene) && targetMesh !== null && targetMesh !== inspectedMesh) {
-      store.setDisplay(inspectedMesh, {
-        coloring: { distanceTo: targetMesh, maxDistance: Math.max(sf.maxDistance, 1e-4), map: nextMap, range: [lo, hi] },
-      });
-      return;
-    }
-    if (!isWorkerScene(store.scene) && activeFieldRef.current.field !== null) {
-      store.scene.inspect?.setColoring(inspectedMesh, {
-        field: activeFieldRef.current.field,
-        map: nextMap,
-        range: [lo, hi],
-      });
-    }
-  };
-
-  const mapMeta = COLORMAPS.find((c) => c.id === sf.map) ?? COLORMAPS[0];
+  const field = useSurfaceField(app, items, selection);
+  const { sf, summary, busy, error, inspectedMesh, targetMesh, mapMeta } = field;
 
   return (
     <div className="op surface-field-panel">
@@ -296,7 +119,7 @@ function SurfaceFieldControls(props: {
             aria-pressed={sf.mode === m.id}
             title={m.title}
             disabled={busy || (m.id !== "none" && items.length === 0) || (m.id === "distance" && items.length < 2)}
-            onClick={() => switchMode(m.id)}
+            onClick={() => field.switchMode(m.id)}
           >
             {m.label}
           </button>
@@ -312,13 +135,7 @@ function SurfaceFieldControls(props: {
               data-inspect-field-mesh
               value={inspectedMesh === null ? "" : String(items.findIndex((i) => i.mesh === inspectedMesh))}
               disabled={busy}
-              onChange={(e) => {
-                const nextMesh = items[Number(e.currentTarget.value)]?.mesh ?? null;
-                const nextTarget = targetMesh === nextMesh ? (items.find((i) => i.mesh !== nextMesh)?.mesh ?? null) : targetMesh;
-                const nextState = { ...sf, mesh: nextMesh, target: nextTarget };
-                app.setSurfaceField(nextState);
-                void computeAndApply(nextState, true);
-              }}
+              onChange={(e) => field.chooseMesh(Number(e.currentTarget.value))}
             >
               {items.map((it, idx) => (
                 <option key={it.id} value={String(idx)}>
@@ -336,12 +153,7 @@ function SurfaceFieldControls(props: {
                 data-inspect-field-target
                 value={targetMesh === null ? "" : String(items.findIndex((i) => i.mesh === targetMesh))}
                 disabled={busy}
-                onChange={(e) => {
-                  const nextTarget = items[Number(e.currentTarget.value)]?.mesh ?? null;
-                  const nextState = { ...sf, mesh: inspectedMesh, target: nextTarget };
-                  app.setSurfaceField(nextState);
-                  void computeAndApply(nextState, true);
-                }}
+                onChange={(e) => field.chooseTarget(Number(e.currentTarget.value))}
               >
                 {items
                   .filter((it) => it.mesh !== inspectedMesh)
@@ -364,7 +176,7 @@ function SurfaceFieldControls(props: {
                 aria-label="Field colormap"
                 data-inspect-field-map
                 value={sf.map}
-                onChange={(e) => updateAppearance({ map: e.currentTarget.value as SurfaceColormap })}
+                onChange={(e) => field.updateAppearance({ map: e.currentTarget.value as SurfaceColormap })}
               >
                 {COLORMAPS.map((c) => (
                   <option key={c.id} value={c.id}>
@@ -382,12 +194,7 @@ function SurfaceFieldControls(props: {
                   min={0.01}
                   mm={sf.maxDistance}
                   unit={unit}
-                  onMm={(mm) => {
-                    const nextMax = Math.max(0.01, mm);
-                    const nextState = { ...sf, mesh: inspectedMesh, target: targetMesh, maxDistance: nextMax };
-                    app.setSurfaceField({ maxDistance: nextMax });
-                    void computeAndApply(nextState, false);
-                  }}
+                  onMm={(mm) => field.setLimit(mm)}
                 />
               </label>
             ) : null}
@@ -402,10 +209,7 @@ function SurfaceFieldControls(props: {
                 aria-label="Field range minimum"
                 data-inspect-field-min
                 value={Number(sf.min.toFixed(4))}
-                onChange={(e) => {
-                  const v = Number(e.currentTarget.value);
-                  if (Number.isFinite(v)) updateAppearance({ min: v });
-                }}
+                onChange={(e) => field.setRangeEnd("min", Number(e.currentTarget.value))}
               />
             </label>
             <label className="field">
@@ -416,22 +220,14 @@ function SurfaceFieldControls(props: {
                 aria-label="Field range maximum"
                 data-inspect-field-max
                 value={Number(sf.max.toFixed(4))}
-                onChange={(e) => {
-                  const v = Number(e.currentTarget.value);
-                  if (Number.isFinite(v)) updateAppearance({ max: v });
-                }}
+                onChange={(e) => field.setRangeEnd("max", Number(e.currentTarget.value))}
               />
             </label>
             <button
               type="button"
               data-inspect-field-auto
               disabled={summary === null}
-              onClick={() => {
-                if (summary === null) return;
-                const lo = summary.min;
-                const hi = summary.max > summary.min ? summary.max : summary.min + 1;
-                updateAppearance({ min: lo, max: hi });
-              }}
+              onClick={field.autoRange}
             >
               Auto
             </button>
@@ -519,7 +315,7 @@ function SectionControls(props: {
   store: ReturnType<typeof useScene>;
   items: readonly Item[];
   item: Item | null;
-  section: { handle: unknown; plane: { origin: readonly [number, number, number]; normal: readonly [number, number, number] } } | null;
+  section: PanelSection | null;
   active: boolean;
   unit: LengthUnit;
 }) {
@@ -527,44 +323,15 @@ function SectionControls(props: {
   if (!active && section === null) {
     return null;
   }
-  const center = sectionCenter(scene, section, item);
-  const normal = section?.plane.normal ?? ([0, 0, 1] as readonly [number, number, number]);
-  const axis: Axis = Math.abs(normal[0]) >= Math.abs(normal[1]) && Math.abs(normal[0]) >= Math.abs(normal[2]) ? "x" : Math.abs(normal[1]) >= Math.abs(normal[2]) ? "y" : "z";
-  const range = Math.max(item?.radius ?? 1, 1e-6);
-  const offset =
-    section === null || center === null
-      ? 0
-      : (section.plane.origin[0] - center[0]) * normal[0] +
-        (section.plane.origin[1] - center[1]) * normal[1] +
-        (section.plane.origin[2] - center[2]) * normal[2];
-
-  const enable = () => {
-    if (items.length === 0) {
-      return;
-    }
-    const c = center ?? [0, 0, 0];
-    const plane = { origin: [...c] as [number, number, number], normal: [0, 0, 1] as [number, number, number] };
-    const handle = store.addSection({ plane, meshes: items.map((i) => i.mesh), fill: false });
-    app.setInspectSection({ handle, plane });
-  };
-  const move = (plane: { origin: [number, number, number]; normal: [number, number, number] }) => {
-    if (section === null) {
-      return;
-    }
-    const handle = section.handle as import("fast-mesh-wasm").SectionHandle;
-    try {
-      store.setSection(handle, { plane });
-    } catch {
-      // Removed meanwhile: the gizmo cleans up.
-    }
-    app.setInspectSection({ handle, plane });
-  };
+  const readout = sectionReadout(scene, section, item);
+  const { center, axis, range, offset } = readout;
+  const actions = sectionActions(app, store, items, section, readout);
 
   return (
     <div className="readout" data-readout="section">
       {section === null ? (
         <p>
-          <button type="button" data-action="section-enable" disabled={items.length === 0} onClick={enable} title="Cut the meshes with a plane">
+          <button type="button" data-action="section-enable" disabled={items.length === 0} onClick={actions.enable} title="Cut the meshes with a plane">
             Cut with a plane
           </button>
         </p>
@@ -581,11 +348,7 @@ function SectionControls(props: {
                 type="button"
                 data-axis={a}
                 aria-pressed={axis === a}
-                onClick={() => {
-                  const n = AXIS_NORMAL[a];
-                  const c = center ?? [0, 0, 0];
-                  move({ origin: [...c] as [number, number, number], normal: [...n] });
-                }}
+                onClick={() => actions.setAxis(a)}
               >
                 {a.toUpperCase()}
               </button>
@@ -594,13 +357,7 @@ function SectionControls(props: {
               type="button"
               data-action="section-flip"
               title="Flip the kept side"
-              onClick={() => {
-                const n = section.plane.normal;
-                move({
-                  origin: [...section.plane.origin] as [number, number, number],
-                  normal: [-n[0], -n[1], -n[2]] as [number, number, number],
-                });
-              }}
+              onClick={actions.flip}
             >
               Flip
             </button>
@@ -614,31 +371,14 @@ function SectionControls(props: {
               step={range / 200}
               value={Math.min(range, Math.max(-range, offset))}
               disabled={center === null}
-              onChange={(e) => {
-                const c = center;
-                if (c === null) {
-                  return;
-                }
-                const t = Number(e.currentTarget.value);
-                move({
-                  origin: [c[0] + normal[0] * t, c[1] + normal[1] * t, c[2] + normal[2] * t],
-                  normal: [...normal] as [number, number, number],
-                });
-              }}
+              onChange={(e) => actions.setOffset(Number(e.currentTarget.value))}
             />
           </label>
           <p>
             <button
               type="button"
               data-action="section-disable"
-              onClick={() => {
-                try {
-                  store.removeSection(section.handle as import("fast-mesh-wasm").SectionHandle);
-                } catch {
-                  // Removed meanwhile.
-                }
-                app.setInspectSection(null);
-              }}
+              onClick={actions.remove}
             >
               Remove plane
             </button>
@@ -647,31 +387,6 @@ function SectionControls(props: {
       )}
     </div>
   );
-}
-
-/**
- * The section's anchor: the selected mesh's world center (its local center
- * through the placement, so the offset slider follows gizmo moves).
- */
-function sectionCenter(
-  scene: Scene | WorkerScene,
-  section: { plane: { origin: readonly [number, number, number] } } | null,
-  item: Item | null,
-): [number, number, number] | null {
-  void section;
-  if (item === null) {
-    return null;
-  }
-  try {
-    const m = scene.matrix4(item.mesh);
-    return [
-      m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12],
-      m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13],
-      m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14],
-    ];
-  } catch {
-    return null; // removed meanwhile
-  }
 }
 
 function ClipControls(props: {
@@ -703,23 +418,10 @@ function ClipControls(props: {
       </p>
     );
   }
-  const span: [number, number, number] = [
-    Math.max(clip.max[0] - clip.min[0], 1e-6),
-    Math.max(clip.max[1] - clip.min[1], 1e-6),
-    Math.max(clip.max[2] - clip.min[2], 1e-6),
-  ];
-  const lo: [number, number, number] = [clip.min[0] - span[0], clip.min[1] - span[1], clip.min[2] - span[2]];
-  const hi: [number, number, number] = [clip.max[0] + span[0], clip.max[1] + span[1], clip.max[2] + span[2]];
+  const { lo, hi } = clipSliderBounds(clip);
   void items;
   const set = (axis: number, end: 0 | 1, v: number) => {
-    const min: [number, number, number] = [...clip.min];
-    const max: [number, number, number] = [...clip.max];
-    if (end === 0) {
-      min[axis] = Math.min(v, max[axis]);
-    } else {
-      max[axis] = Math.max(v, min[axis]);
-    }
-    app.setClipBox({ min, max });
+    app.setClipBox(clipBoxWithEnd(clip, axis, end, v));
   };
   return (
     <div className="readout" data-readout="clip">
@@ -758,125 +460,6 @@ function ClipControls(props: {
   );
 }
 
-/**
- * The selected mesh's middle half in world coordinates: its local center
- * through the placement (scale-aware), half the world radius each way.
- */
-function fitWorldBox(
-  scene: Scene | WorkerScene,
-  item: Item,
-): { min: [number, number, number]; max: [number, number, number] } | null {
-  try {
-    const m = scene.matrix4(item.mesh);
-    const cx = m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12];
-    const cy = m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13];
-    const cz = m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14];
-    // The placement's axis scales (columns' lengths): non-uniform scale (#103) stretches the box.
-    const sx = Math.sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
-    const sy = Math.sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
-    const sz = Math.sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
-    const r = Math.max(item.radius, 1e-6) / 2;
-    return {
-      min: [cx - sx * r, cy - sy * r, cz - sz * r],
-      max: [cx + sx * r, cy + sy * r, cz + sz * r],
-    };
-  } catch {
-    return null; // removed meanwhile
-  }
-}
-
-type DatumAxisKey = "posZ" | "negZ" | "posY" | "posX";
-
-const PRIMITIVE_KINDS: PrimitiveKindInput[] = ["auto", "plane", "sphere", "cylinder", "cone"];
-
-const DATUM_AXIS_OPTIONS: { id: DatumAxisKey; label: string; vec: Vec3 }[] = [
-  { id: "posZ", label: "+Z", vec: [0, 0, 1] },
-  { id: "negZ", label: "-Z", vec: [0, 0, -1] },
-  { id: "posY", label: "+Y", vec: [0, 1, 0] },
-  { id: "posX", label: "+X", vec: [1, 0, 0] },
-];
-
-type ContourPlaneAxis = Axis | "custom";
-
-function formatVec3Unitless(v: readonly [number, number, number]): string {
-  return `(${v[0].toFixed(3)}, ${v[1].toFixed(3)}, ${v[2].toFixed(3)})`;
-}
-
-function summarizePrimitiveGeometry(primitive: FittedPrimitive, unit: LengthUnit): string[] {
-  switch (primitive.kind) {
-    case "plane":
-      return [
-        `Origin: ${formatPoint(primitive.origin, unit)}`,
-        `Normal: ${formatVec3Unitless(primitive.normal)}`,
-      ];
-    case "sphere":
-      return [
-        `Center: ${formatPoint(primitive.center, unit)}`,
-        `Radius: ${formatLength(primitive.radius, unit)}`,
-      ];
-    case "cylinder":
-      return [
-        `Origin: ${formatPoint(primitive.axisOrigin, unit)}`,
-        `Axis: ${formatVec3Unitless(primitive.axisDir)}`,
-        `Radius: ${formatLength(primitive.radius, unit)}`,
-        `Height: ${formatLength(primitive.height, unit)}`,
-      ];
-    case "cone": {
-      const deg = ((primitive.halfAngleRad * 180) / Math.PI).toFixed(2);
-      return [
-        `Apex: ${formatPoint(primitive.apex, unit)}`,
-        `Axis: ${formatVec3Unitless(primitive.axisDir)}`,
-        `Half-angle: ${deg}°`,
-        `Height: ${formatLength(primitive.height, unit)}`,
-      ];
-    }
-  }
-}
-
-function worldCenter(scene: SceneStore["scene"], item: Item | null): [number, number, number] {
-  if (item === null) {
-    return [0, 0, 0];
-  }
-  try {
-    const m = scene.matrix4(item.mesh);
-    return [
-      m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12],
-      m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13],
-      m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14],
-    ];
-  } catch {
-    return [0, 0, 0];
-  }
-}
-
-function normalizeNormalVec(v: readonly [number, number, number]): [number, number, number] {
-  const len = Math.hypot(v[0], v[1], v[2]);
-  if (!Number.isFinite(len) || len < 1e-8) {
-    return [0, 0, 1];
-  }
-  return [v[0] / len, v[1] / len, v[2] / len];
-}
-
-function safeTriggerDownload(text: string, fileName: string, mime: string): void {
-  if (typeof document === "undefined" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
-    return;
-  }
-  downloadReportText(text, fileName, mime);
-}
-
-/** Converts multi-slice Wave 6 contours into minimal R12 DXF entities. */
-export function exportContourSlicesDxf(slices: readonly ContourSlice[]): string {
-  const origin: Vec3 = slices[0]?.planeOrigin ?? [0, 0, 0];
-  const normal: Vec3 = slices[0]?.planeNormal ?? [0, 0, 1];
-  const contours: ContourLike[] = [];
-  for (const slice of slices) {
-    for (const loop of slice.loops) {
-      contours.push({ points: loop.points3d, closed: loop.closed });
-    }
-  }
-  return contoursToDxf(contours, origin, normal);
-}
-
 /** #234 Primitive fitting and datum alignment controls inside the Inspect panel. */
 function PrimitiveFitControls(props: {
   app: AppState;
@@ -888,61 +471,8 @@ function PrimitiveFitControls(props: {
 }) {
   const { app, store, items, item, metrology, unit } = props;
   const targetItem = item ?? items[0] ?? null;
-  const [kind, setKind] = useState<PrimitiveKindInput>("auto");
-  const [targetAxis, setTargetAxis] = useState<DatumAxisKey>("posZ");
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const inspectDomain = store?.scene?.inspect;
-  const canFit = typeof inspectDomain?.fitPrimitive === "function";
-  const canAlign = typeof inspectDomain?.alignToFittedPrimitive === "function";
-  const fitted: FittedPrimitiveReport | null = metrology.fittedPrimitive;
-
-  const onFit = async () => {
-    if (targetItem === null || !inspectDomain?.fitPrimitive) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    setStatus(null);
-    try {
-      const report = await Promise.resolve(inspectDomain.fitPrimitive(targetItem.mesh, { kind }));
-      app.updateWave6((prev) => ({
-        ...prev,
-        metrology: {
-          ...prev.metrology,
-          fittedPrimitive: report,
-          showPrimitiveOverlay: true,
-        },
-      }));
-      setStatus(`Fitted ${report.primitive.kind} (${report.inlierCount} inliers)`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onAlign = async () => {
-    if (targetItem === null || fitted === null || !inspectDomain?.alignToFittedPrimitive) {
-      return;
-    }
-    const axisOpt = DATUM_AXIS_OPTIONS.find((a) => a.id === targetAxis) ?? DATUM_AXIS_OPTIONS[0];
-    setBusy(true);
-    setError(null);
-    try {
-      await Promise.resolve(
-        inspectDomain.alignToFittedPrimitive(targetItem.mesh, fitted.primitive, axisOpt.vec, [0, 0, 0]),
-      );
-      store.commitFrame();
-      setStatus(`Aligned ${targetItem.name} datum to ${axisOpt.label}`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const fit = usePrimitiveFit(app, store, targetItem, metrology);
+  const { kind, targetAxis, busy, status, error, canFit, canAlign, fitted } = fit;
 
   return (
     <div className="op" data-inspect-primitive-fit>
@@ -952,14 +482,7 @@ function PrimitiveFitControls(props: {
           <button
             type="button"
             data-action="inspect-fit-clear"
-            onClick={() => {
-              app.updateWave6((prev) => ({
-                ...prev,
-                metrology: { ...prev.metrology, fittedPrimitive: null },
-              }));
-              setStatus(null);
-              setError(null);
-            }}
+            onClick={fit.onClear}
           >
             Clear
           </button>
@@ -978,7 +501,7 @@ function PrimitiveFitControls(props: {
             data-inspect-fit-kind
             value={kind}
             disabled={busy}
-            onChange={(e) => setKind(e.currentTarget.value as PrimitiveKindInput)}
+            onChange={(e) => fit.setKind(e.currentTarget.value as PrimitiveKindInput)}
           >
             {PRIMITIVE_KINDS.map((k) => (
               <option key={k} value={k}>
@@ -991,7 +514,7 @@ function PrimitiveFitControls(props: {
           type="button"
           data-action="inspect-fit-primitive"
           disabled={busy || targetItem === null || !canFit}
-          onClick={() => void onFit()}
+          onClick={() => void fit.onFit()}
         >
           {busy ? "Working..." : "Fit"}
         </button>
@@ -1002,13 +525,7 @@ function PrimitiveFitControls(props: {
           type="checkbox"
           data-inspect-fit-overlay
           checked={metrology.showPrimitiveOverlay}
-          onChange={(e) => {
-            const checked = e.currentTarget.checked;
-            app.updateWave6((prev) => ({
-              ...prev,
-              metrology: { ...prev.metrology, showPrimitiveOverlay: checked },
-            }));
-          }}
+          onChange={(e) => fit.setShowOverlay(e.currentTarget.checked)}
         />
         Show datum overlay
       </label>
@@ -1036,7 +553,7 @@ function PrimitiveFitControls(props: {
             data-inspect-align-axis
             value={targetAxis}
             disabled={busy || fitted === null}
-            onChange={(e) => setTargetAxis(e.currentTarget.value as DatumAxisKey)}
+            onChange={(e) => fit.setTargetAxis(e.currentTarget.value as DatumAxisKey)}
           >
             {DATUM_AXIS_OPTIONS.map((a) => (
               <option key={a.id} value={a.id}>
@@ -1049,7 +566,7 @@ function PrimitiveFitControls(props: {
           type="button"
           data-action="inspect-align-datum"
           disabled={busy || targetItem === null || fitted === null || !canAlign}
-          onClick={() => void onAlign()}
+          onClick={() => void fit.onAlign()}
         >
           Align Datum
         </button>
@@ -1076,81 +593,9 @@ function ContourSliceControls(props: {
 }) {
   const { app, store, items, item, metrology, unit } = props;
   const targetItem = item ?? items[0] ?? null;
-  const [planeAxis, setPlaneAxis] = useState<ContourPlaneAxis>("z");
-  const [customNormal, setCustomNormal] = useState<[number, number, number]>([0, 0, 1]);
-  const [offsetMm, setOffsetMm] = useState(0);
-  const [stackCount, setStackCount] = useState(1);
-  const [stepMm, setStepMm] = useState(1);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [exportState, setExportState] = useState<{ format: "svg" | "dxf"; text: string; fileName: string } | null>(
-    null,
-  );
-
-  const inspectDomain = store?.scene?.inspect;
-  const canSlice =
-    typeof inspectDomain?.sliceContours === "function" && typeof inspectDomain?.sliceContourStack === "function";
-  const slices = metrology.contourSlices;
-
-  const activeNormal = (): [number, number, number] =>
-    planeAxis === "custom" ? normalizeNormalVec(customNormal) : AXIS_NORMAL[planeAxis];
-
-  const onSlice = async () => {
-    if (targetItem === null || !inspectDomain?.sliceContours || !inspectDomain?.sliceContourStack) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    setExportState(null);
-    try {
-      const n = activeNormal();
-      const center = worldCenter(store.scene, targetItem);
-      const origin: [number, number, number] = [
-        center[0] + n[0] * offsetMm,
-        center[1] + n[1] * offsetMm,
-        center[2] + n[2] * offsetMm,
-      ];
-      const count = Math.max(1, Math.round(stackCount));
-      const nextSlices =
-        count > 1
-          ? await Promise.resolve(inspectDomain.sliceContourStack(targetItem.mesh, origin, n, Math.max(0.001, stepMm), count))
-          : [await Promise.resolve(inspectDomain.sliceContours(targetItem.mesh, origin, n))];
-      app.updateWave6((prev) => ({
-        ...prev,
-        metrology: {
-          ...prev.metrology,
-          contourSlices: nextSlices,
-          showContoursOverlay: true,
-        },
-      }));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onExport = async (format: "svg" | "dxf") => {
-    if (slices === null || slices.length === 0) {
-      return;
-    }
-    setError(null);
-    try {
-      const text =
-        format === "svg" ? (await ensureWave6Wasm()).sliceContoursExport(slices, "svg") : exportContourSlicesDxf(slices);
-      const stem = `${targetItem?.name ?? "contours"}-section`;
-      const fileName = reportFileName(stem, format);
-      const mime = format === "svg" ? "image/svg+xml" : "application/dxf";
-      safeTriggerDownload(text, fileName, mime);
-      setExportState({ format, text, fileName });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const totalLoops = slices === null ? 0 : slices.reduce((sum, s) => sum + s.loops.length, 0);
-  const totalPerimeter = slices === null ? 0 : slices.reduce((sum, s) => sum + s.totalPerimeter, 0);
-  const totalArea = slices === null ? 0 : slices.reduce((sum, s) => sum + s.totalArea, 0);
+  const contours = useContourSlices(app, store, targetItem, metrology);
+  const { planeAxis, customNormal, offsetMm, stackCount, stepMm, busy, error, exportState, canSlice, slices, totals } =
+    contours;
 
   return (
     <div className="op" data-inspect-contours>
@@ -1160,14 +605,7 @@ function ContourSliceControls(props: {
           <button
             type="button"
             data-action="inspect-contours-clear"
-            onClick={() => {
-              app.updateWave6((prev) => ({
-                ...prev,
-                metrology: { ...prev.metrology, contourSlices: null },
-              }));
-              setExportState(null);
-              setError(null);
-            }}
+            onClick={contours.onClear}
           >
             Clear
           </button>
@@ -1182,7 +620,7 @@ function ContourSliceControls(props: {
             data-inspect-contour-axis
             value={planeAxis}
             disabled={busy}
-            onChange={(e) => setPlaneAxis(e.currentTarget.value as ContourPlaneAxis)}
+            onChange={(e) => contours.setPlaneAxis(e.currentTarget.value as ContourPlaneAxis)}
           >
             <option value="z">Z (0, 0, 1)</option>
             <option value="y">Y (0, 1, 0)</option>
@@ -1197,7 +635,7 @@ function ContourSliceControls(props: {
             data-inspect-contour-offset
             mm={offsetMm}
             unit={unit}
-            onMm={setOffsetMm}
+            onMm={contours.setOffsetMm}
           />
         </label>
       </div>
@@ -1213,15 +651,7 @@ function ContourSliceControls(props: {
                 aria-label={`Contour normal ${label}`}
                 data-inspect-contour-normal={label.toLowerCase()}
                 value={customNormal[idx]}
-                onChange={(e) => {
-                  const v = Number(e.currentTarget.value);
-                  if (!Number.isFinite(v)) {
-                    return;
-                  }
-                  const next: [number, number, number] = [...customNormal] as [number, number, number];
-                  next[idx] = v;
-                  setCustomNormal(next);
-                }}
+                onChange={(e) => contours.setNormalComponent(idx, Number(e.currentTarget.value))}
               />
             </label>
           ))}
@@ -1239,12 +669,7 @@ function ContourSliceControls(props: {
             max={100}
             step={1}
             value={stackCount}
-            onChange={(e) => {
-              const n = Number(e.currentTarget.value);
-              if (Number.isFinite(n)) {
-                setStackCount(Math.max(1, Math.min(100, Math.round(n))));
-              }
-            }}
+            onChange={(e) => contours.setStackCount(Number(e.currentTarget.value))}
           />
         </label>
         <label className="field">
@@ -1255,14 +680,14 @@ function ContourSliceControls(props: {
             min={0.001}
             mm={stepMm}
             unit={unit}
-            onMm={(mm) => setStepMm(Math.max(0.001, mm))}
+            onMm={(mm) => contours.setStep(mm)}
           />
         </label>
         <button
           type="button"
           data-action="inspect-slice-contours"
           disabled={busy || targetItem === null || !canSlice}
-          onClick={() => void onSlice()}
+          onClick={() => void contours.onSlice()}
         >
           {busy ? "Slicing..." : "Slice Contours"}
         </button>
@@ -1273,13 +698,7 @@ function ContourSliceControls(props: {
           type="checkbox"
           data-inspect-contours-overlay
           checked={metrology.showContoursOverlay}
-          onChange={(e) => {
-            const checked = e.currentTarget.checked;
-            app.updateWave6((prev) => ({
-              ...prev,
-              metrology: { ...prev.metrology, showContoursOverlay: checked },
-            }));
-          }}
+          onChange={(e) => contours.setShowOverlay(e.currentTarget.checked)}
         />
         Show contour overlay
       </label>
@@ -1288,10 +707,10 @@ function ContourSliceControls(props: {
         <>
           <div className="readout" data-inspect-contours-summary>
             <p>
-              Slices: {slices.length} · Loops: {totalLoops}
+              Slices: {slices.length} · Loops: {totals.loops}
             </p>
             <p>
-              Perimeter: {formatLength(totalPerimeter, unit)} · Area: {formatArea(totalArea, unit)}
+              Perimeter: {formatLength(totals.perimeter, unit)} · Area: {formatArea(totals.area, unit)}
             </p>
           </div>
           <div className="op-row">
@@ -1299,7 +718,7 @@ function ContourSliceControls(props: {
               type="button"
               data-action="inspect-export-svg"
               disabled={slices.length === 0}
-              onClick={() => void onExport("svg")}
+              onClick={() => void contours.onExport("svg")}
             >
               Export SVG
             </button>
@@ -1307,7 +726,7 @@ function ContourSliceControls(props: {
               type="button"
               data-action="inspect-export-dxf"
               disabled={slices.length === 0}
-              onClick={() => void onExport("dxf")}
+              onClick={() => void contours.onExport("dxf")}
             >
               Export DXF
             </button>
