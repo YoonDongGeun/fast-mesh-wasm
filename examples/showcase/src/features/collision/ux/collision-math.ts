@@ -1,7 +1,7 @@
 // The collision panel's arithmetic: slider scales and the tolerance limit
 // (contactHeatmap's validation), the deepest-penetration readout from the
-// fields' values, a target's topology from its analysis, and how distances
-// are printed.
+// fields' values, a target's topology from its analysis, how distances
+// are printed, and the nudge step of the collision probe.
 import type {
   Analysis,
   CollisionMode,
@@ -9,6 +9,7 @@ import type {
   CollisionStepReport,
   MeshHandle,
 } from "fast-mesh-wasm";
+import type { HeatmapParams } from "../../../app/state/app-state";
 import type { Wave6CollisionState } from "../../../app/state/wave6-state";
 
 /** The smallest of 1, 2 or 5 times a power of ten that is at least `r` (1 for a non-positive `r`). */
@@ -35,6 +36,35 @@ export function toleranceLimit(depth: number, gap: number): number {
 export function clampTolerance(tolerance: number, depth: number, gap: number, step: number): number {
   const max = toleranceLimit(depth, gap) - step;
   return max <= 0 ? 0 : Math.min(Math.max(tolerance, 0), max);
+}
+
+/**
+ * The sliders' scale for `meshes`: it follows the size of the meshes
+ * coloured, so a file in millimetres and the unit-sized demo meshes both get
+ * useful ranges. `niceScale` of the largest radius among the listed items.
+ */
+export function meshScale<M>(items: readonly { mesh: M; radius: number }[], meshes: readonly (M | null)[]): number {
+  return niceScale(Math.max(0, ...items.filter((i) => meshes.includes(i.mesh)).map((i) => i.radius)));
+}
+
+/**
+ * The heatmap's slider values at `scale` (in mm, whatever the display unit):
+ * `params` as last set, or before any slider moved (`null`) defaults that
+ * follow the scale. Clamped to contactHeatmap's limits (spec §6.5, gap ≥ 0
+ * from §7.1). `step` is the sliders' step, `toleranceMax` the tolerance
+ * slider's end.
+ */
+export function heatmapLimits(
+  params: HeatmapParams | null,
+  scale: number,
+): { step: number; depth: number; gap: number; tolerance: number; toleranceMax: number } {
+  const step = scale / 1000;
+  const p = params ?? { depth: scale / 2, gap: scale / 2, tolerance: scale / 50 };
+  const depth = Math.min(Math.max(p.depth, step), scale);
+  const gap = Math.min(Math.max(p.gap, 0), scale);
+  const tolerance = clampTolerance(p.tolerance, depth, gap, step);
+  const toleranceMax = Math.max(0, toleranceLimit(depth, gap) - step);
+  return { step, depth, gap, tolerance, toleranceMax };
 }
 
 /** A bounded field's deepest value within this fraction of the bound may hide a deeper one. */
@@ -119,6 +149,26 @@ export function formatDistance(x: number): string {
     return `${m}e${Number(e)}`;
   }
   return a >= 100 ? x.toFixed(0) : String(Number(x.toPrecision(3)));
+}
+
+/**
+ * The collision probe's move of B toward A, from their bounds' centres: half
+ * the distance but at least 0.5 (the whole distance when closer than that),
+ * or 0.25 along x when the centres coincide.
+ */
+export function nudgeOffset(
+  centerA: readonly [number, number, number],
+  centerB: readonly [number, number, number],
+): [number, number, number] {
+  const dx = centerA[0] - centerB[0];
+  const dy = centerA[1] - centerB[1];
+  const dz = centerA[2] - centerB[2];
+  const dist = Math.hypot(dx, dy, dz);
+  const step = dist > 1e-6 ? Math.min(dist, Math.max(0.5, dist * 0.5)) : 0;
+  const sx = dist > 1e-6 ? (dx / dist) * step : 0.25;
+  const sy = dist > 1e-6 ? (dy / dist) * step : 0;
+  const sz = dist > 1e-6 ? (dz / dist) * step : 0;
+  return [sx, sy, sz];
 }
 
 export const DEFAULT_COLLISION_STIFFNESS = 0.5;

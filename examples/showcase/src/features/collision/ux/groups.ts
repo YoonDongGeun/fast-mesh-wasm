@@ -44,6 +44,11 @@ export function setColored<M>(groups: readonly NamedGroup<M>[], id: number, on: 
   return groups.map((g) => (g.id === id ? { ...g, colored: on } : g));
 }
 
+/** The `members` still listed in `items`, in member order. */
+export function liveMembers<M>(members: readonly M[], items: readonly { mesh: M }[]): M[] {
+  return members.filter((m) => items.some((i) => i.mesh === m));
+}
+
 /** Drops `m` from every group (a removal); groups stay, even emptied. */
 export function dropMember<M>(groups: readonly NamedGroup<M>[], m: M): NamedGroup<M>[] {
   return groups.map((g) => (g.members.includes(m) ? { ...g, members: g.members.filter((x) => x !== m) } : g));

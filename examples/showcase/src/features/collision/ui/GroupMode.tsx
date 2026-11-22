@@ -4,53 +4,14 @@
 // the nearest of its partners, with the same heatmap as the pair; readouts
 // are given per pair (gap, intersecting, deepest penetration).
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { useScene, useStoreSelector } from "fast-mesh-wasm/react";
-import type { SceneStore } from "fast-mesh-wasm/store";
+import { useStoreSelector } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useMemo } from "react";
 import { type AppState, type GroupSetup, type Item, useApp } from "../../../app/state/app-state";
-import type { Heatmap } from "./CollisionPanel";
-import { mayBeDeeper } from "../ux/collision-math";
-import { groupPairs, type MemberValues, pairDepths, togglePair } from "../ux/group-math";
-import { type GroupReadouts, inspect } from "../../../app/state/readouts";
-import { meshesKey, useLiveReadouts, useTopologyWarnings } from "../ux/live";
+import type { GroupReadouts } from "../../../app/state/readouts";
+import { meshesKey } from "../ux/live";
+import { useGroupContact } from "../ux/use-group-contact";
+import type { Heatmap } from "../ux/use-heatmap-settings";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
-
-/** The store's id of the panel's contact group. */
-const GROUP_ID = "showcase";
-
-/**
- * The targets of the field behind a mesh's colouring, in the order its
- * nearest-target indices refer to (`store.coloringTargets`: ascending scene
- * id, not the member order); empty without a colouring.
- */
-export function partnersOf(store: SceneStore, mesh: MeshHandle): readonly MeshHandle[] {
-  return store.coloringTargets(mesh) ?? [];
-}
-
-/**
- * A member's colouring read back: the values of its store-owned field
- * (`fetchColoringValues`) and the field's nearest partner per vertex
- * (`fetchFieldNearest` on a Worker scene, `fieldNearest` on a local one),
- * either `null` when it has no colouring or it changed meanwhile.
- */
-export async function readMember(
-  store: SceneStore,
-  scene: Scene | WorkerScene,
-  mesh: MeshHandle,
-): Promise<MemberValues<MeshHandle>> {
-  const partners = partnersOf(store, mesh);
-  const field = scene.coloring(mesh)?.field;
-  const [values, nearest] = await Promise.all([
-    store.fetchColoringValues(mesh).catch(() => null),
-    field === undefined
-      ? null
-      : Promise.resolve()
-          .then(() => ("fetchFieldNearest" in scene ? scene.fetchFieldNearest(field) : scene.fieldNearest(field)))
-          .catch(() => null),
-  ]);
-  return { mesh, values, nearest, partners };
-}
 
 export function GroupMode(props: {
   app: AppState;
@@ -60,63 +21,14 @@ export function GroupMode(props: {
   heat: Heatmap;
 }) {
   const { app, scene, items, group, heat } = props;
-  const store = useScene();
   const units = useApp(app, (s) => s.units);
-  // Members still listed (a removal updates the group in the same tick).
-  const members = useMemo(
-    () => group.members.filter((m) => items.some((i) => i.mesh === m)),
-    [group.members, items],
+  const { members, pairs, ready, bound, readouts, warnings, nameOf, setAllPairs, togglePair } = useGroupContact(
+    app,
+    scene,
+    items,
+    group,
+    heat,
   );
-  const pairs = useMemo(() => groupPairs(members, group.pairs), [members, group.pairs]);
-  const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? "the mesh";
-  const key = meshesKey(items, members);
-  const pairsKey = pairs.map(([a, b]) => meshesKey(items, [a, b])).join(";");
-
-  // The group, set again when its members, pairs or heatmap change: a new
-  // heatmap only recolours (the store keeps each member's field when its
-  // bound and partners stay). Fewer than two members colour nothing.
-  useEffect(() => {
-    store.setContactGroup(
-      GROUP_ID,
-      members.length < 2 ? null : { meshes: members, pairs: group.pairs === "all" ? "all" : pairs, coloring: heat },
-    );
-    // `key` and `pairsKey` stand for `members` and `pairs` (new arrays on every list change).
-  }, [store, key, pairsKey, heat]);
-  // Leaving Group mode uncolours the members and drops their fields.
-  useEffect(() => () => store.setContactGroup(GROUP_ID, null), [store]);
-
-  const bound = heat.maxDistance;
-  const ready = members.length >= 2;
-  const { readouts, poke } = useLiveReadouts<GroupReadouts>(
-    store,
-    ready ? members : null,
-    `${key}/${pairsKey}`,
-    async () => {
-      const entries = await Promise.all(members.map((m) => readMember(store, scene, m)));
-      const each = await Promise.all(
-        pairs.map(([a, b]) => Promise.all([Promise.resolve(scene.meshDistance(a, b)), Promise.resolve(scene.intersects(a, b))])),
-      );
-      const depths = pairDepths(entries, pairs);
-      return {
-        bound,
-        pairs: pairs.map(([a, b], k) => ({
-          a,
-          b,
-          gap: each[k][0] === null ? null : each[k][0].distance,
-          intersects: each[k][1],
-          depth: depths[k],
-          atLeast: depths[k] !== null && mayBeDeeper(depths[k], bound, each[k][1]),
-        })),
-      };
-    },
-    inspect.group,
-  );
-  // A new bound changes how the depths read (the colours follow through change records).
-  useEffect(() => poke(), [bound]);
-  const warnings = useTopologyWarnings(scene, members, key, nameOf);
-  useEffect(() => {
-    inspect.group.warnings = warnings;
-  });
 
   const all = group.pairs === "all";
   const short = (m: MeshHandle) => nameOf(m).split(" ")[0];
@@ -143,7 +55,7 @@ export function GroupMode(props: {
           type="checkbox"
           data-control="all-pairs"
           checked={all}
-          onChange={(e) => app.setGroupPairs(e.currentTarget.checked ? "all" : groupPairs(members, "all"))}
+          onChange={(e) => setAllPairs(e.currentTarget.checked)}
         />
         All pairs
       </label>
@@ -171,7 +83,7 @@ export function GroupMode(props: {
                         data-pair={`${nameOf(a)}|${nameOf(b)}`}
                         title={`${nameOf(a)} ↔ ${nameOf(b)}`}
                         checked={pairs.some(([x, y]) => x === a && y === b)}
-                        onChange={() => app.setGroupPairs(togglePair(group.pairs === "all" ? [] : group.pairs, a, b))}
+                        onChange={() => togglePair(a, b)}
                       />
                     ) : null}
                   </td>
