@@ -130,10 +130,12 @@ matches. Each feature has two parts:
 ```
 src/
   main.tsx       boot: engine, store, React root
-  app/           App.tsx; state/ (app state, tool state, readouts); testing/ (window.__showcase)
+  app/           App.tsx; ux/ (shortcuts, file drop, loading, display settings); state/ (app state,
+                 tool state, readouts); testing/ (window.__showcase)
   shell/         ribbon, status bar, command search, help and tour
   shared/        units, persisted settings, LengthInput
-  viewport/      the canvas (ui/Viewport.tsx) and what it shares (ux/: view registry, touch, clip planes)
+  viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
+                 drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
   io/            loading (parser Worker), DICOM, export, project files, demo meshes
   features/
