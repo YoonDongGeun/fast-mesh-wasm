@@ -167,12 +167,22 @@ export interface SurfaceFieldState {
   maxDistance: number;
 }
 
+/** Values from `lo` to `hi` (both inclusive) that an overlay draws in one colour instead of its colormap (#251). */
+export interface OverlayBand {
+  lo: number;
+  hi: number;
+  /** RGB, each 0..1. */
+  color: readonly [number, number, number];
+}
+
 export interface SurfaceFieldOverlayData {
   mesh: MeshHandle;
   values: Float32Array;
   map: SurfaceColormap;
   min: number;
   max: number;
+  /** A band of values drawn in one colour: a tolerance band, faces that need no support (#251). */
+  band?: OverlayBand | null;
 }
 
 export type CameraProjection = "perspective" | "orthographic";

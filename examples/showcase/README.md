@@ -142,7 +142,8 @@ src/
     view/        ViewCube, shading modes, wireframe, camera presets
     select/      object and face selection
     transform/   numeric transform, scale, ICP alignment
-    inspect/     ruler, query, section plane, clip box
+    inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
+                 triangle quality maps
     mesh-edit/   boolean, plane cut, offset and shell, resample, hollow, place mesh
     mesh-repair/ analysis, healer overlays, repairs, auto repair
     sculpt/      brushes, mask, dyntopo, free-form deformation

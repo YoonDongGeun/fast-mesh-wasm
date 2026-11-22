@@ -17,6 +17,7 @@ import type { AppState } from "../state/app-state";
 import { view } from "../../viewport/ux/view";
 import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays";
 import { hasWireOverlay } from "../../features/view/ui/wire";
+import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
 
 export function installTestHook(
   store: SceneStore,
@@ -255,6 +256,17 @@ export function installTestHook(
       section: inspect.tools.section === null ? null : { ...inspect.tools.section },
       clip: inspect.tools.clip === null ? null : { ...inspect.tools.clip },
     }),
+    /** The inspect map shown (#251): its kind, mesh, reference, readouts, colour range and band, and how many queries landed. */
+    inspectMap: () => {
+      const s = inspectMapProbe.shown;
+      return {
+        runs: inspectMapProbe.runs,
+        shown:
+          s === null
+            ? null
+            : { ...s, readout: { ...s.readout }, range: [...s.range], band: s.band === null ? null : [...s.band] },
+      };
+    },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),
     /** The slice views: the series shown, its window preset, the slice indices, and whether all rendered. */

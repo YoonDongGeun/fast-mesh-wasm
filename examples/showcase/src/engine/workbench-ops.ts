@@ -22,7 +22,7 @@ import type {
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { bounds, type Vec3 } from "../io/mesh-data";
-import type { AppState, Item, SurfaceColormap, SurfaceFieldState } from "../app/state/app-state";
+import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } from "../app/state/app-state";
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
 
@@ -754,6 +754,21 @@ export function evaluateSurfaceColormap(
     }
   }
   return [0.5, 0.5, 0.5];
+}
+
+/**
+ * An overlay vertex's colour: the band's colour for a value inside the band
+ * (#251), else the colormap's over `[min, max]`.
+ */
+export function evaluateOverlayColor(
+  overlay: { map: SurfaceColormap; min: number; max: number; band?: OverlayBand | null },
+  value: number,
+): [number, number, number] {
+  const band = overlay.band;
+  if (band != null && value >= band.lo && value <= band.hi) {
+    return [band.color[0], band.color[1], band.color[2]];
+  }
+  return evaluateSurfaceColormap(overlay.map, value, overlay.min, overlay.max);
 }
 
 /** Computes finite min, max, and mean summary statistics over scalar vertex values. */

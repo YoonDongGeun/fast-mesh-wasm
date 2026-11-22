@@ -475,6 +475,20 @@ input[type="range"] {
   position: absolute;
   transform: translateX(-50%);
 }
+.legend-band {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+  display: inline-block;
+}
 .pair {
   margin-top: 8px;
 }

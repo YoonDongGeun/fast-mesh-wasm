@@ -461,6 +461,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" data-ribbon-focus="contours" onClick={() => focusElement("[data-inspect-contours]")}>
                 Contours
               </button>
+              <button type="button" data-ribbon-focus="maps" onClick={() => focusElement("[data-inspect-maps]")}>
+                Maps
+              </button>
               <button
                 type="button"
                 aria-pressed={shadingMode === "backfaceWarning"}

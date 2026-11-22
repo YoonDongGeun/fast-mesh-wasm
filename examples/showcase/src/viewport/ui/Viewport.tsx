@@ -22,7 +22,7 @@ import type { FocusRequest } from "../../app/App";
 import type { Loader } from "../../io/loader";
 import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
-import { evaluateSurfaceColormap } from "../../engine/workbench-ops";
+import { evaluateOverlayColor } from "../../engine/workbench-ops";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
@@ -380,7 +380,7 @@ function SurfaceFieldOverlay(props: { app: AppState; item: Item; bound: MeshBind
     const colors = new Float32Array(vertCount * 3);
     for (let i = 0; i < vertCount; i++) {
       const val = i < field.values.length ? field.values[i] : Number.NaN;
-      const [r, g, b] = evaluateSurfaceColormap(field.map, val, field.min, field.max);
+      const [r, g, b] = evaluateOverlayColor(field, val);
       colors[3 * i] = r;
       colors[3 * i + 1] = g;
       colors[3 * i + 2] = b;

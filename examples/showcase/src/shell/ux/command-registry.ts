@@ -369,6 +369,15 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:inspect-maps",
+      title: "Inspect: Deviation, Overhang & Quality Maps",
+      category: "Tool",
+      keywords: "inspect map deviation tolerance reference overhang support build direction critical angle triangle quality aspect ratio minimum angle sliver",
+      run: () => {
+        app.setActiveTab("inspect");
+      },
+    },
+    {
       id: "tool:inspect-ruler",
       title: "Inspect: Measure Ruler",
       category: "Tool",

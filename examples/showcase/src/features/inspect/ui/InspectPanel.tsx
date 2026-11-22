@@ -4,6 +4,8 @@
 // thickness/curvature/distance colorings), a draggable section plane
 // (wired to `setSectionPlane` through the store) and an axis-aligned clip
 // box for looking inside meshes. Scalar mesh numbers reuse `measure`.
+// The surface field and the inspect maps (#251: deviation, overhang,
+// triangle quality) colour a mesh through one shared overlay, one at a time.
 import type { MeshHandle, PrimitiveKindInput, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
@@ -30,6 +32,8 @@ import {
   usePrimitiveFit,
 } from "../ux/use-primitive-fit";
 import { COLORMAPS, SURFACE_FIELD_MODES, useSurfaceField } from "../ux/use-surface-field";
+import { FieldLegend } from "./FieldLegend";
+import { InspectMapControls } from "./InspectMapControls";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "../../../shared/ux/units";
 
@@ -62,6 +66,13 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
 
   const { queryValue, queryMeasure } = useQueryReadout(store, scene, query, overlayValues);
   usePublishInspectTools({ items, tool, ruler, distance, query, queryValue, section, clip });
+  // The surface field and the inspect maps share the overlay: a map turns the field off first.
+  const surfaceField = useSurfaceField(app, items, selection);
+  const takeOverlayFromField = () => {
+    if (surfaceField.sf.mode !== "none") {
+      surfaceField.switchMode("none");
+    }
+  };
 
   return (
     <section className="panel" aria-label="Inspect">
@@ -90,7 +101,14 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
       <QueryReadout query={query} items={items} value={queryValue} measure={queryMeasure} unit={units} />
       <SectionControls app={app} scene={scene} store={store} items={items} item={item} section={section} active={tool === "section"} unit={units} />
       {tool === "clip" || clip !== null ? <ClipControls app={app} scene={scene} items={items} item={item} clip={clip} unit={units} /> : null}
-      <SurfaceFieldControls app={app} items={items} selection={selection} unit={units} />
+      <SurfaceFieldControls field={surfaceField} items={items} unit={units} />
+      <InspectMapControls
+        app={app}
+        items={items}
+        selection={selection}
+        unit={units}
+        onTakeOverlay={takeOverlayFromField}
+      />
       <PrimitiveFitControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
       <ContourSliceControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
     </section>
@@ -98,13 +116,11 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
 }
 
 function SurfaceFieldControls(props: {
-  app: AppState;
+  field: ReturnType<typeof useSurfaceField>;
   items: readonly Item[];
-  selection: MeshHandle | null;
   unit: LengthUnit;
 }) {
-  const { app, items, selection, unit } = props;
-  const field = useSurfaceField(app, items, selection);
+  const { field, items, unit } = props;
   const { sf, summary, busy, error, inspectedMesh, targetMesh, mapMeta } = field;
 
   return (
@@ -233,13 +249,7 @@ function SurfaceFieldControls(props: {
             </button>
           </div>
 
-          <div className="legend">
-            <div className="legend-bar" style={{ background: mapMeta.gradient }} />
-            <div className="legend-labels">
-              <span>{sf.min.toPrecision(3)}</span>
-              <span>{sf.max.toPrecision(3)}</span>
-            </div>
-          </div>
+          <FieldLegend map={mapMeta.id} lo={sf.min.toPrecision(3)} hi={sf.max.toPrecision(3)} />
 
           {summary !== null ? (
             <p className="muted" data-inspect-field-stats>
