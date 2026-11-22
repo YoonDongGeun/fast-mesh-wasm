@@ -249,6 +249,16 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:select-criteria",
+      title: "Select: Faces by Criteria",
+      category: "Tool",
+      keywords:
+        "select face criteria area facing camera overhang self intersecting degenerate sliver orientation inverted boundary sharp dihedral contact touching components",
+      run: () => {
+        app.setActiveTab("select");
+      },
+    },
+    {
       id: "tool:deform-ffd",
       title: "Deform: FFD Lattice",
       category: "Tool",

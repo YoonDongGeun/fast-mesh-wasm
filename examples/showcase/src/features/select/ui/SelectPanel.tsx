@@ -1,15 +1,18 @@
 // Face Selection workbench panel (#233): interactive viewport tool selector,
-// combine modes, region/brush parameters, selection modifiers (`grow`, `shrink`,
-// `invert`, `fillSelectionHoles`, `smoothSelectionBoundary`, `selectSmallFaceIslands`,
+// combine modes, region/brush parameters, selection by criteria (#258),
+// selection modifiers (`grow`, `shrink`, `invert`, `fillSelectionHoles`,
+// `smoothSelectionBoundary`, `selectSmallFaceIslands`, expand to components,
 // mask conversion), and selection-driven mesh operations (`extract`, `split`, `delete`).
 import type { SceneStore } from "fast-mesh-wasm/store";
-import type { AppState } from "../../../app/state/app-state";
+import { type AppState, useApp } from "../../../app/state/app-state";
 import {
   ADJACENCY_OPTIONS,
   COMBINE_OPTIONS,
   TOOL_OPTIONS,
   useFaceSelectionActions,
 } from "../ux/use-face-selection-actions";
+import { useSelectCriteria } from "../ux/use-select-criteria";
+import { SelectCriteriaSection } from "./SelectCriteriaSection";
 
 export interface SelectPanelProps {
   app: AppState;
@@ -30,6 +33,7 @@ export function SelectPanel({ app, store }: SelectPanelProps) {
     hasRepair,
     canConvertFromMask,
     patchSelect,
+    runAction,
     onClear,
     onInvert,
     onGrow,
@@ -44,6 +48,8 @@ export function SelectPanel({ app, store }: SelectPanelProps) {
     onDelete,
     onFillMeshHoles,
   } = useFaceSelectionActions(app, store);
+  const criteria = useSelectCriteria(app, store, { activeItem, runAction });
+  const units = useApp(app, (s) => s.units);
 
   return (
     <section className="panel select-panel" aria-label="Face Selection" data-panel="select">
@@ -212,6 +218,16 @@ export function SelectPanel({ app, store }: SelectPanelProps) {
         <p className="muted">Load or select a mesh to edit its face selection.</p>
       ) : (
         <>
+          <SelectCriteriaSection
+            criterion={criteria.criterion}
+            params={criteria.params}
+            unit={units}
+            disabled={busy || liveTriCount === 0}
+            onCriterion={criteria.setCriterion}
+            onParams={criteria.patchParams}
+            onSelect={criteria.onSelectByCriterion}
+          />
+
           <div className="op">
             <span>Modify Selection</span>
             <div className="op-row">
@@ -272,6 +288,15 @@ export function SelectPanel({ app, store }: SelectPanelProps) {
                 onClick={onSelectIslands}
               >
                 Small Islands
+              </button>
+              <button
+                type="button"
+                disabled={busy || !hasSelection}
+                data-select-action="expand-components"
+                title="Grow the selection to the whole components it touches"
+                onClick={criteria.onExpandToComponents}
+              >
+                Components
               </button>
             </div>
             <div className="op-row">

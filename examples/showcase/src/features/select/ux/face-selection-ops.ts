@@ -6,11 +6,12 @@ import type { MeshHandle, RayHit, ScreenSelectOptions, ScreenSelectionShape, Vec
 import { meshState, type SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
 import type { Wave6SelectState } from "../../../app/state/wave6-state";
-import { combineFaceSelection, EMPTY_U32 } from "./face-sets";
+import { combineFaceSelection, EMPTY_U32, sanitizeSelectedTriangles } from "./face-sets";
 
 const RAYCAST_HIDDEN_SKIP_LIMIT = 8;
 
-function isItemVisible(store: SceneStore, mesh: MeshHandle): boolean {
+/** Whether the mesh is shown (an unknown mesh counts as shown). */
+export function isItemVisible(store: SceneStore, mesh: MeshHandle): boolean {
   const st = meshState(store.getSnapshot(), mesh);
   return st ? st.desired.visible : true;
 }
@@ -40,6 +41,28 @@ export function writeMeshFaceSelection(app: AppState, itemId: number, selected: 
       },
     },
   }));
+}
+
+/**
+ * Combines `incoming` with the item's current selection (sanitized against
+ * its live triangles now, so a selection made before an edit cannot bring
+ * back dead slots) by `mode`, stores it and returns it.
+ */
+export function commitFaceSelection(
+  app: AppState,
+  store: SceneStore,
+  item: Item,
+  incoming: Uint32Array,
+  mode: Wave6SelectState["combineMode"],
+): Uint32Array {
+  const indices = store.scene.views(item.mesh).indices();
+  const current = sanitizeSelectedTriangles(
+    indices,
+    app.getSnapshot().wave6.select.selectedByMesh[item.id] ?? EMPTY_U32,
+  );
+  const combined = sanitizeSelectedTriangles(indices, combineFaceSelection(current, incoming, mode));
+  writeMeshFaceSelection(app, item.id, combined);
+  return combined;
 }
 
 /** Raycasts visible scene meshes through `store.scene.inspect.raycast`, skipping hidden meshes. */

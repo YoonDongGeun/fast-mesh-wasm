@@ -162,7 +162,7 @@ src/
   features/
     home/        mesh list, project save and open, export
     view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
-    select/      object and face selection
+    select/      object and face selection, faces by criteria
     transform/   numeric transform, scale, placement helpers, ICP alignment
     inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
                  triangle quality maps

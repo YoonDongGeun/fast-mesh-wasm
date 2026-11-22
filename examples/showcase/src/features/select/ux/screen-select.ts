@@ -3,6 +3,7 @@
 // triangles against, and the camera it projects them with.
 import type { ScreenSelectOptions, ScreenSelectionShape, Vec3 } from "fast-mesh-wasm";
 import * as THREE from "three";
+import type { CameraPose } from "./face-criteria";
 
 /** A box dragged less than this far (in pixels) counts as a click and gets a small pick pad. */
 export const CLICK_DRAG_THRESHOLD_PX = 3;
@@ -129,5 +130,22 @@ export function buildScreenSelectOptions(
     visibleOnly,
     rejectBackfaces,
     includeTouching,
+  };
+}
+
+/** Where `camera` is and looks in the world, for the facing-the-camera criterion. */
+export function cameraPoseOf(camera: THREE.Camera): CameraPose {
+  camera.updateMatrixWorld();
+  const origin = new THREE.Vector3();
+  const forward = new THREE.Vector3();
+  camera.getWorldPosition(origin);
+  camera.getWorldDirection(forward);
+  if (forward.lengthSq() === 0) {
+    forward.set(0, 0, -1);
+  }
+  return {
+    eye: [origin.x, origin.y, origin.z],
+    forward: [forward.x, forward.y, forward.z],
+    orthographic: Boolean((camera as THREE.OrthographicCamera).isOrthographicCamera),
   };
 }

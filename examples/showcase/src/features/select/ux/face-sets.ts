@@ -31,10 +31,27 @@ export function countLiveTriangles(indices: ArrayLike<number>): number {
   return live;
 }
 
-/** Returns sorted, deduplicated non-negative integer triangle indices. */
+/** Whether a `Uint32Array` is strictly ascending (sorted, no duplicates). */
+function isStrictlyAscending(values: Uint32Array): boolean {
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] <= values[i - 1]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns sorted, deduplicated non-negative integer triangle indices. An
+ * already ascending `Uint32Array` (what every tool stores) comes back as
+ * is, so large selections cost one pass.
+ */
 function toSortedUniqueUint32(values: ArrayLike<number>): Uint32Array {
   if (values.length === 0) {
     return EMPTY_U32;
+  }
+  if (values instanceof Uint32Array && isStrictlyAscending(values)) {
+    return values;
   }
   const clean: number[] = [];
   for (let i = 0; i < values.length; i++) {
@@ -139,6 +156,13 @@ export function sanitizeSelectedTriangles(
   const sorted = toSortedUniqueUint32(selected);
   if (sorted.length === 0) {
     return EMPTY_U32;
+  }
+  let allLive = true;
+  for (let i = 0; i < sorted.length && allLive; i++) {
+    allLive = isLiveTriangleSlot(indices, sorted[i]);
+  }
+  if (allLive) {
+    return sorted;
   }
   const out: number[] = [];
   for (let i = 0; i < sorted.length; i++) {
