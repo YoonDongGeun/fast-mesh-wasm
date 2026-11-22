@@ -38,7 +38,7 @@ import {
 } from "../../features/view/ui/shading";
 import {
   countRepairOverlays,
-} from "../../features/mesh-repair/ui/repair-overlays";
+} from "../../features/mesh-repair/ux/repair-overlay-data";
 import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "../../features/mesh-repair/ui/healer-overlays";
 import { DeformHandlesLayer } from "../../features/sculpt/ui/DeformHandlesLayer";
 import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer";

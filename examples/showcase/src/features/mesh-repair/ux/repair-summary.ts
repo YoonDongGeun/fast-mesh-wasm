@@ -17,6 +17,7 @@ import type {
   SliverReport,
   SurfaceRemeshReport,
 } from "fast-mesh-wasm";
+import type { RepairOverlayKind } from "../../../app/state/app-state";
 import { type LengthUnit, toDisplayLength } from "../../../shared/ux/units";
 
 export interface AnalysisSummary {
@@ -67,6 +68,16 @@ export function summarize(a: Analysis): AnalysisSummary {
     s.degenerate === 0 &&
     s.duplicate === 0;
   return { ...s, clean };
+}
+
+/** How many issues of each overlay kind the summary holds (beyond the one largest component). */
+export function overlayIssueCounts(s: AnalysisSummary): Record<RepairOverlayKind, number> {
+  return {
+    holes: s.holes.length,
+    nonManifold: s.nonManifoldEdges,
+    degenerate: s.degenerate + s.duplicate,
+    components: Math.max(0, s.components.length - 1),
+  };
 }
 
 /** `1 triangle`, `2 triangles` (or the given plural). */
@@ -270,6 +281,13 @@ export function buildPresetAutoRepairRequest(settings: PresetRepairSettings): Au
     req.voxelSize = settings.voxelSize;
   }
   return req;
+}
+
+/** The note under Auto repair: the default pipeline's order, or what the chosen preset tailors. */
+export function autoRepairNote(preset: AutoRepairPreset, siOverride: SelfIntersectionMode | "auto"): string {
+  return preset === "general" && siOverride === "auto"
+    ? "Order: weld → remove degenerate → orient → remove small components → fill holes. Uses the tolerance, “below”, “max edges” and “fair” settings above; one grouped undo step (Ctrl+Z). Reports one line per stage with before → after counts."
+    : `Preset ${AUTO_REPAIR_PRESET_LABELS[preset]}: tailors healing stages and tolerances (${preset === "print3d" ? "watertight solid with self-intersection healing + volumetric fallback" : preset === "scan3d" ? "non-manifold healing, outlier pruning, slivers & smooth hole filling" : preset === "cadImport" ? "duplicate & non-manifold cleanup keeping sharp CAD boundaries open" : "standard 5-stage cleanup"}) in one undo step (Ctrl+Z).`;
 }
 
 function beforeAfterCount(n: readonly [number, number], word: string, words = `${word}s`): string {

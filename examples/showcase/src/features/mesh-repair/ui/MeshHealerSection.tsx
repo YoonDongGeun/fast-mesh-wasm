@@ -4,119 +4,24 @@
  * - Click-to-focus defect hotspots
  * - Selective per-category repair checkboxes + [data-repair-op="selectiveHeal"]
  * - Before/after delta readout ([data-healer-delta])
+ * What they do lives in `ux/mesh-healer.ts`.
  */
-import type { Analysis, MeshHandle, RepairOp, SelfIntersectionMode } from "fast-mesh-wasm";
-import type { WorkerScene } from "fast-mesh-wasm/worker";
+import type { Analysis, MeshHandle } from "fast-mesh-wasm";
 import { useMemo, useState } from "react";
 import type { AppState, HealerOverlayKind, RepairOverlayKind } from "../../../app/state/app-state";
 import { useApp } from "../../../app/state/app-state";
+import { HEALER_OVERLAY_KINDS } from "../ux/healer-defects";
 import {
-  countHealerOverlays,
-  type DefectHotspot,
-  extractDefectHotspots,
-  HEALER_OVERLAY_COLORS,
-  HEALER_OVERLAY_KINDS,
-  type HealerOverlayCounts,
-} from "./healer-overlays";
-import { REPAIR_OVERLAY_COLORS } from "./repair-overlays";
+  DEFAULT_SELECTIVE_HEAL,
+  focusDefectHotspot,
+  type HealerMeshViews,
+  readHealerDefects,
+  SELECTIVE_HEAL_CATEGORIES,
+  type SelectiveHealCategory,
+} from "../ux/mesh-healer";
 import { plural, type AnalysisSummary } from "../ux/repair-summary";
-
-export type SelectiveHealCategory =
-  | "weld"
-  | "removeDegenerate"
-  | "orient"
-  | "makeManifold"
-  | "removeSmallComponents"
-  | "fillHoles"
-  | "cleanupSlivers"
-  | "resolveSelfIntersections";
-
-export const SELECTIVE_HEAL_CATEGORIES: readonly { key: SelectiveHealCategory; label: string }[] = [
-  { key: "weld", label: "Weld coincident vertices" },
-  { key: "removeDegenerate", label: "Degenerate & duplicate tris" },
-  { key: "orient", label: "Orient normals & shells" },
-  { key: "makeManifold", label: "Make manifold (edges/pinch)" },
-  { key: "removeSmallComponents", label: "Prune small islands" },
-  { key: "fillHoles", label: "Fill holes" },
-  { key: "cleanupSlivers", label: "Clean sliver faces" },
-  { key: "resolveSelfIntersections", label: "Resolve self-intersections" },
-];
-
-export interface SelectiveHealSettings {
-  weldTolerance: number;
-  minTriangles: number;
-  maxEdges: number;
-  fair: boolean;
-  anySize: number;
-  selfIntersectionMode: SelfIntersectionMode;
-  siVoxelSize: string;
-}
-
-export function buildSelectiveHealOps(
-  enabled: Record<SelectiveHealCategory, boolean>,
-  settings: SelectiveHealSettings,
-): RepairOp[] {
-  const ops: RepairOp[] = [];
-  if (enabled.weld) {
-    ops.push({ op: "weld", tolerance: settings.weldTolerance });
-  }
-  if (enabled.removeDegenerate) {
-    ops.push({ op: "removeDegenerate" });
-  }
-  if (enabled.orient) {
-    ops.push({ op: "orient" });
-  }
-  if (enabled.makeManifold) {
-    ops.push({ op: "makeManifold" });
-  }
-  if (enabled.removeSmallComponents) {
-    ops.push({ op: "removeSmallComponents", minTriangles: settings.minTriangles });
-  }
-  if (enabled.fillHoles) {
-    ops.push({
-      op: "fillHoles",
-      maxEdges: settings.maxEdges > 0 ? settings.maxEdges : settings.anySize,
-      fair: settings.fair,
-    });
-  }
-  if (enabled.cleanupSlivers) {
-    ops.push({ op: "cleanupSlivers", maxAspectRatio: 20 });
-  }
-  if (enabled.resolveSelfIntersections) {
-    const mode = settings.selfIntersectionMode === "none" ? "deleteAndFill" : settings.selfIntersectionMode;
-    ops.push({
-      op: "resolveSelfIntersections",
-      mode,
-      fair: settings.fair,
-      ...(settings.siVoxelSize !== "" && Number(settings.siVoxelSize) > 0
-        ? { voxelSize: Number(settings.siVoxelSize) }
-        : {}),
-    });
-  }
-  return ops;
-}
-
-export function formatHealerDelta(
-  before: AnalysisSummary,
-  after: AnalysisSummary,
-  beforeExtra?: Partial<HealerOverlayCounts> | null,
-  afterExtra?: Partial<HealerOverlayCounts> | null,
-): string {
-  const parts: string[] = [
-    `Holes: ${before.holes.length} → ${after.holes.length}`,
-    `Non-manifold: ${before.nonManifoldEdges} → ${after.nonManifoldEdges}`,
-    `Orientation: ${before.orientationConflicts} → ${after.orientationConflicts}`,
-    `Degenerate: ${before.degenerate + before.duplicate} → ${after.degenerate + after.duplicate}`,
-    `Components: ${before.components.length} → ${after.components.length}`,
-  ];
-  if (beforeExtra?.slivers !== undefined && afterExtra?.slivers !== undefined) {
-    parts.push(`Slivers: ${beforeExtra.slivers} → ${afterExtra.slivers}`);
-  }
-  if (beforeExtra?.selfIntersections !== undefined && afterExtra?.selfIntersections !== undefined) {
-    parts.push(`Self-intersect tris: ${beforeExtra.selfIntersections} → ${afterExtra.selfIntersections}`);
-  }
-  return parts.join(" · ");
-}
+import { HEALER_OVERLAY_COLORS } from "./healer-overlays";
+import { REPAIR_OVERLAY_COLORS } from "./repair-overlays";
 
 const HEALER_LABELS: Record<HealerOverlayKind, string> = {
   selfIntersections: "Self-intersections",
@@ -134,7 +39,7 @@ function swatchHex(kind: RepairOverlayKind | HealerOverlayKind): string {
 
 export function MeshHealerSection(props: {
   app: AppState;
-  scene: { views: (mesh: MeshHandle) => { positions(): Float32Array; indices(): Uint32Array } } | WorkerScene;
+  scene: HealerMeshViews;
   mesh: MeshHandle;
   rawAnalysis: Analysis | null;
   summary: AnalysisSummary;
@@ -145,50 +50,14 @@ export function MeshHealerSection(props: {
   const { app, scene, mesh, rawAnalysis, disabled, deltaLine, onRunSelective } = props;
   const healerKinds = useApp(app, (s) => s.healerOverlays);
 
-  const [selectedCats, setSelectedCats] = useState<Record<SelectiveHealCategory, boolean>>({
-    weld: true,
-    removeDegenerate: true,
-    orient: true,
-    makeManifold: true,
-    removeSmallComponents: true,
-    fillHoles: true,
-    cleanupSlivers: true,
-    resolveSelfIntersections: false,
-  });
+  const [selectedCats, setSelectedCats] = useState<Record<SelectiveHealCategory, boolean>>(DEFAULT_SELECTIVE_HEAL);
 
-  const { hotspots, extraCounts } = useMemo(() => {
-    if (rawAnalysis === null) {
-      return {
-        hotspots: [] as DefectHotspot[],
-        extraCounts: { selfIntersections: 0, inverted: 0, slivers: 0 } satisfies HealerOverlayCounts,
-      };
-    }
-    try {
-      const views = scene.views(mesh);
-      const pos = views.positions();
-      const idx = views.indices();
-      return {
-        hotspots: extractDefectHotspots(rawAnalysis, pos, idx),
-        extraCounts: countHealerOverlays(rawAnalysis, pos, idx),
-      };
-    } catch {
-      return {
-        hotspots: [] as DefectHotspot[],
-        extraCounts: { selfIntersections: 0, inverted: 0, slivers: 0 } satisfies HealerOverlayCounts,
-      };
-    }
-  }, [rawAnalysis, scene, mesh]);
+  const { hotspots, extraCounts } = useMemo(
+    () => readHealerDefects(rawAnalysis, scene, mesh),
+    [rawAnalysis, scene, mesh],
+  );
 
   const anySelected = Object.values(selectedCats).some(Boolean);
-
-  const focusSpot = (spot: DefectHotspot) => {
-    if (spot.kind in HEALER_OVERLAY_COLORS) {
-      app.setHealerOverlay(spot.kind as HealerOverlayKind, true);
-    } else {
-      app.setRepairOverlay(spot.kind as RepairOverlayKind, true);
-    }
-    app.focusDefect(mesh, spot.center, spot.radius);
-  };
 
   return (
     <div className="healer-section" data-mesh-healer>
@@ -231,7 +100,7 @@ export function MeshHealerSection(props: {
                   type="button"
                   className="healer-hotspot-btn"
                   data-healer-focus={spot.id}
-                  onClick={() => focusSpot(spot)}
+                  onClick={() => focusDefectHotspot(app, mesh, spot)}
                   title={`Focus camera on ${spot.label}`}
                 >
                   <span
