@@ -121,8 +121,7 @@ The dev and preview servers send the cross-origin isolation headers (COOP/COEP, 
 
 ## Source layout
 
-`src/features/` has one folder per ribbon area, named after MeshInspector's ribbon tabs where one
-matches. Each feature has two parts:
+`src/features/` has one folder per ribbon area. Each feature has two parts:
 
 - `ui/`: what is shown. React panels and viewport layers, and the three.js objects they draw.
 - `ux/`: how it behaves. Input handling, tool state, engine calls and the math behind them. No JSX.

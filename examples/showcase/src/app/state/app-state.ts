@@ -190,7 +190,7 @@ export interface CameraDirectionRequest {
   n: number;
 }
 
-/** MeshInspector-style workspace ribbon tab (#228). */
+/** A workspace ribbon tab (#228). */
 export type WorkbenchTab = "home" | "select" | "repair" | "edit" | "sculpt" | "align" | "volume" | "inspect";
 
 /** Diagnostic shading modes across the viewport (#232). */

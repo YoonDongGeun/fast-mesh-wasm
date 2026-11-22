@@ -3,7 +3,7 @@
 - **Date:** 2026-11-13
 - **Issues:** [#177](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/177), [#192](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/192), [#197](https://github.com/YoonDongGeun/fast-mesh-wasm/issues/197)
 - **Branch:** `feat/177-192-sculpt-brushes`
-- **Architectural References:** [MeshInspector / MeshLib](https://github.com/MeshInspector/MeshLib) (domain modularization & localized `O(|region|)` operators), [elalish/manifold](https://github.com/elalish/manifold) (deterministic float geometry invariants & parallel-ready design), de Goes & James 2017 (*Regularized Kelvinlets*).
+- **Architectural References:** [elalish/manifold](https://github.com/elalish/manifold) (deterministic float geometry invariants & parallel-ready design), de Goes & James 2017 (*Regularized Kelvinlets*).
 
 ---
 
@@ -19,7 +19,7 @@ Downstream builders of web-based 3D sculpting, dental/medical CAD, and mesh proc
    - **Extra Brushes:** Plane-based `Flatten` (`Both` / `Peaks` [scrape] / `Valleys` [fill]), `Crease` (+ `Pinch`), `Clay` (`Round` / `Strips`), and `Twist` (`Vortex` / `Kelvinlet`).
    - **Local-Axis Mirror `Symmetry`:** `X` / `Y` / `Z` (`1..8` passes) inside one `O(|brush|)` BVH dab and one undo step.
 
-2. **Clean Domain Modularization (MeshInspector / MeshLib Pattern):**
+2. **Clean Domain Modularization:**
    - Previously, mesh repair (`weld`, `fill_holes`, `orient`), brush sculpting (`inflate`, `smooth`, `grab`), global remeshing (`simplify`, `subdivide`, `offset`, `shell`), and boolean operations lived flat in `crates/fast-mesh-ops/src/` and piled onto a single `Scene.repair` surface.
    - Starting in this branch, brush sculpting is organized into a dedicated **`sculpt` domain module** (`crates/fast-mesh-ops/src/sculpt/`, re-exported from `fast_mesh_ops::sculpt` and kept backwards-compatible at `fast_mesh_ops::deform`), paired with clean `SculptOp` / `scene.sculpt(mesh, op)` TypeScript domain types alongside backwards-compatible `RepairOp` / `scene.repair(...)` support. Subsequent steps continue domain separation across `repair/`, `remesh/`, `boolean/` (with `elalish/manifold`-style generalized winding numbers + directional symbolic perturbation + SDF/EDT fallback), and `deform/` (#193).
 

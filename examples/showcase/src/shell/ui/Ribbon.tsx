@@ -1,5 +1,5 @@
 /**
- * MeshInspector-style 2-tier Workspace Ribbon (#228):
+ * The 2-tier Workspace Ribbon (#228):
  * - Tier 1 (`.toolbar`): Quick-Access header + 8 Workspace Ribbon Tabs.
  * - Tier 2 (`.ribbon-shelf`): Contextual tool actions for the active tab, plus
  *   the always-mounted `<SculptToolbox>` (CSS-hidden outside `Sculpt & Deform`
