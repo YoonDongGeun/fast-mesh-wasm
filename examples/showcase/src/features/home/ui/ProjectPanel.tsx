@@ -1,50 +1,11 @@
-// The project save/reopen buttons (issue #126): saving writes the session
-// (meshes + placements + coloring/section state) through the File System
-// Access picker where available, else a download; opening reads one back and
-// replaces the session. Errors show in the panel; cancelling stays silent.
-import { useScene } from "fast-mesh-wasm/react";
-import { useState } from "react";
+// The project save/reopen buttons (issue #126), over `useProjectFile`.
+// Errors show in the panel; cancelling stays silent.
 import { type AppState } from "../../../app/state/app-state";
-import {
-  collectProject,
-  openProjectFile,
-  parseProjectDoc,
-  projectFileName,
-  restoreProject,
-  saveProjectFile,
-} from "../../../io/project";
+import { useProjectFile } from "../ux/use-project-file";
 
 export function ProjectPanel(props: { app: AppState }) {
   const { app } = props;
-  const store = useScene();
-  const [message, setMessage] = useState<string | null>(null);
-
-  const onSave = (): void => {
-    void (async () => {
-      try {
-        const text = JSON.stringify(collectProject(store, app));
-        await saveProjectFile(text, projectFileName());
-        setMessage(null);
-      } catch (error) {
-        setMessage(`Could not save the project: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    })();
-  };
-
-  const onOpen = (): void => {
-    void (async () => {
-      try {
-        const file = await openProjectFile();
-        if (file === null) {
-          return;
-        }
-        restoreProject(store, app, parseProjectDoc(await file.text()));
-        setMessage(null);
-      } catch (error) {
-        setMessage(`Could not open the project: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    })();
-  };
+  const { message, save: onSave, open: onOpen } = useProjectFile(app);
 
   return (
     <section className="panel" aria-label="Project">

@@ -11,7 +11,7 @@ import { settingsFromSnapshot } from "../../shared/ux/settings";
 import { collectProject, parseProjectDoc, restoreProject } from "../../io/project";
 import { type CollisionCsvRow, collisionRowsToCsv, contoursToDxf, contoursToSvg } from "../../io/report";
 import { parseBigFileParams } from "../../io/big-file";
-import { buildCollisionRows, readSectionContours } from "../../features/home/ui/ExportPanel";
+import { buildCollisionRows, readSectionContours } from "../../features/home/ux/export-actions";
 import { shadeProbe } from "./shade-probe";
 import type { AppState } from "../state/app-state";
 import { view } from "../../viewport/ux/view";

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { PREVIEW_SIZE, PreviewQueue, type PreviewHost, PreviewRender, type PreviewSource, turnChanged } from "../src/features/home/ui/mesh-preview";
+import { PREVIEW_SIZE, PreviewRender, type PreviewSource } from "../src/features/home/ui/mesh-preview";
+import { PreviewQueue, type PreviewHost, turnChanged } from "../src/features/home/ux/preview-schedule";
 
 /** A closed axis-aligned box, its corners about `at`. */
 function box(at: [number, number, number], half: [number, number, number]) {

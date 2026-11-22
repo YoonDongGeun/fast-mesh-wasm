@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCollisionRows,
   readSectionContours,
-} from "../src/features/home/ui/ExportPanel";
+} from "../src/features/home/ux/export-actions";
 import {
   collisionRowsToCsv,
   contoursToDxf,

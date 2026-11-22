@@ -3,40 +3,26 @@
 // selection, focus and removal. Heavy loads warn past `?warn-tris=` and can
 // be decimated on load (the #118 simplify op) past `?decimate-tris=`.
 import { useMeshDisplay, useScene, useSelection } from "fast-mesh-wasm/react";
-import type { SceneStore } from "fast-mesh-wasm/store";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { BIG_FILE_DEFAULTS, estimateMeshBytes, formatMeshBytes, formatTriangles, parseBigFileParams } from "../../../io/big-file";
+import { useMemo, useRef, useState } from "react";
+import { formatMeshBytes, formatTriangles } from "../../../io/big-file";
 import { MESH_EXTENSIONS } from "../../../io/parse";
 import { PHANTOM_NAMES, type PhantomKind } from "../../../io/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../../../io/vtkjs";
-import { type AppState, type DiagnosticShadingMode, type Item, type Job, useApp } from "../../../app/state/app-state";
-import { selectMesh } from "../../select/ux/selection";
-import { duplicateMesh, type MirrorAxis, mirrorMesh } from "../../../engine/workbench-ops";
+import { type AppState, type DiagnosticShadingMode, type Item, useApp } from "../../../app/state/app-state";
+import type { MirrorAxis } from "../../../engine/workbench-ops";
 import { useMeshPreview } from "./mesh-preview";
-import { IMPORT_UNITS, importScaleFromFactor, importScaleOf, isImportUnit, parseImportScale } from "../../../shared/ux/units";
-
-const PHASE: Record<Job["phase"], string> = {
-  reading: "reading…",
-  parsing: "parsing…",
-  decimating: "decimating…",
-  adding: "adding…",
-  done: "loaded",
-  error: "failed",
-};
-
-/** Reads the large-file thresholds from the URL (tolerant; see big-file.ts). */
-function bigFileParams(): { warnTriangles: number; decimateTriangles: number; decimateTarget: number } {
-  try {
-    const p = parseBigFileParams(location.search);
-    return { warnTriangles: p.warnTriangles, decimateTriangles: p.decimateTriangles, decimateTarget: p.decimateTarget };
-  } catch {
-    return {
-      warnTriangles: BIG_FILE_DEFAULTS.warnTriangles,
-      decimateTriangles: BIG_FILE_DEFAULTS.decimateTriangles,
-      decimateTarget: BIG_FILE_DEFAULTS.decimateTarget,
-    };
-  }
-}
+import { IMPORT_UNITS } from "../../../shared/ux/units";
+import {
+  bigFileParams,
+  clickRow,
+  formatCount,
+  heavyMeshes,
+  LOAD_PHASE,
+  meshGroupIndex,
+  useImportScaleDraft,
+  useMeshActions,
+  useTriangleCount,
+} from "../ux/mesh-list";
 
 export function MeshList(props: {
   app: AppState;
@@ -58,23 +44,13 @@ export function MeshList(props: {
   const inspectSection = useApp(app, (s) => s.inspectSection);
   const clipBox = useApp(app, (s) => s.clipBox);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<number, boolean>>({});
-  const [mirrorAxis, setMirrorAxis] = useState<MirrorAxis>("x");
-  const [mirrorBusy, setMirrorBusy] = useState(false);
-  const groupByMesh = useMemo(() => {
-    const map = new Map<Item["mesh"], { id: number; name: string }>();
-    for (const g of meshGroups) {
-      for (const m of g.members) {
-        map.set(m, { id: g.id, name: g.name });
-      }
-    }
-    return map;
-  }, [meshGroups]);
-  const volumes = useMemo(() => items.filter((i) => i.volumeId !== null), [items]);
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
+  const { mirrorAxis, setMirrorAxis, mirrorBusy, duplicate, mirror } = useMeshActions(store, app, selectedItem);
+  const groupByMesh = useMemo(() => meshGroupIndex(meshGroups), [meshGroups]);
+  const volumes = useMemo(() => items.filter((i) => i.volumeId !== null), [items]);
   const input = useRef<HTMLInputElement>(null);
   const big = useMemo(bigFileParams, []);
-  const heavy = items.filter((i) => i.triangles >= big.warnTriangles);
-  const heavyBytes = heavy.reduce((n, i) => n + estimateMeshBytes(i.triangles), 0);
+  const { heavy, bytes: heavyBytes } = heavyMeshes(items, big.warnTriangles);
 
   return (
     <section className="panel" aria-label="Meshes" data-tour="mesh-list">
@@ -164,7 +140,7 @@ export function MeshList(props: {
               <span className="job-name" title={job.name}>
                 {job.name}
               </span>
-              <span className="job-phase">{job.message === "cancelled" ? "cancelled" : PHASE[job.phase]}</span>
+              <span className="job-phase">{job.message === "cancelled" ? "cancelled" : LOAD_PHASE[job.phase]}</span>
               {job.phase !== "done" && job.phase !== "error" ? (
                 <button
                   type="button"
@@ -210,11 +186,7 @@ export function MeshList(props: {
           data-action="mesh-duplicate"
           disabled={selectedItem === null || mirrorBusy}
           title="Clone selected mesh's live geometry, attributes, and placement"
-          onClick={() => {
-            if (selectedItem) {
-              duplicateMesh(store, app, selectedItem);
-            }
-          }}
+          onClick={duplicate}
         >
           Duplicate
         </button>
@@ -234,11 +206,7 @@ export function MeshList(props: {
           data-action="mesh-mirror"
           disabled={selectedItem === null || mirrorBusy}
           title="Mirror selected mesh across chosen axis and flip triangle winding"
-          onClick={() => {
-            if (!selectedItem) return;
-            setMirrorBusy(true);
-            void mirrorMesh(store, selectedItem.mesh, mirrorAxis).finally(() => setMirrorBusy(false));
-          }}
+          onClick={mirror}
         >
           Mirror
         </button>
@@ -371,9 +339,7 @@ function ModelButton(props: { action: string; name: string; title: string; onCli
  */
 function ImportScaleControl(props: { app: AppState }) {
   const { app } = props;
-  const scale = useApp(app, (s) => s.importScale);
-  // The factor as typed: an unusable one shows as invalid and is not applied.
-  const [draft, setDraft] = useState<string | null>(null);
+  const { scale, draft, invalid, chooseUnits, typeFactor, endEdit } = useImportScaleDraft(app);
   return (
     <div className="import-scale small">
       <label className="field" title="The unit the next files' numbers are in">
@@ -381,13 +347,7 @@ function ImportScaleControl(props: { app: AppState }) {
         <select
           data-control="import-units"
           value={scale.units ?? "custom"}
-          onChange={(e) => {
-            const units = e.currentTarget.value;
-            if (isImportUnit(units)) {
-              setDraft(null);
-              app.setImportScale(importScaleOf(units));
-            }
-          }}
+          onChange={(e) => chooseUnits(e.currentTarget.value)}
         >
           {IMPORT_UNITS.map((u) => (
             <option key={u} value={u}>
@@ -404,17 +364,10 @@ function ImportScaleControl(props: { app: AppState }) {
           data-control="import-scale"
           min={0}
           step="any"
-          aria-invalid={draft !== null && parseImportScale(draft) === null}
+          aria-invalid={invalid}
           value={draft ?? scale.factor}
-          onChange={(e) => {
-            const text = e.currentTarget.value;
-            setDraft(text);
-            const factor = parseImportScale(text);
-            if (factor !== null) {
-              app.setImportScale(importScaleFromFactor(factor));
-            }
-          }}
-          onBlur={() => setDraft(null)}
+          onChange={(e) => typeFactor(e.currentTarget.value)}
+          onBlur={endEdit}
         />
       </label>
     </div>
@@ -475,11 +428,7 @@ function MeshRow(props: {
           className="mesh-name"
           aria-pressed={selected}
           title={`${item.name}: select (shift-click adds)`}
-          onClick={(e) => {
-            // Plain clicks reset (a lone selection toggles off); shift-clicks toggle.
-            const target = e.shiftKey || !selected || multi.length > 1 ? item.mesh : null;
-            selectMesh(app, select, selection, target, e.shiftKey && target !== null);
-          }}
+          onClick={(e) => clickRow(app, select, selection, item.mesh, multi, e.shiftKey)}
         >
           {item.name}
         </button>
@@ -563,40 +512,4 @@ function MeshRow(props: {
       </div>
     </li>
   );
-}
-
-/** "12,288" or "1.05 M". */
-function formatCount(n: number): string {
-  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)} M` : n.toLocaleString("en");
-}
-
-/**
- * The mesh's live triangle count: as loaded, then recounted from the scene's
- * index view whenever its triangles change (repairs, their undo). A removed
- * triangle reads `0, 0, 0` and is not counted.
- */
-function useTriangleCount(store: SceneStore, item: Item): number {
-  const [count, setCount] = useState(item.triangles);
-  useEffect(
-    () =>
-      store.scene.onChanges((changes) => {
-        for (const c of changes) {
-          if (c.mesh !== item.mesh || c.removed || c.added) {
-            continue;
-          }
-          if (c.indices === "all" || c.indices.length > 0) {
-            const idx = store.scene.views(item.mesh).indices();
-            let n = 0;
-            for (let t = 0; t < idx.length; t += 3) {
-              if (idx[t] !== 0 || idx[t + 1] !== 0 || idx[t + 2] !== 0) {
-                n++;
-              }
-            }
-            setCount(n);
-          }
-        }
-      }),
-    [store, item.mesh],
-  );
-  return count;
 }
