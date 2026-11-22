@@ -11,12 +11,8 @@ import {
   scaleBrushRadiusForTarget,
   shouldAllowStrokeHit,
 } from "../src/viewport/ux/brush-target";
-import {
-  SculptToolbox,
-  canArmSculpt,
-  eligibleSculptItems,
-  resolveSculptTargetItem,
-} from "../src/features/sculpt/ui/Toolbox";
+import { SculptToolbox } from "../src/features/sculpt/ui/Toolbox";
+import { canArmSculpt, eligibleSculptItems, resolveSculptTargetItem } from "../src/features/sculpt/ux/sculpt-target";
 import { sculptBrush, type SculptTool } from "../src/features/sculpt/ux/sculpt";
 
 function makeSelectedApp() {

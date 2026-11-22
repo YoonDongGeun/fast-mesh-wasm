@@ -5,202 +5,56 @@
 // remesh toggles; the viewport paints the strokes.
 // The mask group paints the protected region the brushes hold (invert and
 // clear included); mask painting disarms the sculpt brush and vice versa.
-import type { DyntopoMode, GrabMethod, InflateMethod, MeshHandle, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
-import { useScene, useSelection, useStoreSelector } from "fast-mesh-wasm/react";
-import { meshState, type SceneSnapshot } from "fast-mesh-wasm/store";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { inspect } from "../../../app/state/readouts";
+import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import { LengthInput } from "../../../shared/ui/LengthInput";
-import type {
-  SculptFilterKind,
-  SculptFilterSettings,
-  SculptMethods,
-  SculptSymmetrySettings,
-} from "../../../shared/ux/settings";
+import type { SculptFilterKind } from "../../../shared/ux/settings";
 import { formatLength } from "../../../shared/ux/units";
-import { type AppState, type Item, useApp } from "../../../app/state/app-state";
+import type { AppState } from "../../../app/state/app-state";
 import {
-  applyDyntopoRoi,
-  DEFAULT_STRENGTHS,
   DYNTOPO_MODE_OPTIONS,
   FILTER_KIND_OPTIONS,
-  GRAB_METHOD_OPTIONS,
-  INFLATE_METHOD_OPTIONS,
   REMESH_TRI_LIMIT,
-  SMOOTH_METHOD_OPTIONS,
-  TWIST_METHOD_OPTIONS,
-  checkMask,
-  invertMaskIds,
   remeshTooBig,
-  sculptBrush,
   type SculptTool,
 } from "../ux/sculpt";
+import {
+  formatReadout,
+  methodConfigFor,
+  SCULPT_TOOLS,
+  useMaskTools,
+  useSculptToolbox,
+} from "../ux/use-sculpt-toolbox";
 
 export type { SculptTool };
 
-/** Filters `items` down to visible, unlocked meshes that sculpt/mask tools can target (#229). */
-export function eligibleSculptItems(items: readonly Item[], storeSnapshot: SceneSnapshot): Item[] {
-  return items.filter((item) => !item.locked && meshState(storeSnapshot, item.mesh).desired.visible);
-}
-
-/**
- * Resolves which visible, unlocked mesh sculpt/mask UI controls operate on (#229).
- * When `pinToActive` is true, restricts to `selection` (or the current target if unset).
- * Otherwise keeps `currentTarget` if still eligible, falling back to `selection` then first eligible item.
- */
-export function resolveSculptTargetItem(
-  items: readonly Item[],
-  storeSnapshot: SceneSnapshot,
-  selection: MeshHandle | null,
-  currentTarget: MeshHandle | null,
-  pinToActive: boolean,
-): Item | null {
-  return resolveTargetFromEligible(eligibleSculptItems(items, storeSnapshot), selection, currentTarget, pinToActive);
-}
-
-/** Returns true when at least one eligible target can arm a sculpt brush or mask paint (#229). */
-export function canArmSculpt(
-  items: readonly Item[],
-  storeSnapshot: SceneSnapshot,
-  selection: MeshHandle | null,
-  pinToActive: boolean,
-): boolean {
-  const eligible = eligibleSculptItems(items, storeSnapshot);
-  if (eligible.length === 0) {
-    return false;
-  }
-  return pinToActive ? (selection === null ? false : eligible.some((i) => i.mesh === selection)) : true;
-}
-
-function resolveTargetFromEligible(
-  eligible: readonly Item[],
-  selection: MeshHandle | null,
-  currentTarget: MeshHandle | null,
-  pinToActive: boolean,
-): Item | null {
-  if (eligible.length === 0) {
-    return null;
-  }
-  if (pinToActive) {
-    if (selection !== null) {
-      return eligible.find((i) => i.mesh === selection) ?? null;
-    }
-    return null;
-  }
-  if (currentTarget !== null) {
-    const existing = eligible.find((i) => i.mesh === currentTarget);
-    if (existing !== undefined) {
-      return existing;
-    }
-  }
-  if (selection !== null) {
-    const selected = eligible.find((i) => i.mesh === selection);
-    if (selected !== undefined) {
-      return selected;
-    }
-  }
-  return eligible[0];
-}
-
-const TOOLS: { tool: SculptTool; label: string; title: string }[] = [
-  { tool: "inflate", label: "Inflate", title: "Puff the surface up along its normals" },
-  { tool: "deflate", label: "Deflate", title: "Shrink the surface back along its normals" },
-  { tool: "smooth", label: "Smooth", title: "Relax the surface toward its neighbours" },
-  { tool: "grab", label: "Grab", title: "Drag the surface along with the pointer" },
-  { tool: "flatten", label: "Flatten", title: "Project peaks and valleys toward the brush plane" },
-  { tool: "scrape", label: "Scrape", title: "Shave convex peaks down to the brush plane" },
-  { tool: "fill", label: "Fill", title: "Lift concave valleys up to the brush plane" },
-  { tool: "crease", label: "Crease", title: "Carve a sharp groove while pinching vertices inward" },
-  { tool: "pinch", label: "Pinch", title: "Draw vertices radially toward the brush center" },
-  { tool: "clay", label: "Clay", title: "Build flat-topped round clay dabs" },
-  { tool: "clayStrips", label: "Strips", title: "Lay oriented square clay strips along the stroke" },
-  { tool: "twist", label: "Twist", title: "Swirl vertices around the brush normal" },
-];
-
-const fmt = (v: number): string => String(Number(v.toPrecision(3)));
-
 export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | null }) {
   const { app } = props;
-  const store = useScene();
-  const [storeSelection] = useSelection();
-  const selection = props.selection !== undefined ? props.selection : storeSelection;
-  const items = useApp(app, (s) => s.items);
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const mask = useApp(app, (s) => s.sculptMask);
-  const brushPick = useApp(app, (s) => s.brushPick);
-  const pinToActive = useApp(app, (s) => s.sculptPinToActive);
-  const remesh = useApp(app, (s) => s.sculptRemesh);
-  const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
-  const dyntopo = useApp(app, (s) => s.sculptDyntopo);
-  const dyntopoMode = useApp(app, (s) => s.sculptDyntopoMode);
-  const dyntopoDetail = useApp(app, (s) => s.sculptDyntopoDetail);
-  const methods = useApp(app, (s) => s.sculptMethods);
-  const grabPoisson = useApp(app, (s) => s.sculptGrabPoisson);
-  const filter = useApp(app, (s) => s.sculptFilter);
-  const symmetry = useApp(app, (s) => s.sculptSymmetry);
-  const units = useApp(app, (s) => s.units);
-  const visMask = useStoreSelector((s) =>
-    items.map((i) => (!i.locked && meshState(s, i.mesh).desired.visible ? "1" : "0")).join(""),
-  );
-  const eligibleItems = useMemo(
-    () => items.filter((_, idx) => visMask[idx] === "1"),
-    [items, visMask],
-  );
-  const preferredCurrent = sculpt?.mesh ?? mask?.mesh ?? null;
-  const targetItem = useMemo(
-    () => resolveTargetFromEligible(eligibleItems, selection, preferredCurrent, pinToActive),
-    [eligibleItems, selection, preferredCurrent, pinToActive],
-  );
-  const targetMesh = targetItem?.mesh ?? null;
-  const [tool, setTool] = useState<SculptTool>(() => sculpt?.tool ?? "inflate");
-  const [radius, setRadius] = useState(0.25);
-  const [strengths, setStrengths] = useState<Record<SculptTool, number>>(DEFAULT_STRENGTHS);
-  const [falloff, setFalloff] = useState<"linear" | "smooth">("smooth");
-  const armed = sculpt !== null && targetMesh !== null && sculpt.mesh === targetMesh;
-  const activeTool = armed && sculpt.tool !== undefined ? sculpt.tool : tool;
-  const lastTargetMeshRef = useRef<MeshHandle | null>(null);
-
-  useEffect(() => {
-    if (armed && sculpt.tool !== undefined && sculpt.tool !== tool) {
-      setTool(sculpt.tool);
-    }
-  }, [armed, sculpt?.tool, tool]);
-
-  // If all eligible meshes disappear (hidden/locked/removed), disarm sculpting.
-  useEffect(() => {
-    if (targetMesh === null && sculpt !== null) {
-      app.setSculpt(null);
-    }
-  }, [app, targetMesh, sculpt]);
-
-  // The radius follows the target mesh (adopting hover-scaled radius if already armed there).
-  useEffect(() => {
-    if (targetItem === null) {
-      lastTargetMeshRef.current = null;
-      return;
-    }
-    if (lastTargetMeshRef.current !== targetItem.mesh) {
-      lastTargetMeshRef.current = targetItem.mesh;
-      if (sculpt !== null && sculpt.mesh === targetItem.mesh) {
-        setRadius(sculpt.radius);
-        return;
-      }
-      setRadius(targetItem.radius / 4);
-    }
-  }, [targetItem?.mesh, targetItem?.radius, sculpt]);
-
-  // While armed, the toolbox drives the sculpt brush live (sliders and pickers
-  // stay adjustable mid-stroke).
-  useEffect(() => {
-    if (armed && targetMesh !== null) {
-      arm(app, targetMesh, activeTool, radius, strengths[activeTool], falloff, {
-        methods,
-        grabPoisson,
-        filter,
-        symmetry,
-      });
-    }
-  }, [app, armed, targetMesh, activeTool, radius, strengths, falloff, methods, grabPoisson, filter, symmetry]);
+  const {
+    eligibleItems,
+    targetItem,
+    targetMesh,
+    armed,
+    activeTool,
+    radius,
+    setRadius,
+    strengths,
+    setStrength,
+    falloff,
+    setFalloff,
+    pinToActive,
+    remesh,
+    liveRemesh,
+    dyntopo,
+    dyntopoMode,
+    dyntopoDetail,
+    methods,
+    grabPoisson,
+    filter,
+    symmetry,
+    units,
+    pickTool,
+    remeshRoi,
+  } = useSculptToolbox(app, props.selection);
 
   if (eligibleItems.length === 0) {
     return null;
@@ -217,7 +71,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
   return (
     <div className="toolbox" role="toolbar" aria-label="Sculpt tools">
       <div className="group">
-        {TOOLS.map((t) => (
+        {SCULPT_TOOLS.map((t) => (
           <button
             key={t.tool}
             type="button"
@@ -229,24 +83,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
                 ? "Select an unlocked visible mesh or uncheck Pin to active mesh to sculpt"
                 : t.title
             }
-            onClick={() => {
-              if (armed && activeTool === t.tool) {
-                app.setSculpt(null);
-                return;
-              }
-              if (targetMesh === null) {
-                return;
-              }
-              setTool(t.tool);
-              // One pointer owner: sculpting disarms the mask paint.
-              app.setMaskPaint(false);
-              arm(app, targetMesh, t.tool, radius, strengths[t.tool], falloff, {
-                methods,
-                grabPoisson,
-                filter,
-                symmetry,
-              });
-            }}
+            onClick={() => pickTool(t.tool)}
           >
             {t.label}
           </button>
@@ -273,7 +110,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
           </p>
           {activeTool === "grab" && methods.grab === "kelvinlet" ? (
             <label className="slider" title="Elastic Poisson ratio (0 compressible .. 0.5 incompressible)">
-              poisson <output>{fmt(grabPoisson)}</output>
+              poisson <output>{formatReadout(grabPoisson)}</output>
               <input
                 type="range"
                 data-action="sculpt-grab-poisson"
@@ -313,7 +150,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
               : "Strength of one dab"
         }
       >
-        strength <output>{fmt(strength)}</output>
+        strength <output>{formatReadout(strength)}</output>
         <input
           type="range"
           data-action="sculpt-strength"
@@ -321,7 +158,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
           max={1}
           step={0.01}
           value={strength}
-          onChange={(e) => setStrengths({ ...strengths, [activeTool]: Number(e.currentTarget.value) })}
+          onChange={(e) => setStrength(Number(e.currentTarget.value))}
         />
       </label>
       <label className="field" title="How the strength falls off with distance">
@@ -353,7 +190,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
         {filter.kind === "peaksOnly" || filter.kind === "valleysOnly" ? (
           <>
             <label className="slider" title="Minimum prominence threshold before the brush engages">
-              threshold <output>{fmt(filter.threshold)}</output>
+              threshold <output>{formatReadout(filter.threshold)}</output>
               <input
                 type="range"
                 data-action="sculpt-filter-threshold"
@@ -365,7 +202,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
               />
             </label>
             <label className="slider" title="Sharpness of the filter ramp">
-              contrast <output>{fmt(filter.contrast)}</output>
+              contrast <output>{formatReadout(filter.contrast)}</output>
               <input
                 type="range"
                 data-action="sculpt-filter-contrast"
@@ -380,7 +217,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
         ) : null}
         {filter.kind === "normalAngle" ? (
           <label className="slider" title="Maximum surface normal cone half-angle (degrees)">
-            angle <output>{fmt(filter.maxAngleDeg)}°</output>
+            angle <output>{formatReadout(filter.maxAngleDeg)}°</output>
             <input
               type="range"
               data-action="sculpt-filter-angle"
@@ -510,21 +347,7 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
               data-action="sculpt-dyntopo-apply"
               disabled={targetItem === null}
               title="Clean/subdivide local Dyntopo ROI around brush center or mesh center"
-              onClick={() => {
-                if (targetItem === null) {
-                  return;
-                }
-                void applyDyntopoRoi({
-                  scene: store.scene,
-                  store,
-                  target: targetItem,
-                  brushPick,
-                  mask,
-                  mode: dyntopoMode,
-                  detail: dyntopoDetail,
-                  brushRadius: radius,
-                });
-              }}
+              onClick={remeshRoi}
             >
               Remesh ROI
             </button>
@@ -534,73 +357,6 @@ export function SculptToolbox(props: { app: AppState; selection?: MeshHandle | n
       <MaskTools app={app} targetMesh={targetMesh} radius={targetRadius} />
     </div>
   );
-}
-
-function methodConfigFor(
-  tool: SculptTool,
-  methods: SculptMethods,
-  app: AppState,
-): {
-  value: string;
-  options: readonly { value: string; label: string; description: string }[];
-  description: string;
-  onChange: (next: string) => void;
-} | null {
-  if (tool === "inflate" || tool === "deflate") {
-    const desc = INFLATE_METHOD_OPTIONS.find((o) => o.value === methods.inflate)?.description ?? "";
-    return {
-      value: methods.inflate,
-      options: INFLATE_METHOD_OPTIONS,
-      description: desc,
-      onChange: (next) => app.setSculptMethods({ inflate: next as InflateMethod }),
-    };
-  }
-  if (tool === "smooth") {
-    const desc = SMOOTH_METHOD_OPTIONS.find((o) => o.value === methods.smooth)?.description ?? "";
-    return {
-      value: methods.smooth,
-      options: SMOOTH_METHOD_OPTIONS,
-      description: desc,
-      onChange: (next) => app.setSculptMethods({ smooth: next as SmoothMethod }),
-    };
-  }
-  if (tool === "grab") {
-    const desc = GRAB_METHOD_OPTIONS.find((o) => o.value === methods.grab)?.description ?? "";
-    return {
-      value: methods.grab,
-      options: GRAB_METHOD_OPTIONS,
-      description: desc,
-      onChange: (next) => app.setSculptMethods({ grab: next as GrabMethod }),
-    };
-  }
-  if (tool === "twist") {
-    const desc = TWIST_METHOD_OPTIONS.find((o) => o.value === methods.twist)?.description ?? "";
-    return {
-      value: methods.twist,
-      options: TWIST_METHOD_OPTIONS,
-      description: desc,
-      onChange: (next) => app.setSculptMethods({ twist: next as TwistMethod }),
-    };
-  }
-  return null;
-}
-
-/** Arms (or steers) the sculpt brush for `tool` (see `sculptBrush`). */
-function arm(
-  app: AppState,
-  mesh: MeshHandle,
-  tool: SculptTool,
-  radius: number,
-  strength: number,
-  falloff: "linear" | "smooth",
-  extras: {
-    methods: SculptMethods;
-    grabPoisson: number;
-    filter: SculptFilterSettings;
-    symmetry: SculptSymmetrySettings;
-  },
-): void {
-  app.setSculpt(sculptBrush(tool, mesh, radius, strength, falloff, extras));
 }
 
 /**
@@ -613,40 +369,12 @@ function arm(
  */
 function MaskTools(props: { app: AppState; targetMesh: MeshHandle | null; radius: number }) {
   const { app, targetMesh, radius } = props;
-  const store = useScene();
-  const mask = useApp(app, (s) => s.sculptMask);
-  const painting = useApp(app, (s) => s.maskPaint);
-  const maskRadius = useApp(app, (s) => s.maskRadius);
-  const notice = useApp(app, (s) => s.sculptMaskNotice);
-  const shown = useApp(app, (s) => s.sculptMaskShown);
-  const units = useApp(app, (s) => s.units);
-  // The paint radius follows the mesh, like the sculpt radius.
-  useEffect(() => {
-    app.setMaskRadius(radius / 4);
-  }, [app, radius]);
+  const { mask, painting, maskRadius, notice, shown, units, onInvert, togglePaint } = useMaskTools(
+    app,
+    targetMesh,
+    radius,
+  );
   const sameMesh = mask !== null && targetMesh !== null && mask.mesh === targetMesh;
-
-  /** Clears a mask its mesh outlived: loud, with the notice, never silent. */
-  const staleClear = () => {
-    app.setSculptMask(null);
-    app.setSculptMaskNotice("The mask went stale after a topology edit and was cleared — repaint it.");
-    inspect.sculpt.maskStale++;
-  };
-
-  const onInvert = () => {
-    if (mask === null || !sameMesh || targetMesh === null) {
-      return;
-    }
-    try {
-      const v = store.scene.views(targetMesh);
-      const slots = v.positions().length / 3;
-      checkMask(mask, targetMesh, v.indices(), slots);
-      app.setSculptMask({ mesh: targetMesh, vertices: invertMaskIds(mask.vertices, v.indices(), slots), slots });
-    } catch {
-      // Removed meanwhile, or stale: a stale mask never silently reinterprets.
-      staleClear();
-    }
-  };
 
   return (
     <>
@@ -657,17 +385,7 @@ function MaskTools(props: { app: AppState; targetMesh: MeshHandle | null; radius
           aria-pressed={painting}
           disabled={targetMesh === null}
           title="Paint the protected region the brushes skip (disarms the sculpt brush)"
-          onClick={() => {
-            if (targetMesh === null) {
-              return;
-            }
-            const on = !painting;
-            if (on) {
-              // One pointer owner: mask painting disarms the sculpt brush.
-              app.setSculpt(null);
-            }
-            app.setMaskPaint(on);
-          }}
+          onClick={togglePaint}
         >
           Mask
         </button>
