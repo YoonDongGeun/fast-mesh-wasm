@@ -1997,6 +1997,22 @@ impl WasmScene {
         Ok(self.scene.intersects(a, b)?)
     }
 
+    /// The alive triangles of the mesh that intersect or touch another of
+    /// its triangles sharing no vertex id, ascending (see
+    /// [`Scene::self_intersecting_triangles`]). The mesh's BVH is brought
+    /// up to date first unless the mesh is Manual (then `STALE_BVH` when
+    /// stale).
+    pub fn self_intersecting_triangles(
+        &mut self,
+        index: u32,
+        generation: u32,
+    ) -> Result<Vec<u32>, Error> {
+        let id = self.id(index, generation)?;
+        let mut out = Vec::new();
+        self.scene.self_intersecting_triangles(id, &mut out)?;
+        Ok(out)
+    }
+
     /// The mesh pairs within `margin` of each other, of `pairs` (flat
     /// `[a index, a generation, b index, b generation, ...]`) or of the
     /// whole scene. `[count, contact...]`, each contact `[a index, a

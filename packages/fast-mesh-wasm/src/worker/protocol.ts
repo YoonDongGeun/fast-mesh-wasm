@@ -344,6 +344,7 @@ export interface QueryMap {
     value: { distance: number; a: Vec3; b: Vec3; triangleA: number; triangleB: number } | null;
   };
   intersects: { args: { a: ClientId; b: ClientId }; value: boolean };
+  selfIntersectingTriangles: { args: { mesh: ClientId }; value: Uint32Array };
   findContacts: {
     args: { margin?: number; pairs?: [ClientId, ClientId][] };
     value: {

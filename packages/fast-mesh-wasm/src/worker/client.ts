@@ -903,6 +903,7 @@ export class WorkerScene implements SceneLike {
     closestPoint: (point, options) => this.closestPoint(point, options),
     meshDistance: (a, b, options) => this.meshDistance(a, b, options),
     intersects: (a, b) => this.intersects(a, b),
+    selfIntersectingTriangles: (mesh) => this.selfIntersectingTriangles(mesh),
     findContacts: (options) => this.findContacts(options),
     overhangs: (mesh, options) => this.overhangs(mesh, options),
     triangleQuality: (mesh, metricOrOptions, sliverThreshold) =>
@@ -3571,6 +3572,18 @@ export class WorkerScene implements SceneLike {
     return this.#query(
       "intersects",
       () => ({ a: this.#live(a).id, b: this.#live(b).id }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * The live triangle slots of `mesh` that intersect or touch another of its
+   * own triangles, ascending; see `Scene.selfIntersectingTriangles`.
+   */
+  selfIntersectingTriangles(mesh: MeshHandle): Promise<Uint32Array> {
+    return this.#query(
+      "selfIntersectingTriangles",
+      () => ({ mesh: this.#live(mesh).id }),
       (v) => v,
     );
   }

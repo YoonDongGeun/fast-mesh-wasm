@@ -3306,6 +3306,7 @@ export class Scene implements SceneLike {
     closestPoint: (point, options) => this.closestPoint(point, options),
     meshDistance: (a, b, options) => this.meshDistance(a, b, options),
     intersects: (a, b) => this.intersects(a, b),
+    selfIntersectingTriangles: (mesh) => this.selfIntersectingTriangles(mesh),
     findContacts: (options) => this.findContacts(options),
     overhangs: (mesh, options) => this.overhangs(mesh, options),
     triangleQuality: (mesh, metricOrOptions, sliverThreshold) =>
@@ -4732,6 +4733,21 @@ export class Scene implements SceneLike {
     const ia = this.#id(a);
     const ib = this.#id(b);
     return call(() => this.#scene().intersects(ia.index, ia.generation, ib.index, ib.generation));
+  }
+
+  /**
+   * The live triangle slots of `mesh` that intersect or touch another of its
+   * own triangles, ascending, each once. Triangles that share a vertex are
+   * never tested against each other (neighbours always touch), and
+   * degenerate triangles are skipped, as for
+   * {@link AnalyzeOptions.selfIntersection}. The placement does not change
+   * the answer. The mesh's BVH is brought up to date first.
+   *
+   * @throws `STALE_BVH` for a `"manual"` mesh whose BVH is stale.
+   */
+  selfIntersectingTriangles(mesh: MeshHandle): Uint32Array {
+    const { index, generation } = this.#id(mesh);
+    return call(() => this.#scene().self_intersecting_triangles(index, generation));
   }
 
   /**

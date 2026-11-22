@@ -2140,6 +2140,7 @@ class Engine {
         };
         if (
           req.name === "verticesInSphere" ||
+          req.name === "selfIntersectingTriangles" ||
           req.name === "geodesicDistances" ||
           req.name === "selectFacesScreen" ||
           req.name === "selectFacesInSphere" ||
@@ -2337,6 +2338,10 @@ class Engine {
       case "intersects": {
         const a = args as QueryMap["intersects"]["args"];
         return s.intersects(this.#mesh(a.a), this.#mesh(a.b));
+      }
+      case "selfIntersectingTriangles": {
+        const a = args as QueryMap["selfIntersectingTriangles"]["args"];
+        return s.selfIntersectingTriangles(this.#mesh(a.mesh));
       }
       case "findContacts": {
         const a = args as QueryMap["findContacts"]["args"];

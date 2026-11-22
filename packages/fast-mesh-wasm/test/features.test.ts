@@ -160,6 +160,59 @@ describe("queries", () => {
     expect(touching.distance).toBe(0);
     expect(codeOf(() => s.findContacts({ pairs: [[a, a]] }))).toBe("INVALID_ARGUMENT");
   });
+
+  it("self_intersecting_triangles_lists_the_crossing_triangles_once", () => {
+    const s = scene();
+    const single = addSphere(s, [0, 0, 0]);
+    const none = s.inspect.selfIntersectingTriangles(single);
+    expect(none).toBeInstanceOf(Uint32Array);
+    expect(none.length).toBe(0);
+
+    // Two overlapping spheres as one mesh, and as two meshes: the crossing
+    // triangles of the one are the contact triangles of the two.
+    const p = sphere([0, 0, 0], 1);
+    const q = sphere([1.1, 0.2, 0.1], 1);
+    const offset = p.positions.length / 3;
+    const positions = new Float64Array(p.positions.length + q.positions.length);
+    positions.set(p.positions);
+    positions.set(q.positions, p.positions.length);
+    const indices = new Uint32Array(p.indices.length + q.indices.length);
+    indices.set(p.indices);
+    indices.set(
+      q.indices.map((v) => v + offset),
+      p.indices.length,
+    );
+    const merged = s.addMesh(positions, indices);
+    const crossing = s.inspect.selfIntersectingTriangles(merged);
+    expect(crossing.length).toBeGreaterThan(0);
+    for (let i = 1; i < crossing.length; i++) {
+      expect(crossing[i]).toBeGreaterThan(crossing[i - 1]);
+    }
+    expect(s.inspect.analyze(merged, { selfIntersection: true }).selfIntersects).toBe(true);
+
+    const a = s.addMesh(p.positions, p.indices);
+    const b = s.addMesh(q.positions, q.indices);
+    const [contact] = s.inspect.findContacts({ pairs: [[a, b]] });
+    const trianglesOfB = p.indices.length / 3;
+    const expected = [...contact.trianglesA, ...Array.from(contact.trianglesB, (t) => t + trianglesOfB)];
+    expect(Array.from(crossing)).toEqual(expected);
+
+    // A placement does not change the answer; the legacy method agrees.
+    s.setPlacement(merged, { rotation: [0, -1, 0, 1, 0, 0, 0, 0, 1], translation: [4, 0, 0], scale: [2, 1, 1] });
+    expect(Array.from(s.selfIntersectingTriangles(merged))).toEqual(expected);
+
+    // An edit that pulls the spheres apart clears it.
+    s.edit(merged, [
+      {
+        op: "setPositions",
+        vertices: Uint32Array.from({ length: q.positions.length / 3 }, (_, i) => offset + i),
+        positions: q.positions.map((x, i) => (i % 3 === 0 ? x + 5 : x)),
+      },
+    ]);
+    expect(s.inspect.selfIntersectingTriangles(merged).length).toBe(0);
+    s.removeMesh(single);
+    expect(codeOf(() => s.inspect.selfIntersectingTriangles(single))).toBe("UNKNOWN_MESH");
+  });
 });
 
 describe("fields and colouring", () => {
