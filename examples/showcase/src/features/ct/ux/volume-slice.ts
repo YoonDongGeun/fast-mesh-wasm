@@ -1,7 +1,10 @@
 // The MPR slices: plane extraction over the x-fastest volume, with a
-// fixed orientation (up is +Y for axial, +Z otherwise), and window/level
-// to gray.
+// fixed orientation (up is +Y for axial, +Z otherwise), the crosshair over
+// each view, and window/level to gray.
 export type SliceAxis = "axial" | "coronal" | "sagittal";
+
+/** The three axes in their fixed order: the slice views', the quads'. */
+export const SLICE_AXES: readonly SliceAxis[] = ["axial", "coronal", "sagittal"];
 
 /** The crosshair colors, one per axis, matching the gizmo's RGB. */
 export const AXIS_COLOR: Record<SliceAxis, string> = {
@@ -82,6 +85,32 @@ export function extractSlice(
 
 export type VolumeDims = { columns: number; rows: number; slices: number };
 
+/** The number of slices along `axis`. */
+export function sliceCount(axis: SliceAxis, dims: VolumeDims): number {
+  return axis === "axial" ? dims.slices : axis === "coronal" ? dims.rows : dims.columns;
+}
+
+/** One crosshair line on a slice image: a column (`vertical`) or a row at `at`, in its axis colour. */
+export type CrosshairLine = { vertical: boolean; at: number; color: string };
+
+/** The crosshair over the `axis` slice image: the other two slice positions, coloured by axis. */
+export function crosshairLines(axis: SliceAxis, slices: Record<SliceAxis, number>, dims: VolumeDims): CrosshairLine[] {
+  return axis === "axial"
+    ? [
+        { vertical: true, at: slices.sagittal, color: AXIS_COLOR.sagittal },
+        { vertical: false, at: dims.rows - 1 - slices.coronal, color: AXIS_COLOR.coronal },
+      ]
+    : axis === "coronal"
+      ? [
+          { vertical: true, at: slices.sagittal, color: AXIS_COLOR.sagittal },
+          { vertical: false, at: dims.slices - 1 - slices.axial, color: AXIS_COLOR.axial },
+        ]
+      : [
+          { vertical: true, at: slices.coronal, color: AXIS_COLOR.coronal },
+          { vertical: false, at: dims.slices - 1 - slices.axial, color: AXIS_COLOR.axial },
+        ];
+}
+
 /**
  * A pointer at (`dx`, `dy`) within the view's box to the slice indices it
  * picks on the other two axes. The image is `object-fit: contain`, so the
@@ -120,7 +149,7 @@ export function slicePlaneImages(
 ): SlicePlanes {
   const image = (axis: SliceAxis): SlicePlane => {
     const slice = extractSlice(display, dims.columns, dims.rows, dims.slices, axis, slices[axis]);
-    const count = axis === "axial" ? dims.slices : axis === "coronal" ? dims.rows : dims.columns;
+    const count = sliceCount(axis, dims);
     return {
       data: windowToGray(slice.data, colorWindow, colorLevel),
       width: slice.width,

@@ -6,20 +6,18 @@
 // cached target over the scene, like the panel's box blends over its
 // planes — including over anything overlapping the box.
 import type { Scene } from "fast-mesh-wasm";
-import { useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useFrame } from "@react-three/fiber";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import * as THREE from "three";
 import type { Loader } from "../../../io/loader";
-import type { VolumePayload } from "../../../io/protocol";
 import { inspect } from "../../../app/state/readouts";
-import { displayValues } from "../ux/volume-data";
-import { dataRange, normalizeVolume, presetLut } from "../ux/volume-lut";
+import { normalizeVolume, presetLut } from "../ux/volume-lut";
 import { VOLUME_PRESETS } from "../ux/volume-presets";
 import { createRaymarchMaterial, type RaymarchMaterial, type VolumeGrid } from "./volume-three";
-import { type AppState, type Item, useApp } from "../../../app/state/app-state";
-import { cutFractions, matchVolume, volumeBoxLayout } from "../ux/volume-box";
+import type { AppState } from "../../../app/state/app-state";
+import { cutFractions, volumeBoxLayout } from "../ux/volume-box";
+import { useSceneVolume } from "../ux/use-scene-volume";
 
 /** The march target's scale: half res marches 4x faster, upscaled on composite. */
 const RT_SCALE = 0.5;
@@ -193,41 +191,8 @@ export class SceneVolumeBox {
 
 export function SceneVolume(props: { app: AppState; loader: Loader; scene: Scene | WorkerScene }) {
   const { app, loader, scene } = props;
-  const [selection] = useSelection();
-  const items = useApp(app, (s) => s.items);
-  const mpr = useApp(app, (s) => s.volumeMpr);
   const box = useMemo(() => new SceneVolumeBox(), []);
-  const [payload, setPayload] = useState<VolumePayload | null>(null);
-  const found = matchVolume(items, selection, mpr);
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const liveItem: Item | null = found?.item ?? null;
-  const active = found !== null && found.mpr.inScene && found.item.mesh !== (sculpt?.mesh ?? null);
-  const volumeId = active && found !== null ? found.volumeId : null;
-
-  useEffect(() => {
-    setPayload(null);
-    if (volumeId === null) {
-      return;
-    }
-    let alive = true;
-    loader
-      .fetchVolume(volumeId)
-      .then((got: VolumePayload) => {
-        if (alive) {
-          setPayload(got);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [loader, volumeId]);
-
-  const display = useMemo(
-    () => (payload === null ? null : displayValues(payload.values, payload.pseudoHu)),
-    [payload],
-  );
-  const range = useMemo(() => (display === null ? null : dataRange(display)), [display]);
+  const { item: liveItem, active, volumeId, mpr, payload, display, range } = useSceneVolume(app, loader);
   const prepared = useMemo(
     () => (display === null || range === null ? null : normalizeVolume(display, range[0], range[1])),
     [display, range],

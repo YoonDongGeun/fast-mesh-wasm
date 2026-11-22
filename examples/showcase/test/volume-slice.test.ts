@@ -1,7 +1,17 @@
 // The MPR slices: plane extraction with a fixed orientation (up is +Y
-// for axial, +Z otherwise) and window/level to gray.
+// for axial, +Z otherwise), the stack sizes and crosshairs, and
+// window/level to gray.
 import { describe, expect, it } from "vitest";
-import { extractSlice, pointerSlice, slicePlaneImages, windowToGray } from "../src/features/ct/ux/volume-slice";
+import {
+  AXIS_COLOR,
+  crosshairLines,
+  extractSlice,
+  pointerSlice,
+  SLICE_AXES,
+  sliceCount,
+  slicePlaneImages,
+  windowToGray,
+} from "../src/features/ct/ux/volume-slice";
 
 // 3 x 2 x 2 voxels, x fastest: value = 100 * k + 10 * j + i.
 const COLUMNS = 3;
@@ -74,5 +84,35 @@ describe("windowToGray", () => {
     const out = windowToGray(new Float32Array([-100, 0, 50, 100, 200]), 100, 50);
     // Window [0, 100]: below black, above white, mid gray, all opaque.
     expect(Array.from(out)).toEqual([0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255]);
+  });
+});
+
+describe("sliceCount", () => {
+  it("counts_each_stack_in_axis_order", () => {
+    const dims = { columns: 3, rows: 4, slices: 5 };
+    expect(SLICE_AXES.map((a) => sliceCount(a, dims))).toEqual([5, 4, 3]);
+  });
+});
+
+describe("crosshairLines", () => {
+  const dims = { columns: 3, rows: 4, slices: 5 };
+  const slices = { axial: 1, coronal: 2, sagittal: 0 };
+
+  it("crosses_axial_at_sagittal_and_coronal_with_y_up", () => {
+    expect(crosshairLines("axial", slices, dims)).toEqual([
+      { vertical: true, at: 0, color: AXIS_COLOR.sagittal },
+      { vertical: false, at: 1, color: AXIS_COLOR.coronal },
+    ]);
+  });
+
+  it("crosses_coronal_and_sagittal_at_the_axial_slice_with_z_up", () => {
+    expect(crosshairLines("coronal", slices, dims)).toEqual([
+      { vertical: true, at: 0, color: AXIS_COLOR.sagittal },
+      { vertical: false, at: 3, color: AXIS_COLOR.axial },
+    ]);
+    expect(crosshairLines("sagittal", slices, dims)).toEqual([
+      { vertical: true, at: 2, color: AXIS_COLOR.coronal },
+      { vertical: false, at: 3, color: AXIS_COLOR.axial },
+    ]);
   });
 });

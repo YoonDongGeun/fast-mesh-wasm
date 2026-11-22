@@ -1,7 +1,8 @@
 // The volume presets: HU-tuned color/opacity ramps (bone, soft tissue,
-// vessels), applied to the vtk.js transfer functions.
+// vessels), applied to the vtk.js transfer functions, and the window
+// presets resolved over the data range.
 import { describe, expect, it } from "vitest";
-import { VOLUME_PRESETS, WINDOW_PRESETS } from "../src/features/ct/ux/volume-presets";
+import { presetWindowLevel, VOLUME_PRESETS, WINDOW_PRESETS } from "../src/features/ct/ux/volume-presets";
 
 describe("VOLUME_PRESETS", () => {
   it("covers_bone_tissue_and_vessels", () => {
@@ -42,5 +43,19 @@ describe("WINDOW_PRESETS", () => {
       expect(p.window === "auto" || p.window > 0).toBe(true);
       expect(p.level === "auto" || Number.isFinite(p.level)).toBe(true);
     }
+  });
+});
+
+describe("presetWindowLevel", () => {
+  it("keeps_a_fixed_window_and_level", () => {
+    expect(presetWindowLevel({ name: "Bone", window: 2000, level: 400 }, [-1000, 3000])).toEqual({ window: 2000, level: 400 });
+  });
+
+  it("spans_the_data_range_when_auto", () => {
+    expect(presetWindowLevel({ name: "Full range", window: "auto", level: "auto" }, [-1000, 3000])).toEqual({
+      window: 4000,
+      level: 1000,
+    });
+    expect(presetWindowLevel({ name: "Mixed", window: "auto", level: 40 }, [0, 10])).toEqual({ window: 10, level: 40 });
   });
 });

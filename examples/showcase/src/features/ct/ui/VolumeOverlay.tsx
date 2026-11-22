@@ -5,6 +5,7 @@ import { useSelection } from "fast-mesh-wasm/react";
 import { VOLUME_PRESETS } from "../ux/volume-presets";
 import { type AppState, useApp } from "../../../app/state/app-state";
 import { matchVolume } from "../ux/volume-box";
+import { patchVolumeMpr } from "../ux/volume-mpr";
 
 export function VolumeOverlay(props: { app: AppState }) {
   const { app } = props;
@@ -16,12 +17,8 @@ export function VolumeOverlay(props: { app: AppState }) {
     return null;
   }
   const { volumeId, mpr: live } = found;
-  const set = (patch: { preset?: number; tab?: "volume" | "slices"; inScene?: boolean }): void => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur !== null && cur.volumeId === volumeId) {
-      app.setVolumeMpr({ ...cur, ...patch });
-    }
-  };
+  const set = (patch: { preset?: number; tab?: "volume" | "slices"; inScene?: boolean }): void =>
+    patchVolumeMpr(app, volumeId, patch);
   return (
     <div className="volume-overlay" role="toolbar" aria-label="Volume quick controls">
       <label className="slider" title="Which 3D preset renders the volume">

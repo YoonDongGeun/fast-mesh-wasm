@@ -1,6 +1,6 @@
 // The volume presets: HU-tuned color/opacity ramps (bone, soft tissue,
-// vessels) applied to the vtk.js transfer functions. Air (-1000 HU and
-// below) stays invisible in every preset.
+// vessels) applied to the vtk.js transfer functions, and the slice views'
+// window presets. Air (-1000 HU and below) stays invisible in every preset.
 export type WindowValue = number | "auto";
 
 export interface WindowPreset {
@@ -16,6 +16,14 @@ export const WINDOW_PRESETS: readonly WindowPreset[] = [
   { name: "Lung", window: 1600, level: -600 },
   { name: "Full range", window: "auto", level: "auto" },
 ];
+
+/** A window preset's window and level over the data `range`: "auto" spans the range, centred on it. */
+export function presetWindowLevel(preset: WindowPreset, range: readonly [number, number]): { window: number; level: number } {
+  return {
+    window: preset.window === "auto" ? range[1] - range[0] : preset.window,
+    level: preset.level === "auto" ? (range[0] + range[1]) / 2 : preset.level,
+  };
+}
 
 export interface VolumePreset {
   name: string;

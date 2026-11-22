@@ -10,21 +10,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Loader } from "../../../io/loader";
 import type { VolumePayload } from "../../../io/protocol";
 import { type AppState, useApp } from "../../../app/state/app-state";
-import { selectMesh } from "../../select/ux/selection";
 import { inspect } from "../../../app/state/readouts";
-import { displayValues } from "../ux/volume-data";
-import { dataRange, normalizeVolume, presetLut } from "../ux/volume-lut";
-import { VOLUME_PRESETS, WINDOW_PRESETS, type WindowValue } from "../ux/volume-presets";
-import { AXIS_COLOR, extractSlice, pointerSlice, slicePlaneImages, windowToGray, type SliceAxis } from "../ux/volume-slice";
+import { normalizeVolume, presetLut } from "../ux/volume-lut";
+import { VOLUME_PRESETS, WINDOW_PRESETS } from "../ux/volume-presets";
+import { crosshairLines, extractSlice, SLICE_AXES, slicePlaneImages, sliceCount, windowToGray, type SliceAxis } from "../ux/volume-slice";
+import { useVolumeMpr } from "../ux/volume-mpr";
+import { sliceNavigation, usePanelVolume, useRevealTabs, useSliceViewsProbe, useVolumeSources } from "../ux/use-volume-panel";
 import { VolumeView3D } from "./volume-three";
-
-const SLICE_MAX: Record<SliceAxis, (p: VolumePayload) => number> = {
-  axial: (p) => p.slices - 1,
-  coronal: (p) => p.rows - 1,
-  sagittal: (p) => p.columns - 1,
-};
-
-const SLICE_AXES: SliceAxis[] = ["axial", "coronal", "sagittal"];
 
 export function VolumePanel(props: { app: AppState; loader: Loader }) {
   const { app, loader } = props;
@@ -51,35 +43,7 @@ export function VolumePanel(props: { app: AppState; loader: Loader }) {
 
 function VolumeWork(props: { app: AppState; loader: Loader; volumeId: string; name: string; initialPreset: number }) {
   const { app, loader, volumeId, name, initialPreset } = props;
-  const [payload, setPayload] = useState<VolumePayload | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    inspect.volume = { id: volumeId, preset: VOLUME_PRESETS[0].name, mip: false, planes: 0, ready: false };
-    inspect.slices = { id: volumeId, window: WINDOW_PRESETS[0].name, axial: 0, coronal: 0, sagittal: 0, ready: false };
-    loader
-      .fetchVolume(volumeId)
-      .then((got: VolumePayload) => {
-        if (alive) {
-          setPayload(got);
-        }
-      })
-      .catch(() => {
-        if (alive) {
-          setFailed(true);
-        }
-      });
-    return () => {
-      alive = false;
-      if (inspect.volume.id === volumeId) {
-        inspect.volume = { id: null, preset: "", mip: false, planes: 0, ready: false };
-      }
-      if (inspect.slices.id === volumeId) {
-        inspect.slices = { id: null, window: "", axial: 0, coronal: 0, sagittal: 0, ready: false };
-      }
-    };
-  }, [loader, volumeId]);
+  const { payload, failed } = usePanelVolume(loader, volumeId);
 
   if (failed) {
     return (
@@ -115,90 +79,23 @@ function VolumeTabs(props: {
   initialPreset: number;
 }) {
   const { app, payload, volumeId, name, initialPreset } = props;
-  const mpr = useApp(app, (s) => s.volumeMpr);
-  const tab = mpr !== null && mpr.volumeId === volumeId ? mpr.tab : "volume";
-  const setTab = (t: "volume" | "slices"): void => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur !== null && cur.volumeId === volumeId) {
-      app.setVolumeMpr({ ...cur, tab: t });
-    }
-  };
-  const setPresetIdx = (i: number): void => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur !== null && cur.volumeId === volumeId) {
-      app.setVolumeMpr({ ...cur, preset: i });
-    }
-  };
-  const [selection, select] = useSelection();
-  const sources = useApp(app, (s) => s.items).filter((i) => i.volumeId !== null);
   const tabsRef = useRef<HTMLDivElement>(null);
-  // Selecting a volume mesh brings its tab buttons into view at once,
-  // retried briefly: the panels above can still grow (repair analysis).
-  useEffect(() => {
-    let ticks = 0;
-    const timer = setInterval(() => {
-      ticks += 1;
-      const tabs = tabsRef.current;
-      const pane = tabs?.closest(".sidebar") ?? null;
-      if (tabs === null || pane === null || ticks > 8) {
-        clearInterval(timer);
-        return;
-      }
-      const r = tabs.getBoundingClientRect();
-      const p = pane.getBoundingClientRect();
-      if (r.top < p.top || r.bottom > p.bottom) {
-        tabs.scrollIntoView({ block: "nearest" });
-      } else {
-        clearInterval(timer);
-      }
-    }, 250);
-    return () => clearInterval(timer);
-  }, [volumeId]);
-  useEffect(() => {
-    app.setVolumeMpr({
-      volumeId,
-      slices: {
-        axial: Math.floor((payload.slices - 1) / 2),
-        coronal: Math.floor((payload.rows - 1) / 2),
-        sagittal: Math.floor((payload.columns - 1) / 2),
-      },
-      window: 0,
-      inScene: true,
-      preset: initialPreset,
-      tab: "volume",
-    });
-    return () => {
-      if (app.getSnapshot().volumeMpr?.volumeId === volumeId) {
-        app.setVolumeMpr(null);
-      }
-    };
-  }, [app, payload, volumeId, initialPreset]);
-  const display = useMemo(() => displayValues(payload.values, payload.pseudoHu), [payload]);
-  const range = useMemo(() => dataRange(display), [display]);
-  const live = mpr !== null && mpr.volumeId === volumeId ? mpr : null;
-  const preset = WINDOW_PRESETS[live?.window ?? 0];
-  const resolve = (v: WindowValue, auto: number): number => (v === "auto" ? auto : v);
-  const colorWindow = resolve(preset.window, range[1] - range[0]);
-  const colorLevel = resolve(preset.level, (range[0] + range[1]) / 2);
-  const setSlices: React.Dispatch<React.SetStateAction<Record<SliceAxis, number>>> = (update) => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur === null || cur.volumeId !== volumeId) {
-      return;
-    }
-    app.setVolumeMpr({ ...cur, slices: typeof update === "function" ? update(cur.slices) : update });
-  };
-  const setWindowIdx = (i: number): void => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur !== null && cur.volumeId === volumeId) {
-      app.setVolumeMpr({ ...cur, window: i });
-    }
-  };
-  const setInScene = (on: boolean): void => {
-    const cur = app.getSnapshot().volumeMpr;
-    if (cur !== null && cur.volumeId === volumeId) {
-      app.setVolumeMpr({ ...cur, inScene: on });
-    }
-  };
+  useRevealTabs(tabsRef, volumeId);
+  const {
+    live,
+    tab,
+    display,
+    range,
+    windowName,
+    colorWindow,
+    colorLevel,
+    setTab,
+    setPreset,
+    setWindow,
+    setInScene,
+    setSlices,
+  } = useVolumeMpr(app, payload, volumeId, initialPreset);
+  const { sources, chooseSource } = useVolumeSources(app);
 
   return (
     <section className="panel" aria-label="Volume">
@@ -218,12 +115,7 @@ function VolumeTabs(props: {
           <select
             data-action="volume-source"
             value={volumeId}
-            onChange={(e) => {
-              const item = sources.find((i) => i.volumeId === e.currentTarget.value);
-              if (item !== undefined) {
-                selectMesh(app, select, selection, item.mesh, false);
-              }
-            }}
+            onChange={(e) => chooseSource(e.currentTarget.value)}
           >
             {sources.map((i) => (
               <option key={i.volumeId} value={i.volumeId ?? ""}>
@@ -252,7 +144,7 @@ function VolumeTabs(props: {
           colorWindow={colorWindow}
           colorLevel={colorLevel}
           preset={live.preset}
-          setPreset={setPresetIdx}
+          setPreset={setPreset}
         />
       ) : (
         <SliceWork
@@ -262,8 +154,8 @@ function VolumeTabs(props: {
           slices={live.slices}
           setSlices={setSlices}
           windowIdx={live.window}
-          setWindowIdx={setWindowIdx}
-          windowName={preset.name}
+          setWindowIdx={setWindow}
+          windowName={windowName}
           colorWindow={colorWindow}
           colorLevel={colorLevel}
         />
@@ -412,18 +304,7 @@ function SliceWork(props: {
   colorLevel: number;
 }) {
   const { payload, volumeId, display, slices, setSlices, windowIdx, setWindowIdx, windowName, colorWindow, colorLevel } = props;
-  const [ready, setReady] = useState<Record<SliceAxis, boolean>>({ axial: false, coronal: false, sagittal: false });
-
-  useEffect(() => {
-    inspect.slices = {
-      id: volumeId,
-      window: windowName,
-      axial: slices.axial,
-      coronal: slices.coronal,
-      sagittal: slices.sagittal,
-      ready: ready.axial && ready.coronal && ready.sagittal,
-    };
-  }, [volumeId, windowName, slices, ready]);
+  const markReady = useSliceViewsProbe(volumeId, windowName, slices);
 
   return (
     <>
@@ -449,7 +330,7 @@ function SliceWork(props: {
                 type="range"
                 data-action={`slice-${axis}`}
                 min={0}
-                max={SLICE_MAX[axis](payload)}
+                max={sliceCount(axis, payload) - 1}
                 value={slices[axis]}
                 onChange={(e) => {
                   // Read the event now: the updater runs after dispatch,
@@ -459,7 +340,7 @@ function SliceWork(props: {
                 }}
               />
               <span className="muted small">
-                {slices[axis]}/{SLICE_MAX[axis](payload)}
+                {slices[axis]}/{sliceCount(axis, payload) - 1}
               </span>
             </label>
           </div>
@@ -471,7 +352,7 @@ function SliceWork(props: {
             colorWindow={colorWindow}
             colorLevel={colorLevel}
             onNavigate={(part) => setSlices((s) => ({ ...s, ...part }))}
-            onReady={() => setReady((r) => ({ ...r, [axis]: true }))}
+            onReady={() => markReady(axis)}
           />
         </div>
       ))}
@@ -506,21 +387,7 @@ function SliceView(props: {
     }
     ctx.putImageData(new ImageData(windowToGray(image.data, colorWindow, colorLevel), image.width, image.height), 0, 0);
     // The crosshair: the other two slice positions, colored by axis.
-    const lines: Array<{ vertical: boolean; at: number; color: string }> =
-      axis === "axial"
-        ? [
-            { vertical: true, at: slices.sagittal, color: AXIS_COLOR.sagittal },
-            { vertical: false, at: payload.rows - 1 - slices.coronal, color: AXIS_COLOR.coronal },
-          ]
-        : axis === "coronal"
-          ? [
-              { vertical: true, at: slices.sagittal, color: AXIS_COLOR.sagittal },
-              { vertical: false, at: payload.slices - 1 - slices.axial, color: AXIS_COLOR.axial },
-            ]
-          : [
-              { vertical: true, at: slices.coronal, color: AXIS_COLOR.coronal },
-              { vertical: false, at: payload.slices - 1 - slices.axial, color: AXIS_COLOR.axial },
-            ];
+    const lines = crosshairLines(axis, slices, payload);
     for (const line of lines) {
       ctx.fillStyle = line.color;
       if (line.vertical) {
@@ -532,38 +399,11 @@ function SliceView(props: {
     onReady();
   }, [display, payload, axis, slices, colorWindow, colorLevel, onReady]);
 
-  const navigate = (clientX: number, clientY: number): void => {
-    const canvas = canvasRef.current;
-    if (canvas === null) {
-      return;
-    }
-    const rect = canvas.getBoundingClientRect();
-    onNavigate(
-      pointerSlice(
-        axis,
-        { columns: payload.columns, rows: payload.rows, slices: payload.slices },
-        { width: canvas.width, height: canvas.height },
-        { width: rect.width, height: rect.height },
-        clientX - rect.left,
-        clientY - rect.top,
-      ),
-    );
-  };
+  const { onPointerDown, onPointerMove } = sliceNavigation(canvasRef, axis, payload, onNavigate);
 
   return (
     <div className="slice-canvas" data-slice={axis}>
-      <canvas
-        ref={canvasRef}
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          navigate(e.clientX, e.clientY);
-        }}
-        onPointerMove={(e) => {
-          if (e.buttons & 1) {
-            navigate(e.clientX, e.clientY);
-          }
-        }}
-      />
+      <canvas ref={canvasRef} onPointerDown={onPointerDown} onPointerMove={onPointerMove} />
     </div>
   );
 }

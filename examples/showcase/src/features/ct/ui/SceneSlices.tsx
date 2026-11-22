@@ -4,33 +4,28 @@
 // viewer. The quads ride the mesh's placement, so gizmo moves carry them
 // along.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo } from "react";
 import * as THREE from "three";
 import type { Loader } from "../../../io/loader";
 import type { VolumePayload } from "../../../io/protocol";
-import { type AppState, type Item, useApp } from "../../../app/state/app-state";
+import type { AppState } from "../../../app/state/app-state";
 import { inspect } from "../../../app/state/readouts";
-import { dataRange } from "../ux/volume-lut";
-import { displayValues } from "../ux/volume-data";
-import { WINDOW_PRESETS } from "../ux/volume-presets";
+import { presetWindowLevel, WINDOW_PRESETS } from "../ux/volume-presets";
 import {
   AXIS_COLOR,
   planeSpec,
+  SLICE_AXES,
   slicePlaneImages,
   type SliceAxis,
   type SlicePlane,
   type SlicePlanes,
 } from "../ux/volume-slice";
-import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "../ux/slice-drag";
 import { setSliceClip } from "../../../viewport/ux/clip-planes";
-import { isExtraFinger } from "../../../viewport/ux/touch";
 import { view } from "../../../viewport/ux/view";
-import { matchVolume } from "../ux/volume-box";
-
-const AXES: SliceAxis[] = ["axial", "coronal", "sagittal"];
+import { useSceneVolume } from "../ux/use-scene-volume";
+import { useSliceDrag } from "../ux/use-slice-drag";
 
 type SceneVolume = {
   origin: readonly [number, number, number];
@@ -115,7 +110,7 @@ export class SceneSliceQuads {
         this.entries[i] = undefined;
       }
       if (entry === undefined) {
-        entry = this.buildQuad(AXES[i], plane, [ex, ey, ez]);
+        entry = this.buildQuad(SLICE_AXES[i], plane, [ex, ey, ez]);
         this.group.add(entry.mesh);
         this.entries[i] = entry;
       } else {
@@ -132,7 +127,7 @@ export class SceneSliceQuads {
 
   /** The quad's mesh, once built. */
   quadMesh(axis: SliceAxis): THREE.Mesh | null {
-    return this.entries[AXES.indexOf(axis)]?.mesh ?? null;
+    return this.entries[SLICE_AXES.indexOf(axis)]?.mesh ?? null;
   }
 
   /**
@@ -156,7 +151,7 @@ export class SceneSliceQuads {
     this.entries.forEach((entry, i) => {
       if (entry !== undefined) {
         for (const handle of entry.handles) {
-          out.push({ object: handle, axis: AXES[i] });
+          out.push({ object: handle, axis: SLICE_AXES[i] });
         }
       }
     });
@@ -165,7 +160,7 @@ export class SceneSliceQuads {
 
   /** The `corner`th handle's world position, for the test hook. */
   handleWorld(axis: SliceAxis, corner: number): [number, number, number] | null {
-    const handle = this.entries[AXES.indexOf(axis)]?.handles[corner];
+    const handle = this.entries[SLICE_AXES.indexOf(axis)]?.handles[corner];
     if (handle === undefined) {
       return null;
     }
@@ -249,47 +244,15 @@ function disposeEntry(entry: QuadEntry): void {
 
 export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene | WorkerScene }) {
   const { app, loader, scene } = props;
-  const [selection] = useSelection();
-  const items = useApp(app, (s) => s.items);
-  const mpr = useApp(app, (s) => s.volumeMpr);
   const gl = useThree((s) => s.gl);
   const quads = useMemo(() => new SceneSliceQuads(), []);
-  const [payload, setPayload] = useState<VolumePayload | null>(null);
-  const found = matchVolume(items, selection, mpr);
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const item: Item | null = found?.item ?? null;
-  const mesh: MeshHandle | null = item?.mesh ?? null;
-  const active = found !== null && found.mpr.inScene && found.item.mesh !== (sculpt?.mesh ?? null);
-  const volumeId = active && found !== null ? found.volumeId : null;
 
   useEffect(() => {
     gl.localClippingEnabled = true;
   }, [gl]);
 
-  useEffect(() => {
-    setPayload(null);
-    if (volumeId === null) {
-      return;
-    }
-    let alive = true;
-    loader
-      .fetchVolume(volumeId)
-      .then((got: VolumePayload) => {
-        if (alive) {
-          setPayload(got);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [loader, volumeId]);
-
-  const display = useMemo(
-    () => (payload === null ? null : displayValues(payload.values, payload.pseudoHu)),
-    [payload],
-  );
-  const range = useMemo(() => (display === null ? null : dataRange(display)), [display]);
+  const { item, active, mpr, payload, display, range } = useSceneVolume(app, loader);
+  const mesh: MeshHandle | null = item?.mesh ?? null;
 
   useEffect(() => {
     if (!active || payload === null || display === null || range === null || mpr === null || item === null) {
@@ -309,9 +272,7 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
       }
       return;
     }
-    const preset = WINDOW_PRESETS[mpr.window];
-    const colorWindow = preset.window === "auto" ? range[1] - range[0] : preset.window;
-    const colorLevel = preset.level === "auto" ? (range[0] + range[1]) / 2 : preset.level;
+    const { window: colorWindow, level: colorLevel } = presetWindowLevel(WINDOW_PRESETS[mpr.window], range);
     quads.setSlices(
       slicePlaneImages(
         display,
@@ -371,195 +332,7 @@ export function SceneSlices(props: { app: AppState; loader: Loader; scene: Scene
   );
 }
 
-type SliceDragState = {
-  axis: SliceAxis;
-  volumeId: string;
-  index0: number;
-  grab: [number, number, number];
-  planePoint: [number, number, number];
-  planeNormal: [number, number, number];
-  /** The quad normal towards higher slices (world). */
-  along: [number, number, number];
-  spacing: number;
-  count: number;
-};
-
-/**
- * Drags the slice quads by their corner balls: a press on one grabs the
- * stack, and pulling it moves the slice (the linked MPR state, so every
- * slice view follows). The orbit stands down for the gesture, like for a
- * sculpt stroke; the gizmo's own drags and the sculpt brush keep priority.
- */
 function SliceDrag(props: { app: AppState; quads: SceneSliceQuads; payload: VolumePayload | null; active: boolean }) {
-  const { app, quads } = props;
-  const camera = useThree((s) => s.camera);
-  const gl = useThree((s) => s.gl);
-  const payloadRef = useRef(props.payload);
-  payloadRef.current = props.payload;
-  const activeRef = useRef(props.active);
-  activeRef.current = props.active;
-
-  useEffect(() => {
-    const canvas = gl.domElement;
-    const caster = new THREE.Raycaster();
-    let drag: SliceDragState | null = null;
-    let pointerId = -1;
-
-    const rayOf = (x: number, y: number): THREE.Ray => {
-      const r = canvas.getBoundingClientRect();
-      caster.setFromCamera(
-        new THREE.Vector2(((x - r.left) / r.width) * 2 - 1, 1 - ((y - r.top) / r.height) * 2),
-        camera,
-      );
-      return caster.ray;
-    };
-
-    const endDrag = (): void => {
-      drag = null;
-      pointerId = -1;
-      canvas.style.cursor = "";
-      if (view.orbit !== null) {
-        view.orbit.enabled = true;
-      }
-    };
-
-    const onDown = (e: PointerEvent): void => {
-      if (e.button !== 0 || isExtraFinger(e) || drag !== null || view.dragging) {
-        return;
-      }
-      const snap = app.getSnapshot();
-      if (snap.sculpt !== null || snap.brushPick !== null) {
-        return;
-      }
-      const payload = payloadRef.current;
-      const mpr = snap.volumeMpr;
-      if (!activeRef.current || payload === null || mpr === null || !quads.group.visible) {
-        return;
-      }
-      const ray = rayOf(e.clientX, e.clientY);
-      const hits = caster.intersectObjects(
-        quads.handles.map((h) => h.object),
-        false,
-      );
-      if (hits.length === 0) {
-        return;
-      }
-      const axis = (hits[0].object.userData.sliceAxis ?? null) as SliceAxis | null;
-      const quad = axis === null ? null : quads.quadMesh(axis);
-      if (axis === null || quad === null) {
-        return;
-      }
-      const normal = quad.getWorldDirection(new THREE.Vector3());
-      const seen = camera.getWorldDirection(new THREE.Vector3());
-      const plane = dragPlaneNormal([normal.x, normal.y, normal.z], [seen.x, seen.y, seen.z]);
-      if (plane === null) {
-        return;
-      }
-      const center = hits[0].object.getWorldPosition(new THREE.Vector3());
-      const grab = planeHit(
-        [ray.origin.x, ray.origin.y, ray.origin.z],
-        [ray.direction.x, ray.direction.y, ray.direction.z],
-        [center.x, center.y, center.z],
-        plane,
-      );
-      if (grab === null) {
-        return;
-      }
-      const sign = quads.axisSign(axis, normal);
-      const spacing = axis === "axial" ? payload.spacing[2] : axis === "coronal" ? payload.spacing[1] : payload.spacing[0];
-      const count = axis === "axial" ? payload.slices : axis === "coronal" ? payload.rows : payload.columns;
-      drag = {
-        axis,
-        volumeId: mpr.volumeId,
-        index0: mpr.slices[axis],
-        grab,
-        planePoint: [center.x, center.y, center.z],
-        planeNormal: plane,
-        along: [sign * normal.x, sign * normal.y, sign * normal.z],
-        spacing,
-        count,
-      };
-      pointerId = e.pointerId;
-      view.pressTaken = true;
-      try {
-        canvas.setPointerCapture(e.pointerId);
-      } catch {
-        // Already released: the drag still tracks until the button lifts.
-      }
-      if (view.orbit !== null) {
-        view.orbit.enabled = false;
-      }
-      canvas.style.cursor = "grabbing";
-    };
-
-    const onMove = (e: PointerEvent): void => {
-      if (drag === null) {
-        if (e.buttons !== 0 || view.dragging) {
-          return;
-        }
-        const snap = app.getSnapshot();
-        if (
-          snap.sculpt !== null ||
-          snap.brushPick !== null ||
-          !activeRef.current ||
-          !quads.group.visible
-        ) {
-          return;
-        }
-        rayOf(e.clientX, e.clientY);
-        const hits = caster.intersectObjects(
-          quads.handles.map((h) => h.object),
-          false,
-        );
-        canvas.style.cursor = hits.length === 0 ? "" : "grab";
-        return;
-      }
-      if (e.pointerId !== pointerId) {
-        return;
-      }
-      const ray = rayOf(e.clientX, e.clientY);
-      const now = planeHit(
-        [ray.origin.x, ray.origin.y, ray.origin.z],
-        [ray.direction.x, ray.direction.y, ray.direction.z],
-        drag.planePoint,
-        drag.planeNormal,
-      );
-      if (now === null) {
-        return;
-      }
-      const index = clampSlice(drag.index0 + sliceSteps(drag.grab, now, drag.along, drag.spacing), drag.count);
-      const cur = app.getSnapshot().volumeMpr;
-      if (cur !== null && cur.volumeId === drag.volumeId && cur.slices[drag.axis] !== index) {
-        app.setVolumeMpr({ ...cur, slices: { ...cur.slices, [drag.axis]: index } });
-      }
-    };
-
-    const onUp = (e: PointerEvent): void => {
-      if (e.pointerId === pointerId) {
-        endDrag();
-      }
-    };
-
-    const onLeave = (): void => {
-      if (drag === null) {
-        canvas.style.cursor = "";
-      }
-    };
-
-    canvas.addEventListener("pointerdown", onDown);
-    canvas.addEventListener("pointermove", onMove);
-    canvas.addEventListener("pointerup", onUp);
-    canvas.addEventListener("pointercancel", onUp);
-    canvas.addEventListener("pointerleave", onLeave);
-    return () => {
-      canvas.removeEventListener("pointerdown", onDown);
-      canvas.removeEventListener("pointermove", onMove);
-      canvas.removeEventListener("pointerup", onUp);
-      canvas.removeEventListener("pointercancel", onUp);
-      canvas.removeEventListener("pointerleave", onLeave);
-      endDrag();
-    };
-  }, [app, quads, camera, gl]);
-
+  useSliceDrag(props.app, props.quads, props.payload, props.active);
   return null;
 }
