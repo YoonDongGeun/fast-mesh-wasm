@@ -19,7 +19,7 @@ import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { type AppState, useApp } from "../../../app/state/app-state";
 import type { Wave6PrintPrepState } from "../../../app/state/wave6-state";
-import { raycastVisibleSurface } from "../../../viewport/ui/Viewport";
+import { raycastVisibleSurface } from "../../../viewport/ux/surface-raycast";
 import { view } from "../../../viewport/ux/view";
 
 function tapSlop(pointerType: string, fallback = 4): number {

@@ -10,7 +10,7 @@ import {
   applyAltPinClick,
   scaleBrushRadiusForTarget,
   shouldAllowStrokeHit,
-} from "../src/viewport/ui/Viewport";
+} from "../src/viewport/ux/brush-target";
 import {
   SculptToolbox,
   canArmSculpt,
