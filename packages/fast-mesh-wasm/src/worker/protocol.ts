@@ -323,6 +323,10 @@ export type Request =
   | { kind: "commitCollisionInteraction"; rev: number; id: ClientId; qid: number }
   | { kind: "alignToFittedPrimitive"; rev: number; id: ClientId; primitive: FittedPrimitive; targetAxis: Vec3; targetOrigin: Vec3; qid: number }
   | { kind: "reconstructPointCloud"; rev: number; addedId: ClientId; cloud: Float32Array; options: SurfaceReconstructOptions; qid: number }
+  /** `Scene.convexHull`; replies with the hull's counts. */
+  | { kind: "convexHull"; rev: number; addedId: ClientId; meshes: ClientId[]; normals: boolean; qid: number }
+  /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
+  | { kind: "convexHullPoints"; rev: number; addedId: ClientId; points: Float64Array; normals: boolean; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
@@ -597,6 +601,8 @@ export function keyOf(req: Request): string | undefined {
     case "booleanBatch":
     case "extractSelectedFaces":
     case "reconstructPointCloud":
+    case "convexHull":
+    case "convexHullPoints":
       return `mesh:${req.addedId}`;
     case "placeMesh":
       return req.addedId !== undefined ? `mesh:${req.addedId}` : `edit:${req.target}`;

@@ -2,6 +2,15 @@
 // views, per-frame change records and undo history. Wraps the raw `WasmScene`
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
+import {
+  type ConvexHullOptions,
+  type ConvexHullPoints,
+  type ConvexHullResult,
+  decodeHullCounts,
+  hullMeshList,
+  hullNormals,
+  hullPointsBuffer,
+} from "./hull.js";
 import { checkRegisterOptions } from "./register.js";
 import {
   BOOLEAN_METHOD_CODES,
@@ -3652,6 +3661,52 @@ export class Scene implements SceneLike {
       ),
     );
     return this.#meshHandle(r[0], r[1]);
+  }
+
+  /**
+   * Adds the convex hull of `meshes` (one mesh or several) as a new mesh and
+   * returns it with its counts. The hull is built from the vertices the
+   * meshes' live triangles use; the meshes are not changed.
+   *
+   * The hull is exact (no tolerance): every vertex is inside it or on its
+   * boundary, and it is convex, closed and wound outward, with no
+   * degenerate triangle. Its vertices are input vertices, including every
+   * corner. Duplicate, coplanar and collinear vertices are fine.
+   *
+   * When every mesh has the same placement (one mesh, say), the hull is built
+   * in their own space and the new mesh gets that placement, so it moves
+   * with them; with one origin too, its vertices are exactly theirs.
+   * Otherwise it is built in world space at the identity placement.
+   *
+   * The new mesh is added empty and the hull lands in it as one undo step:
+   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
+   * {@link Scene.redo} fills it again.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list or when the
+   *   vertices have no volume (all on one point, line or plane; the message
+   *   says which), `UNKNOWN_MESH` for a removed mesh.
+   */
+  convexHull(meshes: MeshHandle | readonly MeshHandle[], options?: ConvexHullOptions): ConvexHullResult {
+    const ids = this.#flatIds(hullMeshList(meshes));
+    const normals = hullNormals(options);
+    const r = call(() => this.#scene().convex_hull(ids, normals));
+    return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
+  }
+
+  /**
+   * Adds the convex hull of world `points` (flat positions or a packed point
+   * cloud) as a new mesh at the identity placement, and returns it with its
+   * counts. Exact and one undo step, as for {@link Scene.convexHull}.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for fewer than four points, a
+   *   value that is not a finite number (or beyond `1e100`), or points without
+   *   volume (all on one point, line or plane; the message says which).
+   */
+  convexHullOfPoints(points: ConvexHullPoints, options?: ConvexHullOptions): ConvexHullResult {
+    const buf = hullPointsBuffer(points);
+    const normals = hullNormals(options);
+    const r = call(() => this.#scene().convex_hull_points(buf, normals));
+    return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
   }
 
   /**

@@ -885,6 +885,8 @@ class Engine {
       case "extractSelectedFaces":
       case "splitSelectedFaces":
       case "reconstructPointCloud":
+      case "convexHull":
+      case "convexHullPoints":
       case "punchDrainHole":
       case "placeMesh":
       case "moveWithCollision":
@@ -1969,6 +1971,19 @@ class Engine {
         const added = s.reconstructPointCloud(req.cloud, req.options);
         this.#bindAdded(req.addedId, added);
         b.replies.push({ qid: req.qid, ok: true, value: undefined });
+        return;
+      }
+      case "convexHull":
+      case "convexHullPoints": {
+        this.#ensureUnused(req.addedId);
+        const options = { normals: req.normals };
+        const r =
+          req.kind === "convexHull"
+            ? s.convexHull(this.#meshList(req.meshes), options)
+            : s.convexHullOfPoints(req.points, options);
+        this.#bindAdded(req.addedId, r.mesh);
+        const value = { inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+        b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
       case "hollowMesh": {

@@ -36,6 +36,7 @@ export {
   type Vec3,
 } from "./api.js";
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export type { SceneDomainsLike, SceneLike } from "./scene-like.js";
 export {
   type AdaptiveRemeshOptions,

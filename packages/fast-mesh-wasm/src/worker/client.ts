@@ -7,6 +7,14 @@
 // mirrors back `views()`, and placements and section results are mirrored
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
+import {
+  type ConvexHullOptions,
+  type ConvexHullPoints,
+  type ConvexHullResult,
+  hullMeshList,
+  hullNormals,
+  hullPointsBuffer,
+} from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
 import {
   checkSurfacePathOptions,
@@ -3007,6 +3015,47 @@ export class WorkerScene implements SceneLike {
       },
       (v) => v,
     );
+  }
+
+  /**
+   * Adds the convex hull of `meshes` (one mesh or several) in the Worker as a
+   * new mesh, one undo step (see `Scene.convexHull`).
+   */
+  convexHull(meshes: MeshHandle | readonly MeshHandle[], options?: ConvexHullOptions): Promise<ConvexHullResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const states = hullMeshList(meshes).map((m) => this.#live(m));
+        const normals = hullNormals(options);
+        added = this.#allocMeshState([0, 0, 0], normals);
+        return { kind: "convexHull", rev, addedId: added.id, meshes: states.map((st) => st.id), normals, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<ConvexHullResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
+  /**
+   * Adds the convex hull of world `points` in the Worker as a new mesh, one
+   * undo step (see `Scene.convexHullOfPoints`). The points are copied.
+   */
+  convexHullOfPoints(points: ConvexHullPoints, options?: ConvexHullOptions): Promise<ConvexHullResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        this.#alive();
+        const buf = hullPointsBuffer(points);
+        const normals = hullNormals(options);
+        added = this.#allocMeshState([0, 0, 0], normals);
+        return { kind: "convexHullPoints", rev, addedId: added.id, points: buf, normals, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<ConvexHullResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
   }
 
   reconstructPointCloud(
