@@ -6,17 +6,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ModelingPanel } from "../src/features/mesh-edit/ui/ModelingPanel";
 import { AppState } from "../src/app/state/app-state";
 import { selectMesh } from "../src/features/select/ux/selection";
+import { findCenterSurfaceHit } from "../src/features/mesh-edit/ui/HollowPlaceToolsLayer";
 import {
-  computeHitPointAndWorldNormal,
-  createBuiltinStampMeshGeometry,
   executeDrainHoleAtHit,
   executePlaceStampAtHit,
-  findCenterSurfaceHit,
   getPlaceAlignToNormal,
-  orientationFromSurfaceNormal,
   runHollowMeshOp,
   setPlaceAlignToNormal,
-} from "../src/features/mesh-edit/ui/HollowPlaceToolsLayer";
+} from "../src/features/mesh-edit/ux/print-prep-ops";
+import { createBuiltinStampMeshGeometry } from "../src/features/mesh-edit/ux/stamp-geometry";
+import { computeHitPointAndWorldNormal, orientationFromSurfaceNormal } from "../src/features/mesh-edit/ux/surface-orientation";
 
 function boxMesh(cx = 0, cy = 0, cz = 0, hx = 10, hy = 10, hz = 10) {
   const x0 = cx - hx;

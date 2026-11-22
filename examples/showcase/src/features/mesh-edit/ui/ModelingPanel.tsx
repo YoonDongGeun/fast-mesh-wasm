@@ -1,254 +1,35 @@
 // Modeling & Resampling panel (#195): Boolean CSG (with Keep originals), destructive Plane Cut,
-// Offset & Shell (Solidify), Quadric Simplify, and Loop Subdivide.
-import type {
-  CutReport,
-  HollowBackend,
-  HollowOptions,
-  MeshHandle,
-  OffsetReport,
-  PlaceUpAxis,
-  ShellReport,
-  SimplifyReport,
-  SubdivideReport,
-} from "fast-mesh-wasm";
+// Offset & Shell (Solidify), Quadric Simplify, and Loop Subdivide; then the Print Prep sections
+// (#236): Hollow Mesh, Drain Hole and Surface Stamp. What they do lives in
+// `ux/use-modeling-ops.ts` and `ux/use-print-prep-ops.ts`.
+import type { HollowBackend, PlaceUpAxis } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
-import { useEffect, useState } from "react";
-import { type AppState, type Item, useApp } from "../../../app/state/app-state";
-import {
-  type BooleanOperation,
-  type CutAxis,
-  type CutKeepSide,
-  extractLiveMeshData,
-  type OffsetModeAlgorithm,
-  runBooleanCsg,
-  runOffset,
-  runPlaneCut,
-  runShell,
-  runSimplify,
-  runSubdivide,
-} from "../../../engine/workbench-ops";
-import { computeLocalExtents } from "../../transform/ux/transform-math";
-import {
-  executeDrainHoleAtHit,
-  findCenterSurfaceHit,
-  getPlaceAlignToNormal,
-  runHollowMeshOp,
-  setPlaceAlignToNormal,
-} from "./HollowPlaceToolsLayer";
+import { type AppState, useApp } from "../../../app/state/app-state";
+import type { OffsetModeAlgorithm } from "../../../engine/workbench-ops";
 import { LengthInput } from "../../../shared/ui/LengthInput";
-import { describeReport } from "../../mesh-repair/ux/repair-summary";
-import { formatLength, fromDisplayLength, lengthInputValue } from "../../../shared/ux/units";
-
-function pickOtherMesh(items: readonly Item[], primary: MeshHandle | null, current: MeshHandle | null): MeshHandle | null {
-  if (current !== null && items.some((i) => i.mesh === current) && current !== primary) {
-    return current;
-  }
-  return items.find((i) => i.mesh !== primary)?.mesh ?? items[0]?.mesh ?? null;
-}
+import { formatLength, lengthInputValue } from "../../../shared/ux/units";
+import {
+  BOOLEAN_OPERATIONS,
+  isVoxelOffset,
+  offsetBlocked,
+  triangleCountInput,
+  useModelingOps,
+} from "../ux/use-modeling-ops";
+import { spinInput, stampScaleInput, taperInput, usePrintPrepOps } from "../ux/use-print-prep-ops";
+import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
 
 export function ModelingPanel(props: { app: AppState }) {
-  const prepStore = useScene();
-  const prepUnit = useApp(props.app, (s) => s.units);
-  const printPrep = useApp(props.app, (s) => s.wave6.printPrep);
-  const [hollowWallMm, setHollowWallMm] = useState(1.5);
-  const [hollowBackend, setHollowBackend] = useState<HollowBackend>("bvhSdf");
-  const [hollowVoxelSizeText, setHollowVoxelSizeText] = useState("");
-  const [hollowMaxVoxels, setHollowMaxVoxels] = useState(524288);
-  const [hollowCapInnerShell, setHollowCapInnerShell] = useState(false);
-  const [drainSavedDepthMm, setDrainSavedDepthMm] = useState(12.0);
-  const [placeAlignToNormal, setPlaceAlignState] = useState(() => getPlaceAlignToNormal(props.app));
-  const [prepBusy, setPrepBusy] = useState<string | null>(null);
-  const [prepReport, setPrepReport] = useState<{ label: string; text: string; error?: boolean } | null>(null);
-
-  const drainThrough = printPrep.drainParams.depth <= 0;
-
-  const updatePrintPrep = (patch: Partial<typeof printPrep>) => {
-    const current = props.app.getSnapshot().wave6.printPrep;
-    props.app.updateWave6({ printPrep: { ...current, ...patch } });
-  };
-
-  const updateDrainParams = (patch: Partial<typeof printPrep.drainParams>) => {
-    const current = props.app.getSnapshot().wave6.printPrep;
-    props.app.updateWave6({
-      printPrep: { ...current, drainParams: { ...current.drainParams, ...patch } },
-    });
-  };
-
-  const updatePlaceParams = (patch: Partial<typeof printPrep.placeParams>) => {
-    const current = props.app.getSnapshot().wave6.printPrep;
-    props.app.updateWave6({
-      printPrep: { ...current, placeParams: { ...current.placeParams, ...patch } },
-    });
-  };
-
-  const runHollowAction = async (target: Item) => {
-    setPrepBusy("Hollow Mesh");
-    try {
-      const parsedVoxel = hollowVoxelSizeText.trim() === "" ? undefined : Number(hollowVoxelSizeText);
-      const options: HollowOptions = {
-        wallThickness: Math.max(0.1, hollowWallMm),
-        backend: hollowBackend,
-        ...(parsedVoxel !== undefined && Number.isFinite(parsedVoxel) && parsedVoxel > 0
-          ? { voxelSize: parsedVoxel }
-          : {}),
-        maxVoxels: hollowMaxVoxels,
-        ...(hollowCapInnerShell ? { maxCavityTriangles: 12000 } : {}),
-      };
-      const res = await runHollowMeshOp({ store: prepStore, mesh: target.mesh, options });
-      setPrepReport({
-        label: "Hollow Mesh",
-        text: `${res.beforeTriangles} -> ${res.afterTriangles} tris · ${res.report.cavitiesCreated} cavity (${res.report.cavityTriangles} cavity tris, ${res.report.cavityVolume.toFixed(1)} mm3)`,
-        error: false,
-      });
-    } catch (err) {
-      setPrepReport({
-        label: "Hollow Mesh",
-        text: err instanceof Error ? err.message : String(err),
-        error: true,
-      });
-    } finally {
-      setPrepBusy(null);
-    }
-  };
-
-  const runPunchCenterAction = async (target: Item) => {
-    setPrepBusy("Drain Hole");
-    try {
-      const hit = await findCenterSurfaceHit(prepStore.scene, target.mesh);
-      if (hit === null) {
-        throw new Error("Could not find a surface point on the active mesh.");
-      }
-      const res = await executeDrainHoleAtHit({
-        store: prepStore,
-        app: props.app,
-        target: target.mesh,
-        targetName: target.name,
-        hitPoint: hit.point,
-        hitNormal: hit.normal,
-        drainParams: printPrep.drainParams,
-        through: drainThrough,
-      });
-      const plugText = res.plugs.length > 0 ? ` · ${res.plugs.length} plug adopted` : "";
-      setPrepReport({
-        label: "Drain Hole",
-        text: `${res.beforeTriangles} -> ${res.afterTriangles} tris (${res.report.holesPunched} hole${plugText})`,
-        error: false,
-      });
-    } catch (err) {
-      setPrepReport({
-        label: "Drain Hole",
-        text: err instanceof Error ? err.message : String(err),
-        error: true,
-      });
-    } finally {
-      setPrepBusy(null);
-    }
-  };
-
-  const togglePrintPrepTool = (tool: "drainHole" | "placeStamp") => {
-    const next = printPrep.activeTool === tool ? null : tool;
-    updatePrintPrep({ activeTool: next });
-    void prepStore.commitFrame();
-  };
   const { app } = props;
   const store = useScene();
   const [selection] = useSelection();
   const items = useApp(app, (s) => s.items);
   const units = useApp(app, (s) => s.units);
+  const prep = usePrintPrepOps({ app, store, findCenterHit: findCenterSurfaceHit });
 
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const activeItem = selectedItem ?? items[0] ?? null;
-
-  // Boolean CSG state
-  const [boolTarget, setBoolTarget] = useState<MeshHandle | null>(null);
-  const [boolSource, setBoolSource] = useState<MeshHandle | null>(null);
-  const [boolOp, setBoolOp] = useState<BooleanOperation>("union");
-  const [keepOriginals, setKeepOriginals] = useState(true);
-
-  // Plane Cut state
-  const [cutAxis, setCutAxis] = useState<CutAxis>("y");
-  const [cutCustomNormal, setCutCustomNormal] = useState<[number, number, number]>([0, 1, 0]);
-  const [cutOffset, setCutOffset] = useState(0);
-  const [cutCap, setCutCap] = useState(true);
-  const [cutKeepSide, setCutKeepSide] = useState<CutKeepSide>("+");
-
-  // Offset & Shell state
-  const [offsetAlgorithm, setOffsetAlgorithm] = useState<OffsetModeAlgorithm>("auto");
-  const [offsetDistance, setOffsetDistance] = useState(0.5);
-  const [offsetVoxelSize, setOffsetVoxelSize] = useState("");
-  const [shellThickness, setShellThickness] = useState(1);
-
-  // Resampling state
-  const [lockBoundaries, setLockBoundaries] = useState(true);
-  const [simplifyRatio, setSimplifyRatio] = useState(50);
-  const [simplifyTarget, setSimplifyTarget] = useState(500);
-  const [simplifyUseRatio, setSimplifyUseRatio] = useState(true);
-  const [subdivideLevels, setSubdivideLevels] = useState(1);
-
-  // Live triangle count & axis bounds of active mesh
-  const [liveTris, setLiveTris] = useState(0);
-  const [cutBounds, setCutBounds] = useState<[number, number]>([-50, 50]);
-
-  const [busy, setBusy] = useState<string | null>(null);
-  const [report, setReport] = useState<{ label: string; text: string; error?: boolean } | null>(null);
-
-  const resolvedTarget =
-    (boolTarget !== null && items.some((i) => i.mesh === boolTarget) ? boolTarget : null) ??
-    activeItem?.mesh ??
-    null;
-  const resolvedSource = pickOtherMesh(items, resolvedTarget, boolSource);
-
-  useEffect(() => {
-    if (activeItem === null) {
-      setLiveTris(0);
-      setCutBounds([-50, 50]);
-      return;
-    }
-    const updateStats = () => {
-      try {
-        const snap = extractLiveMeshData(store.scene, activeItem.mesh);
-        const tris = Math.floor(snap.indices.length / 3);
-        setLiveTris(tris);
-        if (simplifyUseRatio) {
-          setSimplifyTarget(Math.max(1, Math.round((tris * simplifyRatio) / 100)));
-        }
-        const ext = computeLocalExtents(snap.positions, snap.indices);
-        const idx = cutAxis === "x" ? 0 : cutAxis === "y" ? 1 : 2;
-        const pad = Math.max(ext.extents[idx] * 0.25, 1);
-        setCutBounds([ext.min[idx] - pad, ext.max[idx] + pad]);
-      } catch {
-        setLiveTris(activeItem.triangles);
-      }
-    };
-    updateStats();
-    const unsubStore = store.subscribe(updateStats);
-    const unsubScene = store.scene.onChanges((changes) => {
-      if (changes.some((c) => c.mesh === activeItem.mesh)) {
-        updateStats();
-      }
-    });
-    return () => {
-      unsubStore();
-      unsubScene();
-    };
-  }, [activeItem, store, cutAxis, simplifyUseRatio, simplifyRatio]);
-
-  const runAction = async (label: string, fn: () => Promise<string>) => {
-    setBusy(label);
-    setReport(null);
-    try {
-      const text = await fn();
-      setReport({ label, text });
-    } catch (e) {
-      setReport({ label, text: e instanceof Error ? e.message : String(e), error: true });
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const targetItem = resolvedTarget === null ? null : (items.find((i) => i.mesh === resolvedTarget) ?? null);
-  const sourceItem = resolvedSource === null ? null : (items.find((i) => i.mesh === resolvedSource) ?? null);
-  const disabled = busy !== null || activeItem === null;
+  const ops = useModelingOps({ app, store, items, activeItem, units });
+  const disabled = ops.busy !== null || activeItem === null;
 
   return (
     <section className="panel modeling-panel" aria-label="Modeling & Resampling" data-panel="modeling">
@@ -268,11 +49,11 @@ export function ModelingPanel(props: { app: AppState }) {
               <select
                 aria-label="Boolean target mesh"
                 data-modeling-boolean-target
-                value={resolvedTarget === null ? "" : String(items.findIndex((i) => i.mesh === resolvedTarget))}
-                disabled={busy !== null}
+                value={ops.resolvedTarget === null ? "" : String(items.findIndex((i) => i.mesh === ops.resolvedTarget))}
+                disabled={ops.busy !== null}
                 onChange={(e) => {
                   const idx = Number(e.currentTarget.value);
-                  setBoolTarget(items[idx]?.mesh ?? null);
+                  ops.setBoolTarget(items[idx]?.mesh ?? null);
                 }}
               >
                 {items.map((it, idx) => (
@@ -287,11 +68,11 @@ export function ModelingPanel(props: { app: AppState }) {
               <select
                 aria-label="Boolean source mesh"
                 data-modeling-boolean-source
-                value={resolvedSource === null ? "" : String(items.findIndex((i) => i.mesh === resolvedSource))}
-                disabled={busy !== null}
+                value={ops.resolvedSource === null ? "" : String(items.findIndex((i) => i.mesh === ops.resolvedSource))}
+                disabled={ops.busy !== null}
                 onChange={(e) => {
                   const idx = Number(e.currentTarget.value);
-                  setBoolSource(items[idx]?.mesh ?? null);
+                  ops.setBoolSource(items[idx]?.mesh ?? null);
                 }}
               >
                 {items.map((it, idx) => (
@@ -302,20 +83,14 @@ export function ModelingPanel(props: { app: AppState }) {
               </select>
             </div>
             <div className="modes" role="group" aria-label="Boolean operation">
-              {(
-                [
-                  ["union", "Union"],
-                  ["intersect", "Intersection"],
-                  ["subtract", "Difference"],
-                ] as const
-              ).map(([op, label]) => (
+              {BOOLEAN_OPERATIONS.map(([op, label]) => (
                 <button
                   key={op}
                   type="button"
                   data-modeling-boolean-op={op}
-                  aria-pressed={boolOp === op}
-                  disabled={busy !== null}
-                  onClick={() => setBoolOp(op)}
+                  aria-pressed={ops.boolOp === op}
+                  disabled={ops.busy !== null}
+                  onClick={() => ops.setBoolOp(op)}
                 >
                   {label}
                 </button>
@@ -325,30 +100,17 @@ export function ModelingPanel(props: { app: AppState }) {
               <input
                 type="checkbox"
                 data-modeling-keep-originals
-                checked={keepOriginals}
-                disabled={busy !== null}
-                onChange={(e) => setKeepOriginals(e.currentTarget.checked)}
+                checked={ops.keepOriginals}
+                disabled={ops.busy !== null}
+                onChange={(e) => ops.setKeepOriginals(e.currentTarget.checked)}
               />
               Keep originals
             </label>
             <button
               type="button"
               data-modeling-boolean-run
-              disabled={busy !== null || targetItem === null || sourceItem === null || items.length < 2}
-              onClick={() => {
-                if (!targetItem || !sourceItem) return;
-                void runAction("Boolean", async () => {
-                  const res = await runBooleanCsg({
-                    store,
-                    app,
-                    target: targetItem,
-                    source: sourceItem,
-                    op: boolOp,
-                    keepOriginals,
-                  });
-                  return `${res.name}: ${res.triangles.toLocaleString()} triangles`;
-                });
-              }}
+              disabled={ops.busy !== null || ops.targetItem === null || ops.sourceItem === null || items.length < 2}
+              onClick={() => ops.runBoolean()}
             >
               Run Boolean
             </button>
@@ -364,15 +126,15 @@ export function ModelingPanel(props: { app: AppState }) {
                   key={ax}
                   type="button"
                   data-modeling-cut-axis={ax}
-                  aria-pressed={cutAxis === ax}
+                  aria-pressed={ops.cutAxis === ax}
                   disabled={disabled}
-                  onClick={() => setCutAxis(ax)}
+                  onClick={() => ops.setCutAxis(ax)}
                 >
                   {ax === "custom" ? "Custom" : ax.toUpperCase()}
                 </button>
               ))}
             </div>
-            {cutAxis === "custom" ? (
+            {ops.cutAxis === "custom" ? (
               <div className="op-row">
                 {(["nx", "ny", "nz"] as const).map((label, idx) => (
                   <label key={label} className="field">
@@ -381,12 +143,8 @@ export function ModelingPanel(props: { app: AppState }) {
                       type="number"
                       step="any"
                       aria-label={`Custom cut normal ${label}`}
-                      value={cutCustomNormal[idx]}
-                      onChange={(e) => {
-                        const next: [number, number, number] = [...cutCustomNormal];
-                        next[idx] = Number(e.currentTarget.value) || 0;
-                        setCutCustomNormal(next);
-                      }}
+                      value={ops.cutCustomNormal[idx]}
+                      onChange={(e) => ops.setCutNormalComponent(idx, e.currentTarget.value)}
                     />
                   </label>
                 ))}
@@ -395,17 +153,17 @@ export function ModelingPanel(props: { app: AppState }) {
             <label className="slider">
               <div className="slider-head">
                 <span>Offset</span>
-                <output>{formatLength(cutOffset, units)}</output>
+                <output>{formatLength(ops.cutOffset, units)}</output>
               </div>
               <input
                 type="range"
                 aria-label="Cut plane offset slider"
-                min={cutBounds[0]}
-                max={cutBounds[1]}
-                step={(cutBounds[1] - cutBounds[0]) / 100 || 0.1}
-                value={Math.max(cutBounds[0], Math.min(cutBounds[1], cutOffset))}
+                min={ops.cutBounds[0]}
+                max={ops.cutBounds[1]}
+                step={(ops.cutBounds[1] - ops.cutBounds[0]) / 100 || 0.1}
+                value={Math.max(ops.cutBounds[0], Math.min(ops.cutBounds[1], ops.cutOffset))}
                 disabled={disabled}
-                onChange={(e) => setCutOffset(Number(e.currentTarget.value))}
+                onChange={(e) => ops.setCutOffset(Number(e.currentTarget.value))}
               />
             </label>
             <div className="op-row">
@@ -414,18 +172,18 @@ export function ModelingPanel(props: { app: AppState }) {
                 <LengthInput
                   aria-label="Cut plane offset"
                   data-modeling-cut-offset
-                  mm={cutOffset}
+                  mm={ops.cutOffset}
                   unit={units}
-                  onMm={setCutOffset}
+                  onMm={ops.setCutOffset}
                 />
               </label>
               <label className="check">
                 <input
                   type="checkbox"
                   data-modeling-cut-cap
-                  checked={cutCap}
+                  checked={ops.cutCap}
                   disabled={disabled}
-                  onChange={(e) => setCutCap(e.currentTarget.checked)}
+                  onChange={(e) => ops.setCutCap(e.currentTarget.checked)}
                 />
                 Cap holes
               </label>
@@ -438,9 +196,9 @@ export function ModelingPanel(props: { app: AppState }) {
                     key={side}
                     type="button"
                     data-modeling-cut-side={side}
-                    aria-pressed={cutKeepSide === side}
+                    aria-pressed={ops.cutKeepSide === side}
                     disabled={disabled}
-                    onClick={() => setCutKeepSide(side)}
+                    onClick={() => ops.setCutKeepSide(side)}
                   >
                     {side} side
                   </button>
@@ -450,21 +208,7 @@ export function ModelingPanel(props: { app: AppState }) {
                 type="button"
                 data-modeling-cut-run
                 disabled={disabled}
-                onClick={() => {
-                  if (!activeItem) return;
-                  void runAction("Plane cut", async () => {
-                    const r: CutReport = await runPlaneCut({
-                      store,
-                      mesh: activeItem.mesh,
-                      axis: cutAxis,
-                      customNormal: cutCustomNormal,
-                      offset: cutOffset,
-                      cap: cutCap,
-                      keepSide: cutKeepSide,
-                    });
-                    return `Kept ${r.keptTriangles.toLocaleString()} tris (removed ${r.removedTriangles.toLocaleString()}, cap ${r.capTriangles.toLocaleString()})`;
-                  });
-                }}
+                onClick={() => ops.runCut()}
               >
                 Cut Mesh
               </button>
@@ -480,9 +224,9 @@ export function ModelingPanel(props: { app: AppState }) {
                 <select
                   aria-label="Offset algorithm"
                   data-modeling-offset-algorithm
-                  value={offsetAlgorithm}
+                  value={ops.offsetAlgorithm}
                   disabled={disabled}
-                  onChange={(e) => setOffsetAlgorithm(e.currentTarget.value as OffsetModeAlgorithm)}
+                  onChange={(e) => ops.setOffsetAlgorithm(e.currentTarget.value as OffsetModeAlgorithm)}
                 >
                   <option value="auto">Auto</option>
                   <option value="normal">Normal</option>
@@ -495,12 +239,12 @@ export function ModelingPanel(props: { app: AppState }) {
                 <LengthInput
                   aria-label="Offset distance"
                   data-modeling-offset-distance
-                  mm={offsetDistance}
+                  mm={ops.offsetDistance}
                   unit={units}
-                  onMm={setOffsetDistance}
+                  onMm={ops.setOffsetDistance}
                 />
               </label>
-              {offsetAlgorithm === "bvhSdf" || offsetAlgorithm === "fhEdt" ? (
+              {isVoxelOffset(ops.offsetAlgorithm) ? (
                 <label className="field">
                   voxel ({units})
                   <input
@@ -510,41 +254,18 @@ export function ModelingPanel(props: { app: AppState }) {
                     aria-label="Offset voxel size"
                     data-modeling-offset-voxel-size
                     placeholder="auto"
-                    value={offsetVoxelSize === "" ? "" : lengthInputValue(Number(offsetVoxelSize), units)}
-                    onChange={(e) => {
-                      const typed = e.currentTarget.value;
-                      setOffsetVoxelSize(typed === "" ? "" : String(fromDisplayLength(Number(typed), units)));
-                    }}
+                    value={ops.offsetVoxelSize === "" ? "" : lengthInputValue(Number(ops.offsetVoxelSize), units)}
+                    onChange={(e) => ops.setOffsetVoxelInput(e.currentTarget.value)}
                   />
                 </label>
               ) : null}
               <button
                 type="button"
                 data-modeling-offset-run
-                disabled={
-                  disabled ||
-                  (offsetAlgorithm !== "bvhSdf" && offsetAlgorithm !== "fhEdt" && offsetDistance === 0) ||
-                  ((offsetAlgorithm === "bvhSdf" || offsetAlgorithm === "fhEdt") &&
-                    offsetVoxelSize !== "" &&
-                    !(Number(offsetVoxelSize) > 0))
-                }
-                onClick={() => {
-                  if (!activeItem) return;
-                  void runAction("Offset", async () => {
-                    const r: OffsetReport = await runOffset({
-                      store,
-                      mesh: activeItem.mesh,
-                      distance: offsetDistance,
-                      algorithm: offsetAlgorithm,
-                      voxelSize: offsetVoxelSize === "" ? undefined : Number(offsetVoxelSize),
-                    });
-                    return describeReport("offset", r, units);
-                  });
-                }}
+                disabled={disabled || offsetBlocked(ops.offsetAlgorithm, ops.offsetDistance, ops.offsetVoxelSize)}
+                onClick={() => ops.runOffset()}
               >
-                {(offsetAlgorithm === "bvhSdf" || offsetAlgorithm === "fhEdt") && offsetDistance === 0
-                  ? "Voxel remesh"
-                  : "Offset"}
+                {isVoxelOffset(ops.offsetAlgorithm) && ops.offsetDistance === 0 ? "Voxel remesh" : "Offset"}
               </button>
             </div>
             <div className="op-row">
@@ -554,26 +275,16 @@ export function ModelingPanel(props: { app: AppState }) {
                   aria-label="Shell wall thickness"
                   data-modeling-shell-thickness
                   min={0}
-                  mm={shellThickness}
+                  mm={ops.shellThickness}
                   unit={units}
-                  onMm={(mm) => setShellThickness(Math.max(0, mm))}
+                  onMm={(mm) => ops.setShellThickness(Math.max(0, mm))}
                 />
               </label>
               <button
                 type="button"
                 data-modeling-shell-run
-                disabled={disabled || !(shellThickness > 0)}
-                onClick={() => {
-                  if (!activeItem) return;
-                  void runAction("Shell", async () => {
-                    const r: ShellReport = await runShell({
-                      store,
-                      mesh: activeItem.mesh,
-                      thickness: shellThickness,
-                    });
-                    return describeReport("shell", r, units);
-                  });
-                }}
+                disabled={disabled || !(ops.shellThickness > 0)}
+                onClick={() => ops.runShell()}
               >
                 Shell
               </button>
@@ -587,16 +298,16 @@ export function ModelingPanel(props: { app: AppState }) {
               <input
                 type="checkbox"
                 data-modeling-lock-boundaries
-                checked={lockBoundaries}
+                checked={ops.lockBoundaries}
                 disabled={disabled}
-                onChange={(e) => setLockBoundaries(e.currentTarget.checked)}
+                onChange={(e) => ops.setLockBoundaries(e.currentTarget.checked)}
               />
               Lock boundaries
             </label>
             <div className="op-row">
               <label className="field">
-                {simplifyUseRatio ? "ratio (%)" : "target tris"}
-                {simplifyUseRatio ? (
+                {ops.simplifyUseRatio ? "ratio (%)" : "target tris"}
+                {ops.simplifyUseRatio ? (
                   <input
                     type="number"
                     min={1}
@@ -604,15 +315,9 @@ export function ModelingPanel(props: { app: AppState }) {
                     step={5}
                     aria-label="Simplify percentage"
                     data-modeling-simplify-ratio
-                    value={simplifyRatio}
+                    value={ops.simplifyRatio}
                     disabled={disabled}
-                    onChange={(e) => {
-                      const pct = Math.max(1, Math.min(100, Number(e.currentTarget.value) || 50));
-                      setSimplifyRatio(pct);
-                      if (liveTris > 0) {
-                        setSimplifyTarget(Math.max(1, Math.round((liveTris * pct) / 100)));
-                      }
-                    }}
+                    onChange={(e) => ops.setSimplifyPercent(e.currentTarget.value)}
                   />
                 ) : (
                   <input
@@ -621,9 +326,9 @@ export function ModelingPanel(props: { app: AppState }) {
                     step={1}
                     aria-label="Simplify target triangles"
                     data-modeling-simplify-target
-                    value={simplifyTarget}
+                    value={ops.simplifyTarget}
                     disabled={disabled}
-                    onChange={(e) => setSimplifyTarget(Math.max(1, Math.round(Number(e.currentTarget.value) || 1)))}
+                    onChange={(e) => ops.setSimplifyTarget(triangleCountInput(e.currentTarget.value))}
                   />
                 )}
               </label>
@@ -631,32 +336,18 @@ export function ModelingPanel(props: { app: AppState }) {
                 type="button"
                 data-modeling-simplify-mode
                 disabled={disabled}
-                onClick={() => setSimplifyUseRatio((v) => !v)}
+                onClick={() => ops.setSimplifyUseRatio((v) => !v)}
                 title="Switch between triangle percentage ratio and exact count"
               >
-                {simplifyUseRatio ? "Count" : "Ratio"}
+                {ops.simplifyUseRatio ? "Count" : "Ratio"}
               </button>
               <button
                 type="button"
                 data-modeling-simplify-run
-                disabled={disabled || liveTris <= 0}
-                onClick={() => {
-                  if (!activeItem) return;
-                  const targetCount = simplifyUseRatio
-                    ? Math.max(1, Math.round((liveTris * simplifyRatio) / 100))
-                    : simplifyTarget;
-                  void runAction("Simplify", async () => {
-                    const r: SimplifyReport = await runSimplify({
-                      store,
-                      mesh: activeItem.mesh,
-                      targetTriangles: targetCount,
-                      preserveBoundary: lockBoundaries,
-                    });
-                    return describeReport("simplify", r, units);
-                  });
-                }}
+                disabled={disabled || ops.liveTris <= 0}
+                onClick={() => ops.runSimplify()}
               >
-                Simplify ({simplifyUseRatio ? Math.max(1, Math.round((liveTris * simplifyRatio) / 100)) : simplifyTarget})
+                Simplify ({ops.simplifyCount})
               </button>
             </div>
             <div className="op-row">
@@ -665,9 +356,9 @@ export function ModelingPanel(props: { app: AppState }) {
                 <select
                   aria-label="Subdivide levels"
                   data-modeling-subdivide-levels
-                  value={String(subdivideLevels)}
+                  value={String(ops.subdivideLevels)}
                   disabled={disabled}
-                  onChange={(e) => setSubdivideLevels(Number(e.currentTarget.value))}
+                  onChange={(e) => ops.setSubdivideLevels(Number(e.currentTarget.value))}
                 >
                   <option value="1">1 (×4 tris)</option>
                   <option value="2">2 (×16 tris)</option>
@@ -678,17 +369,7 @@ export function ModelingPanel(props: { app: AppState }) {
                 type="button"
                 data-modeling-subdivide-run
                 disabled={disabled}
-                onClick={() => {
-                  if (!activeItem) return;
-                  void runAction("Subdivide", async () => {
-                    const r: SubdivideReport = await runSubdivide({
-                      store,
-                      mesh: activeItem.mesh,
-                      levels: subdivideLevels,
-                    });
-                    return describeReport("subdivide", r, units);
-                  });
-                }}
+                onClick={() => ops.runSubdivide()}
               >
                 Subdivide (Loop)
               </button>
@@ -701,18 +382,18 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Wall</span>
                 <LengthInput
-                  mm={hollowWallMm}
-                  unit={prepUnit}
+                  mm={prep.hollowWallMm}
+                  unit={units}
                   data-modeling-hollow-thickness
-                  onMm={(mm) => setHollowWallMm(Math.max(0.1, mm))}
+                  onMm={(mm) => prep.setHollowWallMm(Math.max(0.1, mm))}
                 />
               </label>
               <label className="field">
                 <span>Backend</span>
                 <select
-                  value={hollowBackend}
+                  value={prep.hollowBackend}
                   data-modeling-hollow-backend
-                  onChange={(e) => setHollowBackend(e.target.value as HollowBackend)}
+                  onChange={(e) => prep.setHollowBackend(e.target.value as HollowBackend)}
                 >
                   <option value="bvhSdf">BVH SDF</option>
                   <option value="fhEdt">Fast EDT</option>
@@ -727,17 +408,17 @@ export function ModelingPanel(props: { app: AppState }) {
                   min={0.05}
                   step={0.1}
                   placeholder="Auto"
-                  value={hollowVoxelSizeText}
+                  value={prep.hollowVoxelSizeText}
                   data-modeling-hollow-voxel-size
-                  onChange={(e) => setHollowVoxelSizeText(e.target.value)}
+                  onChange={(e) => prep.setHollowVoxelSizeText(e.target.value)}
                 />
               </label>
               <label className="field">
                 <span>Max Voxels</span>
                 <select
-                  value={hollowMaxVoxels}
+                  value={prep.hollowMaxVoxels}
                   data-modeling-hollow-max-voxels
-                  onChange={(e) => setHollowMaxVoxels(Number(e.target.value))}
+                  onChange={(e) => prep.setHollowMaxVoxels(Number(e.target.value))}
                 >
                   <option value={262144}>256k</option>
                   <option value={524288}>512k</option>
@@ -750,18 +431,18 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="check">
                 <input
                   type="checkbox"
-                  checked={hollowCapInnerShell}
+                  checked={prep.hollowCapInnerShell}
                   data-modeling-hollow-inner-shell
-                  onChange={(e) => setHollowCapInnerShell(e.target.checked)}
+                  onChange={(e) => prep.setHollowCapInnerShell(e.target.checked)}
                 />
                 <span>Cap inner shell (≤12k tris)</span>
               </label>
               <button
                 type="button"
                 className="primary"
-                disabled={disabled || prepBusy !== null}
+                disabled={disabled || prep.prepBusy !== null}
                 data-modeling-hollow-run
-                onClick={() => void runHollowAction(activeItem)}
+                onClick={() => void prep.runHollow(activeItem)}
               >
                 Hollow Mesh
               </button>
@@ -774,24 +455,20 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Radius</span>
                 <LengthInput
-                  mm={printPrep.drainParams.diameter * 0.5}
-                  unit={prepUnit}
+                  mm={prep.printPrep.drainParams.diameter * 0.5}
+                  unit={units}
                   data-modeling-drain-radius
-                  onMm={(mm) => updateDrainParams({ diameter: Math.max(0.2, mm * 2) })}
+                  onMm={(mm) => prep.updateDrainParams({ diameter: Math.max(0.2, mm * 2) })}
                 />
               </label>
               <label className="field">
                 <span>Depth</span>
                 <LengthInput
-                  mm={drainThrough ? drainSavedDepthMm : printPrep.drainParams.depth}
-                  unit={prepUnit}
-                  disabled={drainThrough}
+                  mm={prep.drainThrough ? prep.drainSavedDepthMm : prep.printPrep.drainParams.depth}
+                  unit={units}
+                  disabled={prep.drainThrough}
                   data-modeling-drain-depth
-                  onMm={(mm) => {
-                    const next = Math.max(0.2, mm);
-                    setDrainSavedDepthMm(next);
-                    updateDrainParams({ depth: next });
-                  }}
+                  onMm={prep.setDrainDepth}
                 />
               </label>
             </div>
@@ -799,10 +476,10 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Chamfer</span>
                 <LengthInput
-                  mm={printPrep.drainParams.outerChamfer}
-                  unit={prepUnit}
+                  mm={prep.printPrep.drainParams.outerChamfer}
+                  unit={units}
                   data-modeling-drain-chamfer
-                  onMm={(mm) => updateDrainParams({ outerChamfer: Math.max(0, mm) })}
+                  onMm={(mm) => prep.updateDrainParams({ outerChamfer: Math.max(0, mm) })}
                 />
               </label>
               <label className="field">
@@ -812,13 +489,9 @@ export function ModelingPanel(props: { app: AppState }) {
                   min={0}
                   max={45}
                   step={1}
-                  value={printPrep.drainParams.taperDeg}
+                  value={prep.printPrep.drainParams.taperDeg}
                   data-modeling-drain-taper
-                  onChange={(e) =>
-                    updateDrainParams({
-                      taperDeg: Math.max(0, Math.min(45, Number(e.target.value) || 0)),
-                    })
-                  }
+                  onChange={(e) => prep.updateDrainParams({ taperDeg: taperInput(e.target.value) })}
                 />
               </label>
             </div>
@@ -826,27 +499,18 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="check">
                 <input
                   type="checkbox"
-                  checked={drainThrough}
+                  checked={prep.drainThrough}
                   data-modeling-drain-through
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      if (printPrep.drainParams.depth > 0) {
-                        setDrainSavedDepthMm(printPrep.drainParams.depth);
-                      }
-                      updateDrainParams({ depth: 0 });
-                    } else {
-                      updateDrainParams({ depth: Math.max(0.5, drainSavedDepthMm) });
-                    }
-                  }}
+                  onChange={(e) => prep.setDrainThrough(e.target.checked)}
                 />
                 <span>Through wall</span>
               </label>
               <label className="check">
                 <input
                   type="checkbox"
-                  checked={printPrep.drainParams.generatePlug}
+                  checked={prep.printPrep.drainParams.generatePlug}
                   data-modeling-drain-plug
-                  onChange={(e) => updateDrainParams({ generatePlug: e.target.checked })}
+                  onChange={(e) => prep.updateDrainParams({ generatePlug: e.target.checked })}
                 />
                 <span>Create plug</span>
               </label>
@@ -854,19 +518,19 @@ export function ModelingPanel(props: { app: AppState }) {
             <div className="op-row">
               <button
                 type="button"
-                className={printPrep.activeTool === "drainHole" ? "primary" : undefined}
-                aria-pressed={printPrep.activeTool === "drainHole"}
-                disabled={disabled || prepBusy !== null}
+                className={prep.printPrep.activeTool === "drainHole" ? "primary" : undefined}
+                aria-pressed={prep.printPrep.activeTool === "drainHole"}
+                disabled={disabled || prep.prepBusy !== null}
                 data-modeling-drain-tool
-                onClick={() => togglePrintPrepTool("drainHole")}
+                onClick={() => prep.toggleTool("drainHole")}
               >
                 Pick Surface Point to Punch Hole
               </button>
               <button
                 type="button"
-                disabled={disabled || prepBusy !== null}
+                disabled={disabled || prep.prepBusy !== null}
                 data-modeling-drain-center
-                onClick={() => void runPunchCenterAction(activeItem)}
+                onClick={() => void prep.punchAtCenter(activeItem)}
               >
                 Punch at Center
               </button>
@@ -879,11 +543,11 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Stamp</span>
                 <select
-                  value={printPrep.placeParams.stampSource}
+                  value={prep.printPrep.placeParams.stampSource}
                   data-modeling-place-source
                   onChange={(e) =>
-                    updatePlaceParams({
-                      stampSource: e.target.value as typeof printPrep.placeParams.stampSource,
+                    prep.updatePlaceParams({
+                      stampSource: e.target.value as typeof prep.printPrep.placeParams.stampSource,
                     })
                   }
                 >
@@ -897,24 +561,11 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Scene Stamp</span>
                 <select
-                  value={printPrep.placeParams.stampMeshId === null ? "" : String(printPrep.placeParams.stampMeshId)}
+                  value={
+                    prep.printPrep.placeParams.stampMeshId === null ? "" : String(prep.printPrep.placeParams.stampMeshId)
+                  }
                   data-modeling-place-stamp-mesh
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === "") {
-                      updatePlaceParams({
-                        stampMeshId: null,
-                        ...(printPrep.placeParams.stampSource === "sceneMesh"
-                          ? { stampSource: "peg" }
-                          : {}),
-                      });
-                    } else {
-                      updatePlaceParams({
-                        stampSource: "sceneMesh",
-                        stampMeshId: Number(val),
-                      });
-                    }
-                  }}
+                  onChange={(e) => prep.pickSceneStamp(e.target.value)}
                 >
                   <option value="">Built-in preset</option>
                   {items
@@ -931,11 +582,11 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Mode</span>
                 <select
-                  value={printPrep.placeParams.mode}
+                  value={prep.printPrep.placeParams.mode}
                   data-modeling-place-mode
                   onChange={(e) =>
-                    updatePlaceParams({
-                      mode: e.target.value as typeof printPrep.placeParams.mode,
+                    prep.updatePlaceParams({
+                      mode: e.target.value as typeof prep.printPrep.placeParams.mode,
                     })
                   }
                 >
@@ -947,10 +598,10 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="field">
                 <span>Up Axis</span>
                 <select
-                  value={printPrep.placeParams.upAxis}
+                  value={prep.printPrep.placeParams.upAxis}
                   data-modeling-place-up-axis
                   onChange={(e) =>
-                    updatePlaceParams({ upAxis: e.target.value as PlaceUpAxis })
+                    prep.updatePlaceParams({ upAxis: e.target.value as PlaceUpAxis })
                   }
                 >
                   <option value="posZ">+Z (posZ)</option>
@@ -967,22 +618,18 @@ export function ModelingPanel(props: { app: AppState }) {
                   type="number"
                   min={0.05}
                   step={0.1}
-                  value={printPrep.placeParams.uniformScale}
+                  value={prep.printPrep.placeParams.uniformScale}
                   data-modeling-place-scale
-                  onChange={(e) =>
-                    updatePlaceParams({
-                      uniformScale: Math.max(0.05, Number(e.target.value) || 1),
-                    })
-                  }
+                  onChange={(e) => prep.updatePlaceParams({ uniformScale: stampScaleInput(e.target.value) })}
                 />
               </label>
               <label className="field">
                 <span>Embed</span>
                 <LengthInput
-                  mm={printPrep.placeParams.embedDepth}
-                  unit={prepUnit}
+                  mm={prep.printPrep.placeParams.embedDepth}
+                  unit={units}
                   data-modeling-place-embed-depth
-                  onMm={(mm) => updatePlaceParams({ embedDepth: mm })}
+                  onMm={(mm) => prep.updatePlaceParams({ embedDepth: mm })}
                 />
               </label>
               <label className="field">
@@ -990,11 +637,9 @@ export function ModelingPanel(props: { app: AppState }) {
                 <input
                   type="number"
                   step={5}
-                  value={printPrep.placeParams.twistDeg}
+                  value={prep.printPrep.placeParams.twistDeg}
                   data-modeling-place-spin
-                  onChange={(e) =>
-                    updatePlaceParams({ twistDeg: Number(e.target.value) || 0 })
-                  }
+                  onChange={(e) => prep.updatePlaceParams({ twistDeg: spinInput(e.target.value) })}
                 />
               </label>
             </div>
@@ -1002,23 +647,19 @@ export function ModelingPanel(props: { app: AppState }) {
               <label className="check">
                 <input
                   type="checkbox"
-                  checked={placeAlignToNormal}
+                  checked={prep.placeAlignToNormal}
                   data-modeling-place-align-normal
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setPlaceAlignState(checked);
-                    setPlaceAlignToNormal(props.app, checked);
-                  }}
+                  onChange={(e) => prep.setAlignToNormal(e.target.checked)}
                 />
                 <span>Align to normal</span>
               </label>
               <label className="check">
                 <input
                   type="checkbox"
-                  checked={printPrep.placeParams.conformToSurface}
+                  checked={prep.printPrep.placeParams.conformToSurface}
                   data-modeling-place-conform
                   onChange={(e) =>
-                    updatePlaceParams({ conformToSurface: e.target.checked })
+                    prep.updatePlaceParams({ conformToSurface: e.target.checked })
                   }
                 />
                 <span>Conform to surface</span>
@@ -1027,30 +668,30 @@ export function ModelingPanel(props: { app: AppState }) {
             <div className="op-row">
               <button
                 type="button"
-                className={printPrep.activeTool === "placeStamp" ? "primary" : undefined}
-                aria-pressed={printPrep.activeTool === "placeStamp"}
-                disabled={disabled || prepBusy !== null}
+                className={prep.printPrep.activeTool === "placeStamp" ? "primary" : undefined}
+                aria-pressed={prep.printPrep.activeTool === "placeStamp"}
+                disabled={disabled || prep.prepBusy !== null}
                 data-modeling-place-tool
-                onClick={() => togglePrintPrepTool("placeStamp")}
+                onClick={() => prep.toggleTool("placeStamp")}
               >
                 Click Surface to Place Stamp
               </button>
             </div>
           </div>
 
-          {prepBusy !== null ? <p className="muted busy">{prepBusy}...</p> : null}
-          {prepReport !== null ? (
-            <p className={prepReport.error ? "report error" : "report"} data-modeling-print-prep-report>
-              <strong>{prepReport.label}:</strong> {prepReport.text}
+          {prep.prepBusy !== null ? <p className="muted busy">{prep.prepBusy}...</p> : null}
+          {prep.prepReport !== null ? (
+            <p className={prep.prepReport.error ? "report error" : "report"} data-modeling-print-prep-report>
+              <strong>{prep.prepReport.label}:</strong> {prep.prepReport.text}
             </p>
           ) : null}
         </>
       )}
 
-      {busy !== null ? <p className="muted busy">{busy}...</p> : null}
-      {report !== null ? (
-        <p className={report.error ? "report error" : "report"} data-modeling-report>
-          <strong>{report.label}:</strong> {report.text}
+      {ops.busy !== null ? <p className="muted busy">{ops.busy}...</p> : null}
+      {ops.report !== null ? (
+        <p className={ops.report.error ? "report error" : "report"} data-modeling-report>
+          <strong>{ops.report.label}:</strong> {ops.report.text}
         </p>
       ) : null}
     </section>
