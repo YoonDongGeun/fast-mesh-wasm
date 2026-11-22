@@ -1,412 +1,72 @@
 // Free-Form Deformation & Self-Collision control panel for #193 (FFD, ARAP, Kelvinlets, XPBD).
-import type {
-  ArapWeights,
-  FfdBasis,
-  FfdOutsideMode,
-  FreeformProtection,
-  KelvinletLoad,
-  KelvinletScale,
-  MeshHandle,
-  XpbdPinInput,
-} from "fast-mesh-wasm";
+import type { ArapWeights, FfdBasis, FfdOutsideMode, KelvinletScale } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
-import { useEffect, useState, useSyncExternalStore } from "react";
-import { type AppState, useApp } from "../../../app/state/app-state";
+import type { AppState } from "../../../app/state/app-state";
 import type { Wave6DeformState } from "../../../app/state/wave6-state";
-import {
-  buildProtectionOption,
-  formatFreeformReport,
-  moveFfdControlPoint,
-  requireDeformDomain,
-  resetLatticeOffsets,
-  type Vec3Tuple,
-} from "./DeformHandlesLayer";
+import { ALGORITHMS, clampInt, parseFinite, useDeformPanel, VIEWPORT_TOOLS } from "../ux/use-deform-panel";
 
 export interface DeformPanelProps {
   app: AppState;
   store: SceneStore;
 }
 
-type DeformAlgorithm = Wave6DeformState["algorithm"];
-type DeformTool = Wave6DeformState["activeTool"];
-
-const ALGORITHMS: ReadonlyArray<{ id: DeformAlgorithm; label: string }> = [
-  { id: "ffd", label: "FFD" },
-  { id: "arap", label: "ARAP" },
-  { id: "kelvinlet", label: "Kelvinlets" },
-  { id: "xpbd", label: "XPBD" },
-];
-
-const VIEWPORT_TOOLS: ReadonlyArray<{ id: DeformTool; label: string }> = [
-  { id: null, label: "Off" },
-  { id: "ffdCage", label: "FFD Cage" },
-  { id: "arapPin", label: "ARAP Pin" },
-  { id: "arapHandle", label: "ARAP Handle" },
-  { id: "kelvinletDrag", label: "Kelvinlet Drag" },
-  { id: "xpbdPin", label: "XPBD Pin" },
-];
-
-function clampInt(raw: string, min: number, max: number, fallback: number): number {
-  const n = Math.trunc(Number(raw));
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
-}
-
-function parseFinite(raw: string, fallback: number): number {
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function formatError(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 /** React control panel synced with `wave6.deform` for FFD, ARAP, Kelvinlets, and XPBD. */
 export function DeformPanel({ app, store }: DeformPanelProps) {
-  const deform = useApp(app, (s) => s.wave6.deform);
-  const items = useApp(app, (s) => s.items);
-  const sculptMask = useApp(app, (s) => s.sculptMask);
-
-  const selection = useSyncExternalStore(
-    store.subscribe,
-    () => store.getSnapshot().selection,
-    () => store.getSnapshot().selection,
-  );
-  const activeMesh: MeshHandle | null = selection ?? items[0]?.mesh ?? null;
-  const activeItem = items.find((i) => i.mesh === activeMesh) ?? null;
-
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Protection: Pin Box filter (0 = frozen, 1 = full move)
-  const [pinBoxEnabled, setPinBoxEnabled] = useState(false);
-  const [pinBoxMin, setPinBoxMin] = useState<Vec3Tuple>([-10, -10, -10]);
-  const [pinBoxMax, setPinBoxMax] = useState<Vec3Tuple>([10, -0.25, 10]);
-
-  // FFD local parameters
-  const [ffdPadding, setFfdPadding] = useState(0);
-  const [ffdOutside, setFfdOutside] = useState<FfdOutsideMode>("clamp");
-  const [cpIndexIjk, setCpIndexIjk] = useState<[number, number, number]>([1, 2, 1]);
-  const [cpDelta, setCpDelta] = useState<Vec3Tuple>([0, 0.25, 0]);
-
-  // Clamp FFD control point indices when lattice dims shrink.
-  useEffect(() => {
-    const dims = deform.ffdLattice?.dims ?? deform.ffdDims;
-    setCpIndexIjk(([i, j, k]) => [
-      Math.max(0, Math.min(dims[0] - 1, i)),
-      Math.max(0, Math.min(dims[1] - 1, j)),
-      Math.max(0, Math.min(dims[2] - 1, k)),
-    ]);
-  }, [deform.ffdDims, deform.ffdLattice]);
-
-  // ARAP local parameters
-  const [arapIterations, setArapIterations] = useState(15);
-  const [anchorInput, setAnchorInput] = useState(0);
-  const [handleVertex, setHandleVertex] = useState(1);
-  const [handleVec, setHandleVec] = useState<Vec3Tuple>([0, 0.25, 0]);
-
-  // Kelvinlet local parameters
-  const [kelvinCenter, setKelvinCenter] = useState<Vec3Tuple>([0, 0, 0]);
-  const [kelvinForce, setKelvinForce] = useState<Vec3Tuple>([0, 0.3, 0]);
-  const [kelvinMagnitude, setKelvinMagnitude] = useState(0.25);
-
-  // XPBD local parameters
-  const [xpbdIterations, setXpbdIterations] = useState(4);
-  const [xpbdDamping, setXpbdDamping] = useState(0.02);
-  const [xpbdGravity, setXpbdGravity] = useState<Vec3Tuple>([0, -0.25, 0]);
-
-  const patchDeform = (patch: Partial<Wave6DeformState>) => {
-    app.updateWave6((prev) => ({
-      ...prev,
-      deform: { ...prev.deform, ...patch },
-    }));
-  };
-
-  const buildCurrentProtection = (mesh: MeshHandle): FreeformProtection | undefined => {
-    let positions: Float32Array | undefined;
-    if (pinBoxEnabled) {
-      try {
-        positions = store.scene.views(mesh).positions();
-      } catch {
-        positions = undefined;
-      }
-    }
-    return buildProtectionOption({
-      mask: sculptMask,
-      activeMesh: mesh,
-      protectMask: deform.xpbdProtectMask,
-      pinBox:
-        pinBoxEnabled && positions
-          ? { min: pinBoxMin, max: pinBoxMax, positions }
-          : null,
-    });
-  };
-
-  const runOp = async (label: string, fn: (mesh: MeshHandle) => Promise<void>) => {
-    if (activeMesh === null) {
-      setError("Load or select a mesh before running deformation.");
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await fn(activeMesh);
-    } catch (err) {
-      setError(`${label}: ${formatError(err)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // ---- FFD handlers ----
-  const handleBuildLattice = () =>
-    void runOp("Build FFD Lattice", async (mesh) => {
-      const domain = requireDeformDomain(store);
-      const lattice = await domain.buildFfdLattice(mesh, deform.ffdDims, deform.ffdBasis, ffdPadding);
-      patchDeform({
-        ffdLattice: lattice,
-        lastReport: `Built ${lattice.dims.join("x")} ${lattice.basis} FFD lattice.`,
-      });
-    });
-
-  const handleMoveCp = () => {
-    if (!deform.ffdLattice) {
-      setError("Build an FFD lattice first.");
-      return;
-    }
-    setError(null);
-    try {
-      const next = moveFfdControlPoint(
-        deform.ffdLattice,
-        cpIndexIjk[0],
-        cpIndexIjk[1],
-        cpIndexIjk[2],
-        cpDelta,
-        "delta",
-      );
-      patchDeform({
-        ffdLattice: next,
-        lastReport: `Moved FFD control point (${cpIndexIjk.join(", ")}) by [${cpDelta.join(", ")}].`,
-      });
-    } catch (err) {
-      setError(formatError(err));
-    }
-  };
-
-  const handleApplyFfd = () =>
-    void runOp("Apply FFD", async (mesh) => {
-      if (!deform.ffdLattice) {
-        throw new Error("Build an FFD lattice before applying FFD.");
-      }
-      const domain = requireDeformDomain(store);
-      const protect = buildCurrentProtection(mesh);
-      const report = await domain.applyFfd(mesh, {
-        lattice: deform.ffdLattice,
-        outsideMode: ffdOutside,
-        protect,
-      });
-      store.commitFrame();
-      patchDeform({ lastReport: formatFreeformReport("FFD", report) });
-    });
-
-  const handleResetLattice = () => {
-    if (!deform.ffdLattice) return;
-    setError(null);
-    patchDeform({
-      ffdLattice: resetLatticeOffsets(deform.ffdLattice),
-      lastReport: "Reset FFD control point offsets to zero.",
-    });
-  };
-
-  // ---- ARAP handlers ----
-  const handlePinBottomBand = () => {
-    if (activeMesh === null) return;
-    try {
-      const positions = store.scene.views(activeMesh).positions();
-      let minY = Infinity;
-      let maxY = -Infinity;
-      let topVertex = 0;
-      for (let v = 0; v * 3 + 1 < positions.length; v++) {
-        const y = positions[v * 3 + 1];
-        if (y < minY) minY = y;
-        if (y >= maxY) {
-          maxY = y;
-          topVertex = v;
-        }
-      }
-      if (!Number.isFinite(minY) || !Number.isFinite(maxY)) return;
-      const cutoff = minY + (maxY - minY) * 0.2;
-      const pinned: number[] = [];
-      for (let v = 0; v * 3 + 1 < positions.length; v++) {
-        if (positions[v * 3 + 1] <= cutoff) {
-          pinned.push(v);
-        }
-      }
-      if (pinned.includes(handleVertex) && !pinned.includes(topVertex)) {
-        setHandleVertex(topVertex);
-      }
-      patchDeform({
-        arapAnchors: pinned,
-        lastReport: `Pinned ${pinned.length} bottom-band vertices as anchors.`,
-      });
-    } catch (err) {
-      setError(formatError(err));
-    }
-  };
-
-  const handleAddArapHandleFromDelta = () => {
-    if (activeMesh === null) {
-      setError("Load or select a mesh first.");
-      return;
-    }
-    setError(null);
-    try {
-      const positions = store.scene.views(activeMesh).positions();
-      const b = handleVertex * 3;
-      if (b < 0 || b + 2 >= positions.length) {
-        throw new Error(`Vertex ${handleVertex} is out of range.`);
-      }
-      const target: Vec3Tuple = [
-        positions[b] + handleVec[0],
-        positions[b + 1] + handleVec[1],
-        positions[b + 2] + handleVec[2],
-      ];
-      const nextHandles = [
-        ...deform.arapHandles.filter((h) => h.vertex !== handleVertex),
-        { vertex: handleVertex, target },
-      ];
-      const nextAnchors = deform.arapAnchors.filter((v) => v !== handleVertex);
-      patchDeform({ arapAnchors: nextAnchors, arapHandles: nextHandles });
-    } catch (err) {
-      setError(formatError(err));
-    }
-  };
-
-  const handleApplyArap = () =>
-    void runOp("Apply ARAP", async (mesh) => {
-      const domain = requireDeformDomain(store);
-      const protect = buildCurrentProtection(mesh);
-      const report = await domain.applyArap(mesh, {
-        anchors: deform.arapAnchors.map((vertex) => ({ vertex })),
-        handles: deform.arapHandles,
-        weights: deform.arapWeights,
-        iterations: arapIterations,
-        protect,
-      });
-      store.commitFrame();
-      patchDeform({ lastReport: formatFreeformReport("ARAP", report) });
-    });
-
-  // ---- Kelvinlet handlers ----
-  const handleCenterOnMesh = () => {
-    if (activeMesh === null) return;
-    try {
-      const positions = store.scene.views(activeMesh).positions();
-      let minX = Infinity;
-      let maxX = -Infinity;
-      let minY = Infinity;
-      let maxY = -Infinity;
-      let minZ = Infinity;
-      let maxZ = -Infinity;
-      for (let i = 0; i + 2 < positions.length; i += 3) {
-        const x = positions[i];
-        const y = positions[i + 1];
-        const z = positions[i + 2];
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        if (z < minZ) minZ = z;
-        if (z > maxZ) maxZ = z;
-      }
-      if (Number.isFinite(minX)) {
-        setKelvinCenter([
-          Number(((minX + maxX) * 0.5).toFixed(4)),
-          Number(((minY + maxY) * 0.5).toFixed(4)),
-          Number(((minZ + maxZ) * 0.5).toFixed(4)),
-        ]);
-      }
-    } catch (err) {
-      setError(formatError(err));
-    }
-  };
-
-  const handleApplyKelvinlet = () =>
-    void runOp("Apply Kelvinlet", async (mesh) => {
-      const domain = requireDeformDomain(store);
-      const protect = buildCurrentProtection(mesh);
-      let load: KelvinletLoad;
-      switch (deform.kelvinletKind) {
-        case "grab":
-          load = { kind: "grab", force: kelvinForce };
-          break;
-        case "twist":
-          load = { kind: "twist", torque: kelvinForce };
-          break;
-        case "scale":
-          load = { kind: "scale", magnitude: kelvinMagnitude };
-          break;
-        case "pinch":
-          load = {
-            kind: "pinch",
-            forceDipole: [
-              [kelvinForce[0], 0, 0],
-              [0, kelvinForce[1], 0],
-              [0, 0, kelvinForce[2]],
-            ],
-          };
-          break;
-      }
-      const report = await domain.applyKelvinlet(mesh, {
-        center: kelvinCenter,
-        load,
-        epsilon: deform.kelvinletEpsilon,
-        nu: deform.kelvinletNu,
-        scale: deform.kelvinletScale,
-        symmetry: {
-          x: deform.kelvinletSymX,
-          y: deform.kelvinletSymY,
-          z: deform.kelvinletSymZ,
-        },
-        protect,
-      });
-      store.commitFrame();
-      patchDeform({ lastReport: formatFreeformReport("Kelvinlet", report) });
-    });
-
-  // ---- XPBD handler ----
-  const handleApplyXpbd = () =>
-    void runOp("Apply XPBD", async (mesh) => {
-      const domain = requireDeformDomain(store);
-      const protect = buildCurrentProtection(mesh);
-      const pins: XpbdPinInput[] = [];
-      if (deform.arapAnchors.length > 0) {
-        const positions = store.scene.views(mesh).positions();
-        for (const v of deform.arapAnchors) {
-          const b = v * 3;
-          if (b >= 0 && b + 2 < positions.length) {
-            pins.push({ vertex: v, target: [positions[b], positions[b + 1], positions[b + 2]] });
-          }
-        }
-      }
-      const report = await domain.applyXpbd(mesh, {
-        substeps: deform.xpbdSubsteps,
-        iterations: xpbdIterations,
-        stretchCompliance: deform.xpbdStretchCompliance,
-        bendCompliance: deform.xpbdBendCompliance,
-        damping: xpbdDamping,
-        gravity: xpbdGravity,
-        pins,
-        handles: deform.arapHandles.map((h) => ({ vertex: h.vertex, target: h.target })),
-        selfCollision: deform.xpbdSelfCollision,
-        collisionThickness: deform.xpbdThickness,
-        protect,
-      });
-      store.commitFrame();
-      patchDeform({ lastReport: formatFreeformReport("XPBD", report) });
-    });
-
-  const maskCount = sculptMask && sculptMask.mesh === activeMesh ? sculptMask.vertices.length : 0;
+  const {
+    deform,
+    activeMesh,
+    activeItem,
+    busy,
+    error,
+    maskCount,
+    patchDeform,
+    pinBoxEnabled,
+    setPinBoxEnabled,
+    pinBoxMin,
+    setPinBoxMin,
+    pinBoxMax,
+    setPinBoxMax,
+    ffdPadding,
+    setFfdPadding,
+    ffdOutside,
+    setFfdOutside,
+    cpIndexIjk,
+    setCpIndexIjk,
+    cpDelta,
+    setCpDelta,
+    arapIterations,
+    setArapIterations,
+    anchorInput,
+    setAnchorInput,
+    handleVertex,
+    setHandleVertex,
+    handleVec,
+    setHandleVec,
+    kelvinCenter,
+    setKelvinCenter,
+    kelvinForce,
+    setKelvinForce,
+    kelvinMagnitude,
+    setKelvinMagnitude,
+    xpbdIterations,
+    setXpbdIterations,
+    xpbdDamping,
+    setXpbdDamping,
+    xpbdGravity,
+    setXpbdGravity,
+    handleToggleTool,
+    handleBuildLattice,
+    handleMoveCp,
+    handleApplyFfd,
+    handleResetLattice,
+    handleAddAnchor,
+    handlePinBottomBand,
+    handleAddArapHandleFromDelta,
+    handleApplyArap,
+    handleCenterOnMesh,
+    handleApplyKelvinlet,
+    handleApplyXpbd,
+  } = useDeformPanel(app, store);
 
   return (
     <div className="panel">
@@ -443,11 +103,7 @@ export function DeformPanel({ app, store }: DeformPanelProps) {
                   type="button"
                   className={active ? "active" : ""}
                   aria-pressed={active}
-                  onClick={() =>
-                    patchDeform({
-                      activeTool: tool.id === null ? null : active ? null : tool.id,
-                    })
-                  }
+                  onClick={() => handleToggleTool(tool.id)}
                 >
                   {tool.label}
                 </button>
@@ -696,16 +352,7 @@ export function DeformPanel({ app, store }: DeformPanelProps) {
                 onChange={(e) => setAnchorInput(clampInt(e.target.value, 0, 1_000_000, anchorInput))}
               />
             </label>
-            <button
-              type="button"
-              onClick={() =>
-                patchDeform({
-                  arapAnchors: deform.arapAnchors.includes(anchorInput)
-                    ? deform.arapAnchors
-                    : [...deform.arapAnchors, anchorInput],
-                })
-              }
-            >
+            <button type="button" onClick={handleAddAnchor}>
               Add Anchor
             </button>
             <button type="button" disabled={activeMesh === null} onClick={handlePinBottomBand}>
