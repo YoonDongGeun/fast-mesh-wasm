@@ -2,7 +2,7 @@
 // render views, on the main thread in slices of a few milliseconds at idle
 // (no GPU readback, no copy of the buffers to a Worker). It uses every
 // triangle, so nothing thins out at 1M: a pass costs tens of milliseconds, cut
-// across frames. When the slices run is `ux/preview-schedule`'s.
+// across frames; `ux/preview-schedule` decides when the slices run.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useState } from "react";
