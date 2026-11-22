@@ -25,13 +25,13 @@ import * as THREE from "three";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
 import { exportContourSlicesDxf } from "../src/features/inspect/ux/use-contour-slices";
+import { PointsPanel } from "../src/features/points/ui/PointsPanel";
 import {
-  PointsPanel,
   computePointCloudBounds,
   createSyntheticSphereCloud,
   parsePointCloudFileContent,
   sampleMeshToPointCloud,
-} from "../src/features/points/ui/PointsPanel";
+} from "../src/features/points/ux/point-cloud";
 import { AppState } from "../src/app/state/app-state";
 import {
   MetrologyOverlaysLayer,
