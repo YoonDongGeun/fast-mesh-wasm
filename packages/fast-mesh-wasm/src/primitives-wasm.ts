@@ -23,8 +23,8 @@ import { activeWasmScene } from "./scene.js";
  * {@link PrimitiveShape} for each shape's options and defaults.
  *
  * Add it to a scene with `scene.addMesh(mesh.positions, mesh.indices)`
- * (translate the positions or set a placement to move it), or draw it as a
- * `BufferGeometry`. On a `WorkerScene`, `scene.generatePrimitive(shape)`
+ * (translate the positions or set a placement to move it), or upload it as
+ * a vertex and index buffer. On a `WorkerScene`, `scene.generatePrimitive(shape)`
  * runs the same generator in its Worker, so the main thread needs no wasm.
  *
  * @example

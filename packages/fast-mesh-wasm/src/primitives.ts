@@ -185,7 +185,7 @@ export const PRIMITIVE_SHAPE_KINDS: readonly PrimitiveShapeKind[] = [
   "plane",
 ];
 
-/** A generated primitive: flat positions and triangle indices, ready for `addMesh` or a `BufferGeometry`. */
+/** A generated primitive: flat positions and triangle indices, ready for `addMesh` or a GPU vertex and index buffer. */
 export interface PrimitiveMesh {
   /** 3 per vertex, centred on the origin. */
   positions: Float32Array;

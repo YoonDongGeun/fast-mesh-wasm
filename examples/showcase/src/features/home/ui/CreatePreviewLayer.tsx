@@ -12,7 +12,7 @@ import { useCreateDialog } from "../ux/create-dialog-state";
 /** Shapes up to this many triangles also draw their wireframe. */
 export const PREVIEW_WIRE_TRIANGLES = 200_000;
 
-/** The preview's three.js objects for `mesh`, and how to free them. */
+/** The preview's scene objects for `mesh`, and how to free them. */
 export function buildCreatePreview(mesh: PrimitiveMesh): { root: THREE.Group; dispose(): void } {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
