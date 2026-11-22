@@ -132,6 +132,12 @@ export function installTestHook(
     },
     /** The mesh's placement translation. */
     translation: (name: string) => [...store.scene.placement(find(name).mesh).translation],
+    /** The mesh's whole placement (rotation row-major), and the armed placement pick's kind and point count (#256). */
+    placement: (name: string) => store.scene.placement(find(name).mesh),
+    placementPick: () => {
+      const pick = app.getSnapshot().placementTool.pick;
+      return pick === null ? null : { kind: pick.kind, points: pick.points.length };
+    },
     dragging: () => view.dragging,
     /**
      * The gizmo: `null` when there is none, else the mesh it is attached to

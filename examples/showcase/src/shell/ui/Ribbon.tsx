@@ -9,6 +9,7 @@ import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
+import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
 import { SculptToolbox } from "../../features/sculpt/ui/Toolbox";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 import { focusElement, openFilePicker, triggerClick } from "../ux/panel-triggers";
@@ -288,6 +289,19 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Clear Faces
               </button>
+            </div>
+            <div className="group" aria-label="Placement">
+              {PLACEMENT_COMMANDS.filter((c) => c.shelf).map((c) => (
+                <button
+                  key={c.action}
+                  type="button"
+                  data-ribbon-placement={c.action}
+                  disabled={selection === null}
+                  onClick={() => triggerClick(`[data-placement-action="${c.action}"]`)}
+                >
+                  {c.short}
+                </button>
+              ))}
             </div>
             <div className="group ribbon-shading-strip" aria-label="Diagnostic shading">
               {DIAGNOSTIC_SHADING_OPTIONS.map((opt) => (

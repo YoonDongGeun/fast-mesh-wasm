@@ -32,6 +32,7 @@ import {
 } from "../../shared/ux/settings";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
+import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
 
 export interface Item {
   /** A React key. */
@@ -356,6 +357,8 @@ export interface AppSnapshot {
   commandPaletteOpen: boolean;
   /** Wave 6 feature states (#233, #193, #194, #234, #236). */
   wave6: Wave6State;
+  /** The placement helpers' armed surface pick and latest report (#256). */
+  placementTool: PlacementToolState;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -438,6 +441,7 @@ export class AppState {
     healerFocusRequest: null,
     commandPaletteOpen: false,
     wave6: createDefaultWave6State(),
+    placementTool: DEFAULT_PLACEMENT_TOOL,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -927,6 +931,11 @@ export class AppState {
     if (this.#snap.commandPaletteOpen !== commandPaletteOpen) {
       this.#set({ commandPaletteOpen });
     }
+  }
+
+  /** Arms or clears (`pick: null`) a placement helper's surface pick, or sets its report (#256). */
+  setPlacementTool(patch: Partial<PlacementToolState>): void {
+    this.#set({ placementTool: { ...this.#snap.placementTool, ...patch } });
   }
 
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */

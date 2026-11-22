@@ -6,6 +6,8 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
+import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
+import { triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 
 export interface CommandPaletteItem {
@@ -447,6 +449,21 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: ctx.onOpenHelp,
     },
   );
+
+  // The placement helpers press the transform panel's buttons (#256).
+  for (const c of PLACEMENT_COMMANDS) {
+    cmds.push({
+      id: `placement:${c.action}`,
+      title: c.label,
+      category: "Tool",
+      keywords: c.keywords,
+      disabled: selection === null,
+      run: () => {
+        app.setActiveTab("select");
+        triggerClick(`[data-placement-action="${c.action}"]`);
+      },
+    });
+  }
 
   for (const item of items) {
     cmds.push({

@@ -76,6 +76,8 @@ export function useKeyboardShortcuts(opts: {
             app.disarmWave6Tools();
           } else if (snap.brushPick !== null) {
             app.setBrushPick(null);
+          } else if (snap.placementTool.pick !== null) {
+            app.setPlacementTool({ pick: null });
           } else {
             selectMesh(app, select, selection, null, false);
           }

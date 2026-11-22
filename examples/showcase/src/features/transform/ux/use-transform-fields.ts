@@ -131,6 +131,19 @@ export function useTransformFields(store: SceneStore, selectedItem: Item | null)
     commitPlacement(pos, next);
   };
 
+  /** Takes the current extents as 1× (Apply transform baked the placement's turn and scale into them). */
+  const rebaseScale = () => {
+    if (selectedItem === null) return;
+    try {
+      const v = store.scene.views(selectedItem.mesh);
+      const { extents } = computeLocalExtents(v.positions(), v.indices());
+      baselineExtents.current.set(selectedItem.mesh, [extents[0] || 1, extents[1] || 1, extents[2] || 1]);
+      setScaleVal([1, 1, 1]);
+    } catch {
+      // Removed meanwhile
+    }
+  };
+
   /** Edits the pending scale (all three axes while uniform), ignoring non-finite input; Apply commits it. */
   const editScale = (idx: number, val: number) => {
     if (!Number.isFinite(val)) return;
@@ -155,5 +168,6 @@ export function useTransformFields(store: SceneStore, selectedItem: Item | null)
     setRotAxis,
     editScale,
     commitScale,
+    rebaseScale,
   };
 }

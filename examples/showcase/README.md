@@ -33,6 +33,18 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
+- **Placement.** The Transform panel's helpers place the selected mesh in one click each, one undo
+  step each: *Centre to Origin* and *Bottom to Origin* move its world bounding box centre (or the
+  centre of its bottom) to the origin; *Lay Flat* takes a clicked face, turns the mesh about its box
+  centre so the face points down and rests its lowest point on the floor; *Two Points* and *Face
+  Normal* turn a picked direction onto ±X, ±Y or ±Z; *3-2-1* takes three points on the primary plane
+  (it becomes the floor, the mesh above it), two along the secondary direction (it becomes +X) and
+  one for the origin (its plane becomes X = 0), and puts the datum origin where those planes meet at
+  the world origin. *Up* picks the floor: Z = 0 (the default) or Y = 0. *Apply Transform* bakes
+  the placement into the vertices (the world positions it gave them), so the placement becomes the
+  identity: the placement change and the vertex edit are one history step. The picks are engine
+  raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
+  `src/features/transform/ux/placement-math.ts`.
 - **Repair.** For the selected mesh, `analyze` lists its holes (with their sizes), orientation
   conflicts, components (floating pieces), non-manifold edges and vertices, and degenerate triangles.
   The buttons run the library's repairs through `store.repair`, each one undo step: Weld (within a
@@ -141,7 +153,7 @@ src/
     home/        mesh list, project save and open, export
     view/        ViewCube, shading modes, wireframe, camera presets
     select/      object and face selection
-    transform/   numeric transform, scale, ICP alignment
+    transform/   numeric transform, scale, placement helpers, ICP alignment
     inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
                  triangle quality maps
     mesh-edit/   boolean, plane cut, offset and shell, resample, hollow, place mesh

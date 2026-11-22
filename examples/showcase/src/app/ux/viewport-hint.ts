@@ -16,6 +16,8 @@ export interface HintState {
   printTool: Wave6["printPrep"]["activeTool"];
   /** Waiting for a click to set the brush centre. */
   picking: boolean;
+  /** A placement helper waits for clicks on the selected mesh (#256). */
+  placementPick?: boolean;
   selected: boolean;
   coarse: boolean;
 }
@@ -41,6 +43,9 @@ export function viewportHint(s: HintState): string {
   }
   if (s.picking) {
     return "Click the mesh to set the brush center · Esc cancels";
+  }
+  if (s.placementPick === true) {
+    return "Click the selected mesh to pick (the Transform panel says what) · Esc cancels";
   }
   if (!s.selected) {
     return s.coarse
