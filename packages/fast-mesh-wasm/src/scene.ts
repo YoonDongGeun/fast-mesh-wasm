@@ -264,6 +264,11 @@ export function useWasmScene(ctor: typeof WasmScene): void {
   RawScene = ctor;
 }
 
+/** Internal: the `WasmScene` class new scenes wrap ({@link useWasmScene}), for its statics. */
+export function activeWasmScene(): typeof WasmScene {
+  return RawScene;
+}
+
 const meshIds = new WeakMap<MeshHandle, HandleId>();
 const rawIds = new WeakMap<FieldHandle | SectionHandle, HandleId>();
 

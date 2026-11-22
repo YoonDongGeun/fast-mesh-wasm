@@ -17,6 +17,7 @@
 // `Port`, so it runs in a browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
+import { generateEncodedPrimitive } from "../primitives-wasm.js";
 import {
   type EditOp,
   type FieldHandle,
@@ -2192,6 +2193,10 @@ class Engine {
           pushOwned((value as QueryMap["triangleQuality"]["value"]).vertexQuality);
         } else if (req.name === "meshDeviation") {
           pushOwned((value as QueryMap["meshDeviation"]["value"]).vertexDeviations);
+        } else if (req.name === "generatePrimitive") {
+          const mesh = value as QueryMap["generatePrimitive"]["value"];
+          pushOwned(mesh.positions);
+          pushOwned(mesh.indices);
         }
         return;
       }
@@ -2477,6 +2482,8 @@ class Engine {
         const a = args as QueryMap["sliceContourStack"]["args"];
         return s.sliceContourStack(this.#mesh(a.mesh), a.origin, a.normal, a.spacing, a.count);
       }
+      case "generatePrimitive":
+        return generateEncodedPrimitive(args as QueryMap["generatePrimitive"]["args"]);
       case "debugDump": {
         if (!this.#debug) {
           throw invalid(`unknown query ${name}`);

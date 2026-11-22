@@ -40,6 +40,7 @@ import {
 } from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import { encodePrimitive, type PrimitiveMesh, type PrimitiveShape } from "../primitives.js";
 import { FastMeshError, type FastMeshErrorCode, reportListenerError } from "../core.js";
 import {
   createAlignDomain,
@@ -3291,6 +3292,21 @@ export class WorkerScene implements SceneLike {
   /** Whether there is a step to redo, as of the latest result. */
   get canRedo(): boolean {
     return this.#history.canRedo;
+  }
+
+  // ---- Primitives ----
+
+  /**
+   * Generates a primitive shape in the Worker, as the standalone
+   * `generatePrimitive` does on a thread with the module initialised; the
+   * buffers are transferred back, and the scene is not touched. The shape is
+   * checked by type here, its ranges in the Worker.
+   *
+   * @throws (rejects) `INVALID_ARGUMENT` for an unknown kind or a parameter
+   * out of range; `OUT_OF_MEMORY` when the buffers cannot be allocated.
+   */
+  generatePrimitive(shape: PrimitiveShape): Promise<PrimitiveMesh> {
+    return this.#query("generatePrimitive", () => encodePrimitive(shape), (v) => v);
   }
 
   // ---- Fields and colours ----

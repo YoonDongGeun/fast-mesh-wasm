@@ -4,6 +4,7 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type {
   NormalizedBooleanOptions,
   NormalizedDyntopoOptions,
@@ -394,6 +395,8 @@ export interface QueryMap {
   fitPrimitive: { args: { mesh: ClientId; options: FitPrimitiveOptions }; value: FittedPrimitiveReport };
   sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
   sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
+  /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
+  generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
   debugDump: {
     args: { mesh: ClientId };
