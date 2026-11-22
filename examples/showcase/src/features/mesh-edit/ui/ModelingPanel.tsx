@@ -17,6 +17,8 @@ import {
 } from "../ux/use-modeling-ops";
 import { spinInput, stampScaleInput, taperInput, usePrintPrepOps } from "../ux/use-print-prep-ops";
 import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
+import { BatchBooleanSection } from "./BatchBooleanSection";
+import { IsotropicRemeshSection } from "./IsotropicRemeshSection";
 
 export function ModelingPanel(props: { app: AppState }) {
   const { app } = props;
@@ -115,6 +117,9 @@ export function ModelingPanel(props: { app: AppState }) {
               Run Boolean
             </button>
           </div>
+
+          {/* ---- 1b. Multi-mesh Boolean (#254) ---- */}
+          <BatchBooleanSection app={app} store={store} items={items} />
 
           {/* ---- 2. Destructive Plane Cut ---- */}
           <div className="op">
@@ -375,6 +380,9 @@ export function ModelingPanel(props: { app: AppState }) {
               </button>
             </div>
           </div>
+
+          {/* ---- 4b. Isotropic Remesh (#254) ---- */}
+          <IsotropicRemeshSection store={store} activeItem={activeItem} units={units} />
 
           <div className="op" data-modeling-hollow-section>
             <span className="muted">5. Print Prep — Hollow Mesh</span>

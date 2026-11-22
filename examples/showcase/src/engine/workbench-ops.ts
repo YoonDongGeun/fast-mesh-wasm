@@ -25,6 +25,15 @@ import { bounds, type Vec3 } from "../io/mesh-data";
 import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } from "../app/state/app-state";
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
+import type { BooleanMethod, BooleanOptions, CsgNode, IsotropicRemeshOptions, SurfaceRemeshReport } from "fast-mesh-wasm";
+import {
+  batchBooleanTree,
+  batchResultName,
+  clearMeshOps,
+  emptyResultMessage,
+  localToWorld,
+  remapCorners,
+} from "../features/mesh-edit/ux/batch-boolean";
 
 export type MirrorAxis = "x" | "y" | "z";
 export type BooleanOperation = BooleanOp;
@@ -435,6 +444,133 @@ export async function runBooleanCsg(params: {
   }
 }
 
+/** What a multi-mesh boolean did: the mesh holding the result, its name and triangles. */
+export interface BatchBooleanRunResult {
+  mesh: MeshHandle;
+  name: string;
+  triangles: number;
+}
+
+/** Runs `work` inside one history step: committed when it settles, reverted when it throws. */
+async function inOneStep<T>(store: SceneStore, work: () => Promise<T>): Promise<T> {
+  store.beginStep();
+  try {
+    const value = await work();
+    store.endStep();
+    return value;
+  } catch (err) {
+    store.cancelStep();
+    throw err;
+  }
+}
+
+/**
+ * Replaces `mesh`'s live geometry with world-space `positions` and compact
+ * triangle `corners`: a clear-and-add edit, then the triangles over the new
+ * vertex ids (two edits, so the caller's step makes them one undo step).
+ */
+async function writeWorldGeometry(
+  store: SceneStore,
+  mesh: MeshHandle,
+  positions: Float64Array,
+  corners: Uint32Array,
+): Promise<void> {
+  const views = store.scene.views(mesh);
+  const clear = clearMeshOps(Math.floor(views.positions().length / 3), views.indices());
+  const added = await store.edit(mesh, [...clear, { op: "addVertices", positions }]);
+  const ids = added.added[clear.length];
+  if (ids === undefined || ids.length !== positions.length / 3) {
+    throw new Error("The edit did not report the added vertices.");
+  }
+  await store.edit(mesh, [{ op: "addTriangles", triangles: remapCorners(corners, ids) }]);
+}
+
+/**
+ * The N-way boolean (#254) over `inputs`, the primary first, through
+ * `boolean.booleanBatch` on either scene (`op` folds every input, or takes
+ * the others from the primary; see `batchBooleanTree`). The engine writes
+ * the result to a scratch mesh, read and removed here; then, as one undo
+ * step:
+ *
+ * - `keepInputs`: the result fills a new mesh, added empty first. Undo
+ *   empties it; the inputs never change.
+ * - otherwise the primary takes the result in place (keeping its name and
+ *   placement) and the other inputs are cleared. Undo restores every input.
+ *
+ * Adding and removing meshes are not undo steps, so no input is removed: a
+ * cleared input stays listed, empty, until undo refills it. An empty result
+ * (inputs that do not overlap, say) throws before anything changes.
+ */
+export async function runBatchBoolean(params: {
+  store: SceneStore;
+  app: AppState;
+  inputs: readonly Item[];
+  op: BooleanOperation;
+  keepInputs: boolean;
+  method?: BooleanMethod;
+}): Promise<BatchBooleanRunResult> {
+  const { store, app, inputs, op, keepInputs, method } = params;
+  const scene = store.scene;
+  const domain = scene.boolean as
+    | {
+        booleanBatch?: (
+          meshes: readonly MeshHandle[],
+          tree: CsgNode,
+          options?: BooleanOptions,
+        ) => MeshHandle | Promise<MeshHandle>;
+      }
+    | undefined;
+  if (domain?.booleanBatch === undefined) {
+    throw new Error("This scene has no multi-mesh boolean.");
+  }
+  const tree = batchBooleanTree(op, inputs.length);
+  const scratch = await domain.booleanBatch(
+    inputs.map((i) => i.mesh),
+    tree,
+    method === undefined ? undefined : { method },
+  );
+  let positions: Float64Array;
+  let corners: Uint32Array;
+  try {
+    const snap = extractLiveMeshData(scene, scratch);
+    positions = localToWorld(scene.matrix4(scratch), snap.positions);
+    corners = snap.indices;
+  } finally {
+    store.removeMesh(scratch);
+  }
+  if (corners.length === 0) {
+    throw new Error(emptyResultMessage(op));
+  }
+  const triangles = corners.length / 3;
+
+  if (keepInputs) {
+    const mesh = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: [0, 0, 0] });
+    try {
+      await inOneStep(store, () => writeWorldGeometry(store, mesh, positions, corners));
+    } catch (err) {
+      store.removeMesh(mesh);
+      throw err;
+    }
+    const item = app.adoptSceneMesh(store, mesh, batchResultName(op, inputs));
+    selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, mesh, false);
+    return { mesh, name: item.name, triangles };
+  }
+
+  const [primary, ...others] = inputs;
+  await inOneStep(store, async () => {
+    await writeWorldGeometry(store, primary.mesh, positions, corners);
+    for (const other of others) {
+      const views = scene.views(other.mesh);
+      const clear = clearMeshOps(Math.floor(views.positions().length / 3), views.indices());
+      if (clear.length > 0) {
+        await store.edit(other.mesh, clear);
+      }
+    }
+  });
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, primary.mesh, false);
+  return { mesh: primary.mesh, name: primary.name, triangles };
+}
+
 /** Builds a world-space SectionPlane from axis, custom normal, signed offset, and keep-side (`+` | `-`). */
 export function buildCutPlane(
   axis: CutAxis,
@@ -573,6 +709,19 @@ export async function runSubdivide(params: {
     method: "loop",
     levels,
   });
+}
+
+/**
+ * Isotropic surface remesh (#254): the `remesh.isotropic` request, sent as
+ * a `remeshSurface` repair so it is one undo step on either scene (the
+ * Worker runs it off the main thread).
+ */
+export async function runIsotropicRemesh(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: IsotropicRemeshOptions;
+}): Promise<SurfaceRemeshReport> {
+  return params.store.repair(params.mesh, { op: "remeshSurface", ...params.options, mode: "isotropic" });
 }
 
 /**

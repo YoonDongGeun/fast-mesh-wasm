@@ -367,6 +367,13 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" onClick={() => focusElement("[data-modeling-boolean-run]")}>
                 Boolean CSG
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="batch-boolean"
+                onClick={() => focusElement("[data-batch-boolean-section]")}
+              >
+                Multi Boolean
+              </button>
               <button type="button" onClick={() => focusElement("[data-modeling-cut-run]")}>
                 Plane Cut
               </button>
@@ -378,6 +385,13 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => focusElement("[data-modeling-subdivide-run]")}>
                 Subdivide
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="isotropic-remesh"
+                onClick={() => focusElement("[data-isotropic-section]")}
+              >
+                Isotropic Remesh
               </button>
               <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
                 Hollow
