@@ -20,10 +20,8 @@ import { WorkbenchRibbon } from "../src/shell/ui/Ribbon";
 import { tabMatchesSlot, WORKBENCH_TABS } from "../src/shell/ux/workbench-tabs";
 import { SelectPanel } from "../src/features/select/ui/SelectPanel";
 import { AppState } from "../src/app/state/app-state";
-import {
-  FaceSelectionMarquee,
-  setFaceSelectionMarquee,
-} from "../src/features/select/ui/FaceSelectionLayer";
+import { FaceSelectionMarquee } from "../src/features/select/ui/FaceSelectionLayer";
+import { setFaceSelectionMarquee } from "../src/features/select/ux/face-selection-marquee";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

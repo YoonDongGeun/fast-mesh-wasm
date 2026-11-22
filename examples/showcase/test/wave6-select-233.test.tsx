@@ -12,19 +12,15 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { init, Scene } from "../../../packages/fast-mesh-wasm/dist/web.js";
 import { SelectPanel } from "../src/features/select/ui/SelectPanel";
 import { AppState, type Item } from "../src/app/state/app-state";
+import { buildSelectedFacesGeometry, FaceSelectionMarquee } from "../src/features/select/ui/FaceSelectionLayer";
+import { setFaceSelectionMarquee } from "../src/features/select/ux/face-selection-marquee";
 import {
   applyScreenFaceSelection,
-  buildScreenSelectOptions,
-  buildSelectedFacesGeometry,
-  clientPointToNdc,
-  combineFaceSelection,
-  countLiveTriangles,
-  FaceSelectionMarquee,
-  invertFaceSelection,
   raycastVisibleItem,
-  setFaceSelectionMarquee,
   writeMeshFaceSelection,
-} from "../src/features/select/ui/FaceSelectionLayer";
+} from "../src/features/select/ux/face-selection-ops";
+import { combineFaceSelection, countLiveTriangles, invertFaceSelection } from "../src/features/select/ux/face-sets";
+import { buildScreenSelectOptions, clientPointToNdc } from "../src/features/select/ux/screen-select";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
