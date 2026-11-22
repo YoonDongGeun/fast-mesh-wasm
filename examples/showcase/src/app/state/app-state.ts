@@ -12,6 +12,7 @@ import type { LoadedMesh } from "../../io/protocol";
 import type { SliceAxis } from "../../features/ct/ux/volume-slice";
 import type { SculptBrush, SculptMask } from "../../features/sculpt/ux/sculpt";
 import { installDiagnosticShader } from "../../features/view/ui/shading";
+import type { OrbitDirection, RollDirection } from "../../features/view/ux/view-steps";
 import {
   createGroup,
   dropMember,
@@ -24,6 +25,7 @@ import {
   clampSidebarWidth,
   DEFAULT_SIDEBAR_WIDTH,
   defaultSettings,
+  type ScaleIndicator,
   type SculptFilterSettings,
   type SculptMethods,
   type SculptSymmetrySettings,
@@ -201,6 +203,14 @@ export interface CameraDirectionRequest {
   n: number;
 }
 
+/** A navigation cube arrow (#255): an orbit about the screen's axes, or a roll about the view direction. */
+export type CameraStep =
+  | { kind: "orbit"; direction: OrbitDirection; deg: number }
+  | { kind: "roll"; direction: RollDirection; deg: number };
+
+/** The latest arrow step; `n` makes a repeated press new. */
+export type CameraStepRequest = CameraStep & { n: number };
+
 /** A workspace ribbon tab (#228). */
 export type WorkbenchTab = "home" | "select" | "repair" | "edit" | "sculpt" | "align" | "volume" | "inspect";
 
@@ -335,12 +345,18 @@ export interface AppSnapshot {
   surfaceField: SurfaceFieldState;
   /** Per-vertex scalar values for fields rendered via the client overlay (Gaussian curvature, WorkerScene thickness/mean curvature). */
   surfaceFieldValues: SurfaceFieldOverlayData | null;
-  /** Viewport camera projection mode (#195). */
+  /** Viewport camera projection mode (#195; persisted since #255). */
   cameraProjection: CameraProjection;
   /** Latest camera preset request; `n` distinguishes repeated clicks (#195). */
   cameraPresetRequest: CameraPresetRequest | null;
   /** Arbitrary ViewCube edge/corner direction request (#232). */
   cameraDirectionRequest: CameraDirectionRequest | null;
+  /** Latest navigation cube arrow step (#255). */
+  cameraStepRequest: CameraStepRequest | null;
+  /** The viewport's scale indicator (#255; a display setting: persisted, not undoable). */
+  scaleIndicator: ScaleIndicator;
+  /** Whether the XYZ axis basis shows (#255; a display setting: persisted, not undoable). */
+  showAxisBasis: boolean;
   /** Active workspace ribbon tab driving tier-2 shelf and single right inspector (#228). */
   activeTab: WorkbenchTab;
   /** Whether sculpt/mask hover restricts to `selection` instead of any visible unlocked mesh (#229). */
@@ -433,6 +449,9 @@ export class AppState {
     cameraProjection: "perspective",
     cameraPresetRequest: null,
     cameraDirectionRequest: null,
+    cameraStepRequest: null,
+    scaleIndicator: "ruler",
+    showAxisBasis: true,
     activeTab: "home",
     sculptPinToActive: false,
     shadingMode: "smooth",
@@ -472,6 +491,9 @@ export class AppState {
       sculptSymmetry: { ...initial.sculptSymmetry },
       units: initial.defaultUnits,
       defaultUnits: initial.defaultUnits,
+      cameraProjection: initial.cameraProjection,
+      scaleIndicator: initial.scaleIndicator,
+      showAxisBasis: initial.showAxisBasis,
     };
   }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -1042,6 +1064,22 @@ export class AppState {
     this.#set({ cameraDirectionRequest: { dir: [...dir], up: [...up], n: prevN + 1 } });
   }
 
+  /** Requests a navigation cube arrow step: an orbit or a roll of the view (#255). */
+  requestCameraStep(step: CameraStep): void {
+    const prevN = this.#snap.cameraStepRequest?.n ?? 0;
+    this.#set({ cameraStepRequest: { ...step, n: prevN + 1 } });
+  }
+
+  /** Sets the viewport's scale indicator (#255; a display setting: persisted, not undoable). */
+  setScaleIndicator(scaleIndicator: ScaleIndicator): void {
+    this.#set({ scaleIndicator });
+  }
+
+  /** Shows or hides the XYZ axis basis (#255; a display setting: persisted, not undoable). */
+  setShowAxisBasis(showAxisBasis: boolean): void {
+    this.#set({ showAxisBasis });
+  }
+
   /** Whether heavy loads are decimated on load (the mesh list's checkbox). */
   setDecimateOnLoad(on: boolean): void {
     this.#set({ decimateOnLoad: on });
@@ -1133,6 +1171,9 @@ export class AppState {
       creaseAngleDeg: 35,
       healerOverlays: { selfIntersections: true, inverted: true, slivers: true },
       sculptPinToActive: false,
+      cameraProjection: d.cameraProjection,
+      scaleIndicator: d.scaleIndicator,
+      showAxisBasis: d.showAxisBasis,
     });
   }
 

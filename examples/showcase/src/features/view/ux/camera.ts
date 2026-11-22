@@ -140,6 +140,15 @@ export function presetPose(
   return directionPose(dir, up, bounds, fovDeg);
 }
 
+/** A standard preset's view direction (target to camera) and up, both axis-aligned (#255). */
+export function presetFrame(preset: CameraPreset): {
+  dir: [number, number, number];
+  up: [number, number, number];
+} {
+  const { dir, up } = PRESET_AXES[preset];
+  return { dir: [...dir], up: [...up] };
+}
+
 /** Computes OrthographicCamera half-extents matching a PerspectiveCamera at `distance`. */
 export function perspectiveToOrthoHalfExtents(
   fovDeg: number,

@@ -425,12 +425,16 @@ export function installTestHook(
         svg: contoursToSvg(read.contours, read.origin, read.normal),
       };
     },
-    /** The camera and its orbit target, for scripts/showcase-touch-check.mjs. */
+    /** The camera, its orbit target and its up, for scripts/showcase-touch-check.mjs (and the cube's steps, #255). */
     cameraPose: () => {
       if (view.camera === null || view.orbit === null) {
         return null;
       }
-      return { position: view.camera.position.toArray(), target: view.orbit.target.toArray() };
+      return {
+        position: view.camera.position.toArray(),
+        target: view.orbit.target.toArray(),
+        up: view.camera.up.toArray(),
+      };
     },
     /** Where the section gizmo's handle ball is on the page, in CSS pixels; `null` without a section. */
     sectionHandle: () => {

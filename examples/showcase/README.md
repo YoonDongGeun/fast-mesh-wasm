@@ -45,6 +45,15 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   identity: the placement change and the vertex edit are one history step. The picks are engine
   raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
   `src/features/transform/ux/placement-math.ts`.
+- **View.** The box in the viewport's bottom-right corner (top right on a phone, folded to its toggle
+  there at first) holds the view controls. The cube turns with the camera; a face snaps to its view
+  (<kbd>1</kbd> front, <kbd>3</kbd> left, <kbd>7</kbd> top, with <kbd>Shift</kbd> the opposite face),
+  and the chips beside it to the corner and edge views. The arrows around the cube orbit the view
+  90° about the screen's axes (15° with <kbd>Shift</kbd>), so from a face view each press lands on
+  the next face view; the curved arrows roll it 90° about the view direction. Moves ease in over
+  240 ms (none with reduced motion) and land exactly; a press on the canvas stops one. Under the
+  cube: the scale indicator (a ruler, a screen grid of the same step, or none), the XYZ axis basis,
+  and perspective or orthographic projection, which persist with the other display settings.
 - **Repair.** For the selected mesh, `analyze` lists its holes (with their sizes), orientation
   conflicts, components (floating pieces), non-manifold edges and vertices, and degenerate triangles.
   The buttons run the library's repairs through `store.repair`, each one undo step: Weld (within a
@@ -116,7 +125,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   project never changes the default. The file stores each mesh's positions in mm, and its
   `importScale` as provenance only, so reopening cannot scale a mesh twice.
 - **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
-  repair overlays, collision mode, the last-used heatmap sliders, the default display unit) persist in localStorage across
+  repair overlays, collision mode, the last-used heatmap sliders, the default display unit, the view
+  box's projection, scale indicator and axis basis) persist in localStorage across
   reloads under versioned `fm.showcase.*` keys; Reset settings in the status bar restores the
   defaults. Meshes and projects stay file-based.
 
@@ -151,7 +161,7 @@ src/
   io/            loading (parser Worker), DICOM, export, project files, demo meshes
   features/
     home/        mesh list, project save and open, export
-    view/        ViewCube, shading modes, wireframe, camera presets
+    view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
     select/      object and face selection
     transform/   numeric transform, scale, placement helpers, ICP alignment
     inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and

@@ -711,6 +711,119 @@ input[type="range"] {
   pointer-events: none;
   z-index: 4;
 }
+/* The navigation cube box (#255): the corner and edge views beside the cube,
+   which has orbit arrows on its sides and roll arrows above, then the display
+   toggles and the fold toggle in the corner (the only part shown when folded). */
+.view-cube-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--overlay);
+  pointer-events: auto;
+}
+.view-cube-panel[data-open="false"] {
+  padding: 2px;
+}
+.view-cube-panel[data-open="false"] .view-cube-body {
+  display: none;
+}
+.view-cube-body {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.view-nav {
+  display: grid;
+  grid-template-columns: 26px 68px 26px;
+  grid-template-rows: 26px 68px 26px;
+  gap: 2px;
+}
+.view-nav .roll-ccw {
+  grid-area: 1 / 1;
+}
+.view-nav .orbit-up {
+  grid-area: 1 / 2;
+}
+.view-nav .roll-cw {
+  grid-area: 1 / 3;
+}
+.view-nav .orbit-left {
+  grid-area: 2 / 1;
+}
+.view-nav .view-cube-stage {
+  grid-area: 2 / 2;
+}
+.view-nav .orbit-right {
+  grid-area: 2 / 3;
+}
+.view-nav .orbit-down {
+  grid-area: 3 / 2;
+}
+.view-nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+}
+.view-nav-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+.view-nav-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.view-toggles {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 3px;
+}
+.view-toggles .view-toggle-group {
+  flex: 1;
+  justify-content: flex-start;
+  gap: 3px;
+}
+.view-toggles button {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.3;
+}
+.view-toggles .view-cube-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  padding: 2px 4px;
+}
+.view-cube-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+/* The screen grid scale indicator: lines every scale step at the orbit target, through the centre. */
+.scale-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+  --grid-line: rgba(160, 178, 204, 0.16);
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+}
+:root[data-theme="light"] .scale-grid {
+  --grid-line: rgba(40, 60, 90, 0.16);
+}
 .view-cube-stage {
   width: 68px;
   height: 68px;
@@ -766,11 +879,8 @@ input[type="range"] {
 }
 .view-cube-corners {
   display: grid;
-  grid-template-columns: repeat(4, auto);
+  grid-template-columns: repeat(2, auto);
   gap: 3px;
-  padding: 3px;
-  border-radius: var(--radius);
-  background: var(--overlay);
   pointer-events: auto;
 }
 .view-cube-chip {
@@ -856,6 +966,26 @@ input[type="range"] {
   border-left: 2px solid var(--text);
   border-right: 2px solid var(--text);
   border-bottom: 2px solid var(--text);
+}
+/* A phone held upright: the bottom edge holds the volume controls, so the cube
+   box sits top right with its toggles first (the fold toggle stays in the
+   corner), the triad and scale top left, out of the open box's way. */
+@media (max-width: 600px) {
+  .view-cube {
+    top: 10px;
+    bottom: auto;
+  }
+  .view-cube-panel {
+    flex-direction: column-reverse;
+  }
+  .xyz-scale-hud {
+    top: 10px;
+    bottom: auto;
+    align-items: flex-start;
+  }
+  .viewport:has(.view-cube-panel[data-open="true"]) .xyz-scale-hud {
+    display: none;
+  }
 }
 .toolbox {
   position: static;
@@ -1463,16 +1593,25 @@ input[type="range"] {
   .toolbox {
     display: none;
   }
-  /* Coarse touch viewports use direct orbit/pinch + Reset view, keeping
-     .viewport corners clear for .volume-overlay and bottom-edge touch gestures. */
+  /* Coarse touch viewports orbit and pinch on the canvas: the shading picker
+     stays off, and the cube box (folded to its toggle on a phone at first)
+     takes fingers with 44 px arrows, views and toggles. */
   .camera-bar {
     display: none;
   }
-  .view-cube,
-  .xyz-scale-hud,
-  .scale-bar,
-  .xyz-triad {
-    display: none;
+  .view-nav {
+    grid-template-columns: 44px 68px 44px;
+    grid-template-rows: 44px 68px 44px;
+  }
+  .view-nav-btn svg,
+  .view-cube-toggle svg {
+    width: 18px;
+    height: 18px;
+  }
+  .view-toggles button,
+  .view-toggles .view-cube-toggle {
+    min-width: 44px;
+    min-height: 44px;
   }
   .hover-tip {
     max-width: 228px;

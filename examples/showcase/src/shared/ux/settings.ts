@@ -1,7 +1,8 @@
 // Showcase display settings, persisted in localStorage (issue #144): the
 // theme, the sidebars (shown, widths), the display prefs (wireframe,
 // boundary softness, repair overlays, collision mode, decimate-on-load,
-// sculpt remesh) and the last-used heatmap sliders (the collision colour
+// sculpt remesh, the navigation cube's projection, scale indicator and axis
+// basis) and the last-used heatmap sliders (the collision colour
 // scale). Meshes and projects stay file-based (see load/project.ts), and
 // volume views keep their suggested-or-Bone preset: this is prefs only,
 // so a fresh profile gets the defaults and the scripted session
@@ -11,7 +12,7 @@
 // inside load/save/reset, each guarded the way tour.ts guards its flag,
 // so private mode just means "no persistence".
 import type { DyntopoMode, GrabMethod, InflateMethod, SmoothMethod, TwistMethod } from "fast-mesh-wasm";
-import type { CollisionMode, HeatmapParams, RepairOverlayKind } from "../../app/state/app-state";
+import type { CameraProjection, CollisionMode, HeatmapParams, RepairOverlayKind } from "../../app/state/app-state";
 import type { LengthUnit } from "./units";
 
 export const DYNTOPO_MODES: readonly DyntopoMode[] = [
@@ -51,6 +52,11 @@ export const SETTINGS_VERSION = 1;
 
 /** The app theme: the dark default, or the light one. */
 export type ShowcaseTheme = "dark" | "light";
+
+/** The viewport's scale indicator (#255): a ruler, a screen grid, or none. */
+export type ScaleIndicator = "ruler" | "grid" | "off";
+
+export const SCALE_INDICATORS: readonly ScaleIndicator[] = ["ruler", "grid", "off"];
 
 /** The default sidebar width, in pixels (see styles.css `.app`). */
 export const DEFAULT_SIDEBAR_WIDTH = 290;
@@ -103,6 +109,10 @@ export interface ShowcaseSettings {
   sculptSymmetry: SculptSymmetrySettings;
   /** The display unit new sessions and older project files start on; a project file's own wins. */
   defaultUnits: LengthUnit;
+  /** The navigation cube's toggles (#255): the camera projection, the scale indicator, the axis basis. */
+  cameraProjection: CameraProjection;
+  scaleIndicator: ScaleIndicator;
+  showAxisBasis: boolean;
 }
 
 /** A fresh defaults document (a new object every call: callers may keep it). */
@@ -142,6 +152,9 @@ export function defaultSettings(): ShowcaseSettings {
     },
     sculptSymmetry: { x: false, y: false, z: false },
     defaultUnits: "mm",
+    cameraProjection: "perspective",
+    scaleIndicator: "ruler",
+    showAxisBasis: true,
   };
 }
 
@@ -283,6 +296,9 @@ export function parseSettings(doc: unknown): ShowcaseSettings {
       z: asBoolean(symmetry.z, fallback.sculptSymmetry.z),
     },
     defaultUnits: asLiteral(doc.defaultUnits, ["mm", "in"], fallback.defaultUnits),
+    cameraProjection: asLiteral(doc.cameraProjection, ["perspective", "orthographic"], fallback.cameraProjection),
+    scaleIndicator: asLiteral(doc.scaleIndicator, SCALE_INDICATORS, fallback.scaleIndicator),
+    showAxisBasis: asBoolean(doc.showAxisBasis, fallback.showAxisBasis),
   };
 }
 
@@ -340,6 +356,9 @@ export interface PersistedSnapshot {
   sculptFilter: SculptFilterSettings;
   sculptSymmetry: SculptSymmetrySettings;
   defaultUnits: LengthUnit;
+  cameraProjection: CameraProjection;
+  scaleIndicator: ScaleIndicator;
+  showAxisBasis: boolean;
 }
 
 /** Collects the snapshot's persisted slice into a storable document. */
@@ -369,5 +388,8 @@ export function settingsFromSnapshot(snap: PersistedSnapshot): ShowcaseSettings 
     sculptFilter: { ...snap.sculptFilter },
     sculptSymmetry: { ...snap.sculptSymmetry },
     defaultUnits: snap.defaultUnits,
+    cameraProjection: snap.cameraProjection,
+    scaleIndicator: snap.scaleIndicator,
+    showAxisBasis: snap.showAxisBasis,
   };
 }
