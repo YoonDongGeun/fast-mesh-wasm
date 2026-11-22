@@ -13,6 +13,7 @@ export const SHORTCUTS: Array<[string, string]> = [
   ["Ctrl+Z · Ctrl+Shift+Z (Ctrl+Y)", "Undo / redo"],
   ["F", "Frame the selection"],
   ["W", "Wireframe every mesh"],
+  ["Ctrl+K · /", "Search commands"],
   ["Esc", "Disarm, cancel the pick, deselect"],
   ["?", "This help"],
 ];
