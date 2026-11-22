@@ -393,6 +393,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Isotropic Remesh
               </button>
+              <button type="button" data-ribbon-focus="hull" onClick={() => focusElement("[data-modeling-hull-run]")}>
+                Convex Hull
+              </button>
               <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
                 Hollow
               </button>

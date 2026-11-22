@@ -4,6 +4,8 @@
 // working seamlessly with both synchronous `Scene` and `WorkerScene`.
 import type {
   BooleanOp,
+  ConvexHullPoints,
+  ConvexHullResult,
   CutReport,
   EditOp,
   FieldHandle,
@@ -751,6 +753,38 @@ export async function runIcpAlign(params: {
     translation: [result.placement.translation[0], result.placement.translation[1], result.placement.translation[2]],
   });
   return { ...result, applied: true, notApplied: null };
+}
+
+/** What a convex hull action added: its list item and the hull's counts. */
+export interface ConvexHullRunResult {
+  item: Item;
+  inputPoints: number;
+  vertices: number;
+  triangles: number;
+}
+
+/**
+ * Adds the convex hull of `sources` (their world shapes) or of world `points`
+ * as a new mesh named `name`, lists it and selects it. The sources stay as
+ * they are. The engine fills the new mesh as one undo step (undo empties it),
+ * on the Worker when the scene runs there.
+ */
+export async function runConvexHull(params: {
+  store: SceneStore;
+  app: AppState;
+  name: string;
+  sources?: readonly Item[];
+  points?: ConvexHullPoints;
+}): Promise<ConvexHullRunResult> {
+  const { store, app, name, sources, points } = params;
+  const scene = store.scene;
+  const hull = (s: Scene | WorkerScene): ConvexHullResult | Promise<ConvexHullResult> =>
+    points !== undefined ? s.convexHullOfPoints(points) : s.convexHull((sources ?? []).map((i) => i.mesh));
+  const r = await hull(isWorkerScene(scene) ? scene : asSyncScene(scene));
+  const item = app.adoptSceneMesh(store, r.mesh, name);
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
+  store.commitFrame();
+  return { item, inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
 }
 
 /**

@@ -1,5 +1,5 @@
-// Point cloud import, sampling, filtering, normal estimation & surface
-// reconstruction panel (#234).
+// Point cloud import, sampling, filtering, normal estimation, surface
+// reconstruction (#234) and convex hull panel.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useSyncExternalStore } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
@@ -55,6 +55,7 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
     busy,
     error,
     canReconstruct,
+    canHull,
   } = ops;
 
   return (
@@ -343,6 +344,21 @@ export function PointsPanel({ app, store }: PointsPanelProps) {
             {busy ? "Working..." : "Reconstruct"}
           </button>
         </div>
+      </div>
+
+      <div className="op" data-points-hull-section>
+        <div className="op-head">
+          <strong>Convex Hull</strong>
+        </div>
+        <p className="muted small">The smallest convex mesh around every point, added as a new mesh.</p>
+        <button
+          type="button"
+          data-action="points-convex-hull"
+          disabled={busy || cloud === null || cloud.count < 4 || !canHull}
+          onClick={() => void ops.onConvexHull()}
+        >
+          {busy ? "Working..." : "Convex Hull"}
+        </button>
       </div>
 
       {error !== null ? (

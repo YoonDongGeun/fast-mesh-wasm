@@ -342,6 +342,7 @@ export function useModelingOps(args: {
     liveTris,
     busy,
     report,
+    runAction,
     runBoolean,
     runCut,
     runOffset: runOffsetOp,
