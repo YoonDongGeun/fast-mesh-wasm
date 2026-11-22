@@ -6,78 +6,15 @@
  *   so E2E controls and sliders stay live and queryable).
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
-import { useScene } from "fast-mesh-wasm/react";
-import {
-  type AppState,
-  type InspectTool,
-  useApp,
-  type WorkbenchTab,
-} from "../../app/state/app-state";
-import { applyDyntopoRoi, DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
+import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { SculptToolbox } from "../../features/sculpt/ui/Toolbox";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
-import { formatLength } from "../../shared/ux/units";
-
-export interface WorkbenchTabMeta {
-  id: WorkbenchTab;
-  label: string;
-  shortLabel: string;
-  title: string;
-}
-
-export const WORKBENCH_TABS: readonly WorkbenchTabMeta[] = [
-  { id: "home", label: "Home", shortLabel: "Home", title: "Scene overview, loading, export & layout" },
-  { id: "select", label: "Select", shortLabel: "Select", title: "Object selection & Move/Rotate/Scale gizmos" },
-  { id: "repair", label: "Mesh Repair", shortLabel: "Repair", title: "Mesh Healer, defect overlays & repair" },
-  { id: "edit", label: "Mesh Edit", shortLabel: "Edit", title: "Booleans, plane cut, offset, shell, simplify & subdivide" },
-  { id: "sculpt", label: "Sculpt & Deform", shortLabel: "Sculpt", title: "3D sculpt brushes, mask painting, symmetry & live split" },
-  { id: "align", label: "Points & Align", shortLabel: "Align", title: "Landmark ICP alignment & clearance/collision analysis" },
-  { id: "volume", label: "Voxel / CT", shortLabel: "Volume", title: "CT/DICOM volume rendering, MPR slices & presets" },
-  { id: "inspect", label: "Inspect", shortLabel: "Inspect", title: "Ruler, thickness/point query, cross-section & clip box" },
-];
-
-export type InspectorSlot =
-  | "home"
-  | "project"
-  | "transform"
-  | "select"
-  | "sculpt"
-  | "deform"
-  | "repair"
-  | "modeling"
-  | "points"
-  | "align"
-  | "collision"
-  | "volume"
-  | "inspect"
-  | "export";
-
-/** Returns which right-inspector sections are shown for `tab`. */
-export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean {
-  switch (tab) {
-    case "home":
-      return slot === "home" || slot === "project" || slot === "export";
-    case "select":
-      return slot === "transform" || slot === "select";
-    case "repair":
-      return slot === "repair";
-    case "edit":
-      return slot === "modeling";
-    case "sculpt":
-      return slot === "sculpt" || slot === "deform";
-    case "align":
-      return slot === "points" || slot === "align" || slot === "collision";
-    case "volume":
-      return slot === "volume";
-    case "inspect":
-      return slot === "inspect";
-  }
-}
-
-export function workbenchTabLabel(tab: WorkbenchTab): string {
-  return WORKBENCH_TABS.find((t) => t.id === tab)?.label ?? "Home";
-}
+import { focusElement, openFilePicker, triggerClick } from "../ux/panel-triggers";
+import { DEFORM_ALGORITHMS, FACE_SELECT_TOOLS, INSPECT_TOOLS, useRibbon } from "../ux/use-ribbon";
+import { SCULPT_SHADING_MODES, useSculptInspector } from "../ux/use-sculpt-inspector";
+import { WORKBENCH_TABS, workbenchTabLabel } from "../ux/workbench-tabs";
 
 export interface WorkbenchRibbonProps {
   app: AppState;
@@ -95,18 +32,6 @@ export interface WorkbenchRibbonProps {
   onUndo: () => void;
   onRedo: () => void;
   onOpenHelp: () => void;
-}
-
-function triggerClick(selector: string): void {
-  const el = document.querySelector<HTMLElement>(selector);
-  el?.click();
-}
-
-function focusElement(selector: string): void {
-  const el = document.querySelector<HTMLElement>(selector);
-  if (!el) return;
-  el.scrollIntoView({ block: "nearest" });
-  el.focus();
 }
 
 export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
@@ -128,37 +53,25 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
     onOpenHelp,
   } = props;
 
-  const activeTab = useApp(app, (s) => s.activeTab);
-  const units = useApp(app, (s) => s.units);
-  const shadingMode = useApp(app, (s) => s.shadingMode);
-  const ortho = useApp(app, (s) => s.cameraProjection === "orthographic");
-  const inspectTool = useApp(app, (s) => s.inspectTool);
-  const collisionMode = useApp(app, (s) => s.collisionMode);
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const maskPaint = useApp(app, (s) => s.maskPaint);
-  const healerOverlays = useApp(app, (s) => s.healerOverlays);
-  const faceSelectTool = useApp(app, (s) => s.wave6.select.activeTool);
-  const deformAlgo = useApp(app, (s) => s.wave6.deform.algorithm);
-  const deformTool = useApp(app, (s) => s.wave6.deform.activeTool);
-
-  const pickMode = (next: GizmoMode) => {
-    if (sculpt !== null) app.setSculpt(null);
-    if (maskPaint) app.setMaskPaint(false);
-    app.disarmWave6Tools();
-    onSetMode(next);
-    app.setActiveTab("select");
-  };
-
-  const toggleFaceSelectTool = (tool: "box" | "lasso" | "brush" | "shell") => {
-    if (sculpt !== null) app.setSculpt(null);
-    if (maskPaint) app.setMaskPaint(false);
-    app.updateWave6((prev) => ({
-      ...prev,
-      select: { ...prev.select, activeTool: prev.select.activeTool === tool ? null : tool },
-      deform: { ...prev.deform, activeTool: null },
-      printPrep: { ...prev.printPrep, activeTool: null },
-    }));
-  };
+  const {
+    activeTab,
+    units,
+    shadingMode,
+    ortho,
+    inspectTool,
+    collisionMode,
+    healerOverlays,
+    faceSelectTool,
+    deformAlgo,
+    deformTool,
+    pickMode,
+    toggleFaceSelectTool,
+    chooseDeformAlgorithm,
+    toggleShading,
+    toggleInspectTool,
+    toggleHealerOverlay,
+    toggleUnits,
+  } = useRibbon(app, onSetMode);
 
   return (
     <header className="workbench-ribbon" aria-label="Workspace ribbon">
@@ -168,7 +81,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
           <button
             type="button"
             data-action="ribbon-open"
-            onClick={() => document.getElementById("file-input")?.click()}
+            onClick={openFilePicker}
             title="Open mesh or DICOM file"
           >
             Open
@@ -222,7 +135,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
           <button
             type="button"
             data-action="ribbon-units"
-            onClick={() => app.setUnits(units === "mm" ? "in" : "mm")}
+            onClick={toggleUnits}
             title="Switch display length unit (mm / in)"
           >
             {units}
@@ -269,26 +182,13 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
         {activeTab === "sculpt" ? (
           <div className="ribbon-strip ribbon-strip-compact" data-ribbon-deform-strip>
             <div className="group" aria-label="Free-form deformation">
-              {(
-                [
-                  ["ffd", "FFD"],
-                  ["arap", "ARAP"],
-                  ["kelvinlet", "Kelvinlet"],
-                  ["xpbd", "XPBD"],
-                ] as const
-              ).map(([alg, label]) => (
+              {DEFORM_ALGORITHMS.map(([alg, label]) => (
                 <button
                   key={alg}
                   type="button"
                   data-ribbon-deform-algo={alg}
                   aria-pressed={deformAlgo === alg}
-                  onClick={() => {
-                    app.updateWave6((prev) => ({
-                      ...prev,
-                      deform: { ...prev.deform, algorithm: alg },
-                    }));
-                    focusElement('[data-inspector-slot="deform"]');
-                  }}
+                  onClick={() => chooseDeformAlgorithm(alg)}
                 >
                   {label}
                 </button>
@@ -309,7 +209,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
         {activeTab === "home" ? (
           <div className="ribbon-strip">
             <div className="group">
-              <button type="button" onClick={() => document.getElementById("file-input")?.click()}>
+              <button type="button" onClick={openFilePicker}>
                 Load File
               </button>
               <button type="button" onClick={() => triggerClick('[data-action="demo-meshes"]')}>
@@ -369,14 +269,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
             </div>
             <div className="group" aria-label="Face selection">
-              {(
-                [
-                  ["box", "Box Select"],
-                  ["lasso", "Lasso"],
-                  ["brush", "Brush"],
-                  ["shell", "Shell"],
-                ] as const
-              ).map(([toolId, label]) => (
+              {FACE_SELECT_TOOLS.map(([toolId, label]) => (
                 <button
                   key={toolId}
                   type="button"
@@ -432,21 +325,21 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button
                 type="button"
                 aria-pressed={healerOverlays.selfIntersections}
-                onClick={() => app.setHealerOverlay("selfIntersections", !healerOverlays.selfIntersections)}
+                onClick={() => toggleHealerOverlay("selfIntersections")}
               >
                 Self-Intersect Overlay
               </button>
               <button
                 type="button"
                 aria-pressed={healerOverlays.slivers}
-                onClick={() => app.setHealerOverlay("slivers", !healerOverlays.slivers)}
+                onClick={() => toggleHealerOverlay("slivers")}
               >
                 Sliver Overlay
               </button>
               <button
                 type="button"
                 aria-pressed={healerOverlays.inverted}
-                onClick={() => app.setHealerOverlay("inverted", !healerOverlays.inverted)}
+                onClick={() => toggleHealerOverlay("inverted")}
               >
                 Inverted Overlay
               </button>
@@ -484,9 +377,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button
                 type="button"
                 aria-pressed={shadingMode === "wireframeShaded"}
-                onClick={() =>
-                  app.setShadingMode(shadingMode === "wireframeShaded" ? "smooth" : "wireframeShaded")
-                }
+                onClick={() => toggleShading("wireframeShaded")}
               >
                 Wire-on-Shaded
               </button>
@@ -554,19 +445,12 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
         {activeTab === "inspect" ? (
           <div className="ribbon-strip">
             <div className="group">
-              {(
-                [
-                  ["ruler", "Ruler"],
-                  ["query", "Vertex / Thickness Query"],
-                  ["section", "Cross-Section"],
-                  ["clip", "Clip Box"],
-                ] as readonly [InspectTool, string][]
-              ).map(([toolId, label]) => (
+              {INSPECT_TOOLS.map(([toolId, label]) => (
                 <button
                   key={toolId}
                   type="button"
                   aria-pressed={inspectTool === toolId}
-                  onClick={() => app.setInspectTool(inspectTool === toolId ? null : toolId)}
+                  onClick={() => toggleInspectTool(toolId)}
                 >
                   {label}
                 </button>
@@ -580,9 +464,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button
                 type="button"
                 aria-pressed={shadingMode === "backfaceWarning"}
-                onClick={() =>
-                  app.setShadingMode(shadingMode === "backfaceWarning" ? "smooth" : "backfaceWarning")
-                }
+                onClick={() => toggleShading("backfaceWarning")}
               >
                 Backface Check
               </button>
@@ -653,24 +535,23 @@ export function HomeOverviewCard(props: { app: AppState; itemCount: number; onRe
 
 export function SculptInspectorCard(props: { app: AppState; selection: MeshHandle | null }) {
   const { app, selection } = props;
-  const store = useScene();
-  const sculpt = useApp(app, (s) => s.sculpt);
-  const maskPaint = useApp(app, (s) => s.maskPaint);
-  const mask = useApp(app, (s) => s.sculptMask);
-  const brushPick = useApp(app, (s) => s.brushPick);
-  const pinToActive = useApp(app, (s) => s.sculptPinToActive);
-  const liveRemesh = useApp(app, (s) => s.sculptLiveRemesh);
-  const remesh = useApp(app, (s) => s.sculptRemesh);
-  const dyntopo = useApp(app, (s) => s.sculptDyntopo);
-  const dyntopoMode = useApp(app, (s) => s.sculptDyntopoMode);
-  const dyntopoDetail = useApp(app, (s) => s.sculptDyntopoDetail);
-  const symmetry = useApp(app, (s) => s.sculptSymmetry);
-  const shadingMode = useApp(app, (s) => s.shadingMode);
-  const units = useApp(app, (s) => s.units);
-  const items = useApp(app, (s) => s.items);
-  const targetMesh = sculpt?.mesh ?? mask?.mesh ?? selection;
-  const targetItem = targetMesh === null ? null : (items.find((i) => i.mesh === targetMesh) ?? null);
-  const targetRadius = targetItem?.radius ?? 1;
+  const {
+    sculpt,
+    maskPaint,
+    pinToActive,
+    liveRemesh,
+    remesh,
+    dyntopo,
+    dyntopoMode,
+    dyntopoDetail,
+    detailLabel,
+    symmetry,
+    shadingMode,
+    targetItem,
+    applyDyntopo,
+    disarm,
+    exitToSelect,
+  } = useSculptInspector(app, selection);
 
   return (
     <section className="panel sculpt-inspector-panel" aria-label="Sculpt Parameters" data-panel="sculpt-inspector">
@@ -739,11 +620,7 @@ export function SculptInspectorCard(props: { app: AppState; selection: MeshHandl
         </label>
         <label className="slider">
           Detail{" "}
-          <output>
-            {dyntopoMode === "brush-relative"
-              ? `${Math.round(dyntopoDetail * 100)}%`
-              : formatLength(dyntopoDetail * targetRadius, units)}
-          </output>
+          <output>{detailLabel}</output>
           <input
             type="range"
             data-action="sculpt-inspector-dyntopo-detail"
@@ -758,21 +635,7 @@ export function SculptInspectorCard(props: { app: AppState; selection: MeshHandl
           type="button"
           data-action="sculpt-inspector-dyntopo-apply"
           disabled={targetItem === null}
-          onClick={() => {
-            if (targetItem === null) {
-              return;
-            }
-            void applyDyntopoRoi({
-              scene: store.scene,
-              store,
-              target: targetItem,
-              brushPick,
-              mask,
-              mode: dyntopoMode,
-              detail: dyntopoDetail,
-              brushRadius: sculpt?.radius ?? targetItem.radius * 0.25,
-            });
-          }}
+          onClick={applyDyntopo}
         >
           Subdivide / Clean Dyntopo ROI
         </button>
@@ -795,7 +658,7 @@ export function SculptInspectorCard(props: { app: AppState; selection: MeshHandl
       <div className="op">
         <h3>Surface Shading</h3>
         <div className="modes">
-          {(["smooth", "matcap", "wireframeShaded", "backfaceWarning"] as const).map((mode) => {
+          {SCULPT_SHADING_MODES.map((mode) => {
             const opt = DIAGNOSTIC_SHADING_OPTIONS.find((o) => o.mode === mode)!;
             return (
               <button
@@ -811,23 +674,10 @@ export function SculptInspectorCard(props: { app: AppState; selection: MeshHandl
         </div>
       </div>
       <div className="op-row">
-        <button
-          type="button"
-          onClick={() => {
-            app.setSculpt(null);
-            app.setMaskPaint(false);
-          }}
-        >
+        <button type="button" onClick={disarm}>
           Disarm Tool
         </button>
-        <button
-          type="button"
-          onClick={() => {
-            app.setSculpt(null);
-            app.setMaskPaint(false);
-            app.setActiveTab("select");
-          }}
-        >
+        <button type="button" onClick={exitToSelect}>
           Exit to Select
         </button>
       </div>

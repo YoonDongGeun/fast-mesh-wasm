@@ -1,21 +1,12 @@
 // The app shell: the mesh list on the left, the viewport in the centre, the
 // Repair and Collision panels on the right and the
 // status bar along the bottom. Files dropped anywhere on the page load.
+// What it does (loading, shortcuts, the drop target, the sidebars, the
+// tab auto-switching) lives in `ux/`; this file lays the shell out.
 import type { MeshHandle, Scene } from "fast-mesh-wasm";
-import { useHistory, useScene, useSelection } from "fast-mesh-wasm/react";
+import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import {
-  Suspense,
-  lazy,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type CSSProperties,
-  type RefObject,
-} from "react";
-import { parseBigFileParams } from "../io/big-file";
+import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
@@ -35,20 +26,26 @@ import {
   HomeOverviewCard,
   InspectorHeader,
   SculptInspectorCard,
-  tabMatchesSlot,
   VolumeFallbackCard,
   WorkbenchRibbon,
 } from "../shell/ui/Ribbon";
 import { SelectPanel } from "../features/select/ui/SelectPanel";
 import { TransformPanel } from "../features/transform/ui/TransformPanel";
-import { DEFAULT_SIDEBAR_WIDTH } from "../shared/ux/settings";
 import { StatusBar } from "../shell/ui/StatusBar";
-import { markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "../shell/ux/tour";
+import { useHelpAndTour } from "../shell/ux/use-help-tour";
+import { tabMatchesSlot } from "../shell/ux/workbench-tabs";
 import { type AppState, useApp, type WorkbenchTab } from "./state/app-state";
+import { useCameraRequests } from "./ux/use-camera-requests";
+import { sidebarResizeHandlers, useDisplaySettings } from "./ux/use-display-settings";
+import { useFileDrop } from "./ux/use-file-drop";
+import { useKeyboardShortcuts } from "./ux/use-keyboard-shortcuts";
+import { useSceneLoading } from "./ux/use-scene-loading";
+import { useUndoRedo } from "./ux/use-undo-redo";
+import { useWorkspaceAutoSwitch } from "./ux/use-workspace-auto-switch";
+import { coarsePointer, viewportHint } from "./ux/viewport-hint";
 import { FaceSelectionMarquee } from "../features/select/ui/FaceSelectionLayer";
 import { ViewportNavigationHud } from "../features/view/ui/ViewCube";
 import { selectMesh } from "../features/select/ux/selection";
-import { afterStroke } from "../viewport/ux/view";
 import { VolumeOverlay } from "../features/ct/ui/VolumeOverlay";
 import { type GizmoMode, Viewport } from "../viewport/ui/Viewport";
 
@@ -76,9 +73,6 @@ export interface FocusRequest {
   box?: { center: readonly [number, number, number]; radius: number };
 }
 
-/** A finger is the main pointer here: the hints speak of tapping and pinching. */
-const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
-
 export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const { engine, app, loader } = props;
   const store = useScene();
@@ -88,62 +82,17 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const grouped = useApp(app, (s) => s.collisionMode === "group");
   const members = useApp(app, (s) => s.group.members);
   const [selection, select] = useSelection();
-  const { canUndo, canRedo, undo: undoNow, redo: redoNow } = useHistory();
-  const undo = useCallback(() => afterStroke(undoNow), [undoNow]);
-  const redo = useCallback(() => afterStroke(redoNow), [redoNow]);
+  const { canUndo, canRedo, undo, redo } = useUndoRedo();
   const [mode, setMode] = useState<GizmoMode>("translate");
-  const [focus, setFocus] = useState<FocusRequest | null>(null);
-  const [resetView, setResetView] = useState(0);
-  const [dropping, setDropping] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
-  const [tourStep, setTourStep] = useState<number | null>(null);
+  const { focus, focusOn, resetView, requestResetView } = useCameraRequests();
   const activeTab = useApp(app, (s) => s.activeTab);
   const ortho = useApp(app, (s) => s.cameraProjection === "orthographic");
   const units = useApp(app, (s) => s.units);
-  const inspectTool = useApp(app, (s) => s.inspectTool);
-  const collisionMode = useApp(app, (s) => s.collisionMode);
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const selectedIsVolume = selectedItem !== null && selectedItem.volumeId !== null;
   const hasVolume = items.some((i) => i.volumeId !== null);
-  // The persisted display settings: the theme (as `data-theme` on the
-  // root, for the light overrides) and the sidebars (shown, widths).
-  const theme = useApp(app, (s) => s.theme);
-  const leftVisible = useApp(app, (s) => s.leftVisible);
-  const rightVisible = useApp(app, (s) => s.rightVisible);
-  const leftWidth = useApp(app, (s) => s.leftWidth);
-  const rightWidth = useApp(app, (s) => s.rightWidth);
-  const shellRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-  }, [theme]);
+  const { shellRef, shellStyle, leftVisible, rightVisible } = useDisplaySettings(app);
 
-  // Ending the tour records it, so first-run only runs once.
-  const endTour = useCallback(() => {
-    markTourSeen();
-    setTourStep(null);
-  }, []);
-  const nextTour = useCallback(() => {
-    if (tourStep === null) {
-      return;
-    }
-    const next = tourNext(tourStep);
-    if (next === null) {
-      markTourSeen();
-    }
-    setTourStep(next);
-  }, [tourStep]);
-  const backTour = useCallback(() => {
-    setTourStep((s) => (s === null ? s : tourBack(s)));
-  }, []);
-
-  const focusOn = useCallback(
-    (
-      mesh: MeshHandle,
-      dir?: readonly [number, number, number],
-      box?: { center: readonly [number, number, number]; radius: number },
-    ) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1, dir, box })),
-    [],
-  );
   const brushPick = useApp(app, (s) => s.brushPick);
   const picking = brushPick !== null && brushPick.point === null ? brushPick.mesh : null;
   const sculpt = useApp(app, (s) => s.sculpt);
@@ -159,249 +108,31 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     [app],
   );
 
-  // `?big` loads the ~1M-triangle demo variants (see load/big-file.ts).
-  const demoBig = useMemo(() => {
-    try {
-      return parseBigFileParams(location.search).demoBig;
-    } catch {
-      return false;
-    }
-  }, []);
-  const cancelLoad = useCallback((id: number) => loader.cancelJob(id), [loader]);
+  const { load, cancelLoad, loadPhantom, loadSample, loadDemo } = useSceneLoading({
+    app,
+    scene: engine.scene,
+    loader,
+    select,
+    focusOn,
+  });
+  const { helpOpen, setHelpOpen, openHelp, closeHelp, tourStep, nextTour, backTour, endTour, startTourFromHelp } =
+    useHelpAndTour();
+  useWorkspaceAutoSwitch(app, { selection, selectedIsVolume, sculpt, maskPaint });
+  useKeyboardShortcuts({
+    app,
+    select,
+    selection,
+    undo,
+    redo,
+    focusOn,
+    setMode,
+    helpOpen,
+    setHelpOpen,
+    tourStep,
+    endTour,
+  });
+  const dropping = useFileDrop(load);
 
-  const load = useCallback(
-    (files: Iterable<File>) => {
-      void loader.loadFiles(files).then((added) => {
-        // Point the camera at what was just loaded: a file can be anywhere, at any scale.
-        const last = added.at(-1);
-        if (last !== undefined) {
-          focusOn(last.mesh);
-        }
-      });
-    },
-    [loader, focusOn],
-  );
-
-  // ---- Boot: the CT head, selected and framed ----
-  // Once per page (StrictMode runs effects twice in development): the
-  // medical landing view (the sample suggests its Vessels preset).
-  // Everything else loads from its button.
-  const booted = useRef(false);
-  useEffect(() => {
-    if (booted.current) {
-      return;
-    }
-    booted.current = true;
-    void loader.loadSample("headsq").then((added) => {
-      const last = added.at(-1);
-      if (last === undefined || last.volumeId === null) {
-        return;
-      }
-      selectMesh(app, select, null, last.mesh, false);
-      // A three-quarter view of the volume box (the quads span it, past the
-      // mesh): the cutaway and its slice quads read best at an angle.
-      loader
-        .fetchVolume(last.volumeId)
-        .then((payload) => {
-          const ex = payload.columns * payload.spacing[0];
-          const ey = payload.rows * payload.spacing[1];
-          const ez = payload.slices * payload.spacing[2];
-          const m = engine.scene.matrix4(last.mesh);
-          const lx = payload.origin[0] + ex / 2 - last.center[0];
-          const ly = payload.origin[1] + ey / 2 - last.center[1];
-          const lz = payload.origin[2] + ez / 2 - last.center[2];
-          focusOn(
-            last.mesh,
-            [1, 0.55, 1.15],
-            {
-              center: [
-                m[0] * lx + m[4] * ly + m[8] * lz + m[12],
-                m[1] * lx + m[5] * ly + m[9] * lz + m[13],
-                m[2] * lx + m[6] * ly + m[10] * lz + m[14],
-              ],
-              radius: Math.hypot(ex, ey, ez) / 2,
-            },
-          );
-        })
-        .catch(() => {
-          focusOn(last.mesh);
-        });
-    });
-  }, [app, engine, loader, focusOn, select]);
-
-  // ---- First run: the tour, unless seen, forced off, or headless ----
-  // `?tour=1` forces it on (even headless); `?tour=0` / `?notour` and
-  // headless Chrome (`showcase-check.mjs`) keep it off, so the scripted
-  // session never sees a card over the canvas.
-  const onboarded = useRef(false);
-  useEffect(() => {
-    if (onboarded.current) {
-      return;
-    }
-    onboarded.current = true;
-    const start = resolveTourStart(location.search, navigator.userAgent, navigator.webdriver, tourSeen());
-    if (start !== "off") {
-      setTourStep(0);
-    }
-  }, []);
-
-  const prevSelectedVolumeRef = useRef<boolean>(false);
-  const prevSculptActiveRef = useRef<boolean>(false);
-  const prevInspectToolRef = useRef(inspectTool);
-  const prevCollisionModeRef = useRef(collisionMode);
-
-  // Contextual workspace auto-switching (#228) on meaningful trigger transitions.
-  useEffect(() => {
-    const wasVol = prevSelectedVolumeRef.current;
-    prevSelectedVolumeRef.current = selectedIsVolume;
-    if (!wasVol && selectedIsVolume) {
-      app.setActiveTab("volume");
-    } else if (wasVol && !selectedIsVolume && app.getSnapshot().activeTab === "volume") {
-      app.setActiveTab(selection === null ? "home" : "select");
-    }
-  }, [app, selectedIsVolume, selection]);
-
-  useEffect(() => {
-    const nowActive = sculpt !== null || maskPaint;
-    const wasActive = prevSculptActiveRef.current;
-    prevSculptActiveRef.current = nowActive;
-    if (!wasActive && nowActive) {
-      app.setActiveTab("sculpt");
-    }
-  }, [app, sculpt, maskPaint]);
-
-  useEffect(() => {
-    const was = prevInspectToolRef.current;
-    prevInspectToolRef.current = inspectTool;
-    if (was === null && inspectTool !== null) {
-      app.setActiveTab("inspect");
-    }
-  }, [app, inspectTool]);
-
-  useEffect(() => {
-    const was = prevCollisionModeRef.current;
-    prevCollisionModeRef.current = collisionMode;
-    if (was !== collisionMode) {
-      app.setActiveTab("align");
-    }
-  }, [app, collisionMode]);
-
-  // ---- Keyboard: undo/redo, command palette, gizmo mode, focus, deselect, help ----
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      if ((e.ctrlKey || e.metaKey) && key === "k") {
-        e.preventDefault();
-        app.setCommandPaletteOpen(!app.getSnapshot().commandPaletteOpen);
-        return;
-      }
-      // Typing in a field (the opacity slider, say) is not a shortcut.
-      const target = e.target as HTMLElement | null;
-      if (target !== null && (target.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName))) {
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && key === "z") {
-        e.preventDefault();
-        if (e.shiftKey) {
-          redo();
-        } else {
-          undo();
-        }
-      } else if ((e.ctrlKey || e.metaKey) && key === "y") {
-        e.preventDefault();
-        redo();
-      } else if (e.ctrlKey || e.metaKey || e.altKey) {
-        // Other modified keys are the browser's.
-      } else if (key === "/") {
-        e.preventDefault();
-        app.setCommandPaletteOpen(true);
-      } else if (key === "?") {
-        setHelpOpen((v) => !v);
-      } else if (key === "escape") {
-        const snap = app.getSnapshot();
-        if (snap.commandPaletteOpen) {
-          app.setCommandPaletteOpen(false);
-        } else if (helpOpen) {
-          setHelpOpen(false);
-        } else if (tourStep !== null) {
-          endTour();
-        } else {
-          // Sculpt first (it owns the pointer), then mask paint, then active Wave 6 tool,
-          // then brush pick (never selects), then mesh selection.
-          const hasWave6Tool =
-            snap.wave6.select.activeTool !== null ||
-            snap.wave6.deform.activeTool !== null ||
-            snap.wave6.printPrep.activeTool !== null;
-          if (snap.sculpt !== null) {
-            app.setSculpt(null);
-          } else if (snap.maskPaint) {
-            app.setMaskPaint(false);
-          } else if (hasWave6Tool) {
-            app.disarmWave6Tools();
-          } else if (snap.brushPick !== null) {
-            app.setBrushPick(null);
-          } else {
-            selectMesh(app, select, selection, null, false);
-          }
-        }
-      } else if (key === "t") {
-        app.disarmWave6Tools();
-        setMode("translate");
-      } else if (key === "r") {
-        app.disarmWave6Tools();
-        setMode("rotate");
-      } else if (key === "s") {
-        app.disarmWave6Tools();
-        setMode("scale");
-      } else if (key === "f" && selection !== null) {
-        focusOn(selection);
-      } else if (key === "w") {
-        app.setWireframe(!app.getSnapshot().wireframe);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo, select, selection, focusOn, app, helpOpen, tourStep, endTour]);
-
-  // ---- Drop files anywhere ----
-  useEffect(() => {
-    const hasFiles = (e: DragEvent) => e.dataTransfer?.types.includes("Files") === true;
-    const onDragOver = (e: DragEvent) => {
-      if (hasFiles(e)) {
-        e.preventDefault();
-        setDropping(true);
-      }
-    };
-    const onDragLeave = (e: DragEvent) => {
-      // Leaving the window, not moving between elements.
-      if (e.relatedTarget === null) {
-        setDropping(false);
-      }
-    };
-    const onDrop = (e: DragEvent) => {
-      if (!hasFiles(e)) {
-        return;
-      }
-      e.preventDefault();
-      setDropping(false);
-      load(e.dataTransfer?.files ?? []);
-    };
-    window.addEventListener("dragover", onDragOver);
-    window.addEventListener("dragleave", onDragLeave);
-    window.addEventListener("drop", onDrop);
-    return () => {
-      window.removeEventListener("dragover", onDragOver);
-      window.removeEventListener("dragleave", onDragLeave);
-      window.removeEventListener("drop", onDrop);
-    };
-  }, [load]);
-
-  // A hidden sidebar keeps its panels mounted (their effects, like the
-  // volume view's linked MPR state, stay alive): it just takes no room.
-  const shellStyle = {
-    "--left-w": leftVisible ? `${leftWidth}px` : "0px",
-    "--right-w": rightVisible ? `${rightWidth}px` : "0px",
-  } as CSSProperties;
   const activateTabForSlot = (targetTab: WorkbenchTab) => {
     app.setActiveTab(targetTab);
   };
@@ -417,14 +148,14 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         hasItems={items.length > 0}
         hasVolume={hasVolume}
         onSetMode={setMode}
-        onResetView={() => setResetView((n) => n + 1)}
+        onResetView={requestResetView}
         onFocusSelection={() => {
           if (selection !== null) focusOn(selection);
         }}
         onClearSelection={() => selectMesh(app, select, selection, null, false)}
         onUndo={undo}
         onRedo={redo}
-        onOpenHelp={() => setHelpOpen(true)}
+        onOpenHelp={openHelp}
       />
       <aside className="sidebar sidebar-left" style={leftVisible ? undefined : { display: "none" }}>
         <SidebarHandle side="left" shell={shellRef} app={app} />
@@ -432,26 +163,9 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           app={app}
           onLoad={load}
           onCancelLoad={cancelLoad}
-          onLoadPhantom={(phantom) => {
-            void loader.loadDicomDemo(phantom).then((added) => {
-              const last = added.at(-1);
-              if (last !== undefined) {
-                focusOn(last.mesh);
-              }
-            });
-          }}
-          onLoadSample={(sample) => {
-            void loader.loadSample(sample).then((added) => {
-              const last = added.at(-1);
-              if (last !== undefined) {
-                focusOn(last.mesh);
-              }
-            });
-          }}
-          onLoadDemo={() => {
-            // No focus: the meshes join the current view (Reset view restores the overview).
-            void loader.loadDemo(demoBig);
-          }}
+          onLoadPhantom={loadPhantom}
+          onLoadSample={loadSample}
+          onLoadDemo={loadDemo}
           onFocus={focusOn}
         />
         <GroupsBar app={app} />
@@ -481,27 +195,16 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
         <p className="hint">
-          {sculpt !== null
-            ? "Hover any visible mesh to see brush · drag to sculpt · Esc disarms"
-            : maskPaint
-              ? "Hover any visible mesh · drag to paint mask · Esc disarms"
-              : wave6SelectTool !== null
-                ? `Use ${wave6SelectTool} selection on mesh · Esc disarms`
-                : wave6DeformTool !== null
-                  ? "Drag deformation handle in viewport · Esc disarms"
-                  : wave6PrintTool === "drainHole"
-                    ? "Click mesh surface to punch drain hole · Esc disarms"
-                    : wave6PrintTool === "placeStamp"
-                      ? "Click mesh surface to align and place stamp · Esc disarms"
-                      : picking !== null
-                        ? "Click the mesh to set the brush center · Esc cancels"
-                        : selection === null
-                          ? coarsePointer
-                            ? "Tap a mesh to select it · drag to rotate · pinch to zoom · two fingers to pan"
-                            : "Click a mesh to select it · drag to rotate · scroll to zoom · Ctrl+K search · drop files to load"
-                          : coarsePointer
-                            ? "Drag the gizmo to move · tap empty space to deselect"
-                            : "Drag the gizmo to move · T/R/S move/rotate/scale · F focus · Ctrl+K search · Esc deselect"}
+          {viewportHint({
+            sculpting: sculpt !== null,
+            maskPaint,
+            selectTool: wave6SelectTool,
+            deformTool: wave6DeformTool,
+            printTool: wave6PrintTool,
+            picking: picking !== null,
+            selected: selection !== null,
+            coarse: coarsePointer,
+          })}
         </p>
         {items.length === 0 ? <p className="empty">Drop STL, OBJ, PLY or DICOM series here</p> : null}
       </main>
@@ -512,7 +215,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           className={tabMatchesSlot(activeTab, "home") ? "inspector-slot" : "inspector-slot inspector-hidden"}
           data-inspector-slot="home"
         >
-          <HomeOverviewCard app={app} itemCount={items.length} onResetView={() => setResetView((n) => n + 1)} />
+          <HomeOverviewCard app={app} itemCount={items.length} onResetView={requestResetView} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "transform") ? "inspector-slot" : "inspector-slot inspector-hidden"}
@@ -616,19 +319,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           focusOn(mesh);
         }}
         onSetMode={setMode}
-        onResetView={() => setResetView((n) => n + 1)}
+        onResetView={requestResetView}
         onUndo={undo}
         onRedo={redo}
-        onOpenHelp={() => setHelpOpen(true)}
+        onOpenHelp={openHelp}
       />
       {helpOpen ? (
-        <HelpOverlay
-          onClose={() => setHelpOpen(false)}
-          onStartTour={() => {
-            setHelpOpen(false);
-            setTourStep(0);
-          }}
-        />
+        <HelpOverlay onClose={closeHelp} onStartTour={startTourFromHelp} />
       ) : null}
       {tourStep !== null ? (
         <TourCard index={tourStep} onNext={nextTour} onBack={backTour} onDone={endTour} />
@@ -641,7 +338,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
 /** A sidebar's edge: drag to resize it (persisted), double-click for the default width. */
 function SidebarHandle(props: { side: "left" | "right"; shell: RefObject<HTMLDivElement | null>; app: AppState }) {
   const { side, shell, app } = props;
-  const setWidth = side === "left" ? (w: number) => app.setLeftWidth(w) : (w: number) => app.setRightWidth(w);
+  const resize = sidebarResizeHandlers(side, shell, app);
   return (
     <div
       className={`resize-handle resize-${side}`}
@@ -649,18 +346,9 @@ function SidebarHandle(props: { side: "left" | "right"; shell: RefObject<HTMLDiv
       aria-orientation="vertical"
       aria-label={side === "left" ? "Resize the left panel" : "Resize the right panel"}
       title="Drag to resize · double-click to reset"
-      onDoubleClick={() => setWidth(DEFAULT_SIDEBAR_WIDTH)}
-      onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
-      onPointerMove={(e) => {
-        if (e.buttons !== 1 || !e.isPrimary) {
-          return;
-        }
-        const rect = shell.current?.getBoundingClientRect();
-        if (rect === undefined) {
-          return;
-        }
-        setWidth(side === "left" ? e.clientX - rect.left : rect.right - e.clientX);
-      }}
+      onDoubleClick={resize.onDoubleClick}
+      onPointerDown={resize.onPointerDown}
+      onPointerMove={resize.onPointerMove}
     />
   );
 }

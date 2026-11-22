@@ -2,36 +2,22 @@
 // and triangles shown, the engine (Worker with its thread count, or local)
 // and whether the page is cross-origin isolated; on an error its message
 // and Restart (a new Worker that replays the scene).
-import { useScene, useSceneStatus } from "fast-mesh-wasm/react";
-import { useState } from "react";
+import { useSceneStatus } from "fast-mesh-wasm/react";
 import type { Engine } from "../../app/App";
 import { type AppState, useApp } from "../../app/state/app-state";
+import { useSceneRestart } from "../ux/use-scene-restart";
 
 export function StatusBar(props: { engine: Engine; app: AppState }) {
   const { engine, app } = props;
-  const store = useScene();
   const { status, error } = useSceneStatus();
   const items = useApp(app, (s) => s.items);
   const loading = useApp(app, (s) => s.jobs.filter((j) => j.phase !== "done" && j.phase !== "error").length);
-  const [restarting, setRestarting] = useState(false);
-  // Re-rendered after a restart: the new Worker's thread count.
-  const [, setRestarts] = useState(0);
+  const { restarting, restart } = useSceneRestart();
   // The persisted display settings, and the reset that restores them.
   const theme = useApp(app, (s) => s.theme);
   const leftVisible = useApp(app, (s) => s.leftVisible);
   const rightVisible = useApp(app, (s) => s.rightVisible);
   const units = useApp(app, (s) => s.units);
-
-  const restart = () => {
-    setRestarting(true);
-    store
-      .restart()
-      .catch((e: unknown) => console.warn("restart failed", e))
-      .finally(() => {
-        setRestarting(false);
-        setRestarts((n) => n + 1);
-      });
-  };
 
   const label = restarting ? "Restarting…" : status === "error" ? "Error" : status === "computing" ? "Computing…" : "Ready";
   const threads = engine.threads();

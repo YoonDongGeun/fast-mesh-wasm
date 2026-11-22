@@ -1,11 +1,12 @@
 // The shortcut overlay (`?`) and the first-run tour card: text-first, no new
 // dependencies. Anchors are `[data-tour]` attributes on the panels and the
 // viewport toolbar; the active one gets `.tour-spot` while its step shows.
-import { useEffect } from "react";
 import { TOUR_STEPS } from "../ux/tour";
+import { useTourSpot } from "../ux/use-help-tour";
 
 // Exported for tests: the overlay must name every binding in App's keyboard
-// handler (T/R, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, F, W, Esc, ?).
+// handler, `app/ux/use-keyboard-shortcuts.ts` (T/R, Ctrl+Z / Ctrl+Shift+Z /
+// Ctrl+Y, F, W, Esc, ?).
 export const SHORTCUTS: Array<[string, string]> = [
   ["T / R", "Move / rotate gizmo"],
   ["S", "Scale gizmo"],
@@ -57,13 +58,7 @@ export function TourCard(props: { index: number; onNext: () => void; onBack: () 
   const step = TOUR_STEPS[index];
   const last = index === TOUR_STEPS.length - 1;
 
-  // Ring the step's anchor while it shows.
-  useEffect(() => {
-    const el = document.querySelector(`[data-tour="${step.target}"]`);
-    el?.classList.add("tour-spot");
-    el?.scrollIntoView({ block: "nearest" });
-    return () => el?.classList.remove("tour-spot");
-  }, [step]);
+  useTourSpot(step);
 
   if (step === undefined) {
     return null;

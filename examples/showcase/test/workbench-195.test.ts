@@ -35,7 +35,8 @@ import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
 import { MeshList } from "../src/features/home/ui/MeshList";
 import { ModelingPanel } from "../src/features/mesh-edit/ui/ModelingPanel";
 import { TransformPanel } from "../src/features/transform/ui/TransformPanel";
-import { domainMatchesPanel, WorkbenchDomains } from "../src/shell/ui/WorkbenchDomains";
+import { WorkbenchDomains } from "../src/shell/ui/WorkbenchDomains";
+import { domainMatchesPanel } from "../src/shell/ux/workbench-domains";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

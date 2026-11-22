@@ -7,13 +7,8 @@ import { createSceneStore } from "fast-mesh-wasm/store";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  InspectorHeader,
-  SculptInspectorCard,
-  tabMatchesSlot,
-  WORKBENCH_TABS,
-  WorkbenchRibbon,
-} from "../src/shell/ui/Ribbon";
+import { InspectorHeader, SculptInspectorCard, WorkbenchRibbon } from "../src/shell/ui/Ribbon";
+import { tabMatchesSlot, WORKBENCH_TABS } from "../src/shell/ux/workbench-tabs";
 import { AppState } from "../src/app/state/app-state";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

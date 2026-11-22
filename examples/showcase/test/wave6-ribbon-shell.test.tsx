@@ -11,12 +11,13 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CollisionPanel } from "../src/features/collision/ui/CollisionPanel";
-import { buildCommandPaletteItems } from "../src/shell/ui/CommandPalette";
+import { buildCommandPaletteItems } from "../src/shell/ux/command-registry";
 import { DeformPanel } from "../src/features/sculpt/ui/DeformPanel";
 import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
 import { ModelingPanel } from "../src/features/mesh-edit/ui/ModelingPanel";
 import { PointsPanel } from "../src/features/points/ui/PointsPanel";
-import { tabMatchesSlot, WORKBENCH_TABS, WorkbenchRibbon } from "../src/shell/ui/Ribbon";
+import { WorkbenchRibbon } from "../src/shell/ui/Ribbon";
+import { tabMatchesSlot, WORKBENCH_TABS } from "../src/shell/ux/workbench-tabs";
 import { SelectPanel } from "../src/features/select/ui/SelectPanel";
 import { AppState } from "../src/app/state/app-state";
 import {
