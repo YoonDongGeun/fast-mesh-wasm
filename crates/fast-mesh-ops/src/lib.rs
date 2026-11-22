@@ -76,6 +76,9 @@
 //!   closed, outward-wound mesh, by quickhull on exact orientation predicates.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
+//! - Primitives: [`primitives::generate`] builds a closed, welded,
+//!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
+//!   prism (or an open plane) from its parameters, centred on the origin.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -105,6 +108,7 @@ pub mod marching_cubes;
 mod measure;
 mod offset;
 mod orient;
+pub mod primitives;
 pub mod protect;
 mod refine;
 pub mod remesh;
