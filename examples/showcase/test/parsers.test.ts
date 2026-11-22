@@ -2,11 +2,11 @@
 // and ASCII), OBJ (polygons, index forms) and PLY (ASCII and binary
 // little-endian), plus the dispatch by file name.
 import { describe, expect, it } from "vitest";
-import type { MeshData } from "../src/load/mesh-data";
-import { parseObj } from "../src/load/obj";
-import { parseMeshFile, parseMeshFiles } from "../src/load/parse";
-import { parsePly } from "../src/load/ply";
-import { parseStl } from "../src/load/stl";
+import type { MeshData } from "../src/io/mesh-data";
+import { parseObj } from "../src/io/obj";
+import { parseMeshFile, parseMeshFiles } from "../src/io/parse";
+import { parsePly } from "../src/io/ply";
+import { parseStl } from "../src/io/stl";
 
 const text = (s: string): ArrayBuffer => new TextEncoder().encode(s).buffer as ArrayBuffer;
 

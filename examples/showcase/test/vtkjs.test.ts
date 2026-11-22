@@ -10,7 +10,7 @@ import {
   parseVtkJsImage,
   toFloatVolume,
   volumeToSlices,
-} from "../src/load/vtkjs";
+} from "../src/io/vtkjs";
 
 const DESCRIPTOR = {
   origin: [0, 0, 0],

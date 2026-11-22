@@ -1,7 +1,7 @@
 // The MPR slices: plane extraction with a fixed orientation (up is +Y
 // for axial, +Z otherwise) and window/level to gray.
 import { describe, expect, it } from "vitest";
-import { extractSlice, pointerSlice, slicePlaneImages, windowToGray } from "../src/panels/volume-slice";
+import { extractSlice, pointerSlice, slicePlaneImages, windowToGray } from "../src/features/ct/ux/volume-slice";
 
 // 3 x 2 x 2 voxels, x fastest: value = 100 * k + 10 * j + i.
 const COLUMNS = 3;

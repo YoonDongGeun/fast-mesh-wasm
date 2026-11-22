@@ -1,8 +1,8 @@
 // The volume LUT: a transfer preset sampled into 256 RGBA entries over
 // the data range, plus the volume normalized to 8-bit indices.
 import { describe, expect, it } from "vitest";
-import { VOLUME_PRESETS } from "../src/panels/volume-presets";
-import { dataRange, normalizeVolume, presetLut } from "../src/panels/volume-lut";
+import { VOLUME_PRESETS } from "../src/features/ct/ux/volume-presets";
+import { dataRange, normalizeVolume, presetLut } from "../src/features/ct/ux/volume-lut";
 
 function alphaAt(lut: Uint8Array, v: number, min: number, max: number): number {
   const i = Math.round(((v - min) / (max - min)) * 255);

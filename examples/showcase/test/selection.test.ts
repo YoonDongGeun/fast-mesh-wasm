@@ -3,7 +3,7 @@
 // the Join source seeds from the secondaries in order.
 import type { MeshHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { clickMulti, nextJoinSource } from "../src/scene/selection";
+import { clickMulti, nextJoinSource } from "../src/features/select/ux/selection";
 
 const [a, b, c] = [1, 2, 3].map((n) => n as unknown as MeshHandle);
 

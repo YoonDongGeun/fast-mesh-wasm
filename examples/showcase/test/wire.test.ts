@@ -2,7 +2,7 @@
 // wireframe child draws the edges on top (idempotent, sharing the geometry).
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { setWireOverlay } from "../src/viewport/wire";
+import { setWireOverlay } from "../src/features/view/ui/wire";
 
 function mesh(): THREE.Mesh {
   const geometry = new THREE.BufferGeometry();

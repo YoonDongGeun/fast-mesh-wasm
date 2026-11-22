@@ -10,8 +10,8 @@ import { createRoot, type Root } from "react-dom/client";
 import * as THREE from "three";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { init, Scene } from "../../../packages/fast-mesh-wasm/dist/web.js";
-import { SelectPanel } from "../src/panels/SelectPanel";
-import { AppState, type Item } from "../src/scene/app-state";
+import { SelectPanel } from "../src/features/select/ui/SelectPanel";
+import { AppState, type Item } from "../src/app/state/app-state";
 import {
   applyScreenFaceSelection,
   buildScreenSelectOptions,
@@ -24,7 +24,7 @@ import {
   raycastVisibleItem,
   setFaceSelectionMarquee,
   writeMeshFaceSelection,
-} from "../src/viewport/FaceSelectionLayer";
+} from "../src/features/select/ui/FaceSelectionLayer";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

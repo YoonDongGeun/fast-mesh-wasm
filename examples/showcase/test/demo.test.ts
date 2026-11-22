@@ -1,8 +1,8 @@
 // The generated demo meshes: A and B closed and consistently oriented (every
 // edge used once each way), B penetrating A, C with holes and a floating piece.
 import { describe, expect, it } from "vitest";
-import { blobbySphere, demoMeshes, openShellWithPiece, roundedBox } from "../src/scene/demo";
-import { bounds, type MeshData } from "../src/load/mesh-data";
+import { blobbySphere, demoMeshes, openShellWithPiece, roundedBox } from "../src/io/demo";
+import { bounds, type MeshData } from "../src/io/mesh-data";
 
 /** Directed edges used more than once, and edges with no twin (boundary edges). */
 function edges(m: MeshData): { repeated: number; boundary: number } {

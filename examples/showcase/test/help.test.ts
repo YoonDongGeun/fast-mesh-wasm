@@ -3,8 +3,8 @@
 // content (every binding in App's keyboard handler), the card's step
 // machine, and the localStorage "seen" round-trip.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SHORTCUTS } from "../src/panels/Help";
-import { TOUR_STEPS, markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "../src/panels/tour";
+import { SHORTCUTS } from "../src/shell/ui/Help";
+import { TOUR_STEPS, markTourSeen, resolveTourStart, tourBack, tourNext, tourSeen } from "../src/shell/ux/tour";
 
 const DESKTOP =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";

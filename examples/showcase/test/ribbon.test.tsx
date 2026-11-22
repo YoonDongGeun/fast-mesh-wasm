@@ -13,8 +13,8 @@ import {
   tabMatchesSlot,
   WORKBENCH_TABS,
   WorkbenchRibbon,
-} from "../src/panels/Ribbon";
-import { AppState } from "../src/scene/app-state";
+} from "../src/shell/ui/Ribbon";
+import { AppState } from "../src/app/state/app-state";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

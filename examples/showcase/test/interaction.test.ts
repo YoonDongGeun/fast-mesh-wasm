@@ -1,6 +1,6 @@
-// When the heatmap's engine interaction runs (panels/interaction.ts).
+// When the heatmap's engine interaction runs (features/collision/ux/interaction.ts).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InteractionTimer, SETTLE_MS } from "../src/panels/interaction";
+import { InteractionTimer, SETTLE_MS } from "../src/features/collision/ux/interaction";
 
 describe("interaction timer", () => {
   let seen: boolean[];

@@ -3,7 +3,7 @@
 // contains the quad normal), and the hit's travel along the normal
 // becomes slice steps.
 import { describe, expect, it } from "vitest";
-import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "../src/viewport/slice-drag";
+import { clampSlice, dragPlaneNormal, planeHit, sliceSteps } from "../src/features/ct/ux/slice-drag";
 
 const close = (got: readonly number[] | null, want: readonly number[]): void => {
   expect(got === null ? null : [...got]).not.toBe(null);

@@ -10,10 +10,10 @@ import {
   describeAutoRepairSummary,
   formatAutoRepairReport,
   runAutoRepairPipeline,
-} from "../src/panels/auto-repair";
-import { summarize, type AnalysisSummary } from "../src/panels/repair-summary";
-import { openShellWithPiece } from "../src/scene/demo";
-import { countRepairOverlays } from "../src/viewport/repair-overlays";
+} from "../src/features/mesh-repair/ux/auto-repair";
+import { summarize, type AnalysisSummary } from "../src/features/mesh-repair/ux/repair-summary";
+import { openShellWithPiece } from "../src/io/demo";
+import { countRepairOverlays } from "../src/features/mesh-repair/ui/repair-overlays";
 
 /** An analysis with nothing to report, then the given fields. */
 function analysis(patch: Partial<Analysis>): Analysis {

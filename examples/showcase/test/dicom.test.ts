@@ -2,7 +2,7 @@
 // the geometry and rescale tags a series stack needs, and raw pixels.
 // Encapsulated (compressed) transfer syntaxes fail with a clear message.
 import { describe, expect, it } from "vitest";
-import { isDicom, parseDicom } from "../src/load/dicom";
+import { isDicom, parseDicom } from "../src/io/dicom";
 import { dicomFile } from "./dicom-fixture";
 
 describe("parseDicom", () => {

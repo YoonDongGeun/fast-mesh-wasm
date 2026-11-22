@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCollisionRows,
   readSectionContours,
-} from "../src/panels/ExportPanel";
+} from "../src/features/home/ui/ExportPanel";
 import {
   collisionRowsToCsv,
   contoursToDxf,
@@ -14,7 +14,7 @@ import {
   planeBasis,
   projectContours,
   reportFileName,
-} from "../src/load/report";
+} from "../src/io/report";
 
 const ORIGIN: [number, number, number] = [0, 0, 0];
 const Z: [number, number, number] = [0, 0, 1];

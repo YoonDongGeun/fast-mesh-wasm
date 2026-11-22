@@ -16,7 +16,7 @@ import {
   smallComponentTris,
   triangleEdgeSegments,
   triangleSoup,
-} from "../src/viewport/repair-overlays";
+} from "../src/features/mesh-repair/ui/repair-overlays";
 
 /** An analysis with nothing to report, then the given fields. */
 function analysis(patch: Partial<Analysis>): Analysis {

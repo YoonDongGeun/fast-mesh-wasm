@@ -1,6 +1,6 @@
 // The rules the canvas's pointer listeners share on touch.
 import { describe, expect, it } from "vitest";
-import { FingerTracker, isExtraFinger, tapSlop } from "../src/viewport/touch";
+import { FingerTracker, isExtraFinger, tapSlop } from "../src/viewport/ux/touch";
 
 describe("FingerTracker", () => {
   it("counts_only_canvas_fingers_as_a_gesture", () => {

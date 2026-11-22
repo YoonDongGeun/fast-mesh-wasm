@@ -3,9 +3,9 @@ import { SceneProvider } from "fast-mesh-wasm/react";
 import { SceneStore } from "fast-mesh-wasm/store";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
-import { ModelingPanel } from "../src/panels/ModelingPanel";
-import { AppState } from "../src/scene/app-state";
-import { selectMesh } from "../src/scene/selection";
+import { ModelingPanel } from "../src/features/mesh-edit/ui/ModelingPanel";
+import { AppState } from "../src/app/state/app-state";
+import { selectMesh } from "../src/features/select/ux/selection";
 import {
   computeHitPointAndWorldNormal,
   createBuiltinStampMeshGeometry,
@@ -16,7 +16,7 @@ import {
   orientationFromSurfaceNormal,
   runHollowMeshOp,
   setPlaceAlignToNormal,
-} from "../src/viewport/HollowPlaceToolsLayer";
+} from "../src/features/mesh-edit/ui/HollowPlaceToolsLayer";
 
 function boxMesh(cx = 0, cy = 0, cz = 0, hx = 10, hy = 10, hz = 10) {
   const x0 = cx - hx;

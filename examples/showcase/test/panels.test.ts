@@ -12,8 +12,8 @@ import {
   niceScale,
   toleranceLimit,
   topologyOf,
-} from "../src/panels/collision-math";
-import { describeJoin, describeReport, summarize } from "../src/panels/repair-summary";
+} from "../src/features/collision/ux/collision-math";
+import { describeJoin, describeReport, summarize } from "../src/features/mesh-repair/ux/repair-summary";
 
 describe("collision math", () => {
   it("nice_scale", () => {

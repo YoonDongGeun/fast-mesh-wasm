@@ -7,11 +7,11 @@ import { createSceneStore } from "fast-mesh-wasm/store";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RepairPanel } from "../src/panels/RepairPanel";
-import { SculptInspectorCard } from "../src/panels/Ribbon";
-import { AppState } from "../src/scene/app-state";
-import { selectMesh } from "../src/scene/selection";
-import { SculptToolbox } from "../src/viewport/Toolbox";
+import { RepairPanel } from "../src/features/mesh-repair/ui/RepairPanel";
+import { SculptInspectorCard } from "../src/shell/ui/Ribbon";
+import { AppState } from "../src/app/state/app-state";
+import { selectMesh } from "../src/features/select/ux/selection";
+import { SculptToolbox } from "../src/features/sculpt/ui/Toolbox";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

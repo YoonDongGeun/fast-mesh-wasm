@@ -16,8 +16,8 @@ import {
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
 import { afterEach, describe, expect, it } from "vitest";
-import { AppState, type CameraPreset, type Item } from "../src/scene/app-state";
-import { applyMeshScale, eulerDegToMat3, mat3ToEulerDeg } from "../src/scene/transform-math";
+import { AppState, type CameraPreset, type Item } from "../src/app/state/app-state";
+import { applyMeshScale, eulerDegToMat3, mat3ToEulerDeg } from "../src/features/transform/ux/transform-math";
 import {
   applySurfaceField,
   computeGaussianCurvature,
@@ -30,14 +30,14 @@ import {
   runShell,
   runSimplify,
   runSubdivide,
-} from "../src/scene/workbench-ops";
+} from "../src/engine/workbench-ops";
 import {
   applyCameraPose,
   computeSceneBounds,
   orthoToPerspectiveDistance,
   perspectiveToOrthoHalfExtents,
   presetPose,
-} from "../src/viewport/camera";
+} from "../src/features/view/ux/camera";
 
 function makeBoxGeometry(
   hx: number,

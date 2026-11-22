@@ -3,9 +3,9 @@
 // loader drops bad entries instead of failing the file.
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { describe, expect, it } from "vitest";
-import { bounds } from "../src/load/mesh-data";
-import { importScaleOf, scalePositions } from "../src/panels/units";
-import { AppState, type Item } from "../src/scene/app-state";
+import { bounds } from "../src/io/mesh-data";
+import { importScaleOf, scalePositions } from "../src/shared/ux/units";
+import { AppState, type Item } from "../src/app/state/app-state";
 import {
   buildProjectDoc,
   collectProject,
@@ -17,7 +17,7 @@ import {
   PROJECT_VERSION,
   type ProjectDoc,
   restoreProject,
-} from "../src/load/project";
+} from "../src/io/project";
 
 const POSITIONS = Float64Array.from([0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0, -1.5, 1e100, -1e-100]);
 const INDICES = Uint32Array.from([0, 1, 2, 0, 2, 3]);

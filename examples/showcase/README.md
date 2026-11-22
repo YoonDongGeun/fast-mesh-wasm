@@ -18,14 +18,14 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 ```
 
 - **Load.** Open or drop STL (binary and ASCII), OBJ and PLY (ASCII and binary little-endian) files.
-  They are read and parsed in a Worker (`src/load/parser.worker.ts`); the page only calls
+  They are read and parsed in a Worker (`src/io/parser.worker.ts`); the page only calls
   `store.addMesh` with the transferred arrays. Each file shows its progress. STL corners with
   bit-identical positions share a vertex.
 - **Demo meshes.** A (a blobby sphere), B (a rounded box penetrating A) and C (a shell with two holes
   and a floating piece) are generated in the same Worker when the app opens.
 - **Mesh list.** Name, picture, triangle count, visibility, opacity; select, focus the camera, remove.
   A picture is drawn from the mesh's render views by a small software z-buffer
-  (`src/panels/mesh-preview.ts`), in slices of a few milliseconds at idle, and redrawn once edits
+  (`src/features/home/ui/mesh-preview.ts`), in slices of a few milliseconds at idle, and redrawn once edits
   or turns have stopped for 400 ms and no pointer is pressed on the viewport. A mesh with nothing left
   to draw shows an empty state. The built-in models' buttons show committed pictures
   (`public/previews`, about 15 KB in all, regenerated with `node scripts/showcase-previews.mjs --build`
@@ -118,6 +118,39 @@ URL options:
 
 The dev and preview servers send the cross-origin isolation headers (COOP/COEP, a middleware in
 `vite.config.ts`), so the Worker scene runs its multithreaded engine.
+
+## Source layout
+
+`src/features/` has one folder per ribbon area, named after MeshInspector's ribbon tabs where one
+matches. Each feature has two parts:
+
+- `ui/`: what is shown. React panels and viewport layers, and the three.js objects they draw.
+- `ux/`: how it behaves. Input handling, tool state, engine calls and the math behind them. No JSX.
+
+```
+src/
+  main.tsx       boot: engine, store, React root
+  app/           App.tsx; state/ (app state, tool state, readouts); testing/ (window.__showcase)
+  shell/         ribbon, status bar, command search, help and tour
+  shared/        units, persisted settings, LengthInput
+  viewport/      the canvas (ui/Viewport.tsx) and what it shares (ux/: view registry, touch, clip planes)
+  engine/        the workbench op bridge and the lazy wasm loader
+  io/            loading (parser Worker), DICOM, export, project files, demo meshes
+  features/
+    home/        mesh list, project save and open, export
+    view/        ViewCube, shading modes, wireframe, camera presets
+    select/      object and face selection
+    transform/   numeric transform, scale, ICP alignment
+    inspect/     ruler, query, section plane, clip box
+    mesh-edit/   boolean, plane cut, offset and shell, resample, hollow, place mesh
+    mesh-repair/ analysis, healer overlays, repairs, auto repair
+    sculpt/      brushes, mask, dyntopo, free-form deformation
+    points/      point clouds, primitive fitting, contours
+    ct/          volume rendering, MPR slices
+    collision/   contact heatmap, group mode, named groups
+```
+
+Tests live in `test/`.
 
 ## Checks
 

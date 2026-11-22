@@ -1,7 +1,7 @@
 // The volume presets: HU-tuned color/opacity ramps (bone, soft tissue,
 // vessels), applied to the vtk.js transfer functions.
 import { describe, expect, it } from "vitest";
-import { VOLUME_PRESETS, WINDOW_PRESETS } from "../src/panels/volume-presets";
+import { VOLUME_PRESETS, WINDOW_PRESETS } from "../src/features/ct/ux/volume-presets";
 
 describe("VOLUME_PRESETS", () => {
   it("covers_bone_tissue_and_vessels", () => {

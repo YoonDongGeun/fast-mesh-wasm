@@ -2,9 +2,9 @@
 // normal, rescaled into a regular float volume with its patient geometry.
 // Lone, inconsistent or tilted series fail with a clear message.
 import { describe, expect, it } from "vitest";
-import type { DicomSlice } from "../src/load/dicom";
-import { parseDicom } from "../src/load/dicom";
-import { stackSeries } from "../src/load/series";
+import type { DicomSlice } from "../src/io/dicom";
+import { parseDicom } from "../src/io/dicom";
+import { stackSeries } from "../src/io/series";
 import { dicomFile } from "./dicom-fixture";
 
 function slice(z: number, pixels: number[], extra = {}): DicomSlice {

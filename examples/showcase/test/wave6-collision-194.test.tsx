@@ -12,10 +12,10 @@ import { SceneProvider } from "fast-mesh-wasm/react";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { CollisionPanel } from "../src/panels/CollisionPanel";
-import { GroupsBar } from "../src/panels/GroupsBar";
-import { AppState, type Item } from "../src/scene/app-state";
-import { roundedBox } from "../src/scene/demo";
+import { CollisionPanel } from "../src/features/collision/ui/CollisionPanel";
+import { GroupsBar } from "../src/features/collision/ui/GroupsBar";
+import { AppState, type Item } from "../src/app/state/app-state";
+import { roundedBox } from "../src/io/demo";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

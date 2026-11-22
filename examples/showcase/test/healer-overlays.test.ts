@@ -1,7 +1,7 @@
 import type { Analysis } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { buildSelectiveHealOps, formatHealerDelta } from "../src/panels/MeshHealerSection";
-import type { AnalysisSummary } from "../src/panels/repair-summary";
+import { buildSelectiveHealOps, formatHealerDelta } from "../src/features/mesh-repair/ui/MeshHealerSection";
+import type { AnalysisSummary } from "../src/features/mesh-repair/ux/repair-summary";
 import {
   buildHealerOverlayGroup,
   countHealerOverlays,
@@ -11,7 +11,7 @@ import {
   detectSliverTriangles,
   disposeHealerOverlayGroup,
   extractDefectHotspots,
-} from "../src/viewport/healer-overlays";
+} from "../src/features/mesh-repair/ui/healer-overlays";
 
 function makeAnalysis(partial: Partial<Analysis> = {}): Analysis {
   return {

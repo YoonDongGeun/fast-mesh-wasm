@@ -1,7 +1,7 @@
 // The pure parts of named mesh groups: ticking, creating, colouring and
 // dropping members on removal.
 import { describe, expect, it } from "vitest";
-import { createGroup, dropMember, removeGroup, setColored, toggleCheck } from "../src/panels/groups";
+import { createGroup, dropMember, removeGroup, setColored, toggleCheck } from "../src/features/collision/ux/groups";
 
 describe("named groups", () => {
   it("toggle_check_keeps_list_order", () => {

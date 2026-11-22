@@ -3,7 +3,7 @@
 // renders mirrored or swapped.
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { planeSpec } from "../src/panels/volume-slice";
+import { planeSpec } from "../src/features/ct/ux/volume-slice";
 
 /** The world spot of the top-left texel (u 0, v 1) through the frame. */
 function topLeft(axis: "axial" | "coronal" | "sagittal", size: [number, number, number]): [number, number, number] {

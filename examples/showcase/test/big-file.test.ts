@@ -1,7 +1,7 @@
 // The pure large-file UX core (issue #113): URL thresholds, weight plans,
 // memory estimates and the post-load summary.
 import { describe, expect, it } from "vitest";
-import { AppState } from "../src/scene/app-state";
+import { AppState } from "../src/app/state/app-state";
 import {
   BIG_DECIMATE_TARGET,
   BIG_DECIMATE_TRIANGLES,
@@ -16,7 +16,7 @@ import {
   formatTriangles,
   parseBigFileParams,
   summarizeLoad,
-} from "../src/load/big-file";
+} from "../src/io/big-file";
 
 describe("big-file params", () => {
   it("defaults", () => {

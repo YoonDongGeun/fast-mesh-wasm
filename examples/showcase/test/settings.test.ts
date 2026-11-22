@@ -10,9 +10,9 @@ import {
   saveSettings,
   SETTINGS_KEY,
   settingsFromSnapshot,
-} from "../src/panels/settings";
-import { markTourSeen, tourSeen } from "../src/panels/tour";
-import { AppState } from "../src/scene/app-state";
+} from "../src/shared/ux/settings";
+import { markTourSeen, tourSeen } from "../src/shell/ux/tour";
+import { AppState } from "../src/app/state/app-state";
 
 const LEGACY_SEEN_KEY = "fast-mesh-showcase.seen-tour";
 

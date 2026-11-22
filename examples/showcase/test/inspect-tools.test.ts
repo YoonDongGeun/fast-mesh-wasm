@@ -11,7 +11,7 @@ import {
   rulerDistance,
   snapSlot,
   worldFromMatrix,
-} from "../src/viewport/inspect-tools";
+} from "../src/features/inspect/ux/inspect-tools";
 
 describe("rulerDistance", () => {
   it("measures_world_points", () => {

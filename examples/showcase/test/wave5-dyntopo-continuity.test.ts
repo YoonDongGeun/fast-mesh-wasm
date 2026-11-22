@@ -3,17 +3,17 @@ import { Scene, type DyntopoMode, type SculptBrushOp } from "fast-mesh-wasm";
 import { createSceneStore } from "fast-mesh-wasm/store";
 import * as THREE from "three";
 import { afterEach, describe, expect, it } from "vitest";
-import { SETTINGS_VERSION, parseSettings } from "../src/panels/settings";
-import { AppState } from "../src/scene/app-state";
-import { makeBrushCursor, setBrushDyntopoIndicator } from "../src/viewport/brush-cursor";
-import { MaskLiveTracker } from "../src/viewport/mask-protect";
+import { SETTINGS_VERSION, parseSettings } from "../src/shared/ux/settings";
+import { AppState } from "../src/app/state/app-state";
+import { makeBrushCursor, setBrushDyntopoIndicator } from "../src/features/sculpt/ui/brush-cursor";
+import { MaskLiveTracker } from "../src/features/sculpt/ux/mask-protect";
 import {
   applyDyntopoRoi,
   buildDyntopoOptions,
   dyntopoCursorRatio,
   sculptBrush,
   SculptStroke,
-} from "../src/viewport/sculpt";
+} from "../src/features/sculpt/ux/sculpt";
 
 function openCylinder(slices = 12, radius = 1) {
   const positions: number[] = [];
