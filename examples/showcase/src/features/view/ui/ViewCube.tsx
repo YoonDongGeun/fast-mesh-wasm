@@ -1,25 +1,10 @@
 // Interactive 3D ViewCube (faces/edges/corners + Persp/Ortho), synced XYZ basis
 // triad, live metric/imperial scale bar, and 6-mode shading selector (#232).
-import { useEffect, useRef, useState } from "react";
-import * as THREE from "three";
+import { useRef } from "react";
 import { type AppState, type DiagnosticShadingMode, useApp } from "../../../app/state/app-state";
-import {
-  buildViewCubeMatrixCss,
-  computeMetricScaleBar,
-  projectBasisTriad,
-  type ScaleBarReadout,
-  type TriadAxisProjection,
-  VIEW_CUBE_CORNERS,
-  VIEW_CUBE_EDGES,
-  VIEW_CUBE_FACES,
-  type ViewCubeTarget,
-} from "../ux/navigation-hud";
+import { VIEW_CUBE_CORNERS, VIEW_CUBE_EDGES, VIEW_CUBE_FACES } from "../ux/navigation-hud";
+import { snapView, useNavigationHud } from "../ux/use-navigation-hud";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "./shading";
-import { view } from "../../../viewport/ux/view";
-
-function triadSummaryKey(axes: readonly TriadAxisProjection[]): string {
-  return axes.map((a) => `${a.axis}:${Math.round(a.x * 2)},${Math.round(a.y * 2)}`).join("|");
-}
 
 /**
  * Corner 3D ViewCube + Persp/Ortho toggle + bottom-left XYZ triad & live metric scale bar (#232).
@@ -32,68 +17,7 @@ export function ViewportNavigationHud(props: { app: AppState }) {
   const creaseAngleDeg = useApp(app, (s) => s.creaseAngleDeg);
   const cubeRef = useRef<HTMLDivElement>(null);
 
-  const [triad, setTriad] = useState<TriadAxisProjection[]>(() =>
-    projectBasisTriad(new THREE.Quaternion(), 20),
-  );
-  const [scaleBar, setScaleBar] = useState<ScaleBarReadout>({
-    label: units === "in" ? "1 in" : "10 mm",
-    widthPx: 80,
-    valueInUnits: 10,
-    mmLength: 10,
-  });
-
-  useEffect(() => {
-    let raf = 0;
-    let lastTriadKey = "";
-    let lastScaleKey = "";
-    const targetVec = new THREE.Vector3();
-
-    const tick = () => {
-      const cam = view.camera;
-      const canvas = view.canvas;
-      if (cam !== null) {
-        if (cubeRef.current !== null) {
-          cubeRef.current.style.transform = buildViewCubeMatrixCss(cam.quaternion, -26);
-        }
-        const nextTriad = projectBasisTriad(cam.quaternion, 20);
-        const tKey = triadSummaryKey(nextTriad);
-        if (tKey !== lastTriadKey) {
-          lastTriadKey = tKey;
-          setTriad(nextTriad);
-        }
-        if (canvas !== null && canvas.clientHeight > 0) {
-          if (view.orbit !== null) {
-            targetVec.copy(view.orbit.target);
-          } else {
-            targetVec.set(0, 0, 0);
-          }
-          const dist = cam.position.distanceTo(targetVec);
-          const nextScale = computeMetricScaleBar({
-            camera: cam,
-            viewportHeightPx: canvas.clientHeight,
-            targetDistanceWorld: dist,
-            units,
-          });
-          const sKey = `${nextScale.label}|${Math.round(nextScale.widthPx)}`;
-          if (sKey !== lastScaleKey) {
-            lastScaleKey = sKey;
-            setScaleBar(nextScale);
-          }
-        }
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [units]);
-
-  const snapView = (target: ViewCubeTarget) => {
-    if (target.preset !== undefined) {
-      app.requestCameraPreset(target.preset);
-    } else {
-      app.requestCameraDirection(target.dir, target.up);
-    }
-  };
+  const { triad, scaleBar } = useNavigationHud(units, cubeRef);
 
   return (
     <>
@@ -108,7 +32,7 @@ export function ViewportNavigationHud(props: { app: AppState }) {
                 data-viewcube-face={face.id}
                 data-camera-preset={face.preset}
                 title={face.title}
-                onClick={() => snapView(face)}
+                onClick={() => snapView(app, face)}
               >
                 {face.label}
               </button>
@@ -123,7 +47,7 @@ export function ViewportNavigationHud(props: { app: AppState }) {
               className="view-cube-chip"
               data-viewcube-corner={corner.id}
               title={corner.title}
-              onClick={() => snapView(corner)}
+              onClick={() => snapView(app, corner)}
             >
               {corner.label}
             </button>
@@ -135,7 +59,7 @@ export function ViewportNavigationHud(props: { app: AppState }) {
               className="view-cube-chip edge"
               data-viewcube-edge={edge.id}
               title={edge.title}
-              onClick={() => snapView(edge)}
+              onClick={() => snapView(app, edge)}
             >
               {edge.label.replace("-", "/")}
             </button>
