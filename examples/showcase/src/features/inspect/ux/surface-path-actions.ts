@@ -11,8 +11,13 @@
 // step. Split keeps both sides: inside one history step it fills a new mesh
 // (added empty first: adding a mesh is not an undo step) with a copy of the
 // mesh, then trims the mesh to the outside and the copy to the inside. Undo
-// puts the mesh back whole and empties the copy. A loop that cuts nothing
-// away changes nothing.
+// puts the mesh back whole and empties the copy.
+//
+// A loop need not cut anything away (once around a ring, say). The engine
+// then still imprints it, replacing the triangles it crosses, so triangle
+// counts do not tell a cut from an imprint; the surface does, which an
+// imprint keeps and a cut does not. Such a loop is undone and reported, and
+// the picks stay.
 import type { MeshHandle, RayHit, SceneLike, TrimReport, Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
@@ -204,11 +209,99 @@ export function liveTriangleCount(indices: ArrayLike<number>): number {
   return n;
 }
 
+/** What {@link surfaceCut} compares of a mesh before and after a trim. */
+export interface SurfaceStats {
+  /** Live triangles. */
+  triangles: number;
+  /** Their area, in local units. */
+  area: number;
+  /** The largest local coordinate over the extent: how coarsely `f32` places a vertex for the mesh's size. */
+  reach: number;
+}
+
+/** A mesh's {@link SurfaceStats}, in one pass over its render buffers. */
+export function surfaceStats(positions: ArrayLike<number>, indices: ArrayLike<number>): SurfaceStats {
+  let triangles = 0;
+  let area = 0;
+  let far = 0;
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let k = 0; k + 2 < indices.length; k += 3) {
+    const i0 = indices[k];
+    const i1 = indices[k + 1];
+    const i2 = indices[k + 2];
+    if (i0 === 0 && i1 === 0 && i2 === 0) {
+      continue;
+    }
+    triangles++;
+    for (let corner = 0; corner < 3; corner++) {
+      const i = corner === 0 ? i0 : corner === 1 ? i1 : i2;
+      for (let c = 0; c < 3; c++) {
+        const v = positions[3 * i + c];
+        if (v < lo[c]) lo[c] = v;
+        if (v > hi[c]) hi[c] = v;
+        const a = Math.abs(v);
+        if (a > far) far = a;
+      }
+    }
+    const a = 3 * i0;
+    const b = 3 * i1;
+    const d = 3 * i2;
+    const ux = positions[b] - positions[a];
+    const uy = positions[b + 1] - positions[a + 1];
+    const uz = positions[b + 2] - positions[a + 2];
+    const wx = positions[d] - positions[a];
+    const wy = positions[d + 1] - positions[a + 1];
+    const wz = positions[d + 2] - positions[a + 2];
+    area += 0.5 * Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+  }
+  const extent = triangles === 0 ? 0 : Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+  return { triangles, area, reach: extent > 0 ? far / extent : 0 };
+}
+
+/** An area change below this share of the area is an imprint's rounding, not a cut. */
+const AREA_NOISE = 1e-6;
+/** The share grows with the coordinates' reach, as `f32` places vertices more coarsely. */
+const AREA_NOISE_PER_REACH = 1e-7;
+
+/**
+ * Whether a trim took part of the surface away. An imprint alone never loses
+ * triangles, and keeps the area up to `f32` rounding: about 1e-10 of it on
+ * a mesh centred on its origin, up to about 1e-6 with coordinates hundreds of
+ * extents from it. So a cut shows as fewer triangles, or as area lost beyond
+ * that. (A region smaller than both the noise and what the imprint added is
+ * not told from none.)
+ */
+export function surfaceCut(before: SurfaceStats, after: SurfaceStats): boolean {
+  if (after.triangles < before.triangles) {
+    return true;
+  }
+  return after.area < before.area * (1 - Math.max(AREA_NOISE, AREA_NOISE_PER_REACH * before.reach));
+}
+
+/** The mesh's current {@link SurfaceStats}. */
+function statsOf(scene: SceneLike, mesh: MeshHandle): SurfaceStats {
+  const views = scene.views(mesh);
+  return surfaceStats(views.positions(), views.indices());
+}
+
+/**
+ * Waits until what was asked of the engine so far has landed and its change
+ * records are out: a `WorkerScene` takes a cancelled step back later than
+ * the call that asked for it. `mesh` is a live mesh to ask about.
+ */
+export async function settleChanges(store: SceneStore, mesh: MeshHandle): Promise<void> {
+  try {
+    await store.scene.inspect?.measure(mesh);
+  } catch {
+    // Removed meanwhile: nothing more to wait for.
+  }
+  store.commitFrame();
+}
+
 /** What a trim did. */
 export interface PathTrimResult {
   keep: TrimKeep;
-  /** Triangles removed with the other side. */
-  removed: number;
   /** Triangles the mesh has now. */
   triangles: number;
 }
@@ -217,7 +310,7 @@ export interface PathTrimResult {
  * Trims `mesh` along the closed `path`, keeping `keep`: one undo step. The
  * inside is the side away from the mesh's open edges, or on a closed mesh
  * the side with the smaller area. A loop that cuts nothing away is undone
- * and throws {@link NO_CUT_MESSAGE}.
+ * (see {@link settleChanges}) and throws {@link NO_CUT_MESSAGE}.
  */
 export async function trimAlongPath(
   store: SceneStore,
@@ -227,20 +320,21 @@ export async function trimAlongPath(
 ): Promise<PathTrimResult> {
   const curve = loopCurve(path);
   const trim = trimCall(store.scene);
+  const before = statsOf(store.scene, mesh);
+  let after: SurfaceStats;
   store.beginStep();
-  let report: TrimReport;
   try {
-    report = await trim(mesh, curve, { closed: true, deleteInside: keep === "outside" });
+    await trim(mesh, curve, { closed: true, deleteInside: keep === "outside" });
+    after = statsOf(store.scene, mesh);
+    if (!surfaceCut(before, after)) {
+      throw new Error(NO_CUT_MESSAGE);
+    }
   } catch (err) {
     store.cancelStep();
     throw err;
   }
-  if (report.trianglesRemoved === 0) {
-    store.cancelStep();
-    throw new Error(NO_CUT_MESSAGE);
-  }
   store.endStep();
-  return { keep, removed: report.trianglesRemoved, triangles: liveTriangleCount(store.scene.views(mesh).indices()) };
+  return { keep, triangles: after.triangles };
 }
 
 /** What a split did: the new mesh holding the inside, and both parts' triangles. */
@@ -289,7 +383,11 @@ export async function splitAlongPath(
   if (snap.indices.length === 0) {
     throw new Error("The mesh has no triangles to split.");
   }
+  // Each side against itself: the copy is in world units, the mesh in its own.
+  const before = statsOf(scene, item.mesh);
   const copy = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: boxCentre(world) });
+  let outer: SurfaceStats;
+  let inner: SurfaceStats;
   store.beginStep();
   try {
     // An edit takes world positions; the copy's triangles follow the ids its new vertices got.
@@ -299,9 +397,15 @@ export async function splitAlongPath(
       throw new Error("The edit did not report the added vertices.");
     }
     await store.edit(copy, [{ op: "addTriangles", triangles: remapCorners(snap.indices, ids) }]);
-    const outer = await trim(item.mesh, curve, { closed: true, deleteInside: true });
-    const inner = await trim(copy, curve, { closed: true, deleteInside: false });
-    if (outer.trianglesRemoved === 0 || inner.trianglesRemoved === 0) {
+    const copyBefore = statsOf(scene, copy);
+    await trim(item.mesh, curve, { closed: true, deleteInside: true });
+    outer = statsOf(scene, item.mesh);
+    if (!surfaceCut(before, outer)) {
+      throw new Error(NO_CUT_MESSAGE);
+    }
+    await trim(copy, curve, { closed: true, deleteInside: false });
+    inner = statsOf(scene, copy);
+    if (!surfaceCut(copyBefore, inner)) {
       throw new Error(NO_CUT_MESSAGE);
     }
     store.endStep();
@@ -311,9 +415,5 @@ export async function splitAlongPath(
     throw err;
   }
   const inside = app.adoptSceneMesh(store, copy, `${item.name} inside`);
-  return {
-    inside,
-    outsideTriangles: liveTriangleCount(scene.views(item.mesh).indices()),
-    insideTriangles: liveTriangleCount(scene.views(copy).indices()),
-  };
+  return { inside, outsideTriangles: outer.triangles, insideTriangles: inner.triangles };
 }

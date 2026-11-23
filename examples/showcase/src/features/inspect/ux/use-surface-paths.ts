@@ -7,10 +7,10 @@
 // stands the pick down and keeps the picks.
 import type { GeodesicMethod, MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
 import { formatLength } from "../../../shared/ux/units";
-import { closeSurfaceLoop, splitAlongPath, type TrimKeep, trimAlongPath } from "./surface-path-actions";
+import { closeSurfaceLoop, settleChanges, splitAlongPath, type TrimKeep, trimAlongPath } from "./surface-path-actions";
 import {
   canClose,
   clearedPicks,
@@ -38,6 +38,8 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
   );
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  /** A cut is running: its changes are its own (a failed one takes them back), so they clear no picks. */
+  const cutting = useRef(false);
 
   const item = items.find((i) => i.mesh === selection) ?? null;
   const target = item?.mesh ?? null;
@@ -66,7 +68,7 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     }
     return store.scene.onChanges((changes) => {
       const s = app.getSnapshot().surfacePath;
-      if (s.mesh !== mesh || !surfacePicksChanged(changes, mesh)) {
+      if (cutting.current || s.mesh !== mesh || !surfacePicksChanged(changes, mesh)) {
         return;
       }
       const removed = changes.some((c) => c.mesh === mesh && c.removed);
@@ -131,19 +133,33 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     void closeSurfaceLoop(app, store.scene);
   };
 
-  /** Runs a cut on the selected mesh's closed loop; the picks clear once its change lands. */
+  /**
+   * Runs a cut on the selected mesh's closed loop. A cut that lands used the
+   * picks up: they clear. One that fails left the mesh as it was: they stay,
+   * with the reason.
+   */
   const cut = async (work: () => Promise<string>) => {
-    if (busy || item === null) {
+    if (cutting.current || item === null) {
       return;
     }
+    const mesh = item.mesh;
+    cutting.current = true;
     setBusy(true);
     setStatus(null);
     app.setSurfacePath({ armed: null, error: null });
     try {
-      setStatus(await work());
+      const done = await work();
+      const s = app.getSnapshot().surfacePath;
+      if (s.mesh === mesh) {
+        app.setSurfacePath({ sources: [], path: null, error: null, isoLines: null });
+      }
+      setStatus(done);
     } catch (e) {
-      app.setSurfacePath({ error: e instanceof Error ? e.message : String(e) });
+      const text = e instanceof Error ? e.message : String(e);
+      await settleChanges(store, mesh); // the changes the failed cut took back go by before the picks react again
+      app.setSurfacePath({ error: text });
     } finally {
+      cutting.current = false;
       setBusy(false);
     }
   };
@@ -157,7 +173,7 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     const path = s.mesh === item.mesh ? s.path : null;
     return cut(async () => {
       const r = await trimAlongPath(store, item.mesh, path, keep);
-      return `Trimmed along the loop: kept the ${r.keep} (${r.triangles} triangles, ${r.removed} removed).`;
+      return `Trimmed along the loop: kept the ${r.keep} (${r.triangles} triangles).`;
     });
   };
 

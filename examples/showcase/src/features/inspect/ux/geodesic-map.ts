@@ -221,9 +221,10 @@ export function isoLineSegments(
     const a = indices[k];
     const b = indices[k + 1];
     const c = indices[k + 2];
-    if ((a === 0 && b === 0 && c === 0) || a >= nv || b >= nv || c >= nv) {
+    if (a >= nv || b >= nv || c >= nv) {
       continue;
     }
+    // (A dead slot names vertex 0 three times: one value, so no level passes it.)
     const va = values[a];
     const vb = values[b];
     const vc = values[c];
@@ -232,7 +233,7 @@ export function isoLineSegments(
     }
     const lo = Math.min(va, vb, vc);
     const hi = Math.max(va, vb, vc);
-    const first = Math.max(1, Math.floor(lo / spacing) + 1);
+    const first = Math.floor(lo / spacing) + 1; // past zero: distances are never negative
     const last = Math.ceil(hi / spacing) - 1;
     if (last < first) {
       continue;

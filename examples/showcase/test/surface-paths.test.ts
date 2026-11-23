@@ -2,10 +2,13 @@
 // picks snap to vertices in world coordinates, path taps start, extend and
 // close a path (queued in tap order, stale legs dropped), legs follow the
 // surface, the trim curve and the drawn segments, which scene changes clear
-// the picks, trim and split along a closed loop (one undo step each), and the
-// geodesic map's readouts, legend and iso-lines.
-import { init, type MeshChange, type MeshHandle, type RayHit, Scene, type SceneLike } from "fast-mesh-wasm";
+// the picks, trim and split along a closed loop (one undo step each, on a
+// local scene and a real Worker one, and refusing a loop that separates
+// nothing), and the geodesic map's readouts, legend and iso-lines.
+import { Worker } from "node:worker_threads";
+import { generatePrimitive, init, type MeshChange, type MeshHandle, type RayHit, Scene, type SceneLike } from "fast-mesh-wasm";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
+import { createWorkerScene, type WorkerLike } from "fast-mesh-wasm/worker";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AppState, type Item } from "../src/app/state/app-state";
 import { blobbySphere } from "../src/io/demo";
@@ -27,8 +30,11 @@ import {
   liveTriangleCount,
   NO_CUT_MESSAGE,
   queueSurfaceTap,
+  settleChanges,
   splitAlongPath,
+  surfaceCut,
   surfacePathIdle,
+  surfaceStats,
   trimAlongPath,
 } from "../src/features/inspect/ux/surface-path-actions";
 import {
@@ -121,7 +127,7 @@ function capDirections(polar = 0.7): V3[] {
 }
 
 /** The world area of a mesh's live triangles. */
-function area(scene: Scene, mesh: MeshHandle): number {
+function area(scene: Pick<SceneLike, "views" | "matrix4">, mesh: MeshHandle): number {
   const v = scene.views(mesh);
   const p = v.positions();
   const ix = v.indices();
@@ -471,7 +477,6 @@ describe("trim and split", () => {
 
     const inside = await trimAlongPath(store, item.mesh, path, "inside");
     expect(inside.keep).toBe("inside");
-    expect(inside.removed).toBeGreaterThan(0);
     const insideArea = area(scene, item.mesh);
     expect(insideArea).toBeLessThan(whole / 2);
     expect(inside.triangles).toBe(liveTriangleCount(scene.views(item.mesh).indices()));
@@ -495,24 +500,6 @@ describe("trim and split", () => {
     await expect(trimAlongPath(store, item.mesh, null, "inside")).rejects.toThrow(/Close the loop/);
     const open = startPath({ slot: 0, point: [0, 1, 0] });
     await expect(trimAlongPath(store, item.mesh, open, "inside")).rejects.toThrow(/Close the loop/);
-  });
-
-  it("a_loop_that_cuts_nothing_away_changes_nothing", async () => {
-    const { scene, store, app, item } = setup();
-    const path = await closedLoop(app, scene, item);
-    const calls: string[] = [];
-    const stub = {
-      scene: {
-        boolean: { trimByCurve: () => Promise.resolve({ kept: item.mesh, trianglesAdded: 4, trianglesRemoved: 0, verticesAdded: 2, seamEdges: 4 }) },
-        views: (m: MeshHandle) => scene.views(m),
-      },
-      beginStep: () => calls.push("begin"),
-      endStep: () => calls.push("end"),
-      cancelStep: () => calls.push("cancel"),
-    } as unknown as SceneStore;
-    await expect(trimAlongPath(stub, item.mesh, path, "inside")).rejects.toThrow(NO_CUT_MESSAGE);
-    expect(calls).toEqual(["begin", "cancel"]);
-    void store;
   });
 
   it("split_makes_two_meshes_as_one_undo_step", async () => {
@@ -561,6 +548,328 @@ describe("trim and split", () => {
     expect(meshes()).toBe(n);
     expect(app.getSnapshot().items).toHaveLength(1);
     expect(scene.canUndo()).toBe(false);
+  });
+});
+
+/** The SDK's Node worker-thread stand-in for the browser engine Worker. */
+class NodeWorker implements WorkerLike {
+  readonly worker = new Worker(new URL("../../../packages/fast-mesh-wasm/test/harness/node-worker.mjs", import.meta.url), {
+    workerData: { serve: true },
+  });
+  readonly #message: ((e: { data: unknown }) => void)[] = [];
+  readonly #error: ((e: unknown) => void)[] = [];
+
+  constructor() {
+    this.worker.on("message", (data: unknown) => {
+      for (const cb of this.#message) {
+        cb({ data });
+      }
+    });
+    this.worker.on("error", (e) => {
+      for (const cb of this.#error) {
+        cb(e);
+      }
+    });
+  }
+
+  postMessage(msg: unknown, transfer?: Transferable[]): void {
+    this.worker.postMessage(msg, transfer as never);
+  }
+
+  addEventListener(type: "message" | "error", cb: (e: never) => void): void {
+    (type === "message" ? this.#message : this.#error).push(cb as (e: unknown) => void);
+  }
+
+  terminate(): void {
+    void this.worker.terminate();
+  }
+}
+
+/** Frames until the Worker has answered everything sent (at once on a local scene). */
+async function settle(store: SceneStore): Promise<void> {
+  for (let k = 0; k < 2000; k++) {
+    store.commitFrame();
+    if (store.mode === "local") {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    if (store.getSnapshot().status !== "computing") {
+      store.commitFrame();
+      return;
+    }
+  }
+  throw new Error("the store did not settle");
+}
+
+/** A store over a local `Scene` or a real `WorkerScene`. */
+async function host(kind: "local" | "worker"): Promise<{ store: SceneStore; app: AppState }> {
+  if (kind === "local") {
+    const scene = new Scene();
+    const store = createSceneStore(scene);
+    cleanups.push(() => {
+      store.dispose();
+      scene.free();
+    });
+    return { store, app: new AppState() };
+  }
+  const scene = await createWorkerScene({ createWorker: () => new NodeWorker() });
+  const store = createSceneStore(scene);
+  cleanups.push(() => {
+    store.dispose();
+    scene.terminate();
+  });
+  return { store, app: new AppState() };
+}
+
+/** Adds a mesh whose local vertices are `positions` and waits until the engine has it. */
+async function listed(store: SceneStore, app: AppState, name: string, positions: Float64Array, indices: Uint32Array): Promise<Item> {
+  const item = app.addMesh(store, { name, positions, indices, center: [0, 0, 0], radius: 1.5, volumeId: null, preset: null });
+  await settle(store);
+  return item;
+}
+
+/** The vertex slots nearest to the given local points. */
+function nearestSlots(scene: SceneLike, mesh: MeshHandle, points: readonly V3[]): number[] {
+  const pos = scene.views(mesh).positions();
+  return points.map((p) => {
+    let best = -1;
+    let bestD = Infinity;
+    for (let i = 0; 3 * i < pos.length; i++) {
+      const d = (pos[3 * i] - p[0]) ** 2 + (pos[3 * i + 1] - p[1]) ** 2 + (pos[3 * i + 2] - p[2]) ** 2;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  });
+}
+
+/** A closed path through the vertices nearest to `points` (local coordinates), traced by the SDK. */
+async function loopThrough(
+  store: SceneStore,
+  mesh: MeshHandle,
+  points: readonly V3[],
+  method: "dijkstra" | "heatMethod",
+): Promise<SurfacePath> {
+  const scene = store.scene;
+  const m = scene.matrix4(mesh);
+  const pos = scene.views(mesh).positions();
+  const picks: SurfacePick[] = nearestSlots(scene, mesh, points).map((slot) => {
+    const [x, y, z] = [pos[3 * slot], pos[3 * slot + 1], pos[3 * slot + 2]];
+    return {
+      slot,
+      point: [
+        m[0] * x + m[4] * y + m[8] * z + m[12],
+        m[1] * x + m[5] * y + m[9] * z + m[13],
+        m[2] * x + m[6] * y + m[10] * z + m[14],
+      ],
+    };
+  });
+  let path = startPath(picks[0]);
+  for (let k = 1; k < picks.length; k++) {
+    path = extendPath(path, picks[k], await traceLeg(scene, mesh, picks[k - 1], picks[k], method));
+  }
+  return closePath(path, await traceLeg(scene, mesh, picks[picks.length - 1], picks[0], method));
+}
+
+/** A ring torus (major 1, minor 0.35, around y) and points once around its tube, off the mesh lines: that loop separates nothing. */
+function torus(segments = 48, tubeSegments = 24) {
+  const prim = generatePrimitive({ kind: "torus", majorRadius: 1, minorRadius: 0.35, segments, tubeSegments });
+  const wobble = [0, 0.3, 0, -0.3, 0.2];
+  const around = wobble.map((a, k): V3 => {
+    const t = (k * 2 * Math.PI) / wobble.length;
+    const r = 1 + 0.35 * Math.cos(t);
+    return [r * Math.cos(a), 0.35 * Math.sin(t), r * Math.sin(a)];
+  });
+  return { positions: Float64Array.from(prim.positions), indices: prim.indices, around };
+}
+
+/** The mesh's local geometry as the buffers hold it now, for comparing before and after. */
+function geometry(scene: SceneLike, mesh: MeshHandle) {
+  const v = scene.views(mesh);
+  return { triangles: liveTriangleCount(v.indices()), stats: surfaceStats(v.positions(), v.indices()) };
+}
+
+describe.each(["local", "worker"] as const)("trim and split on a %s scene", (kind) => {
+  it("trim_keeps_either_side_and_undoes_in_one_step", async () => {
+    const { store, app } = await host(kind);
+    const data = sphere();
+    const item = await listed(store, app, "Ball", data.positions, data.indices);
+    const path = await loopThrough(store, item.mesh, capDirections(), "heatMethod");
+    const whole = area(store.scene, item.mesh);
+
+    const inside = await trimAlongPath(store, item.mesh, path, "inside");
+    await settle(store);
+    const insideArea = area(store.scene, item.mesh);
+    expect(inside.triangles).toBe(geometry(store.scene, item.mesh).triangles);
+    expect(insideArea).toBeLessThan(whole / 2);
+    expect(store.getSnapshot().history.canUndo).toBe(true);
+    store.undo();
+    await settle(store);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+    expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 9);
+
+    await trimAlongPath(store, item.mesh, path, "outside");
+    await settle(store);
+    const outsideArea = area(store.scene, item.mesh);
+    expect(outsideArea).toBeGreaterThan(whole / 2);
+    expect(insideArea + outsideArea).toBeCloseTo(whole, 4);
+    store.undo();
+    await settle(store);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+  }, 60_000);
+
+  it("split_makes_two_meshes_in_one_step", async () => {
+    const { store, app } = await host(kind);
+    const data = sphere();
+    const item = await listed(store, app, "Ball", data.positions, data.indices);
+    const path = await loopThrough(store, item.mesh, capDirections(), "dijkstra");
+    const whole = area(store.scene, item.mesh);
+    const r = await splitAlongPath(store, app, item, path);
+    await settle(store);
+    expect(app.getSnapshot().items.map((i) => i.name)).toEqual(["Ball", "Ball inside"]);
+    const outer = area(store.scene, item.mesh);
+    const inner = area(store.scene, r.inside.mesh);
+    expect(inner).toBeLessThan(outer);
+    expect(inner + outer).toBeCloseTo(whole, 3);
+    expect(r.outsideTriangles).toBe(geometry(store.scene, item.mesh).triangles);
+    expect(r.insideTriangles).toBe(geometry(store.scene, r.inside.mesh).triangles);
+    store.undo();
+    await settle(store);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+    expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 9);
+    expect(geometry(store.scene, r.inside.mesh).triangles).toBe(0);
+    store.redo();
+    await settle(store);
+    expect(area(store.scene, r.inside.mesh)).toBeCloseTo(inner, 9);
+  }, 60_000);
+
+  it.each(["dijkstra", "heatMethod"] as const)("a_loop_that_separates_nothing_is_refused_and_taken_back_(%s)", async (method) => {
+    const { store, app } = await host(kind);
+    const t = torus();
+    const item = await listed(store, app, "Ring", t.positions, t.indices);
+    const path = await loopThrough(store, item.mesh, t.around, method);
+    const before = geometry(store.scene, item.mesh);
+    const meshes = store.getSnapshot().meshes.size;
+
+    for (const keep of ["inside", "outside"] as const) {
+      await expect(trimAlongPath(store, item.mesh, path, keep)).rejects.toThrow(NO_CUT_MESSAGE);
+      await settleChanges(store, item.mesh);
+      expect(geometry(store.scene, item.mesh)).toEqual(before);
+      expect(store.getSnapshot().history.canUndo).toBe(false);
+    }
+    await expect(splitAlongPath(store, app, item, path)).rejects.toThrow(NO_CUT_MESSAGE);
+    await settleChanges(store, item.mesh);
+    expect(geometry(store.scene, item.mesh)).toEqual(before);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+    // The copy split was filling is gone, and nothing was listed.
+    expect(store.getSnapshot().meshes.size).toBe(meshes);
+    expect(app.getSnapshot().items.map((i) => i.name)).toEqual(["Ring"]);
+  }, 60_000);
+});
+
+describe("cut or only imprinted", () => {
+  const flat = { triangles: 100, area: 10, reach: 1 };
+
+  it("fewer_triangles_or_lost_area_is_a_cut", () => {
+    expect(surfaceCut(flat, { ...flat, triangles: 99 })).toBe(true);
+    expect(surfaceCut(flat, { ...flat, triangles: 150, area: 9.9 })).toBe(true);
+    expect(surfaceCut(flat, { ...flat, triangles: 150 })).toBe(false);
+  });
+
+  it("area_rounding_is_not_and_the_floor_grows_with_the_coordinates'_reach", () => {
+    expect(surfaceCut(flat, { ...flat, triangles: 150, area: 10 * (1 - 5e-7) })).toBe(false);
+    expect(surfaceCut(flat, { ...flat, triangles: 150, area: 10 * (1 - 5e-6) })).toBe(true);
+    // Coordinates 700 extents from the origin round a hundred times coarser.
+    const far = { ...flat, reach: 700 };
+    expect(surfaceCut(far, { ...far, triangles: 150, area: 10 * (1 - 5e-6) })).toBe(false);
+    expect(surfaceCut(far, { ...far, triangles: 150, area: 10 * (1 - 1e-3) })).toBe(true);
+  });
+
+  it("stats_skip_dead_slots_and_measure_the_reach", () => {
+    // A unit right triangle 10 from the origin, and a dead slot.
+    const s = surfaceStats([10, 0, 0, 11, 0, 0, 10, 1, 0], [0, 1, 2, 0, 0, 0]);
+    expect(s.triangles).toBe(1);
+    expect(s.area).toBeCloseTo(0.5, 12);
+    expect(s.reach).toBeCloseTo(11, 12);
+    expect(surfaceStats([], [])).toEqual({ triangles: 0, area: 0, reach: 0 });
+  });
+
+  it("a_mesh_far_from_its_origin_keeps_an_imprint_apart_from_a_cut", async () => {
+    // f32 coordinates this far out move the area by about 1e-6 of it: an imprint must not read as a cut.
+    const { store, app } = await host("local");
+    const t = torus();
+    const off: V3 = [1000, 2000, -500];
+    const item = await listed(store, app, "Far", t.positions.map((x, i) => x + off[i % 3]), t.indices);
+    const around = t.around.map((p): V3 => [p[0] + off[0], p[1] + off[1], p[2] + off[2]]);
+    for (const method of ["dijkstra", "heatMethod"] as const) {
+      const path = await loopThrough(store, item.mesh, around, method);
+      await expect(trimAlongPath(store, item.mesh, path, "inside")).rejects.toThrow(NO_CUT_MESSAGE);
+    }
+  });
+
+  it("the_smallest_cut_a_mesh_can_have_is_still_a_cut", async () => {
+    for (const rings of [16, 64]) {
+      const { store, app } = await host("local");
+      const prim = generatePrimitive({ kind: "uvSphere", radius: 1, segments: 2 * rings, rings });
+      const item = await listed(store, app, "Ball", Float64Array.from(prim.positions), prim.indices);
+      const ix = store.scene.views(item.mesh).indices();
+      const t = Math.floor(ix.length / 6) + 3;
+      const before = geometry(store.scene, item.mesh);
+      // Around one triangle.
+      const corners = [0, 1, 2].map((k) => ix[3 * t + k]);
+      let path = startPath({ slot: corners[0], point: [0, 0, 0] });
+      for (const k of [1, 2]) {
+        path = extendPath(path, { slot: corners[k], point: [0, 0, 0] }, await traceLeg(store.scene, item.mesh, { slot: corners[k - 1], point: [0, 0, 0] }, { slot: corners[k], point: [0, 0, 0] }, "dijkstra"));
+      }
+      path = closePath(path, await traceLeg(store.scene, item.mesh, { slot: corners[2], point: [0, 0, 0] }, { slot: corners[0], point: [0, 0, 0] }, "dijkstra"));
+      const r = await trimAlongPath(store, item.mesh, path, "outside");
+      expect(r.triangles).toBe(before.triangles - 1);
+    }
+  });
+
+  it("an_open_sheet's_loop_near_the_border_splits_under_any_scale", async () => {
+    // The inside is most of the sheet (it is the side away from the border) and the imprint adds triangles, so
+    // it has no fewer than the whole sheet had: only the area tells the cut, and the copy's area is in world units.
+    for (const scale of [0.1, 1, 10]) {
+      const { store, app } = await host("local");
+      const sheet = generatePrimitive({ kind: "plane", size: 2, segments: 10 });
+      const item = await listed(store, app, "Sheet", Float64Array.from(sheet.positions), sheet.indices);
+      store.setPlacement(item.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0], scale: [scale, scale, scale] });
+      await settle(store);
+      const b = 0.9;
+      const before = geometry(store.scene, item.mesh);
+      const whole = area(store.scene, item.mesh);
+      const loop = await loopThrough(store, item.mesh, [[-b, 0, -b], [b, 0, -b], [b, 0, b], [-b, 0, b]], "heatMethod");
+      const r = await splitAlongPath(store, app, item, loop);
+      expect(r.insideTriangles).toBeGreaterThanOrEqual(before.triangles);
+      const inner = area(store.scene, r.inside.mesh);
+      expect(inner).toBeGreaterThan(0.5 * whole);
+      expect(inner + area(store.scene, item.mesh)).toBeCloseTo(whole, 2 + Math.round(-2 * Math.log10(scale)));
+    }
+  });
+
+  it("split_measures_each_side_in_its_own_units_under_a_scaled_placement", async () => {
+    // The copy is in world units, the mesh in its own: at scale 0.1 the copy's area is a hundredth.
+    for (const scale of [0.1, 10]) {
+      const { store, app } = await host("local");
+      const data = sphere();
+      const item = await listed(store, app, "Ball", data.positions, data.indices);
+      store.setPlacement(item.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0], scale: [scale, scale, scale] });
+      await settle(store);
+      const path = await loopThrough(store, item.mesh, capDirections(), "heatMethod");
+      const whole = area(store.scene, item.mesh);
+      const r = await splitAlongPath(store, app, item, path);
+      expect(area(store.scene, item.mesh) + area(store.scene, r.inside.mesh)).toBeCloseTo(whole, 2 + Math.round(-2 * Math.log10(scale)));
+      // And a loop that separates nothing is still refused there.
+      const t = torus();
+      const ring = await listed(store, app, "Ring", t.positions, t.indices);
+      store.setPlacement(ring.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0], scale: [scale, scale, scale] });
+      await settle(store);
+      const loop = await loopThrough(store, ring.mesh, t.around, "heatMethod");
+      await expect(splitAlongPath(store, app, ring, loop)).rejects.toThrow(NO_CUT_MESSAGE);
+    }
   });
 });
 
