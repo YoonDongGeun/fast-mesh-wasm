@@ -30,6 +30,7 @@ import {
 import { describeReport } from "../../mesh-repair/ux/repair-summary";
 import { fromDisplayLength, type LengthUnit } from "../../../shared/ux/units";
 import { computeLocalExtents } from "../../transform/ux/transform-math";
+import { localToWorld } from "./batch-boolean";
 
 /** One op's report line (or its error). */
 export interface ModelingReport {
@@ -158,7 +159,9 @@ export function useModelingOps(args: {
         if (simplifyUseRatio) {
           setSimplifyTarget(simplifyTargetFor(tris, simplifyRatio));
         }
-        setCutBounds(cutRangeAlong(computeLocalExtents(snap.positions, snap.indices), cutAxis));
+        // The cut plane is in the world, so its range is the mesh's there.
+        const world = localToWorld(store.scene.matrix4(activeItem.mesh), snap.positions);
+        setCutBounds(cutRangeAlong(computeLocalExtents(world, snap.indices), cutAxis));
       } catch {
         setLiveTris(activeItem.triangles);
       }

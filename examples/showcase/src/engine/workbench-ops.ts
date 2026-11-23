@@ -60,6 +60,7 @@ export type CutKeepSide = "+" | "-";
 export type OffsetModeAlgorithm = "auto" | OffsetAlgorithm;
 
 export interface LiveMeshSnapshot {
+  /** Local positions, relative to {@link origin}: see {@link originPositions} to add them as a mesh. */
   positions: Float64Array;
   indices: Uint32Array;
   colors?: Uint8Array;
@@ -213,6 +214,32 @@ function applyPlacementToStore(store: SceneStore, mesh: MeshHandle, placement: P
 }
 
 /**
+ * The snapshot's positions with its origin added, as `addMesh` takes them:
+ * added with that same origin, the new mesh has the local positions and
+ * origin of the one the snapshot is of, so one placement puts both in the
+ * same place.
+ */
+function originPositions(snap: LiveMeshSnapshot): Float64Array {
+  const out = new Float64Array(snap.positions.length);
+  for (let k = 0; k < out.length; k++) {
+    out[k] = snap.positions[k] + snap.origin[k % 3];
+  }
+  return out;
+}
+
+/** The loaded-mesh fields of a snapshot: its geometry around its origin, and its size. */
+function loadedFromSnapshot(snap: LiveMeshSnapshot): Pick<LoadedMesh, "positions" | "indices" | "center" | "radius"> {
+  return { positions: originPositions(snap), indices: snap.indices, center: snap.origin, radius: snap.radius };
+}
+
+/** Adds the mesh a snapshot is of to a scratch scene, where it is in its own (its origin, placement and scale). */
+function addSnapshot(scratch: Scene, snap: LiveMeshSnapshot): MeshHandle {
+  const mesh = scratch.addMesh(originPositions(snap), snap.indices, { origin: snap.origin });
+  scratch.setPlacement(mesh, snap.placement);
+  return mesh;
+}
+
+/**
  * Clones an existing mesh's live geometry, attributes, and placement as
  * `"<name> copy"`, in one undo step (undo removes the copy).
  */
@@ -220,12 +247,9 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
   const snap = extractLiveMeshData(store.scene, item.mesh);
   const loaded: LoadedMesh = {
     name: `${item.name} copy`,
-    positions: snap.positions,
-    indices: snap.indices,
+    ...loadedFromSnapshot(snap),
     ...(snap.colors ? { colors: snap.colors } : {}),
     ...(snap.uvs ? { uvs: snap.uvs } : {}),
-    center: [0, 0, 0],
-    radius: snap.radius,
     volumeId: item.volumeId,
     preset: item.preset,
   };
@@ -426,12 +450,9 @@ export async function runBooleanCsg(params: {
           store,
           {
             name: `${target.name} ${label} ${source.name}`,
-            positions: snap.positions,
-            indices: snap.indices,
+            ...loadedFromSnapshot(snap),
             ...(snap.colors ? { colors: snap.colors } : {}),
             ...(snap.uvs ? { uvs: snap.uvs } : {}),
-            center: [0, 0, 0],
-            radius: snap.radius,
             volumeId: null,
             preset: null,
           },
@@ -463,21 +484,8 @@ export async function runBooleanCsg(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpTarget = tmp.addMesh(targetSnap.positions, targetSnap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpTarget, {
-      rotation: [...targetSnap.placement.rotation],
-      translation: [...targetSnap.placement.translation],
-    });
-    const tmpSource =
-      source.mesh === target.mesh
-        ? tmpTarget
-        : tmp.addMesh(sourceSnap.positions, sourceSnap.indices, { origin: [0, 0, 0] });
-    if (tmpSource !== tmpTarget) {
-      tmp.setPlacement(tmpSource, {
-        rotation: [...sourceSnap.placement.rotation],
-        translation: [...sourceSnap.placement.translation],
-      });
-    }
+    const tmpTarget = addSnapshot(tmp, targetSnap);
+    const tmpSource = source.mesh === target.mesh ? tmpTarget : addSnapshot(tmp, sourceSnap);
     const outHandle = tmp.boolean(tmpTarget, tmpSource, op);
     const outSnap = extractLiveMeshData(tmp, outHandle);
 
@@ -487,10 +495,7 @@ export async function runBooleanCsg(params: {
           store,
           {
             name: `${target.name} ${label} ${source.name}`,
-            positions: outSnap.positions,
-            indices: outSnap.indices,
-            center: [0, 0, 0],
-            radius: outSnap.radius,
+            ...loadedFromSnapshot(outSnap),
             volumeId: null,
             preset: null,
           },
@@ -707,11 +712,7 @@ export async function runPlaneCut(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpMesh = tmp.addMesh(snap.positions, snap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpMesh, {
-      rotation: [...snap.placement.rotation],
-      translation: [...snap.placement.translation],
-    });
+    const tmpMesh = addSnapshot(tmp, snap);
     const report = tmp.boolean.cut(tmpMesh, plane, { cap });
     const outSnap = extractLiveMeshData(tmp, report.kept);
     await replaceMeshGeometryLocal(store, mesh, outSnap.positions, outSnap.indices);
@@ -1345,11 +1346,7 @@ export async function applySurfaceField(params: {
   const { Scene } = await import("fast-mesh-wasm");
   const tmp = new Scene();
   try {
-    const tmpMesh = tmp.addMesh(snap.positions, snap.indices, { origin: [0, 0, 0] });
-    tmp.setPlacement(tmpMesh, {
-      rotation: [...snap.placement.rotation],
-      translation: [...snap.placement.translation],
-    });
+    const tmpMesh = addSnapshot(tmp, snap);
     const field =
       state.mode === "thickness"
         ? tmp.inspect.addThicknessField({ name: "inspect:thickness", on: tmpMesh, maxDistance: maxDist })
