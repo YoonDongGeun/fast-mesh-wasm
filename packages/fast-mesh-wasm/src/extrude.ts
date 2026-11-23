@@ -93,8 +93,8 @@ export interface ExtrudeBaseResult {
   /** Whether a cap's refinement stopped at its vertex budget. */
   capped: boolean;
   /**
-   * Whether the surface was turned around: it faced the way the walls run, so
-   * the solid would have been inside out.
+   * Whether a surface was turned around: it faced the way the walls run, so
+   * its solid would have been inside out.
    */
   flipped: boolean;
   /**

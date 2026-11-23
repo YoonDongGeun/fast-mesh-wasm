@@ -8,8 +8,8 @@ use super::{to_f32, unit};
 use crate::fill_dp::{triangulate_flat_loop, triangulate_with_islands};
 use crate::refine::refine;
 use crate::topology::{
-    BoundaryLoop, EdgeMap, LoopId, VertexFans, components, cross, dot, loops_with, point,
-    proper_triangle, sub,
+    BoundaryLoop, EdgeMap, LoopId, UnionFind, VertexFans, components, cross, dot, loops_with,
+    point, proper_triangle, sub,
 };
 use crate::{OpsError, Result, filled, push, reserve};
 
@@ -109,9 +109,9 @@ pub struct ExtrudeBaseReport {
     pub cap_triangles: usize,
     /// Whether a cap's refinement stopped at its vertex budget.
     pub capped: bool,
-    /// Whether the surfaces were turned around: the solid came out wound
-    /// inward (the surface faced the way the walls go), so every triangle
-    /// of the extruded surfaces and the new ones was reversed.
+    /// Whether a surface was turned around: its solid would have been inside
+    /// out (it faced the way the walls go), so every triangle of the surface
+    /// and its walls and cap was reversed.
     pub flipped: bool,
     /// The triangles of every pair that touches, crosses or folds flat after
     /// the extrusion with a wall or cap among them (see the
@@ -127,7 +127,7 @@ pub struct ExtrudeBaseReport {
 /// [`level`](ExtrudeBaseOptions::level), joins the loop to its copy on the
 /// plane with a wall of two triangles per edge, and closes the copy with a
 /// flat cap. An open surface whose only boundary is the loop becomes a
-/// closed solid. A solid that came out wound inward is reversed, surfaces
+/// closed solid. A solid that would be inside out is turned around, surface
 /// included, so it faces outward ([`ExtrudeBaseReport::flipped`]).
 ///
 /// The base vertices take their loop vertex's channel values (UVs
@@ -177,13 +177,12 @@ struct Plan {
     added: Vec<[f32; 3]>,
     base_parents: Vec<VertexId>,
     cap_parents: Vec<[(VertexId, f32); 3]>,
-    /// Walls, then caps, over planned ids, wound as before any flip.
+    /// Walls, then caps, over planned ids.
     triangles: Vec<[VertexId; 3]>,
     walls: usize,
     capped: bool,
-    /// Existing triangles to reverse, when the solid is flipped.
+    /// Existing triangles to reverse, when a solid is turned around.
     reverse: Vec<TriangleId>,
-    flipped: bool,
     found: Option<Found>,
 }
 
@@ -533,58 +532,15 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
         groups.resize(triangles.len(), outer as u32);
     }
 
-    // Which way the solid faces: the signed volume of the surfaces the loops
-    // bound plus the walls and caps, about the base's centre.
-    let components = components(mesh, &edges)?;
-    let mut component_of = filled(mesh.triangle_slots(), NONE)?;
-    for (c, comp) in components.iter().enumerate() {
-        for &t in &comp.triangles {
-            component_of[t as usize] = c as u32;
-        }
-    }
-    let mut extruded = filled(components.len(), false)?;
-    for l in &picked {
-        let t = edges.triangles(l.vertices[0], l.vertices[1])[0];
-        extruded[component_of[t as usize] as usize] = true;
-    }
-    let base_count = base_parents.len();
-    let mut centre = [0.0f64; 3];
-    for q in &added[..base_count] {
-        for k in 0..3 {
-            centre[k] += f64::from(q[k]) / base_count as f64;
-        }
-    }
-    let at = |v: VertexId| -> [f64; 3] {
-        let q = if v as usize >= slots {
-            added[v as usize - slots].map(f64::from)
-        } else {
-            point(mesh, v)
-        };
-        sub(q, centre)
-    };
-    let volume6 = |[a, b, c]: [VertexId; 3]| dot(at(a), cross(at(b), at(c)));
-    let mut volume = 0.0;
-    for (c, comp) in components.iter().enumerate() {
-        if extruded[c] {
-            volume += comp
-                .triangles
-                .iter()
-                .map(|&t| volume6(mesh.triangles()[t as usize]))
-                .sum::<f64>();
-        }
-    }
-    volume += triangles.iter().map(|&t| volume6(t)).sum::<f64>();
-    let flipped = volume < 0.0;
-    let mut reverse: Vec<TriangleId> = Vec::new();
-    if flipped {
-        for (c, comp) in components.iter().enumerate() {
-            if extruded[c] {
-                reserve(&mut reverse, comp.triangles.len())?;
-                reverse.extend_from_slice(&comp.triangles);
-            }
-        }
-    }
-
+    let reverse = face_outward(
+        mesh,
+        &edges,
+        &picked,
+        &added,
+        base_parents.len(),
+        &groups,
+        &mut triangles,
+    )?;
     let found = if o.check_self_intersections {
         Some(intersections(&Planned {
             mesh,
@@ -611,9 +567,91 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
         walls,
         capped,
         reverse,
-        flipped,
         found,
     })
+}
+
+/// Turns every solid that would be inside out around: reverses its planned
+/// `triangles` and returns the existing ones to reverse. `groups` holds the
+/// outer loop of each planned triangle's outline, an index into `picked`.
+///
+/// A solid is the components its caps join. Its signed volume is taken about
+/// the middle of the `base_count` base vertices, so that a hole left open in
+/// the surface hardly matters.
+fn face_outward(
+    mesh: &Mesh,
+    edges: &EdgeMap,
+    picked: &[&BoundaryLoop],
+    added: &[[f32; 3]],
+    base_count: usize,
+    groups: &[u32],
+    triangles: &mut [[VertexId; 3]],
+) -> Result<Vec<TriangleId>> {
+    let slots = mesh.vertex_slots();
+    let components = components(mesh, edges)?;
+    let mut component_of = filled(mesh.triangle_slots(), NONE)?;
+    for (c, comp) in components.iter().enumerate() {
+        for &t in &comp.triangles {
+            component_of[t as usize] = c as u32;
+        }
+    }
+    let mut loop_component: Vec<u32> = Vec::new();
+    reserve(&mut loop_component, picked.len())?;
+    loop_component.extend(picked.iter().map(|l| {
+        let t = edges.triangles(l.vertices[0], l.vertices[1])[0];
+        component_of[t as usize]
+    }));
+    // Walls come first, two per loop edge, so each loop's group is its first
+    // wall's.
+    let mut solids = UnionFind::new();
+    solids.reset(components.len())?;
+    let mut first_wall = 0;
+    for (l, &c) in picked.iter().zip(&loop_component) {
+        solids.union(c, loop_component[groups[first_wall] as usize]);
+        first_wall += 2 * l.vertices.len();
+    }
+
+    let mut centre = [0.0f64; 3];
+    for q in &added[..base_count] {
+        for k in 0..3 {
+            centre[k] += f64::from(q[k]) / base_count as f64;
+        }
+    }
+    let at = |v: VertexId| {
+        let q = match (v as usize).checked_sub(slots) {
+            Some(i) => added[i].map(f64::from),
+            None => point(mesh, v),
+        };
+        sub(q, centre)
+    };
+    let volume = |[a, b, c]: [VertexId; 3]| dot(at(a), cross(at(b), at(c)));
+    let mut volumes = filled(components.len(), 0.0f64)?;
+    let mut extruded = filled(components.len(), false)?;
+    for &c in &loop_component {
+        extruded[c as usize] = true;
+    }
+    for (c, comp) in components.iter().enumerate() {
+        if extruded[c] {
+            let tris = comp.triangles.iter().map(|&t| mesh.triangles()[t as usize]);
+            volumes[solids.find(c as u32) as usize] += tris.map(volume).sum::<f64>();
+        }
+    }
+    for (t, &g) in triangles.iter().zip(groups) {
+        volumes[solids.find(loop_component[g as usize]) as usize] += volume(*t);
+    }
+    let mut reverse: Vec<TriangleId> = Vec::new();
+    for (c, comp) in components.iter().enumerate() {
+        if extruded[c] && volumes[solids.find(c as u32) as usize] < 0.0 {
+            reserve(&mut reverse, comp.triangles.len())?;
+            reverse.extend_from_slice(&comp.triangles);
+        }
+    }
+    for (t, &g) in triangles.iter_mut().zip(groups) {
+        if volumes[solids.find(loop_component[g as usize]) as usize] < 0.0 {
+            t.swap(1, 2);
+        }
+    }
+    Ok(reverse)
 }
 
 impl Plan {
@@ -654,17 +692,14 @@ impl Plan {
                 v
             }
         };
-        let flip = |[a, b, c]: [VertexId; 3]| if self.flipped { [a, c, b] } else { [a, b, c] };
-        tris.extend(self.triangles.iter().map(|t| flip(t.map(real))));
+        tris.extend(self.triangles.iter().map(|t| t.map(real)));
         let added = tx.add_triangles(&tris)?;
-        if self.flipped {
-            let old = tx.mesh().triangles();
-            reversed.extend(self.reverse.iter().map(|&t| {
-                let [a, b, c] = old[t as usize];
-                [a, c, b]
-            }));
-            tx.set_triangles(&self.reverse, &reversed)?;
-        }
+        let old = tx.mesh().triangles();
+        reversed.extend(self.reverse.iter().map(|&t| {
+            let [a, b, c] = old[t as usize];
+            [a, c, b]
+        }));
+        tx.set_triangles(&self.reverse, &reversed)?;
         let self_intersections = self.found.as_ref().map(|found| {
             found.write_final(&added, &mut crossing);
             crossing
@@ -677,7 +712,7 @@ impl Plan {
             wall_triangles: self.walls,
             cap_triangles: self.triangles.len() - self.walls,
             capped: self.capped,
-            flipped: self.flipped,
+            flipped: !self.reverse.is_empty(),
             self_intersections,
         })
     }

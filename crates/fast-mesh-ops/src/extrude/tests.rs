@@ -924,8 +924,18 @@ fn several_sheets_each_get_a_base() {
     };
     let r = base_checked(&mut mesh, &options, "sheets");
     assert_eq!(r.loops.len(), 2);
+    assert!(!r.flipped);
     assert_closed(&mesh, "sheets");
     assert!((volume(&mesh) - 9.0 * (1.0 + 2.0)).abs() < 1e-4);
+
+    // Each solid is turned outward on its own.
+    let all: Vec<TriangleId> = (0..18).collect();
+    let mut mesh = combine(&[&flip(&grid(3), &all), &shifted]);
+    let r = base_checked(&mut mesh, &options, "facing apart");
+    assert!(r.flipped);
+    assert_closed(&mesh, "facing apart");
+    assert!((volume(&mesh) - 9.0 * (1.0 + 2.0)).abs() < 1e-4);
+    assert!(normal_of(&mesh, 0)[2] > 0.0 && normal_of(&mesh, 18)[2] > 0.0);
 }
 
 #[test]
