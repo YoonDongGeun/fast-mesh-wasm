@@ -1,8 +1,6 @@
 //! The self-intersection check of a planned extrusion, run before writing.
 
-use std::ops::Range;
-
-use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, NodeKind};
+use fast_mesh_bvh::{Aabb, BuildOptions, Bvh};
 use fast_mesh_query::self_intersecting_pairs_where;
 use fast_mesh_store::{Mesh, TriangleId, VertexId};
 use robust::{Coord, orient2d};
@@ -10,7 +8,11 @@ use robust::{Coord, orient2d};
 use crate::topology::{dot, proper_triangle, sub};
 use crate::{Result, filled, push, reserve};
 
-const NONE: u32 = u32::MAX;
+/// A planned triangle's group when it has none.
+pub(crate) const NO_GROUP: u32 = u32::MAX;
+
+/// Cells per axis of the grid that finds the triangles near the planned ones.
+const GRID: usize = 64;
 
 /// Two triangles on one edge count as folded onto each other when the angle
 /// between them has a cosine above this: less than about 1e-3 radians.
@@ -32,9 +34,10 @@ pub(crate) struct Planned<'a> {
     /// Existing triangles that `triangles` replace, ascending: left out of
     /// the check, since they will not exist as they are.
     pub(crate) replaced: &'a [TriangleId],
-    /// Ranges of `triangles` that each tile a planar polygon, so that the
-    /// triangles of one range need no check among themselves.
-    pub(crate) tiles: &'a [Range<usize>],
+    /// The group of each of `triangles`, or [`NO_GROUP`]. Triangles of one
+    /// group do not move relative to each other, or tile a planar polygon,
+    /// so they get no new intersections among themselves.
+    pub(crate) groups: &'a [u32],
 }
 
 /// What [`intersections`] found: the planned triangles (indices into
@@ -83,7 +86,7 @@ impl Found {
 ///   [`FOLD_COS`]), which that test leaves out: a wall pushed straight back
 ///   along the face next to it, say.
 ///
-/// Pairs within one of [`Planned::tiles`] are left out.
+/// Pairs within one of [`Planned::groups`] are left out.
 ///
 /// The search runs on a mesh of the planned triangles and the existing ones
 /// whose boxes touch one of theirs, so past one scan of the mesh's triangle
@@ -116,15 +119,12 @@ pub(crate) fn intersections(p: &Planned) -> Result<Found> {
     reserve(&mut triangles, ours + near.len())?;
     triangles.extend_from_slice(p.triangles);
     triangles.extend(near.iter().map(|&t| mesh.triangles()[t as usize]));
-    let mut tile = filled(ours, NONE)?;
-    for (i, range) in p.tiles.iter().enumerate() {
-        tile[range.clone()].fill(i as u32);
-    }
+    debug_assert_eq!(p.groups.len(), ours);
     let keep = |a: TriangleId, b: TriangleId| {
-        let of = |t: TriangleId| tile.get(t as usize).copied();
-        match (of(a), of(b)) {
+        let group = |t: TriangleId| p.groups.get(t as usize);
+        match (group(a), group(b)) {
             (None, None) => false,
-            (Some(x), Some(y)) => x == NONE || x != y,
+            (Some(x), Some(y)) => x != y || *x == NO_GROUP,
             _ => true,
         }
     };
@@ -168,17 +168,51 @@ fn local_mesh(
     Ok(Mesh::from_buffers(&flat, &index)?)
 }
 
-/// The existing triangles, not replaced, whose box touches the box of a
-/// planned one, ascending.
+/// The existing triangles, not replaced, whose box may touch the box of a
+/// planned one, ascending: those whose box reaches a cell of a coarse grid
+/// that a planned box reaches too.
 fn near(p: &Planned, position: impl Fn(VertexId) -> [f32; 3]) -> Result<Vec<TriangleId>> {
-    let planned = local_mesh(p.triangles, position)?;
-    let bvh = Bvh::build(&planned, &BuildOptions::default())?;
+    let bounds_of = |tri: [VertexId; 3]| {
+        let mut b = Aabb::EMPTY;
+        for v in tri {
+            b.grow_point(position(v));
+        }
+        b
+    };
+    let mut reach = Aabb::EMPTY;
+    for &tri in p.triangles {
+        reach.grow(&bounds_of(tri));
+    }
+    // Never decreasing along an axis, so boxes that share a point share a cell.
+    let scale: [f64; 3] = std::array::from_fn(|k| {
+        let extent = f64::from(reach.max[k]) - f64::from(reach.min[k]);
+        if extent > 0.0 {
+            GRID as f64 / extent
+        } else {
+            0.0
+        }
+    });
+    let cell = |x: f32, k: usize| {
+        let c = (f64::from(x) - f64::from(reach.min[k])) * scale[k];
+        (c.max(0.0) as usize).min(GRID - 1)
+    };
+    // One bit per cell along x; a row per `(y, z)`.
+    let rows = |b: &Aabb| {
+        let [x0, y0, z0] = [0, 1, 2].map(|k| cell(b.min[k], k));
+        let [x1, y1, z1] = [0, 1, 2].map(|k| cell(b.max[k], k));
+        let bits = (u64::MAX << x0) & (u64::MAX >> (GRID - 1 - x1));
+        let rows = (z0..=z1).flat_map(move |z| (y0..=y1).map(move |y| z * GRID + y));
+        (bits, rows)
+    };
+    let mut grid = filled(GRID * GRID, 0u64)?;
+    for &tri in p.triangles {
+        let (bits, rows) = rows(&bounds_of(tri));
+        for row in rows {
+            grid[row] |= bits;
+        }
+    }
     let mesh = p.mesh;
     let mut near: Vec<TriangleId> = Vec::new();
-    let Some(root) = bvh.root() else {
-        return Ok(near);
-    };
-    let reach = bvh.node(root).bounds;
     let mut replaced = p.replaced.iter().copied().peekable();
     for t in 0..mesh.triangle_slots() as TriangleId {
         if replaced.next_if_eq(&t).is_some() {
@@ -191,20 +225,8 @@ fn near(p: &Planned, position: impl Fn(VertexId) -> [f32; 3]) -> Result<Vec<Tria
         if !reach.overlaps(&bounds) {
             continue;
         }
-        let mut hit = false;
-        bvh.traverse(|_, node| {
-            if hit || !node.bounds.overlaps(&bounds) {
-                return false;
-            }
-            if let NodeKind::Leaf { triangles } = node.kind {
-                hit = triangles.iter().any(|&x| {
-                    Aabb::of_triangle(planned.positions(), planned.triangles()[x as usize])
-                        .overlaps(&bounds)
-                });
-            }
-            true
-        });
-        if hit {
+        let (bits, mut rows) = rows(&bounds);
+        if rows.any(|row| grid[row] & bits != 0) {
             push(&mut near, t)?;
         }
     }

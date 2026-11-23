@@ -3,7 +3,7 @@
 
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
-use super::check::{Found, Planned, intersections};
+use super::check::{Found, NO_GROUP, Planned, intersections};
 use super::{IDENTITY, apply, cofactor, inverse, to_f32, unit};
 use crate::topology::{UnionFind, cross, dot, point, proper_triangle, sub};
 use crate::{OpsError, Result, filled, push, reserve};
@@ -477,13 +477,21 @@ fn plan(mesh: &Mesh, triangles: &[TriangleId], o: &ExtrudeFacesOptions) -> Resul
         reserve(&mut planned, caps.len() + walls.len())?;
         planned.extend_from_slice(&caps);
         planned.extend_from_slice(&walls);
+        // What moves as one piece keeps its places: a region, or everything
+        // along one direction.
+        let mut groups = filled(planned.len(), NO_GROUP)?;
+        match o.direction {
+            ExtrudeDirection::RegionNormal => groups[..n].copy_from_slice(&region),
+            ExtrudeDirection::Fixed(_) => groups[..n].fill(0),
+            ExtrudeDirection::VertexNormals => {}
+        }
         Some(intersections(&Planned {
             mesh,
             moved: &moved,
             added: &added,
             triangles: &planned,
             replaced: &sel,
-            tiles: &[],
+            groups: &groups,
         })?)
     } else {
         None

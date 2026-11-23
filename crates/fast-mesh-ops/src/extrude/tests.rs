@@ -534,13 +534,22 @@ fn self_intersections_are_reported_and_written() {
         None
     );
 
-    // An intersection that was there before and is left alone is not listed.
+    // An intersection that was there before is not listed: left alone, or
+    // with both sides moving as one.
     let mut mesh = combine(&[
         &box_mesh([0.0; 3], [2.0; 3]),
         &box_mesh([1.0; 3], [3.0; 3]),
         &box_mesh([10.0; 3], [11.0; 3]),
     ]);
     let r = extrude_checked(&mut mesh, &[34, 35], &out_by(0.5), "elsewhere");
+    assert_eq!(r.self_intersections, Some(vec![]));
+    let options = ExtrudeFacesOptions {
+        direction: ExtrudeDirection::Fixed([0.0, 1.0, 0.0]),
+        ..out_by(0.5)
+    };
+    let crossed: Vec<TriangleId> = (0..24).collect();
+    let r = extrude(&mut mesh, &crossed, &options);
+    assert_eq!((r.regions, r.added_vertices), (2, 0));
     assert_eq!(r.self_intersections, Some(vec![]));
 }
 

@@ -515,7 +515,7 @@ mod tests {
         let bvh = build(&mesh, Quality::Sah);
         let mut all = Vec::new();
         self_intersecting_pairs(&mesh, &bvh, &mut all).unwrap();
-        let some = |a: TriangleId, b: TriangleId| a % 3 == 0 || b % 3 == 0;
+        let some = |a: TriangleId, b: TriangleId| a < 5 || b < 5;
         let want: Vec<_> = all.iter().copied().filter(|&(a, b)| some(a, b)).collect();
         assert!(!want.is_empty() && want.len() < all.len());
         let mut got = vec![(7, 7)];

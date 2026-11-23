@@ -22,9 +22,9 @@
 //! triangles sharing an edge that fold flat onto each other (within about
 //! 1e-3 radians), such as a wall pushed straight back along the face next to
 //! it. Their triangles are reported (`self_intersections`) and the result is
-//! written all the same. Pairs the operation leaves alone are not listed,
-//! and triangles that share just one vertex are not tested against each
-//! other. The check looks only at the triangles near the changed ones, so
+//! written all the same. Pairs that keep their places relative to each other
+//! are not listed, and triangles that share just one vertex are not tested
+//! against each other. The check looks only at the triangles near the changed ones, so
 //! past one scan of the mesh its cost follows the size of the change.
 //!
 //! UVs: new vertices take their parent vertex's values (the wall's rim

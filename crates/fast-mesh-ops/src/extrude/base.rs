@@ -1,11 +1,9 @@
 //! [`extrude_base`]: boundary loops run along a direction to a plane and
 //! capped there.
 
-use std::ops::Range;
-
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
-use super::check::{Found, Planned, intersections};
+use super::check::{Found, NO_GROUP, Planned, intersections};
 use super::{to_f32, unit};
 use crate::fill_dp::{triangulate_flat_loop, triangulate_with_islands};
 use crate::refine::refine;
@@ -425,7 +423,7 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
 
     let budget = if o.refine { CAP_VERTEX_BUDGET } else { 0 };
     let mut capped = false;
-    let mut caps: Vec<Range<usize>> = Vec::new();
+    let mut groups = filled(walls, NO_GROUP)?;
     let mut cap_parents: Vec<[(VertexId, f32); 3]> = Vec::new();
     // A scratch base vertex's planned id.
     let mut planned_base = filled(flat.len() / 3, NONE)?;
@@ -519,9 +517,9 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
             cap_parents.push(parents.map(|(x, wt)| (planned(x), wt)));
         }
         reserve(&mut triangles, patch.triangles.len())?;
-        let first = triangles.len();
         triangles.extend(patch.triangles.iter().map(|t| t.map(planned)));
-        push(&mut caps, first..triangles.len())?;
+        reserve(&mut groups, patch.triangles.len())?;
+        groups.resize(triangles.len(), outer as u32);
     }
 
     // Which way the solid faces: the signed volume of the surfaces the loops
@@ -583,7 +581,7 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
             added: &added,
             triangles: &triangles,
             replaced: &[],
-            tiles: &caps,
+            groups: &groups,
         })?)
     } else {
         None
