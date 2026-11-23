@@ -95,6 +95,16 @@ export const GEODESIC_METHODS: readonly { method: GeodesicMethod; label: string;
   },
 ];
 
+/** From this many triangles on, the accurate method takes tens of seconds a map or leg, and the panel says so. */
+export const SLOW_METHOD_TRIANGLES = 300_000;
+
+/** The note the panel shows for a method that is slow on a mesh of `triangles`, or `null`. */
+export function slowMethodNote(method: GeodesicMethod, triangles: number): string | null {
+  return method === "heatMethod" && triangles >= SLOW_METHOD_TRIANGLES
+    ? `Accurate takes a while on ${triangles} triangles: tens of seconds for each map or path leg.`
+    : null;
+}
+
 /** A method's label in the readouts. */
 export function methodLabel(method: GeodesicMethod): string {
   return method === "heatMethod" ? "heat method" : "edge graph";

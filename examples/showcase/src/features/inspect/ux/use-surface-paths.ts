@@ -9,12 +9,10 @@ import type { GeodesicMethod, MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
-import { formatLength } from "../../../shared/ux/units";
 import { closeSurfaceLoop, settleChanges, splitAlongPath, type TrimKeep, trimAlongPath } from "./surface-path-actions";
 import {
   canClose,
   clearedPicks,
-  pathLength,
   surfacePicksChanged,
   type SurfacePickMode,
   undoPathPoint,
@@ -23,7 +21,6 @@ import {
 export function useSurfacePaths(app: AppState, items: readonly Item[], selection: MeshHandle | null) {
   const store = useScene();
   const tool = useApp(app, (s) => s.surfacePath);
-  const units = useApp(app, (s) => s.units);
   const otherToolArmed = useApp(
     app,
     (s) =>
@@ -100,9 +97,6 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     app.setSurfacePath({ ...base, mesh: target, armed: mode, error: null });
     setStatus(null);
   };
-
-  /** Stops taking taps (the picks stay). */
-  const disarm = () => app.setSurfacePath({ armed: null });
 
   const setMethod = (method: GeodesicMethod) => app.setSurfacePath({ method });
 
@@ -209,10 +203,7 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     locked,
     canClose: canClose(path),
     canCut: closed && !busy && !locked && tool.tracing === 0,
-    length: pathLength(path),
-    lengthText: path === null || path.legs.length === 0 ? null : formatLength(pathLength(path), units),
     arm,
-    disarm,
     setMethod,
     undoSource,
     clearSources,
@@ -223,6 +214,3 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     split,
   };
 }
-
-/** What `useSurfacePaths` gives the panel. */
-export type SurfacePathsState = ReturnType<typeof useSurfacePaths>;

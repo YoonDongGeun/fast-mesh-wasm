@@ -28,7 +28,6 @@ import {
   closeSurfaceLoop,
   landSurfacePick,
   compactPart,
-  liveTriangleCount,
   NO_CUT_MESSAGE,
   partsOf,
   queueSurfaceTap,
@@ -55,6 +54,7 @@ import {
   pathTapAction,
   pickFromHit,
   polylineLength,
+  slowMethodNote,
   startPath,
   type SurfacePath,
   type SurfacePick,
@@ -76,6 +76,17 @@ afterEach(() => {
 });
 
 type V3 = [number, number, number];
+
+/** The triangles an index buffer holds, dead slots (`0, 0, 0`) left out. */
+function liveTriangleCount(indices: ArrayLike<number>): number {
+  let n = 0;
+  for (let k = 0; k + 2 < indices.length; k += 3) {
+    if (indices[k] !== 0 || indices[k + 1] !== 0 || indices[k + 2] !== 0) {
+      n++;
+    }
+  }
+  return n;
+}
 
 /** A unit UV sphere around `c` (32 segments, 16 rings): 482 vertices, 960 triangles. */
 function sphere(c: V3 = [0, 0, 0], radius = 1) {
@@ -202,6 +213,12 @@ describe("picks", () => {
     expect(pick.point[0]).toBeCloseTo(10, 5);
     expect(pick.point[1]).toBeCloseTo(1, 5);
     void store;
+  });
+
+  it("the_slow_method_is_announced_on_large_meshes_only", () => {
+    expect(slowMethodNote("heatMethod", 299_999)).toBeNull();
+    expect(slowMethodNote("heatMethod", 1_046_528)).toContain("1046528 triangles");
+    expect(slowMethodNote("dijkstra", 5_000_000)).toBeNull();
   });
 
   it("a_source_is_added_once", () => {

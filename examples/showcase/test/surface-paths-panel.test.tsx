@@ -38,7 +38,6 @@ import { SurfacePathLayer } from "../src/features/inspect/ui/SurfacePathLayer";
 import { autoIsoSpacing } from "../src/features/inspect/ux/geodesic-map";
 import { inspectMapProbe } from "../src/features/inspect/ux/use-inspect-maps";
 import {
-  liveTriangleCount,
   NO_CUT_MESSAGE,
   queueSurfaceTap,
   surfacePathIdle,
@@ -76,6 +75,17 @@ afterEach(() => {
 });
 
 type V3 = [number, number, number];
+
+/** The triangles an index buffer holds, dead slots (`0, 0, 0`) left out. */
+function liveTriangleCount(indices: ArrayLike<number>): number {
+  let n = 0;
+  for (let k = 0; k + 2 < indices.length; k += 3) {
+    if (indices[k] !== 0 || indices[k + 1] !== 0 || indices[k + 2] !== 0) {
+      n++;
+    }
+  }
+  return n;
+}
 
 function addMesh(store: SceneStore, app: AppState, name: string, positions: Float64Array, indices: Uint32Array): Item {
   return app.addMesh(store, { name, positions, indices, center: [0, 0, 0], radius: 1, volumeId: null, preset: null });
@@ -696,6 +706,20 @@ describe("surface path section (#252)", () => {
     looping = false;
     await loop;
   }, 60_000);
+
+  it("says when the accurate method is slow on the selected mesh", async () => {
+    const { scene, store, app, item } = setup();
+    const host = mount(app, store, scene);
+    expect(host.querySelector("[data-geodesic-slow]")).toBeNull();
+    await click(q(host, '[data-geodesic-method="heatMethod"]'));
+    expect(host.querySelector("[data-geodesic-slow]")).toBeNull();
+    // The list's triangle count is the one it was loaded with.
+    (item as { triangles: number }).triangles = 1_046_528;
+    await act(async () => app.setUnits("in"));
+    expect(host.querySelector("[data-geodesic-slow]")?.textContent).toContain("1046528");
+    await click(q(host, '[data-geodesic-method="dijkstra"]'));
+    expect(host.querySelector("[data-geodesic-slow]")).toBeNull();
+  });
 
   it("a locked mesh can be measured but not cut", async () => {
     const { scene, store, app, item } = setup();

@@ -201,7 +201,8 @@ src/
     transform/   numeric transform, scale, placement helpers; alignment: ICP, landmark pairs, coarse +
                  ICP, symmetry plane
     inspect/     ruler, angle, query, section plane, clip box, surface fields; deviation, overhang and
-                 triangle quality maps; object info, box and normals overlays, quality report
+                 triangle quality maps; geodesic distance, surface paths, trim and split; object info, box and
+                 normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic
                  remesh, hollow, place mesh, text (its font in fonts/)
     mesh-repair/ analysis, healer overlays, repairs, auto repair

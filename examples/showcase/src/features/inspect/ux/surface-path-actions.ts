@@ -302,17 +302,6 @@ export function compactPart(
   return { positions: world, indices };
 }
 
-/** The triangles a mesh's index buffer holds, dead slots (`0, 0, 0`) left out. */
-export function liveTriangleCount(indices: ArrayLike<number>): number {
-  let n = 0;
-  for (let k = 0; k + 2 < indices.length; k += 3) {
-    if (indices[k] !== 0 || indices[k + 1] !== 0 || indices[k + 2] !== 0) {
-      n++;
-    }
-  }
-  return n;
-}
-
 /** What {@link surfaceCut} compares of a mesh before and after a trim. */
 export interface SurfaceStats {
   /** Live triangles. */

@@ -10,7 +10,7 @@ import type { AppState, Item } from "../../../app/state/app-state";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import type { LengthUnit } from "../../../shared/ux/units";
 import { geodesicLegend, geodesicReadoutLines } from "../ux/geodesic-map";
-import { GEODESIC_METHODS, pathReadout } from "../ux/surface-paths";
+import { GEODESIC_METHODS, pathReadout, slowMethodNote } from "../ux/surface-paths";
 import { useGeodesicMap } from "../ux/use-geodesic-map";
 import { useSurfacePaths } from "../ux/use-surface-paths";
 import { FieldLegend } from "./FieldLegend";
@@ -31,6 +31,7 @@ export function SurfacePathControls(props: {
   const legend = report === null ? null : geodesicLegend(report, unit);
   const readout = pathReadout(path, unit);
   const closed = path?.closed ?? false;
+  const slow = slowMethodNote(method, paths.item?.triangles ?? 0);
 
   return (
     <>
@@ -50,6 +51,11 @@ export function SurfacePathControls(props: {
             </button>
           ))}
         </div>
+        {slow !== null ? (
+          <p className="muted small" data-geodesic-slow>
+            {slow}
+          </p>
+        ) : null}
         <div className="op-row">
           <button
             type="button"
