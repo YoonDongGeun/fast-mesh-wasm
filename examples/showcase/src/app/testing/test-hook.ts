@@ -144,6 +144,17 @@ export function installTestHook(
       const pick = app.getSnapshot().placementTool.pick;
       return pick === null ? null : { kind: pick.kind, points: pick.points.length };
     },
+    /** The align panel's landmark points per mesh and whether it is picking, and the symmetry plane's mesh (#253). */
+    alignTool: () => {
+      const { landmarks, symmetry } = app.getSnapshot().alignTool;
+      return {
+        landmarks:
+          landmarks === null
+            ? null
+            : { moving: landmarks.movingPoints.length, fixed: landmarks.fixedPoints.length, picking: landmarks.picking },
+        symmetry: symmetry === null ? null : { mesh: nameOf(symmetry.mesh), errorRms: symmetry.errorRms, score: symmetry.score },
+      };
+    },
     dragging: () => view.dragging,
     /**
      * The gizmo: `null` when there is none, else the mesh it is attached to

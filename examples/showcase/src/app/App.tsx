@@ -104,6 +104,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
   const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
   const placementPick = useApp(app, (s) => s.placementTool.pick);
+  const landmarkPick = useApp(app, (s) => s.alignTool.landmarks?.picking === true);
   const onPickPoint = useCallback(
     (mesh: MeshHandle, point: readonly [number, number, number]) =>
       app.setBrushPick({ mesh, point: [point[0], point[1], point[2]] }),
@@ -206,6 +207,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
             printTool: wave6PrintTool,
             picking: picking !== null,
             placementPick: placementPick !== null,
+            landmarkPick,
             selected: selection !== null,
             coarse: coarsePointer,
           })}

@@ -173,7 +173,8 @@ src/
     home/        mesh list, project save and open, export, the Create dialog (primitive shapes)
     view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
     select/      object and face selection, faces by criteria
-    transform/   numeric transform, scale, placement helpers, ICP alignment
+    transform/   numeric transform, scale, placement helpers; alignment: ICP, landmark pairs, coarse +
+                 ICP, symmetry plane
     inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
                  triangle quality maps
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic

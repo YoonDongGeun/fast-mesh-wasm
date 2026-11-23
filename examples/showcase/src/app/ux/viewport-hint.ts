@@ -18,6 +18,8 @@ export interface HintState {
   picking: boolean;
   /** A placement helper waits for clicks on the selected mesh (#256). */
   placementPick?: boolean;
+  /** The align panel picks landmark pairs on its moving and fixed meshes (#253). */
+  landmarkPick?: boolean;
   selected: boolean;
   coarse: boolean;
 }
@@ -46,6 +48,9 @@ export function viewportHint(s: HintState): string {
   }
   if (s.placementPick === true) {
     return "Click the selected mesh to pick (the Transform panel says what) · Esc cancels";
+  }
+  if (s.landmarkPick === true) {
+    return "Click a point on the moving mesh, then its match on the fixed mesh · Esc stops";
   }
   if (!s.selected) {
     return s.coarse

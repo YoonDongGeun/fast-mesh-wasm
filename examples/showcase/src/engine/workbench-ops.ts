@@ -4,22 +4,28 @@
 // working seamlessly with both synchronous `Scene` and `WorkerScene`.
 import type {
   BooleanOp,
+  CoarseAlignMethod,
   ConvexHullPoints,
   ConvexHullResult,
   CutReport,
   EditOp,
   FieldHandle,
+  IcpObjective,
+  LandmarkAlignment,
+  LandmarkPair,
   MeshHandle,
   OffsetAlgorithm,
   OffsetReport,
   Placement,
   RegisterResult,
+  RegistrationReport,
   Scene,
   SceneLike,
   SectionPlane,
   ShellReport,
   SimplifyReport,
   SubdivideReport,
+  SymmetryPlaneReport,
 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
@@ -219,12 +225,20 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
   return copy;
 }
 
+/** A world plane to mirror across: a point on it and its unit normal (#253). */
+export interface MirrorPlane {
+  point: Vec3;
+  normal: Vec3;
+}
+
 /**
- * Mirrors a mesh across the chosen local X/Y/Z axis and reverses every live triangle
- * winding `(a, b, c) -> (a, c, b)` so outward normals are preserved, in a single undo step.
+ * Mirrors a mesh across the chosen local X/Y/Z axis, or across a world plane, and
+ * reverses every live triangle winding `(a, b, c) -> (a, c, b)` so outward normals
+ * are preserved, in a single undo step.
  */
-export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: MirrorAxis): Promise<void> {
-  const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, across: MirrorAxis | MirrorPlane): Promise<void> {
+  const plane = typeof across === "string" ? null : across;
+  const axisIdx = plane !== null ? -1 : across === "x" ? 0 : across === "y" ? 1 : 2;
   const views = store.scene.views(mesh);
   const srcPos = views.positions();
   const srcIdx = views.indices();
@@ -250,6 +264,9 @@ export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: Mirr
   const e13 = matrix[13];
   const e14 = matrix[14];
 
+  const [nx, ny, nz] = plane?.normal ?? [0, 0, 0];
+  const [px, py, pz] = plane?.point ?? [0, 0, 0];
+
   const worldPos = new Float64Array(vertices.length * 3);
   for (let i = 0; i < vertices.length; i++) {
     const slot = vertices[i];
@@ -258,11 +275,20 @@ export async function mirrorMesh(store: SceneStore, mesh: MeshHandle, axis: Mirr
     let lz = srcPos[3 * slot + 2];
     if (axisIdx === 0) lx = lx === 0 ? 0 : -lx;
     else if (axisIdx === 1) ly = ly === 0 ? 0 : -ly;
-    else lz = lz === 0 ? 0 : -lz;
+    else if (axisIdx === 2) lz = lz === 0 ? 0 : -lz;
 
-    worldPos[3 * i] = e0 * lx + e4 * ly + e8 * lz + e12;
-    worldPos[3 * i + 1] = e1 * lx + e5 * ly + e9 * lz + e13;
-    worldPos[3 * i + 2] = e2 * lx + e6 * ly + e10 * lz + e14;
+    let wx = e0 * lx + e4 * ly + e8 * lz + e12;
+    let wy = e1 * lx + e5 * ly + e9 * lz + e13;
+    let wz = e2 * lx + e6 * ly + e10 * lz + e14;
+    if (plane !== null) {
+      const twice = 2 * ((wx - px) * nx + (wy - py) * ny + (wz - pz) * nz);
+      wx -= twice * nx;
+      wy -= twice * ny;
+      wz -= twice * nz;
+    }
+    worldPos[3 * i] = wx;
+    worldPos[3 * i + 1] = wy;
+    worldPos[3 * i + 2] = wz;
   }
 
   const liveTris: number[] = [];
@@ -753,6 +779,68 @@ export async function runIcpAlign(params: {
     translation: [result.placement.translation[0], result.placement.translation[1], result.placement.translation[2]],
   });
   return { ...result, applied: true, notApplied: null };
+}
+
+/** The scene's alignment domain, or a throw when the engine has none. */
+function alignDomain(store: SceneStore): NonNullable<SceneLike["align"]> {
+  if (!store.scene.align) {
+    throw new Error("Alignment is unavailable");
+  }
+  return store.scene.align;
+}
+
+/**
+ * Landmark alignment (`scene.align.alignByLandmarks`, #253): moves `moving` so
+ * its world `pairs[i].source` points best meet the `target` ones (rigid, or with
+ * a uniform scale), as one undo step.
+ */
+export async function runLandmarkAlign(params: {
+  store: SceneStore;
+  moving: MeshHandle;
+  fixed: MeshHandle;
+  pairs: readonly LandmarkPair[];
+  allowScaling: boolean;
+}): Promise<LandmarkAlignment> {
+  const { store, moving, fixed, pairs, allowScaling } = params;
+  const align = alignDomain(store);
+  return inOneStep(store, async () => await align.alignByLandmarks(moving, fixed, pairs, allowScaling));
+}
+
+/** Both stages of a coarse + ICP run (#253). */
+export interface MultistageAlignResult {
+  coarse: RegistrationReport;
+  fine: RegistrationReport;
+}
+
+/**
+ * Coarse pre-alignment, then ICP (`scene.align.registerMultistage` twice, #253):
+ * the coarse stage alone (no ICP iterations) and then ICP from its pose with
+ * no coarse stage, so each stage reports its own RMSE. Both placements land in
+ * one history step, so one undo puts the mesh back.
+ */
+export async function runMultistageAlign(params: {
+  store: SceneStore;
+  moving: MeshHandle;
+  fixed: MeshHandle;
+  coarseMethod: CoarseAlignMethod;
+  objective: IcpObjective;
+  maxIterations: number;
+  overlap: number;
+  maxDistance?: number;
+}): Promise<MultistageAlignResult> {
+  const { store, moving, fixed, coarseMethod, objective, maxIterations, overlap, maxDistance } = params;
+  const align = alignDomain(store);
+  const shared = { objective, overlap, ...(maxDistance !== undefined && maxDistance > 0 ? { maxDistance } : {}) };
+  return inOneStep(store, async () => {
+    const coarse = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod, maxIterations: 0 });
+    const fine = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod: "none", maxIterations });
+    return { coarse, fine };
+  });
+}
+
+/** The mesh's dominant reflection symmetry plane in world space (`scene.align.detectSymmetryPlane`, #253). */
+export async function runDetectSymmetryPlane(store: SceneStore, mesh: MeshHandle): Promise<SymmetryPlaneReport> {
+  return await alignDomain(store).detectSymmetryPlane(mesh);
 }
 
 /** What a convex hull action added: its list item and the hull's counts. */

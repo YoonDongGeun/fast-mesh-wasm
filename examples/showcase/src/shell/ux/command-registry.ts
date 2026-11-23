@@ -8,6 +8,7 @@ import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab 
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
+import { ALIGN_COMMANDS } from "../../features/transform/ux/align-tools";
 import { triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 
@@ -474,6 +475,21 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setActiveTab("select");
         triggerClick(`[data-placement-action="${c.action}"]`);
+      },
+    });
+  }
+
+  // The align tools press the align panel's buttons (#253).
+  for (const c of ALIGN_COMMANDS) {
+    cmds.push({
+      id: `align:${c.action}`,
+      title: c.label,
+      category: "Tool",
+      keywords: c.keywords,
+      disabled: items.length < c.meshes,
+      run: () => {
+        app.setActiveTab("align");
+        triggerClick(`[data-align-action="${c.action}"]`);
       },
     });
   }

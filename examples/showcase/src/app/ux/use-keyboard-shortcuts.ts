@@ -82,6 +82,9 @@ export function useKeyboardShortcuts(opts: {
             app.setBrushPick(null);
           } else if (snap.placementTool.pick !== null) {
             app.setPlacementTool({ pick: null });
+          } else if (snap.alignTool.landmarks?.picking === true) {
+            // Stops picking landmark pairs; the points stay (#253).
+            app.setAlignTool({ landmarks: { ...snap.alignTool.landmarks, picking: false } });
           } else {
             selectMesh(app, select, selection, null, false);
           }

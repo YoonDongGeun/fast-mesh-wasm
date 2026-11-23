@@ -46,6 +46,7 @@ import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer"
 import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
 import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
+import { AlignToolsLayer } from "../../features/transform/ui/AlignToolsLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
 import { useGizmoDrag, useMeshBindings } from "../ux/use-gizmo";
 import { useHoverRay } from "../ux/use-hover-ray";
@@ -116,8 +117,8 @@ export function Viewport(props: {
   const wave6SelectTool = useApp(app, (s) => s.wave6.select.activeTool);
   const wave6DeformTool = useApp(app, (s) => s.wave6.deform.activeTool);
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
-  // An armed placement pick (#256) owns the pointer like the Wave 6 tools.
-  const placementPicking = useApp(app, (s) => s.placementTool.pick !== null);
+  // An armed placement pick (#256) or landmark pick (#253) owns the pointer like the Wave 6 tools.
+  const placementPicking = useApp(app, (s) => s.placementTool.pick !== null || s.alignTool.landmarks?.picking === true);
   const pointerOwnedByWave6 =
     wave6SelectTool !== null || wave6DeformTool !== null || wave6PrintTool !== null || placementPicking;
   const { downAt, onMissed, onPick } = useSelectionClicks({
@@ -212,6 +213,7 @@ export function Viewport(props: {
       <MetrologyOverlaysLayer app={app} store={store} />
       <HollowPlaceToolsLayer app={app} store={store} />
       <PlacementPicksLayer app={app} store={store} />
+      <AlignToolsLayer app={app} store={store} />
       <CreatePreviewLayer app={app} />
     </Canvas>
   );
