@@ -7,6 +7,7 @@
  */
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
+import { ARRANGE_SCOPE, CLONE_COPIES, toggleBuildPlate } from "../../features/build-plate/ux/build-plate-commands";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
@@ -68,6 +69,7 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
     faceSelectTool,
     deformAlgo,
     deformTool,
+    plateShown,
     pickMode,
     toggleFaceSelectTool,
     chooseDeformAlgorithm,
@@ -243,6 +245,23 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" onClick={() => app.setCommandPaletteOpen(true)}>
                 Command Search (Ctrl+K)
+              </button>
+            </div>
+            <div className="group" aria-label="Build plate">
+              <button
+                type="button"
+                data-action="build-plate"
+                aria-pressed={plateShown}
+                title="Show or hide the build plate"
+                onClick={() => toggleBuildPlate(app)}
+              >
+                Build Plate
+              </button>
+              <button type="button" data-ribbon-focus="arrange" onClick={() => focusElement(ARRANGE_SCOPE)}>
+                Arrange…
+              </button>
+              <button type="button" data-ribbon-focus="multi-clone" onClick={() => focusElement(CLONE_COPIES)}>
+                Multi-Clone…
               </button>
             </div>
             <div className="group ribbon-shading-strip" aria-label="Shading">

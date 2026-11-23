@@ -21,6 +21,7 @@ import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
 import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../features/inspect/ux/use-object-info";
 import { geodesicMapProbe } from "../../features/inspect/ux/use-geodesic-map";
 import { pathLength } from "../../features/inspect/ux/surface-paths";
+import { readWorldBoxes } from "../../features/build-plate/ux/footprint";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
@@ -163,6 +164,12 @@ export function installTestHook(
             : { moving: landmarks.movingPoints.length, fixed: landmarks.fixedPoints.length, picking: landmarks.picking },
         symmetry: symmetry === null ? null : { mesh: nameOf(symmetry.mesh), errorRms: symmetry.errorRms, score: symmetry.score },
       };
+    },
+    /** The build plate as set, and a mesh's world box around its geometry as placed (#266). */
+    buildPlate: () => ({ ...app.getSnapshot().buildPlate }),
+    worldBox: async (name: string) => {
+      const { mesh } = find(name);
+      return (await readWorldBoxes(store.scene, [mesh])).get(mesh) ?? null;
     },
     dragging: () => view.dragging,
     /**

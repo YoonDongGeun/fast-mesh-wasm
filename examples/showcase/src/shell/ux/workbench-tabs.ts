@@ -22,6 +22,7 @@ export const WORKBENCH_TABS: readonly WorkbenchTabMeta[] = [
 
 export type InspectorSlot =
   | "home"
+  | "buildPlate"
   | "project"
   | "transform"
   | "select"
@@ -40,7 +41,7 @@ export type InspectorSlot =
 export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean {
   switch (tab) {
     case "home":
-      return slot === "home" || slot === "project" || slot === "export";
+      return slot === "home" || slot === "buildPlate" || slot === "project" || slot === "export";
     case "select":
       return slot === "transform" || slot === "select";
     case "repair":

@@ -39,6 +39,7 @@ import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/
 import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-tools";
 import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
 import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
+import { type BuildPlate, DEFAULT_BUILD_PLATE } from "../../features/build-plate/ux/plate";
 
 export interface Item {
   /** A React key. */
@@ -404,6 +405,8 @@ export interface AppSnapshot {
   objectInfo: ObjectInfoState;
   /** The geodesic map's sources, the surface path and their armed pick (#252). */
   surfacePath: SurfacePathToolState;
+  /** The build plate and how Arrange fills it (#266; persisted, not undoable). */
+  buildPlate: BuildPlate;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -493,6 +496,7 @@ export class AppState {
     alignTool: DEFAULT_ALIGN_TOOL,
     objectInfo: DEFAULT_OBJECT_INFO,
     surfacePath: DEFAULT_SURFACE_PATH_TOOL,
+    buildPlate: DEFAULT_BUILD_PLATE,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -526,6 +530,7 @@ export class AppState {
       cameraProjection: initial.cameraProjection,
       scaleIndicator: initial.scaleIndicator,
       showAxisBasis: initial.showAxisBasis,
+      buildPlate: { ...initial.buildPlate },
     };
   }
   /** The pair defaults to the first two meshes added, until it is picked by hand. */
@@ -1125,6 +1130,11 @@ export class AppState {
     this.#set({ surfacePath: { ...this.#snap.surfacePath, ...patch } });
   }
 
+  /** Changes the build plate: its size, place, spacing, or whether it shows (#266; not undoable). */
+  setBuildPlate(patch: Partial<BuildPlate>): void {
+    this.#set({ buildPlate: { ...this.#snap.buildPlate, ...patch } });
+  }
+
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */
   setMeshLocked(mesh: MeshHandle, locked: boolean): void {
     let changed = false;
@@ -1339,6 +1349,7 @@ export class AppState {
       cameraProjection: d.cameraProjection,
       scaleIndicator: d.scaleIndicator,
       showAxisBasis: d.showAxisBasis,
+      buildPlate: d.buildPlate,
     });
   }
 

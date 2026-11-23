@@ -23,6 +23,7 @@ import type { Loader } from "../../io/loader";
 import { inspect } from "../../app/state/readouts";
 import { type AppState, type Item, useApp } from "../../app/state/app-state";
 import { evaluateOverlayColor } from "../../engine/workbench-ops";
+import { BuildPlateLayer } from "../../features/build-plate/ui/BuildPlateLayer";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
 import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
 import { TextPreviewLayer } from "../../features/mesh-edit/ui/TextPreviewLayer";
@@ -230,6 +231,7 @@ export function Viewport(props: {
       <SurfacePathLayer app={app} store={store} />
       <CreatePreviewLayer app={app} />
       <TextPreviewLayer app={app} />
+      <BuildPlateLayer app={app} />
     </Canvas>
   );
 }

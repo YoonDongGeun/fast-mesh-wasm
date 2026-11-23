@@ -8,6 +8,7 @@ import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { Suspense, lazy, useCallback, useState, type RefObject } from "react";
 import type { Loader } from "../io/loader";
+import { BuildPlatePanel } from "../features/build-plate/ui/BuildPlatePanel";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
 import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
@@ -228,6 +229,13 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           data-inspector-slot="home"
         >
           <HomeOverviewCard app={app} itemCount={items.length} onResetView={requestResetView} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "buildPlate") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="build-plate"
+          onClickCapture={() => activateTabForSlot("home")}
+        >
+          <BuildPlatePanel app={app} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "transform") ? "inspector-slot" : "inspector-slot inspector-hidden"}

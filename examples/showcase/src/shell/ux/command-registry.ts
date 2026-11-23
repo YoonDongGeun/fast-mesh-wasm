@@ -5,6 +5,7 @@
 // object.
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
+import { buildPlateCommands } from "../../features/build-plate/ux/build-plate-commands";
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { textCommands } from "../../features/mesh-edit/ux/text-commands";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
@@ -148,6 +149,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
 
   cmds.push(...createPrimitiveCommands(app));
   cmds.push(...textCommands(app));
+  cmds.push(...buildPlateCommands(app, items.length > 0, selection !== null));
 
   cmds.push(
     {
