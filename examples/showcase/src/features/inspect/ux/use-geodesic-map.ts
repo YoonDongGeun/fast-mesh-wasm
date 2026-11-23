@@ -128,10 +128,9 @@ export function useGeodesicMap(
         if (
           now.surfaceFieldValues !== before ||
           now.surfaceField.mode !== "none" ||
-          !sameGeodesicRequest(geodesicRequestOf(now.surfacePath), request) ||
           !now.items.some((i) => i.mesh === request.mesh)
         ) {
-          continue; // Another colouring, or a change of the picks, came first.
+          continue; // Another colouring, or the mesh's removal, came first.
         }
         const data = geodesicOverlay(next);
         geodesicOverlays.add(data);

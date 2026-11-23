@@ -418,6 +418,38 @@ describe("taps", () => {
     expect(app.getSnapshot().surfacePath.tracing).toBe(0);
   });
 
+  it("points_on_separate_parts_say_so_and_leave_the_path", async () => {
+    const scene = new Scene();
+    const store = createSceneStore(scene);
+    const app = new AppState();
+    cleanups.push(() => {
+      store.dispose();
+      scene.free();
+    });
+    const a = sphere();
+    const b = sphere([3, 0, 0]);
+    const nv = a.positions.length / 3;
+    const positions = Float64Array.from([...a.positions, ...b.positions]);
+    const indices = Uint32Array.from([...a.indices, ...b.indices.map((v) => v + nv)]);
+    const item = app.addMesh(store, { name: "Pair", positions, indices, center: [0, 0, 0], radius: 3, volumeId: null, preset: null });
+    store.commitFrame();
+    arm(app, item, "path");
+    for (const method of ["dijkstra", "heatMethod"] as const) {
+      app.setSurfacePath({ method, path: null, error: null });
+      await tap(app, scene, scene, [[0, 1, 0]]);
+      void queueSurfaceTap(app, scene, Promise.resolve(hitToward(scene, [0, 1, 0], [3, 0, 0])));
+      await surfacePathIdle(app);
+      const s = app.getSnapshot().surfacePath;
+      expect(s.path?.points).toHaveLength(1);
+      expect(s.tracing).toBe(0);
+      expect(s.error).toBe("These points are on separate parts of the mesh: no surface path joins them.");
+    }
+    // A good tap (on the first part, away from the second) clears the error.
+    await tap(app, scene, scene, [[-1, 0, 0]]);
+    expect(app.getSnapshot().surfacePath.error).toBeNull();
+    expect(app.getSnapshot().surfacePath.path?.points).toHaveLength(2);
+  });
+
   it("a_failed_raycast_drops_only_its_tap", async () => {
     const { scene, app, item } = setup();
     arm(app, item, "sources");
