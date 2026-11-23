@@ -202,7 +202,8 @@ const SETTLE_BOUNDS_MS = 250;
  * colouring's values (`fmValue`), coloured per fragment by a shader chunk the
  * binding adds to the material (see {@link BindMeshOptions.shading}).
  *
- * When the scene mesh is removed, the binding detaches: it stops following
+ * When the scene mesh is removed, the binding detaches (a mesh that undo or
+ * redo brings back is bound again): it stops following
  * the scene and leaves the object as it was (remove it from your THREE.Scene
  * and call {@link BoundMesh.dispose}).
  *

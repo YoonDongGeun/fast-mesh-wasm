@@ -453,25 +453,53 @@ fn budget_counts_and_frees_parked_meshes() {
     assert_eq!(scene.undo(), Ok(false));
     assert!(scene.mesh(ids[2]).is_ok() && scene.mesh(ids[3]).is_ok());
 
-    // An undoable add counts too, so that undoing it stays within budget.
+    // An undoable add holds nothing until it is undone. The furthest redo
+    // goes first, so that every add can be undone.
     let mut scene = Scene::new(SceneOptions {
         history_budget: 2 * one + one / 2,
     });
-    let ids: Vec<MeshId> = (0..3)
+    let ids: Vec<MeshId> = (0..4)
         .map(|_| scene.add_mesh(grid(20), undoable()).unwrap())
         .collect();
-    assert_eq!(scene.history.undo_len(), 2);
+    assert_eq!(scene.history.undo_len(), 4);
+    assert_eq!(scene.history.bytes(), 0);
     while scene.undo().unwrap() {}
-    assert_eq!(restorable(&scene), ids[1..]);
-    assert!(scene.mesh(ids[0]).is_ok(), "its add was evicted: it stays");
+    assert_eq!(scene.ids().count(), 0);
+    assert_eq!(restorable(&scene), ids[..2]);
+    assert_eq!(scene.history.redo_len(), 2);
+    while scene.redo().unwrap() {}
+    assert_eq!(scene.ids().collect::<Vec<_>>(), ids[..2]);
+    assert_eq!(scene.history.bytes(), 0);
 
-    // Larger than the whole budget: dropped as the step closes.
-    let mut scene = Scene::new(SceneOptions { history_budget: 64 });
-    let a = scene.add_mesh(grid(20), undoable()).unwrap();
-    assert!(scene.mesh(a).is_ok() && !scene.can_undo());
+    // Undone, redone and removed: the mesh counts once, on whichever entry
+    // holds it.
+    scene.remove_mesh_undoable(ids[0]).unwrap();
+    let held = scene.history.bytes();
+    assert!(held > one / 2 && held < 2 * one);
+    scene.undo().unwrap();
+    assert_eq!(scene.history.bytes(), 0);
+    scene.redo().unwrap();
+    assert_eq!(scene.history.bytes(), held);
+
+    // Larger than the whole budget: a removal is dropped as its step closes
+    // (it is permanent), an add undoes and cannot be redone, and neither
+    // costs the history before it.
+    let mut scene = Scene::new(SceneOptions {
+        history_budget: 4096,
+    });
+    let a = scene.add_mesh(grid(20), MeshOptions::default()).unwrap();
+    lift(&mut scene, a, 0, 1.0);
+    let n = scene.add_mesh(grid(20), undoable()).unwrap();
+    assert_eq!(scene.history.undo_len(), 2);
+    assert_eq!(scene.undo(), Ok(true));
+    assert!(scene.mesh(n).is_err() && !scene.is_restorable(n));
+    assert!(scene.can_undo() && !scene.can_redo());
+    assert_eq!(scene.undo(), Ok(true));
+    assert_eq!(scene.mesh(a).unwrap().position(0).unwrap()[2], 0.0);
     scene.remove_mesh_undoable(a).unwrap();
     assert!(scene.mesh(a).is_err() && !scene.is_restorable(a));
     assert_eq!(scene.history.bytes(), 0);
+    let mut scene = Scene::new(SceneOptions { history_budget: 64 });
 
     // An open step is not evicted while open; its undo happens whatever its
     // size, then the budget frees what it parked.
@@ -486,6 +514,44 @@ fn budget_counts_and_frees_parked_meshes() {
     assert!(!scene.is_restorable(n) && !scene.can_redo());
     scene.take_changes();
     assert_eq!(scene.ids().collect::<Vec<_>>(), [a]);
+}
+
+#[test]
+fn a_mesh_that_grew_meets_the_budget_when_its_removal_is_redone() {
+    let run = |budget: usize, grow: bool| {
+        let mut scene = Scene::new(SceneOptions {
+            history_budget: budget,
+        });
+        let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+        let m = scene.add_mesh(grid(20), MeshOptions::default()).unwrap();
+        lift(&mut scene, a, 0, 1.0);
+        scene.remove_mesh_undoable(m).unwrap();
+        let bytes = scene.history.bytes();
+        scene.undo().unwrap();
+        if grow {
+            // Not history: the mesh holds more when it is parked again.
+            scene.set_normals(m, true).unwrap();
+        }
+        scene.take_changes();
+        assert_eq!(scene.redo(), Ok(true));
+        assert!(scene.mesh(m).is_err());
+        (scene, m, bytes)
+    };
+    let (scene, m, bytes) = run(usize::MAX, false);
+    assert!(scene.is_restorable(m) && scene.history.bytes() == bytes);
+    let (scene, m, _) = run(usize::MAX, true);
+    let grown = scene.history.bytes();
+    assert!(scene.is_restorable(m) && grown > bytes);
+    // Room for the removal alone: the older edit goes.
+    let (mut scene, m, _) = run(grown - 1, true);
+    assert!(scene.is_restorable(m) && scene.history.undo_len() == 1);
+    assert!(scene.history.bytes() < grown);
+    scene.undo().unwrap();
+    assert!(scene.mesh(m).is_ok());
+    // No room for it: it is redone, and permanent.
+    let (mut scene, m, _) = run(bytes, true);
+    assert!(!scene.is_restorable(m) && scene.history.bytes() == 0);
+    assert!(scene.take_changes().iter().any(|c| c.id == m && c.removed));
 }
 
 #[test]
@@ -1511,7 +1577,8 @@ proptest! {
         ops in prop::collection::vec(op(), 1..70),
         budget in prop_oneof![
             3 => Just(usize::MAX),
-            2 => 200usize..6000,
+            1 => 200usize..6000,
+            3 => 6000usize..200_000,
         ],
     ) {
         let mut scene = Scene::new(SceneOptions { history_budget: budget });

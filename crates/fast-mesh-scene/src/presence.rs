@@ -71,8 +71,8 @@ impl Scene {
     ///
     /// The kept mesh counts against the history budget (see
     /// [`SceneOptions::history_budget`](crate::SceneOptions::history_budget))
-    /// until the history drops the step and frees it for good: by eviction
-    /// or [`Scene::clear_history`]. A removal larger than the whole budget
+    /// while it is out, until the history drops the step and frees it for
+    /// good: by eviction or [`Scene::clear_history`]. A removal larger than the whole budget
     /// is dropped as soon as its step closes, which makes it permanent.
     /// [`Scene::is_restorable`] tells whether the history can still bring a
     /// removed mesh back.
@@ -120,19 +120,11 @@ impl Scene {
     }
 
     /// Records the undoable add of live mesh `id`. `History::reserve` must
-    /// have succeeded since the last record. Normals count as if they were
-    /// on, since they are usually turned on right after the add.
+    /// have succeeded since the last record. It holds nothing until it is
+    /// undone: the mesh is measured then.
     pub(crate) fn record_add(&mut self, id: MeshId) {
-        let bytes = self.entries.get(id).map_or(0, |e| {
-            let normals = if e.normals.is_none() {
-                (e.mesh.vertex_slots() + e.mesh.triangle_slots()) * 12
-            } else {
-                0
-            };
-            e.byte_size() + normals
-        });
         self.history
-            .record(&mut self.entries, Change::Add { id, bytes });
+            .record(&mut self.entries, Change::Add { id, bytes: 0 });
     }
 
     /// Brings the scene's registries in line with the meshes a step parked

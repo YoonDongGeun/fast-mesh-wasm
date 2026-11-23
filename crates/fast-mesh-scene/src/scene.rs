@@ -51,8 +51,9 @@ pub struct MeshOptions {
     /// Record the add in the history (in the open step, or as a step of its
     /// own), so that undo removes the mesh again and redo brings it back
     /// under the same id; see [`Scene::remove_mesh_undoable`] for what a
-    /// mesh keeps while it is out. Off by default: the add is permanent, as
-    /// it always was.
+    /// mesh keeps while it is out. The add counts against the history budget
+    /// only once it is undone and the history holds the mesh. Off by
+    /// default: the add is permanent, as it always was.
     pub undoable: bool,
 }
 
@@ -1174,6 +1175,10 @@ impl Scene {
     /// oldest undo steps and, for a step larger than the budget, drop it
     /// from the redo stack again.
     ///
+    /// A mesh the step added undoably is kept by the redo stack from now on
+    /// and counts against the budget, which may drop the furthest redo steps,
+    /// or this one (its meshes are then gone for good).
+    ///
     /// # Errors
     /// A store error (for example out of memory): the meshes, both stacks
     /// and an open step are then unchanged (the step stays open).
@@ -1192,7 +1197,7 @@ impl Scene {
         self.invalidate_all_strokes();
         let undone = done.map(|d| self.absorb(d)).is_some();
         // Only once the step's meshes are settled: this may free some.
-        self.history.trim(&mut self.entries);
+        self.history.trim_undone(&mut self.entries);
         Ok(undone)
     }
 
@@ -1207,7 +1212,9 @@ impl Scene {
         let done = self.history.redo(&mut self.entries);
         let done = self.after_corrupted(done)?;
         self.invalidate_all_strokes();
-        Ok(done.map(|d| self.absorb(d)).is_some())
+        let redone = done.map(|d| self.absorb(d)).is_some();
+        self.history.trim_redone(&mut self.entries);
+        Ok(redone)
     }
 
     /// True if [`Scene::undo`] would undo something, counting a non-empty
