@@ -80,6 +80,15 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   240 ms (none with reduced motion) and land exactly; a press on the canvas stops one. Under the
   cube: the scale indicator (a ruler, a screen grid of the same step, or none), the XYZ axis basis,
   and perspective or orthographic projection, which persist with the other display settings.
+- **Object info.** The box at the bottom of the left sidebar (it folds) reads the selected mesh: its
+  triangles, vertices, edges, components, area and volume (`scene.inspect.measure`), average edge
+  length, and bounding box along the world's axes or the mesh's own. It draws that box with its
+  dimensions, and the face or vertex normals (at most 20,000 lines, a sample on a large mesh). The
+  overlays follow a gizmo drag and its undo without being rebuilt. The quality report downloads the
+  numbers, the repair analysis and the shown inspect map's readouts as HTML or CSV, in the display
+  unit. Past 200,000 triangles the numbers wait until a brush is put down, and the measurement for a
+  longer rest, so neither queues ahead of the next stroke. The Angle tool (Inspect) measures the
+  angle at the second of three clicked vertices.
 - **Repair.** For the selected mesh, `analyze` lists its holes (with their sizes), orientation
   conflicts, components (floating pieces), non-manifold edges and vertices, and degenerate triangles.
   The buttons run the library's repairs through `store.repair`, each one undo step: Weld (within a
@@ -191,8 +200,8 @@ src/
     select/      object and face selection, faces by criteria
     transform/   numeric transform, scale, placement helpers; alignment: ICP, landmark pairs, coarse +
                  ICP, symmetry plane
-    inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
-                 triangle quality maps
+    inspect/     ruler, angle, query, section plane, clip box, surface fields; deviation, overhang and
+                 triangle quality maps; object info, box and normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic
                  remesh, hollow, place mesh, text (its font in fonts/)
     mesh-repair/ analysis, healer overlays, repairs, auto repair
