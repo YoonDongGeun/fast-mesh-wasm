@@ -85,6 +85,11 @@
 //!   Delaunay triangulation where triangles are nearly coplanar, without
 //!   moving a vertex. Both take an optional face region and report
 //!   [`SurfaceStats`] before and after.
+//! - Extrusion: [`extrude_faces`] moves a face selection along its normals
+//!   (or a direction) and walls its boundary, keeping a closed mesh closed;
+//!   [`extrude_base`] runs boundary loops to a flat, capped base, turning an
+//!   open surface into a solid. Both report the self-intersections they
+//!   would make.
 //! - Primitives: [`primitives::generate`] builds a closed, welded,
 //!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
 //!   prism (or an open plane) from its parameters, centred on the origin.
@@ -109,6 +114,7 @@ pub mod deform;
 pub mod delaunay;
 pub mod denoise;
 mod error;
+pub mod extrude;
 mod fair;
 mod fill;
 mod fill_dp;
@@ -153,6 +159,10 @@ pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
 pub use delaunay::{DelaunayOptions, DelaunayReport, delaunay_flips};
 pub use denoise::{DenoiseOptions, DenoiseReport, SurfaceStats, denoise, surface_stats};
 pub use error::{OpsError, Result};
+pub use extrude::{
+    BaseLevel, BaseLoops, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeDirection,
+    ExtrudeFacesOptions, ExtrudeFacesReport, extrude_base, extrude_faces,
+};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,
     fill_holes,
