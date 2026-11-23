@@ -25,6 +25,14 @@ import {
 } from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
 import {
+  checkWrapOptions,
+  type WrapGridOptions,
+  wrapMeshList,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "../wrap.js";
+import {
   checkSurfacePathOptions,
   checkU32Int,
   isBrushSculptOp,
@@ -3091,6 +3099,42 @@ export class WorkerScene implements SceneLike {
       },
       (v) => v as DelaunayFlipReport,
     );
+  }
+
+  /**
+   * Plans the voxel grid of {@link WorkerScene.wrap} for the same meshes and
+   * options without running it (see `Scene.wrapPlan`).
+   */
+  wrapPlan(meshes: MeshHandle | readonly MeshHandle[], options?: WrapGridOptions): Promise<WrapPlan> {
+    return this.#query(
+      "wrapPlan",
+      () => ({
+        meshes: wrapMeshList(meshes).map((m) => this.#live(m).id),
+        options: checkWrapOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Wraps `meshes` (one mesh or several) in one closed, manifold envelope in
+   * the Worker, added as a new mesh, one undo step (see `Scene.wrap`). The
+   * page stays live while it runs.
+   */
+  wrap(meshes: MeshHandle | readonly MeshHandle[], options?: WrapOptions): Promise<WrapResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        const states = wrapMeshList(meshes).map((m) => this.#live(m));
+        const checked = checkWrapOptions(options);
+        added = this.#allocMeshState([0, 0, 0], checked.normals);
+        return { kind: "wrap", rev, addedId: added.id, meshes: states.map((st) => st.id), options: checked, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<WrapResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
   }
 
   reconstructPointCloud(

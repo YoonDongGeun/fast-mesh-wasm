@@ -23,6 +23,17 @@ import {
 } from "./hull.js";
 import { checkRegisterOptions } from "./register.js";
 import {
+  checkWrapOptions,
+  decodeWrapCounts,
+  decodeWrapPlan,
+  encodeWrapOptions,
+  type WrapGridOptions,
+  wrapMeshList,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "./wrap.js";
+import {
   BOOLEAN_METHOD_CODES,
   BOOLEAN_OP_CODES,
   checkSurfacePathOptions,
@@ -3776,6 +3787,65 @@ export class Scene implements SceneLike {
       this.#scene().delaunay_flips(index, generation, o.dihedralLimit ?? Number.NaN, o.region),
     );
     return decodeDelaunayFlipReport(raw);
+  }
+
+  /**
+   * Plans the voxel grid of {@link Scene.wrap} for the same meshes and
+   * options without running it: its dimensions, voxel size, voxel count and
+   * estimated memory, and whether it is within `maxVoxels`. Cheap (one pass
+   * over the vertices), so it can follow a settings form.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, bad options,
+   *   meshes without triangles, or a voxel size that `f32` positions cannot
+   *   resolve; `UNKNOWN_MESH` for a removed mesh. A grid over the limit is not
+   *   an error here: it comes back with `fits: false`.
+   */
+  wrapPlan(meshes: MeshHandle | readonly MeshHandle[], options?: WrapGridOptions): WrapPlan {
+    const ids = this.#flatIds(wrapMeshList(meshes));
+    const values = encodeWrapOptions(checkWrapOptions(options));
+    return decodeWrapPlan(call(() => this.#scene().wrap_plan(ids, values)));
+  }
+
+  /**
+   * Wraps `meshes` (one mesh or several) in one closed envelope, added as a
+   * new mesh, and returns it with its counts. A robust last resort for broken
+   * scans and merged parts: the meshes may be open, holed, overlapping,
+   * self-intersecting or wound either way, and are not changed.
+   *
+   * The envelope is closed, manifold, wound outward and free of
+   * self-intersections. Gaps, slots and holes narrower than `gap` are closed,
+   * and interior cavities are filled. Every vertex is within about half the
+   * gap (and a voxel) of the meshes. It is built on a voxel grid: features
+   * thinner than a voxel may be lost, and sharp edges are cut by up to a voxel,
+   * less with `project`. A shell with a hole wider than the gap is open to the
+   * outside, so its inside is not filled and its walls, with no thickness,
+   * are lost: raise the gap over the hole. {@link Scene.wrapPlan} reports the
+   * grid and its memory beforehand, and a grid over `maxVoxels` is refused.
+   *
+   * When every mesh has the same placement and it has no scale, the wrap is
+   * built in their own space and the new mesh gets that placement; otherwise
+   * it is built in world space at the identity placement. Lengths are world
+   * units either way.
+   *
+   * The new mesh is added empty and the wrap lands in it as one undo step:
+   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
+   * {@link Scene.redo} fills it again.
+   *
+   * At a million triangles this takes from about half a second to many
+   * seconds, by detail and threads: use `WorkerScene.wrap` to keep the page
+   * live.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, bad options,
+   *   a grid over `maxVoxels` (the message has its size and memory), or meshes
+   *   that enclose no volume at this gap and voxel size (a flat sheet, or a
+   *   shell with a hole wider than the gap); `UNKNOWN_MESH` for a removed mesh;
+   *   `OUT_OF_MEMORY`.
+   */
+  wrap(meshes: MeshHandle | readonly MeshHandle[], options?: WrapOptions): WrapResult {
+    const ids = this.#flatIds(wrapMeshList(meshes));
+    const checked = checkWrapOptions(options);
+    const r = call(() => this.#scene().wrap_meshes(ids, encodeWrapOptions(checked), checked.normals));
+    return { mesh: this.#meshHandle(r[0], r[1]), ...decodeWrapCounts(r) };
   }
 
   /**

@@ -44,6 +44,14 @@ export type {
 } from "./denoise.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export {
+  DEFAULT_WRAP_DETAIL,
+  DEFAULT_WRAP_MAX_VOXELS,
+  type WrapGridOptions,
+  type WrapOptions,
+  type WrapPlan,
+  type WrapResult,
+} from "./wrap.js";
+export {
   type ArrowShape,
   type BoxShape,
   type ConeShape,

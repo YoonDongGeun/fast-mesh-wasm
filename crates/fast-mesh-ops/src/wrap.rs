@@ -34,9 +34,10 @@
 //! and openings narrower than `2r` are spanned. Every result vertex lies
 //! within about `r` (plus a voxel) of the input. Interior cavities are
 //! filled: the result is the outer envelope. Features thinner than a voxel
-//! may vanish or break into pieces, and a surface that encloses no volume
-//! at this gap (a single open sheet, say) wraps to nothing, which is an
-//! error.
+//! may vanish or break into pieces. A shell with a hole wider than the gap is
+//! open to the outside: its inside is not filled, and its walls, which have
+//! no thickness, are lost but for the fillets of its concave creases. When
+//! nothing is left (a smooth open sheet), that is an error.
 //!
 //! The grid is planned before anything is allocated: [`wrap_plan`] reports
 //! its dimensions, voxel count and estimated memory for given bounds, and

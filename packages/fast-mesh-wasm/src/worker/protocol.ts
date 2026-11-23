@@ -6,6 +6,7 @@ import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
+import type { WrapOptions, WrapPlan } from "../wrap.js";
 import type {
   NormalizedBooleanOptions,
   NormalizedDyntopoOptions,
@@ -329,6 +330,8 @@ export type Request =
   | { kind: "convexHull"; rev: number; addedId: ClientId; meshes: ClientId[]; normals: boolean; qid: number }
   /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
   | { kind: "convexHullPoints"; rev: number; addedId: ClientId; points: Float64Array; normals: boolean; qid: number }
+  /** `Scene.wrap`; replies with the wrap's counts and grid. */
+  | { kind: "wrap"; rev: number; addedId: ClientId; meshes: ClientId[]; options: WrapOptions; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
   /** `Scene.denoise`; replies with its report. */
   | { kind: "denoise"; rev: number; id: ClientId; options: DenoiseOptions; qid: number }
@@ -400,6 +403,7 @@ export interface QueryMap {
   fitPrimitive: { args: { mesh: ClientId; options: FitPrimitiveOptions }; value: FittedPrimitiveReport };
   sliceContours: { args: { mesh: ClientId; origin: Vec3; normal: Vec3 }; value: ContourSlice };
   sliceContourStack: { args: { mesh: ClientId; origin: Vec3; normal: Vec3; spacing: number; count: number }; value: ContourSlice[] };
+  wrapPlan: { args: { meshes: ClientId[]; options: WrapOptions }; value: WrapPlan };
   /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
   generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
@@ -613,6 +617,7 @@ export function keyOf(req: Request): string | undefined {
     case "reconstructPointCloud":
     case "convexHull":
     case "convexHullPoints":
+    case "wrap":
       return `mesh:${req.addedId}`;
     case "placeMesh":
       return req.addedId !== undefined ? `mesh:${req.addedId}` : `edit:${req.target}`;

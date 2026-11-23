@@ -888,6 +888,7 @@ class Engine {
       case "reconstructPointCloud":
       case "convexHull":
       case "convexHullPoints":
+      case "wrap":
       case "punchDrainHole":
       case "placeMesh":
       case "moveWithCollision":
@@ -958,6 +959,8 @@ class Engine {
             return a.options?.mesh === undefined || this.#pending(a.options.mesh);
           case "findContacts":
             return a.pairs === undefined || this.#pending(...a.pairs.flat());
+          case "wrapPlan":
+            return this.#pending(...(req.args as QueryMap["wrapPlan"]["args"]).meshes);
           default:
             return this.#pending(a.a, a.b, a.mesh, a.source, a.target);
         }
@@ -2003,6 +2006,13 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "wrap": {
+        this.#ensureUnused(req.addedId);
+        const { mesh, ...value } = s.wrap(this.#meshList(req.meshes), req.options);
+        this.#bindAdded(req.addedId, mesh);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "hollowMesh": {
         const value = s.hollowMesh(this.#mesh(req.id), req.options);
         b.replies.push({ qid: req.qid, ok: true, value });
@@ -2378,6 +2388,10 @@ class Engine {
       case "selfIntersectingTriangles": {
         const a = args as QueryMap["selfIntersectingTriangles"]["args"];
         return s.selfIntersectingTriangles(this.#mesh(a.mesh));
+      }
+      case "wrapPlan": {
+        const a = args as QueryMap["wrapPlan"]["args"];
+        return s.wrapPlan(this.#meshList(a.meshes), a.options);
       }
       case "findContacts": {
         const a = args as QueryMap["findContacts"]["args"];
