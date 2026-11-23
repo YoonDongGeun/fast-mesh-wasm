@@ -121,6 +121,7 @@ function AngleLayer(props: { app: AppState; items: readonly Item[] }) {
   const points = useApp(app, (s) => s.objectInfo.angle);
   const parts = useMemo(() => {
     const group = new THREE.Group();
+    group.name = "object-info-angle";
     const arms = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: ANGLE_COLOR }));
     const arc = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: ANGLE_COLOR }));
     arms.frustumCulled = false;
@@ -180,6 +181,7 @@ function AngleLayer(props: { app: AppState; items: readonly Item[] }) {
 /** The box's twelve edges and its three dimension labels, under `parent` (local box) or the scene (world box). */
 function makeBoxParts() {
   const group = new THREE.Group();
+  group.name = "object-info-box";
   group.matrixAutoUpdate = false;
   const lines = makeLines(BOX_COLOR);
   const labels = [0, 1, 2].map(() => makeLabelSprite("#7fd4ff"));
@@ -300,7 +302,11 @@ function WorldBox(props: { scene: Scene | WorkerScene; item: Item; unit: LengthU
 function NormalsOverlay(props: { scene: Scene | WorkerScene; item: Item; mode: Exclude<NormalsMode, "off">; length: number }) {
   const { scene, item, mode, length } = props;
   const version = useGeometryVersion(item.mesh);
-  const lines = useMemo(() => makeLines(mode === "face" ? FACE_NORMAL_COLOR : VERTEX_NORMAL_COLOR), [mode]);
+  const lines = useMemo(() => {
+    const made = makeLines(mode === "face" ? FACE_NORMAL_COLOR : VERTEX_NORMAL_COLOR);
+    made.name = "object-info-normals";
+    return made;
+  }, [mode]);
   useEffect(() => () => disposeObject(lines), [lines]);
   useAttachToMesh(lines, item.mesh);
 
