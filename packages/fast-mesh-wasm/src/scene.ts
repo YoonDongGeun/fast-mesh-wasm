@@ -13,6 +13,16 @@ import {
   type DenoiseReport,
 } from "./denoise.js";
 import {
+  decodeExtrudeBase,
+  decodeExtrudeFaces,
+  type ExtrudeBaseOptions,
+  type ExtrudeBaseResult,
+  type ExtrudeFacesOptions,
+  type ExtrudeFacesResult,
+  extrudeBaseArgs,
+  extrudeFacesArgs,
+} from "./extrude.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -5756,6 +5766,69 @@ export class Scene implements SceneLike {
     const { index, generation } = this.#id(mesh);
     const raw = call(() => this.#scene().delete_selected_faces(index, generation, normalizeU32Selection(selectedTris)));
     return decodeFaceEditReport(raw);
+  }
+
+  /**
+   * Extrudes `triangles` of `mesh`: moves them by `options.distance` (world
+   * units) and builds side walls between where the selection's boundary was
+   * and where it went, as one undo step. A closed, consistently wound mesh
+   * stays closed and consistently wound.
+   *
+   * Each region of the selection moves along its average normal by default;
+   * see {@link ExtrudeFacesOptions.direction}. Selections with holes get walls
+   * around them, and regions that touch at a vertex separate there. Selected
+   * edges on the mesh's open boundary get walls too. The triangles keep their
+   * slots and are the moved faces, so the same selection extrudes them again.
+   *
+   * Self-intersections of the result are reported, not refused: pushing a
+   * face through the other side of a thin part, say, gives a closed mesh that
+   * crosses itself.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty selection, a slot
+   *   without a live triangle, a distance or direction that is zero or not
+   *   finite, a selected edge shared by three or more triangles, selected
+   *   triangles wound against each other, or a region whose normals cancel out
+   *   (give a direction then); `UNKNOWN_MESH` for a removed mesh. The mesh is
+   *   unchanged on error.
+   */
+  extrudeFaces(mesh: MeshHandle, triangles: Indices, options: ExtrudeFacesOptions): ExtrudeFacesResult {
+    const { index, generation } = this.#id(mesh);
+    const tris = normalizeU32Selection(triangles, "triangles");
+    const { distance, mode, direction, check } = extrudeFacesArgs(options);
+    return decodeExtrudeFaces(
+      call(() => this.#scene().extrude_faces(index, generation, tris, distance, mode, direction, check)),
+    );
+  }
+
+  /**
+   * Turns an open surface into a solid, as one undo step: runs boundary loops
+   * of `mesh` along a world direction (down by default) to a flat plane
+   * perpendicular to it, joins each with a wall and closes it with a flat cap.
+   * The plane is at `options.height`, or `options.offset` past the mesh's
+   * furthest vertex.
+   *
+   * By default only the longest loop is extruded, so fill smaller holes first
+   * (or pass `loops: "all"`, which makes them holes through the solid). A
+   * surface that faces the base is turned around, so that the solid faces
+   * outward ({@link ExtrudeBaseResult.flipped}).
+   *
+   * Self-intersections of the result are reported, not refused: a plane that
+   * cuts through the surface, say.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` when the mesh has no boundary
+   *   loop, a loop is open or not clean (orient or repair the mesh first), a
+   *   boundary vertex does not lie before the plane, or a loop's outline on
+   *   the plane crosses itself; `STALE_LOOPS` for a loop id that matches no
+   *   loop; `UNKNOWN_MESH` for a removed mesh. The mesh is unchanged on error.
+   */
+  extrudeBase(mesh: MeshHandle, options: ExtrudeBaseOptions): ExtrudeBaseResult {
+    const { index, generation } = this.#id(mesh);
+    const a = extrudeBaseArgs(options);
+    return decodeExtrudeBase(
+      call(() =>
+        this.#scene().extrude_base(index, generation, a.direction, a.plane, a.value, a.which, a.loops, a.refine, a.check),
+      ),
+    );
   }
 
   /** Extracts `selectedTris` into a new standalone mesh preserving exact world coordinates. */

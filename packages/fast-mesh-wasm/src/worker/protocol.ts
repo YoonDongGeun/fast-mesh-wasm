@@ -5,6 +5,7 @@
 import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
+import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
 import type {
@@ -313,6 +314,10 @@ export type Request =
   /** `Scene.setFieldInteraction`. */
   | { kind: "fieldInteraction"; rev: number; points: number | null }
   | { kind: "deleteSelectedFaces"; rev: number; id: ClientId; selectedTris: Uint32Array; qid: number }
+  /** `Scene.extrudeFaces`; replies with its result. */
+  | { kind: "extrudeFaces"; rev: number; id: ClientId; triangles: Uint32Array; options: ExtrudeFacesOptions; qid: number }
+  /** `Scene.extrudeBase`; replies with its result. */
+  | { kind: "extrudeBase"; rev: number; id: ClientId; options: ExtrudeBaseOptions; qid: number }
   | { kind: "extractSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
   | { kind: "splitSelectedFaces"; rev: number; id: ClientId; addedId: ClientId; selectedTris: Uint32Array; normals: boolean; qid: number }
   | { kind: "applyFfd"; rev: number; id: ClientId; options: FfdOptions; qid: number }
@@ -599,6 +604,8 @@ export function keyOf(req: Request): string | undefined {
     case "applyDyntopo":
     case "dyntopoDab":
     case "deleteSelectedFaces":
+    case "extrudeFaces":
+    case "extrudeBase":
     case "splitSelectedFaces":
     case "applyFfd":
     case "applyArap":

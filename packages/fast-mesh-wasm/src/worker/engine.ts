@@ -906,6 +906,8 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "applyFfd":
       case "applyArap":
       case "applyKelvinlet":
@@ -1031,6 +1033,8 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "splitSelectedFaces":
       case "applyFfd":
       case "applyArap":
@@ -1358,6 +1362,8 @@ class Engine {
       case "applyDyntopo":
       case "dyntopoDab":
       case "deleteSelectedFaces":
+      case "extrudeFaces":
+      case "extrudeBase":
       case "splitSelectedFaces":
       case "applyFfd":
       case "applyArap":
@@ -1910,6 +1916,16 @@ class Engine {
       }
       case "deleteSelectedFaces": {
         const value = s.deleteSelectedFaces(this.#mesh(req.id), req.selectedTris);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "extrudeFaces": {
+        const value = s.extrudeFaces(this.#mesh(req.id), req.triangles, req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "extrudeBase": {
+        const value = s.extrudeBase(this.#mesh(req.id), req.options);
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }

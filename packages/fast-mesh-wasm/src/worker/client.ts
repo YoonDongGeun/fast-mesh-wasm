@@ -16,6 +16,14 @@ import {
   type DenoiseReport,
 } from "../denoise.js";
 import {
+  type ExtrudeBaseOptions,
+  type ExtrudeBaseResult,
+  type ExtrudeFacesOptions,
+  type ExtrudeFacesResult,
+  extrudeBaseArgs,
+  extrudeFacesArgs,
+} from "../extrude.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -2744,6 +2752,35 @@ export class WorkerScene implements SceneLike {
         return { kind: "deleteSelectedFaces", rev, id: st.id, selectedTris: tris, qid };
       },
       (v) => v as FaceEditReport,
+    );
+  }
+
+  /** Extrudes a face selection in the Worker, one undo step (see `Scene.extrudeFaces`). */
+  extrudeFaces(mesh: MeshHandle, triangles: Indices, options: ExtrudeFacesOptions): Promise<ExtrudeFacesResult> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const tris = normalizeU32Selection(triangles, "triangles");
+        extrudeFacesArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "extrudeFaces", rev, id: st.id, triangles: tris, options: cloned, qid };
+      },
+      (v) => v as ExtrudeFacesResult,
+    );
+  }
+
+  /** Extrudes a mesh's boundary to a flat base in the Worker, one undo step (see `Scene.extrudeBase`). */
+  extrudeBase(mesh: MeshHandle, options: ExtrudeBaseOptions): Promise<ExtrudeBaseResult> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        extrudeBaseArgs(options);
+        const cloned = copyInput(options, "options");
+        this.#endDragOn(st);
+        return { kind: "extrudeBase", rev, id: st.id, options: cloned, qid };
+      },
+      (v) => v as ExtrudeBaseResult,
     );
   }
 

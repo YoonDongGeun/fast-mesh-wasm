@@ -43,6 +43,13 @@ export type {
   DenoiseReport,
   SurfaceStats,
 } from "./denoise.js";
+export type {
+  ExtrudeBaseOptions,
+  ExtrudeBaseResult,
+  ExtrudeDirection,
+  ExtrudeFacesOptions,
+  ExtrudeFacesResult,
+} from "./extrude.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export {
   DEFAULT_WRAP_DETAIL,
