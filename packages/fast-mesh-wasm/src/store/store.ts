@@ -16,6 +16,7 @@ import type {
   MeshHandle,
   AutoRepairReport,
   AutoRepairRequest,
+  RemoveMeshOptions,
   RepairOp,
   RepairReport,
   RepairReportOf,
@@ -152,6 +153,15 @@ interface MeshEntry {
   keys?: readonly string[];
 }
 
+/** A mesh that left the store and that undo or redo can bring back. */
+interface ParkedMesh {
+  entry: MeshEntry;
+  /** The colourings measured to it that it took along: what each was, and what was left. */
+  colorings: { entry: MeshEntry; before: DistanceColoring; left: DistanceColoring }[];
+  /** The sections that cut it. */
+  sections: SectionEntry[];
+}
+
 /** The aspects of a section the store sets one by one. */
 const ASPECTS = ["plane", "meshes", "fill"] as const;
 type Aspect = (typeof ASPECTS)[number];
@@ -268,6 +278,8 @@ export class SceneStore {
   readonly #host: Host;
   readonly #meshes = new Map<MeshHandle, MeshEntry>();
   readonly #sections = new Map<SectionHandle, SectionEntry>();
+  /** Meshes that left the scene and that undo or redo can bring back. */
+  readonly #parked = new Map<MeshHandle, ParkedMesh>();
   readonly #listeners = new Set<() => void>();
   readonly #unsubscribe: (() => void)[];
   /** Meshes whose display changed since the last flush. */
@@ -335,7 +347,13 @@ export class SceneStore {
         this.#queueUpdate();
       }
     };
-    this.#unsubscribe = [scene.onChanges(event), this.#host.onStatus(event), () => this.#host.stop()];
+    const changes = (records: MeshChange[]): void => {
+      if (!this.#disposed) {
+        this.#followChanges(records);
+      }
+      event();
+    };
+    this.#unsubscribe = [scene.onChanges(changes), this.#host.onStatus(event), () => this.#host.stop()];
     this.#update();
   }
 
@@ -389,7 +407,12 @@ export class SceneStore {
 
   // ---- Meshes ----
 
-  /** Adds a mesh (default display) and returns its handle at once. */
+  /**
+   * Adds a mesh (default display) and returns its handle at once. With
+   * `undoable` the add is an undo step, or part of the open one: undo takes
+   * the mesh out of the snapshot, and redo brings it back with the same
+   * handle and display.
+   */
   addMesh(positions: Positions64, indices: Indices, options?: StoreAddMeshOptions): MeshHandle {
     this.#alive();
     const handle = this.#host.addMesh(positions, indices, options);
@@ -434,11 +457,41 @@ export class SceneStore {
    * flush until its colouring changes. A colouring measured to it and other
    * meshes keeps the others (its `distanceTo` loses the mesh). It leaves its
    * contact groups, whose members' partners follow. Sections stop cutting it.
+   *
+   * With `undoable` the removal is an undo step, or part of the open one
+   * ({@link isRestorable} tells whether it can still be undone). The undo
+   * brings the mesh back into the snapshot with the same handle and display,
+   * puts it back into the sections that cut it, and colours again the meshes
+   * that were coloured by distance to it (unless their colouring was changed
+   * since). It does not rejoin its contact groups.
    */
-  removeMesh(mesh: MeshHandle): void {
+  removeMesh(mesh: MeshHandle, options?: RemoveMeshOptions): void {
     this.#alive();
-    this.#host.removeMesh(mesh);
+    this.#host.removeMesh(mesh, options);
+    this.#leave(mesh);
+    this.#update();
+  }
+
+  /**
+   * Whether undo or redo can still bring back a mesh that left the store: it
+   * was removed with `undoable`, or its undoable add was undone, and the
+   * history has not dropped the step. `false` for a mesh in the store.
+   */
+  isRestorable(mesh: MeshHandle): boolean {
+    this.#alive();
+    return this.#parked.has(mesh) && this.#host.presence(mesh) === "restorable";
+  }
+
+  /**
+   * A mesh is out of the scene (removed here, or by the undo of its add or
+   * the redo of its removal): it leaves the snapshot and whatever names it.
+   * Kept aside while undo or redo can bring it back.
+   */
+  #leave(mesh: MeshHandle): void {
+    const restorable = this.#host.presence(mesh) === "restorable";
     const entry = this.#meshes.get(mesh);
+    const parked: ParkedMesh | undefined =
+      restorable && entry !== undefined ? { entry, colorings: [], sections: [] } : undefined;
     if (entry !== undefined) {
       this.#meshes.delete(mesh);
       this.#pendingDisplay.delete(entry);
@@ -450,56 +503,22 @@ export class SceneStore {
       const field = entry.field === undefined ? undefined : `field:${entry.field.id}`;
       this.#host.forgetErrors((k) => k === display || k === field);
     }
+    if (parked !== undefined) {
+      this.#parked.set(mesh, parked);
+    }
     if (this.#selection === mesh) {
       this.#selection = null;
     }
     for (const other of this.#meshes.values()) {
-      // A colouring measured to the mesh and others keeps the others.
-      const prune = (d: DisplayState): DisplayState => {
-        const c = withoutTarget(d.coloring, mesh);
-        return c === d.coloring ? d : Object.freeze({ ...d, coloring: c });
-      };
-      const before = [other.display, other.desired, other.sent];
-      other.display = prune(other.display);
-      other.desired = prune(other.desired);
-      other.sent = withoutTarget(other.sent, mesh);
-      if (other.inflight !== undefined) {
-        other.inflight.value = withoutTarget(other.inflight.value, mesh);
+      const before = other.desired.coloring;
+      if (parked !== undefined && before !== null && targetsOf(before.distanceTo).includes(mesh)) {
+        const left = withoutTarget(before, mesh) as DistanceColoring;
+        parked.colorings.push({ entry: other, before, left });
       }
-      if (other.display !== before[0] || other.desired !== before[1] || other.sent !== before[2]) {
-        this.#dirtyMeshes.add(other.handle);
-      }
-      const owned = other.field;
-      if (owned === undefined || !owned.to.includes(mesh)) {
-        continue;
-      }
-      if (owned.to.length > 1) {
-        // The scene keeps the field without the mesh, and the colouring.
-        const at = owned.to.indexOf(mesh);
-        other.field = {
-          ...owned,
-          to: owned.to.filter((_, k) => k !== at),
-          toIds: owned.toIds.filter((_, k) => k !== at),
-        };
-        // Re-derived, which also re-indexes it under its remaining targets' keys.
-        this.#dirtyMeshes.add(other.handle);
-        continue;
-      }
-      // Gone from the scene with the mesh, and so is a colouring by it.
-      const fieldKey = `field:${owned.id}`;
-      this.#host.forgetErrors((k) => k === fieldKey);
-      other.field = undefined;
-      other.sent = null;
-      other.inflight = undefined;
-      this.#dirtyMeshes.add(other.handle);
-      if (other.display.coloring !== null) {
-        other.display = Object.freeze({ ...other.display, coloring: null });
-      }
-      if (other.desired.coloring !== null) {
-        // The flush tries the rule again and reports why it cannot apply.
-        this.#pendingDisplay.add(other);
-        this.#schedule();
-      }
+      this.#dropTarget(other, mesh);
+    }
+    if (parked !== undefined) {
+      parked.sections = [...this.#sections.values()].filter((s) => s.desired.meshes.includes(mesh));
     }
     const without = (meshes: readonly MeshHandle[]): readonly MeshHandle[] =>
       meshes.includes(mesh) ? Object.freeze(meshes.filter((m) => m !== mesh)) : meshes;
@@ -543,7 +562,157 @@ export class SceneStore {
         }
       }
     }
-    this.#update();
+  }
+
+  /** `mesh` is no longer a target of `other`'s colouring and store-owned field. */
+  #dropTarget(other: MeshEntry, mesh: MeshHandle): void {
+    // A colouring measured to the mesh and others keeps the others.
+    const prune = (d: DisplayState): DisplayState => {
+      const c = withoutTarget(d.coloring, mesh);
+      return c === d.coloring ? d : Object.freeze({ ...d, coloring: c });
+    };
+    const before = [other.display, other.desired, other.sent];
+    other.display = prune(other.display);
+    other.desired = prune(other.desired);
+    other.sent = withoutTarget(other.sent, mesh);
+    if (other.inflight !== undefined) {
+      other.inflight.value = withoutTarget(other.inflight.value, mesh);
+    }
+    if (other.display !== before[0] || other.desired !== before[1] || other.sent !== before[2]) {
+      this.#dirtyMeshes.add(other.handle);
+    }
+    const owned = other.field;
+    if (owned === undefined || !owned.to.includes(mesh)) {
+      return;
+    }
+    if (owned.to.length > 1) {
+      // The scene keeps the field without the mesh, and the colouring.
+      const at = owned.to.indexOf(mesh);
+      other.field = {
+        ...owned,
+        to: owned.to.filter((_, k) => k !== at),
+        toIds: owned.toIds.filter((_, k) => k !== at),
+      };
+      // Re-derived, which also re-indexes it under its remaining targets' keys.
+      this.#dirtyMeshes.add(other.handle);
+      return;
+    }
+    // Gone from the scene with the mesh, and so is a colouring by it.
+    const fieldKey = `field:${owned.id}`;
+    this.#host.forgetErrors((k) => k === fieldKey);
+    other.field = undefined;
+    other.sent = null;
+    other.inflight = undefined;
+    this.#dirtyMeshes.add(other.handle);
+    if (other.display.coloring !== null) {
+      other.display = Object.freeze({ ...other.display, coloring: null });
+    }
+    if (other.desired.coloring !== null) {
+      // The flush tries the rule again and reports why it cannot apply.
+      this.#pendingDisplay.add(other);
+      this.#schedule();
+    }
+  }
+
+  /**
+   * A parked mesh is back in the scene: it comes back into the snapshot as
+   * it was. The scene kept its own field and colouring; the colourings
+   * measured to it and the sections that cut it are asked for again.
+   */
+  #comeBack(mesh: MeshHandle): void {
+    const parked = this.#parked.get(mesh);
+    if (parked === undefined) {
+      return;
+    }
+    this.#parked.delete(mesh);
+    const { entry } = parked;
+    this.#meshes.set(mesh, entry);
+    this.#dirtyMeshes.add(mesh);
+    if (entry.inflight !== undefined) {
+      this.#inflightMeshes.add(entry);
+    }
+    // What its own colouring was measured to may be gone for good by now.
+    const own = [entry.desired.coloring, entry.sent].flatMap((c) => (c === null ? [] : targetsOf(c.distanceTo)));
+    for (const target of new Set([...own, ...(entry.field?.to ?? [])])) {
+      if (this.#host.presence(target) !== "live") {
+        this.#dropTarget(entry, target);
+      }
+    }
+    if (!sameData(entry.desired, entry.display) || !sameData(entry.desired.coloring, entry.sent)) {
+      this.#pendingDisplay.add(entry);
+      this.#schedule();
+    }
+    for (const { entry: other, before, left } of parked.colorings) {
+      const shown = this.#meshes.get(other.handle) === other;
+      if (!shown && this.#parked.get(other.handle)?.entry !== other) {
+        continue;
+      }
+      if (
+        !sameData(other.desired.coloring, left) ||
+        !targetsOf(before.distanceTo).every((m) => this.#host.presence(m) === "live")
+      ) {
+        continue;
+      }
+      other.desired = Object.freeze({ ...other.desired, coloring: before });
+      if (shown) {
+        this.#dirtyMeshes.add(other.handle);
+        this.#pendingDisplay.add(other);
+        this.#schedule();
+      }
+    }
+    for (const s of parked.sections) {
+      if (this.#sections.get(s.handle) !== s || s.desired.meshes.includes(mesh)) {
+        continue;
+      }
+      s.desired = this.#withMeshes(s.desired, Object.freeze([...s.desired.meshes, mesh]));
+      this.#dirtySections.add(s.handle);
+      this.#pendingSections.add(s);
+      this.#schedule();
+    }
+  }
+
+  /** Follows a frame's change records: meshes undo or redo took out of the scene or brought back. */
+  #followChanges(records: readonly MeshChange[]): void {
+    for (const c of records) {
+      if (c.removed) {
+        if (this.#meshes.has(c.mesh) && this.#host.presence(c.mesh) !== "live") {
+          this.#leave(c.mesh);
+        }
+      } else if (this.#parked.has(c.mesh) && this.#host.presence(c.mesh) === "live") {
+        this.#comeBack(c.mesh);
+      }
+    }
+    this.#dropGone();
+  }
+
+  /**
+   * Follows the history at once, as a local scene applies it (a Worker's
+   * comes with the change records).
+   */
+  #followHistory(): void {
+    if (this.mode === "worker") {
+      return;
+    }
+    for (const mesh of [...this.#meshes.keys()]) {
+      if (this.#host.presence(mesh) !== "live") {
+        this.#leave(mesh);
+      }
+    }
+    for (const mesh of [...this.#parked.keys()]) {
+      if (this.#host.presence(mesh) === "live") {
+        this.#comeBack(mesh);
+      }
+    }
+    this.#dropGone();
+  }
+
+  /** Forgets the parked meshes nothing can bring back any more. */
+  #dropGone(): void {
+    for (const mesh of [...this.#parked.keys()]) {
+      if (this.#host.presence(mesh) === "gone") {
+        this.#parked.delete(mesh);
+      }
+    }
   }
 
   /** `parts` with `meshes`, the same object when they are. */
@@ -650,17 +819,23 @@ export class SceneStore {
 
   // ---- History ----
 
-  /** Undoes the latest step. */
+  /**
+   * Undoes the latest step. A mesh the step added undoably leaves the
+   * snapshot and one it removed undoably comes back: at once on a local
+   * scene, with the frame that delivers the result on a Worker scene.
+   */
   undo(): void {
     this.#alive();
     this.#host.undo();
+    this.#followHistory();
     this.#update();
   }
 
-  /** Redoes the latest undone step. */
+  /** Redoes the latest undone step; meshes follow as for {@link undo}. */
   redo(): void {
     this.#alive();
     this.#host.redo();
+    this.#followHistory();
     this.#update();
   }
 
@@ -682,6 +857,7 @@ export class SceneStore {
   cancelStep(): void {
     this.#alive();
     this.#host.cancelStep();
+    this.#followHistory();
     this.#update();
   }
 
@@ -1048,6 +1224,7 @@ export class SceneStore {
     }
     this.#pendingDisplay.clear();
     this.#pendingSections.clear();
+    this.#parked.clear();
   }
 
   // ---- Internals ----

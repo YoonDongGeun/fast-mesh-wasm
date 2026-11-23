@@ -120,12 +120,21 @@ export type Request =
       /**
        * Add in place, in the batch's own result (a restart's replay), never
        * in the background: by default a large mesh is built in the
-       * background and lands with a later result or `update` message.
+       * background and lands with a later result or `update` message. An
+       * `undoable` add is always in place, so that it lands in its step.
        */
       inline?: boolean;
       key?: string;
     }
-  | { kind: "removeMesh" | "compact"; rev: number; id: ClientId; key?: string }
+  | {
+      kind: "removeMesh";
+      rev: number;
+      id: ClientId;
+      /** Remove it as an undo step (see `RemoveMeshOptions`). */
+      undoable?: boolean;
+      key?: string;
+    }
+  | { kind: "compact"; rev: number; id: ClientId; key?: string }
   | {
       kind: "setPlacement";
       rev: number;
@@ -448,6 +457,8 @@ export interface MeshChangeWire {
   id: ClientId;
   added: boolean;
   removed: boolean;
+  /** Only on a removal: undo or redo can bring the mesh back (see `MeshChange`). */
+  restorable?: true;
   placementChanged: boolean;
   capacityChanged: boolean;
   positions: Range[] | "all";
@@ -498,6 +509,13 @@ export interface Result {
    */
   sections: { section: ClientId; mesh: ClientId; result: SectionResultWire | null }[];
   history: { canUndo: boolean; canRedo: boolean };
+  /**
+   * Where each mesh that an undoable add or removal, or its undo or redo,
+   * moved in this batch now is: in the scene (`"live"`), out of it but kept
+   * by the history (`"parked"`), or out of it for good (`"gone"`: the history
+   * dropped a parked mesh). Omitted when there is none.
+   */
+  presence?: { id: ClientId; state: "live" | "parked" | "gone" }[];
   /**
    * The outcome of every keyed request run in this batch, in order (a
    * request dropped as superseded, or an abandoned field build, has none).

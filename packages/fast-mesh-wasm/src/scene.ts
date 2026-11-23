@@ -309,10 +309,22 @@ const rawIds = new WeakMap<FieldHandle | SectionHandle, HandleId>();
  */
 export interface MeshChange {
   mesh: MeshHandle;
-  /** The mesh was added; every buffer is `"all"`. */
+  /**
+   * The mesh was added, or is back (an undone removal, a redone add); every
+   * buffer is `"all"`. A mesh that is back has the handle it had.
+   */
   added: boolean;
-  /** The mesh was removed; drop its GPU buffers. Nothing else is set. */
+  /**
+   * The mesh was removed (by a call, by the undo of its add or by the redo
+   * of its removal); drop its GPU buffers. Nothing else is set but
+   * {@link MeshChange.restorable}.
+   */
   removed: boolean;
+  /**
+   * Only on a removal: undo or redo can bring the mesh back, as `added` with
+   * the same handle (see {@link Scene.isRestorable}). Keep what shows it.
+   */
+  restorable?: true;
   /** Its placement changed: read {@link Scene.matrix4} again. */
   placementChanged: boolean;
   /**
@@ -412,6 +424,22 @@ export interface AddMeshOptions {
    * see `docs/uv-channel.md`. Weld keeps seams apart.
    */
   uvs?: Float32Array | readonly number[];
+  /**
+   * Record the add in the history, in the open step or as a step of its own:
+   * undo removes the mesh, redo brings it back with the same handle. Defaults
+   * to `false` (the add is permanent).
+   */
+  undoable?: boolean;
+}
+
+/** Options of {@link Scene.removeMesh}. */
+export interface RemoveMeshOptions {
+  /**
+   * Remove the mesh as an undo step, or as part of the open one: undo brings
+   * it back with the same handle. Defaults to `false` (removed for good, and
+   * its history entries with it).
+   */
+  undoable?: boolean;
 }
 
 /** Options of the {@link Scene} constructor. */
@@ -3239,8 +3267,10 @@ export function meshAdds(scene: Scene): MeshAdds {
 export class Scene implements SceneLike {
   #raw: WasmScene | undefined;
   readonly #guard: ViewGuard | undefined;
-  /** Live meshes' handles by `"index:generation"`. */
+  /** Handles by `"index:generation"`, of live meshes and of those undo or redo can bring back. */
   readonly #meshes = new Map<string, MeshHandle>();
+  /** A handle in `#meshes` may be of a mesh the history has dropped since. */
+  #prune = false;
   /** Handles of meshes removed since the last `takeChanges`, for their removal records. */
   readonly #removed = new Map<string, MeshHandle>();
   /** The rule each coloured mesh was last given by `setColoring`. */
@@ -3537,12 +3567,16 @@ export class Scene implements SceneLike {
     const p = toFloat64(positions);
     const i = toUint32(indices);
     const normals = options.normals ?? true;
-    if (options.uvs === undefined) {
-      const id = call(() => s.add_mesh(p, i, origin, mode, normals));
-      return this.#meshHandle(id[0], id[1]);
-    }
-    const uvs = options.uvs instanceof Float32Array ? options.uvs : Float32Array.from(options.uvs);
-    const id = call(() => s.add_mesh_with_uvs(p, i, uvs, origin, mode, normals));
+    const uvs =
+      options.uvs === undefined || options.uvs instanceof Float32Array ? options.uvs : Float32Array.from(options.uvs);
+    const id = call(() => {
+      if (options.undoable === true) {
+        return s.add_mesh_undoable(p, i, uvs, origin, mode, normals);
+      }
+      return uvs === undefined
+        ? s.add_mesh(p, i, origin, mode, normals)
+        : s.add_mesh_with_uvs(p, i, uvs, origin, mode, normals);
+    });
     return this.#meshHandle(id[0], id[1]);
   }
 
@@ -3550,17 +3584,49 @@ export class Scene implements SceneLike {
    * Removes a mesh. Its handle then gives `UNKNOWN_MESH`. An active drag of
    * the mesh is ended first, closing its step; the mesh's history entries
    * (the drag's included) are then dropped with it.
+   *
+   * With `undoable` the removal is an undo step (or part of the open one)
+   * and the history stays: {@link Scene.undo} brings the mesh back with the
+   * same handle, its data, placement, display (normals, colouring) and the
+   * fields on it. Nothing is copied, whatever the mesh's size. What belongs
+   * to other meshes is cut as by any removal and does not come back: fields
+   * on other meshes measured to it, its section entries and its collision
+   * rules. The kept mesh counts against the history's memory budget, and is
+   * freed once the history drops the step (see {@link Scene.isRestorable}).
    */
-  removeMesh(mesh: MeshHandle): void {
+  removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
     // A drag of this mesh ends first, recording its moves as one step.
     if (this.#drag?.mesh === mesh) {
       this.#drag.end();
     }
+    if (options.undoable === true) {
+      // Its handle stays known, for the way back.
+      call(() => this.#scene().remove_mesh_undoable(index, generation));
+      this.#prune = true;
+      return;
+    }
     call(() => this.#scene().remove_mesh(index, generation));
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+  }
+
+  /** Whether the scene has `mesh`: `false` once it is removed, or its add is undone. */
+  has(mesh: MeshHandle): boolean {
+    const { index, generation } = this.#id(mesh);
+    return this.#peek().has_mesh(index, generation);
+  }
+
+  /**
+   * Whether undo or redo can still bring back `mesh`: it was removed with
+   * `undoable`, or its undoable add was undone, and the history has not
+   * dropped the step (its memory budget, {@link Scene.clearHistory}, or a
+   * new step after an undone add). `false` for a mesh in the scene.
+   */
+  isRestorable(mesh: MeshHandle): boolean {
+    const { index, generation } = this.#id(mesh);
+    return this.#peek().is_restorable(index, generation);
   }
 
   /**
@@ -3606,8 +3672,8 @@ export class Scene implements SceneLike {
    * boundary of an open mesh stays open. A mesh without UVs is read by vertex
    * index, so its split vertices are such a boundary: weld it first.
    *
-   * The cut undoes in one step; the added mesh stays, like the removed
-   * source of {@link Scene.join}.
+   * The cut and the added mesh are one undo step: undo restores the mesh
+   * and removes the added one, redo brings it back with the same handle.
    *
    * @deprecated Use `scene.boolean.cut()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` when
@@ -3714,9 +3780,8 @@ export class Scene implements SceneLike {
    * with them; with one origin too, its vertices are exactly theirs.
    * Otherwise it is built in world space at the identity placement.
    *
-   * The new mesh is added empty and the hull lands in it as one undo step:
-   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
-   * {@link Scene.redo} fills it again.
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
    *
    * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list or when the
    *   vertices have no volume (all on one point, line or plane; the message
@@ -4421,6 +4486,7 @@ export class Scene implements SceneLike {
         mesh: this.#meshHandle(c.index, c.generation),
         added: c.added,
         removed: c.removed,
+        ...(c.restorable ? { restorable: true as const } : {}),
         placementChanged: c.placementChanged,
         capacityChanged: c.capacityChanged,
         positions: c.positions,
@@ -4436,15 +4502,26 @@ export class Scene implements SceneLike {
         ),
       }),
     );
-    // A removed mesh's id never matches again: drop its handle, whatever
-    // removed it. Every removal is in this message (or was never reported,
-    // for a mesh added and removed in between), so removed handles can go.
+    // The id of a mesh removed for good never matches again: drop its
+    // handle, whatever removed it. Every removal is in this message (or was
+    // never reported, for a mesh added and removed in between), so removed
+    // handles can go. A restorable one is kept for the way back, until the
+    // history drops it.
     for (const c of raw) {
-      if (c.removed) {
+      if (c.removed && !c.restorable) {
         this.#meshes.delete(`${c.index}:${c.generation}`);
       }
     }
     this.#removed.clear();
+    if (this.#prune) {
+      this.#prune = false;
+      for (const [key, handle] of this.#meshes) {
+        const { index, generation } = meshIds.get(handle) as HandleId;
+        if (!s.has_mesh(index, generation) && !s.is_restorable(index, generation)) {
+          this.#meshes.delete(key);
+        }
+      }
+    }
     return out;
   }
 
@@ -4486,12 +4563,15 @@ export class Scene implements SceneLike {
   /**
    * Undoes the latest step; an active drag is ended first. Without an open
    * step around the drag, the drag is what gets undone; inside a caller's
-   * open step, that whole step (drag included) is closed and undone. Returns
-   * `false` when there is nothing to undo.
+   * open step, that whole step (drag included) is closed and undone. A mesh
+   * the step added undoably leaves the scene, and one it removed undoably
+   * comes back (see {@link MeshChange.added}). Returns `false` when there is
+   * nothing to undo.
    */
   undo(): boolean {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     const done = call(() => s.undo());
     this.#stepDepth = 0;
     return done;
@@ -4501,6 +4581,7 @@ export class Scene implements SceneLike {
   redo(): boolean {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     const done = call(() => s.redo());
     this.#stepDepth = 0;
     return done;
@@ -4522,14 +4603,15 @@ export class Scene implements SceneLike {
   clearHistory(): void {
     const s = this.#scene();
     this.#drag?.end();
+    this.#prune = true;
     call(() => s.clear_history());
     this.#stepDepth = 0;
   }
 
   /**
-   * Opens a history step, or one more nesting level of the open one. Edits
-   * and placement changes until the matching {@link Scene.endStep} are
-   * undone together.
+   * Opens a history step, or one more nesting level of the open one. Edits,
+   * placement changes and undoable adds and removals until the matching
+   * {@link Scene.endStep} are undone together.
    */
   beginStep(): void {
     const s = this.#scene();
@@ -4557,6 +4639,7 @@ export class Scene implements SceneLike {
   /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
   cancelStep(): void {
     const s = this.#scene();
+    this.#prune = true;
     call(() => s.cancel_step());
     this.#stepDepth = 0;
     // The drag's step is gone with it: later moves must not record steps.

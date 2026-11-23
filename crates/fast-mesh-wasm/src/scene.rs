@@ -593,6 +593,11 @@ impl WasmScene {
         Ok(self.scene.remove_mesh_undoable(id)?)
     }
 
+    /// Whether the scene has this mesh (false for a removed one).
+    pub fn has_mesh(&self, index: u32, generation: u32) -> bool {
+        self.scene.mesh_id(index, generation).is_some()
+    }
+
     /// Whether this removed mesh can still be brought back by undo or redo.
     pub fn is_restorable(&self, index: u32, generation: u32) -> bool {
         self.scene.restorable_id(index, generation).is_some()
@@ -3872,6 +3877,7 @@ mod tests {
         assert!(s.undo().unwrap());
         assert_eq!(s.take_changes(), gone);
         assert!(s.is_restorable(i, g) && !s.is_restorable(other, 0));
+        assert!(!s.has_mesh(i, g) && s.has_mesh(other, 0));
         assert_eq!(code(s.mesh(i, g).map(|_| ())), codes::UNKNOWN_MESH);
         assert_eq!(code(s.remove_mesh_undoable(i, g)), codes::UNKNOWN_MESH);
         assert!(s.redo().unwrap());

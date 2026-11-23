@@ -140,6 +140,7 @@ import type {
   RepairReportOf,
   SculptBrushOp,
   SculptOp,
+  RemoveMeshOptions,
   SculptReport,
   SculptReportOf,
   SectionDesc,
@@ -562,8 +563,15 @@ interface MeshState {
    */
   requested: Pose | undefined;
   requestedUntil: number;
-  /** `removeMesh` was called: calls on it give `UNKNOWN_MESH`. */
+  /**
+   * `removeMesh` was called, or the engine removed it (the undo of its add,
+   * the redo of its removal): calls on it give `UNKNOWN_MESH`.
+   */
   removed: boolean;
+  /** The revision of the `removeMesh` request (0: none): an older result says nothing about it. */
+  removedRev: number;
+  /** Removed undoably: undo or redo can bring it back, so its state is kept. */
+  parked: boolean;
   /** Its removal was delivered: the mirrors are gone too. */
   gone: boolean;
   /** The colouring last requested (kept for a restart). */
@@ -573,6 +581,8 @@ interface MeshState {
    * applied it is in (`coloring(mesh)` returns it).
    */
   shown: ColorRule | null;
+  /** What `shown` was when the mesh was parked: shown again when it is back. */
+  parkedRule: ColorRule | null;
   /** Colouring requests not applied yet, by revision. */
   pendingRules: Map<number, ColorRule | null>;
   /** The engine has the mesh, as of the latest result (its mirrors are its data). */
@@ -1446,6 +1456,7 @@ export class WorkerScene implements SceneLike {
     for (const c of r.changes) {
       this.#applyChange(c);
     }
+    this.#applyPresence(r);
     // No colours: no colouring (its field removed, or the mesh).
     for (const st of this.#meshes.values()) {
       if (st.colors === null) {
@@ -1545,11 +1556,16 @@ export class WorkerScene implements SceneLike {
     }
     if (c.removed) {
       st.live = false;
+      if (c.restorable === true) {
+        st.parkedRule = st.shown;
+      }
       this.#clearMirrors(st);
     } else {
       if (c.added) {
         st.live = true;
         st.add = undefined;
+        st.shown ??= st.parkedRule;
+        st.parkedRule = null;
         if (c.origin !== undefined) {
           st.origin = [...c.origin] as Vec3;
           st.pose = poseOf(st.pose.rotation, st.pose.translation, st.origin, st.pose.scale);
@@ -1566,6 +1582,7 @@ export class WorkerScene implements SceneLike {
       mesh: st.handle,
       added: c.added,
       removed: c.removed,
+      ...(c.restorable === true ? { restorable: true as const } : {}),
       placementChanged: c.placementChanged,
       capacityChanged: c.capacityChanged,
       positions: c.positions,
@@ -1578,6 +1595,66 @@ export class WorkerScene implements SceneLike {
     };
     const prev = this.#changes.get(st);
     this.#changes.set(st, prev === undefined ? record : merge(prev, record));
+  }
+
+  /**
+   * Follows the meshes that undoable adds and removals, and their undo and
+   * redo, moved out of the engine's scene or back into it. A removal
+   * requested after the result's batch decides instead.
+   */
+  #applyPresence(r: Result): void {
+    const moved = (r.presence ?? []).flatMap(({ id, state }) => {
+      const st = this.#meshes.get(id);
+      return st === undefined || r.rev < st.removedRev ? [] : [{ st, state }];
+    });
+    const left: MeshState[] = [];
+    for (const { st, state } of moved) {
+      if (state === "live") {
+        st.removed = false;
+        st.parked = false;
+        st.gone = false;
+        st.removedRev = 0;
+        continue;
+      }
+      if (!st.removed) {
+        left.push(st);
+      }
+      st.removed = true;
+      st.parked = state === "parked";
+      st.live = false;
+      st.add = undefined;
+      st.local = undefined;
+      st.localUntil = 0;
+      st.requested = undefined;
+      st.requestedUntil = 0;
+      if (!st.gone && this.#changes.get(st)?.removed !== true) {
+        // Added and undone before any record of it was packed.
+        this.#clearMirrors(st);
+        this.#removedHere(st);
+      }
+    }
+    // Once every mesh that left says so: their fields stay between them.
+    for (const st of left) {
+      this.#dropLinks(st, r.rev);
+    }
+    for (const { st, state } of moved) {
+      if (state === "gone") {
+        this.#dropLinks(st, r.rev);
+        if (st.gone) {
+          this.#forgetMesh(st);
+        }
+      }
+    }
+  }
+
+  /** Keeps only a tombstone of a mesh removed for good, once its removal is delivered. */
+  #forgetMesh(st: MeshState): void {
+    this.#meshes.delete(st.id);
+    this.#byMesh.delete(st.handle);
+    this.#tombstones.add(st.handle);
+    const id = st.id;
+    this.#forgetKeys([`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`], []);
+    this.#statusChanged();
   }
 
   #clearMirrors(st: MeshState): void {
@@ -1763,12 +1840,13 @@ export class WorkerScene implements SceneLike {
    * it that do not need it run meanwhile, so a reply to one of them can
    * arrive before the mesh. Until it lands, `status("mesh:<id>")` reads
    * `"computing"` and its views are empty; its buffers arrive with that
-   * status turning `"ready"`.
+   * status turning `"ready"`. An `undoable` add is never in the background:
+   * it lands in the step it was made in, and undo removes the mesh again.
    */
   addMesh(
     positions: Positions64,
     indices: Indices,
-    options: Pick<AddMeshOptions, "origin" | "normals" | "uvs"> = {},
+    options: Pick<AddMeshOptions, "origin" | "normals" | "uvs" | "undoable"> = {},
   ): MeshHandle {
     this.#alive();
     // Copies: the buffers are transferred.
@@ -1783,6 +1861,7 @@ export class WorkerScene implements SceneLike {
     const origin: Vec3 | undefined =
       options.origin === undefined ? boxCentre(p) : [options.origin[0], options.origin[1], options.origin[2]];
     const st = this.#allocMeshState(origin ?? [0, 0, 0], options.normals ?? true);
+    const undoable = options.undoable === true;
     st.add = {
       kind: "addMesh",
       rev: ++this.#rev,
@@ -1791,7 +1870,7 @@ export class WorkerScene implements SceneLike {
       f64: !(p instanceof Float32Array),
       indices: i.buffer as ArrayBuffer,
       ...(uvs === undefined ? {} : { uvs: uvs.buffer as ArrayBuffer }),
-      options: { origin, normals: st.normalsOn },
+      options: { origin, normals: st.normalsOn, ...(undoable ? { undoable } : {}) },
     };
     this.#push(st.add);
     return st.handle;
@@ -1819,7 +1898,10 @@ export class WorkerScene implements SceneLike {
       requested: undefined,
       requestedUntil: 0,
       removed: false,
+      removedRev: 0,
+      parked: false,
       gone: false,
+      parkedRule: null,
       coloring: null,
       live: false,
       normalsOn,
@@ -1850,15 +1932,43 @@ export class WorkerScene implements SceneLike {
    * Removes a mesh, ending an active drag of it first. Later calls on it give
    * `UNKNOWN_MESH`; its mirrors stay readable until the removal is delivered
    * by `commitFrame()`.
+   *
+   * With `undoable` the removal is an undo step (or part of the open one):
+   * {@link WorkerScene.undo} brings the mesh back with the same handle, as
+   * `Scene.removeMesh` does. A {@link WorkerScene.restart} clears the history,
+   * so it makes the removal permanent.
    */
-  removeMesh(mesh: MeshHandle): void {
+  removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const st = this.#live(mesh);
     if (this.#drag?.mesh === st) {
       this.#drag.end();
     }
+    const undoable = options.undoable === true;
     const rev = ++this.#rev;
+    st.parked = undoable;
     this.#noteRemoved(st, rev);
-    this.#push({ kind: "removeMesh", rev, id: st.id });
+    this.#push({ kind: "removeMesh", rev, id: st.id, ...(undoable ? { undoable } : {}) });
+  }
+
+  /**
+   * Whether the scene has `mesh`: `false` once its removal is requested, or
+   * a result says that the undo of its add (or the redo of its removal) took
+   * it out.
+   */
+  has(mesh: MeshHandle): boolean {
+    return !(mesh instanceof MeshHandle && this.#tombstones.has(mesh)) && !this.#state(mesh).removed;
+  }
+
+  /**
+   * Whether undo or redo can still bring back a removed `mesh`, as of the
+   * latest result (see `Scene.isRestorable`).
+   */
+  isRestorable(mesh: MeshHandle): boolean {
+    if (mesh instanceof MeshHandle && this.#tombstones.has(mesh)) {
+      return false;
+    }
+    const st = this.#state(mesh);
+    return st.removed && st.parked;
   }
 
   /**
@@ -1892,13 +2002,23 @@ export class WorkerScene implements SceneLike {
 
   /**
    * Notes a mesh as removed at `rev`: later calls on it give `UNKNOWN_MESH`,
-   * fields on it (or only to it) are dropped and its section entries go. The
-   * engine does the same when the removal lands.
+   * and its links go ({@link WorkerScene.#dropLinks}).
    */
   #noteRemoved(st: MeshState, rev: number): void {
     st.removed = true;
+    st.removedRev = rev;
+    this.#dropLinks(st, rev);
+  }
+
+  /**
+   * Cuts a removed mesh's links: fields on it (or only to it) are dropped and
+   * its section entries and collision rules go. The engine does the same
+   * when the removal lands. A parked mesh keeps the fields on it, and leaves
+   * those of other parked meshes alone: they come back together.
+   */
+  #dropLinks(st: MeshState, rev: number): void {
     for (const f of this.#fields.values()) {
-      if (f.removed) {
+      if (f.removed || (st.parked && this.#meshes.get(f.desc.on)?.parked === true)) {
         continue;
       }
       if (f.desc.on === st.id || (f.desc.to.length === 1 && f.desc.to[0] === st.id)) {
@@ -3849,15 +3969,9 @@ export class WorkerScene implements SceneLike {
           continue;
         }
         st.gone = true;
-        if (st.removed) {
-          // Removed for good (unlike a removal by the engine, which a redo
-          // may revert): keep only a tombstone.
-          this.#meshes.delete(st.id);
-          this.#byMesh.delete(st.handle);
-          this.#tombstones.add(st.handle);
-          const id = st.id;
-          this.#forgetKeys([`mesh:${id}`, `placement:${id}`, `edit:${id}`, `display:${id}`], []);
-          this.#statusChanged();
+        if (st.removed && !st.parked) {
+          // Removed for good: nothing brings it back.
+          this.#forgetMesh(st);
         }
       }
     }
@@ -3933,7 +4047,8 @@ export class WorkerScene implements SceneLike {
    * - fields, colourings and sections as last requested (removed ones are
    *   not re-created).
    *
-   * History is cleared (`canUndo`/`canRedo` are false). The replay is sent
+   * History is cleared (`canUndo`/`canRedo` are false), and the meshes it
+   * could have brought back are gone for good. The replay is sent
    * at once, not with the next frame. Every replayed key is `"computing"`
    * until the replay's results arrive, and so is the key of every pending
    * declarative request (placement, drag, colouring, field, section), also
@@ -4150,6 +4265,14 @@ export class WorkerScene implements SceneLike {
       this.#push({ kind: "values", rev: ++this.#rev });
     }
     const replayed = new Set<ClientId>();
+    // The history goes, and with it the way back of every parked mesh.
+    for (const st of [...this.#meshes.values()].filter((m) => m.parked)) {
+      st.parked = false;
+      this.#dropLinks(st, this.#rev);
+      if (st.gone) {
+        this.#forgetMesh(st);
+      }
+    }
     for (const st of this.#meshes.values()) {
       if (st.removed) {
         if (!st.gone) {
@@ -4300,6 +4423,7 @@ export class WorkerScene implements SceneLike {
       mesh: st.handle,
       added: false,
       removed: true,
+      ...(st.parked ? { restorable: true as const } : {}),
       placementChanged: false,
       capacityChanged: false,
       positions: [],
@@ -4516,7 +4640,13 @@ function merge(a: MeshChange, b: MeshChange): MeshChange {
     return { ...b, added: false };
   }
   if (b.added) {
-    return { ...b, fieldsChanged: union(a.fieldsChanged, b.fieldsChanged), sectionsChanged: union(a.sectionsChanged, b.sectionsChanged) };
+    return {
+      ...b,
+      // Out and back within the frame: whoever still shows it starts over.
+      ...(a.removed ? { placementChanged: true, capacityChanged: true } : {}),
+      fieldsChanged: union(a.fieldsChanged, b.fieldsChanged),
+      sectionsChanged: union(a.sectionsChanged, b.sectionsChanged),
+    };
   }
   if (a.removed) {
     return b;

@@ -14,6 +14,7 @@ import type {
   AutoRepairReport,
   AutoRepairRequest,
   RepairOp,
+  RemoveMeshOptions,
   RepairReport,
   Scene,
   SculptOp,
@@ -27,14 +28,19 @@ import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
 import { addFieldKeyed, type KeyStatus, watchStatusKeys, type WorkerScene } from "../worker/client.js";
 
 /** Options of `SceneStore.addMesh`: those both scenes take (a store mesh is always eager). */
-export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals" | "uvs">;
+export type StoreAddMeshOptions = Pick<AddMeshOptions, "origin" | "normals" | "uvs" | "undoable">;
 
 /** What the store needs of a scene, the same on both hosts. */
 export interface Host {
   readonly mode: "local" | "worker";
   readonly scene: SceneLike;
   addMesh(positions: Positions64, indices: Indices, options?: StoreAddMeshOptions): MeshHandle;
-  removeMesh(mesh: MeshHandle): void;
+  removeMesh(mesh: MeshHandle, options?: RemoveMeshOptions): void;
+  /**
+   * Where the scene has a mesh: in it, out of it but within reach of undo or
+   * redo, or out of it for good.
+   */
+  presence(mesh: MeshHandle): "live" | "restorable" | "gone";
   setPlacement(mesh: MeshHandle, placement: PlacementInput): void;
   edit(mesh: MeshHandle, ops: readonly EditOp[]): Promise<EditResult>;
   repair(mesh: MeshHandle, op: RepairOp | readonly RepairOp[]): Promise<RepairReport | RepairReport[]>;
@@ -131,6 +137,11 @@ function tracker(changed: Set<string>) {
   return { errors, track, forgetErrors };
 }
 
+/** {@link Host.presence} from either scene. */
+function presenceIn(scene: Scene | WorkerScene, mesh: MeshHandle): "live" | "restorable" | "gone" {
+  return scene.has(mesh) ? "live" : scene.isRestorable(mesh) ? "restorable" : "gone";
+}
+
 /**
  * The synchronous scene. Calls apply at once, so every key is `"ready"`,
  * except one whose latest call made through `track` threw: that key is
@@ -148,7 +159,8 @@ export function localHost(scene: Scene): Host {
     mode: "local",
     scene,
     addMesh: (positions, indices, options) => scene.addMesh(positions, indices, options),
-    removeMesh: (mesh) => scene.removeMesh(mesh),
+    removeMesh: (mesh, options) => scene.removeMesh(mesh, options),
+    presence: (mesh) => presenceIn(scene, mesh),
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => promised(() => scene.edit(mesh, ops)),
     // One op, a list or auto: the cast only picks an overload (all take any of them).
@@ -213,7 +225,8 @@ export function workerHost(scene: WorkerScene): Host {
     mode: "worker",
     scene,
     addMesh: (positions, indices, options) => scene.addMesh(positions, indices, options),
-    removeMesh: (mesh) => scene.removeMesh(mesh),
+    removeMesh: (mesh, options) => scene.removeMesh(mesh, options),
+    presence: (mesh) => presenceIn(scene, mesh),
     setPlacement: (mesh, placement) => scene.setPlacement(mesh, placement),
     edit: (mesh, ops) => scene.edit(mesh, ops),
     // One op, a list or auto: the cast only picks an overload (all take any of them).

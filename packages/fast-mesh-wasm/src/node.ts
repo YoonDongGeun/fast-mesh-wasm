@@ -236,6 +236,7 @@ export {
   type AutoRepairRequest,
   type ManifoldOptions,
   type ManifoldReport,
+  type RemoveMeshOptions,
   type RepairOp,
   type RepairReport,
   type RepairReportOf,
