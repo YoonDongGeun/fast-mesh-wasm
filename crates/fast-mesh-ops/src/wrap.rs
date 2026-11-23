@@ -6,7 +6,7 @@
 //! 2-manifold, wound outward and free of self-intersections, with every gap,
 //! slot and hole narrower than [`WrapOptions::gap`] bridged. It is a
 //! morphological closing on a voxel grid, meshed with the Manifold Marching
-//! Cubes of [`crate::marching_cubes`]:
+//! Cubes of [`mod@crate::marching_cubes`]:
 //!
 //! 1. **Unsigned distance.** The exact Felzenszwalb-Huttenlocher distance
 //!    transform of the voxelised input ([`fh_unsigned_grid`]), refined to
