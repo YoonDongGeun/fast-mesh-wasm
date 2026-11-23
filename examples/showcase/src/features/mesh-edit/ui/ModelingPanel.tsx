@@ -20,6 +20,7 @@ import { useConvexHull } from "../ux/use-convex-hull";
 import { spinInput, stampScaleInput, taperInput, usePrintPrepOps } from "../ux/use-print-prep-ops";
 import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
 import { BatchBooleanSection } from "./BatchBooleanSection";
+import { ExtrudeSection } from "./ExtrudeSection";
 import { IsotropicRemeshSection } from "./IsotropicRemeshSection";
 import { TextStampFields } from "./TextStampFields";
 
@@ -299,6 +300,9 @@ export function ModelingPanel(props: { app: AppState }) {
               </button>
             </div>
           </div>
+
+          {/* ---- Extrude Faces & Base (#262) ---- */}
+          <ExtrudeSection app={app} store={store} activeItem={activeItem} units={units} />
 
           {/* ---- Convex Hull ---- */}
           <div className="op" data-modeling-hull-section>

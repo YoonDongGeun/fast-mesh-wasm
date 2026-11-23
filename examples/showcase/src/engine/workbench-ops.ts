@@ -13,6 +13,10 @@ import type {
   DenoiseOptions,
   DenoiseReport,
   EditOp,
+  ExtrudeBaseOptions,
+  ExtrudeBaseResult,
+  ExtrudeFacesOptions,
+  ExtrudeFacesResult,
   FieldHandle,
   IcpObjective,
   LandmarkAlignment,
@@ -755,6 +759,33 @@ export async function runIsotropicRemesh(params: {
   options: IsotropicRemeshOptions;
 }): Promise<SurfaceRemeshReport> {
   return params.store.repair(params.mesh, { op: "remeshSurface", ...params.options, mode: "isotropic" });
+}
+
+/** Extrudes a face selection (#262): one undo step, on the Worker when the scene runs there. */
+export async function runExtrudeFaces(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  triangles: Uint32Array;
+  options: ExtrudeFacesOptions;
+}): Promise<ExtrudeFacesResult> {
+  const { store, mesh, triangles, options } = params;
+  const scene = store.scene;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).extrudeFaces(mesh, triangles, options);
+  store.commitFrame();
+  return r;
+}
+
+/** Extrudes a mesh's open boundary to a flat, capped base (#262): one undo step. */
+export async function runExtrudeBase(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: ExtrudeBaseOptions;
+}): Promise<ExtrudeBaseResult> {
+  const { store, mesh, options } = params;
+  const scene = store.scene;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).extrudeBase(mesh, options);
+  store.commitFrame();
+  return r;
 }
 
 /**

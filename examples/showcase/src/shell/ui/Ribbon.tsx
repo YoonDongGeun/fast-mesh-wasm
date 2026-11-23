@@ -425,6 +425,20 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Isotropic Remesh
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="extrude-faces"
+                onClick={() => focusElement("[data-extrude-faces-distance]")}
+              >
+                Extrude Faces
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="extrude-base"
+                onClick={() => focusElement("[data-extrude-base-run]")}
+              >
+                Extrude Base
+              </button>
               <button type="button" data-ribbon-focus="hull" onClick={() => focusElement("[data-modeling-hull-run]")}>
                 Convex Hull
               </button>

@@ -266,6 +266,24 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:extrude-faces",
+      title: "Mesh Edit: Extrude Faces",
+      category: "Tool",
+      keywords: "extrude faces selection push pull pocket boss wall normal direction distance",
+      run: () => {
+        app.setActiveTab("edit");
+      },
+    },
+    {
+      id: "tool:extrude-base",
+      title: "Mesh Edit: Extrude Base",
+      category: "Tool",
+      keywords: "extrude base boundary loop open surface solid flat plane cap pedestal floor",
+      run: () => {
+        app.setActiveTab("edit");
+      },
+    },
+    {
       id: "tool:deform-ffd",
       title: "Deform: FFD Lattice",
       category: "Tool",
