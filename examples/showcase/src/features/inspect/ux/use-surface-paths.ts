@@ -186,7 +186,7 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     const path = s.mesh === item.mesh ? s.path : null;
     return cut(async () => {
       const r = await splitAlongPath(store, app, item, path);
-      return `Split along the loop: ${item.name} keeps the outside (${r.outsideTriangles} triangles), ${r.inside.name} the inside (${r.insideTriangles}).`;
+      return `Split along the loop: "${item.name}" keeps the outside (${r.outsideTriangles} triangles) and "${r.inside.name}" holds the inside (${r.insideTriangles}).`;
     });
   };
 

@@ -34,7 +34,7 @@ export function SurfacePathControls(props: {
 
   return (
     <>
-      <div className="op surface-field-panel" data-inspect-geodesic tabIndex={-1}>
+      <div className="op surface-field-panel geodesic-panel" data-inspect-geodesic tabIndex={-1}>
         <h3>Geodesic Distance</h3>
         <div className="modes" role="group" aria-label="Distance method">
           {GEODESIC_METHODS.map((m) => (
@@ -126,7 +126,7 @@ export function SurfacePathControls(props: {
         {map.error !== null ? <p className="report error">{map.error}</p> : null}
       </div>
 
-      <div className="op" data-inspect-path tabIndex={-1}>
+      <div className="op surface-field-panel geodesic-panel" data-inspect-path tabIndex={-1}>
         <h3>Surface Path</h3>
         <div className="op-row">
           <button

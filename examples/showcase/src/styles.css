@@ -1819,6 +1819,21 @@ input[type="range"] {
 }
 
 .modeling-panel h3,
+/* The geodesic and path sections (#252): every row on its own line, its controls apart. */
+.geodesic-panel > h3,
+.geodesic-panel > p,
+.geodesic-panel > .legend,
+.geodesic-panel > .readout,
+.geodesic-panel > .op-row {
+  flex: 1 0 100%;
+}
+.geodesic-panel > .op-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
 .surface-field-panel h3 {
   margin: 0 0 6px;
   font-size: 12px;

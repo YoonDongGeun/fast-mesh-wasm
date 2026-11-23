@@ -29,6 +29,7 @@ import { createWorkerScene, type WorkerLike, type WorkerScene } from "fast-mesh-
 import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as THREE from "three";
+import type { LineSegments2 } from "three/addons/lines/LineSegments2.js";
 import { AppState, type Item } from "../src/app/state/app-state";
 import { useKeyboardShortcuts } from "../src/app/ux/use-keyboard-shortcuts";
 import { viewportHint } from "../src/app/ux/viewport-hint";
@@ -538,8 +539,8 @@ describe("surface path section (#252)", () => {
     expect(app.getSnapshot().items.map((i) => i.name)).toEqual(["Ball", "Other", "Ball inside"]);
     const inside = app.getSnapshot().items[2];
     const status = host.querySelector("[data-path-status]")?.textContent ?? "";
-    expect(status).toContain(`Ball keeps the outside (${tri(scene, item.mesh)} triangles)`);
-    expect(status).toContain(`Ball inside the inside (${tri(scene, inside.mesh)})`);
+    expect(status).toContain(`"Ball" keeps the outside (${tri(scene, item.mesh)} triangles)`);
+    expect(status).toContain(`"Ball inside" holds the inside (${tri(scene, inside.mesh)})`);
     expect(store.getSnapshot().selection).toBe(item.mesh);
     await act(async () => {
       store.undo();
@@ -935,32 +936,40 @@ describe("what the viewport draws (#252)", () => {
     );
     await act(async () => root.render(layer()));
     cleanups.push(() => act(() => root.unmount()));
-    // The group's own add call (the layer's five parts) is on `added`.
-    const group = added.mock.contexts[added.mock.calls.findIndex((c) => c.length === 5)] as THREE.Group;
+    // The group's own add call (the layer's six parts) is on `added`.
+    const group = added.mock.contexts[added.mock.calls.findIndex((c) => c.length === 6)] as THREE.Group;
     added.mockRestore();
-    const [iso, line, through, markers, label] = group.children as [
+    const [iso, edge, line, through, markers, label] = group.children as [
       THREE.LineSegments,
-      THREE.LineSegments,
-      THREE.LineSegments,
+      LineSegments2,
+      LineSegments2,
+      LineSegments2,
       THREE.Group,
       THREE.Sprite,
     ];
-    const points = (l: THREE.LineSegments) => (l.geometry.getAttribute("position")?.count ?? 0);
-    expect([points(iso), points(line), points(through), markers.children.length]).toEqual([0, 0, 0, 0]);
+    // A line's segments, and none while it is hidden.
+    const segmentsOf = (l: LineSegments2) => (l.visible ? l.geometry.instanceCount : 0);
+    const isoPoints = () => (iso.visible ? iso.geometry.getAttribute("position").count : 0);
+    const drawn = () => [isoPoints(), segmentsOf(edge), segmentsOf(line), segmentsOf(through), markers.children.length];
+    expect(drawn()).toEqual([0, 0, 0, 0, 0]);
     expect(label.visible).toBe(false);
 
     await act(async () => app.setSurfacePath({ mesh: item.mesh, armed: "path" }));
     await tap(app, scene, CAP.slice(0, 3));
     const path = app.getSnapshot().surfacePath.path!;
     const segments = path.legs.reduce((n, l) => n + l.positions.length / 3 - 1, 0);
-    // Drawn just off the surface on both sides, and once, faintly, through the mesh.
-    expect(points(line)).toBe(2 * 2 * segments);
-    expect(points(through)).toBe(2 * segments);
-    expect((through.material as THREE.LineBasicMaterial).depthTest).toBe(false);
-    expect((line.material as THREE.LineBasicMaterial).depthTest).toBe(true);
-    const above = line.geometry.getAttribute("position").array as Float32Array;
-    expect(Array.from(above.subarray(0, 6 * segments))).toEqual(Array.from(pathSegments(path, 0.002)));
-    expect(markers.children).toHaveLength(3);
+    // Drawn just off the surface on both sides, with a wider dark edge under it, and once, faintly, through the mesh.
+    expect(segmentsOf(line)).toBe(2 * segments);
+    expect(segmentsOf(edge)).toBe(2 * segments);
+    expect(segmentsOf(through)).toBe(segments);
+    expect(through.material.depthTest).toBe(false);
+    expect(line.material.depthTest).toBe(true);
+    expect(edge.material.linewidth).toBeGreaterThan(line.material.linewidth);
+    expect(edge.renderOrder).toBeLessThan(line.renderOrder);
+    const starts = line.geometry.getAttribute("instanceStart") as THREE.InterleavedBufferAttribute;
+    expect(Array.from((starts.data.array as Float32Array).subarray(0, 6 * segments))).toEqual(Array.from(pathSegments(path, 0.002)));
+    // Two balls per point: the dark edge behind and the point.
+    expect(markers.children).toHaveLength(2 * 3);
     expect(markers.children[0].position.toArray()).toEqual(path.points[0].point);
     expect(label.visible).toBe(true);
 
@@ -968,11 +977,19 @@ describe("what the viewport draws (#252)", () => {
     await act(async () =>
       app.setSurfacePath({ isoLines: Float32Array.from([0, 0, 0, 1, 0, 0]), sources: [{ slot: 0, point: [0, 1, 0] }] }),
     );
-    expect(points(iso)).toBe(2);
-    expect(markers.children).toHaveLength(4);
+    expect(isoPoints()).toBe(2);
+    expect(markers.children).toHaveLength(2 * 4);
     await act(async () => app.setSurfacePath({ sources: [], path: null, isoLines: null }));
-    expect([points(iso), points(line), points(through), markers.children.length]).toEqual([0, 0, 0, 0]);
+    expect(drawn()).toEqual([0, 0, 0, 0, 0]);
     expect(label.visible).toBe(false);
+
+    // Replacing lines frees the old buffers instead of leaving them to the GPU.
+    const freed = vi.fn();
+    iso.geometry.addEventListener("dispose", freed);
+    line.geometry.addEventListener("dispose", freed);
+    await act(async () => app.setSurfacePath({ isoLines: Float32Array.from([0, 0, 0, 1, 0, 0]) }));
+    await tap(app, scene, CAP.slice(0, 2));
+    expect(freed.mock.calls.length).toBeGreaterThanOrEqual(3);
   });
 });
 
