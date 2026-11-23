@@ -40,6 +40,8 @@ import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transfor
 import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
 import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
 import { type BuildPlate, DEFAULT_BUILD_PLATE } from "../../features/build-plate/ux/plate";
+import type { Polyline, PolylineDisplay } from "../../features/polylines/ux/polyline";
+import { PolylineHistory } from "../../features/polylines/ux/polyline-history";
 
 export interface Item {
   /** A React key. */
@@ -407,6 +409,10 @@ export interface AppSnapshot {
   surfacePath: SurfacePathToolState;
   /** The build plate and how Arrange fills it (#266; persisted, not undoable). */
   buildPlate: BuildPlate;
+  /** The polylines kept as objects, in list order (#268). */
+  polylines: readonly Polyline[];
+  /** The selected polylines' ids, in click order: what the polyline tools work on (#268). */
+  polylineSelection: readonly number[];
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -497,6 +503,8 @@ export class AppState {
     objectInfo: DEFAULT_OBJECT_INFO,
     surfacePath: DEFAULT_SURFACE_PATH_TOOL,
     buildPlate: DEFAULT_BUILD_PLATE,
+    polylines: [],
+    polylineSelection: [],
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -540,9 +548,12 @@ export class AppState {
   readonly #listeners = new Set<() => void>();
   /** Meshes out of the list that undo or redo can bring back (see {@link AppState.follow}). */
   readonly #parked = new Map<MeshHandle, ParkedItem>();
+  /** The polyline list's place in the undo history. */
+  readonly #polylineHistory = new PolylineHistory();
   #nextItem = 0;
   #nextColor = 0;
   #nextGroup = 1;
+  #nextPolyline = 1;
 
   getSnapshot = (): AppSnapshot => this.#snap;
 
@@ -598,6 +609,17 @@ export class AppState {
     if (select !== undefined && store.getSnapshot().selection === null) {
       this.#set({ multi: [select] });
       store.select(select);
+    }
+    const polylines = this.#polylineHistory.follow(store);
+    if (polylines !== null) {
+      // Display settings are not undone: they stay as they are now.
+      const shown = new Map(this.#snap.polylines.map((p) => [p.id, p]));
+      this.#setPolylines(
+        polylines.map((p) => {
+          const now = shown.get(p.id);
+          return now === undefined ? p : { ...p, name: now.name, color: now.color, visible: now.visible };
+        }),
+      );
     }
   }
 
@@ -1123,6 +1145,43 @@ export class AppState {
   /** Changes the build plate: its size, place, spacing, or whether it shows (#266; not undoable). */
   setBuildPlate(patch: Partial<BuildPlate>): void {
     this.#set({ buildPlate: { ...this.#snap.buildPlate, ...patch } });
+  }
+
+  /**
+   * Replaces the polyline list as an undo step, or as part of the open one
+   * (#268). `select` becomes the selection; without it, the selected ones
+   * still listed stay selected.
+   */
+  editPolylines(store: SceneStore, polylines: readonly Polyline[], select?: readonly number[]): void {
+    const before = this.#snap.polylines;
+    this.#polylineHistory.record(store, before, polylines);
+    this.#setPolylines(polylines, select);
+  }
+
+  /** Replaces the polyline list for good, as opening a project does (#268). */
+  resetPolylines(store: SceneStore, polylines: readonly Polyline[]): void {
+    this.#polylineHistory.reset(store);
+    this.#setPolylines(polylines, []);
+  }
+
+  #setPolylines(polylines: readonly Polyline[], select: readonly number[] = this.#snap.polylineSelection): void {
+    const ids = new Set(polylines.map((p) => p.id));
+    this.#set({ polylines, polylineSelection: select.filter((id) => ids.has(id)) });
+  }
+
+  /** An id for a new polyline, never used before (#268). */
+  newPolylineId(): number {
+    return this.#nextPolyline++;
+  }
+
+  /** Selects polylines by id (#268). */
+  selectPolylines(ids: readonly number[]): void {
+    this.#set({ polylineSelection: ids });
+  }
+
+  /** Renames, recolours, shows or hides a polyline (#268; display state, not undoable). */
+  setPolylineDisplay(id: number, patch: Partial<PolylineDisplay>): void {
+    this.#set({ polylines: this.#snap.polylines.map((p) => (p.id === id ? { ...p, ...patch } : p)) });
   }
 
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */

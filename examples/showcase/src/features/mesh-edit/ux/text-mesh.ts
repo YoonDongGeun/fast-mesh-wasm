@@ -302,7 +302,9 @@ export function triangulateRegion(region: TextRegion): number[][] | null {
     for (let i = 0; i < m; i++) {
       ringEdges.push([start + i, start + ((i + 1) % m)]);
     }
-    pts.push(...ring);
+    for (const v of ring) {
+      pts.push(v);
+    }
   }
   const vec = (c: Contour) => {
     const out: Vector2[] = [];
