@@ -111,10 +111,26 @@ impl Scene {
         self.entries.parked_ids()
     }
 
+    /// The id of the restorable mesh (see [`Scene::is_restorable`]) with this
+    /// [`MeshId::index`] and [`MeshId::generation`], or `None` when there is
+    /// none. The counterpart of [`Scene::mesh_id`], for ids passed back
+    /// across an FFI boundary.
+    pub fn restorable_id(&self, index: u32, generation: u32) -> Option<MeshId> {
+        self.entries.parked_id(index, generation)
+    }
+
     /// Records the undoable add of live mesh `id`. `History::reserve` must
-    /// have succeeded since the last record.
+    /// have succeeded since the last record. Normals count as if they were
+    /// on, since they are usually turned on right after the add.
     pub(crate) fn record_add(&mut self, id: MeshId) {
-        let bytes = self.entries.get(id).map_or(0, Entry::byte_size);
+        let bytes = self.entries.get(id).map_or(0, |e| {
+            let normals = if e.normals.is_none() {
+                (e.mesh.vertex_slots() + e.mesh.triangle_slots()) * 12
+            } else {
+                0
+            };
+            e.byte_size() + normals
+        });
         self.history
             .record(&mut self.entries, Change::Add { id, bytes });
     }

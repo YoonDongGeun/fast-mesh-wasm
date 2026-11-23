@@ -8,8 +8,7 @@
 //!
 //! Only positions and triangles cross over (see the ops docs); the new mesh
 //! has no normals, colouring, fields or section entries. Undo restores the
-//! cut mesh in one step; the added mesh stays, like the removed source of
-//! [`Scene::join`].
+//! cut mesh and removes the added one in one step.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};

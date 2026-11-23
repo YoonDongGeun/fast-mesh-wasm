@@ -155,6 +155,11 @@ fn add_undo_redo_keeps_id_and_data() {
             assert_eq!(scene.ids().collect::<Vec<_>>(), [other]);
             assert_eq!(restorable(&scene), [id]);
             assert!(scene.is_restorable(id) && !scene.is_restorable(other));
+            let parts = (id.index(), id.generation());
+            assert_eq!(scene.restorable_id(parts.0, parts.1), Some(id));
+            assert_eq!(scene.restorable_id(parts.0, parts.1 + 1), None);
+            let parts = (other.index(), other.generation());
+            assert_eq!(scene.restorable_id(parts.0, parts.1), None);
             assert!(!scene.can_undo() && scene.can_redo());
             // A parked mesh is out of reach of every call.
             assert_eq!(

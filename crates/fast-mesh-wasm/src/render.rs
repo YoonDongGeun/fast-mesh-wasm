@@ -24,6 +24,8 @@
 //!    - `256` UVs reported: a fifth range list follows (never set for a mesh
 //!      that has no UVs and did not just lose them)
 //!    - `512` UVs all
+//!    - `1024` restorable: a removed mesh that undo or redo can bring back,
+//!      under the same index and generation
 //! 2. four range lists, for positions, normals, colours and indices, each
 //!    `n, start0, count0, ..., start(n-1), count(n-1)`, and with flag `256`
 //!    a fifth for UVs. Ranges are in elements (vertex slots, or triangle
@@ -50,6 +52,7 @@ pub(crate) const FLAG_COLORS_ALL: u32 = 64;
 pub(crate) const FLAG_INDICES_ALL: u32 = 128;
 pub(crate) const FLAG_UVS: u32 = 256;
 pub(crate) const FLAG_UVS_ALL: u32 = 512;
+pub(crate) const FLAG_RESTORABLE: u32 = 1024;
 
 /// The buffer sizes last reported for one mesh. The render buffers
 /// themselves live in the scene: positions and triangles in the store
@@ -115,6 +118,8 @@ pub(crate) struct Record {
     pub mesh_generation: u32,
     pub added: bool,
     pub removed: bool,
+    /// A removed mesh that undo or redo can bring back.
+    pub restorable: bool,
     pub placement_changed: bool,
     pub dirty: Dirty,
     /// Send the UV list: the mesh has UVs, or just lost them.
@@ -336,6 +341,7 @@ pub(crate) fn encode(records: &[Record], out: &mut Vec<u32>) {
         let all = |set: &Option<Vec<u32>>| d.capacity_changed || set.is_none();
         let flags = flag(r.added, FLAG_ADDED)
             | flag(r.removed, FLAG_REMOVED)
+            | flag(r.restorable, FLAG_RESTORABLE)
             | flag(r.placement_changed, FLAG_PLACEMENT)
             | flag(d.capacity_changed, FLAG_CAPACITY)
             | flag(all(&d.positions), FLAG_POSITIONS_ALL)
@@ -451,6 +457,7 @@ mod tests {
             mesh_generation: 0,
             added: true,
             removed: false,
+            restorable: false,
             placement_changed: false,
             dirty: Dirty::clean(),
             uvs_reported: false,
@@ -591,6 +598,7 @@ mod tests {
             mesh_generation: 0,
             added: false,
             removed: false,
+            restorable: false,
             placement_changed: true,
             dirty,
             uvs_reported: false,
@@ -683,6 +691,7 @@ mod tests {
                 mesh_generation,
                 added: flags & FLAG_ADDED != 0,
                 removed: flags & FLAG_REMOVED != 0,
+                restorable: flags & FLAG_RESTORABLE != 0,
                 placement_changed: flags & FLAG_PLACEMENT != 0,
                 dirty: Dirty {
                     positions: lists.next().unwrap(),
@@ -710,6 +719,7 @@ mod tests {
                 mesh_generation: 7,
                 added: true,
                 removed: false,
+                restorable: false,
                 placement_changed: true,
                 dirty: Dirty::all(),
                 uvs_reported: true,
@@ -721,6 +731,7 @@ mod tests {
                 mesh_generation: 1,
                 added: false,
                 removed: false,
+                restorable: false,
                 placement_changed: false,
                 dirty: Dirty {
                     positions: Some(vec![1, 2, 3, 40]),
@@ -739,6 +750,7 @@ mod tests {
                 mesh_generation: 0,
                 added: false,
                 removed: true,
+                restorable: true,
                 placement_changed: false,
                 dirty: Dirty::clean(),
                 uvs_reported: false,

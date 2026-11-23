@@ -139,6 +139,12 @@ impl<T> SlotMap<T> {
         }
     }
 
+    /// The id of the parked value in slot `index` with this `generation`.
+    pub(crate) fn parked_id(&self, index: u32, generation: u32) -> Option<MeshId> {
+        let id = MeshId { index, generation };
+        self.get_parked(id).map(|_| id)
+    }
+
     /// The parked value of slot `id`.
     pub(crate) fn get_parked(&self, id: MeshId) -> Option<&T> {
         let slot = self.slots.get(id.index as usize)?;

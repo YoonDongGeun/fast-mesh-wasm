@@ -359,6 +359,34 @@ impl WasmScene {
         self.added(id, normals)
     }
 
+    /// [`WasmScene::add_mesh`], or [`WasmScene::add_mesh_with_uvs`] with
+    /// `uvs`, as an undo step (recorded in the open step, or as a step of its
+    /// own): undo removes the mesh again, and redo brings it back under the
+    /// same index and generation. Nothing is added on error.
+    pub fn add_mesh_undoable(
+        &mut self,
+        positions: &[f64],
+        indices: &[u32],
+        uvs: Option<Vec<f32>>,
+        origin: Option<Vec<f64>>,
+        mode: u8,
+        normals: bool,
+    ) -> Result<Vec<u32>, Error> {
+        let mode = parse_mode(mode)?;
+        let mut mesh = mesh_from(positions, indices, origin)?;
+        if let Some(uvs) = uvs {
+            mesh.add_uvs(&uvs)?;
+        }
+        let options = MeshOptions {
+            mode,
+            defer_bvh: mode != UpdateMode::Eager,
+            undoable: true,
+            ..MeshOptions::default()
+        };
+        let id = self.scene.add_mesh(mesh, options)?;
+        self.added(id, normals)
+    }
+
     /// [`WasmScene::add_mesh`] in steps: reserves a mesh of `vertices`
     /// vertices and `triangles` triangles outside the scene and returns the
     /// build's id. Its inputs upload in chunks
@@ -554,7 +582,23 @@ impl WasmScene {
         self.adds.remove(&build);
     }
 
-    /// Removes a mesh; its id never matches again.
+    /// Removes a mesh as an undo step (recorded in the open step, or as a
+    /// step of its own): undo brings it back under the same index and
+    /// generation, which give `UNKNOWN_MESH` until then. See
+    /// `Scene::remove_mesh_undoable` for what comes back with it.
+    pub fn remove_mesh_undoable(&mut self, index: u32, generation: u32) -> Result<(), Error> {
+        let id = self.id(index, generation)?;
+        // Its render state goes with the removal record (or stays, when the
+        // removal is undone before that).
+        Ok(self.scene.remove_mesh_undoable(id)?)
+    }
+
+    /// Whether this removed mesh can still be brought back by undo or redo.
+    pub fn is_restorable(&self, index: u32, generation: u32) -> bool {
+        self.scene.restorable_id(index, generation).is_some()
+    }
+
+    /// Removes a mesh for good; its id never matches again.
     pub fn remove_mesh(&mut self, index: u32, generation: u32) -> Result<(), Error> {
         let id = self.id(index, generation)?;
         self.scene.remove_mesh(id)?;
@@ -792,8 +836,13 @@ impl WasmScene {
                 self.render.remove(&c.id);
                 Dirty::clean()
             } else {
-                match (self.render.get_mut(&c.id), self.scene.mesh(c.id)) {
-                    (Some(state), Ok(mesh)) => {
+                match self.scene.mesh(c.id) {
+                    Ok(mesh) => {
+                        // A restored mesh starts over, like a new one.
+                        let state = self
+                            .render
+                            .entry(c.id)
+                            .or_insert_with(|| RenderState::new(mesh));
                         let normals = self.scene.normals(c.id).ok().flatten();
                         let normals_len = normals.map_or(0, <[_]>::len);
                         // Out of memory: report everything rather than lose
@@ -802,7 +851,7 @@ impl WasmScene {
                             .apply(mesh, &c, normals_len)
                             .unwrap_or_else(|_| Dirty::all())
                     }
-                    _ => Dirty::all(),
+                    Err(_) => Dirty::all(),
                 }
             };
             let uvs = self.scene.mesh(c.id).is_ok_and(|m| uvs_reported(m, &c));
@@ -811,6 +860,7 @@ impl WasmScene {
                 mesh_generation: c.id.generation(),
                 added: c.added,
                 removed: c.removed,
+                restorable: c.removed && self.scene.is_restorable(c.id),
                 placement_changed: c.placement_changed,
                 dirty,
                 uvs_reported: uvs,
@@ -843,6 +893,7 @@ impl WasmScene {
                     mesh_generation: id.generation(),
                     added: false,
                     removed: false,
+                    restorable: false,
                     placement_changed: false,
                     uvs_reported: mesh.uvs().is_some(),
                     dirty,
@@ -1207,8 +1258,8 @@ impl WasmScene {
     /// triangles]`. With `cap` (the usual case) both openings are closed
     /// with flat, unfaired patches, across UV seams on a mesh with UVs;
     /// without it both parts keep the open rim.
-    /// The cut undoes in one step; the added mesh stays, like the removed
-    /// source of [`WasmScene::join`].
+    /// The cut and the add are one undo step: undo restores the mesh and
+    /// removes the added one.
     pub fn cut_by_plane(
         &mut self,
         index: u32,
@@ -1310,8 +1361,8 @@ impl WasmScene {
 
     /// Evaluates an N-ary CSG boolean tree over `meshes` (`[idx0, gen0, ...]`)
     /// using prefix-encoded `tree` (`[0, leafIdx]` for Leaf, `[1, op, ...left, ...right]`
-    /// for Op) and inserts the resulting mesh at identity placement.
-    /// Returns `[added_index, added_generation]`.
+    /// for Op) and inserts the resulting mesh at identity placement, as one
+    /// undo step (undo removes it). Returns `[added_index, added_generation]`.
     #[allow(clippy::too_many_arguments)]
     pub fn boolean_batch(
         &mut self,
@@ -3466,7 +3517,7 @@ mod tests {
 
     use crate::render::{
         FLAG_ADDED, FLAG_CAPACITY, FLAG_COLORS_ALL, FLAG_INDICES_ALL, FLAG_NORMALS_ALL,
-        FLAG_PLACEMENT, FLAG_POSITIONS_ALL, FLAG_REMOVED,
+        FLAG_PLACEMENT, FLAG_POSITIONS_ALL, FLAG_REMOVED, FLAG_RESTORABLE, FLAG_UVS, FLAG_UVS_ALL,
     };
 
     use super::*;
@@ -3799,6 +3850,69 @@ mod tests {
             assert_eq!(e.code, expected, "{err:?}");
             assert_eq!(e.message(), format!("{expected}: {err}"));
         }
+    }
+
+    #[test]
+    fn undoable_adds_and_removals_report_and_restore() {
+        let mut s = WasmScene::new();
+        let (other, _) = add(&mut s, false);
+        let uvs = vec![0., 0., 1., 0., 1., 1., 0., 1.];
+        let id = s
+            .add_mesh_undoable(&QUAD, &QUAD_TRIS, Some(uvs.clone()), None, 0, true)
+            .unwrap();
+        let (i, g) = (id[0], id[1]);
+        assert!(s.can_undo());
+        s.take_changes();
+        let all = FLAG_POSITIONS_ALL | FLAG_NORMALS_ALL | FLAG_COLORS_ALL | FLAG_INDICES_ALL;
+        let uv = FLAG_UVS | FLAG_UVS_ALL;
+        let gone = vec![1, i, g, FLAG_REMOVED | FLAG_RESTORABLE, 0, 0, 0, 0, 0, 0];
+        let back = vec![1, i, g, FLAG_ADDED | all | uv, 0, 0, 0, 0, 0, 0, 0];
+
+        // Undo of the add, redo of the add, removal, undo of the removal.
+        assert!(s.undo().unwrap());
+        assert_eq!(s.take_changes(), gone);
+        assert!(s.is_restorable(i, g) && !s.is_restorable(other, 0));
+        assert_eq!(code(s.mesh(i, g).map(|_| ())), codes::UNKNOWN_MESH);
+        assert_eq!(code(s.remove_mesh_undoable(i, g)), codes::UNKNOWN_MESH);
+        assert!(s.redo().unwrap());
+        assert_eq!(s.take_changes(), back);
+        assert!(!s.is_restorable(i, g));
+        s.remove_mesh_undoable(i, g).unwrap();
+        assert_eq!(s.take_changes(), gone);
+        assert!(s.undo().unwrap());
+        assert_eq!(s.take_changes(), back);
+        assert_eq!(s.mesh(i, g).unwrap().uvs(), Some(&uvs[..]));
+        // Its render state is back too: later edits report exact ranges.
+        let mid = s.id(i, g).unwrap();
+        s.scene
+            .edit(mid, |tx| tx.set_positions(&[2], &[[0.5, 0.5, 0.]]))
+            .unwrap();
+        let msg = s.take_changes();
+        assert_eq!(&msg[..6], &[1, i, g, FLAG_UVS, 1, 2]);
+
+        // Removed and back between two calls: changed in full, never gone.
+        s.remove_mesh_undoable(i, g).unwrap();
+        assert!(s.undo().unwrap());
+        assert_eq!(
+            s.take_changes(),
+            vec![1, i, g, FLAG_PLACEMENT | all | uv, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        // The history drops it: the removal is final.
+        s.remove_mesh_undoable(i, g).unwrap();
+        s.clear_history().unwrap();
+        assert!(!s.is_restorable(i, g));
+        assert_eq!(
+            s.take_changes(),
+            vec![1, i, g, FLAG_REMOVED, 0, 0, 0, 0, 0, 0]
+        );
+
+        // A bad add records nothing.
+        let bad = s.add_mesh_undoable(&QUAD, &[0, 1, 9], None, None, 0, true);
+        assert_eq!(code(bad), codes::INVALID_INDEX);
+        let bad = s.add_mesh_undoable(&QUAD, &QUAD_TRIS, Some(vec![0.]), None, 0, true);
+        assert_eq!(code(bad), codes::INVALID_ARGUMENT);
+        assert!(!s.can_undo() && s.take_changes() == [0]);
     }
 
     #[test]
