@@ -503,6 +503,43 @@ describe("WorkerScene", () => {
     expect(code(() => s.idOf(mesh))).toBe("UNKNOWN_MESH");
   });
 
+  it("removals of a mesh that an undo in flight took out", async () => {
+    const s = await makeWorker();
+    const c = cube();
+    for (const undoable of [true, false]) {
+      const mesh = s.addMesh(c.positions, c.indices, { undoable: true });
+      await settle(s);
+      s.undo();
+      s.removeMesh(mesh, { undoable });
+      await settle(s);
+      expect([s.has(mesh), s.isRestorable(mesh)]).toEqual([false, undoable]);
+      s.redo();
+      await settle(s);
+      // Removed for good while it was out: it does not stay when it is back.
+      expect(s.has(mesh)).toBe(undoable);
+      if (undoable) {
+        expect(s.views(mesh).indices().length).toBe(36);
+        await mirrored(s, mesh);
+        s.removeMesh(mesh);
+        await settle(s);
+      }
+      const hit = s.raycast([0.25, 0.25, 5], [0, 0, -1]);
+      s.commitFrame();
+      expect(await hit).toBeNull();
+    }
+  });
+
+  it("an undoable removal of a mesh whose add failed is final", async () => {
+    const s = await makeWorker();
+    const bad = s.addMesh(new Float64Array([0, 0, 0]), new Uint32Array([0, 1, 2]), { undoable: true });
+    await settle(s);
+    expect(s.status(`mesh:${s.idOf(bad)}`).status).toBe("error");
+    s.removeMesh(bad, { undoable: true });
+    expect(about(await settle(s), bad)).toEqual(["removed"]);
+    expect([s.has(bad), s.isRestorable(bad), s.canUndo]).toEqual([false, false, false]);
+    expect(code(() => s.idOf(bad))).toBe("UNKNOWN_MESH");
+  });
+
   it("restart rebuilds from the mirrors; what only the history held is gone", async () => {
     const s = await makeWorker();
     const [a, b] = [cube(), cube(2)];

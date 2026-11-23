@@ -556,6 +556,8 @@ class Engine {
    * known: they come back with the mesh.
    */
   readonly #parked = new Set<ClientId>();
+  /** Parked meshes the client removed for good meanwhile: they go when they come back. */
+  readonly #doomed = new Set<ClientId>();
   /** Meshes parked, restored or dropped by the history in this batch (see `Result.presence`). */
   readonly #moved = new Set<ClientId>();
   /** What those moves left of fields (see `Result.fieldTargets`). */
@@ -1814,6 +1816,10 @@ class Engine {
       this.#moved.add(id);
       if (live) {
         this.#parked.delete(id);
+        if (this.#doomed.delete(id)) {
+          this.#scene.removeMesh(h);
+          this.#forgetMesh(id, h);
+        }
       } else {
         this.#parked.add(id);
         left.push(id);
@@ -1827,6 +1833,17 @@ class Engine {
     }
   }
 
+  /** Forgets a mesh removed for good. */
+  #forgetMesh(id: ClientId, h: MeshHandle): void {
+    this.#meshes.delete(id);
+    // `#meshIds` keeps the handle until its removal record is sent.
+    this.#removed.push(h);
+    if (this.#drag?.id === id) {
+      this.#drag = undefined;
+    }
+    this.#dropMeshRefs(id);
+  }
+
   /** Forgets the parked meshes the history has dropped for good. */
   #dropGone(): void {
     for (const id of [...this.#parked]) {
@@ -1835,6 +1852,7 @@ class Engine {
         continue;
       }
       this.#parked.delete(id);
+      this.#doomed.delete(id);
       this.#moved.add(id);
       this.#meshes.delete(id);
       // `#meshIds` keeps the handle until its removal record is sent.
@@ -1863,6 +1881,17 @@ class Engine {
         return;
       }
       case "removeMesh": {
+        if (req.undoable === true) {
+          // The result says where it is, whatever comes of this.
+          this.#moved.add(req.id);
+        }
+        if (this.#parked.has(req.id)) {
+          // An undo or redo took it out before the client knew.
+          if (req.undoable !== true) {
+            this.#doomed.add(req.id);
+          }
+          return;
+        }
         const h = this.#mesh(req.id);
         if (req.undoable === true) {
           s.removeMesh(h, { undoable: true });
@@ -1870,13 +1899,7 @@ class Engine {
           return;
         }
         s.removeMesh(h);
-        this.#meshes.delete(req.id);
-        // `#meshIds` keeps the handle until its removal record is sent.
-        this.#removed.push(h);
-        if (this.#drag?.id === req.id) {
-          this.#drag = undefined;
-        }
-        this.#dropMeshRefs(req.id);
+        this.#forgetMesh(req.id, h);
         return;
       }
       case "join": {
@@ -2705,7 +2728,7 @@ class Engine {
     }
     const presence: NonNullable<Result["presence"]> = [...this.#moved].map((id) => ({
       id,
-      state: this.#parked.has(id) ? "parked" : this.#meshes.has(id) ? "live" : "gone",
+      state: this.#doomed.has(id) ? "gone" : this.#parked.has(id) ? "parked" : this.#meshes.has(id) ? "live" : "gone",
     }));
     this.#moved.clear();
     const fieldTargets = [...this.#fieldTargets].map(([field, to]) => ({ field, to }));
@@ -2796,7 +2819,7 @@ class Engine {
       id,
       added: c.added,
       removed: c.removed,
-      ...(c.restorable === true ? { restorable: true as const } : {}),
+      ...(c.restorable === true && !this.#doomed.has(id) ? { restorable: true as const } : {}),
       placementChanged: c.placementChanged,
       capacityChanged: c.capacityChanged,
       positions: c.positions,
