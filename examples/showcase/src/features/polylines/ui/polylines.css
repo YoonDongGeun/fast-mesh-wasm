@@ -1,0 +1,71 @@
+/* The polyline rows of the mesh list and the polyline panel (#268). */
+.polyline-list {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.polyline-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.polyline-list-head p {
+  margin: 0;
+}
+.polyline-list .meshes {
+  margin-top: 4px;
+  /* A stack of sections makes a long list. */
+  max-height: 320px;
+  overflow-y: auto;
+}
+.polyline-row {
+  padding: 4px 6px;
+  margin-bottom: 2px;
+}
+.polyline-row .mesh-head {
+  gap: 6px;
+}
+.polyline-row button.icon {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 5px;
+}
+.polyline-panel h3 {
+  margin: 6px 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.polyline-panel .op > h3,
+.polyline-panel .op > p,
+.polyline-panel .op > .op-row {
+  flex: 1 0 100%;
+}
+.polyline-panel .op-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.polyline-panel .readout p {
+  margin: 2px 0;
+}
+.polyline-panel input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.polyline-panel input[type="color"] {
+  width: 32px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: none;
+}

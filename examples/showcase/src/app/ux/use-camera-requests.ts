@@ -12,7 +12,7 @@ export function useCameraRequests() {
 
   const focusOn = useCallback(
     (
-      mesh: MeshHandle,
+      mesh: MeshHandle | null,
       dir?: readonly [number, number, number],
       box?: { center: readonly [number, number, number]; radius: number },
     ) => setFocus((f) => ({ mesh, n: (f?.n ?? 0) + 1, dir, box })),

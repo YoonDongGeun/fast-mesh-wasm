@@ -22,6 +22,7 @@ import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../fea
 import { geodesicMapProbe } from "../../features/inspect/ux/use-geodesic-map";
 import { pathLength } from "../../features/inspect/ux/surface-paths";
 import { readWorldBoxes } from "../../features/build-plate/ux/footprint";
+import { curveLength, pointCount } from "../../features/polylines/ux/polyline";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
@@ -343,6 +344,19 @@ export function installTestHook(
         map: m === null ? null : { ...m, sources: [...m.sources] },
         mapRuns: geodesicMapProbe.runs,
       };
+    },
+    /** The kept polylines (#268): their names, points, lengths, whether closed and visible, and whether selected. */
+    polylines: () => {
+      const { polylines, polylineSelection } = app.getSnapshot();
+      return polylines.map((p) => ({
+        name: p.name,
+        color: p.color,
+        points: pointCount(p),
+        length: curveLength(p),
+        closed: p.closed,
+        visible: p.visible,
+        selected: polylineSelection.includes(p.id),
+      }));
     },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),

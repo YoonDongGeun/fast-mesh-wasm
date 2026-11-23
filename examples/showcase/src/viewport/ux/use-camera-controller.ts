@@ -400,6 +400,8 @@ export function useCameraRequests(params: {
     if (focus.box !== undefined) {
       center = new THREE.Vector3(focus.box.center[0], focus.box.center[1], focus.box.center[2]);
       radius = Math.max(focus.box.radius, 1e-3);
+    } else if (focus.mesh === null) {
+      return;
     } else {
       let m: Float64Array;
       try {

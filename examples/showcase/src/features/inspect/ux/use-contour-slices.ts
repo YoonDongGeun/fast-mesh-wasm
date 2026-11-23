@@ -9,6 +9,7 @@ import type { AppState, Item } from "../../../app/state/app-state";
 import type { Wave6MetrologyState } from "../../../app/state/wave6-state";
 import { ensureWave6Wasm } from "../../../engine/wave6-wasm-lazy";
 import { type ContourLike, contoursToDxf, downloadReportText, reportFileName } from "../../../io/report";
+import { describeKept, keepCurves } from "../../polylines/ux/polyline-actions";
 import { AXIS_NORMAL, type Axis } from "./section-clip";
 
 export type ContourPlaneAxis = Axis | "custom";
@@ -52,17 +53,16 @@ function safeTriggerDownload(text: string, fileName: string, mime: string): void
   downloadReportText(text, fileName, mime);
 }
 
+/** Every loop of the slices, in order, as world curves. */
+export function sliceCurves(slices: readonly ContourSlice[]): ContourLike[] {
+  return slices.flatMap((slice) => slice.loops.map((loop) => ({ points: loop.points3d, closed: loop.closed })));
+}
+
 /** Converts multi-slice Wave 6 contours into minimal R12 DXF entities. */
 export function exportContourSlicesDxf(slices: readonly ContourSlice[]): string {
   const origin: Vec3 = slices[0]?.planeOrigin ?? [0, 0, 0];
   const normal: Vec3 = slices[0]?.planeNormal ?? [0, 0, 1];
-  const contours: ContourLike[] = [];
-  for (const slice of slices) {
-    for (const loop of slice.loops) {
-      contours.push({ points: loop.points3d, closed: loop.closed });
-    }
-  }
-  return contoursToDxf(contours, origin, normal);
+  return contoursToDxf(sliceCurves(slices), origin, normal);
 }
 
 /** The slices' loop count, perimeter and area summed (all zero without slices). */
@@ -96,6 +96,7 @@ export function useContourSlices(
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<ContourExport | null>(null);
+  const [kept, setKept] = useState<string | null>(null);
 
   const inspectDomain = store?.scene?.inspect;
   const canSlice =
@@ -112,6 +113,7 @@ export function useContourSlices(
     setBusy(true);
     setError(null);
     setExportState(null);
+    setKept(null);
     try {
       const n = activeNormal();
       const center = worldCenter(store.scene, targetItem);
@@ -158,6 +160,20 @@ export function useContourSlices(
     }
   };
 
+  /** Keeps every loop of the slices as a polyline object (#268): one undo step. */
+  const onKeep = () => {
+    if (slices === null) {
+      return;
+    }
+    setError(null);
+    setKept(null);
+    try {
+      setKept(describeKept(keepCurves(app, store, sliceCurves(slices), `${targetItem?.name ?? "Mesh"} contour`)));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   /** Drops the slices, the export preview and the error. */
   const onClear = () => {
     app.updateWave6((prev) => ({
@@ -166,6 +182,7 @@ export function useContourSlices(
     }));
     setExportState(null);
     setError(null);
+    setKept(null);
   };
 
   const setShowOverlay = (checked: boolean) => {
@@ -212,8 +229,10 @@ export function useContourSlices(
     canSlice,
     slices,
     totals: contourSliceTotals(slices),
+    kept,
     onSlice,
     onExport,
+    onKeep,
     onClear,
     setShowOverlay,
   };

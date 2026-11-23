@@ -24,6 +24,7 @@ import { MeshList } from "../features/home/ui/MeshList";
 import { ObjectInfoBox } from "../features/inspect/ui/ObjectInfoBox";
 import { ModelingPanel } from "../features/mesh-edit/ui/ModelingPanel";
 import { PointsPanel } from "../features/points/ui/PointsPanel";
+import { PolylinePanel } from "../features/polylines/ui/PolylinePanel";
 import { ProjectPanel } from "../features/home/ui/ProjectPanel";
 import { RepairPanel } from "../features/mesh-repair/ui/RepairPanel";
 import {
@@ -69,7 +70,8 @@ const VolumePanel = lazy(() => import("../features/ct/ui/VolumePanel").then((m) 
 
 /** A request to point the camera at a mesh; `n` makes a repeated request new. */
 export interface FocusRequest {
-  mesh: MeshHandle;
+  /** `null` with a `box` that is no mesh's. */
+  mesh: MeshHandle | null;
   n: number;
   /** Look from this direction (default: the camera's current one). */
   dir?: readonly [number, number, number];
@@ -174,6 +176,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onLoadSample={loadSample}
           onLoadDemo={loadDemo}
           onFocus={focusOn}
+          onFocusBox={(box) => focusOn(null, undefined, box)}
         />
         <GroupsBar app={app} />
         <ProjectPanel app={app} />
@@ -306,6 +309,12 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
           onClickCapture={() => activateTabForSlot("inspect")}
         >
           <InspectPanel app={app} scene={engine.scene} />
+        </div>
+        <div
+          className={tabMatchesSlot(activeTab, "polylines") ? "inspector-slot" : "inspector-slot inspector-hidden"}
+          data-inspector-slot="polylines"
+        >
+          <PolylinePanel app={app} />
         </div>
         <div
           className={tabMatchesSlot(activeTab, "export") ? "inspector-slot" : "inspector-slot inspector-hidden"}

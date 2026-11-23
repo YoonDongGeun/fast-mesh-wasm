@@ -13,6 +13,7 @@ import type { MirrorAxis } from "../../../engine/workbench-ops";
 import { useMeshPreview } from "./mesh-preview";
 import { IMPORT_UNITS } from "../../../shared/ux/units";
 import { angleDegrees, formatAngle } from "../../inspect/ux/angle-measure";
+import { PolylineList } from "../../polylines/ui/PolylineList";
 import {
   bigFileParams,
   clickRow,
@@ -33,8 +34,10 @@ export function MeshList(props: {
   onLoadSample: (sample: SampleKind) => void;
   onLoadDemo: () => void;
   onFocus: (mesh: Item["mesh"]) => void;
+  /** Frames a world sphere (a polyline's). */
+  onFocusBox?: (box: { center: readonly [number, number, number]; radius: number }) => void;
 }) {
-  const { app, onLoad, onCancelLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus } = props;
+  const { app, onLoad, onCancelLoad, onLoadPhantom, onLoadSample, onLoadDemo, onFocus, onFocusBox } = props;
   const store = useScene();
   const [selection] = useSelection();
   const items = useApp(app, (s) => s.items);
@@ -254,6 +257,7 @@ export function MeshList(props: {
         })}
       </ul>
       {items.length === 0 && jobs.length === 0 ? <p className="muted">No meshes. Open or drop a file.</p> : null}
+      <PolylineList app={app} onFocusBox={onFocusBox} />
       {volumes.length > 0 || ruler !== null || anglePoints.length > 0 || inspectSection !== null || clipBox !== null ? (
         <div className="scene-tree-extras" data-scene-tree-extras aria-label="Volumes and annotations">
           <p className="muted small">Volumes &amp; annotations</p>

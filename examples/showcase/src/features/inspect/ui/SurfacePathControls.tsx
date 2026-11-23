@@ -214,6 +214,15 @@ export function SurfacePathControls(props: {
           >
             Split
           </button>
+          <button
+            type="button"
+            data-action="path-keep"
+            disabled={path === null || path.legs.length === 0}
+            title="Keep the path, open or closed, as a polyline object of the scene"
+            onClick={paths.keep}
+          >
+            Keep as object
+          </button>
         </div>
         {closed ? (
           <p className="muted small">

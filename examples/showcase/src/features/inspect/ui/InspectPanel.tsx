@@ -10,7 +10,8 @@ import type { MeshHandle, PrimitiveKindInput, Scene } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { type AppState, type Item, type SurfaceColormap, useApp } from "../../../app/state/app-state";
+import { useState } from "react";
+import { type AppState, type InspectSection, type Item, type SurfaceColormap, useApp } from "../../../app/state/app-state";
 import { type Wave6MetrologyState } from "../../../app/state/wave6-state";
 import { formatCoord, INSPECT_TOOLS, rulerDistance } from "../ux/inspect-tools";
 import {
@@ -37,6 +38,7 @@ import { FieldLegend } from "./FieldLegend";
 import { InspectMapControls } from "./InspectMapControls";
 import { SurfacePathControls } from "./SurfacePathControls";
 import { releaseGeodesicOverlay } from "../ux/use-geodesic-map";
+import { keepSectionText } from "../../polylines/ux/polyline-actions";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "../../../shared/ux/units";
 
@@ -336,6 +338,7 @@ function SectionControls(props: {
   unit: LengthUnit;
 }) {
   const { app, scene, store, items, item, section, active, unit } = props;
+  const [kept, setKept] = useState<{ text: string; error: boolean } | null>(null);
   if (!active && section === null) {
     return null;
   }
@@ -393,12 +396,25 @@ function SectionControls(props: {
           <p>
             <button
               type="button"
+              data-action="section-keep"
+              title="Keep the plane's contours as polyline objects of the scene"
+              onClick={() => setKept(keepSectionText(app, store, scene, section as InspectSection))}
+            >
+              Keep contours
+            </button>{" "}
+            <button
+              type="button"
               data-action="section-disable"
               onClick={actions.remove}
             >
               Remove plane
             </button>
           </p>
+          {kept !== null ? (
+            <p className={kept.error ? "report error small" : "muted small"} data-section-kept>
+              {kept.text}
+            </p>
+          ) : null}
         </>
       )}
     </div>
@@ -746,7 +762,21 @@ function ContourSliceControls(props: {
             >
               Export DXF
             </button>
+            <button
+              type="button"
+              data-action="inspect-keep-contours"
+              disabled={totals.loops === 0}
+              title="Keep every loop as a polyline object of the scene"
+              onClick={contours.onKeep}
+            >
+              Keep as Objects
+            </button>
           </div>
+          {contours.kept !== null ? (
+            <p className="muted small" data-inspect-contours-kept>
+              {contours.kept}
+            </p>
+          ) : null}
         </>
       ) : null}
 

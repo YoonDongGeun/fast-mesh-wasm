@@ -470,6 +470,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" data-ribbon-focus="place" onClick={() => focusElement("[data-modeling-place-section]")}>
                 Surface Stamp
               </button>
+              <button type="button" data-ribbon-focus="polylines" onClick={() => focusElement("[data-panel='polylines']")}>
+                Polylines
+              </button>
               <button
                 type="button"
                 data-action="text-tool"
@@ -584,6 +587,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="geodesic" onClick={() => focusElement("[data-inspect-geodesic]")}>
                 Geodesic
+              </button>
+              <button type="button" data-ribbon-focus="polylines" onClick={() => focusElement("[data-panel='polylines']")}>
+                Polylines
               </button>
               <button
                 type="button"

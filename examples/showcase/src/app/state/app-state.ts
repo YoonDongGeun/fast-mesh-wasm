@@ -1179,9 +1179,10 @@ export class AppState {
     this.#set({ polylineSelection: ids });
   }
 
-  /** Renames, recolours, shows or hides a polyline (#268; display state, not undoable). */
-  setPolylineDisplay(id: number, patch: Partial<PolylineDisplay>): void {
-    this.#set({ polylines: this.#snap.polylines.map((p) => (p.id === id ? { ...p, ...patch } : p)) });
+  /** Renames, recolours, shows or hides polylines (#268; display state, not undoable). */
+  setPolylineDisplay(ids: readonly number[], patch: Partial<PolylineDisplay>): void {
+    const on = new Set(ids);
+    this.#set({ polylines: this.#snap.polylines.map((p) => (on.has(p.id) ? { ...p, ...patch } : p)) });
   }
 
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */

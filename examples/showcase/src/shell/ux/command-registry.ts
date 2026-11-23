@@ -8,6 +8,7 @@ import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab 
 import { buildPlateCommands } from "../../features/build-plate/ux/build-plate-commands";
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { textCommands } from "../../features/mesh-edit/ux/text-commands";
+import { polylineCommands } from "../../features/polylines/ux/polyline-commands";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -150,6 +151,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
   cmds.push(...createPrimitiveCommands(app));
   cmds.push(...textCommands(app));
   cmds.push(...buildPlateCommands(app, items.length > 0, selection !== null));
+  cmds.push(...polylineCommands(app));
 
   cmds.push(
     {

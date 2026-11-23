@@ -17,6 +17,9 @@
 // before, on the global default unit (`version` stays 1, the fields are
 // additive and older builds ignore them).
 //
+// Kept polylines (#268) ride along the same way: `polylines`, their points
+// as base64 f64 in mm, optional and additive like the units.
+//
 // The pure core (`encodeF64`/`decodeF64`, `encodeU32`/`decodeU32`,
 // `buildProjectDoc`, `parseProjectDoc`) touches no scene and is unit-tested;
 // `collectProject`/`restoreProject` are the thin store/app adapters, and
@@ -27,6 +30,7 @@ import type { DistanceColoring } from "fast-mesh-wasm/store";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState } from "../app/state/app-state";
 import { type ImportScale, isImportUnit, type LengthUnit, NO_IMPORT_SCALE } from "../shared/ux/units";
+import { makeCurve, type Polyline } from "../features/polylines/ux/polyline";
 import { bounds } from "./mesh-data";
 
 /** The project format version written by `buildProjectDoc`. */
@@ -87,6 +91,15 @@ export interface ProjectSection {
   fill: boolean;
 }
 
+/** One kept polyline as stored (#268): its points as base64 little-endian f64, in mm. */
+export interface ProjectPolyline {
+  name: string;
+  color: number;
+  visible: boolean;
+  closed: boolean;
+  points: string;
+}
+
 /** A parsed project file. Unknown fields are ignored by the loader. */
 export interface ProjectDoc {
   version: number;
@@ -98,6 +111,8 @@ export interface ProjectDoc {
   edgeSoftness: number;
   /** The project's display unit (absent in older files: the global default). */
   units?: LengthUnit;
+  /** The kept polylines (absent without any). */
+  polylines?: ProjectPolyline[];
 }
 
 // ---- Base64 over raw bytes (Buffer in Node/tests, btoa/atob in browsers) ----
@@ -233,6 +248,7 @@ export function buildProjectDoc(input: {
   wireframe: boolean;
   edgeSoftness: number;
   units?: LengthUnit;
+  polylines?: readonly Pick<Polyline, "name" | "color" | "visible" | "closed" | "points">[];
 }): ProjectDoc {
   return {
     version: PROJECT_VERSION,
@@ -262,6 +278,17 @@ export function buildProjectDoc(input: {
     wireframe: input.wireframe,
     edgeSoftness: input.edgeSoftness,
     ...(input.units === undefined ? {} : { units: input.units }),
+    ...(input.polylines === undefined || input.polylines.length === 0
+      ? {}
+      : {
+          polylines: input.polylines.map((p) => ({
+            name: p.name,
+            color: p.color,
+            visible: p.visible,
+            closed: p.closed,
+            points: encodeF64(p.points),
+          })),
+        }),
   };
 }
 
@@ -332,6 +359,34 @@ function readImportScale(value: unknown): ImportScale | undefined {
     return undefined;
   }
   return { factor: value.factor, units: isImportUnit(value.units) ? value.units : null };
+}
+
+/** The stored polylines that can be read: the others are dropped. */
+function readPolylines(value: unknown): ProjectPolyline[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: ProjectPolyline[] = [];
+  for (const raw of value as unknown[]) {
+    if (!isRecord(raw) || typeof raw.points !== "string") {
+      continue;
+    }
+    try {
+      const curve = makeCurve(decodeF64(raw.points, "polyline points"), raw.closed === true);
+      if (curve !== null) {
+        out.push({
+          name: typeof raw.name === "string" && raw.name !== "" ? raw.name : `Polyline ${out.length + 1}`,
+          color: typeof raw.color === "number" && Number.isFinite(raw.color) ? raw.color : 0xffd166,
+          visible: raw.visible !== false,
+          closed: curve.closed,
+          points: encodeF64(curve.points),
+        });
+      }
+    } catch {
+      // Not base64 of whole f64s.
+    }
+  }
+  return out;
 }
 
 /**
@@ -406,7 +461,8 @@ export function parseProjectDoc(text: string): ProjectDoc {
       ...(importScale === undefined ? {} : { importScale }),
     });
   }
-  if (meshes.length === 0) {
+  const polylines = readPolylines(root.polylines);
+  if (meshes.length === 0 && polylines.length === 0) {
     throw new Error("this project file has no readable meshes");
   }
   // Targets were validated against the raw count; remap onto the kept meshes.
@@ -449,6 +505,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     wireframe: root.wireframe === true,
     edgeSoftness: typeof root.edgeSoftness === "number" && Number.isFinite(root.edgeSoftness) && root.edgeSoftness >= 0 ? root.edgeSoftness : 0,
     ...(root.units === "mm" || root.units === "in" ? { units: root.units } : {}),
+    ...(polylines.length === 0 ? {} : { polylines }),
   };
 }
 
@@ -511,11 +568,12 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
     wireframe: app.getSnapshot().wireframe,
     edgeSoftness: app.getSnapshot().edgeSoftness,
     units: app.getSnapshot().units,
+    polylines: app.getSnapshot().polylines,
   });
 }
 
 /**
- * Reopens a project doc: replaces every mesh and section with the doc's.
+ * Reopens a project doc: replaces every mesh, section and kept polyline with the doc's.
  * Source volumes are not stored (tens of megabytes), so reopened meshes keep
  * their isosurface geometry but lose their volume link (`volumeId`).
  */
@@ -595,6 +653,17 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   app.setWireframe(doc.wireframe);
   app.setEdgeSoftness(doc.edgeSoftness);
   app.setProjectUnits(doc.units);
+  app.resetPolylines(
+    store,
+    (doc.polylines ?? []).map((p) => ({
+      id: app.newPolylineId(),
+      name: p.name,
+      color: p.color,
+      visible: p.visible,
+      closed: p.closed,
+      points: decodeF64(p.points, "polyline points"),
+    })),
+  );
 }
 
 // ---- Files: File System Access with a download/input fallback ----

@@ -48,6 +48,7 @@ import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer"
 import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
 import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
+import { PolylineLayer } from "../../features/polylines/ui/PolylineLayer";
 import { AlignToolsLayer } from "../../features/transform/ui/AlignToolsLayer";
 import { SurfacePathLayer } from "../../features/inspect/ui/SurfacePathLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
@@ -229,6 +230,7 @@ export function Viewport(props: {
       <PlacementPicksLayer app={app} store={store} />
       <AlignToolsLayer app={app} store={store} />
       <SurfacePathLayer app={app} store={store} />
+      <PolylineLayer app={app} />
       <CreatePreviewLayer app={app} />
       <TextPreviewLayer app={app} />
       <BuildPlateLayer app={app} />

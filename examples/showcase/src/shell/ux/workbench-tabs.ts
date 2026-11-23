@@ -35,6 +35,7 @@ export type InspectorSlot =
   | "collision"
   | "volume"
   | "inspect"
+  | "polylines"
   | "export";
 
 /** Returns which right-inspector sections are shown for `tab`. */
@@ -47,7 +48,7 @@ export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean 
     case "repair":
       return slot === "repair";
     case "edit":
-      return slot === "modeling";
+      return slot === "modeling" || slot === "polylines";
     case "sculpt":
       return slot === "sculpt" || slot === "deform";
     case "align":
@@ -55,7 +56,7 @@ export function tabMatchesSlot(tab: WorkbenchTab, slot: InspectorSlot): boolean 
     case "volume":
       return slot === "volume";
     case "inspect":
-      return slot === "inspect";
+      return slot === "inspect" || slot === "polylines";
   }
 }
 

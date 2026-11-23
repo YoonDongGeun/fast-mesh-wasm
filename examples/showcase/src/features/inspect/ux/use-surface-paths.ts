@@ -9,6 +9,7 @@ import type { GeodesicMethod, MeshHandle } from "fast-mesh-wasm";
 import { useScene } from "fast-mesh-wasm/react";
 import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
+import { describeKept, keepPath } from "../../polylines/ux/polyline-actions";
 import { closeSurfaceLoop, settleChanges, splitAlongPath, type TrimKeep, trimAlongPath } from "./surface-path-actions";
 import {
   canClose,
@@ -184,6 +185,20 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     });
   };
 
+  /** Keeps the path as a polyline object (#268): one undo step. The path stays. */
+  const keep = () => {
+    const s = app.getSnapshot().surfacePath;
+    if (item === null || s.mesh !== item.mesh) {
+      return;
+    }
+    try {
+      setStatus(describeKept(keepPath(app, store, s.path, item.name)));
+      app.setSurfacePath({ error: null });
+    } catch (e) {
+      app.setSurfacePath({ error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
   const path = onTarget ? tool.path : null;
   const sources = onTarget ? tool.sources : [];
   const locked = item?.locked ?? false;
@@ -212,5 +227,6 @@ export function useSurfacePaths(app: AppState, items: readonly Item[], selection
     close,
     trim,
     split,
+    keep,
   };
 }
