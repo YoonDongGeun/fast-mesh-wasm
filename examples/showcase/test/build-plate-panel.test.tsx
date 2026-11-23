@@ -176,10 +176,15 @@ describe("Build Plate panel (#266)", () => {
     expect(q(host, "[data-build-plate-scope]").textContent).toContain("Selected meshes (2)");
     expect(arrange.disabled).toBe(false);
     await act(async () => app.setBuildPlate({ width: 30, depth: 30, origin: [0, 0] }));
+    app.setPlacementTool({
+      pick: { kind: "datum321", mesh: items[0].mesh, points: [[0, 0, 0]], normal: null, up: "z", target: "+z" },
+    });
     const third = scene.placement(items[1].mesh);
     await click(arrange);
     await vi.waitFor(() => expect(q(host, "[data-build-plate-report]").textContent).toBe("Arranged 2 meshes"));
     expect(app.getSnapshot().buildPlate.visible).toBe(true);
+    // A placement pick in flight is dropped: its points are where the mesh was.
+    expect(app.getSnapshot().placementTool.pick).toBeNull();
     for (const i of [items[0], items[2]]) {
       const b = bounds(scene, i);
       expect(b.min[2]).toBe(0);

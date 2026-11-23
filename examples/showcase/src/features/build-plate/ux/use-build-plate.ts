@@ -43,6 +43,8 @@ export function useBuildPlate(app: AppState, store: SceneStore) {
     setBusy(true);
     setReport(null);
     app.setBuildPlate({ visible: true });
+    // A placement pick in flight holds points of where its mesh was.
+    app.setPlacementTool({ pick: null });
     try {
       const targets = arrangeTargets(scope, items, multi, selection, (m) => meshVisible(store, m));
       const done = await arrangeMeshes({ store, app, items: targets, plate: app.getSnapshot().buildPlate });

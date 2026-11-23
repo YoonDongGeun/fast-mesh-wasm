@@ -73,6 +73,21 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   identity: the placement change and the vertex edit are one history step. The picks are engine
   raycasts on the selected mesh only; <kbd>Esc</kbd> cancels one. The math is in
   `src/features/transform/ux/placement-math.ts`.
+- **Build plate.** The Home tab's Build Plate panel (and shelf buttons) draws a grid rectangle on the
+  floor: a width along X, a depth along Y, the corner it starts from, and *Up*, as the placement
+  helpers have it (Z = 0, or Y = 0 with the depth along Z). They are in the display unit and persist
+  with the display settings; the plate takes no pointer rays. *Arrange* packs the footprints of the
+  selected meshes, or of every visible one, with at least *Spacing* between them, and rests each on
+  the plate with its lowest point, as one undo step. A footprint is the rectangle around the mesh's own
+  vertices as it is placed (`src/features/build-plate/ux/footprint.ts`, read in slices: about 10 ms per
+  million triangles), so a turned mesh takes what it projects to. The packing
+  (`src/features/build-plate/ux/pack.ts`) is deterministic, compact and centred on the plate; it turns
+  meshes by 90° only when not everything fits as it is, and then tries several orders and keeps the one
+  that places the most. Meshes too big for the plate, or left without room, are named and stay where
+  they are, as locked ones do; *Keep clear of other meshes* packs around the visible meshes that are
+  not arranged. *Multi-Clone* copies the selected mesh up to 1,000 times, in a grid on the floor or in a
+  line along an axis, with a gap between the copies, as one undo step; the mesh and its copies are then
+  selected, ready to arrange.
 - **View.** The box in the viewport's bottom-right corner (top right on a phone, folded to its toggle
   there at first) holds the view controls. The cube turns with the camera; a face snaps to its view
   (<kbd>1</kbd> front, <kbd>3</kbd> left, <kbd>7</kbd> top, with <kbd>Shift</kbd> the opposite face),
@@ -204,6 +219,7 @@ src/
     home/        mesh list, project save and open, export, the Create dialog (primitive shapes)
     view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
     select/      object and face selection, faces by criteria
+    build-plate/ the plate on the floor, arranging footprints on it, multi-clone
     transform/   numeric transform, scale, placement helpers; alignment: ICP, landmark pairs, coarse +
                  ICP, symmetry plane
     inspect/     ruler, angle, query, section plane, clip box, surface fields; deviation, overhang and

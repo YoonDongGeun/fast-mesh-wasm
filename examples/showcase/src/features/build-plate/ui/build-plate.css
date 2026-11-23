@@ -1,4 +1,7 @@
 /* The Build Plate panel (#266). */
+.build-plate-panel {
+  margin-top: 12px;
+}
 .build-plate-fields {
   display: grid;
   grid-template-columns: 1fr;
