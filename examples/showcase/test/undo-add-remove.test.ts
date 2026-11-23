@@ -180,6 +180,47 @@ describe("the app state", () => {
     expect(app.getSnapshot().collision).toEqual({ a: a.mesh, b: c.mesh });
   });
 
+  it("in pair mode, meshes that leave and return together keep their place, pair and selection", async () => {
+    const h = await local();
+    const { store, app } = h;
+    const [a, b, c] = ["A", "B", "C"].map((n, k) => addBox(h, n, [1.5 * k, 0, 0]));
+    app.setCollisionMode("pair");
+    store.setDisplay(a.mesh, { coloring: { distanceTo: b.mesh, maxDistance: 5, range: [0, 1], map: "turbo" } });
+    store.setDisplay(b.mesh, { coloring: { distanceTo: a.mesh, maxDistance: 5, range: [0, 1], map: "turbo" } });
+    await h.settle();
+    const { collision } = app.getSnapshot();
+    expect(collision).toEqual({ a: a.mesh, b: b.mesh });
+    select(h, b.mesh);
+    // Undone adds, not removals: the app only learns of them from the store.
+    store.beginStep();
+    app.removeMesh(store, a);
+    app.removeMesh(store, b);
+    store.endStep();
+    for (let k = 0; k < 2; k++) {
+      expect(app.getSnapshot().items).toEqual([c]);
+      expect(app.getSnapshot().collision).toEqual({ a: null, b: null });
+      store.undo();
+      expect(app.getSnapshot().items).toEqual([a, b, c]);
+      expect(app.getSnapshot().collision).toEqual(collision);
+      expect(store.getSnapshot().selection).toBe(b.mesh);
+      expect(app.getSnapshot().multi).toEqual([b.mesh]);
+      store.redo();
+    }
+    // One of the pair only: the other's colouring stops, and the item keeps its place.
+    store.undo();
+    store.setDisplay(a.mesh, { coloring: { distanceTo: b.mesh, maxDistance: 5, range: [0, 1], map: "turbo" } });
+    await h.settle();
+    app.removeMesh(store, b);
+    expect(store.getSnapshot().meshes.get(a.mesh)!.desired.coloring).toBeNull();
+    store.undo();
+    expect(app.getSnapshot().items).toEqual([a, b, c]);
+    expect(app.getSnapshot().collision).toEqual(collision);
+    store.redo();
+    expect(app.getSnapshot().items).toEqual([a, c]);
+    store.undo();
+    expect(app.getSnapshot().items).toEqual([a, b, c]);
+  });
+
   it("keeps a removed mesh's volume while undo can bring it back", async () => {
     const h = await local();
     const { store, app } = h;

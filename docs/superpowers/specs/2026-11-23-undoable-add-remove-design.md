@@ -140,7 +140,7 @@ permanent, as any step of that size. Eviction frees the parked mesh at once.
 `AppState.follow(store)` keeps the list in step with the store's snapshot: a mesh that left leaves
 the list, kept aside with its place, groups, collision pair sides and whether it was selected while
 the store says it is restorable; a mesh that is back is listed again as the same item (name, colour,
-material, locks). The material is disposed when it leaves; three.js sets it up afresh on reuse.
+material, locks). The material is disposed when it leaves; the renderer sets it up afresh on reuse.
 Create, duplicate, convex hull, the two-mesh and N-way booleans use undoable adds and removals in one
 step each, and the mesh list's and a group's Remove are undoable. Opening a project clears the
 history first, so that nothing from before comes back. Tools still using the empty-then-fill pattern

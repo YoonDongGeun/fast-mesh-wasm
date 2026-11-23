@@ -47,7 +47,7 @@ export interface Item {
   name: string;
   /**
    * Owned by the app (one per mesh, as `bindMesh` requires); disposed on
-   * removal (an undone removal shows it again: three.js sets it up afresh).
+   * removal (an undone removal shows it again: the renderer sets it up afresh).
    */
   material: THREE.MeshStandardMaterial;
   /** The mesh's colour (`0xrrggbb`), for its swatch: the material turns white while a colouring shows. */
@@ -569,17 +569,30 @@ export class AppState {
   syncMeshes(store: SceneStore): void {
     const { meshes } = store.getSnapshot();
     for (const item of this.#snap.items) {
-      if (!meshes.has(item.mesh)) {
-        this.#leave(store, item, this.#detach(store, item));
+      if (meshes.has(item.mesh) || !this.#snap.items.includes(item)) {
+        continue;
+      }
+      // Releasing a colouring notifies the store's listeners, so this call
+      // comes back here: the item may have left by then.
+      const primary = this.#snap.multi[0] === item.mesh;
+      const detached = this.#detach(store, item);
+      if (this.#snap.items.includes(item)) {
+        this.#leave(store, item, detached, primary);
       }
     }
     // The last to leave first, so that each finds its place.
+    let select: MeshHandle | undefined;
     for (const [mesh, parked] of [...this.#parked].reverse()) {
       if (meshes.has(mesh)) {
-        this.#relist(store, parked);
+        this.#relist(parked);
+        select = parked.primary ? mesh : select;
       } else if (!store.isRestorable(mesh)) {
         this.#parked.delete(mesh);
       }
+    }
+    if (select !== undefined && store.getSnapshot().selection === null) {
+      this.#set({ multi: [select] });
+      store.select(select);
     }
   }
 
@@ -708,7 +721,8 @@ export class AppState {
   /**
    * Removes a mesh from the store and the list, as an undo step or part of
    * the open one (for good with `undoable: false`), and disposes its
-   * material. When it is one of the collision pair, its picker resets; in pair mode
+   * material.
+   * When it is one of the collision pair, its picker resets; in pair mode
    * the other mesh's colouring (measured to it) stops first, in the same
    * tick: the store would otherwise report the colouring's lost target as
    * an error. It also leaves the contact group (and its pairs); the store
@@ -725,12 +739,15 @@ export class AppState {
     }
   }
 
-  /** A mesh that left the scene leaves the list; kept aside while undo or redo can bring it back. */
+  /**
+   * A mesh that left the scene leaves the list (`primary`: it was the primary
+   * selection); kept aside while undo or redo can bring it back.
+   */
   #leave(
     store: SceneStore,
     item: Item,
     detached: { collision: CollisionPair; group: GroupSetup },
-    primary = this.#snap.multi[0] === item.mesh,
+    primary: boolean,
   ): void {
     if (store.isRestorable?.(item.mesh) === true) {
       const { items, collision, group, meshGroups } = this.#snap;
@@ -749,7 +766,7 @@ export class AppState {
   }
 
   /** Lists a mesh that is back in the scene again, where it was. */
-  #relist(store: SceneStore, parked: ParkedItem): void {
+  #relist(parked: ParkedItem): void {
     const { item } = parked;
     this.#parked.delete(item.mesh);
     const items = [...this.#snap.items];
@@ -768,10 +785,6 @@ export class AppState {
     }
     const meshGroups = restoreMember(this.#snap.meshGroups, parked.folders, item.mesh);
     this.#set({ items, collision, group, meshGroups });
-    if (parked.primary && store.getSnapshot().selection === null) {
-      this.#set({ multi: [item.mesh] });
-      store.select(item.mesh);
-    }
   }
 
   /**
