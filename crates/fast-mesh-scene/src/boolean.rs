@@ -314,7 +314,9 @@ impl Scene {
     /// Evaluates an N-ary CSG tree over `meshes` in world coordinates and inserts
     /// the combined mesh into the scene at [`Placement::IDENTITY`], returning its [`MeshId`].
     ///
-    /// Source meshes remain untouched in the scene.
+    /// Source meshes remain untouched in the scene. The add is one undo step
+    /// (an undoable add, see [`MeshOptions::undoable`]): undo removes the
+    /// combined mesh, redo brings it back under the same id.
     pub fn boolean_batch(
         &mut self,
         meshes: &[MeshId],
@@ -380,7 +382,13 @@ impl Scene {
         let combined = crate::ops::boolean::boolean_batch(&pairs, tree, options)?;
         drop(pairs);
         drop(prepared);
-        self.add_mesh(combined, MeshOptions::default())
+        self.add_mesh(
+            combined,
+            MeshOptions {
+                undoable: true,
+                ..MeshOptions::default()
+            },
+        )
     }
 }
 

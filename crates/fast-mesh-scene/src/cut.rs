@@ -124,8 +124,9 @@ impl Scene {
     /// closed. A rim that runs into a real boundary stays open; on a mesh
     /// without UVs, split vertices are such a boundary, so weld them first.
     ///
-    /// The cut runs as one edit of the mesh, so it undoes in one step; the
-    /// added mesh is permanent, like the removed source of [`Scene::join`].
+    /// The cut and the add are one undo step (the add is undoable, see
+    /// [`MeshOptions::undoable`]): undo restores the mesh and removes the
+    /// added one, redo cuts again and brings it back under the same id.
     /// Only positions and triangles cross over: the added mesh has no
     /// normals, colouring, fields or section entries, and new vertices take
     /// channel defaults (crossing vertices on the kept side interpolate
@@ -141,33 +142,40 @@ impl Scene {
     /// recorded and the added mesh is missing.
     pub fn cut_by_plane(&mut self, id: MeshId, options: &CutOptions) -> Result<CutReport> {
         self.drop_field_unit();
-        let local = {
+        let (local, placement, mode) = {
             let entry = self.entry(id)?;
-            local_plane(&entry.placement, entry.mesh.origin(), &options.plane)?
+            (
+                local_plane(&entry.placement, entry.mesh.origin(), &options.plane)?,
+                entry.placement,
+                entry.mode,
+            )
         };
-        let output = self.edit(id, |tx| {
-            ops_cut_by_plane(tx, &local, &OpsCutOptions { cap: options.cap })
-        })?;
-        let (placement, mode) = {
-            let entry = self.entry(id)?;
-            (entry.placement, entry.mode)
-        };
-        let removed_triangles = output.report.removed_triangles;
-        let cap_triangles = output.report.cap_triangles;
-        let added = self.add_mesh(
-            output.removed,
-            MeshOptions {
-                placement,
-                mode,
-                ..MeshOptions::default()
-            },
-        )?;
-        Ok(CutReport {
-            added,
-            kept_triangles: output.report.kept_triangles,
-            removed_triangles,
-            cap_triangles,
-        })
+        // The edit and the add are one step, or part of the caller's open
+        // one: from here to `end_step` nothing returns early.
+        self.begin_step();
+        let cut = self
+            .edit(id, |tx| {
+                ops_cut_by_plane(tx, &local, &OpsCutOptions { cap: options.cap })
+            })
+            .and_then(|output| {
+                let added = self.add_mesh(
+                    output.removed,
+                    MeshOptions {
+                        placement,
+                        mode,
+                        undoable: true,
+                        ..MeshOptions::default()
+                    },
+                )?;
+                Ok(CutReport {
+                    added,
+                    kept_triangles: output.report.kept_triangles,
+                    removed_triangles: output.report.removed_triangles,
+                    cap_triangles: output.report.cap_triangles,
+                })
+            });
+        self.end_step()?;
+        cut
     }
 
     /// Conformatively imprints a world-space polyline (`options.points`) onto
@@ -1190,14 +1198,19 @@ mod tests {
             scene.mesh(report.added).unwrap().triangle_count()
         );
 
-        // One undo step restores the cut mesh; the added part stays.
+        // One undo step restores the cut mesh and removes the added part
+        // (#269); redo brings it back under the same id.
         assert!(scene.can_undo());
         assert!(scene.undo().unwrap());
         assert_eq!(scene.mesh(id).unwrap().triangle_count(), before);
-        assert!(scene.mesh(report.added).is_ok());
+        assert!(scene.mesh(report.added).is_err());
         assert!(!scene.can_undo());
         assert!(scene.redo().unwrap());
         assert_ne!(scene.mesh(id).unwrap().triangle_count(), before);
+        assert_eq!(
+            report.removed_triangles,
+            scene.mesh(report.added).unwrap().triangle_count()
+        );
     }
 
     #[test]

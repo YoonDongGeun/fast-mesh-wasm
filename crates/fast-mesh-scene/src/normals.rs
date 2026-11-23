@@ -63,6 +63,11 @@ pub(crate) struct NormalState {
 }
 
 impl NormalState {
+    /// Approximate heap memory held.
+    pub(crate) fn byte_size(&self) -> usize {
+        (self.normals.capacity() + self.triangles.capacity()) * 12
+    }
+
     /// The normals of `mesh`, computed in full.
     pub(crate) fn new(mesh: &Mesh) -> Result<NormalState> {
         let mut state = NormalState {

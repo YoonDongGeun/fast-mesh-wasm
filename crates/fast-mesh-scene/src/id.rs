@@ -31,6 +31,9 @@ impl MeshId {
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
+    /// The value is parked: kept (with its generation, off the free list)
+    /// but not live, so lookups miss it until it is unparked.
+    parked: bool,
 }
 
 /// Values addressed by [`MeshId`], iterated in index order.
@@ -57,6 +60,7 @@ impl<T> SlotMap<T> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.value = Some(value);
+            slot.parked = false;
             return Ok(MeshId {
                 index,
                 generation: slot.generation,
@@ -67,6 +71,7 @@ impl<T> SlotMap<T> {
         self.slots.push(Slot {
             generation: 0,
             value: Some(value),
+            parked: false,
         });
         Ok(MeshId {
             index,
@@ -74,12 +79,20 @@ impl<T> SlotMap<T> {
         })
     }
 
-    /// Removes and returns the value; the id stops matching.
+    /// Removes and returns the live value; the id stops matching.
     pub(crate) fn remove(&mut self, id: MeshId) -> Option<T> {
         let slot = self.slots.get_mut(id.index as usize)?;
-        if slot.generation != id.generation || slot.value.is_none() {
+        if slot.generation != id.generation || slot.value.is_none() || slot.parked {
             return None;
         }
+        self.free_slot(id)
+    }
+
+    /// Takes the value out of slot `id` (live or parked) and frees the slot:
+    /// its generation goes up, so the id never matches again.
+    fn free_slot(&mut self, id: MeshId) -> Option<T> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        slot.parked = false;
         let value = slot.value.take();
         // A slot whose generation space is used up is retired, not reused. So
         // is one whose free-list entry cannot be reserved (best effort).
@@ -100,7 +113,7 @@ impl<T> SlotMap<T> {
 
     pub(crate) fn get(&self, id: MeshId) -> Option<&T> {
         let slot = self.slots.get(id.index as usize)?;
-        if slot.generation == id.generation {
+        if slot.generation == id.generation && !slot.parked {
             slot.value.as_ref()
         } else {
             None
@@ -109,6 +122,16 @@ impl<T> SlotMap<T> {
 
     pub(crate) fn get_mut(&mut self, id: MeshId) -> Option<&mut T> {
         let slot = self.slots.get_mut(id.index as usize)?;
+        if slot.generation == id.generation && !slot.parked {
+            slot.value.as_mut()
+        } else {
+            None
+        }
+    }
+
+    /// The value of slot `id`, live or parked.
+    pub(crate) fn get_any_mut(&mut self, id: MeshId) -> Option<&mut T> {
+        let slot = self.slots.get_mut(id.index as usize)?;
         if slot.generation == id.generation {
             slot.value.as_mut()
         } else {
@@ -116,9 +139,84 @@ impl<T> SlotMap<T> {
         }
     }
 
+    /// The parked value of slot `id`.
+    pub(crate) fn get_parked(&self, id: MeshId) -> Option<&T> {
+        let slot = self.slots.get(id.index as usize)?;
+        if slot.generation == id.generation && slot.parked {
+            slot.value.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The parked value of slot `id`, mutably.
+    pub(crate) fn get_parked_mut(&mut self, id: MeshId) -> Option<&mut T> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        if slot.generation == id.generation && slot.parked {
+            slot.value.as_mut()
+        } else {
+            None
+        }
+    }
+
+    /// Parks the live value of `id`: it stays in its slot with its id, but
+    /// lookups miss it until [`SlotMap::unpark`]. False when `id` is not
+    /// live.
+    pub(crate) fn park(&mut self, id: MeshId) -> bool {
+        match self.slots.get_mut(id.index as usize) {
+            Some(slot)
+                if slot.generation == id.generation && slot.value.is_some() && !slot.parked =>
+            {
+                slot.parked = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Makes the parked value of `id` live again, under the same id. False
+    /// when `id` is not parked.
+    pub(crate) fn unpark(&mut self, id: MeshId) -> bool {
+        match self.slots.get_mut(id.index as usize) {
+            Some(slot) if slot.generation == id.generation && slot.parked => {
+                slot.parked = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes the parked value of `id` out for good and frees its slot; the
+    /// id never matches again. `None` when `id` is not parked.
+    pub(crate) fn release_parked(&mut self, id: MeshId) -> Option<T> {
+        self.get_parked(id)?;
+        self.free_slot(id)
+    }
+
+    /// Parked values in index order, mutably.
+    pub(crate) fn parked_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.slots
+            .iter_mut()
+            .filter(|s| s.parked)
+            .filter_map(|s| s.value.as_mut())
+    }
+
+    /// Parked ids in index order.
+    pub(crate) fn parked_ids(&self) -> impl Iterator<Item = MeshId> + '_ {
+        self.slots.iter().enumerate().filter_map(|(i, s)| {
+            (s.parked && s.value.is_some()).then_some(MeshId {
+                index: i as u32,
+                generation: s.generation,
+            })
+        })
+    }
+
     /// Live `(id, value)` pairs in index order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (MeshId, &T)> {
         self.slots.iter().enumerate().filter_map(|(i, s)| {
+            if s.parked {
+                return None;
+            }
             s.value.as_ref().map(|v| {
                 (
                     MeshId {
@@ -135,6 +233,9 @@ impl<T> SlotMap<T> {
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (MeshId, &mut T)> {
         self.slots.iter_mut().enumerate().filter_map(|(i, s)| {
             let generation = s.generation;
+            if s.parked {
+                return None;
+            }
             s.value.as_mut().map(|v| {
                 (
                     MeshId {
@@ -163,5 +264,30 @@ mod tests {
         assert_ne!(a, b);
         assert!(m.get(a).is_none());
         assert_eq!(m.get(b), Some(&"b"));
+    }
+
+    #[test]
+    fn parked_slots_keep_their_id_until_released() {
+        let mut m = SlotMap::new();
+        let a = m.insert("a").unwrap();
+        assert!(m.park(a));
+        assert!(!m.park(a));
+        assert!(m.get(a).is_none());
+        assert_eq!(m.remove(a), None, "a parked value is not live");
+        assert_eq!(m.iter().count(), 0);
+        assert_eq!(m.parked_ids().collect::<Vec<_>>(), vec![a]);
+        // A parked slot is not reused.
+        let b = m.insert("b").unwrap();
+        assert_ne!(a.index, b.index);
+        assert!(m.unpark(a));
+        assert_eq!(m.get(a), Some(&"a"));
+        assert!(m.park(a));
+        assert_eq!(m.release_parked(a), Some("a"));
+        assert!(m.get_any_mut(a).is_none());
+        assert!(!m.unpark(a));
+        // Released: the slot is reused under a new generation.
+        let c = m.insert("c").unwrap();
+        assert_eq!(c.index, a.index);
+        assert_ne!(c, a);
     }
 }

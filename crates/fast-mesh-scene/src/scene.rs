@@ -12,6 +12,7 @@ use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickFie
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
+use crate::presence::ParkedLinks;
 use crate::query::{CachedBox, ClosestCandidate, RayCandidate};
 use crate::report::Report;
 use crate::sections::{Section, SectionHook};
@@ -47,6 +48,12 @@ pub struct MeshOptions {
     /// [`Scene::add_mesh`] defers; [`Scene::add_mesh_built`] finishes the
     /// build it was given.
     pub defer_bvh: bool,
+    /// Record the add in the history (in the open step, or as a step of its
+    /// own), so that undo removes the mesh again and redo brings it back
+    /// under the same id; see [`Scene::remove_mesh_undoable`] for what a
+    /// mesh keeps while it is out. Off by default: the add is permanent, as
+    /// it always was.
+    pub undoable: bool,
 }
 
 /// Options for a [`Scene`].
@@ -537,9 +544,29 @@ pub(crate) struct Entry {
     pub(crate) wbox: Option<CachedBox>,
     /// Lazy `O(1)` stroke-start snapshot for sculpt dabs.
     pub(crate) stroke: StrokeSnapshot,
+    /// What the mesh keeps from the scene's registries while it is parked
+    /// (empty while it is live).
+    pub(crate) parked: ParkedLinks,
 }
 
 impl Entry {
+    /// Approximate heap memory held by the mesh with everything attached to
+    /// it: what an undoable add or removal counts against the history
+    /// budget.
+    pub(crate) fn byte_size(&self) -> usize {
+        size_of::<Entry>()
+            + self.mesh.byte_size()
+            + self.bvh.byte_size()
+            + self.normals.as_ref().map_or(0, NormalState::byte_size)
+            + self.coloring.as_ref().map_or(0, ColorState::byte_size)
+            + self.parked.fields.byte_size()
+            + self
+                .parked
+                .rest
+                .as_ref()
+                .map_or(0, |r| r.rest_positions.capacity() * 12)
+    }
+
     /// Marks the mesh as changed in unknown ways, after a failed recovery:
     /// it is reported as fully changed, drops its cached world box, and the
     /// next BVH update rebuilds from scratch even if the revision happens to
@@ -718,10 +745,10 @@ impl Entry {
 }
 
 /// A consumer of change reports.
-struct Subscriber {
+pub(crate) struct Subscriber {
     id: SubscriberId,
     /// Reports of meshes removed since its last `take_changes_for`.
-    removed: Vec<MeshChanges>,
+    pub(crate) removed: Vec<MeshChanges>,
 }
 
 /// A mesh being prepared for [`Scene::add_mesh_built`] outside any scene:
@@ -807,8 +834,9 @@ impl MeshBuild {
 pub struct Scene {
     pub(crate) entries: SlotMap<Entry>,
     /// The subscribers in ascending id order; the default one comes first
-    /// and is never removed. Each entry's `reports` follow this order.
-    subscribers: Vec<Subscriber>,
+    /// and is never removed. Each entry's `reports` (parked ones' too)
+    /// follow this order.
+    pub(crate) subscribers: Vec<Subscriber>,
     /// The id the next `subscribe` hands out.
     next_subscriber: u64,
     /// The shared undo history across all meshes.
@@ -889,6 +917,10 @@ impl Scene {
     /// first use instead (its first update, query or flush), since nothing
     /// needs it before then.
     ///
+    /// With [`MeshOptions::undoable`] the add is recorded in the history
+    /// (in the open step, or as a step of its own, dropping the redo stack):
+    /// undo removes the mesh again, redo brings it back under the same id.
+    ///
     /// # Errors
     /// [`SceneError::InvalidInput`] for an invalid placement, or a BVH or
     /// memory error from the build. An invalid policy is refused before
@@ -897,17 +929,27 @@ impl Scene {
         self.drop_field_unit();
         options.placement.validate()?;
         options.bvh_policy.validate()?;
-        if !options.defer_bvh || options.mode == UpdateMode::Eager {
-            let bvh = Bvh::build(&mesh, &options.build)?;
-            return self.insert_mesh(mesh, bvh, options);
+        if options.undoable {
+            // Make room first, so recording cannot fail after the add.
+            self.history.reserve()?;
         }
-        // Deferred: a placeholder over an empty mesh, replaced by the first
-        // update. Building it validates the build options, as for Eager.
-        let bvh = Bvh::build(&Mesh::new(), &options.build)?;
-        let id = self.insert_mesh(mesh, bvh, options)?;
-        let entry = self.entry_mut(id)?;
-        entry.pending = Some(ChangeSet::default());
-        entry.rebuild = true;
+        let id = if !options.defer_bvh || options.mode == UpdateMode::Eager {
+            let bvh = Bvh::build(&mesh, &options.build)?;
+            self.insert_mesh(mesh, bvh, options)?
+        } else {
+            // Deferred: a placeholder over an empty mesh, replaced by the
+            // first update. Building it validates the build options, as for
+            // Eager.
+            let bvh = Bvh::build(&Mesh::new(), &options.build)?;
+            let id = self.insert_mesh(mesh, bvh, options)?;
+            let entry = self.entry_mut(id)?;
+            entry.pending = Some(ChangeSet::default());
+            entry.rebuild = true;
+            id
+        };
+        if options.undoable {
+            self.record_add(id);
+        }
         Ok(id)
     }
 
@@ -921,6 +963,11 @@ impl Scene {
     /// As for [`Scene::add_mesh`]. The scene is unchanged on error.
     pub fn add_mesh_built(&mut self, mut build: MeshBuild) -> Result<MeshId> {
         self.drop_field_unit();
+        let undoable = build.options.undoable;
+        if undoable {
+            // Make room first, so recording cannot fail after the add.
+            self.history.reserve()?;
+        }
         while !build.step(usize::MAX)? {}
         let MeshBuild {
             mesh,
@@ -938,6 +985,9 @@ impl Scene {
             let entry = self.entry_mut(id)?;
             entry.normals = Some(n);
             entry.report_normals(None);
+        }
+        if undoable {
+            self.record_add(id);
         }
         Ok(id)
     }
@@ -960,12 +1010,15 @@ impl Scene {
             content: 0,
             wbox: None,
             stroke: StrokeSnapshot::default(),
+            parked: ParkedLinks::default(),
         })
     }
 
-    /// Removes a mesh and returns it. The id never matches again. Its
-    /// history entries (undo, redo and in an open step) are dropped, steps
-    /// left empty with them, and its patches release the slots they reserve.
+    /// Removes a mesh for good and returns it. The id never matches again.
+    /// Its history entries (undo, redo and in an open step) are dropped,
+    /// steps left empty with them, and its patches release the slots they
+    /// reserve. [`Scene::remove_mesh_undoable`] removes it as an undo step
+    /// instead.
     /// The removal shows up in every subscriber's next
     /// [`Scene::take_changes_for`], unless the mesh was added since that
     /// subscriber's last call.
@@ -1089,7 +1142,7 @@ impl Scene {
     /// the consequences described for [`Scene::undo`].
     pub fn cancel_step(&mut self) -> Result<()> {
         self.drop_field_unit();
-        let done = self.history.cancel(&mut self.entries);
+        let done = self.with_history(|h, scene| h.cancel(scene));
         let done = self.after_corrupted(done)?;
         self.absorb(done);
         Ok(())
@@ -1138,7 +1191,7 @@ impl Scene {
     /// the caller should consider [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
         self.drop_field_unit();
-        let done = self.history.undo(&mut self.entries);
+        let done = self.with_history(|h, scene| h.undo(scene));
         let done = self.after_corrupted(done)?;
         self.invalidate_all_strokes();
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -1152,7 +1205,7 @@ impl Scene {
     /// As for [`Scene::undo`].
     pub fn redo(&mut self) -> Result<bool> {
         self.drop_field_unit();
-        let done = self.history.redo(&mut self.entries);
+        let done = self.with_history(|h, scene| h.redo(scene));
         let done = self.after_corrupted(done)?;
         self.invalidate_all_strokes();
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -1191,23 +1244,46 @@ impl Scene {
     /// Feeds the outcome of an undo, redo or cancel into the reports and
     /// pending changes, then runs the Eager updates (BVHs, then fields and
     /// sections), as after an edit.
+    ///
+    /// An edit of a mesh the same step then parked (the undo of "add, then
+    /// fill") still reaches its BVH's pending changes and its normals, so
+    /// that they match the mesh when it is restored. Parking and restoring
+    /// report themselves.
     fn absorb(&mut self, done: Vec<Done>) {
         self.invalidate_all_strokes();
-        for (id, changes) in &done {
-            if let Some(e) = self.entries.get_mut(*id) {
-                match changes {
-                    Some(c) => e.record_changes(c),
-                    None => e.report_placement(),
+        for d in &done {
+            match d {
+                Done::Edit(id, c) => {
+                    if let Some(e) = self.entries.get_any_mut(*id) {
+                        e.record_changes(c);
+                    }
                 }
+                Done::Placement(id) => {
+                    if let Some(e) = self.entries.get_any_mut(*id) {
+                        e.report_placement();
+                    }
+                }
+                Done::Parked(..) | Done::Restored(..) => {}
             }
         }
         // Placement entries leave the BVHs alone.
-        for (id, _) in done.iter().filter(|(_, c)| c.is_some()) {
-            if let Some(e) = self.entries.get_mut(*id) {
+        for d in &done {
+            if let Done::Edit(id, _) | Done::Restored(id) = d
+                && let Some(e) = self.entries.get_mut(*id)
+            {
                 e.after_change();
             }
         }
-        let touched: Vec<MeshId> = done.iter().map(|(id, _)| *id).collect();
+        let mut touched: Vec<MeshId> = Vec::new();
+        for d in &done {
+            match d {
+                Done::Edit(id, _) | Done::Placement(id) | Done::Restored(id) => touched.push(*id),
+                Done::Parked(kept_on) => touched.extend_from_slice(kept_on),
+            }
+        }
+        touched.retain(|&id| self.entries.get(id).is_some());
+        touched.sort_unstable();
+        touched.dedup();
         self.run_eager(Some(&touched));
     }
 
@@ -1327,6 +1403,10 @@ impl Scene {
             }
             entry.reports.push(report);
         }
+        // A parked mesh's reports are replaced when it is restored.
+        for entry in self.entries.parked_mut() {
+            entry.reports.push(Report::clean());
+        }
         self.subscribers.push(Subscriber {
             id,
             removed: Vec::new(),
@@ -1350,6 +1430,9 @@ impl Scene {
         let i = self.subscriber_index(id)?;
         self.subscribers.remove(i);
         for (_, entry) in self.entries.iter_mut() {
+            entry.reports.remove(i);
+        }
+        for entry in self.entries.parked_mut() {
             entry.reports.remove(i);
         }
         Ok(())

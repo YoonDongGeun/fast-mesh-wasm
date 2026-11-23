@@ -7,7 +7,11 @@
 //! removed, its id is rejected with [`SceneError::UnknownMesh`] for good.
 //!
 //! - Registry: [`Scene::add_mesh`], [`Scene::remove_mesh`], [`Scene::mesh`]
-//!   and [`Scene::ids`] (in index order).
+//!   and [`Scene::ids`] (in index order). Adds with
+//!   [`MeshOptions::undoable`] and [`Scene::remove_mesh_undoable`] are undo
+//!   steps: undo removes an added mesh again and brings a removed one back
+//!   under the same id, with its data and display state
+//!   ([`Scene::is_restorable`]).
 //! - Placements: [`Scene::placement`] and [`Scene::set_placement`]. A
 //!   placement is validated (a proper rotation, a finite positive scale)
 //!   and stored exactly as given. World queries, fields and sections all
@@ -117,6 +121,7 @@ mod id;
 mod join;
 mod normals;
 mod placement;
+mod presence;
 mod query;
 mod register;
 mod report;

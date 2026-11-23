@@ -676,6 +676,41 @@ pub(crate) struct CurvField {
     fresh: bool,
 }
 
+/// The fields on a parked mesh, kept with it until it is restored or freed
+/// (see [`Scene::park_fields_of`]).
+#[derive(Default)]
+pub(crate) struct ParkedFields {
+    fields: Vec<Field>,
+    thick: Vec<ThickField>,
+    curv: Vec<CurvField>,
+}
+
+impl ParkedFields {
+    /// Approximate heap memory held, beside the values, which are channels
+    /// of the mesh.
+    pub(crate) fn byte_size(&self) -> usize {
+        self.fields
+            .iter()
+            .map(|f| {
+                size_of::<Field>()
+                    + f.nearest.capacity() * 4
+                    + f.finite.capacity() * 4
+                    + f.referenced.capacity()
+                    + f.live.stamps.capacity() * 4
+            })
+            .sum::<usize>()
+            + self.thick.len() * size_of::<ThickField>()
+            + self.curv.len() * size_of::<CurvField>()
+    }
+}
+
+impl ColorState {
+    /// Approximate heap memory held by the colours.
+    pub(crate) fn byte_size(&self) -> usize {
+        self.colors.capacity() * 4 + self.channel.capacity()
+    }
+}
+
 /// Which registry a field id lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldRef {
@@ -2549,6 +2584,165 @@ impl Scene {
             Err(e) => {
                 *slot = None;
                 Err(e.into())
+            }
+        }
+    }
+
+    /// Takes the fields on `mesh` out of the scene, for parking the mesh
+    /// (an undoable removal, or the undo of an undoable add): they keep their
+    /// ids, their channels and the colouring by them, which stay on the mesh,
+    /// and leave their targets' hooks. The fields on other meshes measured to
+    /// `mesh` are then dropped or lose it as a target, as by
+    /// `drop_fields_of`. Returns the parked fields and the meshes whose
+    /// fields lost `mesh` as a target, each once.
+    ///
+    /// # Errors
+    /// [`SceneError::Store`] when out of memory, before anything changed.
+    pub(crate) fn park_fields_of(&mut self, mesh: MeshId) -> Result<(ParkedFields, Vec<MeshId>)> {
+        let mut parked = ParkedFields::default();
+        let on_mesh = |on: MeshId| on == mesh;
+        parked
+            .fields
+            .try_reserve_exact(self.fields.iter().filter(|f| on_mesh(f.desc.on)).count())
+            .map_err(|_| oom())?;
+        parked
+            .thick
+            .try_reserve_exact(self.thick.iter().filter(|f| on_mesh(f.desc.on)).count())
+            .map_err(|_| oom())?;
+        parked
+            .curv
+            .try_reserve_exact(self.curv.iter().filter(|f| on_mesh(f.desc.on)).count())
+            .map_err(|_| oom())?;
+        // Nothing fails from here on.
+        let mut i = 0;
+        while i < self.fields.len() {
+            if self.fields[i].desc.on != mesh {
+                i += 1;
+                continue;
+            }
+            let f = self.fields.remove(i);
+            for &to in &f.desc.to {
+                if let Some(eb) = self.entries.get_mut(to) {
+                    eb.hooks.retain(|h| h.field != f.id);
+                }
+            }
+            parked.fields.push(f);
+        }
+        let mut t = 0;
+        while t < self.thick.len() {
+            if self.thick[t].desc.on == mesh {
+                parked.thick.push(self.thick.remove(t));
+            } else {
+                t += 1;
+            }
+        }
+        let mut c = 0;
+        while c < self.curv.len() {
+            if self.curv[c].desc.on == mesh {
+                parked.curv.push(self.curv.remove(c));
+            } else {
+                c += 1;
+            }
+        }
+        // No field is on the mesh any more: only those measured to it are left.
+        let kept_on = self.drop_fields_of(mesh);
+        Ok((parked, kept_on))
+    }
+
+    /// Makes room for putting `parked` back with [`Scene::unpark_fields`],
+    /// so that it cannot fail: in the registries, and in the hooks of every
+    /// live target.
+    ///
+    /// # Errors
+    /// [`SceneError::Store`] when out of memory, before anything changed.
+    pub(crate) fn reserve_unpark_fields(&mut self, parked: &ParkedFields) -> Result<()> {
+        self.fields
+            .try_reserve(parked.fields.len())
+            .map_err(|_| oom())?;
+        self.thick
+            .try_reserve(parked.thick.len())
+            .map_err(|_| oom())?;
+        self.curv
+            .try_reserve(parked.curv.len())
+            .map_err(|_| oom())?;
+        for f in &parked.fields {
+            for &to in &f.desc.to {
+                if let Some(eb) = self.entries.get_mut(to) {
+                    eb.hooks.try_reserve(1).map_err(|_| oom())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts the fields of a restored mesh (`mesh`, live again) back, each at
+    /// its place in registration order, after [`Scene::reserve_unpark_fields`].
+    /// A distance field drops the targets that are gone meanwhile, rebuilds
+    /// its sign data and is recomputed in full on its next update, since its
+    /// targets may have changed while it was parked; a field left without
+    /// targets is removed, with its channel and a colouring by it. Thickness
+    /// and curvature fields depend on the mesh alone, which did not change:
+    /// they come back as they were. The mesh's own hooks are reset to
+    /// "everything".
+    pub(crate) fn unpark_fields(&mut self, mesh: MeshId, parked: ParkedFields) {
+        let ParkedFields {
+            fields,
+            thick,
+            curv,
+        } = parked;
+        for mut f in fields {
+            let mut dropped = false;
+            for k in (0..f.desc.to.len()).rev() {
+                if self.entries.get(f.desc.to[k]).is_none() {
+                    f.desc.to.remove(k);
+                    f.sign.remove(k);
+                    f.sign_builds.remove(k);
+                    dropped = true;
+                }
+            }
+            if f.desc.to.is_empty() {
+                if let Some(ea) = self.entries.get_mut(mesh) {
+                    ea.hooks.retain(|h| h.field != f.id);
+                    let _ = ea.mesh.remove_channel(&f.channel);
+                    if ea
+                        .coloring
+                        .as_ref()
+                        .is_some_and(|c| c.coloring.field == f.id)
+                    {
+                        ea.coloring = None;
+                        ea.report_colors(None);
+                    }
+                    ea.report_field(f.id);
+                }
+                continue;
+            }
+            f.sign.fill_with(|| None);
+            f.sign_builds.fill_with(|| None);
+            if dropped {
+                // The indices no longer follow the targets.
+                f.nearest.iter_mut().for_each(|n| *n = u32::MAX);
+            }
+            f.live = LiveState::default();
+            f.fresh = true;
+            for &to in &f.desc.to {
+                if let Some(eb) = self.entries.get_mut(to) {
+                    eb.hooks.push(FieldHook::new(f.id));
+                }
+            }
+            let at = self.fields.partition_point(|g| g.id < f.id);
+            self.fields.insert(at, f);
+        }
+        for f in thick {
+            let at = self.thick.partition_point(|g| g.id < f.id);
+            self.thick.insert(at, f);
+        }
+        for f in curv {
+            let at = self.curv.partition_point(|g| g.id < f.id);
+            self.curv.insert(at, f);
+        }
+        if let Some(ea) = self.entries.get_mut(mesh) {
+            for h in &mut ea.hooks {
+                h.changes = None;
             }
         }
     }

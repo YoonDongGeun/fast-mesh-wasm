@@ -42,6 +42,12 @@ pub struct Adjacency {
 }
 
 impl Adjacency {
+    /// Approximate heap memory held.
+    pub(crate) fn byte_size(&self) -> usize {
+        (self.opposite.capacity() + self.vertex_corner.capacity()) * 4
+            + self.non_manifold_vertices.capacity() * 8
+    }
+
     pub(crate) fn build(mesh: &Mesh) -> Result<Self> {
         let mut build = AdjacencyBuild::new(mesh);
         build.step(mesh, usize::MAX)?;
