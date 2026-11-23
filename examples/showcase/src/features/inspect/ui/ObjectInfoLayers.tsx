@@ -109,7 +109,7 @@ function setPositions(lines: THREE.LineSegments | THREE.Line, data: Float32Array
   geometry.setDrawRange(0, data.length / 3);
 }
 
-/** Frees the GPU side only: StrictMode runs cleanups once and keeps the objects, which three uploads again. */
+/** Frees the GPU side only: React can run the effects again on the same objects, which three then uploads again. */
 function disposeObject(o: THREE.Mesh | THREE.Line | THREE.LineSegments): void {
   o.geometry.dispose();
   (o.material as THREE.Material).dispose();

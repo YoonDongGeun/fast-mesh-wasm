@@ -44,7 +44,7 @@ export function makeLabelSprite(color: string): LabelSprite {
       sprite.position.set(at[0], at[1], at[2]);
       sprite.scale.set((height * canvas.width) / canvas.height, height, 1);
     },
-    // Frees the GPU side only: StrictMode runs cleanups once and keeps the objects, which three uploads again.
+    // Frees the GPU side only: React can run the effects again on the same objects, which three then uploads again.
     dispose: () => {
       texture.dispose();
       (sprite.material as THREE.Material).dispose();

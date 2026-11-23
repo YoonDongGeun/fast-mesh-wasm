@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 // The object overlays in a headless viewport (#257): the real layers in an
-// R3F root under StrictMode (as the app mounts them), on the real engine and
-// a real mesh binding, moved through the gizmo's own `attachTransformControls`.
-// The bounding box (world and local) and the normals follow a drag while it
-// is held, its release and its undo without being rebuilt; edits and their
-// undo rebuild them once; they never catch a pointer ray; labels follow the
-// unit; and the angle stays where it was picked.
+// R3F root, on the real engine and a real mesh binding, moved through the
+// gizmo's own `attachTransformControls`. The bounding box (world and local)
+// and the normals follow a drag while it is held, its release and its undo
+// without being rebuilt; edits and their undo rebuild them once; they never
+// catch a pointer ray; labels follow the unit; a cleanup followed by the
+// effects again (a tree hidden and revealed) leaves them whole; and the angle
+// stays where it was picked.
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +20,7 @@ import { init, Scene } from "fast-mesh-wasm";
 import { SceneProvider } from "fast-mesh-wasm/react";
 import { createSceneStore } from "fast-mesh-wasm/store";
 import { attachTransformControls, bindMesh } from "fast-mesh-wasm/three";
-import { StrictMode } from "react";
+import { Activity } from "react";
 import * as THREE from "three";
 import { AppState } from "../src/app/state/app-state";
 import { ObjectInfoLayers } from "../src/features/inspect/ui/ObjectInfoLayers";
@@ -135,17 +136,21 @@ async function setup(patch: Parameters<AppState["setObjectInfo"]>[0]) {
     size: { width: 100, height: 100, top: 0, left: 0 },
   });
   let world: THREE.Scene | null = null;
-  await act(async () => {
-    const three = root.render(
-      <StrictMode>
+  /** The viewport, or (`hidden`) its overlays with every effect cleaned up but their objects kept. */
+  const render = async (mode: "visible" | "hidden") => {
+    await act(async () => {
+      const three = root.render(
         <SceneProvider store={store}>
           <primitive object={bound.object} />
-          <ObjectInfoLayers app={app} scene={scene} items={app.getSnapshot().items} />
-        </SceneProvider>
-      </StrictMode>,
-    );
-    world = three.getState().scene;
-  });
+          <Activity mode={mode}>
+            <ObjectInfoLayers app={app} scene={scene} items={app.getSnapshot().items} />
+          </Activity>
+        </SceneProvider>,
+      );
+      world = three.getState().scene;
+    });
+  };
+  await render("visible");
   let time = 0;
   const frame = async () => {
     await act(async () => {
@@ -163,7 +168,7 @@ async function setup(patch: Parameters<AppState["setObjectInfo"]>[0]) {
     store.dispose();
   });
   const find = (name: string): THREE.Object3D | null => world!.getObjectByName(name) ?? null;
-  return { scene, store, app, item, bound, frame, find, world: world! as THREE.Scene };
+  return { scene, store, app, item, bound, frame, find, render, world: world! as THREE.Scene };
 }
 
 const settle = async (ms = OBJECT_INFO_REFRESH_MS + 100) => {
@@ -367,8 +372,6 @@ describe("object overlays in the viewport (#257)", () => {
 
   it("labels the box's dimensions in the unit setting", async () => {
     const { app, frame, find } = await setup({ showBox: true, space: "world" });
-    // StrictMode's cleanup pass leaves the lines and the three labels in place.
-    expect(find("object-info-box")!.children).toHaveLength(4);
     expect(drawn).toEqual(expect.arrayContaining([`X ${formatLength(4, "mm")}`, `Y ${formatLength(2, "mm")}`, `Z ${formatLength(1, "mm")}`]));
     const count = drawn.length;
     // Frames without a change draw no text again.
@@ -395,6 +398,42 @@ describe("object overlays in the viewport (#257)", () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(hits.every((h) => h.object === bound.object)).toBe(true);
   });
+
+  for (const space of ["local", "world"] as const) {
+    it(`comes back whole when its effects run again on the same objects (${space} box, normals, angle)`, async () => {
+      const { scene, store, app, item, bound, frame, find, render } = await setup({
+        showBox: true,
+        space,
+        normals: "face",
+        angle: [[4, 0, 0], [0, 0, 0], [0, 2, 0]],
+      });
+      const whole = () => {
+        // The lines and the three labels.
+        expect(find("object-info-box")!.children).toHaveLength(4);
+        expect(find("object-info-box")!.visible).toBe(true);
+        expectAround(drawnBox(find("object-info-box")), placedCorners(scene, item.mesh));
+        expect(objectInfoProbe.box?.space).toBe(space);
+        expect(find("object-info-normals")!.parent).toBe(bound.object);
+        expect(objectInfoProbe.normalLines).toBe(12);
+        // The arms, the arc, three balls and the label.
+        expect(find("object-info-angle")!.children).toHaveLength(6);
+        expect(find("object-info-angle")!.visible).toBe(true);
+      };
+      whole();
+      await render("hidden");
+      await frame();
+      expect(find("object-info-normals")).toBeNull();
+      expect(objectInfoProbe.box).toBeNull();
+      // Moved while hidden: revealed where it is now.
+      store.setPlacement(item.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [2, 3, 4] });
+      store.commitFrame();
+      await render("visible");
+      await frame();
+      await frame();
+      whole();
+      expect(app.getSnapshot().objectInfo.showBox).toBe(true);
+    });
+  }
 
   it("hides the box with its mesh, and drops the overlays with the selection", async () => {
     const { app, store, bound, frame, find } = await setup({ showBox: true, space: "world", normals: "vertex" });
