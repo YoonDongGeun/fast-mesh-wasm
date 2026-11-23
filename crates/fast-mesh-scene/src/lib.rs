@@ -77,6 +77,10 @@
 //!   `f32` and results filtered against the exact bound. Queries over all
 //!   meshes update every Lazy BVH and fail with [`SceneError::StaleBvh`] on
 //!   a stale Manual one; queries naming meshes touch only those.
+//! - Height maps: [`Scene::height_map_frame`] fits an orthographic image
+//!   ([`HeightMapFrame`]) to meshes along a direction, [`Scene::height_map`]
+//!   samples the heights of its pixels, and [`Scene::add_heightfield`] adds a
+//!   grid of heights as a closed relief mesh.
 //! - Contacts: [`Scene::find_contacts`] finds the mesh pairs within a margin
 //!   (broadphase over world boxes, then Phase 3b per pair), optionally
 //!   restricted by a [`ContactFilter`].
@@ -116,6 +120,7 @@ mod domains;
 mod error;
 mod extrude;
 mod fields;
+mod height_map;
 mod history;
 mod hull;
 mod id;
@@ -161,6 +166,7 @@ pub use fields::{
     FieldStatus, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, OverhangOptions,
     OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
+pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};

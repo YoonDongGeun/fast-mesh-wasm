@@ -32,7 +32,7 @@ use crate::{MeshId, Placement, Result, Scene, SceneError};
 pub(crate) const PLACEMENT_SLACK: f64 = 2e-5;
 
 /// Relative rounding slack of the `f32` arithmetic inside Phase 3 queries.
-const F32_SLACK: f64 = 16.0 * f32::EPSILON as f64;
+pub(crate) const F32_SLACK: f64 = 16.0 * f32::EPSILON as f64;
 
 /// The smallest `f32` not below `x` (`x` not NaN).
 pub(crate) fn round_up(x: f64) -> f32 {
@@ -65,7 +65,7 @@ fn unscale_direction(p: &Placement, d: [f64; 3]) -> [f64; 3] {
     p.inverse_direction(d)
 }
 
-fn oom() -> SceneError {
+pub(crate) fn oom() -> SceneError {
     SceneError::Store(StoreError::OutOfMemory)
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn check_bound(x: f64, what: &'static str) -> Result<()> {
 }
 
 /// `d` scaled to unit length.
-fn unit_dir(d: [f64; 3]) -> Result<[f64; 3]> {
+pub(crate) fn unit_dir(d: [f64; 3]) -> Result<[f64; 3]> {
     let bad = SceneError::InvalidInput("ray direction must be finite and non-zero");
     if !d.iter().all(|c| c.is_finite()) || d == [0.0; 3] {
         return Err(bad);
@@ -1147,7 +1147,7 @@ impl Aabb64 {
     }
 
     /// The centre and half extents (for a non-empty box).
-    fn centre_half(&self) -> ([f64; 3], [f64; 3]) {
+    pub(crate) fn centre_half(&self) -> ([f64; 3], [f64; 3]) {
         let c = std::array::from_fn(|k| 0.5 * self.min[k] + 0.5 * self.max[k]);
         let h = std::array::from_fn(|k| 0.5 * self.max[k] - 0.5 * self.min[k]);
         (c, h)
