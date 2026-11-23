@@ -198,7 +198,7 @@ export async function executePlaceStampAtHit(args: ExecutePlaceStampArgs): Promi
   } else {
     const geom =
       placeParams.stampSource === "text"
-        ? await textStampGeometry(placeParams.text)
+        ? await textStampGeometry(placeParams.text, { follow: placeParams.conformToSurface })
         : createBuiltinStampMeshGeometry(placeParams.stampSource);
     const rawScene = store.scene as Partial<Scene | WorkerScene>;
     if (typeof rawScene.addMesh === "function") {

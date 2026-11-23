@@ -8,14 +8,18 @@ import type { AppState } from "../../../app/state/app-state";
 import type { Wave6PrintPrepState } from "../../../app/state/wave6-state";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { loadTextFont } from "./text-font";
-import { buildTextMesh, type TextParams, textParamsProblem } from "./text-mesh";
+import { buildTextMesh, FOLLOW_EDGES_PER_LETTER, refineAcross, type TextParams, textParamsProblem } from "./text-mesh";
 
 /**
  * The stamp Place Mesh puts down for `params`: the closed text mesh with
  * its base at z = 0 and its box centred on the origin, as engine buffers.
- * Loads the font on first use.
+ * With `follow` its faces are cut small enough to follow a curved surface
+ * (Conform to Surface moves vertices only). Loads the font on first use.
  */
-export async function textStampGeometry(params: TextParams): Promise<{ positions: Float64Array; indices: Uint32Array }> {
+export async function textStampGeometry(
+  params: TextParams,
+  options: { follow?: boolean } = {},
+): Promise<{ positions: Float64Array; indices: Uint32Array }> {
   const problem = textParamsProblem(params);
   if (problem !== null) {
     throw new Error(problem);
@@ -24,7 +28,8 @@ export async function textStampGeometry(params: TextParams): Promise<{ positions
   if (mesh.indices.length === 0) {
     throw new Error("The text has no letters to place.");
   }
-  return { positions: Float64Array.from(mesh.positions), indices: mesh.indices };
+  const stamp = options.follow === true ? refineAcross(mesh, params.size / FOLLOW_EDGES_PER_LETTER) : mesh;
+  return { positions: Float64Array.from(stamp.positions), indices: stamp.indices };
 }
 
 /** The two ways text goes onto a surface. */

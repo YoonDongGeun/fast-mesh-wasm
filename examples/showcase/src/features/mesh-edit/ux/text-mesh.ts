@@ -549,6 +549,151 @@ export function buildTextMesh(font: TypefaceFont, p: TextParams, options: { cent
 }
 
 /**
+ * `mesh` (closed) with every edge at most `maxLength` long as seen along Z,
+ * for a stamp that is to follow a curve: Place Mesh moves each vertex along
+ * the surface normal by what the curve asks at its X and Y, so a triangle
+ * wide in X and Y cuts straight through the curve, while the edges up the
+ * walls never need splitting. Longest edges are split first, at their
+ * middle, in every triangle that has them, so the mesh stays closed and
+ * wound the same way; a split makes only shorter edges, so this ends.
+ */
+export function refineAcross(
+  mesh: { positions: Float32Array; indices: Uint32Array },
+  maxLength: number,
+): { positions: Float32Array; indices: Uint32Array } {
+  if (!(maxLength > 0)) {
+    throw new Error("the longest edge must be above zero");
+  }
+  const pos = Array.from(mesh.positions);
+  const tris = Array.from(mesh.indices);
+  const limit = maxLength * maxLength;
+  const key = (a: number, b: number) => Math.min(a, b) * KEY_STRIDE + Math.max(a, b);
+  const trianglesOf = new Map<number, number[]>();
+  for (let t = 0; t < tris.length / 3; t++) {
+    for (let e = 0; e < 3; e++) {
+      const k = key(tris[3 * t + e], tris[3 * t + ((e + 1) % 3)]);
+      const list = trianglesOf.get(k);
+      if (list === undefined) {
+        trianglesOf.set(k, [t]);
+      } else {
+        list.push(t);
+      }
+    }
+  }
+  // A binary heap of edges over the limit: longest first, ties by key.
+  const heapKey: number[] = [];
+  const heapLen: number[] = [];
+  const before = (i: number, j: number) =>
+    heapLen[i] > heapLen[j] || (heapLen[i] === heapLen[j] && heapKey[i] < heapKey[j]);
+  const swap = (i: number, j: number) => {
+    [heapKey[i], heapKey[j]] = [heapKey[j], heapKey[i]];
+    [heapLen[i], heapLen[j]] = [heapLen[j], heapLen[i]];
+  };
+  const pushEdge = (k: number) => {
+    const a = Math.floor(k / KEY_STRIDE);
+    const b = k - a * KEY_STRIDE;
+    const len2 = (pos[3 * a] - pos[3 * b]) ** 2 + (pos[3 * a + 1] - pos[3 * b + 1]) ** 2;
+    if (len2 <= limit) {
+      return;
+    }
+    heapKey.push(k);
+    heapLen.push(len2);
+    for (let i = heapKey.length - 1; i > 0; ) {
+      const up = (i - 1) >> 1;
+      if (!before(i, up)) {
+        break;
+      }
+      swap(i, up);
+      i = up;
+    }
+  };
+  const popEdge = (): number => {
+    const top = heapKey[0];
+    const lastKey = heapKey.pop() as number;
+    const lastLen = heapLen.pop() as number;
+    if (heapKey.length > 0) {
+      heapKey[0] = lastKey;
+      heapLen[0] = lastLen;
+      for (let i = 0; ; ) {
+        const left = 2 * i + 1;
+        let best = i;
+        if (left < heapKey.length && before(left, best)) {
+          best = left;
+        }
+        if (left + 1 < heapKey.length && before(left + 1, best)) {
+          best = left + 1;
+        }
+        if (best === i) {
+          break;
+        }
+        swap(i, best);
+        i = best;
+      }
+    }
+    return top;
+  };
+  for (const k of trianglesOf.keys()) {
+    pushEdge(k);
+  }
+  while (heapKey.length > 0) {
+    const k = popEdge();
+    const on = trianglesOf.get(k);
+    if (on === undefined) {
+      continue;
+    }
+    trianglesOf.delete(k);
+    const a = Math.floor(k / KEY_STRIDE);
+    const b = k - a * KEY_STRIDE;
+    const m = pos.length / 3;
+    for (let c = 0; c < 3; c++) {
+      pos.push(Math.fround((pos[3 * a + c] + pos[3 * b + c]) / 2));
+    }
+    const made = new Set<number>();
+    for (const t of on) {
+      // The triangle as (p, q, r), with the edge p-q.
+      let e = 0;
+      while (key(tris[3 * t + e], tris[3 * t + ((e + 1) % 3)]) !== k) {
+        e++;
+      }
+      const p = tris[3 * t + e];
+      const q = tris[3 * t + ((e + 1) % 3)];
+      const r = tris[3 * t + ((e + 2) % 3)];
+      const half = tris.length / 3;
+      tris[3 * t] = p;
+      tris[3 * t + 1] = m;
+      tris[3 * t + 2] = r;
+      tris.push(m, q, r);
+      const qr = trianglesOf.get(key(q, r)) as number[];
+      qr[qr.indexOf(t)] = half;
+      for (const [u, w, own] of [
+        [p, m, [t]],
+        [m, q, [half]],
+        [m, r, [t, half]],
+      ] as const) {
+        const kk = key(u, w);
+        const list = trianglesOf.get(kk);
+        if (list === undefined) {
+          trianglesOf.set(kk, [...own]);
+        } else {
+          list.push(...own);
+        }
+        made.add(kk);
+      }
+    }
+    for (const kk of made) {
+      pushEdge(kk);
+    }
+  }
+  return { positions: Float32Array.from(pos), indices: Uint32Array.from(tris) };
+}
+
+/** Vertex numbers in an edge key: `min * KEY_STRIDE + max` stays exact below 2^26 vertices. */
+const KEY_STRIDE = 2 ** 26;
+
+/** How finely a text stamp that follows a curve is cut: this many edges to a letter's height. */
+export const FOLLOW_EDGES_PER_LETTER = 8;
+
+/**
  * The outline of `p` as line segments at z = 0 (`[x0, y0, 0, x1, y1, 0, ...]`
  * per segment), centred as the mesh, and the radius of its box: what the
  * viewport shows of a text stamp before it is placed.

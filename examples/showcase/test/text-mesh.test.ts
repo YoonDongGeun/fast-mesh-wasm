@@ -12,6 +12,7 @@ import {
   glyphRegions,
   layoutText,
   MAX_TEXT_CHARS,
+  refineAcross,
   repairOutline,
   signedArea,
   type TextMesh,
@@ -172,6 +173,42 @@ describe("cap triangulation", () => {
     ]);
     // A gap no triangle runs over cannot be mended.
     expect(repairOutline(pts, [[0, 2, 3]], ring)).toBe(false);
+  });
+});
+
+describe("refining a stamp to follow a curve", () => {
+  it("cuts every edge down across, not up the walls, and keeps the solid", () => {
+    const p = params({ text: "AB8\nR2", size: 14, depth: 5 });
+    const mesh = buildTextMesh(font, p);
+    const fine = refineAcross(mesh, 14 / 8);
+    expect(expectSolid(fine as TextMesh, "refined")).toBe(expectSolid(mesh, "plain"));
+    expectEngineSolid(fine as TextMesh, "refined");
+    expect(signedVolume(fine)).toBeCloseTo(signedVolume(mesh), 2);
+    let longest = 0;
+    for (let t = 0; t < fine.indices.length; t += 3) {
+      for (let e = 0; e < 3; e++) {
+        const a = 3 * fine.indices[t + e];
+        const b = 3 * fine.indices[t + ((e + 1) % 3)];
+        longest = Math.max(longest, Math.hypot(fine.positions[a] - fine.positions[b], fine.positions[a + 1] - fine.positions[b + 1]));
+      }
+    }
+    expect(longest).toBeLessThanOrEqual(14 / 8);
+    // The walls' upright edges stay whole: no vertex halfway up over an outline point.
+    const corners = new Set<string>();
+    for (let v = 0; v < mesh.positions.length; v += 3) corners.add(`${mesh.positions[v]},${mesh.positions[v + 1]}`);
+    let halfway = 0;
+    for (let v = 0; v < fine.positions.length; v += 3) {
+      const z = fine.positions[v + 2];
+      if (z > 0 && z < 5 && corners.has(`${fine.positions[v]},${fine.positions[v + 1]}`)) halfway++;
+    }
+    expect(halfway).toBe(0);
+    expect(fine.indices.length).toBeGreaterThan(mesh.indices.length);
+    // The vertices it had stay where they were.
+    expect(Array.from(fine.positions.slice(0, mesh.positions.length))).toEqual(Array.from(mesh.positions));
+    // The same every time, and nothing to do when every edge is short already.
+    expect(refineAcross(mesh, 14 / 8)).toEqual(fine);
+    expect(refineAcross(mesh, 1000)).toEqual({ positions: mesh.positions, indices: mesh.indices });
+    expect(() => refineAcross(mesh, 0)).toThrow();
   });
 });
 
