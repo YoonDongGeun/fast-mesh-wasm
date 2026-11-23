@@ -535,6 +535,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" data-ribbon-focus="maps" onClick={() => focusElement("[data-inspect-maps]")}>
                 Maps
               </button>
+              <button type="button" data-ribbon-focus="geodesic" onClick={() => focusElement("[data-inspect-geodesic]")}>
+                Geodesic
+              </button>
               <button
                 type="button"
                 aria-pressed={shadingMode === "backfaceWarning"}

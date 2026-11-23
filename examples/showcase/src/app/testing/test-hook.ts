@@ -19,6 +19,8 @@ import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays
 import { hasWireOverlay } from "../../features/view/ui/wire";
 import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
 import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../features/inspect/ux/use-object-info";
+import { geodesicMapProbe } from "../../features/inspect/ux/use-geodesic-map";
+import { pathLength } from "../../features/inspect/ux/surface-paths";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
@@ -310,6 +312,30 @@ export function installTestHook(
         return null;
       }
       return qualityReportFile(await readQualityReport(app, engine.scene, mesh), format, app.getSnapshot().units).text;
+    },
+    /**
+     * The geodesic map and surface path (#252): the picked mesh, the armed pick, the method, the source
+     * slots, the path (points, legs, closed, world length), legs tracing, the latest error, the iso-line
+     * segments drawn, and the map shown with how many map queries landed.
+     */
+    surfacePath: () => {
+      const s = app.getSnapshot().surfacePath;
+      const m = geodesicMapProbe.shown;
+      return {
+        mesh: nameOf(s.mesh),
+        armed: s.armed,
+        method: s.method,
+        sources: s.sources.map((p) => p.slot),
+        path:
+          s.path === null
+            ? null
+            : { points: s.path.points.length, legs: s.path.legs.length, closed: s.path.closed, length: pathLength(s.path) },
+        tracing: s.tracing,
+        error: s.error,
+        isoSegments: (s.isoLines?.length ?? 0) / 6,
+        map: m === null ? null : { ...m, sources: [...m.sources] },
+        mapRuns: geodesicMapProbe.runs,
+      };
     },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),

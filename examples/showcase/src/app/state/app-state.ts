@@ -37,6 +37,7 @@ import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
 import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-tools";
 import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
+import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
 
 export interface Item {
   /** A React key. */
@@ -381,6 +382,8 @@ export interface AppSnapshot {
   alignTool: AlignToolState;
   /** The object info box, its overlays and the angle measure (#257). */
   objectInfo: ObjectInfoState;
+  /** The geodesic map's sources, the surface path and their armed pick (#252). */
+  surfacePath: SurfacePathToolState;
 }
 
 const PALETTE = [0xd9735f, 0x6ea8d9, 0x8fc46e, 0xc9a0dc, 0xe0b45c, 0x5fc4b8, 0xe08bb0, 0xa3a3f0];
@@ -469,6 +472,7 @@ export class AppState {
     placementTool: DEFAULT_PLACEMENT_TOOL,
     alignTool: DEFAULT_ALIGN_TOOL,
     objectInfo: DEFAULT_OBJECT_INFO,
+    surfacePath: DEFAULT_SURFACE_PATH_TOOL,
   };
 
   /** Starts with the stored display settings (`main.tsx` passes them; tests take the defaults). */
@@ -986,6 +990,11 @@ export class AppState {
   /** Updates the object info box, its overlays or the angle measure's points (#257; display state, not undoable). */
   setObjectInfo(patch: Partial<ObjectInfoState>): void {
     this.#set({ objectInfo: { ...this.#snap.objectInfo, ...patch } });
+  }
+
+  /** Changes the geodesic map and surface path state: picks, the armed pick, the method (#252). */
+  setSurfacePath(patch: Partial<SurfacePathToolState>): void {
+    this.#set({ surfacePath: { ...this.#snap.surfacePath, ...patch } });
   }
 
   /** Locks or unlocks a mesh against move/rotate/scale and sculpt/mask edits (#235). */

@@ -48,6 +48,7 @@ import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceTo
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
 import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
 import { AlignToolsLayer } from "../../features/transform/ui/AlignToolsLayer";
+import { SurfacePathLayer } from "../../features/inspect/ui/SurfacePathLayer";
 import { useCameraRequests, useOrbitCamera } from "../ux/use-camera-controller";
 import { useGizmoDrag, useMeshBindings } from "../ux/use-gizmo";
 import { useHoverRay } from "../ux/use-hover-ray";
@@ -120,8 +121,14 @@ export function Viewport(props: {
   const wave6PrintTool = useApp(app, (s) => s.wave6.printPrep.activeTool);
   // An armed placement pick (#256) or landmark pick (#253) owns the pointer like the Wave 6 tools.
   const placementPicking = useApp(app, (s) => s.placementTool.pick !== null || s.alignTool.landmarks?.picking === true);
+  // So does an armed geodesic or path pick (#252).
+  const surfacePicking = useApp(app, (s) => s.surfacePath.armed !== null);
   const pointerOwnedByWave6 =
-    wave6SelectTool !== null || wave6DeformTool !== null || wave6PrintTool !== null || placementPicking;
+    wave6SelectTool !== null ||
+    wave6DeformTool !== null ||
+    wave6PrintTool !== null ||
+    placementPicking ||
+    surfacePicking;
   const { downAt, onMissed, onPick } = useSelectionClicks({
     app,
     select,
@@ -202,7 +209,12 @@ export function Viewport(props: {
       {maskPaint && sculpt === null ? <MaskLayer app={app} scene={scene} maskTracker={maskTracker} /> : null}
       <PickCursor
         picking={
-          picking !== null || sculpt !== null || wave6SelectTool !== null || wave6PrintTool !== null || placementPicking
+          picking !== null ||
+          sculpt !== null ||
+          wave6SelectTool !== null ||
+          wave6PrintTool !== null ||
+          placementPicking ||
+          surfacePicking
         }
       />
       <MissTracker track={downAt} />
@@ -215,6 +227,7 @@ export function Viewport(props: {
       <HollowPlaceToolsLayer app={app} store={store} />
       <PlacementPicksLayer app={app} store={store} />
       <AlignToolsLayer app={app} store={store} />
+      <SurfacePathLayer app={app} store={store} />
       <CreatePreviewLayer app={app} />
       <TextPreviewLayer app={app} />
     </Canvas>

@@ -35,6 +35,8 @@ import { COLORMAPS, SURFACE_FIELD_MODES, useSurfaceField } from "../ux/use-surfa
 import { AngleReadout } from "./AngleReadout";
 import { FieldLegend } from "./FieldLegend";
 import { InspectMapControls } from "./InspectMapControls";
+import { SurfacePathControls } from "./SurfacePathControls";
+import { releaseGeodesicOverlay } from "../ux/use-geodesic-map";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { formatArea, formatCoordLength, formatLength, formatPoint, formatVolume, type LengthUnit } from "../../../shared/ux/units";
 
@@ -73,6 +75,7 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
     if (surfaceField.sf.mode !== "none") {
       surfaceField.switchMode("none");
     }
+    releaseGeodesicOverlay(app);
   };
 
   return (
@@ -111,6 +114,7 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
         unit={units}
         onTakeOverlay={takeOverlayFromField}
       />
+      <SurfacePathControls app={app} items={items} selection={selection} unit={units} onTakeOverlay={takeOverlayFromField} />
       <PrimitiveFitControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
       <ContourSliceControls app={app} store={store} items={items} item={item} metrology={metrology} unit={units} />
     </section>

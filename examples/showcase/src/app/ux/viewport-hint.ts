@@ -20,6 +20,8 @@ export interface HintState {
   placementPick?: boolean;
   /** The align panel picks landmark pairs on its moving and fixed meshes (#253). */
   landmarkPick?: boolean;
+  /** The inspect panel takes clicks on the selected mesh as geodesic sources or path points (#252). */
+  surfacePick?: "sources" | "path" | null;
   selected: boolean;
   coarse: boolean;
 }
@@ -51,6 +53,12 @@ export function viewportHint(s: HintState): string {
   }
   if (s.landmarkPick === true) {
     return "Click a point on the moving mesh, then its match on the fixed mesh · Esc stops";
+  }
+  if (s.surfacePick === "sources") {
+    return "Click the selected mesh to add a distance source · drag to rotate · Esc stops";
+  }
+  if (s.surfacePick === "path") {
+    return "Click points on the selected mesh to draw a path · click the first point to close it · Esc stops";
   }
   if (!s.selected) {
     return s.coarse

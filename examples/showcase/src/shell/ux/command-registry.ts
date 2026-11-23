@@ -10,7 +10,7 @@ import { textCommands } from "../../features/mesh-edit/ux/text-commands";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
 import { ALIGN_COMMANDS } from "../../features/transform/ux/align-tools";
-import { triggerClick } from "./panel-triggers";
+import { focusElement, triggerClick } from "./panel-triggers";
 import type { GizmoMode } from "../../viewport/ui/Viewport";
 
 export interface CommandPaletteItem {
@@ -393,6 +393,16 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       keywords: "inspect map deviation tolerance reference overhang support build direction critical angle triangle quality aspect ratio minimum angle sliver",
       run: () => {
         app.setActiveTab("inspect");
+      },
+    },
+    {
+      id: "tool:inspect-geodesic",
+      title: "Inspect: Geodesic Distance, Surface Path & Trim",
+      category: "Tool",
+      keywords: "geodesic surface distance source iso line contour path shortest length loop trim split cut curve",
+      run: () => {
+        app.setActiveTab("inspect");
+        focusElement("[data-inspect-geodesic]");
       },
     },
     {
