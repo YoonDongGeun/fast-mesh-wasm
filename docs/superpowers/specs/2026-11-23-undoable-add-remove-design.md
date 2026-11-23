@@ -1,6 +1,6 @@
 # Undoable add and remove mesh (#269)
 
-- **Status:** Implemented.
+- **Status:** Implemented. #271 (2026-11-24) migrated the remaining ops and tools.
 - **Date:** 2026-11-23
 - **Parent spec:** `2026-10-18-fast-mesh-scene-design.md` (§4 registry, §7 history, §10 reports).
   This document amends §4 ("removing a mesh drops its entries from the history") for the new
@@ -29,10 +29,11 @@ tell which meshes the history can still bring back; the TS scenes have `has(mesh
 `isRestorable(mesh)`, the store `isRestorable(mesh)`.
 
 The scene ops that create a mesh as part of their own step record that add too, so their undo
-removes it: `convex_hull`, `convex_hull_points`, `cut_by_plane` (the removed side) and
-`boolean_batch`. The other ops that add meshes (extract and split faces, drain plugs, placed stamps,
-point-cloud reconstruction) and `join` (which removes its source) keep their permanent adds and
-removal for now; migrating them is a follow-up.
+removes it: `convex_hull`, `convex_hull_points`, `wrap`, `cut_by_plane` (the removed side),
+`boolean_batch`, `extract_selected_faces`, `split_selected_faces`, `punch_drain_hole_world` (its
+plugs), `place_mesh_world` (a stamp kept separate) and `reconstruct_point_cloud`. `join` removes its
+source undoably, in the step of its edit. An op of several changes nests one step and always closes
+it: an edit that fails leaves the caller's open step as it was.
 
 ## 3. Keeping a removed mesh
 
@@ -47,12 +48,14 @@ removal for now; migrating them is a follow-up.
 - **What goes with it.** The fields on the mesh (distance fields measured from it, thickness and
   curvature fields) and its colouring by them are parked with it (`ParkedLinks`) and come back,
   recomputed in full on their next update (targets removed meanwhile are dropped; a field left
-  without targets goes, with its colouring). Its elastic rest state is kept too.
+  without targets goes, with its colouring). Its elastic rest state is kept too, and so are its
+  collision pair rules: a rule between two meshes waits until both are back (of two parked meshes one
+  keeps it, and hands it over when it comes back first).
 - **What does not.** Links owned by other meshes are cut exactly as `remove_mesh` cuts them, and are
   not restored: fields on other meshes measured to it alone are removed (with colourings by them),
-  fields measured to it and others lose it as a target, it leaves the sections that cut it, and
-  its collision pair rules go. These are other meshes' or the app's state, which the SDK store
-  and the apps already prune on removal; restoring them would fight their own bookkeeping.
+  fields measured to it and others lose it as a target, and it leaves the sections that cut it. These
+  are other meshes' or the app's state, which the SDK store and the apps already prune on removal;
+  restoring them would fight their own bookkeeping.
 
 ## 4. History entries
 
@@ -116,15 +119,15 @@ permanent, as any step of that size. Eviction frees the parked mesh at once.
   `MeshHandle` object. Handles of meshes the history dropped are pruned after the next undo, redo,
   cancel or clear.
 - **Worker engine.** An undoable add runs inline, never in the background, so it lands in the step
-  it was asked in. After a request that can move meshes (an undoable removal, undo, redo, a
+  it was asked in. After a request that can move meshes (an undoable removal, a join, undo, redo, a
   cancelled step) the engine compares every mesh with the scene. A parked mesh keeps its client id
   and the fields on it; requests on it fail in the scene with `UNKNOWN_MESH`. A result says where
   the moved meshes now are (`presence`: live, parked or gone) and what that left of fields
   (`fieldTargets`) and sections (`sectionMeshes`): which links were cut depends on the order of the
   steps, and a mesh may leave and come back within one batch, so the client cannot infer it.
-- **Worker client.** The state of a parked mesh is kept; calls on it give `UNKNOWN_MESH`, and its
-  mirrors are refilled from the restore record. A `removeMesh` newer than a result decides over what
-  the result says. A mesh added and undone before any record of it was packed still gets a removal
+- **Worker client.** The state of a parked mesh is kept, with its collision rules; calls on it give
+  `UNKNOWN_MESH`, and its mirrors are refilled from the restore record. A `removeMesh` newer than a
+  result decides over what the result says. A mesh added and undone before any record of it was packed still gets a removal
   record, since its handle was given out at the add. `restart()` clears the history, so it rebuilds
   the live meshes from the mirrors and drops the parked ones.
 - **`SceneStore`** follows the local scene after each undo, redo and cancel, and the Worker by the
@@ -141,10 +144,13 @@ permanent, as any step of that size. Eviction frees the parked mesh at once.
 the list, kept aside with its place, groups, collision pair sides and whether it was selected while
 the store says it is restorable; a mesh that is back is listed again as the same item (name, colour,
 material, locks). The material is disposed when it leaves; the renderer sets it up afresh on reuse.
-Create, duplicate, convex hull, the two-mesh and N-way booleans use undoable adds and removals in one
-step each, and the mesh list's and a group's Remove are undoable. Opening a project clears the
-history first, so that nothing from before comes back. Tools still using the empty-then-fill pattern
-keep working unchanged.
+Create, duplicate, convex hull, wrap, the two-mesh and N-way booleans, the split along a surface path,
+extract and split faces, drain plugs, placed stamps, point-cloud reconstruction and join use undoable
+adds and removals in one step each, and the mesh list's and a group's Remove are undoable. Opening a
+project clears the history first, so that nothing from before comes back. Tools using the
+empty-then-fill pattern keep working unchanged. The collision panel keeps a pair's and a group's
+response rule while its meshes are restorable, and sets it again when they are back: the defaults it
+is built on may have changed since.
 
 ## 9. Cost
 

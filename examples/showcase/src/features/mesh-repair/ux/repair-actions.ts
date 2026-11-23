@@ -3,8 +3,8 @@
 // wrapped in one store step, Auto repair (the library's default pipeline,
 // or a preset) and Selective heal with their before/after summaries, and
 // Join, which copies another mesh in, bridges a loop pair and removes the
-// source. The runner shows each report and tells the op's own triangle
-// change from an undo's.
+// source (undo brings it back). The runner shows each report and tells the
+// op's own triangle change from an undo's.
 import type {
   BridgeStats,
   FillContinuity,
@@ -20,6 +20,7 @@ import type { AppState, Item } from "../../../app/state/app-state";
 import type { LengthUnit } from "../../../shared/ux/units";
 import { runAutoRepairPipeline } from "./auto-repair";
 import type { HealerOverlayCounts } from "./healer-defects";
+import { joinMeshes } from "./join";
 import { buildSelectiveHealOps, formatHealerDelta, healerCountsOf, type SelectiveHealCategory } from "./mesh-healer";
 import {
   type AnalysisSummary,
@@ -278,21 +279,14 @@ export function repairActions(ctx: {
     await runGuarded(
       "Join",
       async (into) => {
-        // Like a removal: release the pair colouring first, in the same tick
-        // the engine drops the source.
-        const snap = app.getSnapshot();
-        if (snap.collisionMode === "pair" && (snap.collision.a === source.mesh || snap.collision.b === source.mesh)) {
-          const other = snap.collision.a === source.mesh ? snap.collision.b : snap.collision.a;
-          if (other !== null && other !== source.mesh) {
-            store.setDisplay(other, { coloring: null });
-          }
-        }
-        const r = await scene.join(into, source.mesh, { loopA: target.id, loopB: from.id, maxEdges: options.loopMax });
-        app.dropItem(store, source);
+        const r = await joinMeshes(store, app, into, source, {
+          loopA: target.id,
+          loopB: from.id,
+          maxEdges: options.loopMax,
+        });
         // The queue advances: the next secondary seeds itself.
         picks.setJoinSource("");
-        const line = `${describeJoin(r)} — ${source.name} removed (undo restores ${targetName} only)`;
-        showReport(into, line, false);
+        showReport(into, `${describeJoin(r)} — ${source.name} removed (undo brings it back)`, false);
       },
       (message) => `Join ${source.name} into ${targetName} failed: ${message}`,
     );

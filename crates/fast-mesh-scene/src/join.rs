@@ -1,5 +1,5 @@
-//! Joining two meshes: append one's geometry into the other and bridge a
-//! loop on each, as one undo step, then remove the emptied mesh.
+//! Joining two meshes: append one's geometry into the other, bridge a loop on
+//! each and remove the mesh copied from, as one undo step.
 
 use fast_mesh_ops::append::{AppendSource, append_mesh_with_uvs};
 use fast_mesh_ops::bridge::{BridgeOptions, bridge_loops};
@@ -137,9 +137,13 @@ impl Scene {
     /// Joins the source mesh into the target: copies the source's alive
     /// positions (mapped into the target's local frame, so the world shape
     /// is kept) and triangles into the target, bridges `loop_a` to the
-    /// copied `loop_b`, and removes the source mesh. The copy and the bridge
-    /// run in one edit, so they undo together; the removal is permanent,
-    /// like [`Scene::remove_mesh`].
+    /// copied `loop_b`, and removes the source mesh. The edit and the removal
+    /// are one undo step (the removal is undoable, see
+    /// [`Scene::remove_mesh_undoable`]): undo restores the target and brings
+    /// the source back under the same id, redo joins them again. As for any
+    /// undoable removal, the kept source counts against the history budget,
+    /// and what belongs to other meshes or to the scene (fields measured to
+    /// it, the sections that cut it) is cut and not restored.
     ///
     /// Only positions and triangles cross over: the source's channels are
     /// dropped, and the target's channels take their defaults on the new
@@ -153,8 +157,8 @@ impl Scene {
     /// [`SceneError::Ops`] with [`OpsError::StaleLoops`] for a loop that is
     /// not there, or [`OpsError::InvalidInput`] when the loops cannot bridge
     /// (unclean, over `max_edges`, winding the same way). A failed join
-    /// changes nothing: both meshes are left as they were. If removing the
-    /// source fails (out of memory), the joined geometry stays recorded and
+    /// changes nothing: both meshes are left as they were. If recording the
+    /// removal fails (out of memory), the joined geometry stays recorded and
     /// the source mesh with it.
     pub fn join(&mut self, a: MeshId, b: MeshId, options: &JoinOptions) -> Result<JoinReport> {
         if a == b {
@@ -177,7 +181,10 @@ impl Scene {
             index_of,
             loop_vertices,
         } = prepared;
-        let report = self.edit(a, |tx| -> std::result::Result<JoinReport, OpsError> {
+        // The edit and the removal are one step, or part of the caller's open
+        // one: from here to `end_step` nothing returns early.
+        self.begin_step();
+        let edited = self.edit(a, |tx| -> std::result::Result<JoinReport, OpsError> {
             let appended = append_mesh_with_uvs(tx, &source, uvs.as_deref())?;
             // The copied loop is the one loop whose vertices are exactly the
             // copied source loop's: appended vertices are new ids, referenced
@@ -207,9 +214,13 @@ impl Scene {
                 bridge_triangles_added: bridged.triangles_added,
                 uvs_dropped: appended.uvs_dropped,
             })
-        })?;
-        self.remove_mesh(b)?;
-        Ok(report)
+        });
+        let joined = edited.and_then(|report| {
+            self.remove_mesh_undoable(b)?;
+            Ok(report)
+        });
+        self.end_step()?;
+        joined
     }
 }
 
@@ -279,12 +290,84 @@ mod tests {
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), 2 + 2 + 8);
         assert_eq!(scene.mesh(b).unwrap_err(), SceneError::UnknownMesh);
 
-        // One undo step restores the target; the source stays removed.
+        // One undo step restores the target and brings the source back (#271).
+        let joined = scene.mesh(a).unwrap().positions().to_vec();
+        assert!(scene.is_restorable(b));
         assert!(scene.undo().unwrap());
+        assert!(!scene.can_undo(), "the join is one step");
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), 2);
-        assert_eq!(scene.mesh(b).unwrap_err(), SceneError::UnknownMesh);
+        assert_eq!(scene.mesh(b).unwrap().triangle_count(), 2);
         assert!(scene.redo().unwrap());
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), 2 + 2 + 8);
+        assert_eq!(scene.mesh(a).unwrap().positions(), joined);
+        assert_eq!(scene.mesh(b).unwrap_err(), SceneError::UnknownMesh);
+        // The source that came back is as good as new: it joins again.
+        assert!(scene.undo().unwrap());
+        let options = crate::JoinOptions {
+            loop_a,
+            loop_b,
+            max_edges: None,
+        };
+        assert_eq!(scene.join(a, b, &options), Ok(report));
+        assert!(scene.mesh(b).is_err());
+        assert!(!scene.can_redo());
+    }
+
+    #[test]
+    fn join_is_part_of_the_callers_step_and_a_failed_one_leaves_it_open() {
+        let (a_mesh, b_mesh) = (quad_a(), quad_b());
+        let options = join_options(&a_mesh, &b_mesh);
+        let mut scene = scene_of(a_mesh, b_mesh);
+        let ids: Vec<_> = scene.ids().collect();
+        let (a, b) = (ids[0], ids[1]);
+        let moved = Placement {
+            translation: [0.0, 0.0, 1.0],
+            ..Placement::IDENTITY
+        };
+        scene.begin_step();
+        scene.set_placement(b, moved).unwrap();
+        let bad = crate::JoinOptions {
+            loop_a: LoopId {
+                min_vertex: 99,
+                len: 4,
+                hash: 7,
+            },
+            ..options
+        };
+        assert_eq!(
+            scene.join(a, b, &bad),
+            Err(SceneError::Ops(OpsError::StaleLoops))
+        );
+        assert_eq!(scene.placement(b).unwrap(), moved);
+        scene.join(a, b, &options).unwrap();
+        scene.end_step().unwrap();
+        assert!(scene.mesh(b).is_err());
+        assert!(scene.undo().unwrap());
+        assert!(!scene.can_undo());
+        assert_eq!(scene.mesh(a).unwrap().triangle_count(), 2);
+        assert_eq!(scene.placement(b).unwrap(), Placement::IDENTITY);
+        assert!(scene.redo().unwrap());
+        assert!(scene.mesh(b).is_err());
+        assert_eq!(scene.mesh(a).unwrap().triangle_count(), 2 + 2 + 8);
+    }
+
+    #[test]
+    fn a_joined_source_comes_back_with_what_is_its_own() {
+        let (a_mesh, b_mesh) = (quad_a(), quad_b());
+        let options = join_options(&a_mesh, &b_mesh);
+        let mut scene = scene_of(a_mesh, b_mesh);
+        let ids: Vec<_> = scene.ids().collect();
+        let (a, b) = (ids[0], ids[1]);
+        scene.set_normals(b, true).unwrap();
+        let normals = scene.normals(b).unwrap().unwrap().to_vec();
+        scene.take_changes();
+        scene.join(a, b, &options).unwrap();
+        let gone = scene.take_changes();
+        assert!(gone.iter().any(|c| c.id == b && c.removed));
+        assert!(scene.undo().unwrap());
+        let back = scene.take_changes();
+        assert!(back.iter().any(|c| c.id == b && c.added));
+        assert_eq!(scene.normals(b).unwrap().unwrap(), normals);
     }
 
     fn join_options(mesh_a: &Mesh, mesh_b: &Mesh) -> crate::JoinOptions {

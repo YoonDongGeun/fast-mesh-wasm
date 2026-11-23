@@ -1802,9 +1802,9 @@ class Engine {
   }
 
   /**
-   * After a request that may park or restore meshes (an undoable removal, an
-   * undo, a redo, a cancelled step): brings the engine's books in line with
-   * where the scene has each mesh.
+   * After a request that may park or restore meshes (an undoable removal, a
+   * join, an undo, a redo, a cancelled step): brings the engine's books in
+   * line with where the scene has each mesh.
    */
   #syncPresence(): void {
     const left: ClientId[] = [];
@@ -1906,13 +1906,8 @@ class Engine {
         const target = this.#mesh(req.target);
         const source = this.#mesh(req.source);
         const value = s.join(target, source, req.payload as JoinOptions);
-        this.#meshes.delete(req.source);
-        // `#meshIds` keeps the handle until its removal record is sent.
-        this.#removed.push(source);
-        if (this.#drag?.id === req.source) {
-          this.#drag = undefined;
-        }
-        this.#dropMeshRefs(req.source);
+        // The source is parked: the result says so.
+        this.#syncPresence();
         if (req.qid !== undefined) {
           b.replies.push({ qid: req.qid, ok: true, value });
         }

@@ -470,7 +470,8 @@ export class SceneStore {
    * brings the mesh back into the snapshot with the same handle and display,
    * puts it back into the sections that cut it, and colours again the meshes
    * that were coloured by distance to it (unless their colouring was changed
-   * since). It does not rejoin its contact groups.
+   * since). It does not rejoin its contact groups: set them again with
+   * {@link setContactGroup}.
    */
   removeMesh(mesh: MeshHandle, options?: RemoveMeshOptions): void {
     this.#alive();

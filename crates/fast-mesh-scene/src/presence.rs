@@ -13,7 +13,7 @@
 //! collision rules, reports); a step that fails flips the slots back and never
 //! gets there.
 
-use crate::contacts::ElasticRestState;
+use crate::contacts::{CollisionRule, ElasticRestState, ordered_pair};
 use crate::fields::ParkedFields;
 use crate::history::{Change, Done};
 use crate::report::Report;
@@ -26,6 +26,9 @@ pub(crate) struct ParkedLinks {
     fields: ParkedFields,
     /// Its elastic rest state, if it had one.
     rest: Option<ElasticRestState>,
+    /// The collision rules of its pairs, by the other mesh. Of two parked
+    /// meshes, one keeps their rule.
+    rules: Vec<(MeshId, CollisionRule)>,
 }
 
 impl ParkedLinks {
@@ -36,6 +39,7 @@ impl ParkedLinks {
                 .rest
                 .as_ref()
                 .map_or(0, |r| r.rest_positions.capacity() * 12)
+            + self.rules.capacity() * size_of::<(MeshId, CollisionRule)>()
     }
 }
 
@@ -47,8 +51,9 @@ impl Scene {
     /// of a mesh removed with [`Scene::remove_mesh`].
     ///
     /// The mesh is parked, not copied: its store mesh (every channel and its
-    /// UVs), BVH, placement, mode, normals, colouring, the fields on it and
-    /// its elastic rest state stay as they are and come back with it. A
+    /// UVs), BVH, placement, mode, normals, colouring, the fields on it, its
+    /// elastic rest state and its collision pair rules stay as they are and
+    /// come back with it (a rule once both its meshes are back). A
     /// distance field on it is recomputed in full on its next update, since
     /// its targets may have changed meanwhile; a target removed for good by
     /// then leaves the field, and a field left without targets goes, with
@@ -59,8 +64,7 @@ impl Scene {
     /// [`Scene::remove_mesh`] and are not restored: the fields on other
     /// meshes measured to it alone are removed (with colourings by them),
     /// those measured to it and others lose it as a target (recomputed in
-    /// full, at once when Eager), it leaves the sections that cut it, and its
-    /// collision pair rules go.
+    /// full, at once when Eager), and it leaves the sections that cut it.
     ///
     /// The removal shows up in every subscriber's next
     /// [`Scene::take_changes_for`], unless the mesh was added since that
@@ -163,6 +167,7 @@ impl Scene {
             let links = ParkedLinks {
                 fields: self.park_fields_of(id),
                 rest: self.collision.rest_positions.remove(&id),
+                rules: self.collision.take_rules_of(id),
             };
             if let Some(entry) = self.entries.get_parked_mut(id) {
                 entry.parked = Some(links);
@@ -197,9 +202,27 @@ impl Scene {
                     None => Report::added(),
                 };
             }
-            if let Some(ParkedLinks { fields, rest }) = links {
+            if let Some(ParkedLinks {
+                fields,
+                rest,
+                rules,
+            }) = links
+            {
                 if let Some(rest) = rest {
                     self.collision.rest_positions.insert(id, rest);
+                }
+                for (other, rule) in rules {
+                    if self.entries.get(other).is_some() {
+                        let pair = ordered_pair(id, other);
+                        self.collision.pair_rules.insert(pair, rule);
+                    } else if let Some(links) = self
+                        .entries
+                        .get_parked_mut(other)
+                        .and_then(|e| e.parked.as_mut())
+                    {
+                        // The other mesh is out too: it brings the rule back.
+                        links.rules.push((id, rule));
+                    }
                 }
                 self.unpark_fields(id, fields);
             }

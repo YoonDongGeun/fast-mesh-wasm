@@ -991,8 +991,8 @@ export type WrapRunResult = { item: Item } & Omit<WrapResult, "mesh">;
 /**
  * Adds the closed envelope of `sources` (their world shapes) as a new mesh
  * named `name`, lists it and selects it. The sources stay as they are. The
- * engine fills the new mesh as one undo step (undo empties it), on the Worker
- * when the scene runs there, so the page stays live meanwhile.
+ * engine adds the mesh as one undo step (undo removes it), on the Worker when
+ * the scene runs there, so the page stays live meanwhile.
  */
 export async function runWrap(params: {
   store: SceneStore;

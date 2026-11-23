@@ -73,9 +73,9 @@ impl Scene {
     /// are world lengths. The new mesh's origin is the centre of the meshes'
     /// bounds.
     ///
-    /// The new mesh is added empty and the wrap lands in it as one edit, so
-    /// the wrap is one undo step: undo empties the new mesh and redo fills
-    /// it again. The mesh itself stays.
+    /// The new mesh is added as one undo step (an undoable add, see
+    /// [`MeshOptions::undoable`]): undo removes it again and redo brings it
+    /// back under the same id.
     ///
     /// # Errors
     /// [`SceneError::UnknownMesh`] for a stale id;
@@ -106,19 +106,20 @@ impl Scene {
         }
         let (out, report) = wrap::wrap(&soup, options)?;
         drop(soup);
-        let empty = Mesh::from_buffers_f64_with_origin(&[], &[], c)?;
+        let mut mesh = Mesh::from_buffers_f64_with_origin(&[], &[], c)?;
+        let mut tx = mesh.begin_edit();
+        append_mesh(&mut tx, &out)?;
+        // A patch that only adds slots reserves none: dropping it is free.
+        drop(tx.commit()?);
+        drop(out);
         let added = self.add_mesh(
-            empty,
+            mesh,
             MeshOptions {
                 placement: frame.shared.unwrap_or(Placement::IDENTITY),
+                undoable: true,
                 ..MeshOptions::default()
             },
         )?;
-        if let Err(e) = self.edit(added, |tx| append_mesh(tx, &out)) {
-            // Added and removed before any report: the scene is unchanged.
-            self.remove_mesh(added)?;
-            return Err(e);
-        }
         Ok(SceneWrapReport {
             added,
             plan: report.plan,
@@ -283,11 +284,15 @@ mod tests {
         assert!((volume - 3.0).abs() < 0.06, "{volume}");
         assert!(scene.take_changes().iter().any(|c| c.id == r.added));
 
+        // Undo removes the wrap mesh (#271); redo brings it back as it was.
         assert!(scene.undo().unwrap());
-        assert_eq!(scene.mesh(r.added).unwrap().triangle_count(), 0);
+        assert_eq!(scene.mesh(r.added).err(), Some(SceneError::UnknownMesh));
+        assert!(scene.is_restorable(r.added));
         assert!(!scene.can_undo(), "the wrap is one step");
         assert!(scene.redo().unwrap());
         assert_eq!(scene.mesh(r.added).unwrap().triangle_count(), r.triangles);
+        assert_eq!(world(&scene, r.added), (lo, hi, volume));
+        assert_clean(&mut scene, r.added);
         assert_eq!(scene.mesh(a).unwrap().triangle_count(), before);
     }
 

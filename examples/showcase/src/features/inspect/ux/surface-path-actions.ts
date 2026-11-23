@@ -8,10 +8,9 @@
 // cleared is dropped.
 //
 // Trim deletes one side of the loop (`boolean.trimByCurve`) as one undo
-// step. Split keeps both sides: inside one history step it fills a new mesh
-// (added empty first: adding a mesh is not an undo step) with a copy of the
-// part the loop is on, then trims the mesh to the outside and the copy to
-// the inside. Undo puts the mesh back whole and empties the copy.
+// step. Split keeps both sides: inside one history step it adds a copy of the
+// part the loop is on as a new mesh, then trims the mesh to the outside and
+// the copy to the inside. Undo puts the mesh back whole and removes the copy.
 //
 // A cut is about the part the loop is on. The engine's trim looks at every
 // part of a mesh (the side it calls inside may be another part altogether),
@@ -26,7 +25,6 @@
 import type { MeshHandle, RayHit, SceneLike, TrimReport, Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
-import { remapCorners } from "../../mesh-edit/ux/batch-boolean";
 import { worldFromMatrix } from "./inspect-tools";
 import {
   addSource,
@@ -504,10 +502,10 @@ function boxCentre(world: ArrayLike<number>): Vec3 {
 /**
  * Splits `item` along the closed `path` into two meshes, one undo step:
  * `item` keeps the outside (and every part the loop is not on), a new mesh
- * named `<name> inside` (listed once the split lands) holds the inside. Undo makes `item` whole again and
- * empties the new mesh, which stays listed (adding a mesh is not an undo
- * step). A loop that cuts nothing away changes nothing: the new mesh is
- * removed again and it throws {@link NO_CUT_MESSAGE}.
+ * named `<name> inside` (listed once the split lands) holds the inside. Undo
+ * makes `item` whole again and removes the new mesh. A loop that cuts nothing
+ * away changes nothing: the step is cancelled, the new mesh with it, and it
+ * throws {@link NO_CUT_MESSAGE}.
  */
 export async function splitAlongPath(
   store: SceneStore,
@@ -523,27 +521,22 @@ export async function splitAlongPath(
     throw new Error("The mesh has no triangles to split.");
   }
   const part = compactPart(scene.views(item.mesh).positions(), others.own, scene.matrix4(item.mesh));
-  const copy = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: boxCentre(part.positions) });
+  let copy: MeshHandle;
   let outer: SurfaceStats;
   let inner: SurfaceStats;
   store.beginStep();
   try {
-    // An edit takes world positions; the copy's triangles follow the ids its new vertices got.
-    const added = await store.edit(copy, [{ op: "addVertices", positions: part.positions }]);
-    const ids = added.added[0];
-    if (ids === undefined || ids.length !== part.positions.length / 3) {
-      throw new Error("The edit did not report the added vertices.");
-    }
-    await store.edit(copy, [{ op: "addTriangles", triangles: remapCorners(part.indices, ids) }]);
+    copy = store.addMesh(part.positions, part.indices, { origin: boxCentre(part.positions), undoable: true });
     await liftOff(store, item.mesh, others);
     // Each side against itself: the copy is in world units, the mesh in its own.
     const before = statsOf(scene, item.mesh);
-    const copyBefore = statsOf(scene, copy);
     await trim(item.mesh, curve, { closed: true, deleteInside: true });
     outer = statsOf(scene, item.mesh);
     if (!surfaceCut(before, outer)) {
       throw new Error(NO_CUT_MESSAGE);
     }
+    // Landed by now, on a Worker scene too: the trim was asked for after its add.
+    const copyBefore = statsOf(scene, copy);
     await trim(copy, curve, { closed: true, deleteInside: false });
     inner = statsOf(scene, copy);
     if (!surfaceCut(copyBefore, inner)) {
@@ -552,8 +545,8 @@ export async function splitAlongPath(
     await putBack(store, item.mesh, others);
     store.endStep();
   } catch (err) {
+    // Takes the copy out again.
     store.cancelStep();
-    store.removeMesh(copy);
     throw err;
   }
   const inside = app.adoptSceneMesh(store, copy, `${item.name} inside`);

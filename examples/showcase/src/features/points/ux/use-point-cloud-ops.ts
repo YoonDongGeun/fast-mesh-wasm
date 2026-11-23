@@ -2,7 +2,7 @@
 // active mesh or a synthetic sphere; filter it (statistical and radius
 // outlier removal, voxel downsampling); estimate normals; reconstruct
 // a surface mesh that joins the scene; and add the cloud's convex hull as a
-// new mesh (one undo step). Every result replaces the cloud in the app's
+// new mesh (one undo step each). Every result replaces the cloud in the app's
 // metrology state with a one-line report.
 import type { MeshHandle, PackedPointCloud, SurfaceReconstructMethod } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
@@ -11,6 +11,7 @@ import type { AppState, Item } from "../../../app/state/app-state";
 import { ensureWave6Wasm } from "../../../engine/wave6-wasm-lazy";
 import { runConvexHull } from "../../../engine/workbench-ops";
 import { describeHull } from "../../mesh-edit/ux/use-convex-hull";
+import { selectMesh } from "../../select/ux/selection";
 import { createSyntheticSphereCloud, parsePointCloudFileContent, sampleMeshToPointCloud } from "./point-cloud";
 
 export type ReconstructUiMethod = "poisson" | "bpa";
@@ -202,7 +203,7 @@ export function usePointCloudOps(
       );
       const label = reconstructName.trim() || `Reconstructed (${reconstructMethod})`;
       const item = app.adoptSceneMesh(store, handle, label);
-      store.select(item.mesh);
+      selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
       store.commitFrame();
       commitCloud(
         workingCloud,

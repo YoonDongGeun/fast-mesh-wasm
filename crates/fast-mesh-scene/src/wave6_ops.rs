@@ -678,6 +678,10 @@ impl Scene {
     }
 
     /// Extracts `selected_tris` from `id` as a compact new scene mesh preserving exact world coordinates.
+    ///
+    /// The new mesh is added as one undo step (an undoable add, see
+    /// [`MeshOptions::undoable`]): undo removes it again and redo brings it
+    /// back under the same id.
     pub fn extract_selected_faces(&mut self, id: MeshId, selected_tris: &[u32]) -> Result<MeshId> {
         self.drop_field_unit();
         let (extracted, placement, mode) = {
@@ -686,29 +690,25 @@ impl Scene {
             let ext = extract_selected_faces(&entry.mesh, &sel)?;
             (ext, entry.placement, entry.mode)
         };
-        self.begin_step();
-        let res = self.add_mesh(
+        self.add_mesh(
             extracted,
             MeshOptions {
                 placement,
                 mode,
+                undoable: true,
                 ..MeshOptions::default()
             },
-        );
-        match res {
-            Ok(new_id) => {
-                self.end_step()?;
-                Ok(new_id)
-            }
-            Err(err) => {
-                let _ = self.cancel_step();
-                Err(err)
-            }
-        }
+        )
     }
 
-    /// Splits `selected_tris` out of `id` into a new mesh at the exact matching world pose,
-    /// recording `id`'s edit in one undoable step.
+    /// Splits `selected_tris` out of `id` into a new mesh at the exact matching world pose, in
+    /// one undo step: undo makes `id` whole again and removes the new mesh, redo splits again and
+    /// brings it back under the same id.
+    ///
+    /// # Errors
+    /// As for an edit. A failed split changes nothing, the caller's open step included; if adding
+    /// the new mesh fails (out of memory), the edit of `id` stays recorded and the new mesh is
+    /// missing.
     pub fn split_selected_faces(
         &mut self,
         id: MeshId,
@@ -720,32 +720,25 @@ impl Scene {
             let sel = FaceSelection::from_triangles(&entry.mesh, selected_tris)?;
             (sel, entry.placement, entry.mode)
         };
+        // The edit and the add are one step, or part of the caller's open
+        // one: from here to `end_step` nothing returns early.
         self.begin_step();
-        let edit_res = self.edit(id, |tx| split_selected_faces(tx, &sel));
-        let (detached, report) = match edit_res {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = self.cancel_step();
-                return Err(err);
-            }
-        };
-        let add_res = self.add_mesh(
-            detached,
-            MeshOptions {
-                placement,
-                mode,
-                ..MeshOptions::default()
-            },
-        );
-        let new_id = match add_res {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = self.cancel_step();
-                return Err(err);
-            }
-        };
+        let split =
+            self.edit(id, |tx| split_selected_faces(tx, &sel))
+                .and_then(|(detached, report)| {
+                    let added = self.add_mesh(
+                        detached,
+                        MeshOptions {
+                            placement,
+                            mode,
+                            undoable: true,
+                            ..MeshOptions::default()
+                        },
+                    )?;
+                    Ok((added, report))
+                });
         self.end_step()?;
-        Ok((new_id, report))
+        split
     }
 
     // -----------------------------------------------------------------------
@@ -897,13 +890,23 @@ impl Scene {
     }
 
     /// Reconstructs a surface mesh from `cloud` and adds it to the scene at identity placement.
+    ///
+    /// The new mesh is added as one undo step (an undoable add, see
+    /// [`MeshOptions::undoable`]): undo removes it again and redo brings it
+    /// back under the same id.
     pub fn reconstruct_point_cloud(
         &mut self,
         cloud: &PointCloud,
         options: &SurfaceReconstructOptions,
     ) -> Result<MeshId> {
         let mesh = reconstruct_surface(cloud, options)?;
-        self.add_mesh(mesh, MeshOptions::default())
+        self.add_mesh(
+            mesh,
+            MeshOptions {
+                undoable: true,
+                ..MeshOptions::default()
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -916,7 +919,13 @@ impl Scene {
     }
 
     /// Punches a cylindrical/tapered drain hole specified in world space into `id`, optionally
-    /// adding generated plug meshes positioned inside the hole in world space.
+    /// adding generated plug meshes positioned inside the hole in world space, in one undo step:
+    /// undo fills the hole again and removes the plugs, redo brings both back (the plugs under
+    /// the same ids).
+    ///
+    /// # Errors
+    /// As for an edit. A failed punch changes nothing, the caller's open step included; if adding
+    /// a plug fails (out of memory), the hole and the plugs before it stay recorded.
     pub fn punch_drain_hole_world(
         &mut self,
         id: MeshId,
@@ -934,8 +943,9 @@ impl Scene {
             )
         };
 
-        self.begin_step();
-        let outcome = if let Some(s) = uniform_scale {
+        // Punched in local space, or with no one scale, in the world (`baked`).
+        let (mut spec, mut opts, mut baked) = (*world_spec, *options, None);
+        if let Some(s) = uniform_scale {
             let local_pt = vec3_to_f32(
                 world_to_local(&placement, origin, world_spec.surface_point.map(f64::from)),
                 "drain hole point in local space overflows f32",
@@ -944,7 +954,7 @@ impl Scene {
                 placement.normal_to_local(world_spec.surface_normal.map(f64::from)),
                 "drain hole normal in local space overflows f32",
             )?;
-            let local_spec = DrainHoleSpec {
+            spec = DrainHoleSpec {
                 surface_point: local_pt,
                 surface_normal: local_n,
                 diameter: (f64::from(world_spec.diameter) / s) as f32,
@@ -953,67 +963,55 @@ impl Scene {
                 taper_angle_deg: world_spec.taper_angle_deg,
                 segments: world_spec.segments,
             };
-            let local_opts = DrainHoleOptions {
-                plug_clearance: (f64::from(options.plug_clearance) / s) as f32,
-                ..*options
-            };
-            let edit_res = self.edit(id, |tx| punch_drain_hole(tx, &local_spec, &local_opts));
-            let plug_placement = world_pose_for_local_origin_mesh(&placement, origin);
-            edit_res.map(|rep| (rep, plug_placement))
+            opts.plug_clearance = (f64::from(options.plug_clearance) / s) as f32;
         } else {
-            let world_run = (|| -> Result<(Mesh, DrainHoleReport)> {
-                let (mut baked, _) = baked_world_mesh(self.entry(id)?)?;
-                let mut tx = baked.begin_edit();
-                let rep = punch_drain_hole(&mut tx, world_spec, options)?;
-                tx.commit()?;
-                Ok((baked, rep))
-            })();
-            match world_run {
-                Ok((baked_res, rep)) => {
-                    match self.edit(id, |tx| {
-                        replace_tx_world_to_local(tx, &baked_res, &placement, origin)
-                    }) {
-                        Ok(()) => Ok((rep, Placement::IDENTITY)),
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => Err(e),
-            }
-        };
-
-        let (mut report, plug_placement) = match outcome {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = self.cancel_step();
-                return Err(err);
-            }
-        };
-
-        let mut plug_ids = Vec::with_capacity(report.plug_meshes.len());
-        let plugs = std::mem::take(&mut report.plug_meshes);
-        for plug in plugs {
-            match self.add_mesh(
-                plug,
-                MeshOptions {
-                    placement: plug_placement,
-                    mode,
-                    ..MeshOptions::default()
-                },
-            ) {
-                Ok(pid) => plug_ids.push(pid),
-                Err(err) => {
-                    let _ = self.cancel_step();
-                    return Err(err);
-                }
-            }
+            let (mut mesh, _) = baked_world_mesh(self.entry(id)?)?;
+            let mut tx = mesh.begin_edit();
+            let rep = punch_drain_hole(&mut tx, world_spec, options)?;
+            tx.commit()?;
+            baked = Some((mesh, rep));
         }
+        let plug_placement = match baked {
+            None => world_pose_for_local_origin_mesh(&placement, origin),
+            Some(_) => Placement::IDENTITY,
+        };
+
+        // The edit and the adds are one step, or part of the caller's open
+        // one: from here to `end_step` nothing returns early.
+        self.begin_step();
+        let punched = match baked {
+            None => self.edit(id, |tx| punch_drain_hole(tx, &spec, &opts)),
+            Some((mesh, rep)) => self
+                .edit(id, |tx| {
+                    replace_tx_world_to_local(tx, &mesh, &placement, origin)
+                })
+                .map(|()| rep),
+        }
+        .and_then(|mut report| {
+            let plugs = std::mem::take(&mut report.plug_meshes)
+                .into_iter()
+                .map(|plug| {
+                    self.add_mesh(
+                        plug,
+                        MeshOptions {
+                            placement: plug_placement,
+                            mode,
+                            undoable: true,
+                            ..MeshOptions::default()
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((report, plugs))
+        });
         self.end_step()?;
-        Ok((report, plug_ids))
+        punched
     }
 
     /// Places `stamp` relative to `target` at world `(hit_point_world, hit_normal_world)` in one
-    /// undoable step. Returns `(report, Some(new_id))` in `PlaceMode::KeepSeparate` or
-    /// `(report, None)` for CSG / shell merge modes.
+    /// undoable step. Returns `(report, Some(new_id))` in `PlaceMode::KeepSeparate` (undo removes
+    /// the new mesh, redo brings it back under the same id) or `(report, None)` for CSG / shell
+    /// merge modes.
     pub fn place_mesh_world(
         &mut self,
         target: MeshId,
@@ -1068,6 +1066,7 @@ impl Scene {
                 MeshOptions {
                     placement: Placement::IDENTITY,
                     mode: target_mode,
+                    undoable: true,
                     ..MeshOptions::default()
                 },
             )?;

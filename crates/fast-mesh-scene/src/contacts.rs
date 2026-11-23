@@ -521,6 +521,19 @@ impl CollisionState {
         self.rest_positions.remove(&id);
     }
 
+    /// Takes the pair rules of `id` out, with the other mesh of each.
+    pub(crate) fn take_rules_of(&mut self, id: MeshId) -> Vec<(MeshId, CollisionRule)> {
+        let mut taken = Vec::new();
+        self.pair_rules.retain(|&(a, b), rule| {
+            let keep = a != id && b != id;
+            if !keep {
+                taken.push((if a == id { b } else { a }, *rule));
+            }
+            keep
+        });
+        taken
+    }
+
     pub(crate) fn drop_rest_state(&mut self, id: MeshId) {
         self.rest_positions.remove(&id);
     }

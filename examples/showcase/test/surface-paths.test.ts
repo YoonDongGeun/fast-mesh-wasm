@@ -580,11 +580,11 @@ describe("trim and split", () => {
     expect(r.insideTriangles).toBe(liveTriangleCount(scene.views(r.inside.mesh).indices()));
     // The inside sits where it was cut from: world placement identity, world positions.
     expect(scene.placement(r.inside.mesh).translation).toEqual([0, 0, 0]);
-    // One undo makes the mesh whole and empties the new one.
+    // One undo makes the mesh whole and removes the new one (#271).
     store.undo();
     expect(scene.canUndo()).toBe(false);
     expect(liveTriangleCount(scene.views(item.mesh).indices())).toBe(before);
-    expect(liveTriangleCount(scene.views(r.inside.mesh).indices())).toBe(0);
+    expect(scene.has(r.inside.mesh)).toBe(false);
     store.redo();
     expect(area(scene, r.inside.mesh)).toBeCloseTo(innerArea, 9);
   });
@@ -790,7 +790,7 @@ describe.each(["local", "worker"] as const)("trim and split on a %s scene", (kin
     await settle(store);
     expect(store.getSnapshot().history.canUndo).toBe(false);
     expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 9);
-    expect(geometry(store.scene, r.inside.mesh).triangles).toBe(0);
+    expect(store.getSnapshot().meshes.has(r.inside.mesh)).toBe(false);
     store.redo();
     await settle(store);
     expect(area(store.scene, r.inside.mesh)).toBeCloseTo(inner, 9);
@@ -904,7 +904,7 @@ describe.each(["local", "worker"] as const)("a mesh with several parts on a %s s
     store.undo();
     await settle(store);
     expect(geometry(store.scene, item.mesh).triangles).toBe(before);
-    expect(geometry(store.scene, split.inside.mesh).triangles).toBe(0);
+    expect(store.getSnapshot().meshes.has(split.inside.mesh)).toBe(false);
     expect(store.getSnapshot().history.canUndo).toBe(false);
   }, 60_000);
 
@@ -994,7 +994,7 @@ describe("the demo meshes", () => {
       const split = await splitAlongPath(store, app, item, path);
       expect(area(store.scene, item.mesh) + area(store.scene, split.inside.mesh)).toBeCloseTo(whole, 2);
       store.undo();
-      store.removeMesh(split.inside.mesh);
+      expect(store.getSnapshot().meshes.has(split.inside.mesh)).toBe(false);
       expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 6);
     }
   }, 60_000);

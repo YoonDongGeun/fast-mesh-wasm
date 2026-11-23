@@ -556,3 +556,209 @@ fn hollow_drain_hole_and_place_mesh_world() {
     assert!(scene.undo().unwrap());
     assert_eq!(scene.mesh(target).unwrap().triangle_count(), pre_tris);
 }
+
+/// Undoes the one step that added `added`, checks that it is gone, and redoes
+/// it: the same mesh is back, under the same id.
+fn assert_add_undoes(scene: &mut Scene, added: MeshId) {
+    let shape = |scene: &Scene, id: MeshId| {
+        let mesh = scene.mesh(id).unwrap();
+        let tris: Vec<_> = (0..mesh.triangle_slots() as u32)
+            .filter_map(|t| mesh.triangle(t))
+            .collect();
+        let placement = scene.placement(id).unwrap();
+        (mesh.positions().to_vec(), tris, mesh.origin(), placement)
+    };
+    let before = shape(scene, added);
+    assert!(!before.1.is_empty());
+    let live: Vec<_> = scene.ids().collect();
+    scene.take_changes();
+    assert!(scene.undo().unwrap());
+    assert!(scene.mesh(added).is_err());
+    assert!(scene.is_restorable(added));
+    assert!(
+        scene
+            .take_changes()
+            .iter()
+            .any(|c| c.id == added && c.removed)
+    );
+    assert!(scene.redo().unwrap());
+    assert_eq!(shape(scene, added), before);
+    assert_eq!(scene.ids().collect::<Vec<_>>(), live);
+    assert!(
+        scene
+            .take_changes()
+            .iter()
+            .any(|c| c.id == added && c.added)
+    );
+}
+
+#[test]
+fn ops_that_add_a_mesh_undo_to_nothing_and_redo_it() {
+    let mut scene = Scene::new(SceneOptions::default());
+    let id = scene
+        .add_mesh(
+            build_box_mesh([9.0, 1.0, -1.0], [11.0, 3.0, 1.0], [10.0, 2.0, 0.0]),
+            MeshOptions {
+                placement: Placement {
+                    rotation: rot_z(FRAC_PI_2),
+                    scale: [2.0, 2.0, 2.0],
+                    translation: [5.0, -3.0, 1.5],
+                },
+                mode: UpdateMode::Lazy,
+                ..MeshOptions::default()
+            },
+        )
+        .unwrap();
+    scene.clear_history().unwrap();
+
+    let extracted = scene.extract_selected_faces(id, &[0, 1]).unwrap();
+    assert_add_undoes(&mut scene, extracted);
+    assert_eq!(scene.mesh(id).unwrap().triangle_count(), 12);
+
+    let (detached, report) = scene.split_selected_faces(id, &[0, 1]).unwrap();
+    assert_eq!(report.removed_triangles, 2);
+    assert_add_undoes(&mut scene, detached);
+    assert_eq!(scene.mesh(id).unwrap().triangle_count(), 10);
+    assert!(scene.undo().unwrap());
+    assert_eq!(scene.mesh(id).unwrap().triangle_count(), 12);
+    assert!(scene.mesh(detached).is_err());
+    assert!(scene.undo().unwrap());
+    assert!(scene.mesh(extracted).is_err());
+    assert!(!scene.can_undo(), "one step per op");
+    scene.clear_history().unwrap();
+
+    let mut cloud = PointCloud {
+        positions: Vec::new(),
+        normals: Some(Vec::new()),
+        colors: None,
+    };
+    for ilat in 1..12 {
+        let theta = PI * f64::from(ilat) / 12.0;
+        for ilon in 0..24 {
+            let phi = 2.0 * PI * f64::from(ilon) / 24.0;
+            let n = [
+                (theta.sin() * phi.cos()) as f32,
+                (theta.sin() * phi.sin()) as f32,
+                theta.cos() as f32,
+            ];
+            cloud.positions.push(n.map(|c| c * 1.5));
+            cloud.normals.as_mut().unwrap().push(n);
+        }
+    }
+    let surface = scene
+        .reconstruct_point_cloud(
+            &cloud,
+            &SurfaceReconstructOptions {
+                method: ReconstructMethod::ImplicitMlsMarchingCubes,
+                voxel_size: 0.35,
+                ..SurfaceReconstructOptions::default()
+            },
+        )
+        .unwrap();
+    assert_add_undoes(&mut scene, surface);
+    assert!(scene.undo().unwrap());
+    assert!(!scene.can_undo());
+
+    let target = scene
+        .add_mesh(
+            build_box_mesh([-4.0, -4.0, -4.0], [4.0, 4.0, 4.0], [0.0; 3]),
+            MeshOptions {
+                placement: trans([0.0, 20.0, 0.0]),
+                ..MeshOptions::default()
+            },
+        )
+        .unwrap();
+    let stamp = scene
+        .add_mesh(
+            build_box_mesh([-0.5, -0.5, 0.0], [0.5, 0.5, 1.0], [0.0; 3]),
+            MeshOptions::default(),
+        )
+        .unwrap();
+    for conform_to_surface in [false, true] {
+        let (_, placed) = scene
+            .place_mesh_world(
+                target,
+                stamp,
+                [0.0, 20.0, 4.0],
+                [0.0, 0.0, 1.0],
+                &PlaceMeshParams {
+                    up_axis: PlaceUpAxis::PosZ,
+                    mode: PlaceMode::KeepSeparate,
+                    conform_to_surface,
+                    ..PlaceMeshParams::default()
+                },
+            )
+            .unwrap();
+        assert_add_undoes(&mut scene, placed.unwrap());
+        assert!(scene.undo().unwrap());
+        assert!(!scene.can_undo());
+    }
+}
+
+#[test]
+fn a_drain_hole_and_its_plug_are_one_undo_step() {
+    let spec = DrainHoleSpec {
+        surface_point: [10.0, 0.0, 5.0],
+        surface_normal: [0.0, 0.0, 1.0],
+        diameter: 2.0,
+        depth: Some(3.0),
+        outer_chamfer: 0.2,
+        taper_angle_deg: 2.0,
+        segments: 16,
+    };
+    let options = DrainHoleOptions {
+        generate_plug: true,
+        plug_clearance: 0.05,
+        ..DrainHoleOptions::default()
+    };
+    // With one scale the hole is punched in local space, else in the world.
+    for scale in [[1.0; 3], [1.0, 1.0, 2.0]] {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene
+            .add_mesh(
+                build_box_mesh([-5.0, -5.0, -5.0], [5.0, 5.0, 5.0], [0.0; 3]),
+                MeshOptions {
+                    placement: Placement {
+                        translation: [10.0, 0.0, 5.0 - 5.0 * scale[2]],
+                        scale,
+                        ..Placement::IDENTITY
+                    },
+                    ..MeshOptions::default()
+                },
+            )
+            .unwrap();
+        let whole = scene.mesh(id).unwrap().triangle_count();
+        let (_, plugs) = scene.punch_drain_hole_world(id, &spec, &options).unwrap();
+        assert_eq!(plugs.len(), 1);
+        let punched = scene.mesh(id).unwrap().triangle_count();
+        assert!(punched > whole);
+        assert_add_undoes(&mut scene, plugs[0]);
+        assert_eq!(scene.mesh(id).unwrap().triangle_count(), punched);
+        assert!(scene.undo().unwrap());
+        assert_eq!(scene.mesh(id).unwrap().triangle_count(), whole);
+        assert!(scene.mesh(plugs[0]).is_err());
+        assert!(!scene.can_undo(), "the hole and its plug are one step");
+
+        // A failed punch leaves the caller's step open, with what it has.
+        let moved = trans([1.0, 2.0, 3.0]);
+        scene.begin_step();
+        scene.set_placement(id, moved).unwrap();
+        for bad in [
+            DrainHoleSpec {
+                diameter: -1.0,
+                ..spec
+            },
+            DrainHoleSpec {
+                surface_point: [f32::NAN; 3],
+                ..spec
+            },
+        ] {
+            assert!(scene.punch_drain_hole_world(id, &bad, &options).is_err());
+        }
+        assert!(scene.split_selected_faces(id, &[u32::MAX]).is_err());
+        assert_eq!(scene.placement(id).unwrap(), moved);
+        scene.end_step().unwrap();
+        assert!(scene.undo().unwrap());
+        assert!(!scene.can_undo());
+    }
+}

@@ -860,8 +860,11 @@ export class WorkerScene implements SceneLike {
   #crashWatch: BroadcastChannel | undefined;
   /** Default collision response rule persisted across Worker restarts. */
   #defaultCollisionRule: CollisionRule = { ...DEFAULT_COLLISION_RULE };
-  /** Explicit per-pair collision rules keyed canonically by sorted ClientId pair. */
-  readonly #collisionRules = new Map<string, { a: MeshState; b: MeshState; rule: CollisionRule }>();
+  /**
+   * Explicit per-pair collision rules keyed canonically by sorted ClientId
+   * pair; those of a parked mesh wait here for its way back.
+   */
+  readonly #collisionRules = new Map<string, { a: MeshState; b: MeshState; rule: CollisionRule; rev: number }>();
 
   /**
    * Callable async repair domain (`worker.repair(mesh, op)` and `worker.repair.<method>(...)`).
@@ -1648,6 +1651,8 @@ export class WorkerScene implements SceneLike {
     }
     for (const st of left) {
       this.#dropLinks(st);
+      // Rules requested since the result's batch found it gone.
+      this.#dropCollisionRules(st, r.rev);
     }
     // What went with them depends on the order of the steps, which only the
     // engine knows (a mesh may have left and come back).
@@ -1678,6 +1683,7 @@ export class WorkerScene implements SceneLike {
 
   /** Keeps only a tombstone of a mesh removed for good, once its removal is delivered. */
   #forgetMesh(st: MeshState): void {
+    this.#dropCollisionRules(st);
     this.#meshes.delete(st.id);
     this.#byMesh.delete(st.handle);
     this.#tombstones.add(st.handle);
@@ -2003,7 +2009,8 @@ export class WorkerScene implements SceneLike {
   /**
    * Joins `source` into `target`; see `Scene.join`. The source stays usable
    * until the join lands: only a successful result removes it (a failed join
-   * changes nothing, engine-side or here).
+   * changes nothing, engine-side or here), as part of the join's undo step.
+   * {@link WorkerScene.undo} brings it back.
    *
    * @deprecated Use `workerScene.repair.join()` instead.
    */
@@ -2014,19 +2021,11 @@ export class WorkerScene implements SceneLike {
       this.#drag.end();
     }
     const payload = copyInput(options, "options");
-    // `#ask` runs `make` synchronously, so `rev` is set before `then` runs.
-    let rev = 0;
-    const done = this.#ask(
-      (r, qid) => {
-        rev = r;
-        return { kind: "join", rev: r, target: ta.id, source: st.id, payload, qid };
-      },
+    // The result says where the source is now (`#applyPresence`).
+    return this.#ask(
+      (rev, qid) => ({ kind: "join", rev, target: ta.id, source: st.id, payload, qid }),
       (v) => v as JoinReport,
     );
-    return done.then((report) => {
-      this.#noteRemoved(st, rev);
-      return report;
-    });
   }
 
   /**
@@ -2062,15 +2061,25 @@ export class WorkerScene implements SceneLike {
     }
   }
 
-  /** A removed mesh's section entries and collision rules go, as they do in the engine. */
+  /**
+   * A removed mesh's section entries go, as they do in the engine, and its
+   * collision rules, unless it is parked: they come back with it.
+   */
   #dropLinks(st: MeshState): void {
     for (const s of this.#sections.values()) {
       if (!s.removed) {
         s.meshes = s.meshes.filter((m) => m !== st);
       }
     }
+    if (!st.parked) {
+      this.#dropCollisionRules(st);
+    }
+  }
+
+  /** Drops the collision rules of a mesh's pairs: those requested after `rev` only, if given. */
+  #dropCollisionRules(st: MeshState, rev = 0): void {
     for (const [key, entry] of [...this.#collisionRules.entries()]) {
-      if (entry.a === st || entry.b === st) {
+      if ((entry.a === st || entry.b === st) && entry.rev > rev) {
         this.#collisionRules.delete(key);
       }
     }
@@ -3078,8 +3087,9 @@ export class WorkerScene implements SceneLike {
       throw invalid("collision rule requires two distinct meshes");
     }
     const normalized = normalizeCollisionRule(rule);
-    this.#collisionRules.set(collisionPairKey(sa.id, sb.id), { a: sa, b: sb, rule: normalized });
-    this.#push({ kind: "setCollisionRule", rev: ++this.#rev, a: sa.id, b: sb.id, rule: { ...normalized } });
+    const rev = ++this.#rev;
+    this.#collisionRules.set(collisionPairKey(sa.id, sb.id), { a: sa, b: sb, rule: normalized, rev });
+    this.#push({ kind: "setCollisionRule", rev, a: sa.id, b: sb.id, rule: { ...normalized } });
   }
 
   clearCollisionRule(a: MeshHandle, b: MeshHandle): boolean {

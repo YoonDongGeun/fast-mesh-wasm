@@ -802,7 +802,8 @@ fn failed_steps_leave_every_link_alone() {
         Some(SceneError::UnknownField)
     );
     assert!(scene.section(section, n).is_err());
-    assert_ne!(scene.collision_rule(a, n), Ok(rule));
+    // Its collision pair rules are its own too (#271).
+    assert_eq!(scene.collision_rule(a, n), Ok(rule));
     assert!(scene.mesh(a).unwrap().channel("field:n").is_none());
 
     // A failed reservation changes nothing either.
@@ -812,6 +813,111 @@ fn failed_steps_leave_every_link_alone() {
     fault::fail_reserve_on(1);
     assert!(scene.add_mesh(grid(1), undoable()).is_err());
     assert_eq!(scene.ids().count(), 3);
+}
+
+#[test]
+fn collision_rules_come_back_once_both_meshes_have() {
+    let rule = |contact_margin| CollisionRule {
+        mode: CollisionMode::Rigid,
+        contact_margin,
+        ..CollisionRule::default()
+    };
+    // The first two leave in either order, in one step or one by one, and
+    // come back in the opposite one.
+    for (first, second) in [(0, 1), (1, 0)] {
+        for together in [false, true] {
+            let mut scene = Scene::new(SceneOptions::default());
+            let ids: Vec<_> = (0..3)
+                .map(|_| scene.add_mesh(grid(2), MeshOptions::default()).unwrap())
+                .collect();
+            let (a, b, c) = (ids[0], ids[1], ids[2]);
+            let rules = [((a, b), 0.25), ((b, c), 0.5), ((c, a), 0.75)];
+            for ((x, y), margin) in rules {
+                scene.set_collision_rule(x, y, rule(margin)).unwrap();
+            }
+            let check = |scene: &Scene| {
+                for ((x, y), margin) in rules {
+                    if scene.mesh(x).is_ok() && scene.mesh(y).is_ok() {
+                        assert_eq!(scene.collision_rule(x, y), Ok(rule(margin)));
+                    }
+                }
+                let live = rules
+                    .iter()
+                    .filter(|((x, y), _)| scene.mesh(*x).is_ok() && scene.mesh(*y).is_ok());
+                assert_eq!(scene.collision.pair_rules.len(), live.count());
+            };
+            if together {
+                scene.begin_step();
+            }
+            for k in [first, second] {
+                scene.remove_mesh_undoable(ids[k]).unwrap();
+                check(&scene);
+                assert!(scene.collision_rule(ids[k], c).is_err());
+            }
+            if together {
+                scene.end_step().unwrap();
+            }
+            assert!(scene.collision.pair_rules.is_empty());
+            assert!(!scene.has_active_collision_response(c));
+            for _ in 0..2 {
+                while scene.can_undo() {
+                    scene.undo().unwrap();
+                    check(&scene);
+                }
+                assert_eq!(scene.collision.pair_rules.len(), 3);
+                while scene.can_redo() {
+                    scene.redo().unwrap();
+                    check(&scene);
+                }
+                assert!(scene.collision.pair_rules.is_empty());
+            }
+        }
+    }
+
+    // Out by the undo of an add, and back by its redo.
+    let mut scene = Scene::new(SceneOptions::default());
+    let a = scene.add_mesh(grid(2), undoable()).unwrap();
+    let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+    scene.set_collision_rule(a, b, rule(0.25)).unwrap();
+    scene.remove_mesh_undoable(b).unwrap();
+    assert!(scene.undo().unwrap());
+    assert_eq!(scene.collision_rule(a, b), Ok(rule(0.25)));
+    assert!(scene.undo().unwrap());
+    assert!(scene.mesh(a).is_err() && scene.mesh(b).is_ok());
+    assert!(scene.collision.pair_rules.is_empty());
+    assert!(scene.redo().unwrap());
+    assert_eq!(scene.collision_rule(a, b), Ok(rule(0.25)));
+
+    // Its rules with a mesh that is gone for good go.
+    scene.clear_history().unwrap();
+    scene.remove_mesh_undoable(a).unwrap();
+    scene.remove_mesh(b).unwrap();
+    assert!(scene.undo().unwrap());
+    assert!(scene.mesh(a).is_ok());
+    assert!(scene.collision.pair_rules.is_empty());
+}
+
+#[test]
+fn a_rule_between_meshes_that_return_one_by_one_waits_for_both() {
+    let rule = CollisionRule {
+        mode: CollisionMode::Rigid,
+        ..CollisionRule::default()
+    };
+    let mut scene = Scene::new(SceneOptions::default());
+    let a = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+    let b = scene.add_mesh(grid(2), MeshOptions::default()).unwrap();
+    scene.set_collision_rule(a, b, rule).unwrap();
+    scene.remove_mesh_undoable(a).unwrap();
+    scene.remove_mesh_undoable(b).unwrap();
+    // The rule left with `a`, which the history holds behind `b`: `b` is back
+    // first, then `a`. Flip them by hand for the opposite order.
+    scene.entries.unpark(a);
+    scene.settle_presence(&[crate::history::Done::Presence(a)]);
+    assert!(scene.mesh(a).is_ok() && scene.mesh(b).is_err());
+    assert!(scene.collision.pair_rules.is_empty());
+    scene.entries.unpark(b);
+    scene.settle_presence(&[crate::history::Done::Presence(b)]);
+    assert_eq!(scene.collision_rule(a, b), Ok(rule));
 }
 
 #[test]

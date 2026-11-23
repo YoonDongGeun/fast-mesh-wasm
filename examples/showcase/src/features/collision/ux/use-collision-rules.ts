@@ -144,12 +144,15 @@ export function useCollisionRules(
   }
 
   const liveMeshes = useMemo(() => new Set(items.map((item) => item.mesh)), [items]);
+  const lastLiveRef = useRef(liveMeshes);
   useEffect(() => {
+    // An override waits for a mesh that undo or redo can bring back.
+    const kept = (mesh: MeshHandle) => liveMeshes.has(mesh) || store.isRestorable?.(mesh) === true;
     setPairOverrides((prev) => {
       let changed = false;
       const next: Record<string, PairOverrideEntry> = {};
       for (const [key, entry] of Object.entries(prev)) {
-        if (liveMeshes.has(entry.a) && liveMeshes.has(entry.b)) {
+        if (kept(entry.a) && kept(entry.b)) {
           next[key] = entry;
         } else {
           changed = true;
@@ -157,6 +160,14 @@ export function useCollisionRules(
       }
       return changed ? next : prev;
     });
+    // One that is back has the rule it had: it may have changed since.
+    const before = lastLiveRef.current;
+    lastLiveRef.current = liveMeshes;
+    for (const { a, b, mode } of Object.values(pairOverrides)) {
+      if (liveMeshes.has(a) && liveMeshes.has(b) && !(before.has(a) && before.has(b))) {
+        store.scene.setCollisionRule?.(a, b, buildCollisionRule(collision, { mode, stiffness, contactMargin }));
+      }
+    }
   }, [liveMeshes]);
 
   function syncSceneRules(
@@ -176,6 +187,9 @@ export function useCollisionRules(
     lastSyncedSigRef.current = sig;
     store.scene.setDefaultCollisionRule?.(rule);
     for (const entry of Object.values(overrides)) {
+      if (!liveMeshes.has(entry.a) || !liveMeshes.has(entry.b)) {
+        continue;
+      }
       store.scene.setCollisionRule?.(
         entry.a,
         entry.b,

@@ -23,8 +23,8 @@
 //!   [`SceneError`], so repair operations from [`ops`] (the re-exported
 //!   `fast-mesh-ops`) run directly:
 //!   `scene.edit(id, |tx| ops::fill_holes(tx, &options))`.
-//! - Joining: [`Scene::join`] appends one mesh's geometry into another and
-//!   bridges a loop on each, as one undo step, then removes the source mesh.
+//! - Joining: [`Scene::join`] appends one mesh's geometry into another,
+//!   bridges a loop on each and removes the source mesh, as one undo step.
 //! - Cutting: [`Scene::cut_by_plane`] splits a mesh with a world plane,
 //!   capping both openings flat by default, and adds the removed side as a
 //!   new mesh with the same placement, as one undo step.
@@ -42,8 +42,8 @@
 //!   without moving a vertex; on a whole mesh or a face region, each one undo
 //!   step.
 //! - Wraps: [`Scene::wrap`] adds a closed, manifold envelope around meshes,
-//!   gaps and holes below a size closed, as a new mesh filled as one undo
-//!   step; [`Scene::wrap_plan`] reports its voxel grid first.
+//!   gaps and holes below a size closed, as a new mesh, as one undo step;
+//!   [`Scene::wrap_plan`] reports its voxel grid first.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.

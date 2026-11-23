@@ -1148,7 +1148,8 @@ impl WasmScene {
     }
 
     /// Joins mesh B into mesh A: copies B's geometry into A, bridges the two
-    /// loops and removes B; see [`Scene::join`]. `loops` holds the two loop
+    /// loops and removes B, as one undo step (undo restores A and brings B
+    /// back); see [`Scene::join`]. `loops` holds the two loop
     /// ids (`min_vertex, len, hash low, hash high` each, A's first) and
     /// `max_edges` is NaN for the default. Returns `[vertices_added,
     /// triangles_added, bridge_triangles_added]`.
@@ -1172,8 +1173,9 @@ impl WasmScene {
             loop_b: loop_id(pair[1]),
             max_edges: count_opt(max_edges, "maxEdges")?,
         };
+        // B's render state goes with its removal record, as for
+        // `remove_mesh_undoable`.
         let r = self.scene.join(a, b, &options)?;
-        self.render.remove(&b);
         Ok(vec![
             r.vertices_added as f64,
             r.triangles_added as f64,
@@ -2718,6 +2720,8 @@ impl WasmScene {
         Ok(crate::wave6::encode_face_edit_report(&report))
     }
 
+    /// Copies `selected_tris` into a new mesh, one undo step (undo removes
+    /// it). Returns `[index, generation]`.
     pub fn extract_selected_faces(
         &mut self,
         index: u32,
@@ -2730,6 +2734,9 @@ impl WasmScene {
         self.added(new_id, normals)
     }
 
+    /// Moves `selected_tris` into a new mesh, one undo step (undo restores the
+    /// mesh and removes the new one). Returns `[index, generation,
+    /// removedTriangles, removedVertices]`.
     pub fn split_selected_faces(
         &mut self,
         index: u32,
@@ -3124,6 +3131,8 @@ impl WasmScene {
         crate::wave6::encode_contour_slices(&slices)
     }
 
+    /// Reconstructs a surface from a packed cloud as a new mesh, one undo step
+    /// (undo removes it). Returns `[index, generation]`.
     pub fn reconstruct_point_cloud(
         &mut self,
         packed_cloud: &[f32],
@@ -3173,6 +3182,9 @@ impl WasmScene {
         Ok(crate::wave6::encode_hollow_report(&rep))
     }
 
+    /// Punches a drain hole, adding its plug as a new mesh when asked to; the
+    /// hole and the plug are one undo step (undo fills the hole and removes
+    /// the plug).
     #[allow(clippy::too_many_arguments)]
     pub fn punch_drain_hole(
         &mut self,
@@ -3214,6 +3226,8 @@ impl WasmScene {
         crate::wave6::encode_drain_report(&rep, &plug_ids)
     }
 
+    /// Places a stamp on the target, one undo step: kept separate, it is added
+    /// as a new mesh, which undo removes.
     #[allow(clippy::too_many_arguments)]
     pub fn place_mesh(
         &mut self,
@@ -4849,8 +4863,28 @@ mod tests {
         );
         assert_eq!(s.triangle_count(ai, ag).unwrap(), 2 + 2 + 8);
         assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
+        // The join is one step: undo brings B back, reported like an add (#271).
+        assert!(s.is_restorable(bi, bg));
+        s.take_changes();
         assert!(s.undo().unwrap());
+        assert!(!s.can_undo());
         assert_eq!(s.triangle_count(ai, ag).unwrap(), 2);
+        assert_eq!(s.triangle_count(bi, bg).unwrap(), 2);
+        let added = FLAG_ADDED | FLAG_POSITIONS_ALL | FLAG_INDICES_ALL;
+        let back = s.take_changes();
+        assert_eq!(back[0], 2);
+        let b_at = (1..back.len())
+            .find(|&k| back[k..k + 2] == [bi, bg])
+            .unwrap();
+        assert_eq!(back[b_at + 2] & added, added);
+        // Redo takes it out again, and says that undo can bring it back.
+        assert!(s.redo().unwrap());
+        assert_eq!(code(s.triangle_count(bi, bg)), codes::UNKNOWN_MESH);
+        let gone = s.take_changes();
+        let b_at = (1..gone.len())
+            .find(|&k| gone[k..k + 2] == [bi, bg])
+            .unwrap();
+        assert_eq!(gone[b_at + 2], FLAG_REMOVED | FLAG_RESTORABLE);
     }
 
     #[test]

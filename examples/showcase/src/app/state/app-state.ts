@@ -793,16 +793,6 @@ export class AppState {
   }
 
   /**
-   * Drops a mesh the engine already removed (a join's source): the same list
-   * cleanup as {@link removeMesh}, without the store call (which would report
-   * the missing mesh as an error).
-   */
-  dropItem(store: SceneStore, item: Item): void {
-    item.material.dispose();
-    this.#dropLists(item, this.#detach(store, item));
-  }
-
-  /**
    * Unpicks a removed mesh from the collision pair (releasing the other
    * mesh's colouring first, in the same tick) and the contact group. The
    * store takes a removed mesh out of its groups itself.

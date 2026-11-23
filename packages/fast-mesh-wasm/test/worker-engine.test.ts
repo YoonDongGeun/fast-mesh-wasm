@@ -362,12 +362,26 @@ describe("worker engine", () => {
     ]);
     const want = ref.join(ra, rb, { loopA, loopB });
     expect(replyOf(r, 7)).toEqual({ qid: 7, ok: true, value: want });
-    expect(r.changes.find((c) => c.id === 2)!.removed).toBe(true);
+    expect(r.changes.find((c) => c.id === 2)).toMatchObject({ removed: true, restorable: true });
+    expect(r.presence).toEqual([{ id: 2, state: "parked" }]);
     const mirrors = new Map<ClientId, MeshMirror>();
     applyResult(mirrors, r0);
     applyResult(mirrors, r);
     expect(mirrors.has(2)).toBe(false);
     expectMirror(mirrors.get(1), ref, ra);
+    // Undo brings the source back (#271); a join that fails moves nothing.
+    const back = await h.send([{ kind: "undo", rev: rev() }]);
+    ref.undo();
+    expect(back.presence).toEqual([{ id: 2, state: "live" }]);
+    applyResult(mirrors, back);
+    expectMirror(mirrors.get(1), ref, ra);
+    expectMirror(mirrors.get(2), ref, rb);
+    const stale = { ...loopB, hash: loopB.hash ^ 1n };
+    const bad = await h.send([
+      { kind: "join", rev: rev(), target: 1, source: 2, payload: { loopA, loopB: stale }, qid: 8 },
+    ]);
+    expect(replyOf(bad, 8)).toMatchObject({ qid: 8, ok: false });
+    expect(bad.presence).toBeUndefined();
   });
 
   it("mixed_batch_keeps_edit_order", async () => {

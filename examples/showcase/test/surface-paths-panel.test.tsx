@@ -558,7 +558,7 @@ describe("surface path section (#252)", () => {
     });
     expect(scene.canUndo()).toBe(false);
     expect(tri(scene, item.mesh)).toBe(whole);
-    expect(tri(scene, inside.mesh)).toBe(0);
+    expect(scene.has(inside.mesh)).toBe(false);
   });
 
   it("a loop that separates nothing says so and keeps the path and the map", async () => {

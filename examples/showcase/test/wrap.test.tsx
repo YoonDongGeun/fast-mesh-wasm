@@ -135,6 +135,7 @@ function harness(): { scene: Scene; store: SceneStore; app: AppState } {
   const scene = new Scene();
   const store = createSceneStore(scene);
   const app = new AppState();
+  app.follow(store);
   cleanups.push(() => {
     store.dispose();
     scene.free();
@@ -237,15 +238,22 @@ describe("wrap section", () => {
     await rest();
     expect($("[data-wrap-sources]")?.textContent).toContain("Wrap of 2 meshes");
 
-    // One undo step empties the wrap; the sources stay; redo fills it again.
+    // One undo step removes the wrap and its row (#271); the sources stay;
+    // redo brings it back, selected.
     store.undo();
     store.commitFrame();
-    expect(live(scene, wrap.mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([a, b]);
+    expect(store.getSnapshot().selection).toBeNull();
     expect(live(scene, a.mesh)).toBe(12);
     expect(live(scene, b.mesh)).toBe(12);
+    render();
+    await rest();
     store.redo();
     store.commitFrame();
     expect(live(scene, wrap.mesh)).toBe(triangles);
+    expect(app.getSnapshot().items).toEqual([a, b, wrap]);
+    expect(store.getSnapshot().selection).toBe(wrap.mesh);
+    render();
     await rest();
   });
 

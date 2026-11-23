@@ -3587,12 +3587,13 @@ export class Scene implements SceneLike {
    *
    * With `undoable` the removal is an undo step (or part of the open one)
    * and the history stays: {@link Scene.undo} brings the mesh back with the
-   * same handle, its data, placement, display (normals, colouring) and the
-   * fields on it. Nothing is copied, whatever the mesh's size. What belongs
-   * to other meshes is cut as by any removal and does not come back: fields
-   * on other meshes measured to it, its section entries and its collision
-   * rules. The kept mesh counts against the history's memory budget, and is
-   * freed once the history drops the step (see {@link Scene.isRestorable}).
+   * same handle, its data, placement, display (normals, colouring), the
+   * fields on it and its collision rules (a rule once both its meshes are
+   * back). Nothing is copied, whatever the mesh's size. What belongs to other
+   * meshes is cut as by any removal and does not come back: fields on other
+   * meshes measured to it, and its section entries. The kept mesh counts
+   * against the history's memory budget, and is freed once the history drops
+   * the step (see {@link Scene.isRestorable}).
    */
   removeMesh(mesh: MeshHandle, options: RemoveMeshOptions = {}): void {
     const { index, generation } = this.#id(mesh);
@@ -3632,9 +3633,12 @@ export class Scene implements SceneLike {
   /**
    * Joins `source` into `target`: copies the source's geometry into the
    * target (keeping its world shape), bridges `options.loopA` to the copied
-   * `options.loopB`, and removes the source. The copy and the bridge undo as
-   * one step; the removal is permanent. A drag of the source ends first,
-   * recording its moves as one step, so they survive a failed join.
+   * `options.loopB`, and removes the source. All of it is one undo step:
+   * {@link Scene.undo} restores the target and brings the source back with
+   * the same handle, as for {@link Scene.removeMesh} with `undoable` (what
+   * comes back with it, and the memory it takes, are described there). A drag
+   * of the source ends first, recording its moves as one step, so they
+   * survive a failed join.
    *
    * @deprecated Use `scene.repair.join()` instead.
    * @throws `UNKNOWN_MESH` for a removed handle; `INVALID_ARGUMENT` for one
@@ -3655,9 +3659,8 @@ export class Scene implements SceneLike {
     const r = call(() =>
       this.#scene().join(ta.index, ta.generation, sb.index, sb.generation, Uint32Array.from(loops), maxEdges),
     );
-    const key = `${sb.index}:${sb.generation}`;
-    this.#meshes.delete(key);
-    this.#removed.set(key, source);
+    // Its handle stays known, for the way back.
+    this.#prune = true;
     return { verticesAdded: r[0], trianglesAdded: r[1], bridgeTrianglesAdded: r[2] };
   }
 
@@ -3902,9 +3905,8 @@ export class Scene implements SceneLike {
    * it is built in world space at the identity placement. Lengths are world
    * units either way.
    *
-   * The new mesh is added empty and the wrap lands in it as one undo step:
-   * {@link Scene.undo} empties the new mesh (it stays in the scene) and
-   * {@link Scene.redo} fills it again.
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
    *
    * At a million triangles this takes from about half a second to many
    * seconds, by detail and threads: use `WorkerScene.wrap` to keep the page
@@ -5914,7 +5916,11 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Extracts `selectedTris` into a new standalone mesh preserving exact world coordinates. */
+  /**
+   * Extracts `selectedTris` into a new standalone mesh preserving exact world
+   * coordinates, as one undo step: {@link Scene.undo} removes the new mesh and
+   * {@link Scene.redo} brings it back with the same handle.
+   */
   extractSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): MeshHandle {
     const { index, generation } = this.#id(mesh);
     const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
@@ -5924,7 +5930,12 @@ export class Scene implements SceneLike {
     return this.#meshHandle(id[0], id[1]);
   }
 
-  /** Splits `selectedTris` off into a new detached mesh and removes them from `mesh` in one undo step. */
+  /**
+   * Splits `selectedTris` off into a new detached mesh and removes them from
+   * `mesh`, as one undo step: {@link Scene.undo} makes `mesh` whole again and
+   * removes the new mesh, which {@link Scene.redo} brings back with the same
+   * handle.
+   */
   splitSelectedFaces(mesh: MeshHandle, selectedTris: Indices, options: { normals?: boolean } = {}): SplitFacesReport {
     const { index, generation } = this.#id(mesh);
     const normals = checkBooleanArg(options.normals, this.#hasNormals(index, generation), "normals");
@@ -6192,7 +6203,11 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Reconstructs a triangle mesh from a packed point cloud and adds it to the scene. */
+  /**
+   * Reconstructs a triangle mesh from a packed point cloud and adds it to the
+   * scene, as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
+   */
   reconstructPointCloud(
     cloud: PackedPointCloud | Float32Array,
     options: SurfaceReconstructOptions = {},
@@ -6229,7 +6244,12 @@ export class Scene implements SceneLike {
     );
   }
 
-  /** Punches a tapered/chamfered drain hole in `mesh` (with optional plug generation) in one undo step. */
+  /**
+   * Punches a tapered/chamfered drain hole in `mesh` (with optional plug
+   * generation) in one undo step: {@link Scene.undo} fills the hole again and
+   * removes the plug, which {@link Scene.redo} brings back with the same
+   * handle.
+   */
   punchDrainHole(mesh: MeshHandle, options: DrainHoleOptions): DrainHoleReport {
     const { index, generation } = this.#id(mesh);
     const n = normalizeDrainHoleArgs(options);
@@ -6255,7 +6275,11 @@ export class Scene implements SceneLike {
     return decodeDrainHoleReport(raw, (i, g) => this.#meshHandle(i, g));
   }
 
-  /** Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping. */
+  /**
+   * Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping,
+   * in one undo step. Kept separate, the placed stamp is a new mesh, which {@link Scene.undo} removes
+   * and {@link Scene.redo} brings back with the same handle.
+   */
   placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
     const t = this.#id(target);
     const s = this.#id(stamp);

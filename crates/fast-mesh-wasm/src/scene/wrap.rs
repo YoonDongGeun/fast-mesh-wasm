@@ -19,7 +19,7 @@ impl WasmScene {
 
     /// Adds a closed, manifold, outward-wound envelope without
     /// self-intersections around the meshes `meshes` (flat `[index,
-    /// generation, ...]`) as a new mesh; it lands in it as one undo step.
+    /// generation, ...]`) as a new mesh, as one undo step (undo removes it).
     /// `options` is `[gap, voxelSize (0: from the detail), detail, project (0
     /// or 1), maxVoxels]`, lengths in world units. `normals` turns the new
     /// mesh's smooth vertex normals on. Returns `[index, generation, vertices,
@@ -99,6 +99,7 @@ fn parse_options(flat: &[f64]) -> Result<WrapOptions, Error> {
 mod tests {
     use super::*;
     use crate::error::codes;
+    use crate::render::{FLAG_ADDED, FLAG_REMOVED, FLAG_RESTORABLE};
 
     const CUBE: [f64; 24] = [
         0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 1., 0., 0., 0., 1., 1., 0., 1., 0., 1., 1., 1., 1.,
@@ -143,10 +144,21 @@ mod tests {
         let mut projected = options();
         projected[3] = 1.0;
         assert!(s.wrap_meshes(&both, &projected, false).unwrap()[4] > 0.0);
+        // One undo step removes each wrap (#271).
         assert!(s.undo().unwrap());
+        assert!(s.mesh(i, g).is_ok());
+        s.take_changes();
         assert!(s.undo().unwrap());
-        assert_eq!(s.mesh(i, g).unwrap().triangle_count(), 0);
+        assert!(s.mesh(i, g).is_err());
+        assert!(s.is_restorable(i, g));
+        let gone = s.take_changes();
+        assert_eq!(gone[..4], [1, i, g, FLAG_REMOVED | FLAG_RESTORABLE]);
         assert!(!s.undo().unwrap());
+        assert!(s.redo().unwrap());
+        assert_eq!(f64::from(s.triangle_slots(i, g).unwrap()), r[3]);
+        let back = s.take_changes();
+        assert_eq!(back[..3], [1, i, g]);
+        assert_ne!(back[3] & FLAG_ADDED, 0);
     }
 
     #[test]
