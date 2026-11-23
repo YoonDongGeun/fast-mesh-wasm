@@ -24,7 +24,6 @@ import {
   pointsOnALine,
   quadCorners,
   removeLastLandmark,
-  rms,
   startLandmarks,
 } from "../src/features/transform/ux/align-tools";
 import { placementMatrix, worldPoint } from "../src/features/transform/ux/placement-math";
@@ -135,11 +134,6 @@ describe("landmark pairs", () => {
     expect(landmarksProblem(build(line.slice(0, 2), line.slice(0, 2)))).toBeNull();
     expect(landmarksProblem(addLandmark(build(line, line), [0, 1, 0]))).toContain("lie on a line");
     expect(landmarksProblem(addLandmark(addLandmark(build(line, line), [0, 1, 0]), [0, 1, 0]))).toBeNull();
-  });
-
-  it("takes_the_root_mean_square", () => {
-    expect(rms([])).toBe(0);
-    expect(rms([3, 4])).toBeCloseTo(Math.sqrt(12.5), 12);
   });
 });
 

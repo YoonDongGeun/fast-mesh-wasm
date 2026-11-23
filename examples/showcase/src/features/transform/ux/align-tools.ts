@@ -167,18 +167,6 @@ export function landmarkResiduals(
   );
 }
 
-/** The root mean square of `values` (0 for none). */
-export function rms(values: readonly number[]): number {
-  if (values.length === 0) {
-    return 0;
-  }
-  let s = 0;
-  for (const v of values) {
-    s += v * v;
-  }
-  return Math.sqrt(s / values.length);
-}
-
 // ---- Coarse + ICP ----
 
 export const COARSE_METHODS: readonly (readonly [Exclude<CoarseAlignMethod, "none">, string])[] = [
