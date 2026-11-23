@@ -43,6 +43,7 @@ use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
 mod denoise;
+mod extrude;
 mod hull;
 mod wrap;
 
