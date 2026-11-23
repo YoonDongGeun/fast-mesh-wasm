@@ -260,7 +260,7 @@ export function qualityReportHtml(input: QualityReportInput, unit: LengthUnit): 
     "</head>",
     "<body>",
     `  <h1>${escapeHtml(title)}</h1>`,
-    `  <p>Lengths in ${unit} · generated ${escapeHtml(input.generated.toISOString())}</p>`,
+    `  <p>Length unit: ${unit} · generated ${escapeHtml(input.generated.toISOString())}</p>`,
     body,
     "</body>",
     "</html>",

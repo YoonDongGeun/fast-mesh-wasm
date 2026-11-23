@@ -31,7 +31,7 @@ import {
 /** How long a burst of edits must pause before the map's query runs again. */
 export const INSPECT_MAP_REFRESH_MS = 150;
 
-/** What the test hook reads: the shown map (names, not handles) and how many queries landed. */
+/** What the test hook and the quality report (#257) read: the shown map (names, not handles) and how many queries landed. */
 export const inspectMapProbe: {
   shown: {
     kind: InspectMapReport["kind"];

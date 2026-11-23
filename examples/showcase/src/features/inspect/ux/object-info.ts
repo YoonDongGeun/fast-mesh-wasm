@@ -294,7 +294,7 @@ export interface InfoScene {
   views(mesh: MeshHandle): { positions(): Float32Array; indices(): Uint32Array };
   matrix4(mesh: MeshHandle): ArrayLike<number>;
   origin(mesh: MeshHandle): readonly [number, number, number];
-  readonly inspect?: { measure(mesh: MeshHandle): unknown };
+  readonly inspect?: { measure(mesh: MeshHandle): MeasureInfo | Promise<MeasureInfo> };
 }
 
 /** The topology's view-derived numbers: counts, mean edge, boxes. Reads the views now (before any other scene call). */
@@ -334,8 +334,8 @@ export async function readMeasureInfo(scene: Pick<InfoScene, "inspect">, mesh: M
     return NO_MEASURE;
   }
   try {
-    const m = (await inspect.measure(mesh)) as { area: number; volume: number | null; volumeReason: MeshInfo["volumeReason"] };
-    return { area: m.area, volume: m.volume, volumeReason: m.volumeReason };
+    const { area, volume, volumeReason } = await inspect.measure(mesh);
+    return { area, volume, volumeReason };
   } catch {
     return NO_MEASURE;
   }

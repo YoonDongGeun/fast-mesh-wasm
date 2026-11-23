@@ -16,6 +16,7 @@ export function makeLabelSprite(color: string): LabelSprite {
   const texture = new THREE.CanvasTexture(canvas);
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false, transparent: true }));
   sprite.renderOrder = 999;
+  sprite.raycast = () => {}; // A label is never a click target, also as a child of a mesh that is.
   let shown: string | null = null;
   return {
     sprite,
@@ -43,8 +44,8 @@ export function makeLabelSprite(color: string): LabelSprite {
       sprite.position.set(at[0], at[1], at[2]);
       sprite.scale.set((height * canvas.width) / canvas.height, height, 1);
     },
+    // Frees the GPU side only: StrictMode runs cleanups once and keeps the objects, which three uploads again.
     dispose: () => {
-      sprite.removeFromParent();
       texture.dispose();
       (sprite.material as THREE.Material).dispose();
     },

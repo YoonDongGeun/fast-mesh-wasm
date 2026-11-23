@@ -165,7 +165,7 @@ describe("quality report HTML", () => {
     expect(html).toContain("<title>Quality report: &lt;b&gt;&amp;co&lt;/b&gt;</title>");
     expect(html).not.toContain("<b>&co</b>");
     expect(html).toContain(`<td>${formatArea(24, "in")}</td>`);
-    expect(html).toContain("Lengths in in");
+    expect(html).toContain("Length unit: in");
     expect(html).not.toContain("<h2>Repair analysis</h2>");
   });
 });

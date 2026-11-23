@@ -52,18 +52,16 @@ export function ObjectInfoLayers(props: { app: AppState; scene: Scene | WorkerSc
 function useGeometryVersion(mesh: MeshHandle): number {
   const store = useScene();
   const [version, setVersion] = useState(0);
-  useEffect(
+  // In a layout effect: no change slips between the render that read the buffers and the watch.
+  useLayoutEffect(
     () =>
-      watchMesh(
-        store.scene,
-        mesh,
-        (geometry) => {
-          if (geometry) {
+      watchMesh(store.scene, mesh, {
+        onSettled: (kind) => {
+          if (kind !== "placement") {
             setVersion((v) => v + 1);
           }
         },
-        () => {},
-      ),
+      }),
     [store, mesh],
   );
   return version;
@@ -86,11 +84,16 @@ function useAttachToMesh(child: THREE.Object3D, mesh: MeshHandle): void {
   );
 }
 
-/** A line segments object with a growable position buffer, drawn in local coordinates of its parent. */
+/**
+ * A line segments object drawn in its parent's coordinates. It is never a
+ * click target: the events raycast a mesh's children too, and a line catches
+ * rays a whole unit away.
+ */
 function makeLines(color: number): THREE.LineSegments {
   const lines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color }));
   lines.matrixAutoUpdate = false;
   lines.frustumCulled = false;
+  lines.raycast = () => {};
   return lines;
 }
 
@@ -104,9 +107,9 @@ function setPositions(lines: THREE.LineSegments | THREE.Line, data: Float32Array
     geometry.setAttribute("position", new THREE.BufferAttribute(data, 3));
   }
   geometry.setDrawRange(0, data.length / 3);
-  geometry.computeBoundingSphere();
 }
 
+/** Frees the GPU side only: StrictMode runs cleanups once and keeps the objects, which three uploads again. */
 function disposeObject(o: THREE.Mesh | THREE.Line | THREE.LineSegments): void {
   o.geometry.dispose();
   (o.material as THREE.Material).dispose();
@@ -131,7 +134,6 @@ function AngleLayer(props: { app: AppState; items: readonly Item[] }) {
   }, []);
   useEffect(
     () => () => {
-      parts.group.removeFromParent();
       disposeObject(parts.arms);
       disposeObject(parts.arc);
       parts.balls.forEach(disposeObject);
@@ -193,7 +195,6 @@ function makeBoxParts() {
       });
     },
     dispose: () => {
-      group.removeFromParent();
       disposeObject(lines);
       labels.forEach((l) => l.dispose());
     },
@@ -213,7 +214,7 @@ function BoxOverlay(props: { scene: Scene | WorkerScene; item: Item; space: Info
 function useBoxSource(scene: Scene | WorkerScene, mesh: MeshHandle) {
   const version = useGeometryVersion(mesh);
   return useMemo(() => {
-    void version;
+    void version; // A new one reads the buffers again.
     try {
       const views = scene.views(mesh);
       const positions = Float32Array.from(views.positions());
@@ -261,11 +262,12 @@ function WorldBox(props: { scene: Scene | WorkerScene; item: Item; unit: LengthU
   const tracker = useMemo(() => (source === null ? null : new WorldBoxTracker(source.positions, source.used)), [source]);
   // The matrix last drawn; a new tracker or unit draws again.
   const last = useMemo(() => ({ m: null as number[] | null, tracker, unit, drawn: false }), [tracker, unit]);
-  useEffect(
+  useLayoutEffect(
     () => () => {
+      last.m = null;
       objectInfoProbe.box = null;
     },
-    [],
+    [last],
   );
   useFrame(() => {
     const object = view.bindings.get(item.mesh)?.object ?? null;

@@ -380,6 +380,24 @@ input[type="range"] {
 .analysis.stale {
   opacity: 0.6;
 }
+.object-info-readouts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.object-info-readouts dt {
+  color: var(--muted);
+}
+.object-info-readouts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.object-info-readouts dd.stale {
+  opacity: 0.6;
+}
 .holes {
   margin: 2px 0 0;
   padding-left: 14px;

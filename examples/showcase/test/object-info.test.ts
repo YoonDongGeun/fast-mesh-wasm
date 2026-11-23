@@ -270,15 +270,18 @@ describe("meshChangeKind", () => {
     ...patch,
   });
 
-  it("tells geometry, placement and removal of the watched mesh apart", () => {
+  it("tells triangle, vertex and placement changes and the removal of the watched mesh apart", () => {
     const scene = newScene();
     const c = box([0, 0, 0], [1, 1, 1]);
     const a = add(scene, c.positions, c.indices);
     const b = add(scene, c.positions, c.indices);
     expect(meshChangeKind([record(a, { placementChanged: true })], a)).toBe("placement");
-    expect(meshChangeKind([record(a, { positions: [{ start: 0, end: 1 }] as never })], a)).toBe("geometry");
-    expect(meshChangeKind([record(a, { indices: "all" })], a)).toBe("geometry");
-    expect(meshChangeKind([record(a, { placementChanged: true }), record(a, { capacityChanged: true })], a)).toBe("geometry");
+    expect(meshChangeKind([record(a, { positions: [{ start: 0, end: 1 }] as never })], a)).toBe("positions");
+    expect(meshChangeKind([record(a, { indices: "all" })], a)).toBe("topology");
+    // The largest change of the batch, in either order.
+    expect(meshChangeKind([record(a, { placementChanged: true }), record(a, { capacityChanged: true })], a)).toBe("topology");
+    expect(meshChangeKind([record(a, { capacityChanged: true }), record(a, { placementChanged: true })], a)).toBe("topology");
+    expect(meshChangeKind([record(a, { positions: "all" }), record(a, { placementChanged: true })], a)).toBe("positions");
     expect(meshChangeKind([record(a, { colors: "all" })], a)).toBeNull();
     expect(meshChangeKind([record(b, { indices: "all" })], a)).toBeNull();
     expect(meshChangeKind([record(a, { indices: "all" }), record(a, { removed: true })], a)).toBe("removed");

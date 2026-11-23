@@ -19,7 +19,7 @@ import {
 import { boxSize, type MeshInfo } from "../ux/object-info";
 import { NORMALS_SCALE_RANGE, type NormalsMode } from "../ux/object-info-state";
 import { MAX_NORMAL_LINES } from "../ux/overlay-geometry";
-import { exportQualityReport, objectInfoProbe, useObjectInfo } from "../ux/use-object-info";
+import { exportQualityReport, LARGE_MESH_TRIANGLES, objectInfoProbe, useObjectInfo } from "../ux/use-object-info";
 
 const NORMALS_MODES: readonly { mode: NormalsMode; label: string; title: string }[] = [
   { mode: "off", label: "Off", title: "No normals overlay" },
@@ -34,7 +34,8 @@ export function ObjectInfoBox(props: { app: AppState; scene: Scene | WorkerScene
   const settings = useApp(app, (s) => s.objectInfo);
   const unit = useApp(app, (s) => s.units);
   const item = items.find((i) => i.mesh === selection) ?? null;
-  const { info, measuring } = useObjectInfo(scene, item?.mesh ?? null, settings.open);
+  const brush = useApp(app, (s) => s.sculpt !== null || s.maskPaint);
+  const { info, measuring } = useObjectInfo(app, scene, item?.mesh ?? null, settings.open);
   const [message, setMessage] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
 
@@ -92,6 +93,9 @@ export function ObjectInfoBox(props: { app: AppState; scene: Scene | WorkerScene
           ) : (
             <InfoReadouts info={info} measuring={measuring} space={settings.space} unit={unit} />
           )}
+          {brush && info !== null && info.triangles > LARGE_MESH_TRIANGLES ? (
+            <p className="muted small">Large mesh: the numbers refresh once the brush is put down.</p>
+          ) : null}
           <div className="object-info-overlays">
             <label className="check">
               <input
@@ -183,9 +187,9 @@ function InfoReadouts(props: { info: MeshInfo; measuring: boolean; space: "world
       : measuring
         ? pending
         : info.volumeReason === "open"
-          ? "open mesh"
+          ? "none (open mesh)"
           : info.volumeReason === "non-manifold"
-            ? "non-manifold"
+            ? "none (non-manifold)"
             : "—";
   const rows: [string, string, string][] = [
     ["triangles", "Triangles", info.triangles.toLocaleString("en")],
@@ -204,11 +208,14 @@ function InfoReadouts(props: { info: MeshInfo; measuring: boolean; space: "world
     );
   }
   return (
-    <dl className="readouts" data-object-info={space} aria-busy={measuring}>
+    <dl className="object-info-readouts" data-object-info={space} aria-busy={measuring}>
       {rows.map(([key, label, value]) => (
         <Fragment key={key}>
           <dt>{label}</dt>
-          <dd data-info={key}>{value}</dd>
+          {/* Until the measurement lands, the last one shows dimmed. */}
+          <dd data-info={key} className={measuring && (key === "area" || key === "volume") ? "stale" : undefined}>
+            {value}
+          </dd>
         </Fragment>
       ))}
     </dl>
