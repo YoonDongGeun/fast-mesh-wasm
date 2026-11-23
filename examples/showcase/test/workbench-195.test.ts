@@ -334,6 +334,9 @@ function createFakeSyncScene() {
     },
     canUndo: () => undoStack.length > 0,
     canRedo: () => redoStack.length > 0,
+    beginStep: () => {},
+    endStep: () => {},
+    cancelStep: () => {},
     undo() {
       const entry = undoStack.pop();
       if (!entry) return false;

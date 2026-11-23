@@ -18,6 +18,7 @@ import {
   dropMember,
   type NamedGroup,
   removeGroup,
+  restoreMember,
   setColored,
   toggleCheck,
 } from "../../features/collision/ux/groups";
@@ -44,7 +45,10 @@ export interface Item {
   id: number;
   mesh: MeshHandle;
   name: string;
-  /** Owned by the app (one per mesh, as `bindMesh` requires); disposed on removal. */
+  /**
+   * Owned by the app (one per mesh, as `bindMesh` requires); disposed on
+   * removal (an undone removal shows it again: three.js sets it up afresh).
+   */
   material: THREE.MeshStandardMaterial;
   /** The mesh's colour (`0xrrggbb`), for its swatch: the material turns white while a colouring shows. */
   color: number;
@@ -64,6 +68,22 @@ export interface Item {
   locked: boolean;
   /** Per-mesh diagnostic shading override, or `null` to follow scene shading (#235). */
   shadingOverride: DiagnosticShadingMode | null;
+}
+
+/** A listed mesh that undo or redo can bring back, with the places it had. */
+interface ParkedItem {
+  item: Item;
+  /** Its index in the list. */
+  at: number;
+  /** It was the primary selection. */
+  primary: boolean;
+  /** The sides of the collision pair it was picked for. */
+  sides: readonly (keyof CollisionPair)[];
+  /** It was a member of the contact group, with the listed pairs naming it. */
+  grouped: boolean;
+  pairs: readonly (readonly [MeshHandle, MeshHandle])[];
+  /** The named groups it was in. */
+  folders: readonly number[];
 }
 
 export type JobPhase = "reading" | "parsing" | "decimating" | "adding" | "done" | "error";
@@ -513,6 +533,8 @@ export class AppState {
   /** The group defaults to the first three meshes added (the demo set), until it is ticked by hand. */
   #autoGroup = true;
   readonly #listeners = new Set<() => void>();
+  /** Meshes out of the list that undo or redo can bring back (see {@link AppState.follow}). */
+  readonly #parked = new Map<MeshHandle, ParkedItem>();
   #nextItem = 0;
   #nextColor = 0;
   #nextGroup = 1;
@@ -531,10 +553,50 @@ export class AppState {
     }
   }
 
-  /** Adds a loaded mesh to the store (its arrays are transferred to a Worker scene) and lists it. */
-  addMesh(store: SceneStore, loaded: LoadedMesh): Item {
+  /**
+   * Keeps the list in step with the store as undoable adds and removals are
+   * undone and redone: a mesh that left the scene leaves the list, and one
+   * that is back is listed again as the item it was (name, colour, material,
+   * place, groups, and the selection when nothing else is selected). Returns
+   * the function that stops it.
+   */
+  follow(store: SceneStore): () => void {
+    this.syncMeshes(store);
+    return store.subscribe(() => this.syncMeshes(store));
+  }
+
+  /** {@link AppState.follow}, once. */
+  syncMeshes(store: SceneStore): void {
+    const { meshes } = store.getSnapshot();
+    for (const item of this.#snap.items) {
+      if (!meshes.has(item.mesh)) {
+        this.#leave(store, item, this.#detach(store, item));
+      }
+    }
+    // The last to leave first, so that each finds its place.
+    for (const [mesh, parked] of [...this.#parked].reverse()) {
+      if (meshes.has(mesh)) {
+        this.#relist(store, parked);
+      } else if (!store.isRestorable(mesh)) {
+        this.#parked.delete(mesh);
+      }
+    }
+  }
+
+  /** The volumes of the meshes undo or redo can bring back. */
+  parkedVolumes(): string[] {
+    return [...this.#parked.values()].flatMap(({ item }) => item.volumeId ?? []);
+  }
+
+  /**
+   * Adds a loaded mesh to the store (its arrays are transferred to a Worker
+   * scene) and lists it. With `undoable` the add is an undo step, or part of
+   * the open one.
+   */
+  addMesh(store: SceneStore, loaded: LoadedMesh, options: { undoable?: boolean } = {}): Item {
     const triangles = loaded.indices.length / 3;
     const mesh = store.addMesh(loaded.positions, loaded.indices, {
+      ...(options.undoable === true ? { undoable: true } : {}),
       origin: loaded.center,
       ...(loaded.colors ? { colors: loaded.colors } : {}),
       ...(loaded.uvs ? { uvs: loaded.uvs } : {}),
@@ -595,10 +657,9 @@ export class AppState {
   }
 
   /**
-   * Lists a mesh its caller added to the store and fills itself (the Create
-   * dialog adds an empty mesh and its geometry as one undoable edit), with
-   * the size it will have: the triangle count, centre (its origin) and half
-   * diagonal.
+   * Lists a mesh its caller added to the store (or adds empty and fills
+   * itself), with the size it has or will have: the triangle count, centre
+   * (its origin) and half diagonal.
    */
   listMesh(mesh: MeshHandle, meta: Pick<Item, "name" | "triangles" | "center" | "radius">): Item {
     return this.#registerItem(mesh, { ...meta, volumeId: null, preset: null, importScale: NO_IMPORT_SCALE });
@@ -645,19 +706,72 @@ export class AppState {
   }
 
   /**
-   * Removes a mesh from the store and the list, and disposes its material.
-   * When it is one of the collision pair, its picker resets; in pair mode
+   * Removes a mesh from the store and the list, as an undo step or part of
+   * the open one (for good with `undoable: false`), and disposes its
+   * material. When it is one of the collision pair, its picker resets; in pair mode
    * the other mesh's colouring (measured to it) stops first, in the same
    * tick: the store would otherwise report the colouring's lost target as
    * an error. It also leaves the contact group (and its pairs); the store
    * takes a removed mesh out of its groups itself, and the other members
    * keep their remaining partners.
    */
-  removeMesh(store: SceneStore, item: Item): void {
+  removeMesh(store: SceneStore, item: Item, options: { undoable?: boolean } = {}): void {
+    const primary = store.getSnapshot().selection === item.mesh;
     const detached = this.#detach(store, item);
-    store.removeMesh(item.mesh);
+    store.removeMesh(item.mesh, { undoable: options.undoable ?? true });
+    // A followed store has had it leave the list already.
+    if (this.#snap.items.includes(item)) {
+      this.#leave(store, item, detached, primary);
+    }
+  }
+
+  /** A mesh that left the scene leaves the list; kept aside while undo or redo can bring it back. */
+  #leave(
+    store: SceneStore,
+    item: Item,
+    detached: { collision: CollisionPair; group: GroupSetup },
+    primary = this.#snap.multi[0] === item.mesh,
+  ): void {
+    if (store.isRestorable?.(item.mesh) === true) {
+      const { items, collision, group, meshGroups } = this.#snap;
+      this.#parked.set(item.mesh, {
+        item,
+        at: items.indexOf(item),
+        primary,
+        sides: (["a", "b"] as const).filter((side) => collision[side] === item.mesh),
+        grouped: group.members.includes(item.mesh),
+        pairs: group.pairs === "all" ? [] : group.pairs.filter(([a, b]) => a === item.mesh || b === item.mesh),
+        folders: meshGroups.filter((g) => g.members.includes(item.mesh)).map((g) => g.id),
+      });
+    }
     item.material.dispose();
     this.#dropLists(item, detached);
+  }
+
+  /** Lists a mesh that is back in the scene again, where it was. */
+  #relist(store: SceneStore, parked: ParkedItem): void {
+    const { item } = parked;
+    this.#parked.delete(item.mesh);
+    const items = [...this.#snap.items];
+    items.splice(Math.min(parked.at, items.length), 0, item);
+    let collision = this.#snap.collision;
+    for (const side of parked.sides) {
+      if (collision[side] === null) {
+        collision = { ...collision, [side]: item.mesh };
+      }
+    }
+    let group = this.#snap.group;
+    if (parked.grouped && !group.members.includes(item.mesh)) {
+      const members = [...group.members, item.mesh];
+      const back = parked.pairs.filter(([a, b]) => members.includes(a) && members.includes(b));
+      group = { members, pairs: group.pairs === "all" ? "all" : [...group.pairs, ...back] };
+    }
+    const meshGroups = restoreMember(this.#snap.meshGroups, parked.folders, item.mesh);
+    this.#set({ items, collision, group, meshGroups });
+    if (parked.primary && store.getSnapshot().selection === null) {
+      this.#set({ multi: [item.mesh] });
+      store.select(item.mesh);
+    }
   }
 
   /**
@@ -679,7 +793,8 @@ export class AppState {
     let collision = this.#snap.collision;
     if (collision.a === item.mesh || collision.b === item.mesh) {
       const other = collision.a === item.mesh ? collision.b : collision.a;
-      if (this.#snap.collisionMode === "pair" && other !== null && other !== item.mesh) {
+      const shown = other !== null && other !== item.mesh && store.getSnapshot().meshes.has(other);
+      if (this.#snap.collisionMode === "pair" && shown) {
         store.setDisplay(other, { coloring: null });
       }
       collision = { a: collision.a === item.mesh ? null : collision.a, b: collision.b === item.mesh ? null : collision.b };

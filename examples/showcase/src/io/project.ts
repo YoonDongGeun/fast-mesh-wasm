@@ -521,8 +521,10 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
  */
 export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc): void {
   for (const item of [...app.getSnapshot().items]) {
-    app.removeMesh(store, item);
+    app.removeMesh(store, item, { undoable: false });
   }
+  // Nor can undo bring back a mesh removed before.
+  (store.scene as { clearHistory?: () => void }).clearHistory?.();
   for (const section of [...store.getSnapshot().sections.keys()]) {
     store.removeSection(section);
   }

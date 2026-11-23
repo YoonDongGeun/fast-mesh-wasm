@@ -75,6 +75,7 @@ function harness(): { scene: Scene; store: SceneStore; app: AppState } {
   const scene = new Scene();
   const store = createSceneStore(scene);
   const app = new AppState();
+  app.follow(store);
   cleanups.push(() => {
     store.dispose();
     scene.free();
@@ -134,15 +135,19 @@ describe("convex hull actions", () => {
       "Hull of 2 meshes: 8 vertices, 12 triangles from 16 points",
     );
 
-    // One undo step empties the hull; the sources stay; redo fills it again.
+    // One undo step removes the hull and its row (#269); the sources stay;
+    // redo brings it back, selected.
     store.undo();
     store.commitFrame();
-    expect(live(scene, hull.mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([a, b]);
+    expect(store.getSnapshot().selection).toBeNull();
     expect(live(scene, a.mesh)).toBe(12);
     expect(live(scene, b.mesh)).toBe(12);
     store.redo();
     store.commitFrame();
     expect(live(scene, hull.mesh)).toBe(12);
+    expect(app.getSnapshot().items).toEqual([a, b, hull]);
+    expect(store.getSnapshot().selection).toBe(hull.mesh);
   });
 
   it("Mesh Edit reports a flat selection as an error and adds nothing", async () => {
@@ -186,6 +191,6 @@ describe("convex hull actions", () => {
     expect(app.getSnapshot().wave6.metrology.pointCloud?.count).toBe(10);
     store.undo();
     store.commitFrame();
-    expect(live(scene, items[0].mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([]);
   });
 });

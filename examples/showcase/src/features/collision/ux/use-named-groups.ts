@@ -162,8 +162,14 @@ export function useNamedGroups(app: AppState): {
     }
   };
   const removeMeshes = (members: readonly MeshHandle[]) => {
-    for (const item of items.filter((i) => members.includes(i.mesh))) {
-      app.removeMesh(store, item);
+    // One undo step brings them all back.
+    store.beginStep();
+    try {
+      for (const item of items.filter((i) => members.includes(i.mesh))) {
+        app.removeMesh(store, item);
+      }
+    } finally {
+      store.endStep();
     }
   };
 

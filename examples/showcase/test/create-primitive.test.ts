@@ -31,6 +31,7 @@ function open() {
   const scene = new Scene();
   const store = createSceneStore(scene);
   const app = new AppState();
+  app.follow(store);
   cleanups.push(() => {
     store.dispose();
     scene.free();
@@ -150,7 +151,7 @@ describe("Create runs where the engine runs", () => {
 });
 
 describe("addPrimitive", () => {
-  it("adds the shape as one undo step: undo empties it, redo brings it back", async () => {
+  it("adds the shape as one undo step: undo removes it, redo brings it back", async () => {
     const { scene, store, app } = open();
     const mesh = generatePrimitive({ kind: "box", size: [2, 4, 6] });
     expect(scene.canUndo()).toBe(false);
@@ -179,20 +180,21 @@ describe("addPrimitive", () => {
     expect(scene.canUndo()).toBe(true);
     store.undo();
     expect(scene.canUndo()).toBe(false);
-    expect(scene.inspect.measure(item.mesh).area).toBe(0);
-    // The row stays (meshes outlive their content in the engine's history).
-    expect(app.getSnapshot().items).toHaveLength(1);
+    // The mesh goes, and its row with it (#269).
+    expect(scene.has(item.mesh)).toBe(false);
+    expect(app.getSnapshot().items).toEqual([]);
     store.redo();
     expect(scene.inspect.measure(item.mesh).volume).toBeCloseTo(48, 3);
+    expect(app.getSnapshot().items).toEqual([item]);
   });
 
-  it("removes the empty mesh again when the edit fails", async () => {
-    const { store, app } = open();
+  it("adds nothing when the scene refuses the mesh", () => {
+    const { scene, store, app } = open();
     const bad = { positions: Float32Array.from([0, 0, 0]), indices: Uint32Array.from([0, 1, 2]) };
-    const { done } = addPrimitive(store, app, bad, { name: "Bad", centre: [0, 0, 0], rotationDeg: [0, 0, 0] });
-    await expect(done).rejects.toThrow();
+    expect(() => addPrimitive(store, app, bad, { name: "Bad", centre: [0, 0, 0], rotationDeg: [0, 0, 0] })).toThrow();
     expect(app.getSnapshot().items).toEqual([]);
     expect(store.getSnapshot().meshes.size).toBe(0);
+    expect(scene.canUndo()).toBe(false);
   });
 });
 

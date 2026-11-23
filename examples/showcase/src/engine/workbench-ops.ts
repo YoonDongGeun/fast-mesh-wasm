@@ -38,6 +38,7 @@ import type {
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { bounds, type Vec3 } from "../io/mesh-data";
+import type { LoadedMesh } from "../io/protocol";
 import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } from "../app/state/app-state";
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
@@ -211,10 +212,13 @@ function applyPlacementToStore(store: SceneStore, mesh: MeshHandle, placement: P
   });
 }
 
-/** Clones an existing mesh's live geometry, attributes, and placement as `"<name> copy"`. */
+/**
+ * Clones an existing mesh's live geometry, attributes, and placement as
+ * `"<name> copy"`, in one undo step (undo removes the copy).
+ */
 export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Item {
   const snap = extractLiveMeshData(store.scene, item.mesh);
-  const copy = app.addMesh(store, {
+  const loaded: LoadedMesh = {
     name: `${item.name} copy`,
     positions: snap.positions,
     indices: snap.indices,
@@ -224,8 +228,18 @@ export function duplicateMesh(store: SceneStore, app: AppState, item: Item): Ite
     radius: snap.radius,
     volumeId: item.volumeId,
     preset: item.preset,
-  });
-  applyPlacementToStore(store, copy.mesh, snap.placement);
+  };
+  store.beginStep();
+  let copy: Item;
+  try {
+    copy = app.addMesh(store, loaded, { undoable: true });
+    applyPlacementToStore(store, copy.mesh, snap.placement);
+  } catch (err) {
+    store.cancelStep();
+    app.syncMeshes(store);
+    throw err;
+  }
+  store.endStep();
   const srcColoring = store.getSnapshot().meshes.get(item.mesh)?.display.coloring ?? null;
   if (srcColoring !== null) {
     store.setDisplay(copy.mesh, { coloring: { ...srcColoring } });
@@ -387,7 +401,11 @@ export interface BooleanRunResult {
   triangles: number;
 }
 
-/** Runs Boolean CSG (`union` | `intersect` | `subtract`) on both sync `Scene` and `WorkerScene`. */
+/**
+ * Runs Boolean CSG (`union` | `intersect` | `subtract`) on both sync `Scene`
+ * and `WorkerScene`, as one undo step: undo removes the result mesh
+ * (`keepOriginals`), or restores the target and brings the source back.
+ */
 export async function runBooleanCsg(params: {
   store: SceneStore;
   app: AppState;
@@ -403,28 +421,37 @@ export async function runBooleanCsg(params: {
     const syncScene = asSyncScene(store.scene);
     if (keepOriginals) {
       const snap = extractLiveMeshData(syncScene, target.mesh);
-      const copy = app.addMesh(store, {
-        name: `${target.name} ${label} ${source.name}`,
-        positions: snap.positions,
-        indices: snap.indices,
-        ...(snap.colors ? { colors: snap.colors } : {}),
-        ...(snap.uvs ? { uvs: snap.uvs } : {}),
-        center: [0, 0, 0],
-        radius: snap.radius,
-        volumeId: null,
-        preset: null,
+      const { copy, resultMesh } = await inOneStep(store, app, async () => {
+        const made = app.addMesh(
+          store,
+          {
+            name: `${target.name} ${label} ${source.name}`,
+            positions: snap.positions,
+            indices: snap.indices,
+            ...(snap.colors ? { colors: snap.colors } : {}),
+            ...(snap.uvs ? { uvs: snap.uvs } : {}),
+            center: [0, 0, 0],
+            radius: snap.radius,
+            volumeId: null,
+            preset: null,
+          },
+          { undoable: true },
+        );
+        applyPlacementToStore(store, made.mesh, snap.placement);
+        return { copy: made, resultMesh: syncScene.boolean(made.mesh, source.mesh, op) };
       });
-      applyPlacementToStore(store, copy.mesh, snap.placement);
-      const resultMesh = syncScene.boolean(copy.mesh, source.mesh, op);
       const liveCount = extractLiveMeshData(syncScene, resultMesh).indices.length / 3;
       selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, resultMesh, false);
       return { mesh: resultMesh, name: copy.name, triangles: liveCount };
     }
 
-    const resultMesh = syncScene.boolean(target.mesh, source.mesh, op);
-    if (source.mesh !== target.mesh) {
-      app.removeMesh(store, source);
-    }
+    const resultMesh = await inOneStep(store, app, async () => {
+      const result = syncScene.boolean(target.mesh, source.mesh, op);
+      if (source.mesh !== target.mesh) {
+        app.removeMesh(store, source);
+      }
+      return result;
+    });
     const liveCount = extractLiveMeshData(syncScene, resultMesh).indices.length / 3;
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, resultMesh, false);
     return { mesh: resultMesh, name: target.name, triangles: liveCount };
@@ -455,25 +482,34 @@ export async function runBooleanCsg(params: {
     const outSnap = extractLiveMeshData(tmp, outHandle);
 
     if (keepOriginals) {
-      const added = app.addMesh(store, {
-        name: `${target.name} ${label} ${source.name}`,
-        positions: outSnap.positions,
-        indices: outSnap.indices,
-        center: [0, 0, 0],
-        radius: outSnap.radius,
-        volumeId: null,
-        preset: null,
+      const added = await inOneStep(store, app, async () => {
+        const made = app.addMesh(
+          store,
+          {
+            name: `${target.name} ${label} ${source.name}`,
+            positions: outSnap.positions,
+            indices: outSnap.indices,
+            center: [0, 0, 0],
+            radius: outSnap.radius,
+            volumeId: null,
+            preset: null,
+          },
+          { undoable: true },
+        );
+        applyPlacementToStore(store, made.mesh, outSnap.placement);
+        return made;
       });
-      applyPlacementToStore(store, added.mesh, outSnap.placement);
       selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, added.mesh, false);
       return { mesh: added.mesh, name: added.name, triangles: outSnap.indices.length / 3 };
     }
 
-    await replaceMeshGeometryLocal(store, target.mesh, outSnap.positions, outSnap.indices);
-    applyPlacementToStore(store, target.mesh, outSnap.placement);
-    if (source.mesh !== target.mesh) {
-      app.removeMesh(store, source);
-    }
+    await inOneStep(store, app, async () => {
+      await replaceMeshGeometryLocal(store, target.mesh, outSnap.positions, outSnap.indices);
+      applyPlacementToStore(store, target.mesh, outSnap.placement);
+      if (source.mesh !== target.mesh) {
+        app.removeMesh(store, source);
+      }
+    });
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, target.mesh, false);
     return { mesh: target.mesh, name: target.name, triangles: outSnap.indices.length / 3 };
   } finally {
@@ -488,8 +524,11 @@ export interface BatchBooleanRunResult {
   triangles: number;
 }
 
-/** Runs `work` inside one history step: committed when it settles, reverted when it throws. */
-async function inOneStep<T>(store: SceneStore, work: () => Promise<T>): Promise<T> {
+/**
+ * Runs `work` inside one history step: committed when it settles, reverted
+ * when it throws (the meshes it added or removed leave or rejoin the list).
+ */
+async function inOneStep<T>(store: SceneStore, app: AppState, work: () => Promise<T>): Promise<T> {
   store.beginStep();
   try {
     const value = await work();
@@ -497,6 +536,7 @@ async function inOneStep<T>(store: SceneStore, work: () => Promise<T>): Promise<
     return value;
   } catch (err) {
     store.cancelStep();
+    app.syncMeshes(store);
     throw err;
   }
 }
@@ -529,14 +569,13 @@ async function writeWorldGeometry(
  * the result to a scratch mesh, read and removed here; then, as one undo
  * step:
  *
- * - `keepInputs`: the result fills a new mesh, added empty first. Undo
- *   empties it; the inputs never change.
+ * - `keepInputs`: the result is added as a new mesh. Undo removes it; the
+ *   inputs never change.
  * - otherwise the primary takes the result in place (keeping its name and
- *   placement) and the other inputs are cleared. Undo restores every input.
+ *   placement) and the other inputs are removed. Undo restores every input.
  *
- * Adding and removing meshes are not undo steps, so no input is removed: a
- * cleared input stays listed, empty, until undo refills it. An empty result
- * (inputs that do not overlap, say) throws before anything changes.
+ * An empty result (inputs that do not overlap, say) throws before anything
+ * changes.
  */
 export async function runBatchBoolean(params: {
   store: SceneStore;
@@ -581,27 +620,18 @@ export async function runBatchBoolean(params: {
   const triangles = corners.length / 3;
 
   if (keepInputs) {
-    const mesh = store.addMesh(new Float64Array(0), new Uint32Array(0), { origin: [0, 0, 0] });
-    try {
-      await inOneStep(store, () => writeWorldGeometry(store, mesh, positions, corners));
-    } catch (err) {
-      store.removeMesh(mesh);
-      throw err;
-    }
-    const item = app.adoptSceneMesh(store, mesh, batchResultName(op, inputs));
+    const { center, radius } = bounds(positions);
+    const mesh = store.addMesh(positions, corners, { origin: center, undoable: true });
+    const item = app.listMesh(mesh, { name: batchResultName(op, inputs), triangles, center, radius });
     selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, mesh, false);
     return { mesh, name: item.name, triangles };
   }
 
   const [primary, ...others] = inputs;
-  await inOneStep(store, async () => {
+  await inOneStep(store, app, async () => {
     await writeWorldGeometry(store, primary.mesh, positions, corners);
     for (const other of others) {
-      const views = scene.views(other.mesh);
-      const clear = clearMeshOps(Math.floor(views.positions().length / 3), views.indices());
-      if (clear.length > 0) {
-        await store.edit(other.mesh, clear);
-      }
+      app.removeMesh(store, other);
     }
   });
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, primary.mesh, false);
@@ -921,8 +951,8 @@ export interface ConvexHullRunResult {
 /**
  * Adds the convex hull of `sources` (their world shapes) or of world `points`
  * as a new mesh named `name`, lists it and selects it. The sources stay as
- * they are. The engine fills the new mesh as one undo step (undo empties it),
- * on the Worker when the scene runs there.
+ * they are. The engine adds the mesh as one undo step (undo removes it), on
+ * the Worker when the scene runs there.
  */
 export async function runConvexHull(params: {
   store: SceneStore;

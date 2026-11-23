@@ -158,8 +158,14 @@ function tracker(changed: Set<string>) {
   return { errors, track, forgetErrors };
 }
 
-/** {@link Host.presence} from either scene. */
+/**
+ * {@link Host.presence} from either scene. A stand-in scene without `has`
+ * (tests make them) has every mesh it was given.
+ */
 function presenceIn(scene: Scene | WorkerScene, mesh: MeshHandle): "live" | "restorable" | "gone" {
+  if (typeof scene.has !== "function") {
+    return "live";
+  }
   return scene.has(mesh) ? "live" : scene.isRestorable(mesh) ? "restorable" : "gone";
 }
 

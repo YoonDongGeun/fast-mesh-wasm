@@ -101,11 +101,13 @@ afterEach(async () => {
 function syncSetup(): { scene: Scene; store: SceneStore; app: AppState } {
   const scene = new Scene();
   const store = createSceneStore(scene);
+  const app = new AppState();
+  app.follow(store);
   cleanups.push(() => {
     store.dispose();
     scene.free();
   });
-  return { scene, store, app: new AppState() };
+  return { scene, store, app };
 }
 
 /**
@@ -153,17 +155,20 @@ describe("multi-mesh boolean (sync Scene)", () => {
       expect(liveTriangles(scene, r.mesh)).toBe(r.triangles);
       expect(shapes(scene, inputs)).toEqual(before);
     }
-    // One undo empties the last result only; redo fills it again.
-    const last = app.getSnapshot().items.at(-1)!;
+    // One undo removes the last result only (#269); redo brings it back.
+    const all = app.getSnapshot().items;
+    const last = all.at(-1)!;
     store.undo();
-    expect(liveTriangles(scene, last.mesh)).toBe(0);
-    expect(liveTriangles(scene, app.getSnapshot().items.at(-2)!.mesh)).toBeGreaterThan(0);
+    expect(app.getSnapshot().items).toEqual(all.slice(0, -1));
+    expect(scene.has(last.mesh)).toBe(false);
+    expect(liveTriangles(scene, app.getSnapshot().items.at(-1)!.mesh)).toBeGreaterThan(0);
     store.redo();
+    expect(app.getSnapshot().items).toEqual(all);
     expect(worldVolume(scene, last.mesh)).toBeCloseTo(2, 4);
     expect(shapes(scene, inputs)).toEqual(before);
   });
 
-  it("removes the inputs: the primary takes the result, the others empty, and one undo restores all three", async () => {
+  it("removes the inputs: the primary takes the result, the others go, and one undo restores all three", async () => {
     const { scene, store, app } = syncSetup();
     // The primary is placed, so the result maps into its local frame.
     const a = addBox(store, app, "A", [5, 0, 0], [-5, 0, 0]);
@@ -176,20 +181,20 @@ describe("multi-mesh boolean (sync Scene)", () => {
     const r = await runBatchBoolean({ store, app, inputs, op: "subtract", keepInputs: false });
     expect(r.mesh).toBe(a.mesh);
     expect(r.name).toBe("A");
-    expect(app.getSnapshot().items.length).toBe(3);
+    expect(app.getSnapshot().items).toEqual([a]);
     expect(worldVolume(scene, a.mesh)).toBeCloseTo(2, 4);
     expect(scene.placement(a.mesh)).toEqual(placementBefore);
-    expect(liveTriangles(scene, b.mesh)).toBe(0);
-    expect(liveTriangles(scene, c.mesh)).toBe(0);
+    expect([scene.has(b.mesh), scene.has(c.mesh)]).toEqual([false, false]);
     expect(store.getSnapshot().selection).toBe(a.mesh);
 
     store.undo();
+    expect(app.getSnapshot().items).toEqual(inputs);
     expect(shapes(scene, inputs)).toEqual(before);
     // Only the boolean was undone: the placements before it still stand.
     expect(scene.placement(c.mesh).translation).toEqual([0, 1, 0]);
     store.redo();
     expect(worldVolume(scene, a.mesh)).toBeCloseTo(2, 4);
-    expect(liveTriangles(scene, b.mesh) + liveTriangles(scene, c.mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([a]);
   });
 
   it("changes nothing when the result is empty", async () => {
@@ -323,11 +328,13 @@ describe("multi-mesh boolean and isotropic remesh (WorkerScene)", () => {
   async function workerSetup(): Promise<{ store: SceneStore; app: AppState }> {
     const scene = await createWorkerScene({ createWorker: () => new NodeWorker() });
     const store = createSceneStore(scene);
+    const app = new AppState();
+    app.follow(store);
     cleanups.push(() => {
       store.dispose();
       scene.terminate();
     });
-    return { store, app: new AppState() };
+    return { store, app };
   }
 
   it("runs both off the main thread, each one undo step", async () => {
@@ -344,14 +351,16 @@ describe("multi-mesh boolean and isotropic remesh (WorkerScene)", () => {
     expect(app.getSnapshot().items.find((i) => i.mesh === kept.mesh)?.triangles).toBe(kept.triangles);
     store.undo();
     await settle(store);
-    expect(liveTriangles(scene, kept.mesh)).toBe(0);
+    expect(store.getSnapshot().meshes.has(kept.mesh)).toBe(false);
+    expect(app.getSnapshot().items).toEqual(inputs);
 
     const r = await runBatchBoolean({ store, app, inputs, op: "intersect", keepInputs: false });
     await settle(store);
     expect(worldVolume(scene, r.mesh)).toBeCloseTo(2, 4);
-    expect(liveTriangles(scene, inputs[1].mesh) + liveTriangles(scene, inputs[2].mesh)).toBe(0);
+    expect(app.getSnapshot().items).toEqual([inputs[0]]);
     store.undo();
     await settle(store);
+    expect(app.getSnapshot().items).toEqual(inputs);
     expect(shapes(scene, inputs)).toEqual(before);
 
     const remesh = await runIsotropicRemesh({ store, mesh: inputs[0].mesh, options: { targetEdgeLength: 0.5 } });

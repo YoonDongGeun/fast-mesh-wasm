@@ -138,10 +138,10 @@ describe("multi-mesh boolean", () => {
   it("reports what happened and what undo does", () => {
     const base = { op: "union" as const, inputs: 3, name: "A union +2", triangles: 12345 };
     expect(describeBatchBoolean({ ...base, keptInputs: true })).toBe(
-      "Union of 3 meshes → A union +2: 12,345 triangles (inputs kept; Ctrl+Z empties the result)",
+      "Union of 3 meshes → A union +2: 12,345 triangles (inputs kept; Ctrl+Z removes the result)",
     );
     expect(describeBatchBoolean({ ...base, op: "subtract", name: "A", keptInputs: false })).toBe(
-      "Difference of 3 meshes → A: 12,345 triangles (the others emptied; Ctrl+Z restores every input)",
+      "Difference of 3 meshes → A: 12,345 triangles (the others removed; Ctrl+Z restores every input)",
     );
   });
 });

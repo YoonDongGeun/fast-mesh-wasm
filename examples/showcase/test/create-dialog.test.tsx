@@ -44,6 +44,7 @@ async function mount(): Promise<{ app: AppState; store: SceneStore; scene: Scene
   const scene = new Scene();
   const store = createSceneStore(scene);
   const app = new AppState();
+  app.follow(store);
   const container = document.createElement("div");
   document.body.appendChild(container);
   let root: Root;
@@ -156,7 +157,9 @@ describe("Create dialog", () => {
     expect(scene.canUndo()).toBe(true);
     await act(async () => store.undo());
     expect(scene.canUndo()).toBe(false);
-    expect(scene.inspect.measure(item.mesh).area).toBe(0);
+    // The mesh goes, and its row with it (#269).
+    expect(scene.has(item.mesh)).toBe(false);
+    expect(app.getSnapshot().items).toEqual([]);
   });
 
   it("names repeats uniquely, refuses bad values and closes on Escape", async () => {
