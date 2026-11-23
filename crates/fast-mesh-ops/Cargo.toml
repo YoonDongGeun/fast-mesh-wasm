@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "denoise"
 harness = false
+
+[[bench]]
+name = "wrap"
+harness = false

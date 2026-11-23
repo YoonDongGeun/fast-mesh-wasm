@@ -74,6 +74,9 @@
 //! - Convex hulls: [`convex_hull`] builds the exact convex hull of points
 //!   (from one mesh, several meshes or a point cloud with its wrappers) as a
 //!   closed, outward-wound mesh, by quickhull on exact orientation predicates.
+//! - Wrapping: [`wrap()`](wrap::wrap) closes gaps and holes below a size in
+//!   one or more meshes by a voxel morphological closing, and returns a
+//!   closed, manifold envelope without self-intersections.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
 //! - Denoising and Delaunay flips: [`denoise()`] smooths scan noise by
@@ -133,6 +136,7 @@ mod topology;
 #[cfg(test)]
 mod uv_table;
 mod weld;
+pub mod wrap;
 
 pub use analyze::{Analysis, AnalyzeOptions, AnalyzeOptionsBuilder, analyze};
 pub use append::{AppendReport, AppendSource, append_mesh, append_mesh_with_uvs};
@@ -192,6 +196,7 @@ pub use simplify::{
     SimplifyOptionsBuilder, SimplifyReport, simplify, simplify_with,
 };
 pub use topology::{BoundaryLoop, Component, EdgeKind, LoopId, boundary_loops};
+pub use wrap::{WrapOptions, WrapOptionsBuilder, WrapPlan, WrapReport, wrap_meshes, wrap_plan};
 
 use fast_mesh_store::StoreError;
 
