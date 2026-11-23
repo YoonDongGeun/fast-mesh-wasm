@@ -2592,28 +2592,9 @@ impl Scene {
     /// (an undoable removal, or the undo of an undoable add): they keep their
     /// ids, their channels and the colouring by them, which stay on the mesh,
     /// and leave their targets' hooks. The fields on other meshes measured to
-    /// `mesh` are then dropped or lose it as a target, as by
-    /// `drop_fields_of`. Returns the parked fields and the meshes whose
-    /// fields lost `mesh` as a target, each once.
-    ///
-    /// # Errors
-    /// [`SceneError::Store`] when out of memory, before anything changed.
-    pub(crate) fn park_fields_of(&mut self, mesh: MeshId) -> Result<(ParkedFields, Vec<MeshId>)> {
+    /// `mesh` are left to `drop_fields_of`.
+    pub(crate) fn park_fields_of(&mut self, mesh: MeshId) -> ParkedFields {
         let mut parked = ParkedFields::default();
-        let on_mesh = |on: MeshId| on == mesh;
-        parked
-            .fields
-            .try_reserve_exact(self.fields.iter().filter(|f| on_mesh(f.desc.on)).count())
-            .map_err(|_| oom())?;
-        parked
-            .thick
-            .try_reserve_exact(self.thick.iter().filter(|f| on_mesh(f.desc.on)).count())
-            .map_err(|_| oom())?;
-        parked
-            .curv
-            .try_reserve_exact(self.curv.iter().filter(|f| on_mesh(f.desc.on)).count())
-            .map_err(|_| oom())?;
-        // Nothing fails from here on.
         let mut i = 0;
         while i < self.fields.len() {
             if self.fields[i].desc.on != mesh {
@@ -2622,7 +2603,8 @@ impl Scene {
             }
             let f = self.fields.remove(i);
             for &to in &f.desc.to {
-                if let Some(eb) = self.entries.get_mut(to) {
+                // A target may be parked in the same step.
+                if let Some(eb) = self.entries.get_any_mut(to) {
                     eb.hooks.retain(|h| h.field != f.id);
                 }
             }
@@ -2644,40 +2626,11 @@ impl Scene {
                 c += 1;
             }
         }
-        // No field is on the mesh any more: only those measured to it are left.
-        let kept_on = self.drop_fields_of(mesh);
-        Ok((parked, kept_on))
-    }
-
-    /// Makes room for putting `parked` back with [`Scene::unpark_fields`],
-    /// so that it cannot fail: in the registries, and in the hooks of every
-    /// live target.
-    ///
-    /// # Errors
-    /// [`SceneError::Store`] when out of memory, before anything changed.
-    pub(crate) fn reserve_unpark_fields(&mut self, parked: &ParkedFields) -> Result<()> {
-        self.fields
-            .try_reserve(parked.fields.len())
-            .map_err(|_| oom())?;
-        self.thick
-            .try_reserve(parked.thick.len())
-            .map_err(|_| oom())?;
-        self.curv
-            .try_reserve(parked.curv.len())
-            .map_err(|_| oom())?;
-        for f in &parked.fields {
-            for &to in &f.desc.to {
-                if let Some(eb) = self.entries.get_mut(to) {
-                    eb.hooks.try_reserve(1).map_err(|_| oom())?;
-                }
-            }
-        }
-        Ok(())
+        parked
     }
 
     /// Puts the fields of a restored mesh (`mesh`, live again) back, each at
-    /// its place in registration order, after [`Scene::reserve_unpark_fields`].
-    /// A distance field drops the targets that are gone meanwhile, rebuilds
+    /// its place in registration order. A distance field drops the targets that are gone meanwhile, rebuilds
     /// its sign data and is recomputed in full on its next update, since its
     /// targets may have changed while it was parked; a field left without
     /// targets is removed, with its channel and a colouring by it. Thickness
@@ -2776,7 +2729,8 @@ impl Scene {
                     }
                 }
                 let (id, on) = (f.id, f.desc.on);
-                if let Some(e) = self.entries.get_mut(mesh) {
+                // `mesh` may be parked already (`Scene::settle_presence`).
+                if let Some(e) = self.entries.get_any_mut(mesh) {
                     e.hooks.retain(|h| h.field != id);
                 }
                 if !kept_on.contains(&on) {
@@ -2809,7 +2763,8 @@ impl Scene {
     fn detach_field(&mut self, i: usize) {
         let f = self.fields.remove(i);
         for &to in &f.desc.to {
-            if let Some(eb) = self.entries.get_mut(to) {
+            // A target may be parked already (`Scene::settle_presence`).
+            if let Some(eb) = self.entries.get_any_mut(to) {
                 eb.hooks.retain(|h| h.field != f.id);
             }
         }
@@ -7118,7 +7073,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 58] = [
+        let calls: [(&str, Call); 59] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -7128,6 +7083,9 @@ mod tests {
             }),
             ("remove_mesh", |s, x| {
                 s.remove_mesh(x.c).unwrap();
+            }),
+            ("remove_mesh_undoable", |s, x| {
+                s.remove_mesh_undoable(x.c).unwrap();
             }),
             ("edit", |s, x| {
                 s.edit(x.c, |tx| tx.set_positions(&[0], &[[0.0, 0.0, 0.1]]))

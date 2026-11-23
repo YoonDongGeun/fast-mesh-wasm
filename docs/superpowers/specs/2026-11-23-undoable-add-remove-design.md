@@ -36,9 +36,9 @@ stamps, reconstruction) keep their permanent adds for now; migrating them is a f
 ## 3. Keeping a removed mesh
 
 - **Parked, not copied.** A removed mesh's whole `Entry` (store `Mesh` with every channel and UVs,
-  BVH, placement, mode, normals, colouring, its own fields' state, pending BVH changes) moves into
-  a `Parked` slot of the slot map. Moving the struct moves a few pointers; no buffer is copied, no
-  BVH or normals are rebuilt on the way back.
+  BVH, placement, mode, normals, colouring, pending BVH changes) stays in its slot of the slot
+  map, which is flagged as parked: lookups and iteration miss it. No buffer is moved or copied,
+  and no BVH or normals are rebuilt on the way back.
 - **Ids stay stable.** A parked slot keeps its generation and is not on the free list, so no new
   mesh can take it. Restoring flips the slot back to live: the `MeshId` is the one it had. Only
   when the history drops the entry for good is the slot freed (generation bumped, as for
@@ -58,8 +58,13 @@ stamps, reconstruction) keep their permanent adds for now; migrating them is a f
 `Change::Add { id, bytes }` and `Change::Remove { id, bytes }`. Undo of an add and redo of a
 removal park the mesh; redo of an add and undo of a removal restore it. Within a step entries run in
 order, so "add, then fill" undoes as "empty, then park" and redoes as "restore, then fill".
-Parking and restoring make every allocation first and then cannot fail, so the step stays
-all or nothing.
+
+Parking and restoring only flip the slot's flag while the step runs, which cannot fail, so the
+step stays all or nothing. Once the whole step has run, `Scene::settle_presence` brings the
+registries in line: it cuts the links of the newly parked meshes and puts back what the restored
+ones kept, and reports both. A step that fails flips the flags back and never touches a field, a
+section, a collision rule or a report. Eviction that an undo of an open step causes runs after the
+settling (`History::trim`), since it may free a mesh that was just parked.
 
 When the history drops an entry (eviction, a new step dropping redo, `cancel_step`,
 `clear_history`), the side it is on says what it holds:

@@ -122,6 +122,8 @@ mod join;
 mod normals;
 mod placement;
 mod presence;
+#[cfg(test)]
+mod presence_tests;
 mod query;
 mod register;
 mod report;

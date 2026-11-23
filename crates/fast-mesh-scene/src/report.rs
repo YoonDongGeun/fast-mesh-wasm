@@ -132,8 +132,8 @@ impl Report {
     /// The report of a restored mesh for a subscriber that has not taken
     /// its removal yet (`pending`, withdrawn): to that subscriber the mesh
     /// never left, so it is reported fully changed (placement, colours and
-    /// normals included), with the fields, sections and channels the
-    /// removal carried.
+    /// normals included), with the fields, sections and channels the removal
+    /// carried.
     pub(crate) fn restored(pending: MeshChanges) -> Report {
         Report {
             changes: None,

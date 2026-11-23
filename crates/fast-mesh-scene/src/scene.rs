@@ -544,9 +544,9 @@ pub(crate) struct Entry {
     pub(crate) wbox: Option<CachedBox>,
     /// Lazy `O(1)` stroke-start snapshot for sculpt dabs.
     pub(crate) stroke: StrokeSnapshot,
-    /// What the mesh keeps from the scene's registries while it is parked
-    /// (empty while it is live).
-    pub(crate) parked: ParkedLinks,
+    /// What the mesh keeps from the scene's registries while it is parked;
+    /// `None` while it is live (see `Scene::settle_presence`).
+    pub(crate) parked: Option<ParkedLinks>,
 }
 
 impl Entry {
@@ -559,12 +559,7 @@ impl Entry {
             + self.bvh.byte_size()
             + self.normals.as_ref().map_or(0, NormalState::byte_size)
             + self.coloring.as_ref().map_or(0, ColorState::byte_size)
-            + self.parked.fields.byte_size()
-            + self
-                .parked
-                .rest
-                .as_ref()
-                .map_or(0, |r| r.rest_positions.capacity() * 12)
+            + self.parked.as_ref().map_or(0, ParkedLinks::byte_size)
     }
 
     /// Marks the mesh as changed in unknown ways, after a failed recovery:
@@ -1010,7 +1005,7 @@ impl Scene {
             content: 0,
             wbox: None,
             stroke: StrokeSnapshot::default(),
-            parked: ParkedLinks::default(),
+            parked: None,
         })
     }
 
@@ -1142,9 +1137,10 @@ impl Scene {
     /// the consequences described for [`Scene::undo`].
     pub fn cancel_step(&mut self) -> Result<()> {
         self.drop_field_unit();
-        let done = self.with_history(|h, scene| h.cancel(scene));
-        let done = self.after_corrupted(done)?;
+        let reverted = self.history.cancel(&mut self.entries);
+        let (done, step) = self.after_corrupted(reverted)?;
         self.absorb(done);
+        History::discard(&step, &mut self.entries);
         Ok(())
     }
 
@@ -1191,10 +1187,13 @@ impl Scene {
     /// the caller should consider [`Scene::clear_history`].
     pub fn undo(&mut self) -> Result<bool> {
         self.drop_field_unit();
-        let done = self.with_history(|h, scene| h.undo(scene));
+        let done = self.history.undo(&mut self.entries);
         let done = self.after_corrupted(done)?;
         self.invalidate_all_strokes();
-        Ok(done.map(|d| self.absorb(d)).is_some())
+        let undone = done.map(|d| self.absorb(d)).is_some();
+        // Only once the step's meshes are settled: this may free some.
+        self.history.trim(&mut self.entries);
+        Ok(undone)
     }
 
     /// Closes an open step, then redoes the latest undone step: its entries
@@ -1205,7 +1204,7 @@ impl Scene {
     /// As for [`Scene::undo`].
     pub fn redo(&mut self) -> Result<bool> {
         self.drop_field_unit();
-        let done = self.with_history(|h, scene| h.redo(scene));
+        let done = self.history.redo(&mut self.entries);
         let done = self.after_corrupted(done)?;
         self.invalidate_all_strokes();
         Ok(done.map(|d| self.absorb(d)).is_some())
@@ -1247,8 +1246,7 @@ impl Scene {
     ///
     /// An edit of a mesh the same step then parked (the undo of "add, then
     /// fill") still reaches its BVH's pending changes and its normals, so
-    /// that they match the mesh when it is restored. Parking and restoring
-    /// report themselves.
+    /// that they match the mesh when it is restored.
     fn absorb(&mut self, done: Vec<Done>) {
         self.invalidate_all_strokes();
         for d in &done {
@@ -1263,27 +1261,22 @@ impl Scene {
                         e.report_placement();
                     }
                 }
-                Done::Parked(..) | Done::Restored(..) => {}
+                Done::Presence(_) => {}
             }
         }
-        // Placement entries leave the BVHs alone.
+        let mut touched = self.settle_presence(&done);
         for d in &done {
-            if let Done::Edit(id, _) | Done::Restored(id) = d
+            let (Done::Edit(id, _) | Done::Placement(id) | Done::Presence(id)) = d;
+            // Placement entries leave the BVHs alone.
+            if !matches!(d, Done::Placement(_))
                 && let Some(e) = self.entries.get_mut(*id)
             {
                 e.after_change();
             }
-        }
-        let mut touched: Vec<MeshId> = Vec::new();
-        for d in &done {
-            match d {
-                Done::Edit(id, _) | Done::Placement(id) | Done::Restored(id) => touched.push(*id),
-                Done::Parked(kept_on) => touched.extend_from_slice(kept_on),
+            if self.entries.get(*id).is_some() && !touched.contains(id) {
+                touched.push(*id);
             }
         }
-        touched.retain(|&id| self.entries.get(id).is_some());
-        touched.sort_unstable();
-        touched.dedup();
         self.run_eager(Some(&touched));
     }
 

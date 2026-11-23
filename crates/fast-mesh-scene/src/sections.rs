@@ -880,7 +880,8 @@ impl Scene {
             if let Some(k) = s.entries.iter().position(|se| se.mesh == mesh) {
                 s.entries.remove(k);
                 s.desc.meshes.retain(|&m| m != mesh);
-                if let Some(e) = self.entries.get_mut(mesh) {
+                // `mesh` may be parked already (`Scene::settle_presence`).
+                if let Some(e) = self.entries.get_any_mut(mesh) {
                     e.remove_section_hook(s.id);
                     e.report_section(s.id);
                 }
