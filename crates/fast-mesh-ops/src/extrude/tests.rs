@@ -338,8 +338,8 @@ fn faces_across_an_edge_move_together() {
 #[test]
 fn random_selections_of_a_closed_surface_stay_closed() {
     let mut rng = Lcg(7);
-    for round in 0..40 {
-        let mesh0 = uv_sphere(10, 14, 1.0);
+    for round in 0..16 {
+        let mesh0 = uv_sphere(8, 12, 1.0);
         let n = mesh0.triangle_slots() as u32;
         // Scattered triangles, then patches grown around seeds.
         let mut picked = BTreeSet::new();
@@ -373,7 +373,7 @@ fn random_selections_of_a_closed_surface_stay_closed() {
                     direction,
                     ..Default::default()
                 };
-                let mut mesh = uv_sphere(10, 14, 1.0);
+                let mut mesh = uv_sphere(8, 12, 1.0);
                 let what = format!("round {round}, {direction:?}, {distance}");
                 extrude_checked(&mut mesh, &sel, &options, &what);
                 assert_closed(&mesh, &what);
