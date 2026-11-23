@@ -431,6 +431,12 @@ describe("object overlays in the viewport (#257)", () => {
       await frame();
       await frame();
       whole();
+      // And where it was, when nothing moved meanwhile.
+      await render("hidden");
+      await frame();
+      await render("visible");
+      await frame();
+      whole();
       expect(app.getSnapshot().objectInfo.showBox).toBe(true);
     });
   }

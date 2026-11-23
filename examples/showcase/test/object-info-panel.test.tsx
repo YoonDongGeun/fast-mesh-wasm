@@ -4,7 +4,7 @@
 // the world/local toggle; a placement move, an edit and their undo refresh
 // it once they settle; a collapsed box reads nothing; the overlay controls
 // set the app state; the quality report downloads with the shown map's
-// readouts; and the angle readout in the inspect panel.
+// readouts; and the angle tool's clicks and its readout in the inspect panel.
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -22,8 +22,15 @@ import { AppState } from "../src/app/state/app-state";
 import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
 import { ObjectInfoBox } from "../src/features/inspect/ui/ObjectInfoBox";
 import { inspectMapProbe } from "../src/features/inspect/ux/use-inspect-maps";
-import { OBJECT_INFO_REFRESH_MS, objectInfoProbe } from "../src/features/inspect/ux/use-object-info";
+import {
+  LARGE_MEASURE_DELAY_MS,
+  LARGE_MESH_TRIANGLES,
+  OBJECT_INFO_REFRESH_MS,
+  objectInfoProbe,
+} from "../src/features/inspect/ux/use-object-info";
 import { formatArea, formatLength, formatPoint, formatVolume } from "../src/shared/ux/units";
+import { useMeshClick } from "../src/viewport/ux/use-selection-clicks";
+import { view } from "../src/viewport/ux/view";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -250,6 +257,95 @@ describe("object info box (#257)", () => {
     expect(host.textContent).toContain("Select a mesh");
   });
 
+  it("keeps the topology through moved vertices, and waits for a held stroke", async () => {
+    const { scene, store, app, a } = setup();
+    const host = mount(app, store, scene);
+    await settle(20);
+    const builds = objectInfoProbe.topologyBuilds;
+    const edit = async (x: number) => {
+      await act(async () => {
+        scene.edit(a.mesh, [{ op: "setPositions", vertices: [7], positions: Float64Array.from([x, 2, 1]) }]);
+        store.commitFrame();
+      });
+    };
+    await edit(8);
+    await settle();
+    expect(value(host, "max")).toBe(formatPoint([8, 2, 1], "mm"));
+    expect(objectInfoProbe.topologyBuilds).toBe(builds);
+    // Removed triangles change the counts: built again.
+    await act(async () => {
+      scene.edit(a.mesh, [{ op: "removeTriangles", triangles: [0, 1] }]);
+      store.commitFrame();
+    });
+    await settle();
+    expect(value(host, "triangles")).toBe("10");
+    expect(value(host, "volume")).toBe("none (open mesh)");
+    expect(objectInfoProbe.topologyBuilds).toBe(builds + 1);
+
+    view.stroking = true;
+    try {
+      await edit(9);
+      await settle(3 * OBJECT_INFO_REFRESH_MS);
+      expect(value(host, "max")).toBe(formatPoint([8, 2, 1], "mm"));
+    } finally {
+      view.stroking = false;
+    }
+    await settle();
+    expect(value(host, "max")).toBe(formatPoint([9, 2, 1], "mm"));
+  });
+
+  it("on a large mesh waits for the brush to be put down, and measures after a longer rest", async () => {
+    const { scene, store, app } = setup();
+    // A flat grid just past the limit.
+    const n = Math.ceil(Math.sqrt(LARGE_MESH_TRIANGLES / 2)) + 1;
+    const positions = new Float64Array((n + 1) * (n + 1) * 3);
+    const indices = new Uint32Array(n * n * 6);
+    for (let j = 0, k = 0; j <= n; j++) {
+      for (let i = 0; i <= n; i++, k++) {
+        positions.set([i, j, 0], 3 * k);
+        if (i < n && j < n) {
+          indices.set([k, k + 1, k + n + 2, k, k + n + 2, k + n + 1], 6 * (j * n + i));
+        }
+      }
+    }
+    const big = app.addMesh(store, { name: "big", positions, indices, center: [n / 2, n / 2, 0], radius: n, volumeId: null, preset: null });
+    store.select(big.mesh);
+    store.commitFrame();
+    const host = mount(app, store, scene);
+    await settle(20);
+    // The buffers' numbers are there at once, the measurement after the rest.
+    expect(value(host, "triangles")).toBe((2 * n * n).toLocaleString("en"));
+    expect(value(host, "components")).toBe("1");
+    expect(value(host, "area")).toBe("measuring…");
+    expect(q(host, "[data-object-info]").getAttribute("aria-busy")).toBe("true");
+    await settle(LARGE_MEASURE_DELAY_MS + 300);
+    expect(value(host, "area")).toBe(formatArea(scene.inspect.measure(big.mesh).area, "mm"));
+    expect(q(host, "[data-object-info]").getAttribute("aria-busy")).toBe("false");
+
+    // A brush in hand: the stroke's change waits, and the box says so.
+    const measured = value(host, "area");
+    const refreshes = objectInfoProbe.refreshes;
+    await act(async () => app.setMaskPaint(true));
+    expect(host.textContent).toContain("once the brush is put down");
+    await act(async () => {
+      scene.edit(big.mesh, [{ op: "setPositions", vertices: [0], positions: Float64Array.from([-50, 0, 0]) }]);
+      store.commitFrame();
+    });
+    await settle(LARGE_MEASURE_DELAY_MS + 300);
+    expect(value(host, "min")).toBe(formatPoint([0, 0, 0], "mm"));
+    expect(objectInfoProbe.refreshes).toBe(refreshes);
+    await act(async () => app.setMaskPaint(false));
+    await settle();
+    expect(value(host, "min")).toBe(formatPoint([-50, 0, 0], "mm"));
+    // Until it is measured again the last area shows, dimmed.
+    expect(value(host, "area")).toBe(measured);
+    expect(q(host, '[data-info="area"]').className).toBe("stale");
+    await settle(LARGE_MEASURE_DELAY_MS + 300);
+    expect(q(host, '[data-info="area"]').className).toBe("");
+    expect(objectInfoProbe.info?.area).toBe(scene.inspect.measure(big.mesh).area);
+    expect(host.textContent).not.toContain("once the brush is put down");
+  }, 20_000);
+
   it("drives the bounding box and normals overlays through the app state", async () => {
     const { scene, store, app } = setup();
     const host = mount(app, store, scene);
@@ -320,6 +416,68 @@ describe("object info box (#257)", () => {
     const html = await blobs[1].text();
     expect(html).toContain("<h2>Inspect map</h2>");
     expect(blobs[1].type).toBe("text/html");
+  });
+
+  it("the angle tool's clicks snap to vertices in the world, never select, and a fourth starts again", async () => {
+    const { scene, store, app, a } = setup();
+    const host = document.createElement("div");
+    const root: Root = createRoot(host);
+    cleanups.push(() => act(() => root.unmount()));
+    const onPick = vi.fn();
+    let onClick: ReturnType<typeof useMeshClick> | null = null;
+    function Clicker(props: { tool: "angle" | null }) {
+      onClick = useMeshClick({
+        app,
+        mesh: a.mesh,
+        scene,
+        tool: props.tool,
+        picking: false,
+        sculpted: false,
+        suppressClick: false,
+        onPick,
+        onPickPoint: () => {},
+      });
+      return null;
+    }
+    const show = (tool: "angle" | null) => act(() => root.render(<Clicker tool={tool} />));
+    /** A click looking down at the top face, at world `x, y`. */
+    const clickAt = async (x: number, y: number) => {
+      await act(async () => {
+        onClick!({
+          stopPropagation() {},
+          delta: 0,
+          nativeEvent: { shiftKey: false },
+          ray: { origin: { x, y, z: 50 }, direction: { x: 0, y: 0, z: -1 } },
+        } as never);
+        await new Promise((r) => setTimeout(r, 0));
+      });
+    };
+    // Moved, so the points must be in the world, not the mesh's frame.
+    store.setPlacement(a.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [10, 0, 0] });
+    store.commitFrame();
+    show("angle");
+    await clickAt(13.9, 0.05);
+    await clickAt(10.1, 0.02);
+    await clickAt(10.05, 1.95);
+    expect(app.getSnapshot().objectInfo.angle).toEqual([
+      [14, 0, 1],
+      [10, 0, 1],
+      [10, 2, 1],
+    ]);
+    // A miss changes nothing; a fourth click starts a new angle.
+    await clickAt(99, 99);
+    expect(app.getSnapshot().objectInfo.angle).toHaveLength(3);
+    await clickAt(13.9, 1.95);
+    expect(app.getSnapshot().objectInfo.angle).toEqual([[14, 2, 1]]);
+    expect(onPick).not.toHaveBeenCalled();
+    // Undoing the move leaves the picked point where it is.
+    store.undo();
+    store.commitFrame();
+    expect(app.getSnapshot().objectInfo.angle).toEqual([[14, 2, 1]]);
+    // Disarmed, a click selects as before.
+    show(null);
+    await clickAt(1, 1);
+    expect(onPick).toHaveBeenCalledTimes(1);
   });
 
   it("reads the angle out in the inspect panel", async () => {
