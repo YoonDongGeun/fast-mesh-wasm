@@ -738,6 +738,41 @@ fn a_rim_with_straight_runs_caps_exactly() {
 }
 
 #[test]
+fn a_tilted_base_is_as_good_as_a_level_one() {
+    // Nothing is axis-aligned, so the base positions are rounded off their
+    // plane; the cap must not be reported as crossing itself for that.
+    let rotate = |q: [f64; 3]| -> [f64; 3] {
+        let (a, b) = (0.7f64, -0.4f64);
+        let x = a.cos() * q[0] - a.sin() * q[1];
+        let y = a.sin() * q[0] + a.cos() * q[1];
+        [
+            x,
+            b.cos() * y - b.sin() * q[2],
+            b.sin() * y + b.cos() * q[2],
+        ]
+    };
+    for refine in [true, false] {
+        let (p, t) = parts(&grid(30));
+        let flat: Vec<f32> = p
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|q| rotate(q.map(f64::from)).map(|c| c as f32))
+            .collect();
+        let mut mesh = mesh_of(&flat, &t);
+        let way = rotate([0.0, 0.0, -1.0]);
+        let options = ExtrudeBaseOptions {
+            refine,
+            ..ExtrudeBaseOptions::along(way, BaseLevel::Beyond(3.0))
+        };
+        let r = edit(&mut mesh, |tx| extrude_base(tx, &options)).0;
+        assert_closed(&mesh, "tilted");
+        assert!((volume(&mesh) - 2700.0).abs() < 0.05, "{}", volume(&mesh));
+        assert_eq!(r.self_intersections, Some(vec![]));
+    }
+}
+
+#[test]
 fn the_normal_may_have_any_length() {
     // Levels are measured along the normal as given: half as far here.
     let mut mesh = grid(4);

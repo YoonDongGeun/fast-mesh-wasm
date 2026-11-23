@@ -1,12 +1,16 @@
 //! The self-intersection check of a planned extrusion, run before writing.
 
+use std::ops::Range;
+
 use fast_mesh_bvh::{Aabb, BuildOptions, Bvh, NodeKind};
-use fast_mesh_query::{Rigid, intersecting_pairs, self_intersecting_pairs};
+use fast_mesh_query::self_intersecting_pairs_where;
 use fast_mesh_store::{Mesh, TriangleId, VertexId};
 use robust::{Coord, orient2d};
 
 use crate::topology::{dot, proper_triangle, sub};
-use crate::{Result, push, reserve};
+use crate::{Result, filled, push, reserve};
+
+const NONE: u32 = u32::MAX;
 
 /// Two triangles on one edge count as folded onto each other when the angle
 /// between them has a cosine above this: less than about 1e-3 radians.
@@ -28,6 +32,9 @@ pub(crate) struct Planned<'a> {
     /// Existing triangles that `triangles` replace, ascending: left out of
     /// the check, since they will not exist as they are.
     pub(crate) replaced: &'a [TriangleId],
+    /// Ranges of `triangles` that each tile a planar polygon, so that the
+    /// triangles of one range need no check among themselves.
+    pub(crate) tiles: &'a [Range<usize>],
 }
 
 /// What [`intersections`] found: the planned triangles (indices into
@@ -66,19 +73,6 @@ impl Found {
     }
 }
 
-/// Whether the three corners are collinear (or coincide), decided exactly:
-/// all three axis projections have zero orientation.
-fn collinear(p: [[f32; 3]; 3]) -> bool {
-    (0..3).all(|k| {
-        let (x, y) = ((k + 1) % 3, (k + 2) % 3);
-        let c = |q: [f32; 3]| Coord {
-            x: f64::from(q[x]),
-            y: f64::from(q[y]),
-        };
-        orient2d(c(p[0]), c(p[1]), c(p[2])) == 0.0
-    })
-}
-
 /// The triangles that would intersect after the write, with at least one
 /// planned triangle in every pair:
 ///
@@ -89,14 +83,16 @@ fn collinear(p: [[f32; 3]; 3]) -> bool {
 ///   [`FOLD_COS`]), which that test leaves out: a wall pushed straight back
 ///   along the face next to it, say.
 ///
-/// The planned triangles go into a small mesh of their own; the existing
-/// triangles whose boxes touch one of theirs into another, and the two are
-/// searched against each other and the first against itself. So the cost
-/// follows the size of the changed region, not of the mesh, past one scan
-/// of the mesh's triangle boxes.
+/// Pairs within one of [`Planned::tiles`] are left out.
+///
+/// The search runs on a mesh of the planned triangles and the existing ones
+/// whose boxes touch one of theirs, so past one scan of the mesh's triangle
+/// boxes its cost follows the size of the changed region.
 ///
 /// # Errors
 /// [`OpsError::Store`](crate::OpsError::Store) when memory runs out.
+///
+/// [`self_intersecting_pairs`]: fast_mesh_query::self_intersecting_pairs
 pub(crate) fn intersections(p: &Planned) -> Result<Found> {
     let mut found = Found::default();
     if p.triangles.is_empty() {
@@ -113,20 +109,42 @@ pub(crate) fn intersections(p: &Planned) -> Result<Found> {
             mesh.positions()[v as usize]
         }
     };
-    let planned = local_mesh(p.triangles, position)?;
-    let planned_bvh = Bvh::build(&planned, &BuildOptions::default())?;
-    let mut pairs: Vec<(TriangleId, TriangleId)> = Vec::new();
-    self_intersecting_pairs(&planned, &planned_bvh, &mut pairs)?;
-    reserve(&mut found.planned, 2 * pairs.len())?;
-    found
-        .planned
-        .extend(pairs.iter().flat_map(|&(a, b)| [a, b]));
-
-    let near = near(p, &planned, &planned_bvh)?;
-    if !near.is_empty() {
-        crossings(p, &near, &planned, &planned_bvh, &mut found)?;
+    let near = near(p, position)?;
+    // The planned triangles, then the ones near them.
+    let ours = p.triangles.len();
+    let mut triangles: Vec<[VertexId; 3]> = Vec::new();
+    reserve(&mut triangles, ours + near.len())?;
+    triangles.extend_from_slice(p.triangles);
+    triangles.extend(near.iter().map(|&t| mesh.triangles()[t as usize]));
+    let mut tile = filled(ours, NONE)?;
+    for (i, range) in p.tiles.iter().enumerate() {
+        tile[range.clone()].fill(i as u32);
     }
-    folds(p, &near, position, &mut found)?;
+    let keep = |a: TriangleId, b: TriangleId| {
+        let of = |t: TriangleId| tile.get(t as usize).copied();
+        match (of(a), of(b)) {
+            (None, None) => false,
+            (Some(x), Some(y)) => x == NONE || x != y,
+            _ => true,
+        }
+    };
+    let mut note = |t: TriangleId| match (t as usize).checked_sub(ours) {
+        Some(i) => push(&mut found.existing, near[i]),
+        None => push(&mut found.planned, t),
+    };
+
+    let around = local_mesh(&triangles, position)?;
+    let bvh = Bvh::build(&around, &BuildOptions::default())?;
+    let mut pairs: Vec<(TriangleId, TriangleId)> = Vec::new();
+    self_intersecting_pairs_where(&around, &bvh, keep, &mut pairs)?;
+    for &(a, b) in &pairs {
+        note(a)?;
+        note(b)?;
+    }
+    folds(&triangles, keep, position, |a, b| {
+        note(a)?;
+        note(b)
+    })?;
     Ok(found.finish())
 }
 
@@ -152,13 +170,15 @@ fn local_mesh(
 
 /// The existing triangles, not replaced, whose box touches the box of a
 /// planned one, ascending.
-fn near(p: &Planned, planned: &Mesh, planned_bvh: &Bvh) -> Result<Vec<TriangleId>> {
+fn near(p: &Planned, position: impl Fn(VertexId) -> [f32; 3]) -> Result<Vec<TriangleId>> {
+    let planned = local_mesh(p.triangles, position)?;
+    let bvh = Bvh::build(&planned, &BuildOptions::default())?;
     let mesh = p.mesh;
     let mut near: Vec<TriangleId> = Vec::new();
-    let Some(root) = planned_bvh.root() else {
+    let Some(root) = bvh.root() else {
         return Ok(near);
     };
-    let reach = planned_bvh.node(root).bounds;
+    let reach = bvh.node(root).bounds;
     let mut replaced = p.replaced.iter().copied().peekable();
     for t in 0..mesh.triangle_slots() as TriangleId {
         if replaced.next_if_eq(&t).is_some() {
@@ -172,7 +192,7 @@ fn near(p: &Planned, planned: &Mesh, planned_bvh: &Bvh) -> Result<Vec<TriangleId
             continue;
         }
         let mut hit = false;
-        planned_bvh.traverse(|_, node| {
+        bvh.traverse(|_, node| {
             if hit || !node.bounds.overlaps(&bounds) {
                 return false;
             }
@@ -191,61 +211,18 @@ fn near(p: &Planned, planned: &Mesh, planned_bvh: &Bvh) -> Result<Vec<TriangleId
     Ok(near)
 }
 
-/// Appends the pairs of a planned triangle and one of `near` that intersect
-/// and share no vertex.
-fn crossings(
-    p: &Planned,
-    near: &[TriangleId],
-    planned: &Mesh,
-    planned_bvh: &Bvh,
-    found: &mut Found,
-) -> Result<()> {
-    let mesh = p.mesh;
-    let mut tris: Vec<[VertexId; 3]> = Vec::new();
-    reserve(&mut tris, near.len())?;
-    tris.extend(near.iter().map(|&t| mesh.triangles()[t as usize]));
-    let existing = local_mesh(&tris, |v| mesh.positions()[v as usize])?;
-    let existing_bvh = Bvh::build(&existing, &BuildOptions::default())?;
-    let mut pairs: Vec<(TriangleId, TriangleId)> = Vec::new();
-    intersecting_pairs(
-        planned,
-        planned_bvh,
-        &existing,
-        &existing_bvh,
-        &Rigid::IDENTITY,
-        &mut pairs,
-    )?;
-    let corners =
-        |m: &Mesh, t: TriangleId| m.triangles()[t as usize].map(|v| m.positions()[v as usize]);
-    for &(a, b) in &pairs {
-        let (ours, theirs) = (p.triangles[a as usize], tris[b as usize]);
-        if ours.iter().any(|v| theirs.contains(v))
-            || collinear(corners(planned, a))
-            || collinear(corners(&existing, b))
-        {
-            continue;
-        }
-        push(&mut found.planned, a)?;
-        push(&mut found.existing, near[b as usize])?;
-    }
-    Ok(())
-}
-
-/// Appends the pairs of triangles on one edge that fold flat onto each
-/// other: planned ones, or a planned one and one of `near`.
+/// Calls `fold` on every pair of `triangles` that `keep` accepts, shares an
+/// edge and folds flat onto each other.
 fn folds(
-    p: &Planned,
-    near: &[TriangleId],
+    triangles: &[[VertexId; 3]],
+    keep: impl Fn(TriangleId, TriangleId) -> bool,
     position: impl Fn(VertexId) -> [f32; 3],
-    found: &mut Found,
+    mut fold: impl FnMut(TriangleId, TriangleId) -> Result<()>,
 ) -> Result<()> {
-    let ours = p.triangles.len() as u32;
-    // Every edge with the triangle on it (`near` past the planned ones) and
-    // the vertex across it, grouped by edge, planned triangles first.
+    // Every edge with the triangle on it and the vertex across it, by edge.
     let mut uses: Vec<([VertexId; 2], u32, VertexId)> = Vec::new();
-    reserve(&mut uses, 3 * (p.triangles.len() + near.len()))?;
-    let theirs = near.iter().map(|&t| p.mesh.triangles()[t as usize]);
-    for (i, tri) in p.triangles.iter().copied().chain(theirs).enumerate() {
+    reserve(&mut uses, 3 * triangles.len())?;
+    for (i, tri) in triangles.iter().enumerate() {
         for k in 0..3 {
             let (a, b, apex) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
             uses.push(([a.min(b), a.max(b)], i as u32, apex));
@@ -256,18 +233,9 @@ fn folds(
         let [from, to] = group[0].0;
         let corners = |apex: VertexId| [from, to, apex].map(&position);
         for (i, &(_, a, apex)) in group.iter().enumerate() {
-            if a >= ours {
-                break;
-            }
             for &(_, b, other) in &group[i + 1..] {
-                if !folded(corners(apex), corners(other)) {
-                    continue;
-                }
-                push(&mut found.planned, a)?;
-                if b < ours {
-                    push(&mut found.planned, b)?;
-                } else {
-                    push(&mut found.existing, near[(b - ours) as usize])?;
+                if keep(a, b) && folded(corners(apex), corners(other)) {
+                    fold(a, b)?;
                 }
             }
         }
@@ -291,4 +259,17 @@ fn folded(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> bool {
     };
     let (pa, pb) = (across(a[2]), across(b[2]));
     dot(pa, pb) > FOLD_COS * (dot(pa, pa) * dot(pb, pb)).sqrt()
+}
+
+/// Whether the three corners are collinear (or coincide), decided exactly:
+/// all three axis projections have zero orientation.
+fn collinear(p: [[f32; 3]; 3]) -> bool {
+    (0..3).all(|k| {
+        let (x, y) = ((k + 1) % 3, (k + 2) % 3);
+        let c = |q: [f32; 3]| Coord {
+            x: f64::from(q[x]),
+            y: f64::from(q[y]),
+        };
+        orient2d(c(p[0]), c(p[1]), c(p[2])) == 0.0
+    })
 }

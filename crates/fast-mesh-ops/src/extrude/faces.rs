@@ -483,6 +483,7 @@ fn plan(mesh: &Mesh, triangles: &[TriangleId], o: &ExtrudeFacesOptions) -> Resul
             added: &added,
             triangles: &planned,
             replaced: &sel,
+            tiles: &[],
         })?)
     } else {
         None
