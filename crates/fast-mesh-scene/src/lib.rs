@@ -34,6 +34,9 @@
 //!   keeps sharp features, and [`Scene::delaunay_flips`] improves triangles
 //!   without moving a vertex; on a whole mesh or a face region, each one undo
 //!   step.
+//! - Wraps: [`Scene::wrap`] adds a closed, manifold envelope around meshes,
+//!   gaps and holes below a size closed, as a new mesh filled as one undo
+//!   step; [`Scene::wrap_plan`] reports its voxel grid first.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -119,6 +122,7 @@ mod sections;
 #[cfg(test)]
 mod uv_tests;
 mod wave6_ops;
+mod wrap;
 
 pub use boolean::{BooleanMethod, BooleanOp, BooleanOptions, BooleanReport, CsgNode};
 pub use contacts::{
@@ -161,3 +165,4 @@ pub use scene::{MeshBuild, MeshOptions, Scene, SceneOptions, UpdateMode};
 pub use sculpt::{Dab, DabReport};
 pub use sections::{Gap, SectionContour, SectionDesc, SectionResult, SectionStatus};
 pub use wave6_ops::Vec3;
+pub use wrap::SceneWrapReport;

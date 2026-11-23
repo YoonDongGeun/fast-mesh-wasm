@@ -44,6 +44,7 @@ use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
 mod denoise;
 mod hull;
+mod wrap;
 
 /// A scene of editable meshes with render buffers and change records.
 #[wasm_bindgen]
