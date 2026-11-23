@@ -518,6 +518,10 @@ input[type="range"] {
 .modes button {
   flex: 1;
 }
+/* Five tools: the row wraps in a narrow column. */
+.modes[aria-label="Inspection tool"] {
+  flex-wrap: wrap;
+}
 .members {
   list-style: none;
   margin: 6px 0;
