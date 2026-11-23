@@ -1902,7 +1902,6 @@ try {
   const strokeAt = await hook(`screenPoint(${q(A)})`);
   const shapeOf = `__showcase.positions(${q(A)}).join()`;
   const shapeBefore = await page(shapeOf);
-  const undoBefore = await hook("status().canUndo");
   await mouse("mouseMoved", strokeAt.x, strokeAt.y, { button: "none" });
   await mouse("mousePressed", strokeAt.x, strokeAt.y, { buttons: 1 });
   for (let i = 1; i <= 30; i++) {
@@ -1915,8 +1914,9 @@ try {
   const shapeChanged = (await page(shapeOf)) !== shapeBefore;
   const changed = edited === undefined ? null : await page(`(async () => __diff(await __before, await __pixels(${srcOf})))()`);
   await clickOn('[data-action="sculpt-tool-inflate"]');
-  // Live remeshing splits a stroke into several undo steps: back to the start.
-  for (let i = 0; i < 200 && (await hook("status().canUndo")); i++) {
+  // Live remeshing splits a stroke into several undo steps: back to the shape
+  // before it (removing the other meshes above is undoable too, so not further).
+  for (let i = 0; i < 200 && (await page(shapeOf)) !== shapeBefore; i++) {
     await clickOn("[data-action=undo]");
     await sleep(20);
   }
@@ -1925,7 +1925,7 @@ try {
   const restored = await page(pictureDiff);
   verdict(
     "previews-edit",
-    shapeChanged && !undoBefore && during.starts === settled.starts && changed !== null && changed > 0.05 && restored < 1,
+    shapeChanged && during.starts === settled.starts && changed !== null && changed > 0.05 && restored < 1,
     `shape changed ${shapeChanged}; ${during.starts - settled.starts} redraw(s) started during the stroke; picture changed by ${fmt(changed ?? NaN)} after it, ${fmt(restored ?? NaN)} from the original after Undo`,
   );
 

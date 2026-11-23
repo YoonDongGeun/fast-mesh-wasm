@@ -147,11 +147,11 @@ describe("Text dialog", () => {
     expect(m.closed).toBe(true);
     expect(m.orientationConflicts).toBe(0);
     expect(m.volume).toBeGreaterThan(0);
-    // One undo step.
+    // One undo step: undo removes the mesh and its row.
     expect(scene.canUndo()).toBe(true);
     await act(async () => store.undo());
     expect(scene.canUndo()).toBe(false);
-    expect(scene.inspect.measure(item.mesh).area).toBe(0);
+    expect(scene.has(item.mesh)).toBe(false);
   });
 
   it("arms Place Mesh with the text to emboss or engrave it, from the Mesh Edit shelf", async () => {

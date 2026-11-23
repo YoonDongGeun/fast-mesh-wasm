@@ -526,9 +526,10 @@ export interface BatchBooleanRunResult {
 
 /**
  * Runs `work` inside one history step: committed when it settles, reverted
- * when it throws (the meshes it added or removed leave or rejoin the list).
+ * when it throws (the meshes it added or removed leave or rejoin the list;
+ * `app` is null for work that adds and removes none).
  */
-async function inOneStep<T>(store: SceneStore, app: AppState, work: () => Promise<T>): Promise<T> {
+async function inOneStep<T>(store: SceneStore, app: AppState | null, work: () => Promise<T>): Promise<T> {
   store.beginStep();
   try {
     const value = await work();
@@ -536,7 +537,7 @@ async function inOneStep<T>(store: SceneStore, app: AppState, work: () => Promis
     return value;
   } catch (err) {
     store.cancelStep();
-    app.syncMeshes(store);
+    app?.syncMeshes(store);
     throw err;
   }
 }
@@ -900,7 +901,7 @@ export async function runLandmarkAlign(params: {
 }): Promise<LandmarkAlignment> {
   const { store, moving, fixed, pairs, allowScaling } = params;
   const align = alignDomain(store);
-  return inOneStep(store, async () => await align.alignByLandmarks(moving, fixed, pairs, allowScaling));
+  return inOneStep(store, null, async () => await align.alignByLandmarks(moving, fixed, pairs, allowScaling));
 }
 
 /** Both stages of a coarse + ICP run (#253). */
@@ -928,7 +929,7 @@ export async function runMultistageAlign(params: {
   const { store, moving, fixed, coarseMethod, objective, maxIterations, overlap, maxDistance } = params;
   const align = alignDomain(store);
   const shared = { objective, overlap, ...(maxDistance !== undefined && maxDistance > 0 ? { maxDistance } : {}) };
-  return inOneStep(store, async () => {
+  return inOneStep(store, null, async () => {
     const coarse = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod, maxIterations: 0 });
     const fine = await align.registerMultistage(moving, fixed, { ...shared, coarseMethod: "none", maxIterations });
     return { coarse, fine };
