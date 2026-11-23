@@ -19,8 +19,11 @@ const FIXED_COLOR = 0x38bdf8;
 const PLANE_COLOR = 0x22d3ee;
 const NOOP_RAYCAST = () => {};
 
-/** Copies the mesh's current world matrix (the drawn one while it is bound) into `out`; false when it is gone. */
+/** Copies the mesh's current world matrix (the drawn one while it is bound) into `out`; false when it is hidden or gone. */
 function meshMatrix(store: SceneStore, mesh: MeshHandle, out: THREE.Matrix4): boolean {
+  if (store.getSnapshot().meshes.get(mesh)?.desired.visible === false) {
+    return false;
+  }
   const bound = view.bindings.get(mesh)?.object;
   if (bound !== undefined) {
     out.copy(bound.matrixWorld);
@@ -128,7 +131,7 @@ function LandmarkMarkers(props: { set: LandmarkSet; items: readonly Item[]; stor
           const sprite = new THREE.Sprite(material);
           // Up and to the right of the point, so the point itself stays in view.
           sprite.center.set(-0.15, -0.15);
-          sprite.scale.setScalar(size * 8);
+          sprite.scale.setScalar(size * 6);
           sprite.renderOrder = 13;
           sprite.raycast = NOOP_RAYCAST;
           marker.add(sprite);

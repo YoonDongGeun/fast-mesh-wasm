@@ -87,6 +87,56 @@ export function landmarkPrompt(set: LandmarkSet, movingName: string, fixedName: 
     : `Pair ${pair}: click the matching point on the fixed mesh (${fixedName}).`;
 }
 
+/**
+ * Whether `points` lie on one line, or nearly: none is farther from the line
+ * through the two ends than `tolerance` times its length.
+ */
+export function pointsOnALine(points: readonly Readonly<Vec3>[], tolerance = 0.01): boolean {
+  if (points.length < 3) {
+    return true;
+  }
+  const farthest = (from: Readonly<Vec3>): Readonly<Vec3> => {
+    let best = from;
+    let far = -1;
+    for (const p of points) {
+      const d = Math.hypot(...sub(p, from));
+      if (d > far) {
+        far = d;
+        best = p;
+      }
+    }
+    return best;
+  };
+  const a = farthest(points[0]);
+  const b = farthest(a);
+  const along = unit(sub(b, a));
+  if (along === null) {
+    return true; // one spot, picked again and again
+  }
+  const length = Math.hypot(...sub(b, a));
+  return points.every((p) => Math.hypot(...cross(sub(p, a), along)) <= tolerance * length);
+}
+
+/**
+ * Why the complete pairs cannot fix a pose, or `null`: points on a line leave
+ * the turn about it open, and the fit's RMSE is 0 whichever turn it takes.
+ */
+export function landmarksProblem(set: LandmarkSet): string | null {
+  const n = completePairs(set);
+  if (n < MIN_LANDMARK_PAIRS) {
+    return null;
+  }
+  for (const [side, points] of [
+    ["moving", set.movingPoints],
+    ["fixed", set.fixedPoints],
+  ] as const) {
+    if (pointsOnALine(points.slice(0, n))) {
+      return `The points on the ${side} mesh lie on a line, so the turn about it is open. Add a pair off the line.`;
+    }
+  }
+  return null;
+}
+
 /** The complete pairs as world points, through each mesh's column-major world matrix. */
 export function landmarkPairs(
   set: LandmarkSet,
@@ -163,6 +213,28 @@ export function multistageStages(
     { label: `Coarse (${label.toLowerCase()})`, iterations: 0, rmse: coarse.finalRmse, status: null },
     { label: "ICP", iterations: fine.iterations, rmse: fine.finalRmse, status: fine.status },
   ];
+}
+
+/** What to check after a coarse + ICP run, or `null` when the ICP converged. */
+export function multistageWarning(
+  coarse: Pick<RegistrationReport, "finalRmse">,
+  fine: Pick<RegistrationReport, "finalRmse" | "status">,
+): string | null {
+  if (!Number.isFinite(coarse.finalRmse) && !Number.isFinite(fine.finalRmse)) {
+    return "No point of the moving mesh is within reach of the fixed one, so nothing moved.";
+  }
+  switch (fine.status) {
+    case "converged":
+      return null;
+    case "maxIterations":
+      return "The ICP reached the iteration limit before it settled.";
+    case "underconstrained":
+      return "The shapes do not determine the pose: the mesh may slide or spin with the same fit.";
+    case "tooFewCorrespondences":
+      return "Too few points are within reach: the pose is arbitrary, whatever its RMSE.";
+    case "diverged":
+      return "The ICP diverged.";
+  }
 }
 
 // ---- Symmetry plane ----

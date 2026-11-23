@@ -1825,6 +1825,10 @@ input[type="range"] {
   flex-basis: 100%;
 }
 
+.align-panel .report .error {
+  color: var(--error);
+}
+
 .align-panel .align-residuals {
   margin: 4px 0 0;
   padding-left: 20px;

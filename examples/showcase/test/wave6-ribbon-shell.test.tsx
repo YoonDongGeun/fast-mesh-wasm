@@ -205,6 +205,8 @@ describe("Wave 6 Ribbon, Shell Slot Routing, CommandPalette & Lazy Wasm Safety",
     });
     expect(container.querySelector('[data-ribbon-focus="points"]')).not.toBeNull();
     expect(container.querySelector('[data-ribbon-focus="collision-rules"]')).not.toBeNull();
+    expect(container.querySelector('[data-ribbon-focus="coarse-icp"]')).not.toBeNull();
+    expect(container.querySelector('[data-ribbon-focus="symmetry-plane"]')).not.toBeNull();
 
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[data-ribbon-tab="inspect"]')!.click();

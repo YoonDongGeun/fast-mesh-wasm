@@ -31,6 +31,7 @@ export function AlignPanel(props: { app: AppState }) {
   const indexOf = (mesh: unknown) => items.findIndex((i) => i.mesh === mesh);
   const set = marks.set;
   const picking = set?.picking === true;
+  const movingLocked = items.some((i) => i.mesh === resolvedMoving && i.locked);
 
   /** Starts picking pairs, pinning the moving and fixed meshes so a selection change keeps them. */
   const pickPairs = () => {
@@ -192,7 +193,7 @@ export function AlignPanel(props: { app: AppState }) {
             <button
               type="button"
               data-align-action="multistage-run"
-              disabled={!multi.canRun || anyBusy}
+              disabled={!multi.canRun || anyBusy || movingLocked}
               title="Pre-align by the meshes' shapes, then refine with ICP (the ICP options above), as one undo step"
               onClick={() => void multi.run()}
             >
@@ -203,19 +204,20 @@ export function AlignPanel(props: { app: AppState }) {
                 {multi.error}
               </p>
             ) : null}
-            {multi.stages !== null ? (
-              <div className="report align-report" data-align-multistage-report>
-                <dl>
-                  {multi.stages.map((s) => (
-                    <div key={s.label} style={{ display: "contents" }} data-align-stage={s.status === null ? "coarse" : "icp"}>
-                      <dt>{s.label}</dt>
-                      <dd>
-                        RMSE <span data-align-stage-rmse>{length(s.rmse, units)}</span> · {s.iterations} iterations
-                        {s.status !== null ? ` · ${s.status}` : ""}
-                      </dd>
-                    </div>
-                  ))}
-                </dl>
+            {multi.report !== null ? (
+              <div className="report" data-align-multistage-report>
+                {multi.report.stages.map((s) => (
+                  <div key={s.label} data-align-stage={s.status === null ? "coarse" : "icp"}>
+                    <strong>{s.label}:</strong> RMSE <span data-align-stage-rmse>{length(s.rmse, units)}</span> ·{" "}
+                    {s.iterations} {s.iterations === 1 ? "iteration" : "iterations"}
+                    {s.status !== null ? ` · ${s.status}` : ""}
+                  </div>
+                ))}
+                {multi.report.warning !== null ? (
+                  <div className="error" data-align-multistage-warning>
+                    {multi.report.warning}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -227,7 +229,7 @@ export function AlignPanel(props: { app: AppState }) {
               data-align-pick
               data-align-action="landmarks-pick"
               aria-pressed={picking}
-              disabled={anyBusy || resolvedMoving === null || resolvedFixed === null}
+              disabled={anyBusy || resolvedMoving === null || resolvedFixed === null || (movingLocked && !picking)}
               title="Click a point on the moving mesh, then the matching point on the fixed mesh, for each pair"
               onClick={pickPairs}
             >
@@ -262,7 +264,7 @@ export function AlignPanel(props: { app: AppState }) {
             <button
               type="button"
               data-align-action="landmarks-run"
-              disabled={!marks.canAlign || anyBusy}
+              disabled={!marks.canAlign || anyBusy || movingLocked}
               title={`Move the moving mesh so its points meet their matches (at least ${MIN_LANDMARK_PAIRS} pairs), as one undo step`}
               onClick={() => void marks.align()}
             >
@@ -278,6 +280,16 @@ export function AlignPanel(props: { app: AppState }) {
             {picking && set !== null ? (
               <p className="muted" data-align-landmark-prompt>
                 {landmarkPrompt(set, nameOf(set.moving), nameOf(set.fixed))} Esc stops.
+              </p>
+            ) : null}
+            {marks.problem !== null ? (
+              <p className="muted" data-align-landmark-problem>
+                {marks.problem}
+              </p>
+            ) : null}
+            {movingLocked ? (
+              <p className="muted" data-align-locked>
+                Unlock the moving mesh to align it by landmarks or coarse + ICP.
               </p>
             ) : null}
             {marks.error !== null ? (

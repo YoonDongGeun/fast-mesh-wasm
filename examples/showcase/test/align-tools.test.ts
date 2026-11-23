@@ -13,12 +13,15 @@ import {
   landmarkPairs,
   landmarkPrompt,
   landmarkResiduals,
+  landmarksProblem,
   multistageStages,
+  multistageWarning,
   nextLandmarkSide,
   planeAxes,
   planeQuad,
   planeToLocal,
   planeToWorld,
+  pointsOnALine,
   quadCorners,
   removeLastLandmark,
   rms,
@@ -104,6 +107,34 @@ describe("landmark pairs", () => {
     expect(pairs[0]).toEqual({ source: [6, 0, 0], target: [1, 0, 0] });
     expect(landmarkResiduals(set, movingMatrix, IDENTITY)).toEqual([5, 5, 5]);
     expect(landmarkResiduals(set, IDENTITY, IDENTITY)).toEqual([1, 1, 1]);
+  });
+
+  it("refuses_points_on_a_line_on_either_side", () => {
+    expect(pointsOnALine([[0, 0, 0], [1, 1, 1], [5, 5, 5]])).toBe(true);
+    // The ends come first or last, whatever the order.
+    expect(pointsOnALine([[1, 1, 1], [5, 5, 5], [0, 0, 0], [2, 2, 2.01]])).toBe(true);
+    expect(pointsOnALine([[0, 0, 0], [1, 0, 0], [0, 1, 0]])).toBe(false);
+    expect(pointsOnALine([[2, 2, 2], [2, 2, 2], [2, 2, 2]])).toBe(true);
+    // Within 1% of the length is on the line; 5% is off it.
+    expect(pointsOnALine([[0, 0, 0], [50, 0.9, 0], [100, 0, 0]])).toBe(true);
+    expect(pointsOnALine([[0, 0, 0], [50, 5, 0], [100, 0, 0]])).toBe(false);
+
+    const line: Vec3[] = [[0, 0, 0], [1, 0, 0], [2, 0, 0]];
+    const bent: Vec3[] = [[0, 0, 0], [1, 0, 0], [0, 1, 0]];
+    const build = (m: readonly Vec3[], f: readonly Vec3[]) => {
+      let set = startLandmarks(moving, fixed);
+      m.forEach((p, i) => {
+        set = addLandmark(addLandmark(set, p), f[i]);
+      });
+      return set;
+    };
+    expect(landmarksProblem(build(bent, bent))).toBeNull();
+    expect(landmarksProblem(build(line, bent))).toContain("moving mesh lie on a line");
+    expect(landmarksProblem(build(bent, line))).toContain("fixed mesh lie on a line");
+    // Too few pairs is said elsewhere, and an unmatched point does not count.
+    expect(landmarksProblem(build(line.slice(0, 2), line.slice(0, 2)))).toBeNull();
+    expect(landmarksProblem(addLandmark(build(line, line), [0, 1, 0]))).toContain("lie on a line");
+    expect(landmarksProblem(addLandmark(addLandmark(build(line, line), [0, 1, 0]), [0, 1, 0]))).toBeNull();
   });
 
   it("takes_the_root_mean_square", () => {
@@ -208,6 +239,21 @@ describe("reports and picks", () => {
     expect(multistageStages("pcaCentroid", { finalRmse: 1 }, { finalRmse: 1, iterations: 0, status: "maxIterations" })[0].label).toBe(
       "Coarse (principal axes)",
     );
+  });
+
+  it("warns_when_the_icp_did_not_converge", () => {
+    const fine = (status: "converged" | "maxIterations" | "underconstrained" | "tooFewCorrespondences" | "diverged", finalRmse = 0.1) => ({
+      status,
+      finalRmse,
+    });
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("converged"))).toBeNull();
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("maxIterations"))).toContain("iteration limit");
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("underconstrained"))).toContain("slide or spin");
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("tooFewCorrespondences", 1e-9))).toContain("arbitrary");
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("diverged"))).toContain("diverged");
+    expect(multistageWarning({ finalRmse: Infinity }, fine("tooFewCorrespondences", Infinity))).toContain("nothing moved");
+    // The coarse stage moved it, so it is not "nothing moved".
+    expect(multistageWarning({ finalRmse: 0.2 }, fine("diverged", Infinity))).not.toContain("nothing moved");
   });
 
   it("formats_a_normal_without_signed_zeros", () => {

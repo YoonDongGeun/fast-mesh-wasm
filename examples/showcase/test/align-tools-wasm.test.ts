@@ -19,6 +19,7 @@ import {
   addLandmark,
   landmarkPairs,
   landmarkResiduals,
+  multistageWarning,
   planeToLocal,
   planeToWorld,
   startLandmarks,
@@ -144,6 +145,27 @@ describe("align tools on the demo meshes (Scene)", () => {
       expect(scene.canUndo()).toBe(false);
       expect(scene.placement(copy.mesh).translation).toEqual([2.5, 1.5, -1]);
     }
+  }, DEMO_TIMEOUT_MS);
+
+  it("moves nothing and records no undo step when no point is within reach", async () => {
+    const { scene, store, demos } = setup();
+    const moving = demos[1];
+    store.setPlacement(moving.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [50, 0, 0] });
+    scene.clearHistory();
+    const { coarse, fine } = await runMultistageAlign({
+      store,
+      moving: moving.mesh,
+      fixed: demos[0].mesh,
+      coarseMethod: "pcaCentroid",
+      objective: "pointToPlane",
+      maxIterations: 20,
+      overlap: 1,
+      maxDistance: 1e-9,
+    });
+    expect(coarse.finalRmse).toBe(Infinity);
+    expect(multistageWarning(coarse, fine)).toContain("nothing moved");
+    expect(scene.placement(moving.mesh).translation).toEqual([50, 0, 0]);
+    expect(scene.canUndo()).toBe(false);
   }, DEMO_TIMEOUT_MS);
 
   it("finds the rounded box's symmetry plane through its centre and mirrors across it in one undo step", async () => {

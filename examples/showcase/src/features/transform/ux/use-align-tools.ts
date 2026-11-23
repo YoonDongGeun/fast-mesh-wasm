@@ -17,8 +17,10 @@ import {
   completePairs,
   landmarkPairs,
   landmarkResiduals,
+  landmarksProblem,
   MIN_LANDMARK_PAIRS,
   multistageStages,
+  multistageWarning,
   planeToLocal,
   planeToWorld,
   removeLastLandmark,
@@ -84,7 +86,8 @@ export function useLandmarkAlign(app: AppState, store: SceneStore, moving: MeshH
   }, [app, set, otherToolArmed]);
 
   const pairs = set === null ? 0 : completePairs(set);
-  const canAlign = !busy && set !== null && pairs >= MIN_LANDMARK_PAIRS;
+  const problem = set === null ? null : landmarksProblem(set);
+  const canAlign = !busy && set !== null && pairs >= MIN_LANDMARK_PAIRS && problem === null;
 
   /** Starts (or resumes) picking pairs on the canvas. */
   const pick = () => {
@@ -144,7 +147,7 @@ export function useLandmarkAlign(app: AppState, store: SceneStore, moving: MeshH
     }
   };
 
-  return { set, pairs, canAlign, allowScaling, setAllowScaling, busy, error, result, pick, stop, undoPoint, clear, align };
+  return { set, pairs, problem, canAlign, allowScaling, setAllowScaling, busy, error, result, pick, stop, undoPoint, clear, align };
 }
 
 /** Coarse + ICP between `moving` and `fixed`, with the ICP options of the panel. */
@@ -158,7 +161,7 @@ export function useMultistageAlign(
   const [objective, setObjective] = useState<"pointToPlane" | "pointToPoint" | "symmetricNormal">("pointToPlane");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stages, setStages] = useState<AlignStage[] | null>(null);
+  const [report, setReport] = useState<{ stages: AlignStage[]; warning: string | null } | null>(null);
 
   const canRun = !busy && moving !== null && fixed !== null && moving !== fixed;
 
@@ -178,7 +181,7 @@ export function useMultistageAlign(
         overlap: Math.max(0.05, Math.min(1, options.overlap)),
         maxDistance: options.maxDistance > 0 ? options.maxDistance : undefined,
       });
-      setStages(multistageStages(coarseMethod, coarse, fine));
+      setReport({ stages: multistageStages(coarseMethod, coarse, fine), warning: multistageWarning(coarse, fine) });
     } catch (e) {
       setError(message(e));
     } finally {
@@ -186,7 +189,7 @@ export function useMultistageAlign(
     }
   };
 
-  return { coarseMethod, setCoarseMethod, objective, setObjective, busy, error, stages, canRun, run };
+  return { coarseMethod, setCoarseMethod, objective, setObjective, busy, error, report, canRun, run };
 }
 
 /** The symmetry plane: which mesh to detect it on, the detection, and the mirror across it. */

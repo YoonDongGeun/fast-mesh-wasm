@@ -18,6 +18,7 @@ import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { AppState, type Item } from "../src/app/state/app-state";
+import { useKeyboardShortcuts } from "../src/app/ux/use-keyboard-shortcuts";
 import { viewportHint } from "../src/app/ux/viewport-hint";
 import { mirrorMesh } from "../src/engine/workbench-ops";
 import { AlignPanel } from "../src/features/transform/ui/AlignPanel";
@@ -271,12 +272,93 @@ describe("coarse + ICP (#253)", () => {
     expect(stages.map((s) => s.getAttribute("data-align-stage"))).toEqual(["coarse", "icp"]);
     expect(stages[0].textContent).toContain("Coarse (oriented bounding box)");
     expect(stages[1].textContent).toContain("ICP");
-    expect(stages[1].textContent).toMatch(/\d+ iterations/);
+    expect(stages[1].textContent).toMatch(/\d+ iterations? · converged/);
+    expect(host.querySelector("[data-align-multistage-warning]")).toBeNull();
     expectClose(worldVertices(scene, moving), worldVertices(scene, fixed), 1e-3);
 
     store.undo();
     expect(scene.placement(moving.mesh)).toEqual(before);
     expect(scene.canUndo()).toBe(false);
+  });
+});
+
+/** The app's shortcuts alone, recording their selection calls. */
+function Keys(props: { app: AppState; onSelect: (mesh: unknown) => void }) {
+  const noop = () => {};
+  useKeyboardShortcuts({
+    app: props.app,
+    select: props.onSelect,
+    selection: null,
+    undo: noop,
+    redo: noop,
+    focusOn: noop,
+    setMode: noop,
+    helpOpen: false,
+    setHelpOpen: noop,
+    tourStep: null,
+    endTour: noop,
+  });
+  return null;
+}
+
+describe("Esc while picking pairs (#253)", () => {
+  it("stops picking and keeps the points, and only then deselects", async () => {
+    const { app, store, moving, host } = setup(MOVED);
+    const selected: unknown[] = [];
+    const keys = document.createElement("div");
+    const root = createRoot(keys);
+    act(() => root.render(<Keys app={app} onSelect={(m) => selected.push(m)} />));
+    cleanups.push(() => act(() => root.unmount()));
+    const esc = () => act(async () => void window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+
+    await click(host.querySelector("[data-align-pick]"));
+    act(() => landLandmarkHit(app, store, { mesh: moving.mesh, triangle: 0, barycentric: [1, 0, 0] }));
+    await esc();
+    expect(app.getSnapshot().alignTool.landmarks?.picking).toBe(false);
+    expect(app.getSnapshot().alignTool.landmarks?.movingPoints).toHaveLength(1);
+    expect(selected).toEqual([]);
+    await esc();
+    expect(selected).toEqual([null]);
+  });
+});
+
+describe("alignment guards (#253)", () => {
+  it("refuses landmarks on a line, which a fit with an RMSE of 0 would leave free to turn", async () => {
+    const { scene, store, app, fixed, moving, host } = setup(MOVED);
+    await click(host.querySelector("[data-align-pick]"));
+    // Corners 0, 3 and 0-3's midpoint: the bottom edge along Y.
+    const onEdge: [number, [number, number, number]][] = [
+      [1, [1, 0, 0]],
+      [1, [0, 1, 0]],
+      [1, [0.5, 0.5, 0]],
+    ];
+    for (const [triangle, barycentric] of onEdge) {
+      act(() => landLandmarkHit(app, store, { mesh: moving.mesh, triangle, barycentric }));
+      act(() => landLandmarkHit(app, store, { mesh: fixed.mesh, triangle, barycentric }));
+    }
+    const run = () => host.querySelector<HTMLButtonElement>('[data-align-action="landmarks-run"]')!;
+    expect(host.querySelector("[data-align-landmark-problem]")?.textContent).toContain("lie on a line");
+    expect(run().disabled).toBe(true);
+    expect(scene.canUndo()).toBe(false);
+
+    // One pair off the line settles it.
+    for (const item of [moving, fixed]) {
+      act(() => landLandmarkHit(app, store, { mesh: item.mesh, triangle: 2, barycentric: [0, 0, 1] }));
+    }
+    expect(host.querySelector("[data-align-landmark-problem]")).toBeNull();
+    expect(run().disabled).toBe(false);
+  });
+
+  it("leaves a locked moving mesh alone", async () => {
+    const { app, moving, host } = setup(MOVED);
+    await act(async () => app.setMeshLocked(moving.mesh, true));
+    expect(host.querySelector("[data-align-locked]")).not.toBeNull();
+    for (const action of ["landmarks-pick", "landmarks-run", "multistage-run"]) {
+      expect(host.querySelector<HTMLButtonElement>(`[data-align-action="${action}"]`)?.disabled).toBe(true);
+    }
+    await act(async () => app.setMeshLocked(moving.mesh, false));
+    expect(host.querySelector("[data-align-locked]")).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>('[data-align-action="multistage-run"]')?.disabled).toBe(false);
   });
 });
 

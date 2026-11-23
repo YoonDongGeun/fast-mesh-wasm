@@ -445,6 +445,20 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" onClick={() => focusElement("[data-align-pick]")}>
                 Landmark Align
               </button>
+              <button
+                type="button"
+                data-ribbon-focus="coarse-icp"
+                onClick={() => focusElement('[data-align-action="multistage-run"]')}
+              >
+                Coarse + ICP
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="symmetry-plane"
+                onClick={() => focusElement('[data-align-action="symmetry-detect"]')}
+              >
+                Symmetry Plane
+              </button>
               <button type="button" data-ribbon-focus="points" onClick={() => focusElement("[data-points-panel]")}>
                 Point Cloud
               </button>
