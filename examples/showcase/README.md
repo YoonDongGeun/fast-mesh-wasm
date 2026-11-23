@@ -209,7 +209,7 @@ src/
                  normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic
                  remesh, hollow, place mesh, text (its font in fonts/)
-    mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips
+    mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips, wrap
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull
     ct/          volume rendering, MPR slices

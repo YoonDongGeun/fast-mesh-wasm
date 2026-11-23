@@ -38,6 +38,7 @@ import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } 
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
 import type { BooleanMethod, BooleanOptions, CsgNode, IsotropicRemeshOptions, SurfaceRemeshReport } from "fast-mesh-wasm";
+import type { WrapOptions, WrapPlan, WrapResult } from "fast-mesh-wasm";
 import {
   batchBooleanTree,
   batchResultName,
@@ -908,6 +909,45 @@ export async function runConvexHull(params: {
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
   store.commitFrame();
   return { item, inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+}
+
+/** The voxel grid a wrap of `sources` with `options` takes, without running it. */
+export async function planWrap(params: {
+  store: SceneStore;
+  sources: readonly Item[];
+  options: WrapOptions;
+}): Promise<WrapPlan> {
+  const { scene } = params.store;
+  const meshes = params.sources.map((i) => i.mesh);
+  return isWorkerScene(scene) ? scene.wrapPlan(meshes, params.options) : asSyncScene(scene).wrapPlan(meshes, params.options);
+}
+
+/** What a wrap action added: its list item, and the wrap's counts and grid. */
+export type WrapRunResult = { item: Item } & Omit<WrapResult, "mesh">;
+
+/**
+ * Adds the closed envelope of `sources` (their world shapes) as a new mesh
+ * named `name`, lists it and selects it. The sources stay as they are. The
+ * engine fills the new mesh as one undo step (undo empties it), on the Worker
+ * when the scene runs there, so the page stays live meanwhile.
+ */
+export async function runWrap(params: {
+  store: SceneStore;
+  app: AppState;
+  name: string;
+  sources: readonly Item[];
+  options: WrapOptions;
+}): Promise<WrapRunResult> {
+  const { store, app, name, options } = params;
+  const scene = store.scene;
+  const meshes = params.sources.map((i) => i.mesh);
+  const { mesh, ...counts } = isWorkerScene(scene)
+    ? await scene.wrap(meshes, options)
+    : asSyncScene(scene).wrap(meshes, options);
+  const item = app.adoptSceneMesh(store, mesh, name);
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
+  store.commitFrame();
+  return { item, ...counts };
 }
 
 /**

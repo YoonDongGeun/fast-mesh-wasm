@@ -28,6 +28,7 @@ import { LengthInput } from "../../../shared/ui/LengthInput";
 import { MeshHealerSection } from "./MeshHealerSection";
 import { REPAIR_OVERLAY_COLORS } from "./repair-overlays";
 import { SurfaceCleanupSection } from "./SurfaceCleanupSection";
+import { WrapSection } from "./WrapSection";
 
 /** The holes listed by size. */
 const HOLES_SHOWN = 6;
@@ -607,6 +608,10 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           </p>
         ) : null}
         <p className="muted small">Bridge stitches two holes of this mesh; Join merges another mesh into it (the source is removed).</p>
+      </div>
+
+      <div className="ops">
+        <WrapSection app={app} store={store} items={items} activeItem={item} units={units} disabled={disabled} />
       </div>
 
       {runner.busy !== null ? (

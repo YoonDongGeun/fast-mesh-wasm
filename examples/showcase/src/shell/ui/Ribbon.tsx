@@ -365,6 +365,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                   {c.short}
                 </button>
               ))}
+              <button type="button" disabled={!hasItems} onClick={() => focusElement("[data-wrap-gap]")}>
+                Wrap
+              </button>
               <button
                 type="button"
                 aria-pressed={healerOverlays.selfIntersections}
