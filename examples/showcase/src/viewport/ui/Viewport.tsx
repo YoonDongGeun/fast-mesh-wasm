@@ -25,6 +25,7 @@ import { type AppState, type Item, useApp } from "../../app/state/app-state";
 import { evaluateOverlayColor } from "../../engine/workbench-ops";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
 import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
+import { TextPreviewLayer } from "../../features/mesh-edit/ui/TextPreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
@@ -215,6 +216,7 @@ export function Viewport(props: {
       <PlacementPicksLayer app={app} store={store} />
       <AlignToolsLayer app={app} store={store} />
       <CreatePreviewLayer app={app} />
+      <TextPreviewLayer app={app} />
     </Canvas>
   );
 }

@@ -1,6 +1,7 @@
 // Modeling & Resampling panel (#195): Boolean CSG (with Keep originals), destructive Plane Cut,
 // Offset & Shell (Solidify), Quadric Simplify, and Loop Subdivide; then the Print Prep sections
-// (#236): Hollow Mesh, Drain Hole and Surface Stamp. What they do lives in
+// (#236): Hollow Mesh, Drain Hole and Surface Stamp (a built-in, text or
+// scene stamp; text since #260). What they do lives in
 // `ux/use-modeling-ops.ts` and `ux/use-print-prep-ops.ts`.
 import type { HollowBackend, PlaceUpAxis } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
@@ -20,6 +21,7 @@ import { spinInput, stampScaleInput, taperInput, usePrintPrepOps } from "../ux/u
 import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
 import { BatchBooleanSection } from "./BatchBooleanSection";
 import { IsotropicRemeshSection } from "./IsotropicRemeshSection";
+import { TextStampFields } from "./TextStampFields";
 
 export function ModelingPanel(props: { app: AppState }) {
   const { app } = props;
@@ -583,6 +585,7 @@ export function ModelingPanel(props: { app: AppState }) {
                   <option value="hexBoss">Hex Boss</option>
                   <option value="dome">Dome</option>
                   <option value="cube">Cube</option>
+                  <option value="text">Text</option>
                   <option value="sceneMesh">Scene Mesh</option>
                 </select>
               </label>
@@ -606,6 +609,7 @@ export function ModelingPanel(props: { app: AppState }) {
                 </select>
               </label>
             </div>
+            {prep.printPrep.placeParams.stampSource === "text" ? <TextStampFields app={app} /> : null}
             <div className="op-row">
               <label className="field">
                 <span>Mode</span>

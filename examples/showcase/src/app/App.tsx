@@ -11,6 +11,7 @@ import type { Loader } from "../io/loader";
 import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
 import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
+import { TextDialog } from "../features/mesh-edit/ui/TextDialog";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -198,6 +199,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <VolumeOverlay app={app} />
         <ViewportNavigationHud app={app} />
         <CreatePrimitiveDialog app={app} />
+        <TextDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,

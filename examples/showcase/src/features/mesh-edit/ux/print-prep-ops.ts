@@ -1,8 +1,8 @@
 // The print-prep ops (#236) on a picked surface point, each through the
 // scene's boolean domain and then one committed frame: SDF hollowing, a
 // chamfered drain hole (adopting any plug it makes as a new item) and Place
-// Mesh with a built-in or scene stamp. The Align to normal choice is kept
-// per app, shared by the panel and the viewport tool.
+// Mesh with a built-in, text (#260) or scene stamp. The Align to normal
+// choice is kept per app, shared by the panel and the viewport tool.
 import type {
   BooleanMethod,
   DrainHoleOptions,
@@ -23,6 +23,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { AppState } from "../../../app/state/app-state";
 import type { Wave6PrintPrepState } from "../../../app/state/wave6-state";
 import { createBuiltinStampMeshGeometry } from "./stamp-geometry";
+import { textStampGeometry } from "./text-stamp";
 
 const ALLOWED_UP_AXES: readonly PlaceUpAxis[] = ["negZ", "posZ", "posY", "negY"];
 
@@ -195,7 +196,10 @@ export async function executePlaceStampAtHit(args: ExecutePlaceStampArgs): Promi
     }
     resolvedStamp = stampItem.mesh;
   } else {
-    const geom = createBuiltinStampMeshGeometry(placeParams.stampSource);
+    const geom =
+      placeParams.stampSource === "text"
+        ? await textStampGeometry(placeParams.text)
+        : createBuiltinStampMeshGeometry(placeParams.stampSource);
     const rawScene = store.scene as Partial<Scene | WorkerScene>;
     if (typeof rawScene.addMesh === "function") {
       tempStamp = await rawScene.addMesh(geom.positions, geom.indices);

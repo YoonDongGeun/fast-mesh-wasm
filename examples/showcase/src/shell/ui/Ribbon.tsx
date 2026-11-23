@@ -8,6 +8,7 @@
 import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -225,6 +226,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Create Shape…
               </button>
+              <button
+                type="button"
+                data-action="create-text"
+                title="Create solid text, or emboss or engrave it on a surface"
+                onClick={() => textDialogOf(app).open()}
+              >
+                Create Text…
+              </button>
               <button type="button" onClick={onResetView}>
                 Reset View
               </button>
@@ -413,6 +422,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               </button>
               <button type="button" data-ribbon-focus="place" onClick={() => focusElement("[data-modeling-place-section]")}>
                 Surface Stamp
+              </button>
+              <button
+                type="button"
+                data-action="text-tool"
+                title="Solid text, or text embossed or engraved on a surface"
+                onClick={() => textDialogOf(app).open()}
+              >
+                Text…
               </button>
               <button
                 type="button"

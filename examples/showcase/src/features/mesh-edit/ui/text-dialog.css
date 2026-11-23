@@ -1,0 +1,16 @@
+/* The Text dialog (#260): the Create dialog's panel (create-dialog.css),
+   with a text box for the text itself. */
+.text-dialog .text-field {
+  align-items: flex-start;
+}
+.text-dialog textarea {
+  width: 180px;
+  min-height: 2.6em;
+  resize: vertical;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 4px;
+}

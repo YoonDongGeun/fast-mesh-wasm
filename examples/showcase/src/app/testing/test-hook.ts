@@ -19,6 +19,7 @@ import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays
 import { hasWireOverlay } from "../../features/view/ui/wire";
 import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
 export function installTestHook(
   store: SceneStore,
@@ -56,6 +57,11 @@ export function installTestHook(
     createDialog: () => {
       const d = createDialogOf(app).getSnapshot();
       return { open: d.open, kind: d.kind, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** The Text dialog: whether it is open, and the preview's triangles (0 with none). */
+    textDialog: () => {
+      const d = textDialogOf(app).getSnapshot();
+      return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
     },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),

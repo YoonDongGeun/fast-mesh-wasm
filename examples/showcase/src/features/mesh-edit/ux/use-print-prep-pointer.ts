@@ -42,6 +42,8 @@ export interface PrintPrepPreviewPose {
   normalLength: number;
   /** The in-plane axis lines' length (stamps only). */
   axisLength: number;
+  /** The stamp's uniform scale (1 for drain holes): a text stamp's outline is drawn at it. */
+  stampScale: number;
 }
 
 /** The preview the tool drives: shown at a pose, or hidden. */
@@ -75,6 +77,7 @@ export function printPrepPreviewPose(
       depth: Math.max(1, prep.drainParams.depth),
       normalLength: Math.max(2, radius * 1.5),
       axisLength: 0,
+      stampScale: 1,
     };
   }
   const scale = Math.max(0.25, prep.placeParams.uniformScale);
@@ -87,6 +90,7 @@ export function printPrepPreviewPose(
     depth: 0,
     normalLength: Math.max(2.5, ringR * 1.25),
     axisLength: ringR * 0.85,
+    stampScale: Math.max(0.01, prep.placeParams.uniformScale),
   };
 }
 
