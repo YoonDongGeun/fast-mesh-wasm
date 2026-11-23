@@ -20,6 +20,7 @@ import { HoverTip } from "../features/collision/ui/HoverTip";
 import { AlignPanel } from "../features/transform/ui/AlignPanel";
 import { InspectPanel } from "../features/inspect/ui/InspectPanel";
 import { MeshList } from "../features/home/ui/MeshList";
+import { ObjectInfoBox } from "../features/inspect/ui/ObjectInfoBox";
 import { ModelingPanel } from "../features/mesh-edit/ui/ModelingPanel";
 import { PointsPanel } from "../features/points/ui/PointsPanel";
 import { ProjectPanel } from "../features/home/ui/ProjectPanel";
@@ -174,6 +175,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         />
         <GroupsBar app={app} />
         <ProjectPanel app={app} />
+        <ObjectInfoBox app={app} scene={engine.scene} />
       </aside>
       <main className="viewport">
         <Viewport

@@ -19,6 +19,7 @@ import {
   type InspectMapRequest,
   type InspectMapSettings,
   inspectMapChangeAction,
+  type QualityMapMetric,
   inspectMapOverlay,
   QUALITY_METRICS,
   resolveBuildDirection,
@@ -37,6 +38,11 @@ export const inspectMapProbe: {
     mesh: string | null;
     reference: string | null;
     readout: InspectMapReadout;
+    /** What the readouts were measured with: the request's parameters, without its handles (#257's report). */
+    params:
+      | { signed: boolean }
+      | { criticalAngleDeg: number; direction: [number, number, number] }
+      | { metric: QualityMapMetric; threshold: number };
     range: [number, number];
     band: [number, number] | null;
   } | null;
@@ -236,14 +242,21 @@ export function useInspectMaps(
   useEffect(() => {
     const nameOf = (m: MeshHandle) => items.find((i) => i.mesh === m)?.name ?? null;
     const data = shownRef.current;
+    const r = report?.request ?? null;
     inspectMapProbe.shown =
-      !active || report === null || data === null
+      !active || report === null || r === null || data === null
         ? null
         : {
             kind: report.kind,
             mesh: nameOf(report.request.mesh),
             reference: report.kind === "deviation" ? nameOf(report.request.reference) : null,
             readout: { ...report.readout },
+            params:
+              r.kind === "deviation"
+                ? { signed: r.signed }
+                : r.kind === "overhang"
+                  ? { criticalAngleDeg: r.criticalAngleDeg, direction: [r.direction[0], r.direction[1], r.direction[2]] }
+                  : { metric: r.metric, threshold: r.threshold },
             range: [data.min, data.max],
             band: data.band == null ? null : [data.band.lo, data.band.hi],
           };

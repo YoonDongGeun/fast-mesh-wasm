@@ -41,6 +41,7 @@ export const INSPECT_TOOLS: readonly [InspectTool, string][] = [
   ["query", "Vertex / Thickness Query"],
   ["section", "Cross-Section"],
   ["clip", "Clip Box"],
+  ["angle", "Angle"],
 ];
 
 /** The ribbon's slice of the app state, and its button handlers. */

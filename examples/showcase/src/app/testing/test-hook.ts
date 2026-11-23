@@ -18,6 +18,7 @@ import { view } from "../../viewport/ux/view";
 import { hasRepairOverlays } from "../../features/mesh-repair/ui/repair-overlays";
 import { hasWireOverlay } from "../../features/view/ui/wire";
 import { inspectMapProbe } from "../../features/inspect/ux/use-inspect-maps";
+import { objectInfoProbe, qualityReportFile, readQualityReport } from "../../features/inspect/ux/use-object-info";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 
@@ -295,6 +296,20 @@ export function installTestHook(
             ? null
             : { ...s, readout: { ...s.readout }, range: [...s.range], band: s.band === null ? null : [...s.band] },
       };
+    },
+    /** The object info box, its overlays and the angle measure (#257): the numbers shown, the box drawn, normal lines, the angle. */
+    objectInfo: () => ({
+      ...objectInfoProbe,
+      info: objectInfoProbe.info === null ? null : { ...objectInfoProbe.info },
+      angle: { points: objectInfoProbe.angle.points.map((p) => [...p]), degrees: objectInfoProbe.angle.degrees },
+    }),
+    /** The selected mesh's quality report as HTML or CSV text (#257), `null` without a selection. */
+    qualityReport: async (format: "html" | "csv"): Promise<string | null> => {
+      const mesh = store.getSnapshot().selection;
+      if (mesh === null) {
+        return null;
+      }
+      return qualityReportFile(await readQualityReport(app, engine.scene, mesh), format, app.getSnapshot().units).text;
     },
     /** The volume view: the series shown, its preset, MIP, and whether it rendered. */
     volume: () => ({ ...inspect.volume }),

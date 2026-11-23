@@ -164,7 +164,7 @@ export function collisionRowsToCsv(rows: readonly CollisionCsvRow[], unit: Lengt
 }
 
 /** A download file name: the stem sanitized, with the extension. */
-export function reportFileName(stem: string, extension: "dxf" | "svg" | "csv"): string {
+export function reportFileName(stem: string, extension: "dxf" | "svg" | "csv" | "html"): string {
   const clean = stem.replace(/[\\/:*?"<>|]/g, "_").trim() || "export";
   return `${clean}.${extension}`;
 }

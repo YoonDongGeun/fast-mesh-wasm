@@ -32,6 +32,7 @@ import {
   usePrimitiveFit,
 } from "../ux/use-primitive-fit";
 import { COLORMAPS, SURFACE_FIELD_MODES, useSurfaceField } from "../ux/use-surface-field";
+import { AngleReadout } from "./AngleReadout";
 import { FieldLegend } from "./FieldLegend";
 import { InspectMapControls } from "./InspectMapControls";
 import { LengthInput } from "../../../shared/ui/LengthInput";
@@ -98,6 +99,7 @@ export function InspectPanel(props: { app: AppState; scene: Scene | WorkerScene 
         <p className="muted small">Click a vertex in the viewport to read its coloring value.</p>
       ) : null}
       <RulerReadout app={app} ruler={ruler} distance={distance} unit={units} />
+      <AngleReadout app={app} tool={tool} />
       <QueryReadout query={query} items={items} value={queryValue} measure={queryMeasure} unit={units} />
       <SectionControls app={app} scene={scene} store={store} items={items} item={item} section={section} active={tool === "section"} unit={units} />
       {tool === "clip" || clip !== null ? <ClipControls app={app} scene={scene} items={items} item={item} clip={clip} unit={units} /> : null}

@@ -406,6 +406,36 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:inspect-angle",
+      title: "Inspect: Measure Angle",
+      category: "Tool",
+      keywords: "inspect angle measure three points vertex degrees",
+      run: () => {
+        app.setActiveTab("inspect");
+        app.setInspectTool("angle");
+      },
+    },
+    {
+      id: "action:object-info-box",
+      title: "Object Info: Toggle Bounding Box Overlay",
+      category: "Action",
+      keywords: "object info bounding box overlay dimensions size aabb",
+      run: () => {
+        const oi = app.getSnapshot().objectInfo;
+        app.setObjectInfo({ open: true, showBox: !oi.showBox });
+      },
+    },
+    {
+      id: "action:object-info-normals",
+      title: "Object Info: Toggle Normals Overlay",
+      category: "Action",
+      keywords: "object info normals overlay face vertex lines direction",
+      run: () => {
+        const oi = app.getSnapshot().objectInfo;
+        app.setObjectInfo({ open: true, normals: oi.normals === "off" ? "face" : "off" });
+      },
+    },
+    {
       id: "tool:inspect-section",
       title: "Inspect: Section Cut Plane",
       category: "Tool",

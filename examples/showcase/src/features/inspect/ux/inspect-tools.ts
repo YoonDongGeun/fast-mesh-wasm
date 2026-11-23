@@ -10,6 +10,7 @@ export const INSPECT_TOOLS: { tool: InspectTool; label: string; title: string }[
   { tool: "query", label: "Query", title: "Click a vertex to read its coloring value" },
   { tool: "section", label: "Section", title: "Cut the meshes with a draggable plane" },
   { tool: "clip", label: "Clip box", title: "Keep an axis-aligned world-space box, clip the rest away" },
+  { tool: "angle", label: "Angle", title: "Click three vertices to measure the angle at the middle one (snaps to vertices)" },
 ];
 
 /** The distance between two world points, for the ruler. */

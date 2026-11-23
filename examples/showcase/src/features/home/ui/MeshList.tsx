@@ -12,6 +12,7 @@ import { type AppState, type DiagnosticShadingMode, type Item, useApp } from "..
 import type { MirrorAxis } from "../../../engine/workbench-ops";
 import { useMeshPreview } from "./mesh-preview";
 import { IMPORT_UNITS } from "../../../shared/ux/units";
+import { angleDegrees, formatAngle } from "../../inspect/ux/angle-measure";
 import {
   bigFileParams,
   clickRow,
@@ -43,6 +44,7 @@ export function MeshList(props: {
   const ruler = useApp(app, (s) => s.ruler);
   const inspectSection = useApp(app, (s) => s.inspectSection);
   const clipBox = useApp(app, (s) => s.clipBox);
+  const anglePoints = useApp(app, (s) => s.objectInfo.angle);
   const [collapsedGroups, setCollapsedGroups] = useState<Record<number, boolean>>({});
   const selectedItem = selection === null ? null : (items.find((i) => i.mesh === selection) ?? null);
   const { mirrorAxis, setMirrorAxis, mirrorBusy, duplicate, mirror } = useMeshActions(store, app, selectedItem);
@@ -252,7 +254,7 @@ export function MeshList(props: {
         })}
       </ul>
       {items.length === 0 && jobs.length === 0 ? <p className="muted">No meshes. Open or drop a file.</p> : null}
-      {volumes.length > 0 || ruler !== null || inspectSection !== null || clipBox !== null ? (
+      {volumes.length > 0 || ruler !== null || anglePoints.length > 0 || inspectSection !== null || clipBox !== null ? (
         <div className="scene-tree-extras" data-scene-tree-extras aria-label="Volumes and annotations">
           <p className="muted small">Volumes &amp; annotations</p>
           <ul className="tree-extras-list">
@@ -291,6 +293,19 @@ export function MeshList(props: {
                     : "1 point placed"}
                 </span>
                 <button type="button" onClick={() => app.setRuler(null)}>
+                  Clear
+                </button>
+              </li>
+            ) : null}
+            {anglePoints.length > 0 ? (
+              <li className="tree-extra-row" data-tree-artifact="angle">
+                <span className="tree-node-tag">Angle</span>
+                <span className="tree-extra-name">
+                  {anglePoints.length === 3
+                    ? formatAngle(angleDegrees(anglePoints[0], anglePoints[1], anglePoints[2]) ?? 0)
+                    : `${anglePoints.length} of 3 points placed`}
+                </span>
+                <button type="button" onClick={() => app.setObjectInfo({ angle: [] })}>
                   Clear
                 </button>
               </li>
