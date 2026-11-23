@@ -132,6 +132,9 @@ describe("packRects", () => {
     const plate = { width: 100, depth: 30 };
     expect(check(tall, plate).placed).toEqual([{ index: 0, x: 5, y: 5, turned: true }]);
     expect(check(tall, { ...plate, turn: false })).toEqual({ placed: [], oversized: [0], noRoom: [] });
+    // It does not turn what fits as it is, though turned it would be more compact.
+    const wide = check([{ w: 60, h: 10 }, { w: 10, h: 60 }], { width: 100, depth: 100 });
+    expect(wide.placed.every((p) => !p.turned)).toBe(true);
     // Four bars of 90 x 20 on a 100 x 100 plate, however they are given.
     const bars = [0, 1, 2, 3].map((i) => (i % 2 === 0 ? { w: 90, h: 20 } : { w: 20, h: 90 }));
     expect(check(bars, { width: 100, depth: 100, spacing: 5 }).placed).toHaveLength(4);

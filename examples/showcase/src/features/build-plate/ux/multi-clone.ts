@@ -2,9 +2,9 @@
 // along an axis, as one undo step. The copies take the source's geometry,
 // UVs, origin and placement, moved by whole steps: its world box plus the
 // spacing. They are plain meshes: no colouring, lock or source volume. The
-// source stays where it is, as the array's first place; afterwards it and
-// its copies are selected, so Arrange can follow.
-import type { MeshHandle, Vec3 } from "fast-mesh-wasm";
+// source stays where it is, as the array's first place; it and its copies
+// are selected, so Arrange can follow.
+import type { Vec3 } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
 import { extractLiveMeshData } from "../../../engine/workbench-ops";
@@ -107,8 +107,8 @@ function boxSize(b: WorldBounds): Vec3 {
 }
 
 /**
- * Makes the copies (see the file comment) and selects them with the source.
- * Resolves with the copies once the scene has them.
+ * Makes the copies (see the file comment). They list at once; resolves with
+ * them when the scene has them all.
  *
  * @throws when the layout cannot run, the mesh has no triangles, or the scene
  * refuses a copy (nothing is left of them then).
@@ -174,6 +174,8 @@ export async function cloneMesh(params: {
     app.syncMeshes(store);
     throw err;
   }
+  app.setMulti([item.mesh, ...copies.map((c) => c.mesh)]);
+  store.select(item.mesh);
   const results = await Promise.allSettled(copies.map((c) => landed(store, c.mesh)));
   const failed = results.find((r) => r.status === "rejected");
   if (failed !== undefined) {
@@ -184,16 +186,5 @@ export async function cloneMesh(params: {
     }
     throw failed.reason;
   }
-  selectAll(store, app, item.mesh, copies.map((c) => c.mesh));
   return copies;
-}
-
-/** Selects `primary` and `others`, those still in the scene. */
-function selectAll(store: SceneStore, app: AppState, primary: MeshHandle, others: readonly MeshHandle[]): void {
-  const { meshes } = store.getSnapshot();
-  const all = [primary, ...others].filter((m) => meshes.has(m));
-  if (all.length > 0) {
-    app.setMulti(all);
-    store.select(all[0]);
-  }
 }

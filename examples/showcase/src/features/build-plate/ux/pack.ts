@@ -2,9 +2,10 @@
 // it can on a plate, with a gap between them and 90° turns, off the given
 // obstacles. The free space is kept as its maximal free rectangles; each
 // rectangle takes the free corner with the best score, largest first. The
-// first strategy keeps the arrangement compact; when it leaves something
-// out, other orders and scores are tried and the one that places the most
-// wins. Pure and deterministic (ties go to the first in the list).
+// first try keeps the arrangement compact and turns nothing; when it leaves
+// something out, turns and then other orders and scores are tried, and the
+// one that places the most wins. Pure and deterministic (ties go to the
+// first in the list, unturned).
 //
 // Sizes are rounded up to a millionth of the plate's longer side, and the
 // packing itself runs on those whole numbers, so it is exact: two placed
@@ -71,6 +72,8 @@ interface Part {
 }
 
 interface Strategy {
+  /** Never turns anything. */
+  straight?: true;
   order: (a: Part, b: Part) => number;
   /** The score of a `w` x `h` rectangle at the lowest corner of `free` (lower is better, compared in turn). */
   score: (free: PackBox, w: number, h: number, plateW: number, plateH: number) => [number, number];
@@ -111,6 +114,7 @@ const bestArea: Strategy["score"] = (f, w, h) => [
 const bottomLeft: Strategy["score"] = (f, _w, h) => [f.y0 + h, f.x0];
 
 const STRATEGIES: readonly Strategy[] = [
+  { order: byArea, score: compact, straight: true },
   { order: byArea, score: compact },
   ...[bestShortSide, bestArea, bestLongSide, bottomLeft, compact].flatMap((score) =>
     [byLongSide, byArea, byShortSide].map((order) => ({ order, score })),
@@ -179,7 +183,7 @@ function attempt(
   const out: Attempt = { spots: [], left: [], scored: 0 };
   for (const part of [...parts].sort(strategy.order)) {
     let best: { x: number; y: number; turned: boolean; key: number[] } | null = null;
-    for (const turned of turn && part.w !== part.h ? [false, true] : [false]) {
+    for (const turned of turn && strategy.straight !== true && part.w !== part.h ? [false, true] : [false]) {
       const w = turned ? part.h : part.w;
       const h = turned ? part.w : part.h;
       for (const f of free) {
@@ -187,7 +191,7 @@ function attempt(
           continue;
         }
         out.scored++;
-        const key = [...strategy.score(f, w, h, W, H), f.y0, f.x0];
+        const key = [...strategy.score(f, w, h, W, H), turned ? 1 : 0, f.y0, f.x0];
         if (best === null || less(key, best.key)) {
           best = { x: f.x0, y: f.y0, turned, key };
         }
