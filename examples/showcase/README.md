@@ -40,6 +40,22 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   edit, since the engine's history records edits, not added meshes. Undo empties the mesh, whose row
   stays like any mesh with nothing left to draw; redo brings the shape back. Defaults are sized to
   the listed meshes (about their median diameter, 2 mm in an empty scene); at most 10 M triangles.
+- **Text.** *Create Text…* on the Home shelf, *Text…* on the Mesh Edit shelf (or *Text* in the command
+  search) opens a dialog with the text (newlines start new lines), its letter height (a capital's),
+  depth and letter spacing in the display unit, and how many straight pieces each outline curve takes.
+  Create adds it as a solid mesh in one undo step, as the Create dialog adds a shape. *Emboss on
+  Surface* and *Engrave on Surface* arm Place Mesh with the text as its stamp: click a surface to
+  raise or cut the letters there, one undo step on that mesh. The Surface Stamp section of the Mesh
+  Edit panel offers *Text* as a stamp too, with the same fields, and says how far the settings raise
+  it (its depth less *Embed*) or how deep they cut (*Embed*). Text is made on the main thread
+  (`src/features/mesh-edit/ux/text-mesh.ts`): each glyph's contours are nested by containment, so
+  counters are holes whatever the font's winding; the caps are filled with three.js's ear clipping
+  (the engine's polygon triangulation takes holes too, but has no SDK entry point) and walled
+  between; and the result is welded, closed and wound outward. A stamp that conforms to the surface is
+  also cut so that no edge spans more than an eighth of a letter's height, since conforming moves
+  vertices only. The font (`src/features/mesh-edit/fonts`, under its own licence, kept beside it) is
+  about 62 KB, 22 KB gzipped, and loads as a chunk of its own when a text tool first opens. It has
+  ASCII, Greek and some symbols; a character it lacks is drawn as `?` and named in the dialog.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
@@ -178,7 +194,7 @@ src/
     inspect/     ruler, query, section plane, clip box, surface fields; deviation, overhang and
                  triangle quality maps
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic
-                 remesh, hollow, place mesh
+                 remesh, hollow, place mesh, text (its font in fonts/)
     mesh-repair/ analysis, healer overlays, repairs, auto repair
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull

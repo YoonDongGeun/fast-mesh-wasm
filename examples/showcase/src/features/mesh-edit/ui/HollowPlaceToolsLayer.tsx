@@ -171,6 +171,7 @@ function createPrintPrepPreview(): PrintPrepPreview {
   return {
     root,
     setOutline(next) {
+      outlineGeo.dispose(); // frees the old segments' GPU buffer
       outlineGeo.setAttribute("position", new THREE.Float32BufferAttribute(next?.segments ?? new Float32Array(0), 3));
       outlineGeo.computeBoundingSphere();
       outlineRadius = next === null || next.segments.length === 0 ? null : next.radius;
