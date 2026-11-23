@@ -93,6 +93,8 @@
 //! - Primitives: [`primitives::generate`] builds a closed, welded,
 //!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
 //!   prism (or an open plane) from its parameters, centred on the origin.
+//! - Height fields: [`heightfield()`](heightfield::heightfield) turns a grid
+//!   of heights (an image) into a closed relief with a flat base.
 //! - Brush deformation: [`inflate`](deform::inflate) and
 //!   [`smooth`](deform::smooth) move the vertices under a brush along their
 //!   smooth normals or toward their neighbours, and [`grab`](deform::grab)
@@ -118,6 +120,7 @@ pub mod extrude;
 mod fair;
 mod fill;
 mod fill_dp;
+pub mod heightfield;
 pub mod hull;
 pub mod icp;
 pub mod inspect;
