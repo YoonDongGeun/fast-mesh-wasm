@@ -558,6 +558,10 @@ class Engine {
   readonly #parked = new Set<ClientId>();
   /** Meshes parked, restored or dropped by the history in this batch (see `Result.presence`). */
   readonly #moved = new Set<ClientId>();
+  /** What those moves left of fields (see `Result.fieldTargets`). */
+  readonly #fieldTargets = new Map<ClientId, ClientId[] | null>();
+  /** The sections those moves took meshes from (see `Result.sectionMeshes`). */
+  readonly #sectionsLost = new Set<ClientId>();
   /** The active drag, by the dragged mesh's client id. */
   #drag: { id: ClientId; session: ReturnType<Scene["drag"]>; collisionActive: boolean } | undefined;
   /** Meshes whose authoritative placement must be emitted in the next result even if delta is 0. */
@@ -1753,19 +1757,28 @@ class Engine {
   /**
    * Drops engine-side references of a removed mesh: fields on it (or only
    * to it) and its section entries. The scene did the same with the mesh. A
-   * `parked` mesh keeps the fields on it, and leaves those of other parked
-   * meshes alone: they come back together.
+   * `"parked"` mesh keeps the fields on it, and leaves those of other parked
+   * meshes alone: they come back together. What is left of the fields is
+   * reported when the client did not ask for the removal, or may see it in
+   * another order (`"parked"` and `"gone"`).
    */
-  #dropMeshRefs(id: ClientId, parked = false): void {
+  #dropMeshRefs(id: ClientId, why: "removed" | "parked" | "gone" = "removed"): void {
     for (const [field, [on, ...to]] of this.#fieldMeshes) {
-      if (parked && this.#parked.has(on)) {
+      if (why === "parked" && this.#parked.has(on)) {
         continue;
       }
       if (on === id || (to.length === 1 && to[0] === id)) {
         this.#dropField(field);
+        if (why !== "removed") {
+          this.#fieldTargets.set(field, null);
+        }
       } else if (to.includes(id)) {
         // The field keeps its other targets; so does a deferred build.
-        this.#fieldMeshes.set(field, [on, ...to.filter((m) => m !== id)]);
+        const left = to.filter((m) => m !== id);
+        this.#fieldMeshes.set(field, [on, ...left]);
+        if (why !== "removed") {
+          this.#fieldTargets.set(field, left);
+        }
         const desc = this.#deferred.get(field);
         if (desc !== undefined) {
           this.#deferred.set(field, { ...desc, to: desc.to.filter((m) => m !== id) });
@@ -1779,6 +1792,9 @@ class Engine {
           meshes.filter((m) => m !== id),
         );
         this.#goneEntries.push({ section, mesh: id });
+        if (why !== "removed") {
+          this.#sectionsLost.add(section);
+        }
       }
     }
   }
@@ -1807,7 +1823,7 @@ class Engine {
       if (this.#drag?.id === id) {
         this.#drag = undefined;
       }
-      this.#dropMeshRefs(id, true);
+      this.#dropMeshRefs(id, "parked");
     }
   }
 
@@ -1823,7 +1839,7 @@ class Engine {
       this.#meshes.delete(id);
       // `#meshIds` keeps the handle until its removal record is sent.
       this.#removed.push(h);
-      this.#dropMeshRefs(id);
+      this.#dropMeshRefs(id, "gone");
     }
   }
 
@@ -2692,6 +2708,13 @@ class Engine {
       state: this.#parked.has(id) ? "parked" : this.#meshes.has(id) ? "live" : "gone",
     }));
     this.#moved.clear();
+    const fieldTargets = [...this.#fieldTargets].map(([field, to]) => ({ field, to }));
+    this.#fieldTargets.clear();
+    const sectionMeshes = [...this.#sectionsLost].flatMap((section) => {
+      const meshes = this.#sectionMeshes.get(section);
+      return meshes === undefined ? [] : [{ section, meshes }];
+    });
+    this.#sectionsLost.clear();
     const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
     // Every landed add's record is in this frame.
     this.#packed.clear();
@@ -2713,6 +2736,8 @@ class Engine {
       sections,
       history,
       ...(presence.length === 0 ? {} : { presence }),
+      ...(fieldTargets.length === 0 ? {} : { fieldTargets }),
+      ...(sectionMeshes.length === 0 ? {} : { sectionMeshes }),
       status: b.status,
       replies: b.replies,
       colorings: b.colorings,

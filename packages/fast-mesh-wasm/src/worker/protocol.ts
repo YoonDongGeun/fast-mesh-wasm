@@ -517,6 +517,14 @@ export interface Result {
    */
   presence?: { id: ClientId; state: "live" | "parked" | "gone" }[];
   /**
+   * The fields that lost targets to such a move, with the targets left, or
+   * `null` for a field that went (it was measured to nothing else, or on a
+   * mesh now gone for good). Omitted when there is none.
+   */
+  fieldTargets?: { field: ClientId; to: ClientId[] | null }[];
+  /** The sections that lost meshes to such a move, with the meshes left. Omitted when there is none. */
+  sectionMeshes?: { section: ClientId; meshes: ClientId[] }[];
+  /**
    * The outcome of every keyed request run in this batch, in order (a
    * request dropped as superseded, or an abandoned field build, has none).
    */

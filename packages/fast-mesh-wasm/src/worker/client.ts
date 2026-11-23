@@ -721,6 +721,12 @@ let debugDumpOf: (scene: WorkerScene, mesh: MeshHandle) => Promise<QueryMap["deb
 let addFieldKeyedOf: (scene: WorkerScene, desc: DistanceFieldDesc, key: string) => FieldHandle;
 /** Set by `WorkerScene`'s static block: the internal {@link watchStatusKeys}. */
 let watchStatusKeysOf: (scene: WorkerScene, sink: (key: string) => void) => () => void;
+/** Set by `WorkerScene`'s static block: the internal {@link fieldTargets}. */
+let fieldTargetsOf: (scene: WorkerScene, field: FieldHandle) => readonly MeshHandle[] | null;
+/** Set by `WorkerScene`'s static block: the internal {@link sectionMeshes}. */
+let sectionMeshesOf: (scene: WorkerScene, section: SectionHandle) => readonly MeshHandle[];
+/** Set by `WorkerScene`'s static block: the internal {@link presenceVersion}. */
+let presenceVersionOf: (scene: WorkerScene) => number;
 
 /**
  * A scene whose engine runs in a Worker, from {@link createWorkerScene}. It
@@ -819,6 +825,8 @@ export class WorkerScene implements SceneLike {
   readonly #latest = new Map<string, number>();
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
+  /** See {@link presenceVersion}. */
+  #presenceVersion = 0;
   /** The values mirror is on (a `values()` read asked for it). */
   #values = false;
   #drag: DragState | undefined;
@@ -1603,6 +1611,11 @@ export class WorkerScene implements SceneLike {
    * requested after the result's batch decides instead.
    */
   #applyPresence(r: Result): void {
+    if (r.presence === undefined && r.fieldTargets === undefined && r.sectionMeshes === undefined) {
+      return;
+    }
+    this.#presenceVersion++;
+    this.#statusChanged();
     const moved = (r.presence ?? []).flatMap(({ id, state }) => {
       const st = this.#meshes.get(id);
       return st === undefined || r.rev < st.removedRev ? [] : [{ st, state }];
@@ -1633,16 +1646,32 @@ export class WorkerScene implements SceneLike {
         this.#removedHere(st);
       }
     }
-    // Once every mesh that left says so: their fields stay between them.
     for (const st of left) {
-      this.#dropLinks(st, r.rev);
+      this.#dropLinks(st);
+    }
+    // What went with them depends on the order of the steps, which only the
+    // engine knows (a mesh may have left and come back).
+    for (const { section, meshes } of r.sectionMeshes ?? []) {
+      const s = this.#sections.get(section);
+      if (s !== undefined && !s.removed && (this.#latest.get(`section:${section}:meshes`) ?? 0) <= r.rev) {
+        s.meshes = meshes.flatMap((id) => this.#meshes.get(id) ?? []);
+      }
+    }
+    for (const { field, to } of r.fieldTargets ?? []) {
+      const f = this.#fields.get(field);
+      if (f === undefined || f.removed) {
+        continue;
+      }
+      if (to === null) {
+        this.#fieldRemoved(f, r.rev);
+      } else {
+        // A new object: sent requests keep theirs.
+        f.desc = { ...f.desc, to };
+      }
     }
     for (const { st, state } of moved) {
-      if (state === "gone") {
-        this.#dropLinks(st, r.rev);
-        if (st.gone) {
-          this.#forgetMesh(st);
-        }
+      if (state === "gone" && st.gone) {
+        this.#forgetMesh(st);
       }
     }
   }
@@ -2007,18 +2036,20 @@ export class WorkerScene implements SceneLike {
   #noteRemoved(st: MeshState, rev: number): void {
     st.removed = true;
     st.removedRev = rev;
-    this.#dropLinks(st, rev);
+    if (!st.parked) {
+      this.#dropFieldsOf(st, rev);
+    }
+    this.#dropLinks(st);
   }
 
   /**
-   * Cuts a removed mesh's links: fields on it (or only to it) are dropped and
-   * its section entries and collision rules go. The engine does the same
-   * when the removal lands. A parked mesh keeps the fields on it, and leaves
-   * those of other parked meshes alone: they come back together.
+   * Drops the fields on a mesh removed for good (or only to it). The engine
+   * does the same when the removal lands; for a parked mesh it says what is
+   * left of the fields ({@link WorkerScene.#applyPresence}).
    */
-  #dropLinks(st: MeshState, rev: number): void {
+  #dropFieldsOf(st: MeshState, rev: number): void {
     for (const f of this.#fields.values()) {
-      if (f.removed || (st.parked && this.#meshes.get(f.desc.on)?.parked === true)) {
+      if (f.removed) {
         continue;
       }
       if (f.desc.on === st.id || (f.desc.to.length === 1 && f.desc.to[0] === st.id)) {
@@ -2029,6 +2060,10 @@ export class WorkerScene implements SceneLike {
         f.desc = { ...f.desc, to: f.desc.to.filter((m) => m !== st.id) };
       }
     }
+  }
+
+  /** A removed mesh's section entries and collision rules go, as they do in the engine. */
+  #dropLinks(st: MeshState): void {
     for (const s of this.#sections.values()) {
       if (!s.removed) {
         s.meshes = s.meshes.filter((m) => m !== st);
@@ -4268,7 +4303,7 @@ export class WorkerScene implements SceneLike {
     // The history goes, and with it the way back of every parked mesh.
     for (const st of [...this.#meshes.values()].filter((m) => m.parked)) {
       st.parked = false;
-      this.#dropLinks(st, this.#rev);
+      this.#dropFieldsOf(st, this.#rev);
       if (st.gone) {
         this.#forgetMesh(st);
       }
@@ -4495,6 +4530,15 @@ export class WorkerScene implements SceneLike {
         scene.#statusSinks.delete(sink);
       };
     };
+    fieldTargetsOf = (scene, field) => {
+      const st = scene.#byField.get(field);
+      if (st === undefined || st.removed) {
+        return null;
+      }
+      return st.desc.to.flatMap((id) => scene.#meshes.get(id)?.handle ?? []);
+    };
+    sectionMeshesOf = (scene, section) => scene.#bySection.get(section)?.meshes.map((m) => m.handle) ?? [];
+    presenceVersionOf = (scene) => scene.#presenceVersion;
     debugDumpOf = (scene, mesh) =>
       scene.#query(
         "debugDump",
@@ -4532,6 +4576,28 @@ export function addFieldKeyed(scene: WorkerScene, desc: DistanceFieldDesc, key: 
  */
 export function watchStatusKeys(scene: WorkerScene, sink: (key: string) => void): () => void {
   return watchStatusKeysOf(scene, sink);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: the targets a field is
+ * left with as of the latest result, or `null` for one that is gone.
+ */
+export function fieldTargets(scene: WorkerScene, field: FieldHandle): readonly MeshHandle[] | null {
+  return fieldTargetsOf(scene, field);
+}
+
+/** Internal, not exported from `fast-mesh-wasm/worker`: the meshes a section cuts, as of the latest result. */
+export function sectionMeshes(scene: WorkerScene, section: SectionHandle): readonly MeshHandle[] {
+  return sectionMeshesOf(scene, section);
+}
+
+/**
+ * Internal, not exported from `fast-mesh-wasm/worker`: goes up with every
+ * result that says where undoable adds and removals moved meshes. `onStatus`
+ * listeners are called for it.
+ */
+export function presenceVersion(scene: WorkerScene): number {
+  return presenceVersionOf(scene);
 }
 
 /** Test-only, not exported from `fast-mesh-wasm/worker`: the sizes of the scene's internal maps. */

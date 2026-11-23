@@ -120,10 +120,10 @@ describe("convex hulls on Scene & WorkerScene", () => {
     expect(s.bounds(both.mesh)).not.toBeNull();
     expect(liveTriangles(s, both.mesh)).toBe(12);
 
-    // One undo step empties it; redo fills it again. The sources are untouched.
+    // One undo step removes it (#269); redo brings it back. The sources are untouched.
     s.undo();
     await settle(s);
-    expect(liveTriangles(s, both.mesh)).toBe(0);
+    expect([s.has(both.mesh), s.isRestorable(both.mesh)]).toEqual([false, true]);
     expect(liveTriangles(s, ma)).toBe(12);
     s.redo();
     await settle(s);
