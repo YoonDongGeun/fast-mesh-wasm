@@ -48,3 +48,7 @@ harness = false
 [[bench]]
 name = "wrap"
 harness = false
+
+[[bench]]
+name = "extrude"
+harness = false

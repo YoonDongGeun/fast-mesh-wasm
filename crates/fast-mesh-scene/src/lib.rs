@@ -27,6 +27,9 @@
 //! - Booleans: [`Scene::boolean`] unions, subtracts or intersects mesh B
 //!   into mesh A in the world; the result replaces A with A's placement,
 //!   as one undo step.
+//! - Extrusion: [`Scene::extrude_faces`] moves a triangle selection out and
+//!   walls its boundary, and [`Scene::extrude_base`] runs boundary loops to a
+//!   flat, capped base; each is one undo step, measured in the world.
 //! - Convex hulls: [`Scene::convex_hull`] and [`Scene::convex_hull_points`]
 //!   add the exact convex hull of meshes or points as a new mesh, filled as
 //!   one undo step.
@@ -106,6 +109,7 @@ mod cut;
 mod denoise;
 mod domains;
 mod error;
+mod extrude;
 mod fields;
 mod history;
 mod hull;
@@ -136,6 +140,7 @@ pub use domains::{
     SceneRepairOps, SceneSculptOps,
 };
 pub use error::{Result, SceneError};
+pub use extrude::{BasePlane, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeFacesOptions};
 pub use fast_mesh_fields::{
     ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
 };

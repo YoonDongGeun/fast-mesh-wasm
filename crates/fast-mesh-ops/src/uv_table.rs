@@ -8,6 +8,9 @@ use fast_mesh_store::{Mesh, VertexId};
 
 use crate::bridge::BridgeOptions;
 use crate::deform::{Brush, Falloff, GrabOptions, InflateOptions, SmoothMethod, SmoothOptions};
+use crate::extrude::{
+    BaseLevel, ExtrudeBaseOptions, ExtrudeFacesOptions, extrude_base, extrude_faces,
+};
 use crate::remesh::{Region, RemeshOptions, SurfaceRemeshOptions, remesh_surface};
 use crate::simplify::{DecimateOptions, SimplifyOptions, simplify_with};
 use crate::subdivide::{SubdivideMethod, SubdivideOptions};
@@ -537,6 +540,49 @@ fn shell_copies_uvs_to_the_inner_surface() {
     for k in 0..n as u32 {
         assert_eq!(uv_of(&m, n as u32 + k), uv_of(&before, k));
     }
+}
+
+#[test]
+fn extrude_faces_copies_uvs_to_the_caps() {
+    // Straight up, so a copy with its parent's UV stays on the planar mapping.
+    let mut m = with_planar(grid(4));
+    let before = copy(&m);
+    let sel: Vec<u32> = (10..22).collect();
+    let options = ExtrudeFacesOptions::default();
+    let (r, _) = edit(&mut m, |tx| extrude_faces(tx, &sel, &options));
+    assert!(r.added_vertices > 0);
+    assert_kept(&m, &before);
+    assert_planar(&m, 0.);
+}
+
+#[test]
+fn extrude_faces_walls_a_seam() {
+    // Two islands of two triangles: each has 4 border edges, the seam's among
+    // them, with 2 wall triangles on each.
+    let mut m = seam_with_bend(0.);
+    let sel: Vec<u32> = (0..4).collect();
+    let options = ExtrudeFacesOptions::default();
+    let (r, _) = edit(&mut m, |tx| extrude_faces(tx, &sel, &options));
+    assert_eq!(r.regions, 2);
+    assert_eq!(r.wall_triangles.len(), 2 * 8);
+    let on_seam = r
+        .wall_triangles
+        .iter()
+        .filter_map(|&t| m.triangle(t))
+        .filter(|t| t.iter().all(|&v| m.position(v).unwrap()[0] == 1.))
+        .count();
+    assert_eq!(on_seam, 4);
+}
+
+#[test]
+fn extrude_base_copies_rim_uvs_and_interpolates_the_cap() {
+    let mut m = with_planar(hemisphere(6, 16, 1.0));
+    let before = copy(&m);
+    let options = ExtrudeBaseOptions::along([0., 0., -1.], BaseLevel::At(0.5));
+    let (r, _) = edit(&mut m, |tx| extrude_base(tx, &options));
+    assert!(r.cap_vertices > 0);
+    assert_kept(&m, &before);
+    assert_planar(&m, 1e-6);
 }
 
 #[test]
