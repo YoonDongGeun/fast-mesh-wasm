@@ -84,7 +84,7 @@ fn bench_wrap(c: &mut Criterion) {
             input.triangles.len(),
             plan.dims,
             plan.voxels,
-            plan.bytes / (1 << 20),
+            plan.bytes >> 20,
             report.vertices,
             report.triangles,
             report.projected

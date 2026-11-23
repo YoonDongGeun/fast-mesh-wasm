@@ -26,7 +26,8 @@
 //! 5. **Project** (optional, [`WrapOptions::project`]): every vertex within
 //!    one voxel of the input moves to its closest input point, unless that
 //!    flips, collapses or folds a triangle or makes the surface intersect
-//!    itself; such vertices stay where marching cubes put them.
+//!    itself (checked exactly); such vertices stay where marching cubes put
+//!    them.
 //!
 //! Where the input is smoother than `r`, the result follows it to within
 //! the voxel resolution; concave corners get fillets of radius about `r`,
@@ -44,10 +45,11 @@
 //! marching cubes run on rayon's pool; the result is bit-identical with and
 //! without the feature, for any thread count.
 
-use fast_mesh_bvh::{BuildOptions, Bvh, BvhError};
+use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_fields::{DEFAULT_MAX_VOXELS, GridSpec, edt_3d_sq, fh_unsigned_grid};
 use fast_mesh_query::{ClosestHit, ClosestOptions, closest_point_many, self_intersecting_pairs};
-use fast_mesh_store::{Mesh, StoreError, TriangleId};
+use fast_mesh_store::{Mesh, StoreError, TriangleId, VertexId};
+use robust::{Coord3D, orient3d};
 
 use crate::append::{AppendSource, append_mesh};
 use crate::{IsoMesh, OpsError, Result, allocation_allowed, filled, marching_cubes_raw, reserve};
@@ -65,7 +67,7 @@ pub const MAX_WRAP_DETAIL: u32 = 4096;
 /// Bytes per voxel [`WrapPlan::bytes`] counts, at the peak: a distance grid
 /// (`f32`, also a distance transform's input), the outside flags (`u8`), and
 /// the distance transform's work buffer (`f64`) and output (`f32`).
-pub const WRAP_BYTES_PER_VOXEL: usize = 17;
+pub const WRAP_BYTES_PER_VOXEL: u64 = 17;
 
 /// Empty voxels around the offset surface on every side of the grid.
 const PAD_VOXELS: usize = 3;
@@ -74,6 +76,14 @@ const PAD_VOXELS: usize = 3;
 /// it, so every marching cubes vertex keeps at least about this fraction of
 /// a voxel from the grid nodes and no triangle collapses.
 const NUDGE: f32 = 0.01;
+
+/// Bound, in voxels, on how far the voxelised distance transform is from the
+/// exact distance: `sqrt(3) / 2`, with some slack.
+const VOXELISED_ERROR: f32 = 0.9;
+
+/// The voxel size must be at least this many rounding steps of the largest
+/// coordinate, so that rounding cannot move a vertex across its lattice edge.
+const MIN_VOXEL_ULPS: f64 = 1024.0;
 
 /// Grid nodes per closest-point batch.
 const QUERY_BATCH: usize = 16_384;
@@ -182,12 +192,12 @@ pub struct WrapPlan {
     pub voxel_size: f32,
     /// The closing radius in local units: half the gap, at least one voxel.
     pub radius: f32,
-    /// Grid nodes in all (`usize::MAX` when the count overflows).
-    pub voxels: usize,
+    /// Grid nodes in all (`u64::MAX` when the count overflows).
+    pub voxels: u64,
     /// Estimated peak memory of the grids, in bytes:
     /// [`WRAP_BYTES_PER_VOXEL`] per voxel. The input, the meshes extracted
     /// and their BVHs come on top.
-    pub bytes: usize,
+    pub bytes: u64,
     /// The limit the plan was checked against ([`WrapOptions::max_voxels`]).
     pub max_voxels: usize,
     /// Whether `voxels <= max_voxels`; [`wrap`] refuses the plan otherwise.
@@ -214,9 +224,10 @@ pub struct WrapReport {
 ///
 /// # Errors
 /// [`OpsError::InvalidInput`] for invalid options (see [`WrapOptions`]),
-/// bounds that are not finite or have `min > max`, or bounds without extent
-/// and no voxel size. A plan over the limit is not an error here: it comes
-/// back with `fits == false`.
+/// bounds that are not finite or have `min > max`, bounds without extent and
+/// no voxel size, or a voxel size that `f32` positions this far from the
+/// origin cannot resolve. A plan over the limit is not an error here: it
+/// comes back with `fits == false`.
 pub fn wrap_plan(min: [f32; 3], max: [f32; 3], options: &WrapOptions) -> Result<WrapPlan> {
     validate(options)?;
     if !min.iter().chain(&max).all(|c| c.is_finite()) || (0..3).any(|k| min[k] > max[k]) {
@@ -249,18 +260,23 @@ pub fn wrap_plan(min: [f32; 3], max: [f32; 3], options: &WrapOptions) -> Result<
     for k in 0..3 {
         let span = f64::from(max[k]) - f64::from(min[k]) + 2.0 * margin;
         let cells = (span / hd).ceil();
-        dims[k] = if cells.is_finite() && cells < 1e15 {
-            (cells as usize + 1).max(4)
-        } else {
-            usize::MAX
-        };
+        // Past a billion the plan never fits; kept below overflow.
+        dims[k] = (cells.min(1e9) as usize + 1).max(4);
         let center = 0.5 * (f64::from(min[k]) + f64::from(max[k]));
-        origin[k] = (center - 0.5 * dims[k].saturating_sub(1) as f64 * hd) as f32;
+        origin[k] = (center - 0.5 * (dims[k] - 1) as f64 * hd) as f32;
     }
-    let voxels = dims[0]
-        .checked_mul(dims[1])
-        .and_then(|xy| xy.checked_mul(dims[2]))
-        .unwrap_or(usize::MAX);
+    let voxels = dims.iter().fold(1u64, |n, &d| n.saturating_mul(d as u64));
+    let fits = voxels <= options.max_voxels as u64;
+    let largest = min
+        .iter()
+        .chain(&max)
+        .fold(0.0f64, |m, &c| m.max(f64::from(c).abs()))
+        + margin;
+    if fits && hd < MIN_VOXEL_ULPS * f64::from(f32::EPSILON) * largest {
+        return Err(OpsError::InvalidInput(
+            "wrap voxel size is too small for f32 positions this far from the origin",
+        ));
+    }
     Ok(WrapPlan {
         dims,
         origin,
@@ -269,7 +285,7 @@ pub fn wrap_plan(min: [f32; 3], max: [f32; 3], options: &WrapOptions) -> Result<
         voxels,
         bytes: voxels.saturating_mul(WRAP_BYTES_PER_VOXEL),
         max_voxels: options.max_voxels,
-        fits: voxels <= options.max_voxels,
+        fits,
     })
 }
 
@@ -297,74 +313,45 @@ pub fn wrap(source: &AppendSource, options: &WrapOptions) -> Result<(AppendSourc
     if !plan.fits {
         return Err(OpsError::InvalidInput("wrap grid exceeds max_voxels"));
     }
+    let (h, r) = (plan.voxel_size, plan.radius);
+    // The work mesh is centred on the middle of its bounds, and so is the grid.
     let spec = GridSpec {
-        origin: plan.origin,
+        origin: plan
+            .dims
+            .map(|n| (-0.5 * (n - 1) as f64 * f64::from(h)) as f32),
         dims: plan.dims,
-        voxel_size: plan.voxel_size,
+        voxel_size: h,
     };
     spec.validate(options.max_voxels)?;
-    let h = plan.voxel_size;
-    let r = plan.radius;
-    let delta = NUDGE * h;
     let bvh = build_bvh(&work.mesh)?;
 
-    // 1. The unsigned distance to the input, exact where it can be within
-    // about a voxel of `r` (the voxelised transform is off by at most
-    // `sqrt(3) / 2` voxels).
+    // 1. and 2. The dilated surface, from the distance to the input.
     let mut grid = fh_unsigned_grid(&work.mesh, spec, options.max_voxels)?.into_values();
-    refine(
-        &mut grid,
-        &spec,
-        |_, d| (d - r).abs() <= 2.0 * h,
-        &work.mesh,
-        &bvh,
-        r + 3.0 * h,
-        |d| d,
-    )?;
-
-    // 2. Dilate: the outside, and the boundary of everything else.
-    let outside = flood_outside(&grid, spec.dims, r)?;
-    for (v, &o) in grid.iter_mut().zip(&outside) {
-        *v = if o != 0 {
-            (*v - r).max(delta)
+    let mut flags: Vec<u8> = filled(grid.len(), 0)?;
+    let mut exact = NodeDistances::new(&work.mesh, &bvh, spec, r + 3.0 * h)?;
+    flood_outside(&mut grid, &mut flags, r, &mut exact)?;
+    drop(exact);
+    for (v, &f) in grid.iter_mut().zip(&flags) {
+        *v = if f & OUTSIDE != 0 {
+            (*v - r).max(NUDGE * h)
         } else {
-            (*v - r).min(-delta)
+            (*v - r).min(-NUDGE * h)
         };
     }
     let dilated = marching_cubes_raw(spec.origin, spec.dims, h, &grid, 0.0)?;
-    let dilated = mesh_of_iso(dilated)?;
+    let dilated = Mesh::from_buffers(
+        dilated.positions.as_flattened(),
+        dilated.triangles.as_flattened(),
+    )?;
     let dilated_bvh = build_bvh(&dilated)?;
 
-    // 3. Erode: the distance from every filled node to the dilated surface,
-    // first in whole voxels to the nearest outside node (at most `sqrt(3)`
-    // voxels more than the true distance), then exact near `r`.
-    for (v, &o) in grid.iter_mut().zip(&outside) {
-        *v = if o != 0 { 0.0 } else { f32::INFINITY };
-    }
-    {
-        let mut sq = filled(grid.len(), 0.0f32)?;
-        edt_3d_sq(spec.dims, &grid, &mut sq)?;
-        for ((v, &o), &s) in grid.iter_mut().zip(&outside).zip(&sq) {
-            *v = if o != 0 { r } else { r - h * s.sqrt() };
-        }
-    }
-    refine(
-        &mut grid,
-        &spec,
-        |i, f| outside[i] == 0 && f >= -2.8 * h && f <= 1.1 * h,
-        &dilated,
-        &dilated_bvh,
-        r + 3.0 * h,
-        |e| r - e,
-    )?;
+    // 3. The depth below that surface.
+    let mut exact = NodeDistances::new(&dilated, &dilated_bvh, spec, r + 3.0 * h)?;
+    erode(&mut grid, &mut flags, r, &mut exact)?;
+    drop(exact);
     drop(dilated_bvh);
     drop(dilated);
-    drop(outside);
-    for v in &mut grid {
-        if *v > -delta && *v < delta {
-            *v = delta;
-        }
-    }
+    drop(flags);
 
     // 4. Extract.
     let mut iso = marching_cubes_raw(spec.origin, spec.dims, h, &grid, 0.0)?;
@@ -375,9 +362,14 @@ pub fn wrap(source: &AppendSource, options: &WrapOptions) -> Result<(AppendSourc
         ));
     }
 
+    // Back to the frame of `source`, before the projection's checks.
+    for p in &mut iso.positions {
+        *p = std::array::from_fn(|k| (f64::from(p[k]) + work.center[k]) as f32);
+    }
+
     // 5. Project.
     let projected = if options.project {
-        project(&mut iso, &work.mesh, &bvh, h)?
+        project(&mut iso, &work, &bvh, h)?
     } else {
         0
     };
@@ -396,59 +388,70 @@ pub fn wrap(source: &AppendSource, options: &WrapOptions) -> Result<(AppendSourc
     ))
 }
 
-/// Wraps `meshes` together into a new mesh (see [`wrap`]). With one shared
-/// origin (one mesh, say) the wrap is built in their local frame and keeps
-/// that origin; otherwise it is built around the centre of their bounds,
-/// which becomes its origin. Lengths in `options` are local units.
+/// Wraps `meshes` together, in one frame with their origins applied, into a
+/// new mesh whose origin is the centre of their bounds (see [`wrap`]).
+/// Lengths in `options` are local units.
 ///
 /// # Errors
-/// [`OpsError::InvalidInput`] for an empty list, a local position that does
-/// not fit `f32` around the new origin, and as for [`wrap`].
+/// [`OpsError::InvalidInput`] for an empty list, a position that does not
+/// fit `f32` around the new origin, and as for [`wrap`].
 pub fn wrap_meshes(meshes: &[&Mesh], options: &WrapOptions) -> Result<(Mesh, WrapReport)> {
-    let Some(first) = meshes.first() else {
+    if meshes.is_empty() {
         return Err(OpsError::InvalidInput("wrap needs at least one mesh"));
-    };
-    let origin = first.origin();
-    let shared = meshes.iter().all(|m| m.origin() == origin);
-    let center = if shared {
-        origin
-    } else {
-        let mut lo = [f64::INFINITY; 3];
-        let mut hi = [f64::NEG_INFINITY; 3];
-        for mesh in meshes {
-            let o = mesh.origin();
-            for (v, p) in mesh.positions().iter().enumerate() {
-                if mesh.is_vertex_alive(v as u32) && mesh.corner_count(v as u32) > 0 {
-                    for k in 0..3 {
-                        let w = o[k] + f64::from(p[k]);
-                        lo[k] = lo[k].min(w);
-                        hi[k] = hi[k].max(w);
-                    }
-                }
-            }
-        }
-        if lo[0] > hi[0] {
-            origin
-        } else {
-            std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]))
-        }
-    };
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for mesh in meshes {
+        let o = mesh.origin();
+        extend_bounds(
+            mesh,
+            |p| std::array::from_fn(|k| o[k] + f64::from(p[k])),
+            &mut lo,
+            &mut hi,
+        );
+    }
+    if lo[0] > hi[0] {
+        return Err(OpsError::InvalidInput(
+            "wrap needs at least one triangle with area",
+        ));
+    }
+    let center: [f64; 3] = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
     let mut soup = AppendSource::default();
     for mesh in meshes {
         let o = mesh.origin();
-        let shift: [f64; 3] = std::array::from_fn(|k| o[k] - center[k]);
         push_soup(
             mesh,
-            |p| std::array::from_fn(|k| f64::from(p[k]) + shift[k]),
+            |p| std::array::from_fn(|k| o[k] + f64::from(p[k]) - center[k]),
             &mut soup,
         )?;
     }
     let (out, report) = wrap(&soup, options)?;
+    drop(soup);
     let mut mesh = Mesh::from_buffers_f64_with_origin(&[], &[], center)?;
     let mut tx = mesh.begin_edit();
     append_mesh(&mut tx, &out)?;
     tx.commit()?;
     Ok((mesh, report))
+}
+
+/// Grows the bounds `[lo, hi]` by the positions of the vertices that the
+/// live triangles of `mesh` use, mapped by `map`.
+pub fn extend_bounds(
+    mesh: &Mesh,
+    mut map: impl FnMut([f32; 3]) -> [f64; 3],
+    lo: &mut [f64; 3],
+    hi: &mut [f64; 3],
+) {
+    for (v, &p) in mesh.positions().iter().enumerate() {
+        let v = v as VertexId;
+        if mesh.is_vertex_alive(v) && mesh.corner_count(v) > 0 {
+            let q = map(p);
+            for k in 0..3 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+    }
 }
 
 /// Appends the live triangles of `mesh` to `soup`, with the vertices they
@@ -522,11 +525,13 @@ fn validate(options: &WrapOptions) -> Result<()> {
     Ok(())
 }
 
-/// The proper triangles of a soup as a compact mesh, with their bounds.
+/// The proper triangles of a soup as a compact mesh centred on the middle of
+/// their bounds, with those bounds.
 struct Work {
     mesh: Mesh,
     min: [f32; 3],
     max: [f32; 3],
+    center: [f64; 3],
 }
 
 fn work_mesh(source: &AppendSource) -> Result<Work> {
@@ -545,19 +550,14 @@ fn work_mesh(source: &AppendSource) -> Result<Work> {
         if a == b || b == c || a == c {
             continue;
         }
-        let p = tri.map(|v| source.positions[v as usize]);
-        if !p.iter().flatten().all(|c| c.is_finite()) {
+        if !tri
+            .iter()
+            .flat_map(|&v| source.positions[v as usize])
+            .all(f32::is_finite)
+        {
             return Err(OpsError::InvalidInput("wrap needs finite vertex positions"));
         }
-        let q = p.map(|x| x.map(f64::from));
-        let u: [f64; 3] = std::array::from_fn(|k| q[1][k] - q[0][k]);
-        let w: [f64; 3] = std::array::from_fn(|k| q[2][k] - q[0][k]);
-        let cross = [
-            u[1] * w[2] - u[2] * w[1],
-            u[2] * w[0] - u[0] * w[2],
-            u[0] * w[1] - u[1] * w[0],
-        ];
-        if cross == [0.0; 3] {
+        if normal(&source.positions, tri) == [0.0; 3] {
             continue;
         }
         let mut out = [0u32; 3];
@@ -569,11 +569,7 @@ fn work_mesh(source: &AppendSource) -> Result<Work> {
                     max[k] = max[k].max(pos[k]);
                 }
                 remap[v as usize] = positions.len() as u32;
-                if positions.len() == positions.capacity() {
-                    let grow = positions.len().max(64);
-                    reserve(&mut positions, grow)?;
-                }
-                positions.push(pos);
+                grow_push(&mut positions, pos)?;
             }
             *slot = remap[v as usize];
         }
@@ -584,129 +580,288 @@ fn work_mesh(source: &AppendSource) -> Result<Work> {
             "wrap needs at least one triangle with area",
         ));
     }
+    let center: [f64; 3] = std::array::from_fn(|k| 0.5 * (f64::from(min[k]) + f64::from(max[k])));
+    for p in &mut positions {
+        *p = std::array::from_fn(|k| (f64::from(p[k]) - center[k]) as f32);
+    }
     let mesh = Mesh::from_buffers(positions.as_flattened(), triangles.as_flattened())?;
-    Ok(Work { mesh, min, max })
-}
-
-fn build_bvh(mesh: &Mesh) -> Result<Bvh> {
-    Bvh::build(mesh, &BuildOptions::default()).map_err(|e| match e {
-        BvhError::OutOfMemory => OpsError::Store(StoreError::OutOfMemory),
-        e => e.into(),
+    Ok(Work {
+        mesh,
+        min,
+        max,
+        center,
     })
 }
 
-/// A mesh of the marching cubes output `iso`.
-fn mesh_of_iso(iso: IsoMesh) -> Result<Mesh> {
-    let mesh = Mesh::from_buffers(iso.positions.as_flattened(), iso.triangles.as_flattened())?;
-    Ok(mesh)
+fn build_bvh(mesh: &Mesh) -> Result<Bvh> {
+    Ok(Bvh::build(mesh, &BuildOptions::default())?)
 }
 
-/// Replaces `values[i]` by `map(distance)` for every node `i` that `select`
-/// picks, where `distance` is the exact distance from the node to `mesh`
-/// (`max_distance` when nothing is that close).
-fn refine(
-    values: &mut [f32],
-    spec: &GridSpec,
-    select: impl Fn(usize, f32) -> bool,
-    mesh: &Mesh,
-    bvh: &Bvh,
-    max_distance: f32,
-    map: impl Fn(f32) -> f32,
-) -> Result<()> {
-    let [nx, ny, _] = spec.dims;
-    let nxy = nx * ny;
-    let mut nodes: Vec<usize> = Vec::new();
-    reserve(&mut nodes, QUERY_BATCH)?;
-    let mut points: Vec<[f32; 3]> = Vec::new();
-    reserve(&mut points, QUERY_BATCH)?;
-    let mut hits: Vec<Option<ClosestHit>> = filled(QUERY_BATCH, None)?;
-    let opts = ClosestOptions { max_distance };
-    let mut flush =
-        |nodes: &mut Vec<usize>, points: &mut Vec<[f32; 3]>, values: &mut [f32]| -> Result<()> {
-            let hits = &mut hits[..points.len()];
-            closest_point_many(mesh, bvh, points, &opts, hits)?;
-            for (&i, hit) in nodes.iter().zip(hits.iter()) {
-                values[i] = map(hit.map_or(max_distance, |h| h.distance));
-            }
-            nodes.clear();
-            points.clear();
-            Ok(())
-        };
-    for i in 0..values.len() {
-        if !select(i, values[i]) {
-            continue;
-        }
-        let iz = i / nxy;
-        let rem = i % nxy;
-        nodes.push(i);
-        points.push(spec.point(rem % nx, rem / nx, iz));
-        if nodes.len() == QUERY_BATCH {
-            flush(&mut nodes, &mut points, values)?;
-        }
+/// Pushes with a reservation that doubles the capacity.
+fn grow_push<T>(v: &mut Vec<T>, value: T) -> Result<()> {
+    if v.len() == v.capacity() {
+        let grow = v.len().max(64);
+        reserve(v, grow)?;
     }
-    if !nodes.is_empty() {
-        flush(&mut nodes, &mut points, values)?;
+    v.push(value);
+    Ok(())
+}
+
+/// Exact distances from grid nodes to a mesh, queried in batches.
+struct NodeDistances<'a> {
+    mesh: &'a Mesh,
+    bvh: &'a Bvh,
+    spec: GridSpec,
+    max_distance: f32,
+    points: Vec<[f32; 3]>,
+    hits: Vec<Option<ClosestHit>>,
+}
+
+impl<'a> NodeDistances<'a> {
+    fn new(mesh: &'a Mesh, bvh: &'a Bvh, spec: GridSpec, max_distance: f32) -> Result<Self> {
+        let mut points = Vec::new();
+        reserve(&mut points, QUERY_BATCH)?;
+        Ok(NodeDistances {
+            mesh,
+            bvh,
+            spec,
+            max_distance,
+            points,
+            hits: filled(QUERY_BATCH, None)?,
+        })
+    }
+
+    /// Calls `write` with each of `nodes`, in order, and its distance to the
+    /// mesh (`max_distance` when nothing is that close).
+    fn each(&mut self, nodes: &[usize], mut write: impl FnMut(usize, f32)) -> Result<()> {
+        let [nx, ny, _] = self.spec.dims;
+        let opts = ClosestOptions {
+            max_distance: self.max_distance,
+        };
+        for chunk in nodes.chunks(QUERY_BATCH) {
+            self.points.clear();
+            for &i in chunk {
+                let row = i / nx;
+                self.points
+                    .push(self.spec.point(i % nx, row % ny, row / ny));
+            }
+            let hits = &mut self.hits[..chunk.len()];
+            closest_point_many(self.mesh, self.bvh, &self.points, &opts, hits)?;
+            for (&i, hit) in chunk.iter().zip(hits) {
+                write(i, hit.map_or(self.max_distance, |h| h.distance));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A node reachable from the grid boundary that is farther than `r` from the
+/// input.
+const OUTSIDE: u8 = 1;
+/// A node whose grid value is exact (or is queued to become so).
+const EXACT: u8 = 2;
+
+/// The flat index distance to the next node along each axis.
+fn steps([nx, ny, _]: [usize; 3]) -> [usize; 3] {
+    [1, nx, nx * ny]
+}
+
+/// Calls `f` with the index of every node that is not on the grid boundary,
+/// in order.
+fn for_each_interior(
+    [nx, ny, nz]: [usize; 3],
+    mut f: impl FnMut(usize) -> Result<()>,
+) -> Result<()> {
+    for z in 1..nz - 1 {
+        for y in 1..ny - 1 {
+            let row = (z * ny + y) * nx;
+            for i in row + 1..row + nx - 1 {
+                f(i)?;
+            }
+        }
     }
     Ok(())
 }
 
-/// The nodes farther than `r` that a 6-connected walk from the grid boundary
-/// through such nodes reaches, as `1`; every other node `0`.
-fn flood_outside(distance: &[f32], dims: [usize; 3], r: f32) -> Result<Vec<u8>> {
+/// Looks at node `i` from a neighbouring outside node: one that is surely
+/// farther than `r` from the input is outside and goes on the stack, one too
+/// close to `r` to tell is queued for its exact distance.
+fn reach(
+    i: usize,
+    grid: &[f32],
+    flags: &mut [u8],
+    (r, band): (f32, f32),
+    stack: &mut Vec<usize>,
+    queue: &mut Vec<usize>,
+) -> Result<()> {
+    if flags[i] != 0 {
+        return Ok(());
+    }
+    let d = grid[i];
+    if (d - r).abs() <= band {
+        flags[i] = EXACT;
+        grow_push(queue, i)?;
+    } else if d > r {
+        flags[i] = OUTSIDE;
+        grow_push(stack, i)?;
+    }
+    Ok(())
+}
+
+/// Flags as [`OUTSIDE`] the nodes farther than `r` from the input that a
+/// 6-connected walk from the grid boundary through such nodes reaches, and
+/// makes `grid` exact at both ends of every lattice edge that leaves them.
+///
+/// On entry `grid` holds the voxelised distance, off by at most `sqrt(3) / 2`
+/// voxels, so only nodes that close to `r` need the exact distance to be told
+/// apart, and only those next to an outside node are asked for it.
+fn flood_outside(
+    grid: &mut [f32],
+    flags: &mut [u8],
+    r: f32,
+    exact: &mut NodeDistances,
+) -> Result<()> {
+    let dims = exact.spec.dims;
+    let h = exact.spec.voxel_size;
     let [nx, ny, nz] = dims;
-    let nxy = nx * ny;
-    let mut outside: Vec<u8> = filled(distance.len(), 0)?;
-    let mut frontier: Vec<usize> = Vec::new();
-    let mut next: Vec<usize> = Vec::new();
-    let visit = |i: usize, outside: &mut [u8], into: &mut Vec<usize>| -> Result<()> {
-        if outside[i] == 0 && distance[i] > r {
-            outside[i] = 1;
-            if into.len() == into.capacity() {
-                let grow = into.len().max(1024);
-                reserve(into, grow)?;
+    let steps = steps(dims);
+    let near = (r, VOXELISED_ERROR * h);
+    // The boundary is farther than `r + 2 h` from the input.
+    for z in 0..nz {
+        for y in 0..ny {
+            let row = (z * ny + y) * nx;
+            if z == 0 || z + 1 == nz || y == 0 || y + 1 == ny {
+                flags[row..row + nx].fill(OUTSIDE);
+            } else {
+                flags[row] = OUTSIDE;
+                flags[row + nx - 1] = OUTSIDE;
             }
-            into.push(i);
+        }
+    }
+    let mut stack: Vec<usize> = Vec::new();
+    let mut queue: Vec<usize> = Vec::new();
+    for_each_interior(dims, |i| {
+        let (x, row) = (i % nx, i / nx);
+        let (y, z) = (row % ny, row / ny);
+        if x == 1 || y == 1 || z == 1 || x + 2 == nx || y + 2 == ny || z + 2 == nz {
+            reach(i, grid, flags, near, &mut stack, &mut queue)?;
         }
         Ok(())
-    };
-    for iz in 0..nz {
-        for iy in 0..ny {
-            for ix in 0..nx {
-                if ix == 0 || iy == 0 || iz == 0 || ix + 1 == nx || iy + 1 == ny || iz + 1 == nz {
-                    visit((iz * ny + iy) * nx + ix, &mut outside, &mut frontier)?;
+    })?;
+    loop {
+        // Only interior nodes are stacked, so every neighbour exists.
+        while let Some(i) = stack.pop() {
+            for s in steps {
+                reach(i - s, grid, flags, near, &mut stack, &mut queue)?;
+                reach(i + s, grid, flags, near, &mut stack, &mut queue)?;
+            }
+        }
+        if queue.is_empty() {
+            break;
+        }
+        queue.sort_unstable();
+        exact.each(&queue, |i, d| grid[i] = d)?;
+        for &i in &queue {
+            if grid[i] > r {
+                flags[i] |= OUTSIDE;
+                grow_push(&mut stack, i)?;
+            }
+        }
+        queue.clear();
+    }
+    // The ends of the edges that leave the outside, within `h` of `r`.
+    for_each_interior(dims, |i| {
+        if flags[i] & OUTSIDE == 0 || grid[i] > r + 2.0 * h {
+            return Ok(());
+        }
+        let mut leaves = false;
+        for s in steps {
+            for j in [i - s, i + s] {
+                if flags[j] & OUTSIDE == 0 {
+                    leaves = true;
+                    if flags[j] & EXACT == 0 {
+                        flags[j] |= EXACT;
+                        grow_push(&mut queue, j)?;
+                    }
                 }
             }
         }
+        if leaves && flags[i] & EXACT == 0 {
+            flags[i] |= EXACT;
+            grow_push(&mut queue, i)?;
+        }
+        Ok(())
+    })?;
+    exact.each(&queue, |i, d| grid[i] = d)
+}
+
+/// Replaces `grid` by `r` minus the depth below the dilated surface that
+/// `exact` measures to: negative deeper than `r`, where the result is. Values
+/// keep clear of zero by [`NUDGE`] voxels, and both ends of every lattice edge
+/// that changes sign are exact.
+fn erode(grid: &mut [f32], flags: &mut [u8], r: f32, exact: &mut NodeDistances) -> Result<()> {
+    let dims = exact.spec.dims;
+    let h = exact.spec.voxel_size;
+    let steps = steps(dims);
+    let nudge = NUDGE * h;
+    for (v, f) in grid.iter_mut().zip(flags.iter_mut()) {
+        *f &= OUTSIDE;
+        *v = if *f != 0 { 0.0 } else { f32::INFINITY };
     }
-    while !frontier.is_empty() {
-        for &i in &frontier {
-            let iz = i / nxy;
-            let rem = i % nxy;
-            let iy = rem / nx;
-            let ix = rem % nx;
-            if ix > 0 {
-                visit(i - 1, &mut outside, &mut next)?;
-            }
-            if ix + 1 < nx {
-                visit(i + 1, &mut outside, &mut next)?;
-            }
-            if iy > 0 {
-                visit(i - nx, &mut outside, &mut next)?;
-            }
-            if iy + 1 < ny {
-                visit(i + nx, &mut outside, &mut next)?;
-            }
-            if iz > 0 {
-                visit(i - nxy, &mut outside, &mut next)?;
-            }
-            if iz + 1 < nz {
-                visit(i + nxy, &mut outside, &mut next)?;
+    // The distance to the nearest outside node is at most `sqrt(3)` voxels
+    // more than the depth, and never less.
+    {
+        let mut sq = filled(grid.len(), 0.0f32)?;
+        edt_3d_sq(dims, grid, &mut sq)?;
+        for ((v, &f), &s) in grid.iter_mut().zip(flags.iter()).zip(&sq) {
+            *v = if f != 0 { r } else { r - h * s.sqrt() };
+        }
+    }
+    let mut queue: Vec<usize> = Vec::new();
+    for_each_interior(dims, |i| {
+        if flags[i] == 0 && grid[i] >= -1.8 * h && grid[i] <= 0.05 * h {
+            flags[i] = EXACT;
+            grow_push(&mut queue, i)?;
+        }
+        Ok(())
+    })?;
+    exact.each(&queue, |i, e| grid[i] = r - e)?;
+    queue.clear();
+    for v in grid.iter_mut() {
+        if *v > -nudge && *v < nudge {
+            *v = nudge;
+        }
+    }
+    for_each_interior(dims, |i| {
+        if grid[i] > 0.0 || grid[i] < -3.0 * h {
+            return Ok(());
+        }
+        let mut crosses = false;
+        for s in steps {
+            for j in [i - s, i + s] {
+                if grid[j] > 0.0 {
+                    crosses = true;
+                    if flags[j] == 0 {
+                        flags[j] = EXACT;
+                        grow_push(&mut queue, j)?;
+                    }
+                }
             }
         }
-        std::mem::swap(&mut frontier, &mut next);
-        next.clear();
-    }
-    Ok(outside)
+        if crosses && flags[i] == 0 {
+            flags[i] = EXACT;
+            grow_push(&mut queue, i)?;
+        }
+        Ok(())
+    })?;
+    exact.each(&queue, |i, e| {
+        // Already on its side; the exact value only places the crossing.
+        grid[i] = if grid[i] > 0.0 {
+            (r - e).max(nudge)
+        } else {
+            (r - e).min(-nudge)
+        };
+    })
 }
 
 /// Twice the area vector of the triangle `[a, b, c]` of `p`, in `f64`.
@@ -780,11 +935,44 @@ impl Fans {
     }
 }
 
-/// Moves the vertices of `iso` within `max_distance` of `mesh` onto their
-/// closest points on it, except where that flips, collapses or folds a
-/// triangle (against the unprojected surface) or makes the surface intersect
-/// itself. Returns the vertices left moved.
-fn project(iso: &mut IsoMesh, mesh: &Mesh, bvh: &Bvh, max_distance: f32) -> Result<usize> {
+/// Whether two triangles that share exactly one corner also meet elsewhere
+/// (exactly, except that coplanar ones are not told).
+fn cross_beyond_corner(p: &[[f32; 3]], t: [u32; 3], u: [u32; 3]) -> bool {
+    let mut shared = (0..3).filter(|&i| u.contains(&t[i]));
+    let (Some(i), None) = (shared.next(), shared.next()) else {
+        return false;
+    };
+    let Some(j) = (0..3).find(|&j| u[j] == t[i]) else {
+        return false;
+    };
+    let at = |v: u32| {
+        let [x, y, z] = p[v as usize].map(f64::from);
+        Coord3D { x, y, z }
+    };
+    let (t, u) = (t.map(at), u.map(at));
+    // Whether the edge of `a` across from corner `i` meets the triangle `b`.
+    let edge_meets = |a: [Coord3D<f64>; 3], i: usize, b: [Coord3D<f64>; 3]| {
+        let (q, r) = (a[(i + 1) % 3], a[(i + 2) % 3]);
+        let side = [q, r].map(|x| orient3d(b[0], b[1], b[2], x));
+        if side[0] * side[1] > 0.0 || side == [0.0; 2] {
+            return false;
+        }
+        let w = [
+            orient3d(q, r, b[0], b[1]),
+            orient3d(q, r, b[1], b[2]),
+            orient3d(q, r, b[2], b[0]),
+        ];
+        w.iter().all(|&x| x >= 0.0) || w.iter().all(|&x| x <= 0.0)
+    };
+    edge_meets(t, i, u) || edge_meets(u, j, t)
+}
+
+/// Moves the vertices of `iso` (in the frame of the source) within
+/// `max_distance` of the input `work` onto their closest points on it, except
+/// where that flips, collapses or folds a triangle (against the unprojected
+/// surface) or makes the surface intersect itself. Returns the vertices left
+/// moved.
+fn project(iso: &mut IsoMesh, work: &Work, bvh: &Bvh, max_distance: f32) -> Result<usize> {
     let n = iso.positions.len();
     let tris = &iso.triangles;
     let mut original: Vec<[f32; 3]> = Vec::new();
@@ -793,19 +981,25 @@ fn project(iso: &mut IsoMesh, mesh: &Mesh, bvh: &Bvh, max_distance: f32) -> Resu
     let mut moved: Vec<bool> = filled(n, false)?;
     {
         let opts = ClosestOptions { max_distance };
+        let shift = |p: [f32; 3], by: f64| -> [f32; 3] {
+            std::array::from_fn(|k| (f64::from(p[k]) + by * work.center[k]) as f32)
+        };
+        let mut points: Vec<[f32; 3]> = Vec::new();
+        reserve(&mut points, QUERY_BATCH.min(n))?;
         let mut hits: Vec<Option<ClosestHit>> = filled(QUERY_BATCH.min(n), None)?;
-        for (start, chunk) in (0..n)
-            .step_by(QUERY_BATCH)
-            .zip(original.chunks(QUERY_BATCH))
-        {
+        for start in (0..n).step_by(QUERY_BATCH) {
+            let chunk = &original[start..(start + QUERY_BATCH).min(n)];
+            points.clear();
+            points.extend(chunk.iter().map(|&p| shift(p, -1.0)));
             let hits = &mut hits[..chunk.len()];
-            closest_point_many(mesh, bvh, chunk, &opts, hits)?;
+            closest_point_many(&work.mesh, bvh, &points, &opts, hits)?;
             for (k, hit) in hits.iter().enumerate() {
-                if let Some(hit) = hit
-                    && hit.point != chunk[k]
-                {
-                    iso.positions[start + k] = hit.point;
-                    moved[start + k] = true;
+                if let Some(hit) = hit {
+                    let to = shift(hit.point, 1.0);
+                    if to != chunk[k] {
+                        iso.positions[start + k] = to;
+                        moved[start + k] = true;
+                    }
                 }
             }
         }
@@ -849,7 +1043,8 @@ fn project(iso: &mut IsoMesh, mesh: &Mesh, bvh: &Bvh, max_distance: f32) -> Resu
     };
     let mut rounds = 0;
     loop {
-        // Flips, collapses and folds, until none is left.
+        // Flips, collapses, folds and crossings of triangles that share a
+        // corner, until none is left.
         while let Some(t) = queue.pop() {
             queued[t as usize] = false;
             let tri = tris[t as usize];
@@ -872,13 +1067,21 @@ fn project(iso: &mut IsoMesh, mesh: &Mesh, bvh: &Bvh, max_distance: f32) -> Resu
                     }
                 }
             }
+            if bad.is_none() {
+                bad = tri.iter().find_map(|&v| {
+                    fans.of(v)
+                        .iter()
+                        .copied()
+                        .find(|&u| cross_beyond_corner(&iso.positions, tri, tris[u as usize]))
+                });
+            }
             if let Some(u) = bad {
                 for v in tri.into_iter().chain(tris[u as usize]) {
                     revert(v, &mut iso.positions, &mut moved, &mut queued, &mut queue)?;
                 }
             }
         }
-        // Then self-intersections.
+        // Then crossings of triangles that share none.
         let check = Mesh::from_buffers(iso.positions.as_flattened(), tris.as_flattened())?;
         let check_bvh = build_bvh(&check)?;
         let mut pairs = Vec::new();
@@ -961,11 +1164,12 @@ mod tests {
         // The span plus the radius and three voxels on each side.
         assert_eq!(plan.dims, [32 + 2 * (4 + 3) + 1, 16 + 15, 16 + 15]);
         assert_eq!(plan.voxels, 47 * 31 * 31);
+        assert_eq!(plan.origin, [-0.4375, -0.4375, -0.4375]);
         assert_eq!(plan.bytes, plan.voxels * WRAP_BYTES_PER_VOXEL);
         assert!(plan.fits);
 
         let small = WrapOptions {
-            max_voxels: plan.voxels - 1,
+            max_voxels: plan.voxels as usize - 1,
             ..options
         };
         let tight = wrap_plan([0.0; 3], [2.0, 1.0, 1.0], &small).unwrap();
@@ -1072,6 +1276,32 @@ mod tests {
             assert_eq!(report.triangles, out.triangles.len());
             assert_eq!(report.projected > 0, project);
         }
+    }
+
+    #[test]
+    fn running_out_of_memory_is_an_error() {
+        let soup = soup_of(&[&box_mesh([0.0; 3], [1.0; 3])]);
+        let options = WrapOptions::builder()
+            .gap(0.3)
+            .detail(8)
+            .project(true)
+            .build();
+        let expected = wrap(&soup, &options).unwrap();
+        let mut failed = 0;
+        loop {
+            crate::fail_allocations_after(Some(failed));
+            let got = wrap(&soup, &options);
+            crate::fail_allocations_after(None);
+            match got {
+                Err(e) => assert_eq!(e, OpsError::Store(StoreError::OutOfMemory)),
+                Ok(got) => {
+                    assert_eq!(got, expected);
+                    break;
+                }
+            }
+            failed += 1;
+        }
+        assert!(failed > 10, "{failed} reservations");
     }
 
     #[test]
