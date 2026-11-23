@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "primitives"
 harness = false
+
+[[bench]]
+name = "denoise"
+harness = false

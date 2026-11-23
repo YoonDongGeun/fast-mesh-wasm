@@ -76,6 +76,12 @@
 //!   closed, outward-wound mesh, by quickhull on exact orientation predicates.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
+//! - Denoising and Delaunay flips: [`denoise()`] smooths scan noise by
+//!   bilateral normal filtering and a vertex update while keeping edges
+//!   sharper than a feature angle; [`delaunay_flips`] flips edges towards a
+//!   Delaunay triangulation where triangles are nearly coplanar, without
+//!   moving a vertex. Both take an optional face region and report
+//!   [`SurfaceStats`] before and after.
 //! - Primitives: [`primitives::generate`] builds a closed, welded,
 //!   outward-wound box, cylinder, cone, UV sphere, icosphere, torus, arrow or
 //!   prism (or an open plane) from its parameters, centred on the origin.
@@ -97,6 +103,8 @@ pub mod bridge;
 mod cleanup;
 mod cut;
 pub mod deform;
+pub mod delaunay;
+pub mod denoise;
 mod error;
 mod fair;
 mod fill;
@@ -138,6 +146,8 @@ pub use cleanup::{
     DegenerateReport, RemoveReport, WeldReport, remove_degenerate, remove_small_components, weld,
 };
 pub use cut::{CutOptions, CutOutput, CutReport, cut_by_plane};
+pub use delaunay::{DelaunayOptions, DelaunayReport, delaunay_flips};
+pub use denoise::{DenoiseOptions, DenoiseReport, SurfaceStats, denoise, surface_stats};
 pub use error::{OpsError, Result};
 pub use fill::{
     FailReason, FairWeights, FillOptions, FillOptionsBuilder, FillReport, FilledLoop, SkipReason,

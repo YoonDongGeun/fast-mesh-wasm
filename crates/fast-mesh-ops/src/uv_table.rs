@@ -14,10 +14,10 @@ use crate::subdivide::{SubdivideMethod, SubdivideOptions};
 use crate::test_util::{box_mesh, edit, grid, grid_without, hemisphere, mesh_of, uv_sphere};
 use crate::{
     AppendSource, AutoRepairOptions, BooleanOp, ComponentOptions, CutOptions, DegenerateOptions,
-    FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions, SkipReason, append_mesh,
-    append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan, boundary_loops, bridge_loops,
-    cut_by_plane, fill_holes, inflate, offset, orient, remove_degenerate, remove_small_components,
-    shell, weld,
+    DelaunayOptions, DenoiseOptions, FillOptions, OffsetAlgorithm, OffsetOptions, ShellOptions,
+    SkipReason, append_mesh, append_mesh_with_uvs, apply_boolean, auto_repair, boolean_plan,
+    boundary_loops, bridge_loops, cut_by_plane, delaunay_flips, denoise, fill_holes, inflate,
+    offset, orient, remove_degenerate, remove_small_components, shell, weld,
 };
 
 /// A planar UV of a position: linear, so anything interpolated stays on it.
@@ -570,6 +570,32 @@ fn brush() -> Brush {
         falloff: Falloff::Smooth,
         strength: 0.3,
     }
+}
+
+#[test]
+fn denoise_and_delaunay_flips_keep_uvs_on_their_vertices() {
+    // Sheared cells, so that there is something to flip.
+    let base = grid(6);
+    let mut positions: Vec<f32> = base.positions().iter().flatten().copied().collect();
+    for (i, p) in positions.chunks_mut(3).enumerate() {
+        p[0] += 0.8 * p[1];
+        p[2] = 0.02 * ((i * i) as f32).sin();
+    }
+    let triangles: Vec<[u32; 3]> = (0..base.triangle_slots() as u32)
+        .filter_map(|t| base.triangle(t))
+        .collect();
+    let start = with_planar(mesh_of(&positions, &triangles));
+    let mut m = copy(&start);
+    let (r, _) = edit(&mut m, |tx| denoise(tx, &DenoiseOptions::default(), None));
+    assert!(r.moved > 0);
+    assert_kept(&m, &start);
+    let mut m = copy(&start);
+    let (r, _) = edit(&mut m, |tx| {
+        delaunay_flips(tx, &DelaunayOptions::default(), None)
+    });
+    assert!(r.flips > 0);
+    assert_kept(&m, &start);
+    assert_planar(&m, 0.0);
 }
 
 #[test]
