@@ -165,6 +165,7 @@ fn bench_base(c: &mut Criterion) {
             ("", true, true),
             ("_no_refine", false, true),
             ("_no_check", true, false),
+            ("_no_refine_no_check", false, false),
         ] {
             let options = ExtrudeBaseOptions {
                 refine,

@@ -35,8 +35,8 @@ pub(crate) struct Planned<'a> {
     /// the check, since they will not exist as they are.
     pub(crate) replaced: &'a [TriangleId],
     /// The group of each of `triangles`, or [`NO_GROUP`]. Triangles of one
-    /// group do not move relative to each other, or tile a planar polygon,
-    /// so they get no new intersections among themselves.
+    /// group get no new intersections among themselves: they do not move
+    /// relative to each other, say, or tile a planar polygon.
     pub(crate) groups: &'a [u32],
 }
 

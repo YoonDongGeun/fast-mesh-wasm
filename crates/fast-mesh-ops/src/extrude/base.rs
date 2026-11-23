@@ -3,7 +3,7 @@
 
 use fast_mesh_store::{Mesh, Transaction, TriangleId, VertexId};
 
-use super::check::{Found, NO_GROUP, Planned, intersections};
+use super::check::{Found, Planned, intersections};
 use super::{to_f32, unit};
 use crate::fill_dp::{triangulate_flat_loop, triangulate_with_islands};
 use crate::refine::refine;
@@ -423,7 +423,18 @@ fn plan(mesh: &Mesh, o: &ExtrudeBaseOptions) -> Result<Plan> {
 
     let budget = if o.refine { CAP_VERTEX_BUDGET } else { 0 };
     let mut capped = false;
-    let mut groups = filled(walls, NO_GROUP)?;
+    // A simple outline's walls and cap meet only along their edges: the walls
+    // run in one direction, so they cross only where the outline does.
+    let mut groups: Vec<u32> = Vec::new();
+    reserve(&mut groups, walls)?;
+    for (i, sl) in scratch_loops.iter().enumerate() {
+        let outer = if depth[i] % 2 == 0 {
+            i as u32
+        } else {
+            parent[i]
+        };
+        groups.resize(groups.len() + 2 * sl.n as usize, outer);
+    }
     let mut cap_parents: Vec<[(VertexId, f32); 3]> = Vec::new();
     // A scratch base vertex's planned id.
     let mut planned_base = filled(flat.len() / 3, NONE)?;
