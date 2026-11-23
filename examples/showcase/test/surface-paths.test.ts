@@ -11,7 +11,7 @@ import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { createWorkerScene, type WorkerLike } from "fast-mesh-wasm/worker";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AppState, type Item } from "../src/app/state/app-state";
-import { blobbySphere } from "../src/io/demo";
+import { blobbySphere, demoMeshes, openShellWithPiece } from "../src/io/demo";
 import {
   autoIsoSpacing,
   geodesicLegend,
@@ -27,8 +27,10 @@ import {
 import {
   closeSurfaceLoop,
   landSurfacePick,
+  compactPart,
   liveTriangleCount,
   NO_CUT_MESSAGE,
+  partsOf,
   queueSurfaceTap,
   settleChanges,
   splitAlongPath,
@@ -798,6 +800,186 @@ describe.each(["local", "worker"] as const)("trim and split on a %s scene", (kin
     // The copy split was filling is gone, and nothing was listed.
     expect(store.getSnapshot().meshes.size).toBe(meshes);
     expect(app.getSnapshot().items.map((i) => i.name)).toEqual(["Ring"]);
+  }, 60_000);
+});
+
+/** Two meshes' triangles in one. */
+function merged(...parts: { positions: Float64Array; indices: Uint32Array }[]) {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  for (const part of parts) {
+    const at = positions.length / 3;
+    positions.push(...part.positions);
+    indices.push(...Array.from(part.indices, (v) => v + at));
+  }
+  return { positions: Float64Array.from(positions), indices: Uint32Array.from(indices) };
+}
+
+/** The corner triples of the triangles not connected to `seed`, as text, with their vertices' positions. */
+function otherPart(scene: SceneLike, mesh: MeshHandle, seed: number): string[] {
+  const v = scene.views(mesh);
+  const pos = v.positions();
+  const { otherCorners } = partsOf(v.indices(), pos.length / 3, seed);
+  const out: string[] = [];
+  for (let k = 0; k < otherCorners.length; k += 3) {
+    const corners = [otherCorners[k], otherCorners[k + 1], otherCorners[k + 2]];
+    out.push(corners.map((c) => `${c}:${pos[3 * c]},${pos[3 * c + 1]},${pos[3 * c + 2]}`).join(" "));
+  }
+  return out.sort();
+}
+
+describe.each(["local", "worker"] as const)("a mesh with several parts on a %s scene", (kind) => {
+  const bottom = (polar: number): V3[] => capDirections(polar).map((d) => [d[0], -d[1], d[2]]);
+  const ball = (c: V3, r: number) => blobbySphere(c, r, 32, 16, 0);
+  // Where the loop is, around which centre and how far out, and the mesh. "Inside" by the engine's own rule would be
+  // another part in each of these: the smaller closed one, the closed piece beside open edges, or the whole piece.
+  const scenarios: { name: string; mesh: () => { positions: Float64Array; indices: Uint32Array }; centre: V3; radius: number }[] = [
+    { name: "two closed balls, loop on the big one", mesh: () => merged(ball([0, 0, 0], 1), ball([3, 0, 0], 0.3)), centre: [0, 0, 0], radius: 1 },
+    { name: "two closed balls, loop on the small one", mesh: () => merged(ball([0, 0, 0], 1), ball([3, 0, 0], 0.3)), centre: [3, 0, 0], radius: 0.3 },
+    { name: "an open shell and a piece, loop on the shell", mesh: () => openShellWithPiece([0, 0, 0], 0.8), centre: [0, 0, 0], radius: 0.8 },
+    { name: "an open shell and a piece, loop on the piece", mesh: () => openShellWithPiece([0, 0, 0], 0.8), centre: [0, 1.28, 0], radius: 0.16 },
+  ];
+
+  it.each(scenarios)("cuts only the part the loop is on: $name", async ({ mesh: make, centre, radius }) => {
+    const { store, app } = await host(kind);
+    const data = make();
+    const item = await listed(store, app, "Parts", data.positions, data.indices);
+    const points = bottom(0.7).map((d): V3 => [centre[0] + radius * d[0], centre[1] + radius * d[1], centre[2] + radius * d[2]]);
+    const path = await loopThrough(store, item.mesh, points, "heatMethod");
+    const seed = path.points[0].slot;
+    const others = otherPart(store.scene, item.mesh, seed);
+    expect(others.length).toBeGreaterThan(0);
+    const whole = area(store.scene, item.mesh);
+    const before = geometry(store.scene, item.mesh).triangles;
+    const partArea = (() => {
+      const v = store.scene.views(item.mesh);
+      const own = partsOf(v.indices(), v.positions().length / 3, seed).own;
+      return surfaceStats(v.positions(), own).area;
+    })();
+    const sideArea: Partial<Record<"inside" | "outside", number>> = {};
+
+    for (const keep of ["inside", "outside"] as const) {
+      const r = await trimAlongPath(store, item.mesh, path, keep);
+      await settle(store);
+      expect(r.triangles).toBe(geometry(store.scene, item.mesh).triangles);
+      // Every triangle of the parts the loop is not on is there, on the same vertices, in the same place.
+      expect(otherPart(store.scene, item.mesh, seed).filter((t) => others.includes(t))).toHaveLength(others.length);
+      sideArea[keep] = area(store.scene, item.mesh) - (whole - partArea);
+      store.undo();
+      await settle(store);
+      expect(store.getSnapshot().history.canUndo).toBe(false);
+      expect(geometry(store.scene, item.mesh).triangles).toBe(before);
+      expect(otherPart(store.scene, item.mesh, seed)).toEqual(others);
+    }
+    // Two sides of one part, neither of them empty nor the other part.
+    expect(sideArea.inside! + sideArea.outside!).toBeCloseTo(partArea, 3);
+    expect(sideArea.inside).toBeGreaterThan(0.02 * partArea);
+    expect(sideArea.outside).toBeGreaterThan(0.2 * partArea);
+
+    const split = await splitAlongPath(store, app, item, path);
+    await settle(store);
+    const innerArea = area(store.scene, split.inside.mesh);
+    expect(innerArea).toBeCloseTo(sideArea.inside!, 3);
+    expect(area(store.scene, item.mesh) + innerArea).toBeCloseTo(whole, 3);
+    expect(split.outsideTriangles).toBe(geometry(store.scene, item.mesh).triangles);
+    expect(split.insideTriangles).toBe(geometry(store.scene, split.inside.mesh).triangles);
+    expect(otherPart(store.scene, item.mesh, seed).filter((t) => others.includes(t))).toHaveLength(others.length);
+    store.undo();
+    await settle(store);
+    expect(geometry(store.scene, item.mesh).triangles).toBe(before);
+    expect(geometry(store.scene, split.inside.mesh).triangles).toBe(0);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+  }, 60_000);
+
+  it("a loop that separates nothing on its own part leaves the other part alone too", async () => {
+    // The engine counts every part: with another part in the mesh, a loop once around a ring would delete that part.
+    const { store, app } = await host(kind);
+    const ring = torus();
+    const data = merged(ring, ball([3, 0, 0], 0.3));
+    const item = await listed(store, app, "Ring and ball", data.positions, data.indices);
+    const path = await loopThrough(store, item.mesh, ring.around, "heatMethod");
+    const before = geometry(store.scene, item.mesh);
+    const seed = path.points[0].slot;
+    const others = otherPart(store.scene, item.mesh, seed);
+    for (const keep of ["inside", "outside"] as const) {
+      await expect(trimAlongPath(store, item.mesh, path, keep)).rejects.toThrow(NO_CUT_MESSAGE);
+      await settleChanges(store, item.mesh);
+      expect(geometry(store.scene, item.mesh)).toEqual(before);
+      expect(otherPart(store.scene, item.mesh, seed)).toEqual(others);
+    }
+    await expect(splitAlongPath(store, app, item, path)).rejects.toThrow(NO_CUT_MESSAGE);
+    await settleChanges(store, item.mesh);
+    expect(geometry(store.scene, item.mesh)).toEqual(before);
+    expect(store.getSnapshot().history.canUndo).toBe(false);
+  }, 60_000);
+});
+
+describe("the parts of a mesh", () => {
+  it("are told apart by the vertices they share, dead slots left out", () => {
+    // Two triangles joined by vertex 2, a dead slot, and a separate one.
+    const indices = [0, 1, 2, 2, 3, 4, 0, 0, 0, 5, 6, 7];
+    expect(partsOf(indices, 8, 4)).toEqual({
+      own: Uint32Array.from([0, 1, 2, 2, 3, 4]),
+      otherTriangles: Uint32Array.from([3]),
+      otherCorners: Uint32Array.from([5, 6, 7]),
+    });
+    expect(partsOf(indices, 8, 6).own).toEqual(Uint32Array.from([5, 6, 7]));
+    expect(partsOf([0, 1, 2], 3, 0)).toMatchObject({ otherTriangles: new Uint32Array(0), otherCorners: new Uint32Array(0) });
+  });
+
+  it("take their world positions through the matrix, numbered from zero", () => {
+    const part = compactPart([9, 9, 9, 1, 0, 0, 0, 1, 0, 0, 0, 1], [1, 2, 3, 2, 1, 3], [2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 10, 0, 0, 1]);
+    expect(Array.from(part.indices)).toEqual([0, 1, 2, 1, 0, 2]);
+    expect(Array.from(part.positions)).toEqual([12, 0, 0, 10, 2, 0, 10, 0, 2]);
+  });
+});
+
+describe("the demo meshes", () => {
+  /** A loop around the bottom of the mesh: around `centre`, at `radius` from it. */
+  const around: Record<string, { centre: V3; radius: number }> = {
+    "A · blobby sphere": { centre: [0, 1, 0], radius: 1 },
+    "B · rounded box": { centre: [1.05, 1, 0.1], radius: 0.55 },
+    "C · open shell + piece": { centre: [-2.8, 1, 0], radius: 0.8 },
+  };
+
+  it.each(demoMeshes(false).map((d) => [d.name, d] as const))("%s: map, path, trim and split all work", async (name, demo) => {
+    const { store, app } = await host("local");
+    const item = await listed(store, app, name, demo.data.positions, demo.data.indices);
+    const { centre, radius } = around[name];
+    const points = capDirections(0.6).map((d): V3 => [centre[0] + radius * d[0], centre[1] - radius * d[1], centre[2] + radius * d[2]]);
+    for (const method of ["dijkstra", "heatMethod"] as const) {
+      const path = await loopThrough(store, item.mesh, points, method);
+      expect(path.closed).toBe(true);
+      expect(pathLength(path)).toBeGreaterThan(4 * 0.3 * radius);
+      const report = await runGeodesicMap(store.scene, { mesh: item.mesh, sources: [path.points[0].slot, path.points[2].slot], method });
+      expect(report.max).toBeGreaterThan(radius);
+      // Only the demo with a floating piece has vertices out of reach.
+      expect(report.unreached > 0).toBe(name.startsWith("C"));
+      const v = store.scene.views(item.mesh);
+      expect(isoLineSegments(v.positions(), v.indices(), store.scene.matrix4(item.mesh), report.values, autoIsoSpacing(report.max)).length).toBeGreaterThan(0);
+
+      const whole = area(store.scene, item.mesh);
+      const parts: number[] = [];
+      for (const keep of ["inside", "outside"] as const) {
+        await trimAlongPath(store, item.mesh, path, keep);
+        parts.push(area(store.scene, item.mesh));
+        store.undo();
+        expect(store.getSnapshot().history.canUndo).toBe(false);
+        expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 6);
+      }
+      // Keeping one side keeps that side and the parts the loop is not on, so the two overlap by those.
+      const other = (() => {
+        const w = store.scene.views(item.mesh);
+        const { otherCorners } = partsOf(w.indices(), w.positions().length / 3, path.points[0].slot);
+        return surfaceStats(w.positions(), otherCorners).area;
+      })();
+      expect(parts[0] + parts[1] - other).toBeCloseTo(whole, 2);
+      const split = await splitAlongPath(store, app, item, path);
+      expect(area(store.scene, item.mesh) + area(store.scene, split.inside.mesh)).toBeCloseTo(whole, 2);
+      store.undo();
+      store.removeMesh(split.inside.mesh);
+      expect(area(store.scene, item.mesh)).toBeCloseTo(whole, 6);
+    }
   }, 60_000);
 });
 

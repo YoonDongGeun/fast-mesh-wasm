@@ -211,7 +211,8 @@ export function SurfacePathControls(props: {
         </div>
         {closed ? (
           <p className="muted small">
-            Inside is the side away from the open edges, or on a closed mesh the smaller side. Each cut is one undo step.
+            Inside is the side away from the open edges, or on a closed mesh the smaller side. Parts the loop is not on
+            stay as they are. Each cut is one undo step.
           </p>
         ) : path !== null ? (
           <p className="muted small">Close the loop to trim or split along it.</p>
