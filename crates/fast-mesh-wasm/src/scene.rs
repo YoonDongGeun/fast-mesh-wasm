@@ -42,6 +42,7 @@ use crate::edit::{
 use crate::error::Error;
 use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
+mod denoise;
 mod hull;
 
 /// A scene of editable meshes with render buffers and change records.

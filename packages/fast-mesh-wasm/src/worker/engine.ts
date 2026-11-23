@@ -911,6 +911,8 @@ class Engine {
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
         return this.#pending(req.id);
       case "join":
       case "boolean":
@@ -1032,6 +1034,8 @@ class Engine {
       case "applyKelvinlet":
       case "applyXpbd":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
       case "punchDrainHole":
       case "removeMesh":
         return req.id === id;
@@ -1358,6 +1362,8 @@ class Engine {
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "denoise":
+      case "delaunayFlips":
       case "punchDrainHole":
       case "removeMesh":
         return meshes.has(req.id);
@@ -1984,6 +1990,16 @@ class Engine {
             : s.convexHullOfPoints(req.points, options);
         this.#bindAdded(req.addedId, r.mesh);
         const value = { inputPoints: r.inputPoints, vertices: r.vertices, triangles: r.triangles };
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "denoise": {
+        const value = s.denoise(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
+      case "delaunayFlips": {
+        const value = s.delaunayFlips(this.#mesh(req.id), req.options);
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }

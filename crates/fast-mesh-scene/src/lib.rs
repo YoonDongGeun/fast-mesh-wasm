@@ -30,6 +30,10 @@
 //! - Convex hulls: [`Scene::convex_hull`] and [`Scene::convex_hull_points`]
 //!   add the exact convex hull of meshes or points as a new mesh, filled as
 //!   one undo step.
+//! - Denoising and Delaunay flips: [`Scene::denoise`] smooths scan noise and
+//!   keeps sharp features, and [`Scene::delaunay_flips`] improves triangles
+//!   without moving a vertex; on a whole mesh or a face region, each one undo
+//!   step.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -96,6 +100,7 @@ mod baked;
 mod boolean;
 mod contacts;
 mod cut;
+mod denoise;
 mod domains;
 mod error;
 mod fields;

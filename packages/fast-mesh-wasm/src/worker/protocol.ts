@@ -4,6 +4,7 @@
 // the main side allocates synchronously; the engine maps them to its handles.
 import type { Bounds, Placement, PlacementInput, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
+import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type {
   NormalizedBooleanOptions,
@@ -329,6 +330,10 @@ export type Request =
   /** `Scene.convexHullOfPoints` on flat world positions; replies with the hull's counts. */
   | { kind: "convexHullPoints"; rev: number; addedId: ClientId; points: Float64Array; normals: boolean; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
+  /** `Scene.denoise`; replies with its report. */
+  | { kind: "denoise"; rev: number; id: ClientId; options: DenoiseOptions; qid: number }
+  /** `Scene.delaunayFlips`; replies with its report. */
+  | { kind: "delaunayFlips"; rev: number; id: ClientId; options: DelaunayFlipOptions; qid: number }
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
@@ -596,6 +601,8 @@ export function keyOf(req: Request): string | undefined {
     case "applyKelvinlet":
     case "applyXpbd":
     case "hollowMesh":
+    case "denoise":
+    case "delaunayFlips":
     case "punchDrainHole":
       return `edit:${req.id}`;
     case "join":

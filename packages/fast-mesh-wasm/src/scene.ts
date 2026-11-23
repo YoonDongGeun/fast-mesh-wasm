@@ -3,6 +3,16 @@
 // binding; every call into WebAssembly goes through `call` (error codes and
 // panic poisoning).
 import {
+  checkDelaunayFlipOptions,
+  checkDenoiseOptions,
+  decodeDelaunayFlipReport,
+  decodeDenoiseReport,
+  type DelaunayFlipOptions,
+  type DelaunayFlipReport,
+  type DenoiseOptions,
+  type DenoiseReport,
+} from "./denoise.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -3712,6 +3722,60 @@ export class Scene implements SceneLike {
     const normals = hullNormals(options);
     const r = call(() => this.#scene().convex_hull_points(buf, normals));
     return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
+  }
+
+  /**
+   * Smooths noise (from a scan, say) out of `mesh` while keeping its sharp
+   * features, as one undo step: the face normals are filtered over their
+   * neighbours, except across edges sharper than `featureAngle`, and the
+   * vertices move to fit them. Flat faces become flat again and the edges
+   * between them stay sharp. The triangles and UVs are kept.
+   *
+   * With `region` (a face selection), only those triangles are smoothed and
+   * no vertex that another triangle uses moves. The report has the
+   * surface's readouts before and after. Nothing is recorded when nothing
+   * moves.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an option out of range or
+   *   a dead or out-of-range triangle in `region`, `UNKNOWN_MESH` for a
+   *   removed mesh. Nothing changes then.
+   */
+  denoise(mesh: MeshHandle, options?: DenoiseOptions): DenoiseReport {
+    const { index, generation } = this.#id(mesh);
+    const o = checkDenoiseOptions(options);
+    const raw = call(() =>
+      this.#scene().denoise(
+        index,
+        generation,
+        o.iterations ?? Number.NaN,
+        o.strength ?? Number.NaN,
+        o.featureAngle ?? Number.NaN,
+        o.region,
+      ),
+    );
+    return decodeDenoiseReport(raw);
+  }
+
+  /**
+   * Improves `mesh`'s triangles without moving a vertex, as one undo step:
+   * flips edges towards a Delaunay triangulation wherever that takes the
+   * surface at most `dihedralLimit` degrees from what it was. Edges sharper
+   * than the limit never flip, and the smallest corner angle never drops.
+   * UVs are kept.
+   *
+   * With `region` (a face selection), only edges between two of its
+   * triangles flip. The report has the surface's readouts before and after.
+   * Nothing is recorded when nothing flips.
+   *
+   * @throws {FastMeshError} as {@link Scene.denoise}.
+   */
+  delaunayFlips(mesh: MeshHandle, options?: DelaunayFlipOptions): DelaunayFlipReport {
+    const { index, generation } = this.#id(mesh);
+    const o = checkDelaunayFlipOptions(options);
+    const raw = call(() =>
+      this.#scene().delaunay_flips(index, generation, o.dihedralLimit ?? Number.NaN, o.region),
+    );
+    return decodeDelaunayFlipReport(raw);
   }
 
   /**

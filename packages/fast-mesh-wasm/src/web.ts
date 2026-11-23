@@ -36,6 +36,13 @@ export {
   type Vec3,
 } from "./api.js";
 export { FastMeshError, type FastMeshErrorCode } from "./core.js";
+export type {
+  DelaunayFlipOptions,
+  DelaunayFlipReport,
+  DenoiseOptions,
+  DenoiseReport,
+  SurfaceStats,
+} from "./denoise.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export {
   type ArrowShape,

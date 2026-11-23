@@ -8,6 +8,14 @@
 // too, so everything the adapters read stays synchronous. Drags are
 // optimistic: a move shows at once and holds until the Worker has the drag.
 import {
+  checkDelaunayFlipOptions,
+  checkDenoiseOptions,
+  type DelaunayFlipOptions,
+  type DelaunayFlipReport,
+  type DenoiseOptions,
+  type DenoiseReport,
+} from "../denoise.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -3057,6 +3065,32 @@ export class WorkerScene implements SceneLike {
       this.#discardPlaceholder(added);
       throw e;
     });
+  }
+
+  /** Smooths noise out of `mesh` in the Worker, one undo step (see `Scene.denoise`). */
+  denoise(mesh: MeshHandle, options?: DenoiseOptions): Promise<DenoiseReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkDenoiseOptions(options);
+        this.#endDragOn(st);
+        return { kind: "denoise", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as DenoiseReport,
+    );
+  }
+
+  /** Flips `mesh`'s edges towards Delaunay in the Worker, one undo step (see `Scene.delaunayFlips`). */
+  delaunayFlips(mesh: MeshHandle, options?: DelaunayFlipOptions): Promise<DelaunayFlipReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkDelaunayFlipOptions(options);
+        this.#endDragOn(st);
+        return { kind: "delaunayFlips", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as DelaunayFlipReport,
+    );
   }
 
   reconstructPointCloud(
