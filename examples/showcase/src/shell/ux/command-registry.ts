@@ -355,7 +355,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       id: "tool:repair-wrap",
       title: "Repair: Wrap in a Closed Envelope",
       category: "Tool",
-      keywords: "repair wrap envelope shrinkwrap watertight closed manifold gap hole voxel remesh broken scan merge",
+      keywords: "repair wrap envelope watertight closed manifold gap hole voxel remesh broken scan merge parts",
       run: () => {
         app.setActiveTab("repair");
       },
