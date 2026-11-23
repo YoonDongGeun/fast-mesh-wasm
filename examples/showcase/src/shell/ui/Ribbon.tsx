@@ -9,6 +9,7 @@ import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
 import { DIAGNOSTIC_SHADING_OPTIONS } from "../../features/view/ui/shading";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
@@ -354,6 +355,16 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               >
                 Selective Heal
               </button>
+              {SURFACE_CLEANUP_COMMANDS.map((c) => (
+                <button
+                  key={c.op}
+                  type="button"
+                  disabled={!hasItems}
+                  onClick={() => triggerClick(`[data-repair-op="${c.op}"]`)}
+                >
+                  {c.short}
+                </button>
+              ))}
               <button
                 type="button"
                 aria-pressed={healerOverlays.selfIntersections}

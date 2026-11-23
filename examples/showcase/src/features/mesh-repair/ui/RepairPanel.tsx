@@ -2,7 +2,8 @@
 // sizes, orientation, components, non-manifold and degenerate elements),
 // refreshed whenever its triangles change (a repair, its undo), the 3D
 // overlays drawing those issues on the mesh, and the library's repair ops,
-// each one undo step through `store.repair`. The analysis refresh, the op
+// each one undo step through `store.repair` (denoise and Delaunay flips
+// through the engine bridge). The analysis refresh, the op
 // parameters, the loop picks and the op sequences live in `ux/`.
 import type { AutoRepairPreset, FillContinuity, Scene, SelfIntersectionMode } from "fast-mesh-wasm";
 import { useScene, useSelection } from "fast-mesh-wasm/react";
@@ -21,10 +22,12 @@ import { useRepairAnalysis } from "../ux/use-repair-analysis";
 import { holeTargetsOf, useRepairLoopPicks } from "../ux/use-repair-loop-picks";
 import { useRepairOptions, wholeAtLeast, wholeNumber } from "../ux/use-repair-options";
 import { useRepairRunner } from "../ux/use-repair-runner";
+import { useSurfaceCleanup } from "../ux/use-surface-cleanup";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { MeshHealerSection } from "./MeshHealerSection";
 import { REPAIR_OVERLAY_COLORS } from "./repair-overlays";
+import { SurfaceCleanupSection } from "./SurfaceCleanupSection";
 
 /** The holes listed by size. */
 const HOLES_SHOWN = 6;
@@ -50,6 +53,7 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
     onTriangleChange: runner.noteTriangleChange,
   });
   const picks = useRepairLoopPicks({ app, scene, mesh, items, analysis: live.analysis });
+  const cleanup = useSurfaceCleanup({ app, store, item, units, runner, live });
 
   const s = live.analysis?.mesh === mesh ? live.analysis.summary : null;
   const rawLoops = repairAnalysis?.mesh === mesh ? repairAnalysis.analysis.loops : [];
@@ -329,6 +333,8 @@ export function RepairPanel(props: { app: AppState; scene: Scene | WorkerScene }
           ) : null}
         </div>
       </div>
+
+      <SurfaceCleanupSection cleanup={cleanup} disabled={disabled} />
 
       <div className="ops">
         <div className="op">

@@ -7,6 +7,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
 import { textCommands } from "../../features/mesh-edit/ux/text-commands";
+import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { sculptBrush, type SculptTool } from "../../features/sculpt/ux/sculpt";
 import { PLACEMENT_COMMANDS } from "../../features/transform/ux/placement-picks";
 import { ALIGN_COMMANDS } from "../../features/transform/ux/align-tools";
@@ -532,6 +533,21 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       run: () => {
         app.setActiveTab("align");
         triggerClick(`[data-align-action="${c.action}"]`);
+      },
+    });
+  }
+
+  // Denoise and Delaunay flips press the repair panel's buttons (#264).
+  for (const c of SURFACE_CLEANUP_COMMANDS) {
+    cmds.push({
+      id: `repair:${c.op}`,
+      title: c.label,
+      category: "Action",
+      keywords: c.keywords,
+      disabled: selection === null,
+      run: () => {
+        app.setActiveTab("repair");
+        triggerClick(`[data-repair-op="${c.op}"]`);
       },
     });
   }

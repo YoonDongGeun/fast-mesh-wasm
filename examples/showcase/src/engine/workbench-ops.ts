@@ -8,6 +8,10 @@ import type {
   ConvexHullPoints,
   ConvexHullResult,
   CutReport,
+  DelaunayFlipOptions,
+  DelaunayFlipReport,
+  DenoiseOptions,
+  DenoiseReport,
   EditOp,
   FieldHandle,
   IcpObjective,
@@ -750,6 +754,37 @@ export async function runIsotropicRemesh(params: {
   options: IsotropicRemeshOptions;
 }): Promise<SurfaceRemeshReport> {
   return params.store.repair(params.mesh, { op: "remeshSurface", ...params.options, mode: "isotropic" });
+}
+
+/**
+ * Feature-preserving denoise (#264) of the mesh, or of `options.region`: one
+ * undo step, run by the Worker when the scene is there.
+ */
+export async function runDenoise(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: DenoiseOptions;
+}): Promise<DenoiseReport> {
+  const scene = params.store.scene;
+  const run = (s: Scene | WorkerScene): DenoiseReport | Promise<DenoiseReport> =>
+    s.denoise(params.mesh, params.options);
+  const r = await run(isWorkerScene(scene) ? scene : asSyncScene(scene));
+  params.store.commitFrame();
+  return r;
+}
+
+/** Delaunay edge flips (#264) on the mesh, or on `options.region`, as {@link runDenoise}. */
+export async function runDelaunayFlips(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: DelaunayFlipOptions;
+}): Promise<DelaunayFlipReport> {
+  const scene = params.store.scene;
+  const run = (s: Scene | WorkerScene): DelaunayFlipReport | Promise<DelaunayFlipReport> =>
+    s.delaunayFlips(params.mesh, params.options);
+  const r = await run(isWorkerScene(scene) ? scene : asSyncScene(scene));
+  params.store.commitFrame();
+  return r;
 }
 
 /**

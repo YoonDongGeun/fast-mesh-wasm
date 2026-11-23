@@ -97,7 +97,11 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   included; optionally faired to follow the curvature). Each shows its report while the analysis
   refreshes; a repair, its undo and its redo all re-analyse, and an undo or redo clears the report.
   Auto repair runs the library's whole pipeline with those settings as one undo step
-  (`store.repair(mesh, { kind: "auto", ... })`).
+  (`store.repair(mesh, { kind: "auto", ... })`). *Denoise* (`scene.denoise`) smooths scan noise and
+  keeps edges sharper than an angle; *Delaunay flips* (`scene.delaunayFlips`) improve the triangles
+  without moving a vertex, within an angle of the surface. Both run on the whole mesh or on the
+  selected faces only, each one undo step, and show the mean normal deviation and the minimum angle
+  before and after.
 - **Collision.** Pick meshes A and B (the first two meshes by default): each is coloured by its
   signed distance to the other with `contactHeatmap`, penetration from dark red (*Penetration
   depth*) to red, white within ± *Contact tolerance*, and the gap from green to blue up to *Colour
@@ -205,7 +209,7 @@ src/
                  normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, convex hull, resample, isotropic
                  remesh, hollow, place mesh, text (its font in fonts/)
-    mesh-repair/ analysis, healer overlays, repairs, auto repair
+    mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull
     ct/          volume rendering, MPR slices
