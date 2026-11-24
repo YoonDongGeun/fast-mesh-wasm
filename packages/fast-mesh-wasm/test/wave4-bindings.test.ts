@@ -242,6 +242,87 @@ describe("Wave 4 bindings (#206, #209, #213, #214) on Scene & WorkerScene", () =
     expect(worker.views(wCut.removed).positions().length).toBeGreaterThan(0);
   });
 
+  it("#278: booleanBatch, placeMesh and punchDrainHole keep local precision far away on Scene & WorkerScene", async () => {
+    const far: Vec3 = [148_000.3, -77_000.7, 91_234.1];
+    const a = boxMesh(far[0], far[1], far[2], 0.55, 0.45, 0.35);
+    const b = boxMesh(far[0] + 0.4, far[1] + 0.3, far[2] + 0.2, 0.55, 0.45, 0.35);
+    const stamp = boxMesh(0, 0, 0.15, 0.1, 0.1, 0.15);
+    const top: Vec3 = [far[0], far[1], far[2] + 0.35];
+    const tree = {
+      kind: "op",
+      op: "union",
+      left: { kind: "leaf", meshIndex: 0 },
+      right: { kind: "leaf", meshIndex: 1 },
+    } as const;
+    const place = { hitPoint: top, hitNormal: [0, 0, 1], upAxis: "posZ", mode: "keepSeparate" } as const;
+    // Placed by its scale, so that the hole is punched in a frame in the world.
+    const squash = { rotation: IDENTITY, translation: [-far[0], 0, 0] as Vec3, scale: [2, 1, 1] as Vec3 };
+    const hole = { surfacePoint: top, surfaceNormal: [0, 0, 1] as Vec3, diameter: 0.3, depth: 0.2, segments: 16 };
+
+    const read = (s: Scene | WorkerScene, mesh: MeshHandle) => {
+      const p = s.views(mesh).positions();
+      const i = s.views(mesh).indices();
+      const m = s.matrix4(mesh);
+      const out: Vec3[] = [];
+      for (let k = 0; k + 2 < i.length; k += 3) {
+        if (i[k] === i[k + 1]) continue;
+        for (const v of [i[k], i[k + 1], i[k + 2]]) {
+          out.push([0, 1, 2].map((r) => m[r] * p[3 * v] + m[4 + r] * p[3 * v + 1] + m[8 + r] * p[3 * v + 2] + m[12 + r]) as Vec3);
+        }
+      }
+      return out;
+    };
+    const box = (points: Vec3[]) =>
+      [0, 1, 2].map((k) => [Math.min(...points.map((p) => p[k])) - far[k], Math.max(...points.map((p) => p[k])) - far[k]]);
+    const expectBox = (points: Vec3[], want: [number, number][]) => {
+      for (const [k, [lo, hi]] of box(points).entries()) {
+        expect(lo).toBeCloseTo(want[k][0], 6);
+        expect(hi).toBeCloseTo(want[k][1], 6);
+      }
+    };
+    const expectOrigin = (got: Vec3, want: Vec3) => {
+      for (let k = 0; k < 3; k++) expect(got[k]).toBeCloseTo(want[k], 5);
+    };
+    // Awaiting a sync scene's results is harmless.
+    const run = async (s: Scene | WorkerScene) => {
+      const [ma, mb, ms] = [a, b, stamp].map((d) => s.addMesh(d.positions, d.indices));
+      s.commitFrame();
+      const union = await s.boolean.booleanBatch([ma, mb], tree);
+      s.commitFrame();
+      expectOrigin(s.origin(union), [far[0] + 0.2, far[1] + 0.15, far[2] + 0.1]);
+      expect(s.placement(union).translation).toEqual([0, 0, 0]);
+      expectBox(read(s, union), [
+        [-0.55, 0.95],
+        [-0.45, 0.75],
+        [-0.35, 0.55],
+      ]);
+
+      const placed = await s.boolean.placeMesh(ma, ms, place);
+      s.commitFrame();
+      expectOrigin(s.origin(placed.added!), top);
+      expectBox(read(s, placed.added!), [
+        [-0.1, 0.1],
+        [-0.1, 0.1],
+        [0.35, 0.65],
+      ]);
+
+      s.setPlacement(ma, squash);
+      const { plugs } = await s.boolean.punchDrainHole(ma, { ...hole, generatePlug: true, plugClearance: 0 });
+      s.commitFrame();
+      expect(plugs).toHaveLength(1);
+      const rim = read(s, ma)
+        .filter((p) => Math.abs(p[2] - top[2]) < 1e-3)
+        .map((p) => Math.hypot(p[0] - top[0], p[1] - top[1]))
+        .filter((r) => r < 0.2);
+      expect(rim.length).toBeGreaterThanOrEqual(16);
+      expect(Math.max(...rim)).toBeCloseTo(0.15, 5);
+      const plug = read(s, plugs[0]);
+      expect(Math.max(...plug.map((p) => Math.hypot(p[0] - top[0], p[1] - top[1])))).toBeCloseTo(0.15, 5);
+    };
+    await run(openSync());
+    await run(await openWorker());
+  });
+
   it("#209 & #213: overhangs, triangleQuality, meshDeviation, geodesics, shortestSurfacePath, and trimByCurve", async () => {
     const sph = sphereMesh([0, 0, 0], 1, 10, 20);
     const sphShifted = sphereMesh([0.2, 0, 0], 1, 10, 20);

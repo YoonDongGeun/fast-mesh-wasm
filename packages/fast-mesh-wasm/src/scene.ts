@@ -6435,8 +6435,9 @@ export class Scene implements SceneLike {
 
   /**
    * Places `stamp` onto `target` at a hit point/normal, optionally unioning/engraving/conformance-wrapping,
-   * in one undo step. Kept separate, the placed stamp is a new mesh, which {@link Scene.undo} removes
-   * and {@link Scene.redo} brings back with the same handle.
+   * in one undo step. Kept separate, the placed stamp is a new mesh with the hit point as its
+   * {@link Scene.origin}, which {@link Scene.undo} removes and {@link Scene.redo} brings back with
+   * the same handle.
    */
   placeMesh(target: MeshHandle, stamp: MeshHandle, options: PlaceMeshOptions): PlaceMeshReport {
     const t = this.#id(target);
