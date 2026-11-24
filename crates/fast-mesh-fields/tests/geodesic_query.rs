@@ -353,3 +353,55 @@ fn distances_do_not_depend_on_threads() {
         assert_eq!(par::with_threads(threads, query), sequential, "{threads}");
     }
 }
+
+#[test]
+fn any_soup_of_triangles_gets_distances() {
+    // Random corners: slivers, fans, folded and repeated triangles, edges
+    // with many triangles, at any scale.
+    let mut state = 1u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    for round in 0..120 {
+        let n = 4 + next() % 400;
+        let scale = 10f32.powi(next() as i32 % 25 - 12);
+        let flat = if round % 3 == 0 { 1e-4 } else { 1.0 };
+        let p: Vec<[f32; 3]> = (0..n)
+            .map(|_| {
+                let c = |v: u32| (v % 20_001) as f32 / 1e4 - 1.0;
+                [
+                    c(next()) * scale,
+                    c(next()) * scale * flat,
+                    c(next()) * scale,
+                ]
+            })
+            .collect();
+        let near = 1 + next() % n;
+        let t: Vec<[u32; 3]> = (0..1 + next() % 900)
+            .map(|_| {
+                let a = next() % n;
+                [a, (a + next() % near) % n, (a + next() % near) % n]
+            })
+            .collect();
+        let m = Mesh::from_buffers(p.as_flattened(), t.as_flattened()).unwrap();
+        let sources = [next() % n, next() % n];
+        for time_step_scale in [1.0, 1e-3, 1e4] {
+            let o = GeodesicOptions {
+                time_step_scale,
+                ..Default::default()
+            };
+            let mut d = Vec::new();
+            geodesic_distances(&m, &sources, &o, &mut d).unwrap();
+            assert_eq!(d.len(), n as usize);
+            for (v, x) in d.iter().enumerate() {
+                assert!(*x >= 0.0, "round {round}, {time_step_scale}, {v}: {x}");
+            }
+            for s in sources {
+                assert_eq!(d[s as usize], 0.0, "round {round}");
+            }
+        }
+    }
+}

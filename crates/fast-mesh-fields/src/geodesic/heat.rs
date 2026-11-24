@@ -1031,7 +1031,7 @@ fn divergence(corners: [[f32; 3]; 3], u: [f64; 3]) -> [f64; 3] {
 mod tests {
     use super::*;
     use crate::grid::fail_allocations_after;
-    use crate::test_util::{build_bvh, icosphere, mesh, terrain};
+    use crate::test_util::{icosphere, mesh, terrain};
 
     /// A capped cylinder along Z whose caps are fans around one vertex.
     fn fan_cylinder(segments: u32, rings: u32, height: f32) -> Mesh {
@@ -1299,7 +1299,6 @@ mod tests {
         p.extend(b.positions().iter().map(|v| [v[0] + 100.0, v[1], v[2]]));
         t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
         let m = mesh(&p, &t);
-        let _ = build_bvh(&m);
         let mut want = Vec::new();
         let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
         solver.solve(&[0, base], None, &mut want).unwrap();
