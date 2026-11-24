@@ -45,9 +45,13 @@ export function computeSceneBounds(
     if (isHidden) {
       continue;
     }
+    // The mesh's origin, through its placement when that is known (the
+    // matrix has both): where a mesh without geometry to frame is.
+    const at = new THREE.Vector3(...item.center);
     try {
       const m = scene.matrix4(item.mesh);
       mat.fromArray(m);
+      at.setFromMatrixPosition(mat);
       const b = typeof (scene as Scene).bounds === "function" ? (scene as Scene).bounds(item.mesh) : undefined;
       if (b !== undefined && b !== null) {
         minVec.set(b.min[0], b.min[1], b.min[2]);
@@ -79,14 +83,12 @@ export function computeSceneBounds(
           }
         }
         if (!any && item.radius > 0) {
-          pt.set(item.center[0], item.center[1], item.center[2]).applyMatrix4(mat);
-          box.expandByPoint(pt);
+          box.expandByPoint(at);
         }
       }
     } catch {
-      // Fallback to cached center & radius if mesh views are temporarily unavailable
-      pt.set(item.center[0], item.center[1], item.center[2]);
-      box.expandByPoint(pt);
+      // The mesh's views are temporarily unavailable.
+      box.expandByPoint(at);
     }
   }
 

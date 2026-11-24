@@ -10,6 +10,7 @@ import type { Wave6MetrologyState } from "../../../app/state/wave6-state";
 import { ensureWave6Wasm } from "../../../engine/wave6-wasm-lazy";
 import { type ContourLike, contoursToDxf, downloadReportText, reportFileName } from "../../../io/report";
 import { describeKept, keepCurves } from "../../polylines/ux/polyline-actions";
+import { worldCenter } from "../../../shared/ux/mesh-center";
 import { AXIS_NORMAL, type Axis } from "./section-clip";
 
 export type ContourPlaneAxis = Axis | "custom";
@@ -19,22 +20,6 @@ export interface ContourExport {
   format: "svg" | "dxf";
   text: string;
   fileName: string;
-}
-
-function worldCenter(scene: SceneStore["scene"], item: Item | null): [number, number, number] {
-  if (item === null) {
-    return [0, 0, 0];
-  }
-  try {
-    const m = scene.matrix4(item.mesh);
-    return [
-      m[0] * item.center[0] + m[4] * item.center[1] + m[8] * item.center[2] + m[12],
-      m[1] * item.center[0] + m[5] * item.center[1] + m[9] * item.center[2] + m[13],
-      m[2] * item.center[0] + m[6] * item.center[1] + m[10] * item.center[2] + m[14],
-    ];
-  } catch {
-    return [0, 0, 0];
-  }
 }
 
 /** The unit vector along `v`, or +Z when `v` is zero or not finite. */
@@ -116,7 +101,7 @@ export function useContourSlices(
     setKept(null);
     try {
       const n = activeNormal();
-      const center = worldCenter(store.scene, targetItem);
+      const center = worldCenter(store.scene, targetItem.mesh);
       const origin: [number, number, number] = [
         center[0] + n[0] * offsetMm,
         center[1] + n[1] * offsetMm,

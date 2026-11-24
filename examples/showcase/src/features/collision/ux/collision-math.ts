@@ -152,7 +152,7 @@ export function formatDistance(x: number): string {
 }
 
 /**
- * The collision probe's move of B toward A, from their bounds' centres: half
+ * The collision probe's move of B toward A, from their world centres: half
  * the distance but at least 0.5 (the whole distance when closer than that),
  * or 0.25 along x when the centres coincide.
  */

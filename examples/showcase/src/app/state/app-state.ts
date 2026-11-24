@@ -33,6 +33,7 @@ import {
   type ShowcaseSettings,
   type ShowcaseTheme,
 } from "../../shared/ux/settings";
+import { meshOrigin } from "../../shared/ux/mesh-center";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
@@ -57,7 +58,11 @@ export interface Item {
   color: number;
   /** The triangle count when loaded (repairs change it; see `useTriangleCount`). */
   triangles: number;
-  /** The mesh origin: its bounding box centre when loaded. */
+  /**
+   * The mesh origin: its bounding box centre when loaded. `scene.matrix4`
+   * has it in: see `worldCenter` (shared/ux/mesh-center.ts) for the mesh's
+   * middle in the world.
+   */
   center: Vec3;
   /** Half the bounding box diagonal, for focusing the camera. */
   radius: number;
@@ -683,12 +688,11 @@ export class AppState {
       if (z < z0) z0 = z;
       if (z > z1) z1 = z;
     }
-    const center: Vec3 = x0 <= x1 ? [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2] : [0, 0, 0];
     const radius = x0 <= x1 ? Math.hypot(x1 - x0, y1 - y0, z1 - z0) / 2 : 1;
     return this.#registerItem(mesh, {
       name,
       triangles,
-      center,
+      center: meshOrigin(store.scene, mesh),
       radius,
       volumeId: null,
       preset: null,

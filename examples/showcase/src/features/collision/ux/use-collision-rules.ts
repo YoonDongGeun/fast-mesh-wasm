@@ -21,6 +21,7 @@ import type { WorkerScene } from "fast-mesh-wasm/worker";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { type AppState, type CollisionPair, type Item, useApp } from "../../../app/state/app-state";
 import { createDefaultWave6State, type Wave6CollisionState } from "../../../app/state/wave6-state";
+import { worldCenter } from "../../../shared/ux/mesh-center";
 import { fromDisplayLength, type LengthUnit } from "../../../shared/ux/units";
 import {
   buildCollisionRule,
@@ -276,7 +277,7 @@ export function useCollisionRules(
         }
         return;
       }
-      const [sx, sy, sz] = nudgeOffset(boundsA.center, boundsB.center);
+      const [sx, sy, sz] = nudgeOffset(worldCenter(scene, a), worldCenter(scene, b));
       const nextPlacement: PlacementInput = {
         rotation: placeB.rotation,
         translation: [placeB.translation[0] + sx, placeB.translation[1] + sy, placeB.translation[2] + sz],

@@ -1,9 +1,10 @@
-// Meshes whose f64 origin is far from the world origin (#272): Duplicate and
-// the other tools that rebuild a mesh from another's buffers keep its world
-// shape, with any origin, rotation and scale, on the sync `Scene` and on a
-// Worker.
+// Meshes whose f64 origin is far from the world origin: Duplicate and the
+// other tools that rebuild a mesh from another's buffers (#272) keep their
+// world shapes, and what is centred on a mesh (#277: the camera, the section
+// plane, the clip box, contour slices) is centred on it there. With any
+// origin, rotation and scale, on the sync `Scene` and on a Worker.
 import { Worker } from "node:worker_threads";
-import { type MeshHandle, type Placement, Scene, type SceneLike } from "fast-mesh-wasm";
+import { type MeshHandle, type Placement, Scene, type SceneLike, type Vec3 } from "fast-mesh-wasm";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { createWorkerScene, type WorkerLike } from "fast-mesh-wasm/worker";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +17,12 @@ import {
   runBooleanCsg,
   runPlaneCut,
 } from "../src/engine/workbench-ops";
+import { nudgeOffset } from "../src/features/collision/ux/collision-math";
+import { fitWorldBox, sectionActions, sectionCenter, sectionReadout } from "../src/features/inspect/ux/section-clip";
+import { applyDyntopoRoi } from "../src/features/sculpt/ux/sculpt";
+import { computeSceneBounds } from "../src/features/view/ux/camera";
 import { blobbySphere } from "../src/io/demo";
+import { worldCenter } from "../src/shared/ux/mesh-center";
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -172,6 +178,22 @@ function expectBounds(got: { min: V3; max: V3 }, want: { min: V3; max: V3 }, dig
   }
 }
 
+function expectPoint(got: Readonly<Vec3>, want: Readonly<Vec3>, digits = 4): void {
+  for (let a = 0; a < 3; a++) {
+    expect(got[a]).toBeCloseTo(want[a], digits);
+  }
+}
+
+function middle({ min, max }: { min: Readonly<Vec3>; max: Readonly<Vec3> }): V3 {
+  return [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+}
+
+/** A bumpy ball whose coordinates f64 rounds, listed with `origin` as its origin. */
+function addBall(h: Harness, name: string, centre: Readonly<V3>, origin: Readonly<V3>): Item {
+  const ball = blobbySphere([...centre], 1, 24, 12, 0.2);
+  return h.app.addMesh(h.store, { name, ...ball, center: [...origin], radius: 1, volumeId: null, preset: null });
+}
+
 for (const [mode, open] of [
   ["sync Scene", local],
   ["WorkerScene", worker],
@@ -253,8 +275,7 @@ for (const [mode, open] of [
       expectBounds(worldBounds(store.scene, a.mesh), wantA);
       const batch = await h.settle(runBatchBoolean({ store, app, inputs: [a, b], op: "union", keepInputs: true }));
       await h.settle();
-      // The engine's N-way boolean places vertices by f32 world coordinates.
-      expectBounds(worldBounds(store.scene, batch.mesh), union, 1);
+      expectBounds(worldBounds(store.scene, batch.mesh), union);
     });
 
     it("takes part in a boolean at its scale", async () => {
@@ -296,6 +317,99 @@ for (const [mode, open] of [
       // Across the box's corners, along their normals: the world box is 2 wide.
       expect(r.summary!.max).toBeLessThan(2 * Math.sqrt(3) + 0.01);
       expect(r.summary!.max).toBeGreaterThan(1);
+    });
+
+    it("has the section plane, the clip box and contour slices centred on it", async () => {
+      const h = await open();
+      const { store, app } = h;
+      const plain = addBox(h, "Plain", 1, [10, 20, 30]);
+      const far = addBox(h, "Far", 2, ORIGIN);
+      const placed = addBox(h, "Placed", 2, ORIGIN, PLACEMENT);
+      await h.settle();
+      const scene = store.scene as Scene;
+      // Its origin counted twice would be (20, 40, 60).
+      expect(sectionCenter(scene, null, plain)).toEqual([10, 20, 30]);
+      for (const item of [plain, far, placed]) {
+        const mid = middle(worldBounds(scene, item.mesh));
+        expectPoint(sectionCenter(scene, null, item)!, mid);
+        // The plane starts there, at offset zero.
+        const readout = sectionReadout(scene, null, item);
+        sectionActions(app, store, [item], null, readout).enable();
+        const section = app.getSnapshot().inspectSection!;
+        expectPoint(section.plane.origin, mid);
+        expect(sectionReadout(scene, section, item).offset).toBeCloseTo(0, 4);
+        sectionActions(app, store, [item], section, readout).remove();
+
+        expectPoint(middle(fitWorldBox(scene, item)!), mid);
+      }
+      // A slice through the middle of the 2 x 2 x 2 box is 2 x 2.
+      const at = worldCenter(scene, plain.mesh);
+      const slice = await h.settle(Promise.resolve(scene.inspect.sliceContours(plain.mesh, at, [0, 0, 1])));
+      expect(slice.totalArea).toBeCloseTo(4, 3);
+    });
+
+    it("is framed, and nudged toward, where it is", async () => {
+      const h = await open();
+      const far = addBox(h, "Far", 2, ORIGIN);
+      const placed = addBox(h, "Placed", 2, ORIGIN, PLACEMENT);
+      const near = addBox(h, "Near", 1, [ORIGIN[0] + 8, ORIGIN[1], ORIGIN[2]]);
+      await h.settle();
+      const { scene } = h.store;
+      for (const item of [far, placed]) {
+        const mid = middle(worldBounds(scene, item.mesh));
+        expectPoint(computeSceneBounds([item], scene).center, mid, 3);
+        // Before its buffers arrive: at its origin in the world.
+        const blind = {
+          matrix4: (m: MeshHandle) => scene.matrix4(m),
+          views: () => {
+            throw new Error("not yet");
+          },
+        };
+        expectPoint(computeSceneBounds([item], blind as unknown as SceneLike).center, mid, 3);
+      }
+      expectPoint(nudgeOffset(worldCenter(scene, far.mesh), worldCenter(scene, near.mesh)), [-4, 0, 0]);
+    });
+
+    it("has its middle where its parts are, whatever their origin", async () => {
+      const h = await open();
+      const { store, app } = h;
+      const far = addBox(h, "Far", 2, ORIGIN, PLACEMENT);
+      await h.settle();
+      // The top of the box, off the origin it keeps.
+      const top = await h.settle(Promise.resolve(store.scene.repair!.extractSelectedFaces(far.mesh, [2, 3])));
+      await h.settle();
+      const part = app.adoptSceneMesh(store, top, "Top");
+      expect(part.center).toEqual(ORIGIN);
+      const mid = middle(worldBounds(store.scene, top));
+      expectPoint(sectionCenter(store.scene as Scene, null, part)!, mid);
+      // Without triangles: where its origin is.
+      await h.settle(store.edit(top, [{ op: "removeTriangles", triangles: [0, 1] }]));
+      const m = store.scene.matrix4(top);
+      expect(worldCenter(store.scene, top)).toEqual([m[12], m[13], m[14]]);
+      expectPoint(computeSceneBounds([part], store.scene).center, [m[12], m[13], m[14]]);
+    });
+
+    it("is subdivided around its middle without a brush point", async () => {
+      const h = await open();
+      const { store } = h;
+      const item = addBall(h, "Ball", ORIGIN, ORIGIN);
+      await h.settle();
+      const triangles = () => extractLiveMeshData(store.scene, item.mesh).indices.length / 3;
+      const before = triangles();
+      await h.settle(
+        applyDyntopoRoi({
+          scene: store.scene as Scene,
+          store,
+          target: item,
+          brushPick: null,
+          mask: null,
+          mode: "split-only",
+          detail: 0.02,
+          brushRadius: 2,
+        }),
+      );
+      await h.settle();
+      expect(triangles()).toBeGreaterThan(before);
     });
   });
 }
