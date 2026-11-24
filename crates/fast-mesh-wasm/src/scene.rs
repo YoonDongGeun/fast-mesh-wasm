@@ -44,6 +44,7 @@ use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 
 mod denoise;
 mod extrude;
+mod height_map;
 mod hull;
 mod wrap;
 

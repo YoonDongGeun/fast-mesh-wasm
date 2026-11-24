@@ -192,7 +192,7 @@ fn decode(kind: u8, params: &[f64]) -> Result<Primitive, Error> {
 }
 
 /// `src` as `[vertices, triangles, positions as f32 bits..., indices...]`.
-fn pack(src: &AppendSource) -> Result<Vec<u32>, Error> {
+pub(crate) fn pack(src: &AppendSource) -> Result<Vec<u32>, Error> {
     let (v, t) = (src.positions.len(), src.triangles.len());
     let mut out = Vec::new();
     out.try_reserve_exact(2 + 3 * v + 3 * t)
