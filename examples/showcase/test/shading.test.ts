@@ -8,8 +8,8 @@ import {
   DIAGNOSTIC_SHADING_OPTIONS,
   installDiagnosticShader,
   syncMeshDiagnosticShading,
-} from "../src/viewport/shading";
-import { hasWireOverlay } from "../src/viewport/wire";
+} from "../src/features/view/ui/shading";
+import { hasWireOverlay } from "../src/features/view/ui/wire";
 
 function twoTriangleHinge(angleDeg: number) {
   const rad = THREE.MathUtils.degToRad(angleDeg);

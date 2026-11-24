@@ -1,0 +1,109 @@
+// The status bar: the scene's overall status, loads in progress, the meshes
+// and triangles shown, the engine (Worker with its thread count, or local)
+// and whether the page is cross-origin isolated; on an error its message
+// and Restart (a new Worker that replays the scene).
+import { useSceneStatus } from "fast-mesh-wasm/react";
+import type { Engine } from "../../app/App";
+import { type AppState, useApp } from "../../app/state/app-state";
+import { useSceneRestart } from "../ux/use-scene-restart";
+
+export function StatusBar(props: { engine: Engine; app: AppState }) {
+  const { engine, app } = props;
+  const { status, error } = useSceneStatus();
+  const items = useApp(app, (s) => s.items);
+  const loading = useApp(app, (s) => s.jobs.filter((j) => j.phase !== "done" && j.phase !== "error").length);
+  const { restarting, restart } = useSceneRestart();
+  // The persisted display settings, and the reset that restores them.
+  const theme = useApp(app, (s) => s.theme);
+  const leftVisible = useApp(app, (s) => s.leftVisible);
+  const rightVisible = useApp(app, (s) => s.rightVisible);
+  const units = useApp(app, (s) => s.units);
+
+  const label = restarting ? "Restarting…" : status === "error" ? "Error" : status === "computing" ? "Computing…" : "Ready";
+  const threads = engine.threads();
+
+  return (
+    <footer className="statusbar" role="status">
+      <span className={`state state-${restarting ? "computing" : status}`} data-status={status}>
+        <span className="dot" aria-hidden="true" />
+        {label}
+      </span>
+      {loading > 0 ? <span className="busy">Loading {loading === 1 ? "1 file" : `${loading} files`}…</span> : null}
+      <span>
+        {items.length} {items.length === 1 ? "mesh" : "meshes"}
+      </span>
+      <span className="spacer" />
+      {error !== undefined ? (
+        <span className="error" title={error.code}>
+          {error.code}: {error.message}
+        </span>
+      ) : null}
+      {error !== undefined && engine.mode === "worker" ? (
+        <button type="button" onClick={restart} disabled={restarting}>
+          Restart
+        </button>
+      ) : null}
+      {error !== undefined && engine.mode === "local" ? (
+        <button type="button" onClick={() => location.reload()}>
+          Reload
+        </button>
+      ) : null}
+      <span data-threads={threads} title={engine.mode === "worker" ? "WorkerScene.threads" : "?local: the synchronous Scene"}>
+        {engine.mode === "worker" ? `Worker · ${threads} ${threads === 1 ? "thread" : "threads"}` : "Local · main thread"}
+      </span>
+      <span
+        className={engine.isolated ? "ok" : "warn"}
+        title="Threads need a cross-origin isolated page (COOP/COEP headers)"
+      >
+        {engine.isolated ? "cross-origin isolated" : "not cross-origin isolated"}
+      </span>
+      <span className="settings" role="group" aria-label="Display settings">
+        <button
+          type="button"
+          data-action="units"
+          data-units={units}
+          aria-pressed={units === "in"}
+          onClick={() => app.setUnits(units === "mm" ? "in" : "mm")}
+          title={`Lengths show in ${units === "mm" ? "millimetres" : "inches"}: click to switch. Display only (no mesh changes), saved with the project, and the default from here on`}
+        >
+          {units}
+        </button>
+        <button
+          type="button"
+          data-action="theme"
+          aria-pressed={theme === "light"}
+          onClick={() => app.setTheme(theme === "dark" ? "light" : "dark")}
+          title={theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"}
+        >
+          {theme === "dark" ? "Dark" : "Light"}
+        </button>
+        <button
+          type="button"
+          data-action="toggle-left"
+          aria-pressed={leftVisible}
+          onClick={() => app.setLeftVisible(!leftVisible)}
+          title={leftVisible ? "Hide the left panel" : "Show the left panel"}
+        >
+          Left
+        </button>
+        <button
+          type="button"
+          data-action="toggle-right"
+          aria-pressed={rightVisible}
+          onClick={() => app.setRightVisible(!rightVisible)}
+          title={rightVisible ? "Hide the right panel" : "Show the right panel"}
+        >
+          Right
+        </button>
+        <button
+          type="button"
+          data-action="reset-settings"
+          onClick={() => app.resetDisplaySettings()}
+          title="Reset the display settings to their defaults (meshes stay)"
+        >
+          Reset settings
+        </button>
+      </span>
+    </footer>
+  );
+}

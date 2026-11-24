@@ -4,11 +4,11 @@
 import type { MeshHandle } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BIG_DECIMATE_TARGET, BIG_DECIMATE_TRIANGLES } from "../src/load/big-file";
-import { Loader, siblingBinFiles } from "../src/load/loader";
-import type { LoaderReply, LoaderRequest } from "../src/load/protocol";
-import { importScaleOf } from "../src/panels/units";
-import { AppState } from "../src/scene/app-state";
+import { BIG_DECIMATE_TARGET, BIG_DECIMATE_TRIANGLES } from "../src/io/big-file";
+import { Loader, siblingBinFiles } from "../src/io/loader";
+import type { LoaderReply, LoaderRequest } from "../src/io/protocol";
+import { importScaleOf } from "../src/shared/ux/units";
+import { AppState } from "../src/app/state/app-state";
 
 function named(name: string): File {
   return { name } as File;

@@ -15,8 +15,8 @@ import {
   protectMaskedDab,
   updateMaskLiveFromRanges,
   updateMaskLiveFromSplits,
-} from "../src/viewport/mask-protect";
-import { GrabRegion, maskUsable } from "../src/viewport/sculpt";
+} from "../src/features/sculpt/ux/mask-protect";
+import { GrabRegion, maskUsable } from "../src/features/sculpt/ux/sculpt";
 
 /** A strip along x: vertices at (i, 0, 0) and (i, 1, 0), `2 * (n + 1)` slots. */
 function strip(n: number): { positions: number[]; indices: number[]; slots: number } {

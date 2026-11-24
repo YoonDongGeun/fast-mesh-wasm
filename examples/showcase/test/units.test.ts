@@ -19,9 +19,9 @@ import {
   toDisplayArea,
   toDisplayLength,
   toDisplayVolume,
-} from "../src/panels/units";
-import { defaultSettings } from "../src/panels/settings";
-import { AppState } from "../src/scene/app-state";
+} from "../src/shared/ux/units";
+import { defaultSettings } from "../src/shared/ux/settings";
+import { AppState } from "../src/app/state/app-state";
 
 describe("conversion factors", () => {
   it("length: 1 in is 25.4 mm", () => {

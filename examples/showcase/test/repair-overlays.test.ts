@@ -7,16 +7,18 @@ import { describe, expect, it } from "vitest";
 import {
   buildRepairOverlayGroup,
   clearRepairOverlays,
-  countRepairOverlays,
   disposeRepairOverlayGroup,
   hasRepairOverlays,
+  REPAIR_OVERLAY_COLORS,
+} from "../src/features/mesh-repair/ui/repair-overlays";
+import {
+  countRepairOverlays,
   holeSegments,
   nonManifoldSegments,
-  REPAIR_OVERLAY_COLORS,
   smallComponentTris,
   triangleEdgeSegments,
   triangleSoup,
-} from "../src/viewport/repair-overlays";
+} from "../src/features/mesh-repair/ux/repair-overlay-data";
 
 /** An analysis with nothing to report, then the given fields. */
 function analysis(patch: Partial<Analysis>): Analysis {

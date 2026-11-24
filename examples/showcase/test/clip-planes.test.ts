@@ -3,7 +3,7 @@
 // feature only sets its own part and never wipes the others.
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { clearClip, setBoxClip, setSectionClip, setSliceClip } from "../src/viewport/clip-planes";
+import { clearClip, setBoxClip, setSectionClip, setSliceClip } from "../src/viewport/ux/clip-planes";
 
 function material(): THREE.MeshStandardMaterial {
   return new THREE.MeshStandardMaterial();

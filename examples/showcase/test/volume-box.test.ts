@@ -2,7 +2,7 @@
 // volume mesh's, while the linked MPR state points at it), and where the
 // box sits in mesh-local coordinates.
 import { describe, expect, it } from "vitest";
-import { cutFractions, matchVolume, volumeBoxLayout } from "../src/viewport/volume-box";
+import { cutFractions, matchVolume, volumeBoxLayout } from "../src/features/ct/ux/volume-box";
 
 describe("matchVolume", () => {
   const items = [

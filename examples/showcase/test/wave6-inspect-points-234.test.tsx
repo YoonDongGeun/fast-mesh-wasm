@@ -23,21 +23,22 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import * as THREE from "three";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { InspectPanel, exportContourSlicesDxf } from "../src/panels/InspectPanel";
+import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
+import { exportContourSlicesDxf } from "../src/features/inspect/ux/use-contour-slices";
+import { PointsPanel } from "../src/features/points/ui/PointsPanel";
 import {
-  PointsPanel,
   computePointCloudBounds,
   createSyntheticSphereCloud,
   parsePointCloudFileContent,
   sampleMeshToPointCloud,
-} from "../src/panels/PointsPanel";
-import { AppState } from "../src/scene/app-state";
+} from "../src/features/points/ux/point-cloud";
+import { AppState } from "../src/app/state/app-state";
 import {
   MetrologyOverlaysLayer,
   buildContourSegmentsGeometry,
   buildPointCloudGeometry,
   buildPrimitiveGuideSegments,
-} from "../src/viewport/MetrologyOverlaysLayer";
+} from "../src/features/points/ui/MetrologyOverlaysLayer";
 
 const cleanups: (() => void)[] = [];
 

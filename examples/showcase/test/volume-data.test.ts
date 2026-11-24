@@ -1,7 +1,7 @@
 // The volume display values: real volumes pass through (Hounsfield units),
 // phantom SDF maps to pseudo-HU for the CT presets (air past 5 mm out).
 import { describe, expect, it } from "vitest";
-import { displayValues } from "../src/panels/volume-data";
+import { displayValues } from "../src/features/ct/ux/volume-data";
 
 describe("displayValues", () => {
   it("passes_real_volumes_through", () => {

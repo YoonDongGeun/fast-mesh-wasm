@@ -9,20 +9,18 @@ import { createRoot, type Root } from "react-dom/client";
 import * as THREE from "three";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { init, Scene } from "../../../packages/fast-mesh-wasm/dist/web.js";
-import { DeformPanel, type DeformPanelProps } from "../src/panels/DeformPanel";
-import { AppState } from "../src/scene/app-state";
+import { DeformPanel, type DeformPanelProps } from "../src/features/sculpt/ui/DeformPanel";
+import { AppState } from "../src/app/state/app-state";
+import { DeformHandlesLayer, type DeformHandlesLayerProps } from "../src/features/sculpt/ui/DeformHandlesLayer";
+import { buildFreeformProtectionFromMask, buildProtectionOption } from "../src/features/sculpt/ux/deform-protection";
 import {
   applyDisplacementToLattice,
-  buildFreeformProtectionFromMask,
   buildLatticeEdgeSegments,
-  buildProtectionOption,
   computeLatticeControlPoints,
-  DeformHandlesLayer,
-  type DeformHandlesLayerProps,
   ffdControlPointIndex,
   moveFfdControlPoint,
   resetLatticeOffsets,
-} from "../src/viewport/DeformHandlesLayer";
+} from "../src/features/sculpt/ux/ffd-lattice";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

@@ -7,7 +7,7 @@
 // built, like every showcase test that touches `fast-mesh-wasm`: CI builds
 // before testing.)
 import { describe, expect, it } from "vitest";
-import { MESH_EXTENSIONS, parseMeshFile, parseMeshFiles, parseMeshFilesAsync } from "../src/load/parse";
+import { MESH_EXTENSIONS, parseMeshFile, parseMeshFiles, parseMeshFilesAsync } from "../src/io/parse";
 
 // A quad: corners (0,0,0), (2,0,0), (2,2,0), (0,2,0), faces (0,1,2) and (0,2,3).
 const QUAD_DRC_B64 =

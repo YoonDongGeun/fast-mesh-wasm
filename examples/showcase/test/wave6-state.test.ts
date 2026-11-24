@@ -1,8 +1,8 @@
 import { Scene } from "fast-mesh-wasm";
 import { createSceneStore, meshState } from "fast-mesh-wasm/store";
 import { afterEach, describe, expect, it } from "vitest";
-import { AppState } from "../src/scene/app-state";
-import { DEFAULT_WAVE6_STATE } from "../src/scene/wave6-state";
+import { AppState } from "../src/app/state/app-state";
+import { DEFAULT_WAVE6_STATE } from "../src/app/state/wave6-state";
 
 function makeBox() {
   const positions = Float64Array.from([

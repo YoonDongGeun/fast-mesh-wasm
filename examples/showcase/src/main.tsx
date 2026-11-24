@@ -8,11 +8,11 @@ import { SceneProvider } from "fast-mesh-wasm/react";
 import { createWorkerScene, type WorkerScene } from "fast-mesh-wasm/worker";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { App, type Engine } from "./App";
-import { Loader } from "./load/loader";
-import { loadSettings, saveSettings, settingsFromSnapshot } from "./panels/settings";
-import { AppState } from "./scene/app-state";
-import { installTestHook } from "./test-hook";
+import { App, type Engine } from "./app/App";
+import { Loader } from "./io/loader";
+import { loadSettings, saveSettings, settingsFromSnapshot } from "./shared/ux/settings";
+import { AppState } from "./app/state/app-state";
+import { installTestHook } from "./app/testing/test-hook";
 import "./styles.css";
 
 const params = new URLSearchParams(location.search);

@@ -2,7 +2,7 @@
 // isosurface meshed (Otsu's threshold unless one is given), named for the
 // list. Failures name the file or series and the reason.
 import { describe, expect, it } from "vitest";
-import { extractSeries } from "../src/load/extract";
+import { extractSeries } from "../src/io/extract";
 import { dicomFile } from "./dicom-fixture";
 
 function sphereSeries(uid = "9.9.9", description?: string): { name: string; buffer: ArrayBuffer }[] {

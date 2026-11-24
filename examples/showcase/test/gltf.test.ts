@@ -4,7 +4,7 @@
 // package `dist` built, like every showcase test that touches
 // `fast-mesh-wasm`: CI builds before testing.)
 import { describe, expect, it } from "vitest";
-import { parseMeshFiles, parseMeshFilesAsync } from "../src/load/parse";
+import { parseMeshFiles, parseMeshFilesAsync } from "../src/io/parse";
 
 function f32(values: number[]): Uint8Array {
   const out = new Uint8Array(4 * values.length);

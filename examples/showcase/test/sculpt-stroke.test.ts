@@ -4,7 +4,7 @@
 // sync scene, and a remesh in the middle of a grab keeps it continuous.
 import { type RepairOp, Scene } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { inheritedSplits, MASK_SOFT_BAND, maskEdgeField, protectMaskedDab } from "../src/viewport/mask-protect";
+import { inheritedSplits, MASK_SOFT_BAND, maskEdgeField, protectMaskedDab } from "../src/features/sculpt/ux/mask-protect";
 import {
   dabOperation,
   GRAB_MAX_STRETCH,
@@ -15,7 +15,7 @@ import {
   symmetricRemeshOps,
   unionMaskIds,
   type SculptBrush,
-} from "../src/viewport/sculpt";
+} from "../src/features/sculpt/ux/sculpt";
 
 type Vec = [number, number, number];
 

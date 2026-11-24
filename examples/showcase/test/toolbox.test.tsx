@@ -3,21 +3,17 @@ import { SceneProvider } from "fast-mesh-wasm/react";
 import { SceneStore } from "fast-mesh-wasm/store";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { describeReport } from "../src/panels/repair-summary";
-import { AppState } from "../src/scene/app-state";
-import { selectMesh } from "../src/scene/selection";
+import { describeReport } from "../src/features/mesh-repair/ux/repair-summary";
+import { AppState } from "../src/app/state/app-state";
+import { selectMesh } from "../src/features/select/ux/selection";
 import {
   applyAltPinClick,
   scaleBrushRadiusForTarget,
   shouldAllowStrokeHit,
-} from "../src/viewport/Viewport";
-import {
-  SculptToolbox,
-  canArmSculpt,
-  eligibleSculptItems,
-  resolveSculptTargetItem,
-} from "../src/viewport/Toolbox";
-import { sculptBrush, type SculptTool } from "../src/viewport/sculpt";
+} from "../src/viewport/ux/brush-target";
+import { SculptToolbox } from "../src/features/sculpt/ui/Toolbox";
+import { canArmSculpt, eligibleSculptItems, resolveSculptTargetItem } from "../src/features/sculpt/ux/sculpt-target";
+import { sculptBrush, type SculptTool } from "../src/features/sculpt/ux/sculpt";
 
 function makeSelectedApp() {
   const scene = new Scene();

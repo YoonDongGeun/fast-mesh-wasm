@@ -1,6 +1,6 @@
 // When undo and redo run around a sculpt stroke (see `afterStroke`).
 import { afterEach, describe, expect, it } from "vitest";
-import { afterStroke, view } from "../src/viewport/view";
+import { afterStroke, view } from "../src/viewport/ux/view";
 
 afterEach(() => {
   view.stroking = false;

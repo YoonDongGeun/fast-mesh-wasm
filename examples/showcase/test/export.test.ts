@@ -5,11 +5,11 @@
 import { describe, expect, it } from "vitest";
 import type { SceneLike } from "fast-mesh-wasm";
 import type { MeshHandle } from "fast-mesh-wasm";
-import { exportFileName, exportMeshBytes, type MeshExportFormat } from "../src/load/export";
-import type { MeshData } from "../src/load/mesh-data";
-import { parseObj } from "../src/load/obj";
-import { parsePly } from "../src/load/ply";
-import { parseStl } from "../src/load/stl";
+import { exportFileName, exportMeshBytes, type MeshExportFormat } from "../src/io/export";
+import type { MeshData } from "../src/io/mesh-data";
+import { parseObj } from "../src/io/obj";
+import { parsePly } from "../src/io/ply";
+import { parseStl } from "../src/io/stl";
 
 const QUAD = Float32Array.from([0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 0, 9, 9, 9]);
 const QUAD_TRIS = Uint32Array.from([0, 1, 2, 0, 2, 3, 0, 0, 0]);

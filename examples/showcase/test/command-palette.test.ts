@@ -1,8 +1,9 @@
 import { Scene } from "fast-mesh-wasm";
 import { SceneStore } from "fast-mesh-wasm/store";
 import { describe, expect, it, vi } from "vitest";
-import { buildCommandPaletteItems, fuzzyMatchCommand } from "../src/panels/CommandPalette";
-import { AppState } from "../src/scene/app-state";
+import { buildCommandPaletteItems } from "../src/shell/ux/command-registry";
+import { fuzzyMatchCommand } from "../src/shell/ux/command-search";
+import { AppState } from "../src/app/state/app-state";
 
 const TET_POS = new Float64Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
 const TET_IDX = new Uint32Array([0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3]);

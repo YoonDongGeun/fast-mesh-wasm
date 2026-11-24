@@ -3,7 +3,7 @@
 // Real pixels are in `scripts/showcase-mask-check.mjs`.
 import * as THREE from "three";
 import { describe, expect, it } from "vitest";
-import { MASK_TINT_OPACITY, MaskOverlay, maskOverlayBuild } from "../src/viewport/mask-overlay";
+import { MASK_TINT_OPACITY, MaskOverlay, maskOverlayBuild } from "../src/features/sculpt/ui/mask-overlay";
 
 const ALPHA = Math.round(255 * MASK_TINT_OPACITY);
 

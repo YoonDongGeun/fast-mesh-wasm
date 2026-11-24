@@ -47,8 +47,8 @@ import {
   unionMaskIds,
   widestGrabReach,
   worldPerPixel,
-} from "../src/viewport/sculpt";
-import { defaultSettings } from "../src/panels/settings";
+} from "../src/features/sculpt/ux/sculpt";
+import { defaultSettings } from "../src/shared/ux/settings";
 
 const brush: SculptBrush = {
   mesh: 7 as unknown as MeshHandle,

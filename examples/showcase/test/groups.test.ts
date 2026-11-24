@@ -1,7 +1,7 @@
-// The pure parts of named mesh groups: ticking, creating, colouring and
-// dropping members on removal.
+// The pure parts of named mesh groups: ticking, creating, colouring,
+// dropping members on removal and the members still listed.
 import { describe, expect, it } from "vitest";
-import { createGroup, dropMember, removeGroup, setColored, toggleCheck } from "../src/panels/groups";
+import { createGroup, dropMember, liveMembers, removeGroup, setColored, toggleCheck } from "../src/features/collision/ux/groups";
 
 describe("named groups", () => {
   it("toggle_check_keeps_list_order", () => {
@@ -28,5 +28,12 @@ describe("named groups", () => {
   it("drop_member_on_removal", () => {
     const g = createGroup(createGroup([], 0, "a", "G1", ["x", "y"]), 1, "b", "G2", ["y"]);
     expect(dropMember(g, "y").map((x) => x.members)).toEqual([["x"], []]);
+  });
+
+  it("live_members_keep_member_order", () => {
+    const items = [{ mesh: "c" }, { mesh: "a" }];
+    expect(liveMembers(["a", "b", "c"], items)).toEqual(["a", "c"]);
+    expect(liveMembers(["b"], items)).toEqual([]);
+    expect(liveMembers([], items)).toEqual([]);
   });
 });

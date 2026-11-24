@@ -2,7 +2,7 @@
 // section plane and the clip box.
 import type { MeshHandle, SectionHandle } from "fast-mesh-wasm";
 import { describe, expect, it } from "vitest";
-import { AppState } from "../src/scene/app-state";
+import { AppState } from "../src/app/state/app-state";
 
 const mesh = 7 as unknown as MeshHandle;
 const handle = {} as SectionHandle;

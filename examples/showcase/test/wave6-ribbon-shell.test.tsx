@@ -10,19 +10,18 @@ import { createSceneStore } from "fast-mesh-wasm/store";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CollisionPanel } from "../src/panels/CollisionPanel";
-import { buildCommandPaletteItems } from "../src/panels/CommandPalette";
-import { DeformPanel } from "../src/panels/DeformPanel";
-import { InspectPanel } from "../src/panels/InspectPanel";
-import { ModelingPanel } from "../src/panels/ModelingPanel";
-import { PointsPanel } from "../src/panels/PointsPanel";
-import { tabMatchesSlot, WORKBENCH_TABS, WorkbenchRibbon } from "../src/panels/Ribbon";
-import { SelectPanel } from "../src/panels/SelectPanel";
-import { AppState } from "../src/scene/app-state";
-import {
-  FaceSelectionMarquee,
-  setFaceSelectionMarquee,
-} from "../src/viewport/FaceSelectionLayer";
+import { CollisionPanel } from "../src/features/collision/ui/CollisionPanel";
+import { buildCommandPaletteItems } from "../src/shell/ux/command-registry";
+import { DeformPanel } from "../src/features/sculpt/ui/DeformPanel";
+import { InspectPanel } from "../src/features/inspect/ui/InspectPanel";
+import { ModelingPanel } from "../src/features/mesh-edit/ui/ModelingPanel";
+import { PointsPanel } from "../src/features/points/ui/PointsPanel";
+import { WorkbenchRibbon } from "../src/shell/ui/Ribbon";
+import { tabMatchesSlot, WORKBENCH_TABS } from "../src/shell/ux/workbench-tabs";
+import { SelectPanel } from "../src/features/select/ui/SelectPanel";
+import { AppState } from "../src/app/state/app-state";
+import { FaceSelectionMarquee } from "../src/features/select/ui/FaceSelectionLayer";
+import { setFaceSelectionMarquee } from "../src/features/select/ux/face-selection-marquee";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

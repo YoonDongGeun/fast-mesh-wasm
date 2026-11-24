@@ -2,9 +2,9 @@
 // slice stacks, meshed through the same extraction pipeline as dropped
 // files (so the demos prove the path, not a second one).
 import { describe, expect, it } from "vitest";
-import { meshSlices } from "../src/load/extract";
-import { PHANTOM_FIELD, phantomSlices, type PhantomKind } from "../src/load/phantom";
-import { stackSeries } from "../src/load/series";
+import { meshSlices } from "../src/io/extract";
+import { PHANTOM_FIELD, phantomSlices, type PhantomKind } from "../src/io/phantom";
+import { stackSeries } from "../src/io/series";
 
 const KINDS: PhantomKind[] = ["vessels", "brain", "heart"];
 

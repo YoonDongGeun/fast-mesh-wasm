@@ -2,7 +2,7 @@
 // measures, editing them, each pair's deepest penetration from the members'
 // values and nearest partners, and the partner behind one vertex.
 import { describe, expect, it } from "vitest";
-import { groupPairs, nearestPartner, pairDepths, togglePair } from "../src/panels/group-math";
+import { groupPairs, nearestPartner, pairDepths, togglePair } from "../src/features/collision/ux/group-math";
 
 const NONE = 0xffffffff;
 

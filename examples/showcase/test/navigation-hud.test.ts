@@ -7,7 +7,7 @@ import {
   VIEW_CUBE_CORNERS,
   VIEW_CUBE_EDGES,
   VIEW_CUBE_FACES,
-} from "../src/viewport/navigation-hud";
+} from "../src/features/view/ux/navigation-hud";
 
 describe("ViewCube, XYZ triad & Live Metric Scale Bar (#232)", () => {
   it("provides_6_faces_12_edges_and_8_isometric_corners_with_unit_normals", () => {

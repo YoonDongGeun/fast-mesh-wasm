@@ -2,7 +2,7 @@
 // cube faces always agree) with edge-keyed vertex sharing, plus Otsu's
 // threshold for a modality-agnostic default.
 import { describe, expect, it } from "vitest";
-import { isosurface, otsu } from "../src/load/isosurface";
+import { isosurface, otsu } from "../src/io/isosurface";
 
 const box = (columns: number, rows: number, slices: number) => ({
   columns,
