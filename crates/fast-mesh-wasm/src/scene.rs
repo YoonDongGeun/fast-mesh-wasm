@@ -1369,8 +1369,9 @@ impl WasmScene {
 
     /// Evaluates an N-ary CSG boolean tree over `meshes` (`[idx0, gen0, ...]`)
     /// using prefix-encoded `tree` (`[0, leafIdx]` for Leaf, `[1, op, ...left, ...right]`
-    /// for Op) and inserts the resulting mesh at identity placement, as one
-    /// undo step (undo removes it). Returns `[added_index, added_generation]`.
+    /// for Op) and inserts the resulting mesh at identity placement, its
+    /// origin the centre of the bounds of the meshes used, as one undo step
+    /// (undo removes it). Returns `[added_index, added_generation]`.
     #[allow(clippy::too_many_arguments)]
     pub fn boolean_batch(
         &mut self,
@@ -3209,7 +3210,7 @@ impl WasmScene {
         plug_normals: bool,
     ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
-        let (spec, opts) = crate::wave6::parse_drain_hole(
+        let (point, spec, opts) = crate::wave6::parse_drain_hole(
             surface_point3,
             surface_normal3,
             diameter,
@@ -3222,7 +3223,7 @@ impl WasmScene {
             generate_plug,
             plug_clearance,
         )?;
-        let (rep, plugs) = self.scene.punch_drain_hole_world(id, &spec, &opts)?;
+        let (rep, plugs) = self.scene.punch_drain_hole_at(id, point, &spec, &opts)?;
         let mut plug_ids = Vec::with_capacity(plugs.len() * 2);
         for plug_id in plugs {
             let pair = self.added(plug_id, plug_normals)?;

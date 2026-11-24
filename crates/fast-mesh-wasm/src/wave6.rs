@@ -1467,7 +1467,8 @@ pub(crate) fn parse_drain_hole(
     fallback_bvh_sdf: bool,
     generate_plug: bool,
     plug_clearance: f64,
-) -> Result<(DrainHoleSpec, DrainHoleOptions), Error> {
+) -> Result<([f64; 3], DrainHoleSpec, DrainHoleOptions), Error> {
+    let point = vec3_f64(surface_point3, "surfacePoint")?;
     let spec = DrainHoleSpec {
         surface_point: vec3_f32(surface_point3, "surfacePoint")?,
         surface_normal: vec3_f32(surface_normal3, "surfaceNormal")?,
@@ -1487,7 +1488,7 @@ pub(crate) fn parse_drain_hole(
         generate_plug,
         plug_clearance: f64_to_f32(plug_clearance, "plugClearance")?,
     };
-    Ok((spec, opts))
+    Ok((point, spec, opts))
 }
 
 pub(crate) fn encode_drain_report(

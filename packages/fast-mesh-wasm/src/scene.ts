@@ -3783,7 +3783,9 @@ export class Scene implements SceneLike {
 
   /**
    * Evaluates an N-ary CSG tree over `meshes` (or handle-leaf nodes) and inserts
-   * the resulting mesh into the scene at identity placement (one undo step).
+   * the resulting mesh into the scene at identity placement (one undo step). Its
+   * {@link Scene.origin} is the centre of the bounds of the meshes used, so that it
+   * is as precise far from the world origin as near it.
    */
   booleanBatch(meshes: readonly MeshHandle[], tree: CsgNode, options?: BooleanOptions): MeshHandle;
   booleanBatch(tree: CsgNode, options?: BooleanOptions): MeshHandle;

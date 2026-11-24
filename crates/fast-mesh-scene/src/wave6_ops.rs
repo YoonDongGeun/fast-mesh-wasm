@@ -24,6 +24,7 @@ use fast_mesh_ops::repair::{
 };
 use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
+use crate::baked::baked_mesh;
 use crate::fields::baked_world_mesh;
 use crate::placement::{Placement, local_to_world, orthonormalize, world_to_local};
 use crate::{MeshId, MeshOptions, Result, Scene, SceneError};
@@ -108,6 +109,22 @@ fn world_pose_for_local_origin_mesh(placement: &Placement, parent_origin: [f64; 
         scale: placement.scale,
         translation: local_to_world(placement, parent_origin, [0.0, 0.0, 0.0]),
     }
+}
+
+/// The mesh baked into the world around `center`, its origin: the world
+/// positions minus `center`, which keep their precision in `f32` however far
+/// that is from the world origin.
+fn baked_around(entry: &crate::scene::Entry, center: Vec3) -> Result<Mesh> {
+    let (placement, origin) = (entry.placement, entry.mesh.origin());
+    let (mesh, _) = baked_mesh(
+        &entry.mesh,
+        |l| {
+            let w = local_to_world(&placement, origin, l.map(f64::from));
+            std::array::from_fn(|k| w[k] - center[k])
+        },
+        entry.bvh.options(),
+    )?;
+    Ok(mesh.with_origin(center)?)
 }
 
 fn replace_tx_world_to_local(
@@ -938,7 +955,25 @@ impl Scene {
         world_spec: &DrainHoleSpec,
         options: &DrainHoleOptions,
     ) -> Result<(DrainHoleReport, Vec<MeshId>)> {
+        let point = world_spec.surface_point.map(f64::from);
+        self.punch_drain_hole_at(id, point, world_spec, options)
+    }
+
+    /// [`Scene::punch_drain_hole_world`] at the world point `surface_point`,
+    /// in `f64`, instead of the spec's: far from the world origin that one
+    /// places a hole no better than the steps of `f32` there.
+    ///
+    /// # Errors
+    /// As for [`Scene::punch_drain_hole_world`].
+    pub fn punch_drain_hole_at(
+        &mut self,
+        id: MeshId,
+        surface_point: Vec3,
+        world_spec: &DrainHoleSpec,
+        options: &DrainHoleOptions,
+    ) -> Result<(DrainHoleReport, Vec<MeshId>)> {
         self.drop_field_unit();
+        finite_vec3(surface_point, "drain hole point must be finite")?;
         let (placement, origin, mode, uniform_scale) = {
             let entry = self.entry(id)?;
             (
@@ -949,11 +984,12 @@ impl Scene {
             )
         };
 
-        // Punched in local space, or with no one scale, in the world (`baked`).
+        // Punched in local space, or with no one scale, in the world around
+        // the point (`baked`).
         let (mut spec, mut opts, mut baked) = (*world_spec, *options, None);
         if let Some(s) = uniform_scale {
             let local_pt = vec3_to_f32(
-                world_to_local(&placement, origin, world_spec.surface_point.map(f64::from)),
+                world_to_local(&placement, origin, surface_point),
                 "drain hole point in local space overflows f32",
             )?;
             let local_n = vec3_to_f32(
@@ -971,15 +1007,19 @@ impl Scene {
             };
             opts.plug_clearance = (f64::from(options.plug_clearance) / s) as f32;
         } else {
-            let (mut mesh, _) = baked_world_mesh(self.entry(id)?)?;
+            let mut mesh = baked_around(self.entry(id)?, surface_point)?;
+            spec.surface_point = [0.0; 3];
             let mut tx = mesh.begin_edit();
-            let rep = punch_drain_hole(&mut tx, world_spec, options)?;
+            let rep = punch_drain_hole(&mut tx, &spec, options)?;
             tx.commit()?;
             baked = Some((mesh, rep));
         }
-        let plug_placement = match baked {
-            None => world_pose_for_local_origin_mesh(&placement, origin),
-            Some(_) => Placement::IDENTITY,
+        let (plug_placement, plug_origin) = match baked {
+            None => (
+                world_pose_for_local_origin_mesh(&placement, origin),
+                [0.0; 3],
+            ),
+            Some(_) => (Placement::IDENTITY, surface_point),
         };
 
         // The edit and the adds are one step, or part of the caller's open
@@ -999,7 +1039,7 @@ impl Scene {
                 .into_iter()
                 .map(|plug| {
                     self.add_mesh(
-                        plug,
+                        plug.with_origin(plug_origin)?,
                         MeshOptions {
                             placement: plug_placement,
                             mode,
@@ -1046,18 +1086,27 @@ impl Scene {
             )
         };
 
-        let hp32 = vec3_to_f32(hit_point_world, "hit_point_world must be finite")?;
+        finite_vec3(hit_point_world, "hit_point_world must be finite")?;
         let hn32 = vec3_to_f32(hit_normal_world, "hit_normal_world must be finite")?;
+        // In the world around the hit point, which `f32` may not hold.
         let world_params = PlaceMeshParams {
-            hit_point: hp32,
+            hit_point: [0.0; 3],
             hit_normal: hn32,
             ..*params
         };
-        let world_transform = compute_place_transform(&world_params)?;
+        let mut world_transform = compute_place_transform(&world_params)?;
+        for (t, h) in world_transform
+            .rigid
+            .translation
+            .iter_mut()
+            .zip(hit_point_world)
+        {
+            *t += h;
+        }
 
         if params.mode == PlaceMode::KeepSeparate {
             let mut report = if params.conform_to_surface {
-                let (mut world_target, _) = baked_world_mesh(self.entry(target)?)?;
+                let mut world_target = baked_around(self.entry(target)?, hit_point_world)?;
                 let mut tx = world_target.begin_edit();
                 let rep = place_mesh(&mut tx, &stamp_mesh, &world_params)?;
                 tx.commit()?;
@@ -1073,7 +1122,7 @@ impl Scene {
             report.transform = world_transform;
             let placed = report.placed_mesh.take().ok_or(SceneError::Corrupted)?;
             let new_id = self.add_mesh(
-                placed,
+                placed.with_origin(hit_point_world)?,
                 MeshOptions {
                     placement: Placement::IDENTITY,
                     mode: target_mode,
@@ -1105,7 +1154,7 @@ impl Scene {
             return Ok((rep, None));
         }
 
-        let (mut baked_target, _) = baked_world_mesh(self.entry(target)?)?;
+        let mut baked_target = baked_around(self.entry(target)?, hit_point_world)?;
         let mut rep = {
             let mut tx = baked_target.begin_edit();
             let rep = place_mesh(&mut tx, &stamp_mesh, &world_params)?;
