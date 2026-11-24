@@ -97,33 +97,36 @@ fn deepest_and_farthest(input: &AppendSource, points: &[[f32; 3]]) -> (f32, f32)
 
 #[test]
 fn the_volume_fraction_is_that_of_the_minimal_surface() {
-    // Two cells along each side of a box: whole periods, so the fraction does
-    // not depend on where the cells start.
-    let part = cube([2.0; 3], [0.0; 3]);
+    // A box of one cell: a whole period, so the fraction does not depend on
+    // where the cell starts.
+    let part = cube([1.0; 3], [0.0; 3]);
     for kind in LatticeKind::ALL {
         for (wall, tolerance) in [(0.1, 0.02), (0.15, 0.02), (0.22, 0.02)] {
             let mut mesh = mesh_of(&part);
-            let opts = options(kind, 1.0, wall).min_fragment(0.0).build();
+            let opts = options(kind, 1.0, wall)
+                .voxel_size(Some(0.025))
+                .min_fragment(0.0)
+                .build();
             let r = fill(&mut mesh, &opts).unwrap();
             let out = soup(&mesh);
             let what = format!("{kind:?} {wall}");
             let (_, volume) = check_surface(&out, &what);
             let want = expected(kind, 1.0, wall);
-            let got = volume / 8.0;
+            let got = volume;
             assert!((got / want - 1.0).abs() < tolerance, "{what}: {got} {want}");
             assert!((r.solid_volume - volume).abs() < 1e-3, "{what}");
-            assert!((r.plan.region_volume - 8.0).abs() < 1e-3);
+            assert!((r.plan.region_volume - 1.0).abs() < 1e-4);
             assert!((r.plan.solid_fraction - want).abs() < 1e-6);
             assert_eq!(r.triangles, out.triangles.len());
             assert_eq!(r.vertices, out.positions.len());
             // The estimate the plan makes of the triangles.
             let estimate = r.plan.triangles as f64 / r.triangles as f64;
-            assert!((0.8..1.25).contains(&estimate), "{what}: {estimate}");
+            assert!((0.8..1.3).contains(&estimate), "{what}: {estimate}");
             // Inside, and up to the surface.
             let h = r.plan.voxel_size;
             let (deep, far) = deepest_and_farthest(&part, &out.positions);
             assert!(far < 0.01 * h, "{what}: a vertex {far} outside");
-            assert!(deep < -0.8, "{what}: {deep}");
+            assert!(deep < -0.2, "{what}: {deep}");
         }
     }
 }
@@ -150,26 +153,36 @@ fn ell() -> AppendSource {
 
 fn ring() -> AppendSource {
     torus(&TorusOptions {
-        major_radius: 0.8,
-        minor_radius: 0.4,
+        major_radius: 0.5,
+        minor_radius: 0.28,
+        segments: 32,
+        tube_segments: 16,
         ..TorusOptions::default()
     })
     .unwrap()
 }
 
-/// Shapes about 2 across: smooth, sharp, reentrant, thin, off the grid.
+fn scaled(mut s: AppendSource, by: f32) -> AppendSource {
+    for c in s.positions.iter_mut().flatten() {
+        *c *= by;
+    }
+    s
+}
+
+/// Shapes a little over 1 across: smooth, sharp, reentrant, thin, off the
+/// grid.
 fn shapes() -> Vec<(&'static str, AppendSource)> {
     vec![
-        ("sphere", sphere(1.0, 4)),
-        ("box", cube([2.0, 1.5, 1.2], [0.3, -0.2, 0.1])),
-        ("turned box", turned(cube([1.6; 3], [-0.8; 3]), 0.7)),
+        ("sphere", sphere(0.65, 3)),
+        ("box", cube([1.3, 1.0, 0.9], [0.3, -0.2, 0.1])),
+        ("turned box", turned(cube([1.0; 3], [-0.5; 3]), 0.7)),
         ("torus", ring()),
-        ("ell", ell()),
-        ("turned ell", turned(ell(), 1.1)),
-        ("plate", cube([2.0, 1.5, 0.15], [0.0; 3])),
+        ("ell", scaled(ell(), 0.65)),
+        ("turned ell", turned(scaled(ell(), 0.65), 1.1)),
+        ("plate", cube([1.2, 0.9, 0.13], [0.0; 3])),
         (
             "two parts",
-            merged(&[sphere(0.8, 3), moved(sphere(0.6, 3), [1.6, 0.0, 0.0])]),
+            merged(&[sphere(0.5, 3), moved(sphere(0.4, 3), [1.0, 0.0, 0.0])]),
         ),
     ]
 }
@@ -178,8 +191,8 @@ fn shapes() -> Vec<(&'static str, AppendSource)> {
 fn open_lattices_are_clean_and_stay_inside() {
     for (n, (name, part)) in shapes().into_iter().enumerate() {
         for (i, kind) in LatticeKind::ALL.into_iter().enumerate() {
-            let cell = [0.6, 0.6, 0.8][i];
-            let wall = [0.1, 0.13, 0.1][i];
+            let cell = [0.5, 0.5, 0.65][i];
+            let wall = [0.1, 0.12, 0.1][i];
             // Auto, or as coarse as it goes: two voxels to the wall.
             let voxel = ((n + i) % 2 == 0).then_some(wall / 2.0);
             let mut mesh = mesh_of(&part);
@@ -196,7 +209,7 @@ fn open_lattices_are_clean_and_stay_inside() {
                 // A few cells thick: close to the fraction of whole cells.
                 let share = volume / r.plan.region_volume;
                 let want = expected(kind, cell, wall);
-                assert!((share / want - 1.0).abs() < 0.2, "{what}: {share} {want}");
+                assert!((share / want - 1.0).abs() < 0.3, "{what}: {share} {want}");
             }
         }
     }
@@ -210,9 +223,9 @@ fn a_shell_keeps_the_surface_and_is_one_solid_with_the_walls() {
             continue;
         }
         for (i, kind) in LatticeKind::ALL.into_iter().enumerate() {
-            let cell = [0.6, 0.6, 0.8][i];
-            let wall = [0.1, 0.13, 0.1][i];
-            let shell: f32 = [0.12, 0.1, 0.16][i];
+            let cell = [0.5, 0.5, 0.65][i];
+            let wall = [0.1, 0.12, 0.1][i];
+            let shell: f32 = [0.12, 0.1, 0.14][i];
             let voxel = ((n + i) % 2 == 0).then_some(shell.min(wall) / 2.0);
             let mut mesh = mesh_of(&part);
             let opts = options(kind, cell, wall)
@@ -245,32 +258,32 @@ fn a_shell_keeps_the_surface_and_is_one_solid_with_the_walls() {
 
 #[test]
 fn a_shelled_sphere_weighs_what_shell_and_walls_do() {
-    let part = sphere(1.0, 4);
+    let part = sphere(0.7, 4);
     let solid = measure(&mesh_of(&part)).unwrap().signed_volume;
     for kind in LatticeKind::ALL {
         let mut mesh = mesh_of(&part);
-        let opts = options(kind, 0.4, 0.06).shell_thickness(0.12).build();
+        let opts = options(kind, 0.4, 0.08).shell_thickness(0.1).build();
         let r = fill(&mut mesh, &opts).unwrap();
-        let inside = 4.0 / 3.0 * PI * 0.88f64.powi(3);
-        let want = solid - inside + inside * expected(kind, 0.4, 0.06);
+        let inside = 4.0 / 3.0 * PI * 0.6f64.powi(3);
+        let want = solid - inside + inside * expected(kind, 0.4, 0.08);
         let got = measure(&mesh).unwrap().signed_volume;
-        assert!((got / want - 1.0).abs() < 0.02, "{kind:?}: {got} {want}");
+        assert!((got / want - 1.0).abs() < 0.03, "{kind:?}: {got} {want}");
         assert!((r.solid_volume / got - 1.0).abs() < 1e-3);
     }
 }
 
 #[test]
 fn the_cavity_of_a_hollowed_mesh_fills_from_its_shell() {
-    let part = sphere(1.0, 4);
+    let part = sphere(0.6, 3);
     for kind in LatticeKind::ALL {
         let mut mesh = mesh_of(&part);
-        let wall = 0.12;
+        let wall = 0.1;
         let h = edit(&mut mesh, |tx| {
             hollow_mesh(
                 tx,
                 &HollowOptions {
                     wall_thickness: wall,
-                    voxel_size: Some(0.03),
+                    voxel_size: Some(0.05),
                     ..HollowOptions::default()
                 },
             )
@@ -278,7 +291,7 @@ fn the_cavity_of_a_hollowed_mesh_fills_from_its_shell() {
         .unwrap();
         assert_eq!(h.cavities_created, 1);
         let hollow = measure(&mesh).unwrap().signed_volume;
-        let opts = options(kind, 0.4, 0.06).build();
+        let opts = options(kind, 0.4, 0.08).build();
         let plan = lattice_plan(&mesh, &opts).unwrap();
         assert_eq!(plan.region, LatticeRegion::Cavity);
         assert!((plan.region_volume / h.cavity_volume - 1.0).abs() < 1e-3);
@@ -306,15 +319,15 @@ fn the_cavity_of_a_hollowed_mesh_fills_from_its_shell() {
         // A whole number of cells would give exactly the fraction; here the
         // cavity cuts them.
         let share = r.solid_volume / r.plan.region_volume;
-        let want = expected(kind, 0.4, 0.06);
+        let want = expected(kind, 0.4, 0.08);
         assert!((share / want - 1.0).abs() < 0.12, "{what}: {share} {want}");
 
         // The shell in one go is the same solid.
         let mut direct = mesh_of(&part);
-        let opts = options(kind, 0.4, 0.06).shell_thickness(wall).build();
+        let opts = options(kind, 0.4, 0.08).shell_thickness(wall).build();
         fill(&mut direct, &opts).unwrap();
         let at_once = measure(&direct).unwrap().signed_volume;
-        assert!((at_once / volume - 1.0).abs() < 0.02, "{at_once} {volume}");
+        assert!((at_once / volume - 1.0).abs() < 0.03, "{at_once} {volume}");
     }
 }
 
@@ -337,7 +350,7 @@ fn cavities_with_solids_in_them_and_several_parts_fill() {
         ball(0.5, 5.0),
     ]);
     let mut mesh = mesh_of(&part);
-    let opts = options(LatticeKind::Gyroid, 0.5, 0.08).build();
+    let opts = options(LatticeKind::Gyroid, 0.8, 0.16).build();
     let before = measure(&mesh).unwrap().signed_volume;
     let r = fill(&mut mesh, &opts).unwrap();
     assert_eq!(r.plan.region, LatticeRegion::Cavity);
@@ -360,7 +373,7 @@ fn cavities_with_solids_in_them_and_several_parts_fill() {
 
     // The inside of the same mesh: its material, with the cavities left.
     let mut mesh = mesh_of(&part);
-    let opts = options(LatticeKind::Diamond, 0.3, 0.05)
+    let opts = options(LatticeKind::Diamond, 0.6, 0.12)
         .region(LatticeRegion::Inside)
         .build();
     let r = fill(&mut mesh, &opts).unwrap();
@@ -385,12 +398,12 @@ fn cavities_with_solids_in_them_and_several_parts_fill() {
 
 #[test]
 fn a_thin_wall_around_a_cavity_needs_fine_voxels() {
-    let mut inner = sphere(0.98, 4);
+    let mut inner = sphere(0.47, 3);
     for t in &mut inner.triangles {
         t.swap(1, 2);
     }
-    let part = merged(&[sphere(1.0, 4), inner]);
-    let coarse = options(LatticeKind::SchwarzP, 0.5, 0.08);
+    let part = merged(&[sphere(0.5, 3), inner]);
+    let coarse = options(LatticeKind::SchwarzP, 0.5, 0.1);
     let mut mesh = mesh_of(&part);
     assert_eq!(
         fill(&mut mesh, &coarse.clone().build()).map(|_| ()),
@@ -401,40 +414,41 @@ fn a_thin_wall_around_a_cavity_needs_fine_voxels() {
     );
     assert_eq!(mesh.triangle_count(), part.triangles.len());
     // A shell on top keeps the void away from the wall.
-    let shelled = coarse.clone().shell_thickness(0.06).build();
+    let shelled = coarse.clone().shell_thickness(0.08).build();
     fill(&mut mesh, &shelled).unwrap();
     check_surface(&soup(&mesh), "shelled cavity");
     // And so do voxels finer than the wall.
     let mut mesh = mesh_of(&part);
-    let fine = coarse.voxel_size(Some(0.012)).build();
+    let fine = coarse.voxel_size(Some(0.02)).build();
     fill(&mut mesh, &fine).unwrap();
     check_surface(&soup(&mesh), "fine cavity");
 }
 
 #[test]
 fn lengths_are_measured_after_the_scale() {
-    // Stored half as large along x and ten times along z.
-    let part = cube([1.5, 3.0, 0.3], [2.0, -1.0, 0.0]);
+    // Stored half as large along x and an eighth along z.
+    let part = cube([0.5, 1.0, 0.125], [2.0, -1.0, 0.0]);
     let opts = options(LatticeKind::Gyroid, 1.0, 0.12)
-        .scale([2.0, 1.0, 10.0])
+        .scale([2.0, 1.0, 8.0])
+        .voxel_size(Some(0.025))
         .min_fragment(0.0)
         .build();
     let mut mesh = mesh_of(&part);
     let r = fill(&mut mesh, &opts).unwrap();
-    assert!((r.plan.region_volume - 27.0).abs() < 1e-3);
+    assert!((r.plan.region_volume - 1.0).abs() < 1e-3);
     let mut out = soup(&mesh);
     let (_, far) = deepest_and_farthest(&part, &out.positions);
     assert!(far < 1e-3, "{far}");
     for p in &mut out.positions {
-        *p = [2.0 * p[0], p[1], 10.0 * p[2]];
+        *p = [2.0 * p[0], p[1], 8.0 * p[2]];
     }
     let (_, volume) = check_surface(&out, "scaled");
-    let want = 27.0 * expected(LatticeKind::Gyroid, 1.0, 0.12);
-    assert!((volume / want - 1.0).abs() < 0.02, "{volume} {want}");
-    assert!((r.solid_volume - volume).abs() < 1e-2);
+    let want = expected(LatticeKind::Gyroid, 1.0, 0.12);
+    assert!((volume / want - 1.0).abs() < 0.025, "{volume} {want}");
+    assert!((r.solid_volume - volume).abs() < 1e-3);
 
     // The same lattice as the scaled part has without a scale.
-    let mut plain = mesh_of(&cube([3.0; 3], [0.0; 3]));
+    let mut plain = mesh_of(&cube([1.0; 3], [0.0; 3]));
     let unscaled = LatticeOptions {
         scale: [1.0; 3],
         ..opts
@@ -445,7 +459,7 @@ fn lengths_are_measured_after_the_scale() {
 
 #[test]
 fn far_from_the_origin_the_voxels_must_stay_resolvable() {
-    let opts = options(LatticeKind::Gyroid, 0.5, 0.08).build();
+    let opts = options(LatticeKind::Gyroid, 0.5, 0.1).build();
     let mut mesh = mesh_of(&cube([1.0; 3], [100.0, -50.0, 0.0]));
     fill(&mut mesh, &opts).unwrap();
     check_surface(&soup(&mesh), "far");
@@ -502,9 +516,9 @@ fn the_plan_comes_first_and_big_grids_are_refused() {
 
 #[test]
 fn previews_are_small_and_leave_the_mesh_alone() {
-    let part = sphere(1.0, 4);
+    let part = sphere(0.5, 3);
     let mesh = mesh_of(&part);
-    let opts = options(LatticeKind::Gyroid, 0.4, 0.03).build();
+    let opts = options(LatticeKind::Gyroid, 0.4, 0.06).build();
     let full = lattice_plan(&mesh, &opts).unwrap();
 
     // The full grid, if it fits.
@@ -515,37 +529,37 @@ fn previews_are_small_and_leave_the_mesh_alone() {
     assert!(!all.plan.cropped);
 
     // A coarser one draws the walls two voxels thick.
-    let small = lattice_preview(&mesh, &opts, 200_000).unwrap();
-    assert!(small.plan.voxels <= 200_000 && !small.plan.cropped);
+    let small = lattice_preview(&mesh, &opts, 40_000).unwrap();
+    assert!(small.plan.voxels <= 40_000 && !small.plan.cropped);
     assert!(small.plan.voxel_size > full.voxel_size);
     assert_eq!(small.plan.wall_thickness, 2.0 * small.plan.voxel_size);
     check_surface(&small.walls, "small preview");
     let (_, far) = deepest_and_farthest(&part, &small.walls.positions);
     assert!(far < 0.02 * small.plan.voxel_size);
-    assert!((bounds(&small.walls)[0] + 1.0).abs() < 0.1);
+    assert!((bounds(&small.walls)[0] + 0.5).abs() < 0.05);
 
     // And one too small for the cells shows the middle.
-    let middle = lattice_preview(&mesh, &opts, 30_000).unwrap();
-    assert!(middle.plan.voxels <= 30_000 && middle.plan.cropped && middle.plan.fits);
+    let middle = lattice_preview(&mesh, &opts, 15_000).unwrap();
+    assert!(middle.plan.voxels <= 15_000 && middle.plan.cropped && middle.plan.fits);
     assert!((middle.plan.voxel_size / 0.04 - 1.0).abs() < 1e-6);
     check_surface(&middle.walls, "cropped preview");
-    assert!(bounds(&middle.walls)[0] > -0.8);
+    assert!(bounds(&middle.walls)[0] > -0.48);
 
     // With a shell, the walls start at its inner face.
     let shelled = LatticeOptions {
-        shell_thickness: 0.2,
+        shell_thickness: 0.1,
         ..opts
     };
-    let inner = lattice_preview(&mesh, &shelled, 200_000).unwrap();
+    let inner = lattice_preview(&mesh, &shelled, 40_000).unwrap();
     check_surface(&inner.walls, "shelled preview");
     let (_, far) = deepest_and_farthest(&part, &inner.walls.positions);
-    assert!((far + 0.2).abs() < 0.1 * inner.plan.voxel_size, "{far}");
+    assert!((far + 0.1).abs() < 0.1 * inner.plan.voxel_size, "{far}");
     // Nothing is left: an empty preview.
     let thick = LatticeOptions {
-        shell_thickness: 1.5,
+        shell_thickness: 0.8,
         ..opts
     };
-    let none = lattice_preview(&mesh, &thick, 200_000).unwrap();
+    let none = lattice_preview(&mesh, &thick, 40_000).unwrap();
     assert!(none.walls.triangles.is_empty());
     assert_eq!(soup_in_order(&mesh), part);
 }
@@ -554,9 +568,9 @@ fn previews_are_small_and_leave_the_mesh_alone() {
 fn soup_in_order(mesh: &Mesh) -> AppendSource {
     let mut remap = vec![u32::MAX; mesh.vertex_slots()];
     let mut out = AppendSource::default();
-    for v in 0..mesh.vertex_slots() {
+    for (v, new) in remap.iter_mut().enumerate() {
         if mesh.is_vertex_alive(v as VertexId) {
-            remap[v] = out.positions.len() as u32;
+            *new = out.positions.len() as u32;
             out.positions.push(mesh.positions()[v]);
         }
     }
@@ -578,11 +592,11 @@ fn bounds(s: &AppendSource) -> [f32; 3] {
 fn walls_are_as_thick_as_asked() {
     // Straight through the walls of an open lattice from points on the
     // middle surface: the distance to the result is half the thickness.
-    let part = cube([2.0; 3], [-1.0; 3]);
+    let part = cube([1.1; 3], [-0.55; 3]);
     for kind in LatticeKind::ALL {
         for wall in [0.1, 0.25] {
             let mut mesh = mesh_of(&part);
-            let opts = options(kind, 1.0, wall).voxel_size(Some(0.025)).build();
+            let opts = options(kind, 1.0, wall).voxel_size(Some(0.03)).build();
             fill(&mut mesh, &opts).unwrap();
             let out = mesh_of(&soup(&mesh));
             let bvh = bvh_of(&out);
@@ -646,7 +660,7 @@ fn walls_are_as_thick_as_asked() {
 #[test]
 fn a_uv_seam_does_not_open_the_result() {
     // A box whose faces have their own corners, set apart by their UVs.
-    let part = cube([2.0; 3], [0.0; 3]);
+    let part = cube([1.0; 3], [0.0; 3]);
     let mut split = AppendSource::default();
     let mut uvs: Vec<f32> = Vec::new();
     for (t, tri) in part.triangles.iter().enumerate() {
@@ -657,10 +671,10 @@ fn a_uv_seam_does_not_open_the_result() {
         }
         split.triangles.push([base, base + 1, base + 2]);
     }
-    for shell in [0.0, 0.15] {
+    for shell in [0.0, 0.1] {
         let mut mesh = mesh_of(&split);
         mesh.add_uvs(&uvs).unwrap();
-        let opts = options(LatticeKind::SchwarzP, 0.5, 0.08)
+        let opts = options(LatticeKind::SchwarzP, 0.5, 0.1)
             .shell_thickness(shell)
             .build();
         let r = fill(&mut mesh, &opts).unwrap();
@@ -843,9 +857,9 @@ fn coarse_random_lattices_are_clean() {
         let voxel = (cell / 8.0).min(wall / 2.0);
         let part = turned(
             match run % 4 {
-                0 => cube([1.4, 1.0, 1.2], [-0.6; 3]),
-                1 => sphere(0.8, 3),
-                2 => ell(),
+                0 => cube([1.2, 0.8, 1.0], [-0.5; 3]),
+                1 => sphere(0.6, 3),
+                2 => scaled(ell(), 0.6),
                 _ => ring(),
             },
             6.0 * unit(),

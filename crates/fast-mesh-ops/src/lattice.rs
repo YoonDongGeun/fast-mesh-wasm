@@ -53,9 +53,9 @@
 use fast_mesh_bvh::{BuildOptions, Bvh};
 use fast_mesh_fields::{DEFAULT_MAX_VOXELS, GridSpec, SignData, SignMode, signed_distances};
 use fast_mesh_query::{ClosestHit, ClosestOptions, closest_point_many};
-use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, VertexId};
+use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
-use crate::append::{AppendSource, append_mesh};
+use crate::append::AppendSource;
 use crate::offset::classify_solid;
 use crate::topology::UnionFind;
 use crate::{OpsError, Result, allocation_allowed, filled, reserve};
@@ -1021,13 +1021,20 @@ impl Survey {
         } else {
             added
         };
+        let mut mapped: Vec<[VertexId; 3]> = Vec::new();
+        reserve(&mut mapped, source.triangles.len())?;
+        if had_uvs {
+            tx.drop_channel(UV_CHANNEL)?;
+        }
         if !triangles.is_empty() {
             tx.remove_triangles(&triangles)?;
         }
         if !vertices.is_empty() {
             tx.remove_vertices(&vertices)?;
         }
-        append_mesh(tx, &source)?;
+        let ids = tx.add_vertices(&source.positions)?;
+        mapped.extend(source.triangles.iter().map(|t| t.map(|v| ids[v as usize])));
+        tx.add_triangles(&mapped)?;
         Ok(had_uvs)
     }
 

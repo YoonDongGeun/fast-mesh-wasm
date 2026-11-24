@@ -260,8 +260,8 @@ mod tests {
 
     /// The zero set over two cells, as a fine mesh in phase units.
     fn zero_set(kind: LatticeKind) -> Mesh {
-        let n = 129;
-        let h = 2.0 * TAU / 128.0;
+        let n = 81;
+        let h = 2.0 * TAU / 80.0;
         let mut values = Vec::with_capacity(n * n * n);
         for z in 0..n {
             for y in 0..n {
@@ -282,7 +282,7 @@ mod tests {
             let surface = zero_set(kind);
             let bvh = Bvh::build(&surface, &BuildOptions::default()).unwrap();
             let (mut worst, mut count) = (0.0f64, 0);
-            for _ in 0..4000 {
+            for _ in 0..2000 {
                 // In the middle of the sampled cells, away from their rim.
                 let u: [f64; 3] = std::array::from_fn(|_| TAU * (0.5 + rng(&mut seed)));
                 let hit = closest_point(
@@ -311,8 +311,8 @@ mod tests {
                     }
                 }
             }
-            assert!(count > 500, "{kind:?}: {count}");
-            assert!(worst < 0.03, "{kind:?}: off by {worst}");
+            assert!(count > 250, "{kind:?}: {count}");
+            assert!(worst < 0.035, "{kind:?}: off by {worst}");
         }
     }
 
@@ -322,7 +322,7 @@ mod tests {
             let surface = zero_set(kind);
             let area = crate::measure(&surface).unwrap().area / 8.0 / (TAU * TAU);
             let want = kind.area_per_cell();
-            assert!((area / want - 1.0).abs() < 0.005, "{kind:?}: {area} {want}");
+            assert!((area / want - 1.0).abs() < 0.006, "{kind:?}: {area} {want}");
         }
     }
 

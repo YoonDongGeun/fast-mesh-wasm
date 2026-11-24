@@ -97,67 +97,50 @@ impl Job<'_> {
 
     /// Fills `grid` with the depth minus the distance inside the boundary
     /// (negative where the lattice may be): exact within `band` voxels of
-    /// zero, where `near` becomes 1, and [`CUT`] voxels of the right sign
-    /// elsewhere.
+    /// zero and [`CUT`] voxels of the right sign elsewhere. `near` becomes 1
+    /// on the exact nodes that [`Job::place`] must look at.
     ///
     /// The distance changes no faster than the position, so a block whose
     /// centre is farther from the clip surface than its corners are from the
     /// centre lies on one side of it. Blocks that may reach the clip surface
     /// are halved, down to single nodes.
     fn clip(&self, grid: &mut [f32], near: &mut [u8]) -> Result<()> {
-        let [nx, ny, nz] = self.spec.dims;
+        let [nx, ny, _] = self.spec.dims;
         let h = self.spec.voxel_size;
         let mut blocks: Vec<[u32; 3]> = Vec::new();
-        for z in (0..nz).step_by(BLOCK) {
-            for y in (0..ny).step_by(BLOCK) {
-                for x in (0..nx).step_by(BLOCK) {
-                    grow_push(&mut blocks, [x as u32, y as u32, z as u32])?;
-                }
-            }
-        }
+        self.clip_blocks(grid, &mut blocks)?;
+        // Where the void of a cavity could touch the wall around it, and
+        // where a vertex may not be clear of the clip surface.
+        let keep = -(if self.band > 1.0 {
+            self.band
+        } else {
+            0.5 + 2.0 * CLEAR
+        }) * h;
         let mut points: Vec<[f32; 3]> = Vec::new();
         reserve(&mut points, QUERY_BATCH)?;
         let mut values: Vec<f32> = filled(QUERY_BATCH, 0.0)?;
-        let mut size = BLOCK;
+        let mut size = BLOCK / 2;
         loop {
-            // The centre's offset from the block's first node, and the
-            // distance to its farthest one, with a margin for rounding.
             let half = 0.5 * (size - 1) as f32;
-            let reach = (3f32.sqrt() * half + self.band) * h * 1.001;
+            let reach = self.reach(size);
+            // As far as the block it is half of reached, and from there.
+            let max = self.depth + self.reach(2 * size) + 2.0 * size as f32 * h;
             let mut next: Vec<[u32; 3]> = Vec::new();
             for batch in blocks.chunks(QUERY_BATCH) {
                 points.clear();
-                points.extend(batch.iter().map(|b| {
-                    std::array::from_fn(|k| self.spec.origin[k] + (b[k] as f32 + half) * h)
-                }));
+                points.extend(batch.iter().map(|b| self.block_point(*b, half)));
                 let values = &mut values[..batch.len()];
-                self.clip_at(&points, values)?;
+                self.clip_at(&points, max, values)?;
                 for (&b, &c) in batch.iter().zip(values.iter()) {
-                    let [x, y, z] = b.map(|i| i as usize);
                     if size == 1 {
+                        let [x, y, z] = b.map(|i| i as usize);
                         let i = (z * ny + y) * nx + x;
                         grid[i] = c;
-                        near[i] = 1;
+                        near[i] = u8::from(c >= keep);
                     } else if c.abs() > reach {
-                        let end = |from: usize, n: usize| (from + size).min(n);
-                        for z in z..end(z, nz) {
-                            for y in y..end(y, ny) {
-                                let row = (z * ny + y) * nx;
-                                grid[row + x..row + end(x, nx)].fill((CUT * h).copysign(c));
-                            }
-                        }
+                        self.fill_block(grid, b, size, c);
                     } else {
-                        let half = size / 2;
-                        for child in 0..8 {
-                            let at = [
-                                x + half * (child & 1),
-                                y + half * (child >> 1 & 1),
-                                z + half * (child >> 2),
-                            ];
-                            if at[0] < nx && at[1] < ny && at[2] < nz {
-                                grow_push(&mut next, at.map(|i| i as u32))?;
-                            }
-                        }
+                        self.halve_block(b, size, &mut next)?;
                     }
                 }
             }
@@ -169,10 +152,114 @@ impl Job<'_> {
         }
     }
 
-    /// The depth minus the distance inside the boundary, at `points`.
-    fn clip_at(&self, points: &[[f32; 3]], out: &mut [f32]) -> Result<()> {
+    /// The first pass of [`Job::clip`]: the blocks of [`BLOCK`] nodes a side.
+    /// Those that may reach the clip surface go on `open`, halved.
+    ///
+    /// A block is only asked for its distance up to a limit: deep inside a
+    /// mesh, the closest point is expensive to find. Past the limit, its side
+    /// is that of any neighbour, whose centre is nearer than the surface.
+    fn clip_blocks(&self, grid: &mut [f32], open: &mut Vec<[u32; 3]>) -> Result<()> {
+        let h = self.spec.voxel_size;
+        let [bx, by, bz] = self.spec.dims.map(|n| n.div_ceil(BLOCK));
+        let total = bx * by * bz;
+        let at = |i: usize| [i % bx, i / bx % by, i / bx / by].map(|i| (i * BLOCK) as u32);
+        let half = 0.5 * (BLOCK - 1) as f32;
+        let reach = self.reach(BLOCK);
+        let max = (self.depth + reach).max(1.01 * BLOCK as f32 * h);
+        let mut values: Vec<f32> = filled(total, 0.0)?;
+        let mut points: Vec<[f32; 3]> = Vec::new();
+        reserve(&mut points, QUERY_BATCH.min(total))?;
+        for (n, chunk) in values.chunks_mut(QUERY_BATCH).enumerate() {
+            points.clear();
+            let first = n * QUERY_BATCH;
+            points.extend((first..first + chunk.len()).map(|i| self.block_point(at(i), half)));
+            self.clip_at(&points, max, chunk)?;
+        }
+        // Spreads the sides into the blocks past the limit.
+        let mut queue: Vec<u32> = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            if v.is_finite() {
+                grow_push(&mut queue, i as u32)?;
+            }
+        }
+        let mut next = 0;
+        while next < queue.len() {
+            let i = queue[next] as usize;
+            next += 1;
+            // A known block's side, on the near side of its clip surface.
+            let side = (values[i] - self.depth).signum() * f32::MAX;
+            let [x, y, z] = [i % bx, i / bx % by, i / bx / by];
+            for (inside, j) in [
+                (x > 0, i.wrapping_sub(1)),
+                (x + 1 < bx, i + 1),
+                (y > 0, i.wrapping_sub(bx)),
+                (y + 1 < by, i + bx),
+                (z > 0, i.wrapping_sub(bx * by)),
+                (z + 1 < bz, i + bx * by),
+            ] {
+                if inside && !values[j].is_finite() {
+                    values[j] = side;
+                    grow_push(&mut queue, j as u32)?;
+                }
+            }
+        }
+        for (i, &c) in values.iter().enumerate() {
+            if c.abs() > reach {
+                self.fill_block(grid, at(i), BLOCK, c);
+            } else {
+                self.halve_block(at(i), BLOCK, open)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How close to the clip surface the centre of a block of `size` nodes a
+    /// side must be for one of them to be within the band of it.
+    fn reach(&self, size: usize) -> f32 {
+        // With a margin for rounding.
+        (3f32.sqrt() * 0.5 * (size - 1) as f32 + self.band) * self.spec.voxel_size * 1.001
+    }
+
+    /// The point `half` voxels from node `b` along each axis.
+    fn block_point(&self, b: [u32; 3], half: f32) -> [f32; 3] {
+        std::array::from_fn(|k| self.spec.origin[k] + (b[k] as f32 + half) * self.spec.voxel_size)
+    }
+
+    /// Puts the nodes of a block on the side of `c`.
+    fn fill_block(&self, grid: &mut [f32], b: [u32; 3], size: usize, c: f32) {
+        let dims = self.spec.dims;
+        let [x, y, z] = b.map(|i| i as usize);
+        let end: [usize; 3] = std::array::from_fn(|k| (b[k] as usize + size).min(dims[k]));
+        let value = (CUT * self.spec.voxel_size).copysign(c);
+        for z in z..end[2] {
+            for y in y..end[1] {
+                let row = (z * dims[1] + y) * dims[0];
+                grid[row + x..row + end[0]].fill(value);
+            }
+        }
+    }
+
+    /// Appends the halves of a block that have nodes.
+    fn halve_block(&self, b: [u32; 3], size: usize, out: &mut Vec<[u32; 3]>) -> Result<()> {
+        let half = (size / 2) as u32;
+        for child in 0..8u32 {
+            let at = [
+                b[0] + half * (child & 1),
+                b[1] + half * (child >> 1 & 1),
+                b[2] + half * (child >> 2),
+            ];
+            if (0..3).all(|k| (at[k] as usize) < self.spec.dims[k]) {
+                grow_push(out, at)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The depth minus the distance inside the boundary, at `points`;
+    /// `f32::INFINITY` farther than `max` from the boundary.
+    fn clip_at(&self, points: &[[f32; 3]], max: f32, out: &mut [f32]) -> Result<()> {
         let b = &self.boundary;
-        signed_distances(b.mesh, b.bvh, b.sign, points, f32::INFINITY, out)?;
+        signed_distances(b.mesh, b.bvh, b.sign, points, max, out)?;
         for v in out {
             *v += self.depth;
         }
@@ -300,6 +387,8 @@ impl Job<'_> {
         let mut points: Vec<[f32; 3]> = Vec::new();
         reserve(&mut points, QUERY_BATCH.min(edges.len()))?;
         let mut values: Vec<f32> = filled(QUERY_BATCH.min(edges.len()), 0.0)?;
+        // An edge next to a near node reaches no farther.
+        let max = self.depth + (self.band + 2.0) * h;
         for round in 0..PLACE_ROUNDS {
             let mut kept = 0;
             for start in (0..open.len()).step_by(QUERY_BATCH) {
@@ -309,7 +398,7 @@ impl Job<'_> {
                     points.push(self.on_edge(&edges[e as usize].1).map(|c| c as f32));
                 }
                 let values = &mut values[..range.len()];
-                self.clip_at(&points, values)?;
+                self.clip_at(&points, max, values)?;
                 for (i, at) in range.enumerate() {
                     let e = open[at];
                     let edge = &mut edges[e as usize].1;
