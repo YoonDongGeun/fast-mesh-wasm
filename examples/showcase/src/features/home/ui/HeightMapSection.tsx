@@ -7,6 +7,7 @@ import type { AppState, Item } from "../../../app/state/app-state";
 import { LengthInput } from "../../../shared/ui/LengthInput";
 import { HEIGHT_MAP_VIEWS, type HeightMapView, MAX_RESOLUTION, MIN_RESOLUTION } from "../ux/height-map-export";
 import { type HeightMapSource, useHeightMapExport } from "../ux/use-height-map-export";
+import "./height-map.css";
 
 export function HeightMapSection(props: { app: AppState; scene: Scene | WorkerScene; picked: Item | null }) {
   const { picked } = props;
@@ -15,7 +16,7 @@ export function HeightMapSection(props: { app: AppState; scene: Scene | WorkerSc
   const busy = h.progress !== null;
   const status = h.problem !== null ? { text: h.problem, problem: true } : h.report;
   return (
-    <div className="op" data-height-map-section>
+    <div className="op height-map-section" data-height-map-section>
       <h3>Height map</h3>
       <div className="op-row">
         <label className="field">
