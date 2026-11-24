@@ -429,8 +429,17 @@ input[type="range"] {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
   font-size: 12px;
   color: var(--muted);
+}
+/* Long options and file names shrink to the column. */
+.field select,
+.field input[type="file"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 .field input[type="number"] {
   width: 72px;
@@ -512,15 +521,13 @@ input[type="range"] {
 }
 .modes {
   display: flex;
+  /* Wraps in a narrow column instead of running past it. */
+  flex-wrap: wrap;
   gap: 4px;
   margin: 0 0 6px;
 }
 .modes button {
   flex: 1;
-}
-/* Five tools: the row wraps in a narrow column. */
-.modes[aria-label="Inspection tool"] {
-  flex-wrap: wrap;
 }
 .members {
   list-style: none;
@@ -571,10 +578,14 @@ input[type="range"] {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  max-width: 100%;
   margin: 4px 0;
 }
+/* Single letters (A, B) line up; longer labels (Reference, Format) keep their width. */
 .picker span {
-  width: 14px;
+  flex: none;
+  min-width: 14px;
   font-weight: 600;
   color: var(--muted);
 }
