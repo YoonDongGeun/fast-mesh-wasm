@@ -77,6 +77,10 @@
 //! - Wrapping: [`wrap()`](wrap::wrap) closes gaps and holes below a size in
 //!   one or more meshes by a voxel morphological closing, and returns a
 //!   closed, manifold envelope without self-intersections.
+//! - Lattice infill: [`lattice_fill`] replaces the inside of a closed mesh, or
+//!   the cavity of a hollowed one, by the walls of a gyroid, Schwarz P or
+//!   diamond lattice, open or in a solid shell; [`lattice_plan`] reports the
+//!   voxel grid first, and [`lattice_preview`] builds the walls on a small one.
 //! - Registration: [`icp()`] aligns points to a mesh by rigid, point-to-plane
 //!   ICP with trimmed outlier rejection, and reports how far it got.
 //! - Denoising and Delaunay flips: [`denoise()`] smooths scan noise by
@@ -124,6 +128,7 @@ pub mod heightfield;
 pub mod hull;
 pub mod icp;
 pub mod inspect;
+pub mod lattice;
 pub mod marching_cubes;
 mod measure;
 mod offset;
@@ -174,6 +179,10 @@ pub use hull::{
     ConvexHull, convex_hull, convex_hull_mesh, convex_hull_meshes, convex_hull_point_cloud,
 };
 pub use icp::{IcpMotion, IcpOptions, IcpReport, IcpStatus, icp, sample_surface};
+pub use lattice::{
+    LatticeKind, LatticeOptions, LatticeOptionsBuilder, LatticePlan, LatticePreview, LatticeRegion,
+    LatticeReport, lattice_fill, lattice_plan, lattice_preview,
+};
 pub use marching_cubes::{IsoMesh, marching_cubes, marching_cubes_raw};
 pub use measure::{MeasureReport, VolumeReason, measure, measure_placed};
 pub use offset::{
