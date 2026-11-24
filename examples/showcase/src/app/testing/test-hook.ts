@@ -24,6 +24,7 @@ import { pathLength } from "../../features/inspect/ux/surface-paths";
 import { readWorldBoxes } from "../../features/build-plate/ux/footprint";
 import { curveLength, pointCount } from "../../features/polylines/ux/polyline";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { latticePreviewOf } from "../../features/mesh-edit/ux/lattice-preview-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
 import { DEFAULT_HEIGHT_MAP, exportHeightMap, frameOptions, type HeightMapView, viewAxes } from "../../features/home/ux/height-map-export";
@@ -84,6 +85,12 @@ export function installTestHook(
       const options = frameOptions({ ...DEFAULT_HEIGHT_MAP, view: from, resolution }, axes);
       const out = await exportHeightMap(engine.scene, [find(name)], options);
       return { png: Array.from(out.png.bytes), json: JSON.parse(out.json.text) as unknown, seen: out.seen };
+    },
+    /** The lattice preview: its triangles (0 with none), and the opacity mesh `name` is drawn with. */
+    latticePreview: (name: string) => {
+      const material = view.bindings.get(find(name).mesh)?.object.material as THREE.Material | undefined;
+      const shown = latticePreviewOf(app).getSnapshot();
+      return { triangles: (shown?.walls.indices.length ?? 0) / 3, opacity: material?.opacity ?? null };
     },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),

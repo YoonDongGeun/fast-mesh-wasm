@@ -198,7 +198,7 @@ export function useLattice(args: {
     if (busy || item === null) {
       return;
     }
-    const { problem, options } = optionsFor(item);
+    const { lengths, problem, options } = optionsFor(item);
     if (problem !== null) {
       setReport({ text: problem, error: true });
       return;
@@ -209,7 +209,7 @@ export function useLattice(args: {
     setPreviewing(false);
     try {
       const r = await fillLattice({ store, mesh: item.mesh, options });
-      setReport({ text: describeLattice(item.name, settings.kind, r, units), error: false });
+      setReport({ text: describeLattice(item.name, settings.kind, r, lengths.shell, units), error: false });
     } catch (e) {
       setReport({ text: `Lattice failed: ${message(e)}`, error: true });
     } finally {
@@ -217,14 +217,13 @@ export function useLattice(args: {
     }
   };
 
-  const lengths = latticeLengths(settings, extent);
   return {
     settings,
     update,
     /** The lengths in mm, typed or by default. */
-    lengths,
-    /** The voxel size in mm: typed, or the planned one; `0` before a plan. */
-    voxel: settings.voxel ?? plan.plan?.voxelSize ?? 0,
+    lengths: latticeLengths(settings, extent),
+    /** The voxel size in mm: typed, or the planned one, rounded; `0` before a plan. */
+    voxel: settings.voxel ?? Number((plan.plan?.voxelSize ?? 0).toPrecision(4)),
     plan: plan.plan,
     planError: plan.error,
     previewing,

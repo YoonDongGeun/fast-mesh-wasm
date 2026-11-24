@@ -70,7 +70,7 @@ export function LatticeSection(props: {
             disabled={disabled}
             onMm={(mm) => l.update({ wall: mm > 0 ? mm : null })}
           />
-        </label>
+        </label>{" "}
         <button
           type="button"
           data-lattice-auto
@@ -92,7 +92,7 @@ export function LatticeSection(props: {
             onChange={(e) => l.update({ shell: e.currentTarget.checked })}
           />
           Shell
-        </label>
+        </label>{" "}
         {settings.shell ? (
           <label className="field" title="How thick the solid layer is; in a cavity, on top of its wall">
             thickness ({units})
@@ -118,7 +118,7 @@ export function LatticeSection(props: {
             disabled={disabled}
             onChange={(e) => l.update({ region: e.currentTarget.value as LatticeRegion })}
           >
-            <option value="auto">Auto (cavity if there is one)</option>
+            <option value="auto">Auto (cavity if hollow)</option>
             <option value="inside">Inside</option>
             <option value="cavity">Cavity</option>
           </select>
@@ -134,7 +134,7 @@ export function LatticeSection(props: {
             disabled={disabled}
             onMm={(mm) => l.update({ voxel: mm > 0 ? mm : null })}
           />
-        </label>
+        </label>{" "}
         <button
           type="button"
           data-lattice-voxel-auto
@@ -165,7 +165,7 @@ export function LatticeSection(props: {
           onClick={() => l.setPreviewing(!l.previewing)}
         >
           Preview
-        </button>
+        </button>{" "}
         <button
           type="button"
           className="primary"

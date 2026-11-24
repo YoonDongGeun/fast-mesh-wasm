@@ -121,12 +121,14 @@ describe("lattice settings, options and lines", () => {
 
   it("reports a finished fill", () => {
     const r = { vertices: 10, triangles: 123_456, fragments: 0, solidVolume: 56_000, uvsDropped: false, plan: PLAN };
-    expect(describeLattice("Bracket", "schwarzP", r, "mm")).toBe(
+    expect(describeLattice("Bracket", "schwarzP", r, 0, "mm")).toBe(
       "Bracket: Schwarz P lattice, 123,456 triangles; 45% of the volume is solid (56000 mm³).",
     );
     const cavity = { ...r, fragments: 1, plan: { ...PLAN, region: "cavity" as const } };
-    expect(describeLattice("B", "gyroid", cavity, "mm")).toContain("45% of the cavity is solid");
-    expect(describeLattice("B", "gyroid", cavity, "mm")).toContain("1 loose piece left out.");
+    expect(describeLattice("B", "gyroid", cavity, 0, "mm")).toContain("45% of the cavity is solid");
+    expect(describeLattice("B", "gyroid", cavity, 0, "mm")).toContain("1 small pocket filled.");
+    expect(describeLattice("B", "gyroid", { ...r, fragments: 2 }, 1, "mm")).toContain("2 small pockets filled.");
+    expect(describeLattice("B", "gyroid", { ...r, fragments: 1200 }, 0, "mm")).toContain("1,200 loose pieces left out.");
   });
 
   it("is in the command palette", () => {

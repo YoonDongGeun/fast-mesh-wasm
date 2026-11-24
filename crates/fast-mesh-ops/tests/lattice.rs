@@ -380,6 +380,24 @@ fn cavities_with_solids_in_them_and_several_parts_fill() {
     assert_eq!(r.plan.region, LatticeRegion::Inside);
     check_surface(&soup(&mesh), "the inside of nested balls");
 
+    // A bubble does not make a mesh hollow, but can be asked for.
+    let part = merged(&[ball(1.0, 0.0), reversed(ball(0.3, 0.2))]);
+    let auto = LatticeOptions {
+        region: LatticeRegion::Auto,
+        ..opts
+    };
+    let plan = lattice_plan(&mesh_of(&part), &auto).unwrap();
+    assert_eq!(plan.region, LatticeRegion::Inside);
+    let mut mesh = mesh_of(&part);
+    fill(&mut mesh, &auto).unwrap();
+    check_surface(&soup(&mesh), "around a bubble");
+    let bubble = LatticeOptions {
+        region: LatticeRegion::Cavity,
+        ..opts
+    };
+    let plan = lattice_plan(&mesh_of(&part), &bubble).unwrap();
+    assert_eq!(plan.region, LatticeRegion::Cavity);
+
     // A loose part wound inward is not a cavity.
     let part = merged(&[ball(1.0, 0.0), reversed(ball(0.2, 4.0))]);
     let plan = lattice_plan(&mesh_of(&part), &opts).unwrap();

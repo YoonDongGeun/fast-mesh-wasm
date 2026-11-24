@@ -98,13 +98,18 @@ const PAD_VOXELS: f64 = 2.0;
 /// coordinate, so that rounding cannot move a vertex across its lattice edge.
 const MIN_VOXEL_ULPS: f64 = 1024.0;
 
+/// The share of the outer volume from which cavities make a mesh hollow.
+const HOLLOW_SHARE: f64 = 0.1;
+
 /// Points per closest-point batch.
 const QUERY_BATCH: usize = 16_384;
 
 /// What a lattice fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LatticeRegion {
-    /// The cavities when the mesh encloses one, and the inside otherwise.
+    /// The cavities when they make up at least a tenth of what the surfaces
+    /// around them enclose (a hollowed mesh), and the inside otherwise: a few
+    /// bubbles do not make a mesh hollow.
     #[default]
     Auto,
     /// The inside of the mesh: its material.
@@ -755,19 +760,29 @@ impl Survey {
                 "lattice needs a closed mesh that encloses a volume and is wound outward",
             ));
         }
-        let cavities = if wanted == LatticeRegion::Inside {
-            false
-        } else {
-            self.mark_cavities(&part_of, &mut parts)?
-        };
-        self.region = match wanted {
-            LatticeRegion::Cavity if !cavities => {
-                return Err(OpsError::InvalidInput(
-                    "lattice found no cavity enclosed by the mesh",
-                ));
+        let cavities = match wanted {
+            LatticeRegion::Inside => false,
+            LatticeRegion::Cavity => {
+                if !self.mark_cavities(&part_of, &mut parts)? {
+                    return Err(OpsError::InvalidInput(
+                        "lattice found no cavity enclosed by the mesh",
+                    ));
+                }
+                true
             }
-            _ if cavities => LatticeRegion::Cavity,
-            _ => LatticeRegion::Inside,
+            LatticeRegion::Auto => {
+                let any = self.mark_cavities(&part_of, &mut parts)?;
+                let within = |cavity: bool| -> f64 {
+                    let chosen = parts.iter().filter(|p| p.cavity == cavity);
+                    chosen.map(|p| p.volume).sum()
+                };
+                any && -within(true) >= HOLLOW_SHARE * within(false)
+            }
+        };
+        self.region = if cavities {
+            LatticeRegion::Cavity
+        } else {
+            LatticeRegion::Inside
         };
         reserve(&mut self.bounds_region, self.triangles.len())?;
         for &t in &self.triangles {

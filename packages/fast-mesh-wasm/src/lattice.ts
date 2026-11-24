@@ -28,7 +28,9 @@ export type LatticeKind = "gyroid" | "schwarzP" | "diamond";
  * - `"cavity"`: the cavities the mesh encloses, such as that of a hollowed
  *   mesh. A cavity that a hole opens to the outside is not enclosed: fill it
  *   before making the hole.
- * - `"auto"`: the cavities when the mesh encloses one, else the inside.
+ * - `"auto"`: the cavities when they make up at least a tenth of what the
+ *   surfaces around them enclose (a hollowed mesh), else the inside: a few
+ *   bubbles do not make a mesh hollow.
  */
 export type LatticeRegion = "auto" | "inside" | "cavity";
 

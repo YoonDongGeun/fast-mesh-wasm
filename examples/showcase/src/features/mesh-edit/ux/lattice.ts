@@ -123,13 +123,21 @@ export function describeLatticePreview(plan: LatticePlan, triangles: number, wal
   return `Preview: ${notes.join(", ")}.`;
 }
 
-/** The report line of a finished fill. */
-export function describeLattice(name: string, kind: LatticeKind, r: LatticeReport, unit: LengthUnit): string {
+/** The report line of a finished fill; `shell` is the thickness it left. */
+export function describeLattice(
+  name: string,
+  kind: LatticeKind,
+  r: LatticeReport,
+  shell: number,
+  unit: LengthUnit,
+): string {
   const label = LATTICE_KINDS.find(([id]) => id === kind)?.[1] ?? kind;
   const left = percent(r.solidVolume / r.plan.regionVolume);
   const region = r.plan.region === "cavity" ? "cavity" : "volume";
-  const loose =
-    r.fragments > 0 ? ` ${r.fragments.toLocaleString("en")} loose ${r.fragments === 1 ? "piece" : "pieces"} left out.` : "";
+  // Bits of wall of an open lattice, and of the space between them otherwise.
+  const open = r.plan.region === "inside" && shell === 0;
+  const pieces = `${r.fragments.toLocaleString("en")} ${open ? "loose piece" : "small pocket"}${r.fragments === 1 ? "" : "s"}`;
+  const loose = r.fragments > 0 ? ` ${pieces} ${open ? "left out" : "filled"}.` : "";
   return (
     `${name}: ${label} lattice, ${r.triangles.toLocaleString("en")} triangles; ` +
     `${left} of the ${region} is solid (${formatVolume(r.solidVolume, unit)}).${loose}`
