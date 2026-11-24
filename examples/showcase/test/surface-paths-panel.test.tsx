@@ -22,7 +22,7 @@ vi.mock("@react-three/fiber", async (original) => ({
   useThree: () => three.current,
 }));
 
-import { generatePrimitive, init, type MeshHandle, type RayHit, Scene } from "fast-mesh-wasm";
+import { generatePrimitive, init, type MeshHandle, type RayHit, Scene, type SceneLike } from "fast-mesh-wasm";
 import { SceneProvider } from "fast-mesh-wasm/react";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
 import { createWorkerScene, type WorkerLike, type WorkerScene } from "fast-mesh-wasm/worker";
@@ -41,7 +41,6 @@ import {
   NO_CUT_MESSAGE,
   queueSurfaceTap,
   surfacePathIdle,
-  surfaceStats,
 } from "../src/features/inspect/ux/surface-path-actions";
 import { pathLength, pathSegments } from "../src/features/inspect/ux/surface-paths";
 import { geodesicMapProbe } from "../src/features/inspect/ux/use-geodesic-map";
@@ -192,6 +191,21 @@ async function tap(app: AppState, scene: Scene, dirs: readonly V3[]): Promise<vo
 const readoutOf = (host: HTMLElement) => host.querySelector("[data-geodesic-readout]")?.textContent ?? null;
 const pathOf = (host: HTMLElement) => host.querySelector("[data-path-readout]")?.textContent ?? null;
 const tri = (scene: Scene, mesh: MeshHandle) => liveTriangleCount(scene.views(mesh).indices());
+
+/** The mesh's live triangles as they are now: their corners' positions. */
+function surface(scene: Pick<SceneLike, "views">, mesh: MeshHandle): number[][] {
+  const v = scene.views(mesh);
+  const pos = v.positions();
+  const ix = v.indices();
+  const out: number[][] = [];
+  for (let k = 0; k + 2 < ix.length; k += 3) {
+    const corners = Array.from(ix.subarray(k, k + 3));
+    if (corners.some((c) => c !== 0)) {
+      out.push(corners.flatMap((c) => Array.from(pos.subarray(3 * c, 3 * c + 3))));
+    }
+  }
+  return out;
+}
 
 /** The SDK's Node worker-thread stand-in for the browser engine Worker. */
 class NodeWorker implements WorkerLike {
@@ -600,7 +614,7 @@ describe("surface path section (#252)", () => {
       await surfacePathIdle(app);
     });
     await frame(store);
-    const before = surfaceStats(scene.views(ring.mesh).positions(), scene.views(ring.mesh).indices());
+    const before = surface(scene, ring.mesh);
     const path = app.getSnapshot().surfacePath.path;
     expect(path?.closed).toBe(true);
     const shown = geodesicMapProbe.shown;
@@ -610,7 +624,7 @@ describe("surface path section (#252)", () => {
       await frame(store);
       expect(host.querySelector("[data-path-error]")?.textContent).toBe(NO_CUT_MESSAGE);
       // Nothing changed, and nothing is lost: the same path, the sources and the map.
-      expect(surfaceStats(scene.views(ring.mesh).positions(), scene.views(ring.mesh).indices())).toEqual(before);
+      expect(surface(scene, ring.mesh)).toEqual(before);
       expect(app.getSnapshot().surfacePath.path).toBe(path);
       expect(app.getSnapshot().surfacePath.sources).toHaveLength(1);
       expect(geodesicMapProbe.shown).toEqual(shown);
@@ -686,7 +700,7 @@ describe("surface path section (#252)", () => {
     });
     const path = app.getSnapshot().surfacePath.path;
     expect(path?.closed).toBe(true);
-    const before = surfaceStats(scene.views(ring.mesh).positions(), scene.views(ring.mesh).indices());
+    const before = surface(scene, ring.mesh);
     for (const cut of ["path-trim-inside", "path-split"]) {
       await click(action(host, cut));
       for (let k = 0; k < 200 && host.querySelector("[data-path-error]") === null; k++) {
@@ -699,7 +713,7 @@ describe("surface path section (#252)", () => {
         await frame(store, 5);
       }
       expect(app.getSnapshot().surfacePath.path).toBe(path);
-      expect(surfaceStats(scene.views(ring.mesh).positions(), scene.views(ring.mesh).indices())).toEqual(before);
+      expect(surface(scene, ring.mesh)).toEqual(before);
       expect(store.getSnapshot().history.canUndo).toBe(false);
       expect(app.getSnapshot().items.map((i) => i.name)).toEqual(["Ring"]);
     }
