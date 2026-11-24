@@ -8,7 +8,6 @@ import {
   crosses2,
   fitPlane,
   fromPlane,
-  inside2,
   planarFit,
   planarTolerance,
   planeAt,
@@ -59,6 +58,20 @@ function random(seed: number): () => number {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+/** Whether `(x, y)` is inside the closed 2D run (even-odd). */
+function inside2(xy: ArrayLike<number>, x: number, y: number): boolean {
+  let hit = false;
+  const n = xy.length;
+  for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
+    const yi = xy[i + 1];
+    const yj = xy[j + 1];
+    if (yi > y !== yj > y && x < ((xy[j] - xy[i]) * (y - yi)) / (yj - yi) + xy[i]) {
+      hit = !hit;
+    }
+  }
+  return hit;
 }
 
 const SEGMENTS = new WeakMap<Run2, Float64Array>();

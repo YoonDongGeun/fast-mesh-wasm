@@ -67,11 +67,6 @@ export class PolylineHistory {
     }
   }
 
-  /** The states held (tests). */
-  get size(): number {
-    return this.#states.size;
-  }
-
   /** Forgets the states nothing can bring back any more. */
   #prune(store: HistoryStore): void {
     for (const m of [...this.#states.keys()]) {

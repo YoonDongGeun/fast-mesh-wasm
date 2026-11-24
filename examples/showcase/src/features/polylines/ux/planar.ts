@@ -209,20 +209,6 @@ export function signedArea2(xy: ArrayLike<number>): number {
   return a / 2;
 }
 
-/** Whether `(x, y)` is inside the closed 2D run (even-odd). */
-export function inside2(xy: ArrayLike<number>, x: number, y: number): boolean {
-  let hit = false;
-  const n = xy.length;
-  for (let i = 0, j = n - 2; i < n; j = i, i += 2) {
-    const yi = xy[i + 1];
-    const yj = xy[j + 1];
-    if (yi > y !== yj > y && x < ((xy[j] - xy[i]) * (y - yi)) / (yj - yi) + xy[i]) {
-      hit = !hit;
-    }
-  }
-  return hit;
-}
-
 /** The 2D segments of a run of points, `x0, y0, x1, y1` each. */
 export function segments2(xy: ArrayLike<number>, closed: boolean): Float64Array {
   const n = xy.length / 2;
