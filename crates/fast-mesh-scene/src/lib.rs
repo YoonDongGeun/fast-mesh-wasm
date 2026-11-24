@@ -109,6 +109,7 @@
 mod baked;
 mod boolean;
 mod contacts;
+mod curve_surface;
 mod cut;
 mod denoise;
 mod domains;
@@ -130,6 +131,8 @@ mod report;
 mod scene;
 mod sculpt;
 mod sections;
+#[cfg(test)]
+mod trim_tests;
 #[cfg(test)]
 mod uv_tests;
 mod wave6_ops;

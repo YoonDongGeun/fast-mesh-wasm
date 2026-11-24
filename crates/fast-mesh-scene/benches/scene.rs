@@ -79,8 +79,14 @@
 //! removal and of an add, each with `take_changes`. For comparison, emptying
 //! the mesh with one edit and undoing it (what tools did before adds and
 //! removals were undoable).
+//!
+//! **Trim by a curve**: `trim_by_curve` with a closed loop of 64 points on 1M
+//! triangles, deleting the inside, on one terrain (`terrain(708)`), on one
+//! of two components (`crossed_terrains(500)`, the loop on the first sheet)
+//! and on a closed sphere. Only the trim is timed; each one is undone.
 
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fast_mesh_bvh::{BuildOptions, Bvh};
@@ -88,7 +94,7 @@ use fast_mesh_query::{Plane, Ray, RayOptions, Rigid, mesh_distance, raycast};
 use fast_mesh_scene::{
     ColorRule, Coloring, Colormap, Contact, ContactFilter, DistanceField, FieldBudget, MeshId,
     MeshOptions, OutOfRange, Placement, Scene, SceneOptions, SceneRayOptions, SectionDesc,
-    SignMode, UpdateMode,
+    SignMode, TrimCurveOptions, UpdateMode,
 };
 use fast_mesh_store::Mesh;
 
@@ -1253,8 +1259,62 @@ fn bench_presence(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_trim(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scene trim_by_curve");
+    group.sample_size(10);
+    let turn = |k: usize| k as f64 / 64.0 * std::f64::consts::TAU;
+    // A circle on the terrain, at its height; on the sphere, around its pole.
+    let circle = |mid: f64, r: f64| -> Vec<[f64; 3]> {
+        let at = |k: usize| (mid + r * turn(k).cos(), mid + r * turn(k).sin());
+        (0..64).map(at).map(|(x, y)| [x, y, height(x, y)]).collect()
+    };
+    let cap = |r: f64, polar: f64| -> Vec<[f64; 3]> {
+        let (s, c) = polar.sin_cos();
+        (0..64)
+            .map(|k| [r * s * turn(k).cos(), r * s * turn(k).sin(), r * c])
+            .collect()
+    };
+    for (name, mesh, points) in [
+        ("1M terrain", terrain(708), circle(354.2, 60.3)),
+        (
+            "1M, two components",
+            crossed_terrains(500),
+            circle(250.2, 60.3),
+        ),
+        ("1M sphere", uv_sphere(708, 708, 100.0), cap(100.0, 0.301)),
+    ] {
+        let mut scene = Scene::new(SceneOptions::default());
+        let id = scene.add_mesh(mesh, MeshOptions::default()).unwrap();
+        let options = TrimCurveOptions {
+            points,
+            ..TrimCurveOptions::default()
+        };
+        eprintln!(
+            "trim_by_curve {name}: {} triangles, {:?}",
+            scene.mesh(id).unwrap().triangle_count(),
+            scene.trim_by_curve(id, &options).unwrap()
+        );
+        assert!(scene.undo().unwrap());
+        group.bench_function(name, |bn| {
+            bn.iter_custom(|n| {
+                let mut spent = Duration::ZERO;
+                for _ in 0..n {
+                    let start = Instant::now();
+                    black_box(scene.trim_by_curve(id, &options).unwrap());
+                    spent += start.elapsed();
+                    assert!(scene.undo().unwrap());
+                    scene.take_changes();
+                }
+                spent
+            });
+        });
+    }
+    group.finish();
+}
+
 fn benches(c: &mut Criterion) {
     bench_presence(c);
+    bench_trim(c);
     bench_self_intersections(c);
     bench_sections(c);
     bench_overhead(c, "1M", 708);
