@@ -17,6 +17,8 @@
 // `Port`, so it runs in a browser Worker or in Node `worker_threads`.
 import type { Range } from "../changes.js";
 import { FastMeshError } from "../core.js";
+import { decodeHeightMapFrame, decodeHeightMapOptions } from "../height-map.js";
+import { generateCheckedHeightfield } from "../height-map-wasm.js";
 import { generateEncodedPrimitive } from "../primitives-wasm.js";
 import {
   type EditOp,
@@ -902,6 +904,7 @@ class Engine {
       case "extractSelectedFaces":
       case "splitSelectedFaces":
       case "reconstructPointCloud":
+      case "addHeightfield":
       case "convexHull":
       case "convexHullPoints":
       case "wrap":
@@ -978,7 +981,9 @@ class Engine {
           case "findContacts":
             return a.pairs === undefined || this.#pending(...a.pairs.flat());
           case "wrapPlan":
-            return this.#pending(...(req.args as QueryMap["wrapPlan"]["args"]).meshes);
+          case "heightMapFrame":
+          case "heightMap":
+            return this.#pending(...(req.args as { meshes: ClientId[] }).meshes);
           default:
             return this.#pending(a.a, a.b, a.mesh, a.source, a.target);
         }
@@ -2100,6 +2105,14 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value: undefined });
         return;
       }
+      case "addHeightfield": {
+        this.#ensureUnused(req.addedId);
+        const { normals, ...placement } = req.placement;
+        const { mesh, ...value } = s.addHeightfield(req.field, { placement, normals });
+        this.#bindAdded(req.addedId, mesh);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "convexHull":
       case "convexHullPoints": {
         this.#ensureUnused(req.addedId);
@@ -2339,7 +2352,9 @@ class Engine {
           pushOwned((value as QueryMap["triangleQuality"]["value"]).vertexQuality);
         } else if (req.name === "meshDeviation") {
           pushOwned((value as QueryMap["meshDeviation"]["value"]).vertexDeviations);
-        } else if (req.name === "generatePrimitive") {
+        } else if (req.name === "heightMap") {
+          pushOwned((value as QueryMap["heightMap"]["value"]).heights);
+        } else if (req.name === "generatePrimitive" || req.name === "generateHeightfield") {
           const mesh = value as QueryMap["generatePrimitive"]["value"];
           pushOwned(mesh.positions);
           pushOwned(mesh.indices);
@@ -2632,6 +2647,18 @@ class Engine {
         const a = args as QueryMap["sliceContourStack"]["args"];
         return s.sliceContourStack(this.#mesh(a.mesh), a.origin, a.normal, a.spacing, a.count);
       }
+      case "heightMapFrame": {
+        const a = args as QueryMap["heightMapFrame"]["args"];
+        return s.heightMapFrame(this.#meshList(a.meshes), decodeHeightMapOptions(a.options));
+      }
+      case "heightMap": {
+        const a = args as QueryMap["heightMap"]["args"];
+        const frame =
+          a.frame === undefined ? decodeHeightMapOptions(a.options ?? []) : decodeHeightMapFrame(a.frame);
+        return s.heightMap(this.#meshList(a.meshes), frame, a.rows);
+      }
+      case "generateHeightfield":
+        return generateCheckedHeightfield(args as QueryMap["generateHeightfield"]["args"]);
       case "generatePrimitive":
         return generateEncodedPrimitive(args as QueryMap["generatePrimitive"]["args"]);
       case "debugDump": {

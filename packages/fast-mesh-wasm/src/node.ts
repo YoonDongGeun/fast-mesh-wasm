@@ -49,6 +49,17 @@ export type {
   ExtrudeFacesOptions,
   ExtrudeFacesResult,
 } from "./extrude.js";
+export {
+  type AddHeightfieldOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapPlacement,
+  MAX_HEIGHT_MAP_PIXELS,
+} from "./height-map.js";
+export { generateHeightfield } from "./height-map-wasm.js";
 export type { ConvexHullOptions, ConvexHullPoints, ConvexHullResult } from "./hull.js";
 export {
   DEFAULT_WRAP_DETAIL,

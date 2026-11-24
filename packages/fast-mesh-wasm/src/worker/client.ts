@@ -24,6 +24,20 @@ import {
   extrudeFacesArgs,
 } from "../extrude.js";
 import {
+  type AddHeightfieldOptions,
+  checkHeightfield,
+  checkHeightfieldPlacement,
+  encodeHeightMapFrame,
+  encodeHeightMapOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapMeshList,
+  isHeightMapFrame,
+} from "../height-map.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -397,6 +411,8 @@ function transferOf(batch: Request[]): Transferable[] {
       if (req.uvs !== undefined) {
         transfer.push(req.uvs);
       }
+    } else if (req.kind === "addHeightfield") {
+      transfer.push(req.field.heights.buffer);
     }
   }
   return transfer;
@@ -1283,6 +1299,8 @@ export class WorkerScene implements SceneLike {
     for (const req of batch) {
       if (req.kind === "addMesh") {
         transfer.push(req.positions, req.indices);
+      } else if (req.kind === "addHeightfield") {
+        transfer.push(req.field.heights.buffer);
       }
     }
     try {
@@ -3281,6 +3299,64 @@ export class WorkerScene implements SceneLike {
     });
   }
 
+  /** Fits a height map's frame to `meshes` (one mesh or several) in the Worker (see `Scene.heightMapFrame`). */
+  heightMapFrame(meshes: MeshHandle | readonly MeshHandle[], options?: HeightMapOptions): Promise<HeightMapFrame> {
+    return this.#query(
+      "heightMapFrame",
+      () => ({
+        meshes: heightMapMeshList(meshes).map((m) => this.#live(m).id),
+        options: encodeHeightMapOptions(options),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * An orthographic depth image of `meshes` (one mesh or several), sampled in
+   * the Worker and transferred (see `Scene.heightMap`). Asking for bands of
+   * `rows` lets other requests run in between them.
+   */
+  heightMap(
+    meshes: MeshHandle | readonly MeshHandle[],
+    frame?: HeightMapFrame | HeightMapOptions,
+    rows?: readonly [number, number],
+  ): Promise<HeightMap> {
+    return this.#query(
+      "heightMap",
+      () => ({
+        meshes: heightMapMeshList(meshes).map((m) => this.#live(m).id),
+        ...(isHeightMapFrame(frame)
+          ? { frame: encodeHeightMapFrame(frame) }
+          : { options: encodeHeightMapOptions(frame) }),
+        ...(rows === undefined ? {} : { rows: [rows[0], rows[1]] as [number, number] }),
+      }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Adds the relief of a grid of heights in the Worker as a new mesh, one undo
+   * step (see `Scene.addHeightfield`). The heights are copied here and
+   * transferred; the mesh itself comes back only as the mirror's buffers.
+   */
+  addHeightfield(field: Heightfield, options?: AddHeightfieldOptions): Promise<HeightfieldResult> {
+    let added: MeshState | undefined;
+    return this.#ask(
+      (rev, qid) => {
+        this.#alive();
+        const checked = checkHeightfield(field);
+        const placement = checkHeightfieldPlacement(options);
+        added = this.#allocMeshState([0, 0, 0], placement.normals);
+        const copy = { ...checked, heights: checked.heights.slice() };
+        return { kind: "addHeightfield", rev, addedId: added.id, field: copy, placement, qid };
+      },
+      (v) => ({ mesh: (added as MeshState).handle, ...(v as Omit<HeightfieldResult, "mesh">) }),
+    ).catch((e) => {
+      this.#discardPlaceholder(added);
+      throw e;
+    });
+  }
+
   /** Smooths noise out of `mesh` in the Worker, one undo step (see `Scene.denoise`). */
   denoise(mesh: MeshHandle, options?: DenoiseOptions): Promise<DenoiseReport> {
     return this.#ask(
@@ -3591,6 +3667,18 @@ export class WorkerScene implements SceneLike {
    */
   generatePrimitive(shape: PrimitiveShape): Promise<PrimitiveMesh> {
     return this.#query("generatePrimitive", () => encodePrimitive(shape), (v) => v);
+  }
+
+  /**
+   * Generates the relief of a grid of heights in the Worker, as the standalone
+   * `generateHeightfield` does on a thread with the module initialised; the
+   * buffers are transferred back, and the scene is not touched.
+   *
+   * @throws (rejects) `INVALID_ARGUMENT` for a grid out of range;
+   * `OUT_OF_MEMORY` when the buffers cannot be allocated.
+   */
+  generateHeightfield(field: Heightfield): Promise<PrimitiveMesh> {
+    return this.#query("generateHeightfield", () => checkHeightfield(field), (v) => v);
   }
 
   // ---- Fields and colours ----

@@ -23,6 +23,23 @@ import {
   extrudeFacesArgs,
 } from "./extrude.js";
 import {
+  type AddHeightfieldOptions,
+  checkHeightfield,
+  checkHeightfieldPlacement,
+  checkHeightMapRows,
+  decodeHeightMapFrame,
+  encodeHeightfield,
+  encodeHeightMapFrame,
+  encodeHeightMapOptions,
+  type Heightfield,
+  type HeightfieldResult,
+  type HeightMap,
+  type HeightMapFrame,
+  type HeightMapOptions,
+  heightMapMeshList,
+  isHeightMapFrame,
+} from "./height-map.js";
+import {
   type ConvexHullOptions,
   type ConvexHullPoints,
   type ConvexHullResult,
@@ -3836,6 +3853,93 @@ export class Scene implements SceneLike {
     const normals = hullNormals(options);
     const r = call(() => this.#scene().convex_hull_points(buf, normals));
     return { mesh: this.#meshHandle(r[0], r[1]), ...decodeHullCounts(r) };
+  }
+
+  /**
+   * Fits a height map's frame to `meshes` (one mesh or several): an
+   * orthographic image of square pixels looking along `options.direction`,
+   * centred on the meshes, with their height range. `heightMap` samples it.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, meshes
+   *   without a triangle or without an extent across the direction, an option
+   *   out of range, or an image over {@link MAX_HEIGHT_MAP_PIXELS};
+   *   `UNKNOWN_MESH` for a removed mesh.
+   */
+  heightMapFrame(meshes: MeshHandle | readonly MeshHandle[], options?: HeightMapOptions): HeightMapFrame {
+    const ids = this.#flatIds(heightMapMeshList(meshes));
+    const values = Float64Array.from(encodeHeightMapOptions(options));
+    return decodeHeightMapFrame(call(() => this.#scene().height_map_frame(ids, values)));
+  }
+
+  /**
+   * An orthographic depth image of `meshes` (one mesh or several, in their
+   * placements): the height of each pixel above the frame's zero plane, NaN
+   * where no surface is seen. A pixel's ray runs through its centre and takes
+   * the first surface within the frame's range (either side of a triangle);
+   * a ray exactly through an edge or vertex takes the nearest of the triangles
+   * meeting there, so a watertight mesh has no cracks.
+   *
+   * `frame` is a frame (from {@link Scene.heightMapFrame}, say), or the options
+   * to fit one with. `rows` samples a band of the image's rows, `[first, end)`:
+   * the bands of an image hold exactly what sampling it whole would, so a large
+   * image can be taken in steps.
+   *
+   * `addHeightfield` with the heights, the frame's pixel size and
+   * `heightMapPlacement(frame)` makes a relief that lies on the surface seen.
+   *
+   * @example
+   * ```ts
+   * const { frame, heights } = scene.heightMap(mesh, { direction: [0, 0, -1], resolution: 1024 });
+   * ```
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for an empty list, an invalid
+   *   frame, rows outside it, or as for {@link Scene.heightMapFrame};
+   *   `UNKNOWN_MESH` for a removed mesh, `STALE_BVH` for a stale manual mesh.
+   */
+  heightMap(
+    meshes: MeshHandle | readonly MeshHandle[],
+    frame?: HeightMapFrame | HeightMapOptions,
+    rows?: readonly [number, number],
+  ): HeightMap {
+    const ids = this.#flatIds(heightMapMeshList(meshes));
+    let raw: Float64Array;
+    if (isHeightMapFrame(frame)) {
+      raw = Float64Array.from(encodeHeightMapFrame(frame));
+    } else {
+      const options = Float64Array.from(encodeHeightMapOptions(frame));
+      raw = call(() => this.#scene().height_map_frame(ids, options));
+    }
+    const fitted = decodeHeightMapFrame(raw);
+    const [first, end] = checkHeightMapRows(rows, fitted.height);
+    const heights = call(() => this.#scene().height_map(ids, raw, first, end));
+    return { frame: fitted, rows: [first, end], heights };
+  }
+
+  /**
+   * Adds the relief of a grid of heights as a new mesh and returns it with its
+   * counts: a closed, outward-wound solid from a flat base up to the heights,
+   * with a vertex per sample at exactly its height (see `generateHeightfield`
+   * for its frame). The buffers never leave the engine, so large reliefs cost
+   * no copy on this side.
+   *
+   * The new mesh is added as one undo step: {@link Scene.undo} removes it and
+   * {@link Scene.redo} brings it back with the same handle.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for fewer than 2 samples on a
+   *   side, a wrong number of heights, a height that is infinite or not above
+   *   `-base`, or an invalid placement; `OUT_OF_MEMORY` when the relief does
+   *   not fit.
+   */
+  addHeightfield(field: Heightfield, options?: AddHeightfieldOptions): HeightfieldResult {
+    const f = checkHeightfield(field);
+    const p = checkHeightfieldPlacement(options);
+    const values = encodeHeightfield(f);
+    const rotation = Float64Array.from(p.rotation);
+    const translation = Float64Array.from(p.translation);
+    const scale = p.scale === undefined ? undefined : Float64Array.from(p.scale);
+    const r = call(() =>
+      this.#scene().add_heightfield(f.heights, f.width, f.height, values, rotation, translation, scale, p.normals),
+    );
+    return { mesh: this.#meshHandle(r[0], r[1]), vertices: r[2], triangles: r[3] };
   }
 
   /**
