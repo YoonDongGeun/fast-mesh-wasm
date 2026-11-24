@@ -40,7 +40,7 @@ export function PolylineList(props: { app: AppState; onFocusBox?: FocusBox }) {
           All
         </label>
       </div>
-      <ul className="meshes">
+      <ul className="polyline-rows">
         {polylines.map((p) => (
           <PolylineRow
             key={p.id}
@@ -68,7 +68,7 @@ const PolylineRow = memo(function PolylineRow(props: {
   const store = useScene();
   const length = useMemo(() => curveLength(polyline), [polyline]);
   return (
-    <li className={selected ? "mesh polyline-row selected" : "mesh polyline-row"} data-polyline={polyline.name}>
+    <li className={selected ? "polyline-row selected" : "polyline-row"} data-polyline={polyline.name}>
       <div className="mesh-head">
         <label className="check" title="Visible">
           <input
@@ -89,13 +89,14 @@ const PolylineRow = memo(function PolylineRow(props: {
         >
           {polyline.name}
         </button>
-        <span className="tree-node-tag">{polyline.closed ? "Closed" : "Open"}</span>
         <span className="count" data-polyline-length>
           {formatLength(length, unit)}
         </span>
+      </div>
+      <div className="mesh-controls">
+        <span className="tree-node-tag">{polyline.closed ? "Closed" : "Open"}</span>
         <button
           type="button"
-          className="icon"
           title={`Point the camera at ${polyline.name}`}
           data-polyline-focus={polyline.name}
           onClick={() => {
@@ -109,13 +110,12 @@ const PolylineRow = memo(function PolylineRow(props: {
         </button>
         <button
           type="button"
-          className="icon danger"
-          aria-label={`Remove ${polyline.name}`}
+          className="danger"
           title={`Remove ${polyline.name}`}
           data-polyline-remove={polyline.name}
           onClick={() => removePolylines(app, store, [polyline.id])}
         >
-          ×
+          Remove
         </button>
       </div>
     </li>

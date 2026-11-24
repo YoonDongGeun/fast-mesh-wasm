@@ -13,23 +13,29 @@
 .polyline-list-head p {
   margin: 0;
 }
-.polyline-list .meshes {
-  margin-top: 4px;
+.polyline-rows {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
   /* A stack of sections makes a long list. */
   max-height: 320px;
   overflow-y: auto;
 }
 .polyline-row {
-  padding: 4px 6px;
-  margin-bottom: 2px;
+  padding: 4px 8px;
+  margin-bottom: 3px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--panel-2);
 }
-.polyline-row .mesh-head {
-  gap: 6px;
+.polyline-row.selected {
+  border-color: var(--warn);
 }
-.polyline-row button.icon {
-  flex: none;
-  font-size: 11px;
-  padding: 1px 5px;
+.polyline-row .mesh-controls {
+  margin-top: 2px;
+}
+.polyline-row .tree-node-tag {
+  margin-right: auto;
 }
 .polyline-panel h3 {
   margin: 6px 0 2px;

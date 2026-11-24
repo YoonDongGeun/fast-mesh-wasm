@@ -1,6 +1,7 @@
 // The kept polylines in the viewport (#268): each visible one as a line of
 // its colour, a few pixels wide and just in front of the surface it lies on,
-// with its hidden parts faint through the meshes; the selected ones thicker.
+// with its hidden parts as a thin faint line through the meshes (wide faint
+// ones would show their pieces where they overlap); the selected ones wider.
 // Pointer rays pass through them: picking a mesh or a brush under a line
 // works as if it were not there.
 import { useEffect, useLayoutEffect, useMemo } from "react";
@@ -13,14 +14,14 @@ import { curveSegments, curvesSphere, type Polyline } from "../ux/polyline";
 
 const LINE_PX = 2.5;
 const SELECTED_PX = 4.5;
-const THROUGH = 0.25;
-const SELECTED_THROUGH = 0.5;
+const THROUGH = 0.35;
+const SELECTED_THROUGH = 0.7;
 
 /** One polyline's lines: the visible part, and the whole faintly through everything. */
 interface LineParts {
   group: THREE.Group;
   line: LineSegments2;
-  through: LineSegments2;
+  through: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
   points: Float64Array;
   closed: boolean;
 }
@@ -57,7 +58,6 @@ export class PolylineLines {
       parts.line.material.color.setHex(p.color);
       parts.through.material.color.setHex(p.color);
       parts.line.material.linewidth = on ? SELECTED_PX : LINE_PX;
-      parts.through.material.linewidth = on ? SELECTED_PX : LINE_PX;
       parts.through.material.opacity = on ? SELECTED_THROUGH : THROUGH;
     }
   }
@@ -81,8 +81,9 @@ function noRaycast(): void {}
 
 function build(p: Polyline): LineParts {
   const center = curvesSphere([p])?.center ?? [0, 0, 0];
+  const segments = curveSegments(p, center);
   const geometry = new LineSegmentsGeometry();
-  geometry.setPositions(curveSegments(p, center));
+  geometry.setPositions(segments);
   const line = new LineSegments2(
     geometry,
     new LineMaterial({
@@ -94,9 +95,11 @@ function build(p: Polyline): LineParts {
     }),
   );
   line.renderOrder = 7;
-  const through = new LineSegments2(
-    geometry,
-    new LineMaterial({ toneMapped: false, transparent: true, depthTest: false, depthWrite: false }),
+  const thin = new THREE.BufferGeometry();
+  thin.setAttribute("position", new THREE.BufferAttribute(segments, 3));
+  const through = new THREE.LineSegments(
+    thin,
+    new THREE.LineBasicMaterial({ toneMapped: false, transparent: true, depthTest: false, depthWrite: false }),
   );
   through.renderOrder = 7;
   line.raycast = noRaycast;
@@ -112,6 +115,7 @@ function dispose(parts: LineParts): void {
   parts.group.removeFromParent();
   parts.line.geometry.dispose();
   parts.line.material.dispose();
+  parts.through.geometry.dispose();
   parts.through.material.dispose();
 }
 
