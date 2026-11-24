@@ -288,18 +288,37 @@ export class SegmentTree {
     this.#box = box;
   }
 
-  /** Calls `visit` with the segments whose leaf's box meets the given one, until it returns true. Returns whether it did. */
-  query(x0: number, y0: number, x1: number, y1: number, visit: (segment: number) => boolean): boolean {
+  /**
+   * Calls `visit` with the segments whose leaf's box meets the given one (or
+   * is within `reach` of it), until it returns true. Returns whether it did.
+   * Nearer boxes come first, so a visitor that stops at what is near does.
+   */
+  query(x0: number, y0: number, x1: number, y1: number, visit: (segment: number) => boolean, reach = 0): boolean {
     const box = this.#box;
+    const reach2 = reach * reach;
+    const mx = (x0 + x1) / 2;
+    const my = (y0 + y1) / 2;
+    /** How far node `i`'s box is from the middle of the given one (squared). */
+    const away = (i: number): number => {
+      const dx = Math.max(0, box[4 * i] - mx, mx - box[4 * i + 2]);
+      const dy = Math.max(0, box[4 * i + 1] - my, my - box[4 * i + 3]);
+      return dx * dx + dy * dy;
+    };
     const stack = [1];
     while (stack.length > 0) {
       const i = stack.pop() as number;
       const b = 4 * i;
-      if (box[b] > x1 || box[b + 2] < x0 || box[b + 1] > y1 || box[b + 3] < y0) {
+      const dx = Math.max(0, box[b] - x1, x0 - box[b + 2]);
+      const dy = Math.max(0, box[b + 1] - y1, y0 - box[b + 3]);
+      if (!(dx * dx + dy * dy <= reach2)) {
         continue;
       }
       if (i < this.#first) {
-        stack.push(2 * i + 1, 2 * i);
+        if (away(2 * i) <= away(2 * i + 1)) {
+          stack.push(2 * i + 1, 2 * i);
+        } else {
+          stack.push(2 * i, 2 * i + 1);
+        }
         continue;
       }
       const start = LEAF * (i - this.#first);

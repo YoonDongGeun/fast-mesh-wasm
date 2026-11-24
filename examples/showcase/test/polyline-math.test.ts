@@ -596,13 +596,59 @@ describe("offset", () => {
     expect(loops).toBeGreaterThan(50);
   }, 60_000);
 
-  it("takes thousands of points in a moment", () => {
-    const source = blob(4, 8000, 4);
-    for (const d of [1, 6]) {
-      const start = performance.now();
-      const runs = offsetRun(source, d, "round");
-      expect(performance.now() - start).toBeLessThan(3000);
-      expect(runs.every((r) => r.closed)).toBe(true);
+  /** A wavy outline with f32 points that zigzag by up to `noise`, as a section of a dense mesh has. */
+  function outline(n: number, noise: number, seed: number): PolylineCurve {
+    const rnd = random(seed);
+    return makeCurve(
+      Array.from({ length: n }, (_, i) => {
+        const a = (2 * Math.PI * i) / n;
+        const r = 50 + 6 * Math.sin(7 * a) + 3 * Math.sin(19 * a) + noise * rnd();
+        return [Math.fround(r * Math.cos(a)), Math.fround(r * Math.sin(a)), 5];
+      }).flat(),
+      true,
+    )!;
+  }
+
+  it("stays one clean loop on fine, noisy outlines", () => {
+    // Neighbouring arcs then cross at angles of a thousandth of a radian.
+    for (const noise of [0, 1e-4, 2e-3, 5e-2]) {
+      const source = outline(2000, noise, 11);
+      const fit = fitPlane([source])!;
+      const run: Run2 = { xy: toPlane(source, fit.plane), closed: true };
+      for (const d of [0.5, 5, -5, 40]) {
+        for (const corners of ["round", "sharp"] as const) {
+          const loops = many(offsetCurve(source, d, corners));
+          const label = `noise ${noise} d ${d} ${corners}`;
+          expect(loops, label).toHaveLength(1);
+          expect(loops[0].closed, label).toBe(true);
+          const out: Run2 = { xy: toPlane(loops[0], fit.plane), closed: true };
+          expect(crosses2([out]), label).toBe(false);
+          const s = segments2(out.xy, true);
+          for (let i = 0; i < s.length; i += 4 * 5) {
+            const away = runDistance(run, (s[i] + s[i + 2]) / 2, (s[i + 1] + s[i + 3]) / 2);
+            expect(away, label).toBeGreaterThan(Math.abs(d) * (1 - 1e-5));
+            if (corners === "round") {
+              expect(away, label).toBeLessThan(Math.abs(d) * (1 + 2e-3));
+            }
+          }
+          // What is made can be worked on.
+          expect(many(offsetCurve(loops[0], -d / 2, "round")).every((l) => l.closed), label).toBe(true);
+        }
+      }
+    }
+  }, 60_000);
+
+  it("takes thousands of points in a moment, noisy ones too", () => {
+    for (const noise of [0, 2e-3]) {
+      const source = outline(30_000, noise, 2);
+      for (const d of [0.5, 5, -5]) {
+        const start = performance.now();
+        const loops = many(offsetCurve(source, d, "round"));
+        // A third of a second on an idle machine.
+        expect(performance.now() - start).toBeLessThan(6000);
+        expect(loops).toHaveLength(1);
+        expect(loops[0].closed).toBe(true);
+      }
     }
   });
 });
