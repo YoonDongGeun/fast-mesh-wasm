@@ -10,8 +10,10 @@
 // Trim deletes one side of the loop (`boolean.trimByCurve`) as one undo
 // step. Split keeps both sides: inside one history step it adds a copy of the
 // mesh, trims the mesh to the outside and the copy to the inside, and takes
-// the parts the loop is not on out of the copy. Undo puts the mesh back whole
-// and removes the copy.
+// the parts the loop is not on out of the copy. The copy has the mesh's own
+// coordinates, UVs and placement, so both cuts see the same loop, the same
+// part and the same inside. Undo puts the mesh back whole and removes the
+// copy.
 //
 // The engine cuts the part the loop is on and leaves the others alone. A loop
 // need not cut anything away (once around a ring, say): the engine still
@@ -21,8 +23,7 @@ import type { EditOp, MeshHandle, RayHit, SceneLike, TrimReport, Vec3 } from "fa
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState, Item } from "../../../app/state/app-state";
 import { extractLiveMeshData } from "../../../engine/workbench-ops";
-import { bounds } from "../../../io/mesh-data";
-import { liveTriangleIds, localToWorld } from "../../mesh-edit/ux/batch-boolean";
+import { liveTriangleIds } from "../../mesh-edit/ux/batch-boolean";
 import { countLiveTriangles } from "../../select/ux/face-sets";
 import {
   addSource,
@@ -325,10 +326,10 @@ export interface PathSplitResult {
 /**
  * Splits `item` along the closed `path` into two meshes, one undo step:
  * `item` keeps the outside (and every part the loop is not on), a new mesh
- * named `<name> inside` (listed once the split lands, with its origin at the
- * loop's centre) holds the inside, with its UVs. Undo makes `item` whole
- * again and removes the new mesh. A loop that cuts nothing away changes
- * nothing: the step is cancelled, the new mesh with it, and it throws
+ * named `<name> inside` (listed once the split lands) holds the inside, with
+ * the origin, placement and UVs it had there. Undo makes `item` whole again
+ * and removes the new mesh. A loop that cuts nothing away changes nothing:
+ * the step is cancelled, the new mesh with it, and it throws
  * {@link NO_CUT_MESSAGE}.
  */
 export async function splitAlongPath(
@@ -347,15 +348,16 @@ export async function splitAlongPath(
     throw new Error("The mesh has no triangles to split.");
   }
   const copied = whole.indices.slice(); // a Worker scene takes the added arrays away
-  const { center } = bounds(Float64Array.from(curve.flat()));
+  const { origin } = whole;
   let copy: MeshHandle;
   store.beginStep();
   try {
-    copy = store.addMesh(localToWorld(scene.matrix4(item.mesh), whole.positions), whole.indices, {
-      origin: center,
-      undoable: true,
-      ...(whole.uvs ? { uvs: whole.uvs } : {}),
-    });
+    copy = store.addMesh(
+      whole.positions.map((x, i) => x + origin[i % 3]),
+      whole.indices,
+      { origin, undoable: true, ...(whole.uvs ? { uvs: whole.uvs } : {}) },
+    );
+    store.setPlacement(copy, whole.placement);
     await cutAway(item.mesh, curve, "inside");
     await cutAway(copy, curve, "outside");
     const others = uncutTriangles(
@@ -378,7 +380,7 @@ export async function splitAlongPath(
   const inside = app.listMesh(copy, {
     name: `${item.name} inside`,
     triangles: insideTriangles,
-    center,
+    center: origin,
     radius: cut.radius,
   });
   return { inside, outsideTriangles: countLiveTriangles(indices(item.mesh)), insideTriangles };

@@ -588,8 +588,8 @@ describe("trim and split", () => {
     expect(innerArea + outerArea).toBeCloseTo(whole, 3);
     expect(r.outsideTriangles).toBe(liveTriangleCount(scene.views(item.mesh).indices()));
     expect(r.insideTriangles).toBe(liveTriangleCount(scene.views(r.inside.mesh).indices()));
-    // The inside sits where it was cut from: world placement identity, world positions.
-    expect(scene.placement(r.inside.mesh).translation).toEqual([0, 0, 0]);
+    // The inside sits where it was cut from: the mesh's own placement.
+    expect(scene.placement(r.inside.mesh).translation).toEqual([0.5, -0.25, 0]);
     // One undo makes the mesh whole and removes the new one (#271).
     store.undo();
     expect(scene.canUndo()).toBe(false);
@@ -993,29 +993,57 @@ describe("a split's copy", () => {
     expect(removalOps(indices, 10, [])).toEqual([]);
   });
 
-  it("holds the inside alone, around the loop, with no vertex of another part", async () => {
+  it("holds the inside alone, with no vertex of another part", async () => {
     const { store, app } = await host("local");
     const data = merged(blobbySphere([0, 0, 0], 1, 32, 16, 0), blobbySphere([30, 0, 0], 0.3, 32, 16, 0));
     const item = await listed(store, app, "Parts", data.positions, data.indices);
     const points = capDirections(0.7).map((d): V3 => [30 + 0.3 * d[0], 0.3 * d[1], 0.3 * d[2]]);
     const path = await loopThrough(store, item.mesh, points, "heatMethod");
     const { inside } = await splitAlongPath(store, app, item, path);
-    // The loop's height on the small ball, above its middle.
-    expect(inside.center[0]).toBeCloseTo(30, 1);
-    expect(inside.center[1]).toBeGreaterThan(0.1);
     expect(inside.radius).toBeLessThan(0.3);
     const v = store.scene.views(inside.mesh);
     const ix = v.indices();
-    const m = store.scene.matrix4(inside.mesh);
     const used = liveVertices(ix);
     for (const c of used) {
-      expect(Math.abs(v.positions()[3 * c] + m[12] - 30)).toBeLessThan(0.31);
+      expect(Math.abs(v.positions()[3 * c] - 30)).toBeLessThan(0.31);
     }
     expect(inside.triangles).toBe(liveTriangleCount(ix));
     // The other ball's vertices are gone with it: an edit may not move them.
     const other = Array.from({ length: v.positions().length / 3 }, (_, c) => c).find((c) => !used.has(c))!;
     const move = async () => store.edit(inside.mesh, [{ op: "setPositions", vertices: [other], positions: [0, 0, 0] }]);
     await expect(move()).rejects.toThrow();
+  });
+
+  it.each([
+    [[0, 0, 0], 1],
+    [[0.1, 0.7, -0.3], 1],
+    [[10.3, -2.7, 4.1], 1],
+    [[0.013, 0.2, 0.77], 0.37],
+    [[-3.3, 100.1, 0.9], 3.1],
+  ] as [V3, number][])("cuts a mesh in two equal halves whichever side counts as inside (at %j, scale %d)", async (at, scale) => {
+    // Around the equator, along the mesh lines: the sides' areas tie up to rounding, so both cuts must round alike.
+    for (const rings of [8, 16, 24]) {
+      const { store, app } = await host("local");
+      const prim = generatePrimitive({ kind: "uvSphere", radius: 1, segments: 2 * rings, rings });
+      const item = await listed(store, app, "Ball", Float64Array.from(prim.positions), prim.indices);
+      store.setPlacement(item.mesh, { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: at, scale: [scale, scale, scale] });
+      await settle(store);
+      const whole = area(store.scene, item.mesh);
+      const path = await loopThrough(store, item.mesh, [[1, 0, 0], [0, 0, 1], [-1, 0, 0], [0, 0, -1]], "dijkstra");
+      const r = await splitAlongPath(store, app, item, path);
+      expect(r.insideTriangles).toBe(r.outsideTriangles);
+      expect(area(store.scene, r.inside.mesh) / whole).toBeCloseTo(0.5, 4);
+      expect(area(store.scene, item.mesh) / whole).toBeCloseTo(0.5, 4);
+      // One half each: above and below the equator.
+      const sideOf = (mesh: MeshHandle) => {
+        const v = store.scene.views(mesh);
+        const m = store.scene.matrix4(mesh);
+        const p = v.positions();
+        const heights = [...liveVertices(v.indices())].map((c) => m[1] * p[3 * c] + m[5] * p[3 * c + 1] + m[9] * p[3 * c + 2] + m[13] - at[1]);
+        return [Math.min(...heights), Math.max(...heights)].map((h) => Math.round((10 * h) / scale) / 10);
+      };
+      expect([sideOf(item.mesh), sideOf(r.inside.mesh)].sort((a, b) => a[0] - b[0])).toEqual([[-1, 0], [0, 1]]);
+    }
   });
 
   it("keeps the UVs, and follows the loop's surface over its seams", async () => {
@@ -1171,7 +1199,6 @@ describe("cut or only imprinted", () => {
   });
 
   it("split_works_under_a_scaled_placement", async () => {
-    // The copy is in world units, the mesh in its own.
     for (const scale of [0.1, 10]) {
       const { store, app } = await host("local");
       const data = sphere();
