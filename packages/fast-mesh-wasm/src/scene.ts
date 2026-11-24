@@ -103,6 +103,7 @@ import {
   normalizeSurfacePathTarget,
   normalizeTrimCurveArgs,
   normalizeU32List,
+  throwIfAborted,
 } from "./options.js";
 import type { Bounds, Indices, Mat3, Placement, PlacementInput, Positions64, Quat, UpdateMode, Vec3 } from "./api.js";
 import { decodeChanges, type Range } from "./changes.js";
@@ -1925,6 +1926,13 @@ export interface GeodesicOptions {
   maxDistance?: number;
   /** Dimensionless time-step scale `m` (`t = m * h^2`) for `"heatMethod"`. */
   timeStepScale?: number;
+  /**
+   * Cancels the query: its promise rejects with the signal's reason at once,
+   * and a `WorkerScene`'s Worker stops computing at the query's next step. A
+   * `Scene` computes in one call, so there the signal only counts when it is
+   * aborted already: the call then throws its reason.
+   */
+  signal?: AbortSignal;
 }
 
 /** Sample point along an intrinsic surface shortest path. */
@@ -3310,6 +3318,35 @@ export function meshAdds(scene: Scene): MeshAdds {
 }
 
 /**
+ * Geodesic queries in steps (the scene crate's `GeodesicJob`), for the
+ * Worker engine only: not part of the public API.
+ *
+ * - `begin(mesh, sources, options)`: starts `geodesicDistances` with the
+ *   same arguments (the signal aside), computing nothing yet; returns the
+ *   query's token.
+ * - `step(token, work)`: computes over about `work` more elements of the
+ *   mesh, at least one pass over it or one iteration of a solve; `true` once
+ *   the distances are ready. A query that fails throws and is dropped, as
+ *   when its mesh changed meanwhile.
+ * - `finish(token)`: the distances, as `geodesicDistances` gives them.
+ * - `drop(token)`: forgets a query.
+ */
+interface GeodesicSteps {
+  begin(mesh: MeshHandle, sources: number | readonly number[], options?: GeodesicOptions): number;
+  step(token: number, work: number): boolean;
+  finish(token: number): Float32Array;
+  drop(token: number): void;
+}
+
+/** Set by `Scene`'s static block. */
+let geodesicStepsOf: (scene: Scene) => GeodesicSteps;
+
+/** @internal The stepped geodesic queries of `scene` (see {@link GeodesicSteps}); for the Worker engine. */
+export function geodesicSteps(scene: Scene): GeodesicSteps {
+  return geodesicStepsOf(scene);
+}
+
+/**
  * A scene of editable meshes. Create it after `await init()`; release it with
  * {@link Scene.free} or a `using` declaration (otherwise it is freed when
  * garbage collected).
@@ -3443,6 +3480,7 @@ export class Scene implements SceneLike {
       this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
     meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
     geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    releaseGeodesics: () => this.releaseGeodesics(),
     shortestSurfacePath: (mesh, sources, targetVertex, options) =>
       this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
@@ -5305,7 +5343,10 @@ export class Scene implements SceneLike {
     };
   }
 
-  /** Computes per-vertex surface geodesic distances from `sources` in world units. */
+  /**
+   * Computes per-vertex surface geodesic distances from `sources` in world
+   * units. See {@link InspectDomain.geodesicDistances}.
+   */
   geodesicDistances(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -5314,6 +5355,7 @@ export class Scene implements SceneLike {
     const { index, generation } = this.#id(mesh);
     const src = normalizeSourceVertices(sources);
     const norm = normalizeGeodesicOptions(options);
+    throwIfAborted(options.signal);
     return call(() =>
       this.#scene().geodesic_distances(
         index,
@@ -5324,6 +5366,11 @@ export class Scene implements SceneLike {
         optional(norm.timeStepScale, "timeStepScale"),
       ),
     );
+  }
+
+  /** Frees what `"heatMethod"` queries keep for the next one of the same mesh. */
+  releaseGeodesics(): void {
+    call(() => this.#peek().release_geodesics());
   }
 
   /** Traces the intrinsic shortest surface path from `sources` to `targetVertex` in world coordinates. */
@@ -5337,6 +5384,7 @@ export class Scene implements SceneLike {
     const src = normalizeSourceVertices(sources);
     const target = normalizeSurfacePathTarget(targetVertex);
     const { distances, geodesic } = checkSurfacePathOptions(options);
+    throwIfAborted(options.signal);
     const dists =
       distances ??
       call(() =>
@@ -5736,6 +5784,33 @@ export class Scene implements SceneLike {
         return call(() => scene.#peek().content_stamp(index, generation));
       },
       drop: (token) => call(() => scene.#peek().drop_add_mesh(token)),
+    });
+  }
+
+  // ---- Stepped geodesic queries (internal: see geodesicSteps) ----
+
+  static {
+    geodesicStepsOf = (scene) => ({
+      begin: (mesh, sources, options = {}) => {
+        const { index, generation } = scene.#id(mesh);
+        const src = normalizeSourceVertices(sources);
+        const norm = normalizeGeodesicOptions(options);
+        return call(() =>
+          scene
+            .#peek()
+            .begin_geodesic_distances(
+              index,
+              generation,
+              src,
+              GEODESIC_METHOD_CODES[norm.method],
+              optional(norm.maxDistance, "maxDistance"),
+              optional(norm.timeStepScale, "timeStepScale"),
+            ),
+        );
+      },
+      step: (token, work) => call(() => scene.#peek().step_geodesic_distances(token, work)),
+      finish: (token) => call(() => scene.#peek().finish_geodesic_distances(token)),
+      drop: (token) => call(() => scene.#peek().drop_geodesic_distances(token)),
     });
   }
 

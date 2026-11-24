@@ -360,6 +360,12 @@ export type Request =
   | { kind: "punchDrainHole"; rev: number; id: ClientId; plugId?: ClientId; options: DrainHoleOptions; qid: number }
   | { kind: "placeMesh"; rev: number; target: ClientId; stamp: ClientId; addedId?: ClientId; options: PlaceMeshOptions; qid: number }
   | { kind: "query"; rev: number; qid: number; name: string; args: unknown }
+  /**
+   * Drops the query `qid` when it has not started, or at its next step when
+   * it runs in steps (`geodesicDistances`, `shortestSurfacePath`): its reply
+   * is then a `CANCELLED` error. Anything else is left alone.
+   */
+  | { kind: "cancel"; rev: number; qid: number }
   | { kind: "fetchFieldValues"; rev: number; qid: number; field: ClientId };
 
 /** The queries of `{ kind: "query" }`: their `args` and reply `value`, by name. */
@@ -403,6 +409,7 @@ export interface QueryMap {
   triangleQuality: { args: { mesh: ClientId; metric: QualityMetric; sliverThreshold: number }; value: QualityReport };
   meshDeviation: { args: { source: ClientId; target: ClientId; options?: DeviationOptions }; value: DeviationStats };
   geodesicDistances: { args: { mesh: ClientId; sources: number[]; options?: GeodesicOptions }; value: Float32Array };
+  releaseGeodesics: { args: Record<string, never>; value: null };
   shortestSurfacePath: {
     args: { mesh: ClientId; sources: number[]; targetVertex: number; options?: SurfacePathOptions };
     value: SurfacePathPoint[];

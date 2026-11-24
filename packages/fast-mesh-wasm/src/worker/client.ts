@@ -84,6 +84,7 @@ import {
   normalizeTrimCurveArgs,
   normalizeU32List,
   normalizeVec3,
+  throwIfAborted,
 } from "../options.js";
 import type { Bounds, Indices, Placement, PlacementInput, Positions64, Vec3 } from "../api.js";
 import type { Range } from "../changes.js";
@@ -989,6 +990,7 @@ export class WorkerScene implements SceneLike {
       this.triangleQuality(mesh, metricOrOptions, sliverThreshold),
     meshDeviation: (source, target, options) => this.meshDeviation(source, target, options),
     geodesicDistances: (mesh, sources, options) => this.geodesicDistances(mesh, sources, options),
+    releaseGeodesics: () => this.releaseGeodesics(),
     shortestSurfacePath: (mesh, sources, targetVertex, options) =>
       this.shortestSurfacePath(mesh, sources, targetVertex, options),
     addDistanceField: (desc) => this.addDistanceField(desc),
@@ -1232,25 +1234,60 @@ export class WorkerScene implements SceneLike {
     return req.rev;
   }
 
-  /** Queues a request with a reply and sends soon; resolves with `map(value)`. */
-  #ask<T>(make: (rev: number, qid: number) => Request, map: (value: unknown) => T): Promise<T> {
+  /**
+   * Queues a request with a reply and sends soon; resolves with `map(value)`.
+   * With a `signal`, an abort rejects at once with its reason and cancels
+   * the query (see {@link WorkerScene.#cancel}).
+   */
+  #ask<T>(
+    make: (rev: number, qid: number) => Request,
+    map: (value: unknown) => T,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.#alive();
       const qid = ++this.#qid;
       const req = make(++this.#rev, qid);
+      throwIfAborted(signal);
+      const abort = () => this.#cancel(qid, signal?.reason);
+      signal?.addEventListener("abort", abort, { once: true });
       this.#replies.set(qid, {
         resolve: (v) => {
+          signal?.removeEventListener("abort", abort);
           try {
             resolve(map(v));
           } catch (e) {
             reject(e);
           }
         },
-        reject,
+        reject: (e) => {
+          signal?.removeEventListener("abort", abort);
+          reject(e);
+        },
       });
       this.#push(req);
       this.#scheduleFlush();
     });
+  }
+
+  /**
+   * Cancels a query: rejects its promise with `reason`, and takes it out of
+   * the requests not sent yet, or else tells the Worker to drop it.
+   */
+  #cancel(qid: number, reason: unknown): void {
+    const pending = this.#replies.get(qid);
+    if (pending === undefined) {
+      return;
+    }
+    this.#replies.delete(qid);
+    const at = this.#queue.findIndex((req) => (req as { qid?: number }).qid === qid);
+    if (at >= 0) {
+      this.#queue.splice(at, 1);
+    } else if (!this.#terminated && this.#poison === undefined) {
+      this.#push({ kind: "cancel", rev: ++this.#rev, qid });
+      this.#scheduleFlush();
+    }
+    pending.reject(reason);
   }
 
   /**
@@ -1280,10 +1317,12 @@ export class WorkerScene implements SceneLike {
     name: N,
     args: () => QueryMap[N]["args"],
     map: (value: QueryMap[N]["value"]) => T,
+    signal?: AbortSignal,
   ): Promise<T> {
     return this.#ask(
       (rev, qid) => ({ kind: "query", rev, qid, name, args: args() }),
       (v) => map(v as QueryMap[N]["value"]),
+      signal,
     );
   }
 
@@ -2735,7 +2774,12 @@ export class WorkerScene implements SceneLike {
     );
   }
 
-  /** Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"` or `"heatMethod"`). */
+  /**
+   * Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"`
+   * or `"heatMethod"`), in steps on the Worker: `options.signal` cancels the
+   * query. Other requests wait for it. See
+   * {@link InspectDomain.geodesicDistances}.
+   */
   geodesicDistances(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -2749,10 +2793,24 @@ export class WorkerScene implements SceneLike {
         options: normalizeGeodesicOptions(options),
       }),
       (v) => v,
+      options.signal,
     );
   }
 
-  /** Traces an intrinsic shortest path along the surface of `mesh` to `targetVertex`. */
+  /** Frees what `"heatMethod"` queries keep in the Worker for the next one of the same mesh. */
+  releaseGeodesics(): Promise<void> {
+    return this.#query(
+      "releaseGeodesics",
+      () => ({}),
+      () => undefined,
+    );
+  }
+
+  /**
+   * Traces an intrinsic shortest path along the surface of `mesh` to
+   * `targetVertex`. Without `options.distances` it computes them first, like
+   * {@link WorkerScene.geodesicDistances}: `options.signal` cancels that.
+   */
   shortestSurfacePath(
     mesh: MeshHandle,
     sources: number | readonly number[],
@@ -2777,6 +2835,7 @@ export class WorkerScene implements SceneLike {
         };
       },
       (v) => v,
+      options.signal,
     );
   }
 

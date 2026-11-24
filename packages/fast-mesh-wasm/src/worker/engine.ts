@@ -24,6 +24,7 @@ import {
   type EditOp,
   type FieldHandle,
   fieldSteps,
+  geodesicSteps,
   type JoinOptions,
   type RegisterOptions,
   meshAdds,
@@ -93,7 +94,9 @@ export interface EngineOptions {
    * (`"addMeshBegin"`), stepped (`"addMeshStep"`), copied out
    * (`"addMeshPack"`) and landed (`"addMesh"`), with the mesh's id, every operation of a repair
    * list run in steps (`"repairOp"`), every field step (`"fieldStep"`) and
-   * every abandoned field step unit (`"fieldStepAbandon"`).
+   * every abandoned field step unit (`"fieldStepAbandon"`), every step of a
+   * geodesic query (`"geodesicStep"`) and every query cancelled
+   * (`"queryCancel"`).
    */
   onChunk?: (chunk: { kind: string; id?: ClientId }) => void;
   /**
@@ -147,6 +150,15 @@ export interface EngineOptions {
    */
   addStepWork?: number;
   /**
+   * The work of one step of a geodesic query
+   * ({@link GEODESIC_STEP_WORK} by default): a triangle or vertex visited
+   * by a pass over the mesh, or a vertex by an iteration of a solve. A step
+   * is at least one of either, so on a large mesh this only tells how many
+   * small ones run together. Rounded down and clamped to 1 to 2^32 − 1; NaN
+   * keeps the default.
+   */
+  geodesicStepWork?: number;
+  /**
    * The threads the engine computes with (1 by default; {@link serveEngine}
    * passes what the start reports). With more than one, a request waiting
    * on a background add lands it in one call (the parallel one-call
@@ -179,6 +191,9 @@ export const BACKGROUND_ADD_TRIANGLES = 65_536;
 
 /** The default {@link EngineOptions.addStepWork}: a few milliseconds of BVH build. */
 export const ADD_STEP_WORK = 100_000;
+
+/** The default {@link EngineOptions.geodesicStepWork}: a few milliseconds of a solve. */
+export const GEODESIC_STEP_WORK = 100_000;
 
 /** A step budget that computes a whole unit at once. */
 const ALL_POINTS = 0xffff_ffff;
@@ -495,6 +510,9 @@ class Engine {
   readonly #steps = fieldSteps(this.#scene);
   /** The scene's stepped mesh adds (internal API). */
   readonly #meshAdds = meshAdds(this.#scene);
+  /** Geodesic queries run in steps. */
+  readonly #geodesics = geodesicSteps(this.#scene);
+  readonly #geodesicStepWork: number;
   /** Meshes being added in the background, in arrival order. */
   readonly #adds: PendingAdd[] = [];
   /**
@@ -613,6 +631,8 @@ class Engine {
     // At least one unit a step (NaN or below 1: the default); at most what one call takes.
     const work = Math.floor(options.addStepWork ?? ADD_STEP_WORK);
     this.#addStepWork = work >= 1 ? Math.min(work, ALL_POINTS) : ADD_STEP_WORK;
+    const geodesic = Math.floor(options.geodesicStepWork ?? GEODESIC_STEP_WORK);
+    this.#geodesicStepWork = Number.isNaN(geodesic) ? GEODESIC_STEP_WORK : Math.min(Math.max(geodesic, 1), ALL_POINTS);
     this.#threaded = (options.threads ?? 1) > 1;
     this.#keepCopies = options.keepCopies ?? false;
     // Field updates wait for the end of the batch, to be stepped there.
@@ -758,6 +778,10 @@ class Engine {
     if (this.#superseded(req, key) || this.#abandoned(req, key)) {
       return true;
     }
+    if (req.kind === "query" && this.#cancelled(req.qid)) {
+      this.#replyCancelled(req.qid, b);
+      return true;
+    }
     // A trap while finishing them poisons with this request among the failed.
     if (this.#adds.length > 0 && this.#dependsOnAdds(req) && !(await this.#finishAdds(req))) {
       return false;
@@ -777,6 +801,8 @@ class Engine {
           // Abandoned for a superseded display: no status, as before it starts.
           return true;
         }
+      } else if (req.kind === "query" && (req.name === "geodesicDistances" || req.name === "shortestSurfacePath")) {
+        await this.#geodesicInSteps(req, b);
       } else {
         this.#run(req, b);
       }
@@ -795,6 +821,60 @@ class Engine {
       }
     }
     return true;
+  }
+
+  // ---- Cancelled queries ----
+
+  /** Whether a queued request cancels the query `qid`. */
+  #cancelled(qid: number): boolean {
+    return this.#queue.some((item) => item !== END && item.kind === "cancel" && item.qid === qid);
+  }
+
+  #replyCancelled(qid: number, b: Batch): void {
+    b.replies.push({ qid, ok: false, error: { code: "CANCELLED", message: "the query was cancelled" } });
+    this.#onChunk?.({ kind: "queryCancel" });
+  }
+
+  /**
+   * Runs a query of geodesic distances, or of a path (its distances, then
+   * the path in one go), in steps of {@link EngineOptions.geodesicStepWork},
+   * yielding between them once the time budget is spent: a queued `cancel`
+   * of it then ends it. Other requests wait for it, so its mesh does not
+   * change meanwhile.
+   */
+  async #geodesicInSteps(req: Extract<Request, { kind: "query" }>, b: Batch): Promise<void> {
+    const args = req.args as QueryMap["geodesicDistances"]["args"] & Partial<QueryMap["shortestSurfacePath"]["args"]>;
+    const mesh = this.#mesh(args.mesh);
+    let distances = req.name === "shortestSurfacePath" ? args.options?.distances : undefined;
+    if (distances === undefined) {
+      const steps = this.#geodesics;
+      const token = steps.begin(mesh, args.sources, args.options);
+      try {
+        while (!steps.step(token, this.#geodesicStepWork)) {
+          this.#onChunk?.({ kind: "geodesicStep", id: args.mesh });
+          // Only receives: nothing else runs before this request is done.
+          await this.#maybeYield();
+          if (this.#cancelled(req.qid)) {
+            this.#replyCancelled(req.qid, b);
+            return;
+          }
+        }
+        distances = steps.finish(token);
+      } finally {
+        // (Nothing left to drop once it is finished or failed.)
+        steps.drop(token);
+      }
+    }
+    if (req.name === "geodesicDistances") {
+      b.replies.push({ qid: req.qid, ok: true, value: distances });
+      b.transfer.push(distances.buffer as ArrayBuffer);
+    } else {
+      const value = this.#scene.shortestSurfacePath(mesh, args.sources, args.targetVertex as number, {
+        ...args.options,
+        distances,
+      });
+      b.replies.push({ qid: req.qid, ok: true, value });
+    }
   }
 
   // ---- Background adds ----
@@ -2211,6 +2291,9 @@ class Engine {
       case "fieldInteraction":
         s.setFieldInteraction(req.points);
         return;
+      case "cancel":
+        // Its query is done, or was dropped.
+        return;
       case "compact":
         s.compact(this.#mesh(req.id));
         return;
@@ -2324,7 +2407,6 @@ class Engine {
         if (
           req.name === "verticesInSphere" ||
           req.name === "selfIntersectingTriangles" ||
-          req.name === "geodesicDistances" ||
           req.name === "selectFacesScreen" ||
           req.name === "selectFacesInSphere" ||
           req.name === "selectByCreaseAngle" ||
@@ -2595,14 +2677,9 @@ class Engine {
         const a = args as QueryMap["meshDeviation"]["args"];
         return s.meshDeviation(this.#mesh(a.source), this.#mesh(a.target), a.options);
       }
-      case "geodesicDistances": {
-        const a = args as QueryMap["geodesicDistances"]["args"];
-        return s.geodesicDistances(this.#mesh(a.mesh), a.sources, a.options);
-      }
-      case "shortestSurfacePath": {
-        const a = args as QueryMap["shortestSurfacePath"]["args"];
-        return s.shortestSurfacePath(this.#mesh(a.mesh), a.sources, a.targetVertex, a.options);
-      }
+      case "releaseGeodesics":
+        s.releaseGeodesics();
+        return null;
       case "detectSymmetryPlane": {
         const a = args as QueryMap["detectSymmetryPlane"]["args"];
         return s.detectSymmetryPlane(this.#mesh(a.mesh));
