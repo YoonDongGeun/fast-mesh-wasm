@@ -677,7 +677,8 @@ pub trait SceneBooleanOps {
     /// Cuts mesh `id` with a world plane and adds the removed side to the scene.
     fn cut_by_plane(&mut self, id: MeshId, options: &CutOptions) -> Result<CutReport>;
 
-    /// Conformatively imprints a world polyline on `id` and optionally trims inside/outside.
+    /// Conformatively imprints a world polyline on `id` and optionally trims the inside or
+    /// outside of the component it lies on.
     fn trim_by_curve(&mut self, id: MeshId, options: &TrimCurveOptions) -> Result<TrimReport>;
 
     /// Offsets mesh `id` along its normals or via volumetric SDF reconstruction.

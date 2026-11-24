@@ -203,6 +203,16 @@ This is the owner's per-frame case: the two `terrain(708)` meshes of the overhea
 
 Over the poses, a frame's `find_contacts` costs about 1.25 times a `mesh_distance` (1.32 ms per pose in the overhead table). It does more than `mesh_distance`: it finds every triangle pair within the margin, not only the closest one.
 
+### `trim_by_curve` (issue #273)
+
+`cargo bench -p fast-mesh-scene -- trim_by_curve`: a closed loop of 64 points deleting its inside, on 1M triangles. Medians without the `parallel` feature (nothing in a trim is parallel under a uniform scale), undo not timed, measured on 2026-11-24 one after the other on the machine above. Before, the trace kept hash maps over every edge and vertex; now it keeps compressed fans, finds the component the curve lies on, and traces only that. The results are the same, bit for bit, on a mesh of one component without UVs.
+
+| | Triangles cut | Seam edges | Before | Now |
+| --- | --- | --- | --- | --- |
+| `terrain(708)`, a loop in the middle | 23,224 | 889 | 1,042 ms | 114 ms |
+| Two components (`crossed_terrains(500)`), a loop on one | 23,224 | 890 | 888 ms | 89 ms |
+| A closed sphere, a loop around its pole | 95,580 | 1,478 | 852 ms | 138 ms |
+
 ## Fields (fast-mesh-fields, fast-mesh-scene)
 
 Results for `cargo bench -p fast-mesh-fields` and the `scene fields` group of `cargo bench -p fast-mesh-scene`, measured on 2026-10-19.
