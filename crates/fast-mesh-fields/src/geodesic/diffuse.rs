@@ -25,7 +25,7 @@ use std::collections::BinaryHeap;
 
 use fast_mesh_store::par;
 
-use super::amg::{BLOCK, Matrix, PAR_MIN_ROWS, Rows, dot};
+use super::amg::{BLOCK, Matrix, PAR_MIN_ROWS, Rows, sum_range};
 use crate::geom::{norm, sub, widen};
 use crate::grid::{allocation_allowed, filled, push, reserve};
 use crate::{FieldsError, Result};
@@ -45,6 +45,9 @@ const SETTLED: f64 = 1e-4;
 const EXCEPTIONS: f64 = 1e-3;
 /// How often the bands are solved at most.
 const PASSES: usize = 6;
+/// Row count from which a band's loops run on the pool: there are so many,
+/// between sweeps that cannot, that smaller ones lose more than they gain.
+const PAR_BAND_ROWS: usize = 1 << 17;
 /// An edge is long from this length on, in `√t`.
 const LONG: f64 = 3.0;
 /// No place in the band.
@@ -395,6 +398,10 @@ struct Band {
     ap: Vec<f64>,
 }
 
+fn dot(a: &[f64], b: &[f64]) -> Result<f64> {
+    sum_range(a.len(), PAR_BAND_ROWS, |i| a[i] * b[i])
+}
+
 fn zeroed(v: &mut Vec<f64>, n: usize) -> Result<()> {
     v.clear();
     if v.capacity() < n {
@@ -585,7 +592,7 @@ impl Band {
 
     /// `out = A from`, for `(p, ap)` or the residual's `(x, r)`.
     fn multiply(off: &Rows, diag: &[f64], from: &[f64], out: &mut [f64]) {
-        par::for_each_chunk_mut(out, BLOCK, PAR_MIN_ROWS, |c, ys| {
+        par::for_each_chunk_mut(out, BLOCK, PAR_BAND_ROWS, |c, ys| {
             for (k, y) in ys.iter_mut().enumerate() {
                 let i = c * BLOCK + k;
                 let mut sum = diag[i] * from[i];

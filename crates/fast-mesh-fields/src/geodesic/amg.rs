@@ -814,12 +814,17 @@ fn add_scaled(alpha: f64, x: &[f64], y: &mut [f64]) {
 }
 
 /// The dot product, summed by chunks in order.
-pub(super) fn dot(a: &[f64], b: &[f64]) -> Result<f64> {
-    sum_range(a.len(), |i| a[i] * b[i])
+fn dot(a: &[f64], b: &[f64]) -> Result<f64> {
+    sum_range(a.len(), PAR_MIN_ROWS, |i| a[i] * b[i])
 }
 
-/// The sum of `term(0..len)`, by chunks in order.
-pub(super) fn sum_range(len: usize, term: impl Fn(usize) -> f64 + Sync) -> Result<f64> {
+/// The sum of `term(0..len)`, by chunks in order, on the pool from
+/// `threshold` terms on.
+pub(super) fn sum_range(
+    len: usize,
+    threshold: usize,
+    term: impl Fn(usize) -> f64 + Sync,
+) -> Result<f64> {
     let part = |r: Range<usize>| {
         let mut sum = 0.0;
         for i in r {
@@ -827,7 +832,7 @@ pub(super) fn sum_range(len: usize, term: impl Fn(usize) -> f64 + Sync) -> Resul
         }
         sum
     };
-    if len < PAR_MIN_ROWS {
+    if len < threshold {
         // The same chunks, without a vector of their sums.
         let mut total = 0.0;
         let mut at = 0;
@@ -838,7 +843,7 @@ pub(super) fn sum_range(len: usize, term: impl Fn(usize) -> f64 + Sync) -> Resul
         }
         return Ok(total);
     }
-    let parts = par::map_range(len, BLOCK, PAR_MIN_ROWS, OOM, |r| {
+    let parts = par::map_range(len, BLOCK, threshold, OOM, |r| {
         Ok::<f64, FieldsError>(part(r))
     })?;
     Ok(parts.into_iter().sum())

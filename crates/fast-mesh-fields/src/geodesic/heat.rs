@@ -988,7 +988,7 @@ fn add_divergence(c: &Component, heat: &Heat, range: Range<usize>, b: &mut [f64]
 /// potential whose gradient is nearest to the unit field away from the heat.
 fn begin_poisson(c: &Component, heat: Heat, mut b: Vec<f64>, time_step: f64) -> Result<Solve> {
     let n = c.vertices.len();
-    let mean = sum_range(n, |i| b[i])? / n as f64;
+    let mean = sum_range(n, PAR_MIN_ROWS, |i| b[i])? / n as f64;
     for v in &mut b {
         *v -= mean;
     }
