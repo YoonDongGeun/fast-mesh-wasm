@@ -1959,6 +1959,9 @@ class Engine {
           value: {
             trianglesAdded: r.trianglesAdded,
             trianglesRemoved: r.trianglesRemoved,
+            imprintTriangles: r.imprintTriangles,
+            cutTriangles: r.cutTriangles,
+            removedArea: r.removedArea,
             verticesAdded: r.verticesAdded,
             seamEdges: r.seamEdges,
           },

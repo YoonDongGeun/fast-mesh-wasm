@@ -1402,8 +1402,9 @@ impl WasmScene {
 
     /// Conformatively imprints a world-space polyline (`points`: flat `[x, y, z, ...]`)
     /// onto mesh `(index, generation)` and optionally trims the enclosed interior
-    /// (`closed && delete_inside`) or exterior side.
-    /// Returns `[index, generation, triangles_added, triangles_removed, vertices_added, seam_edges]`.
+    /// (`closed && delete_inside`) or exterior side of the component it lies on.
+    /// Returns `[index, generation, triangles_added, triangles_removed, imprint_triangles,
+    /// cut_triangles, removed_area, vertices_added, seam_edges]`.
     pub fn trim_by_curve(
         &mut self,
         index: u32,
@@ -1412,7 +1413,7 @@ impl WasmScene {
         closed: bool,
         delete_inside: bool,
         snap_tolerance: f64,
-    ) -> Result<Vec<u32>, Error> {
+    ) -> Result<Vec<f64>, Error> {
         let id = self.id(index, generation)?;
         if !points.len().is_multiple_of(3) {
             return Err(Error::invalid("points length must be a multiple of 3"));
@@ -1433,12 +1434,15 @@ impl WasmScene {
             },
         )?;
         Ok(vec![
-            index,
-            generation,
-            len(r.triangles_added),
-            len(r.triangles_removed),
-            len(r.vertices_added),
-            len(r.seam_edges),
+            f64::from(index),
+            f64::from(generation),
+            r.triangles_added as f64,
+            r.triangles_removed as f64,
+            r.imprint_triangles as f64,
+            r.cut_triangles as f64,
+            r.removed_area,
+            r.vertices_added as f64,
+            r.seam_edges as f64,
         ])
     }
 
@@ -5084,8 +5088,11 @@ mod tests {
                 0.,
             )
             .unwrap();
-        assert_eq!(tr.len(), 6);
-        assert!(tr[3] > 0);
+        assert_eq!(tr.len(), 9);
+        assert_eq!(tr[..2], [f64::from(sheet[0]), f64::from(sheet[1])]);
+        // Both triangles lost surface; the loop encloses half a unit.
+        assert_eq!(tr[3..6], [2., 0., 2.]);
+        assert!((tr[6] - 0.5).abs() < 1e-6);
     }
 
     #[test]

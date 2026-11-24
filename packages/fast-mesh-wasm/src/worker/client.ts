@@ -2257,7 +2257,11 @@ export class WorkerScene implements SceneLike {
     });
   }
 
-  /** Conformatively imprints a world-space polyline onto `mesh` and optionally trims inside/outside. */
+  /**
+   * Conformatively imprints a world-space polyline onto `mesh` and optionally
+   * deletes one side of the loop from the component it lies on: see
+   * `Scene.trimByCurve`.
+   */
   trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): Promise<TrimReport>;
   trimByCurve(
     mesh: MeshHandle,

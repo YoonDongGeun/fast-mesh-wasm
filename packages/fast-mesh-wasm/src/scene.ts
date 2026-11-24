@@ -1781,23 +1781,48 @@ export type CsgNode =
 
 /** Options for conforming polyline imprinting and closed-curve trimming via {@link Scene.trimByCurve}. */
 export interface TrimCurveOptions {
-  /** World-space polyline vertices to imprint onto the mesh surface. */
+  /** World-space polyline vertices to imprint onto the mesh surface, all on one component of it. */
   points: readonly Readonly<Vec3>[];
-  /** Treat the curve as a closed loop and split interior/exterior components (default `false`). */
+  /** Treat the curve as a closed loop and delete one side of it from its component (default `false`). */
   closed?: boolean;
-  /** When `closed` is `true`, delete the enclosed interior (`true`, default) or exterior (`false`). */
+  /**
+   * When `closed` is `true`, delete the inside of the loop (`true`, default) or
+   * its outside (`false`), as {@link Scene.trimByCurve} tells them apart.
+   */
   deleteInside?: boolean;
   /** Snap tolerance in world units (`0` / omitted chooses automatically). */
   snapTolerance?: number;
 }
 
-/** Statistics returned by {@link Scene.trimByCurve}. */
+/**
+ * What {@link Scene.trimByCurve} changed.
+ *
+ * Imprinting the curve replaces the triangles it crosses with smaller ones on
+ * the same surface; deleting a side of a loop takes surface away. Either way
+ * the mesh has `trianglesAdded - trianglesRemoved` more triangles than before,
+ * so those two do not tell a cut from an imprint. `removedArea` and
+ * `cutTriangles` do: both are `0` when nothing was cut away (an open curve, or
+ * a loop that separates nothing, such as one around a torus's tube).
+ */
 export interface TrimReport {
   /** Handle of the trimmed mesh (`kept`). */
   kept: MeshHandle;
+  /** Triangles the mesh did not have before: the pieces left of the triangles the curve split. */
   trianglesAdded: number;
+  /**
+   * Triangles the mesh no longer has, replaced by the imprint or cut away:
+   * `imprintTriangles + cutTriangles`.
+   */
   trianglesRemoved: number;
+  /** Of those, the ones replaced with smaller triangles that all stayed: none of their surface is gone. */
+  imprintTriangles: number;
+  /** Of those, the ones that lost surface, in whole or in part. */
+  cutTriangles: number;
+  /** The area of the surface taken away, in world units squared. */
+  removedArea: number;
+  /** New vertices along the curve. */
   verticesAdded: number;
+  /** Distinct mesh edges along the curve. */
   seamEdges: number;
 }
 
@@ -3926,8 +3951,32 @@ export class Scene implements SceneLike {
   }
 
   /**
-   * Conformatively imprints a world-space polyline onto `mesh` and optionally
-   * deletes the enclosed interior (or exterior) when `closed: true` (one undo step).
+   * Conformatively imprints a world-space polyline onto `mesh`, and with
+   * `closed: true` deletes the inside of the loop (or its outside, with
+   * `deleteInside: false`), as one undo step.
+   *
+   * Only the component the curve lies on is imprinted and cut; every other one
+   * stays as it is. A component is a set of triangles joined through shared
+   * edges. On a mesh with UVs an edge also joins across a seam (two edges at
+   * exactly the same positions), so the UV islands of one surface are one
+   * component, and the curve and the cut cross from one to the next. Split
+   * vertices on a mesh without UVs are a real border between components: weld
+   * them first.
+   *
+   * All points must lie on one component: a curve with points on several
+   * throws. Where components touch or coincide, a point lies on each of them.
+   * When all points lie on several, the curve is on the one the first point
+   * projects to, or else on the one with the smallest triangle id there.
+   *
+   * The inside of a loop is the side away from the component's open edges. On
+   * a component with none (a closed one), or when every side reaches one, it
+   * is the side with the smallest world area. A loop that separates nothing,
+   * such as one around a torus's tube, deletes nothing: it is imprinted, and
+   * {@link TrimReport.removedArea} is `0`.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for too few or non-finite
+   *   points, or points on several components (nothing changes);
+   *   `UNKNOWN_MESH` for a removed mesh.
    */
   trimByCurve(mesh: MeshHandle, options: TrimCurveOptions): TrimReport;
   trimByCurve(
@@ -3957,8 +4006,11 @@ export class Scene implements SceneLike {
       kept: this.#meshHandle(r[0], r[1]),
       trianglesAdded: r[2],
       trianglesRemoved: r[3],
-      verticesAdded: r[4],
-      seamEdges: r[5],
+      imprintTriangles: r[4],
+      cutTriangles: r[5],
+      removedArea: r[6],
+      verticesAdded: r[7],
+      seamEdges: r[8],
     };
   }
 
