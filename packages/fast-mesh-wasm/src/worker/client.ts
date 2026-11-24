@@ -2777,8 +2777,7 @@ export class WorkerScene implements SceneLike {
   /**
    * Computes geodesic surface distances from `sources` on `mesh` (`"dijkstra"`
    * or `"heatMethod"`), in steps on the Worker: `options.signal` cancels the
-   * query. Other requests wait for it. See
-   * {@link InspectDomain.geodesicDistances}.
+   * query. Other requests wait for it.
    */
   geodesicDistances(
     mesh: MeshHandle,

@@ -5345,7 +5345,7 @@ export class Scene implements SceneLike {
 
   /**
    * Computes per-vertex surface geodesic distances from `sources` in world
-   * units. See {@link InspectDomain.geodesicDistances}.
+   * units; `inspect.geodesicDistances` says what `"heatMethod"` keeps.
    */
   geodesicDistances(
     mesh: MeshHandle,
