@@ -49,6 +49,8 @@ const PASSES: usize = 6;
 const LONG: f64 = 3.0;
 /// No place in the band.
 const NONE: u32 = u32::MAX;
+/// In the band, without a place yet.
+const UNPLACED: u32 = u32::MAX - 1;
 
 const OOM: fn() -> FieldsError = || FieldsError::OutOfMemory;
 
@@ -334,13 +336,7 @@ impl Diffusion {
 
         let band = &mut self.band;
         band.clear();
-        reserve(&mut band.members, outer - from)?;
-        band.members.extend_from_slice(&self.order[from..outer]);
-        // Numbered like the surface, which keeps neighbours together.
-        band.members.sort_unstable();
-        for (k, &v) in band.members.iter().enumerate() {
-            self.place[v as usize] = k as u32;
-        }
+        band.number(s, &self.order[from..outer], &mut self.place)?;
         band.assemble(s, &self.place, &self.heat)?;
         let scale = band.arrive(&self.heat, &self.is_source)?;
         // The overlap of the band before, or the pass before, is a first guess.
@@ -376,6 +372,10 @@ impl Diffusion {
 #[derive(Debug, Default)]
 struct Band {
     members: Vec<u32>,
+    /// The members in the surface's order.
+    sorted: Vec<u32>,
+    /// One row of `off`: column, weight.
+    row: Vec<(u32, f64)>,
     off: Rows,
     /// Per row, where the columns above the diagonal start.
     upper: Vec<u32>,
@@ -407,12 +407,43 @@ fn zeroed(v: &mut Vec<f64>, n: usize) -> Result<()> {
 impl Band {
     fn clear(&mut self) {
         self.members.clear();
+        self.sorted.clear();
         self.off.ptr.clear();
         self.off.col.clear();
         self.off.val.clear();
         self.upper.clear();
         self.diag.clear();
         self.arrivals.clear();
+    }
+
+    /// Numbers the members in chains along their strongest couplings: the
+    /// incomplete factor is nearly exact along a chain, so that triangles
+    /// with one short side, whose ends couple by far the most, take no more
+    /// iterations than others.
+    fn number(&mut self, s: &Surface<'_>, vertices: &[u32], place: &mut [u32]) -> Result<()> {
+        reserve(&mut self.sorted, vertices.len())?;
+        reserve(&mut self.members, vertices.len())?;
+        self.sorted.extend_from_slice(vertices);
+        // The chains start like the surface, whose order keeps neighbours together.
+        self.sorted.sort_unstable();
+        for &v in &self.sorted {
+            place[v as usize] = UNPLACED;
+        }
+        for &start in &self.sorted {
+            let mut v = start;
+            while place[v as usize] == UNPLACED {
+                place[v as usize] = self.members.len() as u32;
+                self.members.push(v);
+                let mut strongest = 0.0;
+                for (c, w) in s.matrix.off.row(v as usize) {
+                    if -w > strongest && place[c as usize] == UNPLACED {
+                        strongest = -w;
+                        v = c;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The rows of `mass + t · Laplacian` between the members.
@@ -432,21 +463,23 @@ impl Band {
         for (k, &v) in self.members.iter().enumerate() {
             let v = v as usize;
             self.diag.push(s.mass[v] + s.time_step * s.matrix.diag[v]);
-            let mut upper = None;
+            self.row.clear();
             for (c, w) in s.matrix.off.row(v) {
                 let w = s.time_step * w;
                 let at = place[c as usize];
                 if at != NONE {
-                    if at as usize > k && upper.is_none() {
-                        upper = Some(self.off.col.len());
-                    }
-                    self.off.col.push(at);
-                    self.off.val.push(w);
+                    push(&mut self.row, (at, w))?;
                 } else if heat.value[c as usize] > 0.0 {
                     push(&mut self.arrivals, (k as u32, c, -w))?;
                 }
             }
-            self.upper.push(upper.unwrap_or(self.off.col.len()) as u32);
+            self.row.sort_unstable_by_key(|e| e.0);
+            let below = self.row.partition_point(|e| (e.0 as usize) < k);
+            self.upper.push((self.off.col.len() + below) as u32);
+            for &(c, w) in &self.row {
+                self.off.col.push(c);
+                self.off.val.push(w);
+            }
             self.off.ptr.push(self.off.col.len() as u32);
         }
         Ok(())
