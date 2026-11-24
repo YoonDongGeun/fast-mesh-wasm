@@ -124,8 +124,8 @@ mod domains;
 mod error;
 mod extrude;
 mod fields;
-mod height_map;
 mod geodesic;
+mod height_map;
 mod history;
 mod hull;
 mod id;
@@ -172,8 +172,8 @@ pub use fields::{
     FieldStatus, GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, OverhangOptions,
     OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
-pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
 pub use geodesic::GeodesicJob;
+pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
