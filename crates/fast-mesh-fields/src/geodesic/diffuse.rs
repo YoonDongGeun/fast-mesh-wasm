@@ -12,8 +12,13 @@
 //! band itself is kept: what is cut off further out comes back damped twice
 //! over the overlap.
 //!
-//! The distance that cuts the bands is the shortest one along mesh edges. It
-//! only decides what is solved together, not what is solved.
+//! The distance that cuts the bands is an estimate of the heat's fall along
+//! the mesh edges. It only decides what is solved together, not what is
+//! solved, but where the estimate is far off (a fan of long triangles carries
+//! heat much further than its size suggests) a band misses heat that comes
+//! back from a later one. So the solution is checked at every vertex, and
+//! unless it holds the bands are solved again, now cut by the heat found and
+//! with what the rest of the mesh sends back, until it does.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -31,8 +36,21 @@ const WIDTH: f64 = 10.0;
 const OVERLAP: f64 = 6.0;
 /// A band's solve ends at this residual, relative to the heat that arrives.
 const TOLERANCE: f64 = 1e-12;
+/// The heat holds at a vertex when it differs from what its neighbours give
+/// it by at most this share: its direction is then off by about as much.
+const HOLDS: f64 = 1e-3;
+/// A later pass leaves a band alone that differs by at most this share.
+const SETTLED: f64 = 1e-4;
+/// The heat holds when it does at all but this share of the vertices.
+const EXCEPTIONS: f64 = 1e-3;
+/// How often the bands are solved at most.
+const PASSES: usize = 6;
+/// An edge is long from this length on, in `√t`.
+const LONG: f64 = 3.0;
 /// No place in the band.
 const NONE: u32 = u32::MAX;
+
+const OOM: fn() -> FieldsError = || FieldsError::OutOfMemory;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct HeapItem {
@@ -117,18 +135,20 @@ pub(super) struct Surface<'a> {
 /// The diffusion under way.
 #[derive(Debug)]
 pub(super) struct Diffusion {
-    sources: Vec<u32>,
     heat: Heat,
-    /// Distance along edges from the nearest source, over `√t`.
+    /// How far the heat has fallen, as a power of `e`: estimated along the
+    /// edges at first, then measured.
     reach: Vec<f64>,
-    /// The vertices by that distance.
+    /// The vertices in that order.
     order: Vec<u32>,
     heap: BinaryHeap<HeapItem>,
     /// Whether `order` is complete.
     ordered: bool,
-    /// How many vertices of `order` have their heat.
+    /// How many vertices of `order` have their heat in this pass.
     done: usize,
-    solved: Vec<bool>,
+    /// How many passes are over.
+    passes: usize,
+    is_source: Vec<bool>,
     /// Per vertex, its place in the band, or [`NONE`].
     place: Vec<u32>,
     band: Band,
@@ -136,10 +156,12 @@ pub(super) struct Diffusion {
 
 impl Diffusion {
     /// Diffusion from `sources` over a surface of `n` vertices.
-    pub(super) fn new(n: usize, sources: Vec<u32>) -> Result<Diffusion> {
+    pub(super) fn new(n: usize, sources: &[u32]) -> Result<Diffusion> {
         let mut reach = filled(n, f64::INFINITY)?;
+        let mut is_source = filled(n, false)?;
         let mut heap = BinaryHeap::new();
-        for &s in &sources {
+        for &s in sources {
+            is_source[s as usize] = true;
             if reach[s as usize] > 0.0 {
                 reach[s as usize] = 0.0;
                 heap_push(
@@ -154,7 +176,6 @@ impl Diffusion {
         let mut order = Vec::new();
         reserve(&mut order, n)?;
         Ok(Diffusion {
-            sources,
             heat: Heat {
                 value: filled(n, 0.0f64)?,
                 scale: filled(n, 0i32)?,
@@ -164,7 +185,8 @@ impl Diffusion {
             heap,
             ordered: false,
             done: 0,
-            solved: filled(n, false)?,
+            passes: 0,
+            is_source,
             place: filled(n, NONE)?,
             band: Band::default(),
         })
@@ -178,18 +200,80 @@ impl Diffusion {
             self.order_vertices(s, work.max(1024))?;
             return Ok(Some(self.order.len() - before));
         }
-        if self.done == self.order.len() {
+        if self.done < self.order.len() {
+            let size = self.solve_band(s)?;
+            return Ok(Some(size.saturating_mul(16)));
+        }
+        self.passes += 1;
+        if self.passes == PASSES || self.holds(s)? {
             return Ok(None);
         }
-        let size = self.solve_band(s)?;
-        Ok(Some(size.saturating_mul(16)))
+        self.order_by_heat();
+        Ok(Some(self.order.len().saturating_mul(8)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn passes(&self) -> usize {
+        self.passes
     }
 
     pub(super) fn finish(self) -> Heat {
         self.heat
     }
 
-    /// Settles up to `count` more vertices in order of their distance.
+    /// Whether the heat is the solution, at all but a few vertices.
+    fn holds(&self, s: &Surface<'_>) -> Result<bool> {
+        let n = self.order.len();
+        let off = par::map_range(n, BLOCK, PAR_MIN_ROWS, OOM, |range| {
+            let off = range.filter(|&v| self.error_at(s, v) > HOLDS).count();
+            Ok::<usize, FieldsError>(off)
+        })?;
+        let off: usize = off.into_iter().sum();
+        Ok(off as f64 <= EXCEPTIONS * n as f64)
+    }
+
+    /// How much a vertex's heat differs from what it is given, as a share.
+    fn error_at(&self, s: &Surface<'_>, v: usize) -> f64 {
+        let own = s.mass[v] + s.time_step * s.matrix.diag[v];
+        let scale = self.heat.scale[v];
+        let mut given = if self.is_source[v] {
+            power_of_two(-scale)
+        } else {
+            0.0
+        };
+        for (c, w) in s.matrix.off.row(v) {
+            let c = c as usize;
+            let at = power_of_two(self.heat.scale[c] - scale);
+            if at > 0.0 {
+                given -= s.time_step * w * self.heat.value[c] * at;
+            }
+        }
+        let has = own * self.heat.value[v];
+        let error = (given - has).abs() / has;
+        // (NaN without heat, or when a neighbour has too much more of it.)
+        if error.is_finite() {
+            error
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Orders the vertices by how far their heat has fallen.
+    fn order_by_heat(&mut self) {
+        for (v, reach) in self.reach.iter_mut().enumerate() {
+            let fall = -self.heat.ln(v);
+            *reach = if fall.is_nan() { f64::INFINITY } else { fall };
+        }
+        let reach = &self.reach;
+        self.order.sort_unstable_by(|&a, &b| {
+            reach[a as usize]
+                .total_cmp(&reach[b as usize])
+                .then(a.cmp(&b))
+        });
+        self.done = 0;
+    }
+
+    /// Puts up to `count` more vertices in order, from the sources on.
     fn order_vertices(&mut self, s: &Surface<'_>, count: usize) -> Result<()> {
         let per_length = 1.0 / s.time_step.sqrt();
         let end = self.order.len().saturating_add(count);
@@ -200,9 +284,16 @@ impl Diffusion {
             }
             push(&mut self.order, vertex)?;
             let p = widen(s.positions[v]);
-            for (c, _) in s.matrix.off.row(v) {
-                let len = norm(sub(widen(s.positions[c as usize]), p));
-                let next = dist + len * per_length;
+            for (c, w) in s.matrix.off.row(v) {
+                let mut fall = norm(sub(widen(s.positions[c as usize]), p)) * per_length;
+                if fall > LONG {
+                    // Along an edge much longer than `√t` the heat falls at
+                    // most by what this neighbour alone passes on.
+                    let c = c as usize;
+                    let own = s.mass[c] + s.time_step * s.matrix.diag[c];
+                    fall = fall.min(-(-s.time_step * w / own).ln()).max(LONG);
+                }
+                let next = dist + fall;
                 if next < self.reach[c as usize] {
                     self.reach[c as usize] = next;
                     heap_push(
@@ -223,8 +314,8 @@ impl Diffusion {
         Ok(())
     }
 
-    /// Solves the band that starts at the first vertex without heat; how
-    /// many vertices that took.
+    /// Solves the band that starts at the first vertex not done in this
+    /// pass; how many vertices that took.
     fn solve_band(&mut self, s: &Surface<'_>) -> Result<usize> {
         let from = self.done;
         let start = self.reach[self.order[from] as usize];
@@ -232,6 +323,14 @@ impl Diffusion {
             self.order[from..].partition_point(|&v| self.reach[v as usize] <= start + at) + from
         };
         let (keep, outer) = (ends(WIDTH), ends(WIDTH + OVERLAP));
+        if self.passes > 0
+            && self.order[from..keep]
+                .iter()
+                .all(|&v| self.error_at(s, v as usize) <= SETTLED)
+        {
+            self.done = keep;
+            return Ok((keep - from) / 16);
+        }
 
         let band = &mut self.band;
         band.clear();
@@ -242,22 +341,15 @@ impl Diffusion {
         for (k, &v) in band.members.iter().enumerate() {
             self.place[v as usize] = k as u32;
         }
-        band.assemble(s, &self.place, &self.solved, &self.heat)?;
-        let scale = band.arrive(&self.heat)?;
-        if from == 0 {
-            for &v in &self.sources {
-                let k = self.place[v as usize] as usize;
-                band.b[k] = 1.0;
-            }
-        }
-        // The overlap of the band before is a first guess.
+        band.assemble(s, &self.place, &self.heat)?;
+        let scale = band.arrive(&self.heat, &self.is_source)?;
+        // The overlap of the band before, or the pass before, is a first guess.
         for (x, &v) in band.x.iter_mut().zip(&band.members) {
             let v = v as usize;
-            if self.heat.value[v] > 0.0 {
-                *x = self.heat.value[v] * power_of_two(self.heat.scale[v] - scale);
-            }
+            let guess = self.heat.value[v] * power_of_two(self.heat.scale[v] - scale);
+            // (NaN without heat, which counts as scale 0.)
+            *x = if guess.is_finite() { guess } else { 0.0 };
         }
-        band.factor()?;
         band.solve()?;
         // One sweep outwards: it gives every vertex some of the heat of the
         // one before it on its path, so none is left without any.
@@ -275,9 +367,6 @@ impl Diffusion {
             self.heat.scale[v] = scale;
             self.place[v] = NONE;
         }
-        for &v in &self.order[from..keep] {
-            self.solved[v as usize] = true;
-        }
         self.done = keep;
         Ok(outer - from)
     }
@@ -291,7 +380,7 @@ struct Band {
     /// Per row, where the columns above the diagonal start.
     upper: Vec<u32>,
     diag: Vec<f64>,
-    /// Couplings to solved vertices: row, vertex, weight.
+    /// Couplings to vertices with heat outside: row, vertex, weight.
     arrivals: Vec<(u32, u32, f64)>,
     b: Vec<f64>,
     /// The incomplete factor's entries, at their places in `off`.
@@ -327,13 +416,7 @@ impl Band {
     }
 
     /// The rows of `mass + t · Laplacian` between the members.
-    fn assemble(
-        &mut self,
-        s: &Surface<'_>,
-        place: &[u32],
-        solved: &[bool],
-        heat: &Heat,
-    ) -> Result<()> {
+    fn assemble(&mut self, s: &Surface<'_>, place: &[u32], heat: &Heat) -> Result<()> {
         let n = self.members.len();
         let entries: usize = self
             .members
@@ -359,7 +442,7 @@ impl Band {
                     }
                     self.off.col.push(at);
                     self.off.val.push(w);
-                } else if solved[c as usize] && heat.value[c as usize] > 0.0 {
+                } else if heat.value[c as usize] > 0.0 {
                     push(&mut self.arrivals, (k as u32, c, -w))?;
                 }
             }
@@ -369,10 +452,10 @@ impl Band {
         Ok(())
     }
 
-    /// Fills `b` with the heat arriving from solved vertices, over the power
-    /// of two that brings the largest to about 1, which it returns; sizes the
-    /// other vectors.
-    fn arrive(&mut self, heat: &Heat) -> Result<i32> {
+    /// Fills `b` with the heat of the sources and the heat arriving from
+    /// outside, over the power of two that brings the largest to about 1,
+    /// which it returns; sizes the other vectors.
+    fn arrive(&mut self, heat: &Heat, is_source: &[bool]) -> Result<i32> {
         let n = self.members.len();
         for v in [
             &mut self.b,
@@ -393,8 +476,20 @@ impl Band {
             .map(|&(_, v, w)| {
                 heat.scale[v as usize] + exponent_of(heat.value[v as usize]) + exponent_of(w)
             })
+            .chain(
+                // A source gives off 1.
+                self.members
+                    .iter()
+                    .filter(|&&v| is_source[v as usize])
+                    .map(|_| 0),
+            )
             .max()
             .unwrap_or(0);
+        for (b, &v) in self.b.iter_mut().zip(&self.members) {
+            if is_source[v as usize] {
+                *b = power_of_two(-scale);
+            }
+        }
         for &(k, v, w) in &self.arrivals {
             let v = v as usize;
             self.b[k as usize] += w * heat.value[v] * power_of_two(heat.scale[v] - scale);
@@ -476,6 +571,10 @@ impl Band {
         for (r, b) in self.r.iter_mut().zip(&self.b) {
             *r = b - *r;
         }
+        if dot(&self.r, &self.r)? <= goal {
+            return Ok(());
+        }
+        self.factor()?;
         self.precondition();
         self.p.copy_from_slice(&self.z);
         let mut rz = dot(&self.r, &self.z)?;

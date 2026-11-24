@@ -74,6 +74,8 @@ pub enum GeodesicPhase {
     Factorize,
     /// Heat method: diffusing heat from the sources.
     Diffuse,
+    /// Heat method: turning the heat into a direction at every triangle.
+    Gradient,
     /// Heat method: solving for the distances.
     Poisson,
     /// The distances are ready.

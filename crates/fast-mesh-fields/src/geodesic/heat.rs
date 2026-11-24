@@ -5,7 +5,7 @@ use std::ops::Range;
 use fast_mesh_store::{Mesh, par};
 
 use super::amg::{Amg, AmgBuild, Matrix, PAR_MIN_ROWS, Rows, Solve, sum_range};
-use super::diffuse::{Diffusion, Surface};
+use super::diffuse::{Diffusion, Heat, Surface};
 use super::{GeodesicPhase, MeshState, validate_max_distance, validate_options};
 use crate::geom::{add, cross, dot, norm, scale, sub, triangle_normal, widen};
 use crate::grid::{allocation_allowed, filled, push, reserve, reserve_exact};
@@ -19,8 +19,8 @@ const MIN_EDGE_WEIGHT: f64 = 1e-6;
 const TOLERANCE: f64 = 1e-7;
 /// Elements per chunk of the assembly's loops.
 const CHUNK: usize = 8192;
-/// Triangles per step of the divergence.
-const DIVERGENCE_STEP: usize = 1 << 16;
+/// Triangles per step of the gradient.
+const GRADIENT_STEP: usize = 1 << 17;
 /// No component.
 const NONE: u32 = u32::MAX;
 
@@ -755,6 +755,15 @@ enum SolveStage {
         sources: Vec<u32>,
         diffusion: Box<Diffusion>,
     },
+    /// Turn the heat's direction into the right-hand side.
+    Gradient {
+        component: u32,
+        sources: Vec<u32>,
+        heat: Heat,
+        b: Vec<f64>,
+        /// The first triangle not added yet.
+        at: usize,
+    },
     Poisson {
         component: u32,
         sources: Vec<u32>,
@@ -811,6 +820,7 @@ impl HeatSolve {
 
     pub(super) fn phase(&self) -> GeodesicPhase {
         match self.stage {
+            SolveStage::Gradient { .. } => GeodesicPhase::Gradient,
             SolveStage::Poisson { .. } => GeodesicPhase::Poisson,
             _ => GeodesicPhase::Diffuse,
         }
@@ -831,13 +841,11 @@ impl HeatSolve {
                 Some((component, sources)) => {
                     let n = solver.components[component as usize].vertices.len();
                     spent = n;
-                    let mut own = Vec::new();
-                    reserve_exact(&mut own, sources.len())?;
-                    own.extend_from_slice(&sources);
+                    let diffusion = Box::new(Diffusion::new(n, &sources)?);
                     SolveStage::Diffuse {
                         component,
                         sources,
-                        diffusion: Box::new(Diffusion::new(n, own)?),
+                        diffusion,
                     }
                 }
             },
@@ -863,13 +871,42 @@ impl HeatSolve {
                         }
                     }
                     None => {
-                        spent = 4 * c.vertices.len();
-                        let solve = Box::new(begin_poisson(c, *diffusion, time_step)?);
-                        SolveStage::Poisson {
+                        spent = c.vertices.len();
+                        SolveStage::Gradient {
                             component,
                             sources,
-                            solve,
+                            heat: diffusion.finish(),
+                            b: filled(c.vertices.len(), 0.0f64)?,
+                            at: 0,
                         }
+                    }
+                }
+            }
+            SolveStage::Gradient {
+                component,
+                sources,
+                heat,
+                mut b,
+                at,
+            } => {
+                let c = &solver.components[component as usize];
+                let end = c.triangles.len().min(at + GRADIENT_STEP);
+                add_divergence(c, &heat, at..end, &mut b)?;
+                spent = 2 * (end - at) + 1;
+                if end < c.triangles.len() {
+                    SolveStage::Gradient {
+                        component,
+                        sources,
+                        heat,
+                        b,
+                        at: end,
+                    }
+                } else {
+                    let solve = Box::new(begin_poisson(c, heat, b, time_step)?);
+                    SolveStage::Poisson {
+                        component,
+                        sources,
+                        solve,
                     }
                 }
             }
@@ -925,32 +962,32 @@ impl HeatSolve {
     }
 }
 
-/// The Poisson problem of a component's heat: the potential whose gradient
-/// is nearest to the unit field that points away from the heat.
-fn begin_poisson(c: &Component, diffusion: Diffusion, time_step: f64) -> Result<Solve> {
-    let n = c.vertices.len();
-    let heat = diffusion.finish();
-    let mut b = filled(n, 0.0f64)?;
-    let mut at = 0;
-    while at < c.triangles.len() {
-        let end = c.triangles.len().min(at + DIVERGENCE_STEP);
-        allocation_allowed()?;
-        let parts = par::map_range(end - at, CHUNK, 2 * CHUNK, OOM, |r: Range<usize>| {
-            let mut out: Vec<[f64; 3]> = Vec::new();
-            reserve_exact(&mut out, r.len())?;
-            for tri in &c.triangles[at + r.start..at + r.end] {
-                let v = tri.map(|v| v as usize);
-                out.push(divergence(v.map(|v| c.positions[v]), heat.corners(v)));
-            }
-            Ok(out)
-        })?;
-        for (tri, flux) in c.triangles[at..end].iter().zip(parts.iter().flatten()) {
-            for k in 0..3 {
-                b[tri[k] as usize] += flux[k];
-            }
+/// Adds to `b` what the unit field away from the heat flows out of some of a
+/// component's triangles.
+fn add_divergence(c: &Component, heat: &Heat, range: Range<usize>, b: &mut [f64]) -> Result<()> {
+    let triangles = &c.triangles[range];
+    allocation_allowed()?;
+    let parts = par::map_chunks(triangles, CHUNK, 2 * CHUNK, OOM, |_, chunk| {
+        let mut out: Vec<[f64; 3]> = Vec::new();
+        reserve_exact(&mut out, chunk.len())?;
+        for tri in chunk {
+            let v = tri.map(|v| v as usize);
+            out.push(divergence(v.map(|v| c.positions[v]), heat.corners(v)));
         }
-        at = end;
+        Ok(out)
+    })?;
+    for (tri, flux) in triangles.iter().zip(parts.iter().flatten()) {
+        for k in 0..3 {
+            b[tri[k] as usize] += flux[k];
+        }
     }
+    Ok(())
+}
+
+/// The Poisson problem of the divergence `b` of a component's heat: the
+/// potential whose gradient is nearest to the unit field away from the heat.
+fn begin_poisson(c: &Component, heat: Heat, mut b: Vec<f64>, time_step: f64) -> Result<Solve> {
+    let n = c.vertices.len();
     let mean = sum_range(n, |i| b[i])? / n as f64;
     for v in &mut b {
         *v -= mean;
@@ -965,6 +1002,7 @@ fn begin_poisson(c: &Component, diffusion: Diffusion, time_step: f64) -> Result<
             *g = if d.is_finite() { d } else { 0.0 };
         }
     });
+    drop(heat);
     Solve::new(&c.amg, guess, &b, TOLERANCE * TOLERANCE * c.area)
 }
 
@@ -987,4 +1025,307 @@ fn divergence(corners: [[f32; 3]; 3], u: [f64; 3]) -> [f64; 3] {
     }
     let x = scale(g, -0.5 * area2 / len);
     grad.map(|d| dot(d, x))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::fail_allocations_after;
+    use crate::test_util::{build_bvh, icosphere, mesh, terrain};
+
+    /// A capped cylinder along Z whose caps are fans around one vertex.
+    fn fan_cylinder(segments: u32, rings: u32, height: f32) -> Mesh {
+        let mut p = Vec::new();
+        let mut t = Vec::new();
+        for k in 0..=rings {
+            for s in 0..segments {
+                let a = f64::from(s) / f64::from(segments) * std::f64::consts::TAU;
+                let z = height * (k as f32 / rings as f32);
+                p.push([a.cos() as f32, a.sin() as f32, z]);
+            }
+        }
+        for k in 0..rings {
+            for s in 0..segments {
+                let (a, b) = (k * segments + s, k * segments + (s + 1) % segments);
+                let (c, d) = (a + segments, b + segments);
+                t.push([a, b, d]);
+                t.push([a, d, c]);
+            }
+        }
+        let (low, high) = (p.len() as u32, p.len() as u32 + 1);
+        p.push([0.0, 0.0, 0.0]);
+        p.push([0.0, 0.0, height]);
+        let top = rings * segments;
+        for s in 0..segments {
+            let next = (s + 1) % segments;
+            t.push([low, next, s]);
+            t.push([high, top + s, top + next]);
+        }
+        mesh(&p, &t)
+    }
+
+    /// A flat grid of `nx` by `ny` unit cells, `x` scaled.
+    fn strip(nx: u32, ny: u32, x: f32) -> Mesh {
+        let mut p = Vec::new();
+        let mut t = Vec::new();
+        for j in 0..=ny {
+            for i in 0..=nx {
+                p.push([i as f32 * x, j as f32, 0.0]);
+            }
+        }
+        for j in 0..ny {
+            for i in 0..nx {
+                let a = j * (nx + 1) + i;
+                t.push([a, a + 1, a + nx + 2]);
+                t.push([a, a + nx + 2, a + nx + 1]);
+            }
+        }
+        mesh(&p, &t)
+    }
+
+    /// `m` drawn out along Y.
+    fn stretched(m: &Mesh, by: f32) -> Mesh {
+        let p: Vec<_> = m
+            .positions()
+            .iter()
+            .map(|v| [v[0], v[1] * by, v[2]])
+            .collect();
+        mesh(&p, m.triangles())
+    }
+
+    /// The heat of a component by a dense Cholesky solve, which is accurate
+    /// at every vertex: all its sums are of positive terms.
+    fn dense_heat(c: &Component, time_step: f64, sources: &[u32]) -> Vec<f64> {
+        let n = c.vertices.len();
+        let a = c.amg.fine();
+        // The lower triangle, by columns: `l[j * n + i]`.
+        let mut l = vec![0.0f64; n * n];
+        for i in 0..n {
+            l[i * n + i] = c.mass[i] + time_step * a.diag[i];
+            for (j, v) in a.off.row(i) {
+                l[j as usize * n + i] = time_step * v;
+            }
+        }
+        for j in 0..n {
+            let (before, rest) = l.split_at_mut(j * n);
+            let column = &mut rest[..n];
+            for done in before.chunks(n) {
+                let f = done[j];
+                if f != 0.0 {
+                    for i in j..n {
+                        column[i] -= done[i] * f;
+                    }
+                }
+            }
+            let d = column[j].sqrt();
+            for v in &mut column[j..] {
+                *v /= d;
+            }
+        }
+        let mut x = vec![0.0; n];
+        for &s in sources {
+            x[s as usize] = 1.0;
+        }
+        for j in 0..n {
+            x[j] /= l[j * n + j];
+            for i in j + 1..n {
+                x[i] -= l[j * n + i] * x[j];
+            }
+        }
+        for j in (0..n).rev() {
+            for i in j + 1..n {
+                x[j] -= l[j * n + i] * x[i];
+            }
+            x[j] /= l[j * n + j];
+        }
+        x
+    }
+
+    /// The heat of a component, and how many passes it took.
+    fn diffuse(solver: &GeodesicHeatSolver, component: usize, sources: &[u32]) -> (Heat, usize) {
+        let c = &solver.components[component];
+        let surface = Surface {
+            matrix: c.amg.fine(),
+            mass: &c.mass,
+            positions: &c.positions,
+            time_step: solver.time_step_scale * solver.mean_edge * solver.mean_edge,
+        };
+        let mut d = Diffusion::new(c.vertices.len(), sources).unwrap();
+        while d.step(&surface, 100).unwrap().is_some() {}
+        let passes = d.passes();
+        (d.finish(), passes)
+    }
+
+    #[test]
+    fn heat_is_the_solution_at_every_vertex() {
+        // (Heat crosses the stretched triangles much faster than their size
+        // suggests: it takes more than one pass.)
+        for (name, m, scale) in [
+            ("terrain", terrain(18), 1.0),
+            ("small step", terrain(14), 0.2),
+            ("large step", terrain(14), 40.0),
+            ("sphere", icosphere(), 1.0),
+            ("fans", fan_cylinder(40, 8, 1.0), 1.0),
+            ("wide fans", fan_cylinder(80, 4, 0.3), 0.02),
+            ("stretched", stretched(&icosphere(), 20.0), 0.1),
+            ("stretched further", stretched(&icosphere(), 100.0), 1e-3),
+            ("flat cells", strip(60, 6, 0.1), 1.0),
+            ("long strip", strip(150, 1, 1.0), 1.0),
+        ] {
+            let solver = GeodesicHeatSolver::build(&m, scale).unwrap();
+            let t = scale * solver.mean_edge * solver.mean_edge;
+            let n = solver.components[0].vertices.len() as u32;
+            for sources in [vec![0], vec![n / 2], vec![0, n / 3, n - 1]] {
+                let (heat, passes) = diffuse(&solver, 0, &sources);
+                assert_eq!(
+                    passes > 1,
+                    name.starts_with("stretched"),
+                    "{name}: {passes}"
+                );
+                let exact = dense_heat(&solver.components[0], t, &sources);
+                let mut far = 0.0f64;
+                for (v, want) in exact.iter().enumerate() {
+                    let got = heat.ln(v);
+                    assert!(
+                        (got - want.ln()).abs() < 5e-3,
+                        "{name} {sources:?} vertex {v}: e^{got} instead of e^{}",
+                        want.ln()
+                    );
+                    far = far.max(-want.ln());
+                }
+                if name == "long strip" && sources == [0] {
+                    assert!(far > 100.0, "heat reaches e^-{far} only");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multigrid_takes_about_as_many_iterations_on_any_mesh() {
+        for (name, m) in [
+            ("small", terrain(40)),
+            ("medium", terrain(90)),
+            ("large", terrain(200)),
+            ("flat cells", strip(160, 160, 0.05)),
+            ("fans", fan_cylinder(128, 128, 2.0)),
+        ] {
+            let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+            let mut solve = HeatSolve::new(&solver, &[0], None, 1.0).unwrap();
+            let mut iterations = 0;
+            loop {
+                iterations += usize::from(solve.phase() == GeodesicPhase::Poisson);
+                if solve.step(&solver, usize::MAX).unwrap().is_none() {
+                    break;
+                }
+            }
+            assert!(
+                (2..30).contains(&iterations),
+                "{name}: {iterations} iterations"
+            );
+        }
+    }
+
+    #[test]
+    fn operators_are_what_they_should_be() {
+        // Two parts, numbered across each other, with a dead triangle.
+        let (a, b) = (terrain(20), icosphere());
+        let mut p = Vec::new();
+        let mut t = Vec::new();
+        let na = a.vertex_slots() as u32;
+        for &v in a.positions() {
+            p.push(v);
+            p.push([v[0], v[1], v[2] + 50.0]); // unused
+        }
+        for tri in a.triangles() {
+            t.push(tri.map(|v| 2 * v));
+        }
+        for &v in b.positions() {
+            p.push([v[0] + 100.0, v[1], v[2]]);
+        }
+        for tri in b.triangles() {
+            t.push(tri.map(|v| 2 * na + v));
+        }
+        t.push([0, 0, 2]); // degenerate
+        let m = mesh(&p, &t);
+        let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+        assert_eq!(solver.components.len(), 2);
+        let mut seen = 0;
+        for (k, c) in solver.components.iter().enumerate() {
+            let n = c.vertices.len();
+            seen += n;
+            let total: f64 = c.mass.iter().sum();
+            assert!((total - c.area).abs() < 1e-9 * c.area);
+            for (local, &v) in c.vertices.iter().enumerate() {
+                assert_eq!(solver.component_of[v as usize], k as u32);
+                assert_eq!(solver.local_of[v as usize], local as u32);
+                assert_eq!(c.positions[local], m.positions()[v as usize]);
+            }
+            let l = c.amg.fine();
+            for i in 0..n {
+                let row: Vec<_> = l.off.row(i).collect();
+                assert!(row.windows(2).all(|w| w[0].0 < w[1].0));
+                let sum: f64 = row.iter().map(|e| e.1).sum();
+                assert!((sum + l.diag[i]).abs() < 1e-12 * l.diag[i]);
+                for (j, v) in row {
+                    assert!(v < 0.0);
+                    // Symmetric to the bit.
+                    let back = l.off.row(j as usize).find(|e| e.0 == i as u32);
+                    assert_eq!(back.map(|e| e.1.to_bits()), Some(v.to_bits()));
+                }
+            }
+            for tri in &c.triangles {
+                assert!(tri.iter().all(|&v| (v as usize) < n));
+            }
+        }
+        assert_eq!(seen, a.vertex_slots() + b.vertex_slots());
+        assert_eq!(
+            solver
+                .components
+                .iter()
+                .map(|c| c.triangles.len())
+                .sum::<usize>(),
+            a.triangle_count() + b.triangle_count()
+        );
+        assert!(solver.byte_size() > 0);
+    }
+
+    #[test]
+    fn running_out_of_memory_anywhere_is_an_error() {
+        // Large enough for multigrid levels, and in two parts.
+        let (a, b) = (terrain(15), icosphere());
+        let mut p = a.positions().to_vec();
+        let mut t = a.triangles().to_vec();
+        let base = p.len() as u32;
+        p.extend(b.positions().iter().map(|v| [v[0] + 100.0, v[1], v[2]]));
+        t.extend(b.triangles().iter().map(|tri| tri.map(|v| v + base)));
+        let m = mesh(&p, &t);
+        let _ = build_bvh(&m);
+        let mut want = Vec::new();
+        let solver = GeodesicHeatSolver::build(&m, 1.0).unwrap();
+        solver.solve(&[0, base], None, &mut want).unwrap();
+
+        let mut at = 0;
+        loop {
+            let mut out = vec![7.5f32];
+            fail_allocations_after(Some(at));
+            let built = GeodesicHeatSolver::build(&m, 1.0);
+            let solved = match &built {
+                Ok(s) => s.solve(&[0, base], None, &mut out),
+                Err(e) => Err(e.clone()),
+            };
+            fail_allocations_after(None);
+            match solved {
+                Ok(()) => {
+                    assert_eq!(out, want);
+                    break;
+                }
+                Err(e) => {
+                    assert_eq!(e, FieldsError::OutOfMemory);
+                    assert_eq!(out, [7.5]);
+                }
+            }
+            at += 1;
+        }
+        assert!(at > 100, "only {at} allocations");
+    }
 }
