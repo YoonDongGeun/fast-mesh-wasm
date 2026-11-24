@@ -8,6 +8,7 @@ import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { CheckedHeightfield, CheckedHeightfieldPlacement, HeightMap, HeightMapFrame } from "../height-map.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
+import type { LatticeOptions, LatticePlan, LatticePreview } from "../lattice.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
 import type {
   NormalizedBooleanOptions,
@@ -350,6 +351,8 @@ export type Request =
   /** `Scene.wrap`; replies with the wrap's counts and grid. */
   | { kind: "wrap"; rev: number; addedId: ClientId; meshes: ClientId[]; options: WrapOptions; qid: number }
   | { kind: "hollowMesh"; rev: number; id: ClientId; options: HollowOptions; qid: number }
+  /** `Scene.latticeFill`; replies with its report. */
+  | { kind: "latticeFill"; rev: number; id: ClientId; options: LatticeOptions; qid: number }
   /** `Scene.denoise`; replies with its report. */
   | { kind: "denoise"; rev: number; id: ClientId; options: DenoiseOptions; qid: number }
   /** `Scene.delaunayFlips`; replies with its report. */
@@ -430,6 +433,9 @@ export interface QueryMap {
   };
   /** A relief, generated in the Worker (no scene state); its buffers are transferred. */
   generateHeightfield: { args: CheckedHeightfield; value: PrimitiveMesh };
+  latticePlan: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePlan };
+  /** `Scene.latticePreview`; its buffers are transferred. */
+  latticePreview: { args: { mesh: ClientId; options: LatticeOptions }; value: LatticePreview };
   /** A primitive shape, generated in the Worker (no scene state); its buffers are transferred. */
   generatePrimitive: { args: EncodedPrimitive; value: PrimitiveMesh };
   /** Test-only (an engine run with `debug`): copies of a mesh's buffers. */
@@ -650,6 +656,7 @@ export function keyOf(req: Request): string | undefined {
     case "applyKelvinlet":
     case "applyXpbd":
     case "hollowMesh":
+    case "latticeFill":
     case "denoise":
     case "delaunayFlips":
     case "punchDrainHole":

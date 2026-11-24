@@ -47,6 +47,15 @@ import {
 } from "../hull.js";
 import { checkRegisterOptions } from "../register.js";
 import {
+  checkLatticeOptions,
+  DEFAULT_LATTICE_MAX_VOXELS,
+  DEFAULT_LATTICE_PREVIEW_VOXELS,
+  type LatticeOptions,
+  type LatticePlan,
+  type LatticePreview,
+  type LatticeReport,
+} from "../lattice.js";
+import {
   checkWrapOptions,
   type WrapGridOptions,
   wrapMeshList,
@@ -3457,6 +3466,47 @@ export class WorkerScene implements SceneLike {
         return { kind: "hollowMesh", rev, id: st.id, options: cloned, qid };
       },
       (v) => v as HollowReport,
+    );
+  }
+
+  /**
+   * Plans the voxel grid of {@link WorkerScene.latticeFill} for the same mesh
+   * and options without running it (see `Scene.latticePlan`).
+   */
+  latticePlan(mesh: MeshHandle, options: LatticeOptions): Promise<LatticePlan> {
+    return this.#query(
+      "latticePlan",
+      () => ({ mesh: this.#live(mesh).id, options: checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS) }),
+      (v) => v,
+    );
+  }
+
+  /**
+   * Fills the inside of a closed mesh, or the cavity of a hollowed one, with a
+   * lattice in the Worker, one undo step (see `Scene.latticeFill`). The page
+   * stays live while it runs.
+   */
+  latticeFill(mesh: MeshHandle, options: LatticeOptions): Promise<LatticeReport> {
+    return this.#ask(
+      (rev, qid) => {
+        const st = this.#live(mesh);
+        const checked = checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS);
+        this.#endDragOn(st);
+        return { kind: "latticeFill", rev, id: st.id, options: checked, qid };
+      },
+      (v) => v as LatticeReport,
+    );
+  }
+
+  /**
+   * The walls of a lattice on a small grid, built in the Worker without
+   * changing the mesh (see `Scene.latticePreview`).
+   */
+  latticePreview(mesh: MeshHandle, options: LatticeOptions): Promise<LatticePreview> {
+    return this.#query(
+      "latticePreview",
+      () => ({ mesh: this.#live(mesh).id, options: checkLatticeOptions(options, DEFAULT_LATTICE_PREVIEW_VOXELS) }),
+      (v) => v,
     );
   }
 

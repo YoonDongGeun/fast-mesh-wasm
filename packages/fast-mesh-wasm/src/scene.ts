@@ -48,6 +48,19 @@ import {
   hullNormals,
   hullPointsBuffer,
 } from "./hull.js";
+import {
+  checkLatticeOptions,
+  decodeLatticePlan,
+  decodeLatticePreview,
+  decodeLatticeReport,
+  DEFAULT_LATTICE_MAX_VOXELS,
+  DEFAULT_LATTICE_PREVIEW_VOXELS,
+  encodeLatticeOptions,
+  type LatticeOptions,
+  type LatticePlan,
+  type LatticePreview,
+  type LatticeReport,
+} from "./lattice.js";
 import { checkRegisterOptions } from "./register.js";
 import {
   checkWrapOptions,
@@ -6399,6 +6412,85 @@ export class Scene implements SceneLike {
           n.modulationWeights,
         ),
       ),
+    );
+  }
+
+  /**
+   * Plans the voxel grid of {@link Scene.latticeFill} for the same mesh and
+   * options without running it: its dimensions, voxel size, voxel count,
+   * estimated triangles and memory, the share of space the walls fill, and
+   * whether the grid is within `maxVoxels`. Costs a few passes over the mesh
+   * (tens of milliseconds at a million triangles), so it can follow a
+   * settings form.
+   *
+   * @throws {FastMeshError} as {@link Scene.latticeFill}, except that the mesh
+   *   is not checked for being closed, and that a grid over the limit comes
+   *   back with `fits: false`.
+   */
+  latticePlan(mesh: MeshHandle, options: LatticeOptions): LatticePlan {
+    const { index, generation } = this.#id(mesh);
+    const values = encodeLatticeOptions(checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS));
+    return decodeLatticePlan(call(() => this.#scene().lattice_plan(index, generation, values)));
+  }
+
+  /**
+   * Fills the inside of the closed, outward-wound `mesh`, or the cavity of a
+   * hollowed one, with a lattice: walls of uniform thickness that follow a
+   * gyroid, Schwarz P or diamond surface. One undo step.
+   *
+   * - Without a shell, filling the inside turns the mesh into an open
+   *   lattice, cut off at its surface.
+   * - With `shellThickness`, the mesh's surface is kept as it is, and the
+   *   space between the walls is carved out from that depth on, so shell and
+   *   walls are one solid.
+   * - In a cavity, the walls grow out of the shell that is there, whose outer
+   *   surface is kept as it is.
+   *
+   * The result is closed, manifold and free of self-intersections, as far as
+   * the surface that is kept is. It is built on a voxel grid that follows
+   * from the lengths, or from `voxelSize`: edges where walls meet the mesh's
+   * surface are cut by a fraction of a voxel. {@link Scene.latticePlan}
+   * reports the grid, the triangles and the memory beforehand, and
+   * {@link Scene.latticePreview} shows the walls on a small grid.
+   *
+   * Lengths and volumes are measured in the world. The cells are aligned with
+   * the mesh's own axes, around the middle of its bounds. Its UVs are
+   * dropped. A lattice has many triangles (about 600 per cell at ten voxels
+   * a cell, 3,700 at 25) and takes seconds at a few million: use
+   * `WorkerScene.latticeFill` to keep the page live.
+   *
+   * @throws {FastMeshError} `INVALID_ARGUMENT` for bad options, a mesh that is
+   *   not closed and consistently wound outward, `region: "cavity"` without
+   *   a cavity, a grid over `maxVoxels` (the message has its size and
+   *   memory) or too coarse for the walls, the shell, the cells or the wall
+   *   around a cavity, or a lattice that leaves nothing, or nothing open;
+   *   `UNKNOWN_MESH` for a removed mesh; `OUT_OF_MEMORY`. The mesh is
+   *   unchanged on error.
+   */
+  latticeFill(mesh: MeshHandle, options: LatticeOptions): LatticeReport {
+    const { index, generation } = this.#id(mesh);
+    const values = encodeLatticeOptions(checkLatticeOptions(options, DEFAULT_LATTICE_MAX_VOXELS));
+    return decodeLatticeReport(call(() => this.#scene().lattice_fill(index, generation, values)));
+  }
+
+  /**
+   * The walls {@link Scene.latticeFill} would put into `mesh`, on a small
+   * grid, without changing the mesh: buffers in its local frame, to draw at
+   * its `matrix4`. The grid has at most `maxVoxels` voxels (default
+   * {@link DEFAULT_LATTICE_PREVIEW_VOXELS}); walls it is too coarse for are
+   * drawn two voxels thick (`plan.wallThickness`), and a part with too many
+   * cells for it shows its middle only (`plan.cropped`). With a shell the
+   * walls start at its inner face.
+   *
+   * @throws {FastMeshError} as {@link Scene.latticeFill}, except that the grid
+   *   always fits and that a lattice without walls is an empty preview.
+   */
+  latticePreview(mesh: MeshHandle, options: LatticeOptions): LatticePreview {
+    const { index, generation } = this.#id(mesh);
+    const checked = checkLatticeOptions(options, DEFAULT_LATTICE_PREVIEW_VOXELS);
+    const values = encodeLatticeOptions(checked);
+    return decodeLatticePreview(
+      call(() => this.#scene().lattice_preview(index, generation, values, checked.maxVoxels)),
     );
   }
 

@@ -933,6 +933,7 @@ class Engine {
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "latticeFill":
       case "denoise":
       case "delaunayFlips":
         return this.#pending(req.id);
@@ -1062,6 +1063,7 @@ class Engine {
       case "applyKelvinlet":
       case "applyXpbd":
       case "hollowMesh":
+      case "latticeFill":
       case "denoise":
       case "delaunayFlips":
       case "punchDrainHole":
@@ -1392,6 +1394,7 @@ class Engine {
       case "applyXpbd":
       case "alignToFittedPrimitive":
       case "hollowMesh":
+      case "latticeFill":
       case "denoise":
       case "delaunayFlips":
       case "punchDrainHole":
@@ -2148,6 +2151,11 @@ class Engine {
         b.replies.push({ qid: req.qid, ok: true, value });
         return;
       }
+      case "latticeFill": {
+        const value = s.latticeFill(this.#mesh(req.id), req.options);
+        b.replies.push({ qid: req.qid, ok: true, value });
+        return;
+      }
       case "punchDrainHole": {
         if (req.plugId !== undefined) {
           this.#ensureUnused(req.plugId);
@@ -2330,6 +2338,10 @@ class Engine {
           req.name === "vertexMaskToFaceSelection"
         ) {
           pushOwned(value);
+        } else if (req.name === "latticePreview") {
+          const preview = value as QueryMap["latticePreview"]["value"];
+          pushOwned(preview.positions);
+          pushOwned(preview.indices);
         } else if (req.name === "buildFfdLattice") {
           pushOwned((value as QueryMap["buildFfdLattice"]["value"]).offsets);
         } else if (req.name === "fitPrimitive") {
@@ -2527,6 +2539,14 @@ class Engine {
       case "wrapPlan": {
         const a = args as QueryMap["wrapPlan"]["args"];
         return s.wrapPlan(this.#meshList(a.meshes), a.options);
+      }
+      case "latticePlan": {
+        const a = args as QueryMap["latticePlan"]["args"];
+        return s.latticePlan(this.#mesh(a.mesh), a.options);
+      }
+      case "latticePreview": {
+        const a = args as QueryMap["latticePreview"]["args"];
+        return s.latticePreview(this.#mesh(a.mesh), a.options);
       }
       case "findContacts": {
         const a = args as QueryMap["findContacts"]["args"];
