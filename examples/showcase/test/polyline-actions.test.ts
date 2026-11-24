@@ -392,6 +392,30 @@ describe.each([
   });
 });
 
+describe("the engine's restart", () => {
+  it("leaves the polylines, and edits after it are undoable", async () => {
+    const h = await worker();
+    addBall(h);
+    keepCurves(h.app, h.store, [SQUARE], "Square");
+    removePolylines(h.app, h.store, [h.app.getSnapshot().polylines[0].id]);
+    keepCurves(h.app, h.store, [LINE], "Line");
+    await h.settle();
+    await h.store.restart();
+    await h.settle();
+    expect(names(h)).toEqual(["Line"]);
+    keepCurves(h.app, h.store, [SQUARE], "Square");
+    await h.settle();
+    expect(names(h)).toEqual(["Line", "Square"]);
+    h.store.undo();
+    await h.settle();
+    expect(names(h)).toEqual(["Line"]);
+    h.store.redo();
+    await h.settle();
+    expect(names(h)).toEqual(["Line", "Square"]);
+    expect(items(h)).toEqual(["Ball"]);
+  });
+});
+
 describe("what cannot be a mesh", () => {
   it("is refused before anything changes", async () => {
     const h = await local();

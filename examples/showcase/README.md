@@ -55,6 +55,29 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   vertices only. The font (`src/features/mesh-edit/fonts`, under its own licence, kept beside it) is
   about 62 KB, 22 KB gzipped, and loads as a chunk of its own when a text tool first opens. It has
   ASCII, Greek and some symbols; a character it lacks is drawn as `?` and named in the dialog.
+- **Polylines.** *Keep as Objects* (Section Contours), *Keep contours* (the section plane) and *Keep
+  as object* (Surface Path) keep curves as objects of the scene, in world millimetres: they stay when
+  the tool, the plane or the mesh goes. They are listed under the meshes with their length, colour,
+  visibility, focus and removal, drawn as lines that pointer rays pass through, and saved with the
+  project. The Polylines panel (on Mesh Edit and Inspect) works on the selected ones (shift-click
+  adds; the only one needs no selecting), each tool one undo step:
+  - *Simplify* drops the points a curve does without within a tolerance. *Smooth & Resample* replaces
+    it by evenly spaced points of a spline through its points, or through the curve with detail
+    shorter than *smooth under* smoothed away (a loop keeps its size).
+  - *Offset* adds the curves at a distance from a planar one: outward of a loop, to the left of an open
+    curve, negative the other way, with round or sharp corners. A narrow place may split it, a gap may
+    close into a hole, and a loop may vanish.
+  - *Make Tube* sweeps a circle along each curve into a closed mesh (it says where the curve bends
+    tighter than the radius and the tube overlaps itself). *Extrude* makes solids of closed planar
+    curves; those of one plane together, one inside another a hole, with the text tool's caps.
+  - *SVG* and *DXF* export the selected ones (with none, every visible one) through the contour
+    exporter, in their own plane or flattened onto a world one, in millimetres.
+
+  The math is in `src/features/polylines/ux`, all on the main thread and linear or nearly so: a tube
+  along 50,000 points and the offset of a loop of 8,000 each take a fraction of a second. The engine's
+  history knows meshes only, so each state of the list has an empty mesh in the scene as its marker
+  (`polyline-history.ts`): an edit swaps markers undoably, and undo and redo swap them back in order
+  with every other edit. Display settings (name, colour, visibility) are not undo steps.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
@@ -179,7 +202,8 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   The display unit is per project with a global default: a project file stores its own (`units`),
   a file without one takes the default, and picking a unit by hand also sets the default. Opening a
   project never changes the default. The file stores each mesh's positions in mm, and its
-  `importScale` as provenance only, so reopening cannot scale a mesh twice.
+  `importScale` as provenance only, so reopening cannot scale a mesh twice. Kept polylines are stored
+  in mm too, and their SVG and DXF files are in mm.
 - **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
   repair overlays, collision mode, the last-used heatmap sliders, the default display unit, the view
   box's projection, scale indicator and axis basis) persist in localStorage across
@@ -230,6 +254,8 @@ src/
     mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips, wrap
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull
+    polylines/   contours and paths kept as objects: list, lines, simplify, resample, offset, tube,
+                 extrude, SVG and DXF
     ct/          volume rendering, MPR slices
     collision/   contact heatmap, group mode, named groups
 ```
