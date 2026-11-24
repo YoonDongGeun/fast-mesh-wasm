@@ -78,6 +78,19 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
   history knows meshes only, so each state of the list has an empty mesh in the scene as its marker
   (`polyline-history.ts`): an edit swaps markers undoably, and undo and redo swap them back in order
   with every other edit. Display settings (name, colour, visibility) are not undo steps.
+- **Height maps and reliefs.** The export panel's *Height map* section (Home) makes an orthographic
+  depth image of a mesh, or of every visible one, from a standard view or the current one: the
+  pixels along its longer side, and the meshes' own height range or a typed one. It is sampled in
+  bands of rows, with progress and *Cancel*, and downloads two files: a 16-bit grey PNG, whose code
+  is a height (`heightRange * code / 65535`; 0 is also where no surface is seen), and a JSON with
+  the pixel size, the height range and where the image's axes and first pixel are in the world.
+  *Image to Relief…* (Mesh Edit, the command search, or an image dropped anywhere on the page) does
+  the reverse: an image becomes a closed relief with a width, a height for white, a base thickness
+  and a number of samples, previewed live and added as one undo step. Picking or dropping the JSON
+  along with its image puts the relief on the surface the map saw, within one code's height. A
+  16-bit PNG is read at 16 bits (`src/io/png.ts`; a canvas reads 8), other images by the browser,
+  in a Worker of their own. The sampling and the relief's mesh run in the engine
+  (`Scene.heightMap`, `Scene.addHeightfield`), on the scene's Worker.
 - **Move.** Click a mesh to select it; the gizmo (three's `TransformControls`, through
   `attachTransformControls`) moves (<kbd>T</kbd>) or rotates (<kbd>R</kbd>) it, one undo step per drag.
   Undo and Redo, or <kbd>Ctrl</kbd>+<kbd>Z</kbd> and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>.
@@ -238,9 +251,11 @@ src/
   viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
                  drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
-  io/            loading (parser Worker), DICOM, export, project files, demo meshes
+  io/            loading (parser Worker), DICOM, export, project files, demo meshes, 16-bit PNGs and
+                 height images (their own Worker)
   features/
-    home/        mesh list, project save and open, export, the Create dialog (primitive shapes)
+    home/        mesh list, project save and open, export (height maps too), the Create dialog
+                 (primitive shapes)
     view/        navigation cube (presets, orbit and roll steps, display toggles), shading modes, wireframe
     select/      object and face selection, faces by criteria
     build-plate/ the plate on the floor, arranging footprints on it, multi-clone
@@ -250,7 +265,8 @@ src/
                  triangle quality maps; geodesic distance, surface paths, trim and split; object info, box and
                  normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, extrude (faces, base), convex hull,
-                 resample, isotropic remesh, hollow, place mesh, text (its font in fonts/)
+                 resample, isotropic remesh, hollow, place mesh, text (its font in fonts/), image to
+                 relief
     mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips, wrap
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull
