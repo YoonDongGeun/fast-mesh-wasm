@@ -337,7 +337,8 @@ describe("geodesic distance section (#252)", () => {
     const asks: { sources: readonly number[]; answer: () => void; fail: (e: Error) => void }[] = [];
     (scene.inspect as { geodesicDistances: unknown }).geodesicDistances = (m: MeshHandle, src: readonly number[], o: never) =>
       new Promise((res, rej) =>
-        asks.push({ sources: src, answer: () => res(real(m, src, o)), fail: (e) => rej(e) }),
+        // (The signal of a stale ask is aborted: this stand-in answers it all the same.)
+        asks.push({ sources: src, answer: () => res(real(m, src, { ...(o as object), signal: undefined })), fail: (e) => rej(e) }),
       );
     const runs = geodesicMapProbe.runs;
     const answer = async (k: number) => {

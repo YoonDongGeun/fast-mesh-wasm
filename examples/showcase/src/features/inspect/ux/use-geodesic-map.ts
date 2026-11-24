@@ -1,7 +1,7 @@
 // The geodesic map's state and handlers (#252): the map follows the picked
 // sources and the method (each change runs the query again, the latest one
-// only: a request that lands after a newer one was asked for is dropped),
-// and its iso-lines follow the map and their spacing. The map draws through
+// only: a newer ask cancels the query under way, and Cancel does without a
+// newer one), and its iso-lines follow the map and their spacing. The map draws through
 // the surface field overlay like the inspect maps, so one colouring shows at
 // a time: it shows while the overlay is the one it set, and anything else
 // that takes the overlay hides it (the sources stay; Show map brings it
@@ -81,6 +81,8 @@ export function useGeodesicMap(
   reportRef.current = report;
   /** The map asked for and not yet landed (the latest ask wins). */
   const wantRef = useRef<GeodesicMapRequest | null>(null);
+  /** The query under way, if any. */
+  const runRef = useRef<{ request: GeodesicMapRequest; controller: AbortController } | null>(null);
   const runningRef = useRef(false);
   const takeRef = useRef(onTakeOverlay);
   takeRef.current = onTakeOverlay;
@@ -94,6 +96,15 @@ export function useGeodesicMap(
       setReport(null);
     }
   }, [app, report, overlay]);
+
+  /** Asks for `request` (or for none), cancelling a query under way for another. */
+  const want = (request: GeodesicMapRequest | null) => {
+    wantRef.current = request;
+    const run = runRef.current;
+    if (run !== null && run.request !== request) {
+      run.controller.abort();
+    }
+  };
 
   /** Runs the wanted map until none is left, showing each that is still wanted when it lands. */
   const pump = async () => {
@@ -110,15 +121,19 @@ export function useGeodesicMap(
           takeRef.current();
         }
         const before = app.getSnapshot().surfaceFieldValues;
+        const controller = new AbortController();
+        runRef.current = { request, controller };
         let next: GeodesicMapReport;
         try {
-          next = await runGeodesicMap(store.scene, request);
+          next = await runGeodesicMap(store.scene, request, controller.signal);
         } catch (e) {
           if (wantRef.current === request) {
             wantRef.current = null;
             setError(e instanceof Error ? e.message : String(e));
           }
           continue;
+        } finally {
+          runRef.current = null;
         }
         if (wantRef.current !== request) {
           continue; // A newer ask, or none: run that one, or stop.
@@ -146,9 +161,12 @@ export function useGeodesicMap(
     }
   };
 
+  /** Cancels the query under way; a map shown before stays, and the sources do. */
+  const cancel = () => want(null);
+
   /** Removes the map (and any ask still running). */
   const hide = () => {
-    wantRef.current = null;
+    want(null);
     if (shownRef.current !== null && app.getSnapshot().surfaceFieldValues === shownRef.current) {
       app.setSurfaceFieldValues(null);
     }
@@ -161,6 +179,8 @@ export function useGeodesicMap(
   pumpRef.current = pump;
   const hideRef = useRef(hide);
   hideRef.current = hide;
+  const wantFnRef = useRef(want);
+  wantFnRef.current = want;
   useEffect(() => {
     const request = geodesicRequestOf(app.getSnapshot().surfacePath);
     if (request === null) {
@@ -180,9 +200,19 @@ export function useGeodesicMap(
       return;
     }
     setError(null);
-    wantRef.current = request;
+    wantFnRef.current(request);
     void pumpRef.current();
   }, [app, tool.mesh, tool.sources, tool.method]);
+
+  // The operators the accurate method keeps for the next query go with the panel.
+  useEffect(() => {
+    const release = async () => {
+      await store.scene.inspect?.releaseGeodesics?.();
+    };
+    return () => {
+      release().catch(() => undefined); // the scene may be gone already
+    };
+  }, [store]);
 
   /** Shows the map of the current sources again (after another colouring took the overlay). */
   const show = () => {
@@ -192,7 +222,7 @@ export function useGeodesicMap(
       return;
     }
     setError(null);
-    wantRef.current = request;
+    want(request);
     void pump();
   };
 
@@ -247,8 +277,11 @@ export function useGeodesicMap(
 
   return {
     report: active ? report : null,
+    /** The shown map is of other sources, or another method: its query was cancelled. */
+    stale: active && report !== null && !sameGeodesicRequest(report.request, geodesicRequestOf(tool)),
     busy,
     error,
+    cancel,
     iso,
     /** The spacing iso-lines are drawn at (or would be), in mm. */
     spacing: spacing ?? iso.spacing ?? 1,

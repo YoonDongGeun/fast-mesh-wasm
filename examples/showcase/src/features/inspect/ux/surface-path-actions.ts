@@ -4,8 +4,8 @@
 //
 // Taps and Close loop run one at a time, in order (a leg on a large mesh
 // takes a while, on the Worker in the default engine mode), so quick clicks
-// queue instead of racing; a leg that lands after its path was undone or
-// cleared is dropped.
+// queue instead of racing. Undoing or clearing the path cancels the leg
+// being traced, and so does Cancel.
 //
 // Trim deletes one side of the loop (`boolean.trimByCurve`) as one undo
 // step. Split keeps both sides: inside one history step it adds a copy of the
@@ -58,6 +58,14 @@ export function surfacePathIdle(app: AppState): Promise<void> {
   return queues.get(app) ?? Promise.resolve();
 }
 
+/** The leg being traced per app, if any. */
+const tracing = new WeakMap<AppState, AbortController>();
+
+/** Cancels the leg being traced: the path stays as it is. Queued taps still land. */
+export function cancelSurfaceLeg(app: AppState): void {
+  tracing.get(app)?.abort();
+}
+
 /** Traces the leg `from` → `to` and lands `next(leg)` unless the path or its mesh changed meanwhile. */
 async function traceAndLand(
   app: AppState,
@@ -72,19 +80,24 @@ async function traceAndLand(
   if (before === null) {
     return;
   }
+  const run = new AbortController();
+  tracing.set(app, run);
   app.setSurfacePath({ tracing: start.tracing + 1 });
   try {
-    const leg = await traceLeg(scene, mesh, from, to, start.method);
+    const leg = await traceLeg(scene, mesh, from, to, start.method, run.signal);
     const now = app.getSnapshot().surfacePath;
-    if (now.mesh === mesh && now.path === before) {
+    if (!run.signal.aborted && now.mesh === mesh && now.path === before) {
       app.setSurfacePath({ path: next(before, leg), error: null });
     }
   } catch (e) {
     const now = app.getSnapshot().surfacePath;
-    if (now.mesh === mesh && now.path === before) {
+    if (!run.signal.aborted && now.mesh === mesh && now.path === before) {
       app.setSurfacePath({ error: legErrorMessage(e) });
     }
   } finally {
+    if (tracing.get(app) === run) {
+      tracing.delete(app);
+    }
     const now = app.getSnapshot().surfacePath;
     app.setSurfacePath({ tracing: Math.max(0, now.tracing - 1) });
   }
