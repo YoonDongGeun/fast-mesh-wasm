@@ -44,6 +44,10 @@
 //! - Wraps: [`Scene::wrap`] adds a closed, manifold envelope around meshes,
 //!   gaps and holes below a size closed, as a new mesh, as one undo step;
 //!   [`Scene::wrap_plan`] reports its voxel grid first.
+//! - Lattice infill: [`Scene::lattice_fill`] fills a closed mesh, or the
+//!   cavity of a hollowed one, with a gyroid, Schwarz P or diamond lattice, as
+//!   one undo step, measured in the world; [`Scene::lattice_plan`] reports its
+//!   voxel grid first, and [`Scene::lattice_preview`] builds it coarsely.
 //! - Registration: [`Scene::register`] rigidly aligns one mesh to another by
 //!   trimmed point-to-plane ICP from their current placements, and sets the
 //!   moving mesh's placement as one undo step when the result is good.
@@ -125,6 +129,7 @@ mod history;
 mod hull;
 mod id;
 mod join;
+mod lattice;
 mod normals;
 mod placement;
 mod presence;

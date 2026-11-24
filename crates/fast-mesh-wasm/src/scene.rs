@@ -46,6 +46,7 @@ mod denoise;
 mod extrude;
 mod height_map;
 mod hull;
+mod lattice;
 mod wrap;
 
 /// A scene of editable meshes with render buffers and change records.
