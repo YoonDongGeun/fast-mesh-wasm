@@ -20,7 +20,7 @@ use fast_mesh_ops::repair::{
     delete_selected_faces, extract_selected_faces, face_selection_to_vertex_mask,
     fill_selection_holes, grow_face_selection_with, select_by_crease_angle, select_connected_shell,
     select_faces_in_sphere, select_faces_screen, select_small_face_islands, shrink_face_selection,
-    smooth_selection_boundary, split_selected_faces, vertex_mask_to_face_selection,
+    smooth_selection_boundary, vertex_mask_to_face_selection,
 };
 use fast_mesh_store::{Mesh, StoreError, Transaction, TriangleId, UV_CHANNEL, VertexId};
 
@@ -706,37 +706,43 @@ impl Scene {
     /// brings it back under the same id.
     ///
     /// # Errors
-    /// As for an edit. A failed split changes nothing, the caller's open step included; if adding
-    /// the new mesh fails (out of memory), the edit of `id` stays recorded and the new mesh is
-    /// missing.
+    /// As for an edit and an add. A failed split changes nothing, the caller's open step included.
     pub fn split_selected_faces(
         &mut self,
         id: MeshId,
         selected_tris: &[u32],
     ) -> Result<(MeshId, FaceEditReport)> {
         self.drop_field_unit();
-        let (sel, placement, mode) = {
+        let (sel, detached, placement, mode) = {
             let entry = self.entry(id)?;
             let sel = FaceSelection::from_triangles(&entry.mesh, selected_tris)?;
-            (sel, entry.placement, entry.mode)
+            let detached = extract_selected_faces(&entry.mesh, &sel)?;
+            (sel, detached, entry.placement, entry.mode)
         };
-        // The edit and the add are one step, or part of the caller's open
-        // one: from here to `end_step` nothing returns early.
+        // The add and the edit are one step, or part of the caller's open
+        // one: from here to `end_step` nothing returns early. The add comes
+        // first, so that a failure leaves the faces where they are.
         self.begin_step();
-        let split =
-            self.edit(id, |tx| split_selected_faces(tx, &sel))
-                .and_then(|(detached, report)| {
-                    let added = self.add_mesh(
-                        detached,
-                        MeshOptions {
-                            placement,
-                            mode,
-                            undoable: true,
-                            ..MeshOptions::default()
-                        },
-                    )?;
-                    Ok((added, report))
-                });
+        let split = self
+            .add_mesh(
+                detached,
+                MeshOptions {
+                    placement,
+                    mode,
+                    undoable: true,
+                    ..MeshOptions::default()
+                },
+            )
+            .and_then(
+                |added| match self.edit(id, |tx| delete_selected_faces(tx, &sel)) {
+                    Ok(report) => Ok((added, report)),
+                    Err(e) => {
+                        // Added and removed before any report: it never was.
+                        let _ = self.remove_mesh(added);
+                        Err(e)
+                    }
+                },
+            );
         self.end_step()?;
         split
     }
@@ -924,8 +930,8 @@ impl Scene {
     /// the same ids).
     ///
     /// # Errors
-    /// As for an edit. A failed punch changes nothing, the caller's open step included; if adding
-    /// a plug fails (out of memory), the hole and the plugs before it stay recorded.
+    /// As for an edit. A failed punch changes nothing, the caller's open step included; only if
+    /// adding a plug fails (out of memory) inside such a step does the hole stay recorded in it.
     pub fn punch_drain_hole_world(
         &mut self,
         id: MeshId,
@@ -977,7 +983,8 @@ impl Scene {
         };
 
         // The edit and the adds are one step, or part of the caller's open
-        // one: from here to `end_step` nothing returns early.
+        // one: from here to its end nothing returns early.
+        let nested = self.history.is_open();
         self.begin_step();
         let punched = match baked {
             None => self.edit(id, |tx| punch_drain_hole(tx, &spec, &opts)),
@@ -1004,7 +1011,11 @@ impl Scene {
                 .collect::<Result<Vec<_>>>()?;
             Ok((report, plugs))
         });
-        self.end_step()?;
+        if punched.is_err() && !nested {
+            let _ = self.cancel_step();
+        } else {
+            self.end_step()?;
+        }
         punched
     }
 

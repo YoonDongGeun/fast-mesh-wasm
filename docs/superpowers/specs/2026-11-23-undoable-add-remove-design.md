@@ -32,8 +32,8 @@ The scene ops that create a mesh as part of their own step record that add too, 
 removes it: `convex_hull`, `convex_hull_points`, `wrap`, `cut_by_plane` (the removed side),
 `boolean_batch`, `extract_selected_faces`, `split_selected_faces`, `punch_drain_hole_world` (its
 plugs), `place_mesh_world` (a stamp kept separate) and `reconstruct_point_cloud`. `join` removes its
-source undoably, in the step of its edit. An op of several changes nests one step and always closes
-it: an edit that fails leaves the caller's open step as it was.
+source undoably, in the step of its edit. An op of several changes nests a step and never cancels the
+caller's: one that fails leaves it as it was.
 
 ## 3. Keeping a removed mesh
 

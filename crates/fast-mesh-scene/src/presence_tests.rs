@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fast_mesh_fields::{Colormap, OutOfRange};
+use fast_mesh_ops::boolean::{DrainHoleOptions, DrainHoleSpec};
 use fast_mesh_store::{ChannelDesc, Mesh, StoreError, TriangleId, VertexId};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -918,6 +919,72 @@ fn a_rule_between_meshes_that_return_one_by_one_waits_for_both() {
     scene.entries.unpark(b);
     scene.settle_presence(&[crate::history::Done::Presence(b)]);
     assert_eq!(scene.collision_rule(a, b), Ok(rule));
+}
+
+#[test]
+fn ops_that_fail_halfway_leave_the_scene_and_the_callers_step_alone() {
+    let hole = DrainHoleSpec {
+        surface_point: [0.5, 0.5, 1.0],
+        surface_normal: [0.0, 0.0, 1.0],
+        diameter: 0.3,
+        depth: Some(0.4),
+        outer_chamfer: 0.0,
+        taper_angle_deg: 0.0,
+        segments: 16,
+    };
+    let plugged = DrainHoleOptions {
+        generate_plug: true,
+        plug_clearance: 0.01,
+        ..DrainHoleOptions::default()
+    };
+    // A split fails at its add and at its edit, a punch at its edit and, on
+    // its own, at its plug's add.
+    for (op, fail, nested) in [
+        ("split", 1, false),
+        ("split", 2, false),
+        ("split", 1, true),
+        ("split", 2, true),
+        ("punch", 1, false),
+        ("punch", 2, false),
+        ("punch", 1, true),
+    ] {
+        let at = format!("{op} {fail} {nested}");
+        let mut scene = Scene::new(SceneOptions::default());
+        let a = scene
+            .add_mesh(cube([0.0; 3]), MeshOptions::default())
+            .unwrap();
+        if nested {
+            scene.begin_step();
+            scene.set_placement(a, moved(0.5)).unwrap();
+        }
+        let before = scene.mesh(a).unwrap().triangle_count();
+        fault::fail_reserve_on(fail);
+        let failed = match op {
+            "split" => scene.split_selected_faces(a, &[0, 1]).is_err(),
+            _ => scene.punch_drain_hole_world(a, &hole, &plugged).is_err(),
+        };
+        assert!(failed, "{at}");
+        assert_eq!(scene.mesh(a).unwrap().triangle_count(), before, "{at}");
+        assert_eq!(scene.ids().collect::<Vec<_>>(), [a], "{at}");
+        assert_eq!(scene.restorable_ids().count(), 0, "{at}");
+        assert_valid(&scene, a);
+        if nested {
+            assert_eq!(scene.placement(a), Ok(moved(0.5)), "{at}");
+            scene.end_step().unwrap();
+            assert_eq!(scene.undo(), Ok(true), "{at}");
+            assert_eq!(scene.placement(a), Ok(Placement::IDENTITY), "{at}");
+        }
+        assert!(!scene.can_undo(), "{at}");
+        // And it works the next time.
+        match op {
+            "split" => assert!(scene.split_selected_faces(a, &[0, 1]).is_ok(), "{at}"),
+            _ => assert!(
+                scene.punch_drain_hole_world(a, &hole, &plugged).is_ok(),
+                "{at}"
+            ),
+        }
+        assert_eq!(scene.ids().count(), 2, "{at}");
+    }
 }
 
 #[test]
