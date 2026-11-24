@@ -9,6 +9,7 @@ use fast_mesh_store::{
 };
 
 use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickField};
+use crate::geodesic::GeodesicCache;
 use crate::history::{Change, Done, History};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
@@ -543,6 +544,9 @@ pub(crate) struct Entry {
     /// The mesh's world box, cached across queries (see
     /// [`CachedBox`](crate::query::CachedBox)).
     pub(crate) wbox: Option<CachedBox>,
+    /// The heat method's operators of the mesh, kept between geodesic
+    /// queries. Every change that bumps `content` clears them.
+    pub(crate) geodesics: GeodesicCache,
     /// Lazy `O(1)` stroke-start snapshot for sculpt dabs.
     pub(crate) stroke: StrokeSnapshot,
     /// What the mesh keeps from the scene's registries while it is parked;
@@ -582,6 +586,7 @@ impl Entry {
     /// next update.
     pub(crate) fn report_everything(&mut self) {
         self.content += 1;
+        self.geodesics.clear();
         for r in &mut self.reports {
             r.changes = None;
             r.colors_dirty = None;
@@ -660,6 +665,7 @@ impl Entry {
     /// across the new midpoint vertices).
     pub(crate) fn record_changes_keeping_stroke(&mut self, changes: &ChangeSet) {
         self.content += 1;
+        self.geodesics.clear();
         match &mut self.pending {
             Some(p) => p.merge(changes),
             None => self.pending = Some(changes.clone()),
@@ -1005,6 +1011,7 @@ impl Scene {
             normals: None,
             content: 0,
             wbox: None,
+            geodesics: GeodesicCache::default(),
             stroke: StrokeSnapshot::default(),
             parked: None,
         })

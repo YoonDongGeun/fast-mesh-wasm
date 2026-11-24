@@ -180,6 +180,7 @@ impl Scene {
             self.collision.drop_mesh(id);
             if let Some(entry) = self.entries.get_parked_mut(id) {
                 entry.stroke.invalidate_on_mesh(&mut entry.mesh);
+                entry.geodesics.clear();
                 for (s, r) in self.subscribers.iter_mut().zip(&mut entry.reports) {
                     if r.added {
                         // Never told of it: nothing to report.

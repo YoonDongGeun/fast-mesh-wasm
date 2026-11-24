@@ -25,12 +25,11 @@ use fast_mesh_query::Cull;
 use fast_mesh_scene::{
     BooleanMethod, BooleanOp, BooleanOptions, CoarseAlignMethod, ColorRule, Coloring, Colormap,
     ContactFilter, CsgNode, CurvatureField, CutOptions, Dab, DeviationOptions, DistanceField,
-    FieldBudget, FieldId, GeodesicMethod, GeodesicOptions, IcpObjective, JoinOptions, LandmarkPair,
-    MeshBuild, MeshId, MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane,
-    QualityMetric, RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError,
-    SceneOptions, SceneRayOptions, SceneRepairOps as _, SectionDesc, SectionId, SectionStatus,
-    SignMode, StepState, ThicknessField, TrimCurveOptions, UpdateMode,
-    ops::BooleanOp as OpsBooleanOp,
+    FieldBudget, FieldId, GeodesicJob, IcpObjective, JoinOptions, LandmarkPair, MeshBuild, MeshId,
+    MeshOptions, NotApplied, OutOfRange, OverhangOptions, Placement, Plane, QualityMetric,
+    RegisterOptions, RegistrationOptions, Scene, SceneClosestOptions, SceneError, SceneOptions,
+    SceneRayOptions, SceneRepairOps as _, SectionDesc, SectionId, SectionStatus, SignMode,
+    StepState, ThicknessField, TrimCurveOptions, UpdateMode, ops::BooleanOp as OpsBooleanOp,
 };
 use fast_mesh_store::{Mesh, MeshBuilder};
 use wasm_bindgen::prelude::*;
@@ -45,6 +44,7 @@ use crate::render::{Dirty, Record, RenderState, encode, uvs_reported};
 mod denoise;
 mod extrude;
 mod height_map;
+mod geodesic;
 mod hull;
 mod lattice;
 mod wrap;
@@ -59,6 +59,10 @@ pub struct WasmScene {
     adds: BTreeMap<u32, PendingAdd>,
     /// The id the next `begin_add_mesh_upload` hands out.
     next_add: u32,
+    /// Geodesic queries running in steps, by query id.
+    geodesics: BTreeMap<u32, GeodesicJob>,
+    /// The id the next `begin_geodesic_distances` hands out.
+    next_geodesic: u32,
 }
 
 /// A mesh being added in steps: its inputs still uploading into wasm
@@ -308,6 +312,8 @@ impl WasmScene {
             render: BTreeMap::new(),
             adds: BTreeMap::new(),
             next_add: 0,
+            geodesics: BTreeMap::new(),
+            next_geodesic: 0,
         }
     }
 
@@ -1694,49 +1700,6 @@ impl WasmScene {
         out.push(f64::from(stats.p95));
         out.push(count(stats.sample_count));
         out.extend(values.into_iter().map(f64::from));
-        Ok(out)
-    }
-
-    /// Geodesic distances from `sources` (vertex slot indices) in world units.
-    /// `method`: 0 dijkstra, 1 heatMethod. `max_distance`: `NaN` or `Infinity` -> unbounded.
-    pub fn geodesic_distances(
-        &self,
-        index: u32,
-        generation: u32,
-        sources: &[u32],
-        method: u8,
-        max_distance: f64,
-        time_step_scale: f64,
-    ) -> Result<Vec<f32>, Error> {
-        let id = self.id(index, generation)?;
-        let method = match method {
-            0 => GeodesicMethod::Dijkstra,
-            1 => GeodesicMethod::HeatMethod,
-            _ => {
-                return Err(Error::invalid(
-                    "method must be 0 (dijkstra) or 1 (heatMethod)",
-                ));
-            }
-        };
-        let max_distance = if max_distance.is_nan() || max_distance == f64::INFINITY {
-            None
-        } else {
-            Some(max_distance as f32)
-        };
-        let defaults = GeodesicOptions::default();
-        let time_step_scale = if time_step_scale.is_nan() {
-            defaults.time_step_scale
-        } else {
-            time_step_scale
-        };
-        let opts = GeodesicOptions {
-            method,
-            max_distance,
-            time_step_scale,
-        };
-        let mut out = Vec::new();
-        self.scene
-            .geodesic_distances(id, sources, &opts, &mut out)?;
         Ok(out)
     }
 

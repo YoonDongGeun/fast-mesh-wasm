@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "height_map"
 harness = false
+
+[[bench]]
+name = "geodesic"
+harness = false

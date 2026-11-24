@@ -125,6 +125,7 @@ mod error;
 mod extrude;
 mod fields;
 mod height_map;
+mod geodesic;
 mod history;
 mod hull;
 mod id;
@@ -162,7 +163,7 @@ pub use domains::{
 pub use error::{Result, SceneError};
 pub use extrude::{BasePlane, ExtrudeBaseOptions, ExtrudeBaseReport, ExtrudeFacesOptions};
 pub use fast_mesh_fields::{
-    ColorRule, Colormap, FieldsError, OutOfRange, SignMode, SignStatus, color_of,
+    ColorRule, Colormap, FieldsError, GeodesicPhase, OutOfRange, SignMode, SignStatus, color_of,
 };
 pub use fast_mesh_ops as ops;
 pub use fast_mesh_query::{Fill, Plane};
@@ -172,6 +173,7 @@ pub use fields::{
     OverhangReport, QualityMetric, QualityReport, StepState, ThicknessField,
 };
 pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
+pub use geodesic::GeodesicJob;
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};

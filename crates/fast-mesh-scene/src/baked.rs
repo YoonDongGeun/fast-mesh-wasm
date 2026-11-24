@@ -33,6 +33,16 @@ pub(crate) fn baked_mesh(
     map: impl Fn([f32; 3]) -> [f64; 3],
     options: &BuildOptions,
 ) -> Result<(Mesh, Bvh)> {
+    let baked = baked_copy(mesh, map)?;
+    let bvh = Bvh::build(&baked, options)?;
+    Ok((baked, bvh))
+}
+
+/// [`baked_mesh`] without a BVH.
+///
+/// # Errors
+/// As for [`baked_mesh`].
+pub(crate) fn baked_copy(mesh: &Mesh, map: impl Fn([f32; 3]) -> [f64; 3]) -> Result<Mesh> {
     let mut positions: Vec<f32> = Vec::new();
     positions
         .try_reserve(mesh.vertex_slots().saturating_mul(3))
@@ -73,8 +83,7 @@ pub(crate) fn baked_mesh(
         }
         let _ = tx.commit()?;
     }
-    let bvh = Bvh::build(&baked, options)?;
-    Ok((baked, bvh))
+    Ok(baked)
 }
 
 #[cfg(test)]
