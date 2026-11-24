@@ -342,6 +342,15 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
       },
     },
     {
+      id: "tool:print-lattice",
+      title: "Print Prep: Lattice Infill",
+      category: "Tool",
+      keywords: "lattice infill gyroid schwarz diamond minimal surface lightweight fill cavity hollow walls cell print prep",
+      run: () => {
+        app.setActiveTab("edit");
+      },
+    },
+    {
       id: "tool:print-drain-hole",
       title: "Print Prep: Punch Drain Hole",
       category: "Tool",

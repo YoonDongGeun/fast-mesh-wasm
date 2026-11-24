@@ -6455,8 +6455,8 @@ export class Scene implements SceneLike {
    *
    * Lengths and volumes are measured in the world. The cells are aligned with
    * the mesh's own axes, around the middle of its bounds. Its UVs are
-   * dropped. A lattice has many triangles (about 600 per cell at ten voxels
-   * a cell, 3,700 at 25) and takes seconds at a few million: use
+   * dropped. A lattice has many triangles (about 2,000 per gyroid cell at ten
+   * voxels a cell, 12,000 at 25) and takes seconds at a few million: use
    * `WorkerScene.latticeFill` to keep the page live.
    *
    * @throws {FastMeshError} `INVALID_ARGUMENT` for bad options, a mesh that is

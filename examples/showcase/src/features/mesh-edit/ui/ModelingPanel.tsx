@@ -1,6 +1,6 @@
 // Modeling & Resampling panel (#195): Boolean CSG (with Keep originals), destructive Plane Cut,
 // Offset & Shell (Solidify), Quadric Simplify, and Loop Subdivide; then the Print Prep sections
-// (#236): Hollow Mesh, Drain Hole and Surface Stamp (a built-in, text or
+// (#236): Hollow Mesh, Lattice Infill (#265), Drain Hole and Surface Stamp (a built-in, text or
 // scene stamp; text since #260). What they do lives in
 // `ux/use-modeling-ops.ts` and `ux/use-print-prep-ops.ts`.
 import type { HollowBackend, PlaceUpAxis } from "fast-mesh-wasm";
@@ -22,6 +22,7 @@ import { findCenterSurfaceHit } from "./HollowPlaceToolsLayer";
 import { BatchBooleanSection } from "./BatchBooleanSection";
 import { ExtrudeSection } from "./ExtrudeSection";
 import { IsotropicRemeshSection } from "./IsotropicRemeshSection";
+import { LatticeSection } from "./LatticeSection";
 import { TextStampFields } from "./TextStampFields";
 
 export function ModelingPanel(props: { app: AppState }) {
@@ -482,6 +483,15 @@ export function ModelingPanel(props: { app: AppState }) {
               </button>
             </div>
           </div>
+
+          {/* ---- 5b. Lattice Infill (#265) ---- */}
+          <LatticeSection
+            app={app}
+            store={store}
+            activeItem={activeItem}
+            units={units}
+            disabled={disabled || prep.prepBusy !== null}
+          />
 
           <div className="op" data-modeling-drain-section>
             <span className="muted">6. Print Prep — Drain Hole</span>

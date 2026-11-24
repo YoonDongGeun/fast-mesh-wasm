@@ -21,6 +21,10 @@ import type {
   IcpObjective,
   LandmarkAlignment,
   LandmarkPair,
+  LatticeOptions,
+  LatticePlan,
+  LatticePreview,
+  LatticeReport,
   MeshHandle,
   OffsetAlgorithm,
   OffsetReport,
@@ -985,6 +989,39 @@ export async function planWrap(params: {
   const { scene } = params.store;
   const meshes = params.sources.map((i) => i.mesh);
   return isWorkerScene(scene) ? scene.wrapPlan(meshes, params.options) : asSyncScene(scene).wrapPlan(meshes, params.options);
+}
+
+/** The voxel grid a lattice fill of `mesh` with `options` takes (#265), without running it. */
+export async function planLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticePlan> {
+  const { scene } = params.store;
+  return (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticePlan(params.mesh, params.options);
+}
+
+/** The walls of that lattice on a coarse grid, in the mesh's local frame; the mesh stays as it is. */
+export async function previewLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticePreview> {
+  const { scene } = params.store;
+  return (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticePreview(params.mesh, params.options);
+}
+
+/** Fills `mesh` with a lattice (#265): one undo step, on the Worker when the scene runs there. */
+export async function fillLattice(params: {
+  store: SceneStore;
+  mesh: MeshHandle;
+  options: LatticeOptions;
+}): Promise<LatticeReport> {
+  const { store, mesh, options } = params;
+  const { scene } = store;
+  const r = await (isWorkerScene(scene) ? scene : asSyncScene(scene)).latticeFill(mesh, options);
+  store.commitFrame();
+  return r;
 }
 
 /** What a wrap action added: its list item, and the wrap's counts and grid. */

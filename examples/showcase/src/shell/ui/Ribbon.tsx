@@ -473,6 +473,9 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
               <button type="button" data-ribbon-focus="hollow" onClick={() => focusElement("[data-modeling-hollow-section]")}>
                 Hollow
               </button>
+              <button type="button" data-ribbon-focus="lattice" onClick={() => focusElement("[data-lattice-cell]")}>
+                Lattice
+              </button>
               <button type="button" data-ribbon-focus="drain" onClick={() => focusElement("[data-modeling-drain-section]")}>
                 Drain Hole
               </button>

@@ -266,8 +266,8 @@ src/
                  triangle quality maps; geodesic distance, surface paths, trim and split; object info, box and
                  normals overlays, quality report
     mesh-edit/   boolean (two or N-way), plane cut, offset and shell, extrude (faces, base), convex hull,
-                 resample, isotropic remesh, hollow, place mesh, text (its font in fonts/), image to
-                 relief
+                 resample, isotropic remesh, hollow, lattice infill, place mesh, text (its font in
+                 fonts/), image to relief
     mesh-repair/ analysis, healer overlays, repairs, auto repair, denoise, Delaunay flips, wrap
     sculpt/      brushes, mask, dyntopo, free-form deformation
     points/      point clouds, primitive fitting, contours, convex hull

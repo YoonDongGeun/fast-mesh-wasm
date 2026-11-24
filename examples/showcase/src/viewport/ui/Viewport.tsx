@@ -47,6 +47,7 @@ import { buildHealerOverlayGroup, disposeHealerOverlayGroup } from "../../featur
 import { DeformHandlesLayer } from "../../features/sculpt/ui/DeformHandlesLayer";
 import { FaceSelectionLayer } from "../../features/select/ui/FaceSelectionLayer";
 import { HollowPlaceToolsLayer } from "../../features/mesh-edit/ui/HollowPlaceToolsLayer";
+import { LatticePreviewLayer, LatticeSeeThrough } from "../../features/mesh-edit/ui/LatticePreviewLayer";
 import { MetrologyOverlaysLayer } from "../../features/points/ui/MetrologyOverlaysLayer";
 import { PlacementPicksLayer } from "../../features/transform/ui/PlacementPicksLayer";
 import { PolylineLayer } from "../../features/polylines/ui/PolylineLayer";
@@ -228,6 +229,7 @@ export function Viewport(props: {
       <DeformHandlesLayer app={app} store={store} />
       <MetrologyOverlaysLayer app={app} store={store} />
       <HollowPlaceToolsLayer app={app} store={store} />
+      <LatticePreviewLayer app={app} store={store} />
       <PlacementPicksLayer app={app} store={store} />
       <AlignToolsLayer app={app} store={store} />
       <SurfacePathLayer app={app} store={store} />
@@ -368,6 +370,7 @@ function MeshView(props: {
       />
       <RepairOverlays app={app} scene={scene} item={item} bound={bound} />
       <SculptMaskOverlay app={app} item={item} bound={bound} />
+      <LatticeSeeThrough app={app} mesh={item.mesh} bound={bound} />
       <SurfaceFieldOverlay app={app} item={item} bound={bound} />
     </>
   );
