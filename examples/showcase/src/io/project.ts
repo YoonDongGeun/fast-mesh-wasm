@@ -9,6 +9,13 @@
 // failing the whole file. Mesh geometry rides as base64 little-endian bytes
 // (f64 positions, u32 indices), so a round trip is bit-exact.
 //
+// Origins (issue #276): a mesh's positions are relative to its `f64` origin,
+// as the engine stores them, and `origin` is that point, added back on load.
+// Files from before it was stored have no `origin`, and no way to tell it:
+// they open as they always did, their positions taken as they are (`version`
+// stays 1, the field is additive). With an origin far out, positions near it
+// come back to about `f64` rounding there, 1e-11 at 1e5.
+//
 // Units (issue #145): positions are in the world unit, millimetres, whatever
 // the display unit. `units` names how the project displays them; a mesh's
 // `importScale` records how its file's numbers became millimetres. That
@@ -29,6 +36,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import type { DistanceColoring } from "fast-mesh-wasm/store";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import type { AppState } from "../app/state/app-state";
+import { extractLiveMeshData } from "../engine/workbench-ops";
 import { type ImportScale, isImportUnit, type LengthUnit, NO_IMPORT_SCALE } from "../shared/ux/units";
 import { makeCurve, type Polyline } from "../features/polylines/ux/polyline";
 import { bounds } from "./mesh-data";
@@ -74,10 +82,12 @@ export interface ProjectMesh {
   color: number;
   opacity: number;
   visible: boolean;
-  /** Base64 of the local positions as little-endian f64. */
+  /** Base64 of the local positions (relative to `origin`) as little-endian f64. */
   positions: string;
   /** Base64 of the indices as little-endian u32. */
   indices: string;
+  /** The mesh's origin (absent in older files: zero, whatever it was). */
+  origin?: [x: number, y: number, z: number];
   placement: ProjectPlacement;
   coloring: ProjectColoring | null;
   /** How the positions became mm on load (absent: as they were). Already applied: provenance only. */
@@ -226,6 +236,7 @@ export interface ProjectMeshInput {
   visible: boolean;
   positions: ArrayLike<number>;
   indices: ArrayLike<number>;
+  origin?: readonly [x: number, y: number, z: number];
   rotation: ArrayLike<number>;
   translation: [x: number, y: number, z: number];
   scale?: [x: number, y: number, z: number];
@@ -260,6 +271,7 @@ export function buildProjectDoc(input: {
       visible: m.visible,
       positions: encodeF64(m.positions),
       indices: encodeU32(m.indices),
+      ...(m.origin === undefined ? {} : { origin: [...m.origin] as [number, number, number] }),
       placement: {
         rotation: Array.from(m.rotation),
         translation: [...m.translation] as [number, number, number],
@@ -444,6 +456,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
     const translation = numTriple(placement.translation) ?? [0, 0, 0];
     const scaleRaw = numTriple(placement.scale);
     const scale = scaleRaw !== null && scaleRaw.every((n) => n > 0) ? (scaleRaw as [number, number, number]) : undefined;
+    const origin = numTriple(raw.origin);
     const importScale = readImportScale(raw.importScale);
     meshes.push({
       name: typeof raw.name === "string" && raw.name !== "" ? raw.name : `Mesh ${meshes.length + 1}`,
@@ -452,6 +465,7 @@ export function parseProjectDoc(text: string): ProjectDoc {
       visible: raw.visible === undefined ? true : raw.visible === true,
       positions: encodeF64(positions),
       indices: encodeU32(indices),
+      ...(origin === null ? {} : { origin }),
       placement: {
         rotation,
         translation,
@@ -519,7 +533,12 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
   return buildProjectDoc({
     meshes: items.map((item) => {
       const display = snap.meshes.get(item.mesh)?.desired ?? { coloring: null, opacity: 1, visible: true };
+      // Without the slots an edit left dead: their triangles would come back
+      // as ones on vertex 0. A mesh with nothing else keeps them, to be listed.
+      const live = extractLiveMeshData(store.scene, item.mesh);
       const views = store.scene.views(item.mesh);
+      const [positions, indices] =
+        live.indices.length > 0 ? [live.positions, live.indices] : [views.positions(), views.indices()];
       const placement = store.scene.placement(item.mesh);
       const coloring = display.coloring;
       const targets =
@@ -533,8 +552,9 @@ export function collectProject(store: SceneStore, app: AppState): ProjectDoc {
         color: item.color,
         opacity: display.opacity,
         visible: display.visible,
-        positions: views.positions(),
-        indices: views.indices(),
+        positions,
+        indices,
+        origin: live.origin,
         rotation: placement.rotation,
         translation: [placement.translation[0], placement.translation[1], placement.translation[2]],
         ...(placement.scale === undefined ? {} : { scale: [placement.scale[0], placement.scale[1], placement.scale[2]] as [number, number, number] }),
@@ -592,13 +612,19 @@ export function restoreProject(store: SceneStore, app: AppState, doc: ProjectDoc
   for (const mesh of doc.meshes) {
     const positions = decodeF64(mesh.positions, "positions");
     const indices = decodeU32(mesh.indices, "indices");
+    const { origin } = mesh;
+    if (origin !== undefined) {
+      for (let k = 0; k < positions.length; k++) {
+        positions[k] += origin[k % 3];
+      }
+    }
     const { center, radius } = bounds(positions);
     // The positions as stored, already in mm: `importScale` only rides along.
     const item = app.addMesh(store, {
       name: mesh.name,
       positions,
       indices,
-      center,
+      center: origin ?? center,
       radius,
       volumeId: null,
       preset: null,

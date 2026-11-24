@@ -1,8 +1,9 @@
 // Meshes whose f64 origin is far from the world origin: Duplicate and the
-// other tools that rebuild a mesh from another's buffers (#272) keep their
-// world shapes, and what is centred on a mesh (#277: the camera, the section
-// plane, the clip box, contour slices) is centred on it there. With any
-// origin, rotation and scale, on the sync `Scene` and on a Worker.
+// other tools that rebuild a mesh from another's buffers (#272) and a project
+// saved and reopened (#276) keep their world shapes, and what is centred on a
+// mesh (#277: the camera, the section plane, the clip box, contour slices) is
+// centred on it there. With any origin, rotation and scale, on the sync
+// `Scene` and on a Worker.
 import { Worker } from "node:worker_threads";
 import { type MeshHandle, type Placement, Scene, type SceneLike, type Vec3 } from "fast-mesh-wasm";
 import { createSceneStore, type SceneStore } from "fast-mesh-wasm/store";
@@ -22,6 +23,7 @@ import { fitWorldBox, sectionActions, sectionCenter, sectionReadout } from "../s
 import { applyDyntopoRoi } from "../src/features/sculpt/ux/sculpt";
 import { computeSceneBounds } from "../src/features/view/ux/camera";
 import { blobbySphere } from "../src/io/demo";
+import { buildProjectDoc, collectProject, parseProjectDoc, type ProjectDoc, restoreProject } from "../src/io/project";
 import { worldCenter } from "../src/shared/ux/mesh-center";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -317,6 +319,102 @@ for (const [mode, open] of [
       // Across the box's corners, along their normals: the world box is 2 wide.
       expect(r.summary!.max).toBeLessThan(2 * Math.sqrt(3) + 0.01);
       expect(r.summary!.max).toBeGreaterThan(1);
+    });
+
+    it("is saved and reopened where it is, with its origin", async () => {
+      const h = await open();
+      const { store, app } = h;
+      const still = { rotation: [1, 0, 0, 0, 1, 0, 0, 0, 1], translation: [0, 0, 0] as V3, scale: [1, 1, 1] as V3 };
+      addBox(h, "Far", 2, ORIGIN);
+      addBox(h, "Placed", 2, ORIGIN, PLACEMENT);
+      addBox(h, "Off centre", 1, [10, 20, 30], { ...still, translation: [0, 0, 5], scale: [1, 1, 2] });
+      addBox(h, "Back home", 1, ORIGIN, { ...still, translation: [-ORIGIN[0], -ORIGIN[1], -ORIGIN[2]] });
+      addBox(h, "Home", 1, [0, 0, 0]);
+      addBall(h, "Ball", ORIGIN, [ORIGIN[0] + 7, ORIGIN[1], ORIGIN[2]]);
+      await h.settle();
+      const sources = [...app.getSnapshot().items];
+      const doc = collectProject(store, app);
+
+      const other = await open();
+      restoreProject(other.store, other.app, parseProjectDoc(JSON.stringify(doc)));
+      await other.settle();
+      const [scene, reopened] = [store.scene as Scene, other.store.scene as Scene];
+      const items = other.app.getSnapshot().items;
+      expect(items.map((i) => i.name)).toEqual(sources.map((i) => i.name));
+      items.forEach((item, k) => {
+        const source = sources[k];
+        const digits = item.name === "Ball" ? 8 : 10;
+        expectBounds(worldBounds(reopened, item.mesh), worldBounds(scene, source.mesh), digits);
+        expect(reopened.origin(item.mesh)).toEqual(scene.origin(source.mesh));
+        expect(reopened.placement(item.mesh)).toEqual(scene.placement(source.mesh));
+        expect(item.center).toEqual(source.center);
+      });
+      expect(items[0].radius).toBeCloseTo(sources[0].radius, 6);
+      // Saved again: the same file.
+      expect(collectProject(other.store, other.app)).toEqual(doc);
+    });
+
+    it("is saved and reopened where it is after an edit", async () => {
+      const h = await open();
+      const { store, app } = h;
+      const far = addBox(h, "Far", 2, ORIGIN, PLACEMENT);
+      await h.settle();
+      // All but the top of the box goes: vertex 0 is not used any more.
+      await h.settle(store.edit(far.mesh, [{ op: "removeTriangles", triangles: [0, 1, 4, 5, 6, 7, 8, 9, 10, 11] }]));
+      const before = worldBounds(store.scene, far.mesh);
+      const box = (store.scene as Scene).bounds(far.mesh);
+      const doc = parseProjectDoc(JSON.stringify(collectProject(store, app)));
+      const other = await open();
+      restoreProject(other.store, other.app, doc);
+      await other.settle();
+      const [item] = other.app.getSnapshot().items;
+      expect(worldBounds(other.store.scene, item.mesh)).toEqual(before);
+      expect((other.store.scene as Scene).bounds(item.mesh)).toEqual(box);
+    });
+
+    it("opens from a project without origins where it always did: its stored positions are taken as they are", async () => {
+      // Projects saved before origins were stored hold positions relative to
+      // an origin that cannot be told any more. They keep opening as if it
+      // were zero: at those positions, under the stored placement.
+      const h = await open();
+      const { store, app } = h;
+      const local = boxGeometry(2, [0, 0, 0]);
+      const doc = buildProjectDoc({
+        meshes: [undefined, PLACEMENT].map((p, k) => ({
+          name: `Old ${k}`,
+          color: 0xd9735f,
+          opacity: 1,
+          visible: true,
+          positions: local.positions,
+          indices: local.indices,
+          rotation: p?.rotation ?? rotation(0, 0),
+          translation: [...(p?.translation ?? [1, 2, 3])] as V3,
+          ...(p === undefined ? {} : { scale: [...p.scale!] as V3 }),
+          coloring: null,
+        })),
+        sections: [],
+        selection: null,
+        wireframe: false,
+        edgeSoftness: 0,
+      });
+      expect(doc.meshes.some((m) => "origin" in m)).toBe(false);
+      restoreProject(store, app, parseProjectDoc(JSON.stringify(doc)));
+      await h.settle();
+      const [plain, placed] = app.getSnapshot().items;
+      expect(worldBounds(store.scene, plain.mesh)).toEqual({ min: [-1, 0, 1], max: [3, 4, 5] });
+      expect(plain.center).toEqual([0, 0, 0]);
+      const { translation: t, scale: s } = PLACEMENT;
+      const r = Array.from(PLACEMENT.rotation);
+      const reach = [0, 1, 2].map((a) => 2 * [0, 1, 2].reduce((sum, b) => sum + Math.abs(r[3 * a + b]) * s![b], 0));
+      expectBounds(worldBounds(store.scene, placed.mesh), {
+        min: [t[0] - reach[0], t[1] - reach[1], t[2] - reach[2]],
+        max: [t[0] + reach[0], t[1] + reach[1], t[2] + reach[2]],
+      });
+      // As does one whose origin is not three numbers.
+      const bad = JSON.parse(JSON.stringify(doc)) as ProjectDoc;
+      Object.assign(bad.meshes[0], { origin: [1, "x", 3] });
+      Object.assign(bad.meshes[1], { origin: [1, 2] });
+      expect(parseProjectDoc(JSON.stringify(bad))).toEqual(parseProjectDoc(JSON.stringify(doc)));
     });
 
     it("has the section plane, the clip box and contour slices centred on it", async () => {

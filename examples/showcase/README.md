@@ -214,9 +214,10 @@ pnpm --filter fast-mesh-wasm-example-showcase dev   # or: build, then preview
 
   The display unit is per project with a global default: a project file stores its own (`units`),
   a file without one takes the default, and picking a unit by hand also sets the default. Opening a
-  project never changes the default. The file stores each mesh's positions in mm, and its
-  `importScale` as provenance only, so reopening cannot scale a mesh twice. Kept polylines are stored
-  in mm too, and their SVG and DXF files are in mm.
+  project never changes the default. The file stores each mesh's positions in mm, with the origin
+  they are relative to (a file from before origins were stored opens as it always did, its positions
+  taken as they are), and its `importScale` as provenance only, so reopening cannot scale a mesh
+  twice. Kept polylines are stored in mm too, and their SVG and DXF files are in mm.
 - **Settings.** Display prefs (theme, panel visibility and widths, wireframe, boundary softness,
   repair overlays, collision mode, the last-used heatmap sliders, the default display unit, the view
   box's projection, scale indicator and axis basis) persist in localStorage across
@@ -247,7 +248,7 @@ src/
   app/           App.tsx; ux/ (shortcuts, file drop, loading, display settings); state/ (app state,
                  tool state, readouts); testing/ (window.__showcase)
   shell/         ribbon, status bar, command search, help and tour
-  shared/        units, persisted settings, LengthInput
+  shared/        units, persisted settings, mesh centres, LengthInput
   viewport/      the canvas (ui/Viewport.tsx); ux/: selection clicks, the sculpt stroke and mask paint
                  drivers, camera and gizmo control, raycasts, the view registry, touch, clip planes
   engine/        the workbench op bridge and the lazy wasm loader
