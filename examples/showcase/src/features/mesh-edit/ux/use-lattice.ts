@@ -4,11 +4,12 @@
 // one at a time), and the fill as one undo step, with a one-line report. The
 // engine calls are `engine/workbench-ops.ts`'s `planLattice`,
 // `previewLattice` and `fillLattice`: on the Worker when the scene is there,
-// so the page stays live.
+// so the page stays live. Nothing is planned or previewed while another
+// tab's panels show (this one stays mounted): a plan reads the whole mesh.
 import type { LatticePlan } from "fast-mesh-wasm";
 import type { SceneStore } from "fast-mesh-wasm/store";
 import { useEffect, useRef, useState } from "react";
-import type { AppState, Item } from "../../../app/state/app-state";
+import { type AppState, type Item, useApp } from "../../../app/state/app-state";
 import { fillLattice, planLattice, previewLattice } from "../../../engine/workbench-ops";
 import type { LengthUnit } from "../../../shared/ux/units";
 import { worldExtent } from "../../mesh-repair/ux/wrap";
@@ -31,7 +32,11 @@ export interface LatticeLine {
   error: boolean;
 }
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+/** An engine error as a sentence, without the engine's own preamble. */
+function message(e: unknown): string {
+  const text = (e instanceof Error ? e.message : String(e)).replace(/^repair operation failed: (invalid input: )?/, "");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
 
 export function useLattice(args: {
   app: AppState;
@@ -42,9 +47,10 @@ export function useLattice(args: {
 }) {
   const { app, store, activeItem, units } = args;
   const shown = latticePreviewOf(app);
+  const open = useApp(app, (s) => s.activeTab === "edit");
   const [settings, setSettings] = useState<LatticeSettings>(DEFAULT_LATTICE_SETTINGS);
   const [extent, setExtent] = useState(0);
-  const [plan, setPlan] = useState<{ plan: LatticePlan | null; error: string | null }>({ plan: null, error: null });
+  const [plan, setPlan] = useState<{ plan: LatticePlan | null; error: LatticeLine | null }>({ plan: null, error: null });
   const [previewing, setPreviewing] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewLine, setPreviewLine] = useState<LatticeLine | null>(null);
@@ -82,6 +88,9 @@ export function useLattice(args: {
   useEffect(() => {
     const n = ++planned.current;
     const item = itemRef.current;
+    if (!open) {
+      return;
+    }
     if (item === null) {
       setExtent(0);
       setPlan({ plan: null, error: null });
@@ -91,7 +100,7 @@ export function useLattice(args: {
       const { size, problem, options } = optionsFor(item);
       setExtent(size);
       if (problem !== null) {
-        setPlan({ plan: null, error: size > 0 ? problem : null });
+        setPlan({ plan: null, error: size > 0 ? { text: problem, error: true } : null });
         return;
       }
       planLattice({ store, mesh: item.mesh, options }).then(
@@ -99,12 +108,13 @@ export function useLattice(args: {
           if (n === planned.current) setPlan({ plan: p, error: null });
         },
         (e: unknown) => {
-          if (n === planned.current) setPlan({ plan: null, error: message(e) });
+          // A mesh no lattice fits in (an open scan, say) is not the form's fault.
+          if (n === planned.current) setPlan({ plan: null, error: { text: message(e), error: false } });
         },
       );
     }, LATTICE_PLAN_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [store, mesh, settings, revision]);
+  }, [store, open, mesh, settings, revision]);
 
   // The preview follows them too while it is on. One runs at a time; what
   // changed meanwhile starts the next, with the settings it finds then.
@@ -154,6 +164,11 @@ export function useLattice(args: {
   buildOptions.current = optionsFor;
   const buildRef = useRef(build);
   buildRef.current = build;
+  useEffect(() => {
+    if (!open) {
+      setPreviewing(false);
+    }
+  }, [open]);
   useEffect(() => {
     if (!previewing || mesh === null) {
       shown.show(null);

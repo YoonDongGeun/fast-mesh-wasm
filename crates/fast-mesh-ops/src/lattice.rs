@@ -519,7 +519,8 @@ fn fine_voxel(o: &LatticeOptions, region: LatticeRegion) -> Result<f32> {
 /// Grid nodes along each axis for a mesh of these extents.
 fn grid_dims(extent: [f64; 3], h: f32) -> [usize; 3] {
     extent.map(|e| {
-        let cells = (e / f64::from(h) + 2.0 * PAD_VOXELS).ceil();
+        // A voxel size that divides the extent does, whatever `f32` rounds.
+        let cells = (e / f64::from(h) + 2.0 * PAD_VOXELS - 1e-3).ceil();
         // Past a billion the plan never fits; kept below overflow.
         cells.min(1e9) as usize + 1
     })

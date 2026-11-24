@@ -147,8 +147,8 @@ export function LatticeSection(props: {
         </button>
       </div>
       {l.planError !== null ? (
-        <p className="report error" data-lattice-plan role="alert">
-          {l.planError}
+        <p className={l.planError.error ? "report error" : "muted small"} data-lattice-plan role="status">
+          {l.planError.text}
         </p>
       ) : l.plan !== null ? (
         <p className={l.plan.fits ? "muted small" : "report error"} data-lattice-plan>
