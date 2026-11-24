@@ -13,6 +13,8 @@ import { CollisionPanel } from "../features/collision/ui/CollisionPanel";
 import { CommandPalette } from "../shell/ui/CommandPalette";
 import { CreatePrimitiveDialog } from "../features/home/ui/CreatePrimitiveDialog";
 import { TextDialog } from "../features/mesh-edit/ui/TextDialog";
+import { ReliefDialog } from "../features/mesh-edit/ui/ReliefDialog";
+import { useReliefDrop } from "../features/mesh-edit/ux/use-relief-drop";
 import { DeformPanel } from "../features/sculpt/ui/DeformPanel";
 import { ExportPanel } from "../features/home/ui/ExportPanel";
 import { GroupsBar } from "../features/collision/ui/GroupsBar";
@@ -140,7 +142,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
     tourStep,
     endTour,
   });
-  const dropping = useFileDrop(load);
+  const dropping = useFileDrop(useReliefDrop(app, load));
 
   const activateTabForSlot = (targetTab: WorkbenchTab) => {
     app.setActiveTab(targetTab);
@@ -207,6 +209,7 @@ export function App(props: { engine: Engine; app: AppState; loader: Loader }) {
         <ViewportNavigationHud app={app} />
         <CreatePrimitiveDialog app={app} />
         <TextDialog app={app} />
+        <ReliefDialog app={app} />
         <p className="hint">
           {viewportHint({
             sculpting: sculpt !== null,

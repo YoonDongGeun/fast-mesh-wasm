@@ -25,6 +25,8 @@ import { readWorldBoxes } from "../../features/build-plate/ux/footprint";
 import { curveLength, pointCount } from "../../features/polylines/ux/polyline";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
+import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
+import { DEFAULT_HEIGHT_MAP, exportHeightMap, frameOptions, type HeightMapView, viewAxes } from "../../features/home/ux/height-map-export";
 
 export function installTestHook(
   store: SceneStore,
@@ -67,6 +69,21 @@ export function installTestHook(
     textDialog: () => {
       const d = textDialogOf(app).getSnapshot();
       return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** The Image to Relief dialog: whether it is open, and the preview's triangles (0 with none). */
+    reliefDialog: () => {
+      const d = reliefDialogOf(app).getSnapshot();
+      return { open: d.open, previewTriangles: (d.preview?.mesh.indices.length ?? 0) / 3 };
+    },
+    /** Exports a height map of the named mesh, without the downloads: the PNG's bytes, the JSON and the pixels that see a surface. */
+    heightMap: async (name: string, from: HeightMapView = "top", resolution = DEFAULT_HEIGHT_MAP.resolution) => {
+      const axes = viewAxes(from, view.camera);
+      if (axes === null) {
+        throw new Error("no camera");
+      }
+      const options = frameOptions({ ...DEFAULT_HEIGHT_MAP, view: from, resolution }, axes);
+      const out = await exportHeightMap(engine.scene, [find(name)], options);
+      return { png: Array.from(out.png.bytes), json: JSON.parse(out.json.text) as unknown, seen: out.seen };
     },
     /** What the mesh's list picture cost, and how many were started and finished. */
     meshPreview: (name: string) => meshPreviewStats(find(name).mesh),

@@ -7,6 +7,7 @@ import type { MeshHandle } from "fast-mesh-wasm";
 import type { AppState, CameraPreset, DiagnosticShadingMode, Item, WorkbenchTab } from "../../app/state/app-state";
 import { buildPlateCommands } from "../../features/build-plate/ux/build-plate-commands";
 import { createPrimitiveCommands } from "../../features/home/ux/create-commands";
+import { reliefCommands } from "../../features/mesh-edit/ux/relief-commands";
 import { textCommands } from "../../features/mesh-edit/ux/text-commands";
 import { polylineCommands } from "../../features/polylines/ux/polyline-commands";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
@@ -152,6 +153,7 @@ export function buildCommandPaletteItems(ctx: CommandPaletteContext): CommandPal
   cmds.push(...textCommands(app));
   cmds.push(...buildPlateCommands(app, items.length > 0, selection !== null));
   cmds.push(...polylineCommands(app));
+  cmds.push(...reliefCommands(app));
 
   cmds.push(
     {

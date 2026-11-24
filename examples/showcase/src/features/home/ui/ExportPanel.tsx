@@ -1,12 +1,14 @@
 // The export panel (issue #127): the selected mesh out to STL/OBJ/PLY/glTF,
-// the inspect section's contours out to DXF/SVG, and the collision summary
-// out to CSV (the actions in `ux/export-actions`). Errors show in the panel;
+// the inspect section's contours out to DXF/SVG, the collision summary
+// out to CSV (the actions in `ux/export-actions`), and a height map of meshes
+// out to a 16-bit PNG (#267, `HeightMapSection`). Errors show in the panel;
 // cancelling never applies (downloads have no picker to cancel).
 import type { Scene } from "fast-mesh-wasm";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
 import type { AppState } from "../../../app/state/app-state";
 import { exportFileName, type MeshExportFormat } from "../../../io/export";
 import { MESH_FORMATS, useExportActions } from "../ux/export-actions";
+import { HeightMapSection } from "./HeightMapSection";
 
 export function ExportPanel(props: { app: AppState; scene: Scene | WorkerScene }) {
   const { app, scene } = props;
@@ -78,6 +80,7 @@ export function ExportPanel(props: { app: AppState; scene: Scene | WorkerScene }
           Collision CSV
         </button>
       </div>
+      <HeightMapSection app={app} scene={scene} picked={picked} />
       {message !== null ? (
         <p className="error" role="alert">
           {message}

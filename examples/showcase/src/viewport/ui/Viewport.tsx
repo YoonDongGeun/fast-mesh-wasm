@@ -27,6 +27,7 @@ import { BuildPlateLayer } from "../../features/build-plate/ui/BuildPlateLayer";
 import { InspectLayers } from "../../features/inspect/ui/InspectLayers";
 import { CreatePreviewLayer } from "../../features/home/ui/CreatePreviewLayer";
 import { TextPreviewLayer } from "../../features/mesh-edit/ui/TextPreviewLayer";
+import { ReliefPreviewLayer } from "../../features/mesh-edit/ui/ReliefPreviewLayer";
 import { SceneSlices } from "../../features/ct/ui/SceneSlices";
 import { SceneVolume } from "../../features/ct/ui/SceneVolume";
 import { matchVolume } from "../../features/ct/ux/volume-box";
@@ -234,6 +235,7 @@ export function Viewport(props: {
       <CreatePreviewLayer app={app} />
       <TextPreviewLayer app={app} />
       <BuildPlateLayer app={app} />
+      <ReliefPreviewLayer app={app} />
     </Canvas>
   );
 }

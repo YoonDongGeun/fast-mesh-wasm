@@ -43,6 +43,7 @@ import type { AppState, Item, OverlayBand, SurfaceColormap, SurfaceFieldState } 
 import { selectMesh } from "../features/select/ux/selection";
 import { liveVertexIds } from "../features/transform/ux/transform-math";
 import type { BooleanMethod, BooleanOptions, CsgNode, IsotropicRemeshOptions, SurfaceRemeshReport } from "fast-mesh-wasm";
+import type { Heightfield, PlacementInput, PrimitiveMesh } from "fast-mesh-wasm";
 import type { WrapOptions, WrapPlan, WrapResult } from "fast-mesh-wasm";
 import {
   batchBooleanTree,
@@ -52,6 +53,7 @@ import {
   localToWorld,
   remapCorners,
 } from "../features/mesh-edit/ux/batch-boolean";
+import { ensureWave6Wasm } from "./wave6-wasm-lazy";
 
 export type MirrorAxis = "x" | "y" | "z";
 export type BooleanOperation = BooleanOp;
@@ -1007,6 +1009,42 @@ export async function runWrap(params: {
   const { mesh, ...counts } = isWorkerScene(scene)
     ? await scene.wrap(meshes, options)
     : asSyncScene(scene).wrap(meshes, options);
+  const item = app.adoptSceneMesh(store, mesh, name);
+  selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
+  store.commitFrame();
+  return { item, ...counts };
+}
+
+/**
+ * The buffers of a relief of `field` (#267), generated where the engine runs:
+ * in the Worker scene's Worker, or on the main thread for the synchronous
+ * `Scene` (`?local`). The scene is not touched.
+ */
+export function generateRelief(scene: SceneLike, field: Heightfield): Promise<PrimitiveMesh> {
+  if (isWorkerScene(scene)) {
+    return scene.generateHeightfield(field);
+  }
+  return ensureWave6Wasm().then((m) => m.generateHeightfield(field));
+}
+
+/**
+ * Adds the relief of `field` (#267) as a new mesh named `name` at `placement`,
+ * lists it and selects it. The engine builds it, on the Worker when the scene
+ * runs there (only the heights cross), and adds it as one undo step: undo
+ * removes it.
+ */
+export async function runAddRelief(params: {
+  store: SceneStore;
+  app: AppState;
+  name: string;
+  field: Heightfield;
+  placement: PlacementInput;
+}): Promise<{ item: Item; vertices: number; triangles: number }> {
+  const { store, app, name, field, placement } = params;
+  const scene = store.scene;
+  const { mesh, ...counts } = isWorkerScene(scene)
+    ? await scene.addHeightfield(field, { placement })
+    : asSyncScene(scene).addHeightfield(field, { placement });
   const item = app.adoptSceneMesh(store, mesh, name);
   selectMesh(app, (m) => store.select(m), store.getSnapshot().selection, item.mesh, false);
   store.commitFrame();

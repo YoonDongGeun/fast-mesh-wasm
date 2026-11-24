@@ -9,6 +9,7 @@ import type { DyntopoMode, MeshHandle } from "fast-mesh-wasm";
 import type { AppState, WorkbenchTab } from "../../app/state/app-state";
 import { ARRANGE_SCOPE, CLONE_COPIES, toggleBuildPlate } from "../../features/build-plate/ux/build-plate-commands";
 import { createDialogOf } from "../../features/home/ux/create-dialog-state";
+import { reliefDialogOf } from "../../features/mesh-edit/ux/relief-dialog-state";
 import { textDialogOf } from "../../features/mesh-edit/ux/text-dialog-state";
 import { SURFACE_CLEANUP_COMMANDS } from "../../features/mesh-repair/ux/surface-cleanup";
 import { DYNTOPO_MODE_OPTIONS } from "../../features/sculpt/ux/sculpt";
@@ -236,6 +237,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                 onClick={() => textDialogOf(app).open()}
               >
                 Create Text…
+              </button>
+              <button
+                type="button"
+                data-ribbon-focus="height-map"
+                title="Export an orthographic depth image as a 16-bit PNG"
+                onClick={() => focusElement('[data-action="export-height-map"]')}
+              >
+                Height Map…
               </button>
               <button type="button" onClick={onResetView}>
                 Reset View
@@ -480,6 +489,14 @@ export function WorkbenchRibbon(props: WorkbenchRibbonProps) {
                 onClick={() => textDialogOf(app).open()}
               >
                 Text…
+              </button>
+              <button
+                type="button"
+                data-action="image-to-relief"
+                title="Turn an image into a closed relief"
+                onClick={() => reliefDialogOf(app).open()}
+              >
+                Image to Relief…
               </button>
               <button
                 type="button"
