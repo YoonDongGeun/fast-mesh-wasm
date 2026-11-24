@@ -118,10 +118,11 @@ export function parseHeightMapFile(text: string): HeightMapFrame | null {
   if (!Number.isFinite(pixelSize) || !Number.isFinite(range)) {
     return null;
   }
+  // `+ 0` turns -0 into 0.
   const normal: [number, number, number] = [
-    right[1] * up[2] - right[2] * up[1],
-    right[2] * up[0] - right[0] * up[2],
-    right[0] * up[1] - right[1] * up[0],
+    right[1] * up[2] - right[2] * up[1] + 0,
+    right[2] * up[0] - right[0] * up[2] + 0,
+    right[0] * up[1] - right[1] * up[0] + 0,
   ];
   return { width, height, origin, right, up, normal, pixelSize, range };
 }
