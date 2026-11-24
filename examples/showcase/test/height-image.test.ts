@@ -27,6 +27,12 @@ function noise(seed: number): () => number {
   };
 }
 
+/** Whether two arrays hold the same bytes (deep equality is slow on whole images). */
+function sameBytes(a: ArrayBufferView, b: ArrayBufferView): boolean {
+  const bytes = (v: ArrayBufferView) => Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+  return bytes(a).equals(bytes(b));
+}
+
 interface Chunk {
   type: string;
   data: Buffer;
@@ -123,7 +129,7 @@ describe("16-bit PNG", () => {
       [3, 2],
       [2, 5],
       [61, 47],
-      [1000, 700],
+      [300, 200],
     ]) {
       const next = noise(w * 31 + h);
       // Smooth with noise on top, so that both filters get used.
@@ -143,21 +149,24 @@ describe("16-bit PNG", () => {
       const raw = inflateSync(idat);
       expect(raw.length).toBe((2 * w + 1) * h);
       // Undone here by hand: only Sub and Up are written.
-      const bytes = Buffer.alloc(2 * w * h);
+      const bytes = new Uint8Array(2 * w * h);
+      const filters = new Set<number>();
       for (let row = 0; row < h; row++) {
         const filter = raw[row * (2 * w + 1)];
-        expect([1, 2]).toContain(filter);
+        filters.add(filter);
         for (let i = 0; i < 2 * w; i++) {
           const left = i < 2 ? 0 : bytes[row * 2 * w + i - 2];
           const above = row === 0 ? 0 : bytes[(row - 1) * 2 * w + i];
           bytes[row * 2 * w + i] = raw[row * (2 * w + 1) + 1 + i] + (filter === 1 ? left : above);
         }
       }
-      expect(Array.from(codes, (_, i) => bytes.readUInt16BE(2 * i))).toEqual(Array.from(codes));
+      expect([...filters].every((f) => f === 1 || f === 2)).toBe(true);
+      const stored = new DataView(bytes.buffer);
+      expect(sameBytes(Uint16Array.from(codes, (_, i) => stored.getUint16(2 * i)), codes)).toBe(true);
       // And its own decoder.
       const back = await decodePng(png);
       expect([back.width, back.height, back.channels, back.depth]).toEqual([w, h, 1, 16]);
-      expect(back.samples).toEqual(codes);
+      expect(sameBytes(back.samples, codes)).toBe(true);
     }
   });
 
@@ -168,10 +177,11 @@ describe("16-bit PNG", () => {
 
   it("splits a large image's data over several chunks", async () => {
     const next = noise(5);
-    const codes = Uint16Array.from({ length: 1500 * 900 }, next);
-    const png = await encodePng16(codes, 1500, 900);
+    // Noise does not compress: well over one chunk's megabyte.
+    const codes = Uint16Array.from({ length: 900 * 800 }, next);
+    const png = await encodePng16(codes, 900, 800);
     expect(chunks(png).filter((c) => c.type === "IDAT").length).toBeGreaterThan(1);
-    expect((await decodePng(png)).samples).toEqual(codes);
+    expect(sameBytes((await decodePng(png)).samples, codes)).toBe(true);
   });
 
   it("decodes every filter, depth and channel count", async () => {
