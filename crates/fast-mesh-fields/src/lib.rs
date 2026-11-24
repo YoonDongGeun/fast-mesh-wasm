@@ -52,7 +52,10 @@ pub use deviation::{DeviationOptions, DeviationStats, mesh_deviation};
 pub use distance::signed_distances;
 pub use edt::{edt_3d_mask, edt_3d_sq, fh_signed_grid, fh_unsigned_grid};
 pub use error::{FieldsError, Result};
-pub use geodesic::{GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, geodesic_distances};
+pub use geodesic::{
+    GeodesicHeatSolver, GeodesicMethod, GeodesicOptions, GeodesicPhase, GeodesicQuery,
+    geodesic_distances,
+};
 pub use grid::{
     DEFAULT_AUTO_GRID_RES, DEFAULT_MAX_VOXELS, GridSpec, ScalarGrid, bvh_signed_grid,
     bvh_unsigned_grid,
