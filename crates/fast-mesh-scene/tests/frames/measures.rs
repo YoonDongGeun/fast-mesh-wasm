@@ -68,8 +68,15 @@ fn triangle_qualities() {
 
 #[test]
 fn geodesics_and_paths() {
-    for method in [GeodesicMethod::HeatMethod, GeodesicMethod::Dijkstra] {
-        agree("geodesic_distances", 1e-4, |put| {
+    // The heat method cuts a mesh this coarse finer first, the largest
+    // triangles first, so `f32` rounding decides between equal ones: its
+    // distances agree to much less than their own error (3 %), not to
+    // rounding, and the vertices near the bound may fall on either side.
+    for (method, tol, near_bound) in [
+        (GeodesicMethod::HeatMethod, 1e-2, 0.05),
+        (GeodesicMethod::Dijkstra, 1e-4, 0.0),
+    ] {
+        agree("geodesic_distances", tol, |put| {
             let mut s = scene();
             let id = put.add(&mut s, &lump());
             let mut out = Vec::new();
@@ -81,7 +88,13 @@ fn geodesics_and_paths() {
                 };
                 let mut d = Vec::new();
                 s.geodesic_distances(id, &[17], &options, &mut d).unwrap();
-                out.extend(f64s(&d));
+                match max_distance {
+                    Some(max) if near_bound > 0.0 => {
+                        let most = f64::from(max) - near_bound;
+                        out.extend(f64s(&d).iter().map(|x| x.min(most)));
+                    }
+                    _ => out.extend(f64s(&d)),
+                }
                 if max_distance.is_none() {
                     let mut path = Vec::new();
                     s.shortest_surface_path(id, &d, &[17], 97, &mut path)
