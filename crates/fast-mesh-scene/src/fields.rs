@@ -7038,7 +7038,7 @@ mod tests {
         type Call = fn(&mut Scene, &Ctx);
         // Every public `&mut self` method of `Scene` but the three step
         // calls.
-        let calls: [(&str, Call); 60] = [
+        let calls: [(&str, Call); 61] = [
             ("add_mesh", |s, _| {
                 s.add_mesh(sheet(1, 1.0), MeshOptions::default()).unwrap();
             }),
@@ -7070,6 +7070,9 @@ mod tests {
                 s.redo().unwrap();
             }),
             ("clear_history", |s, _| s.clear_history().unwrap()),
+            ("record_entry", |s, _| {
+                s.record_entry(crate::HistoryEntry::default()).unwrap()
+            }),
             ("set_history_budget", |s, _| {
                 s.set_history_budget(1 << 20).unwrap()
             }),

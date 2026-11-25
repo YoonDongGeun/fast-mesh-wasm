@@ -47,7 +47,10 @@ import {
 } from "../hull.js";
 import {
   checkHistoryBudget,
+  checkHistoryEntry,
   DEFAULT_HISTORY_BUDGET,
+  EntryBook,
+  type HistoryEntry,
   type PermanentListener,
   type PermanentStep,
   tellPermanent,
@@ -880,6 +883,8 @@ export class WorkerScene implements SceneLike {
   #statusScheduled = false;
   #history = { canUndo: false, canRedo: false };
   #historyBytes = 0;
+  /** The application's entries in the history, or on their way to it. */
+  readonly #entries = new EntryBook();
   /** See {@link presenceVersion}. */
   #presenceVersion = 0;
   /** The values mirror is on (a `values()` read asked for it). */
@@ -1413,6 +1418,10 @@ export class WorkerScene implements SceneLike {
       if (log) {
         this.#logFailed(req);
       }
+      if (req.kind === "entry") {
+        // It never got to the history.
+        this.#entries.tell(req.id, "drop");
+      }
       const key = keyOf(req);
       if (key !== undefined && this.#latest.get(key) === req.rev) {
         this.#setStatus(key, { status: "error", revision: req.rev, error });
@@ -1474,6 +1483,7 @@ export class WorkerScene implements SceneLike {
       this.#batchDone.delete(batch);
     }
     this.#releaseHolds();
+    this.#entries.dropAll();
     this.#statusChanged();
   }
 
@@ -1531,6 +1541,8 @@ export class WorkerScene implements SceneLike {
         this.#logFailed(req);
       }
       this.#releaseHolds();
+      // The history is gone with the engine.
+      this.#entries.dropAll();
       this.#applyStatus(r);
       this.#applyReplies(r);
       // Any promise of the batch still pending fails the same way.
@@ -1622,8 +1634,38 @@ export class WorkerScene implements SceneLike {
     }
     this.#historyBytes = r.historyBytes ?? 0;
     this.#applyStatus(r);
+    this.#applyEntries(r);
     tellPermanent(this.#permanentListeners, permanent);
     this.#applyReplies(r);
+  }
+
+  /**
+   * Calls the application's entries the result undid, redid or dropped. An
+   * entry recorded here since the request that undid (or redid) them was made
+   * comes after it in the history, but its change is made already: it steps
+   * back first and forward again after, so that the callbacks run in the
+   * history's order.
+   */
+  #applyEntries(r: Result): void {
+    const events = r.entries ?? [];
+    for (let k = 0; k < events.length; ) {
+      const { id, what, rev } = events[k];
+      if (what === "drop") {
+        this.#entries.tell(id, what);
+        k++;
+        continue;
+      }
+      const later = this.#entries.after(rev);
+      for (const l of [...later].reverse()) {
+        this.#entries.tell(l, "undo");
+      }
+      for (; k < events.length && events[k].rev === rev && events[k].what !== "drop"; k++) {
+        this.#entries.tell(events[k].id, events[k].what);
+      }
+      for (const l of later) {
+        this.#entries.tell(l, "redo");
+      }
+    }
   }
 
   #permanentSteps(r: Result): PermanentStep[] {
@@ -3734,6 +3776,34 @@ export class WorkerScene implements SceneLike {
     this.#scheduleFlush();
   }
 
+  /**
+   * Records an entry of the application's own in the history, after the
+   * requests before it; see `Scene.recordEntry`. Its functions run here, on
+   * this thread, as the result that undid, redid or dropped it is applied:
+   * after the mirrors and before the promises the result settles and the
+   * change records of the next {@link WorkerScene.commitFrame}.
+   *
+   * The history's order is that of the calls, whatever is in flight: an
+   * `undo()` undoes what was recorded last when it was called, and the engine
+   * says what that was. An entry recorded while an `undo()` or `redo()` is in
+   * flight comes after it, and the undone entries' functions then run around
+   * it (its `undo` before them, its `redo` after), so that every function
+   * finds the application as the history has it. An entry that could not be
+   * recorded is dropped, and so is every entry by a
+   * {@link WorkerScene.restart}, which clears the history.
+   *
+   * @throws `INVALID_ARGUMENT` for an entry without `undo` and `redo`, or with
+   * bytes below 0.
+   */
+  recordEntry(entry: HistoryEntry): void {
+    this.#alive();
+    const { bytes, coalesce } = checkHistoryEntry(entry);
+    const rev = ++this.#rev;
+    const id = this.#entries.add(entry, rev);
+    this.#push({ kind: "entry", rev, id, bytes, ...(coalesce === undefined ? {} : { coalesce }) });
+    this.#scheduleFlush();
+  }
+
   /** The most bytes the history may hold, as last set here. */
   get historyBudget(): number {
     return this.#init.historyBudget ?? DEFAULT_HISTORY_BUDGET;
@@ -4589,6 +4659,7 @@ export class WorkerScene implements SceneLike {
     this.#failedDropped = 0;
     this.#history = { canUndo: false, canRedo: false };
     this.#historyBytes = 0;
+    this.#entries.dropAll();
     this.#statusChanged();
 
     // The replay, in dependency order: meshes, placements, fields,
@@ -4803,6 +4874,7 @@ export class WorkerScene implements SceneLike {
     this.#batchDone.clear();
     this.#queue = [];
     this.#inflight.length = 0;
+    this.#entries.dropAll();
   }
 
   static {
@@ -4816,6 +4888,7 @@ export class WorkerScene implements SceneLike {
       status: scene.#status.size,
       latest: scene.#latest.size,
       prunes: scene.#prunes.length,
+      entries: scene.#entries.size,
     });
     createScene = (make, options) => {
       const scene = new WorkerScene(make, options);

@@ -10,7 +10,7 @@ use fast_mesh_store::{
 
 use crate::fields::{ColorState, CurvField, Field, FieldHook, FieldUnit, ThickField};
 use crate::geodesic::GeodesicCache;
-use crate::history::{Change, Done, History, PermanentStep};
+use crate::history::{Change, Done, EntryEvent, History, HistoryEntry, PermanentStep};
 use crate::id::SlotMap;
 use crate::normals::{NormalBuild, NormalState};
 use crate::presence::ParkedLinks;
@@ -62,8 +62,9 @@ pub struct MeshOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneOptions {
     /// Most bytes the shared undo history may hold, 256 MiB by default. What
-    /// counts are patches of edits, placement changes, and meshes out of the
-    /// scene that undo or redo can bring back. Past it the oldest undo steps
+    /// counts are patches of edits, placement changes, meshes out of the scene
+    /// that undo or redo can bring back, and what entries of the application
+    /// say they hold. Past it the oldest undo steps
     /// go; a step larger than the whole budget goes as soon as it closes,
     /// which makes it permanent ([`Scene::take_permanent`] tells). Change it
     /// later with [`Scene::set_history_budget`].
@@ -883,7 +884,7 @@ pub struct Scene {
 
 // Every public `&mut self` method of `Scene`, in this file and the others,
 // starts by dropping an open field step unit with `drop_field_unit` (the
-// step calls and `take_permanent` aside), and is listed in the test
+// step calls, `take_permanent` and `take_entry_events` aside), and is listed in the test
 // `fields::tests::mutating_calls_abandon_open_unit`. New ones must do both.
 impl Scene {
     /// An empty scene.
@@ -1153,7 +1154,7 @@ impl Scene {
         let reverted = self.history.cancel(&mut self.entries);
         let (done, step) = self.after_corrupted(reverted)?;
         self.absorb(done);
-        History::discard(&step, &mut self.entries);
+        self.history.discard(&step, &mut self.entries);
         Ok(())
     }
 
@@ -1238,6 +1239,49 @@ impl Scene {
     /// True if [`Scene::redo`] would redo something.
     pub fn can_redo(&self) -> bool {
         self.history.can_redo()
+    }
+
+    /// Records an entry of the application's own in the history: in the open
+    /// step, or as a step of its own when none is open. Recording drops the
+    /// redo stack. It is undone, redone, cancelled and evicted with the
+    /// changes of its step, in order with those of other steps;
+    /// [`Scene::take_entry_events`] tells. The application has made its
+    /// change already, and makes it and its reverse again on those events:
+    /// the scene knows the entry's id and bytes only, and nothing in it
+    /// changes.
+    ///
+    /// Within an open step, an entry right after one with the same
+    /// [`HistoryEntry::merge`] key merges with it: undo then tells of the
+    /// first, redo of the last, and those in between are dropped at once. Any
+    /// other change in between starts a new run.
+    ///
+    /// # Errors
+    /// [`SceneError::Store`] when there is no memory to record it. Nothing is
+    /// recorded then, and the entry has no events.
+    pub fn record_entry(&mut self, entry: HistoryEntry) -> Result<()> {
+        self.drop_field_unit();
+        self.history.reserve()?;
+        self.history.record_app(&mut self.entries, entry);
+        Ok(())
+    }
+
+    /// Takes what happened to the application's entries since the last call,
+    /// in order. Take them after every [`Scene::undo`], [`Scene::redo`] and
+    /// [`Scene::cancel_step`], whose changes of meshes they go with: undone
+    /// entries of a step come in reverse order, redone ones in order, once
+    /// the step has run as a whole (a step that fails has none). An entry is
+    /// dropped when the history lets go of its step: to meet the budget, with
+    /// the redo stack when something is recorded, with a cancelled step (once
+    /// undone), by [`Scene::clear_history`], or after
+    /// [`SceneError::Corrupted`].
+    // Like `take_permanent`, it leaves an open field step unit alone.
+    pub fn take_entry_events(&mut self) -> Vec<EntryEvent> {
+        self.history.take_events()
+    }
+
+    /// Whether [`Scene::take_entry_events`] would return any.
+    pub fn has_entry_events(&self) -> bool {
+        self.history.has_events()
     }
 
     /// The most bytes the history may hold (see

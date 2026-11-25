@@ -40,5 +40,5 @@ export type {
   TwistReport,
   VertexProtection,
 } from "../scene.js";
-export type { PermanentListener, PermanentStep } from "../history.js";
+export type { HistoryEntry, PermanentListener, PermanentStep } from "../history.js";
 export { createSceneStore, SceneStore, type SceneStoreOptions, type SectionPatch } from "./store.js";

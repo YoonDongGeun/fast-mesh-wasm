@@ -7,7 +7,7 @@ import type { Range } from "../changes.js";
 import type { DelaunayFlipOptions, DenoiseOptions } from "../denoise.js";
 import type { ExtrudeBaseOptions, ExtrudeFacesOptions } from "../extrude.js";
 import type { CheckedHeightfield, CheckedHeightfieldPlacement, HeightMap, HeightMapFrame } from "../height-map.js";
-import type { PermanentStep } from "../history.js";
+import type { EntryEvent, PermanentStep } from "../history.js";
 import type { EncodedPrimitive, PrimitiveMesh } from "../primitives.js";
 import type { LatticeOptions, LatticePlan, LatticePreview } from "../lattice.js";
 import type { WrapOptions, WrapPlan } from "../wrap.js";
@@ -198,6 +198,11 @@ export type Request =
   | { kind: "undo" | "redo"; rev: number; key?: string }
   /** Drops every undo and redo step (the end of a `restart()` replay). */
   | { kind: "clearHistory"; rev: number; key?: string }
+  /**
+   * `Scene.recordEntry`: the main side keeps the entry under `id`, and hears
+   * what becomes of it through `Result.entries`.
+   */
+  | { kind: "entry"; rev: number; id: number; bytes: number; coalesce?: string }
   /** `Scene.setHistoryBudget`, with a checked budget. */
   | { kind: "historyBudget"; rev: number; bytes: number; key?: string }
   /** Opens, closes, or cancels a history step matching `Scene.beginStep`/`endStep`/`cancelStep`. */
@@ -543,6 +548,12 @@ export interface Result {
   history: { canUndo: boolean; canRedo: boolean };
   /** The bytes the history holds. Omitted by poisoned results. */
   historyBytes?: number;
+  /**
+   * What happened to the application's entries in this batch, in order: each
+   * was undone, redone or dropped, by the request of revision `rev`. Omitted
+   * when there is none.
+   */
+  entries?: { id: number; what: EntryEvent; rev: number }[];
   /**
    * The steps of this batch the history could not keep (`Scene.onPermanent`),
    * in order. Omitted when there is none.

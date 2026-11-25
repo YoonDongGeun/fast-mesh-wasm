@@ -129,7 +129,16 @@ import {
   type SyncSculptDomain,
 } from "./domains/index.js";
 import { FieldHandle, MeshHandle, rotationMatrix, SectionHandle, targetsOf } from "./handles.js";
-import { checkHistoryBudget, decodePermanent, type PermanentListener, tellPermanent } from "./history.js";
+import {
+  checkHistoryBudget,
+  checkHistoryEntry,
+  decodePermanent,
+  ENTRY_EVENTS,
+  EntryBook,
+  type HistoryEntry,
+  type PermanentListener,
+  tellPermanent,
+} from "./history.js";
 import { checkInteractionPoints, copyRule, encodeRule } from "./rule.js";
 import type { SceneLike } from "./scene-like.js";
 import {
@@ -490,8 +499,9 @@ export interface SceneOptions {
   /**
    * The most bytes the undo history may hold: {@link DEFAULT_HISTORY_BUDGET}
    * (256 MiB) by default. What counts are the patches of edits, placement
-   * changes, and meshes out of the scene that undo or redo can bring back
-   * (about 60 bytes a triangle). Past it the oldest steps go. A step larger
+   * changes, meshes out of the scene that undo or redo can bring back (about
+   * 60 bytes a triangle), and what the application's entries say they hold
+   * ({@link HistoryEntry.bytes}). Past it the oldest steps go. A step larger
    * than the whole budget goes as soon as it closes: the action is then
    * permanent, and {@link Scene.onPermanent} tells. A number, 0 or more;
    * at most 4 GiB, so `Infinity` means that. Change it later with
@@ -3410,6 +3420,10 @@ export class Scene implements SceneLike {
   readonly #sections = new Map<number, SectionHandle>();
   readonly #listeners = new Set<(changes: MeshChange[]) => void>();
   readonly #permanentListeners = new Set<PermanentListener>();
+  /** The application's entries in the history. */
+  readonly #entries = new EntryBook();
+  /** The latest entry's `coalesce` and the number the engine knows it by. */
+  #coalesce: { key: string; id: number } = { key: "", id: 0 };
   /** A {@link Scene.#settleHistory} is queued on a microtask. */
   #settleQueued = false;
   /** History step nesting depth, mirrored from the calls made through this class. */
@@ -3578,6 +3592,7 @@ export class Scene implements SceneLike {
     this.#raw = undefined;
     this.#guard?.bump();
     this.#drag = undefined;
+    this.#entries.dropAll();
     finalizer.unregister(this);
     release(raw);
   }
@@ -3591,8 +3606,8 @@ export class Scene implements SceneLike {
   #scene(): WasmScene {
     const s = this.#peek();
     this.#guard?.bump();
-    if (!this.#settleQueued && this.#permanentListeners.size > 0) {
-      // Whatever the call records, its listeners hear of it soon.
+    if (!this.#settleQueued && (this.#permanentListeners.size > 0 || this.#entries.size > 0)) {
+      // Whatever the call records or drops, the app hears of it soon.
       this.#settleQueued = true;
       queueMicrotask(() => {
         this.#settleQueued = false;
@@ -3606,19 +3621,25 @@ export class Scene implements SceneLike {
     return s;
   }
 
-  /** Tells the listeners what the history did since the last call. */
+  /** Tells the application's entries and the listeners what the history did since the last call. */
   #settleHistory(): void {
     const s = this.#raw;
-    if (s === undefined || !call(() => s.has_permanent())) {
+    if (s === undefined || !call(() => s.has_history_events())) {
       return;
     }
     this.#guard?.bump();
+    // Both before any call: a callback may use the scene.
+    const events = call(() => s.take_entry_events());
     const msg = call(() => s.take_permanent());
     const handle = (index: number, generation: number) => {
       const key = `${index}:${generation}`;
       return this.#meshes.get(key) ?? this.#removed.get(key);
     };
-    tellPermanent(this.#permanentListeners, decodePermanent(msg, handle));
+    const permanent = decodePermanent(msg, handle);
+    for (let k = 0; k < events.length; k += 2) {
+      this.#entries.tell(events[k + 1], ENTRY_EVENTS[events[k]]);
+    }
+    tellPermanent(this.#permanentListeners, permanent);
   }
 
   /** The live raw scene, for a read-only call that leaves every view valid. */
@@ -3776,6 +3797,7 @@ export class Scene implements SceneLike {
     const key = `${index}:${generation}`;
     this.#meshes.delete(key);
     this.#removed.set(key, mesh);
+    this.#settleHistory();
   }
 
   /** Whether the scene has `mesh`: `false` once it is removed, or its add is undone. */
@@ -4913,6 +4935,53 @@ export class Scene implements SceneLike {
     this.#settleHistory();
   }
 
+  /**
+   * Records an entry of the application's own in the history, in the open
+   * step or as a step of its own, for state that is not the scene's: a
+   * selection, a list of curves, a document's title. Make the change, then
+   * record how to take it back and make it again. The entry is undone, redone
+   * and cancelled in order with mesh edits and with its step, counts against
+   * the budget, and drops the steps undone before it.
+   *
+   * On undo its `undo` is called before {@link Scene.undo} returns, once
+   * every mesh of the step has changed; the entries of one step are called in
+   * reverse order, and in order on redo. A callback should not change the
+   * scene (that would be a new step); an error it throws is reported
+   * (`reportError`), and the undo stands.
+   *
+   * @throws `INVALID_ARGUMENT` for an entry without `undo` and `redo`, or with
+   * bytes below 0. Nothing is recorded then, and no function is called.
+   *
+   * @example
+   * ```ts
+   * const before = doc.title;
+   * const after = input.value;
+   * doc.title = after;
+   * scene.recordEntry({
+   *   undo: () => (doc.title = before),
+   *   redo: () => (doc.title = after),
+   *   bytes: 2 * (before.length + after.length),
+   * });
+   * ```
+   */
+  recordEntry(entry: HistoryEntry): void {
+    const { bytes, coalesce } = checkHistoryEntry(entry);
+    const s = this.#scene();
+    if (coalesce !== undefined && (this.#coalesce.id === 0 || coalesce !== this.#coalesce.key)) {
+      // Entries merge only with the one right before them, so a number is
+      // enough for each run of equal keys.
+      this.#coalesce = { key: coalesce, id: this.#coalesce.id + 1 };
+    }
+    const id = this.#entries.add(entry);
+    try {
+      call(() => s.record_entry(id, bytes, coalesce === undefined ? 0 : this.#coalesce.id));
+    } catch (e) {
+      this.#entries.forget(id);
+      throw e;
+    }
+    this.#settleHistory();
+  }
+
   /** The most bytes the history may hold; see {@link SceneOptions.historyBudget}. */
   historyBudget(): number {
     return call(() => this.#peek().history_budget());
@@ -4999,7 +5068,11 @@ export class Scene implements SceneLike {
     this.#settleHistory();
   }
 
-  /** Reverts and discards the open step, however deeply nested. Throws `STEP_NOT_OPEN` when none is open. */
+  /**
+   * Reverts and discards the open step, however deeply nested. The
+   * application's entries in it are undone and dropped. Throws `STEP_NOT_OPEN`
+   * when none is open.
+   */
   cancelStep(): void {
     const s = this.#scene();
     this.#prune = true;
@@ -5007,6 +5080,7 @@ export class Scene implements SceneLike {
     this.#stepDepth = 0;
     // The drag's step is gone with it: later moves must not record steps.
     this.#drag?.abandon();
+    this.#settleHistory();
   }
 
   /**

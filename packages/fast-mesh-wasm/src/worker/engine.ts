@@ -59,6 +59,7 @@ import {
 } from "./protocol.js";
 
 import type { WorkerSceneOptions } from "./client.js";
+import type { EntryEvent } from "../history.js";
 import { PoolStartError } from "./load.js";
 
 // The artifact selection, for the Node `worker_threads` harness (dist/worker-engine.js),
@@ -593,6 +594,10 @@ class Engine {
   readonly #fieldTargets = new Map<ClientId, ClientId[] | null>();
   /** The sections those moves took meshes from (see `Result.sectionMeshes`). */
   readonly #sectionsLost = new Set<ClientId>();
+  /** What happened to the client's entries, for the next result. */
+  readonly #entryEvents: NonNullable<Result["entries"]> = [];
+  /** The revision of the request being run. */
+  #rev = 0;
   /** The steps the history could not keep, for the next result. */
   readonly #permanent: PermanentStepWire[] = [];
   /** The active drag, by the dragged mesh's client id. */
@@ -793,6 +798,7 @@ class Engine {
   async #step(req: Request): Promise<boolean> {
     const b = this.#batch;
     b.rev = Math.max(b.rev, req.rev);
+    this.#rev = req.rev;
     const key = keyOf(req);
     if (this.#superseded(req, key) || this.#abandoned(req, key)) {
       return true;
@@ -2368,6 +2374,21 @@ class Engine {
       case "historyBudget":
         s.setHistoryBudget(req.bytes);
         return;
+      case "entry": {
+        const { id, bytes, coalesce } = req;
+        const note = (what: EntryEvent) => () => {
+          this.#entryEvents.push({ id, what, rev: this.#rev });
+        };
+        const entry = { undo: note("undo"), redo: note("redo"), drop: note("drop"), bytes, coalesce };
+        try {
+          s.recordEntry(entry);
+        } catch (e) {
+          // Not in the history: the client lets go of it.
+          entry.drop();
+          throw e;
+        }
+        return;
+      }
       case "step":
         switch (req.phase) {
           case "begin":
@@ -2886,6 +2907,7 @@ class Engine {
     this.#sectionsLost.clear();
     const history = { canUndo: s.canUndo(), canRedo: s.canRedo() };
     // The frame's commit had the scene report the last of them.
+    const entries = this.#entryEvents.splice(0);
     const permanent = this.#permanent.splice(0);
     // Every landed add's record is in this frame.
     this.#packed.clear();
@@ -2910,6 +2932,7 @@ class Engine {
       ...(presence.length === 0 ? {} : { presence }),
       ...(fieldTargets.length === 0 ? {} : { fieldTargets }),
       ...(sectionMeshes.length === 0 ? {} : { sectionMeshes }),
+      ...(entries.length === 0 ? {} : { entries }),
       ...(permanent.length === 0 ? {} : { permanent }),
       status: b.status,
       replies: b.replies,

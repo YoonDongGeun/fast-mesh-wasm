@@ -21,6 +21,7 @@ import type {
   WorkerRepairDomain,
   WorkerSculptDomain,
 } from "./domains/index.js";
+import type { HistoryEntry } from "./history.js";
 import type { MeshViews } from "./views.js";
 import type {
   BridgeStats,
@@ -87,6 +88,8 @@ export interface SceneLike extends SceneDomainsLike {
   endStep?(): void;
   /** Cancels and reverts the active history step when supported by the scene host. */
   cancelStep?(): void;
+  /** Records an entry of the application's own in the history when supported by the scene host. */
+  recordEntry?(entry: HistoryEntry): void;
   /** Fills a single boundary loop with selectable G0/G1/G2 continuity. */
   fillHoleContinuity?(
     mesh: MeshHandle,

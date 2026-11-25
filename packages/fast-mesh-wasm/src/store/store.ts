@@ -6,7 +6,7 @@
 // a microtask while no frame loop runs), the last value per frame winning.
 import type { Indices, PlacementInput, Positions64, Vec3 } from "../api.js";
 import { FastMeshError, reportListenerError } from "../core.js";
-import type { PermanentListener } from "../history.js";
+import { checkHistoryEntry, type HistoryEntry, type PermanentListener } from "../history.js";
 import type {
   ColorRule,
   DragSession,
@@ -963,6 +963,54 @@ export class SceneStore {
     this.#host.cancelStep();
     this.#followHistory();
     this.#update();
+  }
+
+  /**
+   * Records an entry of the application's own in the undo history, in order
+   * with mesh edits: see the scene's `recordEntry`. The snapshot read in its
+   * `undo` and `redo` has the meshes as the step left them. On a Worker scene
+   * they run when the result arrives.
+   *
+   * @example
+   * ```ts
+   * const before = curves;
+   * curves = [...curves, curve];
+   * store.recordEntry({
+   *   undo: () => (curves = before),
+   *   redo: () => (curves = [...before, curve]),
+   *   bytes: curve.points.byteLength,
+   * });
+   * ```
+   */
+  recordEntry(entry: HistoryEntry): void {
+    this.#alive();
+    const { bytes, coalesce } = checkHistoryEntry(entry);
+    this.#host.recordEntry({
+      undo: () => {
+        this.#catchUp();
+        entry.undo();
+      },
+      redo: () => {
+        this.#catchUp();
+        entry.redo();
+      },
+      drop: () => entry.drop?.(),
+      bytes,
+      ...(coalesce === undefined ? {} : { coalesce }),
+    });
+    this.#update();
+  }
+
+  /** The scene has undone or redone a step and calls the application: the snapshot follows first. */
+  #catchUp(): void {
+    if (this.#disposed) {
+      return;
+    }
+    if (this.mode === "local" || this.#host.presenceVersion() !== this.#presenceSeen) {
+      this.#followPresence();
+    }
+    this.#stale = true;
+    this.#queueUpdate();
   }
 
   /** The most bytes the undo history may hold: 256 MiB unless it was set. */

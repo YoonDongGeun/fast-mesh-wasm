@@ -57,6 +57,8 @@
 //!   [`Scene::redo`] and [`Scene::cancel_step`] are all-or-nothing per step.
 //!   [`SceneOptions::history_budget`] evicts the oldest steps;
 //!   [`Scene::take_permanent`] reports the steps larger than it.
+//!   [`Scene::record_entry`] puts entries of the application's own in it, in
+//!   order with the rest.
 //! - BVH state: each mesh's [`UpdateMode`] says when its BVH follows the
 //!   mesh; [`Scene::set_mode`], [`Scene::update`], [`Scene::flush`] and
 //!   [`Scene::is_current`].
@@ -177,7 +179,7 @@ pub use fields::{
 };
 pub use geodesic::GeodesicJob;
 pub use height_map::{HeightMapFrame, HeightMapOptions, HeightfieldReport, MAX_HEIGHT_MAP_PIXELS};
-pub use history::{HistorySide, PermanentStep};
+pub use history::{EntryEvent, HistoryEntry, HistorySide, PermanentStep};
 pub use hull::ConvexHullReport;
 pub use id::MeshId;
 pub use join::{JoinOptions, JoinReport};
