@@ -40,6 +40,7 @@ const SUMMARY: AnalysisSummary = {
   pinchVertices: 0,
   degenerate: 2,
   duplicate: 0,
+  cavities: 0,
   clean: false,
 };
 

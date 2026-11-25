@@ -7,8 +7,9 @@ use fast_mesh_store::{Mesh, TriangleId, VertexId, par};
 
 use fast_mesh_query::self_intersects;
 
+use crate::nesting::components_with_cavities;
 use crate::topology::{
-    BoundaryLoop, Component, EdgeMap, components, loops_with, pinch_vertices, point, triangle_area,
+    BoundaryLoop, Component, EdgeMap, loops_with, pinch_vertices, point, triangle_area,
 };
 use crate::weld::{check_tolerance, weld_roots};
 use crate::{Result, filled, push, reserve};
@@ -239,7 +240,7 @@ fn topology_pass(mesh: &Mesh, max: usize, parallel: bool) -> Result<Topology> {
         || {
             par::join(
                 parallel,
-                || components(mesh, &edges),
+                || components_with_cavities(mesh, &edges),
                 || edge_kinds(mesh, &edges, max),
             )
         },

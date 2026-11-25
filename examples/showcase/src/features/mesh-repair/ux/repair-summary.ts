@@ -27,14 +27,16 @@ export interface AnalysisSummary {
   openChains: number;
   /** Interior edges used the same way by both their triangles. */
   orientationConflicts: number;
-  /** Largest first. */
+  /** Largest first, without the cavities. */
   components: { triangles: number; closed: boolean }[];
+  /** The voids of hollow solids. */
+  cavities: number;
   nonManifoldEdges: number;
   nonManifoldVertices: number;
   pinchVertices: number;
   degenerate: number;
   duplicate: number;
-  /** Nothing above to repair (a single closed, consistently oriented component). */
+  /** Nothing above to repair (a single closed, consistently oriented component, hollow or not). */
   clean: boolean;
 }
 
@@ -44,6 +46,7 @@ export function summarize(a: Analysis): AnalysisSummary {
     .map((l) => ({ id: l.id, edges: l.id.len, perimeter: l.perimeter }))
     .sort((x, y) => y.edges - x.edges);
   const components = a.components
+    .filter((c) => !c.cavity)
     .map((c) => ({ triangles: c.triangles.length, closed: c.closed }))
     .sort((x, y) => y.triangles - x.triangles);
   const s = {
@@ -51,6 +54,7 @@ export function summarize(a: Analysis): AnalysisSummary {
     openChains: a.loops.length - holes.length,
     orientationConflicts: a.orientationConflicts,
     components,
+    cavities: a.components.length - components.length,
     nonManifoldEdges: a.nonManifoldEdges,
     nonManifoldVertices: a.nonManifoldVertices.length,
     pinchVertices: a.pinchVertices.length,

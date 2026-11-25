@@ -29,7 +29,7 @@ function analysis(patch: Partial<Analysis>): Analysis {
     nonManifoldEdgeList: [],
     nonManifoldVertices: new Uint32Array(),
     pinchVertices: new Uint32Array(),
-    components: [{ triangles: new Uint32Array(12), area: 6, closed: true }],
+    components: [{ triangles: new Uint32Array(12), area: 6, closed: true, cavity: false }],
     orientationConflicts: 0,
     selfIntersects: null,
     ...patch,
@@ -110,8 +110,8 @@ describe("auto-repair report", () => {
       analysis({
         loops: [loop(4, 0.4), loop(64, 5)],
         components: [
-          { triangles: new Uint32Array(224), area: 0.5, closed: true },
-          { triangles: new Uint32Array(3836), area: 7, closed: false },
+          { triangles: new Uint32Array(224), area: 0.5, closed: true, cavity: false },
+          { triangles: new Uint32Array(3836), area: 7, closed: false, cavity: false },
         ],
         orientationConflicts: 3,
         degenerate: 5,
@@ -142,8 +142,8 @@ describe("runAutoRepairPipeline", () => {
     analysis({
       loops: [loop(4, 0.4)],
       components: [
-        { triangles: new Uint32Array(224), area: 0.5, closed: true },
-        { triangles: new Uint32Array(3836), area: 7, closed: false },
+        { triangles: new Uint32Array(224), area: 0.5, closed: true, cavity: false },
+        { triangles: new Uint32Array(3836), area: 7, closed: false, cavity: false },
       ],
       degenerate: 5,
     }),
@@ -234,8 +234,8 @@ describe("auto-repair overlay refresh", () => {
       duplicate: 1,
       duplicateList: Uint32Array.from([5]),
       components: [
-        { triangles: new Uint32Array(12), area: 6, closed: true },
-        { triangles: new Uint32Array(3), area: 1, closed: false },
+        { triangles: new Uint32Array(12), area: 6, closed: true, cavity: false },
+        { triangles: new Uint32Array(3), area: 1, closed: false, cavity: false },
       ],
     });
     const after = analysis({});

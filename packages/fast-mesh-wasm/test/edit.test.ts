@@ -311,6 +311,76 @@ function pyramid(): { positions: number[]; indices: number[] } {
   return { positions, indices };
 }
 
+/** The box `[lo, hi]^3`, wound outward, or inward. */
+function box(lo: number, hi: number, inward = false): { positions: number[]; indices: number[] } {
+  const positions: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    positions.push(...[0, 1, 2].map((k) => ((i >> k) & 1 ? hi : lo)));
+  }
+  const out = [0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6, 7, 2, 7, 3, 0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6];
+  const indices = inward ? out.map((_, k) => out[k - (k % 3) + [0, 2, 1][k % 3]]) : out;
+  return { positions, indices };
+}
+
+/** Several boxes as one mesh. */
+function join(...parts: { positions: number[]; indices: number[] }[]): { positions: number[]; indices: number[] } {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  for (const p of parts) {
+    const base = positions.length / 3;
+    positions.push(...p.positions);
+    indices.push(...p.indices.map((v) => v + base));
+  }
+  return { positions, indices };
+}
+
+describe("cavities of hollow solids", () => {
+  const hollow = join(box(0, 10), box(2, 4, true), box(20, 21));
+  const add = (s: Scene, part = hollow) => s.addMesh(part.positions, part.indices);
+
+  it("analyze_tells_cavities_from_loose_pieces", () => {
+    const s = scene();
+    expect(s.analyze(add(s)).components.map((c) => c.cavity)).toEqual([false, true, false]);
+  });
+
+  it("removal_keeps_cavities_unless_asked", () => {
+    const s = scene();
+    const m = add(s);
+    // Every part is below the bound; the largest stays, and its cavity too.
+    const r = s.repair(m, { op: "removeSmallComponents", minTriangles: 100 });
+    expect(r.removedComponents).toBe(1);
+    expect(s.analyze(m).components.map((c) => c.cavity)).toEqual([false, true]);
+    const all = s.repair(m, { op: "removeSmallComponents", minTriangles: 100, keepCavities: false });
+    expect(all.removedComponents).toBe(1);
+    expect(s.analyze(m).components.length).toBe(1);
+  });
+
+  it("what_hollowing_makes_is_a_cavity", () => {
+    const s = scene();
+    const m = add(s, box(0, 10));
+    s.boolean.hollowMesh(m, { wallThickness: 1.5, voxelSize: 0.5 });
+    const { volume } = s.inspect.measure(m);
+    expect(s.analyze(m).components.map((c) => c.cavity)).toEqual([false, true]);
+    expect(s.repair(m, { op: "orient" }).flippedTriangles).toBe(0);
+    expect(s.repair(m, { op: "removeSmallComponents", minTriangles: 1e6 }).removedComponents).toBe(0);
+    s.repair(m, { kind: "auto" });
+    expect(s.inspect.measure(m).volume).toBeCloseTo(volume as number, 3);
+  });
+
+  it("orient_and_auto_repair_leave_a_hollow_solid_alone", () => {
+    const solid = join(box(0, 10), box(2, 4, true));
+    const s = scene();
+    const m = add(s, solid);
+    expect(s.repair(m, { op: "orient" }).flippedTriangles).toBe(0);
+    s.repair(m, { kind: "auto" });
+    expect(s.inspect.measure(m).volume).toBeCloseTo(1000 - 8, 3);
+    // An inside-out one is turned as a whole.
+    const turned = add(s, join(box(0, 10, true), box(2, 4)));
+    expect(s.repair(turned, { op: "orient" }).flippedTriangles).toBe(24);
+    expect(s.inspect.measure(turned).volume).toBeCloseTo(1000 - 8, 3);
+  });
+});
+
 describe("analyze and repair", () => {
   it("auto_repair_is_the_op_list_in_one_call", () => {
     const { positions, indices } = damagedHemisphere();

@@ -46,7 +46,7 @@ function analysis(patch: Partial<Analysis> = {}): Analysis {
     nonManifoldEdgeList: [],
     nonManifoldVertices: new Uint32Array(),
     pinchVertices: new Uint32Array(),
-    components: [{ triangles: new Uint32Array(12), area: 6, closed: true }],
+    components: [{ triangles: new Uint32Array(12), area: 6, closed: true, cavity: false }],
     orientationConflicts: 0,
     selfIntersects: null,
     ...patch,

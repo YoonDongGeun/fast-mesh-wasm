@@ -803,6 +803,8 @@ export interface MeshComponent {
   area: number;
   /** No boundary and no non-manifold edge. */
   closed: boolean;
+  /** A void of a hollow solid: closed, wound inward, and inside the material of the components around it. */
+  cavity: boolean;
 }
 
 /**
@@ -1205,7 +1207,20 @@ export type RepairOp =
   | SculptOp
   | { op: "weld"; tolerance: number }
   | { op: "removeDegenerate"; areaEpsilon?: number; removeUnusedVertices?: boolean }
-  | { op: "removeSmallComponents"; minTriangles?: number; minArea?: number; keepLargest?: boolean }
+  | {
+      op: "removeSmallComponents";
+      minTriangles?: number;
+      minArea?: number;
+      /** Keep the largest component even when it is below a bound. Default `true`. */
+      keepLargest?: boolean;
+      /**
+       * Keep the cavities (see {@link MeshComponent.cavity}) of the components
+       * that stay, however small they are: removing one fills a void of a
+       * hollow solid. Default `true`. A cavity of a removed component goes
+       * with it.
+       */
+      keepCavities?: boolean;
+    }
   | { op: "orient" }
   | ({ op: "makeManifold" } & ManifoldOptions)
   | ({ op: "resolveSelfIntersections" } & SelfIntersectOptions)
@@ -2719,6 +2734,7 @@ function encodeRepair(ops: readonly RepairOp[]): { values: Float64Array; loops: 
           optional(o.minTriangles, "minTriangles"),
           optional(o.minArea, "minArea"),
           flagOf(o.keepLargest, true),
+          flagOf(o.keepCavities, true),
         );
         break;
       case "orient":
@@ -3167,7 +3183,7 @@ function decodeAnalysis(r: Reader): Analysis {
   const nonManifoldVertices = r.list();
   const pinchVertices = r.list();
   const components = r.many(
-    (): MeshComponent => ({ triangles: r.list(), area: r.next(), closed: r.flag() }),
+    (): MeshComponent => ({ triangles: r.list(), area: r.next(), closed: r.flag(), cavity: r.flag() }),
   );
   const orientationConflicts = r.next();
   const si = r.next();

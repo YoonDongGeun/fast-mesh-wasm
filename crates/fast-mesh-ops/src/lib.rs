@@ -43,7 +43,7 @@
 //!   triangles, non-manifold edges and vertices, pinch vertices, components,
 //!   orientation conflicts and, given a BVH, self-intersection.
 //! - Orientation: [`orient()`] makes the winding consistent patch by patch
-//!   and turns closed components outward.
+//!   and turns closed components outward, cavities of hollow solids inward.
 //! - Booleans: [`boolean_plan`] builds a canonical simplex-keyed intersection
 //!   arrangement between mesh A and mesh B, sub-triangulates cut faces in 2D,
 //!   classifies connected seam-bounded patches for [`BooleanOp`] via exact
@@ -131,6 +131,7 @@ pub mod inspect;
 pub mod lattice;
 pub mod marching_cubes;
 mod measure;
+mod nesting;
 mod offset;
 mod orient;
 pub mod primitives;

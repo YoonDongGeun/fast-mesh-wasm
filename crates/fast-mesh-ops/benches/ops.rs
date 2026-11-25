@@ -300,6 +300,84 @@ fn bench_weld(c: &mut Criterion) {
     group.finish();
 }
 
+/// A sphere of about a million triangles around 1000 inward boxes.
+fn hollow_sphere() -> Buffers {
+    let (mut positions, mut triangles) = (vec![0.0, 0.0, 100.0], Vec::new());
+    for i in 1..N {
+        let polar = std::f32::consts::PI * i as f32 / N as f32;
+        for j in 0..N {
+            let around = std::f32::consts::TAU * j as f32 / N as f32;
+            let (x, y) = (around.cos(), around.sin());
+            positions.extend([x * polar.sin(), y * polar.sin(), polar.cos()].map(|k| 100.0 * k));
+        }
+    }
+    positions.extend([0.0, 0.0, -100.0]);
+    let at = |i: u32, j: u32| 1 + (i - 1) * N + j % N;
+    let south = at(N - 1, N - 1) + 1;
+    for j in 0..N {
+        triangles.extend([0, at(1, j), at(1, j + 1)]);
+        triangles.extend([south, at(N - 1, j + 1), at(N - 1, j)]);
+        for i in 1..N - 1 {
+            triangles.extend([at(i, j), at(i + 1, j), at(i + 1, j + 1)]);
+            triangles.extend([at(i, j), at(i + 1, j + 1), at(i, j + 1)]);
+        }
+    }
+    for i in 0..1000u32 {
+        let base = (positions.len() / 3) as u32;
+        let cell = [i % 10, i / 10 % 10, i / 100].map(|k| (k as f32 - 4.5) * 9.0);
+        for corner in 0..8u32 {
+            positions.extend((0..3).map(|k| cell[k] + (corner >> k & 1) as f32));
+        }
+        for quad in [
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+        ] {
+            let [a, b, c, d] = quad.map(|v: u32| base + v);
+            triangles.extend([a, c, b, a, d, c]);
+        }
+    }
+    (positions, triangles)
+}
+
+fn bench_cavities(c: &mut Criterion) {
+    let buffers = hollow_sphere();
+    let mut mesh = build(&buffers);
+    let options = ComponentOptions {
+        min_triangles: Some(500),
+        ..ComponentOptions::default()
+    };
+    let mut tx = mesh.begin_edit();
+    let removed = remove_small_components(&mut tx, &options).unwrap();
+    let oriented = orient(&mut tx).unwrap();
+    tx.rollback();
+    eprintln!(
+        "1M sphere with 1000 cavities: {} triangles; {removed:?}; {oriented:?}",
+        mesh.triangle_count()
+    );
+    let mut group = c.benchmark_group("ops cavities");
+    group.sample_size(10);
+    group.bench_function("orient_1M_1000_cavities", |b| {
+        b.iter_batched(
+            || build(&buffers),
+            |mut mesh| {
+                let mut tx = mesh.begin_edit();
+                black_box(orient(&mut tx).unwrap());
+                black_box(tx.commit().unwrap());
+                mesh
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.bench_function("analyze_1M_1000_cavities", |b| {
+        b.iter(|| black_box(analyze(&mesh, &AnalyzeOptions::default()).unwrap()))
+    });
+    group.finish();
+}
+
 fn bench_components(c: &mut Criterion) {
     let buffers = terrain_with_specks(N, 1000);
     let mut mesh = build(&buffers);
@@ -595,6 +673,7 @@ criterion_group!(
     bench_fill,
     bench_weld,
     bench_components,
+    bench_cavities,
     bench_icp,
     bench_stretch,
     bench_boolean,

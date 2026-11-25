@@ -202,7 +202,8 @@ export function detectOrientationConflictEdges(indices: Uint32Array): Uint32Arra
 
 /**
  * Finds closed connected components whose signed volume is negative (inward-
- * facing normals across the entire shell).
+ * facing normals across the entire shell). The cavities of a hollow solid
+ * rightly face inward and are left out.
  */
 export function detectInvertedClosedComponents(
   analysis: Analysis,
@@ -211,7 +212,7 @@ export function detectInvertedClosedComponents(
 ): Uint32Array {
   const invertedTris: number[] = [];
   for (const comp of analysis.components) {
-    if (!comp.closed || comp.triangles.length === 0) continue;
+    if (!comp.closed || comp.cavity || comp.triangles.length === 0) continue;
     let vol6 = 0;
     for (let i = 0; i < comp.triangles.length; i++) {
       const t = comp.triangles[i]!;
@@ -690,8 +691,9 @@ export function extractDefectHotspots(
   }
 
   // Disconnected small components.
-  if (analysis.components.length > 1) {
-    const sorted = [...analysis.components].sort((a, b) => a.triangles.length - b.triangles.length);
+  const islands = analysis.components.filter((c) => !c.cavity);
+  if (islands.length > 1) {
+    const sorted = [...islands].sort((a, b) => a.triangles.length - b.triangles.length);
     const smallest = sorted[0];
     if (smallest !== undefined && smallest.triangles.length > 0) {
       const { center, radius } = triangleBounds(positions, smallest.triangles, indices);
@@ -699,7 +701,7 @@ export function extractDefectHotspots(
         id: "small-component",
         kind: "components",
         label: `Smallest island (${smallest.triangles.length} tris)`,
-        count: analysis.components.length - 1,
+        count: islands.length - 1,
         center,
         radius,
       });

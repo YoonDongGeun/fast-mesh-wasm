@@ -112,7 +112,7 @@ describe("collision math", () => {
     // An open chain is a loop that does not close: open too.
     expect(topologyOf(analysis({ loops: [loop(3, 0.1, false)] })).open).toBe(true);
     // A component that is not closed (non-manifold edges, say) with no loop listed.
-    expect(topologyOf(analysis({ components: [{ triangles: new Uint32Array(3), area: 1, closed: false }] })).open).toBe(
+    expect(topologyOf(analysis({ components: [{ triangles: new Uint32Array(3), area: 1, closed: false, cavity: false }] })).open).toBe(
       true,
     );
     expect(topologyOf(analysis({ orientationConflicts: 3 }))).toEqual({ open: false, inconsistent: true });
@@ -141,7 +141,7 @@ function analysis(patch: Partial<Analysis>): Analysis {
     nonManifoldEdgeList: [],
     nonManifoldVertices: new Uint32Array(),
     pinchVertices: new Uint32Array(),
-    components: [{ triangles: new Uint32Array(12), area: 6, closed: true }],
+    components: [{ triangles: new Uint32Array(12), area: 6, closed: true, cavity: false }],
     orientationConflicts: 0,
     selfIntersects: null,
     ...patch,
@@ -163,6 +163,16 @@ describe("repair summaries", () => {
     expect(s.clean).toBe(true);
     expect(s.holes).toEqual([]);
     expect(s.components).toEqual([{ triangles: 12, closed: true }]);
+    expect(s.cavities).toBe(0);
+  });
+
+  it("summarize_counts_cavities_apart", () => {
+    const solid = { triangles: new Uint32Array(12), area: 6, closed: true, cavity: false };
+    const s = summarize(analysis({ components: [solid, { ...solid, cavity: true }, { ...solid, cavity: true }] }));
+    expect(s.components).toEqual([{ triangles: 12, closed: true }]);
+    expect(s.cavities).toBe(2);
+    expect(s.clean).toBe(true);
+    expect(summarize(analysis({ components: [solid, solid] })).clean).toBe(false);
   });
 
   it("summarize_defects", () => {
@@ -170,8 +180,8 @@ describe("repair summaries", () => {
       analysis({
         loops: [loop(4, 0.4), loop(64, 5), loop(3, 0.1, false)],
         components: [
-          { triangles: new Uint32Array(224), area: 0.5, closed: true },
-          { triangles: new Uint32Array(3836), area: 7, closed: false },
+          { triangles: new Uint32Array(224), area: 0.5, closed: true, cavity: false },
+          { triangles: new Uint32Array(3836), area: 7, closed: false, cavity: false },
         ],
         orientationConflicts: 2,
         nonManifoldEdges: 1,

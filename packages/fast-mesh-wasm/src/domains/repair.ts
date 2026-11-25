@@ -60,6 +60,7 @@ export interface CleanOptions {
   minTriangles?: number;
   minArea?: number;
   keepLargest?: boolean;
+  keepCavities?: boolean;
 }
 
 /** Combined report returned by {@link RepairDomain.clean}. */
@@ -308,6 +309,7 @@ export function createRepairDomain<Async extends boolean>(backend: RepairBackend
           minTriangles: options.minTriangles,
           minArea: options.minArea,
           keepLargest: options.keepLargest,
+          keepCavities: options.keepCavities,
         },
       ] as const);
       const mapReport = ([degenerate, components]: [DegenerateReport, RemoveReport]): CleanReport => ({
