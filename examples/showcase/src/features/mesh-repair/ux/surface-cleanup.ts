@@ -1,11 +1,12 @@
 // The surface cleanup section's pure parts (#264): how the denoise and
 // Delaunay flip fields parse, the face region they run on, the report lines
-// and the before/after readouts, and the commands the ribbon and the command
-// palette offer. No React, no engine calls.
+// and the before/after readouts. No React, no engine calls.
 import type { DelaunayFlipReport, DenoiseReport, Placement, SurfaceStats } from "fast-mesh-wasm";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { sanitizeSelectedTriangles } from "../../select/ux/face-sets";
 import { plural } from "./repair-summary";
+
+export { SURFACE_CLEANUP_COMMANDS } from "./surface-cleanup-commands";
 
 /** The engine's limit on denoise rounds. */
 export const MAX_DENOISE_ITERATIONS = 100;
@@ -118,24 +119,3 @@ export function describeDelaunayFlips(r: DelaunayFlipReport): string {
   const stopped = r.converged ? "" : " (stopped at the pass limit)";
   return `Delaunay flips: ${plural(r.flips, "edge")} in ${plural(r.passes, "pass", "passes")}${stopped}, ${readoutText(r)}`;
 }
-
-/** The surface cleanup commands the ribbon and the command palette offer, by the panel button they press. */
-export const SURFACE_CLEANUP_COMMANDS: readonly {
-  op: "denoise" | "delaunayFlips";
-  label: string;
-  short: string;
-  keywords: string;
-}[] = [
-  {
-    op: "denoise",
-    label: "Repair: Denoise (Keep Sharp Edges)",
-    short: "Denoise",
-    keywords: "repair denoise smooth scan noise bilateral normal filter feature preserving sharp edges",
-  },
-  {
-    op: "delaunayFlips",
-    label: "Repair: Delaunay Edge Flips",
-    short: "Delaunay Flips",
-    keywords: "repair delaunay flip edges triangle quality minimum angle dihedral",
-  },
-];

@@ -122,6 +122,15 @@ body,
   text-transform: uppercase;
   color: var(--muted);
 }
+/* A panel or dialog whose code is on its way (#285): only a slow load says so. */
+.lazy-note {
+  animation: lazy-note 0s 400ms both;
+}
+@keyframes lazy-note {
+  from {
+    visibility: hidden;
+  }
+}
 .muted {
   color: var(--muted);
   margin: 6px 0;

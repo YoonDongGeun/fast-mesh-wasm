@@ -6,8 +6,7 @@ import { memo, useMemo } from "react";
 import { type AppState, useApp } from "../../../app/state/app-state";
 import { formatLength, type LengthUnit } from "../../../shared/ux/units";
 import { curveLength, curveReadout, curvesSphere, type Polyline } from "../ux/polyline";
-import { removePolylines } from "../ux/polyline-actions";
-import { clickPolyline, cssColor } from "../ux/polyline-list";
+import { clickPolyline, cssColor, removePolylines } from "../ux/polyline-list";
 import "./polylines.css";
 
 type FocusBox = (box: { center: readonly [number, number, number]; radius: number }) => void;

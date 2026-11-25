@@ -3,7 +3,7 @@
 import type { AppState } from "../../../app/state/app-state";
 import type { CommandPaletteItem } from "../../../shell/ux/command-registry";
 import { createDialogOf } from "./create-dialog-state";
-import { CREATE_SHAPES } from "./create-primitive";
+import { CREATE_SHAPES } from "./create-shapes";
 
 /** Extra words a shape answers to in the palette's search. */
 const SYNONYMS: Partial<Record<string, string>> = {

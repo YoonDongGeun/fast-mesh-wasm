@@ -37,7 +37,7 @@ import { meshOrigin } from "../../shared/ux/mesh-center";
 import { type ImportScale, type LengthUnit, NO_IMPORT_SCALE } from "../../shared/ux/units";
 import { createDefaultWave6State, type Wave6State } from "./wave6-state";
 import { DEFAULT_PLACEMENT_TOOL, type PlacementToolState } from "../../features/transform/ux/placement-picks";
-import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-tools";
+import { type AlignToolState, DEFAULT_ALIGN_TOOL } from "../../features/transform/ux/align-state";
 import { DEFAULT_OBJECT_INFO, type ObjectInfoState } from "../../features/inspect/ux/object-info-state";
 import { DEFAULT_SURFACE_PATH_TOOL, type SurfacePathToolState } from "../../features/inspect/ux/surface-paths";
 import { type BuildPlate, DEFAULT_BUILD_PLATE } from "../../features/build-plate/ux/plate";

@@ -2,6 +2,7 @@
 // the tour's step (null when it is not running) and its first-run start,
 // and the ring on the anchor of the step that shows.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { whenPresent } from "./panel-triggers";
 import { markTourSeen, resolveTourStart, type TourStep, tourBack, tourNext, tourSeen } from "./tour";
 
 export function useHelpAndTour() {
@@ -54,12 +55,18 @@ export function useHelpAndTour() {
   return { helpOpen, setHelpOpen, openHelp, closeHelp, tourStep, nextTour, backTour, endTour, startTourFromHelp };
 }
 
-/** Rings the step's `[data-tour]` anchor (`.tour-spot`) while it shows, scrolled into view. */
+/** Rings the step's `[data-tour]` anchor (`.tour-spot`) while it shows, scrolled into view; a panel still loading is waited for. */
 export function useTourSpot(step: TourStep): void {
   useEffect(() => {
-    const el = document.querySelector(`[data-tour="${step.target}"]`);
-    el?.classList.add("tour-spot");
-    el?.scrollIntoView({ block: "nearest" });
-    return () => el?.classList.remove("tour-spot");
+    let spot: HTMLElement | null = null;
+    const stop = whenPresent(`[data-tour="${step.target}"]`, (el) => {
+      spot = el;
+      el.classList.add("tour-spot");
+      el.scrollIntoView({ block: "nearest" });
+    });
+    return () => {
+      stop();
+      spot?.classList.remove("tour-spot");
+    };
   }, [step]);
 }

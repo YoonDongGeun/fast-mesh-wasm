@@ -3,7 +3,7 @@
 // each side, plus the source's holes and the shift-clicked Join queue.
 import type { BoundaryLoop, MeshHandle, Scene } from "fast-mesh-wasm";
 import type { WorkerScene } from "fast-mesh-wasm/worker";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type AppState, type Item, useApp } from "../../../app/state/app-state";
 import { nextJoinSource } from "../../select/ux/selection";
 import { type AnalysisSummary, summarize } from "./repair-summary";
@@ -67,7 +67,14 @@ export function useRepairLoopPicks(args: {
   }, [mesh, multi, items]);
   // Loop picks are loop ids: a fresh analysis (or mesh) invalidates them.
   // Note: selecting another mesh no longer disarms an active sculpt brush (#228, #229).
+  // Not at the mount, which has nothing to clear: the panel may come after a
+  // multi-selection (#285), whose seed stands.
+  const pickedOn = useRef(mesh);
   useEffect(() => {
+    if (pickedOn.current === mesh) {
+      return;
+    }
+    pickedOn.current = mesh;
     setBridgeA("");
     setBridgeB("");
     setPartialA("");

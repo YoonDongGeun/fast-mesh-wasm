@@ -4,7 +4,7 @@
 import type { AppState, WorkbenchTab } from "../../../app/state/app-state";
 import type { CommandPaletteItem } from "../../../shell/ux/command-registry";
 import { focusElement, triggerClick } from "../../../shell/ux/panel-triggers";
-import { activePolylines } from "./polyline-actions";
+import { activePolylines } from "./polyline-list";
 
 /** A tool's palette entry: the button it presses, and what it works on. */
 interface PolylineCommand {

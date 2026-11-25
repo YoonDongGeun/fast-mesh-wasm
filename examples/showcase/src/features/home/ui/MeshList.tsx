@@ -5,7 +5,7 @@
 import { useMeshDisplay, useScene, useSelection } from "fast-mesh-wasm/react";
 import { useMemo, useRef, useState } from "react";
 import { formatMeshBytes, formatTriangles } from "../../../io/big-file";
-import { MESH_EXTENSIONS } from "../../../io/parse";
+import { MESH_EXTENSIONS } from "../../../io/mesh-extensions";
 import { PHANTOM_NAMES, type PhantomKind } from "../../../io/phantom";
 import { SAMPLE_NAMES, type SampleKind } from "../../../io/vtkjs";
 import { type AppState, type DiagnosticShadingMode, type Item, useApp } from "../../../app/state/app-state";
