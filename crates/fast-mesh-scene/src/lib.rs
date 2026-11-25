@@ -16,7 +16,11 @@
 //!   placement is validated (a proper rotation, a finite positive scale)
 //!   and stored exactly as given. World queries, fields and sections all
 //!   follow the scale; pair queries run on copies baked into one mesh's
-//!   local space (or into the world) when a scale is involved.
+//!   local space (or into the world around a point near it) when a scale is
+//!   involved. The answers are those of the world's shapes, to the `f32`
+//!   rounding of the meshes' local positions, whatever mix of a mesh's `f64`
+//!   origin, pose and scale puts them there and however far from the world
+//!   origin that is.
 //! - Editing: [`Scene::edit`] runs a store transaction on one mesh and
 //!   records its patch. All-or-nothing: a failed edit changes nothing.
 //!   The closure may fail with any error that converts into
@@ -84,6 +88,7 @@
 //!   `f32` and results filtered against the exact bound. Queries over all
 //!   meshes update every Lazy BVH and fail with [`SceneError::StaleBvh`] on
 //!   a stale Manual one; queries naming meshes touch only those.
+//! - Measures: [`Scene::measure_placed`], the area and volume in the world.
 //! - Height maps: [`Scene::height_map_frame`] fits an orthographic image
 //!   ([`HeightMapFrame`]) to meshes along a direction, [`Scene::height_map`]
 //!   samples the heights of its pixels, and [`Scene::add_heightfield`] adds a

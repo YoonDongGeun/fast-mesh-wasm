@@ -86,6 +86,14 @@ fn sections() {
             s.undo().unwrap();
             s.update_sections().unwrap();
             out.extend(numbers(&s, section, id, put, &plane));
+            // Another plane, with a second mesh.
+            let moved = Plane::new(put.world(add(p.0, [0.05, -0.03, 0.1])), p.1).unwrap();
+            let other = put.add(&mut s, &lump().moved([0.3, 0.2, 0.15]));
+            s.set_section_plane(section, moved).unwrap();
+            s.set_section_meshes(section, vec![id, other]).unwrap();
+            s.update_sections().unwrap();
+            out.extend(numbers(&s, section, id, put, &moved));
+            out.extend(numbers(&s, section, other, put, &moved));
             out
         });
     }

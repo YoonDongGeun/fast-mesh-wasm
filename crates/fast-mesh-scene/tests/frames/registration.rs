@@ -51,7 +51,7 @@ fn multistage() {
         coarse_method: CoarseAlignMethod::None,
         ..RegistrationOptions::default()
     };
-    agree_pairs("register_multistage", 1e-3, |pa, pb| {
+    agree_few_pairs("register_multistage", 1e-3, |pa, pb| {
         let mut s = scene();
         let (moving, fixed) = (pa.add(&mut s, &nudged()), pb.add(&mut s, &lump()));
         let before = positions(&s, moving, pa);

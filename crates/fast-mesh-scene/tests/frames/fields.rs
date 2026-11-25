@@ -120,6 +120,28 @@ fn distances_in_steps() {
     });
 }
 
+/// After a drag with the interaction tier on, and its end.
+#[test]
+fn distances_through_an_interaction() {
+    agree_pairs("field interaction", TOL, |pa, pb| {
+        let mut s = scene();
+        let (a, b) = (pa.add(&mut s, &lump()), pb.add(&mut s, &crossing()));
+        let f = s
+            .add_distance_field(DistanceField::new("d", a, b, 0.8, SignMode::Auto))
+            .unwrap();
+        s.set_field_interaction(Some(40)).unwrap();
+        let mut there = s.placement(b).unwrap();
+        for d in [0.11, 0.07, -0.05] {
+            there.translation[0] += d;
+            there.translation[2] -= d;
+            s.set_placement(b, there).unwrap();
+        }
+        s.set_field_interaction(None).unwrap();
+        s.update_fields().unwrap();
+        values(&s, f)
+    });
+}
+
 #[test]
 fn thicknesses() {
     for max_distance in [f64::INFINITY, 1.5] {

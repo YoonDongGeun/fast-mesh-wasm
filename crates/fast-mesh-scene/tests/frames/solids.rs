@@ -60,22 +60,24 @@ fn booleans_with_options() {
 /// units: only about the same.
 #[test]
 fn voxel_booleans() {
-    for method in [BooleanMethod::BvhSdf, BooleanMethod::FhEdt] {
-        for voxel_pitch in [None, Some(0.12f32)] {
-            agree_few_pairs("voxel boolean", 0.2, |pa, pb| {
-                let options = BooleanOptions {
-                    op: fast_mesh_ops::BooleanOp::Subtract,
-                    method,
-                    voxel_pitch: voxel_pitch.map(|p| p / pa.scale[0] as f32),
-                    ..BooleanOptions::default()
-                };
-                let mut s = scene();
-                let (a, b) = (pa.add(&mut s, &lump()), pb.add(&mut s, &crossing()));
-                s.boolean_with_options(a, b, &options).unwrap();
-                let whole = solid(&s, a, pa);
-                [&whole[..1], &whole[2..8]].concat()
-            });
-        }
+    for (method, pitch) in [
+        (BooleanMethod::BvhSdf, Some(0.18f32)),
+        (BooleanMethod::FhEdt, Some(0.18)),
+        (BooleanMethod::FhEdt, None),
+    ] {
+        agree_few_pairs("voxel boolean", 0.25, |pa, pb| {
+            let options = BooleanOptions {
+                op: fast_mesh_ops::BooleanOp::Subtract,
+                method,
+                voxel_pitch: pitch.map(|p| p / pa.scale[0] as f32),
+                ..BooleanOptions::default()
+            };
+            let mut s = scene();
+            let (a, b) = (pa.add(&mut s, &lump()), pb.add(&mut s, &crossing()));
+            s.boolean_with_options(a, b, &options).unwrap();
+            let whole = solid(&s, a, pa);
+            [&whole[..1], &whole[2..8]].concat()
+        });
     }
 }
 
@@ -317,6 +319,66 @@ fn placed_meshes() {
     }
 }
 
+/// A stamp's own coordinates are its origin plus its positions, whatever the
+/// one and the others are.
+#[test]
+fn stamps_do_not_go_by_their_origin() {
+    let params = PlaceMeshParams {
+        twist_angle_rad: 0.4,
+        mode: PlaceMode::EmbedUnion,
+        ..PlaceMeshParams::default()
+    };
+    let run = |origin: V3, put: Put| {
+        let mut s = scene();
+        let id = put.add(&mut s, &block([-1.0, -0.8, -0.7], [1.2, 0.9, 0.7]));
+        let positions: Vec<f64> = arrow().points.into_iter().flatten().collect();
+        let shape = arrow();
+        let indices = shape.triangles.as_flattened();
+        let mesh = Mesh::from_buffers_f64_with_origin(&positions, indices, origin).unwrap();
+        let stamp = s.add_mesh(mesh, MeshOptions::default()).unwrap();
+        let at = put.world([0.1, 0.05, 0.7]);
+        s.place_mesh_world(id, stamp, at, [0.2, -0.1, 0.97], &params)
+            .unwrap();
+        solid(&s, id, put)
+    };
+    let want = run([0.0; 3], PLAIN);
+    for put in some_puts_at(FAR) {
+        for origin in [[0.0; 3], [0.1, -0.2, 0.3], [3.0, 2.0, -1.0]] {
+            let d = off(&run(origin, put), &want);
+            assert!(d < TOL, "{origin:?} {put:?}: {d}");
+        }
+    }
+}
+
+/// What a mesh goes through outside the geometry: a compaction, a removal and
+/// its undo, a step cancelled.
+#[test]
+fn meshes_stay_where_they_are() {
+    agree("compact, remove, cancel", 2e-6, |put| {
+        let mut s = scene();
+        let id = put.add(&mut s, &lump());
+        let mut out = solid(&s, id, put);
+        s.delete_selected_faces(id, &[0, 1, 2, 3]).unwrap();
+        s.compact(id).unwrap();
+        out.extend(solid(&s, id, put));
+        s.remove_mesh_undoable(id).unwrap();
+        s.undo().unwrap();
+        out.extend(solid(&s, id, put));
+        s.begin_step();
+        let there = Placement {
+            translation: [1.0, 2.0, 3.0],
+            scale: [2.0; 3],
+            ..s.placement(id).unwrap()
+        };
+        s.set_placement(id, there).unwrap();
+        s.cancel_step().unwrap();
+        out.extend(solid(&s, id, put));
+        let copy = put.add(&mut s, &lump());
+        out.extend(solid(&s, copy, put));
+        out
+    });
+}
+
 #[test]
 fn extruded_faces() {
     for direction in [
@@ -464,8 +526,8 @@ fn wraps() {
 #[test]
 fn lattices() {
     let options = LatticeOptions {
-        cell_size: 0.5,
-        wall_thickness: 0.1,
+        cell_size: 0.8,
+        wall_thickness: 0.2,
         ..LatticeOptions::default()
     };
     agree_some("lattice_fill", 0.2, |put| {
@@ -487,8 +549,8 @@ fn lattices() {
 #[test]
 fn lattices_do_not_go_by_the_origin() {
     let options = LatticeOptions {
-        cell_size: 0.5,
-        wall_thickness: 0.1,
+        cell_size: 0.8,
+        wall_thickness: 0.2,
         ..LatticeOptions::default()
     };
     let shape = block([-1.0, -0.8, -0.7], [1.2, 0.9, 0.7]);

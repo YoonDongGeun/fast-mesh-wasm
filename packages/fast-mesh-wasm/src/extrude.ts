@@ -66,7 +66,7 @@ export interface ExtrudeBaseOptions {
   offset?: number;
   /**
    * The boundary loops to extrude: `"largest"` (default) is the one with the
-   * longest perimeter, `"all"` every one, where outlines nested on the plane
+   * longest perimeter in the world, `"all"` every one, where outlines nested on the plane
    * become holes in the cap, or the ids of some, from `analyze(mesh).loops`.
    */
   loops?: "largest" | "all" | readonly LoopId[];
